@@ -79,12 +79,31 @@ type struct VendorEntry {
     key:            string;   // registry key (the source dir basename, lowercased)
     name:           string;   // import namespace, e.g. "RayLib"
     source_path:    string;   // absolute path to the vendored C project
-    binding_source: string;   // "headers" (libclang) | "manual" (pre-written) | "cxx-shim" (reserved, unimplemented)
+    binding_source: string;   // "headers" (C/libclang) | "cxx-headers" (C++/libclang, direct mangled) | "manual" (pre-written) | "cxx-shim" (reserved, unimplemented)
     headers:        string[];
     include_dirs:   string[];
     defines:        string[];
+    /// Source language for libclang: "c" (default) or "c++".  Empty means "c".
+    /// `binding_source: "cxx-headers"` implies "c++".  Selects `-x c++`.
+    language:       string;
+    /// C++ standard for `-std=` (e.g. "c++17"); empty defaults to "c++17".
+    /// Ignored for C bindings.
+    std:            string;
     link:           VendorLink;
     cache:          VendorCacheItem[];
+
+    /// True when this entry binds C++ headers (direct mangled-symbol binding).
+    is_cxx(&this) -> boolean {
+        return strcmp(this.binding_source, "cxx-headers") == 0
+            || strcmp(this.language, "c++") == 0;
+    }
+
+    /// The libclang source language for this entry: "c++" for a C++ binding,
+    /// else "c".
+    lang_arg(&this) -> string {
+        if (this.is_cxx()) { return "c++"; }
+        return "c";
+    }
 
     /// The generated bindings path for `triple`, or "" if not yet cached.
     cache_file_for(&this, triple: string) -> string {
@@ -312,6 +331,12 @@ type struct VendorRegistry {
         for (mut i: i64 = 0; i < entry.link.static_unix.length; i++) {
             cfg.link_static_unix.push(entry.link.static_unix[i]);
         }
+        // A C++ library pulls in the C++ runtime; auto-add `-lstdc++` (unix) so a
+        // vendored C++ binding links without the user having to remember it.  A
+        // duplicate (user already listed it) is harmless — the linker dedups.
+        if (entry.is_cxx()) {
+            cfg.link_system_unix.push("stdc++");
+        }
     }
 
     // JSON helpers
@@ -383,6 +408,8 @@ type struct VendorRegistry {
             headers:        VendorRegistry::jstrs(ep, "headers"),
             include_dirs:   VendorRegistry::jstrs(ep, "include_dirs"),
             defines:        VendorRegistry::jstrs(ep, "defines"),
+            language:       VendorRegistry::jstr(ep, "language", ""),
+            std:            VendorRegistry::jstr(ep, "std", ""),
             link:           VendorLink::empty(),
             cache:          [],
         };
@@ -436,6 +463,8 @@ type struct VendorRegistry {
         obj.put("headers",        JsonValue::string_array(&entry.headers));
         obj.put("include_dirs",   JsonValue::string_array(&entry.include_dirs));
         obj.put("defines",        JsonValue::string_array(&entry.defines));
+        obj.put("language",       JsonValue::from_cstr(entry.language));
+        obj.put("std",            JsonValue::from_cstr(entry.std));
 
         mut link: JsonObject = JsonObject::new();
         link.put("system",         JsonValue::string_array(&entry.link.system));

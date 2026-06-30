@@ -2214,6 +2214,22 @@ type struct TypeResolutionPasses {
                             const func_type_ref: TypeRef = arena.get_function(
                                 fn_node.resolved_return_type, ext_params, fn_node.is_variadic);
 
+                            // The LLVM symbol an extern function resolves to: its
+                            // bare C name, UNLESS a function-level `![link("sym")]`
+                            // pins a different linker symbol (the C++ binding
+                            // generator pins the Itanium mangled name).  Read from
+                            // the parsed directive (DirectiveProcessing, which sets
+                            // `has_link_name`, runs LATER than this pass), and
+                            // registered as the DI mangled name so EVERY module —
+                            // declaring and consuming — emits the same symbol,
+                            // making the override work across the module boundary.
+                            const ext_link_str: string = fn_node.link_directive_symbol();
+                            const ext_link_sym: SymbolStr = if (strlen(ext_link_str) > 0) {
+                                ctx.intern_table.intern(ext_link_str)
+                            } else {
+                                fn_node.name
+                            };
+
                             const ext_mod_sym: SymbolStr = ctx.intern(ctx.source_file);
                             // Claim the BARE name only if nothing else owns it yet.
                             // An `intrinsic function` (or a regular function) of the
@@ -2233,8 +2249,9 @@ type struct TypeResolutionPasses {
                                 ctx.decl_index.register_function_with_module(
                                     fn_node.name, fn_node.resolved_return_type, ext_mod_sym);
                                 ctx.decl_index.register_function_type(fn_node.name, func_type_ref);
-                                // Extern C functions use bare name as LLVM symbol.
-                                ctx.decl_index.register_mangled_name(fn_node.name, fn_node.name);
+                                // Extern C functions use the bare name as the LLVM
+                                // symbol, unless `![link]` overrode it (ext_link_sym).
+                                ctx.decl_index.register_mangled_name(fn_node.name, ext_link_sym);
                                 // Remember that an extern block owns this bare
                                 // slot, so a later extern collision can be told
                                 // apart from the intentional intrinsic-wins case.
@@ -2295,7 +2312,7 @@ type struct TypeResolutionPasses {
                                 ctx.decl_index.register_function_with_module(
                                     ext_q_name, fn_node.resolved_return_type, ext_mod_sym);
                                 ctx.decl_index.register_function_type(ext_q_name, func_type_ref);
-                                ctx.decl_index.register_mangled_name(ext_q_name, fn_node.name);
+                                ctx.decl_index.register_mangled_name(ext_q_name, ext_link_sym);
                             }
 
                             // For CImport blocks, also register under alias::name
@@ -2307,8 +2324,9 @@ type struct TypeResolutionPasses {
                                 ctx.decl_index.register_function_with_module(
                                     q_sym, fn_node.resolved_return_type, ext_mod_sym);
                                 ctx.decl_index.register_function_type(q_sym, func_type_ref);
-                                // CImport qualified name also maps to bare C name.
-                                ctx.decl_index.register_mangled_name(q_sym, fn_node.name);
+                                // CImport qualified name maps to the bare C name (or
+                                // the `![link]` override).
+                                ctx.decl_index.register_mangled_name(q_sym, ext_link_sym);
                             }
                         }
                     }

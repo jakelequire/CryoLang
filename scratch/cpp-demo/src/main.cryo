@@ -1,0 +1,71 @@
+/// cpp-demo — §4 de-risk probe for Cryo's C++ binding generator.
+///
+/// Proves that DIRECT mangled-symbol binding works end-to-end on this
+/// toolchain, BY HAND, before any generator code exists:
+///   - `demo::add(int,int)`   binds to `_ZN4demo3addEii`   (namespace free fn)
+///   - `Point::sum() const`   binds to `_ZNK5Point3sumEv`  (non-virtual method,
+///                                                          `this` as 1st ptr arg)
+///   - `Point::origin_x()`    binds to `_ZN5Point8origin_xEv` (static member)
+///
+/// Each is a body-less `extern "C"` decl whose linker symbol is pinned with
+/// `![link("<mangled>")]`.  `Point` is a layout-faithful `type struct` (two
+/// i32s, matching the C++ `struct Point { int x, y; }`), and the const method
+/// receives `self: Point*` — the Itanium implicit-`this` is just a leading
+/// pointer, which `&p` supplies.  Links against `lib/libcpptest.a`.
+namespace CppDemo::Main;
+
+import std::fmt;
+
+type struct Point {
+    x: i32;
+    y: i32;
+}
+
+extern "C" {
+    ![link("_ZN4demo3addEii")]
+    function demo_add(a: i32, b: i32) -> i32;
+
+    ![link("_ZNK5Point3sumEv")]
+    function point_sum(self: Point*) -> i32;
+
+    ![link("_ZN5Point8origin_xEv")]
+    function point_origin_x() -> i32;
+}
+
+// Part B: the SAME C++ symbols bound as REAL Cryo methods on `Point` via
+// `![link]` on body-less method decls.  `&this` lowers to a leading pointer,
+// matching the Itanium implicit-`this` of `Point::sum() const`.  The static
+// method has no receiver, matching `Point::origin_x()`.  This is the shape the
+// Phase 1 generator will emit.
+implement Point {
+    ![link("_ZNK5Point3sumEv")]
+    public sum(&this) -> i32;
+
+    ![link("_ZN5Point8origin_xEv")]
+    public static origin_x() -> i32;
+}
+
+function main() -> int {
+    const sum: i32 = demo_add(2 as i32, 3 as i32);          // expect 5
+    mut p: Point = Point { x: 40 as i32, y: 2 as i32 };
+    const ps: i32 = point_sum(&p);                          // expect 42 (extern fn)
+    const ox: i32 = point_origin_x();                       // expect 0  (extern fn)
+
+    // Part B: method-form calls onto the same mangled symbols.
+    const ps_m: i32 = p.sum();                              // expect 42 (method)
+    const ox_m: i32 = Point::origin_x();                    // expect 0  (static)
+
+    fmt::printf("demo::add(2,3) = %d\n", sum);
+    fmt::printf("point_sum(&p) [extern] = %d\n", ps);
+    fmt::printf("p.sum() [method]       = %d\n", ps_m);
+    fmt::printf("Point::origin_x() [static] = %d\n", ox_m);
+
+    if (sum  != 5 as i32)  { fmt::eprintf("FAIL: demo::add\n");       return 1; }
+    if (ps   != 42 as i32) { fmt::eprintf("FAIL: point_sum extern\n"); return 2; }
+    if (ox   != 0 as i32)  { fmt::eprintf("FAIL: origin_x extern\n");  return 3; }
+    if (ps_m != 42 as i32) { fmt::eprintf("FAIL: p.sum() method\n");   return 4; }
+    if (ox_m != 0 as i32)  { fmt::eprintf("FAIL: Point::origin_x method\n"); return 5; }
+
+    fmt::printf("PROBE+PartB OK: C++ mangled binding works as extern fns AND methods.\n");
+    return 0;
+}

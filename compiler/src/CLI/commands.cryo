@@ -1644,6 +1644,14 @@ type struct Executor {
                 VendorRegistry::normalize_triple(""));
             return strlen(f) > 0 && metadata::exists(Path::from_cstr(f));
         }
+        if (strcmp(req, "cxx") == 0) {
+            // A C++ toolchain is available.  The C++ direct-mangled-binding test
+            // links a `c++`-compiled helper by its Itanium-mangled symbols, so it
+            // is meaningless without a C++ compiler (and the Itanium ABI) — skip
+            // cleanly on a host that has none (e.g. native MSVC Windows).
+            const st: i32 = system("c++ --version > /dev/null 2>&1");
+            return exit_code_of(st) == 0;
+        }
         // Unknown requirement: don't gate on something this compiler can't check.
         return true;
     }
@@ -2411,6 +2419,8 @@ type struct Executor {
             headers:        VendorRegistry::jstrs(&root, "headers"),
             include_dirs:   VendorRegistry::jstrs(&root, "include_dirs"),
             defines:        VendorRegistry::jstrs(&root, "defines"),
+            language:       VendorRegistry::jstr(&root, "language", ""),
+            std:            VendorRegistry::jstr(&root, "std", ""),
             link:           VendorLink::empty(),
             cache:          [],
         };
@@ -2475,9 +2485,11 @@ type struct Executor {
             }
             entry.set_cache(norm_triple, dest, "");
             produced = true;
-        } else if (strcmp(entry.binding_source, "headers") == 0) {
-            // Generate bindings from the manifest's C headers via libclang,
-            // unless an unchanged provenance key makes this a cache hit.
+        } else if (strcmp(entry.binding_source, "headers") == 0
+                || strcmp(entry.binding_source, "cxx-headers") == 0) {
+            // Generate bindings from the manifest's headers via libclang, unless
+            // an unchanged provenance key makes this a cache hit.  "headers" =
+            // C; "cxx-headers" = C++ (direct mangled-symbol binding, Strategy A).
             if (entry.headers.length == 0) {
                 lock.release();
                 fmt::eprintf("Error: manifest declares no \"headers\" to generate bindings from.\n");
@@ -2485,7 +2497,7 @@ type struct Executor {
             }
             const prov_key: string = VendorGenerator::provenance_key(
                 abs, &entry.headers, &entry.include_dirs, &entry.defines,
-                norm_triple, prev_file);
+                norm_triple, prev_file, entry.lang_arg());
             const hit: boolean = !force
                 && strlen(prev_key) > 0 && strcmp(prev_key, prov_key) == 0
                 && strlen(prev_file) > 0 && metadata::exists(Path::from_cstr(prev_file));
@@ -2501,7 +2513,8 @@ type struct Executor {
                     name, entry.headers.length as i64);
                 mut inputs: string[] = [];
                 const src_text: string = VendorGenerator::generate(
-                    name, abs, &entry.headers, &entry.include_dirs, &entry.defines, &inputs);
+                    name, abs, &entry.headers, &entry.include_dirs, &entry.defines, &inputs,
+                    entry.lang_arg(), entry.std);
                 if (strlen(src_text) == 0) {
                     lock.release();
                     fmt::eprintf("Error: binding generation produced no output (no header parsed).\n");
@@ -2525,7 +2538,7 @@ type struct Executor {
                 // without a spurious one-time regeneration.
                 const store_key: string = VendorGenerator::provenance_key(
                     abs, &entry.headers, &entry.include_dirs, &entry.defines,
-                    norm_triple, dest);
+                    norm_triple, dest, entry.lang_arg());
                 entry.set_cache(norm_triple, dest, store_key);
                 produced = true;
             }

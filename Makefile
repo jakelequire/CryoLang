@@ -71,6 +71,16 @@ TEST_HELPERS_C   := $(TEST_HELPERS_DIR)/abi_helpers.c
 TEST_HELPERS_O   := $(TEST_HELPERS_DIR)/abi_helpers.o
 TEST_HELPERS_A   := $(TEST_HELPERS_DIR)/libabihelpers.a
 
+# C++-side helper for the ffi_cpp_link project (the C++ direct-mangled-binding
+# exemplar).  Compiled with the host C++ compiler so the project can `![link]`
+# its Itanium-mangled symbols across a module boundary.  Built only on unix
+# (the project gates on `requires: ["cxx"]`, which a C++-toolchain-less host
+# fails, so it is skipped where this archive is absent).
+TEST_CPP_HELPERS_CPP := $(TEST_HELPERS_DIR)/cpp_link_helper.cpp
+TEST_CPP_HELPERS_O   := $(TEST_HELPERS_DIR)/cpp_link_helper.o
+TEST_CPP_HELPERS_A   := $(TEST_HELPERS_DIR)/libcpplinkhelper.a
+CXX                  ?= c++
+
 # `nproc` is POSIX-only; on Windows make (cmd as recipe shell) the
 # `$(shell)` call would spam "system cannot find the path specified" from
 # the bash-flavoured 2>/dev/null redirect.  Just default to 4 there.
@@ -376,6 +386,12 @@ $(TEST_HELPERS_A): $(TEST_HELPERS_C)
 	@cc -O0 -fPIC -c -o $(TEST_HELPERS_O) $<
 	@ar rcs $@ $(TEST_HELPERS_O)
 
+# C++ helper archive for the ffi_cpp_link project (Itanium-mangled symbols).
+$(TEST_CPP_HELPERS_A): $(TEST_CPP_HELPERS_CPP)
+	@echo "==> Building C++ link-test helper archive"
+	@$(CXX) -O0 -fPIC -c -o $(TEST_CPP_HELPERS_O) $<
+	@ar rcs $@ $(TEST_CPP_HELPERS_O)
+
 ifeq ($(HOST_OS),windows)
 # Native Windows host: recipes run under cmd, which can't execute a quoted
 # forward-slash path and needs the `.exe` the native build emits — so the
@@ -390,10 +406,10 @@ test: $(STAGE2_EXE) $(LIBCRYO_A) $(TEST_HELPERS_A)
 test-list: $(STAGE2_EXE) $(LIBCRYO_A) $(TEST_HELPERS_A)
 	@cd tests && "$(STAGE2_EXE_WIN)" test --list $(ARGS)
 else
-test: $(STAGE2) $(LIBCRYO_A) $(TEST_HELPERS_A)
+test: $(STAGE2) $(LIBCRYO_A) $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A)
 	@cd tests && "$(STAGE2)" test $(ARGS)
 
-test-list: $(STAGE2) $(LIBCRYO_A) $(TEST_HELPERS_A)
+test-list: $(STAGE2) $(LIBCRYO_A) $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A)
 	@cd tests && "$(STAGE2)" test --list $(ARGS)
 endif
 

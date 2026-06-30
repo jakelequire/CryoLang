@@ -615,13 +615,25 @@ type struct DeclarationIndex {
             // spec_type_args) for every template / non-spec method.
             const mangled: MangledName = mangled_base.with_method_spec_args(
                 intern, arena, func.spec_type_args);
-            this.register_mangled_name(combined_sym, mangled.value);
+            // A method bound with `![link("sym")]` (the C++ binding generator)
+            // resolves to the foreign mangled symbol, not the Cryo mangling — so
+            // register THAT as the DI symbol, making every consuming module emit
+            // it for the cross-module extern.  Read from the parsed directive on
+            // the MethodNode (DirectiveProcessing runs later than this pass).
+            // Empty for an ordinary method -> Cryo mangling, byte-unchanged.
+            const link_str: string = method.link_directive_symbol();
+            const eff_mangled: SymbolStr = if (!link_str.eq("")) {
+                intern.intern(link_str)
+            } else {
+                mangled.value
+            };
+            this.register_mangled_name(combined_sym, eff_mangled);
 
             // Also associate this overload's mangled name with its
             // FunctionType in the overload registry, so cross-module
             // extern declaration can emit the right LLVM symbol per
             // overload (not just the last-registered one).
-            this.register_overload_mangled(combined_sym, func_type_ref, mangled.value);
+            this.register_overload_mangled(combined_sym, func_type_ref, eff_mangled);
 
             // Bare-name alias.  For impl blocks on primitives (e.g. `implement
             // string`) the qualified form is `std::core::primitives::string::substring`
@@ -637,8 +649,8 @@ type struct DeclarationIndex {
                 if (bare_combined_sym.id != combined_sym.id) {
                     this.register_function(bare_combined_sym, func.resolved_return_type);
                     this.register_function_type(bare_combined_sym, func_type_ref);
-                    this.register_mangled_name(bare_combined_sym, mangled.value);
-                    this.register_overload_mangled(bare_combined_sym, func_type_ref, mangled.value);
+                    this.register_mangled_name(bare_combined_sym, eff_mangled);
+                    this.register_overload_mangled(bare_combined_sym, func_type_ref, eff_mangled);
                 }
             }
 
