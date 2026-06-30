@@ -515,17 +515,36 @@ type struct Importer {
     /// reached on the C++ path.
     emit_cxx_class(mut &this, cursor: CXCursor) -> void {
         if (cursor.is_anonymous()) { return; }
-        // Build the data-member struct (find-or-create + dedup live in emit_record).
-        this.emit_record(cursor, false);
 
         // Collect this class's member functions (definition cursors carry them;
-        // a forward-declaration cursor has none, so it produces no impl block).
+        // a forward-declaration cursor has none).  Done BEFORE emitting the
+        // record so a vtable can be detected before committing to a layout.
         this.cxx_method_cursors = [];
         Clang::clang_visitChildren(cursor, Importer::visit_collect_cxx_method, this as void*);
-        if (this.cxx_method_cursors.length == 0) { return; }
 
         const owner_sym: SymbolStr = cursor.intern_spelling(this.ctx);
         const owner_str: string = this.ctx.intern_table.resolve(owner_sym);
+
+        // Polymorphic class guard: a class with any virtual method carries a
+        // hidden vtable pointer (at offset 0 in the Itanium ABI).  `emit_record`
+        // lays out DATA MEMBERS ONLY, so the emitted `type struct` would be the
+        // wrong size and every bound method would read its fields at the wrong
+        // offset — a silent miscompile (e.g. a `data` member ends up read 8
+        // bytes early).  Such a class also can't be safely constructed without
+        // ctor + vtable setup (Phase 2).  Skip the WHOLE class (no struct, no
+        // methods) and report it, rather than emit a layout-wrong shell.
+        for (mut vi: i64 = 0; vi < this.cxx_method_cursors.length; vi++) {
+            if (this.cxx_method_cursors[vi].is_virtual_method()) {
+                this.report.skip(format(
+                    "class %s (polymorphic: a vtable pointer Strategy A can't reproduce — methods would read fields at the wrong offset; needs Phase-2 vtable/ctor support)",
+                    owner_str));
+                return;
+            }
+        }
+
+        // Build the data-member struct (find-or-create + dedup live in emit_record).
+        this.emit_record(cursor, false);
+        if (this.cxx_method_cursors.length == 0) { return; }
         mut impl: ImplBlockNode* = new ImplBlockNode(owner_sym, SourceSpan::none());
         mut bound: i64 = 0;
         for (mut i: i64 = 0; i < this.cxx_method_cursors.length; i++) {
@@ -538,6 +557,23 @@ type struct Importer {
         if (bound > 0) {
             this.emit_top_level(impl as ASTNode*);
         }
+    }
+
+    /// True when `name` is a C++ operator/conversion-operator spelling
+    /// (`operator+`, `operator==`, `operator[]`, `operator bool`, ...): the
+    /// 8-char `operator` prefix followed by a NON-identifier char (a symbol, or
+    /// the space of `operator T`).  A normal method like `operatorFoo` has an
+    /// identifier char there and is correctly NOT treated as an operator.
+    static is_operator_spelling(name: string) -> boolean {
+        if (libc::strlen(name) < 9u64) { return false; }
+        if (libc::strncmp(name, "operator", 8u64) != 0) { return false; }
+        const p: u8* = name as u8*;
+        const c: u8 = p[8];
+        const ident: boolean = (c >= 97u8 && c <= 122u8)   // a-z
+            || (c >= 65u8 && c <= 90u8)                      // A-Z
+            || (c >= 48u8 && c <= 57u8)                      // 0-9
+            || c == 95u8;                                    // _
+        return !ident;
     }
 
     /// Bind one C++ member function into `impl` as a body-less `![symbol]` method,
@@ -559,6 +595,17 @@ type struct Importer {
         }
         if (k == Clang::CURSOR_FUNCTION_TEMPLATE) {
             this.report.skip(format("%s::%s (member template, no instantiated symbol)",
+                owner_str, mname));
+            return false;
+        }
+        // C++ operator overloads / conversion operators are spelled
+        // `operator<sym>` (e.g. `operator+`, `operator==`, `operator[]`,
+        // `operator bool`).  That is not a valid Cryo method identifier, and
+        // emitting it raw breaks the parse of the ENTIRE generated binding (so
+        // even the class's ordinary methods become unusable).  Skip + report;
+        // surfacing C++ operators through Cryo's operator traits is a later phase.
+        if (Importer::is_operator_spelling(mname)) {
+            this.report.skip(format("%s::%s (C++ operator overload — not bindable as a plain method; needs operator-trait mapping)",
                 owner_str, mname));
             return false;
         }

@@ -27,6 +27,7 @@
 namespace Compiler::Vendor::Registry;
 
 import ffi::libc;
+import ffi::syscall;
 import Compiler::Deps::Cache;
 import Compiler::ProjectConfig;
 import Utils::Logger;
@@ -291,11 +292,28 @@ type struct VendorRegistry {
         libc::fputs("\n", f);
         libc::fclose(f);
         text.drop();
-        if (libc::rename(tmp, path) != 0) {
+        if (!VendorRegistry::replace_file_atomic(tmp, path)) {
             libc::unlink(tmp);   // leave no stray temp file on a failed swap
             return false;
         }
         return true;
+    }
+
+    /// Atomically replace `path` with `tmp` (the just-written registry).
+    ///
+    /// POSIX `rename()` replaces an existing destination atomically, but the
+    /// Windows CRT `rename()` FAILS when the destination already exists — so
+    /// every `cryo vendor` after the first (once `registry.json` exists) errored
+    /// with "failed to write the vendor registry" on Windows.  Win32
+    /// `MoveFileExA` with `MOVEFILE_REPLACE_EXISTING` (0x1) is the atomic-replace
+    /// equivalent.  Returns true on success.
+    ![target(windows)]
+    static replace_file_atomic(tmp: string, path: string) -> boolean {
+        return syscall::MoveFileExA(tmp, path, 0x1u32) != 0;
+    }
+    ![target(unix)]
+    static replace_file_atomic(tmp: string, path: string) -> boolean {
+        return libc::rename(tmp, path) == 0;
     }
 
     // Link merge
@@ -331,11 +349,16 @@ type struct VendorRegistry {
         for (mut i: i64 = 0; i < entry.link.static_unix.length; i++) {
             cfg.link_static_unix.push(entry.link.static_unix[i]);
         }
-        // A C++ library pulls in the C++ runtime; auto-add `-lstdc++` (unix) so a
-        // vendored C++ binding links without the user having to remember it.  A
-        // duplicate (user already listed it) is harmless — the linker dedups.
+        // A C++ library pulls in the C++ runtime; auto-add `-lstdc++` so a
+        // vendored C++ binding links without the user having to remember it.
+        // Needed on BOTH platforms: the Itanium ABI (Linux + the mingw-w64
+        // toolchain Cryo targets on Windows) puts class typeinfo / vtables in
+        // libstdc++, so a bound class with any virtual member fails to link
+        // without it.  Per-OS so each `cc`/`gcc` link gets the flag; a duplicate
+        // (user already listed it) is harmless — the linker dedups.
         if (entry.is_cxx()) {
             cfg.link_system_unix.push("stdc++");
+            cfg.link_system_windows.push("stdc++");
         }
     }
 
