@@ -1169,6 +1169,45 @@ type struct CompilerInstance {
             }
         }
 
+        // Experimental gate: consuming a C++ vendor library (binding_source
+        // "cxx-headers" / language "c++") requires opting in via
+        // `[experimental] cxx_ffi = true`, because the Strategy-A C++ bindgen
+        // (mangled-symbol binding, no shim) is still experimental.  Checked
+        // here — after origin classification — so each vendored library's name
+        // (ModuleOrigin::Vendor + origin_name) and its registry entry are both
+        // in hand; emitting E0505 through ctx gives a clean, actionable error
+        // rather than the misleading "module not found" a loader-level gate
+        // (no diagnostic sink) would surface.  `cryo vendor` registration is
+        // intentionally not gated — it runs without a project cryoconfig.
+        if (ctx.project_config != null && !ctx.project_config.cxx_ffi) {
+            mut cxx_gated: boolean = false;
+            for (mut gi: u32 = 0; gi < ctx.module_graph.modules.length; gi++) {
+                const ginfo: ModuleInfo* = &ctx.module_graph.modules[gi];
+                const is_vendor: boolean = match (ginfo.origin) {
+                    ModuleOrigin::Vendor => { true }
+                    _ => { false }
+                };
+                if (!is_vendor) { continue; }
+                const vidx: i64 =
+                    loader.vendor_registry.find_index(ginfo.origin_name);
+                if (vidx < 0) { continue; }
+                if (!loader.vendor_registry.entries[vidx].is_cxx()) { continue; }
+                ctx.emit_error(ErrorCode::E0505_EXPERIMENTAL_FEATURE,
+                    format("`import vendor::%s` uses the experimental C++ binding generator",
+                        ginfo.origin_name));
+                cxx_gated = true;
+            }
+            if (cxx_gated) {
+                ctx.emit_help(
+                    "C++ FFI (Strategy-A mangled-symbol binding) is experimental; enable it by adding `[experimental]` with `cxx_ffi = true` to this project's cryoconfig");
+                // Render the deferred diagnostics: this early return is between
+                // the discovery and end-of-compile flush points, so without
+                // this the buffered E0505 would never reach the terminal.
+                ctx.diagnostics.flush();
+                return CompilationResult::failed(ctx.diagnostics.error_count, 0);
+            }
+        }
+
         if (ctx.module_graph.module_count() == 0) {
             fmt::eprintf("error: no modules discovered\n");
             return CompilationResult::failed(1, 0);
