@@ -24,7 +24,8 @@
 ///   ![deprecated("msg")]      : any decl: deprecation marker w/ msg
 ///   ![align(N)]               : struct/class: align bytes (N integer)
 ///   ![repr(C)] / ![repr(packed)] : struct/class: layout repr
-///   ![link("name")]           : extern fn / block: linker name override
+///   ![link("name")]           : extern block: library to link (e.g. "kernel32")
+///   ![symbol("name")]         : extern fn / method: linker symbol-name override
 ///   ![config(<atom>)] / ![target(<atom>)] / ![<atom>] : platform gate
 ///                                 evaluated by ConfigGating; <atom> is
 ///                                 windows / linux / macos / unix or
@@ -209,7 +210,7 @@ type struct DirectiveProcessingPasses {
         return match (name) {
             "inline" | "noinline" | "entry" | "test" | "ignore"
             | "should_panic" | "config" | "deprecated" | "align"
-            | "repr" | "link" | "target" | "allow" | "warn" | "deny"
+            | "repr" | "link" | "symbol" | "target" | "allow" | "warn" | "deny"
             | "derive"
             // `![sink]`: marks a method as consuming its receiver.
             // Tells move-check / drop-insertion to treat the call as moving
@@ -536,7 +537,12 @@ type struct DirectiveProcessingPasses {
                 }
             }
 
-            "link" => {
+            // `![link("lib")]` names a library to link (block-level); `![symbol("sym")]`
+            // overrides a function/method's linker symbol name (the C++ binding
+            // generator pins an Itanium mangled symbol this way).  Both take a single
+            // string-literal argument, so they share the shape check here; their
+            // effects diverge in `apply_effects`.
+            "link" | "symbol" => {
                 if (argc != 1) {
                     DirectiveProcessingPasses::emit_arity_error(ctx, dir, name, 1, argc);
                     return;
@@ -646,7 +652,7 @@ type struct DirectiveProcessingPasses {
                 mut cands: string[] = [
                     "inline", "noinline", "entry", "test", "ignore",
                     "should_panic", "config", "deprecated", "align",
-                    "repr", "link", "target", "allow", "warn", "deny",
+                    "repr", "link", "symbol", "target", "allow", "warn", "deny",
                     "derive", "sink", "implicit", "functions_only",
                     "windows", "linux", "macos", "unix", "not"
                 ];
@@ -891,9 +897,12 @@ type struct DirectiveProcessingPasses {
                 fn.is_implicit = true;
                 return;
             }
-            if (name.eq("link")) {
-                // The validator already checked arity (1) and that the arg is
-                // a string literal; record the override for codegen.
+            if (name.eq("symbol")) {
+                // `![symbol("sym")]` overrides the linker symbol of an extern
+                // function (e.g. the C++ binding generator pins an Itanium mangled
+                // name).  The validator already checked arity (1) and string-lit
+                // shape; record the override for codegen.  (Stored in `link_name`,
+                // the long-standing field name for "the symbol this links as".)
                 if (dir.args.length == 1
                         && dir.args[0].kind == DirectiveArgKind::StringLit) {
                     fn.link_name     = dir.args[0].str_value;
@@ -986,12 +995,12 @@ type struct DirectiveProcessingPasses {
                 }
                 return;
             }
-            // `![link("sym")]` on a method: pin the LLVM symbol of the wrapped
+            // `![symbol("sym")]` on a method: pin the LLVM symbol of the wrapped
             // FunctionDeclNode, which is what codegen's declare_method reads.
             // Used by the C++ binding generator to bind a non-virtual C++ method
             // to its mangled Itanium symbol (`_ZNK5Point3sumEv`) while Cryo
             // callers still resolve through the method's source name.
-            if (name.eq("link")) {
+            if (name.eq("symbol")) {
                 if (m.func != null
                         && dir.args.length == 1
                         && dir.args[0].kind == DirectiveArgKind::StringLit) {
@@ -1224,7 +1233,7 @@ type struct DirectiveProcessingPasses {
             }
 
             // Descend into extern-block functions so per-function directives
-            // like `![link("sym")]` are validated + applied; the block is the
+            // like `![symbol("sym")]` are validated + applied; the block is the
             // top-level statement, its functions aren't otherwise visited here.
             if (decl.kind == NodeKind::ExternBlock) {
                 const eb: ExternBlockNode* = decl as ExternBlockNode*;
