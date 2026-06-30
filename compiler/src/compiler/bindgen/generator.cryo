@@ -76,7 +76,7 @@ import std::collections::str;
 /// (which lowers to a pointer) instead of being skipped — so `*_vappendf`-style
 /// functions BIND and are callable by forwarding a Cryo variadic function's
 /// `args`.  The earlier skip+report is gone.
-const GENERATOR_VERSION: i64 = 12;
+const GENERATOR_VERSION: i64 = 15;
 
 /// Renders bindgen-emitted AST decls to `.cryo` source under `namespace ns`.
 type struct BindingSerializer {
@@ -92,7 +92,8 @@ type struct BindingSerializer {
     /// Render the full binding file for `root` (top-level type decls) plus
     /// `extern_node` (the C functions) under `namespace ns`.
     static render(ctx: CompilationContext*, ns: string,
-                  root: ProgramNode*, extern_node: ExternBlockNode*) -> string {
+                  root: ProgramNode*, extern_node: ExternBlockNode*,
+                  report: ImportReport*) -> string {
         mut buf: String = String::new();
         mut s: BindingSerializer = BindingSerializer {
             ctx: ctx, ns: ns, out: &buf,
@@ -113,15 +114,36 @@ type struct BindingSerializer {
             s.render_decl(node);
         }
 
-        // Extern functions, deduped by name.
+        // Extern functions, deduped by name.  A Cryo binding namespaces every
+        // function under one flat `namespace`, and a single Cryo name binds a
+        // single linker symbol — so a C++ OVERLOAD (`add(int)` + `add(double)`)
+        // or a cross-namespace leaf-name COLLISION (`demo::twice` +
+        // `demo::math::twice`) can only keep ONE.  Keep the first; for any later
+        // same-name function whose linker symbol DIFFERS (a genuine distinct
+        // function being lost, not a benign re-declaration of the same symbol),
+        // record it in the honesty report instead of dropping it silently.
         if (extern_node.functions.length > 0) {
-            mut seen_fn: string[] = [];
+            mut seen_fn:  string[] = [];
+            mut seen_sym: string[] = [];   // parallel: kept symbol per seen name
             s.out.push_cstr("extern \"C\" {\n");
             for (mut i: i64 = 0; i < extern_node.functions.length; i++) {
                 const fnode: FunctionDeclNode* = extern_node.functions[i];
                 const fnm: string = s.ctx.intern_table.resolve(fnode.name);
-                if (BindingSerializer::contains(&seen_fn, fnm)) { continue; }
+                const sym: string = if (fnode.has_link_name) { fnode.link_name } else { fnm };
+                mut dup_at: i64 = -1;
+                for (mut k: i64 = 0; k < seen_fn.length; k++) {
+                    if (seen_fn[k].eq(fnm)) { dup_at = k; break; }
+                }
+                if (dup_at >= 0) {
+                    if (report != null && !seen_sym[dup_at].eq(sym)) {
+                        report.skip(format(
+                            "function `%s` (C++ overload or cross-namespace name collision; bound `%s`, dropped `%s`)",
+                            fnm, seen_sym[dup_at], sym));
+                    }
+                    continue;
+                }
                 seen_fn.push(fnm);
+                seen_sym.push(sym);
                 s.render_function(fnode);
             }
             s.out.push_cstr("}\n");
@@ -634,8 +656,12 @@ type struct VendorGenerator {
         if (parsed == 0) { return ""; }
         if (out_inputs != null) { VendorGenerator::dedup_in_place(out_inputs); }
 
+        // `render` reports any C++ overload / cross-namespace leaf-name
+        // collision it has to drop (one Cryo name can bind only one symbol),
+        // so the summary must print AFTER it, not before.
+        const out: string = BindingSerializer::render(&ctx, ns, root, extern_node, &report);
         report.summary_stdout(ns);
-        return BindingSerializer::render(&ctx, ns, root, extern_node);
+        return out;
     }
 
     /// The libclang version banner (e.g. "clang version 20.1.0"), or "" when
