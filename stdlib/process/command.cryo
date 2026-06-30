@@ -318,32 +318,59 @@ function build_argv(program: &String,
     return Result::Ok(());
 }
 
-/// Apply env overrides inside the child. `clear_env` wipes the
-/// inherited environment first. Called after fork, before exec.
+/// Build the child's environment overrides as NUL-terminated `KEY=VALUE`
+/// C strings, entirely in the PARENT (before `fork`).  This is the
+/// async-signal-safety counterpart to `build_argv`: the child must not
+/// allocate or call `setenv`/`clearenv` (none are async-signal-safe, and
+/// this stdlib ships `thread::spawn`, so a multi-threaded parent could
+/// fork a child that deadlocks on the malloc lock).  `storage` keeps the
+/// strings alive across the fork; `envp` aliases each one's `as_ptr()`
+/// and is NUL-terminated so the child can hand it straight to `execvpe`
+/// on the `clear_env` path.  The inherit path reads `storage` directly
+/// via `putenv` (which stores the pointer without copying).
 ![target(unix)]
-function apply_env(clear_env: boolean,
-                   envs: &Array<EnvEntry>) -> boolean {
-    if (clear_env) {
-        libc::clearenv();
-    }
+function build_envp(envs: &Array<EnvEntry>,
+                    storage: mut &Array<String>,
+                    envp: mut &ArgvBuf) -> Result<(), IoError> {
     mut i: u64 = 0;
     while (i < envs.length()) {
         match (envs.get_ref(i)) {
             Option::Some(entry) => {
-                // NUL-terminated heap copies; this is post-fork, single-
-                // threaded, so malloc is fine.  They drop at the end of
-                // each iteration.
-                mut key: String = String::from_str_c(entry.key.as_str());
-                mut value: String = String::from_str_c(entry.value.as_str());
-                if (libc::setenv(key.as_ptr(), value.as_ptr(), 1) < 0) {
-                    return false;
-                }
+                // "KEY=VALUE\0" — one heap string, the terminator kept in
+                // the buffer for `as_ptr()` (C reads up to the first NUL).
+                mut joined: String = String::new();
+                joined.push(entry.key.as_str());
+                joined.push('=' as u8);
+                joined.push(entry.value.as_str());
+                joined.push(0 as u8);
+                storage.push(joined);
             }
             Option::None => { break; }
         }
         i++;
     }
-    return true;
+    // Pointer array for `execvpe`: one slot per pair + a NULL terminator.
+    // Built after every push so `storage` no longer reallocates and the
+    // aliased `as_ptr()` pointers stay valid (the char buffers are heap-
+    // allocated separately from the moved String headers).
+    mut j: u64 = 0;
+    while (j < storage.length()) {
+        const slot: u8* = storage.get_ref(j).unwrap().as_ptr();
+        match (envp.push(slot)) {
+            Result::Ok(_) => { }
+            Result::Err(_) => {
+                return Result::Err(IoError::new(IoErrorKind::OutOfMemory, 0));
+            }
+        }
+        j++;
+    }
+    match (envp.push(null)) {
+        Result::Ok(_) => { }
+        Result::Err(_) => {
+            return Result::Err(IoError::new(IoErrorKind::OutOfMemory, 0));
+        }
+    }
+    return Result::Ok(());
 }
 
 ![target(unix)]
@@ -391,6 +418,22 @@ function spawn_impl(cmd: &Command) -> Result<Child, IoError> {
         Option::None => { }
     }
 
+    // 3b. Build the child environment in the parent (so the child needs no
+    // malloc / setenv / clearenv — none are async-signal-safe).  `envp` is
+    // only consumed on the clear-env path; the inherit path reads the
+    // `envp_storage` strings directly via `putenv` below.
+    mut envp_storage: Array<String> = Array::new();
+    mut envp: ArgvBuf = ArgvBuf::new();
+    match (build_envp(&cmd.envs, &envp_storage, &envp)) {
+        Result::Ok(_) => { }
+        Result::Err(err) => {
+            close_pipe(&stdin_pipe);
+            close_pipe(&stdout_pipe);
+            close_pipe(&stderr_pipe);
+            return Result::Err(err);
+        }
+    }
+
     // 4. fork.
     const pid: i32 = libc::fork();
     if (pid < 0) {
@@ -403,8 +446,11 @@ function spawn_impl(cmd: &Command) -> Result<Child, IoError> {
 
     if (pid == 0) {
         // -------- child --------
-        // Only async-signal-safe operations from here until exec or
-        // _exit. setenv/chdir/dup2/close/open/execvp are all safe.
+        // Only async-signal-safe operations from here until exec or _exit:
+        // chdir/dup2/close/open/putenv/execvp/execvpe are all safe.  The
+        // environment was assembled in the parent (`build_envp`) precisely
+        // so the child performs no allocation and never calls
+        // setenv/clearenv (which are NOT async-signal-safe).
         if (!child_remap(cmd.stdin_cfg, &stdin_pipe, 0, true)) { libc::_exit(127); }
         if (!child_remap(cmd.stdout_cfg, &stdout_pipe, 1, false)) { libc::_exit(127); }
         if (!child_remap(cmd.stderr_cfg, &stderr_pipe, 2, false)) { libc::_exit(127); }
@@ -417,9 +463,28 @@ function spawn_impl(cmd: &Command) -> Result<Child, IoError> {
             Option::None => { }
         }
 
-        if (!apply_env(cmd.clear_env_flag, &cmd.envs)) { libc::_exit(127); }
-
-        libc::execvp(argv.get(0), argv.as_ptr());
+        // Apply the environment, then exec.
+        //  - clear_env: replace the inherited environment wholesale by
+        //    handing the parent-built `envp` to `execvpe` (PATH search,
+        //    like execvp) — no clearenv, no per-var work in the child.
+        //  - inherit + overrides: `putenv` each pre-built "KEY=VALUE"
+        //    string (stored by pointer, not copied), then inherit the
+        //    rest via `execvp`.  `putenv` may grow the environ array once
+        //    when adding a key not already present; that single libc-
+        //    internal alloc is the only residual on the inherit path and
+        //    is unavoidable without enumerating the inherited environment
+        //    (which the stdlib does not yet expose).
+        //  - inherit, no overrides: plain `execvp`.
+        if (cmd.clear_env_flag) {
+            libc::execvpe(argv.get(0), argv.as_ptr(), envp.as_ptr());
+        } else {
+            mut ei: u64 = 0;
+            while (ei < envp_storage.length()) {
+                libc::putenv(envp_storage.get_ref(ei).unwrap().as_ptr());
+                ei = ei + 1;
+            }
+            libc::execvp(argv.get(0), argv.as_ptr());
+        }
         // If we got here, exec failed.
         libc::_exit(127);
     }

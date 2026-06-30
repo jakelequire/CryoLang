@@ -52,6 +52,13 @@ const LOCAL_MAX_FRAME_SIZE:      u32 = 16384;      // default; also our read cap
 // advertise this as SETTINGS_MAX_HEADER_LIST_SIZE and the decoder enforces
 // the matching decoded-size ceiling (hpack::MAX_DECODED_HEADER_LIST).
 const LOCAL_MAX_HEADER_LIST_SIZE: u32 = 262144;    // 256 KiB
+// Cap on an assembled DATA body (the sum of all DATA frame payloads on a
+// stream).  Without it a peer streams DATA frames without END_STREAM and
+// grows the buffer without bound (a remote memory-exhaustion DoS), because
+// `ack_data` replenishes the flow-control window after every frame.  Mirrors
+// the HTTP/1.1 `MAX_BODY` cap (16 MiB).  Checked at the top of the read loop,
+// so it overshoots by at most one frame before we stop replenishing and fail.
+const LOCAL_MAX_BODY_SIZE: u64 = 16777216;         // 16 MiB
 
 /// The connection-level flow-control window initial value is fixed at
 /// 65535 octets (RFC 7540 §6.9.2); it is not affected by SETTINGS.
@@ -371,9 +378,11 @@ type struct Http2Connection<S> {
         mut stream_done: boolean = false;
 
         while (!(headers_done && stream_done)) {
-            // Reject a CONTINUATION flood / oversized header block before
-            // reading more (overshoots by at most one frame).
-            if (block.length() > LOCAL_MAX_HEADER_LIST_SIZE as u64) {
+            // Reject a CONTINUATION flood / oversized header block, or a
+            // runaway DATA body, before reading more (each overshoots by at
+            // most one frame).
+            if (block.length() > LOCAL_MAX_HEADER_LIST_SIZE as u64
+                || body.length() > LOCAL_MAX_BODY_SIZE) {
                 block.drop(); body.drop();
                 return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
             }
@@ -465,9 +474,11 @@ type struct Http2Connection<S> {
         mut stream_done: boolean = false;
 
         while (!(have_stream && headers_done && stream_done)) {
-            // Reject a CONTINUATION flood / oversized header block before
-            // reading more (overshoots by at most one frame).
-            if (block.length() > LOCAL_MAX_HEADER_LIST_SIZE as u64) {
+            // Reject a CONTINUATION flood / oversized header block, or a
+            // runaway DATA body, before reading more (each overshoots by at
+            // most one frame).
+            if (block.length() > LOCAL_MAX_HEADER_LIST_SIZE as u64
+                || body.length() > LOCAL_MAX_BODY_SIZE) {
                 block.drop(); body.drop();
                 return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
             }

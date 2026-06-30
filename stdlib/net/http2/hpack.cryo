@@ -298,9 +298,13 @@ function decode_string(data: Slice<u8>, cur: mut &Cursor) -> Option<String> {
 
 type struct HpackDecoder {
     table: DynTable;
+    /// The largest dynamic-table size we permit a peer to select — the
+    /// `SETTINGS_HEADER_TABLE_SIZE` we advertised.  RFC 7541 §6.3 requires
+    /// rejecting a dynamic-table-size update that exceeds it.
+    hard_max: u64;
 
     static new(max_dynamic: u64) -> HpackDecoder {
-        return HpackDecoder { table: DynTable::new(max_dynamic) };
+        return HpackDecoder { table: DynTable::new(max_dynamic), hard_max: max_dynamic };
     }
 
     /// Decode a complete header block into a list of fields. Returns
@@ -341,11 +345,16 @@ type struct HpackDecoder {
                     Option::None        => { out.drop(); return Option::None; }
                 }
             } else if ((b & 0x20) != 0) {
-                // §6.3 Dynamic table size update.
+                // §6.3 Dynamic table size update.  RFC 7541 §6.3: the new
+                // size MUST NOT exceed the limit the decoder advertised
+                // (SETTINGS_HEADER_TABLE_SIZE); a larger value is a
+                // decoding error (and would otherwise let a peer inflate
+                // our per-connection table memory).
                 const new_max: u64 = match (decode_integer(data, &cur, 5)) {
                     Option::Some(n) => { n }
                     Option::None    => { out.drop(); return Option::None; }
                 };
+                if (new_max > this.hard_max) { out.drop(); return Option::None; }
                 this.table.set_max(new_max);
             } else {
                 // §6.2.2 / §6.2.3 Literal without indexing / never indexed.
