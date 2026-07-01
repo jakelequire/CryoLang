@@ -43,6 +43,16 @@ type struct MonoCallSpecializer {
     trait_spec:       MonoTraitSpecializer*;
     ast_resolver:     MonoAstResolver*;
     current_module:   SymbolStr;
+    // Transient owner context, set only while re-walking a generic static
+    // method's specialized body (finish_generic_static_method_spec): an
+    // owner-constructing struct literal (`Wrap { v: item }`) whose type the
+    // symbolic template walk left invalid is stamped with `gsm_owner_recv` (the
+    // concrete owner spec).  This runs after the whole-spec type-resolution pass
+    // that types a sibling like `Wrap::base`'s literal, which the late-added
+    // method spec misses.  Cleared (recv invalid) outside that re-walk.
+    gsm_owner_leaf:   SymbolStr;
+    gsm_owner_recv:   TypeRef;
+    gsm_owner_spec:   SymbolStr;
 
     static null() -> MonoCallSpecializer {
         return MonoCallSpecializer {
@@ -56,6 +66,9 @@ type struct MonoCallSpecializer {
             trait_spec:       null,
             ast_resolver:     null,
             current_module:   SymbolStr::empty(),
+            gsm_owner_leaf:   SymbolStr::empty(),
+            gsm_owner_recv:   TypeRef::invalid(),
+            gsm_owner_spec:   SymbolStr::empty(),
         };
     }
 
@@ -352,6 +365,30 @@ type struct MonoCallSpecializer {
             }
             NodeKind::StructLiteral => {
                 const sl: StructLiteralNode* = expr as StructLiteralNode*;
+                // Only while re-walking a generic-static-method's specialized body
+                // (gsm_owner_* set): concretize an owner-typed struct literal
+                // (`Wrap { v: item }`) whose type the symbolic template walk left
+                // bare/invalid.  Gated on `gsm_owner_recv` so the ordinary walk path
+                // is byte-identical to before.
+                if (this.gsm_owner_recv.is_valid()) {
+                    if (sl.struct_type.equals(this.gsm_owner_leaf)) {
+                        // Point the literal at the concrete owner spec by NAME and
+                        // type so the post-mono sema pass (Phase 6b) re-resolves it to
+                        // the spec (not the bare template), regardless of context.
+                        sl.set_resolved_type(this.gsm_owner_recv);
+                        if (this.gsm_owner_spec.is_valid()) {
+                            sl.struct_type = this.gsm_owner_spec;
+                        }
+                    } else if (subst != null && sl.resolved_type.is_valid()) {
+                        // A different generic type built in the body (`Pair<T>{..}`):
+                        // concretize via the active owner/method subst.
+                        const concrete: TypeRef = subst.apply(sl.resolved_type, this.arena);
+                        if (concrete.is_valid() && concrete.id != sl.resolved_type.id
+                                && !this.arena.contains_generic_param(concrete)) {
+                            sl.set_resolved_type(concrete);
+                        }
+                    }
+                }
                 for (mut i: i64 = 0; i < sl.field_inits.length; i++) {
                     this.walk_expr(sl.field_inits[i].value, res_ctx, subst);
                 }
@@ -1079,71 +1116,288 @@ type struct MonoCallSpecializer {
                 && entry.node_kind != NodeKind::ClassDeclaration) { return false; }
         if (entry.param_count == 0 || entry.ast_node == null) { return false; }
 
-        // The owner's type args come from sema's stash (declaration order).
-        if (call.resolved_type_args.length != entry.param_type_ids.length) { return false; }
-        mut binds: TypeRef[] = [];
-        for (mut i: i64 = 0; i < call.resolved_type_args.length; i++) {
+        // Locate the matching static method(s) on the owner (instance methods
+        // route through specialize_method_call instead).  A non-generic method is
+        // handled by the owner-only path below (its stash is the OWNER's type args,
+        // and the owner drain materializes its body).  A generic method
+        // (`Wrap<A>::make<T>`) needs its OWN `<T>` specialized within the owner
+        // spec — the stash is the METHOD's `<T>`; owner args come from the scope
+        // turbofish or template defaults.
+        const empty_methods: MethodNode*[] = [];
+        mut methods: &MethodNode*[] = &empty_methods;
+        if (entry.node_kind == NodeKind::StructDeclaration) { methods = &(entry.ast_node as StructDeclNode*).methods; }
+        else if (entry.node_kind == NodeKind::UnionDeclaration) { methods = &(entry.ast_node as UnionDeclNode*).methods; }
+        else if (entry.node_kind == NodeKind::ClassDeclaration) { methods = &(entry.ast_node as ClassDeclNode*).methods; }
+        else { return false; }
+        mut matched_nongeneric: MethodNode* = null;
+        mut matched_generic: MethodNode* = null;
+        for (mut i: i64 = 0; i < methods.length; i++) {
+            const m: MethodNode* = methods[i];
+            if (m == null || m.func == null || !m.is_static) { continue; }
+            if (!m.func.name.equals(scope.member_name)) { continue; }
+            if (m.func.generic_params.length == 0) {
+                if (matched_nongeneric == null) { matched_nongeneric = m; }
+            } else {
+                if (matched_generic == null) { matched_generic = m; }
+            }
+        }
+
+        // --- Non-generic static method on a generic owner (existing path) ---
+        if (matched_nongeneric != null) {
+            // The owner's type args come from sema's stash (declaration order).
+            if (call.resolved_type_args.length != entry.param_type_ids.length) { return false; }
+            mut binds: TypeRef[] = [];
+            for (mut i: i64 = 0; i < call.resolved_type_args.length; i++) {
+                mut b: TypeRef = call.resolved_type_args[i];
+                if (subst != null) { b = subst.apply(b, this.arena); }
+                if (!b.is_valid() || this.arena.contains_generic_param(b)) { return false; }
+                binds.push(b);
+            }
+
+            // Build the spec'd owner name (bare entry.name so it matches how
+            // ASTSpecializer registers the spec'd struct) + the combined callee key.
+            const base_qname: QualifiedName = QualifiedName::from_symbol(entry.name);
+            const spec_name_sym: SymbolStr = MangledName::specialized_identifier(
+                this.intern_table, this.arena, base_qname, binds);
+            if (!spec_name_sym.is_valid()) { return false; }
+            const spec_name_str: string = this.intern_table.resolve(spec_name_sym);
+            const qualified_owner: SymbolStr = this.qualify_spec_name(entry, spec_name_str);
+            const owner_str: string = this.intern_table.resolve(qualified_owner);
+            const member_str: string = this.intern_table.resolve(scope.member_name);
+            const combined_sym: SymbolStr = this.intern_table.intern(
+                format("%s::%s", owner_str, member_str));
+
+            // Instantiate the owner + enqueue (the drain materializes its methods).
+            const inst_ref: TypeRef = registry.instantiate_for_module(
+                entry.base_type, binds, this.current_module);
+            if (!inst_ref.is_valid()) { return false; }
+            this.state.enqueue_from_type_ref(inst_ref);
+            call.set_resolved_callee(combined_sym);
+            return true;
+        }
+
+        // --- Generic static method on a generic owner (`Wrap<A>::make<T>`) ---
+        if (matched_generic != null) {
+            return this.specialize_generic_static_method(call, scope, entry, matched_generic, subst);
+        }
+        return false;
+    }
+
+    /// Specialize a call to a GENERIC static method on a GENERIC owner
+    /// (`Wrap<A>::make<T>(item)`).  The owner spec is materialized (via the
+    /// scope turbofish / template defaults) and the method's OWN `<T>` (sema's
+    /// stash) is specialized WITHIN that owner spec — exactly how an instance
+    /// generic method (`push<T>`) is handled, with the owner-default instantiation
+    /// standing in for the receiver.  Returns true when the call is claimed.  On
+    /// the first walk the owner spec entry does not exist yet: the owner is
+    /// enqueued and the call is left UNPINNED so the walk/drain fixpoint
+    /// (specialization.cryo) re-visits it once the entry materializes.
+    specialize_generic_static_method(mut &this, call: CallExprNode*, scope: ScopeResolutionNode*,
+                                     entry: TemplateEntry*, orig_method: MethodNode*,
+                                     subst: TypeSubstitution*) -> boolean {
+        const registry: GenericRegistry* = this.generic_registry;
+        if (registry == null) { return false; }
+
+        // Method binds: sema stashed the method's OWN `<T>` (declaration order).
+        const n_method: i64 = orig_method.func.generic_params.length;
+        if (n_method == 0) { return false; }
+        if (call.resolved_type_args.length != n_method) { return false; }
+        mut method_binds: TypeRef[] = [];
+        for (mut i: i64 = 0; i < n_method; i++) {
             mut b: TypeRef = call.resolved_type_args[i];
             if (subst != null) { b = subst.apply(b, this.arena); }
             if (!b.is_valid() || this.arena.contains_generic_param(b)) { return false; }
-            binds.push(b);
+            method_binds.push(b);
         }
 
-        // Confirm a matching non-generic static method on the owner (instance
-        // methods route through specialize_method_call instead).
-        mut found_static: boolean = false;
-        if (entry.node_kind == NodeKind::StructDeclaration) {
-            const sn: StructDeclNode* = entry.ast_node as StructDeclNode*;
-            for (mut i: i64 = 0; i < sn.methods.length; i++) {
-                const m: MethodNode* = sn.methods[i];
-                if (m == null || m.func == null) { continue; }
-                if (!m.func.name.equals(scope.member_name)) { continue; }
-                if (m.func.generic_params.length > 0) { continue; }
-                if (m.is_static) { found_static = true; }
-                break;
-            }
-        } else if (entry.node_kind == NodeKind::UnionDeclaration) {
-            const un: UnionDeclNode* = entry.ast_node as UnionDeclNode*;
-            for (mut i: i64 = 0; i < un.methods.length; i++) {
-                const m: MethodNode* = un.methods[i];
-                if (m == null || m.func == null) { continue; }
-                if (!m.func.name.equals(scope.member_name)) { continue; }
-                if (m.func.generic_params.length > 0) { continue; }
-                if (m.is_static) { found_static = true; }
-                break;
-            }
-        } else {
-            const cn: ClassDeclNode* = entry.ast_node as ClassDeclNode*;
-            for (mut i: i64 = 0; i < cn.methods.length; i++) {
-                const m: MethodNode* = cn.methods[i];
-                if (m == null || m.func == null) { continue; }
-                if (!m.func.name.equals(scope.member_name)) { continue; }
-                if (m.func.generic_params.length > 0) { continue; }
-                if (m.is_static) { found_static = true; }
-                break;
-            }
-        }
-        if (!found_static) { return false; }
+        // Owner binds: scope turbofish, else template defaults.
+        mut owner_binds: TypeRef[] = this.compute_owner_default_binds(scope, entry, subst);
+        if (owner_binds.length != entry.param_type_ids.length) { return false; }
 
-        // Build the spec'd owner name (bare entry.name so it matches how
-        // ASTSpecializer registers the spec'd struct) + the combined callee key.
-        const base_qname: QualifiedName = QualifiedName::from_symbol(entry.name);
-        const spec_name_sym: SymbolStr = MangledName::specialized_identifier(
-            this.intern_table, this.arena, base_qname, binds);
-        if (!spec_name_sym.is_valid()) { return false; }
-        const spec_name_str: string = this.intern_table.resolve(spec_name_sym);
-        const qualified_owner: SymbolStr = this.qualify_spec_name(entry, spec_name_str);
-        const owner_str: string = this.intern_table.resolve(qualified_owner);
-        const member_str: string = this.intern_table.resolve(scope.member_name);
-        const combined_sym: SymbolStr = this.intern_table.intern(
-            format("%s::%s", owner_str, member_str));
-
-        // Instantiate the owner + enqueue (the drain materializes its methods).
+        // Materialize the owner instantiation.
         const inst_ref: TypeRef = registry.instantiate_for_module(
-            entry.base_type, binds, this.current_module);
+            entry.base_type, owner_binds, this.current_module);
         if (!inst_ref.is_valid()) { return false; }
-        this.state.enqueue_from_type_ref(inst_ref);
-        call.set_resolved_callee(combined_sym);
+
+        // Find the owner spec entry.  On the first walk it does not exist yet:
+        // enqueue it and leave the call unpinned for the next fixpoint iteration.
+        mut spec_entry: SpecializationEntry* = this.find_owner_spec_entry(inst_ref);
+        if (spec_entry == null) {
+            this.state.enqueue_from_type_ref(inst_ref);
+            return true;
+        }
+        return this.finish_generic_static_method_spec(
+            call, spec_entry, entry, orig_method, &method_binds);
+    }
+
+    /// Owner type args for a generic-owner static call in mono: explicit scope
+    /// turbofish (`Wrap<u8>::make`) if present, else all-default (`Wrap` ->
+    /// `Wrap<i32>`).  Mirrors sema's `compute_generic_static_owner_binds`.
+    compute_owner_default_binds(mut &this, scope: ScopeResolutionNode*,
+                                entry: TemplateEntry*, subst: TypeSubstitution*) -> TypeRef[] {
+        const want: i64 = entry.param_type_ids.length;
+        if (want == 0) { return []; }
+        if (this.type_resolver == null) { return []; }
+        const _m: string = "";
+        mut rc: ResolutionContext = ResolutionContext::new(_m, _m);
+        mut binds: TypeRef[] = [];
+        for (mut i: i64 = 0; i < scope.scope_generic_args.length; i++) {
+            mut tr: TypeRef = this.type_resolver.resolve(scope.scope_generic_args[i], &rc);
+            if (subst != null) { tr = subst.apply(tr, this.arena); }
+            if (!tr.is_valid()) { return []; }
+            binds.push(tr);
+        }
+        if (binds.length < want) {
+            binds = this.type_resolver.expand_default_type_args(entry, binds, &rc);
+        }
+        if (binds.length != want) { return []; }
+        for (mut i: i64 = 0; i < binds.length; i++) {
+            if (!binds[i].is_valid() || this.arena.contains_generic_param(binds[i])) { return []; }
+        }
+        return binds;
+    }
+
+    /// Find the materialized owner spec entry for an owner instantiation
+    /// (display-equal on `instantiated_type`, matching the instance-method path).
+    find_owner_spec_entry(&this, owner_inst: TypeRef) -> SpecializationEntry* {
+        for (mut i: i64 = 0; i < this.state.spec_entries.length; i++) {
+            const e: SpecializationEntry* = &this.state.spec_entries[i];
+            if (!e.instantiated_type.is_valid() || !e.specialized_type.is_valid()) { continue; }
+            if (e.instantiated_type.id == owner_inst.id
+                    || this.arena.display_equal(e.instantiated_type.id, owner_inst.id)) {
+                return e;
+            }
+        }
+        return null;
+    }
+
+    /// Specialize `orig_method`'s own `<T>` into the already-materialized owner
+    /// spec entry and pin the `$MG`-disambiguated callee.  This is the static
+    /// analogue of the inherent tail of `specialize_method_call`: the owner spec's
+    /// concrete type stands in for the receiver, binding the owner's `A` in the
+    /// body (add_owner_param_bindings), and the method's `<T>` is substituted +
+    /// its `static match` reduced to the live arm.
+    finish_generic_static_method_spec(mut &this, call: CallExprNode*,
+                                      spec_entry: SpecializationEntry*, owner_entry: TemplateEntry*,
+                                      orig_method: MethodNode*,
+                                      method_binds: &TypeRef[]) -> boolean {
+        const recv_type: TypeRef = spec_entry.specialized_type;
+        mut owner_ast: ASTNode* = spec_entry.ast_node;
+        if (!recv_type.is_valid() || owner_ast == null) { return false; }
+        if (orig_method.func == null) { return false; }
+
+        mut method_param_names: SymbolStr[] = [];
+        for (mut i: i64 = 0; i < orig_method.func.generic_params.length; i++) {
+            const gp: GenericParamNode* = orig_method.func.generic_params[i];
+            if (gp == null) { return false; }
+            method_param_names.push(gp.name);
+        }
+        if (method_param_names.length != method_binds.length) { return false; }
+
+        const spec_method: MethodNode* = this.specialize_method(
+            orig_method, &method_param_names, method_binds, recv_type, null);
+        if (spec_method == null || spec_method.func == null) { return false; }
+        spec_method.func.set_self_returning_default(false);
+
+        // A `-> Owner` (bare-template) return substitutes to the still-bare owner
+        // template (0-field layout), while the body constructs the concrete owner
+        // spec — an ABI mismatch that returns garbage (and trips E0200 in the
+        // post-mono sema pass).  Remap a bare-owner return to the concrete owner
+        // spec, matching how a NON-generic sibling (`Wrap::base`) resolves.  Done
+        // BEFORE the `$MG`/mangle step so the emitted symbol carries the right
+        // return type.  (Nested owner returns like `Result<Owner, E>` are
+        // concretized by the substituter and are unaffected.)
+        if (owner_entry != null
+                && spec_method.func.resolved_return_type.id == owner_entry.base_type.id) {
+            spec_method.func.set_resolved_return_type(recv_type);
+        }
+
+        // Stamp the concrete method type args so the spec's mangled symbol carries
+        // the `$MG…` disambiguator (two specs whose signature doesn't mention the
+        // method param — `make<i32>` vs `make<boolean>` returning the owner — would
+        // otherwise mangle identically and collapse onto the first emitted spec).
+        mut spec_args_owned: TypeRef[] = [];
+        for (mut i: i64 = 0; i < method_binds.length; i++) { spec_args_owned.push(method_binds[i]); }
+        spec_method.func.set_spec_type_args(spec_args_owned);
+
+        // Reduce the freshly-minted body's `static match (T)` to the live arm
+        // (T is concrete now), then re-resolve the body's type annotations against
+        // the CONCRETE owner + method binds.  Without this, an owner-typed struct
+        // literal in the body (`Wrap { v: item }`) keeps the bare template type the
+        // symbolic template walk gave it and codegen reports E0638 ("no slot").
+        // This mirrors owner materialization (resolve_specialized_ast), which is
+        // why a NON-generic sibling like `Wrap::base` concretizes but this fresh
+        // method spec would not.
+        if (spec_method.func.body != null && this.ast_resolver != null) {
+            const _pm: string = "";
+            mut prune_ctx: ResolutionContext = ResolutionContext::new(_pm, _pm);
+            if (recv_type.is_valid()) { prune_ctx.set_this_type(recv_type); }
+            this.ast_resolver.prune_static_match_in_block(spec_method.func.body, &prune_ctx);
+
+            mut full_subst: TypeSubstitution = TypeSubstitution::empty();
+            this.add_owner_param_bindings(&full_subst, recv_type);
+            for (mut i: i64 = 0; i < method_param_names.length; i++) {
+                const pref: TypeRef = this.arena.create_generic_param(method_param_names[i], i as u64);
+                full_subst.add(pref.id, method_binds[i]);
+            }
+            mut body_mod: string = "";
+            if (owner_entry != null && owner_entry.module_name.is_valid()) {
+                body_mod = this.intern_table.resolve(owner_entry.module_name);
+            }
+            mut body_ctx: ResolutionContext = ResolutionContext::new(body_mod, "");
+            this.ast_resolver.resolve_func_and_body(spec_method.func, &body_ctx, &full_subst, recv_type);
+        }
+
+        // Dedup: materialize once per (owner spec, method, bindings).
+        const pin_target: SymbolStr = this.arena.get_qualified_name(recv_type);
+        const spec_sym: SymbolStr = this.mangled_symbol_for_spec_method(spec_method, pin_target);
+        if (this.state.method_spec_seen(spec_sym)) {
+            call.set_resolved_method(spec_method as ASTNode*);
+            if (spec_sym.is_valid()) { call.set_resolved_callee(spec_sym); }
+            return true;
+        }
+        this.state.mark_method_spec(spec_sym);
+
+        // Route the spec'd method onto the owner spec entry's AST so codegen emits
+        // it (the generic template AST is skipped by codegen — generic_params > 0).
+        if (owner_ast.kind == NodeKind::StructDeclaration) {
+            (owner_ast as StructDeclNode*).methods.push(spec_method);
+        } else if (owner_ast.kind == NodeKind::UnionDeclaration) {
+            (owner_ast as UnionDeclNode*).methods.push(spec_method);
+        } else if (owner_ast.kind == NodeKind::ClassDeclaration) {
+            (owner_ast as ClassDeclNode*).methods.push(spec_method);
+        } else {
+            return false;
+        }
+        call.set_resolved_method(spec_method as ASTNode*);
+        this.register_spec_method_in_di_inherent(spec_method, recv_type, owner_ast);
+        if (spec_sym.is_valid()) { call.set_resolved_callee(spec_sym); }
+
+        // Re-walk the body for its own generic calls with the owner param bound
+        // (`A` -> concrete) so nested owner-typed calls (`Wrap::base(item)`)
+        // resolve against the owner spec.
+        if (spec_method.func.body != null) {
+            const _empty: string = "";
+            mut rw_ctx: ResolutionContext = ResolutionContext::new(_empty, _empty);
+            mut owner_subst: TypeSubstitution = TypeSubstitution::empty();
+            this.add_owner_param_bindings(&owner_subst, recv_type);
+            // Publish the owner context so walk_expr can stamp owner-constructing
+            // struct literals whose type the symbolic walk left invalid.
+            const saved_leaf: SymbolStr = this.gsm_owner_leaf;
+            const saved_recv: TypeRef = this.gsm_owner_recv;
+            const saved_spec: SymbolStr = this.gsm_owner_spec;
+            this.gsm_owner_leaf = if (owner_entry != null) { owner_entry.name } else { SymbolStr::empty() };
+            this.gsm_owner_recv = recv_type;
+            this.gsm_owner_spec = this.arena.get_qualified_name(recv_type);
+            if (owner_subst.is_empty()) {
+                this.walk_block(spec_method.func.body, &rw_ctx, null);
+            } else {
+                this.walk_block(spec_method.func.body, &rw_ctx, &owner_subst);
+            }
+            this.gsm_owner_leaf = saved_leaf;
+            this.gsm_owner_recv = saved_recv;
+            this.gsm_owner_spec = saved_spec;
+        }
         return true;
     }
 

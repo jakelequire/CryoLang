@@ -2304,6 +2304,14 @@ type struct CallResolver {
     /// -> template).  The template path carries pre-mono re-derivation.
     try_resolve_static_method(mut &this, scope: ScopeResolutionNode*, lookup_sym: SymbolStr,
                               call: CallExprNode*) -> TypeRef {
+        // A GENERIC static method on a GENERIC owner (`Wrap<A>::make<T>`,
+        // `String<A>::from<T>`) is the static analogue of the instance
+        // generic-method path: sema infers the method's OWN `<T>` + stashes it,
+        // resolves the return, and leaves the callee UNPINNED for mono to specialize
+        // (specialize_static_method_on_generic_owner).  Handled before the
+        // owner-only stash / DI-return branches below, which bail on generic methods.
+        const gsm_ret: TypeRef = this.try_resolve_generic_static_method(scope, call);
+        if (gsm_ret.is_valid()) { return gsm_ret; }
         // Stash the owner's concrete type args for mono BEFORE the return-type
         // resolution below.  The stash must be produced on EVERY path: when the
         // return type resolves via the DI `lookup_method_return` branch (next
@@ -2355,6 +2363,192 @@ type struct CallResolver {
             return tmpl_ret;
         }
         return TypeRef::invalid();
+    }
+
+    /// Resolve a call to a GENERIC static method on a GENERIC-owner template
+    /// (`Wrap<A>::make<T>(item)`, `String<A>::from<T>(item)`) — the static analogue
+    /// of the instance generic-method path.  Infers the method's OWN `<T>` from the
+    /// call (turbofish or argument types), stashes it for mono, then resolves the
+    /// return type by substituting the owner's args (turbofish or defaults) AND the
+    /// method's `<T>` into the method's abstract return.  The callee is deliberately
+    /// LEFT UNPINNED — the monomorphizer materializes the owner spec, specializes
+    /// the method, and pins the `$MG`-disambiguated symbol
+    /// (specialize_static_method_on_generic_owner).  Returns invalid (falls through
+    /// to the non-generic static paths) unless `scope` is a registered generic owner
+    /// with exactly one matching GENERIC static method whose `<T>` fully infers.
+    try_resolve_generic_static_method(mut &this, scope: ScopeResolutionNode*,
+                                      call: CallExprNode*) -> TypeRef {
+        if (call == null || scope == null) { return TypeRef::invalid(); }
+        if (this.ctx.generic_registry == null || this.ctx.type_resolver == null) {
+            return TypeRef::invalid();
+        }
+        mut tmpl: TemplateEntry* = this.ctx.generic_registry.get_template(scope.scope_name);
+        if (tmpl == null && this.ctx.decl_index != null) {
+            const q: SymbolStr = this.ctx.decl_index.resolve_qualified(scope.scope_name);
+            if (q.is_valid() && !q.equals(scope.scope_name)) {
+                tmpl = this.ctx.generic_registry.get_template(q);
+            }
+        }
+        if (tmpl == null || tmpl.ast_node == null) { return TypeRef::invalid(); }
+        if (tmpl.param_type_ids.length == 0) { return TypeRef::invalid(); }
+
+        const empty_methods: MethodNode*[] = [];
+        mut methods: &MethodNode*[] = &empty_methods;
+        if (tmpl.node_kind == NodeKind::StructDeclaration) { methods = &(tmpl.ast_node as StructDeclNode*).methods; }
+        else if (tmpl.node_kind == NodeKind::UnionDeclaration) { methods = &(tmpl.ast_node as UnionDeclNode*).methods; }
+        else if (tmpl.node_kind == NodeKind::ClassDeclaration) { methods = &(tmpl.ast_node as ClassDeclNode*).methods; }
+        else { return TypeRef::invalid(); }
+
+        mut matched: MethodNode* = null;
+        mut found_count: i64 = 0;
+        for (mut i: i64 = 0; i < methods.length; i++) {
+            const m: MethodNode* = methods[i];
+            if (m == null || m.func == null || !m.is_static) { continue; }
+            if (!m.func.name.equals(scope.member_name)) { continue; }
+            // A non-generic static method with this name is handled by the existing
+            // owner-only path; defer to it rather than risk a wrong interception.
+            if (m.func.generic_params.length == 0) { return TypeRef::invalid(); }
+            found_count += 1;
+            matched = m;
+        }
+        if (found_count != 1 || matched == null) { return TypeRef::invalid(); }
+        if (!matched.func.resolved_return_type.is_valid()) { return TypeRef::invalid(); }
+
+        // Infer the method's OWN `<T>` (turbofish -> argument types).
+        mut method_binds: TypeRef[] = this.infer_generic_method_bindings(call, scope, matched.func);
+        if (method_binds.length != matched.func.generic_params.length) { return TypeRef::invalid(); }
+        for (mut i: i64 = 0; i < method_binds.length; i++) {
+            if (!method_binds[i].is_valid() || this.types.contains_generic_param(method_binds[i])) {
+                return TypeRef::invalid();
+            }
+        }
+
+        // Owner args: explicit scope turbofish, else all-defaults.
+        mut owner_binds: TypeRef[] = this.compute_generic_static_owner_binds(scope, tmpl);
+        if (owner_binds.length != tmpl.param_type_ids.length) { return TypeRef::invalid(); }
+
+        // Stash the METHOD binds for mono (mono derives owner binds itself from the
+        // scope turbofish / defaults, exactly as here).
+        if (call.resolved_type_args.length == 0) {
+            mut stash: TypeRef[] = [];
+            for (mut i: i64 = 0; i < method_binds.length; i++) { stash.push(method_binds[i]); }
+            call.set_resolved_type_args(stash);
+        }
+
+        // Resolve the return type: substitute owner params (declaration order) AND
+        // the method's `<T>` (name+index-keyed, matching specialize_method's ids).
+        mut subst: TypeSubstitution = TypeSubstitution::from_params(tmpl.param_type_ids, owner_binds);
+        for (mut i: i64 = 0; i < matched.func.generic_params.length; i++) {
+            const gp: GenericParamNode* = matched.func.generic_params[i];
+            if (gp == null) { return TypeRef::invalid(); }
+            const pref: TypeRef = this.arena.create_generic_param(gp.name, i as u64);
+            subst.add(pref.id, method_binds[i]);
+        }
+        mut ret: TypeRef = subst.apply(matched.func.resolved_return_type, this.arena);
+        if (!ret.is_valid()) { return TypeRef::invalid(); }
+        // A bare-owner return (`-> Wrap`) substitutes to the still-bare owner
+        // TEMPLATE (a 0-field layout).  The caller and the specialized method body
+        // both use the CONCRETE owner spec, so return that instantiation instead —
+        // otherwise the call site's ABI (bare template) diverges from the callee's
+        // (concrete spec) and the returned value is garbage.  (Mono applies the same
+        // remap to the spec method's declared return type.)
+        if (ret.id == tmpl.base_type.id) {
+            const inst: TypeRef = this.arena.create_instantiation(tmpl.base_type, owner_binds);
+            if (inst.is_valid()) { ret = inst; }
+        }
+        scope.set_resolved_type(ret);
+        // Deliberately DO NOT pin resolved_callee: mono pins the `$MG` spec symbol.
+        return ret;
+    }
+
+    /// Infer a generic METHOD's own type args from an explicit turbofish
+    /// (`make<i32>(..)`) or, failing that, from the argument types — the method
+    /// analogue of `infer_free_call_bindings`.  Returns a length-`generic_params`
+    /// all-valid array, or `[]` when inference is incomplete.
+    infer_generic_method_bindings(mut &this, call: CallExprNode*, scope: ScopeResolutionNode*,
+                                  func: FunctionDeclNode*) -> TypeRef[] {
+        mut empty: TypeRef[] = [];
+        const n: i64 = func.generic_params.length;
+        if (n == 0) { return empty; }
+        mut pids: u64[] = [];
+        for (mut i: i64 = 0; i < n; i++) {
+            const gp: GenericParamNode* = func.generic_params[i];
+            if (gp == null) { return empty; }
+            const pref: TypeRef = this.arena.create_generic_param(gp.name, i as u64);
+            pids.push(pref.id);
+        }
+        // Explicit turbofish on the member (`Wrap::make<i32>(..)`).
+        mut targs: &TypeAnnotation*[] = &call.generic_args;
+        if (targs.length == 0 && scope.generic_args.length > 0) { targs = &scope.generic_args; }
+        if (targs.length > 0) {
+            if (targs.length != n) { return empty; }
+            mut rc: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
+            this.symbolic.symbolic_bind_params(&rc);
+            mut binds: TypeRef[] = [];
+            for (mut i: i64 = 0; i < targs.length; i++) {
+                const tr: TypeRef = this.ctx.type_resolver.resolve(targs[i], &rc);
+                if (!tr.is_valid()) { return empty; }
+                binds.push(tr);
+            }
+            return binds;
+        }
+        // Inference from concrete argument types.
+        if (func.parameters.length != call.arguments.length) { return empty; }
+        mut ictx: InferCtx = InferCtx::for_template(this.arena, pids);
+        for (mut i: i64 = 0; i < call.arguments.length; i++) {
+            const param: VarDeclNode* = func.parameters[i];
+            if (param == null || !param.resolved_type.is_valid()) { continue; }
+            const arg: ExpressionNode* = call.arguments[i];
+            if (this.sema_arg_is_polymorphic_literal(arg)) { continue; }
+            if (!this.free_infer_arg_reliable(arg)) { continue; }
+            const actual: TypeRef = arg.resolved_type;
+            if (!actual.is_valid()) { continue; }
+            ictx.unify(param.resolved_type, actual);
+        }
+        // Polymorphic literals second (fill only still-unbound params).
+        for (mut i: i64 = 0; i < call.arguments.length; i++) {
+            const param: VarDeclNode* = func.parameters[i];
+            if (param == null || !param.resolved_type.is_valid()) { continue; }
+            const arg: ExpressionNode* = call.arguments[i];
+            if (!this.sema_arg_is_polymorphic_literal(arg)) { continue; }
+            const lit_actual: TypeRef = arg.resolved_type;
+            if (!lit_actual.is_valid()) { continue; }
+            const f_idx: i64 = ictx.binding_index(param.resolved_type.id);
+            if (f_idx >= 0 && ictx.bindings[f_idx].is_valid()) { continue; }
+            ictx.unify(param.resolved_type, lit_actual);
+        }
+        mut bindings: TypeRef[] = [];
+        for (mut i: i64 = 0; i < ictx.bindings.length; i++) { bindings.push(ictx.bindings[i]); }
+        for (mut i: i64 = 0; i < bindings.length; i++) {
+            if (!bindings[i].is_valid()) { return empty; }
+        }
+        return bindings;
+    }
+
+    /// Owner type args for a generic-owner static call: explicit scope turbofish
+    /// (`Wrap<u8>::make`) if present, else all-default (`Wrap` -> `Wrap<i32>`).
+    /// Owner args are NOT inferred from the arguments here — those determine the
+    /// METHOD's `<T>`, not the owner's params.
+    compute_generic_static_owner_binds(mut &this, scope: ScopeResolutionNode*,
+                                       tmpl: TemplateEntry*) -> TypeRef[] {
+        const want: i64 = tmpl.param_type_ids.length;
+        if (want == 0) { return []; }
+        mut rc: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
+        this.symbolic.symbolic_bind_params(&rc);
+        mut sb: TypeRef[] = [];
+        for (mut i: i64 = 0; i < scope.scope_generic_args.length; i++) {
+            const tr: TypeRef = this.ctx.type_resolver.resolve(scope.scope_generic_args[i], &rc);
+            if (!tr.is_valid()) { return []; }
+            sb.push(tr);
+        }
+        if (sb.length < want) {
+            sb = this.ctx.type_resolver.expand_default_type_args(tmpl, sb, &rc);
+        }
+        if (sb.length != want) { return []; }
+        for (mut i: i64 = 0; i < sb.length; i++) {
+            if (!sb[i].is_valid() || this.types.contains_generic_param(sb[i])) { return []; }
+        }
+        return sb;
     }
 
     /// Stash a generic static-method call's owner type args for mono, locating the
