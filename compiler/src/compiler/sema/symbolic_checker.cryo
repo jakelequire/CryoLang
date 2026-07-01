@@ -208,13 +208,27 @@ type struct SymbolicChecker {
     /// intentionally not resolved here.
     symbolic_resolve_owner_method_return(mut &this, recv_type: TypeRef,
                                          method_name: SymbolStr) -> TypeRef {
-        if (!this.symbolic_is_generic_owner_receiver(recv_type)) { return TypeRef::invalid(); }
-        if (this.ctx.generic_registry == null) { return TypeRef::invalid(); }
+        const f: FunctionDeclNode* = this.symbolic_find_owner_method(recv_type, method_name);
+        if (f == null) { return TypeRef::invalid(); }
+        if (f.resolved_return_type.is_valid()) { return f.resolved_return_type; }
+        return TypeRef::invalid();
+    }
+
+    /// Locate the uniquely-named non-static method `method_name` on the generic
+    /// owner template of `recv_type` (a generic-owner symbolic receiver).  Returns
+    /// the FunctionDeclNode only when EXACTLY ONE such method exists; null for 0 or
+    /// an ambiguous overload set (callers defer).  Shared by owner-method return
+    /// typing and the nested-generic-call binding stash so both agree on which
+    /// method a `this.<m>(...)` inside the owner template resolves to.
+    symbolic_find_owner_method(mut &this, recv_type: TypeRef,
+                               method_name: SymbolStr) -> FunctionDeclNode* {
+        if (!this.symbolic_is_generic_owner_receiver(recv_type)) { return null; }
+        if (this.ctx.generic_registry == null) { return null; }
         const base: Type* = this.symbolic_recv_base(recv_type);
-        if (base == null) { return TypeRef::invalid(); }
+        if (base == null) { return null; }
         const tmpl: TemplateEntry* =
             this.ctx.generic_registry.get_template_by_type_id(base.id);
-        if (tmpl == null || tmpl.ast_node == null) { return TypeRef::invalid(); }
+        if (tmpl == null || tmpl.ast_node == null) { return null; }
         const empty_methods: MethodNode*[] = [];
         mut methods: &MethodNode*[] = &empty_methods;
         if (tmpl.node_kind == NodeKind::StructDeclaration) {
@@ -224,19 +238,19 @@ type struct SymbolicChecker {
         } else if (tmpl.node_kind == NodeKind::ClassDeclaration) {
             methods = &(tmpl.ast_node as ClassDeclNode*).methods;
         } else {
-            return TypeRef::invalid();
+            return null;
         }
         mut found_count: i64 = 0;
-        mut ret: TypeRef = TypeRef::invalid();
+        mut found: FunctionDeclNode* = null;
         for (mut i: i64 = 0; i < methods.length; i++) {
             const m: MethodNode* = methods[i];
             if (m == null || m.func == null || m.is_static) { continue; }
             if (!m.func.name.equals(method_name)) { continue; }
             found_count += 1;
-            ret = m.func.resolved_return_type;
+            found = m.func;
         }
-        if (found_count == 1 && ret.is_valid()) { return ret; }
-        return TypeRef::invalid();
+        if (found_count == 1) { return found; }
+        return null;
     }
 
 

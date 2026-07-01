@@ -1324,27 +1324,41 @@ public:
                 "`static match` outside a generic context is not supported yet (its type could not be resolved to a single arm)",
                 sm.span);
         }
-        const arm: StaticMatchArmNode* = sm.arms[0];
-        if (arm == null || arm.body == null) { return TypeRef::invalid(); }
         const outer_expected: TypeRef = this.state.expected_type;
         mut result_type: TypeRef = TypeRef::invalid();
-        if ((arm.body as ASTNode*).kind == NodeKind::BlockStatement) {
-            const block: BlockStmtNode* = arm.body as BlockStmtNode*;
-            const last_idx: i64 = block.statements.length - 1;
-            for (mut j: i64 = 0; j < block.statements.length; j++) {
-                if (j == last_idx && outer_expected.is_valid()) { this.state.expected_type = outer_expected; }
-                this.dispatch_stmt(block.statements[j]);
-                if (j == last_idx) { this.state.expected_type = outer_expected; }
-            }
-            if (block.statements.length > 0) {
-                const last: StatementNode* = block.statements[block.statements.length - 1];
-                if ((last as ASTNode*).kind == NodeKind::ExpressionStatement) {
-                    const es: ExprStmtNode* = last as ExprStmtNode*;
-                    if (es.expression != null && es.expression.has_resolved_type()) { result_type = es.expression.resolved_type; }
+        // During the symbolic (generic-template) check, type-check EVERY arm body —
+        // not just `arms[0]`.  Each concrete instantiation prunes the static match
+        // to whichever arm matches its type and clones that arm's body; an unchecked
+        // arm clones with an untyped receiver and un-stashed nested generic calls,
+        // so a spec landing on a non-first arm (`String<A>::try_push<u8>` -> the `u8`
+        // arm) can't resolve its inner call (codegen E0636 / wrong-spec miscompile).
+        // A concrete (already-pruned) static match has exactly one arm, so the
+        // non-symbolic path checks only `arms[0]` exactly as before.
+        const n_arms: i64 = if (this.state.in_symbolic_check) { sm.arms.length } else { 1 };
+        for (mut ai: i64 = 0; ai < n_arms; ai++) {
+            const arm: StaticMatchArmNode* = sm.arms[ai];
+            if (arm == null || arm.body == null) { continue; }
+            mut arm_result: TypeRef = TypeRef::invalid();
+            if ((arm.body as ASTNode*).kind == NodeKind::BlockStatement) {
+                const block: BlockStmtNode* = arm.body as BlockStmtNode*;
+                const last_idx: i64 = block.statements.length - 1;
+                for (mut j: i64 = 0; j < block.statements.length; j++) {
+                    if (j == last_idx && outer_expected.is_valid()) { this.state.expected_type = outer_expected; }
+                    this.dispatch_stmt(block.statements[j]);
+                    if (j == last_idx) { this.state.expected_type = outer_expected; }
                 }
+                if (block.statements.length > 0) {
+                    const last: StatementNode* = block.statements[block.statements.length - 1];
+                    if ((last as ASTNode*).kind == NodeKind::ExpressionStatement) {
+                        const es: ExprStmtNode* = last as ExprStmtNode*;
+                        if (es.expression != null && es.expression.has_resolved_type()) { arm_result = es.expression.resolved_type; }
+                    }
+                }
+            } else {
+                this.dispatch_stmt(arm.body);
             }
-        } else {
-            this.dispatch_stmt(arm.body);
+            // The static match's type is the first arm's (all arms must agree).
+            if (ai == 0) { result_type = arm_result; }
         }
         this.state.expected_type = outer_expected;
         if (outer_expected.is_valid()) { return outer_expected; }

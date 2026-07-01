@@ -116,3 +116,42 @@ function method_argument_converts_from_literal() -> Result<(), TestError> {
     t.add("de");      // string -> Str
     return expect_eq(t.total, 5);
 }
+
+// -- Overloaded method-argument conversion (regression) ------------------
+// When a method is OVERLOADED, overload selection still has to insert the
+// `![implicit]` converter on the *chosen* overload's argument.  Previously
+// the selector accepted the `Str` overload on the strength of the
+// `string -> Str` converter but left the argument node untouched, so the
+// raw `string` pointer was dropped into the `Str` slot and the callee read
+// a garbage length (runtime abort / spurious result).
+
+type struct Sink {
+    chars: i32;
+    bytes: i32;
+
+    static new() -> Sink {
+        return Sink { chars: 0, bytes: 0 };
+    }
+
+    /// Overload A: a `string` literal reaches this via `Str::new`.
+    feed(mut &this, text: Str) -> void {
+        this.chars = this.chars + (text.length() as i32);
+    }
+
+    /// Overload B: an exact `u8`.  Its mere presence makes `feed`
+    /// overloaded, which is what previously suppressed the converter
+    /// insertion on overload A.
+    feed(mut &this, b: u8) -> void {
+        this.bytes = this.bytes + 1;
+    }
+}
+
+![test]
+function overloaded_method_converts_string_literal_arg() -> Result<(), TestError> {
+    mut s: Sink = Sink::new();
+    s.feed("hello");        // string -> Str (Str overload), 5 chars
+    s.feed("world!");       // string -> Str (Str overload), 6 chars
+    s.feed(0x21 as u8);     // exact u8 overload
+    expect_eq(s.chars, 11)?;
+    return expect_eq(s.bytes, 1);
+}
