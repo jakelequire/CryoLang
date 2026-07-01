@@ -43,6 +43,14 @@ public:
     brace_depth:   int;
     paren_depth:   int;
     bracket_depth: int;
+    // Paren-less `if`/`while`/`for`/`match` conditions forbid a bare struct
+    // literal (`if Foo { .. }` is the loop body, not a struct value).  When a
+    // condition is parsed without surrounding `()`, this records the bracketing
+    // depth (`paren_depth + bracket_depth`) at which struct literals must be
+    // suppressed; descending into `(` / `[` raises the depth and re-enables
+    // them automatically.  -1 means "no restriction active" (the default and
+    // the state inside a fully parenthesized condition).
+    no_struct_lit_depth: int;
     // Recursive-descent depth of `parse_unary`. Prefix-operator chains
     // (`----...x`, `!!!...x`) recurse once per operator with no bracketing
     // token for advance() to count, so they need their own guard or a few
@@ -130,6 +138,7 @@ public:
         this.brace_depth  = 0;
         this.paren_depth  = 0;
         this.bracket_depth = 0;
+        this.no_struct_lit_depth = -1;
         this.unary_depth  = 0;
         this.expr_depth   = 0;
         this.type_depth   = 0;
@@ -209,6 +218,15 @@ public:
     /// Check if the current token is of the given kind.
     check(kind: TokenType) -> boolean {
         return this.current().kind == kind;
+    }
+
+    /// True when a bare struct literal must be suppressed at the current
+    /// position: a paren-less condition set `no_struct_lit_depth`, and we are
+    /// still at that same bracketing depth (not inside a `(` / `[` group that
+    /// would make a following `{` unambiguous again).  See `no_struct_lit_depth`.
+    struct_lit_suppressed() -> boolean {
+        return this.no_struct_lit_depth >= 0
+            && (this.paren_depth + this.bracket_depth) == this.no_struct_lit_depth;
     }
 
     /// Check if the current token is any of the given kinds.

@@ -221,7 +221,7 @@ UnaryOp            ::= "-" | "!" | "&" | "*" | "~" | "++" | "--"
 PostfixExpr        ::= Primary PostfixOp*
 PostfixOp          ::= "(" ArgList? ")"
                      | "[" Expr "]"
-                     | ("." | "->") Ident GenericArgs?
+                     | "." Ident GenericArgs?    (* `.` auto-derefs pointers; there is no `->` operator *)
                      | "::" Ident GenericArgs?
                      | "?"                              (* error propagation / try *)
                      | "++" | "--"
@@ -264,26 +264,32 @@ NewExpr            ::= "new" Type ("(" ArgList? ")")?
                      | "new" Type "[" Expr "]"
                      | "new" Type "{" Ident ":" Expr
                                   ("," Ident ":" Expr)* ","? "}"
-IfExpr             ::= "if" "(" Expr ")" "{" Expr "}" "else" "{" Expr "}"
+IfExpr             ::= "if" Cond "{" Expr "}" "else" "{" Expr "}"
 
 
 (*  Control Flow =============================================== *)
 
-If                 ::= "if" "(" Expr ")" Block
-                       ("else" "if" "(" Expr ")" Block)*
+(* Cond: the `()` around a condition are OPTIONAL.  With parens, any
+   expression is allowed.  Without parens, a *bare* struct literal is
+   suppressed so the following `{` reads as the body — wrap a struct-valued
+   condition in `()` (or nest it inside a call) to use one. *)
+Cond               ::= "(" Expr ")" | Expr
+
+If                 ::= "if" Cond Block
+                       ("else" "if" Cond Block)*
                        ("else" Block)?
-While              ::= "while" "(" Expr ")" Block
-DoWhile            ::= "do" Block "while" "(" Expr ")" ";"
-For                ::= "for" "(" ForInit Expr ";" Expr ")" Block      (* C-style *)
-                     | "for" "(" Ident "in" Expr ")" Block            (* for-in over an iterable *)
+While              ::= "while" Cond Block
+DoWhile            ::= "do" Block "while" Cond ";"
+For                ::= "for" "("? ForInit Expr ";" Expr ")"? Block   (* C-style *)
+                     | "for" "("? Ident "in" Expr ")"? Block         (* for-in over an iterable *)
+                       (* the `(` and `)` are optional but must be balanced *)
 ForInit            ::= VarDecl | Ident ":" Type ("=" Expr)? ";"
 
-Match              ::= "match" "(" Expr ")" "{" MatchArm* "}"
-                       (* the parentheses around the subject are required *)
+Match              ::= "match" Cond "{" MatchArm* "}"
 MatchArm           ::= Pattern ("|" Pattern)* Guard? "=>" (Block | Expr ","?)
-Guard              ::= "if" "(" Expr ")"   (* checked after the pattern matches *)
+Guard              ::= "if" Cond   (* checked after the pattern matches *)
 
-Switch             ::= "switch" "(" Expr ")" "{" CaseClause* "}"
+Switch             ::= "switch" Cond "{" CaseClause* "}"
 CaseClause         ::= ("case" Expr | "default") ":" Statement*
 
 StaticMatch        ::= "static" "match" "(" Type ")" "{" StaticMatchArm* "}"
