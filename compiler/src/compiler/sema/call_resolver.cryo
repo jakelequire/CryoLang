@@ -1130,6 +1130,39 @@ type struct CallResolver {
         }
     }
 
+    /// After an overload has been *selected* whose match relied on a registered
+    /// `![implicit]` converter for one or more arguments, rewrite those argument
+    /// nodes through the converter so the converted value — not the raw source —
+    /// reaches the pinned overload.
+    ///
+    /// Overload selection (`resolve_method_overload` / `match_methods_on_impl_block`)
+    /// is free to *accept* a candidate on the strength of `has_implicit_converter`,
+    /// but it pins by the candidate's parameter types and leaves the argument node
+    /// untouched.  For a builtin coercion (`can_implicit_convert` / an int literal
+    /// that fits) that is correct — codegen coerces natively.  For a user
+    /// `![implicit]` converter (e.g. `string -> Str` via `Str::new`) it is NOT: the
+    /// raw `string` pointer would be dropped straight into the `Str` slot and the
+    /// callee would read a garbage length.  This pass closes that gap; it is a
+    /// no-op for arguments that already match or only need a builtin coercion, so
+    /// callers may invoke it unconditionally after choosing the overload.
+    apply_overload_converter_args(mut &this, visitor: ASTVisitor*, call: CallExprNode*,
+                                  param_types: Slice<TypeRef>) -> void {
+        const n: i64 = param_types.length as i64;
+        for (mut i: i64 = 0; i < n; i++) {
+            if (i >= call.arguments.length) { break; }
+            const arg: ExpressionNode* = call.arguments[i];
+            if (arg == null) { continue; }
+            const arg_ty:   TypeRef = arg.resolved_type;
+            const param_ty: TypeRef = param_types.get(i as u64).unwrap();
+            if (!arg_ty.is_valid() || !param_ty.is_valid()) { continue; }
+            if (arg_ty.id == param_ty.id) { continue; }
+            if (this.checker.can_implicit_convert(arg_ty, param_ty)) { continue; }
+            if (this.literals.int_literal_fits_target(arg, param_ty)) { continue; }
+            if (!this.has_implicit_converter(arg_ty, param_ty)) { continue; }
+            this.try_apply_implicit_conversion(visitor, call, i, arg, arg_ty, param_ty);
+        }
+    }
+
     /// Per-argument type checking for a 1:1 arg/param list.  Flags only hard
     /// category mismatches / lossy narrowing / same-width sign reinterpret;
     /// synthesizes implicit conversions where registered.
@@ -1716,6 +1749,7 @@ type struct CallResolver {
                         break;
                     }
                     if (ok) {
+                        this.apply_overload_converter_args(visitor, call, m.param_types.as_slice());
                         call.set_resolved_method(m.ast_node as ASTNode*);
                         this.pin_method_resolved_callee(call, owner_t, m);
                         return;
@@ -1732,10 +1766,10 @@ type struct CallResolver {
             }
         }
 
-        this.try_match_trait_impl_method(call, member, base_t, arg_types);
+        this.try_match_trait_impl_method(visitor, call, member, base_t, arg_types);
     }
 
-    try_match_trait_impl_method(mut &this, call: CallExprNode*, member: MemberAccessNode*,
+    try_match_trait_impl_method(mut &this, visitor: ASTVisitor*, call: CallExprNode*, member: MemberAccessNode*,
                                 base_t: Type*, arg_types: TypeRef[]) -> void {
         if (call.resolved_callee.is_valid()) { return; }
         if (this.ctx.generic_registry == null) { return; }
@@ -1760,11 +1794,11 @@ type struct CallResolver {
         for (mut ti: i64 = 0; ti < traits.length; ti++) {
             const block: ImplBlockNode* = this.ctx.generic_registry.lookup_trait_impl(traits[ti], target_name);
             if (block == null) { continue; }
-            if (this.match_methods_on_impl_block(call, member, block, target_str, arg_types)) { return; }
+            if (this.match_methods_on_impl_block(visitor, call, member, block, target_str, arg_types)) { return; }
         }
     }
 
-    match_methods_on_impl_block(mut &this, call: CallExprNode*, member: MemberAccessNode*,
+    match_methods_on_impl_block(mut &this, visitor: ASTVisitor*, call: CallExprNode*, member: MemberAccessNode*,
                                 block: ImplBlockNode*, owner_str: string, arg_types: &TypeRef[]) -> boolean {
         if (block == null) { return false; }
         const this_amp: SymbolStr = this.intern.intern("&this");
@@ -1806,6 +1840,7 @@ type struct CallResolver {
                     break;
                 }
                 if (compat) {
+                    this.apply_overload_converter_args(visitor, call, params.as_slice());
                     call.set_resolved_method(mn as ASTNode*);
                     this.pin_method_callee_from_qname(call, owner_str, mn, mn.is_static);
                     return true;
@@ -1848,6 +1883,11 @@ type struct CallResolver {
         const obj_type: TypeRef = this.dispatch.resolve_expr(visitor, member.object);
         if (!obj_type.is_valid()) { return TypeRef::invalid(); }
         if (this.symbolic.symbolic_is_generic_owner_receiver(obj_type)) {
+            // A nested generic-method call on the still-generic owner (`this.try_push(item)`
+            // inside `String<A>::push<T>`) must stash its method bindings now; the
+            // substituter concretizes them when the enclosing method specializes, so
+            // mono can specialize the nested call (else codegen E0636).
+            this.binding.stash_owner_generic_method_bindings(obj_type, member, call);
             const mret: TypeRef = this.symbolic.symbolic_resolve_owner_method_return(obj_type, member.member);
             if (mret.is_valid()) { member.set_resolved_type(mret); return mret; }
             return TypeRef::invalid();

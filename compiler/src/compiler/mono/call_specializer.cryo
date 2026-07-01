@@ -664,15 +664,43 @@ type struct MonoCallSpecializer {
                 t = this.arena.lookup(recv_type.id);
             } else if (t.kind == TypeKind::InstantiatedType) {
                 const inst: InstantiatedType* = t as InstantiatedType*;
-                if (!inst.has_resolved_type()) { break; }
-                recv_type = inst.resolved_type;
-                t = this.arena.lookup(recv_type.id);
+                if (inst.has_resolved_type()) {
+                    recv_type = inst.resolved_type;
+                    t = this.arena.lookup(recv_type.id);
+                } else {
+                    // A substituter-minted nested receiver (`this.try_push(item)`
+                    // cloned into `String<Str>::push`) carries fresh arg TypeIDs and
+                    // so missed `instantiated_cache`/`resolved_type`, even though its
+                    // logical spec is already materialized.  Recover the spec by
+                    // structural equality so the lookup ladder + qualified-name keying
+                    // match the in-source path; else leave it for the fixpoint re-walk.
+                    const spec_ty: TypeRef = this.resolve_unresolved_inst_via_spec(recv_type);
+                    if (!spec_ty.is_valid()) { break; }
+                    recv_type = spec_ty;
+                    t = this.arena.lookup(recv_type.id);
+                }
             } else {
                 break;
             }
             depth += 1;
         }
         if (t == null) { return; }
+        // A bare generic-template struct used directly as a receiver (`this` in
+        // `implement FmtWrite for struct String`, or `mut s: String` with all params
+        // defaulted) is NOT a materialized spec, so a generic method on it (`try_push<T>`)
+        // resolves to nothing in the lookup ladder and the call is left unpinned —
+        // codegen's name+arity fallback then picks an arbitrary sibling spec once more
+        // than one exists (e.g. try_push<Str> -> try_push<i32>, corrupting all
+        // formatting).  Canonicalize to the DEFAULT instantiation's emitted spec
+        // (String<GlobalAlloc>) so the call pins a symbol that is actually emitted.
+        if (t.kind == TypeKind::Struct || t.kind == TypeKind::Class) {
+            const canon: TypeRef = this.canonicalize_default_template_recv(recv_type);
+            if (canon.is_valid() && canon.id != recv_type.id) {
+                recv_type = canon;
+                t = this.arena.lookup(recv_type.id);
+                if (t == null) { return; }
+            }
+        }
         const tk: TypeKind = t.kind;
         const is_user_kind: boolean = tk == TypeKind::Struct
                                    || tk == TypeKind::Class
@@ -958,11 +986,21 @@ type struct MonoCallSpecializer {
 
         // Re-walk the spec'd body for its own generic calls.  specialize_method ran
         // ASTTypeSubstituter over the clone, which rewrites nested resolved_type_args
-        // stashes too (substituter.cryo:620), so they are already concrete -> subst=null.
+        // stashes but NOT identifier `resolved_type`s (substituter.cryo:552).  So a
+        // nested call's owner-typed receiver (`this.try_add(item)`, typed `Box<A>` by
+        // the template's symbolic walk) is still abstract.  Pass an owner-param subst
+        // (`A` -> the receiver's concrete arg) so the re-walk concretizes the receiver
+        // and the nested generic call specializes against the right spec.
         if (spec_method.func != null && spec_method.func.body != null) {
             const _empty: string = "";
             mut rw_ctx: ResolutionContext = ResolutionContext::new(_empty, _empty);
-            this.walk_block(spec_method.func.body, &rw_ctx, null);
+            mut owner_subst: TypeSubstitution = TypeSubstitution::empty();
+            this.add_owner_param_bindings(&owner_subst, recv_type);
+            if (owner_subst.is_empty()) {
+                this.walk_block(spec_method.func.body, &rw_ctx, null);
+            } else {
+                this.walk_block(spec_method.func.body, &rw_ctx, &owner_subst);
+            }
         }
     }
 
@@ -1169,6 +1207,119 @@ type struct MonoCallSpecializer {
             return m;
         }
         return null;
+    }
+
+    /// Add owner-param -> concrete-arg bindings to `subst` for a generic method
+    /// specialized on a generic-struct receiver.  The AST substituter is built only
+    /// from the METHOD params (`<T>`), so without this the cloned body's owner-typed
+    /// receivers (`this: Box<A>` in `Box<A>::add<T>`) keep the abstract owner param
+    /// `A` and a nested `this.<m>(...)` call can't resolve its concrete receiver.
+    /// `owner_type` may be the resolved spec struct or the instantiation itself;
+    /// either way recover the `(generic_base, type_args)` and bind each template
+    /// param (reconstructed by name+index, matching the body's interned ref) to the
+    /// receiver's concrete arg.  No-op when the owner isn't a generic instantiation.
+    add_owner_param_bindings(&this, subst: TypeSubstitution*, owner_type: TypeRef) -> void {
+        if (this.generic_registry == null) { return; }
+        mut inst: InstantiatedType* = null;
+        const ot: Type* = this.arena.lookup(owner_type.id);
+        if (ot != null && ot.kind == TypeKind::InstantiatedType) {
+            inst = ot as InstantiatedType*;
+        } else {
+            for (mut i: i64 = 0; i < this.state.spec_entries.length; i++) {
+                const e: SpecializationEntry* = &this.state.spec_entries[i];
+                if (!e.specialized_type.is_valid() || !e.instantiated_type.is_valid()) { continue; }
+                if (e.specialized_type.id == owner_type.id
+                        || this.arena.display_equal(e.specialized_type.id, owner_type.id)) {
+                    const it: Type* = this.arena.lookup(e.instantiated_type.id);
+                    if (it != null && it.kind == TypeKind::InstantiatedType) {
+                        inst = it as InstantiatedType*;
+                        break;
+                    }
+                }
+            }
+        }
+        if (inst == null) { return; }
+        const tmpl: TemplateEntry* =
+            this.generic_registry.get_template_by_type_id(inst.generic_base.id);
+        if (tmpl == null || tmpl.ast_node == null) { return; }
+        const empty_params: GenericParamNode*[] = [];
+        mut owner_params: &GenericParamNode*[] = &empty_params;
+        if (tmpl.ast_node.kind == NodeKind::StructDeclaration) {
+            owner_params = &(tmpl.ast_node as StructDeclNode*).generic_params;
+        } else if (tmpl.ast_node.kind == NodeKind::UnionDeclaration) {
+            owner_params = &(tmpl.ast_node as UnionDeclNode*).generic_params;
+        } else if (tmpl.ast_node.kind == NodeKind::ClassDeclaration) {
+            owner_params = &(tmpl.ast_node as ClassDeclNode*).generic_params;
+        } else {
+            return;
+        }
+        const n: i64 = if (owner_params.length < inst.type_args.length) {
+            owner_params.length
+        } else {
+            inst.type_args.length
+        };
+        for (mut i: i64 = 0; i < n; i++) {
+            const gp: GenericParamNode* = owner_params[i];
+            if (gp == null) { continue; }
+            if (this.arena.contains_generic_param(inst.type_args[i])) { continue; }
+            const pref: TypeRef = this.arena.create_generic_param(gp.name, i as u64);
+            subst.add(pref.id, inst.type_args[i]);
+        }
+    }
+
+    /// Recover the concrete specialized type for an InstantiatedType that the
+    /// substituter minted with fresh arg TypeIDs (so it missed
+    /// `instantiated_cache`/`resolved_type`) by matching it STRUCTURALLY against a
+    /// materialized spec entry's instantiated type.  TypeID identity is not logical
+    /// identity across the pre-/post-mono boundary (see
+    /// `TypeArena::propagate_instantiated_resolution`), so display-equality — not id
+    /// equality — is the correct key.  Invalid when no materialized spec matches.
+    /// If `recv_type` is a bare generic-template struct/class (every type param has a
+    /// default), build its DEFAULT instantiation and return the materialized spec's
+    /// concrete type — so a generic-method call on the bare template pins/emits under
+    /// the same spec as in-source `String<GlobalAlloc>` receivers.  Returns
+    /// `recv_type` unchanged when it isn't a defaultable template or no spec for the
+    /// default instantiation has been materialized.
+    canonicalize_default_template_recv(mut &this, recv_type: TypeRef) -> TypeRef {
+        if (this.generic_registry == null || this.type_resolver == null) { return recv_type; }
+        const tmpl: TemplateEntry* =
+            this.generic_registry.get_template_by_type_id(recv_type.id);
+        if (tmpl == null || tmpl.ast_node == null) { return recv_type; }
+        const empty_gp: GenericParamNode*[] = [];
+        mut params: &GenericParamNode*[] = &empty_gp;
+        if (tmpl.ast_node.kind == NodeKind::StructDeclaration) {
+            params = &(tmpl.ast_node as StructDeclNode*).generic_params;
+        } else if (tmpl.ast_node.kind == NodeKind::ClassDeclaration) {
+            params = &(tmpl.ast_node as ClassDeclNode*).generic_params;
+        } else {
+            return recv_type;
+        }
+        if (params.length == 0) { return recv_type; }
+        mut default_args: TypeRef[] = [];
+        const _pm: string = "";
+        mut rc: ResolutionContext = ResolutionContext::new(_pm, _pm);
+        for (mut i: i64 = 0; i < params.length; i++) {
+            const gp: GenericParamNode* = params[i];
+            if (gp == null || !gp.has_default_annotation()) { return recv_type; }
+            const da: TypeRef = this.type_resolver.resolve(gp.default_annotation, &rc);
+            if (!da.is_valid() || this.arena.contains_generic_param(da)) { return recv_type; }
+            default_args.push(da);
+        }
+        const default_inst: TypeRef = this.arena.create_instantiation(recv_type, &default_args);
+        const spec_ty: TypeRef = this.resolve_unresolved_inst_via_spec(default_inst);
+        if (spec_ty.is_valid()) { return spec_ty; }
+        return recv_type;
+    }
+
+    resolve_unresolved_inst_via_spec(&this, recv_type: TypeRef) -> TypeRef {
+        for (mut i: i64 = 0; i < this.state.spec_entries.length; i++) {
+            const e: SpecializationEntry* = &this.state.spec_entries[i];
+            if (!e.instantiated_type.is_valid() || !e.specialized_type.is_valid()) { continue; }
+            if (this.arena.display_equal(e.instantiated_type.id, recv_type.id)) {
+                return e.specialized_type;
+            }
+        }
+        return TypeRef::invalid();
     }
 
     /// Spec'd impl-block method lookup, with bound-directed dispatch (prefer the
@@ -1410,7 +1561,14 @@ type struct MonoCallSpecializer {
             const gp_ref: TypeRef = this.arena.create_generic_param(param_names[i], i as u64);
             param_ids.push(gp_ref.id);
         }
-        const subst_val: TypeSubstitution = TypeSubstitution::from_params(param_ids, args);
+        mut subst_val: TypeSubstitution = TypeSubstitution::from_params(param_ids, args);
+        // Also concretize the owner's generic params (`A` in `Box<A>::add<T>`) from
+        // the concrete receiver, so the cloned body's owner-typed receivers
+        // (`this.try_add(item)` on `Box<A>`) resolve their spec instead of staying
+        // abstract -> codegen E0636 on the nested call.
+        if (owner_type.is_valid()) {
+            this.add_owner_param_bindings(&subst_val, owner_type);
+        }
         const subst_ptr: TypeSubstitution* = malloc(sizeof(TypeSubstitution)) as TypeSubstitution*;
         *subst_ptr = subst_val;
 

@@ -644,6 +644,37 @@ type struct MethodBinding {
         call.set_resolved_type_args(bindings);
     }
 
+    /// Generic-owner companion to `stash_method_call_bindings`: stash the
+    /// method-level bindings of a nested generic-method call made on the STILL-GENERIC
+    /// owner inside its own template body (`this.try_push(item)` in
+    /// `String<A>::push<T>`).  The receiver is the un-instantiated owner (`Box<A>`),
+    /// so `find_generic_method_for_call` bails (its instantiation carries a generic
+    /// arg) and `stash_method_call_bindings` never runs.  Without a stash, when the
+    /// enclosing method is specialized (`push<Str>`) the cloned nested call reaches
+    /// mono with no method type-args and is left unspecialized -> codegen E0636
+    /// "no method 'try_push'".  Resolve the bindings symbolically here (they may BE
+    /// the enclosing method's symbolic params, e.g. `[T]`); the substituter
+    /// concretizes the stash when the enclosing method specializes, so mono's
+    /// per-call path can then specialize the nested call.  No-op outside a symbolic
+    /// walk or when the call already carries a stash.
+    stash_owner_generic_method_bindings(mut &this, recv_type: TypeRef,
+                                        member: MemberAccessNode*, call: CallExprNode*) -> void {
+        if (call == null || member == null) { return; }
+        if (!this.state.in_symbolic_check) { return; }
+        if (call.resolved_type_args.length > 0) { return; }
+        const orig_func: FunctionDeclNode* =
+            this.symbolic.symbolic_find_owner_method(recv_type, member.member);
+        if (orig_func == null) { return; }
+        const n_method_params: i64 = orig_func.generic_params.length;
+        if (n_method_params == 0) { return; }
+        mut owner_ctx: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
+        this.symbolic.symbolic_bind_params(&owner_ctx);
+        owner_ctx.set_this_type(recv_type);
+        mut bindings: TypeRef[] = this.solve_method_bindings(orig_func, &owner_ctx, member, call);
+        if (bindings.length != n_method_params) { return; }
+        call.set_resolved_type_args(bindings);
+    }
+
     /// Locate the generic method targeted by `member` on `recv_type` and build the
     /// owner-binding context (receiver type params -> concrete args, plus `This`).
     /// Writes the method's FunctionDeclNode through `out_func` (null when nothing
@@ -667,11 +698,15 @@ type struct MethodBinding {
         const empty_params: GenericParamNode*[] = [];
         mut owner_params: &GenericParamNode*[] = &empty_params;
 
-        const tmpl: TemplateEntry* = if (inst != null) {
-            this.ctx.generic_registry.get_template_by_type_id(inst.generic_base.id)
-        } else {
-            null
-        };
+        // Template key: an instantiation (`Array<i32>`) keys off its generic base; a
+        // BARE template struct used directly as a receiver (`this` in `implement
+        // FmtWrite for struct String`, where `this` is the un-parameterized `String`,
+        // not `String<GlobalAlloc>`) keys off its own type id.  Without the bare case
+        // the call's method-arg bindings are never stashed, so mono can't pin the
+        // generic call and codegen's name+arity fallback picks a wrong sibling spec.
+        const tmpl_base_id: u64 = if (inst != null) { inst.generic_base.id } else { recv_type.id };
+        const tmpl: TemplateEntry* =
+            this.ctx.generic_registry.get_template_by_type_id(tmpl_base_id);
         if (tmpl != null && tmpl.ast_node != null) {
             if (tmpl.node_kind == NodeKind::StructDeclaration) {
                 const sn: StructDeclNode* = tmpl.ast_node as StructDeclNode*;

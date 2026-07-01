@@ -20,6 +20,9 @@ import core::cmp;
 import core::hash;
 import core::drop;
 import core::clone;
+import alloc::layout;
+import fmt::display;
+import fmt::error;
 
 const INITIAL_CAPACITY: u64 = 8;
 
@@ -93,7 +96,7 @@ type struct String<A = GlobalAlloc> {
     static from_str_c(source: Str) -> String {
         mut string: String = String::with_capacity(source.length() + 1);
         string.push(source);
-        string.push(0 as u8);
+        string.push_byte(0 as u8);
         // Drop the terminator from the logical length; the byte stays in
         // the allocation at index `length`.
         string.length = string.length - 1;
@@ -157,7 +160,7 @@ type struct String<A = GlobalAlloc> {
     /// appended first. The owning companion of `Str::sub_bytes` etc. for
     /// handing an owned C-string across the FFI / raw-`string` boundary.
     into_raw(mut this) -> string {
-        this.push(0 as u8);
+        this.push_byte(0 as u8);
         const { buffer, length }: String<A> = this;
         return buffer.into_raw() as string;
     }
@@ -198,8 +201,25 @@ type struct String<A = GlobalAlloc> {
         return this.as_str().split(sep);
     }
 
-    push(mut &this, source: Str) -> void {
-        match (this.try_push(source)) {
+    /// Append `item` to the string as its **text** representation, dispatched
+    /// at compile time via `static match (T)` — no runtime cost, no trait bound,
+    /// because the available arms ARE the accepted types:
+    ///   - `Str` / `string`              — the view's / C string's UTF-8 bytes
+    ///                                      verbatim (a `string`'s terminating
+    ///                                      NUL is not copied).
+    ///   - every primitive integer        — its decimal `Display` text, e.g.
+    ///     (`u8`..`u128`, `i8`..`i128`,     `s.push(65 as u8)` appends `"65"`.
+    ///      `usize` / `isize`)
+    ///   - `f32` / `f64`                  — its `Display` text.
+    ///   - `boolean`                      — `"true"` / `"false"`.
+    /// Any other type is a compile error (the `static match` has no `_` arm).
+    /// To append a single *raw* byte (not its decimal text) use `push_byte`.
+    /// Panics on allocation failure; use `try_push` for the fallible form.
+    ///
+    /// (Replaces the former `push(Str)` / `push(u8)` overloads and the separate
+    /// `push_cstr`: `s.push("text")` now appends a C-string literal directly.)
+    push<T>(mut &this, item: T) -> void {
+        match (this.try_push(item)) {
             Result::Ok(_) => { return; }
             Result::Err(_) => {
                 intrinsics::panic("String::push: allocation failed", FILE, LINE);
@@ -207,7 +227,53 @@ type struct String<A = GlobalAlloc> {
         }
     }
 
-    try_push(mut &this, source: Str) -> Result<(), AllocError> {
+    /// Fallible `push`: returns `AllocError` instead of panicking.  Same
+    /// compile-time dispatch as `push`.
+    try_push<T>(mut &this, item: T) -> Result<(), AllocError> {
+        return static match (T) {
+            Str     => { this.push_view_bytes(item) }
+            string  => { this.push_view_bytes(Str::from_cstr(item)) }
+            u8      => { this.push_display(item) }
+            u16     => { this.push_display(item) }
+            u32     => { this.push_display(item) }
+            u64     => { this.push_display(item) }
+            u128    => { this.push_display(item) }
+            i8      => { this.push_display(item) }
+            i16     => { this.push_display(item) }
+            i32     => { this.push_display(item) }
+            i64     => { this.push_display(item) }
+            i128    => { this.push_display(item) }
+            usize   => { this.push_display(item) }
+            isize   => { this.push_display(item) }
+            f32     => { this.push_display(item) }
+            f64     => { this.push_display(item) }
+            boolean => { this.push_display(item) }
+        };
+    }
+
+    /// Append a single **raw** byte (not its decimal text).  For byte-exact
+    /// work: NUL terminators, control characters, binary buffers.  The caller
+    /// is responsible for keeping the string valid UTF-8.  Panics on
+    /// allocation failure; use `try_push_byte` for the fallible form.
+    push_byte(mut &this, byte: u8) -> void {
+        match (this.try_push_byte(byte)) {
+            Result::Ok(_) => { return; }
+            Result::Err(_) => {
+                intrinsics::panic("String::push_byte: allocation failed", FILE, LINE);
+            }
+        }
+    }
+
+    /// Fallible `push_byte`: append one raw byte, returning `AllocError`
+    /// instead of panicking.
+    try_push_byte(mut &this, byte: u8) -> Result<(), AllocError> {
+        return this.push_one_byte(byte);
+    }
+
+private:
+    /// Append the bytes of a `Str` view verbatim (backs the `Str` / `string`
+    /// arms of `try_push`).  Empty input is a no-op.
+    push_view_bytes(mut &this, source: Str) -> Result<(), AllocError> {
         const add: u64 = source.length();
         if (add == 0) {
             return Result::Ok(());
@@ -222,31 +288,9 @@ type struct String<A = GlobalAlloc> {
         return Result::Ok(());
     }
 
-    /// Append a NUL-terminated `string` (C-style literal or `i8*` cast
-    /// to `string`).  Length is computed once via `strlen` and the
-    /// bytes copied; the NUL itself is not appended.  Use this whenever
-    /// you'd otherwise be writing `push(Str::from_raw(lit as u8*,
-    /// hand_counted_len))`.
-    push_cstr(mut &this, text: string) -> void {
-        this.push(Str::from_cstr(text));
-    }
-
-    try_push_cstr(mut &this, text: string) -> Result<(), AllocError> {
-        return this.try_push(Str::from_cstr(text));
-    }
-
-    /// Append a single byte. The caller is responsible for
-    /// maintaining valid UTF-8.
-    push(mut &this, byte: u8) -> void {
-        match (this.try_push(byte)) {
-            Result::Ok(_) => { return; }
-            Result::Err(_) => {
-                intrinsics::panic("String::push: allocation failed", FILE, LINE);
-            }
-        }
-    }
-
-    try_push(mut &this, byte: u8) -> Result<(), AllocError> {
+    /// Append a single raw byte to the buffer (backs `push_byte` and the
+    /// internal C-string NUL terminators).
+    push_one_byte(mut &this, byte: u8) -> Result<(), AllocError> {
         if (this.length == this.buffer.capacity()) {
             this.buffer.reserve(this.length, 1, INITIAL_CAPACITY)?;
         }
@@ -254,6 +298,33 @@ type struct String<A = GlobalAlloc> {
         this.length++;
         return Result::Ok(());
     }
+
+    /// Render `item`'s `Display` text and append it (backs every integer /
+    /// `f32` / `f64` / `boolean` arm of `try_push`).  Formats into a temporary
+    /// `String` (always `GlobalAlloc`, so this works regardless of `A`) and
+    /// copies the bytes in.  An in-memory sink only ever fails on allocation,
+    /// so a `FmtError` is mapped back to an `AllocError`.
+    push_display<D>(mut &this, item: D) -> Result<(), AllocError>
+    where D: Display {
+        match (format_to_string(&item)) {
+            Result::Ok(rendered) => {
+                const r: Result<(), AllocError> = this.push_view_bytes(rendered.as_str());
+                return r;
+            }
+            Result::Err(fe) => {
+                match (fe) {
+                    FmtError::Alloc(ae) => { return Result::Err(ae); }
+                    FmtError::Io(_) => {
+                        // Unreachable for an in-memory String sink (no fd), but
+                        // the match must be total; surface it as OOM.
+                        return Result::Err(AllocError::new(
+                            AllocErrorKind::OutOfMemory, Layout::new(1u64, 1u64)));
+                    }
+                }
+            }
+        }
+    }
+public:
 
     clear(mut &this) -> void {
         this.length = 0;
