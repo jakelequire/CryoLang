@@ -861,6 +861,30 @@ type struct CallEmitter {
             // identical to the Identifier branch.
             if (node.resolved_callee.is_valid()) {
                 callee_val = this.cg.resolver.resolve_function_by_mangled(node.resolved_callee);
+                // Method-spec-args ($MG) reconciliation.  A generic INHERENT method
+                // spec is emitted under a `$MG<args>$`-disambiguated symbol (see
+                // MangledName::with_method_spec_args, fed `func.spec_type_args` by
+                // both mono's call-site pin and the codegen definition).  But some
+                // resolution paths pin `resolved_callee` to the UNSUFFIXED base
+                // method mangle — notably when a call is resolved to an
+                // already-monomorphized generic method after mono ran (e.g.
+                // `String<GlobalAlloc>`'s `FmtWrite::write_str` calling
+                // `this.try_push<Str>`, reached via the injected owner-module spec).
+                // The base symbol then misses the emitted `$MG` definition, and the
+                // name+arity fallback below would pick a WRONG sibling spec
+                // (try_push<Str> -> try_push<i32>, corrupting all formatting).  The
+                // call still carries its concrete method type-args on
+                // `resolved_type_args`; reconstruct the `$MG` symbol from them and
+                // retry.  No-op for non-generic calls (empty args) and for symbols
+                // that already resolved.
+                if (!callee_val.is_valid() && node.resolved_type_args.length > 0) {
+                    const base_mg: MangledName = MangledName { value: node.resolved_callee };
+                    const mg: MangledName = base_mg.with_method_spec_args(
+                        intern, this.cg.get_arena(), node.resolved_type_args);
+                    if (!mg.value.equals(node.resolved_callee)) {
+                        callee_val = this.cg.resolver.resolve_function_by_mangled(mg.value);
+                    }
+                }
             }
 
             // Post-specialization fallback: when the receiver is a

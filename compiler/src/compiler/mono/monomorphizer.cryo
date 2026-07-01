@@ -518,6 +518,38 @@ type struct Monomorphizer {
             this.ast_resolver.resolve_specialized_ast(kept_impl_asts[ri], NodeKind::ImplementationBlock, entry, &subst, this_type_for_methods);
         }
 
+        // Register the spec entry into `state.spec_entries` BEFORE specializing the
+        // nested calls in its own bodies.  A spec's method body can make a generic
+        // call on a receiver that resolves to the SAME spec being materialized — e.g.
+        // `String<GlobalAlloc>`'s `FmtWrite::write_str` calls `this.try_push(source)`
+        // on a `this: String` (bare, all-defaulted) receiver that
+        // `canonicalize_default_template_recv` must map to `String<GlobalAlloc>` via
+        // a `spec_entries` scan.  Registering AFTER the walk (the old order) left the
+        // scan empty, so the receiver stayed bare, the `try_push` lookup failed, and
+        // the call was left entirely unpinned.  `kept_impl_asts` is MOVED into the
+        // entry, so capture the impl-node pointers into a walk list first (they alias
+        // the same nodes the entry now owns).
+        mut walk_impls: ASTNode*[] = [];
+        for (mut ri: i64 = 0; ri < kept_impl_asts.length; ri++) {
+            walk_impls.push(kept_impl_asts[ri]);
+        }
+        const origin: SymbolStr = this.current_module;
+        const spec_entry: SpecializationEntry = SpecializationEntry {
+            specialized_type:  concrete_type,
+            specialized_name:  spec_name_sym,
+            ast_node:          result.specialized_ast,
+            impl_nodes:        kept_impl_asts,
+            origin_module:     origin,
+            template_module:   entry.module_name,
+            instantiated_type: request.generic_type,
+            injected:          false,
+            owner_source:      SymbolStr::empty(),
+        };
+        const idx: i64 = this.state.spec_entries.length;
+        this.spec_keys.push(key);
+        this.state.spec_entries.push(spec_entry);
+        this.spec_index.insert(key, idx);
+
         // Specialize the generic CALLS inside the freshly-resolved spec'd bodies
         // (e.g. `mem::offset<T>` inside `NonNull<i32>`'s methods, or a nested
         // generic free call inside a spec'd function).  These bodies are never in
@@ -527,10 +559,11 @@ type struct Monomorphizer {
         // `subst` concretizes any template-param binding the ASTTypeSubstituter
         // didn't reach in the clone (no-op on an already-concrete stash).  Each
         // queued function/type spec is itself drained + walked by the worklist
-        // loop, so this is fully transitive.
+        // loop, so this is fully transitive.  (Walk via `walk_impls`, which aliases
+        // the impl nodes now owned by the registered entry.)
         this.call_specializer.specialize_calls_in_spec_decl(result.specialized_ast, &subst);
-        for (mut ri: i64 = 0; ri < kept_impl_asts.length; ri++) {
-            this.call_specializer.specialize_calls_in_spec_decl(kept_impl_asts[ri], &subst);
+        for (mut ri: i64 = 0; ri < walk_impls.length; ri++) {
+            this.call_specializer.specialize_calls_in_spec_decl(walk_impls[ri], &subst);
         }
 
         // Populate the concrete type and set resolved_type on the InstantiatedType.
@@ -565,25 +598,8 @@ type struct Monomorphizer {
 
         // Mark as monomorphized
         this.generic_registry.mark_monomorphized(request.base_type, request.type_args);
-
-        // Cache the result.  origin_module is only a *fallback* owner; Phase 6a-iii
-        // routes each spec to its deterministic owner = template_module.
-        const origin: SymbolStr = this.current_module;
-        const spec_entry: SpecializationEntry = SpecializationEntry {
-            specialized_type:  concrete_type,
-            specialized_name:  spec_name_sym,
-            ast_node:          result.specialized_ast,
-            impl_nodes:        kept_impl_asts,
-            origin_module:     origin,
-            template_module:   entry.module_name,
-            instantiated_type: request.generic_type,
-            injected:          false,
-            owner_source:      SymbolStr::empty(),
-        };
-        const idx: i64 = this.state.spec_entries.length;
-        this.spec_keys.push(key);
-        this.state.spec_entries.push(spec_entry);
-        this.spec_index.insert(key, idx);
+        // (The spec entry was registered ABOVE, before the nested-call walk, so the
+        // walk could canonicalize self-referential generic calls to this spec.)
 
         // Discover nested instantiations from the concrete type's fields, or the
         // function type's param/return types (function templates).
