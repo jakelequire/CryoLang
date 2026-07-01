@@ -2743,7 +2743,12 @@ public:
     /// or for-in: for (item in collection) body
     parse_for_statement() -> StatementNode* {
         const start: Token = this.advance(); // consume 'for'
-        this.consume(TokenType::LParen, "'('");
+        // The surrounding `()` are optional: `for (x in it)` and `for x in it`
+        // (and the C-style `for init; cond; upd`) are both accepted.  When
+        // omitted, the trailing header expression (collection / update) is parsed
+        // with bare struct literals suppressed so the following `{` reads as the
+        // loop body.
+        const has_paren: boolean = this.match_tok(TokenType::LParen);
 
         // For-in syntax: `for (x in iter) body` desugars at parse time into
         //
@@ -2767,14 +2772,16 @@ public:
         if (this.check(TokenType::Identifier) && this.peek_at(1).kind == TokenType::KwIn) {
             const iter_tok: Token = this.advance();             // bound name (`x`)
             this.advance();                                     // consume 'in'
-            const collection: ExpressionNode* = this.parse_expression();
+            mut collection: ExpressionNode* = null;
+            if (has_paren) { collection = this.parse_expression(); }
+            else           { collection = this.parse_expr_no_struct_lit(); }
             if (collection == null) {
                 this.report_error(ErrorCode::E0102_EXPECTED_EXPRESSION,
                     "expected an iterator expression after `in`");
-                this.consume(TokenType::RParen, "')'");
+                if (has_paren) { this.consume(TokenType::RParen, "')'"); }
                 return this.parse_statement_or_block();
             }
-            this.consume(TokenType::RParen, "')'");
+            if (has_paren) { this.consume(TokenType::RParen, "')'"); }
             const body: StatementNode* = this.parse_statement_or_block();
             const full_span: SourceSpan = this.span_from(start);
             return this.build_for_in_desugar(iter_tok, collection, body, full_span);
@@ -2801,10 +2808,17 @@ public:
         this.consume(TokenType::Semicolon, "';'");
 
         mut update: ExpressionNode* = null;
-        if (!this.check(TokenType::RParen)) {
-            update = this.parse_expression();
+        if (has_paren) {
+            if (!this.check(TokenType::RParen)) {
+                update = this.parse_expression();
+            }
+            this.consume(TokenType::RParen, "')'");
+        } else {
+            // Paren-less: the update runs until the loop body's `{`.
+            if (!this.check(TokenType::LBrace)) {
+                update = this.parse_expr_no_struct_lit();
+            }
         }
-        this.consume(TokenType::RParen, "')'");
 
         const body: StatementNode* = this.parse_statement_or_block();
         return new ForStmtNode(init, condition, update, body, this.span_from(start));

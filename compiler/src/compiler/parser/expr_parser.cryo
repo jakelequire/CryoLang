@@ -435,18 +435,22 @@ public:
             } else if (this.check(TokenType::Period)) {
                 expr = this.parse_member_access_expr(expr);
             } else if (this.check(TokenType::Arrow)) {
-                // Pointer member access (treat like member access)
-                this.advance();
-                const member_tok: Token       = this.consume(TokenType::Identifier, "member name");
-                const member: SymbolStr       = this.intern_lexeme(member_tok);
-                const member_span: SourceSpan = this.span_from_token(member_tok);
-                const span: SourceSpan        = ParserBase::merge_spans(expr.span, member_span);
-
-                // First dereference, then member access
-                const deref_op: Token        = Token::new(TokenType::Star, "*", member_tok.line, member_tok.column);
-                const deref: ExpressionNode* = new UnaryExprNode(deref_op, expr, expr.span);
-
-                expr = new MemberAccessNode(deref, member, member_span, span);
+                // Cryo has no `->` operator: `.` auto-dereferences, so `foo.bar`
+                // resolves the member whether `foo` is a value or a pointer.
+                // Reject `foo->bar` with a machine-applicable fix, then recover
+                // by parsing it as `foo.bar` (parse_member_access_expr consumes
+                // the current token as the accessor), so downstream sees a
+                // well-formed member access and no cascade of errors follows.
+                const arrow_span: SourceSpan = this.current_span();
+                this.error_count += 1;
+                mut diag: Diagnostic = Diagnostic::error(
+                    ErrorCode::E0101_UNEXPECTED_TOKEN,
+                    "`->` is not a valid operator; use `.` for member access");
+                diag = diag.at(arrow_span);
+                diag = diag.with_note("Cryo has no `->` operator: `.` auto-dereferences, so `foo.bar` resolves the member whether `foo` is a value or a pointer");
+                diag = diag.suggest(Suggestion::replace(arrow_span, ".", "replace `->` with `.`"));
+                this.ctx.emit_diagnostic(diag);
+                expr = this.parse_member_access_expr(expr);
             } else if (this.check(TokenType::ColonColon)) {
                 // Scope resolution.  For chained paths like `alpha::utils::run`,
                 // join the prior `ScopeResolutionNode`'s scope and member into
@@ -476,6 +480,7 @@ public:
                 expr = this.parse_scope_member(scope_name, no_gen_args, expr.span);
             } else if (this.check(TokenType::LBrace)
                        && expr.kind == NodeKind::ScopeResolution
+                       && !this.struct_lit_suppressed()
                        && this.is_struct_literal_ahead()) {
                 // Qualified struct literal at the tail of a *deep* scope path
                 // (`A::B::C::Type { ... }`).  The 2-segment case is handled in
@@ -960,7 +965,7 @@ public:
                 this.consume(TokenType::RParen, "')'");
                 call.span = this.span_from(tok);
                 return call;
-            } else if (this.check(TokenType::LBrace)) {
+            } else if (this.check(TokenType::LBrace) && !this.struct_lit_suppressed()) {
                 // Generic struct literal: Name<T> { field: value }
                 return this.parse_struct_literal_body(name, gen_args, tok);
             } else if (this.check(TokenType::ColonColon)) {
@@ -999,7 +1004,7 @@ public:
         // validation, and codegen emits garbage. This is what makes
         // `ModB::Widget { ... }` work for same-leaf-name types in different
         // modules (member generic args carry through for `Module::Type<T> {}`).
-        if (this.check(TokenType::LBrace) && this.is_struct_literal_ahead()) {
+        if (this.check(TokenType::LBrace) && !this.struct_lit_suppressed() && this.is_struct_literal_ahead()) {
             mut lit_name: SymbolStr = name;
             mut lit_gen: TypeAnnotation*[] = [];
             if (expr.kind == NodeKind::ScopeResolution) {
@@ -1516,12 +1521,31 @@ public:
         return new YieldExprNode(operand, this.span_from(start));
     }
 
-    /// Parse a parenthesized condition: '(' expression ')'.
-    /// Shared by if, match, while, switch, and do-while parsing.
+    /// Parse a condition, with the surrounding `()` OPTIONAL.
+    /// Shared by if, match, while, switch, do-while, and pattern guards.
+    ///   `if (cond) { .. }`  — parens present: any expression, no restriction.
+    ///   `if cond { .. }`    — parens omitted: a bare struct literal at the
+    ///                         condition's own bracketing depth is suppressed so
+    ///                         the following `{` is unambiguously the body; wrap
+    ///                         a genuine struct-valued condition in `()`.
     parse_paren_condition() -> ExpressionNode* {
-        this.consume(TokenType::LParen, "'('");
+        if (this.check(TokenType::LParen)) {
+            this.consume(TokenType::LParen, "'('");
+            const expr: ExpressionNode* = this.parse_expression();
+            this.consume(TokenType::RParen, "')'");
+            return expr;
+        }
+        return this.parse_expr_no_struct_lit();
+    }
+
+    /// Parse a full expression with bare struct literals suppressed at the
+    /// current bracketing depth (see `struct_lit_suppressed`).  Used for the
+    /// paren-less forms of `if`/`while`/`for`/`match` conditions.
+    parse_expr_no_struct_lit() -> ExpressionNode* {
+        const saved: int = this.no_struct_lit_depth;
+        this.no_struct_lit_depth = this.paren_depth + this.bracket_depth;
         const expr: ExpressionNode* = this.parse_expression();
-        this.consume(TokenType::RParen, "')'");
+        this.no_struct_lit_depth = saved;
         return expr;
     }
 
