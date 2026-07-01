@@ -385,13 +385,13 @@ type struct MonoAstResolver {
         }
 
         if (arms.length == 1) {
-            // A single arm: a `_` default always applies; a single concrete type
-            // pattern must equal the scrutinee.  An originally single-arm match with
-            // a non-matching type is a genuine no-match sema's net never catches.
+            // A single arm: a `_` default always applies; otherwise the scrutinee
+            // must equal one of the arm's `|`-separated types.  A lone matching arm
+            // needs no pruning (return -1); a non-match is a genuine no-match
+            // sema's net never catches.
             const only: StaticMatchArmNode* = arms[0];
-            if (only == null || only.type_pattern == null) { return -1; }
-            const arm0: TypeRef = this.type_resolver.resolve(only.type_pattern, res_ctx);
-            if (arm0.is_valid() && arm0.id == scrut.id) { return -1; }
+            if (only == null || only.type_patterns.length == 0) { return -1; }
+            if (this.arm_matches_scrutinee(only, scrut, res_ctx)) { return -1; }
             const tn0: string = this.arena.format_display(this.arena.lookup(scrut.id));
             this.diagnostics.emit(Diagnostic::error(
                 ErrorCode::E0645_NO_STATIC_MATCH_ARM,
@@ -407,16 +407,15 @@ type struct MonoAstResolver {
         for (mut i: i64 = 0; i < arms.length; i++) {
             const arm: StaticMatchArmNode* = arms[i];
             if (arm == null) { continue; }
-            if (arm.type_pattern == null) {
+            if (arm.type_patterns.length == 0) {
                 if (wildcard_idx < 0) { wildcard_idx = i; }
                 continue;
             }
-            const arm_ty: TypeRef = this.type_resolver.resolve(arm.type_pattern, res_ctx);
-            if (arm_ty.is_valid() && arm_ty.id == scrut.id) {
+            if (this.arm_matches_scrutinee(arm, scrut, res_ctx)) {
                 if (match_idx < 0) {
                     match_idx = i;
                 } else {
-                    // A second arm with the same TypeID: ambiguous.  Keep the
+                    // A second arm matching the same TypeID: ambiguous.  Keep the
                     // deterministic first-wins selection but surface the ambiguity.
                     const dn: string = this.arena.format_display(this.arena.lookup(scrut.id));
                     this.diagnostics.emit(Diagnostic::error(
@@ -440,6 +439,18 @@ type struct MonoAstResolver {
             .with_note("add an arm for this type or a `_` default arm"));
         this.state.error_count += 1;
         return -1;
+    }
+
+    /// True if the scrutinee's TypeID equals any of `arm`'s `|`-separated type
+    /// patterns.  A `static match` arm may list several types that share one body
+    /// (`u8 | u16 | u32 => ...`); the arm is live if the scrutinee matches any.
+    arm_matches_scrutinee(mut &this, arm: StaticMatchArmNode*, scrut: TypeRef,
+                          res_ctx: ResolutionContext*) -> boolean {
+        for (mut p: i64 = 0; p < arm.type_patterns.length; p++) {
+            const arm_ty: TypeRef = this.type_resolver.resolve(arm.type_patterns[p], res_ctx);
+            if (arm_ty.is_valid() && arm_ty.id == scrut.id) { return true; }
+        }
+        return false;
     }
 
     /// Resolve signatures on an array of methods; delegates core signature
