@@ -1611,19 +1611,26 @@ public:
         return sm;
     }
 
-    /// Parse one static-match arm: `<type> => body` or `_ => body`. A `_`
-    /// leaves `type_pattern` null (wildcard). Body is a block or a single
-    /// expression wrapped in a block, mirroring parse_expr_match_arm.
+    /// Parse one static-match arm: `<type> | <type> | ... => body` or
+    /// `_ => body`. A `_` leaves `type_patterns` empty (wildcard). Body is a
+    /// block or a single expression wrapped in a block, mirroring
+    /// parse_expr_match_arm.
     parse_static_match_arm() -> StaticMatchArmNode* {
         const start: Token = this.current();
         mut arm: StaticMatchArmNode* = new StaticMatchArmNode(
             this.span_from_token(start));
 
         if (this.check(TokenType::Identifier) && this.current().lexeme == "_") {
-            this.advance(); // wildcard `_`; type_pattern stays null
+            this.advance(); // wildcard `_`; type_patterns stays empty
         } else {
-            const ty: TypeAnnotation* = this.parse_type_annotation();
-            arm.set_type_pattern(ty);
+            // One or more `|`-separated type patterns share this arm's body:
+            // `u8 | u16 | u32 => { ... }` matches if the scrutinee equals ANY of
+            // the listed types (same `|` alternation as a regular match arm).
+            while (true) {
+                const ty: TypeAnnotation* = this.parse_type_annotation();
+                if (ty != null) { arm.add_type_pattern(ty); }
+                if (!this.match_tok(TokenType::Pipe)) { break; }
+            }
         }
 
         this.consume(TokenType::FatArrow, "'=>'");

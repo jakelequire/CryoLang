@@ -286,6 +286,13 @@ Guard              ::= "if" "(" Expr ")"   (* checked after the pattern matches 
 Switch             ::= "switch" "(" Expr ")" "{" CaseClause* "}"
 CaseClause         ::= ("case" Expr | "default") ":" Statement*
 
+StaticMatch        ::= "static" "match" "(" Type ")" "{" StaticMatchArm* "}"
+                       (* compile-time type dispatch; usable in statement or
+                          expression position inside a generic body *)
+StaticMatchArm     ::= (Type ("|" Type)* | "_") "=>" (Block | Expr)
+                       (* one or more `|`-separated types share the arm's body;
+                          `_` is the wildcard default *)
+
 
 (*  Patterns =================================================== *)
 
