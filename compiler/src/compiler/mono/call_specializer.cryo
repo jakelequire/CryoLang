@@ -225,6 +225,15 @@ type struct MonoCallSpecializer {
                 const inner: DeclarationNode* = ds.declaration;
                 if (inner != null && (inner as ASTNode*).kind == NodeKind::VariableDeclaration) {
                     mut vd: VarDeclNode* = inner as VarDeclNode*;
+                    // Inside a generic-static-method body re-walk: a local typed with
+                    // the bare owner name (`mut s: String`) keeps the bare template
+                    // type; point it at the concrete owner spec (by name + type) so
+                    // it agrees with the concretized return and the post-mono sema
+                    // pass, exactly as owner materialization types a non-generic
+                    // sibling's local.
+                    if (this.gsm_owner_recv.is_valid()) {
+                        this.concretize_owner_local(vd);
+                    }
                     if (vd.initializer != null) {
                         this.walk_expr(vd.initializer, res_ctx, subst);
                         // Sema already typed this binding to a concrete
@@ -1255,6 +1264,28 @@ type struct MonoCallSpecializer {
             if (!binds[i].is_valid() || this.arena.contains_generic_param(binds[i])) { return []; }
         }
         return binds;
+    }
+
+    /// Re-point a local whose annotation is the BARE owner name (`mut s: String`
+    /// in a generic-static-method body) at the concrete owner spec — both the
+    /// annotation NAME (so the post-mono sema pass resolves it to the spec, not the
+    /// bare template) and the cached `resolved_type`.  Only fires inside the
+    /// generic-static-method body re-walk (`gsm_owner_*` set).  Mirrors the
+    /// struct-literal `struct_type` rewrite; together they make every bare
+    /// owner-name reference in the spec body resolve to the concrete owner, so a
+    /// `new()+push()+return-local` constructor body is internally consistent.
+    concretize_owner_local(mut &this, vd: VarDeclNode*) -> void {
+        if (vd == null || vd.type_annotation == null) { return; }
+        if (!this.gsm_owner_spec.is_valid()) { return; }
+        match (*vd.type_annotation) {
+            TypeAnnotation::Named(named) => {
+                if (named != null && named.name.equals(this.gsm_owner_leaf)) {
+                    named.name = this.gsm_owner_spec;
+                    vd.resolved_type = this.gsm_owner_recv;
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Find the materialized owner spec entry for an owner instantiation
