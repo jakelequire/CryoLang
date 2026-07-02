@@ -99,6 +99,29 @@ type struct MoveChecker {
     /// fires.  Pushed around each arm body's walk, truncated after the join.
     pat_binding_keys: u32[];
 
+    /// Partial-move set: parallel arrays recording a non-Copy *droppable*
+    /// FIELD moved out of a non-`Drop` owned local (the Rust partial-move
+    /// model, "allow + track" half).  `pm_binding[i]` is the owning binding's
+    /// name id, `pm_field[i]` the moved field's name id.  A move is recorded
+    /// (and ALLOWED) only when the owner is a straight-line (`branch_depth ==
+    /// 0`) bare local of a struct/class with no user `Drop`, so
+    /// drop_insertion can skip exactly these fields at the owner's scope exit
+    /// - no drop flags needed because an unconditional move is definitely gone
+    /// at every scope exit.  Everything else stays a hard E0453.  Mirrors
+    /// drop_insertion's `pm_binding`/`pm_field`; the two passes MUST classify
+    /// the identical set (a divergence is a double-free or a leak).  Reset in
+    /// `enter_function`.
+    pm_binding: u32[];
+    pm_field:   u32[];
+
+    /// Depth of enclosing conditional / loop bodies.  A partial field move is
+    /// tracked only at `branch_depth == 0`; inside any `if`/`match`/`switch`/
+    /// loop body it stays a hard E0453, because drop-skip without per-field
+    /// drop flags is sound only for an *unconditional* move.  Incremented
+    /// around `merge_branches` / `merge_switch_cases` / `walk_loop_body`;
+    /// mirrored in drop_insertion.
+    branch_depth: i64;
+
     fired: i64;
     /// Count of fatal (loop-carried) use-after-move errors.  Non-zero
     /// fails the pass, which (MoveCheck being fatal_on_failure) aborts
@@ -121,6 +144,9 @@ type struct MoveChecker {
             captured_decl_keys: [],
             carried_keys:       [],
             pat_binding_keys:   [],
+            pm_binding:         [],
+            pm_field:           [],
+            branch_depth:       0,
             fired: 0,
             fatal: 0,
         };
@@ -136,6 +162,9 @@ type struct MoveChecker {
         this.captured_decl_keys = [];
         this.carried_keys       = [];
         this.pat_binding_keys   = [];
+        this.pm_binding         = [];
+        this.pm_field           = [];
+        this.branch_depth       = 0;
         for (mut i: i64 = 0; i < func.parameters.length; i++) {
             const param: VarDeclNode* = func.parameters[i];
             if (param == null) { continue; }
@@ -410,6 +439,9 @@ type struct MoveChecker {
     /// branch: it is skipped, contributing nothing to the union, which
     /// leaves a one-sided move correctly *possibly*-moved.
     merge_branches(mut &this, bodies: StatementNode*[]) -> void {
+        // Inside a conditional: a field-move-out here is NOT an unconditional
+        // partial move, so partial_move_allowed rejects it (stays E0453).
+        this.branch_depth += 1;
         // Full pre-branch snapshot (element-wise copy). A length checkpoint
         // alone is unsound here: an in-branch assignment (`x = ...`) calls
         // `unmark_moved`, which REBUILDS the moved-set without `x`, deleting
@@ -517,6 +549,7 @@ type struct MoveChecker {
         for (mut i: i64 = 0; i < u_keys.length; i++) {
             this.mark_moved(SymbolStr::from_id(u_keys[i]), u_spans[i], u_real[i]);
         }
+        this.branch_depth -= 1;
     }
 
     /// Emit a use-after-move error with a primary label at the use
@@ -799,6 +832,7 @@ type struct MoveChecker {
     /// which the union models correctly (a one-sided move stays *possibly*
     /// moved and is conservatively treated as Moved).
     merge_switch_cases(mut &this, cases: &CaseStmtNode*[]) -> void {
+        this.branch_depth += 1;
         // Full pre-switch snapshot (see `merge_branches` for why a length
         // checkpoint is unsound when a case revives a pre-switch move).
         mut pre_keys:  u32[]        = [];
@@ -875,6 +909,7 @@ type struct MoveChecker {
         for (mut i: i64 = 0; i < u_keys.length; i++) {
             this.mark_moved(SymbolStr::from_id(u_keys[i]), u_spans[i], u_real[i]);
         }
+        this.branch_depth -= 1;
     }
 
     /// Walk a loop body with loop-carried-move detection.
@@ -895,6 +930,9 @@ type struct MoveChecker {
     /// positives, at the cost of missing moves guarded by an inner `if`.
     walk_loop_body(mut &this, body: StatementNode*) -> void {
         if (body == null) { return; }
+        // A loop body is conditional (0+ iterations): a field-move-out inside
+        // it is not an unconditional partial move, so it stays E0453.
+        this.branch_depth += 1;
         // All bookkeeping uses persistent parallel-array stacks with
         // length checkpoints (like `moved_keys`), so nested loops just
         // push and truncate - no array reassignment, no aliasing.
@@ -939,6 +977,7 @@ type struct MoveChecker {
         // to the following code.
         this.truncate_carried(carry_snap);
         this.restore_moves(snap);
+        this.branch_depth -= 1;
     }
 
     walk_var_decl(mut &this, vd: VarDeclNode*) -> void {
@@ -1292,6 +1331,104 @@ type struct MoveChecker {
         return;
     }
 
+    // ---- partial-move tracking (the "allow + track" half) ----------------
+
+    pm_has(&this, binding_id: u32, field_id: u32) -> boolean {
+        for (mut i: i64 = 0; i < this.pm_binding.length; i++) {
+            if (this.pm_binding[i] == binding_id && this.pm_field[i] == field_id) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    pm_has_binding(&this, binding_id: u32) -> boolean {
+        for (mut i: i64 = 0; i < this.pm_binding.length; i++) {
+            if (this.pm_binding[i] == binding_id) { return true; }
+        }
+        return false;
+    }
+
+    /// True when `ty` carries a user-written destructor (an inherent `drop`
+    /// method or an `implement trait Drop` block).  Such an owner's `drop`
+    /// is opaque code that will free every field it thinks it owns, so a
+    /// field moved out of it double-frees - partial moves stay forbidden.
+    has_user_drop(&this, ty: TypeRef) -> boolean {
+        if (!ty.is_valid() || this.arena == null) { return false; }
+        if (OwnershipQuery::has_inherent_drop(this.arena, this.registry,
+                                              this.intern, ty)) { return true; }
+        return OwnershipQuery::type_implements_drop(this.arena, this.registry,
+                                                    this.intern, ty);
+    }
+
+    /// Resolve `ty` to the underlying struct/class Type* whose per-field drop
+    /// glue we can enumerate, peeling `InstantiatedType` wrappers.  Returns
+    /// null for anything we can't safely drop field-by-field (unions, enums,
+    /// arrays, primitives, unresolved generics).  Mirrors
+    /// drop_insertion::aggregate_type_of so both passes agree on which owners
+    /// admit a partial move.
+    aggregate_type_of(&this, ty: TypeRef) -> Type* {
+        if (!ty.is_valid() || this.arena == null) { return null as Type*; }
+        mut cur: TypeRef = ty;
+        mut t: Type* = this.arena.lookup(cur.id);
+        mut guard: i32 = 0;
+        while (t != null && t.kind == TypeKind::InstantiatedType && guard < 16) {
+            const inst: InstantiatedType* = t as InstantiatedType*;
+            if (!inst.has_resolved_type()) { return null as Type*; }
+            cur = inst.resolved_type;
+            t = this.arena.lookup(cur.id);
+            guard = guard + 1;
+        }
+        if (t == null) { return null as Type*; }
+        if (t.kind == TypeKind::Struct) {
+            const st: StructType* = t as StructType*;
+            if (st.is_union) { return null as Type*; }
+            return t;
+        }
+        if (t.kind == TypeKind::Class) { return t; }
+        return null as Type*;
+    }
+
+    /// v1 allow-rule for a field-move-out `ma` (`p.field`): permit (and track)
+    /// it ONLY when the owner is a straight-line bare local of a non-`Drop`
+    /// struct/class value.  Anything else keeps the conservative E0453.
+    partial_move_allowed(&this, ma: MemberAccessNode*) -> boolean {
+        // Unconditional only: drop-skip without per-field flags is sound only
+        // for a definitely-moved field.
+        if (this.branch_depth != 0) { return false; }
+        if (ma.object == null || ma.object.kind != NodeKind::Identifier) {
+            return false;
+        }
+        const id: IdentifierNode* = ma.object as IdentifierNode*;
+        // Must be a real `let`/param local (in the types map); pattern payload
+        // bindings are excluded (their subject-glue-suppression is whole-payload
+        // only - see the handoff), so their field moves stay rejected.
+        const decl_ty: TypeRef = this.lookup_type(id.name);
+        if (!decl_ty.is_valid()) { return false; }
+        if (this.is_pat_binding(id.name.id)) { return false; }
+        // Owned value place (not a borrow), non-`Drop`, and a struct/class whose
+        // fields we can drop individually.
+        if (this.is_ptr_or_ref(decl_ty)) { return false; }
+        if (this.has_user_drop(decl_ty)) { return false; }
+        if (this.aggregate_type_of(decl_ty) == null) { return false; }
+        return true;
+    }
+
+    emit_double_field_move(mut &this, ma: MemberAccessNode*) -> void {
+        const field: string = this.intern.resolve(ma.member);
+        const headline: string = format(
+            "field '%s' moved out of a value more than once", field);
+        mut diag: Diagnostic = Diagnostic::error(
+            ErrorCode::E0452_USE_AFTER_MOVE, headline);
+        diag = diag.at_with_label(ma.span,
+            "this field was already moved out of the value (double free)");
+        diag = diag.help(
+            "a value can be moved out of a given field only once");
+        this.ctx.emit_diagnostic(diag);
+        this.fired += 1;
+        this.fatal += 1;
+    }
+
     /// True when `ty` is a pointer or reference: an address-sized handle
     /// that does not own its referent.  A field projected through such a
     /// handle reads heap or borrowed storage that is NOT drop-glued at
@@ -1372,6 +1509,24 @@ type struct MoveChecker {
         if (!field_ty.is_valid() || this.is_copy(field_ty)) { return; }
         // The source must be an owned, glue-dropped value place.
         if (!this.is_owned_value_place(ma.object)) { return; }
+        // Partial-move model ("allow + track" half): a non-Copy *droppable*
+        // field moved out of a straight-line, non-`Drop` owned local is
+        // ALLOWED and recorded, so drop_insertion skips exactly this field at
+        // the owner's scope exit (per-field glue makes that sound).  Every
+        // other shape - `Drop` owner, in-branch (conditional) move, pattern
+        // binding, non-droppable non-Copy field - keeps the hard E0453.
+        if (this.type_needs_drop(field_ty) && this.partial_move_allowed(ma)) {
+            const owner_id: u32 = (ma.object as IdentifierNode*).name.id;
+            const field_id: u32 = ma.member.id;
+            if (this.pm_has(owner_id, field_id)) {
+                // Moving the SAME field out twice is a double free.
+                if (!this.suppress_emit) { this.emit_double_field_move(ma); }
+                return;
+            }
+            this.pm_binding.push(owner_id);
+            this.pm_field.push(field_id);
+            return;
+        }
         this.emit_move_out_error(ma);
     }
 
@@ -1473,6 +1628,27 @@ type struct MoveChecker {
             this.intern.resolve(name), ty.id, _is_copy as i32,
             _is_moved as i32, in_move_context as i32);
         if (_is_copy) { return; }
+
+        // A whole by-value move of an aggregate that already has a field moved
+        // out of it is a partial-move violation: the value has a hole and
+        // cannot be moved/consumed as a unit.  Reads/borrows (`&p`, `p.other`)
+        // stay fine; only a real move (`real`) is rejected.
+        if (in_move_context && real && this.pm_has_binding(name.id)) {
+            if (!this.suppress_emit) {
+                const headline: string = format(
+                    "use of partially-moved value '%s'", this.intern.resolve(name));
+                mut diag: Diagnostic = Diagnostic::error(
+                    ErrorCode::E0452_USE_AFTER_MOVE, headline);
+                diag = diag.at_with_label(ident.span,
+                    "value moved here after one of its fields was already moved out");
+                diag = diag.help(
+                    "a value with a moved-out field cannot be moved or consumed as a whole");
+                this.ctx.emit_diagnostic(diag);
+                this.fired += 1;
+                this.fatal += 1;
+            }
+            return;
+        }
 
         if (this.is_moved(name)) {
             // A real move site re-reading an already-moved binding upgrades

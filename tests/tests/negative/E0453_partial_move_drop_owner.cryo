@@ -1,0 +1,40 @@
+// E0453: the partial-move model ("allow + track") applies ONLY to owners with
+// no user-written destructor.  A struct that implements `Drop` runs opaque
+// user code (`drop(mut &this)`) that frees every field it believes it owns, so
+// moving a field OUT of it and letting that `drop` run again double-frees the
+// moved field.  Such a field-move-out therefore stays a hard E0453 - the
+// compiler cannot skip a field of an opaque user drop.
+![config(testing)]
+![config(negative, E0453)]
+namespace CryoTests::Negative::PartialMoveDropOwner;
+
+type struct Heap {
+    p: void*;
+}
+
+implement trait Drop for struct Heap {
+    drop(mut &this) -> void { free(this.p); }
+}
+
+type struct Owner {
+    h:   Heap;
+    tag: i32;
+}
+
+implement trait Drop for struct Owner {
+    // Opaque user drop: it will free `h` again at scope exit.
+    drop(mut &this) -> void { this.h.drop(); }
+}
+
+function take(x: Heap) -> void {
+    mut y: Heap = x;
+    y.drop();
+}
+
+function main() -> int {
+    mut o: Owner = Owner { h: Heap { p: malloc(16) }, tag: 1 };
+    // Moving `h` out of a `Drop`-owning value: E0453 (partial moves are only
+    // tracked for non-`Drop` owners).
+    take(o.h);   // error[E0453]: cannot move field 'h' out of a value that owns a destructor
+    return 0;
+}
