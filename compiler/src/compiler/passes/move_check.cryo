@@ -88,6 +88,17 @@ type struct MoveChecker {
     captured_decl_keys: u32[];
     carried_keys:       u32[];
 
+    /// Names bound by an enum/match pattern in an enclosing arm (e.g. `pair`
+    /// in `Some(pair) => ...`).  These are by-value payload bindings the
+    /// pattern MOVED out of the (drop-glued) subject, so - exactly like a
+    /// `let` local - moving a non-Copy FIELD out of one leaves the source's
+    /// scope-exit glue to drop that field a second time.  They are NOT put in
+    /// the `types` map (that would fold them into whole-binding move tracking
+    /// and change behaviour broadly); this narrow set only teaches
+    /// `is_owned_value_place` to recognise them so `check_field_move_out`
+    /// fires.  Pushed around each arm body's walk, truncated after the join.
+    pat_binding_keys: u32[];
+
     fired: i64;
     /// Count of fatal (loop-carried) use-after-move errors.  Non-zero
     /// fails the pass, which (MoveCheck being fatal_on_failure) aborts
@@ -109,6 +120,7 @@ type struct MoveChecker {
             capture_decls:      false,
             captured_decl_keys: [],
             carried_keys:       [],
+            pat_binding_keys:   [],
             fired: 0,
             fatal: 0,
         };
@@ -123,6 +135,7 @@ type struct MoveChecker {
         this.capture_decls      = false;
         this.captured_decl_keys = [];
         this.carried_keys       = [];
+        this.pat_binding_keys   = [];
         for (mut i: i64 = 0; i < func.parameters.length; i++) {
             const param: VarDeclNode* = func.parameters[i];
             if (param == null) { continue; }
@@ -140,6 +153,47 @@ type struct MoveChecker {
         if (this.capture_decls) {
             this.captured_decl_keys.push(name.id);
         }
+    }
+
+    /// Record an arm's enum-pattern payload binding names (direct + nested)
+    /// as pattern-bound owned places for the duration of the arm walk, so
+    /// `check_field_move_out` catches a field moved out of one.  Mirrors
+    /// `drop_insertion::register_enum_pattern_bindings` (which registers the
+    /// same names for consumption/drop-glue on its side).  Returns nothing;
+    /// callers truncate `pat_binding_keys` back to a saved length after the join.
+    register_arm_pat_bindings(mut &this, arm: MatchArmNode*) -> void {
+        if (arm == null) { return; }
+        for (mut p: i64 = 0; p < arm.patterns.length; p++) {
+            const pat: PatternNode* = arm.patterns[p];
+            if (pat == null || pat.pattern_kind != PatternKind::Enum) { continue; }
+            this.register_enum_pat_bindings(pat as EnumPatternNode*);
+        }
+    }
+
+    register_enum_pat_bindings(mut &this, epat: EnumPatternNode*) -> void {
+        if (epat == null) { return; }
+        for (mut pos: i64 = 0; pos < epat.elements.length; pos++) {
+            const pb: PatternBinding* = epat.binding_at(pos);
+            if (pb != null && pb.name.is_valid()) {
+                this.pat_binding_keys.push(pb.name.id);
+                continue;
+            }
+            const sub: PatternNode* = epat.sub_at(pos);
+            if (sub != null && sub.pattern_kind == PatternKind::Enum) {
+                this.register_enum_pat_bindings(sub as EnumPatternNode*);
+            }
+        }
+    }
+
+    truncate_pat_bindings(mut &this, n: i64) -> void {
+        while (this.pat_binding_keys.length > n) { this.pat_binding_keys.pop(); }
+    }
+
+    is_pat_binding(&this, key: u32) -> boolean {
+        for (mut i: i64 = 0; i < this.pat_binding_keys.length; i++) {
+            if (this.pat_binding_keys[i] == key) { return true; }
+        }
+        return false;
     }
 
     is_body_local(&this, key: u32, from: i64) -> boolean {
@@ -621,10 +675,17 @@ type struct MoveChecker {
                 // implicit live fall-through arm.
                 const m: MatchStmtNode* = stmt as MatchStmtNode*;
                 if (m.subject != null) { this.walk_expr_read(m.subject); }
+                // Register every arm's payload bindings as pattern-bound owned
+                // places for the merge (membership-only, so cross-arm overlap
+                // is harmless: an arm body references only its own bindings).
+                // This is what lets `check_field_move_out` catch a field moved
+                // out of a `Some(pair) => ...` binding.
+                const pat_snap: i64 = this.pat_binding_keys.length;
                 mut arm_bodies: StatementNode*[] = [];
                 for (mut ai: i64 = 0; ai < m.arms.length; ai++) {
                     const arm: MatchArmNode* = m.arms[ai];
                     if (arm != null) {
+                        this.register_arm_pat_bindings(arm);
                         // A guard runs before the arm body; walk it as a read
                         // (like an `if` condition) so any move inside it is
                         // tracked. Reads of arm-local pattern bindings are
@@ -634,6 +695,7 @@ type struct MoveChecker {
                     }
                 }
                 this.merge_branches(arm_bodies);
+                this.truncate_pat_bindings(pat_snap);
             }
             NodeKind::StaticMatchStatement => {
                 // Single live arm post-monomorphization: walk it as a plain
@@ -1179,10 +1241,12 @@ type struct MoveChecker {
     read_match(mut &this, m: MatchExprNode*) -> void {
         if (m == null) { return; }
         if (m.subject != null) { this.walk_expr_read(m.subject); }
+        const pat_snap: i64 = this.pat_binding_keys.length;
         mut arm_bodies: StatementNode*[] = [];
         for (mut i: i64 = 0; i < m.arms.length; i++) {
             const arm: MatchArmNode* = m.arms[i];
             if (arm != null) {
+                this.register_arm_pat_bindings(arm);
                 // Guard runs before the body; walk as a read (see the
                 // statement-match handler for the rationale).
                 if (arm.guard != null) { this.walk_expr_read(arm.guard); }
@@ -1190,6 +1254,7 @@ type struct MoveChecker {
             }
         }
         this.merge_branches(arm_bodies);
+        this.truncate_pat_bindings(pat_snap);
         return;
     }
 
@@ -1257,10 +1322,21 @@ type struct MoveChecker {
             // a Reference - a borrow we don't drop here.  A binding absent
             // from the local map (global, function name) isn't a
             // scope-glued local either.
-            const decl_ty: TypeRef = this.lookup_type((obj as IdentifierNode*).name);
-            if (!decl_ty.is_valid()) { return false; }
-            if (this.is_ptr_or_ref(decl_ty)) { return false; }
-            return true;
+            const id: IdentifierNode* = obj as IdentifierNode*;
+            const decl_ty: TypeRef = this.lookup_type(id.name);
+            if (decl_ty.is_valid()) {
+                return !this.is_ptr_or_ref(decl_ty);
+            }
+            // Not a `let`/param local.  An enum/match PATTERN payload binding
+            // (`Some(pair) => ...`) is a by-value owned place too - it was
+            // moved out of the drop-glued subject - but it never entered the
+            // `types` map (see `pat_binding_keys`).  Pattern bindings carry no
+            // `&this` auto-deref subtlety, so the node's resolved type is the
+            // binding's own type: value => owned place, ptr/ref => a borrow.
+            if (this.is_pat_binding(id.name.id)) {
+                return !this.is_ptr_or_ref(obj.resolved_type);
+            }
+            return false;
         }
         if (obj.kind == NodeKind::MemberAccess) {
             // An intermediate field that is itself a pointer/reference

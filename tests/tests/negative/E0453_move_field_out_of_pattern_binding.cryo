@@ -1,0 +1,53 @@
+// E0453: moving a non-Copy field OUT of a match/enum PATTERN payload
+// binding is the same double-free as moving one out of a `let` local -
+// the payload binding is a by-value owned place, so the source's
+// scope-exit drop glue frees the moved field a second time.
+//
+// Regression for the partial-field-move double-free that slipped through
+// when the source was a pattern binding: move_check registered `let`
+// locals but NOT match-arm payload bindings, so `is_owned_value_place`
+// returned false for them and `check_field_move_out` was silently
+// skipped - the field-move-out into the consuming call argument compiled
+// and double-freed at runtime (surfaced as an infinite-recursion crash in
+// the LSP's JSON-RPC encoder cloning the resulting cyclic WorkspaceEdit).
+// The escape hatch is the same: `core::mem::swap`, or restructure so the
+// field is not moved out of the still-live aggregate.
+![config(testing)]
+![config(negative, E0453)]
+namespace CryoTests::Negative::MoveFieldOutOfPatternBinding;
+
+type struct Heap {
+    p: void*;
+}
+
+implement trait Drop for struct Heap {
+    drop(mut &this) -> void { free(this.p); }
+}
+
+type struct Holder {
+    h:   Heap;
+    tag: i32;
+}
+
+function take(x: Heap) -> void {
+    // consumes `x` (by-value owning parameter); the callee drops it.
+    mut y: Heap = x;
+    y.drop();
+}
+
+function make() -> Holder {
+    return Holder { h: Heap { p: malloc(16) }, tag: 1 };
+}
+
+function main() -> int {
+    // `owner` is a match-arm payload binding (a by-value owned place),
+    // not a `let` local.  Moving its non-Copy `h` field out into the
+    // consuming `take(...)` argument double-frees at `owner`'s scope exit.
+    match (Option::Some(make())) {
+        Option::Some(owner) => {
+            take(owner.h);   // error[E0453]: cannot move field 'h' out of a value that owns a destructor
+        }
+        Option::None => { }
+    }
+    return 0;
+}
