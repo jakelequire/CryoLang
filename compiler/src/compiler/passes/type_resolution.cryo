@@ -26,7 +26,7 @@ import Compiler::Passes::PassID;
 import Compiler::CompilationContext;
 import Compiler::Types;
 import Compiler::Types::{
-    TypeRef, Type, UserDefined, Compound, Generic, Arena, Registry, Resolver, GenericRegistry
+    TypeRef, Type, UserDefined, Compound, Generic, Arena, Registry, Resolver, GenericRegistry, Ownership
 };
 import Compiler::Resolver::{ InternTable, SymbolID, SymbolStr, Symbol, Resolver };
 import Utils::Logger;
@@ -1287,6 +1287,39 @@ type struct TypeResolutionPasses {
                             && !canonical_target.equals(node.target_type)) {
                             ctx.generic_registry.register_trait_impl(
                                 trait_root, canonical_target, node);
+                        }
+                        // Precise (collision-proof) registration by canonical
+                        // BASE type id.  This is the authoritative, import-
+                        // resolved site, so resolving `canonical_target` to its
+                        // arena type here yields the same base id the ownership
+                        // Drop/Copy queries derive from a target TypeRef - which
+                        // lets a user type that merely SHARES a stdlib type's
+                        // leaf (e.g. a local `Pair` vs stdlib `Pair<A,B>`) no
+                        // longer inherit its Drop impl.  Ungated (also covers
+                        // same-module impls where canonical_target == bare); a
+                        // non-aggregate / unresolvable target yields base id 0
+                        // and is skipped (bare-name fallback still applies).
+                        if (trait_root.is_valid()) {
+                            mut tgt_ref: TypeRef = ctx.decl_index.lookup_type(
+                                ctx.decl_index.resolve_qualified(canonical_target));
+                            if (!tgt_ref.is_valid()) {
+                                tgt_ref = ctx.decl_index.lookup_type(canonical_target);
+                            }
+                            if (!tgt_ref.is_valid()) {
+                                tgt_ref = ctx.decl_index.lookup_type(node.target_type);
+                            }
+                            if (tgt_ref.is_valid()) {
+                                const base_id: u64 =
+                                    OwnershipQuery::named_base_type_id(
+                                        ctx.type_arena, tgt_ref);
+                                if (base_id != 0) {
+                                    const tgt_leaf: SymbolStr =
+                                        OwnershipQuery::registry_name_of(
+                                            ctx.type_arena, ctx.intern_table, tgt_ref);
+                                    ctx.generic_registry.register_trait_impl_typed(
+                                        trait_root, tgt_leaf, base_id, node);
+                                }
+                            }
                         }
                     }
                 }

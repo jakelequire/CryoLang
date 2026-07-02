@@ -47,10 +47,32 @@ type struct Mixed { p: Probe; id: i32; }
 // partial-move model).  Contrast `Cell`/`Mixed` above (borrow/Copy paths).
 type struct ProbePair { a: Probe; b: Probe; }
 
+// Regression: a user type whose LEAF NAME collides with a stdlib `Drop` type
+// (`Pair<A,B>` in std::collections::pair) must NOT inherit that Drop by
+// bare-name collision.  The trait-impl registry keys Drop precisely by the
+// target's canonical base arena type id, so this local `Pair` - which has no
+// `Drop` and is never imported alongside the stdlib one - is correctly a
+// non-`Drop` owner: its field move is allowed and its live field drops once.
+// Before the id-keying fix this was a spurious E0453.
+type struct Pair { a: Probe; b: Probe; }
+
 // Consumes its by-value owning argument (drops it exactly once).
 function sink(p: Probe) -> void {
     mut y: Probe = p;
     y.drop();
+}
+
+// ---- leaf-name collision with a stdlib Drop type is not inherited ---------
+
+![test]
+function colliding_leaf_name_is_not_drop() -> Result<(), TestError> {
+    reset();
+    {
+        mut pr: Pair = Pair { a: Probe { tag: 1 }, b: Probe { tag: 2 } };
+        sink(pr.a);   // a moved out (count -> 1); pr is a NON-Drop owner
+        // pr.b still live -> dropped once by per-field glue (count -> 2)
+    }
+    return expect_eq(count(), 2);
 }
 
 // ---- partial move out of a non-`Drop` owner: move one field --------------

@@ -101,8 +101,7 @@ type struct OwnershipQuery {
         // use either.
         if (k == TypeKind::Struct) {
             const st: StructType* = t as StructType*;
-            const sbare: SymbolStr = OwnershipQuery::leaf_segment(intern, st.qualified_name);
-            if (OwnershipQuery::has_drop_impl(registry, intern, sbare)) {
+            if (OwnershipQuery::type_has_drop_impl(arena, registry, intern, ty)) {
                 return false;
             }
             if (OwnershipQuery::has_inherent_drop(arena, registry, intern, ty)) {
@@ -120,8 +119,7 @@ type struct OwnershipQuery {
         }
         if (k == TypeKind::Class) {
             const ct: ClassType* = t as ClassType*;
-            const cbare: SymbolStr = OwnershipQuery::leaf_segment(intern, ct.qualified_name);
-            if (OwnershipQuery::has_drop_impl(registry, intern, cbare)) {
+            if (OwnershipQuery::type_has_drop_impl(arena, registry, intern, ty)) {
                 return false;
             }
             if (OwnershipQuery::has_inherent_drop(arena, registry, intern, ty)) {
@@ -132,8 +130,7 @@ type struct OwnershipQuery {
         }
         if (k == TypeKind::Enum) {
             const et: EnumType* = t as EnumType*;
-            const ebare: SymbolStr = OwnershipQuery::leaf_segment(intern, et.qualified_name);
-            if (OwnershipQuery::has_drop_impl(registry, intern, ebare)) {
+            if (OwnershipQuery::type_has_drop_impl(arena, registry, intern, ty)) {
                 return false;
             }
             if (OwnershipQuery::has_inherent_drop(arena, registry, intern, ty)) {
@@ -152,14 +149,12 @@ type struct OwnershipQuery {
         }
 
         // InstantiatedType wrappers route Drop lookup through both
-        // the trait-impl registry (template's bare name) and the
+        // the trait-impl registry (template's canonical base type id) and the
         // inherent-method walk (which handles the cloned spec's
         // own `drop` method). Either match marks the type non-Copy.
         if (k == TypeKind::InstantiatedType) {
             const inst: InstantiatedType* = t as InstantiatedType*;
-            const template_bare: SymbolStr =
-                OwnershipQuery::registry_name_of(arena, intern, ty);
-            if (OwnershipQuery::has_drop_impl(registry, intern, template_bare)) {
+            if (OwnershipQuery::type_has_drop_impl(arena, registry, intern, ty)) {
                 return false;
             }
             if (OwnershipQuery::has_inherent_drop(arena, registry, intern, ty)) {
@@ -671,15 +666,61 @@ type struct OwnershipQuery {
         return false;
     }
 
-    /// Top-level Drop-impl predicate. Resolves `ty` to a registry-keyable
-    /// name and reports whether `implement trait Drop for <leaf> { ... }`
-    /// was registered. Returns false for unresolved or unnamed types.
+    /// Top-level Drop-impl predicate. Reports whether `implement trait Drop for
+    /// <ty> { ... }` was registered, using the PRECISE (collision-proof) type
+    /// identity when available and falling back to the bare-name lookup
+    /// otherwise (see `type_has_drop_impl`).
     static type_implements_drop(arena: TypeArena*, registry: GenericRegistry*,
                                  intern: InternTable*, ty: TypeRef) -> boolean {
+        return OwnershipQuery::type_has_drop_impl(arena, registry, intern, ty);
+    }
+
+    /// The target's canonical BASE arena type id for a NAMED aggregate
+    /// (struct/class/enum), peeling an `InstantiatedType` to its template via
+    /// `generic_base`.  Returns 0 for anything else (primitive, pointer, alias,
+    /// tuple, unresolved) - those never carry a user `Drop` we key precisely,
+    /// and 0 tells the caller to use the bare-name fallback.  This is the SINGLE
+    /// base-id function both the registration side (type_resolution R1) and the
+    /// lookup side use, so their keys always agree.
+    static named_base_type_id(arena: TypeArena*, ty: TypeRef) -> u64 {
+        if (arena == null || !ty.is_valid()) { return 0; }
+        const t: Type* = arena.lookup(ty.id);
+        if (t == null) { return 0; }
+        if (t.kind == TypeKind::InstantiatedType) {
+            const inst: InstantiatedType* = t as InstantiatedType*;
+            return OwnershipQuery::named_base_type_id(arena, inst.generic_base);
+        }
+        if (t.kind == TypeKind::Struct || t.kind == TypeKind::Class ||
+            t.kind == TypeKind::Enum) {
+            return ty.id;
+        }
+        return 0;
+    }
+
+    /// Precise, collision-proof "does `ty` carry a user `Drop` trait impl?".
+    ///
+    /// When `ty`'s base type is a named aggregate AND its `(Drop, leaf)` pair was
+    /// precisely registered (some type with that leaf has a Drop impl), the
+    /// TYPE-ID index is authoritative: a hit means Drop, a MISS is a genuine
+    /// negative - this is what stops a user `Pair` from inheriting stdlib
+    /// `Pair<A,B>`'s Drop by bare-name collision.  Otherwise (unresolvable base,
+    /// or a leaf never precisely registered) we fall back to the historical
+    /// bare-name lookup, so a Drop impl can never be MISSED (the fatal
+    /// direction) - the fix only ever REMOVES false positives.
+    static type_has_drop_impl(arena: TypeArena*, registry: GenericRegistry*,
+                              intern: InternTable*, ty: TypeRef) -> boolean {
         if (arena == null || registry == null || intern == null) { return false; }
-        const target: SymbolStr = OwnershipQuery::registry_name_of(arena, intern, ty);
-        if (!target.is_valid()) { return false; }
-        return OwnershipQuery::has_drop_impl(registry, intern, target);
+        const drop_name: SymbolStr = intern.intern("Drop");
+        if (!drop_name.is_valid()) { return false; }
+        const leaf: SymbolStr = OwnershipQuery::registry_name_of(arena, intern, ty);
+        const base_id: u64 = OwnershipQuery::named_base_type_id(arena, ty);
+        if (base_id != 0 && registry.is_precise_trait_leaf(drop_name, leaf)) {
+            // Authoritative precise path: a miss here is a true negative.
+            return registry.has_trait_impl_typed(drop_name, base_id);
+        }
+        // Fallback: bare-name lookup (old behaviour, safe/conservative).
+        if (!leaf.is_valid()) { return false; }
+        return OwnershipQuery::has_drop_impl(registry, intern, leaf);
     }
 
     /// Internal: true when the trait-impl registry has a `Drop` impl
