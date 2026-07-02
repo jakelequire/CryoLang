@@ -144,16 +144,8 @@ type struct CodeActionBuilder {
                 const total: u64 = parts.length();
                 for (mut i: u64 = 0; i < total; i++) {
                     match (parts.at(i)) {
-                        Option::Some(p) => {
-                            match (CodeActionBuilder::extract_uri_and_edit(p)) {
-                                Option::Some(pair) => {
-                                    CodeActionBuilder::push_text_edit(changes, pair.first.as_str(),
-                                                                      pair.second);
-                                }
-                                Option::None => { }
-                            }
-                        }
-                        Option::None => { }
+                        Option::Some(p) => { CodeActionBuilder::add_part_edit(changes, p); }
+                        Option::None    => { }
                     }
                 }
                 edit.put("changes", JsonValue::Object(changes));
@@ -175,41 +167,69 @@ type struct CodeActionBuilder {
         }
     }
 
-    /// Pull `(uri, TextEdit)` out of one serialized part.  Returns `None`
-    /// when either field is missing.  The TextEdit's range is rebuilt from
-    /// scratch from the part's `range` object so the resulting
-    /// WorkspaceEdit owns its JSON (JsonValue has no clone method, so we
-    /// can't share a node with the input).
-    static extract_uri_and_edit(part: &JsonValue) -> Option<Pair<String, JsonValue>> {
+    /// Read `(uri, range, newText)` from one serialized suggestion part,
+    /// build its LSP `TextEdit` (`{ range, newText }`, range rebuilt from
+    /// scratch so it owns its JSON - JsonValue has no clone), and append it
+    /// to the TextEdit array under `uri` in `changes`.  No-op when any
+    /// field is missing.
+    ///
+    /// Deliberately one method that owns the whole part -> changes
+    /// insertion.  The earlier split returned a `Pair<String, JsonValue>`
+    /// and then, in the caller, *partially* moved `pair.second` into a
+    /// `push_text_edit` argument while borrowing `pair.first.as_str()` in
+    /// the same call.  The pinned compiler mis-handles that partial move:
+    /// it accepts the moved-out field as a call argument but still drops it
+    /// when `pair` leaves scope, double-freeing the TextEdit object.  The
+    /// freed-then-reused node aliased the `changes` object, producing a
+    /// CYCLIC WorkspaceEdit that stack-overflowed the JSON-RPC encoder
+    /// (`clone_value`) and crashed the server on any real quickfix.
+    /// Keeping the edit in a single owned local (no struct field to
+    /// partially move) sidesteps the compiler bug.  Minimal repro of the
+    /// partial-move double-free is filed for a compiler-side fix.
+    static add_part_edit(changes: mut &JsonObject, part: &JsonValue) -> void {
         const uri_v: Option<JsonValue*> = part.get(Str::from_cstr("uri"));
         const range_v: Option<JsonValue*> = part.get(Str::from_cstr("range"));
         const new_text_v: Option<JsonValue*> = part.get(Str::from_cstr("newText"));
         if (uri_v.is_none() || range_v.is_none() || new_text_v.is_none()) {
-            return Option::None;
+            return;
         }
 
         mut uri_str: String = String::new();
         match (uri_v.unwrap().as_str()) {
             Option::Some(s) => { uri_str.push(s); }
-            Option::None    => { return Option::None; }
+            Option::None    => { uri_str.drop(); return; }
         }
 
         mut new_text: String = String::new();
         match (new_text_v.unwrap().as_str()) {
             Option::Some(s) => { new_text.push(s); }
-            Option::None    => { return Option::None; }
+            Option::None    => { uri_str.drop(); new_text.drop(); return; }
         }
 
         const range_copy: JsonValue = CodeActionBuilder::rebuild_range(range_v.unwrap());
-
         mut edit_obj: JsonObject = JsonObject::new();
         edit_obj.put("range", range_copy);
         edit_obj.put("newText", JsonValue::String(new_text));
+        mut edit: JsonValue = JsonValue::Object(edit_obj);
 
-        return Option::Some(Pair<String, JsonValue> {
-            first:  uri_str,
-            second: JsonValue::Object(edit_obj),
-        });
+        // Append this TextEdit to the array under `uri` in `changes`,
+        // creating the array if absent.
+        match (changes.get(uri_str.as_str())) {
+            Option::Some(existing) => {
+                match (existing) {
+                    JsonValue::Array(arr) => {
+                        arr.push(edit);
+                        uri_str.drop();
+                        return;
+                    }
+                    _ => { }
+                }
+            }
+            Option::None => { }
+        }
+        mut fresh: Array<JsonValue> = Array<JsonValue>::with_capacity(1);
+        fresh.push(edit);
+        changes.insert(uri_str, JsonValue::Array(fresh));
     }
 
     /// Rebuild an LSP `Range` JSON object by reading its scalar fields
@@ -252,30 +272,6 @@ type struct CodeActionBuilder {
         o.put("line",      JsonValue::int_value(line));
         o.put("character", JsonValue::int_value(ch));
         return JsonValue::Object(o);
-    }
-
-    /// Append `edit` to the TextEdit array under `uri` in `changes`,
-    /// creating the array if it doesn't exist yet.
-    static push_text_edit(changes: mut &JsonObject, uri: Str,
-                          edit: JsonValue) -> void {
-        mut key: String = String::new();
-        key.push(uri);
-        // JsonObject::get keys on a Str view, not an owned String.
-        match (changes.get(key.as_str())) {
-            Option::Some(existing) => {
-                match (existing) {
-                    JsonValue::Array(arr) => {
-                        arr.push(edit);
-                        return;
-                    }
-                    _ => { }
-                }
-            }
-            Option::None => { }
-        }
-        mut fresh: Array<JsonValue> = Array<JsonValue>::with_capacity(1);
-        fresh.push(edit);
-        changes.insert(key, JsonValue::Array(fresh));
     }
 
     /// Append the "Show full Cryo diagnostic" action backed by the
