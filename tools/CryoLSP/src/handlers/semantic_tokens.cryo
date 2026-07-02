@@ -132,17 +132,19 @@ public function handle_semantic_tokens(docs: &Docs, sessions: mut &SessionMap,
     const uri: Str = uri_str_opt.unwrap_or(Str::from_cstr(""));
 
     // -- Resolve session -> CompilationContext -> ProgramNode -----------
-    const session_opt: Option<CompilerSession*> = sessions.get(uri);
-    if (!session_opt.is_some()) { return Lsp::Protocol::SemanticTokens::empty_response(); }
-    const session: CompilerSession* = session_opt.unwrap_or(null);
+    // Recompile-if-stale (see hover.cryo) so we never tokenize against a
+    // ctx whose shared-arena AST was recycled by another doc's compile.
+    const session: CompilerSession* = sessions.ensure_fresh(docs, uri);
     if (session == null) { return Lsp::Protocol::SemanticTokens::empty_response(); }
     const ctx: CompilationContext* = session.context();
     if (ctx == null) { return Lsp::Protocol::SemanticTokens::empty_response(); }
 
-    const fs_path: Str = Conv::uri_to_fs_path(uri);
+    mut fs_path_owned: String = Conv::uri_to_fs_path(uri);
+    const fs_path: Str = fs_path_owned.as_str();
     mut path_buf: String = String::with_capacity(fs_path.length() + 1);
     path_buf.push(fs_path);
-    path_buf.push(0 as u8);
+    path_buf.push_byte(0 as u8);
+    fs_path_owned.drop();
     const path_buf_len: u64 = path_buf.length() - 1;
     path_buf.truncate(path_buf_len);
     const path_cstr: string = path_buf.as_ptr() as string;

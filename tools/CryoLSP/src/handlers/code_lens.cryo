@@ -26,6 +26,7 @@ import Compiler::CompilationContext;
 import Compiler::Diag::Diagnostic;
 
 import Lsp::Server::Session;
+import Lsp::Server::Docs;
 import Lsp::Protocol::Conv;
 
 
@@ -33,7 +34,7 @@ import Lsp::Protocol::Conv;
 /// array to put in the response's `result` field.  An empty array
 /// (no session, no compile, no diagnostics for this URI) is a valid
 /// non-result.
-public function handle_code_lens(sessions: &SessionMap,
+public function handle_code_lens(docs: &Docs, sessions: mut &SessionMap,
                                   params: &JsonValue) -> JsonValue {
     mut lenses: Array<JsonValue> = Array<JsonValue>::new();
 
@@ -43,12 +44,10 @@ public function handle_code_lens(sessions: &SessionMap,
         return JsonValue::Array(lenses);
     }
 
-    // session <-> context lookup mirrors hover.cryo / definition.cryo.
-    const session_opt: Option<CompilerSession*> = sessions.get(uri.as_str());
-    if (!session_opt.is_some()) {
-        return JsonValue::Array(lenses);
-    }
-    const session: CompilerSession* = session_opt.unwrap_or(null);
+    // Recompile-if-stale (see hover.cryo) so the diagnostic sink we read
+    // below isn't backed by shared-arena memory recycled by another
+    // document's compile.
+    const session: CompilerSession* = sessions.ensure_fresh(docs, uri.as_str());
     if (session == null) {
         return JsonValue::Array(lenses);
     }
@@ -61,7 +60,8 @@ public function handle_code_lens(sessions: &SessionMap,
     // session's sink may carry cross-module diagnostics from compile
     // dependencies, and emitting a lens against the wrong file would
     // surface it on whatever line happens to share coordinates here.
-    const fs_path: Str = Conv::uri_to_fs_path(uri.as_str());
+    mut fs_path_owned: String = Conv::uri_to_fs_path(uri.as_str());
+    const fs_path: Str = fs_path_owned.as_str();
     const diags: &Diagnostic[] = &ctx.diagnostics.diagnostics;
     for (mut i: i64 = 0; i < diags.length; i++) {
         if (!Conv::diag_is_for_path(&diags[i], fs_path)) { continue; }
@@ -69,6 +69,7 @@ public function handle_code_lens(sessions: &SessionMap,
         const id: string = Conv::build_diag_id(&diags[i]);
         lenses.push(build_lens(&diags[i], id));
     }
+    fs_path_owned.drop();
 
     return JsonValue::Array(lenses);
 }
