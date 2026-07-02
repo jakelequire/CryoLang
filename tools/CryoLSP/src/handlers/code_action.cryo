@@ -36,7 +36,7 @@ public function handle(params: &JsonValue) -> JsonValue {
                     for (mut i: u64 = 0; i < total; i++) {
                         match (diags_ptr.at(i)) {
                             Option::Some(d) => {
-                                contribute_actions_for(d, actions);
+                                CodeActionBuilder::contribute_actions_for(d, actions);
                             }
                             Option::None => { }
                         }
@@ -52,283 +52,268 @@ public function handle(params: &JsonValue) -> JsonValue {
 }
 
 
-/// For one wire diagnostic, push every applicable CodeAction into
-/// `actions`.  Order matches user expectations: quickfixes (the
-/// actionable items) come first, then the show-rendered convenience
-/// action.
-function contribute_actions_for(diag: &JsonValue,
+// CodeActionBuilder - assemble CodeAction JSON from wire diagnostics.
+// All statics: pure JSON transforms over the request's diagnostic data.
+
+type struct CodeActionBuilder {
+
+    /// For one wire diagnostic, push every applicable CodeAction into
+    /// `actions`.  Order matches user expectations: quickfixes (the
+    /// actionable items) come first, then the show-rendered convenience
+    /// action.
+    static contribute_actions_for(diag: &JsonValue,
+                                  actions: mut &Array<JsonValue>) -> void {
+        match (diag.get(Str::from_cstr("data"))) {
+            Option::Some(data) => {
+                CodeActionBuilder::push_quickfix_actions(diag, data, actions);
+                CodeActionBuilder::push_show_rendered_action(data, actions);
+            }
+            Option::None => { }
+        }
+    }
+
+    /// Build one `CodeAction` per Suggestion in `data.suggestions` and
+    /// append it to `actions`.  Each action carries a `WorkspaceEdit`
+    /// describing the multipart edit the IDE should apply on click; no
+    /// client-side command is needed.
+    static push_quickfix_actions(diag: &JsonValue, data: &JsonValue,
                                  actions: mut &Array<JsonValue>) -> void {
-    match (diag.get(Str::from_cstr("data"))) {
-        Option::Some(data) => {
-            push_quickfix_actions(diag, data, actions);
-            push_show_rendered_action(data, actions);
-        }
-        Option::None => { }
-    }
-}
-
-
-/// Build one `CodeAction` per Suggestion in `data.suggestions` and
-/// append it to `actions`.  Each action carries a `WorkspaceEdit`
-/// describing the multipart edit the IDE should apply on click; no
-/// client-side command is needed.
-function push_quickfix_actions(diag: &JsonValue, data: &JsonValue,
-                                actions: mut &Array<JsonValue>) -> void {
-    match (data.get(Str::from_cstr("suggestions"))) {
-        Option::Some(suggestions) => {
-            const n: u64 = suggestions.length();
-            for (mut i: u64 = 0; i < n; i++) {
-                match (suggestions.at(i)) {
-                    Option::Some(sug) => {
-                        match (build_quickfix(diag, sug)) {
-                            Option::Some(act) => { actions.push(act); }
-                            Option::None      => { }
-                        }
-                    }
-                    Option::None => { }
-                }
-            }
-        }
-        Option::None => { }
-    }
-}
-
-
-/// Build one quickfix CodeAction from a serialized suggestion.
-/// Returns `None` when the suggestion has no parts (already filtered
-/// server-side, defensive guard).
-function build_quickfix(diag: &JsonValue, sug: &JsonValue) -> Option<JsonValue> {
-    const parts_v: Option<JsonValue*> = sug.get(Str::from_cstr("parts"));
-    match (parts_v) {
-        Option::None => { return Option::None; }
-        Option::Some(parts) => {
-            if (parts.length() == 0) { return Option::None; }
-
-            // Title: the suggestion message.
-            mut title: String = String::new();
-            match (sug.get(Str::from_cstr("message"))) {
-                Option::Some(msg_v) => {
-                    match (msg_v.as_str()) {
-                        Option::Some(s) => { title.push(s); }
-                        Option::None    => { title.push("Apply suggestion"); }
-                    }
-                }
-                Option::None => { title.push("Apply suggestion"); }
-            }
-
-            // Applicability: drives `isPreferred`.  Only machine-applicable
-            // fixes are marked preferred so VS Code's auto-fix won't run a
-            // guess.
-            mut is_preferred: boolean = false;
-            match (sug.get(Str::from_cstr("applicability"))) {
-                Option::Some(app_v) => {
-                    match (app_v.as_str()) {
-                        Option::Some(s) => {
-                            if (s.equals(&Str::from_cstr("machine-applicable"))) {
-                                is_preferred = true;
+        match (data.get(Str::from_cstr("suggestions"))) {
+            Option::Some(suggestions) => {
+                const n: u64 = suggestions.length();
+                for (mut i: u64 = 0; i < n; i++) {
+                    match (suggestions.at(i)) {
+                        Option::Some(sug) => {
+                            match (CodeActionBuilder::build_quickfix(diag, sug)) {
+                                Option::Some(act) => { actions.push(act); }
+                                Option::None      => { }
                             }
                         }
                         Option::None => { }
                     }
                 }
-                Option::None => { }
             }
+            Option::None => { }
+        }
+    }
 
-            // Build the WorkspaceEdit.  Group parts by uri because LSP
-            // `changes` is `{ uri -> TextEdit[] }`.
-            mut edit: JsonObject = JsonObject::new();
-            mut changes: JsonObject = JsonObject::new();
-            const total: u64 = parts.length();
-            for (mut i: u64 = 0; i < total; i++) {
-                match (parts.at(i)) {
-                    Option::Some(p) => {
-                        match (extract_uri_and_edit(p)) {
-                            Option::Some(pair) => {
-                                push_text_edit(changes, pair.first.as_str(),
-                                               pair.second);
+    /// Build one quickfix CodeAction from a serialized suggestion.
+    /// Returns `None` when the suggestion has no parts (already filtered
+    /// server-side, defensive guard).
+    static build_quickfix(diag: &JsonValue, sug: &JsonValue) -> Option<JsonValue> {
+        const parts_v: Option<JsonValue*> = sug.get(Str::from_cstr("parts"));
+        match (parts_v) {
+            Option::None => { return Option::None; }
+            Option::Some(parts) => {
+                if (parts.length() == 0) { return Option::None; }
+
+                // Title: the suggestion message.
+                mut title: String = String::new();
+                match (sug.get(Str::from_cstr("message"))) {
+                    Option::Some(msg_v) => {
+                        match (msg_v.as_str()) {
+                            Option::Some(s) => { title.push(s); }
+                            Option::None    => { title.push("Apply suggestion"); }
+                        }
+                    }
+                    Option::None => { title.push("Apply suggestion"); }
+                }
+
+                // Applicability: drives `isPreferred`.  Only machine-applicable
+                // fixes are marked preferred so VS Code's auto-fix won't run a
+                // guess.
+                mut is_preferred: boolean = false;
+                match (sug.get(Str::from_cstr("applicability"))) {
+                    Option::Some(app_v) => {
+                        match (app_v.as_str()) {
+                            Option::Some(s) => {
+                                if (s.equals(&Str::from_cstr("machine-applicable"))) {
+                                    is_preferred = true;
+                                }
                             }
                             Option::None => { }
                         }
                     }
                     Option::None => { }
                 }
-            }
-            edit.insert(String::from_str(Str::from_cstr("changes")),
-                        JsonValue::Object(changes));
 
-            // (We deliberately omit `diagnostics: [diag]` - JsonValue
-            // has no clone method, and editors render the quickfix
-            // lightbulb on the diagnostic's gutter regardless.  The
-            // correlation field is only useful for advanced grouping
-            // UIs that don't yet exist on the Cryo side.)
-            mut action: JsonObject = JsonObject::new();
-            action.insert(String::from_str(Str::from_cstr("title")),
-                          JsonValue::String(title));
-            action.insert(String::from_str(Str::from_cstr("kind")),
-                          JsonValue::String(String::from_str(Str::from_cstr("quickfix"))));
-            action.insert(String::from_str(Str::from_cstr("edit")),
-                          JsonValue::Object(edit));
-            if (is_preferred) {
-                action.insert(String::from_str(Str::from_cstr("isPreferred")),
-                              JsonValue::Bool(true));
-            }
-            return Option::Some(JsonValue::Object(action));
-        }
-    }
-}
-
-
-/// Pull `(uri, TextEdit)` out of one serialized part.  Returns `None`
-/// when either field is missing.  The TextEdit's range is rebuilt from
-/// scratch from the part's `range` object so the resulting
-/// WorkspaceEdit owns its JSON (JsonValue has no clone method, so we
-/// can't share a node with the input).
-function extract_uri_and_edit(part: &JsonValue) -> Option<Pair<String, JsonValue>> {
-    const uri_v: Option<JsonValue*> = part.get(Str::from_cstr("uri"));
-    const range_v: Option<JsonValue*> = part.get(Str::from_cstr("range"));
-    const new_text_v: Option<JsonValue*> = part.get(Str::from_cstr("newText"));
-    if (uri_v.is_none() || range_v.is_none() || new_text_v.is_none()) {
-        return Option::None;
-    }
-
-    mut uri_str: String = String::new();
-    match (uri_v.unwrap().as_str()) {
-        Option::Some(s) => { uri_str.push(s); }
-        Option::None    => { return Option::None; }
-    }
-
-    mut new_text: String = String::new();
-    match (new_text_v.unwrap().as_str()) {
-        Option::Some(s) => { new_text.push(s); }
-        Option::None    => { return Option::None; }
-    }
-
-    const range_copy: JsonValue = rebuild_range(range_v.unwrap());
-
-    mut edit_obj: JsonObject = JsonObject::new();
-    edit_obj.insert(String::from_str(Str::from_cstr("range")), range_copy);
-    edit_obj.insert(String::from_str(Str::from_cstr("newText")),
-                    JsonValue::String(new_text));
-
-    return Option::Some(Pair<String, JsonValue> {
-        first:  uri_str,
-        second: JsonValue::Object(edit_obj),
-    });
-}
-
-
-/// Rebuild an LSP `Range` JSON object by reading its scalar fields
-/// out of `src`.  Missing or malformed fields collapse to 0, matching
-/// what `range_json_from_span` produces for a spanless diagnostic.
-function rebuild_range(src: JsonValue*) -> JsonValue {
-    const sl: i64 = read_range_pos(src, "start", "line");
-    const sc: i64 = read_range_pos(src, "start", "character");
-    const el: i64 = read_range_pos(src, "end",   "line");
-    const ec: i64 = read_range_pos(src, "end",   "character");
-    return build_range(sl, sc, el, ec);
-}
-
-function read_range_pos(src: JsonValue*, anchor: string, field: string) -> i64 {
-    match (src.get(Str::from_cstr(anchor))) {
-        Option::Some(pos) => {
-            match (pos.get(Str::from_cstr(field))) {
-                Option::Some(v) => {
-                    match (v.as_i64()) {
-                        Option::Some(n) => { return n; }
-                        Option::None    => { return 0; }
+                // Build the WorkspaceEdit.  Group parts by uri because LSP
+                // `changes` is `{ uri -> TextEdit[] }`.
+                mut edit: JsonObject = JsonObject::new();
+                mut changes: JsonObject = JsonObject::new();
+                const total: u64 = parts.length();
+                for (mut i: u64 = 0; i < total; i++) {
+                    match (parts.at(i)) {
+                        Option::Some(p) => {
+                            match (CodeActionBuilder::extract_uri_and_edit(p)) {
+                                Option::Some(pair) => {
+                                    CodeActionBuilder::push_text_edit(changes, pair.first.as_str(),
+                                                                      pair.second);
+                                }
+                                Option::None => { }
+                            }
+                        }
+                        Option::None => { }
                     }
                 }
-                Option::None => { return 0; }
-            }
-        }
-        Option::None => { return 0; }
-    }
-}
+                edit.put("changes", JsonValue::Object(changes));
 
-function build_range(sl: i64, sc: i64, el: i64, ec: i64) -> JsonValue {
-    mut o: JsonObject = JsonObject::new();
-    o.insert(String::from_str(Str::from_cstr("start")), build_pos(sl, sc));
-    o.insert(String::from_str(Str::from_cstr("end")),   build_pos(el, ec));
-    return JsonValue::Object(o);
-}
-
-function build_pos(line: i64, ch: i64) -> JsonValue {
-    mut o: JsonObject = JsonObject::new();
-    o.insert(String::from_str(Str::from_cstr("line")),
-             JsonValue::Number(JsonNumber::Int(line)));
-    o.insert(String::from_str(Str::from_cstr("character")),
-             JsonValue::Number(JsonNumber::Int(ch)));
-    return JsonValue::Object(o);
-}
-
-
-/// Append `edit` to the TextEdit array under `uri` in `changes`,
-/// creating the array if it doesn't exist yet.
-function push_text_edit(changes: mut &JsonObject, uri: Str,
-                         edit: JsonValue) -> void {
-    mut key: String = String::new();
-    key.push(uri);
-    // JsonObject::get keys on a Str view, not an owned String.
-    match (changes.get(key.as_str())) {
-        Option::Some(existing) => {
-            match (existing) {
-                JsonValue::Array(arr) => {
-                    arr.push(edit);
-                    return;
+                // (We deliberately omit `diagnostics: [diag]` - JsonValue
+                // has no clone method, and editors render the quickfix
+                // lightbulb on the diagnostic's gutter regardless.  The
+                // correlation field is only useful for advanced grouping
+                // UIs that don't yet exist on the Cryo side.)
+                mut action: JsonObject = JsonObject::new();
+                action.put("title", JsonValue::String(title));
+                action.put("kind", JsonValue::from_cstr("quickfix"));
+                action.put("edit", JsonValue::Object(edit));
+                if (is_preferred) {
+                    action.put("isPreferred", JsonValue::Bool(true));
                 }
-                _ => { }
+                return Option::Some(JsonValue::Object(action));
             }
         }
-        Option::None => { }
     }
-    mut fresh: Array<JsonValue> = Array<JsonValue>::with_capacity(1);
-    fresh.push(edit);
-    changes.insert(key, JsonValue::Array(fresh));
-}
 
-
-/// Append the "Show full Cryo diagnostic" action backed by the
-/// diagnostic's `diagId`.  Skipped when the wire diagnostic carries
-/// no id.
-function push_show_rendered_action(data: &JsonValue,
-                                    actions: mut &Array<JsonValue>) -> void {
-    match (data.get(Str::from_cstr("diagId"))) {
-        Option::Some(id_v) => {
-            match (id_v.as_str()) {
-                Option::Some(id) => { actions.push(build_show_rendered_action(id)); }
-                Option::None     => { }
-            }
+    /// Pull `(uri, TextEdit)` out of one serialized part.  Returns `None`
+    /// when either field is missing.  The TextEdit's range is rebuilt from
+    /// scratch from the part's `range` object so the resulting
+    /// WorkspaceEdit owns its JSON (JsonValue has no clone method, so we
+    /// can't share a node with the input).
+    static extract_uri_and_edit(part: &JsonValue) -> Option<Pair<String, JsonValue>> {
+        const uri_v: Option<JsonValue*> = part.get(Str::from_cstr("uri"));
+        const range_v: Option<JsonValue*> = part.get(Str::from_cstr("range"));
+        const new_text_v: Option<JsonValue*> = part.get(Str::from_cstr("newText"));
+        if (uri_v.is_none() || range_v.is_none() || new_text_v.is_none()) {
+            return Option::None;
         }
-        Option::None => { }
+
+        mut uri_str: String = String::new();
+        match (uri_v.unwrap().as_str()) {
+            Option::Some(s) => { uri_str.push(s); }
+            Option::None    => { return Option::None; }
+        }
+
+        mut new_text: String = String::new();
+        match (new_text_v.unwrap().as_str()) {
+            Option::Some(s) => { new_text.push(s); }
+            Option::None    => { return Option::None; }
+        }
+
+        const range_copy: JsonValue = CodeActionBuilder::rebuild_range(range_v.unwrap());
+
+        mut edit_obj: JsonObject = JsonObject::new();
+        edit_obj.put("range", range_copy);
+        edit_obj.put("newText", JsonValue::String(new_text));
+
+        return Option::Some(Pair<String, JsonValue> {
+            first:  uri_str,
+            second: JsonValue::Object(edit_obj),
+        });
     }
-}
 
+    /// Rebuild an LSP `Range` JSON object by reading its scalar fields
+    /// out of `src`.  Missing or malformed fields collapse to 0, matching
+    /// what `range_json_from_span` produces for a spanless diagnostic.
+    static rebuild_range(src: JsonValue*) -> JsonValue {
+        const sl: i64 = CodeActionBuilder::read_range_pos(src, "start", "line");
+        const sc: i64 = CodeActionBuilder::read_range_pos(src, "start", "character");
+        const el: i64 = CodeActionBuilder::read_range_pos(src, "end",   "line");
+        const ec: i64 = CodeActionBuilder::read_range_pos(src, "end",   "character");
+        return CodeActionBuilder::build_range(sl, sc, el, ec);
+    }
 
-/// Build the show-rendered CodeAction object.  Runs the client-side
-/// `cryo.openRenderedDiagnostic` command (registered by the
-/// CryoAnalyzer VS Code extension) which opens the virtual
-/// `cryo-diagnostic:` URI for `id`.
-function build_show_rendered_action(id: Str) -> JsonValue {
-    const title:   string = "Show full Cryo diagnostic";
-    const cmd_id:  string = "cryo.openRenderedDiagnostic";
+    static read_range_pos(src: JsonValue*, anchor: string, field: string) -> i64 {
+        match (src.get(Str::from_cstr(anchor))) {
+            Option::Some(pos) => {
+                match (pos.get(Str::from_cstr(field))) {
+                    Option::Some(v) => {
+                        match (v.as_i64()) {
+                            Option::Some(n) => { return n; }
+                            Option::None    => { return 0; }
+                        }
+                    }
+                    Option::None => { return 0; }
+                }
+            }
+            Option::None => { return 0; }
+        }
+    }
 
-    mut args: Array<JsonValue> = Array<JsonValue>::with_capacity(1);
-    args.push(JsonValue::String(String::from_str(id)));
+    static build_range(sl: i64, sc: i64, el: i64, ec: i64) -> JsonValue {
+        mut o: JsonObject = JsonObject::new();
+        o.put("start", CodeActionBuilder::build_pos(sl, sc));
+        o.put("end",   CodeActionBuilder::build_pos(el, ec));
+        return JsonValue::Object(o);
+    }
 
-    mut cmd: JsonObject = JsonObject::new();
-    cmd.insert(String::from_str(Str::from_cstr("title")),
-               JsonValue::String(String::from_str(Str::from_cstr(title))));
-    cmd.insert(String::from_str(Str::from_cstr("command")),
-               JsonValue::String(String::from_str(Str::from_cstr(cmd_id))));
-    cmd.insert(String::from_str(Str::from_cstr("arguments")),
-               JsonValue::Array(args));
+    static build_pos(line: i64, ch: i64) -> JsonValue {
+        mut o: JsonObject = JsonObject::new();
+        o.put("line",      JsonValue::int_value(line));
+        o.put("character", JsonValue::int_value(ch));
+        return JsonValue::Object(o);
+    }
 
-    mut action: JsonObject = JsonObject::new();
-    action.insert(String::from_str(Str::from_cstr("title")),
-                  JsonValue::String(String::from_str(Str::from_cstr(title))));
-    action.insert(String::from_str(Str::from_cstr("kind")),
-                  JsonValue::String(String::from_str(Str::from_cstr("quickfix"))));
-    action.insert(String::from_str(Str::from_cstr("command")),
-                  JsonValue::Object(cmd));
-    return JsonValue::Object(action);
+    /// Append `edit` to the TextEdit array under `uri` in `changes`,
+    /// creating the array if it doesn't exist yet.
+    static push_text_edit(changes: mut &JsonObject, uri: Str,
+                          edit: JsonValue) -> void {
+        mut key: String = String::new();
+        key.push(uri);
+        // JsonObject::get keys on a Str view, not an owned String.
+        match (changes.get(key.as_str())) {
+            Option::Some(existing) => {
+                match (existing) {
+                    JsonValue::Array(arr) => {
+                        arr.push(edit);
+                        return;
+                    }
+                    _ => { }
+                }
+            }
+            Option::None => { }
+        }
+        mut fresh: Array<JsonValue> = Array<JsonValue>::with_capacity(1);
+        fresh.push(edit);
+        changes.insert(key, JsonValue::Array(fresh));
+    }
+
+    /// Append the "Show full Cryo diagnostic" action backed by the
+    /// diagnostic's `diagId`.  Skipped when the wire diagnostic carries
+    /// no id.
+    static push_show_rendered_action(data: &JsonValue,
+                                     actions: mut &Array<JsonValue>) -> void {
+        match (data.get(Str::from_cstr("diagId"))) {
+            Option::Some(id_v) => {
+                match (id_v.as_str()) {
+                    Option::Some(id) => { actions.push(CodeActionBuilder::build_show_rendered_action(id)); }
+                    Option::None     => { }
+                }
+            }
+            Option::None => { }
+        }
+    }
+
+    /// Build the show-rendered CodeAction object.  Runs the client-side
+    /// `cryo.openRenderedDiagnostic` command (registered by the
+    /// CryoAnalyzer VS Code extension) which opens the virtual
+    /// `cryo-diagnostic:` URI for `id`.
+    static build_show_rendered_action(id: Str) -> JsonValue {
+        const title:   string = "Show full Cryo diagnostic";
+        const cmd_id:  string = "cryo.openRenderedDiagnostic";
+
+        mut args: Array<JsonValue> = Array<JsonValue>::with_capacity(1);
+        args.push(JsonValue::from_str(id));
+
+        mut cmd: JsonObject = JsonObject::new();
+        cmd.put("title", JsonValue::from_cstr(title));
+        cmd.put("command", JsonValue::from_cstr(cmd_id));
+        cmd.put("arguments", JsonValue::Array(args));
+
+        mut action: JsonObject = JsonObject::new();
+        action.put("title", JsonValue::from_cstr(title));
+        action.put("kind", JsonValue::from_cstr("quickfix"));
+        action.put("command", JsonValue::Object(cmd));
+        return JsonValue::Object(action);
+    }
 }

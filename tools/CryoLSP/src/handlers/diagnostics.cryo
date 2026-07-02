@@ -25,50 +25,50 @@ import Lsp::Protocol::Conv;
 import Lsp::Server::DiagRenderCache;
 
 
-/// Publish diagnostics for `uri`, reading them from the compilation
-/// context's diagnostic sink.  Always emits - even when `diagnostics`
-/// is empty - so the editor clears squiggles after a successful
-/// recompile.  `cache` receives the rendered text of each emitted
-/// diagnostic, keyed by `diagId`, so the `cryo/renderedDiagnostic`
-/// request can later return the same text for the editor's virtual
-/// diagnostic tab.
-public function publish_for(writer: mut &Stdout, uri: Str,
-                            ctx: CompilationContext*,
-                            cache: DiagRenderCache*) -> void {
-    if (ctx == null) {
-        publish_empty(writer, uri);
-        return;
+// DiagnosticPublisher - build + frame + write publishDiagnostics
+// notifications to the wire.  Stateless: the stdout sink is passed in.
+
+type struct DiagnosticPublisher {
+
+    /// Publish diagnostics for `uri`, reading them from the compilation
+    /// context's diagnostic sink.  Always emits - even when `diagnostics`
+    /// is empty - so the editor clears squiggles after a successful
+    /// recompile.  `cache` receives the rendered text of each emitted
+    /// diagnostic, keyed by `diagId`, so the `cryo/renderedDiagnostic`
+    /// request can later return the same text for the editor's virtual
+    /// diagnostic tab.
+    static publish_for(writer: mut &Stdout, uri: Str,
+                       ctx: CompilationContext*,
+                       cache: DiagRenderCache*) -> void {
+        if (ctx == null) {
+            DiagnosticPublisher::publish_empty(writer, uri);
+            return;
+        }
+        const params: JsonValue =
+            DiagnosticConverter::build_publish_params(uri, &ctx.diagnostics.diagnostics, cache);
+        DiagnosticPublisher::send_notification(writer, params);
     }
-    const params: JsonValue =
-        Conv::build_publish_params(uri, &ctx.diagnostics.diagnostics, cache);
-    send_notification(writer, params);
-}
 
-
-/// Publish an empty diagnostics array for `uri`.  Used when there's
-/// no compilation context to consult (e.g. didClose, or a session
-/// that never compiled successfully).
-public function publish_empty(writer: mut &Stdout, uri: Str) -> void {
-    mut params: JsonObject = JsonObject::new();
-    params.insert(
-        String::from_str(Str::from_cstr("uri")),
-        JsonValue::String(String::from_str(uri)));
-    params.insert(
-        String::from_str(Str::from_cstr("diagnostics")),
-        JsonValue::Array(Array<JsonValue>::with_capacity(0)));
-    send_notification(writer, JsonValue::Object(params));
-}
-
-
-/// Encode + frame + write a `publishDiagnostics` notification.  Write
-/// failures are swallowed (consistent with the rest of the server -
-/// stdout is the wire, so logging the error there would corrupt it).
-function send_notification(writer: mut &Stdout, params: JsonValue) -> void {
-    mut body: String = JsonRpc::encode_notification(
-        Str::from_cstr("textDocument/publishDiagnostics"), params);
-    match (Framing::write_message(writer, body.as_str())) {
-        Result::Ok(_)  => { }
-        Result::Err(_) => { }
+    /// Publish an empty diagnostics array for `uri`.  Used when there's
+    /// no compilation context to consult (e.g. didClose, or a session
+    /// that never compiled successfully).
+    static publish_empty(writer: mut &Stdout, uri: Str) -> void {
+        mut params: JsonObject = JsonObject::new();
+        params.put("uri", JsonValue::from_str(uri));
+        params.put("diagnostics", JsonValue::Array(Array<JsonValue>::with_capacity(0)));
+        DiagnosticPublisher::send_notification(writer, JsonValue::Object(params));
     }
-    body.drop();
+
+    /// Encode + frame + write a `publishDiagnostics` notification.  Write
+    /// failures are swallowed (consistent with the rest of the server -
+    /// stdout is the wire, so logging the error there would corrupt it).
+    static send_notification(writer: mut &Stdout, params: JsonValue) -> void {
+        mut body: String = JsonRpcCodec::encode_notification(
+            Str::from_cstr("textDocument/publishDiagnostics"), params);
+        match (FrameCodec::write_message(writer, body.as_str())) {
+            Result::Ok(_)  => { }
+            Result::Err(_) => { }
+        }
+        body.drop();
+    }
 }

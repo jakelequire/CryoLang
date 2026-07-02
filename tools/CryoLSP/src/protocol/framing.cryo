@@ -7,10 +7,22 @@
 ///!   \r\n
 ///!   <N raw UTF-8 bytes>
 ///!
-///! `read_message` returns `Ok(Some(body))` for a clean frame,
-///! `Ok(None)` on EOF before any byte arrived, and `Err` on a
-///! malformed header line.  Content-Type is read but ignored - LSP
-///! only ever uses `application/vscode-jsonrpc; charset=utf-8`.
+///! `FrameCodec::read_message` returns `Ok(Some(body))` for a clean
+///! frame, `Ok(None)` on EOF before any byte arrived, and `Err` on a
+///! malformed header line.  Content-Type is read but ignored - LSP only
+///! ever uses `application/vscode-jsonrpc; charset=utf-8`.
+///!
+///! The codec is stateless: `read_message` / `write_message` take the
+///! stdio stream by reference so one codec type serves both the single
+///! read loop and the several write sites (diagnostics, text_sync,
+///! server) without owning - and thereby monopolising - the streams.
+///! (A `BufReader` byte buffer would naturally live on this type, but is
+///! deliberately deferred: buffering stdin *ahead* of a frame boundary
+///! would hide already-consumed bytes from `Server::poll_stdin_readable`,
+///! which polls the raw fd to drive the edit-coalescing debounce window -
+///! so a buffered read-ahead would silently break coalescing.  Adding it
+///! safely means teaching the poll path about the codec's buffer, which
+///! is a separate change.)
 
 namespace Lsp::Protocol::Framing;
 
@@ -35,6 +47,15 @@ type enum FrameError {
     MessageTooLarge;
 }
 
+/// Status of one header-line read.  `Eof` means zero bytes arrived
+/// before EOF - graceful terminator.  Any other premature closure
+/// surfaces as `FrameError::UnexpectedEof` from the caller.
+type enum LineStatus {
+    Eof;
+    Blank;
+    Read;
+}
+
 /// Cap on a single header line.  Real clients emit ~25 bytes; bigger
 /// is almost certainly a stuck-pipe situation, and reading-until-LF
 /// would otherwise let a malicious peer pin our memory at infinity.
@@ -52,212 +73,212 @@ const HEADER_CONTENT_LENGTH:     string = "Content-Length:";
 const HEADER_CONTENT_LENGTH_LEN: u64    = 15;
 
 
-// Read
+// FrameCodec - LSP Content-Length frame reader/writer
+//
+// A stateless codec grouping the read + write halves of the framing
+// protocol as namespaced statics on one type.  See the module note for
+// why the stdio streams are passed by reference rather than owned.
 
-/// Read one full LSP frame from `reader`.  Returned `String` owns the
-/// body bytes; the caller drops it after handing the body to the JSON
-/// parser.  `Ok(None)` means a clean EOF before any byte arrived (the
-/// client closed stdin between frames) - the server treats that as a
-/// normal exit if shutdown was requested.
-function read_message(reader: mut &Stdin) -> Result<Option<String>, FrameError> {
-    mut content_length: u64    = 0;
-    mut got_length:    boolean = false;
-    mut saw_any_byte:  boolean = false;
-    mut line_buf:      String  = String::new();
+type struct FrameCodec {
 
-    loop {
-        line_buf.clear();
-        match (read_header_line(reader, &line_buf)) {
-            Result::Ok(line_status) => {
-                match (line_status) {
-                    LineStatus::Eof => {
-                        line_buf.drop();
-                        if (saw_any_byte) {
-                            return Result::Err(FrameError::UnexpectedEof);
+    // Read
+
+    /// Read one full LSP frame from `reader`.  Returned `String` owns the
+    /// body bytes; the caller drops it after handing the body to the JSON
+    /// parser.  `Ok(None)` means a clean EOF before any byte arrived (the
+    /// client closed stdin between frames) - the server treats that as a
+    /// normal exit if shutdown was requested.
+    static read_message(reader: mut &Stdin) -> Result<Option<String>, FrameError> {
+        mut content_length: u64    = 0;
+        mut got_length:    boolean = false;
+        mut saw_any_byte:  boolean = false;
+        mut line_buf:      String  = String::new();
+
+        loop {
+            line_buf.clear();
+            match (FrameCodec::read_header_line(reader, &line_buf)) {
+                Result::Ok(line_status) => {
+                    match (line_status) {
+                        LineStatus::Eof => {
+                            line_buf.drop();
+                            if (saw_any_byte) {
+                                return Result::Err(FrameError::UnexpectedEof);
+                            }
+                            return Result::Ok(Option::None);
                         }
-                        return Result::Ok(Option::None);
-                    }
-                    LineStatus::Blank => {
-                        // Blank line ends the header block.
-                        break;
-                    }
-                    LineStatus::Read => {
-                        saw_any_byte = true;
-                        if (header_is_content_length(line_buf.as_str())) {
-                            match (parse_content_length(line_buf.as_str())) {
-                                Option::Some(n) => {
-                                    content_length = n;
-                                    got_length     = true;
-                                }
-                                Option::None => {
-                                    line_buf.drop();
-                                    return Result::Err(FrameError::InvalidContentLength);
+                        LineStatus::Blank => {
+                            // Blank line ends the header block.
+                            break;
+                        }
+                        LineStatus::Read => {
+                            saw_any_byte = true;
+                            if (FrameCodec::header_is_content_length(line_buf.as_str())) {
+                                match (FrameCodec::parse_content_length(line_buf.as_str())) {
+                                    Option::Some(n) => {
+                                        content_length = n;
+                                        got_length     = true;
+                                    }
+                                    Option::None => {
+                                        line_buf.drop();
+                                        return Result::Err(FrameError::InvalidContentLength);
+                                    }
                                 }
                             }
+                            // Other headers (Content-Type, X-*) are ignored.
                         }
-                        // Other headers (Content-Type, X-*) are ignored.
                     }
                 }
-            }
-            Result::Err(e) => {
-                line_buf.drop();
-                return Result::Err(e);
+                Result::Err(e) => {
+                    line_buf.drop();
+                    return Result::Err(e);
+                }
             }
         }
-    }
-    line_buf.drop();
+        line_buf.drop();
 
-    if (!got_length) {
-        return Result::Err(FrameError::MissingContentLength);
-    }
+        if (!got_length) {
+            return Result::Err(FrameError::MissingContentLength);
+        }
 
-    // Guard the allocation below: a hostile or corrupt `Content-Length`
-    // (e.g. near-u64::MAX) would otherwise ask the allocator for an
-    // absurd buffer and take the process down before a single body byte
-    // is read.
-    if (content_length > MAX_MESSAGE_SIZE) {
-        return Result::Err(FrameError::MessageTooLarge);
-    }
+        // Guard the allocation below: a hostile or corrupt `Content-Length`
+        // (e.g. near-u64::MAX) would otherwise ask the allocator for an
+        // absurd buffer and take the process down before a single body byte
+        // is read.
+        if (content_length > MAX_MESSAGE_SIZE) {
+            return Result::Err(FrameError::MessageTooLarge);
+        }
 
-    // Read exactly `content_length` raw bytes for the body.
-    mut body: String = String::with_capacity(content_length);
-    if (content_length == 0) {
+        // Read exactly `content_length` raw bytes for the body.
+        mut body: String = String::with_capacity(content_length);
+        if (content_length == 0) {
+            return Result::Ok(Option::Some(body));
+        }
+
+        mut scratch:     u8  = 0;
+        mut read_so_far: u64 = 0;
+        while (read_so_far < content_length) {
+            match (reader.read(&scratch, 1)) {
+                Result::Ok(n) => {
+                    if (n == 0) {
+                        body.drop();
+                        return Result::Err(FrameError::UnexpectedEof);
+                    }
+                    body.push_byte(scratch);
+                    read_so_far = read_so_far + 1;
+                }
+                Result::Err(e) => {
+                    body.drop();
+                    return Result::Err(FrameError::Io(e));
+                }
+            }
+        }
         return Result::Ok(Option::Some(body));
     }
 
-    mut scratch:     u8  = 0;
-    mut read_so_far: u64 = 0;
-    while (read_so_far < content_length) {
-        match (reader.read(&scratch, 1)) {
-            Result::Ok(n) => {
-                if (n == 0) {
-                    body.drop();
-                    return Result::Err(FrameError::UnexpectedEof);
+    /// Read until `\r\n`, stripping the terminator.  Empty payload means
+    /// the header block is closing; returns `Blank`.  `Eof` only when no
+    /// byte arrived at all - once any byte is buffered, EOF means the
+    /// peer hung up mid-header and we surface that as an error.
+    static read_header_line(reader: mut &Stdin, out: mut &String) -> Result<LineStatus, FrameError> {
+        mut prev_cr: boolean = false;
+        mut got_any: boolean = false;
+        mut byte:    u8      = 0;
+
+        loop {
+            match (reader.read(&byte, 1)) {
+                Result::Ok(n) => {
+                    if (n == 0) {
+                        if (!got_any) {
+                            return Result::Ok(LineStatus::Eof);
+                        }
+                        return Result::Err(FrameError::UnexpectedEof);
+                    }
+                    got_any = true;
+
+                    if (byte == 10) {                           // '\n'
+                        if (prev_cr) {
+                            // Drop the `\r` we already pushed - `\r\n` is
+                            // the terminator, not part of the value.
+                            const cur: u64 = out.length();
+                            if (cur > 0) { out.truncate(cur - 1); }
+                        }
+                        if (out.length() == 0) {
+                            return Result::Ok(LineStatus::Blank);
+                        }
+                        return Result::Ok(LineStatus::Read);
+                    }
+
+                    if (out.length() >= MAX_HEADER_LINE) {
+                        return Result::Err(FrameError::HeaderTooLong);
+                    }
+                    out.push_byte(byte);
+                    prev_cr = (byte == 13);                     // '\r'
                 }
-                body.push_byte(scratch);
-                read_so_far = read_so_far + 1;
-            }
-            Result::Err(e) => {
-                body.drop();
-                return Result::Err(FrameError::Io(e));
+                Result::Err(e) => {
+                    return Result::Err(FrameError::Io(e));
+                }
             }
         }
+        return Result::Ok(LineStatus::Read);                    // unreachable
     }
-    return Result::Ok(Option::Some(body));
-}
 
-/// Status of one header-line read.  `Eof` means zero bytes arrived
-/// before EOF - graceful terminator.  Any other premature closure
-/// surfaces as `FrameError::UnexpectedEof` from the caller.
-type enum LineStatus {
-    Eof;
-    Blank;
-    Read;
-}
+    /// Case-sensitive prefix check (LSP fixes the casing).
+    static header_is_content_length(line: Str) -> boolean {
+        if (line.length() < HEADER_CONTENT_LENGTH_LEN) { return false; }
+        const head: Str = line.sub_bytes(0, HEADER_CONTENT_LENGTH_LEN);
+        return head.equals(&Str::from_cstr(HEADER_CONTENT_LENGTH));
+    }
 
-/// Read until `\r\n`, stripping the terminator.  Empty payload means
-/// the header block is closing; returns `Blank`.  `Eof` only when no
-/// byte arrived at all - once any byte is buffered, EOF means the
-/// peer hung up mid-header and we surface that as an error.
-function read_header_line(reader: mut &Stdin, out: mut &String) -> Result<LineStatus, FrameError> {
-    mut prev_cr: boolean = false;
-    mut got_any: boolean = false;
-    mut byte:    u8      = 0;
+    static parse_content_length(line: Str) -> Option<u64> {
+        return FrameCodec::parse_u64_skip_ws(line.sub_bytes(
+            HEADER_CONTENT_LENGTH_LEN, line.length()));
+    }
 
-    loop {
-        match (reader.read(&byte, 1)) {
-            Result::Ok(n) => {
-                if (n == 0) {
-                    if (!got_any) {
-                        return Result::Ok(LineStatus::Eof);
-                    }
-                    return Result::Err(FrameError::UnexpectedEof);
-                }
-                got_any = true;
-
-                if (byte == 10) {                           // '\n'
-                    if (prev_cr) {
-                        // Drop the `\r` we already pushed - `\r\n` is
-                        // the terminator, not part of the value.
-                        const cur: u64 = out.length();
-                        if (cur > 0) { out.truncate(cur - 1); }
-                    }
-                    if (out.length() == 0) {
-                        return Result::Ok(LineStatus::Blank);
-                    }
-                    return Result::Ok(LineStatus::Read);
-                }
-
-                if (out.length() >= MAX_HEADER_LINE) {
-                    return Result::Err(FrameError::HeaderTooLong);
-                }
-                out.push_byte(byte);
-                prev_cr = (byte == 13);                     // '\r'
-            }
-            Result::Err(e) => {
-                return Result::Err(FrameError::Io(e));
-            }
+    /// Skip leading SP / HTAB then parse decimal digits.  `None` on any
+    /// non-digit (including a trailing comment, which LSP doesn't permit).
+    static parse_u64_skip_ws(s: Str) -> Option<u64> {
+        const len: u64 = s.length();
+        const ptr: u8* = s.as_ptr();
+        mut i: u64 = 0;
+        while (i < len && (ptr[i] == 32 || ptr[i] == 9)) {
+            i = i + 1;
         }
+        if (i == len) { return Option::None; }
+
+        mut value:     u64     = 0;
+        mut saw_digit: boolean = false;
+        while (i < len) {
+            const b: u8 = ptr[i];
+            if (b < 48 || b > 57) { break; }                    // not '0'..'9'
+            value = value * 10 + ((b - 48) as u64);
+            saw_digit = true;
+            i = i + 1;
+        }
+        if (!saw_digit) { return Option::None; }
+        return Option::Some(value);
     }
-    return Result::Ok(LineStatus::Read);                    // unreachable
-}
 
-/// Case-sensitive prefix check (LSP fixes the casing).
-function header_is_content_length(line: Str) -> boolean {
-    if (line.length() < HEADER_CONTENT_LENGTH_LEN) { return false; }
-    const head: Str = line.sub_bytes(0, HEADER_CONTENT_LENGTH_LEN);
-    return head.equals(&Str::from_cstr(HEADER_CONTENT_LENGTH));
-}
 
-function parse_content_length(line: Str) -> Option<u64> {
-    return parse_u64_skip_ws(line.sub_bytes(
-        HEADER_CONTENT_LENGTH_LEN, line.length()));
-}
+    // Write
 
-/// Skip leading SP / HTAB then parse decimal digits.  `None` on any
-/// non-digit (including a trailing comment, which LSP doesn't permit).
-function parse_u64_skip_ws(s: Str) -> Option<u64> {
-    const len: u64 = s.length();
-    const ptr: u8* = s.as_ptr();
-    mut i: u64 = 0;
-    while (i < len && (ptr[i] == 32 || ptr[i] == 9)) {
-        i = i + 1;
+    /// Encode and write one frame: `Content-Length: N\r\n\r\n<body>`.
+    /// Caller is responsible for flushing if their writer is buffered;
+    /// `Stdout::write` is unbuffered so a one-frame-per-turn server
+    /// doesn't need to.
+    static write_message(writer: mut &Stdout, body: Str) -> Result<(), IoError> {
+        mut header: String = String::with_capacity(64);
+        header.push("Content-Length: ");
+        mut len_buf: u8[20];
+        const len_digits: u64 = body.length().to_decimal_buf(&len_buf[0]);
+        header.push(Str::from_raw(&len_buf[0], len_digits));
+        header.push("\r\n\r\n");
+
+        const w_header: Result<(), IoError> = writer.write_all(header.as_bytes());
+        header.drop();
+        match (w_header) {
+            Result::Ok(_)  => { }
+            Result::Err(e) => { return Result::Err(e); }
+        }
+        return writer.write_all(body.as_bytes());
     }
-    if (i == len) { return Option::None; }
-
-    mut value:     u64     = 0;
-    mut saw_digit: boolean = false;
-    while (i < len) {
-        const b: u8 = ptr[i];
-        if (b < 48 || b > 57) { break; }                    // not '0'..'9'
-        value = value * 10 + ((b - 48) as u64);
-        saw_digit = true;
-        i = i + 1;
-    }
-    if (!saw_digit) { return Option::None; }
-    return Option::Some(value);
-}
-
-
-// Write
-
-/// Encode and write one frame: `Content-Length: N\r\n\r\n<body>`.
-/// Caller is responsible for flushing if their writer is buffered;
-/// `Stdout::write` is unbuffered so a one-frame-per-turn server
-/// doesn't need to.
-function write_message(writer: mut &Stdout, body: Str) -> Result<(), IoError> {
-    mut header: String = String::with_capacity(64);
-    header.push("Content-Length: ");
-    mut len_buf: u8[20];
-    const len_digits: u64 = body.length().to_decimal_buf(&len_buf[0]);
-    header.push(Str::from_raw(&len_buf[0], len_digits));
-    header.push("\r\n\r\n");
-
-    const w_header: Result<(), IoError> = writer.write_all(header.as_bytes());
-    header.drop();
-    match (w_header) {
-        Result::Ok(_)  => { }
-        Result::Err(e) => { return Result::Err(e); }
-    }
-    return writer.write_all(body.as_bytes());
 }

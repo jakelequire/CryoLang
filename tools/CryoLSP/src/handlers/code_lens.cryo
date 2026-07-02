@@ -39,7 +39,7 @@ public function handle_code_lens(docs: &Docs, sessions: mut &SessionMap,
     mut lenses: Array<JsonValue> = Array<JsonValue>::new();
 
     // params.textDocument.uri  -> the document we're lensing
-    const uri: String = uri_from_params(params);
+    const uri: String = CodeLensBuilder::uri_from_params(params);
     if (uri.length() == 0) {
         return JsonValue::Array(lenses);
     }
@@ -60,14 +60,14 @@ public function handle_code_lens(docs: &Docs, sessions: mut &SessionMap,
     // session's sink may carry cross-module diagnostics from compile
     // dependencies, and emitting a lens against the wrong file would
     // surface it on whatever line happens to share coordinates here.
-    mut fs_path_owned: String = Conv::uri_to_fs_path(uri.as_str());
+    mut fs_path_owned: String = UriPath::uri_to_fs_path(uri.as_str());
     const fs_path: Str = fs_path_owned.as_str();
     const diags: &Diagnostic[] = &ctx.diagnostics.diagnostics;
     for (mut i: i64 = 0; i < diags.length; i++) {
-        if (!Conv::diag_is_for_path(&diags[i], fs_path)) { continue; }
+        if (!DiagnosticConverter::diag_is_for_path(&diags[i], fs_path)) { continue; }
         if (!diags[i].span.has_location())               { continue; }
-        mut id: String = Conv::build_diag_id(&diags[i]);
-        lenses.push(build_lens(&diags[i], id.as_str()));
+        mut id: String = DiagnosticConverter::build_diag_id(&diags[i]);
+        lenses.push(CodeLensBuilder::build_lens(&diags[i], id.as_str()));
         id.drop();
     }
     fs_path_owned.drop();
@@ -76,51 +76,50 @@ public function handle_code_lens(docs: &Docs, sessions: mut &SessionMap,
 }
 
 
-/// Extract `params.textDocument.uri` as an owned `String`.  Returns
-/// an empty string when the field is missing or wrong-typed - the
-/// caller then short-circuits to an empty lens array.
-function uri_from_params(params: &JsonValue) -> String {
-    match (params.get(Str::from_cstr("textDocument"))) {
-        Option::Some(td) => {
-            match (td.get(Str::from_cstr("uri"))) {
-                Option::Some(uri_v) => {
-                    match (uri_v.as_str()) {
-                        Option::Some(s) => { return String::from_str(s); }
-                        Option::None    => { return String::new(); }
+// CodeLensBuilder - extract request fields + build CodeLens JSON.
+
+type struct CodeLensBuilder {
+
+    /// Extract `params.textDocument.uri` as an owned `String`.  Returns
+    /// an empty string when the field is missing or wrong-typed - the
+    /// caller then short-circuits to an empty lens array.
+    static uri_from_params(params: &JsonValue) -> String {
+        match (params.get(Str::from_cstr("textDocument"))) {
+            Option::Some(td) => {
+                match (td.get(Str::from_cstr("uri"))) {
+                    Option::Some(uri_v) => {
+                        match (uri_v.as_str()) {
+                            Option::Some(s) => { return String::from_str(s); }
+                            Option::None    => { return String::new(); }
+                        }
                     }
+                    Option::None => { return String::new(); }
                 }
-                Option::None => { return String::new(); }
             }
+            Option::None => { return String::new(); }
         }
-        Option::None => { return String::new(); }
     }
-}
 
+    /// Build one CodeLens JSON object - `{ range, command }`.  The
+    /// `range` is the diagnostic's primary span; the `command` fires
+    /// the client-side `cryo.openRenderedDiagnostic` with the
+    /// diagnostic id as a single argument.
+    static build_lens(diag: &Diagnostic, id: Str) -> JsonValue {
+        const title:  string = "Show full diagnostic";
+        const cmd_id: string = "cryo.openRenderedDiagnostic";
 
-/// Build one CodeLens JSON object - `{ range, command }`.  The
-/// `range` is the diagnostic's primary span; the `command` fires
-/// the client-side `cryo.openRenderedDiagnostic` with the
-/// diagnostic id as a single argument.
-function build_lens(diag: &Diagnostic, id: Str) -> JsonValue {
-    const title:  string = "Show full diagnostic";
-    const cmd_id: string = "cryo.openRenderedDiagnostic";
+        // command.arguments = ["<diagId>"]
+        mut args: Array<JsonValue> = Array<JsonValue>::with_capacity(1);
+        args.push(JsonValue::from_str(id));
 
-    // command.arguments = ["<diagId>"]
-    mut args: Array<JsonValue> = Array<JsonValue>::with_capacity(1);
-    args.push(JsonValue::String(String::from_str(id)));
+        mut cmd: JsonObject = JsonObject::new();
+        cmd.put("title", JsonValue::from_cstr(title));
+        cmd.put("command", JsonValue::from_cstr(cmd_id));
+        cmd.put("arguments", JsonValue::Array(args));
 
-    mut cmd: JsonObject = JsonObject::new();
-    cmd.insert(String::from_str(Str::from_cstr("title")),
-               JsonValue::String(String::from_str(Str::from_cstr(title))));
-    cmd.insert(String::from_str(Str::from_cstr("command")),
-               JsonValue::String(String::from_str(Str::from_cstr(cmd_id))));
-    cmd.insert(String::from_str(Str::from_cstr("arguments")),
-               JsonValue::Array(args));
-
-    mut lens: JsonObject = JsonObject::new();
-    lens.insert(String::from_str(Str::from_cstr("range")),
-                Conv::range_json_from_span(diag.span));
-    lens.insert(String::from_str(Str::from_cstr("command")),
-                JsonValue::Object(cmd));
-    return JsonValue::Object(lens);
+        mut lens: JsonObject = JsonObject::new();
+        lens.put("range", DiagnosticConverter::range_json_from_span(diag.span));
+        lens.put("command", JsonValue::Object(cmd));
+        return JsonValue::Object(lens);
+    }
 }

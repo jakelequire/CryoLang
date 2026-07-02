@@ -127,250 +127,227 @@ type struct ResponseMessage {
 }
 
 
-// Parsing
+// JsonRpcCodec - parse inbound frames, encode outbound messages.
+// All statics: the codec is stateless (operates on the value passed in).
 
-/// Decode the body of one frame into an `IncomingMessage`.  Any
-/// failure mode - bad JSON, missing fields, wrong shapes - collapses
-/// into `Invalid(reason)` so the caller has a single recovery path.
-function parse_incoming(body: Str) -> IncomingMessage {
-    match (parser::parse(body)) {
-        Result::Ok(v) => {
-            mut owned: JsonValue = v;
-            return classify(&owned);
-        }
-        Result::Err(e) => {
-            mut err: JsonError  = e;
-            mut reason: String  = String::new();
-            reason.push("json parse failed: ");
-            reason.push(err.msg.as_str());
-            err.drop();
-            return IncomingMessage::Invalid(reason);
-        }
-    }
-}
+type struct JsonRpcCodec {
 
-/// Classify an already-parsed JsonValue.  Mutates the input by
-/// extracting (cloning out) owned fields; the leftover container is
-/// dropped before we return.
-function classify(v: mut &JsonValue) -> IncomingMessage {
-    if (!v.is_object()) {
-        v.drop();
-        return invalid_msg("body is not a JSON object");
-    }
+    // Parsing
 
-    // jsonrpc must be the literal string "2.0".
-    if (!field_equals(v, "jsonrpc", "2.0")) {
-        v.drop();
-        return invalid_msg("missing or wrong 'jsonrpc' field");
-    }
-
-    // method must be a string.
-    const method: String = match (clone_string_field(v, "method")) {
-        Option::Some(s) => { s }
-        Option::None    => {
-            v.drop();
-            return invalid_msg("missing 'method' field");
-        }
-    };
-
-    // params: object/array/missing -> defaults to Null for handlers.
-    const params: JsonValue = match (clone_field(v, "params")) {
-        Option::Some(p) => { p }
-        Option::None    => { JsonValue::Null }
-    };
-
-    // id present => request, absent => notification.
-    match (clone_field(v, "id")) {
-        Option::Some(id) => {
-            v.drop();
-            return IncomingMessage::Request(RequestMessage {
-                id:     id,
-                method: method,
-                params: params,
-            });
-        }
-        Option::None => {
-            v.drop();
-            return IncomingMessage::Notification(NotificationMessage {
-                method: method,
-                params: params,
-            });
-        }
-    }
-}
-
-function invalid_msg(reason: string) -> IncomingMessage {
-    mut s: String = String::new();
-    s.push(reason);
-    return IncomingMessage::Invalid(s);
-}
-
-function field_equals(obj: &JsonValue, key: string, expected: string) -> boolean {
-    match (obj.get(Str::from_cstr(key))) {
-        Option::Some(v) => {
-            match (v.as_str()) {
-                Option::Some(s) => { return s.equals(&Str::from_cstr(expected)); }
-                Option::None    => { return false; }
+    /// Decode the body of one frame into an `IncomingMessage`.  Any
+    /// failure mode - bad JSON, missing fields, wrong shapes - collapses
+    /// into `Invalid(reason)` so the caller has a single recovery path.
+    static parse_incoming(body: Str) -> IncomingMessage {
+        match (parser::parse(body)) {
+            Result::Ok(v) => {
+                mut owned: JsonValue = v;
+                return JsonRpcCodec::classify(&owned);
+            }
+            Result::Err(e) => {
+                mut err: JsonError  = e;
+                mut reason: String  = String::new();
+                reason.push("json parse failed: ");
+                reason.push(err.msg.as_str());
+                err.drop();
+                return IncomingMessage::Invalid(reason);
             }
         }
-        Option::None => { return false; }
     }
-}
 
-function clone_string_field(obj: &JsonValue, key: string) -> Option<String> {
-    match (obj.get(Str::from_cstr(key))) {
-        Option::Some(v) => {
-            match (v.as_str()) {
-                Option::Some(s) => { return Option::Some(String::from_str(s)); }
-                Option::None    => { return Option::None; }
+    /// Classify an already-parsed JsonValue.  Mutates the input by
+    /// extracting (cloning out) owned fields; the leftover container is
+    /// dropped before we return.
+    static classify(v: mut &JsonValue) -> IncomingMessage {
+        if (!v.is_object()) {
+            v.drop();
+            return JsonRpcCodec::invalid_msg("body is not a JSON object");
+        }
+
+        // jsonrpc must be the literal string "2.0".
+        if (!JsonRpcCodec::field_equals(v, "jsonrpc", "2.0")) {
+            v.drop();
+            return JsonRpcCodec::invalid_msg("missing or wrong 'jsonrpc' field");
+        }
+
+        // method must be a string.
+        const method: String = match (JsonRpcCodec::clone_string_field(v, "method")) {
+            Option::Some(s) => { s }
+            Option::None    => {
+                v.drop();
+                return JsonRpcCodec::invalid_msg("missing 'method' field");
+            }
+        };
+
+        // params: object/array/missing -> defaults to Null for handlers.
+        const params: JsonValue = match (JsonRpcCodec::clone_field(v, "params")) {
+            Option::Some(p) => { p }
+            Option::None    => { JsonValue::Null }
+        };
+
+        // id present => request, absent => notification.
+        match (JsonRpcCodec::clone_field(v, "id")) {
+            Option::Some(id) => {
+                v.drop();
+                return IncomingMessage::Request(RequestMessage {
+                    id:     id,
+                    method: method,
+                    params: params,
+                });
+            }
+            Option::None => {
+                v.drop();
+                return IncomingMessage::Notification(NotificationMessage {
+                    method: method,
+                    params: params,
+                });
             }
         }
-        Option::None => { return Option::None; }
     }
-}
 
-function clone_field(obj: &JsonValue, key: string) -> Option<JsonValue> {
-    match (obj.get(Str::from_cstr(key))) {
-        Option::Some(v) => { return Option::Some(clone_value(v)); }
-        Option::None    => { return Option::None; }
+    static invalid_msg(reason: string) -> IncomingMessage {
+        mut s: String = String::new();
+        s.push(reason);
+        return IncomingMessage::Invalid(s);
     }
-}
 
-
-// Cloning JsonValue
-
-/// Deep-clone a `JsonValue`.  We need this when a handler stashes
-/// the request `id` for the eventual reply - the parsed tree owns
-/// the bytes, and we want to drop the tree without freeing the id
-/// out from under the response.
-function clone_value(v: &JsonValue) -> JsonValue {
-    match (v) {
-        JsonValue::Null      => { return JsonValue::Null; }
-        JsonValue::Bool(b)   => { return JsonValue::Bool(b); }
-        JsonValue::Number(n) => { return JsonValue::Number(n); }
-        JsonValue::String(s) => {
-            return JsonValue::String(String::from_str(s.as_str()));
-        }
-        JsonValue::Array(arr) => {
-            mut out: Array<JsonValue> = Array<JsonValue>::with_capacity(arr.length());
-            mut i: u64 = 0;
-            while (i < arr.length()) {
-                // JsonValue owns resources (not Copy): borrow the element in
-                // place with get_ref rather than copying it out with get.
-                match (arr.get_ref(i)) {
-                    Option::Some(elem) => { out.push(clone_value(elem)); }
-                    Option::None       => { }
+    static field_equals(obj: &JsonValue, key: string, expected: string) -> boolean {
+        match (obj.get(Str::from_cstr(key))) {
+            Option::Some(v) => {
+                match (v.as_str()) {
+                    Option::Some(s) => { return s.equals(&Str::from_cstr(expected)); }
+                    Option::None    => { return false; }
                 }
-                i = i + 1;
             }
-            return JsonValue::Array(out);
+            Option::None => { return false; }
         }
-        JsonValue::Object(obj) => {
-            mut out: JsonObject = JsonObject::new();
-            mut i: u64 = 0;
-            while (i < obj.length()) {
-                match (obj.key_at(i)) {
-                    Option::Some(k) => {
-                        match (obj.value_at(i)) {
-                            Option::Some(vp) => {
-                                out.insert(String::from_str(k), clone_value(vp));
-                            }
-                            Option::None => { }
-                        }
+    }
+
+    static clone_string_field(obj: &JsonValue, key: string) -> Option<String> {
+        match (obj.get(Str::from_cstr(key))) {
+            Option::Some(v) => {
+                match (v.as_str()) {
+                    Option::Some(s) => { return Option::Some(String::from_str(s)); }
+                    Option::None    => { return Option::None; }
+                }
+            }
+            Option::None => { return Option::None; }
+        }
+    }
+
+    static clone_field(obj: &JsonValue, key: string) -> Option<JsonValue> {
+        match (obj.get(Str::from_cstr(key))) {
+            Option::Some(v) => { return Option::Some(JsonRpcCodec::clone_value(v)); }
+            Option::None    => { return Option::None; }
+        }
+    }
+
+    // Cloning JsonValue
+
+    /// Deep-clone a `JsonValue`.  We need this when a handler stashes
+    /// the request `id` for the eventual reply - the parsed tree owns
+    /// the bytes, and we want to drop the tree without freeing the id
+    /// out from under the response.
+    static clone_value(v: &JsonValue) -> JsonValue {
+        match (v) {
+            JsonValue::Null      => { return JsonValue::Null; }
+            JsonValue::Bool(b)   => { return JsonValue::Bool(b); }
+            JsonValue::Number(n) => { return JsonValue::Number(n); }
+            JsonValue::String(s) => {
+                return JsonValue::String(String::from_str(s.as_str()));
+            }
+            JsonValue::Array(arr) => {
+                mut out: Array<JsonValue> = Array<JsonValue>::with_capacity(arr.length());
+                mut i: u64 = 0;
+                while (i < arr.length()) {
+                    // JsonValue owns resources (not Copy): borrow the element in
+                    // place with get_ref rather than copying it out with get.
+                    match (arr.get_ref(i)) {
+                        Option::Some(elem) => { out.push(JsonRpcCodec::clone_value(elem)); }
+                        Option::None       => { }
                     }
-                    Option::None => { }
+                    i = i + 1;
                 }
-                i = i + 1;
+                return JsonValue::Array(out);
             }
-            return JsonValue::Object(out);
-        }
-    }
-}
-
-
-// Encoding
-
-/// Render a `ResponseMessage` to its JSON-RPC wire form.  The result
-/// is an owned `String` whose bytes the framing layer hands straight
-/// to `Stdout::write_all`.
-function encode_response(resp: &ResponseMessage) -> String {
-    mut obj: JsonObject = JsonObject::new();
-    obj.insert(
-        String::from_str(Str::from_cstr("jsonrpc")),
-        JsonValue::String(String::from_str(Str::from_cstr("2.0"))));
-    obj.insert(
-        String::from_str(Str::from_cstr("id")),
-        clone_value(&resp.id));
-
-    match (resp.error) {
-        Option::Some(err) => {
-            mut err_obj: JsonObject = JsonObject::new();
-            mut code_num: JsonNumber = JsonNumber::Int(err.code as i64);
-            err_obj.insert(
-                String::from_str(Str::from_cstr("code")),
-                JsonValue::Number(code_num));
-            err_obj.insert(
-                String::from_str(Str::from_cstr("message")),
-                JsonValue::String(String::from_str(err.message.as_str())));
-            obj.insert(
-                String::from_str(Str::from_cstr("error")),
-                JsonValue::Object(err_obj));
-        }
-        Option::None => {
-            obj.insert(
-                String::from_str(Str::from_cstr("result")),
-                clone_value(&resp.result));
+            JsonValue::Object(obj) => {
+                mut out: JsonObject = JsonObject::new();
+                mut i: u64 = 0;
+                while (i < obj.length()) {
+                    match (obj.key_at(i)) {
+                        Option::Some(k) => {
+                            match (obj.value_at(i)) {
+                                Option::Some(vp) => {
+                                    out.insert(String::from_str(k), JsonRpcCodec::clone_value(vp));
+                                }
+                                Option::None => { }
+                            }
+                        }
+                        Option::None => { }
+                    }
+                    i = i + 1;
+                }
+                return JsonValue::Object(out);
+            }
         }
     }
 
-    const wire: JsonValue = JsonValue::Object(obj);
-    mut owned_wire: JsonValue = wire;
-    const out: String = serializer::stringify(&owned_wire);
-    owned_wire.drop();
-    return out;
-}
+    // Encoding
 
-/// Build a notification on the wire (no `id` field).
-public function encode_notification(method: Str, params: JsonValue) -> String {
-    mut obj: JsonObject = JsonObject::new();
-    obj.insert(
-        String::from_str(Str::from_cstr("jsonrpc")),
-        JsonValue::String(String::from_str(Str::from_cstr("2.0"))));
-    obj.insert(
-        String::from_str(Str::from_cstr("method")),
-        JsonValue::String(String::from_str(method)));
-    obj.insert(
-        String::from_str(Str::from_cstr("params")),
-        params);
+    /// Render a `ResponseMessage` to its JSON-RPC wire form.  The result
+    /// is an owned `String` whose bytes the framing layer hands straight
+    /// to `Stdout::write_all`.
+    static encode_response(resp: &ResponseMessage) -> String {
+        mut obj: JsonObject = JsonObject::new();
+        obj.put("jsonrpc", JsonValue::from_cstr("2.0"));
+        obj.put("id", JsonRpcCodec::clone_value(&resp.id));
 
-    mut owned: JsonValue = JsonValue::Object(obj);
-    const out: String = serializer::stringify(&owned);
-    owned.drop();
-    return out;
-}
+        match (resp.error) {
+            Option::Some(err) => {
+                mut err_obj: JsonObject = JsonObject::new();
+                err_obj.put("code", JsonValue::int_value(err.code as i64));
+                err_obj.put("message", JsonValue::from_str(err.message.as_str()));
+                obj.put("error", JsonValue::Object(err_obj));
+            }
+            Option::None => {
+                obj.put("result", JsonRpcCodec::clone_value(&resp.result));
+            }
+        }
 
-/// Build a server->client request on the wire with the given id.  Used
-/// for spec messages like `workspace/semanticTokens/refresh` where the
-/// server pushes a refresh hint to the client.  The id is required by
-/// JSON-RPC for routing the (eventual) response back; the response is
-/// typically ignored on this server side.
-public function encode_request(id: i64, method: Str, params: JsonValue) -> String {
-    mut obj: JsonObject = JsonObject::new();
-    obj.insert(
-        String::from_str(Str::from_cstr("jsonrpc")),
-        JsonValue::String(String::from_str(Str::from_cstr("2.0"))));
-    obj.insert(
-        String::from_str(Str::from_cstr("id")),
-        JsonValue::Number(JsonNumber::Int(id)));
-    obj.insert(
-        String::from_str(Str::from_cstr("method")),
-        JsonValue::String(String::from_str(method)));
-    obj.insert(
-        String::from_str(Str::from_cstr("params")),
-        params);
+        const wire: JsonValue = JsonValue::Object(obj);
+        mut owned_wire: JsonValue = wire;
+        const out: String = serializer::stringify(&owned_wire);
+        owned_wire.drop();
+        return out;
+    }
 
-    mut owned: JsonValue = JsonValue::Object(obj);
-    const out: String = serializer::stringify(&owned);
-    owned.drop();
-    return out;
+    /// Build a notification on the wire (no `id` field).
+    static encode_notification(method: Str, params: JsonValue) -> String {
+        mut obj: JsonObject = JsonObject::new();
+        obj.put("jsonrpc", JsonValue::from_cstr("2.0"));
+        obj.put("method", JsonValue::from_str(method));
+        obj.put("params", params);
+
+        mut owned: JsonValue = JsonValue::Object(obj);
+        const out: String = serializer::stringify(&owned);
+        owned.drop();
+        return out;
+    }
+
+    /// Build a server->client request on the wire with the given id.  Used
+    /// for spec messages like `workspace/semanticTokens/refresh` where the
+    /// server pushes a refresh hint to the client.  The id is required by
+    /// JSON-RPC for routing the (eventual) response back; the response is
+    /// typically ignored on this server side.
+    static encode_request(id: i64, method: Str, params: JsonValue) -> String {
+        mut obj: JsonObject = JsonObject::new();
+        obj.put("jsonrpc", JsonValue::from_cstr("2.0"));
+        obj.put("id", JsonValue::int_value(id));
+        obj.put("method", JsonValue::from_str(method));
+        obj.put("params", params);
+
+        mut owned: JsonValue = JsonValue::Object(obj);
+        const out: String = serializer::stringify(&owned);
+        owned.drop();
+        return out;
+    }
 }

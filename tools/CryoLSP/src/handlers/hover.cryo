@@ -18,6 +18,13 @@
 ///! AST, no node at cursor, or no type on that node.  The LSP spec
 ///! treats `null` as "no hover here", which the editor renders as
 ///! "no tooltip" (clean fallback).
+///!
+///! All rendering + AST/graph queries hang off `HoverEngine`, a
+///! per-request object holding the compilation pointers (`ctx`, type
+///! `arena`, `intern` table, module `graph`).  Formatters and graph
+///! walks are `&this` methods; stateless string/AST utilities are
+///! `static` methods on the same type.  `handle_hover` is the only free
+///! function - it builds one engine per request and drives the dispatch.
 
 namespace Lsp::Handlers::Hover;
 
@@ -77,8 +84,8 @@ public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
     if (!pos_opt.is_some()) { return JsonValue::Null; }
     const pos: JsonValue* = pos_opt.unwrap_or(null);
     if (pos == null) { return JsonValue::Null; }
-    const line:      u32 = json_u32_field(pos, "line");
-    const character: u32 = json_u32_field(pos, "character");
+    const line:      u32 = HoverEngine::json_u32_field(pos, "line");
+    const character: u32 = HoverEngine::json_u32_field(pos, "character");
 
     // -- Keyword hover (token-level, AST-independent) -----------------
     // Run before any session/AST work: keywords like `function`,
@@ -110,7 +117,7 @@ public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
     if (ctx == null) { return JsonValue::Null; }
 
     // Strip `file://` to get the filesystem path the loader stored.
-    mut fs_path_owned: String = Conv::uri_to_fs_path(uri);
+    mut fs_path_owned: String = UriPath::uri_to_fs_path(uri);
     const fs_path: Str = fs_path_owned.as_str();
     mut path_buf: String = String::with_capacity(fs_path.length() + 1);
     path_buf.push(fs_path);
@@ -135,6 +142,10 @@ public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
         ast, cursor_line, cursor_char);
     if (node == null) { return JsonValue::Null; }
     if (ctx.type_arena == null) { return JsonValue::Null; }
+
+    // Per-request engine: holds the compilation pointers so the
+    // formatters + graph walks below don't each re-thread them.
+    mut eng: HoverEngine = HoverEngine::new(ctx);
 
     // -- Pick a content string and a span for the highlight ---------
     const name_span: SourceSpan = NodeLocator::name_span_of(node);
@@ -163,11 +174,11 @@ public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
         const trait_owner: SymbolStr = NodeLocator::find_trait_for_function(
             ctx.module_graph, f);
         if (trait_owner.is_valid()) {
-            const owner_str: string = leaf_after_separator(
+            const owner_str: string = HoverEngine::leaf_after_separator(
                 ctx.intern_table.resolve(trait_owner));
-            content = format_trait_method_signature(f, owner_str, ctx.type_arena);
+            content = eng.format_trait_method_signature(f, owner_str);
         } else {
-            content = format_function_signature(f, ctx.type_arena);
+            content = eng.format_function_signature(f);
         }
         hover_span = name_span;
         doc_text   = f.documentation;
@@ -180,9 +191,9 @@ public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
             const owner: SymbolStr = NodeLocator::find_method_owner(
                 ctx.module_graph, m);
             const owner_str: string = if (owner.is_valid()) {
-                leaf_after_separator(ctx.type_arena.intern_table.resolve(owner))
+                HoverEngine::leaf_after_separator(ctx.type_arena.intern_table.resolve(owner))
             } else { "" };
-            content    = format_method_signature(m, owner_str, ctx.type_arena);
+            content    = eng.format_method_signature(m, owner_str);
             hover_span = name_span;
             doc_text   = m.documentation;
         }
@@ -191,7 +202,7 @@ public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
         // rather than just the type, so the hover reflects what the
         // user wrote (`const` vs. `mut`, the variable's name).
         const v: VarDeclNode* = node as VarDeclNode*;
-        content    = format_variable_decl(v, ctx.type_arena);
+        content    = eng.format_variable_decl(v);
         hover_span = name_span;
         doc_text   = v.documentation;
     } else if (node.kind == NodeKind::VariableDeclaration) {
@@ -202,8 +213,8 @@ public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
         // `this: &Type` so the receiver's resolved type is visible
         // even though there's no source-level name-span to anchor.
         const v: VarDeclNode* = node as VarDeclNode*;
-        if (is_receiver_param(v, ctx.type_arena)) {
-            content    = format_receiver(v, ctx.type_arena);
+        if (eng.is_receiver_param(v)) {
+            content    = eng.format_receiver(v);
             hover_span = v.span;
         }
     } else if (on_decl_name && node.kind == NodeKind::FieldDeclaration) {
@@ -211,7 +222,7 @@ public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
         // field name in source - the locator descends into the
         // struct's `fields[]` to land here - and render `name: Type`.
         const fld: FieldDeclNode* = node as FieldDeclNode*;
-        content    = format_field_decl(fld, ctx.type_arena);
+        content    = eng.format_field_decl(fld);
         hover_span = name_span;
         doc_text   = fld.documentation;
     } else if (on_decl_name && (
@@ -223,7 +234,7 @@ public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
         // `type struct HashMap<K, V, A = GlobalAlloc>` - render the
         // type-decl head, including generic params with their
         // defaults so the user can see the full parameter list.
-        content    = format_type_decl(node, ctx.type_arena);
+        content    = eng.format_type_decl(node);
         hover_span = name_span;
         doc_text   = (node as DeclarationNode*).documentation;
     } else if (on_decl_name && node.kind == NodeKind::EnumVariant) {
@@ -232,10 +243,9 @@ public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
         // discriminant when set.  Reverse-walks the graph to find the
         // enclosing enum so the hover renders the qualified name.
         const variant: EnumVariantNode* = node as EnumVariantNode*;
-        const parent: EnumDeclNode* = find_enum_for_variant(
-            ctx.module_graph, variant);
+        const parent: EnumDeclNode* = eng.find_enum_for_variant(variant);
         if (parent != null) {
-            content    = format_enum_variant(parent, variant, ctx.type_arena);
+            content    = eng.format_enum_variant(parent, variant);
             hover_span = name_span;
             doc_text   = variant.documentation;
         }
@@ -248,15 +258,15 @@ public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
         const m: MethodNode* = NodeLocator::find_method_in_modules(
             ctx.module_graph, ctx.intern_table, sr.scope_name, sr.member_name);
         if (m != null && m.func != null) {
-            const owner_str: string = leaf_after_separator(
+            const owner_str: string = HoverEngine::leaf_after_separator(
                 ctx.type_arena.intern_table.resolve(sr.scope_name));
-            content  = format_method_signature(m, owner_str, ctx.type_arena);
+            content  = eng.format_method_signature(m, owner_str);
             doc_text = m.documentation;
         } else {
             const f: FunctionDeclNode* = NodeLocator::find_function_in_modules(
                 ctx.module_graph, sr.member_name);
             if (f != null) {
-                content  = format_function_signature(f, ctx.type_arena);
+                content  = eng.format_function_signature(f);
                 doc_text = f.documentation;
             } else {
                 // Enum-variant fallback.  `find_type_decl_in_modules`
@@ -266,10 +276,10 @@ public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
                     ctx.module_graph, ctx.intern_table, sr.scope_name);
                 if (td != null && td.kind == NodeKind::EnumDeclaration) {
                     const ed: EnumDeclNode* = td as EnumDeclNode*;
-                    const v: EnumVariantNode* = find_variant_in_enum(
+                    const v: EnumVariantNode* = HoverEngine::find_variant_in_enum(
                         ed, sr.member_name);
                     if (v != null) {
-                        content  = format_enum_variant(ed, v, ctx.type_arena);
+                        content  = eng.format_enum_variant(ed, v);
                         doc_text = v.documentation;
                     }
                 }
@@ -284,9 +294,8 @@ public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
         //     (the locator descends into `value` so we typically don't
         //     even reach this branch in that case)
         const sl: StructLiteralNode* = node as StructLiteralNode*;
-        const sl_result: StructLiteralHover = struct_literal_hover_at(
-            sl, cursor_line, cursor_char,
-            ctx.module_graph, ctx.intern_table, ctx.type_arena);
+        const sl_result: StructLiteralHover = eng.struct_literal_hover_at(
+            sl, cursor_line, cursor_char);
         if (sl_result.content != "") {
             content    = sl_result.content;
             hover_span = sl_result.span;
@@ -312,8 +321,7 @@ public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
             // hits the carrier's entry in the reverse map.
             mut type_sym: SymbolStr = SymbolStr::empty();
             mut owner_display: string = "";
-            const recv_ty: TypeRef = unwrap_to_carrier(
-                ma.object.resolved_type, ctx.type_arena);
+            const recv_ty: TypeRef = eng.unwrap_to_carrier(ma.object.resolved_type);
             if (recv_ty.is_valid()) {
                 type_sym = ctx.decl_index.lookup_type_name(recv_ty);
                 if (type_sym.is_valid()) {
@@ -332,11 +340,11 @@ public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
             // `Formatter<W>` -> take `Formatter` as the carrier name,
             // then run the method lookup by name.
             if (!type_sym.is_valid()) {
-                const annot_name: SymbolStr = receiver_carrier_name_from_annotation(
-                    ma.object, ctx);
+                const annot_name: SymbolStr = eng.receiver_carrier_name_from_annotation(
+                    ma.object);
                 if (annot_name.is_valid()) {
                     type_sym = annot_name;
-                    owner_display = leaf_after_separator(
+                    owner_display = HoverEngine::leaf_after_separator(
                         ctx.intern_table.resolve(annot_name));
                 }
             }
@@ -363,19 +371,19 @@ public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
                 // and render the trait method instead.  Done before
                 // the regular method/field path so trait method docs
                 // win when both exist (which is rare anyway).
-                const trait_m: FunctionDeclNode* = trait_method_for_generic_receiver(
-                    ctx, ma.span.file, ma.span.start_line, ma.span.start_col,
+                const trait_m: FunctionDeclNode* = eng.trait_method_for_generic_receiver(
+                    ma.span.file, ma.span.start_line, ma.span.start_col,
                     type_sym, ma.member);
                 if (trait_m != null) {
                     const trait_owner: SymbolStr =
                         NodeLocator::find_trait_for_function(
                             ctx.module_graph, trait_m);
                     const owner_str: string = if (trait_owner.is_valid()) {
-                        leaf_after_separator(
+                        HoverEngine::leaf_after_separator(
                             ctx.intern_table.resolve(trait_owner))
                     } else { "" };
-                    content  = format_trait_method_signature(
-                        trait_m, owner_str, ctx.type_arena);
+                    content  = eng.format_trait_method_signature(
+                        trait_m, owner_str);
                     doc_text = trait_m.documentation;
                     if (NodeLocator::span_contains(
                             ma.member_span, cursor_line, cursor_char)) {
@@ -394,13 +402,13 @@ public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
                     const m: MethodNode* = NodeLocator::find_method_in_modules(
                         ctx.module_graph, ctx.intern_table, type_sym, ma.member);
                     if (m != null && m.func != null) {
-                        content  = format_method_signature(m, owner_display, ctx.type_arena);
+                        content  = eng.format_method_signature(m, owner_display);
                         doc_text = m.documentation;
                     } else {
                         const fld: FieldDeclNode* = NodeLocator::find_field_in_modules(
                             ctx.module_graph, ctx.intern_table, type_sym, ma.member);
                         if (fld != null) {
-                            content  = format_field_decl(fld, ctx.type_arena);
+                            content  = eng.format_field_decl(fld);
                             doc_text = fld.documentation;
                         }
                     }
@@ -412,13 +420,13 @@ public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
                     const fld: FieldDeclNode* = NodeLocator::find_field_in_modules(
                         ctx.module_graph, ctx.intern_table, type_sym, ma.member);
                     if (fld != null) {
-                        content  = format_field_decl(fld, ctx.type_arena);
+                        content  = eng.format_field_decl(fld);
                         doc_text = fld.documentation;
                     } else {
                         const m: MethodNode* = NodeLocator::find_method_in_modules(
                             ctx.module_graph, ctx.intern_table, type_sym, ma.member);
                         if (m != null && m.func != null) {
-                            content  = format_method_signature(m, owner_display, ctx.type_arena);
+                            content  = eng.format_method_signature(m, owner_display);
                             doc_text = m.documentation;
                         }
                     }
@@ -439,16 +447,13 @@ public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
         // resolve the literal path against `std::` as a fallback -
         // matching the loader's stdlib-search behavior.
         const imp: ImportDeclNode* = node as ImportDeclNode*;
-        const seg_idx: i64 = import_segment_at(
+        const seg_idx: i64 = HoverEngine::import_segment_at(
             imp, cursor_line, cursor_char);
         if (seg_idx >= 0) {
-            const literal: string = build_segment_path(
-                imp, seg_idx, ctx.type_arena.intern_table);
-            const seg_path: string = resolve_namespace_path(
-                ctx.module_graph, literal);
-            content    = format_namespace_overview(
-                seg_path, ctx.module_graph);
-            doc_text   = namespace_doc_for_path(ctx.module_graph, seg_path);
+            const literal: string = eng.build_segment_path(imp, seg_idx);
+            const seg_path: string = eng.resolve_namespace_path(literal);
+            content    = eng.format_namespace_overview(seg_path);
+            doc_text   = eng.namespace_doc_for_path(seg_path);
             hover_span = imp.path_segment_spans[seg_idx];
         }
     } else if (node.kind == NodeKind::ModuleDeclaration) {
@@ -459,16 +464,13 @@ public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
         // share the per-segment span tracking populated by the
         // parser.
         const md: ModuleDeclNode* = node as ModuleDeclNode*;
-        const seg_idx: i64 = module_decl_segment_at(
+        const seg_idx: i64 = HoverEngine::module_decl_segment_at(
             md, cursor_line, cursor_char);
         if (seg_idx >= 0) {
-            const literal: string = build_module_decl_path(
-                md, seg_idx, ctx.type_arena.intern_table);
-            const seg_path: string = resolve_namespace_path(
-                ctx.module_graph, literal);
-            content    = format_namespace_overview(
-                seg_path, ctx.module_graph);
-            doc_text   = namespace_doc_for_path(ctx.module_graph, seg_path);
+            const literal: string = eng.build_module_decl_path(md, seg_idx);
+            const seg_path: string = eng.resolve_namespace_path(literal);
+            content    = eng.format_namespace_overview(seg_path);
+            doc_text   = eng.namespace_doc_for_path(seg_path);
             hover_span = md.path_segment_spans[seg_idx];
         }
     } else if (node.kind == NodeKind::ImplementationBlock) {
@@ -488,7 +490,7 @@ public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
                 const decl: ASTNode* = NodeLocator::find_type_decl_in_modules(
                     ctx.module_graph, ctx.intern_table, named.name);
                 if (decl != null) {
-                    content    = format_type_decl(decl, ctx.type_arena);
+                    content    = eng.format_type_decl(decl);
                     hover_span = named.span;
                     doc_text   = (decl as DeclarationNode*).documentation;
                 }
@@ -503,7 +505,7 @@ public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
             const decl: ASTNode* = NodeLocator::find_type_decl_in_modules(
                 ctx.module_graph, ctx.intern_table, impl_blk.target_type);
             if (decl != null) {
-                content    = format_type_decl(decl, ctx.type_arena);
+                content    = eng.format_type_decl(decl);
                 hover_span = impl_blk.target_type_span;
                 doc_text   = (decl as DeclarationNode*).documentation;
             }
@@ -521,7 +523,7 @@ public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
             const v: VarDeclNode* = NodeLocator::find_const_in_modules(
                 ctx.module_graph, pat.binding_name);
             if (v != null) {
-                content    = format_variable_decl(v, ctx.type_arena);
+                content    = eng.format_variable_decl(v);
                 hover_span = pat.span;
                 doc_text   = v.documentation;
             }
@@ -536,11 +538,11 @@ public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
         // shows in source and the type alone is the useful info.
         const lit: LiteralNode* = node as LiteralNode*;
         if (lit.literal_kind == LiteralKind::String) {
-            content    = format_string_literal(lit);
+            content    = HoverEngine::format_string_literal(lit);
             hover_span = lit.span;
         } else if (lit.literal_kind == LiteralKind::Integer
                 || lit.literal_kind == LiteralKind::Float) {
-            content    = format_numeric_literal(lit, ctx.type_arena);
+            content    = eng.format_numeric_literal(lit);
             hover_span = lit.span;
         }
     } else if (node.kind == NodeKind::Identifier && ctx.resolver != null) {
@@ -567,7 +569,7 @@ public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
                     ctx.module_graph, id_node.span.file,
                     id_node.span.start_line, id_node.span.start_col);
                 if (owner.is_valid()) {
-                    const owner_str: string = leaf_after_separator(
+                    const owner_str: string = HoverEngine::leaf_after_separator(
                         ctx.intern_table.resolve(owner));
                     content    = "this: " + owner_str;
                     hover_span = id_node.span;
@@ -584,33 +586,33 @@ public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
                 // round-trips through the arena as `?` for arrow types.
                 // Trait-method detection mirrors the decl-name dispatch above.
                 if (sym.kind == SymbolKind::Function) {
-                    const fdecl: FunctionDeclNode* = function_decl_at_span(
-                        ctx.module_graph, sym.declaring_span);
+                    const fdecl: FunctionDeclNode* = eng.function_decl_at_span(
+                        sym.declaring_span);
                     if (fdecl != null) {
                         const trait_owner: SymbolStr = NodeLocator::find_trait_for_function(
                             ctx.module_graph, fdecl);
                         if (trait_owner.is_valid()) {
-                            const owner_str: string = leaf_after_separator(
+                            const owner_str: string = HoverEngine::leaf_after_separator(
                                 ctx.intern_table.resolve(trait_owner));
-                            content = format_trait_method_signature(
-                                fdecl, owner_str, ctx.type_arena);
+                            content = eng.format_trait_method_signature(
+                                fdecl, owner_str);
                         } else {
-                            content = format_function_signature(fdecl, ctx.type_arena);
+                            content = eng.format_function_signature(fdecl);
                         }
                         doc_text = fdecl.documentation;
                     }
                 }
 
                 if (content == "") {
-                    const init_str: string = const_initializer_text(
-                        ctx.module_graph, sym.declaring_span);
-                    content = format_identifier_use(
-                        sym, id_node.resolved_type, ctx.type_arena, init_str);
+                    const init_str: string = eng.const_initializer_text(
+                        sym.declaring_span);
+                    content = eng.format_identifier_use(
+                        sym, id_node.resolved_type, init_str);
                     // Pull doc from the symbol's source decl, if reachable.
                     // Covers `const ENOENT: i32 = 2` use sites; method/field/
                     // parameter uses fall through with empty doc.
-                    const v: VarDeclNode* = var_decl_at_span(
-                        ctx.module_graph, sym.declaring_span);
+                    const v: VarDeclNode* = eng.var_decl_at_span(
+                        sym.declaring_span);
                     if (v != null) { doc_text = v.documentation; }
 
                     // Generic-body fallback: when sema didn't stamp a
@@ -622,12 +624,12 @@ public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
                     // exactly the way it was written, even when sema
                     // couldn't lower it through the type arena yet.
                     if (v != null && v.type_annotation != null
-                            && contains_unknown_type(content)) {
-                        const ann_str: string = format_annotation(
-                            v.type_annotation, ctx.intern_table);
+                            && HoverEngine::contains_unknown_type(content)) {
+                        const ann_str: string = eng.format_annotation(
+                            v.type_annotation);
                         if (ann_str != "" && ann_str != "?") {
-                            content = rebuild_identifier_use_with_annotation(
-                                sym, ann_str, init_str, ctx.intern_table);
+                            content = eng.rebuild_identifier_use_with_annotation(
+                                sym, ann_str, init_str);
                         }
                     }
                 }
@@ -642,15 +644,15 @@ public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
     // descent reaches).  Scan trait_bounds[] for a TraitRef whose
     // span covers the cursor; render its declaring trait.
     if (content == "") {
-        const trait_ref_match: SymbolStr = trait_ref_at_cursor(
+        const trait_ref_match: SymbolStr = HoverEngine::trait_ref_at_cursor(
             node, cursor_line, cursor_char);
         if (trait_ref_match.is_valid()) {
             const decl: ASTNode* = NodeLocator::find_type_decl_in_modules(
                 ctx.module_graph, ctx.intern_table, trait_ref_match);
             if (decl != null) {
-                content    = format_type_decl(decl, ctx.type_arena);
+                content    = eng.format_type_decl(decl);
                 doc_text   = (decl as DeclarationNode*).documentation;
-                hover_span = trait_ref_span_at_cursor(node, cursor_line, cursor_char);
+                hover_span = HoverEngine::trait_ref_span_at_cursor(node, cursor_line, cursor_char);
             }
         }
     }
@@ -661,14 +663,13 @@ public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
     // `[bound.span.start, first_trait_ref.span.start)` - same line in
     // every case the parser produces.
     if (content == "") {
-        const param_span: SourceSpan = type_param_span_at_cursor(
+        const param_span: SourceSpan = HoverEngine::type_param_span_at_cursor(
             node, cursor_line, cursor_char);
         if (param_span.has_location()) {
-            const param_name: SymbolStr = type_param_at_cursor(
+            const param_name: SymbolStr = HoverEngine::type_param_at_cursor(
                 node, cursor_line, cursor_char);
             if (param_name.is_valid()) {
-                content    = format_generic_param_at(
-                    node, param_name, ctx.intern_table);
+                content    = eng.format_generic_param_at(node, param_name);
                 hover_span = param_span;
             }
         }
@@ -684,7 +685,7 @@ public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
         // via `format_type_decl`.  Falls through to the type-name
         // fallback when the named segment isn't a user-defined type
         // (primitives, generic params).
-        const ann_root: TypeAnnotation* = annotation_for_decl(node);
+        const ann_root: TypeAnnotation* = HoverEngine::annotation_for_decl(node);
         if (ann_root != null) {
             const named: NamedAnnotation* = NodeLocator::find_named_annotation_at(
                 ann_root, cursor_line, cursor_char);
@@ -692,7 +693,7 @@ public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
                 const decl: ASTNode* = NodeLocator::find_type_decl_in_modules(
                     ctx.module_graph, ctx.intern_table, named.name);
                 if (decl != null) {
-                    content    = format_type_decl(decl, ctx.type_arena);
+                    content    = eng.format_type_decl(decl);
                     hover_span = named.span;
                     doc_text   = (decl as DeclarationNode*).documentation;
                 }
@@ -712,7 +713,7 @@ public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
             // function - the locator can't descend into TypeAnnotation
             // (it's an enum, not an AST node) so the walk stops at the
             // enclosing decl.
-            const ann_span: SourceSpan = annotation_span_at_cursor(
+            const ann_span: SourceSpan = HoverEngine::annotation_span_at_cursor(
                 node, cursor_line, cursor_char);
             if (NodeLocator::span_contains(ann_span, cursor_line, cursor_char)) {
                 hover_span = ann_span;
@@ -730,7 +731,7 @@ public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
     value_buf.push(content);
     value_buf.push("\n```");
     if (doc_text != "") {
-        const doc_clean: string = clean_doc_for_hover(doc_text);
+        const doc_clean: string = HoverEngine::clean_doc_for_hover(doc_text);
         if (doc_clean != "") {
             value_buf.push("\n\n");
             value_buf.push(doc_clean);
@@ -740,7 +741,7 @@ public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
     const contents: MarkupContent = MarkupContent::markdown(value_buf);
     const hover: Hover = Hover {
         contents: contents,
-        range:    Option::Some(range_from_span(hover_span)),
+        range:    Option::Some(HoverEngine::range_from_span(hover_span)),
     };
     const result: JsonValue = hover.to_json();
     mut h: Hover = hover;
@@ -749,1460 +750,8 @@ public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
 }
 
 
-// Signature formatters
+// Struct-literal hover result
 //
-// Render a callable as `function name(p1: T1, p2: T2) -> Ret` (free
-// function) or `method name(...)` / `static name(...)` (method).
-// Parameter types come from `VarDeclNode.resolved_type`; the function's
-// return type comes from `FunctionDeclNode.resolved_return_type`.  Both
-// are filled in by sema, so this only produces useful output once name
-// resolution + type checking have run.  When sema bailed mid-pipeline
-// (the common LSP case for in-progress edits) the affected slots stay
-// `TypeRef::invalid()` and render as `?`.
-
-/// Render a trait method as `<Trait>::<name><generics>(<params>) -> <ret>
-///     where <bounds>`.  `owner_display` is the trait's leaf name
-/// (`Display` rather than `std::fmt::display::Display`).  No `function`
-/// keyword - trait method declarations omit it in source too.
-function format_trait_method_signature(func: FunctionDeclNode*,
-                                        owner_display: string,
-                                        arena: TypeArena*) -> string {
-    if (func == null) { return ""; }
-    mut sig: string = "";
-    if (owner_display != "") {
-        sig = sig + owner_display + "::";
-    }
-    sig = sig + arena.intern_table.resolve(func.name);
-    sig = sig + format_generic_params(func.generic_params, arena.intern_table);
-    sig = sig + format_params(func.parameters, arena);
-    sig = sig + " -> ";
-    sig = sig + arena.resolve_display_name_short(func.resolved_return_type.id);
-    sig = sig + format_where_clause(func.trait_bounds, arena.intern_table);
-    return sig;
-}
-
-function format_function_signature(func: FunctionDeclNode*,
-                                    arena: TypeArena*) -> string {
-    if (func == null) { return ""; }
-    mut sig: string = "function ";
-    sig = sig + arena.intern_table.resolve(func.name);
-    sig = sig + format_generic_params(func.generic_params, arena.intern_table);
-    sig = sig + format_params(func.parameters, arena);
-    sig = sig + " -> ";
-    sig = sig + arena.resolve_display_name_short(func.resolved_return_type.id);
-    sig = sig + format_where_clause(func.trait_bounds, arena.intern_table);
-    return sig;
-}
-
-/// Render a method as `<modifier>? <Owner>::<name>(<params>) -> <ret>`.
-/// Modifier is one of `static` / `constructor` / `destructor` and is
-/// omitted on plain instance methods - the `&this` / `mut &this`
-/// receiver in the parameter list already conveys instance-ness, so
-/// a leading `method` keyword would just be noise.
-///
-/// `owner_display` is the rendered owner string the caller has
-/// already computed.  For decl-name and scope-resolution hovers the
-/// caller passes the leaf of a SymbolStr (`Str` from
-/// `std::collections::str::Str`).  For member-access hovers the
-/// caller passes the receiver type's display name from the type
-/// arena - which goes through the arena's `format_display_short` and
-/// covers monomorphized generics correctly
-/// (`Array<u8, GlobalAlloc>` rather than the mangled
-/// `5Array$Lh_N$L3std.5alloc.9allocator.11GlobalAlloc$G$G`).  Empty
-/// string means "no owner prefix".
-function format_method_signature(method: MethodNode*, owner_display: string,
-                                  arena: TypeArena*) -> string {
-    if (method == null || method.func == null) { return ""; }
-    const f: FunctionDeclNode* = method.func;
-    mut sig: string = "";
-    if (method.is_static)      { sig = sig + "static "; }
-    if (method.is_constructor) { sig = sig + "constructor "; }
-    if (method.is_destructor)  { sig = sig + "destructor "; }
-    if (owner_display != "") {
-        sig = sig + owner_display + "::";
-    }
-    sig = sig + arena.intern_table.resolve(f.name);
-    sig = sig + format_generic_params(f.generic_params, arena.intern_table);
-    sig = sig + format_params(f.parameters, arena);
-    sig = sig + " -> ";
-    sig = sig + arena.resolve_display_name_short(f.resolved_return_type.id);
-    sig = sig + format_where_clause(f.trait_bounds, arena.intern_table);
-    return sig;
-}
-
-/// Return everything after the final `::` in `s`, or `s` itself when
-/// there's no `::`.  Mirrors `extract_leaf_segment` in
-/// `Compiler::Types::Arena` - duplicated here to avoid the cross-
-/// module import for one tiny string helper.
-function leaf_after_separator(s: string) -> string {
-    const len: i64 = strlen(s) as i64;
-    mut last_sep: i64 = -1;
-    for (mut i: i64 = 0; i + 1 < len; i++) {
-        if (s[i] == ':' && s[i + 1] == ':') { last_sep = i; }
-    }
-    if (last_sep < 0) { return s; }
-    const start: i64 = last_sep + 2;
-    if (start >= len) { return ""; }
-    return ptr_add(s as void*, start) as string;
-}
-
-/// Render a struct/class field as `<name>: <Type>`.  No `field`
-/// keyword: the surrounding `type struct/class` already conveys
-/// it, and source uses just `name: Type` for fields.
-function format_field_decl(fld: FieldDeclNode*, arena: TypeArena*) -> string {
-    if (fld == null) { return ""; }
-    mut sig: string = arena.intern_table.resolve(fld.name);
-    sig = sig + ": ";
-    sig = sig + arena.resolve_display_name_short(fld.resolved_type.id);
-    return sig;
-}
-
-/// Render a type declaration's full body for hover:
-///
-///   type struct Point<T = i32> {
-///       x: T;
-///       y: T;
-///   }
-///
-/// Struct/class hovers list fields; enum hovers list variants with
-/// their auto-numbered or explicit discriminants; trait hovers list
-/// method signatures; type-alias hovers append the resolved target
-/// after `=`.  Methods on struct/class are intentionally omitted -
-/// individual method hovers cover those, and including them would
-/// make the type-hover unwieldy for stdlib types like `HashMap` or
-/// `Array`.  Empty bodies collapse to just the head.
-function format_type_decl(node: ASTNode*, arena: TypeArena*) -> string {
-    return match (node.kind) {
-        NodeKind::StructDeclaration => {
-            const d: StructDeclNode* = node as StructDeclNode*;
-            mut sig: string = "type struct " + arena.intern_table.resolve(d.name)
-                + format_generic_params(d.generic_params, arena.intern_table);
-            if (d.fields.length > 0) {
-                sig = sig + " {\n";
-                for (mut i: i64 = 0; i < d.fields.length; i++) {
-                    sig = sig + "    " + format_field_decl(d.fields[i], arena) + ";\n";
-                }
-                sig = sig + "}";
-            }
-            sig
-        }
-        NodeKind::ClassDeclaration => {
-            const d: ClassDeclNode* = node as ClassDeclNode*;
-            mut sig: string = "type class " + arena.intern_table.resolve(d.name)
-                + format_generic_params(d.generic_params, arena.intern_table);
-            if (d.base_class.is_valid()) {
-                sig = sig + " : "
-                    + leaf_after_separator(arena.intern_table.resolve(d.base_class));
-            }
-            if (d.fields.length > 0) {
-                sig = sig + " {\n";
-                for (mut i: i64 = 0; i < d.fields.length; i++) {
-                    sig = sig + "    " + format_field_decl(d.fields[i], arena) + ";\n";
-                }
-                sig = sig + "}";
-            }
-            sig
-        }
-        NodeKind::EnumDeclaration => {
-            const d: EnumDeclNode* = node as EnumDeclNode*;
-            mut sig: string = "type enum " + arena.intern_table.resolve(d.name)
-                + format_generic_params(d.generic_params, arena.intern_table);
-            if (d.variants.length > 0) {
-                sig = sig + " {\n";
-                for (mut i: i64 = 0; i < d.variants.length; i++) {
-                    sig = sig + "    " + format_variant_in_decl(d, d.variants[i], arena) + "\n";
-                }
-                sig = sig + "}";
-            }
-            sig
-        }
-        NodeKind::TraitDeclaration => {
-            const d: TraitDeclNode* = node as TraitDeclNode*;
-            mut sig: string = "type trait " + arena.intern_table.resolve(d.name)
-                + format_generic_params(d.generic_params, arena.intern_table);
-            if (d.methods.length > 0) {
-                sig = sig + " {\n";
-                for (mut i: i64 = 0; i < d.methods.length; i++) {
-                    const m: FunctionDeclNode* = d.methods[i];
-                    if (m == null) { continue; }
-                    sig = sig + "    " + arena.intern_table.resolve(m.name)
-                        + format_params(m.parameters, arena)
-                        + " -> "
-                        + arena.resolve_display_name_short(m.resolved_return_type.id)
-                        + ";\n";
-                }
-                sig = sig + "}";
-            }
-            sig
-        }
-        NodeKind::TypeAliasDeclaration => {
-            const d: TypeAliasDeclNode* = node as TypeAliasDeclNode*;
-            mut sig: string = "type alias " + arena.intern_table.resolve(d.alias_name);
-            sig = sig + format_generic_params(d.generic_params, arena.intern_table);
-            // Append the resolved target after `=` when sema has filled
-            // it in; otherwise leave the head bare so partially-typed
-            // sources still produce useful hovers.
-            if (d.resolved_target.is_valid()) {
-                sig = sig + " = "
-                    + arena.resolve_display_name_short(d.resolved_target.id);
-            }
-            sig
-        }
-        _ => { "" }
-    };
-}
-
-/// Render one variant inside an enum-decl body: `Name = N;` for
-/// unit-only variants (auto-numbered or explicit), `Name(T1, T2);`
-/// for payload variants.  Mirrors the standalone variant hover but
-/// without the enclosing `EnumName::` prefix - it's redundant inside
-/// the enum's own decl listing.
-function format_variant_in_decl(parent: EnumDeclNode*, variant: EnumVariantNode*,
-                                 arena: TypeArena*) -> string {
-    if (variant == null) { return ""; }
-    mut s: string = arena.intern_table.resolve(variant.name);
-    if (variant.associated_types.length > 0) {
-        s = s + "(";
-        for (mut i: i64 = 0; i < variant.associated_types.length; i++) {
-            if (i > 0) { s = s + ", "; }
-            s = s + format_annotation(
-                variant.associated_types[i], arena.intern_table);
-        }
-        return s + ");";
-    }
-    const disc: i64 = if (variant.has_value) {
-        variant.explicit_value
-    } else {
-        variant_auto_index(parent, variant)
-    };
-    return s + " = " + i64_to_text(disc) + ";";
-}
-
-function format_generic_params(params: &GenericParamNode*[],
-                                intern: InternTable*) -> string {
-    if (params.length == 0) { return ""; }
-    mut s: string = "<";
-    for (mut i: i64 = 0; i < params.length; i++) {
-        if (i > 0) { s = s + ", "; }
-        const p: GenericParamNode* = params[i];
-        if (p == null) { continue; }
-        s = s + intern.resolve(p.name);
-        if (p.default_annotation != null) {
-            s = s + " = " + format_annotation(p.default_annotation, intern);
-        }
-    }
-    return s + ">";
-}
-
-/// Render a function/method's trait bounds as a `where` clause on a
-/// new indented line.  Mirrors the source spelling:
-///
-///     hash<H>(&this, hasher: mut &H) -> void
-///         where H: Hasher
-///
-///     foo<T, U>(...) -> ...
-///         where T: Default + Clone, U: Eq
-///
-/// Each `TraitBound` carries the type-parameter name plus one or more
-/// `TraitRef`s; multi-trait bounds join with `+`, multi-param bounds
-/// join with `, `.  Empty bound list returns "" so callers can
-/// unconditionally concatenate.
-function format_where_clause(bounds: &TraitBound[], intern: InternTable*) -> string {
-    if (bounds.length == 0) { return ""; }
-    mut s: string = "\n    where ";
-    for (mut i: i64 = 0; i < bounds.length; i++) {
-        if (i > 0) { s = s + ", "; }
-        const b: &TraitBound = &bounds[i];
-        s = s + intern.resolve(b.type_parameter);
-        s = s + ": ";
-        for (mut j: i64 = 0; j < b.trait_refs.length; j++) {
-            if (j > 0) { s = s + " + "; }
-            s = s + format_trait_ref(&b.trait_refs[j], intern);
-        }
-    }
-    return s;
-}
-
-/// Render a `TraitRef` as `<leaf>[<args>]`.  Multi-segment paths
-/// (`io::Write`) collapse to their leaf - the hover already names the
-/// enclosing context, so the prefix would just be noise.
-function format_trait_ref(tref: &TraitRef, intern: InternTable*) -> string {
-    if (tref.path.length == 0) { return "?"; }
-    const leaf_sym: SymbolStr = tref.path[tref.path.length - 1];
-    mut s: string = intern.resolve(leaf_sym);
-    if (tref.type_args.length > 0) {
-        s = s + "<";
-        for (mut i: i64 = 0; i < tref.type_args.length; i++) {
-            if (i > 0) { s = s + ", "; }
-            s = s + format_annotation(tref.type_args[i], intern);
-        }
-        s = s + ">";
-    }
-    return s;
-}
-
-/// Render a `TypeAnnotation*` as a one-line string.  Handles the
-/// common shapes generic-param defaults take: bare `Named` (e.g.
-/// `GlobalAlloc`), `Primitive` (e.g. `i32`), and pointer/reference
-/// wrappers.  Unhandled variants render as `?` rather than error -
-/// hover should never crash when sema has only partially digested
-/// the source.
-function format_annotation(ann: TypeAnnotation*, intern: InternTable*) -> string {
-    if (ann == null) { return "?"; }
-    return match (*ann) {
-        TypeAnnotation::Primitive(p) => { intern.resolve(p.name) }
-        TypeAnnotation::Named(n)     => {
-            leaf_after_separator(intern.resolve(n.name))
-        }
-        TypeAnnotation::Pointer(p)   => {
-            format_annotation(p.inner, intern) + "*"
-        }
-        TypeAnnotation::Reference(r) => {
-            const inner: string = format_annotation(r.inner, intern);
-            const prefix: string = if (r.is_mutable) { "&mut " } else { "&" };
-            prefix + inner
-        }
-        TypeAnnotation::Optional(o)  => {
-            format_annotation(o.inner, intern) + "?"
-        }
-        TypeAnnotation::Array(a)     => {
-            format_annotation(a.element, intern) + "[]"
-        }
-        _                            => { "?" }
-    };
-}
-
-
-/// Render a variable declaration as `const|mut <name>: <Type>`,
-/// matching the source-level form.  `is_global` doesn't get a
-/// dedicated marker - the type already conveys what matters.
-/// For globals with a literal initializer, the value is appended:
-/// `const ENOENT: i32 = 2` - useful for errno-style constant tables
-/// where the value is the relevant fact about the binding.
-/// Reconstruct a closure's signature `(P0, P1, ...) -> Ret` from the
-/// LambdaExprNode.  A capturing lambda's `resolved_type` is the synthesized
-/// `__Closure_<N>` struct, so displaying that type name gives an opaque
-/// `__Closure_0` in hovers; the signature is the useful information and it's
-/// fully recoverable from the lambda's parameters + return type.
-function format_lambda_signature(lam: LambdaExprNode*, arena: TypeArena*) -> string {
-    mut s: string = "(";
-    for (mut i: i64 = 0; i < lam.parameters.length; i++) {
-        if (i > 0) { s = s + ", "; }
-        const p: VarDeclNode* = lam.parameters[i];
-        if (p.has_resolved_type()) {
-            s = s + arena.resolve_display_name_short(p.resolved_type.id);
-        } else if (p.type_annotation != null) {
-            s = s + format_annotation(p.type_annotation, arena.intern_table);
-        } else {
-            s = s + "?";
-        }
-    }
-    s = s + ") -> ";
-    if (lam.return_type.is_valid()) {
-        s = s + arena.resolve_display_name_short(lam.return_type.id);
-    } else if (lam.return_type_ann != null) {
-        s = s + format_annotation(lam.return_type_ann, arena.intern_table);
-    } else {
-        s = s + "void";
-    }
-    return s;
-}
-
-function format_variable_decl(v: VarDeclNode*, arena: TypeArena*) -> string {
-    if (v == null) { return ""; }
-    mut sig: string = if (v.is_mutable) { "mut " } else { "const " };
-    sig = sig + arena.intern_table.resolve(v.name);
-    sig = sig + ": ";
-    if (v.initializer != null && v.initializer.kind == NodeKind::LambdaExpression) {
-        sig = sig + format_lambda_signature(v.initializer as LambdaExprNode*, arena);
-    } else {
-        sig = sig + arena.resolve_display_name_short(v.resolved_type.id);
-    }
-    if (v.is_global && v.initializer != null) {
-        const init: string = literal_text(v.initializer);
-        if (init != "") { sig = sig + " = " + init; }
-    }
-    return sig;
-}
-
-/// True when `v` is a method receiver parameter (`&this` /
-/// `mut &this` / `this`).  The parser stores the literal lexeme
-/// (`&this` etc.) as the param's `name`, so a string-content match
-/// against the interned name is the most direct way to detect it.
-function is_receiver_param(v: VarDeclNode*, arena: TypeArena*) -> boolean {
-    if (v == null) { return false; }
-    const name_str: string = arena.intern_table.resolve(v.name);
-    return strcmp(name_str, "&this") == 0
-        || strcmp(name_str, "this")  == 0;
-}
-
-/// Return the type-annotation span on `node` that covers the
-/// cursor, if any.  Looks at the return-type annotation for
-/// functions and methods, and the type annotation for variables /
-/// fields.  Used to narrow the hover highlight when the cursor sits
-/// on a type token that isn't its own AST node.
-function annotation_span_at_cursor(node: ASTNode*, line: u32, ch: u32) -> SourceSpan {
-    const ann: TypeAnnotation* = annotation_for_decl(node);
-    return NodeLocator::annotation_span(ann);
-}
-
-/// Scan a FunctionDeclNode or MethodNode's `trait_bounds[]` for a
-/// TraitRef whose span covers `(line, character)`.  Returns the
-/// leaf SymbolStr of the trait reference's qualified path (e.g.
-/// `FmtWrite` from `where W: FmtWrite`) - that's the name the
-/// `find_type_decl_in_modules` lookup keys on.  Returns
-/// `SymbolStr::empty()` when the cursor isn't on any trait ref.
-function trait_ref_at_cursor(node: ASTNode*, line: u32, character: u32) -> SymbolStr {
-    const bounds: TraitBound[]* = bounds_of_decl(node);
-    if (bounds == null) { return SymbolStr::empty(); }
-    for (mut bi: i64 = 0; bi < bounds.length; bi++) {
-        const b: &TraitBound = &(*bounds)[bi];
-        for (mut ti: i64 = 0; ti < b.trait_refs.length; ti++) {
-            const tref: &TraitRef = &b.trait_refs[ti];
-            if (!NodeLocator::span_contains(tref.span, line, character)) { continue; }
-            if (tref.path.length == 0) { continue; }
-            return tref.path[tref.path.length - 1];
-        }
-    }
-    return SymbolStr::empty();
-}
-
-/// Companion to `trait_ref_at_cursor` - returns the span of the
-/// matching TraitRef so the hover can highlight the exact lexeme.
-function trait_ref_span_at_cursor(node: ASTNode*, line: u32, character: u32) -> SourceSpan {
-    const bounds: TraitBound[]* = bounds_of_decl(node);
-    if (bounds == null) { return SourceSpan::none(); }
-    for (mut bi: i64 = 0; bi < bounds.length; bi++) {
-        const b: &TraitBound = &(*bounds)[bi];
-        for (mut ti: i64 = 0; ti < b.trait_refs.length; ti++) {
-            const tref: &TraitRef = &b.trait_refs[ti];
-            if (NodeLocator::span_contains(tref.span, line, character)) {
-                return tref.span;
-            }
-        }
-    }
-    return SourceSpan::none();
-}
-
-/// Approximate span of the type-parameter portion of a `where`
-/// bound.  TraitBound stamps a single span over the whole `A:
-/// Trait + Trait2` lexeme and a separate span on each TraitRef; the
-/// type-parameter sits between `bound.span.start` and the first
-/// trait_ref's start.  Returns `SourceSpan::none()` when the cursor
-/// isn't on any param.
-function type_param_span_at_cursor(node: ASTNode*, line: u32, character: u32) -> SourceSpan {
-    const bounds: TraitBound[]* = bounds_of_decl(node);
-    if (bounds == null) { return SourceSpan::none(); }
-    for (mut bi: i64 = 0; bi < bounds.length; bi++) {
-        const b: &TraitBound = &(*bounds)[bi];
-        if (b.trait_refs.length == 0) { continue; }
-        const first: &TraitRef = &b.trait_refs[0];
-        // Build a synthetic span: same start as the bound, end at the
-        // first trait ref's start (i.e. the position of `:`).
-        const param_span: SourceSpan = SourceSpan::new(
-            b.span.file,
-            b.span.start_line, b.span.start_col,
-            first.span.start_line, first.span.start_col);
-        if (NodeLocator::span_contains(param_span, line, character)) {
-            return param_span;
-        }
-    }
-    return SourceSpan::none();
-}
-
-function type_param_at_cursor(node: ASTNode*, line: u32, character: u32) -> SymbolStr {
-    const bounds: TraitBound[]* = bounds_of_decl(node);
-    if (bounds == null) { return SymbolStr::empty(); }
-    for (mut bi: i64 = 0; bi < bounds.length; bi++) {
-        const b: &TraitBound = &(*bounds)[bi];
-        if (b.trait_refs.length == 0) { continue; }
-        const first: &TraitRef = &b.trait_refs[0];
-        const param_span: SourceSpan = SourceSpan::new(
-            b.span.file,
-            b.span.start_line, b.span.start_col,
-            first.span.start_line, first.span.start_col);
-        if (NodeLocator::span_contains(param_span, line, character)) {
-            return b.type_parameter;
-        }
-    }
-    return SymbolStr::empty();
-}
-
-/// Render `<param_name>: <Bound1> + <Bound2>` for the generic param
-/// on `node`.  Walks every bound on the decl whose `type_parameter`
-/// matches `param_name` and joins their trait-ref leaves with `+` -
-/// mirrors how `format_where_clause` renders the source side.
-function format_generic_param_at(node: ASTNode*, param_name: SymbolStr,
-                                  intern: InternTable*) -> string {
-    if (intern == null || !param_name.is_valid()) { return ""; }
-    mut s: string = intern.resolve(param_name);
-    const bounds: TraitBound[]* = bounds_of_decl(node);
-    if (bounds == null) { return s; }
-    mut first_ref: boolean = true;
-    for (mut bi: i64 = 0; bi < bounds.length; bi++) {
-        const b: &TraitBound = &(*bounds)[bi];
-        if (!b.type_parameter.equals(param_name)) { continue; }
-        for (mut ti: i64 = 0; ti < b.trait_refs.length; ti++) {
-            if (first_ref) {
-                s = s + ": " + format_trait_ref(&b.trait_refs[ti], intern);
-                first_ref = false;
-            } else {
-                s = s + " + " + format_trait_ref(&b.trait_refs[ti], intern);
-            }
-        }
-    }
-    return s;
-}
-
-/// Extract the `trait_bounds[]` (or impl-level `where_bounds[]`)
-/// slice from a decl whose head can carry a `where` clause.
-/// FunctionDeclNode owns its own bounds; MethodNode delegates to its
-/// inner `func`; ImplBlockNode keeps its head-level where clause in
-/// `where_bounds[]` rather than a per-method array.  Empty array for
-/// any other node kind.
-// Returns a BORROW (pointer into the AST node) of the decl's bounds array,
-// or null when the node has none.  Returning `f.trait_bounds` by value would
-// alias the owning `TraitBound[]` buffer into the caller's local, whose
-// scope-exit drop would then free a buffer the AST node still owns (double
-// free) - the static checker doesn't flag return-of-field, but the drop glue
-// still fires.  Callers read through the pointer (`(*bounds)[i]`).
-function bounds_of_decl(node: ASTNode*) -> TraitBound[]* {
-    if (node == null) { return null; }
-    if (node.kind == NodeKind::FunctionDeclaration) {
-        const f: FunctionDeclNode* = node as FunctionDeclNode*;
-        return &f.trait_bounds;
-    }
-    if (node.kind == NodeKind::MethodDeclaration) {
-        const m: MethodNode* = node as MethodNode*;
-        if (m.func == null) { return null; }
-        return &m.func.trait_bounds;
-    }
-    if (node.kind == NodeKind::ImplementationBlock) {
-        const b: ImplBlockNode* = node as ImplBlockNode*;
-        return &b.where_bounds;
-    }
-    return null;
-}
-
-function annotation_for_decl(node: ASTNode*) -> TypeAnnotation* {
-    if (node == null) { return null; }
-    if (node.kind == NodeKind::FunctionDeclaration) {
-        const f: FunctionDeclNode* = node as FunctionDeclNode*;
-        return f.return_type_annotation;
-    }
-    if (node.kind == NodeKind::MethodDeclaration) {
-        const m: MethodNode* = node as MethodNode*;
-        if (m.func == null) { return null; }
-        return m.func.return_type_annotation;
-    }
-    if (node.kind == NodeKind::VariableDeclaration) {
-        const v: VarDeclNode* = node as VarDeclNode*;
-        return v.type_annotation;
-    }
-    if (node.kind == NodeKind::FieldDeclaration) {
-        const fld: FieldDeclNode* = node as FieldDeclNode*;
-        return fld.type_annotation;
-    }
-    if (node.kind == NodeKind::TypeAliasDeclaration) {
-        const ta: TypeAliasDeclNode* = node as TypeAliasDeclNode*;
-        return ta.target_annotation;
-    }
-    return null;
-}
-
-/// Render a method receiver as `this: <ReceiverType>`.  The receiver
-/// type is whatever sema resolved on the synthetic `&this` /
-/// `mut &this` / `this` `VarDeclNode` - that already includes the
-/// `&` / `&mut` / value shape, so the formatter doesn't need to
-/// reconstruct it from the name lexeme.
-function format_receiver(v: VarDeclNode*, arena: TypeArena*) -> string {
-    return "this: " + arena.resolve_display_name_short(v.resolved_type.id);
-}
-
-/// True when `s` ends in the `: ?` placeholder the arena uses for
-/// invalid type IDs.  Used by the hover handler to detect a sema
-/// miss (generic body, partial compile) and trigger the annotation
-/// fallback.
-function contains_unknown_type(s: string) -> boolean {
-    const len: i64 = strlen(s) as i64;
-    if (len < 3) { return false; }
-    return s[len - 3] == ':' && s[len - 2] == ' ' && s[len - 1] == '?';
-}
-
-/// Re-render an identifier use with an explicit type-annotation
-/// string instead of the arena's short display.  Mirrors
-/// `format_identifier_use`'s per-SymbolKind formatting so the
-/// fallback shape stays consistent with the primary path.
-function rebuild_identifier_use_with_annotation(sym: Symbol, type_str: string,
-                                                 init_str: string,
-                                                 intern: InternTable*) -> string {
-    const name_str: string = if (intern != null) {
-        intern.resolve(sym.name)
-    } else {
-        ""
-    };
-    const init_suffix: string = if (init_str != "") { " = " + init_str } else { "" };
-
-    return match (sym.kind) {
-        SymbolKind::Variable  => {
-            const prefix: string = if (sym.is_mutable) { "mut " } else { "const " };
-            prefix + name_str + ": " + type_str + init_suffix
-        }
-        SymbolKind::Constant  => {
-            "const " + name_str + ": " + type_str + init_suffix
-        }
-        SymbolKind::Parameter => {
-            const prefix: string = if (sym.is_mutable) { "mut " } else { "" };
-            prefix + name_str + ": " + type_str
-        }
-        SymbolKind::Field     => {
-            "field " + name_str + ": " + type_str
-        }
-        _                     => { type_str }
-    };
-}
-
-/// Render an identifier use as the declaration form of the symbol it
-/// resolves to: `const body_str: Str` for a const local,
-/// `mut body_str: Str` for a mutable local, `body_str: Str` for a
-/// parameter (with `mut` prefix when the param itself is mutable),
-/// `<name>: <Type>` for a field reached via `this.<name>` or similar.
-/// `ty` is the use-site's resolved type (already short-formatted so
-/// callers don't have to re-resolve through the arena).  `init_str`
-/// is the literal text of the symbol's initializer (empty when the
-/// symbol has no literal value or isn't a top-level const) - appended
-/// as ` = <value>` so a hovered errno reads `const ENOENT: i32 = 2`.
-function format_identifier_use(sym: Symbol, ty: TypeRef,
-                                arena: TypeArena*, init_str: string) -> string {
-    const type_str: string = arena.resolve_display_name_short(ty.id);
-    const name_str: string = arena.intern_table.resolve(sym.name);
-    const init_suffix: string = if (init_str != "") { " = " + init_str } else { "" };
-
-    return match (sym.kind) {
-        SymbolKind::Variable  => {
-            const prefix: string = if (sym.is_mutable) { "mut " } else { "const " };
-            prefix + name_str + ": " + type_str + init_suffix
-        }
-        SymbolKind::Constant  => {
-            "const " + name_str + ": " + type_str + init_suffix
-        }
-        SymbolKind::Parameter => {
-            const prefix: string = if (sym.is_mutable) { "mut " } else { "" };
-            prefix + name_str + ": " + type_str
-        }
-        SymbolKind::Field     => {
-            "field " + name_str + ": " + type_str
-        }
-        // For Function/Method/Type/etc. just show the type - the
-        // ScopeResolution and decl-name branches above already handle
-        // the signature-rich cases.
-        _                     => { type_str }
-    };
-}
-
-function format_params(params: &VarDeclNode*[], arena: TypeArena*) -> string {
-    mut s: string = "(";
-    for (mut i: i64 = 0; i < params.length; i++) {
-        if (i > 0) { s = s + ", "; }
-        const p: VarDeclNode* = params[i];
-        if (p == null) { continue; }
-        s = s + arena.intern_table.resolve(p.name);
-        s = s + ": ";
-        s = s + arena.resolve_display_name_short(p.resolved_type.id);
-    }
-    return s + ")";
-}
-
-
-// Helpers
-//
-// URI helpers live in `Lsp::Protocol::Conv` (`Conv::uri_to_fs_path`).
-
-function json_u32_field(obj: &JsonValue, key: string) -> u32 {
-    match (obj.get(Str::from_cstr(key))) {
-        Option::Some(v) => {
-            match (v) {
-                JsonValue::Number(n) => {
-                    match (n) {
-                        JsonNumber::Int(i)   => {
-                            if (i < 0) { return 0 as u32; }
-                            return i as u32;
-                        }
-                        JsonNumber::UInt(u)  => { return u as u32; }
-                        JsonNumber::Float(f) => {
-                            if (f < 0.0) { return 0 as u32; }
-                            return f as u32;
-                        }
-                    }
-                }
-                _ => { return 0 as u32; }
-            }
-        }
-        Option::None => { return 0 as u32; }
-    }
-    return 0 as u32;
-}
-
-/// Convert a 1-based compiler `SourceSpan` to a 0-based LSP `Range`.
-/// Used so the editor highlights the matched token while the tooltip
-/// is open - without a range the hover anchors to a single point.
-function range_from_span(span: SourceSpan) -> Range {
-    mut sl: u32 = 0;
-    mut sc: u32 = 0;
-    mut el: u32 = 0;
-    mut ec: u32 = 0;
-    if (span.start_line > 0) { sl = span.start_line - 1; }
-    if (span.start_col  > 0) { sc = span.start_col  - 1; }
-    if (span.end_line   > 0) { el = span.end_line   - 1; }
-    if (span.end_col    > 0) { ec = span.end_col    - 1; }
-    return Range::new(Position::new(sl, sc), Position::new(el, ec));
-}
-
-
-// Const initializer text + i64 formatting
-
-/// Render a literal-bearing expression to its source-level text.
-/// Handles bare `LiteralNode` and `-<literal>` UnaryExpressions
-/// (negative integer constants).  Returns "" for any other shape so
-/// hover never displays a partial expression - composite initializers
-/// like `(FOO | BAR)` are better shown by the user navigating to the
-/// decl itself.
-function literal_text(expr: ExpressionNode*) -> string {
-    if (expr == null) { return ""; }
-    if (expr.kind == NodeKind::Literal) {
-        const l: LiteralNode* = expr as LiteralNode*;
-        return l.value;
-    }
-    if (expr.kind == NodeKind::UnaryExpression) {
-        const u: UnaryExprNode* = expr as UnaryExprNode*;
-        if (u.operand != null && u.operand.kind == NodeKind::Literal) {
-            const l: LiteralNode* = u.operand as LiteralNode*;
-            return "-" + l.value;
-        }
-    }
-    return "";
-}
-
-/// Walk the module graph to the decl at `decl_span` and return the
-/// initializer literal as text - empty when the decl isn't a global
-/// const, has no initializer, or the initializer isn't a literal we
-/// can render compactly.  Used to enrich identifier-use hovers for
-/// errno-style const tables (`const ENOENT: i32 = 2`).
-function const_initializer_text(graph: ModuleGraph*, decl_span: SourceSpan) -> string {
-    const v: VarDeclNode* = var_decl_at_span(graph, decl_span);
-    if (v == null)             { return ""; }
-    if (!v.is_global)          { return ""; }
-    if (v.initializer == null) { return ""; }
-    return literal_text(v.initializer);
-}
-
-/// Locate a `VarDeclNode` at the start position of `decl_span`.
-/// Returns `null` when the span isn't reachable in the graph or the
-/// node at that position isn't a variable decl.  Shared between the
-/// initializer-text helper and the Pattern-identifier dispatch.
-function var_decl_at_span(graph: ModuleGraph*, decl_span: SourceSpan) -> VarDeclNode* {
-    if (graph == null)                       { return null; }
-    if (decl_span.file == "")                { return null; }
-    if (strlen(decl_span.file) == 0 as u64)  { return null; }
-    if (!decl_span.has_location())           { return null; }
-
-    const mod_idx: i64 = graph.find_module_by_path(decl_span.file);
-    if (mod_idx < 0) { return null; }
-    const ast: ProgramNode* = graph.get_module_ast(mod_idx as u32);
-    if (ast == null) { return null; }
-
-    const node: ASTNode* = NodeLocator::find_innermost_node_at(
-        ast, decl_span.start_line, decl_span.start_col);
-    if (node == null) { return null; }
-    if (node.kind != NodeKind::VariableDeclaration) { return null; }
-    return node as VarDeclNode*;
-}
-
-/// When a receiver's carrier resolves to a generic parameter name
-/// (`T`, `W`, ...), method lookup on the bare param fails because no
-/// struct named `T` exists.  Find the enclosing function, scan its
-/// `trait_bounds[]` for the param, and look up `method_name` on the
-/// bounded trait.  Returns the trait method's FunctionDeclNode, or
-/// null when no trait bound carries that method.
-///
-/// The hover handler treats null as "fall through to normal method/
-/// field lookup" - for non-generic receivers this returns null
-/// immediately because no trait_bound's `type_parameter` matches.
-function trait_method_for_generic_receiver(ctx: CompilationContext*,
-                                            file_path: string,
-                                            line: u32,
-                                            character: u32,
-                                            carrier: SymbolStr,
-                                            method_name: SymbolStr) -> FunctionDeclNode* {
-    if (ctx == null || !carrier.is_valid())     { return null; }
-    if (!method_name.is_valid())                { return null; }
-
-    const fdecl: FunctionDeclNode* = NodeLocator::find_enclosing_function(
-        ctx.module_graph, file_path, line, character);
-    if (fdecl == null) { return null; }
-
-    // Walk this function's trait bounds + every enclosing method's
-    // bounds (where-clause on an outer impl/method) to find one whose
-    // type_parameter equals the carrier.  For the common case the
-    // immediate function carries the bound - we only need the local
-    // scan.
-    for (mut bi: i64 = 0; bi < fdecl.trait_bounds.length; bi++) {
-        const b: &TraitBound = &fdecl.trait_bounds[bi];
-        if (!b.type_parameter.equals(carrier)) { continue; }
-        // Walk the bound's traits left-to-right.  First match wins;
-        // a multi-bound (`T: Display + Debug`) where both traits
-        // declare `fmt` is unusual but the leftmost is the most
-        // direct read of source order.
-        for (mut ti: i64 = 0; ti < b.trait_refs.length; ti++) {
-            const tref: &TraitRef = &b.trait_refs[ti];
-            if (tref.path.length == 0) { continue; }
-            const trait_leaf: SymbolStr = tref.path[tref.path.length - 1];
-            const f: FunctionDeclNode* = NodeLocator::find_trait_method_in_modules(
-                ctx.module_graph, ctx.intern_table, trait_leaf, method_name);
-            if (f != null) { return f; }
-        }
-    }
-    return null;
-}
-
-
-/// AST-side companion to `unwrap_to_carrier`.  Recover the receiver's
-/// carrier-type SymbolStr from the AST when sema didn't stamp a usable
-/// resolved_type - primarily for member-access hovers inside generic
-/// function bodies where `f.resolved_type` is invalid because sema
-/// type-checked the body with unresolved generic params.
-///
-/// Path:
-///   1. `recv` must be an IdentifierNode.
-///   2. Look up the resolver symbol for that identifier.
-///   3. Find the declaring VarDeclNode (parameter or local).
-///   4. Walk the TypeAnnotation, peeling Reference/Pointer/Generic
-///      wrappers, and return the SymbolStr of the leaf Named node.
-///
-/// Returns `SymbolStr::empty()` when any step misses.  All callers
-/// treat an empty result as "no fallback available" and skip the
-/// method lookup.
-function receiver_carrier_name_from_annotation(
-        recv: ExpressionNode*, ctx: CompilationContext*) -> SymbolStr {
-    if (recv == null || ctx == null) { return SymbolStr::empty(); }
-    if (recv.kind != NodeKind::Identifier) { return SymbolStr::empty(); }
-    if (ctx.resolver == null) { return SymbolStr::empty(); }
-
-    const id: IdentifierNode* = recv as IdentifierNode*;
-
-    // `this` is parsed as an IdentifierNode but the resolver has no
-    // symbol entry for it (it's the synthesised receiver, not a
-    // user-bound name).  Recover the carrier type by scanning the
-    // module graph for the method whose body span covers `this`'s
-    // position - that method's owner IS the carrier type.
-    if (id.name.is_valid() && ctx.intern_table != null) {
-        const this_sym: SymbolStr = ctx.intern_table.intern("this");
-        if (id.name.equals(this_sym) && id.span.has_location()) {
-            return NodeLocator::find_enclosing_method_owner(
-                ctx.module_graph, id.span.file,
-                id.span.start_line, id.span.start_col);
-        }
-    }
-
-    const sym_id: SymbolID = ctx.resolver.resolve(id.span);
-    if (!sym_id.is_valid()) { return SymbolStr::empty(); }
-    const sym: Symbol = ctx.resolver.get_symbol(sym_id);
-
-    const v: VarDeclNode* = var_decl_at_span(
-        ctx.module_graph, sym.declaring_span);
-    if (v == null) { return SymbolStr::empty(); }
-    if (v.type_annotation == null) { return SymbolStr::empty(); }
-    return annotation_carrier_name(v.type_annotation);
-}
-
-/// Walk a `TypeAnnotation*`, peeling Reference/Pointer/Array/Optional/
-/// Generic wrappers, and return the SymbolStr of the innermost `Named`
-/// (or `Primitive`) annotation.  Empty SymbolStr if the leaf isn't a
-/// named carrier - function types, tuples, and ThisType don't have a
-/// single SymbolStr the DI can key on.
-function annotation_carrier_name(ann: TypeAnnotation*) -> SymbolStr {
-    if (ann == null) { return SymbolStr::empty(); }
-    mut cur: TypeAnnotation* = ann;
-    mut hops: i64 = 0;
-    while (hops < 6) {
-        const result: SymbolStr = match (*cur) {
-            TypeAnnotation::Named(n)     => { n.name }
-            TypeAnnotation::Primitive(p) => { p.name }
-            _                            => { SymbolStr::empty() }
-        };
-        if (result.is_valid()) { return result; }
-
-        const next: TypeAnnotation* = match (*cur) {
-            TypeAnnotation::Reference(r) => { r.inner }
-            TypeAnnotation::Pointer(p)   => { p.inner }
-            TypeAnnotation::Array(a)     => { a.element }
-            TypeAnnotation::Optional(o)  => { o.inner }
-            TypeAnnotation::Generic(g)   => { g.base }
-            _                            => { null }
-        };
-        if (next == null) { return SymbolStr::empty(); }
-        cur = next;
-        hops = hops + 1;
-    }
-    return SymbolStr::empty();
-}
-
-
-/// Strip Reference, Pointer, and InstantiatedType wrappers from `ty`
-/// until a "carrier" type - the actual struct / class / enum the
-/// receiver names - is reached.  Method declarations register against
-/// the carrier's TypeRef, never against the borrow form or the spec
-/// instantiation wrapper, so any DI lookup that expects to find
-/// `Foo::bar` from a `&Foo<T>` receiver must unwrap first.
-///
-/// Caps the chain at 6 hops as a safety net against malformed type
-/// arenas - a self-referential pointer would otherwise loop forever.
-function unwrap_to_carrier(ty: TypeRef, arena: TypeArena*) -> TypeRef {
-    if (arena == null) { return ty; }
-    mut cur: TypeRef = ty;
-    mut hops: i64 = 0;
-    while (hops < 6) {
-        if (!cur.is_valid()) { return cur; }
-        const t: Type* = arena.lookup(cur.id);
-        if (t == null) { return cur; }
-        if (t.kind == TypeKind::Reference) {
-            const rt: ReferenceType* = t as ReferenceType*;
-            cur = rt.referent;
-        } else if (t.kind == TypeKind::Pointer) {
-            const pt: PointerType* = t as PointerType*;
-            cur = pt.pointee;
-        } else if (t.kind == TypeKind::InstantiatedType) {
-            // `Formatter<W>` -> unwrap to the bare `Formatter` template.
-            // Methods are declared on the template's TypeRef; the
-            // monomorphized spec re-registers them but the bare base
-            // is what the DI's reverse map keys on for hover.
-            const it: InstantiatedType* = t as InstantiatedType*;
-            cur = it.generic_base;
-        } else {
-            return cur;
-        }
-        hops = hops + 1;
-    }
-    return cur;
-}
-
-function function_decl_at_span(graph: ModuleGraph*, decl_span: SourceSpan) -> FunctionDeclNode* {
-    if (graph == null)                       { return null; }
-    if (decl_span.file == "")                { return null; }
-    if (strlen(decl_span.file) == 0 as u64)  { return null; }
-    if (!decl_span.has_location())           { return null; }
-
-    const mod_idx: i64 = graph.find_module_by_path(decl_span.file);
-    if (mod_idx < 0) { return null; }
-    const ast: ProgramNode* = graph.get_module_ast(mod_idx as u32);
-    if (ast == null) { return null; }
-
-    const node: ASTNode* = NodeLocator::find_innermost_node_at(
-        ast, decl_span.start_line, decl_span.start_col);
-    if (node == null) { return null; }
-    if (node.kind != NodeKind::FunctionDeclaration) { return null; }
-    return node as FunctionDeclNode*;
-}
-
-// Import-segment hover
-
-/// Return the index into `imp.path_segments` whose span contains
-/// the cursor, or -1 when the cursor sits on the `import` keyword,
-/// the trailing `;`, or any inter-segment punctuation (`::`).
-function import_segment_at(imp: ImportDeclNode*, line: u32, ch: u32) -> i64 {
-    if (imp == null) { return -1 as i64; }
-    for (mut i: i64 = 0; i < imp.path_segment_spans.length; i++) {
-        if (NodeLocator::span_contains(imp.path_segment_spans[i], line, ch)) {
-            return i;
-        }
-    }
-    return -1 as i64;
-}
-
-/// Build the namespace path for `imp.path_segments[0..=index]`,
-/// joined with `::`.  Used to find the matching `_module.cryo`
-/// (the file whose `namespace_name` equals this prefix).
-function build_segment_path(imp: ImportDeclNode*, index: i64,
-                             intern: InternTable*) -> string {
-    mut path: string = "";
-    for (mut i: i64 = 0; i <= index; i++) {
-        if (i > 0) { path = path + "::"; }
-        path = path + intern.resolve(imp.path_segments[i]);
-    }
-    return path;
-}
-
-/// Index of the `ModuleDeclNode` segment whose span contains the
-/// cursor, or -1 when the cursor is on `namespace` / `module` /
-/// `public` / `;` / a `::` separator.  Mirror of
-/// `import_segment_at` for `namespace X::Y::Z;` and
-/// `public module X::Y;` decls.
-function module_decl_segment_at(md: ModuleDeclNode*, line: u32, ch: u32) -> i64 {
-    if (md == null) { return -1 as i64; }
-    for (mut i: i64 = 0; i < md.path_segment_spans.length; i++) {
-        if (NodeLocator::span_contains(md.path_segment_spans[i], line, ch)) {
-            return i;
-        }
-    }
-    return -1 as i64;
-}
-
-/// `::`-joined namespace path for `md.path_segments[0..=index]`.
-function build_module_decl_path(md: ModuleDeclNode*, index: i64,
-                                  intern: InternTable*) -> string {
-    mut path: string = "";
-    for (mut i: i64 = 0; i <= index; i++) {
-        if (i > 0) { path = path + "::"; }
-        path = path + intern.resolve(md.path_segments[i]);
-    }
-    return path;
-}
-
-/// Resolve an import-segment literal path to the absolute namespace
-/// path the loader would pick.  Stdlib imports inside stdlib source
-/// are written relative (`import core::option;`); the loader
-/// resolves them under `<stdlib>/`, which corresponds to the `std::`
-/// namespace prefix.  We try the literal first so absolute paths
-/// (and project-relative imports whose namespace already matches)
-/// stay correct, then `std::<literal>` as the fallback.  When
-/// neither matches a loaded module, we still prefer the candidate
-/// that has loaded *descendants* in the graph so the synth-children
-/// fallback in `format_namespace_overview` produces useful output.
-function resolve_namespace_path(graph: ModuleGraph*, literal: string) -> string {
-    if (graph == null) { return literal; }
-    if (NodeLocator::find_program_by_namespace(graph, literal) != null) {
-        return literal;
-    }
-    const std_path: string = "std::" + literal;
-    if (NodeLocator::find_program_by_namespace(graph, std_path) != null) {
-        return std_path;
-    }
-    // Neither namespace is loaded - pick whichever has descendants
-    // under it (so the children-synth fallback in the formatter
-    // shows the expected sub-modules).  Prefer `std::` because
-    // stdlib-relative is the dominant relative-import case.
-    if (namespace_has_descendants(graph, std_path))  { return std_path; }
-    if (namespace_has_descendants(graph, literal))   { return literal; }
-    return literal;
-}
-
-/// True when any module in the graph declares a namespace whose
-/// path starts with `prefix::`.  Used by `resolve_namespace_path`
-/// to pick the candidate whose synth-children list will be
-/// non-empty.
-function namespace_has_descendants(graph: ModuleGraph*, prefix: string) -> boolean {
-    if (graph == null) { return false; }
-    const prefix_len: i64 = strlen(prefix) as i64;
-    if (prefix_len == 0) { return false; }
-    const n: u32 = graph.module_count();
-    for (mut mi: u32 = 0; mi < n; mi++) {
-        const ast: ProgramNode* = graph.get_module_ast(mi);
-        if (ast == null) { continue; }
-        const ns: string = ast.namespace_name;
-        const ns_len: i64 = strlen(ns) as i64;
-        if (ns_len <= prefix_len + 2) { continue; }
-        if (ns[prefix_len] != ':' as i8 || ns[prefix_len + 1] != ':' as i8) {
-            continue;
-        }
-        mut prefix_match: boolean = true;
-        for (mut i: i64 = 0; i < prefix_len; i++) {
-            if (ns[i] != prefix[i]) { prefix_match = false; break; }
-        }
-        if (prefix_match) { return true; }
-    }
-    return false;
-}
-
-
-/// Render the namespace overview for `path`: the `namespace X::Y;`
-/// line plus every `public module ...;` declaration in the matching
-/// `_module.cryo`.  When no `_module.cryo` for this namespace is in
-/// the graph (the compiler doesn't load ancestor module files
-/// proactively - only the leaf file directly imported is parsed),
-/// derive the sub-module list by walking all loaded modules and
-/// taking the unique next-segment of those whose namespace starts
-/// with `path::`.  That gives a useful "what's reachable under
-/// this namespace" view from already-parsed source.
-function format_namespace_overview(path: string, graph: ModuleGraph*) -> string {
-    mut sig: string = "namespace " + path + ";";
-    const prog: ProgramNode* = NodeLocator::find_program_by_namespace(graph, path);
-
-    if (prog != null) {
-        mut had_modules: boolean = false;
-        for (mut i: i64 = 0; i < prog.statements.length; i++) {
-            const stmt: ASTNode* = unwrap_top_decl(prog.statements[i]);
-            if (stmt == null) { continue; }
-            if (stmt.kind != NodeKind::ModuleDeclaration) { continue; }
-            const m: ModuleDeclNode* = stmt as ModuleDeclNode*;
-            // Skip the file's own `namespace X::Y::Z;` line -
-            // `parse_namespace_declaration` lowers it into a
-            // ModuleDeclNode with the qualified path, but it isn't a
-            // re-export of itself.
-            if (strcmp(m.path, path) == 0) { continue; }
-            if (!had_modules) { sig = sig + "\n"; had_modules = true; }
-            sig = sig + "\n";
-            if (m.is_public) { sig = sig + "public "; }
-            sig = sig + "module " + m.path + ";";
-        }
-        if (had_modules) { return sig; }
-    }
-
-    // Fallback: synthesize the sub-module list from descendant
-    // namespaces in the graph.  Each unique direct child becomes a
-    // synthetic `module <name>;` line.
-    if (graph == null) { return sig; }
-    const path_len: i64 = strlen(path) as i64;
-    mut children: string[] = [];
-    const n: u32 = graph.module_count();
-    for (mut mi: u32 = 0; mi < n; mi++) {
-        const ast: ProgramNode* = graph.get_module_ast(mi);
-        if (ast == null) { continue; }
-        const ns: string = ast.namespace_name;
-        const ns_len: i64 = strlen(ns) as i64;
-        // Match `path` followed by `::` then a segment.
-        if (ns_len <= path_len + 2) { continue; }
-        if (ns[path_len] != ':' as i8 || ns[path_len + 1] != ':' as i8) { continue; }
-        // Compare the prefix.
-        mut prefix_match: boolean = true;
-        for (mut i: i64 = 0; i < path_len; i++) {
-            if (ns[i] != path[i]) { prefix_match = false; break; }
-        }
-        if (!prefix_match) { continue; }
-        // Extract first child segment after `path::`.
-        const child: string = first_segment_after(ns, (path_len + 2 as i64) as i64);
-        if (child == "") { continue; }
-        if (!contains_string(&children, child)) {
-            children.push(child);
-        }
-    }
-    if (children.length == 0) { return sig; }
-    sig = sig + "\n";
-    for (mut i: i64 = 0; i < children.length; i++) {
-        sig = sig + "\nmodule " + children[i] + ";";
-    }
-    return sig;
-}
-
-/// The `///!` banner doc for namespace `path`: locate that namespace's
-/// program in the graph and read the `documentation` the parser
-/// attached to its own `namespace X::Y;` decl.  The self-namespace
-/// `ModuleDeclNode` is the one whose `path` equals `path` (same
-/// identification `format_namespace_overview` uses to *skip* it).
-/// Empty string when the namespace isn't loaded or has no banner.
-function namespace_doc_for_path(graph: ModuleGraph*, path: string) -> string {
-    const prog: ProgramNode* = NodeLocator::find_program_by_namespace(graph, path);
-    if (prog == null) { return ""; }
-    for (mut i: i64 = 0; i < prog.statements.length; i++) {
-        const stmt: ASTNode* = unwrap_top_decl(prog.statements[i]);
-        if (stmt == null) { continue; }
-        if (stmt.kind != NodeKind::ModuleDeclaration) { continue; }
-        const m: ModuleDeclNode* = stmt as ModuleDeclNode*;
-        if (strcmp(m.path, path) == 0) { return m.documentation; }
-    }
-    return "";
-}
-
-/// Return the substring of `s` from byte index `start` up to (but
-/// not including) the next `::` or end-of-string.  Used to extract
-/// the first namespace segment after a known prefix.
-function first_segment_after(s: string, start: i64) -> string {
-    const len: i64 = strlen(s) as i64;
-    mut end: i64 = start;
-    while (end < len) {
-        if (end + 1 < len
-                && s[end] == ':' as i8 && s[end + 1] == ':' as i8) {
-            break;
-        }
-        end = end + 1;
-    }
-    const seg_len: i64 = end - start;
-    if (seg_len <= 0) { return ""; }
-    const buf: i8* = malloc((seg_len + 1) as u64) as i8*;
-    for (mut i: i64 = 0; i < seg_len; i++) { buf[i] = s[start + i]; }
-    buf[seg_len] = 0 as i8;
-    return buf as string;
-}
-
-function contains_string(arr: &string[], target: string) -> boolean {
-    for (mut i: i64 = 0; i < arr.length; i++) {
-        if (strcmp(arr[i], target) == 0) { return true; }
-    }
-    return false;
-}
-
-
-/// Strip per-line `///` (and a single optional space after) from a
-/// doc-comment cluster so the rendered hover reads as plain markdown
-/// rather than as a wall of Cryo source.  Lines starting with the
-/// alternate doc-block markers (`///!`, `/**`, `* `, `*/`) get the
-/// same treatment - keeps stdlib-style module banners legible.
-/// Trailing whitespace + blank trailing lines are trimmed; embedded
-/// blank lines pass through (markdown paragraph breaks).
-function clean_doc_for_hover(raw: string) -> string {
-    const len: i64 = strlen(raw) as i64;
-    if (len == 0) { return ""; }
-    const buf: i8* = malloc((len + 1) as u64) as i8*;
-    mut out: i64 = 0;
-    mut i:   i64 = 0;
-    while (i < len) {
-        // Skip leading whitespace on this line.
-        while (i < len && (raw[i] == ' ' as i8 || raw[i] == '\t' as i8)) {
-            i = i + 1;
-        }
-        // Strip `///!`, `///`, `/**`, `*/`, or a leading `*` continuation.
-        if (i + 3 < len
-                && raw[i] == '/' as i8 && raw[i + 1] == '/' as i8
-                && raw[i + 2] == '/' as i8 && raw[i + 3] == '!' as i8) {
-            i = i + 4;
-        } else if (i + 2 < len
-                && raw[i] == '/' as i8 && raw[i + 1] == '/' as i8
-                && raw[i + 2] == '/' as i8) {
-            i = i + 3;
-        } else if (i + 2 < len
-                && raw[i] == '/' as i8 && raw[i + 1] == '*' as i8
-                && raw[i + 2] == '*' as i8) {
-            i = i + 3;
-        } else if (i + 1 < len
-                && raw[i] == '*' as i8 && raw[i + 1] == '/' as i8) {
-            i = i + 2;
-        } else if (i < len && raw[i] == '*' as i8
-                && (i + 1 >= len || raw[i + 1] != '*' as i8)) {
-            i = i + 1;
-        }
-        // Single optional space after the marker.
-        if (i < len && raw[i] == ' ' as i8) { i = i + 1; }
-
-        // Copy until end of line, stopping at a trailing `*/`.
-        while (i < len && raw[i] != '\n' as i8) {
-            if (i + 1 < len
-                    && raw[i] == '*' as i8 && raw[i + 1] == '/' as i8) {
-                i = i + 2;
-                break;
-            }
-            buf[out] = raw[i];
-            out = out + 1;
-            i = i + 1;
-        }
-        // Trim trailing whitespace on this line.
-        while (out > 0 && (buf[out - 1] == ' ' as i8 || buf[out - 1] == '\t' as i8)) {
-            out = out - 1;
-        }
-        // Append the newline if present.
-        if (i < len) {
-            buf[out] = '\n' as i8;
-            out = out + 1;
-            i = i + 1;
-        }
-    }
-    // Drop trailing newlines so markdown doesn't render a dangling blank line.
-    while (out > 0 && buf[out - 1] == '\n' as i8) { out = out - 1; }
-    buf[out] = 0 as i8;
-    return buf as string;
-}
-
-
-/// Format an `i64` as a heap-leased decimal `string`.  Routes through
-/// `i64.to_decimal_buf` so the digit logic stays in one place; the
-/// returned buffer is a bare `malloc` that outlives this call (same
-/// pattern as the other `format_*` helpers in this file - the leak is
-/// per-hover-request and acceptable until the LSP grows a per-call
-/// arena).
-///
-/// The buffer must NOT be a `String`: `String` is `Drop`, so a local
-/// one is freed on scope exit and `as_ptr()` would hand back dangling
-/// memory.  That UAF surfaced as garbage byte-counts in string-literal
-/// hovers (`string("...")[<garbage>]`).
-function i64_to_text(value: i64) -> string {
-    mut scratch: u8[21];
-    const n: u64 = value.to_decimal_buf(&scratch[0]);
-    const src: u8*  = &scratch[0];
-    const buf: i8*  = malloc(n + 1 as u64) as i8*;
-    for (mut i: i64 = 0; i < n as i64; i++) { buf[i] = src[i] as i8; }
-    buf[n as i64] = 0 as i8;
-    return buf as string;
-}
-
-
-// String literal hover
-
-/// Render a numeric literal as `<value>: <inferred-type>` - for
-/// example `42: i32`, `0xFF: u8`, `3.14: f64`.  The type comes from
-/// `resolved_type` which sema fills in based on the surrounding
-/// context, so the same literal can hover differently depending on
-/// where it appears (annotation, parameter type, arithmetic peer).
-/// When sema bails, the type slot is `?` rather than empty so the
-/// hover still reads sensibly.
-function format_numeric_literal(lit: LiteralNode*, arena: TypeArena*) -> string {
-    if (lit == null) { return ""; }
-    const ty: TypeRef = lit.resolved_type;
-    const type_str: string = if (ty.is_valid()) {
-        arena.resolve_display_name_short(ty.id)
-    } else { "?" };
-    return lit.value + ": " + type_str;
-}
-
-
-/// Render a string literal as `string("<text>")[<bytes>]` so the
-/// hover surfaces both the source text and the byte count.  The
-/// lexer already strips the surrounding quotes and resolves escape
-/// sequences when populating `LiteralNode.value`, so the byte count
-/// is just `strlen(value)` and we re-escape control characters so
-/// the displayed text fits on one line of hover markup.  Long
-/// strings get truncated past 60 visible chars - hover isn't the
-/// place for the full payload.
-function format_string_literal(lit: LiteralNode*) -> string {
-    if (lit == null) { return "string"; }
-    const bytes:   i64    = strlen(lit.value) as i64;
-    const escaped: string = escape_for_hover(lit.value);
-    return "string(\"" + escaped + "\")[" + i64_to_text(bytes) + "]";
-}
-
-/// Re-escape `\n`/`\r`/`\t`/`"`/`\` in `s` so the hover renders the
-/// source-level appearance (newlines wouldn't survive markdown
-/// otherwise).  Truncates with `...` past 60 visible chars to keep the
-/// hover panel one line.
-///
-/// Writes into a bare `malloc` rather than a `String` builder: a local
-/// `String` is `Drop`, so returning `out.as_ptr()` handed back a freed
-/// buffer - the UAF that rendered string-literal hovers as garbage
-/// (`string("<garbage>")[...]`).  Worst case every input byte escapes to
-/// two output bytes, plus a trailing `...` and NUL - `2*len + 4`.
-function escape_for_hover(s: string) -> string {
-    const len: i64 = strlen(s) as i64;
-    const max_show: i64 = 60;
-    const buf: i8* = malloc((2 * len + 4) as u64) as i8*;
-    mut wi: i64 = 0;
-    mut shown: i64 = 0;
-    mut i: i64 = 0;
-    while (i < len) {
-        if (shown >= max_show) {
-            buf[wi] = '.' as i8;  wi = wi + 1;
-            buf[wi] = '.' as i8;  wi = wi + 1;
-            buf[wi] = '.' as i8;  wi = wi + 1;
-            break;
-        }
-        const c: i8 = s[i];
-        if (c == '\n' as i8) {
-            buf[wi] = '\\' as i8; wi = wi + 1;
-            buf[wi] = 'n' as i8;  wi = wi + 1;
-            shown = shown + 2;
-        } else if (c == '\r' as i8) {
-            buf[wi] = '\\' as i8; wi = wi + 1;
-            buf[wi] = 'r' as i8;  wi = wi + 1;
-            shown = shown + 2;
-        } else if (c == '\t' as i8) {
-            buf[wi] = '\\' as i8; wi = wi + 1;
-            buf[wi] = 't' as i8;  wi = wi + 1;
-            shown = shown + 2;
-        } else if (c == '"' as i8) {
-            buf[wi] = '\\' as i8; wi = wi + 1;
-            buf[wi] = '"' as i8;  wi = wi + 1;
-            shown = shown + 2;
-        } else if (c == '\\' as i8) {
-            buf[wi] = '\\' as i8; wi = wi + 1;
-            buf[wi] = '\\' as i8; wi = wi + 1;
-            shown = shown + 2;
-        } else {
-            buf[wi] = c; wi = wi + 1;
-            shown = shown + 1;
-        }
-        i = i + 1;
-    }
-    buf[wi] = 0 as i8;
-    return buf as string;
-}
-
-
-// Enum-variant lookup + rendering
-
-/// Render a variant as `<EnumName>::<VariantName> = <discriminant>`
-/// for unit-only variants, or `<EnumName>::<VariantName>(<types>)`
-/// when the variant carries associated types.  Discriminant is the
-/// explicit value when set, otherwise the variant's index in source
-/// order - Cryo enums start at 0 and step by one.
-function format_enum_variant(parent: EnumDeclNode*, variant: EnumVariantNode*,
-                              arena: TypeArena*) -> string {
-    if (parent == null || variant == null) { return ""; }
-    mut sig: string = arena.intern_table.resolve(parent.name);
-    sig = sig + "::" + arena.intern_table.resolve(variant.name);
-
-    if (variant.associated_types.length > 0) {
-        sig = sig + "(";
-        for (mut i: i64 = 0; i < variant.associated_types.length; i++) {
-            if (i > 0) { sig = sig + ", "; }
-            sig = sig + format_annotation(
-                variant.associated_types[i], arena.intern_table);
-        }
-        return sig + ")";
-    }
-
-    const disc: i64 = if (variant.has_value) {
-        variant.explicit_value
-    } else {
-        variant_auto_index(parent, variant)
-    };
-    return sig + " = " + i64_to_text(disc);
-}
-
-/// Index of `variant` in `parent.variants[]`.  Falls back to 0 when
-/// the variant somehow isn't on the parent - shouldn't happen for
-/// nodes the locator returned.
-function variant_auto_index(parent: EnumDeclNode*, variant: EnumVariantNode*) -> i64 {
-    for (mut i: i64 = 0; i < parent.variants.length; i++) {
-        if (parent.variants[i] == variant) { return i; }
-    }
-    return 0;
-}
-
-/// Linear scan for a variant by name on a known enum decl.  Used by
-/// the `EnumName::Variant` ScopeResolution branch.
-function find_variant_in_enum(parent: EnumDeclNode*, name: SymbolStr) -> EnumVariantNode* {
-    if (parent == null) { return null; }
-    for (mut i: i64 = 0; i < parent.variants.length; i++) {
-        const v: EnumVariantNode* = parent.variants[i];
-        if (v != null && v.name.equals(name)) { return v; }
-    }
-    return null;
-}
-
-/// Reverse-walk: given a variant node, find the enclosing
-/// `EnumDeclNode`.  Mirrors `find_method_owner` for methods -
-/// EnumVariantNodes don't carry a parent pointer so we scan the
-/// graph.  Returns `null` when nothing matches (shouldn't happen for
-/// a variant node the locator just returned).
-function find_enum_for_variant(graph: ModuleGraph*,
-                                variant: EnumVariantNode*) -> EnumDeclNode* {
-    if (graph == null || variant == null) { return null; }
-    const n: u32 = graph.module_count();
-    for (mut mi: u32 = 0; mi < n; mi++) {
-        const ast: ProgramNode* = graph.get_module_ast(mi);
-        if (ast == null) { continue; }
-        for (mut si: i64 = 0; si < ast.statements.length; si++) {
-            const stmt: ASTNode* = unwrap_top_decl(ast.statements[si]);
-            if (stmt == null) { continue; }
-            if (stmt.kind != NodeKind::EnumDeclaration) { continue; }
-            const ed: EnumDeclNode* = stmt as EnumDeclNode*;
-            for (mut vi: i64 = 0; vi < ed.variants.length; vi++) {
-                if (ed.variants[vi] == variant) { return ed; }
-            }
-        }
-    }
-    return null;
-}
-
-/// `ProgramNode.statements` may wrap top-level decls in a
-/// `DeclStmtNode`; unwrap so callers can branch on the inner kind.
-/// Mirrors the locator's `unwrap_decl_stmt` (kept private there).
-function unwrap_top_decl(node: ASTNode*) -> ASTNode* {
-    if (node == null) { return null; }
-    if (node.kind != NodeKind::DeclarationStatement) { return node; }
-    const d: DeclStmtNode* = node as DeclStmtNode*;
-    return d.declaration as ASTNode*;
-}
-
-
-// Struct-literal hover
-
 /// Result of dispatching a struct-literal hover: the rendered string
 /// + the highlight span.  Empty `content` means the struct-literal
 /// branch couldn't classify the cursor (caller falls back to the
@@ -2213,126 +762,1570 @@ type struct StructLiteralHover {
     doc:     string;
 }
 
-/// Decide which sub-region of `IoError { kind: ..., os_code: ... }` the
-/// cursor hit, and render accordingly:
-///
-///   - Cursor before any field (the `IoError` token region) ->
-///     full struct head, span = the type-name range
-///   - Cursor on a field-init name -> `<field>: <Type>`, span = the
-///     field-init's name segment (`init.span` start through
-///     `init.value.span` start)
-///   - Cursor in a field-init value -> empty (locator usually descends
-///     into the value, so we rarely see this; keep as fallback)
-function struct_literal_hover_at(sl: StructLiteralNode*, line: u32, ch: u32,
-                                  graph: ModuleGraph*, intern: InternTable*,
-                                  arena: TypeArena*) -> StructLiteralHover {
-    mut result: StructLiteralHover = StructLiteralHover {
-        content: "",
-        span:    sl.span,
-        doc:     "",
-    };
-    if (sl == null) { return result; }
 
-    // Look up the struct/class decl whose name appears at the head.
-    const decl: ASTNode* = NodeLocator::find_type_decl_in_modules(
-        graph, intern, sl.struct_type);
+// HoverEngine - per-request rendering + AST/graph queries
+//
+// Holds the compilation pointers for one hover request.  Signature
+// formatters, graph reverse-walks, and namespace lookups are `&this`
+// methods (they read `arena` / `intern` / `graph` / `ctx`); the
+// stateless string + AST utilities are `static` methods on the same
+// type so the hover logic all lives in one place instead of a wall of
+// free functions.
 
-    // Field-name dispatch.  For each field-init, the name occupies
-    // [init.span.start_col, init.value.span.start_col) on
-    // init.span.start_line.  Compare cursor (line, ch) against that
-    // range; on hit, render the field decl.
-    for (mut i: i64 = 0; i < sl.field_inits.length; i++) {
-        const init: FieldInit = sl.field_inits[i];
-        if (init.value == null) { continue; }
-        if (line != init.span.start_line) { continue; }
+type struct HoverEngine {
+    ctx:    CompilationContext*;
+    arena:  TypeArena*;
+    intern: InternTable*;
+    graph:  ModuleGraph*;
 
-        const name_start: u32 = init.span.start_col;
-        const name_end:   u32 = init.value.span.start_col;
-        if (ch < name_start || ch >= name_end) { continue; }
+    static new(ctx: CompilationContext*) -> HoverEngine {
+        return HoverEngine {
+            ctx:    ctx,
+            arena:  ctx.type_arena,
+            intern: ctx.intern_table,
+            graph:  ctx.module_graph,
+        };
+    }
 
-        // Cursor is on the field name.  Look up the field on the
-        // owning struct/class decl and render `<name>: <Type>`.
-        if (decl != null) {
-            const fld: FieldDeclNode* = find_field_on_type_decl(
-                decl, init.field_name);
-            if (fld != null) {
-                result.content = format_field_decl(fld, arena);
-                result.span    = field_init_name_span(init.span, init.value.span);
-                result.doc     = fld.documentation;
+
+    // Signature formatters
+    //
+    // Render a callable as `function name(p1: T1, p2: T2) -> Ret` (free
+    // function) or `method name(...)` / `static name(...)` (method).
+    // Parameter types come from `VarDeclNode.resolved_type`; the function's
+    // return type comes from `FunctionDeclNode.resolved_return_type`.  Both
+    // are filled in by sema, so this only produces useful output once name
+    // resolution + type checking have run.  When sema bailed mid-pipeline
+    // (the common LSP case for in-progress edits) the affected slots stay
+    // `TypeRef::invalid()` and render as `?`.
+
+    /// Render a trait method as `<Trait>::<name><generics>(<params>) -> <ret>
+    ///     where <bounds>`.  `owner_display` is the trait's leaf name
+    /// (`Display` rather than `std::fmt::display::Display`).  No `function`
+    /// keyword - trait method declarations omit it in source too.
+    format_trait_method_signature(&this, func: FunctionDeclNode*,
+                                  owner_display: string) -> string {
+        if (func == null) { return ""; }
+        mut sig: string = "";
+        if (owner_display != "") {
+            sig = sig + owner_display + "::";
+        }
+        sig = sig + this.arena.intern_table.resolve(func.name);
+        sig = sig + this.format_generic_params(func.generic_params);
+        sig = sig + this.format_params(func.parameters);
+        sig = sig + " -> ";
+        sig = sig + this.arena.resolve_display_name_short(func.resolved_return_type.id);
+        sig = sig + this.format_where_clause(func.trait_bounds);
+        return sig;
+    }
+
+    format_function_signature(&this, func: FunctionDeclNode*) -> string {
+        if (func == null) { return ""; }
+        mut sig: string = "function ";
+        sig = sig + this.arena.intern_table.resolve(func.name);
+        sig = sig + this.format_generic_params(func.generic_params);
+        sig = sig + this.format_params(func.parameters);
+        sig = sig + " -> ";
+        sig = sig + this.arena.resolve_display_name_short(func.resolved_return_type.id);
+        sig = sig + this.format_where_clause(func.trait_bounds);
+        return sig;
+    }
+
+    /// Render a method as `<modifier>? <Owner>::<name>(<params>) -> <ret>`.
+    /// Modifier is one of `static` / `constructor` / `destructor` and is
+    /// omitted on plain instance methods - the `&this` / `mut &this`
+    /// receiver in the parameter list already conveys instance-ness, so
+    /// a leading `method` keyword would just be noise.
+    ///
+    /// `owner_display` is the rendered owner string the caller has
+    /// already computed.  For decl-name and scope-resolution hovers the
+    /// caller passes the leaf of a SymbolStr (`Str` from
+    /// `std::collections::str::Str`).  For member-access hovers the
+    /// caller passes the receiver type's display name from the type
+    /// arena - which goes through the arena's `format_display_short` and
+    /// covers monomorphized generics correctly
+    /// (`Array<u8, GlobalAlloc>` rather than the mangled
+    /// `5Array$Lh_N$L3std.5alloc.9allocator.11GlobalAlloc$G$G`).  Empty
+    /// string means "no owner prefix".
+    format_method_signature(&this, method: MethodNode*, owner_display: string) -> string {
+        if (method == null || method.func == null) { return ""; }
+        const f: FunctionDeclNode* = method.func;
+        mut sig: string = "";
+        if (method.is_static)      { sig = sig + "static "; }
+        if (method.is_constructor) { sig = sig + "constructor "; }
+        if (method.is_destructor)  { sig = sig + "destructor "; }
+        if (owner_display != "") {
+            sig = sig + owner_display + "::";
+        }
+        sig = sig + this.arena.intern_table.resolve(f.name);
+        sig = sig + this.format_generic_params(f.generic_params);
+        sig = sig + this.format_params(f.parameters);
+        sig = sig + " -> ";
+        sig = sig + this.arena.resolve_display_name_short(f.resolved_return_type.id);
+        sig = sig + this.format_where_clause(f.trait_bounds);
+        return sig;
+    }
+
+    /// Render a struct/class field as `<name>: <Type>`.  No `field`
+    /// keyword: the surrounding `type struct/class` already conveys
+    /// it, and source uses just `name: Type` for fields.
+    format_field_decl(&this, fld: FieldDeclNode*) -> string {
+        if (fld == null) { return ""; }
+        mut sig: string = this.arena.intern_table.resolve(fld.name);
+        sig = sig + ": ";
+        sig = sig + this.arena.resolve_display_name_short(fld.resolved_type.id);
+        return sig;
+    }
+
+    /// Render a type declaration's full body for hover:
+    ///
+    ///   type struct Point<T = i32> {
+    ///       x: T;
+    ///       y: T;
+    ///   }
+    ///
+    /// Struct/class hovers list fields; enum hovers list variants with
+    /// their auto-numbered or explicit discriminants; trait hovers list
+    /// method signatures; type-alias hovers append the resolved target
+    /// after `=`.  Methods on struct/class are intentionally omitted -
+    /// individual method hovers cover those, and including them would
+    /// make the type-hover unwieldy for stdlib types like `HashMap` or
+    /// `Array`.  Empty bodies collapse to just the head.
+    format_type_decl(&this, node: ASTNode*) -> string {
+        return match (node.kind) {
+            NodeKind::StructDeclaration => {
+                const d: StructDeclNode* = node as StructDeclNode*;
+                mut sig: string = "type struct " + this.arena.intern_table.resolve(d.name)
+                    + this.format_generic_params(d.generic_params);
+                if (d.fields.length > 0) {
+                    sig = sig + " {\n";
+                    for (mut i: i64 = 0; i < d.fields.length; i++) {
+                        sig = sig + "    " + this.format_field_decl(d.fields[i]) + ";\n";
+                    }
+                    sig = sig + "}";
+                }
+                sig
+            }
+            NodeKind::ClassDeclaration => {
+                const d: ClassDeclNode* = node as ClassDeclNode*;
+                mut sig: string = "type class " + this.arena.intern_table.resolve(d.name)
+                    + this.format_generic_params(d.generic_params);
+                if (d.base_class.is_valid()) {
+                    sig = sig + " : "
+                        + HoverEngine::leaf_after_separator(this.arena.intern_table.resolve(d.base_class));
+                }
+                if (d.fields.length > 0) {
+                    sig = sig + " {\n";
+                    for (mut i: i64 = 0; i < d.fields.length; i++) {
+                        sig = sig + "    " + this.format_field_decl(d.fields[i]) + ";\n";
+                    }
+                    sig = sig + "}";
+                }
+                sig
+            }
+            NodeKind::EnumDeclaration => {
+                const d: EnumDeclNode* = node as EnumDeclNode*;
+                mut sig: string = "type enum " + this.arena.intern_table.resolve(d.name)
+                    + this.format_generic_params(d.generic_params);
+                if (d.variants.length > 0) {
+                    sig = sig + " {\n";
+                    for (mut i: i64 = 0; i < d.variants.length; i++) {
+                        sig = sig + "    " + this.format_variant_in_decl(d, d.variants[i]) + "\n";
+                    }
+                    sig = sig + "}";
+                }
+                sig
+            }
+            NodeKind::TraitDeclaration => {
+                const d: TraitDeclNode* = node as TraitDeclNode*;
+                mut sig: string = "type trait " + this.arena.intern_table.resolve(d.name)
+                    + this.format_generic_params(d.generic_params);
+                if (d.methods.length > 0) {
+                    sig = sig + " {\n";
+                    for (mut i: i64 = 0; i < d.methods.length; i++) {
+                        const m: FunctionDeclNode* = d.methods[i];
+                        if (m == null) { continue; }
+                        sig = sig + "    " + this.arena.intern_table.resolve(m.name)
+                            + this.format_params(m.parameters)
+                            + " -> "
+                            + this.arena.resolve_display_name_short(m.resolved_return_type.id)
+                            + ";\n";
+                    }
+                    sig = sig + "}";
+                }
+                sig
+            }
+            NodeKind::TypeAliasDeclaration => {
+                const d: TypeAliasDeclNode* = node as TypeAliasDeclNode*;
+                mut sig: string = "type alias " + this.arena.intern_table.resolve(d.alias_name);
+                sig = sig + this.format_generic_params(d.generic_params);
+                // Append the resolved target after `=` when sema has filled
+                // it in; otherwise leave the head bare so partially-typed
+                // sources still produce useful hovers.
+                if (d.resolved_target.is_valid()) {
+                    sig = sig + " = "
+                        + this.arena.resolve_display_name_short(d.resolved_target.id);
+                }
+                sig
+            }
+            _ => { "" }
+        };
+    }
+
+    /// Render one variant inside an enum-decl body: `Name = N;` for
+    /// unit-only variants (auto-numbered or explicit), `Name(T1, T2);`
+    /// for payload variants.  Mirrors the standalone variant hover but
+    /// without the enclosing `EnumName::` prefix - it's redundant inside
+    /// the enum's own decl listing.
+    format_variant_in_decl(&this, parent: EnumDeclNode*, variant: EnumVariantNode*) -> string {
+        if (variant == null) { return ""; }
+        mut s: string = this.arena.intern_table.resolve(variant.name);
+        if (variant.associated_types.length > 0) {
+            s = s + "(";
+            for (mut i: i64 = 0; i < variant.associated_types.length; i++) {
+                if (i > 0) { s = s + ", "; }
+                s = s + this.format_annotation(variant.associated_types[i]);
+            }
+            return s + ");";
+        }
+        const disc: i64 = if (variant.has_value) {
+            variant.explicit_value
+        } else {
+            HoverEngine::variant_auto_index(parent, variant)
+        };
+        return s + " = " + HoverEngine::i64_to_text(disc) + ";";
+    }
+
+    format_generic_params(&this, params: &GenericParamNode*[]) -> string {
+        if (params.length == 0) { return ""; }
+        mut s: string = "<";
+        for (mut i: i64 = 0; i < params.length; i++) {
+            if (i > 0) { s = s + ", "; }
+            const p: GenericParamNode* = params[i];
+            if (p == null) { continue; }
+            s = s + this.intern.resolve(p.name);
+            if (p.default_annotation != null) {
+                s = s + " = " + this.format_annotation(p.default_annotation);
+            }
+        }
+        return s + ">";
+    }
+
+    /// Render a function/method's trait bounds as a `where` clause on a
+    /// new indented line.  Mirrors the source spelling:
+    ///
+    ///     hash<H>(&this, hasher: mut &H) -> void
+    ///         where H: Hasher
+    ///
+    ///     foo<T, U>(...) -> ...
+    ///         where T: Default + Clone, U: Eq
+    ///
+    /// Each `TraitBound` carries the type-parameter name plus one or more
+    /// `TraitRef`s; multi-trait bounds join with `+`, multi-param bounds
+    /// join with `, `.  Empty bound list returns "" so callers can
+    /// unconditionally concatenate.
+    format_where_clause(&this, bounds: &TraitBound[]) -> string {
+        if (bounds.length == 0) { return ""; }
+        mut s: string = "\n    where ";
+        for (mut i: i64 = 0; i < bounds.length; i++) {
+            if (i > 0) { s = s + ", "; }
+            const b: &TraitBound = &bounds[i];
+            s = s + this.intern.resolve(b.type_parameter);
+            s = s + ": ";
+            for (mut j: i64 = 0; j < b.trait_refs.length; j++) {
+                if (j > 0) { s = s + " + "; }
+                s = s + this.format_trait_ref(&b.trait_refs[j]);
+            }
+        }
+        return s;
+    }
+
+    /// Render a `TraitRef` as `<leaf>[<args>]`.  Multi-segment paths
+    /// (`io::Write`) collapse to their leaf - the hover already names the
+    /// enclosing context, so the prefix would just be noise.
+    format_trait_ref(&this, tref: &TraitRef) -> string {
+        if (tref.path.length == 0) { return "?"; }
+        const leaf_sym: SymbolStr = tref.path[tref.path.length - 1];
+        mut s: string = this.intern.resolve(leaf_sym);
+        if (tref.type_args.length > 0) {
+            s = s + "<";
+            for (mut i: i64 = 0; i < tref.type_args.length; i++) {
+                if (i > 0) { s = s + ", "; }
+                s = s + this.format_annotation(tref.type_args[i]);
+            }
+            s = s + ">";
+        }
+        return s;
+    }
+
+    /// Render a `TypeAnnotation*` as a one-line string.  Handles the
+    /// common shapes generic-param defaults take: bare `Named` (e.g.
+    /// `GlobalAlloc`), `Primitive` (e.g. `i32`), and pointer/reference
+    /// wrappers.  Unhandled variants render as `?` rather than error -
+    /// hover should never crash when sema has only partially digested
+    /// the source.
+    format_annotation(&this, ann: TypeAnnotation*) -> string {
+        if (ann == null) { return "?"; }
+        return match (*ann) {
+            TypeAnnotation::Primitive(p) => { this.intern.resolve(p.name) }
+            TypeAnnotation::Named(n)     => {
+                HoverEngine::leaf_after_separator(this.intern.resolve(n.name))
+            }
+            TypeAnnotation::Pointer(p)   => {
+                this.format_annotation(p.inner) + "*"
+            }
+            TypeAnnotation::Reference(r) => {
+                const inner: string = this.format_annotation(r.inner);
+                const prefix: string = if (r.is_mutable) { "&mut " } else { "&" };
+                prefix + inner
+            }
+            TypeAnnotation::Optional(o)  => {
+                this.format_annotation(o.inner) + "?"
+            }
+            TypeAnnotation::Array(a)     => {
+                this.format_annotation(a.element) + "[]"
+            }
+            _                            => { "?" }
+        };
+    }
+
+    /// Reconstruct a closure's signature `(P0, P1, ...) -> Ret` from the
+    /// LambdaExprNode.  A capturing lambda's `resolved_type` is the synthesized
+    /// `__Closure_<N>` struct, so displaying that type name gives an opaque
+    /// `__Closure_0` in hovers; the signature is the useful information and it's
+    /// fully recoverable from the lambda's parameters + return type.
+    format_lambda_signature(&this, lam: LambdaExprNode*) -> string {
+        mut s: string = "(";
+        for (mut i: i64 = 0; i < lam.parameters.length; i++) {
+            if (i > 0) { s = s + ", "; }
+            const p: VarDeclNode* = lam.parameters[i];
+            if (p.has_resolved_type()) {
+                s = s + this.arena.resolve_display_name_short(p.resolved_type.id);
+            } else if (p.type_annotation != null) {
+                s = s + this.format_annotation(p.type_annotation);
+            } else {
+                s = s + "?";
+            }
+        }
+        s = s + ") -> ";
+        if (lam.return_type.is_valid()) {
+            s = s + this.arena.resolve_display_name_short(lam.return_type.id);
+        } else if (lam.return_type_ann != null) {
+            s = s + this.format_annotation(lam.return_type_ann);
+        } else {
+            s = s + "void";
+        }
+        return s;
+    }
+
+    /// Render a variable declaration as `const|mut <name>: <Type>`,
+    /// matching the source-level form.  `is_global` doesn't get a
+    /// dedicated marker - the type already conveys what matters.
+    /// For globals with a literal initializer, the value is appended:
+    /// `const ENOENT: i32 = 2` - useful for errno-style constant tables
+    /// where the value is the relevant fact about the binding.
+    format_variable_decl(&this, v: VarDeclNode*) -> string {
+        if (v == null) { return ""; }
+        mut sig: string = if (v.is_mutable) { "mut " } else { "const " };
+        sig = sig + this.arena.intern_table.resolve(v.name);
+        sig = sig + ": ";
+        if (v.initializer != null && v.initializer.kind == NodeKind::LambdaExpression) {
+            sig = sig + this.format_lambda_signature(v.initializer as LambdaExprNode*);
+        } else {
+            sig = sig + this.arena.resolve_display_name_short(v.resolved_type.id);
+        }
+        if (v.is_global && v.initializer != null) {
+            const init: string = HoverEngine::literal_text(v.initializer);
+            if (init != "") { sig = sig + " = " + init; }
+        }
+        return sig;
+    }
+
+    /// True when `v` is a method receiver parameter (`&this` /
+    /// `mut &this` / `this`).  The parser stores the literal lexeme
+    /// (`&this` etc.) as the param's `name`, so a string-content match
+    /// against the interned name is the most direct way to detect it.
+    is_receiver_param(&this, v: VarDeclNode*) -> boolean {
+        if (v == null) { return false; }
+        const name_str: string = this.arena.intern_table.resolve(v.name);
+        return strcmp(name_str, "&this") == 0
+            || strcmp(name_str, "this")  == 0;
+    }
+
+    /// Render `<param_name>: <Bound1> + <Bound2>` for the generic param
+    /// on `node`.  Walks every bound on the decl whose `type_parameter`
+    /// matches `param_name` and joins their trait-ref leaves with `+` -
+    /// mirrors how `format_where_clause` renders the source side.
+    format_generic_param_at(&this, node: ASTNode*, param_name: SymbolStr) -> string {
+        if (this.intern == null || !param_name.is_valid()) { return ""; }
+        mut s: string = this.intern.resolve(param_name);
+        const bounds: TraitBound[]* = HoverEngine::bounds_of_decl(node);
+        if (bounds == null) { return s; }
+        mut first_ref: boolean = true;
+        for (mut bi: i64 = 0; bi < bounds.length; bi++) {
+            const b: &TraitBound = &(*bounds)[bi];
+            if (!b.type_parameter.equals(param_name)) { continue; }
+            for (mut ti: i64 = 0; ti < b.trait_refs.length; ti++) {
+                if (first_ref) {
+                    s = s + ": " + this.format_trait_ref(&b.trait_refs[ti]);
+                    first_ref = false;
+                } else {
+                    s = s + " + " + this.format_trait_ref(&b.trait_refs[ti]);
+                }
+            }
+        }
+        return s;
+    }
+
+    /// Render a method receiver as `this: <ReceiverType>`.  The receiver
+    /// type is whatever sema resolved on the synthetic `&this` /
+    /// `mut &this` / `this` `VarDeclNode` - that already includes the
+    /// `&` / `&mut` / value shape, so the formatter doesn't need to
+    /// reconstruct it from the name lexeme.
+    format_receiver(&this, v: VarDeclNode*) -> string {
+        return "this: " + this.arena.resolve_display_name_short(v.resolved_type.id);
+    }
+
+    /// Re-render an identifier use with an explicit type-annotation
+    /// string instead of the arena's short display.  Mirrors
+    /// `format_identifier_use`'s per-SymbolKind formatting so the
+    /// fallback shape stays consistent with the primary path.
+    rebuild_identifier_use_with_annotation(&this, sym: Symbol, type_str: string,
+                                           init_str: string) -> string {
+        const name_str: string = if (this.intern != null) {
+            this.intern.resolve(sym.name)
+        } else {
+            ""
+        };
+        const init_suffix: string = if (init_str != "") { " = " + init_str } else { "" };
+
+        return match (sym.kind) {
+            SymbolKind::Variable  => {
+                const prefix: string = if (sym.is_mutable) { "mut " } else { "const " };
+                prefix + name_str + ": " + type_str + init_suffix
+            }
+            SymbolKind::Constant  => {
+                "const " + name_str + ": " + type_str + init_suffix
+            }
+            SymbolKind::Parameter => {
+                const prefix: string = if (sym.is_mutable) { "mut " } else { "" };
+                prefix + name_str + ": " + type_str
+            }
+            SymbolKind::Field     => {
+                "field " + name_str + ": " + type_str
+            }
+            _                     => { type_str }
+        };
+    }
+
+    /// Render an identifier use as the declaration form of the symbol it
+    /// resolves to: `const body_str: Str` for a const local,
+    /// `mut body_str: Str` for a mutable local, `body_str: Str` for a
+    /// parameter (with `mut` prefix when the param itself is mutable),
+    /// `<name>: <Type>` for a field reached via `this.<name>` or similar.
+    /// `ty` is the use-site's resolved type (already short-formatted so
+    /// callers don't have to re-resolve through the arena).  `init_str`
+    /// is the literal text of the symbol's initializer (empty when the
+    /// symbol has no literal value or isn't a top-level const) - appended
+    /// as ` = <value>` so a hovered errno reads `const ENOENT: i32 = 2`.
+    format_identifier_use(&this, sym: Symbol, ty: TypeRef, init_str: string) -> string {
+        const type_str: string = this.arena.resolve_display_name_short(ty.id);
+        const name_str: string = this.arena.intern_table.resolve(sym.name);
+        const init_suffix: string = if (init_str != "") { " = " + init_str } else { "" };
+
+        return match (sym.kind) {
+            SymbolKind::Variable  => {
+                const prefix: string = if (sym.is_mutable) { "mut " } else { "const " };
+                prefix + name_str + ": " + type_str + init_suffix
+            }
+            SymbolKind::Constant  => {
+                "const " + name_str + ": " + type_str + init_suffix
+            }
+            SymbolKind::Parameter => {
+                const prefix: string = if (sym.is_mutable) { "mut " } else { "" };
+                prefix + name_str + ": " + type_str
+            }
+            SymbolKind::Field     => {
+                "field " + name_str + ": " + type_str
+            }
+            // For Function/Method/Type/etc. just show the type - the
+            // ScopeResolution and decl-name branches above already handle
+            // the signature-rich cases.
+            _                     => { type_str }
+        };
+    }
+
+    format_params(&this, params: &VarDeclNode*[]) -> string {
+        mut s: string = "(";
+        for (mut i: i64 = 0; i < params.length; i++) {
+            if (i > 0) { s = s + ", "; }
+            const p: VarDeclNode* = params[i];
+            if (p == null) { continue; }
+            s = s + this.arena.intern_table.resolve(p.name);
+            s = s + ": ";
+            s = s + this.arena.resolve_display_name_short(p.resolved_type.id);
+        }
+        return s + ")";
+    }
+
+    /// Render a numeric literal as `<value>: <inferred-type>` - for
+    /// example `42: i32`, `0xFF: u8`, `3.14: f64`.  The type comes from
+    /// `resolved_type` which sema fills in based on the surrounding
+    /// context, so the same literal can hover differently depending on
+    /// where it appears (annotation, parameter type, arithmetic peer).
+    /// When sema bails, the type slot is `?` rather than empty so the
+    /// hover still reads sensibly.
+    format_numeric_literal(&this, lit: LiteralNode*) -> string {
+        if (lit == null) { return ""; }
+        const ty: TypeRef = lit.resolved_type;
+        const type_str: string = if (ty.is_valid()) {
+            this.arena.resolve_display_name_short(ty.id)
+        } else { "?" };
+        return lit.value + ": " + type_str;
+    }
+
+    /// Render a variant as `<EnumName>::<VariantName> = <discriminant>`
+    /// for unit-only variants, or `<EnumName>::<VariantName>(<types>)`
+    /// when the variant carries associated types.  Discriminant is the
+    /// explicit value when set, otherwise the variant's index in source
+    /// order - Cryo enums start at 0 and step by one.
+    format_enum_variant(&this, parent: EnumDeclNode*, variant: EnumVariantNode*) -> string {
+        if (parent == null || variant == null) { return ""; }
+        mut sig: string = this.arena.intern_table.resolve(parent.name);
+        sig = sig + "::" + this.arena.intern_table.resolve(variant.name);
+
+        if (variant.associated_types.length > 0) {
+            sig = sig + "(";
+            for (mut i: i64 = 0; i < variant.associated_types.length; i++) {
+                if (i > 0) { sig = sig + ", "; }
+                sig = sig + this.format_annotation(variant.associated_types[i]);
+            }
+            return sig + ")";
+        }
+
+        const disc: i64 = if (variant.has_value) {
+            variant.explicit_value
+        } else {
+            HoverEngine::variant_auto_index(parent, variant)
+        };
+        return sig + " = " + HoverEngine::i64_to_text(disc);
+    }
+
+
+    // Graph / ctx queries
+
+    /// Walk the module graph to the decl at `decl_span` and return the
+    /// initializer literal as text - empty when the decl isn't a global
+    /// const, has no initializer, or the initializer isn't a literal we
+    /// can render compactly.  Used to enrich identifier-use hovers for
+    /// errno-style const tables (`const ENOENT: i32 = 2`).
+    const_initializer_text(&this, decl_span: SourceSpan) -> string {
+        const v: VarDeclNode* = this.var_decl_at_span(decl_span);
+        if (v == null)             { return ""; }
+        if (!v.is_global)          { return ""; }
+        if (v.initializer == null) { return ""; }
+        return HoverEngine::literal_text(v.initializer);
+    }
+
+    /// Locate a `VarDeclNode` at the start position of `decl_span`.
+    /// Returns `null` when the span isn't reachable in the graph or the
+    /// node at that position isn't a variable decl.  Shared between the
+    /// initializer-text helper and the Pattern-identifier dispatch.
+    var_decl_at_span(&this, decl_span: SourceSpan) -> VarDeclNode* {
+        if (this.graph == null)                  { return null; }
+        if (decl_span.file == "")                { return null; }
+        if (strlen(decl_span.file) == 0 as u64)  { return null; }
+        if (!decl_span.has_location())           { return null; }
+
+        const mod_idx: i64 = this.graph.find_module_by_path(decl_span.file);
+        if (mod_idx < 0) { return null; }
+        const ast: ProgramNode* = this.graph.get_module_ast(mod_idx as u32);
+        if (ast == null) { return null; }
+
+        const node: ASTNode* = NodeLocator::find_innermost_node_at(
+            ast, decl_span.start_line, decl_span.start_col);
+        if (node == null) { return null; }
+        if (node.kind != NodeKind::VariableDeclaration) { return null; }
+        return node as VarDeclNode*;
+    }
+
+    /// When a receiver's carrier resolves to a generic parameter name
+    /// (`T`, `W`, ...), method lookup on the bare param fails because no
+    /// struct named `T` exists.  Find the enclosing function, scan its
+    /// `trait_bounds[]` for the param, and look up `method_name` on the
+    /// bounded trait.  Returns the trait method's FunctionDeclNode, or
+    /// null when no trait bound carries that method.
+    ///
+    /// The hover handler treats null as "fall through to normal method/
+    /// field lookup" - for non-generic receivers this returns null
+    /// immediately because no trait_bound's `type_parameter` matches.
+    trait_method_for_generic_receiver(&this, file_path: string, line: u32,
+                                      character: u32, carrier: SymbolStr,
+                                      method_name: SymbolStr) -> FunctionDeclNode* {
+        if (!carrier.is_valid())     { return null; }
+        if (!method_name.is_valid()) { return null; }
+
+        const fdecl: FunctionDeclNode* = NodeLocator::find_enclosing_function(
+            this.graph, file_path, line, character);
+        if (fdecl == null) { return null; }
+
+        // Walk this function's trait bounds + every enclosing method's
+        // bounds (where-clause on an outer impl/method) to find one whose
+        // type_parameter equals the carrier.  For the common case the
+        // immediate function carries the bound - we only need the local
+        // scan.
+        for (mut bi: i64 = 0; bi < fdecl.trait_bounds.length; bi++) {
+            const b: &TraitBound = &fdecl.trait_bounds[bi];
+            if (!b.type_parameter.equals(carrier)) { continue; }
+            // Walk the bound's traits left-to-right.  First match wins;
+            // a multi-bound (`T: Display + Debug`) where both traits
+            // declare `fmt` is unusual but the leftmost is the most
+            // direct read of source order.
+            for (mut ti: i64 = 0; ti < b.trait_refs.length; ti++) {
+                const tref: &TraitRef = &b.trait_refs[ti];
+                if (tref.path.length == 0) { continue; }
+                const trait_leaf: SymbolStr = tref.path[tref.path.length - 1];
+                const f: FunctionDeclNode* = NodeLocator::find_trait_method_in_modules(
+                    this.graph, this.intern, trait_leaf, method_name);
+                if (f != null) { return f; }
+            }
+        }
+        return null;
+    }
+
+    /// AST-side companion to `unwrap_to_carrier`.  Recover the receiver's
+    /// carrier-type SymbolStr from the AST when sema didn't stamp a usable
+    /// resolved_type - primarily for member-access hovers inside generic
+    /// function bodies where `f.resolved_type` is invalid because sema
+    /// type-checked the body with unresolved generic params.
+    ///
+    /// Path:
+    ///   1. `recv` must be an IdentifierNode.
+    ///   2. Look up the resolver symbol for that identifier.
+    ///   3. Find the declaring VarDeclNode (parameter or local).
+    ///   4. Walk the TypeAnnotation, peeling Reference/Pointer/Generic
+    ///      wrappers, and return the SymbolStr of the leaf Named node.
+    ///
+    /// Returns `SymbolStr::empty()` when any step misses.  All callers
+    /// treat an empty result as "no fallback available" and skip the
+    /// method lookup.
+    receiver_carrier_name_from_annotation(&this, recv: ExpressionNode*) -> SymbolStr {
+        if (recv == null) { return SymbolStr::empty(); }
+        if (recv.kind != NodeKind::Identifier) { return SymbolStr::empty(); }
+        if (this.ctx.resolver == null) { return SymbolStr::empty(); }
+
+        const id: IdentifierNode* = recv as IdentifierNode*;
+
+        // `this` is parsed as an IdentifierNode but the resolver has no
+        // symbol entry for it (it's the synthesised receiver, not a
+        // user-bound name).  Recover the carrier type by scanning the
+        // module graph for the method whose body span covers `this`'s
+        // position - that method's owner IS the carrier type.
+        if (id.name.is_valid() && this.intern != null) {
+            const this_sym: SymbolStr = this.intern.intern("this");
+            if (id.name.equals(this_sym) && id.span.has_location()) {
+                return NodeLocator::find_enclosing_method_owner(
+                    this.graph, id.span.file,
+                    id.span.start_line, id.span.start_col);
+            }
+        }
+
+        const sym_id: SymbolID = this.ctx.resolver.resolve(id.span);
+        if (!sym_id.is_valid()) { return SymbolStr::empty(); }
+        const sym: Symbol = this.ctx.resolver.get_symbol(sym_id);
+
+        const v: VarDeclNode* = this.var_decl_at_span(sym.declaring_span);
+        if (v == null) { return SymbolStr::empty(); }
+        if (v.type_annotation == null) { return SymbolStr::empty(); }
+        return HoverEngine::annotation_carrier_name(v.type_annotation);
+    }
+
+    /// Strip Reference, Pointer, and InstantiatedType wrappers from `ty`
+    /// until a "carrier" type - the actual struct / class / enum the
+    /// receiver names - is reached.  Method declarations register against
+    /// the carrier's TypeRef, never against the borrow form or the spec
+    /// instantiation wrapper, so any DI lookup that expects to find
+    /// `Foo::bar` from a `&Foo<T>` receiver must unwrap first.
+    ///
+    /// Caps the chain at 6 hops as a safety net against malformed type
+    /// arenas - a self-referential pointer would otherwise loop forever.
+    unwrap_to_carrier(&this, ty: TypeRef) -> TypeRef {
+        if (this.arena == null) { return ty; }
+        mut cur: TypeRef = ty;
+        mut hops: i64 = 0;
+        while (hops < 6) {
+            if (!cur.is_valid()) { return cur; }
+            const t: Type* = this.arena.lookup(cur.id);
+            if (t == null) { return cur; }
+            if (t.kind == TypeKind::Reference) {
+                const rt: ReferenceType* = t as ReferenceType*;
+                cur = rt.referent;
+            } else if (t.kind == TypeKind::Pointer) {
+                const pt: PointerType* = t as PointerType*;
+                cur = pt.pointee;
+            } else if (t.kind == TypeKind::InstantiatedType) {
+                // `Formatter<W>` -> unwrap to the bare `Formatter` template.
+                // Methods are declared on the template's TypeRef; the
+                // monomorphized spec re-registers them but the bare base
+                // is what the DI's reverse map keys on for hover.
+                const it: InstantiatedType* = t as InstantiatedType*;
+                cur = it.generic_base;
+            } else {
+                return cur;
+            }
+            hops = hops + 1;
+        }
+        return cur;
+    }
+
+    function_decl_at_span(&this, decl_span: SourceSpan) -> FunctionDeclNode* {
+        if (this.graph == null)                  { return null; }
+        if (decl_span.file == "")                { return null; }
+        if (strlen(decl_span.file) == 0 as u64)  { return null; }
+        if (!decl_span.has_location())           { return null; }
+
+        const mod_idx: i64 = this.graph.find_module_by_path(decl_span.file);
+        if (mod_idx < 0) { return null; }
+        const ast: ProgramNode* = this.graph.get_module_ast(mod_idx as u32);
+        if (ast == null) { return null; }
+
+        const node: ASTNode* = NodeLocator::find_innermost_node_at(
+            ast, decl_span.start_line, decl_span.start_col);
+        if (node == null) { return null; }
+        if (node.kind != NodeKind::FunctionDeclaration) { return null; }
+        return node as FunctionDeclNode*;
+    }
+
+    /// Build the namespace path for `imp.path_segments[0..=index]`,
+    /// joined with `::`.  Used to find the matching `_module.cryo`
+    /// (the file whose `namespace_name` equals this prefix).
+    build_segment_path(&this, imp: ImportDeclNode*, index: i64) -> string {
+        mut path: string = "";
+        for (mut i: i64 = 0; i <= index; i++) {
+            if (i > 0) { path = path + "::"; }
+            path = path + this.intern.resolve(imp.path_segments[i]);
+        }
+        return path;
+    }
+
+    /// `::`-joined namespace path for `md.path_segments[0..=index]`.
+    build_module_decl_path(&this, md: ModuleDeclNode*, index: i64) -> string {
+        mut path: string = "";
+        for (mut i: i64 = 0; i <= index; i++) {
+            if (i > 0) { path = path + "::"; }
+            path = path + this.intern.resolve(md.path_segments[i]);
+        }
+        return path;
+    }
+
+    /// Resolve an import-segment literal path to the absolute namespace
+    /// path the loader would pick.  Stdlib imports inside stdlib source
+    /// are written relative (`import core::option;`); the loader
+    /// resolves them under `<stdlib>/`, which corresponds to the `std::`
+    /// namespace prefix.  We try the literal first so absolute paths
+    /// (and project-relative imports whose namespace already matches)
+    /// stay correct, then `std::<literal>` as the fallback.  When
+    /// neither matches a loaded module, we still prefer the candidate
+    /// that has loaded *descendants* in the graph so the synth-children
+    /// fallback in `format_namespace_overview` produces useful output.
+    resolve_namespace_path(&this, literal: string) -> string {
+        if (this.graph == null) { return literal; }
+        if (NodeLocator::find_program_by_namespace(this.graph, literal) != null) {
+            return literal;
+        }
+        const std_path: string = "std::" + literal;
+        if (NodeLocator::find_program_by_namespace(this.graph, std_path) != null) {
+            return std_path;
+        }
+        // Neither namespace is loaded - pick whichever has descendants
+        // under it (so the children-synth fallback in the formatter
+        // shows the expected sub-modules).  Prefer `std::` because
+        // stdlib-relative is the dominant relative-import case.
+        if (this.namespace_has_descendants(std_path))  { return std_path; }
+        if (this.namespace_has_descendants(literal))   { return literal; }
+        return literal;
+    }
+
+    /// True when any module in the graph declares a namespace whose
+    /// path starts with `prefix::`.  Used by `resolve_namespace_path`
+    /// to pick the candidate whose synth-children list will be
+    /// non-empty.
+    namespace_has_descendants(&this, prefix: string) -> boolean {
+        if (this.graph == null) { return false; }
+        const prefix_len: i64 = strlen(prefix) as i64;
+        if (prefix_len == 0) { return false; }
+        const n: u32 = this.graph.module_count();
+        for (mut mi: u32 = 0; mi < n; mi++) {
+            const ast: ProgramNode* = this.graph.get_module_ast(mi);
+            if (ast == null) { continue; }
+            const ns: string = ast.namespace_name;
+            const ns_len: i64 = strlen(ns) as i64;
+            if (ns_len <= prefix_len + 2) { continue; }
+            if (ns[prefix_len] != ':' as i8 || ns[prefix_len + 1] != ':' as i8) {
+                continue;
+            }
+            mut prefix_match: boolean = true;
+            for (mut i: i64 = 0; i < prefix_len; i++) {
+                if (ns[i] != prefix[i]) { prefix_match = false; break; }
+            }
+            if (prefix_match) { return true; }
+        }
+        return false;
+    }
+
+    /// Render the namespace overview for `path`: the `namespace X::Y;`
+    /// line plus every `public module ...;` declaration in the matching
+    /// `_module.cryo`.  When no `_module.cryo` for this namespace is in
+    /// the graph (the compiler doesn't load ancestor module files
+    /// proactively - only the leaf file directly imported is parsed),
+    /// derive the sub-module list by walking all loaded modules and
+    /// taking the unique next-segment of those whose namespace starts
+    /// with `path::`.  That gives a useful "what's reachable under
+    /// this namespace" view from already-parsed source.
+    format_namespace_overview(&this, path: string) -> string {
+        mut sig: string = "namespace " + path + ";";
+        const prog: ProgramNode* = NodeLocator::find_program_by_namespace(this.graph, path);
+
+        if (prog != null) {
+            mut had_modules: boolean = false;
+            for (mut i: i64 = 0; i < prog.statements.length; i++) {
+                const stmt: ASTNode* = HoverEngine::unwrap_top_decl(prog.statements[i]);
+                if (stmt == null) { continue; }
+                if (stmt.kind != NodeKind::ModuleDeclaration) { continue; }
+                const m: ModuleDeclNode* = stmt as ModuleDeclNode*;
+                // Skip the file's own `namespace X::Y::Z;` line -
+                // `parse_namespace_declaration` lowers it into a
+                // ModuleDeclNode with the qualified path, but it isn't a
+                // re-export of itself.
+                if (strcmp(m.path, path) == 0) { continue; }
+                if (!had_modules) { sig = sig + "\n"; had_modules = true; }
+                sig = sig + "\n";
+                if (m.is_public) { sig = sig + "public "; }
+                sig = sig + "module " + m.path + ";";
+            }
+            if (had_modules) { return sig; }
+        }
+
+        // Fallback: synthesize the sub-module list from descendant
+        // namespaces in the graph.  Each unique direct child becomes a
+        // synthetic `module <name>;` line.
+        if (this.graph == null) { return sig; }
+        const path_len: i64 = strlen(path) as i64;
+        mut children: string[] = [];
+        const n: u32 = this.graph.module_count();
+        for (mut mi: u32 = 0; mi < n; mi++) {
+            const ast: ProgramNode* = this.graph.get_module_ast(mi);
+            if (ast == null) { continue; }
+            const ns: string = ast.namespace_name;
+            const ns_len: i64 = strlen(ns) as i64;
+            // Match `path` followed by `::` then a segment.
+            if (ns_len <= path_len + 2) { continue; }
+            if (ns[path_len] != ':' as i8 || ns[path_len + 1] != ':' as i8) { continue; }
+            // Compare the prefix.
+            mut prefix_match: boolean = true;
+            for (mut i: i64 = 0; i < path_len; i++) {
+                if (ns[i] != path[i]) { prefix_match = false; break; }
+            }
+            if (!prefix_match) { continue; }
+            // Extract first child segment after `path::`.
+            const child: string = HoverEngine::first_segment_after(ns, (path_len + 2 as i64) as i64);
+            if (child == "") { continue; }
+            if (!HoverEngine::contains_string(&children, child)) {
+                children.push(child);
+            }
+        }
+        if (children.length == 0) { return sig; }
+        sig = sig + "\n";
+        for (mut i: i64 = 0; i < children.length; i++) {
+            sig = sig + "\nmodule " + children[i] + ";";
+        }
+        return sig;
+    }
+
+    /// The `///!` banner doc for namespace `path`: locate that namespace's
+    /// program in the graph and read the `documentation` the parser
+    /// attached to its own `namespace X::Y;` decl.  The self-namespace
+    /// `ModuleDeclNode` is the one whose `path` equals `path` (same
+    /// identification `format_namespace_overview` uses to *skip* it).
+    /// Empty string when the namespace isn't loaded or has no banner.
+    namespace_doc_for_path(&this, path: string) -> string {
+        const prog: ProgramNode* = NodeLocator::find_program_by_namespace(this.graph, path);
+        if (prog == null) { return ""; }
+        for (mut i: i64 = 0; i < prog.statements.length; i++) {
+            const stmt: ASTNode* = HoverEngine::unwrap_top_decl(prog.statements[i]);
+            if (stmt == null) { continue; }
+            if (stmt.kind != NodeKind::ModuleDeclaration) { continue; }
+            const m: ModuleDeclNode* = stmt as ModuleDeclNode*;
+            if (strcmp(m.path, path) == 0) { return m.documentation; }
+        }
+        return "";
+    }
+
+    /// Reverse-walk: given a variant node, find the enclosing
+    /// `EnumDeclNode`.  Mirrors `find_method_owner` for methods -
+    /// EnumVariantNodes don't carry a parent pointer so we scan the
+    /// graph.  Returns `null` when nothing matches (shouldn't happen for
+    /// a variant node the locator just returned).
+    find_enum_for_variant(&this, variant: EnumVariantNode*) -> EnumDeclNode* {
+        if (this.graph == null || variant == null) { return null; }
+        const n: u32 = this.graph.module_count();
+        for (mut mi: u32 = 0; mi < n; mi++) {
+            const ast: ProgramNode* = this.graph.get_module_ast(mi);
+            if (ast == null) { continue; }
+            for (mut si: i64 = 0; si < ast.statements.length; si++) {
+                const stmt: ASTNode* = HoverEngine::unwrap_top_decl(ast.statements[si]);
+                if (stmt == null) { continue; }
+                if (stmt.kind != NodeKind::EnumDeclaration) { continue; }
+                const ed: EnumDeclNode* = stmt as EnumDeclNode*;
+                for (mut vi: i64 = 0; vi < ed.variants.length; vi++) {
+                    if (ed.variants[vi] == variant) { return ed; }
+                }
+            }
+        }
+        return null;
+    }
+
+
+    // Struct-literal hover
+
+    /// Decide which sub-region of `IoError { kind: ..., os_code: ... }` the
+    /// cursor hit, and render accordingly:
+    ///
+    ///   - Cursor before any field (the `IoError` token region) ->
+    ///     full struct head, span = the type-name range
+    ///   - Cursor on a field-init name -> `<field>: <Type>`, span = the
+    ///     field-init's name segment (`init.span` start through
+    ///     `init.value.span` start)
+    ///   - Cursor in a field-init value -> empty (locator usually descends
+    ///     into the value, so we rarely see this; keep as fallback)
+    struct_literal_hover_at(&this, sl: StructLiteralNode*, line: u32, ch: u32) -> StructLiteralHover {
+        mut result: StructLiteralHover = StructLiteralHover {
+            content: "",
+            span:    sl.span,
+            doc:     "",
+        };
+        if (sl == null) { return result; }
+
+        // Look up the struct/class decl whose name appears at the head.
+        const decl: ASTNode* = NodeLocator::find_type_decl_in_modules(
+            this.graph, this.intern, sl.struct_type);
+
+        // Field-name dispatch.  For each field-init, the name occupies
+        // [init.span.start_col, init.value.span.start_col) on
+        // init.span.start_line.  Compare cursor (line, ch) against that
+        // range; on hit, render the field decl.
+        for (mut i: i64 = 0; i < sl.field_inits.length; i++) {
+            const init: FieldInit = sl.field_inits[i];
+            if (init.value == null) { continue; }
+            if (line != init.span.start_line) { continue; }
+
+            const name_start: u32 = init.span.start_col;
+            const name_end:   u32 = init.value.span.start_col;
+            if (ch < name_start || ch >= name_end) { continue; }
+
+            // Cursor is on the field name.  Look up the field on the
+            // owning struct/class decl and render `<name>: <Type>`.
+            if (decl != null) {
+                const fld: FieldDeclNode* = HoverEngine::find_field_on_type_decl(
+                    decl, init.field_name);
+                if (fld != null) {
+                    result.content = this.format_field_decl(fld);
+                    result.span    = HoverEngine::field_init_name_span(init.span, init.value.span);
+                    result.doc     = fld.documentation;
+                    return result;
+                }
+            }
+
+            // Decl unavailable - fall back to `name: <ResolvedValueType>`.
+            const value_ty: TypeRef = init.value.resolved_type;
+            if (value_ty.is_valid()) {
+                result.content = this.arena.intern_table.resolve(init.field_name)
+                    + ": " + this.arena.resolve_display_name_short(value_ty.id);
+                result.span    = HoverEngine::field_init_name_span(init.span, init.value.span);
                 return result;
             }
         }
 
-        // Decl unavailable - fall back to `name: <ResolvedValueType>`.
-        const value_ty: TypeRef = init.value.resolved_type;
-        if (value_ty.is_valid()) {
-            result.content = arena.intern_table.resolve(init.field_name)
-                + ": " + arena.resolve_display_name_short(value_ty.id);
-            result.span    = field_init_name_span(init.span, init.value.span);
-            return result;
+        // Cursor wasn't on any field-init name span - treat it as a hit
+        // on the struct-type token at the head of the literal.
+        if (decl != null) {
+            result.content = this.format_type_decl(decl);
+            result.span    = this.struct_literal_head_span(sl);
+            result.doc     = (decl as DeclarationNode*).documentation;
         }
+        return result;
     }
 
-    // Cursor wasn't on any field-init name span - treat it as a hit
-    // on the struct-type token at the head of the literal.
-    if (decl != null) {
-        result.content = format_type_decl(decl, arena);
-        result.span    = struct_literal_head_span(sl, intern);
-        result.doc     = (decl as DeclarationNode*).documentation;
+    /// Span of the type-name token at the head of a struct literal.
+    /// The literal's outer span starts at the type name; we trim it to
+    /// just the identifier's length so the editor highlights `IoError`
+    /// rather than `IoError { ... }`.
+    struct_literal_head_span(&this, sl: StructLiteralNode*) -> SourceSpan {
+        const name: string = if (this.intern != null) {
+            this.intern.resolve(sl.struct_type)
+        } else { "" };
+        const name_len: u32 = strlen(name) as u32;
+        return SourceSpan::new(
+            sl.span.file,
+            sl.span.start_line, sl.span.start_col,
+            sl.span.start_line, sl.span.start_col + name_len);
     }
-    return result;
+
+
+    // Stateless string / AST utilities (statics)
+
+    /// Return everything after the final `::` in `s`, or `s` itself when
+    /// there's no `::`.  Mirrors `extract_leaf_segment` in
+    /// `Compiler::Types::Arena` - duplicated here to avoid the cross-
+    /// module import for one tiny string helper.
+    static leaf_after_separator(s: string) -> string {
+        const len: i64 = strlen(s) as i64;
+        mut last_sep: i64 = -1;
+        for (mut i: i64 = 0; i + 1 < len; i++) {
+            if (s[i] == ':' && s[i + 1] == ':') { last_sep = i; }
+        }
+        if (last_sep < 0) { return s; }
+        const start: i64 = last_sep + 2;
+        if (start >= len) { return ""; }
+        return ptr_add(s as void*, start) as string;
+    }
+
+    /// Return the type-annotation span on `node` that covers the
+    /// cursor, if any.  Looks at the return-type annotation for
+    /// functions and methods, and the type annotation for variables /
+    /// fields.  Used to narrow the hover highlight when the cursor sits
+    /// on a type token that isn't its own AST node.
+    static annotation_span_at_cursor(node: ASTNode*, line: u32, ch: u32) -> SourceSpan {
+        const ann: TypeAnnotation* = HoverEngine::annotation_for_decl(node);
+        return NodeLocator::annotation_span(ann);
+    }
+
+    /// Scan a FunctionDeclNode or MethodNode's `trait_bounds[]` for a
+    /// TraitRef whose span covers `(line, character)`.  Returns the
+    /// leaf SymbolStr of the trait reference's qualified path (e.g.
+    /// `FmtWrite` from `where W: FmtWrite`) - that's the name the
+    /// `find_type_decl_in_modules` lookup keys on.  Returns
+    /// `SymbolStr::empty()` when the cursor isn't on any trait ref.
+    static trait_ref_at_cursor(node: ASTNode*, line: u32, character: u32) -> SymbolStr {
+        const bounds: TraitBound[]* = HoverEngine::bounds_of_decl(node);
+        if (bounds == null) { return SymbolStr::empty(); }
+        for (mut bi: i64 = 0; bi < bounds.length; bi++) {
+            const b: &TraitBound = &(*bounds)[bi];
+            for (mut ti: i64 = 0; ti < b.trait_refs.length; ti++) {
+                const tref: &TraitRef = &b.trait_refs[ti];
+                if (!NodeLocator::span_contains(tref.span, line, character)) { continue; }
+                if (tref.path.length == 0) { continue; }
+                return tref.path[tref.path.length - 1];
+            }
+        }
+        return SymbolStr::empty();
+    }
+
+    /// Companion to `trait_ref_at_cursor` - returns the span of the
+    /// matching TraitRef so the hover can highlight the exact lexeme.
+    static trait_ref_span_at_cursor(node: ASTNode*, line: u32, character: u32) -> SourceSpan {
+        const bounds: TraitBound[]* = HoverEngine::bounds_of_decl(node);
+        if (bounds == null) { return SourceSpan::none(); }
+        for (mut bi: i64 = 0; bi < bounds.length; bi++) {
+            const b: &TraitBound = &(*bounds)[bi];
+            for (mut ti: i64 = 0; ti < b.trait_refs.length; ti++) {
+                const tref: &TraitRef = &b.trait_refs[ti];
+                if (NodeLocator::span_contains(tref.span, line, character)) {
+                    return tref.span;
+                }
+            }
+        }
+        return SourceSpan::none();
+    }
+
+    /// Approximate span of the type-parameter portion of a `where`
+    /// bound.  TraitBound stamps a single span over the whole `A:
+    /// Trait + Trait2` lexeme and a separate span on each TraitRef; the
+    /// type-parameter sits between `bound.span.start` and the first
+    /// trait_ref's start.  Returns `SourceSpan::none()` when the cursor
+    /// isn't on any param.
+    static type_param_span_at_cursor(node: ASTNode*, line: u32, character: u32) -> SourceSpan {
+        const bounds: TraitBound[]* = HoverEngine::bounds_of_decl(node);
+        if (bounds == null) { return SourceSpan::none(); }
+        for (mut bi: i64 = 0; bi < bounds.length; bi++) {
+            const b: &TraitBound = &(*bounds)[bi];
+            if (b.trait_refs.length == 0) { continue; }
+            const first: &TraitRef = &b.trait_refs[0];
+            // Build a synthetic span: same start as the bound, end at the
+            // first trait ref's start (i.e. the position of `:`).
+            const param_span: SourceSpan = SourceSpan::new(
+                b.span.file,
+                b.span.start_line, b.span.start_col,
+                first.span.start_line, first.span.start_col);
+            if (NodeLocator::span_contains(param_span, line, character)) {
+                return param_span;
+            }
+        }
+        return SourceSpan::none();
+    }
+
+    static type_param_at_cursor(node: ASTNode*, line: u32, character: u32) -> SymbolStr {
+        const bounds: TraitBound[]* = HoverEngine::bounds_of_decl(node);
+        if (bounds == null) { return SymbolStr::empty(); }
+        for (mut bi: i64 = 0; bi < bounds.length; bi++) {
+            const b: &TraitBound = &(*bounds)[bi];
+            if (b.trait_refs.length == 0) { continue; }
+            const first: &TraitRef = &b.trait_refs[0];
+            const param_span: SourceSpan = SourceSpan::new(
+                b.span.file,
+                b.span.start_line, b.span.start_col,
+                first.span.start_line, first.span.start_col);
+            if (NodeLocator::span_contains(param_span, line, character)) {
+                return b.type_parameter;
+            }
+        }
+        return SymbolStr::empty();
+    }
+
+    /// Extract the `trait_bounds[]` (or impl-level `where_bounds[]`)
+    /// slice from a decl whose head can carry a `where` clause.
+    /// FunctionDeclNode owns its own bounds; MethodNode delegates to its
+    /// inner `func`; ImplBlockNode keeps its head-level where clause in
+    /// `where_bounds[]` rather than a per-method array.  Empty array for
+    /// any other node kind.
+    // Returns a BORROW (pointer into the AST node) of the decl's bounds array,
+    // or null when the node has none.  Returning `f.trait_bounds` by value would
+    // alias the owning `TraitBound[]` buffer into the caller's local, whose
+    // scope-exit drop would then free a buffer the AST node still owns (double
+    // free) - the static checker doesn't flag return-of-field, but the drop glue
+    // still fires.  Callers read through the pointer (`(*bounds)[i]`).
+    static bounds_of_decl(node: ASTNode*) -> TraitBound[]* {
+        if (node == null) { return null; }
+        if (node.kind == NodeKind::FunctionDeclaration) {
+            const f: FunctionDeclNode* = node as FunctionDeclNode*;
+            return &f.trait_bounds;
+        }
+        if (node.kind == NodeKind::MethodDeclaration) {
+            const m: MethodNode* = node as MethodNode*;
+            if (m.func == null) { return null; }
+            return &m.func.trait_bounds;
+        }
+        if (node.kind == NodeKind::ImplementationBlock) {
+            const b: ImplBlockNode* = node as ImplBlockNode*;
+            return &b.where_bounds;
+        }
+        return null;
+    }
+
+    static annotation_for_decl(node: ASTNode*) -> TypeAnnotation* {
+        if (node == null) { return null; }
+        if (node.kind == NodeKind::FunctionDeclaration) {
+            const f: FunctionDeclNode* = node as FunctionDeclNode*;
+            return f.return_type_annotation;
+        }
+        if (node.kind == NodeKind::MethodDeclaration) {
+            const m: MethodNode* = node as MethodNode*;
+            if (m.func == null) { return null; }
+            return m.func.return_type_annotation;
+        }
+        if (node.kind == NodeKind::VariableDeclaration) {
+            const v: VarDeclNode* = node as VarDeclNode*;
+            return v.type_annotation;
+        }
+        if (node.kind == NodeKind::FieldDeclaration) {
+            const fld: FieldDeclNode* = node as FieldDeclNode*;
+            return fld.type_annotation;
+        }
+        if (node.kind == NodeKind::TypeAliasDeclaration) {
+            const ta: TypeAliasDeclNode* = node as TypeAliasDeclNode*;
+            return ta.target_annotation;
+        }
+        return null;
+    }
+
+    /// True when `s` ends in the `: ?` placeholder the arena uses for
+    /// invalid type IDs.  Used by the hover handler to detect a sema
+    /// miss (generic body, partial compile) and trigger the annotation
+    /// fallback.
+    static contains_unknown_type(s: string) -> boolean {
+        const len: i64 = strlen(s) as i64;
+        if (len < 3) { return false; }
+        return s[len - 3] == ':' && s[len - 2] == ' ' && s[len - 1] == '?';
+    }
+
+    static json_u32_field(obj: &JsonValue, key: string) -> u32 {
+        match (obj.get(Str::from_cstr(key))) {
+            Option::Some(v) => {
+                match (v) {
+                    JsonValue::Number(n) => {
+                        match (n) {
+                            JsonNumber::Int(i)   => {
+                                if (i < 0) { return 0 as u32; }
+                                return i as u32;
+                            }
+                            JsonNumber::UInt(u)  => { return u as u32; }
+                            JsonNumber::Float(f) => {
+                                if (f < 0.0) { return 0 as u32; }
+                                return f as u32;
+                            }
+                        }
+                    }
+                    _ => { return 0 as u32; }
+                }
+            }
+            Option::None => { return 0 as u32; }
+        }
+        return 0 as u32;
+    }
+
+    /// Convert a 1-based compiler `SourceSpan` to a 0-based LSP `Range`.
+    /// Used so the editor highlights the matched token while the tooltip
+    /// is open - without a range the hover anchors to a single point.
+    static range_from_span(span: SourceSpan) -> Range {
+        mut sl: u32 = 0;
+        mut sc: u32 = 0;
+        mut el: u32 = 0;
+        mut ec: u32 = 0;
+        if (span.start_line > 0) { sl = span.start_line - 1; }
+        if (span.start_col  > 0) { sc = span.start_col  - 1; }
+        if (span.end_line   > 0) { el = span.end_line   - 1; }
+        if (span.end_col    > 0) { ec = span.end_col    - 1; }
+        return Range::new(Position::new(sl, sc), Position::new(el, ec));
+    }
+
+    /// Render a literal-bearing expression to its source-level text.
+    /// Handles bare `LiteralNode` and `-<literal>` UnaryExpressions
+    /// (negative integer constants).  Returns "" for any other shape so
+    /// hover never displays a partial expression - composite initializers
+    /// like `(FOO | BAR)` are better shown by the user navigating to the
+    /// decl itself.
+    static literal_text(expr: ExpressionNode*) -> string {
+        if (expr == null) { return ""; }
+        if (expr.kind == NodeKind::Literal) {
+            const l: LiteralNode* = expr as LiteralNode*;
+            return l.value;
+        }
+        if (expr.kind == NodeKind::UnaryExpression) {
+            const u: UnaryExprNode* = expr as UnaryExprNode*;
+            if (u.operand != null && u.operand.kind == NodeKind::Literal) {
+                const l: LiteralNode* = u.operand as LiteralNode*;
+                return "-" + l.value;
+            }
+        }
+        return "";
+    }
+
+    /// Walk a `TypeAnnotation*`, peeling Reference/Pointer/Array/Optional/
+    /// Generic wrappers, and return the SymbolStr of the innermost `Named`
+    /// (or `Primitive`) annotation.  Empty SymbolStr if the leaf isn't a
+    /// named carrier - function types, tuples, and ThisType don't have a
+    /// single SymbolStr the DI can key on.
+    static annotation_carrier_name(ann: TypeAnnotation*) -> SymbolStr {
+        if (ann == null) { return SymbolStr::empty(); }
+        mut cur: TypeAnnotation* = ann;
+        mut hops: i64 = 0;
+        while (hops < 6) {
+            const result: SymbolStr = match (*cur) {
+                TypeAnnotation::Named(n)     => { n.name }
+                TypeAnnotation::Primitive(p) => { p.name }
+                _                            => { SymbolStr::empty() }
+            };
+            if (result.is_valid()) { return result; }
+
+            const next: TypeAnnotation* = match (*cur) {
+                TypeAnnotation::Reference(r) => { r.inner }
+                TypeAnnotation::Pointer(p)   => { p.inner }
+                TypeAnnotation::Array(a)     => { a.element }
+                TypeAnnotation::Optional(o)  => { o.inner }
+                TypeAnnotation::Generic(g)   => { g.base }
+                _                            => { null }
+            };
+            if (next == null) { return SymbolStr::empty(); }
+            cur = next;
+            hops = hops + 1;
+        }
+        return SymbolStr::empty();
+    }
+
+    /// Return the index into `imp.path_segments` whose span contains
+    /// the cursor, or -1 when the cursor sits on the `import` keyword,
+    /// the trailing `;`, or any inter-segment punctuation (`::`).
+    static import_segment_at(imp: ImportDeclNode*, line: u32, ch: u32) -> i64 {
+        if (imp == null) { return -1 as i64; }
+        for (mut i: i64 = 0; i < imp.path_segment_spans.length; i++) {
+            if (NodeLocator::span_contains(imp.path_segment_spans[i], line, ch)) {
+                return i;
+            }
+        }
+        return -1 as i64;
+    }
+
+    /// Index of the `ModuleDeclNode` segment whose span contains the
+    /// cursor, or -1 when the cursor is on `namespace` / `module` /
+    /// `public` / `;` / a `::` separator.  Mirror of
+    /// `import_segment_at` for `namespace X::Y::Z;` and
+    /// `public module X::Y;` decls.
+    static module_decl_segment_at(md: ModuleDeclNode*, line: u32, ch: u32) -> i64 {
+        if (md == null) { return -1 as i64; }
+        for (mut i: i64 = 0; i < md.path_segment_spans.length; i++) {
+            if (NodeLocator::span_contains(md.path_segment_spans[i], line, ch)) {
+                return i;
+            }
+        }
+        return -1 as i64;
+    }
+
+    /// Return the substring of `s` from byte index `start` up to (but
+    /// not including) the next `::` or end-of-string.  Used to extract
+    /// the first namespace segment after a known prefix.
+    static first_segment_after(s: string, start: i64) -> string {
+        const len: i64 = strlen(s) as i64;
+        mut end: i64 = start;
+        while (end < len) {
+            if (end + 1 < len
+                    && s[end] == ':' as i8 && s[end + 1] == ':' as i8) {
+                break;
+            }
+            end = end + 1;
+        }
+        const seg_len: i64 = end - start;
+        if (seg_len <= 0) { return ""; }
+        const buf: i8* = malloc((seg_len + 1) as u64) as i8*;
+        for (mut i: i64 = 0; i < seg_len; i++) { buf[i] = s[start + i]; }
+        buf[seg_len] = 0 as i8;
+        return buf as string;
+    }
+
+    static contains_string(arr: &string[], target: string) -> boolean {
+        for (mut i: i64 = 0; i < arr.length; i++) {
+            if (strcmp(arr[i], target) == 0) { return true; }
+        }
+        return false;
+    }
+
+    /// Strip per-line `///` (and a single optional space after) from a
+    /// doc-comment cluster so the rendered hover reads as plain markdown
+    /// rather than as a wall of Cryo source.  Lines starting with the
+    /// alternate doc-block markers (`///!`, `/**`, `* `, `*/`) get the
+    /// same treatment - keeps stdlib-style module banners legible.
+    /// Trailing whitespace + blank trailing lines are trimmed; embedded
+    /// blank lines pass through (markdown paragraph breaks).
+    static clean_doc_for_hover(raw: string) -> string {
+        const len: i64 = strlen(raw) as i64;
+        if (len == 0) { return ""; }
+        const buf: i8* = malloc((len + 1) as u64) as i8*;
+        mut out: i64 = 0;
+        mut i:   i64 = 0;
+        while (i < len) {
+            // Skip leading whitespace on this line.
+            while (i < len && (raw[i] == ' ' as i8 || raw[i] == '\t' as i8)) {
+                i = i + 1;
+            }
+            // Strip `///!`, `///`, `/**`, `*/`, or a leading `*` continuation.
+            if (i + 3 < len
+                    && raw[i] == '/' as i8 && raw[i + 1] == '/' as i8
+                    && raw[i + 2] == '/' as i8 && raw[i + 3] == '!' as i8) {
+                i = i + 4;
+            } else if (i + 2 < len
+                    && raw[i] == '/' as i8 && raw[i + 1] == '/' as i8
+                    && raw[i + 2] == '/' as i8) {
+                i = i + 3;
+            } else if (i + 2 < len
+                    && raw[i] == '/' as i8 && raw[i + 1] == '*' as i8
+                    && raw[i + 2] == '*' as i8) {
+                i = i + 3;
+            } else if (i + 1 < len
+                    && raw[i] == '*' as i8 && raw[i + 1] == '/' as i8) {
+                i = i + 2;
+            } else if (i < len && raw[i] == '*' as i8
+                    && (i + 1 >= len || raw[i + 1] != '*' as i8)) {
+                i = i + 1;
+            }
+            // Single optional space after the marker.
+            if (i < len && raw[i] == ' ' as i8) { i = i + 1; }
+
+            // Copy until end of line, stopping at a trailing `*/`.
+            while (i < len && raw[i] != '\n' as i8) {
+                if (i + 1 < len
+                        && raw[i] == '*' as i8 && raw[i + 1] == '/' as i8) {
+                    i = i + 2;
+                    break;
+                }
+                buf[out] = raw[i];
+                out = out + 1;
+                i = i + 1;
+            }
+            // Trim trailing whitespace on this line.
+            while (out > 0 && (buf[out - 1] == ' ' as i8 || buf[out - 1] == '\t' as i8)) {
+                out = out - 1;
+            }
+            // Append the newline if present.
+            if (i < len) {
+                buf[out] = '\n' as i8;
+                out = out + 1;
+                i = i + 1;
+            }
+        }
+        // Drop trailing newlines so markdown doesn't render a dangling blank line.
+        while (out > 0 && buf[out - 1] == '\n' as i8) { out = out - 1; }
+        buf[out] = 0 as i8;
+        return buf as string;
+    }
+
+    /// Format an `i64` as a heap-leased decimal `string`.  Routes through
+    /// `i64.to_decimal_buf` so the digit logic stays in one place; the
+    /// returned buffer is a bare `malloc` that outlives this call (same
+    /// pattern as the other `format_*` helpers in this file - the leak is
+    /// per-hover-request and acceptable until the LSP grows a per-call
+    /// arena).
+    ///
+    /// The buffer must NOT be a `String`: `String` is `Drop`, so a local
+    /// one is freed on scope exit and `as_ptr()` would hand back dangling
+    /// memory.  That UAF surfaced as garbage byte-counts in string-literal
+    /// hovers (`string("...")[<garbage>]`).
+    static i64_to_text(value: i64) -> string {
+        mut scratch: u8[21];
+        const n: u64 = value.to_decimal_buf(&scratch[0]);
+        const src: u8*  = &scratch[0];
+        const buf: i8*  = malloc(n + 1 as u64) as i8*;
+        for (mut i: i64 = 0; i < n as i64; i++) { buf[i] = src[i] as i8; }
+        buf[n as i64] = 0 as i8;
+        return buf as string;
+    }
+
+    /// Render a string literal as `string("<text>")[<bytes>]` so the
+    /// hover surfaces both the source text and the byte count.  The
+    /// lexer already strips the surrounding quotes and resolves escape
+    /// sequences when populating `LiteralNode.value`, so the byte count
+    /// is just `strlen(value)` and we re-escape control characters so
+    /// the displayed text fits on one line of hover markup.  Long
+    /// strings get truncated past 60 visible chars - hover isn't the
+    /// place for the full payload.
+    static format_string_literal(lit: LiteralNode*) -> string {
+        if (lit == null) { return "string"; }
+        const bytes:   i64    = strlen(lit.value) as i64;
+        const escaped: string = HoverEngine::escape_for_hover(lit.value);
+        return "string(\"" + escaped + "\")[" + HoverEngine::i64_to_text(bytes) + "]";
+    }
+
+    /// Re-escape `\n`/`\r`/`\t`/`"`/`\` in `s` so the hover renders the
+    /// source-level appearance (newlines wouldn't survive markdown
+    /// otherwise).  Truncates with `...` past 60 visible chars to keep the
+    /// hover panel one line.
+    ///
+    /// Writes into a bare `malloc` rather than a `String` builder: a local
+    /// `String` is `Drop`, so returning `out.as_ptr()` handed back a freed
+    /// buffer - the UAF that rendered string-literal hovers as garbage
+    /// (`string("<garbage>")[...]`).  Worst case every input byte escapes to
+    /// two output bytes, plus a trailing `...` and NUL - `2*len + 4`.
+    static escape_for_hover(s: string) -> string {
+        const len: i64 = strlen(s) as i64;
+        const max_show: i64 = 60;
+        const buf: i8* = malloc((2 * len + 4) as u64) as i8*;
+        mut wi: i64 = 0;
+        mut shown: i64 = 0;
+        mut i: i64 = 0;
+        while (i < len) {
+            if (shown >= max_show) {
+                buf[wi] = '.' as i8;  wi = wi + 1;
+                buf[wi] = '.' as i8;  wi = wi + 1;
+                buf[wi] = '.' as i8;  wi = wi + 1;
+                break;
+            }
+            const c: i8 = s[i];
+            if (c == '\n' as i8) {
+                buf[wi] = '\\' as i8; wi = wi + 1;
+                buf[wi] = 'n' as i8;  wi = wi + 1;
+                shown = shown + 2;
+            } else if (c == '\r' as i8) {
+                buf[wi] = '\\' as i8; wi = wi + 1;
+                buf[wi] = 'r' as i8;  wi = wi + 1;
+                shown = shown + 2;
+            } else if (c == '\t' as i8) {
+                buf[wi] = '\\' as i8; wi = wi + 1;
+                buf[wi] = 't' as i8;  wi = wi + 1;
+                shown = shown + 2;
+            } else if (c == '"' as i8) {
+                buf[wi] = '\\' as i8; wi = wi + 1;
+                buf[wi] = '"' as i8;  wi = wi + 1;
+                shown = shown + 2;
+            } else if (c == '\\' as i8) {
+                buf[wi] = '\\' as i8; wi = wi + 1;
+                buf[wi] = '\\' as i8; wi = wi + 1;
+                shown = shown + 2;
+            } else {
+                buf[wi] = c; wi = wi + 1;
+                shown = shown + 1;
+            }
+            i = i + 1;
+        }
+        buf[wi] = 0 as i8;
+        return buf as string;
+    }
+
+    /// Index of `variant` in `parent.variants[]`.  Falls back to 0 when
+    /// the variant somehow isn't on the parent - shouldn't happen for
+    /// nodes the locator returned.
+    static variant_auto_index(parent: EnumDeclNode*, variant: EnumVariantNode*) -> i64 {
+        for (mut i: i64 = 0; i < parent.variants.length; i++) {
+            if (parent.variants[i] == variant) { return i; }
+        }
+        return 0;
+    }
+
+    /// Linear scan for a variant by name on a known enum decl.  Used by
+    /// the `EnumName::Variant` ScopeResolution branch.
+    static find_variant_in_enum(parent: EnumDeclNode*, name: SymbolStr) -> EnumVariantNode* {
+        if (parent == null) { return null; }
+        for (mut i: i64 = 0; i < parent.variants.length; i++) {
+            const v: EnumVariantNode* = parent.variants[i];
+            if (v != null && v.name.equals(name)) { return v; }
+        }
+        return null;
+    }
+
+    /// `ProgramNode.statements` may wrap top-level decls in a
+    /// `DeclStmtNode`; unwrap so callers can branch on the inner kind.
+    /// Mirrors the locator's `unwrap_decl_stmt` (kept private there).
+    static unwrap_top_decl(node: ASTNode*) -> ASTNode* {
+        if (node == null) { return null; }
+        if (node.kind != NodeKind::DeclarationStatement) { return node; }
+        const d: DeclStmtNode* = node as DeclStmtNode*;
+        return d.declaration as ASTNode*;
+    }
+
+    /// Span of just the field name within a `FieldInit`.  The init's
+    /// outer span runs from the name through the value; the value's own
+    /// span tells us where the name ends.  Falls back to the outer span
+    /// when the value span is missing (sema bailed pre-resolution).
+    static field_init_name_span(init_span: SourceSpan, value_span: SourceSpan) -> SourceSpan {
+        if (!value_span.has_location()) { return init_span; }
+        return SourceSpan::new(
+            init_span.file,
+            init_span.start_line, init_span.start_col,
+            init_span.start_line, value_span.start_col);
+    }
+
+    /// Lookup a field by name on a struct or class decl.  Mirrors the
+    /// `methods_contains` style of the locator's reverse walks; returns
+    /// `null` for kinds without an inline `fields[]` (enums, traits) and
+    /// for missing names.
+    static find_field_on_type_decl(decl: ASTNode*, name: SymbolStr) -> FieldDeclNode* {
+        if (decl == null) { return null; }
+        if (decl.kind == NodeKind::StructDeclaration) {
+            const sd: StructDeclNode* = decl as StructDeclNode*;
+            return HoverEngine::field_by_name(&sd.fields, name);
+        }
+        if (decl.kind == NodeKind::ClassDeclaration) {
+            const cd: ClassDeclNode* = decl as ClassDeclNode*;
+            return HoverEngine::field_by_name(&cd.fields, name);
+        }
+        return null;
+    }
+
+    static field_by_name(fields: &FieldDeclNode*[], name: SymbolStr) -> FieldDeclNode* {
+        for (mut i: i64 = 0; i < fields.length; i++) {
+            const f: FieldDeclNode* = fields[i];
+            if (f != null && f.name.equals(name)) { return f; }
+        }
+        return null;
+    }
 }
 
-/// Span of just the field name within a `FieldInit`.  The init's
-/// outer span runs from the name through the value; the value's own
-/// span tells us where the name ends.  Falls back to the outer span
-/// when the value span is missing (sema bailed pre-resolution).
-function field_init_name_span(init_span: SourceSpan,
-                               value_span: SourceSpan) -> SourceSpan {
-    if (!value_span.has_location()) { return init_span; }
-    return SourceSpan::new(
-        init_span.file,
-        init_span.start_line, init_span.start_col,
-        init_span.start_line, value_span.start_col);
-}
 
-/// Span of the type-name token at the head of a struct literal.
-/// The literal's outer span starts at the type name; we trim it to
-/// just the identifier's length so the editor highlights `IoError`
-/// rather than `IoError { ... }`.
-function struct_literal_head_span(sl: StructLiteralNode*,
-                                   intern: InternTable*) -> SourceSpan {
-    const name: string = if (intern != null) {
-        intern.resolve(sl.struct_type)
-    } else { "" };
-    const name_len: u32 = strlen(name) as u32;
-    return SourceSpan::new(
-        sl.span.file,
-        sl.span.start_line, sl.span.start_col,
-        sl.span.start_line, sl.span.start_col + name_len);
-}
-
-/// Lookup a field by name on a struct or class decl.  Mirrors the
-/// `methods_contains` style of the locator's reverse walks; returns
-/// `null` for kinds without an inline `fields[]` (enums, traits) and
-/// for missing names.
-function find_field_on_type_decl(decl: ASTNode*, name: SymbolStr) -> FieldDeclNode* {
-    if (decl == null) { return null; }
-    if (decl.kind == NodeKind::StructDeclaration) {
-        const sd: StructDeclNode* = decl as StructDeclNode*;
-        return field_by_name(&sd.fields, name);
-    }
-    if (decl.kind == NodeKind::ClassDeclaration) {
-        const cd: ClassDeclNode* = decl as ClassDeclNode*;
-        return field_by_name(&cd.fields, name);
-    }
-    return null;
-}
-
-function field_by_name(fields: &FieldDeclNode*[], name: SymbolStr) -> FieldDeclNode* {
-    for (mut i: i64 = 0; i < fields.length; i++) {
-        const f: FieldDeclNode* = fields[i];
-        if (f != null && f.name.equals(name)) { return f; }
-    }
-    return null;
-}
+// URI helpers live in `Lsp::Protocol::Conv` (`UriPath::uri_to_fs_path`).
