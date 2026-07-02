@@ -127,7 +127,7 @@ type struct CompilerSession {
 
         // Editor-side `uri` is `file://<absolute-path>` (percent-encoded);
         // decode + normalize to a real filesystem path the loader accepts.
-        mut fs_path_owned: String = Conv::uri_to_fs_path(uri);
+        mut fs_path_owned: String = UriPath::uri_to_fs_path(uri);
         const fs_path: Str = fs_path_owned.as_str();
 
         // Replace backing buffers.  The previous `ctx` (if any) holds
@@ -138,10 +138,10 @@ type struct CompilerSession {
         this.content_buf.drop();
         this.config_buf.drop();
         this.stdlib_buf.drop();
-        this.path_buf    = build_cstring_buffer(fs_path);
-        this.content_buf = build_cstring_buffer(content);
-        this.config_buf  = discover_project_cryoconfig(fs_path);
-        this.stdlib_buf  = discover_stdlib_root(fs_path);
+        this.path_buf    = PathFinder::build_cstring_buffer(fs_path);
+        this.content_buf = PathFinder::build_cstring_buffer(content);
+        this.config_buf  = PathFinder::discover_project_cryoconfig(fs_path);
+        this.stdlib_buf  = PathFinder::discover_stdlib_root(fs_path);
         fs_path_owned.drop();                    // fs_path (borrow) unused below
 
         // Wire the discovered stdlib path through to the compiler's
@@ -351,7 +351,16 @@ type struct SessionMap {
 
 // Helpers
 //
-// URI helpers live in `Lsp::Protocol::Conv` (`Conv::uri_to_fs_path`).
+// URI helpers live in `Lsp::Protocol::Conv` (`UriPath::uri_to_fs_path`).
+
+// PathFinder - project discovery + path utilities for the LSP.
+// Static methods: they walk the filesystem from a path, holding no state.
+//
+// (Follow-up: these hand-roll parent-walk + existence checks with raw
+// `intrinsics::access`; a pass to route through `std::fs` path/metadata
+// helpers is a possible consolidation, deferred to keep behaviour fixed.)
+
+type struct PathFinder {
 
 /// Walk parents of `fs_path` looking for a directory that contains
 /// `stdlib/lib.cryo`; return that `stdlib` directory's absolute
@@ -363,8 +372,8 @@ type struct SessionMap {
 /// project (`.../tools/CryoLSP/build/bin/cryolsp`), so the
 /// binary-relative search the CLI driver uses doesn't reach the
 /// in-repo stdlib.  Walking up from the source file does.
-function discover_stdlib_root(fs_path: Str) -> String {
-    mut dir: String = lsp_parent_dir(fs_path);
+static discover_stdlib_root(fs_path: Str) -> String {
+    mut dir: String = PathFinder::lsp_parent_dir(fs_path);
     loop {
         if (dir.length() == 0) { dir.drop(); return String::new(); }
 
@@ -390,7 +399,7 @@ function discover_stdlib_root(fs_path: Str) -> String {
         }
         probe.drop();
 
-        const next: String = lsp_parent_dir(dir.as_str());
+        const next: String = PathFinder::lsp_parent_dir(dir.as_str());
         dir.drop();
         dir = next;
     }
@@ -406,9 +415,9 @@ function discover_stdlib_root(fs_path: Str) -> String {
 /// finds
 ///   /home/.../CryoLang/compiler/cryoconfig
 /// even though /home/.../CryoLang has no cryoconfig at the root.
-function discover_project_cryoconfig(fs_path: Str) -> String {
+static discover_project_cryoconfig(fs_path: Str) -> String {
     // Start from the file's directory.
-    mut dir: String = lsp_parent_dir(fs_path);
+    mut dir: String = PathFinder::lsp_parent_dir(fs_path);
     loop {
         if (dir.length() == 0) { dir.drop(); return String::new(); }
 
@@ -429,7 +438,7 @@ function discover_project_cryoconfig(fs_path: Str) -> String {
 
         // Step up to the parent.  lsp_parent_dir of "/" is "" - that's
         // the loop's exit condition.
-        const next: String = lsp_parent_dir(dir.as_str());
+        const next: String = PathFinder::lsp_parent_dir(dir.as_str());
         dir.drop();
         dir = next;
     }
@@ -441,7 +450,7 @@ function discover_project_cryoconfig(fs_path: Str) -> String {
 /// onwards is dropped.  `lsp_parent_dir("/foo/bar")` -> `"/foo"`,
 /// `lsp_parent_dir("/foo")` -> `""` (we treat `"/"`'s parent as empty so
 /// the discover_project_cryoconfig loop terminates).
-function lsp_parent_dir(path: Str) -> String {
+static lsp_parent_dir(path: Str) -> String {
     const len: u64 = path.length();
     if (len == 0) { return String::new(); }
     const ptr: u8* = path.as_ptr();
@@ -464,12 +473,13 @@ function lsp_parent_dir(path: Str) -> String {
 /// for `String.as_ptr() as string`.  The reported `length()` excludes
 /// the trailing NUL, but the byte sits in the buffer immediately past
 /// the last logical byte.
-function build_cstring_buffer(s: Str) -> String {
+static build_cstring_buffer(s: Str) -> String {
     mut out: String = String::with_capacity(s.length() + 1);
     out.push(s);
     out.push_byte(0 as u8);
     out.truncate(s.length());                       // hide the NUL from length()
     return out;
+}
 }
 
 

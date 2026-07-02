@@ -47,51 +47,8 @@ public function handle_initialize(state: mut &ServerState, params: &JsonValue) -
     // the client only offers UTF-16, we leave the field unset (defaulting
     // to UTF-16) - positions on non-ASCII lines are then off by the usual
     // UTF-8/UTF-16 unit delta until real UTF-16 counting lands.
-    const advertise_utf8: boolean = client_offers_utf8(params);
-    return build_initialize_result(advertise_utf8);
-}
-
-/// True when the client's `initialize` params advertise support for the
-/// `utf-8` position encoding (`capabilities.general.positionEncodings`
-/// contains the string `"utf-8"`).  Missing/wrong-typed fields => false.
-function client_offers_utf8(params: &JsonValue) -> boolean {
-    match (params.get(Str::from_cstr("capabilities"))) {
-        Option::Some(caps) => {
-            match (caps.get(Str::from_cstr("general"))) {
-                Option::Some(general) => {
-                    match (general.get(Str::from_cstr("positionEncodings"))) {
-                        Option::Some(encs) => {
-                            match (encs) {
-                                JsonValue::Array(arr) => {
-                                    for (mut i: u64 = 0; i < arr.length(); i++) {
-                                        match (arr.get_ref(i)) {
-                                            Option::Some(e) => {
-                                                match (e.as_str()) {
-                                                    Option::Some(s) => {
-                                                        if (s.equals(&Str::from_cstr("utf-8"))) {
-                                                            return true;
-                                                        }
-                                                    }
-                                                    Option::None => { }
-                                                }
-                                            }
-                                            Option::None => { }
-                                        }
-                                    }
-                                    return false;
-                                }
-                                _ => { return false; }
-                            }
-                        }
-                        Option::None => { return false; }
-                    }
-                }
-                Option::None => { return false; }
-            }
-        }
-        Option::None => { return false; }
-    }
-    return false;
+    const advertise_utf8: boolean = LspCapabilities::client_offers_utf8(params);
+    return LspCapabilities::build_initialize_result(advertise_utf8);
 }
 
 /// Handle a `shutdown` request.  Per LSP spec the response body is
@@ -103,104 +60,123 @@ public function handle_shutdown(state: mut &ServerState) -> JsonValue {
 }
 
 
-// Capabilities
+// LspCapabilities - client-capability probing + InitializeResult building.
 
-/// Build the `InitializeResult` payload.  Only what we actually
-/// support today - adding a feature should grow this object, not a
-/// separate registration step.
-function build_initialize_result(advertise_utf8: boolean) -> JsonValue {
-    mut caps: JsonObject = JsonObject::new();
+type struct LspCapabilities {
 
-    // positionEncoding: only advertised when the client offered `utf-8`
-    // (see `client_offers_utf8`).  Advertising it unconditionally would
-    // break clients that speak only UTF-16, so the field is omitted in
-    // that case and the connection falls back to the UTF-16 default.
-    if (advertise_utf8) {
-        caps.insert(
-            String::from_str(Str::from_cstr("positionEncoding")),
-            JsonValue::String(String::from_str(Str::from_cstr("utf-8"))));
+    /// True when the client's `initialize` params advertise support for the
+    /// `utf-8` position encoding (`capabilities.general.positionEncodings`
+    /// contains the string `"utf-8"`).  Missing/wrong-typed fields => false.
+    static client_offers_utf8(params: &JsonValue) -> boolean {
+        match (params.get(Str::from_cstr("capabilities"))) {
+            Option::Some(caps) => {
+                match (caps.get(Str::from_cstr("general"))) {
+                    Option::Some(general) => {
+                        match (general.get(Str::from_cstr("positionEncodings"))) {
+                            Option::Some(encs) => {
+                                match (encs) {
+                                    JsonValue::Array(arr) => {
+                                        for (mut i: u64 = 0; i < arr.length(); i++) {
+                                            match (arr.get_ref(i)) {
+                                                Option::Some(e) => {
+                                                    match (e.as_str()) {
+                                                        Option::Some(s) => {
+                                                            if (s.equals(&Str::from_cstr("utf-8"))) {
+                                                                return true;
+                                                            }
+                                                        }
+                                                        Option::None => { }
+                                                    }
+                                                }
+                                                Option::None => { }
+                                            }
+                                        }
+                                        return false;
+                                    }
+                                    _ => { return false; }
+                                }
+                            }
+                            Option::None => { return false; }
+                        }
+                    }
+                    Option::None => { return false; }
+                }
+            }
+            Option::None => { return false; }
+        }
+        return false;
     }
 
-    // textDocumentSync: 1 = Full.  `did_change` treats the last
-    // `contentChanges` entry as a whole-document replacement, which
-    // matches what editors send under Full sync.  Advertising
-    // Incremental (2) without applying ranges to a stored buffer
-    // would discard everything except the last edit's snippet -
-    // the symptom users see as "save twice for the LSP to catch
-    // up".  Move to Incremental (with proper range application)
-    // when keystroke-by-keystroke recompile cost is the bottleneck.
-    caps.insert(
-        String::from_str(Str::from_cstr("textDocumentSync")),
-        JsonValue::Number(JsonNumber::Int(1 as i64)));
+    /// Build the `InitializeResult` payload.  Only what we actually
+    /// support today - adding a feature should grow this object, not a
+    /// separate registration step.
+    static build_initialize_result(advertise_utf8: boolean) -> JsonValue {
+        mut caps: JsonObject = JsonObject::new();
 
-    caps.insert(
-        String::from_str(Str::from_cstr("hoverProvider")),
-        JsonValue::Bool(true));
-    caps.insert(
-        String::from_str(Str::from_cstr("definitionProvider")),
-        JsonValue::Bool(true));
+        // positionEncoding: only advertised when the client offered `utf-8`
+        // (see `client_offers_utf8`).  Advertising it unconditionally would
+        // break clients that speak only UTF-16, so the field is omitted in
+        // that case and the connection falls back to the UTF-16 default.
+        if (advertise_utf8) {
+            caps.put("positionEncoding", JsonValue::from_cstr("utf-8"));
+        }
 
-    // Completion: trigger on `.` and `:` (member access + scope
-    // resolution).  Both are entered in Phase C; advertised here so
-    // editors enable the keystroke handler.
-    mut completion: JsonObject = JsonObject::new();
-    mut triggers: Array<JsonValue> = Array<JsonValue>::with_capacity(2);
-    triggers.push(JsonValue::String(String::from_str(Str::from_cstr("."))));
-    triggers.push(JsonValue::String(String::from_str(Str::from_cstr(":"))));
-    completion.insert(
-        String::from_str(Str::from_cstr("triggerCharacters")),
-        JsonValue::Array(triggers));
-    caps.insert(
-        String::from_str(Str::from_cstr("completionProvider")),
-        JsonValue::Object(completion));
+        // textDocumentSync: 1 = Full.  `did_change` treats the last
+        // `contentChanges` entry as a whole-document replacement, which
+        // matches what editors send under Full sync.  Advertising
+        // Incremental (2) without applying ranges to a stored buffer
+        // would discard everything except the last edit's snippet -
+        // the symptom users see as "save twice for the LSP to catch
+        // up".  Move to Incremental (with proper range application)
+        // when keystroke-by-keystroke recompile cost is the bottleneck.
+        caps.put("textDocumentSync", JsonValue::int_value(1 as i64));
 
-    // Semantic tokens: full-document only.  Legend (token types +
-    // modifiers) lives in `Lsp::Protocol::SemanticTokens`; the indexes
-    // emitted by the handler must match the order declared there.
-    caps.insert(
-        String::from_str(Str::from_cstr("semanticTokensProvider")),
-        Lsp::Protocol::SemanticTokens::provider_capability());
+        caps.put("hoverProvider", JsonValue::Bool(true));
+        caps.put("definitionProvider", JsonValue::Bool(true));
 
-    // Code actions: every diagnostic gets a "Show full Cryo
-    // diagnostic" lightbulb item; clicking it fires the
-    // `cryo.openRenderedDiagnostic` client-side command that opens
-    // a `cryo-diagnostic:` virtual document containing the rendered
-    // report.  Boolean form advertises support without a kind
-    // filter - the handler decides per-diagnostic whether to emit.
-    caps.insert(
-        String::from_str(Str::from_cstr("codeActionProvider")),
-        JsonValue::Bool(true));
+        // Completion: trigger on `.` and `:` (member access + scope
+        // resolution).  Both are entered in Phase C; advertised here so
+        // editors enable the keystroke handler.
+        mut completion: JsonObject = JsonObject::new();
+        mut triggers: Array<JsonValue> = Array<JsonValue>::with_capacity(2);
+        triggers.push(JsonValue::from_cstr("."));
+        triggers.push(JsonValue::from_cstr(":"));
+        completion.put("triggerCharacters", JsonValue::Array(triggers));
+        caps.put("completionProvider", JsonValue::Object(completion));
 
-    // Code lenses: render an inline "Show full diagnostic" link
-    // above every diagnostic line.  Same destination as the code
-    // action, just always visible - no Ctrl+. needed.
-    // `resolveProvider: false` keeps the lens fully populated up
-    // front; no separate `codeLens/resolve` round-trip.
-    mut code_lens: JsonObject = JsonObject::new();
-    code_lens.insert(
-        String::from_str(Str::from_cstr("resolveProvider")),
-        JsonValue::Bool(false));
-    caps.insert(
-        String::from_str(Str::from_cstr("codeLensProvider")),
-        JsonValue::Object(code_lens));
+        // Semantic tokens: full-document only.  Legend (token types +
+        // modifiers) lives in `Lsp::Protocol::SemanticTokens`; the indexes
+        // emitted by the handler must match the order declared there.
+        caps.put("semanticTokensProvider",
+                 SemanticTokensCodec::provider_capability());
 
-    mut result: JsonObject = JsonObject::new();
-    result.insert(
-        String::from_str(Str::from_cstr("capabilities")),
-        JsonValue::Object(caps));
+        // Code actions: every diagnostic gets a "Show full Cryo
+        // diagnostic" lightbulb item; clicking it fires the
+        // `cryo.openRenderedDiagnostic` client-side command that opens
+        // a `cryo-diagnostic:` virtual document containing the rendered
+        // report.  Boolean form advertises support without a kind
+        // filter - the handler decides per-diagnostic whether to emit.
+        caps.put("codeActionProvider", JsonValue::Bool(true));
 
-    // serverInfo block - purely cosmetic; lets clients log the
-    // language server's version next to its own.
-    mut info: JsonObject = JsonObject::new();
-    info.insert(
-        String::from_str(Str::from_cstr("name")),
-        JsonValue::String(String::from_str(Str::from_cstr("cryolsp"))));
-    info.insert(
-        String::from_str(Str::from_cstr("version")),
-        JsonValue::String(String::from_str(Str::from_cstr("0.1.0"))));
-    result.insert(
-        String::from_str(Str::from_cstr("serverInfo")),
-        JsonValue::Object(info));
+        // Code lenses: render an inline "Show full diagnostic" link
+        // above every diagnostic line.  Same destination as the code
+        // action, just always visible - no Ctrl+. needed.
+        // `resolveProvider: false` keeps the lens fully populated up
+        // front; no separate `codeLens/resolve` round-trip.
+        mut code_lens: JsonObject = JsonObject::new();
+        code_lens.put("resolveProvider", JsonValue::Bool(false));
+        caps.put("codeLensProvider", JsonValue::Object(code_lens));
 
-    return JsonValue::Object(result);
+        mut result: JsonObject = JsonObject::new();
+        result.put("capabilities", JsonValue::Object(caps));
+
+        // serverInfo block - purely cosmetic; lets clients log the
+        // language server's version next to its own.
+        mut info: JsonObject = JsonObject::new();
+        info.put("name", JsonValue::from_cstr("cryolsp"));
+        info.put("version", JsonValue::from_cstr("0.1.0"));
+        result.put("serverInfo", JsonValue::Object(info));
+
+        return JsonValue::Object(result);
+    }
 }
