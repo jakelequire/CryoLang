@@ -41,6 +41,48 @@ implement Cell {
 
 type struct Mixed { p: Probe; id: i32; }
 
+// A non-`Drop` owner (no `implement trait Drop`) whose fields are droppable:
+// the compiler synthesizes per-field drop glue, so a field moved out of a
+// straight-line local is tracked and skipped at scope exit (the Rust
+// partial-move model).  Contrast `Cell`/`Mixed` above (borrow/Copy paths).
+type struct ProbePair { a: Probe; b: Probe; }
+
+// Consumes its by-value owning argument (drops it exactly once).
+function sink(p: Probe) -> void {
+    mut y: Probe = p;
+    y.drop();
+}
+
+// ---- partial move out of a non-`Drop` owner: move one field --------------
+
+![test]
+function partial_move_nondrop_owner_one_field() -> Result<(), TestError> {
+    reset();
+    {
+        mut pr: ProbePair = ProbePair { a: Probe { tag: 1 }, b: Probe { tag: 2 } };
+        sink(pr.a);   // a moved out and dropped inside sink (count -> 1)
+        // pr.a is skipped at scope exit; pr.b is still live and dropped by
+        // per-field glue exactly once (count -> 2).
+    }
+    return expect_eq(count(), 2);
+}
+
+// ---- partial move out of a non-`Drop` owner: move ALL fields -------------
+
+![test]
+function partial_move_nondrop_owner_all_fields() -> Result<(), TestError> {
+    reset();
+    {
+        mut pr: ProbePair = ProbePair { a: Probe { tag: 1 }, b: Probe { tag: 2 } };
+        sink(pr.a);   // count -> 1
+        sink(pr.b);   // count -> 2
+        // BOTH fields moved: the owner's scope-exit drop must be a no-op
+        // (skipping both), so the total stays 2 - a double free would push
+        // it to 4 (and trip valgrind under `make valgrind-check`).
+    }
+    return expect_eq(count(), 2);
+}
+
 // ---- replace idiom through a borrowed receiver ---------------------------
 
 ![test]
