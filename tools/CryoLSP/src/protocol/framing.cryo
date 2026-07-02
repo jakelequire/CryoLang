@@ -32,12 +32,21 @@ type enum FrameError {
     InvalidContentLength;
     UnexpectedEof;
     HeaderTooLong;
+    MessageTooLarge;
 }
 
 /// Cap on a single header line.  Real clients emit ~25 bytes; bigger
 /// is almost certainly a stuck-pipe situation, and reading-until-LF
 /// would otherwise let a malicious peer pin our memory at infinity.
 const MAX_HEADER_LINE: u64 = 8192;
+
+/// Hard cap on a single message body.  LSP payloads are source
+/// documents plus JSON overhead; even a very large source file stays
+/// far below this.  A `Content-Length` beyond it is either corruption
+/// or a hostile peer trying to make us pre-allocate unbounded memory
+/// via `String::with_capacity(content_length)` below - so reject the
+/// frame instead of honoring the advertised size.
+const MAX_MESSAGE_SIZE: u64 = 536870912;                // 512 MiB
 
 const HEADER_CONTENT_LENGTH:     string = "Content-Length:";
 const HEADER_CONTENT_LENGTH_LEN: u64    = 15;
@@ -100,6 +109,14 @@ function read_message(reader: mut &Stdin) -> Result<Option<String>, FrameError> 
 
     if (!got_length) {
         return Result::Err(FrameError::MissingContentLength);
+    }
+
+    // Guard the allocation below: a hostile or corrupt `Content-Length`
+    // (e.g. near-u64::MAX) would otherwise ask the allocator for an
+    // absurd buffer and take the process down before a single body byte
+    // is read.
+    if (content_length > MAX_MESSAGE_SIZE) {
+        return Result::Err(FrameError::MessageTooLarge);
     }
 
     // Read exactly `content_length` raw bytes for the body.

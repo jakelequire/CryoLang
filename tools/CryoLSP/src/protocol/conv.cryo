@@ -11,6 +11,7 @@
 namespace Lsp::Protocol::Conv;
 
 import std::core::option;
+import std::core::intrinsics;
 import std::collections::str;
 import std::collections::string;
 import std::collections::array;
@@ -91,6 +92,11 @@ public function severity_int_from(sev: Severity) -> i64 {
 /// from sibling files at made-up positions in the active buffer.
 public function build_publish_params(uri: Str, diags: &Diagnostic[],
                                      cache: DiagRenderCache*) -> JsonValue {
+    // Open a publish cycle for this URI: drops the cache entries this
+    // URI left last time and arms `cache.insert` to track the ids about
+    // to be repopulated below (see DiagRenderCache).
+    cache.begin_publish(uri);
+
     mut fs_path_owned: String = uri_to_fs_path(uri);
     const fs_path: Str = fs_path_owned.as_str();
     // One renderer for the whole batch.  It caches source files across
@@ -337,12 +343,22 @@ function code_description_json() -> JsonValue {
 /// distinct ids with FNV-1a's collision profile (negligible for
 /// per-session use).  The id is URI-path-safe (hex digits only) so it
 /// embeds cleanly in a `cryo-diagnostic:/<id>.cryo-diag` URI.
-public function build_diag_id(diag: &Diagnostic) -> string {
+///
+/// Returns an OWNED `String`.  The raw `string`s that `ErrorCode::format`
+/// and `format` heap-allocate here are freed before returning; the
+/// previous `-> string` form leaked all three (code, key, hash) on every
+/// diagnostic of every publish, unbounded over a session.
+public function build_diag_id(diag: &Diagnostic) -> String {
     const code_str: string = diag.code.format();
     const key: string = format("%s:%u:%u:%s",
         diag.span.file, diag.span.start_line, diag.span.start_col, code_str);
     const h: u64 = hash_str(key);
-    return format("%016llx", h);
+    const hex: string = format("%016llx", h);
+    mut out: String = String::from_str(Str::from_cstr(hex));
+    intrinsics::free(code_str as void*);
+    intrinsics::free(key as void*);
+    intrinsics::free(hex as void*);
+    return out;
 }
 
 
@@ -459,9 +475,8 @@ public function diag_to_json(diag: &Diagnostic,
 
     // diagId: stable across publishes; the cache key + the value
     // the editor extension passes to `cryo/renderedDiagnostic`.
-    const id_cstr: string = build_diag_id(diag);
-    mut id_for_cache: String = String::new();
-    id_for_cache.push(id_cstr);
+    mut id: String = build_diag_id(diag);
+    mut id_for_cache: String = String::from_str(id.as_str());
     cache.insert(id_for_cache, rendered);
 
     // data: { "diagId": "<id>", "suggestions": [...] }.  diagId
@@ -469,8 +484,8 @@ public function diag_to_json(diag: &Diagnostic,
     // are serialized so the `textDocument/codeAction` handler can
     // build per-suggestion CodeAction entries with WorkspaceEdit
     // payloads (machine-applicable fixes auto-apply on click).
-    mut id_for_data: String = String::new();
-    id_for_data.push(id_cstr);
+    mut id_for_data: String = String::from_str(id.as_str());
+    id.drop();
     mut data_obj: JsonObject = JsonObject::new();
     data_obj.insert(String::from_str(Str::from_cstr("diagId")),
                     JsonValue::String(id_for_data));

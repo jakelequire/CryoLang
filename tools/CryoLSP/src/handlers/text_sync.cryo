@@ -31,7 +31,6 @@ import Lsp::Protocol::Framing;
 
 
 public function did_open(docs: mut &Docs, sessions: mut &SessionMap,
-                          writer: mut &Stdout, cache: DiagRenderCache*,
                           params: &JsonValue) -> void {
     match (params.get(Str::from_cstr("textDocument"))) {
         Option::Some(td) => {
@@ -45,13 +44,11 @@ public function did_open(docs: mut &Docs, sessions: mut &SessionMap,
                 version);
             docs.insert(doc);
 
-            const session_ptr: CompilerSession* = sessions.get_or_create(uri.as_str());
-            if (session_ptr != null) {
-                session_ptr.recompile(uri.as_str(), text.as_str());
-                Diagnostics::publish_for(writer, uri.as_str(),
-                                          session_ptr.context(), cache);
-                send_semantic_tokens_refresh(writer);
-            }
+            // Defer the compile+publish: mark the session dirty and queue
+            // the URI.  The flush (idle window in the server loop, or the
+            // next request via ensure_fresh) turns the whole burst into a
+            // single compile.
+            sessions.mark_dirty(uri.as_str());
 
             mut u: String = uri;     u.drop();
             mut t: String = text;    t.drop();
@@ -62,7 +59,6 @@ public function did_open(docs: mut &Docs, sessions: mut &SessionMap,
 
 
 public function did_change(docs: mut &Docs, sessions: mut &SessionMap,
-                            writer: mut &Stdout, cache: DiagRenderCache*,
                             params: &JsonValue) -> void {
     match (params.get(Str::from_cstr("textDocument"))) {
         Option::Some(td) => {
@@ -94,19 +90,45 @@ public function did_change(docs: mut &Docs, sessions: mut &SessionMap,
                 }
             }
 
-            const session_ptr: CompilerSession* = sessions.get_or_create(uri.as_str());
-            if (session_ptr != null) {
-                session_ptr.recompile(uri.as_str(), new_text.as_str());
-                Diagnostics::publish_for(writer, uri.as_str(),
-                                          session_ptr.context(), cache);
-                send_semantic_tokens_refresh(writer);
-            }
+            // Coalesce: flag the edit and enqueue; the compile is owed
+            // but not run here (see did_open).  This is what turns a
+            // per-keystroke whole-project recompile into one compile per
+            // editing pause.
+            sessions.mark_dirty(uri.as_str());
 
             mut u: String = uri;       u.drop();
             mut t: String = new_text;  t.drop();
         }
         Option::None => { }
     }
+}
+
+
+/// Compile + publish every document queued by `mark_dirty` since the
+/// last flush, then clear the queue.  Called by the server loop when the
+/// input stream goes idle (the edit burst has subsided).  Each URI is
+/// routed through `ensure_fresh`, so a document already recompiled by an
+/// interleaved request (hover/completion) isn't compiled twice - it just
+/// gets its diagnostics published.
+public function flush_pending(docs: &Docs, sessions: mut &SessionMap,
+                               writer: mut &Stdout, cache: DiagRenderCache*) -> void {
+    mut uris: Array<String> = sessions.take_pending();
+    const n: u64 = uris.length();
+    for (mut i: u64 = 0; i < n; i++) {
+        match (uris.get_ref(i)) {
+            Option::Some(uri_ptr) => {
+                const uri: Str = uri_ptr.as_str();
+                const session: CompilerSession* = sessions.ensure_fresh(docs, uri);
+                if (session != null && session.context() != null) {
+                    Diagnostics::publish_for(writer, uri,
+                                              session.context(), cache);
+                    send_semantic_tokens_refresh(writer);
+                }
+            }
+            Option::None => { }
+        }
+    }
+    uris.drop();
 }
 
 
@@ -117,6 +139,9 @@ public function did_close(docs: mut &Docs, sessions: mut &SessionMap,
             const uri: String = clone_string_field_or_empty(td, "uri");
             docs.remove(uri.as_str());
             sessions.remove(uri.as_str());
+            // Drop any queued-but-unflushed edit for this URI so a later
+            // flush doesn't resurrect a session for a closed document.
+            sessions.clear_pending_for(uri.as_str());
             // Clear stale squiggles in the editor.
             Diagnostics::publish_empty(writer, uri.as_str());
             mut u: String = uri;  u.drop();

@@ -26,6 +26,8 @@ import std::io::error;
 import std::io::traits;
 import std::json::value;
 import std::env;
+import std::ffi::libc;
+import std::ffi::syscall;
 
 import Lsp::Protocol::Framing;
 import Lsp::Protocol::JsonRpc;
@@ -72,8 +74,30 @@ type struct Server {
 
     /// Run until either `exit` or stdin closes.  Returns the process
     /// exit code (0 on a clean shutdown, 1 otherwise).
+    ///
+    /// Edit notifications (didOpen/didChange) don't compile inline; they
+    /// queue the URI (see `TextSync`).  When the queue is non-empty the
+    /// loop waits up to `DEBOUNCE_MS` for more input before flushing, so
+    /// a burst of keystrokes collapses into a single whole-project
+    /// compile instead of one per keystroke.  Interleaved requests still
+    /// see fresh state - each handler routes through `ensure_fresh`.
     run(mut &this) -> i32 {
         loop {
+            // Debounce window: only enter it while a compile is owed, so
+            // an otherwise-idle server still blocks indefinitely on the
+            // read below (no busy-loop) when there's nothing pending.
+            if (this.sessions.has_pending()) {
+                if (!poll_stdin_readable(DEBOUNCE_MS)) {
+                    // Input went quiet: the edit burst is over.  Compile
+                    // and publish the coalesced set, then loop.
+                    TextSync::flush_pending(&this.docs, &this.sessions,
+                                             &this.writer, &this.diag_cache);
+                    continue;
+                }
+                // Input is ready - fall through and read it, deferring the
+                // flush so a still-arriving burst keeps coalescing.
+            }
+
             match (Framing::read_message(&this.reader)) {
                 Result::Ok(maybe) => {
                     match (maybe) {
@@ -237,19 +261,29 @@ type struct Server {
 
                 if (method.equals(&Str::from_cstr("textDocument/didOpen"))) {
                     TextSync::did_open(&this.docs, &this.sessions,
-                                        &this.writer, &this.diag_cache,
                                         &notif.params);
                     return;
                 }
                 if (method.equals(&Str::from_cstr("textDocument/didChange"))) {
                     TextSync::did_change(&this.docs, &this.sessions,
-                                          &this.writer, &this.diag_cache,
                                           &notif.params);
                     return;
                 }
                 if (method.equals(&Str::from_cstr("textDocument/didClose"))) {
                     TextSync::did_close(&this.docs, &this.sessions,
                                          &this.writer, &notif.params);
+                    return;
+                }
+
+                // `$/cancelRequest`: the client asks us to abandon an
+                // in-flight request.  This server is synchronous - a
+                // request is fully computed before the next frame is even
+                // read - so by the time we could observe a cancellation
+                // the request has already been answered.  Per the spec a
+                // server that can't cancel simply responds normally, so
+                // this is a deliberate no-op (kept explicit rather than
+                // falling into the catch-all below for documentation).
+                if (method.equals(&Str::from_cstr("$/cancelRequest"))) {
                     return;
                 }
 
@@ -293,4 +327,55 @@ type struct Server {
         }
         body.drop();
     }
+}
+
+
+// Non-blocking stdin readiness - the debounce primitive.
+//
+// Edit-coalescing (see `Server::run`) needs to ask "is more input ready
+// within a short window?" without blocking forever.  POSIX uses poll(2)
+// with a timeout; Windows peeks the stdin pipe.  Both return true when a
+// byte is ready (read it next) and false on a lull (flush the coalesced
+// compiles).  The bindings are the stdlib's proven `libc` / `syscall`
+// ones - no new externs.
+
+/// Debounce window in milliseconds: how long to wait for the next
+/// keystroke before compiling.  Small enough to feel instant, large
+/// enough that continuous typing coalesces into one compile per pause.
+const DEBOUNCE_MS: i32 = 40 as i32;
+
+/// True when stdin (fd 0) has a byte ready within `timeout_ms`.  A poll
+/// error (EINTR, ...) or a timeout both report "not ready", so the caller
+/// flushes and re-enters the loop - it never hangs waiting on a lull.
+![target(unix)]
+function poll_stdin_readable(timeout_ms: i32) -> boolean {
+    mut pfd: libc::pollfd = libc::pollfd {
+        fd:      0 as i32,                          // stdin
+        events:  libc::POLLIN,
+        revents: 0 as i16,
+    };
+    const rc: i32 = libc::poll(&pfd, 1 as u64, timeout_ms);
+    return rc > 0 as i32;
+}
+
+/// Windows stdin is the client's pipe; `PeekNamedPipe` reports how many
+/// bytes are buffered without consuming them.  Poll it in 5 ms steps up
+/// to `timeout_ms`.  If the peek fails (stdin is a redirected file or a
+/// console rather than a pipe) fall back to "ready" so the reader is
+/// never starved of input.
+![target(windows)]
+function poll_stdin_readable(timeout_ms: i32) -> boolean {
+    const h: u8* = syscall::GetStdHandle(syscall::STD_INPUT_HANDLE);
+    mut waited: i32 = 0 as i32;
+    loop {
+        mut avail: u32 = 0 as u32;
+        const ok: i32 = syscall::PeekNamedPipe(
+            h, null, 0 as u32, null, &avail, null);
+        if (ok == 0 as i32)   { return true; }      // not a pipe: don't starve
+        if (avail > 0 as u32) { return true; }
+        if (waited >= timeout_ms) { return false; }
+        syscall::Sleep(5 as u32);
+        waited = waited + 5 as i32;
+    }
+    return false;
 }

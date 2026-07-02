@@ -39,7 +39,59 @@ public function handle_initialize(state: mut &ServerState, params: &JsonValue) -
     }
 
     state.initialized = true;
-    return build_initialize_result();
+
+    // Position-encoding negotiation.  LSP defaults `character` offsets to
+    // UTF-16 code units, but our line index and handlers count raw UTF-8
+    // bytes.  When the client advertises `utf-8` support we advertise it
+    // back, which makes the existing byte math correct on the wire.  If
+    // the client only offers UTF-16, we leave the field unset (defaulting
+    // to UTF-16) - positions on non-ASCII lines are then off by the usual
+    // UTF-8/UTF-16 unit delta until real UTF-16 counting lands.
+    const advertise_utf8: boolean = client_offers_utf8(params);
+    return build_initialize_result(advertise_utf8);
+}
+
+/// True when the client's `initialize` params advertise support for the
+/// `utf-8` position encoding (`capabilities.general.positionEncodings`
+/// contains the string `"utf-8"`).  Missing/wrong-typed fields => false.
+function client_offers_utf8(params: &JsonValue) -> boolean {
+    match (params.get(Str::from_cstr("capabilities"))) {
+        Option::Some(caps) => {
+            match (caps.get(Str::from_cstr("general"))) {
+                Option::Some(general) => {
+                    match (general.get(Str::from_cstr("positionEncodings"))) {
+                        Option::Some(encs) => {
+                            match (encs) {
+                                JsonValue::Array(arr) => {
+                                    for (mut i: u64 = 0; i < arr.length(); i++) {
+                                        match (arr.get_ref(i)) {
+                                            Option::Some(e) => {
+                                                match (e.as_str()) {
+                                                    Option::Some(s) => {
+                                                        if (s.equals(&Str::from_cstr("utf-8"))) {
+                                                            return true;
+                                                        }
+                                                    }
+                                                    Option::None => { }
+                                                }
+                                            }
+                                            Option::None => { }
+                                        }
+                                    }
+                                    return false;
+                                }
+                                _ => { return false; }
+                            }
+                        }
+                        Option::None => { return false; }
+                    }
+                }
+                Option::None => { return false; }
+            }
+        }
+        Option::None => { return false; }
+    }
+    return false;
 }
 
 /// Handle a `shutdown` request.  Per LSP spec the response body is
@@ -56,8 +108,18 @@ public function handle_shutdown(state: mut &ServerState) -> JsonValue {
 /// Build the `InitializeResult` payload.  Only what we actually
 /// support today - adding a feature should grow this object, not a
 /// separate registration step.
-function build_initialize_result() -> JsonValue {
+function build_initialize_result(advertise_utf8: boolean) -> JsonValue {
     mut caps: JsonObject = JsonObject::new();
+
+    // positionEncoding: only advertised when the client offered `utf-8`
+    // (see `client_offers_utf8`).  Advertising it unconditionally would
+    // break clients that speak only UTF-16, so the field is omitted in
+    // that case and the connection falls back to the UTF-16 default.
+    if (advertise_utf8) {
+        caps.insert(
+            String::from_str(Str::from_cstr("positionEncoding")),
+            JsonValue::String(String::from_str(Str::from_cstr("utf-8"))));
+    }
 
     // textDocumentSync: 1 = Full.  `did_change` treats the last
     // `contentChanges` entry as a whole-document replacement, which
