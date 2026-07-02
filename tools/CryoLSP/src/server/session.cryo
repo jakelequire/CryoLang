@@ -34,6 +34,7 @@ import std::core::drop;
 import std::core::intrinsics;
 import std::collections::str;
 import std::collections::string;
+import std::collections::array;
 import std::collections::hashmap;
 
 import Compiler::CompileMode;
@@ -85,16 +86,24 @@ type struct CompilerSession {
     /// reset the shared AST arena and `ctx` is dangling (see the module
     /// note on `g_compile_epoch`).  Zero until the first `recompile()`.
     epoch:       u64;
+    /// Set when the editor buffer changed since `ctx` was last built, so
+    /// a compile is owed.  The per-keystroke recompile is coalesced: edits
+    /// only flip this flag (and enqueue the URI in `SessionMap::pending`);
+    /// the actual recompile happens either on the next request that needs
+    /// the session (`ensure_fresh`) or when the edit burst subsides
+    /// (`flush_pending`).  Cleared at the end of every `recompile()`.
+    needs_recompile: boolean;
 
     static new() -> CompilerSession {
         return CompilerSession {
-            instance:    CompilerInstance::new(CompilerConfig::default()),
-            ctx:         null,
-            path_buf:    String::new(),
-            content_buf: String::new(),
-            config_buf:  String::new(),
-            stdlib_buf:  String::new(),
-            epoch:       0 as u64,
+            instance:        CompilerInstance::new(CompilerConfig::default()),
+            ctx:             null,
+            path_buf:        String::new(),
+            content_buf:     String::new(),
+            config_buf:      String::new(),
+            stdlib_buf:      String::new(),
+            epoch:           0 as u64,
+            needs_recompile: false,
         };
     }
 
@@ -154,8 +163,10 @@ type struct CompilerSession {
             Box<CompilationContext>::new(
                 CompilationContext::new(CompileMode::Lsp, path_cstr));
         this.ctx = ctx_box.leak();
-        // Mark this session as backed by the arena as of this epoch.
+        // Mark this session as backed by the arena as of this epoch, and
+        // clear the pending-edit flag: `ctx` now reflects `content`.
         this.epoch = g_compile_epoch;
+        this.needs_recompile = false;
 
         if (this.config_buf.length() == 0) {
             // No project context - fall back to single-file mode.  The
@@ -180,11 +191,74 @@ type struct CompilerSession {
 /// the contained session (recompile) without copying it out.
 type struct SessionMap {
     by_uri: HashMap<String, CompilerSession>;
+    /// URIs with edits owed a compile+publish, awaiting the next
+    /// `flush_pending`.  Deduped: a burst of edits to one file adds one
+    /// entry.  Small - bounded by the number of open documents.
+    pending: Array<String>;
 
     static new() -> SessionMap {
         return SessionMap {
-            by_uri: HashMap<String, CompilerSession>::new(),
+            by_uri:  HashMap<String, CompilerSession>::new(),
+            pending: Array<String>::new(),
         };
+    }
+
+    /// True when at least one document is awaiting a coalesced compile.
+    has_pending(&this) -> boolean {
+        return this.pending.length() > 0 as u64;
+    }
+
+    /// Record that `uri`'s buffer changed: flip the session's
+    /// `needs_recompile` flag (creating the session if needed) and
+    /// enqueue the URI for the next flush.  Does NOT compile - that is
+    /// deferred so a burst of keystrokes collapses to a single compile.
+    mark_dirty(mut &this, uri: Str) -> void {
+        const session: CompilerSession* = this.get_or_create(uri);
+        if (session != null) { session.needs_recompile = true; }
+        if (!this.pending_contains(uri)) {
+            this.pending.push(String::from_str(uri));
+        }
+    }
+
+    /// Whether `uri` is already queued (linear scan; `pending` is tiny).
+    pending_contains(&this, uri: Str) -> boolean {
+        for (mut i: u64 = 0; i < this.pending.length(); i++) {
+            match (this.pending.get_ref(i)) {
+                Option::Some(p) => {
+                    if (p.as_str().equals(&uri)) { return true; }
+                }
+                Option::None => { }
+            }
+        }
+        return false;
+    }
+
+    /// Take ownership of the pending set and reset it to empty.  The
+    /// caller drains it (recompile + publish each URI) and drops it.
+    take_pending(mut &this) -> Array<String> {
+        mut out: Array<String> = this.pending;
+        this.pending = Array<String>::new();
+        return out;
+    }
+
+    /// Drop `uri` from the pending set (used on didClose so a flush
+    /// doesn't try to compile a document that's been closed).
+    clear_pending_for(mut &this, uri: Str) -> void {
+        mut kept: Array<String> = Array<String>::new();
+        const n: u64 = this.pending.length();
+        for (mut i: u64 = 0; i < n; i++) {
+            match (this.pending.get_ref(i)) {
+                Option::Some(p) => {
+                    if (p.as_str().equals(&uri)) {
+                        continue;                    // drop this one
+                    }
+                    kept.push(String::from_str(p.as_str()));
+                }
+                Option::None => { }
+            }
+        }
+        this.pending.drop();
+        this.pending = kept;
     }
 
     /// Insert a fresh session for `uri`.  If one already exists it is
@@ -236,11 +310,13 @@ type struct SessionMap {
         const session: CompilerSession* = this.get_or_create(uri);
         if (session == null) { return null; }
 
-        if (session.ctx != null && session.epoch == g_compile_epoch) {
-            return session;                          // still arena-live
+        if (session.ctx != null && session.epoch == g_compile_epoch
+                && !session.needs_recompile) {
+            return session;                          // still arena-live + up to date
         }
 
-        // Stale or never compiled: rebuild from the live editor buffer.
+        // Stale, never compiled, or edited since last compile: rebuild
+        // from the live editor buffer (this also clears needs_recompile).
         match (docs.get(uri)) {
             Option::Some(doc) => {
                 session.recompile(uri, doc.text.as_str());
@@ -416,5 +492,6 @@ implement trait Drop for CompilerSession {
 implement trait Drop for SessionMap {
     drop(mut &this) -> void {
         this.by_uri.drop();
+        this.pending.drop();
     }
 }

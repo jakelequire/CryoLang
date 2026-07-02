@@ -8,10 +8,16 @@
 ///! request - opening it in a virtual document tab, which is the
 ///! rust-analyzer-style "diagnostics view" UX.
 ///!
-///! Cache grows for the LSP-process lifetime: each entry is a small
-///! string and a typical editing session accumulates a few thousand
-///! at most.  Eviction can land later when long-lived sessions
-///! justify it.
+///! Eviction is keyed off the publish cycle.  Diagnostic ids are a hash
+///! of (file, line, col, code), so an edit that shifts positions mints
+///! *new* ids for the same underlying diagnostics - without eviction the
+///! `by_id` map grows without bound over a long editing session.  The map
+///! key is opaque (can't be filtered by URI after the fact), so the cache
+///! tracks, per URI, the exact ids inserted during that URI's last
+///! publish; `begin_publish(uri)` drops that prior set before the next
+///! publish repopulates it.  Steady-state size is therefore bounded by
+///! the number of live diagnostics across open documents, not by edit
+///! count.
 
 namespace Lsp::Server::DiagRenderCache;
 
@@ -19,23 +25,84 @@ import std::core::option;
 import std::core::drop;
 import std::collections::str;
 import std::collections::string;
+import std::collections::array;
 import std::collections::hashmap;
 
 
 type struct DiagRenderCache {
     by_id: HashMap<String, String>;
+    /// Ids inserted during each URI's most recent publish, so the next
+    /// publish for that URI can evict them before repopulating.
+    ids_by_uri: HashMap<String, Array<String>>;
+    /// The URI whose publish is currently in progress (set by
+    /// `begin_publish`).  `insert` appends each id it stores to this
+    /// URI's list.  Empty when no publish is active - `insert` then
+    /// stores without tracking (degrades to the old grow-forever
+    /// behaviour rather than misattributing the id).
+    current_uri: String;
 
     static new() -> DiagRenderCache {
         return DiagRenderCache {
-            by_id: HashMap<String, String>::new(),
+            by_id:       HashMap<String, String>::new(),
+            ids_by_uri:  HashMap<String, Array<String>>::new(),
+            current_uri: String::new(),
         };
+    }
+
+    /// Begin a publish cycle for `uri`: evict every cache entry left by
+    /// this URI's previous publish, then arm `insert` to track the ids
+    /// of the entries about to be (re)inserted.  Call once at the top of
+    /// each `publishDiagnostics` build for a URI.
+    begin_publish(mut &this, uri: Str) -> void {
+        const key: String = String::from_str(uri);
+
+        // Evict the ids from this URI's prior publish.
+        match (this.ids_by_uri.remove(&key)) {
+            Option::Some(prev) => {
+                mut ids: Array<String> = prev;
+                const cnt: u64 = ids.length();
+                for (mut i: u64 = 0; i < cnt; i++) {
+                    match (ids.get_ref(i)) {
+                        Option::Some(id_ptr) => {
+                            match (this.by_id.remove(id_ptr)) {
+                                Option::Some(v) => { mut vv: String = v; vv.drop(); }
+                                Option::None    => { }
+                            }
+                        }
+                        Option::None => { }
+                    }
+                }
+                ids.drop();
+            }
+            Option::None => { }
+        }
+
+        // Fresh, empty id-list for the publish about to run.
+        this.ids_by_uri.insert(String::from_str(uri), Array<String>::new());
+
+        // Arm insert() to route ids into this URI's list.
+        this.current_uri.drop();
+        this.current_uri = String::from_str(uri);
+
+        mut k: String = key;
+        k.drop();
     }
 
     /// Store the rendered text for `id`.  Both arguments are consumed.
     /// A pre-existing entry under the same id is dropped - diagnostic
     /// ids are stable across publishes of the *same* diagnostic, so the
-    /// replacement always carries the freshest rendering.
+    /// replacement always carries the freshest rendering.  When a publish
+    /// is active (`begin_publish` was called), `id` is also recorded
+    /// under the current URI so the next publish can evict it.
     insert(mut &this, id: String, text: String) -> void {
+        if (this.current_uri.length() > 0) {
+            match (this.ids_by_uri.get_ref(&this.current_uri)) {
+                Option::Some(list_ptr) => {
+                    list_ptr.push(String::from_str(id.as_str()));
+                }
+                Option::None => { }
+            }
+        }
         match (this.by_id.insert(id, text)) {
             Option::Some(prev) => { mut p: String = prev; p.drop(); }
             Option::None       => { }
@@ -64,5 +131,7 @@ type struct DiagRenderCache {
 implement trait Drop for DiagRenderCache {
     drop(mut &this) -> void {
         this.by_id.drop();
+        this.ids_by_uri.drop();
+        this.current_uri.drop();
     }
 }
