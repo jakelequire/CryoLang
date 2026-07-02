@@ -209,6 +209,29 @@ type struct GenericRegistry {
     trait_impls:      Pair<u64, ImplBlockNode*>[];  // .first = key, .second = impl block
     trait_impl_index:   HashMap<u64, i64>;
 
+    // -- Precise (collision-proof) trait-impl index, keyed by TYPE IDENTITY --
+    // The bare-name `trait_impl_index` above collides when a user type shares a
+    // stdlib type's leaf (e.g. a local `Pair` vs stdlib `Pair<A,B>`), because
+    // both map to the same `(trait, "Pair")` key.  This index instead keys on
+    // `(trait_name.id << 32) | (base_type_id & 0xFFFFFFFF)` where `base_type_id`
+    // is the target's canonical BASE arena type id (an instantiation's template,
+    // via `InstantiatedType.generic_base`) - a module-independent identity that
+    // distinguishes same-leaf types.  Values are indices into `trait_impls`
+    // (the block table is shared).  Populated at the authoritative,
+    // import-resolved registration site (type_resolution R1) whenever the
+    // target resolves to a named aggregate.  Consulted by the ownership Drop/Copy
+    // queries (ownership.cryo), which have the target TypeRef and can reproduce
+    // the same base id.  SAFE-BIAS: a `(trait, leaf)` that was NOT precisely
+    // registered (`precise_trait_leaf` below is false for it) falls back to the
+    // bare index, so a Drop impl can never be MISSED (the fatal direction).
+    trait_impl_typeid_index: HashMap<u64, i64>;
+    // Set of `(trait_name.id, leaf_name.id)` bare keys that HAVE at least one
+    // precise typeid registration.  When a lookup's (trait, leaf) is in this
+    // set, the typeid index is authoritative (a typeid miss is a genuine
+    // negative - this is how the collision false-positive is removed); when it
+    // is absent, lookups fall back to the bare `trait_impl_index`.
+    precise_trait_leaf: HashMap<u64, i64>;
+
     // -- Trait-impl coherence index --
     // Separate from `trait_impls` because that table is keyed on bare,
     // parser-captured names and is written under several keys per node
@@ -278,6 +301,8 @@ type struct GenericRegistry {
             demand:            [],
             trait_impls:       [],
             trait_impl_index:  HashMap<u64, i64>::new(),
+            trait_impl_typeid_index: HashMap<u64, i64>::new(),
+            precise_trait_leaf:      HashMap<u64, i64>::new(),
             coherence_records: [],
             coherence_index:   HashMap<u64, i64>::new(),
             trait_decl_index:  HashMap<u32, i64>::new(),
@@ -552,6 +577,56 @@ type struct GenericRegistry {
             return this.trait_impls[opt.unwrap()].second;
         }
         return null;
+    }
+
+    /// Pack `(trait_name, base_type_id)` for the precise typeid index.  Same
+    /// layout as `trait_impl_key` but with the target's canonical base arena
+    /// type id in the low 32 bits instead of a bare name id.
+    static trait_impl_typeid_key(trait_name: SymbolStr, base_type_id: u64) -> u64 {
+        return ((trait_name.id as u64) << 32) | (base_type_id & 0xFFFFFFFF);
+    }
+
+    /// Register a trait impl under the PRECISE (trait, base-type-id) key, and
+    /// mark its (trait, leaf) bare pair as precisely-registered so lookups know
+    /// the typeid index is authoritative for that leaf.  `leaf` MUST be the same
+    /// bare leaf the lookup side derives from the target type (i.e.
+    /// `OwnershipQuery::registry_name_of`), or the precise/fallback decision
+    /// would diverge.  No-op when `base_type_id == 0` (target not a resolvable
+    /// named aggregate) - such impls stay bare-only and are found via fallback.
+    register_trait_impl_typed(mut &this, trait_name: SymbolStr, leaf: SymbolStr,
+                              base_type_id: u64, block: ImplBlockNode*) -> void {
+        if (block == null) { return; }
+        if (!trait_name.is_valid() || base_type_id == 0) { return; }
+        const key: u64 = GenericRegistry::trait_impl_typeid_key(trait_name, base_type_id);
+        const existing: Option<i64> = this.trait_impl_typeid_index.get(&key);
+        if (existing.is_some()) {
+            // Latest impl wins (matches register_trait_impl's overwrite policy).
+            this.trait_impls[existing.unwrap()].second = block;
+        } else {
+            const idx: i64 = this.trait_impls.length;
+            this.trait_impls.push(Pair::new(key, block));
+            this.trait_impl_typeid_index.insert(key, idx);
+        }
+        if (leaf.is_valid()) {
+            const lk: u64 = GenericRegistry::trait_impl_key(trait_name, leaf);
+            this.precise_trait_leaf.insert(lk, 1);
+        }
+    }
+
+    /// True when a PRECISE impl is registered for `(trait, base_type_id)`.
+    has_trait_impl_typed(&this, trait_name: SymbolStr, base_type_id: u64) -> boolean {
+        if (!trait_name.is_valid() || base_type_id == 0) { return false; }
+        const key: u64 = GenericRegistry::trait_impl_typeid_key(trait_name, base_type_id);
+        return this.trait_impl_typeid_index.get(&key).is_some();
+    }
+
+    /// True when `(trait, leaf)` had at least one precise typeid registration,
+    /// so the typeid index is authoritative for that leaf (a miss is a genuine
+    /// negative, not a reason to fall back to the colliding bare index).
+    is_precise_trait_leaf(&this, trait_name: SymbolStr, leaf: SymbolStr) -> boolean {
+        if (!trait_name.is_valid() || !leaf.is_valid()) { return false; }
+        const lk: u64 = GenericRegistry::trait_impl_key(trait_name, leaf);
+        return this.precise_trait_leaf.get(&lk).is_some();
     }
 
     /// Number of registered trait impls. Useful for debug prints and tests.
