@@ -76,17 +76,19 @@ public function handle_definition(docs: &Docs, sessions: mut &SessionMap,
     const character: u32 = json_u32_field(pos, "character");
 
     // -- Find the session + module + AST for this URI -----------------
-    const session_opt: Option<CompilerSession*> = sessions.get(uri);
-    if (!session_opt.is_some()) { return JsonValue::Null; }
-    const session: CompilerSession* = session_opt.unwrap_or(null);
+    // See hover.cryo: recompile-if-stale to avoid walking a ctx whose
+    // shared-arena memory was recycled by another document's compile.
+    const session: CompilerSession* = sessions.ensure_fresh(docs, uri);
     if (session == null) { return JsonValue::Null; }
     const ctx: CompilationContext* = session.context();
     if (ctx == null) { return JsonValue::Null; }
 
-    const fs_path: Str = Conv::uri_to_fs_path(uri);
+    mut fs_path_owned: String = Conv::uri_to_fs_path(uri);
+    const fs_path: Str = fs_path_owned.as_str();
     mut path_buf: String = String::with_capacity(fs_path.length() + 1);
     path_buf.push(fs_path);
-    path_buf.push(0 as u8);
+    path_buf.push_byte(0 as u8);
+    fs_path_owned.drop();
     const path_buf_len: u64 = path_buf.length() - 1;
     path_buf.truncate(path_buf_len);
     const path_cstr: string = path_buf.as_ptr() as string;
@@ -526,9 +528,8 @@ function drop_path_components(path: string, n: i64) -> string {
 /// file isn't loaded so we can't pinpoint its namespace decl, but
 /// can still get the user to the right file.
 function build_file_start_location(fs_path: string) -> JsonValue {
-    mut uri_buf: String = String::with_capacity(strlen(fs_path) + FILE_SCHEME_LEN);
-    uri_buf.push(FILE_SCHEME);
-    uri_buf.push(fs_path);
+    // Shared builder handles the Windows `file:///C:/...` drive form.
+    mut uri_buf: String = Conv::uri_string_from_fs_path(fs_path);
 
     const range: Range = Range::new(Position::new(0, 0), Position::new(0, 0));
     const loc: Location = Location { uri: uri_buf, range: range };
@@ -615,9 +616,9 @@ const FILE_SCHEME_LEN: u64    = 7;
 /// every span with the source it came from).  Reconstructs the URI
 /// by prepending `file://` - the inverse of `uri_to_fs_path`.
 function build_location_json(span: SourceSpan) -> JsonValue {
-    mut uri_buf: String = String::with_capacity(strlen(span.file) + FILE_SCHEME_LEN);
-    uri_buf.push(FILE_SCHEME);
-    uri_buf.push(span.file);
+    // Reconstruct the URI via the shared builder so Windows drive paths
+    // get the `file:///C:/...` form (see Conv::uri_string_from_fs_path).
+    mut uri_buf: String = Conv::uri_string_from_fs_path(span.file);
 
     const range: Range = range_from_span(span);
     const loc: Location = Location { uri: uri_buf, range: range };

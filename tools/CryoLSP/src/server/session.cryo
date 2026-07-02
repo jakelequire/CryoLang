@@ -41,6 +41,24 @@ import Compiler::CompilationContext;
 import Compiler::Instance;
 
 import Lsp::Protocol::Conv;
+import Lsp::Server::Docs;
+
+
+// Compile epoch.
+//
+// The compiler routes every session's AST nodes (and, while active, its
+// container heap) through ONE process-global bump arena that is `reset()`
+// at the start of each compile (see `codegen/ast_arena.cryo`).  Because
+// the arena is shared, recompiling document A recycles the arena memory
+// that document B's still-cached `ctx` points into - a cross-document
+// use-after-free the moment a handler for B walks B's now-dangling AST.
+//
+// `g_compile_epoch` is a monotonic counter bumped by every `recompile()`.
+// Each session records the epoch its `ctx` was built at; a session whose
+// `epoch` is behind the global counter has had the arena reset out from
+// under it and MUST be recompiled before its `ctx` is read again.  See
+// `SessionMap::ensure_fresh`.
+mut g_compile_epoch: u64 = 0;
 
 
 type struct CompilerSession {
@@ -62,6 +80,11 @@ type struct CompilerSession {
     /// for the session because `instance.config.stdlib_path_override`
     /// is a `string` (raw `char*`) pointer into this buffer.
     stdlib_buf:  String;
+    /// The `g_compile_epoch` value at which `ctx` was last built.  When
+    /// it lags the global counter, another document's recompile has
+    /// reset the shared AST arena and `ctx` is dangling (see the module
+    /// note on `g_compile_epoch`).  Zero until the first `recompile()`.
+    epoch:       u64;
 
     static new() -> CompilerSession {
         return CompilerSession {
@@ -71,6 +94,7 @@ type struct CompilerSession {
             content_buf: String::new(),
             config_buf:  String::new(),
             stdlib_buf:  String::new(),
+            epoch:       0 as u64,
         };
     }
 
@@ -86,9 +110,16 @@ type struct CompilerSession {
     /// and either drives the whole-project compile (preferred) or
     /// falls back to single-file mode if no cryoconfig is reachable.
     recompile(mut &this, uri: Str, content: Str) -> CompilationResult {
-        // Editor-side `uri` is `file://<absolute-path>`; strip the
-        // scheme to get a filesystem path the loader will recognise.
-        const fs_path: Str = Conv::uri_to_fs_path(uri);
+        // Claim a new compile epoch.  This recompile is about to reset the
+        // shared AST arena, so every OTHER session's `ctx` becomes stale
+        // as of now; stamping `this.epoch` below marks THIS session as the
+        // one the arena currently backs.
+        g_compile_epoch = g_compile_epoch + 1 as u64;
+
+        // Editor-side `uri` is `file://<absolute-path>` (percent-encoded);
+        // decode + normalize to a real filesystem path the loader accepts.
+        mut fs_path_owned: String = Conv::uri_to_fs_path(uri);
+        const fs_path: Str = fs_path_owned.as_str();
 
         // Replace backing buffers.  The previous `ctx` (if any) holds
         // raw `string` pointers into the OLD buffers, but we leak the
@@ -102,6 +133,7 @@ type struct CompilerSession {
         this.content_buf = build_cstring_buffer(content);
         this.config_buf  = discover_project_cryoconfig(fs_path);
         this.stdlib_buf  = discover_stdlib_root(fs_path);
+        fs_path_owned.drop();                    // fs_path (borrow) unused below
 
         // Wire the discovered stdlib path through to the compiler's
         // `--stdlib=` equivalent.  If `stdlib_buf` is empty the
@@ -122,6 +154,8 @@ type struct CompilerSession {
             Box<CompilationContext>::new(
                 CompilationContext::new(CompileMode::Lsp, path_cstr));
         this.ctx = ctx_box.leak();
+        // Mark this session as backed by the arena as of this epoch.
+        this.epoch = g_compile_epoch;
 
         if (this.config_buf.length() == 0) {
             // No project context - fall back to single-file mode.  The
@@ -187,6 +221,38 @@ type struct SessionMap {
         }
     }
 
+    /// Return the session for `uri` with a `ctx` that is guaranteed
+    /// valid to walk RIGHT NOW.  If the session was never compiled, or a
+    /// different document has recompiled since (bumping `g_compile_epoch`
+    /// and resetting the shared AST arena), the document is recompiled
+    /// from its current editor buffer first.  Read handlers must go
+    /// through this rather than `get()` + `context()` to avoid walking a
+    /// ctx whose arena memory was recycled by another document's compile.
+    ///
+    /// Returns `null` only if the session can't be created.  A non-null
+    /// return may still have a null `context()` when no buffer is open
+    /// for `uri` to recompile from - callers already null-check ctx.
+    ensure_fresh(mut &this, docs: &Docs, uri: Str) -> CompilerSession* {
+        const session: CompilerSession* = this.get_or_create(uri);
+        if (session == null) { return null; }
+
+        if (session.ctx != null && session.epoch == g_compile_epoch) {
+            return session;                          // still arena-live
+        }
+
+        // Stale or never compiled: rebuild from the live editor buffer.
+        match (docs.get(uri)) {
+            Option::Some(doc) => {
+                session.recompile(uri, doc.text.as_str());
+            }
+            Option::None => {
+                // No open buffer to compile from; leave ctx as-is (the
+                // caller null-checks it).
+            }
+        }
+        return session;
+    }
+
     remove(mut &this, uri: Str) -> boolean {
         const key: String = String::from_str(uri);
         match (this.by_uri.remove(&key)) {
@@ -229,7 +295,7 @@ function discover_stdlib_root(fs_path: Str) -> String {
         mut probe: String = String::with_capacity(dir.length() + 16);
         probe.push(dir.as_str());
         probe.push("/stdlib/lib.cryo");
-        probe.push(0 as u8);
+        probe.push_byte(0 as u8);
         const probe_len: u64 = probe.length() - 1;
         probe.truncate(probe_len);
         const p_cstr: string = probe.as_ptr() as string;
@@ -239,7 +305,7 @@ function discover_stdlib_root(fs_path: Str) -> String {
             mut out: String = String::with_capacity(dir.length() + 8);
             out.push(dir.as_str());
             out.push("/stdlib");
-            out.push(0 as u8);
+            out.push_byte(0 as u8);
             const out_len: u64 = out.length() - 1;
             out.truncate(out_len);
             probe.drop();
@@ -273,7 +339,7 @@ function discover_project_cryoconfig(fs_path: Str) -> String {
         mut candidate: String = String::with_capacity(dir.length() + 12);
         candidate.push(dir.as_str());
         candidate.push("/cryoconfig");
-        candidate.push(0 as u8);
+        candidate.push_byte(0 as u8);
         const cand_len: u64 = candidate.length() - 1;
         candidate.truncate(cand_len);
         const c_cstr: string = candidate.as_ptr() as string;
@@ -325,7 +391,7 @@ function lsp_parent_dir(path: Str) -> String {
 function build_cstring_buffer(s: Str) -> String {
     mut out: String = String::with_capacity(s.length() + 1);
     out.push(s);
-    out.push(0 as u8);
+    out.push_byte(0 as u8);
     out.truncate(s.length());                       // hide the NUL from length()
     return out;
 }

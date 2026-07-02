@@ -91,7 +91,8 @@ public function severity_int_from(sev: Severity) -> i64 {
 /// from sibling files at made-up positions in the active buffer.
 public function build_publish_params(uri: Str, diags: &Diagnostic[],
                                      cache: DiagRenderCache*) -> JsonValue {
-    const fs_path: Str = uri_to_fs_path(uri);
+    mut fs_path_owned: String = uri_to_fs_path(uri);
+    const fs_path: Str = fs_path_owned.as_str();
     // One renderer for the whole batch.  It caches source files across
     // diagnostics, so reusing it holds each publish to a single read per
     // file.  `plain()` config: no ANSI, no leading rule - the rendered
@@ -103,6 +104,7 @@ public function build_publish_params(uri: Str, diags: &Diagnostic[],
             arr.push(diag_to_json(&diags[i], &renderer, cache));
         }
     }
+    fs_path_owned.drop();
 
     mut params: JsonObject = JsonObject::new();
     params.insert(
@@ -120,16 +122,78 @@ public function build_publish_params(uri: Str, diags: &Diagnostic[],
 const FILE_SCHEME:     string = "file://";
 const FILE_SCHEME_LEN: u64    = 7;
 
-/// Strip the `file://` scheme from a URI to get the absolute
-/// filesystem path the compiler stores in `SourceSpan::file`.
-public function uri_to_fs_path(uri: Str) -> Str {
+/// Convert a `file://` URI to the absolute filesystem path the compiler
+/// stores in `SourceSpan::file`.  Three steps:
+///   1. Strip the `file://` scheme.
+///   2. Percent-decode (`%3A` -> `:`, `%20` -> ` `, ...).  Editors send
+///      URIs percent-encoded; on Windows the drive colon arrives as
+///      `%3A` (`file:///c%3A/...`), so skipping this leaves an un-openable
+///      path and every stdlib / cryoconfig / module lookup fails.
+///   3. Platform-normalize (Windows: drop the leading `/` before a drive
+///      letter so `/C:/x` becomes `C:/x`; POSIX: unchanged).
+/// Returns an OWNED String - callers append their own NUL when they need
+/// a C string, exactly as before.
+public function uri_to_fs_path(uri: Str) -> String {
+    mut start: u64 = 0;
     if (uri.length() >= FILE_SCHEME_LEN) {
         const prefix: Str = uri.sub_bytes(0, FILE_SCHEME_LEN);
         if (prefix.equals(&Str::from_cstr(FILE_SCHEME))) {
-            return uri.sub_bytes(FILE_SCHEME_LEN, uri.length());
+            start = FILE_SCHEME_LEN;
         }
     }
-    return uri;
+
+    const ptr: u8* = uri.as_ptr();
+    const len: u64 = uri.length();
+    mut out: String = String::with_capacity(len - start);
+    mut i: u64 = start;
+    while (i < len) {
+        const b: u8 = ptr[i];
+        if (b == 37 && i + 2 < len) {                        // '%'
+            const hi: i32 = hex_nibble(ptr[i + 1]);
+            const lo: i32 = hex_nibble(ptr[i + 2]);
+            if (hi >= 0 && lo >= 0) {
+                out.push_byte(((hi * 16) + lo) as u8);
+                i = i + 3;
+                continue;
+            }
+        }
+        out.push_byte(b);
+        i = i + 1;
+    }
+    return normalize_fs_path(out);
+}
+
+/// Value of a single hex digit, or -1 if the byte isn't `[0-9A-Fa-f]`.
+function hex_nibble(b: u8) -> i32 {
+    if (b >= 48 && b <= 57)  { return (b - 48) as i32; }        // '0'-'9'
+    if (b >= 65 && b <= 70)  { return (b - 65 + 10) as i32; }   // 'A'-'F'
+    if (b >= 97 && b <= 102) { return (b - 97 + 10) as i32; }   // 'a'-'f'
+    return -1 as i32;
+}
+
+/// Windows file URIs carry the path as `/C:/dir/file`; the leading slash
+/// before the drive letter is not a valid Windows path, so strip it.
+![target(windows)]
+function normalize_fs_path(path: String) -> String {
+    const len: u64 = path.length();
+    if (len >= 3) {
+        const p: u8* = path.as_ptr();
+        const is_alpha: boolean =
+            (p[1] >= 65 && p[1] <= 90) || (p[1] >= 97 && p[1] <= 122);
+        if (p[0] == 47 && is_alpha && p[2] == 58) {            // '/', letter, ':'
+            mut out: String = String::from_str(path.as_str().sub_bytes(1, len));
+            mut owned: String = path;
+            owned.drop();
+            return out;
+        }
+    }
+    return path;
+}
+
+/// POSIX paths keep their leading slash (`/home/...`); nothing to do.
+![target(unix)]
+function normalize_fs_path(path: String) -> String {
+    return path;
 }
 
 /// True when this diagnostic's source span belongs to `fs_path`.
@@ -167,11 +231,31 @@ const ERROR_DOC_URL: string =
 
 /// Reconstruct a `file://` URI from the absolute filesystem path the
 /// compiler stamps onto every span - the inverse of `uri_to_fs_path`.
-function uri_string_from_fs_path(file: string) -> String {
-    mut s: String = String::with_capacity(strlen(file) + FILE_SCHEME_LEN);
+/// Build a `file://` URI from an absolute filesystem path - the inverse
+/// of `uri_to_fs_path`.  On Windows a drive path (`C:/...`) must become
+/// `file:///C:/...`: without the extra leading slash the `C:` is parsed
+/// as a URI host authority and the editor can't open the target.  POSIX
+/// paths already start with `/`, so `file://` + `/home/...` is correct.
+public function uri_string_from_fs_path(file: string) -> String {
+    mut s: String = String::with_capacity(strlen(file) + FILE_SCHEME_LEN + 1);
     s.push(FILE_SCHEME);
+    s.push(uri_authority_slash(file));
     s.push(file);
     return s;
+}
+
+/// `"/"` when `file` needs a leading slash inserted after `file://` so a
+/// Windows drive letter isn't mistaken for a host; `""` otherwise.
+![target(windows)]
+function uri_authority_slash(file: string) -> string {
+    const fp: u8* = file as u8*;
+    if (strlen(file) > 0 as u64 && fp[0] != 47) { return "/"; }   // not '/'
+    return "";
+}
+
+![target(unix)]
+function uri_authority_slash(file: string) -> string {
+    return "";                                        // already '/'-rooted
 }
 
 /// Build one `DiagnosticRelatedInformation` entry: a `{ location, message }`

@@ -1,9 +1,16 @@
 ///! LSP 3.17 wire types.
 ///!
 ///! Just the shapes the v1 server actually emits - Position, Range,
-///! Location, Diagnostic, Hover, MarkupContent, CompletionItem.  Each
-///! type carries `to_json()` so dispatch handlers can build a wire
-///! payload without touching JsonObject directly.
+///! Location, Hover, MarkupContent, CompletionItem.  Each type carries
+///! `to_json()` so dispatch handlers can build a wire payload without
+///! touching JsonObject directly.
+///!
+///! NOTE: LSP diagnostics are NOT modelled here.  `publishDiagnostics`
+///! payloads are built directly from `Compiler::Diag::Diagnostic` in
+///! `Lsp::Protocol::Conv` - a wire-side `Diagnostic` struct here would
+///! collide by bare name with the compiler's `Diagnostic` (Cryo's
+///! resolver exposes a dependency's type names globally), which breaks
+///! compilation of the compiler library the LSP links against.
 ///!
 ///! Field names follow the spec exactly so the JSON encoder doesn't
 ///! need a translation table.
@@ -86,87 +93,6 @@ type struct Location {
 
     drop(mut &this) -> void {
         this.uri.drop();
-    }
-}
-
-
-// Diagnostic  (LSP section 3.6.13)
-
-type enum DiagnosticSeverity {
-    Error;          // 1
-    Warning;        // 2
-    Information;    // 3
-    Hint;           // 4
-}
-
-implement enum DiagnosticSeverity {
-    to_int(&this) -> i64 {
-        return match (this) {
-            DiagnosticSeverity::Error       => { 1 as i64 }
-            DiagnosticSeverity::Warning     => { 2 as i64 }
-            DiagnosticSeverity::Information => { 3 as i64 }
-            DiagnosticSeverity::Hint        => { 4 as i64 }
-        };
-    }
-}
-
-type struct Diagnostic {
-    range:    Range;
-    severity: DiagnosticSeverity;
-    code:     Option<String>;          // e.g. "E0102"
-    source:   Option<String>;          // e.g. "cryoc"
-    message:  String;
-
-    /// Build a fully-populated diagnostic.  Convenience constructor
-    /// for callers in other namespaces - `Lsp::Protocol::Lsp::Diagnostic { ... }`
-    /// struct-literal syntax doesn't parse with a fully-qualified name.
-    static new(range: Range, severity: DiagnosticSeverity,
-               code: Option<String>, source: Option<String>,
-               message: String) -> Diagnostic {
-        return Diagnostic {
-            range:    range,
-            severity: severity,
-            code:     code,
-            source:   source,
-            message:  message,
-        };
-    }
-
-    to_json(&this) -> JsonValue {
-        mut o: JsonObject = JsonObject::new();
-        o.insert(String::from_str(Str::from_cstr("range")),
-                 this.range.to_json());
-        o.insert(String::from_str(Str::from_cstr("severity")),
-                 JsonValue::Number(JsonNumber::Int(this.severity.to_int())));
-        match (this.code) {
-            Option::Some(c) => {
-                o.insert(String::from_str(Str::from_cstr("code")),
-                         JsonValue::String(String::from_str(c.as_str())));
-            }
-            Option::None => { }
-        }
-        match (this.source) {
-            Option::Some(src) => {
-                o.insert(String::from_str(Str::from_cstr("source")),
-                         JsonValue::String(String::from_str(src.as_str())));
-            }
-            Option::None => { }
-        }
-        o.insert(String::from_str(Str::from_cstr("message")),
-                 JsonValue::String(String::from_str(this.message.as_str())));
-        return JsonValue::Object(o);
-    }
-
-    drop(mut &this) -> void {
-        match (this.code) {
-            Option::Some(c) => { c.drop(); }
-            Option::None    => { }
-        }
-        match (this.source) {
-            Option::Some(s) => { s.drop(); }
-            Option::None    => { }
-        }
-        this.message.drop();
     }
 }
 

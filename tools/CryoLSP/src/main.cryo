@@ -18,6 +18,33 @@ import Utils::Logger;
 import Lsp::Server::Server;
 
 
+// Windows stdio binary mode.
+//
+// The C runtime opens fd 0 (stdin) and fd 1 (stdout) in *text* mode on
+// Windows, which translates `\n` -> `\r\n` on write and `\r\n` -> `\n`
+// on read.  That silently corrupts LSP Content-Length framing: written
+// headers gain a spurious `\r` (`Content-Length: N\r\r\n`), and any raw
+// `\n` on the read side shifts the byte count.  `_setmode(fd, _O_BINARY)`
+// puts both streams in binary mode so the JSON-RPC wire is byte-exact.
+// POSIX streams are already binary, so the non-Windows form is a no-op.
+![target(windows)]
+extern "C" {
+    function _setmode(fd: i32, mode: i32) -> i32;
+}
+
+![target(windows)]
+function set_stdio_binary() -> void {
+    const O_BINARY: i32 = 0x8000 as i32;                // _O_BINARY
+    _setmode(0 as i32, O_BINARY);                        // stdin
+    _setmode(1 as i32, O_BINARY);                        // stdout
+}
+
+![target(unix)]
+function set_stdio_binary() -> void {
+    // POSIX standard streams are already binary; nothing to do.
+}
+
+
 function main() -> i32 {
     // The compiler library writes hard-error messages (stdlib lookup
     // failure, ICE banners) via `fprintf(g_stderr, ...)`.  `g_stderr`
@@ -25,6 +52,10 @@ function main() -> i32 {
     // CLI driver calls it at startup, so we mirror that here - without
     // it any compiler-side fprintf segfaults on a NULL FILE*.
     Logger::init();
+
+    // Byte-exact JSON-RPC framing over stdio (see note above).  Must run
+    // before the first frame is read or written.
+    set_stdio_binary();
 
     mut server: Server = Server::new();
     const code: i32 = server.run();
