@@ -309,8 +309,7 @@ type struct OwnershipQuery {
         // structural field walk.
         if (k == TypeKind::Struct) {
             const st: StructType* = t as StructType*;
-            const sbare: SymbolStr = OwnershipQuery::leaf_segment(intern, st.qualified_name);
-            if (OwnershipQuery::is_thread_safety_denied(intern, sbare)) {
+            if (OwnershipQuery::is_thread_safety_denied(arena, intern, ty)) {
                 return false;
             }
             return OwnershipQuery::all_fields_thread_safe(arena, registry, intern,
@@ -318,8 +317,7 @@ type struct OwnershipQuery {
         }
         if (k == TypeKind::Class) {
             const ct: ClassType* = t as ClassType*;
-            const cbare: SymbolStr = OwnershipQuery::leaf_segment(intern, ct.qualified_name);
-            if (OwnershipQuery::is_thread_safety_denied(intern, cbare)) {
+            if (OwnershipQuery::is_thread_safety_denied(arena, intern, ty)) {
                 return false;
             }
             return OwnershipQuery::all_fields_thread_safe(arena, registry, intern,
@@ -327,8 +325,7 @@ type struct OwnershipQuery {
         }
         if (k == TypeKind::Enum) {
             const et: EnumType* = t as EnumType*;
-            const ebare: SymbolStr = OwnershipQuery::leaf_segment(intern, et.qualified_name);
-            if (OwnershipQuery::is_thread_safety_denied(intern, ebare)) {
+            if (OwnershipQuery::is_thread_safety_denied(arena, intern, ty)) {
                 return false;
             }
             return OwnershipQuery::all_variants_thread_safe(arena, registry, intern,
@@ -344,11 +341,9 @@ type struct OwnershipQuery {
 
         if (k == TypeKind::InstantiatedType) {
             const inst: InstantiatedType* = t as InstantiatedType*;
-            // Deny-list check on the template's bare name catches
+            // Deny-list check on the template's canonical identity catches
             // `Rc<T>` even when its type_args[0] is itself thread-safe.
-            const template_bare: SymbolStr =
-                OwnershipQuery::registry_name_of(arena, intern, ty);
-            if (OwnershipQuery::is_thread_safety_denied(intern, template_bare)) {
+            if (OwnershipQuery::is_thread_safety_denied(arena, intern, ty)) {
                 return false;
             }
             if (inst.has_resolved_type()) {
@@ -492,23 +487,28 @@ type struct OwnershipQuery {
         return true;
     }
 
-    /// True when `leaf` names a stdlib type that is inherently
-    /// !Send + !Sync regardless of its component types:
+    /// True when `ty` IS a stdlib type that is inherently !Send + !Sync
+    /// regardless of its component types:
     ///   - `Rc` : single-threaded reference counting.
     ///   - `MutexGuard`, `RwLockReadGuard`, `RwLockWriteGuard` :
     ///     pthread mutex/rwlock primitives require unlock from the
     ///     same thread that acquired the lock, so a guard cannot
     ///     cross threads.
-    static is_thread_safety_denied(intern: InternTable*, leaf: SymbolStr) -> boolean {
-        if (intern == null || !leaf.is_valid()) { return false; }
-        const rc_name: SymbolStr = intern.intern("Rc");
-        if (rc_name.is_valid() && leaf.equals(rc_name)) { return true; }
-        const mg_name: SymbolStr = intern.intern("MutexGuard");
-        if (mg_name.is_valid() && leaf.equals(mg_name)) { return true; }
-        const rrg_name: SymbolStr = intern.intern("RwLockReadGuard");
-        if (rrg_name.is_valid() && leaf.equals(rrg_name)) { return true; }
-        const rwg_name: SymbolStr = intern.intern("RwLockWriteGuard");
-        if (rwg_name.is_valid() && leaf.equals(rwg_name)) { return true; }
+    ///
+    /// Keyed on the target's canonical QUALIFIED-NAME identity (via
+    /// `named_qualified_id`, peeling an `InstantiatedType` to its template), NOT
+    /// the bare leaf: a USER type merely NAMED `Rc` must not be denied Send/Sync.
+    /// Conservative direction (a false deny is over-restrictive, not unsound),
+    /// but keyed precisely so only the actual stdlib types are denied.
+    static is_thread_safety_denied(arena: TypeArena*, intern: InternTable*,
+                                   ty: TypeRef) -> boolean {
+        if (arena == null || intern == null) { return false; }
+        const qid: u64 = OwnershipQuery::named_qualified_id(arena, intern, ty);
+        if (qid == 0) { return false; }
+        if (qid == intern.intern("std::alloc::rc::Rc").id as u64) { return true; }
+        if (qid == intern.intern("std::sync::mutex::MutexGuard").id as u64) { return true; }
+        if (qid == intern.intern("std::sync::rwlock::RwLockReadGuard").id as u64) { return true; }
+        if (qid == intern.intern("std::sync::rwlock::RwLockWriteGuard").id as u64) { return true; }
         return false;
     }
 
@@ -675,24 +675,41 @@ type struct OwnershipQuery {
         return OwnershipQuery::type_has_drop_impl(arena, registry, intern, ty);
     }
 
-    /// The target's canonical BASE arena type id for a NAMED aggregate
+    /// The target's canonical QUALIFIED-NAME identity for a NAMED aggregate
     /// (struct/class/enum), peeling an `InstantiatedType` to its template via
-    /// `generic_base`.  Returns 0 for anything else (primitive, pointer, alias,
-    /// tuple, unresolved) - those never carry a user `Drop` we key precisely,
-    /// and 0 tells the caller to use the bare-name fallback.  This is the SINGLE
-    /// base-id function both the registration side (type_resolution R1) and the
-    /// lookup side use, so their keys always agree.
-    static named_base_type_id(arena: TypeArena*, ty: TypeRef) -> u64 {
-        if (arena == null || !ty.is_valid()) { return 0; }
+    /// `generic_base`.  Returns the interned qualified-name SymbolStr id (a
+    /// module-independent identity that distinguishes same-leaf types like a
+    /// local `Pair` vs stdlib `std::collections::pair::Pair`).  Returns 0 for
+    /// anything else (primitive, pointer, alias, tuple, unresolved) - those
+    /// never carry a user `Drop` we key precisely, and 0 tells the caller to use
+    /// the bare-name fallback.
+    ///
+    /// This keys on the interned qualified NAME rather than the arena TYPE id on
+    /// purpose: the same nominal type can be materialised under several arena
+    /// type ids across passes (a decl entry vs a field-type resolution vs a
+    /// monomorphized spec), so a type-id key registered in one pass MISSES when
+    /// the query in a later pass carries a different id for the same type - an
+    /// allocation-order-dependent false negative that silently drops a real
+    /// `Drop`.  The qualified name is canonical per nominal type, so the
+    /// registration side (type_resolution R1) and every lookup side agree.
+    static named_qualified_id(arena: TypeArena*, intern: InternTable*,
+                              ty: TypeRef) -> u64 {
+        if (arena == null || intern == null || !ty.is_valid()) { return 0; }
         const t: Type* = arena.lookup(ty.id);
         if (t == null) { return 0; }
         if (t.kind == TypeKind::InstantiatedType) {
             const inst: InstantiatedType* = t as InstantiatedType*;
-            return OwnershipQuery::named_base_type_id(arena, inst.generic_base);
+            return OwnershipQuery::named_qualified_id(arena, intern,
+                                                       inst.generic_base);
         }
         if (t.kind == TypeKind::Struct || t.kind == TypeKind::Class ||
             t.kind == TypeKind::Enum) {
-            return ty.id;
+            const qname: SymbolStr = OwnershipQuery::qualified_name_of(arena, ty);
+            if (!qname.is_valid()) { return 0; }
+            // The qualified-name SymbolStr id is canonical in the single shared
+            // intern table, so it is directly comparable across passes and
+            // between the registration and lookup sides (both reach here).
+            return qname.id as u64;
         }
         return 0;
     }
@@ -701,8 +718,8 @@ type struct OwnershipQuery {
     ///
     /// When `ty`'s base type is a named aggregate AND its `(Drop, leaf)` pair was
     /// precisely registered (some type with that leaf has a Drop impl), the
-    /// TYPE-ID index is authoritative: a hit means Drop, a MISS is a genuine
-    /// negative - this is what stops a user `Pair` from inheriting stdlib
+    /// QUALIFIED-NAME index is authoritative: a hit means Drop, a MISS is a
+    /// genuine negative - this is what stops a user `Pair` from inheriting stdlib
     /// `Pair<A,B>`'s Drop by bare-name collision.  Otherwise (unresolvable base,
     /// or a leaf never precisely registered) we fall back to the historical
     /// bare-name lookup, so a Drop impl can never be MISSED (the fatal
@@ -713,14 +730,50 @@ type struct OwnershipQuery {
         const drop_name: SymbolStr = intern.intern("Drop");
         if (!drop_name.is_valid()) { return false; }
         const leaf: SymbolStr = OwnershipQuery::registry_name_of(arena, intern, ty);
-        const base_id: u64 = OwnershipQuery::named_base_type_id(arena, ty);
-        if (base_id != 0 && registry.is_precise_trait_leaf(drop_name, leaf)) {
+        const qual_id: u64 = OwnershipQuery::named_qualified_id(arena, intern, ty);
+        if (qual_id != 0 && registry.is_precise_trait_leaf(drop_name, leaf)) {
             // Authoritative precise path: a miss here is a true negative.
-            return registry.has_trait_impl_typed(drop_name, base_id);
+            return registry.has_trait_impl_typed(drop_name, qual_id);
         }
         // Fallback: bare-name lookup (old behaviour, safe/conservative).
         if (!leaf.is_valid()) { return false; }
         return OwnershipQuery::has_drop_impl(registry, intern, leaf);
+    }
+
+    /// Precise, collision-proof trait-impl lookup for ANY trait — the general
+    /// form of `type_has_drop_impl`.  Returns the `implement trait <T> for <ty>`
+    /// block, disambiguating same-leaf types (a local `Cell` vs another module's
+    /// `Cell`, both implementing `Clone`) by the target's canonical
+    /// QUALIFIED-NAME identity, and falling back to the historical bare-leaf
+    /// lookup when `ty` is not a precisely-registered named aggregate.
+    ///
+    /// `ty` should be normalized to its InstantiatedType wrapper by the caller
+    /// (every reroute site already does, via `TypeArena::find_inst_wrapping`), so
+    /// `named_qualified_id` peels to the template's qualified name and matches the
+    /// registration key.  The trait name is normalized to its LEAF on BOTH sides
+    /// (`leaf_segment` here, and at the type_resolution R1 registration) so a
+    /// qualified `implement trait Mod::Tr` and a bare `implement trait Tr` share
+    /// one key.  Failure mode is a loud compile error (never a UAF), so the
+    /// precise path is authoritative: a miss for a precisely-registered leaf is a
+    /// genuine negative.
+    static resolve_trait_impl_for_type(arena: TypeArena*, registry: GenericRegistry*,
+                                       intern: InternTable*, trait_name: SymbolStr,
+                                       ty: TypeRef) -> ImplBlockNode* {
+        if (arena == null || registry == null || intern == null) { return null; }
+        const trait_leaf: SymbolStr = OwnershipQuery::leaf_segment(intern, trait_name);
+        const leaf: SymbolStr = OwnershipQuery::registry_name_of(arena, intern, ty);
+        if (leaf.is_valid() && trait_leaf.is_valid()
+                && registry.is_precise_trait_leaf(trait_leaf, leaf)) {
+            const qual_id: u64 = OwnershipQuery::named_qualified_id(arena, intern, ty);
+            if (qual_id != 0) {
+                // Authoritative precise path: a miss here is a true negative.
+                return registry.lookup_trait_impl_typed(trait_leaf, qual_id);
+            }
+        }
+        // Fallback: historical bare-leaf lookup (keyed on the ORIGINAL trait
+        // name, matching how `lookup_trait_impl`'s bare index was written).
+        if (!leaf.is_valid()) { return null; }
+        return registry.lookup_trait_impl(trait_name, leaf);
     }
 
     /// Internal: true when the trait-impl registry has a `Drop` impl

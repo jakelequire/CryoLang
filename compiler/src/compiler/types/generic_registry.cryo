@@ -209,22 +209,34 @@ type struct GenericRegistry {
     trait_impls:      Pair<u64, ImplBlockNode*>[];  // .first = key, .second = impl block
     trait_impl_index:   HashMap<u64, i64>;
 
-    // -- Precise (collision-proof) trait-impl index, keyed by TYPE IDENTITY --
+    // -- Precise (collision-proof) trait-impl index, keyed by QUALIFIED NAME --
     // The bare-name `trait_impl_index` above collides when a user type shares a
     // stdlib type's leaf (e.g. a local `Pair` vs stdlib `Pair<A,B>`), because
     // both map to the same `(trait, "Pair")` key.  This index instead keys on
-    // `(trait_name.id << 32) | (base_type_id & 0xFFFFFFFF)` where `base_type_id`
-    // is the target's canonical BASE arena type id (an instantiation's template,
-    // via `InstantiatedType.generic_base`) - a module-independent identity that
-    // distinguishes same-leaf types.  Values are indices into `trait_impls`
-    // (the block table is shared).  Populated at the authoritative,
-    // import-resolved registration site (type_resolution R1) whenever the
-    // target resolves to a named aggregate.  Consulted by the ownership Drop/Copy
-    // queries (ownership.cryo), which have the target TypeRef and can reproduce
-    // the same base id.  SAFE-BIAS: a `(trait, leaf)` that was NOT precisely
-    // registered (`precise_trait_leaf` below is false for it) falls back to the
-    // bare index, so a Drop impl can never be MISSED (the fatal direction).
+    // `(trait_name.id << 32) | (qual_id & 0xFFFFFFFF)` where `qual_id` is the
+    // target's canonical QUALIFIED-NAME SymbolStr id (an instantiation peeled to
+    // its template's qualified name, via `InstantiatedType.generic_base`) - a
+    // module-independent identity that distinguishes same-leaf types.  Keying on
+    // the qualified NAME rather than the arena TYPE id is deliberate: the same
+    // nominal type is materialised under several arena type ids across passes,
+    // so a type-id key would MISS (allocation-order-dependent) when a later pass
+    // carries a different id for the same type; the qualified name is canonical.
+    // Values are indices into `trait_impls_typed`.  Populated at the
+    // authoritative, import-resolved registration site (type_resolution R1)
+    // whenever the target resolves to a named aggregate.  Consulted by the
+    // ownership Drop/Copy queries (ownership.cryo), which have the target
+    // TypeRef and reproduce the same qualified-name id via
+    // `OwnershipQuery::named_qualified_id`.  SAFE-BIAS: a `(trait, leaf)` that
+    // was NOT precisely registered (`precise_trait_leaf` below is false for it)
+    // falls back to the bare index, so a Drop impl can never be MISSED (the
+    // fatal direction).
     trait_impl_typeid_index: HashMap<u64, i64>;
+    // Backing table for the precise index above.  Kept SEPARATE from the
+    // bare-keyed `trait_impls` because that table is linearly scanned by
+    // `traits_implemented_by` (interpreting `.first` as a bare-name key) and by
+    // mono/sema block loops; a qualified-name-keyed entry there would be
+    // misread.  `trait_impl_typeid_index` values are indices into THIS array.
+    trait_impls_typed: Pair<u64, ImplBlockNode*>[];
     // Set of `(trait_name.id, leaf_name.id)` bare keys that HAVE at least one
     // precise typeid registration.  When a lookup's (trait, leaf) is in this
     // set, the typeid index is authoritative (a typeid miss is a genuine
@@ -302,6 +314,7 @@ type struct GenericRegistry {
             trait_impls:       [],
             trait_impl_index:  HashMap<u64, i64>::new(),
             trait_impl_typeid_index: HashMap<u64, i64>::new(),
+            trait_impls_typed:       [],
             precise_trait_leaf:      HashMap<u64, i64>::new(),
             coherence_records: [],
             coherence_index:   HashMap<u64, i64>::new(),
@@ -579,32 +592,41 @@ type struct GenericRegistry {
         return null;
     }
 
-    /// Pack `(trait_name, base_type_id)` for the precise typeid index.  Same
-    /// layout as `trait_impl_key` but with the target's canonical base arena
-    /// type id in the low 32 bits instead of a bare name id.
-    static trait_impl_typeid_key(trait_name: SymbolStr, base_type_id: u64) -> u64 {
-        return ((trait_name.id as u64) << 32) | (base_type_id & 0xFFFFFFFF);
+    /// Pack `(trait_name, qual_id)` for the precise index.  Same layout as
+    /// `trait_impl_key` but with the target's canonical QUALIFIED-NAME SymbolStr
+    /// id in the low 32 bits instead of a bare leaf name id.  Both are u32 ids,
+    /// so the `& 0xFFFFFFFF` mask is loss-free.
+    static trait_impl_typeid_key(trait_name: SymbolStr, qual_id: u64) -> u64 {
+        return ((trait_name.id as u64) << 32) | (qual_id & 0xFFFFFFFF);
     }
 
-    /// Register a trait impl under the PRECISE (trait, base-type-id) key, and
-    /// mark its (trait, leaf) bare pair as precisely-registered so lookups know
-    /// the typeid index is authoritative for that leaf.  `leaf` MUST be the same
-    /// bare leaf the lookup side derives from the target type (i.e.
-    /// `OwnershipQuery::registry_name_of`), or the precise/fallback decision
-    /// would diverge.  No-op when `base_type_id == 0` (target not a resolvable
-    /// named aggregate) - such impls stay bare-only and are found via fallback.
+    /// Register a trait impl under the PRECISE (trait, qualified-name-id) key,
+    /// and mark its (trait, leaf) bare pair as precisely-registered so lookups
+    /// know the precise index is authoritative for that leaf.  `leaf` MUST be
+    /// the same bare leaf the lookup side derives from the target type (i.e.
+    /// `OwnershipQuery::registry_name_of`), and `qual_id` MUST be the same
+    /// qualified-name id the lookup side derives (i.e.
+    /// `OwnershipQuery::named_qualified_id`), or the precise/fallback decision
+    /// would diverge.  No-op when `qual_id == 0` (target not a resolvable named
+    /// aggregate) - such impls stay bare-only and are found via fallback.
+    ///
+    /// The precise entries live in their own `trait_impls_typed` table, NOT the
+    /// bare-keyed `trait_impls`: that table is linearly scanned by
+    /// `traits_implemented_by` (which reads `.first` as a bare-name key) and by
+    /// several mono/sema loops (which double-process duplicated blocks), so
+    /// mixing a qualified-name-keyed entry into it corrupts those readers.
     register_trait_impl_typed(mut &this, trait_name: SymbolStr, leaf: SymbolStr,
-                              base_type_id: u64, block: ImplBlockNode*) -> void {
+                              qual_id: u64, block: ImplBlockNode*) -> void {
         if (block == null) { return; }
-        if (!trait_name.is_valid() || base_type_id == 0) { return; }
-        const key: u64 = GenericRegistry::trait_impl_typeid_key(trait_name, base_type_id);
+        if (!trait_name.is_valid() || qual_id == 0) { return; }
+        const key: u64 = GenericRegistry::trait_impl_typeid_key(trait_name, qual_id);
         const existing: Option<i64> = this.trait_impl_typeid_index.get(&key);
         if (existing.is_some()) {
             // Latest impl wins (matches register_trait_impl's overwrite policy).
-            this.trait_impls[existing.unwrap()].second = block;
+            this.trait_impls_typed[existing.unwrap()].second = block;
         } else {
-            const idx: i64 = this.trait_impls.length;
-            this.trait_impls.push(Pair::new(key, block));
+            const idx: i64 = this.trait_impls_typed.length;
+            this.trait_impls_typed.push(Pair::new(key, block));
             this.trait_impl_typeid_index.insert(key, idx);
         }
         if (leaf.is_valid()) {
@@ -613,11 +635,23 @@ type struct GenericRegistry {
         }
     }
 
-    /// True when a PRECISE impl is registered for `(trait, base_type_id)`.
-    has_trait_impl_typed(&this, trait_name: SymbolStr, base_type_id: u64) -> boolean {
-        if (!trait_name.is_valid() || base_type_id == 0) { return false; }
-        const key: u64 = GenericRegistry::trait_impl_typeid_key(trait_name, base_type_id);
+    /// True when a PRECISE impl is registered for `(trait, qual_id)`.
+    has_trait_impl_typed(&this, trait_name: SymbolStr, qual_id: u64) -> boolean {
+        if (!trait_name.is_valid() || qual_id == 0) { return false; }
+        const key: u64 = GenericRegistry::trait_impl_typeid_key(trait_name, qual_id);
         return this.trait_impl_typeid_index.get(&key).is_some();
+    }
+
+    /// Return the impl block registered under the PRECISE (trait, qual_id) key,
+    /// or null on miss.  Used by the sema/mono trait-dispatch re-key so a
+    /// same-leaf collision resolves to the impl for the ACTUAL type, not the
+    /// first same-leaf impl found by the bare index.
+    lookup_trait_impl_typed(&this, trait_name: SymbolStr, qual_id: u64) -> ImplBlockNode* {
+        if (!trait_name.is_valid() || qual_id == 0) { return null; }
+        const key: u64 = GenericRegistry::trait_impl_typeid_key(trait_name, qual_id);
+        const opt: Option<i64> = this.trait_impl_typeid_index.get(&key);
+        if (opt.is_none()) { return null; }
+        return this.trait_impls_typed[opt.unwrap()].second;
     }
 
     /// True when `(trait, leaf)` had at least one precise typeid registration,
@@ -757,6 +791,30 @@ type struct GenericRegistry {
     /// Check whether a TypeID corresponds to a registered template.
     is_template(&this, type_id: u64) -> boolean {
         return this.type_index.contains_key(&type_id);
+    }
+
+    /// The first registered generic TYPE-OWNER template (struct/class/enum/union
+    /// declaration, i.e. a type that can host static methods) whose bare leaf is
+    /// `leaf`, or null.  Templates are keyed in `name_index` by their QUALIFIED
+    /// name, so a bare-leaf `get_template` misses them; this scans by the
+    /// unqualified `TemplateEntry.name`.  Used by sema to recover the generic
+    /// `std::collections::pair::Pair` template for a static call like `Pair::new`
+    /// when a same-leaf NON-generic type (e.g. a test-local `Pair`) shadows the
+    /// bare name in `resolve_qualified`.  Callers member-check via the returned
+    /// entry's AST, so a leaf match without the member harmlessly finds nothing.
+    get_type_owner_template_with_leaf(&this, leaf: SymbolStr) -> TemplateEntry* {
+        if (!leaf.is_valid()) { return null; }
+        for (mut i: i64 = 0; i < this.entries.length; i++) {
+            const e: TemplateEntry* = &this.entries[i];
+            if (e.param_count <= 0) { continue; }
+            if (!e.name.equals(leaf)) { continue; }
+            const nk: NodeKind = e.node_kind;
+            if (nk == NodeKind::StructDeclaration || nk == NodeKind::ClassDeclaration
+                    || nk == NodeKind::EnumDeclaration || nk == NodeKind::UnionDeclaration) {
+                return &this.entries[i];
+            }
+        }
+        return null;
     }
 
     /// Number of registered templates.

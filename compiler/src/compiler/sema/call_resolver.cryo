@@ -2225,7 +2225,45 @@ type struct CallResolver {
                 if (t != null && t.kind == TypeKind::InstantiatedType) { return true; }
             }
         }
+        // Same-leaf shadow disambiguation.  `resolve_qualified` binds a bare
+        // scope to the globally-first same-leaf type, which may be a LOCAL
+        // NON-generic type shadowing a stdlib generic template of the same leaf
+        // (e.g. a test-local `type struct Pair` vs `std::collections::pair::Pair`).
+        // A static call `Pair::new` must still be recognized as generic so mono
+        // specializes it (a bare pin here would leave the callee unspecialized,
+        // and codegen then can't resolve `Pair::new`).  Recognize a same-leaf
+        // generic TYPE-OWNER template (the `name_index` keys on qualified names,
+        // so a bare-leaf `get_template` misses it under a local shadow).
+        const scope_leaf: SymbolStr = this.intern.intern(
+            QualifiedName::leaf_of(this.intern.resolve(scope_sym)));
+        if (this.ctx.generic_registry.get_type_owner_template_with_leaf(scope_leaf) != null) {
+            return true;
+        }
         return false;
+    }
+
+    /// Resolve a static-call scope name to its generic OWNER template, tolerating
+    /// a same-leaf NON-generic type that shadows the bare name in
+    /// `resolve_qualified` (a test-local `Pair` vs `std::collections::pair::Pair`).
+    /// Tries the qualified-name index first (`get_template`), then the bare-leaf
+    /// scan.  Returns null when no generic type-owner template matches; callers
+    /// then member-check by walking the returned template's methods, so a leaf
+    /// match that lacks the static member resolves to nothing.
+    resolve_scope_owner_template(&this, scope_sym: SymbolStr) -> TemplateEntry* {
+        if (this.ctx.generic_registry == null) { return null; }
+        mut tmpl: TemplateEntry* = this.ctx.generic_registry.get_template(scope_sym);
+        if (tmpl == null && this.ctx.decl_index != null) {
+            const q: SymbolStr = this.ctx.decl_index.resolve_qualified(scope_sym);
+            if (q.is_valid() && !q.equals(scope_sym)) {
+                tmpl = this.ctx.generic_registry.get_template(q);
+            }
+        }
+        if (tmpl == null) {
+            const leaf: SymbolStr = this.intern.intern(
+                QualifiedName::leaf_of(this.intern.resolve(scope_sym)));
+            tmpl = this.ctx.generic_registry.get_type_owner_template_with_leaf(leaf);
+        }
+        return tmpl;
     }
 
     pin_scope_callee_combined(mut &this, call: CallExprNode*, scope_sym: SymbolStr, member_sym: SymbolStr) -> void {
@@ -2382,13 +2420,7 @@ type struct CallResolver {
         if (this.ctx.generic_registry == null || this.ctx.type_resolver == null) {
             return TypeRef::invalid();
         }
-        mut tmpl: TemplateEntry* = this.ctx.generic_registry.get_template(scope.scope_name);
-        if (tmpl == null && this.ctx.decl_index != null) {
-            const q: SymbolStr = this.ctx.decl_index.resolve_qualified(scope.scope_name);
-            if (q.is_valid() && !q.equals(scope.scope_name)) {
-                tmpl = this.ctx.generic_registry.get_template(q);
-            }
-        }
+        mut tmpl: TemplateEntry* = this.resolve_scope_owner_template(scope.scope_name);
         if (tmpl == null || tmpl.ast_node == null) { return TypeRef::invalid(); }
         if (tmpl.param_type_ids.length == 0) { return TypeRef::invalid(); }
 
@@ -2562,11 +2594,7 @@ type struct CallResolver {
         if (call == null || scope == null) { return; }
         if (call.resolved_type_args.length > 0) { return; }
         if (this.ctx.generic_registry == null) { return; }
-        mut tmpl: TemplateEntry* = this.ctx.generic_registry.get_template(scope.scope_name);
-        if (tmpl == null && this.ctx.decl_index != null) {
-            const q: SymbolStr = this.ctx.decl_index.resolve_qualified(scope.scope_name);
-            if (q.is_valid() && !q.equals(scope.scope_name)) { tmpl = this.ctx.generic_registry.get_template(q); }
-        }
+        mut tmpl: TemplateEntry* = this.resolve_scope_owner_template(scope.scope_name);
         if (tmpl == null || tmpl.ast_node == null) { return; }
         if (tmpl.param_type_ids.length == 0) { return; }
         const empty_methods: MethodNode*[] = [];
@@ -2594,11 +2622,7 @@ type struct CallResolver {
     resolve_static_method_return_via_template(mut &this, scope: ScopeResolutionNode*,
                                               call: CallExprNode*) -> TypeRef {
         if (this.ctx.generic_registry == null) { return TypeRef::invalid(); }
-        mut tmpl: TemplateEntry* = this.ctx.generic_registry.get_template(scope.scope_name);
-        if (tmpl == null && this.ctx.decl_index != null) {
-            const q: SymbolStr = this.ctx.decl_index.resolve_qualified(scope.scope_name);
-            if (q.is_valid() && !q.equals(scope.scope_name)) { tmpl = this.ctx.generic_registry.get_template(q); }
-        }
+        mut tmpl: TemplateEntry* = this.resolve_scope_owner_template(scope.scope_name);
         if (tmpl == null || tmpl.ast_node == null) { return TypeRef::invalid(); }
         if (tmpl.param_type_ids.length == 0) { return TypeRef::invalid(); }
         const empty_methods: MethodNode*[] = [];
