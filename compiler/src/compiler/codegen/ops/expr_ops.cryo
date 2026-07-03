@@ -1278,6 +1278,22 @@ type struct ExprOps {
                 out_value = this.codegen_call(fn_val, fn_ty, args, "strcat");
                 return out_value;
             }
+            if (op_kind == TokenType::Minus) {
+                // string - int -> retreat the i8* cursor by `int` bytes.
+                // Only `string - numeric` reaches here (`string - string`
+                // is not a valid `-`), so there is no concat ambiguity.
+                // Mirrors the `+` advance with a negated offset, matching
+                // `intrinsics::ptr_sub`.  Without this, `-` fell through to
+                // the null-return below and silently miscompiled.
+                const neg: LValue = this.builder.build_neg(rhs_val, "stroff.neg");
+                const buf: void* = intrinsics::malloc(8);
+                const slots: void** = buf as void**;
+                slots[0] = neg.raw;
+                out_value = this.builder.build_gep(
+                    LType::i8(), lhs_val, buf, 1, "ptrret");
+                intrinsics::free(buf);
+                return out_value;
+            }
             // Ordered comparison between two strings (i.e. raw `char*`
             // buffer walking (`this.current >= this.buffer_end`).  LLVM
             // allows `icmp` directly on matching pointer types; treat as

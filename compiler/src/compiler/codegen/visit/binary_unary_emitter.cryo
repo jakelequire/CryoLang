@@ -299,21 +299,26 @@ type struct BinaryUnaryEmitter {
             // integer add; LLVM rejects `add ptr, i64`.  `++p` advances
             // one pointee-sized slot; `--p` retreats one.  Mirrors the
             // `ptr + int` path in codegen_binary (expr_codegen.cryo).
-            // Only raw pointers reach the GEP path.  References (`&T`) are
-            // rejected upstream by `check_unary_op` (checker.cryo) - a
-            // reference is an alias, not a reseatable cursor, so `++`/`--`
-            // on one is a type error, never a codegen case.
+            // Pointers and `string` walk element-wise via a GEP over the
+            // pointee: `p++` advances one element; `str++` one byte (a
+            // string is a length-less `i8*` cursor, mirroring the `string +
+            // int` path in expr_ops).  References (`&T`) are NOT here - they
+            // are rejected upstream by `check_unary_op` (a reference is an
+            // alias, not a reseatable cursor), so they never reach codegen.
             const op_t: Type* = this.cg.lookup_type_by_id(node.operand.resolved_type.id);
             mut is_ptr: boolean = false;
-            mut elem_ty_ref: TypeRef = TypeRef::invalid();
-            if (op_t != null && op_t.kind == TypeKind::Pointer) {
-                is_ptr = true;
-                const ptr_t: PointerType* = op_t as PointerType*;
-                elem_ty_ref = ptr_t.pointee;
+            mut pointee_lty: LType = LType::i8();
+            if (op_t != null) {
+                if (op_t.kind == TypeKind::Pointer) {
+                    is_ptr = true;
+                    pointee_lty = this.cg.type_mapper.map_type((op_t as PointerType*).pointee);
+                } else if (op_t.kind == TypeKind::String) {
+                    is_ptr = true;
+                    pointee_lty = LType::i8();
+                }
             }
             mut updated: LValue = LValue::null();
             if (is_ptr) {
-                const pointee_lty: LType = this.cg.type_mapper.map_type(elem_ty_ref);
                 if (!pointee_lty.is_valid()) {
                     this.state.last_value = LValue::null();
                     this.state.last_is_lvalue = false;
