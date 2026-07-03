@@ -1061,6 +1061,26 @@ public:
                     "the value assigned here doesn't match the type of the assignment target",
                     bin.left.span, bin.right);
             }
+            // Compound assignment (`+=`, `-=`, `*=`, ...) also has to
+            // type-check the *underlying* binary operation.  Plain binary
+            // exprs run through `check_binary_op` (see below), but this
+            // assignment branch used to return `lhs` unchecked, so a
+            // nonsense compound like `s *= 3` (string) or `p /= 2`
+            // (pointer) passed sema and silently emitted null IR in
+            // codegen (the base op has no arm in `codegen_binary`).
+            // Validate the base op the same way, guarding on
+            // symbolically-unresolved operands so pre-monomorphization
+            // generic bodies don't trip.
+            const base_lex: string = bin.op.kind.compound_base_lexeme();
+            if (base_lex != "" && lhs.is_valid() && rhs.is_valid()
+                && !this.symbolic.symbolic_type_unresolved(lhs)
+                && !this.symbolic.symbolic_type_unresolved(rhs)) {
+                const cres: TypeCheckResult = this.checker.check_binary_op(base_lex, lhs, rhs);
+                if (!cres.success) {
+                    this.ctx.emit_error_at(ErrorCode::E0229_INVALID_BINARY_OP,
+                        cres.error_message, bin.span);
+                }
+            }
             return lhs;
         }
 
