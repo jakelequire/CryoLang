@@ -328,6 +328,39 @@ public:
         return this.intern_table.resolve(this.namespace_str);
     }
 
+    /// The use-site module identity (a namespace SymbolStr) for import-scoped
+    /// name resolution: the declared namespace when set (the multi-module
+    /// norm), else the source file interned (single-file mode).  This is the
+    /// identity space shared by qualified type names and ModuleInfo dependencies.
+    current_module_ns(&this) -> SymbolStr {
+        if (this.has_namespace()) { return this.namespace_str; }
+        return this.intern_table.intern(this.source_file);
+    }
+
+    /// Import-scoped resolution of a bare leaf from the module currently being
+    /// processed.  The import-aware replacement for the context-free
+    /// `decl_index.resolve_qualified`; see DeclarationIndex::resolve_qualified_scoped.
+    resolve_scoped(&this, bare: SymbolStr) -> ScopeResolution {
+        return this.decl_index.resolve_qualified_scoped(
+            bare, this.current_module_ns(), this.intern_table);
+    }
+
+    /// `resolve_scoped(bare).resolved_or(bare)` — the drop-in replacement for
+    /// `decl_index.resolve_qualified(bare)` at non-authoritative call sites
+    /// (e.g. codegen, which receives already-qualified names).  Authoritative
+    /// sites call `resolve_scoped` and diagnose `Ambiguous` themselves.
+    resolve_scoped_or(&this, bare: SymbolStr) -> SymbolStr {
+        return this.resolve_scoped(bare).resolved_or(bare);
+    }
+
+    /// True when `bare` resolves to two or more import-visible same-leaf
+    /// candidates from the current module — a hard ambiguity the caller must
+    /// diagnose (E0154) and the author must qualify.  False for the common
+    /// unique/local/miss cases.
+    scope_is_ambiguous(&this, bare: SymbolStr) -> boolean {
+        return this.resolve_scoped(bare).is_ambiguous();
+    }
+
     /// Temporarily override the active namespace (e.g., for scope switching in sema).
     /// Returns the previous value so it can be restored.
     swap_namespace(mut &this, new_ns: SymbolStr) -> SymbolStr {

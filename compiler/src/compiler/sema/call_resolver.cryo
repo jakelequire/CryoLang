@@ -123,7 +123,7 @@ type struct CallResolver {
             const bare_sym: SymbolStr = this.intern.intern(bare_combined);
             const bare_ft: TypeRef = this.ctx.decl_index.lookup_func_type(bare_sym);
             if (bare_ft.is_valid()) { return bare_ft; }
-            const resolved_scope: SymbolStr = this.ctx.decl_index.resolve_qualified(sr.scope_name);
+            const resolved_scope: SymbolStr = this.ctx.resolve_scoped_or(sr.scope_name);
             if (resolved_scope.is_valid()) {
                 const q_combined: string = format("%s::%s",
                     this.intern.resolve(resolved_scope), this.intern.resolve(sr.member_name));
@@ -828,7 +828,7 @@ type struct CallResolver {
         const member_str: string = this.intern.resolve(scope.member_name);
         mut entry: TemplateEntry* = null;
         if (this.ctx.decl_index != null) {
-            const q: SymbolStr = this.ctx.decl_index.resolve_qualified(scope.scope_name);
+            const q: SymbolStr = this.ctx.resolve_scoped_or(scope.scope_name);
             if (q.is_valid()) {
                 const qstr: string = this.intern.resolve(q) + "::" + member_str;
                 entry = this.ctx.generic_registry.get_template(this.intern.intern(qstr));
@@ -1232,7 +1232,7 @@ type struct CallResolver {
     canon_trait_name(&this, name: SymbolStr) -> SymbolStr {
         if (!name.is_valid()) { return name; }
         if (this.ctx.decl_index == null) { return name; }
-        return this.ctx.decl_index.resolve_qualified(name);
+        return this.ctx.decl_index.canonical_qualified(name);
     }
 
     /// Per-argument type checking for an instance method call.  Gathers same-named
@@ -2160,8 +2160,43 @@ type struct CallResolver {
 
     // -- Scope-resolution call resolution (Type::method / Module::func / variant) --
 
+    /// Emit E0154 for a bare scope name that resolves to multiple import-visible
+    /// same-leaf types.  Lists every registered qualified candidate so the
+    /// author can pick one; the fix is always to write the fully-qualified name.
+    report_scope_ambiguity(mut &this, scope: ScopeResolutionNode*) -> void {
+        const alts: SymbolStr[] = this.ctx.decl_index.lookup_qualified_alternatives(scope.scope_name);
+        mut cand_list: string = "";
+        for (mut i: i64 = 0; i < alts.length; i++) {
+            if (i > 0) { cand_list = cand_list + ", "; }
+            cand_list = cand_list + this.intern.resolve(alts[i]);
+        }
+        mut diag: Diagnostic = Diagnostic::error(
+            ErrorCode::E0154_AMBIGUOUS_CALL,
+            format("`%s` is ambiguous: it names a type in more than one module in scope",
+                this.intern.resolve(scope.scope_name)));
+        diag = diag.at_with_label(scope.span,
+            format("candidates: %s", cand_list));
+        diag = diag.with_note("disambiguate with the fully-qualified name, e.g. `Module::Type::method(...)`");
+        this.ctx.emit_diagnostic(diag);
+    }
+
     resolve_scope_call(mut &this, scope: ScopeResolutionNode*, call: CallExprNode*) -> TypeRef {
-        mut lookup_sym: SymbolStr = scope.scope_name;
+        // A bare scope that resolves to two or more import-visible same-leaf
+        // types is a hard ambiguity: the author must qualify it.  Reported once,
+        // in a real (non-symbolic) pass, only for a non-generic scope (a generic
+        // scope carries its own args-driven resolution).  Reporting does not
+        // stop resolution: it proceeds with the bare form so a single, clean
+        // E0154 is emitted rather than a cascade of downstream misresolutions.
+        if (scope.scope_generic_args.length == 0 && !this.state.in_symbolic_check
+                && this.ctx.scope_is_ambiguous(scope.scope_name)) {
+            this.report_scope_ambiguity(scope);
+        }
+        // Resolve the scope to the import-visible qualified type FIRST, so a
+        // same-leaf type in another module (`Coll::B::Beacon` when this module
+        // imported `Coll::A::Beacon`) can't win the bare `lookup_method_return`
+        // via last-write-wins.  Falls through to the bare form downstream when
+        // scoping doesn't apply (unique leaf, module scope, or a generic param).
+        mut lookup_sym: SymbolStr = this.ctx.resolve_scoped_or(scope.scope_name);
         if (scope.scope_generic_args.length > 0) {
             const spec_sym: SymbolStr = this.resolve_generic_scope_name(scope.scope_name, scope.scope_generic_args);
             if (spec_sym.is_valid()) { lookup_sym = spec_sym; }
@@ -2200,7 +2235,7 @@ type struct CallResolver {
         const scope_entry: TemplateEntry* = this.ctx.generic_registry.get_template(scope_sym);
         if (scope_entry != null) { return true; }
         if (this.ctx.decl_index != null) {
-            const qscope: SymbolStr = this.ctx.decl_index.resolve_qualified(scope_sym);
+            const qscope: SymbolStr = this.ctx.resolve_scoped_or(scope_sym);
             if (qscope.is_valid() && !qscope.equals(scope_sym)) {
                 if (this.ctx.generic_registry.get_template(qscope) != null) { return true; }
             }
@@ -2211,7 +2246,7 @@ type struct CallResolver {
             const csym: SymbolStr = this.intern.intern(format("%s::%s", scope_str, member_str));
             if (this.ctx.generic_registry.get_template(csym) != null) { return true; }
             if (this.ctx.decl_index != null) {
-                const qscope2: SymbolStr = this.ctx.decl_index.resolve_qualified(scope_sym);
+                const qscope2: SymbolStr = this.ctx.resolve_scoped_or(scope_sym);
                 if (qscope2.is_valid() && !qscope2.equals(scope_sym)) {
                     const qcsym: SymbolStr = this.intern.intern(format("%s::%s", this.intern.resolve(qscope2), member_str));
                     if (this.ctx.generic_registry.get_template(qcsym) != null) { return true; }
@@ -2225,43 +2260,33 @@ type struct CallResolver {
                 if (t != null && t.kind == TypeKind::InstantiatedType) { return true; }
             }
         }
-        // Same-leaf shadow disambiguation.  `resolve_qualified` binds a bare
-        // scope to the globally-first same-leaf type, which may be a LOCAL
-        // NON-generic type shadowing a stdlib generic template of the same leaf
-        // (e.g. a test-local `type struct Pair` vs `std::collections::pair::Pair`).
-        // A static call `Pair::new` must still be recognized as generic so mono
-        // specializes it (a bare pin here would leave the callee unspecialized,
-        // and codegen then can't resolve `Pair::new`).  Recognize a same-leaf
-        // generic TYPE-OWNER template (the `name_index` keys on qualified names,
-        // so a bare-leaf `get_template` misses it under a local shadow).
-        const scope_leaf: SymbolStr = this.intern.intern(
-            QualifiedName::leaf_of(this.intern.resolve(scope_sym)));
-        if (this.ctx.generic_registry.get_type_owner_template_with_leaf(scope_leaf) != null) {
-            return true;
-        }
+        // A same-leaf generic template is now recovered directly by the
+        // import-scoped `resolve_scoped_or` probes above (a static call
+        // `Pair::new` resolves `Pair` to the imported `std::collections::pair::Pair`
+        // and finds its template), so the former bare-leaf template scan is no
+        // longer needed.  A LOCAL non-generic type that shadows a same-leaf
+        // stdlib generic without importing it correctly resolves to the local
+        // type here (not generic), and importing both is a hard ambiguity
+        // (E0154) rather than a silent pick.
         return false;
     }
 
-    /// Resolve a static-call scope name to its generic OWNER template, tolerating
-    /// a same-leaf NON-generic type that shadows the bare name in
-    /// `resolve_qualified` (a test-local `Pair` vs `std::collections::pair::Pair`).
-    /// Tries the qualified-name index first (`get_template`), then the bare-leaf
-    /// scan.  Returns null when no generic type-owner template matches; callers
-    /// then member-check by walking the returned template's methods, so a leaf
-    /// match that lacks the static member resolves to nothing.
+    /// Resolve a static-call scope name to its generic OWNER template.  Tries
+    /// the scope name as-is (already-qualified or a spec), then its import-scoped
+    /// qualified form (`resolve_scoped_or`), which recovers a same-leaf stdlib
+    /// generic (`Pair` -> `std::collections::pair::Pair`) that a bare
+    /// `get_template` would miss.  Returns null when no generic type-owner
+    /// template matches; callers then member-check by walking the returned
+    /// template's methods, so a match that lacks the static member resolves to
+    /// nothing.
     resolve_scope_owner_template(&this, scope_sym: SymbolStr) -> TemplateEntry* {
         if (this.ctx.generic_registry == null) { return null; }
         mut tmpl: TemplateEntry* = this.ctx.generic_registry.get_template(scope_sym);
         if (tmpl == null && this.ctx.decl_index != null) {
-            const q: SymbolStr = this.ctx.decl_index.resolve_qualified(scope_sym);
+            const q: SymbolStr = this.ctx.resolve_scoped_or(scope_sym);
             if (q.is_valid() && !q.equals(scope_sym)) {
                 tmpl = this.ctx.generic_registry.get_template(q);
             }
-        }
-        if (tmpl == null) {
-            const leaf: SymbolStr = this.intern.intern(
-                QualifiedName::leaf_of(this.intern.resolve(scope_sym)));
-            tmpl = this.ctx.generic_registry.get_type_owner_template_with_leaf(leaf);
         }
         return tmpl;
     }
@@ -3073,7 +3098,7 @@ type struct CallResolver {
         if (this.ctx.generic_registry != null) {
             mut entry: TemplateEntry* = this.ctx.generic_registry.get_template(base_name);
             if (entry == null) {
-                const di_qual: SymbolStr = this.ctx.decl_index.resolve_qualified(base_name);
+                const di_qual: SymbolStr = this.ctx.resolve_scoped_or(base_name);
                 if (di_qual.is_valid() && !di_qual.equals(base_name)) {
                     entry = this.ctx.generic_registry.get_template(di_qual);
                 }
@@ -3172,7 +3197,12 @@ type struct CallResolver {
     check_scope_call_arg_types(mut &this, visitor: ASTVisitor*, scope: ScopeResolutionNode*,
                                call: CallExprNode*) -> void {
         if (this.ctx.decl_index == null) { return; }
-        mut lookup_sym: SymbolStr = scope.scope_name;
+        // Resolve the scope to the import-visible qualified type FIRST, so a
+        // same-leaf type in another module (`Coll::B::Beacon` when this module
+        // imported `Coll::A::Beacon`) can't win the bare `lookup_method_return`
+        // via last-write-wins.  Falls through to the bare form downstream when
+        // scoping doesn't apply (unique leaf, module scope, or a generic param).
+        mut lookup_sym: SymbolStr = this.ctx.resolve_scoped_or(scope.scope_name);
         if (scope.scope_generic_args.length > 0) {
             const spec_sym: SymbolStr = this.resolve_generic_scope_name(scope.scope_name, scope.scope_generic_args);
             if (spec_sym.is_valid()) { lookup_sym = spec_sym; }

@@ -23,6 +23,50 @@ import std::core::option;
 import std::collections::{ hashmap, pair };
 
 
+/// Outcome of import-scoped bare-leaf name resolution
+/// (`DeclarationIndex::resolve_qualified_scoped`).  Distinguishes the cases the
+/// old context-free `resolve_qualified` collapsed onto a single last-write-wins
+/// pick: a clean unique resolution, a same-module (local) definition, a genuine
+/// import-visible ambiguity (a hard error the caller must diagnose), and a
+/// clean miss.  `Ambiguous` carries no payload; the caller re-fetches the
+/// candidate set via `lookup_qualified_alternatives` for the diagnostic.
+type enum ScopeResolution {
+    NotFound;
+    Unique(SymbolStr);
+    SameModule(SymbolStr);
+    Ambiguous;
+}
+
+implement enum ScopeResolution {
+    /// The resolved qualified name for a clean/local resolution, or `bare`
+    /// unchanged on a miss or ambiguity.  Mirrors the old `resolve_qualified`
+    /// contract so migrated call sites that only want a name stay one-liners;
+    /// ambiguity is surfaced separately via `is_ambiguous` at the authoritative
+    /// (type-resolution / sema) sites that own the diagnostic.
+    resolved_or(&this, bare: SymbolStr) -> SymbolStr {
+        match (&this) {
+            ScopeResolution::Unique(q)     => { return q; }
+            ScopeResolution::SameModule(q) => { return q; }
+            _                              => { return bare; }
+        }
+    }
+
+    is_ambiguous(&this) -> boolean {
+        match (&this) {
+            ScopeResolution::Ambiguous => { return true; }
+            _                          => { return false; }
+        }
+    }
+
+    is_found(&this) -> boolean {
+        match (&this) {
+            ScopeResolution::NotFound => { return false; }
+            _                         => { return true; }
+        }
+    }
+}
+
+
 type struct DeclarationIndex {
     // Function name -> return type
     func_returns:   HashMap<u32, TypeRef>;
@@ -57,12 +101,6 @@ type struct DeclarationIndex {
                                       // path so two modules can each declare the
                                       // same private `const NAME = ...` without
                                       // colliding at link time.
-
-    // Bare name -> qualified name mapping.
-    // When a function is registered under both "printf" and
-    // "std::core::intrinsics::printf", this maps the bare id -> qualified id.
-    // Used by codegen to resolve auto-imported identifiers.
-    bare_to_qualified:   HashMap<u32, u32>;
 
     // Qualified function name -> mangled LLVM symbol name.
     // Computed once at registration time so codegen never mangles.
@@ -153,6 +191,36 @@ type struct DeclarationIndex {
     // entry here). See type_resolution.cryo extern-block handling.
     extern_bare_owner:   HashMap<u32, u32>;
 
+    // --- Import-scoped name resolution (resolve_qualified_scoped) -----------
+    // Everything below is keyed on the NAMESPACE identity space (e.g.
+    // `std::alloc::rc`, `CryoTests::Tests::Lang::LeafDispatchA`), the one space
+    // shared by a type's qualified name (namespace = qualified minus leaf),
+    // `ModuleInfo.dependencies` (stored as namespace names), and the use site's
+    // `current_module_name()`.  It is deliberately stored as resolved SymbolStr
+    // ids rather than reached via a ModuleGraph/CompilationContext back-pointer:
+    // Cryo forbids circular imports (the module graph must be a DAG), and both
+    // module_graph.cryo and compilation_context.cryo already import DeclIndex,
+    // so a back-pointer here would be a compile-time module cycle.
+
+    // Use-site namespace SymbolStr.id -> the namespace ids it imports (a copy of
+    // that module's `ModuleInfo.dependencies`).  Populated once per module by
+    // the orchestrator (instance.cryo) after module discovery.
+    module_imports:      HashMap<u32, u32[]>;
+
+    // Namespace SymbolStr.ids re-exported by `std::prelude` (the modules whose
+    // public types — Rc, Box, Option, Range, ... — are auto-in-scope in every
+    // module).  A LOCAL type whose leaf collides with one of these is a hard
+    // conflict (ambiguous), not a silent shadow.  Populated once.
+    prelude_ns:          u32[];
+
+    // Qualified type-name SymbolStr.id -> is_public.  Lets same-leaf resolution
+    // exclude a PRIVATE cross-module candidate from the visible set so it can't
+    // manufacture a false ambiguity.  A name absent from this map is treated as
+    // public (permissive): resolution then degrades to pure import-scoping,
+    // which is still correct — cross-module privacy is independently enforced
+    // downstream by the visibility pass.
+    type_visibility:     HashMap<u32, boolean>;
+
 
     static new() -> DeclarationIndex {
         return DeclarationIndex {
@@ -170,7 +238,6 @@ type struct DeclarationIndex {
             module_global_keys:       [],
             module_global_modules:    [],
             module_global_namespaces: [],
-            bare_to_qualified:   HashMap<u32, u32>::new(),
             mangled_names:       HashMap<u32, u32>::new(),
             overload_func_keys:    [],
             overload_func_types:   [],
@@ -183,6 +250,9 @@ type struct DeclarationIndex {
             mangled_to_overload_pos: HashMap<u32, u32[]>::new(),
             intrinsic_names:    HashMap<u32, boolean>::new(),
             extern_bare_owner:  HashMap<u32, u32>::new(),
+            module_imports:     HashMap<u32, u32[]>::new(),
+            prelude_ns:         [],
+            type_visibility:    HashMap<u32, boolean>::new(),
         };
     }
 
@@ -828,9 +898,6 @@ type struct DeclarationIndex {
     /// Also records the qualified name in the per-bare alternatives list
     /// so codegen can detect ambiguous bare-name fallbacks.
     register_name_mapping(mut &this, bare: SymbolStr, qualified: SymbolStr) -> void {
-        const h: u64 = hash_int(bare.id as u64);
-        this.bare_to_qualified.insert(bare.id, qualified.id);
-
         // Append to alternatives list, deduped by (bare, qualified) pair --
         // scoped to this bare name's positions via bare_alts_index.
         match (this.bare_alts_index.get_ref(&bare.id)) {
@@ -851,14 +918,181 @@ type struct DeclarationIndex {
         (*slot).push(new_pos);
     }
 
-    /// Resolve a bare name to its qualified form.
-    /// Returns the qualified SymbolStr, or the input unchanged if no mapping exists.
-    resolve_qualified(&this, bare: SymbolStr) -> SymbolStr {
-        const h: u64 = hash_int(bare.id as u64);
-        return match (this.bare_to_qualified.get(&bare.id)) {
-            Option::Some(val) => { SymbolStr::from_id(val) }
-            Option::None      => { bare }
+    // --- Import-scoped resolution: population + query -----------------------
+
+    /// Record a module's import list (its `ModuleInfo.dependencies`, which are
+    /// namespace names) under its own namespace, for later use-site scoping.
+    /// Called once per module by the orchestrator after module discovery.
+    register_module_imports(mut &this, module_ns: SymbolStr, imports: &SymbolStr[]) -> void {
+        mut ids: u32[] = [];
+        for (mut i: i64 = 0; i < imports.length; i++) {
+            ids.push(imports[i].id);
+        }
+        this.module_imports.insert(module_ns.id, ids);
+    }
+
+    /// Seed the prelude re-export set from the fixed list in
+    /// `stdlib/prelude.cryo`.  These namespaces' public types (Rc, Box, Option,
+    /// Result, Range, Iterator, Array, Slice, ...) are auto-in-scope in every
+    /// module via the injected `import std::prelude`, so a LOCAL same-leaf type
+    /// collides with them.  They arrive as `public module` SUBMODULES of the
+    /// prelude, which the loader does NOT record as dependency edges, so they
+    /// can't be derived from the graph — this mirrors `stdlib/prelude.cryo`
+    /// directly.  KEEP IN SYNC if the prelude's `public module` set changes (it
+    /// is deliberately small and stable).
+    seed_prelude_namespaces(mut &this, intern: InternTable*) -> void {
+        mut ns: SymbolStr[] = [];
+        ns.push(intern.intern("std::core::panic"));
+        ns.push(intern.intern("std::core::option"));
+        ns.push(intern.intern("std::core::result"));
+        ns.push(intern.intern("std::core::primitives"));
+        ns.push(intern.intern("std::core::intrinsics"));
+        ns.push(intern.intern("std::core::varargs"));
+        ns.push(intern.intern("std::collections::array"));
+        ns.push(intern.intern("std::core::slice"));
+        ns.push(intern.intern("std::core::ops"));
+        ns.push(intern.intern("std::core::iter"));
+        ns.push(intern.intern("std::alloc::box"));
+        ns.push(intern.intern("std::alloc::rc"));
+        this.register_prelude_namespaces(ns);
+    }
+
+    /// Record the namespaces re-exported by `std::prelude` (deduped).  A local
+    /// same-leaf as any type in these namespaces is a hard conflict.
+    register_prelude_namespaces(mut &this, prelude: SymbolStr[]) -> void {
+        for (mut i: i64 = 0; i < prelude.length; i++) {
+            const id: u32 = prelude[i].id;
+            mut seen: boolean = false;
+            for (mut j: i64 = 0; j < this.prelude_ns.length; j++) {
+                if (this.prelude_ns[j] == id) { seen = true; }
+            }
+            if (!seen) { this.prelude_ns.push(id); }
+        }
+    }
+
+    /// Record a type's visibility (keyed by its qualified name) so same-leaf
+    /// resolution can exclude a private cross-module candidate.
+    set_type_visibility(mut &this, qualified: SymbolStr, is_public: boolean) -> void {
+        this.type_visibility.insert(qualified.id, is_public);
+    }
+
+    /// The defining namespace of a qualified name (everything before the leaf),
+    /// re-interned as a SymbolStr in the shared table so its id is comparable
+    /// with the import/prelude/use-site namespace ids.  A bare name (no `::`)
+    /// yields the empty SymbolStr.
+    namespace_of(&this, qualified: SymbolStr, intern: InternTable*) -> SymbolStr {
+        const full: string = intern.resolve(qualified);
+        const qn: QualifiedName = QualifiedName::parse(intern, full);
+        if (qn.depth() <= 1) { return SymbolStr::empty(); }
+        return intern.intern(qn.display_parent(intern));
+    }
+
+    is_prelude_ns(&this, ns: SymbolStr) -> boolean {
+        for (mut i: i64 = 0; i < this.prelude_ns.length; i++) {
+            if (this.prelude_ns[i] == ns.id) { return true; }
+        }
+        return false;
+    }
+
+    /// Whether the module `use_site_ns` imports (depends on) `target_ns`.
+    ns_imports(&this, use_site_ns: SymbolStr, target_ns: SymbolStr) -> boolean {
+        match (this.module_imports.get_ref(&use_site_ns.id)) {
+            Option::Some(ids) => {
+                mut k: i64 = 0;
+                while (k < (*ids).length) {
+                    if ((*ids)[k] == target_ns.id) { return true; }
+                    k = k + 1;
+                }
+            }
+            Option::None => { }
+        }
+        return false;
+    }
+
+    /// Visibility verdict for a candidate; permissive default (see
+    /// `type_visibility`).
+    is_candidate_public(&this, qualified: SymbolStr) -> boolean {
+        return match (this.type_visibility.get(&qualified.id)) {
+            Option::Some(v) => { v }
+            Option::None    => { true }
         };
+    }
+
+    /// Resolve a bare leaf to the qualified name the USE SITE actually means,
+    /// using its namespace + import list.  This is the import-aware replacement
+    /// for the context-free, last-write-wins `resolve_qualified`: it only
+    /// differs when a leaf has MORE THAN ONE registered qualified form (a
+    /// same-leaf collision); a unique leaf resolves identically and cheaply.
+    ///
+    /// Precedence (a local definition beats imports; a prelude name is special):
+    ///   1. exactly one candidate            -> Unique
+    ///   2. a same-namespace (local) candidate:
+    ///        - also a prelude-name candidate -> Ambiguous  (local vs prelude
+    ///          is a hard conflict; the local must be renamed or qualified)
+    ///        - otherwise                     -> SameModule (local wins)
+    ///   3. no local candidate: keep the public candidates whose namespace is
+    ///      imported (or preluded):
+    ///        - exactly one  -> Unique
+    ///        - two or more  -> Ambiguous  (caller demands qualification)
+    ///        - none visible -> NotFound   (a later "undefined" error owns it)
+    resolve_qualified_scoped(&this, bare: SymbolStr, use_site_ns: SymbolStr,
+                             intern: InternTable*) -> ScopeResolution {
+        const cands: SymbolStr[] = this.lookup_qualified_alternatives(bare);
+        if (cands.length == 0) { return ScopeResolution::NotFound; }
+        if (cands.length == 1) { return ScopeResolution::Unique(cands[0]); }
+
+        mut local:   SymbolStr[] = [];
+        mut visible: SymbolStr[] = [];
+        mut prelude_hit: boolean = false;
+        for (mut i: i64 = 0; i < cands.length; i++) {
+            const c: SymbolStr = cands[i];
+            const c_ns: SymbolStr = this.namespace_of(c, intern);
+            if (c_ns.id == use_site_ns.id) {
+                local.push(c);
+                continue;
+            }
+            const c_prelude: boolean = this.is_prelude_ns(c_ns);
+            if (c_prelude) { prelude_hit = true; }
+            if ((c_prelude || this.ns_imports(use_site_ns, c_ns))
+                && this.is_candidate_public(c)) {
+                visible.push(c);
+            }
+        }
+
+        if (local.length >= 1) {
+            if (prelude_hit)        { return ScopeResolution::Ambiguous; }
+            if (local.length == 1)  { return ScopeResolution::SameModule(local[0]); }
+            return ScopeResolution::Ambiguous;
+        }
+        if (visible.length == 1) { return ScopeResolution::Unique(visible[0]); }
+        if (visible.length == 0) { return ScopeResolution::NotFound; }
+        return ScopeResolution::Ambiguous;
+    }
+
+    /// Convenience mirroring the old `resolve_qualified` return contract:
+    /// the resolved qualified name, or `bare` unchanged on a miss/ambiguity.
+    /// Use at non-authoritative sites (codegen, which receives already-qualified
+    /// names); authoritative sites call `resolve_qualified_scoped` directly so
+    /// they can diagnose `Ambiguous`.
+    resolve_qualified_scoped_or(&this, bare: SymbolStr, use_site_ns: SymbolStr,
+                                intern: InternTable*) -> SymbolStr {
+        return this.resolve_qualified_scoped(bare, use_site_ns, intern).resolved_or(bare);
+    }
+
+    /// Context-FREE canonicalization: fold a bare leaf to its qualified form
+    /// only when that form is UNAMBIGUOUS (exactly one registered candidate);
+    /// otherwise return the input unchanged.  Unlike `resolve_qualified_scoped`,
+    /// this deliberately ignores the use site — it exists for the few consumers
+    /// that need a module-INDEPENDENT identity (cross-module coherence keys in
+    /// `type_name_key` / where-clause keying), where a use-site-dependent answer
+    /// would key the same type differently from different modules and break
+    /// dedup.  A colliding leaf stays bare here (callers fall back to the arena
+    /// type id, which is itself canonical), which is strictly MORE
+    /// module-independent than the old last-write-wins pick.
+    canonical_qualified(&this, bare: SymbolStr) -> SymbolStr {
+        const cands: SymbolStr[] = this.lookup_qualified_alternatives(bare);
+        if (cands.length == 1) { return cands[0]; }
+        return bare;
     }
 
     /// Return every qualified name registered under the given bare name.

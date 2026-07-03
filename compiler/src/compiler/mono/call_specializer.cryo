@@ -43,6 +43,11 @@ type struct MonoCallSpecializer {
     trait_spec:       MonoTraitSpecializer*;
     ast_resolver:     MonoAstResolver*;
     current_module:   SymbolStr;
+    // The current module's NAMESPACE (distinct from `current_module`, which is
+    // the source-file identity used for origin tracking).  Import-scoped generic
+    // scope resolution keys on the namespace space, so it needs this, not the
+    // file path.  Set by the specialization pass alongside `current_module`.
+    current_ns:       SymbolStr;
     // Transient owner context, set only while re-walking a generic static
     // method's specialized body (finish_generic_static_method_spec): an
     // owner-constructing struct literal (`Wrap { v: item }`) whose type the
@@ -66,6 +71,7 @@ type struct MonoCallSpecializer {
             trait_spec:       null,
             ast_resolver:     null,
             current_module:   SymbolStr::empty(),
+            current_ns:       SymbolStr::empty(),
             gsm_owner_leaf:   SymbolStr::empty(),
             gsm_owner_recv:   TypeRef::invalid(),
             gsm_owner_spec:   SymbolStr::empty(),
@@ -90,6 +96,10 @@ type struct MonoCallSpecializer {
 
     set_current_module(mut &this, module: SymbolStr) -> void {
         this.current_module = module;
+    }
+
+    set_current_ns(mut &this, ns: SymbolStr) -> void {
+        this.current_ns = ns;
     }
 
 
@@ -451,7 +461,8 @@ type struct MonoCallSpecializer {
         if (callee_scope.is_valid()) {
             const member_str: string = this.intern_table.resolve(callee_name);
             const qualified_scope: SymbolStr = if (this.decl_index != null) {
-                this.decl_index.resolve_qualified(callee_scope)
+                this.decl_index.resolve_qualified_scoped_or(
+                    callee_scope, this.current_ns, this.intern_table)
             } else {
                 callee_scope
             };
@@ -1114,7 +1125,8 @@ type struct MonoCallSpecializer {
         if (registry == null) { return false; }
         mut entry: TemplateEntry* = registry.get_template(scope.scope_name);
         if (entry == null && this.decl_index != null) {
-            const q: SymbolStr = this.decl_index.resolve_qualified(scope.scope_name);
+            const q: SymbolStr = this.decl_index.resolve_qualified_scoped_or(
+                scope.scope_name, this.current_ns, this.intern_table);
             if (q.is_valid() && !q.equals(scope.scope_name)) {
                 entry = registry.get_template(q);
             }
