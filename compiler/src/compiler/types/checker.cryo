@@ -733,12 +733,15 @@ type struct TypeChecker {
             // the expression as a type error, the result's resolved_type is
             // invalid, and `*p` falls through to a generic `load i32`
             // instead of the i8-load + zext that codegen does for `*string`.
+            //
+            // Only the cursor-first form (`string + numeric`) is accepted:
+            // it lowers to a GEP with the string as base.  The commutative
+            // `numeric + string` is intentionally rejected — codegen has no
+            // arm for a numeric base and would emit `add ptr, i64` (invalid
+            // IR).  Advancing a cursor reads naturally cursor-first anyway;
+            // write `s + n`, not `n + s`.
             if ((op == "+" || op == "-") &&
                     lhs_type.kind == TypeKind::String && rhs_type.is_numeric()) {
-                return TypeCheckResult::ok(this.arena.get_string());
-            }
-            if (op == "+" &&
-                    lhs_type.is_numeric() && rhs_type.kind == TypeKind::String) {
                 return TypeCheckResult::ok(this.arena.get_string());
             }
             // Pointer / reference arithmetic: `p + offset`, `p - offset`
@@ -747,16 +750,13 @@ type struct TypeChecker {
             // buffer code (`buffer.ptr() + length`, `cursor++`,
             // `&scratch[0] + i`).  `p - q` where both sides are pointers
             // (returning a count) is intentionally NOT accepted here;
-            // emit it explicitly with `as i64` casts.
+            // emit it explicitly with `as i64` casts.  As with strings,
+            // only the pointer-first form is accepted; `numeric + pointer`
+            // is rejected for the same broken-IR reason.
             const lhs_is_ptrlike: boolean = lhs_type.kind == TypeKind::Pointer
                                          || lhs_type.kind == TypeKind::Reference;
-            const rhs_is_ptrlike: boolean = rhs_type.kind == TypeKind::Pointer
-                                         || rhs_type.kind == TypeKind::Reference;
             if ((op == "+" || op == "-") && lhs_is_ptrlike && rhs_type.is_numeric()) {
                 return TypeCheckResult::ok(lhs);
-            }
-            if (op == "+" && lhs_type.is_numeric() && rhs_is_ptrlike) {
-                return TypeCheckResult::ok(rhs);
             }
             return TypeCheckResult::fail(format("Cannot apply '%s' to %s and %s",
                 op, lhs_type.kind.to_string(), rhs_type.kind.to_string()));
