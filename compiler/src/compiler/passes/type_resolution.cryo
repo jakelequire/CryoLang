@@ -1289,19 +1289,33 @@ type struct TypeResolutionPasses {
                                 trait_root, canonical_target, node);
                         }
                         // Precise (collision-proof) registration by canonical
-                        // BASE type id.  This is the authoritative, import-
-                        // resolved site, so resolving `canonical_target` to its
-                        // arena type here yields the same base id the ownership
-                        // Drop/Copy queries derive from a target TypeRef - which
-                        // lets a user type that merely SHARES a stdlib type's
-                        // leaf (e.g. a local `Pair` vs stdlib `Pair<A,B>`) no
-                        // longer inherit its Drop impl.  Ungated (also covers
-                        // same-module impls where canonical_target == bare); a
-                        // non-aggregate / unresolvable target yields base id 0
-                        // and is skipped (bare-name fallback still applies).
+                        // QUALIFIED-NAME identity.  This is the authoritative,
+                        // import-resolved site, so resolving the impl's target to
+                        // its arena type here yields the same qualified-name id
+                        // the ownership Drop/Copy queries derive from a target
+                        // TypeRef (via `named_qualified_id`) - which lets a user
+                        // type that merely SHARES a stdlib type's leaf (e.g. a
+                        // local `Pair` vs stdlib `Pair<A,B>`) no longer inherit
+                        // its Drop impl.  A non-aggregate / unresolvable target
+                        // yields qual id 0 and is skipped (bare-name fallback
+                        // still applies).
+                        //
+                        // Resolve the target MODULE-FIRST: `qualify_symbol_sym`
+                        // qualifies the bare `node.target_type` with the impl's
+                        // OWN defining namespace, so a `Drop` impl co-located with
+                        // its type (the common shape - stdlib `Pair`'s Drop lives
+                        // in `std::collections::pair`) resolves to THAT type, not
+                        // to whichever same-leaf type `lookup_type` happens to
+                        // return first.  The `canonical_target` / bare fallbacks
+                        // below cover cross-module impls whose target is not in
+                        // the defining namespace.
                         if (trait_root.is_valid()) {
                             mut tgt_ref: TypeRef = ctx.decl_index.lookup_type(
-                                ctx.decl_index.resolve_qualified(canonical_target));
+                                ctx.qualify_symbol_sym(node.target_type));
+                            if (!tgt_ref.is_valid()) {
+                                tgt_ref = ctx.decl_index.lookup_type(
+                                    ctx.decl_index.resolve_qualified(canonical_target));
+                            }
                             if (!tgt_ref.is_valid()) {
                                 tgt_ref = ctx.decl_index.lookup_type(canonical_target);
                             }
@@ -1309,15 +1323,24 @@ type struct TypeResolutionPasses {
                                 tgt_ref = ctx.decl_index.lookup_type(node.target_type);
                             }
                             if (tgt_ref.is_valid()) {
-                                const base_id: u64 =
-                                    OwnershipQuery::named_base_type_id(
-                                        ctx.type_arena, tgt_ref);
-                                if (base_id != 0) {
+                                const qual_id: u64 =
+                                    OwnershipQuery::named_qualified_id(
+                                        ctx.type_arena, ctx.intern_table, tgt_ref);
+                                if (qual_id != 0) {
                                     const tgt_leaf: SymbolStr =
                                         OwnershipQuery::registry_name_of(
                                             ctx.type_arena, ctx.intern_table, tgt_ref);
+                                    // Normalize the trait name to its LEAF so a
+                                    // qualified `implement trait Mod::Tr` and a
+                                    // bare `implement trait Tr` share one precise
+                                    // key (the lookup side uses `leaf_segment`
+                                    // too).  `Drop` is already a leaf, so the
+                                    // ownership Drop path is unaffected.
+                                    const trait_leaf_reg: SymbolStr =
+                                        OwnershipQuery::leaf_segment(
+                                            ctx.intern_table, trait_root);
                                     ctx.generic_registry.register_trait_impl_typed(
-                                        trait_root, tgt_leaf, base_id, node);
+                                        trait_leaf_reg, tgt_leaf, qual_id, node);
                                 }
                             }
                         }
