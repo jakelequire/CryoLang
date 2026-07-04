@@ -1,10 +1,12 @@
 ///! Operator traits (`core::ops`): user `Deref` / `Index` impls.
 ///!
-///! v1.0 ships the `Deref<Target>` and `Index<Idx, Output>` traits with
-///! their explicit methods (`.deref()` / `.index()`); the `*` / `[]`
-///! operator sugar over user types is a documented post-1.0 follow-up
-///! (see `core::ops`), so these tests call the methods directly. They
-///! pin that a user type can implement the operator traits and that the
+///! v1.0 ships the `Deref<Target>` trait with its explicit `.deref()`
+///! method (`*` sugar is a documented post-1.0 follow-up), so the `Deref`
+///! tests call the method directly. The `Index<Idx, Output>` trait now has
+///! full `[]` operator sugar: `a[i]` desugars to `*(a.index(i))`, which is a
+///! place, so it works as a read, a write target, and a compound-assignment
+///! target. The tests pin the sugar (read/write/compound, generic and
+///! bounded-param dispatch) alongside the direct-method contract that the
 ///! returned pointer aliases the receiver's storage in place.
 
 ![config(testing)]
@@ -87,4 +89,93 @@ function index_pointer_aliases_in_place() -> Result<(), TestError> {
     const p: i32* = t.index(1u64);
     *p = 99;
     return expect_eq(t.b, 99);
+}
+
+// A container whose `index` bumps a counter, so a compound assignment that
+// evaluated the LHS place twice would show `calls == 2`.
+type struct Counted {
+    slot:  i32;
+    calls: i32;
+}
+
+implement trait Index<i64, i32> for Counted {
+    index(mut &this, idx: i64) -> i32* {
+        this.calls = this.calls + 1;
+        return &this.slot;
+    }
+}
+
+// A generic container: exercises the mono/cloner/substituter descent into the
+// index desugar so `Wrap<i32>::index` gets specialized.
+type struct Wrap<T> {
+    x: T;
+    y: T;
+}
+
+implement<T> trait Index<i64, T> for struct Wrap<T> {
+    index(&this, idx: i64) -> T* {
+        if (idx == 0) { return &this.x; }
+        return &this.y;
+    }
+}
+
+// `c[i]` on a generic param bounded by `Index` (Phase 2). Triple is all-scalar,
+// so passing it by value is a plain copy.
+function get_at<T>(c: T, i: u64) -> i32 where T: Index<u64, i32> {
+    return c[i];
+}
+
+// `[]` sugar as a read: `t[i]` desugars to `*(t.index(i))`.
+![test]
+function index_sugar_reads() -> Result<(), TestError> {
+    const t: Triple = Triple { a: 10, b: 20, c: 30 };
+    match (expect_eq(t[0u64], 10)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(t[1u64], 20)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(t[2u64], 30);
+}
+
+// `[]` sugar as a write target: the desugar `*(t.index(i))` is a place.
+![test]
+function index_sugar_writes() -> Result<(), TestError> {
+    mut t: Triple = Triple { a: 1, b: 2, c: 3 };
+    t[1u64] = 99;
+    return expect_eq(t.b, 99);
+}
+
+// Compound assignment through `[]` calls `index` exactly once.
+![test]
+function index_sugar_compound_once() -> Result<(), TestError> {
+    mut c: Counted = Counted { slot: 5, calls: 0 };
+    c[0] += 7;
+    match (expect_eq(c.slot, 12)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(c.calls, 1);
+}
+
+// Generic container: `[]` sugar reads and writes through a specialized
+// `Wrap<i32>::index`.
+![test]
+function index_sugar_generic() -> Result<(), TestError> {
+    mut w: Wrap<i32> = Wrap<i32> { x: 100, y: 200 };
+    match (expect_eq(w[0], 100)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    w[1] = 250;
+    return expect_eq(w.y, 250);
+}
+
+// `[]` on a generic param bounded by `Index`.
+![test]
+function index_sugar_bounded_param() -> Result<(), TestError> {
+    const t: Triple = Triple { a: 7, b: 8, c: 9 };
+    return expect_eq(get_at(t, 2u64), 9);
 }

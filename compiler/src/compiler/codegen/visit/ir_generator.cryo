@@ -1071,6 +1071,18 @@ public:
     }
 
     override visit(mut &this, node: ArrayAccessNode*) -> void {
+        // Index operator overloading: sema rewrote `a[i]` on a user type (or a
+        // generic param bounded by `Index`) into `*(a.index(i))` and hung it on
+        // `desugared_call`.  Delegate to that expression with a plain
+        // generate_expression — do NOT force an rvalue.  The `*` emitter leaves
+        // `last_is_lvalue = true` (the deref is a place), so the enclosing
+        // codegen_rvalue / codegen_lvalue caller decides load-vs-address.  This
+        // single delegation covers reads (`v = a[i]`), writes (`a[i] = x`), and
+        // compound assignment (`a[i] += x`), calling `index` exactly once.
+        if (node.desugared_call != null) {
+            this.dispatch.generate_expression(this, node.desugared_call);
+            return;
+        }
         // Tuple bracket indexing is a struct GEP. Sema validated the
         // index at compile time, so we can read the literal value
         // here and skip codegen_array_access entirely (which is sized
