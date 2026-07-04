@@ -358,7 +358,23 @@ type struct MemberResolver {
     /// succeeded in `check_index_access`), mirroring the arithmetic desugar.
     try_index_overload(mut &this, visitor: ASTVisitor*, access: ArrayAccessNode*,
                        ty: TypeRef) -> ExpressionNode* {
-        const t: Type* = this.arena.lookup(ty.id);
+        mut base_ty: TypeRef = ty;
+        mut t: Type* = this.arena.lookup(base_ty.id);
+        if (t == null) { return null; }
+        // Auto-deref a reference base (`&Vec`): `check_index_access` on a
+        // reference recurses to the referent and fails for a user Index type, so
+        // a by-reference container reaches here typed as `Reference`.  Unwrap it
+        // (indexing a reference has no primitive rule that could be perturbed) so
+        // `v[i]` on a `&T` parameter overloads exactly like on a value — the
+        // method call auto-derefs the receiver.  Raw pointers are left alone:
+        // `Vec*[i]` keeps its C pointer-arithmetic meaning (which already
+        // succeeded in `check_index_access` and never reaches here).
+        mut rdepth: i32 = 0;
+        while (t != null && t.kind == TypeKind::Reference && rdepth < 4) {
+            base_ty = (t as ReferenceType*).referent;
+            t = this.arena.lookup(base_ty.id);
+            rdepth += 1;
+        }
         if (t == null) { return null; }
         const index_leaf: SymbolStr = this.intern.intern("Index");
         mut overloads: boolean = false;
@@ -367,7 +383,7 @@ type struct MemberResolver {
         } else if (t.kind == TypeKind::Struct || t.kind == TypeKind::Class
                 || t.kind == TypeKind::Enum || t.kind == TypeKind::InstantiatedType) {
             const impl_block: ImplBlockNode* = OwnershipQuery::resolve_trait_impl_for_type(
-                this.arena, this.ctx.generic_registry, this.intern, index_leaf, ty);
+                this.arena, this.ctx.generic_registry, this.intern, index_leaf, base_ty);
             overloads = impl_block != null;
         } else {
             return null;
@@ -420,7 +436,15 @@ type struct MemberResolver {
     /// true when it emitted (caller skips the fallback); false for non-user bases
     /// (a genuine primitive index error keeps its original message).
     emit_index_missing_impl(mut &this, ty: TypeRef, span: SourceSpan) -> boolean {
-        const t: Type* = this.arena.lookup(ty.id);
+        mut t: Type* = this.arena.lookup(ty.id);
+        if (t == null) { return false; }
+        // Look through references so `&UserType` (a by-reference container that
+        // still lacks an `Index` impl) gets the trait-naming diagnostic too.
+        mut rdepth: i32 = 0;
+        while (t != null && t.kind == TypeKind::Reference && rdepth < 4) {
+            t = this.arena.lookup((t as ReferenceType*).referent.id);
+            rdepth += 1;
+        }
         if (t == null) { return false; }
         const is_user: boolean = t.kind == TypeKind::Struct || t.kind == TypeKind::Class
                               || t.kind == TypeKind::Enum || t.kind == TypeKind::InstantiatedType;
