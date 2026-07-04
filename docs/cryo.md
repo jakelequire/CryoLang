@@ -695,7 +695,7 @@ This is a defined deterministic result, not undefined behavior, but it is *silen
 | `<` `>` `<=` `>=` | Ordering comparisons                                         |
 | `<=>`             | Three-way comparison (spaceship); negative / zero / positive |
 
-Comparison operators return `boolean`. They work on numeric types and pointers; for user-defined types, use the `Eq` and `Ord` traits ([§ 11](#11-traits)).
+Comparison operators return `boolean`. On numeric types and pointers they emit native instructions; on user-defined types that implement `Eq`/`Ord` they are **overloaded** — `a == b` becomes `a.equals(&b)` and `a < b` becomes `a.compare(&b).is_lt()` (see operator overloading, [§ 11.6](#116-operator-overloading)).
 
 ### 5.3 Logical
 
@@ -1601,9 +1601,10 @@ where T: Hash + Eq, V: Clone
 | `Drop`                      | Explicit destructor; types implementing it are non-`Copy`.                                                 |
 | `Clone`                     | Explicit deep duplication via `clone()`.                                                                   |
 | `Default`                   | A canonical zero value: `static default() -> This`.                                                        |
-| `Eq`                        | Equality.                                                                                                  |
-| `Ord` (`: Eq`)              | Total ordering via `compare(...) -> Ordering`.                                                             |
+| `Eq`                        | Equality (backs `==` / `!=`; see [§11.6](#116-operator-overloading)).                                     |
+| `Ord` (`: Eq`)              | Total ordering via `compare(...) -> Ordering` (backs `< > <= >=`).                                         |
 | `Hash`                      | Type-level hashing into a `Hasher`.                                                                        |
+| `Add`/`Sub`/`Mul`/`Div`/`Rem`, `Neg`, `BitAnd`/`BitOr`/`BitXor`/`Shl`/`Shr`, `Not`/`BitNot`, `Index`, `Deref` | Operator overloading — see [§11.6](#116-operator-overloading). |
 | `Iterator`                  | Lazy sequence with an associated `Item` and `next() -> Option<Item>` (see [§11.5](#115-associated-types)). |
 | `IntoIterator`              | Conversion into an iterator.                                                                               |
 | `From<T>` / `Into<T>`       | Infallible conversions.                                                                                    |
@@ -1682,6 +1683,130 @@ implement trait Seq<NotCopy> for struct Holder { … }   // E0306: Item not Copy
 
 Because Cryo monomorphises, a projection is fully resolved at compile time:
 `MapIter<Range<i32>, i64>::Item` reduces to `i64` with no runtime cost.
+
+### 11.6 Operator Overloading
+
+Operators on a user-defined type desugar, in the compiler, to a call to the
+corresponding **operator trait** method. Implement the trait and the operator
+works on your type; the rewrite happens during semantic analysis, so there is
+no runtime dispatch and the result monomorphises like any other method call.
+
+The rewrite is **type-directed** and **LHS-driven**: `a OP b` dispatches on the
+type of `a`, and it only fires when the built-in rule does not already apply.
+Primitive arithmetic (`1 + 2`), pointer stepping, and native integer/pointer
+comparison keep emitting raw instructions — primitives deliberately do **not**
+implement the arithmetic traits. The operator traits live in
+[`stdlib/core/ops.cryo`](../stdlib/core/ops.cryo) (`Eq`/`Ord` are in
+[`stdlib/core/cmp.cryo`](../stdlib/core/cmp.cryo)).
+
+| Operator(s)                | Trait (`core::ops` / `core::cmp`) | Method / desugar                                 |
+| -------------------------- | --------------------------------- | ------------------------------------------------ |
+| `+` `-` `*` `/` `%`        | `Add` `Sub` `Mul` `Div` `Rem`     | `a + b` → `a.add(&b)` (etc.)                      |
+| `-` (unary)                | `Neg`                             | `-a` → `a.neg()`                                  |
+| `&` `\|` `^` `<<` `>>`     | `BitAnd` `BitOr` `BitXor` `Shl` `Shr` | `a & b` → `a.bitand(&b)` (etc.)              |
+| `!` `~` (unary)            | `Not` `BitNot`                    | `!a` → `a.not()`, `~a` → `a.bitnot()`            |
+| `==` `!=`                  | `Eq`                              | `a == b` → `a.equals(&b)`, `a != b` → `!a.equals(&b)` |
+| `<` `>` `<=` `>=`          | `Ord` (`: Eq`)                    | `a < b` → `a.compare(&b).is_lt()` (`is_gt`/`is_le`/`is_ge`) |
+| `a[i]`                     | `Index<Idx, Output>`              | `a[i]` → `*(a.index(i))`                          |
+| `*a` (deref)              | `Deref<Target>`                   | `*a` → `*(a.deref())`                             |
+
+Each arithmetic/bitwise trait carries `Rhs` and `Output` type parameters, so an
+operator can mix types (add a scalar to a vector, shift by a plain integer) and
+choose its result type. The right operand is taken **by reference** (`rhs: &Rhs`)
+to avoid moving an owned aggregate.
+
+```cryo
+type struct Vec2 { x: i64; y: i64; }
+
+implement trait Add<Vec2, Vec2> for struct Vec2 {
+    add(&this, rhs: &Vec2) -> Vec2 { return Vec2 { x: this.x + rhs.x, y: this.y + rhs.y }; }
+}
+implement trait Mul<i64, Vec2> for struct Vec2 {          // scalar on the right
+    mul(&this, rhs: &i64) -> Vec2 { return Vec2 { x: this.x * *rhs, y: this.y * *rhs }; }
+}
+implement trait Neg<Vec2> for struct Vec2 {
+    neg(&this) -> Vec2 { return Vec2 { x: -this.x, y: -this.y }; }
+}
+
+const a: Vec2 = Vec2 { x: 1, y: 2 };
+const b: Vec2 = Vec2 { x: 3, y: 4 };
+const c: Vec2 = a + b;      // Vec2 { 4, 6 }
+const d: Vec2 = a * 3;      // Vec2 { 3, 6 }
+const e: Vec2 = -a;         // Vec2 { -1, -2 }
+```
+
+**Equality and ordering.** Implement `Eq` for `==`/`!=` and `Ord` (which extends
+`Eq`) for `< > <= >=`. A single `compare` backs all four relational operators
+through the `Ordering` predicates:
+
+```cryo
+implement trait Eq for struct Vec2 {
+    equals(&this, other: &Vec2) -> boolean { return this.x == other.x && this.y == other.y; }
+}
+implement trait Ord for struct Vec2 {
+    compare(&this, other: &Vec2) -> Ordering {
+        if (this.x != other.x) { return this.x.compare(&other.x); }
+        return this.y.compare(&other.y);
+    }
+}
+const eq: boolean = a == b;   // a.equals(&b)      -> false
+const lt: boolean = a < b;    // a.compare(&b).is_lt() -> true
+```
+
+**Compound assignment** routes through the same trait: `a += b` evaluates
+`a.add(&b)` and stores the result back into `a`. This holds for every binary
+arithmetic, bitwise, and shift operator (`+= -= *= /= %= &= |= ^= <<= >>=`).
+
+**Indexing.** `Index<Idx, Output>::index` returns a **pointer** (`Output*`), so
+the desugar `a[i]` → `*(a.index(i))` is a *place*: one implementation serves
+reads (`v = a[i]`), writes (`a[i] = v`), and compound assignment (`a[i] += v`).
+Built-in array/slice/string/pointer indexing keeps its native path.
+
+```cryo
+type struct Grid { cells: i32[9]; }
+implement trait Index<u64, i32> for struct Grid {
+    index(&this, i: u64) -> i32* { return &this.cells[i]; }
+}
+mut g: Grid = ...;
+g[0] = 42;        // *(g.index(0)) = 42
+g[0] += 1;        // index called once
+```
+
+**Dereference and auto-deref.** `Deref<Target>::deref` also returns a pointer
+(`Target*`), so `*b` → `*(b.deref())` is likewise a place (read/write/compound).
+Member access **coerces** through `Deref` too: when a receiver lacks a field or
+method but implements `Deref`, `b.field` / `b.method()` retry on the pointee
+(transitively), inserting the `.deref()` chain for you — the smart-pointer
+pattern.
+
+```cryo
+type struct Boxed<T> { value: T; }
+implement<T> trait Deref<T> for struct Boxed<T> {
+    deref(&this) -> T* { return &this.value; }
+}
+mut b: Boxed<Vec2> = Boxed<Vec2> { value: Vec2 { x: 1, y: 2 } };
+const v: Vec2 = *b;   // *(b.deref())
+b.x = 10;             // auto-deref: (*b.deref()).x  — b has no field `x`
+```
+
+**Reference operands.** A by-reference operand (`&T`, the common
+container/parameter case) overloads exactly like a value — `v[i]`, `a + b`,
+`-a`, and `a == b` all work when `a`/`v` is a `&T`. In particular `&x == &y`
+(where the referent implements `Eq`) compares **by value** (`x.equals(&y)`),
+not by pointer identity. A raw pointer `T*` is never unwrapped this way: `p ==
+null` and pointer arithmetic stay on the primitive path.
+
+**Reflected (primitive left operand).** When the left operand is a primitive and
+the right is a user type, the operator dispatches to a trait implemented **on
+the primitive** — `2 * v` calls `(2).mul(&v)` given `implement trait Mul<Vec2,
+Vec2> for i64`. This is the one case where the right operand's type pulls in the
+impl; `Eq`/`Ord` are excluded (their operands share `This`).
+
+Generic and bounded-param dispatch work throughout: a `T: Add` parameter
+overloads `a + b` in a generic body (Phase 2), and the desugar is carried through
+monomorphisation so `Container<i32>::index` (etc.) specialises correctly. When a
+type lacks the required impl, the compiler names the missing trait (e.g. *"`Vec2`
+does not implement `Mul`; add `implement trait Mul ... for Vec2`"*).
 
 ---
 
