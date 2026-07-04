@@ -93,12 +93,19 @@ type struct OperatorTraitMap {
         if (op == ">")  { return OperatorTraitMap::mk_ord("is_gt"); }
         if (op == "<=") { return OperatorTraitMap::mk_ord("is_le"); }
         if (op == ">=") { return OperatorTraitMap::mk_ord("is_ge"); }
+        if (op == "&")  { return OperatorTraitMap::mk("BitAnd", "bitand", false); }
+        if (op == "|")  { return OperatorTraitMap::mk("BitOr",  "bitor",  false); }
+        if (op == "^")  { return OperatorTraitMap::mk("BitXor", "bitxor", false); }
+        if (op == "<<") { return OperatorTraitMap::mk("Shl",    "shl",    false); }
+        if (op == ">>") { return OperatorTraitMap::mk("Shr",    "shr",    false); }
         return OperatorTraitMap::none();
     }
 
     /// Unary `-` (negation). `!` stays a primitive boolean op.
     static for_unary(op: string) -> OperatorTraitMap {
         if (op == "-") { return OperatorTraitMap::mk("Neg", "neg", false); }
+        if (op == "!") { return OperatorTraitMap::mk("Not", "not", false); }
+        if (op == "~") { return OperatorTraitMap::mk("BitNot", "bitnot", false); }
         return OperatorTraitMap::none();
     }
 }
@@ -1105,10 +1112,19 @@ public:
         const member: MemberAccessNode* = new MemberAccessNode(receiver, method, span, span);
         mut call: CallExprNode* = new CallExprNode(member as ExpressionNode*, span);
         if (rhs != null) {
-            const amp: Token = Token::new(TokenType::Amp, "&", op_tok.line, op_tok.column);
-            mut ref_rhs: UnaryExprNode* = new UnaryExprNode(amp, rhs, rhs.span);
-            ref_rhs.is_synthetic = true;
-            call.add_argument(ref_rhs as ExpressionNode*);
+            // The trait method takes `rhs: &Rhs`.  When the operand is already a
+            // reference (`&Rhs`, e.g. a by-reference parameter or `&scratch[0]`),
+            // pass it straight through; only synthesize `&rhs` for a value
+            // operand, so we never build a `&&Rhs` that fails to type-check.
+            const rhs_t: Type* = this.arena.lookup(rhs.resolved_type.id);
+            if (rhs_t != null && rhs_t.kind == TypeKind::Reference) {
+                call.add_argument(rhs);
+            } else {
+                const amp: Token = Token::new(TokenType::Amp, "&", op_tok.line, op_tok.column);
+                mut ref_rhs: UnaryExprNode* = new UnaryExprNode(amp, rhs, rhs.span);
+                ref_rhs.is_synthetic = true;
+                call.add_argument(ref_rhs as ExpressionNode*);
+            }
         }
         return call as ExpressionNode*;
     }
@@ -1146,20 +1162,36 @@ public:
     /// registered trait impl.  Phase 2: a generic param bounded by the trait.
     operator_overload_expr(mut &this, receiver: ExpressionNode*, ty: TypeRef,
                            rhs: ExpressionNode*, map: OperatorTraitMap,
-                           op_tok: Token, span: SourceSpan) -> ExpressionNode* {
+                           op_tok: Token, span: SourceSpan,
+                           deref_ref: boolean) -> ExpressionNode* {
         if (!map.valid) { return null; }
-        const t: Type* = this.arena.lookup(ty.id);
+        mut base_ty: TypeRef = ty;
+        mut t: Type* = this.arena.lookup(base_ty.id);
         if (t == null) { return null; }
-        // Cheap kind gate first, and NOTE: we deliberately do NOT unwrap
-        // pointers / references.  A raw-pointer or reference operand keeps the
-        // primitive path — `this.ptr == null`, pointer arithmetic, and pointer
-        // comparison must never be rewritten into a value-equality / arithmetic
-        // trait call (unwrapping the pointee of a `Pair<..>*` and finding its
-        // `Eq` impl is exactly how `p == null` got miscompiled into
-        // `p.equals(&null)`).  Only a value-typed user aggregate or a bounded
-        // generic param overloads; everything else (primitives, pointers,
-        // references, strings) falls straight through, so the compiler's own
-        // hot-path IR stays byte-identical.
+        // Cheap kind gate.  We NEVER unwrap raw pointers: `this.ptr == null`,
+        // pointer arithmetic, and pointer comparison must keep the primitive
+        // path (unwrapping a `Pair<..>*`'s pointee and finding its `Eq` impl is
+        // exactly how `p == null` got miscompiled into `p.equals(&null)`).
+        //
+        // References ARE unwrapped, but ONLY when `deref_ref` is set — which the
+        // callers do exclusively on the FAILURE path, i.e. after the primitive
+        // `check_binary_op`/`check_unary_op` already rejected the operands.  On
+        // the success path (reference + numeric arithmetic `&p + n`, reference
+        // identity comparison `refA == refB`) the primitive rule applies and
+        // must be preserved byte-identical, so those callers pass
+        // `deref_ref = false`.  With this split, `a + b` / `-a` on a `&T`
+        // parameter (the common by-reference case) overloads just like on a
+        // value, while the pointer-ish primitive paths are untouched.  Bounded
+        // depth guards a pathological `&&T`.
+        if (deref_ref) {
+            mut rdepth: i32 = 0;
+            while (t != null && t.kind == TypeKind::Reference && rdepth < 4) {
+                base_ty = (t as ReferenceType*).referent;
+                t = this.arena.lookup(base_ty.id);
+                rdepth += 1;
+            }
+            if (t == null) { return null; }
+        }
         const is_bounded: boolean = t.kind == TypeKind::BoundedParam;
         const is_user: boolean = t.kind == TypeKind::Struct || t.kind == TypeKind::Class
                               || t.kind == TypeKind::Enum || t.kind == TypeKind::InstantiatedType;
@@ -1170,7 +1202,7 @@ public:
             overloads = this.bounded_param_has_trait(t as BoundedParamType*, trait_leaf);
         } else {
             const impl_block: ImplBlockNode* = OwnershipQuery::resolve_trait_impl_for_type(
-                this.arena, this.ctx.generic_registry, this.intern, trait_leaf, ty);
+                this.arena, this.ctx.generic_registry, this.intern, trait_leaf, base_ty);
             overloads = impl_block != null;
         }
         if (!overloads) { return null; }
@@ -1202,7 +1234,15 @@ public:
     emit_operator_missing_impl(mut &this, ty: TypeRef, map: OperatorTraitMap,
                                op_lexeme: string, span: SourceSpan) -> boolean {
         if (!map.valid) { return false; }
-        const t: Type* = this.arena.lookup(ty.id);
+        mut t: Type* = this.arena.lookup(ty.id);
+        if (t == null) { return false; }
+        // Look through references so `&UserType OP x` (a by-reference operand
+        // lacking the trait impl) gets the trait-naming diagnostic too.
+        mut rdepth: i32 = 0;
+        while (t != null && t.kind == TypeKind::Reference && rdepth < 4) {
+            t = this.arena.lookup((t as ReferenceType*).referent.id);
+            rdepth += 1;
+        }
         if (t == null) { return false; }
         const is_user: boolean = t.kind == TypeKind::Struct || t.kind == TypeKind::Class
                               || t.kind == TypeKind::Enum || t.kind == TypeKind::InstantiatedType;
@@ -1268,14 +1308,14 @@ public:
                 if (cres.success) {
                     if (map.valid && bin.desugared_call == null) {
                         const de: ExpressionNode* = this.operator_overload_expr(
-                            bin.left, lhs, bin.right, map, bin.op, bin.span);
+                            bin.left, lhs, bin.right, map, bin.op, bin.span, false);
                         if (de != null) { bin.desugared_call = de; }
                     }
                 } else {
                     mut overloaded: boolean = false;
                     if (map.valid && bin.desugared_call == null) {
                         const de: ExpressionNode* = this.operator_overload_expr(
-                            bin.left, lhs, bin.right, map, bin.op, bin.span);
+                            bin.left, lhs, bin.right, map, bin.op, bin.span, true);
                         if (de != null) { bin.desugared_call = de; overloaded = true; }
                     }
                     if (!overloaded
@@ -1344,7 +1384,7 @@ public:
                 // Concrete primitives fall straight through (no user impl).
                 if (map.valid && bin.desugared_call == null) {
                     const de: ExpressionNode* = this.operator_overload_expr(
-                        bin.left, lhs, bin.right, map, bin.op, bin.span);
+                        bin.left, lhs, bin.right, map, bin.op, bin.span, false);
                     if (de != null) { bin.desugared_call = de; return de.resolved_type; }
                 }
                 return result.result_type;
@@ -1353,7 +1393,7 @@ public:
             // registered impl overloads; otherwise it is a genuine type error.
             if (map.valid && bin.desugared_call == null) {
                 const de: ExpressionNode* = this.operator_overload_expr(
-                    bin.left, lhs, bin.right, map, bin.op, bin.span);
+                    bin.left, lhs, bin.right, map, bin.op, bin.span, true);
                 if (de != null) { bin.desugared_call = de; return de.resolved_type; }
                 if (this.emit_operator_missing_impl(lhs, map, bin.op.lexeme, bin.span)) {
                     return TypeRef::invalid();
@@ -1447,7 +1487,7 @@ public:
             const map: OperatorTraitMap = OperatorTraitMap::for_unary(unary.op.lexeme);
             if (map.valid && unary.desugared_call == null) {
                 const de: ExpressionNode* = this.operator_overload_expr(
-                    unary.operand, operand_type, null, map, unary.op, unary.span);
+                    unary.operand, operand_type, null, map, unary.op, unary.span, true);
                 if (de != null) { unary.desugared_call = de; return de.resolved_type; }
                 if (this.emit_operator_missing_impl(operand_type, map, unary.op.lexeme, unary.span)) {
                     return operand_type;
