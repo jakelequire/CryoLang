@@ -53,25 +53,34 @@ import Utils::Logger;
 
 /// Operator -> (trait leaf, method) overloading map. `valid == false` means
 /// the operator is not overloadable; `negate` flags `!=`, which lowers to
-/// `!a.equals(&b)`. Kept in one place so the plain-binary, compound-assignment,
-/// and unary sema paths agree on the mapping.
+/// `!a.equals(&b)`. `ord_pred` (non-empty only for the relational operators
+/// `< > <= >=`) names an `Ordering` predicate: those lower to
+/// `a.compare(&b).<ord_pred>()` (e.g. `a < b` -> `a.compare(&b).is_lt()`).
+/// Kept in one place so the plain-binary, compound-assignment, and unary sema
+/// paths agree on the mapping.
 type struct OperatorTraitMap {
     trait_leaf: string;
     method:     string;
+    ord_pred:   string;
     negate:     boolean;
     valid:      boolean;
 
     static none() -> OperatorTraitMap {
-        return OperatorTraitMap { trait_leaf: "", method: "", negate: false, valid: false };
+        return OperatorTraitMap { trait_leaf: "", method: "", ord_pred: "", negate: false, valid: false };
     }
 
     static mk(t: string, m: string, neg: boolean) -> OperatorTraitMap {
-        return OperatorTraitMap { trait_leaf: t, method: m, negate: neg, valid: true };
+        return OperatorTraitMap { trait_leaf: t, method: m, ord_pred: "", negate: neg, valid: true };
     }
 
-    /// Binary `+ - * / %` (arithmetic) and `== !=` (equality). Bitwise, shift,
-    /// relational (`< > <= >=`) and logical operators are intentionally absent:
-    /// they are not overloadable in v1.
+    /// A relational operator: `a OP b` -> `a.compare(&b).<pred>()` via `Ord`.
+    static mk_ord(pred: string) -> OperatorTraitMap {
+        return OperatorTraitMap { trait_leaf: "Ord", method: "compare", ord_pred: pred, negate: false, valid: true };
+    }
+
+    /// Binary `+ - * / %` (arithmetic), `== !=` (equality via `Eq`), and
+    /// `< > <= >=` (relational via `Ord::compare`). Bitwise, shift, and logical
+    /// operators are intentionally absent: they are not overloadable in v1.
     static for_binary(op: string) -> OperatorTraitMap {
         if (op == "+")  { return OperatorTraitMap::mk("Add", "add", false); }
         if (op == "-")  { return OperatorTraitMap::mk("Sub", "sub", false); }
@@ -80,6 +89,10 @@ type struct OperatorTraitMap {
         if (op == "%")  { return OperatorTraitMap::mk("Rem", "rem", false); }
         if (op == "==") { return OperatorTraitMap::mk("Eq", "equals", false); }
         if (op == "!=") { return OperatorTraitMap::mk("Eq", "equals", true); }
+        if (op == "<")  { return OperatorTraitMap::mk_ord("is_lt"); }
+        if (op == ">")  { return OperatorTraitMap::mk_ord("is_gt"); }
+        if (op == "<=") { return OperatorTraitMap::mk_ord("is_le"); }
+        if (op == ">=") { return OperatorTraitMap::mk_ord("is_ge"); }
         return OperatorTraitMap::none();
     }
 
@@ -1075,7 +1088,7 @@ public:
         return TypeRef::invalid();
     }
 
-    // -- Operator overloading (arithmetic / equality / negation) --
+    // -- Operator overloading (arithmetic / equality / relational / negation) --
     //
     // Type-directed: the raw `check_binary_op` / `check_unary_op` rules run
     // first so primitive / pointer / string operations keep emitting native
@@ -1164,6 +1177,14 @@ public:
         const method_sym: SymbolStr = this.intern.intern(map.method);
         mut desugared: ExpressionNode* =
             this.build_operator_call(receiver, method_sym, rhs, op_tok, span);
+        // Relational operators: wrap the `compare` call in an `Ordering`
+        // predicate — `a < b` -> `a.compare(&b).is_lt()`.
+        if (map.ord_pred != "") {
+            const pred_sym: SymbolStr = this.intern.intern(map.ord_pred);
+            const pred_member: MemberAccessNode* =
+                new MemberAccessNode(desugared, pred_sym, span, span);
+            desugared = new CallExprNode(pred_member as ExpressionNode*, span) as ExpressionNode*;
+        }
         if (map.negate) {
             const bang: Token = Token::new(TokenType::Exclaim, "!", op_tok.line, op_tok.column);
             desugared = new UnaryExprNode(bang, desugared, span) as ExpressionNode*;
