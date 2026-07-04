@@ -1987,6 +1987,19 @@ type struct CallResolver {
             return this.arena.get_void();
         }
 
+        // Deref coercion: no such method on the receiver, but if it implements
+        // `Deref<Target>`, retry the method on the pointee — `b.method()` on a
+        // `Box<Foo>` becomes `(*b.deref()).method()` (transitively).  The Member
+        // resolver rewrites `member.object` into the `*(b.deref())` place and
+        // returns the method's type; re-stash the call bindings against the
+        // coerced receiver so mono/codegen bind the method on `Target`.
+        const coerced: TypeRef = this.member.try_deref_coercion(visitor, member);
+        if (coerced.is_valid()) {
+            this.binding.stash_method_call_bindings(member.object.resolved_type, member, call);
+            member.set_resolved_type(coerced);
+            return coerced;
+        }
+
         const method_name: string = this.intern.resolve(member.member);
         const recv_t: Type* = this.arena.lookup(lookup_ref.id);
         const type_display: string = if (recv_t != null) { this.arena.format_display(recv_t) } else { this.intern.resolve(type_sym) };

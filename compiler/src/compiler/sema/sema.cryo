@@ -56,6 +56,9 @@ import Utils::Logger;
 /// `!a.equals(&b)`. `ord_pred` (non-empty only for the relational operators
 /// `< > <= >=`) names an `Ordering` predicate: those lower to
 /// `a.compare(&b).<ord_pred>()` (e.g. `a < b` -> `a.compare(&b).is_lt()`).
+/// `deref_wrap` flags the unary `*` -> `Deref`: the built `b.deref()` call
+/// returns `Target*`, so the desugar wraps it in an outer `*` (`*(b.deref())`),
+/// a place that serves read / write / compound uniformly.
 /// Kept in one place so the plain-binary, compound-assignment, and unary sema
 /// paths agree on the mapping.
 type struct OperatorTraitMap {
@@ -63,19 +66,25 @@ type struct OperatorTraitMap {
     method:     string;
     ord_pred:   string;
     negate:     boolean;
+    deref_wrap: boolean;
     valid:      boolean;
 
     static none() -> OperatorTraitMap {
-        return OperatorTraitMap { trait_leaf: "", method: "", ord_pred: "", negate: false, valid: false };
+        return OperatorTraitMap { trait_leaf: "", method: "", ord_pred: "", negate: false, deref_wrap: false, valid: false };
     }
 
     static mk(t: string, m: string, neg: boolean) -> OperatorTraitMap {
-        return OperatorTraitMap { trait_leaf: t, method: m, ord_pred: "", negate: neg, valid: true };
+        return OperatorTraitMap { trait_leaf: t, method: m, ord_pred: "", negate: neg, deref_wrap: false, valid: true };
     }
 
     /// A relational operator: `a OP b` -> `a.compare(&b).<pred>()` via `Ord`.
     static mk_ord(pred: string) -> OperatorTraitMap {
-        return OperatorTraitMap { trait_leaf: "Ord", method: "compare", ord_pred: pred, negate: false, valid: true };
+        return OperatorTraitMap { trait_leaf: "Ord", method: "compare", ord_pred: pred, negate: false, deref_wrap: false, valid: true };
+    }
+
+    /// Unary `*` -> `Deref::deref`: `*b` desugars to `*(b.deref())`.
+    static mk_deref() -> OperatorTraitMap {
+        return OperatorTraitMap { trait_leaf: "Deref", method: "deref", ord_pred: "", negate: false, deref_wrap: true, valid: true };
     }
 
     /// Binary `+ - * / %` (arithmetic), `== !=` (equality via `Eq`), and
@@ -101,11 +110,14 @@ type struct OperatorTraitMap {
         return OperatorTraitMap::none();
     }
 
-    /// Unary `-` (negation). `!` stays a primitive boolean op.
+    /// Unary `-` (negation) -> `Neg`, `!` -> `Not`, `~` -> `BitNot`, and `*`
+    /// (dereference) -> `Deref`. All are type-directed and only fire when the
+    /// primitive `check_unary_op` rule rejects the operand.
     static for_unary(op: string) -> OperatorTraitMap {
         if (op == "-") { return OperatorTraitMap::mk("Neg", "neg", false); }
         if (op == "!") { return OperatorTraitMap::mk("Not", "not", false); }
         if (op == "~") { return OperatorTraitMap::mk("BitNot", "bitnot", false); }
+        if (op == "*") { return OperatorTraitMap::mk_deref(); }
         return OperatorTraitMap::none();
     }
 }
@@ -1221,9 +1233,34 @@ public:
             const bang: Token = Token::new(TokenType::Exclaim, "!", op_tok.line, op_tok.column);
             desugared = new UnaryExprNode(bang, desugared, span) as ExpressionNode*;
         }
+        // Deref: wrap the `b.deref()` call (which returns `Target*`) in an outer
+        // `*` so `*b` yields the pointee.  The inner call's `Target*` is a real
+        // pointer, so the wrapping `*` resolves on the primitive pointer rule and
+        // never re-enters this hook.  `*ptr` is a place, so the one desugar serves
+        // reads (`v = *b`), writes (`*b = x`), and compound (`*b += x`).
+        if (map.deref_wrap) {
+            const star: Token = Token::new(TokenType::Star, "*", op_tok.line, op_tok.column);
+            mut star_node: UnaryExprNode* = new UnaryExprNode(star, desugared, span);
+            star_node.is_synthetic = true;
+            desugared = star_node as ExpressionNode*;
+        }
         const rty: TypeRef = this.resolve_expr(desugared);
         if (!rty.is_valid()) { return null; }
         return desugared;
+    }
+
+    /// True when a comparison (`== != < > <= >=`) should unwrap a reference
+    /// operand to reach a user `Eq`/`Ord` referent for value comparison: at least
+    /// one operand is `&T`, and NEITHER operand is void (a `null` literal), so
+    /// `ref == null` keeps its pointer null-check.  The user-vs-primitive decision
+    /// is left to `operator_overload_expr` (which only fires for a user referent),
+    /// so `&i32 == &i32` and pointer/class null-checks stay on the identity path.
+    comparison_unwraps_reference(&this, lhs: TypeRef, rhs: TypeRef) -> boolean {
+        const lt: Type* = this.arena.lookup(lhs.id);
+        const rt: Type* = this.arena.lookup(rhs.id);
+        if (lt == null || rt == null) { return false; }
+        if (lt.kind == TypeKind::Void || rt.kind == TypeKind::Void) { return false; }
+        return lt.kind == TypeKind::Reference || rt.kind == TypeKind::Reference;
     }
 
     /// Reflected operator overloading for a PRIMITIVE left operand: `2 * vec`,
@@ -1427,8 +1464,20 @@ public:
                 // even though `check_binary_op` passed the generic param through.
                 // Concrete primitives fall straight through (no user impl).
                 if (map.valid && bin.desugared_call == null) {
+                    // References to a user `Eq`/`Ord` type compare BY VALUE, not by
+                    // identity: `&a == &b` -> `a.equals(&b)` (and `<`/`>` via `Ord`).
+                    // `check_binary_op` passes any reference comparison as a `bool`
+                    // (pointer identity); for the comparison traits we instead unwrap
+                    // the reference and overload when the referent is a user type
+                    // implementing the trait.  Everything else keeps identity: a
+                    // `null`/void operand (`ref == null` stays a pointer null-check),
+                    // and a reference to a primitive or a non-`Eq` type — those make
+                    // `operator_overload_expr` return null and fall through here.
+                    const succ_deref: boolean =
+                        (map.trait_leaf == "Eq" || map.trait_leaf == "Ord")
+                        && this.comparison_unwraps_reference(lhs, rhs);
                     const de: ExpressionNode* = this.operator_overload_expr(
-                        bin.left, lhs, bin.right, map, bin.op, bin.span, false);
+                        bin.left, lhs, bin.right, map, bin.op, bin.span, succ_deref);
                     if (de != null) { bin.desugared_call = de; return de.resolved_type; }
                 }
                 return result.result_type;
