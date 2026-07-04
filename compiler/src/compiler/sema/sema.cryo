@@ -51,6 +51,46 @@ import std::fmt;
 import Utils::Logger;
 
 
+/// Operator -> (trait leaf, method) overloading map. `valid == false` means
+/// the operator is not overloadable; `negate` flags `!=`, which lowers to
+/// `!a.equals(&b)`. Kept in one place so the plain-binary, compound-assignment,
+/// and unary sema paths agree on the mapping.
+type struct OperatorTraitMap {
+    trait_leaf: string;
+    method:     string;
+    negate:     boolean;
+    valid:      boolean;
+
+    static none() -> OperatorTraitMap {
+        return OperatorTraitMap { trait_leaf: "", method: "", negate: false, valid: false };
+    }
+
+    static mk(t: string, m: string, neg: boolean) -> OperatorTraitMap {
+        return OperatorTraitMap { trait_leaf: t, method: m, negate: neg, valid: true };
+    }
+
+    /// Binary `+ - * / %` (arithmetic) and `== !=` (equality). Bitwise, shift,
+    /// relational (`< > <= >=`) and logical operators are intentionally absent:
+    /// they are not overloadable in v1.
+    static for_binary(op: string) -> OperatorTraitMap {
+        if (op == "+")  { return OperatorTraitMap::mk("Add", "add", false); }
+        if (op == "-")  { return OperatorTraitMap::mk("Sub", "sub", false); }
+        if (op == "*")  { return OperatorTraitMap::mk("Mul", "mul", false); }
+        if (op == "/")  { return OperatorTraitMap::mk("Div", "div", false); }
+        if (op == "%")  { return OperatorTraitMap::mk("Rem", "rem", false); }
+        if (op == "==") { return OperatorTraitMap::mk("Eq", "equals", false); }
+        if (op == "!=") { return OperatorTraitMap::mk("Eq", "equals", true); }
+        return OperatorTraitMap::none();
+    }
+
+    /// Unary `-` (negation). `!` stays a primitive boolean op.
+    static for_unary(op: string) -> OperatorTraitMap {
+        if (op == "-") { return OperatorTraitMap::mk("Neg", "neg", false); }
+        return OperatorTraitMap::none();
+    }
+}
+
+
 type class SemaVisitor : BaseASTVisitor {
 public:
     // -- Immutable environment + the by-value checker (handed to collaborators
@@ -1035,7 +1075,130 @@ public:
         return TypeRef::invalid();
     }
 
+    // -- Operator overloading (arithmetic / equality / negation) --
+    //
+    // Type-directed: the raw `check_binary_op` / `check_unary_op` rules run
+    // first so primitive / pointer / string operations keep emitting native
+    // instructions (and the compiler's own IR stays byte-identical).  Only when
+    // an operand is a user type (Phase 1) or a generic param bounded by the
+    // operator's trait (Phase 2) do we rewrite `a + b` into the trait-method
+    // call `a.add(&b)` and hand it back for the caller to hang on the node.
+
+    /// Build `receiver.method(&rhs)` (or `receiver.method()` when `rhs` is
+    /// null).  The `&rhs` is a compiler-synthesized address-of, matching the
+    /// `<=>` desugar so it is exempt from the "no address-of a literal" check.
+    build_operator_call(mut &this, receiver: ExpressionNode*, method: SymbolStr,
+                        rhs: ExpressionNode*, op_tok: Token, span: SourceSpan) -> ExpressionNode* {
+        const member: MemberAccessNode* = new MemberAccessNode(receiver, method, span, span);
+        mut call: CallExprNode* = new CallExprNode(member as ExpressionNode*, span);
+        if (rhs != null) {
+            const amp: Token = Token::new(TokenType::Amp, "&", op_tok.line, op_tok.column);
+            mut ref_rhs: UnaryExprNode* = new UnaryExprNode(amp, rhs, rhs.span);
+            ref_rhs.is_synthetic = true;
+            call.add_argument(ref_rhs as ExpressionNode*);
+        }
+        return call as ExpressionNode*;
+    }
+
+    /// True when `bound` resolves to a `TraitType` whose leaf is `trait_leaf`,
+    /// or (transitively, to bounded depth) one of its super-traits is.  Covers
+    /// `T: Ord` satisfying `Eq` (`Ord : Eq`).
+    trait_ref_matches(&this, bound: TypeRef, trait_leaf: SymbolStr, depth: i32) -> boolean {
+        if (depth > 4) { return false; }
+        const bt: Type* = this.arena.lookup(bound.id);
+        if (bt == null || bt.kind != TypeKind::Trait) { return false; }
+        const tt: TraitType* = bt as TraitType*;
+        const leaf: SymbolStr = OwnershipQuery::leaf_segment(this.intern, tt.qualified_name);
+        if (leaf.is_valid() && leaf.equals(trait_leaf)) { return true; }
+        for (mut i: i64 = 0; i < tt.super_traits.length; i++) {
+            if (this.trait_ref_matches(tt.super_traits[i], trait_leaf, depth + 1)) { return true; }
+        }
+        return false;
+    }
+
+    /// True when a generic `BoundedParam`'s declared bounds (or their
+    /// super-traits) name `trait_leaf`, so an operator on that param overloads.
+    bounded_param_has_trait(&this, bp: BoundedParamType*, trait_leaf: SymbolStr) -> boolean {
+        for (mut i: i64 = 0; i < bp.bounds.length; i++) {
+            if (this.trait_ref_matches(bp.bounds[i], trait_leaf, 0)) { return true; }
+        }
+        return false;
+    }
+
+    /// Decide whether operand type `ty` overloads `map`'s operator and, if so,
+    /// build + resolve the trait-method call, returning the resolved desugar
+    /// expression (its `resolved_type` set) for the caller to attach.  Returns
+    /// null when no overload applies (caller keeps the primitive path or errors).
+    /// Phase 1: a concrete user type (Struct/Class/Enum/Instantiated) with a
+    /// registered trait impl.  Phase 2: a generic param bounded by the trait.
+    operator_overload_expr(mut &this, receiver: ExpressionNode*, ty: TypeRef,
+                           rhs: ExpressionNode*, map: OperatorTraitMap,
+                           op_tok: Token, span: SourceSpan) -> ExpressionNode* {
+        if (!map.valid) { return null; }
+        const t: Type* = this.arena.lookup(ty.id);
+        if (t == null) { return null; }
+        // Cheap kind gate first, and NOTE: we deliberately do NOT unwrap
+        // pointers / references.  A raw-pointer or reference operand keeps the
+        // primitive path — `this.ptr == null`, pointer arithmetic, and pointer
+        // comparison must never be rewritten into a value-equality / arithmetic
+        // trait call (unwrapping the pointee of a `Pair<..>*` and finding its
+        // `Eq` impl is exactly how `p == null` got miscompiled into
+        // `p.equals(&null)`).  Only a value-typed user aggregate or a bounded
+        // generic param overloads; everything else (primitives, pointers,
+        // references, strings) falls straight through, so the compiler's own
+        // hot-path IR stays byte-identical.
+        const is_bounded: boolean = t.kind == TypeKind::BoundedParam;
+        const is_user: boolean = t.kind == TypeKind::Struct || t.kind == TypeKind::Class
+                              || t.kind == TypeKind::Enum || t.kind == TypeKind::InstantiatedType;
+        if (!is_bounded && !is_user) { return null; }
+        const trait_leaf: SymbolStr = this.intern.intern(map.trait_leaf);
+        mut overloads: boolean = false;
+        if (is_bounded) {
+            overloads = this.bounded_param_has_trait(t as BoundedParamType*, trait_leaf);
+        } else {
+            const impl_block: ImplBlockNode* = OwnershipQuery::resolve_trait_impl_for_type(
+                this.arena, this.ctx.generic_registry, this.intern, trait_leaf, ty);
+            overloads = impl_block != null;
+        }
+        if (!overloads) { return null; }
+        const method_sym: SymbolStr = this.intern.intern(map.method);
+        mut desugared: ExpressionNode* =
+            this.build_operator_call(receiver, method_sym, rhs, op_tok, span);
+        if (map.negate) {
+            const bang: Token = Token::new(TokenType::Exclaim, "!", op_tok.line, op_tok.column);
+            desugared = new UnaryExprNode(bang, desugared, span) as ExpressionNode*;
+        }
+        const rty: TypeRef = this.resolve_expr(desugared);
+        if (!rty.is_valid()) { return null; }
+        return desugared;
+    }
+
+    /// When an overloadable operator hits a user type that lacks the required
+    /// trait impl, emit a diagnostic that names the missing trait instead of the
+    /// generic "cannot apply".  Returns true when it emitted (so the caller
+    /// skips the fallback error); false for non-user operands (a genuine
+    /// primitive type error keeps its original message).
+    emit_operator_missing_impl(mut &this, ty: TypeRef, map: OperatorTraitMap,
+                               op_lexeme: string, span: SourceSpan) -> boolean {
+        if (!map.valid) { return false; }
+        const t: Type* = this.arena.lookup(ty.id);
+        if (t == null) { return false; }
+        const is_user: boolean = t.kind == TypeKind::Struct || t.kind == TypeKind::Class
+                              || t.kind == TypeKind::Enum || t.kind == TypeKind::InstantiatedType;
+        if (!is_user) { return false; }
+        const name: string = this.arena.format_display(t);
+        this.ctx.emit_error_at(ErrorCode::E0229_INVALID_BINARY_OP,
+            format("`%s` does not implement `%s`; add `implement trait %s ... for %s` to use the `%s` operator on it",
+                name, map.trait_leaf, map.trait_leaf, name, op_lexeme), span);
+        return true;
+    }
+
     resolve_binary(mut &this, bin: BinaryExprNode*) -> TypeRef {
+        // Idempotent: if a previous resolution already rewrote this operator
+        // into a trait-method call, return its type without re-running
+        // `check_binary_op` (which would re-reject the user-typed operands and
+        // emit a spurious E0229 the second time around).
+        if (bin.desugared_call != null) { return bin.desugared_call.resolved_type; }
         const left_is_lit:  boolean = is_numeric_literal_expr(bin.left);
         const right_is_lit: boolean = is_numeric_literal_expr(bin.right);
         mut lhs: TypeRef = TypeRef::invalid();
@@ -1076,9 +1239,29 @@ public:
                 && !this.symbolic.symbolic_type_unresolved(lhs)
                 && !this.symbolic.symbolic_type_unresolved(rhs)) {
                 const cres: TypeCheckResult = this.checker.check_binary_op(base_lex, lhs, rhs);
-                if (!cres.success) {
-                    this.ctx.emit_error_at(ErrorCode::E0229_INVALID_BINARY_OP,
-                        cres.error_message, bin.span);
+                // Compound assignment routes through the same operator traits:
+                // `a += b` overloads to `a.add(&b)` and stores the result back
+                // into `a` (codegen). Phase 2 bounded params overload on the
+                // success path; concrete user types on the failure path.
+                const map: OperatorTraitMap = OperatorTraitMap::for_binary(base_lex);
+                if (cres.success) {
+                    if (map.valid && bin.desugared_call == null) {
+                        const de: ExpressionNode* = this.operator_overload_expr(
+                            bin.left, lhs, bin.right, map, bin.op, bin.span);
+                        if (de != null) { bin.desugared_call = de; }
+                    }
+                } else {
+                    mut overloaded: boolean = false;
+                    if (map.valid && bin.desugared_call == null) {
+                        const de: ExpressionNode* = this.operator_overload_expr(
+                            bin.left, lhs, bin.right, map, bin.op, bin.span);
+                        if (de != null) { bin.desugared_call = de; overloaded = true; }
+                    }
+                    if (!overloaded
+                        && !this.emit_operator_missing_impl(lhs, map, base_lex, bin.span)) {
+                        this.ctx.emit_error_at(ErrorCode::E0229_INVALID_BINARY_OP,
+                            cres.error_message, bin.span);
+                    }
                 }
             }
             return lhs;
@@ -1133,7 +1316,28 @@ public:
         }
         if (lhs.is_valid() && rhs.is_valid()) {
             const result: TypeCheckResult = this.checker.check_binary_op(bin.op.lexeme, lhs, rhs);
-            if (result.success) { return result.result_type; }
+            const map: OperatorTraitMap = OperatorTraitMap::for_binary(bin.op.lexeme);
+            if (result.success) {
+                // Phase 2: a bounded-param operand (`T: Add`) still overloads,
+                // even though `check_binary_op` passed the generic param through.
+                // Concrete primitives fall straight through (no user impl).
+                if (map.valid && bin.desugared_call == null) {
+                    const de: ExpressionNode* = this.operator_overload_expr(
+                        bin.left, lhs, bin.right, map, bin.op, bin.span);
+                    if (de != null) { bin.desugared_call = de; return de.resolved_type; }
+                }
+                return result.result_type;
+            }
+            // Phase 1: `check_binary_op` rejected — a concrete user type with a
+            // registered impl overloads; otherwise it is a genuine type error.
+            if (map.valid && bin.desugared_call == null) {
+                const de: ExpressionNode* = this.operator_overload_expr(
+                    bin.left, lhs, bin.right, map, bin.op, bin.span);
+                if (de != null) { bin.desugared_call = de; return de.resolved_type; }
+                if (this.emit_operator_missing_impl(lhs, map, bin.op.lexeme, bin.span)) {
+                    return TypeRef::invalid();
+                }
+            }
             this.ctx.emit_error_at(ErrorCode::E0229_INVALID_BINARY_OP, result.error_message, bin.span);
         }
         if (lhs.is_valid()) { return lhs; }
@@ -1198,6 +1402,9 @@ public:
     }
 
     resolve_unary(mut &this, unary: UnaryExprNode*) -> TypeRef {
+        // Idempotent (see resolve_binary): a prior resolution may have rewritten
+        // `-x` into `x.neg()`; return its type rather than re-rejecting.
+        if (unary.desugared_call != null) { return unary.desugared_call.resolved_type; }
         const operand_type: TypeRef = this.resolve_expr(unary.operand);
         if (!operand_type.is_valid()) { return TypeRef::invalid(); }
         if (unary.op.lexeme == "&" && !unary.is_synthetic && unary.operand != null
@@ -1213,6 +1420,18 @@ public:
         const result: TypeCheckResult = this.checker.check_unary_op(unary.op.lexeme, operand_type);
         if (!result.success) {
             if (this.symbolic.symbolic_type_unresolved(operand_type)) { return operand_type; }
+            // Operator overloading: `-x` on a user type (Phase 1) or a
+            // `Neg`-bounded generic param (Phase 2) rewrites to `x.neg()`.
+            // A bounded param is non-numeric, so it reaches this failure path.
+            const map: OperatorTraitMap = OperatorTraitMap::for_unary(unary.op.lexeme);
+            if (map.valid && unary.desugared_call == null) {
+                const de: ExpressionNode* = this.operator_overload_expr(
+                    unary.operand, operand_type, null, map, unary.op, unary.span);
+                if (de != null) { unary.desugared_call = de; return de.resolved_type; }
+                if (this.emit_operator_missing_impl(operand_type, map, unary.op.lexeme, unary.span)) {
+                    return operand_type;
+                }
+            }
             this.ctx.emit_error_at(ErrorCode::E0230_INVALID_UNARY_OP, result.error_message, unary.span);
             return operand_type;
         }

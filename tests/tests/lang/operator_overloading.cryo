@@ -1,0 +1,117 @@
+///! Language tests - user-defined operator overloading via the stdlib
+///! operator traits (`Add`/`Sub`/`Mul`/`Div`/`Rem`/`Neg` in `core::ops`,
+///! `Eq` in `core::cmp`).
+///!
+///! `a + b` on a user type desugars, in sema, to the trait-method call
+///! `a.add(&b)` (and likewise `-`/`*`/`/`/`%`, unary `-` -> `neg`, `==`/`!=`
+///! -> `equals`). The rewrite is type-directed: primitive arithmetic keeps its
+///! native path, so these tests also pin that `2 + 2` is untouched.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::OperatorOverloading;
+
+import std::core::result;
+import std::core::cmp;
+import std::collections::str;
+import std::test::error;
+import std::test::assert;
+
+// A 2D integer vector implementing the arithmetic + equality operators.
+type struct V2 { x: i64; y: i64; }
+
+implement trait Add<V2, V2> for struct V2 {
+    add(&this, rhs: &V2) -> V2 { return V2 { x: this.x + rhs.x, y: this.y + rhs.y }; }
+}
+implement trait Sub<V2, V2> for struct V2 {
+    sub(&this, rhs: &V2) -> V2 { return V2 { x: this.x - rhs.x, y: this.y - rhs.y }; }
+}
+implement trait Mul<i64, V2> for struct V2 {
+    mul(&this, rhs: &i64) -> V2 { return V2 { x: this.x * *rhs, y: this.y * *rhs }; }
+}
+implement trait Neg<V2> for struct V2 {
+    neg(&this) -> V2 { return V2 { x: -this.x, y: -this.y }; }
+}
+implement trait Eq for struct V2 {
+    equals(&this, other: &V2) -> boolean { return this.x == other.x && this.y == other.y; }
+}
+
+// A generic wrapper whose `Add` forwards to the element's `Add` — exercises a
+// bounded-param operand (`this.v + rhs.v`, `T: Add`) that must monomorphize.
+type struct Wrap<T> { v: T; }
+implement<T> trait Add<Wrap<T>, Wrap<T>> for struct Wrap<T> where T: Add<T, T> {
+    add(&this, rhs: &Wrap<T>) -> Wrap<T> { return Wrap<T> { v: this.v + rhs.v }; }
+}
+
+![test]
+function add_sub_mul() -> Result<(), TestError> {
+    const a: V2 = V2 { x: 1, y: 2 };
+    const b: V2 = V2 { x: 3, y: 4 };
+    const c: V2 = a + b;        // (4, 6)
+    match (expect_eq(c.x, 4)) { Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); } }
+    match (expect_eq(c.y, 6)) { Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); } }
+    const d: V2 = b - a;        // (2, 2)
+    match (expect_eq(d.x, 2)) { Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); } }
+    const e: V2 = a * 3;        // (3, 6)
+    match (expect_eq(e.x, 3)) { Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); } }
+    match (expect_eq(e.y, 6)) { Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); } }
+    return Result::Ok(());
+}
+
+![test]
+function unary_neg() -> Result<(), TestError> {
+    const a: V2 = V2 { x: 5, y: -7 };
+    const n: V2 = -a;           // (-5, 7)
+    match (expect_eq(n.x, -5)) { Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); } }
+    match (expect_eq(n.y, 7))  { Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); } }
+    return Result::Ok(());
+}
+
+![test]
+function chained_and_compound() -> Result<(), TestError> {
+    const a: V2 = V2 { x: 1, y: 1 };
+    const b: V2 = V2 { x: 2, y: 3 };
+    const chained: V2 = (a + b) + a;  // (4, 5)
+    match (expect_eq(chained.x, 4)) { Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); } }
+    match (expect_eq(chained.y, 5)) { Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); } }
+    mut g: V2 = a;
+    g += b;                     // (3, 4)
+    match (expect_eq(g.x, 3)) { Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); } }
+    match (expect_eq(g.y, 4)) { Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); } }
+    return Result::Ok(());
+}
+
+![test]
+function equality() -> Result<(), TestError> {
+    const a: V2 = V2 { x: 1, y: 2 };
+    const b: V2 = V2 { x: 9, y: 9 };
+    match (expect_true(a == a, Str::new("a == a should hold"))) {
+        Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_true(a != b, Str::new("a != b should hold"))) {
+        Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_false(a == b, Str::new("a == b should not hold"))) {
+        Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function generic_operator_impl() -> Result<(), TestError> {
+    const a: V2 = V2 { x: 1, y: 2 };
+    const b: V2 = V2 { x: 3, y: 4 };
+    const w1: Wrap<V2> = Wrap<V2> { v: a };
+    const w2: Wrap<V2> = Wrap<V2> { v: b };
+    const w3: Wrap<V2> = w1 + w2;   // v = (4, 6)
+    match (expect_eq(w3.v.x, 4)) { Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); } }
+    match (expect_eq(w3.v.y, 6)) { Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); } }
+    return Result::Ok(());
+}
+
+![test]
+function primitive_arithmetic_untouched() -> Result<(), TestError> {
+    // The type-directed rule must leave primitive operators on the native path.
+    match (expect_eq(3 + 4 * 2, 11)) { Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); } }
+    match (expect_eq(-5 + 2, -3))     { Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); } }
+    return Result::Ok(());
+}

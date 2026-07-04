@@ -63,6 +63,34 @@ type struct BinaryUnaryEmitter {
     emit_binary(mut &this, visitor: ASTVisitor*, node: BinaryExprNode*) -> void {
         const op: TokenType = node.op.kind;
 
+        // Operator overloading: sema rewrote `a + b` / `a == b` / etc. into a
+        // trait-method call (`a.add(&b)`, `a.equals(&b)`, `!a.equals(&b)`, ...)
+        // and hung it on `desugared_call`.  Delegate to that expression instead
+        // of emitting a raw arithmetic / comparison instruction.  For compound
+        // assignment (`a += b`, whose base op sema also overloaded) the call
+        // computes the new value; store it back into the left place, mirroring
+        // the `=` branch below.
+        if (node.desugared_call != null) {
+            const is_compound: boolean =
+                op == TokenType::PlusEqual    || op == TokenType::MinusEqual   ||
+                op == TokenType::StarEqual    || op == TokenType::SlashEqual   ||
+                op == TokenType::PercentEqual;
+            if (is_compound) {
+                const addr: LValue = this.dispatch.codegen_lvalue(visitor, node.left);
+                const val: LValue = this.dispatch.codegen_rvalue(visitor, node.desugared_call);
+                if (addr.is_valid() && val.is_valid()) {
+                    this.cg.builder.build_store(val, addr);
+                }
+                this.state.last_value = val;
+                this.state.last_is_lvalue = false;
+                return;
+            }
+            const val: LValue = this.dispatch.codegen_rvalue(visitor, node.desugared_call);
+            this.state.last_value = val;
+            this.state.last_is_lvalue = false;
+            return;
+        }
+
         // Assignment
         if (op == TokenType::Equal) {
             const addr: LValue = this.dispatch.codegen_lvalue(visitor,node.left);
@@ -219,6 +247,14 @@ type struct BinaryUnaryEmitter {
 
     emit_unary(mut &this, visitor: ASTVisitor*, node: UnaryExprNode*) -> void {
         const op: TokenType = node.op.kind;
+        // Operator overloading: sema rewrote `-x` (user type / `Neg`-bounded
+        // param) into `x.neg()`.  Delegate to the call.
+        if (node.desugared_call != null) {
+            const val: LValue = this.dispatch.codegen_rvalue(visitor, node.desugared_call);
+            this.state.last_value = val;
+            this.state.last_is_lvalue = false;
+            return;
+        }
         if (op == TokenType::Star) {
             const op_t: Type* = this.cg.lookup_type_by_id(node.operand.resolved_type.id);
             mut is_ptr_like: boolean = false;

@@ -105,12 +105,26 @@ public:
     op:    Token;
     left:  ExpressionNode*;
     right: ExpressionNode*;
+    /// Operator-overloading desugar target, or null for the ordinary
+    /// primitive / pointer / string path.  When an operand is a user type
+    /// (or a generic param bounded by the operator's trait), sema rewrites
+    /// `a + b` into the trait-method call `a.add(&b)` (`a == b` into
+    /// `a.equals(&b)`, `a != b` into `!a.equals(&b)`, etc.) and hangs the
+    /// resolved call here.  It is NOT built at parse time — `+ - * / %` are
+    /// overwhelmingly primitive, and the parser has no types — so the rewrite
+    /// is type-directed: it only fires after `check_binary_op` rejects (or,
+    /// for a bounded param, when the bound names the operator's trait).  When
+    /// set, codegen delegates to this expression instead of emitting a raw
+    /// arithmetic / comparison instruction; for compound assignment the
+    /// call's result is stored back into the left place.
+    desugared_call: ExpressionNode*;
 
     BinaryExprNode(op: Token, left: ExpressionNode*, right: ExpressionNode*, span: SourceSpan)
         : ExpressionNode(NodeKind::BinaryExpression, span) {
         this.op    = op;
         this.left  = left;
         this.right = right;
+        this.desugared_call = null;
     }
 
     override accept(visitor: ASTVisitor*) -> void {
@@ -136,6 +150,12 @@ public:
     /// (E0223) - skip synthesized nodes, which legitimately take the
     /// address of a temporary the compiler just materialized.
     is_synthetic: boolean;
+    /// Unary operator-overloading desugar target (currently only `-x` for a
+    /// user type or a `Neg`-bounded generic param, rewritten to `x.neg()`), or
+    /// null for the ordinary numeric-negation / deref / addr-of / inc-dec path.
+    /// Same discipline as `BinaryExprNode.desugared_call`: type-directed, built
+    /// in sema after `check_unary_op` rejects, and delegated to by codegen.
+    desugared_call: ExpressionNode*;
 
     UnaryExprNode(op: Token, operand: ExpressionNode*, span: SourceSpan)
         : ExpressionNode(NodeKind::UnaryExpression, span) {
@@ -143,6 +163,7 @@ public:
         this.operand      = operand;
         this.is_postfix   = false;
         this.is_synthetic = false;
+        this.desugared_call = null;
     }
 
     override accept(visitor: ASTVisitor*) -> void {
