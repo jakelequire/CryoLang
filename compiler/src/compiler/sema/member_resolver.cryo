@@ -165,6 +165,15 @@ type struct MemberResolver {
                 return method_ret;
             }
 
+            // Deref coercion: the receiver has no such field or method, but if it
+            // implements `Deref<Target>`, retry the lookup on the pointee — `b.field`
+            // / `b.method()` on a `Box<Foo>` becomes `(*b.deref()).field` — repeating
+            // while the pointee is itself a `Deref` type (bounded).  Because
+            // `*(b.deref())` is a place, coerced access serves reads, writes, and
+            // method receivers uniformly, and codegen needs nothing new.
+            const coerced: TypeRef = this.try_deref_coercion(visitor, member);
+            if (coerced.is_valid()) { return coerced; }
+
             const type_name: string = this.intern.resolve(type_sym);
             const member_name: string = this.intern.resolve(member.member);
             const m_span: SourceSpan = if (member.member_span.has_location()) {
@@ -181,6 +190,123 @@ type struct MemberResolver {
             this.ctx.emit_diagnostic(d);
         }
 
+        return TypeRef::invalid();
+    }
+
+    /// Deref coercion: `member.object`'s type has no `member.member`.  If it
+    /// implements `Deref<Target>`, rewrite the access onto the pointee —
+    /// `obj.member` -> `(*obj.deref()).member` — and retry, repeating while the
+    /// pointee is itself a `Deref` type (bounded).  On success `member.object` is
+    /// committed to the `*(obj.deref())` chain (a place, so reads / writes /
+    /// method receivers all work) and the member's type returned; otherwise the
+    /// original `member.object` is left untouched and `invalid` returned.
+    /// Restricted to concrete user receivers; a bounded `T: Deref` param is not
+    /// coerced (its abstract pointee has no field/method to bind pre-mono).
+    try_deref_coercion(mut &this, visitor: ASTVisitor*, member: MemberAccessNode*) -> TypeRef {
+        if (member.object == null) { return TypeRef::invalid(); }
+        if (this.ctx.generic_registry == null) { return TypeRef::invalid(); }
+        const deref_leaf: SymbolStr   = this.intern.intern("Deref");
+        const deref_method: SymbolStr = this.intern.intern("deref");
+        mut cur_obj: ExpressionNode* = member.object;
+        mut cur_ty:  TypeRef         = member.object.resolved_type;
+        mut guard: i32 = 0;
+        while (guard < 6) {
+            guard += 1;
+            // Peel references to the concrete receiver; a raw pointer keeps its
+            // native field auto-deref and never needs `Deref`.
+            mut base_ty: TypeRef = cur_ty;
+            mut t: Type* = this.arena.lookup(base_ty.id);
+            mut rd: i32 = 0;
+            while (t != null && t.kind == TypeKind::Reference && rd < 4) {
+                base_ty = (t as ReferenceType*).referent;
+                t = this.arena.lookup(base_ty.id);
+                rd += 1;
+            }
+            if (t == null) { return TypeRef::invalid(); }
+            const is_user: boolean = t.kind == TypeKind::Struct || t.kind == TypeKind::Class
+                                  || t.kind == TypeKind::Enum   || t.kind == TypeKind::InstantiatedType;
+            if (!is_user) { return TypeRef::invalid(); }
+            const impl_block: ImplBlockNode* = OwnershipQuery::resolve_trait_impl_for_type(
+                this.arena, this.ctx.generic_registry, this.intern, deref_leaf, base_ty);
+            if (impl_block == null) { return TypeRef::invalid(); }
+            // Build `*(cur_obj.deref())` and resolve it to the pointee `Target`.
+            const member_acc: MemberAccessNode* =
+                new MemberAccessNode(cur_obj, deref_method, member.span, member.span);
+            mut call: CallExprNode* = new CallExprNode(member_acc as ExpressionNode*, member.span);
+            const star_tok: Token = Token::new(TokenType::Star, "*",
+                member.span.start_line as int, member.span.start_col as int);
+            mut star: UnaryExprNode* = new UnaryExprNode(star_tok, call as ExpressionNode*, member.span);
+            star.is_synthetic = true;
+            const star_expr: ExpressionNode* = star as ExpressionNode*;
+            const target_ty: TypeRef = this.dispatch.resolve_expr(visitor, star_expr);
+            if (!target_ty.is_valid()) { return TypeRef::invalid(); }
+            // Re-attempt the field / method lookup on `Target`.
+            const r: TypeRef = this.member_type_on(member, target_ty);
+            if (r.is_valid()) {
+                member.object = star_expr;
+                member.set_resolved_type(r);
+                return r;
+            }
+            // Chain deeper: the pointee may itself implement `Deref`.
+            cur_obj = star_expr;
+            cur_ty  = target_ty;
+        }
+        return TypeRef::invalid();
+    }
+
+    /// Resolve `member.member` as a field (incl. generic-template field) or
+    /// method on the ALREADY-RESOLVED receiver type `obj_type`, enforcing
+    /// visibility on success.  Returns the member's type, or `invalid` on a
+    /// genuine miss — emits no diagnostic.  Used by Deref coercion to probe each
+    /// pointee in the chain without perturbing the direct-access path.
+    member_type_on(mut &this, member: MemberAccessNode*, obj_type: TypeRef) -> TypeRef {
+        const acc_span: SourceSpan = if (member.member_span.has_location()) {
+            member.member_span
+        } else {
+            member.span
+        };
+        // Field.
+        const result: TypeCheckResult = this.checker.check_field_access(obj_type, member.member);
+        if (result.success) {
+            this.enforce_field_visibility(obj_type, member.member, acc_span);
+            return this.binding.subst_method_return_from_receiver(obj_type, result.result_type);
+        }
+        // Generic base-template field.
+        const field_ret: TypeRef = this.resolve_field_via_template(obj_type, member.member);
+        if (field_ret.is_valid()) { return field_ret; }
+        // Method (from the dereferenced receiver symbol).
+        mut walk_ty: TypeRef = obj_type;
+        mut walk_t: Type* = this.arena.lookup(walk_ty.id);
+        mut depth: i32 = 0;
+        while (walk_t != null && depth < 5) {
+            match (walk_t.kind) {
+                TypeKind::Pointer => {
+                    walk_ty = (walk_t as PointerType*).pointee;
+                    walk_t = this.arena.lookup(walk_ty.id);
+                }
+                TypeKind::Reference => {
+                    walk_ty = (walk_t as ReferenceType*).referent;
+                    walk_t = this.arena.lookup(walk_ty.id);
+                }
+                TypeKind::InstantiatedType => {
+                    const it: InstantiatedType* = walk_t as InstantiatedType*;
+                    if (!it.has_resolved_type()) { break; }
+                    walk_ty = it.resolved_type;
+                    walk_t = this.arena.lookup(walk_ty.id);
+                }
+                _ => { break; }
+            }
+            depth += 1;
+        }
+        const type_sym: SymbolStr = this.types.lookup_type_sym(walk_ty);
+        if (type_sym.is_valid()) {
+            const method_ret: TypeRef =
+                this.binding.lookup_method_with_inheritance(walk_ty, type_sym, member.member);
+            if (method_ret.is_valid()) {
+                this.enforce_method_visibility(obj_type, member.member, acc_span);
+                return method_ret;
+            }
+        }
         return TypeRef::invalid();
     }
 

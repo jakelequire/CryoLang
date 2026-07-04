@@ -5,7 +5,9 @@
 ///! `a + b` on a user type desugars, in sema, to the trait-method call
 ///! `a.add(&b)` (and likewise `-`/`*`/`/`/`%`, unary `-` -> `neg`, `==`/`!=`
 ///! -> `equals`). The rewrite is type-directed: primitive arithmetic keeps its
-///! native path, so these tests also pin that `2 + 2` is untouched.
+///! native path, so these tests also pin that `2 + 2` is untouched. Reference
+///! operands compare by value too: `&a == &b` (referent implements `Eq`/`Ord`)
+///! unwraps to `a.equals(&b)` rather than a pointer-identity comparison.
 
 ![config(testing)]
 namespace CryoTests::Tests::Lang::OperatorOverloading;
@@ -132,6 +134,50 @@ function relational() -> Result<(), TestError> {
     match (expect_true(a >= c, Str::new("(1,2) >= (1,2)")))      { Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); } }
     match (expect_true(b >= a, Str::new("(1,5) >= (1,2)")))      { Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); } }
     match (expect_false(b <= a, Str::new("(1,5) <= (1,2) is false"))) { Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); } }
+    return Result::Ok(());
+}
+
+// Reference operands compare BY VALUE, not by identity: `&a == &b` desugars to
+// `a.equals(&b)` (and `<`/`>`/... via `Ord`) when the referent implements the
+// trait.  These helpers take `&V2` so both operands are reference-typed; the
+// callers pass DISTINCT storage with equal value, so a pass proves value
+// semantics (identity/pointer comparison would report them unequal).
+function ref_eq(a: &V2, b: &V2) -> boolean { return a == b; }
+function ref_ne(a: &V2, b: &V2) -> boolean { return a != b; }
+function ref_lt(a: &V2, b: &V2) -> boolean { return a < b; }
+function ref_ge(a: &V2, b: &V2) -> boolean { return a >= b; }
+
+![test]
+function reference_value_equality() -> Result<(), TestError> {
+    const a: V2 = V2 { x: 1, y: 2 };
+    const b: V2 = V2 { x: 1, y: 2 };   // equal value, DISTINCT storage
+    const c: V2 = V2 { x: 1, y: 5 };
+    match (expect_true(ref_eq(&a, &b), Str::new("&a == &b by value"))) {
+        Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_false(ref_ne(&a, &b), Str::new("&a != &b is false by value"))) {
+        Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_false(ref_eq(&a, &c), Str::new("&a == &c is false"))) {
+        Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function reference_value_ordering() -> Result<(), TestError> {
+    const a: V2 = V2 { x: 1, y: 2 };
+    const b: V2 = V2 { x: 1, y: 2 };
+    const c: V2 = V2 { x: 1, y: 5 };
+    match (expect_true(ref_lt(&a, &c),  Str::new("&a < &c by value")))  {
+        Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_false(ref_ge(&a, &c), Str::new("&a >= &c is false"))) {
+        Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_true(ref_ge(&a, &b),  Str::new("&a >= &b (equal) holds"))) {
+        Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); }
+    }
     return Result::Ok(());
 }
 

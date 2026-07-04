@@ -1,15 +1,15 @@
 ///! Operator traits (`core::ops`): user `Deref` / `Index` impls.
 ///!
-///! v1.0 ships the `Deref<Target>` trait with its explicit `.deref()`
-///! method (`*` sugar is a documented post-1.0 follow-up), so the `Deref`
-///! tests call the method directly. Every other operator has full sugar over
-///! user types: arithmetic (`+ - * / %`), unary `-`, equality/relational
-///! (`== != < > <= >=`), bitwise/shift (`& | ^ << >>` + their `&=`-style
-///! compound forms), unary complement (`!` / `~`), and indexing (`[]` as
-///! read/write/compound, incl. generic and bounded-param dispatch). Operands
-///! passed by reference (`&T`) overload exactly like values. The tests pin
-///! that sugar alongside the direct-method contract that an `Index`/`Deref`
-///! pointer aliases the receiver's storage in place.
+///! Every overloadable operator has full sugar over user types: arithmetic
+///! (`+ - * / %`), unary `-`, equality/relational (`== != < > <= >=`),
+///! bitwise/shift (`& | ^ << >>` + their `&=`-style compound forms), unary
+///! complement (`!` / `~`), indexing (`[]` as read/write/compound), and
+///! dereference (`*b` as read/write/compound, plus `b.field` / `b.method()`
+///! member-access auto-deref coercion, transitively). All are incl. generic
+///! and bounded-param dispatch. Operands passed by reference (`&T`) overload
+///! exactly like values. The tests pin that sugar alongside the direct-method
+///! contract that an `Index`/`Deref` pointer aliases the receiver's storage
+///! in place.
 
 ![config(testing)]
 namespace CryoTests::Tests::Lang::OperatorOverload;
@@ -29,8 +29,7 @@ implement trait Deref<i32> for Boxed {
 }
 
 // Resolve `.deref()` through the `Deref` bound rather than the bare global
-// method name: bound-directed resolution is unambiguous and also dodges
-// the unrelated struct also named `Deref` in another test module.
+// method name: bound-directed resolution is unambiguous.
 function deref_ptr<T, U>(x: &T) -> U* where T: Deref<U> {
     return x.deref();
 }
@@ -231,13 +230,13 @@ function negation_through_reference() -> Result<(), TestError> {
 // -- Bitwise / shift / complement operator overloading. --
 
 type struct Bits { v: i32; }
-implement trait BitAnd<Bits, Bits> for Bits { bitand(&this, rhs: &Bits) -> Bits { return Bits { v: this.v & rhs.v }; } }
-implement trait BitOr<Bits, Bits>  for Bits { bitor(&this, rhs: &Bits)  -> Bits { return Bits { v: this.v | rhs.v }; } }
-implement trait BitXor<Bits, Bits> for Bits { bitxor(&this, rhs: &Bits) -> Bits { return Bits { v: this.v ^ rhs.v }; } }
-implement trait Shl<i32, Bits>     for Bits { shl(&this, rhs: &i32) -> Bits { return Bits { v: this.v << *rhs }; } }
-implement trait Shr<i32, Bits>     for Bits { shr(&this, rhs: &i32) -> Bits { return Bits { v: this.v >> *rhs }; } }
-implement trait Not<Bits>          for Bits { not(&this) -> Bits { return Bits { v: if (this.v == 0) { 1 } else { 0 } }; } }
-implement trait BitNot<Bits>       for Bits { bitnot(&this) -> Bits { return Bits { v: ~this.v }; } }
+implement trait BitAnd<Bits, Bits> for struct Bits { bitand(&this, rhs: &Bits) -> Bits { return Bits { v: this.v & rhs.v }; } }
+implement trait BitOr<Bits, Bits>  for struct Bits { bitor(&this, rhs: &Bits)  -> Bits { return Bits { v: this.v | rhs.v }; } }
+implement trait BitXor<Bits, Bits> for struct Bits { bitxor(&this, rhs: &Bits) -> Bits { return Bits { v: this.v ^ rhs.v }; } }
+implement trait Shl<i32, Bits>     for struct Bits { shl(&this, rhs: &i32) -> Bits { return Bits { v: this.v << *rhs }; } }
+implement trait Shr<i32, Bits>     for struct Bits { shr(&this, rhs: &i32) -> Bits { return Bits { v: this.v >> *rhs }; } }
+implement trait Not<Bits>          for struct Bits { not(&this) -> Bits { return Bits { v: if (this.v == 0) { 1 } else { 0 } }; } }
+implement trait BitNot<Bits>       for struct Bits { bitnot(&this) -> Bits { return Bits { v: ~this.v }; } }
 
 ![test]
 function bitwise_binary_ops() -> Result<(), TestError> {
@@ -318,4 +317,148 @@ function reflected_scalar_times_vector() -> Result<(), TestError> {
         Result::Err(e) => { return Result::Err(e); }
     }
     return expect_eq(b.y, 40);
+}
+
+// -- Deref (`*`) operator sugar: `*b` desugars to `*(b.deref())`. --
+
+// A generic smart pointer: exercises the mono/cloner/substituter descent into
+// the `*` desugar so `SmartBox<i32>::deref` gets specialized.
+type struct SmartBox<T> { slot: T; }
+implement<T> trait Deref<T> for struct SmartBox<T> {
+    deref(&this) -> T* { return &this.slot; }
+}
+
+// `*b` on a generic param bounded by `Deref` (Phase 2). By value: a `&T`
+// operand would deref the *reference* (primitive rule), not the trait.
+function read_deref<T, U>(b: T) -> U where T: Deref<U> {
+    return *b;
+}
+
+// `*b` sugar as a read: desugars to `*(b.deref())`.
+![test]
+function deref_sugar_reads() -> Result<(), TestError> {
+    const b: Boxed = Boxed { value: 41 };
+    return expect_eq(*b, 41);
+}
+
+// `*b` sugar as a write target: the desugar `*(b.deref())` is a place, so the
+// pointer aliases the receiver's storage in place.
+![test]
+function deref_sugar_writes() -> Result<(), TestError> {
+    mut b: Boxed = Boxed { value: 1 };
+    *b = 100;
+    return expect_eq(b.value, 100);
+}
+
+// Compound assignment through `*b` reads-modifies-writes the same place.
+![test]
+function deref_sugar_compound() -> Result<(), TestError> {
+    mut b: Boxed = Boxed { value: 5 };
+    *b += 7;
+    return expect_eq(b.value, 12);
+}
+
+// Generic container: `*b` reads and writes through a specialized
+// `SmartBox<i32>::deref`.
+![test]
+function deref_sugar_generic() -> Result<(), TestError> {
+    mut g: SmartBox<i32> = SmartBox<i32> { slot: 200 };
+    match (expect_eq(*g, 200)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    *g = 250;
+    return expect_eq(g.slot, 250);
+}
+
+// `*b` on a generic param bounded by `Deref`.
+![test]
+function deref_sugar_bounded_param() -> Result<(), TestError> {
+    const b: Boxed = Boxed { value: 77 };
+    return expect_eq(read_deref<Boxed, i32>(b), 77);
+}
+
+// -- Deref coercion on member access: `b.field` / `b.method()` auto-deref. --
+
+// A pointee with a field and methods.
+type struct Coord { px: i32; py: i32; }
+implement Coord {
+    total(&this) -> i32 { return this.px + this.py; }
+    bump_x(mut &this, v: i32) -> void { this.px = v; }
+}
+
+// A smart pointer over Coord.
+type struct CoordBox { c: Coord; }
+implement trait Deref<Coord> for CoordBox {
+    deref(&this) -> Coord* { return &this.c; }
+}
+
+// A box over a box: exercises transitive (multi-hop) coercion.
+type struct CoordBoxBox { inner: CoordBox; }
+implement trait Deref<CoordBox> for CoordBoxBox {
+    deref(&this) -> CoordBox* { return &this.inner; }
+}
+
+// A generic smart pointer: exercises mono descent into the coerced chain.
+type struct GBox<T> { held: T; }
+implement<T> trait Deref<T> for struct GBox<T> {
+    deref(&this) -> T* { return &this.held; }
+}
+
+// `b.field` auto-derefs through `.deref()` when the receiver lacks the field.
+![test]
+function deref_coercion_field_read() -> Result<(), TestError> {
+    const b: CoordBox = CoordBox { c: Coord { px: 3, py: 4 } };
+    match (expect_eq(b.px, 3)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(b.py, 4);
+}
+
+// The coerced field is a place: `b.field = v` writes through to the pointee.
+![test]
+function deref_coercion_field_write() -> Result<(), TestError> {
+    mut b: CoordBox = CoordBox { c: Coord { px: 1, py: 2 } };
+    b.px = 100;
+    return expect_eq(b.c.px, 100);
+}
+
+// `b.method()` auto-derefs the receiver (both shared and `mut` receivers).
+![test]
+function deref_coercion_method() -> Result<(), TestError> {
+    mut b: CoordBox = CoordBox { c: Coord { px: 5, py: 6 } };
+    match (expect_eq(b.total(), 11)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    b.bump_x(99);
+    return expect_eq(b.c.px, 99);
+}
+
+// Transitive coercion: CoordBoxBox -> CoordBox -> Coord.
+![test]
+function deref_coercion_multi_hop() -> Result<(), TestError> {
+    const b: CoordBoxBox = CoordBoxBox { inner: CoordBox { c: Coord { px: 8, py: 9 } } };
+    match (expect_eq(b.px, 8)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(b.total(), 17);
+}
+
+// Coercion through a generic smart pointer, field + method + write.
+![test]
+function deref_coercion_generic() -> Result<(), TestError> {
+    mut g: GBox<Coord> = GBox<Coord> { held: Coord { px: 11, py: 22 } };
+    match (expect_eq(g.px, 11)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(g.total(), 33)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    g.px = 44;
+    return expect_eq(g.held.px, 44);
 }
