@@ -157,15 +157,6 @@ type struct IntrinsicEmitter {
 
     // Per-intrinsic IR emission helpers
 
-    emit_ptr_offset(mut &this, base: LValue, off: LValue, label: string) -> LValue {
-        const idx_buf: void* = intrinsics::malloc(8);
-        const idx_slots: void** = idx_buf as void**;
-        idx_slots[0] = off.raw;
-        const r: LValue = this.builder.build_gep(LType::i8(), base, idx_buf, 1, label);
-        intrinsics::free(idx_buf);
-        return r;
-    }
-
     emit_ptr_diff(mut &this, a: LValue, b: LValue) -> LValue {
         const i64_ty: LType = LType::i64();
         const ai: LValue = this.builder.build_ptr_to_int(a, i64_ty, "p.a");
@@ -308,8 +299,6 @@ type struct IntrinsicEmitter {
         // arity, so this is a single guard.
         const expected: i64 = match (kind) {
             IntrinsicKind::NotIntrinsic => { -1 }
-            IntrinsicKind::PtrAdd       => { 2 }
-            IntrinsicKind::PtrSub       => { 2 }
             IntrinsicKind::PtrDiff      => { 2 }
             IntrinsicKind::Rotl32       => { 2 }
             IntrinsicKind::Rotl64       => { 2 }
@@ -359,9 +348,8 @@ type struct IntrinsicEmitter {
 
         // Auto-deref pointer args for value-arg intrinsics: handles the
         // pervasive `intrinsic(&this)` pattern in stdlib's
-        // primitives.cryo.  No-op for the pointer-arg intrinsics
-        // (PtrAdd/PtrSub/PtrDiff) since src_type returns null
-        // for those.
+        // primitives.cryo.  No-op for the pointer-arg intrinsic
+        // (PtrDiff) since src_type returns null for it.
         const src_ty: LType = kind.src_type();
         mut a0: LValue = args[0];
         if (src_ty.is_valid()) {
@@ -383,13 +371,8 @@ type struct IntrinsicEmitter {
         mut out_value: LValue = match (kind) {
             IntrinsicKind::NotIntrinsic => { LValue::null() }   // unreachable
 
-            // -- Pointer arithmetic (no auto-deref of args[0]; these
-            //    intentionally accept and produce pointers). --
-            IntrinsicKind::PtrAdd  => { this.emit_ptr_offset(args[0], args[1], "ptr.add") }
-            IntrinsicKind::PtrSub  => {
-                const negged: LValue = this.builder.build_neg(args[1], "ptr.off.neg");
-                this.emit_ptr_offset(args[0], negged, "ptr.sub")
-            }
+            // -- Pointer arithmetic (no auto-deref of args[0]; this
+            //    intentionally accepts pointers and produces a count). --
             IntrinsicKind::PtrDiff => { this.emit_ptr_diff(args[0], args[1]) }
 
             // -- Signed widening (sext) --
