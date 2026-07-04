@@ -1226,6 +1226,50 @@ public:
         return desugared;
     }
 
+    /// Reflected operator overloading for a PRIMITIVE left operand: `2 * vec`,
+    /// where the user type is the RIGHT operand and the operator trait is
+    /// implemented ON the primitive (`implement trait Mul<Vec, Vec> for i32`).
+    ///
+    /// Operator dispatch is LHS-driven and primitives are excluded from the
+    /// normal `operator_overload_expr` gate (their arithmetic must stay on the
+    /// native fast path).  This is therefore a SEPARATE, FAILURE-PATH-ONLY
+    /// attempt, tried only after `check_binary_op` rejected the operands and the
+    /// normal (LHS-driven) overload found nothing: a primitive OP primitive
+    /// always type-checks and never reaches here, so the native path is never
+    /// perturbed, and primitive OP user-type used to be a hard error, so this is
+    /// purely additive.  Builds `lhs.method(&rhs)` — primitive receivers support
+    /// trait-method calls (cf. `Ord::compare` / `Step::successor` on `i32`).
+    ///
+    /// Restricted to the arithmetic / bitwise / shift traits, whose `Rhs` is a
+    /// free type parameter.  `Eq`/`Ord` are excluded: their receiver and operand
+    /// share `This`, so `2 == vec` can never match a primitive's own comparison
+    /// impl, and attempting it would only risk a spurious diagnostic.
+    reflected_operator_overload_expr(mut &this, lhs_expr: ExpressionNode*, lhs: TypeRef,
+                                     rhs_expr: ExpressionNode*, map: OperatorTraitMap,
+                                     op_tok: Token, span: SourceSpan) -> ExpressionNode* {
+        if (!map.valid) { return null; }
+        if (map.ord_pred != "" || map.trait_leaf == "Eq") { return null; }
+        const lt: Type* = this.arena.lookup(lhs.id);
+        if (lt == null) { return null; }
+        // Only a genuine primitive scalar LHS.  A user / bounded / pointer /
+        // reference / string LHS is handled (or deliberately not) elsewhere.
+        const is_primitive: boolean = lt.kind == TypeKind::Int || lt.kind == TypeKind::Float
+                                   || lt.kind == TypeKind::Char || lt.kind == TypeKind::Bool;
+        if (!is_primitive) { return null; }
+        const trait_leaf: SymbolStr = this.intern.intern(map.trait_leaf);
+        // Gate on the impl EXISTING on the primitive before building anything,
+        // so a plain `2 * 3`-shaped error never materializes a bogus call.
+        const impl_block: ImplBlockNode* = OwnershipQuery::resolve_trait_impl_for_type(
+            this.arena, this.ctx.generic_registry, this.intern, trait_leaf, lhs);
+        if (impl_block == null) { return null; }
+        const method_sym: SymbolStr = this.intern.intern(map.method);
+        mut desugared: ExpressionNode* =
+            this.build_operator_call(lhs_expr, method_sym, rhs_expr, op_tok, span);
+        const rty: TypeRef = this.resolve_expr(desugared);
+        if (!rty.is_valid()) { return null; }
+        return desugared;
+    }
+
     /// When an overloadable operator hits a user type that lacks the required
     /// trait impl, emit a diagnostic that names the missing trait instead of the
     /// generic "cannot apply".  Returns true when it emitted (so the caller
@@ -1395,6 +1439,13 @@ public:
                 const de: ExpressionNode* = this.operator_overload_expr(
                     bin.left, lhs, bin.right, map, bin.op, bin.span, true);
                 if (de != null) { bin.desugared_call = de; return de.resolved_type; }
+                // Reflected: a PRIMITIVE left operand with the trait implemented
+                // on it (`2 * vec` => `(2).mul(&vec)`).  LHS-driven dispatch skips
+                // primitives, so this is the one place the right operand's user
+                // type can pull in an impl hung on the primitive.
+                const rde: ExpressionNode* = this.reflected_operator_overload_expr(
+                    bin.left, lhs, bin.right, map, bin.op, bin.span);
+                if (rde != null) { bin.desugared_call = rde; return rde.resolved_type; }
                 if (this.emit_operator_missing_impl(lhs, map, bin.op.lexeme, bin.span)) {
                     return TypeRef::invalid();
                 }
