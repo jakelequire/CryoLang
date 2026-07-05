@@ -48,6 +48,8 @@ import Utils;
 import Utils::Logger;
 import std::fmt;
 import std::collections::string;
+import std::collections::str;
+import std::env;
 
 /// A structured account of what a single translation unit's import could NOT
 /// translate faithfully — the honesty channel PLAN.md §3 requires.  Two buckets:
@@ -566,7 +568,7 @@ type struct Importer {
     /// identifier char there and is correctly NOT treated as an operator.
     static is_operator_spelling(name: string) -> boolean {
         if (name.length() < 9u64) { return false; }
-        if (libc::strncmp(name, "operator", 8u64) != 0) { return false; }
+        if (!name.starts_with("operator")) { return false; }
         const p: u8* = name as u8*;
         const c: u8 = p[8];
         const ident: boolean = (c >= 97u8 && c <= 122u8)   // a-z
@@ -1925,10 +1927,18 @@ type struct Importer {
         } else {
             args.push("c" as u8*);
         }
-        const res_dir: i8* = libc::getenv("CRYO_CLANG_RESOURCE_DIR") as i8*;
-        if (res_dir != null && (res_dir as string).length() > 0) {
-            args.push("-resource-dir" as u8*);
-            args.push(res_dir as u8*);
+        match (env::var(Str::new("CRYO_CLANG_RESOURCE_DIR"))) {
+            Option::Some(v) => {
+                // Pushed into `args` and read later by clang_parseTranslationUnit,
+                // so the bytes must outlive this scope: hand off an owned raw
+                // `string` (leaked once, like the old environ pointer).
+                const rd: string = v.into_raw();
+                if (rd.length() > 0) {
+                    args.push("-resource-dir" as u8*);
+                    args.push(rd as u8*);
+                }
+            }
+            Option::None => {}
         }
         for (mut ei: i64 = 0; ei < extra_args.length; ei++) {
             args.push(extra_args[ei]);
