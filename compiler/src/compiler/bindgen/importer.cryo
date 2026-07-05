@@ -27,7 +27,6 @@
 
 namespace Compiler::Bindgen::Importer;
 
-import ffi::libc;
 import Compiler::Bindgen::Clang;
 import Compiler::Bindgen::Clang::{ CXCursor, CXType, CXUnsavedFile, CXSourceRange, CXToken, CXString, CXSourceLocation };
 import Compiler::Bindgen::TypeMap;
@@ -49,6 +48,8 @@ import Utils::Logger;
 import std::fmt;
 import std::collections::string;
 import std::collections::str;
+import std::fs::metadata;
+import std::fs::path;
 import std::env;
 
 /// A structured account of what a single translation unit's import could NOT
@@ -1225,12 +1226,12 @@ type struct Importer {
             return;
         }
 
-        // Integer literal: strtoull(base 0) follows C lexing (0x hex, 0 octal,
+        // Integer literal: parse_c_uint follows C lexing (0x hex, 0 octal,
         // decimal) and stops at the type suffix.  Pick the narrowest type that
         // holds the value, mirroring C integer-literal typing; emit the value as
         // a u64 decimal (negative -> two's-complement, truncated at codegen).
         const has_u: boolean = spell.is_unsigned_literal();
-        const mag: u64 = libc::strtoull(spell as u8*, null, 0);
+        const mag: u64 = spell.parse_c_uint();
         mut type_name: string = "i32";
         mut value_u64: u64 = mag;
         if (neg) {
@@ -1653,7 +1654,7 @@ type struct Importer {
         const sp: string = tok.spelling(this.tu, this.ctx);
         if (k == Clang::TOKEN_LITERAL) {
             if (sp.is_text_literal() || sp.is_float_literal()) { return false; }
-            *out = libc::strtoull(sp as u8*, null, 0) as i64;
+            *out = sp.parse_c_uint() as i64;
             return true;
         }
         if (k == Clang::TOKEN_IDENTIFIER) {
@@ -1663,7 +1664,7 @@ type struct Importer {
             }
             for (mut i: i64 = 0; i < this.mac_names.length; i++) {
                 if (this.mac_names[i].equals(tsym) && !this.mac_floats[i]) {
-                    *out = libc::strtoull(this.mac_texts[i] as u8*, null, 0) as i64;
+                    *out = this.mac_texts[i].parse_c_uint() as i64;
                     return true;
                 }
             }
@@ -2024,9 +2025,7 @@ type struct Importer {
         intrinsics::memcpy((buf + src_len + 1) as void*, include_path as void*, inc_len);
         buf[src_len + 1 + inc_len] = 0;
 
-        const f: void* = libc::fopen(buf as string, "r");
-        if (f != null) {
-            libc::fclose(f);
+        if (metadata::exists(Path::from_cstr(buf as string))) {
             return buf as string;
         }
 
