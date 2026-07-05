@@ -125,18 +125,34 @@ function exit_code_of(status: i32) -> int {
 /// to the current directory; the negative suite ran Linux-only before this.
 ![target(windows)]
 function neg_tmp_path() -> string {
-    mut dir: i8* = getenv("TEMP") as i8*;
-    if (dir == null) { dir = getenv("TMP") as i8*; }
-    if (dir == null) { return format("cryo_negtest_%d.out", getpid()); }
-    return format("%s\\cryo_negtest_%d.out", dir as string, getpid());
+    match (env::var(Str::new("TEMP"))) {
+        Option::Some(v) => {
+            mut s: String = v;
+            return format("%s\\cryo_negtest_%d.out", s.as_cstr() as string, getpid());
+        }
+        Option::None => {}
+    }
+    match (env::var(Str::new("TMP"))) {
+        Option::Some(v) => {
+            mut s: String = v;
+            return format("%s\\cryo_negtest_%d.out", s.as_cstr() as string, getpid());
+        }
+        Option::None => {}
+    }
+    return format("cryo_negtest_%d.out", getpid());
 }
 
 /// POSIX: honor `$TMPDIR`, else `/tmp`.
 ![target(unix)]
 function neg_tmp_path() -> string {
-    const dir: i8* = getenv("TMPDIR") as i8*;
-    if (dir == null) { return format("/tmp/cryo_negtest_%d.out", getpid()); }
-    return format("%s/cryo_negtest_%d.out", dir as string, getpid());
+    match (env::var(Str::new("TMPDIR"))) {
+        Option::Some(v) => {
+            mut s: String = v;
+            return format("%s/cryo_negtest_%d.out", s.as_cstr() as string, getpid());
+        }
+        Option::None => {}
+    }
+    return format("/tmp/cryo_negtest_%d.out", getpid());
 }
 
 type enum CommandKind {
@@ -1404,8 +1420,10 @@ type struct Executor {
         if (col_choice == "always") { return true;  }
         if (col_choice == "never")  { return false; }
         // "auto" or "" (default): NO_COLOR > isatty.
-        const nc: i8* = getenv("NO_COLOR") as i8*;
-        if (nc != null) { return false; }
+        match (env::var(Str::new("NO_COLOR"))) {
+            Option::Some(_) => { return false; }
+            Option::None => {}
+        }
         return stdio::is_tty(1);
     }
 
@@ -1463,7 +1481,7 @@ type struct Executor {
             if (pn != "." && pn != ".."
                 && pnl > 5
                 && (pn + ((pnl - 5) as u64)) == ".cryo"
-                && (pattern == "" || strstr(pn, pattern) != null)) {
+                && (pattern == "" || pn.contains(pattern))) {
                 to_run += 1;
             }
             pre_entry = readdir(pre_dp);
@@ -1509,7 +1527,7 @@ type struct Executor {
             if (nlen <= 5) { entry = readdir(dp); continue; }
             const ext: string = name + ((nlen - 5) as u64);
             if (ext != ".cryo") { entry = readdir(dp); continue; }
-            if (pattern != "" && strstr(name, pattern) == null) {
+            if (pattern != "" && !name.contains(pattern)) {
                 entry = readdir(dp); continue;
             }
 
@@ -1550,7 +1568,7 @@ type struct Executor {
             system(runcmd);
             const out: string = Executor::read_file_or_empty(tmp);
             const want: string = format("error[%s]", expected);
-            const passed: boolean = strstr(out, want) != null;
+            const passed: boolean = out.contains(want);
             if (passed) {
                 if (is_compact) {
                     fmt::printf(".");
@@ -1575,7 +1593,7 @@ type struct Executor {
             entry = readdir(dp);
         }
         closedir(dp);
-        unlink(tmp);
+        dir::remove_file(Path::from_cstr(tmp));
 
         // Compact: close out the single in-flight line with the tally.
         if (is_compact && ran > 0) {
@@ -1630,12 +1648,17 @@ type struct Executor {
     /// True when a single `requires` token holds (see `proj_first_unmet_requirement`).
     static proj_requirement_met(req: string) -> boolean {
         if (req == "display") {
-            const d: i8* = getenv("DISPLAY") as i8*;
-            if (d != null && (d as string).length() > 0) { return true; }
-            const w: i8* = getenv("WAYLAND_DISPLAY") as i8*;
-            return w != null && (w as string).length() > 0;
+            match (env::var(Str::new("DISPLAY"))) {
+                Option::Some(v) => { mut s: String = v; if (s.length() > 0) { return true; } }
+                Option::None => {}
+            }
+            match (env::var(Str::new("WAYLAND_DISPLAY"))) {
+                Option::Some(v) => { mut s: String = v; return s.length() > 0; }
+                Option::None => {}
+            }
+            return false;
         }
-        if ((strstr(req, "vendor:") as void*) == (req as void*)) {
+        if (req.starts_with("vendor:")) {
             const lib: string = req + 7;   // strip "vendor:"
             const reg: VendorRegistry = VendorRegistry::load_global();
             const idx: i64 = reg.find_index(lib);
@@ -1772,9 +1795,9 @@ type struct Executor {
         while (pre_entry != null) {
             const pn: string = dirent_name(pre_entry);
             if (pn != "." && pn != ".."
-                && (pattern == "" || strstr(pn, pattern) != null)) {
+                && (pattern == "" || pn.contains(pattern))) {
                 const tj: string = Executor::proj_marker_path(projects_dir, pn);
-                if (access(tj, 0) == 0) { to_run += 1; }
+                if (metadata::exists(Path::from_cstr(tj))) { to_run += 1; }
             }
             pre_entry = readdir(pre_dp);
         }
@@ -1810,11 +1833,11 @@ type struct Executor {
             if (name == "." || name == "..") {
                 entry = readdir(dp); continue;
             }
-            if (pattern != "" && strstr(name, pattern) == null) {
+            if (pattern != "" && !name.contains(pattern)) {
                 entry = readdir(dp); continue;
             }
             const tj: string = Executor::proj_marker_path(projects_dir, name);
-            if (access(tj, 0) != 0) { entry = readdir(dp); continue; }
+            if (!metadata::exists(Path::from_cstr(tj))) { entry = readdir(dp); continue; }
 
             if (is_pretty) {
                 fmt::printf("  %s ... ", name);
@@ -1874,7 +1897,7 @@ type struct Executor {
             entry = readdir(dp);
         }
         closedir(dp);
-        unlink(tmp);
+        dir::remove_file(Path::from_cstr(tmp));
 
         if (is_compact && ran > 0) {
             fmt::printf("   %d ok", ran - failures);
@@ -1949,7 +1972,7 @@ type struct Executor {
             const out: string = Executor::read_file_or_empty(tmp);
             if (spec.diagnostic.length() > 0) {
                 const want: string = format("error[%s]", spec.diagnostic);
-                passed = failed && (strstr(out, want) != null);
+                passed = failed && out.contains(want);
                 if (!passed) { detail = format("expected build to fail with %s", spec.diagnostic); }
             } else {
                 passed = failed;
@@ -1966,7 +1989,7 @@ type struct Executor {
                 detail = format("exit %d, expected %lld", ec, spec.exit_code);
             } else if (spec.stdout_sub.length() > 0) {
                 const out: string = Executor::read_file_or_empty(tmp);
-                passed = strstr(out, spec.stdout_sub) != null;
+                passed = out.contains(spec.stdout_sub);
                 if (!passed) { detail = format("stdout missing \"%s\"", spec.stdout_sub); }
             }
         } else {
