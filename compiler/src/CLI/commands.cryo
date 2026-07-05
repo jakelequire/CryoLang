@@ -1258,14 +1258,10 @@ type struct Executor {
         }
         mut stdlib_abs: string = "";
         if (result.stdlib_root.length() > 0) {
-            mut std_abs: i8* = malloc(4096) as i8*;
-            const resolved: i8* = intrinsics::realpath(result.stdlib_root, std_abs);
-            if (resolved != null) {
-                stdlib_abs = format("%s", std_abs as string);
-            } else {
-                stdlib_abs = result.stdlib_root;
+            match (dir::canonicalize(Path::from_cstr(result.stdlib_root))) {
+                Result::Ok(pb)  => { stdlib_abs = pb.into_raw(); }
+                Result::Err(_)  => { stdlib_abs = result.stdlib_root; }
             }
-            free(std_abs as void*);
         }
 
         cdebug("[Test] %s\n", cmd);
@@ -1385,9 +1381,9 @@ type struct Executor {
     /// Pull the expected error code out of a `![config(negative, <code>)]`
     /// directive in `content`. Returns "" if absent.
     static neg_code_from(content: string) -> string {
-        const marker: i8* = strstr(content, "config(negative");
-        if (marker == null) { return ""; }
-        mut p: i8* = marker + ("config(negative".length() as u64);
+        const idx: i64 = content.find("config(negative");
+        if (idx < 0) { return ""; }
+        mut p: i8* = (content as i8*) + (idx as u64) + ("config(negative".length() as u64);
         // Skip the separator: comma and any spaces.
         loop {
             const c: i8 = *p;
@@ -2399,13 +2395,14 @@ type struct Executor {
     static vendor_register(path: string, args: &ParsedArgs, force: boolean) -> int {
         // Resolve to an absolute path (the registry stores absolute roots so
         // `import vendor::Name` works from any project directory).
-        mut abuf: i8* = malloc(4096) as i8*;
-        const resolved: i8* = intrinsics::realpath(path, abuf);
-        if (resolved == null) {
-            fmt::eprintf("Error: cannot resolve vendor path '%s' (does it exist?).\n", path);
-            return 1;
+        mut abs: string = "";
+        match (dir::canonicalize(Path::from_cstr(path))) {
+            Result::Ok(pb)  => { abs = pb.into_raw(); }
+            Result::Err(_)  => {
+                fmt::eprintf("Error: cannot resolve vendor path '%s' (does it exist?).\n", path);
+                return 1;
+            }
         }
-        const abs: string = abuf as string;
 
         const manifest_path: string = format("%s/cryo-vendor.json", abs);
         if (!metadata::exists(Path::from_cstr(manifest_path))) {

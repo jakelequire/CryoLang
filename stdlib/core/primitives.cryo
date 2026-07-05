@@ -992,17 +992,28 @@ implement string {
     /// error (E0645), no trait constraint needed.
     parse_int<T>(&this) -> T {
         return static match (T) {
-            u8    => { string_parse_radix_u64(this, 0) as u8 }
-            u16   => { string_parse_radix_u64(this, 0) as u16 }
-            u32   => { string_parse_radix_u64(this, 0) as u32 }
-            u64   => { string_parse_radix_u64(this, 0) }
-            usize => { string_parse_radix_u64(this, 0) as usize }
+            u8    => { string_parse_radix_u64(this, 0, false) as u8 }
+            u16   => { string_parse_radix_u64(this, 0, false) as u16 }
+            u32   => { string_parse_radix_u64(this, 0, false) as u32 }
+            u64   => { string_parse_radix_u64(this, 0, false) }
+            usize => { string_parse_radix_u64(this, 0, false) as usize }
             i8    => { string_parse_radix_i64(this) as i8 }
             i16   => { string_parse_radix_i64(this) as i16 }
             i32   => { string_parse_radix_i64(this) as i32 }
             i64   => { string_parse_radix_i64(this) }
             isize => { string_parse_radix_i64(this) as isize }
         };
+    }
+
+    /// Parse `this` as a C integer literal with `strtoull(s, null, 0)`
+    /// semantics: an optional sign, then `0x`/`0X` hex, `0b`/`0B` binary,
+    /// `0o`/`0O` or a bare leading `0` octal, else decimal; `_` separators are
+    /// skipped and parsing stops at the first character invalid for the
+    /// detected base (e.g. a `U`/`L` type suffix). Unlike `parse_int`, a bare
+    /// leading `0` selects octal — matching C header `#define`s like `0755`.
+    /// INFALLIBLE: malformed input yields 0 and overflow wraps.
+    parse_c_uint(&this) -> u64 {
+        return string_parse_radix_u64(this, 0, true);
     }
 
     /// Strip one pair of surrounding ASCII double quotes if both are
@@ -1291,7 +1302,7 @@ private function string_is_ascii_ws(b: i8) -> boolean {
 /// `i*` width recovers the right two's-complement value, and a `u*` width
 /// recovers the wrapped magnitude — matching the historical literal parser).
 /// Overflow wraps; "" or garbage yields 0.
-private function string_parse_radix_u64(s: string, start: i64) -> u64 {
+private function string_parse_radix_u64(s: string, start: i64, c_octal: boolean) -> u64 {
     if (s == null) { return 0; }
     mut i: i64 = start;
     mut negate: boolean = false;
@@ -1302,6 +1313,9 @@ private function string_parse_radix_u64(s: string, start: i64) -> u64 {
     if (s[i] == 48 && (s[i+1] == 120 || s[i+1] == 88))      { base = 16; i += 2; }  // 0x/0X
     else if (s[i] == 48 && (s[i+1] == 98 || s[i+1] == 66))  { base = 2;  i += 2; }  // 0b/0B
     else if (s[i] == 48 && (s[i+1] == 111 || s[i+1] == 79)) { base = 8;  i += 2; }  // 0o/0O
+    // C `strtoull(base 0)`: a bare leading `0` followed by an octal digit is
+    // octal (e.g. `0755`). Gated so the default parser keeps `007` == 7.
+    else if (c_octal && s[i] == 48 && s[i+1] >= 48 && s[i+1] <= 55) { base = 8; i += 1; }
 
     mut acc: u64 = 0;
     while (s[i] != 0) {
@@ -1322,5 +1336,5 @@ private function string_parse_radix_u64(s: string, start: i64) -> u64 {
 
 /// Signed view of the parse core: parse as wrapped-unsigned, reinterpret.
 private function string_parse_radix_i64(s: string) -> i64 {
-    return string_parse_radix_u64(s, 0) as i64;
+    return string_parse_radix_u64(s, 0, false) as i64;
 }

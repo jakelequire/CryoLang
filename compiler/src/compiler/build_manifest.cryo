@@ -45,7 +45,6 @@ namespace Compiler::BuildManifest;
 
 import Compiler::ProjectConfig;
 import Utils::Logger;
-import ffi::libc;
 import std::fs::file;
 import std::fs::metadata;
 import std::fs::path;
@@ -158,15 +157,20 @@ type struct ModuleKeyTable {
     /// which always runs alongside this on the success path).
     static write_module_keys(path: string, names: &string[],
                                keys: &string[]) -> void {
-        const f: void* = libc::fopen(path, "w");
-        if (f == null) {
-            fmt::eprintln(f"warning: cannot write per-module cache keys to {path}");
-            return;
-        }
+        mut text: String = String::new();
         for (mut i: i64 = 0; i < names.length; i++) {
-            intrinsics::fprintf(f, "%s\t%s\n", names[i], keys[i]);
+            text.push(Str::new(names[i]));
+            text.push_byte(9 as u8);     // TAB
+            text.push(Str::new(keys[i]));
+            text.push_byte(10 as u8);    // LF
         }
-        libc::fclose(f);
+        match (file::write(Path::from_cstr(path), text.as_bytes())) {
+            Result::Ok(_)  => {}
+            Result::Err(_) => {
+                fmt::eprintln(f"warning: cannot write per-module cache keys to {path}");
+            }
+        }
+        text.drop();
     }
 }
 
@@ -248,13 +252,16 @@ type struct Manifest {
     write_fingerprint(&this, fp_hex: string) -> void {
         ProjectConfig::mkdir_p(this.cfg.incremental_dir());
         const path: string = this.cfg.fingerprint_path();
-        const f: void* = libc::fopen(path, "w");
-        if (f == null) {
-            fmt::eprintln(f"warning: cannot write build fingerprint to {path}");
-            return;
+        mut text: String = String::new();
+        text.push(Str::new(fp_hex));
+        text.push_byte(10 as u8);        // LF
+        match (file::write(Path::from_cstr(path), text.as_bytes())) {
+            Result::Ok(_)  => {}
+            Result::Err(_) => {
+                fmt::eprintln(f"warning: cannot write build fingerprint to {path}");
+            }
         }
-        intrinsics::fprintf(f, "%s\n", fp_hex);
-        libc::fclose(f);
+        text.drop();
     }
 
     /// Write the human/tooling-facing per-profile `build-manifest.json` at
@@ -263,11 +270,6 @@ type struct Manifest {
                    artifacts: &string[]) -> void {
         ProjectConfig::mkdir_p(this.cfg.profile_dir());
         const path: string = this.cfg.manifest_path();
-        const f: void* = libc::fopen(path, "w");
-        if (f == null) {
-            fmt::eprintln(f"warning: cannot write build manifest to {path}");
-            return;
-        }
 
         const cfp: u64 = Manifest::compiler_fingerprint();
         const compiler_fp: string = cfp.to_hex_padded_str(16);
@@ -321,10 +323,14 @@ type struct Manifest {
         mut text: String = serializer::stringify_pretty(&doc);
         doc.drop();
 
-        libc::fwrite(text.as_ptr(), 1, text.length(), f);
-        libc::fputs("\n", f);
+        text.push_byte(10 as u8);        // trailing newline (matches prior fputs)
+        match (file::write(Path::from_cstr(path), text.as_bytes())) {
+            Result::Ok(_)  => {}
+            Result::Err(_) => {
+                fmt::eprintln(f"warning: cannot write build manifest to {path}");
+            }
+        }
         text.drop();
-        libc::fclose(f);
     }
 
     /// Fold a single byte into a running FNV-1a state, via the canonical
@@ -480,14 +486,12 @@ type struct Manifest {
         return buf as string;
     }
 
-    /// File size in bytes via `fseek`/`ftell`, without reading the contents.
-    /// Returns -1 when the file can't be opened.
+    /// File size in bytes via `fs::metadata`, without reading the contents.
+    /// Returns -1 when the file can't be stat'd.
     static file_size_bytes(path: string) -> i64 {
-        const h: void* = libc::fopen(path, "rb");
-        if (h == null) { return -1 as i64; }
-        libc::fseek(h, 0 as i64, 2);   // SEEK_END
-        const n: i64 = libc::ftell(h);
-        libc::fclose(h);
-        return n;
+        match (metadata::metadata(Path::from_cstr(path))) {
+            Result::Ok(m)  => { return m.len() as i64; }
+            Result::Err(_) => { return -1 as i64; }
+        }
     }
 }
