@@ -26,6 +26,8 @@ import std::core::option;
 import std::core::drop;
 import std::core::cmp;
 import std::collections::array;
+import std::collections::str;
+import std::collections::string;
 import std::test::error;
 import std::test::assert;
 
@@ -138,6 +140,39 @@ function unwrap_consume_no_double_free() -> Result<(), TestError> {
         p.drop();
     }
     return expect_eq(count(), 1);
+}
+
+// ---- match `mut` binding that reallocs mid-arm ---------------------------
+//
+// Regression: a `mut` payload binding whose heap buffer MOVES during the arm
+// (String::push reallocs) must be freed with its CURRENT pointer, not the
+// bind-time snapshot.  The match used to copy the owning subject into a
+// throwaway `match.subj` slot; the arm mutated the copy while the subject's
+// scope-exit drop reloaded the ORIGINAL slot — still holding the pre-realloc
+// (now-freed) pointer — and double-freed it (Windows 0xC0000374 / Linux abort).
+// prepare_match_subject now binds payloads against the subject's real storage,
+// so mutation-slot and drop-slot coincide.  A fixed-size Probe can't surface
+// this (its buffer never moves); a String can.
+
+![test]
+function match_mut_binding_realloc_no_double_free() -> Result<(), TestError> {
+    mut got_len: u64 = 0;
+    {
+        mut o: Option<String> = Option::Some(String::from_str(Str::new("abc")));
+        match (o) {
+            Option::Some(mut v) => {
+                // Grow well past the initial capacity so the heap buffer is
+                // reallocated (moved) inside the arm.
+                v.push(Str::new("defghijklmnopqrstuvwxyz0123456789"));
+                got_len = v.length();
+            }
+            Option::None => { }
+        }
+        // Borrow-only arm: `o` stays live; its scope-exit drop frees the
+        // REALLOCATED buffer exactly once. A stale-pointer double free here
+        // aborts the test process.
+    }
+    return expect_eq(got_len as i32, 36);   // 3 + 33
 }
 
 // ---- container of owned elements -----------------------------------------

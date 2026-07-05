@@ -1566,6 +1566,35 @@ public:
         // Idempotent (see resolve_binary): a prior resolution may have rewritten
         // `-x` into `x.neg()`; return its type rather than re-rejecting.
         if (unary.desugared_call != null) { return unary.desugared_call.resolved_type; }
+        // Address-of resolved against an expected `&T`: a numeric-literal
+        // operand must adopt the referent width (`&3` bound to `&i64` -> `&i64`,
+        // not `&i32`; otherwise codegen spills a too-narrow temp and the
+        // callee's `*rhs` reads uninitialised high bytes). The operand was
+        // already typed (default width) during the pre-desugar binary
+        // resolution, so `resolve_expr` short-circuits any expected-type hint —
+        // re-run the literal resolver directly (which re-adopts the width AND
+        // bound-checks it), then restamp the node. Only polymorphic numeric
+        // literals are touched; a real place keeps its own type.
+        if (unary.op.lexeme == "&" && unary.operand != null
+            && unary.operand.kind == NodeKind::Literal
+            && this.state.expected_type.is_valid()) {
+            const exp_t0: Type* = this.arena.lookup(this.state.expected_type.id);
+            if (exp_t0 != null && exp_t0.kind == TypeKind::Reference) {
+                const ref_ty0: TypeRef = (exp_t0 as ReferenceType*).referent;
+                const rt0: Type* = this.arena.lookup(ref_ty0.id);
+                const lit0: LiteralNode* = unary.operand as LiteralNode*;
+                const numeric_match: boolean = rt0 != null
+                    && ((rt0.kind == TypeKind::Int && lit0.literal_kind == LiteralKind::Integer)
+                     || (rt0.kind == TypeKind::Float && lit0.literal_kind == LiteralKind::Float));
+                if (numeric_match) {
+                    const saved_exp0: TypeRef = this.state.expected_type;
+                    this.state.expected_type = ref_ty0;
+                    const lit_ty0: TypeRef = this.literals.resolve_literal(lit0);
+                    this.state.expected_type = saved_exp0;
+                    if (lit_ty0.is_valid()) { unary.operand.set_resolved_type(lit_ty0); }
+                }
+            }
+        }
         const operand_type: TypeRef = this.resolve_expr(unary.operand);
         if (!operand_type.is_valid()) { return TypeRef::invalid(); }
         if (unary.op.lexeme == "&" && !unary.is_synthetic && unary.operand != null

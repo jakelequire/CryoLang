@@ -370,6 +370,22 @@ public:
         this.cg.builder.position_at_end(blocks.merge_bb);
     }
 
+    /// Storage address of a match subject when it is an addressable owning
+    /// slot — an Identifier bound to its local alloca. Binding the arm's
+    /// payloads against this slot (rather than a throwaway copy) keeps the
+    /// `mut` bindings and the subject's scope-exit drop pointed at ONE slot, so
+    /// a binding that reallocs mid-arm (e.g. `String::as_cstr`) is dropped with
+    /// its current pointer, not a stale one. Returns null for non-Identifier
+    /// subjects; DropInsertion already hoists owning non-Identifier subjects
+    /// into Identifier locals, so this covers every owning subject without
+    /// double-evaluating a side-effecting rvalue (Identifiers are idempotent).
+    match_subject_addr(mut &this, subject_node: ExpressionNode*) -> LValue {
+        if (subject_node == null || subject_node.kind != NodeKind::Identifier) {
+            return LValue::null();
+        }
+        return this.dispatch.codegen_lvalue(this, subject_node);
+    }
+
     override visit(mut &this, node: MatchStmtNode*) -> void {
         if (node.subject == null || node.arms.length == 0) { return; }
 
@@ -382,8 +398,9 @@ public:
 
         // Resolve the enum type (if subject is an enum), normalize to ptr, and
         // pre-extract the tag value for pattern comparison.
+        const subject_addr: LValue = this.match_subject_addr(node.subject);
         const minfo: MatchSubjectInfo = this.patterns.prepare_match_subject(
-            subject, node.subject.resolved_type, current_fn);
+            subject, node.subject.resolved_type, subject_addr, current_fn);
 
         // String subjects need strcmp for pattern comparison, not icmp
         // (strings are i8* at the LLVM level and icmp would compare
@@ -1405,8 +1422,9 @@ public:
             return;
         }
 
+        const subject_addr: LValue = this.match_subject_addr(node.subject);
         const minfo: MatchSubjectInfo = this.patterns.prepare_match_subject(
-            subject, node.subject.resolved_type, current_fn);
+            subject, node.subject.resolved_type, subject_addr, current_fn);
 
         // String subjects need strcmp (i8* content compare), not icmp
         // (which would compare pointer addresses).
