@@ -23,10 +23,20 @@ Statement          ::= VarDecl | FunctionDecl
                      | If | While | For | "loop" Block | DoWhile
                      | Match | Switch
                      | "break" ";" | "continue" ";" | Return
-                     | "unsafe" Block | Block | Expr ";"
+                     | "unsafe" Block | AsmBlock | Block | Expr ";"
 
 Block              ::= "{" Statement* "}"
 Return             ::= "return" Expr? ";"
+
+(*  Inline assembly.  The block body is raw target assembly (no string
+    quoting); a mandatory `![arch(<arch>, <dialect>)]` directive above it
+    selects the arch (gating) + dialect, and an optional `![clobber(...)]`
+    lists clobbered registers.  `${ ... }` holes bind Cryo operands; bare
+    `{` / `}` are literal assembly text (e.g. AVX-512 masks `{k1}`).       *)
+AsmBlock           ::= Directive* "asm" "{" AsmBody "}"
+AsmBody            ::= (AsmText | AsmOperand)*
+AsmOperand         ::= "$" "{" ("=" | "+")? Expr (":" AsmConstraint)? "}"
+AsmConstraint      ::= StringLit | "m" | "i" | "r"
 
 
 (*  Modules, Imports, Directives =============================== *)
@@ -391,17 +401,17 @@ Ident              ::= /* [a-zA-Z_][a-zA-Z0-9_]*                */
 (*  are lexed but not yet wired into the parser - see § 21 of       *)
 (*  `cryo.md` for the reserved-syntax table.                        *)
 (*                                                                  *)
-(*  alignof    as         async     auto      await      boolean   *)
-(*  break      case       char      class     const      continue  *)
-(*  default    delete     do        double    else       enum      *)
-(*  export     extern     f32       f64       false      float     *)
-(*  for        from       function  i8        i16        i32       *)
-(*  i64        i128       if        implement import     in        *)
-(*  inline     int        intrinsic loop      match      module    *)
-(*  move       mut        namespace new       null       optional  *)
-(*  override   private    protected public    return     sizeof    *)
-(*  static     string     struct    switch    this       This      *)
-(*  trait      true       tuple     type      typeof     u8        *)
-(*  u16        u32        u64       u128      uint       union     *)
-(*  unsafe     unsigned   virtual   void      where      while     *)
-(*  with       yield                                               *)
+(*  alignof    as         asm        async     auto      await     *)
+(*  boolean    break      case      char      class     const     *)
+(*  continue   default    delete    do        double    else      *)
+(*  enum       export     extern    f32       f64       false     *)
+(*  float      for        from      function  i8        i16       *)
+(*  i32        i64        i128      if        implement import    *)
+(*  in         inline     int       intrinsic loop      match     *)
+(*  module     move       mut       namespace new       null      *)
+(*  optional   override   private   protected public    return    *)
+(*  sizeof     static     string    struct    switch    this      *)
+(*  This       trait      true      tuple     type      typeof    *)
+(*  u8         u16        u32       u64       u128      uint      *)
+(*  union      unsafe     unsigned  virtual   void      where     *)
+(*  while      with       yield                                   *)

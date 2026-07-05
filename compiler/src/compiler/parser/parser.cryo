@@ -192,6 +192,15 @@ public:
                 break;
             }
 
+            // Module-level `asm { ... }` (naked / global asm, no operands),
+            // lowered to LLVM module inline asm.  `pending` (its `![arch]` /
+            // `![clobber]`) is lifted into the node.
+            if (this.check(TokenType::KwAsm)) {
+                const asm_node: AsmBlockStmtNode* = this.parse_asm_block(pending, true);
+                program.add_statement(asm_node as ASTNode*);
+                continue;
+            }
+
             const node: ASTNode* = this.parse_top_level();
             if (node != null) {
                 if (pending.length > 0 && Parser::is_attachable_decl(node)) {
@@ -2541,6 +2550,10 @@ public:
                 if (d != null) { pending.push(d); }
                 if (this.is_at_end()) { break; }
             }
+            // `![arch(...)] ![clobber(...)] asm { ... }`
+            if (this.check(TokenType::KwAsm)) {
+                return this.parse_asm_block(pending, false);
+            }
             if (!this.check(TokenType::LBrace)) {
                 this.report_error(ErrorCode::E0102_EXPECTED_EXPRESSION,
                     format("expected '{' after `![...]` directive in statement position; got '%s'",
@@ -2608,6 +2621,13 @@ public:
 
         if (tok.kind == TokenType::KwUnsafe) {
             return this.parse_unsafe_block();
+        }
+
+        // Bare `asm { ... }` (no preceding directive; arch is required and
+        // its absence is reported by the directive-processing pass).
+        if (tok.kind == TokenType::KwAsm) {
+            mut empty: DirectiveNode*[] = [];
+            return this.parse_asm_block(empty, false);
         }
 
         // Variable declarations (as statements).  Peek past `const`/`mut`:
@@ -3131,6 +3151,209 @@ public:
         const start: Token = this.advance(); // consume 'unsafe'
         const block: BlockStmtNode* = this.parse_block_statement();
         return new UnsafeBlockStmtNode(block, this.span_from(start));
+    }
+
+    /// Parse an inline-assembly block: `asm { ...raw asm... }`.
+    ///
+    /// The body is captured as raw assembly text (comments already stripped
+    /// by `advance()`), with `${...}` operand references pulled out into typed
+    /// operands.  Bare `{` / `}` are literal assembly (so e.g. AVX-512 masks
+    /// `{k1}` pass straight through); brace depth is tracked to find the
+    /// block's closing `}`.  Exact inter-token spacing is reconstructed from
+    /// column deltas so tight sequences like AT&T `%rax` / `$60` stay glued
+    /// while `mov rax, 60` keeps its spaces.  `pending` are the `![arch(...)]`
+    /// / `![clobber(...)]` directives already drained by the caller; arch,
+    /// dialect and clobbers are lifted out of them here (validated later by
+    /// the directive-processing pass).
+    ///
+    /// Operand grammar inside `${ }` (LLVM-prefix style):
+    ///   `${x}`        input, any general register
+    ///   `${=x}`       output
+    ///   `${+x}`       in-out
+    ///   `${x:"rax"}`  pin to a specific register
+    ///   `${x:m}`      memory operand (passed by address)
+    ///   `${x:i}`      immediate ; `${x:r}` explicit general register
+    parse_asm_block(pending: DirectiveNode*[], is_module: boolean) -> AsmBlockStmtNode* {
+        const start: Token = this.advance(); // consume 'asm'
+        mut node: AsmBlockStmtNode* = new AsmBlockStmtNode(this.span_from_token(start));
+        node.is_module_level = is_module;
+
+        // Lift arch / dialect / clobbers out of the attached directives.
+        for (mut i: i64 = 0; i < pending.length; i++) {
+            const d: DirectiveNode* = pending[i];
+            if (d == null) { continue; }
+            node.add_directive(d);
+            if (d.directive_kind == "arch") {
+                if (d.args.length >= 1 && d.args[0].kind == DirectiveArgKind::Ident) {
+                    node.arch = d.args[0].name;
+                }
+                if (d.args.length >= 2 && d.args[1].kind == DirectiveArgKind::Ident) {
+                    if (d.args[1].name == "intel") { node.dialect = AsmDialect::Intel; }
+                    else { node.dialect = AsmDialect::ATT; }
+                }
+            } else if (d.directive_kind == "clobber") {
+                for (mut j: i64 = 0; j < d.args.length; j++) {
+                    if (d.args[j].kind == DirectiveArgKind::Ident) {
+                        node.add_clobber(d.args[j].name);
+                    }
+                }
+            }
+        }
+
+        this.consume(TokenType::LBrace, "'{'");
+
+        mut current_text: string = "";
+        mut prev_line: int = -1;
+        mut prev_end_col: int = -1;
+        // Names parallel to `node.operands`, for dedup of repeated `${x}` refs.
+        mut names: string[] = [];
+        // Brace depth inside the block.  Bare `{` / `}` are literal assembly
+        // text (so e.g. AVX-512 masks `{k1}` pass straight through); only the
+        // `}` that returns depth to 0 terminates the block.  `${...}` operand
+        // braces never reach this counter - the operand path consumes them.
+        mut depth: i64 = 1;
+
+        while (true) {
+            if (this.is_at_end()) {
+                this.report_error(ErrorCode::E0111_INVALID_SYNTAX,
+                    "unterminated `asm { ... }` block (missing '}')");
+                break;
+            }
+            const tok: Token = this.current();
+
+            // Whitespace separating this unit from the previous emitted one.
+            mut sep: string = "";
+            if (prev_line >= 0) {
+                if (tok.line != prev_line) {
+                    sep = "\n";
+                } else {
+                    mut n: int = tok.column - prev_end_col;
+                    mut k: int = 0;
+                    while (k < n) { sep = sep + " "; k = k + 1; }
+                }
+            }
+
+            // `${ ... }` operand reference.  A bare `{` (no leading `$`) is
+            // literal assembly, handled by the brace-depth logic below.
+            if (tok.kind == TokenType::Dollar
+                    && this.peek_at(1).kind == TokenType::LBrace) {
+                current_text = current_text + sep;
+                if (current_text != "") { node.add_piece(AsmPiece::raw(current_text)); }
+                current_text = "";
+
+                this.advance(); // consume '$'
+                this.advance(); // consume '{'
+
+                mut dir: AsmOpDir = AsmOpDir::In;
+                if (this.check(TokenType::Equal)) { this.advance(); dir = AsmOpDir::Out; }
+                else if (this.check(TokenType::Plus)) { this.advance(); dir = AsmOpDir::InOut; }
+
+                // Record a plain identifier operand's name so repeated refs
+                // to the same variable collapse to one operand.
+                mut opname: string = "";
+                if (this.check(TokenType::Identifier)) {
+                    const nxt: Token = this.peek_at(1);
+                    if (nxt.kind == TokenType::RBrace || nxt.kind == TokenType::Colon) {
+                        opname = this.current().lexeme;
+                    }
+                }
+                const expr: ExpressionNode* = this.parse_expression();
+
+                mut ck: AsmConstraintKind = AsmConstraintKind::Reg;
+                mut pin: string = "";
+                if (this.check(TokenType::Colon)) {
+                    this.advance();
+                    if (this.check(TokenType::StringLiteral)) {
+                        const s: Token = this.advance();
+                        ck = AsmConstraintKind::Pinned;
+                        pin = ParserBase::unquote_string_lexeme(s.lexeme);
+                    } else if (this.check(TokenType::Identifier)) {
+                        const c: Token = this.advance();
+                        if (c.lexeme == "m") { ck = AsmConstraintKind::Memory; }
+                        else if (c.lexeme == "i") { ck = AsmConstraintKind::Imm; }
+                        else if (c.lexeme == "r") { ck = AsmConstraintKind::Reg; }
+                        else {
+                            this.report_error(ErrorCode::E0111_INVALID_SYNTAX,
+                                format("unknown asm operand constraint '%s' (expected r, m, i, or a \"register\")",
+                                    c.lexeme));
+                        }
+                    } else {
+                        this.report_error(ErrorCode::E0111_INVALID_SYNTAX,
+                            "expected an asm operand constraint after ':' (a \"register\", m, i, or r)");
+                    }
+                }
+                const rb: Token = this.consume(TokenType::RBrace, "'}'");
+                prev_line = rb.line;
+                prev_end_col = rb.column + rb.source_length;
+
+                // Dedup by identifier name; merge directions (in + out => inout).
+                mut idx: i64 = -1;
+                if (opname != "") {
+                    mut j: i64 = 0;
+                    while (j < names.length) {
+                        if (names[j] == opname) { idx = j; break; }
+                        j = j + 1;
+                    }
+                }
+                if (idx >= 0) {
+                    mut existing: AsmOperand* = node.operands[idx];
+                    if (existing.direction != dir) { existing.direction = AsmOpDir::InOut; }
+                    if (existing.constraint == AsmConstraintKind::Reg
+                            && ck != AsmConstraintKind::Reg) {
+                        existing.constraint = ck;
+                        existing.pinned_reg = pin;
+                    }
+                } else {
+                    const op: AsmOperand* = new AsmOperand(dir, expr, ck, pin);
+                    idx = node.add_operand(op);
+                    names.push(opname);
+                }
+                node.add_piece(AsmPiece::operand(idx));
+                continue;
+            }
+
+            // Closing `}`: at depth 0 it terminates the block; deeper, it is
+            // a literal brace in the assembly.
+            if (tok.kind == TokenType::RBrace) {
+                depth = depth - 1;
+                if (depth == 0) {
+                    if (current_text != "") { node.add_piece(AsmPiece::raw(current_text)); }
+                    this.advance(); // consume closing '}'
+                    break;
+                }
+                current_text = current_text + sep + "}";
+                prev_line = tok.line;
+                prev_end_col = tok.column + tok.source_length;
+                this.advance();
+                continue;
+            }
+
+            // Literal `{` in the assembly (e.g. an AVX-512 mask `{k1}`).
+            if (tok.kind == TokenType::LBrace) {
+                depth = depth + 1;
+                current_text = current_text + sep + "{";
+                prev_line = tok.line;
+                prev_end_col = tok.column + tok.source_length;
+                this.advance();
+                continue;
+            }
+
+            // Ordinary raw assembly token.  For a FUNCTION-level block a
+            // literal `$` (AT&T immediate prefix, e.g. `$60`) must be doubled
+            // to `$$` because LLVM uses `$` as the operand-reference escape in
+            // the inline-asm template.  Module-level asm is emitted verbatim
+            // (no operand substitution), so `$` must stay a single `$` there.
+            // `$` only ever arrives as its own Dollar token.
+            mut piece_text: string = tok.lexeme;
+            if (tok.kind == TokenType::Dollar && !is_module) { piece_text = "$$"; }
+            current_text = current_text + sep + piece_text;
+            prev_line = tok.line;
+            prev_end_col = tok.column + tok.source_length;
+            this.advance();
+        }
+
+        node.span = this.span_from(start);
+        return node;
     }
 
     /// Helper: parse a statement that should be a block, or wrap in one.

@@ -227,6 +227,11 @@ type struct DirectiveProcessingPasses {
             // header's function prototypes — suppress struct/enum/typedef
             // emission.  Used by the compiler's own `llvm` bootstrap import.
             | "functions_only"
+            // `![arch(<arch>, <dialect>)]` / `![clobber(...)]`: attached to an
+            // `asm { ... }` block.  `arch` selects the target architecture
+            // (gating the block in ConfigGating) and the asm dialect; `clobber`
+            // lists clobbered registers / `flags` / `memory`.
+            | "arch" | "clobber"
             // Bare-atom forms of the cfg/config gate.  These are sugar for
             // `![config(<atom>)]` and are evaluated by the ConfigGating pass.
             | "windows" | "linux" | "macos" | "unix"
@@ -630,6 +635,53 @@ type struct DirectiveProcessingPasses {
                     && target != DirectiveTarget::Class
                     && target != DirectiveTarget::Enum) {
                     DirectiveProcessingPasses::emit_placement_error(ctx, dir, name, "struct/class/enum", target);
+                }
+            }
+
+            // `![arch(<arch>, <dialect>)]`: exactly two identifiers — the
+            // target architecture (used to gate the following `asm` block and
+            // pick the dialect) and the dialect (`intel` or `att`).  The arch
+            // name is left permissive (validated against the target triple at
+            // codegen); the assembler rejects genuinely unknown arches.
+            "arch" => {
+                if (argc != 2) {
+                    DirectiveProcessingPasses::emit_arity_error(ctx, dir, name, 2, argc);
+                    return;
+                }
+                const a0: DirectiveArg = dir.args[0];
+                const a1: DirectiveArg = dir.args[1];
+                if (a0.kind != DirectiveArgKind::Ident) {
+                    DirectiveProcessingPasses::emit_arg_kind_error(ctx, dir, name, 0, "an architecture identifier");
+                    return;
+                }
+                if (a1.kind != DirectiveArgKind::Ident) {
+                    DirectiveProcessingPasses::emit_arg_kind_error(ctx, dir, name, 1, "a dialect identifier (`intel` or `att`)");
+                    return;
+                }
+                if (!(a1.name == "intel" || a1.name == "att")) {
+                    const code: ErrorCode = ErrorCode::E0152_DIRECTIVE_BAD_ARG;
+                    const msg: string = format(
+                        "directive `![arch]`: unknown dialect `%s` (expected `intel` or `att`)",
+                        a1.name);
+                    mut diag: Diagnostic = Diagnostic::error(code, msg);
+                    diag = diag.at(dir.span);
+                    ctx.emit_diagnostic(diag);
+                }
+            }
+
+            // `![clobber(...)]`: one or more identifiers — register names, or
+            // the special tokens `flags` / `memory`.  Attached to an `asm` block.
+            "clobber" => {
+                if (argc == 0) {
+                    DirectiveProcessingPasses::emit_arity_error(ctx, dir, name, 1, argc);
+                    return;
+                }
+                for (mut i: i64 = 0; i < argc; i++) {
+                    const a: DirectiveArg = dir.args[i];
+                    if (a.kind != DirectiveArgKind::Ident) {
+                        DirectiveProcessingPasses::emit_arg_kind_error(ctx, dir, name, i,
+                            "a register name, `flags`, or `memory`");
+                    }
                 }
             }
 
