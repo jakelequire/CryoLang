@@ -38,6 +38,7 @@ import std::fs::path;
 import std::env;
 import std::time::clock;
 import std::collections::string;
+import std::collections::str;
 
 type struct CompilerConfig {
     debug:              boolean;
@@ -2332,15 +2333,20 @@ type struct CompilerInstance {
         }
 
         // 1. Explicit env var.
-        const env_raw: i8* = libc::getenv("CRYO_STDLIB") as i8*;
-        if (env_raw != null) {
-            const env_path: string = env_raw as string;
-            if (metadata::exists(Path::from_cstr(env_path + "/lib.cryo"))) {
-                return env_path;
+        match (env::var(Str::new("CRYO_STDLIB"))) {
+            Option::Some(v) => {
+                // Returned directly on match, so the value must outlive this
+                // scope: `into_raw` hands back an owned, NUL-terminated raw
+                // `string` (leaked once, like the old environ pointer).
+                const env_path: string = v.into_raw();
+                if (metadata::exists(Path::from_cstr(env_path + "/lib.cryo"))) {
+                    return env_path;
+                }
+                if (tried_out != null) {
+                    tried_out.push(format("%s  ($CRYO_STDLIB)", env_path));
+                }
             }
-            if (tried_out != null) {
-                tried_out.push(format("%s  ($CRYO_STDLIB)", env_path));
-            }
+            Option::None => {}
         }
 
         // 2. + 3. Install-root env var.  install.sh writes CRYO_HOME into
@@ -2348,23 +2354,27 @@ type struct CompilerInstance {
         // `<CRYO_HOME>/stdlib` (the simple layout install.sh creates today)
         // or `<CRYO_HOME>/share/cryo/stdlib` (FHS layout, in case packagers
         // pick that).  Cross-platform; does not depend on /proc/self/exe.
-        const home_raw: i8* = libc::getenv("CRYO_HOME") as i8*;
-        if (home_raw != null) {
-            const home_path: string = home_raw as string;
-            const cand_home_simple: string = home_path + "/stdlib";
-            if (metadata::exists(Path::from_cstr(cand_home_simple + "/lib.cryo"))) {
-                return cand_home_simple;
+        match (env::var(Str::new("CRYO_HOME"))) {
+            Option::Some(v) => {
+                // Consumed into an owned raw `string` (leaked once, like the old
+                // environ pointer); used only to build fresh candidate paths.
+                const home_path: string = v.into_raw();
+                const cand_home_simple: string = home_path + "/stdlib";
+                if (metadata::exists(Path::from_cstr(cand_home_simple + "/lib.cryo"))) {
+                    return cand_home_simple;
+                }
+                if (tried_out != null) {
+                    tried_out.push(format("%s  ($CRYO_HOME/stdlib)", cand_home_simple));
+                }
+                const cand_home_share: string = home_path + "/share/cryo/stdlib";
+                if (metadata::exists(Path::from_cstr(cand_home_share + "/lib.cryo"))) {
+                    return cand_home_share;
+                }
+                if (tried_out != null) {
+                    tried_out.push(format("%s  ($CRYO_HOME/share/cryo/stdlib)", cand_home_share));
+                }
             }
-            if (tried_out != null) {
-                tried_out.push(format("%s  ($CRYO_HOME/stdlib)", cand_home_simple));
-            }
-            const cand_home_share: string = home_path + "/share/cryo/stdlib";
-            if (metadata::exists(Path::from_cstr(cand_home_share + "/lib.cryo"))) {
-                return cand_home_share;
-            }
-            if (tried_out != null) {
-                tried_out.push(format("%s  ($CRYO_HOME/share/cryo/stdlib)", cand_home_share));
-            }
+            Option::None => {}
         }
 
         // 4. + 5. Binary-relative via /proc/self/exe.  Single 4 KiB scratch
@@ -2516,9 +2526,10 @@ type struct CompilerInstance {
     /// True when the `CRYO_TIMINGS` env var is set to a non-empty value.  Gates
     /// the per-phase wall-time report printed at the end of a successful build.
     static timing_enabled() -> boolean {
-        const raw: i8* = libc::getenv("CRYO_TIMINGS") as i8*;
-        if (raw == null) { return false; }
-        return (raw as string).length() > 0;
+        match (env::var(Str::new("CRYO_TIMINGS"))) {
+            Option::Some(v) => { return v.length() > 0; }
+            Option::None => { return false; }
+        }
     }
 
     /// Render a nanosecond span as milliseconds with one decimal place, plus

@@ -5,6 +5,8 @@
 
 namespace Compiler::Codegen::Passes;
 import ffi::libc;
+import std::env;
+import std::collections::str;
 
 import Compiler::Codegen;
 import Compiler::Codegen::{ LLVMTypes, TypeMap, Context };
@@ -86,9 +88,9 @@ type struct LinkerConfig {
         // x86_64 windows-gnu (mingw-w64).  Substring-match the OS field so
         // every reasonable spelling (`x86_64-pc-windows-gnu`,
         // `x86_64-w64-windows-gnu`, `x86_64-windows-gnu`) routes here.
-        if (strstr(triple, "windows") != null
-                && strstr(triple, "gnu") != null
-                && strstr(triple, "x86_64") != null) {
+        if (triple.contains("windows")
+                && triple.contains("gnu")
+                && triple.contains("x86_64")) {
             return LinkerConfig {
                 driver:             CodegenPasses::pick_link_driver("x86_64-w64-mingw32-gcc"),
                 // `-lws2_32` for std::net (Winsock); mingw does NOT auto-link it
@@ -907,7 +909,7 @@ type struct CodegenPasses {
         // line and every other supported triple today).  Same flag shapes
         // as the common loops above: search -> -L, system -> -l, static
         // -> verbatim path.
-        if (strstr(effective_triple, "windows") != null) {
+        if (effective_triple.contains("windows")) {
             for (mut i: i64 = 0; i < cfg.link_search_windows.length; i++) {
                 cmd = format("%s -L%s", cmd, CodegenPasses::link_quote(cfg.link_search_windows[i]));
             }
@@ -1428,10 +1430,14 @@ type struct CodegenPasses {
     /// historic choice and selfhost byte-identity are preserved and the probe
     /// only falls through to `llvm-ar` when `ar` is genuinely absent.
     static pick_archiver() -> string {
-        const env_raw: i8* = libc::getenv("CRYO_AR") as i8*;
-        if (env_raw != null) {
-            const env_val: string = env_raw as string;
-            if (env_val.length() > 0) { return env_val; }
+        match (env::var(Str::new("CRYO_AR"))) {
+            Option::Some(v) => {
+                // Returned as-is, so persist it: `into_raw` yields an owned
+                // NUL-terminated `string` (empty is treated as unset below).
+                const env_val: string = v.into_raw();
+                if (env_val.length() > 0) { return env_val; }
+            }
+            Option::None => {}
         }
         if (CodegenPasses::tool_available("ar"))         { return "ar"; }
         if (CodegenPasses::tool_available("llvm-ar"))    { return "llvm-ar"; }
@@ -1461,13 +1467,15 @@ type struct CodegenPasses {
     ///      substitute, so we DON'T fall back for it - the original name is
     ///      kept so the link error names the absent cross toolchain.
     static pick_link_driver(default_driver: string) -> string {
-        const env_raw: i8* = libc::getenv("CRYO_CC") as i8*;
-        if (env_raw != null) {
-            const env_val: string = env_raw as string;
-            if (env_val.length() > 0) { return env_val; }
+        match (env::var(Str::new("CRYO_CC"))) {
+            Option::Some(v) => {
+                const env_val: string = v.into_raw();
+                if (env_val.length() > 0) { return env_val; }
+            }
+            Option::None => {}
         }
         if (CodegenPasses::tool_available(default_driver)) { return default_driver; }
-        if (strstr(default_driver, "mingw") == null) {
+        if (!default_driver.contains("mingw")) {
             if (CodegenPasses::tool_available("gcc"))   { return "gcc"; }
             if (CodegenPasses::tool_available("clang")) { return "clang"; }
             if (CodegenPasses::tool_available("cc"))    { return "cc"; }
@@ -1483,10 +1491,12 @@ type struct CodegenPasses {
     /// build under Alpine point at its own `llvm-config` (which reports the
     /// musl-built static `.a` set) with no source change.
     static pick_llvm_config() -> string {
-        const env_raw: i8* = libc::getenv("CRYO_LLVM_CONFIG") as i8*;
-        if (env_raw != null) {
-            const env_val: string = env_raw as string;
-            if (env_val.length() > 0) { return env_val; }
+        match (env::var(Str::new("CRYO_LLVM_CONFIG"))) {
+            Option::Some(v) => {
+                const env_val: string = v.into_raw();
+                if (env_val.length() > 0) { return env_val; }
+            }
+            Option::None => {}
         }
         return "llvm-config-20";
     }
