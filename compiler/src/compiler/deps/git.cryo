@@ -5,12 +5,11 @@
 ///! as the source-of-truth; working trees are materialised under
 ///! `cache/checkouts/<sanitized>/<sha>` on demand.
 ///!
-///! All operations shell out via `system()` or `popen()`.  We rely on
-///! the user's git installation for protocol/auth handling; nothing
-///! here is reimplemented in-process.
+///! All operations run the `git` binary via `std::process::Command` (argv,
+///! no shell).  We rely on the user's git installation for protocol/auth
+///! handling; nothing here is reimplemented in-process.
 
 namespace Compiler::Deps::Git;
-import ffi::libc;
 
 import Utils::Logger;
 import std::fs::metadata;
@@ -19,6 +18,8 @@ import std::fs::path;
 import std::fmt;
 import std::collections::str;
 import std::collections::string;
+import std::core::slice;
+import std::process::command;
 import Compiler::Deps::Cache;
 
 
@@ -43,8 +44,8 @@ type struct Git {
             // output can run with `CRYO_DEBUG=1`.
             dir::create_dir_all(Path::from_cstr(dir.parent_dir()));
             fmt::println(f"[deps] cloning {url}");
-            const cmd: string = format("git clone --bare --quiet '%s' '%s'", url, dir);
-            const status: i32 = system(cmd);
+            mut clone_args: string[] = ["clone", "--bare", "--quiet", url, dir];
+            const status: i32 = Git::run_git(&clone_args);
             if (status != 0) {
                 fmt::eprintln(f"error: git clone failed for {url}");
                 return false;
@@ -54,9 +55,10 @@ type struct Git {
 
         if (refresh) {
             fmt::println(f"[deps] refreshing {url}");
-            const cmd: string = format(
-                "git --git-dir='%s' fetch --quiet --tags --prune --all", dir);
-            const status: i32 = system(cmd);
+            mut fetch_args: string[] = [
+                format("--git-dir=%s", dir),
+                "fetch", "--quiet", "--tags", "--prune", "--all"];
+            const status: i32 = Git::run_git(&fetch_args);
             if (status != 0) {
                 fmt::eprintln(f"warning: git fetch failed for {url} (using stale refs)");
                 // Soft-fail: an offline build with a populated cache is
@@ -110,12 +112,13 @@ type struct Git {
         }
 
         for (mut i: int = 0; i < candidates.length; i++) {
-            const cmd: string = format(
-                "git --git-dir='%s' rev-parse --verify --quiet '%s^{commit}' 2>/dev/null",
-                dir, candidates[i]);
-            const sha: string = Git::read_first_line(cmd);
-            if (sha.length() > 0) {
-                return sha;
+            mut rp_args: string[] = [
+                format("--git-dir=%s", dir),
+                "rev-parse", "--verify", "--quiet",
+                format("%s^{commit}", candidates[i])];
+            const lines: string[] = Git::capture_git(&rp_args);
+            if (lines.length > 0 && lines[0].length() > 0) {
+                return lines[0];
             }
         }
 
@@ -128,9 +131,8 @@ type struct Git {
     /// Returns an empty list on failure (and prints a diagnostic).
     static list_tags(url: string) -> string[] {
         const dir: string = Cache::git_dir_for(url);
-        const cmd: string = format(
-            "git --git-dir='%s' tag --list 2>/dev/null", dir);
-        return Git::read_lines(cmd);
+        mut tag_args: string[] = [format("--git-dir=%s", dir), "tag", "--list"];
+        return Git::capture_git(&tag_args);
     }
 
 
@@ -170,15 +172,13 @@ type struct Git {
             dir::remove_dir_all(Path::from_cstr(wt));
         }
 
-        const clone_cmd: string = format(
-            "git clone --local --quiet '%s' '%s'", bare, wt);
-        if (system(clone_cmd) != 0) {
+        mut clone_args: string[] = ["clone", "--local", "--quiet", bare, wt];
+        if (Git::run_git(&clone_args) != 0) {
             fmt::eprintln(f"error: failed to materialize working tree at {wt}");
             return false;
         }
-        const co_cmd: string = format(
-            "git -C '%s' checkout --quiet --detach '%s'", wt, sha);
-        if (system(co_cmd) != 0) {
+        mut co_args: string[] = ["-C", wt, "checkout", "--quiet", "--detach", sha];
+        if (Git::run_git(&co_args) != 0) {
             fmt::eprintln(f"error: failed to checkout {sha} in {wt}");
             return false;
         }
@@ -186,41 +186,60 @@ type struct Git {
     }
 
 
-    // Subprocess output capture
+    // Subprocess helpers (argv via std::process::Command, no shell)
 
-    /// Run `cmd` and return its first line of stdout (with trailing
-    /// newline stripped).  Returns "" if the process produced no output
-    /// or exited non-zero.  Caller is responsible for adding redirection
-    /// (`2>/dev/null`) when stderr noise is unwanted.
-    static read_first_line(cmd: string) -> string {
-        const pipe: void* = intrinsics::popen(cmd, "r");
-        if (pipe == null) { return ""; }
-        mut buf: i8* = intrinsics::malloc(4096) as i8*;
-        const got: i8* = libc::fgets(buf, 4096, pipe) as i8*;
-        const status: i32 = intrinsics::pclose(pipe);
-        if (got == null) { return ""; }
-        const line: string = (buf as string).trim();
-        if (status != 0 && line.length() == 0) { return ""; }
-        return line;
+    /// Run `git` with `args`, inheriting stdio, and return the child's exit
+    /// code (0 on success), or -1 if git could not be spawned / was signalled.
+    /// Used for clone/fetch/checkout, whose `--quiet` progress goes to the
+    /// terminal.
+    static run_git(args: &string[]) -> i32 {
+        mut c: Command = Command::new(Str::new("git"));
+        for (mut i: i64 = 0; i < args.length; i++) {
+            c.arg(Str::new(args[i]));
+        }
+        match (c.status()) {
+            Result::Ok(st) => {
+                match (st.exit_code()) {
+                    Option::Some(code) => { return code; }
+                    Option::None       => { return -1; }
+                }
+            }
+            Result::Err(_) => { return -1; }
+        }
     }
 
-    /// Run `cmd` and return every line of stdout in source order.
-    /// Trailing newlines are stripped; empty lines are skipped.
-    static read_lines(cmd: string) -> string[] {
+    /// Run `git` with `args`, capturing stdout with stderr suppressed (the
+    /// argv equivalent of the old `2>/dev/null`), and return every non-empty
+    /// line trimmed of surrounding whitespace, in source order.  Returns an
+    /// empty list on spawn failure or empty output.
+    static capture_git(args: &string[]) -> string[] {
         mut out: string[] = [];
-        const pipe: void* = intrinsics::popen(cmd, "r");
-        if (pipe == null) { return out; }
-
-        mut buf: i8* = intrinsics::malloc(4096) as i8*;
-        while (true) {
-            const got: i8* = libc::fgets(buf, 4096, pipe) as i8*;
-            if (got == null) { break; }
-            const line: string = (buf as string).trim();
-            if (line.length() > 0) {
-                out.push(line);
-            }
+        mut c: Command = Command::new(Str::new("git"));
+        for (mut i: i64 = 0; i < args.length; i++) {
+            c.arg(Str::new(args[i]));
         }
-        intrinsics::pclose(pipe);
+        c.stderr(Stdio::Null);
+        match (c.output()) {
+            Result::Ok(res) => {
+                mut o: Output = res;
+                const bytes: Slice<u8> = o.stdout();
+                if (bytes.length() > 0) {
+                    mut buf: String = String::new();
+                    mut i: u64 = 0;
+                    while (i < bytes.length()) {
+                        buf.push_byte(bytes.get(i).unwrap_or(0 as u8));
+                        i++;
+                    }
+                    const raw: string = buf.into_raw();
+                    mut lines: string[] = raw.split_char('\n' as i8);
+                    for (mut j: i64 = 0; j < lines.length; j++) {
+                        const t: string = lines[j].trim();
+                        if (t.length() > 0) { out.push(t); }
+                    }
+                }
+            }
+            Result::Err(_) => {}
+        }
         return out;
     }
 }

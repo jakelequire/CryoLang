@@ -16,6 +16,7 @@ import std::fs::file;
 import std::fs::path;
 import std::fs::metadata;
 import std::fs::dir;
+import std::process::exec;
 import std::json::parser;
 import std::json::value;
 import std::json::serializer;
@@ -81,10 +82,8 @@ type struct ProjOutcome {
 //     parses the leading `/`-bearing token as a switch and reports
 //     `'build' is not recognized` - so the leading binary path must be
 //     rewritten to backslashes.  `sh` runs the path as-is.
-//   * Exit status: POSIX `system` returns a wait-status whose exit code
-//     lives in bits 8-15 (`(s >> 8) & 0xff`); Windows msvcrt `system`
-//     returns the child's exit code directly.  Decoding the Windows value
-//     with the POSIX shift turns every small exit code into 0.
+//     (`cryo test` still routes its forwarded-flag command through
+//     `exec::shell`, so the leading binary path is host-normalized.)
 
 /// Rewrite a path's `/` to `\` so a `cmd`-executed command resolves it.
 /// Windows-host only; never referenced on the POSIX side.
@@ -105,19 +104,6 @@ function exec_path(path: string) -> string {
 ![target(unix)]
 function exec_path(path: string) -> string {
     return path;
-}
-
-/// Decode a libc `system(3)` return value into a process exit code.
-/// Windows: msvcrt returns the child exit code directly.
-![target(windows)]
-function exit_code_of(status: i32) -> int {
-    return (status & 0xff) as int;
-}
-
-/// POSIX: the exit code lives in bits 8-15 of the wait-status.
-![target(unix)]
-function exit_code_of(status: i32) -> int {
-    return ((status >> 8) & 0xff) as int;
 }
 
 /// Per-process scratch path for capturing a negative test's compiler
@@ -500,40 +486,40 @@ type struct Executor {
     /// Registers all built-in commands with the Runner.
     static register_commands(runner: Runner*) -> void {
         const help: CommandKind = CommandKind::Help;
-        runner.add_command(Command::new(help.name(), help.description(), help.usage()));
+        runner.add_command(CLI::Command::new(help.name(), help.description(), help.usage()));
 
         const version: CommandKind = CommandKind::Version;
-        runner.add_command(Command::new(version.name(), version.description(), version.usage()));
+        runner.add_command(CLI::Command::new(version.name(), version.description(), version.usage()));
 
         const init: CommandKind = CommandKind::Init;
-        runner.add_command(Command::new(init.name(), init.description(), init.usage()));
+        runner.add_command(CLI::Command::new(init.name(), init.description(), init.usage()));
 
         const build: CommandKind = CommandKind::Build;
-        runner.add_command(Command::new(build.name(), build.description(), build.usage()));
+        runner.add_command(CLI::Command::new(build.name(), build.description(), build.usage()));
 
         const run: CommandKind = CommandKind::Run;
-        runner.add_command(Command::new(run.name(), run.description(), run.usage()));
+        runner.add_command(CLI::Command::new(run.name(), run.description(), run.usage()));
 
         const test_cmd: CommandKind = CommandKind::Test;
-        runner.add_command(Command::new(test_cmd.name(), test_cmd.description(), test_cmd.usage()));
+        runner.add_command(CLI::Command::new(test_cmd.name(), test_cmd.description(), test_cmd.usage()));
 
         const check: CommandKind = CommandKind::Check;
-        runner.add_command(Command::new(check.name(), check.description(), check.usage()));
+        runner.add_command(CLI::Command::new(check.name(), check.description(), check.usage()));
 
         const raw: CommandKind = CommandKind::Raw;
-        runner.add_command(Command::new(raw.name(), raw.description(), raw.usage()));
+        runner.add_command(CLI::Command::new(raw.name(), raw.description(), raw.usage()));
 
         const demangle: CommandKind = CommandKind::Demangle;
-        runner.add_command(Command::new(demangle.name(), demangle.description(), demangle.usage()));
+        runner.add_command(CLI::Command::new(demangle.name(), demangle.description(), demangle.usage()));
 
         const fetch: CommandKind = CommandKind::Fetch;
-        runner.add_command(Command::new(fetch.name(), fetch.description(), fetch.usage()));
+        runner.add_command(CLI::Command::new(fetch.name(), fetch.description(), fetch.usage()));
 
         const update: CommandKind = CommandKind::Update;
-        runner.add_command(Command::new(update.name(), update.description(), update.usage()));
+        runner.add_command(CLI::Command::new(update.name(), update.description(), update.usage()));
 
         const vendor: CommandKind = CommandKind::Vendor;
-        runner.add_command(Command::new(vendor.name(), vendor.description(), vendor.usage()));
+        runner.add_command(CLI::Command::new(vendor.name(), vendor.description(), vendor.usage()));
     }
 
     /// Apply the build-profile and incremental flags shared by
@@ -1136,16 +1122,18 @@ type struct Executor {
         // output (under --debug); otherwise the libc line buffer can
         // interleave them.
         fflush(null);
-        // system(3) returns the wait status: low byte holds the signal,
-        // bits 8-15 hold the exit code on a normal exit.  Surface the
-        // exit code so the caller's $? matches what the inner binary
-        // returned.
-        const status: i32 = system(exec_path(result.output_path));
+        // Run the produced binary through the platform shell (`Command::shell`
+        // under the hood), inheriting stdio so its output reaches the terminal.
+        // `exec_path` host-normalizes the leading path for the `cmd /c` route on
+        // Windows.  The decoded exit code is surfaced so the caller's `$?`
+        // matches what the inner binary returned; a negative value signals a
+        // spawn failure.
+        const status: i32 = exec::shell(exec_path(result.output_path));
         if (status < 0) {
             fmt::eprintf("Error: failed to spawn '%s'\n", result.output_path);
             return 1;
         }
-        return exit_code_of(status);
+        return status as int;
     }
 
     /// `cryo test [pattern] [flags]`: build the project's tests and
@@ -1269,12 +1257,12 @@ type struct Executor {
         // before the child's output under --debug.  Same precaution as
         // `cmd_run`.
         fflush(null);
-        const status: i32 = system(cmd);
+        const status: i32 = exec::shell(cmd);
         if (status < 0) {
             fmt::eprintf("Error: failed to spawn '%s'\n", result.output_path);
             return 1;
         }
-        mut exit_code: int = exit_code_of(status);
+        mut exit_code: int = status as int;
         const unit_ok: boolean = exit_code == 0;
 
         // Compile-fail suite: run each tests/negative/*.cryo file through
@@ -1561,7 +1549,7 @@ type struct Executor {
                 runcmd = format("%s check %s > %s 2>&1", self_exe, full, tmp);
             }
             fflush(null);
-            system(runcmd);
+            exec::shell(runcmd);
             const out: string = Executor::read_file_or_empty(tmp);
             const want: string = format("error[%s]", expected);
             const passed: boolean = out.contains(want);
@@ -1668,8 +1656,12 @@ type struct Executor {
             // links a `c++`-compiled helper by its Itanium-mangled symbols, so it
             // is meaningless without a C++ compiler (and the Itanium ABI) — skip
             // cleanly on a host that has none (e.g. native MSVC Windows).
-            const st: i32 = system("c++ --version > /dev/null 2>&1");
-            return exit_code_of(st) == 0;
+            // Preserve the exact prior probe: on POSIX `sh` runs `c++
+            // --version` and discards output; on Windows `cmd` cannot honour
+            // the `/dev/null` redirect, so the probe fails and the C++ test
+            // skips (as it did before this migration) rather than unmasking a
+            // separate Windows C++ link gap.
+            return exec::shell("c++ --version > /dev/null 2>&1") == 0;
         }
         // Unknown requirement: don't gate on something this compiler can't check.
         return true;
@@ -1963,8 +1955,8 @@ type struct Executor {
             // compile_fail: `cryo build` must fail and emit error[<diagnostic>].
             const cmd: string = format("%s build%s > %s 2>&1", self_exe, std_flag, tmp);
             fflush(null);
-            const st: i32 = system(cmd);
-            const failed: boolean = exit_code_of(st) != 0;
+            const st: i32 = exec::shell(cmd);
+            const failed: boolean = st != 0;
             const out: string = Executor::read_file_or_empty(tmp);
             if (spec.diagnostic.length() > 0) {
                 const want: string = format("error[%s]", spec.diagnostic);
@@ -1978,8 +1970,8 @@ type struct Executor {
             // run: build+run; assert exit code (and optional stdout substring).
             const cmd: string = format("%s run%s > %s 2>&1", self_exe, std_flag, tmp);
             fflush(null);
-            const st: i32 = system(cmd);
-            const ec: int = exit_code_of(st);
+            const st: i32 = exec::shell(cmd);
+            const ec: int = st as int;
             passed = (ec as i64) == spec.exit_code;
             if (!passed) {
                 detail = format("exit %d, expected %lld", ec, spec.exit_code);
@@ -1992,8 +1984,8 @@ type struct Executor {
             // collect: run the project's own `cryo test`; exit 0 = all passed.
             const cmd: string = format("%s test --format=plain%s > %s 2>&1", self_exe, std_flag, tmp);
             fflush(null);
-            const st: i32 = system(cmd);
-            passed = exit_code_of(st) == 0;
+            const st: i32 = exec::shell(cmd);
+            passed = st == 0;
             if (!passed) { detail = "project tests failed"; }
         }
 
