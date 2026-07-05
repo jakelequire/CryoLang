@@ -62,7 +62,7 @@ type struct PatternEmitter {
     /// Prepare a match subject: resolve its enum type (if any), normalize to
     /// a ptr (for payload extraction), and pre-extract the i32 tag value.
     prepare_match_subject(mut &this, subject: LValue, subj_ref: TypeRef,
-                          current_fn: LValue) -> MatchSubjectInfo {
+                          subject_addr: LValue, current_fn: LValue) -> MatchSubjectInfo {
         mut info: MatchSubjectInfo = MatchSubjectInfo {
             enum_type:   null,
             enum_ref:    subj_ref,
@@ -138,6 +138,15 @@ type struct PatternEmitter {
         // has a terminator.
         if (is_ptr) {
             info.subject_ptr = subject;
+        } else if (subject_addr.is_valid()) {
+            // The subject is an addressable owning slot (an Identifier local,
+            // possibly hoisted here by DropInsertion). Match in place against
+            // that real storage instead of a throwaway `match.subj` copy, so an
+            // arm's `mut` payload binding and the subject's scope-exit drop
+            // reference ONE slot. Otherwise a binding that reallocs its buffer
+            // mid-arm (e.g. `String::as_cstr`) updates only the copy, leaving
+            // the drop to free the original's stale pointer (double free).
+            info.subject_ptr = subject_addr;
         } else {
             info.subject_ptr = this.cg.builder.build_alloca(info.enum_llvm, "match.subj");
             if (info.subject_ptr.is_valid()) {

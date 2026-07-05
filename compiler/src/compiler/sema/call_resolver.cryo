@@ -353,6 +353,23 @@ type struct CallResolver {
                         && !is_negative_numeric_literal_expr(arg)
                         && is_wide_int_type(this.arena, param_types[i])) {
                     push_expected = true;
+                } else if (arg_node.kind == NodeKind::UnaryExpression) {
+                    // Address-of-a-literal arg (`&<literal>`) bound to a `&T`
+                    // parameter: forward the reference type so `resolve_unary`
+                    // hints the referent `T` to the literal. A synthetic
+                    // `&<literal>` (operator desugar, e.g. `a * 3` ->
+                    // `a.mul(&3)`) then adopts the parameter's width instead of
+                    // defaulting to i32 — otherwise codegen spills a too-narrow
+                    // temp and the callee's `*rhs` reads uninitialised high
+                    // bytes. Scoped to a literal operand so `&place` / `&mut`
+                    // argument typing is untouched.
+                    const u_arg: UnaryExprNode* = arg as UnaryExprNode*;
+                    const pt_ref: Type* = this.arena.lookup(param_types[i].id);
+                    if (u_arg.op.lexeme == "&" && u_arg.operand != null
+                        && u_arg.operand.kind == NodeKind::Literal
+                        && pt_ref != null && pt_ref.kind == TypeKind::Reference) {
+                        push_expected = true;
+                    }
                 }
             }
             if (push_expected) {
