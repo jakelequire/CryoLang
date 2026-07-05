@@ -81,6 +81,7 @@ Keywords are reserved identifiers. They cannot be used as variable, function, or
 | `break`      | `static_assert` |          | `move`      |                   |                |                         |
 | `continue`   | `union`      |             |             |                   |                |                         |
 | `return`     |              |             |             |                   |                |                         |
+| `asm`        |              |             |             |                   |                |                         |
 
 `move` marks a closure that captures its environment by move (see [§ 16.3](#163-move-checking)).
 
@@ -980,6 +981,76 @@ unsafe {
 ```
 
 This is the committed 1.0 behavior: `unsafe` is a documentation marker and nothing more. It is **not** reserved to silently become enforcing — 1.0 code will not break under a future release on account of `unsafe`. Should later versions add safety checks around raw pointer dereference, raw-to-pointer `as`-casts, or `extern` calls, they would arrive compatibly (as an opt-in lint/warning first), not as a breaking change to code that already compiles.
+
+### 6.13 Inline Assembly
+
+`asm { ... }` embeds target assembly directly, lowering to an LLVM inline-assembly call. The block body is **raw assembly** — written without string quoting — and Cryo values are bound into it through `${ ... }` operand holes. Bare `{` and `}` are literal assembly text, so target syntax that uses braces (AVX-512 mask registers such as `{k1}`, for instance) passes straight through.
+
+A mandatory `![arch(<arch>, <dialect>)]` directive must appear immediately above the block. It names the target architecture (which *gates* the block — see below) and the assembly dialect (`intel` or `att`):
+
+```cryo
+![arch(x86_64, intel)]
+asm {
+    mov ${=out}, ${in}
+}
+```
+
+**Operands.** Each `${ ... }` hole binds a Cryo variable. A prefix selects its direction and an optional `:` suffix pins a register or constraint class:
+
+| Form         | Meaning                                          |
+| ------------ | ------------------------------------------------ |
+| `${x}`       | input — the value of `x` is read into a register |
+| `${=x}`      | output — the result is written back to `x`       |
+| `${+x}`      | in-out — `x` is both read and written            |
+| `${x:"rax"}` | pin the operand to a specific register           |
+| `${x:m}`     | memory operand — `x` is addressed in memory      |
+| `${x:i}`     | immediate — `x` must be a compile-time constant  |
+
+Referencing the same variable more than once collapses to a single operand, and a variable used as both an input and an output is promoted to in-out. Operands must be register-sized scalars or pointers.
+
+**Clobbers.** Registers, `flags`, or `memory` that the block overwrites but doesn't name as operands are declared with `![clobber(...)]`, so the compiler doesn't assume their values survive the block:
+
+```cryo
+![arch(x86_64, intel)]
+![clobber(rcx, r11, flags, memory)]
+asm {
+    mov rax, ${v}
+    add rax, rax
+    mov ${=out}, rax
+}
+```
+
+**Outputs and results.** An `asm` block is a statement; values leave it through `${=x}` / `${+x}` operands, and a block may have any number of outputs.
+
+**Dialects.** `intel` is destination-first and prefix-less (`mov rax, 60`); `att` is source-first with `%` registers and `$` immediates (`movq $60, %rax`). The dialect is always stated explicitly in the `![arch(...)]` directive.
+
+**Arch gating.** `<arch>` is matched against the compile target: a block whose arch differs from the target is dropped, exactly like a `![linux]` / `![windows]` gate. This lets per-architecture blocks sit side by side, each written for its own target:
+
+```cryo
+![arch(x86_64, intel)]
+asm { syscall }
+
+![arch(aarch64, att)]
+asm { svc #0 }
+```
+
+**Module-level assembly.** An `asm { ... }` written at module scope (outside any function, with no operands) emits module-level inline assembly — for naked/global stubs, `.globl` symbols, or raw data.
+
+A `write` system call on x86_64 Linux, pulling the buffer and length in as operands:
+
+```cryo
+![arch(x86_64, att)]
+![clobber(rcx, r11, memory)]
+asm {
+    movq $1, %rax        // SYS_write
+    movq $1, %rdi        // fd = stdout
+    movq ${buf}, %rsi    // buffer pointer
+    movq ${len}, %rdx    // length
+    syscall
+}
+```
+
+> **Note.** LLVM passes the assembly text through to the target assembler unchanged — Cryo does not parse it — so a typo in a mnemonic or register name surfaces as an assembler error at build time, not a Cryo diagnostic. Only `${ ... }` introduces an operand; a literal `$` (an AT&T immediate such as `$60`) and bare `{` / `}` are emitted verbatim.
 
 ---
 
@@ -2213,6 +2284,8 @@ type struct AlignedData {
 | `![config(<atom>)]` / `![target(<atom>)]` / `![<atom>]`   | any decl                  | Platform / build-flavor gate. `<atom>` is `windows`, `linux`, `macos`, `unix`, or `not(<atom>)`. The bare-atom form (`![windows]`) is sugar for `![config(windows)]`. The decl is stripped from the AST when the gate doesn't match.                                                                                                                                                                                        |
 | `![repr(C)]` / `![repr(packed)]` / `![repr(transparent)]` | struct / class / enum     | Memory layout control. See [§ 17.3](#173-memory-layout).                                                                                                                                                                                                                                                                                                                                                                    |
 | `![align(N)]`                                             | struct / class / variable | Minimum alignment in bytes; N must be a power of two. See [§ 17.3](#173-memory-layout).                                                                                                                                                                                                                                                                                                                                     |
+| `![arch(<arch>, <dialect>)]`                              | asm block                 | Required directly above an `asm { ... }` block (see [§ 6.13](#613-inline-assembly)). Names the target architecture — which *gates* the block, like `![config]` — and the assembly dialect (`intel` or `att`).                                                                                                                                                                                    |
+| `![clobber(...)]`                                         | asm block                 | Lists registers, `flags`, or `memory` that an `asm` block overwrites but does not bind as operands.                                                                                                                                                                                                                                                                                                       |
 
 The test-mode directives (`![config(testing)]`, `![test]`, `![ignore]`, `![should_panic]`) are documented in the next subsection.
 

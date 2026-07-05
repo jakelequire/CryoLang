@@ -271,6 +271,240 @@ public:
         this.dispatch.generate_block(this,node.block);
     }
 
+    /// Comma-join two constraint fragments (skipping the leading comma when
+    /// `a` is empty).  Used to assemble the inline-asm constraint string.
+    asm_join(a: string, b: string) -> string {
+        if (a == "") { return b; }
+        return a + "," + b;
+    }
+
+    /// Lower an `asm { ... }` block to an LLVM inline-asm call (or, at module
+    /// scope, to module-level inline asm).  See AsmBlockStmtNode and the
+    /// lowering rules in the plan: operands are numbered outputs-first, the
+    /// constraint string is [outputs, inputs, tied-inouts, clobbers], and
+    /// direct (register) outputs are stored back after the call.
+    override visit(mut &this, node: AsmBlockStmtNode*) -> void {
+        // Arch gating: an `![arch(X, ...)]` block is only emitted when the
+        // compile target's arch matches X, so per-arch blocks can sit side
+        // by side (the others are skipped here).  `arch == ""` only happens
+        // when the required directive is missing, which sema has already
+        // reported (codegen is skipped once diagnostics exist).
+        if (node.arch != "") {
+            const _triple: string = LTargetMachine::resolve_effective_triple(this.cg.ctx.target_triple);
+            if (!_triple.contains(node.arch)) {
+                this.state.last_value = LValue::null();
+                this.state.last_is_lvalue = false;
+                return;
+            }
+        }
+
+        // Assemble the template string.  Operand pieces are numbered in
+        // constraint order (outputs first, then pure inputs); tied inout
+        // inputs are never referenced in the template.
+        const nops: i64 = node.operands.length;
+
+        // Classify operands by direction.
+        mut out_idx: i64[] = [];    // Out and InOut, source order
+        mut in_idx: i64[] = [];     // pure In, source order
+        mut tied_idx: i64[] = [];   // InOut, source order
+        for (mut k: i64 = 0; k < nops; k++) {
+            const op: AsmOperand* = node.operands[k];
+            if (op.direction == AsmOpDir::In) {
+                in_idx.push(k);
+            } else {
+                out_idx.push(k);
+                // A register in-out needs a tied input carrying the current
+                // value.  A MEMORY in-out reads/writes through its pointer
+                // (a single `=*m` operand), so it takes no tied input.
+                if (op.direction == AsmOpDir::InOut
+                        && op.constraint != AsmConstraintKind::Memory) {
+                    tied_idx.push(k);
+                }
+            }
+        }
+
+        // Template number per source operand.
+        mut tmpl_num: i64[] = [];
+        for (mut k: i64 = 0; k < nops; k++) { tmpl_num.push(-1); }
+        for (mut p: i64 = 0; p < out_idx.length; p++) { tmpl_num[out_idx[p]] = p; }
+        for (mut p: i64 = 0; p < in_idx.length; p++) {
+            tmpl_num[in_idx[p]] = out_idx.length + p;
+        }
+
+        // Build the asm template text.
+        mut tmpl: string = "";
+        for (mut pi: i64 = 0; pi < node.pieces.length; pi++) {
+            const piece: AsmPiece* = node.pieces[pi];
+            if (piece.is_operand) {
+                mut num: i64 = tmpl_num[piece.operand_index];
+                if (num < 0) { num = 0; }
+                tmpl = tmpl + format("$%d", num as i32);
+            } else {
+                tmpl = tmpl + piece.text;
+            }
+        }
+
+        // Module-level (naked / global) asm: no operands, emit as module asm.
+        if (node.is_module_level) {
+            this.cg.llvm_module.append_inline_asm(tmpl);
+            this.state.last_value = LValue::null();
+            this.state.last_is_lvalue = false;
+            return;
+        }
+
+        // Build the constraint string: outputs, pure inputs, tied inouts,
+        // then clobbers.
+        mut cons: string = "";
+        for (mut p: i64 = 0; p < out_idx.length; p++) {
+            const op: AsmOperand* = node.operands[out_idx[p]];
+            mut c: string = "=r";
+            if (op.constraint == AsmConstraintKind::Memory) { c = "=*m"; }
+            else if (op.constraint == AsmConstraintKind::Pinned) {
+                c = "={" + op.pinned_reg + "}";
+            }
+            cons = this.asm_join(cons, c);
+        }
+        for (mut p: i64 = 0; p < in_idx.length; p++) {
+            const op: AsmOperand* = node.operands[in_idx[p]];
+            mut c: string = "r";
+            if (op.constraint == AsmConstraintKind::Memory) { c = "*m"; }
+            else if (op.constraint == AsmConstraintKind::Imm) { c = "i"; }
+            else if (op.constraint == AsmConstraintKind::Pinned) {
+                c = "{" + op.pinned_reg + "}";
+            }
+            cons = this.asm_join(cons, c);
+        }
+        for (mut p: i64 = 0; p < tied_idx.length; p++) {
+            const oi: i64 = tied_idx[p];
+            mut outpos: i64 = 0;
+            for (mut q: i64 = 0; q < out_idx.length; q++) {
+                if (out_idx[q] == oi) { outpos = q; break; }
+            }
+            cons = this.asm_join(cons, format("%d", outpos as i32));
+        }
+        for (mut c: i64 = 0; c < node.clobbers.length; c++) {
+            const name: string = node.clobbers[c];
+            mut tok: string = "~{" + name + "}";
+            cons = this.asm_join(cons, tok);
+        }
+
+        // Collect argument values in constraint order: memory outputs (as
+        // addresses), then pure inputs (values / addresses), then tied inout
+        // inputs (current values).  Indirect memory operands (`*m`) pass a
+        // pointer and require an `elementtype(T)` call-site attribute (LLVM
+        // opaque pointers); record their arg index + pointee type here.
+        mut arg_vals: LValue[] = [];
+        mut mem_arg_idx: i64[] = [];
+        mut mem_arg_pointee: LType[] = [];
+        for (mut p: i64 = 0; p < out_idx.length; p++) {
+            const op: AsmOperand* = node.operands[out_idx[p]];
+            if (op.constraint == AsmConstraintKind::Memory) {
+                mem_arg_idx.push(arg_vals.length);
+                mem_arg_pointee.push(this.cg.type_mapper.map_type(op.expr.resolved_type));
+                arg_vals.push(this.dispatch.codegen_lvalue(this, op.expr));
+            }
+        }
+        for (mut p: i64 = 0; p < in_idx.length; p++) {
+            const op: AsmOperand* = node.operands[in_idx[p]];
+            if (op.constraint == AsmConstraintKind::Memory) {
+                mem_arg_idx.push(arg_vals.length);
+                mem_arg_pointee.push(this.cg.type_mapper.map_type(op.expr.resolved_type));
+                arg_vals.push(this.dispatch.codegen_lvalue(this, op.expr));
+            } else {
+                arg_vals.push(this.dispatch.codegen_rvalue(this, op.expr));
+            }
+        }
+        for (mut p: i64 = 0; p < tied_idx.length; p++) {
+            const op: AsmOperand* = node.operands[tied_idx[p]];
+            arg_vals.push(this.dispatch.codegen_rvalue(this, op.expr));
+        }
+
+        // Marshal args + their LLVM types into raw buffers for LLVMBuildCall2
+        // and LLVMFunctionType.
+        const nargs: i64 = arg_vals.length;
+        mut arg_buf: void* = null;
+        mut ptype_buf: void* = null;
+        if (nargs > 0) {
+            arg_buf = intrinsics::malloc((nargs * 8) as u64);
+            ptype_buf = intrinsics::malloc((nargs * 8) as u64);
+            const aslots: void** = arg_buf as void**;
+            const pslots: void** = ptype_buf as void**;
+            for (mut i: i64 = 0; i < nargs; i++) {
+                aslots[i] = arg_vals[i].raw;
+                pslots[i] = arg_vals[i].type_of().raw;
+            }
+        }
+
+        // Return type = the direct (register) outputs, in output order.
+        mut direct_out: i64[] = [];   // positions within out_idx that are direct
+        for (mut p: i64 = 0; p < out_idx.length; p++) {
+            const op: AsmOperand* = node.operands[out_idx[p]];
+            if (op.constraint != AsmConstraintKind::Memory) { direct_out.push(p); }
+        }
+        mut ret_ty: LType = LType::void_type();
+        if (direct_out.length == 1) {
+            const op: AsmOperand* = node.operands[out_idx[direct_out[0]]];
+            ret_ty = this.cg.type_mapper.map_type(op.expr.resolved_type);
+        } else if (direct_out.length >= 2) {
+            const dn: i64 = direct_out.length;
+            const tbuf: void* = intrinsics::malloc((dn * 8) as u64);
+            const tslots: void** = tbuf as void**;
+            for (mut i: i64 = 0; i < dn; i++) {
+                const op: AsmOperand* = node.operands[out_idx[direct_out[i]]];
+                tslots[i] = this.cg.type_mapper.map_type(op.expr.resolved_type).raw;
+            }
+            ret_ty = LType::literal_struct(tbuf, dn as u32, false);
+            intrinsics::free(tbuf);
+        }
+
+        // Build the inline-asm callee and issue the call.
+        const fn_ty: LType = LType::function_type(ret_ty, ptype_buf, nargs as u32, false);
+        const dialect_i: i32 = if (node.dialect == AsmDialect::Intel) { 1 } else { 0 };
+        const callee: LValue = LValue::inline_asm(fn_ty, tmpl, cons, true, false, dialect_i, false);
+        const rname: string = if (direct_out.length == 0) { "" } else { "asm" };
+        const result: LValue = this.cg.builder.build_call(fn_ty, callee, arg_buf, nargs as u32, rname);
+
+        if (arg_buf != null) { intrinsics::free(arg_buf); }
+        if (ptype_buf != null) { intrinsics::free(ptype_buf); }
+
+        // Indirect memory operands (`*m`) pass a pointer; LLVM (opaque
+        // pointers) requires an `elementtype(T)` attribute on each such
+        // call-site argument.  Attribute index is 1-based (0 = return).
+        if (mem_arg_idx.length > 0 && result.is_valid()) {
+            const et_ctx: LContext = LContext::current();
+            const et_kind: u32 = llvm::LLVMGetEnumAttributeKindForName("elementtype", 11);
+            for (mut i: i64 = 0; i < mem_arg_idx.length; i++) {
+                const pointee: LType = mem_arg_pointee[i];
+                if (!pointee.is_valid()) { continue; }
+                const attr: void* = llvm::LLVMCreateTypeAttribute(
+                    et_ctx.raw, et_kind, pointee.raw);
+                llvm::LLVMAddCallSiteAttribute(
+                    result.raw, (mem_arg_idx[i] + 1) as u32, attr);
+            }
+        }
+
+        // Store direct outputs back into their variables.
+        if (direct_out.length == 1) {
+            const op: AsmOperand* = node.operands[out_idx[direct_out[0]]];
+            const addr: LValue = this.dispatch.codegen_lvalue(this, op.expr);
+            if (addr.is_valid() && result.is_valid()) {
+                this.cg.builder.build_store(result, addr);
+            }
+        } else if (direct_out.length >= 2) {
+            for (mut i: i64 = 0; i < direct_out.length; i++) {
+                const op: AsmOperand* = node.operands[out_idx[direct_out[i]]];
+                const ev: LValue = this.cg.builder.build_extract_value(result, i as u32, "asmout");
+                const addr: LValue = this.dispatch.codegen_lvalue(this, op.expr);
+                if (addr.is_valid() && ev.is_valid()) {
+                    this.cg.builder.build_store(ev, addr);
+                }
+            }
+        }
+
+        this.state.last_value = LValue::null();
+        this.state.last_is_lvalue = false;
+    }
+
 
     // Statement visitors
 

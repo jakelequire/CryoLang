@@ -1,0 +1,141 @@
+///! Language tests - the `asm { ... }` inline-assembly block.
+///!
+///! Exercises every operand form (input `${x}`, output `${=x}`, in-out
+///! `${+x}`, pinned `${x:"reg"}`, memory `${x:m}`), both x86 dialects, multi-
+///! output struct returns, clobbers, and arch gating.  All blocks are
+///! x86_64 - the compiler only initializes X86 targets, so the suite always
+///! runs on x86_64 and these blocks are always emitted (except the aarch64
+///! gating probe, which must be dropped).  Only register-arithmetic is used
+///! (no syscalls), so the assembly is OS-independent across Win/Linux x86_64.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::AsmInline;
+
+import std::core::result;
+import std::test::error;
+import std::test::assert;
+
+// In-out register operand: `${+a}` reads a, adds b, writes a back.
+// Lowers to `"=r,r,0"` (output, input, tied-input) - see the constraint
+// string in codegen/ir_generator.cryo.
+![test]
+function inout_add() -> Result<(), TestError> {
+    mut a: i64 = 40;
+    const b: i64 = 2;
+    ![arch(x86_64, intel)]
+    asm { add ${+a}, ${b} }
+    return expect_eq(a, 42);
+}
+
+// Output + input: copy x into y via `mov`.  Lowers to `"=r,r"`.
+![test]
+function output_and_input() -> Result<(), TestError> {
+    const x: i64 = 7;
+    mut y: i64 = 0;
+    ![arch(x86_64, intel)]
+    asm { mov ${=y}, ${x} }
+    return expect_eq(y, 7);
+}
+
+// Pinned register + clobber: force use of rax and declare it clobbered.
+![test]
+function pinned_register_and_clobber() -> Result<(), TestError> {
+    const v: i64 = 21;
+    mut out: i64 = 0;
+    ![arch(x86_64, intel)]
+    ![clobber(rax)]
+    asm {
+        mov rax, ${v}
+        add rax, rax
+        mov ${=out}, rax
+    }
+    return expect_eq(out, 42);
+}
+
+// AT&T dialect: src-first, `%` registers, `$` immediates (which must be
+// emitted as `$$` in the LLVM template).
+![test]
+function att_dialect() -> Result<(), TestError> {
+    const p: i64 = 10;
+    const q: i64 = 5;
+    mut z: i64 = 0;
+    ![arch(x86_64, att)]
+    ![clobber(rax)]
+    asm {
+        movq ${p}, %rax
+        addq ${q}, %rax
+        addq $100, %rax
+        movq %rax, ${=z}
+    }
+    return expect_eq(z, 115);
+}
+
+// Two outputs -> struct return `{ i64, i64 }` + per-field extractvalue
+// writeback.
+![test]
+function multiple_outputs() -> Result<(), TestError> {
+    mut lo: i64 = 0;
+    mut hi: i64 = 0;
+    ![arch(x86_64, intel)]
+    asm {
+        mov ${=lo}, 11
+        mov ${=hi}, 22
+    }
+    match (expect_eq(lo, 11)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(hi, 22);
+}
+
+// Memory operand `${src:m}` - passed as a pointer with an `elementtype`
+// attribute (`*m` constraint).
+![test]
+function memory_operand() -> Result<(), TestError> {
+    const src: i64 = 77;
+    mut dst: i64 = 0;
+    ![arch(x86_64, att)]
+    ![clobber(rax)]
+    asm {
+        movq ${src:m}, %rax
+        movq %rax, ${=dst}
+    }
+    return expect_eq(dst, 77);
+}
+
+// Immediate operand `${9:i}` - a compile-time-constant operand (`i`
+// constraint).  The operand must be a literal / constant expression; LLVM
+// rejects a runtime value for `i`.
+![test]
+function immediate_operand() -> Result<(), TestError> {
+    mut r: i64 = 0;
+    ![arch(x86_64, intel)]
+    asm {
+        mov ${=r}, ${9:i}
+    }
+    return expect_eq(r, 9);
+}
+
+// Arch gating: an `![arch(aarch64, ...)]` block must be dropped when
+// building x86_64, so `w` is left unchanged.  If gating regressed and the
+// block emitted as x86, `w` would become 10.
+![test]
+function arch_gating_drops_other_arch() -> Result<(), TestError> {
+    mut w: i64 = 5;
+    ![arch(aarch64, att)]
+    asm { add ${+w}, ${w} }
+    return expect_eq(w, 5);
+}
+
+// Repeated `${x}` references collapse to one operand; the same variable used
+// as both input and output is promoted to a single in-out.
+![test]
+function repeated_operand_dedup() -> Result<(), TestError> {
+    mut n: i64 = 3;
+    ![arch(x86_64, intel)]
+    asm {
+        add ${=n}, ${n}
+        add ${n}, 1
+    }
+    return expect_eq(n, 7);
+}

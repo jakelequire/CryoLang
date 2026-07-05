@@ -69,6 +69,138 @@ public:
 }
 
 
+/// Assembly dialect for an `asm` block, selected by the mandatory
+/// `![arch(<arch>, <dialect>)]` directive.  Maps to LLVM's
+/// `LLVMInlineAsmDialect` (ATT = 0, Intel = 1).
+type enum AsmDialect {
+    ATT;
+    Intel;
+}
+
+/// Direction of an `asm` operand, from its `{...}` prefix:
+///   `{x}` -> In, `{=x}` -> Out, `{+x}` -> InOut.
+type enum AsmOpDir {
+    In;
+    Out;
+    InOut;
+}
+
+/// Constraint class of an `asm` operand, from its `:...` suffix.
+///   (none) / `:r` -> Reg (any general register)
+///   `:"rax"`      -> Pinned (a specific register, name in `pinned_reg`)
+///   `:m`          -> Memory (operand passed by address)
+///   `:i`          -> Imm (immediate)
+type enum AsmConstraintKind {
+    Reg;
+    Pinned;
+    Memory;
+    Imm;
+}
+
+/// One operand of an `asm` block: a Cryo expression bound into the
+/// assembly with a direction and a constraint class.  See
+/// `visit(AsmBlockStmtNode*)` in codegen/ir_generator.cryo for lowering.
+type class AsmOperand {
+public:
+    direction: AsmOpDir;
+    /// The Cryo operand.  Inputs are read as rvalues; outputs / in-outs
+    /// must be assignable lvalues (the call result is stored back).
+    expr: ExpressionNode*;
+    constraint: AsmConstraintKind;
+    /// Register name when `constraint == Pinned` (e.g. "rax"); else "".
+    pinned_reg: string;
+
+    AsmOperand(direction: AsmOpDir, expr: ExpressionNode*,
+               constraint: AsmConstraintKind, pinned_reg: string) {
+        this.direction = direction;
+        this.expr = expr;
+        this.constraint = constraint;
+        this.pinned_reg = pinned_reg;
+    }
+}
+
+/// One chunk of an `asm` template: either raw assembly text or a
+/// reference to an operand (by index into `AsmBlockStmtNode.operands`).
+/// Codegen concatenates the pieces, substituting `$N` for operand refs
+/// (N assigned in outputs-first constraint order).
+type class AsmPiece {
+public:
+    is_operand: boolean;
+    /// Raw assembly text when `!is_operand`.
+    text: string;
+    /// Index into `operands` when `is_operand`.
+    operand_index: i64;
+
+    AsmPiece(is_operand: boolean, text: string, operand_index: i64) {
+        this.is_operand = is_operand;
+        this.text = text;
+        this.operand_index = operand_index;
+    }
+
+    static raw(text: string) -> AsmPiece* {
+        return new AsmPiece(false, text, 0);
+    }
+
+    static operand(index: i64) -> AsmPiece* {
+        return new AsmPiece(true, "", index);
+    }
+}
+
+/// `asm { ... }` inline-assembly block.  The body is captured as raw text
+/// pieces interleaved with `{...}` operand references.  A mandatory
+/// `![arch(<arch>, <dialect>)]` directive selects the target arch (used to
+/// gate the block in the ConfigGating pass) and the dialect.  An optional
+/// `![clobber(...)]` directive lists clobbered registers / `flags` / `memory`.
+/// A module-level `asm { ... }` (no operands) lowers to module inline asm.
+type class AsmBlockStmtNode : StatementNode {
+public:
+    /// Target architecture from `![arch(...)]` (e.g. "x86_64").
+    arch: string;
+    dialect: AsmDialect;
+    operands: AsmOperand*[];
+    pieces: AsmPiece*[];
+    /// Clobber tokens from `![clobber(...)]` (register names, "flags", "memory").
+    clobbers: string[];
+    /// True when written at module scope (naked / global asm, no operands).
+    is_module_level: boolean;
+    /// The `![arch(...)]` / `![clobber(...)]` directives, kept for the
+    /// directive-processing validation pass.
+    attached_directives: DirectiveNode*[];
+
+    AsmBlockStmtNode(span: SourceSpan)
+        : StatementNode(NodeKind::AsmBlockStatement, span) {
+        this.arch = "";
+        this.dialect = AsmDialect::ATT;
+        this.operands = [];
+        this.pieces = [];
+        this.clobbers = [];
+        this.is_module_level = false;
+        this.attached_directives = [];
+    }
+
+    add_operand(op: AsmOperand*) -> i64 {
+        this.operands.push(op);
+        return this.operands.length - 1;
+    }
+
+    add_piece(p: AsmPiece*) -> void {
+        this.pieces.push(p);
+    }
+
+    add_clobber(name: string) -> void {
+        this.clobbers.push(name);
+    }
+
+    add_directive(d: DirectiveNode*) -> void {
+        if (d != null) { this.attached_directives.push(d); }
+    }
+
+    override accept(visitor: ASTVisitor*) -> void {
+        visitor.visit(this);
+    }
+}
+
+
 type class ReturnStmtNode : StatementNode {
 public:
     expression: ExpressionNode*;

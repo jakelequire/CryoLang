@@ -484,6 +484,23 @@ LLVMValueRef LLVMBuildInsertValue(LLVMBuilderRef B, LLVMValueRef AggVal,
 
 
 /* ===================================================================
+ * Inline Assembly
+ *
+ * `Dialect` is really `LLVMInlineAsmDialect` (0 = ATT, 1 = Intel) but is
+ * declared as `unsigned` here so the `![functions_only]` C-import doesn't
+ * need to pull the enum type into the `llvm::` namespace.  The returned
+ * value is used as the callee of LLVMBuildCall2.
+ * =================================================================== */
+
+LLVMValueRef LLVMGetInlineAsm(LLVMTypeRef Ty,
+                              const char *AsmString, size_t AsmStringSize,
+                              const char *Constraints, size_t ConstraintsSize,
+                              LLVMBool HasSideEffects, LLVMBool IsAlignStack,
+                              unsigned Dialect, LLVMBool CanThrow);
+void LLVMAppendModuleInlineAsm(LLVMModuleRef M, const char *Asm, size_t Len);
+
+
+/* ===================================================================
  * Target
  * =================================================================== */
 
