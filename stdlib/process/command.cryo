@@ -178,6 +178,48 @@ type struct Command {
         return c.wait();
     }
 
+    /// Run `command` through the platform shell (`/bin/sh -c` on POSIX,
+    /// `cmd /c` on Windows), inheriting stdio, and return the child's exit
+    /// code (0 on success), or -1 if the shell could not be spawned or the
+    /// child was killed by a signal. The cross-platform replacement for the
+    /// raw `system(3)` intrinsic when a command genuinely needs shell
+    /// semantics (pipes, redirects, glob expansion). For a plain program
+    /// invocation, build the argv with `new`/`arg` and call `status` instead.
+    ![target(unix)]
+    static shell(command: string) -> i32 {
+        mut c: Command = Command::new(Str::new("/bin/sh"));
+        c.arg(Str::new("-c"));
+        c.arg(Str::new(command));
+        return decode_shell_status(c.status());
+    }
+
+    // Windows: delegate to the C runtime's `system`, which drives `cmd /c`
+    // with the correct command-line quoting.  Re-spawning `cmd /c <command>`
+    // through `CreateProcess` argv instead mangles the embedded quotes of a
+    // link/archiver command line (cmd's `/c` quote-stripping rules differ from
+    // argv joining).  `system` returns the child's exit code directly (0 on
+    // success), or -1 if the command interpreter could not be started.
+    ![target(windows)]
+    static shell(command: string) -> i32 {
+        return intrinsics::system(command);
+    }
+
+}
+
+/// Collapse a `status()` Result into a plain exit code: the child's code on
+/// a normal exit (0 on success), or -1 on spawn failure / signal death.
+/// Backs the POSIX `Command::shell` (the Windows one delegates to `system`).
+![target(unix)]
+function decode_shell_status(r: Result<ExitStatus, IoError>) -> i32 {
+    match (r) {
+        Result::Ok(st) => {
+            match (st.exit_code()) {
+                Option::Some(code) => { return code; }
+                Option::None       => { return -1; }
+            }
+        }
+        Result::Err(_) => { return -1; }
+    }
 }
 
 // Output: the result of `Command::output()`

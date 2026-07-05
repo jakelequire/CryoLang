@@ -4,11 +4,14 @@
 /// ObjectEmission, and Linking.  Called by PassRegistry::run_pass().
 
 namespace Compiler::Codegen::Passes;
-import ffi::libc;
 import std::env;
 import std::collections::str;
+import std::collections::string;
+import std::core::slice;
 import std::fs::dir;
 import std::fs::path;
+import std::fs::file;
+import std::process::command;
 
 import Compiler::Codegen;
 import Compiler::Codegen::{ LLVMTypes, TypeMap, Context };
@@ -163,17 +166,6 @@ type struct LinkerConfig {
 
 type struct CodegenPasses {
 
-    /// Shell redirect that discards stdout+stderr while probing a tool for
-    /// existence.  Host-gated (`cmd` uses `>NUL`, POSIX `sh` uses
-    /// `>/dev/null`; both honour `2>&1`) exactly like `c_header_import`'s
-    /// `cc_silence` - ConfigGating strips the inactive side at build time, so
-    /// the running compiler emits the form its own shell understands.
-    ![target(unix)]
-    static probe_silence() -> string { return ">/dev/null 2>&1"; }
-
-    ![target(windows)]
-    static probe_silence() -> string { return ">NUL 2>&1"; }
-
     // Host-shell-aware command construction
     //
     // The compiler shells out through libc `system(3)`, which runs `sh -c` on
@@ -201,35 +193,36 @@ type struct CodegenPasses {
         return format("\"%s\"", s);
     }
 
-    /// Rewrite `/` to `\` for a path handed to a `cmd` builtin (`copy`), which
-    /// parses a leading `/` on a token as a switch.  Drivers invoked as real
-    /// programs (gcc/clang) accept `/` fine, so only the `cmd`-builtin hoist
-    /// needs this.  Windows-only; never referenced on the POSIX side.
-    ![target(windows)]
-    static to_windows_path(s: string) -> string {
-        const len: u64 = s.length();
-        const buf: i8* = intrinsics::malloc(len + 1) as i8*;
-        const sb: i8* = s as i8*;
-        for (mut i: u64 = 0; i < len; i++) {
-            const ch: i8 = sb[i];
-            if (ch == '/') { buf[i] = '\\' as i8; } else { buf[i] = ch; }
-        }
-        buf[len] = 0;
-        return buf as string;
-    }
-
     /// Copy the freshly-linked binary from the per-profile cache to the build
-    /// root.  POSIX: `cp -f`.  Windows: the `copy /Y` builtin (backslash paths,
-    /// stdout silenced via `>NUL`).  Returns the spawned command's exit code.
-    ![target(unix)]
+    /// root.  Cross-platform via `fs::file::copy`, which creates/truncates the
+    /// destination and mirrors the source's Unix mode bits (so the hoisted
+    /// binary stays executable).  Returns 0 on success, 1 on failure - the same
+    /// success contract the old `system(cp/copy)` exit code provided.
     static hoist_binary(src: string, dst: string) -> i32 {
-        return system(format("cp -f %s %s", CodegenPasses::shell_quote(src), CodegenPasses::shell_quote(dst)));
+        match (file::copy(Path::from_cstr(src), Path::from_cstr(dst))) {
+            Result::Ok(_)  => { return 0; }
+            Result::Err(_) => { return 1; }
+        }
     }
 
-    ![target(windows)]
-    static hoist_binary(src: string, dst: string) -> i32 {
-        return system(format("copy /Y \"%s\" \"%s\" >NUL",
-            CodegenPasses::to_windows_path(src), CodegenPasses::to_windows_path(dst)));
+    /// Write a linker/archiver `@response` file listing every object file, one
+    /// double-quoted path per line (parses identically under a POSIX `sh -c`
+    /// driver or a Windows `cmd /c` one, so selfhost byte-identity is
+    /// unaffected).  Returns false if the file could not be written.
+    static write_rsp_file(path: string, objects: &string[]) -> boolean {
+        mut text: String = String::new();
+        for (mut i: i64 = 0; i < objects.length; i++) {
+            text.push_byte(34 as u8);           // "
+            text.push(Str::new(objects[i]));
+            text.push_byte(34 as u8);           // "
+            text.push_byte(10 as u8);           // \n
+        }
+        const ok: boolean = match (file::write(Path::from_cstr(path), text.as_bytes())) {
+            Result::Ok(_)  => { true }
+            Result::Err(_) => { false }
+        };
+        text.drop();
+        return ok;
     }
 
     /// Emit the combined `.ll` IR dump next to the hoisted exe (selfhost-check's
@@ -242,7 +235,7 @@ type struct CodegenPasses {
         const ll_cmd: string = format(
             "llvm-link-20 -S %s/*/ir/*.ll -o %s 2>/dev/null",
             CodegenPasses::shell_quote(profile_dir), CodegenPasses::shell_quote(ll_path));
-        const ll_rc: i32 = system(ll_cmd);
+        const ll_rc: i32 = Command::shell(ll_cmd);
         if (ll_rc == 0) {
             cdebug("[Codegen] Linked IR dump: %s\n", ll_path);
         } else {
@@ -875,16 +868,11 @@ type struct CodegenPasses {
         // same order, same libs => a byte-identical executable on every
         // host, so selfhost byte-identity is unaffected.
         const link_rsp_path: string = format("%s.rsp", exe_path);
-        const link_rf: void* = libc::fopen(link_rsp_path, "w");
-        if (link_rf == null) {
+        if (!CodegenPasses::write_rsp_file(link_rsp_path, &ctx.artifacts.object_files)) {
             ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
                 format("could not open linker response file for writing: %s", link_rsp_path));
             return PassResult::failure(1);
         }
-        for (mut i: i64 = 0; i < ctx.artifacts.object_files.length; i++) {
-            intrinsics::fprintf(link_rf, "\"%s\"\n", ctx.artifacts.object_files[i]);
-        }
-        libc::fclose(link_rf);
 
         mut cmd: string = format("%s -o %s @\"%s\"",
             link_cfg.driver, CodegenPasses::link_quote(exe_path), link_rsp_path);
@@ -991,7 +979,7 @@ type struct CodegenPasses {
             cdebug("[Codegen] Link command: %s\n", cmd);
         }
 
-        const rc: i32 = system(cmd);
+        const rc: i32 = Command::shell(cmd);
         // The response file has served its purpose; remove it so it doesn't
         // linger in the per-profile dir (best-effort - a failed unlink is
         // harmless).
@@ -1094,16 +1082,11 @@ type struct CodegenPasses {
         // spawned command short and byte-identical on every host.  `@"%s"`
         // (literal double quotes) parses the same under `sh -c` and `cmd /c`.
         const link_rsp_path: string = format("%s.rsp", exe_path);
-        const link_rf: void* = libc::fopen(link_rsp_path, "w");
-        if (link_rf == null) {
+        if (!CodegenPasses::write_rsp_file(link_rsp_path, &ctx.artifacts.object_files)) {
             ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
                 format("could not open linker response file for writing: %s", link_rsp_path));
             return PassResult::failure(1);
         }
-        for (mut i: i64 = 0; i < ctx.artifacts.object_files.length; i++) {
-            intrinsics::fprintf(link_rf, "\"%s\"\n", ctx.artifacts.object_files[i]);
-        }
-        libc::fclose(link_rf);
 
         mut cmd: string = format("%s -o %s @\"%s\"",
             link_cfg.driver, CodegenPasses::link_quote(exe_path), link_rsp_path);
@@ -1124,7 +1107,7 @@ type struct CodegenPasses {
             cdebug("[Codegen] Link command: %s\n", cmd);
         }
 
-        const rc: i32 = system(cmd);
+        const rc: i32 = Command::shell(cmd);
         // Discard the response file once the link has consumed it
         // (best-effort - a failed unlink is harmless).
         dir::remove_file(Path::from_cstr(link_rsp_path));
@@ -1191,16 +1174,11 @@ type struct CodegenPasses {
         // trip cmd's outer-quote-stripping rule.
         const ar: string = CodegenPasses::pick_archiver();
         const rsp_path: string = format("%s.rsp", archive_path);
-        const rf: void* = libc::fopen(rsp_path, "w");
-        if (rf == null) {
+        if (!CodegenPasses::write_rsp_file(rsp_path, &ctx.artifacts.object_files)) {
             ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
                 format("could not open archiver response file for writing: %s", rsp_path));
             return PassResult::failure(1);
         }
-        for (mut i: i64 = 0; i < ctx.artifacts.object_files.length; i++) {
-            intrinsics::fprintf(rf, "\"%s\"\n", ctx.artifacts.object_files[i]);
-        }
-        libc::fclose(rf);
 
         const cmd: string = format("%s rcs \"%s\" @\"%s\"", ar, archive_path, rsp_path);
 
@@ -1210,7 +1188,7 @@ type struct CodegenPasses {
             cdebug("[Codegen] Bundle command: %s\n", cmd);
         }
 
-        const rc: i32 = system(cmd);
+        const rc: i32 = Command::shell(cmd);
         // Drop the response file now the archiver has read it (best-effort).
         dir::remove_file(Path::from_cstr(rsp_path));
         if (rc != 0) {
@@ -1413,14 +1391,21 @@ type struct CodegenPasses {
         return buf as string;
     }
 
-    /// True iff `tool` can be launched, probed via `<tool> --version`.  A
-    /// missing binary makes the shell exit non-zero (`sh`: 127; `cmd`: 9009)
-    /// and `system(3)` reports that, so exit 0 means it's usable.  Mirrors
-    /// `pick_c_preprocessor`'s `cc_available` probe.  The probe runs after IR
-    /// is emitted (link/archive time), so the tool chosen never affects the
-    /// `.ll` the selfhost gate compares.
+    /// True iff `tool` can be launched, probed via `<tool> --version` with both
+    /// streams sent to the null device.  A missing binary makes `spawn` fail
+    /// (Windows) or the child `_exit(127)` (POSIX), so a successful exit means
+    /// it's usable.  Mirrors `pick_c_preprocessor`'s `cc_available` probe.  The
+    /// probe runs after IR is emitted (link/archive time), so the tool chosen
+    /// never affects the `.ll` the selfhost gate compares.
     static tool_available(tool: string) -> boolean {
-        return system(format("%s --version %s", tool, CodegenPasses::probe_silence())) == 0;
+        mut probe: Command = Command::new(Str::new(tool));
+        probe.arg(Str::new("--version"));
+        probe.stdout(Stdio::Null);
+        probe.stderr(Stdio::Null);
+        match (probe.status()) {
+            Result::Ok(st) => { return st.success(); }
+            Result::Err(_) => { return false; }
+        }
     }
 
     /// Pick the static archiver binary.  `CRYO_AR` overrides everything,
@@ -1512,50 +1497,38 @@ type struct CodegenPasses {
     /// musl/Alpine release where the static libs live elsewhere.  llvm-config
     /// emits the sections in flag order: `-L` first, then the component libs,
     /// then the system libs - the correct single-pass static link order.
-    /// Returns "" on popen failure, empty output, or a non-zero exit so the
-    /// caller can fail the link with a clear diagnostic.  Mirrors the
-    /// popen/fgets/pclose pattern in `c_header_import`'s `run_preproc_pipe`.
-    /// Runs at link time (after IR is emitted), so it never touches the `.ll`
-    /// the selfhost gate compares.
+    /// Returns "" on spawn failure, empty output, or a non-zero exit so the
+    /// caller can fail the link with a clear diagnostic.  Captures the tool's
+    /// stdout via `Command::output()`.  Runs at link time (after IR is emitted),
+    /// so it never touches the `.ll` the selfhost gate compares.
     static static_llvm_link_flags(llvm_config: string) -> string {
-        const cmd: string = format("%s --ldflags --libs --system-libs --link-static", llvm_config);
-        const pipe: void* = intrinsics::popen(cmd, "r");
-        if (pipe == null) { return ""; }
-
-        mut out_buf: i8* = intrinsics::malloc(65536) as i8*;
-        mut out_len: u64 = 0;
-        mut out_cap: u64 = 65536;
-        mut line_buf: i8[4096];
-
-        while (libc::fgets(&line_buf[0], 4096, pipe) != null) {
-            const llen: u64 = (&line_buf[0] as string).length();
-            if (out_len + llen >= out_cap) {
-                out_cap *= 2;
-                const nb: i8* = intrinsics::malloc(out_cap) as i8*;
-                intrinsics::memcpy(nb as void*, out_buf as void*, out_len);
-                intrinsics::free(out_buf as void*);
-                out_buf = nb;
+        mut probe: Command = Command::new(Str::new(llvm_config));
+        probe.arg(Str::new("--ldflags"));
+        probe.arg(Str::new("--libs"));
+        probe.arg(Str::new("--system-libs"));
+        probe.arg(Str::new("--link-static"));
+        match (probe.output()) {
+            Result::Ok(out) => {
+                mut o: Output = out;
+                if (!o.status.success()) { return ""; }
+                const bytes: Slice<u8> = o.stdout();
+                if (bytes.length() == 0) { return ""; }
+                // llvm-config prints `--libs` and `--system-libs` on separate
+                // lines; flatten every newline to a space so the result is one
+                // flat argument string (libs first, then system libs - the
+                // correct single-pass static link order).
+                mut flags: String = String::new();
+                mut i: u64 = 0;
+                while (i < bytes.length()) {
+                    const b: u8 = bytes.get(i).unwrap_or(0 as u8);
+                    if (b == 10 as u8 || b == 13 as u8) { flags.push_byte(32 as u8); }
+                    else { flags.push_byte(b); }
+                    i++;
+                }
+                return flags.into_raw();
             }
-            intrinsics::memcpy((out_buf + out_len) as void*, &line_buf[0] as void*, llen);
-            out_len += llen;
+            Result::Err(_) => { return ""; }
         }
-        out_buf[out_len] = 0;
-        const exit_code: i32 = intrinsics::pclose(pipe);
-
-        if (exit_code != 0 || out_len == 0) {
-            intrinsics::free(out_buf as void*);
-            return "";
-        }
-
-        // llvm-config prints `--libs` and `--system-libs` on separate lines;
-        // flatten every newline to a space so the result is one flat argument
-        // string (libs first, then system libs - the correct static link order).
-        for (mut i: u64 = 0; i < out_len; i++) {
-            if (out_buf[i] == '\n' as i8 || out_buf[i] == '\r' as i8) {
-                out_buf[i] = ' ' as i8;
-            }
-        }
-        return out_buf as string;
     }
 
     /// Byte-wise path equality that treats `/` and `\` as the same
