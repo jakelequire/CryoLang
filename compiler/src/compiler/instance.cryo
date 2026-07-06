@@ -634,7 +634,7 @@ type struct CompilerInstance {
     compile_project(&this, config_path: string) -> CompilationResult {
         LOG_DEBUG(LogComponent::General, "[Compiler] compile_project: %s", config_path);
 
-        // Phase 0: Parse project configuration
+        // Project configuration
         mut config: ProjectConfig = ProjectConfig::parse(config_path);
         if (config.error_count > 0) {
             // ProjectConfig::parse already wrote diagnostics to stderr;
@@ -743,7 +743,7 @@ type struct CompilerInstance {
             return CompilationResult::failed(1, 0);
         }
 
-        // Phase 1: Create context and discover modules
+        // Module discovery: create context and discover modules
         // Select compile mode based on target type, with a `cryo test`
         // override:
         //   --test (any executable) -> Test         (suppresses user main,
@@ -819,11 +819,11 @@ type struct CompilerInstance {
         // Defensive: guarantee this target STARTS with arena routing OFF, so
         // its survivor construction (below, pre-activation) always lands in
         // libc — even on the impossible-by-construction path where a prior
-        // target leaked the active flag.  The bracket re-enables it at Phase 2.
+        // target leaked the active flag.  The bracket re-enables it at Frontend.
         Compiler::Codegen::AstArena::cryo_alloc_arena_set_active(false);
         // Same defensive reset for the LLVM context: dispose any leftover from
         // a prior target so this target starts on the global-context fallback
-        // until its own context is published at Phase 2.
+        // until its own context is published at Frontend.
         Compiler::Codegen::LLVMTypes::dispose_codegen_context();
 
         // CRYO_TIMINGS phase profiling.  All marks are captured regardless;
@@ -1271,8 +1271,8 @@ type struct CompilerInstance {
         mut manifest_stdlib_archive: string = "";
         mut build_fp_hex: string = "";
 
-        // Per-module incremental cache.  Computed after Phase 6a (§ below),
-        // consumed by the Phase 6b/7 skip and the success-path sidecar write.
+        // Per-module incremental cache.  Computed after Specialization (§ below),
+        // consumed by the SemanticAnalysis/Codegen skip and the success-path sidecar write.
         //   pm_cached[m]   : module index m may reuse its on-disk .o
         //   pm_key_names[m]: namespace of module m (parallel to pm_key_hex)
         //   pm_key_hex[m]  : current cache key of module m
@@ -1371,352 +1371,51 @@ type struct CompilerInstance {
         const scope_buf: void* = intrinsics::malloc(buf_size);
         intrinsics::memset(scope_buf, 0, buf_size);
 
-        // Phase 2: Frontend: lex, parse, validate all modules in topo order
-        cdebug("[Compiler] Phase 2: Building frontend pipeline...\n");
         mut pipeline: PassRegistry = PassRegistry::new();
         pipeline.set_verbose(this.config.verbose_passes);
-        cdebug("[Compiler] Phase 2: Calling set_passes...\n");
-        pipeline.set_passes([PassID::Lexing, PassID::Parsing,
-                             PassID::ConfigGating,
-                             PassID::ASTValidation, PassID::CHeaderImport]);
-        cdebug("[Compiler] Phase 2: Calling validate...\n");
-        const phase2_valid: boolean = pipeline.validate();
-        cdebug("[Compiler] Phase 2: validate returned %d\n", phase2_valid as int);
 
-        for (mut i: u32 = 0; i < n; i++) {
-            const mod_idx: u32 = order[i];
-            cdebug("[Compiler] Phase 2: Processing module %u (index %u)\n", i, mod_idx);
-            ctx.switch_to_module(mod_idx as i64);
-            cdebug("[Compiler] Phase 2: Module %u path='%s'\n", i, ctx.source_file);
-            cdebug("[Compiler] Phase 2: Calling run_all for module %u...\n", i);
-            if (!pipeline.run_all(ctx)) {
-                fmt::eprintln(f"error: frontend pipeline failed for module {i}");
-                return this.project_failure_release(ctx, ast_buf, scope_buf);
-            }
-            cdebug("[Compiler] Phase 2: Module %u succeeded\n", i);
-            // Save the parsed AST using local buffer
-            const ast_slot: void** = (ast_buf as void**) + mod_idx;
-            *ast_slot = ctx.artifacts.ast.root as void*;
-            // Mirror into the module_graph's per-module AST table so
-            // out-of-band consumers (the LSP for hover/definition) can
-            // retrieve a module's AST after the orchestrator returns;
-            // the local `ast_buf` goes out of scope at end of function.
-            ctx.module_graph.set_module_ast(mod_idx, ctx.artifacts.ast.root);
-            pipeline.reset();
-            ctx.provisions.clear();
+        // Run each stage across ALL modules before advancing to the next; see
+        // the stage-driver block below for why the ordering is load-bearing.
+        if (!this.run_frontend(ctx, &pipeline, ast_buf)) {
+            return this.project_failure_release(ctx, ast_buf, scope_buf);
+        }
+        if (!this.run_module_resolution(ctx, &pipeline, ast_buf, scope_buf)) {
+            return this.project_failure_release(ctx, ast_buf, scope_buf);
+        }
+        if (!this.collect_type_declarations(ctx, &pipeline, ast_buf, scope_buf)) {
+            return this.project_failure_release(ctx, ast_buf, scope_buf);
         }
 
-        // Phase 3: Module Resolution: auto-import, import resolution, name resolution
-        pipeline.set_passes([PassID::AutoImport, PassID::ImportResolution, PassID::NameResolution]);
-        {
-            mut initial3: ProvisionSet = ProvisionSet::empty();
-            initial3.mark(Provision::ASTValidated);
-            pipeline.validate_with_initial(initial3);
+        if (!this.register_templates(ctx, &pipeline, ast_buf, scope_buf)) {
+            return this.project_failure_release(ctx, ast_buf, scope_buf);
         }
-
-        for (mut i: u32 = 0; i < n; i++) {
-            CompilerInstance::load_module(ctx, ctx.intern_table, ast_buf, order[i], n);
-            ctx.provisions.clear();
-            ctx.provisions.mark(Provision::Tokens);
-            ctx.provisions.mark(Provision::AST);
-            ctx.provisions.mark(Provision::ASTValidated);
-            if (!pipeline.run_all(ctx)) {
-                return this.project_failure_release(ctx, ast_buf, scope_buf);
-            }
-            // Save the resolver's scope to local buffer
-            if (ctx.resolver != null && ctx.active_module_index >= 0) {
-                const scope_val: u64 = ctx.resolver.get_current_scope_id();
-                const sc_idx: u32 = ctx.active_module_index as u32;
-                if (sc_idx < n) {
-                    const sc_slot: u64* = (scope_buf as u64*) + sc_idx;
-                    *sc_slot = scope_val;
-                }
-            }
-            pipeline.reset();
+        if (!this.expand_defaults_and_signatures(ctx, &pipeline, ast_buf, scope_buf)) {
+            return this.project_failure_release(ctx, ast_buf, scope_buf);
         }
-
-        // Phase 4a: TypeDeclaration: register all type NAMES in the arena
-        // across all modules before resolving any signatures.  This handles
-        // forward references (e.g., node.cryo uses ASTVisitor* which is
-        // defined in visitor.cryo, but visitor depends on node).
-        pipeline.set_passes([PassID::TypeDeclaration]);
-        {
-            mut initial4a: ProvisionSet = ProvisionSet::empty();
-            initial4a.mark(Provision::ASTValidated);
-            initial4a.mark(Provision::NamesResolved);
-            pipeline.validate_with_initial(initial4a);
-        }
-
-        for (mut i: u32 = 0; i < n; i++) {
-            CompilerInstance::load_module_with_scope(ctx, ctx.intern_table, ast_buf, scope_buf, order[i], n);
-            ctx.provisions.clear();
-            ctx.provisions.mark(Provision::Tokens);
-            ctx.provisions.mark(Provision::AST);
-            ctx.provisions.mark(Provision::ASTValidated);
-            ctx.provisions.mark(Provision::ImportsDiscovered);
-            ctx.provisions.mark(Provision::ModulesLoaded);
-            ctx.provisions.mark(Provision::ModuleOrder);
-            ctx.provisions.mark(Provision::NamesResolved);
-            if (!pipeline.run_all(ctx)) {
-                return this.project_failure_release(ctx, ast_buf, scope_buf);
-            }
-            pipeline.reset();
-        }
-
-        // Phase 4b.0: TemplateRegistration across ALL modules first.
-        //
-        // The DefaultExpansion pass in Phase 4b.1 rewrites bare references
-        // to all-default-generic types (e.g. `String` -> `String<GlobalAlloc>`)
-        // by consulting the shared GenericRegistry.  For the rewrite of a
-        // bare `T` to fire, the template for `T` must already be in the
-        // registry - i.e. the module that *declares* `T` must have run
-        // TemplateRegistration before *any* module's DefaultExpansion.
-        //
-        // The previous structure ran the trio
-        // `[DefaultExpansion, FunctionSignature, TemplateRegistration]` as
-        // one per-module loop and relied on module `order[]` being
-        // strictly dependents-after-dependencies.  That assumption fails
-        // whenever the import graph perturbs the topological sort: e.g.
-        // `compiler/src/compiler/diag/renderer.cryo` adds
-        // `import std::collections::string;` and the new edge can place
-        // a consumer (`std::collections::str`, which uses `String` in
-        // `Str::to_ascii_lowercase`) before its declarer
-        // (`std::collections::string`) in `order[]`.  In that case
-        // str.cryo's DefaultExpansion ran with an empty registry, its
-        // bare `String` references were never rewritten, monomorphization
-        // never specialised `String<GlobalAlloc>::push` for that
-        // call site, and the link failed with an undefined reference to
-        // the bare-template method.
-        //
-        // Running TemplateRegistration across all modules first makes
-        // the cross-module visibility invariant true by construction:
-        // every template is in the registry before any DefaultExpansion
-        // runs, regardless of where the module sits in `order[]`.
-        pipeline.set_passes([PassID::TemplateRegistration]);
-        {
-            mut initial4b0: ProvisionSet = ProvisionSet::empty();
-            initial4b0.mark(Provision::ASTValidated);
-            initial4b0.mark(Provision::NamesResolved);
-            initial4b0.mark(Provision::TypeDeclarations);
-            pipeline.validate_with_initial(initial4b0);
-        }
-
-        for (mut i: u32 = 0; i < n; i++) {
-            CompilerInstance::load_module_with_scope(ctx, ctx.intern_table, ast_buf, scope_buf, order[i], n);
-            ctx.provisions.clear();
-            ctx.provisions.mark(Provision::Tokens);
-            ctx.provisions.mark(Provision::AST);
-            ctx.provisions.mark(Provision::ASTValidated);
-            ctx.provisions.mark(Provision::ImportsDiscovered);
-            ctx.provisions.mark(Provision::ModulesLoaded);
-            ctx.provisions.mark(Provision::ModuleOrder);
-            ctx.provisions.mark(Provision::NamesResolved);
-            ctx.provisions.mark(Provision::TypeDeclarations);
-            if (!pipeline.run_all(ctx)) {
-                return this.project_failure_release(ctx, ast_buf, scope_buf);
-            }
-            pipeline.reset();
-        }
-
-        // Phase 4b.1: DefaultExpansion + FunctionSignature.
-        // With TemplateRegistration now globally complete, DefaultExpansion
-        // sees every cross-module template; FunctionSignature then resolves
-        // the rewritten annotations.  FunctionSignature must run after
-        // DefaultExpansion in the same module's iteration: annotation
-        // resolution is guarded by `!resolved_type.is_valid()`, so a later
-        // re-walk would skip them.
-        pipeline.set_passes([PassID::DefaultExpansion,
-                             PassID::FunctionSignature]);
-        {
-            mut initial4b: ProvisionSet = ProvisionSet::empty();
-            initial4b.mark(Provision::ASTValidated);
-            initial4b.mark(Provision::NamesResolved);
-            initial4b.mark(Provision::TypeDeclarations);
-            initial4b.mark(Provision::TemplatesRegistered);
-            pipeline.validate_with_initial(initial4b);
-        }
-
-        for (mut i: u32 = 0; i < n; i++) {
-            CompilerInstance::load_module_with_scope(ctx, ctx.intern_table, ast_buf, scope_buf, order[i], n);
-            ctx.provisions.clear();
-            ctx.provisions.mark(Provision::Tokens);
-            ctx.provisions.mark(Provision::AST);
-            ctx.provisions.mark(Provision::ASTValidated);
-            ctx.provisions.mark(Provision::ImportsDiscovered);
-            ctx.provisions.mark(Provision::ModulesLoaded);
-            ctx.provisions.mark(Provision::ModuleOrder);
-            ctx.provisions.mark(Provision::NamesResolved);
-            ctx.provisions.mark(Provision::TypeDeclarations);
-            ctx.provisions.mark(Provision::TemplatesRegistered);
-            if (!pipeline.run_all(ctx)) {
-                return this.project_failure_release(ctx, ast_buf, scope_buf);
-            }
-            pipeline.reset();
-        }
-
-        // Phase 5: Type Resolution
-        pipeline.set_passes([PassID::TypeResolution, PassID::StructFieldTypeSync]);
-        {
-            mut initial5: ProvisionSet = ProvisionSet::empty();
-            initial5.mark(Provision::ASTValidated);
-            initial5.mark(Provision::NamesResolved);
-            initial5.mark(Provision::TypeDeclarations);
-            initial5.mark(Provision::FunctionSignatures);
-            initial5.mark(Provision::TemplatesRegistered);
-            pipeline.validate_with_initial(initial5);
-        }
-
-        for (mut i: u32 = 0; i < n; i++) {
-            CompilerInstance::load_module_with_scope(ctx, ctx.intern_table, ast_buf, scope_buf, order[i], n);
-            ctx.provisions.clear();
-            ctx.provisions.mark(Provision::Tokens);
-            ctx.provisions.mark(Provision::AST);
-            ctx.provisions.mark(Provision::ASTValidated);
-            ctx.provisions.mark(Provision::NamesResolved);
-            ctx.provisions.mark(Provision::TypeDeclarations);
-            ctx.provisions.mark(Provision::FunctionSignatures);
-            ctx.provisions.mark(Provision::TemplatesRegistered);
-            if (!pipeline.run_all(ctx)) {
-                return this.project_failure_release(ctx, ast_buf, scope_buf);
-            }
-            pipeline.reset();
+        if (!this.resolve_types(ctx, &pipeline, ast_buf, scope_buf)) {
+            return this.project_failure_release(ctx, ast_buf, scope_buf);
         }
 
         tm_frontend_end = Instant::now().as_nanos();
 
-        // Phase 6a: Specialization: monomorphize ALL modules before validation.
-        // GenericValidation walks the shared TypeArena which contains
-        // InstantiatedTypes from every module.  If we ran validation
-        // per-module inside the same loop as monomorphization, the first
-        // module's validation would see unmonomorphized types created by
-        // later modules during Phase 5 (TypeResolution).  Splitting into
-        // 6a (mono) and 6b (validation+sema) ensures every module has
-        // completed monomorphization before any validation runs.
-        // Phase 6a-i: DirectiveProcessing for ALL modules first. This must
-        // complete for every module before any Monomorphization runs.
-        // Mono clones generic templates, and a template's `![repr]` /
-        // `![align]` layout flags are only set once *its* module's
-        // DirectiveProcessing has run. The mono worklist is global and
-        // drained per-module, so a spec requested by an early module would
-        // otherwise be cloned before its (later) template module's
-        // directives were processed, silently dropping the layout onto
-        // every instantiation. (Mono lists `DirectivesProcessed` as an
-        // *optional* requirement, so the pass framework won't enforce this
-        // ordering for us - we sequence it explicitly here.)
-        pipeline.set_passes([PassID::DirectiveProcessing]);
-        {
-            mut init6ai: ProvisionSet = ProvisionSet::empty();
-            init6ai.mark(Provision::ASTValidated);
-            init6ai.mark(Provision::NamesResolved);
-            init6ai.mark(Provision::TypesResolved);
-            init6ai.mark(Provision::StructFieldsSynced);
-            pipeline.validate_with_initial(init6ai);
+        // Specialization runs as three ordered stages across all modules:
+        // directives (layout flags) -> body typecheck (mono-after-sema) ->
+        // monomorphization.  Each must complete for EVERY module before the
+        // next begins (see the stage-driver block for the invariants).
+        if (!this.process_directives(ctx, &pipeline, ast_buf, scope_buf)) {
+            return this.project_failure_release(ctx, ast_buf, scope_buf);
         }
-        for (mut i: u32 = 0; i < n; i++) {
-            CompilerInstance::load_module_with_scope(ctx, ctx.intern_table, ast_buf, scope_buf, order[i], n);
-            ctx.provisions.clear();
-            ctx.provisions.mark(Provision::Tokens);
-            ctx.provisions.mark(Provision::AST);
-            ctx.provisions.mark(Provision::ASTValidated);
-            ctx.provisions.mark(Provision::NamesResolved);
-            ctx.provisions.mark(Provision::TypeDeclarations);
-            ctx.provisions.mark(Provision::FunctionSignatures);
-            ctx.provisions.mark(Provision::TemplatesRegistered);
-            ctx.provisions.mark(Provision::TypesResolved);
-            ctx.provisions.mark(Provision::StructFieldsSynced);
-            if (!pipeline.run_all(ctx)) {
-                return this.project_failure_release(ctx, ast_buf, scope_buf);
-            }
-            pipeline.reset();
+        if (!this.typecheck_bodies(ctx, &pipeline, ast_buf, scope_buf)) {
+            return this.project_failure_release(ctx, ast_buf, scope_buf);
+        }
+        if (!this.monomorphize(ctx, &pipeline, ast_buf, scope_buf)) {
+            return this.project_failure_release(ctx, ast_buf, scope_buf);
         }
 
-        // Phase 6a-i.5: FunctionBodyTypeCheck (semantic analysis) for ALL
-        // modules, BEFORE Monomorphization.  This is the mono-after-sema flip:
-        // sema is the single source of truth for resolved types, and mono runs
-        // afterward to specialize what sema resolved.  Sema needs every
-        // module's directives processed (Phase 6a-i) so `![repr]`/layout flags
-        // are visible, but must precede mono so it - not mono's now-deleted
-        // inference engine - resolves generic call return types.  No
-        // `pm_cached` skip: the incremental-cache decision isn't computed until
-        // after mono, so every module's bodies are type-checked here.
-        pipeline.set_passes([PassID::FunctionBodyTypeCheck]);
-        {
-            mut init6sema: ProvisionSet = ProvisionSet::empty();
-            init6sema.mark(Provision::ASTValidated);
-            init6sema.mark(Provision::NamesResolved);
-            init6sema.mark(Provision::TypesResolved);
-            init6sema.mark(Provision::StructFieldsSynced);
-            init6sema.mark(Provision::DirectivesProcessed);
-            pipeline.validate_with_initial(init6sema);
-        }
-        for (mut i: u32 = 0; i < n; i++) {
-            CompilerInstance::load_module_with_scope(ctx, ctx.intern_table, ast_buf, scope_buf, order[i], n);
-            ctx.provisions.clear();
-            ctx.provisions.mark(Provision::Tokens);
-            ctx.provisions.mark(Provision::AST);
-            ctx.provisions.mark(Provision::ASTValidated);
-            ctx.provisions.mark(Provision::NamesResolved);
-            ctx.provisions.mark(Provision::TypeDeclarations);
-            ctx.provisions.mark(Provision::FunctionSignatures);
-            ctx.provisions.mark(Provision::TemplatesRegistered);
-            ctx.provisions.mark(Provision::TypesResolved);
-            ctx.provisions.mark(Provision::StructFieldsSynced);
-            ctx.provisions.mark(Provision::DirectivesProcessed);
-            if (!pipeline.run_all(ctx)) {
-                return this.project_failure_release(ctx, ast_buf, scope_buf);
-            }
-            pipeline.reset();
-        }
-
-        // Phase 6a-ii: Monomorphization + GenericExpressionResolution for
-        // ALL modules, now that every template carries its final layout.
-        pipeline.set_passes([
-            PassID::Monomorphization,
-            PassID::GenericExpressionResolution,
-        ]);
-        {
-            mut initial6a: ProvisionSet = ProvisionSet::empty();
-            initial6a.mark(Provision::ASTValidated);
-            initial6a.mark(Provision::NamesResolved);
-            initial6a.mark(Provision::TypesResolved);
-            initial6a.mark(Provision::StructFieldsSynced);
-            initial6a.mark(Provision::DirectivesProcessed);
-            pipeline.validate_with_initial(initial6a);
-        }
-
-        for (mut i: u32 = 0; i < n; i++) {
-            CompilerInstance::load_module_with_scope(ctx, ctx.intern_table, ast_buf, scope_buf, order[i], n);
-            ctx.provisions.clear();
-            ctx.provisions.mark(Provision::Tokens);
-            ctx.provisions.mark(Provision::AST);
-            ctx.provisions.mark(Provision::ASTValidated);
-            ctx.provisions.mark(Provision::NamesResolved);
-            ctx.provisions.mark(Provision::TypeDeclarations);
-            ctx.provisions.mark(Provision::FunctionSignatures);
-            ctx.provisions.mark(Provision::TemplatesRegistered);
-            ctx.provisions.mark(Provision::TypesResolved);
-            ctx.provisions.mark(Provision::StructFieldsSynced);
-            ctx.provisions.mark(Provision::DirectivesProcessed);
-            if (!pipeline.run_all(ctx)) {
-                return this.project_failure_release(ctx, ast_buf, scope_buf);
-            }
-            pipeline.reset();
-        }
-
-        // Phase 6a-iii: Route every specialization to its DETERMINISTIC owner
-        // module (the template's defining module) and register+inject it there.
-        // Mono (6a-ii) only *creates* specs; injection is deferred to here so a
-        // spec's object-file home is a function of its template, not of which
-        // module first demanded it.  Each owner module is loaded as `ctx` so
-        // AST placement and DeclarationIndex ownership both reference the owner
-        // and stay consistent.  Runs while still in bootstrap mode (before
-        // `end_bootstrap`) so spec registration can fall back to the arena, and
-        // before Phase 6b so the DI is fully populated for sema.
-        for (mut i: u32 = 0; i < n; i++) {
-            CompilerInstance::load_module_with_scope(ctx, ctx.intern_table, ast_buf, scope_buf, order[i], n);
-            if (!SpecializationPasses::route_specializations_to_owners(ctx).success) {
-                return this.project_failure_release(ctx, ast_buf, scope_buf);
-            }
+        // Spec routing: deferred injection of the specs mono created, before
+        // semantic analysis so the DI is fully populated for sema.
+        if (!this.route_specializations(ctx, ast_buf, scope_buf)) {
+            return this.project_failure_release(ctx, ast_buf, scope_buf);
         }
 
         // Soundness assertion: every specialization must have been routed to an
@@ -1734,18 +1433,18 @@ type struct CompilerInstance {
             }
         }
 
-        // End bootstrap mode: the DI is now fully populated from Phase 5
-        // and Phase 6a (spec routing registered all specializations).
+        // End bootstrap mode: the DI is now fully populated from TypeResolution
+        // and Specialization (spec routing registered all specializations).
         // TypeResolver will no longer fall back to arena lookups (steps 4/4a).
         if (ctx.type_resolver != null) {
             ctx.type_resolver.end_bootstrap();
         }
 
         // Invariant: every queued specialization must be drained before
-        // Phase 6b starts.  Phase 6b's sema walks the shared TypeArena
+        // semantic analysis starts.  Its sema walks the shared TypeArena
         // expecting every InstantiatedType wrapper to point at a
         // specialized AST that's already been emitted.  A non-empty
-        // worklist here means a Phase 6a pass exited early without
+        // worklist here means a specialization pass exited early without
         // draining; the system would still produce output but sema
         // would silently see unresolved generic params, and the bug
         // would surface as a downstream codegen mangle/link failure.
@@ -1754,7 +1453,7 @@ type struct CompilerInstance {
             const remaining: i64 = ctx.monomorphizer.pending_count();
             ctx.diagnostics.emit(Diagnostic::error(
                 ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                format("monomorphizer worklist not drained between Phase 6a and 6b (%d pending)",
+                format("monomorphizer worklist not drained between monomorphization and semantic analysis (%d pending)",
                     remaining)));
             return this.project_failure_release(ctx, ast_buf, scope_buf);
         }
@@ -1763,7 +1462,7 @@ type struct CompilerInstance {
 
         // ====================================================================
         // Per-module incremental cache: decide which modules can reuse their
-        // on-disk object file instead of re-running Phase 6b + Phase 7.
+        // on-disk object file instead of re-running SemanticAnalysis + Codegen.
         // Whole-program monomorphization (Phases 1-6a) has just finished, so
         // spec ownership and every module's source are final.  Two key
         // formulas (see build_manifest.cryo for the soundness argument):
@@ -1863,12 +1562,13 @@ type struct CompilerInstance {
             }
         }
 
-        // Phase 6b: Validation + Semantic Analysis + Codegen Preparation.
-        // Now that every module has been monomorphized and specialized ASTs
-        // injected, GenericValidation can safely walk the entire arena
-        // without false positives from not-yet-monomorphized modules.
-        // FunctionBodyTypeCheck now runs in Phase 6a-i.5 (before mono); 6b is
-        // post-mono validation only.  BodiesTypeChecked is an INCOMING
+        // Semantic analysis: GenericValidation + MoveCheck + DropInsertion +
+        // Codegen preparation.  Now that every module has been monomorphized and
+        // specialized ASTs injected, GenericValidation can safely walk the
+        // entire arena without false positives from not-yet-monomorphized
+        // modules.  FunctionBodyTypeCheck already ran in `typecheck_bodies`
+        // (before mono); this stage is post-mono validation only.
+        // BodiesTypeChecked is an INCOMING
         // provision here (sema provided it earlier) so MoveCheck's requirement
         // is satisfied.
         pipeline.set_passes([
@@ -1953,15 +1653,15 @@ type struct CompilerInstance {
             }
         }
 
-        // Phase 7: Per-module codegen: IR generation, optimization, object emission.
+        // Codegen: per-module IR generation, optimization, object emission.
         // Each module gets its own LLVM module. Cross-module references use extern
         // declarations from ModuleGraph.cross_module_fns.
-        cdebug("[Compiler] Phase 7 gate: phase6_failed=%d, codegen_enabled=%d, errors=%u\n",
+        cdebug("[Compiler] Codegen gate: phase6_failed=%d, codegen_enabled=%d, errors=%u\n",
             phase6_failed as int, ctx.mode.codegen_enabled() as int, ctx.diagnostics.error_count);
         if (!phase6_failed && ctx.mode.codegen_enabled()) {
-            cdebug("[Compiler] Phase 7: Codegen (%u modules)\n", n);
+            cdebug("[Compiler] Codegen: %u modules\n", n);
 
-            // Concise per-package build summary.  Phase 7 only runs on a real
+            // Concise per-package build summary.  Codegen only runs on a real
             // (non-short-circuited) build and never under LSP, so this is safe
             // to print to stdout.  Test mode owns its own runner output, so
             // skip the summary there to keep `cryo test` output clean.
@@ -2029,7 +1729,7 @@ type struct CompilerInstance {
             for (mut i: u32 = 0; i < n; i++) {
                 const _mi: ModuleInfo* = &ctx.module_graph.modules[order[i]];
                 const _mn: string = ctx.intern_table.resolve(_mi.name);
-                cdebug("[Compiler] Phase 7: module %u/%u (%s)\n", i, n, _mn);
+                cdebug("[Compiler] Codegen: module %u/%u (%s)\n", i, n, _mn);
                 // Cached module: reuse the on-disk object instead of
                 // regenerating IR + emitting it.  The object path is the same
                 // deterministic location ObjectEmission would have written
@@ -2042,7 +1742,7 @@ type struct CompilerInstance {
                             ModuleInfo::origin_subdir(_mi.origin, _mi.origin_name)),
                         Compiler::BuildManifest::Manifest::mangle_module(_mn));
                     ctx.artifacts.register_object_file(cobj);
-                    cdebug("[Compiler] Phase 7: reused cached object %s\n", cobj);
+                    cdebug("[Compiler] Codegen: reused cached object %s\n", cobj);
                     continue;
                 }
                 CompilerInstance::load_module_with_scope(
@@ -2098,9 +1798,9 @@ type struct CompilerInstance {
                     }
 
                     if (pipeline_ok) {
-                        cdebug("[Compiler] Phase 7: IR + obj for module %u (%s)\n", i, mod_name);
+                        cdebug("[Compiler] Codegen: IR + obj for module %u (%s)\n", i, mod_name);
                     } else {
-                        cdebug("[Compiler] Phase 7: IR generated for module %u (%s)\n", i, mod_name);
+                        cdebug("[Compiler] Codegen: IR generated for module %u (%s)\n", i, mod_name);
                     }
                 } else if (!pipeline_ok) {
                     fmt::eprintln(f"error: codegen failed for module {i}");
@@ -2119,12 +1819,12 @@ type struct CompilerInstance {
 
             tm_codegen_end = Instant::now().as_nanos();
 
-            // Phase 7b: synthesize the test-runner main when in test mode.
+            // test-main synthesis: synthesize the test-runner main when in test mode.
             // Walks the directive registry for `![test]` records, builds
             // a fresh LLVM module containing the descriptor table + main,
             // emits it to disk, and registers it with the linker artifacts.
             if (!ctx.diagnostics.has_errors() && ctx.mode.skip_user_main()) {
-                cdebug("[Compiler] Phase 7b: Synthesizing test main\n");
+                cdebug("[Compiler] test-main synthesis: Synthesizing test main\n");
                 const test_result: PassResult = TestMainCodegen::run_test_main_codegen(ctx);
                 if (!test_result.success) {
                     fmt::eprintf("error: test-main synthesis failed\n");
@@ -2140,11 +1840,11 @@ type struct CompilerInstance {
                 }
             }
 
-            // Phase 8: link the per-module objects into the final binary.
-            // Only runs when Phase 7 produced at least one object (executable
+            // Linking: link the per-module objects into the final binary.
+            // Only runs when Codegen produced at least one object (executable
             // targets); library/stdlib builds short-circuit inside run_linking.
             if (!ctx.diagnostics.has_errors() && ctx.artifacts.object_files.length > 0) {
-                cdebug("[Compiler] Phase 8: Linking (%lld objects)\n",
+                cdebug("[Compiler] Linking: %lld objects\n",
                     ctx.artifacts.object_files.length);
                 const link_result: PassResult = CodegenPasses::run_linking(ctx);
                 if (!link_result.success) {
@@ -2191,7 +1891,7 @@ type struct CompilerInstance {
         // ── Per-target LLVM context: DISPOSE (success path) ─────────────
         // Codegen + linking are done (linking reads on-disk objects, not LLVM
         // modules; the per-module LLVMModuleRefs were each disposed in the
-        // Phase 7 loop).  Free this target's whole LLVM context now so its
+        // Codegen loop).  Free this target's whole LLVM context now so its
         // type tables don't survive into the next target.  Nothing below
         // touches LLVM (exe_path + manifest are pure string/file work).
         Compiler::Codegen::LLVMTypes::dispose_codegen_context();
@@ -2237,7 +1937,7 @@ type struct CompilerInstance {
 
         // CRYO_TIMINGS report: per-phase wall time + the frontend/backend
         // split that gates the per-module-incremental design (only the
-        // backend — Phase 6b + Phase 7 + link — is cacheable per module; the
+        // backend — SemanticAnalysis + Codegen + link — is cacheable per module; the
         // frontend and whole-program monomorphization must always run).
         if (tm_on) {
             // Use the last mark that actually fired as the build end, so the
@@ -2249,8 +1949,8 @@ type struct CompilerInstance {
             const fe: i64 = tm_mono_end - tm_entry;
             const be: i64 = tm_end - tm_mono_end;
             fmt::println(f"\n=== cryo build timings ({config.project_name}) ===");
-            CompilerInstance::timing_fmt("discovery (phase 1)", tm_discovery_end - tm_entry, total);
-            CompilerInstance::timing_fmt("frontend (phase 2-5)", tm_frontend_end - tm_discovery_end, total);
+            CompilerInstance::timing_fmt("discovery (discovery)", tm_discovery_end - tm_entry, total);
+            CompilerInstance::timing_fmt("frontend (frontend)", tm_frontend_end - tm_discovery_end, total);
             CompilerInstance::timing_fmt("monomorphization (6a)", tm_mono_end - tm_frontend_end, total);
             CompilerInstance::timing_fmt("sema/lowering (6b)", tm_sema_end - tm_mono_end, total);
             if (tm_codegen_end > 0i64) {
@@ -2270,6 +1970,378 @@ type struct CompilerInstance {
         intrinsics::free(ast_buf);
         intrinsics::free(scope_buf);
         return ok_result;
+    }
+
+    // ========================================================================
+    // Multi-module stage drivers
+    //
+    // `compile_project_with_ctx` runs the pipeline one STAGE at a time across
+    // ALL modules before advancing, rather than one module through all stages.
+    // Cross-module invariants force this: e.g. every template must be
+    // registered (register_templates) before any module's default-expansion
+    // runs, and every module must be monomorphized before generic validation
+    // walks the shared arena.  Each driver below owns one such stage; the
+    // provision marks are the exact per-module preconditions that stage's
+    // passes consume.  All return false on the first module that fails, and
+    // the caller performs the buffer-releasing failure return.
+    // ========================================================================
+
+    /// Frontend: Lexing, Parsing, ConfigGating, ASTValidation, CHeaderImport
+    /// over every module in topological order.  Records each module's parse
+    /// tree into `ast_buf` and the module_graph AST table (for out-of-band LSP
+    /// consumers).
+    run_frontend(&this, ctx: CompilationContext*, pipeline: PassRegistry*,
+                 ast_buf: void*) -> boolean {
+        const order: &u32[] = &ctx.module_graph.topo_order;
+        const n: u32 = order.length as u32;
+        cdebug("[Compiler] Frontend: %u module(s)\n", n);
+        pipeline.set_passes([PassID::Lexing, PassID::Parsing,
+                             PassID::ConfigGating,
+                             PassID::ASTValidation, PassID::CHeaderImport]);
+        pipeline.validate();
+
+        for (mut i: u32 = 0; i < n; i++) {
+            const mod_idx: u32 = order[i];
+            ctx.switch_to_module(mod_idx as i64);
+            if (!pipeline.run_all(ctx)) {
+                fmt::eprintln(f"error: frontend pipeline failed for module {i}");
+                return false;
+            }
+            // Save the parsed AST using local buffer
+            const ast_slot: void** = (ast_buf as void**) + mod_idx;
+            *ast_slot = ctx.artifacts.ast.root as void*;
+            // Mirror into the module_graph's per-module AST table so
+            // out-of-band consumers (the LSP for hover/definition) can
+            // retrieve a module's AST after the orchestrator returns;
+            // the local `ast_buf` goes out of scope at end of function.
+            ctx.module_graph.set_module_ast(mod_idx, ctx.artifacts.ast.root);
+            pipeline.reset();
+            ctx.provisions.clear();
+        }
+        return true;
+    }
+
+    /// Module resolution: AutoImport, ImportResolution, NameResolution over
+    /// every module.  Saves each module's resolver scope into `scope_buf` for
+    /// later stages to restore.
+    run_module_resolution(&this, ctx: CompilationContext*, pipeline: PassRegistry*,
+                          ast_buf: void*, scope_buf: void*) -> boolean {
+        const order: &u32[] = &ctx.module_graph.topo_order;
+        const n: u32 = order.length as u32;
+        pipeline.set_passes([PassID::AutoImport, PassID::ImportResolution, PassID::NameResolution]);
+        {
+            mut initial3: ProvisionSet = ProvisionSet::empty();
+            initial3.mark(Provision::ASTValidated);
+            pipeline.validate_with_initial(initial3);
+        }
+
+        for (mut i: u32 = 0; i < n; i++) {
+            CompilerInstance::load_module(ctx, ctx.intern_table, ast_buf, order[i], n);
+            ctx.provisions.clear();
+            ctx.provisions.mark(Provision::Tokens);
+            ctx.provisions.mark(Provision::AST);
+            ctx.provisions.mark(Provision::ASTValidated);
+            if (!pipeline.run_all(ctx)) {
+                return false;
+            }
+            // Save the resolver's scope to local buffer
+            if (ctx.resolver != null && ctx.active_module_index >= 0) {
+                const scope_val: u64 = ctx.resolver.get_current_scope_id();
+                const sc_idx: u32 = ctx.active_module_index as u32;
+                if (sc_idx < n) {
+                    const sc_slot: u64* = (scope_buf as u64*) + sc_idx;
+                    *sc_slot = scope_val;
+                }
+            }
+            pipeline.reset();
+        }
+        return true;
+    }
+
+    /// TypeDeclaration: register all type NAMES in the arena across all modules
+    /// before resolving any signatures.  Handles forward references (e.g.
+    /// node.cryo uses ASTVisitor* defined in visitor.cryo, which depends on
+    /// node).
+    collect_type_declarations(&this, ctx: CompilationContext*, pipeline: PassRegistry*,
+                              ast_buf: void*, scope_buf: void*) -> boolean {
+        const order: &u32[] = &ctx.module_graph.topo_order;
+        const n: u32 = order.length as u32;
+        pipeline.set_passes([PassID::TypeDeclaration]);
+        {
+            mut initial4a: ProvisionSet = ProvisionSet::empty();
+            initial4a.mark(Provision::ASTValidated);
+            initial4a.mark(Provision::NamesResolved);
+            pipeline.validate_with_initial(initial4a);
+        }
+
+        for (mut i: u32 = 0; i < n; i++) {
+            CompilerInstance::load_module_with_scope(ctx, ctx.intern_table, ast_buf, scope_buf, order[i], n);
+            ctx.provisions.clear();
+            ctx.provisions.mark(Provision::Tokens);
+            ctx.provisions.mark(Provision::AST);
+            ctx.provisions.mark(Provision::ASTValidated);
+            ctx.provisions.mark(Provision::ImportsDiscovered);
+            ctx.provisions.mark(Provision::ModulesLoaded);
+            ctx.provisions.mark(Provision::ModuleOrder);
+            ctx.provisions.mark(Provision::NamesResolved);
+            if (!pipeline.run_all(ctx)) {
+                return false;
+            }
+            pipeline.reset();
+        }
+        return true;
+    }
+
+    /// TemplateRegistration across ALL modules first, so every generic template
+    /// is in the shared registry before any module's DefaultExpansion consults
+    /// it.  Making the cross-module visibility invariant true by construction
+    /// (rather than relying on topo order) fixes bare-template rewrites when the
+    /// import graph places a consumer before its declarer in `order[]`.
+    register_templates(&this, ctx: CompilationContext*, pipeline: PassRegistry*,
+                       ast_buf: void*, scope_buf: void*) -> boolean {
+        const order: &u32[] = &ctx.module_graph.topo_order;
+        const n: u32 = order.length as u32;
+        pipeline.set_passes([PassID::TemplateRegistration]);
+        {
+            mut initial4b0: ProvisionSet = ProvisionSet::empty();
+            initial4b0.mark(Provision::ASTValidated);
+            initial4b0.mark(Provision::NamesResolved);
+            initial4b0.mark(Provision::TypeDeclarations);
+            pipeline.validate_with_initial(initial4b0);
+        }
+
+        for (mut i: u32 = 0; i < n; i++) {
+            CompilerInstance::load_module_with_scope(ctx, ctx.intern_table, ast_buf, scope_buf, order[i], n);
+            ctx.provisions.clear();
+            ctx.provisions.mark(Provision::Tokens);
+            ctx.provisions.mark(Provision::AST);
+            ctx.provisions.mark(Provision::ASTValidated);
+            ctx.provisions.mark(Provision::ImportsDiscovered);
+            ctx.provisions.mark(Provision::ModulesLoaded);
+            ctx.provisions.mark(Provision::ModuleOrder);
+            ctx.provisions.mark(Provision::NamesResolved);
+            ctx.provisions.mark(Provision::TypeDeclarations);
+            if (!pipeline.run_all(ctx)) {
+                return false;
+            }
+            pipeline.reset();
+        }
+        return true;
+    }
+
+    /// DefaultExpansion + FunctionSignature.  With templates globally
+    /// registered, DefaultExpansion sees every cross-module template and
+    /// FunctionSignature resolves the rewritten annotations.  The two run in
+    /// one module iteration because signature resolution is guarded by
+    /// `!resolved_type.is_valid()`, so a later re-walk would skip them.
+    expand_defaults_and_signatures(&this, ctx: CompilationContext*, pipeline: PassRegistry*,
+                                   ast_buf: void*, scope_buf: void*) -> boolean {
+        const order: &u32[] = &ctx.module_graph.topo_order;
+        const n: u32 = order.length as u32;
+        pipeline.set_passes([PassID::DefaultExpansion,
+                             PassID::FunctionSignature]);
+        {
+            mut initial4b: ProvisionSet = ProvisionSet::empty();
+            initial4b.mark(Provision::ASTValidated);
+            initial4b.mark(Provision::NamesResolved);
+            initial4b.mark(Provision::TypeDeclarations);
+            initial4b.mark(Provision::TemplatesRegistered);
+            pipeline.validate_with_initial(initial4b);
+        }
+
+        for (mut i: u32 = 0; i < n; i++) {
+            CompilerInstance::load_module_with_scope(ctx, ctx.intern_table, ast_buf, scope_buf, order[i], n);
+            ctx.provisions.clear();
+            ctx.provisions.mark(Provision::Tokens);
+            ctx.provisions.mark(Provision::AST);
+            ctx.provisions.mark(Provision::ASTValidated);
+            ctx.provisions.mark(Provision::ImportsDiscovered);
+            ctx.provisions.mark(Provision::ModulesLoaded);
+            ctx.provisions.mark(Provision::ModuleOrder);
+            ctx.provisions.mark(Provision::NamesResolved);
+            ctx.provisions.mark(Provision::TypeDeclarations);
+            ctx.provisions.mark(Provision::TemplatesRegistered);
+            if (!pipeline.run_all(ctx)) {
+                return false;
+            }
+            pipeline.reset();
+        }
+        return true;
+    }
+
+    /// TypeResolution + StructFieldTypeSync over every module.
+    resolve_types(&this, ctx: CompilationContext*, pipeline: PassRegistry*,
+                  ast_buf: void*, scope_buf: void*) -> boolean {
+        const order: &u32[] = &ctx.module_graph.topo_order;
+        const n: u32 = order.length as u32;
+        pipeline.set_passes([PassID::TypeResolution, PassID::StructFieldTypeSync]);
+        {
+            mut initial5: ProvisionSet = ProvisionSet::empty();
+            initial5.mark(Provision::ASTValidated);
+            initial5.mark(Provision::NamesResolved);
+            initial5.mark(Provision::TypeDeclarations);
+            initial5.mark(Provision::FunctionSignatures);
+            initial5.mark(Provision::TemplatesRegistered);
+            pipeline.validate_with_initial(initial5);
+        }
+
+        for (mut i: u32 = 0; i < n; i++) {
+            CompilerInstance::load_module_with_scope(ctx, ctx.intern_table, ast_buf, scope_buf, order[i], n);
+            ctx.provisions.clear();
+            ctx.provisions.mark(Provision::Tokens);
+            ctx.provisions.mark(Provision::AST);
+            ctx.provisions.mark(Provision::ASTValidated);
+            ctx.provisions.mark(Provision::NamesResolved);
+            ctx.provisions.mark(Provision::TypeDeclarations);
+            ctx.provisions.mark(Provision::FunctionSignatures);
+            ctx.provisions.mark(Provision::TemplatesRegistered);
+            if (!pipeline.run_all(ctx)) {
+                return false;
+            }
+            pipeline.reset();
+        }
+        return true;
+    }
+
+    /// DirectiveProcessing for ALL modules, before any Monomorphization.  Mono
+    /// clones generic templates, and a template's `![repr]`/`![align]` layout
+    /// flags are only set once *its* module's directives have run; since the
+    /// mono worklist is global, a spec requested by an early module would
+    /// otherwise be cloned before its (later) template module's directives were
+    /// processed, silently dropping the layout onto every instantiation.
+    process_directives(&this, ctx: CompilationContext*, pipeline: PassRegistry*,
+                       ast_buf: void*, scope_buf: void*) -> boolean {
+        const order: &u32[] = &ctx.module_graph.topo_order;
+        const n: u32 = order.length as u32;
+        pipeline.set_passes([PassID::DirectiveProcessing]);
+        {
+            mut init6ai: ProvisionSet = ProvisionSet::empty();
+            init6ai.mark(Provision::ASTValidated);
+            init6ai.mark(Provision::NamesResolved);
+            init6ai.mark(Provision::TypesResolved);
+            init6ai.mark(Provision::StructFieldsSynced);
+            pipeline.validate_with_initial(init6ai);
+        }
+        for (mut i: u32 = 0; i < n; i++) {
+            CompilerInstance::load_module_with_scope(ctx, ctx.intern_table, ast_buf, scope_buf, order[i], n);
+            ctx.provisions.clear();
+            ctx.provisions.mark(Provision::Tokens);
+            ctx.provisions.mark(Provision::AST);
+            ctx.provisions.mark(Provision::ASTValidated);
+            ctx.provisions.mark(Provision::NamesResolved);
+            ctx.provisions.mark(Provision::TypeDeclarations);
+            ctx.provisions.mark(Provision::FunctionSignatures);
+            ctx.provisions.mark(Provision::TemplatesRegistered);
+            ctx.provisions.mark(Provision::TypesResolved);
+            ctx.provisions.mark(Provision::StructFieldsSynced);
+            if (!pipeline.run_all(ctx)) {
+                return false;
+            }
+            pipeline.reset();
+        }
+        return true;
+    }
+
+    /// FunctionBodyTypeCheck (semantic analysis) for ALL modules, BEFORE
+    /// Monomorphization — the mono-after-sema flip.  Sema is the single source
+    /// of truth for resolved types; it needs every module's directives
+    /// processed (so layout flags are visible) but must precede mono so it, not
+    /// mono, resolves generic call return types.
+    typecheck_bodies(&this, ctx: CompilationContext*, pipeline: PassRegistry*,
+                     ast_buf: void*, scope_buf: void*) -> boolean {
+        const order: &u32[] = &ctx.module_graph.topo_order;
+        const n: u32 = order.length as u32;
+        pipeline.set_passes([PassID::FunctionBodyTypeCheck]);
+        {
+            mut init6sema: ProvisionSet = ProvisionSet::empty();
+            init6sema.mark(Provision::ASTValidated);
+            init6sema.mark(Provision::NamesResolved);
+            init6sema.mark(Provision::TypesResolved);
+            init6sema.mark(Provision::StructFieldsSynced);
+            init6sema.mark(Provision::DirectivesProcessed);
+            pipeline.validate_with_initial(init6sema);
+        }
+        for (mut i: u32 = 0; i < n; i++) {
+            CompilerInstance::load_module_with_scope(ctx, ctx.intern_table, ast_buf, scope_buf, order[i], n);
+            ctx.provisions.clear();
+            ctx.provisions.mark(Provision::Tokens);
+            ctx.provisions.mark(Provision::AST);
+            ctx.provisions.mark(Provision::ASTValidated);
+            ctx.provisions.mark(Provision::NamesResolved);
+            ctx.provisions.mark(Provision::TypeDeclarations);
+            ctx.provisions.mark(Provision::FunctionSignatures);
+            ctx.provisions.mark(Provision::TemplatesRegistered);
+            ctx.provisions.mark(Provision::TypesResolved);
+            ctx.provisions.mark(Provision::StructFieldsSynced);
+            ctx.provisions.mark(Provision::DirectivesProcessed);
+            if (!pipeline.run_all(ctx)) {
+                return false;
+            }
+            pipeline.reset();
+        }
+        return true;
+    }
+
+    /// Monomorphization + GenericExpressionResolution for ALL modules, now that
+    /// every template carries its final layout and sema has resolved the types
+    /// mono specializes.
+    monomorphize(&this, ctx: CompilationContext*, pipeline: PassRegistry*,
+                 ast_buf: void*, scope_buf: void*) -> boolean {
+        const order: &u32[] = &ctx.module_graph.topo_order;
+        const n: u32 = order.length as u32;
+        pipeline.set_passes([
+            PassID::Monomorphization,
+            PassID::GenericExpressionResolution,
+        ]);
+        {
+            mut initial6a: ProvisionSet = ProvisionSet::empty();
+            initial6a.mark(Provision::ASTValidated);
+            initial6a.mark(Provision::NamesResolved);
+            initial6a.mark(Provision::TypesResolved);
+            initial6a.mark(Provision::StructFieldsSynced);
+            initial6a.mark(Provision::DirectivesProcessed);
+            pipeline.validate_with_initial(initial6a);
+        }
+
+        for (mut i: u32 = 0; i < n; i++) {
+            CompilerInstance::load_module_with_scope(ctx, ctx.intern_table, ast_buf, scope_buf, order[i], n);
+            ctx.provisions.clear();
+            ctx.provisions.mark(Provision::Tokens);
+            ctx.provisions.mark(Provision::AST);
+            ctx.provisions.mark(Provision::ASTValidated);
+            ctx.provisions.mark(Provision::NamesResolved);
+            ctx.provisions.mark(Provision::TypeDeclarations);
+            ctx.provisions.mark(Provision::FunctionSignatures);
+            ctx.provisions.mark(Provision::TemplatesRegistered);
+            ctx.provisions.mark(Provision::TypesResolved);
+            ctx.provisions.mark(Provision::StructFieldsSynced);
+            ctx.provisions.mark(Provision::DirectivesProcessed);
+            if (!pipeline.run_all(ctx)) {
+                return false;
+            }
+            pipeline.reset();
+        }
+        return true;
+    }
+
+    /// Spec routing: send every specialization mono created to its
+    /// DETERMINISTIC owner module (the template's defining module) and
+    /// register + inject it there, so a spec's object-file home is a function
+    /// of its template, not of which module first demanded it.  Each owner
+    /// module is loaded as `ctx` so AST placement and DeclarationIndex
+    /// ownership stay consistent.  Runs while still in bootstrap mode so spec
+    /// registration can fall back to the arena.
+    route_specializations(&this, ctx: CompilationContext*,
+                          ast_buf: void*, scope_buf: void*) -> boolean {
+        const order: &u32[] = &ctx.module_graph.topo_order;
+        const n: u32 = order.length as u32;
+        for (mut i: u32 = 0; i < n; i++) {
+            CompilerInstance::load_module_with_scope(ctx, ctx.intern_table, ast_buf, scope_buf, order[i], n);
+            if (!SpecializationPasses::route_specializations_to_owners(ctx).success) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /// Release the per-module AST / scope buffers allocated by
