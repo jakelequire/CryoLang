@@ -4,18 +4,19 @@
 /// ANSI colors, source snippets, caret underlines, secondary spans, child
 /// diagnostics, and suggestions.
 ///
-/// Output goes to a configurable `FILE*` (`DiagRenderer::out`).  The default
-/// is `g_stderr`, which keeps stdout clean for LSP/JSON-RPC.  `render_to_string`
-/// swaps in an `open_memstream` buffer so the language server can embed the
-/// full rendered report in an LSP diagnostic's `message`.
+/// Output goes through `Utils::DiagSink` over `io::Write` (`DiagRenderer::out`
+/// is the discriminator).  The default (`out == null`) is the process's stderr,
+/// written unbuffered via fd 2, which keeps stdout clean for LSP/JSON-RPC.
+/// `render_to_string` points `out` at a `String` buffer so the language server
+/// can embed the full rendered report in an LSP diagnostic's `message`.
 
 namespace Compiler::Diag::Renderer;
-import ffi::libc;
 
 import Compiler::Diag;
 import Compiler::Diag::{ Severity, SourceSpan, SpanLabel, Suggestion, Diagnostic };
 import Utils;
 import Utils::SyntaxHighlighter;
+import Utils::DiagSink;
 import std::core::{ option, slice };
 import std::io::stdio;
 import std::env;
@@ -145,11 +146,10 @@ type struct RenderConfig {
 
 /// Renders diagnostics with source snippets and (optionally) ANSI colors.
 ///
-/// `out` is the destination `FILE*`.  When it is `null` the renderer
-/// writes to `g_stderr` - resolved lazily via `out_stream()` because
-/// `g_stderr` is itself lazily initialised and may still be null when the
-/// renderer is constructed.  `render_to_string` temporarily points `out`
-/// at an `open_memstream` buffer.
+/// `out` is the `DiagSink` discriminator: `null` writes to the process's
+/// stderr (fd 2, unbuffered); a non-null value is the `String*` buffer that
+/// `render_to_string` temporarily points it at.  Every write goes through
+/// `Utils::DiagSink`, which is `io::Write`-based - no `FILE*` involved.
 type struct DiagRenderer {
     config:          RenderConfig;
     cached_files:    string[];
@@ -165,16 +165,6 @@ type struct DiagRenderer {
             file_index:      HashMap<string, i64>::new(),
             out:             null,
         };
-    }
-
-    /// Resolve the destination stream.  `null` means "the process-wide
-    /// stderr handle"; a non-null value is the in-memory buffer set up
-    /// by `render_to_string`.
-    out_stream(&this) -> void* {
-        if (this.out == null) {
-            return g_stderr;
-        }
-        return this.out;
     }
 
     /// The configured left-gutter prefix prepended to every structural
@@ -355,33 +345,35 @@ type struct DiagRenderer {
             if (ch == 96) {  // '`'
                 if (!in_code) {
                     if (colors_on) {
-                        libc::fprintf(out, "%s", bold);
+                        DiagSink::emit_raw(out, bold);
                     }
                     if (keep_ticks) {
-                        libc::fprintf(out, "%c", ch as i32);
+                        DiagSink::emit_byte(out, ch);
                     }
                     in_code = true;
                 } else {
                     if (keep_ticks) {
-                        libc::fprintf(out, "%c", ch as i32);
+                        DiagSink::emit_byte(out, ch);
                     }
                     if (colors_on) {
-                        libc::fprintf(out, "%s%s", reset, base_color);
+                        DiagSink::emit_raw(out, reset);
+                        DiagSink::emit_raw(out, base_color);
                     }
                     in_code = false;
                 }
                 i = i + 1;
                 continue;
             }
-            // Emit one byte verbatim - `%c` handles multi-byte UTF-8 by
-            // letting each lead/continuation byte flow through unchanged.
-            libc::fprintf(out, "%c", ch as i32);
+            // Emit one byte verbatim - a single UTF-8 lead/continuation byte
+            // flows through unchanged.
+            DiagSink::emit_byte(out, ch);
             i = i + 1;
         }
         if (in_code && colors_on) {
             // Unclosed backtick: best-effort reset so we don't leak
             // bold formatting into following lines.
-            libc::fprintf(out, "%s%s", reset, base_color);
+            DiagSink::emit_raw(out, reset);
+            DiagSink::emit_raw(out, base_color);
         }
     }
 
@@ -408,6 +400,39 @@ type struct DiagRenderer {
         };
     }
 
+    // Left-gutter emitters (the `<lead><n> |` margin column).  Factored out
+    // because the exact byte layout repeats ~15 times across the snippet,
+    // caret, secondary-label, and suggestion renderers.
+
+    /// Blank gutter (padded, no line number): `<lead><line_width spaces>
+    /// <blue>|<reset><tail>`.  `tail` is `" "` before a caret/source line or
+    /// `"\n"` for a bare margin.
+    emit_gutter_blank(&this, out: void*, line_width: u32, tail: string) -> void {
+        DiagSink::emit_raw(out, this.lead());
+        DiagSink::emit_pad(out, line_width as i32);
+        DiagSink::emit_raw(out, " ");
+        DiagSink::emit_raw(out, this.color_blue());
+        DiagSink::emit_raw(out, "|");
+        DiagSink::emit_raw(out, this.color_reset());
+        DiagSink::emit_raw(out, tail);
+    }
+
+    /// Numbered gutter: `<lead><num_pre><ln right-justified in line_width>
+    /// <reset> <blue>|<reset><tail>`.  `num_pre` is the ANSI prefix before the
+    /// number - grey for a context line, or bold+severity for the error line.
+    emit_gutter_num(&this, out: void*, num_pre: string, line_width: u32,
+                    ln: u32, tail: string) -> void {
+        DiagSink::emit_raw(out, this.lead());
+        DiagSink::emit_raw(out, num_pre);
+        DiagSink::emit_uint(out, ln as u64, line_width as i32);
+        DiagSink::emit_raw(out, this.color_reset());
+        DiagSink::emit_raw(out, " ");
+        DiagSink::emit_raw(out, this.color_blue());
+        DiagSink::emit_raw(out, "|");
+        DiagSink::emit_raw(out, this.color_reset());
+        DiagSink::emit_raw(out, tail);
+    }
+
 
     // Rendering
 
@@ -429,35 +454,19 @@ type struct DiagRenderer {
     /// suggestions - on hover or in the problems panel.
     ///
     /// No leading rule and no ANSI escapes: callers construct the
-    /// renderer with `RenderConfig::plain()`.  Falls back to the
-    /// one-line `Diagnostic::to_string()` form if the rendering stream
-    /// cannot be opened.
+    /// renderer with `RenderConfig::plain()`.
     ///
-    /// The stream-open and stream-drain steps live in per-OS free
-    /// helpers below (`open_render_stream` / `drain_render_stream`);
-    /// the method itself is OS-agnostic, which matters because
-    /// ConfigGating doesn't currently recurse into struct method
-    /// bodies to apply `![target(...)]`.  POSIX uses `open_memstream`
-    /// for an in-memory buffer; Windows uses `tmpfile()` + seek/read
-    /// since msvcrt has no equivalent.
+    /// Cross-platform with no `FILE*` at all: `this.out` is pointed at a
+    /// local `String` (the sink treats a non-null `out` as a `String*`
+    /// buffer), the body is rendered into it, and `out` is restored so the
+    /// renderer stays reusable for terminal output.
     render_to_string(mut &this, diag: Diagnostic) -> String {
-        mut buf: i8* = null;
-        mut size: u64 = 0;
-        const stream: void* = open_render_stream(&buf, &size);
-        if (stream == null) {
-            mut fallback: String = String::new();
-            fallback.push(diag.to_string());
-            return fallback;
-        }
-
-        // Redirect the body render at the rendering stream, then put
-        // `out` back so the renderer stays reusable for terminal output.
+        mut buf: String = String::new();
         const saved: void* = this.out;
-        this.out = stream;
-        this.render_body(diag);
+        this.out = (&buf) as void*;
+        this.render_body(&diag);
         this.out = saved;
-
-        return drain_render_stream(stream, buf, size);
+        return buf;
     }
 
     /// Render the diagnostic itself - header, snippet(s), secondary
@@ -465,7 +474,7 @@ type struct DiagRenderer {
     /// Shared by `render` (terminal) and `render_to_string` (language
     /// server).
     render_body(mut &this, diag: &Diagnostic) -> void {
-        const out: void* = this.out_stream();
+        const out: void* = this.out;
 
         // 1. Header line:  error[E0200]: message
         this.render_header(diag);
@@ -513,9 +522,11 @@ type struct DiagRenderer {
             const div_bold:  string = this.color_bold();
             const div_grey:  string = this.color_grey();
             const div_reset: string = this.color_reset();
-            libc::fprintf(out,
-                "%s%s================================================================================%s\n",
-                div_bold, div_grey, div_reset);
+            DiagSink::emit_raw(out, div_bold);
+            DiagSink::emit_raw(out, div_grey);
+            DiagSink::emit_raw(out, "================================================================================");
+            DiagSink::emit_raw(out, div_reset);
+            DiagSink::emit_raw(out, "\n");
         }
 
         // 4. Children (notes, helps)
@@ -531,7 +542,7 @@ type struct DiagRenderer {
         }
 
         // Trailing blank line for separation
-        libc::fprintf(out, "\n");
+        DiagSink::emit_raw(out, "\n");
     }
 
     /// Print a horizontal rule of `=` characters tinted with the diagnostic
@@ -541,8 +552,11 @@ type struct DiagRenderer {
         const sev_color: string = this.severity_color(severity);
         const bold: string  = this.color_bold();
         const reset: string = this.color_reset();
-        libc::fprintf(this.out_stream(), "%s%s================================================================================%s\n",
-            bold, sev_color, reset);
+        DiagSink::emit_raw(this.out, bold);
+        DiagSink::emit_raw(this.out, sev_color);
+        DiagSink::emit_raw(this.out, "================================================================================");
+        DiagSink::emit_raw(this.out, reset);
+        DiagSink::emit_raw(this.out, "\n");
     }
 
     /// The inline caption to print under the caret for a single-snippet
@@ -584,21 +598,26 @@ type struct DiagRenderer {
         const bold: string = this.color_bold();
         const reset: string = this.color_reset();
         const white: string = this.color_white();
-        const out: void* = this.out_stream();
+        const out: void* = this.out;
 
         // Severity + code chip, then the headline.  The message body
         // goes through `print_message` so backticked code like `i32`
         // can be re-bolded after we drop out of the headline's white
         // base color.
-        libc::fprintf(out, "%s%s%s%s[%s]%s: %s%s",
-            bold, sev_color,
-            diag.severity.label(),
-            reset,
-            diag.code.format(),
-            reset,
-            bold, white);
+        DiagSink::emit_raw(out, bold);
+        DiagSink::emit_raw(out, sev_color);
+        DiagSink::emit_raw(out, diag.severity.label());
+        DiagSink::emit_raw(out, reset);
+        DiagSink::emit_raw(out, "[");
+        DiagSink::emit_raw(out, diag.code.format());
+        DiagSink::emit_raw(out, "]");
+        DiagSink::emit_raw(out, reset);
+        DiagSink::emit_raw(out, ": ");
+        DiagSink::emit_raw(out, bold);
+        DiagSink::emit_raw(out, white);
         this.print_message(out, diag.message, white);
-        libc::fprintf(out, "%s\n", reset);
+        DiagSink::emit_raw(out, reset);
+        DiagSink::emit_raw(out, "\n");
     }
 
     /// Render a source snippet with caret underline for the primary span.
@@ -607,12 +626,21 @@ type struct DiagRenderer {
         const reset: string = this.color_reset();
         const bold: string  = this.color_bold();
         const grey: string  = this.color_grey();
-        const out: void* = this.out_stream();
+        const out: void* = this.out;
 
         // Arrow line:  --> file:line:col
-        libc::fprintf(out, "%s%s%s-->%s %s:%u:%u\n",
-            this.lead(), bold, blue, reset,
-            span.file, span.start_line, span.start_col);
+        DiagSink::emit_raw(out, this.lead());
+        DiagSink::emit_raw(out, bold);
+        DiagSink::emit_raw(out, blue);
+        DiagSink::emit_raw(out, "-->");
+        DiagSink::emit_raw(out, reset);
+        DiagSink::emit_raw(out, " ");
+        DiagSink::emit_raw(out, span.file);
+        DiagSink::emit_raw(out, ":");
+        DiagSink::emit_int(out, span.start_line as u64);
+        DiagSink::emit_raw(out, ":");
+        DiagSink::emit_int(out, span.start_col as u64);
+        DiagSink::emit_raw(out, "\n");
 
         // Width of the line-number column, sized to the largest line we'll
         // render (start + trailing context).
@@ -632,20 +660,33 @@ type struct DiagRenderer {
         // Render context lines before the error
         for (mut ln: u32 = first_line; ln < span.start_line; ln++) {
             const line_text: string = this.get_line(span.file, ln);
-            libc::fprintf(out, "%s%s%*u%s %s|%s ",
-                this.lead(), grey, line_width, ln, reset,
-                blue, reset);
+            DiagSink::emit_raw(out, this.lead());
+            DiagSink::emit_raw(out, grey);
+            DiagSink::emit_uint(out, ln as u64, line_width as i32);
+            DiagSink::emit_raw(out, reset);
+            DiagSink::emit_raw(out, " ");
+            DiagSink::emit_raw(out, blue);
+            DiagSink::emit_raw(out, "|");
+            DiagSink::emit_raw(out, reset);
+            DiagSink::emit_raw(out, " ");
             this.print_source_line(out, line_text);
-            libc::fprintf(out, "\n");
+            DiagSink::emit_raw(out, "\n");
         }
 
         // Render the error line
         const error_line: string = this.get_line(span.file, span.start_line);
-        libc::fprintf(out, "%s%s%s%*u%s %s|%s ",
-            this.lead(), bold, blue, line_width, span.start_line, reset,
-            blue, reset);
+        DiagSink::emit_raw(out, this.lead());
+        DiagSink::emit_raw(out, bold);
+        DiagSink::emit_raw(out, blue);
+        DiagSink::emit_uint(out, span.start_line as u64, line_width as i32);
+        DiagSink::emit_raw(out, reset);
+        DiagSink::emit_raw(out, " ");
+        DiagSink::emit_raw(out, blue);
+        DiagSink::emit_raw(out, "|");
+        DiagSink::emit_raw(out, reset);
+        DiagSink::emit_raw(out, " ");
         this.print_source_line(out, error_line);
-        libc::fprintf(out, "\n");
+        DiagSink::emit_raw(out, "\n");
 
         // Render the caret underline
         this.render_underline(span, severity, message, line_width);
@@ -657,11 +698,9 @@ type struct DiagRenderer {
             if (line_text == "" && ln > span.start_line + 1) {
                 break;  // Stop at empty lines past the first one
             }
-            libc::fprintf(out, "%s%s%*u%s %s|%s ",
-                this.lead(), grey, line_width, ln, reset,
-                blue, reset);
+            this.emit_gutter_num(out, grey, line_width, ln, " ");
             this.print_source_line(out, line_text);
-            libc::fprintf(out, "\n");
+            DiagSink::emit_raw(out, "\n");
         }
 
         // Bottom margin
@@ -670,10 +709,7 @@ type struct DiagRenderer {
 
     /// Render a margin-only line:  "   |"
     render_margin(&this, line_width: u32) -> void {
-        const blue: string  = this.color_blue();
-        const reset: string = this.color_reset();
-        libc::fprintf(this.out_stream(), "%s%*s %s|%s\n",
-            this.lead(), line_width, "", blue, reset);
+        this.emit_gutter_blank(this.out, line_width, "\n");
     }
 
     /// Render an ellipsis line that separates non-adjacent line groups
@@ -681,7 +717,11 @@ type struct DiagRenderer {
     render_ellipsis(&this, line_width: u32) -> void {
         const blue: string  = this.color_blue();
         const reset: string = this.color_reset();
-        libc::fprintf(this.out_stream(), "%s%*s...%s\n", blue, line_width, "", reset);
+        DiagSink::emit_raw(this.out, blue);
+        DiagSink::emit_pad(this.out, line_width as i32);
+        DiagSink::emit_raw(this.out, "...");
+        DiagSink::emit_raw(this.out, reset);
+        DiagSink::emit_raw(this.out, "\n");
     }
 
     /// Width of the largest line number a snippet will render, used to
@@ -734,7 +774,7 @@ type struct DiagRenderer {
         const blue: string  = this.color_blue();
         const reset: string = this.color_reset();
         const bold: string  = this.color_bold();
-        const out: void* = this.out_stream();
+        const out: void* = this.out;
 
         const primary_span: SourceSpan = diag.span;
         const labels: SpanLabel[] = this.collect_same_file_labels(diag);
@@ -755,9 +795,18 @@ type struct DiagRenderer {
         const line_width: u32 = this.line_number_width(max_line);
 
         // Header arrow:  --> file:line:col  (always anchored at primary)
-        libc::fprintf(out, "%s%s%s-->%s %s:%u:%u\n",
-            this.lead(), bold, blue, reset,
-            primary_span.file, primary_span.start_line, primary_span.start_col);
+        DiagSink::emit_raw(out, this.lead());
+        DiagSink::emit_raw(out, bold);
+        DiagSink::emit_raw(out, blue);
+        DiagSink::emit_raw(out, "-->");
+        DiagSink::emit_raw(out, reset);
+        DiagSink::emit_raw(out, " ");
+        DiagSink::emit_raw(out, primary_span.file);
+        DiagSink::emit_raw(out, ":");
+        DiagSink::emit_int(out, primary_span.start_line as u64);
+        DiagSink::emit_raw(out, ":");
+        DiagSink::emit_int(out, primary_span.start_col as u64);
+        DiagSink::emit_raw(out, "\n");
 
         this.render_margin(line_width);
 
@@ -810,7 +859,7 @@ type struct DiagRenderer {
         const reset: string = this.color_reset();
         const grey: string  = this.color_grey();
         const bold: string  = this.color_bold();
-        const out: void* = this.out_stream();
+        const out: void* = this.out;
 
         for (mut ln: u32 = start_line; ln <= end_line; ln++) {
             const line_text: string = this.get_line(file, ln);
@@ -830,22 +879,26 @@ type struct DiagRenderer {
                 // group). If we've actually run off the file end, the
                 // caller already bounded us by max_line, so this is
                 // safe.
-                libc::fprintf(out, "%s%s%*u%s %s|%s\n",
-                    this.lead(), grey, line_width, ln, reset, blue, reset);
+                this.emit_gutter_num(out, grey, line_width, ln, "\n");
                 continue;
             }
 
             if (has_label) {
-                libc::fprintf(out, "%s%s%s%*u%s %s|%s ",
-                    this.lead(), bold, blue, line_width, ln, reset,
-                    blue, reset);
+                DiagSink::emit_raw(out, this.lead());
+                DiagSink::emit_raw(out, bold);
+                DiagSink::emit_raw(out, blue);
+                DiagSink::emit_uint(out, ln as u64, line_width as i32);
+                DiagSink::emit_raw(out, reset);
+                DiagSink::emit_raw(out, " ");
+                DiagSink::emit_raw(out, blue);
+                DiagSink::emit_raw(out, "|");
+                DiagSink::emit_raw(out, reset);
+                DiagSink::emit_raw(out, " ");
             } else {
-                libc::fprintf(out, "%s%s%*u%s %s|%s ",
-                    this.lead(), grey, line_width, ln, reset,
-                    blue, reset);
+                this.emit_gutter_num(out, grey, line_width, ln, " ");
             }
             this.print_source_line(out, line_text);
-            libc::fprintf(out, "\n");
+            DiagSink::emit_raw(out, "\n");
 
             if (has_label) {
                 this.render_labels_for_line(labels, file, ln, severity, line_width);
@@ -920,7 +973,7 @@ type struct DiagRenderer {
         const reset: string = this.color_reset();
         const bold:  string = this.color_bold();
         const sev_color: string = this.severity_color(severity);
-        const out: void* = this.out_stream();
+        const out: void* = this.out;
 
         const line_text: string = this.get_line(file, line_num);
 
@@ -935,13 +988,13 @@ type struct DiagRenderer {
 
         // Underline row.  Walk cells 1..max(left_ve, right_ve) and pick
         // the glyph for each cell; primary wins inside an overlap zone.
-        libc::fprintf(out, "%s%*s %s|%s ", this.lead(), line_width, "", blue, reset);
+        this.emit_gutter_blank(out, line_width, " ");
         mut max_cell: u32 = if (right_ve > left_ve) { right_ve } else { left_ve };
         for (mut cell: u32 = 1; cell < max_cell; cell++) {
             const in_left:  boolean = cell >= left_vs  && cell < left_ve;
             const in_right: boolean = cell >= right_vs && cell < right_ve;
             if (!in_left && !in_right) {
-                libc::fprintf(out, " ");
+                DiagSink::emit_raw(out, " ");
                 continue;
             }
             // Glyph + color preference: primary wins.
@@ -950,35 +1003,46 @@ type struct DiagRenderer {
             if (in_right && right.is_primary) { is_primary = true; }
             const glyph: string = if (is_primary) { "^" } else { "-" };
             const color: string = if (is_primary) { sev_color } else { cyan };
-            libc::fprintf(out, "%s%s%s%s", bold, color, glyph, reset);
+            DiagSink::emit_raw(out, bold);
+            DiagSink::emit_raw(out, color);
+            DiagSink::emit_raw(out, glyph);
+            DiagSink::emit_raw(out, reset);
         }
 
         // Append the rightmost label's caption inline.
         if (right.message != "") {
             const right_color: string = if (right.is_primary) { sev_color } else { cyan };
-            libc::fprintf(out, " %s%s", bold, right_color);
+            DiagSink::emit_raw(out, " ");
+            DiagSink::emit_raw(out, bold);
+            DiagSink::emit_raw(out, right_color);
             this.print_message(out, right.message, right_color);
-            libc::fprintf(out, "%s", reset);
+            DiagSink::emit_raw(out, reset);
         }
-        libc::fprintf(out, "\n");
+        DiagSink::emit_raw(out, "\n");
 
         // Connector row for the left label.
-        libc::fprintf(out, "%s%*s %s|%s ", this.lead(), line_width, "", blue, reset);
+        this.emit_gutter_blank(out, line_width, " ");
         const left_color: string = if (left.is_primary) { sev_color } else { cyan };
         for (mut cell: u32 = 1; cell < left_vs; cell++) {
-            libc::fprintf(out, " ");
+            DiagSink::emit_raw(out, " ");
         }
-        libc::fprintf(out, "%s%s|%s\n", bold, left_color, reset);
+        DiagSink::emit_raw(out, bold);
+        DiagSink::emit_raw(out, left_color);
+        DiagSink::emit_raw(out, "|");
+        DiagSink::emit_raw(out, reset);
+        DiagSink::emit_raw(out, "\n");
 
         // Caption row for the left label.
         if (left.message != "") {
-            libc::fprintf(out, "%s%*s %s|%s ", this.lead(), line_width, "", blue, reset);
+            this.emit_gutter_blank(out, line_width, " ");
             for (mut cell: u32 = 1; cell < left_vs; cell++) {
-                libc::fprintf(out, " ");
+                DiagSink::emit_raw(out, " ");
             }
-            libc::fprintf(out, "%s%s", bold, left_color);
+            DiagSink::emit_raw(out, bold);
+            DiagSink::emit_raw(out, left_color);
             this.print_message(out, left.message, left_color);
-            libc::fprintf(out, "%s\n", reset);
+            DiagSink::emit_raw(out, reset);
+            DiagSink::emit_raw(out, "\n");
         }
     }
 
@@ -991,7 +1055,7 @@ type struct DiagRenderer {
         const blue: string  = this.color_blue();
         const reset: string = this.color_reset();
         const bold: string  = this.color_bold();
-        const out: void* = this.out_stream();
+        const out: void* = this.out;
 
         const span: SourceSpan = label.span;
         // Visual cells, not bytes: a tab counts as up to 4 cells, a
@@ -1006,9 +1070,9 @@ type struct DiagRenderer {
             ul_len = DiagRenderer::byte_range_visual_width(line_text, span.start_col, span.end_col);
         }
 
-        libc::fprintf(out, "%s%*s %s|%s ", this.lead(), line_width, "", blue, reset);
+        this.emit_gutter_blank(out, line_width, " ");
         for (mut s: u32 = 0; s < ul_start; s++) {
-            libc::fprintf(out, " ");
+            DiagSink::emit_raw(out, " ");
         }
 
         const caption_color: string = if (label.is_primary) {
@@ -1018,16 +1082,19 @@ type struct DiagRenderer {
         };
         const caret_char: string = if (label.is_primary) { "^" } else { "-" };
 
-        libc::fprintf(out, "%s%s%s", bold, caption_color, caret_char);
+        DiagSink::emit_raw(out, bold);
+        DiagSink::emit_raw(out, caption_color);
+        DiagSink::emit_raw(out, caret_char);
         for (mut t: u32 = 1; t < ul_len; t++) {
-            libc::fprintf(out, "%s", caret_char);
+            DiagSink::emit_raw(out, caret_char);
         }
 
         if (label.message != "") {
-            libc::fprintf(out, " ");
+            DiagSink::emit_raw(out, " ");
             this.print_message(out, label.message, caption_color);
         }
-        libc::fprintf(out, "%s\n", reset);
+        DiagSink::emit_raw(out, reset);
+        DiagSink::emit_raw(out, "\n");
     }
 
     /// Render the caret underline below a source line.
@@ -1037,7 +1104,7 @@ type struct DiagRenderer {
         const reset: string     = this.color_reset();
         const bold: string      = this.color_bold();
         const sev_color: string = this.severity_color(severity);
-        const out: void* = this.out_stream();
+        const out: void* = this.out;
 
         // Calculate underline position in *visual cells* - see the
         // header comments at the top of this file for the byte-to-cell
@@ -1056,26 +1123,29 @@ type struct DiagRenderer {
 
         // Build the underline string: spaces + ^ + ~~~
         // Leading spaces for margin + pipe + gap
-        libc::fprintf(out, "%s%*s %s|%s ", this.lead(), line_width, "", blue, reset);
+        this.emit_gutter_blank(out, line_width, " ");
 
         // Spaces to reach the underline start
         for (mut s: u32 = 0; s < ul_start; s++) {
-            libc::fprintf(out, " ");
+            DiagSink::emit_raw(out, " ");
         }
 
         // The caret and tildes
-        libc::fprintf(out, "%s%s^", bold, sev_color);
+        DiagSink::emit_raw(out, bold);
+        DiagSink::emit_raw(out, sev_color);
+        DiagSink::emit_raw(out, "^");
         for (mut t: u32 = 1; t < ul_len; t++) {
-            libc::fprintf(out, "~");
+            DiagSink::emit_raw(out, "~");
         }
 
         // Inline label
         if (message != "") {
-            libc::fprintf(out, " ");
+            DiagSink::emit_raw(out, " ");
             this.print_message(out, message, sev_color);
         }
 
-        libc::fprintf(out, "%s\n", reset);
+        DiagSink::emit_raw(out, reset);
+        DiagSink::emit_raw(out, "\n");
     }
 
     /// Render a secondary span:  :: file:line:col  with cyan underline.
@@ -1085,12 +1155,21 @@ type struct DiagRenderer {
         const bold: string  = this.color_bold();
         const reset: string = this.color_reset();
         const grey: string  = this.color_grey();
-        const out: void* = this.out_stream();
+        const out: void* = this.out;
 
         // Secondary arrow:  :: file:line:col
-        libc::fprintf(out, "%s%s%s::%s %s:%u:%u\n",
-            this.lead(), bold, blue, reset,
-            label.span.file, label.span.start_line, label.span.start_col);
+        DiagSink::emit_raw(out, this.lead());
+        DiagSink::emit_raw(out, bold);
+        DiagSink::emit_raw(out, blue);
+        DiagSink::emit_raw(out, "::");
+        DiagSink::emit_raw(out, reset);
+        DiagSink::emit_raw(out, " ");
+        DiagSink::emit_raw(out, label.span.file);
+        DiagSink::emit_raw(out, ":");
+        DiagSink::emit_int(out, label.span.start_line as u64);
+        DiagSink::emit_raw(out, ":");
+        DiagSink::emit_int(out, label.span.start_col as u64);
+        DiagSink::emit_raw(out, "\n");
 
         const line_width: u32 = this.line_number_width(label.span.start_line);
 
@@ -1098,11 +1177,9 @@ type struct DiagRenderer {
 
         // Render the source line
         const line_text: string = this.get_line(label.span.file, label.span.start_line);
-        libc::fprintf(out, "%s%s%*u%s %s|%s ",
-            this.lead(), grey, line_width, label.span.start_line, reset,
-            blue, reset);
+        this.emit_gutter_num(out, grey, line_width, label.span.start_line, " ");
         this.print_source_line(out, line_text);
-        libc::fprintf(out, "\n");
+        DiagSink::emit_raw(out, "\n");
 
         // Cyan underline - visual cells, not bytes.
         const visual_start: u32 = DiagRenderer::byte_col_to_visual(line_text, label.span.start_col);
@@ -1116,19 +1193,22 @@ type struct DiagRenderer {
                 label.span.start_col, label.span.end_col);
         }
 
-        libc::fprintf(out, "%s%*s %s|%s ", this.lead(), line_width, "", blue, reset);
+        this.emit_gutter_blank(out, line_width, " ");
         for (mut s: u32 = 0; s < ul_start; s++) {
-            libc::fprintf(out, " ");
+            DiagSink::emit_raw(out, " ");
         }
-        libc::fprintf(out, "%s%s^", bold, cyan);
+        DiagSink::emit_raw(out, bold);
+        DiagSink::emit_raw(out, cyan);
+        DiagSink::emit_raw(out, "^");
         for (mut t: u32 = 1; t < ul_len; t++) {
-            libc::fprintf(out, "~");
+            DiagSink::emit_raw(out, "~");
         }
         if (label.message != "") {
-            libc::fprintf(out, " ");
+            DiagSink::emit_raw(out, " ");
             this.print_message(out, label.message, cyan);
         }
-        libc::fprintf(out, "%s\n", reset);
+        DiagSink::emit_raw(out, reset);
+        DiagSink::emit_raw(out, "\n");
 
         this.render_margin(line_width);
     }
@@ -1138,14 +1218,18 @@ type struct DiagRenderer {
         const bold: string  = this.color_bold();
         const reset: string = this.color_reset();
         const sev_color: string = this.severity_color(child.severity);
-        const out: void* = this.out_stream();
+        const out: void* = this.out;
 
         // Severity prefix; the message body goes through `print_message`
         // so backticked identifiers/types are bolded inline.
-        libc::fprintf(out, "%s%s%s%s%s: ",
-            this.lead(), bold, sev_color, child.severity.label(), reset);
+        DiagSink::emit_raw(out, this.lead());
+        DiagSink::emit_raw(out, bold);
+        DiagSink::emit_raw(out, sev_color);
+        DiagSink::emit_raw(out, child.severity.label());
+        DiagSink::emit_raw(out, reset);
+        DiagSink::emit_raw(out, ": ");
         this.print_message(out, child.message, "");
-        libc::fprintf(out, "\n");
+        DiagSink::emit_raw(out, "\n");
 
         if (child.span.has_location()) {
             this.load_source(child.span.file);
@@ -1175,7 +1259,7 @@ type struct DiagRenderer {
         const green: string = this.color_green();
         const reset: string = this.color_reset();
         const grey: string  = this.color_grey();
-        const out: void* = this.out_stream();
+        const out: void* = this.out;
 
         const applicability_tag: string =
             match (sug.applicability) {
@@ -1184,10 +1268,17 @@ type struct DiagRenderer {
                 Applicability::MaybeIncorrect    => { " [maybe]"              }
                 Applicability::Unspecified       => { ""                       }
             };
-        libc::fprintf(out, "%s%s%ssuggestion%s%s%s%s: ",
-            this.lead(), bold, green, reset, grey, applicability_tag, reset);
+        DiagSink::emit_raw(out, this.lead());
+        DiagSink::emit_raw(out, bold);
+        DiagSink::emit_raw(out, green);
+        DiagSink::emit_raw(out, "suggestion");
+        DiagSink::emit_raw(out, reset);
+        DiagSink::emit_raw(out, grey);
+        DiagSink::emit_raw(out, applicability_tag);
+        DiagSink::emit_raw(out, reset);
+        DiagSink::emit_raw(out, ": ");
         this.print_message(out, sug.message, "");
-        libc::fprintf(out, "\n");
+        DiagSink::emit_raw(out, "\n");
 
         for (mut i: i64 = 0; i < sug.parts.length; i++) {
             this.render_suggestion_part(sug.parts[i]);
@@ -1203,13 +1294,22 @@ type struct DiagRenderer {
         const grey:  string = this.color_grey();
         const reset: string = this.color_reset();
         const bold:  string = this.color_bold();
-        const out: void* = this.out_stream();
+        const out: void* = this.out;
 
         // If the part has no real location, fall back to a bare row.
         if (!part.span.has_location()) {
             if (part.replacement != "") {
-                libc::fprintf(out, "%s   %s|%s %s%s%s%s\n",
-                    this.lead(), blue, reset, bold, green, part.replacement, reset);
+                DiagSink::emit_raw(out, this.lead());
+                DiagSink::emit_raw(out, "   ");
+                DiagSink::emit_raw(out, blue);
+                DiagSink::emit_raw(out, "|");
+                DiagSink::emit_raw(out, reset);
+                DiagSink::emit_raw(out, " ");
+                DiagSink::emit_raw(out, bold);
+                DiagSink::emit_raw(out, green);
+                DiagSink::emit_raw(out, part.replacement);
+                DiagSink::emit_raw(out, reset);
+                DiagSink::emit_raw(out, "\n");
             }
             return;
         }
@@ -1219,8 +1319,17 @@ type struct DiagRenderer {
         if (orig_line == "") {
             // Source not available; degrade to the bare replacement row.
             if (part.replacement != "") {
-                libc::fprintf(out, "%s   %s|%s %s%s%s%s\n",
-                    this.lead(), blue, reset, bold, green, part.replacement, reset);
+                DiagSink::emit_raw(out, this.lead());
+                DiagSink::emit_raw(out, "   ");
+                DiagSink::emit_raw(out, blue);
+                DiagSink::emit_raw(out, "|");
+                DiagSink::emit_raw(out, reset);
+                DiagSink::emit_raw(out, " ");
+                DiagSink::emit_raw(out, bold);
+                DiagSink::emit_raw(out, green);
+                DiagSink::emit_raw(out, part.replacement);
+                DiagSink::emit_raw(out, reset);
+                DiagSink::emit_raw(out, "\n");
             }
             return;
         }
@@ -1280,11 +1389,18 @@ type struct DiagRenderer {
 
         // Patched source line, syntax-highlighted (replacement re-tokenises
         // cleanly inside the surrounding code).
-        libc::fprintf(out, "%s%s%s%*u%s %s|%s ",
-            this.lead(), bold, blue, line_width, part.span.start_line, reset,
-            blue, reset);
+        DiagSink::emit_raw(out, this.lead());
+        DiagSink::emit_raw(out, bold);
+        DiagSink::emit_raw(out, blue);
+        DiagSink::emit_uint(out, part.span.start_line as u64, line_width as i32);
+        DiagSink::emit_raw(out, reset);
+        DiagSink::emit_raw(out, " ");
+        DiagSink::emit_raw(out, blue);
+        DiagSink::emit_raw(out, "|");
+        DiagSink::emit_raw(out, reset);
+        DiagSink::emit_raw(out, " ");
         this.print_source_line(out, patched);
-        libc::fprintf(out, "\n");
+        DiagSink::emit_raw(out, "\n");
 
         // Underline row: green diff glyph under the affected portion of
         // the patched line.
@@ -1307,15 +1423,18 @@ type struct DiagRenderer {
                 part.span.start_col, part.span.start_col + repl_byte_len);
         }
 
-        libc::fprintf(out, "%s%*s %s|%s ", this.lead(), line_width, "", blue, reset);
+        this.emit_gutter_blank(out, line_width, " ");
         for (mut s: u32 = 0; s < ul_start; s++) {
-            libc::fprintf(out, " ");
+            DiagSink::emit_raw(out, " ");
         }
-        libc::fprintf(out, "%s%s%s", bold, green, glyph);
+        DiagSink::emit_raw(out, bold);
+        DiagSink::emit_raw(out, green);
+        DiagSink::emit_raw(out, glyph);
         for (mut t: u32 = 1; t < ul_len; t++) {
-            libc::fprintf(out, "%s", glyph);
+            DiagSink::emit_raw(out, glyph);
         }
-        libc::fprintf(out, "%s\n", reset);
+        DiagSink::emit_raw(out, reset);
+        DiagSink::emit_raw(out, "\n");
 
         if (patched != orig_line) {
             intrinsics::free(patched as void*);
@@ -1346,7 +1465,7 @@ type struct DiagRenderer {
         const grey:  string = this.color_grey();
         const reset: string = this.color_reset();
         const bold:  string = this.color_bold();
-        const out: void* = this.out_stream();
+        const out: void* = this.out;
 
         // Splice the first segment (everything before the first `\n` in
         // the replacement) into the anchor line.  This is the line that
@@ -1374,21 +1493,26 @@ type struct DiagRenderer {
             const prev_ln: u32 = part.span.start_line - 1;
             const prev_text: string = this.get_line(part.span.file, prev_ln);
             if (prev_text != "") {
-                libc::fprintf(out, "%s%s%*u%s %s|%s ",
-                    this.lead(), grey, line_width, prev_ln, reset,
-                    blue, reset);
+                this.emit_gutter_num(out, grey, line_width, prev_ln, " ");
                 this.print_source_line(out, prev_text);
-                libc::fprintf(out, "\n");
+                DiagSink::emit_raw(out, "\n");
             }
         }
 
         // Anchor line: line number kept, but gutter switched to `~` so
         // a casual reader sees the change marker even without colour.
-        libc::fprintf(out, "%s%s%s%*u%s %s~%s ",
-            this.lead(), bold, green, line_width, part.span.start_line, reset,
-            green, reset);
+        DiagSink::emit_raw(out, this.lead());
+        DiagSink::emit_raw(out, bold);
+        DiagSink::emit_raw(out, green);
+        DiagSink::emit_uint(out, part.span.start_line as u64, line_width as i32);
+        DiagSink::emit_raw(out, reset);
+        DiagSink::emit_raw(out, " ");
+        DiagSink::emit_raw(out, green);
+        DiagSink::emit_raw(out, "~");
+        DiagSink::emit_raw(out, reset);
+        DiagSink::emit_raw(out, " ");
         this.print_source_line(out, patched_first);
-        libc::fprintf(out, "\n");
+        DiagSink::emit_raw(out, "\n");
 
         // Underline the inserted slice on the anchor line.
         const first_seg_bytes: u32 = first_nl as u32;
@@ -1399,16 +1523,17 @@ type struct DiagRenderer {
             if (visual_start > 0) { ul_start = visual_start - 1; }
             const ul_len: u32 = DiagRenderer::byte_range_visual_width(patched_first,
                 part.span.start_col, part.span.start_col + first_seg_bytes);
-            libc::fprintf(out, "%s%*s %s|%s ",
-                this.lead(), line_width, "", blue, reset);
+            this.emit_gutter_blank(out, line_width, " ");
             for (mut s: u32 = 0; s < ul_start; s++) {
-                libc::fprintf(out, " ");
+                DiagSink::emit_raw(out, " ");
             }
-            libc::fprintf(out, "%s%s", bold, green);
+            DiagSink::emit_raw(out, bold);
+            DiagSink::emit_raw(out, green);
             for (mut t: u32 = 0; t < ul_len; t++) {
-                libc::fprintf(out, "~");
+                DiagSink::emit_raw(out, "~");
             }
-            libc::fprintf(out, "%s\n", reset);
+            DiagSink::emit_raw(out, reset);
+            DiagSink::emit_raw(out, "\n");
         }
 
         // Each subsequent segment is a new inserted line: blank line-
@@ -1426,10 +1551,16 @@ type struct DiagRenderer {
             const new_line: string = indent_str + seg;
 
             // Inserted-line row.
-            libc::fprintf(out, "%s%*s %s%s+%s ",
-                this.lead(), line_width, "", bold, green, reset);
+            DiagSink::emit_raw(out, this.lead());
+            DiagSink::emit_pad(out, line_width as i32);
+            DiagSink::emit_raw(out, " ");
+            DiagSink::emit_raw(out, bold);
+            DiagSink::emit_raw(out, green);
+            DiagSink::emit_raw(out, "+");
+            DiagSink::emit_raw(out, reset);
+            DiagSink::emit_raw(out, " ");
             this.print_source_line(out, new_line);
-            libc::fprintf(out, "\n");
+            DiagSink::emit_raw(out, "\n");
 
             // Underline the new line with `+` glyphs - positioned
             // under the *content* only, not the leading indent.  The
@@ -1449,16 +1580,17 @@ type struct DiagRenderer {
             } else {
                 0
             };
-            libc::fprintf(out, "%s%*s %s|%s ",
-                this.lead(), line_width, "", blue, reset);
+            this.emit_gutter_blank(out, line_width, " ");
             for (mut sp: u32 = 0; sp < indent_visual; sp++) {
-                libc::fprintf(out, " ");
+                DiagSink::emit_raw(out, " ");
             }
-            libc::fprintf(out, "%s%s", bold, green);
+            DiagSink::emit_raw(out, bold);
+            DiagSink::emit_raw(out, green);
             for (mut t: u32 = 0; t < seg_visual; t++) {
-                libc::fprintf(out, "+");
+                DiagSink::emit_raw(out, "+");
             }
-            libc::fprintf(out, "%s\n", reset);
+            DiagSink::emit_raw(out, reset);
+            DiagSink::emit_raw(out, "\n");
 
             seg_start = seg_end + 1;
         }
@@ -1471,11 +1603,9 @@ type struct DiagRenderer {
             const next_ln: u32 = part.span.end_line + ctx_i;
             const next_text: string = this.get_line(part.span.file, next_ln);
             if (next_text == "") { break; }
-            libc::fprintf(out, "%s%s%*u%s %s|%s ",
-                this.lead(), grey, line_width, next_ln, reset,
-                blue, reset);
+            this.emit_gutter_num(out, grey, line_width, next_ln, " ");
             this.print_source_line(out, next_text);
-            libc::fprintf(out, "\n");
+            DiagSink::emit_raw(out, "\n");
         }
 
         this.render_margin(line_width);
@@ -1486,24 +1616,34 @@ type struct DiagRenderer {
         const bold: string  = this.color_bold();
         const red: string   = this.color_red();
         const reset: string = this.color_reset();
-        const out: void* = this.out_stream();
+        const out: void* = this.out;
 
         if (error_count > 0) {
-            libc::fprintf(out, "%s%saborting due to %u error%s",
-                bold, red, error_count,
-                if (error_count == 1) { "" } else { "s" });
+            DiagSink::emit_raw(out, bold);
+            DiagSink::emit_raw(out, red);
+            DiagSink::emit_raw(out, "aborting due to ");
+            DiagSink::emit_int(out, error_count as u64);
+            DiagSink::emit_raw(out, " error");
+            DiagSink::emit_raw(out, if (error_count == 1) { "" } else { "s" });
             if (warning_count > 0) {
-                libc::fprintf(out, "; %u warning%s emitted",
-                    warning_count,
-                    if (warning_count == 1) { "" } else { "s" });
+                DiagSink::emit_raw(out, "; ");
+                DiagSink::emit_int(out, warning_count as u64);
+                DiagSink::emit_raw(out, " warning");
+                DiagSink::emit_raw(out, if (warning_count == 1) { "" } else { "s" });
+                DiagSink::emit_raw(out, " emitted");
             }
-            libc::fprintf(out, "%s\n", reset);
+            DiagSink::emit_raw(out, reset);
+            DiagSink::emit_raw(out, "\n");
         } else if (warning_count > 0) {
             const yellow: string = this.color_yellow();
-            libc::fprintf(out, "%s%s%u warning%s emitted%s\n",
-                bold, yellow, warning_count,
-                if (warning_count == 1) { "" } else { "s" },
-                reset);
+            DiagSink::emit_raw(out, bold);
+            DiagSink::emit_raw(out, yellow);
+            DiagSink::emit_int(out, warning_count as u64);
+            DiagSink::emit_raw(out, " warning");
+            DiagSink::emit_raw(out, if (warning_count == 1) { "" } else { "s" });
+            DiagSink::emit_raw(out, " emitted");
+            DiagSink::emit_raw(out, reset);
+            DiagSink::emit_raw(out, "\n");
         }
     }
 
@@ -1709,68 +1849,4 @@ type struct DiagRenderer {
         if (v_end <= v_start) { return 1; }
         return v_end - v_start;
     }
-}
-
-
-// Per-OS render-stream helpers
-//
-// `render_to_string` writes the diagnostic into a stream and then
-// recovers the bytes as a `String`.  POSIX has `open_memstream`, which
-// hands the buffer back through output pointers and updates them on
-// `fflush`/`fclose`.  msvcrt has nothing equivalent; the Windows side
-// uses `tmpfile()` instead (a FILE* tied to an auto-deleted temp
-// file) and reads the contents back at the end.
-//
-// These live as free functions, not methods, because ConfigGating
-// doesn't currently recurse into struct method bodies to apply
-// `![target(...)]` - so the per-OS divergence has to sit one level
-// out, where the pass can see it.
-
-/// Open a stream that buffers writes for later recovery.  Populates
-/// `*buf_out` / `*size_out` on POSIX (the open_memstream contract);
-/// leaves them untouched on Windows.  Returns null on failure.
-![target(unix)]
-private function open_render_stream(buf_out: i8**, size_out: u64*) -> void* {
-    return libc::open_memstream(buf_out, size_out);
-}
-
-![target(windows)]
-private function open_render_stream(buf_out: i8**, size_out: u64*) -> void* {
-    return libc::tmpfile();
-}
-
-/// Drain the rendering stream into a `String`, closing it and
-/// releasing any heap buffer the OS path allocated for us.
-///
-///   POSIX: `fflush` finalises the open_memstream-owned buffer;
-///   `*buf` then points at NUL-terminated bytes we copy and `free`.
-///
-///   Windows: rewind the tmpfile and read its contents back through
-///   `fread`.  No external buffer; `buf` / `size` are unused.
-![target(unix)]
-private function drain_render_stream(stream: void*, buf: i8*, size: u64) -> String {
-    libc::fflush(stream);
-    libc::fclose(stream);
-    mut result: String = String::new();
-    if (buf != null) {
-        result.push(buf as string);
-        intrinsics::free(buf as void*);
-    }
-    return result;
-}
-
-![target(windows)]
-private function drain_render_stream(stream: void*, buf: i8*, size: u64) -> String {
-    libc::fflush(stream);
-    // SEEK_SET = 0; rewind to the start to read what we just wrote.
-    libc::fseek(stream, 0i64, 0);
-    mut result: String = String::new();
-    mut chunk: u8[4096];
-    loop {
-        const n: u64 = libc::fread(&chunk[0] as void*, 1u64, 4096u64, stream);
-        if (n == 0u64) { break; }
-        result.push(Str::from_raw(&chunk[0], n));
-    }
-    libc::fclose(stream);
-    return result;
 }
