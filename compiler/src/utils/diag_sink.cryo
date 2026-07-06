@@ -1,0 +1,84 @@
+/// DiagSink
+///
+/// Output dispatch for the diagnostic renderer and the syntax highlighter,
+/// replacing the old `libc::fprintf(FILE*)` model with `io::Write`.
+///
+/// The `out` handle is the discriminator, matching the renderer's long-standing
+/// convention: `null` means "the process's stderr" (fd 2, written UNBUFFERED via
+/// `io::stdio::Stderr`, so diagnostics never lag behind an unbuffered
+/// `eprintf`-style summary), and a non-null pointer is a `String*` buffer - the
+/// destination `render_to_string` points it at so the language server can embed
+/// the full report.  Every write goes through `emit`; the typed helpers
+/// (`emit_byte` / `emit_pad` / `emit_uint` / `emit_int` / `emit_bytes`) reproduce
+/// the `%c` / `%*s` / `%*u` / `%u` / `%.*s` printf specifiers the renderer used.
+
+namespace Utils::DiagSink;
+
+import std::io::stdio;
+import std::io::traits;
+import std::core::result;
+import std::core::slice;
+import std::collections::str;
+import std::collections::string;
+
+type struct DiagSink {
+    /// Write `s` to the sink identified by `out`.
+    static emit(out: void*, s: Str) -> void {
+        if (out == null) {
+            mut e: Stderr = stdio::stderr();
+            match (e.write(s.as_bytes())) {
+                Result::Ok(_)  => {}
+                Result::Err(_) => {}
+            }
+        } else {
+            (out as String*).push(s);
+        }
+    }
+
+    /// Write a raw NUL-terminated C string (`%s`).
+    static emit_raw(out: void*, s: string) -> void {
+        DiagSink::emit(out, Str::new(s));
+    }
+
+    /// Write one byte verbatim (`%c`; a single UTF-8 lead/continuation byte
+    /// flows through unchanged).
+    static emit_byte(out: void*, b: i8) -> void {
+        mut one: u8[1];
+        one[0] = b as u8;
+        DiagSink::emit(out, Str::from_raw(&one[0], 1u64));
+    }
+
+    /// Write `n` spaces (the `%*s` gutter padding with an empty argument).
+    static emit_pad(out: void*, n: i32) -> void {
+        mut i: i32 = 0;
+        while (i < n) {
+            DiagSink::emit(out, Str::new(" "));
+            i += 1;
+        }
+    }
+
+    /// Write `value` in decimal, right-justified in `width` columns (`%*u`);
+    /// a `width` no wider than the digit count emits the number unpadded.
+    static emit_uint(out: void*, value: u64, width: i32) -> void {
+        mut buf: u8[24];
+        const n: u64 = value.to_decimal_buf(&buf[0]);
+        mut pad: i32 = width - (n as i32);
+        while (pad > 0) {
+            DiagSink::emit(out, Str::new(" "));
+            pad -= 1;
+        }
+        DiagSink::emit(out, Str::from_raw(&buf[0], n));
+    }
+
+    /// Write `value` in decimal, unpadded (`%u` / `%d` / `%llu`).
+    static emit_int(out: void*, value: u64) -> void {
+        mut buf: u8[24];
+        const n: u64 = value.to_decimal_buf(&buf[0]);
+        DiagSink::emit(out, Str::from_raw(&buf[0], n));
+    }
+
+    /// Write `len` bytes starting at `start` (the old `%.*s`).
+    static emit_bytes(out: void*, start: void*, len: u64) -> void {
+        DiagSink::emit(out, Str::from_raw(start as u8*, len));
+    }
+}
