@@ -5,9 +5,9 @@
 ///! creates concrete types in the TypeArena, and discovers transitive dependencies.
 ///!
 ///! After process_all() completes, every InstantiatedType has a resolved_type
-///! pointing to a concrete Struct/Enum/Class, and get_all_specialized_asts()
-///! returns the full set of specialized declarations ready for injection into
-///! the program AST.
+///! pointing to a concrete Struct/Enum/Class, and the finished specializations
+///! are exposed to `passes/specialization.cryo` through `spec_entry_at()` + the
+///! injection cursor for placement into the program AST.
 ///!
 ///! POST-REORDER (mono-after-sema): semantic analysis is authoritative and runs
 ///! FIRST.  It pins generic type arguments onto `CallExprNode.resolved_type_args`
@@ -86,10 +86,6 @@ type struct Monomorphizer {
     // Current module being processed (set by pass before calling process_all)
     current_module:    SymbolStr;
 
-    // Per-module consumption tracking (flat parallel arrays).
-    consumer_spec_indices: i64[];
-    consumer_modules:      u32[];
-
 
     /// Construct the orchestrator with its environment.  Collaborators + state are
     /// `null()`-initialized here; their back-pointers are set later by `wire()`
@@ -120,8 +116,6 @@ type struct Monomorphizer {
             in_progress:           HashMap<string, boolean>::new(),
             injection_cursor:      0,
             current_module:        SymbolStr::empty(),
-            consumer_spec_indices: [],
-            consumer_modules:      [],
         };
     }
 
@@ -687,50 +681,9 @@ type struct Monomorphizer {
         this.in_progress = HashMap<string, boolean>::new();
     }
 
-    /// Get only the specialized ASTs produced since the last call to this method.
-    /// Advances the injection cursor so each module receives only its new specs.
-    get_new_specialized_asts(mut &this) -> ASTNode*[] {
-        mut result: ASTNode*[] = [];
-        for (mut i: i64 = this.injection_cursor; i < this.state.spec_entries.length; i++) {
-            if (this.state.spec_entries[i].ast_node != null) {
-                result.push(this.state.spec_entries[i].ast_node);
-            }
-            for (mut j: i64 = 0; j < this.state.spec_entries[i].impl_nodes.length; j++) {
-                result.push(this.state.spec_entries[i].impl_nodes[j]);
-            }
-        }
-        this.injection_cursor = this.state.spec_entries.length;
-        return result;
-    }
-
-
-    // Result access
-
-    /// Get all specialized AST declarations for injection into the program.
-    get_all_specialized_asts(&this) -> ASTNode*[] {
-        mut result: ASTNode*[] = [];
-        for (mut i: i64 = 0; i < this.state.spec_entries.length; i++) {
-            if (this.state.spec_entries[i].ast_node != null) {
-                result.push(this.state.spec_entries[i].ast_node);
-            }
-            for (mut j: i64 = 0; j < this.state.spec_entries[i].impl_nodes.length; j++) {
-                result.push(this.state.spec_entries[i].impl_nodes[j]);
-            }
-        }
-        return result;
-    }
-
     /// Number of specializations completed.
     specialization_count(&this) -> i64 {
         return this.state.spec_entries.length;
-    }
-
-    /// Record that a module consumes (has injected) a specialization.
-    record_consuming_module(mut &this, spec_index: i64, module: SymbolStr) -> void {
-        if (spec_index >= 0 && spec_index < this.state.spec_entries.length) {
-            this.consumer_spec_indices.push(spec_index);
-            this.consumer_modules.push(module.id);
-        }
     }
 
     /// Count specializations not yet routed into an owner module by Phase 6a-iii.
@@ -741,18 +694,6 @@ type struct Monomorphizer {
         }
         return n;
     }
-
-    /// Get all modules that consume a specific specialization.
-    get_consuming_modules(&this, spec_index: i64) -> SymbolStr[] {
-        mut result: SymbolStr[] = [];
-        for (mut i: i64 = 0; i < this.consumer_spec_indices.length; i++) {
-            if (this.consumer_spec_indices[i] == spec_index) {
-                result.push(SymbolStr::from_id(this.consumer_modules[i]));
-            }
-        }
-        return result;
-    }
-
 
     // -- Accessors for passes/specialization.cryo (SpecInjector + routing) --
     // Replace the pass's former direct pokes at `spec_entries` / `injection_cursor`.
