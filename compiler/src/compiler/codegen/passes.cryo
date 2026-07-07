@@ -1789,9 +1789,90 @@ type struct EmitTarget {
 /// `run_multiprocess_emit`).  The producer fills the inputs + the module/context
 /// handles (each module in its OWN `LLVMContext`); `codegen_emit_job` emits it
 /// and sets `ok`; `CompilerInstance::emit_jobs_serial` disposes the handles.
+// ---------------------------------------------------------------------------
+// Per-module context auditor (gated by CRYO_CTX_AUDIT; zero cost otherwise).
+// Reports any LLVM type reachable from a module whose owning LLVMContext is not
+// the module's own — i.e. a type that leaked into the process-global context and
+// is therefore SHARED across every per-module context.  Such sharing is fatal
+// for the zero-copy threaded emitter (concurrent emit would race the shared
+// object's use-list), so this is the invariant check that guards it: a green run
+// means every module is fully self-contained and safe to emit in parallel.  It
+// found the `LLVMAppendBasicBlock` (global-context) leak; keep it as a guard
+// against reintroducing that whole class of bug.
+// ---------------------------------------------------------------------------
+function ctx_audit_type(ty: void*, mod_ctx: void*, seen: void*[]*,
+                        mod_name: string, whence: string) -> void {
+    if (ty == null) { return; }
+    for (mut i: i64 = 0; i < (*seen).length as i64; i++) {
+        if ((*seen)[i] == ty) { return; }
+    }
+    (*seen).push(ty);
+    if (llvm::LLVMGetTypeContext(ty) != mod_ctx) {
+        const ts: string = llvm::LLVMPrintTypeToString(ty) as string;
+        fmt::eprintln(f"[ctxaudit] {mod_name}: FOREIGN-CTX type via {whence}: {ts}");
+        return;
+    }
+    const kind: i32 = llvm::LLVMGetTypeKind(ty);
+    if (kind == 10) {                       // Struct
+        const n: u32 = llvm::LLVMCountStructElementTypes(ty);
+        for (mut e: u32 = 0; e < n; e++) {
+            ctx_audit_type(llvm::LLVMStructGetTypeAtIndex(ty, e), mod_ctx, seen, mod_name, whence);
+        }
+    } else if (kind == 11 || kind == 13) {  // Array / Vector
+        ctx_audit_type(llvm::LLVMGetElementType(ty), mod_ctx, seen, mod_name, whence);
+    } else if (kind == 9) {                 // Function (return type only)
+        ctx_audit_type(llvm::LLVMGetReturnType(ty), mod_ctx, seen, mod_name, whence);
+    }
+}
+
+function ctx_audit_module(module_raw: void*, mod_name: string) -> void {
+    const mod_ctx: void* = llvm::LLVMGetModuleContext(module_raw);
+    mut seen: void*[] = [];
+    mut g: void* = llvm::LLVMGetFirstGlobal(module_raw);
+    while (g != null) {
+        ctx_audit_type(llvm::LLVMGlobalGetValueType(g), mod_ctx, &seen, mod_name, "global-valtype");
+        const init: void* = llvm::LLVMGetInitializer(g);
+        if (init != null) {
+            ctx_audit_type(llvm::LLVMTypeOf(init), mod_ctx, &seen, mod_name, "global-init");
+        }
+        g = llvm::LLVMGetNextGlobal(g);
+    }
+    mut f: void* = llvm::LLVMGetFirstFunction(module_raw);
+    while (f != null) {
+        ctx_audit_type(llvm::LLVMGlobalGetValueType(f), mod_ctx, &seen, mod_name, "fn-type");
+        mut bb: void* = llvm::LLVMGetFirstBasicBlock(f);
+        while (bb != null) {
+            mut inst: void* = llvm::LLVMGetFirstInstruction(bb);
+            while (inst != null) {
+                ctx_audit_type(llvm::LLVMTypeOf(inst), mod_ctx, &seen, mod_name, "inst-type");
+                const nops: i32 = llvm::LLVMGetNumOperands(inst);
+                for (mut k: i32 = 0; k < nops; k++) {
+                    const op: void* = llvm::LLVMGetOperand(inst, k as u32);
+                    if (op != null) {
+                        ctx_audit_type(llvm::LLVMTypeOf(op), mod_ctx, &seen, mod_name, "operand-type");
+                    }
+                }
+                inst = llvm::LLVMGetNextInstruction(inst);
+            }
+            bb = llvm::LLVMGetNextBasicBlock(bb);
+        }
+        f = llvm::LLVMGetNextFunction(f);
+    }
+}
+
 type struct EmitJob {
-    llvm_module:     void*;     // LLVMModuleRef, owned by this job
+    // ZERO-COPY emit: the producer hands the worker the LIVE module directly,
+    // in its OWN `LLVMContext`, plus a target machine built on the MAIN thread.
+    // Every module is fully self-contained in its own context (verified by the
+    // context auditor — no type leaks into the shared global context), so
+    // concurrent `LLVMTargetMachineEmitToFile` over disjoint modules touches no
+    // shared LLVM state.  The worker also allocates NO Cryo memory (it makes the
+    // raw LLVM emit call and defers error reporting to the main thread), so the
+    // compiler's single-threaded bump arena is never accessed off the main
+    // thread — no round-trip, no arena pause.
+    llvm_module:     void*;     // LLVMModuleRef (live), owned by this job
     llvm_context:    void*;     // its LLVMContextRef, owned by this job
+    tm:              void*;     // LLVMTargetMachineRef, built on the main thread
     emit_path:       string;
     emit_type:       LFileType;
     triple:          string;
@@ -1808,15 +1889,54 @@ type struct EmitJob {
 /// originally a thread entry point; kept as-is now that emission is serial
 /// in-process here and out-of-process for large builds.
 function codegen_emit_job(job: EmitJob*) -> void {
-    mut tm: LTargetMachine = LTargetMachine::create_target_machine_with_opt(
-        (*job).triple, (*job).opt_level as i32);
-    if (tm.is_valid()) {
-        const mod: LModule = LModule { raw: (*job).llvm_module };
-        (*job).ok = tm.emit_to_file(mod, (*job).emit_path, (*job).emit_type);
-        tm.dispose();
-    } else {
+    // Emit this module's live IR directly with its main-thread-built target
+    // machine.  Deliberately ALLOCATION-FREE on the Cryo side: it makes the raw
+    // LLVM emit call and, on error, disposes the LLVM message (libc, thread-safe)
+    // and just records `ok = false` — reporting is left to the main thread.  So
+    // a worker never touches the compiler's single-threaded bump arena, and the
+    // per-module context isolation makes the concurrent LLVM emit itself safe.
+    // The module, context, and target machine are disposed by the caller on the
+    // main thread after every worker has joined (LLVM disposal must not
+    // interleave with emit).
+    if ((*job).tm == null || (*job).llvm_module == null) {
         (*job).ok = false;
+        return;
     }
-    // The module + context are disposed by the caller
-    // (`CompilerInstance::emit_jobs_serial`), not here.
+    mut err: i8* = null;
+    const rc: i32 = llvm::LLVMTargetMachineEmitToFile(
+        (*job).tm, (*job).llvm_module, (*job).emit_path,
+        (*job).emit_type as i32, &err as void*);
+    if (err != null) { llvm::LLVMDisposeMessage(err as void*); }
+    (*job).ok = rc == 0;
+}
+
+/// Per-worker context for the IN-PROCESS THREADED object emitter
+/// (`CompilerInstance::emit_jobs_threaded`).  Each worker owns a disjoint,
+/// round-robin slice `[start, start+stride, start+2*stride, ...]` of a shared,
+/// already-finalized `EmitJob` array — disjoint indices mean no two workers
+/// ever touch the same job, so the only writes (`job.ok`) never alias and need
+/// no lock.  `jobs` is the array's stable base pointer: the producer stops
+/// pushing before any worker is spawned, so no realloc can move it mid-emit.
+type struct EmitWorkerCtx {
+    jobs:   EmitJob*;   // stable base of the finalized job array (not owned)
+    count:  i64;        // total job count
+    start:  u32;        // this worker's first index
+    stride: u32;        // number of workers (round-robin step)
+}
+
+/// Thread entry for the in-process threaded emitter.  A plain top-level
+/// function (not a lambda) so its body may freely call the generic LLVM
+/// wrappers inside `codegen_emit_job` — a lambda handed to the generic
+/// `Scope::spawn` cannot (see [[closure-generic-fn-limits]]).  Emits only this
+/// worker's round-robin slice; `init_native_target` already ran on the main
+/// thread during IR generation, and each `codegen_emit_job` builds its OWN
+/// target machine, so nothing here mutates process-global LLVM state.
+function emit_worker_entry(wc: EmitWorkerCtx*) -> void {
+    const cnt:    i64 = (*wc).count;
+    const stride: i64 = (*wc).stride as i64;
+    mut j: i64 = (*wc).start as i64;
+    while (j < cnt) {
+        codegen_emit_job(&((*wc).jobs)[j]);
+        j = j + stride;
+    }
 }

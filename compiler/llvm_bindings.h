@@ -134,6 +134,11 @@ LLVMTypeRef LLVMDoubleType(void);
 LLVMTypeRef LLVMVoidTypeInContext(LLVMContextRef C);
 LLVMTypeRef LLVMVoidType(void);
 int LLVMGetTypeKind(LLVMTypeRef Ty);  /* 0 = LLVMVoidTypeKind */
+/* Context-audit introspection: which LLVMContext owns a type, and a printable
+ * form.  Used by the codegen context auditor to detect a type that leaked into
+ * the global context (would be shared across per-module contexts). */
+LLVMContextRef LLVMGetTypeContext(LLVMTypeRef Ty);
+char          *LLVMPrintTypeToString(LLVMTypeRef Ty);
 LLVMTypeRef LLVMPointerType(LLVMTypeRef ElementType, unsigned AddressSpace);
 LLVMTypeRef LLVMPointerTypeInContext(LLVMContextRef C, unsigned AddressSpace);
 
@@ -259,6 +264,9 @@ LLVMValueRef LLVMConstGEP2(LLVMTypeRef Ty, LLVMValueRef ConstantVal,
 
 LLVMValueRef LLVMAddGlobal(LLVMModuleRef M, LLVMTypeRef Ty, const char *Name);
 LLVMValueRef LLVMGetNamedGlobal(LLVMModuleRef M, const char *Name);
+LLVMValueRef LLVMGetFirstGlobal(LLVMModuleRef M);
+LLVMValueRef LLVMGetNextGlobal(LLVMValueRef GlobalVar);
+LLVMValueRef LLVMGetInitializer(LLVMValueRef GlobalVar);
 void         LLVMSetInitializer(LLVMValueRef GlobalVar, LLVMValueRef ConstantVal);
 void         LLVMSetGlobalConstant(LLVMValueRef GlobalVar, LLVMBool IsConstant);
 void         LLVMSetUnnamedAddress(LLVMValueRef Global, int UnnamedAddr);
