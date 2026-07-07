@@ -721,7 +721,20 @@ type struct CompilerInstance {
         // IRGen on the first generic instantiation it tries to map.
         mut last_output: string = "";
 
-        if (base.lib.is_present()) {
+        // Compile-once, link-twice: when the project declares BOTH a `[lib]`
+        // and at least one `[[bin]]`, the bin's whole-program compile already
+        // emits every object the `[lib]` archive would contain (the bin's
+        // import closure covers the lib's, e.g. the `cryo` bin over the whole
+        // compiler `[lib]`).  Rather than run a second full `[lib]` compile,
+        // the FIRST bin derives `lib<lib.name>.a` from its own object set
+        // (minus its entry module) after it links — see
+        // `bundle_lib_from_bin` and `compile_project_with_ctx`.  The bin's
+        // compile is unchanged, so the executable stays byte-identical; only
+        // the redundant lib pass is dropped.  A `[lib]` with no `[[bin]]`
+        // (library-only project) still gets its own full compile below.
+        const derive_lib: boolean = base.lib.is_present() && base.bins.length > 0;
+
+        if (base.lib.is_present() && !derive_lib) {
             cdebug("[Compiler] Multi-target: building lib '%s' from %s\n",
                 base.lib.name, base.lib.source_dir);
             // Clone so `base` survives for the per-bin views below.
@@ -735,7 +748,11 @@ type struct CompilerInstance {
                 base.bins[i].name, base.bins[i].entry_point);
             // Clone `base` per iteration; make_bin_view consumes its first arg.
             const sel: BinTarget = base.bins[i];
-            const bin_view: ProjectConfig = CompilerInstance::make_bin_view(base.clone(), sel);
+            mut bin_view: ProjectConfig = CompilerInstance::make_bin_view(base.clone(), sel);
+            // Derive the `[lib]` archive from the first bin's objects.
+            if (derive_lib && i == 0) {
+                bin_view.bundle_lib_from_bin = base.lib.name;
+            }
             const r: CompilationResult = this.compile_project_with_config(bin_view);
             if (!r.success) { return r; }
             if (r.output_path.length() > 0) { last_output = r.output_path; }
@@ -2095,6 +2112,57 @@ type struct CompilerInstance {
                 const link_result: PassResult = CodegenPasses::run_linking(ctx);
                 if (!link_result.success) {
                     fmt::eprintf("error: linking failed\n");
+                }
+            }
+
+            // Compile-once, link-twice: when the multi-target driver tagged this
+            // bin to also produce a `[lib]` archive (`bundle_lib_from_bin`), bundle
+            // `lib<name>.a` from the objects this bin just linked, minus the entry
+            // module's object (so the library carries no `main`).  This reuses the
+            // bin's whole-program object set instead of a second full `[lib]`
+            // compile; the executable above is untouched (byte-identical).  The
+            // archive reflects exactly what links into the executable, so it may
+            // omit `[lib]`-only modules the bin's closure never reaches — an
+            // accepted trade-off (nothing links this archive; a missing symbol
+            // would surface as a loud link error, never a silent miscompile).
+            if (config.bundle_lib_from_bin.length() > 0
+                    && !ctx.diagnostics.has_errors()
+                    && ctx.project_config != null) {
+                // Identify the entry module's object to keep it out of the
+                // library archive (a library carries no `main`).  Match the
+                // module whose file_path ends with the bin's relative
+                // entry_point (`src/main.cryo`) — form-independent, unlike the
+                // strict path compare, so it works whether the loader stored an
+                // absolute or a relative path.
+                // cg_obj is indexed by TOPO POSITION; the module at position ti
+                // is modules[order[ti]] (see the codegen loop above).
+                mut entry_obj: string = "";
+                if (config.entry_point.length() > 0) {
+                    for (mut ti: u32 = 0; ti < n; ti++) {
+                        if (ctx.module_graph.modules[order[ti] as i64].file_path.ends_with(
+                                config.entry_point)) {
+                            entry_obj = cg_obj[ti as i64];
+                            break;
+                        }
+                    }
+                }
+                mut lib_objs: string[] = [];
+                for (mut oi: i64 = 0; oi < ctx.artifacts.object_files.length; oi++) {
+                    const o: string = ctx.artifacts.object_files[oi];
+                    if (o.length() == 0) { continue; }
+                    if (entry_obj.length() > 0 && o == entry_obj) { continue; }
+                    lib_objs.push(o);
+                }
+                const lib_archive: string = ctx.project_config.lib_archive_path(
+                    format("lib%s.a", config.bundle_lib_from_bin));
+                ProjectConfig::mkdir_p(ctx.project_config.output_dir);
+                const bres: PassResult = CodegenPasses::bundle_object_list(
+                    ctx, lib_archive, &lib_objs);
+                if (!bres.success) {
+                    fmt::eprintf("error: deriving %s from bin objects failed\n", lib_archive);
+                } else {
+                    cdebug("[Compiler] Compile-once: derived %s from %lld bin object(s)\n",
+                        lib_archive, lib_objs.length);
                 }
             }
             tm_link_end = Instant::now().as_nanos();
