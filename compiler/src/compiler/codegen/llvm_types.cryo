@@ -197,6 +197,35 @@ type struct LModule {
         llvm::LLVMDumpModule(this.raw);
     }
 
+    /// Write this module's bitcode to `path` for the multi-process object
+    /// emitter (a child process re-parses it and emits the `.o`).  Returns
+    /// true on success.
+    write_bitcode(&this, path: string) -> boolean {
+        return llvm::LLVMWriteBitcodeToFile(this.raw, path) == 0;
+    }
+
+    /// Parse a textual-or-bitcode IR file into a NEW module owned by `ctx`.
+    /// Returns a null LModule on failure.  `LLVMParseIRInContext` consumes the
+    /// file's memory buffer internally, so there is nothing to dispose on the
+    /// success path.
+    static parse_ir_file(path: string, ctx: LContext) -> LModule {
+        mut membuf: void* = null;
+        mut err: i8* = null;
+        if (llvm::LLVMCreateMemoryBufferWithContentsOfFile(
+                path, &membuf as void*, &err as void*) != 0) {
+            if (err != null) { llvm::LLVMDisposeMessage(err as void*); }
+            return LModule::null();
+        }
+        mut out_mod: void* = null;
+        mut perr: i8* = null;
+        if (llvm::LLVMParseIRInContext(
+                ctx.raw, membuf, &out_mod as void*, &perr as void*) != 0) {
+            if (perr != null) { llvm::LLVMDisposeMessage(perr as void*); }
+            return LModule::null();
+        }
+        return LModule { raw: out_mod };
+    }
+
     set_target_triple(&this, triple: string) -> void {
         llvm::LLVMSetTarget(this.raw, triple);
     }
@@ -334,6 +363,30 @@ public function dispose_codegen_context() -> void {
         llvm::LLVMContextDispose(g_codegen_context);
         g_codegen_context = null;
     }
+}
+
+/// Parallel-codegen: publish a fresh per-MODULE context WITHOUT disposing the
+/// prior one.  Unlike `set_codegen_context_new`, ownership of the previous
+/// context transfers to the caller (it has been captured in an in-flight emit
+/// job and will be disposed by the worker that emits it).  Disposing here would
+/// free a context a worker is still reading.  Pair every producer that calls
+/// this with `clear_codegen_context_ptr` once the final batch has joined.
+public function set_codegen_context_new_keep_prior() -> void {
+    g_codegen_context = llvm::LLVMContextCreate();
+}
+
+/// Parallel-codegen: the currently-published codegen context, captured into an
+/// emit job so the worker can dispose it after `emit_to_file`.
+public function current_codegen_context() -> void* {
+    return g_codegen_context;
+}
+
+/// Parallel-codegen: drop the global's pointer WITHOUT disposing.  Used after
+/// the last emit batch has joined — every per-module context was already
+/// disposed by its worker, so the dangling global must be nulled (not freed)
+/// before the target-end `dispose_codegen_context` runs, or it double-frees.
+public function clear_codegen_context_ptr() -> void {
+    g_codegen_context = null;
 }
 
 

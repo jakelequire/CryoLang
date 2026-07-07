@@ -35,9 +35,24 @@ import std::fmt;
 import std::fs::metadata;
 import std::fs::path;
 import std::env;
+import std::thread;
 import std::time::clock;
 import std::collections::string;
 import std::collections::str;
+
+// Default codegen worker count: the online CPU count.  Object emission is
+// parallelized by fanning each module out to a child `cryo __emit-obj` PROCESS
+// (see the codegen loop + `CodegenPasses::run_multiprocess_emit`): a process
+// boundary is required because in-process threading of LLVM codegen corrupts
+// process-global LLVM state (it crashed on both Linux and Windows).  The
+// multi-process path is byte-identical to serial and stable; it engages only
+// above `CODEGEN_MULTIPROC_MIN_MODULES` so small builds skip the spawn +
+// bitcode round-trip overhead.  `CRYO_CODEGEN_THREADS=N` overrides (1 = serial).
+function codegen_default_threads() -> u32 { return thread::available_parallelism(); }
+
+// Below this module count the bitcode round-trip + child-process spawn cost
+// outweighs the parallel-emit win, so codegen stays serial + in-process.
+const CODEGEN_MULTIPROC_MIN_MODULES: u32 = 16u32;
 
 type struct CompilerConfig {
     debug:              boolean;
@@ -1708,9 +1723,15 @@ type struct CompilerInstance {
             // byte-identity gate reads the resulting `<name>.ll`. Keep these
             // paths in lockstep with `ProjectConfig::ir_dir_for()`.
 
+            // Parallel per-module object emission (see
+            // .todo/plans/PARALLEL-CODEGEN.md).  The per-module pipeline now
+            // runs IR generation ONLY; object emission is split off so it can
+            // run on a worker pool.  IR generation stays SERIAL — it reads
+            // shared compiler state (arena, intern table, lazily-declared
+            // cross-module externs) — while each module's LLVM module + context
+            // is self-contained and emits independently.
             pipeline.set_passes([
                 PassID::IRGeneration,
-                PassID::ObjectEmission,
             ]);
             {
                 mut initial7: ProvisionSet = ProvisionSet::empty();
@@ -1726,25 +1747,75 @@ type struct CompilerInstance {
                 pipeline.validate_with_initial(initial7);
             }
 
+            const cg_threads: u32 = CompilerInstance::codegen_thread_count(n);
+
+            // Multi-process object emission.  When more than one worker is
+            // requested, each module's object is compiled by a SEPARATE child
+            // process (`cryo __emit-obj`) from bitcode the main process writes —
+            // in-process threading of LLVM codegen corrupts process-global LLVM
+            // state (crashes on BOTH OSes), so real parallelism has to cross a
+            // process boundary.  Needs this compiler's own path to re-invoke; if
+            // that can't be resolved, fall back to serial in-process emit.
+            mut multiproc: boolean = cg_threads > 1 && n >= CODEGEN_MULTIPROC_MIN_MODULES;
+            mut self_exe:  string = "";
+            if (multiproc) {
+                match (env::current_exe()) {
+                    Option::Some(s) => { self_exe = s.into_raw(); }
+                    Option::None    => { multiproc = false; }
+                }
+            }
+
+            // The per-TARGET codegen context (published before sema/mono) is
+            // superseded by per-MODULE contexts below; dispose it up front so
+            // the first `set_codegen_context_new_keep_prior` doesn't orphan it.
+            Compiler::Codegen::LLVMTypes::dispose_codegen_context();
+
+            // Per-topo-position object path to hand the linker ("" = nothing to
+            // register: a cached hit records its own path, an IRText/Asm/-o
+            // artifact isn't relinked, or the module failed).  Registering AFTER
+            // the whole loop, in topo order, keeps the linker's input order
+            // identical regardless of the order objects finish emitting.
+            mut cg_obj: string[] = [];
+            mut cg_failed: boolean = false;
+            for (mut r: u32 = 0; r < n; r++) { cg_obj.push(""); }
+
+            // Multi-process collection: parallel arrays of (bitcode, object)
+            // paths + topo position, one per module emitted out-of-process.
+            mut mp_bc:  string[] = [];
+            mut mp_obj: string[] = [];
+            mut mp_pos: u32[] = [];
+
+            // In-process serial fallback batch (used when `!multiproc`).
+            mut cg_jobs: EmitJob[] = [];
+            mut cg_pos:  u32[] = [];
+
             for (mut i: u32 = 0; i < n; i++) {
                 const _mi: ModuleInfo* = &ctx.module_graph.modules[order[i]];
                 const _mn: string = ctx.intern_table.resolve(_mi.name);
                 cdebug("[Compiler] Codegen: module %u/%u (%s)\n", i, n, _mn);
                 // Cached module: reuse the on-disk object instead of
-                // regenerating IR + emitting it.  The object path is the same
-                // deterministic location ObjectEmission would have written
-                // (`deps_dir_for(origin)/<mangled-namespace>.o`), and pushing
-                // it here — at this module's topo position — keeps the linker's
-                // object order byte-identical to a clean build.
+                // regenerating IR + emitting it.  Recorded at this topo
+                // position; registered with everything else below.
                 if (pm_active && pm_cached[order[i] as i64]) {
-                    const cobj: string = format("%s/%s.o",
+                    cg_obj[i as i64] = format("%s/%s.o",
                         ctx.project_config.deps_dir_for(
                             ModuleInfo::origin_subdir(_mi.origin, _mi.origin_name)),
                         Compiler::BuildManifest::Manifest::mangle_module(_mn));
-                    ctx.artifacts.register_object_file(cobj);
-                    cdebug("[Compiler] Codegen: reused cached object %s\n", cobj);
+                    cdebug("[Compiler] Codegen: reused cached object %s\n", cg_obj[i as i64]);
                     continue;
                 }
+
+                // Fresh per-module LLVM context — KEPT alive: its emit job owns
+                // it and disposes it after `emit_to_file`, so it must not be
+                // freed here (a concurrent worker may still be reading it).  The
+                // context-bound TypeRef->LLVMTypeRef cache is reset in lockstep
+                // (a ref minted in one context is invalid in the next).  Each
+                // `.o` is self-contained (types re-declared per module), so
+                // per-module contexts leave objects byte-identical — the
+                // selfhost byte-identity gate is the arbiter.
+                Compiler::Codegen::LLVMTypes::set_codegen_context_new_keep_prior();
+                Compiler::Codegen::TypeMap::TypeMapperCache::reset_shared_type_cache();
+
                 CompilerInstance::load_module_with_scope(
                     ctx, ctx.intern_table, ast_buf, scope_buf, order[i], n);
                 ctx.provisions.clear();
@@ -1763,58 +1834,153 @@ type struct CompilerInstance {
                 ctx.provisions.mark(Provision::BodiesTypeChecked);
                 ctx.provisions.mark(Provision::TypesLowered);
 
-                const pipeline_ok: boolean = pipeline.run_all(ctx);
+                const gen_ok: boolean = pipeline.run_all(ctx);
 
-                if (ctx.artifacts.ir.is_valid()) {
-                    const mod_info: ModuleInfo* = &ctx.module_graph.modules[order[i]];
-                    const mod_name: string = ctx.intern_table.resolve(mod_info.name);
-
-                    // Write .ll text file when --emit-llvm is set
-                    // (either via CLI flag or cryoconfig args).
-                    if (this.config.emit_llvm || config.emit_llvm) {
-                        const mn_len: u64 = mod_name.length();
-                        const mn_buf: i8* = intrinsics::malloc(mn_len + 1) as i8*;
-                        intrinsics::memcpy(mn_buf as void*, mod_name as void*, mn_len);
-                        mn_buf[mn_len] = 0;
-                        for (mut k: u64 = 0; k < mn_len; k++) {
-                            if (mn_buf[k] == ':') { mn_buf[k] = '_'; }
-                        }
-                        mut ir_dir: string = "build/target/release/local/ir";
-                        if (ctx.project_config != null) {
-                            ir_dir = ctx.project_config.ir_dir_for(
-                                ModuleInfo::origin_subdir(
-                                    mod_info.origin, mod_info.origin_name));
-                        }
-                        ProjectConfig::mkdir_p(ir_dir);
-                        const ll_path: string = format("%s/%s.ll", ir_dir, mn_buf as string);
-                        mut ll_err: i8* = null;
-                        const ll_ok: i32 = llvm::LLVMPrintModuleToFile(
-                            ctx.artifacts.ir.llvm_module, ll_path, &ll_err as void*);
-                        if (ll_ok != 0 && ll_err != null) {
-                            fmt::eprintln(f"warning: failed to write {ll_path}: {ll_err as string}");
-                            llvm::LLVMDisposeMessage(ll_err as void*);
-                        }
-                        intrinsics::free(mn_buf as void*);
-                    }
-
-                    if (pipeline_ok) {
-                        cdebug("[Compiler] Codegen: IR + obj for module %u (%s)\n", i, mod_name);
-                    } else {
-                        cdebug("[Compiler] Codegen: IR generated for module %u (%s)\n", i, mod_name);
-                    }
-                } else if (!pipeline_ok) {
+                if (!ctx.artifacts.ir.is_valid()) {
+                    // IR generation failed for this module.  The fresh context
+                    // has no module to emit; reclaim it now.
                     fmt::eprintln(f"error: codegen failed for module {i}");
+                    cg_failed = true;
+                    Compiler::Codegen::LLVMTypes::dispose_codegen_context();
+                    pipeline.reset();
+                    continue;
                 }
 
-                // Dispose the LLVM module to free LLVM global context memory.
-                // Without this, each module's LLVMModuleRef leaks and LLVM's
-                // internal type tables grow until they exhaust the stack.
-                if (ctx.artifacts.ir.is_valid()) {
-                    mut lmod: LModule = LModule { raw: ctx.artifacts.ir.llvm_module };
-                    lmod.dispose();
-                    ctx.artifacts.ir = IROutput::empty();
+                const mod_info: ModuleInfo* = &ctx.module_graph.modules[order[i]];
+                const mod_name: string = ctx.intern_table.resolve(mod_info.name);
+
+                // Write the `.ll` text dump while the module is still on the main
+                // thread (before it is handed to a worker), when --emit-llvm is
+                // set via CLI flag or cryoconfig args.
+                if (this.config.emit_llvm || config.emit_llvm) {
+                    const mn_len: u64 = mod_name.length();
+                    const mn_buf: i8* = intrinsics::malloc(mn_len + 1) as i8*;
+                    intrinsics::memcpy(mn_buf as void*, mod_name as void*, mn_len);
+                    mn_buf[mn_len] = 0;
+                    for (mut k: u64 = 0; k < mn_len; k++) {
+                        if (mn_buf[k] == ':') { mn_buf[k] = '_'; }
+                    }
+                    mut ir_dir: string = "build/target/release/local/ir";
+                    if (ctx.project_config != null) {
+                        ir_dir = ctx.project_config.ir_dir_for(
+                            ModuleInfo::origin_subdir(
+                                mod_info.origin, mod_info.origin_name));
+                    }
+                    ProjectConfig::mkdir_p(ir_dir);
+                    const ll_path: string = format("%s/%s.ll", ir_dir, mn_buf as string);
+                    mut ll_err: i8* = null;
+                    const ll_ok: i32 = llvm::LLVMPrintModuleToFile(
+                        ctx.artifacts.ir.llvm_module, ll_path, &ll_err as void*);
+                    if (ll_ok != 0 && ll_err != null) {
+                        fmt::eprintln(f"warning: failed to write {ll_path}: {ll_err as string}");
+                        llvm::LLVMDisposeMessage(ll_err as void*);
+                    }
+                    intrinsics::free(mn_buf as void*);
                 }
+
+                // Resolve WHERE/HOW to emit on the MAIN thread (needs ctx + the
+                // module graph).
+                const tgt: EmitTarget = CodegenPasses::resolve_emit_target(ctx);
+                if (tgt.is_ir_text || !tgt.should_register) {
+                    // An IR text dump, or an explicit `-o` Asm/Object artifact
+                    // for the entry module — rare, entry-only, never fanned out.
+                    // Emit in-process now and reclaim this module + context.
+                    CodegenPasses::run_object_emission(ctx);
+                    mut lmod0: LModule = LModule { raw: ctx.artifacts.ir.llvm_module };
+                    lmod0.dispose();
+                    ctx.artifacts.ir = IROutput::empty();
+                    Compiler::Codegen::LLVMTypes::dispose_codegen_context();
+                    pipeline.reset();
+                    continue;
+                }
+
+                if (multiproc) {
+                    // Serialize the module to bitcode and dispose it immediately
+                    // (one live context at a time — lower peak RSS than the
+                    // in-process batch), then hand its path to a child process.
+                    const bc_path: string = format("%s.bc", tgt.emit_path);
+                    mut lmbc: LModule = LModule { raw: ctx.artifacts.ir.llvm_module };
+                    const wrote: boolean = lmbc.write_bitcode(bc_path);
+                    lmbc.dispose();
+                    ctx.artifacts.ir = IROutput::empty();
+                    Compiler::Codegen::LLVMTypes::dispose_codegen_context();
+                    pipeline.reset();
+                    if (wrote) {
+                        mp_bc.push(bc_path);
+                        mp_obj.push(tgt.emit_path);
+                        mp_pos.push(i);
+                    } else {
+                        fmt::eprintln(f"error: codegen failed for module {i}");
+                        cg_failed = true;
+                    }
+                    continue;
+                }
+
+                // In-process serial emit: one job, flushed immediately (keeps a
+                // single live LLVM context, byte-identical to the old path).
+                cg_jobs.push(EmitJob {
+                    llvm_module:     ctx.artifacts.ir.llvm_module,
+                    llvm_context:    Compiler::Codegen::LLVMTypes::current_codegen_context(),
+                    emit_path:       tgt.emit_path,
+                    emit_type:       tgt.emit_type,
+                    triple:          CodegenPasses::effective_triple(ctx),
+                    opt_level:       ctx.opt_level,
+                    should_register: tgt.should_register,
+                    ok:              false
+                });
+                cg_pos.push(i);
+                ctx.artifacts.ir = IROutput::empty();
                 pipeline.reset();
+
+                CompilerInstance::emit_jobs_serial(&cg_jobs);
+                for (mut b: i64 = 0; b < cg_jobs.length as i64; b++) {
+                    const p: u32 = cg_pos[b];
+                    if (cg_jobs[b].ok) {
+                        cg_obj[p as i64] = cg_jobs[b].emit_path;
+                    } else {
+                        fmt::eprintln(f"error: codegen failed for module {p}");
+                        cg_failed = true;
+                    }
+                }
+                cg_jobs.clear();
+                cg_pos.clear();
+            }
+
+            // Fan the multi-process emit out to child processes, then record
+            // each object (verifying it exists so a crashed worker fails the
+            // build rather than silently dropping an object).
+            if (multiproc) {
+                mut mf_dir: string = "build";
+                if (ctx.project_config != null) {
+                    mf_dir = ctx.project_config.deps_dir_for("local");
+                }
+                ProjectConfig::mkdir_p(mf_dir);
+                const manifest: string = format("%s/.cryo_emit_manifest.txt", mf_dir);
+                const mp_triple: string = CodegenPasses::effective_triple(ctx);
+                const emit_ok: boolean = CodegenPasses::run_multiprocess_emit(
+                    &mp_bc, &mp_obj, mp_triple, ctx.opt_level, cg_threads,
+                    self_exe, manifest);
+                if (!emit_ok) { cg_failed = true; }
+                for (mut k: i64 = 0; k < mp_pos.length as i64; k++) {
+                    if (metadata::exists(Path::from_cstr(mp_obj[k]))) {
+                        cg_obj[mp_pos[k] as i64] = mp_obj[k];
+                    } else {
+                        fmt::eprintln(f"error: codegen failed for module {mp_pos[k]}");
+                        cg_failed = true;
+                    }
+                }
+            }
+
+            // The last per-module context was disposed above; NULL the global
+            // (do not dispose) before the target-end teardown, or it double-frees.
+            Compiler::Codegen::LLVMTypes::clear_codegen_context_ptr();
+
+            // Register every module's object in topo order — link-stable
+            // regardless of the order objects finished emitting.
+            for (mut i: u32 = 0; i < n; i++) {
+                if (cg_obj[i as i64].length() > 0) {
+                    ctx.artifacts.register_object_file(cg_obj[i as i64]);
+                }
             }
 
             tm_codegen_end = Instant::now().as_nanos();
@@ -2615,5 +2781,69 @@ type struct CompilerInstance {
         }
         fmt::printf("  %-28s %6lld.%lld ms  (%lld%%)\n",
             label, ms_x10 / 10i64, ms_x10 % 10i64, pct);
+    }
+
+    /// Parallel-codegen worker count.  `CRYO_CODEGEN_THREADS` overrides; 0/1
+    /// mean serial (the byte-identical fallback, kept for selfhost-diff
+    /// bisection and `--no-parallel`-style debugging).  The default is the
+    /// online CPU count, clamped to the module count so a small build never
+    /// oversubscribes.  A per-batch cap of `nthreads` in-flight modules is what
+    /// bounds LLVM-side memory (see the codegen loop).
+    static codegen_thread_count(module_count: u32) -> u32 {
+        mut n: u32 = codegen_default_threads();
+        match (env::var(Str::new("CRYO_CODEGEN_THREADS"))) {
+            Option::Some(v) => {
+                // Parse a leading unsigned count from the BORROWED view and let
+                // the owned String drop at the arm's end (same shape as
+                // `timing_enabled`) — no `into_raw`/`free` of the buffer.
+                const s: Str = v.as_str();
+                const len: u64 = s.length;
+                const p: u8* = s.as_ptr();
+                mut acc: u32 = 0;
+                mut got: boolean = false;
+                mut k: u64 = 0;
+                while (k < len) {
+                    const ch: u8 = p[k];
+                    if (ch >= 48 && ch <= 57) {
+                        acc = acc * 10 + ((ch - 48) as u32);
+                        got = true;
+                        k = k + 1;
+                    } else { break; }
+                }
+                if (got && acc >= 1) { n = acc; }
+            }
+            Option::None => { }
+        }
+        if (module_count > 0 && n > module_count) { n = module_count; }
+        if (n < 1) { n = 1; }
+        return n;
+    }
+
+    /// Emit a batch of ready modules' object files.  Each job carries its own
+    /// standalone LLVM module + context, so with `nthreads > 1` they emit
+    /// concurrently through `thread::Scope` (fork-join — every worker is joined
+    /// before this returns).  `nthreads <= 1` runs them inline (same code path,
+    /// no threads), so a serial build stays byte-identical.  On return each
+    /// job's `ok` reflects its emission and its module/context are disposed.
+    /// Emit a batch of ready modules' objects IN-PROCESS on the main thread,
+    /// then dispose each module + its context.  Used for the serial path (small
+    /// builds, or `CRYO_CODEGEN_THREADS=1`); large builds fan the emit out to
+    /// child processes instead (`CodegenPasses::run_multiprocess_emit`) — LLVM
+    /// codegen cannot be threaded in-process without corrupting global state.
+    static emit_jobs_serial(jobs: EmitJob[]*) -> void {
+        const cnt: i64 = (*jobs).length as i64;
+        for (mut j: i64 = 0; j < cnt; j++) {
+            codegen_emit_job(&(*jobs)[j]);
+        }
+        for (mut j: i64 = 0; j < cnt; j++) {
+            if ((*jobs)[j].llvm_module != null) {
+                mut m: LModule = LModule { raw: (*jobs)[j].llvm_module };
+                m.dispose();
+            }
+            if ((*jobs)[j].llvm_context != null) {
+                mut c: LContext = LContext { raw: (*jobs)[j].llvm_context };
+                c.dispose();
+            }
+        }
     }
 }
