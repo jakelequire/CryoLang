@@ -227,6 +227,11 @@ type struct ProjectConfig {
     profile:      string;
     no_std:       boolean;
     emit_llvm:    boolean;
+    /// `[compiler] codegen_threads = N` — worker count for parallel object
+    /// emission.  `-1` (unset) => the online CPU count; `1` forces serial
+    /// codegen.  The CLI `--codegen-threads=N` overrides this.  Never affects
+    /// emitted bytes (each object is compiled independently), only build speed.
+    codegen_threads: i64;
     /// `[experimental] cxx_ffi = true` — opt-in to consuming C++ vendor
     /// libraries (`import vendor::<lib>` whose registry entry is `cxx-headers`
     /// / `language = "c++"`). Off by default: a build that imports a C++
@@ -335,6 +340,7 @@ type struct ProjectConfig {
             profile:      "release",
             no_std:       false,
             emit_llvm:    false,
+            codegen_threads: -1,
             cxx_ffi:      false,
             project_root: ".",
             target_triple: "",
@@ -404,6 +410,7 @@ type struct ProjectConfig {
             profile:       this.profile,
             no_std:        this.no_std,
             emit_llvm:     this.emit_llvm,
+            codegen_threads: this.codegen_threads,
             cxx_ffi:       this.cxx_ffi,
             project_root:  this.project_root,
             target_triple: this.target_triple,
@@ -601,6 +608,9 @@ type struct ProjectConfig {
                         }
                         "no_std"    => { config.no_std    = ProjectConfig::parse_bool(val); }
                         "emit_llvm" => { config.emit_llvm = ProjectConfig::parse_bool(val); }
+                        "codegen_threads" => {
+                            config.codegen_threads = ProjectConfig::parse_codegen_threads(val);
+                        }
                         // Removed in the v1.0 schema:
                         "args" => {
                             config.error_count += ProjectConfig::report_removed_key("compiler", "args",
@@ -935,6 +945,26 @@ type struct ProjectConfig {
             "O3" | "o3" | "3" => { 3 }
             _                 => { 2 }
         };
+    }
+
+    /// Parse a `[compiler] codegen_threads` value into a worker count.
+    /// `"auto"` / empty => `-1` (use the online CPU count); `"off"` / `"serial"`
+    /// / `"false"` / `"no"` / `0` / `1` => `1` (serial codegen); a bare positive
+    /// integer => that many workers.  Unrecognized text => `-1` (auto).
+    static parse_codegen_threads(s: string) -> i64 {
+        if (s.length() == 0 || s == "auto") { return -1; }
+        if (s == "off" || s == "serial" || s == "false" || s == "no") { return 1; }
+        const len: i64 = s.length() as i64;
+        mut acc: i64 = 0;
+        mut got: boolean = false;
+        for (mut k: i64 = 0; k < len; k++) {
+            const ch: i64 = s[k] as i64;
+            if (ch >= 48 && ch <= 57) { acc = acc * 10 + (ch - 48); got = true; }
+            else { break; }
+        }
+        if (!got) { return -1; }
+        if (acc < 1) { return 1; }   // 0 => serial
+        return acc;
     }
 
     /// Parse a TOML-like string array value: `["a", "b", "c"]` -> ["a","b","c"].

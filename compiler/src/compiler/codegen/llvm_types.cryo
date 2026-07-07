@@ -1005,7 +1005,15 @@ type struct LType {
     }
 
     static const_struct(values: void*, count: u32, packed: boolean) -> LValue {
-        return LValue { raw: llvm::LLVMConstStruct(values, count, packed as i32) };
+        // MUST build in the current per-module context, not the implicit global
+        // one: the context-less `LLVMConstStruct` interns the anonymous struct
+        // constant in the GLOBAL LLVMContext, so the same constant would be
+        // shared across every module's supposedly-isolated context.  Emitting
+        // two such modules concurrently then races that shared constant's
+        // use-list (heap corruption inside LLVM).  `InContext` keeps every
+        // constant private to its module — the invariant parallel emit needs.
+        return LValue { raw: llvm::LLVMConstStructInContext(
+            LContext::current().raw, values, count, packed as i32) };
     }
 
     static const_named_struct(ty: LType, values: void*, count: u32) -> LValue {
@@ -1039,7 +1047,17 @@ type struct LBasicBlock {
     }
 
     static append(fn: LValue, name: string) -> LBasicBlock {
-        return LBasicBlock { raw: llvm::LLVMAppendBasicBlock(fn.raw, name) };
+        // MUST append in the current per-module context.  The context-less
+        // `LLVMAppendBasicBlock` is `LLVMAppendBasicBlockInContext(
+        // LLVMGetGlobalContext(), ...)` under the hood, which mints the block —
+        // and its `label` type plus the `void` terminators built into it — in
+        // the process-global context, shared across every module's private
+        // context.  Two such modules emitting concurrently then race that shared
+        // type's use-list (heap corruption inside LLVM).  `InContext` keeps every
+        // block private to its module — the last leak that blocked zero-copy
+        // threaded emit.
+        return LBasicBlock { raw: llvm::LLVMAppendBasicBlockInContext(
+            LContext::current().raw, fn.raw, name) };
     }
 
     get_terminator(&this) -> LValue {
