@@ -12,6 +12,8 @@ import std::fs::dir;
 import std::fs::path;
 import std::fs::file;
 import std::process::command;
+import std::process::child;
+import std::core::slice;
 
 import Compiler::Codegen;
 import Compiler::Codegen::{ LLVMTypes, TypeMap, Context };
@@ -596,31 +598,259 @@ type struct CodegenPasses {
     ///                                Linking pass picks it up and shells
     ///                                out to `cc` to produce the final
     ///                                executable at the override path.
+    /// Resolve WHERE and HOW this module's IR is emitted, WITHOUT touching
+    /// LLVM.  Split out of `run_object_emission` so the codegen producer
+    /// (instance.cryo) can compute the target on the producer side — it needs
+    /// `ctx`, `project_config`, and the module graph — and hand only the
+    /// resolved `{path, file_type, register}` triple to the emitter (a child
+    /// process for large builds, or the in-process serial path).  `is_ir_text`
+    /// flags the pure text-dump kind that bypasses the target machine entirely.
+    ///
+    /// In project mode the `-o PATH` override applies to the ENTRY module only
+    /// (a single-file build is a synthesized one-entry project whose stdlib
+    /// imports compile as real modules); non-entry modules fall back to the
+    /// per-origin `target/<profile>/<origin>/deps/<mod>.o` layout so the
+    /// Linking pass has a stable per-module input set.  Registration is skipped
+    /// for an explicit Asm/Object/IRText artifact (a user-facing file `cc` must
+    /// not re-link); Exe and the no-override case register their `.o`.
+    static resolve_emit_target(ctx: CompilationContext*) -> EmitTarget {
+        mut kind: OutputKind = ctx.output_kind;
+        if (ctx.project_config != null && !CodegenPasses::is_entry_module_active(ctx)) {
+            kind = OutputKind::None;
+        }
+        match (kind) {
+            OutputKind::IRText => {
+                return EmitTarget { is_ir_text: true,
+                    emit_path: ctx.output_path_override,
+                    emit_type: LFileType::Object, should_register: false };
+            }
+            OutputKind::Asm => {
+                return EmitTarget { is_ir_text: false,
+                    emit_path: ctx.output_path_override,
+                    emit_type: LFileType::Assembly, should_register: false };
+            }
+            OutputKind::Object => {
+                return EmitTarget { is_ir_text: false,
+                    emit_path: ctx.output_path_override,
+                    emit_type: LFileType::Object, should_register: false };
+            }
+            _ => {
+                return EmitTarget { is_ir_text: false,
+                    emit_path: CodegenPasses::legacy_obj_path(ctx),
+                    emit_type: LFileType::Object, should_register: true };
+            }
+        }
+    }
+
+    /// The effective target triple for this build (host triple unless a
+    /// cryoconfig `target` / CLI `--target` override is set).  Exposed so the
+    /// parallel-codegen producer can stamp each emit job with it on the main
+    /// thread — a worker must not recompute it (the resolver reads process
+    /// state that is only stable to read serially).
+    static effective_triple(ctx: CompilationContext*) -> string {
+        return LTargetMachine::resolve_effective_triple(ctx.target_triple);
+    }
+
+
+    // ---- multi-process object emitter: manifest scanning (child side) ------
+    // The manifest is a UTF-8 text file:
+    //   line 0            effective target triple
+    //   line 1            opt level (decimal)
+    //   line 2..          "<bitcode-path>\t<object-path>" per module, topo order
+    // These scanners malloc fresh copies and never free them — a child process
+    // is short-lived and exits, so leaking the parsed strings is fine and keeps
+    // the hot path allocation-simple.
+
+    /// Copy bytes from `*cursor` up to (not including) the next '\n' into a
+    /// fresh NUL-terminated string, then advance `*cursor` past the '\n'.
+    static scan_line(p: u8*, n: u64, cursor: u64*) -> string {
+        const start: u64 = *cursor;
+        mut i: u64 = start;
+        while (i < n && p[i] != 10u8) { i = i + 1u64; }
+        const len: u64 = i - start;
+        const buf: i8* = intrinsics::malloc(len + 1u64) as i8*;
+        intrinsics::memcpy(buf as void*, (p + start) as void*, len);
+        buf[len] = 0;
+        if (i < n) { i = i + 1u64; }
+        *cursor = i;
+        return buf as string;
+    }
+
+    /// Index of the first byte `b` in `s`, or -1.
+    static index_of_byte(s: string, b: u8) -> i64 {
+        const len: u64 = s.length();
+        mut i: u64 = 0u64;
+        while (i < len) {
+            if ((s[i] as u8) == b) { return i as i64; }
+            i = i + 1u64;
+        }
+        return -1i64;
+    }
+
+    /// `s[start .. start+len]` as a fresh NUL-terminated string.
+    static substr(s: string, start: u64, len: u64) -> string {
+        const buf: i8* = intrinsics::malloc(len + 1u64) as i8*;
+        intrinsics::memcpy(buf as void*, ((s as i8*) + start) as void*, len);
+        buf[len] = 0;
+        return buf as string;
+    }
+
+    /// Child-process entry (`cryo __emit-obj <manifest> <idx> <count>`): read
+    /// the manifest and emit the objects assigned to this worker (module line
+    /// `k` belongs to worker `k % count`, round-robin so large modules spread
+    /// across workers).  Returns 0 iff every assigned object emitted.
+    static run_emit_worker(manifest_path: string, worker_idx: u32,
+                           worker_count: u32) -> i32 {
+        mut content: String = String::new();
+        match (file::read_to_string(Path::from_cstr(manifest_path))) {
+            Result::Ok(s)  => { content = s; }
+            Result::Err(_) => {
+                fmt::eprintln(f"__emit-obj: cannot read manifest {manifest_path}");
+                return 1i32;
+            }
+        }
+        const view: Str = content.as_str();
+        const p: u8* = view.as_ptr();
+        const n: u64 = view.length;
+
+        mut cur: u64 = 0u64;
+        const triple: string = CodegenPasses::scan_line(p, n, &cur);
+        const opt_str: string = CodegenPasses::scan_line(p, n, &cur);
+        const opt: u32 = opt_str.parse_c_uint() as u32;
+
+        mut mod_idx: u32 = 0u32;
+        mut failures: i32 = 0i32;
+        while (cur < n) {
+            const line: string = CodegenPasses::scan_line(p, n, &cur);
+            if (line.length() == 0u64) { continue; }
+            if (mod_idx % worker_count == worker_idx) {
+                const tab: i64 = CodegenPasses::index_of_byte(line, 9u8);
+                if (tab >= 0i64) {
+                    const bc: string = CodegenPasses::substr(line, 0u64, tab as u64);
+                    const ol: string = CodegenPasses::substr(
+                        line, (tab + 1i64) as u64, line.length() - (tab as u64) - 1u64);
+                    if (!CodegenPasses::emit_object_from_bitcode(bc, ol, triple, opt)) {
+                        fmt::eprintln(f"__emit-obj: failed to emit {ol}");
+                        failures = failures + 1i32;
+                    }
+                }
+            }
+            mod_idx = mod_idx + 1u32;
+        }
+        return if (failures > 0i32) { 1i32 } else { 0i32 };
+    }
+
+    /// Parent side of the multi-process object emitter.  Writes the manifest,
+    /// spawns `worker_count` child `cryo __emit-obj` processes over it, and
+    /// waits for all of them.  Each module's object is emitted in a separate
+    /// PROCESS (own address space, own LLVM globals) — so there is no shared
+    /// LLVM state to race, which is what makes this safe where in-process
+    /// threading was not.  Returns true iff every worker exited successfully.
+    static run_multiprocess_emit(bc: string[]*, obj: string[]*, triple: string,
+                                 opt: u32, worker_count: u32, self_exe: string,
+                                 manifest_path: string) -> boolean {
+        // Manifest: triple, opt, then "<bc>\t<o>" per module in topo order.
+        mut mf: String = String::new();
+        mf.push(triple);            mf.push_byte(10u8);
+        mf.push(format("%u", opt)); mf.push_byte(10u8);
+        const cnt: i64 = (*bc).length as i64;
+        for (mut k: i64 = 0; k < cnt; k++) {
+            mf.push((*bc)[k]);  mf.push_byte(9u8);
+            mf.push((*obj)[k]); mf.push_byte(10u8);
+        }
+        match (file::write(Path::from_cstr(manifest_path),
+                           Slice<u8>::from_raw(mf.as_str().as_ptr(), mf.length()))) {
+            Result::Ok(_)  => { }
+            Result::Err(_) => {
+                fmt::eprintln("codegen: failed to write emit manifest");
+                return false;
+            }
+        }
+
+        // Spawn the workers (all concurrent), then wait for each.
+        mut children: Child[] = [];
+        mut w: u32 = 0u32;
+        while (w < worker_count) {
+            mut cmd: Command = Command::new(Str::new(self_exe));
+            cmd.arg(Str::new("__emit-obj"));
+            cmd.arg(Str::new(manifest_path));
+            cmd.arg(Str::new(format("%u", w)));
+            cmd.arg(Str::new(format("%u", worker_count)));
+            match (cmd.spawn()) {
+                Result::Ok(c)  => { children.push(c); }
+                Result::Err(_) => { fmt::eprintln("codegen: failed to spawn emit worker"); }
+            }
+            w = w + 1u32;
+        }
+
+        mut ok: boolean = true;
+        mut ci: i64 = 0i64;
+        while (ci < children.length as i64) {
+            match (children[ci].wait()) {
+                Result::Ok(st) => { if (!st.success()) { ok = false; } }
+                Result::Err(_) => { ok = false; }
+            }
+            ci = ci + 1i64;
+        }
+
+        // Reclaim the transient bitcode + manifest — pure inputs to the child
+        // emitters, regenerated every build.  Best-effort (ignore errors).
+        mut rk: i64 = 0i64;
+        while (rk < cnt) {
+            match (dir::remove_file(Path::from_cstr((*bc)[rk]))) {
+                Result::Ok(_)  => { }
+                Result::Err(_) => { }
+            }
+            rk = rk + 1i64;
+        }
+        match (dir::remove_file(Path::from_cstr(manifest_path))) {
+            Result::Ok(_)  => { }
+            Result::Err(_) => { }
+        }
+        return ok;
+    }
+
+    /// Child-process entry for the multi-process object emitter: parse a
+    /// module's bitcode from `bc_path` (written by the main process) in a FRESH
+    /// per-process LLVM context and emit its object to `o_path`.  Runs in its
+    /// own process, so there is no shared LLVM global state to race — the whole
+    /// point of going multi-process instead of multi-thread.  Returns true iff
+    /// the object was emitted.
+    static emit_object_from_bitcode(bc_path: string, o_path: string,
+                                    triple: string, opt_level: u32) -> boolean {
+        LTargetMachine::init_native_target();
+        const eff: string = LTargetMachine::resolve_effective_triple(triple);
+        const lctx: LContext = LContext::create();
+        mut m: LModule = LModule::parse_ir_file(bc_path, lctx);
+        if (!m.is_valid()) {
+            mut c0: LContext = lctx;
+            c0.dispose();
+            return false;
+        }
+        mut ok: boolean = false;
+        mut tm: LTargetMachine = LTargetMachine::create_target_machine_with_opt(
+            eff, opt_level as i32);
+        if (tm.is_valid()) {
+            ok = tm.emit_to_file(m, o_path, LFileType::Object);
+            tm.dispose();
+        }
+        m.dispose();
+        mut c: LContext = lctx;
+        c.dispose();
+        return ok;
+    }
+
     static run_object_emission(ctx: CompilationContext*) -> PassResult {
         if (!ctx.artifacts.ir.is_valid()) {
             return PassResult::ok();
         }
 
-        // In project mode the `-o PATH` override applies to the ENTRY
-        // module only.  A single-file build is a synthesized one-entry
-        // project whose stdlib imports compile as real modules; without
-        // this gate every std module would in turn overwrite the user's
-        // `-o foo.o`.  Non-entry modules behave as if no override were
-        // given (per-origin deps layout).
-        mut kind: OutputKind = ctx.output_kind;
-        if (ctx.project_config != null && !CodegenPasses::is_entry_module_active(ctx)) {
-            kind = OutputKind::None;
-        }
+        const target: EmitTarget = CodegenPasses::resolve_emit_target(ctx);
 
-        // IRText is the only kind that doesn't go through LLVM's
-        // target-machine emit path; it's a pure text dump of the
-        // module IR, no codegen needed.  Handle first to avoid
-        // creating a target machine we won't use.
-        match (kind) {
-            OutputKind::IRText => {
-                return CodegenPasses::emit_ir_text(ctx, ctx.output_path_override);
-            }
-            _ => { /* fall through */ }
+        // IRText is the only kind that doesn't go through LLVM's target-machine
+        // emit path; it's a pure text dump of the module IR.
+        if (target.is_ir_text) {
+            return CodegenPasses::emit_ir_text(ctx, target.emit_path);
         }
 
         // Resolve the effective triple here too; the object format
@@ -636,38 +866,13 @@ type struct CodegenPasses {
             return PassResult::failure(1);
         }
 
-        // Decide the emit path + LLVM file_type.  Asm and Object kinds
-        // route directly to the user's override.  Exe and the no-override
-        // case route to the per-origin `target/<profile>/<origin>/deps/<mod>.o`
-        // layout so the Linking pass has a stable per-module input set.
-        mut emit_path: string = "";
-        mut emit_type: LFileType = LFileType::Object;
-        match (kind) {
-            OutputKind::Asm => {
-                emit_path = ctx.output_path_override;
-                emit_type = LFileType::Assembly;
-            }
-            OutputKind::Object => {
-                emit_path = ctx.output_path_override;
-                emit_type = LFileType::Object;
-            }
-            _ => {
-                emit_path = CodegenPasses::legacy_obj_path(ctx);
-                emit_type = LFileType::Object;
-            }
-        }
-
         const mod: LModule = LModule { raw: ctx.artifacts.ir.llvm_module };
-        const success: boolean = tm.emit_to_file(mod, emit_path, emit_type);
+        const success: boolean = tm.emit_to_file(mod, target.emit_path, target.emit_type);
         tm.dispose();
 
         if (!success) {
             ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                format("failed to emit %s",
-                    match (kind) {
-                        OutputKind::Asm => { format("assembly file: %s", emit_path) }
-                        _               => { format("object file: %s", emit_path) }
-                    }));
+                format("failed to emit object file: %s", target.emit_path));
             return PassResult::failure(1);
         }
 
@@ -676,32 +881,19 @@ type struct CodegenPasses {
         // (`ctx.artifacts.linked.object_file_path = ...`) has historically
         // been a source of codegen bugs through multi-deref chains. Assign
         // a full `LinkedOutput` replacement instead.
-        ctx.artifacts.linked = LinkedOutput { object_file_path: emit_path };
+        ctx.artifacts.linked = LinkedOutput { object_file_path: target.emit_path };
 
         // Accumulate every module's object path so the linker pass can
         // invoke `cc` once over all of them at the end of Phase 7.
         // Route through `register_object_file`; directly calling
         // `.push()` on a multi-deref field chain has historically landed
         // on a temp copy (push-through-pointer codegen limitation).
-        //
-        // Skip registration for Asm/Object/IRText: those kinds emit a
-        // user-facing artifact (assembly text, object, IR text) that
-        // is NOT something `cc` should re-link.  Registering an .s/.ll
-        // here would feed it back into run_linking and corrupt the
-        // link command.  The legacy path and Exe kind both want the
-        // .o registered: Exe so the link step picks it up, legacy so
-        // multi-module project builds aggregate it.
-        match (kind) {
-            OutputKind::Asm    => { /* no register */ }
-            OutputKind::Object => { /* no register */ }
-            OutputKind::IRText => { /* unreachable: handled above */ }
-            _ => {
-                ctx.artifacts.register_object_file(emit_path);
-            }
+        if (target.should_register) {
+            ctx.artifacts.register_object_file(target.emit_path);
         }
 
         if (ctx.debug_mode) {
-            cdebug("[Codegen] Emitted: %s\n", emit_path);
+            cdebug("[Codegen] Emitted: %s\n", target.emit_path);
         }
 
         return PassResult::ok();
@@ -1574,4 +1766,57 @@ type struct CodegenPasses {
         const lc:  LinkerConfig = LinkerConfig::linker_config_for_triple(tri);
         return cfg.bin_artifact_path(ctx.mode.skip_user_main()).with_exe_suffix(lc.exe_suffix);
     }
+}
+
+
+// ===========================================================================
+// Parallel per-module object emission (see .todo/plans/PARALLEL-CODEGEN.md)
+// ===========================================================================
+
+/// Where + how a module's IR is emitted, resolved on the MAIN thread by
+/// `CodegenPasses::resolve_emit_target` (it needs `ctx` + the module graph)
+/// and consumed by both the serial `run_object_emission` and the parallel
+/// producer in instance.cryo.
+type struct EmitTarget {
+    is_ir_text:      boolean;   // pure IR text dump — no target machine
+    emit_path:       string;
+    emit_type:       LFileType; // Object / Assembly
+    should_register: boolean;   // feed this .o to the linker
+}
+
+/// One unit of IN-PROCESS serial object emission — the fallback path for small
+/// builds and `CRYO_CODEGEN_THREADS=1`; large builds emit out-of-process (see
+/// `run_multiprocess_emit`).  The producer fills the inputs + the module/context
+/// handles (each module in its OWN `LLVMContext`); `codegen_emit_job` emits it
+/// and sets `ok`; `CompilerInstance::emit_jobs_serial` disposes the handles.
+type struct EmitJob {
+    llvm_module:     void*;     // LLVMModuleRef, owned by this job
+    llvm_context:    void*;     // its LLVMContextRef, owned by this job
+    emit_path:       string;
+    emit_type:       LFileType;
+    triple:          string;
+    opt_level:       u32;
+    should_register: boolean;
+    ok:              boolean;   // result: emission succeeded
+}
+
+/// Emit ONE module's object file from its own standalone LLVM context (the
+/// in-process serial path).  Touches only LLVM state private to this job —
+/// never `ctx`, the arena, or the intern table.  The target machine is created
+/// per-job (cheap); `init_native_target` must already have run (it has, during
+/// IRGeneration).  A top-level function (not a method/lambda) because it was
+/// originally a thread entry point; kept as-is now that emission is serial
+/// in-process here and out-of-process for large builds.
+function codegen_emit_job(job: EmitJob*) -> void {
+    mut tm: LTargetMachine = LTargetMachine::create_target_machine_with_opt(
+        (*job).triple, (*job).opt_level as i32);
+    if (tm.is_valid()) {
+        const mod: LModule = LModule { raw: (*job).llvm_module };
+        (*job).ok = tm.emit_to_file(mod, (*job).emit_path, (*job).emit_type);
+        tm.dispose();
+    } else {
+        (*job).ok = false;
+    }
+    // The module + context are disposed by the caller
+    // (`CompilerInstance::emit_jobs_serial`), not here.
 }

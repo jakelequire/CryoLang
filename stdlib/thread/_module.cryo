@@ -614,14 +614,32 @@ function scope_trampoline<C>(arg: u8*) -> u32 { scope_body<C>(arg); return 0u32;
 /// Create an OS thread running `scope_trampoline<C>(arg)`, writing the
 /// joinable id/handle into `tbuf`. Returns 0 on success.
 ![target(unix)]
-private function os_create_scope_thread<C>(tbuf: u8*, arg: u8*) -> i32 {
+private function os_create_scope_thread<C>(tbuf: u8*, arg: u8*, stack_bytes: u64) -> i32 {
     const t: (u8*) -> u8* = scope_trampoline<C>;
-    return pthread_create(tbuf, null, t as void*, arg);
+    if (stack_bytes == 0u64) {
+        return pthread_create(tbuf, null, t as void*, arg);
+    }
+    mut attr: u8[56];
+    mut i: u64 = 0u64;
+    while (i < 56u64) { attr[i] = 0u8; i = i + 1u64; }
+    if (pthread_attr_init(&attr[0]) != 0) { return 11; }
+    if (pthread_attr_setstacksize(&attr[0], stack_bytes) != 0) {
+        pthread_attr_destroy(&attr[0]);
+        return 22;
+    }
+    const rc: i32 = pthread_create(tbuf, &attr[0], t as void*, arg);
+    pthread_attr_destroy(&attr[0]);
+    return rc;
 }
 ![target(windows)]
-private function os_create_scope_thread<C>(tbuf: u8*, arg: u8*) -> i32 {
+private function os_create_scope_thread<C>(tbuf: u8*, arg: u8*, stack_bytes: u64) -> i32 {
     const t: (u8*) -> u32 = scope_trampoline<C>;
-    const h: u8* = syscall::CreateThread(null, 0u64, t as void*, arg, 0u32, null);
+    // STACK_SIZE_PARAM_IS_A_RESERVATION (0x10000): treat `stack_bytes` as the
+    // reserve (committed lazily) rather than an eager commit, so a large worker
+    // stack costs address space, not resident memory.
+    mut flags: u32 = 0u32;
+    if (stack_bytes != 0u64) { flags = 65536u32; }
+    const h: u8* = syscall::CreateThread(null, stack_bytes, t as void*, arg, flags, null);
     if (h == null) { return 11; }
     *(tbuf as u64*) = h as u64;
     return 0;
@@ -645,11 +663,19 @@ private function os_create_scope_thread<C>(tbuf: u8*, arg: u8*) -> i32 {
 /// not the type system - is what keeps borrowed data alive; do not let a
 /// scope outlive what its threads point at.)
 type struct Scope {
-    tids: u64[];
+    tids:        u64[];
+    stack_bytes: u64;   // per-thread stack; 0 -> OS default
 
-    /// Create an empty scope.
+    /// Create an empty scope whose threads use the OS default stack size.
     static new() -> Scope {
-        return Scope { tids: [] };
+        return Scope { tids: [], stack_bytes: 0u64 };
+    }
+
+    /// Create a scope whose threads each get a `stack_bytes`-byte stack. Use
+    /// this for bodies that recurse deeply (e.g. driving LLVM codegen), where
+    /// the ~1 MiB default worker stack would overflow. `0` means OS default.
+    static new_with_stack(stack_bytes: u64) -> Scope {
+        return Scope { tids: [], stack_bytes: stack_bytes };
     }
 
     /// Spawn a scoped thread running `body(ctx)`. `ctx` is moved in (often
@@ -669,7 +695,7 @@ type struct Scope {
         (*p).body = body;
         (*p).ctx  = ctx;
         mut tbuf: u8[8] = [0u8; 8];
-        const rc: i32 = os_create_scope_thread<C>(&tbuf[0], p as u8*);
+        const rc: i32 = os_create_scope_thread<C>(&tbuf[0], p as u8*, this.stack_bytes);
         if (rc != 0) { intrinsics::panic("Scope::spawn: thread creation failed", FILE, LINE); }
         this.tids.push(*(&tbuf[0] as u64*));
     }
@@ -695,4 +721,34 @@ implement trait Drop for struct Scope {
         this.join_all();
         this.tids.drop();
     }
+}
+
+
+// ---------------------------------------------------------------------------
+// available_parallelism
+// ---------------------------------------------------------------------------
+
+/// The number of hardware threads available to the process — the natural
+/// default size for a worker pool. Clamped to at least 1 so a pool always
+/// makes progress. Best-effort: returns 1 if the OS query fails.
+![target(unix)]
+function available_parallelism() -> u32 {
+    // _SC_NPROCESSORS_ONLN == 84 on Linux/glibc and the BSDs.
+    const n: i64 = libc::sysconf(84);
+    if (n <= 0) { return 1; }
+    return n as u32;
+}
+
+![target(windows)]
+function available_parallelism() -> u32 {
+    mut si: syscall::SYSTEM_INFO_PARTIAL = syscall::SYSTEM_INFO_PARTIAL {
+        wProcessorArchitecture: 0u16, wReserved: 0u16, dwPageSize: 0u32,
+        lpMinimumApplicationAddress: null, lpMaximumApplicationAddress: null,
+        dwActiveProcessorMask: 0u64, dwNumberOfProcessors: 0u32,
+        dwProcessorType: 0u32, dwAllocationGranularity: 0u32,
+        wProcessorLevel: 0u16, wProcessorRevision: 0u16
+    };
+    syscall::GetSystemInfo(&si as u8*);
+    if (si.dwNumberOfProcessors == 0) { return 1; }
+    return si.dwNumberOfProcessors;
 }
