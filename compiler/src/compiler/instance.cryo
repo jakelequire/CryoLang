@@ -39,6 +39,8 @@ import std::thread;
 import std::time::clock;
 import std::collections::string;
 import std::collections::str;
+import std::core::hash;
+import std::core::mem;
 
 // Default codegen worker count: the online CPU count.  Object emission is
 // parallelized by fanning each module out to a child `cryo __emit-obj` PROCESS
@@ -1408,9 +1410,9 @@ type struct CompilerInstance {
         // (ctx.module_graph.field = x) which the codegen may not persist.
         const buf_size: u64 = n as u64 * 8;
         const ast_buf: void* = intrinsics::malloc(buf_size);
-        intrinsics::memset(ast_buf, 0, buf_size);
+        mem::zero<u8>(ast_buf as u8*, buf_size);
         const scope_buf: void* = intrinsics::malloc(buf_size);
-        intrinsics::memset(scope_buf, 0, buf_size);
+        mem::zero<u8>(scope_buf as u8*, buf_size);
 
         mut pipeline: PassRegistry = PassRegistry::new();
         pipeline.set_verbose(this.config.verbose_passes);
@@ -1552,11 +1554,12 @@ type struct CompilerInstance {
             }
 
             // Global digest over every module's source hash, in topo order.
-            mut pm_global: u64 = Compiler::BuildManifest::Manifest::fnv_seed();
-            pm_global = Compiler::BuildManifest::Manifest::fnv_u64(pm_global, pm_tool_fp);
+            mut pm_global_h: DefaultHasher = DefaultHasher::new();
+            pm_global_h.fold(pm_tool_fp);
             for (mut i: u32 = 0; i < n; i++) {
-                pm_global = Compiler::BuildManifest::Manifest::fnv_u64(pm_global, pm_src_h[order[i] as i64]);
+                pm_global_h.fold(pm_src_h[order[i] as i64]);
             }
+            const pm_global: u64 = pm_global_h.finish();
 
             const pm_prior: BuildManifest::ModuleKeyTable =
                 Compiler::BuildManifest::ModuleKeyTable::read_module_keys(ctx.project_config.module_keys_path());
@@ -1566,23 +1569,23 @@ type struct CompilerInstance {
             for (mut m: u32 = 0; m < n; m++) {
                 const mi: ModuleInfo* = &ctx.module_graph.modules[m];
                 const ns: string = ctx.intern_table.resolve(mi.name);
-                mut k: u64 = Compiler::BuildManifest::Manifest::fnv_seed();
-                k = Compiler::BuildManifest::Manifest::fnv_u64(k, pm_tool_fp);
+                mut k: DefaultHasher = DefaultHasher::new();
+                k.fold(pm_tool_fp);
                 if (pm_owns_spec[m as i64]) {
-                    k = Compiler::BuildManifest::Manifest::fnv_str(k, "owner");
-                    k = Compiler::BuildManifest::Manifest::fnv_u64(k, pm_global);
+                    k.fold("owner");
+                    k.fold(pm_global);
                 } else {
-                    k = Compiler::BuildManifest::Manifest::fnv_str(k, "leaf");
+                    k.fold("leaf");
                     const clos: boolean[] =
                         ctx.module_graph.compute_import_closure(m, n);
                     for (mut i: u32 = 0; i < n; i++) {
                         if (clos[order[i] as i64]) {
-                            k = Compiler::BuildManifest::Manifest::fnv_u64(k, pm_src_h[order[i] as i64]);
+                            k.fold(pm_src_h[order[i] as i64]);
                         }
                     }
                 }
                 pm_key_names.push(ns);
-                pm_key_hex.push(k.to_hex_padded_str(16));
+                pm_key_hex.push(k.finish().to_hex_padded_str(16));
             }
 
             // Cached if the prior key matches AND the .o is still on disk.

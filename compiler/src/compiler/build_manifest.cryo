@@ -188,36 +188,36 @@ type struct Manifest {
 
     /// Combined fingerprint over every build input.
     compute_fingerprint(&this, modules: &ModuleEntry[]) -> u64 {
-        mut h: u64 = DefaultHasher::offset_basis();
-        h = Manifest::fnv_u64(h, Manifest::compiler_fingerprint());
+        mut h: DefaultHasher = DefaultHasher::new();
+        h.fold(Manifest::compiler_fingerprint());
         // Resolved knobs.
-        h = Manifest::fnv_u64(h, this.opt_level as u64);
+        h.fold(this.opt_level as u64);
         const dbg_b:  u8 = if (this.debug_info)    { 1 } else { 0 };
         const ell_b:  u8 = if (this.cfg.emit_llvm) { 1 } else { 0 };
         const nstd_b: u8 = if (this.cfg.no_std)    { 1 } else { 0 };
-        h = Manifest::fnv_byte(h, dbg_b);
-        h = Manifest::fnv_byte(h, ell_b);
-        h = Manifest::fnv_byte(h, nstd_b);
-        h = Manifest::fnv_str(h, this.cfg.target_triple);
-        h = Manifest::fnv_str(h, this.cfg.profile);
+        h.fold(dbg_b);
+        h.fold(ell_b);
+        h.fold(nstd_b);
+        h.fold(this.cfg.target_triple);
+        h.fold(this.cfg.profile);
         // [link] lists affect the final binary but not the .o files.
-        for (mut i: i64 = 0; i < this.cfg.link_system.length; i++) { h = Manifest::fnv_str(h, this.cfg.link_system[i]); }
-        for (mut i: i64 = 0; i < this.cfg.link_search.length; i++) { h = Manifest::fnv_str(h, this.cfg.link_search[i]); }
-        for (mut i: i64 = 0; i < this.cfg.link_static.length; i++) { h = Manifest::fnv_str(h, this.cfg.link_static[i]); }
+        for (mut i: i64 = 0; i < this.cfg.link_system.length; i++) { h.fold(this.cfg.link_system[i]); }
+        for (mut i: i64 = 0; i < this.cfg.link_search.length; i++) { h.fold(this.cfg.link_search[i]); }
+        for (mut i: i64 = 0; i < this.cfg.link_static.length; i++) { h.fold(this.cfg.link_static[i]); }
         // Stdlib archive bytes (so a rebuilt stdlib invalidates dependents).
         if (this.stdlib_archive.length() > 0) {
-            h = Manifest::fnv_file(h, this.stdlib_archive);
+            Manifest::fold_file(&h, this.stdlib_archive);
         }
         // Every source module, in topo order: namespace + origin (output
         // location) + full content.  Folding origin_subdir means moving a
         // module between packages (which changes where its .o lands)
         // invalidates the cache even when its source bytes are unchanged.
         for (mut i: i64 = 0; i < modules.length; i++) {
-            h = Manifest::fnv_str(h, modules[i].namespace_name);
-            h = Manifest::fnv_str(h, modules[i].origin_subdir);
-            h = Manifest::fnv_file(h, modules[i].source_path);
+            h.fold(modules[i].namespace_name);
+            h.fold(modules[i].origin_subdir);
+            Manifest::fold_file(&h, modules[i].source_path);
         }
-        return h;
+        return h.finish();
     }
 
     /// True when the saved fingerprint matches `fp_hex` AND every artifact
@@ -319,44 +319,38 @@ type struct Manifest {
         text.drop();
     }
 
-    /// Fold a single byte into a running FNV-1a state, via the canonical
-    /// `core::hash` FNV-1a so the offset basis + prime live in one place.
-    static fnv_byte(state: u64, b: u8) -> u64 {
-        mut h: DefaultHasher = DefaultHasher::from_state(state);
-        h.write_u8(b);
-        return h.finish();
-    }
-
-    /// Fold a NUL-terminated string's bytes into the state, plus a separator so
-    /// adjacent concatenations can't collide ("ab"+"c" vs "a"+"bc").
-    static fnv_str(state: u64, s: string) -> u64 {
-        mut h: u64 = state;
-        const len: u64 = s.length();
-        const b: i8* = s as i8*;
-        for (mut i: u64 = 0; i < len; i++) {
-            h = Manifest::fnv_byte(h, b[i] as u8);
+    /// Fold a NUL-terminated string's bytes + a separator NUL into a hasher
+    /// held by POINTER, byte-for-byte identical to `DefaultHasher::fold(string)`
+    /// but via the non-generic `write_u8`.
+    ///
+    /// Why not just `h.fold(s)`: `fold` is a *generic* inherent method, and the
+    /// compiler does not currently monomorphize a generic method invoked
+    /// through a pointer/reference (it emits one unspecialized `fold$…T` symbol
+    /// for every T → invalid IR / a runtime hang). Value receivers are fine, so
+    /// every other fingerprint site still uses `h.fold(x)` directly; only the
+    /// pointer-held file/depfile folds route through the plain trait methods
+    /// (`write_u8` / `write_uint`), which monomorphize correctly through a
+    /// pointer.
+    static fold_cstr(h: DefaultHasher*, s: string) -> void {
+        const bytes: u8* = s as u8*;
+        mut i: u64 = 0;
+        while (bytes[i] != 0 as u8) {
+            h.write_u8(bytes[i]);
+            i = i + 1;
         }
-        return Manifest::fnv_byte(h, 0);
+        h.write_u8(0 as u8);
     }
 
-    /// Fold a u64 (8 bytes, low byte first) into the state.
-    static fnv_u64(state: u64, v: u64) -> u64 {
-        mut h: u64 = state;
-        mut x: u64 = v;
-        for (mut i: u64 = 0; i < 8; i++) {
-            h = Manifest::fnv_byte(h, (x & 255) as u8);
-            x = x >> 8;
-        }
-        return h;
-    }
-
-    /// Fold a file's full byte content (NULs included) into the state. A
-    /// missing or unreadable file folds a distinct marker so it still perturbs
-    /// the fingerprint. The byte count is mixed in last as a length guard.
-    static fnv_file(state: u64, path: string) -> u64 {
-        mut h: u64 = state;
+    /// Fold a file's full byte content (NULs included) into the running digest
+    /// `h`. A missing or unreadable file folds a distinct marker so it still
+    /// perturbs the fingerprint. The byte count is mixed in last as a length
+    /// guard. `h` is held by pointer, so this folds via the trait methods
+    /// (`write_u8` / `write_uint`) and `fold_cstr` rather than the generic
+    /// `fold` (see `fold_cstr`).
+    static fold_file(h: DefaultHasher*, path: string) -> void {
         if (!metadata::exists(Path::from_cstr(path))) {
-            return Manifest::fnv_str(h, "<missing>");
+            Manifest::fold_cstr(h, "<missing>");
+            return;
         }
         match (file::read(Path::from_cstr(path))) {
             Result::Ok(data) => {
@@ -364,13 +358,13 @@ type struct Manifest {
                 const n: u64 = bytes.length();
                 const d: u8* = bytes.as_ptr();
                 for (mut i: u64 = 0; i < n; i++) {
-                    h = Manifest::fnv_byte(h, d[i]);
+                    h.write_u8(d[i]);
                 }
                 bytes.drop();
-                return Manifest::fnv_u64(h, n);
+                h.write_uint(n as u128, 8);
             }
             Result::Err(_) => {
-                return Manifest::fnv_str(h, "<unreadable>");
+                Manifest::fold_cstr(h, "<unreadable>");
             }
         }
     }
@@ -389,17 +383,13 @@ type struct Manifest {
     /// compiler changes, invalidating every cached build it produced.
     static compiler_fingerprint() -> u64 {
         const exe: string = Manifest::self_exe_path();
-        mut h: u64 = DefaultHasher::offset_basis();
+        mut h: DefaultHasher = DefaultHasher::new();
         if (exe.length() == 0) {
-            return Manifest::fnv_str(h, "<unknown-compiler>");
+            h.fold("<unknown-compiler>");
+            return h.finish();
         }
-        return Manifest::fnv_file(h, exe);
-    }
-
-    /// The FNV-1a seed, exposed so the orchestrator can fold module keys with
-    /// the same hash family used everywhere else in this module.
-    static fnv_seed() -> u64 {
-        return DefaultHasher::offset_basis();
+        Manifest::fold_file(&h, exe);
+        return h.finish();
     }
 
     /// FNV-1a digest of a SINGLE module's identity + content, mirroring exactly
@@ -409,11 +399,11 @@ type struct Manifest {
     /// packages (which changes where its `.o` lands) invalidates its key.
     static module_source_hash(namespace_name: string, origin_subdir: string,
                                 source_path: string) -> u64 {
-        mut h: u64 = DefaultHasher::offset_basis();
-        h = Manifest::fnv_str(h, namespace_name);
-        h = Manifest::fnv_str(h, origin_subdir);
-        h = Manifest::fnv_file(h, source_path);
-        return h;
+        mut h: DefaultHasher = DefaultHasher::new();
+        h.fold(namespace_name);
+        h.fold(origin_subdir);
+        Manifest::fold_file(&h, source_path);
+        return h.finish();
     }
 
     /// FNV-1a digest of the toolchain inputs that affect EVERY object file: the
@@ -425,18 +415,18 @@ type struct Manifest {
     /// invalidates the whole per-module cache.
     static toolchain_fingerprint(cfg: ProjectConfig*, opt_level: u32,
                                    debug_info: boolean) -> u64 {
-        mut h: u64 = DefaultHasher::offset_basis();
-        h = Manifest::fnv_u64(h, Manifest::compiler_fingerprint());
-        h = Manifest::fnv_u64(h, opt_level as u64);
+        mut h: DefaultHasher = DefaultHasher::new();
+        h.fold(Manifest::compiler_fingerprint());
+        h.fold(opt_level as u64);
         const dbg_b:  u8 = if (debug_info)    { 1 } else { 0 };
         const ell_b:  u8 = if (cfg.emit_llvm) { 1 } else { 0 };
         const nstd_b: u8 = if (cfg.no_std)    { 1 } else { 0 };
-        h = Manifest::fnv_byte(h, dbg_b);
-        h = Manifest::fnv_byte(h, ell_b);
-        h = Manifest::fnv_byte(h, nstd_b);
-        h = Manifest::fnv_str(h, cfg.target_triple);
-        h = Manifest::fnv_str(h, cfg.profile);
-        return h;
+        h.fold(dbg_b);
+        h.fold(ell_b);
+        h.fold(nstd_b);
+        h.fold(cfg.target_triple);
+        h.fold(cfg.profile);
+        return h.finish();
     }
 
     /// Read a file's content with trailing whitespace/newlines stripped, or ""
