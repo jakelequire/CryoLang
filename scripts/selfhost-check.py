@@ -511,7 +511,7 @@ def _compare_ir_trees(root_a: Path, root_b: Path):
     # RELATIVE to `ir/` — a plain basename collides across subdirs
     # (`core/error.ll` vs `io/error.ll` both basename `error.ll`).
     def _key(p: Path) -> str:
-        return str(p).rsplit("/ir/", 1)[-1]
+        return p.as_posix().rsplit("/ir/", 1)[-1]
     a = {_key(p): p for p in root_a.glob("**/ir/**/*.ll")}
     b = {_key(p): p for p in root_b.glob("**/ir/**/*.ll")}
     if not a or not b:

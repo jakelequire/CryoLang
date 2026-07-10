@@ -43,16 +43,30 @@ type struct NegSuiteResult {
 }
 
 /// Parsed `test.json` for a multi-module test project (see
-/// `run_projects_suite`). `outcome`: 0 = collect (run the project's own
-/// `![test]`s, expect exit 0), 1 = compile_fail (build must fail with
-/// `diagnostic`), 2 = run (build+run, exit must equal `exit_code` and, if
-/// non-empty, stdout must contain `stdout_sub`).
+/// `run_projects_suite`). The FIXTURE (`outcome`: 0 = collect, 1 = build,
+/// 2 = run) and the ASSERTIONS (the `expect` fields — `exit_code`, `fails`,
+/// `stdout_sub`, `output_contains`, `output_excludes`) are orthogonal.
+/// `compile_fail` is a recognized alias for `build` + `fails`, and
+/// `expect.diagnostic` is sugar for `fails` + an `error[<code>]` marker in
+/// `output_contains`.
 type struct ProjSpec {
+    /// FIXTURE: 0 = collect (run the project's own `cryo test`), 1 = build
+    /// (`cryo build`), 2 = run (`cryo run`).  The fixture (what is set up) and
+    /// the ASSERTION (what is checked, via the `expect` fields below) are
+    /// orthogonal: `compile_fail` is simply `build` + `expect.fails`.
     outcome:    i32;
     ignore:     boolean;
+    /// Expected process exit code (default 0).  Ignored when `fails` is set.
     exit_code:  i64;
-    diagnostic: string;
+    /// The build/run must exit NON-ZERO; `exit_code` is then not checked.
+    fails:      boolean;
+    /// Single substring that must appear in the combined stdout+stderr.
     stdout_sub: string;
+    /// Every entry must appear in the combined output; no entry of
+    /// `output_excludes` may.  `expect.diagnostic: "E0200"` is sugar: it sets
+    /// `fails` and appends `error[E0200]` to `output_contains`.
+    output_contains: string[];
+    output_excludes: string[];
     /// Environment prerequisites (test.json `requires`): the project runs only
     /// where every token holds, and is otherwise SKIPPED with a reason (not a
     /// failure).  Recognized tokens: `"display"` (an X11/Wayland display is
@@ -1312,7 +1326,7 @@ type struct Executor {
 
             // Multi-module test projects: each is a real Cryo package under
             // tests/projects/ carrying a test.json. Driven via this compiler
-            // as a subprocess (collect / compile_fail / run). Absent dir is a
+            // as a subprocess (collect / build / run). Absent dir is a
             // clean no-op.
             const proj_dir: string = format("%s/tests/projects", proj_root);
             const proj_res: NegSuiteResult =
@@ -1699,17 +1713,22 @@ type struct Executor {
             Result::Err(mut e) => { e.drop(); return Option::None; }
         };
         mut spec: ProjSpec = ProjSpec {
-            outcome: 0, ignore: false, exit_code: 0, diagnostic: "", stdout_sub: "",
-            requires: []
+            outcome: 0, ignore: false, exit_code: 0, fails: false, stdout_sub: "",
+            output_contains: [], output_excludes: [], requires: []
         };
 
-        const cf_str:  Str = Str::new("compile_fail");
-        const run_str: Str = Str::new("run");
+        // Outcome selects the FIXTURE: collect (default) / build / run.
+        // `compile_fail` is a recognized alias for `build` + `fails`, so the
+        // pre-orthogonal spelling keeps working.
+        const build_str: Str = Str::new("build");
+        const cf_str:    Str = Str::new("compile_fail");
+        const run_str:   Str = Str::new("run");
         match (root.get(Str::new("outcome"))) {
             Option::Some(vp) => {
                 match (vp.as_str()) {
                     Option::Some(os) => {
-                        if (os.equals(&cf_str))       { spec.outcome = 1; }
+                        if (os.equals(&build_str))    { spec.outcome = 1; }
+                        else if (os.equals(&cf_str))  { spec.outcome = 1; spec.fails = true; }
                         else if (os.equals(&run_str)) { spec.outcome = 2; }
                     }
                     Option::None => { }
@@ -1754,10 +1773,26 @@ type struct Executor {
                     }
                     Option::None => { }
                 }
+                match (ep.get(Str::new("fails"))) {
+                    Option::Some(fp) => {
+                        match (fp.as_bool()) {
+                            Option::Some(b) => { spec.fails = b; }
+                            Option::None    => { }
+                        }
+                    }
+                    Option::None => { }
+                }
+                // `diagnostic` is sugar for a failing build that must emit a
+                // specific error code: it sets `fails` and appends the
+                // `error[<code>]` marker to `output_contains`.
                 match (ep.get(Str::new("diagnostic"))) {
                     Option::Some(dp) => {
                         match (dp.as_str()) {
-                            Option::Some(ds) => { spec.diagnostic = Executor::dup_cstr(ds); }
+                            Option::Some(ds) => {
+                                const dcode: string = Executor::dup_cstr(ds);
+                                spec.fails = true;
+                                spec.output_contains.push(format("error[%s]", dcode));
+                            }
                             Option::None     => { }
                         }
                     }
@@ -1768,6 +1803,40 @@ type struct Executor {
                         match (sp.as_str()) {
                             Option::Some(ss) => { spec.stdout_sub = Executor::dup_cstr(ss); }
                             Option::None     => { }
+                        }
+                    }
+                    Option::None => { }
+                }
+                match (ep.get(Str::new("output_contains"))) {
+                    Option::Some(ap) => {
+                        const n: u64 = ap.length();
+                        for (mut i: u64 = 0; i < n; i++) {
+                            match (ap.at(i)) {
+                                Option::Some(iv) => {
+                                    match (iv.as_str()) {
+                                        Option::Some(is) => { spec.output_contains.push(Executor::dup_cstr(is)); }
+                                        Option::None     => { }
+                                    }
+                                }
+                                Option::None => { }
+                            }
+                        }
+                    }
+                    Option::None => { }
+                }
+                match (ep.get(Str::new("output_excludes"))) {
+                    Option::Some(ap) => {
+                        const n: u64 = ap.length();
+                        for (mut i: u64 = 0; i < n; i++) {
+                            match (ap.at(i)) {
+                                Option::Some(iv) => {
+                                    match (iv.as_str()) {
+                                        Option::Some(is) => { spec.output_excludes.push(Executor::dup_cstr(is)); }
+                                        Option::None     => { }
+                                    }
+                                }
+                                Option::None => { }
+                            }
                         }
                     }
                     Option::None => { }
@@ -1787,8 +1856,8 @@ type struct Executor {
 
     /// Run every multi-module test project under `projects_dir`. Each project
     /// is a real Cryo package (its own `cryoconfig` + `src/`) carrying a
-    /// `test.json` that selects how it is checked (collect / compile_fail /
-    /// run). This is the `cryo test` META-RUNNER: it `chdir`s into each
+    /// `test.json` that selects how it is checked (collect / build / run).
+    /// This is the `cryo test` META-RUNNER: it `chdir`s into each
     /// project and drives this very compiler (`self_exe`) as a subprocess,
     /// mirroring how `run_negative_suite` drives `cryo check`. Absent or empty
     /// `projects_dir` is a clean no-op (returns {0,0}).
@@ -1860,8 +1929,8 @@ type struct Executor {
 
             const content: string = Executor::read_file_or_empty(tj);
             mut spec: ProjSpec = ProjSpec {
-                outcome: 0, ignore: false, exit_code: 0, diagnostic: "", stdout_sub: "",
-                requires: []
+                outcome: 0, ignore: false, exit_code: 0, fails: false, stdout_sub: "",
+                output_contains: [], output_excludes: [], requires: []
             };
             mut parsed_ok: boolean = false;
             match (Executor::parse_test_json(content)) {
@@ -1975,34 +2044,41 @@ type struct Executor {
         mut passed: boolean = false;
         mut detail: string = "";
 
-        if (spec.outcome == 1) {
-            // compile_fail: `cryo build` must fail and emit error[<diagnostic>].
-            const cmd: string = format("%s build%s > %s 2>&1", self_exe, std_flag, tmp);
+        if (spec.outcome == 1 || spec.outcome == 2) {
+            // FIXTURE build (`cryo build`) or run (`cryo run`); both capture the
+            // combined stdout+stderr so the ASSERTIONS below can scan it.  The
+            // fixture and the checks are orthogonal: a failing build is just
+            // build + `fails`, a diagnostic is `fails` + an `output_contains`
+            // marker (both folded in at parse time).
+            const verb: string = if (spec.outcome == 1) { "build" } else { "run" };
+            const cmd: string = format("%s %s%s > %s 2>&1", self_exe, verb, std_flag, tmp);
             fflush(null);
             const st: i32 = exec::shell(cmd);
-            const failed: boolean = st != 0;
+            const ec: i64 = st as i64;
             const out: string = Executor::read_file_or_empty(tmp);
-            if (spec.diagnostic.length() > 0) {
-                const want: string = format("error[%s]", spec.diagnostic);
-                passed = failed && out.contains(want);
-                if (!passed) { detail = format("expected build to fail with %s", spec.diagnostic); }
+
+            if (spec.fails) {
+                passed = ec != 0;
+                if (!passed) { detail = format("expected %s to fail (exit non-zero)", verb); }
             } else {
-                passed = failed;
-                if (!passed) { detail = "expected build to fail"; }
+                passed = ec == spec.exit_code;
+                if (!passed) { detail = format("exit %lld, expected %lld", ec, spec.exit_code); }
             }
-        } else if (spec.outcome == 2) {
-            // run: build+run; assert exit code (and optional stdout substring).
-            const cmd: string = format("%s run%s > %s 2>&1", self_exe, std_flag, tmp);
-            fflush(null);
-            const st: i32 = exec::shell(cmd);
-            const ec: int = st as int;
-            passed = (ec as i64) == spec.exit_code;
-            if (!passed) {
-                detail = format("exit %d, expected %lld", ec, spec.exit_code);
-            } else if (spec.stdout_sub.length() > 0) {
-                const out: string = Executor::read_file_or_empty(tmp);
+            if (passed && spec.stdout_sub.length() > 0) {
                 passed = out.contains(spec.stdout_sub);
-                if (!passed) { detail = format("stdout missing \"%s\"", spec.stdout_sub); }
+                if (!passed) { detail = format("output missing \"%s\"", spec.stdout_sub); }
+            }
+            for (mut i: i64 = 0; passed && i < spec.output_contains.length; i++) {
+                if (!out.contains(spec.output_contains[i])) {
+                    passed = false;
+                    detail = format("output missing \"%s\"", spec.output_contains[i]);
+                }
+            }
+            for (mut i: i64 = 0; passed && i < spec.output_excludes.length; i++) {
+                if (out.contains(spec.output_excludes[i])) {
+                    passed = false;
+                    detail = format("output must not contain \"%s\"", spec.output_excludes[i]);
+                }
             }
         } else {
             // collect: run the project's own `cryo test`; exit 0 = all passed.
