@@ -1153,6 +1153,21 @@ type struct LTargetMachine {
         mut target: void* = null;
         mut err_msg: i8* = null;
 
+        // Register the backend here rather than trusting the caller.  LLVM's
+        // target registry is per-process and starts EMPTY, and this is the one
+        // chokepoint every target machine is created through — so a caller that
+        // reaches codegen's `init_native_target` first is merely the common
+        // case, not a guarantee.  It is NOT one: an incremental build whose
+        // modules are all cached codegens nothing (that is where
+        // `init_native_target` used to run) yet still proceeds to link and, in
+        // test mode, to test-main synthesis, which lands here.  The registry is
+        // then empty and `LLVMGetTargetFromTriple` fails with "no targets are
+        // registered", surfacing as E0900 "native target machine unavailable"
+        // on a build whose sources never changed.  The LLVM initializers are
+        // idempotent (each guards on a `static once_flag`), so calling them on
+        // every target-machine creation is free.
+        LTargetMachine::init_native_target();
+
         const found: i32 = llvm::LLVMGetTargetFromTriple(effective, &target as void*, &err_msg as void*);
         if (found != 0) {
             if (err_msg != null) {
