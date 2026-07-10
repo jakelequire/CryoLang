@@ -307,21 +307,44 @@ type struct DeclarationEmitter {
     }
 
     /// Declare a single function signature (no body generation).
-    /// A monomorphization gets `linkonce_odr` linkage.  It is a pure function of
+    /// A monomorphization gets `weak_odr` linkage.  It is a pure function of
     /// (template, type-args): every module that instantiates the same generic
     /// with the same arguments clones the same source into the same symbol, so
     /// duplicate definitions are equivalent by construction and the linker may
-    /// keep any one.  This is what lets a spec be emitted at its USE SITE — and
-    /// lets a separately-compiled consumer emit its own copy of one the prebuilt
-    /// library already carries — without a multiple-definition error.
+    /// keep any one.  This is what lets a spec be emitted at its USE SITE —
+    /// where two modules instantiating the same generic each emit it — without a
+    /// multiple-definition error.
+    ///
+    /// NOT `linkonce_odr`, which additionally permits LLVM to DISCARD a
+    /// definition that its own module never references.  A spec is placed with
+    /// the module owning its type argument, which frequently does not call it —
+    /// `Drop for Array<Str, GlobalAlloc>` lands in `collections::str`, and only
+    /// the compiler's `CLI` module ever invokes it.  Under `linkonce_odr` that
+    /// body vanished from `str.o`, which the host build hid (the stdlib ARCHIVE
+    /// carried another copy) and the Windows cross-build exposed at link time:
+    /// cross targets link per-target objects with no archive.  `weak_odr` keeps
+    /// the definition.
+    ///
+    /// The definition also gets an `any`-selection COMDAT keyed on its symbol.
+    /// On ELF that just folds the section group; on COFF it is mandatory.
+    /// Without it LLVM lowers a weak definition as a strong `.weak.<sym>` plus a
+    /// weak-external alias, and `x86_64-w64-mingw32-ld` leaves the alias
+    /// unresolved — the Windows cross-link failed with "undefined reference" to
+    /// symbols that `nm` showed defined in the very object doing the
+    /// referencing.  A COMDAT is how C++ emits inline functions, and it is what
+    /// `IntrinsicEmitter::attach_runtime_comdat` already does for the runtime
+    /// helpers.
     ///
     /// `main` is exempt: it is the C entry point, must be strong, and is never a
     /// specialization anyway (the guard only documents the invariant).
-    static apply_spec_linkage(fn_val: LValue, node: FunctionDeclNode*,
-                              is_program_main: boolean) -> void {
+    apply_spec_linkage(mut &this, fn_val: LValue, node: FunctionDeclNode*,
+                       fn_name: string, is_program_main: boolean) -> void {
         if (node == null || is_program_main) { return; }
-        if (!node.is_specialization) { return; }
-        fn_val.set_linkage(LLinkage::LinkOnceODR);
+        if (!node.is_specialization || !fn_val.is_valid()) { return; }
+        fn_val.set_linkage(LLinkage::WeakODR);
+        const comdat: void* = llvm::LLVMGetOrInsertComdat(
+            this.llvm_module.raw, fn_name);
+        if (comdat != null) { llvm::LLVMSetComdat(fn_val.raw, comdat); }
     }
 
     declare_function(mut &this, node: FunctionDeclNode*) -> void {
@@ -445,7 +468,7 @@ type struct DeclarationEmitter {
 
         // Add the function to the LLVM module.
         const fn_val: LValue = this.llvm_module.add_function(fn_name, fn_type);
-        DeclarationEmitter::apply_spec_linkage(fn_val, node, is_program_main);
+        this.apply_spec_linkage(fn_val, node, fn_name, is_program_main);
 
         // Phase 1: attach `sret(%T)` to LLVM parameter slot 0 when the
         // classifier promoted the return to Indirect.  Call sites detect
@@ -1211,7 +1234,7 @@ type struct DeclarationEmitter {
         intrinsics::free(buf);
 
         const fn_val: LValue = this.llvm_module.add_function(fn_name, fn_type);
-        DeclarationEmitter::apply_spec_linkage(fn_val, node.func, false);
+        this.apply_spec_linkage(fn_val, node.func, fn_name, false);
 
         // Attach `sret(%T)` to LLVM param 0 when the classifier promoted
         // the return.  This must match what `build_function_ltype`
