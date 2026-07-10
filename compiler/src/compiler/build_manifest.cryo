@@ -86,12 +86,8 @@ type struct ModuleKeyTable {
 
     /// Copy `len` bytes from `data+start` into a fresh NUL-terminated string.
     static modkeys_slice(data: i8*, start: u64, len: u64) -> string {
-        const out: i8* = intrinsics::malloc(len + 1) as i8*;
-        if (len > 0) {
-            intrinsics::memcpy(out as void*, (data + start) as void*, len);
-        }
-        out[len] = 0;
-        return out as string;
+        mut s: String = String::from_str(Str::from_raw((data + start) as u8*, len));
+        return s.into_raw();
     }
 
     /// Parse the `*.modkeys` sidecar into a `ModuleKeyTable`. A missing or
@@ -420,23 +416,21 @@ type struct Manifest {
             len -= 1;
         }
         if (len <= 0) { return ""; }
-        const out: i8* = intrinsics::malloc(len as u64 + 1) as i8*;
-        intrinsics::memcpy(out as void*, raw as void*, len as u64);
-        out[len] = 0;
-        return out as string;
+        mut s: String = String::from_str(Str::from_raw(raw as u8*, len as u64));
+        return s.into_raw();
     }
 
     /// Mangle a namespace to its object-file stem (`::` -> `_`), matching
     /// `CodegenPasses::legacy_obj_path`.
     static mangle_module(ns: string) -> string {
         const len: u64 = ns.length();
-        const buf: i8* = intrinsics::malloc(len + 1) as i8*;
-        intrinsics::memcpy(buf as void*, ns as void*, len);
-        buf[len] = 0;
+        const src: i8* = ns as i8*;
+        mut s: String = String::with_capacity(len + 1);
         for (mut i: u64 = 0; i < len; i++) {
-            if (buf[i] == ':') { buf[i] = '_'; }
+            if (src[i] == ':') { s.push_byte('_' as u8); }
+            else { s.push_byte(src[i] as u8); }
         }
-        return buf as string;
+        return s.into_raw();
     }
 
     /// Map a namespace to its object-file RELATIVE PATH: each `::` becomes a
@@ -448,27 +442,22 @@ type struct Manifest {
     /// `.o` — fresh emit (`legacy_obj_path`), the incremental cache probe/reuse,
     /// and this manifest's artifact prediction — MUST route through here, or the
     /// predicted path and the emitted path diverge and caching breaks.  The `::`
-    /// -> `/` collapse shrinks the string, so `malloc(len+1)` is ample.
+    /// -> `/` collapse shrinks the string, so `with_capacity(len+1)` never grows.
     static path_module(ns: string) -> string {
         const len: u64 = ns.length();
-        const buf: i8* = intrinsics::malloc(len + 1) as i8*;
-        intrinsics::memcpy(buf as void*, ns as void*, len);
-        buf[len] = 0;
-        mut w: u64 = 0;
+        const src: i8* = ns as i8*;
+        mut s: String = String::with_capacity(len + 1);
         mut i: u64 = 0;
         while (i < len) {
-            if (i + 1 < len && buf[i] == ':' && buf[i + 1] == ':') {
-                buf[w] = '/';
-                w = w + 1;
+            if (i + 1 < len && src[i] == ':' && src[i + 1] == ':') {
+                s.push_byte('/' as u8);
                 i = i + 2;
             } else {
-                buf[w] = buf[i];
-                w = w + 1;
+                s.push_byte(src[i] as u8);
                 i = i + 1;
             }
         }
-        buf[w] = 0;
-        return buf as string;
+        return s.into_raw();
     }
 
     /// File size in bytes via `fs::metadata`, without reading the contents.

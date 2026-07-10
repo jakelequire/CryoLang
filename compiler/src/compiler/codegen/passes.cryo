@@ -422,13 +422,12 @@ type struct CodegenPasses {
         // Dump .ll BEFORE verification so failing modules are inspectable.
         if (ctx.debug_mode) {
             const mn_len: u64 = module_name.length();
-            const mn_buf: void* = intrinsics::malloc(mn_len + 1);
-            intrinsics::memcpy(mn_buf, module_name as void*, mn_len);
-            const mn_bytes: i8* = mn_buf as i8*;
+            const mn_src: i8* = module_name as i8*;
+            mut mn_s: String = String::with_capacity(mn_len + 1);
             for (mut si: u64 = 0; si < mn_len; si++) {
-                if (mn_bytes[si] == 58) { mn_bytes[si] = 95; }
+                if (mn_src[si] == 58) { mn_s.push_byte(95 as u8); }
+                else { mn_s.push_byte(mn_src[si] as u8); }
             }
-            mn_bytes[mn_len] = 0;
             // Per-module IR lands under the per-profile cache, grouped by
             // origin (`<output_dir>/target/<profile>/<origin>/ir`); honour
             // project_config so `--build-dir=...` and the active profile both
@@ -439,11 +438,11 @@ type struct CodegenPasses {
                     CodegenPasses::current_origin_subdir(ctx));
             }
             ProjectConfig::mkdir_p(ll_dir);
-            const ll_path: string = format("%s/%s.ll", ll_dir, mn_buf as string);
+            const ll_path: string = format("%s/%s.ll", ll_dir, mn_s.as_cstr() as string);
             mut ll_err: i8* = null;
             llvm::LLVMPrintModuleToFile(cg.llvm_module.raw, ll_path, &ll_err as void*);
             if (ll_err != null) { llvm::LLVMDisposeMessage(ll_err as void*); }
-            intrinsics::free(mn_buf);
+            mn_s.drop();
         }
 
         if (has_corrupt) {
@@ -468,10 +467,8 @@ type struct CodegenPasses {
                     const err_len: u64 = (verify_err as string).length();
                     mut note_body: string = verify_err as string;
                     if (err_len > max_len) {
-                        const trunc_buf: i8* = intrinsics::malloc(max_len + 1) as i8*;
-                        intrinsics::memcpy(trunc_buf as void*, verify_err as void*, max_len);
-                        trunc_buf[max_len] = 0;
-                        note_body = trunc_buf as string;
+                        mut tr: String = String::from_str(Str::from_raw(verify_err as u8*, max_len));
+                        note_body = tr.into_raw();
                     }
                     diag = diag.with_note("LLVM reports: " + note_body);
                     if (err_len > max_len) {
@@ -571,10 +568,8 @@ type struct CodegenPasses {
                 const err_len: u64 = (verify_err as string).length();
                 mut note_body: string = verify_err as string;
                 if (err_len > max_len) {
-                    const trunc_buf: i8* = intrinsics::malloc(max_len + 1) as i8*;
-                    intrinsics::memcpy(trunc_buf as void*, verify_err as void*, max_len);
-                    trunc_buf[max_len] = 0;
-                    note_body = trunc_buf as string;
+                    mut tr: String = String::from_str(Str::from_raw(verify_err as u8*, max_len));
+                    note_body = tr.into_raw();
                 }
                 diag = diag.with_note("LLVM reports: " + note_body);
                 llvm::LLVMDisposeMessage(verify_err as void*);
@@ -668,12 +663,10 @@ type struct CodegenPasses {
         mut i: u64 = start;
         while (i < n && p[i] != 10u8) { i = i + 1u64; }
         const len: u64 = i - start;
-        const buf: i8* = intrinsics::malloc(len + 1u64) as i8*;
-        intrinsics::memcpy(buf as void*, (p + start) as void*, len);
-        buf[len] = 0;
+        mut s: String = String::from_str(Str::from_raw((p + start) as u8*, len));
         if (i < n) { i = i + 1u64; }
         *cursor = i;
-        return buf as string;
+        return s.into_raw();
     }
 
     /// Index of the first byte `b` in `s`, or -1.
@@ -689,10 +682,8 @@ type struct CodegenPasses {
 
     /// `s[start .. start+len]` as a fresh NUL-terminated string.
     static substr(s: string, start: u64, len: u64) -> string {
-        const buf: i8* = intrinsics::malloc(len + 1u64) as i8*;
-        intrinsics::memcpy(buf as void*, ((s as i8*) + start) as void*, len);
-        buf[len] = 0;
-        return buf as string;
+        mut out: String = String::from_str(Str::from_raw(((s as i8*) + start) as u8*, len));
+        return out.into_raw();
     }
 
     /// Child-process entry (`cryo __emit-obj <manifest> <idx> <count>`): read
@@ -1572,24 +1563,22 @@ type struct CodegenPasses {
         // Worst case: every byte is a single quote, expanding to 4 bytes,
         // plus two outer quotes and a NUL terminator.
         const cap: u64 = len * 4 + 3;
-        const buf: i8* = intrinsics::malloc(cap) as i8*;
-        mut o: u64 = 0;
-        buf[o] = '\''; o += 1;
+        mut sbuf: String = String::with_capacity(cap);
+        sbuf.push_byte('\'' as u8);
         const sb: i8* = s as i8*;
         for (mut i: u64 = 0; i < len; i++) {
             const ch: i8 = sb[i];
             if (ch == '\'') {
-                buf[o] = '\''; o += 1;
-                buf[o] = '\\'; o += 1;
-                buf[o] = '\''; o += 1;
-                buf[o] = '\''; o += 1;
+                sbuf.push_byte('\'' as u8);
+                sbuf.push_byte('\\' as u8);
+                sbuf.push_byte('\'' as u8);
+                sbuf.push_byte('\'' as u8);
             } else {
-                buf[o] = ch; o += 1;
+                sbuf.push_byte(ch as u8);
             }
         }
-        buf[o] = '\''; o += 1;
-        buf[o] = 0;
-        return buf as string;
+        sbuf.push_byte('\'' as u8);
+        return sbuf.into_raw();
     }
 
     /// True iff `tool` can be launched, probed via `<tool> --version` with both

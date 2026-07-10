@@ -7,6 +7,8 @@ import Compiler::Diag::Diagnostic;
 import Compiler::Diag::Suggestion;
 import Compiler::Diag::Sink;
 import Utils::Logger;
+import std::collections::string;
+import std::collections::str;
 
 type struct Lexer {
 private:
@@ -946,17 +948,16 @@ private:
             return raw;
         }
 
-        // Allocate a buffer large enough (escapes shrink, never grow)
-        mut buf: string = intrinsics::malloc(len + 1) as string;
-        mut wi: i64 = 0;  // write index
+        // Build into an owned String; escapes only shrink, so with_capacity
+        // reserves enough that no reallocation occurs.
+        mut buf: String = String::with_capacity((len + 1) as u64);
         mut ri: i64 = 0;  // read index
 
         while (ri < len) {
             const c: char = *(raw + ri) as char;
 
             if (c != '\\' || ri + 1 >= len) {
-                *(buf + wi) = c;
-                wi += 1;
+                buf.push_byte(c as u8);
                 ri += 1;
                 continue;
             }
@@ -966,13 +967,13 @@ private:
             ri += 2; // consume both backslash and escape char
 
             match (esc) {
-                'n'  => { *(buf + wi) = '\n'; wi += 1; }
-                't'  => { *(buf + wi) = '\t'; wi += 1; }
-                'r'  => { *(buf + wi) = '\r'; wi += 1; }
-                '\\' => { *(buf + wi) = '\\'; wi += 1; }
-                '\'' => { *(buf + wi) = '\''; wi += 1; }
-                '"'  => { *(buf + wi) = '"';  wi += 1; }
-                '0'  => { *(buf + wi) = '\0'; wi += 1; }
+                'n'  => { buf.push_byte('\n' as u8); }
+                't'  => { buf.push_byte('\t' as u8); }
+                'r'  => { buf.push_byte('\r' as u8); }
+                '\\' => { buf.push_byte('\\' as u8); }
+                '\'' => { buf.push_byte('\'' as u8); }
+                '"'  => { buf.push_byte('"' as u8); }
+                '0'  => { buf.push_byte('\0' as u8); }
                 'x'  => {
                     // Hex escape: \xHH (exactly up to 2 hex digits).  A
                     // `\x` with no following hex digit is malformed; emit
@@ -992,11 +993,10 @@ private:
                         digits += 1;
                     }
                     if (digits == 0) {
-                        *(buf + wi) = '\\'; wi += 1;
-                        *(buf + wi) = 'x';  wi += 1;
+                        buf.push_byte('\\' as u8);
+                        buf.push_byte('x' as u8);
                     } else {
-                        *(buf + wi) = val as i8;
-                        wi += 1;
+                        buf.push_byte(val as u8);
                     }
                 }
                 'u'  => {
@@ -1023,54 +1023,48 @@ private:
                         const closed: boolean = ri < len && *(raw + ri) as char == '}';
                         if (closed) { ri += 1; } // consume '}'
                         if (ndig > 0 && closed && cp <= 0x10FFFF) {
-                            wi = Lexer::encode_utf8(buf, wi, cp);
+                            Lexer::encode_utf8(&buf, cp);
                         } else {
                             // Malformed: preserve the `\u` we consumed; the
                             // brace/digit bytes were already copied past or
                             // will be re-scanned as ordinary characters.
-                            *(buf + wi) = '\\'; wi += 1;
-                            *(buf + wi) = 'u';  wi += 1;
+                            buf.push_byte('\\' as u8);
+                            buf.push_byte('u' as u8);
                         }
                     } else {
-                        *(buf + wi) = '\\'; wi += 1;
-                        *(buf + wi) = 'u';  wi += 1;
+                        buf.push_byte('\\' as u8);
+                        buf.push_byte('u' as u8);
                     }
                 }
                 _ => {
                     // Unknown escape; preserve both characters
-                    *(buf + wi) = '\\';
-                    wi += 1;
-                    *(buf + wi) = esc;
-                    wi += 1;
+                    buf.push_byte('\\' as u8);
+                    buf.push_byte(esc as u8);
                 }
             }
         }
 
-        *(buf + wi) = '\0';
-        return buf;
+        return buf.into_raw();
     }
 
-    /// Encode Unicode codepoint `cp` (assumed <= 0x10FFFF) as UTF-8 into
-    /// `buf` starting at write index `w`, returning the index past the last
-    /// byte written.  Used by `process_escape_sequences` for `\u{HEX}`.
-    static encode_utf8(buf: string, w: i64, cp: i64) -> i64 {
-        mut wi: i64 = w;
+    /// Encode Unicode codepoint `cp` (assumed <= 0x10FFFF) as UTF-8, appending
+    /// its 1–4 bytes to `buf`.  Used by `process_escape_sequences` for `\u{HEX}`.
+    static encode_utf8(buf: mut &String, cp: i64) -> void {
         if (cp <= 0x7F) {
-            *(buf + wi) = cp as i8; wi += 1;
+            buf.push_byte(cp as u8);
         } else if (cp <= 0x7FF) {
-            *(buf + wi) = (0xC0 | (cp >> 6)) as i8; wi += 1;
-            *(buf + wi) = (0x80 | (cp & 0x3F)) as i8; wi += 1;
+            buf.push_byte((0xC0 | (cp >> 6)) as u8);
+            buf.push_byte((0x80 | (cp & 0x3F)) as u8);
         } else if (cp <= 0xFFFF) {
-            *(buf + wi) = (0xE0 | (cp >> 12)) as i8; wi += 1;
-            *(buf + wi) = (0x80 | ((cp >> 6) & 0x3F)) as i8; wi += 1;
-            *(buf + wi) = (0x80 | (cp & 0x3F)) as i8; wi += 1;
+            buf.push_byte((0xE0 | (cp >> 12)) as u8);
+            buf.push_byte((0x80 | ((cp >> 6) & 0x3F)) as u8);
+            buf.push_byte((0x80 | (cp & 0x3F)) as u8);
         } else {
-            *(buf + wi) = (0xF0 | (cp >> 18)) as i8; wi += 1;
-            *(buf + wi) = (0x80 | ((cp >> 12) & 0x3F)) as i8; wi += 1;
-            *(buf + wi) = (0x80 | ((cp >> 6) & 0x3F)) as i8; wi += 1;
-            *(buf + wi) = (0x80 | (cp & 0x3F)) as i8; wi += 1;
+            buf.push_byte((0xF0 | (cp >> 18)) as u8);
+            buf.push_byte((0x80 | ((cp >> 12) & 0x3F)) as u8);
+            buf.push_byte((0x80 | ((cp >> 6) & 0x3F)) as u8);
+            buf.push_byte((0x80 | (cp & 0x3F)) as u8);
         }
-        return wi;
     }
 }
 
