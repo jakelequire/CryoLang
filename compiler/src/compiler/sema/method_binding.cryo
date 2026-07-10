@@ -679,13 +679,36 @@ type struct MethodBinding {
     /// owner-binding context (receiver type params -> concrete args, plus `This`).
     /// Writes the method's FunctionDeclNode through `out_func` (null when nothing
     /// to infer).  Shared by `resolve_generic_method_return` + `stash_method_call_bindings`.
-    find_generic_method_for_call(mut &this, recv_type: TypeRef, member: MemberAccessNode*,
+    find_generic_method_for_call(mut &this, mut recv_type: TypeRef, member: MemberAccessNode*,
                                  out_func: FunctionDeclNode**) -> ResolutionContext {
         *out_func = null;
         mut owner_ctx: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
         if (this.ctx.generic_registry == null) { return owner_ctx; }
         if (this.ctx.type_resolver == null)    { return owner_ctx; }
         if (member == null)                    { return owner_ctx; }
+
+        // Unwrap a Pointer/Reference receiver to the underlying nominal type so
+        // every method lookup below keys off the struct/class/enum rather than
+        // the pointer type.  A pointer/reference receiver (`h: DefaultHasher*;
+        // h.fold(x)`, or a `mut &this`-style forward) otherwise matches no
+        // template / owner here, so the method's type-args are never stashed and
+        // the monomorphizer leaves the generic call unspecialized -> codegen
+        // emits the symbolic `fold$…T` symbol (E0900 / a runtime hang).  Value
+        // receivers already arrive nominal, so this is a no-op for them.
+        mut ru: Type* = this.arena.lookup(recv_type.id);
+        mut du: i32 = 0;
+        while (ru != null && du < 8) {
+            if (ru.kind == TypeKind::Pointer) {
+                recv_type = (ru as PointerType*).pointee;
+                ru = this.arena.lookup(recv_type.id);
+            } else if (ru.kind == TypeKind::Reference) {
+                recv_type = (ru as ReferenceType*).referent;
+                ru = this.arena.lookup(recv_type.id);
+            } else {
+                break;
+            }
+            du += 1;
+        }
 
         const inst: InstantiatedType* = this.types.peel_to_instantiation(recv_type);
         if (inst != null) {
