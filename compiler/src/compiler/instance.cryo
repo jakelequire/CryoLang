@@ -1595,7 +1595,7 @@ type struct CompilerInstance {
                     const objp: string = format("%s/%s.o",
                         ctx.project_config.deps_dir_for(
                             ModuleInfo::origin_subdir(mi.origin, mi.origin_name)),
-                        Compiler::BuildManifest::Manifest::mangle_module(ctx.intern_table.resolve(mi.name)));
+                        Compiler::BuildManifest::Manifest::path_module(ctx.intern_table.resolve(mi.name)));
                     if (metadata::exists(Path::from_cstr(objp))) {
                         pm_cached[m as i64] = true;
                     }
@@ -1852,7 +1852,7 @@ type struct CompilerInstance {
                     cg_obj[i as i64] = format("%s/%s.o",
                         ctx.project_config.deps_dir_for(
                             ModuleInfo::origin_subdir(_mi.origin, _mi.origin_name)),
-                        Compiler::BuildManifest::Manifest::mangle_module(_mn));
+                        Compiler::BuildManifest::Manifest::path_module(_mn));
                     cdebug("[Compiler] Codegen: reused cached object %s\n", cg_obj[i as i64]);
                     continue;
                 }
@@ -1916,21 +1916,21 @@ type struct CompilerInstance {
                 // thread (before it is handed to a worker), when --emit-llvm is
                 // set via CLI flag or cryoconfig args.
                 if (this.config.emit_llvm || config.emit_llvm) {
-                    const mn_len: u64 = mod_name.length();
-                    const mn_buf: i8* = intrinsics::malloc(mn_len + 1) as i8*;
-                    intrinsics::memcpy(mn_buf as void*, mod_name as void*, mn_len);
-                    mn_buf[mn_len] = 0;
-                    for (mut k: u64 = 0; k < mn_len; k++) {
-                        if (mn_buf[k] == ':') { mn_buf[k] = '_'; }
-                    }
                     mut ir_dir: string = "build/target/release/local/ir";
                     if (ctx.project_config != null) {
                         ir_dir = ctx.project_config.ir_dir_for(
                             ModuleInfo::origin_subdir(
                                 mod_info.origin, mod_info.origin_name));
                     }
-                    ProjectConfig::mkdir_p(ir_dir);
-                    const ll_path: string = format("%s/%s.ll", ir_dir, mn_buf as string);
+                    // IR (`.ll`) files mirror the module namespace as
+                    // SUBDIRECTORIES under `ir/`, exactly like the object files
+                    // under `deps/` — same `Manifest::path_module` mapping — so the
+                    // IR tree mirrors the source tree instead of one flat folder
+                    // of `__`-joined stems.
+                    const ll_rel: string =
+                        Compiler::BuildManifest::Manifest::path_module(mod_name);
+                    const ll_path: string = format("%s/%s.ll", ir_dir, ll_rel);
+                    ProjectConfig::mkdir_p(ll_path.parent_dir());
                     mut ll_err: i8* = null;
                     const ll_ok: i32 = llvm::LLVMPrintModuleToFile(
                         ctx.artifacts.ir.llvm_module, ll_path, &ll_err as void*);
@@ -1938,7 +1938,6 @@ type struct CompilerInstance {
                         fmt::eprintln(f"warning: failed to write {ll_path}: {ll_err as string}");
                         llvm::LLVMDisposeMessage(ll_err as void*);
                     }
-                    intrinsics::free(mn_buf as void*);
                 }
 
                 // Resolve WHERE/HOW to emit on the MAIN thread (needs ctx + the

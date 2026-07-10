@@ -81,6 +81,32 @@ type struct DeclVisitEmitter {
         cdebug("[IRGen]   impl done\n"); fflush(null);
     }
 
+    /// The arena's CANONICAL qualified name for a struct/union/class decl —
+    /// the prefix its method bodies must mangle under.  Must agree exactly with
+    /// `DeclarationEmitter::canonical_type_qname`, which named the declaration:
+    /// if the two disagree, the declaration is left bodyless (and, being a
+    /// monomorph, `linkonce_odr`) while the body is emitted under a second
+    /// symbol nobody references — LLVM rejects the module with "Global is
+    /// external, but doesn't have external or weak linkage".
+    ///
+    /// `this.cg.qualify` stamps the EMITTING module's namespace, which is the
+    /// canonical one only by coincidence.  For an injected monomorph the two
+    /// diverge — a spec lives in the module owning its type argument, not its
+    /// template's — so fall through to the arena's bare-name alias, which the
+    /// monomorphizer registers for every spec.
+    canonical_impl_target(mut &this, name: SymbolStr) -> SymbolStr {
+        const di: DeclarationIndex* = this.cg.get_decl_index();
+        const local: SymbolStr = this.cg.qualify(name);
+        mut tref: TypeRef = di.lookup_type(local);
+        if (!tref.is_valid()) { tref = di.lookup_type(name); }
+        if (!tref.is_valid()) { tref = this.cg.get_arena().lookup_by_name(name); }
+        if (tref.is_valid()) {
+            const q: SymbolStr = this.cg.get_arena().get_qualified_name(tref);
+            if (q.is_valid()) { return q; }
+        }
+        return local;
+    }
+
     emit_struct_decl(mut &this, visitor: ASTVisitor*, node: StructDeclNode*) -> void {
         if (node == null) { return; }
         if (node.generic_params.length > 0) { return; }
@@ -88,25 +114,7 @@ type struct DeclVisitEmitter {
         const sname: string = this.cg.resolve(node.name);
         cdebug("[IRGen]   struct methods: %s (%lld methods)\n",
                sname, node.methods.length); fflush(null);
-        // Use the arena's canonical qualified name for specialized
-        // structs so method keys match the DI registration.
-        const s_di: DeclarationIndex* = this.cg.get_decl_index();
-        const s_local: SymbolStr = this.cg.qualify(node.name);
-        mut s_ref: TypeRef = s_di.lookup_type(s_local);
-        if (!s_ref.is_valid()) {
-            s_ref = s_di.lookup_type(node.name);
-        }
-        if (s_ref.is_valid()) {
-            const s_arena: TypeArena* = this.cg.get_arena();
-            const s_qname: SymbolStr = s_arena.get_qualified_name(s_ref);
-            if (s_qname.is_valid()) {
-                this.state.current_impl_target = s_qname;
-            } else {
-                this.state.current_impl_target = s_local;
-            }
-        } else {
-            this.state.current_impl_target = s_local;
-        }
+        this.state.current_impl_target = this.canonical_impl_target(node.name);
         for (mut j: i64 = 0; j < node.methods.length; j++) {
             this.generate_method_body(visitor, node.methods[j]);
         }
@@ -120,23 +128,7 @@ type struct DeclVisitEmitter {
         if (node == null) { return; }
         if (node.generic_params.length > 0) { return; }
         if (node.methods.length == 0) { return; }
-        const u_di: DeclarationIndex* = this.cg.get_decl_index();
-        const u_local: SymbolStr = this.cg.qualify(node.name);
-        mut u_ref: TypeRef = u_di.lookup_type(u_local);
-        if (!u_ref.is_valid()) {
-            u_ref = u_di.lookup_type(node.name);
-        }
-        if (u_ref.is_valid()) {
-            const u_arena: TypeArena* = this.cg.get_arena();
-            const u_qname: SymbolStr = u_arena.get_qualified_name(u_ref);
-            if (u_qname.is_valid()) {
-                this.state.current_impl_target = u_qname;
-            } else {
-                this.state.current_impl_target = u_local;
-            }
-        } else {
-            this.state.current_impl_target = u_local;
-        }
+        this.state.current_impl_target = this.canonical_impl_target(node.name);
         for (mut j: i64 = 0; j < node.methods.length; j++) {
             this.generate_method_body(visitor, node.methods[j]);
         }
@@ -150,31 +142,7 @@ type struct DeclVisitEmitter {
         const cname: string = this.cg.resolve(node.name);
         cdebug("[IRGen]   class methods: %s (%lld methods)\n",
                cname, node.methods.length); fflush(null);
-        // Use the arena's canonical qualified name for specialized
-        // classes so method keys match the DI registration.  Mirrors
-        // the struct path in `emit_struct_decl` - without the canonical
-        // lookup a spec'd `Bucket<u32, i32>` injected into the consuming
-        // module emits its body under that module's namespace, while
-        // call sites in the defining module reference the canonical
-        // qualified name; the mismatch surfaces as an undefined-reference
-        // link error.
-        const c_di: DeclarationIndex* = this.cg.get_decl_index();
-        const c_local: SymbolStr = this.cg.qualify(node.name);
-        mut c_ref: TypeRef = c_di.lookup_type(c_local);
-        if (!c_ref.is_valid()) {
-            c_ref = c_di.lookup_type(node.name);
-        }
-        if (c_ref.is_valid()) {
-            const c_arena: TypeArena* = this.cg.get_arena();
-            const c_qname: SymbolStr = c_arena.get_qualified_name(c_ref);
-            if (c_qname.is_valid()) {
-                this.state.current_impl_target = c_qname;
-            } else {
-                this.state.current_impl_target = c_local;
-            }
-        } else {
-            this.state.current_impl_target = c_local;
-        }
+        this.state.current_impl_target = this.canonical_impl_target(node.name);
         for (mut j: i64 = 0; j < node.methods.length; j++) {
             this.generate_method_body(visitor, node.methods[j]);
         }

@@ -921,23 +921,23 @@ type struct CodegenPasses {
             output_dir = ctx.project_config.deps_dir_for(
                 CodegenPasses::current_origin_subdir(ctx));
         }
-        // mkdir_p creates every missing level (`target`, `<profile>`,
-        // `<origin>`, `deps`, and any custom `--build-dir=...` prefix); a bare
-        // `mkdir` would fail on the nested path and object emission would
-        // error with "No such file or directory".
-        ProjectConfig::mkdir_p(output_dir);
-
-        // Mangle module name: replace "::" with "_" for filesystem safety.
-        mut safe_name: string = ctx.artifacts.ir.module_name;
-        const name_len: u64 = safe_name.length();
-        const name_buf: i8* = intrinsics::malloc(name_len + 1) as i8*;
-        intrinsics::memcpy(name_buf as void*, safe_name as void*, name_len);
-        name_buf[name_len] = 0;
-        for (mut k: u64 = 0; k < name_len; k++) {
-            if (name_buf[k] == ':') { name_buf[k] = '_'; }
-        }
-        safe_name = name_buf as string;
-        return format("%s/%s.o", output_dir, safe_name);
+        // Object files mirror the module namespace as SUBDIRECTORIES under the
+        // origin's `deps/` dir (`std::core::intrinsics` ->
+        // `<deps>/std/core/intrinsics.o`), so the build tree mirrors the source
+        // tree instead of collapsing every module into one flat folder of
+        // `__`-joined stems.  `Manifest::path_module` is the single source of
+        // truth for this mapping, shared with the incremental cache probe/reuse
+        // and the manifest's artifact prediction; they MUST agree or the
+        // predicted path diverges from the emitted one and caching breaks.
+        const rel: string = Compiler::BuildManifest::Manifest::path_module(
+            ctx.artifacts.ir.module_name);
+        const obj_path: string = format("%s/%s.o", output_dir, rel);
+        // mkdir_p the object's PARENT (the namespace subdirs), which subsumes
+        // `deps/` and any `--build-dir=...` prefix; a bare `mkdir` of the deep
+        // path would fail and object emission would error "No such file or
+        // directory".
+        ProjectConfig::mkdir_p(obj_path.parent_dir());
+        return obj_path;
     }
 
     /// Dump the LLVM module to a `.ll` text file at `path`.  Skips the

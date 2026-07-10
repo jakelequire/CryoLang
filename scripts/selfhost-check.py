@@ -439,25 +439,28 @@ def _config_without_bin(text: str) -> str:
 # ---------------------------------------------------------------------------
 WIN_BOOT = ROOT / "bin" / "cryo.exe"
 
-# Per-stage build dirs, kept off the Linux build/.bin trees so a Windows host
-# running the Linux chain under WSL into the same repo doesn't collide.
+# Per-stage build dirs.  Nested under the same `self/` subtree as the Linux
+# stages (which use `self/sN`) so every selfhost artifact lives under
+# `build/self` and `.bin/self`; the `win-` name keeps them distinct from the
+# Linux `sN` stages, so a Windows host running the Linux chain under WSL into
+# the same repo still doesn't collide.
 _WIN_STAGE_DIRS = [
-    ROOT / "stdlib"   / ".bin"  / "win-s1",
-    ROOT / "compiler" / "build" / "win-s2",
-    ROOT / "stdlib"   / ".bin"  / "win-s2",
-    ROOT / "compiler" / "build" / "win-s3",
-    ROOT / "stdlib"   / ".bin"  / "win-s3",
-    ROOT / "compiler" / "build" / "win-s4",
+    ROOT / "stdlib"   / ".bin"  / "self" / "win-s1",
+    ROOT / "compiler" / "build" / "self" / "win-s2",
+    ROOT / "stdlib"   / ".bin"  / "self" / "win-s2",
+    ROOT / "compiler" / "build" / "self" / "win-s3",
+    ROOT / "stdlib"   / ".bin"  / "self" / "win-s3",
+    ROOT / "compiler" / "build" / "self" / "win-s4",
 ]
-WIN_S2_EXE = ROOT / "compiler" / "build" / "win-s2" / "cryo.exe"
-WIN_S3_EXE = ROOT / "compiler" / "build" / "win-s3" / "cryo.exe"
+WIN_S2_EXE = ROOT / "compiler" / "build" / "self" / "win-s2" / "cryo.exe"
+WIN_S3_EXE = ROOT / "compiler" / "build" / "self" / "win-s3" / "cryo.exe"
 # stage-3 / stage-4 emitted per-module IR; compared for the fixed point.
 # Build-dir roots for stages 4 and 6; the per-module IR lives under
 # <root>/target/release/<bucket>/*/ir/*.ll for whatever target bucket the
 # build resolved to (host-windows for a gnu default, the triple otherwise) —
 # _compare_ir_trees globs across buckets so it doesn't matter which.
-WIN_S3_IR  = ROOT / "compiler" / "build" / "win-s3"
-WIN_S4_IR  = ROOT / "compiler" / "build" / "win-s4"
+WIN_S3_IR  = ROOT / "compiler" / "build" / "self" / "win-s3"
+WIN_S4_IR  = ROOT / "compiler" / "build" / "self" / "win-s4"
 
 
 def make_windows_stages(runner: list, env: dict) -> list:
@@ -474,12 +477,12 @@ def make_windows_stages(runner: list, env: dict) -> list:
 
     sl, cm = ROOT / "stdlib", ROOT / "compiler"
     return [
-        Stage("stdlib",   "pinned",  ".bin/win-s1",  sl, build(boot, ".bin/win-s1"), env),
-        Stage("compiler", "pinned",  "build/win-s2", cm, build(boot, "build/win-s2"), env),
-        Stage("stdlib",   "stage-2", ".bin/win-s2",  sl, build(s2,   ".bin/win-s2"), env),
-        Stage("compiler", "stage-2", "build/win-s3", cm, build(s2,   "build/win-s3", emit=True), env),
-        Stage("stdlib",   "stage-3", ".bin/win-s3",  sl, build(s3,   ".bin/win-s3"), env),
-        Stage("compiler", "stage-3", "build/win-s4", cm, build(s3,   "build/win-s4", emit=True), env),
+        Stage("stdlib",   "pinned",  ".bin/self/win-s1",  sl, build(boot, ".bin/self/win-s1"), env),
+        Stage("compiler", "pinned",  "build/self/win-s2", cm, build(boot, "build/self/win-s2"), env),
+        Stage("stdlib",   "stage-2", ".bin/self/win-s2",  sl, build(s2,   ".bin/self/win-s2"), env),
+        Stage("compiler", "stage-2", "build/self/win-s3", cm, build(s2,   "build/self/win-s3", emit=True), env),
+        Stage("stdlib",   "stage-3", ".bin/self/win-s3",  sl, build(s3,   ".bin/self/win-s3"), env),
+        Stage("compiler", "stage-3", "build/self/win-s4", cm, build(s3,   "build/self/win-s4", emit=True), env),
     ]
 
 
@@ -500,11 +503,17 @@ def _drop_llvm_dll_beside(exe: Path):
 
 
 def _compare_ir_trees(root_a: Path, root_b: Path):
-    """Compare two per-module IR trees (<root>/*/ir/*.ll).  Returns
+    """Compare two per-module IR trees (<root>/*/ir/**/*.ll).  Returns
     (True, (nmods, bytes)) on match, (False, first_diff_name) on mismatch, or
     (None, reason) when they can't be compared."""
-    a = {p.name: p for p in root_a.glob("**/ir/*.ll")}
-    b = {p.name: p for p in root_b.glob("**/ir/*.ll")}
+    # Per-module `.ll` files live in per-namespace SUBDIRECTORIES under `ir/`
+    # (e.g. `ir/std/core/error.ll`), so glob recursively and key by the path
+    # RELATIVE to `ir/` — a plain basename collides across subdirs
+    # (`core/error.ll` vs `io/error.ll` both basename `error.ll`).
+    def _key(p: Path) -> str:
+        return str(p).rsplit("/ir/", 1)[-1]
+    a = {_key(p): p for p in root_a.glob("**/ir/**/*.ll")}
+    b = {_key(p): p for p in root_b.glob("**/ir/**/*.ll")}
     if not a or not b:
         return None, "no per-module IR found (was --emit-llvm honored?)"
     if set(a) != set(b):
@@ -581,7 +590,7 @@ def run_windows_selfhost(runner: list, verbose: bool = False) -> str:
     ok, detail = _compare_ir_trees(WIN_S3_IR, WIN_S4_IR)
     if ok is None:
         print(f"  {C.RED}✗ cannot compare windows IR:{C.RESET} {detail}")
-        print(f"     {C.DIM}looked under {WIN_S3_IR.relative_to(ROOT)} and …/win-s4{C.RESET}")
+        print(f"     {C.DIM}looked under {WIN_S3_IR.relative_to(ROOT)} and …/self/win-s4{C.RESET}")
         result = "fail"
     elif ok:
         nmods, total = detail
