@@ -319,37 +319,14 @@ type struct Manifest {
         text.drop();
     }
 
-    /// Fold a NUL-terminated string's bytes + a separator NUL into a hasher
-    /// held by POINTER, byte-for-byte identical to `DefaultHasher::fold(string)`
-    /// but via the non-generic `write_u8`.
-    ///
-    /// Why not just `h.fold(s)`: `fold` is a *generic* inherent method, and the
-    /// compiler does not currently monomorphize a generic method invoked
-    /// through a pointer/reference (it emits one unspecialized `fold$…T` symbol
-    /// for every T → invalid IR / a runtime hang). Value receivers are fine, so
-    /// every other fingerprint site still uses `h.fold(x)` directly; only the
-    /// pointer-held file/depfile folds route through the plain trait methods
-    /// (`write_u8` / `write_uint`), which monomorphize correctly through a
-    /// pointer.
-    static fold_cstr(h: DefaultHasher*, s: string) -> void {
-        const bytes: u8* = s as u8*;
-        mut i: u64 = 0;
-        while (bytes[i] != 0 as u8) {
-            h.write_u8(bytes[i]);
-            i = i + 1;
-        }
-        h.write_u8(0 as u8);
-    }
-
     /// Fold a file's full byte content (NULs included) into the running digest
     /// `h`. A missing or unreadable file folds a distinct marker so it still
     /// perturbs the fingerprint. The byte count is mixed in last as a length
-    /// guard. `h` is held by pointer, so this folds via the trait methods
-    /// (`write_u8` / `write_uint`) and `fold_cstr` rather than the generic
-    /// `fold` (see `fold_cstr`).
+    /// guard. File reading is compiler-specific, so this lives here and drives
+    /// the canonical `DefaultHasher::fold` for the actual byte mixing.
     static fold_file(h: DefaultHasher*, path: string) -> void {
         if (!metadata::exists(Path::from_cstr(path))) {
-            Manifest::fold_cstr(h, "<missing>");
+            h.fold("<missing>");
             return;
         }
         match (file::read(Path::from_cstr(path))) {
@@ -358,13 +335,13 @@ type struct Manifest {
                 const n: u64 = bytes.length();
                 const d: u8* = bytes.as_ptr();
                 for (mut i: u64 = 0; i < n; i++) {
-                    h.write_u8(d[i]);
+                    h.fold(d[i]);
                 }
                 bytes.drop();
-                h.write_uint(n as u128, 8);
+                h.fold(n);
             }
             Result::Err(_) => {
-                Manifest::fold_cstr(h, "<unreadable>");
+                h.fold("<unreadable>");
             }
         }
     }
