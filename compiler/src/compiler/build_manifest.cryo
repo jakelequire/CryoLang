@@ -64,20 +64,6 @@ type struct ModuleEntry {
 }
 
 
-// FNV-1a folding helpers
-
-
-// Compiler self-fingerprint
-
-
-// Per-module cache key components
-
-
-// Hex / string helpers
-
-
-// Per-module key sidecar (*.modkeys): `namespace<TAB>keyhex` per line
-
 /// Prior per-module cache keys, loaded from the `*.modkeys` sidecar. Parallel
 /// `names`/`keys` arrays; `lookup` returns the stored key hex for a namespace
 /// or "" when absent (a never-before-seen module always rebuilds).
@@ -304,7 +290,7 @@ type struct Manifest {
         for (mut i: i64 = 0; i < modules.length; i++) {
             const obj: string = format("%s/%s.o",
                 this.cfg.deps_dir_for(modules[i].origin_subdir),
-                Manifest::mangle_module(modules[i].namespace_name));
+                Manifest::path_module(modules[i].namespace_name));
             const obj_size: i64 = Manifest::file_size_bytes(obj);
             mut m: JsonObject = JsonObject::new();
             m.put("namespace",   JsonValue::from_cstr(modules[i].namespace_name));
@@ -483,6 +469,38 @@ type struct Manifest {
         for (mut i: u64 = 0; i < len; i++) {
             if (buf[i] == ':') { buf[i] = '_'; }
         }
+        return buf as string;
+    }
+
+    /// Map a namespace to its object-file RELATIVE PATH: each `::` becomes a
+    /// directory separator (`std::core::intrinsics` -> `std/core/intrinsics`),
+    /// while a lone `_` inside a segment (`raw_buffer`) is preserved.  Object
+    /// files are laid out in per-namespace SUBDIRECTORIES under the origin's
+    /// `deps/` dir (rather than one flat folder of `__`-joined stems), so the
+    /// build tree mirrors the source tree.  Every site that names a module's
+    /// `.o` — fresh emit (`legacy_obj_path`), the incremental cache probe/reuse,
+    /// and this manifest's artifact prediction — MUST route through here, or the
+    /// predicted path and the emitted path diverge and caching breaks.  The `::`
+    /// -> `/` collapse shrinks the string, so `malloc(len+1)` is ample.
+    static path_module(ns: string) -> string {
+        const len: u64 = ns.length();
+        const buf: i8* = intrinsics::malloc(len + 1) as i8*;
+        intrinsics::memcpy(buf as void*, ns as void*, len);
+        buf[len] = 0;
+        mut w: u64 = 0;
+        mut i: u64 = 0;
+        while (i < len) {
+            if (i + 1 < len && buf[i] == ':' && buf[i + 1] == ':') {
+                buf[w] = '/';
+                w = w + 1;
+                i = i + 2;
+            } else {
+                buf[w] = buf[i];
+                w = w + 1;
+                i = i + 1;
+            }
+        }
+        buf[w] = 0;
         return buf as string;
     }
 

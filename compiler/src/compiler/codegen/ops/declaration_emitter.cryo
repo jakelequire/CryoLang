@@ -307,6 +307,23 @@ type struct DeclarationEmitter {
     }
 
     /// Declare a single function signature (no body generation).
+    /// A monomorphization gets `linkonce_odr` linkage.  It is a pure function of
+    /// (template, type-args): every module that instantiates the same generic
+    /// with the same arguments clones the same source into the same symbol, so
+    /// duplicate definitions are equivalent by construction and the linker may
+    /// keep any one.  This is what lets a spec be emitted at its USE SITE — and
+    /// lets a separately-compiled consumer emit its own copy of one the prebuilt
+    /// library already carries — without a multiple-definition error.
+    ///
+    /// `main` is exempt: it is the C entry point, must be strong, and is never a
+    /// specialization anyway (the guard only documents the invariant).
+    static apply_spec_linkage(fn_val: LValue, node: FunctionDeclNode*,
+                              is_program_main: boolean) -> void {
+        if (node == null || is_program_main) { return; }
+        if (!node.is_specialization) { return; }
+        fn_val.set_linkage(LLinkage::LinkOnceODR);
+    }
+
     declare_function(mut &this, node: FunctionDeclNode*) -> void {
         // Skip generic templates.
         if (node.generic_params.length > 0) {
@@ -428,6 +445,7 @@ type struct DeclarationEmitter {
 
         // Add the function to the LLVM module.
         const fn_val: LValue = this.llvm_module.add_function(fn_name, fn_type);
+        DeclarationEmitter::apply_spec_linkage(fn_val, node, is_program_main);
 
         // Phase 1: attach `sret(%T)` to LLVM parameter slot 0 when the
         // classifier promoted the return to Indirect.  Call sites detect
@@ -543,6 +561,41 @@ type struct DeclarationEmitter {
         }
     }
 
+    /// The arena's CANONICAL qualified name for a struct/union/class decl —
+    /// the key its methods are registered under, and therefore the prefix every
+    /// caller's cross-module reference mangles.
+    ///
+    /// `qualify_symbol_sym` would stamp the EMITTING module's namespace, which
+    /// is only the canonical one by coincidence.  For an injected monomorph the
+    /// two diverge: a spec is placed in the module owning its type argument
+    /// (`Array<u8, GlobalAlloc>` -> `alloc::allocator`), while its canonical
+    /// identity stays with the template (`collections::array::5Array$Lh_...$G`).
+    /// Deriving the name from the emitting module renamed the symbol —
+    /// `raw_buffer::RawBuffer$Lh...::new_in` became
+    /// `allocator::RawBuffer$Lh...::new_in` — so callers, which mangle the
+    /// canonical form, could not resolve it (E0636 / undefined reference).
+    ///
+    /// The DI lookups only hit when the emitting module happens to be the
+    /// canonical one, so fall through to the arena's bare-name alias, which the
+    /// monomorphizer registers for every spec (`TypeArena::add_name_alias`).
+    canonical_type_ref(mut &this, name: SymbolStr) -> TypeRef {
+        const ctx_ptr: CompilationContext* = this.ctx;
+        const di: DeclarationIndex* = ctx_ptr.decl_index;
+        mut tref: TypeRef = di.lookup_type(ctx_ptr.qualify_symbol_sym(name));
+        if (!tref.is_valid()) { tref = di.lookup_type(name); }
+        if (!tref.is_valid()) { tref = this.get_arena().lookup_by_name(name); }
+        return tref;
+    }
+
+    canonical_type_qname(mut &this, name: SymbolStr) -> SymbolStr {
+        const tref: TypeRef = this.canonical_type_ref(name);
+        if (tref.is_valid()) {
+            const q: SymbolStr = this.get_arena().get_qualified_name(tref);
+            if (q.is_valid()) { return q; }
+        }
+        return this.ctx.qualify_symbol_sym(name);
+    }
+
     /// Declare methods defined inline within a struct declaration.
     declare_struct_methods(mut &this, node: StructDeclNode*) -> void {
         if (node.generic_params.length > 0) {
@@ -551,28 +604,7 @@ type struct DeclarationEmitter {
         if (node.methods.length == 0) {
             return;
         }
-        // Use the arena's canonical qualified name for the struct type.
-        // For specialized structs (e.g., Array_Token), the arena name is
-        // the correct DI key (e.g., std::collections::array::Array_Token).
-        // qualify_symbol_sym would produce the consuming module's namespace
-        // prefix, which doesn't match the DI registration.
-        const ctx_ptr: CompilationContext* = this.ctx;
-        const di: DeclarationIndex* = ctx_ptr.decl_index;
-        mut qualified: SymbolStr = SymbolStr::empty();
-        // Try both local-qualified and bare name in the DI, then get the
-        // arena's canonical qualified name from the TypeRef.
-        const local_sym: SymbolStr = ctx_ptr.qualify_symbol_sym(node.name);
-        mut di_ref: TypeRef = di.lookup_type(local_sym);
-        if (!di_ref.is_valid()) {
-            di_ref = di.lookup_type(node.name);
-        }
-        if (di_ref.is_valid()) {
-            const arena: TypeArena* = this.get_arena();
-            qualified = arena.get_qualified_name(di_ref);
-        }
-        if (!qualified.is_valid()) {
-            qualified = local_sym;
-        }
+        const qualified: SymbolStr = this.canonical_type_qname(node.name);
         for (mut i: i64 = 0; i < node.methods.length; i++) {
             this.declare_method(node.methods[i], qualified);
         }
@@ -587,21 +619,7 @@ type struct DeclarationEmitter {
         if (node.methods.length == 0) {
             return;
         }
-        const ctx_ptr: CompilationContext* = this.ctx;
-        const di: DeclarationIndex* = ctx_ptr.decl_index;
-        mut qualified: SymbolStr = SymbolStr::empty();
-        const local_sym: SymbolStr = ctx_ptr.qualify_symbol_sym(node.name);
-        mut di_ref: TypeRef = di.lookup_type(local_sym);
-        if (!di_ref.is_valid()) {
-            di_ref = di.lookup_type(node.name);
-        }
-        if (di_ref.is_valid()) {
-            const arena: TypeArena* = this.get_arena();
-            qualified = arena.get_qualified_name(di_ref);
-        }
-        if (!qualified.is_valid()) {
-            qualified = local_sym;
-        }
+        const qualified: SymbolStr = this.canonical_type_qname(node.name);
         for (mut i: i64 = 0; i < node.methods.length; i++) {
             this.declare_method(node.methods[i], qualified);
         }
@@ -612,30 +630,8 @@ type struct DeclarationEmitter {
         if (node.generic_params.length > 0) {
             return;
         }
-        // Use the arena's canonical qualified name for specialized
-        // classes so method keys match the DI registration.  Mirrors
-        // the struct path in `declare_struct_methods` - without the
-        // canonical lookup, a spec'd `Bucket<u32, i32>` injected into
-        // the consuming module would get keyed under that module's
-        // namespace (e.g. `std::core::intrinsics::Bucket<u32, i32>`)
-        // while the call site (in the defining module) emits the
-        // canonical `Main::Bucket<u32, i32>` reference, producing an
-        // `undefined reference` at link time.
-        const ctx_ptr: CompilationContext* = this.ctx;
-        const di: DeclarationIndex* = ctx_ptr.decl_index;
-        const local_sym: SymbolStr = ctx_ptr.qualify_symbol_sym(node.name);
-        mut qualified: SymbolStr = SymbolStr::empty();
-        mut di_ref: TypeRef = di.lookup_type(local_sym);
-        if (!di_ref.is_valid()) {
-            di_ref = di.lookup_type(node.name);
-        }
-        if (di_ref.is_valid()) {
-            const arena: TypeArena* = this.get_arena();
-            qualified = arena.get_qualified_name(di_ref);
-        }
-        if (!qualified.is_valid()) {
-            qualified = local_sym;
-        }
+        const di_ref: TypeRef = this.canonical_type_ref(node.name);
+        const qualified: SymbolStr = this.canonical_type_qname(node.name);
         for (mut i: i64 = 0; i < node.methods.length; i++) {
             this.declare_method(node.methods[i], qualified);
         }
@@ -1215,6 +1211,7 @@ type struct DeclarationEmitter {
         intrinsics::free(buf);
 
         const fn_val: LValue = this.llvm_module.add_function(fn_name, fn_type);
+        DeclarationEmitter::apply_spec_linkage(fn_val, node.func, false);
 
         // Attach `sret(%T)` to LLVM param 0 when the classifier promoted
         // the return.  This must match what `build_function_ltype`
