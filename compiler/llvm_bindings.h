@@ -705,6 +705,8 @@ LLVMMetadataRef LLVMDIBuilderCreateFunction(LLVMDIBuilderRef Builder,
 
 void LLVMSetSubprogram(LLVMValueRef Func, LLVMMetadataRef SP);
 
+LLVMMetadataRef LLVMGetSubprogram(LLVMValueRef Func);
+
 LLVMMetadataRef LLVMDIBuilderCreateDebugLocation(LLVMContextRef Ctx,
     unsigned Line, unsigned Column, LLVMMetadataRef Scope,
     LLVMMetadataRef InlinedAt);
