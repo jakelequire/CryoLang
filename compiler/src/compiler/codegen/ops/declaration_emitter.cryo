@@ -1593,43 +1593,56 @@ type struct DeclarationEmitter {
         const dib:  void* = ctx_ptr.di_builder;
         const file: void* = ctx_ptr.di_file;
 
-        const subroutine_ty: void* = llvm::LLVMDIBuilderCreateSubroutineType(
-            dib, file, null, 0, 0);
-
-        // DW_AT_name: module-qualified source name (e.g.
-        // "Compiler::Codegen::State::FunctionRegistry::get") so same-named
-        // methods are distinguishable in a backtrace, rather than the bare
-        // leaf name.
-        const disp_sym: SymbolStr = ctx_ptr.qualify_symbol_sym(node.name);
-        const name: string = this.resolve(disp_sym);
-        const name_len: u64 = name.length();
-
-        // DW_AT_linkage_name: the function's actual ELF symbol (the mangled
-        // name LLVM emits for `fn_val`).  Setting this to exactly the ELF
-        // symbol is what lets perf/gdb/lldb bridge a sampled address -> ELF
-        // symbol -> this DISubprogram and surface the readable DW_AT_name
-        // instead of the raw mangled symbol.  Previously this slot was
-        // (incorrectly) the source name, so the bridge never matched.
-        mut link_len: u64 = 0;
-        const linkage: string = llvm::LLVMGetValueName2(fn_val.raw, &link_len);
-
         mut line: u32 = node.span.start_line;
         if (line == 0) { line = 1; }
 
-        // IsOptimized: reflect the build's opt level so debuggers know to
-        // warn about optimized-out locals / reordered code.
-        mut is_opt: i32 = 0;
-        if (ctx_ptr.opt_level > 0) { is_opt = 1; }
+        // Idempotent: if `fn_val` already carries a DISubprogram, REUSE it. A
+        // function whose prologue is emitted more than once in this module (a
+        // generic spec placed/walked twice — e.g. `Layout_of<T>` routed into a
+        // consumer module) would otherwise get a SECOND `LLVMDIBuilderCreateFunction`
+        // and `LLVMSetSubprogram`, detaching the first subprogram while the
+        // instructions it already scoped keep pointing at it -> the verifier
+        // rejects "!dbg attachment points at wrong subprogram" (`-g`/`--dev`
+        // only; release emits no debug info so the double emission was silently
+        // tolerated). Reusing the existing subprogram keeps every instruction in
+        // the function scoped to one SP.
+        mut sp: void* = llvm::LLVMGetSubprogram(fn_val.raw);
+        if (sp == null) {
+            const subroutine_ty: void* = llvm::LLVMDIBuilderCreateSubroutineType(
+                dib, file, null, 0, 0);
 
-        const sp: void* = llvm::LLVMDIBuilderCreateFunction(
-            dib, file, name, name_len, linkage, link_len, file, line,
-            subroutine_ty,
-            0,        // IsLocalToUnit
-            1,        // IsDefinition
-            line,     // ScopeLine
-            0,        // Flags
-            is_opt);  // IsOptimized
-        llvm::LLVMSetSubprogram(fn_val.raw, sp);
+            // DW_AT_name: module-qualified source name (e.g.
+            // "Compiler::Codegen::State::FunctionRegistry::get") so same-named
+            // methods are distinguishable in a backtrace, rather than the bare
+            // leaf name.
+            const disp_sym: SymbolStr = ctx_ptr.qualify_symbol_sym(node.name);
+            const name: string = this.resolve(disp_sym);
+            const name_len: u64 = name.length();
+
+            // DW_AT_linkage_name: the function's actual ELF symbol (the mangled
+            // name LLVM emits for `fn_val`).  Setting this to exactly the ELF
+            // symbol is what lets perf/gdb/lldb bridge a sampled address -> ELF
+            // symbol -> this DISubprogram and surface the readable DW_AT_name
+            // instead of the raw mangled symbol.  Previously this slot was
+            // (incorrectly) the source name, so the bridge never matched.
+            mut link_len: u64 = 0;
+            const linkage: string = llvm::LLVMGetValueName2(fn_val.raw, &link_len);
+
+            // IsOptimized: reflect the build's opt level so debuggers know to
+            // warn about optimized-out locals / reordered code.
+            mut is_opt: i32 = 0;
+            if (ctx_ptr.opt_level > 0) { is_opt = 1; }
+
+            sp = llvm::LLVMDIBuilderCreateFunction(
+                dib, file, name, name_len, linkage, link_len, file, line,
+                subroutine_ty,
+                0,        // IsLocalToUnit
+                1,        // IsDefinition
+                line,     // ScopeLine
+                0,        // Flags
+                is_opt);  // IsOptimized
+            llvm::LLVMSetSubprogram(fn_val.raw, sp);
+        }
 
         mut col: u32 = node.span.start_col;
         if (col == 0) { col = 1; }
