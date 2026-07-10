@@ -13,6 +13,7 @@ namespace std::core::hash;
 
 import core::option;
 import core::slice;
+import core::mem;
 
 type trait Hasher {
     /// Feed a single byte into the hash state.
@@ -27,6 +28,21 @@ type trait Hasher {
                 Option::Some(byte) => { this.write_u8(byte); }
                 Option::None => { break; }
             }
+            i++;
+        }
+    }
+
+    /// Feed the low `byte_count` bytes of `value`, least-significant byte
+    /// first (little-endian, platform-independent). The single entry point
+    /// for hashing any fixed-width integer: `write_u8` is the 1-byte special
+    /// case; this covers 2/4/8/16-byte values. The default loops `write_u8`;
+    /// implementations may override with a faster path.
+    write_uint(mut &this, value: u128, byte_count: u32) -> void {
+        mut x: u128 = value;
+        mut i: u32 = 0;
+        while (i < byte_count) {
+            this.write_u8((x & 0xFF) as u8);
+            x = x >> 8;
             i++;
         }
     }
@@ -62,6 +78,59 @@ type struct DefaultHasher {
     static offset_basis() -> u64 {
         return FNV_OFFSET_BASIS;
     }
+
+    /// Fold one delimited value into the running digest, dispatched at compile
+    /// time via `static match (T)` (no runtime cost, no trait bound — the arms
+    /// ARE the accepted types). Lets a digest be composed from heterogeneous
+    /// typed parts (`h.fold(x); h.fold(y); h.finish()`) without a per-type
+    /// helper name. Every primitive scalar is accepted:
+    ///   - integers (`u8`..`u128`, `i8`..`i128`, `usize`/`isize`) — their
+    ///     two's-complement bytes at NATURAL width, low byte first (LE), so a
+    ///     `u8` folds 1 byte, a `u32` 4, a `u64` 8, a `u128` 16.
+    ///   - `f32`/`f64` — their IEEE-754 bit pattern (via `mem::transmute`), so
+    ///     `0.0`/`-0.0`/NaN payloads fold distinctly (4 / 8 bytes).
+    ///   - `char`      — its 32-bit Unicode scalar (4 bytes, LE).
+    ///   - `boolean`   — one byte, `1` or `0`.
+    ///   - `string`    — its NUL-terminated bytes, then a separator NUL so
+    ///                   adjacent concatenations can't collide ("ab"+"c" vs
+    ///                   "a"+"bc").
+    /// Fixed-width values need no separator; only the variable-length `string`
+    /// arm appends one. Any non-primitive type is a compile error (no `_` arm).
+    fold<T>(mut &this, value: T) -> void {
+        static match (T) {
+            // 1-byte
+            u8      => { this.write_u8(value); }
+            i8      => { this.write_u8(value as u8); }
+            boolean => { this.write_u8(if (value) { 1 as u8 } else { 0 as u8 }); }
+            // 2-byte
+            u16 => { this.write_uint(value as u128, 2); }
+            i16 => { this.write_uint((value as u16) as u128, 2); }
+            // 4-byte
+            u32  => { this.write_uint(value as u128, 4); }
+            i32  => { this.write_uint((value as u32) as u128, 4); }
+            char => { this.write_uint((value as u32) as u128, 4); }
+            f32  => { this.write_uint(mem::transmute<f32, u32>(value) as u128, 4); }
+            // 8-byte
+            u64   => { this.write_uint(value as u128, 8); }
+            i64   => { this.write_uint((value as u64) as u128, 8); }
+            usize => { this.write_uint(value as u128, 8); }
+            isize => { this.write_uint((value as u64) as u128, 8); }
+            f64   => { this.write_uint(mem::transmute<f64, u64>(value) as u128, 8); }
+            // 16-byte
+            u128 => { this.write_uint(value, 16); }
+            i128 => { this.write_uint(value as u128, 16); }
+            // variable-length + separator
+            string => {
+                const bytes: u8* = value as u8*;
+                mut i: u64 = 0;
+                while (bytes[i] != 0 as u8) {
+                    this.write_u8(bytes[i]);
+                    i = i + 1;
+                }
+                this.write_u8(0 as u8);
+            }
+        }
+    }
 }
 
 const FNV_PRIME:        u64 = 1099511628211;
@@ -78,52 +147,24 @@ implement trait Hasher for struct DefaultHasher {
     }
 }
 
-// FNV-1a convenience digests
+// One-shot digest
 //
-// The single canonical FNV-over-bytes entry points, so callers that only
-// need a `u64` digest (HashMap's precomputed-hash bridge, the LSP's
-// diagnostic ids, the compiler's build fingerprint) don't re-derive the
-// offset basis + prime inline.
-
-/// FNV-1a digest of a NUL-terminated raw `string` (Cryo's C-string view).
-/// Stops at the first NUL, matching `string`'s equality and length
-/// semantics and the `Hash for string` impl below.
-function fnv1a_str(s: string) -> u64 {
+// The canonical single-value digest: fold a value's bytes through a fresh
+// `DefaultHasher` and return the `u64`. Works for ANY `Hash` type (strings,
+// integers, chars, …) via the `Hash` impls below, so callers that only need a
+// `u64` digest (HashMap's precomputed-hash bridge, the LSP's diagnostic ids,
+// the compiler's build-fingerprint atoms) don't re-derive the offset basis +
+// prime inline, and there's no per-type entry point to keep in sync. For a
+// running digest over several mixed values, drive a `DefaultHasher` directly
+// with `fold` / `finish`.
+function digest<T>(value: &T) -> u64
+where T: Hash {
     mut h: DefaultHasher = DefaultHasher::new();
-    const bytes: u8* = s as u8*;
-    mut i: u64 = 0;
-    while (bytes[i] != 0 as u8) {
-        h.write_u8(bytes[i]);
-        i = i + 1;
-    }
-    return h.finish();
-}
-
-/// FNV-1a digest of an explicit byte range (NUL bytes included).
-function fnv1a_bytes(ptr: u8*, len: u64) -> u64 {
-    mut h: DefaultHasher = DefaultHasher::new();
-    mut i: u64 = 0;
-    while (i < len) {
-        h.write_u8(ptr[i]);
-        i = i + 1;
-    }
+    value.hash(&h);
     return h.finish();
 }
 
 // Primitive Hash impls
-
-/// Shared helper for integer Hash impls: feed the little-endian bytes
-/// of `value` to the hasher.
-function hash_u64_le<H>(hasher: mut &H, value: u64) -> void 
-where H: Hasher {
-    mut v: u64 = value;
-    mut i: u32 = 0;
-    while (i < 8) {
-        hasher.write_u8((v & 0xFF) as u8);
-        v = v >> 8;
-        i++;
-    }
-}
 
 implement trait Hash for u8 {
     hash<H>(&this, hasher: mut &H) -> void 
@@ -133,23 +174,23 @@ implement trait Hash for u8 {
 }
 
 implement trait Hash for u16 {
-    hash<H>(&this, hasher: mut &H) -> void 
+    hash<H>(&this, hasher: mut &H) -> void
     where H: Hasher {
-        hash_u64_le(hasher, this as u64);
+        hasher.write_uint(this as u128, 8);
     }
 }
 
 implement trait Hash for u32 {
-    hash<H>(&this, hasher: mut &H) -> void 
+    hash<H>(&this, hasher: mut &H) -> void
     where H: Hasher {
-        hash_u64_le(hasher, this as u64);
+        hasher.write_uint(this as u128, 8);
     }
 }
 
 implement trait Hash for u64 {
-    hash<H>(&this, hasher: mut &H) -> void 
+    hash<H>(&this, hasher: mut &H) -> void
     where H: Hasher {
-        hash_u64_le(hasher, this);
+        hasher.write_uint(this as u128, 8);
     }
 }
 
@@ -161,23 +202,23 @@ implement trait Hash for i8 {
 }
 
 implement trait Hash for i16 {
-    hash<H>(&this, hasher: mut &H) -> void 
+    hash<H>(&this, hasher: mut &H) -> void
     where H: Hasher {
-        hash_u64_le(hasher, (this as u16) as u64);
+        hasher.write_uint((this as u16) as u128, 8);
     }
 }
 
 implement trait Hash for i32 {
-    hash<H>(&this, hasher: mut &H) -> void 
+    hash<H>(&this, hasher: mut &H) -> void
     where H: Hasher {
-        hash_u64_le(hasher, (this as u32) as u64);
+        hasher.write_uint((this as u32) as u128, 8);
     }
 }
 
 implement trait Hash for i64 {
-    hash<H>(&this, hasher: mut &H) -> void 
+    hash<H>(&this, hasher: mut &H) -> void
     where H: Hasher {
-        hash_u64_le(hasher, this as u64);
+        hasher.write_uint((this as u64) as u128, 8);
     }
 }
 
@@ -200,7 +241,7 @@ implement trait Hash for char {
         // low byte (e.g. 'A' 0x41 vs U+0141 vs U+1041) into one bucket,
         // degrading `HashMap<char, V>` / `HashSet<char>` to near-linear for
         // non-ASCII keys. Mirrors the `u32` impl.
-        hash_u64_le(hasher, this as u64);
+        hasher.write_uint((this as u64) as u128, 8);
     }
 }
 

@@ -41,6 +41,7 @@ import std::fs::path;
 import std::fs::file;
 import std::fmt;
 import std::core::primitives;
+import std::core::hash;
 import std::collections::string;
 import std::collections::str;
 
@@ -697,7 +698,7 @@ type struct VendorGenerator {
     static provenance_key(source_path: string, headers: &string[],
                           include_dirs: &string[], defines: &string[],
                           triple: string, cache_file: string, lang: string) -> string {
-        mut h: u64 = Manifest::fnv_seed();
+        mut h: DefaultHasher = DefaultHasher::new();
         const depfile: string = if (cache_file.length() > 0) {
             format("%s.deps", cache_file)
         } else {
@@ -705,7 +706,7 @@ type struct VendorGenerator {
         };
         if (depfile.length() > 0
                 && metadata::exists(Path::from_cstr(depfile))) {
-            h = VendorGenerator::fold_depfile(h, depfile);
+            VendorGenerator::fold_depfile(&h, depfile);
         } else {
             // Fallback (fresh register / pre-sidecar cache): entry headers only.
             for (mut i: i64 = 0; i < headers.length; i++) {
@@ -714,10 +715,10 @@ type struct VendorGenerator {
                 if (hp.length() == 0) {
                     // A missing header still perturbs the key (distinct marker +
                     // the requested name) so it can't masquerade as unchanged.
-                    h = Manifest::fnv_str(h, "<missing-header>");
-                    h = Manifest::fnv_str(h, headers[i]);
+                    h.fold("<missing-header>");
+                    h.fold(headers[i]);
                 } else {
-                    h = Manifest::fnv_file(h, hp);
+                    Manifest::fold_file(&h, hp);
                 }
             }
         }
@@ -727,37 +728,36 @@ type struct VendorGenerator {
         // touching any header) MUST invalidate the cache.  Distinct markers
         // keep the two lists from aliasing each other, and the per-element
         // order is the manifest order (stable across regenerations).
-        h = Manifest::fnv_str(h, "<include_dirs>");
+        h.fold("<include_dirs>");
         for (mut i: i64 = 0; i < include_dirs.length; i++) {
-            h = Manifest::fnv_str(h, include_dirs[i]);
+            h.fold(include_dirs[i]);
         }
-        h = Manifest::fnv_str(h, "<defines>");
+        h.fold("<defines>");
         for (mut i: i64 = 0; i < defines.length; i++) {
-            h = Manifest::fnv_str(h, defines[i]);
+            h.fold(defines[i]);
         }
         // The source language ("c" vs "c++") changes what libclang parses and
         // what the generator emits, so flipping it (without touching headers)
         // MUST invalidate the cache.  An empty/"c" lang folds the same marker so
         // existing C entries keep a stable key relative to each other.
-        h = Manifest::fnv_str(h, "<lang>");
-        h = Manifest::fnv_str(h, if ((lang as string) == "c++") { "c++" } else { "c" });
-        h = Manifest::fnv_str(h, triple);
-        h = Manifest::fnv_str(h, VendorGenerator::clang_version());
-        h = Manifest::fnv_u64(h, GENERATOR_VERSION as u64);
-        return h.to_hex_padded_str(16);
+        h.fold("<lang>");
+        h.fold(if ((lang as string) == "c++") { "c++" } else { "c" });
+        h.fold(triple);
+        h.fold(VendorGenerator::clang_version());
+        h.fold(GENERATOR_VERSION as u64);
+        return h.finish().to_hex_padded_str(16);
     }
 
     /// Fold the bytes of every file listed in an include-graph depfile (one path
-    /// per line, written by `write_depfile`) into the running hash `seed`.  A
+    /// per line, written by `write_depfile`) into the running digest `h`.  A
     /// listed file that has since been deleted perturbs the key with a distinct
     /// marker (so it can't masquerade as unchanged → forces a regeneration that
-    /// rebuilds the graph).  Blank lines are skipped.  Returns the updated hash.
-    static fold_depfile(seed: u64, depfile: string) -> u64 {
-        mut h: u64 = seed;
+    /// rebuilds the graph).  Blank lines are skipped.
+    static fold_depfile(h: DefaultHasher*, depfile: string) -> void {
         mut content: string = "";
         match (file::read_to_string(Path::from_cstr(depfile))) {
             Result::Ok(s)  => { content = s.into_raw(); }
-            Result::Err(_) => { return h; }
+            Result::Err(_) => { return; }
         }
         const len: i64 = content.length() as i64;
         mut i: i64 = 0;
@@ -770,15 +770,17 @@ type struct VendorGenerator {
             if (end > start) {
                 const path: string = content.substr(start, end - start);
                 if (metadata::exists(Path::from_cstr(path))) {
-                    h = Manifest::fnv_file(h, path);
+                    Manifest::fold_file(h, path);
                 } else {
-                    h = Manifest::fnv_str(h, "<missing-include>");
-                    h = Manifest::fnv_str(h, path);
+                    // `h` is held by pointer; fold via the trait-method helper,
+                    // not the generic `fold` (see Manifest::fold_cstr).
+                    Manifest::fold_cstr(h, "<missing-include>");
+                    Manifest::fold_cstr(h, path);
                 }
             }
             if (i < len) { i += 1; }   // skip '\n'
         }
-        return h;
+        return;
     }
 
     /// Write the include-graph sidecar `<cryo_path>.deps`: one input file path
