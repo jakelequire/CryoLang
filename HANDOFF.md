@@ -1,305 +1,276 @@
-# HANDOFF — Multi-threaded codegen: audit & further optimization
+# HANDOFF — separate compilation was removed; here is what must come back
 
-**Your mission (fresh agent):** audit multi-threading in the Cryo compiler's
-codegen and find what can still be optimized or improved. The core feature —
-**true in-process multi-threaded object emission** — is DONE, validated, and the
-default. This document tells you exactly what shipped, why, and where the
-remaining levers are so you don't re-derive a long investigation.
-
-Read this whole file first. The maintainer (Jake) wants **correct, principled**
-solutions, never "just make it work" hacks. Only Jake commits; you may repin.
-
----
-
-## 0. TL;DR
-
-| Item | State |
-|---|---|
-| In-process **multi-threaded** object emit | **DONE**, ZERO-COPY (live modules, no bitcode round-trip, no arena pause) |
-| Correctness | byte-identical serial-vs-threaded on **Windows + Linux**; `make selfhost-check` FIXED POINT; `make test` PASS; context auditor 0-foreign |
-| Config | `--codegen-threads=N` flag + `[compiler] codegen_threads` cryoconfig (default = CPU count; `1` = serial). NOT env-driven. |
-| Wall-clock win | compiler build 40s → 32s (~19%); stdlib ~26% |
-| Committed? | **NO** — uncommitted working tree (7 code files). Repin pending (from a clean tree, after Jake commits). |
-| Everything below §3 | **the audit targets — your job** |
-
-Design doc with the full journey+log: `.todo/plans/PARALLEL-CODEGEN.md`
-(read the top "UPDATE (c)" and "(b)" blocks). Memory:
-`memory/parallel-codegen-project.md`.
+> **Read this first.** Branch `remove-sepcomp` was **hard-reset** to `d63bbb72`, the last
+> commit before separate compilation began. The reset discarded 27 commits. Most were
+> sepcomp and are gone on purpose. **Six were not**, and they are listed below.
+>
+> **Nothing is lost.** `main` still points at `c9b25eef`. Every commit named here is
+> reachable: `git log main`, `git show <sha>`, `git cherry-pick <sha>`.
+>
+> Maintainer (Jake) wants **correct, principled** solutions, never expedient hacks or
+> silent fallbacks. **Only Jake commits**; you may repin.
+>
+> (Not to be confused with `HANDOFF.md`, which is the *parallel-codegen* handoff and is
+> unrelated to this work.)
 
 ---
 
-## 1. Orientation (5-minute version)
+## 0. Why the reset, and why `d63bbb72`
 
-- **Self-hosted compiler** written in Cryo, targets LLVM 20 via the **LLVM-C
-  API**. Compiler source: `compiler/src/compiler/` (~123 `.cryo`). Stdlib:
-  `stdlib/`. Build = bootstrap: pinned `bin/cryo`(+`.exe`) compiles stdlib +
-  compiler.
-- 9-stage pipeline per module: Frontend → ModuleResolution → DeclCollection →
-  TypeResolution → SemanticAnalysis → Specialization(mono) → CodegenPrep →
-  IRGeneration → (ObjectEmission). Object emission is the parallelized phase.
-- **Windows** needs `CRYO_CC=gcc`; build from PowerShell. **Linux/WSL** is where
-  self-host + `make test` run. The agent "Bash" tool here is Git Bash (no
-  `/mnt/c`); reach WSL via `wsl.exe -e bash -lc '...'` with `MSYS_NO_PATHCONV=1`.
+Separate compilation (`.crymeta` metadata + `.crygen` generic **source** slices + `.cryart`
+bundles) was correct but unfinished. Finishing it properly meant giving Cryo a serialized,
+name-resolved IR — weeks of work, itself gated on the mono-after-sema pipeline reorder.
+Not a v1.0 problem. It was cut.
 
----
+The cut point is **`d63bbb72`** ("feat: implement compile-once, link-twice optimization for
+bin and lib projects"). Its child `cf8a2161` is the **true first sepcomp commit** — *not*
+the one that created `compiler/src/compiler/sepcomp/` (`e9635cc7`). `cf8a2161` introduced
+`is_external`, `prebuilt`, `nonexternal_source_for_namespace`, and the monomorphization
+*placement inversion* in `instance.cryo`, `module_graph.cryo`, and
+`passes/specialization.cryo`. Resetting to `e9635cc7^` would have left all of that behind.
 
-## 2. What shipped — the multi-threaded emitter (how it works now)
-
-**Model:** the per-module pipeline runs IR-generation SERIALLY on the main
-thread (it reads shared compiler state — arena, intern table, decl index,
-lazily-declared cross-module externs). Only the **backend object emit**
-(`LLVMTargetMachineEmitToFile`: SelectionDAG instruction selection, register
-allocation, scheduling at O2) runs in PARALLEL, one module per worker.
-
-**Zero-copy, allocation-free workers:**
-- The producer (main thread) builds each module's IR in its **own
-  `LLVMContext`** (`set_codegen_context_new_keep_prior`), then builds that
-  module's **target machine on the main thread** and pushes an `EmitJob`
-  carrying `{ live LLVMModuleRef, its LLVMContextRef, its TargetMachineRef,
-  emit_path, … }`. The module stays alive (owned by the job).
-- Jobs accumulate to a batch of `cg_batch_cap` (= `cg_threads`) and are emitted
-  concurrently via `thread::Scope::new_with_stack(64 MiB)` (SelectionDAG recurses
-  deep — the default ~1 MiB thread stack overflows). Workers take **disjoint
-  round-robin slices**; the only write is `job.ok`, so no lock.
-- A worker's body (`codegen_emit_job`) makes the **raw** `LLVMTargetMachineEmitToFile`
-  call and defers error reporting to the main thread — it is **allocation-free on
-  the Cryo side**. That's deliberate (see §2.2).
-- After join, the main thread disposes module+context+TM (`dispose_emit_jobs`).
-  LLVM disposal must not interleave with emit.
-
-**Config resolution** (in `compile_project_with_ctx`): CLI
-`--codegen-threads` (`CompilerConfig.codegen_threads_override`) > cryoconfig
-`[compiler] codegen_threads` (`ProjectConfig.codegen_threads`) > env
-`CRYO_CODEGEN_THREADS` (debug-only) > auto (`available_parallelism`). Then
-`codegen_thread_count(n, requested)` clamps to the module count.
-`CRYO_CODEGEN_MODE=process` still selects the legacy multi-**process** emitter
-(child `cryo __emit-obj` from bitcode) as a fallback; `=serial` forces serial.
-
-### 2.1 Why the previous "it's impossible" conclusion was wrong
-An earlier attempt concluded concurrent LLVM codegen "corrupts process-global
-state, unsafe on both OSes," and shipped a multi-**process** emitter as a
-workaround. **That diagnosis was wrong.** A standalone C++ harness driving
-concurrent `LLVMTargetMachineEmitToFile` over the exact Cryo modules never faults
-(0 crashes, 60+ trials, 12 threads). The linked libLLVM is thread-safe
-(`LLVMIsMultithreaded()==1` on both the Linux `libLLVM.so.20.1` and the Windows
-`LLVM-C.dll`). Every crash was **Cryo-side**: two context-less LLVM-C calls
-leaked objects into the process-**global** `LLVMContext`, shared across every
-per-module context, so concurrent emit raced the shared object's use-list:
-- `LType::const_struct` → `LLVMConstStruct` (= `…InContext(GlobalContext)`).
-- `LBasicBlock::append` → `LLVMAppendBasicBlock` (= `…InContext(GlobalContext)`)
-  — the decisive one: every block + its `label` type + `void` terminators leaked.
-
-Both fixed to the `…InContext(LContext::current())` variant. A **context auditor**
-(`ctx_audit_module`, env `CRYO_CTX_AUDIT`) walks every module and flags any type
-whose `LLVMGetTypeContext` ≠ the module's; it's kept as a permanent invariant
-guard. **RULE:** never use a context-less LLVM-C object creator
-(`LLVMConstStruct`, `LLVMConstString`, `LLVMAppendBasicBlock`, `LLVMCreateBuilder`,
-`LLVMInt*Type()` w/o `InContext`, …) in codegen — always pass
-`LContext::current()`.
-
-### 2.2 Why there's no arena "pause" and no thread-safe arena
-The compiler uses a per-target **bump arena** (`std::alloc` GlobalArena,
-`stdlib/alloc/arena.cryo`; the peak-RSS optimization) that is single-threaded by
-design. An interim design paused it during the parallel region (a hack). The
-proper fix that shipped: the **workers allocate nothing**, so the arena is simply
-never touched off the main thread — no pause, no locks. A region allocator is
-single-threaded by design; the correct fix for "touched concurrently" is to stop
-touching it concurrently, not to bolt atomics onto the compiler's hottest path. A
-genuinely lock-free arena is feasible (`sync::atomic` has no alloc dependency) if
-you ever *need* worker-side allocation, but today you don't.
+Verified clean at `d63bbb72`: `crymeta`, `crygen`, `cryart`, `sepcomp`, `prebuilt`,
+`is_external`, `DepArtifact`, `CRYO_EMIT_ARTIFACT` → **0 hits** across `compiler/src/`.
 
 ---
 
-## 3. THE AUDIT — where the remaining wins are (your job)
+## 1. ALREADY RE-APPLIED — do not re-apply
 
-The ~19% wall win is **Amdahl-bound**: only the backend emit is parallel. Measure
-with `CRYO_TIMINGS=1 cryo build` (per-phase wall + a frontend/backend split).
-Representative per-target profile (O2, one `make cryo` = TWO such invocations —
-lib then bin):
-
-| phase | ~time | parallel? |
+| what | from | status |
 |---|---|---|
-| discovery | 3–4s | no |
-| frontend (lex/parse) | 2–3s | no |
-| monomorphization | ~1.5s | no |
-| sema/lowering | ~2s | no |
-| **IR-generation** | ~4–5s | **no (serial floor)** |
-| **backend emit (O2)** | ~6–9s serial → ~1.8s parallel | **YES (done)** |
-| link | ~0.5s | no |
+| `init_native_target()` at the `create_target_machine_with_opt` chokepoint | `c9b25eef` | **applied, uncommitted** |
 
-So ~15s/target is the SERIAL floor and the emit is already parallel. Ranked
-opportunities:
+**Why it matters.** LLVM's target registry is per-process and starts empty.
+`init_native_target()` used to run only inside per-module IR generation. An incremental
+build whose modules are **all** cached codegens zero modules — so nothing registers a
+target — yet a missing final binary still drives it on to link and, in test mode, to
+test-main synthesis, which creates a target machine and dies:
 
-### A. Overlap serial IR-gen with parallel emit (tractable, ~10% more)
-Today the producer builds a **batch** of `cg_threads` modules' IR (serial), then
-emits the batch (parallel, barrier), then the next batch. During emit the main
-thread blocks in `join_all` (no IR-gen); during IR-gen the cores idle. Wall ≈
-`ΣIR-gen + Σemit_batches`. Replace the batch-barrier with a **bounded
-producer/consumer pipeline**: workers emit already-built modules while the main
-thread keeps generating the next module's IR. Wall → ≈ `max(ΣIR-gen, Σemit)` +
-tail — hides the parallel-emit time behind IR-gen. Needs a small concurrent queue
-(stdlib has `sync::mpsc`; watch the memory bound — don't let un-emitted modules
-pile up: cap in-flight to ~`cg_threads`). **Caveat:** IR-gen mutates shared
-compiler state and MUST stay single-threaded; only the emit consumer is parallel.
-Keep registration topo-ordered.
-
-### B. Load-balance the emit (tractable)
-Workers get **static** round-robin slices. Module emit times vary a lot (a few
-huge modules dominate), so a slice with a giant module stalls the batch. Switch to
-a **shared work queue** (atomic index or `mpsc`) workers pull from — near-perfect
-balance, especially combined with (A). Verify byte-identity is unaffected (it
-won't be: order only matters for linker input, which is registered post-join in
-topo order, not completion order).
-
-### C. Parallelize the serial phases (big lever, high effort/risk)
-The ~15s serial floor is discovery/frontend/mono/sema/**IR-gen**. IR-gen is the
-fattest and the closest to the parallel boundary. Parallelizing any of these means
-taming shared mutable state: the **arena**, the **intern table**
-(`resolver/InternTable`), the **type registry/arena**, the **decl index**, the
-lazily-declared cross-module externs. Options: per-worker arenas + a merge, or
-concurrent data structures, or sharding modules across worker *pipelines*. Highest
-ceiling, highest risk — only after A/B. This is where a real design doc + Jake
-sign-off is warranted.
-
-### D. Adjacent build-time wins (not strictly threading, but compounding)
-- **`make cryo` double-compiles** the whole compiler (lib then bin over ~99%
-  identical source; the bin closure ⊇ the lib). "Compile-once, link-twice" is
-  ~50% off `make cryo`. Fully scoped in `.todo/plans/COMPILE-ONCE.md`. **Not
-  started.** Orthogonal to threading but the single biggest build-time lever.
-- **IR-level optimization is OFF** in project builds (passes are just
-  `[IRGeneration, ObjectEmission]`; no `PassID::Optimization`). Enabling it is
-  per-module and rides the same emit parallelism, and makes the compiler + every
-  user binary faster. **Blocked** by a latent IR-gen bug: post-opt
-  `LLVMVerifyModule` fails `Invalid operands for select instruction!` on
-  `std::core::primitives`. Fix that `select` first.
-- **Discovery double-lexes** every file (namespace index, then the frontend lexes
-  again) — a low-blast-radius serial win.
-- **Build-manifest hashing** folds files a byte at a time (`fnv_byte`) and hashes
-  each source ≥2×/build (~4.6% in an old callgrind). Word-at-a-time + hash-once.
-
-### E. Peak-RSS under threading (measure, maybe bound)
-Zero-copy keeps `cg_threads` live modules (each a full `LLVMContext`) alive per
-batch — higher than the interim bitcode design (one live at a time). The arena
-project fights ~2.4 GB OOMs. Measure peak RSS at high thread counts
-(`/usr/bin/time -v` on Linux); if it regresses, lower the default `cg_batch_cap`
-or make it a function of free memory. (A pipeline (A) naturally bounds in-flight.)
-
-### F. Thread-count/default tuning
-Default = `available_parallelism()`. Emit parallelism saturates well before
-core-count on many machines (memory-bandwidth bound); a smaller default might match
-wall time at lower RSS/scheduler overhead. Benchmark the curve.
-
----
-
-## 4. Traps & gotchas (save yourself the pain)
-
-- **Incremental-cache MISCOMPILE.** After editing spec-owner/codegen modules, an
-  incremental `cryo build` can produce a compiler that CRASHES on threaded builds;
-  a full `--no-incremental` rebuild fixes it. **Always validate the compiler with
-  `--no-incremental`.** (Root: a spec-owner module's cache key folds a global
-  digest.) This bit me once and looked like a real regression — it wasn't.
-- **`MALLOC_CHECK_=3` HIDES the heap-race** class of bug (it changes libc
-  timing). Diagnose concurrency crashes with gdb backtraces + a standalone C++
-  repro, not malloc checkers.
-- **Context leaks are invisible without assertions.** The linked libLLVM is a
-  non-assert (RelWithDebInfo) build, so a cross-context reference corrupts
-  silently instead of asserting. Use `CRYO_CTX_AUDIT=1 cryo build` — expect **0**
-  `FOREIGN-CTX` lines. If you add codegen that creates LLVM objects, re-run it.
-- **Object-dir path differs by host.** Windows native → `…/target/release/
-  host-windows/local/deps/*.o`; Linux → `…/host/local/deps`. `find … | head -1`
-  may grab a stale `.bin/self/s2` selfhost dir — target the fresh dir explicitly
-  when hashing for byte-identity.
-- **Background WSL tasks get SIGHUP'd** at turn boundaries in this environment —
-  run `make selfhost-check` (~4.5 min) in the FOREGROUND with a long timeout.
-- **Windows/Linux artifact contamination:** running Windows builds
-  (`CRYO_CC=gcc`) then `make test` on Linux fails linking `tests/helpers/
-  abi_helpers.o` (a COFF object). `rm -f tests/helpers/abi_helpers.o
-  tests/helpers/libabihelpers.a` before `make test` to force an ELF rebuild.
-- **Byte-identity is THE gate**, not "it runs." Check serial-vs-threaded AND
-  across selfhost stages. Thread count must never change output (it doesn't —
-  only registration order matters, and that's topo-fixed post-join).
-- **`![target(...)]` free fns** are the accepted pattern for platform splits /
-  thread entry points (`std::thread`'s `available_parallelism`, the trampolines).
-  Jake dislikes free functions generally but these are fine.
-- **`ffi::syscall` imported directly into a compiler module breaks codegen** —
-  that's why CPU detection lives in `std::thread`, and the compiler just calls it.
-
----
-
-## 5. Files changed (all UNCOMMITTED; the threaded-emit feature)
-
-- `compiler/llvm_bindings.h` — `LLVMAppendBasicBlockInContext` use; auditor
-  introspection (`LLVMGetTypeContext`, `LLVMPrintTypeToString`, `LLVMGetFirstGlobal`
-  /`GetNextGlobal`/`GetInitializer`).
-- `compiler/src/compiler/codegen/llvm_types.cryo` — `const_struct` and
-  `LBasicBlock::append` → `…InContext(LContext::current())` (the two leak fixes).
-- `compiler/src/compiler/codegen/passes.cryo` — `EmitJob {llvm_module,
-  llvm_context, tm, …}`, allocation-free `codegen_emit_job`, `emit_worker_entry` +
-  `EmitWorkerCtx`, the context auditor (`ctx_audit_module`/`ctx_audit_type`).
-- `compiler/src/compiler/instance.cryo` — codegen loop (build TM on main +
-  keep module alive), `emit_jobs_threaded`/`emit_jobs_serial`/`dispose_emit_jobs`,
-  `codegen_mode`, `codegen_thread_count(n, requested)`, config resolution,
-  `CompilerConfig.codegen_threads_override`, env-gated audit call,
-  `CODEGEN_MULTIPROC_MIN_MODULES`, `cg_batch_cap`.
-- `compiler/src/compiler/project_config.cryo` — `[compiler] codegen_threads`
-  field + `parse_codegen_threads`.
-- `compiler/src/CLI/_module.cryo` — `--codegen-threads` in the flag allowlist +
-  `flag_takes_value`.
-- `compiler/src/CLI/commands.cryo` — `--codegen-threads` parse into config.
-
-Retained but unused-by-default: the multi-process path (`run_multiprocess_emit`,
-`emit_object_from_bitcode`, CLI `__emit-obj`) — reachable via
-`CRYO_CODEGEN_MODE=process`.
-
-Reminder: **only Jake commits.** Repin from a clean tree after commit
-(`make pin` via WSL; do NOT force `CRYO_CC=gcc` on `make pin` — it breaks the
-cryo.exe cross-link).
-
----
-
-## 6. Build & validate
-
-```sh
-# Windows host (PowerShell), CRYO_CC=gcc:
-cd stdlib   && ../bin/cryo.exe build --no-incremental
-cd compiler && ../bin/cryo.exe build --no-incremental   # -> compiler/build/cryo.exe
-
-# Linux/WSL:
-cd compiler && ../bin/cryo build --no-incremental        # -> compiler/build/cryo
-
-# Phase timings (the profiler for your audit):
-CRYO_TIMINGS=1 cryo build
-
-# Control threading (NO env needed — this is the UI):
-cryo build --codegen-threads=1     # serial
-cryo build --codegen-threads=8     # cap the pool
-#   or cryoconfig:  [compiler]  codegen_threads = N
-# Debug knobs: CRYO_CODEGEN_THREADS=N, CRYO_CODEGEN_MODE=process|serial
-
-# Context-isolation invariant (MUST be 0):
-CRYO_CTX_AUDIT=1 cryo build 2>&1 | grep -c FOREIGN-CTX
-
-# THE correctness gates (Linux/WSL; run selfhost-check in the FOREGROUND):
-make selfhost-check    # 6-stage byte-identical fixed point; must print "FIXED POINT OK"
-rm -f tests/helpers/abi_helpers.o tests/helpers/libabihelpers.a && make test
-
-# Byte-identity spot check (serial vs threaded): build with --codegen-threads=1,
-# hash <deps>/*.o; rebuild with a high count; diff. Both must match.
+```
+error[E0900]: test-main synthesis: native target machine unavailable
+[Codegen] Target lookup failed for triple '<host>': ... (no targets are registered)
 ```
 
-Everything here is measured, byte-identity-checked, and selfhost-gated. Keep it
-that way — proper, not "just works."
+…on a build whose sources never changed. It hit `collect_multimod` and `ffi_cpp_link` —
+the only two `collect`-outcome projects, the only ones that synthesize a test main.
+
+**Deterministic repro** (failing before, passing after — re-verified on this branch):
+1. `cryo test` in `tests/tests/projects/collect_multimod` (cold) → pass
+2. rerun (warm) → pass
+3. delete **only** `build/collect_multimod-test[.exe]`, keep `build/target/**` objects → **failed before the fix**
+
+The fix registers the backend at the single chokepoint every target machine is created
+through, instead of trusting callers to have passed through codegen first. LLVM's
+initializers guard on a `static once_flag`, so it is idempotent and free. **Do not "fix"
+this by adding a fallback lookup elsewhere.**
 
 ---
 
-## 7. Suggested order of work
+## 2. MUST COME BACK — apply from `main`, in this order
 
-1. `CRYO_TIMINGS=1` on a clean `--no-incremental` compiler build; confirm the
-   serial-floor vs parallel-emit split on THIS machine before optimizing.
-2. **(B) load-balance** the emit (shared work queue) — cheap, safe, immediate.
-3. **(A) pipeline** IR-gen ∥ emit — hides the parallel-emit time; the best
-   threading-side win. Gate on byte-identical selfhost + peak-RSS not worse.
-4. **(D) compile-once** (`.todo/plans/COMPILE-ONCE.md`) and the invalid-`select`
-   fix → enable IR-opt. Biggest build-time levers, orthogonal to threading.
-5. **(C) parallelize the serial phases** — only with a design doc + Jake sign-off.
-6. Repin after Jake commits.
+Prefer `git cherry-pick` from `main` (authoritative). Standalone patch files were also
+saved to the agent scratchpad under `scratchpad/keepers/`, but they are a convenience only.
+
+### 2a. `2df466ad` — Windows self-hosting build paths + module path handling
+Pure Windows/build-path work, no sepcomp content. **Apply first**; later items sit on it.
+
+> ⚠️ This is the commit that makes per-module IR land in **nested** subdirectories under
+> `ir/` (`ir/Compiler/AST/Cloner.ll`). That is what breaks `selfhost-check.py` — see §3.
+
+### 2b. `ec1bba2b` — `fix(mono)`: register static generic method templates declared in impl blocks
+Independent mono bug fix. No sepcomp content. Clean.
+
+### 2c. `bb9cfaf0` — `feat(mono)`: place monomorphizations at their type argument, with `linkonce_odr`
+**The codegen improvement Jake explicitly wants back.** It encodes the Rust rule: a
+monomorphization lives with the module owning the concrete type argument that forced it.
+
+> ⚠️ **Not clean.** It touches `module_graph.cryo` / `passes/specialization.cryo` and drags
+> in `is_external` + `nonexternal_source_for_namespace`. With sepcomp gone there are **no
+> external modules**, so the external-module skip is vacuous. Keep the placement rule;
+> drop `is_external`, `is_owner_key_external()`, and the "non-external" qualifier on
+> `nonexternal_source_for_namespace()` (it collapses to a plain namespace → source-path
+> lookup). At the time of removal `is_external` had exactly **one writer** (the bundle
+> ingest, now gone) and five readers — two in `specialization.cryo`, one each in
+> `type_resolution.cryo` and `sema.cryo`, plus the `module_graph.cryo` helpers. All five
+> become dead once it is always `false`; delete them rather than leaving them dangling.
+
+### 2d. `61088f93` — `fix(codegen)`: give monomorph definitions `weak_odr` linkage in a comdat
+**Apply after 2c — it depends on that placement.** It fixed real duplicate-definition
+breakage (duplicate monomorph definitions; LLVM rejects the module / duplicate symbols at
+link). If the placement rule goes back, this must too. If it does *not* go back, re-validate
+before assuming this is safe to omit.
+
+---
+
+## 3. MUST COME BACK, BUT ONLY *WITH* §2a
+
+### `scripts/selfhost-check.py` — `_compare_ir_trees._key` must use `as_posix()`
+
+```python
+# WRONG: on a Windows host str(Path) yields backslashes, so the "/ir/" split never
+# matches; every key stays a full absolute path containing the stage dir
+# (win-s3 vs win-s4) and the two sets can never be equal.
+def _key(p: Path) -> str:
+    return str(p).rsplit("/ir/", 1)[-1]
+
+# RIGHT:
+def _key(p: Path) -> str:
+    return p.as_posix().rsplit("/ir/", 1)[-1]
+```
+
+**Do NOT apply this at `d63bbb72`.** Here `_compare_ir_trees` keys on `p.name`, and the
+build emits a *flattened* IR name (`Compiler__AST__Cloner.ll`) alongside the nested one, so
+basenames are unique and the comparator is correct. The `_key`/`rsplit` rewrite — and thus
+the bug — arrives with the nested-IR layout in **§2a**. Re-apply `as_posix()` in the same
+change that introduces `_key`.
+
+**The tell** you've hit it: `✗ cannot compare windows IR: module sets differ (233 vs 233)`
+— *equal counts, different name sets*. It means the Windows byte-identity fixed point has
+never actually been compared. It only ever worked under wine from a Linux host, where paths
+are already POSIX.
+
+---
+
+## 4. WANTED BACK, BUT RE-DERIVE — do not cherry-pick
+
+### The orthogonal `test.json` schema (from `c9b25eef`)
+
+The old schema fused two orthogonal things — the **fixture** (what you set up) and the
+**assertion** (what you check) — so every (fixture × assertion) pair needed its own enum
+variant and its own arm in `dispatch_project`. It reached seven outcomes:
+
+```
+collect | compile_fail | run | crymeta_roundtrip | crygen_e2e | crygen_fail | prebuilt_std_e2e
+```
+
+`crygen_e2e` and `crygen_fail` were *the same fixture*, differing only in whether the
+consumer must run or must fail to build. That is the proof the axes were fused.
+
+**Re-derive it, sepcomp-free:**
+
+```
+outcome:  collect | build | run
+
+expect:   exit_code         exact status (default 0)
+          fails             must exit non-zero; exit_code then ignored
+          stdout_contains   substring of combined output
+          output_contains   [] all must appear
+          output_excludes   [] none may appear
+          diagnostic        sugar: implies fails + appends error[<code>] to output_contains
+```
+
+`compile_fail` collapses into `build` + `expect.fails`, because `diagnostic: "E0200"` was
+always just `output_contains: ["error[E0200]"]` in disguise.
+
+> ⚠️ **Drop the fixture axis entirely.** `prepare` / `emit_artifact` / `argv` / `command` /
+> `{crymeta}` / `find_suffixed()` exist only to serve sepcomp and have **zero users** once
+> it is gone. The saved patch `KEEP-harness-schema-refactor-CONTAINS-SEPCOMP.patch`
+> contains them — do not apply it verbatim.
+
+One portability lesson worth preserving: the old sepcomp arms used `(cd X && VAR=1 …)` and
+`rm -rf`, which `cmd /c` cannot run — which is why `crygen_e2e` and `crymeta_roundtrip`
+were **silently red on every native Windows host**. Any future fixture must set env with
+`env::set_var` and change directory with `chdir` **in the runner process**, never through
+shell syntax.
+
+---
+
+## 5. Deliberately NOT coming back
+
+All pure sepcomp: `cf8a2161`, `e9635cc7`, `a64ae200`, `b3723b32`, `04d5c78c`, `39a427a9`,
+`2ba49789`, `f2c46166`, `566061a3`, `2c7def13`, `1cc336ca`, `2ddc8d22`, `a9a3001a`,
+`fe865a97`, `7dd371c0`, `8cf703a7`, `c917197f`, `a5b7262f`, `d46bf2c2`.
+
+Plus three repin chores (`c9599741`, `6033a243`, `7f54ba5a`) — **never cherry-pick a
+repin**; regenerate with `make pin`.
+
+Thirteen test projects went with them: `assoc_e2e`, `coherence_fail_e2e`, `crygen_e2e`,
+`crymeta_roundtrip`, `drop_e2e`, `methods_e2e`, `multimod_e2e`, `ops_e2e`, `overload_e2e`,
+`prebuilt_std_e2e`, `primmethod_e2e`, `traits_e2e`, `visibility_e2e`. The projects suite is
+back to **6**.
+
+> **Coverage gap this opens — worth closing.** Those projects were *phrased* as `lib/` +
+> prebuilt `consumer/`, but what they actually tested was the **language**: associated
+> types, drop semantics, methods, multi-module resolution, operator overloading, overload
+> resolution, primitive methods, traits, visibility, and trait coherence — **across a
+> module boundary**. Only their single-module unit tests remain.
+>
+> They can be rebuilt as ordinary **source path-dependencies**, which do work. The gotcha:
+> the dependency's `cryoconfig` must declare a `[lib]` section (`name` + `source_dir`),
+> otherwise `DepResolver::harvest_roots` contributes no source root and the consumer fails
+> with `error[E0500]: cannot find module ...`. The old fixtures declared only `[project]`,
+> because prebuilt mode never needed it.
+
+---
+
+## 6. Traps that cost real time — do not rediscover them
+
+- **`make test` does NOT rebuild the compiler.** `$(STAGE2)` and `$(LIBCRYO_A)` are bare
+  file targets with **no source prerequisites**; the Makefile says so outright: *"Run
+  `make cryo` first to pick up compiler changes."* Edit compiler source, run `make test`,
+  and you silently exercise the **previous** binary. Always:
+  ```sh
+  rm -f compiler/build/cryo stdlib/.bin/libcryo.a && make cryo && make test
+  ```
+  and **prove it**: `stat -c '%y %n' <edited source> compiler/build/cryo` — the binary must
+  be newer than the source. This single trap made a real bug look intermittent for hours.
+
+- **Cross-OS artifact clobber.** `stdlib/.bin/libcryo.a` and `tests/helpers/lib*.a`
+  alternate between ELF and PE/COFF when you build on Windows and then in WSL against the
+  same tree. Delete them when switching host; `make test` will not notice and the link
+  fails with confusing `undefined reference` errors.
+
+- **`make selfhost-check` can exit 0 while skipping Windows entirely.** Count the
+  successes: `grep -c 'FIXED POINT OK'` must be **2** (Linux + Windows). From a Linux host
+  the wine path returns `"skip"` (not `"fail"`) when `.toolchains/llvm-mingw/bin/clang.exe`
+  and `llvm-ar.exe` are absent. To get both fixed points **without** that download, run the
+  gate from the **Windows** host: `selfhost-check.py` drives the Linux six stages through
+  WSL and then runs the Windows six natively against `bin/cryo.exe` (needs `CRYO_CC=gcc`).
+  To re-check only the Windows half after the stages are built, import the script and call
+  `run_windows_selfhost([])`.
+
+- **`make cryo-exe` is a gate `selfhost-check` does not cover** — the Windows selfhost
+  stages only compare IR; they never link `cryo.exe`.
+
+- **Never `wsl --shutdown` while detached WSL processes are alive.** It wedges
+  `WSLService`; afterwards *every* `wsl.exe` call hangs — including `wsl --shutdown` itself
+  and `make pin`, which blocks on `pin-windows.cmd`'s first WSL call (`wslpath -a "%CD%"`)
+  before printing anything of its own, with `Ctrl+C` swallowed by the `for /f` subshell.
+  Recovery needs **elevation**: `Stop-Process -Name wslservice,vmmemWSL -Force`.
+  `Restart-Service` also hangs — it waits for an acknowledgement the wedged service never
+  sends. Also: WSL2 balloons its VM across repeated builds and never returns the memory to
+  Windows; that is not a compiler leak.
+
+- **Do not force `CRYO_CC=gcc` on `make pin`** — it breaks the `cryo.exe` cross-link.
+
+---
+
+## 7. State of this branch
+
+- `HEAD` = `d63bbb72` + the `llvm_types` native-target fix (§1), **uncommitted**.
+- `main` = `c9b25eef`, untouched. Everything above is recoverable from it.
+- Pinned `bin/cryo` / `bin/cryo.exe` are the ones committed at `d63bbb72`; `verify-pin` is
+  **OK**, and the tree bootstraps as-is.
+- **Re-pin after landing §1 and anything from §2** — the pins no longer match the source
+  once those go in. A pin from a dirty worktree is not reproducible
+  (`verify-pin.py --require-clean` is the release gate): commit first, then re-pin clean.
+
+### Verified at `d63bbb72` + §1 (Windows host)
+
+```
+unit           1418 passed, 0 failed
+compile-fail    124 passed, 0 failed
+projects          4 passed, 2 skipped (cxx, display)
+OVERALL        PASS
+```
+
+### Gate checklist before committing anything
+
+```sh
+rm -f compiler/build/cryo stdlib/.bin/libcryo.a && make cryo   # $(STAGE2) will not rebuild itself
+make test                                                      # projects: 6
+make selfhost-check                                            # require "FIXED POINT OK" x2
+make cryo-exe                                                  # separate gate
+cd compiler && CRYO_CTX_AUDIT=1 ../bin/cryo build --no-incremental 2>&1 | grep -c FOREIGN-CTX   # must be 0
+make pin                                                       # NOT with CRYO_CC=gcc
+```
