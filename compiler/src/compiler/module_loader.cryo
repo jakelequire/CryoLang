@@ -22,7 +22,10 @@ import std::fmt;
 import std::fs::file;
 import std::fs::metadata;
 import std::fs::path;
+import std::fs::dir;
 import std::collections::{ hashmap, pair };
+import std::collections::string;
+import std::collections::str;
 import std::core::option;
 
 type struct ModuleLoader {
@@ -218,114 +221,92 @@ type struct ModuleLoader {
     discover_tests_directory(mut &this, intern: InternTable*,
                              graph: ModuleGraph*, sink: DiagnosticSink*,
                              dir: string, debug: boolean) -> boolean {
-        const dp: void* = opendir(dir);
-        if (dp == null) { return true; }
+        mut rd: ReadDir = match (dir::read_dir(Path::from_cstr(dir))) {
+            Result::Ok(r)  => { r }
+            Result::Err(_) => { return true; }
+        };
 
         mut overall_ok: boolean = true;
-        mut entry: void* = readdir(dp);
-        while (entry != null) {
-            const name: string = dirent_name(entry);
-            if (name.eq(".") || name.eq("..")) {
-                entry = readdir(dp);
-                continue;
-            }
-            const full_path: string = format("%s/%s", dir, name);
-            if (this.is_dir_path(full_path)) {
-                // `tests/negative/` holds compile-fail cases: files that are
-                // intentionally malformed so the compiler rejects them. They
-                // must NOT be compiled into the shared test binary (one bad
-                // file would break the whole build). `cmd_test` drives them
-                // separately, compiling each on its own and checking the
-                // expected diagnostic.
-                if (name.eq("negative")) {
-                    entry = readdir(dp);
-                    continue;
-                }
-                // `tests/projects/` holds multi-module test PROJECTS: each is
-                // its own Cryo package (own cryoconfig + src/) driven as a
-                // subprocess by `cmd_test`'s projects meta-runner. Their
-                // sources must NOT be folded into this shared test binary.
-                if (name.eq("projects")) {
-                    entry = readdir(dp);
-                    continue;
-                }
-                // Recurse into subdirectories.
-                if (!this.discover_tests_directory(
-                        intern, graph, sink, full_path, debug)) {
-                    overall_ok = false;
-                }
-            } else {
-                const name_len: u64 = name.length();
-                if (name_len > 5) {
-                    const ext: string = name + ((name_len - 5) as i64);
-                    if (ext.eq(".cryo")) {
-                        if (!this.discover_module(
-                                intern, graph, sink, full_path, debug)) {
-                            overall_ok = false;
+        loop {
+            match (rd.next()) {
+                Option::Some(entry) => {
+                    mut name_s: String = String::from_str_c(entry.name());
+                    const name: string = name_s.as_ptr() as string;
+                    const full_path: string = format("%s/%s", dir, name);
+                    if (metadata::is_dir(Path::from_cstr(full_path))) {
+                        // `tests/negative/` holds compile-fail cases (files that
+                        // are intentionally malformed so the compiler rejects
+                        // them) and `tests/projects/` holds independent test
+                        // PACKAGES (own cryoconfig + src/). Neither may fold into
+                        // the shared test binary - one bad file would break the
+                        // whole build - so `cmd_test` drives them separately.
+                        if (!name.eq("negative") && !name.eq("projects")) {
+                            // Recurse into subdirectories.
+                            if (!this.discover_tests_directory(
+                                    intern, graph, sink, full_path, debug)) {
+                                overall_ok = false;
+                            }
+                        }
+                    } else {
+                        const name_len: u64 = name.length();
+                        if (name_len > 5) {
+                            const ext: string = name + ((name_len - 5) as i64);
+                            if (ext.eq(".cryo")) {
+                                if (!this.discover_module(
+                                        intern, graph, sink, full_path, debug)) {
+                                    overall_ok = false;
+                                }
+                            }
                         }
                     }
+                    name_s.drop();
                 }
+                Option::None => { break; }
             }
-            entry = readdir(dp);
         }
-        closedir(dp);
+        rd.drop();
         return overall_ok;
-    }
-
-    /// Portable directory test.  `opendir` succeeds only on directories, so
-    /// it tells files from subdirectories without relying on dirent's
-    /// `d_type` field - which glibc populates but mingw-w64's `struct dirent`
-    /// omits entirely (`dirent_type` is therefore meaningless on Windows).
-    /// Keyed on the full path so it is independent of the dirent layout.
-    is_dir_path(&this, path: string) -> boolean {
-        const d: void* = opendir(path);
-        if (d == null) { return false; }
-        closedir(d);
-        return true;
     }
 
     /// Recursively walk a directory, lex every .cryo file to extract its
     /// namespace declaration, and register namespace -> file_path in ns_map.
     scan_all_project_files(mut &this, dir: string, debug: boolean) -> void {
-        const dp: void* = opendir(dir);
-        if (dp == null) { return; }
+        mut rd: ReadDir = match (dir::read_dir(Path::from_cstr(dir))) {
+            Result::Ok(r)  => { r }
+            Result::Err(_) => { return; }
+        };
 
-        mut entry: void* = readdir(dp);
-        while (entry != null) {
-            const name: string = dirent_name(entry);
+        loop {
+            match (rd.next()) {
+                Option::Some(entry) => {
+                    mut name_s: String = String::from_str_c(entry.name());
+                    const name: string = name_s.as_ptr() as string;
+                    const full_path: string = format("%s/%s", dir, name);
 
-            // Skip . and ..
-            if (name.eq(".") || name.eq("..")) {
-                entry = readdir(dp);
-                continue;
-            }
-
-            const full_path: string = format("%s/%s", dir, name);
-
-            if (this.is_dir_path(full_path)) {
-                // `tests/projects/` are independent sub-packages (see
-                // `discover_tests_directory`); don't scan their namespaces
-                // into this project's resolution map.
-                if (name.eq("projects")) {
-                    entry = readdir(dp);
-                    continue;
-                }
-                // Recurse into subdirectory.
-                this.scan_all_project_files(full_path, debug);
-            } else {
-                // Regular file; check for .cryo extension.
-                const name_len: u64 = name.length();
-                if (name_len > 5) {
-                    const ext: string = name + ((name_len - 5) as i64);
-                    if (ext.eq(".cryo")) {
-                        this.scan_file_namespace(full_path);
+                    if (metadata::is_dir(Path::from_cstr(full_path))) {
+                        // `tests/projects/` are independent sub-packages (see
+                        // `discover_tests_directory`); don't scan their
+                        // namespaces into this project's resolution map.
+                        if (!name.eq("projects")) {
+                            // Recurse into subdirectory.
+                            this.scan_all_project_files(full_path, debug);
+                        }
+                    } else {
+                        // Regular file; check for .cryo extension.
+                        const name_len: u64 = name.length();
+                        if (name_len > 5) {
+                            const ext: string = name + ((name_len - 5) as i64);
+                            if (ext.eq(".cryo")) {
+                                this.scan_file_namespace(full_path);
+                            }
+                        }
                     }
+                    name_s.drop();
                 }
+                Option::None => { break; }
             }
-
-            entry = readdir(dp);
         }
-        closedir(dp);
+        rd.drop();
     }
 
     /// Lex a single .cryo file, extract the namespace declaration,
