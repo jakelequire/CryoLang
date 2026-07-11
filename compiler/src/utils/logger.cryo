@@ -5,6 +5,11 @@
 namespace Utils::Logger;
 import ffi::libc;
 import std::env;
+import std::io::stdio;
+import std::io::traits;
+import std::core::result;
+import std::collections::str;
+import std::collections::string;
 
 
 type enum LogLevel {
@@ -201,31 +206,41 @@ private:
             return;
         }
 
-        // Build the prefix: [LEVEL] [COMPONENT] message
-        // Using fprintf to stderr (fd 2 via the void* stderr handle).
-        // We write each part separately to avoid needing string concat.
+        // Assemble the whole line - [LEVEL][COMPONENT] message - into one
+        // buffer, then hand it to stderr in a single write.  `io::stdio::Stderr`
+        // writes straight through `write(2)` (fd 2, unbuffered), so the message
+        // appears immediately with no explicit flush, and stdout stays clean for
+        // any LSP/JSON-RPC channel.
+        mut line: String = String::new();
 
         if (this.config.enable_colors) {
-            const color: string = level.color();
-            intrinsics::fprintf(g_stderr, "%s", color);
+            line.push(level.color());
         }
 
-        intrinsics::fprintf(g_stderr, "[%s]", level.label());
+        line.push("[");
+        line.push(level.label());
+        line.push("]");
 
         if (this.config.enable_component_tags) {
-            intrinsics::fprintf(g_stderr, "[%s]", component.label());
+            line.push("[");
+            line.push(component.label());
+            line.push("]");
         }
 
-        intrinsics::fprintf(g_stderr, " %s", msg);
+        line.push(" ");
+        line.push(msg);
 
         if (this.config.enable_colors) {
-            intrinsics::fprintf(g_stderr, "%s", level.reset());
+            line.push(level.reset());
         }
 
-        intrinsics::fprintf(g_stderr, "\n");
+        line.push("\n");
 
-        // Flush after each message to ensure it appears immediately
-        fflush(g_stderr);
+        mut e: Stderr = stdio::stderr();
+        match (e.write(line.as_str().as_bytes())) {
+            Result::Ok(_)  => {}
+            Result::Err(_) => {}
+        }
     }
 }
 
