@@ -110,6 +110,20 @@ type struct MonoState {
     // shared by every module.
     method_specs:     HashMap<string, boolean>;
 
+    // Owner modules of generic-METHOD specs (those attached to an impl block or a
+    // fixed receiver's decl, NOT the `spec_entries` type/free-function specs).
+    // A method spec's definition is emitted into the module owning the impl block
+    // it is pushed onto, but that module is often an UPSTREAM dependency of the
+    // demanding call site (`Logger` demands `Stderr::write<Str>`, whose definition
+    // lands in `io::stdio`).  The per-module incremental cache keys such an owner
+    // module on the global source digest so a downstream module introducing a new
+    // spec invalidates the owner's `.o`; without this record the owner is misread
+    // as a leaf (keyed only on its own import closure) and a stale object — missing
+    // the spec's definition — is reused, yielding an undefined-symbol link error.
+    // One entry per newly-materialized method spec (may repeat an owner); the cache
+    // consumer folds them into a per-module boolean, so duplicates are harmless.
+    spec_owner_modules: SymbolStr[];
+
     static null() -> MonoState {
         return MonoState {
             arena:            null,
@@ -122,6 +136,7 @@ type struct MonoState {
             nested_visited:   [],
             error_count:      0,
             method_specs:     HashMap<string, boolean>::new(),
+            spec_owner_modules: [],
         };
     }
 
@@ -139,6 +154,16 @@ type struct MonoState {
         if (!mangled.is_valid()) { return; }
         const key: string = this.intern_table.resolve(mangled);
         this.method_specs.insert(key, true);
+    }
+
+    /// Record the module that owns a just-materialized generic-method spec (the
+    /// module whose impl block / receiver decl the spec method was pushed onto),
+    /// so the per-module incremental cache treats it as a spec owner.  Called once
+    /// per new method spec at DI registration; a `key` (namespace or source path)
+    /// resolvable by `ModuleGraph::source_file_for_owner_key`.
+    record_spec_owner_module(mut &this, key: SymbolStr) -> void {
+        if (!key.is_valid()) { return; }
+        this.spec_owner_modules.push(key);
     }
 
     wire(mut &this, arena: TypeArena*, generic_registry: GenericRegistry*,
