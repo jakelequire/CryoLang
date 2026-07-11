@@ -28,11 +28,13 @@ export function getConfig(): CryoConfig {
  *   2. `$CRYO_HOME` — the same install-root env var the compiler reads
  *      for stdlib lookup (see compiler/src/compiler/instance.cryo).
  *      Probed at `$CRYO_HOME/bin/cryolsp` (FHS-style install) and
- *      `$CRYO_HOME/tools/CryoLSP/build/bin/cryolsp` (when CRYO_HOME
+ *      `$CRYO_HOME/tools/CryoLSP/build/cryolsp` (when CRYO_HOME
  *      points at a source checkout).
- *   3. Workspace-local `tools/CryoLSP/build/bin/cryolsp` — the
- *      output of `cryo build` inside the in-repo CryoLSP project.
- *      Picks up dev builds without needing any setting changes.
+ *   3. Workspace-local `tools/CryoLSP/build/cryolsp` — the output of
+ *      `cryo build` (which emits into `output_dir`, = "build") inside
+ *      the in-repo CryoLSP project.  Picks up dev builds without
+ *      needing any setting changes.  The legacy `build/bin/` layout is
+ *      also probed as a fallback for older packaged installs.
  *   4. Workspace-local `bin/cryolsp` — legacy install location for
  *      older CryoLSP packages; kept so existing users don't break.
  *   5. `cryolsp` on `$PATH`.
@@ -93,6 +95,10 @@ export function resolveServerPath(
     const cryoHome = process.env.CRYO_HOME;
     if (cryoHome) {
         pushPair(cryoHome, 'bin');
+        // `cryo build` emits into `output_dir` (= "build") directly, so
+        // the binary is at build/cryolsp; build/bin/ is a legacy layout
+        // kept as a fallback for older packaged installs.
+        pushPair(cryoHome, 'tools', 'CryoLSP', 'build');
         pushPair(cryoHome, 'tools', 'CryoLSP', 'build', 'bin');
     }
 
@@ -101,6 +107,7 @@ export function resolveServerPath(
     if (workspaceFolders) {
         for (const folder of workspaceFolders) {
             const root = folder.uri.fsPath;
+            pushPair(root, 'tools', 'CryoLSP', 'build');
             pushPair(root, 'tools', 'CryoLSP', 'build', 'bin');
             pushPair(root, 'bin');
         }
@@ -122,13 +129,15 @@ export function resolveServerPath(
         try { cryoReal = fs.realpathSync(cryoPath); } catch { /* keep original */ }
         const cryoDir = path.dirname(cryoReal);
         pushPair(cryoDir);
-        // <repo>/bin/cryo → <repo>/tools/CryoLSP/build/bin/cryolsp
+        // <repo>/bin/cryo → <repo>/tools/CryoLSP/build/cryolsp
+        pushPair(cryoDir, '..', 'tools', 'CryoLSP', 'build');
         pushPair(cryoDir, '..', 'tools', 'CryoLSP', 'build', 'bin');
     }
 
     // 7. Extension-relative candidates.  When the extension lives at
     // `<repo>/tools/CryoAnalyzer/`, CryoLSP is a sibling at
     // `<repo>/tools/CryoLSP/`; legacy bin/ is two parents up.
+    pushPair(extensionPath, '..', 'CryoLSP', 'build');
     pushPair(extensionPath, '..', 'CryoLSP', 'build', 'bin');
     pushPair(extensionPath, '..', '..', 'bin');
 
@@ -152,9 +161,15 @@ function findOnPath(name: string): string | undefined {
     const sep = process.platform === 'win32' ? ';' : ':';
     const dirs = pathEnv.split(sep).filter((d) => d.length > 0);
 
+    // Try the name verbatim first (empty ext), then append PATHEXT
+    // variants.  Callers pass names that already include `.exe` on
+    // Windows (e.g. `cryolsp.exe`), so without the leading '' the loop
+    // would only ever probe `cryolsp.exe.EXE`, `cryolsp.exe.CMD`, … and
+    // never match the actual `cryolsp.exe` on disk.  The PATHEXT entries
+    // remain for callers that pass a bare command name (`cryo`).
     const exts =
         process.platform === 'win32'
-            ? (process.env.PATHEXT?.split(';') ?? ['.EXE', '.CMD', '.BAT'])
+            ? ['', ...(process.env.PATHEXT?.split(';') ?? ['.EXE', '.CMD', '.BAT'])]
             : [''];
 
     for (const dir of dirs) {
