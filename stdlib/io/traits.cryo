@@ -2,14 +2,16 @@
 ///! implements.
 ///!
 ///! Both report failure as `Result<_, IoError>`. The byte count in
-///! `read` / `write` is the number actually transferred: fewer than
-///! requested is normal (a partial read at EOF, a partial write due
-///! to a full pipe). Callers that need an all-or-nothing transfer
-///! use `write_all` / `read_exact`, which loop internally.
+///! `read` / `write_some` is the number actually transferred: fewer
+///! than requested is normal (a partial read at EOF, a partial write
+///! due to a full pipe). Callers that need an all-or-nothing transfer
+///! use `write` / `read_exact`, which loop internally.
 ///!
 ///! The default methods here (`read_all`, `read_exact`, `read_line`,
-///! `read_to_end`, `write_all`) are written once against the required
-///! `read` / `write` so every sink or source inherits them for free.
+///! `read_to_end`, `write`) are written once against the required
+///! `read` / `write_some` so every sink or source inherits them for
+///! free. `write` is generic over the payload (`Slice<u8>` / `Str` /
+///! C-`string` / `u8`), dispatched at compile time with `static match`.
 
 namespace std::io::traits;
 
@@ -280,22 +282,31 @@ type trait Read {
 }
 
 type trait Write {
-    /// Write up to `length` bytes. Returns the number actually
-    /// written; may be less than `length` on slow sinks. Callers
-    /// that need all bytes written use `write_all`.
-    write(mut &this, bytes: Slice<u8>) -> Result<u64, IoError>;
+    /// Low-level primitive: write up to `bytes.length()` bytes, returning
+    /// the number actually written (may be less than requested on a slow
+    /// sink). Every implementor provides this; the generic `write` loops
+    /// over it to deliver every byte.
+    write_some(mut &this, bytes: Slice<u8>) -> Result<u64, IoError>;
 
     /// Push any buffered bytes to the underlying sink. Unbuffered
     /// writers override with a no-op.
     flush(mut &this) -> Result<(), IoError>;
 
-    /// Write every byte of `bytes`, retrying short writes and
-    /// `Interrupted` errors. Fails with `WriteZero` if the sink
-    /// repeatedly refuses progress; better to surface that than spin.
-    write_all(mut &this, bytes: Slice<u8>) -> Result<(), IoError> {
-        mut remaining: Slice<u8> = bytes;
+    /// Write `data` in full, retrying short writes and `Interrupted`
+    /// errors. Generic over the payload, dispatched at compile time via
+    /// `static match`: a raw byte `Slice<u8>`, a `Str` view, a
+    /// NUL-terminated C `string`, or a single `u8`. Fails with `WriteZero`
+    /// if the sink repeatedly refuses progress; better to surface that
+    /// than spin.
+    write<T>(mut &this, data: T) -> Result<(), IoError> {
+        mut remaining: Slice<u8> = static match (T) {
+            Slice<u8> => { data }
+            Str       => { data.as_bytes() }
+            string    => { Str::new(data).as_bytes() }
+            u8        => { Slice<u8>::from_raw(&data, 1) }
+        };
         while (!remaining.is_empty()) {
-            match (this.write(remaining)) {
+            match (this.write_some(remaining)) {
                 Result::Ok(n) => {
                     if (n == 0) {
                         return Result::Err(IoError::new(IoErrorKind::WriteZero, 0));
@@ -311,21 +322,5 @@ type trait Write {
             }
         }
         return Result::Ok(());
-    }
-
-    /// Write every byte of `source`. Convenience over `write_all` for
-    /// the common "write a pre-formatted string" case; the bytes are
-    /// the `Str`'s underlying UTF-8, no extra work.
-    write_str(mut &this, source: Str) -> Result<(), IoError> {
-        return this.write_all(source.as_bytes());
-    }
-
-    /// Write `source` followed by `\n`. Single logical line of text;
-    /// whether it arrives in one syscall depends on the sink's
-    /// buffering strategy.
-    write_line(mut &this, source: Str) -> Result<(), IoError> {
-        this.write_all(source.as_bytes())?;
-        const lf: u8[1] = [0x0A];
-        return this.write_all(Slice::from_raw(&lf[0], 1));
     }
 }
