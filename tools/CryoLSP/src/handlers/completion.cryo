@@ -145,14 +145,32 @@ public function handle_completion(docs: &Docs, sessions: mut &SessionMap,
     ident_buf.truncate(ident_len);
     const ident_cstr: string = ident_buf.as_ptr() as string;
 
-    // 6. Get compiler session and context.  `ensure_fresh` recompiles
-    // this document if another document's edit reset the shared AST
-    // arena since it last compiled, so `ctx` below is never dangling.
-    const session: CompilerSession* = sessions.ensure_fresh(docs, uri);
+    // 6. Build a parseable "completion buffer".  LSP completion always
+    // fires on syntactically incomplete code - the dangling `f.` / `Foo::`
+    // the user just typed - and Cryo's parser aborts the whole frontend on
+    // it, so a clean compile yields no AST/types and we'd only ever reach
+    // the keyword fallback.  Splice a placeholder identifier in at the
+    // cursor so the receiver (`f`) / scope (`Foo`) parses and gets a real
+    // type stamped; the enumerators below then read it exactly as they do
+    // for a valid buffer.  Positions before the cursor are untouched, so
+    // the receiver/scope the resolver looks up keeps its coordinates.
+    mut patched: String = CompletionEngine::build_completion_buffer(text, byte_off);
+
+    // 7. Compile that buffer into this URI's session.  We bypass
+    // `ensure_fresh` (which compiles the *clean* buffer) and drive
+    // `recompile` with the patched source directly.  This compile resets
+    // the shared AST arena, so we flag the session dirty immediately: the
+    // next hover / diagnostic request rebuilds from the clean editor buffer
+    // and never sees the placeholder.
+    const session: CompilerSession* = sessions.get_or_create(uri);
     if (session == null) {
+        patched.drop();
         ident_buf.drop();
         return CompletionEngine::make_keyword_list();
     }
+    session.recompile(uri, patched.as_str());
+    patched.drop();
+    session.needs_recompile = true;
     const ctx: CompilationContext* = session.context();
     if (ctx == null || ctx.type_arena == null || ctx.intern_table == null) {
         ident_buf.drop();
@@ -534,5 +552,47 @@ type struct CompletionEngine {
         if (b >= 48 as u8 && b <= 57 as u8)  { return true; }
         if (b == 95 as u8) { return true; }
         return false;
+    }
+
+    /// Build a parseable copy of `text` with the placeholder identifier
+    /// `__cryo_completion__` spliced in at byte offset `cursor` (right after
+    /// the `.` / `::` the user just typed).  This turns the incomplete
+    ///   f.            ->  f.__cryo_completion__;
+    ///   Foo::         ->  Foo::__cryo_completion__;
+    /// into something the compiler parses cleanly, so the receiver / scope
+    /// before the cursor gets a real type and the enumerators resolve it.
+    ///
+    /// The trailing `;` is appended only when the rest of the cursor's line
+    /// is blank (statement position).  In an in-progress expression such as
+    /// `bar(f.)` the remainder is non-blank, so no `;` is added and the
+    /// result `bar(f.__cryo_completion__)` still parses; inserting a `;`
+    /// there would break it.  The placeholder name is never matched against
+    /// anything - the resolver reads the receiver/scope, which sits before
+    /// the splice - so a collision with a real member is harmless.
+    static build_completion_buffer(text: Str, cursor: u64) -> String {
+        const len: u64 = text.length();
+        const ptr: u8* = text.as_ptr();
+        const LF:  u8 = 10 as u8;
+        const SP:  u8 = 32 as u8;
+        const TAB: u8 = 9 as u8;
+        const CR:  u8 = 13 as u8;
+
+        // Statement position iff every byte from the cursor to the next
+        // newline (or EOF) is whitespace.
+        mut rest_blank: boolean = true;
+        mut i: u64 = cursor;
+        while (i < len) {
+            const b: u8 = ptr[i];
+            if (b == LF) { break; }
+            if (b != SP && b != TAB && b != CR) { rest_blank = false; break; }
+            i = i + 1;
+        }
+
+        mut out: String = String::with_capacity(len + 24);
+        if (cursor > 0)   { out.push(text.sub_bytes(0, cursor)); }
+        out.push("__cryo_completion__");
+        if (rest_blank)   { out.push_byte(59 as u8); }         // ';'
+        if (cursor < len) { out.push(text.sub_bytes(cursor, len)); }
+        return out;
     }
 }
