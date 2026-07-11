@@ -111,10 +111,30 @@ type struct BufWriter<W> {
         if (this.length == 0) {
             return Result::Ok(());
         }
-        const bytes: Slice<u8> = Slice::from_raw(this.buffer, this.length);
-        // On error, `length` is left intact; a follow-up retry still has
-        // the bytes. Callers that want to give up call `clear`.
-        this.writer.write_all(bytes)?;
+        // Drive the low-level `write_some` directly, looping over short
+        // writes and retrying `Interrupted` — a buffered writer IS this
+        // loop.  (We don't call the generic `write` on the inner sink:
+        // it's only known through the `W: Write` bound, and the buffered
+        // writer already owns the all-or-nothing responsibility.)
+        // On error `length` is left intact so a retry still has the bytes;
+        // callers that want to give up call `clear`.
+        mut remaining: Slice<u8> = Slice::from_raw(this.buffer, this.length);
+        while (!remaining.is_empty()) {
+            match (this.writer.write_some(remaining)) {
+                Result::Ok(n) => {
+                    if (n == 0) {
+                        return Result::Err(IoError::new(IoErrorKind::WriteZero, 0));
+                    }
+                    remaining = remaining.subslice(n, remaining.length());
+                }
+                Result::Err(err) => {
+                    match (err.kind) {
+                        IoErrorKind::Interrupted => { }
+                        _ => { return Result::Err(err); }
+                    }
+                }
+            }
+        }
         this.length = 0;
         return Result::Ok(());
     }
@@ -123,7 +143,7 @@ type struct BufWriter<W> {
 
 implement<W> trait Write for struct BufWriter<W>
 where W: Write {
-    write(mut &this, bytes: Slice<u8>) -> Result<u64, IoError> {
+    write_some(mut &this, bytes: Slice<u8>) -> Result<u64, IoError> {
         const incoming: u64 = bytes.length();
         // Buffer would overflow; flush what we have.
         if (this.length + incoming > this.capacity) {
@@ -133,7 +153,7 @@ where W: Write {
         // the buffer there's no point double-copying; send straight
         // to the sink.
         if (incoming >= this.capacity) {
-            return this.writer.write(bytes);
+            return this.writer.write_some(bytes);
         }
         intrinsics::memcpy(
             (this.buffer + this.length) as void*,
@@ -180,7 +200,7 @@ type struct LineWriter<W> {
 
 implement<W> trait Write for struct LineWriter<W>
 where W: Write {
-    write(mut &this, bytes: Slice<u8>) -> Result<u64, IoError> {
+    write_some(mut &this, bytes: Slice<u8>) -> Result<u64, IoError> {
         // Find the last newline in the incoming chunk. Everything up
         // to and including that newline is flushed immediately; the
         // tail goes through the normal buffer path. This gives the
@@ -201,18 +221,18 @@ where W: Write {
         }
 
         if (last_nl < 0) {
-            return this.inner.write(bytes);
+            return this.inner.write_some(bytes);
         }
 
         const head_len: u64 = (last_nl as u64) + 1;
         const head: Slice<u8> = bytes.subslice(0, head_len);
-        this.inner.write(head)?;
+        this.inner.write_some(head)?;
         this.inner.flush_buffer()?;
         if (head_len == bytes.length()) {
             return Result::Ok(head_len);
         }
         const tail: Slice<u8> = bytes.subslice(head_len, bytes.length());
-        const n: u64 = this.inner.write(tail)?;
+        const n: u64 = this.inner.write_some(tail)?;
         return Result::Ok(head_len + n);
     }
 

@@ -4,7 +4,7 @@
 ///! implements `Read` or `Write` (or both conceptually, in the case
 ///! of `/dev/tty`-backed terminal I/O), inheriting every default
 ///! method on those traits (`read_line`, `read_to_string`,
-///! `read_to_end`, `write_line`, `write_all`, etc.) without repeat
+///! `read_to_end`, `write`, etc.) without repeat
 ///! boilerplate per handle.
 ///!
 ///! No buffering at this layer. `stdout()` and `stderr()` translate
@@ -28,7 +28,7 @@
 ///! stdio-specific: `is_tty`, `as_fd`, and (on `Stdin`) the
 ///! interactive shortcuts `line` and `prompt`. Everything else
 ///! (`read_byte`, `read_char`, `read_until`, `read_line`,
-///! `read_to_string`, `write_str`, `write_line`, `write_all`) lives
+///! `read_to_string`, `write`) lives
 ///! on the `Read` / `Write` traits as defaults, because `Stdin` is
 ///! not special in its byte-pumping behaviour. A `File` or a
 ///! `TcpStream` or a `BufReader` gets the same methods for free.
@@ -44,8 +44,8 @@
 ///!
 ///! ```cryo
 ///! mut out: StdoutLock = stdout().lock();   // blocks other lockers
-///! out.write_all(part_a)?;
-///! out.write_all(part_b)?;                   // a/b are adjacent
+///! out.write(part_a)?;
+///! out.write(part_b)?;                   // a/b are adjacent
 ///! out.drop();                               // releases the lock
 ///! ```
 ///!
@@ -126,8 +126,7 @@ private function stream_unlock(slot: u8*) -> void {
 
 // Line-ending primitives
 
-/// ASCII line feed byte. Emitted by every `write_line` /
-/// `println` path in the stdlib.
+/// ASCII line feed byte. Emitted by every `println` path in the stdlib.
 const LINE_FEED: u8 = 0x0A;
 
 /// Single-byte newline slice. Callers use this for explicit
@@ -223,7 +222,7 @@ type struct Stdin {
     /// `None` if the user closed stdin (Ctrl-D) before typing.
     prompt(mut &this, prompt_msg: Str) -> Result<Option<String>, IoError> {
         mut err_handle: Stderr = stderr();
-        err_handle.write_all(prompt_msg.as_bytes())?;
+        err_handle.write(prompt_msg.as_bytes())?;
         err_handle.flush()?;
         return this.line();
     }
@@ -266,7 +265,7 @@ function stdout() -> Stdout {
 }
 
 implement trait Write for struct Stdout {
-    write(mut &this, bytes: Slice<u8>) -> Result<u64, IoError> {
+    write_some(mut &this, bytes: Slice<u8>) -> Result<u64, IoError> {
         return fd::write_fd(STDOUT_FD, bytes);
     }
 
@@ -304,7 +303,7 @@ function stderr() -> Stderr {
 }
 
 implement trait Write for struct Stderr {
-    write(mut &this, bytes: Slice<u8>) -> Result<u64, IoError> {
+    write_some(mut &this, bytes: Slice<u8>) -> Result<u64, IoError> {
         return fd::write_fd(STDERR_FD, bytes);
     }
 
@@ -339,12 +338,12 @@ implement trait Drop for struct StdinLock {
 }
 
 /// RAII guard over the stdout lock; writes through fd 1. Get one from
-/// `stdout().lock()`. Inherits the `Write` trait defaults
-/// (`write_all`, `write_str`, `write_line`, ...).
+/// `stdout().lock()`. Inherits the `Write` trait default `write` (generic
+/// over the payload).
 type struct StdoutLock { }
 
 implement trait Write for struct StdoutLock {
-    write(mut &this, bytes: Slice<u8>) -> Result<u64, IoError> {
+    write_some(mut &this, bytes: Slice<u8>) -> Result<u64, IoError> {
         return fd::write_fd(STDOUT_FD, bytes);
     }
 
@@ -364,7 +363,7 @@ implement trait Drop for struct StdoutLock {
 type struct StderrLock { }
 
 implement trait Write for struct StderrLock {
-    write(mut &this, bytes: Slice<u8>) -> Result<u64, IoError> {
+    write_some(mut &this, bytes: Slice<u8>) -> Result<u64, IoError> {
         return fd::write_fd(STDERR_FD, bytes);
     }
 

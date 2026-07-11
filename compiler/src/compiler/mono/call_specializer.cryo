@@ -1070,6 +1070,19 @@ type struct MonoCallSpecializer {
             mut rw_ctx: ResolutionContext = ResolutionContext::new(_empty, _empty);
             mut owner_subst: TypeSubstitution = TypeSubstitution::empty();
             this.add_owner_param_bindings(&owner_subst, recv_type);
+            // Also bind THIS method's own generic params (`m<W>`) to their concrete
+            // args, so a nested call whose receiver is typed by a method generic
+            // (`s: W; s.put(bytes)`) concretizes during the re-walk instead of keeping
+            // an abstract method-level `T` (codegen then reports "Incorrect number of
+            // arguments" against the still-generic `m<T>` symbol).  Owner-param
+            // bindings alone miss these when the owner is NON-generic
+            // (`Emitter.write_to<W>`): `W` is a method param, not an owner param.
+            // Same 0-based method-position index the substituter + resolve_func_and_body
+            // path use (see ~line 1400).
+            for (mut mbi: i64 = 0; mbi < method_param_names.length && mbi < bindings.length; mbi++) {
+                const mpref: TypeRef = this.arena.create_generic_param(method_param_names[mbi], mbi as u64);
+                owner_subst.add(mpref.id, bindings[mbi]);
+            }
             if (owner_subst.is_empty()) {
                 this.walk_block(spec_method.func.body, &rw_ctx, null);
             } else {
