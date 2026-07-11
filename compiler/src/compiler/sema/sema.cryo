@@ -325,11 +325,21 @@ public:
         const this_placeholder: TypeRef = this.arena.create_generic_param(this_name, 0xFFFFFFFF as u64);
         for (mut j: i64 = 0; j < node.methods.length; j++) {
             const func: FunctionDeclNode* = node.methods[j];
-            if (func != null && func.body != null) {
-                this.enter_function(func, this_placeholder);
-                this.visit(func.body);
-                this.state.body_count += 1;
+            if (func == null || func.body == null) { continue; }
+            // A GENERIC default method (its own `<T>`) may use `static match (T)`
+            // in its body; that has to be walked SYMBOLICALLY (in_symbolic_check),
+            // exactly like a struct/impl generic method (visit_methods), so the
+            // arms are deferred to monomorphization instead of tripping E0645
+            // ("static match outside a generic context").  symbolic_check_body
+            // is a no-op when the symbolic check is disabled; mono then checks
+            // the concrete body.  Non-generic defaults keep the plain walk.
+            if (func.is_generic()) {
+                this.symbolic_check_body(func, this_placeholder, this_placeholder);
+                continue;
             }
+            this.enter_function(func, this_placeholder);
+            this.visit(func.body);
+            this.state.body_count += 1;
         }
     }
 
