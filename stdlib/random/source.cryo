@@ -1,10 +1,10 @@
 ///! std::random::source: the `RandomSource` trait.
 ///!
 ///! A `RandomSource` produces 64 random bits via the one required
-///! method, `next_u64`. Every other draw - smaller integers, booleans,
-///! floats, bounded ranges, byte fills, in-place shuffling, and uniform
-///! choice - is a default method derived from it, so a generator only
-///! implements `next_u64`.
+///! method, `next_64`. Every other draw - integers of any width, booleans,
+///! floats, chars, bounded ranges, byte fills, in-place shuffling, and
+///! uniform choice - is a default method derived from it, so a generator
+///! only implements `next_64`.
 ///!
 ///! Both shipped generators (`Rng`, `SecureRng`) satisfy this trait, so
 ///! code written against `R: RandomSource` runs against either.
@@ -17,127 +17,169 @@ import core::slice;
 import core::mem;
 import random::bits;
 
-const U64_MAX: u64 = 0xFFFFFFFFFFFFFFFFu64;
+const U64_MAX: u64 = 0xFFFFFFFFFFFFFFFF;
 
 type trait RandomSource {
     /// The single required primitive: the next 64 random bits.
-    next_u64(mut &this) -> u64;
+    next_64(mut &this) -> u64;
 
-    /// The next 32 random bits (the high half of `next_u64`, whose bits
-    /// are the best mixed).
-    next_u32(mut &this) -> u32 {
-        return (this.next_u64() >> 32u64) as u32;
-    }
-
-    /// A random `boolean`, taken from the top (highest-quality) bit.
-    next_bool(mut &this) -> boolean {
-        return (this.next_u64() >> 63u64) == 1u64;
-    }
-
-    /// A uniform `f64` in `[0.0, 1.0)`, using the top 53 bits so every
-    /// representable value in the interval is equally likely.
-    next_f64(mut &this) -> f64 {
-        const bits: u64 = this.next_u64() >> 11u64;        // 53 bits
-        return (bits as f64) / 9007199254740992.0;         // / 2^53
-    }
-
-    /// A uniform `f32` in `[0.0, 1.0)`.
-    next_f32(mut &this) -> f32 {
-        return this.next_f64() as f32;
+    /// A uniform draw of type `T`, dispatched at compile time via
+    /// `static match (T)` over the primitive `next_64`. Covers every fixed-width
+    /// integer, the platform-width `usize`/`isize`, `boolean`, `f32`/`f64`, and
+    /// `char`:
+    ///   - integers — the required number of bits, taken from the top (best-mixed)
+    ///     end for the sub-64-bit widths; `u128`/`i128` concatenate two draws.
+    ///   - `boolean` — the top (highest-quality) bit.
+    ///   - `f64`/`f32` — a uniform value in `[0.0, 1.0)`; `f64` uses the top 53
+    ///     bits so every representable value in the interval is equally likely.
+    ///   - `char` — a uniform Unicode scalar value (the surrogate range is skipped).
+    /// Select the type with a turbofish (`rng.next<u32>()`) or from context.
+    next<T>(mut &this) -> T {
+        // Each arm draws directly from `next_64` - no `next<T>` -> `next<T>`
+        // recursion (the sub-widths reinterpret the top, best-mixed bits).
+        return static match (T) {
+            u8    => { (this.next_64() >> 56) as u8 }
+            u16   => { (this.next_64() >> 48) as u16 }
+            u32   => { (this.next_64() >> 32) as u32 }
+            u64   => { this.next_64() }
+            u128  => { ((this.next_64() as u128) << 64) | (this.next_64() as u128) }
+            usize => { this.next_64() as usize }
+            i8    => { (this.next_64() >> 56) as i8 }
+            i16   => { (this.next_64() >> 48) as i16 }
+            i32   => { (this.next_64() >> 32) as i32 }
+            i64   => { this.next_64() as i64 }
+            i128  => { (((this.next_64() as u128) << 64) | (this.next_64() as u128)) as i128 }
+            isize => { this.next_64() as isize }
+            boolean => { (this.next_64() >> 63) == 1 }
+            f64 => {
+                const bits: u64 = this.next_64() >> 11;    // 53 bits
+                (bits as f64) / 9007199254740992.0         // / 2^53
+            }
+            f32 => {
+                const bits: u64 = this.next_64() >> 11;
+                ((bits as f64) / 9007199254740992.0) as f32
+            }
+            char => {
+                // Uniform Unicode scalar: draw over `[0, 0x110000)` minus the
+                // 0x800-wide UTF-16 surrogate gap `[0xD800, 0xE000)`, then fold
+                // the gap back in.
+                const bound: u64 = 0x110000 - 0x800;
+                mut c: u32 = this.next_below(bound) as u32;
+                if (c >= 0xD800) { c = c + 0x800; }
+                c as char
+            }
+        };
     }
 
     /// A uniform integer in `[0, bound)`. Unbiased: the top partial
     /// bucket is rejected so the modulo introduces no skew. Panics when
     /// `bound == 0` - an empty range has no value to return.
     next_below(mut &this, bound: u64) -> u64 {
-        if (bound == 0u64) {
+        if (bound == 0) {
             intrinsics::panic("RandomSource::next_below: bound must be > 0", FILE, LINE);
         }
-        const threshold: u64 = (U64_MAX - bound + 1u64) % bound;   // 2^64 mod bound
+        const threshold: u64 = (U64_MAX - bound + 1) % bound;   // 2^64 mod bound
         loop {
-            const x: u64 = this.next_u64();
+            const x: u64 = this.next_64();
             if (x >= threshold) {
                 return x % bound;
             }
         }
     }
 
-    /// A uniform unsigned integer in `[lo, hi)`. Requires `lo < hi`.
-    next_range(mut &this, lo: u64, hi: u64) -> u64 {
-        if (lo >= hi) {
-            intrinsics::panic("RandomSource::next_range: lo must be < hi", FILE, LINE);
-        }
-        return lo + this.next_below(hi - lo);
+    /// A uniform integer of type `T` in `[lo, hi)`. Requires `lo < hi`.
+    /// `static match (T)` covers every integer width: the spans of the
+    /// 64-bit-and-narrower types are drawn unbiased through `next_below`;
+    /// `u128`/`i128` use an inline 128-bit rejection sampler.
+    next_range<T>(mut &this, lo: T, hi: T) -> T {
+        return static match (T) {
+            u8 | u16 | u32 | u64 | usize | i8 | i16 | i32 | i64 | isize => {
+                if (lo >= hi) {
+                    intrinsics::panic("RandomSource::next_range: lo must be < hi", FILE, LINE);
+                }
+                lo + (this.next_below((hi - lo) as u64) as T)
+            }
+            u128 => {
+                if (lo >= hi) {
+                    intrinsics::panic("RandomSource::next_range: lo must be < hi", FILE, LINE);
+                }
+                lo + this.next_below_wide(hi - lo)
+            }
+            i128 => {
+                if (lo >= hi) {
+                    intrinsics::panic("RandomSource::next_range: lo must be < hi", FILE, LINE);
+                }
+                lo + (this.next_below_wide((hi - lo) as u128) as i128)
+            }
+        };
     }
 
-    /// A uniform signed integer in `[lo, hi)`. Requires `lo < hi`.
-    next_range_i64(mut &this, lo: i64, hi: i64) -> i64 {
-        if (lo >= hi) {
-            intrinsics::panic("RandomSource::next_range_i64: lo must be < hi", FILE, LINE);
+    /// A uniform `u128` in `[0, bound)`, unbiased by the same top-bucket
+    /// rejection as `next_below` but over the full 128-bit range. Backs the
+    /// `u128`/`i128` arms of `next_range`.
+    next_below_wide(mut &this, bound: u128) -> u128 {
+        if (bound == 0) {
+            intrinsics::panic("RandomSource::next_below_wide: bound must be > 0", FILE, LINE);
         }
-        const span: u64 = (hi - lo) as u64;
-        return lo + (this.next_below(span) as i64);
+        const wide_max: u128 = ~(0 as u128);
+        const threshold: u128 = (wide_max - bound + 1) % bound;   // 2^128 mod bound
+        loop {
+            const x: u128 = ((this.next_64() as u128) << 64) | (this.next_64() as u128);
+            if (x >= threshold) {
+                return x % bound;
+            }
+        }
     }
 
     /// Fill `dst` with random bytes, writing through the view.
     fill(mut &this, dst: Slice<u8>) -> void {
         const len: u64 = dst.length();
         const buf: u8* = dst.as_ptr();
-        mut i: u64 = 0u64;
-        while (i + 8u64 <= len) {
-            store_u64_le(mem::offset(buf, i as i64), this.next_u64());
-            i = i + 8u64;
+        mut i: u64 = 0;
+        while (i + 8 <= len) {
+            store_u64_le(mem::offset(buf, i as i64), this.next_64());
+            i = i + 8;
         }
         if (i < len) {
-            mut last: u64 = this.next_u64();
+            mut last: u64 = this.next_64();
             while (i < len) {
-                buf[i] = (last & 0xFFu64) as u8;
-                last = last >> 8u64;
-                i = i + 1u64;
+                buf[i] = (last & 0xFF) as u8;
+                last = last >> 8;
+                i = i + 1;
             }
         }
     }
-}
 
-// Collection algorithms over a source.
-//
-// These are free generic functions rather than `RandomSource` default
-// methods: a default method carrying its own type parameter does not yet
-// monomorphize cleanly when inherited (codegen passes the wrong argument
-// count). As standalone generics - the same shape as `mem::swap<T>` -
-// they specialize correctly for any element type and any source.
-
-/// Shuffle `items` in place with a uniform Fisher-Yates pass, drawing
-/// from `rng`. Works for any element type - elements are swapped, never
-/// copied out, so no `Copy` bound is needed.
-function shuffle<T, R>(rng: mut &R, items: &Slice<T>) -> void
-where R: RandomSource {
-    const n: u64 = items.length();
-    if (n < 2u64) { return; }
-    const base: T* = items.as_ptr();
-    mut i: u64 = n - 1u64;
-    loop {
-        const j: u64 = rng.next_below(i + 1u64);
-        if (i != j) {
-            const a: T* = mem::offset(base, i as i64);
-            const b: T* = mem::offset(base, j as i64);
-            const tmp: T = *a;
-            *a = *b;
-            *b = tmp;
+    /// Shuffle `items` in place with a uniform Fisher-Yates pass. Works for
+    /// any element type - elements are swapped, never copied out, so no
+    /// `Copy` bound is needed.
+    shuffle<T>(mut &this, items: &Slice<T>) -> void {
+        const n: u64 = items.length();
+        if (n < 2) { return; }
+        const base: T* = items.as_ptr();
+        mut i: u64 = n - 1;
+        loop {
+            const j: u64 = this.next_below(i + 1);
+            if (i != j) {
+                const a: T* = mem::offset(base, i as i64);
+                const b: T* = mem::offset(base, j as i64);
+                const tmp: T = *a;
+                *a = *b;
+                *b = tmp;
+            }
+            if (i == 0) { break; }
+            i = i - 1;
         }
-        if (i == 0u64) { break; }
-        i = i - 1u64;
     }
-}
 
-/// Borrow a uniformly chosen element of `items`, or `None` when `items`
-/// is empty. Returns a pointer in place, so no `Copy` is required and
-/// owning element types are fine.
-function choose<T, R>(rng: mut &R, items: &Slice<T>) -> Option<T*>
-where R: RandomSource {
-    const n: u64 = items.length();
-    if (n == 0u64) {
-        return Option::None;
+    /// Borrow a uniformly chosen element of `items`, or `None` when `items`
+    /// is empty. Returns a pointer in place, so no `Copy` is required and
+    /// owning element types are fine.
+    choose<T>(mut &this, items: &Slice<T>) -> Option<T*> {
+        const n: u64 = items.length();
+        if (n == 0) {
+            return Option::None;
+        }
+        return items.get_ref(this.next_below(n));
     }
-    return items.get_ref(rng.next_below(n));
 }

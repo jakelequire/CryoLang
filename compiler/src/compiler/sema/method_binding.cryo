@@ -831,9 +831,42 @@ type struct MethodBinding {
         return owner_ctx;
     }
 
+    /// A bare / negated / arithmetic-constant numeric literal is polymorphic for
+    /// generic inference (adopts whatever a non-literal arg or context binds), so
+    /// its `resolved_type` (the DEFAULT `i32`/`f64`) must not pin a method param.
+    /// Mirrors `CallResolver::sema_arg_is_polymorphic_literal` for the method path.
+    method_arg_is_polymorphic_literal(&this, expr: ExpressionNode*) -> boolean {
+        if (expr == null) { return false; }
+        const node: ASTNode* = expr as ASTNode*;
+        if (node.kind == NodeKind::Literal) {
+            const lit: LiteralNode* = expr as LiteralNode*;
+            return lit.literal_kind == LiteralKind::Integer
+                || lit.literal_kind == LiteralKind::Float;
+        }
+        if (node.kind == NodeKind::UnaryExpression) {
+            const u: UnaryExprNode* = expr as UnaryExprNode*;
+            if (u.op.lexeme == "-" || u.op.lexeme == "+" || u.op.lexeme == "~") {
+                return this.method_arg_is_polymorphic_literal(u.operand);
+            }
+            return false;
+        }
+        if (node.kind == NodeKind::BinaryExpression) {
+            const b: BinaryExprNode* = expr as BinaryExprNode*;
+            const op: string = b.op.lexeme;
+            const is_arith: boolean =
+                op == "+" || op == "-" || op == "*" || op == "/" || op == "%"
+                || op == "<<" || op == ">>" || op == "&" || op == "|" || op == "^";
+            if (!is_arith) { return false; }
+            return this.method_arg_is_polymorphic_literal(b.left)
+                && this.method_arg_is_polymorphic_literal(b.right);
+        }
+        return false;
+    }
+
     /// Solve every method-level generic param of `orig_func` for this call:
-    /// explicit turbofish, else formal/actual unification (with `![implicit]`
-    /// return-type recovery).  Returns the bindings in declaration order, or `[]`
+    /// explicit turbofish, else formal/actual unification (with return-type
+    /// recovery + polymorphic-literal adoption, mirroring the free-fn path).
+    /// Returns the bindings in declaration order, or `[]`
     /// when any stays unbound/abstract (caller defers to mono).
     solve_method_bindings(mut &this, orig_func: FunctionDeclNode*,
                           owner_ctx: ResolutionContext*, member: MemberAccessNode*,
@@ -895,26 +928,43 @@ type struct MethodBinding {
             if (explicit_params.length != call.arguments.length) { return []; }
 
             mut ictx: InferCtx = InferCtx::for_template(this.arena, method_param_ids);
+            // Resolve each parameter's formal type once (in the fresh-param
+            // context), so all three inference passes share it.
+            mut formals: TypeRef[] = [];
             for (mut i: i64 = 0; i < call.arguments.length; i++) {
                 const param: VarDeclNode* = explicit_params[i];
                 if (param == null || param.type_annotation == null) { return []; }
                 mut formal: TypeRef = this.ctx.type_resolver.resolve(param.type_annotation, &infer_ctx);
                 if (!formal.is_valid()) { return []; }
                 formal = this.reduce_assoc_projections(formal);
+                formals.push(formal);
+            }
+            // PASS A — bind from NON-literal args. A polymorphic numeric literal
+            // (`100u64`; the suffix is only a hint for generic inference — see
+            // `sema_arg_is_polymorphic_literal`) carries its DEFAULT type (`i32`)
+            // in `resolved_type`, so unifying `T` against it would wrongly pin
+            // `T = i32`. Skip literals here and let context/adoption bind them,
+            // exactly as the free-function inference path does.
+            for (mut i: i64 = 0; i < call.arguments.length; i++) {
                 const arg: ExpressionNode* = call.arguments[i];
                 if (arg == null) { return []; }
+                if (this.method_arg_is_polymorphic_literal(arg)) { continue; }
                 const actual: TypeRef = arg.resolved_type;
                 if (!actual.is_valid()) { return []; }
-                ictx.unify(formal, actual);
+                ictx.unify(formals[i], actual);
             }
-            // Return-driven inference for `![implicit]` methods whose generic
-            // appears ONLY in the return position.
+            // PASS B — recover still-unbound method params from a CONCRETE
+            // expected type via the return annotation. Not gated on `is_implicit`:
+            // any generic method whose param appears in the return (`next_range<T>
+            // (lo: T, hi: T) -> T` bound to a `u64` context) needs it once its
+            // only value-carrying args are polymorphic literals.
             mut any_unbound: boolean = false;
             for (mut i: i64 = 0; i < n_method_params; i++) {
                 if (!ictx.bindings[i].is_valid()) { any_unbound = true; break; }
             }
-            if (any_unbound && orig_func.is_implicit
+            if (any_unbound
                     && this.state.expected_type.is_valid()
+                    && !this.types.contains_generic_param(this.state.expected_type)
                     && orig_func.return_type_annotation != null) {
                 mut ret_formal: TypeRef = this.ctx.type_resolver.resolve(
                     orig_func.return_type_annotation, &infer_ctx);
@@ -922,6 +972,18 @@ type struct MethodBinding {
                     ret_formal = this.reduce_assoc_projections(ret_formal);
                     ictx.unify(ret_formal, this.state.expected_type);
                 }
+            }
+            // PASS C — a polymorphic literal adopts whatever its param now binds;
+            // if still unbound, it falls back to the literal's own default type.
+            for (mut i: i64 = 0; i < call.arguments.length; i++) {
+                const arg: ExpressionNode* = call.arguments[i];
+                if (arg == null) { return []; }
+                if (!this.method_arg_is_polymorphic_literal(arg)) { continue; }
+                const f_idx: i64 = ictx.binding_index(formals[i].id);
+                if (f_idx >= 0 && ictx.bindings[f_idx].is_valid()) { continue; }
+                const lit_actual: TypeRef = arg.resolved_type;
+                if (!lit_actual.is_valid()) { continue; }
+                ictx.unify(formals[i], lit_actual);
             }
             for (mut i: i64 = 0; i < n_method_params; i++) {
                 const b: TypeRef = ictx.bindings[i];

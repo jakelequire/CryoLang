@@ -429,7 +429,13 @@ type struct CallResolver {
             this.resolve_method_overload(visitor, call, callee as MemberAccessNode*);
             this.check_method_call_arg_types(visitor, call, callee as MemberAccessNode*);
             const mret: TypeRef = this.resolve_method_call(visitor, callee as MemberAccessNode*, call);
-            if (mret.is_valid() && call.resolved_method != null) {
+            // A pinned non-generic method's return type overrides `mret` for a
+            // genuine overload, but NOT when `mret` is a generic method's per-call
+            // primitive-scalar return: there the pin can be a SIBLING spec of a
+            // different instantiation, and `mret` is authoritative
+            // (`generic_scalar_return`).
+            if (mret.is_valid() && call.resolved_method != null
+                    && !this.generic_scalar_return(call, mret)) {
                 const ovl_rm: MethodNode* = call.resolved_method as MethodNode*;
                 if (ovl_rm != null && ovl_rm.func != null
                         && ovl_rm.func.generic_params.length == 0
@@ -1894,6 +1900,25 @@ type struct CallResolver {
 
     // -- Method call return typing --
 
+    /// True when `call` targets a GENERIC method (it carries stashed method-level
+    /// `resolved_type_args`) whose return type `t` is a primitive SCALAR.  For
+    /// such a return the per-call inference (`resolve_generic_method_return`,
+    /// driven by THIS call's own type args) reproduces the EXACT interned type,
+    /// so it can safely override the method's by-name pin — which, once the method
+    /// is instantiated at several types, may be a SIBLING spec (a `next_range<u64>`
+    /// call reading `next_range<i64>`'s `i64`).  Compound / instantiated returns
+    /// are EXCLUDED: re-deriving them mints a DISTINCT arena TypeID from mono's
+    /// materialized one (iterator adapters like `ChainIter`/`ZipIter`/`TakeIter`),
+    /// which would spuriously mismatch, so their pin stays authoritative.
+    generic_scalar_return(&this, call: CallExprNode*, t: TypeRef) -> boolean {
+        if (call == null || call.resolved_type_args.length == 0) { return false; }
+        if (!t.is_valid()) { return false; }
+        const ty: Type* = this.arena.lookup(t.id);
+        if (ty == null) { return false; }
+        return ty.kind == TypeKind::Int || ty.kind == TypeKind::Float
+            || ty.kind == TypeKind::Bool || ty.kind == TypeKind::Char;
+    }
+
     resolve_method_call(mut &this, visitor: ASTVisitor*, member: MemberAccessNode*,
                         call: CallExprNode*) -> TypeRef {
         const obj_type: TypeRef = this.dispatch.resolve_expr(visitor, member.object);
@@ -1965,12 +1990,25 @@ type struct CallResolver {
             } else {
                 this.binding.subst_method_return_from_receiver(obj_type, ret)
             };
-            mut final_ret: TypeRef =
-                if (refined.is_valid() && this.types.contains_generic_param(refined)) {
-                    this.binding.resolve_generic_method_return(obj_type, member, call, refined)
-                } else {
-                    refined
-                };
+            // When the return is still abstract, resolve it per-call (existing).
+            // Otherwise, if the call targets a generic method whose by-name lookup
+            // handed back a CONCRETE (post-mono) return, re-derive it from THIS
+            // call's args and prefer that ONLY when it is a primitive scalar — a
+            // sibling spec of a different instantiation can otherwise leak in (a
+            // `next_range<u64>` call seeing `next_range<i64>`'s `i64`). Compound
+            // returns keep `refined` (see `generic_scalar_return`).
+            mut final_ret: TypeRef = refined;
+            if (refined.is_valid() && this.types.contains_generic_param(refined)) {
+                final_ret = this.binding.resolve_generic_method_return(obj_type, member, call, refined);
+            } else if (this.generic_scalar_return(call, refined)) {
+                // Only when the by-name lookup already returned a concrete SCALAR
+                // for a generic method (a possible sibling-spec leak). Gating the
+                // genret CALL on a scalar `refined` matters: re-deriving a compound
+                // return (iterator adapters) has arena side effects that break mono.
+                const grt: TypeRef =
+                    this.binding.resolve_generic_method_return(obj_type, member, call, refined);
+                if (this.generic_scalar_return(call, grt)) { final_ret = grt; }
+            }
             final_ret = this.binding.finalize_assoc_return(obj_type, member, final_ret);
             member.set_resolved_type(final_ret);
             return final_ret;
