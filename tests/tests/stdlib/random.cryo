@@ -34,13 +34,13 @@ where R: RandomSource {
 function from_seed_is_deterministic() -> Result<(), TestError> {
     mut a: Rng = Rng::from_seed(12345u64);
     mut b: Rng = Rng::from_seed(12345u64);
-    expect_eq(a.next_u64(), b.next_u64())?;
-    expect_eq(a.next_u64(), b.next_u64())?;
-    expect_eq(a.next_u64(), b.next_u64())?;
+    expect_eq(a.next_64(), b.next_64())?;
+    expect_eq(a.next_64(), b.next_64())?;
+    expect_eq(a.next_64(), b.next_64())?;
 
     mut c: Rng = Rng::from_seed(1u64);
     mut d: Rng = Rng::from_seed(2u64);
-    expect_true(c.next_u64() != d.next_u64(),
+    expect_true(c.next_64() != d.next_64(),
                 Str::new("distinct seeds produce distinct streams"))?;
     return Result::Ok(());
 }
@@ -78,12 +78,49 @@ function next_range_respects_bounds() -> Result<(), TestError> {
 }
 
 ![test]
+function next_range_signed_respects_bounds() -> Result<(), TestError> {
+    // Instantiates `next_range<i64>` alongside the `next_range<u64>` above in the
+    // same binary — the mixed-instantiation case that regressed generic-method
+    // return resolution (a `next_range<u64>` call reading `next_range<i64>`'s
+    // return). Both bare-literal forms must stay pinned to their own type.
+    mut r: Rng = Rng::from_seed(909090u64);
+    mut ok: boolean = true;
+    mut i: i32 = 0;
+    while (i < 2000) {
+        const v: i64 = r.next_range(-5, 5);
+        if (v < -5 || v >= 5) { ok = false; }
+        i = i + 1;
+    }
+    expect_true(ok, Str::new("next_range(-5,5) stays within [-5,5)"))?;
+    return Result::Ok(());
+}
+
+![test]
+function next_all_widths_draw() -> Result<(), TestError> {
+    // Exercise codegen for the wider next<T> / next_range<T> arms (u8/u128/i128/
+    // char and a 128-bit range) in one binary.
+    mut r: Rng = Rng::from_seed(777u64);
+    const _a: u8   = r.next<u8>();
+    const _b: u128 = r.next<u128>();
+    const _c: i128 = r.next<i128>();
+    const ch: char = r.next<char>();
+    const cu: u32  = ch as u32;
+    expect_true(cu <= 0x10FFFF && !(cu >= 0xD800 && cu < 0xE000),
+                Str::new("next<char> is a valid Unicode scalar"))?;
+    const r8: u8 = r.next_range(10 as u8, 20 as u8);
+    expect_true(r8 >= 10 && r8 < 20, Str::new("next_range<u8> in [10,20)"))?;
+    const rw: u128 = r.next_range(0 as u128, 1000000 as u128);
+    expect_true(rw < 1000000 as u128, Str::new("next_range<u128> in [0,1_000_000)"))?;
+    return Result::Ok(());
+}
+
+![test]
 function next_f64_is_unit_interval() -> Result<(), TestError> {
     mut r: Rng = Rng::from_seed(2024u64);
     mut ok: boolean = true;
     mut i: i32 = 0;
     while (i < 2000) {
-        const f: f64 = r.next_f64();
+        const f: f64 = r.next<f64>();
         if (f < 0.0 || f >= 1.0) { ok = false; }
         i = i + 1;
     }
@@ -114,7 +151,7 @@ function shuffle_is_a_permutation() -> Result<(), TestError> {
     while (i < 10) { data[i] = i; i = i + 1; }
 
     const view: Slice<i32> = Slice::from_raw(&data[0], 10u64);
-    shuffle(&r, &view);
+    r.shuffle(&view);
 
     // Every value 0..9 appears exactly once.
     mut seen: i32[10];
@@ -143,7 +180,7 @@ function choose_returns_an_element() -> Result<(), TestError> {
     mut all_member: boolean = true;
     mut k: i32 = 0;
     while (k < 200) {
-        match (choose(&r, &view)) {
+        match (r.choose(&view)) {
             Option::Some(p) => {
                 const v: i32 = *p;
                 if (v != 10 && v != 20 && v != 30 && v != 40 && v != 50) {
