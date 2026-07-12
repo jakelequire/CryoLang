@@ -101,9 +101,21 @@ public function cryo_alloc_arena_set_active(active: boolean) -> void {
 /// first allocation.  `reset` keeps the chunks for reuse rather than freeing
 /// them, amortizing the malloc/free round-trip across targets.
 public function cryo_ast_arena_reset() -> void {
-    if (g_ast_arena != null) {
-        g_ast_arena.reset();
-    }
+    // Publish + reset in one step.  Publishing the arena here (rather than
+    // lazily on the first AST-node `new`) guarantees `GlobalArena` is live the
+    // instant a caller flips routing on — so container allocations made BEFORE
+    // the first `new` route into the arena too, instead of being pinned to libc
+    // for their whole lifetime.  This matters for the LSP: `recompile()` sets
+    // routing active then builds a fresh `CompilationContext`/`Resolver` (whose
+    // `scopes`/intern tables and the discovery source buffers allocate before
+    // any AST node exists); without an already-published arena those land in
+    // libc and, because `GlobalAlloc::reallocate` keys on `holds(ptr)`, every
+    // subsequent grow stays libc and leaks with the per-recompile ctx.
+    // CLI-neutral: the build path keeps routing INACTIVE across discovery
+    // (set_active stays false there), so publishing early changes nothing until
+    // it activates at Frontend.
+    mut a: Arena* = get_ast_arena();
+    a.reset();
 }
 
 /// Free the entire AST arena's chunks back to the allocator (and, for the
@@ -112,7 +124,15 @@ public function cryo_ast_arena_reset() -> void {
 /// completed target's heap does not stay resident while the next target
 /// builds.  The arena re-grows from empty on the next allocation.
 public function cryo_ast_arena_release() -> void {
-    if (g_ast_arena != null) {
-        g_ast_arena.release();
-    }
+    // Publish (see `cryo_ast_arena_reset`) so a caller that flips routing on
+    // right after this still routes into the arena, then free all chunks back
+    // to the OS.  The LSP calls this per recompile instead of `reset`: `reset`
+    // keeps chunks resident for reuse, but a long-lived daemon compiling a
+    // fresh project every keystroke sees the per-compile high-water vary
+    // slightly (edited source → different sizes), which defeats chunk reuse and
+    // leaks one chunk per recompile.  Releasing bounds peak at a single
+    // compile's footprint; the re-`mmap` cost is trivial against an ~8 s LSP
+    // compile.
+    mut a: Arena* = get_ast_arena();
+    a.release();
 }
