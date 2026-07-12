@@ -544,7 +544,14 @@ type struct CompilerInstance {
         // LLVMTypeRef) cache between LSP recompiles every fresh TypeRef
         // would alias a stale entry from a prior keystroke's compile.
         Compiler::Codegen::TypeMap::TypeMapperCache::reset_shared_type_cache();
-        Compiler::Codegen::AstArena::cryo_ast_arena_reset();
+        // NB: the arena is NOT reset here.  The LSP session owns the arena
+        // lifecycle — it resets + activates routing before constructing `ctx`
+        // (so this single-file path's whole container heap — intern strings,
+        // resolver maps, type tables, decl index — is arena-backed and bulk
+        // reclaimed by the next recompile, instead of leaking to libc every
+        // keystroke as it did when this path reset but never activated routing)
+        // and deactivates on return.  Resetting here would free the just-built,
+        // session-owned `ctx` out from under this compile.
         ctx.artifacts.tokens = TokenStream::new([], virtual_path, content);
         mut pipeline: PassRegistry = PassRegistry::build_frontend_pipeline();
         return this.run_pipeline(ctx, &pipeline, "");
@@ -858,12 +865,26 @@ type struct CompilerInstance {
         // releasing, and only here.  No-op on the first target.  NB: if the
         // context ever becomes shared across targets, those node-pointer arrays
         // would dangle after this reset and must be cleared here too.
-        Compiler::Codegen::AstArena::cryo_ast_arena_reset();
-        // Defensive: guarantee this target STARTS with arena routing OFF, so
-        // its survivor construction (below, pre-activation) always lands in
-        // libc — even on the impossible-by-construction path where a prior
-        // target leaked the active flag.  The bracket re-enables it at Frontend.
-        Compiler::Codegen::AstArena::cryo_alloc_arena_set_active(false);
+        //
+        // LSP EXCEPTION: the language server owns the arena lifecycle at the
+        // session level — it resets the arena and activates routing BEFORE
+        // constructing the `ctx` it passes here (so the ctx + its sub-components
+        // are arena-backed), and deactivates on return.  Running the reset here
+        // would free that session-owned ctx mid-compile, and deactivating here
+        // would push discovery/frontend allocations back to libc (the very leak
+        // this arrangement fixes).  So both are gated to the non-LSP build path.
+        const lsp_owns_arena: boolean = match (ctx.mode) {
+            CompileMode::Lsp => { true }
+            _                => { false }
+        };
+        if (!lsp_owns_arena) {
+            Compiler::Codegen::AstArena::cryo_ast_arena_reset();
+            // Defensive: guarantee this target STARTS with arena routing OFF, so
+            // its survivor construction (below, pre-activation) always lands in
+            // libc — even on the impossible-by-construction path where a prior
+            // target leaked the active flag.  The bracket re-enables it at Frontend.
+            Compiler::Codegen::AstArena::cryo_alloc_arena_set_active(false);
+        }
         // Same defensive reset for the LLVM context: dispose any leftover from
         // a prior target so this target starts on the global-context fallback
         // until its own context is published at Frontend.
@@ -965,6 +986,20 @@ type struct CompilerInstance {
         }
         ctx.stdlib_root = stdlib_root;
 
+        // NB (LSP): the language server owns the per-recompile arena lifecycle at
+        // the SESSION level (`CompilerSession::recompile`): it resets the arena
+        // and activates routing BEFORE constructing this `ctx`, so the whole
+        // context — including its sub-components (DeclarationIndex, ModuleGraph,
+        // InternTable, DiagnosticSink) and everything discovery/frontend/sema/mono
+        // allocate below — is arena-backed and reclaimed in bulk by the next
+        // recompile's reset, then deactivates routing when this returns.  Routing
+        // is therefore already ACTIVE here in LSP mode; the `set_active(true)` at
+        // the codegen boundary (~1396) is a no-op for LSP and the real activation
+        // for builds, and the reset at the top of this method is gated OFF for LSP
+        // (resetting here would free the session-owned `ctx` mid-compile).  The
+        // compile-epoch guard makes this safe: a stale session always recompiles
+        // before any handler reads its ctx, so nothing is read across a reset.
+
         // Effective scan roots = own [project].source_paths, then a
         // resolved view of each [dependencies] entry's source roots.
         // The loader appends each to project_root and pre-scans them so
@@ -1057,6 +1092,10 @@ type struct CompilerInstance {
             // goes to stderr (never stdout) to avoid corrupting the
             // LSP JSON-RPC stream when the daemon embeds the compiler.
             fmt::eprintf("error: module discovery failed\n");
+            // Deactivate the arena in case LSP mode activated it early (above);
+            // no-op on the build path, which activates only at ~1396.  Keeps the
+            // active flag from leaking past this pre-frontend early return.
+            Compiler::Codegen::AstArena::cryo_alloc_arena_set_active(false);
             return CompilationResult::failed(ctx.diagnostics.error_count, ctx.diagnostics.warning_count);
         }
 
@@ -1403,7 +1442,19 @@ type struct CompilerInstance {
         // never-disposed global context across the lib+bin builds.  Created
         // here (before any LLVM type is built — frontend/mono/sema/codegen all
         // follow) and disposed on every exit path alongside the arena flip.
-        Compiler::Codegen::LLVMTypes::set_codegen_context_new();
+        //
+        // LSP mode skips this: codegen is gated off (line ~1726) and the only
+        // passes that run — frontend/sema/mono + the Cryo-side TypeLowering
+        // (layouts, recursive-type + static_assert checks; no LLVM types) — never
+        // touch the codegen context.  Creating an LLVMContext per keystroke and
+        // disposing it frees back to LLVM's libc allocator, which retains the
+        // pages (RSS never drops), so an editing session climbs even though the
+        // context is logically freed each compile.  Skipping the create avoids
+        // that entirely; the null disposes downstream are no-ops.
+        match (ctx.mode) {
+            CompileMode::Lsp => { }
+            _ => { Compiler::Codegen::LLVMTypes::set_codegen_context_new(); }
+        }
 
         // Allocate local buffers for per-module ASTs and scopes.
         // Using local variables avoids deep nested struct field assignment

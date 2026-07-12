@@ -706,6 +706,38 @@ type struct IntrinsicEmitter {
         return this.llvm_module.add_function("vasprintf", fty);
     }
 
+    /// Declare libc `void* memcpy(void* dst, const void* src, size_t n)` if
+    /// absent.  Used by the `format` runtime to relocate the `vasprintf` result
+    /// out of the libc buffer into arena-aware storage.
+    get_or_decl_memcpy(mut &this) -> LValue {
+        mut fn: LValue = this.llvm_module.get_named_function("memcpy");
+        if (fn.is_valid()) { return fn; }
+        const ptr_ty: LType = LType::pointer_to(LType::i8());
+        const buf: void* = intrinsics::malloc(24);
+        const slots: void** = buf as void**;
+        slots[0] = ptr_ty.raw;   // void* dst
+        slots[1] = ptr_ty.raw;   // const void* src
+        slots[2] = LType::i64().raw;   // size_t n
+        const fty: LType = LType::function_type(ptr_ty, buf, 3, false);
+        intrinsics::free(buf);
+        return this.llvm_module.add_function("memcpy", fty);
+    }
+
+    /// Declare libc `void free(void* ptr)` if absent.  Used by the `format`
+    /// runtime to release the temporary `vasprintf` libc buffer after its
+    /// contents have been copied into arena-aware storage.
+    get_or_decl_free(mut &this) -> LValue {
+        mut fn: LValue = this.llvm_module.get_named_function("free");
+        if (fn.is_valid()) { return fn; }
+        const ptr_ty: LType = LType::pointer_to(LType::i8());
+        const buf: void* = intrinsics::malloc(8);
+        const slots: void** = buf as void**;
+        slots[0] = ptr_ty.raw;   // void* ptr
+        const fty: LType = LType::function_type(LType::void_type(), buf, 1, false);
+        intrinsics::free(buf);
+        return this.llvm_module.add_function("free", fty);
+    }
+
     /// Declare libc `int vprintf(const char* fmt, va_list)` if absent.
     /// The intrinsic-declaration pass usually emits this already (from the
     /// `intrinsic function vprintf` decl); we re-derive the identical
@@ -975,7 +1007,7 @@ type struct IntrinsicEmitter {
     /// hasn't been emitted yet.  Idempotent.  Called once per module
     /// before user IR-gen; the linkonce_odr linkage means the linker
     /// collapses all 100+ copies down to one.
-    emit_format_runtime(mut &this) -> void {
+    emit_format_runtime(mut &this, alloc_fn: LValue) -> void {
         // If `format` already has a basic block, it's already defined here.
         mut fmt_fn: LValue = this.llvm_module.get_named_function("format");
         if (fmt_fn.is_valid()) {
@@ -1052,6 +1084,70 @@ type struct IntrinsicEmitter {
         ve_slots[0] = va_alloca.raw;
         this.builder.build_call(va_end_ty, va_end_fn, ve_buf, 1, "");
         intrinsics::free(ve_buf);
+
+        // ── Relocate the vasprintf result into arena-aware storage ──────────
+        // `vasprintf` malloc'd `*strp` through libc, which the per-target arena
+        // never sees.  When `alloc_fn` (`global_heap_alloc`) resolved, copy the
+        // formatted string into a `GlobalAlloc` buffer (arena while the compiler
+        // has it active, plain libc in every other program) and free the libc
+        // temp, so a long-running host that recompiles per keystroke (the LSP)
+        // reclaims every leaked `format()` result at the next arena reset instead
+        // of leaking it to libc forever.  Behaviour-preserving for normal
+        // programs: `global_heap_alloc` with the arena inactive IS libc `malloc`,
+        // and callers that `free()` the result still hit the GlobalAlloc-aware
+        // free.  Branchless and safe on the failure/OOM paths — the copy size
+        // folds to 0 and the freed pointer is nulled when `n < 0` (where `*strp`
+        // is POSIX-undefined), and when the arena allocation itself returns null.
+        if (alloc_fn.is_valid()) {
+            const zero32b: LValue = LType::const_int(LType::i32(), 0, false);
+            const one32:   LValue = LType::const_int(LType::i32(), 1, false);
+            const neg2: LValue = this.builder.build_icmp(
+                LIntPredicate::SLT, n_result, zero32b, "fneg");
+            const n1: LValue = this.builder.build_add(n_result, one32, "n1");
+            const size_pre: LValue = this.builder.build_select(neg2, zero32b, n1, "szpre");
+            const size64: LValue = this.builder.build_zext(size_pre, LType::i64(), "sz64");
+            const old_buf2: LValue = this.builder.build_load(ptr_ty, strp_alloca, "obuf");
+            const null_p: LValue = LType::const_pointer_null(ptr_ty);
+            const safe_old: LValue = this.builder.build_select(neg2, null_p, old_buf2, "sold");
+
+            const alloc_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(alloc_fn.raw) };
+            const one64: LValue = LType::const_int(LType::i64(), 1, false);
+            const ga_buf: void* = intrinsics::malloc(16);
+            const ga_slots: void** = ga_buf as void**;
+            ga_slots[0] = size64.raw;
+            ga_slots[1] = one64.raw;
+            const new_buf: LValue = this.builder.build_call(alloc_ty, alloc_fn, ga_buf, 2, "fbuf");
+            intrinsics::free(ga_buf);
+
+            // cpy_size = new_buf ? size64 : 0  — never memcpy into a null OOM dst.
+            const new_null: LValue = this.builder.build_icmp(
+                LIntPredicate::EQ, new_buf, null_p, "fnull");
+            const zero64: LValue = LType::const_int(LType::i64(), 0, false);
+            const cpy_size: LValue = this.builder.build_select(new_null, zero64, size64, "csz");
+
+            const memcpy_fn: LValue = this.get_or_decl_memcpy();
+            const memcpy_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(memcpy_fn.raw) };
+            const mc_buf: void* = intrinsics::malloc(24);
+            const mc_slots: void** = mc_buf as void**;
+            mc_slots[0] = new_buf.raw;
+            mc_slots[1] = safe_old.raw;
+            mc_slots[2] = cpy_size.raw;
+            this.builder.build_call(memcpy_ty, memcpy_fn, mc_buf, 3, "");
+            intrinsics::free(mc_buf);
+
+            // free(safe_old) — release the libc vasprintf temp (null when n<0).
+            const free_fn: LValue = this.get_or_decl_free();
+            const free_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(free_fn.raw) };
+            const fr_buf: void* = intrinsics::malloc(8);
+            const fr_slots: void** = fr_buf as void**;
+            fr_slots[0] = safe_old.raw;
+            this.builder.build_call(free_ty, free_fn, fr_buf, 1, "");
+            intrinsics::free(fr_buf);
+
+            // Publish the relocated buffer; the tail loads strp and returns it
+            // (selecting null when n<0, exactly as before).
+            this.builder.build_store(new_buf, strp_alloca);
+        }
 
         // %neg = (n < 0); %buf = load strp; %ret = select neg, null, buf
         const zero32: LValue = LType::const_int(LType::i32(), 0, false);

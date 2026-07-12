@@ -40,6 +40,7 @@ import std::collections::hashmap;
 import Compiler::CompileMode;
 import Compiler::CompilationContext;
 import Compiler::Instance;
+import Compiler::Codegen::AstArena;
 
 import Lsp::Protocol::Conv;
 import Lsp::Server::Docs;
@@ -158,6 +159,25 @@ type struct CompilerSession {
         const path_cstr:    string = this.path_buf.as_ptr() as string;
         const content_cstr: string = this.content_buf.as_ptr() as string;
 
+        // ── Per-recompile arena lifecycle (owned here, at the session) ──
+        // The compiler routes AST nodes and — while active — the whole container
+        // heap (intern strings, resolver maps, type arena, decl index, module
+        // graph, and every `T[]`/`HashMap`/`Box`/`String`) through one process-
+        // global bump arena.  Reset it NOW, before building the fresh `ctx`, to
+        // reclaim the PREVIOUS recompile's entire footprint in bulk: the epoch
+        // was just bumped, so no handler will read the old `ctx` again (a stale
+        // session recompiles via `ensure_fresh` first).  Then ACTIVATE routing so
+        // the `CompilationContext::new` below — and everything the compile
+        // allocates — is arena-backed rather than libc.  Without this the ctx and
+        // its sub-components are libc-allocated and, because they're rebuilt fresh
+        // every keystroke, leaked ~monotonically for the process lifetime (the
+        // "LSP eats memory" bug).  The buffers above (`*_buf`) were built with
+        // routing still OFF, so they stay libc and remain safe to `String::drop`.
+        // Routing is DEACTIVATED before returning so per-request handler
+        // allocations (hover/completion strings) don't land in the arena.
+        AstArena::cryo_ast_arena_reset();
+        AstArena::cryo_alloc_arena_set_active(true);
+
         // Allocate a fresh CompilationContext on the heap with mode=Lsp.
         const ctx_box: Box<CompilationContext> =
             Box<CompilationContext>::new(
@@ -173,13 +193,21 @@ type struct CompilerSession {
             // user gets lex / parse / AST-validation / name-resolution
             // diagnostics; later passes can't run because cross-file
             // types are invalid.
-            return this.instance.compile_for_lsp_content_into(
+            mut r_sf: CompilationResult = this.instance.compile_for_lsp_content_into(
                 this.ctx, path_cstr, content_cstr);
+            // Compile done: turn routing OFF so handler-side allocations between
+            // now and the next recompile use libc (and are freed as usual),
+            // leaving the arena holding only this compile's ctx for the handlers
+            // to walk until the next recompile's reset reclaims it.
+            AstArena::cryo_alloc_arena_set_active(false);
+            return r_sf;
         }
 
         const config_cstr: string = this.config_buf.as_ptr() as string;
-        return this.instance.compile_for_lsp_project_into(
+        mut r_proj: CompilationResult = this.instance.compile_for_lsp_project_into(
             this.ctx, config_cstr, path_cstr, content_cstr);
+        AstArena::cryo_alloc_arena_set_active(false);
+        return r_proj;
     }
 }
 
