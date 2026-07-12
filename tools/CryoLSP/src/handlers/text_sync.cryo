@@ -38,20 +38,18 @@ public function did_open(docs: mut &Docs, sessions: mut &SessionMap,
             const version: i32    = TextFields::i32_field_or(td, "version", 1 as i32);
             const text:    String = TextFields::clone_string_field_or_empty(td, "text");
 
-            mut doc: Document = Document::new(
-                String::from_str(uri.as_str()),
-                String::from_str(text.as_str()),
-                version);
-            docs.insert(doc);
-
             // Defer the compile+publish: mark the session dirty and queue
             // the URI.  The flush (idle window in the server loop, or the
             // next request via ensure_fresh) turns the whole burst into a
-            // single compile.
+            // single compile.  Queuing here FIRST (it only borrows the URI)
+            // lets the freshly-extracted `uri`/`text` buffers be MOVED into
+            // `Document` below instead of copied again — under Full sync
+            // `text` is the whole file, so that saves a full-document copy
+            // per didOpen.
             sessions.mark_dirty(uri.as_str());
 
-            mut u: String = uri;     u.drop();
-            mut t: String = text;    t.drop();
+            mut doc: Document = Document::new(uri, text, version);
+            docs.insert(doc);
         }
         Option::None => { }
     }
@@ -73,31 +71,35 @@ public function did_change(docs: mut &Docs, sessions: mut &SessionMap,
                 Option::None          => { String::new() }
             };
 
+            // Coalesce: flag the edit and enqueue; the compile is owed
+            // but not run here (see did_open).  This is what turns a
+            // per-keystroke whole-project recompile into one compile per
+            // editing pause.  Done BEFORE consuming the buffers (it only
+            // borrows the URI) so `new_text` can be MOVED into the store
+            // below rather than copied again — under Full sync `new_text`
+            // is the whole document, so that saves a full-document copy
+            // per keystroke.
+            sessions.mark_dirty(uri.as_str());
+
             // Update the stored document - `replace_text` rebuilds the
-            // line index, which is needed even for full sync.
+            // line index, which is needed even for full sync.  `new_text`
+            // is moved into whichever path applies and isn't read after.
             match (docs.get(uri.as_str())) {
                 Option::Some(doc_ptr) => {
-                    doc_ptr.replace_text(String::from_str(new_text.as_str()), version);
+                    doc_ptr.replace_text(new_text, version);
                 }
                 Option::None => {
                     // didChange before didOpen - accept it anyway by
                     // creating the doc.
                     mut fresh: Document = Document::new(
                         String::from_str(uri.as_str()),
-                        String::from_str(new_text.as_str()),
+                        new_text,
                         version);
                     docs.insert(fresh);
                 }
             }
 
-            // Coalesce: flag the edit and enqueue; the compile is owed
-            // but not run here (see did_open).  This is what turns a
-            // per-keystroke whole-project recompile into one compile per
-            // editing pause.
-            sessions.mark_dirty(uri.as_str());
-
             mut u: String = uri;       u.drop();
-            mut t: String = new_text;  t.drop();
         }
         Option::None => { }
     }
