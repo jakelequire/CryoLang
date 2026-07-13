@@ -3001,8 +3001,77 @@ type struct CallResolver {
         }
         if (concrete_t == null || concrete_t.kind != TypeKind::Enum) { return TypeRef::invalid(); }
         const promoted: TypeRef = this.promote_to_expected_instantiation(type_ref);
+        // `promote` only specialises when an expected type supplies the args.
+        // With no expected type — the inline `match (Option::Some(<expr>))`
+        // subject — it returns the generic base, so the variant binding lands as
+        // the raw param `T`.  A `T`-typed binding hides a `Drop`-field move-out
+        // from move-check (a real double-free).  Recover the concrete
+        // instantiation from the constructor's argument types.  Gated to the
+        // match subject AND a destructor-owning payload: exactly the unsound set,
+        // so Copy-payload subjects keep the generic-base path (no mono/codegen
+        // ripple).
+        if (promoted.id == type_ref.id && this.state.resolving_match_subject) {
+            const inferred: TypeRef = this.infer_variant_instantiation(type_ref, scope.member_name, call);
+            if (inferred.is_valid()) { scope.set_resolved_type(inferred); return inferred; }
+        }
         scope.set_resolved_type(promoted);
         return promoted;
+    }
+
+    /// Infer the concrete instantiation of a generic enum from an enum-variant
+    /// constructor's argument types (`Option::Some(<Holder>)` -> `Option<Holder>`)
+    /// when no expected type promoted it.  Matches each of the variant's
+    /// bare-param payload positions against the corresponding argument's resolved
+    /// type and binds the template params.  Returns an `InstantiatedType` ONLY
+    /// when (1) every template param is bound to a fully concrete argument type
+    /// and (2) some bound arg owns a destructor — i.e. the exact case the
+    /// pattern-binding move-check needs concretised; otherwise `TypeRef::invalid()`
+    /// so the caller keeps the generic base (Copy/plain payloads and generic
+    /// template bodies stay on the existing path).
+    infer_variant_instantiation(mut &this, base_ref: TypeRef, member: SymbolStr,
+                                call: CallExprNode*) -> TypeRef {
+        if (call == null || this.ctx.generic_registry == null) { return TypeRef::invalid(); }
+        const tmpl: TemplateEntry* = this.ctx.generic_registry.get_template_by_type_id(base_ref.id);
+        if (tmpl == null || tmpl.param_count == 0) { return TypeRef::invalid(); }
+        const base_t: Type* = this.arena.lookup(base_ref.id);
+        if (base_t == null || base_t.kind != TypeKind::Enum) { return TypeRef::invalid(); }
+        const variant: EnumVariantInfo* = (base_t as EnumType*).get_variant(member);
+        if (variant == null) { return TypeRef::invalid(); }
+        if (variant.payload_types.length != call.arguments.length) { return TypeRef::invalid(); }
+
+        mut bindings: TypeRef[] = [];
+        for (mut p: i64 = 0; p < tmpl.param_count; p++) { bindings.push(TypeRef::invalid()); }
+        mut any_needs_drop: boolean = false;
+
+        for (mut i: i64 = 0; i < variant.payload_types.length; i++) {
+            const pt: Type* = this.arena.lookup(variant.payload_types[i].id);
+            if (pt == null) { continue; }
+            // Only the direct `T` payload shape (the position IS a bare param).
+            mut pname: SymbolStr = SymbolStr::empty();
+            if (pt.kind == TypeKind::GenericParam) { pname = (pt as GenericParamType*).param_name; }
+            else if (pt.kind == TypeKind::BoundedParam) { pname = (pt as BoundedParamType*).param_name; }
+            else { continue; }
+            const arg: ExpressionNode* = call.arguments[i];
+            if (arg == null || !arg.has_resolved_type()) { continue; }
+            const arg_ty: TypeRef = arg.resolved_type;
+            if (this.types.contains_generic_param(arg_ty)) { continue; }
+            if (OwnershipQuery::needs_drop(this.arena, this.ctx.generic_registry, this.intern, arg_ty)) {
+                any_needs_drop = true;
+            }
+            for (mut p: i64 = 0; p < tmpl.param_count; p++) {
+                if (tmpl.param_names[p].equals(pname)) { bindings[p] = arg_ty; break; }
+            }
+        }
+
+        if (!any_needs_drop) { return TypeRef::invalid(); }
+        for (mut p: i64 = 0; p < tmpl.param_count; p++) {
+            if (!bindings[p].is_valid()) { return TypeRef::invalid(); }
+        }
+        // Record the demand (keyed by source file, like TypeResolution) so the
+        // instantiation is monomorphized for codegen; instantiate_for_module
+        // stays arena-only under a symbolic no-demand walk.
+        const mod_sym: SymbolStr = this.intern.intern(this.ctx.source_file);
+        return this.ctx.generic_registry.instantiate_for_module(base_ref, &bindings, mod_sym);
     }
 
     try_resolve_module_function(mut &this, scope: ScopeResolutionNode*, call: CallExprNode*) -> TypeRef {
