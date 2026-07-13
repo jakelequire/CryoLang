@@ -223,7 +223,7 @@ References use `&`. They appear principally as method receivers (`&this` for sha
 
 ```cryo
 &int               // shared reference to int
-&mut int           // exclusive reference to int
+mut &int           // exclusive reference to int
 ```
 
 The receiver shape on a method is part of its signature: a `&this` method may not modify the receiver; a `mut &this` method may. Callers see this distinction without reading the body.
@@ -1609,7 +1609,7 @@ type trait Ord : Eq {
 }
 ```
 
-### 11.2 Implementing a Trait
+### 11.2 Implementing a Traitg
 
 `implement trait <Trait> for <Type> { ... }` provides the method bodies for a concrete type.
 
