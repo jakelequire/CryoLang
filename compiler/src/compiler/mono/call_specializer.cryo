@@ -929,10 +929,40 @@ type struct MonoCallSpecializer {
         // resolution (collapsing coexisting combinator specs onto the first).
         const inherent_pin: boolean = inherent_owner_ast != null
             || (impl_node != null && !impl_node.is_trait_impl());
-        if (inherent_pin) {
+
+        // A trait-impl generic method whose type params appear ONLY in the
+        // return / where-bound - no VALUE parameter mentions them - can't be
+        // told apart by its parameter-shaped mangle, and its owner-spec name is
+        // the SAME across instantiations (the owner is one concrete type), so
+        // two specs collapse onto the first emitted symbol.  Concretely
+        // `JsonExtract::as<T>() -> Option<T> where T: TryFrom<&JsonValue>`
+        // mangled to `...as...Option<boolean>` for EVERY `T`, and every
+        // `as<i64>` / `as<Str>` call linked to the `as<boolean>` body.  Stamp
+        // the `$MG…` method-spec args in that case too.  Iterator combinators
+        // are structurally excluded: their method type param is always carried
+        // by a value parameter (`chain<I>(other: I)`, `zip<U>(other: U)`,
+        // `map<F>(f: F)`), so `method_generic_in_value_param` is true and this
+        // branch never fires for them - their owner-spec disambiguation (a
+        // distinct `ChainIter<...>` owner per spec) is preserved.
+        mut method_generic_in_value_param: boolean = false;
+        if (orig_func != null) {
+            const this_amp_p: SymbolStr = this.intern_table.intern("&this");
+            const this_val_p: SymbolStr = this.intern_table.intern("this");
+            for (mut pi: i64 = 0; pi < orig_func.parameters.length; pi++) {
+                const pp: VarDeclNode* = orig_func.parameters[pi];
+                if (pp == null) { continue; }
+                if (pp.name.equals(this_amp_p) || pp.name.equals(this_val_p)) { continue; }
+                if (this.arena.contains_generic_param(pp.resolved_type)) {
+                    method_generic_in_value_param = true;
+                    break;
+                }
+            }
+        }
+
+        if (inherent_pin || !method_generic_in_value_param) {
             // Stamp the concrete method type args so the spec's mangled symbol
             // carries the `$MG…` disambiguator (MangledName::with_method_spec_args).
-            // Two specs of one inherent method whose signature doesn't mention the
+            // Two specs of one method whose signature doesn't mention the
             // method param (`name<T>() -> string`) would otherwise mangle
             // identically and collapse onto the first emitted spec.
             mut spec_args_owned: TypeRef[] = [];
@@ -967,10 +997,15 @@ type struct MonoCallSpecializer {
             spec_method, pin_target);
         if (this.state.method_spec_seen(spec_sym)) {
             call.set_resolved_method(spec_method as ASTNode*);
-            // Inherent specs pin the precise symbol; trait-impl specs rely on the
-            // already-present DI entry (their mangle can diverge from the emitted
-            // symbol), exactly as the first materialization did below.
-            if (inherent_pin && spec_sym.is_valid()) {
+            // Inherent specs pin the precise symbol; trait-impl specs normally
+            // rely on the already-present DI entry (their mangle can diverge from
+            // the emitted symbol), exactly as the first materialization did below.
+            // EXCEPTION: a trait-impl method whose type param is return-only
+            // (`!method_generic_in_value_param`) MUST pin its `$MG` symbol - its
+            // unmangled DI key is identical across instantiations and would
+            // otherwise collapse every spec onto the first (see the stamping
+            // comment above and the matching pin below).
+            if ((inherent_pin || !method_generic_in_value_param) && spec_sym.is_valid()) {
                 call.set_resolved_callee(spec_sym);
             }
             return;
@@ -1033,8 +1068,12 @@ type struct MonoCallSpecializer {
             // codegen falls back to the unmangled `Type::method` key and every
             // instantiation collapses onto whichever spec was emitted first.
             // Trait-impl / combinator specs stay unpinned (their DI mangle can
-            // diverge from the emitted definition symbol).
-            if (!impl_node.is_trait_impl() && spec_sym.is_valid()) {
+            // diverge from the emitted definition symbol) - EXCEPT a trait-impl
+            // method with a return-only type param, which shares one unmangled DI
+            // key across all instantiations and so must pin its distinct `$MG`
+            // symbol (matching the stamped `spec_type_args` + the emitted def).
+            if ((!impl_node.is_trait_impl() || !method_generic_in_value_param)
+                    && spec_sym.is_valid()) {
                 call.set_resolved_callee(spec_sym);
             }
         }

@@ -220,16 +220,27 @@ implement enum JsonValue {
     /// Take ownership of `s`.
     static string_value(s: String) -> JsonValue { return JsonValue::String(s); }
 
-    /// Construct an owned String from the borrowed Str, then wrap.
-    static from_str(s: Str) -> JsonValue {
-        return JsonValue::String(String::from_str(s));
-    }
-
-    /// JSON string value from a raw NUL-terminated `string` (C-string),
-    /// mirroring `Str::from_cstr`. Saves callers the `from_str(Str::from_cstr(..))`
-    /// dance when they hold a raw `string`.
-    static from_cstr(s: string) -> JsonValue {
-        return JsonValue::String(String::from_str(Str::from_cstr(s)));
+    /// JSON string value from a text `src`. `static match (T)` restricts
+    /// the accepted types to a borrowed `Str` or a raw NUL-terminated
+    /// `string` (C-string), copying either into an owned `String`. The
+    /// match deliberately admits no numeric/boolean arm: those must go
+    /// through `int_value` / `uint_value` / `float_value` / `bool_value`
+    /// so a number never silently becomes a JSON *string*.
+    static from<T>(src: T) -> JsonValue {
+        // Build the owned String in each arm via a CONCRETE constructor
+        // (never the generic `String::from`, whose inner type argument would
+        // stay abstract under monomorphization), then wrap once outside the
+        // dispatch.  The `static match` is used in STATEMENT position
+        // (assigning `owned`) and the enclosing value returns a local - the
+        // same "build a local, return the local" shape as `String::from`.
+        // This keeps `from` compilable by a bootstrap compiler that predates
+        // the drop-insertion fix for aggregate-yielding static-match arms.
+        mut owned: String = String::new();
+        static match (T) {
+            Str    => { owned = String::from_str(src); }
+            string => { owned = String::from_str(Str::from_cstr(src)); }
+        }
+        return JsonValue::String(owned);
     }
 
     /// JSON array of strings from a raw `string[]`. Each element is
@@ -237,7 +248,7 @@ implement enum JsonValue {
     static string_array(items: &string[]) -> JsonValue {
         mut arr: Array<JsonValue> = Array<JsonValue>::new();
         for (mut i: i64 = 0; i < items.length; i++) {
-            arr.push(JsonValue::from_cstr(items[i]));
+            arr.push(JsonValue::from(items[i]));
         }
         return JsonValue::Array(arr);
     }
@@ -258,44 +269,6 @@ implement enum JsonValue {
     is_string(&this) -> boolean { return match (this) { JsonValue::String(_) => { true } _ => { false } }; }
     is_array(&this)  -> boolean { return match (this) { JsonValue::Array(_) => { true } _ => { false } }; }
     is_object(&this) -> boolean { return match (this) { JsonValue::Object(_) => { true } _ => { false } }; }
-
-    // Typed accessors: return None when the variant doesn't match.
-
-    as_bool(&this) -> Option<boolean> {
-        return match (this) {
-            JsonValue::Bool(b) => { Option::Some(b) }
-            _                  => { Option::None }
-        };
-    }
-
-    as_i64(&this) -> Option<i64> {
-        return match (this) {
-            JsonValue::Number(n) => { n.as_i64() }
-            _                    => { Option::None }
-        };
-    }
-
-    as_u64(&this) -> Option<u64> {
-        return match (this) {
-            JsonValue::Number(n) => { n.as_u64() }
-            _                    => { Option::None }
-        };
-    }
-
-    as_f64(&this) -> Option<f64> {
-        return match (this) {
-            JsonValue::Number(n) => { Option::Some(n.as_f64()) }
-            _                    => { Option::None }
-        };
-    }
-
-    /// Borrow the inner string. Returns `None` for any other variant.
-    as_str(&this) -> Option<Str> {
-        return match (this) {
-            JsonValue::String(s) => { Option::Some(s.as_str()) }
-            _                    => { Option::None }
-        };
-    }
 
     // Path access: chain through nested objects/arrays.
     //
@@ -338,6 +311,30 @@ implement enum JsonValue {
 
 }
 
+/// Typed scalar extraction from a `JsonValue`, dispatched on the
+/// requested type `T`.  `json.as<i64>()` yields `Some` when the value is
+/// a number representable as `i64`, else `None`; likewise `as<boolean>`,
+/// `as<u64>`, `as<f64>`, and `as<Str>` (a borrow into the value's owned
+/// string, valid for the JsonValue's lifetime).
+///
+/// This is the single generic replacement for the former `as_bool` /
+/// `as_i64` / `as_u64` / `as_f64` / `as_str` family.  It routes through
+/// the open `TryFrom<&JsonValue>` abstraction, so any `T` a caller
+/// teaches `TryFrom<&JsonValue>` (see below) is readable via `as<T>` too,
+/// with no change here.  A conversion error - wrong variant, or a number
+/// out of range for `T` - becomes `None`; use `T::try_from(&json)`
+/// directly when the reason matters.
+type trait JsonExtract {
+    as<T>(&this) -> Option<T> where T: TryFrom<&JsonValue> {
+        return match (T::try_from(this)) {
+            Result::Ok(v)  => { Option::Some(v) }
+            Result::Err(_) => { Option::None }
+        };
+    }
+}
+
+implement trait JsonExtract for JsonValue { }
+
 // TryFrom<&JsonValue>: extract typed scalars from a JsonValue borrow.
 //
 // Each implementation says "here is how to extract a `T` from a
@@ -351,49 +348,55 @@ implement enum JsonValue {
 
 implement trait TryFrom<&JsonValue> for boolean {
     static try_from(value: &JsonValue) -> Result<boolean, ConversionError> {
-        match (value.as_bool()) {
-            Option::Some(b) => { return Result::Ok(b); }
-            Option::None    => {
-                return Result::Err(ConversionError::new(
-                    "JsonValue is not a Bool"));
+        return match (value) {
+            JsonValue::Bool(b) => { Result::Ok(b) }
+            _                  => {
+                Result::Err(ConversionError::new("JsonValue is not a Bool"))
             }
-        }
+        };
     }
 }
 
 implement trait TryFrom<&JsonValue> for i64 {
     static try_from(value: &JsonValue) -> Result<i64, ConversionError> {
-        match (value.as_i64()) {
-            Option::Some(n) => { return Result::Ok(n); }
-            Option::None    => {
-                return Result::Err(ConversionError::new(
-                    "JsonValue is not representable as i64"));
+        match (value) {
+            JsonValue::Number(n) => {
+                match (n.as_i64()) {
+                    Option::Some(x) => { return Result::Ok(x); }
+                    Option::None    => { }
+                }
             }
+            _ => { }
         }
+        return Result::Err(ConversionError::new(
+            "JsonValue is not representable as i64"));
     }
 }
 
 implement trait TryFrom<&JsonValue> for u64 {
     static try_from(value: &JsonValue) -> Result<u64, ConversionError> {
-        match (value.as_u64()) {
-            Option::Some(n) => { return Result::Ok(n); }
-            Option::None    => {
-                return Result::Err(ConversionError::new(
-                    "JsonValue is not representable as u64"));
+        match (value) {
+            JsonValue::Number(n) => {
+                match (n.as_u64()) {
+                    Option::Some(x) => { return Result::Ok(x); }
+                    Option::None    => { }
+                }
             }
+            _ => { }
         }
+        return Result::Err(ConversionError::new(
+            "JsonValue is not representable as u64"));
     }
 }
 
 implement trait TryFrom<&JsonValue> for f64 {
     static try_from(value: &JsonValue) -> Result<f64, ConversionError> {
-        match (value.as_f64()) {
-            Option::Some(n) => { return Result::Ok(n); }
-            Option::None    => {
-                return Result::Err(ConversionError::new(
-                    "JsonValue is not a Number"));
+        return match (value) {
+            JsonValue::Number(n) => { Result::Ok(n.as_f64()) }
+            _                    => {
+                Result::Err(ConversionError::new("JsonValue is not a Number"))
             }
-        }
+        };
     }
 }
 
@@ -401,13 +404,12 @@ implement trait TryFrom<&JsonValue> for f64 {
 /// Valid for the lifetime of the parent `JsonValue`.
 implement trait TryFrom<&JsonValue> for Str {
     static try_from(value: &JsonValue) -> Result<Str, ConversionError> {
-        match (value.as_str()) {
-            Option::Some(s) => { return Result::Ok(s); }
-            Option::None    => {
-                return Result::Err(ConversionError::new(
-                    "JsonValue is not a String"));
+        return match (value) {
+            JsonValue::String(s) => { Result::Ok(s.as_str()) }
+            _                    => {
+                Result::Err(ConversionError::new("JsonValue is not a String"))
             }
-        }
+        };
     }
 }
 
