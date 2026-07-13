@@ -1,8 +1,9 @@
-// E0453: moving a non-Copy field OUT of an owned, drop-glued value is a
-// double free. `owner` still owns `h`, so `owner`'s scope-exit drop glue
-// frees `h.p` - and so does `stolen` - the same pointer freed twice.
-// Cryo has no partial-move tracking, so MoveCheck rejects this before
-// codegen rather than emitting the silently-corrupting binary.
+// E0453: moving a non-Copy field OUT of an owned, drop-glued value in a
+// CONDITIONAL context is a double free. `owner` still owns `h`, so `owner`'s
+// scope-exit drop glue frees `h.p` - and so does `stolen` - the same pointer
+// freed twice. Drop-skip without per-field drop flags is sound only for an
+// *unconditional* move (which the partial-move feature allows and tracks); an
+// in-branch move like this one keeps the hard E0453.
 //
 // Regression for the partial-field-move double-free (audit finding H1).
 // The escape hatch is `core::mem::swap` (leave the field a valid value to
@@ -11,6 +12,11 @@
 ![config(testing)]
 ![config(negative, E0453)]
 namespace CryoTests::Negative::MoveFieldOutOfAggregate;
+
+extern "C" {
+    function malloc(size: u64) -> void*;
+    function free(ptr: void*) -> void;
+}
 
 type struct Heap {
     p: void*;
@@ -27,6 +33,9 @@ type struct Holder {
 
 function main() -> int {
     mut owner: Holder = Holder { h: Heap { p: malloc(16) }, tag: 1 };
-    mut stolen: Heap = owner.h;   // error[E0453]: cannot move 'h' out of 'owner'
+    if (owner.tag == 1) {
+        mut stolen: Heap = owner.h;   // error[E0453]: cannot move 'h' out of 'owner'
+        stolen.drop();
+    }
     return 0;
 }

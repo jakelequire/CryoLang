@@ -272,10 +272,27 @@ public:
         mut left: ExpressionNode* = this.parse_cast();
         if (left == null || this.panic_mode) { return left; }
 
+        // A left-associative operator chain (`a + b + c + ...`) is parsed
+        // iteratively by this loop, but the tree it builds is left-leaning:
+        // its height equals the chain length.  Later recursive AST walks
+        // (name resolution / sema / codegen) descend that left spine, so an
+        // unbounded chain overflows the native stack (SIGSEGV) even though the
+        // parser itself never recurses deeply here.  Cap the chain length at
+        // parse time so the pathological tree is never built.  256 is far past
+        // any realistic flat expression and matches the paren/unary/ternary
+        // limits, which keeps the downstream-recursion bound uniform.
+        mut chain_len: int = 0;
         while (true) {
             const prec: int = this.current().kind.binary_precedence();
             if (prec < min_prec || prec == 0) {
                 break;
+            }
+
+            chain_len += 1;
+            if (chain_len > 256) {
+                this.report_error(ErrorCode::E0111_INVALID_SYNTAX,
+                    "expression nesting too deep (binary-operator chain limit exceeded)");
+                return left;
             }
 
             const op: Token = this.advance();
@@ -424,8 +441,21 @@ public:
 
     /// Parse postfix operations: call, index, member access, ++/--.
     parse_postfix(mut expr: ExpressionNode*) -> ExpressionNode* {
+        // Postfix chains (`a.b.b.b...`, `a()()()...`, `a[i][i]...`) are parsed
+        // iteratively but build a left-leaning tree whose height equals the
+        // chain length; later recursive AST walks descend it and overflow the
+        // native stack (SIGSEGV) on a pathological chain.  Cap the chain at
+        // parse time, matching the 256 limit used for the other nesting guards.
+        mut chain_len: int = 0;
         while (true) {
             if (this.panic_mode || this.is_at_end()) { break; }
+
+            chain_len += 1;
+            if (chain_len > 256) {
+                this.report_error(ErrorCode::E0111_INVALID_SYNTAX,
+                    "expression nesting too deep (postfix chain limit exceeded)");
+                break;
+            }
 
             if (this.check(TokenType::LParen)) {
                 expr = this.parse_call_args(expr);
@@ -2549,7 +2579,21 @@ public:
         mut result: TypeAnnotation* = base;
         mut ptr_const: boolean = pending_const;
 
+        // Pointer/array/optional suffixes (`T*`, `T[]`, `T?`) are consumed
+        // iteratively here, but each wraps `result` in a new node, so a long
+        // suffix run (`i32****...`) builds a left-leaning type tree whose height
+        // equals the run length; later recursive type walks overflow the native
+        // stack (SIGSEGV) on it.  `parse_type_annotation`'s `type_depth` guard
+        // does not cover this loop (it does not recurse through there), so cap
+        // the run length here, matching the 256 limit used elsewhere.
+        mut suffix_len: int = 0;
         while (true) {
+            suffix_len += 1;
+            if (suffix_len > 256) {
+                this.report_error(ErrorCode::E0104_EXPECTED_TYPE,
+                    "type nesting too deep (pointer/array suffix limit exceeded)");
+                return result;
+            }
             // Pointer suffix: T*
             if (this.check(TokenType::Star)) {
                 this.advance();
