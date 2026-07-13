@@ -37,6 +37,8 @@ import std::collections::string;
 import std::collections::array;
 import std::collections::hashmap;
 
+import std::alloc::arena;
+
 import Compiler::CompileMode;
 import Compiler::CompilationContext;
 import Compiler::Instance;
@@ -46,21 +48,23 @@ import Lsp::Protocol::Conv;
 import Lsp::Server::Docs;
 
 
-// Compile epoch.
+// Per-session arenas (persistent contexts).
 //
-// The compiler routes every session's AST nodes (and, while active, its
-// container heap) through ONE process-global bump arena that is `reset()`
-// at the start of each compile (see `codegen/ast_arena.cryo`).  Because
-// the arena is shared, recompiling document A recycles the arena memory
-// that document B's still-cached `ctx` points into - a cross-document
-// use-after-free the moment a handler for B walks B's now-dangling AST.
+// Each open document owns its OWN bump arena (`CompilerSession.arena`), so a
+// recompile of document B never touches the memory document A's `ctx` points
+// into.  A context therefore stays valid for as long as its session is live -
+// hover / go-to-def on an already-compiled file answer instantly, with no
+// re-parse, even after edits to other files.  Before compiling OR reading a
+// session, the daemon makes that session's arena the current one via
+// `AstArena::cryo_ast_arena_set_current` (see the note there on why reads must
+// publish too: `GlobalAlloc`'s free/realloc key on the published arena).
 //
-// `g_compile_epoch` is a monotonic counter bumped by every `recompile()`.
-// Each session records the epoch its `ctx` was built at; a session whose
-// `epoch` is behind the global counter has had the arena reset out from
-// under it and MUST be recompiled before its `ctx` is read again.  See
-// `SessionMap::ensure_fresh`.
-mut g_compile_epoch: u64 = 0;
+// This replaces the old single-shared-arena model, whose per-recompile reset
+// forced a compile-epoch guard that invalidated EVERY other document's context
+// on any edit - correct, but it meant a full whole-project recompile (~10-30s
+// for the compiler) on every file switch and every edit, blocking the handler.
+// Per-session arenas trade that latency back for memory bounded by the number
+// of LIVE contexts, which `SessionMap` caps with an LRU (see `MAX_LIVE_CTX`).
 
 
 type struct CompilerSession {
@@ -82,11 +86,12 @@ type struct CompilerSession {
     /// for the session because `instance.config.stdlib_path_override`
     /// is a `string` (raw `char*`) pointer into this buffer.
     stdlib_buf:  String;
-    /// The `g_compile_epoch` value at which `ctx` was last built.  When
-    /// it lags the global counter, another document's recompile has
-    /// reset the shared AST arena and `ctx` is dangling (see the module
-    /// note on `g_compile_epoch`).  Zero until the first `recompile()`.
-    epoch:       u64;
+    /// This session's OWN bump arena, holding `ctx` and everything the
+    /// compile allocated.  Heap-boxed + leaked so it outlives the compile
+    /// call; owned by the session and reclaimed on `evict()` / `drop()`.
+    /// `null` until the first `recompile()`, and again after an LRU
+    /// eviction (which nulls `ctx` too, so the next request recompiles).
+    arena:       Arena*;
     /// Set when the editor buffer changed since `ctx` was last built, so
     /// a compile is owed.  The per-keystroke recompile is coalesced: edits
     /// only flip this flag (and enqueue the URI in `SessionMap::pending`);
@@ -103,9 +108,26 @@ type struct CompilerSession {
             content_buf:     String::new(),
             config_buf:      String::new(),
             stdlib_buf:      String::new(),
-            epoch:           0 as u64,
+            arena:           null,
             needs_recompile: false,
         };
+    }
+
+    /// Reclaim this session's context in bulk by releasing its arena, and
+    /// null both `arena` and `ctx` so the next request recompiles from the
+    /// live editor buffer.  Keeps the backing buffers + `needs_recompile`
+    /// untouched: an evicted session is still a valid, just-uncompiled one.
+    /// Used by the LRU cap and by `Drop`.
+    release_ctx(mut &this) -> void {
+        if (this.arena != null) {
+            // `ctx` and every container it owns live inside this arena, so
+            // releasing the chunks frees them all at once; free the Arena
+            // struct itself (libc-allocated, see `recompile`) afterwards.
+            this.arena.release();
+            intrinsics::free(this.arena as void*);
+            this.arena = null;
+        }
+        this.ctx = null;
     }
 
     /// Borrow the current `CompilationContext`.  Returns `null` if no
@@ -120,12 +142,6 @@ type struct CompilerSession {
     /// and either drives the whole-project compile (preferred) or
     /// falls back to single-file mode if no cryoconfig is reachable.
     recompile(mut &this, uri: Str, content: Str) -> CompilationResult {
-        // Claim a new compile epoch.  This recompile is about to reset the
-        // shared AST arena, so every OTHER session's `ctx` becomes stale
-        // as of now; stamping `this.epoch` below marks THIS session as the
-        // one the arena currently backs.
-        g_compile_epoch = g_compile_epoch + 1 as u64;
-
         // Editor-side `uri` is `file://<absolute-path>` (percent-encoded);
         // decode + normalize to a real filesystem path the loader accepts.
         mut fs_path_owned: String = UriPath::uri_to_fs_path(uri);
@@ -159,37 +175,43 @@ type struct CompilerSession {
         const path_cstr:    string = this.path_buf.as_ptr() as string;
         const content_cstr: string = this.content_buf.as_ptr() as string;
 
-        // ── Per-recompile arena lifecycle (owned here, at the session) ──
+        // ── Per-recompile arena lifecycle (this session's OWN arena) ──
         // The compiler routes AST nodes and — while active — the whole container
         // heap (intern strings, resolver maps, type arena, decl index, module
-        // graph, and every `T[]`/`HashMap`/`Box`/`String`) through one process-
-        // global bump arena.  Reset it NOW, before building the fresh `ctx`, to
-        // reclaim the PREVIOUS recompile's entire footprint in bulk: the epoch
-        // was just bumped, so no handler will read the old `ctx` again (a stale
-        // session recompiles via `ensure_fresh` first).  Then ACTIVATE routing so
-        // the `CompilationContext::new` below — and everything the compile
-        // allocates — is arena-backed rather than libc.  Without this the ctx and
-        // its sub-components are libc-allocated and, because they're rebuilt fresh
-        // every keystroke, leaked ~monotonically for the process lifetime (the
-        // "LSP eats memory" bug).  The buffers above (`*_buf`) were built with
-        // routing still OFF, so they stay libc and remain safe to `String::drop`.
-        // Routing is DEACTIVATED before returning so per-request handler
-        // allocations (hover/completion strings) don't land in the arena.
-        // Release (not reset) the arena: free the previous compile's chunks back
-        // to the OS so peak stays bounded at one compile.  `reset` keeps chunks,
-        // and across many keystroke-recompiles the slightly-varying per-compile
-        // high-water leaks a chunk each time (arena capacity creep).
-        AstArena::cryo_ast_arena_release();
+        // graph, and every `T[]`/`HashMap`/`Box`/`String`) through a bump arena
+        // published via `AstArena`.  This session owns its arena outright, so no
+        // OTHER document's compile ever disturbs the `ctx` we build here — the
+        // context stays valid for hover/def until this session is recompiled,
+        // evicted, or dropped.  Create the arena on first use (libc-backed:
+        // routing is still OFF here, so the `Box<Arena>` and the buffers above
+        // stay in libc and are safe to free explicitly).
+        if (this.arena == null) {
+            const arena_box: Box<Arena> = Box<Arena>::new(
+                Arena::with_chunk_size(8u64 * 1024u64 * 1024u64));
+            this.arena = arena_box.leak();
+        }
+        // Make THIS session's arena the current AST + container arena, then
+        // reset it to reclaim this session's PREVIOUS compile in bulk before
+        // building the fresh one.  Reset (not release) keeps the chunks: this
+        // arena only ever compiles the SAME document's project, so the per-
+        // recompile footprint is stable and the chunks are reused cleanly (no
+        // capacity creep — that only happened when one shared arena hosted
+        // differently-sized projects back to back).
+        AstArena::cryo_ast_arena_set_current(this.arena);
+        this.arena.reset();
+        // ACTIVATE routing so the `CompilationContext::new` below — and
+        // everything the compile allocates — is arena-backed rather than libc.
+        // Deactivated before returning so per-request handler allocations
+        // (hover/completion strings) land in libc and are freed as usual.
         AstArena::cryo_alloc_arena_set_active(true);
 
-        // Allocate a fresh CompilationContext on the heap with mode=Lsp.
+        // Allocate a fresh CompilationContext on the heap with mode=Lsp.  With
+        // routing active this — and the whole context — lands in `this.arena`.
         const ctx_box: Box<CompilationContext> =
             Box<CompilationContext>::new(
                 CompilationContext::new(CompileMode::Lsp, path_cstr));
         this.ctx = ctx_box.leak();
-        // Mark this session as backed by the arena as of this epoch, and
-        // clear the pending-edit flag: `ctx` now reflects `content`.
-        this.epoch = g_compile_epoch;
+        // `ctx` now reflects `content`; clear the pending-edit flag.
         this.needs_recompile = false;
 
         if (this.config_buf.length() == 0) {
@@ -227,12 +249,63 @@ type struct SessionMap {
     /// `flush_pending`.  Deduped: a burst of edits to one file adds one
     /// entry.  Small - bounded by the number of open documents.
     pending: Array<String>;
+    /// URIs whose session currently holds a LIVE context (arena + `ctx`),
+    /// in least-recently-used order (front = oldest).  Every session owns a
+    /// full-project context, so this is capped at `MAX_LIVE_CTX`: the moment
+    /// a fresh compile pushes the count over, the oldest context is evicted
+    /// (its arena released, `ctx` nulled) so the process holds at most a few
+    /// project footprints at once.  An evicted document recompiles on its
+    /// next request - it just loses the "instant" property until then.
+    live_order: Array<String>;
 
     static new() -> SessionMap {
         return SessionMap {
-            by_uri:  HashMap<String, CompilerSession>::new(),
-            pending: Array<String>::new(),
+            by_uri:     HashMap<String, CompilerSession>::new(),
+            pending:    Array<String>::new(),
+            live_order: Array<String>::new(),
         };
+    }
+
+    /// Mark `uri` as the most-recently-used live context, then evict the
+    /// oldest live contexts back down to `MAX_LIVE_CTX`.  Called by
+    /// `ensure_fresh` after a session's `ctx` is confirmed live (whether it
+    /// was just compiled or already cached).  The current `uri` is always the
+    /// most-recent entry, so it is never the one evicted here.
+    touch_live(mut &this, uri: Str) -> void {
+        this.forget_live(uri);                       // dedup: drop any prior entry
+        this.live_order.push(String::from_str(uri));
+        // Evict from the front (oldest) while over the cap.  `remove` returns
+        // the owned URI String, which we drop after using it.
+        while (this.live_order.length() > MAX_LIVE_CTX) {
+            mut evicted: String = this.live_order.remove(0 as u64);
+            // Release that document's context; it stays in `by_uri` (with a
+            // null ctx) so its buffers/dirty flag survive and a later request
+            // recompiles it cleanly.
+            match (this.get(evicted.as_str())) {
+                Option::Some(s) => { s.release_ctx(); }
+                Option::None    => { }
+            }
+            evicted.drop();
+        }
+    }
+
+    /// Drop `uri` from the live-order list if present (linear scan; the list
+    /// is at most `MAX_LIVE_CTX` long).  Does NOT release the context - used
+    /// both as the dedup step in `touch_live` and on close/removal.
+    forget_live(mut &this, uri: Str) -> void {
+        const n: u64 = this.live_order.length();
+        for (mut i: u64 = 0; i < n; i++) {
+            match (this.live_order.get_ref(i)) {
+                Option::Some(p) => {
+                    if (p.as_str().equals(&uri)) {
+                        mut gone: String = this.live_order.remove(i);
+                        gone.drop();
+                        return;
+                    }
+                }
+                Option::None => { }
+            }
+        }
     }
 
     /// True when at least one document is awaiting a coalesced compile.
@@ -327,13 +400,17 @@ type struct SessionMap {
         }
     }
 
-    /// Return the session for `uri` with a `ctx` that is guaranteed
-    /// valid to walk RIGHT NOW.  If the session was never compiled, or a
-    /// different document has recompiled since (bumping `g_compile_epoch`
-    /// and resetting the shared AST arena), the document is recompiled
-    /// from its current editor buffer first.  Read handlers must go
-    /// through this rather than `get()` + `context()` to avoid walking a
-    /// ctx whose arena memory was recycled by another document's compile.
+    /// Return the session for `uri` with a `ctx` that is guaranteed valid to
+    /// walk RIGHT NOW.  Because each session owns its arena, a context stays
+    /// valid across other documents' compiles - so a cached, unedited session
+    /// is returned WITHOUT recompiling; only a never-compiled, LRU-evicted, or
+    /// edited session is rebuilt from the live editor buffer.  Either way, this
+    /// session's arena is made the current published one before returning, so
+    /// `GlobalAlloc`'s free/realloc (which key on the published arena) stay
+    /// correct for the context the handler is about to walk, and the session is
+    /// promoted to most-recently-used in the LRU.
+    ///
+    /// Read handlers must go through this rather than `get()` + `context()`.
     ///
     /// Returns `null` only if the session can't be created.  A non-null
     /// return may still have a null `context()` when no buffer is open
@@ -342,16 +419,24 @@ type struct SessionMap {
         const session: CompilerSession* = this.get_or_create(uri);
         if (session == null) { return null; }
 
-        if (session.ctx != null && session.epoch == g_compile_epoch
-                && !session.needs_recompile) {
-            return session;                          // still arena-live + up to date
+        if (session.ctx != null && !session.needs_recompile) {
+            // Cached + up to date: re-publish this session's arena (a compile
+            // or read of another document may have made a different arena
+            // current) so pointers in `ctx` are the ones `holds()` recognises.
+            if (session.arena != null) {
+                AstArena::cryo_ast_arena_set_current(session.arena);
+            }
+            this.touch_live(uri);
+            return session;
         }
 
-        // Stale, never compiled, or edited since last compile: rebuild
-        // from the live editor buffer (this also clears needs_recompile).
+        // Never compiled, evicted, or edited since last compile: rebuild from
+        // the live editor buffer (this also clears needs_recompile and makes
+        // the session's arena current).
         match (docs.get(uri)) {
             Option::Some(doc) => {
                 session.recompile(uri, doc.text.as_str());
+                if (session.ctx != null) { this.touch_live(uri); }
             }
             Option::None => {
                 // No open buffer to compile from; leave ctx as-is (the
@@ -362,6 +447,7 @@ type struct SessionMap {
     }
 
     remove(mut &this, uri: Str) -> boolean {
+        this.forget_live(uri);                       // drop any live-order entry
         const key: String = String::from_str(uri);
         match (this.by_uri.remove(&key)) {
             Option::Some(session) => {
@@ -519,11 +605,12 @@ static build_cstring_buffer(s: Str) -> String {
 
 implement trait Drop for CompilerSession {
     drop(mut &this) -> void {
-        // The current `ctx` is leaked.  Reclaiming would mean walking
-        // CompilationContext's internal Box::leak'd sub-components and
-        // freeing each - none of which expose `drop` today.  Acceptable
-        // for v1 (LSP processes are short-lived); revisit when memory
-        // growth in long-running sessions becomes a concern.
+        // Release this session's arena (frees `ctx` and every container it
+        // owns in one shot) and free the Arena struct itself.  Unlike the old
+        // single-shared-arena model - where each session leaked its ctx and the
+        // process-global arena reclaimed it - the ctx here lives in a session-
+        // owned region, so closing/dropping the session reclaims it directly.
+        this.release_ctx();
         this.path_buf.drop();
         this.content_buf.drop();
         this.config_buf.drop();
@@ -535,5 +622,15 @@ implement trait Drop for SessionMap {
     drop(mut &this) -> void {
         this.by_uri.drop();
         this.pending.drop();
+        this.live_order.drop();
     }
 }
+
+
+/// Cap on the number of documents that may hold a LIVE full-project context
+/// at once.  Each context is a whole compile's footprint, so this bounds peak
+/// memory at roughly `MAX_LIVE_CTX` project footprints.  The active document
+/// plus a couple of recently-viewed ones stay instant; older ones recompile on
+/// their next request.  Tunable - raise for more instant files at higher peak
+/// memory, lower to trade responsiveness for a tighter footprint.
+const MAX_LIVE_CTX: u64 = 3 as u64;
