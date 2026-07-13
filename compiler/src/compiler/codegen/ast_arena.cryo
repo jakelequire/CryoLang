@@ -78,6 +78,29 @@ public function cryo_ast_arena_alloc(size: u64, align: u64) -> void* {
     return a.bump(sz, al);
 }
 
+/// Publish `a` as THE current AST + container arena, replacing whatever was
+/// current before.  Both the AST-node path (`cryo_ast_arena_alloc` → the
+/// module global `g_ast_arena`) and the container path (`GlobalArena`) are
+/// pointed at `a`, so every allocation this compile makes lands in `a`.
+///
+/// This exists for the LANGUAGE SERVER, which owns one arena PER open document
+/// instead of a single process-global one.  A fresh compile of document B must
+/// not disturb document A's already-built context, so the daemon gives each
+/// session its own `Arena` and calls this to make the session-of-interest's
+/// arena current before compiling OR reading that session's context.  Making
+/// it current before a READ matters for correctness: `GlobalAlloc`'s free/
+/// realloc route by `GlobalArena::holds(ptr)`, which only knows the currently
+/// published arena — so the published arena must always own the pointers the
+/// active operation might free, i.e. it must match the context being touched.
+///
+/// The CLI build path never calls this: it keeps the single lazily-created
+/// `g_ast_arena` throughout, so this is inert for `cryo build`.
+public function cryo_ast_arena_set_current(a: Arena*) -> void {
+    g_ast_arena = a;
+    // Point the container-heap router at the same region (see get_ast_arena).
+    GlobalArena::publish(a);
+}
+
 /// Enable/disable routing the compiler's **container** heap (every `T[]`,
 /// default `HashMap`/`Box`/`String` — all the `GlobalAlloc`-backed storage)
 /// into the per-target arena that already holds the AST nodes.  The driver
