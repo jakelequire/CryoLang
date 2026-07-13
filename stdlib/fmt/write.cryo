@@ -24,23 +24,41 @@ import collections::string;
 import fmt::error;
 
 type trait FmtWrite {
-    /// Write every byte of `source`. Returns when the entire slice has
-    /// been accepted by the sink or surfaces the first failure.
+    /// Write `source` in full, returning when the whole view has been
+    /// accepted by the sink or surfacing the first failure.  This is the
+    /// ONE required method; everything else routes through it.  The
+    /// argument is a `Str`, so the sink only ever sees valid UTF-8 - the
+    /// invariant that lets a text container like `String` be a format
+    /// target.  (A byte sink that isn't UTF-8-constrained is an
+    /// `io::Write`, not an `FmtWrite`.)
     write_str(mut &this, source: Str) -> Result<(), FmtError>;
 
-    /// Raw-byte variant. UTF-8 in, UTF-8 out; callers use this for
-    /// pre-formatted ASCII (integer digits, keyword bytes) without
-    /// paying for a `Str` round trip. Default routes through
-    /// `write_str`; writers can override if a direct byte path is
-    /// cheaper.
-    write_bytes(mut &this, bytes: Slice<u8>) -> Result<(), FmtError> {
-        return this.write_str(Str::from_bytes(bytes));
-    }
-
-    /// Single byte. Override with a direct path where worthwhile.
-    write_byte(mut &this, byte: u8) -> Result<(), FmtError> {
-        const local: u8[1] = [byte];
-        return this.write_bytes(Slice::from_raw(&local[0], 1));
+    /// Write a single Unicode scalar, UTF-8-encoded (1-4 bytes).  Routes
+    /// through `write_str`; the formatter uses it for punctuation such as
+    /// the quotes `Debug` puts around a string.
+    write_char(mut &this, c: char) -> Result<(), FmtError> {
+        const cp: u32 = c as u32;
+        mut buf: u8[4];
+        mut n: u64 = 1;
+        if (cp < 0x80) {
+            buf[0] = cp as u8;
+        } else if (cp < 0x800) {
+            buf[0] = (0xC0 | (cp >> 6)) as u8;
+            buf[1] = (0x80 | (cp & 0x3F)) as u8;
+            n = 2;
+        } else if (cp < 0x10000) {
+            buf[0] = (0xE0 | (cp >> 12)) as u8;
+            buf[1] = (0x80 | ((cp >> 6) & 0x3F)) as u8;
+            buf[2] = (0x80 | (cp & 0x3F)) as u8;
+            n = 3;
+        } else {
+            buf[0] = (0xF0 | (cp >> 18)) as u8;
+            buf[1] = (0x80 | ((cp >> 12) & 0x3F)) as u8;
+            buf[2] = (0x80 | ((cp >> 6) & 0x3F)) as u8;
+            buf[3] = (0x80 | (cp & 0x3F)) as u8;
+            n = 4;
+        }
+        return this.write_str(Str::from_raw(&buf[0], n));
     }
 }
 
@@ -51,25 +69,11 @@ implement trait FmtWrite for struct Stdout {
             Result::Err(err) => { return Result::Err(FmtError::Io(err)); }
         }
     }
-
-    write_bytes(mut &this, bytes: Slice<u8>) -> Result<(), FmtError> {
-        match (this.write(bytes)) {
-            Result::Ok(_) => { return Result::Ok(()); }
-            Result::Err(err) => { return Result::Err(FmtError::Io(err)); }
-        }
-    }
 }
 
 implement trait FmtWrite for struct Stderr {
     write_str(mut &this, source: Str) -> Result<(), FmtError> {
         match (this.write(source.as_bytes())) {
-            Result::Ok(_) => { return Result::Ok(()); }
-            Result::Err(err) => { return Result::Err(FmtError::Io(err)); }
-        }
-    }
-
-    write_bytes(mut &this, bytes: Slice<u8>) -> Result<(), FmtError> {
-        match (this.write(bytes)) {
             Result::Ok(_) => { return Result::Ok(()); }
             Result::Err(err) => { return Result::Err(FmtError::Io(err)); }
         }
@@ -85,9 +89,5 @@ implement trait FmtWrite for struct String {
             Result::Ok(_) => { return Result::Ok(()); }
             Result::Err(err) => { return Result::Err(FmtError::Alloc(err)); }
         }
-    }
-
-    write_bytes(mut &this, bytes: Slice<u8>) -> Result<(), FmtError> {
-        return this.write_str(Str::from_bytes(bytes));
     }
 }
