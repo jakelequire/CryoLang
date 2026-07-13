@@ -166,7 +166,12 @@ const s: String = f"x = {x}, opt = {opt:?}";   // "x = 42, opt = Some(7)"
   is auto-imported into any module that uses one.
 
 For raw, untyped formatted output (C `printf` semantics, `%d`/`%s`
-specifiers, not type-checked), use `print` / `println` from `std::fmt`.
+specifiers, not type-checked), use `printf` — an intrinsic that is
+auto-imported into every module (no `import` needed). For typed,
+`Display`-formatted output, build a `String` (usually with an f-string) and
+pass it to `print` / `println` from `std::fmt`; both take a *single*
+already-formatted argument (`println(f"{x}")`), not a printf-style format
+string with trailing values.
 
 #### Boolean and Null Literals
 
@@ -196,7 +201,7 @@ Every value in Cryo has a known type at compile time. A binding's type is either
 | `i8` `i16` `i32` `i64` `i128` | Signed integers of fixed width.                                                                                                                  | 1 / 2 / 4 / 8 / 16 bytes |
 | `uint`                        | Default unsigned integer; alias for `u32`.                                                                                                       | 4 bytes                  |
 | `u8` `u16` `u32` `u64` `u128` | Unsigned integers of fixed width.                                                                                                                | 1 / 2 / 4 / 8 / 16 bytes |
-| `float`                       | Default float; alias for `f32`.                                                                                                                  | 8 bytes                  |
+| `float`                       | Default float; alias for `f64`.                                                                                                                  | 8 bytes                  |
 | `f32` `f64`                   | IEEE 754 floats.                                                                                                                                 | 4 / 8 bytes              |
 | `double`                      | Alias for `f64`.                                                                                                                                 | 8 bytes                  |
 | `usize` `isize`               | Pointer-width unsigned / signed integers — distinct types whose width tracks the target's pointer size (the natural type for sizes and indices). | 8 bytes on 64-bit        |
@@ -538,7 +543,7 @@ function add(a: int, b: int) -> int {
 }
 
 function greet(name: string) -> void {
-    println("Hello, %s!", name);
+    printf("Hello, %s!\n", name);
 }
 
 function main() -> int {
@@ -827,7 +832,7 @@ const is_even: boolean = if (n % 2 == 0) { true } else { false };
 ```cryo
 mut i: int = 0;
 while (i < 10) {
-    println("%d", i);
+    printf("%d\n", i);
     i = i + 1;
 }
 ```
@@ -897,7 +902,7 @@ The body executes at least once, then the condition is checked.
 for (mut i: int = 0; i < 20; i++) {
     if (i % 2 == 0) { continue; }
     if (i > 10)     { break; }
-    println("%d", i);
+    printf("%d\n", i);
 }
 ```
 
@@ -1073,8 +1078,8 @@ type enum Shape {
 
 function describe(s: Shape) -> void {
     match (s) {
-        Shape::Circle(r)        => { println("Circle r=%f", r); }
-        Shape::Rectangle(w, h)  => { println("Rectangle %f x %f", w, h); }
+        Shape::Circle(r)        => { printf("Circle r=%f\n", r); }
+        Shape::Rectangle(w, h)  => { printf("Rectangle %f x %f\n", w, h); }
         Shape::Point            => { println("A point"); }
     }
 }
@@ -1354,7 +1359,7 @@ public:
     }
 
     greet(&this) -> void {
-        println("Hi, I'm %s, age %d", this.name, this.age);
+        printf("Hi, I'm %s, age %d\n", this.name, this.age);
     }
 }
 ```
@@ -1401,7 +1406,7 @@ public:
     Animal(_kind: string) { this.kind = _kind; }
 
     describe(&this) -> void {
-        println("Animal: %s", this.kind);
+        printf("Animal: %s\n", this.kind);
     }
 }
 
@@ -1414,7 +1419,7 @@ public:
     }
 
     bark(&this) -> void {
-        println("%s says: Woof!", this.name);
+        printf("%s says: Woof!\n", this.name);
     }
 }
 ```
@@ -1461,7 +1466,7 @@ Code written against a base-class pointer dispatches automatically to the actual
 
 ```cryo
 function print_area(shape: Shape*) -> void {
-    println("%s: area = %f", shape.name(), shape.area());
+    printf("%s: area = %f\n", shape.name(), shape.area());
 }
 
 function main() -> i32 {

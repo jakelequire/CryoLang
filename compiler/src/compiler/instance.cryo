@@ -493,18 +493,48 @@ type struct CompilerInstance {
     /// suppresses the end-of-pipeline flush (the LSP surfaces diagnostics
     /// via JSON-RPC instead), which made `cryo check` silently swallow
     /// every warning including the unknown-directive warning.
+    ///
+    /// This routes through the SAME multi-module project driver as
+    /// `compile_file` / `cryo build` (via `compile_project_with_ctx`), differing
+    /// only in `CompileMode::Check`, which gates codegen off after TypeLowering.
+    /// The earlier single-file frontend pipeline (`build_frontend_pipeline` over
+    /// one module) never loaded the imported stdlib modules, so a reference to a
+    /// stdlib type like `String`/`Str`/`Array` failed to resolve (a spurious
+    /// E0203/E0233 that a real build did not report).  Loading the whole module
+    /// graph the way a build does makes `check` agree with `build`.
     compile_for_check(&this, source: string) -> CompilationResult {
         if (!metadata::exists(Path::from(source))) {
             fmt::eprintln(f"error: file not found: {source}");
             return CompilationResult::failed(1, 0);
         }
 
-        mut ctx: CompilationContext = CompilationContext::new(CompileMode::SingleFile, source);
+        // Synthesize the same single-file project view `compile_file` builds,
+        // so module discovery finds this file as the entry point and follows
+        // its imports (including the prelude + stdlib) into the module graph.
+        mut config: ProjectConfig = ProjectConfig::default();
+        config.project_root = source.parent_dir();
+        config.entry_point  = source.basename();
+        config.project_name = source.stem();
+        config.no_std       = this.config.no_std;
+        if (this.config.target_triple_override.length() > 0) {
+            config.target_triple = this.config.target_triple_override;
+        }
+
+        const root_path: string = config.discovery_root_path();
+        if (!metadata::exists(Path::from(root_path))) {
+            fmt::eprintln(f"error: entry point not found: {root_path}");
+            return CompilationResult::failed(1, 0);
+        }
+
+        // Heap-allocate the context (it is large) exactly as
+        // `compile_project_with_config` does; `compile_project_with_ctx` is a
+        // supported direct entry (the LSP uses it too) and resolves the stdlib
+        // root itself from `this.config.stdlib_path_override`.
+        const _box_ctx: Box<CompilationContext> = Box<CompilationContext>::new(
+            CompilationContext::new(CompileMode::Check, root_path));
+        mut ctx: CompilationContext* = _box_ctx.leak();
         ctx.debug_mode = this.config.debug;
-        mut tried: string[] = [];
-        ctx.stdlib_root = CompilerInstance::resolve_stdlib_root(this.config.stdlib_path_override, "", "", &tried);
-        mut pipeline: PassRegistry = PassRegistry::build_frontend_pipeline();
-        return this.run_pipeline(&ctx, &pipeline, "");
+        return this.compile_project_with_ctx(ctx, config);
     }
 
     /// Compile for LSP: frontend + semantic analysis, no codegen.
