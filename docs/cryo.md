@@ -191,12 +191,12 @@ Every value in Cryo has a known type at compile time. A binding's type is either
 | `void`                        | No value; only valid as a return type.                                                                                                           | 0                        |
 | `boolean`                     | `true` / `false`. Not interchangeable with integers.                                                                                             | 1 byte                   |
 | `char`                        | 8-bit character (byte).                                                                                                                          | 1 byte                   |
-| `string`                      | NUL-terminated raw string (`*u8`). FFI-shaped.                                                                                                   | pointer                  |
+| `string`                      | NUL-terminated raw string (`u8*`). FFI-shaped.                                                                                                   | pointer                  |
 | `int`                         | Default signed integer; alias for `i32`.                                                                                                         | 4 bytes                  |
 | `i8` `i16` `i32` `i64` `i128` | Signed integers of fixed width.                                                                                                                  | 1 / 2 / 4 / 8 / 16 bytes |
 | `uint`                        | Default unsigned integer; alias for `u32`.                                                                                                       | 4 bytes                  |
 | `u8` `u16` `u32` `u64` `u128` | Unsigned integers of fixed width.                                                                                                                | 1 / 2 / 4 / 8 / 16 bytes |
-| `float`                       | Default float; alias for `f64`.                                                                                                                  | 8 bytes                  |
+| `float`                       | Default float; alias for `f32`.                                                                                                                  | 8 bytes                  |
 | `f32` `f64`                   | IEEE 754 floats.                                                                                                                                 | 4 / 8 bytes              |
 | `double`                      | Alias for `f64`.                                                                                                                                 | 8 bytes                  |
 | `usize` `isize`               | Pointer-width unsigned / signed integers — distinct types whose width tracks the target's pointer size (the natural type for sizes and indices). | 8 bytes on 64-bit        |
@@ -374,14 +374,6 @@ A `type` alias introduces a new name for an existing type. Aliases are transpare
 type Byte           = u8;
 type StringResult<T> = Result<T, string>;
 type Callback        = (int) -> void;
-```
-
-The `ffi` module aliases C types to their Cryo equivalents:
-
-```cryo
-type c_int    = i32;
-type c_char   = i8;
-type c_size_t = u64;
 ```
 
 ### 2.9 Casting with `as`
@@ -2193,7 +2185,7 @@ Cryo implements a static ownership model that is enforced at compile time. The m
 
 A type is `Copy` if it can be duplicated by a bitwise copy of its bytes. The compiler infers `Copy` for:
 
-- All primitive types (integers, floats, `boolean`, `char`, `string` (the raw `*u8` view), pointers, references, function pointers).
+- All primitive types (integers, floats, `boolean`, `char`, `string` (the raw `u8*` view), pointers, references, function pointers).
 - Struct, class, enum, and tuple aggregates **iff** every field is `Copy` **and** the type does not implement `Drop`.
 - Generic parameters are conservatively non-`Copy` unless bound by `T: Copy`.
 
