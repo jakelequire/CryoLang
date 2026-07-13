@@ -45,23 +45,17 @@ type struct Formatter<W> {
         return Formatter<W> { writer: writer };
     }
 
-    /// Write raw bytes. The low-level escape hatch every other method
-    /// routes through.
-    write_bytes(mut &this, bytes: Slice<u8>) -> Result<(), FmtError>
-    where W: FmtWrite {
-        return this.writer.write_bytes(bytes);
-    }
-
-    /// Write a `Str`. The usual path for fixed text.
+    /// Write a `Str`. The usual path for fixed text and for
+    /// pre-rendered ASCII (integer digits, escapes) wrapped as a `Str`.
     write_str(mut &this, source: Str) -> Result<(), FmtError>
     where W: FmtWrite {
         return this.writer.write_str(source);
     }
 
-    /// Write a single byte.
-    write_byte(mut &this, byte: u8) -> Result<(), FmtError>
+    /// Write a single Unicode scalar, UTF-8-encoded.
+    write_char(mut &this, c: char) -> Result<(), FmtError>
     where W: FmtWrite {
-        return this.writer.write_byte(byte);
+        return this.writer.write_char(c);
     }
 
     /// Surface the underlying writer. For advanced composition where
@@ -87,28 +81,28 @@ private function write_u64<W>(f: mut &Formatter<W>, value: u64) -> Result<(), Fm
 where W: FmtWrite {
     mut buffer: u8[20];
     const digits: u64 = value.to_decimal_buf(&buffer[0]);
-    return f.write_bytes(Slice::from_raw(&buffer[0], digits));
+    return f.write_str(Str::from_raw(&buffer[0], digits));
 }
 
 private function write_i64<W>(f: mut &Formatter<W>, value: i64) -> Result<(), FmtError>
 where W: FmtWrite {
     mut buffer: u8[21];
     const digits: u64 = value.to_decimal_buf(&buffer[0]);
-    return f.write_bytes(Slice::from_raw(&buffer[0], digits));
+    return f.write_str(Str::from_raw(&buffer[0], digits));
 }
 
 private function write_u128<W>(f: mut &Formatter<W>, value: u128) -> Result<(), FmtError>
 where W: FmtWrite {
     mut buffer: u8[39];
     const digits: u64 = value.to_decimal_buf(&buffer[0]);
-    return f.write_bytes(Slice::from_raw(&buffer[0], digits));
+    return f.write_str(Str::from_raw(&buffer[0], digits));
 }
 
 private function write_i128<W>(f: mut &Formatter<W>, value: i128) -> Result<(), FmtError>
 where W: FmtWrite {
     mut buffer: u8[40];
     const digits: u64 = value.to_decimal_buf(&buffer[0]);
-    return f.write_bytes(Slice::from_raw(&buffer[0], digits));
+    return f.write_str(Str::from_raw(&buffer[0], digits));
 }
 
 /// Format `value` as lowercase hex through `f`.
@@ -116,28 +110,28 @@ private function write_u64_hex<W>(f: mut &Formatter<W>, value: u64) -> Result<()
 where W: FmtWrite {
     mut buffer: u8[16];
     const digits: u64 = value.to_hex_buf(&buffer[0]);
-    return f.write_bytes(Slice::from_raw(&buffer[0], digits));
+    return f.write_str(Str::from_raw(&buffer[0], digits));
 }
 
 private function write_u64_hex_upper<W>(f: mut &Formatter<W>, value: u64) -> Result<(), FmtError>
 where W: FmtWrite {
     mut buffer: u8[16];
     const digits: u64 = value.to_hex_upper_buf(&buffer[0]);
-    return f.write_bytes(Slice::from_raw(&buffer[0], digits));
+    return f.write_str(Str::from_raw(&buffer[0], digits));
 }
 
 private function write_u64_oct<W>(f: mut &Formatter<W>, value: u64) -> Result<(), FmtError>
 where W: FmtWrite {
     mut buffer: u8[22];
     const digits: u64 = value.to_oct_buf(&buffer[0]);
-    return f.write_bytes(Slice::from_raw(&buffer[0], digits));
+    return f.write_str(Str::from_raw(&buffer[0], digits));
 }
 
 private function write_u64_bin<W>(f: mut &Formatter<W>, value: u64) -> Result<(), FmtError>
 where W: FmtWrite {
     mut buffer: u8[64];
     const digits: u64 = value.to_bin_buf(&buffer[0]);
-    return f.write_bytes(Slice::from_raw(&buffer[0], digits));
+    return f.write_str(Str::from_raw(&buffer[0], digits));
 }
 
 /// Display-side wrapper for the float printer.
@@ -145,7 +139,7 @@ private function write_float64<W>(f: mut &Formatter<W>, value: f64) -> Result<()
 where W: FmtWrite {
     mut buffer: u8[32];
     const digits: u64 = value.to_buf(&buffer[0]);
-    return f.write_bytes(Slice::from_raw(&buffer[0], digits));
+    return f.write_str(Str::from_raw(&buffer[0], digits));
 }
 
 // Primitive Display impls
@@ -266,7 +260,7 @@ implement trait Display for char {
     where W: FmtWrite {
         mut buffer: u8[4];
         const length: u64 = encode_utf8(this as u32, &buffer[0]);
-        return f.write_bytes(Slice::from_raw(&buffer[0], length));
+        return f.write_str(Str::from_raw(&buffer[0], length));
     }
 }
 
@@ -434,9 +428,9 @@ implement trait Debug for boolean {
 implement trait Debug for char {
     fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
     where W: FmtWrite {
-        f.write_byte(0x27)?; // '\''
+        f.write_char(0x27 as char)?; // '\''
         write_debug_scalar(f, this as u32, 0x27)?;
-        return f.write_byte(0x27);
+        return f.write_char(0x27 as char);
     }
 }
 
@@ -448,19 +442,38 @@ implement trait Debug for char {
 implement trait Debug for struct Str {
     fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
     where W: FmtWrite {
-        f.write_byte(0x22)?; // '"'
+        f.write_char(0x22 as char)?; // '"'
         const bytes: Slice<u8> = this.as_bytes();
+        const base: u8* = bytes.as_ptr();
+        const len: u64 = bytes.length();
+        // Emit maximal runs of non-escaped bytes as one `Str` each: a run
+        // is a substring of the (valid-UTF-8) source, so it satisfies
+        // `write_str`'s UTF-8 contract even where it spans multi-byte
+        // scalars.  Only bytes that need escaping are handled one at a time.
+        mut run_start: u64 = 0;
         mut i: u64 = 0;
-        while (i < bytes.length()) {
+        while (i < len) {
             match (bytes.get(i)) {
                 Option::Some(byte) => {
-                    write_debug_byte(f, byte, 0x22)?;
+                    // Escaped iff `write_debug_byte` would not pass it
+                    // through: backslash, the `"` delimiter, any control
+                    // byte (< 0x20, covering \n \r \t \0), or DEL (0x7F).
+                    if (byte == 0x5C || byte == 0x22 || byte < 0x20 || byte == 0x7F) {
+                        if (i > run_start) {
+                            f.write_str(Str::from_raw(base + run_start, i - run_start))?;
+                        }
+                        write_debug_byte(f, byte, 0x22)?;
+                        run_start = i + 1;
+                    }
                 }
                 Option::None => { break; }
             }
             i++;
         }
-        return f.write_byte(0x22);
+        if (len > run_start) {
+            f.write_str(Str::from_raw(base + run_start, len - run_start))?;
+        }
+        return f.write_char(0x22 as char);
     }
 }
 
@@ -506,11 +519,13 @@ where W: FmtWrite {
         escape[1] = 0x78; // 'x'
         const byte_val: u64 = byte as u64;
         byte_val.to_hex_padded_buf(&escape[2], 2);
-        return f.write_bytes(Slice::from_raw(&escape[0], 4));
+        return f.write_str(Str::from_raw(&escape[0], 4));
     }
-    // Printable ASCII and high bytes (UTF-8 continuation / leading)
-    // pass through verbatim.
-    return f.write_byte(byte);
+    // Printable ASCII passes through verbatim.  `byte` is always < 0x80
+    // here: `write_debug_scalar` only calls this for ASCII scalars, and
+    // `Debug<Str>` batches its own non-escaped byte runs (which may be
+    // multi-byte UTF-8) into `write_str`, never routing a high byte here.
+    return f.write_char(byte as char);
 }
 
 /// Escape one Unicode scalar for Debug<char> output. Non-ASCII
@@ -524,8 +539,8 @@ where W: FmtWrite {
     mut buffer: u8[8];
     const scalar_val: u64 = scalar as u64;
     const digits: u64 = scalar_val.to_hex_buf(&buffer[0]);
-    f.write_bytes(Slice::from_raw(&buffer[0], digits))?;
-    return f.write_byte(0x7D); // '}'
+    f.write_str(Str::from_raw(&buffer[0], digits))?;
+    return f.write_char(0x7D as char); // '}'
 }
 
 // Composite Display / Debug impls: Option, Result
