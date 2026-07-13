@@ -22,6 +22,7 @@
 namespace std::fmt::float;
 
 import core::intrinsics;
+import core::option;
 import core::primitives;
 import core::slice;
 import ffi::libc;
@@ -41,6 +42,22 @@ private function fp_is_nan(v: f64) -> boolean { return libc::_isnan(v) != 0; }
 ![target(windows)]
 private function fp_is_inf(v: f64) -> boolean {
     return libc::_isnan(v) == 0 && libc::_finite(v) == 0;
+}
+
+/// Parse a leading `f64` from `s` using C `strtod` semantics: skip
+/// leading whitespace, read the longest valid float prefix (decimal or
+/// scientific; no hex floats). Returns `None` when `s` has no numeric
+/// prefix.  The single funnel every float-from-text caller routes
+/// through, replacing scattered `sscanf("%lf")`.  Caller-supplied
+/// strings must already be cleaned of digit separators (`_`), which
+/// `strtod` — like `sscanf` — would stop at.
+function parse_f64(s: string) -> Option<f64> {
+    if (s == null) { return Option::None; }
+    mut end: u8* = null;
+    const v: f64 = libc::strtod(s as u8*, &end);
+    // `strtod` leaves `endptr == s` when it converts nothing.
+    if (end == (s as u8*)) { return Option::None; }
+    return Option::Some(v);
 }
 
 /// Default fractional digits for fixed-point output.
@@ -164,7 +181,7 @@ implement f64 {
 
 // Private helpers
 
-function write_literal(buffer: u8*, literal: u8*, length: u64) -> u64 {
+private function write_literal(buffer: u8*, literal: u8*, length: u64) -> u64 {
     intrinsics::memcpy(buffer as void*, literal as void*, length);
     return length;
 }
@@ -172,7 +189,7 @@ function write_literal(buffer: u8*, literal: u8*, length: u64) -> u64 {
 /// Fixed-point: integer part, `.`, zero-padded fraction. Assumes
 /// `value >= 0` and is within LARGE/SMALL thresholds; caller has
 /// routed NaN/Inf/zero/scientific cases already.
-function write_fixed(buffer: u8*, value: f64, decimals: u64) -> u64 {
+private function write_fixed(buffer: u8*, value: f64, decimals: u64) -> u64 {
     mut integer_part: u64 = value as u64;
 
     if (decimals == 0) {
@@ -203,7 +220,7 @@ function write_fixed(buffer: u8*, value: f64, decimals: u64) -> u64 {
 }
 
 /// Scientific: `<mantissa>e<sign><exponent>`. Assumes `value > 0`.
-function write_scientific(buffer: u8*, value: f64, decimals: u64) -> u64 {
+private function write_scientific(buffer: u8*, value: f64, decimals: u64) -> u64 {
     const exponent: i64 = libc::log10(value) as i64;
     // `log10` rounds toward nearest, not toward zero; if the floor
     // landed one step high we end up with mantissa < 1. Correct by
