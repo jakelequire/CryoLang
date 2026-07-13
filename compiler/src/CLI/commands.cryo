@@ -781,13 +781,10 @@ type struct Executor {
             mkdir(target_dir, 493);
         }
 
-        // Open stdin once so multiple fgets calls share the same FILE*
-        // (re-fdopen'ing fd 0 each time mixes buffered/unbuffered reads).
-        const in_stream: void* = fdopen(0, "r");
-        if (in_stream == null) {
-            fmt::eprintf("Error: cannot read from stdin\n");
-            return 1;
-        }
+        // Read the interactive answers straight from fd 0 through the
+        // stdlib Stdin handle.  It is unbuffered, so a single handle shared
+        // across the prompts below cannot lose data between reads.
+        mut input: stdio::Stdin = stdio::stdin();
 
         fmt::printf("Initializing Cryo project in %s\n\n", target_dir);
 
@@ -795,17 +792,17 @@ type struct Executor {
         // as the default project name; `cryo init hello` + Enter at every
         // prompt is the documented shortcut path.
         const name: string = if (has_positional) {
-            Executor::prompt_default(in_stream, "Project name", target_dir)
+            Executor::prompt_default(&input, "Project name", target_dir)
         } else {
-            Executor::prompt_required(in_stream, "Project name")
+            Executor::prompt_required(&input, "Project name")
         };
         if (name == "") {
             fmt::eprintf("Error: project name is required\n");
             return 1;
         }
-        const src_dir: string  = Executor::prompt_default(in_stream, "Source directory", "src");
-        const out_dir: string  = Executor::prompt_default(in_stream, "Output directory", "build");
-        const ttype:   string  = Executor::prompt_default(in_stream, "Target type (executable/library/stdlib)", "executable");
+        const src_dir: string  = Executor::prompt_default(&input, "Source directory", "src");
+        const out_dir: string  = Executor::prompt_default(&input, "Output directory", "build");
+        const ttype:   string  = Executor::prompt_default(&input, "Target type (executable/library/stdlib)", "executable");
 
         // Validate target_type; silently accepting "exe" or typos would
         // produce a cryoconfig the parser can't load.
@@ -843,37 +840,56 @@ type struct Executor {
         return 0;
     }
 
-    /// Read a line from `in_stream`, returning `def` when the user
+    /// Read a line from `input`, returning `def` when the user
     /// presses Enter (empty input) or stdin closes.
-    static prompt_default(in_stream: void*, label: string, def: string) -> string {
+    static prompt_default(input: mut &stdio::Stdin, label: string, def: string) -> string {
         fmt::printf("%s [%s]: ", label, def);
         fflush(null);
-        return Executor::read_line_or(in_stream, def);
+        return Executor::read_line_or(input, def);
     }
 
     /// Like `prompt_default` but with no default: returns the empty
     /// string on EOF / blank input so the caller can reject it.
-    static prompt_required(in_stream: void*, label: string) -> string {
+    static prompt_required(input: mut &stdio::Stdin, label: string) -> string {
         fmt::printf("%s: ", label);
         fflush(null);
-        return Executor::read_line_or(in_stream, "");
+        return Executor::read_line_or(input, "");
     }
 
-    static read_line_or(in_stream: void*, def: string) -> string {
-        mut buf: i8[1024];
-        if (fgets(&buf[0], 1024, in_stream) == null) {
-            return def;
+    static read_line_or(input: mut &stdio::Stdin, def: string) -> string {
+        // Read one line into a local buffer.  Keeping it out of the `match`
+        // binding lets it drop as an ordinary local on the `def` paths and
+        // be consumed by `into_raw` on the success path.
+        mut line: String = String::new();
+        match (input.read_line(&line)) {
+            Result::Ok(n) => {
+                if (n == 0) { return def; }        // EOF before any bytes
+                const len: u64 = Executor::strip_eol(&line);
+                if (len == 0) { return def; }       // blank line -> default
+                line.truncate(len);
+                // Hand off ownership as a NUL-terminated C string; the
+                // caller keeps it for the lifetime of `cryo init`.
+                return line.into_raw();
+            }
+            Result::Err(_) => { return def; }
         }
-        // Strip trailing CR/LF.
-        mut len: i64 = (&buf[0] as string).length() as i64;
-        while (len > 0
-                && (buf[len - 1] as i32 == 10 || buf[len - 1] as i32 == 13)) {
-            len -= 1;
+    }
+
+    /// Length of `line` with any trailing CR/LF bytes removed.  `read_line`
+    /// leaves the terminating `\n` (and a preceding `\r` on Windows input)
+    /// in the buffer; interactive answers never want it.
+    static strip_eol(line: &String) -> u64 {
+        mut n: u64 = line.length();
+        while (n > 0) {
+            match (line.as_bytes().get(n - 1)) {
+                Option::Some(b) => {
+                    if (b == 0x0A || b == 0x0D) { n = n - 1; }
+                    else { break; }
+                }
+                Option::None => { break; }
+            }
         }
-        buf[len] = 0;
-        if (len == 0) { return def; }
-        // Heap-copy so the buf-on-stack doesn't dangle after return.
-        return strdup(&buf[0] as string) as string;
+        return n;
     }
 
     static write_main_cryo(path: string, ns_name: string) -> boolean {
@@ -2194,27 +2210,24 @@ type struct Executor {
             return 0;
         }
 
-        // No arg -> read from stdin, one symbol per line.  Use fdopen(0)
-        // because Cryo doesn't expose libc's `stdin` global; the returned
-        // FILE* aliases fd 0 and works fine with fgets.
-        const in_stream: void* = fdopen(0, "r");
-        if (in_stream == null) {
-            fmt::eprintf("Error: No symbol provided.\n");
-            fmt::eprintf("Usage: cryo demangle <mangled-symbol>\n");
-            return 1;
-        }
-        mut buf: i8[8192];
+        // No arg -> read from stdin, one symbol per line, through the
+        // stdlib Stdin handle (reads fd 0 directly, no libc FILE*).
+        mut input: stdio::Stdin = stdio::stdin();
+        mut line: String = String::new();
         mut saw_input: boolean = false;
-        while (fgets(&buf[0], 8192, in_stream) != null) {
-            mut end: i64 = (&buf[0] as string).length() as i64;
-            while (end > 0
-                && (buf[end - 1] as i32 == 10 || buf[end - 1] as i32 == 13)) {
-                end -= 1;
+        loop {
+            line.truncate(0);
+            match (input.read_line(&line)) {
+                Result::Ok(n) => {
+                    if (n == 0) { break; }          // EOF
+                    const len: u64 = Executor::strip_eol(&line);
+                    if (len == 0) { continue; }      // skip blank lines
+                    line.truncate(len);
+                    saw_input = true;
+                    Executor::print_demangled(line.as_cstr() as string);
+                }
+                Result::Err(_) => { break; }
             }
-            buf[end] = 0;
-            if (end == 0) { continue; }
-            saw_input = true;
-            Executor::print_demangled(&buf[0] as string);
         }
 
         if (!saw_input) {
