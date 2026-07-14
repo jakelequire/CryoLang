@@ -12,6 +12,8 @@ import core::option;
 import core::result;
 import core::hash;
 import core::cmp;
+import core::clone;
+import core::default;
 import core::drop;
 import core::iter;
 import alloc::allocator;
@@ -155,14 +157,28 @@ where T: Drop, A: Allocator {
     }
 }
 
-// NOTE: `Clone` and `Default` for `HashSet` are intentionally NOT implemented.
-// `HashSet<T, A = GlobalAlloc>` is a wrapper over `HashMap<T, (), A>`, and the
-// only expressible impl form — `implement<T> trait ... for struct HashSet<T>`
-// (GlobalAlloc-only; a `<T, A>` Clone/Default can't fabricate an `A` to
-// construct/clone with) — currently trips the monomorphizer with
-// "arg count mismatch (expected 2, got 1)" for this wrap-a-generic case (the
-// non-wrapper `Array<T>` accepts the same-shaped impl fine, so it is specific
-// to the wrapper).  `HashMap` itself has both `Clone` and `Default`, so a
-// caller needing a cloneable/defaultable set can use `HashMap<T, ()>` directly
-// until the mono limitation is lifted.  `Display`/`Debug` (in `fmt::display`)
-// use the working `<T, A>` arity and ARE provided.
+/// A fresh empty set is `HashSet`'s canonical "zero value", so it can satisfy
+/// a `Default` bound. Allocates nothing until the first insert.
+implement<T> trait Default for struct HashSet<T> {
+    static default() -> HashSet<T> {
+        return HashSet::new();
+    }
+}
+
+/// Deep copy: a fresh set that owns independent clones of every element,
+/// mirroring `HashMap::Clone`. Walks by borrow (`iter_ref`) and clones each
+/// element in, so it is sound for owning `T` (`HashSet<String>`).
+implement<T> trait Clone for struct HashSet<T>
+where T: Hash + Eq + Clone {
+    clone(&this) -> HashSet<T> {
+        mut out: HashSet<T> = HashSet::new();
+        mut it: implement Iterator<T*> = this.iter_ref();
+        loop {
+            match (it.next()) {
+                Option::Some(e) => { out.insert((*e).clone()); }
+                Option::None    => { break; }
+            }
+        }
+        return out;
+    }
+}

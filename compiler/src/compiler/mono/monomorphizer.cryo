@@ -777,6 +777,18 @@ type struct Monomorphizer {
         if (idx < 0 || idx >= this.state.spec_entries.length) { return; }
         const entry: SpecializationEntry* = &this.state.spec_entries[idx];
         if (!entry.specialized_type.is_valid()) { return; }
+        // Resolve the request's OWN instantiation directly, mirroring the
+        // first-time specialize path (which sets `resolved_type` on
+        // `request.generic_type`).  `propagate_instantiated_resolution` below only
+        // matches instantiations whose (base, type_args) equal the request's, so
+        // it misses a LOWER-arity form — e.g. the 1-arg receiver `HashSet<String>`
+        // of a wrapper-type method, whose request carries the default-expanded
+        // 2-arg `type_args` but references the original 1-arg `generic_type`.
+        // Without this, that receiver stays unresolved after mono (E0900).
+        const inst_t: Type* = this.arena.lookup(request.generic_type.id);
+        if (inst_t != null && inst_t.kind == TypeKind::InstantiatedType) {
+            (inst_t as InstantiatedType*).set_resolved_type(entry.specialized_type);
+        }
         this.arena.propagate_instantiated_resolution(
             request.base_type, request.type_args, entry.specialized_type);
     }
