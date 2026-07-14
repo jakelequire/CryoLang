@@ -226,6 +226,48 @@ type struct HashMap<K, V, A = GlobalAlloc> {
         };
     }
 
+    /// Iterate over every entry, yielding `Pair<K*, V*>` (borrowed key and
+    /// value). Unlike `iter`, this is sound for **any** `K`/`V` (owning or
+    /// Copy) because it hands out borrows, never bitcopies — so it is the way
+    /// to walk a `HashMap<String, Foo>` without cloning. The pointers borrow
+    /// map-owned storage and are invalidated by any mutation that inserts,
+    /// removes, or resizes; same contract as `get_ref`. Order is bucket-major
+    /// and unstable across resizes.
+    entries(&this) -> implement Iterator<Pair<K*, V*>> {
+        return EntriesRefIter<K, V> {
+            buckets: this.buckets,
+            bucket_count: this.bucket_count,
+            bucket_index: 0,
+            current: null
+        };
+    }
+
+    /// Iterate over the keys by shared borrow, yielding `K*`. Sound for any
+    /// `K` (owning or Copy); this is how to walk the keys of a
+    /// `HashMap<String, V>` — the common case — without the `K: Copy` gate on
+    /// `keys`. Same borrow/invalidation contract as `entries`.
+    keys_ref(&this) -> implement Iterator<K*> {
+        return KeysRefIter<K, V> {
+            buckets: this.buckets,
+            bucket_count: this.bucket_count,
+            bucket_index: 0,
+            current: null
+        };
+    }
+
+    /// Iterate over the values by shared borrow, yielding `V*`. Sound for any
+    /// `V` (owning or Copy). Same borrow/invalidation contract as `entries`;
+    /// use this to read or mutate owning values in place without the `V: Copy`
+    /// gate on `values`.
+    values_ref(&this) -> implement Iterator<V*> {
+        return ValuesRefIter<K, V> {
+            buckets: this.buckets,
+            bucket_count: this.bucket_count,
+            bucket_index: 0,
+            current: null
+        };
+    }
+
     contains_key(&this, key: &K) -> boolean
     where K: Hash + Eq {
         // Borrow rather than copy out, so this stays sound for owning V
@@ -600,6 +642,96 @@ implement<K, V> trait Iterator<V> for struct ValuesIter<K, V> {
                 const entry: Entry<K, V>* = this.current;
                 this.current = entry.next;
                 return Option::Some(entry.value);
+            }
+            if (this.bucket_index >= this.bucket_count) {
+                return Option::None;
+            }
+            this.current = this.buckets[this.bucket_index];
+            this.bucket_index = this.bucket_index + 1;
+        }
+    }
+}
+
+// Borrow-yielding iterators: EntriesRefIter / KeysRefIter / ValuesRefIter.
+//
+// Same bucket-major state machine and invalidation contract as the by-value
+// iterators above, but each `next()` hands out a borrow (`K*` / `V*` /
+// `Pair<K*, V*>`) into the live entry rather than a bitcopy. That makes them
+// UNGATED — no `K: Copy` / `V: Copy` — so they walk maps of owning types
+// (`HashMap<String, Foo>`) that the Copy-gated `iter`/`keys`/`values` reject.
+// The yielded pointers alias map-owned storage, so they are read/mutate views,
+// not values to move out of.
+//
+// `EntriesRefIter` mirrors `HashMapIter`; the projections mirror
+// `KeysIter`/`ValuesIter`. `KeysRefIter` is `public` because `HashSet::iter_ref`
+// wraps it (a public type may back a private one); the other two are only
+// produced as opaque `implement Iterator<...>` and stay private.
+
+private type struct EntriesRefIter<K, V> {
+    buckets: Entry<K, V>**;
+    bucket_count: u64;
+    bucket_index: u64;
+    current: Entry<K, V>*;
+}
+
+implement<K, V> trait Iterator<Pair<K*, V*>> for struct EntriesRefIter<K, V> {
+    next(mut &this) -> Option<Pair<K*, V*>> {
+        loop {
+            if (this.current != null) {
+                const entry: Entry<K, V>* = this.current;
+                this.current = entry.next;
+                return Option::Some(Pair<K*, V*> {
+                    first: &entry.key,
+                    second: &entry.value
+                });
+            }
+            if (this.bucket_index >= this.bucket_count) {
+                return Option::None;
+            }
+            this.current = this.buckets[this.bucket_index];
+            this.bucket_index = this.bucket_index + 1;
+        }
+    }
+}
+
+type struct KeysRefIter<K, V> {
+    buckets: Entry<K, V>**;
+    bucket_count: u64;
+    bucket_index: u64;
+    current: Entry<K, V>*;
+}
+
+implement<K, V> trait Iterator<K*> for struct KeysRefIter<K, V> {
+    next(mut &this) -> Option<K*> {
+        loop {
+            if (this.current != null) {
+                const entry: Entry<K, V>* = this.current;
+                this.current = entry.next;
+                return Option::Some(&entry.key);
+            }
+            if (this.bucket_index >= this.bucket_count) {
+                return Option::None;
+            }
+            this.current = this.buckets[this.bucket_index];
+            this.bucket_index = this.bucket_index + 1;
+        }
+    }
+}
+
+private type struct ValuesRefIter<K, V> {
+    buckets: Entry<K, V>**;
+    bucket_count: u64;
+    bucket_index: u64;
+    current: Entry<K, V>*;
+}
+
+implement<K, V> trait Iterator<V*> for struct ValuesRefIter<K, V> {
+    next(mut &this) -> Option<V*> {
+        loop {
+            if (this.current != null) {
+                const entry: Entry<K, V>* = this.current;
+                this.current = entry.next;
+                return Option::Some(&entry.value);
             }
             if (this.bucket_index >= this.bucket_count) {
                 return Option::None;
