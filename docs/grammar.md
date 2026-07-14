@@ -158,7 +158,7 @@ UnionDecl          ::= "type" "union" Ident Generics?
                           `![align(N)]`.  A union literal initialises EXACTLY
                           one field (`Value { i: 1 }`); members are accessed as
                           `u.field`.  There is no discriminant and it is not
-                          matched variant-wise — use `type enum` for a tagged
+                          matched variant-wise - use `type enum` for a tagged
                           (discriminated) union.  Reading a member other than
                           the one last written is the programmer's
                           responsibility.  Unlike `struct`/`class` there is no
@@ -253,7 +253,7 @@ Primary            ::= Literal
                      | IfExpr
                      | Match
                      | Lambda
-                     | "delete" Expr           (* parsed; see cryo.md §21 *)
+                     | "delete" Expr           (* parsed; see cryo.md section 21 *)
                      | "await"  Expr           (* parsed; no async semantics yet *)
                      | "yield"  Expr?          (* parsed; no generator semantics yet *)
                      | "(" Expr ")"
@@ -281,7 +281,7 @@ IfExpr             ::= "if" Cond "{" Expr "}" "else" "{" Expr "}"
 
 (* Cond: the `()` around a condition are OPTIONAL.  With parens, any
    expression is allowed.  Without parens, a *bare* struct literal is
-   suppressed so the following `{` reads as the body — wrap a struct-valued
+   suppressed so the following `{` reads as the body - wrap a struct-valued
    condition in `()` (or nest it inside a call) to use one. *)
 Cond               ::= "(" Expr ")" | Expr
 
@@ -341,7 +341,7 @@ Type               ::= BaseType "*"+                       (* pointer *)
                      | "(" (Type ("," Type)*)? ")" "->" Type  (* fn (the `->` disambiguates) *)
                      | "()"                                (* unit (also the empty tuple) *)
                      | Type "?"                            (* optional: T? desugars to Option<T> *)
-                     | "implement" QualName GenericArgs?   (* opaque: implement Trait (see cryo.md §2.11) *)
+                     | "implement" QualName GenericArgs?   (* opaque: implement Trait (see cryo.md section 2.11) *)
                      | BaseType
 BaseType           ::= Primitive | "This" | QualName GenericArgs?
 Primitive          ::= "void" | "boolean" | "char" | "string"
@@ -365,14 +365,14 @@ TypeSuffix         ::= "u8" | "u16" | "u32" | "u64"
 FloatSuffix        ::= "f32" | "f64"
 StringLit          ::= /* "..."  with implemented escapes; an f-prefix  */
                        /* (f"...{expr}...") is an interpolated string    */
-                       /* literal — see cryo.md §1.4.                    */
+                       /* literal - see cryo.md section 1.4.                    */
 CharLit            ::= /* '.'    with implemented escapes           */
 BoolLit            ::= "true" | "false"
 Ident              ::= /* [a-zA-Z_][a-zA-Z0-9_]*                */
 
 
 (*   Operator Precedence  (lowest to highest) ==================    *)
-(*   Mirrors cryo.md § 5.7; the parser is the source of truth.      *)
+(*   Mirrors cryo.md section 5.7; the parser is the source of truth.      *)
 (*                                                                  *)
 (*    1   =  +=  -=  *=  /=  %=  &=  |=  ^=  <<=  >>=     right      *)
 (*    2   ??   (null-coalescing)                         right      *)
@@ -398,7 +398,7 @@ Ident              ::= /* [a-zA-Z_][a-zA-Z0-9_]*                */
 (*                                                                  *)
 (*  These names are reserved by the lexer and may not be used as    *)
 (*  identifiers.  Some (e.g. `from`, `async`, `await`, `yield`)     *)
-(*  are lexed but not yet wired into the parser - see § 21 of       *)
+(*  are lexed but not yet wired into the parser - see section 21 of       *)
 (*  `cryo.md` for the reserved-syntax table.                        *)
 (*                                                                  *)
 (*  alignof    as         asm        async     auto      await     *)

@@ -2,20 +2,17 @@
 ///! OWN generic param (not the receiver's) varies across call sites, that
 ///! forwards to a NESTED inherent generic method.
 ///!
-///! The bug (net-library HTTPS/WebSocket gate): the nested call's resolved
-///! spec was pinned the FIRST time the outer method specialized, and every
-///! later specialization inherited that stale pin.  After the AST
-///! substituter was taught to clear the pin, both specs were minted, but
-///! codegen resolved the nested call through a `<receiver-type>::<method>`
-///! + arity key that is IDENTICAL for every spec of the same method on the
-///! same receiver - so it handed back whichever spec was registered last.
-///! Concretely `Outer::run<A>` wrongly called `Inner::relay<B>`, passing an
-///! `A` to the `B` impl.  Real-world shape: `Request::write_to<TlsStream>`
-///! calling `Headers::write_to<TcpStream>` -> garbage fd, EBADF, plaintext
-///! on the wire.
-///!
-///! Fix: the monomorphizer pins the nested call's `resolved_callee` to the
-///! spec's precise mangled symbol, so codegen targets the right one.
+///! Each specialization of the outer method must resolve its nested call to
+///! its OWN spec's precise mangled symbol: the monomorphizer pins the
+///! nested call's `resolved_callee` per spec, since codegen cannot key the
+///! nested call by `<receiver-type>::<method>` + arity alone - that key is
+///! IDENTICAL for every spec of the same method on the same receiver and
+///! would hand back whichever spec was registered last.  Concretely,
+///! `Outer::run<A>` must call `Inner::relay<A>`, never `Inner::relay<B>`
+///! (which would pass an `A` to the `B` impl).  Real-world shape:
+///! `Request::write_to<TlsStream>` must not resolve to
+///! `Headers::write_to<TcpStream>` -> garbage fd, EBADF, plaintext on the
+///! wire.
 ///!
 ///! Each `Sink` impl mutates a distinct field, so a mis-dispatch (calling
 ///! the wrong impl on a punned receiver) is observable as a wrong value.
@@ -72,8 +69,7 @@ function nested_generic_dispatch_picks_right_spec() -> Result<(), TestError> {
     const o: Outer = Outer { h: Inner { tag: 1 } };
 
     // run<A> must reach A::put (fd += 1000); run<B> must reach B::put
-    // (val += 1).  Before the fix, run<A> dispatched to relay<B>, so A::put
-    // never ran and `a.fd` stayed 0.
+    // (val += 1).
     o.run(&a);
     o.run(&b);
 

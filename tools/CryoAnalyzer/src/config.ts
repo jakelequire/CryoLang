@@ -25,23 +25,23 @@ export function getConfig(): CryoConfig {
  *   1. `cryo.languageServer.path` user setting.  Relative paths are
  *      resolved against the first workspace folder so settings like
  *      `./bin/cryolsp` work without expanding to an absolute path.
- *   2. `$CRYO_HOME` — the same install-root env var the compiler reads
+ *   2. `$CRYO_HOME` - the same install-root env var the compiler reads
  *      for stdlib lookup (see compiler/src/compiler/instance.cryo).
  *      Probed at `$CRYO_HOME/bin/cryolsp` (FHS-style install) and
  *      `$CRYO_HOME/tools/CryoLSP/build/cryolsp` (when CRYO_HOME
  *      points at a source checkout).
- *   3. Workspace-local `tools/CryoLSP/build/cryolsp` — the output of
+ *   3. Workspace-local `tools/CryoLSP/build/cryolsp` - the output of
  *      `cryo build` (which emits into `output_dir`, = "build") inside
  *      the in-repo CryoLSP project.  Picks up dev builds without
  *      needing any setting changes.  The legacy `build/bin/` layout is
  *      also probed as a fallback for older packaged installs.
- *   4. Workspace-local `bin/cryolsp` — legacy install location for
+ *   4. Workspace-local `bin/cryolsp` - legacy install location for
  *      older CryoLSP packages; kept so existing users don't break.
  *   5. `cryolsp` on `$PATH`.
  *   6. Sibling of `cryo` on `$PATH`.  We resolve the `cryo` binary
  *      (following symlinks) and probe `<cryo-dir>/cryolsp` plus the
  *      in-repo `tools/CryoLSP/build/bin/cryolsp` location relative to
- *      the resolved repo root — handles the common setup where
+ *      the resolved repo root - handles the common setup where
  *      install.sh symlinks /usr/local/bin/cryo into a source checkout.
  *   7. Extension-relative paths (sibling CryoLSP/ tree, then the
  *      legacy `../../bin/` location).
@@ -49,7 +49,7 @@ export function getConfig(): CryoConfig {
  * If a user-configured path is set but doesn't exist, the resolver
  * SILENTLY falls through to auto-detection.  A warning is logged to
  * the output channel only if the eventual return value is `undefined`
- * — otherwise stale settings (e.g. a Windows `.exe` path on Linux)
+ * - otherwise stale settings (e.g. a Windows `.exe` path on Linux)
  * spam a popup on every restart even when auto-detection succeeds.
  *
  * `.exe` candidates are only probed on Windows; Linux/macOS skip them
@@ -91,7 +91,7 @@ export function resolveServerPath(
         }
     };
 
-    // 2. $CRYO_HOME — same env var the compiler uses for stdlib lookup.
+    // 2. $CRYO_HOME - same env var the compiler uses for stdlib lookup.
     const cryoHome = process.env.CRYO_HOME;
     if (cryoHome) {
         pushPair(cryoHome, 'bin');
@@ -129,7 +129,7 @@ export function resolveServerPath(
         try { cryoReal = fs.realpathSync(cryoPath); } catch { /* keep original */ }
         const cryoDir = path.dirname(cryoReal);
         pushPair(cryoDir);
-        // <repo>/bin/cryo → <repo>/tools/CryoLSP/build/cryolsp
+        // <repo>/bin/cryo -> <repo>/tools/CryoLSP/build/cryolsp
         pushPair(cryoDir, '..', 'tools', 'CryoLSP', 'build');
         pushPair(cryoDir, '..', 'tools', 'CryoLSP', 'build', 'bin');
     }
@@ -164,7 +164,7 @@ function findOnPath(name: string): string | undefined {
     // Try the name verbatim first (empty ext), then append PATHEXT
     // variants.  Callers pass names that already include `.exe` on
     // Windows (e.g. `cryolsp.exe`), so without the leading '' the loop
-    // would only ever probe `cryolsp.exe.EXE`, `cryolsp.exe.CMD`, … and
+    // would only ever probe `cryolsp.exe.EXE`, `cryolsp.exe.CMD`, ... and
     // never match the actual `cryolsp.exe` on disk.  The PATHEXT entries
     // remain for callers that pass a bare command name (`cryo`).
     const exts =

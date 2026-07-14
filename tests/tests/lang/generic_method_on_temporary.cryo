@@ -1,17 +1,18 @@
 ///! Regression: a GENERIC method called on a TEMPORARY (call-expression)
 ///! receiver - the fluent-builder shape `T::new().cfg(..).run<U>(..)`.
 ///!
-///! Two compiler bugs used to break this pattern:
+///! Two compiler bugs threaten this pattern:
 ///!
-///!  1. A by-value (`this` / `mut this`) method called cross-module dropped
-///!     its receiver from the extern signature (the receiver param had no
-///!     resolved_type, so decl_index skipped it) -> LLVM "incorrect number
-///!     of arguments". Fixed by recovering the receiver's target type.
-///!  2. A generic method on a temporary receiver was never specialized,
-///!     because the monomorphizer couldn't type a call-expression receiver
-///!     before sema ran -> codegen E0636 "no method found". Fixed by
-///!     resolving a concrete, non-generic builder-chain receiver from the
-///!     declared method-return types.
+///!  1. A by-value (`this` / `mut this`) method called cross-module would
+///!     drop its receiver from the extern signature if the receiver param
+///!     had no resolved_type (decl_index would skip it) -> LLVM "incorrect
+///!     number of arguments". Guarded by recovering the receiver's target
+///!     type.
+///!  2. A generic method on a temporary receiver would never be
+///!     specialized, because the monomorphizer can't type a call-expression
+///!     receiver before sema runs -> codegen E0636 "no method found".
+///!     Guarded by resolving a concrete, non-generic builder-chain receiver
+///!     from the declared method-return types.
 ///!
 ///! This file pins the second (and the by-value receiver path) same-module;
 ///! the cross-module angle is covered by tests/stdlib/thread_builder.cryo.
@@ -38,8 +39,8 @@ type struct Cfg {
     }
 
     // Generic method taking `this` by value. Applies `f` to `ctx` and
-    // scales the result. `run<C, T>` is the shape that used to fail when
-    // the receiver was a temporary.
+    // scales the result. `run<C, T>` is the shape that would fail when
+    // the receiver is a temporary (see bug 2 above).
     run<C>(this, ctx: C, f: (C) -> i32) -> i32 {
         return f(ctx) * this.scale;
     }
@@ -52,7 +53,7 @@ function ident(x: i32) -> i32 {
 ![test]
 function generic_method_on_chained_temporary() -> Result<(), TestError> {
     // Receiver is the temporary returned by `with_scale` - the case that
-    // used to surface E0636 at codegen.
+    // would surface E0636 at codegen (see bug 2 above).
     const r: i32 = Cfg::new().with_scale(10).run<i32>(5, ident);
     expect_eq(r, 50)?;
     return Result::Ok(());

@@ -1,5 +1,5 @@
 /*
- * llvm_bindings.h — Thin LLVM-C API wrapper for the Cryo compiler.
+ * llvm_bindings.h - Thin LLVM-C API wrapper for the Cryo compiler.
  *
  * Declares only the LLVM-C functions needed by cryoc's codegen phase.
  * All LLVM handles are typedef'd to void* for clean FFI across the
@@ -18,7 +18,7 @@
  * preprocessing it: without the declarations clang would default the unknown
  * type names to implicit-int (i32), silently truncating the 64-bit DIBuilder
  * size/length arguments. (Preprocess-only scanning never resolved types, so
- * the spellings `size_t`/`uint64_t` mapped to u64 by name — this keeps both
+ * the spellings `size_t`/`uint64_t` mapped to u64 by name - this keeps both
  * engines in agreement; verified parity-neutral for the old scanner.) */
 #include <stddef.h>
 #include <stdint.h>
@@ -29,7 +29,7 @@ extern "C" {
 
 
 /* ===================================================================
- * Opaque handle types — all void* on the Cryo side
+ * Opaque handle types - all void* on the Cryo side
  * =================================================================== */
 
 typedef void *LLVMModuleRef;
@@ -96,7 +96,7 @@ LLVMValueRef   LLVMGetNextInstruction(LLVMValueRef Inst);
 
 
 /* ===================================================================
- * Types — Integer
+ * Types - Integer
  * =================================================================== */
 
 LLVMTypeRef LLVMInt1TypeInContext(LLVMContextRef C);
@@ -118,7 +118,7 @@ unsigned    LLVMGetIntTypeWidth(LLVMTypeRef IntegerTy);
 
 
 /* ===================================================================
- * Types — Floating Point
+ * Types - Floating Point
  * =================================================================== */
 
 LLVMTypeRef LLVMFloatTypeInContext(LLVMContextRef C);
@@ -128,7 +128,7 @@ LLVMTypeRef LLVMDoubleType(void);
 
 
 /* ===================================================================
- * Types — Void / Label / Pointer
+ * Types - Void / Label / Pointer
  * =================================================================== */
 
 LLVMTypeRef LLVMVoidTypeInContext(LLVMContextRef C);
@@ -144,7 +144,7 @@ LLVMTypeRef LLVMPointerTypeInContext(LLVMContextRef C, unsigned AddressSpace);
 
 
 /* ===================================================================
- * Types — Function
+ * Types - Function
  * =================================================================== */
 
 LLVMTypeRef LLVMFunctionType(LLVMTypeRef ReturnType, LLVMTypeRef *ParamTypes,
@@ -155,7 +155,7 @@ LLVMTypeRef LLVMGetReturnType(LLVMTypeRef FunctionTy);
 
 
 /* ===================================================================
- * Types — Struct
+ * Types - Struct
  * =================================================================== */
 
 LLVMTypeRef LLVMStructTypeInContext(LLVMContextRef C, LLVMTypeRef *ElementTypes,
@@ -170,7 +170,7 @@ LLVMBool    LLVMIsOpaqueStruct(LLVMTypeRef StructTy);
 
 
 /* ===================================================================
- * Types — Array
+ * Types - Array
  * =================================================================== */
 
 LLVMTypeRef LLVMArrayType(LLVMTypeRef ElementType, unsigned ElementCount);
@@ -180,7 +180,7 @@ LLVMTypeRef LLVMGetElementType(LLVMTypeRef Ty);
 
 
 /* ===================================================================
- * Types — Vector
+ * Types - Vector
  * ===================================================================
  *
  * SysV x86-64 packs two `float` fields that share an eightbyte into a
@@ -192,7 +192,7 @@ LLVMTypeRef LLVMVectorType(LLVMTypeRef ElementType, unsigned ElementCount);
 
 
 /* ===================================================================
- * Values — General
+ * Values - General
  * =================================================================== */
 
 LLVMTypeRef    LLVMTypeOf(LLVMValueRef Val);
@@ -301,7 +301,7 @@ LLVMValueRef      LLVMGetBasicBlockTerminator(LLVMBasicBlockRef BB);
 LLVMValueRef      LLVMGetBasicBlockParent(LLVMBasicBlockRef BB);
 LLVMValueRef      LLVMBasicBlockAsValue(LLVMBasicBlockRef BB);
 
-/* Use list — `LLVMGetFirstUse` returns NULL when a value has no uses.
+/* Use list - `LLVMGetFirstUse` returns NULL when a value has no uses.
  * For a basic-block-as-value that means no branch/blockaddress targets
  * it, i.e. the block has no predecessors (dead / unreachable). */
 typedef void *LLVMUseRef;
@@ -321,7 +321,7 @@ LLVMBasicBlockRef LLVMGetInsertBlock(LLVMBuilderRef Builder);
 
 
 /* ===================================================================
- * Builder — Terminators
+ * Builder - Terminators
  * =================================================================== */
 
 LLVMValueRef LLVMBuildRetVoid(LLVMBuilderRef B);
@@ -336,7 +336,7 @@ void         LLVMAddCase(LLVMValueRef Switch, LLVMValueRef OnVal,
 LLVMValueRef LLVMBuildUnreachable(LLVMBuilderRef B);
 
 /* ===================================================================
- * Builder — Atomic Operations
+ * Builder - Atomic Operations
  *
  * Memory ordering values (LLVMAtomicOrdering, llvm-c/Core.h):
  *   0 = NotAtomic, 1 = Unordered, 2 = Monotonic (Relaxed),
@@ -350,11 +350,11 @@ LLVMValueRef LLVMBuildUnreachable(LLVMBuilderRef B);
  *
  * Pass `int SingleThread = 0` for a normal multi-thread op (the only
  * thing the stdlib currently uses).  Per LLVM rules, atomic loads
- * and stores REQUIRE an explicit alignment — callers must invoke
+ * and stores REQUIRE an explicit alignment - callers must invoke
  * LLVMSetAlignment after LLVMBuildLoad2/LLVMBuildStore for atomics.
  * =================================================================== */
 
-/* Atomic fence — used by IntrinsicsCodegen to lower atomic_fence(order). */
+/* Atomic fence - used by IntrinsicsCodegen to lower atomic_fence(order). */
 LLVMValueRef LLVMBuildFence(LLVMBuilderRef B, int Ordering, int SingleThread,
                             const char *Name);
 
@@ -382,7 +382,7 @@ void LLVMSetAlignment(LLVMValueRef V, unsigned Bytes);
 
 
 /* ===================================================================
- * Builder — Arithmetic
+ * Builder - Arithmetic
  * =================================================================== */
 
 LLVMValueRef LLVMBuildAdd(LLVMBuilderRef B, LLVMValueRef LHS, LLVMValueRef RHS, const char *Name);
@@ -405,7 +405,7 @@ LLVMValueRef LLVMBuildFNeg(LLVMBuilderRef B, LLVMValueRef V, const char *Name);
 
 
 /* ===================================================================
- * Builder — Bitwise
+ * Builder - Bitwise
  * =================================================================== */
 
 LLVMValueRef LLVMBuildShl(LLVMBuilderRef B, LLVMValueRef LHS, LLVMValueRef RHS, const char *Name);
@@ -418,7 +418,7 @@ LLVMValueRef LLVMBuildNot(LLVMBuilderRef B, LLVMValueRef V, const char *Name);
 
 
 /* ===================================================================
- * Builder — Comparisons
+ * Builder - Comparisons
  * =================================================================== */
 
 /* Integer comparison predicates */
@@ -442,7 +442,7 @@ LLVMValueRef LLVMBuildFCmp(LLVMBuilderRef B, int Op, LLVMValueRef LHS,
 
 
 /* ===================================================================
- * Builder — Memory
+ * Builder - Memory
  * =================================================================== */
 
 LLVMValueRef LLVMBuildAlloca(LLVMBuilderRef B, LLVMTypeRef Ty, const char *Name);
@@ -463,7 +463,7 @@ LLVMValueRef LLVMBuildMemCpy(LLVMBuilderRef B, LLVMValueRef Dst, unsigned DstAli
 
 
 /* ===================================================================
- * Builder — Casts
+ * Builder - Casts
  * =================================================================== */
 
 LLVMValueRef LLVMBuildTrunc(LLVMBuilderRef B, LLVMValueRef Val, LLVMTypeRef DestTy, const char *Name);
@@ -482,7 +482,7 @@ LLVMValueRef LLVMBuildPointerCast(LLVMBuilderRef B, LLVMValueRef Val, LLVMTypeRe
 
 
 /* ===================================================================
- * Builder — Other
+ * Builder - Other
  * =================================================================== */
 
 LLVMValueRef LLVMBuildPhi(LLVMBuilderRef B, LLVMTypeRef Ty, const char *Name);
@@ -605,9 +605,9 @@ enum {
  * was made mandatory in LLVM 15+ when opaque pointers landed).
  *
  * Attribute index conventions:
- *   * 0 (LLVMAttributeReturnIndex)   — the function's return value
- *   * -1 / UINT_MAX (LLVMAttributeFunctionIndex) — the function itself
- *   * 1..N                          — parameter slot N (1-based)
+ *   * 0 (LLVMAttributeReturnIndex) - the function's return value
+ *   * -1 / UINT_MAX (LLVMAttributeFunctionIndex) - the function itself
+ *   * 1..N - parameter slot N (1-based)
  */
 
 unsigned          LLVMGetEnumAttributeKindForName(const char *Name, unsigned long SLen);

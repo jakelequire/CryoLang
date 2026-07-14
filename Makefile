@@ -1,7 +1,7 @@
 # Cryo top-level build orchestration.
 #
 # The compiler is self-hosted.  The pinned binaries at bin/cryo (Linux
-# ELF) and bin/cryo.exe (Windows PE) bootstrap every other target —
+# ELF) and bin/cryo.exe (Windows PE) bootstrap every other target - 
 # every build flows through one of them depending on the host OS.
 #
 # Targets:
@@ -29,7 +29,7 @@ LIBCRYO_A  := $(ROOT)/stdlib/.bin/libcryo.a
 #   uname -s: only consulted off Windows so we don't end up shelling out
 #     to cmd from a native-make build.  Distinguishes Linux from macOS.
 #     WSL Linux reports plain `Linux` (the Microsoft kernel is opaque to
-#     uname) and therefore takes the Linux branch — which is correct: a
+#     uname) and therefore takes the Linux branch - which is correct: a
 #     `make` invoked inside WSL runs the build natively, not via the
 #     Windows host's WSL re-entry path.
 ifeq ($(OS),Windows_NT)
@@ -65,7 +65,7 @@ WIN_CLANG_DLL := $(ROOT)/.toolchains/llvm-win/bin/libclang.dll
 
 # C-side helpers for the ABI tests.  Compiled with the host cc to a
 # static archive that `tests/cryoconfig` links via -L./helpers
-# -labihelpers — see tests/helpers/abi_helpers.c for the contract.
+# -labihelpers - see tests/helpers/abi_helpers.c for the contract.
 TEST_HELPERS_DIR := $(ROOT)/tests/helpers
 TEST_HELPERS_C   := $(TEST_HELPERS_DIR)/abi_helpers.c
 TEST_HELPERS_O   := $(TEST_HELPERS_DIR)/abi_helpers.o
@@ -212,7 +212,7 @@ $(LIBCRYO_A):
 #                 Linux ELF can only be produced by a cross toolchain
 #                 not generally installed on Windows, and (b) the native
 #                 cryo.exe cross-link currently exceeds cmd.exe's 8KB
-#                 command-line limit at link time — both paths already
+#                 command-line limit at link time - both paths already
 #                 work cleanly inside WSL.  Fails loudly with an
 #                 install hint if WSL isn't present.
 #
@@ -323,7 +323,7 @@ install-lsp:
 endif
 
 # ---- selfhost byte-identity check -------------------------------------
-# Implementation lives in scripts/selfhost-check.py — that gives us
+# Implementation lives in scripts/selfhost-check.py - that gives us
 # per-stage progress + timings, per-stage logs in build-logs/, and a
 # tail-on-failure dump.  Run the script directly with --verbose for
 # streaming subprocess output.
@@ -352,7 +352,7 @@ endif
 # (catches a binary committed without regenerating its sidecar, corruption,
 # or a hand-edited sidecar).  Pure-python, no build, runs on any host.
 #   verify-pin        integrity only (sha256 == sidecar)
-#   verify-pin-clean  ALSO require a clean-worktree pin — the release gate
+#   verify-pin-clean  ALSO require a clean-worktree pin - the release gate
 #                     (a pin built from a dirty tree isn't reproducible).
 verify-pin:
 	@$(PYTHON) scripts/verify-pin.py
@@ -394,7 +394,7 @@ $(TEST_CPP_HELPERS_A): $(TEST_CPP_HELPERS_CPP)
 
 ifeq ($(HOST_OS),windows)
 # Native Windows host: recipes run under cmd, which can't execute a quoted
-# forward-slash path and needs the `.exe` the native build emits — so the
+# forward-slash path and needs the `.exe` the native build emits - so the
 # stage-2 compiler is `compiler\build\cryo.exe` (backslashes, suffix), built
 # through the host-branched `cryo`/`stdlib` targets above.  $(STAGE2_EXE)
 # and $(LIBCRYO_A) are file targets, so the compiler/stdlib are rebuilt only

@@ -1,19 +1,21 @@
 ///! Regression: an owning-enum `match` whose arm moves the subject's
 ///! payload, nested inside another scope (a block or an outer match arm).
 ///!
-///! Two codegen bugs used to break this:
+///! Two codegen hazards this guards against:
 ///!  1. The subject is partially moved (one arm extracts the payload, others
 ///!     don't), so drop_insertion synthesizes a `<subj>__dropflag` and a
 ///!     scope-exit `if (!flag) { drop }`.  When the match is nested, the
-///!     flag's name binding was popped with the inner block scope before the
-///!     conditional drop (which runs at an outer scope) read it -> the
-///!     condition failed to codegen -> a `cond_br` with an invalid condition
-///!     emitted NO terminator -> "N of M basic blocks unterminated" (E0633),
-///!     body discarded.  Fixed by registering drop-flag locals persistently.
-///!  2. The flag's `store false` init sat inside a conditional arm, so a
-///!     sibling path reaching the drop read the flag uninitialized (benign
-///!     in effect - the enum drop glue tag-guards - but UB).  Fixed by
-///!     defaulting drop-flag slots to false in the entry block.
+///!     flag's name binding must survive past the inner block scope so the
+///!     conditional drop (which runs at an outer scope) can still read it;
+///!     otherwise the condition fails to codegen, the `cond_br` emits NO
+///!     terminator, and codegen aborts with "N of M basic blocks
+///!     unterminated" (E0633).  Drop-flag locals are registered persistently
+///!     to guarantee this.
+///!  2. The flag's `store false` init must not sit inside a conditional arm,
+///!     or a sibling path reaching the drop would read the flag
+///!     uninitialized (benign in effect - the enum drop glue tag-guards -
+///!     but UB).  Drop-flag slots default to false in the entry block to
+///!     avoid this.
 ///!
 ///! Each arm mutates an accumulator so a mis-compile is observable here, and
 ///! the owning payloads (String / Array) mean a wrong drop would leak or
@@ -66,7 +68,7 @@ function nested_match_payload_move_compiles_and_runs() -> Result<(), TestError> 
 
 /// The outer-match-arm-subject variant: the inner match's subject is bound by
 /// the OUTER match arm, and the Err path reaches the subject's conditional
-/// drop without binding it — the case that exposed the uninitialized-flag
+/// drop without binding it - the case that exposed the uninitialized-flag
 /// read.
 function probe_result(r: Result<Message, i32>) -> i32 {
     mut out: i32 = 0;

@@ -2,11 +2,10 @@
 ///!
 ///! Pinning the codegen contract for `LiteralKind::Integer`: a u64 (or
 ///! any unsigned-typed) literal whose bit pattern crosses i64::MAX must
-///! still compare correctly as unsigned. Historical bug
-///! (expr_codegen.cryo:109) sign-extended every integer literal
-///! regardless of the source-level type's signedness, which made inline
-///! comparisons against u64 literals exceeding i64::MAX silently flip
-///! to signed semantics. The fix gates `sign_extend` on
+///! still compare correctly as unsigned. Sign-extending every integer
+///! literal regardless of the source-level type's signedness would make
+///! inline comparisons against u64 literals exceeding i64::MAX silently
+///! flip to signed semantics, so `sign_extend` gates on
 ///! `IntType::is_unsigned()`.
 
 ![config(testing)]
@@ -18,10 +17,10 @@ import std::test::error;
 import std::test::assert;
 
 // 2^63 - one past i64::MAX. Smallest positive u64 whose top bit is set,
-// so it sign-extends to a negative APInt under the old codegen path.
+// so it would sign-extend to a negative APInt without the `is_unsigned()` gate.
 const I64_MAX_PLUS_ONE: u64 = 9223372036854775808;
 
-// u64::MAX - every bit set. Under the old codegen path this becomes -1
+// u64::MAX - every bit set. Without the `is_unsigned()` gate this becomes -1
 // in any signed comparison.
 const U64_ALL_ONES: u64 = 18446744073709551615;
 
@@ -87,9 +86,9 @@ function u64_high_bit_round_trips_as_value() -> Result<(), TestError> {
 
 ![test]
 function u32_high_bit_compares_positive() -> Result<(), TestError> {
-    // Same hazard, narrower type. 2^31 is i32::MAX + 1; under the old
-    // sign-extend-everywhere path a u32 literal at the high bit could
-    // also flip negative.
+    // Same hazard, narrower type. 2^31 is i32::MAX + 1; a sign-extend-
+    // everywhere path would flip a u32 literal at the high bit negative
+    // too.
     const big: u32 = 2147483648;
     match (expect(big > 0,
         Str::new("u32 2^31 should be > 0"))) {
@@ -99,20 +98,17 @@ function u32_high_bit_compares_positive() -> Result<(), TestError> {
     return Result::Ok(());
 }
 
-// Inline-literal-vs-u64 sema bug (originally hit in
-// stdlib/json/parser.cryo's parse_number).
+// Inline-literal-vs-u64 sema coverage.
 //
 // Shape: a u64 variable compared against an inline integer literal that
-// exceeds i64::MAX.  Pre-fix, sema typed such literals as the default
-// int (i32), truncating the bit pattern to its low 32 bits before
-// codegen ever ran.  For 9_223_372_036_854_775_808 (2^63), the low 32
-// bits are 0x00000000 - so `acc > 9223372036854775808` lowered as
-// `acc > 0`, true for every non-zero u64.
-//
-// Fix landed in resolve_binary (sema.cryo): for non-assignment binary
-// ops, push the non-literal operand's type as expected_type while
-// resolving the literal.  resolve_integer_literal then adopts u64
-// instead of defaulting to i32.
+// exceeds i64::MAX.  If sema typed such literals as the default int (i32),
+// it would truncate the bit pattern to its low 32 bits before codegen ever
+// ran.  For 9_223_372_036_854_775_808 (2^63), the low 32 bits are
+// 0x00000000 - so `acc > 9223372036854775808` would lower as `acc > 0`,
+// true for every non-zero u64.  For non-assignment binary ops, sema pushes
+// the non-literal operand's type as expected_type while resolving the
+// literal, so resolve_integer_literal adopts u64 instead of defaulting to
+// i32.
 ![test]
 function u64_var_vs_inline_literal_above_i64_max_greater_than() -> Result<(), TestError> {
     const acc: u64 = 7;
@@ -125,7 +121,7 @@ function u64_var_vs_inline_literal_above_i64_max_greater_than() -> Result<(), Te
 
 ![test]
 function i64_negative_literal_still_negative() -> Result<(), TestError> {
-    // Sanity: the fix narrows sign-extension to unsigned types only;
+    // Sanity: the unsigned-adopt rule applies to unsigned types only;
     // signed types must keep working. -1 must still be < 0.
     const neg: i64 = -1;
     match (expect(neg < 0,
@@ -184,9 +180,9 @@ function ilit_identity(x: i64) -> i64 { return x; }
 type enum ILitWrap { Val(i64); }
 
 // Octal literals. The `0o` / `0O` prefix is the language's only octal
-// spelling (docs §1.4). The value parsers used to ignore the prefix
-// (`0o755` decoded to 0) and instead treated a bare leading zero as
-// C-style octal (`077` decoded to 63). Both were silent miscompiles.
+// spelling (docs section 1.4). Guards against the value parsers ignoring the
+// prefix (`0o755` decoding to 0) and instead treating a bare leading zero as
+// C-style octal (`077` decoding to 63). Both would be silent miscompiles.
 ![test]
 function octal_prefix_decodes_value() -> Result<(), TestError> {
     const a: i32 = 0o755;

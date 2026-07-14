@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# build-release — build + package one platform's distributable Cryo toolchain.
+# build-release - build + package one platform's distributable Cryo toolchain.
 #
 #   scripts/build-release.sh linux     # static cryo + stdlib  -> dist/cryo-<ver>-linux-x86_64.tar.gz
 #   scripts/build-release.sh windows   # cross cryo.exe + DLL   -> dist/cryo-<ver>-windows-x86_64.zip

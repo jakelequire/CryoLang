@@ -198,8 +198,7 @@ type struct CodegenPasses {
     /// Copy the freshly-linked binary from the per-profile cache to the build
     /// root.  Cross-platform via `fs::file::copy`, which creates/truncates the
     /// destination and mirrors the source's Unix mode bits (so the hoisted
-    /// binary stays executable).  Returns 0 on success, 1 on failure - the same
-    /// success contract the old `system(cp/copy)` exit code provided.
+    /// binary stays executable).  Returns 0 on success, 1 on failure.
     static hoist_binary(src: string, dst: string) -> i32 {
         match (file::copy(Path::from(src), Path::from(dst))) {
             Result::Ok(_)  => { return 0; }
@@ -318,8 +317,8 @@ type struct CodegenPasses {
 
         // Cross-module externs are declared lazily by `resolve_function` /
         // `resolve_function_with_arity` / `resolve_global` on first reference
-        // from this module, avoiding the O(modules x funcs x overloads) bulk
-        // pre-declaration loop that used to run here.
+        // from this module, avoiding an O(modules x funcs x overloads) bulk
+        // pre-declaration pass.
 
         // Emit the inline runtime helpers (`format`, `panic`, etc.) into
         // this module with linkonce_odr linkage.  Idempotent and
@@ -606,8 +605,8 @@ type struct CodegenPasses {
     ///                                executable at the override path.
     /// Resolve WHERE and HOW this module's IR is emitted, WITHOUT touching
     /// LLVM.  Split out of `run_object_emission` so the codegen producer
-    /// (instance.cryo) can compute the target on the producer side — it needs
-    /// `ctx`, `project_config`, and the module graph — and hand only the
+    /// (instance.cryo) can compute the target on the producer side - it needs
+    /// `ctx`, `project_config`, and the module graph - and hand only the
     /// resolved `{path, file_type, register}` triple to the emitter (a child
     /// process for large builds, or the in-process serial path).  `is_ir_text`
     /// flags the pure text-dump kind that bypasses the target machine entirely.
@@ -651,7 +650,7 @@ type struct CodegenPasses {
     /// The effective target triple for this build (host triple unless a
     /// cryoconfig `target` / CLI `--target` override is set).  Exposed so the
     /// parallel-codegen producer can stamp each emit job with it on the main
-    /// thread — a worker must not recompute it (the resolver reads process
+    /// thread - a worker must not recompute it (the resolver reads process
     /// state that is only stable to read serially).
     static effective_triple(ctx: CompilationContext*) -> string {
         return LTargetMachine::resolve_effective_triple(ctx.target_triple);
@@ -663,7 +662,7 @@ type struct CodegenPasses {
     //   line 0            effective target triple
     //   line 1            opt level (decimal)
     //   line 2..          "<bitcode-path>\t<object-path>" per module, topo order
-    // These scanners malloc fresh copies and never free them — a child process
+    // These scanners malloc fresh copies and never free them - a child process
     // is short-lived and exits, so leaking the parsed strings is fine and keeps
     // the hot path allocation-simple.
 
@@ -745,7 +744,7 @@ type struct CodegenPasses {
     /// Parent side of the multi-process object emitter.  Writes the manifest,
     /// spawns `worker_count` child `cryo __emit-obj` processes over it, and
     /// waits for all of them.  Each module's object is emitted in a separate
-    /// PROCESS (own address space, own LLVM globals) — so there is no shared
+    /// PROCESS (own address space, own LLVM globals) - so there is no shared
     /// LLVM state to race, which is what makes this safe where in-process
     /// threading was not.  Returns true iff every worker exited successfully.
     static run_multiprocess_emit(bc: string[]*, obj: string[]*, triple: string,
@@ -795,7 +794,7 @@ type struct CodegenPasses {
             ci = ci + 1i64;
         }
 
-        // Reclaim the transient bitcode + manifest — pure inputs to the child
+        // Reclaim the transient bitcode + manifest - pure inputs to the child
         // emitters, regenerated every build.  Best-effort (ignore errors).
         mut rk: i64 = 0i64;
         while (rk < cnt) {
@@ -815,7 +814,7 @@ type struct CodegenPasses {
     /// Child-process entry for the multi-process object emitter: parse a
     /// module's bitcode from `bc_path` (written by the main process) in a FRESH
     /// per-process LLVM context and emit its object to `o_path`.  Runs in its
-    /// own process, so there is no shared LLVM global state to race — the whole
+    /// own process, so there is no shared LLVM global state to race - the whole
     /// point of going multi-process instead of multi-thread.  Returns true iff
     /// the object was emitted.
     static emit_object_from_bitcode(bc_path: string, o_path: string,
@@ -1052,7 +1051,7 @@ type struct CodegenPasses {
         // the command line, for the SAME reason `bundle_archive` does it:
         // a real project (the self-hosted compiler itself is ~520 objects)
         // blows straight past `cmd /c`'s ~8191-char command-line cap on a
-        // native Windows host, where `system(3)` routes through cmd — the
+        // native Windows host, where `system(3)` routes through cmd - the
         // historic "The command line is too long." native self-host link
         // failure.  gcc / clang / cc all accept `@file` with one
         // whitespace- or newline-separated, optionally double-quoted entry
@@ -1359,7 +1358,7 @@ type struct CodegenPasses {
         //
         // The object list goes in an @response-file rather than on the
         // command line for TWO reasons: (1) a real compiler easily exceeds
-        // the shell's argv limit on a large project — and under wine
+        // the shell's argv limit on a large project - and under wine
         // `system(3)` routes through `cmd /c`, whose command line caps at
         // ~8191 chars (155 object paths blow straight past it, and cmd
         // truncates rather than erroring, crashing the archiver); (2) it
@@ -1557,7 +1556,7 @@ type struct CodegenPasses {
         }
     }
 
-    // ---- Toolchain probing + path helpers (moved from module scope) ----
+    // ---- Toolchain probing + path helpers ----
 
     /// POSIX-shell-safe quote a path or argument for use in `system()` /
     /// `sh -c` commands.  Wraps the input in single quotes and rewrites any
@@ -1779,7 +1778,7 @@ type struct CodegenPasses {
 
 
 // ===========================================================================
-// Parallel per-module object emission (see .todo/plans/PARALLEL-CODEGEN.md)
+// Parallel per-module object emission
 // ===========================================================================
 
 /// Where + how a module's IR is emitted, resolved on the MAIN thread by
@@ -1787,13 +1786,13 @@ type struct CodegenPasses {
 /// and consumed by both the serial `run_object_emission` and the parallel
 /// producer in instance.cryo.
 type struct EmitTarget {
-    is_ir_text:      boolean;   // pure IR text dump — no target machine
+    is_ir_text:      boolean;   // pure IR text dump - no target machine
     emit_path:       string;
     emit_type:       LFileType; // Object / Assembly
     should_register: boolean;   // feed this .o to the linker
 }
 
-/// One unit of IN-PROCESS serial object emission — the fallback path for small
+/// One unit of IN-PROCESS serial object emission - the fallback path for small
 /// builds and `CRYO_CODEGEN_THREADS=1`; large builds emit out-of-process (see
 /// `run_multiprocess_emit`).  The producer fills the inputs + the module/context
 /// handles (each module in its OWN `LLVMContext`); `codegen_emit_job` emits it
@@ -1801,7 +1800,7 @@ type struct EmitTarget {
 // ---------------------------------------------------------------------------
 // Per-module context auditor (gated by CRYO_CTX_AUDIT; zero cost otherwise).
 // Reports any LLVM type reachable from a module whose owning LLVMContext is not
-// the module's own — i.e. a type that leaked into the process-global context and
+// the module's own - i.e. a type that leaked into the process-global context and
 // is therefore SHARED across every per-module context.  Such sharing is fatal
 // for the zero-copy threaded emitter (concurrent emit would race the shared
 // object's use-list), so this is the invariant check that guards it: a green run
@@ -1873,12 +1872,12 @@ type struct EmitJob {
     // ZERO-COPY emit: the producer hands the worker the LIVE module directly,
     // in its OWN `LLVMContext`, plus a target machine built on the MAIN thread.
     // Every module is fully self-contained in its own context (verified by the
-    // context auditor — no type leaks into the shared global context), so
+    // context auditor - no type leaks into the shared global context), so
     // concurrent `LLVMTargetMachineEmitToFile` over disjoint modules touches no
     // shared LLVM state.  The worker also allocates NO Cryo memory (it makes the
     // raw LLVM emit call and defers error reporting to the main thread), so the
     // compiler's single-threaded bump arena is never accessed off the main
-    // thread — no round-trip, no arena pause.
+    // thread - no round-trip, no arena pause.
     llvm_module:     void*;     // LLVMModuleRef (live), owned by this job
     llvm_context:    void*;     // its LLVMContextRef, owned by this job
     tm:              void*;     // LLVMTargetMachineRef, built on the main thread
@@ -1891,17 +1890,17 @@ type struct EmitJob {
 }
 
 /// Emit ONE module's object file from its own standalone LLVM context (the
-/// in-process serial path).  Touches only LLVM state private to this job —
+/// in-process serial path).  Touches only LLVM state private to this job - 
 /// never `ctx`, the arena, or the intern table.  The target machine is created
 /// per-job (cheap); `init_native_target` must already have run (it has, during
-/// IRGeneration).  A top-level function (not a method/lambda) because it was
-/// originally a thread entry point; kept as-is now that emission is serial
-/// in-process here and out-of-process for large builds.
+/// IRGeneration).  A top-level function (not a method/lambda), a form usable
+/// as a thread entry point; emission is serial in-process here and
+/// out-of-process for large builds.
 function codegen_emit_job(job: EmitJob*) -> void {
     // Emit this module's live IR directly with its main-thread-built target
     // machine.  Deliberately ALLOCATION-FREE on the Cryo side: it makes the raw
     // LLVM emit call and, on error, disposes the LLVM message (libc, thread-safe)
-    // and just records `ok = false` — reporting is left to the main thread.  So
+    // and just records `ok = false` - reporting is left to the main thread.  So
     // a worker never touches the compiler's single-threaded bump arena, and the
     // per-module context isolation makes the concurrent LLVM emit itself safe.
     // The module, context, and target machine are disposed by the caller on the
@@ -1922,7 +1921,7 @@ function codegen_emit_job(job: EmitJob*) -> void {
 /// Per-worker context for the IN-PROCESS THREADED object emitter
 /// (`CompilerInstance::emit_jobs_threaded`).  Each worker owns a disjoint,
 /// round-robin slice `[start, start+stride, start+2*stride, ...]` of a shared,
-/// already-finalized `EmitJob` array — disjoint indices mean no two workers
+/// already-finalized `EmitJob` array - disjoint indices mean no two workers
 /// ever touch the same job, so the only writes (`job.ok`) never alias and need
 /// no lock.  `jobs` is the array's stable base pointer: the producer stops
 /// pushing before any worker is spawned, so no realloc can move it mid-emit.
@@ -1935,7 +1934,7 @@ type struct EmitWorkerCtx {
 
 /// Thread entry for the in-process threaded emitter.  A plain top-level
 /// function (not a lambda) so its body may freely call the generic LLVM
-/// wrappers inside `codegen_emit_job` — a lambda handed to the generic
+/// wrappers inside `codegen_emit_job` - a lambda handed to the generic
 /// `Scope::spawn` cannot (see [[closure-generic-fn-limits]]).  Emits only this
 /// worker's round-robin slice; `init_native_target` already ran on the main
 /// thread during IR generation, and each `codegen_emit_job` builds its OWN

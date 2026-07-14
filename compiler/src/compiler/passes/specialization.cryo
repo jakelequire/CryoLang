@@ -318,9 +318,9 @@ type struct SpecializationPasses {
                 Monomorphizer::new(arena, generic_reg, ctx.intern_table, ctx.diagnostics,
                                    ctx.type_resolver, ctx.decl_index));
             mono_ptr = _box_mono.leak();
-            // The new orchestrator does NOT auto-wire its collaborators; their
+            // The orchestrator does NOT auto-wire its collaborators; their
             // back-pointers must be set AFTER the leak puts it at a stable heap
-            // address (the old monolith had no wire() step).
+            // address.
             mono_ptr.wire();
             mono_ptr.set_current_module(module_sym);
             mono_ptr.set_current_ns(ctx.current_module_ns());
@@ -344,16 +344,14 @@ type struct SpecializationPasses {
         // methods, e.g. `Request::parse(stream)` inside `handle_connection`).
         // This CONSUMES sema's `CallExprNode.resolved_type_args`; it never
         // re-derives bindings.  (Owner-generic `![implicit]` static converters
-        // like `String<GlobalAlloc>::from_string` are now synthesized by sema
+        // like `String<GlobalAlloc>::from_string` are synthesized by sema
         // with `scope_generic_args` pre-mono, so the normal stash path covers
-        // them — the old eager `force_instantiate_static_converter` loop is
-        // gone.)
+        // them.)
         //
         // WALK/DRAIN FIXPOINT: re-walking is idempotent (each call is guarded
         // by its `resolved_callee` / non-generic `resolved_method`), so iterate
         // walk + drain until no new specialization entries appear.  This is
-        // what resolves adapter-chain receivers (`r.map(f).fold()`) now that
-        // the monolith's synchronous `ensure_receiver_inst_resolved` is gone:
+        // what resolves adapter-chain receivers (`r.map(f).fold()`):
         // the first pass types+specializes `.map(f)`, the next pass sees the
         // now-resolved receiver of `.fold()`, and so on to a fixpoint.
         const root: ProgramNode* = ctx.artifacts.ast.root;
@@ -387,14 +385,14 @@ type struct SpecializationPasses {
     // Pass 3: Generic Expression Resolution
     //
     // This pass REGISTERS each new specialization into the DeclarationIndex
-    // (under the demanding module, exactly as before) so that monomorphization
+    // (under the demanding module) so that monomorphization
     // discovery for later modules in the same Phase 6a-ii loop can resolve
     // calls against already-created specs.  It deliberately does NOT place the
-    // spec's AST into a ProgramNode root — physical placement is deferred to
+    // spec's AST into a ProgramNode root - physical placement is deferred to
     // Phase 6a-iii (`route_specializations_to_owners`), which injects each spec
     // into its DETERMINISTIC owner module (the template's defining module),
     // independent of demand order.  Splitting registration (here, per demander)
-    // from placement (there, per owner) keeps discovery byte-identical while
+    // from placement (there, per owner) keeps discovery unchanged while
     // making a spec's object-file home a function of its template.
     static run_generic_expression_resolution(ctx: CompilationContext*) -> PassResult {
         const snap: DiagnosticSnapshot = ctx.diagnostics.snapshot();
@@ -437,13 +435,13 @@ type struct SpecializationPasses {
     /// Walk the InstantiatedType's type arguments and return the source-file
     /// path of the first whose enclosing namespace names an in-build module.
     /// `Result<TlsStream, IoError>` then lands in `net/tls/stream.o` rather than
-    /// in `core/result.o` alongside every other `Result<T,E>` in the program —
+    /// in `core/result.o` alongside every other `Result<T,E>` in the program - 
     /// which is what keeps `result.o` from referencing `TlsStream::drop` and
     /// dragging `net::tls` (and `SSL_*`) onto the link line of anything that
     /// merely returns a `Result`.
     ///
     /// Returns an invalid SymbolStr when no argument resolves to an in-build
-    /// module — a purely primitive instantiation such as `Option<i64>`, or a
+    /// module - a purely primitive instantiation such as `Option<i64>`, or a
     /// FUNCTION spec (`mem::offset<T>`), which carries no InstantiatedType.  The
     /// caller then falls back to the template's defining module.
     static type_arg_owner_for_spec(ctx: CompilationContext*,
@@ -477,9 +475,9 @@ type struct SpecializationPasses {
     ///     instantiation).  `Option<fn(Request) -> Response>` has a function
     ///     type as its sole argument, which carries no qualified name at all.
     ///   * MONOMORPHS.  A spec struct's qualified name lives in its TEMPLATE's
-    ///     namespace (`std::core::option::6Option$L…RequestOnStream…$G`), so
+    ///     namespace (`std::core::option::6Option$L...RequestOnStream...$G`), so
     ///     stopping at it would route `Result<Option<RequestOnStream>, IoError>`
-    ///     to `core::option` — whose object then references
+    ///     to `core::option` - whose object then references
     ///     `RequestOnStream::drop` and pulls `net::http2`, `net::tls` and
     ///     `SSL_*` onto the link line of any program that merely uses an
     ///     `Option`.  The `$` in the leaf is the marker; recurse into the
@@ -549,7 +547,7 @@ type struct SpecializationPasses {
         if (!qn.is_valid()) { return SymbolStr::empty(); }
         const qs: string = ctx.intern_table.resolve(qn);
         // Parse (splitting on `::`), not `from_symbol` (which keeps the whole
-        // qualified name as one segment) — we need the enclosing namespace to
+        // qualified name as one segment) - we need the enclosing namespace to
         // match against a module's `namespace_name`.
         const qname: QualifiedName = QualifiedName::parse(ctx.intern_table, qs);
         const parent_str: string = qname.display_parent(ctx.intern_table);
@@ -574,9 +572,8 @@ type struct SpecializationPasses {
 
     /// Register a single specialization into the DeclarationIndex, scope-tag its
     /// AST nodes, and re-register its impl methods.  Runs under the DEMANDING
-    /// module's `ctx` (same as the pre-refactor inline loop) so discovery and
-    /// DI state are byte-identical to baseline.  Does NOT place the AST into any
-    /// root — that is Phase 6a-iii's job.
+    /// module's `ctx` so discovery and DI state stay consistent.  Does NOT place
+    /// the AST into any root - that is Phase 6a-iii's job.
     static register_spec(ctx: CompilationContext*, mono: Monomorphizer*,
                          entry: SpecializationEntry*) -> void {
         const arena: TypeArena* = ctx.type_arena;
@@ -588,22 +585,21 @@ type struct SpecializationPasses {
         // root holds the definition.
         //
         // A spec is owned by the module that owns the concrete TYPE ARGUMENT
-        // forcing it — the Rust rule that a monomorphization is codegen'd where
+        // forcing it - the Rust rule that a monomorphization is codegen'd where
         // it is instantiated, expressed through the one piece of the
         // instantiation that is stable and demand-order independent.  (The
         // literally-demanding module is unusable: the monomorphizer materializes
         // its entire worklist while `ctx` is still loaded to the FIRST module,
         // so every spec in the program would pile into that one object.)
         //
-        // The old rule relocated every spec to its TEMPLATE's defining module.
-        // That was deterministic and gave each spec exactly one definition, but
-        // it aggregated every instantiation of a generic into a single object:
-        // `core::result` ended up defining all 855 `Result<T,E>` specs in the
-        // stdlib, so `result.o` referenced `TlsStream::drop`, `JsonValue::drop`,
+        // Routing by type argument avoids aggregating every instantiation of a
+        // generic into a single object.  Keying on the template's defining module
+        // would make `core::result` define all 855 `Result<T,E>` specs in the
+        // stdlib, so `result.o` would reference `TlsStream::drop`, `JsonValue::drop`,
         // `Child::drop`, ...  A static archive is pulled one whole member at a
-        // time, so linking a hello-world against a prebuilt stdlib dragged in
-        // `net::tls` — and therefore `SSL_*` — merely because the allocator
-        // returns a `Result`.  Routing by type argument severs that.
+        // time, so linking a hello-world against a prebuilt stdlib would drag in
+        // `net::tls` - and therefore `SSL_*` - merely because the allocator
+        // returns a `Result`.
         //
         // Two modules that instantiate the same generic now each emit it.  That
         // is sound because a monomorph is a pure function of (template,
@@ -622,12 +618,11 @@ type struct SpecializationPasses {
         //     codegen_function_prologue).  That makes their definition symbol
         //     and every caller's cross-module reference both qualify by the
         //     TEMPLATE module, so relocating the definition never diverges the
-        //     names (which used to yield undefined-symbol link errors such as
-        //     `CompileMode::Layout_of<...>` / `Sema::swap<u32[]>`).
+        //     names.
         //
         // Fallback, when no type argument names an in-build module (a purely
         // primitive `Option<i64>`, or a FUNCTION spec, which carries no
-        // InstantiatedType): the template's defining module, as before.  Such a
+        // InstantiatedType): the template's defining module.  Such a
         // spec's arguments are primitives, so its object can only reference the
         // template's own dependencies and cannot aggregate the world.
         mut owner_module_sym: SymbolStr = module_sym;
@@ -667,10 +662,8 @@ type struct SpecializationPasses {
         // (see type_resolution's ImplementationBlock handler), so it can't mark
         // "this exact node is an injected spec" without conflation. The side
         // table only ever holds injected specs, which is what `dispatch_top_level`
-        // needs. (An earlier comment blamed a vtable field-write miscompile; that
-        // was misdiagnosed — base writes are correct — but the side table stays
-        // for the disambiguation reason above.) Physical placement into the
-        // owner module's root happens later in Phase 6a-iii.
+        // needs. Physical placement into the owner module's root happens later
+        // in Phase 6a-iii.
         if (entry.ast_node != null) {
             if (entry.template_module.is_valid()) {
                 ctx.register_injected_origin(
@@ -768,8 +761,8 @@ type struct SpecializationPasses {
     /// (Phase 6a-ii); this pass only performs the physical `add_statement`, which
     /// determines which object file emits the spec's definition.
     ///
-    /// Placement keys off `entry.owner_source` — the resolved owner module's
-    /// source-file path that `register_spec` ALSO used for DI ownership — so AST
+    /// Placement keys off `entry.owner_source` - the resolved owner module's
+    /// source-file path that `register_spec` ALSO used for DI ownership - so AST
     /// placement and DI ownership always agree.  The owner is the template's
     /// defining module (deterministic, demand-order independent) for every spec
     /// whose template module resolves to a module in the build; specs with no
@@ -989,7 +982,7 @@ type struct SpecializationPasses {
     ///
     /// Registration is unconditional for non-generic owners so the index is
     /// a complete `qualified_name -> AST` map for them; receiver-type lookups
-    /// no longer have to thread a fallback through DeclarationIndex.  Generic
+    /// do not have to thread a fallback through DeclarationIndex.  Generic
     /// owners go through `register_generic_template` instead; their methods
     /// are specialized as part of struct/class monomorphization rather than
     /// per-call.
@@ -1010,9 +1003,9 @@ type struct SpecializationPasses {
     /// Tag an AST node's source_module field with the template's module name.
     /// struct/class/enum/function/impl decls are all DeclarationNode subclasses and
     /// `source_module` lives on that shared base, so a single base-pointer write
-    /// covers every kind. (The kind check keeps the cast sound — only declaration
+    /// covers every kind. (The kind check keeps the cast sound - only declaration
     /// nodes are written.) The earlier per-leaf concrete casts here worked around a
-    /// believed vtable field-offset miscompile; that was misdiagnosed — base-pointer
+    /// believed vtable field-offset miscompile; that was misdiagnosed - base-pointer
     /// field writes on the vtable'd AST hierarchy are correct (verified 2026-06-17,
     /// O0+O2). The real crash was a since-fixed mangler ICE on `Array<ptr>` specs.
     static tag_decl_source_module(node: ASTNode*, module: string) -> void {
@@ -1069,7 +1062,7 @@ type struct SpecializationPasses {
                 // NOTE: coherence (a trait may be implemented at most once per
                 // type) is NOT checked here.  At this stage (DeclarationCollection)
                 // there is no import-resolved target name, so a key would have to
-                // use bare simple names — which conflate same-named types in
+                // use bare simple names - which conflate same-named types in
                 // different modules and ignore trait/target type args.  The
                 // single coherence check lives in TypeResolution's
                 // `register_decl_in_index`, after `canonical_target` is stamped;
@@ -1085,7 +1078,7 @@ type struct SpecializationPasses {
     /// `Foo` out of `Foo`, `Foo<T>`, or `&Foo`. Returns an invalid SymbolStr
     /// for shapes the trait-impl registry doesn't index (Primitive, ThisType,
     /// Tuple, Function, Optional, Array). Qualified-path traits are tracked
-    /// only by their leaf name here; full-path indexing is B.4 work.
+    /// only by their leaf name here; full-path indexing is not yet implemented.
     static extract_root_name(ann: TypeAnnotation*) -> SymbolStr {
         if (ann == null) { return SymbolStr::empty(); }
         return match (*ann) {
@@ -1125,18 +1118,18 @@ type struct SpecializationPasses {
             // Instantiations minted only by the additive symbolic generic-body walk
             // are never monomorphized or codegen'd (they may be concrete types that
             // live solely inside a never-instantiated template). They are not real
-            // unresolved instantiations — skip, exactly like the generic-arg ones below.
+            // unresolved instantiations - skip, exactly like the generic-arg ones below.
             if (inst.is_symbolic) { continue; }
 
             // Skip template-internal references whose type args contain generic
             // parameters at any depth (e.g., Pair<T>, Option<Result<T, E>>).
             // These are created when a generic declaration references another
             // generic with its own params and are never meant to be monomorphized
-            // until the *outer* template is specialized.  The shallow direct-arg
-            // check used to miss nested cases like Option<Result<T,E>> where the
-            // direct arg is an InstantiatedType, not a GenericParam.  Mirrors
-            // the recursive filter in `TypeArena::contains_generic_param`, which is
-            // the single authority every consumer (mono, sema, this validator) shares.
+            // until the *outer* template is specialized.  Nested cases like
+            // Option<Result<T,E>>, where the direct arg is an InstantiatedType
+            // rather than a GenericParam, need the recursive filter in
+            // `TypeArena::contains_generic_param`, which is the single authority
+            // every consumer (mono, sema, this validator) shares.
             mut has_generic_arg: boolean = false;
             for (mut j: i64 = 0; j < inst.type_args.length; j++) {
                 if (arena.contains_generic_param(inst.type_args[j])) {

@@ -9,11 +9,10 @@
 ///! are exposed to `passes/specialization.cryo` through `spec_entry_at()` + the
 ///! injection cursor for placement into the program AST.
 ///!
-///! POST-REORDER (mono-after-sema): semantic analysis is authoritative and runs
-///! FIRST.  It pins generic type arguments onto `CallExprNode.resolved_type_args`
-///! and types every expression/literal.  This monomorphizer CONSUMES those pinned
-///! bindings (via `MonoCallSpecializer`); it does NOT re-derive them — the old
-///! argument/receiver/literal inference engine is deleted.  Mono's job: materialize
+///! Semantic analysis is authoritative and runs FIRST.  It pins generic type
+///! arguments onto `CallExprNode.resolved_type_args` and types every
+///! expression/literal.  This monomorphizer CONSUMES those pinned bindings (via
+///! `MonoCallSpecializer`); it does NOT re-derive them.  Mono's job: materialize
 ///! concrete arena types, discover nested instantiations, consume sema's stash to
 ///! mint per-call free/method specializations, and handle cross-module naming.
 ///!
@@ -199,9 +198,8 @@ type struct Monomorphizer {
     }
 
     /// Consume sema's `resolved_type_args` stash across a module's call sites,
-    /// minting per-call free/method specializations (replaces the old
-    /// `discover_inferred_calls_in_module` inference walk).  New instantiations
-    /// it queues are drained by `drain_pending_worklist` (caller's responsibility).
+    /// minting per-call free/method specializations.  New instantiations it
+    /// queues are drained by `drain_pending_worklist` (caller's responsibility).
     specialize_calls_in_module(mut &this, root: ProgramNode*) -> void {
         this.call_specializer.specialize_calls_in_module(root);
     }
@@ -347,8 +345,8 @@ type struct Monomorphizer {
     /// `specialize_calls_in_module` queues new instantiations.  Returns true on success.
     drain_pending_worklist(mut &this) -> boolean {
         mut errors: i64 = 0;
-        // Same type-growing-instantiation ceiling as `process_all` (this drain
-        // path was previously uncapped, so an unbounded tower hung hard here).
+        // Same type-growing-instantiation ceiling as `process_all` (without a cap
+        // on this drain path an unbounded tower hangs hard here).
         const max_iterations: i64 = 100000 + this.arena.type_count() * 100;
         mut drain_iters: i64 = 0;
         while (this.state.pending_cursor < this.state.pending.length) {
@@ -537,13 +535,13 @@ type struct Monomorphizer {
 
         // Register the spec entry into `state.spec_entries` BEFORE specializing the
         // nested calls in its own bodies.  A spec's method body can make a generic
-        // call on a receiver that resolves to the SAME spec being materialized — e.g.
+        // call on a receiver that resolves to the SAME spec being materialized - e.g.
         // `String<GlobalAlloc>`'s `FmtWrite::write_str` calls `this.try_push(source)`
         // on a `this: String` (bare, all-defaulted) receiver that
         // `canonicalize_default_template_recv` must map to `String<GlobalAlloc>` via
-        // a `spec_entries` scan.  Registering AFTER the walk (the old order) left the
-        // scan empty, so the receiver stayed bare, the `try_push` lookup failed, and
-        // the call was left entirely unpinned.  `kept_impl_asts` is MOVED into the
+        // a `spec_entries` scan.  Registering after the walk would leave the scan
+        // empty, so the receiver would stay bare, the `try_push` lookup would fail,
+        // and the call would be left entirely unpinned.  `kept_impl_asts` is MOVED into the
         // entry, so capture the impl-node pointers into a walk list first (they alias
         // the same nodes the entry now owns).
         mut walk_impls: ASTNode*[] = [];
@@ -571,7 +569,7 @@ type struct Monomorphizer {
         // (e.g. `mem::offset<T>` inside `NonNull<i32>`'s methods, or a nested
         // generic free call inside a spec'd function).  These bodies are never in
         // the module root that `specialize_calls_in_module` traverses, and AST
-        // re-resolution does not consume their call stashes — so this is the one
+        // re-resolution does not consume their call stashes - so this is the one
         // place a spec'd body's inner generic calls get pinned + enqueued.  The
         // `subst` concretizes any template-param binding the ASTTypeSubstituter
         // didn't reach in the clone (no-op on an already-concrete stash).  Each
@@ -712,7 +710,7 @@ type struct Monomorphizer {
     }
 
     // -- Accessors for passes/specialization.cryo (SpecInjector + routing) --
-    // Replace the pass's former direct pokes at `spec_entries` / `injection_cursor`.
+    // Used by the pass instead of poking `spec_entries` / `injection_cursor` directly.
 
     /// Borrow spec entry `i` for inspection/mutation.  Null for out-of-range.
     spec_entry_at(mut &this, i: i64) -> SpecializationEntry* {
@@ -744,9 +742,9 @@ type struct Monomorphizer {
     /// `W`'s InstantiatedType to `C`.  Keying structurally (e.g. off the
     /// mangled symbol, which encodes `W` and `C` differently) splits them and
     /// leaves nested wrappers like `ChainIter<MapIter<Range>>` unresolved
-    /// (E0900).  See the DEFERRED sub-issue 1 note in HANDOFF.md: aligning the
-    /// pinned symbol to this canonical key (not the reverse) is the only sound
-    /// fix, and it is a wholesale mangling change requiring its own repin.
+    /// (E0900).  Aligning the pinned symbol to this canonical key (not the
+    /// reverse) is the only sound fix, and it is a wholesale mangling change
+    /// requiring its own repin.
     make_key(&this, request: &MonomorphRequest) -> string {
         return this.make_key_for(request.base_type, request.type_args);
     }
@@ -781,7 +779,7 @@ type struct Monomorphizer {
         // first-time specialize path (which sets `resolved_type` on
         // `request.generic_type`).  `propagate_instantiated_resolution` below only
         // matches instantiations whose (base, type_args) equal the request's, so
-        // it misses a LOWER-arity form — e.g. the 1-arg receiver `HashSet<String>`
+        // it misses a LOWER-arity form - e.g. the 1-arg receiver `HashSet<String>`
         // of a wrapper-type method, whose request carries the default-expanded
         // 2-arg `type_args` but references the original 1-arg `generic_type`.
         // Without this, that receiver stays unresolved after mono (E0900).

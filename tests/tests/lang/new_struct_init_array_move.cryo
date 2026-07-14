@@ -2,18 +2,18 @@
 ///! local into the heap-constructed object, not leave it to be dropped at
 ///! the constructing scope's exit.
 ///!
-///! drop_insertion (and move_check) walked only `NewExpr.arguments`, never
-///! `NewExpr.struct_init`, so a field initializer like `new Bag { items: xs }`
-///! never marked `xs` moved. The drop glue then freed `xs`'s buffer (and each
-///! owning element) at scope exit while the heap object still aliased it - a
-///! double free / use-after-free. The matching bare struct literal
-///! (`Bag { items: xs }`) was always handled by read_struct_lit and is kept
-///! here as a control. See passes/drop_insertion.cryo::read_new and
-///! passes/move_check.cryo::read_new.
+///! drop_insertion (and move_check) must walk `NewExpr.struct_init`, not
+///! just `NewExpr.arguments`; otherwise a field initializer like
+///! `new Bag { items: xs }` never marks `xs` moved, and the drop glue then
+///! frees `xs`'s buffer (and each owning element) at scope exit while the
+///! heap object still aliases it - a double free / use-after-free. The
+///! matching bare struct literal (`Bag { items: xs }`) is always handled by
+///! read_struct_lit and is kept here as a control. See
+///! passes/drop_insertion.cryo::read_new and passes/move_check.cryo::read_new.
 ///!
 ///! Same Probe/counter harness as drop_glue.cryo / move_field_out_ok.cryo:
 ///! each drop bumps a module counter, and the tests assert the EXACT count -
-///! too many means the double free we set out to prevent.
+///! too many means a double free.
 
 ![config(testing)]
 namespace CryoTests::Tests::Lang::NewStructInitArrayMove;
@@ -41,9 +41,9 @@ implement trait Eq for struct Probe {
 type struct Bag { items: Probe[]; }
 
 // `new Bag { items: xs }` moves `xs` into the heap Bag. The heap object is a
-// raw pointer (not scope-dropped), so its Probes never drop here. Pre-fix,
-// `xs` was dropped at block exit (count would be 2) and the read below would
-// touch freed storage.
+// raw pointer (not scope-dropped), so its Probes never drop here. If the move
+// were missed, `xs` would be dropped at block exit (count would be 2) and the
+// read below would touch freed storage.
 ![test]
 function new_struct_init_moves_owning_array() -> Result<(), TestError> {
     reset();
@@ -51,7 +51,7 @@ function new_struct_init_moves_owning_array() -> Result<(), TestError> {
     {
         const xs: Probe[] = [Probe { tag: 1 }, Probe { tag: 2 }];
         const bag: Bag* = new Bag { items: xs };
-        // Read through the heap object: a use-after-free on the buggy compiler.
+        // Read through the heap object: would be a use-after-free if the move were missed.
         observed_len = bag.items.length as i32;
     }
     // xs was moved into the (leaked) heap Bag -> nothing dropped at scope exit.

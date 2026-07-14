@@ -20,9 +20,9 @@ The scheme has one hard constraint that governs every character choice:
 
 Consequences:
 
-- Separators are drawn only from `A–Z a–z 0–9 $ . _ -`.
+- Separators are drawn only from `A-Z a-z 0-9 $ . _ -`.
 - `$` is reserved for structural markers and never appears in an identifier body.
-- Symbols appear verbatim in IR, `nm`, `objdump`, and linker diagnostics — no
+- Symbols appear verbatim in IR, `nm`, `objdump`, and linker diagnostics - no
   `@"..."` quoting is ever required.
 
 Symbols declared `extern "C"` are **not** mangled: the source name passes through to
@@ -46,7 +46,7 @@ Plain       = Path [ Signature ] [ Overload ] ;                (* functions, met
 
 Path        = Segment { "." Segment } [ "-" Segment ] ;        (* "." namespaces, "-" type member *)
 Segment     = Ident [ "$L" TypeList "$G" ] ;                   (* optional generic argument list *)
-Ident       = Length Bytes ;                                   (* Length-prefixed, see §5 *)
+Ident       = Length Bytes ;                                   (* Length-prefixed, see section 5 *)
 Length      = Digit { Digit } ;                                (* decimal UTF-8 byte count *)
 
 Signature   = "$F" ParamList "$R" Type ;
@@ -62,7 +62,7 @@ Type        = Prim
             | "N$L" Path [ "$L" TypeList "$G" ] "$G" ;         (* named [generic] type *)
 
 Overload    = "$O" Length ;
-Digit       = "0" … "9" ;
+Digit       = "0" ... "9" ;
 ```
 
 The grammar is unambiguous with two-character lookahead at `$`-marker positions: a
@@ -94,11 +94,11 @@ Type-position prefixes (a single leading letter, never preceded by `$`):
 
 | Prefix | Role                                   |
 |--------|----------------------------------------|
-| `P`    | Pointer — `P` + pointee                |
-| `R`    | Reference — `R` + referent             |
-| `A`    | Array / slice — `A` + element          |
-| `N`    | Named type — `N$L` Path [args] `$G`    |
-| `F`    | Function type — `F$L` params `$G` ret  |
+| `P`    | Pointer - `P` + pointee                |
+| `R`    | Reference - `R` + referent             |
+| `A`    | Array / slice - `A` + element          |
+| `N`    | Named type - `N$L` Path [args] `$G`    |
+| `F`    | Function type - `F$L` params `$G` ret  |
 
 The structural return marker `$R` is always preceded by `$`; the reference prefix `R`
 never is. They are not confusable.
@@ -108,7 +108,7 @@ never is. They are not confusable.
 ## 4. Kind Tags
 
 A kind tag is a two-letter code placed immediately after `C$` and followed by `$`
-(yielding, e.g., `C$ct$…`). It marks symbols that are not plain functions. The
+(yielding, e.g., `C$ct$...`). It marks symbols that are not plain functions. The
 trailing `$` separates the tag from the path, whose first segment always begins with
 a digit.
 
@@ -139,11 +139,11 @@ Rect.area  (method)         ->  4Rect-4area
 
 Each identifier is encoded as its **UTF-8 byte length** in decimal followed by the raw
 bytes (`<length><bytes>`). Lengths count bytes, not code points, so Unicode identifiers
-require no escaping: `café` (5 bytes) → `5café`. Length-prefixing also makes embedded
+require no escaping: `café` (5 bytes) -> `5café`. Length-prefixing also makes embedded
 `_` unambiguous, so identifiers need no escape rules of their own.
 
 A constructor's and destructor's member segment duplicates the owning type's leaf name
-(e.g. `C$ct$3Dog-3Dog…`).
+(e.g. `C$ct$3Dog-3Dog...`).
 
 ---
 
@@ -209,14 +209,14 @@ with `s` (`i16`). Additional rules:
 
 | Cryo type            | Encoding                                | Example                          |
 |----------------------|-----------------------------------------|----------------------------------|
-| Pointer `T*`         | `P` + `T`                               | `int*` → `Pi`                    |
-| Reference `&T`       | `R` + `T`                               | `&Vec2` → `RN$L4Vec2$G`          |
-| Array / slice        | `A` + element                           | `int[]` → `Ai`                   |
-| Named type           | `N$L` Path `$G`                         | `Math::Vec2` → `N$L4Math.4Vec2$G`|
-| Generic instance     | `N$L` Path `$L` args `$G$G`             | `Pair<int>` → `N$L4Pair$Li$G$G`  |
-| Optional `T?`        | `N$L8Optional$L` T `$G$G`               | `int?` → `N$L8Optional$Li$G$G`   |
-| Tuple `(T0, T1, …)`  | `N$L5Tuple$L` T0 `_` T1 … `$G$G`        | `(i32, i32)` → `N$L5Tuple$Li_i$G$G` |
-| Function `fn(…)->R`  | `F$L` params `$G` R                     | `fn(int,int)->int` → `F$Li_i$Gi` |
+| Pointer `T*`         | `P` + `T`                               | `int*` -> `Pi`                    |
+| Reference `&T`       | `R` + `T`                               | `&Vec2` -> `RN$L4Vec2$G`          |
+| Array / slice        | `A` + element                           | `int[]` -> `Ai`                   |
+| Named type           | `N$L` Path `$G`                         | `Math::Vec2` -> `N$L4Math.4Vec2$G`|
+| Generic instance     | `N$L` Path `$L` args `$G$G`             | `Pair<int>` -> `N$L4Pair$Li$G$G`  |
+| Optional `T?`        | `N$L8Optional$L` T `$G$G`               | `int?` -> `N$L8Optional$Li$G$G`   |
+| Tuple `(T0, T1, ...)`  | `N$L5Tuple$L` T0 `_` T1 ... `$G$G`        | `(i32, i32)` -> `N$L5Tuple$Li_i$G$G` |
+| Function `fn(...)->R`  | `F$L` params `$G` R                     | `fn(int,int)->int` -> `F$Li_i$Gi` |
 
 Notes:
 
@@ -273,9 +273,9 @@ Data symbols carry no signature. Their forms:
 | Type info                  | `C$ti$` Path                      | `C$ti$6Animal`                |
 | Module initializer         | `C$mi$` Path                      | `C$mi$4Math.6Vector`          |
 | Closure                    | `C$cl$` Path `$O` Index           | `C$cl$8identity$O0`           |
-| Global / constant          | `C$` Path                         | `Math::PI` → `C$4Math.2PI`    |
-| Named-type (LLVM type name)| `C$` Path                         | `Math::Vec2` → `C$4Math.4Vec2`|
-| Generic-instance label     | `C$` Path-with-leaf-generics      | `Pair<int>` → `C$4Pair$Li$G`  |
+| Global / constant          | `C$` Path                         | `Math::PI` -> `C$4Math.2PI`    |
+| Named-type (LLVM type name)| `C$` Path                         | `Math::Vec2` -> `C$4Math.4Vec2`|
+| Generic-instance label     | `C$` Path-with-leaf-generics      | `Pair<int>` -> `C$4Pair$Li$G`  |
 
 A root-namespace global with no enclosing namespace takes the bare `C$<name>` form
 (e.g. `C$3foo`). Module initializers are linked into a global init list run before

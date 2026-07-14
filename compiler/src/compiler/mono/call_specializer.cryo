@@ -6,19 +6,13 @@
 /// queues the function-template instantiation, and (for generic methods) clones +
 /// re-resolves a concrete method sibling and registers it in the DeclarationIndex.
 ///
-/// POST-REORDER (mono-after-sema): semantic analysis ran FIRST and stashed every
-/// generic call's concrete type arguments on `CallExprNode.resolved_type_args`,
-/// and typed every receiver/argument expression.  This collaborator READS those —
-/// it NEVER re-derives them.  The old argument/receiver/literal inference engine
-/// (`unify_for_inference`, `resolve_arg_type_for_inference`, the literal-default
-/// guess, the local-variable mini-sema tables) is GONE: bindings come from the
-/// stash, the receiver type from `ma.object.resolved_type`.  What remains is
-/// template/method LOOKUP, where-bound checking, and the clone+substitute+register
-/// mechanics — none of which is inference.
-///
-/// This replaces the monolith's `discover_inferred_calls_in_module` +
-/// `try_infer_function_call` + `try_infer_method_call` +
-/// `try_infer_static_method_on_generic_template`.
+/// Semantic analysis ran FIRST and stashed every generic call's concrete type
+/// arguments on `CallExprNode.resolved_type_args`, and typed every
+/// receiver/argument expression.  This collaborator READS those - it NEVER
+/// re-derives them.  Bindings come from the stash, the receiver type from
+/// `ma.object.resolved_type`.  What remains is template/method LOOKUP,
+/// where-bound checking, and the clone+substitute+register mechanics - none of
+/// which is inference.
 
 namespace Compiler::Mono::CallSpecializer;
 
@@ -168,7 +162,7 @@ type struct MonoCallSpecializer {
     /// calls inside them, threading the active `subst`.  The orchestrator calls
     /// this right after `resolve_specialized_ast`: a spec'd type's / function's
     /// body is NOT in the module root the `specialize_calls_in_module` walk
-    /// traverses, and `resolve_func_and_body` no longer re-derives its inner calls
+    /// traverses, and `resolve_func_and_body` does not re-derive its inner calls
     /// via inference, so the only place a spec'd body's `mem::offset<T>`-style
     /// generic calls get consumed (and the resulting fn/type specializations
     /// enqueued) is here.  `subst` concretizes any template-param binding the
@@ -406,7 +400,7 @@ type struct MonoCallSpecializer {
                 // (gsm_owner_* set): concretize an owner-typed struct literal
                 // (`Wrap { v: item }`) whose type the symbolic template walk left
                 // bare/invalid.  Gated on `gsm_owner_recv` so the ordinary walk path
-                // is byte-identical to before.
+                // is unaffected.
                 if (this.gsm_owner_recv.is_valid()) {
                     if (sl.struct_type.equals(this.gsm_owner_leaf)) {
                         // Point the literal at the concrete owner spec by NAME and
@@ -521,7 +515,7 @@ type struct MonoCallSpecializer {
                     // method on a GENERIC owner (`Slice<T>::from_raw`,
                     // `String<GA>::from_string`).  Sema stashed the owner's type args;
                     // consume them.  When handled (callee pinned + owner enqueued),
-                    // stop — there is no free-function template to instantiate.
+                    // stop - there is no free-function template to instantiate.
                     const sr2: ScopeResolutionNode* = call.callee as ScopeResolutionNode*;
                     if (this.specialize_static_method_on_generic_owner(call, sr2, subst)) {
                         return;
@@ -541,8 +535,7 @@ type struct MonoCallSpecializer {
         if (entry.param_type_ids.length == 0) { return; }
         if (call.resolved_type_args.length != entry.param_type_ids.length) {
             // No (or partial) stash: outside sema's visibility; leave unspecialized.
-            // (Invariant #2 candidate to HARDEN to an ICE once the reorder is
-            // validated end-to-end — left as a soft return during bring-up.)
+            // (Candidate to HARDEN to an ICE; left as a soft return for now.)
             return;
         }
         mut bindings: TypeRef[] = [];
@@ -580,7 +573,7 @@ type struct MonoCallSpecializer {
     /// first-class value: resolve the explicit turbofish args, pin the specialized
     /// callee symbol on the identifier, and queue the instantiation.  No-op for
     /// ordinary identifiers (no turbofish).  This reads explicit turbofish args
-    /// directly (not a stash) — it is not inference.
+    /// directly (not a stash) - it is not inference.
     specialize_fn_value_ref(mut &this, ident: IdentifierNode*,
                             res_ctx: ResolutionContext*,
                             subst: TypeSubstitution*) -> void {
@@ -621,13 +614,11 @@ type struct MonoCallSpecializer {
     // -- Method-call specialization (consumes call.resolved_type_args) --
 
     /// Specialize a generic method call from sema's method-level binding stash.
-    /// Ported from the monolith `try_infer_method_call` (5500-5909), DEINFERENCED:
-    ///   * RECEIVER: `ma.object.resolved_type` (sema-pinned) replaces the deleted
-    ///     resolve_arg_type_for_inference + static-call / fluent-builder recovery.
+    ///   * RECEIVER: `ma.object.resolved_type` (sema-pinned).
     ///   * BINDINGS: the method's own generics come from `call.resolved_type_args`
-    ///     (sema's stash); the formal/actual unify engine is gone.
+    ///     (sema's stash).
     ///   * ADAPTER RECEIVERS: there is no synchronous `ensure_receiver_inst_resolved`
-    ///     (it needed the orchestrator's spec cache).  Instead the unwrap loop leaves
+    ///     (it would need the orchestrator's spec cache).  Instead the unwrap loop leaves
     ///     an unresolved adapter inst alone; `find_spec_inline_method` enqueues it, and
     ///     the run_monomorphization walk/drain FIXPOINT resolves the chained call on a
     ///     later iteration (sema pre-types adapter returns as concrete InstantiatedTypes).
@@ -636,7 +627,7 @@ type struct MonoCallSpecializer {
     /// structural READ over sema-given types: any expression sema typed returns
     /// that type as-is; a member access resolves its object's type, unwraps to the
     /// underlying struct/class, and reads the named field's DECLARED type.  This is
-    /// not inference and it does NOT concretize via the substitution — applying
+    /// not inference and it does NOT concretize via the substitution - applying
     /// the subst would mint untracked arena instantiations as a side effect, even
     /// on calls that later bail.  Concretization isn't needed for the cases this
     /// serves (a non-generic-owner receiver like the field `this.h : Inner`, whose
@@ -714,7 +705,7 @@ type struct MonoCallSpecializer {
         // In a specialized body the cloner reset the receiver expression's
         // `resolved_type`; for the member-access shape (`this.h.relay(w)`) the type
         // is reconstructed structurally from the (carried) object type + the named
-        // field, which is spec-local and authoritative — no re-inference.
+        // field, which is spec-local and authoritative - no re-inference.
         mut recv_type: TypeRef = ma.object.resolved_type;
         mut recv_derived: boolean = false;
         if (recv_type.is_valid()) {
@@ -763,7 +754,7 @@ type struct MonoCallSpecializer {
         // A bare generic-template struct used directly as a receiver (`this` in
         // `implement FmtWrite for struct String`, or `mut s: String` with all params
         // defaulted) is NOT a materialized spec, so a generic method on it (`try_push<T>`)
-        // resolves to nothing in the lookup ladder and the call is left unpinned —
+        // resolves to nothing in the lookup ladder and the call is left unpinned - 
         // codegen's name+arity fallback then picks an arbitrary sibling spec once more
         // than one exists (e.g. try_push<Str> -> try_push<i32>, corrupting all
         // formatting).  Canonicalize to the DEFAULT instantiation's emitted spec
@@ -849,7 +840,7 @@ type struct MonoCallSpecializer {
         //   * R is a NON-generic owner (`Inner`): there is NO monomorphization of
         //     R, so `m<W>` specs exist ONLY because a call site demands them.  A
         //     spec'd-body call (whose receiver type we reconstructed above) is a
-        //     real, possibly sole, demand — it MUST be specialized here.  This is
+        //     real, possibly sole, demand - it MUST be specialized here.  This is
         //     the inherent path (`inherent_owner_ast != null`).
         //   * R is a generic-type SPEC (`Array<i32>`): `m<W>` is materialized and
         //     placed by the canonical in-source / struct-spec machinery, driven by
@@ -920,7 +911,7 @@ type struct MonoCallSpecializer {
 
         // Whether this spec is resolved through a PINNED `resolved_callee` (the
         // precise mangled symbol) rather than the trait-impl/combinator DI path.
-        // Only the pinned (inherent) regime gets the `$MG…` method-spec-args
+        // Only the pinned (inherent) regime gets the `$MG...` method-spec-args
         // disambiguator: there the call pin, the codegen definition, and the DI
         // registration all fold `func.spec_type_args` in and so agree.  Trait-impl
         // specs stay unpinned and are disambiguated by their existing machinery
@@ -938,7 +929,7 @@ type struct MonoCallSpecializer {
         // `JsonExtract::as<T>() -> Option<T> where T: TryFrom<&JsonValue>`
         // mangled to `...as...Option<boolean>` for EVERY `T`, and every
         // `as<i64>` / `as<Str>` call linked to the `as<boolean>` body.  Stamp
-        // the `$MG…` method-spec args in that case too.  Iterator combinators
+        // the `$MG...` method-spec args in that case too.  Iterator combinators
         // are structurally excluded: their method type param is always carried
         // by a value parameter (`chain<I>(other: I)`, `zip<U>(other: U)`,
         // `map<F>(f: F)`), so `method_generic_in_value_param` is true and this
@@ -961,7 +952,7 @@ type struct MonoCallSpecializer {
 
         if (inherent_pin || !method_generic_in_value_param) {
             // Stamp the concrete method type args so the spec's mangled symbol
-            // carries the `$MG…` disambiguator (MangledName::with_method_spec_args).
+            // carries the `$MG...` disambiguator (MangledName::with_method_spec_args).
             // Two specs of one method whose signature doesn't mention the
             // method param (`name<T>() -> string`) would otherwise mangle
             // identically and collapse onto the first emitted spec.
@@ -973,7 +964,7 @@ type struct MonoCallSpecializer {
         }
 
         // Dedup: a generic-method spec is materialized once per (owner, method,
-        // bindings).  The same logical call can arrive from more than one site —
+        // bindings).  The same logical call can arrive from more than one site - 
         // an in-source `arr.fmt(f)` AND a clone of that call in a specialized body
         // (whose `resolved_callee`/`resolved_method` the substituter cleared,
         // forcing re-resolution).  Re-materializing would double-push the spec
@@ -1082,7 +1073,7 @@ type struct MonoCallSpecializer {
         // A method-level `static match (T)` (e.g. `string::parse_int<T>`) was cloned
         // with all arms intact; the substituter rewrote each scrutinee to the
         // concrete binding (`T` -> `i64`).  Reduce every static match to its single
-        // live arm now — exactly as the owner-template path does
+        // live arm now - exactly as the owner-template path does
         // (monomorphizer.cryo:480).  Without this the spec'd clone keeps >1 arm and a
         // later normal-mode walk of the concrete body reports E0645 ("static match
         // outside a generic context").  Done before the call re-walk so it only
@@ -1134,9 +1125,8 @@ type struct MonoCallSpecializer {
     /// Lazily instantiate a zero-own-generic self-returning trait default
     /// (take/filter) for the concrete receiver.  Own-generic defaults (map<B>)
     /// return false and fall through to specialize_method_call's main path.
-    /// DEINFERENCED: the receiver type is passed in (read from resolved_type by the
-    /// caller); the old ensure_receiver_inst_resolved re-find is gone (the fixpoint
-    /// re-walk resolves an adapter receiver on a later iteration).
+    /// The receiver type is passed in (read from resolved_type by the caller);
+    /// the fixpoint re-walk resolves an adapter receiver on a later iteration.
     try_instantiate_self_returning_default(mut &this, call: CallExprNode*,
                                            ma: MemberAccessNode*,
                                            recv_type: TypeRef) -> boolean {
@@ -1180,8 +1170,7 @@ type struct MonoCallSpecializer {
     // -- Static method on a GENERIC owner (Slice<T>::from_raw, String<GA>::from_string) --
 
     /// Specialize a non-generic static method on a generic owner from sema's owner
-    /// stash.  Replaces the monolith's inference-driven
-    /// `try_infer_static_method_on_generic_template` (4710-5007): sema now stashes the
+    /// stash.  Sema stashes the
     /// owner's concrete type args on the call (resolve_static_method_return_via_template
     /// -> stash_static_owner_bindings), so this just instantiates the owner, enqueues
     /// it (the worklist drain materializes + DI-registers its methods), and pins the
@@ -1212,7 +1201,7 @@ type struct MonoCallSpecializer {
         // handled by the owner-only path below (its stash is the OWNER's type args,
         // and the owner drain materializes its body).  A generic method
         // (`Wrap<A>::make<T>`) needs its OWN `<T>` specialized within the owner
-        // spec — the stash is the METHOD's `<T>`; owner args come from the scope
+        // spec - the stash is the METHOD's `<T>`; owner args come from the scope
         // turbofish or template defaults.
         const empty_methods: MethodNode*[] = [];
         mut methods: &MethodNode*[] = &empty_methods;
@@ -1277,7 +1266,7 @@ type struct MonoCallSpecializer {
     /// Specialize a call to a GENERIC static method on a GENERIC owner
     /// (`Wrap<A>::make<T>(item)`).  The owner spec is materialized (via the
     /// scope turbofish / template defaults) and the method's OWN `<T>` (sema's
-    /// stash) is specialized WITHIN that owner spec — exactly how an instance
+    /// stash) is specialized WITHIN that owner spec - exactly how an instance
     /// generic method (`push<T>`) is handled, with the owner-default instantiation
     /// standing in for the receiver.  Returns true when the call is claimed.  On
     /// the first walk the owner spec entry does not exist yet: the owner is
@@ -1349,7 +1338,7 @@ type struct MonoCallSpecializer {
     }
 
     /// Re-point a local whose annotation is the BARE owner name (`mut s: String`
-    /// in a generic-static-method body) at the concrete owner spec — both the
+    /// in a generic-static-method body) at the concrete owner spec - both the
     /// annotation NAME (so the post-mono sema pass resolves it to the spec, not the
     /// bare template) and the cached `resolved_type`.  Only fires inside the
     /// generic-static-method body re-walk (`gsm_owner_*` set).  Mirrors the
@@ -1414,7 +1403,7 @@ type struct MonoCallSpecializer {
 
         // A `-> Owner` (bare-template) return substitutes to the still-bare owner
         // template (0-field layout), while the body constructs the concrete owner
-        // spec — an ABI mismatch that returns garbage (and trips E0200 in the
+        // spec - an ABI mismatch that returns garbage (and trips E0200 in the
         // post-mono sema pass).  Remap a bare-owner return to the concrete owner
         // spec, matching how a NON-generic sibling (`Wrap::base`) resolves.  Done
         // BEFORE the `$MG`/mangle step so the emitted symbol carries the right
@@ -1426,8 +1415,8 @@ type struct MonoCallSpecializer {
         }
 
         // Stamp the concrete method type args so the spec's mangled symbol carries
-        // the `$MG…` disambiguator (two specs whose signature doesn't mention the
-        // method param — `make<i32>` vs `make<boolean>` returning the owner — would
+        // the `$MG...` disambiguator (two specs whose signature doesn't mention the
+        // method param - `make<i32>` vs `make<boolean>` returning the owner - would
         // otherwise mangle identically and collapse onto the first emitted spec).
         mut spec_args_owned: TypeRef[] = [];
         for (mut i: i64 = 0; i < method_binds.length; i++) { spec_args_owned.push(method_binds[i]); }
@@ -1472,7 +1461,7 @@ type struct MonoCallSpecializer {
         this.state.mark_method_spec(spec_sym);
 
         // Route the spec'd method onto the owner spec entry's AST so codegen emits
-        // it (the generic template AST is skipped by codegen — generic_params > 0).
+        // it (the generic template AST is skipped by codegen - generic_params > 0).
         if (owner_ast.kind == NodeKind::StructDeclaration) {
             (owner_ast as StructDeclNode*).methods.push(spec_method);
         } else if (owner_ast.kind == NodeKind::UnionDeclaration) {
@@ -1515,7 +1504,7 @@ type struct MonoCallSpecializer {
     }
 
 
-    // -- Method-lookup ladder (LOOKUP, not inference; ported verbatim) --
+    // -- Method-lookup ladder (LOOKUP, not inference) --
 
     /// Spec'd struct/class own `methods[]` lookup for an inline generic method
     /// (e.g. `NonNull<u8>::cast<U>`).  Two-step fallback when no spec entry exists:
@@ -1639,11 +1628,11 @@ type struct MonoCallSpecializer {
     /// `instantiated_cache`/`resolved_type`) by matching it STRUCTURALLY against a
     /// materialized spec entry's instantiated type.  TypeID identity is not logical
     /// identity across the pre-/post-mono boundary (see
-    /// `TypeArena::propagate_instantiated_resolution`), so display-equality — not id
-    /// equality — is the correct key.  Invalid when no materialized spec matches.
+    /// `TypeArena::propagate_instantiated_resolution`), so display-equality - not id
+    /// equality - is the correct key.  Invalid when no materialized spec matches.
     /// If `recv_type` is a bare generic-template struct/class (every type param has a
     /// default), build its DEFAULT instantiation and return the materialized spec's
-    /// concrete type — so a generic-method call on the bare template pins/emits under
+    /// concrete type - so a generic-method call on the bare template pins/emits under
     /// the same spec as in-source `String<GlobalAlloc>` receivers.  Returns
     /// `recv_type` unchanged when it isn't a defaultable template or no spec for the
     /// default instantiation has been materialized.
@@ -1799,7 +1788,7 @@ type struct MonoCallSpecializer {
             }
             if (q_first_m != null) { *out_impl = q_first_impl; return q_first_m; }
         }
-        // Pass 2: bare-name fallback (original behavior — single-impl programs,
+        // Pass 2: bare-name fallback (original behavior - single-impl programs,
         // and impls whose qualified target is unavailable).
         mut first_m: MethodNode* = null;
         mut first_impl: ImplBlockNode* = null;
@@ -1895,7 +1884,7 @@ type struct MonoCallSpecializer {
     }
 
 
-    // -- The spec CORE: clone + substitute + re-resolve (deinferenced) --
+    // -- The spec CORE: clone + substitute + re-resolve --
 
     /// Clone a generic method's func, substitute its own generic params with `args`,
     /// clear generic_params, and re-resolve the signature against the owner type.
@@ -2057,7 +2046,7 @@ type struct MonoCallSpecializer {
         // -> `NonNull<U>`) triggers monomorphization of the referenced generic.
         // The type-spec path does this in `resolve_func_and_body`; the method-call
         // path is the equivalent producer for generic instance/static methods, so
-        // it must request the same discovery — otherwise the return-type
+        // it must request the same discovery - otherwise the return-type
         // instantiation is created (by sema/substitution) but never resolved.
         //
         // Reset `nested_visited` first: it is a shared cycle-detection set whose
@@ -2065,7 +2054,7 @@ type struct MonoCallSpecializer {
         // caller to clear it before each top-level traversal. Without this, stale
         // TypeIDs left over from an earlier drain step cause this method's return/
         // param instantiations to be silently skipped (order-dependent miscompile
-        // → unresolved InstantiatedType → E0636/null-operand). One reset for the
+        // -> unresolved InstantiatedType -> E0636/null-operand). One reset for the
         // whole signature is intentional: it dedupes a type referenced by both the
         // return type and a parameter to a single request.
         this.state.nested_visited = [];

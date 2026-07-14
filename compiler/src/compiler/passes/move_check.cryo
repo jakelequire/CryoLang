@@ -332,7 +332,7 @@ type struct MoveChecker {
     /// truncates back to that length, dropping any moves recorded in
     /// the bracketed region. Used to scope branch state: an if-body
     /// that moves a binding shouldn't leak that move into post-if
-    /// code (Phase 1 doesn't yet model partial-move joins).
+    /// code (partial-move joins aren't yet modeled).
     snapshot_moves(&this) -> i64 {
         return this.moved_keys.length;
     }
@@ -700,12 +700,12 @@ type struct MoveChecker {
                 this.merge_branches(if_branches);
             }
             NodeKind::MatchStatement => {
-                // Previously unhandled: moves inside match arms were invisible,
-                // so a double-move within one arm (or a move in an arm reused
-                // after the match) silently double-freed at runtime. Read the
-                // subject once, then merge the arm bodies like if/else
-                // branches. Sema guarantees exhaustiveness, so there is no
-                // implicit live fall-through arm.
+                // Moves inside match arms must be tracked, or a double-move
+                // within one arm (or a move in an arm reused after the match)
+                // would silently double-free at runtime. Read the subject once,
+                // then merge the arm bodies like if/else branches. Sema
+                // guarantees exhaustiveness, so there is no implicit live
+                // fall-through arm.
                 const m: MatchStmtNode* = stmt as MatchStmtNode*;
                 if (m.subject != null) { this.walk_expr_read(m.subject); }
                 // Register every arm's payload bindings as pattern-bound owned
@@ -759,10 +759,10 @@ type struct MoveChecker {
                 this.walk_loop_body(lp.body);
             }
             NodeKind::SwitchStatement => {
-                // Previously unhandled (the `_ => {}` arm): moves inside switch
-                // case bodies were invisible, so a double-move within one case -
-                // or a move in a case reused after the switch - silently double-
-                // freed/used-after-free at runtime. Cryo's switch has no
+                // Moves inside switch case bodies must be tracked, or a
+                // double-move within one case - or a move in a case reused after
+                // the switch - would silently double-free/use-after-free at
+                // runtime. Cryo's switch has no
                 // fallthrough (each case is an independent block), so cases are
                 // mutually-exclusive branches like match arms: read the subject
                 // once, then merge the case bodies. The subject is always a Copy
@@ -1158,11 +1158,11 @@ type struct MoveChecker {
         //     context (real=true) so a later use reports use-after-move and a
         //     loop-carried reuse - a guaranteed double free - is a hard error.
         // This mirrors drop_insertion::read_call so both passes agree on which
-        // arguments transfer ownership; an earlier mismatch (move_check saw a
-        // borrow, drop_insertion saw a move) silently double-freed by-value
-        // owning arguments.  The `autoref` gate is what keeps this precise:
-        // walking every argument as a move (the old behavior) recorded
-        // spurious moves on borrows.  Copy args and explicit `&x`/pointer args
+        // arguments transfer ownership; a mismatch (move_check seeing a borrow,
+        // drop_insertion a move) would silently double-free by-value owning
+        // arguments.  The `autoref` gate is what keeps this precise: walking
+        // every argument as a move would record spurious moves on borrows.
+        // Copy args and explicit `&x`/pointer args
         // fall out via the Copy / address-of guards in `walk_expr_move`.
         // Only a by-value argument whose type actually needs drop can
         // double-free on reuse; tracking non-droppable by-value args (e.g.
@@ -1402,7 +1402,7 @@ type struct MoveChecker {
         const id: IdentifierNode* = ma.object as IdentifierNode*;
         // Must be a real `let`/param local (in the types map); pattern payload
         // bindings are excluded (their subject-glue-suppression is whole-payload
-        // only - see the handoff), so their field moves stay rejected.
+        // only), so their field moves stay rejected.
         const decl_ty: TypeRef = this.lookup_type(id.name);
         if (!decl_ty.is_valid()) { return false; }
         if (this.is_pat_binding(id.name.id)) { return false; }

@@ -20,11 +20,11 @@ function new_box_holds_value() -> Result<(), TestError> {
     return Result::Ok(());
 }
 
-// Regression for the audit finding that a generic constructor pinned its
-// owner's type parameter from an integer LITERAL's i32 default, ignoring the
-// declared `Box<i64>`. `Box::new(1234567890123)` monomorphized `Box<i32>`,
-// allocated 4 bytes, and stored the literal truncated to its low 32 bits
-// (1912276171). Mono now recovers `T = i64` from the expected `Box<i64>`
+// Guards against a generic constructor pinning its owner's type parameter
+// from an integer LITERAL's i32 default, ignoring the declared `Box<i64>`:
+// that would monomorphize `Box::new(1234567890123)` to `Box<i32>`,
+// allocate 4 bytes, and store the literal truncated to its low 32 bits
+// (1912276171). Mono recovers `T = i64` from the expected `Box<i64>`
 // (return-type-driven inference) so the full 8-byte value round-trips.
 ![test]
 function box_i64_preserves_wide_literal() -> Result<(), TestError> {
@@ -102,9 +102,9 @@ function box_holds_struct_by_value() -> Result<(), TestError> {
 // Pointee-drop test
 //
 // A `Wrapper` type whose `drop` writes a sentinel (99) through a raw pointer
-// proves that Box::drop now calls T's destructor before freeing the memory.
-// Before the fix, the sentinel was never written because Box::drop bypassed
-// the pointee's Drop impl.
+// proves that Box::drop calls T's destructor before freeing the memory. If
+// Box::drop bypassed the pointee's Drop impl, the sentinel would never be
+// written.
 // ============================================================================
 
 type struct Wrapper {
@@ -145,10 +145,10 @@ type struct InlineDropBox {
     drop(mut &this) -> void { *this.counter_ptr = *this.counter_ptr + 1; }
 }
 
-// C3 regression: a payload whose destructor is an inline `drop` method
-// must satisfy Box's `where T: Drop`, so `Box<InlineDropBox>`
-// instantiates and runs the inner drop. Previously this failed with
-// `E0636: no method 'drop' found` at codegen.
+// A payload whose destructor is an inline `drop` method must satisfy
+// Box's `where T: Drop`, so `Box<InlineDropBox>` instantiates and runs
+// the inner drop (without this, `E0636: no method 'drop' found` would
+// fire at codegen).
 ![test]
 function box_inline_drop_payload_compiles_and_drops() -> Result<(), TestError> {
     mut count: i32 = 0;
@@ -156,9 +156,3 @@ function box_inline_drop_payload_compiles_and_drops() -> Result<(), TestError> {
     b.drop();
     return expect_eq(count, 1);
 }
-
-// Historical note: this file used to assert that double-`.drop()`
-// on a Box handle was a runtime-idempotent no-op.  Idempotency at
-// the implementation level is still true, but as of 2026-05-26 the
-// move-checker rejects double `.drop()` on the same binding at
-// compile time (E0452).  See `tests/tests/negative/E0452_double_drop.cryo`.

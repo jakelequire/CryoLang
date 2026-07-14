@@ -2,7 +2,7 @@
 
 Cryo ships a built-in unit-test framework (`std::test`) and a first-class
 `cryo test` runner. There are no external harnesses, no shell glue, and no
-third-party dependencies — the compiler discovers tests, synthesizes a test
+third-party dependencies - the compiler discovers tests, synthesizes a test
 `main`, and the runner executes each test in an isolated child process.
 
 This document is the canonical reference for the test surface. The framework
@@ -39,7 +39,7 @@ The compiler suppresses the project's real `main` during a test build and
 synthesizes a runner main that drives every discovered `![test]` function
 through `std::test::runner::run_all`.
 
-`std::test` is **not** in the prelude — test files import what they need
+`std::test` is **not** in the prelude - test files import what they need
 explicitly (`import std::test::*;`).
 
 ---
@@ -70,8 +70,8 @@ Each assertion returns a `Result<(), TestError>`; propagate failures with the
 
 ### Annotations
 
-- `![ignore]` — the test is skipped unless `cryo test --ignored` is passed.
-- `![should_panic]` — the test passes **only** if its body panics or returns
+- `![ignore]` - the test is skipped unless `cryo test --ignored` is passed.
+- `![should_panic]` - the test passes **only** if its body panics or returns
   `Err`; a clean `Ok` exit is reported as a failure.
 
 ```cryo
@@ -85,7 +85,7 @@ function rejects_out_of_range() -> Result<(), TestError> {
 
 ### Fixtures (`std::test::fixture`)
 
-A **fixture** is a resource a test sets up and tears down — a temp directory, a
+A **fixture** is a resource a test sets up and tears down - a temp directory, a
 seeded RNG, a probe allocator, a socket. The `Fixture` trait standardizes the
 setup half; the value's `Drop` impl is the teardown:
 
@@ -95,8 +95,8 @@ type trait Fixture {
 }
 ```
 
-Cryo runs drop glue on **every** scope exit — the success path and the
-early-return paths that `?` and `return Err(...)` take — so a fixture bound as a
+Cryo runs drop glue on **every** scope exit - the success path and the
+early-return paths that `?` and `return Err(...)` take - so a fixture bound as a
 local is torn down on success *and* on assertion failure, with no per-test
 cleanup code. (A hard process abort/panic is the one path `Drop` cannot cover;
 there the OS reclaims everything.)
@@ -127,11 +127,11 @@ function writes_then_reads() -> Result<(), TestError> {
 }
 ```
 
-This is plain RAII — no closures — so the body calls `expect_*` directly. Cryo
+This is plain RAII - no closures - so the body calls `expect_*` directly. Cryo
 v1.0 does not provide a `with_fixture(|f| ...)` closure combinator: a closure
 passed to a generic helper cannot call the generic `expect_*` assertions, which
 would make such a combinator unusable for real tests. The trait still earns its
-place — it names the convention and is the dispatch point a future
+place - it names the convention and is the dispatch point a future
 `![test(fixture = T)]` directive would call.
 
 > The `Fixture` *trait* (a code-level setup/teardown concept) is unrelated to the
@@ -174,13 +174,13 @@ Use `prefix_named_case(label, e)` instead when the rows carry their own names
 the index prefix identifies *which* row failed, but a row that aborts takes the
 group down and the group shares one timeout. For cases that must be isolated,
 give each its own `![test]` function, or use a separate multi-module project
-(§7).
+(section 7).
 
 ---
 
 ## 3. Isolation model
 
-Each test runs in **its own child process** — `fork` on POSIX, a
+Each test runs in **its own child process** - `fork` on POSIX, a
 `CreateProcessA` re-exec on Windows. A panic, abort, or crash in one test
 cannot corrupt or take down any other. Cryo has no in-process panic catch
 (`setjmp`/`longjmp`), so process isolation is the simplest correct option.
@@ -221,13 +221,13 @@ that `cryo test` suppresses.
 
 ```
 my-project/
-├── cryoconfig
-├── src/
-│   └── main.cryo          # real entry point (suppressed under `cryo test`)
-└── tests/
-    ├── math.cryo          # ![config(testing)] + ![test] functions
-    ├── negative/          # optional compile-fail tests (see §6)
-    └── projects/          # optional multi-module test projects (see §7)
++-- cryoconfig
++-- src/
+|   +-- main.cryo          # real entry point (suppressed under `cryo test`)
++-- tests/
+    +-- math.cryo          # ![config(testing)] + ![test] functions
+    +-- negative/          # optional compile-fail tests (see section 6)
+    +-- projects/          # optional multi-module test projects (see section 7)
 ```
 
 An optional `[test]` section in `cryoconfig` sets defaults:
@@ -247,7 +247,7 @@ environment variables.
 ## 6. Compile-fail (negative) tests
 
 Negative tests assert that the compiler **rejects** a program with a specific
-diagnostic. They are not `![test]` functions — they are standalone files under
+diagnostic. They are not `![test]` functions - they are standalone files under
 `tests/negative/`, each carrying `![config(negative, <CODE>)]` (plus the usual
 `![config(testing)]`):
 
@@ -268,7 +268,7 @@ files are intentionally malformed), then compiles each file on its own via
 `cryo check <file>` and asserts the build fails with the declared code.
 Results appear in the normal `cryo test` output under `compile-fail result:`.
 
-A case fails the suite — honestly, as a red test — if the file compiles
+A case fails the suite - honestly, as a red test - if the file compiles
 cleanly or emits a different code. Name each file after the code it asserts
 (`E0214_free_function.cryo`) and use collision-proof identifiers (e.g. a `cf_`
 prefix) so a snippet can't shadow a stdlib symbol.
@@ -278,20 +278,20 @@ prefix) so a snippet can't shadow a stdlib symbol.
 ## 7. Multi-module test projects
 
 A single `![test]` file is one compilation unit. When you need to test something
-that spans **several cooperating modules** — FFI/C-interop with real link
+that spans **several cooperating modules** - FFI/C-interop with real link
 config, the module system itself (cross-module imports, visibility), or a
-realistic end-to-end program — write a **multi-module test project**: a real
+realistic end-to-end program - write a **multi-module test project**: a real
 Cryo package living under `tests/projects/<name>/`, built through the normal
 package pipeline.
 
 ```
 tests/projects/
-└── my_feature/
-    ├── cryoconfig        # the BUILD config (link libs, C sources, deps, ...)
-    ├── test.json         # the TEST-HARNESS metadata (how to check the project)
-    └── src/
-        ├── main.cryo
-        └── lib.cryo
++-- my_feature/
+    +-- cryoconfig        # the BUILD config (link libs, C sources, deps, ...)
+    +-- test.json         # the TEST-HARNESS metadata (how to check the project)
+    +-- src/
+        +-- main.cryo
+        +-- lib.cryo
 ```
 
 A directory is recognized as a project by the presence of **`test.json`**.
@@ -300,19 +300,19 @@ subprocess to check it against its declared **outcome**. Projects report under a
 `projects` section in the normal `cryo test` output, and a project failure fails
 the overall run (non-zero exit).
 
-The two config files have distinct jobs — `cryoconfig` is the build (exactly as
+The two config files have distinct jobs - `cryoconfig` is the build (exactly as
 for any package: `[link]`, `[dependencies]`, target type), and `test.json` is
 *only* test-harness metadata:
 
 | `test.json` field | Meaning |
 | --- | --- |
-| `"outcome"` | `"collect"` (default) · `"compile_fail"` · `"run"` |
+| `"outcome"` | `"collect"` (default) / `"compile_fail"` / `"run"` |
 | `"ignore"` | `true` skips the project (reported as ignored) |
 | `"expect"` | per-outcome assertions (below) |
 
 ### Outcomes
 
-- **`collect`** — build the package and run *its own* `![test]` functions
+- **`collect`** - build the package and run *its own* `![test]` functions
   (its `tests/` dir, discovered exactly as for a top-level project). The project
   passes iff all of them pass. This is the common case: a multi-module package
   whose tests exercise cross-module behavior.
@@ -321,17 +321,17 @@ for any package: `[link]`, `[dependencies]`, target type), and `test.json` is
   { "outcome": "collect" }
   ```
 
-- **`compile_fail`** — the package must **fail** to compile. `cryo build` is run
+- **`compile_fail`** - the package must **fail** to compile. `cryo build` is run
   and the build must fail emitting `expect.diagnostic`. This is the
   project-granularity lift of the file-level `![config(negative, E0xxx)]`
-  mechanism (§6) — useful for negative tests of imports/visibility/resolution
+  mechanism (section 6) - useful for negative tests of imports/visibility/resolution
   that need more than one module.
 
   ```json
   { "outcome": "compile_fail", "expect": { "diagnostic": "E0200" } }
   ```
 
-- **`run`** — build *and run* the package's binary; assert the process exit code
+- **`run`** - build *and run* the package's binary; assert the process exit code
   (and, optionally, that its combined output contains a substring). The
   realistic-integration case.
 
@@ -340,14 +340,14 @@ for any package: `[link]`, `[dependencies]`, target type), and `test.json` is
   ```
 
 Each project is built and run as its own process tree, so a crash in one project
-can't take down the suite — the same isolation guarantee fork-per-test gives
-individual tests (§3). The `PATTERN` argument to `cryo test` filters projects by
+can't take down the suite - the same isolation guarantee fork-per-test gives
+individual tests (section 3). The `PATTERN` argument to `cryo test` filters projects by
 directory name just as it filters tests by name.
 
 > Why JSON rather than the INI `cryoconfig` format? `test.json` is read by the
 > standard library's own `std::json` parser, and keeping test metadata in a
 > separate file leaves `cryoconfig` to mean exactly what it means for every
-> other package — the build.
+> other package - the build.
 
 ---
 

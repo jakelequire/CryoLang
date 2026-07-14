@@ -3,12 +3,11 @@
 // the payload binding is a by-value owned place, so the source's
 // scope-exit drop glue frees the moved field a second time.
 //
-// Regression for the partial-field-move double-free that slipped through
-// when the source was a pattern binding: move_check registered `let`
-// locals but NOT match-arm payload bindings, so `is_owned_value_place`
-// returned false for them and `check_field_move_out` was silently
-// skipped - the field-move-out into the consuming call argument compiled
-// and double-freed at runtime (surfaced as an infinite-recursion crash in
+// Regression test: move_check must register match-arm payload bindings as
+// owned value places, the same as `let` locals - if `is_owned_value_place`
+// returns false for them, `check_field_move_out` is silently skipped and
+// the field-move-out into the consuming call argument would compile and
+// double-free at runtime (this surfaced as an infinite-recursion crash in
 // the LSP's JSON-RPC encoder cloning the resulting cyclic WorkspaceEdit).
 // The escape hatch is the same: `core::mem::swap`, or restructure so the
 // field is not moved out of the still-live aggregate.
@@ -50,13 +49,13 @@ function main() -> int {
     // consuming `take(...)` argument double-frees at `owner`'s scope exit.
     //
     // The subject is an INLINE-constructed generic-enum literal
-    // (`match (Option::Some(make()))`).  Sema infers a non-concrete
-    // `Option<T>` for such a subject, which used to leave the binding's field
-    // type an unresolved generic param and hide this move from move-check (a
-    // silent double-free).  The fix makes a Drop-owning inline variant-
-    // constructor subject resolve to the concrete `Option<Holder>`
-    // (call_resolver's `infer_variant_instantiation`), so the field's `Drop`
-    // is visible and this is correctly rejected.
+    // (`match (Option::Some(make()))`).  For such a subject, sema must
+    // resolve a Drop-owning inline variant-constructor subject to the
+    // concrete `Option<Holder>` (call_resolver's `infer_variant_instantiation`),
+    // not an unresolved generic param - otherwise the binding's field type
+    // hides this move from move-check (a silent double-free). With the
+    // concrete type, the field's `Drop` is visible and this is correctly
+    // rejected.
     match (Option::Some(make())) {
         Option::Some(owner) => {
             take(owner.h);   // error[E0453]: cannot move field 'h' out of a value that owns a destructor

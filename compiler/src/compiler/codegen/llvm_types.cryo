@@ -272,7 +272,7 @@ type struct LModule {
     /// that referenced the bare name as an undefined external (the real
     /// definition gets the suffixed name).  Generic specializations in
     /// particular flow through codegen many times per requesting module,
-    /// so duplicate-add was producing thousands of `.N`-renamed declares
+    /// so a duplicate-add would produce thousands of `.N`-renamed declares
     /// per module.
     add_function(&this, name: string, fn_type: LType) -> LValue {
         const existing: void* = llvm::LLVMGetNamedFunction(this.raw, name);
@@ -295,7 +295,7 @@ type struct LModule {
 /// (`instance.cryo`) so the ~385 MiB of LLVM type tables a single target
 /// produces are reclaimed at the target boundary instead of stacking across
 /// the lib+bin builds in the never-disposed global context.  Single-threaded
-/// compiler → a module-level global needs no synchronisation (same argument
+/// compiler -> a module-level global needs no synchronisation (same argument
 /// as `g_ast_arena` / `g_shared_type_cache`).
 mut g_codegen_context: void* = null;
 
@@ -314,9 +314,9 @@ type struct LContext {
     /// published (`g_codegen_context`, set by the driver around each target's
     /// pipeline) every leaf type/module/builder factory routes through it, so
     /// disposing that one context at the target boundary reclaims all of the
-    /// target's LLVM type tables + named structs (~385 MiB) — the LLVM-side
+    /// target's LLVM type tables + named structs (~385 MiB) - the LLVM-side
     /// analogue of the per-target arena.  Null => the real global context, so
-    /// non-project paths (compile_raw / frontend-only) behave exactly as before.
+    /// non-project paths (compile_raw / frontend-only) are unaffected.
     static current() -> LContext {
         if (g_codegen_context != null) {
             return LContext { raw: g_codegen_context };
@@ -340,7 +340,7 @@ type struct LContext {
     }
 }
 
-// Per-target codegen context lifecycle (Stage 4: cap LLVM-side memory).
+// Per-target codegen context lifecycle (caps LLVM-side memory).
 // Called by the driver (instance.cryo) around each target's pipeline,
 // mirroring the per-target arena's set-active / reset.
 
@@ -355,7 +355,7 @@ public function set_codegen_context_new() -> void {
 
 /// Dispose the per-target codegen context and fall back to the global one.
 /// Frees every LLVM type/named-struct/module created for this target in one
-/// shot — the LLVM analogue of the arena reset.  No-op when unset.  Safe to
+/// shot - the LLVM analogue of the arena reset.  No-op when unset.  Safe to
 /// call after the per-module `LLVMDisposeModule`s: those detach their modules
 /// from the context first, and `LLVMContextDispose` reclaims anything left.
 public function dispose_codegen_context() -> void {
@@ -382,7 +382,7 @@ public function current_codegen_context() -> void* {
 }
 
 /// Parallel-codegen: drop the global's pointer WITHOUT disposing.  Used after
-/// the last emit batch has joined — every per-module context was already
+/// the last emit batch has joined - every per-module context was already
 /// disposed by its worker, so the dangling global must be nulled (not freed)
 /// before the target-end `dispose_codegen_context` runs, or it double-frees.
 public function clear_codegen_context_ptr() -> void {
@@ -1011,7 +1011,7 @@ type struct LType {
         // shared across every module's supposedly-isolated context.  Emitting
         // two such modules concurrently then races that shared constant's
         // use-list (heap corruption inside LLVM).  `InContext` keeps every
-        // constant private to its module — the invariant parallel emit needs.
+        // constant private to its module - the invariant parallel emit needs.
         return LValue { raw: llvm::LLVMConstStructInContext(
             LContext::current().raw, values, count, packed as i32) };
     }
@@ -1049,12 +1049,12 @@ type struct LBasicBlock {
     static append(fn: LValue, name: string) -> LBasicBlock {
         // MUST append in the current per-module context.  The context-less
         // `LLVMAppendBasicBlock` is `LLVMAppendBasicBlockInContext(
-        // LLVMGetGlobalContext(), ...)` under the hood, which mints the block —
-        // and its `label` type plus the `void` terminators built into it — in
+        // LLVMGetGlobalContext(), ...)` under the hood, which mints the block - 
+        // and its `label` type plus the `void` terminators built into it - in
         // the process-global context, shared across every module's private
         // context.  Two such modules emitting concurrently then race that shared
         // type's use-list (heap corruption inside LLVM).  `InContext` keeps every
-        // block private to its module — the last leak that blocked zero-copy
+        // block private to its module - the last leak that blocked zero-copy
         // threaded emit.
         return LBasicBlock { raw: llvm::LLVMAppendBasicBlockInContext(
             LContext::current().raw, fn.raw, name) };
@@ -1145,7 +1145,7 @@ type struct LTargetMachine {
         mut effective: string = triple;
         if (triple == "" || triple.length() == 0) {
             // Go through `get_default_triple`, not the raw LLVM API, so the
-            // Windows msvc→gnu coercion applies here too (otherwise a caller
+            // Windows msvc->gnu coercion applies here too (otherwise a caller
             // passing "" on Windows would get the raw `windows-msvc` triple
             // and emit MSVC-style code the mingw linker can't resolve).
             effective = LTargetMachine::get_default_triple();
@@ -1155,11 +1155,11 @@ type struct LTargetMachine {
 
         // Register the backend here rather than trusting the caller.  LLVM's
         // target registry is per-process and starts EMPTY, and this is the one
-        // chokepoint every target machine is created through — so a caller that
+        // chokepoint every target machine is created through - so a caller that
         // reaches codegen's `init_native_target` first is merely the common
         // case, not a guarantee.  It is NOT one: an incremental build whose
         // modules are all cached codegens nothing (that is where
-        // `init_native_target` used to run) yet still proceeds to link and, in
+        // `init_native_target` normally runs) yet still proceeds to link and, in
         // test mode, to test-main synthesis, which lands here.  The registry is
         // then empty and `LLVMGetTargetFromTriple` fails with "no targets are
         // registered", surfacing as E0900 "native target machine unavailable"
@@ -1207,7 +1207,7 @@ type struct LTargetMachine {
             Option::Some(v) => {
                 // Move the owned value into a local so it drops cleanly on every
                 // exit (including the early `return true`); a borrowed cstr view
-                // drives the scan. No leak — unlike a boundary `into_raw`.
+                // drives the scan. No leak - unlike a boundary `into_raw`.
                 mut s: String = v;
                 const path: string = s.as_cstr() as string;
                 const len: i64 = path.length() as i64;
@@ -1254,17 +1254,17 @@ type struct LTargetMachine {
     /// `clang+llvm-*-x86_64-pc-windows-msvc` release (see
     /// `scripts/fetch-windows-llvm.sh`), so `LLVMGetDefaultTargetTriple`
     /// reports `x86_64-pc-windows-msvc`.  But code emitted for the MSVC ABI
-    /// cannot be linked by mingw — the most visible mismatch is the stack-probe
+    /// cannot be linked by mingw - the most visible mismatch is the stack-probe
     /// symbol: MSVC emits `__chkstk` while mingw provides `___chkstk_ms`, so a
     /// mingw `cryo build` of MSVC-ABI code fails with `undefined reference to
     /// __chkstk`.  So when LLVM reports msvc we pick the ABI from the linker
     /// that is actually on `PATH`, rather than assuming one:
-    ///   - an mingw `gcc` present → `x86_64-pc-windows-gnu` (the only link path
+    ///   - an mingw `gcc` present -> `x86_64-pc-windows-gnu` (the only link path
     ///     the port supports today; preferred when both are installed);
-    ///   - else an MSVC linker (`lld-link`/`link.exe`) present → keep the
+    ///   - else an MSVC linker (`lld-link`/`link.exe`) present -> keep the
     ///     `windows-msvc` triple, so codegen emits MSVC-ABI objects for the
     ///     user's own toolchain to link;
-    ///   - else → `x86_64-pc-windows-gnu` (mingw is the default we ship for).
+    ///   - else -> `x86_64-pc-windows-gnu` (mingw is the default we ship for).
     /// The probe runs once per process and is cached.  An explicit `--target=`
     /// bypasses all of this (see `resolve_effective_triple`).
     ![target(unix)]

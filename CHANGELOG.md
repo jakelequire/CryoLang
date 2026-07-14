@@ -30,20 +30,20 @@ is written entirely in Cryo, and the public surface is frozen under semver.
 - **Associated types.** A trait may declare an associated type
   (`type Item;`) and refer to it by projection (`This::Item` inside the trait,
   `I::Item` off a generic parameter). Each impl binds it positionally
-  (`implement trait Iterator<i32> for X` — sugar for `Iterator<Item = i32>`,
+  (`implement trait Iterator<i32> for X` - sugar for `Iterator<Item = i32>`,
   available when the trait has no generic params of its own) or with the
   explicit body form (`type Item = i32;`). Two diagnostics enforce the binding
   rules: `E0309` (a declared associated type left unbound by an impl) and
   `E0310` (an associated type bound positionally on a trait that also has
-  generic params — use the explicit body form `type Out = …;` instead).
+  generic params - use the explicit body form `type Out = ...;` instead).
   Declaration-site bounds on an associated type (`type Item: Copy;`) are
   enforced against each impl's concrete binding (`E0306`). Opaque `implement Iterator<T>`
   bindings now cross-check `<T>` against the iterator's actual `Item` (`E0200`
-  on a category-level mismatch). See [`docs/cryo.md` §11.5](./docs/cryo.md#115-associated-types).
+  on a category-level mismatch). See [`docs/cryo.md` section 11.5](./docs/cryo.md#115-associated-types).
 - **Classes:** single-inheritance with virtual dispatch, destructors,
   `protected`/`private` visibility, `override` and `virtual` modifiers.
 - **Enums:** algebraic enums with explicit discriminants and discriminant
-  base type (`type enum X : u8 { … }`), exhaustive match enforcement on
+  base type (`type enum X : u8 { ... }`), exhaustive match enforcement on
   enum subjects.
 - **Pattern matching:** literal, identifier-binding, wildcard,
   enum-destructure (including nested sub-patterns such as `Some(Some(n))`
@@ -102,8 +102,8 @@ is written entirely in Cryo, and the public surface is frozen under semver.
 ### Build system
 
 - **New build-directory layout.** The final artifact is **hoisted** to the
-  **root** of the build directory — `build/<name>` for an executable,
-  `build/lib<name>.a` for a library — so it runs as `build/<name>` regardless of
+  **root** of the build directory - `build/<name>` for an executable,
+  `build/lib<name>.a` for a library - so it runs as `build/<name>` regardless of
   profile. All intermediates live under a visible, per-profile cache tree
   (`build/target/<profile>/`) grouped by **package origin**: the standard
   library (`std/`), the local project (`local/`), and one subtree per
@@ -232,7 +232,7 @@ is written entirely in Cryo, and the public surface is frozen under semver.
 
 ### Diagnostics
 
-- Over 200 defined error codes (in the E0000–E0999 range) with source-span
+- Over 200 defined error codes (in the E0000-E0999 range) with source-span
   underlines, fix suggestions, and machine-applicable quickfixes where applicable.
 - ANSI color rendering respecting `NO_COLOR`/`FORCE_COLOR`/`CLICOLOR_FORCE`
   with `isatty(2)` fallback.
@@ -251,16 +251,16 @@ stdin-driven interactive I/O, capturing closures, and OS threads with
 
 ### Target triples
 
-Verified end-to-end — compile, link, run, and a self-host byte-identity gate
-(`make selfhost-check`) — on x86_64:
+Verified end-to-end - compile, link, run, and a self-host byte-identity gate
+(`make selfhost-check`) - on x86_64:
 
-- **`x86_64-*-linux-gnu`** — native host builds; the canonical dev/CI host.
-- **`x86_64-pc-windows-gnu`** — native Windows host builds *and*
-  Linux→Windows cross-compilation via the mingw-w64 toolchain: Win64 ABI,
+- **`x86_64-*-linux-gnu`** - native host builds; the canonical dev/CI host.
+- **`x86_64-pc-windows-gnu`** - native Windows host builds *and*
+  Linux->Windows cross-compilation via the mingw-w64 toolchain: Win64 ABI,
   COFF objects, `.exe` linking, and a native 6-stage self-host fixed point.
 
 The host C toolchain (header preprocessor + linker) is auto-detected
-(`clang-20` → `clang` → `gcc` → `cc`) and the standard library is auto-located
+(`clang-20` -> `clang` -> `gcc` -> `cc`) and the standard library is auto-located
 relative to the `cryo` binary, so a stock toolchain needs neither `CRYO_CC`
 nor `CRYO_STDLIB`.
 
@@ -268,7 +268,7 @@ nor `CRYO_STDLIB`.
 
 These are not bugs against 1.0 - the language deliberately ships
 without them and the grammar reserves the relevant syntax. See
-[`docs/cryo.md` § 21](./docs/cryo.md#21-reserved-syntax) for the
+[`docs/cryo.md` section 21](./docs/cryo.md#21-reserved-syntax) for the
 authoritative list.
 
 - Async / await / coroutines.

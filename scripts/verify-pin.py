@@ -10,7 +10,7 @@ confusing downstream build failure. This script is the cheap gate.
 For each pin it:
   1. recomputes sha256(binary) and compares it to the sidecar's `sha256:`,
   2. (optional, --require-clean) asserts the sidecar recorded `worktree: clean`,
-     which is what a *release* pin must look like (see M12 — pins built from a
+     which is what a *release* pin must look like (see M12 - pins built from a
      dirty worktree are not reproducible from any commit).
 
 A pin whose binary is absent is skipped with a note (a Linux-only checkout

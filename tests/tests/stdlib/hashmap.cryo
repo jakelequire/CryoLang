@@ -158,13 +158,12 @@ function remove_missing_returns_none() -> Result<(), TestError> {
 }
 
 // ============================================================================
-// String keys - the historical breakage that drove the Pair migration
+// String keys hash/compare by value, not by pointer
 //
-// Once upon a time, `utils::Map<string, V>` was indexed by raw pointer
-// equality, which silently misbehaved when two value-equal string
-// literals lived in different ROData slots.  `HashMap` routes through
-// `Hash + Eq for string` instead, so value-equal keys with different
-// pointers find each other.  These tests pin that contract.
+// Two value-equal string literals can live in different ROData slots, so a
+// raw-pointer-equality key comparison would silently misbehave.  `HashMap`
+// routes through `Hash + Eq for string` instead, so value-equal keys with
+// different pointers find each other.  These tests pin that contract.
 // ============================================================================
 
 ![test]
@@ -229,9 +228,9 @@ function string_keys_insert_replaces_existing() -> Result<(), TestError> {
 //
 // These tests pin the "cursor-remove" contract: after removing one key from
 // a map, every OTHER previously-inserted key must still be accessible.
-// The old `previous.next = node.next` remove implementation could silently
-// break the bucket chain when two keys shared a bucket (same bucket index),
-// making the surviving sibling unreachable.  The cursor rewrite fixes this.
+// A naive `previous.next = node.next` remove implementation can silently
+// break the bucket chain when two keys share a bucket (same bucket index),
+// making the surviving sibling unreachable.  Cursor-based removal avoids this.
 // ============================================================================
 
 ![test]
@@ -491,11 +490,10 @@ function iter_spans_multiple_buckets_after_resize() -> Result<(), TestError> {
     return expect_eq(value_sum, want_sum);
 }
 
-// A capacity hint above 2^63 used to hang `next_pow2` forever (the doubling
-// `p` wrapped past 2^63 to 0 and `0 < n` stayed true). It now saturates to
-// 2^63, so the bucket-array allocation overflows `Layout::try_array` and
-// `with_capacity` panics cleanly instead of spinning. (Pre-fix this test
-// would hang and be killed by the per-test watchdog, not panic.)
+// A capacity hint above 2^63 would hang `next_pow2` forever if the doubling
+// `p` wraps past 2^63 to 0 (making `0 < n` stay true). It saturates to
+// 2^63 instead, so the bucket-array allocation overflows `Layout::try_array`
+// and `with_capacity` panics cleanly instead of spinning.
 ![test]
 ![should_panic]
 function with_capacity_huge_hint_panics_not_hangs() -> Result<(), TestError> {

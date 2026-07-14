@@ -3,24 +3,22 @@
 /// Processes CImport extern blocks: `extern module name := "C" { #include ... }`.
 /// For each `#include`, libclang builds a real translation unit, and a cursor
 /// walk emits a FunctionDeclNode per top-level C function declaration into the
-/// ExternBlockNode — so downstream passes (name resolution, type resolution,
+/// ExternBlockNode - so downstream passes (name resolution, type resolution,
 /// codegen) treat them identically to hand-written extern functions.
 ///
-/// This replaces the former hand-rolled `clang -E -P` + byte-scanning parser
-/// (`passes/c_header_import.cryo`).  libclang preprocesses internally, so the
-/// `popen`/preprocessor-probe subprocess is gone; clang is now a hard
-/// dependency of C-import (the gcc/cc fallback no longer applies).
+/// libclang preprocesses internally, so clang is a hard dependency of
+/// C-import.
 ///
 /// `Importer` is a single stateful object: it carries both the static pass
 /// entry (`run` / `collect_from_tu` / path resolution) and the per-translation-
 /// unit emit state (alias, accumulators) with the emit logic as `mut &this`
 /// methods.  The libclang cursor visitors must be bare C function pointers, so
-/// they are `static` `visit_*` trampolines (no receiver — they match the C
+/// they are `static` `visit_*` trampolines (no receiver - they match the C
 /// callback signature) that cast their `client: void*` back to the live
 /// `Importer` and delegate to an instance method.  The same object is reused
 /// as the client data for the nested field/constant walks (the transient
 /// `field_cursors` / `cur_enum` / `cur_enum_int` targets), so no separate
-/// per-walk state structs are needed — libclang walks synchronously and the
+/// per-walk state structs are needed - libclang walks synchronously and the
 /// nested visitors never overlap.  A record's members are collected into
 /// `field_cursors` first (rather than emitted one-by-one) so a run of bitfields
 /// can be spanned by a single storage blob with look-ahead.
@@ -54,19 +52,19 @@ import std::fs::path;
 import std::env;
 
 /// A structured account of what a single translation unit's import could NOT
-/// translate faithfully — the honesty channel PLAN.md §3 requires.  Two buckets:
-/// `skipped` (a construct that produced NO binding — a function-like macro, a
+/// translate faithfully - the honesty channel.  Two buckets:
+/// `skipped` (a construct that produced NO binding - a function-like macro, a
 /// non-literal macro body) and `approximated` (a binding that round-trips by
-/// value but loses member access — a union, a bitfield run, an anonymous
+/// value but loses member access - a union, a bitfield run, an anonymous
 /// record member or field, lowered to an opaque storage blob).  Surfaced via
 /// `cdebug` today (so it only appears under `--debug`); the eventual `cryo
 /// vendor` generator will consume the same lists for its translation report.
 type struct ImportReport {
-    /// LOST: a construct we *could* bind but don't yet — real API surface the
+    /// LOST: a construct we *could* bind but don't yet - real API surface the
     /// import failed to translate.  This is the headline number.
     skipped:      string[];
     approximated: string[];
-    /// IGNORED: a `#define`/decl that is never bindable API in the first place —
+    /// IGNORED: a `#define`/decl that is never bindable API in the first place - 
     /// a header guard, a marker macro (`RLAPI`, `extern`), a function-like macro.
     /// Tracked so it doesn't inflate the "not bound" headline; surfaced as a
     /// single count line, with detail only under `--debug`.
@@ -77,14 +75,14 @@ type struct ImportReport {
     }
 
     /// Note a construct that yielded no binding at all but COULD be bound (lost
-    /// API) — the headline "not bound" bucket.
+    /// API) - the headline "not bound" bucket.
     skip(mut &this, line: string) -> void { this.skipped.push(line); }
 
     /// Note a binding emitted at reduced fidelity (layout-only, no field access).
     approx(mut &this, line: string) -> void { this.approximated.push(line); }
 
     /// Note a construct that is inherently not bindable API (header guard, marker
-    /// macro, function-like macro) — expected noise, kept out of the headline.
+    /// macro, function-like macro) - expected noise, kept out of the headline.
     ignore(mut &this, line: string) -> void { this.ignored.push(line); }
 
     /// Emit a per-translation-unit summary (no-op when nothing was lost, and
@@ -124,8 +122,8 @@ type struct ImportReport {
     }
 
     /// Print the user-facing translation report to stdout at `cryo vendor`
-    /// time (the honesty channel PLAN.md §3 requires: every unbindable or
-    /// approximated construct is listed, never silently dropped).  No-op when
+    /// time (the honesty channel: every unbindable or approximated construct
+    /// is listed, never silently dropped).  No-op when
     /// everything bound faithfully.
     summary_stdout(&this, label: string) -> void {
         if (this.skipped.length == 0 && this.approximated.length == 0
@@ -176,7 +174,7 @@ type struct Importer {
     cur_enum:       EnumDeclNode*;
     cur_enum_int:   CXType*;
     /// Transient per-NAMED-enum dup-value tracking.  C enums permit several
-    /// constants to share a value (deliberate aliases — e.g. SDL's
+    /// constants to share a value (deliberate aliases - e.g. SDL's
     /// `KMOD_RESERVED == KMOD_SCROLL`, `SDL_PIXELFORMAT_RGBA32 == ..._ABGR8888`),
     /// but a Cryo `type enum` requires unique discriminants.  The first constant
     /// for each value becomes the enum variant; a later same-valued constant is
@@ -289,7 +287,7 @@ type struct Importer {
     // ---- libclang visitor trampolines ----
     //
     // Handed to `clang_visitChildren` as bare C function pointers, so they are
-    // `static` (no `this` receiver — they must match the C callback signature
+    // `static` (no `this` receiver - they must match the C callback signature
     // `(CXCursor, CXCursor, void*) -> i32`).  Each casts its `client: void*`
     // back to the live `Importer` and delegates to an instance method.
 
@@ -349,7 +347,7 @@ type struct Importer {
         } else if (k == Clang::CURSOR_ENUM_DECL) {
             imp.emit_enum(cursor);
         } else if (k == Clang::CURSOR_MACRO_DEFINITION) {
-            // W1: defer — a macro can alias an enum constant, struct, or another
+            // W1: defer - a macro can alias an enum constant, struct, or another
             // macro that this walk hasn't reached yet (cursor order is not
             // guaranteed with a detailed-preprocessing-record TU), so it is
             // emitted only after every decl is bound.
@@ -359,7 +357,7 @@ type struct Importer {
     }
 
     /// Nested visitor: collect a record's layout-contributing children into
-    /// `field_cursors` — every FieldDecl, plus each anonymous struct/union MEMBER
+    /// `field_cursors` - every FieldDecl, plus each anonymous struct/union MEMBER
     /// (a nameless `union { ... };`, which carries storage but has no FieldDecl).
     /// A nameless record DEFINITION used by a following named field is NOT a
     /// member (its `is_anonymous_record_decl` is false) and is skipped here; the
@@ -379,7 +377,7 @@ type struct Importer {
 
     /// Nested visitor: collect a union/anon-record's FieldDecl members into
     /// `acc_members` (for reinterpret-accessor generation).  Anonymous
-    /// sub-records are ignored here — accessors only cover named members.
+    /// sub-records are ignored here - accessors only cover named members.
     static visit_collect_acc_member(cursor: CXCursor, parent: CXCursor, client: void*) -> i32 {
         if (Clang::clang_getCursorKind(cursor) == Clang::CURSOR_FIELD_DECL) {
             const imp: Importer* = client as Importer*;
@@ -432,7 +430,7 @@ type struct Importer {
         this.ctx.artifacts.ast.root.statements.push(node);
     }
 
-    /// Push an alias-namespaced immutable global `const name = <init>` — the
+    /// Push an alias-namespaced immutable global `const name = <init>` - the
     /// shape both anonymous-enum constants and object-like `#define` macros
     /// lower to.  `binding_namespace` keeps it reachable only as `alias::name`.
     emit_alias_const(mut &this, name_sym: SymbolStr,
@@ -470,7 +468,7 @@ type struct Importer {
 
         // C++ free/namespace function: pin its mangled symbol via `![symbol]`.  A
         // function with no emitted symbol (inline / template) yields an empty
-        // mangling — skip + report rather than emit an unresolvable extern.  The
+        // mangling - skip + report rather than emit an unresolvable extern.  The
         // C path never enters this branch, so its output is byte-unchanged.
         if (this.is_cpp) {
             const mangled: SymbolStr = cursor.intern_mangling(this.ctx);
@@ -533,14 +531,14 @@ type struct Importer {
         // hidden vtable pointer (at offset 0 in the Itanium ABI).  `emit_record`
         // lays out DATA MEMBERS ONLY, so the emitted `type struct` would be the
         // wrong size and every bound method would read its fields at the wrong
-        // offset — a silent miscompile (e.g. a `data` member ends up read 8
+        // offset - a silent miscompile (e.g. a `data` member ends up read 8
         // bytes early).  Such a class also can't be safely constructed without
-        // ctor + vtable setup (Phase 2).  Skip the WHOLE class (no struct, no
+        // ctor + vtable setup.  Skip the WHOLE class (no struct, no
         // methods) and report it, rather than emit a layout-wrong shell.
         for (mut vi: i64 = 0; vi < this.cxx_method_cursors.length; vi++) {
             if (this.cxx_method_cursors[vi].is_virtual_method()) {
                 this.report.skip(format(
-                    "class %s (polymorphic: a vtable pointer Strategy A can't reproduce — methods would read fields at the wrong offset; needs Phase-2 vtable/ctor support)",
+                    "class %s (polymorphic: a vtable pointer Strategy A can't reproduce - methods would read fields at the wrong offset; needs Phase-2 vtable/ctor support)",
                     owner_str));
                 return;
             }
@@ -556,7 +554,7 @@ type struct Importer {
                 bound = bound + 1;
             }
         }
-        // Only emit the impl block if at least one method bound — an all-skipped
+        // Only emit the impl block if at least one method bound - an all-skipped
         // class would otherwise render an empty `implement` block.
         if (bound > 0) {
             this.emit_top_level(impl as ASTNode*);
@@ -587,8 +585,8 @@ type struct Importer {
         const k: i32 = Clang::clang_getCursorKind(cursor);
         const mname: string = this.spelling_of(cursor);
 
-        // Constructors / destructors are a Phase-2 lifecycle concern (allocate +
-        // call the mangled ctor, call dtor before free) — report for now.
+        // Constructors / destructors are a lifecycle concern (allocate +
+        // call the mangled ctor, call dtor before free) - report for now.
         if (k == Clang::CURSOR_CONSTRUCTOR) {
             this.report.skip(format("%s constructor (lifecycle binding is Phase 2)", owner_str));
             return false;
@@ -609,7 +607,7 @@ type struct Importer {
         // even the class's ordinary methods become unusable).  Skip + report;
         // surfacing C++ operators through Cryo's operator traits is a later phase.
         if (Importer::is_operator_spelling(mname)) {
-            this.report.skip(format("%s::%s (C++ operator overload — not bindable as a plain method; needs operator-trait mapping)",
+            this.report.skip(format("%s::%s (C++ operator overload - not bindable as a plain method; needs operator-trait mapping)",
                 owner_str, mname));
             return false;
         }
@@ -618,12 +616,12 @@ type struct Importer {
             return false;
         }
         if (cursor.is_virtual_method()) {
-            this.report.skip(format("%s::%s (virtual — dispatched via vtable; use the shim path)",
+            this.report.skip(format("%s::%s (virtual - dispatched via vtable; use the shim path)",
                 owner_str, mname));
             return false;
         }
         if (cursor.is_inlined()) {
-            this.report.skip(format("%s::%s (inline — no out-of-line symbol)", owner_str, mname));
+            this.report.skip(format("%s::%s (inline - no out-of-line symbol)", owner_str, mname));
             return false;
         }
         const mangled: SymbolStr = cursor.intern_mangling(this.ctx);
@@ -675,15 +673,15 @@ type struct Importer {
     }
 
     /// Emit a `type struct` for a struct (or a layout-faithful opaque blob for a
-    /// union — Cryo has no native union).  Find-or-populate handles libclang's
+    /// union - Cryo has no native union).  Find-or-populate handles libclang's
     /// forward-decl-then-definition double visit and truly-opaque records.
     emit_record(mut &this, cursor: CXCursor, is_union: boolean) -> void {
         const name_sym: SymbolStr = cursor.intern_spelling(this.ctx);
         if (cursor.is_anonymous()) {
             // Anonymous record: not nameable as a top-level type (libclang gives
-            // it a synthetic `struct (unnamed at …)` spelling, so test anonymity
+            // it a synthetic `struct (unnamed at ...)` spelling, so test anonymity
             // via clang_Cursor_isAnonymous, NOT an empty-spelling check).
-            // Reported, not silently relied upon — references fall back to void*.
+            // Reported, not silently relied upon - references fall back to void*.
             cdebug("[Bindgen] skipped anonymous record (use a typedef to name it)\n");
             return;
         }
@@ -691,8 +689,8 @@ type struct Importer {
         if (is_union) {
             // Native `type union`: one field per member, all sharing storage at
             // offset 0 (the first-class union feature, not the pre-union `_storage`
-            // blob).  By-value FFI ABI is unchanged — a union still lowers to the
-            // same sized/aligned blob — but members are accessed directly (`v.i`)
+            // blob).  By-value FFI ABI is unchanged - a union still lowers to the
+            // same sized/aligned blob - but members are accessed directly (`v.i`)
             // instead of through synthesized reinterpret accessors.
             if (this.name_seen(name_sym)) { return; }
             const ct: CXType = Clang::clang_getCursorType(cursor);
@@ -703,7 +701,7 @@ type struct Importer {
             unode.binding_namespace = this.alias;
             unode.repr_c = true;
             // Keep the C ABI alignment even when a member is approximated to a
-            // blob (which would otherwise be alignment 1) — mirrors the struct path.
+            // blob (which would otherwise be alignment 1) - mirrors the struct path.
             if (align > 0) { unode.min_alignment = align as u64; }
             this.seen_names.push(name_sym);
             this.type_names.push(name_sym);
@@ -736,14 +734,14 @@ type struct Importer {
 
     /// Build a struct's fields from its collected member cursors, faithfully
     /// handling the three constructs a one-to-one field map gets wrong:
-    ///   - a **bitfield run** (`unsigned a:3; unsigned b:5;`) — adjacent
+    ///   - a **bitfield run** (`unsigned a:3; unsigned b:5;`) - adjacent
     ///     bitfields share a storage unit, so a per-field map would inflate the
     ///     layout; the whole run collapses to one opaque `u8[span]` blob spanning
     ///     from its first bit to the next non-bitfield field (or the struct end);
-    ///   - an **anonymous record member** (`union { ... };`) — no FieldDecl, so a
+    ///   - an **anonymous record member** (`union { ... };`) - no FieldDecl, so a
     ///     plain field walk drops it and undersizes the struct; emitted as an
     ///     aligned blob in declaration order;
-    ///   - a **named field of anonymous type** (`struct {...} pt;`) — mapped to an
+    ///   - a **named field of anonymous type** (`struct {...} pt;`) - mapped to an
     ///     aligned blob by `CTypeMapper::map` rather than `void*`.
     /// Any approximation raises the struct's `min_alignment` to libclang's
     /// authoritative figure, so an opaque blob (alignment 1) can't lower the
@@ -773,7 +771,7 @@ type struct Importer {
                 node.add_field(fnode);
                 // Both an anonymous union (members overlay at offset 0) and an
                 // anonymous struct (members at their byte offsets) get reinterpret
-                // accessors over the blob — `add_reinterpret_accessors` reads each
+                // accessors over the blob - `add_reinterpret_accessors` reads each
                 // member's offset, so the same path covers both.
                 const kindword: string = if (k == Clang::CURSOR_UNION_DECL) { "union" } else { "struct" };
                 const nacc: i32 = this.add_reinterpret_accessors(node, fname, cur);
@@ -823,7 +821,7 @@ type struct Importer {
                 node.add_field(fnode);
                 // Restore field access: a shift/mask get/set per UNSIGNED bitfield
                 // in the run (only when the blob has a native backing integer
-                // width — 1/2/4/8 bytes; signed bitfields stay opaque).
+                // width - 1/2/4/8 bytes; signed bitfields stay opaque).
                 const nacc: i32 = this.emit_bitfield_accessors(node, fname, span, start_byte, i, j);
                 if (nacc > 0) {
                     this.report.approx(format("bitfield run in struct '%s' -> field '_bitfield%d' (%lld-byte) + %d get/set accessors",
@@ -862,10 +860,10 @@ type struct Importer {
     }
 
     /// Build a native `type union`'s fields from its collected member cursors
-    /// (`this.field_cursors`) — one Cryo field per C union member, all overlaid at
+    /// (`this.field_cursors`) - one Cryo field per C union member, all overlaid at
     /// offset 0 by the union layout.  A named member maps by type (`CTypeMapper::map`,
     /// which already lowers an anonymous-typed named field to an aligned blob); an
-    /// anonymous nested record *member* (a nameless `struct {…};`/`union {…};` with no
+    /// anonymous nested record *member* (a nameless `struct {...};`/`union {...};` with no
     /// FieldDecl) has no name to bind, so it becomes an aligned opaque blob `_anonN`
     /// (Cryo has no anonymous union fields).  Each lossy member is reported.
     populate_union_fields(mut &this, node: UnionDeclNode*) -> void {
@@ -1041,7 +1039,7 @@ type struct Importer {
 
         // Duplicate-valued constants (C enum aliases) can't be enum variants in
         // Cryo (unique discriminants required), so emit each as a namespaced
-        // alias `const NAME: <Enum> = <value>` AFTER the enum decl above — the
+        // alias `const NAME: <Enum> = <value>` AFTER the enum decl above - the
         // type is now in scope, and a bare `Lib::NAME` matches how C uses enum
         // constants anyway.  Registered in `ec_*` so an identifier-alias macro
         // can still resolve to it.
@@ -1142,14 +1140,14 @@ type struct Importer {
     }
 
     /// Emit an object-like `#define NAME <literal>` as an alias-namespaced global
-    /// `const`.  Per PLAN.md §3, only simple numeric (int/float) literals are
-    /// bound; every unbindable form — function-like macro, builtin, valueless
-    /// guard, compound/non-literal body, string/char literal — is REPORTED,
+    /// `const`.  Only simple numeric (int/float) literals are
+    /// bound; every unbindable form - function-like macro, builtin, valueless
+    /// guard, compound/non-literal body, string/char literal - is REPORTED,
     /// never silently dropped.  String/char binding awaits escape-faithful
     /// lowering.
     emit_macro(mut &this, cursor: CXCursor) -> void {
         if (Clang::clang_Cursor_isMacroBuiltin(cursor) != 0u32) { return; }
-        // Compiler/target PREDEFINED macros (`__STDC__`, `__GCC_HAVE_*`, …) live
+        // Compiler/target PREDEFINED macros (`__STDC__`, `__GCC_HAVE_*`, ...) live
         // in a `<built-in>` pseudo-file and are NOT flagged as system headers, so
         // the system-header filter misses them; restrict import to the header.
         if (!cursor.is_from_main_file()) { return; }
@@ -1159,8 +1157,8 @@ type struct Importer {
         if (this.name_seen(name_sym)) { return; }
 
         // SIMPLE-MACRO PASS (W1): bind only an object-like macro whose body is a
-        // single numeric/text literal (optionally signed).  Anything else —
-        // function-like, valueless, a compound/identifier/arithmetic body — is
+        // single numeric/text literal (optionally signed).  Anything else - 
+        // function-like, valueless, a compound/identifier/arithmetic body - is
         // LEFT for `emit_macro_complex`, which runs after this pass has recorded
         // every simple const, so an alias/arithmetic macro can resolve forward
         // references regardless of cursor order.  No report entries here; the
@@ -1270,8 +1268,8 @@ type struct Importer {
     ///   - W2 identifier alias (`#define MOUSE_LEFT_BUTTON MOUSE_BUTTON_LEFT`)
     ///     -> a const aliasing the resolved enum constant / macro const, or a
     ///        `type` alias of a resolved type;
-    ///   - W3 compound-literal struct const (`#define RAYWHITE CLITERAL(Color){…}`)
-    ///     -> `const RAYWHITE: Color = Color { … }`;
+    ///   - W3 compound-literal struct const (`#define RAYWHITE CLITERAL(Color){...}`)
+    ///     -> `const RAYWHITE: Color = Color { ... }`;
     ///   - W4 constant arithmetic (`#define DEG2RAD (PI/180.0f)`) -> the value
     ///     folded to a single float literal const.
     /// Everything genuinely unbindable is reported: inherently-not-API noise
@@ -1304,7 +1302,7 @@ type struct Importer {
             return;
         }
 
-        // W3: compound-literal struct const, e.g. `CLITERAL(Color){ 245,… }`.
+        // W3: compound-literal struct const, e.g. `CLITERAL(Color){ 245,... }`.
         if (this.try_emit_compound_struct(name_sym, name_str, toks, ntok)) {
             Clang::clang_disposeTokens(this.tu, toks, ntok);
             return;
@@ -1341,7 +1339,7 @@ type struct Importer {
     }
 
     /// True if a top-level C function `name` was bound in this import (so a
-    /// macro aliasing it is recognized as a — currently unsupported — function
+    /// macro aliasing it is recognized as a - currently unsupported - function
     /// alias rather than misclassified as a marker).
     is_bound_function(&this, name: string) -> boolean {
         const sym: SymbolStr = this.ctx.intern_table.intern(name);
@@ -1401,7 +1399,7 @@ type struct Importer {
             return true;
         }
 
-        // Bound function: a thin forwarding wrapper (vendor path only — see
+        // Bound function: a thin forwarding wrapper (vendor path only - see
         // `is_vendor`).  A variadic target can't be forwarded (no way to pass a
         // C `...` through), so it's left for the caller to report.
         if (this.is_vendor) {
@@ -1482,15 +1480,15 @@ type struct Importer {
         }
     }
 
-    /// W3: bind a C compound-literal macro `#define NAME [CLITERAL](Type){ a, b, … }`
-    /// as `const NAME: Type = Type { f0: a, f1: b, … }`.  The struct's fields
+    /// W3: bind a C compound-literal macro `#define NAME [CLITERAL](Type){ a, b, ... }`
+    /// as `const NAME: Type = Type { f0: a, f1: b, ... }`.  The struct's fields
     /// supply the names (positional C initializer); each value must be a numeric
     /// literal.  Returns false (leaving the macro for another handler) when the
     /// tokens are not this shape, the type isn't a bound struct, or the value
     /// count doesn't match the field count.
     try_emit_compound_struct(mut &this, name_sym: SymbolStr, name_str: string,
                              toks: CXToken*, ntok: u32) -> boolean {
-        // Locate the brace group `{ … }`.
+        // Locate the brace group `{ ... }`.
         mut bo: i64 = -1;
         mut bc: i64 = -1;
         for (mut i: i64 = 1; i < ntok as i64; i++) {
@@ -1503,7 +1501,7 @@ type struct Importer {
         if (bo < 0 || bc <= bo) { return false; }
 
         // The struct type is the last bound-struct identifier before the brace
-        // (handles both `(Type){…}` and `CLITERAL(Type){…}`).
+        // (handles both `(Type){...}` and `CLITERAL(Type){...}`).
         mut struct_node: StructDeclNode* = null;
         for (mut i: i64 = 1; i < bo; i++) {
             if (Clang::clang_getTokenKind(*(toks + i)) != Clang::TOKEN_IDENTIFIER) { continue; }
@@ -1546,7 +1544,7 @@ type struct Importer {
     /// W4: bind a constant-arithmetic macro whose replacement is a same-operator
     /// chain over numeric literals / bound consts, e.g. `#define DEG2RAD (PI/180.0f)`
     /// or a flag-combine `#define GN_FLAGS (1 | 2 | 4)`.  The value is folded at
-    /// import time to a single literal const — sidestepping both the unsupported
+    /// import time to a single literal const - sidestepping both the unsupported
     /// global const-references-const init and any serializer change.  An integer
     /// fold is tried first (covers bitwise flag combines + enum-constant operands),
     /// then a float fold.  Mixed operators (`a + b * c`) decline to avoid a
@@ -1734,7 +1732,7 @@ type struct Importer {
             this.report.skip(format("macro '%s' (malformed signed text literal)", name_str));
             return;
         }
-        // Find the opening quote — it may follow an encoding prefix (`u8`/`L`/
+        // Find the opening quote - it may follow an encoding prefix (`u8`/`L`/
         // `u`/`U`).  A `"` opens a string; a `'` opens a character.
         const slen: i64 = spell.length() as i64;
         mut open: i64 = -1;
@@ -1835,7 +1833,7 @@ type struct Importer {
     }
 
     /// Parse an angle-bracket system header (`#include <stdio.h>`) by feeding
-    /// a one-line `#include <...>` to libclang as an in-memory unsaved file —
+    /// a one-line `#include <...>` to libclang as an in-memory unsaved file - 
     /// libclang resolves it against its own system search path.  The header
     /// name is validated to path-safe characters first.
     static import_system_header(header: string, extern_node: ExternBlockNode*,
@@ -1861,7 +1859,7 @@ type struct Importer {
 
     /// `clang_getInclusions` trampoline: records each non-system file the TU
     /// pulled in (entry header + transitive `#include`s) into `imp.inputs`, for
-    /// the include-graph `.deps` sidecar.  System headers are dropped — they are
+    /// the include-graph `.deps` sidecar.  System headers are dropped - they are
     /// already covered by the libclang-version fold in the provenance key, and
     /// hashing glibc/CRT headers on every cache check would be wasteful.  Matches
     /// the C `CXInclusionVisitor` signature `(CXFile, CXSourceLocation*, unsigned,
@@ -1884,8 +1882,8 @@ type struct Importer {
         Clang::clang_disposeString(fname);
     }
 
-    /// Build a libclang TU (forcing C with `-x c`, matching the old
-    /// preprocess), walk its top-level cursors, and emit FunctionDeclNodes.
+    /// Build a libclang TU (forcing C with `-x c`), walk its top-level
+    /// cursors, and emit FunctionDeclNodes.
     /// `unsaved`/`num_unsaved` carry an in-memory buffer for system headers
     /// (null/0 for a real file).  Returns the number of functions emitted.
     /// `out_report` (when non-null) accumulates this TU's skipped/approximated
@@ -1904,7 +1902,7 @@ type struct Importer {
         // old preprocess byte-for-byte; C++ (`-x c++ -std=<cpp_std>`) drives the
         // C++ binding generator (Strategy A: direct mangled-symbol binding).
         // `CRYO_CLANG_RESOURCE_DIR`, when set, adds `-resource-dir <dir>` so
-        // libclang finds its builtin headers (stddef.h / stdint.h / …) — needed on
+        // libclang finds its builtin headers (stddef.h / stdint.h / ...) - needed on
         // Windows, where the bundled libclang.dll is staged next to cryo.exe and
         // so cannot locate its resource dir by the default
         // `<dll>/../lib/clang/<v>` walk.  Unset on a normal host install (the
@@ -1929,7 +1927,7 @@ type struct Importer {
             Option::Some(v) => {
                 // Pushed into `args` and read later by clang_parseTranslationUnit,
                 // so the bytes must outlive this scope: hand off an owned raw
-                // `string` (leaked once, like the old environ pointer).
+                // `string` (leaked once).
                 const rd: string = v.into_raw();
                 if (rd.length() > 0) {
                     args.push("-resource-dir" as u8*);
@@ -1990,7 +1988,7 @@ type struct Importer {
     }
 
 
-    // Path Resolution (ported verbatim from the former hand-rolled pass).
+    // Path Resolution.
 
     /// Extract directory component from a file path.
     static get_directory(path: string) -> string {

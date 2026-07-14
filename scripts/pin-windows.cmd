@@ -1,6 +1,6 @@
 @echo off
 rem ---------------------------------------------------------------------
-rem pin-windows.cmd — Windows-host wrapper for `make pin`.
+rem pin-windows.cmd - Windows-host wrapper for `make pin`.
 rem
 rem `make pin` on a Windows host can't run the Linux build (no native ELF
 rem toolchain) and can't currently run the cryo.exe link locally either
