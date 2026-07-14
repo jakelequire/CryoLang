@@ -20,6 +20,7 @@ import core::cmp;
 import core::hash;
 import core::drop;
 import core::clone;
+import core::default;
 import alloc::layout;
 import fmt::display;
 import fmt::error;
@@ -77,14 +78,16 @@ type struct String<A = GlobalAlloc> {
         return string;
     }
 
-    /// Construct an owned `String` from a NUL-terminated `string`
-    /// (C-string literal) by copying its bytes.  Marked `![implicit]`:
-    /// the compiler treats this as the constructor when a `string` flows
-    /// into a `String` slot — a parameter (`println("text")`) or a typed
-    /// binding (`mut s: String = "text"`).  The resulting `String` owns
-    /// its buffer and moves into the destination.
+    /// Construct an owned `String` from a `string` (Cryo's raw NUL-terminated
+    /// C-string view) by copying its bytes.  Marked `![implicit]`: the compiler
+    /// treats this as the constructor when a `string` flows into a `String`
+    /// slot — a parameter (`println("text")`) or a typed binding
+    /// (`mut s: String = "text"`).  The resulting `String` owns its buffer and
+    /// moves into the destination.  Named for its source type (`string`), the
+    /// mirror of `from_str` (which takes a `Str`); `with_null` is the inverse
+    /// direction (produce a C-facing NUL-terminated buffer).
     ![implicit]
-    static from_cstr(text: string) -> String {
+    static from_string(text: string) -> String {
         return String::from_str(Str::from(text));
     }
 
@@ -92,8 +95,10 @@ type struct String<A = GlobalAlloc> {
     /// The terminating NUL lives in the buffer (so `as_ptr()` yields a
     /// valid `const char*`) but is excluded from the logical length, so
     /// `as_str()` / `length()` see only `source`. Matches C semantics on
-    /// an interior NUL: the C side stops reading at the first one.
-    static from_str_c(source: Str) -> String {
+    /// an interior NUL: the C side stops reading at the first one.  This is
+    /// the produce-*for*-C direction; `from_string` is the consume-*from*-C
+    /// one.  Pairs with the `as_cstr()` borrow method.
+    static with_null(source: Str) -> String {
         mut string: String = String::with_capacity(source.length() + 1);
         string.push(source);
         string.push_byte(0 as u8);
@@ -146,7 +151,7 @@ type struct String<A = GlobalAlloc> {
     /// `as_ptr()` alone is not a valid C string. `as_cstr()` writes the
     /// terminator at index `length` - reserving one spare byte if the
     /// buffer is full - WITHOUT changing the logical length, mirroring
-    /// the `from_str_c` invariant. The work is idempotent and zero-alloc
+    /// the `with_null` invariant. The work is idempotent and zero-alloc
     /// once the spare byte exists.
     ///
     /// The returned pointer borrows this String's buffer: it is valid
@@ -203,8 +208,27 @@ type struct String<A = GlobalAlloc> {
         return this.as_str().trim();
     }
 
+    /// Borrowed sub-slice with leading ASCII whitespace removed. Mirrors
+    /// `Str::trim_start`, closing the `String` vs `Str` method asymmetry.
+    trim_start(&this) -> Str {
+        return this.as_str().trim_start();
+    }
+
+    /// Borrowed sub-slice with trailing ASCII whitespace removed. Mirrors
+    /// `Str::trim_end`.
+    trim_end(&this) -> Str {
+        return this.as_str().trim_end();
+    }
+
     to_ascii_uppercase(&this) -> String {
         return this.as_str().to_ascii_uppercase();
+    }
+
+    /// Fresh `String` with every ASCII uppercase byte folded to lowercase.
+    /// Mirrors `Str::to_ascii_lowercase` and the existing
+    /// `String::to_ascii_uppercase`.
+    to_ascii_lowercase(&this) -> String {
+        return this.as_str().to_ascii_lowercase();
     }
 
     /// Iterator over pieces separated by `sep` (borrows this String).
@@ -403,5 +427,13 @@ where A: Allocator {
 implement trait Clone for struct String {
     clone(&this) -> String {
         return String::from_str(this.as_str());
+    }
+}
+
+/// The empty string is `String`'s canonical "zero value". Allocates nothing
+/// until first mutated, so `String` can satisfy a `Default` bound.
+implement trait Default for struct String {
+    static default() -> String {
+        return String::new();
     }
 }

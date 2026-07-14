@@ -691,7 +691,7 @@ This is a defined deterministic result, not undefined behavior, but it is *silen
 | ----------------- | ------------------------------------------------------------ |
 | `==` `!=`         | Equal / not equal                                            |
 | `<` `>` `<=` `>=` | Ordering comparisons                                         |
-| `<=>`             | Three-way comparison (spaceship); negative / zero / positive |
+| `<=>`             | Three-way comparison (spaceship); yields an `Ordering` (`Less` / `Equal` / `Greater`) |
 
 Comparison operators return `boolean`. On numeric types and pointers they emit native instructions; on user-defined types that implement `Eq`/`Ord` they are **overloaded** — `a == b` becomes `a.equals(&b)` and `a < b` becomes `a.compare(&b).is_lt()` (see operator overloading, [§ 11.6](#116-operator-overloading)).
 
@@ -2925,6 +2925,7 @@ color  = "auto"                     # auto | always | never
 | `cryo demangle <sym>`    | Decode a mangled symbol to its source form.                                                |
 | `cryo fetch`             | Fetch dependencies and write `cryoconfig.lock`.                                            |
 | `cryo update`            | Re-resolve every dependency, ignoring the lockfile.                                        |
+| `cryo vendor <sub>`      | Manage the per-machine registry of vendored C libraries: `<path>` \| `list` \| `remove <name>` \| `rebuild [name]`. |
 | `cryo version`           | Print the compiler version.                                                                |
 
 Running `cryo <file.cryo>` with no command compiles that file directly.
@@ -2944,9 +2945,11 @@ Accepted by `build` / `run` / `test` / `check` as noted; run `cryo help flags` o
 | `--opt-level=N`       | Optimization level `0`..`3`; overrides the profile and `[compiler] optimize`.                                                           |
 | `-g`, `--debug-info`  | Emit DWARF debug info.                                                                                                                  |
 | `--release`           | Build with the `release` profile (O2, no debug info).                                                                                   |
+| `--release-static`    | Static-link libLLVM + the C++ runtime into a self-contained binary for distribution (Linux host only; implies `--release`).             |
 | `--dev`               | Build with the `debug` profile (O0 + DWARF).                                                                                            |
 | `--profile=NAME`      | Build with a named profile (cache under `build/target/NAME/`).                                                                          |
 | `--no-incremental`    | Force a full build: skip the up-to-date short-circuit and the manifest/fingerprint write.                                               |
+| `--locked`            | Verify the `cryoconfig.lock` vendor pins instead of re-resolving them; error if the lock is missing or out of date.                     |
 | `-o`, `--output PATH` | Redirect output for single-file builds; the output kind is inferred from the extension (`.o`, `.s`, `.ll`, or an executable).           |
 
 Test-only flags: `--ignored`, `--list`, `--exact`, `-q` / `--quiet`.
