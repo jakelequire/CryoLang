@@ -66,6 +66,17 @@ public function try_keyword_hover(doc: Document*, line: u32, character: u32) -> 
     word_buf.truncate(word_len);
     const word_cstr: string = word_buf.as_ptr() as string;
 
+    // Receiver `mut &this` / `mut this`: the `mut` there belongs to the
+    // receiver, not a standalone modifier.  Suppress the keyword doc so the
+    // hover falls through to the AST path, which renders the receiver as
+    // `this: mut &Type` - the same hover `&` and `this` already resolve to,
+    // so the whole `mut &this` reads as one receiver.
+    if (strcmp(word_cstr, "mut") == 0
+            && KeywordLookup::mut_begins_this_receiver(ptr, len, end)) {
+        word_buf.drop();
+        return Option::None;
+    }
+
     const md: string = KeywordLookup::lookup_keyword_doc(word_cstr);
     word_buf.drop();
     if (md == "") { return Option::None; }
@@ -117,6 +128,39 @@ static is_ident_byte(b: u8) -> boolean {
 
 static is_digit(b: u8) -> boolean {
     return b >= 48 as u8 && b <= 57 as u8;
+}
+
+static is_space_byte(b: u8) -> boolean {
+    // space, tab, CR, LF
+    return b == 32 as u8 || b == 9 as u8 || b == 13 as u8 || b == 10 as u8;
+}
+
+/// True when the bytes starting at `after_mut` (the position just past a
+/// `mut` keyword) begin a `this` receiver: `mut &this` or the bare
+/// `mut this`.  Skips intervening whitespace and an optional `&`, then
+/// requires the exact word `this` at a word boundary.  Used to route a
+/// hover on the `mut` of a receiver to the receiver hover instead of the
+/// `mut` keyword doc.  A `mut &T` reference parameter (non-`this`) fails
+/// the `this` check and keeps its keyword doc.
+static mut_begins_this_receiver(ptr: u8*, len: u64, after_mut: u64) -> boolean {
+    mut p: u64 = after_mut;
+    while (p < len && KeywordLookup::is_space_byte(ptr[p])) { p = p + 1; }
+    // Optional `&` (0x26), then more whitespace.
+    if (p < len && ptr[p] == 38 as u8) {
+        p = p + 1;
+        while (p < len && KeywordLookup::is_space_byte(ptr[p])) { p = p + 1; }
+    }
+    // Require the exact word `this` (t=116 h=104 i=105 s=115).
+    if (p + 4 as u64 > len)      { return false; }
+    if (ptr[p]     != 116 as u8) { return false; }
+    if (ptr[p + 1] != 104 as u8) { return false; }
+    if (ptr[p + 2] != 105 as u8) { return false; }
+    if (ptr[p + 3] != 115 as u8) { return false; }
+    // Word boundary: the char after `this` must not continue the identifier.
+    if (p + 4 as u64 < len && KeywordLookup::is_ident_byte(ptr[p + 4])) {
+        return false;
+    }
+    return true;
 }
 
 
@@ -260,7 +304,7 @@ static lookup_keyword_doc(s: string) -> string {
         return "## protected\nVisibility modifier. Restricts a member to the declaring type and its subclasses.\n\n### Syntax\n```cryo\ntype class Base {\nprotected:\n    state: i32;\n}\n```\n\n### Notes\n- Most useful inside `type class` hierarchies";
     }
     if (s == "mut") {
-        return "## mut\nMarks a binding, parameter, or receiver as mutable.\n\n### Syntax\n```cryo\nmut count: i32 = 0;\nfunction push(mut &this, v: i32) -> void { ... }\n```\n\n### Notes\n- `mut x` - the binding can be reassigned\n- `mut &this` - the method can mutate the receiver\n- `&mut T` - a mutable reference to `T`\n- `mut x: T = ...;` is the local-variable form; pair with `const` for immutable bindings";
+        return "## mut\nMarks a binding, parameter, or receiver as mutable.\n\n### Syntax\n```cryo\nmut count: i32 = 0;\nfunction push(mut &this, v: i32) -> void { ... }\n```\n\n### Notes\n- `mut x` - the binding can be reassigned\n- `mut &this` - the method can mutate the receiver\n- `mut &T` - a mutable reference to `T`\n- `mut x: T = ...;` is the local-variable form; pair with `const` for immutable bindings";
     }
     if (s == "move") {
         return "## move\nLambda prefix that opts a closure into capture-by-move semantics: each non-Copy capture consumes the outer binding at the lambda's construction site, the synthesized closure-struct takes ownership of the value, and its Drop releases it at scope exit.\n\n### Syntax\n```cryo\nconst p: SomeOwning = ...;\nconst f = move () -> i32 { return p.field; };\n// `p` is consumed here; using it below is E0452.\n```\n\n### Notes\n- Sema flips a lambda's `is_move` flag automatically whenever a non-Copy capture is taken, so the keyword is **optional** for the common case\n- Useful as an explicit signal when handing closures to `thread::spawn` or any API where capture-by-move makes the consumption visible at the call site\n- Has no effect on a Copy-only closure (Copy types don't drop), so writing `move` there is a harmless documentation marker";
