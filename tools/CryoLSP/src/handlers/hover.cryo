@@ -202,9 +202,21 @@ public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
         // rather than just the type, so the hover reflects what the
         // user wrote (`const` vs. `mut`, the variable's name).
         const v: VarDeclNode* = node as VarDeclNode*;
-        content    = eng.format_variable_decl(v);
-        hover_span = name_span;
-        doc_text   = v.documentation;
+        // A receiver whose name token IS the whole lexeme (`this`, `&this`)
+        // lands here with `on_decl_name` true; render it as the receiver
+        // (`this` / `this: mut &Type`), not `const this: ?`.
+        if (eng.is_receiver_param(v)) {
+            content    = eng.format_receiver(v);
+            hover_span = name_span;
+        } else {
+            content    = eng.format_variable_decl(v);
+            // Surface a bound when the declared type is a constrained generic
+            // param (`const held: T where T: Show`), matching the use-site form.
+            content    = eng.append_param_bound(content, v.resolved_type,
+                node.span.file, cursor_line, cursor_char);
+            hover_span = name_span;
+            doc_text   = v.documentation;
+        }
     } else if (node.kind == NodeKind::VariableDeclaration) {
         // Cursor on a `VarDeclNode` outside the name token - the
         // common case is the synthesized `&this` / `mut &this` /
@@ -250,40 +262,80 @@ public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
             doc_text   = variant.documentation;
         }
     } else if (node.kind == NodeKind::ScopeResolution) {
-        // `Type::method(...)` or `Module::function(...)` - show the
-        // callable's signature.  Method on `Type` wins; falls back to
-        // a free function in some module if no method matches; finally
-        // an enum variant (`IoErrorKind::NotFound`) when neither hits.
+        // `Type::method(...)` or `Module::function(...)`.  Two cursor
+        // sub-positions, resolved independently so hovering `fmt` in
+        // `fmt::printf` shows the `fmt` namespace, not the `printf`
+        // callable:
+        //   - on the SCOPE token (`fmt`, `Option`) -> the scope's own
+        //     hover: a type/enum/trait decl when the scope names one,
+        //     else the namespace overview (same as an import segment).
+        //   - on the MEMBER token (`printf`, `Some`) -> the callable's
+        //     signature.  Method on `Type` wins; falls back to a free
+        //     function in some module; finally an enum variant.
         const sr: ScopeResolutionNode* = node as ScopeResolutionNode*;
-        const m: MethodNode* = NodeLocator::find_method_in_modules(
-            ctx.module_graph, ctx.intern_table, sr.scope_name, sr.member_name);
-        if (m != null && m.func != null) {
-            const owner_str: string = HoverEngine::leaf_after_separator(
-                ctx.type_arena.intern_table.resolve(sr.scope_name));
-            content  = eng.format_method_signature(m, owner_str);
-            doc_text = m.documentation;
-        } else {
-            const f: FunctionDeclNode* = NodeLocator::find_function_in_modules(
-                ctx.module_graph, sr.member_name);
-            if (f != null) {
-                content  = eng.format_function_signature(f);
-                doc_text = f.documentation;
+
+        // Scope side first.  The member span is checked to break ties on
+        // synthetic nodes whose scope/member spans both equal the whole
+        // span (there the cursor is treated as on the member).
+        const on_scope: boolean = NodeLocator::span_contains(
+                sr.scope_span, cursor_line, cursor_char)
+            && !NodeLocator::span_contains(
+                sr.member_span, cursor_line, cursor_char);
+        if (on_scope) {
+            const scope_decl: ASTNode* = NodeLocator::find_type_decl_in_modules(
+                ctx.module_graph, ctx.intern_table, sr.scope_name);
+            if (scope_decl != null) {
+                content    = eng.format_type_decl(scope_decl);
+                doc_text   = (scope_decl as DeclarationNode*).documentation;
+                hover_span = sr.scope_span;
             } else {
-                // Enum-variant fallback.  `find_type_decl_in_modules`
-                // already accepts qualified-or-bare names and matches
-                // enum decls; cast and scan variants for the member.
-                const td: ASTNode* = NodeLocator::find_type_decl_in_modules(
-                    ctx.module_graph, ctx.intern_table, sr.scope_name);
-                if (td != null && td.kind == NodeKind::EnumDeclaration) {
-                    const ed: EnumDeclNode* = td as EnumDeclNode*;
-                    const v: EnumVariantNode* = HoverEngine::find_variant_in_enum(
-                        ed, sr.member_name);
-                    if (v != null) {
-                        content  = eng.format_enum_variant(ed, v);
-                        doc_text = v.documentation;
+                // Namespace scope (`fmt`, `io`) - resolve against `std::`
+                // and render the same overview an import segment shows.
+                const literal: string = ctx.intern_table.resolve(sr.scope_name);
+                const seg_path: string = eng.resolve_namespace_path(literal);
+                const ns: string = eng.format_namespace_overview(seg_path);
+                if (ns != "") {
+                    content    = ns;
+                    doc_text   = eng.namespace_doc_for_path(seg_path);
+                    hover_span = sr.scope_span;
+                }
+            }
+        }
+
+        if (content == "") {
+            const m: MethodNode* = NodeLocator::find_method_in_modules(
+                ctx.module_graph, ctx.intern_table, sr.scope_name, sr.member_name);
+            if (m != null && m.func != null) {
+                const owner_str: string = HoverEngine::leaf_after_separator(
+                    ctx.type_arena.intern_table.resolve(sr.scope_name));
+                content  = eng.format_method_signature(m, owner_str);
+                doc_text = m.documentation;
+            } else {
+                const f: FunctionDeclNode* = NodeLocator::find_function_in_modules(
+                    ctx.module_graph, sr.member_name);
+                if (f != null) {
+                    content  = eng.format_function_signature(f);
+                    doc_text = f.documentation;
+                } else {
+                    // Enum-variant fallback.  `find_type_decl_in_modules`
+                    // already accepts qualified-or-bare names and matches
+                    // enum decls; cast and scan variants for the member.
+                    const td: ASTNode* = NodeLocator::find_type_decl_in_modules(
+                        ctx.module_graph, ctx.intern_table, sr.scope_name);
+                    if (td != null && td.kind == NodeKind::EnumDeclaration) {
+                        const ed: EnumDeclNode* = td as EnumDeclNode*;
+                        const v: EnumVariantNode* = HoverEngine::find_variant_in_enum(
+                            ed, sr.member_name);
+                        if (v != null) {
+                            content  = eng.format_enum_variant(ed, v);
+                            doc_text = v.documentation;
+                        }
                     }
                 }
             }
+            // Narrow the highlight to the member token so only `printf`
+            // underlines, not the whole `fmt::printf`.
+            if (content != "") { hover_span = sr.member_span; }
         }
     } else if (node.kind == NodeKind::StructLiteral) {
         // `IoError { kind: ..., os_code: ... }` - three sub-cases based
@@ -330,6 +382,21 @@ public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
                 }
             }
 
+            // -- Path 1b: generic-param receiver ---------------------
+            // A receiver whose resolved type is a bare generic param
+            // (`this.second` typed `J`) has no entry in the type reverse
+            // map, so `lookup_type_name` misses.  Use the param's own
+            // name as the carrier; the trait-method lookup below then
+            // resolves `J::next` through the enclosing impl's
+            // `where J: Iterator<A>` bound.
+            if (!type_sym.is_valid() && recv_ty.is_valid()) {
+                const gp_name: SymbolStr = eng.generic_param_name_of(recv_ty);
+                if (gp_name.is_valid()) {
+                    type_sym = gp_name;
+                    owner_display = ctx.intern_table.resolve(gp_name);
+                }
+            }
+
             // -- Path 2: annotation fallback -------------------------
             // Inside a generic function body sema may not have stamped
             // a valid resolved_type on identifier expressions (the
@@ -346,6 +413,24 @@ public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
                     type_sym = annot_name;
                     owner_display = HoverEngine::leaf_after_separator(
                         ctx.intern_table.resolve(annot_name));
+                }
+            }
+
+            // -- Path 2b: field-access receiver (`this.second.next()`) --
+            // The receiver is itself a field read (`this.second`), not an
+            // identifier, so Path 2's annotation walk (Identifier-only)
+            // misses and sema left the field access's resolved_type
+            // unstamped in the template body.  Recover the field's declared
+            // carrier from the AST: find `second` on the enclosing method's
+            // owner and read its annotation's leaf (`J`).  The trait-method
+            // lookup below then resolves `J::next` through the impl's
+            // `where J: Iterator<A>` bound.
+            if (!type_sym.is_valid()) {
+                const fld_carrier: SymbolStr = eng.member_field_carrier_name(ma.object);
+                if (fld_carrier.is_valid()) {
+                    type_sym = fld_carrier;
+                    owner_display = HoverEngine::leaf_after_separator(
+                        ctx.intern_table.resolve(fld_carrier));
                 }
             }
 
@@ -409,6 +494,8 @@ public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
                             ctx.module_graph, ctx.intern_table, type_sym, ma.member);
                         if (fld != null) {
                             content  = eng.format_field_decl(fld);
+                            content  = eng.append_param_bound(content, fld.resolved_type,
+                                ma.span.file, cursor_line, cursor_char);
                             doc_text = fld.documentation;
                         }
                     }
@@ -421,6 +508,8 @@ public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
                         ctx.module_graph, ctx.intern_table, type_sym, ma.member);
                     if (fld != null) {
                         content  = eng.format_field_decl(fld);
+                        content  = eng.append_param_bound(content, fld.resolved_type,
+                            ma.span.file, cursor_line, cursor_char);
                         doc_text = fld.documentation;
                     } else {
                         const m: MethodNode* = NodeLocator::find_method_in_modules(
@@ -480,10 +569,25 @@ public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
         // head (it only descends into methods), so this branch routes
         // both sub-positions.
         const impl_blk: ImplBlockNode* = node as ImplBlockNode*;
+        // Generic-param side: cursor on `I` / `O` in `implement<I, O>`.
+        // Each param owns its own span; render the param plus its bound
+        // from the impl's own `where` clause (`I where I: Iterator`).
+        for (mut gpi: i64 = 0; gpi < impl_blk.generic_params.length; gpi++) {
+            const gp: GenericParamNode* = impl_blk.generic_params[gpi];
+            if (gp == null) { continue; }
+            if (!NodeLocator::span_contains(gp.span, cursor_line, cursor_char)) {
+                continue;
+            }
+            const leaf: string = ctx.intern_table.resolve(gp.name);
+            content    = leaf + eng.render_where_for_param(
+                &impl_blk.where_bounds, gp.name);
+            hover_span = gp.span;
+            break;
+        }
         // Trait side: the trait_annotation owns spans on its own
         // NamedAnnotations, so reuse the same path used for type
         // annotations elsewhere in this file.
-        if (impl_blk.trait_annotation != null) {
+        if (content == "" && impl_blk.trait_annotation != null) {
             const named: NamedAnnotation* = NodeLocator::find_named_annotation_at(
                 impl_blk.trait_annotation, cursor_line, cursor_char);
             if (named != null) {
@@ -511,21 +615,86 @@ public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
             }
         }
     } else if (node.kind == NodeKind::Pattern) {
-        // Match-arm identifier patterns (e.g. `ENOENT => ...`).  Cryo's
-        // current pattern semantics treat identifier patterns as
-        // fresh bindings - the resolver doesn't record a span->sym
-        // entry and the binding shadows any const of the same name.
-        // For hover utility, look up the global const by name so the
-        // tooltip surfaces the value the author almost certainly
-        // intended (an errno-style table is the canonical case).
         const pat: PatternNode* = node as PatternNode*;
-        if (pat.pattern_kind == PatternKind::Identifier) {
-            const v: VarDeclNode* = NodeLocator::find_const_in_modules(
-                ctx.module_graph, pat.binding_name);
-            if (v != null) {
-                content    = eng.format_variable_decl(v);
-                hover_span = pat.span;
-                doc_text   = v.documentation;
+        if (pat.pattern_kind == PatternKind::Enum) {
+            // Enum arm `Option::Some(value)`.  Route the cursor to one of
+            // three sub-positions, each hovered independently:
+            //   - a payload binding (`value`)  -> `value: <payload type>`
+            //   - the variant token (`Some`)   -> `Option::Some(T)`
+            //   - the enum-path token (`Option`) -> the enum's decl body
+            const ep: EnumPatternNode* = node as EnumPatternNode*;
+
+            // 1. Payload binding: `value` in `Some(value)`.  Each binding
+            //    owns its own span; the type is the variant's declared
+            //    associated type at the same positional index.
+            for (mut ei: i64 = 0; ei < ep.elements.length; ei++) {
+                const pb: PatternBinding* = ep.binding_at(ei);
+                if (pb == null) { continue; }
+                if (NodeLocator::span_contains(pb.span, cursor_line, cursor_char)) {
+                    content    = eng.format_pattern_binding(ep, ei, pb);
+                    hover_span = pb.span;
+                    break;
+                }
+            }
+
+            // 2/3. Variant vs enum-path token.  Look the enum decl up once;
+            //      `Some` renders the variant, `Option` renders the enum.
+            if (content == "") {
+                const td: ASTNode* = NodeLocator::find_type_decl_in_modules(
+                    ctx.module_graph, ctx.intern_table, ep.enum_name);
+                if (td != null && td.kind == NodeKind::EnumDeclaration) {
+                    const ed: EnumDeclNode* = td as EnumDeclNode*;
+                    const on_variant: boolean = NodeLocator::span_contains(
+                        ep.variant_span, cursor_line, cursor_char);
+                    if (!on_variant && NodeLocator::span_contains(
+                            ep.enum_span, cursor_line, cursor_char)) {
+                        content    = eng.format_type_decl(td);
+                        hover_span = ep.enum_span;
+                        doc_text   = (td as DeclarationNode*).documentation;
+                    } else {
+                        // Variant token, or an unqualified/whole-pattern
+                        // fallback: render the variant it names.
+                        const v: EnumVariantNode* = HoverEngine::find_variant_in_enum(
+                            ed, ep.variant_name);
+                        if (v != null) {
+                            content    = eng.format_enum_variant(ed, v);
+                            hover_span = ep.variant_span;
+                            doc_text   = v.documentation;
+                        }
+                    }
+                }
+            }
+        } else if (pat.pattern_kind == PatternKind::Identifier) {
+            // Bare identifier arm.  Two readings, tried in order:
+            //   1. an enum variant used unqualified (`FOO` for
+            //      `MyEnum::FOO`) - the near-certain intent inside a
+            //      `match` over an enum subject; the parser can't tell it
+            //      apart from a fresh binding, so it lands here as an
+            //      Identifier pattern with no enum qualifier.
+            //   2. a global const of that name (errno-style tables), which
+            //      an identifier pattern shadows as a fresh binding - the
+            //      resolver records no span->sym entry for it.
+            // Enum-variant first: consts and variants rarely share a name,
+            // and when neither matches (a genuine capture binding) both
+            // lookups simply miss and the hover falls through.
+            const ed: EnumDeclNode* = eng.find_enum_with_variant(pat.binding_name);
+            if (ed != null) {
+                const v: EnumVariantNode* = HoverEngine::find_variant_in_enum(
+                    ed, pat.binding_name);
+                if (v != null) {
+                    content    = eng.format_enum_variant(ed, v);
+                    hover_span = pat.span;
+                    doc_text   = v.documentation;
+                }
+            }
+            if (content == "") {
+                const cv: VarDeclNode* = NodeLocator::find_const_in_modules(
+                    ctx.module_graph, pat.binding_name);
+                if (cv != null) {
+                    content    = eng.format_variable_decl(cv);
+                    hover_span = pat.span;
+                    doc_text   = cv.documentation;
+                }
             }
         }
     } else if (node.kind == NodeKind::Literal) {
@@ -608,6 +777,11 @@ public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
                         sym.declaring_span);
                     content = eng.format_identifier_use(
                         sym, id_node.resolved_type, init_str);
+                    // Surface a generic param's bound at the use site:
+                    // `foo<T: Display>(x)` hovered on `x` reads
+                    // `const x: T where T: Display`.
+                    content = eng.append_param_bound(content, id_node.resolved_type,
+                        id_node.span.file, cursor_line, cursor_char);
                     // Pull doc from the symbol's source decl, if reachable.
                     // Covers `const ENOENT: i32 = 2` use sites; method/field/
                     // parameter uses fall through with empty doc.
@@ -633,6 +807,42 @@ public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
                         }
                     }
                 }
+            }
+        }
+
+        // AST fallback: inside a trait default-method / generic template
+        // body the resolver records no span->sym for parameters or pattern
+        // bindings, so `resolve` above misses and the type-only fallbacks
+        // find nothing.  Recover the declaration straight from the AST.
+        if (content == "" && id_node.name.is_valid()) {
+            // Enclosing function parameter (`pred` in `pred(value)`).
+            content = eng.identifier_as_param(id_node.name, id_node.span.file,
+                id_node.span.start_line, id_node.span.start_col);
+            if (content == "") {
+                // Match-arm payload binding (`value` in
+                // `Some(value) => pred(value)`).
+                content = eng.identifier_as_pattern_binding(id_node.name,
+                    id_node.span.file,
+                    id_node.span.start_line, id_node.span.start_col);
+            }
+            if (content != "") { hover_span = id_node.span; }
+        }
+    }
+
+    // Associated-type cursor: hovering `Item` in `type Item;` inside a
+    // trait body.  `AssocTypeDeclNode` is a plain struct (not an AST node),
+    // so the locator stops at the enclosing TraitDeclaration; scan its
+    // `assoc_types[]` for the one whose span covers the cursor and render
+    // `type Item` (with any declaration-site bounds).
+    if (content == "" && node.kind == NodeKind::TraitDeclaration) {
+        const td: TraitDeclNode* = node as TraitDeclNode*;
+        for (mut ai: i64 = 0; ai < td.assoc_types.length; ai++) {
+            const a: AssocTypeDeclNode* = td.assoc_types[ai];
+            if (a == null) { continue; }
+            if (NodeLocator::span_contains(a.span, cursor_line, cursor_char)) {
+                content    = eng.format_assoc_type(a);
+                hover_span = a.span;
+                break;
             }
         }
     }
@@ -687,8 +897,20 @@ public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
         // (primitives, generic params).
         const ann_root: TypeAnnotation* = HoverEngine::annotation_for_decl(node);
         if (ann_root != null) {
-            const named: NamedAnnotation* = NodeLocator::find_named_annotation_at(
+            // `This` token (`ZipIter<This, J>`): explain the implementing
+            // type it stands for.  Checked before the named-segment walk,
+            // which skips `ThisType` entirely.
+            const this_span: SourceSpan = NodeLocator::find_this_span_at(
                 ann_root, cursor_line, cursor_char);
+            if (this_span.has_location()) {
+                content    = eng.this_reference_type(node);
+                hover_span = this_span;
+            }
+
+            const named: NamedAnnotation* = if (content == "") {
+                NodeLocator::find_named_annotation_at(
+                    ann_root, cursor_line, cursor_char)
+            } else { null };
             if (named != null) {
                 const decl: ASTNode* = NodeLocator::find_type_decl_in_modules(
                     ctx.module_graph, ctx.intern_table, named.name);
@@ -696,6 +918,25 @@ public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
                     content    = eng.format_type_decl(decl);
                     hover_span = named.span;
                     doc_text   = (decl as DeclarationNode*).documentation;
+                } else {
+                    // Not a user-defined type - it's a generic type
+                    // parameter.  When the enclosing context bounds it,
+                    // render `I where I: Iterator`; an unbound param that the
+                    // enclosing decl declares (`J` in `zip<J>() -> ...<J>`)
+                    // renders as its bare name; anything else falls through.
+                    const leaf: string = HoverEngine::leaf_after_separator(
+                        ctx.intern_table.resolve(named.name));
+                    const suffix: string = eng.generic_param_where_suffix(
+                        named.name, node.span.file, cursor_line, cursor_char);
+                    if (suffix != "") {
+                        content    = leaf + suffix;
+                        hover_span = named.span;
+                    } else if (eng.enclosing_declares_generic_param(
+                            named.name, node, node.span.file,
+                            cursor_line, cursor_char)) {
+                        content    = leaf;
+                        hover_span = named.span;
+                    }
                 }
             }
         }
@@ -940,8 +1181,15 @@ type struct HoverEngine {
                 const d: TraitDeclNode* = node as TraitDeclNode*;
                 mut sig: string = "type trait " + this.arena.intern_table.resolve(d.name)
                     + this.format_generic_params(d.generic_params);
-                if (d.methods.length > 0) {
+                if (d.assoc_types.length > 0 || d.methods.length > 0) {
                     sig = sig + " {\n";
+                    // Associated types first (`type Item;`), then methods -
+                    // matching the usual source order in a trait body.
+                    for (mut ai: i64 = 0; ai < d.assoc_types.length; ai++) {
+                        const a: AssocTypeDeclNode* = d.assoc_types[ai];
+                        if (a == null) { continue; }
+                        sig = sig + "    " + this.format_assoc_type(a) + ";\n";
+                    }
                     for (mut i: i64 = 0; i < d.methods.length; i++) {
                         const m: FunctionDeclNode* = d.methods[i];
                         if (m == null) { continue; }
@@ -1058,6 +1306,22 @@ type struct HoverEngine {
         return s;
     }
 
+    /// Render an associated-type member as `type Item` or, when it carries
+    /// declaration-site constraints, `type Item: Copy + Clone`.  No trailing
+    /// `;` - the caller appends one where a member listing needs it.
+    format_assoc_type(&this, a: AssocTypeDeclNode*) -> string {
+        if (a == null) { return ""; }
+        mut s: string = "type " + this.intern.resolve(a.name);
+        if (a.bounds.length > 0) {
+            s = s + ": ";
+            for (mut i: i64 = 0; i < a.bounds.length; i++) {
+                if (i > 0) { s = s + " + "; }
+                s = s + this.format_trait_ref(&a.bounds[i]);
+            }
+        }
+        return s;
+    }
+
     /// Render a `TypeAnnotation*` as a one-line string.  Handles the
     /// common shapes generic-param defaults take: bare `Named` (e.g.
     /// `GlobalAlloc`), `Primitive` (e.g. `i32`), and pointer/reference
@@ -1076,7 +1340,8 @@ type struct HoverEngine {
             }
             TypeAnnotation::Reference(r) => {
                 const inner: string = this.format_annotation(r.inner);
-                const prefix: string = if (r.is_mutable) { "&mut " } else { "&" };
+                // Cryo spells a mutable reference `mut &T`, not `&mut T`.
+                const prefix: string = if (r.is_mutable) { "mut &" } else { "&" };
                 prefix + inner
             }
             TypeAnnotation::Optional(o)  => {
@@ -1177,12 +1442,199 @@ type struct HoverEngine {
         return s;
     }
 
+    /// The generic-param name a type denotes, or empty if it isn't a bare
+    /// generic / bounded param.  Peels Reference / Pointer so `mut &I` and
+    /// `I*` still report `I` - a receiver or by-pointer field typed on a
+    /// generic param should still surface the param's bound.
+    generic_param_name_of(&this, ty: TypeRef) -> SymbolStr {
+        if (this.arena == null || !ty.is_valid()) { return SymbolStr::empty(); }
+        const t: Type* = this.arena.lookup(ty.id);
+        if (t == null) { return SymbolStr::empty(); }
+        if (t.kind == TypeKind::GenericParam) {
+            return (t as GenericParamType*).param_name;
+        }
+        if (t.kind == TypeKind::BoundedParam) {
+            return (t as BoundedParamType*).param_name;
+        }
+        if (t.kind == TypeKind::Reference) {
+            return this.generic_param_name_of((t as ReferenceType*).referent);
+        }
+        if (t.kind == TypeKind::Pointer) {
+            return this.generic_param_name_of((t as PointerType*).pointee);
+        }
+        return SymbolStr::empty();
+    }
+
+    /// Render the ` where <pname>: <T1> + <T2>` suffix for `pname` if the
+    /// matching bound is present in `bounds`, else "".  Inline form: the
+    /// caller concatenates it right after the type (`inner: I where
+    /// I: Iterator`).
+    render_where_for_param(&this, bounds: &TraitBound[], pname: SymbolStr) -> string {
+        if (this.intern == null) { return ""; }
+        for (mut i: i64 = 0; i < bounds.length; i++) {
+            const b: &TraitBound = &bounds[i];
+            if (!b.type_parameter.equals(pname)) { continue; }
+            if (b.trait_refs.length == 0) { continue; }
+            mut s: string = " where " + this.intern.resolve(pname) + ": ";
+            for (mut j: i64 = 0; j < b.trait_refs.length; j++) {
+                if (j > 0) { s = s + " + "; }
+                s = s + this.format_trait_ref(&b.trait_refs[j]);
+            }
+            return s;
+        }
+        return "";
+    }
+
+    /// Find the ` where <pname>: <traits>` suffix visible at cursor position
+    /// `(file, line, col)` for generic param `pname`.  A param's bound can
+    /// sit on either the enclosing function/method's own `where` clause OR
+    /// the enclosing impl block's `where` clause - the common case: a struct
+    /// field typed `I` carries no bound on the struct, but the impl that
+    /// operates on it declares `implement<I> ... where I: Iterator`.  Scans
+    /// the file's top-level decls for whichever encloses the cursor.  Empty
+    /// when no enclosing decl bounds `pname` (an unconstrained param).
+    generic_param_where_suffix(&this, pname: SymbolStr, file: string,
+                               line: u32, col: u32) -> string {
+        if (this.graph == null || this.intern == null || !pname.is_valid()) {
+            return "";
+        }
+        const mod_idx: i64 = this.graph.find_module_by_path(file);
+        if (mod_idx < 0) { return ""; }
+        const ast: ProgramNode* = this.graph.get_module_ast(mod_idx as u32);
+        if (ast == null) { return ""; }
+        for (mut si: i64 = 0; si < ast.statements.length; si++) {
+            const stmt: ASTNode* = HoverEngine::unwrap_top_decl(ast.statements[si]);
+            if (stmt == null) { continue; }
+            if (stmt.kind == NodeKind::ImplementationBlock) {
+                const ib: ImplBlockNode* = stmt as ImplBlockNode*;
+                // The impl's span covers head-through-closing-brace, so a
+                // cursor anywhere inside a method body maps to this impl.
+                if (!NodeLocator::span_contains(ib.span, line, col)) { continue; }
+                const s: string = this.render_where_for_param(&ib.where_bounds, pname);
+                if (s != "") { return s; }
+                // A method may add its own `where` on top of the impl's.
+                for (mut mi: i64 = 0; mi < ib.methods.length; mi++) {
+                    const m: MethodNode* = ib.methods[mi];
+                    if (m == null || m.func == null) { continue; }
+                    if (!NodeLocator::span_contains(m.span, line, col)) { continue; }
+                    const ms: string = this.render_where_for_param(
+                        &m.func.trait_bounds, pname);
+                    if (ms != "") { return ms; }
+                }
+                return "";
+            }
+            if (stmt.kind == NodeKind::FunctionDeclaration) {
+                const f: FunctionDeclNode* = stmt as FunctionDeclNode*;
+                if (!NodeLocator::span_contains(f.span, line, col)) { continue; }
+                const s: string = this.render_where_for_param(&f.trait_bounds, pname);
+                if (s != "") { return s; }
+            }
+        }
+        return "";
+    }
+
+    /// If `ty` is a bare generic param bound in the context at
+    /// `(file, line, col)`, append its ` where <p>: <traits>` suffix to
+    /// `content` (inline form).  No-op when `content` is empty, `ty` isn't
+    /// a generic param, or the param is unconstrained here.  The single
+    /// entry point the render sites (field / member / identifier-use) call
+    /// so the bound-surfacing rule lives in one place.
+    append_param_bound(&this, content: string, ty: TypeRef, file: string,
+                       line: u32, col: u32) -> string {
+        if (content == "") { return content; }
+        const pname: SymbolStr = this.generic_param_name_of(ty);
+        if (!pname.is_valid()) { return content; }
+        return content + this.generic_param_where_suffix(pname, file, line, col);
+    }
+
+    /// The type `This` stands for, as code.  `node` is the enclosing
+    /// function/method decl the `This` token sits in (a signature-position
+    /// cursor lands on it - and the return-type token is outside the body a
+    /// position walk would search).  In a trait method `This` is the
+    /// implementing type, bounded by the enclosing trait -> `This: Iterator`.
+    /// In an impl/inherent method it is that concrete owner -> `This = ChainIter`.
+    /// Bare `This` when neither can be determined.
+    this_reference_type(&this, node: ASTNode*) -> string {
+        mut f: FunctionDeclNode* = null;
+        if (node.kind == NodeKind::FunctionDeclaration) {
+            f = node as FunctionDeclNode*;
+        } else if (node.kind == NodeKind::MethodDeclaration) {
+            f = (node as MethodNode*).func;
+        }
+        if (f != null) {
+            const trait_owner: SymbolStr = NodeLocator::find_trait_for_function(
+                this.graph, f);
+            if (trait_owner.is_valid()) {
+                return "This: " + HoverEngine::leaf_after_separator(
+                    this.intern.resolve(trait_owner));
+            }
+        }
+        if (node.kind == NodeKind::MethodDeclaration) {
+            const owner: SymbolStr = NodeLocator::find_method_owner(
+                this.graph, node as MethodNode*);
+            if (owner.is_valid()) {
+                return "This = " + HoverEngine::leaf_after_separator(
+                    this.intern.resolve(owner));
+            }
+        }
+        return "This";
+    }
+
+    /// True when the context at `(file, line, col)` declares a generic
+    /// parameter named `name` - on the enclosing function/method, or the
+    /// enclosing impl block, or the enclosing trait.  Lets an unbound
+    /// param token (`J` in `ZipIter<This, J>`) hover as its bare name
+    /// rather than falling back to the whole enclosing type.
+    enclosing_declares_generic_param(&this, name: SymbolStr, node: ASTNode*,
+                                     file: string, line: u32, col: u32) -> boolean {
+        if (this.graph == null || !name.is_valid()) { return false; }
+        // The located decl itself (a signature-position cursor - `J` in a
+        // return type - lands on the method/function decl whose own
+        // generic params a position walk of the body would never reach).
+        if (HoverEngine::param_list_has(
+                HoverEngine::generic_params_of_decl(node), name)) {
+            return true;
+        }
+        const f: FunctionDeclNode* = NodeLocator::find_enclosing_function(
+            this.graph, file, line, col);
+        if (f != null && HoverEngine::param_list_has(&f.generic_params, name)) {
+            return true;
+        }
+        const mod_idx: i64 = this.graph.find_module_by_path(file);
+        if (mod_idx < 0) { return false; }
+        const ast: ProgramNode* = this.graph.get_module_ast(mod_idx as u32);
+        if (ast == null) { return false; }
+        for (mut si: i64 = 0; si < ast.statements.length; si++) {
+            const stmt: ASTNode* = HoverEngine::unwrap_top_decl(ast.statements[si]);
+            if (stmt == null) { continue; }
+            if (!NodeLocator::span_contains(stmt.span, line, col)) { continue; }
+            if (HoverEngine::param_list_has(
+                    HoverEngine::generic_params_of_decl(stmt), name)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// True when `params` (may be null) contains a generic param named `name`.
+    static param_list_has(params: GenericParamNode*[]*, name: SymbolStr) -> boolean {
+        if (params == null) { return false; }
+        for (mut i: i64 = 0; i < (*params).length; i++) {
+            const gp: GenericParamNode* = (*params)[i];
+            if (gp != null && gp.name.equals(name)) { return true; }
+        }
+        return false;
+    }
+
     /// Render a method receiver as `this: <ReceiverType>`.  The receiver
     /// type is whatever sema resolved on the synthetic `&this` /
     /// `mut &this` / `this` `VarDeclNode` - that already includes the
     /// `&` / `&mut` / value shape, so the formatter doesn't need to
     /// reconstruct it from the name lexeme.
     format_receiver(&this, v: VarDeclNode*) -> string {
+        // A by-value `this` receiver in a template has no resolved self type;
+        // render bare `this` (as written) rather than `this: ?`.
+        if (!v.resolved_type.is_valid()) { return "this"; }
         return "this: " + this.arena.resolve_display_name_short(v.resolved_type.id);
     }
 
@@ -1208,7 +1660,12 @@ type struct HoverEngine {
                 "const " + name_str + ": " + type_str + init_suffix
             }
             SymbolKind::Parameter => {
-                const prefix: string = if (sym.is_mutable) { "mut " } else { "" };
+                // A parameter is an immutable binding unless declared `mut`,
+                // so render it the same as a local: `const` / `mut`.  This
+                // keeps a param's use-site hover consistent with its
+                // declaration hover (`format_variable_decl`), which already
+                // prefixes `const`.
+                const prefix: string = if (sym.is_mutable) { "mut " } else { "const " };
                 prefix + name_str + ": " + type_str
             }
             SymbolKind::Field     => {
@@ -1242,7 +1699,11 @@ type struct HoverEngine {
                 "const " + name_str + ": " + type_str + init_suffix
             }
             SymbolKind::Parameter => {
-                const prefix: string = if (sym.is_mutable) { "mut " } else { "" };
+                // A parameter is an immutable binding unless declared `mut`,
+                // so render it the same as a local: `const` / `mut`.  Keeps a
+                // param's use-site hover consistent with its declaration
+                // hover (`format_variable_decl`), which prefixes `const`.
+                const prefix: string = if (sym.is_mutable) { "mut " } else { "const " };
                 prefix + name_str + ": " + type_str
             }
             SymbolKind::Field     => {
@@ -1261,11 +1722,32 @@ type struct HoverEngine {
             if (i > 0) { s = s + ", "; }
             const p: VarDeclNode* = params[i];
             if (p == null) { continue; }
-            s = s + this.arena.intern_table.resolve(p.name);
-            s = s + ": ";
-            s = s + this.arena.resolve_display_name_short(p.resolved_type.id);
+            const raw: string = this.arena.intern_table.resolve(p.name);
+            s = s + HoverEngine::param_name_display(raw);
+            // A by-value `this` receiver in a trait template has no resolved
+            // self type yet - render bare `this` (as written in source),
+            // not `this: ?`.  The `&this` / `mut &this` forms always carry a
+            // valid reference type, so they still show `this: mut &Type`.
+            if (strcmp(raw, "this") == 0 && !p.resolved_type.is_valid()) {
+                // bare receiver, no type suffix
+            } else {
+                s = s + ": ";
+                s = s + this.arena.resolve_display_name_short(p.resolved_type.id);
+            }
         }
         return s + ")";
+    }
+
+    /// A receiver parameter is stored under its literal lexeme (`&this`,
+    /// `mut &this`, or `&mut this`); render all three as just `this` so a
+    /// signature reads `next(this: mut &This)`, not `next(&this: ...)`.  The
+    /// borrow/mutability shape already shows in the param's type.  Any other
+    /// name passes through unchanged.
+    static param_name_display(name: string) -> string {
+        if (strcmp(name, "&this")     == 0) { return "this"; }
+        if (strcmp(name, "mut &this") == 0) { return "this"; }
+        if (strcmp(name, "&mut this") == 0) { return "this"; }
+        return name;
     }
 
     /// Render a numeric literal as `<value>: <inferred-type>` - for
@@ -1309,6 +1791,80 @@ type struct HoverEngine {
             HoverEngine::variant_auto_index(parent, variant)
         };
         return sig + " = " + HoverEngine::i64_to_text(disc);
+    }
+
+    /// Render a payload binding from an enum pattern (`value` in
+    /// `Option::Some(value)`) as `value: <payload type>`.  The type is the
+    /// matched variant's declared associated type at the binding's
+    /// positional index (`Some(T)` -> `T`); falls back to the bare name
+    /// when the enum/variant/position can't be resolved.
+    format_pattern_binding(&this, ep: EnumPatternNode*, index: i64,
+                           pb: PatternBinding*) -> string {
+        if (pb == null) { return ""; }
+        mut s: string = this.intern.resolve(pb.name);
+        const td: ASTNode* = NodeLocator::find_type_decl_in_modules(
+            this.graph, this.intern, ep.enum_name);
+        if (td != null && td.kind == NodeKind::EnumDeclaration) {
+            const ed: EnumDeclNode* = td as EnumDeclNode*;
+            const v: EnumVariantNode* = HoverEngine::find_variant_in_enum(
+                ed, ep.variant_name);
+            if (v != null && index >= 0 && index < v.associated_types.length) {
+                const ann: string = this.format_annotation(v.associated_types[index]);
+                if (ann != "" && ann != "?") { s = s + ": " + ann; }
+            }
+        }
+        return s;
+    }
+
+    /// AST fallback for an identifier the resolver didn't track (a use
+    /// inside a trait default-method / generic template body, where sema
+    /// records no span->sym).  If the enclosing function declares a
+    /// parameter of that name, render it as its declaration form
+    /// (`const pred: (This::Item) -> boolean`).  Empty when no enclosing
+    /// function or no matching parameter.
+    identifier_as_param(&this, name: SymbolStr, file: string,
+                        line: u32, col: u32) -> string {
+        const f: FunctionDeclNode* = NodeLocator::find_enclosing_function(
+            this.graph, file, line, col);
+        if (f == null) { return ""; }
+        for (mut i: i64 = 0; i < f.parameters.length; i++) {
+            const p: VarDeclNode* = f.parameters[i];
+            if (p == null || !p.name.equals(name)) { continue; }
+            if (this.is_receiver_param(p)) { return this.format_receiver(p); }
+            mut s: string = if (p.is_mutable) { "mut " } else { "const " };
+            s = s + this.intern.resolve(p.name) + ": ";
+            if (p.resolved_type.is_valid()) {
+                s = s + this.arena.resolve_display_name_short(p.resolved_type.id);
+            } else if (p.type_annotation != null) {
+                s = s + this.format_annotation(p.type_annotation);
+            } else {
+                s = s + "?";
+            }
+            return s;
+        }
+        return "";
+    }
+
+    /// AST fallback for a pattern-binding *use* the resolver didn't track
+    /// (`value` in `Some(value) => pred(value)`).  Find the enclosing match
+    /// arm, scan its enum patterns for a binding of that name, and render it
+    /// (`value: <payload type>`).  Empty when no enclosing arm binds it.
+    identifier_as_pattern_binding(&this, name: SymbolStr, file: string,
+                                  line: u32, col: u32) -> string {
+        const arm: MatchArmNode* = NodeLocator::find_enclosing_match_arm(
+            this.graph, file, line, col);
+        if (arm == null) { return ""; }
+        for (mut pi: i64 = 0; pi < arm.patterns.length; pi++) {
+            const pn: PatternNode* = arm.patterns[pi];
+            if (pn == null || pn.pattern_kind != PatternKind::Enum) { continue; }
+            const ep: EnumPatternNode* = pn as EnumPatternNode*;
+            for (mut ei: i64 = 0; ei < ep.elements.length; ei++) {
+                const pb: PatternBinding* = ep.binding_at(ei);
+                if (pb == null || !pb.name.equals(name)) { continue; }
+                return this.format_pattern_binding(ep, ei, pb);
+            }
+        }
+        return "";
     }
 
 
@@ -1365,22 +1921,59 @@ type struct HoverEngine {
         if (!carrier.is_valid())     { return null; }
         if (!method_name.is_valid()) { return null; }
 
+        // The bound on `carrier` can sit on either the enclosing function/
+        // method's own `where` clause OR the enclosing impl block's `where`
+        // clause.  The impl case is the common one: a struct field typed
+        // `J` carries no bound on the struct, but the impl operating on it
+        // declares `implement<I, J, A> ... where J: Iterator<A>` - so
+        // `this.second.next()` inside that impl resolves `next` through the
+        // impl's `where_bounds`, not the `next` method's own (empty) ones.
+
+        // 1. Enclosing function/method's own trait bounds.
         const fdecl: FunctionDeclNode* = NodeLocator::find_enclosing_function(
             this.graph, file_path, line, character);
-        if (fdecl == null) { return null; }
+        if (fdecl != null) {
+            const f: FunctionDeclNode* = this.trait_method_from_bounds(
+                &fdecl.trait_bounds, carrier, method_name);
+            if (f != null) { return f; }
+        }
 
-        // Walk this function's trait bounds + every enclosing method's
-        // bounds (where-clause on an outer impl/method) to find one whose
-        // type_parameter equals the carrier.  For the common case the
-        // immediate function carries the bound - we only need the local
-        // scan.
-        for (mut bi: i64 = 0; bi < fdecl.trait_bounds.length; bi++) {
-            const b: &TraitBound = &fdecl.trait_bounds[bi];
+        // 2. Enclosing impl block's where clause.  Its span covers the whole
+        //    body, so a cursor inside any method maps to this impl.
+        if (this.graph != null && file_path != "") {
+            const mod_idx: i64 = this.graph.find_module_by_path(file_path);
+            if (mod_idx >= 0) {
+                const ast: ProgramNode* = this.graph.get_module_ast(mod_idx as u32);
+                if (ast != null) {
+                    for (mut si: i64 = 0; si < ast.statements.length; si++) {
+                        const stmt: ASTNode* = HoverEngine::unwrap_top_decl(
+                            ast.statements[si]);
+                        if (stmt == null) { continue; }
+                        if (stmt.kind != NodeKind::ImplementationBlock) { continue; }
+                        const ib: ImplBlockNode* = stmt as ImplBlockNode*;
+                        if (!NodeLocator::span_contains(ib.span, line, character)) {
+                            continue;
+                        }
+                        const f: FunctionDeclNode* = this.trait_method_from_bounds(
+                            &ib.where_bounds, carrier, method_name);
+                        if (f != null) { return f; }
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    /// Scan `bounds` for one whose `type_parameter` equals `carrier`, then
+    /// look up `method_name` on each trait the bound names (left-to-right,
+    /// first match wins) - a multi-bound `T: Display + Debug` where both
+    /// declare the method is unusual, so source order is the truest read.
+    /// Returns the trait method's FunctionDeclNode, or null.
+    trait_method_from_bounds(&this, bounds: &TraitBound[], carrier: SymbolStr,
+                             method_name: SymbolStr) -> FunctionDeclNode* {
+        for (mut bi: i64 = 0; bi < bounds.length; bi++) {
+            const b: &TraitBound = &bounds[bi];
             if (!b.type_parameter.equals(carrier)) { continue; }
-            // Walk the bound's traits left-to-right.  First match wins;
-            // a multi-bound (`T: Display + Debug`) where both traits
-            // declare `fmt` is unusual but the leftmost is the most
-            // direct read of source order.
             for (mut ti: i64 = 0; ti < b.trait_refs.length; ti++) {
                 const tref: &TraitRef = &b.trait_refs[ti];
                 if (tref.path.length == 0) { continue; }
@@ -1438,6 +2031,49 @@ type struct HoverEngine {
         if (v == null) { return SymbolStr::empty(); }
         if (v.type_annotation == null) { return SymbolStr::empty(); }
         return HoverEngine::annotation_carrier_name(v.type_annotation);
+    }
+
+    /// Carrier-type SymbolStr for a receiver that is itself a field read
+    /// (`this.second` in `this.second.next()`).  Sema often leaves such a
+    /// nested member access's resolved_type unstamped in a template body,
+    /// and `receiver_carrier_name_from_annotation` only handles identifier
+    /// receivers - so recover the field's declared type from the AST:
+    ///   1. `recv` must be a MemberAccess `<base>.<field>`.
+    ///   2. Resolve the owner type of `<base>` (`this` -> enclosing method
+    ///      owner; an identifier param/local -> its annotation carrier).
+    ///   3. Find `<field>` on that owner and return its annotation's leaf
+    ///      name (`J`), which the trait-method lookup keys on.
+    /// Empty when any step misses.
+    member_field_carrier_name(&this, recv: ExpressionNode*) -> SymbolStr {
+        if (recv == null || recv.kind != NodeKind::MemberAccess) {
+            return SymbolStr::empty();
+        }
+        const inner: MemberAccessNode* = recv as MemberAccessNode*;
+        if (inner.object == null) { return SymbolStr::empty(); }
+
+        // Owner type of the base object.
+        mut owner: SymbolStr = SymbolStr::empty();
+        if (inner.object.kind == NodeKind::Identifier && this.intern != null) {
+            const base_id: IdentifierNode* = inner.object as IdentifierNode*;
+            const this_sym: SymbolStr = this.intern.intern("this");
+            if (base_id.name.is_valid() && base_id.name.equals(this_sym)
+                    && base_id.span.has_location()) {
+                owner = NodeLocator::find_enclosing_method_owner(
+                    this.graph, base_id.span.file,
+                    base_id.span.start_line, base_id.span.start_col);
+            } else {
+                // A named local/param whose type is a struct we can name.
+                owner = this.receiver_carrier_name_from_annotation(inner.object);
+            }
+        }
+        if (!owner.is_valid()) { return SymbolStr::empty(); }
+
+        const fld: FieldDeclNode* = NodeLocator::find_field_in_modules(
+            this.graph, this.intern, owner, inner.member);
+        if (fld == null || fld.type_annotation == null) {
+            return SymbolStr::empty();
+        }
+        return HoverEngine::annotation_carrier_name(fld.type_annotation);
     }
 
     /// Strip Reference, Pointer, and InstantiatedType wrappers from `ty`
@@ -1912,6 +2548,37 @@ type struct HoverEngine {
         return null;
     }
 
+    /// The `generic_params[]` a decl declares (function/method/impl/trait/
+    /// struct/class/enum), or null for kinds without any.  Lets an unbound
+    /// generic-param token be recognized as such at a use site.
+    static generic_params_of_decl(node: ASTNode*) -> GenericParamNode*[]* {
+        if (node == null) { return null; }
+        if (node.kind == NodeKind::FunctionDeclaration) {
+            return &(node as FunctionDeclNode*).generic_params;
+        }
+        if (node.kind == NodeKind::MethodDeclaration) {
+            const m: MethodNode* = node as MethodNode*;
+            if (m.func == null) { return null; }
+            return &m.func.generic_params;
+        }
+        if (node.kind == NodeKind::ImplementationBlock) {
+            return &(node as ImplBlockNode*).generic_params;
+        }
+        if (node.kind == NodeKind::TraitDeclaration) {
+            return &(node as TraitDeclNode*).generic_params;
+        }
+        if (node.kind == NodeKind::StructDeclaration) {
+            return &(node as StructDeclNode*).generic_params;
+        }
+        if (node.kind == NodeKind::ClassDeclaration) {
+            return &(node as ClassDeclNode*).generic_params;
+        }
+        if (node.kind == NodeKind::EnumDeclaration) {
+            return &(node as EnumDeclNode*).generic_params;
+        }
+        return null;
+    }
+
     static annotation_for_decl(node: ASTNode*) -> TypeAnnotation* {
         if (node == null) { return null; }
         if (node.kind == NodeKind::FunctionDeclaration) {
@@ -2275,6 +2942,31 @@ type struct HoverEngine {
         for (mut i: i64 = 0; i < parent.variants.length; i++) {
             const v: EnumVariantNode* = parent.variants[i];
             if (v != null && v.name.equals(name)) { return v; }
+        }
+        return null;
+    }
+
+    /// Find the first enum decl in the graph that declares a variant named
+    /// `name`.  Used for unqualified match-arm patterns (`FOO` for
+    /// `MyEnum::FOO`), which carry no enum qualifier.  First match wins:
+    /// variant names are near-unique across a program, and callers only
+    /// reach here for a bare identifier that named no const.  Returns null
+    /// when no enum declares the variant (a genuine capture binding).
+    find_enum_with_variant(&this, name: SymbolStr) -> EnumDeclNode* {
+        if (this.graph == null) { return null; }
+        const n: u32 = this.graph.module_count();
+        for (mut mi: u32 = 0; mi < n; mi++) {
+            const ast: ProgramNode* = this.graph.get_module_ast(mi);
+            if (ast == null) { continue; }
+            for (mut si: i64 = 0; si < ast.statements.length; si++) {
+                const stmt: ASTNode* = HoverEngine::unwrap_top_decl(ast.statements[si]);
+                if (stmt == null) { continue; }
+                if (stmt.kind != NodeKind::EnumDeclaration) { continue; }
+                const ed: EnumDeclNode* = stmt as EnumDeclNode*;
+                if (HoverEngine::find_variant_in_enum(ed, name) != null) {
+                    return ed;
+                }
+            }
         }
         return null;
     }

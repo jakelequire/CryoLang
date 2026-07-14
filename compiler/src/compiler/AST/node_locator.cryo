@@ -542,6 +542,48 @@ public function find_named_annotation_at(ann: TypeAnnotation*,
 }
 
 
+/// Span of a `This` (`ThisType`) annotation covering `(line, ch)`, or
+/// `SourceSpan::none()` when the cursor isn't on a `This` token.
+/// `find_named_annotation_at` skips `ThisType` (it names no declaring node),
+/// so the LSP uses this sibling walk to render a dedicated `This` hover.
+public function find_this_span_at(ann: TypeAnnotation*, line: u32, ch: u32) -> SourceSpan {
+    if (ann == null) { return SourceSpan::none(); }
+    if (!span_contains(annotation_span(ann), line, ch)) { return SourceSpan::none(); }
+    match (*ann) {
+        TypeAnnotation::ThisType(t) => { return t.span; }
+        TypeAnnotation::Pointer(p)  => { return find_this_span_at(p.inner, line, ch); }
+        TypeAnnotation::Reference(r) => { return find_this_span_at(r.inner, line, ch); }
+        TypeAnnotation::Optional(o) => { return find_this_span_at(o.inner, line, ch); }
+        TypeAnnotation::Array(a)    => { return find_this_span_at(a.element, line, ch); }
+        TypeAnnotation::Generic(g) => {
+            const base_hit: SourceSpan = find_this_span_at(g.base, line, ch);
+            if (base_hit.has_location()) { return base_hit; }
+            for (mut i: i64 = 0; i < g.args.length; i++) {
+                const arg_hit: SourceSpan = find_this_span_at(g.args[i], line, ch);
+                if (arg_hit.has_location()) { return arg_hit; }
+            }
+            return SourceSpan::none();
+        }
+        TypeAnnotation::Tuple(t) => {
+            for (mut i: i64 = 0; i < t.elements.length; i++) {
+                const hit: SourceSpan = find_this_span_at(t.elements[i], line, ch);
+                if (hit.has_location()) { return hit; }
+            }
+            return SourceSpan::none();
+        }
+        TypeAnnotation::Function(f) => {
+            for (mut i: i64 = 0; i < f.parameters.length; i++) {
+                const hit: SourceSpan = find_this_span_at(f.parameters[i], line, ch);
+                if (hit.has_location()) { return hit; }
+            }
+            return find_this_span_at(f.return_type, line, ch);
+        }
+        _ => { return SourceSpan::none(); }
+    }
+    return SourceSpan::none();
+}
+
+
 /// Position/name lookup helpers for LSP (go-to-def, hover, enclosing-scope).
 /// Stateless `static`s over the AST + module graph; the `public function`
 /// API above dispatches into these.
@@ -1205,6 +1247,167 @@ type struct NodeLocator {
         }
         return null;
     }
+
+
+    // Enclosing match arm
+
+    /// Find the innermost match arm whose BODY span covers `(line,
+    /// character)` in `file`.  The LSP uses this to resolve a pattern-binding
+    /// *use* (`value` in `Some(value) => pred(value)`): the resolver records
+    /// no span->sym for pattern bindings, so hover recovers the binding by
+    /// scanning the enclosing arm's patterns.  Null when no arm body covers
+    /// the position.
+    static find_enclosing_match_arm(graph: ModuleGraph*, file: string,
+                                    line: u32, character: u32) -> MatchArmNode* {
+        if (graph == null || file == "") { return null; }
+        const mod_idx: i64 = graph.find_module_by_path(file);
+        if (mod_idx < 0) { return null; }
+        const ast: ProgramNode* = graph.get_module_ast(mod_idx as u32);
+        if (ast == null) { return null; }
+        for (mut si: i64 = 0; si < ast.statements.length; si++) {
+            const found: MatchArmNode* = NodeLocator::match_arm_in(
+                ast.statements[si], line, character);
+            if (found != null) { return found; }
+        }
+        return null;
+    }
+
+/// Recurse the containers where a `match` can appear, returning the
+/// innermost arm whose body covers the position.  Mirrors the structural
+/// dispatch of `node_contains_callee`, but descends only the container
+/// kinds (blocks, loops, conditionals, statements, decls) - it does not
+/// need every expression form, only the ones that can hold a match body.
+static match_arm_in(node: ASTNode*, line: u32, character: u32) -> MatchArmNode* {
+    if (node == null) { return null; }
+
+    if (node.kind == NodeKind::MatchStatement) {
+        const m: MatchStmtNode* = node as MatchStmtNode*;
+        return NodeLocator::deepest_arm(&m.arms, line, character);
+    }
+    if (node.kind == NodeKind::MatchExpression) {
+        const m: MatchExprNode* = node as MatchExprNode*;
+        return NodeLocator::deepest_arm(&m.arms, line, character);
+    }
+    if (node.kind == NodeKind::BlockStatement) {
+        const b: BlockStmtNode* = node as BlockStmtNode*;
+        for (mut i: i64 = 0; i < b.statements.length; i++) {
+            const f: MatchArmNode* = NodeLocator::match_arm_in(
+                b.statements[i], line, character);
+            if (f != null) { return f; }
+        }
+        return null;
+    }
+    if (node.kind == NodeKind::UnsafeBlockStatement) {
+        const u: UnsafeBlockStmtNode* = node as UnsafeBlockStmtNode*;
+        return NodeLocator::match_arm_in(u.block as ASTNode*, line, character);
+    }
+    if (node.kind == NodeKind::LoopStatement) {
+        const s: LoopStmtNode* = node as LoopStmtNode*;
+        return NodeLocator::match_arm_in(s.body as ASTNode*, line, character);
+    }
+    if (node.kind == NodeKind::WhileStatement) {
+        const s: WhileStmtNode* = node as WhileStmtNode*;
+        return NodeLocator::match_arm_in(s.body as ASTNode*, line, character);
+    }
+    if (node.kind == NodeKind::DoWhileStatement) {
+        const s: DoWhileStmtNode* = node as DoWhileStmtNode*;
+        return NodeLocator::match_arm_in(s.body as ASTNode*, line, character);
+    }
+    if (node.kind == NodeKind::ForStatement) {
+        const s: ForStmtNode* = node as ForStmtNode*;
+        return NodeLocator::match_arm_in(s.body as ASTNode*, line, character);
+    }
+    if (node.kind == NodeKind::IfStatement) {
+        const s: IfStmtNode* = node as IfStmtNode*;
+        const t: MatchArmNode* = NodeLocator::match_arm_in(
+            s.then_stmt as ASTNode*, line, character);
+        if (t != null) { return t; }
+        return NodeLocator::match_arm_in(s.else_stmt as ASTNode*, line, character);
+    }
+    if (node.kind == NodeKind::IfExpression) {
+        const s: IfExprNode* = node as IfExprNode*;
+        const t: MatchArmNode* = NodeLocator::match_arm_in(
+            s.then_expr as ASTNode*, line, character);
+        if (t != null) { return t; }
+        return NodeLocator::match_arm_in(s.else_expr as ASTNode*, line, character);
+    }
+    if (node.kind == NodeKind::ReturnStatement) {
+        const r: ReturnStmtNode* = node as ReturnStmtNode*;
+        return NodeLocator::match_arm_in(r.expression as ASTNode*, line, character);
+    }
+    if (node.kind == NodeKind::ExpressionStatement) {
+        const s: ExprStmtNode* = node as ExprStmtNode*;
+        return NodeLocator::match_arm_in(s.expression as ASTNode*, line, character);
+    }
+    if (node.kind == NodeKind::DeclarationStatement) {
+        const s: DeclStmtNode* = node as DeclStmtNode*;
+        return NodeLocator::match_arm_in(s.declaration as ASTNode*, line, character);
+    }
+    if (node.kind == NodeKind::VariableDeclaration) {
+        const v: VarDeclNode* = node as VarDeclNode*;
+        return NodeLocator::match_arm_in(v.initializer as ASTNode*, line, character);
+    }
+    if (node.kind == NodeKind::FunctionDeclaration) {
+        const f: FunctionDeclNode* = node as FunctionDeclNode*;
+        return NodeLocator::match_arm_in(f.body as ASTNode*, line, character);
+    }
+    if (node.kind == NodeKind::MethodDeclaration) {
+        const m: MethodNode* = node as MethodNode*;
+        if (m.func == null) { return null; }
+        return NodeLocator::match_arm_in(m.func.body as ASTNode*, line, character);
+    }
+    if (node.kind == NodeKind::ImplementationBlock) {
+        const d: ImplBlockNode* = node as ImplBlockNode*;
+        return NodeLocator::arm_in_methods(&d.methods, line, character);
+    }
+    if (node.kind == NodeKind::TraitDeclaration) {
+        const d: TraitDeclNode* = node as TraitDeclNode*;
+        for (mut i: i64 = 0; i < d.methods.length; i++) {
+            const f: MatchArmNode* = NodeLocator::match_arm_in(
+                d.methods[i] as ASTNode*, line, character);
+            if (f != null) { return f; }
+        }
+        return null;
+    }
+    if (node.kind == NodeKind::StructDeclaration) {
+        const d: StructDeclNode* = node as StructDeclNode*;
+        return NodeLocator::arm_in_methods(&d.methods, line, character);
+    }
+    if (node.kind == NodeKind::ClassDeclaration) {
+        const d: ClassDeclNode* = node as ClassDeclNode*;
+        return NodeLocator::arm_in_methods(&d.methods, line, character);
+    }
+    if (node.kind == NodeKind::UnionDeclaration) {
+        const d: UnionDeclNode* = node as UnionDeclNode*;
+        return NodeLocator::arm_in_methods(&d.methods, line, character);
+    }
+    return null;
+}
+
+/// Pick the arm whose body covers the position, then recurse into that
+/// body for a still-deeper (nested-match) arm.  Deepest wins so a hover
+/// inside `match { A => match { B => ... } }` resolves to the inner arm.
+static deepest_arm(arms: &MatchArmNode*[], line: u32, character: u32) -> MatchArmNode* {
+    for (mut i: i64 = 0; i < arms.length; i++) {
+        const arm: MatchArmNode* = arms[i];
+        if (arm == null || arm.body == null) { continue; }
+        if (span_contains(arm.body.span, line, character)) {
+            const deeper: MatchArmNode* = NodeLocator::match_arm_in(
+                arm.body as ASTNode*, line, character);
+            return if (deeper != null) { deeper } else { arm };
+        }
+    }
+    return null;
+}
+
+static arm_in_methods(arr: &MethodNode*[], line: u32, character: u32) -> MatchArmNode* {
+    for (mut i: i64 = 0; i < arr.length; i++) {
+        const f: MatchArmNode* = NodeLocator::match_arm_in(
+            arr[i] as ASTNode*, line, character);
+        if (f != null) { return f; }
+    }
+    return null;
+}
 
     /// DFS over the AST looking for a `CallExprNode` whose `callee` is
     /// `target`.  Per-kind dispatch over the structural children; adding

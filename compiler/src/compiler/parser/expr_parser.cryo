@@ -1941,9 +1941,14 @@ public:
         // followed by another `::` then `Bar` is just another namespace
         // segment and the *next* identifier is a candidate variant name.
         // Repeat until the lookahead is no longer `::`.
+        // `path_end_tok` tracks the last segment of the enum-path portion so
+        // the LSP can span the path (`Option` / `A::B`) apart from the
+        // variant (`Some` / `C`).
         mut enum_path: string = first_tok.lexeme;
+        mut path_end_tok: Token = first_tok;
         while (this.check(TokenType::ColonColon)) {
             enum_path = format("%s::%s", enum_path, variant_tok.lexeme);
+            path_end_tok = variant_tok;
             this.advance(); // consume '::'
             variant_tok = this.consume(TokenType::Identifier, "variant name");
         }
@@ -1951,6 +1956,10 @@ public:
         mut pat: EnumPatternNode* = new EnumPatternNode(this.span_from_token(start));
         pat.set_enum_name(this.ctx.intern(enum_path));
         pat.set_variant_name(this.intern_lexeme(variant_tok));
+        pat.set_segment_spans(
+            ParserBase::merge_spans(this.span_from_token(first_tok),
+                                    this.span_from_token(path_end_tok)),
+            this.span_from_token(variant_tok));
 
         // Optional destructuring: Variant(a, b, _)
         if (this.check(TokenType::LParen)) {
@@ -2181,8 +2190,12 @@ public:
             this.consume(TokenType::Identifier, "member name after '::'")
         };
         const member_name: SymbolStr = this.intern_lexeme(member_tok);
-        const span: SourceSpan = ParserBase::merge_spans(start_span, this.span_from_token(member_tok));
+        const member_span: SourceSpan = this.span_from_token(member_tok);
+        const span: SourceSpan = ParserBase::merge_spans(start_span, member_span);
         mut sr: ScopeResolutionNode* = new ScopeResolutionNode(scope_name, member_name, span);
+        // Record the scope/member token spans separately so LSP hover can
+        // resolve each side of `Scope::member` independently.
+        sr.set_segment_spans(start_span, member_span);
 
         // Set scope-level generic args if present (e.g. Foo<T>::bar)
         if (scope_gen_args.length > 0) {
