@@ -24,6 +24,8 @@ import core::ptr;
 import core::drop;
 import core::clone;
 import core::cmp;
+import core::hash;
+import core::default;
 import core::iter;
 import alloc::layout;
 import alloc::allocator;
@@ -746,6 +748,50 @@ where T: Clone {
             i++;
         }
         return out;
+    }
+}
+
+/// A fresh empty `Array` — the canonical "zero value" so `Array<T>` can be a
+/// `T: Default` field / satisfy a `Default` bound. Allocates nothing.
+implement<T> trait Default for struct Array<T> {
+    static default() -> Array<T> {
+        return Array<T>::new();
+    }
+}
+
+// Eq / Hash carry the FULL `<T, A>` arity (like `Drop` above), not the
+// defaulted-allocator `<T>` form `Clone` uses: a bare-name method call
+// (`.equals()`) resolves against either, but a *trait bound* — `Array<i32>` as
+// a `HashMap` key, or `T: Eq`/`T: Hash` on a fully-applied
+// `Array<i32, GlobalAlloc>` — is only satisfied when the impl names the
+// allocator param too.
+
+/// Element-wise equality: equal length and every element equal in order.
+implement<T, A> trait Eq for struct Array<T, A>
+where T: Eq, A: Allocator {
+    equals(&this, other: &Array<T, A>) -> boolean {
+        if (this.length != other.length) { return false; }
+        mut i: u64 = 0;
+        while (i < this.length) {
+            if (!this.ptr[i].equals(&other.ptr[i])) { return false; }
+            i = i + 1;
+        }
+        return true;
+    }
+}
+
+/// Order-sensitive hash: fold the length first (so `[1, 2]` and `[1, 2, 0]`
+/// differ) then each element in order. Consistent with `Eq` above.
+implement<T, A> trait Hash for struct Array<T, A>
+where T: Hash, A: Allocator {
+    hash<H>(&this, hasher: mut &H) -> void
+    where H: Hasher {
+        this.length.hash(hasher);
+        mut i: u64 = 0;
+        while (i < this.length) {
+            this.ptr[i].hash(hasher);
+            i = i + 1;
+        }
     }
 }
 

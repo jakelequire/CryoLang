@@ -70,10 +70,20 @@ type struct IpV4Addr {
              | (this.d as u32);
     }
 
-    /// Parse canonical `a.b.c.d`. Returns `None` on any failure:
-    /// extra whitespace, out-of-range octets, missing or extra dots,
-    /// leading/trailing separators.
-    static parse(source: Str) -> Option<IpV4Addr> {
+    /// Parse canonical `a.b.c.d`. Returns `Err(ConversionError)` on any
+    /// failure (extra whitespace, out-of-range octets, missing or extra dots,
+    /// leading/trailing separators); the error is describable/printable. Use
+    /// `parse_opt` if you only need presence, not the reason.
+    static parse(source: Str) -> Result<IpV4Addr, ConversionError> {
+        match (IpV4Addr::parse_opt(source)) {
+            Option::Some(addr) => { return Result::Ok(addr); }
+            Option::None       => { return Result::Err(ConversionError::new("invalid IPv4 address")); }
+        }
+    }
+
+    /// Detail-free variant of `parse`: `None` on any failure. Backs `parse`
+    /// and suits callers that branch only on success/failure.
+    static parse_opt(source: Str) -> Option<IpV4Addr> {
         mut parts: u8[4];
         mut part_index: u64 = 0;
         mut segment_start: u64 = 0;
@@ -164,8 +174,17 @@ type struct IpV6Addr {
 
     /// Parse canonical IPv6 text: full `a:b:c:d:e:f:g:h`, `::`-compressed
     /// (one run at most), and a trailing embedded IPv4 (`::ffff:1.2.3.4`).
-    /// Returns `None` on any malformed input.
-    static parse(source: Str) -> Option<IpV6Addr> {
+    /// Returns `Err(ConversionError)` on any malformed input; use `parse_opt`
+    /// for the detail-free variant.
+    static parse(source: Str) -> Result<IpV6Addr, ConversionError> {
+        match (IpV6Addr::parse_opt(source)) {
+            Option::Some(addr) => { return Result::Ok(addr); }
+            Option::None       => { return Result::Err(ConversionError::new("invalid IPv6 address")); }
+        }
+    }
+
+    /// Detail-free variant of `parse`: `None` on any malformed input.
+    static parse_opt(source: Str) -> Option<IpV6Addr> {
         const n: u64 = source.length();
         if (n < 2) { return Option::None; }   // shortest legal is "::"
 
@@ -271,7 +290,7 @@ function ip_parse_groups(source: Str, start: u64, end: u64, out: u16*) -> Option
                 if (i != end) { return Option::None; }
                 if (count > 6) { return Option::None; }
                 const quad: Str = source.sub_bytes(seg_start, i);
-                match (IpV4Addr::parse(quad)) {
+                match (IpV4Addr::parse_opt(quad)) {
                     Option::Some(v4) => {
                         out[count]     = ((v4.a as u16) << 8) | (v4.b as u16);
                         out[count + 1] = ((v4.c as u16) << 8) | (v4.d as u16);
@@ -316,19 +335,28 @@ implement enum IpAddr {
     }
 
     /// Parse textual form. A ':' routes to the v6 parser; otherwise v4.
-    /// Returns `None` if the selected parser rejects the input.
-    static parse(source: Str) -> Option<IpAddr> {
+    /// Returns `Err(ConversionError)` if the selected parser rejects the
+    /// input; use `parse_opt` for the detail-free variant.
+    static parse(source: Str) -> Result<IpAddr, ConversionError> {
+        match (IpAddr::parse_opt(source)) {
+            Option::Some(addr) => { return Result::Ok(addr); }
+            Option::None       => { return Result::Err(ConversionError::new("invalid IP address")); }
+        }
+    }
+
+    /// Detail-free variant of `parse`: `None` if the selected parser rejects.
+    static parse_opt(source: Str) -> Option<IpAddr> {
         mut i: u64 = 0;
         while (i < source.length()) {
             if (ip_byte_eq(source, i, 0x3A)) {
-                match (IpV6Addr::parse(source)) {
+                match (IpV6Addr::parse_opt(source)) {
                     Option::Some(v6) => { return Option::Some(IpAddr::V6(v6)); }
                     Option::None     => { return Option::None; }
                 }
             }
             i = i + 1;
         }
-        match (IpV4Addr::parse(source)) {
+        match (IpV4Addr::parse_opt(source)) {
             Option::Some(v4) => { return Option::Some(IpAddr::V4(v4)); }
             Option::None => { return Option::None; }
         }

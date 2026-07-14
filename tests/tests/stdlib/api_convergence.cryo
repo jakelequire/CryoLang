@@ -31,6 +31,9 @@ import std::random::error;
 import std::alloc::allocator;
 import std::alloc::layout;
 import std::fmt::error;
+import std::net::ip;
+import std::net::http::method;
+import std::fmt::display;
 import std::test::error;
 import std::test::assert;
 
@@ -338,4 +341,104 @@ function fmt_error_describe_forwards_to_inner() -> Result<(), TestError> {
     const e: FmtError = FmtError::Io(inner);
     return expect(e.describe().equals(&Str::new("broken_pipe")),
         Str::new("FmtError::describe() should forward to the wrapped IoError"));
+}
+
+// ============================================================================
+// m7 - fallible parsers return Result (describable failure), not bare Option
+// ============================================================================
+
+![test]
+function ipv4_parse_ok_and_err() -> Result<(), TestError> {
+    // Success carries the value; failure carries a describable ConversionError.
+    match (IpV4Addr::parse(Str::new("127.0.0.1"))) {
+        Result::Ok(v4) => {
+            match (expect_eq(v4.octet(0), 127)) {
+                Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+            }
+        }
+        Result::Err(_) => { return Result::Err(TestError::failed(Str::new("127.0.0.1 should parse Ok"))); }
+    }
+    match (IpV4Addr::parse(Str::new("256.0.0.1"))) {
+        Result::Ok(_)  => { return Result::Err(TestError::failed(Str::new("256.0.0.1 should be Err"))); }
+        Result::Err(e) => {
+            return expect(e.describe().equals(&Str::new("invalid IPv4 address")),
+                Str::new("IPv4 parse error should describe itself"));
+        }
+    }
+}
+
+![test]
+function method_parse_ok_and_err() -> Result<(), TestError> {
+    match (Method::parse(Str::new("GET"))) {
+        Result::Ok(m) => {
+            match (expect(m.as_str().equals(&Str::new("GET")), Str::new("GET round-trips"))) {
+                Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+            }
+        }
+        Result::Err(_) => { return Result::Err(TestError::failed(Str::new("GET should parse Ok"))); }
+    }
+    match (Method::parse(Str::new("BREW"))) {
+        Result::Ok(_)  => { return Result::Err(TestError::failed(Str::new("BREW should be Err"))); }
+        Result::Err(e) => {
+            return expect(e.describe().equals(&Str::new("unknown HTTP method")),
+                Str::new("unknown-method error should describe itself"));
+        }
+    }
+}
+
+// ============================================================================
+// N3 - additive trait gaps: Array Eq/Hash, collection Default, Pair Display
+// ============================================================================
+
+![test]
+function array_eq_and_hash_as_map_key() -> Result<(), TestError> {
+    // Array Eq + Hash (full `<T, A>` arity) let an `Array` be a HashMap key.
+    mut m: HashMap<Array<i32>, i32> = HashMap::new();
+    mut k: Array<i32> = Array::new();
+    k.push(1); k.push(2); k.push(3);
+    m.insert(k, 99);
+
+    mut probe: Array<i32> = Array::new();
+    probe.push(1); probe.push(2); probe.push(3);
+    const got: Option<i32> = m.get(&probe);
+    const eq_self: boolean = probe.equals(&probe);
+    probe.drop();
+    m.drop();
+
+    match (expect(eq_self, Str::new("an Array should equal itself (Eq)"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    match (got) {
+        Option::Some(v) => { return expect_eq(v, 99); }
+        Option::None => {
+            return Result::Err(TestError::failed(Str::new("equal Array key should hash/compare equal")));
+        }
+    }
+}
+
+![test]
+function collection_defaults_are_empty() -> Result<(), TestError> {
+    mut a: Array<i32>        = Array<i32>::default();
+    mut s: String           = String::default();
+    mut m: HashMap<i32, i32> = HashMap<i32, i32>::default();
+    const all_empty: boolean = a.length() == 0 && s.length() == 0 && m.length() == 0;
+    a.drop();
+    s.drop();
+    m.drop();
+    return expect(all_empty, Str::new("Array/String/HashMap ::default() should be empty"));
+}
+
+![test]
+function pair_display() -> Result<(), TestError> {
+    const p: Pair<i32, i32> = Pair::new(3, 4);
+    match (format_to_string(&p)) {
+        Result::Ok(mut rendered) => {
+            const ok: boolean = rendered.as_str().equals(&Str::new("(3, 4)"));
+            rendered.drop();
+            return expect(ok, Str::new("Pair should Display as \"(3, 4)\""));
+        }
+        Result::Err(_) => {
+            return Result::Err(TestError::failed(Str::new("format_to_string(&pair) should succeed")));
+        }
+    }
 }

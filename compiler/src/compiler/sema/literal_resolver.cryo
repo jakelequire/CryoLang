@@ -78,6 +78,26 @@ type struct LiteralResolver {
                         format("integer literal `%s` is out of range for type `%s`",
                             lit.value, it.int_kind.to_string()),
                         lit.span);
+                } else if (max_mag != 0 && it.int_kind.is_signed()) {
+                    // The literal fits the width's bit pattern but, for a signed
+                    // type, exceeds the representable signed range: a bare
+                    // `i8 = 200` stores the two's-complement pattern (-56).  This
+                    // is deliberate (bit-pattern initializers up to the width are
+                    // admitted), so it is a lint (W0012), not an error.  Threshold
+                    // at 2^(w-1) = (max_mag >> 1) + 1 so a valid min-magnitude
+                    // negative (`i8 = -128`, whose literal magnitude is 128) is
+                    // NOT flagged: only magnitudes strictly beyond 2^(w-1) — which
+                    // are representable as neither a positive nor the negative
+                    // min — warn.
+                    const signed_min_mag: u64 = (max_mag >> 1) + 1;
+                    if (int_literal_exceeds(lit.value, signed_min_mag)) {
+                        mut diag: Diagnostic = Diagnostic::warning(
+                            ErrorCode::W0012_SIGNED_LITERAL_OUT_OF_RANGE,
+                            format("integer literal `%s` is outside the range of signed type `%s`; it is stored as its two's-complement bit pattern (wraps to a negative value)",
+                                lit.value, it.int_kind.to_string()));
+                        diag = diag.at(lit.span);
+                        this.ctx.emit_diagnostic(diag);
+                    }
                 }
                 return this.state.expected_type;
             }
