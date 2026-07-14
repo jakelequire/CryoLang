@@ -1,7 +1,7 @@
 # The Cryo Language Reference
 
 > **Version:** 1.0.0 \
-> **Last revised:** May 2026
+> **Last revised:** July 2026
 
 Cryo is a statically-typed, compiled systems language. It targets native machine code through LLVM 20, has a self-hosted compiler, and ships a standard library written entirely in itself. Three principles shape the language:
 
@@ -66,22 +66,22 @@ The compiler does not enforce naming, but the standard library and ecosystem use
 
 Keywords are reserved identifiers. They cannot be used as variable, function, or type names.
 
-| Control flow | Declarations |             | Modifiers   | Operator keywords | Special values | Reserved for future use |
-| ------------ | ------------ | ----------- | ----------- | ----------------- | -------------- | ----------------------- |
-| `if`         | `function`   | `from`      | `const`     | `new`             | `true`         | `yield`                 |
-| `else`       | `class`      | `as`        | `mut`       | `delete`          | `false`        | `async`                 |
-| `switch`     | `struct`     | `implement` | `static`    | `sizeof`          | `null`         | `await`                 |
-| `case`       | `enum`       | `intrinsic` | `public`    | `alignof`         | `this`         | `auto`                  |
-| `default`    | `trait`      | `where`     | `private`   | `typeof`          | `This`         | `unsigned`              |
-| `match`      | `type`       | `extern`    | `protected` | `in`              |                | `tuple`                 |
-| `while`      | `namespace`  |             | `virtual`   | `as`              |                | `optional`              |
-| `for`        | `module`     |             | `override`  |                   |                | `with`                  |
-| `loop`       | `import`     |             | `inline`    |                   |                |                         |
-| `do`         | `export`     |             | `unsafe`    |                   |                |                         |
-| `break`      | `static_assert` |          | `move`      |                   |                |                         |
-| `continue`   | `union`      |             |             |                   |                |                         |
-| `return`     |              |             |             |                   |                |                         |
-| `asm`        |              |             |             |                   |                |                         |
+| Control flow | Declarations    |             | Modifiers   | Operator keywords | Special values | Reserved for future use |
+| ------------ | --------------- | ----------- | ----------- | ----------------- | -------------- | ----------------------- |
+| `if`         | `function`      | `from`      | `const`     | `new`             | `true`         | `yield`                 |
+| `else`       | `class`         | `as`        | `mut`       | `delete`          | `false`        | `async`                 |
+| `switch`     | `struct`        | `implement` | `static`    | `sizeof`          | `null`         | `await`                 |
+| `case`       | `enum`          | `intrinsic` | `public`    | `alignof`         | `this`         | `auto`                  |
+| `default`    | `trait`         | `where`     | `private`   | `typeof`          | `This`         | `unsigned`              |
+| `match`      | `type`          | `extern`    | `protected` | `in`              |                | `tuple`                 |
+| `while`      | `namespace`     |             | `virtual`   | `as`              |                | `optional`              |
+| `for`        | `module`        |             | `override`  |                   |                | `with`                  |
+| `loop`       | `import`        |             | `inline`    |                   |                |                         |
+| `do`         | `export`        |             | `unsafe`    |                   |                |                         |
+| `break`      | `static_assert` |             | `move`      |                   |                |                         |
+| `continue`   | `union`         |             |             |                   |                |                         |
+| `return`     |                 |             |             |                   |                |                         |
+| `asm`        |                 |             |             |                   |                |                         |
 
 `move` marks a closure that captures its environment by move (see [§ 16.3](#163-move-checking)).
 
@@ -201,7 +201,7 @@ Every value in Cryo has a known type at compile time. A binding's type is either
 | `i8` `i16` `i32` `i64` `i128` | Signed integers of fixed width.                                                                                                                  | 1 / 2 / 4 / 8 / 16 bytes |
 | `uint`                        | Default unsigned integer; alias for `u32`.                                                                                                       | 4 bytes                  |
 | `u8` `u16` `u32` `u64` `u128` | Unsigned integers of fixed width.                                                                                                                | 1 / 2 / 4 / 8 / 16 bytes |
-| `float`                       | Default float; alias for `f64`.                                                                                                                  | 8 bytes                  |
+| `float`                       | Alias for `f32` (single-precision IEEE 754). Distinct from `double`. Bare float literals still default to `f64`.                                  | 4 bytes                  |
 | `f32` `f64`                   | IEEE 754 floats.                                                                                                                                 | 4 / 8 bytes              |
 | `double`                      | Alias for `f64`.                                                                                                                                 | 8 bytes                  |
 | `usize` `isize`               | Pointer-width unsigned / signed integers — distinct types whose width tracks the target's pointer size (the natural type for sizes and indices). | 8 bytes on 64-bit        |
@@ -1614,7 +1614,7 @@ type trait Ord : Eq {
 }
 ```
 
-### 11.2 Implementing a Traitg
+### 11.2 Implementing a Trait
 
 `implement trait <Trait> for <Type> { ... }` provides the method bodies for a concrete type.
 
@@ -1663,24 +1663,24 @@ where T: Hash + Eq, V: Clone
 
 ### 11.4 Standard Library Traits
 
-| Trait                       | Purpose                                                                                                    |
-| --------------------------- | ---------------------------------------------------------------------------------------------------------- |
-| `Copy`                      | Marker for types that are bitwise-copyable (no `Drop` impl).                                               |
-| `Drop`                      | Explicit destructor; types implementing it are non-`Copy`.                                                 |
-| `Clone`                     | Explicit deep duplication via `clone()`.                                                                   |
-| `Default`                   | A canonical zero value: `static default() -> This`.                                                        |
-| `Eq`                        | Equality (backs `==` / `!=`; see [§11.6](#116-operator-overloading)).                                     |
-| `Ord` (`: Eq`)              | Total ordering via `compare(...) -> Ordering` (backs `< > <= >=`).                                         |
-| `Hash`                      | Type-level hashing into a `Hasher`.                                                                        |
-| `Add`/`Sub`/`Mul`/`Div`/`Rem`, `Neg`, `BitAnd`/`BitOr`/`BitXor`/`Shl`/`Shr`, `Not`/`BitNot`, `Index`, `Deref` | Operator overloading — see [§11.6](#116-operator-overloading). |
-| `Iterator`                  | Lazy sequence with an associated `Item` and `next() -> Option<Item>` (see [§11.5](#115-associated-types)). |
-| `IntoIterator`              | Conversion into an iterator.                                                                               |
-| `From<T>` / `Into<T>`       | Infallible conversions.                                                                                    |
-| `TryFrom<T>` / `TryInto<T>` | Fallible conversions returning `Result`.                                                                   |
-| `Read` / `Write`            | Byte-level I/O.                                                                                            |
-| `Display` / `Debug`         | Formatting.                                                                                                |
-| `FmtWrite`                  | Sink trait for the formatter.                                                                              |
-| `Allocator`                 | Heap allocation strategy.                                                                                  |
+| Trait                                                                                                         | Purpose                                                                                                    |
+| ------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| `Copy`                                                                                                        | Marker for types that are bitwise-copyable (no `Drop` impl).                                               |
+| `Drop`                                                                                                        | Explicit destructor; types implementing it are non-`Copy`.                                                 |
+| `Clone`                                                                                                       | Explicit deep duplication via `clone()`.                                                                   |
+| `Default`                                                                                                     | A canonical zero value: `static default() -> This`.                                                        |
+| `Eq`                                                                                                          | Equality (backs `==` / `!=`; see [§11.6](#116-operator-overloading)).                                      |
+| `Ord` (`: Eq`)                                                                                                | Total ordering via `compare(...) -> Ordering` (backs `< > <= >=`).                                         |
+| `Hash`                                                                                                        | Type-level hashing into a `Hasher`.                                                                        |
+| `Add`/`Sub`/`Mul`/`Div`/`Rem`, `Neg`, `BitAnd`/`BitOr`/`BitXor`/`Shl`/`Shr`, `Not`/`BitNot`, `Index`, `Deref` | Operator overloading — see [§11.6](#116-operator-overloading).                                             |
+| `Iterator`                                                                                                    | Lazy sequence with an associated `Item` and `next() -> Option<Item>` (see [§11.5](#115-associated-types)). |
+| `IntoIterator`                                                                                                | Conversion into an iterator.                                                                               |
+| `From<T>` / `Into<T>`                                                                                         | Infallible conversions.                                                                                    |
+| `TryFrom<T>` / `TryInto<T>`                                                                                   | Fallible conversions returning `Result`.                                                                   |
+| `Read` / `Write`                                                                                              | Byte-level I/O.                                                                                            |
+| `Display` / `Debug`                                                                                           | Formatting.                                                                                                |
+| `FmtWrite`                                                                                                    | Sink trait for the formatter.                                                                              |
+| `Allocator`                                                                                                   | Heap allocation strategy.                                                                                  |
 
 Every standard-library trait is declared in [`stdlib/core/`](../stdlib/core/) with the exception of `Read`/`Write` (in `stdlib/io/traits.cryo`), `Display`/`Debug`/`FmtWrite` (in `stdlib/fmt/`), and `Allocator` (in `stdlib/alloc/allocator.cryo`).
 
@@ -1767,16 +1767,16 @@ implement the arithmetic traits. The operator traits live in
 [`stdlib/core/ops.cryo`](../stdlib/core/ops.cryo) (`Eq`/`Ord` are in
 [`stdlib/core/cmp.cryo`](../stdlib/core/cmp.cryo)).
 
-| Operator(s)                | Trait (`core::ops` / `core::cmp`) | Method / desugar                                 |
-| -------------------------- | --------------------------------- | ------------------------------------------------ |
-| `+` `-` `*` `/` `%`        | `Add` `Sub` `Mul` `Div` `Rem`     | `a + b` → `a.add(&b)` (etc.)                      |
-| `-` (unary)                | `Neg`                             | `-a` → `a.neg()`                                  |
-| `&` `\|` `^` `<<` `>>`     | `BitAnd` `BitOr` `BitXor` `Shl` `Shr` | `a & b` → `a.bitand(&b)` (etc.)              |
-| `!` `~` (unary)            | `Not` `BitNot`                    | `!a` → `a.not()`, `~a` → `a.bitnot()`            |
-| `==` `!=`                  | `Eq`                              | `a == b` → `a.equals(&b)`, `a != b` → `!a.equals(&b)` |
-| `<` `>` `<=` `>=`          | `Ord` (`: Eq`)                    | `a < b` → `a.compare(&b).is_lt()` (`is_gt`/`is_le`/`is_ge`) |
-| `a[i]`                     | `Index<Idx, Output>`              | `a[i]` → `*(a.index(i))`                          |
-| `*a` (deref)              | `Deref<Target>`                   | `*a` → `*(a.deref())`                             |
+| Operator(s)            | Trait (`core::ops` / `core::cmp`)     | Method / desugar                                            |
+| ---------------------- | ------------------------------------- | ----------------------------------------------------------- |
+| `+` `-` `*` `/` `%`    | `Add` `Sub` `Mul` `Div` `Rem`         | `a + b` → `a.add(&b)` (etc.)                                |
+| `-` (unary)            | `Neg`                                 | `-a` → `a.neg()`                                            |
+| `&` `\|` `^` `<<` `>>` | `BitAnd` `BitOr` `BitXor` `Shl` `Shr` | `a & b` → `a.bitand(&b)` (etc.)                             |
+| `!` `~` (unary)        | `Not` `BitNot`                        | `!a` → `a.not()`, `~a` → `a.bitnot()`                       |
+| `==` `!=`              | `Eq`                                  | `a == b` → `a.equals(&b)`, `a != b` → `!a.equals(&b)`       |
+| `<` `>` `<=` `>=`      | `Ord` (`: Eq`)                        | `a < b` → `a.compare(&b).is_lt()` (`is_gt`/`is_le`/`is_ge`) |
+| `a[i]`                 | `Index<Idx, Output>`                  | `a[i]` → `*(a.index(i))`                                    |
+| `*a` (deref)           | `Deref<Target>`                       | `*a` → `*(a.deref())`                                       |
 
 Each arithmetic/bitwise trait carries `Rhs` and `Output` type parameters, so an
 operator can mix types (add a scalar to a vector, shift by a plain integer) and
@@ -2273,7 +2273,7 @@ type struct AlignedData {
 | `![inline]`                                               | function                  | Inlining hint. *Parsed and validated; not yet emitted as an LLVM attribute (no effect at the default `-O0`).*                                                                                                                                                                                                                                                                                                               |
 | `![noinline]`                                             | function                  | Anti-inlining hint. *Parsed and validated; not yet emitted as an LLVM attribute.*                                                                                                                                                                                                                                                                                                                                           |
 | `![deprecated]` / `![deprecated("msg")]`                  | any decl                  | Marks a declaration as deprecated. *Parsed and validated; use-site warnings are not yet emitted.*                                                                                                                                                                                                                                                                                                                           |
-| `![symbol("name")]`                                       | extern fn / method        | Override the linker symbol used to resolve an extern function or body-less method: Cryo callers use the declared name while the symbol resolved at link time is `name`. Used by the C++ binding generator to pin a decl to its Itanium-mangled symbol.                                                                                                                                                                       |
+| `![symbol("name")]`                                       | extern fn / method        | Override the linker symbol used to resolve an extern function or body-less method: Cryo callers use the declared name while the symbol resolved at link time is `name`. Used by the C++ binding generator to pin a decl to its Itanium-mangled symbol.                                                                                                                                                                      |
 | `![allow(name)]` / `![warn(name)]` / `![deny(name)]`      | any decl                  | Intended to adjust a named lint's level. *Parsed and validated; lint-level adjustment is not yet implemented.*                                                                                                                                                                                                                                                                                                              |
 | `![derive(Trait, …)]`                                     | struct / class / enum     | Auto-derive one or more traits.                                                                                                                                                                                                                                                                                                                                                                                             |
 | `![sink]`                                                 | method                    | Marks a method as consuming its receiver, even when the receiver is syntactically `&this` or `mut &this`. Useful for methods that semantically take ownership but want the borrow-style call ergonomics.                                                                                                                                                                                                                    |
@@ -2281,8 +2281,8 @@ type struct AlignedData {
 | `![config(<atom>)]` / `![target(<atom>)]` / `![<atom>]`   | any decl                  | Platform / build-flavor gate. `<atom>` is `windows`, `linux`, `macos`, `unix`, or `not(<atom>)`. The bare-atom form (`![windows]`) is sugar for `![config(windows)]`. The decl is stripped from the AST when the gate doesn't match.                                                                                                                                                                                        |
 | `![repr(C)]` / `![repr(packed)]` / `![repr(transparent)]` | struct / class / enum     | Memory layout control. See [§ 17.3](#173-memory-layout).                                                                                                                                                                                                                                                                                                                                                                    |
 | `![align(N)]`                                             | struct / class / variable | Minimum alignment in bytes; N must be a power of two. See [§ 17.3](#173-memory-layout).                                                                                                                                                                                                                                                                                                                                     |
-| `![arch(<arch>, <dialect>)]`                              | asm block                 | Required directly above an `asm { ... }` block (see [§ 6.13](#613-inline-assembly)). Names the target architecture — which *gates* the block, like `![config]` — and the assembly dialect (`intel` or `att`).                                                                                                                                                                                    |
-| `![clobber(...)]`                                         | asm block                 | Lists registers, `flags`, or `memory` that an `asm` block overwrites but does not bind as operands.                                                                                                                                                                                                                                                                                                       |
+| `![arch(<arch>, <dialect>)]`                              | asm block                 | Required directly above an `asm { ... }` block (see [§ 6.13](#613-inline-assembly)). Names the target architecture — which *gates* the block, like `![config]` — and the assembly dialect (`intel` or `att`).                                                                                                                                                                                                               |
+| `![clobber(...)]`                                         | asm block                 | Lists registers, `flags`, or `memory` that an `asm` block overwrites but does not bind as operands.                                                                                                                                                                                                                                                                                                                         |
 
 The test-mode directives (`![config(testing)]`, `![test]`, `![ignore]`, `![should_panic]`) are documented in the next subsection.
 

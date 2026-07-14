@@ -1,0 +1,341 @@
+///! Regression tests for the v1.0 stdlib API-convergence work (audit
+///! findings M5-M8):
+///!   - M5: every error type exposes `describe(&this) -> Str` and is
+///!         printable via `Display`/`Debug`.
+///!   - M6: `usize`/`isize`/`i128`/`u128` implement Clone/Eq/Ord/Hash/Default,
+///!         so they can be map keys, sorted, cloned, and defaulted.
+///!   - M7: `string`/`Str`/`String` implement lexicographic `Ord`, so string
+///!         collections can be sorted.
+///!   - M8: HashMap/HashSet expose borrow-yielding iterators
+///!         (`entries`/`keys_ref`/`values_ref`/`iter_ref`) that work for
+///!         owning element types the `Copy`-gated iterators reject.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::ApiConvergence;
+
+import std::core::result;
+import std::core::option;
+import std::core::iter;
+import std::core::cmp;
+import std::core::clone;
+import std::core::default;
+import std::core::convert;
+import std::collections::str;
+import std::collections::string;
+import std::collections::array;
+import std::collections::hashmap;
+import std::collections::hashset;
+import std::collections::pair;
+import std::io::error;
+import std::random::error;
+import std::alloc::allocator;
+import std::alloc::layout;
+import std::fmt::error;
+import std::test::error;
+import std::test::assert;
+
+// ============================================================================
+// M6 - usize/isize/i128/u128 trait coherence
+// ============================================================================
+
+![test]
+function usize_is_a_hashmap_key() -> Result<(), TestError> {
+    // Requires `usize: Hash + Eq` (the M6 gap that made this an E0358).
+    mut map: HashMap<usize, i32> = HashMap::new();
+    const k1: usize = 7;
+    const k2: usize = 9;
+    map.insert(k1, 100);
+    map.insert(k2, 200);
+    const got: Option<i32> = map.get(&k1);
+    const len: u64 = map.length();
+    map.drop();
+    match (expect_eq(len, 2 as u64)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    match (got) {
+        Option::Some(v) => { return expect_eq(v, 100); }
+        Option::None => {
+            return Result::Err(TestError::failed(Str::new("usize key lookup missed")));
+        }
+    }
+}
+
+![test]
+function usize_clone_default_ord() -> Result<(), TestError> {
+    const a: usize = 5;
+    const b: usize = a.clone();
+    match (expect_eq(a, b)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    const d: usize = usize::default();
+    match (expect_eq(d, 0 as usize)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    const lo: usize = 3;
+    const hi: usize = 4;
+    const is_less: boolean = match (lo.compare(&hi)) {
+        Ordering::Less => { true } _ => { false }
+    };
+    return expect(is_less, Str::new("3usize should compare Less than 4usize"));
+}
+
+![test]
+function i128_u128_isize_traits() -> Result<(), TestError> {
+    // i128 Clone + Eq + Ord.
+    const big: i128 = 170141183460469231731;
+    const big_clone: i128 = big.clone();
+    match (expect(big.equals(&big_clone), Str::new("i128 clone should equal original"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    const small: i128 = 1;
+    const is_greater: boolean = match (big.compare(&small)) {
+        Ordering::Greater => { true } _ => { false }
+    };
+    match (expect(is_greater, Str::new("large i128 should compare Greater than 1"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    // u128 Default.
+    const zu: u128 = u128::default();
+    match (expect(zu == 0, Str::new("u128::default() should be 0"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    // isize Ord + Default.
+    const neg: isize = 0 - 3;
+    const pos: isize = 2;
+    const neg_less: boolean = match (neg.compare(&pos)) {
+        Ordering::Less => { true } _ => { false }
+    };
+    return expect(neg_less, Str::new("-3isize should compare Less than 2isize"));
+}
+
+// ============================================================================
+// M7 - lexicographic Ord for string / Str / String
+// ============================================================================
+
+![test]
+function str_lexicographic_compare() -> Result<(), TestError> {
+    const apple:  Str = Str::new("apple");
+    const banana: Str = Str::new("banana");
+    const apple2: Str = Str::new("apple");
+    const app:    Str = Str::new("app");
+
+    const a_lt_b: boolean = match (apple.compare(&banana)) {
+        Ordering::Less => { true } _ => { false }
+    };
+    const a_eq_a: boolean = match (apple.compare(&apple2)) {
+        Ordering::Equal => { true } _ => { false }
+    };
+    // A prefix sorts before the longer string it is a prefix of.
+    const app_lt_apple: boolean = match (app.compare(&apple)) {
+        Ordering::Less => { true } _ => { false }
+    };
+
+    match (expect(a_lt_b, Str::new("\"apple\" should sort before \"banana\""))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect(a_eq_a, Str::new("equal Str content should compare Equal"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect(app_lt_apple, Str::new("\"app\" should sort before \"apple\""));
+}
+
+![test]
+function string_compare_delegates_to_str() -> Result<(), TestError> {
+    mut a: String = String::from_str(Str::new("alpha"));
+    mut b: String = String::from_str(Str::new("beta"));
+    const a_lt_b: boolean = match (a.compare(&b)) {
+        Ordering::Less => { true } _ => { false }
+    };
+    a.drop();
+    b.drop();
+    return expect(a_lt_b, Str::new("String \"alpha\" should compare Less than \"beta\""));
+}
+
+![test]
+function array_of_string_sorts_lexicographically() -> Result<(), TestError> {
+    // `Array::sort()` is `where T: Ord`; before M7 no string type satisfied
+    // that bound, so a `Array<String>` could not be sorted at all.
+    mut arr: Array<String> = Array::new();
+    arr.push(String::from_str(Str::new("cherry")));
+    arr.push(String::from_str(Str::new("apple")));
+    arr.push(String::from_str(Str::new("banana")));
+    arr.sort();
+
+    mut ordered: boolean = true;
+    match (arr.get_ref(0)) {
+        Option::Some(s) => { if (!s.as_str().equals(&Str::new("apple")))  { ordered = false; } }
+        Option::None    => { ordered = false; }
+    }
+    match (arr.get_ref(1)) {
+        Option::Some(s) => { if (!s.as_str().equals(&Str::new("banana"))) { ordered = false; } }
+        Option::None    => { ordered = false; }
+    }
+    match (arr.get_ref(2)) {
+        Option::Some(s) => { if (!s.as_str().equals(&Str::new("cherry"))) { ordered = false; } }
+        Option::None    => { ordered = false; }
+    }
+    arr.drop();
+    return expect(ordered, Str::new("Array<String> should sort to apple, banana, cherry"));
+}
+
+// ============================================================================
+// M8 - borrow-yielding map/set iterators (sound for owning elements)
+// ============================================================================
+
+![test]
+function hashmap_entries_yields_borrows() -> Result<(), TestError> {
+    mut map: HashMap<u32, i32> = HashMap::new();
+    map.insert(1, 10);
+    map.insert(2, 20);
+    map.insert(3, 30);
+
+    mut it: implement Iterator<Pair<u32*, i32*>> = map.entries();
+    mut visited: u64 = 0;
+    mut key_sum: u32 = 0;
+    mut value_sum: i32 = 0;
+    loop {
+        match (it.next()) {
+            Option::Some(p) => {
+                visited = visited + 1;
+                key_sum = key_sum + *p.first;
+                value_sum = value_sum + *p.second;
+            }
+            Option::None => { break; }
+        }
+    }
+    map.drop();
+
+    match (expect_eq(visited, 3 as u64)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(key_sum, 6 as u32)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(value_sum, 60);
+}
+
+![test]
+function hashmap_values_ref_yields_borrows() -> Result<(), TestError> {
+    mut map: HashMap<u32, i32> = HashMap::new();
+    map.insert(1, 5);
+    map.insert(2, 15);
+
+    mut it: implement Iterator<i32*> = map.values_ref();
+    mut sum: i32 = 0;
+    loop {
+        match (it.next()) {
+            Option::Some(v) => { sum = sum + *v; }
+            Option::None    => { break; }
+        }
+    }
+    map.drop();
+    return expect_eq(sum, 20);
+}
+
+![test]
+function hashmap_string_keys_walk_by_ref() -> Result<(), TestError> {
+    // `HashMap<String, V>` keys - the common case - are walkable without the
+    // `K: Copy` gate that blocks `keys()` for owning keys.
+    mut map: HashMap<String, i32> = HashMap::new();
+    map.insert(String::from_str(Str::new("one")), 1);
+    map.insert(String::from_str(Str::new("two")), 2);
+
+    mut it: implement Iterator<String*> = map.keys_ref();
+    mut count: u64 = 0;
+    mut total_len: u64 = 0;
+    loop {
+        match (it.next()) {
+            Option::Some(k) => {
+                count = count + 1;
+                total_len = total_len + k.length();
+            }
+            Option::None => { break; }
+        }
+    }
+    map.drop();
+    match (expect_eq(count, 2 as u64)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    // "one" (3) + "two" (3) == 6 bytes, order-independent.
+    return expect_eq(total_len, 6 as u64);
+}
+
+![test]
+function hashset_string_iter_ref() -> Result<(), TestError> {
+    // `HashSet<String>` - walkable by borrow, which the `T: Copy` `iter()`
+    // rejects for an owning `String`.
+    mut set: HashSet<String> = HashSet::new();
+    set.insert(String::from_str(Str::new("x")));
+    set.insert(String::from_str(Str::new("y")));
+
+    mut it: implement Iterator<String*> = set.iter_ref();
+    mut count: u64 = 0;
+    loop {
+        match (it.next()) {
+            Option::Some(e) => { count = count + 1; }
+            Option::None    => { break; }
+        }
+    }
+    set.drop();
+    return expect_eq(count, 2 as u64);
+}
+
+// ============================================================================
+// M5 - converged error accessor `describe()` + Display / Debug
+// ============================================================================
+
+![test]
+function io_error_describe() -> Result<(), TestError> {
+    const e: IoError = IoError::new(IoErrorKind::NotFound, 2);
+    return expect(e.describe().equals(&Str::new("not_found")),
+        Str::new("IoError::describe() should be \"not_found\""));
+}
+
+![test]
+function io_error_display_via_fstring() -> Result<(), TestError> {
+    // Display makes the error printable (`f"{e}"`), the M5 goal.
+    const e: IoError = IoError::new(IoErrorKind::TimedOut, 110);
+    mut shown: String = f"{e}";
+    const ok: boolean = shown.as_str().equals(&Str::new("timed_out"));
+    shown.drop();
+    return expect(ok, Str::new("f\"{io_error}\" should render its describe() text"));
+}
+
+![test]
+function io_error_debug_via_fstring() -> Result<(), TestError> {
+    const e: IoError = IoError::new(IoErrorKind::PermissionDenied, 13);
+    mut shown: String = f"{e:?}";
+    const ok: boolean = shown.as_str().equals(&Str::new("permission_denied"));
+    shown.drop();
+    return expect(ok, Str::new("f\"{io_error:?}\" should render via Debug"));
+}
+
+![test]
+function random_error_describe() -> Result<(), TestError> {
+    const e: RandomError = RandomError::EmptyRange;
+    return expect(e.describe().equals(&Str::new("empty range")),
+        Str::new("RandomError::describe() should be \"empty range\""));
+}
+
+![test]
+function conversion_error_describe() -> Result<(), TestError> {
+    const e: ConversionError = ConversionError::new("i64 out of i32 range");
+    return expect(e.describe().equals(&Str::new("i64 out of i32 range")),
+        Str::new("ConversionError::describe() should echo its reason"));
+}
+
+![test]
+function alloc_error_describe() -> Result<(), TestError> {
+    const e: AllocError = AllocError::new(AllocErrorKind::OutOfMemory, Layout::new(8, 8));
+    return expect(e.describe().equals(&Str::new("out of memory")),
+        Str::new("AllocError::describe() should describe its kind"));
+}
+
+![test]
+function fmt_error_describe_forwards_to_inner() -> Result<(), TestError> {
+    // FmtError::describe delegates to the wrapped error's describe.
+    const inner: IoError = IoError::new(IoErrorKind::BrokenPipe, 32);
+    const e: FmtError = FmtError::Io(inner);
+    return expect(e.describe().equals(&Str::new("broken_pipe")),
+        Str::new("FmtError::describe() should forward to the wrapped IoError"));
+}
