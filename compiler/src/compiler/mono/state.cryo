@@ -249,6 +249,24 @@ type struct MonoState {
         for (mut i: i64 = 0; i < inst.type_args.length; i++) {
             args.push(inst.type_args[i]);
         }
+        // Fill any omitted trailing defaulted params to the template's full arity
+        // so the request survives `specialize_with_entry`'s arg-count check. This
+        // fires for the `&this` receiver of a method on
+        // `implement<T> ... for struct Wrapper<T>` where `Wrapper<T, A = ...>`:
+        // the receiver substitutes to the 1-arg `Wrapper<Concrete>` while the
+        // template has 2 params, and a method call on `this` (e.g. `HashSet::clone`
+        // calling `this.iter_ref()`) re-instantiates and enqueues that receiver
+        // here — a field-access-only body (`Array::clone` reading `this.ptr`) never
+        // did, so the non-wrapper `Array<T>` slipped by.  `generic_type` stays the
+        // ORIGINAL (lower-arity) `ty`, so the later `set_resolved_type` still lands
+        // on the instantiation the program actually references, resolving it.
+        const tmpl: TemplateEntry* =
+            this.generic_registry.get_template_by_type_id(inst.generic_base.id);
+        if (tmpl != null && args.length < tmpl.param_count) {
+            const _pm: string = "";
+            mut ex_ctx: ResolutionContext = ResolutionContext::new(_pm, _pm);
+            args = this.type_resolver.expand_default_type_args(tmpl, args, &ex_ctx);
+        }
         const request: MonomorphRequest = MonomorphRequest {
             generic_type: ty,
             type_args:    args,
