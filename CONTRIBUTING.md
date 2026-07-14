@@ -88,7 +88,7 @@ A few conventions worth knowing:
 - Async / await / coroutines parse but do not lower.
 - No package registry. Dependencies resolve via git URL with a lockfile
   and content-addressed cache.
-- Cross-compilation is limited to Linux → x86_64 Windows via mingw-w64
+- Cross-compilation is limited to Linux -> x86_64 Windows via mingw-w64
   (`--target=x86_64-pc-windows-gnu`); otherwise the host toolchain is the target.
 - `process::Command` is POSIX-first (`fork` + `execve`); a partial Windows
   (`CreateProcessA`) path exists with known gaps (`Stdio::Null` / `Fd` fall back

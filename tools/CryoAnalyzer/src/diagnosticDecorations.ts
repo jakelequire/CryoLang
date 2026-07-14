@@ -6,13 +6,13 @@ import * as vscode from 'vscode';
  * The TextMate grammar in `syntaxes/cryo-diag.tmGrammar.json` provides
  * baseline scope tagging so the document still reads in users who
  * haven't installed this extension's decorations, but TextMate colors
- * are entirely theme-driven — and themes are wildly inconsistent about
+ * are entirely theme-driven - and themes are wildly inconsistent about
  * niche scopes like `markup.error` or `keyword.other.severity.help`.
  *
  * To get guaranteed rustc-quality output we layer
  * `vscode.TextEditorDecorationType` ranges on top: each role (severity
  * tag, error code chip, caret, label caption, inline backticked code,
- * line-number gutter, arrow, file link, …) has its own decoration with
+ * line-number gutter, arrow, file link, ...) has its own decoration with
  * an explicit `ThemeColor` reference.  The colors themselves live in
  * `package.json` under `contributes.colors`, with separate dark / light
  * / high-contrast palettes, so the user's color theme still tints the
@@ -297,7 +297,7 @@ function tokenizeInlineCode(
  *
  * Plus optional trailing label text.  We classify each run by its
  * leading character, then attribute the inline label (if any) to the
- * RIGHTMOST run's kind — that's the rustc convention: the caption sits
+ * RIGHTMOST run's kind - that's the rustc convention: the caption sits
  * next to the right-most caret in the line.
  */
 function tokenizeMarginTail(
@@ -329,7 +329,7 @@ function tokenizeMarginTail(
         if (ch === '^') {
             // Primary caret.  `render_underline` (single-span path)
             // emits one `^` followed by tildes to fill the span width
-            // — the tildes are NOT a suggestion replace, they're
+            // - the tildes are NOT a suggestion replace, they're
             // primary-caret continuation. Gobble them so the whole run
             // stays one primary run.
             let j = i;
@@ -356,7 +356,7 @@ function tokenizeMarginTail(
             continue;
         }
         if (ch === '~') {
-            // Standalone tilde run — only happens inside a suggestion
+            // Standalone tilde run - only happens inside a suggestion
             // block; primary-span tildes already got absorbed by the
             // `^` branch above.
             let j = i;
@@ -389,7 +389,7 @@ function tokenizeMarginTail(
             i += 1;
             continue;
         }
-        // Anything else terminates the glyph zone — what's left is the
+        // Anything else terminates the glyph zone - what's left is the
         // label caption.
         break;
     }
@@ -397,7 +397,7 @@ function tokenizeMarginTail(
     // Decorate each run with its caret style.
     //
     // Connector pipes (`|` glyphs in the margin tail) always render in
-    // the secondary tone — they're the stitch between a stacked
+    // the secondary tone - they're the stitch between a stacked
     // secondary caret and its caption row.  Rustc convention: primary
     // labels go inline, so the only `|` that ever survives to the
     // margin tail belongs to a secondary label.
@@ -441,7 +441,7 @@ function tokenizeMarginTail(
             const last = runs.length > 0 ? runs[runs.length - 1] : undefined;
             let labelKey: DecoKey;
             if (!last) {
-                // No caret runs preceded the caption → this is a
+                // No caret runs preceded the caption -> this is a
                 // stacked caption row from `render_stacked_two_labels`.
                 // Default to the secondary tone: the renderer's left
                 // label (the one needing a connector + caption pair)
@@ -533,7 +533,7 @@ function tokenizeDocument(doc: vscode.TextDocument): Map<DecoKey, vscode.Range[]
         m = SUGGESTION_HEADER_RE.exec(lineText);
         if (m && m.index === 0) {
             ctx.inSuggestion = true;
-            // Don't override ctx.severity — suggestion lives under a
+            // Don't override ctx.severity - suggestion lives under a
             // parent diagnostic and its caret glyphs (~, +) carry their
             // own coloring.
             const pad = m[1] ?? '';
@@ -660,7 +660,7 @@ function tokenizeDocument(doc: vscode.TextDocument): Map<DecoKey, vscode.Range[]
                 isActive ? 'gutterActive' : 'gutter',
                 rangeOf(ln, pipeCol, pipeCol + 1)
             );
-            // The rest of the line is the source code — leave it to the
+            // The rest of the line is the source code - leave it to the
             // embedded `source.cryo` grammar.  We still scan for inline
             // backtick code just in case (rare in real source, but free).
             continue;
@@ -668,7 +668,7 @@ function tokenizeDocument(doc: vscode.TextDocument): Map<DecoKey, vscode.Range[]
 
         // Margin-only line:  "   |"
         //
-        // The leftmost pipe is the snippet's vertical gutter — always
+        // The leftmost pipe is the snippet's vertical gutter - always
         // blue, never severity-tinted.  Rustc convention: the
         // "this line is part of an error" cue is the caret/label
         // color, not the gutter.

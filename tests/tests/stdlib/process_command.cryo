@@ -1,7 +1,7 @@
 ///! Command / Child - spawn known binaries, check exit status, capture
-///! stdout and stderr.  The H3 stderr-drain deadlock is fixed on both
-///! platforms (Unix: poll(2) over non-blocking pipes, 2026-05-26;
-///! Windows: a PeekNamedPipe-gated interleaved drain, M5/P3), so large
+///! stdout and stderr.  The stderr-drain deadlock is fixed on both
+///! platforms (Unix: poll(2) over non-blocking pipes; Windows: a
+///! PeekNamedPipe-gated interleaved drain), so large
 ///! captures are safe.  `output_with_large_stderr_does_not_deadlock`
 ///! (Unix /bin/sh) and `output_large_stderr_no_deadlock_win` (Windows
 ///! PowerShell) each force a >64-KiB stderr load as a regression.
@@ -236,14 +236,14 @@ function output_captures_stdout() -> Result<(), TestError> {
     return expect(content_ok, Str::new("output().stdout should be the \"foo bar\" line"));
 }
 
-// Regression for the H3 stderr-drain deadlock (audit 2026-05-26).
-// Pre-fix: collect_output() read stdout fully, then stderr.  A child
-// that filled its 64-KiB stderr pipe buffer before its stdout was
-// drained would block on `write(stderr, ...)`, the parent would block
-// on `read(stdout, ...)` waiting for the terminator the child hadn't
-// yet produced, and the whole thing would deadlock forever.
+// Regression for the stderr-drain deadlock: a `collect_output()` that reads
+// stdout fully, then stderr, deadlocks when a child fills its 64-KiB stderr
+// pipe buffer before its stdout is drained - the child blocks on
+// `write(stderr, ...)`, the parent blocks on `read(stdout, ...)` waiting for
+// the terminator the child hasn't yet produced, and the whole thing hangs
+// forever.
 //
-// Post-fix: poll(2) over both pipes interleaved.  This test forces
+// collect_output() polls both pipes interleaved via poll(2).  This test forces
 // roughly 100 KiB onto stderr (well past the kernel's pipe buffer)
 // before the child writes any stdout, and confirms output() returns
 // in bounded time with both streams captured.
@@ -253,7 +253,7 @@ function output_with_large_stderr_does_not_deadlock() -> Result<(), TestError> {
     cmd.arg(Str::new("-c"));
     // Print ~100 KiB to stderr first (`yes` repeats "y\n" forever;
     // `head -c` caps to 100000 bytes), then one terminator line to
-    // stdout.  Under the old serial-drain code this hangs forever.
+    // stdout.  A serial-drain implementation would hang forever here.
     cmd.arg(Str::new("yes | head -c 100000 >&2; echo done"));
     mut deadlocked: boolean = true;
     mut success:    boolean = false;
@@ -311,7 +311,7 @@ function print_var_expect() -> Str { return Str::new("cryo_env_works"); }
 ![target(windows)]
 function print_var_expect() -> Str { return Str::new("cryo_env_works\r\n"); }
 
-// M5/P1: env() overrides reach the child. On Windows this exercises the new
+// env() overrides reach the child. On Windows this exercises the
 // CreateProcessA environment-block builder (the parent process does not have
 // CRYO_TEST_VAR, so the child can only see it via the constructed block); on
 // unix it exercises the existing per-var apply_env path.
@@ -337,7 +337,7 @@ function env_override_passed_to_child() -> Result<(), TestError> {
     return expect(content_ok, Str::new("child should see the overridden env var"));
 }
 
-// M5/P2: stdout=Null is honoured (no longer silently inherits the parent's
+// stdout=Null is honoured (it does not silently inherit the parent's
 // handle on Windows). `output()` forces Piped, so verify via status(): the
 // child must spawn with the NUL handle and exit cleanly.
 ![test]
@@ -355,7 +355,7 @@ function stdout_null_spawns_and_succeeds() -> Result<(), TestError> {
     return expect(success, Str::new("echo with stdout/stderr=Null should exit 0"));
 }
 
-// M5/P4: `Stdio::Fd` redirects a child stream to a caller-supplied fd.  On
+// `Stdio::Fd` redirects a child stream to a caller-supplied fd.  On
 // Windows the fd's underlying HANDLE is recovered (`_get_osfhandle`) and
 // duplicated inheritable for the child; `Stdio::Fd` transfers ownership, so
 // the spawn closes our fd and we detach the File (fd = -1) before dropping it
@@ -431,11 +431,11 @@ function stdout_fd_redirects_to_file() -> Result<(), TestError> {
     return expect(content_ok, Str::new("redirected stdout must reach the file"));
 }
 
-// M5/P3: the Windows `collect_output` drain interleaves stdout/stderr via
+// The Windows `collect_output` drain interleaves stdout/stderr via
 // PeekNamedPipe, so a child that floods one pipe before touching the other
 // cannot deadlock us.  The Unix twin uses `/bin/sh` (absent on Windows); this
 // one drives PowerShell to push ~100 KiB onto stderr (well past the 64-KiB
-// pipe buffer) *before* writing stdout, which wedged the old serial drain.
+// pipe buffer) *before* writing stdout, which would wedge a serial drain.
 ![target(windows)]
 ![test]
 function output_large_stderr_no_deadlock_win() -> Result<(), TestError> {

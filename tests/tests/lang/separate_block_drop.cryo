@@ -3,12 +3,13 @@
 ///! be visible to ownership classification: the type is non-Copy and its
 ///! destructor is synthesized at scope exit.
 ///!
-///! Before this fix, `has_inherent_drop` only walked the type-decl node's
-///! inline `methods[]` and the TemplateEntry's impl_blocks (generics only).
-///! A non-generic type whose `drop` lived in a standalone inherent impl block
-///! was silently classified Copy AND never dropped - a silent leak, and a
-///! `where T: Copy` soundness hole. Separate-block methods already resolve and
-///! codegen for ordinary calls, so the gap was purely in the drop/Copy query.
+///! `has_inherent_drop` must walk standalone inherent impl blocks, not just
+///! the type-decl node's inline `methods[]` and the TemplateEntry's
+///! impl_blocks (generics only). A non-generic type whose `drop` lives in a
+///! standalone inherent impl block would otherwise be silently classified
+///! Copy AND never dropped - a silent leak, and a `where T: Copy` soundness
+///! hole. Separate-block methods already resolve and codegen for ordinary
+///! calls, so the gap is purely in the drop/Copy query.
 ///!
 ///! Each `Probe::drop()` bumps a module counter; tests assert the exact count.
 
@@ -24,7 +25,7 @@ function reset_drop_count() -> void { g_drop_count = 0; }
 function drop_count()       -> i32  { return g_drop_count; }
 
 // `drop` lives in a standalone inherent impl block, NOT inline and NOT a
-// trait impl. This is the construct the fix wires into ownership analysis.
+// trait impl. This is the construct that ownership analysis must recognize.
 type struct Probe { tag: i32; }
 implement Probe {
     bumped(&this) -> i32 { return this.tag + 1; }
@@ -63,7 +64,7 @@ function separate_block_drop_each_local() -> Result<(), TestError> {
 }
 
 // A discarded owning temporary of the type drops at statement end (the
-// drop-synthesis path now sees the separate-block destructor).
+// drop-synthesis path sees the separate-block destructor).
 ![test]
 function separate_block_drop_discarded_temp() -> Result<(), TestError> {
     reset_drop_count();

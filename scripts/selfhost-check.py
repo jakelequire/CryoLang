@@ -20,15 +20,15 @@ extra safety round; in practice convergence happens at stage-3.
 Stage outputs are nested under the regular build dirs to avoid
 top-level clutter:
 
-    compiler/build/                 (stage-2 — also what `make cryo` builds)
+    compiler/build/                 (stage-2 - also what `make cryo` builds)
     compiler/build/self/s3/         (stage-3 compiler)
-    compiler/build/self/s4/         (stage-4 compiler — IR-identity gate)
-    stdlib/.bin/                    (built by pin — canonical link target)
+    compiler/build/self/s4/         (stage-4 compiler - IR-identity gate)
+    stdlib/.bin/                    (built by pin - canonical link target)
     stdlib/.bin/self/s2/            (rebuilt by stage-2; smoke-test only)
     stdlib/.bin/self/s3/            (rebuilt by stage-3; smoke-test only)
 
 The `.bin/self/sN` archives are written by their corresponding compiler
-stage but never read back — every compiler stage links against the
+stage but never read back - every compiler stage links against the
 canonical `<stdlib>/.bin/libcryo.a` produced in round 1. Rebuilding
 stdlib at each round is a smoke test that the stage's codegen handles
 the stdlib source, not a link dependency.
@@ -53,7 +53,7 @@ import sys
 import threading
 import time
 
-# The status glyphs (✓ ✗ ↷) are above cp1252's range, so on a Windows
+# The status glyphs (check / cross / skip marks) are above cp1252's range, so on a Windows
 # console with a legacy code page (PowerShell / cmd defaults to cp1252)
 # the very first print explodes with UnicodeEncodeError.  Reconfigure
 # stdout/stderr to UTF-8 before anything prints.  No-op on POSIX where
@@ -72,14 +72,14 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 ROOT   = Path(__file__).resolve().parent.parent
 BOOT   = ROOT / "bin" / "cryo"                                       # pinned boot
-STAGE2 = ROOT / "compiler" / "build"                 / "cryo"      # boot → stage-2
-STAGE3 = ROOT / "compiler" / "build" / "self" / "s3" / "cryo"      # stage-2 → stage-3
-STAGE4 = ROOT / "compiler" / "build" / "self" / "s4" / "cryo"      # stage-3 → stage-4
+STAGE2 = ROOT / "compiler" / "build"                 / "cryo"      # boot -> stage-2
+STAGE3 = ROOT / "compiler" / "build" / "self" / "s3" / "cryo"      # stage-2 -> stage-3
+STAGE4 = ROOT / "compiler" / "build" / "self" / "s4" / "cryo"      # stage-3 -> stage-4
 S3_LL  = ROOT / "compiler" / "build" / "self" / "s3" / "cryo.ll"
 S4_LL  = ROOT / "compiler" / "build" / "self" / "s4" / "cryo.ll"
 LOG_DIR = ROOT / "build-logs" / "selfhost-check"
 
-# Top-level dirs we wipe before the chain runs. Recursive — covers the
+# Top-level dirs we wipe before the chain runs. Recursive - covers the
 # nested `self/` subtree as well.
 WIPE_PATHS = [
     ROOT / "compiler" / "build",
@@ -122,7 +122,7 @@ class Stage:
 def make_stages():
     return [
         # ------------------------------------------------------------------
-        # Round 1: pinned boot → stage-2  (default build dirs)
+        # Round 1: pinned boot -> stage-2  (default build dirs)
         # ------------------------------------------------------------------
         Stage(
             src="stdlib", via="pinned", to=".bin",
@@ -135,7 +135,7 @@ def make_stages():
             cmd=[str(BOOT), "build", "--no-incremental"],
         ),
         # ------------------------------------------------------------------
-        # Round 2: stage-2 → stage-3  (nested under self/)
+        # Round 2: stage-2 -> stage-3  (nested under self/)
         # ------------------------------------------------------------------
         Stage(
             src="stdlib", via="stage-2", to=".bin/self/s2",
@@ -148,7 +148,7 @@ def make_stages():
             cmd=[str(STAGE2), "build", "--no-incremental", "--build-dir=build/self/s3"],
         ),
         # ------------------------------------------------------------------
-        # Round 3: stage-3 → stage-4  (byte-identity gate)
+        # Round 3: stage-3 -> stage-4  (byte-identity gate)
         # ------------------------------------------------------------------
         Stage(
             src="stdlib", via="stage-3", to=".bin/self/s3",
@@ -292,13 +292,13 @@ def print_summary(times, total):
 # cryo.exe CAN fully self-host under wine, given a wine-runnable Windows
 # toolchain.  Two pieces, both fetched by scripts/fetch-windows-llvm.sh:
 #
-#   * .toolchains/llvm-win/   — the LLVM-20 C API the compiler calls: the
+#   * .toolchains/llvm-win/ - the LLVM-20 C API the compiler calls: the
 #     official msvc `LLVM-C.dll` (runtime dep, ships beside cryo.exe) plus a
 #     synthesized mingw import lib (`libLLVM-C.dll.a`) to link against.
-#   * .toolchains/llvm-mingw/ — mstorsjo's llvm-mingw (a Windows-PE clang +
+#   * .toolchains/llvm-mingw/ - mstorsjo's llvm-mingw (a Windows-PE clang +
 #     ld.lld + a full mingw-w64 sysroot).  Its `clang.exe` defaults to the
 #     `x86_64-w64-windows-gnu` target and finds ld.lld + the sysroot on its
-#     own, so — unlike the bare msvc clang.exe, which has no bundled linker —
+#     own, so - unlike the bare msvc clang.exe, which has no bundled linker - 
 #     it LINKS a real cryo.exe under wine with no extra flags.  It serves both
 #     the `#include "llvm_bindings.h"` preprocess (CRYO_CC) and the final link;
 #     `llvm-ar.exe` is the archiver wine can launch (CRYO_AR).
@@ -318,9 +318,9 @@ WIN_LLVM_DLL    = ROOT / ".toolchains" / "llvm-win" / "bin" / "LLVM-C.dll"
 # libclang, so a cryo.exe cross-build links/loads it alongside LLVM-C.
 WIN_CLANG_LIB   = ROOT / ".toolchains" / "llvm-win" / "lib" / "libclang.dll.a"
 WIN_CLANG_DLL   = ROOT / ".toolchains" / "llvm-win" / "bin" / "libclang.dll"
-# clang resource dir (contains include/stddef.h, stdint.h, …). Passed to the
+# clang resource dir (contains include/stddef.h, stdint.h, ...). Passed to the
 # wine cryo.exe as CRYO_CLANG_RESOURCE_DIR so libclang resolves the builtin
-# headers llvm_bindings.h #includes — the default <dll>/../lib/clang/<v> walk
+# headers llvm_bindings.h #includes - the default <dll>/../lib/clang/<v> walk
 # fails once libclang.dll is staged next to a per-stage cryo.exe. "20" is the
 # clang major (LLVM_WIN_VERSION 20.x in scripts/llvm-version.env).
 WIN_CLANG_RESDIR = ROOT / ".toolchains" / "llvm-win" / "lib" / "clang" / "20"
@@ -335,7 +335,7 @@ WIN_AR          = WIN_MINGW_DIR / "bin" / "llvm-ar.exe"
 MINGW_GCC       = "x86_64-w64-mingw32-gcc"
 LLVM_LINK       = "llvm-link-20"
 # [w4] builds the compiler LIBRARY only (no [[bin]]); a lib-only build under
-# wine completes on its own well inside this — the timeout is just a safety net.
+# wine completes on its own well inside this - the timeout is just a safety net.
 W4_BUILD_TIMEOUT = 1800  # s
 
 
@@ -406,7 +406,7 @@ def _config_without_bin(text: str) -> str:
     good for that: the [[bin]] driver is a 2nd whole-program unit that
     re-emits the shared `std__*`/`Compiler__*` modules (injecting the bin's
     own monomorphizations and advancing the global string-id counter), so the
-    on-disk lib .ll become bin-contaminated — and unless BOTH sides build the
+    on-disk lib .ll become bin-contaminated - and unless BOTH sides build the
     bin to the exact same point they won't match.  Dropping [[bin]] makes both
     sides emit clean, identical library IR (and skips the slow bin unit under
     wine).  A block runs from its `[[bin]]` line to the next section header."""
@@ -434,7 +434,7 @@ def _config_without_bin(text: str) -> str:
 # stage's cryo.exe builds the next, then we run it).  So the Windows toolchain
 # must compile + archive + LINK cryo.exe: a C driver (CRYO_CC), an archiver, a
 # linker, and LLVM-C.dll.  wine has no linker, so under wine this needs the
-# fetched .toolchains/llvm-win bits and still can't link the bin — it's meant
+# fetched .toolchains/llvm-win bits and still can't link the bin - it's meant
 # to run on a native Windows host.
 # ---------------------------------------------------------------------------
 WIN_BOOT = ROOT / "bin" / "cryo.exe"
@@ -457,7 +457,7 @@ WIN_S3_EXE = ROOT / "compiler" / "build" / "self" / "win-s3" / "cryo.exe"
 # stage-3 / stage-4 emitted per-module IR; compared for the fixed point.
 # Build-dir roots for stages 4 and 6; the per-module IR lives under
 # <root>/target/release/<bucket>/*/ir/*.ll for whatever target bucket the
-# build resolved to (host-windows for a gnu default, the triple otherwise) —
+# build resolved to (host-windows for a gnu default, the triple otherwise) - 
 # _compare_ir_trees globs across buckets so it doesn't matter which.
 WIN_S3_IR  = ROOT / "compiler" / "build" / "self" / "win-s3"
 WIN_S4_IR  = ROOT / "compiler" / "build" / "self" / "win-s4"
@@ -508,7 +508,7 @@ def _compare_ir_trees(root_a: Path, root_b: Path):
     (None, reason) when they can't be compared."""
     # Per-module `.ll` files live in per-namespace SUBDIRECTORIES under `ir/`
     # (e.g. `ir/std/core/error.ll`), so glob recursively and key by the path
-    # RELATIVE to `ir/` — a plain basename collides across subdirs
+    # RELATIVE to `ir/` - a plain basename collides across subdirs
     # (`core/error.ll` vs `io/error.ll` both basename `error.ll`).
     def _key(p: Path) -> str:
         return p.as_posix().rsplit("/ir/", 1)[-1]
@@ -550,7 +550,7 @@ def run_windows_selfhost(runner: list, verbose: bool = False) -> str:
             missing.append("wine")
         if not (WIN_CLANG.exists() and WIN_AR.exists()
                 and WIN_LLVM_DLL.exists() and WIN_CLANG_DLL.exists()):
-            missing.append("windows toolchain (.toolchains/llvm-mingw + llvm-win — scripts/fetch-windows-llvm.sh)")
+            missing.append("windows toolchain (.toolchains/llvm-mingw + llvm-win - scripts/fetch-windows-llvm.sh)")
         if missing:
             print(f"  {C.YELLOW}↷ skipped{C.RESET} (can't self-host under wine):")
             for m in missing:
@@ -613,7 +613,7 @@ def run_windows_selfhost(runner: list, verbose: bool = False) -> str:
 # The selfhost stages build Linux ELF artifacts rooted at bin/cryo, so they
 # can't run natively on Windows.  On a Windows host we re-invoke this script
 # inside WSL and stream its output verbatim, so `make selfhost-check` looks
-# and behaves like a native Linux run — same header, stage rows, live ticker,
+# and behaves like a native Linux run - same header, stage rows, live ticker,
 # and fixed-point gate.  The wine-based [w1]-[w4] cross-verify is skipped here
 # (--no-windows): it's redundant on Windows and wine doesn't run under the
 # non-interactive WSL invocation.  WSL is required.
@@ -652,12 +652,12 @@ def _wsl_path(p: Path) -> str | None:
 def main_windows(args) -> int:
     """Windows-host entry point: two sections, the same 6-stage self-host.
 
-      1. Linux section — runs inside WSL (the Linux stages build ELF artifacts
+      1. Linux section - runs inside WSL (the Linux stages build ELF artifacts
          rooted at bin/cryo, which can't run natively on Windows).  Streamed
          verbatim so it looks like a native Linux run.  --no-windows so the WSL
          child doesn't also try the windows section (wine can't, and we run it
          natively below).
-      2. Windows section — bin/cryo.exe through the same 6 stages, run NATIVELY
+      2. Windows section - bin/cryo.exe through the same 6 stages, run NATIVELY
          on this Windows host."""
     if not shutil.which("wsl.exe"):
         print(f"{C.RED}✗ wsl.exe not on PATH{C.RESET}")
@@ -692,7 +692,7 @@ def main_windows(args) -> int:
 # Main
 # ---------------------------------------------------------------------------
 def ensure_boot():
-    """Bail out if `bin/cryo` is missing — the pin is the entry point."""
+    """Bail out if `bin/cryo` is missing - the pin is the entry point."""
     if BOOT.exists():
         return True
     print(f"{C.RED}✗ pinned boot not found:{C.RESET} {BOOT.relative_to(ROOT)}")
@@ -715,7 +715,7 @@ def main():
     args = parser.parse_args()
 
     # Windows host: native pre-check + WSL Linux chain.  This branch never
-    # touches BOOT (bin/cryo, the Linux ELF) directly — it routes the Linux
+    # touches BOOT (bin/cryo, the Linux ELF) directly - it routes the Linux
     # work through WSL, which sees the same repo via /mnt/c/...
     if is_windows_host():
         return main_windows(args)
@@ -724,7 +724,7 @@ def main():
         return 2
 
     print()
-    print(f"{C.BOLD}selfhost-check{C.RESET}  {C.DIM}— 6-stage byte-identity gate (boot: bin/cryo){C.RESET}")
+    print(f"{C.BOLD}selfhost-check{C.RESET}  {C.DIM} - 6-stage byte-identity gate (boot: bin/cryo){C.RESET}")
     print(f"  {C.DIM}root:{C.RESET} {ROOT}")
     print(f"  {C.DIM}logs:{C.RESET} {LOG_DIR.relative_to(ROOT)}/")
     print()
@@ -763,7 +763,7 @@ def main():
             print(f"{C.RED}{C.BOLD}✗ FAILED at stage {i}/{len(stages)}{C.RESET}")
             return 1
 
-    # All stages passed.  Keep the per-stage [N/6] rows on screen — the run
+    # All stages passed.  Keep the per-stage [N/6] rows on screen - the run
     # reads the same live and after-the-fact (no collapse).
 
     # Byte-identity verification

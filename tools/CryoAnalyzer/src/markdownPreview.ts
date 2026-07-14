@@ -3,7 +3,7 @@
 // VS Code has two independent syntax-highlighting engines: the editor and the
 // rendered Markdown preview. To make the preview match the editor exactly we
 // highlight it with Shiki, which consumes the *same* TextMate grammar the
-// editor uses (../syntaxes/cryo.tmGrammar.json) via an oniguruma engine — so
+// editor uses (../syntaxes/cryo.tmGrammar.json) via an oniguruma engine - so
 // the token decisions are identical. Colors follow the default VS Code themes
 // (Dark+/Light+), switched to track the preview's light/dark mode.
 //
@@ -26,8 +26,8 @@ const LIGHT_THEME = 'light-plus';
 let highlighter: CryoHighlighter | undefined;
 
 /**
- * Build the Shiki highlighter once, loading ONLY what we need — the Cryo
- * TextMate grammar plus the two default VS Code themes — to keep the bundle
+ * Build the Shiki highlighter once, loading ONLY what we need - the Cryo
+ * TextMate grammar plus the two default VS Code themes - to keep the bundle
  * lean. Called from activate() so the instance is ready before the preview
  * renders. Failures are swallowed: the markdown-it hook then falls back to
  * VS Code's default highlighting.

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# install-llvm (CI) — install the LLVM toolchain on a GitHub Actions ubuntu
+# install-llvm (CI) - install the LLVM toolchain on a GitHub Actions ubuntu
 # runner, with a tarball cache so warm runs never touch apt.llvm.org.
 #
 # The workflows restore ~/.cache/cryo-ci via actions/cache (keyed on
@@ -37,7 +37,7 @@ install_from_apt() {
     chmod +x /tmp/llvm.sh
     sudo /tmp/llvm.sh "${LLVM_MAJOR}"
     # libclang1-N provides the libclang-N.so the C-import engine (Compiler::Bindgen)
-    # links against — /usr/lib/llvm-N/lib/libclang-N.so.1 (a symlink into the
+    # links against - /usr/lib/llvm-N/lib/libclang-N.so.1 (a symlink into the
     # multiarch dir, captured by write_cache_tarball below).
     sudo apt-get install -y "llvm-${LLVM_MAJOR}-dev" "clang-${LLVM_MAJOR}" \
         "libpolly-${LLVM_MAJOR}-dev" "libclang1-${LLVM_MAJOR}"
@@ -50,7 +50,7 @@ write_cache_tarball() {
     # the runtime libLLVM.so in the multiarch dir, and the /usr/bin/<tool>-X
     # entry points into the tree.
     # The /usr/lib/llvm-N tree includes the libclang-N.so.1 symlink, but that
-    # symlink points into the multiarch dir — capture the real libclang shared
+    # symlink points into the multiarch dir - capture the real libclang shared
     # object there too (alongside libLLVM) or a cache restore leaves it dangling.
     sudo tar --zstd -cf "$TARBALL" \
         "/usr/lib/llvm-${LLVM_MAJOR}" \

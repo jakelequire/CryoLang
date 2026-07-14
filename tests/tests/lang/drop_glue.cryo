@@ -1,12 +1,12 @@
-///! Recursive drop glue (C1): destructors run for owned values nested in
+///! Recursive drop glue: destructors run for owned values nested in
 ///! struct fields, enum payloads (Option/Result), and combinations thereof -
 ///! WITHOUT a hand-written `drop` on the aggregate, and without double-freeing
 ///! when the payload is also consumed manually.
 ///!
-///! Before drop glue, a non-Copy value nested in an Option/Result/struct that
-///! lacked its own `Drop` impl silently leaked: the compiler only ever emitted
-///! a single top-level `binding.drop()` and never recursed into fields or
-///! payloads.  Glue (codegen, call_emitter) now expands a `.drop()` on such an
+///! A non-Copy value nested in an Option/Result/struct that lacks its own
+///! `Drop` impl would otherwise silently leak: a single top-level
+///! `binding.drop()` does not by itself recurse into fields or payloads.
+///! Glue (codegen, call_emitter) expands a `.drop()` on such an
 ///! aggregate into in-place drops of its droppable parts.
 ///!
 ///! The double-free cases are the dangerous direction (worse than the leak):
@@ -146,13 +146,13 @@ function unwrap_consume_no_double_free() -> Result<(), TestError> {
 //
 // Regression: a `mut` payload binding whose heap buffer MOVES during the arm
 // (String::push reallocs) must be freed with its CURRENT pointer, not the
-// bind-time snapshot.  The match used to copy the owning subject into a
-// throwaway `match.subj` slot; the arm mutated the copy while the subject's
-// scope-exit drop reloaded the ORIGINAL slot — still holding the pre-realloc
-// (now-freed) pointer — and double-freed it (Windows 0xC0000374 / Linux abort).
-// prepare_match_subject now binds payloads against the subject's real storage,
-// so mutation-slot and drop-slot coincide.  A fixed-size Probe can't surface
-// this (its buffer never moves); a String can.
+// bind-time snapshot.  If the match copied the owning subject into a
+// throwaway `match.subj` slot, the arm would mutate the copy while the
+// subject's scope-exit drop reloaded the ORIGINAL slot - still holding the
+// pre-realloc (now-freed) pointer - and double-free it (Windows 0xC0000374 /
+// Linux abort). prepare_match_subject binds payloads against the subject's
+// real storage, so mutation-slot and drop-slot coincide.  A fixed-size Probe
+// can't surface this (its buffer never moves); a String can.
 
 ![test]
 function match_mut_binding_realloc_no_double_free() -> Result<(), TestError> {
@@ -190,12 +190,11 @@ function array_of_owned_drops_each() -> Result<(), TestError> {
 
 // ---- fixed-size T[N] arrays ----------------------------------------------
 //
-// Prior to this regression test, drop_glue did not recurse into the elements
-// of a bare fixed-size array: a `T[N]` local whose element type needed drop
-// (e.g. `Probe[2]`, `String[3]`) silently leaked at scope exit because the
-// codegen's `emit_drop_glue` had no `TypeKind::Array` arm and bailed as a
-// no-op.  call_emitter::emit_fixed_array_drops now synthesizes per-element
-// `arr[i].drop()` calls so glue lands once per element.
+// Fixed-size arrays need drop_glue to recurse into their elements: a `T[N]`
+// local whose element type needs drop (e.g. `Probe[2]`, `String[3]`) would
+// otherwise silently leak at scope exit if codegen's `emit_drop_glue` had no
+// `TypeKind::Array` arm and bailed as a no-op.  call_emitter::emit_fixed_array_drops
+// synthesizes per-element `arr[i].drop()` calls so glue lands once per element.
 
 ![test]
 function fixed_array_of_owned_drops_each() -> Result<(), TestError> {
@@ -211,11 +210,11 @@ function fixed_array_of_owned_drops_each() -> Result<(), TestError> {
 
 // ---- match subject hoisting ----------------------------------------------
 //
-// Prior to this regression test, a non-Identifier owning rvalue used as a
-// match subject (e.g. `match (compute()) { ... }`) leaked the value: the
-// subject temporary was invisible to the binding/scope-exit drop machinery,
-// and walk_match_arms's consumption-tracking gated on `subject.kind ==
-// Identifier`.  drop_insertion now hoists such subjects into a synthesized
+// A non-Identifier owning rvalue used as a match subject (e.g.
+// `match (compute()) { ... }`) would leak the value if the subject temporary
+// were invisible to the binding/scope-exit drop machinery, i.e. if
+// walk_match_arms's consumption-tracking gated on `subject.kind ==
+// Identifier`.  drop_insertion hoists such subjects into a synthesized
 // local declared just before the match, so the standard binding-drop path
 // fires.  Verified by counting Probe::drop calls on a hoisted Option<Probe>.
 

@@ -1,4 +1,4 @@
-// cpp_link_helper.cpp — out-of-line definitions so each entity emits a symbol.
+// cpp_link_helper.cpp - out-of-line definitions so each entity emits a symbol.
 #include "cpp_link_helper.hpp"
 
 namespace cpplink {

@@ -1,6 +1,6 @@
 @echo off
 rem ---------------------------------------------------------------------
-rem selfhost-check-windows.cmd — Windows-host wrapper for `make selfhost-check`.
+rem selfhost-check-windows.cmd - Windows-host wrapper for `make selfhost-check`.
 rem
 rem Checks for a python interpreter + wsl.exe on PATH, then drives the
 rem main script.  scripts/selfhost-check.py is host-aware: when it sees a

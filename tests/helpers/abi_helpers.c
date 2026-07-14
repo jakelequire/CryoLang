@@ -7,7 +7,7 @@
 // C compiler emits for the same signature.
 //
 // Keep this file dependency-free (no system headers beyond <stdint.h>)
-// so the cross-toolchain build stays trivially portable — the tests
+// so the cross-toolchain build stays trivially portable - the tests
 // only run on Linux x86-64 anyway, which is what we target.
 
 #include <stdint.h>
@@ -15,7 +15,7 @@
 #include <stdio.h>    // for vsnprintf, forwarded into by bindgen_probe_vfmt
 
 
-// ----- §3.1 DirectPair returns (9–16 byte aggregates) ----------------------
+// ----- section 3.1 DirectPair returns (9-16 byte aggregates) ----------------------
 
 // 12-byte struct (int * 3).  Returns as `{i64, i32}` under SysV.
 typedef struct ThreeI32 { int32_t a, b, c; } ThreeI32;
@@ -26,7 +26,7 @@ ThreeI32 abi_make_three_i32(int32_t a, int32_t b, int32_t c) {
 }
 
 
-// ----- §3.2 small-aggregate extern-C params --------------------------------
+// ----- section 3.2 small-aggregate extern-C params --------------------------------
 
 // 8-byte struct (int * 2).  Passed by value in a single INTEGER eightbyte.
 typedef struct TwoI32 { int32_t a, b; } TwoI32;
@@ -42,10 +42,10 @@ int32_t abi_sum_three_i32(ThreeI32 s) {
 }
 
 
-// ----- §3.3 SSE eightbyte ---------------------------------------------------
+// ----- section 3.3 SSE eightbyte ---------------------------------------------------
 
 // All-double 16-byte struct.  Under SysV, both eightbytes are SSE class
-// — the return value rides %xmm0:%xmm1 and the LLVM lowering should
+// - the return value rides %xmm0:%xmm1 and the LLVM lowering should
 // produce `{double, double}`, NOT `{i64, i64}`.
 typedef struct TwoDoubles { double a, b; } TwoDoubles;
 
@@ -75,13 +75,13 @@ float abi_sum_two_floats(TwoFloats s) {
 }
 
 
-// ----- §3.3 SSE eightbyte: floats nested inside member aggregates ----------
+// ----- section 3.3 SSE eightbyte: floats nested inside member aggregates ----------
 //
 // These exercise the *recursive* SysV eightbyte classification: a float
 // buried inside a nested struct / array still makes its eightbyte SSE
 // class.  A direct-fields-only classifier wrongly demotes them to
 // INTEGER, so Cryo would pass/return them in GP registers while clang
-// (here) uses XMM — and both fields read back garbage.
+// (here) uses XMM - and both fields read back garbage.
 
 // 16-byte struct whose first eightbyte is a *nested* struct holding one
 // double, second eightbyte a plain double.  Both eightbytes are SSE.
@@ -112,7 +112,7 @@ float abi_wrap_f_get(WrapF s) {
 }
 
 // 8-byte struct holding a fixed array of two floats.  Both floats share
-// one eightbyte → `<2 x float>` SSE, exercising the array branch of the
+// one eightbyte -> `<2 x float>` SSE, exercising the array branch of the
 // recursive leaf walk.
 typedef struct ArrF2 { float v[2]; } ArrF2;
 
@@ -129,7 +129,7 @@ float abi_sum_arr_f2(ArrF2 s) {
 // ----- libclang C-import engine (Compiler::Bindgen) regression probe -------
 // Uniquely named so the dedicated #include-import test
 // (tests/tests/lang/c_import_libclang.cryo) can declare it in a local header,
-// import it through the libclang engine, and CALL it — exercising the full
+// import it through the libclang engine, and CALL it - exercising the full
 // parse -> emit FunctionDecl -> resolve -> link -> run path. (Self-host proves
 // IR byte-identity over llvm_bindings.h but never runs an imported function.)
 int bindgen_probe_add3(int a, int b, int c) {
@@ -172,7 +172,7 @@ int bindgen_probe_vstrlen(int n, va_list ap) {
     return total;
 }
 
-// Forward the SAME va_list a second time, into real libc `vsnprintf` — proves a
+// Forward the SAME va_list a second time, into real libc `vsnprintf` - proves a
 // va_list survives a double hand-off (Cryo args -> this C fn -> libc) and that
 // format-string processing reads the forwarded list correctly.
 int bindgen_probe_vfmt(char *buf, unsigned long size, const char *fmt, va_list ap) {

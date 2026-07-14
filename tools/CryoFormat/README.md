@@ -1,10 +1,10 @@
 # CryoFormat
 
-> **Status: experimental — not part of the CryoLang 1.0 release.** CryoFormat is an
+> **Status: experimental - not part of the CryoLang 1.0 release.** CryoFormat is an
 > independent Rust prototype that targets an older subset of the language; it is not
 > built by the top-level `make`, not covered by repo CI, and **not wired into the
 > CryoAnalyzer VS Code extension** (the `editor.defaultFormatter` / `cryolang.cryofmt`
-> instructions below do not work yet — no extension registers that formatter). Treat
+> instructions below do not work yet - no extension registers that formatter). Treat
 > everything here as forward-looking. The shipped 1.0 tooling is the LSP
 > (`tools/CryoLSP`) and the VS Code extension (`tools/CryoAnalyzer`).
 

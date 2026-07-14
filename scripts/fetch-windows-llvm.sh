@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 #
-# fetch-windows-llvm — provision a wine-runnable Windows toolchain for the Cryo
+# fetch-windows-llvm - provision a wine-runnable Windows toolchain for the Cryo
 # compiler's windows-gnu cross-build + self-host.
 #
 # Two pieces land under the repo's gitignored .toolchains/:
 #
-#   1. .toolchains/llvm-win/  — the LLVM-C API the compiler links against.
+#   1. .toolchains/llvm-win/ - the LLVM-C API the compiler links against.
 #      A windows-gnu cross-build of cryo.exe must resolve the ~192 LLVM-C
 #      symbols the codegen backend calls.  There is no official windows-*gnu*
 #      libLLVM release, so this takes the official windows-*msvc* `LLVM-C.dll`,
@@ -14,11 +14,11 @@
 #      across msvc/mingw on x64 (undecorated cdecl names), so an mingw-linked
 #      cryo.exe resolves cleanly against the import lib and loads the DLL at
 #      runtime.  The official DLL statically links the MSVC CRT (`/MT`), so it
-#      only needs kernel32/advapi32/ntdll at runtime — all wine builtins — which
+#      only needs kernel32/advapi32/ntdll at runtime - all wine builtins - which
 #      is why the result also runs under wine.  Pinned to LLVM 20 to match the
 #      host build's `-lLLVM-20`.
 #
-#   2. .toolchains/llvm-mingw/ — mstorsjo's llvm-mingw (Windows-PE build): a
+#   2. .toolchains/llvm-mingw/ - mstorsjo's llvm-mingw (Windows-PE build): a
 #      wine-runnable `clang.exe` + `ld.lld.exe` + a full mingw-w64 sysroot.
 #      The msvc `LLVM-C.dll` gives us the API to LINK AGAINST, but the msvc
 #      clang has no bundled linker, so it cannot produce an executable under
@@ -27,16 +27,16 @@
 #      preprocesses the one `#include "llvm_bindings.h"` site (CRYO_CC) AND
 #      links a real, wine-runnable cryo.exe with no extra flags.  `llvm-ar.exe`
 #      is the archiver wine can launch (CRYO_AR).  Used purely as a
-#      driver/linker/preprocessor — its own LLVM version is irrelevant; the
+#      driver/linker/preprocessor - its own LLVM version is irrelevant; the
 #      LLVM-C symbols come from the import lib in (1), and llvm_bindings.h is
 #      self-contained (no system #includes).
 #
 # Output (default prefix .toolchains/, override with CRYO_WIN_LLVM_PREFIX /
 # CRYO_WIN_MINGW_PREFIX):
-#     <llvm-win>/lib/libLLVM-C.dll.a   — link against this (`-lLLVM-C`)
-#     <llvm-win>/bin/LLVM-C.dll        — ship next to cryo.exe (runtime dep)
-#     <llvm-mingw>/bin/clang.exe       — CRYO_CC (preprocess + link driver)
-#     <llvm-mingw>/bin/llvm-ar.exe     — CRYO_AR (archiver, wine-runnable)
+#     <llvm-win>/lib/libLLVM-C.dll.a - link against this (`-lLLVM-C`)
+#     <llvm-win>/bin/LLVM-C.dll - ship next to cryo.exe (runtime dep)
+#     <llvm-mingw>/bin/clang.exe - CRYO_CC (preprocess + link driver)
+#     <llvm-mingw>/bin/llvm-ar.exe - CRYO_AR (archiver, wine-runnable)
 #
 # scripts/selfhost-check.py points CRYO_CC/CRYO_AR at the llvm-mingw bits and
 # runs the full 6-stage windows byte-identity self-host under wine.  Idempotent:
@@ -141,9 +141,9 @@ else
     cp "${work}/LLVM-C.dll"  "$DLL"
     cp "${work}/libclang.dll" "$CLANG_DLL"
 
-    # libclang's builtin resource headers (stddef.h / stdint.h / …).  The
+    # libclang's builtin resource headers (stddef.h / stdint.h / ...).  The
     # Windows libclang must find these to parse any header that #includes them
-    # — e.g. the compiler's own llvm_bindings.h.  Staged at lib/clang/<v>/include
+    # - e.g. the compiler's own llvm_bindings.h.  Staged at lib/clang/<v>/include
     # so they sit at libclang.dll's default `<dll>/../lib/clang/<v>` resource
     # path; selfhost-check also exports CRYO_CLANG_RESOURCE_DIR to lib/clang/<v>
     # for the wine self-host, where libclang.dll is copied out of this tree and
@@ -178,7 +178,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Part 2: llvm-mingw (.toolchains/llvm-mingw) — wine-runnable clang + ld.lld
+# Part 2: llvm-mingw (.toolchains/llvm-mingw) - wine-runnable clang + ld.lld
 # ---------------------------------------------------------------------------
 if [[ -f "$MINGW_CLANG" && -f "$MINGW_AR" && "$force" -eq 0 ]]; then
     echo "[fetch-windows-llvm] llvm-mingw already present under $MINGW_PREFIX (pass --force to rebuild)"

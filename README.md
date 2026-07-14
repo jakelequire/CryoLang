@@ -67,7 +67,7 @@ curl -fsSL https://cryo-lang.org/install.sh | bash -s -- --version=1.0.0
 ~/.cryo/bin/cryo --version          # or: cryo --uninstall via the script
 ```
 
-> **One runtime requirement:** compiling a program shells out to a system C compiler/linker for the final link. Install one if you don't have it — `gcc`/`clang` on Linux, a mingw-w64 `gcc` on Windows. The `cryo` binary itself needs nothing.
+> **One runtime requirement:** compiling a program shells out to a system C compiler/linker for the final link. Install one if you don't have it - `gcc`/`clang` on Linux, a mingw-w64 `gcc` on Windows. The `cryo` binary itself needs nothing.
 
 ### From source / for compiler development
 
@@ -76,7 +76,7 @@ The repo ships a committed self-hosted compiler at `bin/cryo` and a stdlib at `s
 ```bash
 git clone https://github.com/jakelequire/CryoLang.git
 cd CryoLang
-./install.sh --dev                 # → /usr/local/bin/cryo, /usr/local/share/cryo/stdlib
+./install.sh --dev                 # -> /usr/local/bin/cryo, /usr/local/share/cryo/stdlib
 ./install.sh --dev --prefix=$HOME/.local
 ./install.sh --dev --uninstall
 ```
@@ -85,7 +85,7 @@ cd CryoLang
 
 ### Requirements
 
-The **quick-install** binary is statically linked — it only needs a C compiler on `PATH` to link the programs you compile. The table below applies to the **from-source / dev** flow (the pinned `bin/cryo` is dynamically linked):
+The **quick-install** binary is statically linked - it only needs a C compiler on `PATH` to link the programs you compile. The table below applies to the **from-source / dev** flow (the pinned `bin/cryo` is dynamically linked):
 
 | Dependency | Version | Why |
 | --- | --- | --- |
@@ -114,9 +114,9 @@ This produces:
 
 ```
 hello/
-├── cryoconfig
-└── src/
-    └── main.cryo
++-- cryoconfig
++-- src/
+    +-- main.cryo
 ```
 
 `src/main.cryo`:
@@ -303,7 +303,7 @@ extern "C" {
     function strlen(s: string) -> u64;
 }
 
-// …or import a whole C header under an alias. Quoted includes resolve
+// ...or import a whole C header under an alias. Quoted includes resolve
 // relative to the source file; angle-bracket includes use the system
 // search path, exactly as in C.
 c := extern "C" {
@@ -317,7 +317,7 @@ function main() -> int {
 }
 ```
 
-The `c := extern "C" { #include … }` form imports a real C header. The compiler invokes `clang` to preprocess it and synthesises bindings under the named alias. Don't also hand-declare a symbol that the imported header defines (e.g. `puts` from `<stdio.h>`) — call it through the alias (`c::puts`) instead.
+The `c := extern "C" { #include ... }` form imports a real C header. The compiler invokes `clang` to preprocess it and synthesises bindings under the named alias. Don't also hand-declare a symbol that the imported header defines (e.g. `puts` from `<stdio.h>`) - call it through the alias (`c::puts`) instead.
 
 ### Tests
 
@@ -333,7 +333,7 @@ function addition_is_commutative() -> Result<(), TestError> {
 }
 ```
 
-Run with `cryo test`. See [`docs/cryo.md` § 20](./docs/cryo.md#20-testing).
+Run with `cryo test`. See [`docs/cryo.md` section 20](./docs/cryo.md#20-testing).
 
 ---
 
@@ -343,7 +343,7 @@ Run with `cryo test`. See [`docs/cryo.md` § 20](./docs/cryo.md#20-testing).
 | --- | --- |
 | `cryo init [dir]` | Scaffold a new project (`cryoconfig` + `src/main.cryo`). |
 | `cryo build` | Build the project in the current directory. |
-| `cryo build --opt-level=N` | Override the optimization level (`0`–`3`) for this build. |
+| `cryo build --opt-level=N` | Override the optimization level (`0`-`3`) for this build. |
 | `cryo build -g` | Emit DWARF debug info (source file/line) for gdb/lldb backtraces. |
 | `cryo run` | Build and execute. |
 | `cryo test [filter]` | Discover, build, and run every `![test]` function. |
@@ -408,7 +408,7 @@ entry_point = "src/tool/main.cryo"
 | `io` | `Read` and `Write` traits with rich defaults; `Stdin` / `Stdout` / `Stderr`; `BufWriter` / `LineWriter` / `BufReader`; POSIX `IoError` mapping. |
 | `fmt` | `Display`, `Debug`, `Formatter<W>`, `FmtWrite`. Heap-free integer and float writers. `print` / `println` / `eprint` / `eprintln`. |
 | `json` | RFC 8259 parser + serializer. `JsonValue`, `JsonNumber`, ordered `JsonObject`. |
-| `encoding` | Byte↔text codecs: `base64` (RFC 4648) `encode`/`decode`, and `sha1` (RFC 3174) 20-byte digest. |
+| `encoding` | Byte<->text codecs: `base64` (RFC 4648) `encode`/`decode`, and `sha1` (RFC 3174) 20-byte digest. |
 | `fs` | `Path` / `PathBuf`. `OpenOptions` builder, `File` (`Read + Write`). Path manipulation. |
 | `ffi` | The C ABI boundary. `libc` houses every `extern "C"` the stdlib needs. `cstr` for `CStr` / `CString`. |
 | `env` | `args()`, `var()`, `set_var()`, `process_exit()`. |
@@ -461,11 +461,11 @@ Each archive gets a sibling `.sha256`. The Linux build needs `libpolly-20-dev` a
 The compiler runs a multi-pass pipeline driven from [`compiler/src/compiler/instance.cryo`](./compiler/src/compiler/instance.cryo):
 
 ```
-Source → Lex → Parse → Module Resolution → Declaration Collection → Type Resolution
-       → Type Lowering → Specialisation (monomorphisation) → Semantic Analysis
-       → Move Check → Drop Insertion (scope-exit synthesis active;
+Source -> Lex -> Parse -> Module Resolution -> Declaration Collection -> Type Resolution
+       -> Type Lowering -> Specialisation (monomorphisation) -> Semantic Analysis
+       -> Move Check -> Drop Insertion (scope-exit synthesis active;
          loop fixed-point reanalysis gated)
-       → IR Generation (LLVM 20) → Linking (clang) → Native binary
+       -> IR Generation (LLVM 20) -> Linking (clang) -> Native binary
 ```
 
 | Stage | Source |
@@ -474,7 +474,7 @@ Source → Lex → Parse → Module Resolution → Declaration Collection → Ty
 | Parsing | `compiler/src/compiler/parser/` |
 | AST | `compiler/src/compiler/AST/` |
 | Type system, monomorphisation | `compiler/src/compiler/types/` |
-| Passes (sema, move, drop, specialisation, type lowering, header import, …) | `compiler/src/compiler/passes/` |
+| Passes (sema, move, drop, specialisation, type lowering, header import, ...) | `compiler/src/compiler/passes/` |
 | LLVM IR generation | `compiler/src/compiler/codegen/` |
 | Diagnostics | `compiler/src/compiler/diag/` |
 | CLI | `compiler/src/CLI/` |
@@ -487,29 +487,29 @@ The compiler runtime, meaning every intrinsic from `stdlib/core/intrinsics.cryo`
 
 ```
 CryoLang/
-├── bin/                  Pinned self-hosted compiler binary (committed)
-├── compiler/             The self-hosted Cryo compiler
-│   └── src/
-├── stdlib/               The standard library, written in Cryo
-├── tools/
-│   ├── CryoLSP           Language Server (Cryo source); builds via `make lsp`
-│   ├── CryoFormat        Formatter (experimental; not built by default)
-│   └── CryoAnalyzer      Semantic analyser
-├── legacy/
-│   └── bootstrap/        Retired C++23 bootstrap; kept for historical reference only
-├── docs/                 Language reference (cryo.md), grammar, mangling spec
-├── examples/             Standalone example projects
-│   ├── 09-json-config    std::json parsing
-│   ├── 11-http-server    net::http server
-│   └── …
-├── tests/                Repo-level test suite (uses ![test])
-├── scripts/              Build helpers (selfhost-check, cryo-pin)
-├── assets/
-├── Makefile              Top-level build orchestration
-├── install.sh            Symlink installer
-├── CHANGELOG.md
-├── CONTRIBUTING.md
-└── LICENSE
++-- bin/                  Pinned self-hosted compiler binary (committed)
++-- compiler/             The self-hosted Cryo compiler
+|   +-- src/
++-- stdlib/               The standard library, written in Cryo
++-- tools/
+|   +-- CryoLSP           Language Server (Cryo source); builds via `make lsp`
+|   +-- CryoFormat        Formatter (experimental; not built by default)
+|   +-- CryoAnalyzer      Semantic analyser
++-- legacy/
+|   +-- bootstrap/        Retired C++23 bootstrap; kept for historical reference only
++-- docs/                 Language reference (cryo.md), grammar, mangling spec
++-- examples/             Standalone example projects
+|   +-- 09-json-config    std::json parsing
+|   +-- 11-http-server    net::http server
+|   +-- ...
++-- tests/                Repo-level test suite (uses ![test])
++-- scripts/              Build helpers (selfhost-check, cryo-pin)
++-- assets/
++-- Makefile              Top-level build orchestration
++-- install.sh            Symlink installer
++-- CHANGELOG.md
++-- CONTRIBUTING.md
++-- LICENSE
 ```
 
 ---
@@ -543,11 +543,11 @@ for the full 1.0 release notes.
 **Beyond 1.0 (post-stable):**
 
 - Async / await / coroutines (currently parser-only).
-- Re-adapting an opaque-typed iterator **local**. The adapters `.map`, `.filter`, `.take`, `.chain`, `.enumerate`, `.zip` (plus `.copied` / `.cloned`) ship in 1.0 and compose when chained directly off the source (`src.map(f).filter(g)`), consumed by `.count` / `.fold` / `.for_each` / `for-in` or gathered with `from_iter`. The residual limitation is binding an adapter to a local and re-adapting it (`let it = src.map(f); it.filter(g)`) — see [`docs/cryo.md` § 2.11](./docs/cryo.md). `for (x in iter)` over ranges, `Array<T>`, `Slice<T>`, fixed-size arrays, and any `Iterator`, plus range expressions `a..b` / `a..=b`, ship in 1.0.
+- Re-adapting an opaque-typed iterator **local**. The adapters `.map`, `.filter`, `.take`, `.chain`, `.enumerate`, `.zip` (plus `.copied` / `.cloned`) ship in 1.0 and compose when chained directly off the source (`src.map(f).filter(g)`), consumed by `.count` / `.fold` / `.for_each` / `for-in` or gathered with `from_iter`. The residual limitation is binding an adapter to a local and re-adapting it (`let it = src.map(f); it.filter(g)`) - see [`docs/cryo.md` section 2.11](./docs/cryo.md). `for (x in iter)` over ranges, `Array<T>`, `Slice<T>`, fixed-size arrays, and any `Iterator`, plus range expressions `a..b` / `a..=b`, ship in 1.0.
 - Dialable IPv6 (the `IpAddr::V6` representation and DNS resolution exist in 1.0; connecting over v6 does not yet).
-- macOS / Darwin targets. (x86_64 Linux and x86_64 Windows — native builds plus Linux→Windows cross via mingw-w64 — ship in 1.0.)
+- macOS / Darwin targets. (x86_64 Linux and x86_64 Windows - native builds plus Linux->Windows cross via mingw-w64 - ship in 1.0.)
 
-A precise list of features the grammar reserves but the compiler does not yet lower lives in [`docs/cryo.md` § 21](./docs/cryo.md#21-reserved-syntax).
+A precise list of features the grammar reserves but the compiler does not yet lower lives in [`docs/cryo.md` section 21](./docs/cryo.md#21-reserved-syntax).
 
 ---
 
@@ -555,4 +555,4 @@ A precise list of features the grammar reserves but the compiler does not yet lo
 
 Licensed under the [Apache License 2.0](LICENSE).
 
-Copyright 2025–2026 Jacob LeQuire.
+Copyright 2025-2026 Jacob LeQuire.

@@ -15,14 +15,14 @@ cross the function-call boundary" is `AbiClassifier`, defined in
 `compiler/src/compiler/codegen/abi.cryo`.
 
 ```
-            ┌─────────────────────────────────────────┐
-            │  CodegenContext::abi  (AbiClassifier)   │
-            │   • type_mapper: TypeMapper*            │
-            │   • sret_kind, byval_kind (cached IDs)  │
-            └───────────────┬─────────────────────────┘
-                            │ back-pointer
-       ┌────────────────────┼────────────────────┬────────────────┐
-       ▼                    ▼                    ▼                ▼
+            +-----------------------------------------+
+            |  CodegenContext::abi  (AbiClassifier)   |
+            |   - type_mapper: TypeMapper*            |
+            |   - sret_kind, byval_kind (cached IDs)  |
+            +---------------+-------------------------+
+                            | back-pointer
+       +--------------------+--------------------+----------------+
+       v                    v                    v                v
 DeclarationEmitter      ExprOps          SymbolResolver    CallEmitter
 (declare_function,   (codegen_call,   (build_function_   (post-call
  declare_method,      codegen_return,   ltype for cross-   coercion at
@@ -56,7 +56,7 @@ type struct SignaturePlan {
     return_plan:  ParamPlan;
     param_plans:  ParamPlan[];
     llvm_fn_type: LType;
-    sret_slot:    boolean;  // true ⇒ LLVM param 0 is the result pointer
+    sret_slot:    boolean;  // true => LLVM param 0 is the result pointer
     is_variadic:  boolean;
 }
 ```
@@ -66,7 +66,7 @@ type struct SignaturePlan {
 Driven by the aggregate's `size_bytes()` after unwrapping `TypeAlias`
 and `InstantiatedType` to the concrete kind. Aggregate kinds are
 `Struct`, `Class`, `Enum`, `Tuple`, and `Optional`. Primitive scalars
-(`Int`, `Float`, `Pointer`, `Reference`, …) and `Array`/`String`/etc.
+(`Int`, `Float`, `Pointer`, `Reference`, ...) and `Array`/`String`/etc.
 are always Direct.
 
 ### Returns
@@ -76,8 +76,8 @@ are always Direct.
 | `void` / `Unit`     | -         | `Ignore` (LLVM `void`, no slot)                                               |
 | Scalar / primitive  | -         | `Direct` (one LLVM slot = source type)                                        |
 | Aggregate           | 0 / inv.  | falls back to `Direct` (whatever `map_type` says)                             |
-| Aggregate           | 1–8       | `Direct` with coercion - one register-sized slot (slot type per the eightbyte rules below) |
-| Aggregate           | 9–16      | `DirectPair` - two register-sized slots, wrapped in `{lo, hi}` literal struct |
+| Aggregate           | 1-8       | `Direct` with coercion - one register-sized slot (slot type per the eightbyte rules below) |
+| Aggregate           | 9-16      | `DirectPair` - two register-sized slots, wrapped in `{lo, hi}` literal struct |
 | Aggregate           | > 16      | `Indirect` with `SRet` - hidden first `ptr sret(%T)` parameter, LLVM returns `void` |
 
 ### Parameters
@@ -92,8 +92,8 @@ to the unified classifiers.
 | Source kind         | Size      | Plan                                                                          |
 |---------------------|-----------|-------------------------------------------------------------------------------|
 | Scalar / primitive  | -         | `Direct` (one LLVM slot = source type)                                        |
-| Aggregate           | 1–8       | `Direct` with coercion - one register-sized slot (slot type per the eightbyte rules below) |
-| Aggregate           | 9–16      | `DirectPair` - two register-sized slots                                       |
+| Aggregate           | 1-8       | `Direct` with coercion - one register-sized slot (slot type per the eightbyte rules below) |
+| Aggregate           | 9-16      | `DirectPair` - two register-sized slots                                       |
 | Aggregate           | > 16      | `Indirect` with `ByVal` - single `ptr byval(%T)` slot                         |
 
 The prologue (`codegen_function_prologue` and `codegen_method_prologue`)
@@ -121,7 +121,7 @@ keeps the call site's slot count in agreement with the callee.
 
 ## 3. Eightbyte slot classification
 
-For each ≤ 8 byte half of an aggregate ("eightbyte bucket"),
+For each <= 8 byte half of an aggregate ("eightbyte bucket"),
 `AbiClassifier::eightbyte_slot_type` picks the LLVM type that occupies
 the slot:
 
@@ -131,8 +131,8 @@ the slot:
 3. **Two F32 fields packing into one 8-byte eightbyte**: emit
    `<2 x float>` via `LLVMVectorType` - multi-float SSE.
 4. **Anything else** (mixed int/ptr, multiple non-float fields, F32+F64
-   sharing a bucket, …): emit the smallest power-of-two integer
-   container ≥ `bucket_size` (`i8` / `i16` / `i32` / `i64`) - INTEGER
+   sharing a bucket, ...): emit the smallest power-of-two integer
+   container >= `bucket_size` (`i8` / `i16` / `i32` / `i64`) - INTEGER
    class.
 
 This matches what clang emits for the same source layouts. The
@@ -184,12 +184,12 @@ mismatches in the equal-kinds case.
 the LLVM-actual and LLVM-expected types disagree:
 
 - `Integer | Float | Double | Vector` expected, `Struct` actual:
-  ≤ 8 byte aggregate param - spill struct, reload as scalar/vector.
+  <= 8 byte aggregate param - spill struct, reload as scalar/vector.
 - `Integer | Float | Double | Vector` expected, `Pointer` actual where
-  the arg is an ≤ 8 byte aggregate by *address* (an lvalue, or a `T*` /
+  the arg is an <= 8 byte aggregate by *address* (an lvalue, or a `T*` /
   `&T` to the aggregate, detected via `agg_register_size`): load the
   register through the pointer. This takes priority over the generic
-  `Integer ← Pointer` `ptrtoint` below - `ptrtoint`-ing the address
+  `Integer <- Pointer` `ptrtoint` below - `ptrtoint`-ing the address
   would pass the pointer where the callee expects the aggregate's bytes
   (e.g. an 8-byte `LBuilder` reached through `this.builder: LBuilder*`).
 - `Struct` expected, `Integer | Float | Double | Vector` actual:
@@ -198,7 +198,7 @@ the LLVM-actual and LLVM-expected types disagree:
 - `Struct` actual+expected, actual is literal: the arg came from a
   DirectPair return whose `{lo, hi}` shape doesn't match the receiving
   param's named struct; reshape.
-- Various `Integer ↔ Pointer`, `Struct ↔ Pointer` cases for receiver /
+- Various `Integer <-> Pointer`, `Struct <-> Pointer` cases for receiver /
   reference plumbing (pre-existing, not ABI-driven).
 
 DirectPair param expansion (a single source aggregate expanding into two
@@ -212,7 +212,7 @@ size (e.g. a `string` literal coerced to a `Str` parameter).
 ### Defining-side coercion (callee)
 
 `codegen_return` in `expr_ops.cryo`. When the function's LLVM return
-type is register-shaped (scalar/vector for ≤ 8 byte returns, literal
+type is register-shaped (scalar/vector for <= 8 byte returns, literal
 `{lo, hi}` struct for DirectPair returns) but the source return value
 is a struct, spill the struct and reload as the declared return
 type before `ret`. Inverse of the post-call coercion.

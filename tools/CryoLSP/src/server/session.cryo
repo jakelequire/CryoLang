@@ -59,11 +59,11 @@ import Lsp::Server::Docs;
 // `AstArena::cryo_ast_arena_set_current` (see the note there on why reads must
 // publish too: `GlobalAlloc`'s free/realloc key on the published arena).
 //
-// This replaces the old single-shared-arena model, whose per-recompile reset
-// forced a compile-epoch guard that invalidated EVERY other document's context
-// on any edit - correct, but it meant a full whole-project recompile (~10-30s
-// for the compiler) on every file switch and every edit, blocking the handler.
-// Per-session arenas trade that latency back for memory bounded by the number
+// A single shared arena would need a per-recompile reset guarded by a
+// compile-epoch check that invalidates EVERY other document's context on any
+// edit - correct, but it means a full whole-project recompile (~10-30s for
+// the compiler) on every file switch and every edit, blocking the handler.
+// Per-session arenas trade that latency for memory bounded by the number
 // of LIVE contexts, which `SessionMap` caps with an LRU (see `MAX_LIVE_CTX`).
 
 
@@ -175,12 +175,12 @@ type struct CompilerSession {
         const path_cstr:    string = this.path_buf.as_ptr() as string;
         const content_cstr: string = this.content_buf.as_ptr() as string;
 
-        // ── Per-recompile arena lifecycle (this session's OWN arena) ──
-        // The compiler routes AST nodes and — while active — the whole container
+        // -- Per-recompile arena lifecycle (this session's OWN arena) --
+        // The compiler routes AST nodes and - while active - the whole container
         // heap (intern strings, resolver maps, type arena, decl index, module
         // graph, and every `T[]`/`HashMap`/`Box`/`String`) through a bump arena
         // published via `AstArena`.  This session owns its arena outright, so no
-        // OTHER document's compile ever disturbs the `ctx` we build here — the
+        // OTHER document's compile ever disturbs the `ctx` we build here - the
         // context stays valid for hover/def until this session is recompiled,
         // evicted, or dropped.  Create the arena on first use (libc-backed:
         // routing is still OFF here, so the `Box<Arena>` and the buffers above
@@ -195,18 +195,18 @@ type struct CompilerSession {
         // building the fresh one.  Reset (not release) keeps the chunks: this
         // arena only ever compiles the SAME document's project, so the per-
         // recompile footprint is stable and the chunks are reused cleanly (no
-        // capacity creep — that only happened when one shared arena hosted
+        // capacity creep - that only happened when one shared arena hosted
         // differently-sized projects back to back).
         AstArena::cryo_ast_arena_set_current(this.arena);
         this.arena.reset();
-        // ACTIVATE routing so the `CompilationContext::new` below — and
-        // everything the compile allocates — is arena-backed rather than libc.
+        // ACTIVATE routing so the `CompilationContext::new` below - and
+        // everything the compile allocates - is arena-backed rather than libc.
         // Deactivated before returning so per-request handler allocations
         // (hover/completion strings) land in libc and are freed as usual.
         AstArena::cryo_alloc_arena_set_active(true);
 
         // Allocate a fresh CompilationContext on the heap with mode=Lsp.  With
-        // routing active this — and the whole context — lands in `this.arena`.
+        // routing active this - and the whole context - lands in `this.arena`.
         const ctx_box: Box<CompilationContext> =
             Box<CompilationContext>::new(
                 CompilationContext::new(CompileMode::Lsp, path_cstr));
@@ -606,10 +606,9 @@ static build_cstring_buffer(s: Str) -> String {
 implement trait Drop for CompilerSession {
     drop(mut &this) -> void {
         // Release this session's arena (frees `ctx` and every container it
-        // owns in one shot) and free the Arena struct itself.  Unlike the old
-        // single-shared-arena model - where each session leaked its ctx and the
-        // process-global arena reclaimed it - the ctx here lives in a session-
-        // owned region, so closing/dropping the session reclaims it directly.
+        // owns in one shot) and free the Arena struct itself.  The ctx lives
+        // in a session-owned region, so closing/dropping the session
+        // reclaims it directly.
         this.release_ctx();
         this.path_buf.drop();
         this.content_buf.drop();

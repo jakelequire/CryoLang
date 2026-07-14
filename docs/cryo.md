@@ -5,7 +5,7 @@
 
 Cryo is a statically-typed, compiled systems language. It targets native machine code through LLVM 20, has a self-hosted compiler, and ships a standard library written entirely in itself. Three principles shape the language:
 
-1. **Explicitness.** Cryo has no implicit conversions and no hidden control flow. The programmer writes out every cast and every loop condition. Type inference is deliberately local — a binding may adopt its initialiser's type, but there is no flow- or program-level inference — so the cost of every operation stays visible in the source and the code is easy to reason about.
+1. **Explicitness.** Cryo has no implicit conversions and no hidden control flow. The programmer writes out every cast and every loop condition. Type inference is deliberately local - a binding may adopt its initialiser's type, but there is no flow- or program-level inference - so the cost of every operation stays visible in the source and the code is easy to reason about.
 
 2. **One toolchain.** Build, run, test, fetch, init, and check are subcommands of a single `cryo` binary. The package manager, the test runner, and the dependency resolver ship with the compiler.
 
@@ -83,9 +83,9 @@ Keywords are reserved identifiers. They cannot be used as variable, function, or
 | `return`     |                 |             |             |                   |                |                         |
 | `asm`        |                 |             |             |                   |                |                         |
 
-`move` marks a closure that captures its environment by move (see [§ 16.3](#163-move-checking)).
+`move` marks a closure that captures its environment by move (see [section 16.3](#163-move-checking)).
 
-Reserved-for-future-use keywords are recognised by the lexer; the parser may accept them in places that have no semantic implementation. See [§ 21](#21-reserved-syntax).
+Reserved-for-future-use keywords are recognised by the lexer; the parser may accept them in places that have no semantic implementation. See [section 21](#21-reserved-syntax).
 
 ### 1.3 Comments
 
@@ -141,7 +141,7 @@ Strings are enclosed in double quotes; characters in single quotes. Both share t
 '\x41'                     // hex byte: equivalent to 'A'
 ```
 
-**Escape sequences:** `\n` `\t` `\r` `\0` `\\` `\'` `\"` `\xHH` (hex byte). Raw strings (`r"..."`) and the additional C escapes `\a \b \f \v` are reserved but not yet implemented — see [§ 21](#21-reserved-syntax).
+**Escape sequences:** `\n` `\t` `\r` `\0` `\\` `\'` `\"` `\xHH` (hex byte). Raw strings (`r"..."`) and the additional C escapes `\a \b \f \v` are reserved but not yet implemented - see [section 21](#21-reserved-syntax).
 
 #### f-strings (string interpolation)
 
@@ -166,7 +166,7 @@ const s: String = f"x = {x}, opt = {opt:?}";   // "x = 42, opt = Some(7)"
   is auto-imported into any module that uses one.
 
 For raw, untyped formatted output (C `printf` semantics, `%d`/`%s`
-specifiers, not type-checked), use `printf` — an intrinsic that is
+specifiers, not type-checked), use `printf` - an intrinsic that is
 auto-imported into every module (no `import` needed). For typed,
 `Display`-formatted output, build a `String` (usually with an f-string) and
 pass it to `print` / `println` from `std::fmt`; both take a *single*
@@ -187,7 +187,7 @@ There is no implicit conversion between `boolean` and integers; `if (1)` is a ty
 
 ## 2. Type System
 
-Every value in Cryo has a known type at compile time. A binding's type is either written explicitly or inferred from its initialiser (local inference only — see [§ 3](#3-variables-and-constants)). There are no implicit conversions between numeric types; when you need a conversion, you write it with `as`.
+Every value in Cryo has a known type at compile time. A binding's type is either written explicitly or inferred from its initialiser (local inference only - see [section 3](#3-variables-and-constants)). There are no implicit conversions between numeric types; when you need a conversion, you write it with `as`.
 
 ### 2.1 Primitive Types
 
@@ -204,7 +204,7 @@ Every value in Cryo has a known type at compile time. A binding's type is either
 | `float`                       | Alias for `f32` (single-precision IEEE 754). Distinct from `double`. Bare float literals still default to `f64`.                                  | 4 bytes                  |
 | `f32` `f64`                   | IEEE 754 floats.                                                                                                                                 | 4 / 8 bytes              |
 | `double`                      | Alias for `f64`.                                                                                                                                 | 8 bytes                  |
-| `usize` `isize`               | Pointer-width unsigned / signed integers — distinct types whose width tracks the target's pointer size (the natural type for sizes and indices). | 8 bytes on 64-bit        |
+| `usize` `isize`               | Pointer-width unsigned / signed integers - distinct types whose width tracks the target's pointer size (the natural type for sizes and indices). | 8 bytes on 64-bit        |
 
 In performance-sensitive or cross-platform code, prefer the explicit-width forms (`i32`, `u64`, `f64`) so the layout is unambiguous. The shorthand aliases exist for ergonomics.
 
@@ -220,7 +220,7 @@ const pp: int** = &p;          // pointer to pointer
 const v:  void* = malloc(64);  // type-erased
 ```
 
-Raw pointers are unchecked. Validity, aliasing, and lifetime are the programmer's responsibility. For a pointer that is statically guaranteed non-null, see `core::ptr::NonNull<T>`. For owned heap allocations, prefer `Box<T>`. See [§ 15](#15-pointers-and-memory).
+Raw pointers are unchecked. Validity, aliasing, and lifetime are the programmer's responsibility. For a pointer that is statically guaranteed non-null, see `core::ptr::NonNull<T>`. For owned heap allocations, prefer `Box<T>`. See [section 15](#15-pointers-and-memory).
 
 ### 2.3 References
 
@@ -330,7 +330,7 @@ when the type parameter appears *nowhere* the call can infer it from.
 
 ### 2.6 Tuple Types
 
-A tuple groups a fixed number of values — of possibly different types — into one
+A tuple groups a fixed number of values - of possibly different types - into one
 compound value. Tuple types and tuple literals both use parentheses:
 
 ```cryo
@@ -346,19 +346,19 @@ const y: int    = p[0];    // `t[N]` indexing is equivalent to `t.N`
 Because parentheses are also used for grouping, the unit type, and function
 types, the forms are:
 
-- `()` — the unit type / unit value, which also serves as the empty tuple (§2.7).
-- `(T)` / `(expr)` — **grouping**: just `T` / `expr`, *not* a 1-tuple.
-- `(T,)` / `(x,)` — a **1-tuple**: the trailing comma distinguishes it from grouping.
-- `(T, U)`, `(T, U, V)`, … — 2-, 3-, … element tuples.
-- `(A, B) -> R` — a function type, not a tuple (the `->` disambiguates).
+- `()` - the unit type / unit value, which also serves as the empty tuple (section 2.7).
+- `(T)` / `(expr)` - **grouping**: just `T` / `expr`, *not* a 1-tuple.
+- `(T,)` / `(x,)` - a **1-tuple**: the trailing comma distinguishes it from grouping.
+- `(T, U)`, `(T, U, V)`, ... - 2-, 3-, ... element tuples.
+- `(A, B) -> R` - a function type, not a tuple (the `->` disambiguates).
 
-Element access is positional with an integer literal — `t.0`, `t.1`, … (or the
-equivalent `t[0]`, `t[1]`) — and the index is checked against the tuple's arity
+Element access is positional with an integer literal - `t.0`, `t.1`, ... (or the
+equivalent `t[0]`, `t[1]`) - and the index is checked against the tuple's arity
 at compile time. Chained access like `t.1.0` works (element 1, then element 0 of
 that).
 
 > **Note:** a pre-1.0 bracket spelling, `[T, U]`, was previously accepted in
-> type position. It has been removed — a leading `[` in a type is now an error.
+> type position. It has been removed - a leading `[` in a type is now an error.
 > Write `(T, U)`. (The array suffixes `T[]` / `T[N]` are unaffected: they are
 > postfix on an existing type, not a leading bracket.)
 
@@ -395,7 +395,7 @@ const p: u8* = some_string as u8*; // pointer reinterpretation
 
 `T?` is shorthand for `Option<T>`. It is pure sugar - the parser rewrites `T?`
 to `Option<T>`, so the two are the *same* type. A `T?` value carries all of
-`Option`'s methods (`is_some`, `is_none`, `unwrap_or`, `map`, …) and is freely
+`Option`'s methods (`is_some`, `is_none`, `unwrap_or`, `map`, ...) and is freely
 assignable to and from `Option<T>`. The suffix works in every type position:
 variable, parameter, return type, struct field, and generic argument.
 
@@ -443,15 +443,15 @@ allocation, vtable, or runtime indirection. It corresponds to "return some
 single type that implements this trait", **not** to a dynamically-dispatched
 trait object. (`implement` is the same keyword used for implement blocks; in
 *type position* it introduces an opaque type, while at the *start of a
-declaration* it introduces an implement block — the two never overlap.)
+declaration* it introduces an implement block - the two never overlap.)
 
 **Where it is allowed.** Two positions:
 
-- **Return type** — the concrete type is inferred from the body's first
+- **Return type** - the concrete type is inferred from the body's first
   `return` expression. That expression must currently be a *struct literal*
-  (e.g. `return SliceIter<T> { … }`), which is how every standard-library
+  (e.g. `return SliceIter<T> { ... }`), which is how every standard-library
   iterator is written.
-- **Variable binding** — `mut it: implement Iterator<i32> = expr;`. The type
+- **Variable binding** - `mut it: implement Iterator<i32> = expr;`. The type
   is taken from the initialiser, which is then checked to actually implement
   the named trait; a mismatch is `E0200`:
 
@@ -461,7 +461,7 @@ declaration* it introduces an implement block — the two never overlap.)
 
   When the initialiser is a **concrete static constructor**
   (`mut it: implement Iterator<i32> = Range<i32>::new(0, 10);`), you can
-  re-adapt the local directly — `it.take(3)` specialises the adapter against
+  re-adapt the local directly - `it.take(3)` specialises the adapter against
   the recovered concrete receiver. The binding's *visible* type is still the
   opaque trait; the compiler recovers the concrete initialiser type for
   combinator specialisation.
@@ -469,23 +469,23 @@ declaration* it introduces an implement block — the two never overlap.)
   This recovery only applies when the initialiser names its concrete type.
   When the producer itself returns an opaque iterator
   (`mut it: implement Iterator<i32> = arr.iter();`, where `iter` returns
-  `implement Iterator<…>`), the concrete cursor is hidden behind that opaque
-  return, so the local has no concrete receiver to specialise against — chain
+  `implement Iterator<...>`), the concrete cursor is hidden behind that opaque
+  return, so the local has no concrete receiver to specialise against - chain
   the combinator on the producing expression instead
   (`arr.iter().take(2).count()`), or bind to the concrete adapter type when you
   need a named local (`mut z: ZipIter<Range<i32>, Range<i32>> = a.zip(b);`).
 
 To accept *any* iterator as a **parameter**, use a generic with a trait bound
-instead — that is the tool for the input side:
+instead - that is the tool for the input side:
 
 ```cryo
-function sum<I>(mut it: I) -> i32 where I: Iterator<i32> { … }
+function sum<I>(mut it: I) -> i32 where I: Iterator<i32> { ... }
 ```
 
 **Multiple bounds** combine with `+`: `implement Iterator<i32> + Clone`.
 
 **One concrete type per site.** An opaque return names a single underlying
-type — every `return` in the body must produce the same one. Two iterators of
+type - every `return` in the body must produce the same one. Two iterators of
 different concrete types cannot be returned from one `implement Trait`
 function (that would require a dynamically-dispatched trait object, which Cryo
 does not provide).
@@ -529,7 +529,7 @@ const VERSION:    string = "1.0.0";
 mut   g_counter:  u64    = 0;
 ```
 
-> **Local type inference.** The type annotation may be omitted when an initialiser is present; the binding adopts the initialiser's *concrete* type (`const x = 10;` infers `i32`, `mut p = Point { ... };` infers `Point`). Because the inferred type is the concrete one the initialiser produces — not an erased `implement Trait` — methods on it stay callable, so `mut it = arr.iter(); it.take(3)...` works without naming the iterator type. Inference is purely local: it reads only the initialiser of the same statement, never later uses. A binding with no initialiser therefore still needs an annotation (`mut y: int;`), and an initialiser that yields no value (`void`) cannot be inferred (both are `E0104`). There are still no implicit conversions and no flow- or program-level inference.
+> **Local type inference.** The type annotation may be omitted when an initialiser is present; the binding adopts the initialiser's *concrete* type (`const x = 10;` infers `i32`, `mut p = Point { ... };` infers `Point`). Because the inferred type is the concrete one the initialiser produces - not an erased `implement Trait` - methods on it stay callable, so `mut it = arr.iter(); it.take(3)...` works without naming the iterator type. Inference is purely local: it reads only the initialiser of the same statement, never later uses. A binding with no initialiser therefore still needs an annotation (`mut y: int;`), and an initialiser that yields no value (`void`) cannot be inferred (both are `E0104`). There are still no implicit conversions and no flow- or program-level inference.
 
 ---
 
@@ -579,7 +579,7 @@ const n: int    = identity<int>(42);
 const s: string = identity<string>("hello");
 ```
 
-Each call produces a fully specialised version of the function. See [§ 12.6 Monomorphisation](#126-monomorphisation).
+Each call produces a fully specialised version of the function. See [section 12.6 Monomorphisation](#126-monomorphisation).
 
 To require capabilities of `T` (such as the ability to compare it with `<`), use a `where` clause:
 
@@ -613,7 +613,7 @@ function sum(count: i32, args...) -> i64 {
 }
 ```
 
-`va.next<T>()` is the explicit form; `va.next()` infers `T` from the expected type at the call site (see [§ 17.x](#directives) on `![implicit]`). `va.as_ptr()` returns the raw `va_list` pointer for forwarding to a C `v*printf` callee - equivalently, pass the original `args` identifier.
+`va.next<T>()` is the explicit form; `va.next()` infers `T` from the expected type at the call site (see [section 17.x](#directives) on `![implicit]`). `va.as_ptr()` returns the raw `va_list` pointer for forwarding to a C `v*printf` callee - equivalently, pass the original `args` identifier.
 
 Two limits are inherited from C varargs and no wrapper can remove them:
 
@@ -633,7 +633,7 @@ extern "C" {
 }
 ```
 
-See [§ 18](#18-foreign-function-interface) for full FFI semantics, including `extern "C" { ... }` blocks and the `extern module c := "C" { #include <header.h> }` form.
+See [section 18](#18-foreign-function-interface) for full FFI semantics, including `extern "C" { ... }` blocks and the `extern module c := "C" { #include <header.h> }` form.
 
 ### 4.5 Intrinsic Functions
 
@@ -693,7 +693,7 @@ This is a defined deterministic result, not undefined behavior, but it is *silen
 | `<` `>` `<=` `>=` | Ordering comparisons                                         |
 | `<=>`             | Three-way comparison (spaceship); yields an `Ordering` (`Less` / `Equal` / `Greater`) |
 
-Comparison operators return `boolean`. On numeric types and pointers they emit native instructions; on user-defined types that implement `Eq`/`Ord` they are **overloaded** — `a == b` becomes `a.equals(&b)` and `a < b` becomes `a.compare(&b).is_lt()` (see operator overloading, [§ 11.6](#116-operator-overloading)).
+Comparison operators return `boolean`. On numeric types and pointers they emit native instructions; on user-defined types that implement `Eq`/`Ord` they are **overloaded** - `a == b` becomes `a.equals(&b)` and `a < b` becomes `a.compare(&b).is_lt()` (see operator overloading, [section 11.6](#116-operator-overloading)).
 
 ### 5.3 Logical
 
@@ -731,7 +731,7 @@ Only `mut` bindings can be assigned to.
 | `?` `:`        | Ternary conditional.                                                                                                                          |
 | `?` (postfix)  | Error propagation ("try"): on a `Result`/`Option`, yields the `Ok`/`Some` payload, else returns the `Err`/`None` from the enclosing function. |
 | `??`           | Null-coalescing: `opt ?? fallback` yields a `Some`'s payload, else `fallback` (evaluated only when `opt` is `None`).                          |
-| `\|>` `<\|`    | Pipeline: thread a value into a call (`x \|> f(a)` ⇒ `f(x, a)`; `f(a) <\| x` ⇒ `f(a, x)`).                                                    |
+| `\|>` `<\|`    | Pipeline: thread a value into a call (`x \|> f(a)` => `f(x, a)`; `f(a) <\| x` => `f(a, x)`).                                                    |
 | `as`           | Explicit type cast.                                                                                                                           |
 | `.`            | Member access.                                                                                                                                |
 | `&`            | Address-of (unary).                                                                                                                           |
@@ -741,7 +741,7 @@ Only `mut` bindings can be assigned to.
 | `typeof(expr)` | Compile-time type of `expr`, used in type position (decltype-style).                                                                          |
 | `new` `delete` | Heap allocation / deallocation.                                                                                                               |
 
-> **Reserved.** `?.` and `...` in call position are recognised by the lexer but not yet lowered. See [§ 21](#21-reserved-syntax). (The range operators `..` / `..=` *are* fully lowered — see [§ 5.7](#57-operator-precedence).)
+> **Reserved.** `?.` and `...` in call position are recognised by the lexer but not yet lowered. See [section 21](#21-reserved-syntax). (The range operators `..` / `..=` *are* fully lowered - see [section 5.7](#57-operator-precedence).)
 
 **Pipeline (`|>`, `<|`).** The pipeline operators thread a value into a call. `x |> f` is `f(x)`; with an argument list the piped value is **prepended** - `x |> f(a, b)` is `f(x, a, b)`. The backward form **appends** instead - `f(a, b) <| x` is `f(a, b, x)`. Pipes are left-associative, so `x |> f |> g` is `g(f(x))`. They are a compile-time rewrite to an ordinary call, with no runtime cost.
 
@@ -801,7 +801,7 @@ From **lowest** to **highest**:
 
 `as` sits between multiplication and unary, so `x * y as i64` casts `y`, not the product. Use parentheses if you mean `(x * y) as i64`.
 
-The range operators `..` / `..=` bind looser than every arithmetic and comparison operator, so `a + 1 .. b * 2` is `(a + 1) .. (b * 2)`. They desugar at parse time to `Range::new` / `RangeInclusive::new` (see [§ 6.3](#63-for-loops)).
+The range operators `..` / `..=` bind looser than every arithmetic and comparison operator, so `a + 1 .. b * 2` is `(a + 1) .. (b * 2)`. They desugar at parse time to `Range::new` / `RangeInclusive::new` (see [section 6.3](#63-for-loops)).
 
 ---
 
@@ -851,9 +851,9 @@ for (mut i: int = 0; i < 10; i++) {
 
 The scrutinee may be:
 
-- An **`Iterator`** directly — anything exposing `next(mut &this) -> Option<T>`, including the stdlib's `Range<T>` / `RangeInclusive<T>` and any type that `implement trait Iterator<T>`.
-- A **range literal** `a..b` (half-open) or `a..=b` (inclusive). These are sugar for `Range::new(a, b)` / `RangeInclusive::new(a, b)`; see the precedence table in [§ 5.7](#57-operator-precedence).
-- An **iterable** that exposes `iter()` returning an iterator — `Array<T>` and `Slice<T>` (their `iter()` is gated `where T: Copy`). The lowering inserts the `.iter()` call.
+- An **`Iterator`** directly - anything exposing `next(mut &this) -> Option<T>`, including the stdlib's `Range<T>` / `RangeInclusive<T>` and any type that `implement trait Iterator<T>`.
+- A **range literal** `a..b` (half-open) or `a..=b` (inclusive). These are sugar for `Range::new(a, b)` / `RangeInclusive::new(a, b)`; see the precedence table in [section 5.7](#57-operator-precedence).
+- An **iterable** that exposes `iter()` returning an iterator - `Array<T>` and `Slice<T>` (their `iter()` is gated `where T: Copy`). The lowering inserts the `.iter()` call.
 - A **fixed-size array** `T[N]`. The lowering views it as a `Slice<T>` over its `N` elements.
 
 ```cryo
@@ -918,7 +918,7 @@ match (color) {
 }
 ```
 
-There is no fallthrough between arms. See [§ 7](#7-pattern-matching) for the full pattern language.
+There is no fallthrough between arms. See [section 7](#7-pattern-matching) for the full pattern language.
 
 ### 6.8 Match: Expression Form
 
@@ -977,13 +977,13 @@ unsafe {
 }
 ```
 
-This is the committed 1.0 behavior: `unsafe` is a documentation marker and nothing more. It is **not** reserved to silently become enforcing — 1.0 code will not break under a future release on account of `unsafe`. Should later versions add safety checks around raw pointer dereference, raw-to-pointer `as`-casts, or `extern` calls, they would arrive compatibly (as an opt-in lint/warning first), not as a breaking change to code that already compiles.
+This is the committed 1.0 behavior: `unsafe` is a documentation marker and nothing more. It is **not** reserved to silently become enforcing - 1.0 code will not break under a future release on account of `unsafe`. Should later versions add safety checks around raw pointer dereference, raw-to-pointer `as`-casts, or `extern` calls, they would arrive compatibly (as an opt-in lint/warning first), not as a breaking change to code that already compiles.
 
 ### 6.13 Inline Assembly
 
-`asm { ... }` embeds target assembly directly, lowering to an LLVM inline-assembly call. The block body is **raw assembly** — written without string quoting — and Cryo values are bound into it through `${ ... }` operand holes. Bare `{` and `}` are literal assembly text, so target syntax that uses braces (AVX-512 mask registers such as `{k1}`, for instance) passes straight through.
+`asm { ... }` embeds target assembly directly, lowering to an LLVM inline-assembly call. The block body is **raw assembly** - written without string quoting - and Cryo values are bound into it through `${ ... }` operand holes. Bare `{` and `}` are literal assembly text, so target syntax that uses braces (AVX-512 mask registers such as `{k1}`, for instance) passes straight through.
 
-A mandatory `![arch(<arch>, <dialect>)]` directive must appear immediately above the block. It names the target architecture (which *gates* the block — see below) and the assembly dialect (`intel` or `att`):
+A mandatory `![arch(<arch>, <dialect>)]` directive must appear immediately above the block. It names the target architecture (which *gates* the block - see below) and the assembly dialect (`intel` or `att`):
 
 ```cryo
 ![arch(x86_64, intel)]
@@ -996,12 +996,12 @@ asm {
 
 | Form         | Meaning                                          |
 | ------------ | ------------------------------------------------ |
-| `${x}`       | input — the value of `x` is read into a register |
-| `${=x}`      | output — the result is written back to `x`       |
-| `${+x}`      | in-out — `x` is both read and written            |
+| `${x}`       | input - the value of `x` is read into a register |
+| `${=x}`      | output - the result is written back to `x`       |
+| `${+x}`      | in-out - `x` is both read and written            |
 | `${x:"rax"}` | pin the operand to a specific register           |
-| `${x:m}`     | memory operand — `x` is addressed in memory      |
-| `${x:i}`     | immediate — `x` must be a compile-time constant  |
+| `${x:m}`     | memory operand - `x` is addressed in memory      |
+| `${x:i}`     | immediate - `x` must be a compile-time constant  |
 
 Referencing the same variable more than once collapses to a single operand, and a variable used as both an input and an output is promoted to in-out. Operands must be register-sized scalars or pointers.
 
@@ -1031,7 +1031,7 @@ asm { syscall }
 asm { svc #0 }
 ```
 
-**Module-level assembly.** An `asm { ... }` written at module scope (outside any function, with no operands) emits module-level inline assembly — for naked/global stubs, `.globl` symbols, or raw data.
+**Module-level assembly.** An `asm { ... }` written at module scope (outside any function, with no operands) emits module-level inline assembly - for naked/global stubs, `.globl` symbols, or raw data.
 
 A `write` system call on x86_64 Linux, pulling the buffer and length in as operands:
 
@@ -1047,7 +1047,7 @@ asm {
 }
 ```
 
-> **Note.** LLVM passes the assembly text through to the target assembler unchanged — Cryo does not parse it — so a typo in a mnemonic or register name surfaces as an assembler error at build time, not a Cryo diagnostic. Only `${ ... }` introduces an operand; a literal `$` (an AT&T immediate such as `$60`) and bare `{` / `}` are emitted verbatim.
+> **Note.** LLVM passes the assembly text through to the target assembler unchanged - Cryo does not parse it - so a typo in a mnemonic or register name surfaces as an assembler error at build time, not a Cryo diagnostic. Only `${ ... }` introduces an operand; a literal `$` (an AT&T immediate such as `$60`) and bare `{` / `}` are emitted verbatim.
 
 ---
 
@@ -1091,7 +1091,7 @@ If you don't need a payload, use `_`: `Option::Some(_) => { ... }`.
 
 ### 7.3 Range Patterns
 
-Range patterns match values within an inclusive range. They are most useful for character classification. Both spellings — `a..b` and the explicit `a..=b` — are **inclusive** in pattern position (note this differs from a range *expression*, where `a..b` is half-open). Bounds must be integer or char literals of the same kind.
+Range patterns match values within an inclusive range. They are most useful for character classification. Both spellings - `a..b` and the explicit `a..=b` - are **inclusive** in pattern position (note this differs from a range *expression*, where `a..b` is half-open). Bounds must be integer or char literals of the same kind.
 
 ```cryo
 match (ch) {
@@ -1143,7 +1143,7 @@ type struct Point {
 
 ### 8.2 Fields and Visibility
 
-Struct fields are **public by default** — readable and writable wherever the struct itself is visible. Restrict a field with `private`; a private field is then accessible only from within the declaring type's own methods (enforced as `E0353`), so it is hidden even from free functions in the same module. Visibility blocks group fields that share an access level:
+Struct fields are **public by default** - readable and writable wherever the struct itself is visible. Restrict a field with `private`; a private field is then accessible only from within the declaring type's own methods (enforced as `E0353`), so it is hidden even from free functions in the same module. Visibility blocks group fields that share an access level:
 
 ```cryo
 type struct Rect {
@@ -1155,13 +1155,13 @@ public:
 }
 ```
 
-Visibility may also be declared per-field with a leading `private` / `public`. Within a struct, only `public:` and `private:` blocks are valid; `protected:` is reserved for classes (where it extends access to subclasses). Class members carry **no default** — every field and method must appear inside an explicit visibility block.
+Visibility may also be declared per-field with a leading `private` / `public`. Within a struct, only `public:` and `private:` blocks are valid; `protected:` is reserved for classes (where it extends access to subclasses). Class members carry **no default** - every field and method must appear inside an explicit visibility block.
 
-> Field visibility (a `private` *field* → type-scoped, `E0353`) is a different axis from a top-level type being `private` (module-scoped, `E0503` — see [§14.4](#144-visibility)). A `public` struct may have `private` fields, and a `private` struct's fields are public to the rest of its own module.
+> Field visibility (a `private` *field* -> type-scoped, `E0353`) is a different axis from a top-level type being `private` (module-scoped, `E0503` - see [section 14.4](#144-visibility)). A `public` struct may have `private` fields, and a `private` struct's fields are public to the rest of its own module.
 
 Fields may declare **default values** with `= <expr>`.
 
-> **Status: reserved — see [§21](#21-reserved-syntax).** The default-value
+> **Status: reserved - see [section 21](#21-reserved-syntax).** The default-value
 > syntax parses, but defaults are **not yet applied** at construction: a
 > struct literal must still supply every field, and omitting a field that
 > has a default is an error (`E0355`). The syntax below is accepted by the
@@ -1184,7 +1184,7 @@ Methods are functions inside a struct body whose first parameter declares how th
 
 - **`&this`**: shared (read-only) borrow. The body may not modify fields.
 - **`mut &this`**: exclusive (mutating) borrow. The body may modify fields.
-- **`this`** / **`mut this`**: by-value (consuming) receiver. The receiver is *moved* into the method; the caller's value is consumed and may not be used afterward. Use this for a method that dismantles a value — unwrapping it into its parts, or handing its storage off. `mut this` additionally lets the body reassign the receiver binding.
+- **`this`** / **`mut this`**: by-value (consuming) receiver. The receiver is *moved* into the method; the caller's value is consumed and may not be used afterward. Use this for a method that dismantles a value - unwrapping it into its parts, or handing its storage off. `mut this` additionally lets the body reassign the receiver binding.
 
 ```cryo
 type struct Rect {
@@ -1206,7 +1206,7 @@ The receiver shape is part of the signature, so a caller knows whether a method 
 
 #### Struct-destructuring bindings
 
-A `const`/`mut` binding may use a **destructuring pattern** — `{ field, field, ... }` with a type annotation naming the struct — to move a struct's fields out into individually named locals. Each field is moved into a like-named local (field order need not match the declaration). This is the idiomatic companion to a consuming (`this`) receiver: binding the fields marks the receiver as *fully consumed*, so its automatic drop is suppressed and the fields can be handed off without a double free. Any bound field you don't move onward is dropped normally at the end of scope.
+A `const`/`mut` binding may use a **destructuring pattern** - `{ field, field, ... }` with a type annotation naming the struct - to move a struct's fields out into individually named locals. Each field is moved into a like-named local (field order need not match the declaration). This is the idiomatic companion to a consuming (`this`) receiver: binding the fields marks the receiver as *fully consumed*, so its automatic drop is suppressed and the fields can be handed off without a double free. Any bound field you don't move onward is dropped normally at the end of scope.
 
 ```cryo
 type struct Box<T, A = GlobalAlloc> {
@@ -1277,7 +1277,7 @@ const ints: Pair<int>    = Pair<int>::new(1, 2);
 const strs: Pair<string> = Pair<string>::new("hello", "world");
 ```
 
-`Pair<int>` and `Pair<string>` are independent types. See [§ 12.6](#126-monomorphisation).
+`Pair<int>` and `Pair<string>` are independent types. See [section 12.6](#126-monomorphisation).
 
 ### 8.7 Unions
 
@@ -1291,7 +1291,7 @@ type union Value {
 }
 ```
 
-Here `sizeof(Value) == 8` — the size of the largest member (`i64`/`f64`), not their sum. Writing one member and reading another *reinterprets* the shared bytes:
+Here `sizeof(Value) == 8` - the size of the largest member (`i64`/`f64`), not their sum. Writing one member and reading another *reinterprets* the shared bytes:
 
 ```cryo
 mut v: Value = Value { i: 0 };
@@ -1331,9 +1331,9 @@ type union Either<A, B> {
 const e: Either<i64, f64> = Either<i64, f64> { a: 100 };
 ```
 
-**Layout control.** `![repr(c)]` and `![align(N)]` apply to unions exactly as they do to structs (see [§ 17](#17-directives-and-attributes)).
+**Layout control.** `![repr(c)]` and `![align(N)]` apply to unions exactly as they do to structs (see [section 17](#17-directives-and-attributes)).
 
-**Matching.** A union value is not matched variant-wise the way an enum is (there is no discriminant). You `match` on a *member's value* — e.g. `match (v.i) { 0 => ..., _ => ... }` — and `static match (T)` works inside a generic union's methods.
+**Matching.** A union value is not matched variant-wise the way an enum is (there is no discriminant). You `match` on a *member's value* - e.g. `match (v.i) { 0 => ..., _ => ... }` - and `static match (T)` works inside a generic union's methods.
 
 **Ownership.** A union is treated as a plain-data (`Copy`) value: its members are never auto-dropped, since the active member is unknown. If a union owns a resource, give it an explicit `drop` method and that is honoured.
 
@@ -1577,7 +1577,7 @@ implement enum Option<T> {
 }
 ```
 
-See [§ 13](#13-implement-blocks) for the full implement-block grammar.
+See [section 13](#13-implement-blocks) for the full implement-block grammar.
 
 ---
 
@@ -1669,11 +1669,11 @@ where T: Hash + Eq, V: Clone
 | `Drop`                                                                                                        | Explicit destructor; types implementing it are non-`Copy`.                                                 |
 | `Clone`                                                                                                       | Explicit deep duplication via `clone()`.                                                                   |
 | `Default`                                                                                                     | A canonical zero value: `static default() -> This`.                                                        |
-| `Eq`                                                                                                          | Equality (backs `==` / `!=`; see [§11.6](#116-operator-overloading)).                                      |
+| `Eq`                                                                                                          | Equality (backs `==` / `!=`; see [section 11.6](#116-operator-overloading)).                                      |
 | `Ord` (`: Eq`)                                                                                                | Total ordering via `compare(...) -> Ordering` (backs `< > <= >=`).                                         |
 | `Hash`                                                                                                        | Type-level hashing into a `Hasher`.                                                                        |
-| `Add`/`Sub`/`Mul`/`Div`/`Rem`, `Neg`, `BitAnd`/`BitOr`/`BitXor`/`Shl`/`Shr`, `Not`/`BitNot`, `Index`, `Deref` | Operator overloading — see [§11.6](#116-operator-overloading).                                             |
-| `Iterator`                                                                                                    | Lazy sequence with an associated `Item` and `next() -> Option<Item>` (see [§11.5](#115-associated-types)). |
+| `Add`/`Sub`/`Mul`/`Div`/`Rem`, `Neg`, `BitAnd`/`BitOr`/`BitXor`/`Shl`/`Shr`, `Not`/`BitNot`, `Index`, `Deref` | Operator overloading - see [section 11.6](#116-operator-overloading).                                             |
+| `Iterator`                                                                                                    | Lazy sequence with an associated `Item` and `next() -> Option<Item>` (see [section 11.5](#115-associated-types)). |
 | `IntoIterator`                                                                                                | Conversion into an iterator.                                                                               |
 | `From<T>` / `Into<T>`                                                                                         | Infallible conversions.                                                                                    |
 | `TryFrom<T>` / `TryInto<T>`                                                                                   | Fallible conversions returning `Result`.                                                                   |
@@ -1684,11 +1684,11 @@ where T: Hash + Eq, V: Clone
 
 Every standard-library trait is declared in [`stdlib/core/`](../stdlib/core/) with the exception of `Read`/`Write` (in `stdlib/io/traits.cryo`), `Display`/`Debug`/`FmtWrite` (in `stdlib/fmt/`), and `Allocator` (in `stdlib/alloc/allocator.cryo`).
 
-The collection iterator entry points (`Array::iter`, `HashMap::keys`/`values`, `Str::split`, …) return [`implement Iterator<…>`](#211-opaque-types-implement-trait) rather than naming their concrete cursor structs, so you consume them through the trait and a `for-in` loop without ever spelling the underlying type.
+The collection iterator entry points (`Array::iter`, `HashMap::keys`/`values`, `Str::split`, ...) return [`implement Iterator<...>`](#211-opaque-types-implement-trait) rather than naming their concrete cursor structs, so you consume them through the trait and a `for-in` loop without ever spelling the underlying type.
 
 ### 11.5 Associated Types
 
-A trait may declare an **associated type** — a type that each implementation
+A trait may declare an **associated type** - a type that each implementation
 supplies, named once in the trait and referred to by every method. The
 standard `Iterator` is written this way:
 
@@ -1696,12 +1696,12 @@ standard `Iterator` is written this way:
 type trait Iterator {
     type Item;                              // each impl chooses its element type
     next(mut &this) -> Option<This::Item>;  // `This::Item` projects it
-    // ... defaults (count, fold, map, filter, …) all in terms of This::Item ...
+    // ... defaults (count, fold, map, filter, ...) all in terms of This::Item ...
 }
 ```
 
 `This::Item` is a **projection**: inside the trait it stands for "the `Item`
-this implementation bound". Projections also work off a generic parameter — a
+this implementation bound". Projections also work off a generic parameter - a
 generic adapter names its source's element as `I::Item`:
 
 ```cryo
@@ -1712,7 +1712,7 @@ type struct MapIter<I, O> { inner: I; f: (I::Item) -> O; }
 in one of two ways:
 
 ```cryo
-// 1. Positional sugar - `Iterator<i32>` ≡ `Iterator<Item = i32>`. Available
+// 1. Positional sugar - `Iterator<i32>` == `Iterator<Item = i32>`. Available
 //    only when the trait has no generic params of its own (Iterator's case).
 implement trait Iterator<i32> for struct Counter { ... }
 
@@ -1729,25 +1729,25 @@ the source: `implement<I, A> trait Iterator<A> for struct TakeIter<I> where I:
 Iterator<A>` binds `Item := A := I::Item`.
 
 **Declaration-site bounds.** An associated type may carry a bound
-(`type Item: Copy;`). Every impl's concrete binding is checked against it — an
+(`type Item: Copy;`). Every impl's concrete binding is checked against it - an
 impl whose `Item` does not satisfy the bound is rejected with `E0306`:
 
 ```cryo
 type trait Seq { type Item: Copy; next_one(&this) -> i32; }
-implement trait Seq<NotCopy> for struct Holder { … }   // E0306: Item not Copy
+implement trait Seq<NotCopy> for struct Holder { ... }   // E0306: Item not Copy
 ```
 
 **Diagnostics.** Three errors guard the rules:
 
-- `E0306` — an impl binds an `Item` that does not satisfy a declaration-site
+- `E0306` - an impl binds an `Item` that does not satisfy a declaration-site
   bound (`type Item: Copy;`).
-- `E0309` — an impl of a trait that declares an associated type binds none of
-  them (no positional arg and no `type Item = …;` body). The projection could
+- `E0309` - an impl of a trait that declares an associated type binds none of
+  them (no positional arg and no `type Item = ...;` body). The projection could
   never reduce, so it is rejected up front.
-- `E0310` — an associated type bound *positionally* on a trait that also has
+- `E0310` - an associated type bound *positionally* on a trait that also has
   generic parameters. Positional args fill the declared generic params in
   order, so an associated type of such a trait must be bound with the explicit
-  body form (`type Out = …;`).
+  body form (`type Out = ...;`).
 
 Because Cryo monomorphises, a projection is fully resolved at compile time:
 `MapIter<Range<i32>, i64>::Item` reduces to `i64` with no runtime cost.
@@ -1762,21 +1762,21 @@ no runtime dispatch and the result monomorphises like any other method call.
 The rewrite is **type-directed** and **LHS-driven**: `a OP b` dispatches on the
 type of `a`, and it only fires when the built-in rule does not already apply.
 Primitive arithmetic (`1 + 2`), pointer stepping, and native integer/pointer
-comparison keep emitting raw instructions — primitives deliberately do **not**
+comparison keep emitting raw instructions - primitives deliberately do **not**
 implement the arithmetic traits. The operator traits live in
 [`stdlib/core/ops.cryo`](../stdlib/core/ops.cryo) (`Eq`/`Ord` are in
 [`stdlib/core/cmp.cryo`](../stdlib/core/cmp.cryo)).
 
 | Operator(s)            | Trait (`core::ops` / `core::cmp`)     | Method / desugar                                            |
 | ---------------------- | ------------------------------------- | ----------------------------------------------------------- |
-| `+` `-` `*` `/` `%`    | `Add` `Sub` `Mul` `Div` `Rem`         | `a + b` → `a.add(&b)` (etc.)                                |
-| `-` (unary)            | `Neg`                                 | `-a` → `a.neg()`                                            |
-| `&` `\|` `^` `<<` `>>` | `BitAnd` `BitOr` `BitXor` `Shl` `Shr` | `a & b` → `a.bitand(&b)` (etc.)                             |
-| `!` `~` (unary)        | `Not` `BitNot`                        | `!a` → `a.not()`, `~a` → `a.bitnot()`                       |
-| `==` `!=`              | `Eq`                                  | `a == b` → `a.equals(&b)`, `a != b` → `!a.equals(&b)`       |
-| `<` `>` `<=` `>=`      | `Ord` (`: Eq`)                        | `a < b` → `a.compare(&b).is_lt()` (`is_gt`/`is_le`/`is_ge`) |
-| `a[i]`                 | `Index<Idx, Output>`                  | `a[i]` → `*(a.index(i))`                                    |
-| `*a` (deref)           | `Deref<Target>`                       | `*a` → `*(a.deref())`                                       |
+| `+` `-` `*` `/` `%`    | `Add` `Sub` `Mul` `Div` `Rem`         | `a + b` -> `a.add(&b)` (etc.)                                |
+| `-` (unary)            | `Neg`                                 | `-a` -> `a.neg()`                                            |
+| `&` `\|` `^` `<<` `>>` | `BitAnd` `BitOr` `BitXor` `Shl` `Shr` | `a & b` -> `a.bitand(&b)` (etc.)                             |
+| `!` `~` (unary)        | `Not` `BitNot`                        | `!a` -> `a.not()`, `~a` -> `a.bitnot()`                       |
+| `==` `!=`              | `Eq`                                  | `a == b` -> `a.equals(&b)`, `a != b` -> `!a.equals(&b)`       |
+| `<` `>` `<=` `>=`      | `Ord` (`: Eq`)                        | `a < b` -> `a.compare(&b).is_lt()` (`is_gt`/`is_le`/`is_ge`) |
+| `a[i]`                 | `Index<Idx, Output>`                  | `a[i]` -> `*(a.index(i))`                                    |
+| `*a` (deref)           | `Deref<Target>`                       | `*a` -> `*(a.deref())`                                       |
 
 Each arithmetic/bitwise trait carries `Rhs` and `Output` type parameters, so an
 operator can mix types (add a scalar to a vector, shift by a plain integer) and
@@ -1826,7 +1826,7 @@ const lt: boolean = a < b;    // a.compare(&b).is_lt() -> true
 arithmetic, bitwise, and shift operator (`+= -= *= /= %= &= |= ^= <<= >>=`).
 
 **Indexing.** `Index<Idx, Output>::index` returns a **pointer** (`Output*`), so
-the desugar `a[i]` → `*(a.index(i))` is a *place*: one implementation serves
+the desugar `a[i]` -> `*(a.index(i))` is a *place*: one implementation serves
 reads (`v = a[i]`), writes (`a[i] = v`), and compound assignment (`a[i] += v`).
 Built-in array/slice/string/pointer indexing keeps its native path.
 
@@ -1841,10 +1841,10 @@ g[0] += 1;        // index called once
 ```
 
 **Dereference and auto-deref.** `Deref<Target>::deref` also returns a pointer
-(`Target*`), so `*b` → `*(b.deref())` is likewise a place (read/write/compound).
+(`Target*`), so `*b` -> `*(b.deref())` is likewise a place (read/write/compound).
 Member access **coerces** through `Deref` too: when a receiver lacks a field or
 method but implements `Deref`, `b.field` / `b.method()` retry on the pointee
-(transitively), inserting the `.deref()` chain for you — the smart-pointer
+(transitively), inserting the `.deref()` chain for you - the smart-pointer
 pattern.
 
 ```cryo
@@ -1854,11 +1854,11 @@ implement<T> trait Deref<T> for struct Boxed<T> {
 }
 mut b: Boxed<Vec2> = Boxed<Vec2> { value: Vec2 { x: 1, y: 2 } };
 const v: Vec2 = *b;   // *(b.deref())
-b.x = 10;             // auto-deref: (*b.deref()).x  — b has no field `x`
+b.x = 10;             // auto-deref: (*b.deref()).x - b has no field `x`
 ```
 
 **Reference operands.** A by-reference operand (`&T`, the common
-container/parameter case) overloads exactly like a value — `v[i]`, `a + b`,
+container/parameter case) overloads exactly like a value - `v[i]`, `a + b`,
 `-a`, and `a == b` all work when `a`/`v` is a `&T`. In particular `&x == &y`
 (where the referent implements `Eq`) compares **by value** (`x.equals(&y)`),
 not by pointer identity. A raw pointer `T*` is never unwrapped this way: `p ==
@@ -1866,7 +1866,7 @@ null` and pointer arithmetic stay on the primitive path.
 
 **Reflected (primitive left operand).** When the left operand is a primitive and
 the right is a user type, the operator dispatches to a trait implemented **on
-the primitive** — `2 * v` calls `(2).mul(&v)` given `implement trait Mul<Vec2,
+the primitive** - `2 * v` calls `(2).mul(&v)` given `implement trait Mul<Vec2,
 Vec2> for i64`. This is the one case where the right operand's type pulls in the
 impl; `Eq`/`Ord` are excluded (their operands share `This`).
 
@@ -2097,20 +2097,20 @@ Wildcard imports are convenient but can cause name collisions; prefer the brace 
 | `private`           | Accessible only within the same module.                                                  |
 | `protected`         | Class-only; accessible to the class and its subclasses.                                  |
 
-Top-level items are **public by default**; mark an item `private` to confine it to its own module. For top-level types (`struct` / `class` / `enum`), `private` is enforced across modules: naming a `private` type from another module — in a type annotation, a struct literal, or a function signature — is rejected with `E0503`. A `private` type remains fully usable within its own module.
+Top-level items are **public by default**; mark an item `private` to confine it to its own module. For top-level types (`struct` / `class` / `enum`), `private` is enforced across modules: naming a `private` type from another module - in a type annotation, a struct literal, or a function signature - is rejected with `E0503`. A `private` type remains fully usable within its own module.
 
-This is the mechanism behind hiding iterator engines: a cursor struct can be `private` while its producer returns [`implement Iterator<…>`](#211-opaque-types-implement-trait), so callers consume the sequence through the trait and can never name the concrete type.
+This is the mechanism behind hiding iterator engines: a cursor struct can be `private` while its producer returns [`implement Iterator<...>`](#211-opaque-types-implement-trait), so callers consume the sequence through the trait and can never name the concrete type.
 
 ```cryo
 // engine.cryo
 namespace app::engine;
-private type struct Cursor { /* … */ }          // hidden outside app::engine
+private type struct Cursor { /* ... */ }          // hidden outside app::engine
 public function scan(...) -> implement Iterator<i32> { return Cursor { ... }; }
 
 // main.cryo
 namespace app;
 import app::engine;
-for (x in scan(...)) { ... }                     // fine — never names Cursor
+for (x in scan(...)) { ... }                     // fine - never names Cursor
 mut c: Cursor = ...;                             // E0503: `Cursor` is private to `app::engine`
 ```
 
@@ -2184,7 +2184,7 @@ const non_null: NonNull<u8> = NonNull::new(buf).unwrap();
 
 ## 16. Ownership, Copy, and Drop
 
-Cryo implements a static ownership model that is enforced at compile time. The model is **deliberately weaker than Rust's**: it is built around three notions (`Copy`, `Drop`, and a flow-sensitive move check). It has no borrow checker, no lifetimes, and does not track aliasing of raw pointers — but the move check is a *hard error*, not a warning: using a value after it has been moved is rejected at compile time (`E0452`, see [§ 16.3](#163-move-checking)).
+Cryo implements a static ownership model that is enforced at compile time. The model is **deliberately weaker than Rust's**: it is built around three notions (`Copy`, `Drop`, and a flow-sensitive move check). It has no borrow checker, no lifetimes, and does not track aliasing of raw pointers - but the move check is a *hard error*, not a warning: using a value after it has been moved is rejected at compile time (`E0452`, see [section 16.3](#163-move-checking)).
 
 ### 16.1 The `Copy` Trait
 
@@ -2239,7 +2239,7 @@ Two move/ownership hazards that are unambiguous memory errors, called out as the
 - **Loop-carried move** (`E0452`) - a value moved inside a loop and re-read on the next iteration would be freed twice.
 - **Returning the address of a local** (`E0455`) - `return &local;` hands back a pointer into the stack frame that is freed when the function returns. (`return &this` / `return &param` is fine - those are caller-backed.)
 
-Cryo has **no borrow checker**. References and raw pointers are unchecked: aliasing, validity, and lifetimes are the programmer's responsibility, as in C++ (see [§ 2](#2-type-system) and [§ 15](#15-pointers-and-memory)). Move tracking enforces the moved-set above; it is not a full Rust-style soundness boundary.
+Cryo has **no borrow checker**. References and raw pointers are unchecked: aliasing, validity, and lifetimes are the programmer's responsibility, as in C++ (see [section 2](#2-type-system) and [section 15](#15-pointers-and-memory)). Move tracking enforces the moved-set above; it is not a full Rust-style soundness boundary.
 
 ---
 
@@ -2275,22 +2275,22 @@ type struct AlignedData {
 | `![deprecated]` / `![deprecated("msg")]`                  | any decl                  | Marks a declaration as deprecated. *Parsed and validated; use-site warnings are not yet emitted.*                                                                                                                                                                                                                                                                                                                           |
 | `![symbol("name")]`                                       | extern fn / method        | Override the linker symbol used to resolve an extern function or body-less method: Cryo callers use the declared name while the symbol resolved at link time is `name`. Used by the C++ binding generator to pin a decl to its Itanium-mangled symbol.                                                                                                                                                                      |
 | `![allow(name)]` / `![warn(name)]` / `![deny(name)]`      | any decl                  | Intended to adjust a named lint's level. *Parsed and validated; lint-level adjustment is not yet implemented.*                                                                                                                                                                                                                                                                                                              |
-| `![derive(Trait, …)]`                                     | struct / class / enum     | Auto-derive one or more traits.                                                                                                                                                                                                                                                                                                                                                                                             |
+| `![derive(Trait, ...)]`                                     | struct / class / enum     | Auto-derive one or more traits.                                                                                                                                                                                                                                                                                                                                                                                             |
 | `![sink]`                                                 | method                    | Marks a method as consuming its receiver, even when the receiver is syntactically `&this` or `mut &this`. Useful for methods that semantically take ownership but want the borrow-style call ergonomics.                                                                                                                                                                                                                    |
-| `![implicit]`                                             | generic function / method | Lets a call omit its generic type arguments: the compiler recovers them by unifying the declared return type against the call's *expected* type (the type of the `const x: T = …` it initialises). Every type parameter must appear in the return type. A call with no expected type reports `E0307`; write the arguments explicitly (`f<T>(…)`) there. Used by `VaArgs::next` so `const n: i64 = va.next()` reads cleanly. |
+| `![implicit]`                                             | generic function / method | Lets a call omit its generic type arguments: the compiler recovers them by unifying the declared return type against the call's *expected* type (the type of the `const x: T = ...` it initialises). Every type parameter must appear in the return type. A call with no expected type reports `E0307`; write the arguments explicitly (`f<T>(...)`) there. Used by `VaArgs::next` so `const n: i64 = va.next()` reads cleanly. |
 | `![config(<atom>)]` / `![target(<atom>)]` / `![<atom>]`   | any decl                  | Platform / build-flavor gate. `<atom>` is `windows`, `linux`, `macos`, `unix`, or `not(<atom>)`. The bare-atom form (`![windows]`) is sugar for `![config(windows)]`. The decl is stripped from the AST when the gate doesn't match.                                                                                                                                                                                        |
-| `![repr(C)]` / `![repr(packed)]` / `![repr(transparent)]` | struct / class / enum     | Memory layout control. See [§ 17.3](#173-memory-layout).                                                                                                                                                                                                                                                                                                                                                                    |
-| `![align(N)]`                                             | struct / class / variable | Minimum alignment in bytes; N must be a power of two. See [§ 17.3](#173-memory-layout).                                                                                                                                                                                                                                                                                                                                     |
-| `![arch(<arch>, <dialect>)]`                              | asm block                 | Required directly above an `asm { ... }` block (see [§ 6.13](#613-inline-assembly)). Names the target architecture — which *gates* the block, like `![config]` — and the assembly dialect (`intel` or `att`).                                                                                                                                                                                                               |
+| `![repr(C)]` / `![repr(packed)]` / `![repr(transparent)]` | struct / class / enum     | Memory layout control. See [section 17.3](#173-memory-layout).                                                                                                                                                                                                                                                                                                                                                                    |
+| `![align(N)]`                                             | struct / class / variable | Minimum alignment in bytes; N must be a power of two. See [section 17.3](#173-memory-layout).                                                                                                                                                                                                                                                                                                                                     |
+| `![arch(<arch>, <dialect>)]`                              | asm block                 | Required directly above an `asm { ... }` block (see [section 6.13](#613-inline-assembly)). Names the target architecture - which *gates* the block, like `![config]` - and the assembly dialect (`intel` or `att`).                                                                                                                                                                                                               |
 | `![clobber(...)]`                                         | asm block                 | Lists registers, `flags`, or `memory` that an `asm` block overwrites but does not bind as operands.                                                                                                                                                                                                                                                                                                                         |
 
 The test-mode directives (`![config(testing)]`, `![test]`, `![ignore]`, `![should_panic]`) are documented in the next subsection.
 
-Other names that appear with `![…]` syntax are accepted by the parser and recorded so user tooling can observe them, but the compiler emits a warning for any non-builtin name and applies no semantics. A list of reserved-but-unimplemented directive names is in [§ 21](#21-reserved-syntax).
+Other names that appear with `![...]` syntax are accepted by the parser and recorded so user tooling can observe them, but the compiler emits a warning for any non-builtin name and applies no semantics. A list of reserved-but-unimplemented directive names is in [section 21](#21-reserved-syntax).
 
 ### 17.2 Test Directives
 
-The test framework introduces a small set of directives recognised by the compiler ([§ 20](#20-testing) covers usage):
+The test framework introduces a small set of directives recognised by the compiler ([section 20](#20-testing) covers usage):
 
 | Directive            | Description                                                        |
 | -------------------- | ------------------------------------------------------------------ |
@@ -2466,17 +2466,17 @@ function main() -> int {
 }
 ```
 
-Each `#include` takes either an angle-bracketed name (`<stdio.h>`, resolved on the C preprocessor's system include search path) or a quoted path (`"./my_header.h"`, resolved relative to the importing file) — exactly as in C. The identifier after `extern module` (`c` here) introduces a namespace into which the imported declarations are placed; access both functions and types with `::` (`c::printf`, `c::Point`) to prevent collisions between C and Cryo names. Only declarations from the named header(s) are imported — types pulled in transitively from system headers (`size_t`, `int32_t`, …) are resolved to their Cryo primitive directly rather than re-emitted.
+Each `#include` takes either an angle-bracketed name (`<stdio.h>`, resolved on the C preprocessor's system include search path) or a quoted path (`"./my_header.h"`, resolved relative to the importing file) - exactly as in C. The identifier after `extern module` (`c` here) introduces a namespace into which the imported declarations are placed; access both functions and types with `::` (`c::printf`, `c::Point`) to prevent collisions between C and Cryo names. Only declarations from the named header(s) are imported - types pulled in transitively from system headers (`size_t`, `int32_t`, ...) are resolved to their Cryo primitive directly rather than re-emitted.
 
-Type mapping: a C `struct`/`union` becomes a `![repr(c)]` `type struct` (a union is a layout-faithful opaque storage blob — no field access); a named `enum` becomes a `type enum` with its explicit discriminant values; an **anonymous** `enum` (which has no nameable type — its constants are plain integers in C) contributes one alias-namespaced `const` per constant (`enum { LO = 1, HI = 2 }` → `c::LO`, `c::HI`); a `typedef` becomes a `type alias`; function-pointer parameters/fields map to Cryo `(Args) -> Ret`. Imported types and constants are namespaced under the alias only (`c::Point`, `c::LO`), never the global namespace.
+Type mapping: a C `struct`/`union` becomes a `![repr(c)]` `type struct` (a union is a layout-faithful opaque storage blob - no field access); a named `enum` becomes a `type enum` with its explicit discriminant values; an **anonymous** `enum` (which has no nameable type - its constants are plain integers in C) contributes one alias-namespaced `const` per constant (`enum { LO = 1, HI = 2 }` -> `c::LO`, `c::HI`); a `typedef` becomes a `type alias`; function-pointer parameters/fields map to Cryo `(Args) -> Ret`. Imported types and constants are namespaced under the alias only (`c::Point`, `c::LO`), never the global namespace.
 
-Some C constructs have no first-class Cryo equivalent, so they are translated to **layout-faithful opaque storage** — a struct of that type round-trips by value over the FFI boundary (correct size and alignment, verifiable with `static_assert`; see [§18.5](#185-compile-time-layout-assertions-static_assert)) but offers no member access to that part: a **bitfield run** (adjacent `unsigned x : 3` fields share a storage unit) collapses to one blob field; a C11 **anonymous struct/union member** (`union { ... };` with no field name) becomes an aligned blob field named `_anon0`, `_anon1`, …; and a field whose type is an inline **anonymous struct/union** likewise maps to a blob rather than a pointer. Each such approximation is reported (see below).
+Some C constructs have no first-class Cryo equivalent, so they are translated to **layout-faithful opaque storage** - a struct of that type round-trips by value over the FFI boundary (correct size and alignment, verifiable with `static_assert`; see [section 18.5](#185-compile-time-layout-assertions-static_assert)) but offers no member access to that part: a **bitfield run** (adjacent `unsigned x : 3` fields share a storage unit) collapses to one blob field; a C11 **anonymous struct/union member** (`union { ... };` with no field name) becomes an aligned blob field named `_anon0`, `_anon1`, ...; and a field whose type is an inline **anonymous struct/union** likewise maps to a blob rather than a pointer. Each such approximation is reported (see below).
 
-Object-like `#define` constants whose body is a single literal are imported too, each as an alias-namespaced `const` with an inferred type: a **numeric** literal (`#define MAX_LEN 256` → `c::MAX_LEN: i32`; hex, octal, negative, and floating-point are supported, with integer width inferred from the value and `u`/`l` suffixes); a **string** literal (`#define NAME "cryo"` → `c::NAME: string`, with C escape sequences decoded); and a **character** literal (`#define TAB '\t'` → `c::TAB: char` carrying the code point). Macros that can't be bound — **function-like** macros (`#define SQUARE(x) ...`), valueless guards (`#define HEADER_H`), and compound expressions (`#define AREA (W * H)`) — are skipped rather than silently dropped. Only macros defined in the named header itself are considered (the compiler's predefined macros are excluded).
+Object-like `#define` constants whose body is a single literal are imported too, each as an alias-namespaced `const` with an inferred type: a **numeric** literal (`#define MAX_LEN 256` -> `c::MAX_LEN: i32`; hex, octal, negative, and floating-point are supported, with integer width inferred from the value and `u`/`l` suffixes); a **string** literal (`#define NAME "cryo"` -> `c::NAME: string`, with C escape sequences decoded); and a **character** literal (`#define TAB '\t'` -> `c::TAB: char` carrying the code point). Macros that can't be bound - **function-like** macros (`#define SQUARE(x) ...`), valueless guards (`#define HEADER_H`), and compound expressions (`#define AREA (W * H)`) - are skipped rather than silently dropped. Only macros defined in the named header itself are considered (the compiler's predefined macros are excluded).
 
 Every construct that is skipped or approximated is recorded and printed as a per-header **translation report** under `--debug` (`[skip]` for an unbound construct, `[approx]` for a layout-only binding), so nothing is lost silently.
 
-To import only a header's function prototypes — suppressing all struct/enum/typedef emission — apply the **`![functions_only]`** directive to the extern-module block. It is valid only on a C-import extern module:
+To import only a header's function prototypes - suppressing all struct/enum/typedef emission - apply the **`![functions_only]`** directive to the extern-module block. It is valid only on a C-import extern module:
 
 ```cryo
 ![functions_only]
@@ -2485,7 +2485,7 @@ extern module c := "C" {
 }
 ```
 
-An aliased import block holds **only** `#include` directives, never Cryo declarations; conversely, a plain `extern "C"` block (§18.1) holds **only** hand-written Cryo signatures, never `#include`. Don't also hand-declare a symbol that an imported header already defines (e.g. `puts` from `<stdio.h>`) — reach it through the alias (`c::puts`) instead.
+An aliased import block holds **only** `#include` directives, never Cryo declarations; conversely, a plain `extern "C"` block (section 18.1) holds **only** hand-written Cryo signatures, never `#include`. Don't also hand-declare a symbol that an imported header already defines (e.g. `puts` from `<stdio.h>`) - reach it through the alias (`c::puts`) instead.
 
 ### 18.3 Calling Cryo from C
 
@@ -2495,7 +2495,7 @@ A `![no_mangle]` / `![export]` directive that suppresses mangling for a single C
 
 ### 18.4 Function-pointer callbacks
 
-Many C APIs take a function pointer (`qsort`, event loops, AST visitors). Declare the parameter with Cryo's function-pointer type `(Args) -> Ret` and pass a **named Cryo function by its bare name** — taking the address is implicit, no `&`:
+Many C APIs take a function pointer (`qsort`, event loops, AST visitors). Declare the parameter with Cryo's function-pointer type `(Args) -> Ret` and pass a **named Cryo function by its bare name** - taking the address is implicit, no `&`:
 
 ```cryo
 extern "C" {
@@ -2512,7 +2512,7 @@ function cmp_i32(a: const void*, b: const void*) -> i32 {
 // qsort(&arr[0] as void*, n, 4, cmp_i32);   // sorts in place via the callback
 ```
 
-The callback must be a **bare function pointer** — a named function or a non-capturing lambda. A capturing closure is *not* C-compatible: a C function pointer has no environment slot. Thread per-call state through an explicit `void*` client-data parameter instead (the standard C idiom, e.g. libclang's `clang_visitChildren(cursor, visitor, client_data)`):
+The callback must be a **bare function pointer** - a named function or a non-capturing lambda. A capturing closure is *not* C-compatible: a C function pointer has no environment slot. Thread per-call state through an explicit `void*` client-data parameter instead (the standard C idiom, e.g. libclang's `clang_visitChildren(cursor, visitor, client_data)`):
 
 ```cryo
 extern "C" {
@@ -2525,7 +2525,7 @@ Where a C API documents an *optional* callback, a typed `null` is a valid value:
 
 ### 18.5 Compile-time layout assertions (`static_assert`)
 
-When binding a C library, a Cryo struct must match the C struct's layout exactly. `static_assert` checks a constant condition at compile time and fails the build (E0237) if it is false — so a binding can verify its own layout against the numbers the C side guarantees, rather than miscompiling silently.
+When binding a C library, a Cryo struct must match the C struct's layout exactly. `static_assert` checks a constant condition at compile time and fails the build (E0237) if it is false - so a binding can verify its own layout against the numbers the C side guarantees, rather than miscompiling silently.
 
 ```cryo
 type struct Color { r: u8; g: u8; b: u8; a: u8; }
@@ -2535,7 +2535,7 @@ static_assert(alignof(Color) == 1);
 static_assert(sizeof(Color) == 4, "Color must be 4 bytes to match the C ABI");
 ```
 
-`static_assert` is a module-scope declaration: `static_assert(cond)` or `static_assert(cond, "message")`. The condition is folded after layouts are computed and may use integer/boolean literals, `sizeof(T)`, `alignof(T)`, and the arithmetic, comparison, logical, and bitwise operators. A condition that is false — or that is not a compile-time constant — is a compile error. (It is a general feature, not FFI-only, but layout verification is its primary use.)
+`static_assert` is a module-scope declaration: `static_assert(cond)` or `static_assert(cond, "message")`. The condition is folded after layouts are computed and may use integer/boolean literals, `sizeof(T)`, `alignof(T)`, and the arithmetic, comparison, logical, and bitwise operators. A condition that is false - or that is not a compile-time constant - is a compile error. (It is a general feature, not FFI-only, but layout verification is its primary use.)
 
 ---
 
@@ -2552,7 +2552,7 @@ The prelude is auto-imported into every Cryo source file. Currently:
 | `core::panic`        | `panic(message: string, file: string, line: u32) -> void` (does not return; aborts the process)                       |
 | `core::option`       | `Option<T>` (`Some` / `None`) and its methods                                                                         |
 | `core::result`       | `Result<T, E>` (`Ok` / `Err`) and its methods                                                                         |
-| `core::primitives`   | Methods on built-in types (`i32::max_value`, `char::is_digit`, …)                                                     |
+| `core::primitives`   | Methods on built-in types (`i32::max_value`, `char::is_digit`, ...)                                                     |
 | `core::intrinsics`   | Compiler intrinsics including `printf`, `malloc`, `free`, `memcpy` (the `print`/`println` family lives in `std::fmt`) |
 | `core::varargs`      | `VaArgs`, the compiler-assigned type of a function's `args...` bucket                                                 |
 | `collections::array` | `Array<T>`, needed because `T[]` desugars to `Array<T>`                                                               |
@@ -2577,14 +2577,14 @@ The prelude is deliberately small. Anything else is an explicit `import` - notab
 | **`fs`**          | `Path` (borrowed) and `PathBuf` (owned). `OpenOptions` builder, `File` (`Read + Write`), convenience `read(path)` / `write(path, bytes)` / `read_to_string(path)` / `copy(from, to)`. Whole-path operations: `remove_file`, `rename`, `create_dir` / `create_dir_all`, `remove_dir` / `remove_dir_all`, `read_dir` (a `ReadDir` iterator of `DirEntry`), `canonicalize`. Metadata: `metadata` / `symlink_metadata` (typed `Metadata` via `stat` / `lstat`), `exists`, `is_file`, `is_dir`. `O_*` and `SEEK_*` constants.                                                                               |
 | **`ffi`**         | The C ABI boundary. `libc` is the single home for every `extern "C"` the stdlib needs (POSIX I/O, sockets, math) and the named POSIX constants. `cstr` provides `CStr` (borrowed) and `CString` (owned), with a `NulError` for interior-NUL conversion failures.                                                                                                                                                                                                                                                                                                                                       |
 | **`env`**         | `args() -> Array<String>`, `var(name) -> Option<String>`, `set_var`, `remove_var`, `process_exit(code: i32) -> void`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| **`math`**        | Thin libm wrappers: `sqrt`, `cbrt`, `pow`, `exp` / `exp2`, `ln`, `log2` / `log10`, `sin` / `cos` / `tan` (plus the `a*` inverses and `*h` hyperbolics), `floor`, `ceil`, `round`, `trunc`, `fabs`, integer `abs_i32` / `abs_i64`, `min` / `max` / `clamp`, `f32` variants (`sqrt_f32`, `fabs_f32`, …), and the constants `PI`, `TAU`, `E`.                                                                                                                                                                                                                                                             |
+| **`math`**        | Thin libm wrappers: `sqrt`, `cbrt`, `pow`, `exp` / `exp2`, `ln`, `log2` / `log10`, `sin` / `cos` / `tan` (plus the `a*` inverses and `*h` hyperbolics), `floor`, `ceil`, `round`, `trunc`, `fabs`, integer `abs_i32` / `abs_i64`, `min` / `max` / `clamp`, `f32` variants (`sqrt_f32`, `fabs_f32`, ...), and the constants `PI`, `TAU`, `E`.                                                                                                                                                                                                                                                             |
 | **`time`**        | `Duration` (normalized seconds + sub-second nanoseconds; `from_secs`/`from_millis`/`from_micros`/`from_nanos`, `as_secs`/`as_millis`/`as_micros`/`as_nanos`/`subsec_*`, `add`/`saturating_sub`/`is_zero`, `Eq` + `Ord`). `Instant` (monotonic `CLOCK_MONOTONIC`; `now`, `elapsed`, `duration_since`). `SystemTime` (wall `CLOCK_REALTIME`; `now`, `unix_epoch`, `duration_since_epoch`, `duration_since`). `sleep(Duration)` (EINTR-restarting). All clock differences saturate at zero.                                                                                                               |
 | **`random`**      | `Rng`, a fast non-cryptographic xoshiro256** generator seeded via `from_seed(u64)` (reproducible) or `from_os()`: `next_u64`/`next_u32`/`next_bool`/`next_f64`, unbiased `below(bound)` / `range_u64(lo, hi)` (rejection-sampled), `fill_bytes`. `secure_bytes(buf, len)` fills from the kernel CSPRNG (`getrandom`); use it for keys/tokens/nonces - `Rng` is not cryptographic.                                                                                                                                                                                                                      |
 | **`net`**         | `IpV4Addr`, `IpV6Addr`, `IpAddr`, `SocketAddr`, `TcpStream` (`Read + Write`), `TcpListener`. **HTTP/1.1 layer (`net::http`):** `Method`, `StatusCode`, `Headers`, `Request`, `Response`, `Router`, `HttpServer` with keep-alive + `Connection: close` opt-out + per-connection read timeouts, `Client::get`/`post` with `send(addr, req)`. **TLS** (`net::tls`, OpenSSL-backed `TlsStream`), **UDP** (`UdpSocket`), **HTTP/2** (`net::http2`, HPACK + single-stream framing), and **WebSocket** (`net::ws`, RFC 6455) all ship in 1.0. IPv6 addressing is parsed and represented but not yet dialable. |
 | **`process`**     | POSIX subprocess spawning (`fork + execve`). `Command` builder (`arg`, `env`, `stdin`/`stdout`/`stderr`, `current_dir`), `Stdio` (`Inherit`, `Null`, `Piped`, `Fd`), `Child`, `ExitStatus`, `ChildStdin`/`ChildStdout`/`ChildStderr`, `Signal`. Windows is not yet supported.                                                                                                                                                                                                                                                                                                                          |
 | **`sync`**        | A generic `Atomic<T>` (`T` = `u8` / `u32` / `u64` / `i32` / `i64` / `boolean`, dispatched at compile time via `static match`; `load` / `store` / `swap` / `fetch_add` / `fetch_sub` / `fetch_and` / `fetch_or` / `fetch_xor` / `compare_exchange`), `MemoryOrder`, `fence`, `compiler_fence`, `Mutex<T, A>`, `RwLock<T, A>`, `CondVar`, `Once`, `Barrier`. RAII guards (`MutexGuard`, `RwLockReadGuard`, `RwLockWriteGuard`) are `!Send`. `Send` / `Sync` auto-derive with call-site enforcement.                                                                                                      |
 | **`thread`**      | `ThreadLocal<T>` lazy per-thread storage via `pthread_key`. `thread::spawn` / `try_spawn` / `JoinHandle<T>` (returning the body's value on `join`), `spawn_with_attr`, scoped threads (`thread::Scope`), `thread::current` / `yield_now` / `sleep` / `sleep_ms`, plus `sync::mpsc` channels (`channel`, `Sender`, `Receiver`) all ship in 1.0, built on `pthread`. The `sync` primitives and `Arc<T>` ship alongside. `Builder` (`Builder::new().stack_size(bytes).name(str).spawn`/`try_spawn`) configures the stack size and OS thread name for a spawn.                                             |
-| **`test`**        | Built-in unit-test framework. Tests live in `<project>/tests/`, are marked `![test]`, and are discovered and run fork-per-test by `cryo test`. `expect`, `expect_eq`, `expect_ne`, `bail`, `bail_other`. See [§ 20](#20-testing).                                                                                                                                                                                                                                                                                                                                                                      |
+| **`test`**        | Built-in unit-test framework. Tests live in `<project>/tests/`, are marked `![test]`, and are discovered and run fork-per-test by `cryo test`. `expect`, `expect_eq`, `expect_ne`, `bail`, `bail_other`. See [section 20](#20-testing).                                                                                                                                                                                                                                                                                                                                                                      |
 
 ### 19.3 Naming Conventions in the Standard Library
 
@@ -2592,7 +2592,7 @@ The standard library follows a small set of conventions that user code is encour
 
 - **No NUL-terminated strings outside `ffi/`.** Every other module works in `Str` and `String`. The translation between Cryo strings and C strings happens at the boundary in `ffi::cstr`.
 - **`Result` for fallible operations, `panic` for broken invariants.** A function returns `Result<T, E>` whenever failure is part of its contract; it panics only when the contract truly cannot be preserved (e.g., an out-of-bounds index on a function whose contract excludes it).
-- **Explicit resource management.** Every owning type exposes a `drop(mut &this)` method, and its docstring identifies the ownership obligation. In practice the compiler synthesises these drops at scope exit (see [§ 16.2](#162-the-drop-trait)); manual `.drop()` remains valid for early release.
+- **Explicit resource management.** Every owning type exposes a `drop(mut &this)` method, and its docstring identifies the ownership obligation. In practice the compiler synthesises these drops at scope exit (see [section 16.2](#162-the-drop-trait)); manual `.drop()` remains valid for early release.
 - **Allocator-generic containers.** `Array<T>`, `HashMap<K, V>`, `String`, etc. accept any `Allocator` implementation, defaulting to `GlobalAlloc`.
 
 ---
@@ -2690,16 +2690,16 @@ The lexer and grammar reserve the following forms because the language plans to 
 | Optional chaining `?.`                        | Token reserved; not consumed by the parser.                                                                                                                                                       |
 | Spread `...` in calls / literals              | The token exists for variadic parameter declarations only.                                                                                                                                        |
 | Pure-virtual class method (e.g. `= 0` syntax) | Not implemented. Use a `virtual` method without a body to declare an interface point.                                                                                                             |
-| Struct field defaults (`field: T = expr`)     | The `= expr` default syntax parses, but defaults are not applied at construction: every field must be supplied in a literal, and omitting one is `E0355`. See [§ 8.2](#82-fields-and-visibility). |
+| Struct field defaults (`field: T = expr`)     | The `= expr` default syntax parses, but defaults are not applied at construction: every field must be supplied in a literal, and omitting one is `E0355`. See [section 8.2](#82-fields-and-visibility). |
 | Macros                                        | No macro system exists, and `macro` is **not** currently a reserved word (it lexes as an ordinary identifier). A future hygienic macro system may introduce one.                                  |
 | `![pure]`                                     | Reserved. Will assert the function has no observable side effects (enabling aggressive folding). Parsed as an unknown directive today (warning + no semantics).                                   |
 | `![const]`                                    | Reserved. Will mark a function as evaluable at compile time.                                                                                                                                      |
 | `![noreturn]`                                 | Reserved. Will declare a function that never returns normally.                                                                                                                                    |
-| `![export]` / `![no_mangle]`                  | Reserved. Will suppress Cryo name mangling so the function ships under its declared identifier and can be linked from C without a wrapper. See [§ 18.3](#183-calling-cryo-from-c).                |
+| `![export]` / `![no_mangle]`                  | Reserved. Will suppress Cryo name mangling so the function ships under its declared identifier and can be linked from C without a wrapper. See [section 18.3](#183-calling-cryo-from-c).                |
 | `![section("name")]`                          | Reserved. Will place the symbol in a specific object-file section.                                                                                                                                |
 | `![weak]`                                     | Reserved. Will declare weak linkage.                                                                                                                                                              |
 | `![constructor]` / `![destructor]`            | Reserved. Will register functions that run before `main` / after `main` returns.                                                                                                                  |
-| `![repr(<int_type>)]` on enums                | Reserved. Use `type enum Foo : u8 { … }` syntax for now; future versions may accept `![repr(u8)]` as an equivalent spelling.                                                                      |
+| `![repr(<int_type>)]` on enums                | Reserved. Use `type enum Foo : u8 { ... }` syntax for now; future versions may accept `![repr(u8)]` as an equivalent spelling.                                                                      |
 
 When any of these moves out of "reserved" and into "implemented," it will be added to the relevant section of this document and removed from this table.
 
@@ -2782,10 +2782,10 @@ source_dir    = "src"               # source root (libraries / stdlib)
 output_dir    = "build"             # where build artifacts are written
 source_paths  = ["../shared/src"]   # extra source roots to scan for modules
 target_triple = ""                  # cross-compile triple; empty => build for host
-stdlib_root   = ""                  # project-pinned stdlib root (see §24.3)
+stdlib_root   = ""                  # project-pinned stdlib root (see section 24.3)
 ```
 
-`target_triple` (e.g. `"x86_64-pc-windows-gnu"`) cross-compiles: it is threaded into LLVM and selects the target ABI and toolchain. For `x86_64-pc-windows-gnu` the build drives a full mingw-w64 link to a `.exe`; for triples without a known toolchain (aarch64, riscv, windows-msvc, …) the host link step is skipped and the object files are left for a manual link. The CLI `--target=TRIPLE` overrides it.
+`target_triple` (e.g. `"x86_64-pc-windows-gnu"`) cross-compiles: it is threaded into LLVM and selects the target ABI and toolchain. For `x86_64-pc-windows-gnu` the build drives a full mingw-w64 link to a `.exe`; for triples without a known toolchain (aarch64, riscv, windows-msvc, ...) the host link step is skipped and the object files are left for a manual link. The CLI `--target=TRIPLE` overrides it.
 
 ### 23.2 `[compiler]`
 
@@ -2822,28 +2822,28 @@ overrides everything; `-g` forces debug info on regardless of profile.
 **Build directory layout.** The final artifact is **hoisted** to the root of
 `output_dir` so it runs as `build/<name>` regardless of profile; everything
 else lives under a visible, per-profile cache (`target/<profile>/`) grouped by
-**package origin** — the standard library (`std/`), the local project
+**package origin** - the standard library (`std/`), the local project
 (`local/`), and one subtree per third-party dependency (`<depname>/`):
 
 ```
 build/
-├── <name>                          # hoisted final executable  (cryo run / [[bin]])
-├── lib<name>.a                     # hoisted final library     ([lib] target)
-└── target/
-    └── <profile>/                  # release | debug
-        ├── <name>                  # per-profile build (the hoist source)
-        ├── <name>.ll               # combined LLVM IR          (when emit_llvm)
-        ├── build-manifest.json     # per-profile metadata + fingerprint
-        ├── std/                    # standard library package
-        │   ├── deps/  *.o          #   per-module objects
-        │   └── ir/    *.ll         #   per-module IR (when emit_llvm)
-        ├── local/                  # the local project package
-        │   ├── deps/  *.o
-        │   ├── ir/    *.ll
-        │   └── incremental/        #   rebuild fingerprint
-        └── <depname>/              # one subtree per dependency
-            ├── deps/  *.o
-            └── ir/    *.ll
++-- <name>                          # hoisted final executable  (cryo run / [[bin]])
++-- lib<name>.a                     # hoisted final library     ([lib] target)
++-- target/
+    +-- <profile>/                  # release | debug
+        +-- <name>                  # per-profile build (the hoist source)
+        +-- <name>.ll               # combined LLVM IR          (when emit_llvm)
+        +-- build-manifest.json     # per-profile metadata + fingerprint
+        +-- std/                    # standard library package
+        |   +-- deps/  *.o          #   per-module objects
+        |   +-- ir/    *.ll         #   per-module IR (when emit_llvm)
+        +-- local/                  # the local project package
+        |   +-- deps/  *.o
+        |   +-- ir/    *.ll
+        |   +-- incremental/        #   rebuild fingerprint
+        +-- <depname>/              # one subtree per dependency
+            +-- deps/  *.o
+            +-- ir/    *.ll
 ```
 
 `cryo build` is incremental: if no input changed (sources, the resolved knobs,
@@ -2853,7 +2853,7 @@ full rebuild and refresh the manifest.
 
 ### 23.3 `[link]`
 
-Native libraries to link, named by *intent* rather than by raw linker flag — so a project never has to juggle two similar lists.
+Native libraries to link, named by *intent* rather than by raw linker flag - so a project never has to juggle two similar lists.
 
 ```ini
 [link]
@@ -2865,10 +2865,10 @@ static = ["helpers/libabihelpers.a"] # local archives, passed to the linker by p
 | Key      | Role                                                                                        | Linker form        |
 | -------- | ------------------------------------------------------------------------------------------- | ------------------ |
 | `system` | A library the linker finds on its default search path.                                      | `-l<name>`         |
-| `search` | Extra directories to search — only needed for `system` libs that live off the default path. | `-L<dir>`          |
+| `search` | Extra directories to search - only needed for `system` libs that live off the default path. | `-L<dir>`          |
 | `static` | A local archive in your project; linked by its path.                                        | the path, verbatim |
 
-> Migrating from pre-1.0: `link_libs` → `[link] system`, `link_paths` → `[link] search` (or `[link] static` for a local archive). The old `[compiler] args = ["--emit-llvm"]` flag-smuggling is gone — set `emit_llvm = true`. `[compiler] include_paths` → `[project] source_paths`. `[project] target` → `[project] target_triple`.
+> Migrating from pre-1.0: `link_libs` -> `[link] system`, `link_paths` -> `[link] search` (or `[link] static` for a local archive). The old `[compiler] args = ["--emit-llvm"]` flag-smuggling is gone - set `emit_llvm = true`. `[compiler] include_paths` -> `[project] source_paths`. `[project] target` -> `[project] target_triple`.
 
 ### 23.4 Multi-target: `[lib]` and `[[bin]]`
 
@@ -2886,7 +2886,7 @@ entry_point = "src/main.cryo"
 
 ### 23.5 `[dependencies]`
 
-Each entry is an inline table — a local path dependency or a git dependency. `cryo fetch` resolves them and writes `cryoconfig.lock`.
+Each entry is an inline table - a local path dependency or a git dependency. `cryo fetch` resolves them and writes `cryoconfig.lock`.
 
 ```ini
 [dependencies]
@@ -2940,7 +2940,7 @@ Accepted by `build` / `run` / `test` / `check` as noted; run `cryo help flags` o
 | `--ast`               | Dump the AST after parsing.                                                                                                             |
 | `--emit-llvm`         | Emit LLVM IR (`.ll`) beside the object output.                                                                                          |
 | `--build-dir=PATH`    | Override `[project] output_dir`.                                                                                                        |
-| `--stdlib=PATH`       | Standard-library root for this run (highest priority; see §24.3).                                                                       |
+| `--stdlib=PATH`       | Standard-library root for this run (highest priority; see section 24.3).                                                                       |
 | `--target=TRIPLE`     | Cross-compile for an LLVM target triple. `x86_64-pc-windows-gnu` links to a `.exe` via mingw-w64; other triples emit object files only. |
 | `--opt-level=N`       | Optimization level `0`..`3`; overrides the profile and `[compiler] optimize`.                                                           |
 | `-g`, `--debug-info`  | Emit DWARF debug info.                                                                                                                  |
@@ -2958,11 +2958,11 @@ Test-only flags: `--ignored`, `--list`, `--exact`, `-q` / `--quiet`.
 
 The compiler resolves the stdlib root from the first source that matches:
 
-1. `--stdlib=PATH` — one-off override (this run only)
-2. `$CRYO_STDLIB` — explicit stdlib pointer (environment)
-3. `$CRYO_HOME/stdlib` — install-root pointer (set by `install.sh`)
-4. `<bindir>/../stdlib` — binary-relative auto-detection
-5. `[project] stdlib_root` — project-pinned in cryoconfig (relative to the project root when not absolute)
-6. `<project_root>/../stdlib` — in-tree fallback
+1. `--stdlib=PATH` - one-off override (this run only)
+2. `$CRYO_STDLIB` - explicit stdlib pointer (environment)
+3. `$CRYO_HOME/stdlib` - install-root pointer (set by `install.sh`)
+4. `<bindir>/../stdlib` - binary-relative auto-detection
+5. `[project] stdlib_root` - project-pinned in cryoconfig (relative to the project root when not absolute)
+6. `<project_root>/../stdlib` - in-tree fallback
 
 Most installs need none of these: the binary-relative default (4) finds the stdlib shipped alongside `cryo`. Projects living outside the Cryo repo pin a specific stdlib with `[project] stdlib_root`.

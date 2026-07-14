@@ -8,7 +8,7 @@
 
 int bindgen_probe_add3(int a, int b, int c);
 
-/* va_list probes: exercise the first-class `va_list` type end-to-end — the
+/* va_list probes: exercise the first-class `va_list` type end-to-end - the
  * importer maps each `va_list` parameter to `va_list`, and the tests forward a
  * Cryo variadic function's `args` into them.  Spread across the SysV arg
  * classes so the va_list register-save / overflow areas are all exercised:

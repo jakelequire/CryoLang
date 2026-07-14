@@ -1,6 +1,6 @@
 /// Vendor binding generator (libclang -> `.cryo` source text)
 ///
-/// Stage 2 of the vendor library system (.todo/VENDOR_PLAN.md).  Drives the
+/// Drives the
 /// existing libclang cursor-walk engine (`Importer`) to build the same decl
 /// nodes the inline `extern module := "C"` path produces, then SERIALIZES them
 /// back to `.cryo` SOURCE TEXT (approach A, the rust-bindgen model) under a
@@ -9,13 +9,13 @@
 /// pipeline like any other module.
 ///
 /// Two pieces:
-///   • BindingSerializer — renders the struct / enum / typedef / global-const /
+///   - BindingSerializer - renders the struct / enum / typedef / global-const /
 ///     extern-function nodes (and their TypeAnnotation trees) to Cryo source.
 ///     The importer qualifies emitted type references under its alias namespace
 ///     (we pass the vendor namespace as that alias), so a `Color` field types as
 ///     `<Name>::Color`; the serializer strips the namespace prefix since every
 ///     emitted type already lives under the file's `namespace <Name>;`.
-///   • VendorGenerator — builds one libclang TU per manifest header (with the
+///   - VendorGenerator - builds one libclang TU per manifest header (with the
 ///     manifest's `-I<include_dir>` / `-D<define>` args), accumulates the decls
 ///     into a throwaway context, and returns the serialized source.
 
@@ -46,16 +46,16 @@ import std::collections::string;
 import std::collections::str;
 
 /// Bump whenever the emitted binding format changes (a new field shape, a
-/// different type mapping, …).  It participates in the Stage-3 cache key, so an
+/// different type mapping, ...).  It participates in the cache key, so an
 /// increment invalidates every previously cached binding after a compiler
-/// upgrade — old caches no longer match and regenerate on next `cryo vendor`.
+/// upgrade - old caches no longer match and regenerate on next `cryo vendor`.
 ///
 /// 5 -> 6: provenance now folds the full transitive `#include` graph (recorded
 /// in a `<bindings>.cryo.deps` sidecar) instead of the entry header alone.  The
 /// bump forces one regeneration per cached lib so every existing cache gains a
 /// depfile and the transitive-edit protection takes effect immediately rather
 /// than only after the next unrelated change.
-/// 6 -> 7: two robustness fixes surfaced by SDL2 — (a) duplicate-valued C enum
+/// 6 -> 7: two robustness fixes surfaced by SDL2 - (a) duplicate-valued C enum
 /// constants (deliberate aliases, e.g. SDL's `KMOD_RESERVED == KMOD_SCROLL`) are
 /// diverted from clashing enum variants to namespaced alias `const`s (a Cryo
 /// `type enum` requires unique discriminants); (b) a pointer to a system-header
@@ -70,10 +70,10 @@ import std::collections::str;
 /// `va_list` (canonicalized to the builtin `__va_list_tag[1]`, e.g. sqlite3's
 /// `*_vappendf`) is dropped with a report entry. (b) A field whose type is a
 /// (pointer to a) record declared NESTED inside another record (e.g.
-/// `sqlite3_index_constraint_usage` inside `sqlite3_index_info`) — never emitted
-/// top-level — now falls back to opaque `void*`/blob like a system-header record.
+/// `sqlite3_index_constraint_usage` inside `sqlite3_index_info`) - never emitted
+/// top-level - now falls back to opaque `void*`/blob like a system-header record.
 /// 9 -> 10: a C `va_list` parameter now maps to the first-class `va_list` type
-/// (which lowers to a pointer) instead of being skipped — so `*_vappendf`-style
+/// (which lowers to a pointer) instead of being skipped - so `*_vappendf`-style
 /// functions BIND and are callable by forwarding a Cryo variadic function's
 /// `args`.  The earlier skip+report is gone.
 const GENERATOR_VERSION: i64 = 15;
@@ -116,7 +116,7 @@ type struct BindingSerializer {
 
         // Extern functions, deduped by name.  A Cryo binding namespaces every
         // function under one flat `namespace`, and a single Cryo name binds a
-        // single linker symbol — so a C++ OVERLOAD (`add(int)` + `add(double)`)
+        // single linker symbol - so a C++ OVERLOAD (`add(int)` + `add(double)`)
         // or a cross-namespace leaf-name COLLISION (`demo::twice` +
         // `demo::math::twice`) can only keep ONE.  Keep the first; for any later
         // same-name function whose linker symbol DIFFERS (a genuine distinct
@@ -219,7 +219,7 @@ type struct BindingSerializer {
     }
 
     /// Render a native `type union` (untagged C union): one field per member, all
-    /// overlaid at offset 0.  No synthesized accessors — members are accessed
+    /// overlaid at offset 0.  No synthesized accessors - members are accessed
     /// directly (`v.field`); a literal initializes exactly one member.
     render_union(mut &this, node: UnionDeclNode*) -> void {
         if (node.repr_c) { this.out.push("![repr(C)]\n"); }
@@ -349,8 +349,8 @@ type struct BindingSerializer {
         const init: ExpressionNode* = node.initializer;
         if (init == null) { return; }
         // A struct-literal initializer (a C compound-literal macro the importer
-        // lowered, e.g. `#define RAYWHITE CLITERAL(Color){…}`): render
-        // `const NAME: Type = Type { field: value, … };`.
+        // lowered, e.g. `#define RAYWHITE CLITERAL(Color){...}`): render
+        // `const NAME: Type = Type { field: value, ... };`.
         if (init.kind == NodeKind::StructLiteral) {
             this.render_struct_const(node, ty, init as StructLiteralNode*);
             return;
@@ -364,7 +364,7 @@ type struct BindingSerializer {
             val = lit.value;
         } else {
             // Integer (and char, stored as its integer code point): an explicit
-            // cast keeps the source in range — the importer stores a negative C
+            // cast keeps the source in range - the importer stores a negative C
             // value as its unsigned two's-complement decimal, which would
             // overflow the declared signed type as a bare literal.
             val = format("%s as %s", lit.value, ty);
@@ -373,7 +373,7 @@ type struct BindingSerializer {
             BindingSerializer::ident(this.ctx.intern_table.resolve(node.name)), ty, val));
     }
 
-    /// Render a struct-literal global const (`const NAME: Type = Type { … };`).
+    /// Render a struct-literal global const (`const NAME: Type = Type { ... };`).
     /// Field initializers are numeric literals in struct-declaration order (the
     /// importer emits them that way); names are keyword-escaped like every other
     /// emitted identifier.
@@ -423,8 +423,8 @@ type struct BindingSerializer {
     }
 
     /// Render a function-alias forwarding wrapper (a bodied top-level function):
-    /// `function NAME(p0: T0, …) -> Ret { return TARGET(p0, …); }`.  The body is
-    /// a single statement the importer built — a `return TARGET(args)` (or, for a
+    /// `function NAME(p0: T0, ...) -> Ret { return TARGET(p0, ...); }`.  The body is
+    /// a single statement the importer built - a `return TARGET(args)` (or, for a
     /// `void` target, a bare `TARGET(args)`).  Top-level functions are public by
     /// default, so no modifier is emitted; the file's `namespace` qualifies it.
     render_wrapper_function(mut &this, node: FunctionDeclNode*) -> void {
@@ -483,7 +483,7 @@ type struct BindingSerializer {
         s = s + format("%s(", BindingSerializer::ident(this.ctx.intern_table.resolve(func.name)));
         // For an instance method the first parameter is the synthetic receiver
         // (its NAME is the literal `&this`/`mut &this` token, type_annotation
-        // null) — rendered verbatim, not as `name: type`.
+        // null) - rendered verbatim, not as `name: type`.
         mut first: boolean = true;
         for (mut i: i64 = 0; i < func.parameters.length; i++) {
             const p: VarDeclNode* = func.parameters[i];
@@ -543,7 +543,7 @@ type struct BindingSerializer {
     // ---- helpers ----
 
     /// Make a C identifier safe to emit as a Cryo identifier: a C name that is
-    /// a Cryo keyword (`type`, `in`, `new`, `string`, …) is suffixed with `_`
+    /// a Cryo keyword (`type`, `in`, `new`, `string`, ...) is suffixed with `_`
     /// so the binding parses (raylib's `AutomationEvent.type`, for instance).
     /// Layout/ABI is positional, so renaming a field/param/variant is harmless;
     /// the consumer simply uses the suffixed name.  Reuses the lexer's own
@@ -602,8 +602,8 @@ type struct VendorGenerator {
     /// Returns the source text, or "" if no header could be parsed.
     ///
     /// `out_inputs` (when non-null) is filled with the de-duplicated set of files
-    /// that fed the bindings — each resolved entry header plus every non-system
-    /// file reached transitively via `#include` — so the caller can write a
+    /// that fed the bindings - each resolved entry header plus every non-system
+    /// file reached transitively via `#include` - so the caller can write a
     /// `<bindings>.cryo.deps` sidecar that `provenance_key` folds on the next
     /// cache check (catching edits to transitively-included headers).
     static generate(ns: string, source_path: string, headers: &string[],
@@ -677,9 +677,9 @@ type struct VendorGenerator {
         return out;
     }
 
-    /// The Stage-3 cache provenance key: a hex FNV-1a digest folding the bytes
+    /// The cache provenance key: a hex FNV-1a digest folding the bytes
     /// of the binding's input files, the manifest's `include_dirs` and `defines`
-    /// (the `-I`/`-D` parse args — same headers under different args bind
+    /// (the `-I`/`-D` parse args - same headers under different args bind
     /// differently), the (already-normalized) target `triple`, the libclang
     /// version, and `GENERATOR_VERSION`.  A change in any of these regenerates;
     /// an unchanged set is a cache hit.  Reuses the build manifest's FNV-1a
@@ -687,8 +687,8 @@ type struct VendorGenerator {
     ///
     /// `cache_file` is the path of the PREVIOUSLY generated `.cryo` (or "" on a
     /// fresh registration).  When its `<cache_file>.deps` include-graph sidecar
-    /// exists, the key folds every file listed there — the entry headers AND
-    /// their transitive `#include`s — so editing a deeply-included header
+    /// exists, the key folds every file listed there - the entry headers AND
+    /// their transitive `#include`s - so editing a deeply-included header
     /// invalidates the cache.  When no sidecar exists yet (a fresh register, or a
     /// cache written before this mechanism), it falls back to folding the entry
     /// headers alone; that fallback is byte-identical to the pre-sidecar key, so
@@ -751,7 +751,7 @@ type struct VendorGenerator {
     /// Fold the bytes of every file listed in an include-graph depfile (one path
     /// per line, written by `write_depfile`) into the running digest `h`.  A
     /// listed file that has since been deleted perturbs the key with a distinct
-    /// marker (so it can't masquerade as unchanged → forces a regeneration that
+    /// marker (so it can't masquerade as unchanged -> forces a regeneration that
     /// rebuilds the graph).  Blank lines are skipped.
     static fold_depfile(h: DefaultHasher*, depfile: string) -> void {
         mut content: string = "";
@@ -782,7 +782,7 @@ type struct VendorGenerator {
     }
 
     /// Write the include-graph sidecar `<cryo_path>.deps`: one input file path
-    /// per line, in the order `generate` accumulated them.  Best-effort — a
+    /// per line, in the order `generate` accumulated them.  Best-effort - a
     /// write failure just means the next cache check falls back to the
     /// entry-header key (a possible spurious regeneration, never a stale cache).
     static write_depfile(cryo_path: string, inputs: &string[]) -> void {
