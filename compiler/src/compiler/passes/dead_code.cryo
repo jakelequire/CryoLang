@@ -1,0 +1,332 @@
+///! Dead-Code Analysis Pass.
+///!
+///! A diagnostic-only lint that emits WARNINGS (never errors) for code that
+///! can never run or names that are never used.  Warnings increment the
+///! sink's separate `warning_count`, so this pass never fails a build; a user
+///! who dislikes a given lint can suppress it by its numeric code through
+///! `DiagConfig`.  `run` always returns `PassResult::ok()`.
+///!
+///! Lints implemented here:
+///!
+///!   * W0009 (unreachable statement) - a statement that follows an
+///!     unconditionally-diverging statement (`return` / `break` / `continue`,
+///!     or an `if`/`match` whose every branch diverges) in the same block.
+///!     Reported once per block, at the first unreachable statement.  Only
+///!     literal divergence is considered (no `panic`/`noreturn` reasoning),
+///!     which keeps the false-positive rate at essentially zero.
+///!
+///!   * W0001 (unused variable) - a local `let`/`const`/`mut` binding that is
+///!     never referenced.  A leading-underscore name (`_scratch`) opts out,
+///!     matching the Rust convention.  Destructuring bindings
+///!     (`const { a, b } = pair;`) are exempt: they frequently exist to move a
+///!     field out of an aggregate while deliberately discarding the rest.
+///!
+///! Scope: only the module currently being compiled is linted, and standard-
+///! library modules (`std::*`) are skipped entirely - a dependency's internals
+///! are not the user's dead code (this mirrors how Rust only warns about your
+///! own crate).  Usage is read from the resolver's `ResolutionMap`, which
+///! records every resolved identifier reference by span.
+///!
+///! Unused private functions/methods (W0002) and unused imports (W0003) are
+///! deliberately staged as follow-ups.
+///!
+///! Placement: after Monomorphization (so generic call sites are resolved) and
+///! before DropInsertion (so unreachable detection sees the user's own
+///! statements, not synthesized drop cleanups).  See `instance.cryo`'s
+///! post-mono semantic-analysis stage.
+
+namespace Compiler::Passes::DeadCode;
+
+import Compiler::Diag;
+import Compiler::Diag::{ Diagnostic, SourceSpan };
+import Compiler::AST;
+import Compiler::AST::{ Node, Expression, Statement, Declaration, Pattern };
+import Compiler::CompilationContext;
+import Compiler::Passes::PassID;
+import Compiler::Resolver;
+import Compiler::Resolver::{ Resolver, Symbol, SymbolID, SymbolStr, ResolutionMap };
+import std::collections::hashmap;
+import std::core::option;
+import std::fmt;
+
+
+type struct DeadCodeChecker {
+    ctx: CompilationContext*;
+
+    /// Set of declaration-span keys (see `ResolutionMap::make_key`) that are
+    /// referenced somewhere.  A binding counts as "used" when its declaring
+    /// span key is in this set.  Built once from the resolution map by
+    /// `build_used`.
+    used: HashMap<u64, boolean>;
+
+    static new(ctx: CompilationContext*) -> DeadCodeChecker {
+        return DeadCodeChecker {
+            ctx:  ctx,
+            used: HashMap<u64, boolean>::new(),
+        };
+    }
+
+    // -- Usage set --
+
+    /// Populate `used` from the resolution map.  Each entry maps a reference
+    /// span -> the SymbolID it resolves to; we record the *declaration* span
+    /// key of every referenced symbol, EXCLUDING the entry a declaration
+    /// records for itself (whose key equals the declaring span), so a
+    /// declaration never counts as a use of itself.
+    build_used(mut &this) -> void {
+        const resolver: Resolver* = this.ctx.get_resolver();
+        if (resolver == null) { return; }
+        const n: u64 = resolver.symbols.length as u64;
+        mut it: HashMapIter<u64, SymbolID> = resolver.resolution_map.singles.iter();
+        loop {
+            match (it.next()) {
+                Option::Some(pair) => {
+                    const ref_key: u64  = pair.first;
+                    const sid: SymbolID = pair.second;
+                    if (!sid.is_valid() || sid.id > n) { continue; }
+                    const decl_span: SourceSpan = resolver.symbols[(sid.id - 1) as i64].declaring_span;
+                    const decl_key: u64 = ResolutionMap::make_key(decl_span);
+                    if (ref_key != decl_key) {
+                        this.used.insert(decl_key, true);
+                    }
+                }
+                Option::None => { break; }
+            }
+        }
+    }
+
+    // -- Module walk (both lints) --
+
+    /// Walk every function/method body in the current module.
+    check_module(mut &this, root: ProgramNode*) -> void {
+        if (root == null) { return; }
+        for (mut i: i64 = 0; i < root.statements.length; i++) {
+            const stmt: ASTNode* = root.statements[i];
+            if (stmt == null) { continue; }
+            match (stmt.kind) {
+                NodeKind::FunctionDeclaration => {
+                    this.check_fn(stmt as FunctionDeclNode*);
+                }
+                NodeKind::StructDeclaration => {
+                    this.check_methods((stmt as StructDeclNode*).methods);
+                }
+                NodeKind::UnionDeclaration => {
+                    this.check_methods((stmt as UnionDeclNode*).methods);
+                }
+                NodeKind::ClassDeclaration => {
+                    this.check_methods((stmt as ClassDeclNode*).methods);
+                }
+                NodeKind::ImplementationBlock => {
+                    this.check_methods((stmt as ImplBlockNode*).methods);
+                }
+                NodeKind::TraitDeclaration => {
+                    const td: TraitDeclNode* = stmt as TraitDeclNode*;
+                    for (mut j: i64 = 0; j < td.methods.length; j++) {
+                        this.check_fn(td.methods[j]);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    check_methods(mut &this, methods: &MethodNode*[]) -> void {
+        for (mut i: i64 = 0; i < methods.length; i++) {
+            const m: MethodNode* = methods[i];
+            if (m == null || m.func == null) { continue; }
+            this.check_fn(m.func);
+        }
+    }
+
+    check_fn(mut &this, func: FunctionDeclNode*) -> void {
+        if (func == null || func.body == null) { return; }
+        this.check_block(func.body);
+    }
+
+    /// Scan a block's statement list for both lints.  For each REACHABLE
+    /// statement: flag an unused local it declares (W0001), then recurse into
+    /// its nested blocks.  The moment a statement unconditionally diverges, the
+    /// next non-null statement is unreachable (W0009) - report it once and stop
+    /// (everything after is equally dead, and dead bindings need no
+    /// unused-warning).
+    check_block(mut &this, block: BlockStmtNode*) -> void {
+        if (block == null) { return; }
+        for (mut i: i64 = 0; i < block.statements.length; i++) {
+            const stmt: StatementNode* = block.statements[i];
+            if (stmt == null) { continue; }
+
+            this.check_local_decl(stmt);
+            this.check_stmt(stmt);
+
+            if (this.stmt_diverges(stmt)) {
+                mut j: i64 = i + 1;
+                while (j < block.statements.length && block.statements[j] == null) {
+                    j = j + 1;
+                }
+                if (j < block.statements.length) {
+                    const span: SourceSpan = this.report_span(block.statements[j]);
+                    if (span.has_location()) {
+                        mut diag: Diagnostic = Diagnostic::warning(
+                            ErrorCode::W0009_DEAD_CODE,
+                            "unreachable statement: the preceding statement always diverges, so this can never be reached");
+                        diag = diag.at(span);
+                        this.ctx.emit_diagnostic(diag);
+                    }
+                }
+                return;
+            }
+        }
+    }
+
+    /// A reportable source span for a statement.  A `DeclStmt` wrapper carries
+    /// no location of its own; fall back to the declaration it wraps.
+    report_span(&this, stmt: StatementNode*) -> SourceSpan {
+        if (stmt.span.has_location()) { return stmt.span; }
+        if (stmt.kind == NodeKind::DeclarationStatement) {
+            const ds: DeclStmtNode* = stmt as DeclStmtNode*;
+            if (ds.declaration != null) { return ds.declaration.span; }
+        }
+        return stmt.span;
+    }
+
+    /// If `stmt` declares a plain local binding that is never referenced, warn
+    /// (W0001).  Destructuring bindings are exempt (see the module header).
+    check_local_decl(mut &this, stmt: StatementNode*) -> void {
+        if (stmt.kind != NodeKind::DeclarationStatement) { return; }
+        const ds: DeclStmtNode* = stmt as DeclStmtNode*;
+        if (ds.declaration == null) { return; }
+        if (ds.declaration.kind != NodeKind::VariableDeclaration) { return; }
+
+        const vd: VarDeclNode* = ds.declaration as VarDeclNode*;
+        if (!vd.span.has_location()) { return; }
+
+        const name: string = this.ctx.resolve_str(vd.name);
+        if (name == "" || name.starts_with("_")) { return; }
+
+        const key: u64 = ResolutionMap::make_key(vd.span);
+        if (this.used.contains_key(&key)) { return; }
+
+        mut diag: Diagnostic = Diagnostic::warning(
+            ErrorCode::W0001_UNUSED_VARIABLE,
+            format("unused variable `%s`; prefix it with `_` to silence this warning", name));
+        diag = diag.at(vd.span);
+        this.ctx.emit_diagnostic(diag);
+    }
+
+    /// Recurse into a statement's nested blocks so code inside an `if` arm,
+    /// loop body, etc. is scanned too.  Does NOT judge divergence.
+    check_stmt(mut &this, stmt: StatementNode*) -> void {
+        if (stmt == null) { return; }
+        match (stmt.kind) {
+            NodeKind::BlockStatement => {
+                this.check_block(stmt as BlockStmtNode*);
+            }
+            NodeKind::IfStatement => {
+                const it: IfStmtNode* = stmt as IfStmtNode*;
+                if (it.then_stmt != null) { this.check_stmt(it.then_stmt); }
+                if (it.else_stmt != null) { this.check_stmt(it.else_stmt); }
+            }
+            NodeKind::WhileStatement => {
+                this.check_stmt((stmt as WhileStmtNode*).body);
+            }
+            NodeKind::ForStatement => {
+                this.check_stmt((stmt as ForStmtNode*).body);
+            }
+            NodeKind::DoWhileStatement => {
+                this.check_stmt((stmt as DoWhileStmtNode*).body);
+            }
+            NodeKind::LoopStatement => {
+                this.check_stmt((stmt as LoopStmtNode*).body);
+            }
+            NodeKind::MatchStatement => {
+                const m: MatchStmtNode* = stmt as MatchStmtNode*;
+                for (mut i: i64 = 0; i < m.arms.length; i++) {
+                    const arm: MatchArmNode* = m.arms[i];
+                    if (arm != null && arm.body != null) { this.check_stmt(arm.body); }
+                }
+            }
+            NodeKind::StaticMatchStatement => {
+                const sm: StaticMatchStmtNode* = stmt as StaticMatchStmtNode*;
+                for (mut i: i64 = 0; i < sm.arms.length; i++) {
+                    const arm: StaticMatchArmNode* = sm.arms[i];
+                    if (arm != null && arm.body != null) { this.check_stmt(arm.body); }
+                }
+            }
+            NodeKind::SwitchStatement => {
+                const sw: SwitchStmtNode* = stmt as SwitchStmtNode*;
+                for (mut i: i64 = 0; i < sw.cases.length; i++) {
+                    const c: CaseStmtNode* = sw.cases[i];
+                    if (c != null && c.body != null) { this.check_stmt(c.body as StatementNode*); }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Does this statement ALWAYS transfer control away, so a following
+    /// statement in the same block can never execute?  Conservative: only
+    /// literal `return`/`break`/`continue` and control structures whose every
+    /// branch diverges count.  Everything else is treated as fall-through, so
+    /// the lint never fabricates an unreachable warning.
+    stmt_diverges(mut &this, stmt: StatementNode*) -> boolean {
+        if (stmt == null) { return false; }
+        match (stmt.kind) {
+            NodeKind::ReturnStatement   => { return true; }
+            NodeKind::BreakStatement    => { return true; }
+            NodeKind::ContinueStatement => { return true; }
+            NodeKind::BlockStatement => {
+                return this.block_diverges(stmt as BlockStmtNode*);
+            }
+            NodeKind::IfStatement => {
+                const it: IfStmtNode* = stmt as IfStmtNode*;
+                if (it.then_stmt == null || it.else_stmt == null) { return false; }
+                return this.stmt_diverges(it.then_stmt) && this.stmt_diverges(it.else_stmt);
+            }
+            NodeKind::MatchStatement => {
+                const m: MatchStmtNode* = stmt as MatchStmtNode*;
+                if (m.arms.length == 0) { return false; }
+                for (mut i: i64 = 0; i < m.arms.length; i++) {
+                    const arm: MatchArmNode* = m.arms[i];
+                    if (arm == null || arm.body == null || !this.stmt_diverges(arm.body)) {
+                        return false;
+                    }
+                }
+                return true;
+            }
+            _ => { return false; }
+        }
+    }
+
+    /// A block diverges if any statement in it diverges (once one does, the
+    /// block cannot complete normally).
+    block_diverges(mut &this, block: BlockStmtNode*) -> boolean {
+        if (block == null) { return false; }
+        for (mut i: i64 = 0; i < block.statements.length; i++) {
+            const stmt: StatementNode* = block.statements[i];
+            if (stmt != null && this.stmt_diverges(stmt)) { return true; }
+        }
+        return false;
+    }
+}
+
+
+type struct DeadCodePass {
+    static run(ctx: CompilationContext*) -> PassResult {
+        const root: ProgramNode* = ctx.artifacts.ast.root;
+        if (root == null) { return PassResult::ok(); }
+
+        // Only lint the user's own code: skip the standard library. A
+        // dependency's unused internals are not the user's dead code.
+        if (root.namespace_name.starts_with("std::")) {
+            return PassResult::ok();
+        }
+
+        mut chk: DeadCodeChecker = DeadCodeChecker::new(ctx);
+        chk.build_used();
+        chk.check_module(root);
+
+        // A lint never fails the build; warnings are counted separately by the
+        // DiagnosticSink and do not raise the error count.
+        return PassResult::ok();
+    }
+}
