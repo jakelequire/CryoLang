@@ -78,11 +78,23 @@ type struct DeadCodeChecker {
     /// resolution map).  Also covers operator overloads via `desugared_call`.
     method_used: HashMap<u64, boolean>;
 
+    /// Whether the body currently being walked was name-resolved, so its local
+    /// references are present in `used`.  W0001 (unused local) is only sound
+    /// when this holds.  It is FALSE for trait *default* method bodies - the
+    /// resolver declares trait methods "as signatures only" (see
+    /// visit(TraitDeclNode)) and never resolves their bodies - and for mono
+    /// specialization clones, which are not independently resolved (their
+    /// resolved template, walked separately, is where a genuine dead local
+    /// surfaces).  W0009 (unreachable) is structural and stays enabled either
+    /// way.  Set per-body by `check_fn`.
+    body_resolved: boolean;
+
     static new(ctx: CompilationContext*) -> DeadCodeChecker {
         return DeadCodeChecker {
-            ctx:         ctx,
-            used:        HashMap<u64, boolean>::new(),
-            method_used: HashMap<u64, boolean>::new(),
+            ctx:           ctx,
+            used:          HashMap<u64, boolean>::new(),
+            method_used:   HashMap<u64, boolean>::new(),
+            body_resolved: true,
         };
     }
 
@@ -125,7 +137,8 @@ type struct DeadCodeChecker {
             if (stmt == null) { continue; }
             match (stmt.kind) {
                 NodeKind::FunctionDeclaration => {
-                    this.check_fn(stmt as FunctionDeclNode*);
+                    const fn: FunctionDeclNode* = stmt as FunctionDeclNode*;
+                    this.check_fn(fn, this.is_body_resolved(fn));
                 }
                 NodeKind::StructDeclaration => {
                     this.check_methods((stmt as StructDeclNode*).methods);
@@ -140,9 +153,12 @@ type struct DeadCodeChecker {
                     this.check_methods((stmt as ImplBlockNode*).methods);
                 }
                 NodeKind::TraitDeclaration => {
+                    // Trait default method bodies are not name-resolved
+                    // (signatures only), so W0001 would false-positive on every
+                    // local; run structural W0009 only (body_resolved = false).
                     const td: TraitDeclNode* = stmt as TraitDeclNode*;
                     for (mut j: i64 = 0; j < td.methods.length; j++) {
-                        this.check_fn(td.methods[j]);
+                        this.check_fn(td.methods[j], false);
                     }
                 }
                 _ => {}
@@ -154,13 +170,26 @@ type struct DeadCodeChecker {
         for (mut i: i64 = 0; i < methods.length; i++) {
             const m: MethodNode* = methods[i];
             if (m == null || m.func == null) { continue; }
-            this.check_fn(m.func);
+            this.check_fn(m.func, this.is_body_resolved(m.func));
         }
     }
 
-    check_fn(mut &this, func: FunctionDeclNode*) -> void {
+    /// Whether `func`'s body was name-resolved (so its locals are in `used`).
+    /// False for mono specialization clones and for trait-default methods
+    /// synthesized into an impl block (`is_synth_default`) - both are copies of
+    /// bodies the resolver never walked. See the `body_resolved` field doc.
+    is_body_resolved(&this, func: FunctionDeclNode*) -> boolean {
+        return !func.is_specialization && !func.is_synth_default;
+    }
+
+    /// `body_resolved` gates W0001 (see the field doc): pass false for bodies
+    /// whose local references are absent from `used` (trait defaults, mono
+    /// clones); W0009 runs regardless.
+    check_fn(mut &this, func: FunctionDeclNode*, body_resolved: boolean) -> void {
         if (func == null || func.body == null) { return; }
+        this.body_resolved = body_resolved;
         this.check_block(func.body);
+        this.body_resolved = true;
     }
 
     /// Scan a block's statement list for both lints.  For each REACHABLE
@@ -212,6 +241,7 @@ type struct DeadCodeChecker {
     /// If `stmt` declares a plain local binding that is never referenced, warn
     /// (W0001).  Destructuring bindings are exempt (see the module header).
     check_local_decl(mut &this, stmt: StatementNode*) -> void {
+        if (!this.body_resolved) { return; }   // unresolved body: `used` is incomplete
         if (stmt.kind != NodeKind::DeclarationStatement) { return; }
         const ds: DeclStmtNode* = stmt as DeclStmtNode*;
         if (ds.declaration == null) { return; }
