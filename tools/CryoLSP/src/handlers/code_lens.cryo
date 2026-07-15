@@ -24,6 +24,13 @@ import std::json::value;
 
 import Compiler::CompilationContext;
 import Compiler::Diag::Diagnostic;
+import Compiler::Diag::SourceSpan;
+import Compiler::AST;
+import Compiler::AST::Node;
+import Compiler::AST::Declaration;
+import Compiler::AST::NodeLocator;
+import Compiler::Resolver::SymbolStr;
+import Compiler::ModuleGraph;
 
 import Lsp::Server::Session;
 import Lsp::Server::Docs;
@@ -72,7 +79,161 @@ public function handle_code_lens(docs: &Docs, sessions: mut &SessionMap,
     }
     fs_path_owned.drop();
 
+    // Second producer: an "N implementations" lens above every type and
+    // trait declaration in this document, counting impl blocks across the
+    // whole module graph.  Clicking it opens a reference peek listing each
+    // implementation (client command `cryo.showImplementations`).
+    ImplLensBuilder::append_impl_lenses(&lenses, ctx, uri.as_str());
+
     return JsonValue::Array(lenses);
+}
+
+
+// ImplLensBuilder - "N implementations" lenses above type / trait decls.
+//
+// For each top-level struct / class / enum / union / trait in the
+// document, count the impl blocks targeting it (types) or implementing
+// it (traits) across the module graph, and emit a code lens whose
+// command opens a VS Code reference peek over the implementation sites.
+
+type struct ImplLensBuilder {
+
+    /// Append one lens per implementable declaration in `uri`'s module.
+    /// No-op when the module isn't in the graph (single-file fallback for
+    /// a URI outside the project) or carries no type/trait decls.
+    static append_impl_lenses(lenses: mut &Array<JsonValue>,
+                               ctx: CompilationContext*, uri: Str) -> void {
+        if (ctx == null || ctx.module_graph == null) { return; }
+        const ast: ProgramNode* = ImplLensBuilder::module_ast_for_uri(ctx, uri);
+        if (ast == null) { return; }
+
+        for (mut si: i64 = 0; si < ast.statements.length; si++) {
+            const stmt: ASTNode* = NodeLocator::unwrap_decl_stmt(ast.statements[si]);
+            if (stmt == null) { continue; }
+
+            // Classify: which decls get a lens, and by name vs by trait.
+            mut name: SymbolStr = SymbolStr::empty();
+            mut is_trait: boolean = false;
+            mut wanted: boolean = true;
+            match (stmt.kind) {
+                NodeKind::StructDeclaration => {
+                    const d: StructDeclNode* = stmt as StructDeclNode*;
+                    name = d.name;
+                }
+                NodeKind::ClassDeclaration => {
+                    const d: ClassDeclNode* = stmt as ClassDeclNode*;
+                    name = d.name;
+                }
+                NodeKind::EnumDeclaration => {
+                    const d: EnumDeclNode* = stmt as EnumDeclNode*;
+                    name = d.name;
+                }
+                NodeKind::UnionDeclaration => {
+                    const d: UnionDeclNode* = stmt as UnionDeclNode*;
+                    name = d.name;
+                }
+                NodeKind::TraitDeclaration => {
+                    const d: TraitDeclNode* = stmt as TraitDeclNode*;
+                    name = d.name;
+                    is_trait = true;
+                }
+                _ => { wanted = false; }
+            }
+            if (!wanted || !name.is_valid()) { continue; }
+
+            // `find_impls_of_*` returns an owning array; auto-dropped at
+            // the end of this iteration (its SourceSpans are non-owning
+            // views into AST-owned strings, so nothing else frees).
+            mut spans: SourceSpan[] = [];
+            if (is_trait) {
+                spans = find_impls_of_trait(ctx.module_graph, ctx.intern_table, name);
+            } else {
+                spans = find_impls_of_type(ctx.module_graph, ctx.intern_table, name);
+            }
+            if (spans.length == 0) { continue; }
+
+            const name_span: SourceSpan = NodeLocator::name_span_of(stmt);
+            if (!name_span.has_location()) { continue; }
+
+            lenses.push(ImplLensBuilder::build_impl_lens(uri, name_span, &spans));
+        }
+    }
+
+    /// Resolve `uri` to its parsed `ProgramNode`, or null when the file
+    /// isn't loaded in the graph.  Mirrors the NUL-terminated path dance
+    /// in `definition.cryo` (`find_module_by_path` wants a C string, but
+    /// `Str` isn't NUL-terminated).
+    static module_ast_for_uri(ctx: CompilationContext*, uri: Str) -> ProgramNode* {
+        mut fs_path_owned: String = UriPath::uri_to_fs_path(uri);
+        const fs_path: Str = fs_path_owned.as_str();
+        mut path_buf: String = String::with_capacity(fs_path.length() + 1);
+        path_buf.push(fs_path);
+        path_buf.push_byte(0 as u8);
+        fs_path_owned.drop();
+        const path_buf_len: u64 = path_buf.length() - 1;
+        path_buf.truncate(path_buf_len);
+        const path_cstr: string = path_buf.as_ptr() as string;
+
+        const mod_idx: i64 = ctx.module_graph.find_module_by_path(path_cstr);
+        path_buf.drop();
+        if (mod_idx < 0) { return null; }
+        return ctx.module_graph.get_module_ast(mod_idx as u32);
+    }
+
+    /// Build one `{ range, command }` lens.  `range` is the declaration's
+    /// name span; the command fires `cryo.showImplementations` with
+    /// `[anchorUri, anchorPosition, locations]` so the client extension
+    /// can hand them to VS Code's `editor.action.showReferences` peek.
+    static build_impl_lens(uri: Str, name_span: SourceSpan,
+                            spans: &SourceSpan[]) -> JsonValue {
+        const count: i64 = spans.length;
+
+        // command.arguments[2] = [ Location, ... ]
+        mut locs: Array<JsonValue> = Array<JsonValue>::with_capacity(count as u64);
+        for (mut i: i64 = 0; i < spans.length; i++) {
+            locs.push(ImplLensBuilder::location_json(spans[i]));
+        }
+
+        // command.arguments = [ anchorUri, anchorPosition, locations ]
+        mut args: Array<JsonValue> = Array<JsonValue>::with_capacity(3);
+        args.push(JsonValue::from(uri));
+        args.push(ImplLensBuilder::position_json(name_span));
+        args.push(JsonValue::Array(locs));
+
+        const title: string = if (count == 1) {
+            "1 implementation"
+        } else {
+            format("%d implementations", count as i32)
+        };
+
+        mut cmd: JsonObject = JsonObject::new();
+        cmd.put("title", JsonValue::from(title));
+        cmd.put("command", JsonValue::from("cryo.showImplementations"));
+        cmd.put("arguments", JsonValue::Array(args));
+
+        mut lens: JsonObject = JsonObject::new();
+        lens.put("range", DiagnosticConverter::range_json_from_span(name_span));
+        lens.put("command", JsonValue::Object(cmd));
+        return JsonValue::Object(lens);
+    }
+
+    /// LSP `Location` JSON (`{ uri, range }`) for an implementation site.
+    static location_json(span: SourceSpan) -> JsonValue {
+        mut loc: JsonObject = JsonObject::new();
+        loc.put("uri",   JsonValue::String(UriPath::uri_string_from_fs_path(span.file)));
+        loc.put("range", DiagnosticConverter::range_json_from_span(span));
+        return JsonValue::Object(loc);
+    }
+
+    /// LSP `Position` JSON at the 0-based start of `span` - the anchor the
+    /// reference peek opens over.
+    static position_json(span: SourceSpan) -> JsonValue {
+        mut sl: u32 = 0;
+        mut sc: u32 = 0;
+        if (span.start_line > 0) { sl = span.start_line - 1; }
+        if (span.start_col  > 0) { sc = span.start_col  - 1; }
+        return DiagnosticConverter::pos_json(sl, sc);
+    }
 }
 
 
