@@ -840,7 +840,24 @@ public:
                     expr_src = hole_src.substr(0, tl - 2);
                 }
 
-                const inner: ExpressionNode* = this.fstr_parse_hole(expr_src);
+                // Real source position of the hole's first byte (raw[i+1]) so
+                // the sub-lexed tokens report true file coordinates.  raw[0]
+                // sits at column tok.column+2 (past the `f"` prefix); walk the
+                // template up to the hole, resetting column on embedded '\n'.
+                mut hole_line: int = tok.line;
+                mut hole_col:  int = tok.column + 2;
+                mut sc: i64 = 0;
+                while (sc < i + 1) {
+                    if ((*(raw + sc) as char) == '\n') {
+                        hole_line += 1;
+                        hole_col = 1;
+                    } else {
+                        hole_col += 1;
+                    }
+                    sc += 1;
+                }
+                const inner: ExpressionNode* = this.fstr_parse_hole(
+                    expr_src, hole_line, hole_col);
                 chunk_start = j + 1; // literal run resumes past the closing '}'
                 i = j + 1;
                 if (inner == null) {
@@ -915,8 +932,15 @@ public:
     /// it to a fresh sub-parser via `parse_expr_from_tokens` (overridden on
     /// the concrete `Parser`).  A separate parser is used so the hole's
     /// tokens never displace this parser's own (owned) token stream.
-    fstr_parse_hole(src: string) -> ExpressionNode* {
+    /// `base_line`/`base_col` are the hole's real position in the enclosing
+    /// file, so the sub-lexed tokens carry true coordinates (the sub-parser
+    /// stamps them with `this.source_file`).  Without a real base every hole
+    /// would sit at 1:1 and collide in the resolution map, so a local used only
+    /// inside an f-string looks unreferenced (W0001 false positive) and LSP
+    /// hover/def point nowhere.
+    fstr_parse_hole(src: string, base_line: int, base_col: int) -> ExpressionNode* {
         mut lx: Lexer = Lexer::new("<fstring>", src, this.ctx.diagnostics);
+        lx.seed_location(base_line, base_col);
         const hole_toks: Token[] = lx.lex();
         return this.parse_expr_from_tokens(hole_toks);
     }
@@ -1237,7 +1261,6 @@ public:
         // call.  Until the form is properly desugared to `{ return expr; }`,
         // reject it with a clear diagnostic pointing at the braced form.
         if (this.check(TokenType::LBrace)) {
-            const block_start: Token = this.current();
             // Route through the virtual `parse_inner_block` hook so Parser's
             // full-statement override (if/while/for/loop/match/switch/break/
             // continue, plus the const-mut-return-expr forms ExprParser can
