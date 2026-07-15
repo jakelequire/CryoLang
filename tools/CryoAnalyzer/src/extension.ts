@@ -103,6 +103,40 @@ export async function activate(
     // restarts without a re-registration step.
     registerDiagnosticView(context, () => client, outputChannel);
 
+    // Hover-verbosity toggle: flip the expand flag and re-show the hover the
+    // user is pointing at.  `editor.action.showHover` renders at the caret, not
+    // the mouse, so we move the caret onto the last-hovered token first (the
+    // middleware recorded it in `lastHoverPosition`).  The editor keeps
+    // keyboard focus during a mouse hover, so pressing the key while hovering
+    // fires this command.  Registered here in `activate` (once), not in
+    // `startClient`, so a server restart doesn't re-register it and throw
+    // "command 'cryo.toggleHoverMethods' already exists".  It touches only
+    // module-level state and VS Code APIs, so it needs no `client` reference.
+    context.subscriptions.push(
+        vscode.commands.registerCommand('cryo.toggleHoverMethods', async () => {
+            hoverMethodsExpanded = !hoverMethodsExpanded;
+            const target = lastHoverPosition;
+            if (target) {
+                const editor =
+                    vscode.window.activeTextEditor &&
+                    vscode.window.activeTextEditor.document.uri.toString() ===
+                        target.uri
+                        ? vscode.window.activeTextEditor
+                        : vscode.window.visibleTextEditors.find(
+                              (e) => e.document.uri.toString() === target.uri
+                          );
+                if (editor) {
+                    const pos = new vscode.Position(
+                        target.line,
+                        target.character
+                    );
+                    editor.selection = new vscode.Selection(pos, pos);
+                }
+            }
+            await vscode.commands.executeCommand('editor.action.showHover');
+        })
+    );
+
     // Build the Shiki highlighter for the Markdown preview before returning, so
     // it's ready when VS Code renders. Non-fatal: on failure the markdown-it
     // hook falls back to VS Code's default highlighting.
@@ -269,37 +303,6 @@ async function startClient(context: vscode.ExtensionContext): Promise<void> {
                 break;
         }
     });
-
-    // Hover-verbosity toggle: flip the expand flag and re-show the hover the
-    // user is pointing at.  `editor.action.showHover` renders at the caret, not
-    // the mouse, so we move the caret onto the last-hovered token first (the
-    // middleware recorded it in `lastHoverPosition`).  The editor keeps
-    // keyboard focus during a mouse hover, so pressing the key while hovering
-    // fires this command.
-    context.subscriptions.push(
-        vscode.commands.registerCommand('cryo.toggleHoverMethods', async () => {
-            hoverMethodsExpanded = !hoverMethodsExpanded;
-            const target = lastHoverPosition;
-            if (target) {
-                const editor =
-                    vscode.window.activeTextEditor &&
-                    vscode.window.activeTextEditor.document.uri.toString() ===
-                        target.uri
-                        ? vscode.window.activeTextEditor
-                        : vscode.window.visibleTextEditors.find(
-                              (e) => e.document.uri.toString() === target.uri
-                          );
-                if (editor) {
-                    const pos = new vscode.Position(
-                        target.line,
-                        target.character
-                    );
-                    editor.selection = new vscode.Selection(pos, pos);
-                }
-            }
-            await vscode.commands.executeCommand('editor.action.showHover');
-        })
-    );
 
     try {
         await client.start();
