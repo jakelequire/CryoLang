@@ -77,6 +77,16 @@ public function try_keyword_hover(doc: Document*, line: u32, character: u32) -> 
         return Option::None;
     }
 
+    // Path/member segment: a keyword-LEXEME immediately preceded by `::`
+    // (e.g. `core::default`, `Foo::type`, a namespace/import segment) is an
+    // identifier here, never a keyword.  Suppress the keyword doc so the hover
+    // falls through to the AST path, which renders the segment's namespace /
+    // member card.  The check skips intervening whitespace before the `::`.
+    if (KeywordLookup::preceded_by_scope_sep(ptr, start)) {
+        word_buf.drop();
+        return Option::None;
+    }
+
     const md: string = KeywordLookup::lookup_keyword_doc(word_cstr);
     word_buf.drop();
     if (md == "") { return Option::None; }
@@ -160,6 +170,21 @@ static mut_begins_this_receiver(ptr: u8*, len: u64, after_mut: u64) -> boolean {
     if (p + 4 as u64 < len && KeywordLookup::is_ident_byte(ptr[p + 4])) {
         return false;
     }
+    return true;
+}
+
+/// True when the bytes ending at `word_start` (the first byte of the hovered
+/// word) are immediately preceded by a `::` scope separator, skipping any
+/// intervening whitespace.  Used to route a hover on a keyword-lexeme path
+/// segment (`core::default`, `Foo::type`) away from the keyword doc and into
+/// the AST namespace/member hover.  Colon byte is 58 (`:`).
+static preceded_by_scope_sep(ptr: u8*, word_start: u64) -> boolean {
+    mut p: u64 = word_start;
+    while (p > 0 && KeywordLookup::is_space_byte(ptr[p - 1])) { p = p - 1; }
+    // Need two colons immediately before `p`.
+    if (p < 2 as u64) { return false; }
+    if (ptr[p - 1] != 58 as u8) { return false; }
+    if (ptr[p - 2] != 58 as u8) { return false; }
     return true;
 }
 

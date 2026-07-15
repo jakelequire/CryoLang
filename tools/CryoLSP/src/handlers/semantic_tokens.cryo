@@ -204,6 +204,14 @@ type struct SemanticTokenizer {
             this.walk_enum_variant(node as EnumVariantNode*);
             return;
         }
+        if (node.kind == NodeKind::ImportDeclaration) {
+            this.walk_import_decl(node as ImportDeclNode*);
+            return;
+        }
+        if (node.kind == NodeKind::ModuleDeclaration) {
+            this.walk_module_decl(node as ModuleDeclNode*);
+            return;
+        }
         if (node.kind == NodeKind::DeclarationStatement) {
             const ds: DeclStmtNode* = node as DeclStmtNode*;
             this.st_walk_node(ds.declaration as ASTNode*);
@@ -449,6 +457,43 @@ type struct SemanticTokenizer {
         this.walk_type_annotation(b.trait_annotation);
         for (mut i: i64 = 0; i < b.methods.length; i++) {
             this.walk_method_decl(b.methods[i]);
+        }
+    }
+
+    /// `import std::core::default;` - emit a `namespace` token over each
+    /// path segment.  Without this the segments carry NO semantic token and
+    /// fall through to the TextMate grammar, which colours keyword-lexemes
+    /// (`default`, `type`, `from`, ...) used as module names with the keyword
+    /// colour.  The parser records each segment's exact span in
+    /// `path_segment_spans` (same data the hover handler dispatches on), so we
+    /// paint them all as `namespace`.  Specific-import names (`{X, Y}`) and the
+    /// `as Alias` identifier have no per-name span on the node, so they're left
+    /// to the TextMate grammar (their lexemes are user identifiers / types, not
+    /// keywords, so no mis-colouring results).
+    walk_import_decl(mut &this, imp: ImportDeclNode*) -> void {
+        if (imp == null) { return; }
+        for (mut i: i64 = 0; i < imp.path_segment_spans.length; i++) {
+            const sp: SourceSpan = imp.path_segment_spans[i];
+            if (sp.has_location()) {
+                this.emit_span(sp,
+                               Lsp::Protocol::SemanticTokens::TYPE_NAMESPACE,
+                               Lsp::Protocol::SemanticTokens::MOD_NONE);
+            }
+        }
+    }
+
+    /// `namespace X::Y::default;` / `public module A::B;` - same segment-level
+    /// `namespace` overlay as `walk_import_decl`, so a keyword-lexeme segment in
+    /// a namespace/module declaration doesn't render as a keyword.
+    walk_module_decl(mut &this, m: ModuleDeclNode*) -> void {
+        if (m == null) { return; }
+        for (mut i: i64 = 0; i < m.path_segment_spans.length; i++) {
+            const sp: SourceSpan = m.path_segment_spans[i];
+            if (sp.has_location()) {
+                this.emit_span(sp,
+                               Lsp::Protocol::SemanticTokens::TYPE_NAMESPACE,
+                               Lsp::Protocol::SemanticTokens::MOD_NONE);
+            }
         }
     }
 
