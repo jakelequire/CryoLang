@@ -60,8 +60,23 @@ import Lsp::Protocol::Conv;
 import Lsp::Handlers::KeywordDocs;
 
 
+/// Standard `textDocument/hover` entry point - base (non-verbose) hover.
 public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
                               params: &JsonValue) -> JsonValue {
+    return handle_hover_ex(docs, sessions, params, false);
+}
+
+/// `cryo/expandHover` entry point - the expanded hover the extension
+/// requests when the user raises the hover verbosity.  Identical to the
+/// base hover except a struct/class type-decl body additionally lists the
+/// type's method signatures.
+public function handle_hover_verbose(docs: &Docs, sessions: mut &SessionMap,
+                                      params: &JsonValue) -> JsonValue {
+    return handle_hover_ex(docs, sessions, params, true);
+}
+
+public function handle_hover_ex(docs: &Docs, sessions: mut &SessionMap,
+                                 params: &JsonValue, verbose: boolean) -> JsonValue {
     // -- Extract URI + 0-based (line, character) from the params ------
     // Use stepwise extraction with early returns; deeply nested
     // `match` arms returning `Str` AND diverging via `return` confuse
@@ -163,6 +178,7 @@ public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
     // Per-request engine: holds the compilation pointers so the
     // formatters + graph walks below don't each re-thread them.
     mut eng: HoverEngine = HoverEngine::new(ctx);
+    eng.verbose = verbose;
 
     // -- Pick a content string and a span for the highlight ---------
     const name_span: SourceSpan = NodeLocator::name_span_of(node);
@@ -511,6 +527,7 @@ public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
                             ctx.module_graph, ctx.intern_table, type_sym, ma.member);
                         if (fld != null) {
                             content  = eng.format_field_decl(fld);
+                            content  = eng.prefix_field_owner(content, ma.object, type_sym);
                             content  = eng.append_param_bound(content, fld.resolved_type,
                                 ma.span.file, cursor_line, cursor_char);
                             doc_text = fld.documentation;
@@ -525,6 +542,7 @@ public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
                         ctx.module_graph, ctx.intern_table, type_sym, ma.member);
                     if (fld != null) {
                         content  = eng.format_field_decl(fld);
+                        content  = eng.prefix_field_owner(content, ma.object, type_sym);
                         content  = eng.append_param_bound(content, fld.resolved_type,
                             ma.span.file, cursor_line, cursor_char);
                         doc_text = fld.documentation;
@@ -792,18 +810,29 @@ public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
                 if (content == "") {
                     const init_str: string = eng.const_initializer_text(
                         sym.declaring_span);
-                    content = eng.format_identifier_use(
-                        sym, id_node.resolved_type, init_str);
-                    // Surface a generic param's bound at the use site:
-                    // `foo<T: Display>(x)` hovered on `x` reads
-                    // `const x: T where T: Display`.
-                    content = eng.append_param_bound(content, id_node.resolved_type,
-                        id_node.span.file, cursor_line, cursor_char);
-                    // Pull doc from the symbol's source decl, if reachable.
+                    // Pull the symbol's source decl up front: besides docs, its
+                    // `resolved_type` is the reliable type source.  A use-site
+                    // reference to a global const (`this.f(INITIAL_BUCKETS)`)
+                    // often carries no stamped `resolved_type` on the reference
+                    // identifier - sema resolves the declaration, not every
+                    // use - so `id_node.resolved_type` would render `?`.  The
+                    // decl node carries the sema-resolved `u64`; prefer it when
+                    // the use-site type is missing.
                     // Covers `const ENOENT: i32 = 2` use sites; method/field/
                     // parameter uses fall through with empty doc.
                     const v: VarDeclNode* = eng.var_decl_at_span(
                         sym.declaring_span);
+                    mut use_ty: TypeRef = id_node.resolved_type;
+                    if (!use_ty.is_valid() && v != null
+                            && v.resolved_type.is_valid()) {
+                        use_ty = v.resolved_type;
+                    }
+                    content = eng.format_identifier_use(sym, use_ty, init_str);
+                    // Surface a generic param's bound at the use site:
+                    // `foo<T: Display>(x)` hovered on `x` reads
+                    // `const x: T where T: Display`.
+                    content = eng.append_param_bound(content, use_ty,
+                        id_node.span.file, cursor_line, cursor_char);
                     if (v != null) { doc_text = v.documentation; }
 
                     // Generic-body fallback: when sema didn't stamp a
@@ -1035,13 +1064,19 @@ type struct HoverEngine {
     arena:  TypeArena*;
     intern: InternTable*;
     graph:  ModuleGraph*;
+    /// Expanded ("verbose") hover: when set, a struct/class type-decl hover
+    /// additionally lists the type's method signatures in its body.  Driven
+    /// by the `cryo/expandHover` custom request the extension fires when the
+    /// user increases the hover's verbosity level.
+    verbose: boolean;
 
     static new(ctx: CompilationContext*) -> HoverEngine {
         return HoverEngine {
-            ctx:    ctx,
-            arena:  ctx.type_arena,
-            intern: ctx.intern_table,
-            graph:  ctx.module_graph,
+            ctx:     ctx,
+            arena:   ctx.type_arena,
+            intern:  ctx.intern_table,
+            graph:   ctx.module_graph,
+            verbose: false,
         };
     }
 
@@ -1155,11 +1190,16 @@ type struct HoverEngine {
                 const d: StructDeclNode* = node as StructDeclNode*;
                 mut sig: string = "type struct " + this.arena.intern_table.resolve(d.name)
                     + this.format_generic_params(d.generic_params);
-                if (d.fields.length > 0) {
+                const methods_str: string = if (this.verbose) {
+                    this.format_type_methods(d.name)
+                } else { "" };
+                if (d.fields.length > 0 || methods_str != "") {
                     sig = sig + " {\n";
                     for (mut i: i64 = 0; i < d.fields.length; i++) {
                         sig = sig + "    " + this.format_field_decl(d.fields[i]) + ";\n";
                     }
+                    if (d.fields.length > 0 && methods_str != "") { sig = sig + "\n"; }
+                    sig = sig + methods_str;
                     sig = sig + "}";
                 }
                 sig
@@ -1172,11 +1212,16 @@ type struct HoverEngine {
                     sig = sig + " : "
                         + HoverEngine::leaf_after_separator(this.arena.intern_table.resolve(d.base_class));
                 }
-                if (d.fields.length > 0) {
+                const methods_str: string = if (this.verbose) {
+                    this.format_type_methods(d.name)
+                } else { "" };
+                if (d.fields.length > 0 || methods_str != "") {
                     sig = sig + " {\n";
                     for (mut i: i64 = 0; i < d.fields.length; i++) {
                         sig = sig + "    " + this.format_field_decl(d.fields[i]) + ";\n";
                     }
+                    if (d.fields.length > 0 && methods_str != "") { sig = sig + "\n"; }
+                    sig = sig + methods_str;
                     sig = sig + "}";
                 }
                 sig
@@ -1235,6 +1280,55 @@ type struct HoverEngine {
             }
             _ => { "" }
         };
+    }
+
+    /// List every method declared for the type named `type_name`, one
+    /// indented signature per line, for the expanded (verbose) type hover.
+    /// Walks all impl blocks in the module graph whose target type matches:
+    ///   * inherent impls (`implement Foo { ... }`) render the plain
+    ///     signature - `resize_buckets(this: mut &This, n: u64) -> void`.
+    ///   * trait impls (`implement trait Iterator for Foo`) prefix the
+    ///     signature with `trait <Trait>::` - `trait Iterator::next(...) -> ...`.
+    /// Reuses `format_method_signature` with an empty owner (no `Owner::`
+    /// prefix) so static/where-clause rendering matches method hovers.
+    /// Returns "" when the type has no methods, so callers concatenate
+    /// unconditionally.  Name matching mirrors `find_impls_of_type`.
+    format_type_methods(&this, type_name: SymbolStr) -> string {
+        if (this.graph == null || this.intern == null) { return ""; }
+        const type_leaf: string = NodeLocator::leaf_segment_str(
+            this.intern.resolve(type_name));
+        mut out: string = "";
+        const n: u32 = this.graph.module_count();
+        for (mut mi: u32 = 0; mi < n; mi++) {
+            const ast: ProgramNode* = this.graph.get_module_ast(mi);
+            if (ast == null) { continue; }
+            for (mut si: i64 = 0; si < ast.statements.length; si++) {
+                const stmt: ASTNode* = NodeLocator::unwrap_decl_stmt(
+                    ast.statements[si]);
+                if (stmt == null) { continue; }
+                if (stmt.kind != NodeKind::ImplementationBlock) { continue; }
+                const impl_blk: ImplBlockNode* = stmt as ImplBlockNode*;
+                if (!NodeLocator::type_name_matches(this.intern,
+                        impl_blk.target_type, type_name, type_leaf)) { continue; }
+                // Trait impls prefix each signature with `trait <Trait>::`.
+                mut prefix: string = "";
+                if (impl_blk.trait_annotation != null) {
+                    const th: SymbolStr = NodeLocator::annotation_head_name(
+                        impl_blk.trait_annotation);
+                    if (th.is_valid()) {
+                        prefix = "trait " + HoverEngine::leaf_after_separator(
+                            this.intern.resolve(th)) + "::";
+                    }
+                }
+                for (mut k: i64 = 0; k < impl_blk.methods.length; k++) {
+                    const m: MethodNode* = impl_blk.methods[k];
+                    if (m == null || m.func == null) { continue; }
+                    out = out + "    " + prefix
+                        + this.format_method_signature(m, "") + "\n";
+                }
+            }
+        }
+        return out;
     }
 
     /// Render one variant inside an enum-decl body: `Name = N;` for
@@ -2131,6 +2225,102 @@ type struct HoverEngine {
         return cur;
     }
 
+    /// Unwrap only Reference / Pointer wrappers, PRESERVING an
+    /// InstantiatedType so its generic args (`<K, V>`) survive in the
+    /// display.  Companion to `unwrap_to_carrier`, which additionally strips
+    /// the InstantiatedType down to its bare template base for method lookup.
+    unwrap_ref_ptr(&this, ty: TypeRef) -> TypeRef {
+        if (this.arena == null) { return ty; }
+        mut cur: TypeRef = ty;
+        mut hops: i64 = 0;
+        while (hops < 6) {
+            if (!cur.is_valid()) { return cur; }
+            const t: Type* = this.arena.lookup(cur.id);
+            if (t == null) { return cur; }
+            if (t.kind == TypeKind::Reference) {
+                cur = (t as ReferenceType*).referent;
+            } else if (t.kind == TypeKind::Pointer) {
+                cur = (t as PointerType*).pointee;
+            } else {
+                return cur;
+            }
+            hops = hops + 1;
+        }
+        return cur;
+    }
+
+    /// Owner-type prefix for a field hover - e.g. `EntriesRefIter<K, V>` for
+    /// the `buckets` field reached through `this.buckets`, so the hover reads
+    /// `EntriesRefIter<K, V>.buckets: Entry<K, V>**`.  Prefers the receiver
+    /// expression's resolved type (Reference/Pointer peeled but the
+    /// InstantiatedType kept so `<K, V>` shows); when sema left the receiver
+    /// unstamped (generic template body) falls back to the carrier struct /
+    /// class decl named by `type_sym`, rendered with its own generic params.
+    /// Returns "" when no usable owner name is available, so callers can
+    /// concatenate unconditionally.
+    field_owner_display(&this, obj: ExpressionNode*, type_sym: SymbolStr) -> string {
+        // Path A (preferred): the carrier's declaration + its declared generic
+        // params, e.g. `EntriesRefIter<K, V>`.  This is the canonical decl
+        // form and avoids the doubled-arg quirk (`EntriesRefIter<K, V, K, V>`)
+        // that resolve_display_name_short produces for a `this` receiver whose
+        // resolved type is an InstantiatedType wrapping a spec that already
+        // carries its args in the display name.
+        if (type_sym.is_valid() && this.graph != null && this.intern != null) {
+            const decl: ASTNode* = NodeLocator::find_type_decl_in_modules(
+                this.graph, this.intern, type_sym);
+            if (decl != null) {
+                const nm: SymbolStr = HoverEngine::decl_type_name(decl);
+                if (nm.is_valid()) {
+                    mut s: string = this.intern.resolve(nm);
+                    const params: GenericParamNode*[]* =
+                        HoverEngine::generic_params_of_decl(decl);
+                    if (params != null) {
+                        s = s + this.format_generic_params(*params);
+                    }
+                    return s;
+                }
+            }
+        }
+        // Path B (fallback): receiver's resolved type, ref/ptr peeled with
+        // generics kept.  Used when the decl can't be located by name - e.g.
+        // a receiver whose carrier lives outside the walkable module graph.
+        if (obj != null && obj.resolved_type.is_valid() && this.arena != null) {
+            const carrier: TypeRef = this.unwrap_ref_ptr(obj.resolved_type);
+            if (carrier.is_valid()) {
+                const s: string = this.arena.resolve_display_name_short(carrier.id);
+                if (s != "" && s != "?") { return s; }
+            }
+        }
+        return "";
+    }
+
+    /// Prefix a rendered field decl (`buckets: Entry<K, V>**`) with its owner
+    /// type and a `.` separator when the owner is resolvable, yielding
+    /// `EntriesRefIter<K, V>.buckets: Entry<K, V>**`.  Passes the field string
+    /// through unchanged when no owner name is available.
+    prefix_field_owner(&this, field_str: string, obj: ExpressionNode*,
+                       type_sym: SymbolStr) -> string {
+        const owner: string = this.field_owner_display(obj, type_sym);
+        if (owner == "") { return field_str; }
+        return owner + "." + field_str;
+    }
+
+    /// Name symbol of a struct / class / enum declaration node.  Returns an
+    /// empty SymbolStr for other node kinds.
+    static decl_type_name(node: ASTNode*) -> SymbolStr {
+        if (node == null) { return SymbolStr::empty(); }
+        if (node.kind == NodeKind::StructDeclaration) {
+            return (node as StructDeclNode*).name;
+        }
+        if (node.kind == NodeKind::ClassDeclaration) {
+            return (node as ClassDeclNode*).name;
+        }
+        if (node.kind == NodeKind::EnumDeclaration) {
+            return (node as EnumDeclNode*).name;
+        }
+        return SymbolStr::empty();
+    }
+
     function_decl_at_span(&this, decl_span: SourceSpan) -> FunctionDeclNode* {
         if (this.graph == null)                  { return null; }
         if (decl_span.file == "")                { return null; }
@@ -2622,14 +2812,24 @@ type struct HoverEngine {
         return null;
     }
 
-    /// True when `s` ends in the `: ?` placeholder the arena uses for
-    /// invalid type IDs.  Used by the hover handler to detect a sema
-    /// miss (generic body, partial compile) and trigger the annotation
-    /// fallback.
+    /// True when `s` carries a `: ?` placeholder the arena uses for invalid
+    /// type IDs.  Used by the hover handler to detect a sema miss (generic
+    /// body, partial compile) and trigger the annotation fallback.  The `?`
+    /// may sit at the end (`const x: ?`) or mid-string when a value suffix
+    /// follows (`const INITIAL_BUCKETS: ? = 8`), so scan for the pattern
+    /// rather than only inspecting the trailing three bytes.
     static contains_unknown_type(s: string) -> boolean {
         const len: i64 = strlen(s) as i64;
-        if (len < 3) { return false; }
-        return s[len - 3] == ':' && s[len - 2] == ' ' && s[len - 1] == '?';
+        for (mut i: i64 = 0; i + 2 < len; i++) {
+            if (s[i] == ':' && s[i + 1] == ' ' && s[i + 2] == '?') {
+                // Confirm it's the placeholder, not part of a larger token:
+                // the `?` must end the type, i.e. be the last byte or be
+                // followed by a space (` = <value>` initializer suffix).
+                const after: i64 = i + 3;
+                if (after >= len || s[after] == ' ') { return true; }
+            }
+        }
+        return false;
     }
 
     static json_u32_field(obj: &JsonValue, key: string) -> u32 {
