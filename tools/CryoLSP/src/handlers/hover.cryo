@@ -87,60 +87,77 @@ public function handle_hover(docs: &Docs, sessions: mut &SessionMap,
     const line:      u32 = HoverEngine::json_u32_field(pos, "line");
     const character: u32 = HoverEngine::json_u32_field(pos, "character");
 
-    // -- Keyword hover (token-level, AST-independent) -----------------
-    // Run before any session/AST work: keywords like `function`,
-    // `mut`, `i32` either don't map to an AST node at all or sit
-    // inside a larger node whose span covers them - neither case
-    // produces useful hover via the AST path.  Document text is
-    // enough; if the cursor lands on a known keyword, return its
-    // markdown blurb.  A miss falls through to the AST flow.
-    const doc_opt: Option<Document*> = docs.get(uri);
-    match (doc_opt) {
-        Option::Some(doc) => {
-            const kw_hover: Option<JsonValue> =
-                KeywordDocs::try_keyword_hover(doc, line, character);
-            match (kw_hover) {
-                Option::Some(json) => { return json; }
-                Option::None       => { }
-            }
-        }
-        Option::None => { }
-    }
-
-    // -- Find the session + module + AST for this URI ----------------
-    // `ensure_fresh` recompiles this document if another document's
-    // edit reset the shared AST arena since this session last compiled,
-    // so the ctx we walk below is never dangling (see Session.cryo).
-    const session: CompilerSession* = sessions.ensure_fresh(docs, uri);
-    if (session == null) { return JsonValue::Null; }
-    const ctx: CompilationContext* = session.context();
-    if (ctx == null) { return JsonValue::Null; }
-
-    // Strip `file://` to get the filesystem path the loader stored.
-    mut fs_path_owned: String = UriPath::uri_to_fs_path(uri);
-    const fs_path: Str = fs_path_owned.as_str();
-    mut path_buf: String = String::with_capacity(fs_path.length() + 1);
-    path_buf.push(fs_path);
-    path_buf.push_byte(0 as u8);
-    fs_path_owned.drop();
-    const path_buf_len: u64 = path_buf.length() - 1;
-    path_buf.truncate(path_buf_len);
-    const path_cstr: string = path_buf.as_ptr() as string;
-
-    const mod_idx: i64 = ctx.module_graph.find_module_by_path(path_cstr);
-    path_buf.drop();
-    if (mod_idx < 0) { return JsonValue::Null; }
-
-    const ast: ProgramNode* = ctx.module_graph.get_module_ast(mod_idx as u32);
-    if (ast == null) { return JsonValue::Null; }
-
-    // -- Walk to the innermost node ----------------------------------
-    // Compiler spans are 1-based; LSP positions are 0-based.
+    // -- Resolve the session + module + AST (best-effort) ------------
+    // We resolve the AST BEFORE deciding on the keyword-doc hover, so we
+    // can tell whether the cursor sits on an identifier / binding / path
+    // segment that merely happens to be SPELLED like a keyword - a param
+    // named `default`, an import segment `core::default`.  At those sites
+    // the token is used as an identifier and the AST hover is correct;
+    // the keyword doc would be wrong.  When no project / AST is available
+    // (single-file buffer, pre-compile), `node` stays null and the
+    // keyword-doc path runs exactly as it did before.
+    //
+    // `ensure_fresh` recompiles this document if another document's edit
+    // reset the shared AST arena since this session last compiled, so the
+    // ctx we walk below is never dangling (see Session.cryo).
     const cursor_line: u32 = line + 1 as u32;
     const cursor_char: u32 = character + 1 as u32;
-    const node: ASTNode* = NodeLocator::find_innermost_node_at(
-        ast, cursor_line, cursor_char);
+
+    mut ctx: CompilationContext* = null;
+    mut node: ASTNode* = null;
+    const session: CompilerSession* = sessions.ensure_fresh(docs, uri);
+    if (session != null) {
+        ctx = session.context();
+    }
+    if (ctx != null) {
+        // Strip `file://` to get the filesystem path the loader stored.
+        mut fs_path_owned: String = UriPath::uri_to_fs_path(uri);
+        const fs_path: Str = fs_path_owned.as_str();
+        mut path_buf: String = String::with_capacity(fs_path.length() + 1);
+        path_buf.push(fs_path);
+        path_buf.push_byte(0 as u8);
+        fs_path_owned.drop();
+        const path_buf_len: u64 = path_buf.length() - 1;
+        path_buf.truncate(path_buf_len);
+        const path_cstr: string = path_buf.as_ptr() as string;
+
+        const mod_idx: i64 = ctx.module_graph.find_module_by_path(path_cstr);
+        path_buf.drop();
+        if (mod_idx >= 0) {
+            const ast: ProgramNode* = ctx.module_graph.get_module_ast(mod_idx as u32);
+            if (ast != null) {
+                node = NodeLocator::find_innermost_node_at(ast, cursor_line, cursor_char);
+            }
+        }
+    }
+
+    // -- Keyword hover (token-level), gated by AST context -----------
+    // Skip it when the cursor is on an identifier / binding / path
+    // segment name: there the keyword-lexeme is an identifier, not a
+    // keyword (Cryo accepts `default`, `type`, ... as binding/path
+    // names).  Otherwise run it exactly as before - keywords like
+    // `function` / `mut` / `i32` don't sit on a name span, so they still
+    // resolve to their markdown blurb.
+    const on_name: boolean =
+        HoverEngine::cursor_on_name_position(node, cursor_line, cursor_char);
+    if (!on_name) {
+        const doc_opt: Option<Document*> = docs.get(uri);
+        match (doc_opt) {
+            Option::Some(doc) => {
+                const kw_hover: Option<JsonValue> =
+                    KeywordDocs::try_keyword_hover(doc, line, character);
+                match (kw_hover) {
+                    Option::Some(json) => { return json; }
+                    Option::None       => { }
+                }
+            }
+            Option::None => { }
+        }
+    }
+
+    // -- AST hover requires a resolved node + type arena -------------
     if (node == null) { return JsonValue::Null; }
+    if (ctx == null) { return JsonValue::Null; }
     if (ctx.type_arena == null) { return JsonValue::Null; }
 
     // Per-request engine: holds the compilation pointers so the
@@ -2638,6 +2655,45 @@ type struct HoverEngine {
             Option::None => { return 0 as u32; }
         }
         return 0 as u32;
+    }
+
+    /// True when the cursor lands on a position where a token is being used
+    /// AS an identifier - a declared name, an identifier use, or a namespace
+    /// path segment - rather than as a language keyword.  Cryo accepts several
+    /// keyword LEXEMES as identifiers in binding / path position (`default` as
+    /// a param name, `core::default` as an import segment), so a byte-level
+    /// keyword match at these sites is wrong; the caller uses this to suppress
+    /// the keyword-doc hover and let the AST path render the real symbol.
+    static cursor_on_name_position(node: ASTNode*, cline: u32, cchar: u32) -> boolean {
+        if (node == null) { return false; }
+        // Declared name (function / method / variable / parameter / field /
+        // struct / ... - name_span_of covers every declaration kind).
+        const nspan: SourceSpan = NodeLocator::name_span_of(node);
+        if (NodeLocator::span_contains(nspan, cline, cchar)) { return true; }
+        // Identifier use (`return default;`, `pred(value)`).
+        if (node.kind == NodeKind::Identifier) {
+            const id: IdentifierNode* = node as IdentifierNode*;
+            if (NodeLocator::span_contains(id.span, cline, cchar)) { return true; }
+        }
+        // `import A::B::C;` path segment.
+        if (node.kind == NodeKind::ImportDeclaration) {
+            const imp: ImportDeclNode* = node as ImportDeclNode*;
+            for (mut i: i64 = 0; i < imp.path_segment_spans.length; i++) {
+                if (NodeLocator::span_contains(imp.path_segment_spans[i], cline, cchar)) {
+                    return true;
+                }
+            }
+        }
+        // `namespace A::B;` / `public module A::B;` path segment.
+        if (node.kind == NodeKind::ModuleDeclaration) {
+            const md: ModuleDeclNode* = node as ModuleDeclNode*;
+            for (mut i: i64 = 0; i < md.path_segment_spans.length; i++) {
+                if (NodeLocator::span_contains(md.path_segment_spans[i], cline, cchar)) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     /// Convert a 1-based compiler `SourceSpan` to a 0-based LSP `Range`.
