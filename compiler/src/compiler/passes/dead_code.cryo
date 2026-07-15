@@ -21,14 +21,25 @@
 ///!     (`const { a, b } = pair;`) are exempt: they frequently exist to move a
 ///!     field out of an aggregate while deliberately discarding the rest.
 ///!
+///!   * W0002 (unused function/method) - a PRIVATE, module-local function or
+///!     method that no call site targets.  Method usage is read from each call
+///!     site's sema/mono-resolved `resolved_method` (operator overloads
+///!     included, via their `desugared_call`); free-function usage from the
+///!     resolution map.  Entry points (`main`, `![entry]`), tests, trait-impl
+///!     methods, constructors/destructors, virtual/override methods, generic
+///!     templates, mono specializations, and `![symbol(...)]` link-named
+///!     functions are never flagged.  STATIC methods are also skipped for now:
+///!     they are called as `Type::m()`, whose usage pins `resolved_callee` (a
+///!     name) not `resolved_method`, so the harvest can't see it - precise
+///!     static-call tracking is a follow-up.
+///!
 ///! Scope: only the module currently being compiled is linted, and standard-
 ///! library modules (`std::*`) are skipped entirely - a dependency's internals
 ///! are not the user's dead code (this mirrors how Rust only warns about your
-///! own crate).  Usage is read from the resolver's `ResolutionMap`, which
-///! records every resolved identifier reference by span.
+///! own crate).  Local/free-function usage is read from the resolver's
+///! `ResolutionMap`; method usage from resolved call targets.
 ///!
-///! Unused private functions/methods (W0002) and unused imports (W0003) are
-///! deliberately staged as follow-ups.
+///! Unused imports (W0003) are deliberately staged as a follow-up.
 ///!
 ///! Placement: after Monomorphization (so generic call sites are resolved) and
 ///! before DropInsertion (so unreachable detection sees the user's own
@@ -56,13 +67,22 @@ type struct DeadCodeChecker {
     /// Set of declaration-span keys (see `ResolutionMap::make_key`) that are
     /// referenced somewhere.  A binding counts as "used" when its declaring
     /// span key is in this set.  Built once from the resolution map by
-    /// `build_used`.
+    /// `build_used`.  Covers identifier references: local variables and
+    /// free-function callees.
     used: HashMap<u64, boolean>;
+
+    /// Set of method/function declaration-span keys that are the target of a
+    /// resolved call.  Populated by `harvest_module` from every call site's
+    /// `resolved_method` (set by sema/mono), which is the only reliable signal
+    /// for METHOD calls (`obj.foo()` is type-directed and not recorded in the
+    /// resolution map).  Also covers operator overloads via `desugared_call`.
+    method_used: HashMap<u64, boolean>;
 
     static new(ctx: CompilationContext*) -> DeadCodeChecker {
         return DeadCodeChecker {
-            ctx:  ctx,
-            used: HashMap<u64, boolean>::new(),
+            ctx:         ctx,
+            used:        HashMap<u64, boolean>::new(),
+            method_used: HashMap<u64, boolean>::new(),
         };
     }
 
@@ -307,6 +327,346 @@ type struct DeadCodeChecker {
         }
         return false;
     }
+
+    // -- Method-usage harvest (for W0002) --
+
+    /// Record a resolved call target (a method or specialized free function)
+    /// as used, keyed by its declaration span so it matches how the target
+    /// declaration is keyed in `report_module`.
+    mark_call_target(mut &this, node: ASTNode*) -> void {
+        if (node == null) { return; }
+        mut key: u64 = 0;
+        if (node.kind == NodeKind::MethodDeclaration) {
+            const mn: MethodNode* = node as MethodNode*;
+            if (mn.func == null) { return; }
+            key = ResolutionMap::make_key(mn.func.span);
+        } else if (node.kind == NodeKind::FunctionDeclaration) {
+            key = ResolutionMap::make_key((node as FunctionDeclNode*).span);
+        } else {
+            return;
+        }
+        this.method_used.insert(key, true);
+    }
+
+    /// Walk every function/method body harvesting call targets.  This is a
+    /// COMPLETE traversal (unlike the lint-1 walk it does not early-exit on
+    /// divergence): a method called only inside otherwise-unreachable code is
+    /// still conservatively counted as used, so the lint never fabricates an
+    /// "unused method" warning.
+    harvest_module(mut &this, root: ProgramNode*) -> void {
+        if (root == null) { return; }
+        for (mut i: i64 = 0; i < root.statements.length; i++) {
+            const stmt: ASTNode* = root.statements[i];
+            if (stmt == null) { continue; }
+            match (stmt.kind) {
+                NodeKind::FunctionDeclaration => { this.harvest_fn(stmt as FunctionDeclNode*); }
+                NodeKind::StructDeclaration   => { this.harvest_methods((stmt as StructDeclNode*).methods); }
+                NodeKind::UnionDeclaration    => { this.harvest_methods((stmt as UnionDeclNode*).methods); }
+                NodeKind::ClassDeclaration    => { this.harvest_methods((stmt as ClassDeclNode*).methods); }
+                NodeKind::ImplementationBlock => { this.harvest_methods((stmt as ImplBlockNode*).methods); }
+                NodeKind::TraitDeclaration => {
+                    const td: TraitDeclNode* = stmt as TraitDeclNode*;
+                    for (mut j: i64 = 0; j < td.methods.length; j++) { this.harvest_fn(td.methods[j]); }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    harvest_methods(mut &this, methods: &MethodNode*[]) -> void {
+        for (mut i: i64 = 0; i < methods.length; i++) {
+            const m: MethodNode* = methods[i];
+            if (m == null || m.func == null) { continue; }
+            this.harvest_fn(m.func);
+        }
+    }
+
+    harvest_fn(mut &this, func: FunctionDeclNode*) -> void {
+        if (func == null || func.body == null) { return; }
+        this.harvest_stmt(func.body as StatementNode*);
+    }
+
+    /// Fully recurse a statement, harvesting call targets from every
+    /// expression and every nested statement.
+    harvest_stmt(mut &this, stmt: StatementNode*) -> void {
+        if (stmt == null) { return; }
+        match (stmt.kind) {
+            NodeKind::BlockStatement => {
+                const b: BlockStmtNode* = stmt as BlockStmtNode*;
+                for (mut i: i64 = 0; i < b.statements.length; i++) { this.harvest_stmt(b.statements[i]); }
+            }
+            NodeKind::UnsafeBlockStatement => {
+                this.harvest_stmt((stmt as UnsafeBlockStmtNode*).block as StatementNode*);
+            }
+            NodeKind::ReturnStatement     => { this.walk_expr((stmt as ReturnStmtNode*).expression); }
+            NodeKind::ExpressionStatement => { this.walk_expr((stmt as ExprStmtNode*).expression); }
+            NodeKind::DeclarationStatement => {
+                const ds: DeclStmtNode* = stmt as DeclStmtNode*;
+                if (ds.declaration != null) { this.harvest_decl(ds.declaration); }
+            }
+            NodeKind::VariableDeclaration   => { this.harvest_decl(stmt as DeclarationNode*); }
+            NodeKind::DestructureDeclaration => { this.harvest_decl(stmt as DeclarationNode*); }
+            NodeKind::IfStatement => {
+                const it: IfStmtNode* = stmt as IfStmtNode*;
+                this.walk_expr(it.condition);
+                this.harvest_stmt(it.then_stmt);
+                this.harvest_stmt(it.else_stmt);
+            }
+            NodeKind::WhileStatement => {
+                const w: WhileStmtNode* = stmt as WhileStmtNode*;
+                this.walk_expr(w.condition);
+                this.harvest_stmt(w.body);
+            }
+            NodeKind::DoWhileStatement => {
+                const d: DoWhileStmtNode* = stmt as DoWhileStmtNode*;
+                this.harvest_stmt(d.body);
+                this.walk_expr(d.condition);
+            }
+            NodeKind::ForStatement => {
+                const f: ForStmtNode* = stmt as ForStmtNode*;
+                if (f.init != null) { this.harvest_stmt(f.init as StatementNode*); }
+                this.walk_expr(f.condition);
+                this.walk_expr(f.update);
+                this.harvest_stmt(f.body);
+            }
+            NodeKind::LoopStatement => {
+                this.harvest_stmt((stmt as LoopStmtNode*).body);
+            }
+            NodeKind::MatchStatement => {
+                const m: MatchStmtNode* = stmt as MatchStmtNode*;
+                this.walk_expr(m.subject);
+                for (mut i: i64 = 0; i < m.arms.length; i++) {
+                    const arm: MatchArmNode* = m.arms[i];
+                    if (arm == null) { continue; }
+                    this.walk_expr(arm.guard);
+                    this.harvest_stmt(arm.body);
+                }
+            }
+            NodeKind::StaticMatchStatement => {
+                const sm: StaticMatchStmtNode* = stmt as StaticMatchStmtNode*;
+                for (mut i: i64 = 0; i < sm.arms.length; i++) {
+                    const arm: StaticMatchArmNode* = sm.arms[i];
+                    if (arm != null) { this.harvest_stmt(arm.body); }
+                }
+            }
+            NodeKind::SwitchStatement => {
+                const sw: SwitchStmtNode* = stmt as SwitchStmtNode*;
+                this.walk_expr(sw.expression);
+                for (mut i: i64 = 0; i < sw.cases.length; i++) {
+                    const c: CaseStmtNode* = sw.cases[i];
+                    if (c != null && c.body != null) { this.harvest_stmt(c.body as StatementNode*); }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    harvest_decl(mut &this, decl: DeclarationNode*) -> void {
+        if (decl == null) { return; }
+        if (decl.kind == NodeKind::VariableDeclaration) {
+            this.walk_expr((decl as VarDeclNode*).initializer);
+        } else if (decl.kind == NodeKind::DestructureDeclaration) {
+            this.walk_expr((decl as DestructureDeclNode*).initializer);
+        }
+    }
+
+    /// Complete expression traversal: harvest a call target at every
+    /// `CallExprNode`, and recurse into every child expression - including the
+    /// `desugared_call` side-channels where operator overloads hang their
+    /// resolved method call.
+    walk_expr(mut &this, e: ExpressionNode*) -> void {
+        if (e == null) { return; }
+        match (e.kind) {
+            NodeKind::CallExpression => {
+                const c: CallExprNode* = e as CallExprNode*;
+                this.mark_call_target(c.resolved_method);
+                this.walk_expr(c.callee);
+                for (mut i: i64 = 0; i < c.arguments.length; i++) { this.walk_expr(c.arguments[i]); }
+            }
+            NodeKind::BinaryExpression => {
+                const b: BinaryExprNode* = e as BinaryExprNode*;
+                this.walk_expr(b.left);
+                this.walk_expr(b.right);
+                this.walk_expr(b.desugared_call);
+            }
+            NodeKind::UnaryExpression => {
+                const u: UnaryExprNode* = e as UnaryExprNode*;
+                this.walk_expr(u.operand);
+                this.walk_expr(u.desugared_call);
+            }
+            NodeKind::TernaryExpression => {
+                const t: TernaryExprNode* = e as TernaryExprNode*;
+                this.walk_expr(t.condition);
+                this.walk_expr(t.true_expr);
+                this.walk_expr(t.false_expr);
+            }
+            NodeKind::IfExpression => {
+                const ie: IfExprNode* = e as IfExprNode*;
+                this.walk_expr(ie.condition);
+                this.walk_expr(ie.then_expr);
+                this.walk_expr(ie.else_expr);
+            }
+            NodeKind::MatchExpression => {
+                const m: MatchExprNode* = e as MatchExprNode*;
+                this.walk_expr(m.subject);
+                for (mut i: i64 = 0; i < m.arms.length; i++) {
+                    const arm: MatchArmNode* = m.arms[i];
+                    if (arm == null) { continue; }
+                    this.walk_expr(arm.guard);
+                    this.harvest_stmt(arm.body);
+                }
+            }
+            NodeKind::StaticMatchExpression => {
+                const sm: StaticMatchExprNode* = e as StaticMatchExprNode*;
+                for (mut i: i64 = 0; i < sm.arms.length; i++) {
+                    const arm: StaticMatchArmNode* = sm.arms[i];
+                    if (arm != null) { this.harvest_stmt(arm.body); }
+                }
+            }
+            NodeKind::NewExpression => {
+                const n: NewExprNode* = e as NewExprNode*;
+                for (mut i: i64 = 0; i < n.arguments.length; i++) { this.walk_expr(n.arguments[i]); }
+                this.walk_expr(n.array_size);
+                if (n.struct_init != null) { this.walk_expr(n.struct_init as ExpressionNode*); }
+            }
+            NodeKind::CastExpression => {
+                this.walk_expr((e as CastExprNode*).expression);
+            }
+            NodeKind::StructLiteral => {
+                const sl: StructLiteralNode* = e as StructLiteralNode*;
+                for (mut i: i64 = 0; i < sl.field_inits.length; i++) { this.walk_expr(sl.field_inits[i].value); }
+            }
+            NodeKind::ArrayLiteral => {
+                const al: ArrayLiteralNode* = e as ArrayLiteralNode*;
+                for (mut i: i64 = 0; i < al.elements.length; i++) { this.walk_expr(al.elements[i]); }
+            }
+            NodeKind::TupleLiteral => {
+                const tl: TupleLiteralNode* = e as TupleLiteralNode*;
+                for (mut i: i64 = 0; i < tl.elements.length; i++) { this.walk_expr(tl.elements[i]); }
+            }
+            NodeKind::LambdaExpression => {
+                this.harvest_stmt((e as LambdaExprNode*).body);
+            }
+            NodeKind::ArrayAccess => {
+                const a: ArrayAccessNode* = e as ArrayAccessNode*;
+                this.walk_expr(a.array);
+                this.walk_expr(a.index);
+                this.walk_expr(a.desugared_call);
+            }
+            NodeKind::MemberAccess => {
+                this.walk_expr((e as MemberAccessNode*).object);
+            }
+            NodeKind::TypeofExpression => { this.walk_expr((e as TypeofExprNode*).operand); }
+            NodeKind::DeleteExpression => { this.walk_expr((e as DeleteExprNode*).operand); }
+            NodeKind::AwaitExpression  => { this.walk_expr((e as AwaitExprNode*).operand); }
+            NodeKind::YieldExpression  => { this.walk_expr((e as YieldExprNode*).operand); }
+            NodeKind::TryExpression => {
+                const tr: TryExprNode* = e as TryExprNode*;
+                this.walk_expr(tr.operand);
+                this.walk_expr(tr.desugared);
+            }
+            _ => {}
+        }
+    }
+
+    // -- Lint 3: unused private functions/methods (W0002) --
+
+    /// Emit W0002 for every private, module-local function/method that no call
+    /// site targets.  Scoped to private symbols so per-module analysis is
+    /// sound (a private symbol is only reachable within its own module).
+    report_module(mut &this, root: ProgramNode*) -> void {
+        if (root == null) { return; }
+        for (mut i: i64 = 0; i < root.statements.length; i++) {
+            const stmt: ASTNode* = root.statements[i];
+            if (stmt == null) { continue; }
+            match (stmt.kind) {
+                NodeKind::FunctionDeclaration => { this.report_function(stmt as FunctionDeclNode*); }
+                NodeKind::StructDeclaration   => { this.report_methods((stmt as StructDeclNode*).methods); }
+                NodeKind::UnionDeclaration    => { this.report_methods((stmt as UnionDeclNode*).methods); }
+                NodeKind::ClassDeclaration    => { this.report_methods((stmt as ClassDeclNode*).methods); }
+                NodeKind::ImplementationBlock => { this.report_methods((stmt as ImplBlockNode*).methods); }
+                _ => {}
+            }
+        }
+    }
+
+    report_methods(mut &this, methods: &MethodNode*[]) -> void {
+        for (mut i: i64 = 0; i < methods.length; i++) {
+            const m: MethodNode* = methods[i];
+            if (m == null || m.func == null) { continue; }
+            this.report_method(m);
+        }
+    }
+
+    /// True if this call target's declaration span is referenced anywhere.
+    is_target_used(&this, span: SourceSpan) -> boolean {
+        const key: u64 = ResolutionMap::make_key(span);
+        return this.method_used.contains_key(&key) || this.used.contains_key(&key);
+    }
+
+    report_function(mut &this, func: FunctionDeclNode*) -> void {
+        if (func == null || func.body == null) { return; }   // extern / no body
+        if (func.is_public) { return; }                       // only private
+        if (func.is_generic()) { return; }                    // template - skip (conservative)
+        if (func.is_specialization) { return; }               // mono-generated instance
+        if (this.is_directive_excluded(func)) { return; }
+        if (!func.span.has_location()) { return; }
+        if (this.is_target_used(func.span)) { return; }
+
+        const name: string = this.ctx.resolve_str(func.name);
+        if (name == "" || name == "main") { return; }
+
+        mut diag: Diagnostic = Diagnostic::warning(
+            ErrorCode::W0002_UNUSED_FUNCTION,
+            format("function `%s` is never used", name));
+        diag = diag.at(func.span);
+        this.ctx.emit_diagnostic(diag);
+    }
+
+    report_method(mut &this, m: MethodNode*) -> void {
+        const f: FunctionDeclNode* = m.func;
+        if (f == null || f.body == null) { return; }          // abstract / no body
+        // Only private methods.  A method's symbol visibility derives from
+        // `MethodNode.visibility` (see name_resolution), which defaults Public,
+        // so anything not explicitly private is conservatively left alone.
+        match (m.visibility) {
+            Visibility::Private => {}
+            _                   => { return; }
+        }
+        if (f.is_generic()) { return; }                       // template - skip
+        if (f.is_specialization) { return; }                  // mono-generated instance
+        // Static methods are called as `Type::m()` (scope-resolution), whose
+        // usage pins `resolved_callee` (a name), not `resolved_method` - our
+        // harvest can't see it, so flagging them would false-positive. Tracking
+        // static-call usage precisely is a follow-up; skip them for now.
+        if (m.is_static) { return; }
+        // Dispatch-only or implicitly-invoked methods are never called by name:
+        if (m.is_constructor || m.is_destructor || m.is_virtual || m.is_override) { return; }
+        if (f.origin_trait.is_valid()) { return; }            // trait-impl method
+        if (this.is_directive_excluded(f)) { return; }
+        if (!f.span.has_location()) { return; }
+        if (this.is_target_used(f.span)) { return; }
+
+        const name: string = this.ctx.resolve_str(f.name);
+        if (name == "") { return; }
+
+        mut diag: Diagnostic = Diagnostic::warning(
+            ErrorCode::W0002_UNUSED_FUNCTION,
+            format("method `%s` is never used", name));
+        diag = diag.at(f.span);
+        this.ctx.emit_diagnostic(diag);
+    }
+
+    /// Always-live directives/link-names: entry points, tests, and functions
+    /// whose linker symbol is pinned are never "unused".
+    is_directive_excluded(&this, func: FunctionDeclNode*) -> boolean {
+        if (func.has_link_name) { return true; }
+        if (func.has_directive("entry"))         { return true; }
+        if (func.has_directive("test"))          { return true; }
+        if (func.has_directive("ignore"))        { return true; }
+        if (func.has_directive("should_panic"))  { return true; }
+        return false;
+    }
 }
 
 
@@ -322,8 +682,10 @@ type struct DeadCodePass {
         }
 
         mut chk: DeadCodeChecker = DeadCodeChecker::new(ctx);
-        chk.build_used();
-        chk.check_module(root);
+        chk.build_used();          // resolution-map usage (locals, free-fn callees)
+        chk.harvest_module(root);  // call targets (methods, operator overloads)
+        chk.check_module(root);    // W0009 unreachable + W0001 unused locals
+        chk.report_module(root);   // W0002 unused private functions/methods
 
         // A lint never fails the build; warnings are counted separately by the
         // DiagnosticSink and do not raise the error count.
