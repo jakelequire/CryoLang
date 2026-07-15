@@ -502,7 +502,7 @@ extern "C" {
     function dup3(oldfd: i32, newfd: i32, flags: i32) -> i32;
     function pipe(fds: i32*) -> i32;
     function pipe2(fds: i32*, flags: i32) -> i32;
-    function isatty(fd: i32) -> i32;
+    // `isatty` is OS-dispatched (msvcrt spells it `_isatty`); see below.
     function ttyname(fd: i32) -> u8*;
     function ttyname_r(fd: i32, buf: u8*, buflen: u64) -> i32;
 
@@ -563,7 +563,7 @@ extern "C" {
                     newdirfd: i32, newpath: u8*, flags: i32) -> i32;
     function symlink(target: u8*, linkpath: u8*) -> i32;
     function symlinkat(target: u8*, newdirfd: i32, linkpath: u8*) -> i32;
-    function readlink(path: u8*, buf: u8*, bufsize: u64) -> i64;
+    // `readlink` is OS-dispatched (Windows has no symlink reader); see below.
     function readlinkat(dirfd: i32, path: u8*, buf: u8*, bufsize: u64) -> i64;
     function access(path: u8*, mode: i32) -> i32;
     function faccessat(dirfd: i32, path: u8*, mode: i32, flags: i32) -> i32;
@@ -693,6 +693,15 @@ extern "C" {
     function scanf(fmt: u8*, ...)                           -> i32;
     function fscanf(stream: void*, fmt: u8*, ...)           -> i32;
     function sscanf(s: u8*, fmt: u8*, ...)                  -> i32;
+
+    // va_list-taking variants. `va` must be the `args` identifier of an
+    // enclosing variadic function; Cryo lowers that bucket to the C
+    // `va_list` (a pointer) at the call boundary, so it is typed `void*`
+    // here. These back the printf-style `print`/`println` in `std::fmt`
+    // and any code that forwards a raw variadic list to libc.
+    function vprintf(fmt: u8*, va: void*)                       -> i32;
+    function vfprintf(stream: void*, fmt: u8*, va: void*)       -> i32;
+    function vsnprintf(buf: u8*, size: u64, fmt: u8*, va: void*) -> i32;
 }
 
 // In-memory output stream: `open_memstream(char **bufp, size_t *sizep)`.
@@ -713,15 +722,15 @@ const EXIT_SUCCESS: i32 = 0;
 const EXIT_FAILURE: i32 = 1;
 
 extern "C" {
-    // Memory: `core::intrinsics::malloc` shadows these for
-    // allocator implementations; raw externs are here for code that
-    // wants the C symbols directly.
+    // Memory. These are the stdlib's allocation primitives; the alloc
+    // layer (`std::alloc`) calls them directly. Over-aligned allocation
+    // (`aligned_alloc` / `aligned_free`) is OS-dispatched below, since
+    // msvcrt has no C11 `aligned_alloc`.
     function malloc(size: u64)                                -> u8*;
     function calloc(nmemb: u64, size: u64)                    -> u8*;
     function realloc(ptr: u8*, size: u64)                     -> u8*;
     function reallocarray(ptr: u8*, nmemb: u64, size: u64)    -> u8*;
     function free(ptr: u8*)                                   -> void;
-    function aligned_alloc(alignment: u64, size: u64)         -> u8*;
     function posix_memalign(memptr: u8**, alignment: u64, size: u64) -> i32;
     function valloc(size: u64)                                -> u8*;
     function pvalloc(size: u64)                               -> u8*;
@@ -802,6 +811,89 @@ extern "C" {
     function wcstombs(dest: u8*, src: u32*, n: u64) -> u64;
 
     function realpath(path: u8*, resolved: u8*) -> u8*;
+}
+
+// Over-aligned allocation, OS-dispatched.
+//
+// POSIX C11 `aligned_alloc(align, size)` exists on glibc/musl but NOT on
+// mingw-w64's msvcrt. Its memory may be released with plain `free()` (C11
+// guarantee), so on UNIX `aligned_free` collapses to `free`.
+//
+// On Windows we route over-aligned requests (alignment > 16) to
+// `_aligned_malloc`, since mingw-w64's `malloc` only guarantees 16-byte
+// alignment on x64. `_aligned_malloc` memory MUST be released with
+// `_aligned_free`, so `aligned_free` selects the matching deallocator from
+// the recorded alignment. Requests at alignment <= 16 use plain
+// `malloc`/`free` on both platforms (the common fast path).
+![target(unix)]
+extern "C" {
+    function aligned_alloc(alignment: u64, size: u64) -> u8*;
+}
+
+![target(unix)]
+function aligned_free(ptr: u8*, alignment: u64) -> void {
+    free(ptr);
+}
+
+// msvcrt's over-aligned allocator. Note the arg order is the reverse of C11
+// `aligned_alloc`, and its memory MUST be freed with `_aligned_free`.
+![target(windows)]
+extern "C" {
+    function _aligned_malloc(size: u64, alignment: u64) -> u8*;
+    function _aligned_free(memblock: u8*) -> void;
+}
+
+![target(windows)]
+function aligned_alloc(alignment: u64, size: u64) -> u8* {
+    if (alignment > 16u64) {
+        return _aligned_malloc(size, alignment);
+    }
+    return malloc(size);
+}
+
+![target(windows)]
+function aligned_free(ptr: u8*, alignment: u64) -> void {
+    if (alignment > 16u64) {
+        _aligned_free(ptr);
+        return;
+    }
+    free(ptr);
+}
+
+// TTY detection and symlink reading, OS-dispatched.
+//
+// POSIX `isatty(fd)` is spelled `_isatty(fd)` on msvcrt. `readlink` has no
+// msvcrt equivalent; the only path Cryo passes through it is
+// "/proc/self/exe" (compiler / test-runner self-discovery), so the Windows
+// shim satisfies that single case via `GetModuleFileNameA` (kernel32) and
+// returns -1 for any other path.
+![target(unix)]
+extern "C" {
+    function isatty(fd: i32) -> i32;
+    function readlink(path: u8*, buf: u8*, bufsize: u64) -> i64;
+}
+
+// msvcrt / kernel32 aliases. `GetModuleFileNameA` is also called directly by
+// the test runner's Windows exe-path discovery.
+![target(windows)]
+extern "C" {
+    function _isatty(fd: i32) -> i32;
+    function GetModuleFileNameA(hModule: void*, lpFilename: u8*, nSize: u32) -> u32;
+}
+
+![target(windows)]
+function isatty(fd: i32) -> i32 {
+    return _isatty(fd);
+}
+
+![target(windows)]
+function readlink(path: u8*, buf: u8*, bufsize: u64) -> i64 {
+    if (strcmp(path, "/proc/self/exe") != 0) {
+        return -1i64;
+    }
+    const n: u32 = GetModuleFileNameA(null, buf, bufsize as u32);
+    if (n == 0u32) { return -1i64; }
+    return n as i64;
 }
 
 // Windows-only msvcrt env helper.  mingw doesn't ship POSIX
