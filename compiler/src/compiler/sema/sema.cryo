@@ -743,8 +743,30 @@ public:
                 "`static match` outside a generic context is not supported yet (its type could not be resolved to a single arm)",
                 node.span);
         }
-        const arm: StaticMatchArmNode* = node.arms[0];
-        if (arm != null && arm.body != null) { this.dispatch_stmt(arm.body); }
+        // First arm: the representative diagnostic walk, narrowed to its concrete
+        // type when the scrutinee is a generic param (symbolic-only, eligible).
+        const arm0: StaticMatchArmNode* = node.arms[0];
+        if (arm0 != null && arm0.body != null) {
+            const s0: i64 = this.narrow_static_match_arm(node.scrutinee, arm0);
+            this.dispatch_stmt(arm0.body);
+            this.scopes.restore_scope(s0);
+        }
+        // Remaining arms (symbolic only): stamp their bodies - narrowed to each
+        // arm's concrete type - for correct monomorphization and hover, with
+        // diagnostics suppressed so arms this instantiation may never select
+        // don't report concrete-check errors.
+        if (this.state.in_symbolic_check && node.arms.length > 1) {
+            const sink: DiagnosticSink* = this.ctx.diagnostics;
+            for (mut ai: i64 = 1; ai < node.arms.length; ai++) {
+                const arm: StaticMatchArmNode* = node.arms[ai];
+                if (arm == null || arm.body == null) { continue; }
+                const sv: i64 = this.narrow_static_match_arm(node.scrutinee, arm);
+                if (sink != null) { sink.begin_suppress(); }
+                this.dispatch_stmt(arm.body);
+                if (sink != null) { sink.end_suppress(); }
+                this.scopes.restore_scope(sv);
+            }
+        }
     }
 
     override visit(mut &this, node: SwitchStmtNode*) -> void {
@@ -1805,9 +1827,20 @@ public:
         // A concrete (already-pruned) static match has exactly one arm, so the
         // non-symbolic path checks only `arms[0]` exactly as before.
         const n_arms: i64 = if (this.state.in_symbolic_check) { sm.arms.length } else { 1 };
+        const sink: DiagnosticSink* = this.ctx.diagnostics;
         for (mut ai: i64 = 0; ai < n_arms; ai++) {
             const arm: StaticMatchArmNode* = sm.arms[ai];
             if (arm == null || arm.body == null) { continue; }
+            // Narrow this arm to its concrete type (symbolic-only, eligible arms)
+            // so `item`/method calls resolve concretely and hover sees the real
+            // type.  Arms after the first are still walked (stamping their bodies
+            // for correct monomorphization) but with diagnostics suppressed - the
+            // first arm is the representative one for reporting, and the concrete
+            // re-check of later arms would otherwise surface errors for arms this
+            // instantiation may never select.
+            const nsave: i64 = this.narrow_static_match_arm(sm.scrutinee, arm);
+            const suppress: boolean = ai > 0 && sink != null;
+            if (suppress) { sink.begin_suppress(); }
             mut arm_result: TypeRef = TypeRef::invalid();
             if ((arm.body as ASTNode*).kind == NodeKind::BlockStatement) {
                 const block: BlockStmtNode* = arm.body as BlockStmtNode*;
@@ -1827,12 +1860,65 @@ public:
             } else {
                 this.dispatch_stmt(arm.body);
             }
+            if (suppress) { sink.end_suppress(); }
+            this.scopes.restore_scope(nsave);
             // The static match's type is the first arm's (all arms must agree).
             if (ai == 0) { result_type = arm_result; }
         }
         this.state.expected_type = outer_expected;
         if (outer_expected.is_valid()) { return outer_expected; }
         return result_type;
+    }
+
+    /// During the symbolic generic-body check, narrow a `static match (T)` arm to
+    /// its concrete type for the duration of that arm's body walk.  When the
+    /// scrutinee is a bare generic param (`T`) and the arm lists exactly one
+    /// concrete type pattern (`String => ...`), every in-scope local typed
+    /// exactly `T` is rebound to that concrete type, so member/method resolution
+    /// - and hover - sees the real type instead of an abstract param.  The
+    /// rebinding is logged on the scope undo log; the caller restores the
+    /// returned checkpoint after the body.  A no-op returning the checkpoint
+    /// unchanged when not eligible (non-symbolic walk, multi-type / wildcard arm,
+    /// non-generic scrutinee, or a still-generic arm pattern).
+    narrow_static_match_arm(mut &this, scrutinee: TypeAnnotation*,
+                            arm: StaticMatchArmNode*) -> i64 {
+        const save: i64 = this.scopes.save_scope();
+        if (!this.state.in_symbolic_check) { return save; }
+        if (scrutinee == null || arm == null) { return save; }
+        if (arm.type_patterns.length != 1) { return save; }
+        if (this.ctx.type_resolver == null || this.arena == null) { return save; }
+
+        mut rc: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
+        this.symbolic.symbolic_bind_params(&rc);
+        const scrut_ref: TypeRef = this.ctx.type_resolver.resolve(scrutinee, &rc);
+        if (!scrut_ref.is_valid()) { return save; }
+        const st: Type* = this.arena.lookup(scrut_ref.id);
+        if (st == null) { return save; }
+        if (st.kind != TypeKind::GenericParam && st.kind != TypeKind::BoundedParam) { return save; }
+
+        const arm_ref: TypeRef = this.ctx.type_resolver.resolve(arm.type_patterns[0], &rc);
+        if (!arm_ref.is_valid() || this.arena.contains_generic_param(arm_ref)) { return save; }
+
+        // Collect locals typed exactly as the scrutinee param first, then rebind:
+        // register_local_with_mut mutates `state.locals`, so it must not run while
+        // the entry iterator is live.
+        mut keys: u32[] = [];
+        mut it: HashMapIter<u32, TypeRef> = this.state.locals.iter();
+        loop {
+            match (it.next()) {
+                Option::Some(pair) => {
+                    if (pair.second.id == scrut_ref.id) { keys.push(pair.first); }
+                }
+                Option::None => { break; }
+            }
+        }
+        for (mut i: i64 = 0; i < keys.length; i++) {
+            const nm: SymbolStr = SymbolStr::from_id(keys[i]);
+            const is_mut: boolean = this.scopes.local_is_mutable(nm);
+            this.scopes.register_local_with_mut(nm, arm_ref, is_mut);
+        }
+        keys.drop();
+        return save;
     }
 
     enum_try_shape(&this, ty: TypeRef) -> i32 {
