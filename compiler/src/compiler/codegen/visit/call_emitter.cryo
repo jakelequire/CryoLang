@@ -81,59 +81,6 @@ type struct CallEmitter {
         return bb.get_parent();
     }
 
-    /// Determine whether an AST call callee resolves to a known
-    /// divergent (non-returning) function.  Drives the post-call
-    /// `unreachable` emission without relying on string-comparing the
-    /// emitted LLVM symbol name to a hard-coded mangle.
-    ///
-    /// Recognized:
-    ///   - bare `panic` (the intrinsic / legacy stdlib path)
-    ///   - any function `panic` whose containing namespace ends in
-    ///     `::core::panic` or `::prelude` (matches the new stdlib's
-    ///     `std::core::panic::panic` and the legacy `std::prelude::panic`)
-    ///
-    /// When the language gains `-> never` return-type syntax this is
-    /// the path that should subsume the special cases.
-    is_divergent_callee(&this, callee: ExpressionNode*) -> boolean {
-        if (callee == null) { return false; }
-        const intern: InternTable* = this.cg.get_intern();
-
-        if (callee.kind == NodeKind::Identifier) {
-            const id: IdentifierNode* = callee as IdentifierNode*;
-            const name_str: string = intern.resolve(id.name);
-            if (name_str.eq("panic")) { return true; }
-            return false;
-        }
-
-        if (callee.kind == NodeKind::ScopeResolution) {
-            const sr: ScopeResolutionNode* = callee as ScopeResolutionNode*;
-            const member_str: string = intern.resolve(sr.member_name);
-            if (!member_str.eq("panic")) { return false; }
-
-            const scope_str: string = intern.resolve(sr.scope_name);
-            const slen: i64 = scope_str.length() as i64;
-            // Match `<...>::core::panic`.
-            if (slen >= 11) {
-                const tail11: string = (scope_str + (slen - 11)) as string;
-                if (tail11 == "core::panic") { return true; }
-            }
-            // Match `<...>::prelude` and the bare `prelude` form.
-            if (slen >= 7) {
-                const tail7: string = (scope_str + (slen - 7)) as string;
-                if (tail7.eq("prelude")) { return true; }
-            }
-            // Match `intrinsics` / `core::intrinsics` (the stdlib's
-            // panic emerges through this layer too).
-            if (slen >= 10) {
-                const tail10: string = (scope_str + (slen - 10)) as string;
-                if (tail10.eq("intrinsics")) { return true; }
-            }
-            if (scope_str.eq("intrinsics")) { return true; }
-            return false;
-        }
-
-        return false;
-    }
 
     /// Produce the ADDRESS of a value for auto-ref (a by-value argument
     /// passed to a `&T` parameter).  When `v` is a `load` instruction we
@@ -1223,25 +1170,18 @@ type struct CallEmitter {
             }
         }
 
-        // Emit `unreachable` after calls to divergent functions.  Two
-        // cases handled here:
-        //   1. The callee's resolved return type is `never`.
-        //   2. The callee resolves to a known divergent function from
-        //      the stdlib (`panic` intrinsic; `core::panic::panic` and the
-        //      legacy `prelude::panic` wrapper).  These are declared
-        //      `-> void` in source even though they semantically diverge.
-        // Without this, calls in a non-void-returning context (e.g. the
-        // `None` arm of `Option<T>::unwrap`) leave the block without a
-        // terminator and the body-validator strips the entire function.
+        // Emit `unreachable` after a call to a divergent function - one
+        // whose resolved return type is `never` (e.g. `core::panic` /
+        // `intrinsics::panic`). Without this, a divergent call in a
+        // non-void-returning context (e.g. the `None` arm of
+        // `Option<T>::unwrap`) leaves the block without a terminator and
+        // the body-validator strips the entire function.
         mut should_unreachable: boolean = false;
         if (node.resolved_type.is_valid()) {
             const _ret_t: Type* = this.cg.lookup_type_by_id(node.resolved_type.id);
             if (_ret_t != null && _ret_t.kind == TypeKind::Never) {
                 should_unreachable = true;
             }
-        }
-        if (!should_unreachable && this.is_divergent_callee(node.callee)) {
-            should_unreachable = true;
         }
         if (should_unreachable) {
             this.cg.builder.build_unreachable();
