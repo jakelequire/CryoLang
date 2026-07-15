@@ -337,6 +337,79 @@ public function find_trait_method_in_modules(graph: ModuleGraph*,
 }
 
 
+/// Collect a jump span for every impl block in the module graph that
+/// targets a type named `type_name` - both inherent (`implement Foo`)
+/// and trait (`implement trait T for Foo`) blocks.  Powers the LSP's
+/// "N implementations" code lens above struct / class / enum / union
+/// declarations.  Each span points at the impl head's target-type
+/// lexeme when the parser stamped one (`target_type_span`), else the
+/// impl block's own span - a usable peek/jump target either way.
+///
+/// `type_name` may be bare (as `ImplBlockNode.target_type` is parsed)
+/// or qualified; the leaf segment is pre-extracted so both shapes match
+/// (see `type_name_matches`).  Returns an empty array when the graph is
+/// null or nothing targets the type.
+public function find_impls_of_type(graph: ModuleGraph*,
+                                    intern: InternTable*,
+                                    type_name: SymbolStr) -> SourceSpan[] {
+    mut spans: SourceSpan[] = [];
+    if (graph == null) { return spans; }
+    const type_leaf: string = if (intern != null) {
+        NodeLocator::leaf_segment_str(intern.resolve(type_name))
+    } else { "" };
+    const n: u32 = graph.module_count();
+    for (mut mi: u32 = 0; mi < n; mi++) {
+        const ast: ProgramNode* = graph.get_module_ast(mi);
+        if (ast == null) { continue; }
+        for (mut si: i64 = 0; si < ast.statements.length; si++) {
+            const stmt: ASTNode* = NodeLocator::unwrap_decl_stmt(ast.statements[si]);
+            if (stmt == null) { continue; }
+            if (stmt.kind != NodeKind::ImplementationBlock) { continue; }
+            const impl_blk: ImplBlockNode* = stmt as ImplBlockNode*;
+            if (!NodeLocator::type_name_matches(intern, impl_blk.target_type,
+                                                type_name, type_leaf)) { continue; }
+            spans.push(NodeLocator::impl_jump_span(impl_blk));
+        }
+    }
+    return spans;
+}
+
+
+/// Collect a jump span for every impl block that implements a trait
+/// named `trait_name` (`implement trait <trait_name> for X`).  Powers
+/// the "N implementations" lens above trait declarations.  Inherent
+/// impls (no `trait_annotation`) are skipped.  Span selection and name
+/// matching mirror `find_impls_of_type`.
+public function find_impls_of_trait(graph: ModuleGraph*,
+                                     intern: InternTable*,
+                                     trait_name: SymbolStr) -> SourceSpan[] {
+    mut spans: SourceSpan[] = [];
+    if (graph == null) { return spans; }
+    const trait_leaf: string = if (intern != null) {
+        NodeLocator::leaf_segment_str(intern.resolve(trait_name))
+    } else { "" };
+    const n: u32 = graph.module_count();
+    for (mut mi: u32 = 0; mi < n; mi++) {
+        const ast: ProgramNode* = graph.get_module_ast(mi);
+        if (ast == null) { continue; }
+        for (mut si: i64 = 0; si < ast.statements.length; si++) {
+            const stmt: ASTNode* = NodeLocator::unwrap_decl_stmt(ast.statements[si]);
+            if (stmt == null) { continue; }
+            if (stmt.kind != NodeKind::ImplementationBlock) { continue; }
+            const impl_blk: ImplBlockNode* = stmt as ImplBlockNode*;
+            if (impl_blk.trait_annotation == null) { continue; }
+            const impl_trait: SymbolStr =
+                NodeLocator::annotation_head_name(impl_blk.trait_annotation);
+            if (!impl_trait.is_valid()) { continue; }
+            if (!NodeLocator::type_name_matches(intern, impl_trait,
+                                                trait_name, trait_leaf)) { continue; }
+            spans.push(NodeLocator::impl_jump_span(impl_blk));
+        }
+    }
+    return spans;
+}
+
+
 /// Reverse-walk the module graph to find the function whose body span
 /// contains `(line, character)` in `file_path`.  Returns the inner
 /// `FunctionDeclNode*` (for method bodies, the wrapping MethodNode's
@@ -1048,6 +1121,35 @@ type struct NodeLocator {
         if (intern == null || type_leaf.length() == 0) { return false; }
         const dn: string = intern.resolve(decl_name);
         return dn.eq(type_leaf);
+    }
+
+    /// The peek / jump span for an impl block: the target-type lexeme in
+    /// the impl head when the parser stamped one, else the block's own
+    /// span.  Used by `find_impls_of_type` / `find_impls_of_trait` to
+    /// give the LSP a concrete location for each implementation.
+    static impl_jump_span(impl_blk: ImplBlockNode*) -> SourceSpan {
+        if (impl_blk == null) { return SourceSpan::none(); }
+        if (impl_blk.target_type_span.has_location()) {
+            return impl_blk.target_type_span;
+        }
+        return (impl_blk as ASTNode*).span;
+    }
+
+    /// Head (leaf) name of a type annotation, peeling Generic / Reference
+    /// / Pointer wrappers down to the underlying Named segment - e.g.
+    /// `&Iterator<T>` -> `Iterator`.  Mirrors the TypeResolution pass's
+    /// `extract_trait_leaf`, kept here so the AST layer doesn't depend on
+    /// the passes layer.  Returns `SymbolStr::empty()` for annotation
+    /// shapes with no head name.
+    static annotation_head_name(ann: TypeAnnotation*) -> SymbolStr {
+        if (ann == null) { return SymbolStr::empty(); }
+        return match (*ann) {
+            TypeAnnotation::Named(n)     => { n.name }
+            TypeAnnotation::Generic(g)   => { NodeLocator::annotation_head_name(g.base) }
+            TypeAnnotation::Reference(r) => { NodeLocator::annotation_head_name(r.inner) }
+            TypeAnnotation::Pointer(p)   => { NodeLocator::annotation_head_name(p.inner) }
+            _                            => { SymbolStr::empty() }
+        };
     }
 
     /// `ProgramNode.statements` mixes raw decl nodes and `DeclStmtNode`
