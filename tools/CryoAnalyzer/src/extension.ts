@@ -22,11 +22,20 @@ let outputChannel: vscode.OutputChannel;
 // Hover verbosity: when true, struct/class type hovers additionally list the
 // type's method signatures.  VS Code's native Hover Verbosity API is still a
 // proposed API (unavailable to a normally-installed extension), so we emulate
-// it: the hover middleware appends a "Show/Hide methods" toggle to type
-// hovers, and the `cryo.toggleHoverMethods` command flips this flag and
-// re-shows the hover.  The flag is global (a "verbosity level"), matching how
-// the native feature persists across hovers.
+// it with a keybinding.  The trick that makes "mouse-hover a struct, press the
+// key, expand in place" work is `lastHoverPosition`: the hover middleware runs
+// on EVERY hover (including mouse hovers), so we record what the pointer is
+// over; the `cryo.toggleHoverMethods` command then moves the caret there and
+// re-shows the hover (VS Code can only re-show a hover at the caret, not at the
+// mouse).  The flag is global (a "verbosity level"), matching how the native
+// feature persists across hovers.
 let hoverMethodsExpanded = false;
+let lastHoverPosition: { uri: string; line: number; character: number } | undefined;
+
+// The keybinding bound to `cryo.toggleHoverMethods` in package.json; surfaced
+// in the hover hint so the affordance is discoverable.  Keep in sync with the
+// package.json contribution.
+const TOGGLE_HINT_KEY = 'Shift+Alt+M';
 
 /** True when a hover's markdown looks like a struct/class type declaration -
  *  i.e. the only kind the "expand methods" toggle is meaningful for. */
@@ -38,29 +47,19 @@ function isTypeHover(hover: vscode.Hover | null | undefined): boolean {
     });
 }
 
-/** Append the expand/collapse affordance to a type hover.  The link runs the
- *  toggle command, carrying the hovered position so it can re-show the hover
- *  at the right token.  Non-type hovers are returned untouched. */
-function appendMethodsToggle(
+/** Append a discoverability hint to a type hover telling the user which key
+ *  toggles the method listing.  Not a clickable link - the keybinding is the
+ *  intended trigger.  Non-type hovers are returned untouched. */
+function appendMethodsHint(
     hover: vscode.Hover | null | undefined,
-    document: vscode.TextDocument,
-    position: vscode.Position,
     expanded: boolean
 ): vscode.Hover | null | undefined {
     if (!isTypeHover(hover)) { return hover; }
-    const arg = encodeURIComponent(
-        JSON.stringify({
-            uri: document.uri.toString(),
-            line: position.line,
-            character: position.character,
-        })
-    );
     const md = new vscode.MarkdownString(
         expanded
-            ? `$(chevron-down) [Hide methods](command:cryo.toggleHoverMethods?${arg})`
-            : `$(chevron-right) [Show methods](command:cryo.toggleHoverMethods?${arg})`
+            ? `$(chevron-down) _${TOGGLE_HINT_KEY} to hide methods_`
+            : `$(chevron-right) _${TOGGLE_HINT_KEY} to show methods_`
     );
-    md.isTrusted = true;
     md.supportThemeIcons = true;
     hover!.contents.push(md);
     return hover;
@@ -178,9 +177,16 @@ async function startClient(context: vscode.ExtensionContext): Promise<void> {
             // ask the server for the method-listing variant via the custom
             // `cryo/expandHover` request.
             provideHover: async (document, position, token, next) => {
+                // Record what the pointer is over so the toggle keybinding can
+                // re-show *this* hover (the caret is usually elsewhere).
+                lastHoverPosition = {
+                    uri: document.uri.toString(),
+                    line: position.line,
+                    character: position.character,
+                };
                 if (!hoverMethodsExpanded) {
                     const base = await next(document, position, token);
-                    return appendMethodsToggle(base, document, position, false);
+                    return appendMethodsHint(base, false);
                 }
                 // Expanded mode: request the verbose hover from the server.
                 try {
@@ -204,12 +210,12 @@ async function startClient(context: vscode.ExtensionContext): Promise<void> {
                     const hover = await client!.protocol2CodeConverter.asHover(
                         resp
                     );
-                    return appendMethodsToggle(hover, document, position, true);
+                    return appendMethodsHint(hover, true);
                 } catch {
                     // Older server without `cryo/expandHover`, or a transient
                     // error - degrade gracefully to the standard hover.
                     const base = await next(document, position, token);
-                    return appendMethodsToggle(base, document, position, false);
+                    return appendMethodsHint(base, false);
                 }
             },
         },
@@ -264,35 +270,35 @@ async function startClient(context: vscode.ExtensionContext): Promise<void> {
         }
     });
 
-    // Hover-verbosity toggle: flip the expand flag and re-show the hover.
-    // Invoked from the "Show/Hide methods" link in a type hover (with the
-    // hovered position as its argument) or from a keybinding (no argument,
-    // uses the current cursor position).
+    // Hover-verbosity toggle: flip the expand flag and re-show the hover the
+    // user is pointing at.  `editor.action.showHover` renders at the caret, not
+    // the mouse, so we move the caret onto the last-hovered token first (the
+    // middleware recorded it in `lastHoverPosition`).  The editor keeps
+    // keyboard focus during a mouse hover, so pressing the key while hovering
+    // fires this command.
     context.subscriptions.push(
-        vscode.commands.registerCommand(
-            'cryo.toggleHoverMethods',
-            async (arg?: { uri: string; line: number; character: number }) => {
-                hoverMethodsExpanded = !hoverMethodsExpanded;
-                // `editor.action.showHover` renders at the cursor, not the
-                // mouse, so move the selection onto the hovered token first
-                // when the link handed us its position.
-                if (arg && typeof arg.line === 'number') {
-                    const editor = vscode.window.visibleTextEditors.find(
-                        (e) => e.document.uri.toString() === arg.uri
+        vscode.commands.registerCommand('cryo.toggleHoverMethods', async () => {
+            hoverMethodsExpanded = !hoverMethodsExpanded;
+            const target = lastHoverPosition;
+            if (target) {
+                const editor =
+                    vscode.window.activeTextEditor &&
+                    vscode.window.activeTextEditor.document.uri.toString() ===
+                        target.uri
+                        ? vscode.window.activeTextEditor
+                        : vscode.window.visibleTextEditors.find(
+                              (e) => e.document.uri.toString() === target.uri
+                          );
+                if (editor) {
+                    const pos = new vscode.Position(
+                        target.line,
+                        target.character
                     );
-                    if (editor) {
-                        const pos = new vscode.Position(arg.line, arg.character);
-                        editor.selection = new vscode.Selection(pos, pos);
-                        await vscode.window.showTextDocument(editor.document, {
-                            viewColumn: editor.viewColumn,
-                            preserveFocus: false,
-                            preview: false,
-                        });
-                    }
+                    editor.selection = new vscode.Selection(pos, pos);
                 }
-                await vscode.commands.executeCommand('editor.action.showHover');
             }
-        )
+            await vscode.commands.executeCommand('editor.action.showHover');
+        })
     );
 
     try {

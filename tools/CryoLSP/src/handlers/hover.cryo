@@ -649,6 +649,27 @@ public function handle_hover_ex(docs: &Docs, sessions: mut &SessionMap,
                 doc_text   = (decl as DeclarationNode*).documentation;
             }
         }
+    } else if (node.kind == NodeKind::StaticMatchExpression
+            || node.kind == NodeKind::StaticMatchStatement) {
+        // `static match (T) { String => ... u8 | u16 => ... }`.  Arm type
+        // patterns (and the scrutinee) are `TypeAnnotation`s, not ASTNodes, so
+        // the locator can't return one and stops at the static-match node.
+        // Scan the scrutinee + every arm's type patterns for the annotation
+        // under the cursor and render its type decl - so a NAMED pattern
+        // (`String`, `Str`, a user type) hovers like any other type name.
+        // Primitive patterns (`u8`, `boolean`) were already handled by the
+        // keyword-doc path before the AST walk, so they don't reach here.
+        const named: NamedAnnotation* = eng.static_match_annotation_at(
+            node, cursor_line, cursor_char);
+        if (named != null) {
+            const decl: ASTNode* = NodeLocator::find_type_decl_in_modules(
+                ctx.module_graph, ctx.intern_table, named.name);
+            if (decl != null) {
+                content    = eng.format_type_decl(decl);
+                hover_span = named.span;
+                doc_text   = (decl as DeclarationNode*).documentation;
+            }
+        }
     } else if (node.kind == NodeKind::Pattern) {
         const pat: PatternNode* = node as PatternNode*;
         if (pat.pattern_kind == PatternKind::Enum) {
@@ -1191,7 +1212,7 @@ type struct HoverEngine {
                 mut sig: string = "type struct " + this.arena.intern_table.resolve(d.name)
                     + this.format_generic_params(d.generic_params);
                 const methods_str: string = if (this.verbose) {
-                    this.format_type_methods(d.name)
+                    this.format_type_methods(d.name, d.methods)
                 } else { "" };
                 if (d.fields.length > 0 || methods_str != "") {
                     sig = sig + " {\n";
@@ -1213,7 +1234,7 @@ type struct HoverEngine {
                         + HoverEngine::leaf_after_separator(this.arena.intern_table.resolve(d.base_class));
                 }
                 const methods_str: string = if (this.verbose) {
-                    this.format_type_methods(d.name)
+                    this.format_type_methods(d.name, d.methods)
                 } else { "" };
                 if (d.fields.length > 0 || methods_str != "") {
                     sig = sig + " {\n";
@@ -1282,18 +1303,33 @@ type struct HoverEngine {
         };
     }
 
-    /// List every method declared for the type named `type_name`, one
-    /// indented signature per line, for the expanded (verbose) type hover.
-    /// Walks all impl blocks in the module graph whose target type matches:
-    ///   * inherent impls (`implement Foo { ... }`) render the plain
-    ///     signature - `resize_buckets(this: mut &This, n: u64) -> void`.
-    ///   * trait impls (`implement trait Iterator for Foo`) prefix the
-    ///     signature with `trait <Trait>::` - `trait Iterator::next(...) -> ...`.
+    /// Render the type's INLINE methods (declared directly in the struct /
+    /// class body, e.g. `String`'s `push_byte` / `length` / `as_str`) as plain
+    /// indented signatures for the expanded hover.  These live on the decl's
+    /// own `methods` array, NOT in a separate impl block, so `format_type_methods`
+    /// (which walks impl blocks) never sees them.  Always inherent → no prefix.
+    format_inline_methods(&this, methods: &MethodNode*[]) -> string {
+        mut out: string = "";
+        for (mut i: i64 = 0; i < methods.length; i++) {
+            const m: MethodNode* = methods[i];
+            if (m == null || m.func == null) { continue; }
+            out = out + "    " + this.format_method_signature(m, "") + "\n";
+        }
+        return out;
+    }
+
+    /// List the type's impl-block methods for the expanded hover, one indented
+    /// signature per line.  `want_trait` selects which impl blocks to include:
+    ///   * `false` -> inherent impls (`implement Foo { ... }`), plain signature
+    ///     (`resize_buckets(this: mut &This, n: u64) -> void`).
+    ///   * `true`  -> trait impls (`implement trait Iterator for Foo`), each
+    ///     prefixed `trait <Trait>::` (`trait Iterator::next(...) -> ...`).
+    /// Splitting the two lets the caller render them as separate sections.
     /// Reuses `format_method_signature` with an empty owner (no `Owner::`
     /// prefix) so static/where-clause rendering matches method hovers.
-    /// Returns "" when the type has no methods, so callers concatenate
-    /// unconditionally.  Name matching mirrors `find_impls_of_type`.
-    format_type_methods(&this, type_name: SymbolStr) -> string {
+    /// Returns "" when nothing matches, so callers concatenate unconditionally.
+    /// Name matching mirrors `find_impls_of_type`.
+    format_impl_methods(&this, type_name: SymbolStr, want_trait: boolean) -> string {
         if (this.graph == null || this.intern == null) { return ""; }
         const type_leaf: string = NodeLocator::leaf_segment_str(
             this.intern.resolve(type_name));
@@ -1310,9 +1346,11 @@ type struct HoverEngine {
                 const impl_blk: ImplBlockNode* = stmt as ImplBlockNode*;
                 if (!NodeLocator::type_name_matches(this.intern,
                         impl_blk.target_type, type_name, type_leaf)) { continue; }
+                const is_trait: boolean = impl_blk.trait_annotation != null;
+                if (is_trait != want_trait) { continue; }
                 // Trait impls prefix each signature with `trait <Trait>::`.
                 mut prefix: string = "";
-                if (impl_blk.trait_annotation != null) {
+                if (is_trait) {
                     const th: SymbolStr = NodeLocator::annotation_head_name(
                         impl_blk.trait_annotation);
                     if (th.is_valid()) {
@@ -1329,6 +1367,22 @@ type struct HoverEngine {
             }
         }
         return out;
+    }
+
+    /// Assemble the expanded-hover method listing for a struct/class: inherent
+    /// methods first (inline body methods + inherent impl blocks), then a blank
+    /// line, then trait-impl methods.  Either section may be empty; the blank
+    /// separator is inserted only when both are present.  Returns "" when the
+    /// type has no methods at all.
+    format_type_methods(&this, type_name: SymbolStr,
+                        inline_methods: &MethodNode*[]) -> string {
+        const inherent: string = this.format_inline_methods(inline_methods)
+            + this.format_impl_methods(type_name, false);
+        const traits: string = this.format_impl_methods(type_name, true);
+        if (inherent != "" && traits != "") {
+            return inherent + "\n" + traits;
+        }
+        return inherent + traits;
     }
 
     /// Render one variant inside an enum-decl body: `Name = N;` for
@@ -2223,6 +2277,47 @@ type struct HoverEngine {
             hops = hops + 1;
         }
         return cur;
+    }
+
+    /// Find the named type annotation under the cursor inside a static-match
+    /// node - its scrutinee or any arm's type patterns.  Returns null when the
+    /// node isn't a static match or the cursor isn't on a NAMED annotation
+    /// (primitives return null here and are covered by the keyword-doc path).
+    static_match_annotation_at(&this, node: ASTNode*, line: u32,
+                               col: u32) -> NamedAnnotation* {
+        if (node.kind == NodeKind::StaticMatchExpression) {
+            const sm: StaticMatchExprNode* = node as StaticMatchExprNode*;
+            return this.scan_static_match(sm.scrutinee, sm.arms, line, col);
+        }
+        if (node.kind == NodeKind::StaticMatchStatement) {
+            const sm: StaticMatchStmtNode* = node as StaticMatchStmtNode*;
+            return this.scan_static_match(sm.scrutinee, sm.arms, line, col);
+        }
+        return null;
+    }
+
+    /// Scan a static match's scrutinee then each arm type pattern for the named
+    /// annotation covering `(line, col)`.  `find_named_annotation_at` handles
+    /// descending into pointer/generic/reference wrappers and returns null for
+    /// primitives and `This`.
+    scan_static_match(&this, scrutinee: TypeAnnotation*,
+                      arms: &StaticMatchArmNode*[], line: u32,
+                      col: u32) -> NamedAnnotation* {
+        if (scrutinee != null) {
+            const n: NamedAnnotation* = NodeLocator::find_named_annotation_at(
+                scrutinee, line, col);
+            if (n != null) { return n; }
+        }
+        for (mut i: i64 = 0; i < arms.length; i++) {
+            const arm: StaticMatchArmNode* = arms[i];
+            if (arm == null) { continue; }
+            for (mut j: i64 = 0; j < arm.type_patterns.length; j++) {
+                const n: NamedAnnotation* = NodeLocator::find_named_annotation_at(
+                    arm.type_patterns[j], line, col);
+                if (n != null) { return n; }
+            }
+        }
+        return null;
     }
 
     /// Unwrap only Reference / Pointer wrappers, PRESERVING an
