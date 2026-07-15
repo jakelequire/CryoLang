@@ -638,11 +638,32 @@ type struct SemanticTokenizer {
             return;
         }
         if (e.kind == NodeKind::CastExpression) {
-            // CastExprNode has fields: expr, target_type; walk the inner
-            // expression and the type annotation.  We don't know the
-            // node's exact field names here; the cloner has them - but
-            // for v1 just descend the span if we can't reach inner fields,
-            // skip silently.  Real handling is added when needed.
+            // `expr as Type` - walk the operand and paint the target type
+            // name.  Without this the operand's identifiers get no semantic
+            // token and fall back to the TextMate grammar.
+            const ce: CastExprNode* = e as CastExprNode*;
+            this.walk_expr(ce.expression);
+            this.walk_type_annotation(ce.target_annotation);
+            return;
+        }
+        if (e.kind == NodeKind::TryExpression) {
+            // `expr?` - descend into the operand.  Missing this branch left
+            // every identifier under a `?` (e.g. the `INITIAL_BUCKETS` arg in
+            // `this.resize_buckets(INITIAL_BUCKETS)?`) with no semantic token,
+            // so the TextMate grammar's uppercase-as-type rule mis-painted
+            // constants green.
+            const te: TryExprNode* = e as TryExprNode*;
+            this.walk_expr(te.operand);
+            return;
+        }
+        if (e.kind == NodeKind::AwaitExpression) {
+            const ae: AwaitExprNode* = e as AwaitExprNode*;
+            this.walk_expr(ae.operand);
+            return;
+        }
+        if (e.kind == NodeKind::YieldExpression) {
+            const ye: YieldExprNode* = e as YieldExprNode*;
+            this.walk_expr(ye.operand);
             return;
         }
         if (e.kind == NodeKind::StructLiteral) {
@@ -725,6 +746,21 @@ type struct SemanticTokenizer {
         // f-string desugar: skip the whole subtree (see helper above).  The
         // TextMate grammar handles f-string colouring.
         if (this.is_fstring_runtime_call(c)) { return; }
+        // Compiler-synthesized implicit conversion: sema rewrites an
+        // initializer whose type needs conversion (e.g. a `string` literal
+        // assigned to a `String`) into a `String::from_string("...")` call
+        // whose synthetic callee inherits the ORIGINAL operand's span (see
+        // sema call_resolver `build_implicit_conversion`).  Overlaying that
+        // callee would paint the string literal like a function/method.
+        // Detect the shape - a single argument whose span exactly equals the
+        // callee's span - and skip the callee overlay, walking only the real
+        // argument so it keeps its own (string) colour.
+        if (SemanticTokenizer::is_synthetic_conversion(c)) {
+            for (mut i: i64 = 0; i < c.arguments.length; i++) {
+                this.walk_expr(c.arguments[i]);
+            }
+            return;
+        }
         // Override the callee's classification: it's a callable, so the
         // callee name should be `function` or `method`, not `variable` or
         // `property`.
@@ -1142,6 +1178,27 @@ type struct SemanticTokenizer {
     /// pointer-equality is NOT reliable (different code paths produce different
     /// copies of the same logical path), so we walk and compare bytes until a
     /// NUL.
+    /// True when `c` is a compiler-synthesized implicit-conversion call.
+    /// Sema wraps an operand needing conversion in a call (e.g.
+    /// `String::from_string(<literal>)`) and stamps the synthetic callee AND
+    /// the wrapping call with the ORIGINAL operand's span, then adds that
+    /// operand as the sole argument.  So the tell-tale shape is: exactly one
+    /// argument whose span is co-located with the callee's span.  A genuine
+    /// user call `f(x)` never has its callee and argument at the same span.
+    static is_synthetic_conversion(c: CallExprNode*) -> boolean {
+        if (c == null || c.callee == null) { return false; }
+        if (c.arguments.length != 1)       { return false; }
+        const arg: ExpressionNode* = c.arguments[0];
+        if (arg == null)                   { return false; }
+        const cs: SourceSpan = c.callee.span;
+        const as_: SourceSpan = arg.span;
+        if (!cs.has_location() || !as_.has_location()) { return false; }
+        return cs.start_line == as_.start_line
+            && cs.start_col  == as_.start_col
+            && cs.end_line   == as_.end_line
+            && cs.end_col    == as_.end_col;
+    }
+
     static file_paths_equal(a: string, b: string) -> boolean {
         if (a == b) { return true; }                      // same pointer
         mut i: u64 = 0;
