@@ -263,8 +263,23 @@ the libc `isnan`/`finite` family; selfhost + tests green. `-lm` still linked
 > `sema/call_resolver.cryo` (locals-shadow + qualified-before-bare) plus an
 > E0600 codegen backstop in `enum_variant_emitter.cryo` so a dropped payload
 > store can never again be silent.
-> **Remaining in Stage 1:** `fabs`/`floor`/`ceil`/`trunc`/`round`/`copysign` +
-> `sqrt`/`fma` via LLVM intrinsics (the "cheap math" half) — libm still linked.
+> **Status: cheap-math half DONE — Stage 1 complete.** Ten new compiler
+> intrinsics — `fabs64`/`fabs32`/`floor64`/`ceil64`/`ftrunc64`/`round64`/
+> `copysign64`/`sqrt64`/`sqrt32`/`fma64` — lower to the matching LLVM float
+> intrinsics (`llvm.fabs.f64`, ...); names carry a width suffix so common
+> leaf names (`round`, `sqrt`) are not reserved by the leaf-name intrinsic
+> dispatch. `std::math` (`sqrt`/`sqrt_f32`/`mul_add`/`floor`/`ceil`/`round`/
+> `trunc`/`fract`/`fabs`/`fabs_f32`/`copysign`) and `fmt/float.cryo` are off
+> libm for these; the 11 corresponding externs (`sqrt(f)`, `floor`, `ceil`,
+> `round`, `trunc`, `fabs(f)`, `copysign(f)`, `fma`) are deleted from
+> `ffi::libc`. Edge-case tests added (round half-away-from-zero both signs,
+> sign-bit ops on -0.0/NaN, sqrt domain, an exact 2^-104 fma-fusion witness).
+> Note on codegen: on baseline x86-64, `fabs`/`copysign`/`sqrt` legalize to
+> instructions, while `floor`/`ceil`/`trunc`/`round`/`fma` legalize to libm
+> LIBCALLS (no SSE4.1/FMA3 at the default target) — those references are now
+> backend-owned legalization, not stdlib surface, and `-lm` stays linked as
+> planned. A later freestanding stage must provide them (compiler-rt or a
+> target-feature bump). Transcendentals remain on libm by design.
 
 ### Stage 2 — Native Linux syscall backend (the keystone)
 
