@@ -16,8 +16,9 @@
 ///! The public API is `f64.to_buf(buffer)` / `f64.to_buf_with(buffer,
 ///! decimals)`: extension methods on the primitive. Integer formatting
 ///! lives in `core::primitives`; this file is float-only because the
-///! implementation needs `libm` (fabs / log10 / __isnan / __isinf) which
-///! `core` deliberately doesn't depend on.
+///! implementation needs `libm` (fabs / log10) which `core` deliberately
+///! doesn't depend on.  Classification is libm-free (the `fpclass`
+///! intrinsic).
 
 namespace std::fmt::float;
 
@@ -28,21 +29,12 @@ import core::slice;
 import ffi::libc;
 
 
-// Per-OS classifications.  glibc exports `__isnan` / `__isinf`;
-// msvcrt exports `_isnan` / `_finite` (no `_isinf` - derive).  Kept as
-// file-local helpers so fmt doesn't take a dependency on std::math.
-
-![target(linux)]
-private function fp_is_nan(v: f64) -> boolean { return libc::__isnan(v) != 0; }
-![target(linux)]
-private function fp_is_inf(v: f64) -> boolean { return libc::__isinf(v) != 0; }
-
-![target(windows)]
-private function fp_is_nan(v: f64) -> boolean { return libc::_isnan(v) != 0; }
-![target(windows)]
-private function fp_is_inf(v: f64) -> boolean {
-    return libc::_isnan(v) == 0 && libc::_finite(v) == 0;
-}
+// FP classification via the `fpclass` intrinsic (LLVM `llvm.is.fpclass`):
+// no libm, no FP exceptions, platform-independent.  Kept as file-local
+// helpers so fmt doesn't take a dependency on std::math.  Test masks mirror
+// LLVM's is.fpclass bits (SNaN|QNaN = 0x003; -Inf|+Inf = 0x204).
+private function fp_is_nan(v: f64) -> boolean { return intrinsics::fpclass(v, 0x003); }
+private function fp_is_inf(v: f64) -> boolean { return intrinsics::fpclass(v, 0x204); }
 
 /// Parse a leading `f64` from `s` using C `strtod` semantics: skip
 /// leading whitespace, read the longest valid float prefix (decimal or

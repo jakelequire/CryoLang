@@ -4,6 +4,7 @@
 namespace CryoTests::Tests::Stdlib::MathT;
 
 import std::core::result;
+import std::core::mem;
 import std::math;
 import std::test::error;
 import std::test::assert;
@@ -192,6 +193,110 @@ function is_nan_of_nan() -> Result<(), TestError> {
 function is_infinite_of_infinity() -> Result<(), TestError> {
     return expect(math::is_infinite(math::infinity()),
         Str::new("infinity() should be infinite"));
+}
+
+// Classification is now pure Cryo over the IEEE-754 bit pattern (the
+// `fpclass` intrinsic, LLVM `llvm.is.fpclass`) - no libm.  These cover the
+// edge classes that the previous `isnan`/`finite` surface never exercised:
+// subnormals, -0.0, and the full `classify` category set.  Edge values are
+// built by transmuting exact bit patterns so the tests don't depend on how
+// any particular literal is rounded.
+
+![test]
+function is_normal_true_only_for_normals() -> Result<(), TestError> {
+    match (expect(math::is_normal(1.0), Str::new("1.0 is normal"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect(!math::is_normal(0.0), Str::new("0.0 is not normal"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect(!math::is_normal(math::nan()), Str::new("NaN is not normal"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect(!math::is_normal(math::infinity()), Str::new("Inf is not normal"));
+}
+
+![test]
+function is_sign_negative_reads_the_sign_bit() -> Result<(), TestError> {
+    // -0.0 has the sign bit set but is numerically zero; the raw-bit read
+    // must report it as negative (a value compare could not).
+    const neg_zero: f64 = mem::transmute<u64, f64>(0x8000000000000000);
+    match (expect(math::is_sign_negative(neg_zero), Str::new("-0.0 is sign-negative"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect(math::is_sign_negative(0.0 - 3.5), Str::new("-3.5 is sign-negative"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect(!math::is_sign_negative(0.0), Str::new("+0.0 is not sign-negative"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect(!math::is_sign_negative(3.5), Str::new("+3.5 is not sign-negative"));
+}
+
+![test]
+function classify_normal_and_zero() -> Result<(), TestError> {
+    const norm: boolean = match (math::classify(1.5)) {
+        FpCategory::Normal => { true }
+        _                  => { false }
+    };
+    match (expect(norm, Str::new("1.5 classifies as Normal"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    const pos_zero: boolean = match (math::classify(0.0)) {
+        FpCategory::Zero => { true }
+        _                => { false }
+    };
+    match (expect(pos_zero, Str::new("+0.0 classifies as Zero"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    const neg_zero_val: f64 = mem::transmute<u64, f64>(0x8000000000000000);
+    const neg_zero: boolean = match (math::classify(neg_zero_val)) {
+        FpCategory::Zero => { true }
+        _                => { false }
+    };
+    return expect(neg_zero, Str::new("-0.0 classifies as Zero"));
+}
+
+![test]
+function classify_subnormal_is_finite_not_normal() -> Result<(), TestError> {
+    // Smallest positive subnormal: bit pattern 0x0000000000000001.  A
+    // subnormal f32 would widen to a *normal* f64, so this must be tested
+    // natively at f64 width.
+    const sub: f64 = mem::transmute<u64, f64>(1);
+    const is_sub: boolean = match (math::classify(sub)) {
+        FpCategory::Subnormal => { true }
+        _                     => { false }
+    };
+    match (expect(is_sub, Str::new("smallest subnormal classifies as Subnormal"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect(math::is_finite(sub), Str::new("subnormal is finite"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect(!math::is_normal(sub), Str::new("subnormal is not normal"));
+}
+
+![test]
+function classify_nan_and_infinite() -> Result<(), TestError> {
+    const is_nan_cat: boolean = match (math::classify(math::nan())) {
+        FpCategory::Nan => { true }
+        _               => { false }
+    };
+    match (expect(is_nan_cat, Str::new("nan() classifies as Nan"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    const is_inf_cat: boolean = match (math::classify(math::infinity())) {
+        FpCategory::Infinite => { true }
+        _                    => { false }
+    };
+    match (expect(is_inf_cat, Str::new("+infinity() classifies as Infinite"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    const is_neg_inf_cat: boolean = match (math::classify(math::neg_infinity())) {
+        FpCategory::Infinite => { true }
+        _                    => { false }
+    };
+    return expect(is_neg_inf_cat, Str::new("-infinity() classifies as Infinite"));
 }
 
 // --- integer helpers ---------------------------------------------------

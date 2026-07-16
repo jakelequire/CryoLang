@@ -2,7 +2,7 @@
 ///
 /// Inline-lowering for the bare-name intrinsics declared in
 /// `stdlib/core/intrinsics.cryo` (sign-extension, pointer arithmetic,
-/// rotates, ctlz/cttz, fp/int conversions, atomic_fence, isfinite,
+/// rotates, ctlz/cttz, fp/int conversions, atomic_fence, fpclass,
 /// dirent_name/type, panic).  Also emits the per-module `@panic` and
 /// `@format` runtime helpers as `linkonce_odr` definitions so the linker
 /// can collapse copies across translation units.
@@ -121,6 +121,20 @@ type struct IntrinsicEmitter {
         return this.llvm_module.add_function(name, fn_ty);
     }
 
+    // `declare i1 @llvm.is.fpclass.f64(double, i32)`.  The i32 test mask is
+    // an immarg at the call site; the declared parameter type is plain i32.
+    get_or_decl_fpclass(mut &this, name: string, val_ty: LType, mask_ty: LType) -> LValue {
+        mut fn: LValue = this.llvm_module.get_named_function(name);
+        if (fn.is_valid()) { return fn; }
+        const param_buf: void* = intrinsics::malloc(16);
+        const param_slots: void** = param_buf as void**;
+        param_slots[0] = val_ty.raw;
+        param_slots[1] = mask_ty.raw;
+        const fn_ty: LType = LType::function_type(LType::i1(), param_buf, 2, false);
+        intrinsics::free(param_buf);
+        return this.llvm_module.add_function(name, fn_ty);
+    }
+
 
     // Direct LLVM call helpers (sized-arg variants for the intrinsic paths)
 
@@ -219,6 +233,33 @@ type struct IntrinsicEmitter {
             shift = this.builder.build_zext(shift, LType::i64(), "rot.shift.zext");
         }
         return this.call3(fn, fn_ty, x, x, shift, "rot");
+    }
+
+    // Emit `call i1 @llvm.is.fpclass.f64(double x, i32 <mask>)`.
+    //
+    // The test mask must be an LLVM immarg (compile-time constant): stdlib
+    // callers always pass an integer literal, so we read the constant value
+    // out of `mask_val` and rebuild it as a fresh i32 constant operand.  A
+    // non-constant mask is unreachable in practice (the intrinsic is stdlib-
+    // internal); it degrades to mask 0 (always-false) rather than emitting
+    // invalid IR, mirroring the atomic-ordering fallback.
+    emit_fpclass(mut &this, x: LValue, mask_val: LValue) -> LValue {
+        const val_ty:  LType = LType::f64();
+        const mask_ty: LType = LType::i32();
+        const fn: LValue = this.get_or_decl_fpclass("llvm.is.fpclass.f64", val_ty, mask_ty);
+        if (!fn.is_valid()) { return LValue::null(); }
+        mut mask_bits: u64 = 0;
+        if (mask_val.is_valid() && llvm::LLVMIsConstant(mask_val.raw) != 0) {
+            mask_bits = llvm::LLVMConstIntGetZExtValue(mask_val.raw);
+        }
+        const mask_const: LValue = LType::const_int(mask_ty, mask_bits, false);
+        const param_buf: void* = intrinsics::malloc(16);
+        const param_slots: void** = param_buf as void**;
+        param_slots[0] = val_ty.raw;
+        param_slots[1] = mask_ty.raw;
+        const fn_ty: LType = LType::function_type(LType::i1(), param_buf, 2, false);
+        intrinsics::free(param_buf);
+        return this.call2(fn, fn_ty, x, mask_const, "fpclass");
     }
 
 
@@ -339,8 +380,10 @@ type struct IntrinsicEmitter {
             // vprintf(fmt, va) - 2 args; vfprintf(file, fmt, va) - 3 args.
             IntrinsicKind::Vprintf  => { 2 }
             IntrinsicKind::Vfprintf => { 3 }
-            // atomic_fence(order: i32): single arg.  isfinite, dirent_*
-            // also single arg, so they fall through to the default below.
+            // fpclass(value: f64, test: i32): value + constant test mask.
+            IntrinsicKind::FpClass      => { 2 }
+            // atomic_fence(order: i32): single arg.  dirent_* also single
+            // arg, so they fall through to the default below.
             _                           => { 1 }
         };
         if (expected < 0)            { return Option::None; }
@@ -466,14 +509,10 @@ type struct IntrinsicEmitter {
                 LValue::null()
             }
 
-            // -- isfinite(x): fcmp oeq (x - x), 0; true if x is finite.
-            //    NaN/+/-inf produce NaN in `x - x`, and oeq with NaN is
-            //    false. --
-            IntrinsicKind::IsFinite => {
-                const diff: LValue = this.builder.build_fsub(a0, a0, "is_fin.diff");
-                const zero: LValue = LType::const_real(LType::f64(), 0.0);
-                this.builder.build_fcmp(LRealPredicate::OEQ, diff, zero, "is_fin")
-            }
+            // -- fpclass(x, test): llvm.is.fpclass.f64(x, test); true when
+            //    x's IEEE-754 class is selected by the constant `test`
+            //    bitmask.  Exception-free, unlike the old `(x-x)==0` trick. --
+            IntrinsicKind::FpClass => { this.emit_fpclass(a0, a1) }
 
             // -- dirent_name(entry) -> entry == null ? "" : (entry + 19).
             //    d_name is at byte offset 19 in glibc's struct dirent.
