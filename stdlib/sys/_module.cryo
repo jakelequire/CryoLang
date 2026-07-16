@@ -1,0 +1,87 @@
+///! sys: the low-level OS seam.
+///!
+///! `sys` is the one layer in the stdlib that talks to the operating system
+///! directly. Everything above it (String, collections, `io` buffering, the
+///! `net` upper layers, ...) is pure Cryo; everything below it is a swappable
+///! backend. As Cryo takes on more of its own low-level runtime (see
+///! `LOW_LEVEL_PLAN.md` at the repo root), the portable functions here gain
+///! native backends selected at compile time by `![config(native_syscalls)]`
+///! (cryoconfig `[low_level] native_syscalls`); today every function is a thin
+///! pass-through to `ffi::libc`, and the flag has no effect on behavior.
+///!
+///! ## The error model this seam presents upward
+///!
+///! Every fallible `sys` function returns a signed integer. A **negative**
+///! result is `-errno`: the negated POSIX error number (e.g. `-EINTR` == -4,
+///! `-EBADF` == -9). A **non-negative** result is the success value (a byte
+///! count, a file descriptor, `0`, ...). This is normalized *at the seam*,
+///! independent of backend:
+///!   - libc backend (today): libc returns -1 and sets `errno`; the seam reads
+///!     `errno` and returns `-errno`.
+///!   - native syscall backend (Linux, Stage 2): a raw syscall already returns
+///!     `-errno` in the result register, so it is returned as-is.
+///! Callers that want a rich `Result`/`IoError` (and `EINTR` retry) build it on
+///! top of this raw layer — that policy lives above `sys`, not in it (see
+///! `io::fd`, which Stage 4 rebuilds on this seam).
+///!
+///! ## Surface
+///!
+///! Stage 0 establishes the seam with the file-descriptor + process core
+///! (`read`/`write`/`open`/`close`/`exit`). Memory (`mmap`/`mprotect`), sync
+///! (`futex`), and time (`clock_mono`/`sleep`) primitives join the seam as
+///! their consumers migrate in later stages (3 / 5).
+///!
+///! Sub-modules:
+///!   - `syscall` : raw syscalls per platform. Linux x86_64: `Syscall::read`
+///!                 numbers + libc `syscall()` trampoline + typed wrappers
+///!                 (`sys_read`, `sys_clone3`, `sys_io_uring_setup`, ...).
+///!                 Windows x86_64: Win32 (kernel32, user32, advapi32) +
+///!                 NT API (ntdll). Each surface is gated with
+///!                 `![target(...)]` so only the host platform's externs
+///!                 are emitted.
+
+namespace std::sys;
+
+import ffi::libc;
+
+public module sys::syscall;
+
+/// Normalize a libc call's `-1`-on-error return into the seam's `-errno`
+/// model. `n` is the raw libc result; on failure (`n < 0`) it is replaced by
+/// the negated current `errno`. Kept private to the seam.
+function normalize(n: i64) -> i64 {
+    if (n < 0) {
+        return -(libc::errno() as i64);
+    }
+    return n;
+}
+
+/// `read(2)`: read up to `count` bytes from `fd` into `buf`. Returns the byte
+/// count read (`0` == EOF), or `-errno` on failure. A single raw call — no
+/// `EINTR` retry; a caller that wants retry loops on `-EINTR` itself.
+function read(fd: i32, buf: u8*, count: u64) -> i64 {
+    return normalize(libc::read(fd, buf, count));
+}
+
+/// `write(2)`: write up to `count` bytes from `buf` to `fd`. Returns the byte
+/// count written (short writes are normal), or `-errno` on failure.
+function write(fd: i32, buf: u8*, count: u64) -> i64 {
+    return normalize(libc::write(fd, buf, count));
+}
+
+/// `open(2)`: open `path` (a NUL-terminated C string) with `flags` and, when
+/// creating, `mode`. Returns the new file descriptor (>= 0), or `-errno`.
+function open(path: u8*, flags: i32, mode: u32) -> i64 {
+    return normalize(libc::open(path, flags, mode) as i64);
+}
+
+/// `close(2)`: release `fd`. Returns `0` on success, or `-errno`.
+function close(fd: i32) -> i64 {
+    return normalize(libc::close(fd) as i64);
+}
+
+/// `_exit(2)`-style process termination with status `code`. Does not return.
+/// Unflushed buffered writers lose their contents; flush before calling.
+function exit(code: i32) -> void {
+    libc::exit(code);
+}
