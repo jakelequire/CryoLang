@@ -1,8 +1,11 @@
 ///! Allocator: the trait every heap strategy implements.
 ///!
-///! `GlobalAlloc` is the default implementation, backed by the platform
-///! allocator via `libc::aligned_alloc` / `libc::aligned_free`. An
-///! arena or pool can plug in anywhere an `Allocator` is expected.
+///! `GlobalAlloc` is the default implementation. Its memory operations are
+///! delegated to the `backend_*` functions below — libc
+///! (`aligned_alloc`/`aligned_free`/`realloc`) by default, or the
+///! mmap-backed `alloc::heap` under the temporary `[low_level]
+///! native_alloc` migration switch (Low-Level Plan Stage 3). An arena or
+///! pool can plug in anywhere an `Allocator` is expected.
 ///!
 ///! Collections accept `A: Allocator` as a type parameter so the
 ///! storage strategy is a caller decision, not hard-coded in the
@@ -23,6 +26,10 @@ import collections::str;
 // arena-backed and bulk-reclaimed between targets.  Null/inactive in every
 // other program -> the branches below are never taken.
 import alloc::arena;
+// Same one-way-edge shape as `arena`: `heap` is allocator-free (raw
+// `void*`/`u64` surface), so importing it here forms no cycle.  Supplies the
+// `native_alloc` backend arms below.
+import alloc::heap;
 
 type enum AllocErrorKind {
     /// The underlying allocator returned null; the system is out of
@@ -120,11 +127,77 @@ function next_capacity(current: u64, required: u64, min_capacity: u64) -> u64 {
     return new_cap;
 }
 
-// GlobalAlloc: platform allocator
+// Platform backend
+//
+// `GlobalAlloc`'s trait methods keep the policy (zero-size rejection, arena
+// routing) and delegate the actual memory operations to these three
+// config-gated functions.  Default: libc.  Under the temporary `[low_level]
+// native_alloc` migration switch: the mmap-backed `alloc::heap`
+// (Low-Level Plan Stage 3; the switch and the libc arms are deleted once
+// the native heap is proven).  All three return null for "out of memory".
+
+![config(not(native_alloc))]
+function backend_alloc(layout: Layout) -> void* {
+    return libc::aligned_alloc(layout.alignment(), layout.padded_size());
+}
+
+![config(native_alloc)]
+function backend_alloc(layout: Layout) -> void* {
+    return heap::alloc(layout.size(), layout.alignment());
+}
+
+![config(not(native_alloc))]
+function backend_free(ptr: void*, layout: Layout) -> void {
+    // Pair with `backend_alloc`'s `aligned_alloc`: over-aligned blocks
+    // (Windows `_aligned_malloc`) need `_aligned_free`, selected by the
+    // layout's alignment.  On POSIX this collapses to plain `free`.
+    libc::aligned_free(ptr, layout.alignment());
+}
+
+![config(native_alloc)]
+function backend_free(ptr: void*, layout: Layout) -> void {
+    // The native heap recovers the block size from the pointer itself
+    // (segment-header mask), so the layout carries no information it needs.
+    heap::free(ptr);
+}
+
+![config(not(native_alloc))]
+function backend_realloc(ptr: void*, old_layout: Layout,
+                         new_layout: Layout) -> void* {
+    // `realloc` only guarantees alignment up to `max_align_t`
+    // (MAX_REALLOC_ALIGN = 16).  Any over-aligned type - a
+    // `![align(32)]`/`![align(64)]` aggregate or a SIMD vector - must go
+    // through allocate/copy/free even when its alignment is UNCHANGED on
+    // grow; otherwise realloc may return a merely-16-aligned buffer and
+    // every subsequent aligned load/store is UB.
+    if (new_layout.alignment() > MAX_REALLOC_ALIGN) {
+        const np: void* = backend_alloc(new_layout);
+        if (np == null) { return null; }
+        mut copy_size: u64 = old_layout.size();
+        if (new_layout.size() < copy_size) {
+            copy_size = new_layout.size();
+        }
+        intrinsics::memcpy(np, ptr, copy_size);
+        backend_free(ptr, old_layout);
+        return np;
+    }
+    return libc::realloc(ptr, new_layout.padded_size());
+}
+
+![config(native_alloc)]
+function backend_realloc(ptr: void*, old_layout: Layout,
+                         new_layout: Layout) -> void* {
+    // The native heap handles over-alignment and in-place growth itself.
+    return heap::realloc(ptr, old_layout.size(),
+                                     new_layout.size(),
+                                     new_layout.alignment());
+}
+
+// GlobalAlloc: the process-wide allocator
 
 /// Zero-sized handle to the process-wide allocator. Construct with
 /// `GlobalAlloc::new()`; all instances dispatch through the same
-/// underlying malloc/free.
+/// underlying backend.
 type struct GlobalAlloc {
     static new() -> GlobalAlloc {
         return GlobalAlloc { };
@@ -145,10 +218,7 @@ implement trait Allocator for struct GlobalAlloc {
             }
             return Result::Err(AllocError::new(AllocErrorKind::OutOfMemory, layout));
         }
-        const raw: void* = libc::aligned_alloc(
-            layout.alignment(),
-            layout.padded_size()
-        );
+        const raw: void* = backend_alloc(layout);
         if (raw == null) {
             return Result::Err(AllocError::new(AllocErrorKind::OutOfMemory, layout));
         }
@@ -156,20 +226,18 @@ implement trait Allocator for struct GlobalAlloc {
     }
 
     deallocate(mut &this, ptr: NonNull<u8>, layout: Layout) -> void {
-        // Arena-owned blocks are bulk-reclaimed at `reset`; never libc-free
-        // them.  Consulted regardless of the active flag (the central
-        // correctness rule: an arena pointer must not reach `free`).
+        // Arena-owned blocks are bulk-reclaimed at `reset`; never hand them
+        // to the backend.  Consulted regardless of the active flag (the
+        // central correctness rule: an arena pointer must not reach `free`).
         if (GlobalArena::holds(ptr.as_ptr() as void*)) {
             return;
         }
-        // Pair with `allocate`'s `aligned_alloc`: over-aligned blocks (Windows
-        // `_aligned_malloc`) need `_aligned_free`, selected by the layout's
-        // alignment.  On POSIX this collapses to plain `free`.
-        libc::aligned_free(ptr.as_ptr() as void*, layout.alignment());
+        backend_free(ptr.as_ptr() as void*, layout);
     }
 
-    /// Override the default: the platform allocator has a real
-    /// `realloc` and we'd be silly not to use it.
+    /// Override the default: both backends have a real `realloc` (libc's, or
+    /// the native heap's same-class/in-place path) and we'd be silly not to
+    /// use it.
     reallocate(mut &this,
                ptr: NonNull<u8>,
                old_layout: Layout,
@@ -178,7 +246,7 @@ implement trait Allocator for struct GlobalAlloc {
             return Result::Err(AllocError::new(AllocErrorKind::ZeroSized, new_layout));
         }
         // Arena-owned blocks grow inside the arena (frontier grow-in-place or
-        // alloc-new + copy); never hand them to libc `realloc`.  Consulted
+        // alloc-new + copy); never hand them to the backend.  Consulted
         // regardless of the active flag, same correctness rule as `deallocate`.
         if (GlobalArena::holds(ptr.as_ptr() as void*)) {
             const np: void* = GlobalArena::grow(
@@ -191,26 +259,8 @@ implement trait Allocator for struct GlobalAlloc {
             }
             return Result::Err(AllocError::new(AllocErrorKind::OutOfMemory, new_layout));
         }
-        // `realloc` only guarantees alignment up to `max_align_t`
-        // (MAX_REALLOC_ALIGN = 16).  Any over-aligned type - a
-        // `![align(32)]`/`![align(64)]` aggregate or a SIMD vector - must go
-        // through allocate/copy/free even when its alignment is UNCHANGED on
-        // grow; otherwise realloc may return a merely-16-aligned buffer and
-        // every subsequent aligned load/store is UB.
-        if (new_layout.alignment() > MAX_REALLOC_ALIGN) {
-            const new_ptr: NonNull<u8> = this.allocate(new_layout)?;
-            mut copy_size: u64 = old_layout.size();
-            if (new_layout.size() < copy_size) {
-                copy_size = new_layout.size();
-            }
-            intrinsics::memcpy(new_ptr.as_ptr(), ptr.as_ptr(), copy_size);
-            this.deallocate(ptr, old_layout);
-            return Result::Ok(new_ptr);
-        }
-        const raw: void* = libc::realloc(
-            ptr.as_ptr() as void*,
-            new_layout.padded_size()
-        );
+        const raw: void* = backend_realloc(ptr.as_ptr() as void*,
+                                           old_layout, new_layout);
         if (raw == null) {
             return Result::Err(AllocError::new(AllocErrorKind::OutOfMemory, new_layout));
         }
