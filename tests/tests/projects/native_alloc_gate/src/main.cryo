@@ -1,0 +1,117 @@
+/// Built and run end-to-end by the projects meta-runner (Low-Level Plan
+/// Stage 3). This project's cryoconfig sets `[low_level] native_alloc =
+/// true`, so every `GlobalAlloc` allocation in this binary — `Box`, `Array`,
+/// `String`, `HashMap`, `format`, `new`/`delete` — is served by the
+/// mmap-backed `std::alloc::heap` instead of libc malloc. Each
+/// section stresses one consumer with content checks that would trip on a
+/// corrupted, misaligned, or misrouted block. Failures exit with a distinct
+/// step code via libc (independent of the machinery under test).
+namespace NativeAllocGate::Main;
+
+import std::core::intrinsics;
+import std::collections::hashmap;
+import ffi::libc;
+
+function fail(step: i32) -> void {
+    intrinsics::printf("FAIL step %d\n", step);
+    libc::exit(step);
+}
+
+type struct Node {
+    value: i64;
+    tag: String;
+}
+
+function main() -> int {
+    // -- Array<i64>: growth across many reallocations -----------------------
+    mut xs: i64[] = [];
+    for (mut i: i64 = 0; i < 10000; i++) {
+        xs.push(i * 3);
+    }
+    if (xs.length != 10000) { fail(1); }
+    mut sum: i64 = 0;
+    for (mut i: i64 = 0; i < xs.length; i++) {
+        sum += xs[i];
+    }
+    if (sum != 3 * (9999 * 10000 / 2)) { fail(2); }
+
+    // -- String: build, grow, verify byte content ---------------------------
+    mut s: String = String::new();
+    for (mut i: i64 = 0; i < 500; i++) {
+        s.push("abcdefgh");
+    }
+    if (s.length() != 4000) { fail(3); }
+    const sv: Str = s.as_str();
+    for (mut i: i64 = 0; i < 4000; i++) {
+        const want: u8 = ("abcdefgh" as u8*)[i % 8];
+        // NOTE: `byte_at` returns Option<u8>; compare via match.  A direct
+        // `!= want` compiles but miscompiles today (the implicit Some-wrap
+        // of the scalar side never happens and equals traps on a garbage
+        // tag) - pre-existing compiler bug, repro noted in HANDOFF.
+        match (sv.byte_at(i as u64)) {
+            Option::Some(b) => { if (b != want) { fail(4); } }
+            Option::None    => { fail(4); }
+        }
+    }
+
+    // -- format: the compiler lowers this through the alloc bridge ----------
+    const f: string = format("checksum=%lld/%s", sum, "native");
+    if (f.length() == 0) { fail(5); }
+
+    // -- new/delete: the codegen bridge functions ----------------------------
+    for (mut i: i64 = 0; i < 1000; i++) {
+        const n: Node* = new Node { value: i, tag: String::from_str("node") };
+        if (n == null) { fail(6); }
+        if (n.value != i) { fail(7); }
+        delete n;
+    }
+
+    // -- HashMap: insert/lookup/remove churn ---------------------------------
+    mut m: HashMap<i64, i64> = HashMap::new();
+    for (mut i: i64 = 0; i < 3000; i++) {
+        m.insert(i, i * 7);
+    }
+    for (mut i: i64 = 0; i < 3000; i += 2) {
+        m.remove(i);
+    }
+    for (mut i: i64 = 1; i < 3000; i += 2) {
+        match (m.get(i)) {
+            Option::Some(v) => { if (v != i * 7) { fail(8); } }
+            Option::None    => { fail(9); }
+        }
+    }
+
+    // -- Mixed-size churn: Strings spanning small and large classes, with
+    // interleaved frees, then byte-level verification of every survivor.
+    mut evens: String[] = [];
+    mut odds: String[] = [];
+    for (mut i: i64 = 0; i < 120; i++) {
+        mut t: String = String::new();
+        // 8 .. ~31k bytes: crosses the small classes and into the large path.
+        const reps: i64 = (i % 40) * 100 + 1;
+        for (mut r: i64 = 0; r < reps; r++) {
+            t.push("01234567");
+        }
+        if (i % 2 == 0) { evens.push(t); } else { odds.push(t); }
+    }
+    // Free half the blocks while the other half stays live.
+    evens.clear();
+    for (mut i: i64 = 0; i < odds.length; i++) {
+        const idx: i64 = i * 2 + 1;                    // original loop index
+        const reps: i64 = (idx % 40) * 100 + 1;
+        const t: &String = &odds[i];
+        if (t.length() != (reps as u64) * 8) { fail(10); }
+        const tv: Str = t.as_str();
+        match (tv.byte_at(0)) {
+            Option::Some(b) => { if (b != ("0" as u8*)[0]) { fail(11); } }
+            Option::None    => { fail(11); }
+        }
+        match (tv.byte_at(t.length() - 1)) {
+            Option::Some(b) => { if (b != ("7" as u8*)[0]) { fail(12); } }
+            Option::None    => { fail(12); }
+        }
+    }
+
+    intrinsics::printf("all native alloc checks passed\n");
+    return 0;
+}

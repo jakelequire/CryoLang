@@ -1,0 +1,206 @@
+///! std::alloc::heap - direct exercises of the mmap-backed heap
+///! (Low-Level Plan Stage 3).
+///!
+///! These call the heap's raw surface (`heap::alloc`/`heap::free`/
+///! `heap::realloc`) directly, so they run in EVERY build - the
+///! `[low_level] native_alloc` switch only controls whether `GlobalAlloc`
+///! routes through this heap, not whether the heap itself is compiled. The
+///! switched-ON integration (Box/Array/String/HashMap over the native heap)
+///! is covered end-to-end by the `native_alloc_gate` test project.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::Heap;
+
+import std::core::result;
+import std::alloc::heap;
+import std::test::error;
+import std::test::assert;
+
+/// Fill `p[0..n)` with a position-dependent pattern seeded by `seed`.
+function fill(p: u8*, n: u64, seed: u64) -> void {
+    for (mut i: u64 = 0; i < n; i++) {
+        p[i] = ((i * 131 + seed) & 255) as u8;
+    }
+}
+
+/// True if `p[0..n)` still holds `fill(p, n, seed)`'s pattern.
+function check(p: u8*, n: u64, seed: u64) -> boolean {
+    for (mut i: u64 = 0; i < n; i++) {
+        if (p[i] != (((i * 131 + seed) & 255) as u8)) { return false; }
+    }
+    return true;
+}
+
+// Small path: allocate/write/verify/free across every size class boundary
+// region (1, 16, 17, 128, 129, 1024, 4096, 32768).
+![test]
+function small_classes_roundtrip() -> Result<(), TestError> {
+    mut sizes: u64[8];
+    sizes[0] = 1;    sizes[1] = 16;   sizes[2] = 17;    sizes[3] = 128;
+    sizes[4] = 129;  sizes[5] = 1024; sizes[6] = 4096;  sizes[7] = 32768;
+    for (mut i: i64 = 0; i < 8; i++) {
+        const n: u64 = sizes[i];
+        const p: void* = heap::alloc(n, 16);
+        match (expect(p != null, Str::new("small alloc succeeds"))) {
+            Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+        }
+        // 16-alignment is the small path's contract.
+        match (expect(((p as u64) & 15) == 0, Str::new("small alloc 16-aligned"))) {
+            Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+        }
+        fill(p as u8*, n, i as u64);
+        match (expect(check(p as u8*, n, i as u64), Str::new("pattern survives"))) {
+            Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+        }
+        heap::free(p);
+    }
+    return Result::Ok(());
+}
+
+// Free-list reuse: freeing a small block and allocating the same class again
+// must hand the same address back (LIFO free list, same segment).
+![test]
+function free_list_reuses_block() -> Result<(), TestError> {
+    // A second live block pins the segment so the free doesn't unmap it.
+    const keep: void* = heap::alloc(64, 16);
+    const a: void* = heap::alloc(64, 16);
+    match (expect(a != null && keep != null, Str::new("allocs succeed"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    heap::free(a);
+    const b: void* = heap::alloc(64, 16);
+    match (expect_eq(b as u64, a as u64)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    heap::free(b);
+    heap::free(keep);
+    return Result::Ok(());
+}
+
+// Large path: above SMALL_MAX gets its own mapping; contents and page-level
+// alignment hold; free returns it without disturbing other blocks.
+![test]
+function large_path_roundtrip() -> Result<(), TestError> {
+    const n: u64 = 262144;   // 256 KiB
+    const p: void* = heap::alloc(n, 16);
+    match (expect(p != null, Str::new("large alloc succeeds"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    fill(p as u8*, n, 7);
+    match (expect(check(p as u8*, n, 7), Str::new("large pattern survives"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    heap::free(p);
+    return Result::Ok(());
+}
+
+// Over-aligned requests route to the large path and honor the alignment.
+![test]
+function over_aligned_allocations() -> Result<(), TestError> {
+    mut aligns: u64[4];
+    aligns[0] = 32; aligns[1] = 64; aligns[2] = 4096; aligns[3] = 65536;
+    for (mut i: i64 = 0; i < 4; i++) {
+        const al: u64 = aligns[i];
+        const p: void* = heap::alloc(100, al);
+        match (expect(p != null, Str::new("aligned alloc succeeds"))) {
+            Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+        }
+        match (expect(((p as u64) & (al - 1)) == 0, Str::new("alignment honored"))) {
+            Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+        }
+        heap::free(p);
+    }
+    return Result::Ok(());
+}
+
+// Realloc within one class is in-place; across classes it moves and
+// preserves contents; shrinking never loses the prefix.
+![test]
+function realloc_semantics() -> Result<(), TestError> {
+    const p: void* = heap::alloc(100, 16);
+    fill(p as u8*, 100, 3);
+    // 100 -> 112 stays in the 112-byte class: same pointer.
+    const q: void* = heap::realloc(p, 100, 112, 16);
+    match (expect_eq(q as u64, p as u64)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    // Grow across classes: moves, prefix preserved.
+    const r: void* = heap::realloc(q, 112, 5000, 16);
+    match (expect(r != null, Str::new("grow realloc succeeds"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect(check(r as u8*, 100, 3), Str::new("contents survive the move"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    // Grow into the large path, then shrink back small.
+    const s: void* = heap::realloc(r, 5000, 100000, 16);
+    match (expect(s != null && check(s as u8*, 100, 3), Str::new("large grow keeps prefix"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    const t: void* = heap::realloc(s, 100000, 64, 16);
+    match (expect(t != null && check(t as u8*, 64, 3), Str::new("shrink keeps prefix"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    heap::free(t);
+    return Result::Ok(());
+}
+
+// Interleaved stress: many live blocks of mixed classes with per-block
+// patterns; verify every survivor after a churn of frees, then free all.
+![test]
+function interleaved_stress_integrity() -> Result<(), TestError> {
+    const COUNT: i64 = 256;
+    // Addresses stored as u64 slots: fixed arrays of scalar element types
+    // are the proven form (`u8[64]`-style); pointer elements are not.
+    mut ptrs: u64[256];
+    mut sizes: u64[256];
+    for (mut i: i64 = 0; i < COUNT; i++) {
+        // Mixed sizes across classes: 1..~8 KiB, occasionally large.
+        mut n: u64 = ((i as u64) * 37 % 8000) + 1;
+        if (i % 61 == 0) { n = 50000 + (i as u64) * 100; }
+        const p: void* = heap::alloc(n, 16);
+        if (p == null) {
+            return expect(false, Str::new("stress alloc failed"));
+        }
+        fill(p as u8*, n, i as u64);
+        ptrs[i] = p as u64;
+        sizes[i] = n;
+    }
+    // Free every third block, then verify the survivors are untouched.
+    for (mut i: i64 = 0; i < COUNT; i += 3) {
+        heap::free(ptrs[i] as void*);
+        ptrs[i] = 0;
+    }
+    for (mut i: i64 = 0; i < COUNT; i++) {
+        if (ptrs[i] == 0) { continue; }
+        if (!check(ptrs[i] as u8*, sizes[i], i as u64)) {
+            return expect(false, Str::new("survivor corrupted after churn"));
+        }
+    }
+    // Refill the holes (exercises the free lists), verify, then drain.
+    for (mut i: i64 = 0; i < COUNT; i += 3) {
+        const n: u64 = sizes[i];
+        const p: void* = heap::alloc(n, 16);
+        if (p == null) {
+            return expect(false, Str::new("refill alloc failed"));
+        }
+        fill(p as u8*, n, 1000 + i as u64);
+        ptrs[i] = p as u64;
+    }
+    for (mut i: i64 = 0; i < COUNT; i++) {
+        const seed: u64 = if (i % 3 == 0) { 1000 + i as u64 } else { i as u64 };
+        if (!check(ptrs[i] as u8*, sizes[i], seed)) {
+            return expect(false, Str::new("block corrupted at drain"));
+        }
+        heap::free(ptrs[i] as void*);
+    }
+    return Result::Ok(());
+}
+
+// Zero-size requests: the heap returns null (the `alloc` bridge and
+// `GlobalAlloc` guard zero before reaching the heap).
+![test]
+function zero_size_returns_null() -> Result<(), TestError> {
+    const p: void* = heap::alloc(0, 16);
+    return expect(p == null, Str::new("zero-size alloc is null"));
+}
