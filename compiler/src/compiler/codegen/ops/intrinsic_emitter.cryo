@@ -3,6 +3,7 @@
 /// Inline-lowering for the bare-name intrinsics declared in
 /// `stdlib/core/intrinsics.cryo` (sign-extension, pointer arithmetic,
 /// rotates, ctlz/cttz, fp/int conversions, atomic_fence, fpclass,
+/// cheap fp math (fabs/floor/ceil/ftrunc/round/copysign/sqrt/fma),
 /// dirent_name/type, panic).  Also emits the per-module `@panic` and
 /// `@format` runtime helpers as `linkonce_odr` definitions so the linker
 /// can collapse copies across translation units.
@@ -108,7 +109,23 @@ type struct IntrinsicEmitter {
         return this.llvm_module.add_function(name, fn_ty);
     }
 
-    get_or_decl_funnel_shift(mut &this, name: string, ty: LType) -> LValue {
+    /// `declare T @name(T, T)` - homogeneous binary LLVM intrinsics
+    /// (llvm.copysign.*).
+    get_or_decl_binary_intrinsic(mut &this, name: string, ty: LType) -> LValue {
+        mut fn: LValue = this.llvm_module.get_named_function(name);
+        if (fn.is_valid()) { return fn; }
+        const param_buf: void* = intrinsics::malloc(16);
+        const param_slots: void** = param_buf as void**;
+        param_slots[0] = ty.raw;
+        param_slots[1] = ty.raw;
+        const fn_ty: LType = LType::function_type(ty, param_buf, 2, false);
+        intrinsics::free(param_buf);
+        return this.llvm_module.add_function(name, fn_ty);
+    }
+
+    /// `declare T @name(T, T, T)` - homogeneous ternary LLVM intrinsics
+    /// (llvm.fshl/fshr funnel shifts, llvm.fma.*).
+    get_or_decl_ternary_intrinsic(mut &this, name: string, ty: LType) -> LValue {
         mut fn: LValue = this.llvm_module.get_named_function(name);
         if (fn.is_valid()) { return fn; }
         const param_buf: void* = intrinsics::malloc(24);
@@ -212,7 +229,7 @@ type struct IntrinsicEmitter {
     }
 
     emit_rotate(mut &this, iname: string, ty: LType, x: LValue, n: LValue) -> LValue {
-        const fn: LValue = this.get_or_decl_funnel_shift(iname, ty);
+        const fn: LValue = this.get_or_decl_ternary_intrinsic(iname, ty);
         if (!fn.is_valid()) { return LValue::null(); }
         const param_buf: void* = intrinsics::malloc(24);
         const param_slots: void** = param_buf as void**;
@@ -233,6 +250,35 @@ type struct IntrinsicEmitter {
             shift = this.builder.build_zext(shift, LType::i64(), "rot.shift.zext");
         }
         return this.call3(fn, fn_ty, x, x, shift, "rot");
+    }
+
+    /// Emit `call T @iname(T x, T y)` for a homogeneous binary LLVM
+    /// intrinsic (llvm.copysign.f64).
+    emit_binary_llvm(mut &this, iname: string, ty: LType, x: LValue, y: LValue, label: string) -> LValue {
+        const fn: LValue = this.get_or_decl_binary_intrinsic(iname, ty);
+        if (!fn.is_valid()) { return LValue::null(); }
+        const param_buf: void* = intrinsics::malloc(16);
+        const param_slots: void** = param_buf as void**;
+        param_slots[0] = ty.raw;
+        param_slots[1] = ty.raw;
+        const fn_ty: LType = LType::function_type(ty, param_buf, 2, false);
+        intrinsics::free(param_buf);
+        return this.call2(fn, fn_ty, x, y, label);
+    }
+
+    /// Emit `call T @iname(T x, T y, T z)` for a homogeneous ternary LLVM
+    /// intrinsic (llvm.fma.f64).
+    emit_ternary_llvm(mut &this, iname: string, ty: LType, x: LValue, y: LValue, z: LValue, label: string) -> LValue {
+        const fn: LValue = this.get_or_decl_ternary_intrinsic(iname, ty);
+        if (!fn.is_valid()) { return LValue::null(); }
+        const param_buf: void* = intrinsics::malloc(24);
+        const param_slots: void** = param_buf as void**;
+        param_slots[0] = ty.raw;
+        param_slots[1] = ty.raw;
+        param_slots[2] = ty.raw;
+        const fn_ty: LType = LType::function_type(ty, param_buf, 3, false);
+        intrinsics::free(param_buf);
+        return this.call3(fn, fn_ty, x, y, z, label);
     }
 
     // Emit `call i1 @llvm.is.fpclass.f64(double x, i32 <mask>)`.
@@ -382,6 +428,10 @@ type struct IntrinsicEmitter {
             IntrinsicKind::Vfprintf => { 3 }
             // fpclass(value: f64, test: i32): value + constant test mask.
             IntrinsicKind::FpClass      => { 2 }
+            // copysign64(magnitude, sign); fma64(x, y, z).  The remaining
+            // cheap-math intrinsics are unary and use the default below.
+            IntrinsicKind::Copysign64   => { 2 }
+            IntrinsicKind::Fma64        => { 3 }
             // atomic_fence(order: i32): single arg.  dirent_* also single
             // arg, so they fall through to the default below.
             _                           => { 1 }
@@ -513,6 +563,28 @@ type struct IntrinsicEmitter {
             //    x's IEEE-754 class is selected by the constant `test`
             //    bitmask.  Exception-free, unlike the old `(x-x)==0` trick. --
             IntrinsicKind::FpClass => { this.emit_fpclass(a0, a1) }
+
+            // -- Cheap IEEE-754 math: each lowers to the matching LLVM float
+            //    intrinsic.  a0 is auto-deref'd via src_type above; the extra
+            //    value args of copysign64/fma64 are deref'd here since the
+            //    shared a1 path only handles the rotate count. --
+            IntrinsicKind::Fabs64   => { this.emit_unary_llvm("llvm.fabs.f64",  LType::f64(), a0, false, "fabs") }
+            IntrinsicKind::Fabs32   => { this.emit_unary_llvm("llvm.fabs.f32",  LType::f32(), a0, false, "fabs") }
+            IntrinsicKind::Floor64  => { this.emit_unary_llvm("llvm.floor.f64", LType::f64(), a0, false, "floor") }
+            IntrinsicKind::Ceil64   => { this.emit_unary_llvm("llvm.ceil.f64",  LType::f64(), a0, false, "ceil") }
+            IntrinsicKind::FTrunc64 => { this.emit_unary_llvm("llvm.trunc.f64", LType::f64(), a0, false, "ftrunc") }
+            IntrinsicKind::Round64  => { this.emit_unary_llvm("llvm.round.f64", LType::f64(), a0, false, "round") }
+            IntrinsicKind::Sqrt64   => { this.emit_unary_llvm("llvm.sqrt.f64",  LType::f64(), a0, false, "sqrt") }
+            IntrinsicKind::Sqrt32   => { this.emit_unary_llvm("llvm.sqrt.f32",  LType::f32(), a0, false, "sqrt") }
+            IntrinsicKind::Copysign64 => {
+                const sign: LValue = this.auto_deref_to(a1, LType::f64());
+                this.emit_binary_llvm("llvm.copysign.f64", LType::f64(), a0, sign, "copysign")
+            }
+            IntrinsicKind::Fma64 => {
+                const y: LValue = this.auto_deref_to(a1, LType::f64());
+                const z: LValue = this.auto_deref_to(args[2], LType::f64());
+                this.emit_ternary_llvm("llvm.fma.f64", LType::f64(), a0, y, z, "fma")
+            }
 
             // -- dirent_name(entry) -> entry == null ? "" : (entry + 19).
             //    d_name is at byte offset 19 in glibc's struct dirent.

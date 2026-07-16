@@ -1,12 +1,16 @@
 ///! math: numeric operations on floats and integers.
 ///!
-///! Float functions are thin wrappers over libm and inherit its
-///! platform behavior (rounding mode, errno on domain errors,
-///! subnormal handling); we don't re-derive the IEEE 754 corner cases
-///! in Cryo. Naming follows C: `sqrt`, `ln`, `sin`, `atan2`. f64 is the
-///! default; an `_f32` suffix marks a single-precision variant, and
-///! integer variants carry an `_i64` / `_u64` / `_i32` suffix (the
-///! plain name is the f64 form).
+///! Transcendentals (`sin`, `exp`, `pow`, ...) are thin wrappers over
+///! libm and inherit its platform behavior (rounding mode, errno on
+///! domain errors, subnormal handling); we don't re-derive those IEEE
+///! 754 corner cases in Cryo. Classification and the cheap ops
+///! (`fabs`, `floor`, `round`, `copysign`, `sqrt`, `mul_add`, ...) are
+///! Cryo-owned compiler intrinsics lowered to LLVM float intrinsics -
+///! same results as the libm functions of the same name, but no libm
+///! dependency and no errno. Naming follows C: `sqrt`, `ln`, `sin`,
+///! `atan2`. f64 is the default; an `_f32` suffix marks a
+///! single-precision variant, and integer variants carry an `_i64` /
+///! `_u64` / `_i32` suffix (the plain name is the f64 form).
 
 namespace std::math;
 
@@ -52,8 +56,8 @@ function nan() -> f64 { const inf: f64 = infinity(); return inf - inf; }
 
 // --- roots & powers ----------------------------------------------------
 
-function sqrt(value: f64) -> f64 { return libc::sqrt(value); }
-function sqrt_f32(value: f32) -> f32 { return libc::sqrtf(value); }
+function sqrt(value: f64) -> f64 { return intrinsics::sqrt64(value); }
+function sqrt_f32(value: f32) -> f32 { return intrinsics::sqrt32(value); }
 function cbrt(value: f64) -> f64 { return libc::cbrt(value); }
 function pow(base: f64, exponent: f64) -> f64 { return libc::pow(base, exponent); }
 
@@ -83,7 +87,7 @@ function powi(base: f64, exp: i64) -> f64 {
 
 /// Fused multiply-add: `a * b + c` computed with a single rounding (IEEE
 /// fma), more accurate than performing the multiply and add separately.
-function mul_add(a: f64, b: f64, c: f64) -> f64 { return libc::fma(a, b, c); }
+function mul_add(a: f64, b: f64, c: f64) -> f64 { return intrinsics::fma64(a, b, c); }
 
 // --- exponential & logarithm -------------------------------------------
 
@@ -124,22 +128,26 @@ function to_degrees(radians: f64) -> f64 { return radians * (180.0 / PI); }
 
 // --- rounding ----------------------------------------------------------
 
-function floor(value: f64) -> f64 { return libc::floor(value); }
-function ceil(value: f64) -> f64 { return libc::ceil(value); }
-function round(value: f64) -> f64 { return libc::round(value); }
-function trunc(value: f64) -> f64 { return libc::trunc(value); }
+function floor(value: f64) -> f64 { return intrinsics::floor64(value); }
+function ceil(value: f64) -> f64 { return intrinsics::ceil64(value); }
+
+/// Round to the nearest integer, halfway cases away from zero
+/// (`round(2.5) == 3.0`, `round(-2.5) == -3.0`) - C `round` semantics,
+/// not the current-rounding-mode `rint`/`nearbyint`.
+function round(value: f64) -> f64 { return intrinsics::round64(value); }
+function trunc(value: f64) -> f64 { return intrinsics::ftrunc64(value); }
 
 /// Fractional part, with the sign of `value` (`fract(-2.25) == -0.25`).
-function fract(value: f64) -> f64 { return value - libc::trunc(value); }
+function fract(value: f64) -> f64 { return value - intrinsics::ftrunc64(value); }
 
 // --- sign & absolute value ---------------------------------------------
 
-function fabs(value: f64) -> f64 { return libc::fabs(value); }
-function fabs_f32(value: f32) -> f32 { return libc::fabsf(value); }
+function fabs(value: f64) -> f64 { return intrinsics::fabs64(value); }
+function fabs_f32(value: f32) -> f32 { return intrinsics::fabs32(value); }
 
 /// `magnitude` with the sign of `sign` (IEEE copysign).
 function copysign(magnitude: f64, sign: f64) -> f64 {
-    return libc::copysign(magnitude, sign);
+    return intrinsics::copysign64(magnitude, sign);
 }
 
 /// Floating-point remainder of `x / y` (IEEE fmod).
