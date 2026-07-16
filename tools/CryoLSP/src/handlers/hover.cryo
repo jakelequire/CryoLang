@@ -200,19 +200,12 @@ public function handle_hover_ex(docs: &Docs, sessions: mut &SessionMap,
     // like the source line and matches how editors show signatures.
     if (on_decl_name && node.kind == NodeKind::FunctionDeclaration) {
         const f: FunctionDeclNode* = node as FunctionDeclNode*;
-        // Trait methods are stored as bare `FunctionDeclNode*` on
-        // `TraitDeclNode.methods`, not as `MethodNode*`.  Detect that
-        // case by reverse-walking the module graph; when found, render
-        // as `Trait::name(...)` instead of the free-function form.
-        const trait_owner: SymbolStr = NodeLocator::find_trait_for_function(
-            ctx.module_graph, f);
-        if (trait_owner.is_valid()) {
-            const owner_str: string = HoverEngine::leaf_after_separator(
-                ctx.intern_table.resolve(trait_owner));
-            content = eng.format_trait_method_signature(f, owner_str);
-        } else {
-            content = eng.format_function_signature(f);
-        }
+        // A bare `FunctionDeclNode*` can be a trait method (stored on
+        // `TraitDeclNode.methods`, no `MethodNode` wrapper), an extern
+        // declaration (on `ExternBlockNode.functions`), or a free
+        // function; `format_callable_decl` reverse-walks the graph and
+        // renders the matching form.
+        content    = eng.format_callable_decl(f);
         hover_span = name_span;
         doc_text   = f.documentation;
     } else if (on_decl_name && node.kind == NodeKind::MethodDeclaration) {
@@ -347,7 +340,7 @@ public function handle_hover_ex(docs: &Docs, sessions: mut &SessionMap,
                 const f: FunctionDeclNode* = NodeLocator::find_function_in_modules(
                     ctx.module_graph, sr.member_name);
                 if (f != null) {
-                    content  = eng.format_function_signature(f);
+                    content  = eng.format_callable_decl(f);
                     doc_text = f.documentation;
                 } else {
                     // Enum-variant fallback.  `find_type_decl_in_modules`
@@ -814,16 +807,7 @@ public function handle_hover_ex(docs: &Docs, sessions: mut &SessionMap,
                     const fdecl: FunctionDeclNode* = eng.function_decl_at_span(
                         sym.declaring_span);
                     if (fdecl != null) {
-                        const trait_owner: SymbolStr = NodeLocator::find_trait_for_function(
-                            ctx.module_graph, fdecl);
-                        if (trait_owner.is_valid()) {
-                            const owner_str: string = HoverEngine::leaf_after_separator(
-                                ctx.intern_table.resolve(trait_owner));
-                            content = eng.format_trait_method_signature(
-                                fdecl, owner_str);
-                        } else {
-                            content = eng.format_function_signature(fdecl);
-                        }
+                        content  = eng.format_callable_decl(fdecl);
                         doc_text = fdecl.documentation;
                     }
                 }
@@ -1126,7 +1110,7 @@ type struct HoverEngine {
         }
         sig = sig + this.arena.intern_table.resolve(func.name);
         sig = sig + this.format_generic_params(func.generic_params);
-        sig = sig + this.format_params(func.parameters);
+        sig = sig + this.format_params(func.parameters, func.is_variadic);
         sig = sig + " -> ";
         sig = sig + this.arena.resolve_display_name_short(func.resolved_return_type.id);
         sig = sig + this.format_where_clause(func.trait_bounds);
@@ -1139,11 +1123,52 @@ type struct HoverEngine {
         sig = sig + "function ";
         sig = sig + this.arena.intern_table.resolve(func.name);
         sig = sig + this.format_generic_params(func.generic_params);
-        sig = sig + this.format_params(func.parameters);
+        sig = sig + this.format_params(func.parameters, func.is_variadic);
         sig = sig + " -> ";
         sig = sig + this.arena.resolve_display_name_short(func.resolved_return_type.id);
         sig = sig + this.format_where_clause(func.trait_bounds);
         return sig;
+    }
+
+    /// Render an extern declaration as
+    /// `extern "C" function syscall(number: Syscall, ...) -> i64`.
+    /// Directives come from BOTH levels: the block's (`![target(linux)]`
+    /// gates the whole `extern "C" { ... }`) and the function's own
+    /// (`![symbol("lseek64")]`), in that source order.
+    format_extern_function_signature(&this, func: FunctionDeclNode*,
+                                     block: ExternBlockNode*) -> string {
+        if (func == null || block == null) { return ""; }
+        mut sig: string = HoverEngine::directives_prefix(block as DeclarationNode*);
+        sig = sig + HoverEngine::directives_prefix(func as DeclarationNode*);
+        sig = sig + "extern \"" + block.linkage_type + "\" function ";
+        sig = sig + this.arena.intern_table.resolve(func.name);
+        sig = sig + this.format_params(func.parameters, func.is_variadic);
+        sig = sig + " -> ";
+        sig = sig + this.arena.resolve_display_name_short(func.resolved_return_type.id);
+        return sig;
+    }
+
+    /// Render a bare `FunctionDeclNode*` in its declaration form, decided
+    /// by where the graph declares it: a trait's method
+    /// (`Display::fmt(...)`), an extern declaration (`extern "C" function
+    /// ...`), or a free function (`function ...`).  Single dispatch point
+    /// for the decl-name, identifier-call-site, and scope-resolution
+    /// hovers, which previously each re-implemented the trait check.
+    format_callable_decl(&this, func: FunctionDeclNode*) -> string {
+        if (func == null) { return ""; }
+        const trait_owner: SymbolStr = NodeLocator::find_trait_for_function(
+            this.graph, func);
+        if (trait_owner.is_valid()) {
+            const owner_str: string = HoverEngine::leaf_after_separator(
+                this.intern.resolve(trait_owner));
+            return this.format_trait_method_signature(func, owner_str);
+        }
+        const eb: ExternBlockNode* = NodeLocator::find_extern_block_for_function(
+            this.graph, func);
+        if (eb != null) {
+            return this.format_extern_function_signature(func, eb);
+        }
+        return this.format_function_signature(func);
     }
 
     /// Render a method as `<modifier>? <Owner>::<name>(<params>) -> <ret>`.
@@ -1174,7 +1199,7 @@ type struct HoverEngine {
         }
         sig = sig + this.arena.intern_table.resolve(f.name);
         sig = sig + this.format_generic_params(f.generic_params);
-        sig = sig + this.format_params(f.parameters);
+        sig = sig + this.format_params(f.parameters, f.is_variadic);
         sig = sig + " -> ";
         sig = sig + this.arena.resolve_display_name_short(f.resolved_return_type.id);
         sig = sig + this.format_where_clause(f.trait_bounds);
@@ -1336,7 +1361,7 @@ type struct HoverEngine {
                         const m: FunctionDeclNode* = d.methods[i];
                         if (m == null) { continue; }
                         sig = sig + "    " + this.arena.intern_table.resolve(m.name)
-                            + this.format_params(m.parameters)
+                            + this.format_params(m.parameters, m.is_variadic)
                             + " -> "
                             + this.arena.resolve_display_name_short(m.resolved_return_type.id)
                             + ";\n";
@@ -1944,7 +1969,25 @@ type struct HoverEngine {
         };
     }
 
-    format_params(&this, params: &VarDeclNode*[]) -> string {
+    /// `is_variadic` renders the function's varargs the way source spells
+    /// them.  Two forms (see `parse_parameter_list`): the named tail
+    /// `args...` keeps its param in the list (so the body can reference
+    /// it) but with NO type annotation - rendered `args...`; the bare
+    /// extern-C `...` pushes no param at all - rendered as a trailing
+    /// `...` after the fixed params.
+    format_params(&this, params: &VarDeclNode*[], is_variadic: boolean) -> string {
+        mut named_va_idx: i64 = -1;
+        if (is_variadic && params.length > 0) {
+            const last: VarDeclNode* = params[params.length - 1];
+            if (last != null && last.type_annotation == null) {
+                const lraw: string = this.arena.intern_table.resolve(last.name);
+                // Never mistake an annotation-less receiver for the
+                // variadic tail (a by-value `this` in a trait template).
+                if (strcmp(HoverEngine::param_name_display(lraw), "this") != 0) {
+                    named_va_idx = params.length - 1;
+                }
+            }
+        }
         mut s: string = "(";
         for (mut i: i64 = 0; i < params.length; i++) {
             if (i > 0) { s = s + ", "; }
@@ -1952,6 +1995,10 @@ type struct HoverEngine {
             if (p == null) { continue; }
             const raw: string = this.arena.intern_table.resolve(p.name);
             s = s + HoverEngine::param_name_display(raw);
+            if (i == named_va_idx) {
+                s = s + "...";
+                continue;
+            }
             // A by-value `this` receiver in a trait template has no resolved
             // self type yet - render bare `this` (as written in source),
             // not `this: ?`.  The `&this` / `mut &this` forms always carry a
@@ -1962,6 +2009,10 @@ type struct HoverEngine {
                 s = s + ": ";
                 s = s + this.arena.resolve_display_name_short(p.resolved_type.id);
             }
+        }
+        if (is_variadic && named_va_idx < 0) {
+            if (params.length > 0) { s = s + ", "; }
+            s = s + "...";
         }
         return s + ")";
     }
