@@ -216,6 +216,9 @@ change. The switch exists and defaults to libc.
 
 **Risk:** low. This is scaffolding.
 
+> **Status: DONE** (committed `d9f8ee35`). `sys` seam + `native_syscalls` switch
+> landed; both pins refreshed.
+
 ### Stage 1 — Pure-computation wins
 
 **Goal:** remove libc surface that has *no OS dependency at all* — the safest
@@ -248,6 +251,20 @@ the libc `isnan`/`finite` family; selfhost + tests green. `-lm` still linked
 (for transcendentals) but the surface is smaller.
 
 **Risk:** low. Pure functions, easily differential-tested against libm.
+
+> **Status: classification DONE** (committed `dc8ad4c5`): `fpclass` compiler
+> intrinsic → `llvm.is.fpclass.f64` (replaced the exception-raising `isfinite`
+> `(x-x)==0` trick); `is_nan`/`is_infinite`/`is_finite`/`is_normal`/
+> `is_sign_negative`/`classify() -> FpCategory` in pure Cryo; libc
+> classification externs deleted from `ffi::libc`; edge-case tests added.
+> The `nested_match_neg` failure this exposed was a PRE-EXISTING compiler bug
+> (same-leaf expected-type hint poisoning generic-enum ctor args, Windows-only
+> by module-registration order), root-caused and fixed 2026-07-16 in
+> `sema/call_resolver.cryo` (locals-shadow + qualified-before-bare) plus an
+> E0600 codegen backstop in `enum_variant_emitter.cryo` so a dropped payload
+> store can never again be silent.
+> **Remaining in Stage 1:** `fabs`/`floor`/`ceil`/`trunc`/`round`/`copysign` +
+> `sqrt`/`fma` via LLVM intrinsics (the "cheap math" half) — libm still linked.
 
 ### Stage 2 — Native Linux syscall backend (the keystone)
 
