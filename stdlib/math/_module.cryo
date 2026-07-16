@@ -12,6 +12,8 @@ namespace std::math;
 
 import ffi::libc;
 import core::option;
+import core::intrinsics;
+import core::mem;
 
 // --- constants ---------------------------------------------------------
 
@@ -242,36 +244,48 @@ function clamp_u64(value: u64, lo: u64, hi: u64) -> u64 {
 
 // --- classification ----------------------------------------------------
 //
-// `isnan` / `isinf` in libc are macros; the underlying primitive
-// implementations are exposed under different names per platform:
-//   - glibc:    `__isnan`, `__isinf`, `__finite`
-//   - msvcrt:   `_isnan`, `_finite`  (no `_isinf` export - derive it)
-// Both surfaces live in `ffi::libc` behind their own `![target(...)]`
-// gates.
+// IEEE-754 class tests via the `fpclass` intrinsic (LLVM `llvm.is.fpclass`):
+// pure bit-class predicates with no libm dependency and no FP exceptions,
+// so they are platform-independent - no per-OS libc name gymnastics.  Each
+// `test` literal selects which classes count as true; the bit meanings are
+// documented on `intrinsics::fpclass`.
 
-![target(linux)]
-function is_nan(value: f64) -> boolean { return libc::__isnan(value) != 0; }
-
-![target(linux)]
-function is_infinite(value: f64) -> boolean { return libc::__isinf(value) != 0; }
-
-![target(linux)]
-function is_finite(value: f64) -> boolean {
-    return libc::__finite(value) != 0;
+/// IEEE-754 value categories, as returned by `classify`.
+type enum FpCategory {
+    Nan;
+    Infinite;
+    Zero;
+    Subnormal;
+    Normal;
 }
 
-![target(windows)]
-function is_nan(value: f64) -> boolean { return libc::_isnan(value) != 0; }
+/// True if `value` is NaN (quiet or signaling).
+function is_nan(value: f64) -> boolean { return intrinsics::fpclass(value, 0x003); }
 
-![target(windows)]
-function is_finite(value: f64) -> boolean { return libc::_finite(value) != 0; }
+/// True if `value` is positive or negative infinity.
+function is_infinite(value: f64) -> boolean { return intrinsics::fpclass(value, 0x204); }
 
-// msvcrt has no direct `_isinf`; `!finite && !nan` is the standard
-// derivation and matches what C99's `isinf` macro is defined to do
-// for any value that compares unequal to itself only when NaN.
-![target(windows)]
-function is_infinite(value: f64) -> boolean {
-    return !is_finite(value) && !is_nan(value);
+/// True if `value` is finite - neither NaN nor infinite.  Includes +/-0
+/// and subnormals.
+function is_finite(value: f64) -> boolean { return intrinsics::fpclass(value, 0x1F8); }
+
+/// True if `value` is a normal number: finite, nonzero, and not subnormal.
+function is_normal(value: f64) -> boolean { return intrinsics::fpclass(value, 0x108); }
+
+/// True if `value`'s IEEE-754 sign bit is set.  Unlike the class tests this
+/// reports the raw sign bit, so it is true for -0.0 and negative NaNs too.
+/// A single bit read - no libm.
+function is_sign_negative(value: f64) -> boolean {
+    return (mem::transmute<f64, u64>(value) >> 63) != 0;
+}
+
+/// Classify `value` into its IEEE-754 category.
+function classify(value: f64) -> FpCategory {
+    if (intrinsics::fpclass(value, 0x003)) { return FpCategory::Nan; }
+    if (intrinsics::fpclass(value, 0x204)) { return FpCategory::Infinite; }
+    if (intrinsics::fpclass(value, 0x060)) { return FpCategory::Zero; }
+    if (intrinsics::fpclass(value, 0x090)) { return FpCategory::Subnormal; }
+    return FpCategory::Normal;
 }
 
 // --- integer helpers ---------------------------------------------------
