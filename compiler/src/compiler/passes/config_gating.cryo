@@ -107,11 +107,17 @@ implement enum HostOS {
 /// The active build configuration a `![config(...)]` gate resolves against:
 /// the target OS plus the low-level feature flags.  Replaces the bare
 /// `HostOS` that used to thread through the gating routines so that non-OS
-/// atoms (`native_syscalls`, ...) can gate on a build flag instead of the
+/// atoms (`native_alloc`, ...) can gate on a build flag instead of the
 /// target triple.
+///
+/// Feature flags here are MIGRATION SWITCHES, not product features: a flag
+/// exists while a subsystem's native reimplementation bakes against its libc
+/// predecessor, and is deleted (with its gated arms collapsing to the native
+/// implementation) once proven.  `native_syscalls` (Stage 2) already
+/// completed that lifecycle.
 type struct CfgEnv {
     os: HostOS;
-    native_syscalls: boolean;
+    native_alloc: boolean;
 
     /// Resolve from CompilationContext: OS from the effective target triple
     /// (honors `--target` / cryoconfig, host fallback), feature flags from
@@ -119,36 +125,27 @@ type struct CfgEnv {
     static from_ctx(ctx: CompilationContext*) -> CfgEnv {
         const triple: string = LTargetMachine::resolve_effective_triple(ctx.target_triple);
         const os: HostOS = HostOS::from_triple(triple);
-        // `native_syscalls` selects the native LINUX syscall backend
-        // (Low-Level Plan Stage 2); on any other target the flag is
-        // meaningless, so it is clamped off here - the single point every
-        // `![config(native_syscalls)]` gate resolves through.  Without the
-        // clamp, a Windows build with the flag set would strip BOTH arms of
-        // a native/libc function pair (the native arm by its
-        // `![target(linux)]` gate, the libc arm by `not(native_syscalls)`)
-        // and fail name resolution instead of degrading to the libc backend.
-        mut native: boolean = ctx.native_syscalls;
-        const is_linux: boolean = match (os) {
-            HostOS::Linux => { true }
-            _             => { false }
-        };
-        if (native && !is_linux) { native = false; }
+        // `native_alloc` selects the native mmap-backed heap behind
+        // `GlobalAlloc` (Low-Level Plan Stage 3).  NOT clamped per-OS: the
+        // allocator is dual-OS by design (page provider = `sys::mmap` on
+        // unix, `VirtualAlloc` on windows), so the flag is meaningful on
+        // every supported target.
         return CfgEnv {
             os: os,
-            native_syscalls: native,
+            native_alloc: ctx.native_alloc,
         };
     }
 
     /// True if `atom` names a known non-OS feature flag (parallels
     /// `HostOS::is_os_atom`).  Keep in sync with `feature_active`.
     static is_feature_atom(atom: string) -> boolean {
-        return atom.eq("native_syscalls");
+        return atom.eq("native_alloc");
     }
 
     /// Evaluate a known feature atom against this env's flags.  Precondition:
     /// `CfgEnv::is_feature_atom(atom)` is true.
     feature_active(&this, atom: string) -> boolean {
-        if (atom.eq("native_syscalls")) { return this.native_syscalls; }
+        if (atom.eq("native_alloc")) { return this.native_alloc; }
         return false;
     }
 }

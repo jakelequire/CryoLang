@@ -6,10 +6,9 @@
 ///!
 ///!   - Linux x86_64: the full `*` number table, typed wrappers for the
 ///!     common-case syscalls (via the libc `syscall(number, ...)`
-///!     trampoline), and the `sys_call0..6` escape hatch, which is
-///!     dual-backend: libc trampoline by default, raw `syscall`
-///!     instruction via inline asm under `[low_level] native_syscalls`
-///!     (see the block comment at `sys_call0`).
+///!     trampoline), and the `sys_call0..6` generic entry points, which
+///!     issue the raw `syscall` instruction via inline asm - no libc
+///!     involvement (see the block comment at `sys_call0`).
 ///!   - Windows x86_64: the Win32 system surface (kernel32.dll,
 ///!     user32.dll, advapi32.dll, etc.) plus a small NT API surface
 ///!     (ntdll.dll) for programs that want to skip Win32.
@@ -1127,7 +1126,7 @@ function sys_landlock_restrict_self(ruleset_fd: i32, flags: u32) -> i32 {
 // six i64-shaped arguments. Useful for syscalls that don't yet have a
 // typed wrapper above. Pre-cast non-i64 args at the call site.
 //
-// ## Contract: the RAW KERNEL convention, identical in both backends
+// ## Contract: the RAW KERNEL convention
 //
 // `sys_callN` returns the kernel's result register untranslated: a value
 // in `[-4095, -1]` is `-errno` (`-EINTR` == -4, `-ENOENT` == -2, ...);
@@ -1139,80 +1138,25 @@ function sys_landlock_restrict_self(ruleset_fd: i32, flags: u32) -> i32 {
 // arch) must apply the `-4095..-1` window themselves, exactly as with a
 // raw kernel return.
 //
-// ## Backends (Low-Level Plan Stage 2)
+// ## Implementation (Low-Level Plan Stage 2)
 //
-// Each arity has two bodies selected at compile time by the
-// `[low_level] native_syscalls` cryoconfig flag:
-//
-//   - OFF (default): forward through libc's `syscall()` trampoline, then
-//     convert its `-1`-plus-`errno` back to `-errno` so the contract is
-//     backend-independent. (`-1` is the trampoline's only error return;
-//     glibc maps exactly the kernel's `[-4095, -1]` window onto it.)
-//   - ON: issue the `syscall` instruction directly via inline asm - no
-//     libc involvement. x86-64 kernel ABI: number in `rax`, args in
-//     `rdi`/`rsi`/`rdx`/`r10`/`r8`/`r9` (NOT `rcx` - the instruction
-//     itself overwrites `rcx` with the return RIP and `r11` with
-//     RFLAGS, which is why both are clobbered), result in `rax`. The
-//     `memory` clobber orders the call against surrounding loads/stores
-//     since the kernel reads/writes user memory through pointer args the
-//     optimizer cannot see. The `mov reg, ${x:"reg"}` lines assemble to
-//     self-moves (a pinned operand substitutes as its register name);
-//     they exist to BIND each value to its ABI register - LLVM places
-//     the values before the block runs.
-
-/// libc-side error translation for the OFF backend: the trampoline's
-/// `-1`-plus-`errno` becomes the seam's `-errno`.
-![target(linux)]
-![config(not(native_syscalls))]
-private function trampoline_result(r: i64) -> i64 {
-    if (r == -1) { return -(libc::errno() as i64); }
-    return r;
-}
+// The `syscall` instruction issued directly via inline asm - no libc
+// involvement. Landed behind a `native_syscalls` migration switch, proven
+// (object inspection, differential gate, dual-OS selfhost fixed point),
+// then the libc-trampoline arm and the switch were deleted: on Linux the
+// kernel syscall interface IS the stable ABI, so this is simply the
+// implementation. x86-64 kernel ABI: number in `rax`, args in
+// `rdi`/`rsi`/`rdx`/`r10`/`r8`/`r9` (NOT `rcx` - the instruction
+// itself overwrites `rcx` with the return RIP and `r11` with
+// RFLAGS, which is why both are clobbered), result in `rax`. The
+// `memory` clobber orders the call against surrounding loads/stores
+// since the kernel reads/writes user memory through pointer args the
+// optimizer cannot see. The `mov reg, ${x:"reg"}` lines assemble to
+// self-moves (a pinned operand substitutes as its register name);
+// they exist to BIND each value to its ABI register - LLVM places
+// the values before the block runs.
 
 ![target(linux)]
-![config(not(native_syscalls))]
-function sys_call0(num: Syscall) -> i64 {
-    return trampoline_result(syscall(num));
-}
-
-![target(linux)]
-![config(not(native_syscalls))]
-function sys_call1(num: Syscall, a: i64) -> i64 {
-    return trampoline_result(syscall(num, a));
-}
-
-![target(linux)]
-![config(not(native_syscalls))]
-function sys_call2(num: Syscall, a: i64, b: i64) -> i64 {
-    return trampoline_result(syscall(num, a, b));
-}
-
-![target(linux)]
-![config(not(native_syscalls))]
-function sys_call3(num: Syscall, a: i64, b: i64, c: i64) -> i64 {
-    return trampoline_result(syscall(num, a, b, c));
-}
-
-![target(linux)]
-![config(not(native_syscalls))]
-function sys_call4(num: Syscall, a: i64, b: i64, c: i64, d: i64) -> i64 {
-    return trampoline_result(syscall(num, a, b, c, d));
-}
-
-![target(linux)]
-![config(not(native_syscalls))]
-function sys_call5(num: Syscall, a: i64, b: i64, c: i64, d: i64, e: i64) -> i64 {
-    return trampoline_result(syscall(num, a, b, c, d, e));
-}
-
-![target(linux)]
-![config(not(native_syscalls))]
-function sys_call6(num: Syscall, a: i64, b: i64, c: i64, d: i64, e: i64, f: i64) -> i64 {
-    return trampoline_result(syscall(num, a, b, c, d, e, f));
-}
-
-![target(linux)]
-![config(native_syscalls)]
 function sys_call0(num: Syscall) -> i64 {
     const n: i64 = num as i64;
     mut ret: i64 = 0;
@@ -1227,7 +1171,6 @@ function sys_call0(num: Syscall) -> i64 {
 }
 
 ![target(linux)]
-![config(native_syscalls)]
 function sys_call1(num: Syscall, a: i64) -> i64 {
     const n: i64 = num as i64;
     mut ret: i64 = 0;
@@ -1243,7 +1186,6 @@ function sys_call1(num: Syscall, a: i64) -> i64 {
 }
 
 ![target(linux)]
-![config(native_syscalls)]
 function sys_call2(num: Syscall, a: i64, b: i64) -> i64 {
     const n: i64 = num as i64;
     mut ret: i64 = 0;
@@ -1260,7 +1202,6 @@ function sys_call2(num: Syscall, a: i64, b: i64) -> i64 {
 }
 
 ![target(linux)]
-![config(native_syscalls)]
 function sys_call3(num: Syscall, a: i64, b: i64, c: i64) -> i64 {
     const n: i64 = num as i64;
     mut ret: i64 = 0;
@@ -1278,7 +1219,6 @@ function sys_call3(num: Syscall, a: i64, b: i64, c: i64) -> i64 {
 }
 
 ![target(linux)]
-![config(native_syscalls)]
 function sys_call4(num: Syscall, a: i64, b: i64, c: i64, d: i64) -> i64 {
     const n: i64 = num as i64;
     mut ret: i64 = 0;
@@ -1297,7 +1237,6 @@ function sys_call4(num: Syscall, a: i64, b: i64, c: i64, d: i64) -> i64 {
 }
 
 ![target(linux)]
-![config(native_syscalls)]
 function sys_call5(num: Syscall, a: i64, b: i64, c: i64, d: i64, e: i64) -> i64 {
     const n: i64 = num as i64;
     mut ret: i64 = 0;
@@ -1317,7 +1256,6 @@ function sys_call5(num: Syscall, a: i64, b: i64, c: i64, d: i64, e: i64) -> i64 
 }
 
 ![target(linux)]
-![config(native_syscalls)]
 function sys_call6(num: Syscall, a: i64, b: i64, c: i64, d: i64, e: i64, f: i64) -> i64 {
     const n: i64 = num as i64;
     mut ret: i64 = 0;
