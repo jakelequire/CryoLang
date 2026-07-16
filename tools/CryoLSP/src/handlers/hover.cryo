@@ -226,7 +226,7 @@ public function handle_hover_ex(docs: &Docs, sessions: mut &SessionMap,
             const owner_str: string = if (owner.is_valid()) {
                 HoverEngine::leaf_after_separator(ctx.type_arena.intern_table.resolve(owner))
             } else { "" };
-            content    = eng.format_method_signature(m, owner_str);
+            content    = eng.format_method_signature_full(m, owner_str);
             hover_span = name_span;
             doc_text   = m.documentation;
         }
@@ -341,7 +341,7 @@ public function handle_hover_ex(docs: &Docs, sessions: mut &SessionMap,
             if (m != null && m.func != null) {
                 const owner_str: string = HoverEngine::leaf_after_separator(
                     ctx.type_arena.intern_table.resolve(sr.scope_name));
-                content  = eng.format_method_signature(m, owner_str);
+                content  = eng.format_method_signature_full(m, owner_str);
                 doc_text = m.documentation;
             } else {
                 const f: FunctionDeclNode* = NodeLocator::find_function_in_modules(
@@ -520,7 +520,7 @@ public function handle_hover_ex(docs: &Docs, sessions: mut &SessionMap,
                     const m: MethodNode* = NodeLocator::find_method_in_modules(
                         ctx.module_graph, ctx.intern_table, type_sym, ma.member);
                     if (m != null && m.func != null) {
-                        content  = eng.format_method_signature(m, owner_display);
+                        content  = eng.format_method_signature_full(m, owner_display);
                         doc_text = m.documentation;
                     } else {
                         const fld: FieldDeclNode* = NodeLocator::find_field_in_modules(
@@ -1120,7 +1120,7 @@ type struct HoverEngine {
     format_trait_method_signature(&this, func: FunctionDeclNode*,
                                   owner_display: string) -> string {
         if (func == null) { return ""; }
-        mut sig: string = "";
+        mut sig: string = HoverEngine::directives_prefix(func as DeclarationNode*);
         if (owner_display != "") {
             sig = sig + owner_display + "::";
         }
@@ -1135,7 +1135,8 @@ type struct HoverEngine {
 
     format_function_signature(&this, func: FunctionDeclNode*) -> string {
         if (func == null) { return ""; }
-        mut sig: string = "function ";
+        mut sig: string = HoverEngine::directives_prefix(func as DeclarationNode*);
+        sig = sig + "function ";
         sig = sig + this.arena.intern_table.resolve(func.name);
         sig = sig + this.format_generic_params(func.generic_params);
         sig = sig + this.format_params(func.parameters);
@@ -1180,6 +1181,64 @@ type struct HoverEngine {
         return sig;
     }
 
+    /// Main-hover variant of `format_method_signature`: prefixes the
+    /// method's attached `![...]` directives above the signature.  The
+    /// expanded-hover listings (`format_inline_methods` /
+    /// `format_impl_methods`) keep calling the bare form - a multi-line
+    /// directive prefix would break their one-line-per-method indentation.
+    format_method_signature_full(&this, method: MethodNode*,
+                                 owner_display: string) -> string {
+        const sig: string = this.format_method_signature(method, owner_display);
+        if (sig == "") { return ""; }
+        return HoverEngine::directives_prefix(method as DeclarationNode*) + sig;
+    }
+
+
+    // Directive rendering
+    //
+    // Declarations carry their source-order `![...]` directives on
+    // `DeclarationNode.attached_directives` (parser-attached; config
+    // gating and directive processing read them but never strip them).
+    // Hover renders them above the signature exactly as written in
+    // source, e.g. `![target(linux)]` above `sys_lseek`.
+
+    /// Render one directive body (no `![ ]` wrapper): `target(linux)`,
+    /// `symbol("lseek64")`, `config(not(windows))`.  Nested directive
+    /// calls recurse; leaf args reuse `DirectiveArg::to_text`.
+    static render_directive(d: DirectiveNode*) -> string {
+        if (d == null) { return ""; }
+        mut s: string = d.directive_kind;
+        if (d.args.length > 0) {
+            s = s + "(";
+            for (mut i: i64 = 0; i < d.args.length; i++) {
+                if (i > 0) { s = s + ", "; }
+                const a: DirectiveArg = d.args[i];
+                if (a.kind == DirectiveArgKind::Nested) {
+                    s = s + HoverEngine::render_directive(a.nested);
+                } else {
+                    s = s + a.to_text();
+                }
+            }
+            s = s + ")";
+        }
+        return s;
+    }
+
+    /// A decl's attached directives as a hover prefix - one `![...]` per
+    /// line, each newline-terminated so the signature follows below.
+    /// "" when the decl is null or carries no directives, so callers can
+    /// unconditionally concatenate.
+    static directives_prefix(decl: DeclarationNode*) -> string {
+        if (decl == null || decl.attached_directives.length == 0) { return ""; }
+        mut s: string = "";
+        for (mut i: i64 = 0; i < decl.attached_directives.length; i++) {
+            const d: DirectiveNode* = decl.attached_directives[i];
+            if (d == null) { continue; }
+            s = s + "![" + HoverEngine::render_directive(d) + "]\n";
+        }
+        return s;
+    }
+
     /// Render a struct/class field as `<name>: <Type>`.  No `field`
     /// keyword: the surrounding `type struct/class` already conveys
     /// it, and source uses just `name: Type` for fields.
@@ -1206,7 +1265,7 @@ type struct HoverEngine {
     /// make the type-hover unwieldy for stdlib types like `HashMap` or
     /// `Array`.  Empty bodies collapse to just the head.
     format_type_decl(&this, node: ASTNode*) -> string {
-        return match (node.kind) {
+        const body: string = match (node.kind) {
             NodeKind::StructDeclaration => {
                 const d: StructDeclNode* = node as StructDeclNode*;
                 mut sig: string = "type struct " + this.arena.intern_table.resolve(d.name)
@@ -1301,6 +1360,10 @@ type struct HoverEngine {
             }
             _ => { "" }
         };
+        if (body == "") { return ""; }
+        // All five matched kinds inherit DeclarationNode; prepend any
+        // attached `![...]` directives (`![repr(c)]`, `![align(16)]`, ...).
+        return HoverEngine::directives_prefix(node as DeclarationNode*) + body;
     }
 
     /// Render the type's INLINE methods (declared directly in the struct /
