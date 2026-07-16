@@ -46,11 +46,20 @@ long-horizon change safe to pursue incrementally.
    projects). The compiler links this stdlib and exercises the allocator, I/O,
    and threading harder than any test — a broken primitive shows up as a
    self-host failure immediately.
-2. **Dual-backed, switchable, reversible.** Each primitive keeps its libc-backed
-   implementation behind a build/config switch until the native one is proven in
-   the wild. A regression must be bisectable to a single flag flip, never a
-   rewrite. No stage deletes the libc path in the same change that adds the
-   native one.
+2. **Switches are migration aids, not product features.** *(Revised 2026-07-16
+   — "burn the boats, keep the tests".)* A high-risk primitive (the allocator)
+   may land behind a temporary `[low_level]` config switch so a regression is
+   bisectable to a flag flip while it bakes — but the switch and the libc arm
+   are **deleted at the stage boundary once the native implementation is
+   proven** (differential tests + dual-OS self-host fixed point). At most one
+   migration switch is live at a time. Low-risk mechanical stages (4, 6) use
+   no switch at all: direct rewires, verified by the permanent test
+   discipline. Per-OS `![target(...)]` splits are not switches — they encode
+   genuine platform differences and are permanent. The caution that stays
+   forever is principle #4's verification, not runtime escape hatches; git
+   history is the rollback lever after a switch is gone. (`native_syscalls`
+   completed this lifecycle in Stage 2: landed switched, proven, switch
+   deleted — raw syscalls are simply THE Linux implementation now.)
 3. **One OS, one arch first.** **x86-64 Linux is the beachhead.** Windows is a
    *different problem* (see §4) and stays on Win32/NT — which is already not
    glibc. aarch64 is deferred until the compiler emits aarch64 codegen at all
@@ -309,6 +318,37 @@ selfhost + tests green with the switch in **both** positions.
 the ABI details (clobbers, 6th-arg register, `EINTR`) demand care. Low blast
 radius because it's opt-in and nothing consumes it yet.
 
+> **Status: DONE.** `syscall::sys_call0..6` are now dual-backed: the default
+> libc-trampoline body (now normalizing the trampoline's `-1`+errno to the
+> seam's raw `-errno` contract) and, under `[low_level] native_syscalls`, an
+> inline-asm body issuing the x86-64 `syscall` instruction directly (number in
+> `rax`, args in `rdi/rsi/rdx/r10/r8/r9`, `rcx`/`r11`/`memory` clobbered).
+> The `std::sys` seam (`read`/`write`/`open`/`close`/`exit`) gained matching
+> native arms; `exit` uses `exit_group`. Register binding uses the pinned
+> operand form `${x:"reg"}` — first covered by two new `asm_inline` tests
+> (single- and multi-register spread) before being relied on. `native_syscalls`
+> is clamped off for non-Linux targets in `config_gating.cryo` (`CfgEnv::from_ctx`)
+> so a flagged Windows build degrades to libc instead of stripping both arms.
+> Verified: the `native_syscalls_gate` project is now the ON-backend
+> differential suite (native ops cross-checked against libc, `-errno` contract
+> on deliberate failures, mmap/getpid round-trips, exit via native `exit_group`
+> → exit code 3); a new `sys_seam` stdlib test asserts the identical contract on
+> the OFF backend. Object inspection confirms each `sys_callN` emits a raw
+> `syscall` (`0f 05`) with the correct ABI registers and no trampoline `call`.
+> Both switch positions build and self-host (dual-OS 6-stage fixed point).
+> NOTE: `sys::exit` (native `exit_group`) is a raw exit — it runs no libc
+> atexit handlers and flushes nothing; callers must flush buffered stdio first
+> (the gate project does).
+>
+> **2026-07-16 follow-up ("burn the boats"):** with the backend proven, the
+> `native_syscalls` migration switch completed its lifecycle and was DELETED —
+> `sys_call0..6` keep only the inline-asm bodies (`![target(linux)]`), the
+> seam functions became per-OS splits (`![target(linux)]` raw /
+> `![not(linux)]` libc), `trampoline_result` and the compiler-side atom /
+> clamp / `[low_level] native_syscalls` key are gone. The differential gate
+> project and `sys_seam` test remain — they verify results, not switch
+> positions. See revised principle #2.
+
 ### Stage 3 — Native mmap allocator
 
 **Goal:** move the entire managed heap off libc `malloc` — the single
@@ -335,8 +375,36 @@ under the switch; selfhost byte-identical both OS with the native allocator on;
 valgrind-clean; differential/stress tested.
 
 **Risk:** **high.** Allocator bugs are memory-corruption bugs. This is where
-Principle #2 (switchable, reversible) matters most. Consider keeping the native
-allocator opt-in (off by default) for a long bake-in period even after it works.
+Principle #2's temporary switch earns its keep: land behind `[low_level]
+native_alloc`, bake against the libc arm, then delete the switch and the libc
+arm once proven (per the revised principle, not "opt-in indefinitely").
+
+> **Status: DONE (baking).** `stdlib/alloc/heap.cryo`: a segment
+> allocator in the mimalloc family. Every mapping is 4 MiB-aligned, so
+> `ptr & ~(4MiB-1)` recovers the owning segment header — required because the
+> codegen `free` bridge cannot supply a size. Small path (≤ 32 KiB, align
+> ≤ 16): 40 size classes (16-byte steps to 128, then quarter-steps per
+> doubling), one class per segment, intrusive free list + bump frontier,
+> empty segments unmapped (deterministic RSS return). Large/over-aligned
+> path: dedicated aligned mapping, payload at `max(page, align)`. Page
+> provider: `sys::mmap` (unix) / `VirtualAlloc` reserve-release-re-reserve
+> dance (windows). One global spinlock (`atomic_cmpxchg_u32`) — correctness
+> before design. Foreign pointers abort loudly on a magic check. `GlobalAlloc`
+> keeps policy (zero-size, arena routing) and delegates to three config-gated
+> `backend_*` fns; the libc arms and the switch are deleted at end of bake-in.
+> Verified: 7 direct unit tests (flag-independent); `native_alloc_gate`
+> project (Array/String/format/new+delete/HashMap churn, flag ON, exit 0;
+> object inspection shows `backend_alloc→heap::alloc` and zero `aligned_alloc`
+> refs); valgrind 0 errors on the gate (libc heap reduced to 2 stdio allocs)
+> AND on the flag-ON compiler compiling a file; **flag-ON dual-OS 6-stage
+> selfhost FIXED POINT OK** (the wine side exercises the VirtualAlloc dance).
+> The `json/parser.cryo` `intrinsics::malloc` bypass named below no longer
+> exists (removed in an earlier cleanup). Known deliberate v1 crudeness:
+> single lock, no per-segment cache at the empty boundary, realloc never
+> shrinks in place across classes. DISCOVERED (unrelated, default backend):
+> `Option<T> != T` silently miscompiles — the scalar side is never
+> Some-wrapped and `equals` traps on a garbage tag; minimal repro exists;
+> needs its own fix session.
 
 ### Stage 4 — Route fd I/O, fs, process, env through `sys`
 
@@ -348,10 +416,12 @@ allocator opt-in (off by default) for a long bake-in period even after it works.
 - Preserve errno semantics and `EINTR` retry behavior exactly.
 - Networking (`net/sys.cryo`) can follow the same pattern, or stay on libc
   sockets longer — sockets are a big surface with subtle semantics; low priority.
+- **No migration switch** (revised principle #2): these are direct rewires onto
+  the proven `sys` seam, verified by the test suite and self-host — not
+  dual-backed.
 
-**Exit:** the common I/O/fs/process/env paths run through `sys` (native Linux
-backend) under the switch; selfhost + tests green both OS and both switch
-positions.
+**Exit:** the common I/O/fs/process/env paths run through `sys` (native on
+Linux); selfhost + tests green both OS.
 
 **Risk:** medium. Broad but mechanical. The danger is subtle behavior drift
 (errno, partial reads, retry-on-`EINTR`) — differential tests guard this.
