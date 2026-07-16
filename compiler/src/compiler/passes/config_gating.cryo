@@ -104,6 +104,40 @@ implement enum HostOS {
 
 
 
+/// The active build configuration a `![config(...)]` gate resolves against:
+/// the target OS plus the low-level feature flags.  Replaces the bare
+/// `HostOS` that used to thread through the gating routines so that non-OS
+/// atoms (`native_syscalls`, ...) can gate on a build flag instead of the
+/// target triple.
+type struct CfgEnv {
+    os: HostOS;
+    native_syscalls: boolean;
+
+    /// Resolve from CompilationContext: OS from the effective target triple
+    /// (honors `--target` / cryoconfig, host fallback), feature flags from
+    /// their context fields (cryoconfig `[low_level]`).
+    static from_ctx(ctx: CompilationContext*) -> CfgEnv {
+        const triple: string = LTargetMachine::resolve_effective_triple(ctx.target_triple);
+        return CfgEnv {
+            os: HostOS::from_triple(triple),
+            native_syscalls: ctx.native_syscalls,
+        };
+    }
+
+    /// True if `atom` names a known non-OS feature flag (parallels
+    /// `HostOS::is_os_atom`).  Keep in sync with `feature_active`.
+    static is_feature_atom(atom: string) -> boolean {
+        return atom.eq("native_syscalls");
+    }
+
+    /// Evaluate a known feature atom against this env's flags.  Precondition:
+    /// `CfgEnv::is_feature_atom(atom)` is true.
+    feature_active(&this, atom: string) -> boolean {
+        if (atom.eq("native_syscalls")) { return this.native_syscalls; }
+        return false;
+    }
+}
+
 // Directive evaluation
 
 /// Result of evaluating one directive against the active target.
@@ -122,16 +156,9 @@ type enum CfgEvalResult {
 // ConfigGating pass routines as static methods on a stateless struct
 // (peer convention: TypeResolutionPasses, DirectiveProcessingPasses).
 type struct ConfigGatingPasses {
-    /// Resolve the active target OS from CompilationContext.  Honors
-    /// `ctx.target_triple` (set by Instance from CLI / cryoconfig) and
-    /// falls back to the host triple from LLVM.
-    static active_os(ctx: CompilationContext*) -> HostOS {
-        const triple: string = LTargetMachine::resolve_effective_triple(ctx.target_triple);
-        return HostOS::from_triple(triple);
-    }
     /// Evaluate a single `not(<atom>)` nested call.  Returns Active if the
     /// inner atom does NOT match the active OS, Inactive if it does.
-    static eval_not_call(inner: DirectiveNode*, os: HostOS) -> CfgEvalResult {
+    static eval_not_call(inner: DirectiveNode*, env: CfgEnv) -> CfgEvalResult {
         if (inner == null) { return CfgEvalResult::NotAGate; }
         if (inner.args.length != 1) {
             // Malformed `not(...)`; directive_processing emits a diagnostic.
@@ -142,34 +169,49 @@ type struct ConfigGatingPasses {
         if (a.kind != DirectiveArgKind::Ident) {
             return CfgEvalResult::NotAGate;
         }
-        if (!HostOS::is_os_atom(a.name)) {
-            return CfgEvalResult::NotAGate;
+        // `not(<os-atom>)`: active when the target OS does NOT match.
+        if (HostOS::is_os_atom(a.name)) {
+            if (env.os.matches(a.name)) {
+                return CfgEvalResult::Inactive;
+            }
+            return CfgEvalResult::Active;
         }
-        if (os.matches(a.name)) {
-            return CfgEvalResult::Inactive;
+        // `not(<feature-atom>)`: active when the feature flag is OFF.
+        if (CfgEnv::is_feature_atom(a.name)) {
+            if (env.feature_active(a.name)) {
+                return CfgEvalResult::Inactive;
+            }
+            return CfgEvalResult::Active;
         }
-        return CfgEvalResult::Active;
+        return CfgEvalResult::NotAGate;
     }
 
     /// Classify the gate inside `![config(...)]` / `![target(...)]`.  The
     /// directive must have exactly one arg for the platform-gate forms we
     /// support; everything else is a NotAGate (e.g. `config(testing)`,
     /// multi-arg `cfg(any(...))` which we defer until vocabulary expansion).
-    static eval_config_args(d: DirectiveNode*, os: HostOS) -> CfgEvalResult {
+    static eval_config_args(d: DirectiveNode*, env: CfgEnv) -> CfgEvalResult {
         if (d.args.length != 1) {
             return CfgEvalResult::NotAGate;
         }
         const a: DirectiveArg = d.args[0];
 
-        // Bare-ident form: `config(windows)`.
+        // Bare-ident form: `config(windows)` (OS atom) or
+        // `config(native_syscalls)` (feature atom).
         if (a.kind == DirectiveArgKind::Ident) {
-            if (!HostOS::is_os_atom(a.name)) {
-                return CfgEvalResult::NotAGate;
+            if (HostOS::is_os_atom(a.name)) {
+                if (env.os.matches(a.name)) {
+                    return CfgEvalResult::Active;
+                }
+                return CfgEvalResult::Inactive;
             }
-            if (os.matches(a.name)) {
-                return CfgEvalResult::Active;
+            if (CfgEnv::is_feature_atom(a.name)) {
+                if (env.feature_active(a.name)) {
+                    return CfgEvalResult::Active;
+                }
+                return CfgEvalResult::Inactive;
             }
-            return CfgEvalResult::Inactive;
+            return CfgEvalResult::NotAGate;
         }
 
         // Nested call: `config(not(windows))`.
@@ -177,7 +219,7 @@ type struct ConfigGatingPasses {
             const inner: DirectiveNode* = a.nested;
             if (inner == null) { return CfgEvalResult::NotAGate; }
             if (inner.directive_kind.eq("not")) {
-                return ConfigGatingPasses::eval_not_call(inner, os);
+                return ConfigGatingPasses::eval_not_call(inner, env);
             }
             // `any(...)` / `all(...)` deferred until vocabulary expansion.
             return CfgEvalResult::NotAGate;
@@ -189,12 +231,12 @@ type struct ConfigGatingPasses {
     /// Evaluate one attached directive.  Maps the bare-OS-atom,
     /// `![not(<atom>)]`, and `![config(...)]` / `![target(...)]` forms onto
     /// a CfgEvalResult; everything else is NotAGate.
-    static eval_directive(d: DirectiveNode*, os: HostOS) -> CfgEvalResult {
+    static eval_directive(d: DirectiveNode*, env: CfgEnv) -> CfgEvalResult {
         if (d == null) { return CfgEvalResult::NotAGate; }
 
         // Bare form: `![windows]`, `![linux]`, etc.
         if (HostOS::is_os_atom(d.directive_kind)) {
-            if (os.matches(d.directive_kind)) {
+            if (env.os.matches(d.directive_kind)) {
                 return CfgEvalResult::Active;
             }
             return CfgEvalResult::Inactive;
@@ -203,13 +245,13 @@ type struct ConfigGatingPasses {
         // Bare negation: `![not(<atom>)]`.  Mirrors the nested `not(...)`
         // form inside `config(...)` for consistency.
         if (d.directive_kind.eq("not")) {
-            return ConfigGatingPasses::eval_not_call(d, os);
+            return ConfigGatingPasses::eval_not_call(d, env);
         }
 
         // Wrapped form: `![config(...)]` / `![target(...)]`.
         if (d.directive_kind.eq("config")
                 || d.directive_kind.eq("target")) {
-            return ConfigGatingPasses::eval_config_args(d, os);
+            return ConfigGatingPasses::eval_config_args(d, env);
         }
 
         return CfgEvalResult::NotAGate;
@@ -224,11 +266,11 @@ type struct ConfigGatingPasses {
     /// NotAGate / Active), the decl survives.  Multiple gates on a single
     /// decl are AND'd: `![windows] ![linux] fn` would be impossible to
     /// satisfy, which is the sensible behavior; both must be active.
-    static decl_is_active(decl: DeclarationNode*, os: HostOS) -> boolean {
+    static decl_is_active(decl: DeclarationNode*, env: CfgEnv) -> boolean {
         if (decl == null) { return true; }
         for (mut i: i64 = 0; i < decl.attached_directives.length; i++) {
             const d: DirectiveNode* = decl.attached_directives[i];
-            const r: CfgEvalResult = ConfigGatingPasses::eval_directive(d, os);
+            const r: CfgEvalResult = ConfigGatingPasses::eval_directive(d, env);
             if (match (r) { CfgEvalResult::Inactive => { true } _ => { false } }) {
                 return false;
             }
@@ -239,11 +281,11 @@ type struct ConfigGatingPasses {
     /// Same predicate for block-attached directives.  Used by the
     /// function-body walker to decide whether `![dir] { ... }` blocks
     /// survive.
-    static block_is_active(block: BlockStmtNode*, os: HostOS) -> boolean {
+    static block_is_active(block: BlockStmtNode*, env: CfgEnv) -> boolean {
         if (block == null) { return true; }
         for (mut i: i64 = 0; i < block.attached_directives.length; i++) {
             const d: DirectiveNode* = block.attached_directives[i];
-            const r: CfgEvalResult = ConfigGatingPasses::eval_directive(d, os);
+            const r: CfgEvalResult = ConfigGatingPasses::eval_directive(d, env);
             if (match (r) { CfgEvalResult::Inactive => { true } _ => { false } }) {
                 return false;
             }
@@ -259,7 +301,7 @@ type struct ConfigGatingPasses {
     /// so gates can sit at any nesting level.  Active gated blocks have
     /// their `attached_directives` cleared once kept; downstream passes
     /// see them as plain blocks.
-    static process_block(block: BlockStmtNode*, os: HostOS, ctx: CompilationContext*) -> void {
+    static process_block(block: BlockStmtNode*, env: CfgEnv, ctx: CompilationContext*) -> void {
         if (block == null) { return; }
         // Fast-path scan: most function bodies have no inline cfg-gated
         // sub-blocks at all.  Skip the rebuild loop in that case so we
@@ -284,14 +326,14 @@ type struct ConfigGatingPasses {
 
             if (stmt.kind == NodeKind::BlockStatement) {
                 const inner: BlockStmtNode* = stmt as BlockStmtNode*;
-                if (inner.has_directives() && !ConfigGatingPasses::block_is_active(inner, os)) {
+                if (inner.has_directives() && !ConfigGatingPasses::block_is_active(inner, env)) {
                     if (ctx.debug_mode) {
                         cdebug("[ConfigGating] stripped inline block at line %u\n",
                             inner.span.start_line);
                     }
                     continue;
                 }
-                ConfigGatingPasses::process_block(inner, os, ctx);
+                ConfigGatingPasses::process_block(inner, env, ctx);
             }
             kept.push(stmt);
         }
@@ -305,12 +347,12 @@ type struct ConfigGatingPasses {
     /// `match` expression's arms has historically miscompiled.  Borrows the
     /// list (read-only) so the caller keeps ownership of the owning node's
     /// `methods` field.
-    static walk_method_bodies(methods: &MethodNode*[], os: HostOS, ctx: CompilationContext*) -> void {
+    static walk_method_bodies(methods: &MethodNode*[], env: CfgEnv, ctx: CompilationContext*) -> void {
         for (mut i: i64 = 0; i < methods.length; i++) {
             const m: MethodNode* = methods[i];
             if (m != null && m.func != null) {
                 const body: BlockStmtNode* = m.func.body;
-                ConfigGatingPasses::process_block(body, os, ctx);
+                ConfigGatingPasses::process_block(body, env, ctx);
             }
         }
     }
@@ -320,11 +362,11 @@ type struct ConfigGatingPasses {
     /// allocating so the overwhelmingly-common no-gate case stays cheap and
     /// never rewrites the owning node's `methods` field (a class-field array
     /// write is a heavier codegen path; mirrors `process_block`'s fast-path).
-    static methods_need_filter(methods: &MethodNode*[], os: HostOS) -> boolean {
+    static methods_need_filter(methods: &MethodNode*[], env: CfgEnv) -> boolean {
         for (mut i: i64 = 0; i < methods.length; i++) {
             const m: MethodNode* = methods[i];
             if (m == null) { continue; }
-            if (!ConfigGatingPasses::decl_is_active(m as DeclarationNode*, os)) { return true; }
+            if (!ConfigGatingPasses::decl_is_active(m as DeclarationNode*, env)) { return true; }
         }
         return false;
     }
@@ -336,13 +378,13 @@ type struct ConfigGatingPasses {
     /// Inactive - the same predicate (`decl_is_active`) used for top-level
     /// declarations, so `![target(windows)]` / `![target(unix)]` on a method
     /// behaves exactly like it does on a free function.
-    static active_methods(methods: &MethodNode*[], os: HostOS,
+    static active_methods(methods: &MethodNode*[], env: CfgEnv,
                             ctx: CompilationContext*) -> MethodNode*[] {
         mut kept: MethodNode*[] = [];
         for (mut i: i64 = 0; i < methods.length; i++) {
             const m: MethodNode* = methods[i];
             if (m == null) { continue; }
-            if (!ConfigGatingPasses::decl_is_active(m as DeclarationNode*, os)) {
+            if (!ConfigGatingPasses::decl_is_active(m as DeclarationNode*, env)) {
                 if (ctx.debug_mode) {
                     cdebug("[ConfigGating] stripped gated method for target os\n");
                 }
@@ -366,14 +408,14 @@ type struct ConfigGatingPasses {
             return PassResult::ok();
         }
 
-        const os: HostOS = ConfigGatingPasses::active_os(ctx);
+        const env: CfgEnv = CfgEnv::from_ctx(ctx);
 
         // An unclassifiable triple can't drive platform gating correctly: every
         // ![windows]/![linux]/![macos]/![unix] decl would be stripped and every
         // ![not(...)] decl kept, silently producing a wrong build. Fail loudly
         // instead. Reachable only via an explicit unsupported --target; the LLVM
         // host-triple fallback always classifies.
-        const os_unknown: boolean = match (os) {
+        const os_unknown: boolean = match (env.os) {
             HostOS::Other => { true }
             _             => { false }
         };
@@ -419,7 +461,7 @@ type struct ConfigGatingPasses {
             }
 
             const decl: DeclarationNode* = stmt as DeclarationNode*;
-            if (!ConfigGatingPasses::decl_is_active(decl, os)) {
+            if (!ConfigGatingPasses::decl_is_active(decl, env)) {
                 stripped += 1;
                 if (ctx.debug_mode) {
                     cdebug("[ConfigGating] stripped %s for target os\n",
@@ -440,7 +482,7 @@ type struct ConfigGatingPasses {
                 const fd: FunctionDeclNode* = stmt as FunctionDeclNode*;
                 const body: BlockStmtNode* = fd.body;
                 if (body != null) {
-                    ConfigGatingPasses::process_block(body, os, ctx);
+                    ConfigGatingPasses::process_block(body, env, ctx);
                 }
             }
             if (k == NodeKind::MethodDeclaration) {
@@ -448,37 +490,37 @@ type struct ConfigGatingPasses {
                 if (md.func != null) {
                     const mbody: BlockStmtNode* = md.func.body;
                     if (mbody != null) {
-                        ConfigGatingPasses::process_block(mbody, os, ctx);
+                        ConfigGatingPasses::process_block(mbody, env, ctx);
                     }
                 }
             }
             if (k == NodeKind::StructDeclaration) {
                 const sd: StructDeclNode* = stmt as StructDeclNode*;
-                if (ConfigGatingPasses::methods_need_filter(&sd.methods, os)) {
-                    sd.methods = ConfigGatingPasses::active_methods(&sd.methods, os, ctx);
+                if (ConfigGatingPasses::methods_need_filter(&sd.methods, env)) {
+                    sd.methods = ConfigGatingPasses::active_methods(&sd.methods, env, ctx);
                 }
-                ConfigGatingPasses::walk_method_bodies(&sd.methods, os, ctx);
+                ConfigGatingPasses::walk_method_bodies(&sd.methods, env, ctx);
             }
             if (k == NodeKind::UnionDeclaration) {
                 const ud: UnionDeclNode* = stmt as UnionDeclNode*;
-                if (ConfigGatingPasses::methods_need_filter(&ud.methods, os)) {
-                    ud.methods = ConfigGatingPasses::active_methods(&ud.methods, os, ctx);
+                if (ConfigGatingPasses::methods_need_filter(&ud.methods, env)) {
+                    ud.methods = ConfigGatingPasses::active_methods(&ud.methods, env, ctx);
                 }
-                ConfigGatingPasses::walk_method_bodies(&ud.methods, os, ctx);
+                ConfigGatingPasses::walk_method_bodies(&ud.methods, env, ctx);
             }
             if (k == NodeKind::ClassDeclaration) {
                 const cd: ClassDeclNode* = stmt as ClassDeclNode*;
-                if (ConfigGatingPasses::methods_need_filter(&cd.methods, os)) {
-                    cd.methods = ConfigGatingPasses::active_methods(&cd.methods, os, ctx);
+                if (ConfigGatingPasses::methods_need_filter(&cd.methods, env)) {
+                    cd.methods = ConfigGatingPasses::active_methods(&cd.methods, env, ctx);
                 }
-                ConfigGatingPasses::walk_method_bodies(&cd.methods, os, ctx);
+                ConfigGatingPasses::walk_method_bodies(&cd.methods, env, ctx);
             }
             if (k == NodeKind::ImplementationBlock) {
                 const ib: ImplBlockNode* = stmt as ImplBlockNode*;
-                if (ConfigGatingPasses::methods_need_filter(&ib.methods, os)) {
-                    ib.methods = ConfigGatingPasses::active_methods(&ib.methods, os, ctx);
+                if (ConfigGatingPasses::methods_need_filter(&ib.methods, env)) {
+                    ib.methods = ConfigGatingPasses::active_methods(&ib.methods, env, ctx);
                 }
-                ConfigGatingPasses::walk_method_bodies(&ib.methods, os, ctx);
+                ConfigGatingPasses::walk_method_bodies(&ib.methods, env, ctx);
             }
             kept.push(stmt);
         }
