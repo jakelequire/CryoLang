@@ -110,10 +110,28 @@ type struct CallResolver {
         const n: ASTNode* = callee as ASTNode*;
         if (n.kind == NodeKind::Identifier) {
             const ident: IdentifierNode* = callee as IdentifierNode*;
-            const bare: TypeRef = this.ctx.decl_index.lookup_func_type(ident.name);
-            if (bare.is_valid()) { return bare; }
+            // A local binding (closure, fn-pointer, plain value) shadows any
+            // free function sharing its leaf name: hint from the local's own
+            // type when it is callable, never from the free-function index.
+            const local: TypeRef = this.scopes.lookup_local(ident.name);
+            if (local.is_valid()) {
+                const local_t: Type* = this.arena.lookup(local.id);
+                if (local_t != null && local_t.kind == TypeKind::Function) { return local; }
+                return TypeRef::invalid();
+            }
+            // Current module's own signature FIRST: the bare `func_type_refs`
+            // slot is single-slot last-write-wins across EVERY module that
+            // defines this leaf, and module registration order is not
+            // meaningful (it varies with host path/enumeration order).  An
+            // unqualified call in a defining module must take the module-local
+            // signature; a wrong same-leaf signature here poisons
+            // expected-type propagation into the arguments - a generic-enum
+            // literal arg (`classify(Option::Some(-3))`) then never
+            // instantiates and codegen drops its payload store entirely.
             const q_sym: SymbolStr = this.ctx.qualify_symbol_sym(ident.name);
-            return this.ctx.decl_index.lookup_func_type(q_sym);
+            const qual: TypeRef = this.ctx.decl_index.lookup_func_type(q_sym);
+            if (qual.is_valid()) { return qual; }
+            return this.ctx.decl_index.lookup_func_type(ident.name);
         }
         if (n.kind == NodeKind::ScopeResolution) {
             const sr: ScopeResolutionNode* = callee as ScopeResolutionNode*;

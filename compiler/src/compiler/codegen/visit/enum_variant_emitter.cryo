@@ -32,6 +32,17 @@ type struct EnumVariantEmitter {
     }
 
 
+    /// A payload-variant construction whose field type failed to lower
+    /// (an uninstantiated generic parameter reaching codegen).  Emitting
+    /// the value anyway would leave its payload bytes uninitialised, so
+    /// this is a hard error, not a skip.
+    report_unresolved_payload(&this, et: EnumType*, variant: EnumVariantInfo*) -> void {
+        this.cg.ctx.emit_error(ErrorCode::E0600_CODEGEN_FAILED,
+            format("codegen: payload type of enum variant `%s::%s` is unresolved (generic parameter not instantiated); the constructed value would lose its payload",
+                   this.cg.resolve(et.qualified_name),
+                   this.cg.resolve(variant.name)));
+    }
+
     /// Current LLVM function for entry-block alloca placement.
     get_current_function(&this) -> LValue {
         const bb: LBasicBlock = this.cg.builder.get_insert_block();
@@ -90,13 +101,20 @@ type struct EnumVariantEmitter {
         // For multi-payload, store each field sequentially.
         if (args.length == 1 && variant.payload_types.length == 1) {
             const payload_ty: LType = this.cg.type_mapper.map_type(variant.payload_types[0]);
-            if (payload_ty.is_valid()) {
-                const typed_ptr: LValue = this.cg.builder.build_bitcast(
-                    payload_ptr, LType::pointer_to(payload_ty), "enum.payload.cast");
-                const stored_val: LValue = this.coerce_int_payload(
-                    args[0], payload_ty, variant.payload_types[0]);
-                this.cg.builder.build_store(stored_val, typed_ptr);
+            if (!payload_ty.is_valid()) {
+                // An unmapped payload type here means the variant is still
+                // carrying an uninstantiated generic parameter at emission
+                // time (sema failed to stamp the constructor's concrete
+                // instantiation).  Silently dropping the store would emit a
+                // value whose payload is stack garbage - fail loudly instead.
+                this.report_unresolved_payload(et, variant);
+                return LValue::null();
             }
+            const typed_ptr: LValue = this.cg.builder.build_bitcast(
+                payload_ptr, LType::pointer_to(payload_ty), "enum.payload.cast");
+            const stored_val: LValue = this.coerce_int_payload(
+                args[0], payload_ty, variant.payload_types[0]);
+            this.cg.builder.build_store(stored_val, typed_ptr);
         } else {
             // Multi-field payload: lay out sequentially using the SAME field
             // alignment rules as compute_enum_layout (type_map) so the store
@@ -107,7 +125,14 @@ type struct EnumVariantEmitter {
             mut offset: u64 = 0;
             for (mut i: i64 = 0; i < args.length && i < variant.payload_types.length as i64; i++) {
                 const field_ty: LType = this.cg.type_mapper.map_type(variant.payload_types[i]);
-                if (!field_ty.is_valid()) { continue; }
+                if (!field_ty.is_valid()) {
+                    // Same unresolved-generic hole as the single-payload
+                    // path: an argument is present but its field type never
+                    // instantiated - dropping the store is a silent
+                    // miscompile.
+                    this.report_unresolved_payload(et, variant);
+                    return LValue::null();
+                }
                 const ft: Type* = this.resolve_payload_type(variant.payload_types[i]);
                 if (ft != null) {
                     // align_up the running offset to this field's alignment
