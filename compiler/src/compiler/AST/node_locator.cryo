@@ -194,6 +194,18 @@ public function find_function_in_modules(graph: ModuleGraph*,
         for (mut si: i64 = 0; si < ast.statements.length; si++) {
             const stmt: ASTNode* = NodeLocator::unwrap_decl_stmt(ast.statements[si]);
             if (stmt == null) { continue; }
+            // Extern declarations count too: `sys::syscall(...)`-style
+            // scope-resolution hover resolves the member through this
+            // lookup, and the declaring node lives on the block's
+            // `functions` array rather than at top level.
+            if (stmt.kind == NodeKind::ExternBlock) {
+                const eb: ExternBlockNode* = stmt as ExternBlockNode*;
+                for (mut fi: i64 = 0; fi < eb.functions.length; fi++) {
+                    const ef: FunctionDeclNode* = eb.functions[fi];
+                    if (ef != null && ef.name.equals(name)) { return ef; }
+                }
+                continue;
+            }
             if (stmt.kind != NodeKind::FunctionDeclaration) { continue; }
             const f: FunctionDeclNode* = stmt as FunctionDeclNode*;
             if (f.name.equals(name)) { return f; }
@@ -522,6 +534,33 @@ public function find_trait_for_function(graph: ModuleGraph*,
         }
     }
     return SymbolStr::empty();
+}
+
+
+/// Find the `extern "C" { ... }` block that declares `func`, by
+/// reverse-walking every module's top-level decls (mirror of
+/// `find_trait_for_function` - extern declarations are bare
+/// `FunctionDeclNode*`s on the block's `functions` array).  Returns
+/// `null` for ordinary functions, letting hover render the free-function
+/// form.
+public function find_extern_block_for_function(graph: ModuleGraph*,
+                                                func: FunctionDeclNode*) -> ExternBlockNode* {
+    if (graph == null || func == null) { return null; }
+    const n: u32 = graph.module_count();
+    for (mut mi: u32 = 0; mi < n; mi++) {
+        const ast: ProgramNode* = graph.get_module_ast(mi);
+        if (ast == null) { continue; }
+        for (mut si: i64 = 0; si < ast.statements.length; si++) {
+            const stmt: ASTNode* = NodeLocator::unwrap_decl_stmt(ast.statements[si]);
+            if (stmt == null) { continue; }
+            if (stmt.kind != NodeKind::ExternBlock) { continue; }
+            const eb: ExternBlockNode* = stmt as ExternBlockNode*;
+            for (mut fi: i64 = 0; fi < eb.functions.length; fi++) {
+                if (eb.functions[fi] == func) { return eb; }
+            }
+        }
+    }
+    return null;
 }
 
 
@@ -942,6 +981,15 @@ type struct NodeLocator {
                 // trait head instead of the method.
                 const d: TraitDeclNode* = node as TraitDeclNode*;
                 return NodeLocator::pick_array_function(d.methods, line, character);
+            }
+            NodeKind::ExternBlock => {
+                // Extern declarations are bare `FunctionDeclNode*`s on the
+                // block's `functions` array, exactly like trait methods.
+                // Without this descent the locator stops at the block and
+                // hovering `syscall` in `extern "C" { function syscall(...) }`
+                // finds no declaration.
+                const d: ExternBlockNode* = node as ExternBlockNode*;
+                return NodeLocator::pick_array_function(d.functions, line, character);
             }
             NodeKind::ImplementationBlock => {
                 // `synthesize_default_trait_methods` (TypeResolution) clones
