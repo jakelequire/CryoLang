@@ -140,6 +140,17 @@ type struct DeclarationIndex {
     overload_func_keys:    u32[];     // SymbolStr.id of function name
     overload_func_types:   TypeRef[]; // FunctionType TypeRef for this overload
     overload_func_mangled: u32[];     // SymbolStr.id of mangled LLVM name (0 = unset)
+    overload_func_owner:   u32[];     // SymbolStr.id of the owning declaration's
+                                      // QUALIFIED name (0 = legacy/global claim:
+                                      // extern "C" twins, combined-name and
+                                      // qualified-name registrations).  Lets two
+                                      // same-signature declarations from different
+                                      // modules coexist under one bare leaf
+                                      // (`intrinsics::free` vs `alloc::heap::free`)
+                                      // instead of being merged into a single
+                                      // last-writer-owned entry, and lets the
+                                      // bare-call binder filter candidates by the
+                                      // use site's imports.
 
     // Bare-name -> all qualified names ever registered for it.
     // Populated by `register_name_mapping`.
@@ -255,6 +266,7 @@ type struct DeclarationIndex {
             overload_func_keys:    [],
             overload_func_types:   [],
             overload_func_mangled: [],
+            overload_func_owner:   [],
             bare_alts:      [],
             overload_index:     HashMap<u32, u32[]>::new(),
             bare_alts_index:    HashMap<u32, u32[]>::new(),
@@ -273,7 +285,15 @@ type struct DeclarationIndex {
     // Registration (called by TypeResolution & Specialization passes)
 
     /// Register a function's return type.
+    ///
+    /// Intrinsic durability: once a declared `intrinsic function` owns a
+    /// leaf (see `register_intrinsic_function_type`), a later same-leaf
+    /// regular function must not overwrite the single-slot return type -
+    /// the intrinsic's own registration runs BEFORE it is marked, so this
+    /// guard never blocks the intrinsic itself, and either registration
+    /// order converges on the intrinsic's binding.
     register_function(mut &this, name: SymbolStr, return_type: TypeRef) -> void {
+        if (this.intrinsic_names.contains_key(&name.id)) { return; }
         this.func_returns.insert(name.id, return_type);
     }
 
@@ -309,20 +329,39 @@ type struct DeclarationIndex {
     /// Register a function's FunctionType TypeRef (full signature in the arena).
     /// `func_type_refs` is a single-slot map (last wins); use the parallel
     /// overload arrays below when every overload matters (cross-module
-    /// extern declaration).
+    /// extern declaration).  Legacy entry point: the overload entry is owned
+    /// by nobody (owner 0 = global claim).
     register_function_type(mut &this, name: SymbolStr, func_type_ref: TypeRef) -> void {
-        this.func_type_refs.insert(name.id, func_type_ref);
+        this.register_function_type_owned(name, func_type_ref, SymbolStr::empty());
+    }
+
+    /// Owner-aware variant: `owner` is the declaring function's QUALIFIED
+    /// name, stamped on the overload entry so two same-signature declarations
+    /// from different modules keep separate entries (separate mangled slots),
+    /// and so the bare-call binder can filter candidates by the use site's
+    /// imports.  De-dup is by (name, TypeRef, owner): re-registering the same
+    /// declaration is a no-op; a same-signature declaration from a DIFFERENT
+    /// owner appends its own entry instead of silently adopting (and later
+    /// re-mangling) the first claimant's.
+    register_function_type_owned(mut &this, name: SymbolStr, func_type_ref: TypeRef,
+                                 owner: SymbolStr) -> void {
+        // Intrinsic durability: the single-slot signature of an
+        // intrinsic-owned leaf is not overwritable by regular registrations
+        // (the intrinsic itself writes it in `register_intrinsic_function_type`).
+        if (!this.intrinsic_names.contains_key(&name.id)) {
+            this.func_type_refs.insert(name.id, func_type_ref);
+        }
         // Also append to the overload list so cross-module extern
-        // declaration can enumerate every overload's signature.
-        // De-dup by exact (name, TypeRef.id) so re-registration doesn't
-        // produce duplicates -- scoped to this name's positions via the
-        // overload_index instead of scanning every overload in the program.
+        // declaration can enumerate every overload's signature -- scoped to
+        // this name's positions via the overload_index instead of scanning
+        // every overload in the program.
         match (this.overload_index.get_ref(&name.id)) {
             Option::Some(positions) => {
                 mut k: i64 = 0;
                 while (k < (*positions).length) {
                     const pos: u32 = (*positions)[k];
-                    if (this.overload_func_types[pos as i64].id == func_type_ref.id) {
+                    if (this.overload_func_types[pos as i64].id == func_type_ref.id
+                        && this.overload_func_owner[pos as i64] == owner.id) {
                         return;
                     }
                     k = k + 1;
@@ -334,6 +373,7 @@ type struct DeclarationIndex {
         this.overload_func_keys.push(name.id);
         this.overload_func_types.push(func_type_ref);
         this.overload_func_mangled.push(0);
+        this.overload_func_owner.push(owner.id);
         const slot: u32[]* = this.overload_index.get_or_insert(name.id, []);
         (*slot).push(new_pos);
     }
@@ -349,18 +389,47 @@ type struct DeclarationIndex {
     /// first (which otherwise strands `malloc`/`strlen`/... at codegen with
     /// an ambiguous second overload, E0636). The qualified `libc::<name>`
     /// form registered separately stays available regardless.
-    register_intrinsic_function_type(mut &this, name: SymbolStr, func_type_ref: TypeRef) -> void {
+    register_intrinsic_function_type(mut &this, name: SymbolStr, func_type_ref: TypeRef,
+                                     owner: SymbolStr) -> void {
         // Record the leaf name as a genuine intrinsic declaration so codegen
         // can distinguish it from a user function that shares the leaf name
         // (see `is_intrinsic_decl_name` and the inline-dispatch guards in
-        // call_emitter).
+        // call_emitter).  From this point on the leaf's single-slot bindings
+        // (func_type_refs / func_returns / mangled_names) are durable: the
+        // intrinsic-durability guards in the register_* methods refuse
+        // non-intrinsic overwrites, so a later same-leaf regular function
+        // (e.g. `alloc::heap::free`) can no longer silently rebind bare
+        // calls program-wide.  `owner` is the intrinsic's qualified name
+        // (`std::core::intrinsics::free`), stamped on the overload entry for
+        // import-scoped candidate reporting.
         this.intrinsic_names.insert(name.id, true);
         this.func_type_refs.insert(name.id, func_type_ref);
         const new_pos: u32 = this.overload_func_keys.length as u32;
         this.overload_func_keys.push(name.id);
         this.overload_func_types.push(func_type_ref);
         this.overload_func_mangled.push(0);
+        this.overload_func_owner.push(owner.id);
+        // Sole bare ownership drops the UNOWNED claimants only: extern "C"
+        // twins (owner 0), whose divergent Cryo signature would otherwise
+        // shadow the intrinsic (see method doc).  OWNED same-leaf regular
+        // functions (`fs::write` vs intrinsic `write`) keep their entries -
+        // they coexist by owner identity and the bare-call binder picks by
+        // signature + use-site imports - which also makes this registration
+        // order-robust when a regular fn's module registered first.
         mut positions: u32[] = [];
+        match (this.overload_index.get_ref(&name.id)) {
+            Option::Some(prev) => {
+                mut k: i64 = 0;
+                while (k < (*prev).length) {
+                    const pos: u32 = (*prev)[k];
+                    if (this.overload_func_owner[pos as i64] != 0) {
+                        positions.push(pos);
+                    }
+                    k = k + 1;
+                }
+            }
+            Option::None => { }
+        }
         positions.push(new_pos);
         this.overload_index.insert(name.id, positions);
     }
@@ -398,6 +467,10 @@ type struct DeclarationIndex {
     /// single mangled name stored in `mangled_names`.
     register_overload_mangled(mut &this, name: SymbolStr, func_type_ref: TypeRef,
                                mangled: SymbolStr) -> void {
+        // Legacy (owner-blind) entry point: matches the first entry with this
+        // signature.  Owner-aware callers use `register_overload_mangled_owned`
+        // so a same-signature entry from a different declaration is never
+        // restamped.
         match (this.overload_index.get_ref(&name.id)) {
             Option::Some(positions) => {
                 mut k: i64 = 0;
@@ -405,11 +478,47 @@ type struct DeclarationIndex {
                     const pos: u32 = (*positions)[k];
                     if (this.overload_func_types[pos as i64].id == func_type_ref.id) {
                         const prev: u32 = this.overload_func_mangled[pos as i64];
+                        // Intrinsic durability: never restamp the intrinsic's
+                        // own entry (its mangled IS the leaf name) with a
+                        // different symbol; try the next same-signature entry
+                        // (the caller's own) instead.
+                        if (this.intrinsic_names.contains_key(&name.id)
+                            && prev == name.id && mangled.id != name.id) {
+                            k = k + 1;
+                            continue;
+                        }
                         this.overload_func_mangled[pos as i64] = mangled.id;
                         // Record the reverse mapping only when this position
                         // newly takes this mangled id, so repeated registration
                         // of the same (pos, mangled) pair never duplicates the
                         // bucket entry.
+                        if (prev != mangled.id) {
+                            const slot: u32[]* = this.mangled_to_overload_pos.get_or_insert(mangled.id, []);
+                            (*slot).push(pos);
+                        }
+                        return;
+                    }
+                    k = k + 1;
+                }
+            }
+            Option::None => { }
+        }
+    }
+
+    /// Owner-aware variant of `register_overload_mangled`: stamps the entry
+    /// matching (name, signature, owner) exactly, so two same-signature
+    /// declarations under one bare leaf each keep their own mangled symbol.
+    register_overload_mangled_owned(mut &this, name: SymbolStr, func_type_ref: TypeRef,
+                                    owner: SymbolStr, mangled: SymbolStr) -> void {
+        match (this.overload_index.get_ref(&name.id)) {
+            Option::Some(positions) => {
+                mut k: i64 = 0;
+                while (k < (*positions).length) {
+                    const pos: u32 = (*positions)[k];
+                    if (this.overload_func_types[pos as i64].id == func_type_ref.id
+                        && this.overload_func_owner[pos as i64] == owner.id) {
+                        const prev: u32 = this.overload_func_mangled[pos as i64];
+                        this.overload_func_mangled[pos as i64] = mangled.id;
                         if (prev != mangled.id) {
                             const slot: u32[]* = this.mangled_to_overload_pos.get_or_insert(mangled.id, []);
                             (*slot).push(pos);
@@ -443,6 +552,9 @@ type struct DeclarationIndex {
     }
 
     lookup_overload_mangled(&this, name: SymbolStr, func_type_ref: TypeRef) -> SymbolStr {
+        // Signature match; scans past unmangled entries so a same-signature
+        // pair (possible under a bare leaf since entries became per-owner)
+        // still yields the entry that actually carries a symbol.
         match (this.overload_index.get_ref(&name.id)) {
             Option::Some(positions) => {
                 mut k: i64 = 0;
@@ -453,6 +565,28 @@ type struct DeclarationIndex {
                         if (mid != 0) {
                             return SymbolStr::from_id(mid);
                         }
+                    }
+                    k = k + 1;
+                }
+            }
+            Option::None => { }
+        }
+        return SymbolStr::empty();
+    }
+
+    /// Owner-aware mangled lookup: the entry matching (name, signature,
+    /// owner) exactly, or empty.
+    lookup_overload_mangled_owned(&this, name: SymbolStr, func_type_ref: TypeRef,
+                                  owner: u32) -> SymbolStr {
+        match (this.overload_index.get_ref(&name.id)) {
+            Option::Some(positions) => {
+                mut k: i64 = 0;
+                while (k < (*positions).length) {
+                    const pos: u32 = (*positions)[k];
+                    if (this.overload_func_types[pos as i64].id == func_type_ref.id
+                        && this.overload_func_owner[pos as i64] == owner) {
+                        const mid: u32 = this.overload_func_mangled[pos as i64];
+                        if (mid != 0) { return SymbolStr::from_id(mid); }
                         return SymbolStr::empty();
                     }
                     k = k + 1;
@@ -461,6 +595,63 @@ type struct DeclarationIndex {
             Option::None => { }
         }
         return SymbolStr::empty();
+    }
+
+    /// Every overload entry registered under `name`, with its owning
+    /// declaration's qualified-name id (0 = legacy/global claim) and its
+    /// mangled-symbol id (0 = unset), as three parallel arrays the caller
+    /// indexes together.  The bare-call binder uses the owners to filter
+    /// candidates by the use site's imports and to name candidates in the
+    /// E0154 ambiguity diagnostic.
+    lookup_func_overload_owners(&this, name: SymbolStr) -> u32[] {
+        mut result: u32[] = [];
+        match (this.overload_index.get_ref(&name.id)) {
+            Option::Some(positions) => {
+                mut k: i64 = 0;
+                while (k < (*positions).length) {
+                    result.push(this.overload_func_owner[(*positions)[k] as i64]);
+                    k = k + 1;
+                }
+            }
+            Option::None => { }
+        }
+        return result;
+    }
+
+    /// The FunctionType of the overload entry that carries this mangled LLVM
+    /// symbol, or invalid.  The pinned `resolved_callee` is ground truth for
+    /// a call's signature: name-based return lookups (`func_returns` bare
+    /// slots) are single-slot and can legitimately belong to a DIFFERENT
+    /// same-leaf declaration (an intrinsic-owned leaf keeps the intrinsic's),
+    /// so a re-resolution of an already-pinned call must read the entry the
+    /// pin actually points at.
+    lookup_func_type_by_mangled(&this, mangled: SymbolStr) -> TypeRef {
+        match (this.mangled_to_overload_pos.get_ref(&mangled.id)) {
+            Option::Some(positions) => {
+                if ((*positions).length > 0) {
+                    return this.overload_func_types[(*positions)[0] as i64];
+                }
+            }
+            Option::None => { }
+        }
+        return TypeRef::invalid();
+    }
+
+    /// Parallel to `lookup_func_type_overloads` / `lookup_func_overload_owners`:
+    /// each entry's mangled-symbol id (0 = unset).
+    lookup_func_overload_mangleds(&this, name: SymbolStr) -> u32[] {
+        mut result: u32[] = [];
+        match (this.overload_index.get_ref(&name.id)) {
+            Option::Some(positions) => {
+                mut k: i64 = 0;
+                while (k < (*positions).length) {
+                    result.push(this.overload_func_mangled[(*positions)[k] as i64]);
+                    k = k + 1;
+                }
+            }
+            Option::None => { }
+        }
+        return result;
     }
 
     /// Register a method's return type on a specific type.
@@ -876,7 +1067,19 @@ type struct DeclarationIndex {
 
     /// Store the mangled LLVM symbol name for a function or method.
     /// Called at registration time so codegen never computes mangling.
+    ///
+    /// Intrinsic durability: a declared intrinsic's bare leaf maps to the
+    /// intrinsic's own C symbol - which IS the leaf name (`free` -> `free`) -
+    /// permanently.  A later same-leaf regular function writing its q-mangled
+    /// symbol into this single slot would silently redirect every blind
+    /// bare-name fallback (codegen `resolve_function`, extern declaration)
+    /// into a module the caller never imported.  The intrinsic's own write
+    /// (mangled == leaf) always passes, so registration order converges.
     register_mangled_name(mut &this, qualified: SymbolStr, mangled: SymbolStr) -> void {
+        if (this.intrinsic_names.contains_key(&qualified.id)
+            && mangled.id != qualified.id) {
+            return;
+        }
         this.mangled_names.insert(qualified.id, mangled.id);
     }
 

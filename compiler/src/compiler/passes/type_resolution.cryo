@@ -1156,9 +1156,22 @@ type struct TypeResolutionPasses {
 
                     // Also register under bare name for backward-compatible lookups.
                     // Use the same mangled name as the qualified version.
+                    // A leaf owned by a declared `intrinsic function` keeps
+                    // its single-slot bindings: the DeclarationIndex refuses
+                    // non-intrinsic overwrites of intrinsic-owned slots (see
+                    // the intrinsic-durability guards in decl_index), while
+                    // this function's own per-signature overload entry still
+                    // registers so arity/signature dispatch can pick it.
                     if (!q_name.equals(func.name)) {
                         ctx.decl_index.register_function(func.name, func.resolved_return_type);
-                        ctx.decl_index.register_function_type(func.name, func_type_ref);
+                        // Owner-stamped (by q_name): a same-signature bare
+                        // leaf from another module keeps its own entry +
+                        // mangled slot instead of adopting/restamping the
+                        // first claimant's (`heap::free` vs the `free`
+                        // intrinsic), and the bare-call binder can filter
+                        // candidates by the use site's imports.
+                        ctx.decl_index.register_function_type_owned(
+                            func.name, func_type_ref, q_name);
                         ctx.decl_index.register_name_mapping(func.name, q_name);
                         const q_mangled: SymbolStr = ctx.decl_index.lookup_mangled_name(q_name);
                         if (q_mangled.is_valid()) {
@@ -1167,8 +1180,8 @@ type struct TypeResolutionPasses {
                             // mangled-name slot is overwritten across modules
                             // (last-wins) and would otherwise hand out the
                             // wrong symbol when this overload gets picked.
-                            ctx.decl_index.register_overload_mangled(
-                                func.name, func_type_ref, q_mangled);
+                            ctx.decl_index.register_overload_mangled_owned(
+                                func.name, func_type_ref, q_name, q_mangled);
                         }
                     }
                 }
@@ -2459,12 +2472,16 @@ type struct TypeResolutionPasses {
                             // Sole bare owner: drop any libc extern twin overload
                             // so bare `malloc`/`strlen`/... bind to the intrinsic
                             // regardless of module topo order (see method doc).
-                            ctx.decl_index.register_intrinsic_function_type(node.name, i_func_type_ref);
+                            // Owned regular same-leaf functions keep their
+                            // entries; the intrinsic's ownership of the leaf's
+                            // single-slot bindings is durable from here on.
+                            ctx.decl_index.register_intrinsic_function_type(
+                                node.name, i_func_type_ref, q_name);
                             ctx.decl_index.register_name_mapping(node.name, q_name);
                             // Bare name also needs its own mangled entry.
                             ctx.decl_index.register_mangled_name(node.name, bare_mangled);
-                            ctx.decl_index.register_overload_mangled(
-                                node.name, i_func_type_ref, bare_mangled);
+                            ctx.decl_index.register_overload_mangled_owned(
+                                node.name, i_func_type_ref, q_name, bare_mangled);
                         }
                     }
                     sig_count++;
