@@ -1887,6 +1887,9 @@ type struct EmitJob {
     opt_level:       u32;
     should_register: boolean;
     ok:              boolean;   // result: emission succeeded
+    err_msg:         string;    // LLVM error message on failure (worker-set;
+                                // the main-thread report loop prints it and
+                                // disposes it via LLVMDisposeMessage)
 }
 
 /// Emit ONE module's object file from its own standalone LLVM context (the
@@ -1899,8 +1902,9 @@ type struct EmitJob {
 function codegen_emit_job(job: EmitJob*) -> void {
     // Emit this module's live IR directly with its main-thread-built target
     // machine.  Deliberately ALLOCATION-FREE on the Cryo side: it makes the raw
-    // LLVM emit call and, on error, disposes the LLVM message (libc, thread-safe)
-    // and just records `ok = false` - reporting is left to the main thread.  So
+    // LLVM emit call and, on error, stashes the LLVM message pointer in the job
+    // and records `ok = false` - reporting and disposal are left to the main
+    // thread.  So
     // a worker never touches the compiler's single-threaded bump arena, and the
     // per-module context isolation makes the concurrent LLVM emit itself safe.
     // The module, context, and target machine are disposed by the caller on the
@@ -1914,7 +1918,10 @@ function codegen_emit_job(job: EmitJob*) -> void {
     const rc: i32 = llvm::LLVMTargetMachineEmitToFile(
         (*job).tm, (*job).llvm_module, (*job).emit_path,
         (*job).emit_type as i32, &err as void*);
-    if (err != null) { llvm::LLVMDisposeMessage(err as void*); }
+    // Hand the LLVM error string to the main thread instead of discarding it
+    // (storing the raw pointer allocates nothing on the Cryo side); the
+    // report loop prints it and disposes it with LLVMDisposeMessage.
+    (*job).err_msg = err as string;
     (*job).ok = rc == 0;
 }
 

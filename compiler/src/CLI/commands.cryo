@@ -1697,12 +1697,29 @@ type struct Executor {
     ///   - `"display"`        an X11 (`DISPLAY`) or Wayland (`WAYLAND_DISPLAY`)
     ///                        display is available;
     ///   - `"vendor:<Name>"`  the vendor library `<Name>` is registered and has
-    ///                        generated host bindings.
-    /// An unrecognized token is treated as SATISFIED so a newer test.json run
-    /// under an older compiler degrades to running, not spuriously skipping.
+    ///                        generated host bindings;
+    ///   - `"os:<name>"`      the compiler's own target OS is `<name>`;
+    ///   - `"cxx"`            a C++ toolchain is available.
+    /// Unrecognized tokens never reach here: `proj_first_unknown_requirement`
+    /// rejects them as a hard test failure first.
     static proj_first_unmet_requirement(reqs: &string[]) -> string {
         for (mut i: i64 = 0; i < reqs.length; i++) {
             if (!Executor::proj_requirement_met(reqs[i])) { return reqs[i]; }
+        }
+        return "";
+    }
+
+    /// The first `requires` token this harness does not recognize, or ""
+    /// when every token is known.  An unknown token is a hard test failure,
+    /// not a skip and not "satisfied": a typo'd requirement must not
+    /// silently change semantics from "gated" to "always-run" (or park the
+    /// project as permanently skipped).
+    static proj_first_unknown_requirement(reqs: &string[]) -> string {
+        for (mut i: i64 = 0; i < reqs.length; i++) {
+            const r: string = reqs[i];
+            const known: boolean = r == "display" || r == "cxx"
+                || r.starts_with("vendor:") || r.starts_with("os:");
+            if (!known) { return r; }
         }
         return "";
     }
@@ -1749,7 +1766,8 @@ type struct Executor {
             // separate Windows C++ link gap.
             return exec::shell("c++ --version > /dev/null 2>&1") == 0;
         }
-        // Unknown requirement: don't gate on something this compiler can't check.
+        // Unreachable for project specs: unknown tokens were already rejected
+        // as a hard failure by proj_first_unknown_requirement.
         return true;
     }
 
@@ -1995,6 +2013,16 @@ type struct Executor {
                 else if (is_pretty) { fmt::printf("[IGNORED]\n"); }
                 else { fmt::printf("ignored\n"); }
                 entry = readdir(dp); continue;
+            }
+
+            // A `requires` token the harness doesn't recognize is a hard
+            // FAILURE, not a skip: a typo'd requirement would otherwise
+            // silently change semantics from "gated" to "always-run".
+            const unknown_req: string = Executor::proj_first_unknown_requirement(&spec.requires);
+            if (unknown_req.length() > 0) {
+                Executor::proj_report(is_pretty, is_compact, color_on, false,
+                    format("unknown requires token \"%s\"", unknown_req));
+                failures += 1; ran += 1; entry = readdir(dp); continue;
             }
 
             // Environment-gated skip: a project declaring `requires` runs only
