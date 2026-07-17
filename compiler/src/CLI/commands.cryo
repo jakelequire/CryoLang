@@ -71,10 +71,12 @@ type struct ProjSpec {
     /// Environment prerequisites (test.json `requires`): the project runs only
     /// where every token holds, and is otherwise SKIPPED with a reason (not a
     /// failure).  Recognized tokens: `"display"` (an X11/Wayland display is
-    /// present) and `"vendor:<Name>"` (that vendor library is registered with
-    /// host bindings).  Lets a real integration test (e.g. the raylib window
-    /// demo) stay live without turning a portable `make test` red.  Empty = no
-    /// prerequisites (the common case).
+    /// present), `"vendor:<Name>"` (that vendor library is registered with
+    /// host bindings), `"cxx"` (a C++ toolchain responds), and `"os:<name>"`
+    /// (the host OS is `linux`/`windows`/`macos` - for projects whose sources
+    /// hard-use one platform's surface).  Lets a real integration test (e.g.
+    /// the raylib window demo) stay live without turning a portable
+    /// `make test` red.  Empty = no prerequisites (the common case).
     requires:   string[];
 }
 
@@ -120,6 +122,25 @@ function exec_path(path: string) -> string {
 ![target(unix)]
 function exec_path(path: string) -> string {
     return path;
+}
+
+// The host OS this compiler was built for, as the name an `os:<name>`
+// project-test requirement matches against (see `proj_requirement_met`).
+// A method body can't be `![target(...)]`-gated, so this lives as a
+// per-target free function like `exec_path` above.
+![target(linux)]
+function host_os_name() -> string {
+    return "linux";
+}
+
+![target(windows)]
+function host_os_name() -> string {
+    return "windows";
+}
+
+![target(macos)]
+function host_os_name() -> string {
+    return "macos";
 }
 
 /// Per-process scratch path for capturing a negative test's compiler
@@ -1707,6 +1728,14 @@ type struct Executor {
             const f: string = reg.entries[idx].cache_file_for(
                 VendorRegistry::normalize_triple(""));
             return f.length() > 0 && metadata::exists(Path::from(f));
+        }
+        if (req.starts_with("os:")) {
+            // The project's sources hard-use one platform's surface (e.g.
+            // native_syscalls_gate's Linux `syscall`-instruction asm), so it
+            // can only compile and run on that host.  Matched against the
+            // COMPILER's OWN target - the projects suite builds and runs on
+            // the host, so compiler target == project host.
+            return (req + 3) == host_os_name();
         }
         if (req == "cxx") {
             // A C++ toolchain is available.  The C++ direct-mangled-binding test

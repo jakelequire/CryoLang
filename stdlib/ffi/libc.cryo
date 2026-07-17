@@ -297,30 +297,89 @@ extern "C" {
 //
 // `O_*` and `F_*` are bit-flag and command sets; kept as constants.
 // `fcntl` is a variadic command dispatcher; arg type depends on cmd.
+//
+// The `O_*` bit VALUES are OS-specific: glibc and MSVCRT lay them out
+// differently (glibc's `O_CREAT`=0x40 is MSVCRT's `_O_TEMPORARY` -
+// delete-on-close! - so reusing glibc values on Windows silently opens
+// without creating).  Only the access-mode bits agree.  Each target gets
+// its own faithful mirror of its C library's header; a flag that does not
+// exist on a target is not defined for it, so misuse is a compile error
+// rather than a silently-wrong bitmask.
 
 const O_RDONLY:    i32 = 0;
 const O_WRONLY:    i32 = 1;
 const O_RDWR:      i32 = 2;
 const O_ACCMODE:   i32 = 3;
 
+// Linux/glibc `<fcntl.h>` values.
+![target(unix)]
 const O_CREAT:     i32 = 64;
+![target(unix)]
 const O_EXCL:      i32 = 128;
+![target(unix)]
 const O_NOCTTY:    i32 = 256;
+![target(unix)]
 const O_TRUNC:     i32 = 512;
+![target(unix)]
 const O_APPEND:    i32 = 1024;
+![target(unix)]
 const O_NONBLOCK:  i32 = 2048;
+![target(unix)]
 const O_NDELAY:    i32 = 2048;     // == O_NONBLOCK
+![target(unix)]
 const O_DSYNC:     i32 = 4096;
+![target(unix)]
 const O_ASYNC:     i32 = 8192;
+![target(unix)]
 const O_DIRECT:    i32 = 16384;
+![target(unix)]
 const O_LARGEFILE: i32 = 32768;
+![target(unix)]
 const O_DIRECTORY: i32 = 65536;
+![target(unix)]
 const O_NOFOLLOW:  i32 = 131072;
+![target(unix)]
 const O_NOATIME:   i32 = 262144;
+![target(unix)]
 const O_CLOEXEC:   i32 = 524288;
+![target(unix)]
 const O_SYNC:      i32 = 1052672;  // O_DSYNC | O_RSYNC
+![target(unix)]
 const O_PATH:      i32 = 2097152;
+![target(unix)]
 const O_TMPFILE:   i32 = 4259840;  // O_TMPFILE | O_DIRECTORY
+// POSIX has no text/binary distinction; a zero `O_BINARY` lets portable
+// callers write `flags | O_BINARY` unconditionally (the standard C idiom).
+![target(unix)]
+const O_BINARY:    i32 = 0;
+
+// MSVCRT `<fcntl.h>` (`_O_*`) values, spelled without the underscore so
+// portable call sites read identically.  `O_NOINHERIT` is the CRT's
+// close-on-exec analog (the fd's handle is not inherited by children);
+// `O_TEMPORARY` is delete-on-close.  Text-mode translation (CRLF) applies
+// unless `O_BINARY` is set - binary is what POSIX semantics expect.
+![target(windows)]
+const O_APPEND:      i32 = 8;       // _O_APPEND
+![target(windows)]
+const O_RANDOM:      i32 = 16;      // _O_RANDOM
+![target(windows)]
+const O_SEQUENTIAL:  i32 = 32;      // _O_SEQUENTIAL
+![target(windows)]
+const O_TEMPORARY:   i32 = 64;      // _O_TEMPORARY (delete-on-close)
+![target(windows)]
+const O_NOINHERIT:   i32 = 128;     // _O_NOINHERIT
+![target(windows)]
+const O_CREAT:       i32 = 256;     // _O_CREAT
+![target(windows)]
+const O_TRUNC:       i32 = 512;     // _O_TRUNC
+![target(windows)]
+const O_EXCL:        i32 = 1024;    // _O_EXCL
+![target(windows)]
+const O_SHORT_LIVED: i32 = 4096;    // _O_SHORT_LIVED
+![target(windows)]
+const O_TEXT:        i32 = 16384;   // _O_TEXT (CRLF translation)
+![target(windows)]
+const O_BINARY:      i32 = 32768;   // _O_BINARY (no translation)
 
 // fcntl() commands
 const F_DUPFD:         i32 = 0;
@@ -483,10 +542,55 @@ const _SC_LOGIN_NAME_MAX:   i32 = 71;
 
 // unistd.h: POSIX file / process operations
 
+// Byte I/O + lseek widths are OS-dispatched.  POSIX `read`/`write` take a
+// `size_t` count and return `ssize_t` (both 64-bit); MSVCRT's `_read`/
+// `_write` take `unsigned int` and return `int`, and its `lseek` alias is
+// the 32-bit `_lseek` (`long` return).  Declaring the CRT trio at POSIX
+// widths reads garbage past bit 31 of the return register: an error `-1`
+// zero-extends to 4294967295, which callers see as SUCCESS.  Windows gets
+// faithful `_read`/`_write`/`_lseeki64` externs plus POSIX-shaped shims
+// (same pattern as `isatty` below).
+![target(unix)]
 extern "C" {
-    // Byte I/O
     function read(fd: i32, buffer: u8*, count: u64) -> i64;
     function write(fd: i32, buffer: u8*, count: u64) -> i64;
+    function lseek(fd: i32, offset: i64, whence: Whence) -> i64;
+}
+
+![target(windows)]
+extern "C" {
+    function _read(fd: i32, buffer: u8*, count: u32) -> i32;
+    function _write(fd: i32, buffer: u8*, count: u32) -> i32;
+    function _lseeki64(fd: i32, offset: i64, origin: i32) -> i64;
+}
+
+/// POSIX-shaped `read` over CRT `_read`.  The count is clamped to the
+/// CRT's `INT_MAX` request ceiling - a short read is legal under the
+/// POSIX contract, so callers loop as they already must.
+![target(windows)]
+function read(fd: i32, buffer: u8*, count: u64) -> i64 {
+    mut n: u32 = 2147483647;
+    if (count < 2147483647) { n = count as u32; }
+    return _read(fd, buffer, n) as i64;
+}
+
+/// POSIX-shaped `write` over CRT `_write`; same clamp, short writes legal.
+![target(windows)]
+function write(fd: i32, buffer: u8*, count: u64) -> i64 {
+    mut n: u32 = 2147483647;
+    if (count < 2147483647) { n = count as u32; }
+    return _write(fd, buffer, n) as i64;
+}
+
+/// POSIX-shaped `lseek` over CRT `_lseeki64` (the 64-bit offset entry
+/// point; plain CRT `lseek` truncates offsets and returns to 32 bits).
+![target(windows)]
+function lseek(fd: i32, offset: i64, whence: Whence) -> i64 {
+    return _lseeki64(fd, offset, whence as i32);
+}
+
+extern "C" {
+    // Byte I/O (POSIX-only entry points; no MSVCRT equivalent)
     function pread(fd: i32, buffer: u8*, count: u64, offset: i64) -> i64;
     function pwrite(fd: i32, buffer: u8*, count: u64, offset: i64) -> i64;
     function readv(fd: i32, iov: iovec*, iovcnt: i32) -> i64;
@@ -496,7 +600,6 @@ extern "C" {
 
     // Descriptor management
     function close(fd: i32) -> i32;
-    function lseek(fd: i32, offset: i64, whence: Whence) -> i64;
     function dup(oldfd: i32) -> i32;
     function dup2(oldfd: i32, newfd: i32) -> i32;
     function dup3(oldfd: i32, newfd: i32, flags: i32) -> i32;
