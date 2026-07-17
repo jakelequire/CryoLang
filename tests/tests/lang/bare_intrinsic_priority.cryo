@@ -1,0 +1,72 @@
+///! Bare-leaf intrinsic priority.
+///!
+///! `std::alloc::heap` defines public `free(void*)` / `realloc(...)` whose
+///! leaf names collide with the declared prelude intrinsics
+///! `intrinsics::free` / `intrinsics::realloc`.  A bare `free(p)` in a
+///! module that does NOT import `alloc::heap` must keep binding the
+///! intrinsic (libc): the bare decl-index slot is owned by the intrinsic
+///! and a later same-leaf regular function must not rebind it.  Under the
+///! bug, `free(malloc'd)` dispatched to `heap::free`, which crashed on the
+///! foreign pointer, and bare 2-arg `realloc` failed codegen outright
+///! (`cannot resolve function 'realloc'`).
+///!
+///! This module deliberately imports nothing allocation-related.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::BareIntrinsicPriority;
+
+import std::core::result;
+import std::test::error;
+import std::test::assert;
+
+// Bare `free` on a libc-malloc'd pointer must reach libc free, not
+// `heap::free` (identical `(void*) -> void` signature — the silent-stomp
+// case: same interned FunctionType, so the overload-mangled slot is shared).
+![test]
+function bare_free_binds_intrinsic() -> Result<(), TestError> {
+    const p: void* = malloc(64);
+    match (expect_true(p != null, "malloc returned null")) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    // Touch the block so the allocation is observable, then free it BARE.
+    const bytes: u8* = p as u8*;
+    bytes[0] = 42;
+    match (expect_eq(bytes[0], 42)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    free(p);
+    return Result::Ok(());
+}
+
+// Bare 2-arg `realloc` must bind the intrinsic (arity-distinct from
+// `heap::realloc`, but the bare mangled-name slot was last-write-stomped
+// all the same).
+![test]
+function bare_realloc_binds_intrinsic() -> Result<(), TestError> {
+    mut p: void* = malloc(16);
+    match (expect_true(p != null, "malloc returned null")) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    const b: u8* = p as u8*;
+    b[0] = 7;
+    b[15] = 9;
+    p = realloc(p, 4096);
+    match (expect_true(p != null, "realloc returned null")) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    const nb: u8* = p as u8*;
+    match (expect_eq(nb[0], 7)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(nb[15], 9)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    free(p);
+    return Result::Ok(());
+}

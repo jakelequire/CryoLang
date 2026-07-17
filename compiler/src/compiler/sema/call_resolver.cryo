@@ -45,6 +45,18 @@ import Compiler::Sema::{
 import std::core::{ slice, option };
 import std::fmt;
 
+/// Scope class of a bare-call overload candidate relative to the use site,
+/// nearest first: `Imported` (the current module or an explicit import),
+/// `Prelude` (auto-in-scope via std::prelude, incl. declared intrinsics),
+/// `Global` (un-namespaced legacy claims), `Hidden` (a module the use site
+/// never imported - must not capture a bare call).
+type enum BareCandidateScope {
+    Imported;
+    Prelude;
+    Global;
+    Hidden;
+}
+
 type struct CallResolver {
     arena:    TypeArena*;
     intern:   InternTable*;
@@ -413,6 +425,32 @@ type struct CallResolver {
             if (call.resolved_callee.is_valid()) {
                 const spec_ret: TypeRef = this.types.lookup_func_return(call.resolved_callee);
                 if (spec_ret.is_valid()) { return spec_ret; }
+                // The pin is ground truth: on a re-resolution of an
+                // already-pinned call (a match subject is resolved once
+                // standalone and once for arm binding), the name-based
+                // fallbacks below would re-derive the type from the BARE
+                // single-slot maps, which can belong to a different
+                // same-leaf declaration (an intrinsic-owned leaf keeps the
+                // intrinsic's i64, not the pinned `fs::write`'s Result).
+                // Read the pinned overload entry's own signature instead.
+                const pinned_ft: TypeRef =
+                    this.ctx.decl_index.lookup_func_type_by_mangled(call.resolved_callee);
+                if (pinned_ft.is_valid()) {
+                    const pinned_ret: TypeRef = this.overload_return_type(pinned_ft);
+                    if (pinned_ret.is_valid()) {
+                        // Returning early must not skip `![implicit]`
+                        // converter insertion for the pinned signature (a
+                        // call pinned outside the normal identifier flow
+                        // never reached check_call_arity).  Errorless: the
+                        // authoritative arg-check pass owns diagnostics.
+                        const pt_raw: Type* = this.arena.lookup(pinned_ft.id);
+                        if (pt_raw != null && pt_raw.kind == TypeKind::Function) {
+                            this.apply_implicit_conversions_only(visitor, call,
+                                (pt_raw as FunctionType*).param_types.as_slice());
+                        }
+                        return pinned_ret;
+                    }
+                }
             }
             if (inferred_generic_ret.is_valid()) { return inferred_generic_ret; }
             if (call.generic_args.length > 0) {
@@ -1460,9 +1498,17 @@ type struct CallResolver {
         const qualified: SymbolStr = this.ctx.qualify_symbol_sym(ident.name);
         mut overloads: TypeRef[] = di.lookup_func_type_overloads(qualified);
         mut lookup_key: SymbolStr = qualified;
+        // Bare fallback: candidates may span modules (per-owner entries), so
+        // binding becomes import-scoped - see the candidate selection below.
+        mut scoped_bare: boolean = false;
+        mut owners:   u32[] = [];
+        mut mangleds: u32[] = [];
         if (overloads.length == 0) {
             overloads = di.lookup_func_type_overloads(ident.name);
+            owners    = di.lookup_func_overload_owners(ident.name);
+            mangleds  = di.lookup_func_overload_mangleds(ident.name);
             lookup_key = ident.name;
+            scoped_bare = true;
         }
         if (overloads.length == 0) { return TypeRef::invalid(); }
         if (overloads.length == 1) {
@@ -1471,6 +1517,8 @@ type struct CallResolver {
             if (unique_mangled.is_valid()) { call.set_resolved_callee(unique_mangled); }
             return this.overload_return_type(overloads[0]);
         }
+        // Signature-matching candidates (indices into the parallel arrays).
+        mut matches: i64[] = [];
         for (mut oi: i64 = 0; oi < overloads.length; oi++) {
             const ot: Type* = this.arena.lookup(overloads[oi].id);
             if (ot == null || ot.kind != TypeKind::Function) { continue; }
@@ -1487,11 +1535,165 @@ type struct CallResolver {
                 }
             }
             if (!all_match) { continue; }
+            matches.push(oi);
+        }
+        if (matches.length == 0) {
+            if (!scoped_bare) { return TypeRef::invalid(); }
+            // No exact signature match - commonly an integer literal narrower
+            // than the parameter (`realloc(p, 4096)`: i32 literal vs u64).
+            // The pre-scoping behavior pinned a globally-UNIQUE candidate
+            // blind (argument conversion is checked/handled downstream); with
+            // per-owner entries a leaf can be globally plural yet still
+            // unique in the nearest visible scope tier - preserve the blind
+            // pin at that granularity.  Hidden (unimported) candidates never
+            // bind.
+            mut t_imported: i64[] = [];
+            mut t_prelude:  i64[] = [];
+            mut t_legacy:   i64[] = [];
+            for (mut oi: i64 = 0; oi < overloads.length; oi++) {
+                const owner: u32 = if (owners.length > oi) { owners[oi] } else { 0 };
+                if (owner == 0) { t_legacy.push(oi); continue; }
+                match (this.bare_candidate_scope(owner)) {
+                    BareCandidateScope::Imported => { t_imported.push(oi); }
+                    BareCandidateScope::Prelude  => { t_prelude.push(oi); }
+                    BareCandidateScope::Global   => { t_legacy.push(oi); }
+                    BareCandidateScope::Hidden   => { }
+                }
+            }
+            mut tier_len: i64 = t_legacy.length;
+            mut tier_first: i64 = if (t_legacy.length > 0) { t_legacy[0] } else { 0 };
+            if (t_prelude.length > 0) {
+                tier_len = t_prelude.length;
+                tier_first = t_prelude[0];
+            }
+            if (t_imported.length > 0) {
+                tier_len = t_imported.length;
+                tier_first = t_imported[0];
+            }
+            if (tier_len != 1) { return TypeRef::invalid(); }
+            const oi: i64 = tier_first;
+            const owner: u32 = if (owners.length > oi) { owners[oi] } else { 0 };
+            mut mangled: SymbolStr = SymbolStr::empty();
+            if (owner != 0) {
+                mangled = di.lookup_overload_mangled_owned(lookup_key, overloads[oi], owner);
+            }
+            if (!mangled.is_valid()) {
+                mangled = di.lookup_overload_mangled(lookup_key, overloads[oi]);
+            }
+            if (!mangled.is_valid()) { mangled = di.lookup_mangled_name(lookup_key); }
+            if (mangled.is_valid()) { call.set_resolved_callee(mangled); }
+            return this.overload_return_type(overloads[oi]);
+        }
+
+        if (!scoped_bare || matches.length == 1) {
+            // Qualified key, or a unique signature match: pin it directly
+            // (the qualified path's entries all belong to one declaration
+            // family; no cross-module scoping applies).
+            const oi: i64 = matches[0];
+            mut mangled: SymbolStr = SymbolStr::empty();
+            if (scoped_bare && owners.length > oi && owners[oi] != 0) {
+                mangled = di.lookup_overload_mangled_owned(
+                    lookup_key, overloads[oi], owners[oi]);
+            }
+            if (!mangled.is_valid()) {
+                mangled = di.lookup_overload_mangled(lookup_key, overloads[oi]);
+            }
+            if (mangled.is_valid()) { call.set_resolved_callee(mangled); }
+            return this.overload_return_type(overloads[oi]);
+        }
+
+        // Bare leaf with SEVERAL signature-matching candidates: import-scoped
+        // selection, nearest scope wins.
+        //   1. a candidate from the CURRENT module or an EXPLICIT import -
+        //      two of those with the same signature are a genuine ambiguity
+        //      (E0154: qualify);
+        //   2. else the prelude/intrinsic candidate - an explicit import
+        //      shadows the implicit prelude silently (standard nearer-scope
+        //      shadowing: `import std::fmt` makes bare `printf` fmt's even
+        //      though the `printf` intrinsic is prelude-visible);
+        //   3. else owner-0 entries (extern "C" twins and other global
+        //      claims), which keep their legacy first-match behavior;
+        //   4. a candidate in a module the use site never imported must NOT
+        //      capture the call.
+        mut imported_owned: i64[] = [];
+        mut prelude_owned:  i64[] = [];
+        mut legacy: i64[] = [];
+        for (mut mi: i64 = 0; mi < matches.length; mi++) {
+            const oi: i64 = matches[mi];
+            const owner: u32 = if (owners.length > oi) { owners[oi] } else { 0 };
+            if (owner == 0) { legacy.push(oi); continue; }
+            match (this.bare_candidate_scope(owner)) {
+                BareCandidateScope::Imported => { imported_owned.push(oi); }
+                BareCandidateScope::Prelude  => { prelude_owned.push(oi); }
+                BareCandidateScope::Global   => { legacy.push(oi); }
+                BareCandidateScope::Hidden   => { }
+            }
+        }
+        if (imported_owned.length >= 2) {
+            // Two or more same-signature functions equally in scope: the
+            // author must qualify.  (Each owner is a distinct declaration -
+            // one function has one signature entry per owner.)
+            this.emit_ambiguous_bare_call(call, ident,
+                owners[imported_owned[0]], owners[imported_owned[1]]);
+            return TypeRef::invalid();
+        }
+        if (imported_owned.length == 1 || prelude_owned.length >= 1) {
+            // A unique import-scoped candidate, else the prelude one.  Two
+            // same-signature PRELUDE candidates cannot arise: prelude
+            // modules' leaves are curated (and an intrinsic leaf claims sole
+            // bare ownership), so taking the first is exact.
+            const oi: i64 = if (imported_owned.length == 1) { imported_owned[0] }
+                            else { prelude_owned[0] };
+            mut mangled: SymbolStr = di.lookup_overload_mangled_owned(
+                lookup_key, overloads[oi], owners[oi]);
+            if (!mangled.is_valid()) {
+                mangled = di.lookup_overload_mangled(lookup_key, overloads[oi]);
+            }
+            if (mangled.is_valid()) { call.set_resolved_callee(mangled); }
+            return this.overload_return_type(overloads[oi]);
+        }
+        if (legacy.length > 0) {
+            const oi: i64 = legacy[0];
             const mangled: SymbolStr = di.lookup_overload_mangled(lookup_key, overloads[oi]);
             if (mangled.is_valid()) { call.set_resolved_callee(mangled); }
             return this.overload_return_type(overloads[oi]);
         }
+        // Only candidates from unimported modules remain: never bind them.
         return TypeRef::invalid();
+    }
+
+    /// Scope class of a bare-call overload candidate owned by `owner` (a
+    /// qualified function-name id) relative to the module being checked.
+    /// Mirrors the type-side `resolve_qualified_scoped` visibility rules,
+    /// with explicit imports ranked NEARER than the implicit prelude.
+    bare_candidate_scope(&this, owner: u32) -> BareCandidateScope {
+        const di: DeclarationIndex* = this.ctx.decl_index;
+        const owner_sym: SymbolStr = SymbolStr::from_id(owner);
+        const c_ns: SymbolStr = di.namespace_of(owner_sym, this.intern);
+        if (!c_ns.is_valid()) { return BareCandidateScope::Global; }
+        const use_ns: SymbolStr = this.ctx.current_module_ns();
+        if (c_ns.id == use_ns.id) { return BareCandidateScope::Imported; }
+        if (di.ns_imports(use_ns, c_ns)) { return BareCandidateScope::Imported; }
+        if (di.is_prelude_ns(c_ns)) { return BareCandidateScope::Prelude; }
+        return BareCandidateScope::Hidden;
+    }
+
+    /// E0154 for a bare call that matches two or more same-signature
+    /// functions visible from the use site: demand qualification.
+    emit_ambiguous_bare_call(mut &this, call: CallExprNode*, ident: IdentifierNode*,
+                             owner_a: u32, owner_b: u32) -> void {
+        if (this.state.in_symbolic_check) { return; }
+        const name_str: string = this.intern.resolve(ident.name);
+        const a_str: string = this.intern.resolve(SymbolStr::from_id(owner_a));
+        const b_str: string = this.intern.resolve(SymbolStr::from_id(owner_b));
+        mut diag: Diagnostic = Diagnostic::error(
+            ErrorCode::E0154_AMBIGUOUS_CALL,
+            format("call to `%s` is ambiguous: multiple same-signature functions named `%s` are in scope",
+                name_str, name_str));
+        diag = diag.at_with_label(call.span,
+            format("`%s` could be `%s` or `%s`", name_str, a_str, b_str));
+        diag = diag.with_note("qualify the callee with its module path, e.g. `module::function(...)`");
+        this.ctx.emit_diagnostic(diag);
     }
 
     overload_return_type(&this, fn_ref: TypeRef) -> TypeRef {
