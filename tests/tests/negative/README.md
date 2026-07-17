@@ -31,9 +31,10 @@ Results appear in the normal `cryo test` output under `compile-fail result:`.
 ```
 
 A case **fails the suite** (honestly, as a red test) if the file compiles
-cleanly or emits a different code. Some files here intentionally fail today
-because they pin a diagnostic the compiler *should* emit but doesn't yet -
-that red is the signal, not something to paper over.
+cleanly or emits a different code. `make test` is a required gate, so every
+file in this directory must fail with its declared code *today*. A diagnostic
+the compiler *should* emit but doesn't yet is tracked as an issue/TODO - it
+cannot live here as a permanently red test.
 
 Keep `![config(testing)]` too (every test file carries it). Use collision-proof
 names (`cf_`-prefixed) so a snippet can't accidentally shadow stdlib symbols.

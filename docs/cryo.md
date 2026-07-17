@@ -2161,11 +2161,14 @@ const arr: int* = new int[100];
 
 ### 15.3 Null
 
-`null` is the null pointer literal, valid in any pointer context.
+`null` is the null pointer literal, valid in any pointer context. The primitive `string` is pointer-shaped (a NUL-terminated `u8*`), so it counts as a pointer context: `null` assigns to, initializes, returns as, and compares with a `string` without a cast.
 
 ```cryo
 const p: int* = null;
 if (p == null) { println("null"); }
+
+const s: string = null;          // string is pointer-shaped
+if (s == null) { println("no name"); }
 ```
 
 Dereferencing a null pointer is undefined behaviour. For "may be absent" semantics on a value, use `Option<T>` rather than a nullable pointer; the compiler then forces you to handle the absent case at every use.
