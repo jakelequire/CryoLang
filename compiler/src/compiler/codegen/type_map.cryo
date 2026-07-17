@@ -574,51 +574,20 @@ type struct TypeMapper {
             return this.enum_tag_ltype(t);
         }
 
-        // ADT enum: walk variants, computing each one's aligned payload
-        // size (mirroring compute_enum_layout in passes/type_lowering)
-        // so the LLVM struct lines up with the source-language layout.
+        // ADT enum: each variant's aligned payload size/alignment comes from
+        // the single layout authority (TypeArena::variant_payload_layout,
+        // the same function behind compute_enum_layout in
+        // passes/type_lowering and every payload emitter), so the LLVM
+        // struct lines up with the source-language layout by construction.
         mut max_payload_size:  u64 = 0;
         mut max_payload_align: u64 = 1;
         for (mut i: i64 = 0; i < t.variants.length; i++) {
             const v: &EnumVariantInfo = &t.variants[i];
             if (!v.has_payload()) { continue; }
 
-            mut v_offset: u64 = 0;
-            mut v_align:  u64 = 1;
-            for (mut j: i64 = 0; j < v.payload_types.length; j++) {
-                mut pt: Type* = this.arena.lookup(v.payload_types[j].id);
-                if (pt == null) { continue; }
-                // InstantiatedType wrappers (e.g. an Option payload of
-                // type `Array<i32>`) carry size/alignment of 0; the
-                // wrapper never had its layout populated, only the
-                // resolved spec'd struct does.  Follow `resolved_type`
-                // to the concrete struct so size_bytes/alignment return
-                // the right values; otherwise the enum lowers to
-                // `{ i32, [0 x i8] }` and Some(payload) extraction
-                // reads garbage off the end of the 4-byte allocation.
-                if (pt.kind == TypeKind::InstantiatedType) {
-                    const inst_pt: InstantiatedType* = pt as InstantiatedType*;
-                    if (inst_pt.has_resolved_type()) {
-                        const resolved_pt: Type* = this.arena.lookup(
-                            inst_pt.resolved_type.id);
-                        if (resolved_pt != null) { pt = resolved_pt; }
-                    }
-                }
-                const p_size:  u64 = pt.size_bytes();
-                const p_align: u64 = pt.alignment();
-                if (p_align > 0) {
-                    // align_up for the field's offset within the variant
-                    const rem: u64 = v_offset % p_align;
-                    if (rem != 0) { v_offset += (p_align - rem); }
-                    if (p_align > v_align) { v_align = p_align; }
-                }
-                v_offset += p_size;
-            }
-            // Round variant total up to its own alignment.
-            const v_rem: u64 = v_offset % v_align;
-            const v_total: u64 = if (v_align > 1 && v_rem != 0) {
-                v_offset + (v_align - v_rem)
-            } else { v_offset };
+            mut v_total: u64 = 0;
+            mut v_align: u64 = 1;
+            this.arena.variant_payload_layout(v, &v_total, &v_align);
 
             if (v_total > max_payload_size)  { max_payload_size  = v_total; }
             if (v_align > max_payload_align) { max_payload_align = v_align; }

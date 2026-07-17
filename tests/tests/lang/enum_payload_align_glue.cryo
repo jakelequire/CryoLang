@@ -1,0 +1,73 @@
+///! Enum drop glue must free ADT payload fields at the SAME aligned
+///! offsets construction stored them at.  A `V(u32, String)`-shaped
+///! payload puts the 8-aligned String at offset 8 (a packed running sum
+///! says 4); drop glue walking packed offsets reads 4 bytes of the u32
+///! plus 4 bytes of the String pointer and frees the resulting garbage
+///! pointer.  Regression tests for the single layout authority
+///! (TypeArena::variant_payload_layout): these crash or corrupt the heap
+///! if any consumer (construction, pattern binding, drop glue, map_enum,
+///! compute_enum_layout) ever diverges again.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::EnumPayloadAlignGlue;
+
+import std::core::result;
+import std::collections::str;
+import std::collections::string;
+import std::collections::array;
+import std::test::error;
+import std::test::assert;
+
+// u32 (align 4) first, then an 8-aligned owning String:
+// packed offset = 4, aligned offset = 8.
+type enum SkewedPair {
+    Nothing;
+    Both(u32, String);
+}
+
+// u8 first and an InstantiatedType (Array<i32>) in the middle: without
+// following the wrapper to its resolved spec the Array reports size 0,
+// collapsing the trailing String's offset onto (or before) the Array's.
+type enum WrappedMiddle {
+    Nothing;
+    Loaded(u8, Array<i32>, String);
+}
+
+function epag_string() -> String {
+    return String::from_str(Str::new("heap-allocated payload, long enough to matter"));
+}
+
+![test]
+function drop_glue_frees_string_at_aligned_offset() -> Result<(), TestError> {
+    mut v: SkewedPair = SkewedPair::Both(7, epag_string());
+    // `v` drops at scope exit through enum drop glue; with packed glue
+    // offsets this freed a garbage pointer built from the u32 + half the
+    // String pointer.
+    return Result::Ok(());
+}
+
+![test]
+function construction_and_pattern_agree_on_offsets() -> Result<(), TestError> {
+    mut v: SkewedPair = SkewedPair::Both(7, epag_string());
+    mut n_ok: boolean = false;
+    match (&v) {
+        SkewedPair::Both(n, s) => {
+            n_ok = (n == 7) && (s.length() > 0);
+        }
+        _ => { }
+    }
+    return expect_true(n_ok, Str::new("pattern must read the payload fields construction stored"));
+}
+
+![test]
+function drop_glue_handles_instantiated_middle_field() -> Result<(), TestError> {
+    mut a: Array<i32> = Array::new();
+    a.push(1);
+    a.push(2);
+    a.push(3);
+    mut v: WrappedMiddle = WrappedMiddle::Loaded(9, a, epag_string());
+    // Glue must drop the Array at its aligned offset AND place the String
+    // after the Array's REAL size (InstantiatedType wrapper unwrapped) -
+    // otherwise both frees run on garbage.
+    return Result::Ok(());
+}

@@ -886,6 +886,35 @@ type struct IntrinsicEmitter {
         return this.llvm_module.add_function("vfprintf", fty);
     }
 
+    /// Declare libc `int printf(const char* fmt, ...)` if absent.  Used by
+    /// the `panic` runtime to report the message before aborting.
+    get_or_decl_printf(mut &this) -> LValue {
+        mut fn: LValue = this.llvm_module.get_named_function("printf");
+        if (fn.is_valid()) { return fn; }
+        const ptr_ty: LType = LType::pointer_to(LType::i8());
+        const buf: void* = intrinsics::malloc(8);
+        const slots: void** = buf as void**;
+        slots[0] = ptr_ty.raw;   // const char* fmt
+        const fty: LType = LType::function_type(LType::i32(), buf, 1, true);
+        intrinsics::free(buf);
+        return this.llvm_module.add_function("printf", fty);
+    }
+
+    /// Declare libc `int fflush(FILE* stream)` if absent.  `fflush(NULL)`
+    /// flushes every open output stream - the `panic` runtime uses it so
+    /// the panic report survives the abort() that follows.
+    get_or_decl_fflush(mut &this) -> LValue {
+        mut fn: LValue = this.llvm_module.get_named_function("fflush");
+        if (fn.is_valid()) { return fn; }
+        const ptr_ty: LType = LType::pointer_to(LType::i8());
+        const buf: void* = intrinsics::malloc(8);
+        const slots: void** = buf as void**;
+        slots[0] = ptr_ty.raw;   // FILE* (null = all streams)
+        const fty: LType = LType::function_type(LType::i32(), buf, 1, false);
+        intrinsics::free(buf);
+        return this.llvm_module.add_function("fflush", fty);
+    }
+
     /// Pluck the next variadic argument of type `ty` from the va_list `va`
     /// points at.
     ///
@@ -1067,9 +1096,10 @@ type struct IntrinsicEmitter {
     /// `call @panic(...)` with no body; without this, the linker fails on
     /// `undefined reference to 'panic'`.
     ///
-    /// The body just calls libc `abort()` and emits `unreachable`; on a
-    /// future iteration we can route through `fprintf(stderr, ...)` to
-    /// print the message, but that requires extra externs.
+    /// The body prints `panic: <msg>\n  at <file>:<line>` via libc printf,
+    /// flushes every open stream (`fflush(NULL)`) so the report survives
+    /// the abort, then calls `abort()` and emits `unreachable`.  Before
+    /// the print landed, every unwrap failure was a mute SIGABRT.
     emit_panic_runtime(mut &this) -> void {
         mut panic_fn: LValue = this.llvm_module.get_named_function("panic");
         if (panic_fn.is_valid()) {
@@ -1099,6 +1129,33 @@ type struct IntrinsicEmitter {
         const saved_bb: LBasicBlock = this.builder.get_insert_block();
         const entry_bb: LBasicBlock = LBasicBlock::append(panic_fn, "entry");
         this.builder.position_at_end(entry_bb);
+
+        // Report the panic before dying - a mute SIGABRT on every unwrap
+        // failure is undebuggable.  printf + fflush(NULL) (flush ALL open
+        // output streams) because abort() skips stream teardown.
+        const printf_fn: LValue = this.get_or_decl_printf();
+        const fmt_ptr: LValue = this.builder.build_global_string_ptr(
+            "\npanic: %s\n  at %s:%d\n", "panic.fmt");
+        if (printf_fn.is_valid() && fmt_ptr.is_valid()) {
+            const printf_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(printf_fn.raw) };
+            const abuf: void* = intrinsics::malloc(32);
+            const aslots: void** = abuf as void**;
+            aslots[0] = fmt_ptr.raw;
+            aslots[1] = panic_fn.get_param(0).raw;
+            aslots[2] = panic_fn.get_param(1).raw;
+            aslots[3] = panic_fn.get_param(2).raw;
+            this.builder.build_call(printf_ty, printf_fn, abuf, 4, "");
+            intrinsics::free(abuf);
+        }
+        const fflush_fn: LValue = this.get_or_decl_fflush();
+        if (fflush_fn.is_valid()) {
+            const fflush_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(fflush_fn.raw) };
+            const fbuf: void* = intrinsics::malloc(8);
+            const fslots: void** = fbuf as void**;
+            fslots[0] = LType::const_null(LType::pointer_to(LType::i8())).raw;
+            this.builder.build_call(fflush_ty, fflush_fn, fbuf, 1, "");
+            intrinsics::free(fbuf);
+        }
 
         // Direct LLVM call to abort() - no need for the full codegen_call
         // machinery here (the abort signature is fixed and we have zero

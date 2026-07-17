@@ -41,8 +41,8 @@ function scalar_name(k: i32) -> string {
     if (k == Clang::TK_Short)      { return "i16"; }
     if (k == Clang::TK_UInt)       { return "u32"; }
     if (k == Clang::TK_Int)        { return "i32"; }
-    if (k == Clang::TK_ULong)      { return "u64"; }
-    if (k == Clang::TK_Long)       { return "i64"; }
+    // TK_Long / TK_ULong are handled in `map()` via clang_Type_getSizeOf:
+    // their width is target-dependent (LP64 vs LLP64), not a fixed name.
     if (k == Clang::TK_ULongLong)  { return "u64"; }
     if (k == Clang::TK_LongLong)   { return "i64"; }
     if (k == Clang::TK_Float)      { return "f32"; }
@@ -282,6 +282,19 @@ type struct CTypeMapper {
             }
             // Enums with no emittable name still round-trip as their integer width.
             return this.prim("i32");
+        }
+
+        // C `long` / `unsigned long` width is TARGET-DEPENDENT: 8 bytes on
+        // LP64 (Linux/macOS), 4 on LLP64 (Windows).  Ask libclang for the
+        // canonical type's actual size in this TU's target instead of
+        // assuming LP64 - a hardcoded i64/u64 gives every bare-`long` C API
+        // wrong-width fields and params on Windows.
+        if (k == Clang::TK_Long || k == Clang::TK_ULong) {
+            const long_size: i64 = Clang::clang_Type_getSizeOf(c);
+            if (long_size == 4) {
+                return this.prim(if (k == Clang::TK_Long) { "i32" } else { "u32" });
+            }
+            return this.prim(if (k == Clang::TK_Long) { "i64" } else { "u64" });
         }
 
         const name: string = scalar_name(k);
