@@ -1172,6 +1172,18 @@ public:
             return this.parse_lambda_expression(start);
         }
 
+        // Untyped-parameter lambda: `(x) -> ...` / `(x, y) -> ...`.  The
+        // first param has no `: Type`, so the check above misses it and it
+        // would otherwise parse as a parenthesized expression / tuple and
+        // then trip the generic "`->` is not an operator" error - confusing,
+        // because the user clearly meant a lambda.  Cryo has no `->`
+        // operator, so a `( ... ) ->` shape is unambiguously a lambda
+        // parameter list; route it to the lambda parser, which reports the
+        // missing annotations precisely and recovers.
+        if (this.check(TokenType::Identifier) && this.looks_like_lambda_params()) {
+            return this.parse_lambda_expression(start);
+        }
+
         // Parse as expression (possibly tuple)
         const first: ExpressionNode* = this.parse_expression();
         if (first == null) {
@@ -1200,6 +1212,32 @@ public:
         return first;
     }
 
+    /// Lookahead: does the paren group just opened (the `(` already
+    /// consumed, so `pos` sits at the first token inside) close with a
+    /// matching `)` immediately followed by `->`?  That shape is only ever
+    /// a lambda parameter list - Cryo has no `->` operator, so no valid
+    /// parenthesized expression or tuple can be followed by `->`.  Scans by
+    /// paren depth (nested function-pointer type params balance correctly)
+    /// with a hard bound so a pathological unbalanced stream can't spin.
+    looks_like_lambda_params(&this) -> boolean {
+        mut depth: int = 1;   // account for the already-consumed '('
+        mut off:   int = 0;
+        while (off < 4096) {
+            const k: TokenType = this.peek_at(off).kind;
+            if (k == TokenType::EOF) { return false; }
+            if (k == TokenType::LParen) {
+                depth += 1;
+            } else if (k == TokenType::RParen) {
+                depth -= 1;
+                if (depth == 0) {
+                    return this.peek_at(off + 1).kind == TokenType::Arrow;
+                }
+            }
+            off += 1;
+        }
+        return false;
+    }
+
     /// Parse a lambda starting from the parameter list (after '(' was consumed).
     /// Lambdas accept a stripped-down parameter form: `name` or `name: Type`,
     /// without `mut`, default values, or variadics. Kept inline (rather than
@@ -1208,6 +1246,7 @@ public:
     /// duplicating it on ParserBase or threading a Parser* through.
     parse_lambda_expression(start: Token) -> ExpressionNode* {
         mut params: VarDeclNode*[] = [];
+        mut reported_untyped: boolean = false;
         while (!this.check(TokenType::RParen) && !this.is_at_end()) {
             const name_tok: Token = this.consume(TokenType::Identifier, "parameter name");
             const pname: SymbolStr = this.intern_lexeme(name_tok);
@@ -1216,6 +1255,22 @@ public:
             if (this.match_tok(TokenType::Colon)) {
                 const ptype: TypeAnnotation* = this.parse_type_annotation();
                 param.set_type_annotation(ptype);
+            } else if (!reported_untyped) {
+                // Lambda parameters must be typed: there is no parameter-type
+                // inference, so an unannotated param would fail obscurely
+                // downstream.  Report it here, once per lambda (pointing at the
+                // first bare param), then keep parsing so the body still forms
+                // a lambda node and no cascade follows.  Emitted directly (not
+                // via report_error) to avoid tripping panic-mode recovery -
+                // mirrors the `->` member-access diagnostic above.
+                this.error_count += 1;
+                mut diag: Diagnostic = Diagnostic::error(
+                    ErrorCode::E0104_EXPECTED_TYPE,
+                    "lambda parameters need explicit type annotations");
+                diag = diag.at(this.span_from_token(name_tok));
+                diag = diag.with_note("annotate each parameter, e.g. `(x: T) -> ...`; Cryo does not infer lambda parameter types");
+                this.ctx.emit_diagnostic(diag);
+                reported_untyped = true;
             }
 
             params.push(param);

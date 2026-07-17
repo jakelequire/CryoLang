@@ -75,7 +75,9 @@ public:
             this.previous_token = tok;
         }
 
-        const eof: Token = this.make_token(TokenType::EOF, "");
+        // EOF is a zero-width token at the current end position.
+        const eof: Token = Token::new(TokenType::EOF, "",
+            this.current_location.line, this.current_location.column);
         tokens.push(eof);
 
         LOG_DEBUG(LogComponent::Lexer, "[Lexer] Lexing complete, total tokens: %d", tokens.length);
@@ -86,8 +88,17 @@ private:
     lex_token(&this) -> Token {
         this.skip_whitespace();
 
+        // Capture the token's true start position ONCE, before any advance()
+        // and before the comment dispatch below.  Threaded explicitly into
+        // every lex_* helper so each token records its real start line/column -
+        // correct even for tab-bearing or multi-line tokens (block/doc
+        // comments), where the old `column - lexeme.length()` back-computation
+        // yielded the END line and a nonsense column.
+        const start_line: int = this.current_location.line;
+        const start_col:  int = this.current_location.column;
+
         if (this.at_end()) {
-            return this.make_token(TokenType::EOF, "");
+            return Token::new(TokenType::EOF, "", start_line, start_col);
         }
 
         // Comments must be detected BEFORE advance():
@@ -100,18 +111,18 @@ private:
                 // Line comment (//) or doc comment (///)
                 this.advance(); // consume first '/'
                 if (this.peek_ahead(1) == '/') {
-                    return this.lex_doc_comment();
+                    return this.lex_doc_comment(start_line, start_col);
                 }
-                return this.lex_comment();
+                return this.lex_comment(start_line, start_col);
             }
 
             if (next_ch == '*') {
                 // Block comment (/* */) or doc comment (/** */)
                 this.advance(); // consume first '/'
                 if (this.peek_ahead(1) == '*') {
-                    return this.lex_doc_comment();
+                    return this.lex_doc_comment(start_line, start_col);
                 }
-                return this.lex_comment();
+                return this.lex_comment(start_line, start_col);
             }
         }
 
@@ -129,11 +140,11 @@ private:
         }
 
         if (Lexer::is_alpha(c)) {
-            return this.lex_identifier();
+            return this.lex_identifier(start_line, start_col);
         }
 
         if (Lexer::is_digit(c)) {
-            return this.lex_number();
+            return this.lex_number(start_line, start_col);
         }
 
         if (c == '"') {
@@ -148,14 +159,14 @@ private:
         if (punct_kind != TokenType::Unknown) {
             const punct_len: u64 = (this.current as i64 - token_start as i64) as u64;
             const punct_lexeme: string = token_start.substr(0, punct_len);
-            return this.make_token(punct_kind, punct_lexeme);
+            return Token::new(punct_kind, punct_lexeme, start_line, start_col);
         }
 
         LOG_DEBUG(LogComponent::Lexer, "[Lexer] Unexpected character at line %d col %d", this.current_location.line, this.current_location.column);
         return this.emit_error(ErrorCode::E0001_UNEXPECTED_CHARACTER, "Unexpected character");
     }
 
-    lex_identifier(&this) -> Token {
+    lex_identifier(&this, start_line: int, start_col: int) -> Token {
         // Back up one character: lex_token() already consumed the first char via advance()
         const start: string = this.current - 1;
 
@@ -172,10 +183,10 @@ private:
         const kw_kind: TokenType = TokenType::from_keyword(text);
         const kind: TokenType = if (kw_kind == TokenType::Unknown) { TokenType::Identifier } else { kw_kind };
 
-        return this.make_token(kind, text);
+        return Token::new(kind, text, start_line, start_col);
     }
 
-    lex_number(&this) -> Token {
+    lex_number(&this, start_line: int, start_col: int) -> Token {
         // Back up one character: lex_token() already consumed the first digit via advance()
         const start: string = this.current - 1;
 
@@ -313,7 +324,7 @@ private:
         const len: u64 = (this.current as i64 - start as i64) as u64;
         const lexeme: string = start.substr(0, len);
 
-        return this.make_token(TokenType::NumericConstant, lexeme);
+        return Token::new(TokenType::NumericConstant, lexeme, start_line, start_col);
     }
 
     lex_string(&this, quote: char) -> Token {
@@ -439,9 +450,9 @@ private:
         const start: string = this.current;
         // `lex_token()` already consumed the opening `'` via advance(), so
         // `current_location.column` sits one past it - the opening quote's
-        // own column is one back.  Capture it for an accurate token span;
-        // `make_token` would instead derive the column from the
-        // quote-stripped lexeme length and land two columns too far right.
+        // own column is one back.  Capture it directly for an accurate token
+        // span (character literals build their own explicit start, like the
+        // string/f-string lexers).
         const start_line: int = this.current_location.line;
         const start_col:  int = this.current_location.column - 1;
 
@@ -547,7 +558,7 @@ private:
         return Token::new(TokenType::CharConstant, lexeme, start_line, start_col);
     }
 
-    lex_comment(&this) -> Token {
+    lex_comment(&this, start_line: int, start_col: int) -> Token {
         // `this.current` points to the second character of the comment opener
         // (the second '/' for //, or '*' for /*).  Back up one for the token start.
         const start: string = this.current - 1;
@@ -597,10 +608,10 @@ private:
         const len: u64 = (this.current as i64 - start as i64) as u64;
         const lexeme: string = start.substr(0, len);
 
-        return this.make_token(TokenType::Comment, lexeme);
+        return Token::new(TokenType::Comment, lexeme, start_line, start_col);
     }
 
-    lex_doc_comment(&this) -> Token {
+    lex_doc_comment(&this, start_line: int, start_col: int) -> Token {
         // `this.current` points to the second character of the opener.
         // Back up one for the token start.
         const start: string = this.current - 1;
@@ -658,13 +669,13 @@ private:
             }
 
         } else {
-            return this.lex_comment();
+            return this.lex_comment(start_line, start_col);
         }
 
         const len: u64 = (this.current as i64 - start as i64) as u64;
         const lexeme: string = start.substr(0, len);
 
-        return this.make_token(doc_kind, lexeme);
+        return Token::new(doc_kind, lexeme, start_line, start_col);
     }
 
     lex_punctuator(&this, c: char) -> TokenType {
@@ -844,15 +855,6 @@ private:
 
     at_end(&this) -> boolean {
         return this.current >= this.buffer_end;
-    }
-
-    make_token(&this, kind: TokenType, lexeme: string) -> Token {
-        return Token::new(
-            kind,
-            lexeme,
-            this.current_location.line,
-            (this.current_location.column - lexeme.length()) as i32
-        );
     }
 
     /// Emit a diagnostic and return an Unknown token.
