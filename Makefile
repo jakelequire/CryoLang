@@ -64,21 +64,36 @@ WIN_CLANG_LIB := $(ROOT)/.toolchains/llvm-win/lib/libclang.dll.a
 WIN_CLANG_DLL := $(ROOT)/.toolchains/llvm-win/bin/libclang.dll
 
 # C-side helpers for the ABI tests.  Compiled with the host cc to a
-# static archive that `tests/cryoconfig` links via -L./helpers
-# -labihelpers - see tests/helpers/abi_helpers.c for the contract.
+# static archive that `tests/cryoconfig` links by verbatim path - see
+# tests/helpers/abi_helpers.c for the contract.
+#
+# The artifact names are per-OS (`-unix` / `-windows`): a native Windows
+# `make test` and a WSL/Linux one share this working tree, and an
+# OS-agnostic path let a PE archive satisfy the Linux link (and vice
+# versa) - the resulting failure is cryptic (`__mingw_vsnprintf` /
+# `__ImageBase` relocation errors buried behind E0900).  Each host OS owns
+# its own artifact; `tests/cryoconfig` selects it via the matching
+# `[link.unix]` / `[link.windows]` overlay.
+ifeq ($(HOST_OS),windows)
+    HELPER_OS := windows
+else
+    HELPER_OS := unix
+endif
 TEST_HELPERS_DIR := $(ROOT)/tests/helpers
 TEST_HELPERS_C   := $(TEST_HELPERS_DIR)/abi_helpers.c
-TEST_HELPERS_O   := $(TEST_HELPERS_DIR)/abi_helpers.o
-TEST_HELPERS_A   := $(TEST_HELPERS_DIR)/libabihelpers.a
+TEST_HELPERS_O   := $(TEST_HELPERS_DIR)/abi_helpers-$(HELPER_OS).o
+TEST_HELPERS_A   := $(TEST_HELPERS_DIR)/libabihelpers-$(HELPER_OS).a
 
 # C++-side helper for the ffi_cpp_link project (the C++ direct-mangled-binding
 # exemplar).  Compiled with the host C++ compiler so the project can `![link]`
 # its Itanium-mangled symbols across a module boundary.  Built only on unix
 # (the project gates on `requires: ["cxx"]`, which a C++-toolchain-less host
-# fails, so it is skipped where this archive is absent).
+# fails, so it is skipped where this archive is absent).  Same per-OS
+# naming discipline as the C helpers (`-unix` today; a windows arm would
+# add `-windows` + a `[link.windows]` overlay in the project cryoconfig).
 TEST_CPP_HELPERS_CPP := $(TEST_HELPERS_DIR)/cpp_link_helper.cpp
-TEST_CPP_HELPERS_O   := $(TEST_HELPERS_DIR)/cpp_link_helper.o
-TEST_CPP_HELPERS_A   := $(TEST_HELPERS_DIR)/libcpplinkhelper.a
+TEST_CPP_HELPERS_O   := $(TEST_HELPERS_DIR)/cpp_link_helper-unix.o
+TEST_CPP_HELPERS_A   := $(TEST_HELPERS_DIR)/libcpplinkhelper-unix.a
 CXX                  ?= c++
 
 # `nproc` is POSIX-only; on Windows make (cmd as recipe shell) the
@@ -495,4 +510,4 @@ clean:
 	@rm -rf compiler/build stdlib/.bin
 	@rm -rf tools/CryoLSP/build
 	@rm -f bin/cryolsp
-	@rm -f $(TEST_HELPERS_O) $(TEST_HELPERS_A)
+	@rm -f $(TEST_HELPERS_DIR)/*.o $(TEST_HELPERS_DIR)/*.a

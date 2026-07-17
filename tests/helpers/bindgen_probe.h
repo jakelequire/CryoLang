@@ -2,8 +2,8 @@
  * (tests/tests/lang/c_import_libclang.cryo).  The only non-system include is
  * <stdarg.h>, needed for the `va_list` probes; libclang's system-header filter
  * drops stdarg's own decls, so the imported surface stays exactly these
- * prototypes.  All symbols are defined in abi_helpers.c and linked via
- * libabihelpers.a. */
+ * prototypes.  All symbols are defined in abi_helpers.c and linked via the
+ * per-OS libabihelpers archive (see the top-level Makefile). */
 #include <stdarg.h>
 
 int bindgen_probe_add3(int a, int b, int c);
