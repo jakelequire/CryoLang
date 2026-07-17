@@ -16,14 +16,15 @@
 /// demand.  `resolve_call` + the method/arg-check methods that recurse into
 /// argument resolution take `visitor: ASTVisitor*`.
 ///
-/// GATED (R1/R2 - mono-after-sema): `try_resolve_static_method` +
-/// `resolve_static_method_return_via_template` + `infer_static_owner_return_from_args`
-/// (the literal-default-guess / Atomic<u64> trap) carry pre-mono re-derivation;
-/// `scope_is_generic_template` + `try_pin_overload_mangled_callee`'s no-op-on-template
-/// are the two-resolver "decline to pin" seams.  With mono-after-sema live, the
-/// literal-default site is now HARDENED: an unannotated literal-only owner binding is
-/// E0307 (`emit_static_owner_literal_default`), not a silent i32 guess.  Still tagged
-/// for the R1/R2 return-typing dedup (the 3 inference copies collapse) - not yet done.
+/// R1/R2 (mono-after-sema): `compute_static_owner_bindings` is the SINGLE authority
+/// for owner type-arg inference on a generic-owner static call - it feeds the stash
+/// that mono consumes AND (via substitution into the abstract return) the return type
+/// in `resolve_static_method_return_via_template`; the return path no longer re-derives.
+/// The literal-default site is HARDENED: an unannotated literal-only owner binding is
+/// E0307 (`emit_static_owner_literal_default`), not a silent i32 guess; range-literal
+/// sugar is exempt (`owner_is_range_family`).  `scope_is_generic_template` +
+/// `try_pin_overload_mangled_callee`'s no-op-on-template remain the "decline to pin"
+/// seams (sema must not pin the un-specialized template form mono will pin).
 
 namespace Compiler::Sema::CallResolver;
 
@@ -2958,47 +2959,28 @@ type struct CallResolver {
             matched = m;
         }
         if (found_count != 1 || !abstract_ret.is_valid()) { return TypeRef::invalid(); }
-        // Stash the owner's concrete type args (declaration order, all-concrete) so
-        // the monomorphizer specializes the owner WITHOUT re-deriving them - sema is
-        // the sole source of truth for resolved types (mono-after-sema).  Additive:
-        // the return-type resolution below is unchanged; absence of a stash means
-        // mono cannot specialize this owner-generic static call.
+        // Owner type args come from ONE authority: `compute_static_owner_bindings`
+        // (turbofish -> concrete args -> expected-type unify -> expected-base ->
+        // literal-default; it also emits the E0307 for a literal-only binding).  Its
+        // result is stashed on the call so the monomorphizer specializes the owner
+        // WITHOUT re-deriving it - sema is the sole source of truth (mono-after-sema).
+        // Idempotent: `stash_static_owner_bindings_for` already ran first on every
+        // static call, so this normally no-ops; it just guarantees the stash on any
+        // path that reaches us without the pre-stash (absence of a stash means mono
+        // cannot specialize this owner-generic static call).
         this.stash_static_owner_bindings(scope, call, tmpl, matched);
         if (!this.types.contains_generic_param(abstract_ret)) { return abstract_ret; }
 
-        // CONCRETE args only here - the literal-default guess is demoted to the
-        // last resort below so it can't preempt the expected type / turbofish.
-        if (call != null) {
-            const inferred: TypeRef = this.infer_static_owner_return_from_args(tmpl, matched, abstract_ret, call, false);
-            if (inferred.is_valid() && !this.types.contains_generic_param(inferred)) { return inferred; }
-        }
-        const ret_inst: InstantiatedType* = this.types.peel_to_instantiation(abstract_ret);
-        if (this.state.expected_type.is_valid() && ret_inst != null) {
-            const exp_inst: InstantiatedType* = this.types.peel_to_instantiation(this.state.expected_type);
-            if (exp_inst != null && exp_inst.generic_base.id == ret_inst.generic_base.id
-                    && !this.types.contains_generic_param(this.state.expected_type)) {
-                return this.state.expected_type;
-            }
-        }
-        mut owner_concrete: TypeRef = TypeRef::invalid();
-        if (scope.scope_generic_args.length > 0) {
-            const spec_sym: SymbolStr = this.resolve_generic_scope_name(scope.scope_name, scope.scope_generic_args);
-            if (spec_sym.is_valid()) { owner_concrete = this.types.lookup_type_by_sym(spec_sym); }
-        }
-        if (!owner_concrete.is_valid()) { owner_concrete = this.types.lookup_type_by_sym(scope.scope_name); }
-        if (owner_concrete.is_valid()) {
-            const via_recv: TypeRef = this.binding.subst_method_return_from_receiver(owner_concrete, abstract_ret);
-            if (via_recv.is_valid() && !this.types.contains_generic_param(via_recv)) { return via_recv; }
-        }
-        // LAST RESORT: the literal-default GUESS.  Only reached when turbofish,
-        // concrete args, expected type, and owner-scope lookup all failed to pin a
-        // concrete return (e.g. unannotated `Atomic::new(0)`).  The E0307 for this
-        // case is emitted once by `compute_static_owner_bindings` (via the stash on
-        // the always-first `stash_static_owner_bindings_for`); this return-type guess
-        // does NOT re-emit - it only recovers the i32 return so sema stays cascade-free.
-        if (call != null) {
-            const guessed: TypeRef = this.infer_static_owner_return_from_args(tmpl, matched, abstract_ret, call, true);
-            if (guessed.is_valid() && !this.types.contains_generic_param(guessed)) { return guessed; }
+        // B2a: the return type is the abstract return with the SAME owner bindings the
+        // stash holds substituted in - no independent re-derivation.  The stash is in
+        // `tmpl.param_type_ids` declaration order, so it maps the owner params directly.
+        // This collapses the former concrete-args / expected-type / owner-scope /
+        // literal-default return-typing copies (each of which re-ran a subset of
+        // `compute_static_owner_bindings`) into the single authority.
+        if (call != null && call.resolved_type_args.length == tmpl.param_type_ids.length) {
+            mut subst: TypeSubstitution = TypeSubstitution::from_params(tmpl.param_type_ids, call.resolved_type_args);
+            const out: TypeRef = subst.apply(abstract_ret, this.arena);
+            if (out.is_valid() && !this.types.contains_generic_param(out)) { return out; }
         }
         return TypeRef::invalid();
     }
@@ -3098,20 +3080,6 @@ type struct CallResolver {
             if (this.types.contains_generic_param(bindings[i])) { return []; }
         }
         return bindings;
-    }
-
-    /// Substitute a generic static-constructor's return type using owner bindings
-    /// inferred from the call args.  Invalid if the owner args can't be inferred.
-    /// `allow_literal_default` forwards to the binding inference (see that method):
-    /// the caller passes `false` for the authoritative attempt and `true` only as a
-    /// last resort, so the literal-default guess never preempts the expected type.
-    infer_static_owner_return_from_args(mut &this, tmpl: TemplateEntry*, method: MethodNode*,
-                                        abstract_ret: TypeRef, call: CallExprNode*,
-                                        allow_literal_default: boolean) -> TypeRef {
-        const bindings: TypeRef[] = this.infer_static_owner_bindings_from_args(tmpl, method, call, allow_literal_default);
-        if (bindings.length != tmpl.param_type_ids.length) { return TypeRef::invalid(); }
-        mut subst: TypeSubstitution = TypeSubstitution::from_params(tmpl.param_type_ids, bindings);
-        return subst.apply(abstract_ret, this.arena);
     }
 
     /// Compute a generic static-method call's owner type args (declaration order,
