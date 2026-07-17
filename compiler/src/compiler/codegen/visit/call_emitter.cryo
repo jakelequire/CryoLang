@@ -1403,15 +1403,20 @@ type struct CallEmitter {
             sw.add_case(LType::const_int(LType::i32(), v.tag_value, false), drop_bb);
             this.cg.builder.position_at_end(drop_bb);
 
-            mut running: u64 = 0;
+            // Field offsets from the single layout authority
+            // (TypeArena::variant_payload_layout) - the SAME align-up
+            // offsets construction stored the fields at.  The packed
+            // running sum this replaced dropped e.g. `V(u32, String)`'s
+            // String from packed offset 4 while construction wrote it at
+            // aligned offset 8 - freeing a garbage pointer.
+            const offsets: u64[] = arena.variant_payload_layout(v, null, null);
             for (mut pos: i64 = 0; pos < v.payload_types.length; pos++) {
                 const pt: TypeRef = v.payload_types[pos];
-                const ft: Type* = this.cg.lookup_type_by_id(pt.id);
                 if (OwnershipQuery::needs_drop(arena, registry, intern, pt)) {
-                    // field_ptr = payload base + running (byte offset)
+                    // field_ptr = payload base + offsets[pos] (byte offset)
                     mut field_ptr_raw: LValue = payload_ptr;
-                    if (running != 0) {
-                        const byte_off: LValue = LType::const_int(LType::i64(), running, false);
+                    if (offsets[pos] != 0) {
+                        const byte_off: LValue = LType::const_int(LType::i64(), offsets[pos], false);
                         const obuf: void* = intrinsics::malloc(8);
                         const obuf_arr: void** = obuf as void**;
                         obuf_arr[0] = byte_off.raw;
@@ -1439,7 +1444,6 @@ type struct CallEmitter {
                         call as ExpressionNode*, receiver.span);
                     stmt.accept(visitor);
                 }
-                if (ft != null) { running = running + ft.size_bytes(); }
             }
 
             // Branch to the merge block from wherever payload drops left the

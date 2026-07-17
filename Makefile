@@ -130,7 +130,7 @@ EXT_ID        := cryolang.cryo-analyzer
 EXT_VSIX      := $(EXT_DIR)/cryo-analyzer.vsix
 
 .DEFAULT_GOAL := help
-.PHONY: help stdlib cryo cryo-exe selfhost-check test test-list examples examples-golden valgrind-check pin \
+.PHONY: help stdlib cryo cryo-exe selfhost-check test test-list roster-check examples examples-golden valgrind-check pin \
         pin-linux-impl pin-windows-impl _pin-windows-do \
         install uninstall clean lsp install-lsp release release-linux release-windows
 
@@ -420,12 +420,21 @@ test: $(STAGE2_EXE) $(LIBCRYO_A) $(TEST_HELPERS_A)
 
 test-list: $(STAGE2_EXE) $(LIBCRYO_A) $(TEST_HELPERS_A)
 	@cd tests && "$(STAGE2_EXE_WIN)" test --list $(ARGS)
+
+roster-check: $(STAGE2_EXE) $(LIBCRYO_A) $(TEST_HELPERS_A)
+	@python scripts/roster-check.py "$(STAGE2_EXE_WIN)" $(ARGS)
 else
 test: $(STAGE2) $(LIBCRYO_A) $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A)
 	@cd tests && "$(STAGE2)" test $(ARGS)
 
 test-list: $(STAGE2) $(LIBCRYO_A) $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A)
 	@cd tests && "$(STAGE2)" test --list $(ARGS)
+
+# Golden-file gate on the DISCOVERED unit-test roster: a compiler change
+# that silently breaks `![test]` discovery would otherwise stay green
+# ("0 of 0 failed" is a pass).  Re-pin deliberately with ARGS=--update.
+roster-check: $(STAGE2) $(LIBCRYO_A) $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A)
+	@python3 scripts/roster-check.py "$(STAGE2)" $(ARGS)
 endif
 
 # ---- examples smoke build ---------------------------------------------

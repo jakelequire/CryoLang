@@ -648,27 +648,22 @@ type struct TypeLoweringPasses {
             const variant: EnumVariantInfo* = &en.variants[i];
             if (!variant.has_payload()) { continue; }
 
-            // Compute this variant's payload size (like a tuple of its associated types)
-            mut v_offset: u64 = 0;
-            mut v_align:  u64 = 1;
-
+            // Defer until every payload type has a computed layout (the
+            // driver re-runs this pass to a fixpoint).  Checked on the RAW
+            // arena node, exactly as before the math was unified below.
             for (mut j: i64 = 0; j < variant.payload_types.length; j++) {
                 const pt: Type* = arena.lookup(variant.payload_types[j].id);
                 if (pt == null) { continue; }
-
-                const p_size:  u64 = pt.size_bytes();
-                const p_align: u64 = pt.alignment();
-
-                if (p_size == 0 && TypeLoweringPasses::needs_layout(pt)) { return false; }
-
-                if (p_align > 0) {
-                    v_offset = math::align_up(v_offset, p_align);
-                    if (p_align > v_align) { v_align = p_align; }
-                }
-                v_offset += p_size;
+                if (pt.size_bytes() == 0 && TypeLoweringPasses::needs_layout(pt)) { return false; }
             }
 
-            const v_total: u64 = math::align_up(v_offset, v_align);
+            // Per-field offset/size math lives in the single layout
+            // authority shared with codegen (construction, pattern binding,
+            // drop glue, and map_enum all consume the same function).
+            mut v_total: u64 = 0;
+            mut v_align: u64 = 1;
+            arena.variant_payload_layout(variant, &v_total, &v_align);
+
             if (v_total > max_payload_size)  { max_payload_size  = v_total; }
             if (v_align > max_payload_align) { max_payload_align = v_align; }
         }

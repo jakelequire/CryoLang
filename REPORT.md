@@ -32,7 +32,7 @@ string-keyed monomorphization era).
 
 ## Tier 0 — Verified soundness / miscompile bugs (fix before 1.0)
 
-- [ ] **Enum drop-glue payload offsets ignore alignment** **[verified]**
+- [x] **Enum drop-glue payload offsets ignore alignment** **[verified]**
   `compiler/src/compiler/codegen/ops/call_emitter.cryo:1406-1442`
   Enum payload layout is computed independently in **four** places. Three
   align fields up (e.g. `pattern_emitter.cryo:205-231`, whose comment promises
@@ -138,7 +138,7 @@ string-keyed monomorphization era).
   `ops/expr_ops.cryo:653-664`, whose reduced inline coercion loop differs
   from the main path.
 
-- [ ] **`@panic` discards its message** — every unwrap failure is a mute
+- [x] **`@panic` discards its message** — every unwrap failure is a mute
   SIGABRT (`intrinsic_emitter.cryo:1073-1115`, documented TODO).
 
 ### Incremental compilation (stale-`.o` holes)
@@ -183,7 +183,7 @@ string-keyed monomorphization era).
 
 ### Tooling / infra
 
-- [ ] **Bindgen LLP64 bug: C `long` → i64/u64 unconditionally**
+- [x] **Bindgen LLP64 bug: C `long` → i64/u64 unconditionally**
   `compiler/src/compiler/bindgen/type_map.cryo:44-45` — on Windows `long` is
   32-bit; any C API trafficking in bare `long` gets wrong-width fields/params.
   Masked so far because SDL2/raylib/sqlite mostly use `int`/fixed-width.
@@ -234,7 +234,7 @@ hazard classes above.
   (`arena.cryo:66-69` vs `:573` — contradictory comments).
   *Scope: likely coupled to the planned mono-after-sema reorder.*
 
-- [ ] **D2. Single authority for enum/aggregate layout.** Layout computed in
+- [x] **D2. Single authority for enum/aggregate layout.** Layout computed in
   4 places (one divergent = Tier-0 bug #1). One `compute_enum_layout` used by
   construction, pattern match, drop glue, and size queries.
 
@@ -330,11 +330,11 @@ hazard classes above.
 
 ## Tier 3 — Test & validation gaps
 
-- [ ] **Snapshot the test roster.** CI never asserts a test *count*; a
+- [x] **Snapshot the test roster.** CI never asserts a test *count*; a
   compiler change that silently drops `![test]` discovery stays green.
   Cheapest high-value fix: golden-file the `cryo test --list` output.
 
-- [ ] **Known-failing canary test.** The test framework is compiled by the
+- [x] **Known-failing canary test.** The test framework is compiled by the
   compiler under test; a miscompile of `expect_eq` or failure-propagation
   converts failures into passes. One tiny test CI asserts *fails* closes the
   trust loop.

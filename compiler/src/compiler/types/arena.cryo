@@ -725,6 +725,66 @@ type struct TypeArena {
         return this.types[index];
     }
 
+    /// Look up a payload field type, following an `InstantiatedType`
+    /// wrapper to its concrete resolved type.  The wrapper reports
+    /// size/alignment 0 (only the resolved spec'd struct carries layout),
+    /// so layout math on the raw wrapper collapses fields onto their
+    /// predecessors.
+    lookup_payload_type(&this, ty: TypeRef) -> Type* {
+        mut t: Type* = this.lookup(ty.id);
+        if (t != null && t.kind == TypeKind::InstantiatedType) {
+            const inst: InstantiatedType* = t as InstantiatedType*;
+            if (inst.has_resolved_type()) {
+                const resolved: Type* = this.lookup(inst.resolved_type.id);
+                if (resolved != null) { t = resolved; }
+            }
+        }
+        return t;
+    }
+
+    /// THE single layout authority for an ADT enum variant's payload.
+    /// Returns each payload field's byte offset (aligned up to the field's
+    /// alignment, C struct rules); the optional out-params receive the
+    /// variant's total payload size (rounded up to its alignment) and its
+    /// max field alignment.
+    ///
+    /// Frontend layout (compute_enum_layout), the lowered LLVM type
+    /// (TypeMapper::map_enum), construction (EnumVariantEmitter), pattern
+    /// binding (PatternEmitter), and drop glue (CallEmitter) must ALL
+    /// consume this.  These were once five hand-synced copies; the drop
+    /// glue's copy used a packed running sum with no align-up, so it freed
+    /// a garbage "pointer" out of any `V(u32, String)`-shaped payload
+    /// (packed offset 4 vs constructed offset 8).
+    variant_payload_layout(&this, variant: EnumVariantInfo*,
+                           out_size: u64*, out_align: u64*) -> u64[] {
+        mut offsets: u64[] = [];
+        mut running: u64 = 0;
+        mut max_align: u64 = 1;
+        for (mut i: i64 = 0; i < variant.payload_types.length; i++) {
+            const ft: Type* = this.lookup_payload_type(variant.payload_types[i]);
+            if (ft != null) {
+                const fa: u64 = ft.alignment();
+                if (fa > 0) {
+                    // align_up the running offset to this field's alignment
+                    const rem: u64 = running % fa;
+                    if (rem != 0) { running += (fa - rem); }
+                    if (fa > max_align) { max_align = fa; }
+                }
+            }
+            offsets.push(running);
+            if (ft != null) { running += ft.size_bytes(); }
+        }
+        if (out_size != null) {
+            // Round the variant's total up to its own alignment.
+            mut total: u64 = running;
+            const rem: u64 = running % max_align;
+            if (max_align > 1 && rem != 0) { total = running + (max_align - rem); }
+            out_size[0] = total;
+        }
+        if (out_align != null) { out_align[0] = max_align; }
+        return offsets;
+    }
+
     /// Register an additional name alias for an existing type in the
     /// appropriate cache.  Used by the Monomorphizer to register a bare
     /// specialization name (e.g. "Triple_i32_string") alongside the
