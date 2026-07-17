@@ -95,7 +95,7 @@ string-keyed monomorphization era).
   re-increments column to 2. `skip_whitespace` (:775-785) already bypasses
   `advance()` specifically to avoid this — pattern known, fixed in 1 of 5 sites.
 
-- [ ] **`make_token` span math wrong for tabs and multi-line tokens**
+- [x] **`make_token` span math wrong for tabs and multi-line tokens**
   `lex/lexer.cryo:819-826` — column = current column − lexeme length; wrong
   for tokens containing tabs; multi-line block/doc comments get the *end*
   line plus a nonsense column (feeds doc-cluster gap logic at
@@ -105,7 +105,7 @@ string-keyed monomorphization era).
   `parser/expr_parser.cryo:2242-2319` — `f(a < b, c > (d))` misparses as a
   generic call. Follower-token list has grown by bugfix ("GAP 1a" comments).
 
-- [ ] **Untyped lambda `(x) -> ...` produces the wrong diagnostic**
+- [x] **Untyped lambda `(x) -> ...` produces the wrong diagnostic**
   Falls into the `->`-is-not-an-operator error path instead of a
   "lambda params need types" message.
 
