@@ -1,14 +1,17 @@
 // C-side helpers for the Cryo ABI test suite.  Compiled with the host
-// toolchain to a static archive (`libabihelpers.a`) by the top-level
-// Makefile, then linked into the test executable via cryoconfig's
-// `link_paths` + `link_libs` settings.  Every function here exercises
-// a specific SysV x86-64 calling-convention shape so that the Cryo
-// extern declaration's lowering can be verified against what a real
-// C compiler emits for the same signature.
+// toolchain to a per-OS static archive (`libabihelpers-unix.a` /
+// `libabihelpers-windows.a`) by the top-level Makefile, then linked into
+// the test executable via the matching `[link.unix]` / `[link.windows]`
+// `static` entry in tests/cryoconfig.  (Per-OS because a Windows and a
+// WSL/Linux build share the working tree; one shared archive path lets a
+// stale PE archive poison the Linux link.)  Every function here exercises
+// a specific x86-64 calling-convention shape so that the Cryo extern
+// declaration's lowering can be verified against what a real C compiler
+// emits for the same signature.
 //
 // Keep this file dependency-free (no system headers beyond <stdint.h>)
-// so the cross-toolchain build stays trivially portable - the tests
-// only run on Linux x86-64 anyway, which is what we target.
+// so the build stays trivially portable across the Linux and Windows
+// x86-64 hosts the suite runs on.
 
 #include <stdint.h>
 #include <stdarg.h>   // for the bindgen_probe_v* va_list probes (see end of file)

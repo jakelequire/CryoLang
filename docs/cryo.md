@@ -2859,7 +2859,7 @@ Native libraries to link, named by *intent* rather than by raw linker flag - so 
 [link]
 system = ["ssl", "crypto"]          # system libraries        -> -l<name>
 search = ["/usr/lib/llvm-20/lib"]   # extra -L dirs to resolve `system` libs
-static = ["helpers/libabihelpers.a"] # local archives, passed to the linker by path
+static = ["vendor/libhelpers.a"]    # local archives, passed to the linker by path
 ```
 
 | Key      | Role                                                                                        | Linker form        |
@@ -2867,6 +2867,20 @@ static = ["helpers/libabihelpers.a"] # local archives, passed to the linker by p
 | `system` | A library the linker finds on its default search path.                                      | `-l<name>`         |
 | `search` | Extra directories to search - only needed for `system` libs that live off the default path. | `-L<dir>`          |
 | `static` | A local archive in your project; linked by its path.                                        | the path, verbatim |
+
+Per-OS overlays `[link.unix]` and `[link.windows]` carry the same three keys. Bare `[link]` is common (applied to every target); the overlay whose OS matches the effective target triple is appended on top, so a project can name a library differently per platform - or link a platform-specific archive - without a cross-compile dragging in the other OS's libs:
+
+```ini
+[link]
+system = ["ssl", "crypto"]           # linked everywhere
+
+[link.unix]
+static = ["helpers/libhelpers-unix.a"]
+
+[link.windows]
+static = ["helpers/libhelpers-windows.a"]
+system = ["ws2_32"]                  # winsock, windows targets only
+```
 
 > Migrating from pre-1.0: `link_libs` -> `[link] system`, `link_paths` -> `[link] search` (or `[link] static` for a local archive). The old `[compiler] args = ["--emit-llvm"]` flag-smuggling is gone - set `emit_llvm = true`. `[compiler] include_paths` -> `[project] source_paths`. `[project] target` -> `[project] target_triple`.
 
