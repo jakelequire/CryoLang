@@ -1184,22 +1184,40 @@ type struct MoveChecker {
 
     read_binary(mut &this, b: BinaryExprNode*) -> void {
         if (b == null) { return; }
-        // Plain assignment to a bare identifier is a pure write: it
-        // reinitializes the binding rather than reading it. Walk only the
-        // RHS, then clear the binding's moved state so a moved-then-
-        // reassigned local is Live again. This is what keeps the
-        // loop-carried check from flagging the safe reinit-each-iteration
-        // pattern (`consume(x); x = make();`).
         if (b.op.kind == TokenType::Equal) {
-            // The RHS is a storage-duplicating move into the LHS place,
-            // regardless of whether the LHS is a bare binding or a field /
-            // index target - so a field-move-out on the RHS double-frees.
+            // `lhs = rhs` moves the RHS into the LHS place, regardless of
+            // whether the LHS is a bare binding or a field / index target:
+            // the RHS is a storage-duplicating move.  A field-move-out on the
+            // RHS double-frees, so check for it explicitly.
             if (b.right != null) { this.check_field_move_out(b.right); }
             if (b.left != null && b.left.kind == NodeKind::Identifier) {
-                if (b.right != null) { this.walk_expr_read(b.right); }
+                // Plain assignment to a bare identifier is a pure write: it
+                // reinitializes the binding rather than reading it.  MOVE the
+                // RHS (real=false: mark a bare-ident non-Copy RHS moved so a
+                // later use surfaces as E0452, WITHOUT applying the real-move
+                // array-move-out checks - the assignment path never ran those
+                // and doing so would false-positive on the swap-remove idiom
+                // `a[i] = a[last]` and on shallow array-field copies).  This
+                // aligns move_check's move set with drop_insertion, which also
+                // moves the RHS of every `=` and suppresses its scope-exit
+                // drop; walking the RHS in read context here instead would
+                // leave it Live for move_check while drop_insertion suppressed
+                // its drop, so `x = y; f(y);` (non-Copy `y`) would compile and
+                // then double-free `y`.  Then clear the LHS's moved state so a
+                // moved-then-reassigned local is Live again (keeps the loop-
+                // carried check from flagging `consume(x); x = make();` and
+                // leaves `x = f(x)` with `x` Live).  Do NOT walk the LHS
+                // (reading it would spuriously flag reassigning a moved-out
+                // binding).
+                if (b.right != null) { this.walk_expr_move(b.right, false); }
                 this.unmark_moved((b.left as IdentifierNode*).name);
                 return;
             }
+            // Field / index LHS: read the LHS place (its address is computed)
+            // and move the RHS into it (same real=false rationale as above).
+            if (b.left  != null) { this.walk_expr_read(b.left); }
+            if (b.right != null) { this.walk_expr_move(b.right, false); }
+            return;
         }
         if (b.left != null)  { this.walk_expr_read(b.left); }
         if (b.right != null) { this.walk_expr_read(b.right); }
