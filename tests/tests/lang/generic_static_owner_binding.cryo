@@ -1,0 +1,51 @@
+// Regression coverage for generic static-constructor OWNER type-arg binding
+// (`compute_static_owner_bindings` in sema/call_resolver.cryo).  The owner `T`
+// of a `Type<T>::new(x: T)` call can be bound from several sources; their
+// PRIORITY is load-bearing: an authoritative source (turbofish, annotation /
+// expected type, concrete non-literal arg) MUST win over the last-resort
+// literal-default guess (`0 -> i32`).  If the guess ever preempted an
+// authoritative source, `Wrap<u64> = Wrap::new(0)` would silently bind `T=i32`
+// and truncate a >32-bit value.
+//
+// These cases were previously uncovered: every stdlib `Atomic::new` test uses
+// explicit turbofish + width-suffixed literals, so a regression that made the
+// literal-default guess eager would not have been caught.  Added while scoping
+// the mono-after-sema "collapse the inference copies" work so that refactor is
+// guarded.
+![config(testing)]
+namespace CryoTests::Tests::Lang::GenericStaticOwnerBinding;
+
+import std::test::{ TestError, expect_eq };
+
+type struct Wrap<T> {
+    v: T;
+    static new(x: T) -> Wrap<T> { return Wrap<T> { v: x }; }
+    get(&this) -> T { return this.v; }
+}
+
+// 2^40 - does not fit in i32/u32; truncation to a 32-bit owner is observable.
+function big() -> u64 { return 0xFFFFFFFFFF as u64; }
+
+// Expected type from the binding annotation binds owner T = u64, even though the
+// constructor arg `0` is a polymorphic literal the concrete-args pass skips.
+![test]
+function annotation_binds_owner_over_literal_default() -> Result<(), TestError> {
+    mut a: Wrap<u64> = Wrap::new(0);
+    a.v = big();
+    return expect_eq(a.get(), big());
+}
+
+// A concrete (non-literal) argument binds owner T = u64 directly.
+![test]
+function concrete_arg_binds_owner() -> Result<(), TestError> {
+    const b: Wrap<u64> = Wrap::new(big());
+    return expect_eq(b.get(), big());
+}
+
+// Explicit owner turbofish binds T = u64 (authoritative; no inference wanted).
+![test]
+function turbofish_binds_owner() -> Result<(), TestError> {
+    mut c: Wrap<u64> = Wrap<u64>::new(0);
+    c.v = big();
+    return expect_eq(c.get(), big());
+}
