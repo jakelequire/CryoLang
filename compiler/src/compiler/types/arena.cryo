@@ -119,6 +119,18 @@ type struct TypeArena {
     // site that allocates an InstantiatedType.
     inst_by_base: HashMap<u64, u32[]>;
 
+    // -- Reverse index: concrete resolved TypeID -> the InstantiatedType wrapper
+    // that carries it (`find_inst_wrapping`).  Without this, that lookup linear-
+    // scans EVERY arena type (~5.6% frontend self-time).  Keyed by the concrete
+    // `resolved_type.id`, valued with the SMALLEST wrapper id resolving to it -
+    // arena ids are allocation order, so the smallest is exactly the first match
+    // the old scan returned (behavior-preserving).  Populated wherever a wrapper's
+    // resolved_type is set (`propagate_instantiated_resolution` + the mono primary
+    // sites), via `note_wrapper_resolution`.  find_inst_wrapping verifies each hit
+    // still carries the queried concrete and falls back to the scan on a miss, so
+    // completeness is a PERF property, not a correctness one.
+    wrapper_by_resolved: HashMap<u64, u64>;
+
 
     /// Create a new TypeArena and initialize all 20 primitive singletons.
     static new(intern_table: InternTable*) -> TypeArena {
@@ -169,6 +181,7 @@ type struct TypeArena {
             assoc_projection_cache: HashMap<string, TypeRef>::new(),
             leaf_index:          HashMap<u32, u32>::new(),
             inst_by_base:        HashMap<u64, u32[]>::new(),
+            wrapper_by_resolved: HashMap<u64, u64>::new(),
         };
 
         arena.init_primitives();
@@ -603,6 +616,7 @@ type struct TypeArena {
                     }
                     if (matches) {
                         inst.set_resolved_type(resolved);
+                        this.note_wrapper_resolution(t.id, resolved.id);
                         count += 1;
                     }
                 }
@@ -610,6 +624,26 @@ type struct TypeArena {
             Option::None => { }
         }
         return count;
+    }
+
+    /// Record that InstantiatedType `wrapper_id` resolves to concrete `resolved_id`
+    /// in the `wrapper_by_resolved` reverse index.  Keeps the SMALLEST wrapper id
+    /// per resolved id (arena ids are allocation order, so the smallest is the
+    /// first match the old `find_inst_wrapping` scan returned).  Idempotent and
+    /// order-independent thanks to the min compare; called at every site that sets
+    /// a wrapper's resolved_type.
+    note_wrapper_resolution(mut &this, wrapper_id: u64, resolved_id: u64) -> void {
+        if (wrapper_id == 0 || resolved_id == 0) { return; }
+        match (this.wrapper_by_resolved.get(&resolved_id)) {
+            Option::Some(existing) => {
+                if (wrapper_id < existing) {
+                    this.wrapper_by_resolved.insert(resolved_id, wrapper_id);
+                }
+            }
+            Option::None => {
+                this.wrapper_by_resolved.insert(resolved_id, wrapper_id);
+            }
+        }
     }
 
     /// The canonical identity of a type argument: an `InstantiatedType` that
@@ -1618,6 +1652,23 @@ type struct TypeArena {
     /// receiver-inference path.
     static find_inst_wrapping(arena: TypeArena*, concrete: TypeRef) -> TypeRef {
         if (arena == null || !concrete.is_valid()) { return TypeRef::invalid(); }
+        // Fast path: the `wrapper_by_resolved` reverse index.  Verify the cached
+        // wrapper still carries this concrete before trusting it - a stale entry
+        // then simply falls through to the scan, so the index is a PERF hint and
+        // never a source of wrong answers.
+        match (arena.wrapper_by_resolved.get(&concrete.id)) {
+            Option::Some(wid) => {
+                const wt: Type* = arena.lookup(wid);
+                if (wt != null && wt.kind == TypeKind::InstantiatedType) {
+                    const winst: InstantiatedType* = wt as InstantiatedType*;
+                    if (winst.has_resolved_type() && winst.resolved_type.id == concrete.id) {
+                        return TypeRef::new(wid, arena);
+                    }
+                }
+            }
+            Option::None => { }
+        }
+        // Fallback: full scan (covers any resolution site not yet registered).
         const total: i64 = arena.types.length;
         for (mut i: i64 = 0; i < total; i++) {
             const t: Type* = arena.types[i];
