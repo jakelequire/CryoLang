@@ -198,7 +198,7 @@ string-keyed monomorphization era).
   (`bindgen/generator.cryo:119-144`). Reported but not disambiguated; rename
   instead.
 
-- [ ] **LSP body read is 1 byte per syscall**
+- [x] **LSP body read is 1 byte per syscall**
   `tools/CryoLSP/src/protocol/framing.cryo:159-167` — the poll-based-debounce
   justification (:19-23) only holds for headers; once Content-Length is known
   a bulk `read_exact` is safe. A 100 KB didChange ≈ 100k syscalls.
