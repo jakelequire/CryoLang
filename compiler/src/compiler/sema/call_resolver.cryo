@@ -20,8 +20,10 @@
 /// `resolve_static_method_return_via_template` + `infer_static_owner_return_from_args`
 /// (the literal-default-guess / Atomic<u64> trap) carry pre-mono re-derivation;
 /// `scope_is_generic_template` + `try_pin_overload_mangled_callee`'s no-op-on-template
-/// are the two-resolver "decline to pin" seams.  Tagged; the
-/// 3 inference copies collapse + the literal-default site hardens once mono-after-sema lands.
+/// are the two-resolver "decline to pin" seams.  With mono-after-sema live, the
+/// literal-default site is now HARDENED: an unannotated literal-only owner binding is
+/// E0307 (`emit_static_owner_literal_default`), not a silent i32 guess.  Still tagged
+/// for the R1/R2 return-typing dedup (the 3 inference copies collapse) - not yet done.
 
 namespace Compiler::Sema::CallResolver;
 
@@ -2988,9 +2990,12 @@ type struct CallResolver {
             const via_recv: TypeRef = this.binding.subst_method_return_from_receiver(owner_concrete, abstract_ret);
             if (via_recv.is_valid() && !this.types.contains_generic_param(via_recv)) { return via_recv; }
         }
-        // LAST RESORT: the literal-default GUESS (emits E0307).  Only reached when
-        // turbofish, concrete args, expected type, and owner-scope lookup all failed
-        // to pin a concrete return (e.g. unannotated `Atomic::new(0)`).
+        // LAST RESORT: the literal-default GUESS.  Only reached when turbofish,
+        // concrete args, expected type, and owner-scope lookup all failed to pin a
+        // concrete return (e.g. unannotated `Atomic::new(0)`).  The E0307 for this
+        // case is emitted once by `compute_static_owner_bindings` (via the stash on
+        // the always-first `stash_static_owner_bindings_for`); this return-type guess
+        // does NOT re-emit - it only recovers the i32 return so sema stays cascade-free.
         if (call != null) {
             const guessed: TypeRef = this.infer_static_owner_return_from_args(tmpl, matched, abstract_ret, call, true);
             if (guessed.is_valid() && !this.types.contains_generic_param(guessed)) { return guessed; }
@@ -3007,9 +3012,12 @@ type struct CallResolver {
     /// `Atomic<u64>::new(0)` miscompile trap).  Because it is a guess, callers pass
     /// `false` for the authoritative pass and only run it (`true`) as a LAST RESORT,
     /// AFTER turbofish + concrete args + the expected type have all failed - otherwise
-    /// `RwLock<i32> = RwLock::new(0)` would guess+warn (E0307) instead of taking the
-    /// owner arg from the `<i32>` annotation.  The guess is applied silently
-    /// (i32 IS the language-defined default for an unsuffixed literal).
+    /// `RwLock<i32> = RwLock::new(0)` would error (E0307) instead of taking the owner
+    /// arg from the `<i32>` annotation.  This method stays a PURE inference primitive:
+    /// it never emits.  The DECISION that a literal-only owner binding is an error
+    /// lives in `compute_static_owner_bindings` step 3, which calls this with `true`
+    /// solely to detect the case, then emits E0307 (an unannotated literal is no
+    /// longer accepted as the sole source for a generic owner's type argument).
     infer_static_owner_bindings_from_args(mut &this, tmpl: TemplateEntry*, method: MethodNode*,
                                           call: CallExprNode*, allow_literal_default: boolean) -> TypeRef[] {
         if (method == null || method.func == null) { return []; }
@@ -3032,12 +3040,13 @@ type struct CallResolver {
         }
         // Pass 2 (GATED literal-default - last resort only): a still-unbound owner
         // param adopts a polymorphic literal's default type (`0` -> i32).  This runs
-        // ONLY after turbofish + concrete args + the expected type all failed, so by
-        // the time we reach it there is no other information and i32 IS the language-
-        // defined default for an unsuffixed literal (`0..5` -> `Range<i32>`).  The
+        // ONLY after turbofish + concrete args + the expected type all failed.  The
         // dangerous `Atomic<u64>::new(0)` case is bound by the expected-type/turbofish
-        // sources BEFORE this guess, so applying the standard default here is correct
-        // and NOT warned about (warning here would be a spurious E0307 on idiomatic code).
+        // sources BEFORE the guess, so those never reach Pass 2.  This pass stays a
+        // pure detector: it binds i32 so the caller can SEE that a literal-only owner
+        // binding would complete, but the caller (`compute_static_owner_bindings` step
+        // 3) then rejects that with E0307 - an unannotated literal is no longer an
+        // accepted source for a generic owner's type argument.  No emission here.
         if (allow_literal_default) {
             for (mut i: i64 = 0; i < method.func.parameters.length; i++) {
                 const p2: VarDeclNode* = method.func.parameters[i];
@@ -3170,13 +3179,63 @@ type struct CallResolver {
             }
         }
 
-        // 3. LAST RESORT: the literal-default GUESS (`Atomic::new(0)` with no turbofish
-        // and no expected type -> i32).  Runs only after every authoritative source
-        // failed.  Demoting it here is what stops a spurious E0307 on
-        // `RwLock<i32> = RwLock::new(0)` (step 2 binds it from `<i32>`).
+        // 3. LAST RESORT: the literal-default GUESS (`Wrap::new(0)` with no turbofish,
+        // no concrete arg, and no expected type -> the owner arg would default to i32
+        // from a polymorphic literal).  Reached only after every authoritative source
+        // (turbofish, concrete args, expected type) has failed; demoting it here is
+        // what stops a spurious E0307 on `RwLock<i32> = RwLock::new(0)` (step 2 binds
+        // it from `<i32>`).  With mono-after-sema live, an unannotated literal-only
+        // owner binding is now HARDENED into an error: E0307, not a silent i32 guess.
+        // We still return the guessed bindings so sema types the call as i32 and does
+        // not cascade; the emitted error aborts the build.  Single-fire: `stash_*`
+        // sets `resolved_type_args` from these bindings, so its idempotency guard
+        // short-circuits every later `compute` for this call before it re-emits.
         const lb: TypeRef[] = this.infer_static_owner_bindings_from_args(tmpl, method, call, true);
-        if (lb.length == want) { return lb; }
+        if (lb.length == want) {
+            // EXEMPTION: a range literal (`0..5` / `1..=4`) is lowered by the parser
+            // into `Range::new` / `RangeInclusive::new` (see expr_parser.cryo), and its
+            // element type follows the ordinary integer-literal default (i32) - a
+            // language-defined default, not a guess.  Erroring here would reject every
+            // unannotated `for (i in 0..N)`.  Keep the silent i32 default for the range
+            // family; only USER generic owners (`Atomic::new(0)`) get E0307.
+            if (!this.owner_is_range_family(scope)) {
+                this.emit_static_owner_literal_default(scope, call);
+            }
+            return lb;
+        }
         return [];
+    }
+
+    /// Whether a generic-owner static call targets one of the built-in range types
+    /// whose element type is defined to default to the integer-literal default (i32).
+    /// These are the parser's range-literal lowering targets (`Range`, `RangeInclusive`
+    /// - see expr_parser.cryo's `..`/`..=` desugar); a literal-only owner binding on
+    /// them is intended, so they are exempt from the E0307 literal-default hardening.
+    owner_is_range_family(&this, scope: ScopeResolutionNode*) -> boolean {
+        if (scope == null) { return false; }
+        const name: string = this.intern.resolve(scope.scope_name);
+        return name == "Range" || name == "RangeInclusive";
+    }
+
+    /// E0307 for a generic-owner static call whose owner type argument could only be
+    /// bound from a polymorphic literal's default (`Wrap::new(0)` in a context with no
+    /// turbofish, no concrete argument, and no expected type).  Pre-mono-after-sema
+    /// this was a silent i32 guess (the `Atomic<u64>::new(0)` trap); it is now an
+    /// error.  Emitted at most once per call (see `compute_static_owner_bindings`
+    /// step 3).  `scope.scope_name` is the owner, `scope.member_name` the method.
+    emit_static_owner_literal_default(mut &this, scope: ScopeResolutionNode*,
+                                      call: CallExprNode*) -> void {
+        const owner_str:  string = this.intern.resolve(scope.scope_name);
+        const method_str: string = this.intern.resolve(scope.member_name);
+        mut d: Diagnostic = Diagnostic::error(
+            ErrorCode::E0307_CANNOT_INFER_TYPE_ARG,
+            format("cannot infer the owner type argument for `%s::%s` from a polymorphic literal",
+                owner_str, method_str));
+        d = d.at(call.span);
+        d = d.with_note("the owner type argument would default to `i32` from an unsuffixed literal; a bare literal is no longer accepted as the only source for a generic owner's type argument");
+        d = d.help(format("write the owner type argument explicitly, e.g. `%s<i64>::%s(...)`, or give the call an expected type (`const x: %s<i64> = ...`)",
+            owner_str, method_str, owner_str));
+        this.ctx.emit_diagnostic(d);
     }
 
     /// Stash a generic static-method call's owner type args on the call node so the
