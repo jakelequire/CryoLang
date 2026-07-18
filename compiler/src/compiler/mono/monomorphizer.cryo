@@ -501,8 +501,11 @@ type struct Monomorphizer {
         // body can reference itself by its bare/qualified spec name, and that must
         // resolve to the concrete's eventual id during resolve_specialized_ast.
         // The slot is flipped from wrapper to concrete at populate time (below).
-        // Function templates and the (rare) missing-wrapper case fall back to
-        // allocating a fresh concrete via create_concrete_type.
+        // For a named generic this is the ONLY construction route for a concrete;
+        // the missing-wrapper case is an internal error (see the else branch).
+        // Function templates are not `is_named` and never reach here - they get a
+        // FunctionType bridged via `resolved_type` at the end of this function,
+        // which is still a two-id representation (D1 §6.2, open).
         mut concrete_type: TypeRef = TypeRef::invalid();
         mut swap_path: boolean = false;
         if (is_named) {
@@ -513,6 +516,24 @@ type struct Monomorphizer {
                 swap_path = true;
                 this.arena.reserve_spec_names(concrete_type, qualified_spec_sym, spec_name_sym, target_kind);
             } else {
+                // INVARIANT (D1, one id per semantic type): a named generic reaches
+                // here only via the swap path above, so `wrapper.id == concrete.id`.
+                // This branch is the pre-D1 two-id fallback and is believed
+                // unreachable - a probe over the compiler's own 232 modules, the
+                // stdlib, and the full test suite recorded ZERO fires.  It is kept
+                // (rather than deleted) so that a reachable case fails LOUDLY here
+                // instead of silently minting a second id for one semantic type:
+                // the wrapper's `resolved_type` is only set at the end of this
+                // function, so any nested-call walk in between would see the two ids
+                // disagree, leave its call unpinned, and let codegen's name+arity
+                // fallback bind an arbitrary sibling spec.
+                //
+                // If you are reading this because it fired: the fix is to give the
+                // request a valid unresolved InstantiatedType wrapper upstream, not
+                // to relax this check.
+                this.diagnostics.emit(Diagnostic::error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                    format("named generic `%s` reached monomorphization without an unresolved InstantiatedType wrapper, so its concrete type cannot reuse the wrapper's arena id (one id per semantic type)", key)));
+                this.state.error_count += 1;
                 concrete_type = this.create_concrete_type(entry, qualified_spec_sym, &subst);
                 // Register the bare spec name as an alias so resolve_body_locals()
                 // can find the type (the substituter rewrites to bare names).
