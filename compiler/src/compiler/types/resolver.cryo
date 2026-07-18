@@ -332,8 +332,13 @@ type struct TypeResolver {
             k == TypeKind::Char || k == TypeKind::String) {
             return this.intern_table.intern(t.display_name());
         }
-        if (k == TypeKind::InstantiatedType) {
-            return this.proj_bare_name((t as InstantiatedType*).generic_base);
+        // Instantiations key on the TEMPLATE's bare name.  Via `inst_generic_base`
+        // so this holds for a post-mono concrete too - it carries its own base,
+        // and without this a spec would key on its MANGLED name, which no
+        // trait-impl registry holds.
+        const inst_base: TypeRef = this.arena.inst_generic_base(ty);
+        if (inst_base.is_valid()) {
+            return this.proj_bare_name(inst_base);
         }
         const qname: SymbolStr = this.arena.get_qualified_name(ty);
         if (!qname.is_valid()) { return SymbolStr::empty(); }
@@ -355,38 +360,28 @@ type struct TypeResolver {
     resolve_concrete_member(&this, base_ty_in: TypeRef, member: SymbolStr,
                             ctx: ResolutionContext*) -> TypeRef {
         if (this.generic_registry == null) { return TypeRef::invalid(); }
-        // A base that is already a concrete spec'd Struct/Class/Enum (e.g. the
-        // monomorphized `TakeIter` a combinator receiver resolved to) carries
-        // its mangled spec name and NO type_args - the trait-impl lookup (keyed
-        // on the template's bare name) and the target-arg binding below both
-        // need the InstantiatedType wrapper instead. Recover it. Mirrors the
-        // same recovery in the monomorphizer's `concrete_trait_args_for`.
-        mut base_ty: TypeRef = base_ty_in;
-        const bt0: Type* = this.arena.lookup(base_ty_in.id);
-        if (bt0 != null
-                && (bt0.kind == TypeKind::Struct
-                    || bt0.kind == TypeKind::Class
-                    || bt0.kind == TypeKind::Enum)) {
-            const wrapper: TypeRef = TypeArena::find_inst_wrapping(this.arena, base_ty_in);
-            if (wrapper.is_valid()) { base_ty = wrapper; }
-        }
+        // The base is used directly whether it is a pre-mono InstantiatedType
+        // wrapper or a post-mono concrete spec: `proj_bare_name` resolves either to
+        // the TEMPLATE's bare name, and the args below come from the same
+        // representation-neutral views.  (This used to recover the origin carrier
+        // first, because a concrete spec answered with its mangled name and no
+        // type_args.)
+        const base_ty: TypeRef = base_ty_in;
         const bt: Type* = this.arena.lookup(base_ty.id);
         if (bt == null) { return TypeRef::invalid(); }
         const bare: SymbolStr = this.proj_bare_name(base_ty);
         if (!bare.is_valid()) { return TypeRef::invalid(); }
 
-        // Element-wise copy, NOT `base_args = inst.type_args`: a by-value
-        // assignment of an owning array aliases the InstantiatedType's buffer,
-        // and dropping the local at function exit would free the base type's
-        // live `type_args` storage (use-after-free that silently corrupts a
-        // sibling instantiation's args - surfaces as a cyclic type graph and a
-        // SIGSEGV when chaining adapters, e.g. `First<First<IntSeq>>`).
+        // Element-wise copy, NOT a by-value array assignment: that would alias the
+        // type's owning `type_args` buffer, and dropping the local at function exit
+        // would free the base type's live storage (use-after-free that silently
+        // corrupts a sibling instantiation's args - surfaces as a cyclic type graph
+        // and a SIGSEGV when chaining adapters, e.g. `First<First<IntSeq>>`).
+        // `inst_type_arg_at` returns by value, so this stays a copy by construction.
         mut base_args: TypeRef[] = [];
-        if (bt.kind == TypeKind::InstantiatedType) {
-            const binst: InstantiatedType* = bt as InstantiatedType*;
-            for (mut bi: i64 = 0; bi < binst.type_args.length; bi++) {
-                base_args.push(binst.type_args[bi]);
-            }
+        const base_nargs: i64 = this.arena.inst_type_arg_count(base_ty);
+        for (mut bi: i64 = 0; bi < base_nargs; bi++) {
+            base_args.push(this.arena.inst_type_arg_at(base_ty, bi));
         }
 
         for (mut i: i64 = 0; i < this.generic_registry.trait_decl_nodes.length; i++) {

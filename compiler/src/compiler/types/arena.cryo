@@ -534,15 +534,16 @@ type struct TypeArena {
     // is copied into the owning InstantiatedType (TypeRef is Copy).  Callers
     // keep ownership and can reuse the array for demand tracking.
     create_instantiation(mut &this, base: TypeRef, args: &TypeRef[]) -> TypeRef {
+        // Append in place (`+=`) rather than rebuilding via `format("%s...", key)`
+        // each iteration: the latter copies the whole accumulated key per arg,
+        // making a hot-path lookup quadratic in the arg count.  Matches
+        // `Monomorphizer::make_key_for`, which keys the same shape.
         mut key: string = format("%llu<", base.id);
         for (mut i: i64 = 0; i < args.length; i++) {
-            if (i > 0) {
-                key = format("%s,%llu", key, args[i].id);
-            } else {
-                key = format("%s%llu", key, args[i].id);
-            }
+            if (i > 0) { key += ","; }
+            key += format("%llu", args[i].id);
         }
-        key = format("%s>", key);
+        key += ">";
 
         const cached: Option<TypeRef> = this.instantiated_cache.get(&key);
         if (cached.is_some()) {
@@ -561,25 +562,6 @@ type struct TypeArena {
         const ref: TypeRef = this.alloc_type(inst_node);
         this.instantiated_cache.insert(key, ref);
         return ref;
-    }
-
-    /// The canonical identity of a type argument: an `InstantiatedType` that
-    /// already carries a `resolved_type` collapses to that concrete type's id.
-    /// Two textual occurrences of the same generic instantiation can otherwise
-    /// disagree on a nested arg's representation - e.g. an annotation
-    /// `TakeIter<Range<i32>>` holds the inner `Range<i32>` as an
-    /// InstantiatedType wrapper, while the monomorphizer built its spec from
-    /// the concrete `Range_i32` StructType.  Both denote the same type, so
-    /// canonicalizing through `resolved_type` lets them compare equal.
-    canon_type_id(&this, r: TypeRef) -> u64 {
-        const t: Type* = this.lookup(r.id);
-        if (t != null && t.kind == TypeKind::InstantiatedType) {
-            const inst: InstantiatedType* = t as InstantiatedType*;
-            if (inst.has_resolved_type()) {
-                return inst.resolved_type.id;
-            }
-        }
-        return r.id;
     }
 
     /// Create an error type for type resolution failures.
@@ -729,13 +711,16 @@ type struct TypeArena {
         this.register_leaf_name(qualified_spec);
     }
 
-    /// The late half of swap-relocate: flip the `InstantiatedType` slot at
-    /// `wrapper_ref` into the concrete monomorphized aggregate IN PLACE, so the
-    /// instantiation keeps its original id (`wrapper.id == concrete.id`).  The old
-    /// wrapper node is RELOCATED to a fresh id and kept as a pure origin-carrier
-    /// (`concrete.origin_wrapper = carrier`, `carrier.resolved_type = concrete`)
-    /// so `find_inst_wrapping` still recovers the (base, type_args) it needs.  The
-    /// monomorphizer then populates the concrete's fields at the same id.
+    /// Flip the `InstantiatedType` slot at `wrapper_ref` into the concrete
+    /// monomorphized aggregate IN PLACE, so the instantiation keeps its original
+    /// id (`wrapper.id == concrete.id`) and the concrete carries the
+    /// instantiation's `(generic_base, type_args)` intrinsically.
+    ///
+    /// Nothing is relocated and no side node survives: a monomorphized type IS
+    /// its instantiation, the way rustc's `TyKind::Adt(AdtDef, SubstsRef)` carries
+    /// its substitutions on the type.  (This used to relocate the wrapper node to
+    /// a fresh id as an "origin carrier" that consumers had to look up; forgetting
+    /// that lookup was a silent-wrong-answer defect class.)
     ///
     /// Idempotent: if the slot is already concrete (a duplicate request) it is
     /// returned unchanged.  Returns `wrapper_ref` (now denoting the concrete).
@@ -745,43 +730,38 @@ type struct TypeArena {
         const w_id: u64 = wrapper_ref.id;
         if (w_id == 0 || (w_id - 1) >= this.types.length) { return wrapper_ref; }
         const index: u64 = w_id - 1;
-        mut old: Type* = this.types[index];
+        const old: Type* = this.types[index];
         if (old == null || old.kind != TypeKind::InstantiatedType) {
             return wrapper_ref;
         }
 
-        // Relocate the wrapper node to a fresh id as an origin-carrier.
-        const carrier_id: u64 = this.next_id;
-        old.id = carrier_id;
-        this.next_id += 1;
-        this.types.push(old);
-        const carrier_ref: TypeRef = TypeRef::new(carrier_id, this);
-
         // Build the concrete aggregate AT the wrapper's original id and install it
-        // in the wrapper's slot (no new id for the concrete).
+        // in the wrapper's slot (no new id for the concrete).  The instantiation's
+        // (base, type_args) are copied ONTO the concrete - its intrinsic generic
+        // identity, the `TyKind::Adt(AdtDef, SubstsRef)` shape - so every consumer
+        // reads them from the type itself.  Nothing is relocated: there is no
+        // origin carrier and no side node to keep in sync.
+        const w_inst: InstantiatedType* = old as InstantiatedType*;
+        const w_base: TypeRef = w_inst.generic_base;
         mut concrete: Type* = null;
         if (kind == TypeKind::Enum) {
             mut et: EnumType* = new EnumType(w_id, qualified_spec, module_name, this.intern_table);
             if (display.length() > 0) { et.set_display_name(display); }
-            et.set_origin_wrapper(carrier_ref);
+            et.set_generic_origin(w_base, &w_inst.type_args);
             concrete = et as Type*;
         } else if (kind == TypeKind::Class) {
             mut ct: ClassType* = new ClassType(w_id, qualified_spec, module_name, this.intern_table);
             if (display.length() > 0) { ct.set_display_name(display); }
-            ct.set_origin_wrapper(carrier_ref);
+            ct.set_generic_origin(w_base, &w_inst.type_args);
             concrete = ct as Type*;
         } else {
             mut st: StructType* = new StructType(w_id, qualified_spec, module_name, this.intern_table);
             if (is_union) { st.set_union(true); }
             if (display.length() > 0) { st.set_display_name(display); }
-            st.set_origin_wrapper(carrier_ref);
+            st.set_generic_origin(w_base, &w_inst.type_args);
             concrete = st as Type*;
         }
         this.types[index] = concrete;
-
-        // Back-link the carrier to the concrete so the InstantiatedType node still
-        // reports itself resolved (consumers that reach it via origin_wrapper).
-        (old as InstantiatedType*).set_resolved_type(wrapper_ref);
         return wrapper_ref;
     }
 
@@ -1502,34 +1482,91 @@ type struct TypeArena {
         return "";
     }
 
-    /// Record the InstantiatedType wrapper a concrete aggregate was
-    /// monomorphized FROM, directly on the concrete (`origin_wrapper`).  Called
-    /// by the monomorphizer at the site it sets the wrapper's `resolved_type`, so
-    /// the concrete's generic-instantiation identity is correct by construction.
-    /// A no-op for non-aggregate concretes (e.g. a specialized function type),
-    /// which `find_inst_wrapping` never queries.
-    set_type_origin_wrapper(mut &this, concrete: TypeRef, wrapper: TypeRef) -> void {
+    /// Establish a concrete aggregate's intrinsic generic identity from the
+    /// `InstantiatedType` it was monomorphized from.  This is the NON-swap
+    /// monomorphization path (a concrete allocated at a fresh id rather than
+    /// installed in the wrapper's slot); it must set the same identity as
+    /// `swap_wrapper_to_concrete`, or every `inst_generic_base` /
+    /// `inst_type_arg_*` query on such a type answers "not an instantiation" and
+    /// its associated types, trait impls and drop glue all resolve against the
+    /// wrong key.  A no-op for non-aggregate concretes (e.g. a specialized
+    /// function type), which carry no generic identity.
+    set_type_generic_origin(mut &this, concrete: TypeRef, wrapper: TypeRef) -> void {
         const t: Type* = this.lookup(concrete.id);
         if (t == null) { return; }
-        if (t.kind == TypeKind::Struct)     { (t as StructType*).set_origin_wrapper(wrapper); }
-        else if (t.kind == TypeKind::Class) { (t as ClassType*).set_origin_wrapper(wrapper); }
-        else if (t.kind == TypeKind::Enum)  { (t as EnumType*).set_origin_wrapper(wrapper); }
+        const w: Type* = this.lookup(wrapper.id);
+        if (w == null || w.kind != TypeKind::InstantiatedType) { return; }
+        const wi: InstantiatedType* = w as InstantiatedType*;
+        if (!wi.generic_base.is_valid()) { return; }
+        if (t.kind == TypeKind::Struct) {
+            (t as StructType*).set_generic_origin(wi.generic_base, &wi.type_args);
+        } else if (t.kind == TypeKind::Class) {
+            (t as ClassType*).set_generic_origin(wi.generic_base, &wi.type_args);
+        } else if (t.kind == TypeKind::Enum) {
+            (t as EnumType*).set_generic_origin(wi.generic_base, &wi.type_args);
+        }
     }
 
-    /// Find the `InstantiatedType` arena wrapper whose `resolved_type` is
-    /// `concrete`. Used to recover a concrete struct/enum/class actual's generic
-    /// args during unification (the actual was already specialized to the concrete
-    /// type, e.g. `HashMap_String_GlobalAlloc`, so the args live on its wrapper).
-    /// Reads the concrete's intrinsic `origin_wrapper`, set by the monomorphizer
-    /// when it built the concrete - an O(1) field read, correct by construction.
-    /// Returns invalid for a non-generic concrete (no wrapper) or a non-aggregate.
-    static find_inst_wrapping(arena: TypeArena*, concrete: TypeRef) -> TypeRef {
-        if (arena == null || !concrete.is_valid()) { return TypeRef::invalid(); }
-        const t: Type* = arena.lookup(concrete.id);
+    // -- Intrinsic generic identity (the carrier-free accessors) ---------------
+    //
+    // A monomorphized aggregate carries its own `(generic_base, type_args)` - the
+    // rustc `TyKind::Adt(AdtDef, SubstsRef)` shape.  Prefer these over
+    // They read the type directly, so there is no side node to remember to
+    // consult (forgetting to chase such a node is precisely the defect class that
+    // produced the 2026-07-18 sweep).
+
+    /// The template `ty` is an instantiation of, or invalid when it is not one.
+    /// Answers for BOTH representations: a pre-mono `InstantiatedType` wrapper
+    /// reads its own node; a post-mono concrete reads its intrinsic identity.
+    /// Does NOT peel Pointer / Reference - see `TypeUtils::view_generic_base`.
+    inst_generic_base(&this, ty: TypeRef) -> TypeRef {
+        const t: Type* = this.lookup(ty.id);
         if (t == null) { return TypeRef::invalid(); }
-        if (t.kind == TypeKind::Struct)     { return (t as StructType*).origin_wrapper; }
-        if (t.kind == TypeKind::Class)      { return (t as ClassType*).origin_wrapper; }
-        if (t.kind == TypeKind::Enum)       { return (t as EnumType*).origin_wrapper; }
+        if (t.kind == TypeKind::InstantiatedType) { return (t as InstantiatedType*).generic_base; }
+        if (t.kind == TypeKind::Struct) { return (t as StructType*).generic_base; }
+        if (t.kind == TypeKind::Class)  { return (t as ClassType*).generic_base; }
+        if (t.kind == TypeKind::Enum)   { return (t as EnumType*).generic_base; }
+        return TypeRef::invalid();
+    }
+
+    /// Number of type arguments `ty` carries as an instantiation (0 if none).
+    inst_type_arg_count(&this, ty: TypeRef) -> i64 {
+        const t: Type* = this.lookup(ty.id);
+        if (t == null) { return 0; }
+        if (t.kind == TypeKind::InstantiatedType) { return (t as InstantiatedType*).type_args.length; }
+        if (t.kind == TypeKind::Struct) { return (t as StructType*).type_args.length; }
+        if (t.kind == TypeKind::Class)  { return (t as ClassType*).type_args.length; }
+        if (t.kind == TypeKind::Enum)   { return (t as EnumType*).type_args.length; }
+        return 0;
+    }
+
+    /// The `i`-th type argument of `ty` as an instantiation, or invalid.
+    /// Indexed rather than returned as an array: handing out a `TypeRef[]` by
+    /// value would alias the type's owned buffer and free it twice.
+    inst_type_arg_at(&this, ty: TypeRef, i: i64) -> TypeRef {
+        if (i < 0) { return TypeRef::invalid(); }
+        const t: Type* = this.lookup(ty.id);
+        if (t == null) { return TypeRef::invalid(); }
+        if (t.kind == TypeKind::InstantiatedType) {
+            const wt: InstantiatedType* = t as InstantiatedType*;
+            if (i >= wt.type_args.length) { return TypeRef::invalid(); }
+            return wt.type_args[i];
+        }
+        if (t.kind == TypeKind::Struct) {
+            const st: StructType* = t as StructType*;
+            if (i >= st.type_args.length) { return TypeRef::invalid(); }
+            return st.type_args[i];
+        }
+        if (t.kind == TypeKind::Class) {
+            const ct: ClassType* = t as ClassType*;
+            if (i >= ct.type_args.length) { return TypeRef::invalid(); }
+            return ct.type_args[i];
+        }
+        if (t.kind == TypeKind::Enum) {
+            const et: EnumType* = t as EnumType*;
+            if (i >= et.type_args.length) { return TypeRef::invalid(); }
+            return et.type_args[i];
+        }
         return TypeRef::invalid();
     }
 }

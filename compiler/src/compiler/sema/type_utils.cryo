@@ -287,45 +287,84 @@ type struct TypeUtils {
         return null;
     }
 
-    /// View a MONOMORPHIZED concrete aggregate as its generic instantiation.
-    ///
-    /// Under single-id generic identity, the monomorphizer flips a `Pair<i32>`
-    /// wrapper slot IN PLACE into the concrete Struct/Class/Enum (so
-    /// `wrapper.id == concrete.id`) and relocates the original InstantiatedType
-    /// node to an origin-carrier reachable via `find_inst_wrapping`.  Post-mono a
-    /// receiver spelled `Pair<i32>` is therefore a concrete Struct, not an
-    /// InstantiatedType, so `peel_to_instantiation` returns null for it.  This
-    /// helper bridges that: it returns the origin carrier (an InstantiatedType
-    /// carrying `generic_base` + `type_args`) so generic reasoning that keys off
-    /// the base template + args works identically for pre-mono wrappers and
-    /// post-mono concretes.  Returns null for a non-generic type or a still-live
-    /// wrapper (use `peel_to_instantiation` for the latter).
-    concrete_instantiation_view(&this, ty: TypeRef) -> InstantiatedType* {
-        if (!ty.is_valid()) { return null; }
+    // -- Generic-identity views (carrier-free) ---------------------------------
+    //
+    // These answer "what generic instantiation is this?" for BOTH a pre-mono
+    // `InstantiatedType` wrapper and a post-mono concrete aggregate, WITHOUT
+    // routing through the origin carrier: a wrapper answers from its own node, a
+    // concrete from its intrinsic `generic_base` / `type_args`.  Pointer and
+    // Reference layers are peeled.
+    //
+    // A monomorphized type answers these from its own fields; there is no side
+    // node to consult and none to forget.
+
+    /// The template `ty` is an instantiation of, or invalid.
+    view_generic_base(&this, ty: TypeRef) -> TypeRef {
+        if (!ty.is_valid()) { return TypeRef::invalid(); }
         const t: Type* = this.arena.lookup(ty.id);
-        if (t == null) { return null; }
+        if (t == null) { return TypeRef::invalid(); }
         if (t.kind == TypeKind::Reference) {
-            return this.concrete_instantiation_view((t as ReferenceType*).referent);
+            return this.view_generic_base((t as ReferenceType*).referent);
         }
         if (t.kind == TypeKind::Pointer) {
-            return this.concrete_instantiation_view((t as PointerType*).pointee);
+            return this.view_generic_base((t as PointerType*).pointee);
         }
-        const carrier: TypeRef = TypeArena::find_inst_wrapping(this.arena, ty);
-        if (!carrier.is_valid()) { return null; }
-        const ct: Type* = this.arena.lookup(carrier.id);
-        if (ct == null || ct.kind != TypeKind::InstantiatedType) { return null; }
-        return ct as InstantiatedType*;
+        return this.arena.inst_generic_base(ty);
     }
 
-    /// The generic-instantiation view of a receiver whether it is still a pre-mono
-    /// InstantiatedType wrapper OR a post-mono concrete aggregate: tries
-    /// `peel_to_instantiation` first, then `concrete_instantiation_view`.  Use at
-    /// sites that need a generic receiver's `(generic_base, type_args)` regardless
-    /// of monomorphization state (e.g. method-generic call resolution).
-    instantiation_view(&this, ty: TypeRef) -> InstantiatedType* {
-        const w: InstantiatedType* = this.peel_to_instantiation(ty);
-        if (w != null) { return w; }
-        return this.concrete_instantiation_view(ty);
+    /// Number of type arguments `ty` carries as an instantiation (0 if none).
+    view_type_arg_count(&this, ty: TypeRef) -> i64 {
+        if (!ty.is_valid()) { return 0; }
+        const t: Type* = this.arena.lookup(ty.id);
+        if (t == null) { return 0; }
+        if (t.kind == TypeKind::Reference) {
+            return this.view_type_arg_count((t as ReferenceType*).referent);
+        }
+        if (t.kind == TypeKind::Pointer) {
+            return this.view_type_arg_count((t as PointerType*).pointee);
+        }
+        return this.arena.inst_type_arg_count(ty);
+    }
+
+    /// The `i`-th type argument of `ty` as an instantiation, or invalid.
+    view_type_arg_at(&this, ty: TypeRef, i: i64) -> TypeRef {
+        if (!ty.is_valid() || i < 0) { return TypeRef::invalid(); }
+        const t: Type* = this.arena.lookup(ty.id);
+        if (t == null) { return TypeRef::invalid(); }
+        if (t.kind == TypeKind::Reference) {
+            return this.view_type_arg_at((t as ReferenceType*).referent, i);
+        }
+        if (t.kind == TypeKind::Pointer) {
+            return this.view_type_arg_at((t as PointerType*).pointee, i);
+        }
+        return this.arena.inst_type_arg_at(ty, i);
+    }
+
+    /// The CONCRETE specialization denoted by `ty` when `ty` is an instantiation:
+    /// a post-mono concrete is already it (single-id identity), a pre-mono wrapper
+    /// yields its `resolved_type`.  Invalid when `ty` is a wrapper that has not
+    /// been monomorphized yet.
+    view_concrete_of(&this, ty: TypeRef) -> TypeRef {
+        if (!ty.is_valid()) { return TypeRef::invalid(); }
+        const t: Type* = this.arena.lookup(ty.id);
+        if (t == null) { return TypeRef::invalid(); }
+        if (t.kind == TypeKind::InstantiatedType) {
+            const inst: InstantiatedType* = t as InstantiatedType*;
+            if (inst.has_resolved_type()) { return inst.resolved_type; }
+            return TypeRef::invalid();
+        }
+        if (this.arena.inst_generic_base(ty).is_valid()) { return ty; }
+        return TypeRef::invalid();
+    }
+
+    /// Copy `ty`'s instantiation type arguments into a fresh owned array.
+    /// Element-wise by construction - never hand back a borrow of the type's own
+    /// buffer, which would be freed twice.
+    view_type_args_copy(&this, ty: TypeRef) -> TypeRef[] {
+        mut out: TypeRef[] = [];
+        const n: i64 = this.view_type_arg_count(ty);
+        for (mut i: i64 = 0; i < n; i++) { out.push(this.view_type_arg_at(ty, i)); }
+        return out;
     }
 
     /// Peel Pointer / Reference / resolved-InstantiatedType wrappers (bounded
@@ -356,17 +395,12 @@ type struct TypeUtils {
 
     /// The generic base of an instantiation, or invalid.
     ///
-    /// Goes through `instantiation_view`, not a bare `kind == InstantiatedType`
-    /// test: the whole contract of this function is "give me what this is an
-    /// instantiation OF", and under single-id identity a monomorphized type
-    /// answers `Struct`/`Enum`/`Class` while its base lives on the origin
-    /// carrier.  Testing the kind directly returns invalid for precisely the
-    /// types callers are asking about.
+    /// Alias for `view_generic_base`: the whole contract of this function is
+    /// "give me what this is an instantiation OF", which a monomorphized type now
+    /// answers from its own intrinsic identity.  A bare `kind == InstantiatedType`
+    /// test here would return invalid for precisely the types callers ask about.
     generic_base_of(&this, ty: TypeRef) -> TypeRef {
-        if (!ty.is_valid()) { return TypeRef::invalid(); }
-        const inst: InstantiatedType* = this.instantiation_view(ty);
-        if (inst == null) { return TypeRef::invalid(); }
-        return inst.generic_base;
+        return this.view_generic_base(ty);
     }
 
     /// Pointee of a concrete pointer TypeRef, or invalid if not a pointer.

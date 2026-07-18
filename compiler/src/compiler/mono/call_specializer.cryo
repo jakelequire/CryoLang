@@ -1576,44 +1576,34 @@ type struct MonoCallSpecializer {
     /// receiver's concrete arg.  No-op when the owner isn't a generic instantiation.
     add_owner_param_bindings(&this, subst: TypeSubstitution*, owner_type: TypeRef) -> void {
         if (this.generic_registry == null) { return; }
-        mut inst: InstantiatedType* = null;
-        const ot: Type* = this.arena.lookup(owner_type.id);
-        if (ot != null && ot.kind == TypeKind::InstantiatedType) {
-            inst = ot as InstantiatedType*;
-        } else {
-            // Post-mono concrete owner: single-id identity flipped the receiver's
-            // slot from the InstantiatedType wrapper to the concrete Struct/Enum/
-            // Class and relocated the wrapper to an origin carrier.  Recover the
-            // carrier (it still holds generic_base + type_args) so the owner's
-            // params (`T` in `Option<T>::map<U>`) bind to the concrete args - else
-            // the body's owner-typed constructions (`Option<T>::Some(..)`,
-            // `NonNull<T> { .. }`) stay abstract and codegen ICEs (E0600/E0638).
-            const carrier: TypeRef = TypeArena::find_inst_wrapping(this.arena, owner_type);
-            if (carrier.is_valid()) {
-                const ct: Type* = this.arena.lookup(carrier.id);
-                if (ct != null && ct.kind == TypeKind::InstantiatedType) {
-                    inst = ct as InstantiatedType*;
-                }
-            }
-            // Legacy fallback (owner without an origin carrier): match the concrete
-            // against a materialized spec entry's InstantiatedType.
-            if (inst == null) {
-                for (mut i: i64 = 0; i < this.state.spec_entries.length; i++) {
-                    const e: SpecializationEntry* = &this.state.spec_entries[i];
-                    if (!e.specialized_type.is_valid() || !e.instantiated_type.is_valid()) { continue; }
-                    if (e.specialized_type.id == owner_type.id) {
-                        const it: Type* = this.arena.lookup(e.instantiated_type.id);
-                        if (it != null && it.kind == TypeKind::InstantiatedType) {
-                            inst = it as InstantiatedType*;
-                            break;
-                        }
+        // The owner's `(generic_base, type_args)` read directly: a pre-mono wrapper
+        // answers from its own node, a post-mono concrete from its intrinsic
+        // identity.  Without these bindings the cloned body's owner-typed
+        // constructions (`Option<T>::Some(..)`, `NonNull<T> { .. }`) stay abstract
+        // and codegen ICEs (E0600/E0638).
+        mut owner_src: TypeRef = owner_type;
+        mut owner_base: TypeRef = this.arena.inst_generic_base(owner_type);
+        if (!owner_base.is_valid()) {
+            // Legacy fallback: an owner minted without generic identity (the
+            // substituter can mint an instantiation with fresh arg ids) - match the
+            // concrete against a materialized spec entry's instantiated type.
+            for (mut i: i64 = 0; i < this.state.spec_entries.length; i++) {
+                const e: SpecializationEntry* = &this.state.spec_entries[i];
+                if (!e.specialized_type.is_valid() || !e.instantiated_type.is_valid()) { continue; }
+                if (e.specialized_type.id == owner_type.id) {
+                    const cand: TypeRef = this.arena.inst_generic_base(e.instantiated_type);
+                    if (cand.is_valid()) {
+                        owner_src = e.instantiated_type;
+                        owner_base = cand;
+                        break;
                     }
                 }
             }
         }
-        if (inst == null) { return; }
+        if (!owner_base.is_valid()) { return; }
+        const owner_nargs: i64 = this.arena.inst_type_arg_count(owner_src);
         const tmpl: TemplateEntry* =
-            this.generic_registry.get_template_by_type_id(inst.generic_base.id);
+            this.generic_registry.get_template_by_type_id(owner_base.id);
         if (tmpl == null || tmpl.ast_node == null) { return; }
         const empty_params: GenericParamNode*[] = [];
         mut owner_params: &GenericParamNode*[] = &empty_params;
@@ -1626,17 +1616,18 @@ type struct MonoCallSpecializer {
         } else {
             return;
         }
-        const n: i64 = if (owner_params.length < inst.type_args.length) {
+        const n: i64 = if (owner_params.length < owner_nargs) {
             owner_params.length
         } else {
-            inst.type_args.length
+            owner_nargs
         };
         for (mut i: i64 = 0; i < n; i++) {
             const gp: GenericParamNode* = owner_params[i];
             if (gp == null) { continue; }
-            if (this.arena.contains_generic_param(inst.type_args[i])) { continue; }
+            const arg_i: TypeRef = this.arena.inst_type_arg_at(owner_src, i);
+            if (this.arena.contains_generic_param(arg_i)) { continue; }
             const pref: TypeRef = this.arena.create_generic_param(gp.name, i as u64);
-            subst.add(pref.id, inst.type_args[i]);
+            subst.add(pref.id, arg_i);
         }
     }
 

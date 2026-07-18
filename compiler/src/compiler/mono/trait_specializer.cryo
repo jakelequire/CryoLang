@@ -105,15 +105,9 @@ type struct MonoTraitSpecializer {
         // The monomorphizer often binds a where-clause param straight to the
         // concrete spec'd Struct/Class/Enum rather than its InstantiatedType
         // wrapper.  Recover the wrapper first (mirrors `type_implements_trait`).
-        mut subject: TypeRef = subject_in;
-        const subj_t: Type* = this.arena.lookup(subject_in.id);
-        if (subj_t != null
-                && (subj_t.kind == TypeKind::Struct
-                    || subj_t.kind == TypeKind::Class
-                    || subj_t.kind == TypeKind::Enum)) {
-            const wrapper: TypeRef = TypeArena::find_inst_wrapping(this.arena, subject_in);
-            if (wrapper.is_valid()) { subject = wrapper; }
-        }
+        // No carrier normalization: the lookups below resolve a post-mono concrete
+        // to its template through its intrinsic generic identity.
+        const subject: TypeRef = subject_in;
         const base_name: SymbolStr = this.bare_name_of(subject);
         if (!base_name.is_valid()) { return out; }
         const impl_node: ImplBlockNode* =
@@ -124,22 +118,25 @@ type struct MonoTraitSpecializer {
         if (trait_ann == null) { return out; }
 
         mut ctx: ResolutionContext = ResolutionContext::new("", "");
-        const st: Type* = this.arena.lookup(subject.id);
-        if (st != null && st.kind == TypeKind::InstantiatedType) {
-            const inst: InstantiatedType* = st as InstantiatedType*;
+        // Arg count via the view: the subject may be a pre-mono wrapper OR a
+        // post-mono concrete carrying its own args.  A bare `kind ==
+        // InstantiatedType` test here would skip the bindings for every concrete
+        // (which is what the removed carrier swap used to paper over).
+        const subj_nargs: i64 = this.arena.inst_type_arg_count(subject);
+        if (subj_nargs > 0) {
             // Bind the struct's OWN params from the TARGET args, not the full
             // generic-param list (a where-clause can introduce extra generics).
             mut subst: TypeSubstitution = TypeSubstitution::empty();
-            if (impl_node.target_args.length == inst.type_args.length) {
+            if (impl_node.target_args.length == subj_nargs) {
                 for (mut i: i64 = 0; i < impl_node.target_args.length; i++) {
                     const ta: TypeAnnotation* = impl_node.target_args[i];
                     if (ta == null) { continue; }
                     match (*ta) {
                         TypeAnnotation::Named(n) => {
-                            ctx.add_binding(n.name, inst.type_args[i]);
+                            ctx.add_binding(n.name, this.arena.inst_type_arg_at(subject, i));
                             const gp_ref: TypeRef =
                                 this.arena.create_generic_param(n.name, i as u64);
-                            subst.add(gp_ref.id, inst.type_args[i]);
+                            subst.add(gp_ref.id, this.arena.inst_type_arg_at(subject, i));
                         }
                         _ => {}
                     }

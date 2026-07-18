@@ -263,15 +263,13 @@ type struct CallResolver {
                     const alias: TypeAliasType* = exp_t as TypeAliasType*;
                     if (alias.has_target()) { exp_ref = alias.target; exp_t = this.arena.lookup(exp_ref.id); }
                 }
-                // `instantiation_view` (not a raw `kind == InstantiatedType` test):
+                // Generic-identity view, not a raw `kind == InstantiatedType` test:
                 // under single-id identity the expected type may already BE the
-                // concrete specialization sitting at the former wrapper's id, in
-                // which case the base+args come from its origin carrier.
-                const exp_inst: InstantiatedType* = this.types.instantiation_view(exp_ref);
-                if (exp_inst != null) {
-                    if (exp_inst.generic_base.id == type_ref.id && exp_inst.has_resolved_type()) {
-                        enum_t = this.arena.lookup(exp_inst.resolved_type.id);
-                    }
+                // concrete specialization sitting at the former wrapper's id, and
+                // a concrete carries its own base + args.
+                if (this.types.view_generic_base(exp_ref).id == type_ref.id) {
+                    const spec: TypeRef = this.types.view_concrete_of(exp_ref);
+                    if (spec.is_valid()) { enum_t = this.arena.lookup(spec.id); }
                 }
             }
         }
@@ -291,11 +289,9 @@ type struct CallResolver {
             // nested construction (`Result::Ok(Option::Some(x))`) gets the
             // SUBSTITUTED payload (`Option<u8>`) pushed as its argument hint
             // instead of falling through to the abstract `T` below.
-            const exp_inst2: InstantiatedType* = this.types.instantiation_view(exp_ref2);
-            if (exp_inst2 != null) {
-                if (exp_inst2.generic_base.id == type_ref.id) {
-                    return this.substitute_payload_types(variant.payload_types, type_ref, exp_inst2.type_args);
-                }
+            if (this.types.view_generic_base(exp_ref2).id == type_ref.id) {
+                const exp_args: TypeRef[] = this.types.view_type_args_copy(exp_ref2);
+                return this.substitute_payload_types(variant.payload_types, type_ref, &exp_args);
             }
         }
         return sema_copy_type_refs(&variant.payload_types);
@@ -1158,17 +1154,17 @@ type struct CallResolver {
         } else {
             mut sr: ScopeResolutionNode* = new ScopeResolutionNode(
                 SymbolStr::from_id(type_name_id), SymbolStr::from_id(method_name_id), sp);
-            // Via `instantiation_view`: a post-mono concrete target still needs its
+            // Generic-identity view: a post-mono concrete target still needs its
             // type_args stamped onto the synthesized scope, or the converter call
             // resolves against the bare generic scope name.
-            const it: InstantiatedType* = this.types.instantiation_view(to_ty);
-            if (it != null) {
+            const n_args: i64 = this.types.view_type_arg_count(to_ty);
+            if (n_args > 0) {
                 mut gargs: TypeAnnotation*[] = [];
-                for (mut gi: i64 = 0; gi < it.type_args.length; gi++) {
+                for (mut gi: i64 = 0; gi < n_args; gi++) {
                     mut na: NamedAnnotation* = new NamedAnnotation {
                         name:         SymbolStr::empty(),
                         span:         sp,
-                        pre_resolved: it.type_args[gi],
+                        pre_resolved: this.types.view_type_arg_at(to_ty, gi),
                     };
                     gargs.push(new TypeAnnotation::Named(na));
                 }
@@ -3148,20 +3144,18 @@ type struct CallResolver {
 
         // 2. Expected-type derived (e.g. `const s: Slice<i32> = Slice::from_raw(..)`).
         if (this.state.expected_type.is_valid()) {
-            // `instantiation_view`, not `peel_to_instantiation`: under single-id
+            // Generic-identity view, not `peel_to_instantiation`: under single-id
             // identity the expected type is often the post-mono CONCRETE aggregate
             // sitting at the former wrapper's id, for which `peel` returns null.
-            // The view recovers `(generic_base, type_args)` from its origin carrier,
+            // The view reads `(generic_base, type_args)` off the concrete itself,
             // so a bare static call on a generic owner (`RawBuffer::new()` typed by
             // the field annotation `RawBuffer<u8, GlobalAlloc>`) still binds its
             // owner params here instead of falling through to the literal-default guess.
-            const exp_inst: InstantiatedType* = this.types.instantiation_view(this.state.expected_type);
-            if (exp_inst != null && exp_inst.generic_base.id == tmpl.base_type.id
-                    && exp_inst.type_args.length == want
-                    && !this.types.contains_generic_param(this.state.expected_type)) {
-                mut eb: TypeRef[] = [];
-                for (mut i: i64 = 0; i < exp_inst.type_args.length; i++) { eb.push(exp_inst.type_args[i]); }
-                return eb;
+            const exp_ref_s: TypeRef = this.state.expected_type;
+            if (this.types.view_generic_base(exp_ref_s).id == tmpl.base_type.id
+                    && this.types.view_type_arg_count(exp_ref_s) == want
+                    && !this.types.contains_generic_param(exp_ref_s)) {
+                return this.types.view_type_args_copy(exp_ref_s);
             }
         }
 
@@ -3550,13 +3544,14 @@ type struct CallResolver {
             if (alias.has_target()) { exp_ref = alias.target; exp_t = this.arena.lookup(exp_ref.id); }
         }
         // Sibling of the expected-type peel in `compute_static_owner_bindings`:
-        // via `instantiation_view` so a post-mono concrete expected type still
+        // via the generic-identity view so a post-mono concrete expected type still
         // yields its type_args.  Without it this returns the still-abstract `ret`.
-        const exp_inst: InstantiatedType* = this.types.instantiation_view(exp_ref);
-        if (exp_inst == null) { return ret; }
-        if (ret_inst.generic_base.id != exp_inst.generic_base.id) { return ret; }
+        const exp_base: TypeRef = this.types.view_generic_base(exp_ref);
+        if (!exp_base.is_valid()) { return ret; }
+        if (ret_inst.generic_base.id != exp_base.id) { return ret; }
+        const exp_args: TypeRef[] = this.types.view_type_args_copy(exp_ref);
         const scope_qname: QualifiedName = QualifiedName::from_symbol(scope_name);
-        const spec_sym: SymbolStr = MangledName::specialized_identifier(this.intern, this.arena, scope_qname, exp_inst.type_args);
+        const spec_sym: SymbolStr = MangledName::specialized_identifier(this.intern, this.arena, scope_qname, exp_args);
         const spec_ret: TypeRef = this.types.lookup_method_return(spec_sym, member_name);
         if (spec_ret.is_valid()) { return spec_ret; }
         return this.state.expected_type;
@@ -3573,22 +3568,16 @@ type struct CallResolver {
             if (alias.has_target()) { exp_ref = alias.target; exp_t = this.arena.lookup(exp_ref.id); }
         }
         if (exp_t == null) { return found; }
-        if (exp_t.kind == TypeKind::InstantiatedType) {
-            const exp_inst: InstantiatedType* = exp_t as InstantiatedType*;
-            if (exp_inst.generic_base.equals(found)) { return exp_ref; }
-            return found;
-        }
-        if (exp_t.kind == TypeKind::Enum || exp_t.kind == TypeKind::Struct || exp_t.kind == TypeKind::Class) {
-            const count: i64 = this.arena.type_count();
-            for (mut i: i64 = 0; i < count; i++) {
-                const t: Type* = this.arena.types[i];
-                if (t == null || t.kind != TypeKind::InstantiatedType) { continue; }
-                const inst: InstantiatedType* = t as InstantiatedType*;
-                if (!inst.generic_base.equals(found)) { continue; }
-                if (!inst.has_resolved_type()) { continue; }
-                if (inst.resolved_type.id == exp_ref.id) { return exp_ref; }
-            }
-        }
+        // One O(1) question for both representations: is the expected type an
+        // instantiation OF `found`?  A pre-mono wrapper and a post-mono concrete
+        // both answer from their own generic identity.
+        //
+        // This replaces an O(arena) scan that looked for an InstantiatedType whose
+        // `resolved_type` was the expected concrete - i.e. it depended on the
+        // origin-carrier node existing, and silently found nothing once the
+        // concrete carried its identity itself.
+        const exp_base: TypeRef = this.types.view_generic_base(exp_ref);
+        if (exp_base.is_valid() && exp_base.equals(found)) { return exp_ref; }
         return found;
     }
 

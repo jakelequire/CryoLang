@@ -616,7 +616,7 @@ type struct Monomorphizer {
 
         // Populate the concrete type.  On the swap path, flip the wrapper slot to
         // the concrete IN PLACE first (one id per semantic type); the wrapper node
-        // is relocated to a carrier so `find_inst_wrapping` still recovers base +
+        // identity is copied onto the concrete so `inst_generic_base` recovers base +
         // type_args.  On the fallback path, bridge the wrapper to the freshly
         // allocated concrete via `resolved_type` (the pre-A2a mechanism).
         if (concrete_type.is_valid()) {
@@ -631,15 +631,15 @@ type struct Monomorphizer {
                 if (inst_t != null && inst_t.kind == TypeKind::InstantiatedType) {
                     (inst_t as InstantiatedType*).set_resolved_type(concrete_type);
                     // Record the concrete's intrinsic generic-instantiation identity:
-                    // the wrapper it was built from (`find_inst_wrapping` reads this).
-                    this.arena.set_type_origin_wrapper(concrete_type, request.generic_type);
+                    // the instantiation it was built from (the `inst_*` views read this).
+                    this.arena.set_type_generic_origin(concrete_type, request.generic_type);
                 }
             }
         } else if (entry.node_kind == NodeKind::FunctionDeclaration) {
             // Function templates don't create named arena types, but still get a
             // concrete FunctionType so the InstantiatedType has a valid resolved_type.
-            // (No origin_wrapper: a FunctionType is not an aggregate and is never
-            // queried by find_inst_wrapping.)
+            // (No generic origin: a FunctionType is not an aggregate and carries
+            // no intrinsic instantiation identity.)
             const func_type: TypeRef = this.type_populator.build_function_type_from_ast(result.specialized_ast);
             if (func_type.is_valid()) {
                 const inst_t: Type* = this.arena.lookup(request.generic_type.id);
@@ -776,19 +776,14 @@ type struct Monomorphizer {
     // Cache helpers (orchestrator-private)
 
     /// Build a cache key from a request.  Mirrors GenericRegistry's
-    /// `make_cache_key` format (`base<arg,arg>`) but canonicalizes each arg id
-    /// through `canon_type_id` so equivalent instantiations dedup to one spec.
+    /// `make_cache_key` format (`base<arg,arg>`), keyed on plain arena ids.
     ///
-    /// The canonicalization is load-bearing for nested-generic RESOLUTION, not
-    /// just dedup: a request that arrives with an unresolved `InstantiatedType`
-    /// wrapper arg `W` must hit the cache entry built for its resolved concrete
-    /// `C` (`canon_type_id(W) == C.id`) so `propagate_cached_resolution` links
-    /// `W`'s InstantiatedType to `C`.  Keying structurally (e.g. off the
-    /// mangled symbol, which encodes `W` and `C` differently) splits them and
-    /// leaves nested wrappers like `ChainIter<MapIter<Range>>` unresolved
-    /// (E0900).  Aligning the pinned symbol to this canonical key (not the
-    /// reverse) is the only sound fix, and it is a wholesale mangling change
-    /// requiring its own repin.
+    /// This used to canonicalize each arg through `canon_type_id`, because a
+    /// request carrying an unresolved `InstantiatedType` wrapper `W` had to hit
+    /// the cache entry built for its separately-allocated concrete `C` - two ids
+    /// for one type.  Under single-id identity the wrapper's slot IS the
+    /// concrete (`W.id == C.id`), so the ids coincide and plain `.id` is already
+    /// canonical; `canon_type_id` was deleted as dead (D1).
     make_key(&this, request: &MonomorphRequest) -> string {
         return this.make_key_for(request.base_type, request.type_args);
     }
@@ -797,7 +792,7 @@ type struct Monomorphizer {
         mut key: string = format("%llu<", base.id);
         for (mut i: i64 = 0; i < type_args.length; i++) {
             if (i > 0) { key += ","; }
-            key += format("%llu", this.arena.canon_type_id(type_args[i]));
+            key += format("%llu", type_args[i].id);
         }
         key += ">";
         return key;
@@ -829,7 +824,7 @@ type struct Monomorphizer {
         const inst_t: Type* = this.arena.lookup(request.generic_type.id);
         if (inst_t != null && inst_t.kind == TypeKind::InstantiatedType) {
             (inst_t as InstantiatedType*).set_resolved_type(entry.specialized_type);
-            this.arena.set_type_origin_wrapper(entry.specialized_type, request.generic_type);
+            this.arena.set_type_generic_origin(entry.specialized_type, request.generic_type);
         }
     }
 
