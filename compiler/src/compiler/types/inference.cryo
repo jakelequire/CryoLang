@@ -157,34 +157,28 @@ type struct InferCtx {
         }
 
         // InstantiatedType vs InstantiatedType: same base + recursive args.
-        if (ft.kind == TypeKind::InstantiatedType && at.kind == TypeKind::InstantiatedType) {
-            const fi: InstantiatedType* = ft as InstantiatedType*;
-            const ai: InstantiatedType* = at as InstantiatedType*;
-            if (fi.generic_base.id != ai.generic_base.id) { return false; }
-            if (fi.type_args.length != ai.type_args.length) { return false; }
-            for (mut i: i64 = 0; i < fi.type_args.length; i++) {
-                if (!this.unify(fi.type_args[i], ai.type_args[i])) {
+        // Instantiation formal vs instantiation actual.  EITHER side may be a
+        // pre-mono `InstantiatedType` wrapper OR a post-mono concrete aggregate
+        // carrying its own `(generic_base, type_args)`, so compare through the
+        // `inst_*` views instead of testing node kinds.  This subsumes what used
+        // to be three branches - wrapper/wrapper, wrapper/concrete (which had to
+        // look up the concrete's origin carrier and re-unify against it), and the
+        // reject case - into one, because the two representations now answer the
+        // same questions.
+        if (ft.kind == TypeKind::InstantiatedType) {
+            const f_base: TypeRef = this.arena.inst_generic_base(formal);
+            const a_base: TypeRef = this.arena.inst_generic_base(actual);
+            if (!f_base.is_valid() || !a_base.is_valid()) { return false; }
+            if (f_base.id != a_base.id) { return false; }
+            const n_f: i64 = this.arena.inst_type_arg_count(formal);
+            if (n_f != this.arena.inst_type_arg_count(actual)) { return false; }
+            for (mut i: i64 = 0; i < n_f; i++) {
+                if (!this.unify(this.arena.inst_type_arg_at(formal, i),
+                                this.arena.inst_type_arg_at(actual, i))) {
                     return false;
                 }
             }
             return true;
-        }
-
-        // InstantiatedType formal vs concrete struct/enum/class actual: find
-        // the matching InstantiatedType wrapper in the arena and unify against
-        // it so the recursive arg walk can recover concrete bindings.
-        if (ft.kind == TypeKind::InstantiatedType
-                && (at.kind == TypeKind::Struct
-                    || at.kind == TypeKind::Class
-                    || at.kind == TypeKind::Enum)) {
-            const wrapper: TypeRef = TypeArena::find_inst_wrapping(this.arena, actual);
-            if (wrapper.is_valid()) {
-                return this.unify(formal, wrapper);
-            }
-            return false;
-        }
-        if (ft.kind == TypeKind::InstantiatedType) {
-            return false;
         }
 
         // Function type vs function type: equal arity and variadic-ness, then

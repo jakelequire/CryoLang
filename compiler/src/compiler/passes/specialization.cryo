@@ -451,24 +451,15 @@ type struct SpecializationPasses {
             return SymbolStr::empty();
         }
         const arena: TypeArena* = ctx.type_arena;
-        // Single-id identity: this id holds the CONCRETE type after the swap, so a
-        // bare kind test is always false and this would return empty for every
-        // spec - collapsing spec placement onto the template's defining module and
-        // undoing the type-arg-owner placement this function exists to provide.
-        // Recover the (base, type_args) from the relocated origin carrier.
-        mut it: Type* = arena.lookup(entry.instantiated_type.id);
-        if (it != null && it.kind != TypeKind::InstantiatedType) {
-            const carrier: TypeRef =
-                TypeArena::find_inst_wrapping(arena, entry.instantiated_type);
-            if (carrier.is_valid()) { it = arena.lookup(carrier.id); }
-        }
-        if (it == null || it.kind != TypeKind::InstantiatedType) {
-            return SymbolStr::empty();
-        }
-        const inst: InstantiatedType* = it as InstantiatedType*;
-        for (mut i: i64 = 0; i < inst.type_args.length; i++) {
+        // `inst_*` answers for a pre-mono wrapper AND a post-mono concrete alike
+        // (single-id identity puts the concrete at the wrapper's id, carrying its
+        // own base + args).  A bare `kind == InstantiatedType` test here would be
+        // false for every monomorphized spec, collapsing placement onto the
+        // template's defining module.
+        const n_args: i64 = arena.inst_type_arg_count(entry.instantiated_type);
+        for (mut i: i64 = 0; i < n_args; i++) {
             const src: SymbolStr = SpecializationPasses::owner_of_type(
-                ctx, inst.type_args[i], 0);
+                ctx, arena.inst_type_arg_at(entry.instantiated_type, i), 0);
             if (src.is_valid()) { return src; }
         }
         return SymbolStr::empty();
@@ -570,11 +561,12 @@ type struct SpecializationPasses {
         if (!qs.contains("$")) { return fallback; }
 
         // A monomorph.  Its name only tells us where the TEMPLATE lives; look
-        // inside for a real type.  The linear scan is affordable because it runs
-        // only for a spec-struct type ARGUMENT, never for the common cases above.
-        const wrap: TypeRef = TypeArena::find_inst_wrapping(arena, tref);
-        if (wrap.is_valid()) {
-            const s: SymbolStr = SpecializationPasses::owner_of_type(ctx, wrap, depth + 1);
+        // inside its type ARGUMENTS for a source-declared type.  Read straight off
+        // the spec's intrinsic identity - no carrier, and no arena scan.
+        const n_args: i64 = arena.inst_type_arg_count(tref);
+        for (mut i: i64 = 0; i < n_args; i++) {
+            const s: SymbolStr = SpecializationPasses::owner_of_type(
+                ctx, arena.inst_type_arg_at(tref, i), depth + 1);
             if (s.is_valid()) { return s; }
         }
         return fallback;
@@ -712,28 +704,21 @@ type struct SpecializationPasses {
                 // The element type is always type_args[0]; subsequent args
                 // (e.g. the allocator in stdlib-next's `Array<T, A = GlobalAlloc>`)
                 // are part of the Array spec but not part of the element key.
-                // `entry.instantiated_type` is the WRAPPER's ref.  Under single-id
-                // identity the swap installs the concrete at that very id, so the
-                // slot is a Struct here, not an InstantiatedType - the (base,
-                // type_args) now live on the relocated origin carrier.  Recover it,
-                // or the Array element->spec-name mapping below is never registered
-                // and codegen cannot find methods on a dynamic `T[]` receiver.
-                mut inst_t: Type* = arena.lookup(entry.instantiated_type.id);
-                if (inst_t != null && inst_t.kind != TypeKind::InstantiatedType) {
-                    const carrier: TypeRef =
-                        TypeArena::find_inst_wrapping(arena, entry.instantiated_type);
-                    if (carrier.is_valid()) { inst_t = arena.lookup(carrier.id); }
-                }
-                if (inst_t != null && inst_t.kind == TypeKind::InstantiatedType) {
-                    const inst: InstantiatedType* = inst_t as InstantiatedType*;
-                    if (inst.type_args.length >= 1) {
-                        const base_qn: SymbolStr = arena.get_qualified_name(inst.generic_base);
-                        if (base_qn.is_valid()) {
-                            const base_str: string = ctx.intern_table.resolve(base_qn);
-                            if (base_str == "std::collections::array::Array") {
-                                ctx.decl_index.register_array_element_type(
-                                    inst.type_args[0], conc_qname);
-                            }
+                // `inst_*` reads the instantiation identity whether this id holds a
+                // pre-mono wrapper or the post-mono concrete (single-id identity).
+                // A bare `kind == InstantiatedType` test would be false for every
+                // monomorphized spec, so this mapping would never be registered and
+                // codegen could not find methods on a dynamic `T[]` receiver.
+                if (arena.inst_type_arg_count(entry.instantiated_type) >= 1) {
+                    const inst_base: TypeRef =
+                        arena.inst_generic_base(entry.instantiated_type);
+                    const base_qn: SymbolStr = arena.get_qualified_name(inst_base);
+                    if (base_qn.is_valid()) {
+                        const base_str: string = ctx.intern_table.resolve(base_qn);
+                        if (base_str == "std::collections::array::Array") {
+                            ctx.decl_index.register_array_element_type(
+                                arena.inst_type_arg_at(entry.instantiated_type, 0),
+                                conc_qname);
                         }
                     }
                 }

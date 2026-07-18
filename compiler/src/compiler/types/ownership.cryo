@@ -692,10 +692,8 @@ type struct OwnershipQuery {
     /// allocation-order-dependent false negative that silently drops a real
     /// `Drop`.  The qualified name is canonical per nominal type, so the
     /// registration side (type_resolution R1) and every lookup side agree.
-    /// The `InstantiatedType` view of `ty` whether it is still a pre-mono WRAPPER
-    /// or a post-mono CONCRETE sitting at that wrapper's own id (single-id
-    /// identity): the wrapper answers directly, the concrete answers through its
-    /// relocated origin carrier.
+    /// The template `ty` is an instantiation of, for BOTH a pre-mono wrapper and
+    /// a post-mono concrete (which carries its own base), or invalid.
     ///
     /// Every ownership lookup below keys on the TEMPLATE - `(Drop, Box)`, never
     /// `(Drop, Box_i32)` - because registration happens pre-mono against the
@@ -704,16 +702,9 @@ type struct OwnershipQuery {
     /// the SPEC's name, every registry probe misses, and a real `Drop` impl is
     /// silently lost (the instantiation is then classified `Copy` and loses its
     /// drop glue - a leak, with no diagnostic).
-    static inst_view(arena: TypeArena*, ty: TypeRef) -> InstantiatedType* {
-        if (arena == null || !ty.is_valid()) { return null; }
-        const t: Type* = arena.lookup(ty.id);
-        if (t == null) { return null; }
-        if (t.kind == TypeKind::InstantiatedType) { return t as InstantiatedType*; }
-        const carrier: TypeRef = TypeArena::find_inst_wrapping(arena, ty);
-        if (!carrier.is_valid()) { return null; }
-        const ct: Type* = arena.lookup(carrier.id);
-        if (ct == null || ct.kind != TypeKind::InstantiatedType) { return null; }
-        return ct as InstantiatedType*;
+    static inst_base_of(arena: TypeArena*, ty: TypeRef) -> TypeRef {
+        if (arena == null || !ty.is_valid()) { return TypeRef::invalid(); }
+        return arena.inst_generic_base(ty);
     }
 
     static named_qualified_id(arena: TypeArena*, intern: InternTable*,
@@ -721,10 +712,9 @@ type struct OwnershipQuery {
         if (arena == null || intern == null || !ty.is_valid()) { return 0; }
         const t: Type* = arena.lookup(ty.id);
         if (t == null) { return 0; }
-        const inst: InstantiatedType* = OwnershipQuery::inst_view(arena, ty);
-        if (inst != null) {
-            return OwnershipQuery::named_qualified_id(arena, intern,
-                                                       inst.generic_base);
+        const inst_base: TypeRef = OwnershipQuery::inst_base_of(arena, ty);
+        if (inst_base.is_valid()) {
+            return OwnershipQuery::named_qualified_id(arena, intern, inst_base);
         }
         if (t.kind == TypeKind::Struct || t.kind == TypeKind::Class ||
             t.kind == TypeKind::Enum) {
@@ -771,10 +761,9 @@ type struct OwnershipQuery {
     /// QUALIFIED-NAME identity, and falling back to the historical bare-leaf
     /// lookup when `ty` is not a precisely-registered named aggregate.
     ///
-    /// `ty` should be normalized to its InstantiatedType wrapper by the caller
-    /// (every reroute site already does, via `TypeArena::find_inst_wrapping`), so
-    /// `named_qualified_id` peels to the template's qualified name and matches the
-    /// registration key.  The trait name is normalized to its LEAF on BOTH sides
+    /// `named_qualified_id` resolves `ty` to the TEMPLATE's qualified name - for a
+    /// pre-mono wrapper and a post-mono concrete alike - so it matches the
+    /// registration key without the caller normalizing anything first.  The trait name is normalized to its LEAF on BOTH sides
     /// (`leaf_segment` here, and at the type_resolution R1 registration) so a
     /// qualified `implement trait Mod::Tr` and a bare `implement trait Tr` share
     /// one key.  Failure mode is a loud compile error (never a UAF), so the
@@ -838,10 +827,9 @@ type struct OwnershipQuery {
         // the template's AST; `registry.get_template` is keyed on the template name.
         const t: Type* = arena.lookup(ty.id);
         if (t == null) { return false; }
-        const inst: InstantiatedType* = OwnershipQuery::inst_view(arena, ty);
-        if (inst != null) {
-            return OwnershipQuery::has_inherent_drop(arena, registry, intern,
-                                                      inst.generic_base);
+        const inst_base: TypeRef = OwnershipQuery::inst_base_of(arena, ty);
+        if (inst_base.is_valid()) {
+            return OwnershipQuery::has_inherent_drop(arena, registry, intern, inst_base);
         }
 
         const qname: SymbolStr = OwnershipQuery::qualified_name_of(arena, ty);
@@ -955,12 +943,11 @@ type struct OwnershipQuery {
         }
         // Walk through the template-base of an instantiation rather
         // than the resolved spec; `(Drop, Box)` is the registry key,
-        // not `(Drop, Box_i32)`.  Via `inst_view` so this holds for a
+        // not `(Drop, Box_i32)`.  Via `inst_base_of` so this holds for a
         // post-mono concrete too, not just a pre-mono wrapper.
-        const inst: InstantiatedType* = OwnershipQuery::inst_view(arena, ty);
-        if (inst != null) {
-            return OwnershipQuery::registry_name_of(arena, intern,
-                                                     inst.generic_base);
+        const inst_base: TypeRef = OwnershipQuery::inst_base_of(arena, ty);
+        if (inst_base.is_valid()) {
+            return OwnershipQuery::registry_name_of(arena, intern, inst_base);
         }
         // For all named user-defined types, take the bare leaf of the
         // qualified name, matching how trait_impl_key() in the registry
@@ -1070,16 +1057,16 @@ type struct OwnershipQuery {
             return OwnershipQuery::type_method_consumes(arena, registry, intern,
                                                         pt.pointee, method_name);
         }
-        // Via `inst_view` so a POST-MONO concrete resolves to its template too:
+        // Via `inst_base_of` so a POST-MONO concrete resolves to its template too:
         // `registry.get_template` / `lookup_inherent_owner` below are keyed on the
         // template name, so a monomorphized `Option<String>` that answered `Enum`
         // here used to miss and return false - reporting that `![sink] unwrap`
         // does NOT consume its receiver.  `drop_insertion` then emits drop glue
         // for a receiver whose payload was already moved out: a double free.
-        const inst: InstantiatedType* = OwnershipQuery::inst_view(arena, recv_ty);
-        if (inst != null) {
+        const inst_base: TypeRef = OwnershipQuery::inst_base_of(arena, recv_ty);
+        if (inst_base.is_valid()) {
             return OwnershipQuery::type_method_consumes(arena, registry, intern,
-                                                        inst.generic_base, method_name);
+                                                        inst_base, method_name);
         }
         const qname: SymbolStr = OwnershipQuery::qualified_name_of(arena, recv_ty);
         if (!qname.is_valid()) { return false; }

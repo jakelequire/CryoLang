@@ -766,13 +766,9 @@ type struct MangleContext {
              || ty.kind == TypeKind::Class
              || ty.kind == TypeKind::Enum) {
                 const self_ref: TypeRef = TypeRef::new(ty.id, this.arena);
-                const carrier: TypeRef =
-                    TypeArena::find_inst_wrapping(this.arena, self_ref);
-                if (carrier.is_valid()) {
-                    const ct: Type* = this.arena.lookup(carrier.id);
-                    if (ct != null && ct.kind == TypeKind::InstantiatedType) {
-                        return this.encode_instantiated(ct as InstantiatedType*);
-                    }
+                const inst_base: TypeRef = this.arena.inst_generic_base(self_ref);
+                if (inst_base.is_valid()) {
+                    return this.encode_instantiation_of(inst_base, ty.id);
                 }
             }
             const inner_n: string = MangleContext::encode_named_type_path(this.table, ty);
@@ -892,7 +888,18 @@ type struct MangleContext {
     ///   Pair<int>       -> 4Pair$Li$G
     ///   Result<T, U>    -> 6Result$L<T>_<U>$G
     encode_instantiated(&this, inst: InstantiatedType*) -> string {
-        const base_t: Type* = this.arena.lookup(inst.generic_base.id);
+        return this.encode_instantiation_of(inst.generic_base, inst.id);
+    }
+
+    /// Encode an instantiation from its `(generic_base, type_args)` identity,
+    /// reading the args off `owner` (a pre-mono wrapper OR a post-mono concrete -
+    /// both carry the same identity).  Keeping ONE encoder for both is what
+    /// guarantees a type mangles to a single symbol regardless of which
+    /// representation the caller happens to hold; encoding them separately is
+    /// what produced the defined-vs-referenced symbol split.
+    encode_instantiation_of(&this, base: TypeRef, owner_id: u64) -> string {
+        const owner: TypeRef = TypeRef::new(owner_id, this.arena);
+        const base_t: Type* = this.arena.lookup(base.id);
         mut buf: string = "N$L";
         if (base_t == null) {
             buf += MangleContext::encode_ident("?");
@@ -900,9 +907,11 @@ type struct MangleContext {
             buf += MangleContext::encode_named_type_path(this.table, base_t);
         }
         buf += "$L";
-        for (mut i: i64 = 0; i < inst.type_args.length; i++) {
+        const n: i64 = this.arena.inst_type_arg_count(owner);
+        for (mut i: i64 = 0; i < n; i++) {
             if (i > 0) { buf += "_"; }
-            buf += this.encode_type_ref(inst.type_args[i], "InstantiatedType.arg");
+            buf += this.encode_type_ref(this.arena.inst_type_arg_at(owner, i),
+                                        "InstantiatedType.arg");
         }
         buf += "$G";
         buf += "$G";
