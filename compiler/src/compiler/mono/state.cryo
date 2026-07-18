@@ -110,6 +110,19 @@ type struct MonoState {
     // shared by every module.
     method_specs:     HashMap<string, boolean>;
 
+    // Arena ids of InstantiatedTypes that have a REGISTERED spec entry.
+    //
+    // This is a membership question, not an identity question: under single-id a
+    // materialized named spec reuses its wrapper's arena id, so "the spec for this
+    // instantiation" IS this instantiation - there is nothing to look up.  What is
+    // NOT answerable from the type alone is whether the spec has been registered
+    // YET, because `materialize` registers the entry BEFORE it swaps the wrapper
+    // slot to the concrete (the nested-call walk in between must be able to see the
+    // spec it is currently inside - the `String<GlobalAlloc>` self-reference case).
+    // During that window the slot still reads as an unresolved wrapper even though
+    // the spec exists, so the slot kind cannot answer it and this set must.
+    materialized_insts: HashMap<string, boolean>;
+
     // Owner modules of generic-METHOD specs (those attached to an impl block or a
     // fixed receiver's decl, NOT the `spec_entries` type/free-function specs).
     // A method spec's definition is emitted into the module owning the impl block
@@ -136,6 +149,7 @@ type struct MonoState {
             nested_visited:   [],
             error_count:      0,
             method_specs:     HashMap<string, boolean>::new(),
+            materialized_insts: HashMap<string, boolean>::new(),
             spec_owner_modules: [],
         };
     }
@@ -154,6 +168,24 @@ type struct MonoState {
         if (!mangled.is_valid()) { return; }
         const key: string = this.intern_table.resolve(mangled);
         this.method_specs.insert(key, true);
+    }
+
+    /// True if a spec entry has been REGISTERED for this instantiation (see
+    /// `materialized_insts`).  Answers "has this been specialized yet?", NOT
+    /// "what type did it specialize to" - under single-id the answer to the
+    /// latter is the instantiation itself.
+    has_materialized_spec(&this, inst: TypeRef) -> boolean {
+        if (!inst.is_valid()) { return false; }
+        const key: string = format("%llu", inst.id);
+        return this.materialized_insts.contains_key(&key);
+    }
+
+    /// Record that a spec entry has been registered for this instantiation.
+    /// Called at spec-entry registration, before the wrapper->concrete swap.
+    mark_materialized_spec(mut &this, inst: TypeRef) -> void {
+        if (!inst.is_valid()) { return; }
+        const key: string = format("%llu", inst.id);
+        this.materialized_insts.insert(key, true);
     }
 
     /// Record the module that owns a just-materialized generic-method spec (the
