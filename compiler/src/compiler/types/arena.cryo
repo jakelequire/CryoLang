@@ -485,11 +485,23 @@ type struct TypeArena {
 
     // Generic type factories (deduplicated by name + index)
 
-    /// Get or create a generic parameter type.
-    /// Deduplicated by (name.id, index) so that multiple passes resolving
-    /// the same generic parameter T at index 0 always get the same TypeRef.
+    /// Get or create a generic parameter type, deduplicated by NAME so a given
+    /// logical param (e.g. `T`) is ONE canonical TypeID no matter which sema
+    /// entry point mints it.  Several paths assign a different positional
+    /// `index` to the same param (most visibly a generic enum's method resolving
+    /// the enclosing `T` through a fresh scope), which under an (name, index) key
+    /// produced distinct TypeIDs.  That mattered because substitution keys by
+    /// param TypeID (`TypeSubstitution::from_params`): a divergent-index copy was
+    /// absent from the map and stayed abstract, forcing the checker's name-only
+    /// structural fallback and the canonicalization mechanisms downstream.  Keying
+    /// by name collapses them and matches that long-standing name-only equality.
+    /// `param_index` is still stored (first creation wins) but only feeds
+    /// `display_name` (`T%lu`); the mangler encodes GenericParam by `param_name`
+    /// alone, so first-index-wins is display-only and never perturbs emitted
+    /// symbols.  (Within any one template, param names are unique, so nothing
+    /// relies on two same-name params having distinct ids.)
     create_generic_param(mut &this, name: SymbolStr, index: u64) -> TypeRef {
-        const key: u64 = ((name.id as u64) << 32) | (index & 0xFFFFFFFF);
+        const key: u64 = name.id as u64;
 
         const cached: Option<TypeRef> = this.generic_param_cache.get(&key);
         if (cached.is_some()) { return cached.unwrap(); }
@@ -499,10 +511,12 @@ type struct TypeArena {
         return ref;
     }
 
-    /// Get or create a bounded generic parameter type.
-    /// Deduplicated by (name.id, index); bounds are set on first creation.
+    /// Get or create a bounded generic parameter type, deduplicated by NAME
+    /// (see `create_generic_param` for why leaves are name-canonical).  The
+    /// bounds and `param_index` from the FIRST creation win; the checker already
+    /// compares BoundedParams by name alone, so this is consistent.
     create_bounded_param(mut &this, name: SymbolStr, index: u64, bounds: TypeRef[]) -> TypeRef {
-        const key: u64 = ((name.id as u64) << 32) | (index & 0xFFFFFFFF);
+        const key: u64 = name.id as u64;
 
         const cached: Option<TypeRef> = this.bounded_param_cache.get(&key);
         if (cached.is_some()) { return cached.unwrap(); }
