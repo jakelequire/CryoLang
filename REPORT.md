@@ -44,7 +44,7 @@ string-keyed monomorphization era).
   *Fix direction: single layout authority (see D1) or at minimum make glue
   call the same align-up helper as construction.*
 
-- [ ] **MoveCheck / DropInsertion diverge on assignment RHS → double-free hole** **[verified]**
+- [x] **MoveCheck / DropInsertion diverge on assignment RHS → double-free hole** **[verified]**
   `compiler/src/compiler/passes/move_check.cryo:1198-1201` walks the RHS of
   `x = y` in **read** context (never marks `y` moved);
   `passes/drop_insertion.cryo:2479-2494` walks the same RHS in **move**
@@ -52,6 +52,15 @@ string-keyed monomorphization era).
   non-Copy `y` is compile-accepted; `x`'s scope-exit drop and `f`'s callee
   param drop free the same storage. Violates the passes' own stated invariant
   (`drop_insertion.cryo:137-143`) that their move-sets must be identical.
+  *Fixed:* `move_check::read_binary` now moves the `=` RHS
+  (`walk_expr_move(rhs, real=false)` + explicit `check_field_move_out`), matching
+  drop_insertion's move-set. `real=false` deliberately skips the real-move
+  array-move-out checks so the swap-remove idiom `a[i] = a[last]` and shallow
+  array-field copies don't false-positive. The fix exposed 4 genuine (benign but
+  model-illegal) assign-move-then-use sites in the compiler's own source
+  (`pass_registry`, `config_gating`, `module_graph`), now reading via the new
+  owner. Regression test: `tests/negative/E0452_assign_rhs_use_after_move.cryo`.
+  Gated (test + selfhost fixed-point ×2) and repinned.
 
 - [x] **ICEs terminate with no message printed** **[verified]**
   `compiler/src/compiler/compilation_context.cryo:566-572` — `ice()` emits

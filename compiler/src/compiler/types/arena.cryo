@@ -108,16 +108,6 @@ type struct TypeArena {
     // type references that can't be resolved through the scope chain.
     leaf_index: HashMap<u32, u32>;   // bare SymbolStr.id -> qualified SymbolStr.id
 
-    // -- Index: generic_base.id -> positions of its InstantiatedTypes --
-    // Without this bucket, `propagate_instantiated_resolution` and
-    // `find_resolved_instantiation` would linear-scan ALL arena types (the #1
-    // frontend self-time, ~5.6%, quadratic in program size).  It lets them visit only
-    // same-base instantiations.  Append-only and position-stable: alloc_type
-    // only ever pushes, so a recorded position never moves.  Resolved-vs-
-    // unresolved filtering stays in the consumers (has_resolved_type), so the
-    // bucket needs no removal.  Populated in `create_instantiation`, the sole
-    // site that allocates an InstantiatedType.
-    inst_by_base: HashMap<u64, u32[]>;
 
 
     /// Create a new TypeArena and initialize all 20 primitive singletons.
@@ -168,7 +158,6 @@ type struct TypeArena {
             bounded_param_cache: HashMap<u64, TypeRef>::new(),
             assoc_projection_cache: HashMap<string, TypeRef>::new(),
             leaf_index:          HashMap<u32, u32>::new(),
-            inst_by_base:        HashMap<u64, u32[]>::new(),
         };
 
         arena.init_primitives();
@@ -570,60 +559,8 @@ type struct TypeArena {
         // never-instantiated template and are never monomorphized/codegen'd).
         if (this.symbolic_no_demand_active) { inst_node.is_symbolic = true; }
         const ref: TypeRef = this.alloc_type(inst_node);
-        const pos: u32 = (this.types.length - 1) as u32;
-        const bucket: u32[]* = this.inst_by_base.get_or_insert(base.id, []);
-        (*bucket).push(pos);
         this.instantiated_cache.insert(key, ref);
         return ref;
-    }
-
-    /// After the monomorphizer finalizes a specialization, every other
-    /// InstantiatedType in the arena that shares the same (generic_base,
-    /// type_args) should point at the same concrete resolved type so that
-    /// codegen walks `resolved_type` into a real struct/enum/class instead of
-    /// bottoming out on an unresolved placeholder.
-    ///
-    /// `create_instantiation` DOES dedupe by (base, arg TypeIDs) via
-    /// `instantiated_cache` (keyed on a content string, hashed by value - so
-    /// equal keys hit).  But TypeID identity is not LOGICAL identity across the
-    /// pre-/post-mono boundary: the same logical `HashMap<string, u32>` can
-    /// carry distinct arg TypeIDs before vs after monomorphization, hashing to
-    /// different keys and landing in distinct arena slots.  Without
-    /// propagation, only the single InstantiatedType handed to the
-    /// monomorphizer via `request.generic_type` gets its resolved_type set;
-    /// the other logically-equal occurrences stay unresolved and break
-    /// `fallback 2` in codegen scope-call resolution.
-    propagate_instantiated_resolution(mut &this, base: TypeRef,
-                                       type_args: &TypeRef[],
-                                       resolved: TypeRef) -> i64 {
-        mut count: i64 = 0;
-        match (this.inst_by_base.get_ref(&base.id)) {
-            Option::Some(plist) => {
-                for (mut k: i64 = 0; k < (*plist).length; k++) {
-                    const pos: u32 = (*plist)[k];
-                    const t: Type* = this.types[pos as i64];
-                    if (t == null) { continue; }
-                    if (t.kind != TypeKind::InstantiatedType) { continue; }
-                    const inst: InstantiatedType* = t as InstantiatedType*;
-                    if (inst.has_resolved_type()) { continue; }
-                    if (inst.generic_base.id != base.id) { continue; }
-                    if (inst.type_args.length != type_args.length) { continue; }
-                    mut matches: boolean = true;
-                    for (mut j: i64 = 0; j < type_args.length; j++) {
-                        if (inst.type_args[j].id != type_args[j].id) {
-                            matches = false;
-                            break;
-                        }
-                    }
-                    if (matches) {
-                        inst.set_resolved_type(resolved);
-                        count += 1;
-                    }
-                }
-            }
-            Option::None => { }
-        }
-        return count;
     }
 
     /// The canonical identity of a type argument: an `InstantiatedType` that
@@ -1089,94 +1026,6 @@ type struct TypeArena {
 
         // Primitives, user-defined types (Struct, Class, Enum, Trait)
         return ty.display_name();
-    }
-
-    /// Allocation-free equivalent of `format_display(a) == format_display(b)`:
-    /// returns true iff the two types render to the same display string - 
-    /// compared structurally (kind + recursive sub-types + leaf display names)
-    /// without building ANY String.  The codegen vtable-slot hot path
-    /// (`CodegenUtil::param_types_equal_structural`) calls this on every call
-    /// expression; formatting both types to Strings there would churn ~470 MB
-    /// of transient display Strings across a self-host build (the single
-    /// biggest heap consumer, per a massif profile).  This mirrors the same
-    /// `match` shape as `format_display` so the equality stays identical, but
-    /// every leaf is a stored interned name (no allocation).
-    display_equal(&this, a_id: u64, b_id: u64) -> boolean {
-        if (a_id == b_id) { return true; }
-        const ta: Type* = this.lookup(a_id);
-        const tb: Type* = this.lookup(b_id);
-        if (ta == null || tb == null) { return false; }
-        if (ta.kind != tb.kind) { return false; }
-
-        match (ta.kind) {
-            TypeKind::Pointer => {
-                const pa: PointerType* = ta as PointerType*;
-                const pb: PointerType* = tb as PointerType*;
-                return this.display_equal(pa.pointee.id, pb.pointee.id);
-            }
-            TypeKind::Reference => {
-                const ra: ReferenceType* = ta as ReferenceType*;
-                const rb: ReferenceType* = tb as ReferenceType*;
-                if (ra.is_mutable() != rb.is_mutable()) { return false; }
-                return this.display_equal(ra.referent.id, rb.referent.id);
-            }
-            TypeKind::Array => {
-                const aa: ArrayType* = ta as ArrayType*;
-                const ab: ArrayType* = tb as ArrayType*;
-                if (aa.is_dynamic() != ab.is_dynamic()) { return false; }
-                if (!aa.is_dynamic() && aa.size != ab.size) { return false; }
-                return this.display_equal(aa.element.id, ab.element.id);
-            }
-            TypeKind::Optional => {
-                const oa: OptionalType* = ta as OptionalType*;
-                const ob: OptionalType* = tb as OptionalType*;
-                return this.display_equal(oa.wrapped.id, ob.wrapped.id);
-            }
-            TypeKind::Function => {
-                const fa: FunctionType* = ta as FunctionType*;
-                const fb: FunctionType* = tb as FunctionType*;
-                if (fa.is_variadic != fb.is_variadic) { return false; }
-                if (fa.param_types.length != fb.param_types.length) { return false; }
-                for (mut i: i64 = 0; i < fa.param_types.length; i++) {
-                    if (!this.display_equal(fa.param_types[i].id, fb.param_types[i].id)) { return false; }
-                }
-                return this.display_equal(fa.return_type.id, fb.return_type.id);
-            }
-            TypeKind::Tuple => {
-                const tua: TupleType* = ta as TupleType*;
-                const tub: TupleType* = tb as TupleType*;
-                if (tua.elements.length != tub.elements.length) { return false; }
-                for (mut i: i64 = 0; i < tua.elements.length; i++) {
-                    if (!this.display_equal(tua.elements[i].id, tub.elements[i].id)) { return false; }
-                }
-                return true;
-            }
-            TypeKind::InstantiatedType => {
-                const ia: InstantiatedType* = ta as InstantiatedType*;
-                const ib: InstantiatedType* = tb as InstantiatedType*;
-                if (ia.type_args.length != ib.type_args.length) { return false; }
-                if (!this.display_equal(ia.generic_base.id, ib.generic_base.id)) { return false; }
-                for (mut i: i64 = 0; i < ia.type_args.length; i++) {
-                    if (!this.display_equal(ia.type_args[i].id, ib.type_args[i].id)) { return false; }
-                }
-                return true;
-            }
-            TypeKind::GenericParam => {
-                const ga: GenericParamType* = ta as GenericParamType*;
-                const gb: GenericParamType* = tb as GenericParamType*;
-                return ga.param_name.equals(gb.param_name);
-            }
-            TypeKind::BoundedParam => {
-                const ba: BoundedParamType* = ta as BoundedParamType*;
-                const bb: BoundedParamType* = tb as BoundedParamType*;
-                return ba.param_name.equals(bb.param_name);
-            }
-            _ => { }
-        }
-
-        // Primitives + user-defined (Struct/Class/Enum/Trait): the leaf display
-        // name is a stored interned string, so this compare allocates nothing.
-        return ta.display_name().eq(tb.display_name());
     }
 
     /// Same as `resolve_display_name` but strips namespace prefixes
