@@ -287,6 +287,47 @@ type struct TypeUtils {
         return null;
     }
 
+    /// View a MONOMORPHIZED concrete aggregate as its generic instantiation.
+    ///
+    /// Under single-id generic identity, the monomorphizer flips a `Pair<i32>`
+    /// wrapper slot IN PLACE into the concrete Struct/Class/Enum (so
+    /// `wrapper.id == concrete.id`) and relocates the original InstantiatedType
+    /// node to an origin-carrier reachable via `find_inst_wrapping`.  Post-mono a
+    /// receiver spelled `Pair<i32>` is therefore a concrete Struct, not an
+    /// InstantiatedType, so `peel_to_instantiation` returns null for it.  This
+    /// helper bridges that: it returns the origin carrier (an InstantiatedType
+    /// carrying `generic_base` + `type_args`) so generic reasoning that keys off
+    /// the base template + args works identically for pre-mono wrappers and
+    /// post-mono concretes.  Returns null for a non-generic type or a still-live
+    /// wrapper (use `peel_to_instantiation` for the latter).
+    concrete_instantiation_view(&this, ty: TypeRef) -> InstantiatedType* {
+        if (!ty.is_valid()) { return null; }
+        const t: Type* = this.arena.lookup(ty.id);
+        if (t == null) { return null; }
+        if (t.kind == TypeKind::Reference) {
+            return this.concrete_instantiation_view((t as ReferenceType*).referent);
+        }
+        if (t.kind == TypeKind::Pointer) {
+            return this.concrete_instantiation_view((t as PointerType*).pointee);
+        }
+        const carrier: TypeRef = TypeArena::find_inst_wrapping(this.arena, ty);
+        if (!carrier.is_valid()) { return null; }
+        const ct: Type* = this.arena.lookup(carrier.id);
+        if (ct == null || ct.kind != TypeKind::InstantiatedType) { return null; }
+        return ct as InstantiatedType*;
+    }
+
+    /// The generic-instantiation view of a receiver whether it is still a pre-mono
+    /// InstantiatedType wrapper OR a post-mono concrete aggregate: tries
+    /// `peel_to_instantiation` first, then `concrete_instantiation_view`.  Use at
+    /// sites that need a generic receiver's `(generic_base, type_args)` regardless
+    /// of monomorphization state (e.g. method-generic call resolution).
+    instantiation_view(&this, ty: TypeRef) -> InstantiatedType* {
+        const w: InstantiatedType* = this.peel_to_instantiation(ty);
+        if (w != null) { return w; }
+        return this.concrete_instantiation_view(ty);
+    }
+
     /// Peel Pointer / Reference / resolved-InstantiatedType wrappers (bounded
     /// depth) to the underlying base `Type*`, or null if an instantiation is
     /// still unresolved.

@@ -163,7 +163,15 @@ type struct TypeResolver {
                 if (n.pre_resolved.is_valid()) {
                     return n.pre_resolved;
                 }
-                this.resolve_named(n.name, ctx)
+                // Canonicalize a BARE all-default generic name to its default
+                // instantiation (`String` -> `String<GlobalAlloc>`) so a bare
+                // reference shares ONE TypeID with the explicit form - the single
+                // authority for default-arg identity (no-op for non-templates,
+                // partially-defaulted templates, and generic-parameter bindings).
+                // The base of an explicit `String<...>` is resolved directly in
+                // resolve_generic and deliberately bypasses this, so it is NOT
+                // canonicalized here (which would nest as `String<GlobalAlloc><...>`).
+                this.canonicalize_default_generic_type(this.resolve_named(n.name, ctx))
             }
             TypeAnnotation::Pointer(p) => {
                 mut inner: TypeRef = this.resolve(p.inner, ctx);
@@ -1232,7 +1240,15 @@ private:
     /// Requires GenericRegistry (no silent fallback). If the registry is
     /// missing, the compiler has a pipeline ordering bug and must abort.
     resolve_generic(&this, g: GenericAnnotation*, ctx: ResolutionContext*) -> TypeRef {
-        mut base: TypeRef = this.resolve(g.base, ctx);
+        // Resolve the base template WITHOUT default-canonicalization: an explicit
+        // `String<...>` must instantiate the String TEMPLATE, not the canonical
+        // `String<GlobalAlloc>` (which would nest as `String<GlobalAlloc><...>`).
+        // A bare Named base goes straight through resolve_named, bypassing the
+        // canonicalization the `resolve()` Named arm applies to bare uses.
+        mut base: TypeRef = match (*g.base) {
+            TypeAnnotation::Named(bn) => { this.resolve_named(bn.name, ctx) }
+            _                         => { this.resolve(g.base, ctx) }
+        };
 
         // Bail early if the base type itself couldn't be resolved.
         if (!base.is_valid()) {

@@ -323,11 +323,16 @@ type struct MethodBinding {
         }
         if (owner_t == null) { return fallback; }
 
+        // The owner may be a pre-mono InstantiatedType wrapper OR a post-mono
+        // concrete aggregate (single-id identity flips the slot in place).  Recover
+        // its instantiation view either way so the base TEMPLATE's method AST is
+        // found - keying off a concrete's own spec name ("NonNull_u8") finds no
+        // template and leaks a sibling spec's return.
+        const owner_inst: InstantiatedType* = this.types.instantiation_view(owner_ref);
         mut owner_ast: ASTNode* = null;
-        if (owner_t.kind == TypeKind::InstantiatedType) {
-            const inst: InstantiatedType* = owner_t as InstantiatedType*;
+        if (owner_inst != null) {
             const tmpl: TemplateEntry* =
-                this.ctx.generic_registry.get_template_by_type_id(inst.generic_base.id);
+                this.ctx.generic_registry.get_template_by_type_id(owner_inst.generic_base.id);
             if (tmpl != null) { owner_ast = tmpl.ast_node; }
         }
         if (owner_ast == null) {
@@ -414,17 +419,16 @@ type struct MethodBinding {
         if (ret_ann == null) { return fallback; }
 
         mut res_ctx: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
-        if (owner_t.kind == TypeKind::InstantiatedType) {
-            const inst: InstantiatedType* = owner_t as InstantiatedType*;
-            const n: i64 = if (owner_params.length < inst.type_args.length) {
+        if (owner_inst != null) {
+            const n: i64 = if (owner_params.length < owner_inst.type_args.length) {
                 owner_params.length
             } else {
-                inst.type_args.length
+                owner_inst.type_args.length
             };
             for (mut i: i64 = 0; i < n; i++) {
                 const gp: GenericParamNode* = owner_params[i];
                 if (gp == null) { continue; }
-                res_ctx.add_binding(gp.name, inst.type_args[i]);
+                res_ctx.add_binding(gp.name, owner_inst.type_args[i]);
             }
         }
         for (mut i: i64 = 0; i < found.func.generic_params.length; i++) {
@@ -710,7 +714,12 @@ type struct MethodBinding {
             du += 1;
         }
 
-        const inst: InstantiatedType* = this.types.peel_to_instantiation(recv_type);
+        // A generic receiver may be a pre-mono InstantiatedType wrapper OR a
+        // post-mono concrete aggregate (single-id identity flips the slot in
+        // place).  Recover its (base, args) either way, so method-generic
+        // resolution keys off the base template - not the concrete's own id, which
+        // has no template and would drop the call onto the shared symbolic return.
+        const inst: InstantiatedType* = this.types.instantiation_view(recv_type);
         if (inst != null) {
             for (mut i: i64 = 0; i < inst.type_args.length; i++) {
                 if (this.types.contains_generic_param(inst.type_args[i])) { return owner_ctx; }

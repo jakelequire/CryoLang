@@ -471,27 +471,60 @@ type struct Monomorphizer {
         const kept_impl_asts: ASTNode*[] = this.trait_spec.filter_bounds_violating_impls(
             result.impl_asts, &subst);
 
-        const concrete_type: TypeRef = this.create_concrete_type(entry, qualified_spec_sym, &subst);
-
-        // Register the bare spec name as an alias so resolve_body_locals() can find
-        // the type (the substituter rewrites annotations to bare names).
-        if (concrete_type.is_valid() && !spec_name_sym.equals(qualified_spec_sym)) {
-            this.arena.add_name_alias(spec_name_sym, concrete_type);
+        // Determine the concrete aggregate kind for this template.  Function
+        // templates (`is_named == false`) produce no arena type.
+        mut target_kind: TypeKind = TypeKind::Struct;
+        mut is_named: boolean = true;
+        mut is_union_kind: boolean = false;
+        match (entry.node_kind) {
+            NodeKind::StructDeclaration   => { target_kind = TypeKind::Struct; }
+            NodeKind::UnionDeclaration    => { target_kind = TypeKind::Struct; is_union_kind = true; }
+            NodeKind::EnumDeclaration     => { target_kind = TypeKind::Enum; }
+            NodeKind::ClassDeclaration    => { target_kind = TypeKind::Class; }
+            NodeKind::FunctionDeclaration => { is_named = false; }
+            _                             => { target_kind = TypeKind::Struct; }
         }
 
-        // Set human-readable display name (e.g., "Pair<i32, string>") on the type.
-        if (concrete_type.is_valid()) {
+        // Human-readable display name ("Pair<i32, string>"), computed from the
+        // still-unresolved InstantiatedType wrapper (valid whether or not we take
+        // the swap path below).
+        mut display_name: string = "";
+        if (request.generic_type.is_valid()) {
             const inst_for_name: Type* = this.arena.lookup(request.generic_type.id);
-            if (inst_for_name != null) {
-                const display: string = this.arena.format_display(inst_for_name);
-                const concrete_t: Type* = this.arena.lookup(concrete_type.id);
-                if (concrete_t != null) {
-                    if (concrete_t.kind == TypeKind::Struct) {
-                        (concrete_t as StructType*).set_display_name(display);
-                    } else if (concrete_t.kind == TypeKind::Enum) {
-                        (concrete_t as EnumType*).set_display_name(display);
-                    } else if (concrete_t.kind == TypeKind::Class) {
-                        (concrete_t as ClassType*).set_display_name(display);
+            if (inst_for_name != null) { display_name = this.arena.format_display(inst_for_name); }
+        }
+
+        // SWAP-RELOCATE identity path: a named generic whose request carries a
+        // valid, still-unresolved InstantiatedType wrapper reuses THAT wrapper's
+        // arena id for the concrete, so `wrapper.id == concrete.id` (one id per
+        // semantic type).  Reserve the spec names against the wrapper NOW - a spec
+        // body can reference itself by its bare/qualified spec name, and that must
+        // resolve to the concrete's eventual id during resolve_specialized_ast.
+        // The slot is flipped from wrapper to concrete at populate time (below).
+        // Function templates and the (rare) missing-wrapper case fall back to
+        // allocating a fresh concrete via create_concrete_type.
+        mut concrete_type: TypeRef = TypeRef::invalid();
+        mut swap_path: boolean = false;
+        if (is_named) {
+            const w_t: Type* = this.arena.lookup(request.generic_type.id);
+            if (request.generic_type.is_valid() && w_t != null
+                    && w_t.kind == TypeKind::InstantiatedType) {
+                concrete_type = request.generic_type;
+                swap_path = true;
+                this.arena.reserve_spec_names(concrete_type, qualified_spec_sym, spec_name_sym, target_kind);
+            } else {
+                concrete_type = this.create_concrete_type(entry, qualified_spec_sym, &subst);
+                // Register the bare spec name as an alias so resolve_body_locals()
+                // can find the type (the substituter rewrites to bare names).
+                if (concrete_type.is_valid() && !spec_name_sym.equals(qualified_spec_sym)) {
+                    this.arena.add_name_alias(spec_name_sym, concrete_type);
+                }
+                if (concrete_type.is_valid() && display_name.length() > 0) {
+                    const ct: Type* = this.arena.lookup(concrete_type.id);
+                    if (ct != null) {
+                        if (ct.kind == TypeKind::Struct)     { (ct as StructType*).set_display_name(display_name); }
+                        else if (ct.kind == TypeKind::Enum)  { (ct as EnumType*).set_display_name(display_name); }
+                        else if (ct.kind == TypeKind::Class) { (ct as ClassType*).set_display_name(display_name); }
                     }
                 }
             }
@@ -581,16 +614,26 @@ type struct Monomorphizer {
             this.call_specializer.specialize_calls_in_spec_decl(walk_impls[ri], &subst);
         }
 
-        // Populate the concrete type and set resolved_type on the InstantiatedType.
+        // Populate the concrete type.  On the swap path, flip the wrapper slot to
+        // the concrete IN PLACE first (one id per semantic type); the wrapper node
+        // is relocated to a carrier so `find_inst_wrapping` still recovers base +
+        // type_args.  On the fallback path, bridge the wrapper to the freshly
+        // allocated concrete via `resolved_type` (the pre-A2a mechanism).
         if (concrete_type.is_valid()) {
+            if (swap_path) {
+                this.arena.swap_wrapper_to_concrete(concrete_type, qualified_spec_sym,
+                    entry.module_name, target_kind, is_union_kind, display_name);
+            }
             this.type_populator.populate_concrete_type(concrete_type, result.specialized_ast, entry.node_kind, &subst, entry);
 
-            const inst_t: Type* = this.arena.lookup(request.generic_type.id);
-            if (inst_t != null) {
-                (inst_t as InstantiatedType*).set_resolved_type(concrete_type);
-                // Record the concrete's intrinsic generic-instantiation identity:
-                // the wrapper it was built from (`find_inst_wrapping` reads this).
-                this.arena.set_type_origin_wrapper(concrete_type, request.generic_type);
+            if (!swap_path) {
+                const inst_t: Type* = this.arena.lookup(request.generic_type.id);
+                if (inst_t != null && inst_t.kind == TypeKind::InstantiatedType) {
+                    (inst_t as InstantiatedType*).set_resolved_type(concrete_type);
+                    // Record the concrete's intrinsic generic-instantiation identity:
+                    // the wrapper it was built from (`find_inst_wrapping` reads this).
+                    this.arena.set_type_origin_wrapper(concrete_type, request.generic_type);
+                }
             }
         } else if (entry.node_kind == NodeKind::FunctionDeclaration) {
             // Function templates don't create named arena types, but still get a
