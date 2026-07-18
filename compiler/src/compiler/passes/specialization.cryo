@@ -451,7 +451,17 @@ type struct SpecializationPasses {
             return SymbolStr::empty();
         }
         const arena: TypeArena* = ctx.type_arena;
-        const it: Type* = arena.lookup(entry.instantiated_type.id);
+        // Single-id identity: this id holds the CONCRETE type after the swap, so a
+        // bare kind test is always false and this would return empty for every
+        // spec - collapsing spec placement onto the template's defining module and
+        // undoing the type-arg-owner placement this function exists to provide.
+        // Recover the (base, type_args) from the relocated origin carrier.
+        mut it: Type* = arena.lookup(entry.instantiated_type.id);
+        if (it != null && it.kind != TypeKind::InstantiatedType) {
+            const carrier: TypeRef =
+                TypeArena::find_inst_wrapping(arena, entry.instantiated_type);
+            if (carrier.is_valid()) { it = arena.lookup(carrier.id); }
+        }
         if (it == null || it.kind != TypeKind::InstantiatedType) {
             return SymbolStr::empty();
         }
@@ -702,7 +712,18 @@ type struct SpecializationPasses {
                 // The element type is always type_args[0]; subsequent args
                 // (e.g. the allocator in stdlib-next's `Array<T, A = GlobalAlloc>`)
                 // are part of the Array spec but not part of the element key.
-                const inst_t: Type* = arena.lookup(entry.instantiated_type.id);
+                // `entry.instantiated_type` is the WRAPPER's ref.  Under single-id
+                // identity the swap installs the concrete at that very id, so the
+                // slot is a Struct here, not an InstantiatedType - the (base,
+                // type_args) now live on the relocated origin carrier.  Recover it,
+                // or the Array element->spec-name mapping below is never registered
+                // and codegen cannot find methods on a dynamic `T[]` receiver.
+                mut inst_t: Type* = arena.lookup(entry.instantiated_type.id);
+                if (inst_t != null && inst_t.kind != TypeKind::InstantiatedType) {
+                    const carrier: TypeRef =
+                        TypeArena::find_inst_wrapping(arena, entry.instantiated_type);
+                    if (carrier.is_valid()) { inst_t = arena.lookup(carrier.id); }
+                }
                 if (inst_t != null && inst_t.kind == TypeKind::InstantiatedType) {
                     const inst: InstantiatedType* = inst_t as InstantiatedType*;
                     if (inst.type_args.length >= 1) {

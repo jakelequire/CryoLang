@@ -692,13 +692,37 @@ type struct OwnershipQuery {
     /// allocation-order-dependent false negative that silently drops a real
     /// `Drop`.  The qualified name is canonical per nominal type, so the
     /// registration side (type_resolution R1) and every lookup side agree.
+    /// The `InstantiatedType` view of `ty` whether it is still a pre-mono WRAPPER
+    /// or a post-mono CONCRETE sitting at that wrapper's own id (single-id
+    /// identity): the wrapper answers directly, the concrete answers through its
+    /// relocated origin carrier.
+    ///
+    /// Every ownership lookup below keys on the TEMPLATE - `(Drop, Box)`, never
+    /// `(Drop, Box_i32)` - because registration happens pre-mono against the
+    /// template name.  A bare `kind == InstantiatedType` test is therefore not
+    /// enough: after monomorphization it is false, the derivation falls through to
+    /// the SPEC's name, every registry probe misses, and a real `Drop` impl is
+    /// silently lost (the instantiation is then classified `Copy` and loses its
+    /// drop glue - a leak, with no diagnostic).
+    static inst_view(arena: TypeArena*, ty: TypeRef) -> InstantiatedType* {
+        if (arena == null || !ty.is_valid()) { return null; }
+        const t: Type* = arena.lookup(ty.id);
+        if (t == null) { return null; }
+        if (t.kind == TypeKind::InstantiatedType) { return t as InstantiatedType*; }
+        const carrier: TypeRef = TypeArena::find_inst_wrapping(arena, ty);
+        if (!carrier.is_valid()) { return null; }
+        const ct: Type* = arena.lookup(carrier.id);
+        if (ct == null || ct.kind != TypeKind::InstantiatedType) { return null; }
+        return ct as InstantiatedType*;
+    }
+
     static named_qualified_id(arena: TypeArena*, intern: InternTable*,
                               ty: TypeRef) -> u64 {
         if (arena == null || intern == null || !ty.is_valid()) { return 0; }
         const t: Type* = arena.lookup(ty.id);
         if (t == null) { return 0; }
-        if (t.kind == TypeKind::InstantiatedType) {
-            const inst: InstantiatedType* = t as InstantiatedType*;
+        const inst: InstantiatedType* = OwnershipQuery::inst_view(arena, ty);
+        if (inst != null) {
             return OwnershipQuery::named_qualified_id(arena, intern,
                                                        inst.generic_base);
         }
@@ -810,11 +834,12 @@ type struct OwnershipQuery {
         const drop_sym: SymbolStr = intern.intern("drop");
         if (!drop_sym.is_valid()) { return false; }
 
-        // For an InstantiatedType, route to the template's AST.
+        // For an instantiation - pre-mono wrapper OR post-mono concrete - route to
+        // the template's AST; `registry.get_template` is keyed on the template name.
         const t: Type* = arena.lookup(ty.id);
         if (t == null) { return false; }
-        if (t.kind == TypeKind::InstantiatedType) {
-            const inst: InstantiatedType* = t as InstantiatedType*;
+        const inst: InstantiatedType* = OwnershipQuery::inst_view(arena, ty);
+        if (inst != null) {
             return OwnershipQuery::has_inherent_drop(arena, registry, intern,
                                                       inst.generic_base);
         }
@@ -930,9 +955,10 @@ type struct OwnershipQuery {
         }
         // Walk through the template-base of an instantiation rather
         // than the resolved spec; `(Drop, Box)` is the registry key,
-        // not `(Drop, Box_i32)`.
-        if (k == TypeKind::InstantiatedType) {
-            const inst: InstantiatedType* = t as InstantiatedType*;
+        // not `(Drop, Box_i32)`.  Via `inst_view` so this holds for a
+        // post-mono concrete too, not just a pre-mono wrapper.
+        const inst: InstantiatedType* = OwnershipQuery::inst_view(arena, ty);
+        if (inst != null) {
             return OwnershipQuery::registry_name_of(arena, intern,
                                                      inst.generic_base);
         }
@@ -1044,8 +1070,14 @@ type struct OwnershipQuery {
             return OwnershipQuery::type_method_consumes(arena, registry, intern,
                                                         pt.pointee, method_name);
         }
-        if (t.kind == TypeKind::InstantiatedType) {
-            const inst: InstantiatedType* = t as InstantiatedType*;
+        // Via `inst_view` so a POST-MONO concrete resolves to its template too:
+        // `registry.get_template` / `lookup_inherent_owner` below are keyed on the
+        // template name, so a monomorphized `Option<String>` that answered `Enum`
+        // here used to miss and return false - reporting that `![sink] unwrap`
+        // does NOT consume its receiver.  `drop_insertion` then emits drop glue
+        // for a receiver whose payload was already moved out: a double free.
+        const inst: InstantiatedType* = OwnershipQuery::inst_view(arena, recv_ty);
+        if (inst != null) {
             return OwnershipQuery::type_method_consumes(arena, registry, intern,
                                                         inst.generic_base, method_name);
         }

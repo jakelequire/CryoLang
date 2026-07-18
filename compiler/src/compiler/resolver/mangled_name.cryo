@@ -749,6 +749,32 @@ type struct MangleContext {
          || ty.kind == TypeKind::Trait
          || ty.kind == TypeKind::TypeAlias
          || ty.kind == TypeKind::FunctionTemplate) {
+            // SINGLE-ID IDENTITY: a monomorphized generic now lives at its former
+            // wrapper's id AS a concrete Struct/Class/Enum carrying the mangled
+            // SPEC name, so it lands here - while any path still holding an
+            // InstantiatedType node lands on the `encode_instantiated` branch
+            // below.  One logical type, two symbols: the definition is emitted
+            // under the spec-named form while call sites reference the base+args
+            // form (or vice versa), and the link fails with undefined references.
+            //
+            // Normalize onto the base+args form, which is what the pinned
+            // pre-swap compiler emits for every generic instantiation.  Encoding
+            // toward the spec-named form instead would change every generic
+            // symbol in the program relative to the pin, breaking selfhost
+            // byte-identity and forcing a two-phase repin.
+            if (ty.kind == TypeKind::Struct
+             || ty.kind == TypeKind::Class
+             || ty.kind == TypeKind::Enum) {
+                const self_ref: TypeRef = TypeRef::new(ty.id, this.arena);
+                const carrier: TypeRef =
+                    TypeArena::find_inst_wrapping(this.arena, self_ref);
+                if (carrier.is_valid()) {
+                    const ct: Type* = this.arena.lookup(carrier.id);
+                    if (ct != null && ct.kind == TypeKind::InstantiatedType) {
+                        return this.encode_instantiated(ct as InstantiatedType*);
+                    }
+                }
+            }
             const inner_n: string = MangleContext::encode_named_type_path(this.table, ty);
             mut buf_n: string = "N$L";
             buf_n += inner_n;
