@@ -1581,15 +1581,32 @@ type struct MonoCallSpecializer {
         if (ot != null && ot.kind == TypeKind::InstantiatedType) {
             inst = ot as InstantiatedType*;
         } else {
-            for (mut i: i64 = 0; i < this.state.spec_entries.length; i++) {
-                const e: SpecializationEntry* = &this.state.spec_entries[i];
-                if (!e.specialized_type.is_valid() || !e.instantiated_type.is_valid()) { continue; }
-                if (e.specialized_type.id == owner_type.id
-                        || e.specialized_type.id == owner_type.id) {
-                    const it: Type* = this.arena.lookup(e.instantiated_type.id);
-                    if (it != null && it.kind == TypeKind::InstantiatedType) {
-                        inst = it as InstantiatedType*;
-                        break;
+            // Post-mono concrete owner: single-id identity flipped the receiver's
+            // slot from the InstantiatedType wrapper to the concrete Struct/Enum/
+            // Class and relocated the wrapper to an origin carrier.  Recover the
+            // carrier (it still holds generic_base + type_args) so the owner's
+            // params (`T` in `Option<T>::map<U>`) bind to the concrete args - else
+            // the body's owner-typed constructions (`Option<T>::Some(..)`,
+            // `NonNull<T> { .. }`) stay abstract and codegen ICEs (E0600/E0638).
+            const carrier: TypeRef = TypeArena::find_inst_wrapping(this.arena, owner_type);
+            if (carrier.is_valid()) {
+                const ct: Type* = this.arena.lookup(carrier.id);
+                if (ct != null && ct.kind == TypeKind::InstantiatedType) {
+                    inst = ct as InstantiatedType*;
+                }
+            }
+            // Legacy fallback (owner without an origin carrier): match the concrete
+            // against a materialized spec entry's InstantiatedType.
+            if (inst == null) {
+                for (mut i: i64 = 0; i < this.state.spec_entries.length; i++) {
+                    const e: SpecializationEntry* = &this.state.spec_entries[i];
+                    if (!e.specialized_type.is_valid() || !e.instantiated_type.is_valid()) { continue; }
+                    if (e.specialized_type.id == owner_type.id) {
+                        const it: Type* = this.arena.lookup(e.instantiated_type.id);
+                        if (it != null && it.kind == TypeKind::InstantiatedType) {
+                            inst = it as InstantiatedType*;
+                            break;
+                        }
                     }
                 }
             }

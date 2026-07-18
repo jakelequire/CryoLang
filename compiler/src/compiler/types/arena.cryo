@@ -704,6 +704,87 @@ type struct TypeArena {
         }
     }
 
+    /// Register the (future) concrete for a generic instantiation under its
+    /// specialized names, WHILE the slot at `wrapper_ref` is still the
+    /// `InstantiatedType` wrapper.  This is the early half of the swap-relocate
+    /// that gives a generic instantiation a SINGLE arena id: names must resolve
+    /// during `resolve_specialized_ast` (a spec body can reference itself by its
+    /// bare/qualified spec name), and they must resolve to the SAME id the
+    /// concrete will occupy after `swap_wrapper_to_concrete` flips the slot in
+    /// place - so a body's self-reference and its `this` share one id.  `kind` is
+    /// the concrete's eventual kind (Struct/Class/Enum); `is_union` selects the
+    /// struct cache with the union flag semantics (unions are Structs).
+    reserve_spec_names(mut &this, wrapper_ref: TypeRef, qualified_spec: SymbolStr,
+                       bare_spec: SymbolStr, kind: TypeKind) -> void {
+        if (kind == TypeKind::Enum) {
+            this.enum_cache.insert(qualified_spec.id, wrapper_ref);
+            if (!bare_spec.equals(qualified_spec)) { this.enum_cache.insert(bare_spec.id, wrapper_ref); }
+        } else if (kind == TypeKind::Class) {
+            this.class_cache.insert(qualified_spec.id, wrapper_ref);
+            if (!bare_spec.equals(qualified_spec)) { this.class_cache.insert(bare_spec.id, wrapper_ref); }
+        } else {
+            this.struct_cache.insert(qualified_spec.id, wrapper_ref);
+            if (!bare_spec.equals(qualified_spec)) { this.struct_cache.insert(bare_spec.id, wrapper_ref); }
+        }
+        this.register_leaf_name(qualified_spec);
+    }
+
+    /// The late half of swap-relocate: flip the `InstantiatedType` slot at
+    /// `wrapper_ref` into the concrete monomorphized aggregate IN PLACE, so the
+    /// instantiation keeps its original id (`wrapper.id == concrete.id`).  The old
+    /// wrapper node is RELOCATED to a fresh id and kept as a pure origin-carrier
+    /// (`concrete.origin_wrapper = carrier`, `carrier.resolved_type = concrete`)
+    /// so `find_inst_wrapping` still recovers the (base, type_args) it needs.  The
+    /// monomorphizer then populates the concrete's fields at the same id.
+    ///
+    /// Idempotent: if the slot is already concrete (a duplicate request) it is
+    /// returned unchanged.  Returns `wrapper_ref` (now denoting the concrete).
+    swap_wrapper_to_concrete(mut &this, wrapper_ref: TypeRef, qualified_spec: SymbolStr,
+                             module_name: SymbolStr, kind: TypeKind, is_union: boolean,
+                             display: string) -> TypeRef {
+        const w_id: u64 = wrapper_ref.id;
+        if (w_id == 0 || (w_id - 1) >= this.types.length) { return wrapper_ref; }
+        const index: u64 = w_id - 1;
+        mut old: Type* = this.types[index];
+        if (old == null || old.kind != TypeKind::InstantiatedType) {
+            return wrapper_ref;
+        }
+
+        // Relocate the wrapper node to a fresh id as an origin-carrier.
+        const carrier_id: u64 = this.next_id;
+        old.id = carrier_id;
+        this.next_id += 1;
+        this.types.push(old);
+        const carrier_ref: TypeRef = TypeRef::new(carrier_id, this);
+
+        // Build the concrete aggregate AT the wrapper's original id and install it
+        // in the wrapper's slot (no new id for the concrete).
+        mut concrete: Type* = null;
+        if (kind == TypeKind::Enum) {
+            mut et: EnumType* = new EnumType(w_id, qualified_spec, module_name, this.intern_table);
+            if (display.length() > 0) { et.set_display_name(display); }
+            et.set_origin_wrapper(carrier_ref);
+            concrete = et as Type*;
+        } else if (kind == TypeKind::Class) {
+            mut ct: ClassType* = new ClassType(w_id, qualified_spec, module_name, this.intern_table);
+            if (display.length() > 0) { ct.set_display_name(display); }
+            ct.set_origin_wrapper(carrier_ref);
+            concrete = ct as Type*;
+        } else {
+            mut st: StructType* = new StructType(w_id, qualified_spec, module_name, this.intern_table);
+            if (is_union) { st.set_union(true); }
+            if (display.length() > 0) { st.set_display_name(display); }
+            st.set_origin_wrapper(carrier_ref);
+            concrete = st as Type*;
+        }
+        this.types[index] = concrete;
+
+        // Back-link the carrier to the concrete so the InstantiatedType node still
+        // reports itself resolved (consumers that reach it via origin_wrapper).
+        (old as InstantiatedType*).set_resolved_type(wrapper_ref);
+        return wrapper_ref;
+    }
+
     /// Search all user-defined type caches by name.
     lookup_by_name(&this, name: SymbolStr) -> TypeRef {
 

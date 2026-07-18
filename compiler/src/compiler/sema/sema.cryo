@@ -2021,18 +2021,79 @@ public:
         return this.resolve_expr(desugared as ExpressionNode*);
     }
 
+    /// Resolve a struct/union/class literal's TYPE through the SAME canonical path
+    /// a type ANNOTATION uses - `instantiate_for_module`, exactly as `resolve()`
+    /// does for `x as Foo<Args>`.  ONE resolution authority: a `Foo<Args> {}`
+    /// literal denotes the same canonical TypeID as the annotation `Foo<Args>`, so
+    /// `return NonNull<U> {}` matches its declared `-> NonNull<U>` by identity - no
+    /// name-lookup that races spec registration.  Fires ONLY when every arg
+    /// resolves CONCRETE: an abstract arg (`Pair<T, V>` in a template body, or an
+    /// unresolved method generic) would materialize a `Foo<?>` instantiation that
+    /// GenericValidation flags (E0900), so those return invalid and the caller
+    /// keeps the demand-free name-based path.
+    resolve_struct_literal_type(mut &this, lit: StructLiteralNode*) -> TypeRef {
+        if (this.ctx.type_resolver == null || this.ctx.generic_registry == null
+                || lit.generic_args.length == 0) {
+            return TypeRef::invalid();
+        }
+        const base_ref: TypeRef = this.types.lookup_type_by_sym(lit.struct_type);
+        if (!base_ref.is_valid()) { return TypeRef::invalid(); }
+        if (this.ctx.generic_registry.get_template_by_type_id(base_ref.id) == null) {
+            return TypeRef::invalid();
+        }
+        mut rc: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
+        mut arg_refs: TypeRef[] = [];
+        for (mut i: i64 = 0; i < lit.generic_args.length; i++) {
+            const a: TypeRef = this.ctx.type_resolver.resolve(lit.generic_args[i], &rc);
+            if (!a.is_valid() || this.arena.contains_generic_param(a)) {
+                return TypeRef::invalid();
+            }
+            arg_refs.push(a);
+        }
+        // Demand-FREE: return the canonical arena slot for (base, concrete args) -
+        // the SAME slot the annotation `Foo<Args>` minted and demanded.  The
+        // literal only REFERENCES the type; its monomorphization demand comes from
+        // the declared type it flows into.  Adding a fresh demand here
+        // (instantiate_for_module) perturbs the mono worklist and can strand a
+        // sibling method spec's owner binding (an Option::Some payload lost its
+        // instantiation).  create_instantiation dedups by (base, arg ids), so this
+        // is the concrete post-swap slot on a cache hit.
+        return this.arena.create_instantiation(base_ref, &arg_refs);
+    }
+
     resolve_struct_literal(mut &this, lit: StructLiteralNode*) -> TypeRef {
         this.member.check_type_name_visibility(lit.struct_type, (lit as ASTNode*).span);
         mut struct_ref: TypeRef = TypeRef::invalid();
+        // Name-based lookup FIRST: for a literal whose spec is already registered
+        // (the common case) this is a pure lookup with no side effects.
         if (lit.generic_args.length > 0 && this.ctx.type_resolver != null) {
             const spec_sym: SymbolStr = this.calls.resolve_generic_scope_name(lit.struct_type, lit.generic_args);
             if (spec_sym.is_valid()) { struct_ref = this.types.lookup_type_by_sym(spec_sym); }
+        }
+        // Only when the name lookup found nothing (the spec isn't registered yet -
+        // e.g. a method-generic literal `NonNull<U>` in a spec body whose
+        // `NonNull<ChanNode<i32>>` races registration) fall to the canonical
+        // resolution path, so the literal denotes the same TypeID as its
+        // annotation.  Confining it to this case keeps its arg-resolution off the
+        // hot path where it would perturb sibling monomorphization.
+        if (!struct_ref.is_valid() && lit.generic_args.length > 0) {
+            struct_ref = this.resolve_struct_literal_type(lit);
         }
         if (!struct_ref.is_valid()) { struct_ref = this.types.lookup_type_by_sym(lit.struct_type); }
         mut struct_t: Type* = if (struct_ref.is_valid()) { this.arena.lookup(struct_ref.id) } else { null };
         if (struct_t != null && struct_t.kind == TypeKind::InstantiatedType) {
             const inst: InstantiatedType* = struct_t as InstantiatedType*;
             if (inst.has_resolved_type()) { struct_t = this.arena.lookup(inst.resolved_type.id); }
+        }
+
+        // The literal's TYPE is the canonical default instantiation for a bare
+        // all-default generic (`String { .. }` denotes `String<GlobalAlloc>`),
+        // matching how a bare `String` annotation resolves - so the literal shares
+        // ONE TypeID with its declared type.  `struct_ref`/`struct_t` stay raw
+        // below for the template's field lookup, visibility, and arity checks.
+        mut lit_type: TypeRef = struct_ref;
+        if (this.ctx.type_resolver != null) {
+            lit_type = this.ctx.type_resolver.canonicalize_default_generic_type(struct_ref);
         }
 
         const saved_expected: TypeRef = this.state.expected_type;
@@ -2088,7 +2149,7 @@ public:
                     if (lit.field_inits.length == 0) { "no field initialized" } else { "more than one field initialized" });
                 this.ctx.emit_diagnostic(udiag);
             }
-            return struct_ref;
+            return lit_type;
         }
 
         if (struct_t != null && (struct_t.kind == TypeKind::Struct || struct_t.kind == TypeKind::Class)) {
@@ -2125,7 +2186,7 @@ public:
                 }
             }
         }
-        return struct_ref;
+        return lit_type;
     }
 
     resolve_scope_resolution(mut &this, scope: ScopeResolutionNode*) -> TypeRef {
