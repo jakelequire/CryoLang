@@ -505,7 +505,7 @@ type struct Monomorphizer {
         // the missing-wrapper case is an internal error (see the else branch).
         // Function templates are not `is_named` and never reach here - they get a
         // FunctionType bridged via `resolved_type` at the end of this function,
-        // which is still a two-id representation (D1 §6.2, open).
+        // which stays a two-id representation (see the bridge below for why).
         mut concrete_type: TypeRef = TypeRef::invalid();
         mut swap_path: boolean = false;
         if (is_named) {
@@ -516,9 +516,9 @@ type struct Monomorphizer {
                 swap_path = true;
                 this.arena.reserve_spec_names(concrete_type, qualified_spec_sym, spec_name_sym, target_kind);
             } else {
-                // INVARIANT (D1, one id per semantic type): a named generic reaches
+                // INVARIANT (one id per semantic type): a named generic reaches
                 // here only via the swap path above, so `wrapper.id == concrete.id`.
-                // This branch is the pre-D1 two-id fallback and is believed
+                // This branch is the older two-id fallback and is believed
                 // unreachable - a probe over the compiler's own 232 modules, the
                 // stdlib, and the full test suite recorded ZERO fires.  It is kept
                 // (rather than deleted) so that a reachable case fails LOUDLY here
@@ -686,10 +686,10 @@ type struct Monomorphizer {
             // (No generic origin: a FunctionType is not an aggregate and carries
             // no intrinsic instantiation identity.)
             //
-            // D1 §2.4 RESOLVED — function specs are OUT OF SCOPE for single-id by
-            // construction, not merely un-migrated.  The aggregate swap
-            // (`swap_wrapper_to_concrete`) installs the concrete at the wrapper's
-            // id so `wrapper.id == concrete.id`.  That is impossible here, and the
+            // Function specs are out of scope for single-id identity BY
+            // CONSTRUCTION.  The aggregate swap (`swap_wrapper_to_concrete`)
+            // installs the concrete at the wrapper's id so
+            // `wrapper.id == concrete.id`.  That is impossible here, and the
             // reason is not a missing branch:
             //
             //   `get_function` interns a FunctionType on its SIGNATURE ALONE -
@@ -697,16 +697,16 @@ type struct Monomorphizer {
             //   function it came from is in the key.  So `identity<i32>` and
             //   `negate<i32>` - two distinct templates, two distinct wrappers, two
             //   distinct spec_entries - share ONE FunctionType id for `(i32)->i32`.
-            //   One id cannot be assigned to two wrappers, so id-unification is not
-            //   under-implemented, it is arithmetically unavailable.  Doing the swap
-            //   for whichever spec arrives first and not the other would be strictly
-            //   worse than this bridge.
+            //   One id cannot be assigned to two wrappers, so id-unification is
+            //   arithmetically unavailable here.  Doing the swap for whichever spec
+            //   arrives first and not the other would be strictly worse than this
+            //   bridge.
             //
             // The two ids are also not two names for one thing: the WRAPPER is the
             // INSTANTIATION identity (FunctionTemplate base + type args, uniquely
             // keyed), the FunctionType is the SIGNATURE identity (structurally
-            // keyed, deliberately SHARED across functions).  D1's invariant is that
-            // one semantic TYPE has one id - a function specialization is a code
+            // keyed, deliberately SHARED across functions).  The one-id-per-type
+            // invariant applies to TYPES - a function specialization is a code
             // artifact, not a type; its type is its signature, and that already has
             // canonical single-id identity through the interner.  `reserve_spec_names`
             // reinforces this: it writes only the struct/class/enum caches, so a
@@ -856,13 +856,11 @@ type struct Monomorphizer {
     /// Build a cache key from a request: the CANONICAL INSTANTIATION ID for
     /// (base, args).
     ///
-    /// This was the last of the three `base<a,b>` string-key producers (D1 §2.3);
-    /// the other two, in `GenericRegistry`, are already gone.  The string form was
-    /// never a *correctness* problem - it was built from arena ids, so string
-    /// equality was id equality - but it allocated and `format()`ed on every cache
-    /// probe in the worklist loop, and it was a second, parallel way to say
-    /// "these two instantiations are the same type".  The arena's structural
-    /// interner already answers that question with a single id, so ask it.
+    /// The arena's structural interner already decides whether two instantiations
+    /// are the same type, and answers with a single id - so ask it, rather than
+    /// keeping a parallel `base<a,b>` string key that has to agree.  The id form
+    /// also avoids a `format()` and an allocation on every probe of this cache,
+    /// which sits in the worklist loop.
     ///
     /// Uses `create_instantiation`, NOT the pure `find_instantiation` lookup, for
     /// the same reason `GenericRegistry::mark_monomorphized` does: a lookup that

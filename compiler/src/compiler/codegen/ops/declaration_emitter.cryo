@@ -686,7 +686,6 @@ type struct DeclarationEmitter {
     /// the base's layout with its own additions.
     collect_vtable_slots(mut &this, cls: ClassType*) -> VTableSlot[] {
         const arena: TypeArena* = this.get_arena();
-        const intern: InternTable* = this.get_intern();
 
         // Build chain = [cls, ..., root].
         mut chain: ClassType*[] = [];
@@ -709,16 +708,14 @@ type struct DeclarationEmitter {
                 if (!m.is_virtual) { continue; }
                 mut already: boolean = false;
                 for (mut ki: i64 = 0; ki < slots.length; ki++) {
-                    // Structural (display-name) equality, NOT raw-ID: this must
-                    // match how `find_vtable_slot_impl` / `vtable_slot_index`
-                    // look slots up. With raw-ID matching here, two virtual
-                    // declarations of the same overload whose param TypeRefs
-                    // resolved to different IDs (e.g. `Foo*` registered before
-                    // vs after the type finished resolving) produced two slots,
-                    // while the structural lookup then matched both to one
-                    // method - a duplicate slot / index skew.
+                    // Must use the SAME param equality as `find_vtable_slot_impl`
+                    // / `vtable_slot_index`, or slot construction and slot
+                    // lookup disagree: two virtual declarations of the same
+                    // overload counted as distinct here produce two slots, while
+                    // a laxer lookup then matches both to one method - a
+                    // duplicate slot / index skew.
                     if (slots[ki].name.equals(m.name) &&
-                        CodegenUtil::param_types_equal_structural(arena, intern,
+                        CodegenUtil::param_types_equal(
                             slots[ki].param_types, m.param_types)) {
                         already = true;
                         break;
@@ -755,16 +752,17 @@ type struct DeclarationEmitter {
             for (mut mi: i64 = 0; mi < walk.methods.length; mi++) {
                 const m: &MethodInfo = &walk.methods[mi];
                 if (!m.name.equals(slot_name)) { continue; }
-                // Use structural (display-name) equality on params instead of
-                // raw-ID matching: an override method's params can resolve to
-                // different TypeRef IDs than the virtual base's params even
-                // though they're semantically the same type (e.g. `ASTVisitor*`
+                // Param equality must agree with `collect_vtable_slots`, which
+                // built these slots.  It relies on canonical type identity: an
+                // override's params and the virtual base's params denote the
+                // same types and therefore share arena ids, even when the two
+                // declarations resolved at different points (e.g. `ASTVisitor*`
                 // registered before vs. after the visitor module finished
-                // resolving).  Strict ID matching here misses every override
-                // and the whole vtable bails (every `new <DerivedClass>` then
-                // skips the vtable store; runtime virtual dispatch crashes
-                // reading a null vtable pointer).
-                if (!CodegenUtil::param_types_equal_structural(arena, intern, m.param_types, slot_params)) { continue; }
+                // resolving).  If that ever stopped holding, this would miss
+                // every override and the whole vtable would bail (every
+                // `new <DerivedClass>` then skips the vtable store; runtime
+                // virtual dispatch crashes reading a null vtable pointer).
+                if (!CodegenUtil::param_types_equal(m.param_types, slot_params)) { continue; }
                 if (!m.is_virtual && !m.is_override) { continue; }
                 // Skip pure virtual declarations (virtual without body).
                 // Their LLVM function is a bare `declare` that links as an
@@ -835,21 +833,20 @@ type struct DeclarationEmitter {
     /// via `CallExprNode.resolved_method`; this function just maps that
     /// declaration to its slot position.
     ///
-    /// Uses *structural* param-type equality (display-name match) rather than
-    /// strict arena-ID match: an override method's parameter `Foo*` may be
-    /// registered under a different arena ID than the base method's `Foo*` if
-    /// the two declarations were resolved before/after `Foo`'s body was sealed,
-    /// even though they denote the same nominal pointer type.  Without this,
-    /// `node.accept(this)` on a base-class pointer falls back to a static call
-    /// to the base accept (which targets vtable slot 0, the no-op base
-    /// `visit(BaseNode*)`; silently dropping every visitor traversal).
+    /// Param-type matching goes through `param_types_equal` (canonical arena-id
+    /// compare), the same relation `collect_vtable_slots` used to build the
+    /// slots.  It matters that an override's parameter `Foo*` and the base
+    /// method's `Foo*` share one id even when the two declarations resolved
+    /// before/after `Foo`'s body was sealed - that is exactly what canonical
+    /// type identity provides.  Were they to diverge, `node.accept(this)` on a
+    /// base-class pointer would fall back to a static call to the base accept
+    /// (which targets vtable slot 0, the no-op base `visit(BaseNode*)`;
+    /// silently dropping every visitor traversal).
     vtable_slot_index(mut &this, cls: ClassType*, method_name: SymbolStr, param_types: TypeRef[]) -> i32 {
         const slots: VTableSlot[] = this.collect_vtable_slots(cls);
-        const arena: TypeArena* = this.get_arena();
-        const intern: InternTable* = this.get_intern();
         for (mut i: i32 = 0; i < slots.length as i32; i++) {
             if (slots[i].name.equals(method_name) &&
-                CodegenUtil::param_types_equal_structural(arena, intern,
+                CodegenUtil::param_types_equal(
                     slots[i].param_types, param_types)) {
                 return i;
             }

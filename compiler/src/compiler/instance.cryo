@@ -1787,6 +1787,35 @@ type struct CompilerInstance {
             ctx.type_arena.debug_dump();
         }
 
+        // Invariant guard (gated by CRYO_TYPE_AUDIT): canonical type identity.
+        // Off by default; zero cost when unset.
+        //
+        // Checks the property the whole interner exists to provide - for any two
+        // TypeRefs denoting the same semantic type, `a.id == b.id`.  Run HERE,
+        // after every stage that mints or mutates types in place
+        // (monomorphization's `swap_wrapper_to_concrete`, sema's resolution) and
+        // before codegen consumes those ids, so a fork is caught at its widest
+        // point rather than after it has already skewed a vtable or a mangle.
+        //
+        // A violation is an ICE rather than a warning: forked identity produces
+        // wrong output, not a diagnostic, so continuing past it just buries the
+        // symptom somewhere further downstream.
+        match (env::var(Str::new("CRYO_TYPE_AUDIT"))) {
+            Option::Some(_) => {
+                const forked: i64 = ctx.type_arena.verify_canonical_identity();
+                if (forked > 0) {
+                    ctx.diagnostics.emit(Diagnostic::error(
+                        ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                        format("canonical type identity violated: %d interned entr(ies) do not resolve to themselves by their own key (type identity has forked)",
+                            forked)));
+                    phase6_failed = true;
+                } else {
+                    fmt::eprintln("[type-audit] canonical type identity OK (0 violations)");
+                }
+            }
+            Option::None => { }
+        }
+
         // Build cross-module function descriptors from front-end data.
         // This populates ModuleGraph.cross_module_fns so codegen can create
         // extern declarations without re-scanning ASTs or type arenas.

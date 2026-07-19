@@ -229,7 +229,7 @@ These are the highest-leverage investments. Multiple reviewers independently
 named **D1** as the single change that would eliminate the majority of the
 hazard classes above.
 
-- [ ] **D1. Canonical type identity.** TypeArena is TyCtxt-shaped but without
+- [x] **D1. Canonical type identity.** TypeArena is TyCtxt-shaped but without
   the property that makes TyCtxt work: interning such that ID equality =
   semantic equality. Today ≥6 compensating mechanisms exist —
   `propagate_instantiated_resolution`, `canon_type_id`,
@@ -242,6 +242,35 @@ hazard classes above.
   string-keyed HashMap equality has been pointer-based
   (`arena.cryo:66-69` vs `:573` — contradictory comments).
   *Scope: likely coupled to the planned mono-after-sema reorder.*
+
+  **DONE.** A real hash-cons interner (`types/arena.cryo`) makes identity
+  exactly `(kind, aux0, aux1, operand ids)`, with `entry_matches` as the single
+  formal authority; each entry stores an IMMUTABLE copy of its key, so
+  in-place node mutation (`swap_wrapper_to_concrete`, `populate_concrete_type`)
+  can't fork identity. All six compensating mechanisms are deleted, every dedup
+  cache is integer-keyed, and `swap_wrapper_to_concrete` collapses an
+  instantiation into its concrete aggregate at the SAME arena id
+  (rustc's `Adt(AdtDef, SubstsRef)` shape).
+
+  Two corrections to the audit text above, both verified:
+  * "Three equality relations" was a miscount. What remains is one *identity*
+    relation (arena id), one *coercion/subtyping* relation
+    (`check_compatibility`, returning a lattice), and one *unification*
+    relation (`unify`). That is the same three-way split rustc draws
+    (`eq` / `sub`+coerce / `unify`) and is correct as-is.
+  * The function-template wrapper and its `FunctionType` are deliberately NOT
+    unified — they are `FnDef(DefId, Substs)` vs `FnPtr(FnSig)`, two different
+    semantic types bridged by a coercion. Sharing an id is arithmetically
+    unavailable, not unfinished work.
+
+  `ErrorType` is the one kind excluded from interning (it carries a per-failure
+  reason + span, and never reaches an identity comparison); documented at
+  `create_error` as deliberate.
+
+  Guarded by `verify_canonical_identity()`, wired to the `CRYO_TYPE_AUDIT` env
+  gate before codegen (off by default, ICE on violation). Observed reporting
+  **0 violations** across the full test suite; both failure and success paths
+  exercised. `make test` green, `make selfhost-check` green (2/2 fixed points).
 
 - [x] **D2. Single authority for enum/aggregate layout.** Layout computed in
   4 places (one divergent = Tier-0 bug #1). One `compute_enum_layout` used by
