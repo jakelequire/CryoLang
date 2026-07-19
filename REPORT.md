@@ -68,13 +68,13 @@ string-keyed monomorphization era).
   (`diag/sink.cryo:111-114` defers rendering until `flush()`). Every ICE is a
   silent exit-1.
 
-- [ ] **Array element compatibility falls back to TypeKind equality**
+- [x] **Array element compatibility falls back to TypeKind equality**
   `compiler/src/compiler/types/checker.cryo:187-194` — if element TypeRefs
   differ, elements are "ok" when their *kinds* match: `StructA[]` is
   `Compatible` with `StructB[]`. Silent layout mismatch. Related holes at
   :202-221 (`int[] -> char[]`, `Array -> string` as `ImplicitConvert`).
 
-- [ ] **Width-blind `Int <-> Char` implicit conversion (both directions)**
+- [x] **Width-blind `Int <-> Char` implicit conversion (both directions)**
   `types/checker.cryo:470-475` — `i64 -> char` silently truncates outside the
   call-arg lossy-narrowing gate.
 
@@ -131,7 +131,7 @@ string-keyed monomorphization era).
   (`call_specializer.cryo:1303-1307`). Dead `in_progress` cycle detection can
   never fire (`monomorphizer.cryo:80, 266-271`).
 
-- [ ] **Ternary/if-expr phi handling lacks the terminated-arm and coercion
+- [x] **Ternary/if-expr phi handling lacks the terminated-arm and coercion
   handling the match-expr path has**
   `codegen/ir_generator.cryo:1808-1842` vs `:1739-1773`.
 
@@ -294,7 +294,7 @@ hazard classes above.
   admit pins go stale post-substitution (:843-845). Goal: sema pin is the
   *only* path; everything else becomes an ICE.
 
-- [ ] **D5. Mono instantiation identity: three parallel string keying
+- [x] **D5. Mono instantiation identity: three parallel string keying
   schemes** (registry raw-id key `generic_registry.cryo:901-907`, canonical
   `make_key` `monomorphizer.cryo:752-760`, display-name mangles).
   `make_key`'s own doc (:734-747) admits canonical-vs-structural keying is
@@ -431,7 +431,7 @@ hazard classes above.
 
 ### Spec holes on load-bearing features
 
-- [ ] **`static match` has no section in the language reference.** Two passing
+- [x] **`static match` has no section in the language reference.** Two passing
   mentions in `docs/cryo.md` (lines ~1336, ~2585); no section, no TOC entry —
   despite 30+ stdlib uses and powering `Atomic<T>`, `String::push<T>`,
   `io::Write::write<T>`. `docs/grammar.md:305-311` defines `StaticMatch` but
@@ -443,18 +443,18 @@ hazard classes above.
   also the implementation stance: raw pointers and references are
   unconditionally Send+Sync with a hardcoded 4-entry deny-list
   (`types/ownership.cryo:503-513`) — document that `Send` is advisory.
-- [ ] **`->` contradiction**: cryo.md §5.6 + precedence table list
+- [x] **`->` contradiction**: cryo.md §5.6 + precedence table list
   `p->field`; `grammar.md:234` says "there is no `->` operator."
 - [ ] **`![derive(Trait, ...)]` listed (§17.1) with no list of derivable
   traits anywhere.**
-- [ ] **Tuple story inconsistency**: cryo.md §2.6 documents heterogeneous
+- [x] **Tuple story inconsistency**: cryo.md §2.6 documents heterogeneous
   tuple literals fully; CHANGELOG.md:151 says "Cryo has no heterogeneous
   tuple literal" (re `.zip`/`.enumerate` using `Pair`). One is stale.
 - [ ] **Closure capability boundary scattered across three documents**
   (capturing closures advertised in §2.5; E0458 non-capturing iterator limit
   only in CHANGELOG "Known limitations").
-- [ ] **`abi.md` covers SysV x86-64 only** — Win64 ships but is undocumented.
-- [ ] **grammar.md drift**: `UnionDecl` defined but absent from
+- [x] **`abi.md` covers SysV x86-64 only** — Win64 ships but is undocumented.
+- [x] **grammar.md drift**: `UnionDecl` defined but absent from
   `TopLevelItem`; self-demoting ("the parser is the source of truth").
 
 ### Design debt to decide on before freeze

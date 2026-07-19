@@ -207,28 +207,32 @@ type struct TypeChecker {
                     return TypeCompatibility::Compatible;
                 }
             }
-            // Different element types but both integer/char: allow coercion
-            // for patterns like `char[] = [0; N]` where 0 is i32.
-            if (to_arr.is_dynamic() || from_arr.is_dynamic()) {
-                const from_elem: Type* = this.arena.lookup(from_arr.element.id);
-                const to_elem: Type* = this.arena.lookup(to_arr.element.id);
-                if (from_elem != null && to_elem != null &&
-                    from_elem.kind == TypeKind::Int && to_elem.kind == TypeKind::Int) {
-                    return TypeCompatibility::ImplicitConvert;
-                }
-                // i32[] -> char[] (char is integer-compatible)
-                if (from_elem != null && to_elem != null &&
-                    from_elem.kind == TypeKind::Int && to_elem.kind == TypeKind::Char) {
-                    return TypeCompatibility::ImplicitConvert;
-                }
-            }
+            // Element types that merely share a kind are NOT interchangeable.
+            // An array is one contiguous buffer, so there is no element-wise
+            // conversion to emit: admitting `i64[] -> u8[]` would reinterpret
+            // the backing memory at a different stride.  Literals reach their
+            // element type through `resolve_array_literal`'s expected-type
+            // propagation instead, which is why `char[] c = [0; N]` needs no
+            // coercion here.
         }
 
-        // Array -> string coercion: [0; N] buffer allocation pattern.
-        // In Cryo, `string` is a raw char pointer; initializing it from
-        // an integer/char array fill expression is a standard buffer allocation.
+        // Array -> string: `string` is a raw byte pointer, so only a byte-wide
+        // element array can decay to one.  A wider element type would hand
+        // `string` a buffer it reads at the wrong stride.
         if (from_type.kind == TypeKind::Array && to_type.kind == TypeKind::String) {
-            return TypeCompatibility::ImplicitConvert;
+            const from_arr_s: ArrayType* = from_type as ArrayType*;
+            const elem_s: Type* = this.arena.lookup(from_arr_s.element.id);
+            if (elem_s != null) {
+                if (elem_s.kind == TypeKind::Char) {
+                    return TypeCompatibility::ImplicitConvert;
+                }
+                if (elem_s.kind == TypeKind::Int) {
+                    const ei: IntType* = elem_s as IntType*;
+                    if (ei.bit_width() == 8) {
+                        return TypeCompatibility::ImplicitConvert;
+                    }
+                }
+            }
         }
 
         // Reference, Tuple and InstantiatedType deliberately have NO structural
@@ -413,23 +417,23 @@ type struct TypeChecker {
 
         // Char <-> integer conversions.
         //
-        // Deliberately width-blind in BOTH directions, which means `i64 -> char`
-        // truncates silently (and outside the call-argument lossy-narrowing
-        // gate, so nothing else catches it).  This is a known hole, left open on
-        // purpose: closing it requires first deciding how wide `char` actually
-        // is, and the codebase currently disagrees with itself.
-        //   * `CharType::size_bytes`/`alignment` say 4, `map_type` lowers it to
-        //     `i32`, and `core/hash.cryo` folds it as "a 32-bit Unicode scalar".
-        //   * `string` is a NUL-terminated `i8*`, and the stdlib routinely reads
-        //     `this[i]` into an `i8` - i.e. treats `char` as one byte.
-        // Applying the integer width lattice here (the obvious fix) makes every
-        // one of those stdlib reads a narrowing error, so the lattice cannot be
-        // turned on until `char`'s width is settled one way or the other.
+        // `char` is a 32-bit UNSIGNED Unicode scalar - `CharType::size_bytes` is
+        // 4, `map_type` lowers it to `i32`, and indexing a `string` loads one
+        // byte and `zext`s it to i32.  So it belongs in the same width lattice
+        // as the integers: widening implicitly, narrowing only through an
+        // explicit `as`.  Returning a bare `ImplicitConvert` both ways made
+        // `i64 -> char` a silent 64->32 truncation, and made `char -> i8` a
+        // silent 32->8 one that turns any byte >= 128 negative.
+        const CHAR_BITS: u64 = 32;
         if (from_type.kind == TypeKind::Char && to_type.kind == TypeKind::Int) {
-            return TypeCompatibility::ImplicitConvert;
+            const to_i: IntType* = to_type as IntType*;
+            return TypeChecker::width_lattice(CHAR_BITS, false,
+                                              to_i.bit_width(), to_i.is_signed());
         }
         if (from_type.kind == TypeKind::Int && to_type.kind == TypeKind::Char) {
-            return TypeCompatibility::ImplicitConvert;
+            const from_i: IntType* = from_type as IntType*;
+            return TypeChecker::width_lattice(from_i.bit_width(), from_i.is_signed(),
+                                              CHAR_BITS, false);
         }
 
         // Optional wrapping: T -> T?
