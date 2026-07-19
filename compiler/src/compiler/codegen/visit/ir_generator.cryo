@@ -1813,31 +1813,72 @@ public:
         const merge_bb: LBasicBlock = LBasicBlock::append(current_fn, "ternary.merge");
         this.cg.builder.build_cond_br(cond, then_bb, else_bb);
 
-        this.cg.builder.position_at_end(then_bb);
-        const then_val: LValue = this.dispatch.codegen_rvalue(this,node.true_expr);
-        const then_end: LBasicBlock = this.cg.builder.get_insert_block();
-        this.cg.flow.branch_if_not_terminated(merge_bb);
-
-        this.cg.builder.position_at_end(else_bb);
-        const else_val: LValue = this.dispatch.codegen_rvalue(this,node.false_expr);
-        const else_end: LBasicBlock = this.cg.builder.get_insert_block();
-        this.cg.flow.branch_if_not_terminated(merge_bb);
-
-        this.cg.builder.position_at_end(merge_bb);
         const ty: LType = this.cg.type_mapper.map_type(node.resolved_type);
-        const phi: LValue = this.cg.builder.build_phi(ty, "ternary");
+
+        // Only arms that actually reach `merge_bb` may be phi predecessors, and
+        // each arm's value is coerced to the phi type BEFORE its branch - the
+        // same contract the match-expression path above follows, for the same
+        // two reasons.
+        //
+        // An arm can terminate: `Never` is compatible with every type, so
+        // `if (c) { panic("x") } else { 5 }` is legal and its `then` block ends
+        // in `unreachable`.  `branch_if_not_terminated` correctly emits no `br`
+        // for it, which means that block is NOT a predecessor of `merge_bb` -
+        // adding it to the phi anyway builds a phi whose incoming block doesn't
+        // branch here, and the LLVM verifier rejects the function.
+        //
+        // Coercing after the branch would instead leave `zext`/`sext`/`inttoptr`
+        // sitting past the terminator, so the block reads as having none.
         const vals: void* = intrinsics::malloc(16);
         const blks: void* = intrinsics::malloc(16);
         const vals_arr: void** = vals as void**;
         const blks_arr: void** = blks as void**;
-        vals_arr[0] = then_val.raw;
-        vals_arr[1] = else_val.raw;
-        blks_arr[0] = then_end.raw;
-        blks_arr[1] = else_end.raw;
-        phi.add_incoming(vals, blks, 2);
+        mut n: u32 = 0;
+
+        this.cg.builder.position_at_end(then_bb);
+        mut then_val: LValue = this.dispatch.codegen_rvalue(this,node.true_expr);
+        const then_end: LBasicBlock = this.cg.builder.get_insert_block();
+        const then_live: boolean = then_end.is_valid() && !then_end.has_terminator();
+        if (then_live && then_val.is_valid()) {
+            then_val = IRGeneratorVisitor::coerce_to_phi_type(
+                this.cg, then_val, ty, node.resolved_type);
+        }
+        this.cg.flow.branch_if_not_terminated(merge_bb);
+        if (then_live) {
+            vals_arr[n as i64] = if (then_val.is_valid()) { then_val.raw }
+                                 else { llvm::LLVMGetUndef(ty.raw) };
+            blks_arr[n as i64] = then_end.raw;
+            n += 1;
+        }
+
+        this.cg.builder.position_at_end(else_bb);
+        mut else_val: LValue = this.dispatch.codegen_rvalue(this,node.false_expr);
+        const else_end: LBasicBlock = this.cg.builder.get_insert_block();
+        const else_live: boolean = else_end.is_valid() && !else_end.has_terminator();
+        if (else_live && else_val.is_valid()) {
+            else_val = IRGeneratorVisitor::coerce_to_phi_type(
+                this.cg, else_val, ty, node.resolved_type);
+        }
+        this.cg.flow.branch_if_not_terminated(merge_bb);
+        if (else_live) {
+            vals_arr[n as i64] = if (else_val.is_valid()) { else_val.raw }
+                                 else { llvm::LLVMGetUndef(ty.raw) };
+            blks_arr[n as i64] = else_end.raw;
+            n += 1;
+        }
+
+        this.cg.builder.position_at_end(merge_bb);
+        if (n > 0 && ty.is_valid()) {
+            const phi: LValue = this.cg.builder.build_phi(ty, "ternary");
+            phi.add_incoming(vals, blks, n);
+            this.state.last_value = phi;
+        } else {
+            // Both arms diverged; `merge_bb` is unreachable and there is no
+            // value to produce.
+            this.state.last_value = LValue::null();
+        }
         intrinsics::free(vals);
         intrinsics::free(blks);
-        this.state.last_value = phi;
         this.state.last_is_lvalue = false;
     }
 

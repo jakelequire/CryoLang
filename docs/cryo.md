@@ -725,7 +725,7 @@ Only `mut` bindings can be assigned to.
 
 | Operator       | Description                                                                                                                                   |
 | -------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| `->`           | Return-type arrow; pointer member access (`p->field`).                                                                                        |
+| `->`           | Return-type arrow. Not a member-access operator: `.` auto-dereferences pointers, so write `p.field`, never `p->field`.                         |
 | `=>`           | Pattern-to-body separator inside `match`.                                                                                                     |
 | `::`           | Scope resolution: static methods, enum variants, module members.                                                                              |
 | `?` `:`        | Ternary conditional.                                                                                                                          |
@@ -797,7 +797,7 @@ From **lowest** to **highest**:
 | 15    | `*` `/` `%`                                                   | Left          |
 | 16    | `as`                                                          | Left          |
 | 17    | `-` `!` `&` `*` `~` `++` `--` (unary prefix), `new`, `delete` | Right         |
-| 18    | `()` `[]` `.` `->` `?` (postfix try) `++` `--` (postfix)      | Left          |
+| 18    | `()` `[]` `.` `?` (postfix try) `++` `--` (postfix)           | Left          |
 
 `as` sits between multiplication and unary, so `x * y as i64` casts `y`, not the product. Use parentheses if you mean `(x * y) as i64`.
 
@@ -1975,6 +1975,70 @@ it generates two independent types and two specialised function bodies, one for 
 
 The pipeline driver lives in [`compiler/src/compiler/types/monomorphizer.cryo`](../compiler/src/compiler/types/monomorphizer.cryo) (Phase 6a in `instance.cryo`), invoked after type resolution and trait-bound validation but before function-body type checking. The follow-on [`compiler/src/compiler/passes/specialization.cryo`](../compiler/src/compiler/passes/specialization.cryo) walks already-typed bodies and rewrites generic call sites to point at the monomorphised callees.
 
+### 12.7 `static match` — Compile-Time Type Dispatch
+
+`static match` selects a body by inspecting a type parameter *at compile time*. It is the mechanism that lets one generic function accept several unrelated types without a trait bound and without runtime dispatch.
+
+```cryo
+static match (T) {
+    u8      => { this.write_u8(value); }
+    i8      => { this.write_u8(value as u8); }
+    boolean => { this.write_u8(if (value) { 1 as u8 } else { 0 as u8 }); }
+}
+```
+
+The subject is a **type**, not a value, and each arm is a type rather than a pattern. During monomorphisation the compiler knows what `T` is, keeps the one matching arm, and discards the rest — so there is no branch and no runtime cost in the emitted code.
+
+**Arms may group types with `|`, and `_` is the wildcard:**
+
+```cryo
+static match (T) {
+    u8 | u16 | u32 | u64 => { this.push_display(item) }
+    string               => { this.push_view_bytes(Str::from(item)) }
+    _                    => { core::panic("unsupported", FILE, LINE); }
+}
+```
+
+**Omitting `_` makes the arm list the accepted-type list.** A `T` that matches no arm is a compile error. This is deliberate and is how the standard library expresses "this generic accepts exactly these types" without inventing a trait:
+
+```cryo
+// `String::try_push` accepts strings, integers, floats and boolean.
+// Any other T is rejected at compile time - there is no `_` arm.
+try_push<T>(mut &this, item: T) -> Result<(), AllocError> {
+    return static match (T) {
+        String  => { this.push_view_bytes(item.as_str()) }
+        Str     => { this.push_view_bytes(item) }
+        string  => { this.push_view_bytes(Str::from(item)) }
+        u8 | u16 | u32 | u64 |
+        i8 | i16 | i32 | i64 |
+        f32 | f64 |
+        boolean => { this.push_display(item) }
+    };
+}
+```
+
+**Statement and expression position both work.** As an expression, every arm's body yields the value of its final expression, and all arms must agree on a type — as in the `try_push` example above, where each arm yields `Result<(), AllocError>`.
+
+**Discarded arms are not type-checked against the wrong type.** Because pruning happens before the body is checked, an arm may use operations that are valid only for its own type — `item.as_str()` in the `String` arm above is not an error when `T` is `u8`, since that arm no longer exists in the `u8` instantiation. This is the property that makes the construct useful: without it, every arm would have to compile for every `T`.
+
+**The subject may be any type parameter in scope** — the enclosing type's parameter, or one introduced by the method itself:
+
+```cryo
+type struct Atomic<T> {
+    // `T` here comes from the type.
+    load(&this) -> T { return static match (T) { /* ... */ }; }
+}
+
+implement struct String {
+    // `T` here is introduced by the method.
+    push<T>(mut &this, item: T) -> void { /* static match (T) ... */ }
+}
+```
+
+`static match` is also permitted in a trait's default method body, which is what lets `io::Write::write<T>` dispatch on the payload type without each implementor restating the arms.
+
+**When to reach for it.** Prefer a trait bound when the operation is genuinely the same across types and the set is open. Reach for `static match` when the set of accepted types is closed and each one needs *different* code — width-specific integer handling, or a conversion whose implementation differs per source type. The standard library uses it for `Hash::fold`, `String::push`/`try_push`, `Str::from`, `Atomic<T>`, and `io::Write::write`.
+
 ---
 
 ## 13. Implement Blocks
@@ -2732,10 +2796,15 @@ statement       = var_declaration | function_declaration | struct_declaration
                 | type_alias_declaration | implementation_block
                 | if_statement | while_statement | for_statement
                 | loop_statement | do_while_statement
-                | match_statement | switch_statement
+                | match_statement | switch_statement | static_match
                 | break_statement | continue_statement | return_statement
                 | unsafe_block | block | expression_statement
+
+static_match    = "static" "match" "(" type ")" "{" static_match_arm* "}"
+static_match_arm = ( type { "|" type } | "_" ) "=>" ( block | expression )
 ```
+
+`static_match` is also an expression form (see section 12.7).
 
 ### 22.3 Expression Hierarchy
 
