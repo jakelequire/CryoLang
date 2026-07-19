@@ -183,16 +183,16 @@ type struct TypeChecker {
         if (from_type.kind == TypeKind::Array && to_type.kind == TypeKind::Array) {
             const from_arr: ArrayType* = from_type as ArrayType*;
             const to_arr: ArrayType* = to_type as ArrayType*;
-            // Check element compatibility by ID first, then by kind.
-            mut elems_ok: boolean = from_arr.element.equals(to_arr.element);
-            if (!elems_ok) {
-                const ea: Type* = this.arena.lookup(from_arr.element.id);
-                const eb: Type* = this.arena.lookup(to_arr.element.id);
-                if (ea != null && eb != null && ea.kind == eb.kind) {
-                    elems_ok = true;
-                }
-            }
-            if (elems_ok) {
+            // Element identity is plain id equality: elements are interned
+            // through the arena's structural hash-cons table (D1), so one
+            // semantic element type has exactly one id.  This deliberately does
+            // NOT fall back to comparing element `kind`: two unrelated structs
+            // are both `TypeKind::Struct`, which made `Foo[]` read as
+            // `Compatible` with `Bar[]`, and `i32[]` -> `u8[]` `Compatible`
+            // (stronger than the `ImplicitConvert` the widening branch below
+            // returns for that same pair).  See the `&T` -> `T*` branch, which
+            // recurses for exactly this reason.
+            if (from_arr.element.equals(to_arr.element)) {
                 if (to_arr.is_dynamic() || from_arr.size == to_arr.size) {
                     return TypeCompatibility::Compatible;
                 }
@@ -221,81 +221,33 @@ type struct TypeChecker {
             return TypeCompatibility::ImplicitConvert;
         }
 
-        // Reference structural equality: &T == &T, &mut T == &mut T
-        // Needed because the arena may allocate duplicate ReferenceType objects
-        // with different TypeRef IDs for the same logical type.
-        if (from_type.kind == TypeKind::Reference && to_type.kind == TypeKind::Reference) {
-            const from_ref: ReferenceType* = from_type as ReferenceType*;
-            const to_ref: ReferenceType* = to_type as ReferenceType*;
-            if (from_ref.referent.equals(to_ref.referent) &&
-                from_ref.is_mutable() == to_ref.is_mutable()) {
-                return TypeCompatibility::Identical;
-            }
-        }
-
-        // Tuple structural equality.  Same reason as Reference above: the
-        // arena allocates a fresh TupleType every time a (T1, T2, ...)
-        // annotation is parsed, so a function declaration's return-type
-        // tuple and the call site's expression tuple have different
-        // TypeIDs even when they describe the same shape.  Compare element
-        // counts, then recurse on each element.  Identical only when every
-        // element matches; any element divergence falls through.
-        if (from_type.kind == TypeKind::Tuple && to_type.kind == TypeKind::Tuple) {
-            const from_tup: TupleType* = from_type as TupleType*;
-            const to_tup:   TupleType* = to_type as TupleType*;
-            if (from_tup.elements.length == to_tup.elements.length) {
-                mut all_compat: boolean = true;
-                mut any_convert: boolean = false;
-                for (mut i: i64 = 0; i < from_tup.elements.length; i++) {
-                    const ec: TypeCompatibility = this.check_compatibility(
-                        from_tup.elements[i], to_tup.elements[i]);
-                    if (ec == TypeCompatibility::Incompatible) {
-                        all_compat = false;
-                        break;
-                    }
-                    if (ec == TypeCompatibility::ImplicitConvert ||
-                        ec == TypeCompatibility::ExplicitCast) {
-                        any_convert = true;
-                    }
-                }
-                if (all_compat) {
-                    return if (any_convert) {
-                        TypeCompatibility::ImplicitConvert
-                    } else {
-                        TypeCompatibility::Identical
-                    };
-                }
-            }
-        }
-
-        // InstantiatedType structural equality.  Like Reference/Tuple above,
-        // the arena dedupes instantiations only by (base, arg TypeIDs) (see
-        // `create_instantiation`): the same logical `Foo<Bar<i32>>` can still
-        // carry distinct arg TypeIDs across the pre-/post-mono boundary, so
-        // under mono-after-sema the pre-mono and post-mono passes mint distinct
-        // IDs for one for-loop iterator type, and when neither side carries a
-        // `resolved_type` (so the deref above was a no-op) they would otherwise
-        // read as Incompatible.  Compare the generic base and each type
-        // argument structurally instead.
-        if (from_type.kind == TypeKind::InstantiatedType
-                && to_type.kind == TypeKind::InstantiatedType) {
-            const from_inst2: InstantiatedType* = from_type as InstantiatedType*;
-            const to_inst2:   InstantiatedType* = to_type as InstantiatedType*;
-            if (from_inst2.generic_base.equals(to_inst2.generic_base)
-                    && from_inst2.type_args.length == to_inst2.type_args.length) {
-                mut args_identical: boolean = true;
-                for (mut i: i64 = 0; i < from_inst2.type_args.length; i++) {
-                    if (this.check_compatibility(from_inst2.type_args[i],
-                            to_inst2.type_args[i]) != TypeCompatibility::Identical) {
-                        args_identical = false;
-                        break;
-                    }
-                }
-                if (args_identical) {
-                    return TypeCompatibility::Identical;
-                }
-            }
-        }
+        // NOTE (D1): Reference, Tuple and InstantiatedType each used to carry a
+        // structural fallback here, justified by the arena minting duplicate ids
+        // for one logical type ("the arena may allocate duplicate ReferenceType
+        // objects", "the arena allocates a fresh TupleType every time",
+        // "distinct arg TypeIDs across the pre-/post-mono boundary").  All three
+        // kinds are now interned through the arena's structural hash-cons table,
+        // so one semantic type has exactly one id and the id-equality fast path
+        // at the top of this function already answers them.  They were deleted
+        // rather than left as dead belt-and-braces: while they existed they could
+        // mask a genuine identity fork, which is what D1 forbids.
+        //
+        // The Tuple one additionally performed element-wise COERCION, reporting
+        // the tuple `ImplicitConvert` as a whole when only some elements needed
+        // converting.  That was not merely redundant, it was UNSOUND: codegen
+        // emits no per-element cast for it, so the tuple was written with the
+        // source layout and read with the target layout.  `return (a, 2)` with
+        // `a: i32` from a `-> (i64, i64)` function compiled clean and read every
+        // element after the first from the wrong offset (element 0 shares offset
+        // 0 between the two layouts, which is what made it look correct in a
+        // one-element spot check).  Verified against the pinned compiler, so it
+        // predates D1.
+        //
+        // Correctly typed tuple literals no longer need this branch at all:
+        // `resolve_tuple_literal` now propagates the expected type per position,
+        // so `return (1, 2)` types as `(i64, i64)` directly and matches by id.
+        // A genuinely mixed-width tuple is now E0200 rather than silent
+        // corruption - write `(a as i64, 2)`, which already lowered correctly.
 
         // Pointer conversions
         if (from_type.kind == TypeKind::Pointer && to_type.kind == TypeKind::Pointer) {
@@ -409,11 +361,12 @@ type struct TypeChecker {
             if (from_ref.referent.equals(to_ptr.pointee)) {
                 return TypeCompatibility::ImplicitConvert;
             }
-            // Cross-module fallback: referent and pointee may have different
-            // TypeRef.ids if not deduped through the shared arena cache.
-            // Recursively check pointee compatibility: that handles class
-            // upcasts, enum equivalence, etc., without falsely matching
-            // unrelated structs that merely share the same TypeKind.
+            // Referent and pointee are not required to be the SAME type, only a
+            // compatible one: recursing here is what admits `&Derived -> Base*`
+            // and enum equivalence.  This is a subtyping rule, not a duplicate-id
+            // workaround, so D1 leaves it in place.  Note it recurses rather than
+            // comparing `kind`, deliberately, so unrelated structs that merely
+            // share a TypeKind do not match.
             const pointee_compat: TypeCompatibility = this.check_compatibility(
                 from_ref.referent, to_ptr.pointee);
             if (pointee_compat == TypeCompatibility::Identical

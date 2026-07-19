@@ -117,15 +117,65 @@ type struct SegmentHeader {
 mut g_heads: SegmentHeader** = null;
 mut g_lock: u32 = 0;
 
-/// Spin until the heap lock is acquired. Uncontended in the common case
-/// (the compiler is single-threaded outside parallel codegen); a crude spin
-/// is acceptable for v1 and has no dependencies that could recurse.
+/// Number of failed acquire attempts before a waiter yields its timeslice.
+/// Small: the critical sections here are a few dozen instructions, so if we
+/// have not won within this many spins the holder is almost certainly not
+/// running, and spinning further is pure waste.
+const LOCK_SPIN_LIMIT: u32 = 64;
+
+/// Yield this thread's timeslice. Uses the raw OS primitive rather than
+/// `thread::yield_now()` or libc: this file must not call anything that could
+/// allocate and recurse into the lock we are trying to acquire.
+![target(windows)]
+function heap_yield() -> void { syscall::SwitchToThread(); }
+
+![target(unix)]
+function heap_yield() -> void { syscall::sys_sched_yield(); }
+
+/// Acquire the heap lock: bounded spin, then yield.
+///
+/// This used to be an unbounded busy-spin on `atomic_cmpxchg_u32`, justified by
+/// "uncontended in the common case (the compiler is single-threaded outside
+/// parallel codegen)". That assumption does NOT hold for the test runner, whose
+/// `--jobs=N` worker THREADS all allocate, and the failure mode was severe:
+/// **a lock convoy**. When the thread holding the lock is preempted, every other
+/// worker sits at 100% CPU spinning on a lock that cannot be released, occupying
+/// the very cores the holder needs to be rescheduled onto. Throughput therefore
+/// got WORSE as parallelism rose. Measured on a 6-physical-core box, per test:
+/// 1 job 1134 ms, 2 jobs 505 ms, 4 jobs 2849 ms, 8 jobs 5407 ms, 12 jobs 6614 ms.
+/// The default is `auto` = core count, so the full suite took ~1 hour.
+///
+/// Two changes fix it:
+///   1. BOUNDED spin, then `heap_yield()` - a waiter that cannot make progress
+///      surrenders its core so the holder can finish. This is what actually
+///      breaks the convoy.
+///   2. TEST-and-test-and-set: spin on a RELAXED LOAD, only attempting the
+///      read-modify-write when the lock looks free. A bare cmpxchg loop takes
+///      the cache line exclusive on every attempt, so N spinners ping-pong the
+///      line between cores and slow the holder down too.
+///
+/// This stays a global lock - per-class locks / thread-local pages remain the
+/// intended later evolution. It only stops the crude version from being
+/// pathological under real concurrency.
 function lock() -> void {
+    mut spins: u32 = 0;
     loop {
         mut ok: boolean = false;
         intrinsics::atomic_cmpxchg_u32(&g_lock, 0, 1,
                                        ORDER_ACQUIRE, ORDER_RELAXED, &ok);
         if (ok) { return; }
+
+        // Lost the race: wait for the lock to LOOK free before trying the
+        // expensive exclusive operation again.
+        loop {
+            const cur: u32 = intrinsics::atomic_load_u32(&g_lock, ORDER_RELAXED);
+            if (cur == 0) { break; }
+            spins = spins + 1;
+            if (spins >= LOCK_SPIN_LIMIT) {
+                heap_yield();
+                spins = 0;
+            }
+        }
     }
 }
 
