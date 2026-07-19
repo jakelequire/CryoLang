@@ -361,7 +361,52 @@ public:
             if (!target_str.contains("::")) {
                 qualified_target = this.ctx.qualify_symbol_sym(node.target_type);
             }
-            if (greg.get_template(qualified_target) != null) { return; }
+            const tmpl: TemplateEntry* = greg.get_template(qualified_target);
+            if (tmpl != null) {
+                // BARE impl block on a GENERIC TEMPLATE target, e.g.
+                // `implement trait Sink for struct Buf` where `Buf` is declared
+                // `Buf<A = Tag>`.  `is_generic()` is false (the impl block itself
+                // has no `<...>`), so the generic path above was skipped - but the
+                // concrete path below cannot type-check it either, because the
+                // target is still a template.  This used to just `return`, which
+                // meant the method bodies were NEVER WALKED BY SEMA AT ALL.
+                //
+                // That silently broke method-generic calls inside such a body:
+                // `resolve_method_call`'s stash (`call.set_resolved_type_args`) is
+                // the ONLY producer of method-spec demand, mono consumes it and
+                // bails when it is absent (`call_specializer` "outside sema's
+                // visibility"), so `this.accum(Unit{...})` was left unspecialized
+                // and codegen failed with E0636.  It only APPEARED order-dependent:
+                // codegen has a name-based `Type::method` fallback, so the program
+                // compiled iff some unrelated call had already materialized that
+                // method spec under the same name.  Verified by probe: this bail
+                // fires in BOTH the failing and the "working" variant.
+                //
+                // Walk the bodies symbolically instead, using the TEMPLATE's own
+                // generic params (the impl block has none of its own) so the
+                // receiver reads as a generic owner and the stash is produced
+                // independently of any other call site.
+                if (this.sema_symbolic_check_enabled() && tmpl.ast_node != null) {
+                    const owner_ty: TypeRef = this.types.lookup_type_by_sym(node.target_type);
+                    const saved_impl: ImplBlockNode* = this.state.symbolic_impl_node;
+                    this.state.symbolic_impl_node = node;
+                    if (tmpl.node_kind == NodeKind::StructDeclaration) {
+                        this.symbolic_check_owner_methods(node.methods, owner_ty,
+                            (tmpl.ast_node as StructDeclNode*).generic_params);
+                    } else if (tmpl.node_kind == NodeKind::ClassDeclaration) {
+                        this.symbolic_check_owner_methods(node.methods, owner_ty,
+                            (tmpl.ast_node as ClassDeclNode*).generic_params);
+                    } else if (tmpl.node_kind == NodeKind::EnumDeclaration) {
+                        this.symbolic_check_owner_methods(node.methods, owner_ty,
+                            (tmpl.ast_node as EnumDeclNode*).generic_params);
+                    } else if (tmpl.node_kind == NodeKind::UnionDeclaration) {
+                        this.symbolic_check_owner_methods(node.methods, owner_ty,
+                            (tmpl.ast_node as UnionDeclNode*).generic_params);
+                    }
+                    this.state.symbolic_impl_node = saved_impl;
+                }
+                return;
+            }
         }
         const impl_this: TypeRef = this.types.lookup_type_by_sym(node.target_type);
         this.check_assoc_decl_bounds(node, impl_this);
@@ -2312,9 +2357,55 @@ public:
         return TypeRef::invalid();
     }
 
+    /// Resolve a tuple literal, propagating the expected type per POSITION.
+    ///
+    /// Tuples were the one aggregate literal never wired up for expected-type
+    /// propagation (arrays do it at `resolve_array_literal`, structs per field).
+    /// Two things went wrong without it.  First, an element never saw its own
+    /// expected type, so `return (1, 2)` from a `-> (i64, i64)` function typed
+    /// the `2` by the i32 default.  Second - and worse - the ENCLOSING hint was
+    /// not cleared either, so the whole `(i64, i64)` tuple type leaked in as the
+    /// hint for each element; `resolve_integer_literal` only adopts a hint whose
+    /// kind is `Int`, so a tuple-typed hint was silently ignored rather than
+    /// diagnosed.  The literal then defaulted to i32 and the mismatch was papered
+    /// over downstream by a structural coercion branch in `check_compatibility`
+    /// that miscompiled: it reported the tuple `ImplicitConvert` as a whole, but
+    /// codegen emitted no per-element cast, so the value was WRITTEN with the
+    /// source layout and READ with the target layout.  Element 0 shares offset 0
+    /// between the two layouts and looked correct; every later element was read
+    /// from the wrong offset.  That branch is now deleted (D1) and this is what
+    /// replaces it: elements adopt their expected type directly, so a correctly
+    /// typed tuple needs no coercion at all, and a genuinely mixed-width tuple
+    /// (a non-literal `i32` element in an `i64` slot) is now a hard E0200 instead
+    /// of silently wrong code.  Write the cast explicitly.
     resolve_tuple_literal(mut &this, tup: TupleLiteralNode*) -> TypeRef {
+        mut exp_tup: TupleType* = null;
+        if (this.state.expected_type.is_valid()) {
+            mut exp_t: Type* = this.arena.lookup(this.state.expected_type.id);
+            if (exp_t != null && exp_t.kind == TypeKind::InstantiatedType) {
+                const inst: InstantiatedType* = exp_t as InstantiatedType*;
+                if (inst.has_resolved_type()) { exp_t = this.arena.lookup(inst.resolved_type.id); }
+            }
+            if (exp_t != null && exp_t.kind == TypeKind::Tuple) {
+                const cand: TupleType* = exp_t as TupleType*;
+                // Arity must match, or the positions do not correspond and the
+                // per-element hints would be nonsense; fall through untyped and
+                // let the arity mismatch be diagnosed by the caller.
+                if (cand.elements.length == tup.elements.length) { exp_tup = cand; }
+            }
+        }
+        const saved_expected: TypeRef = this.state.expected_type;
         mut elem_types: TypeRef[] = [];
-        for (mut i: i64 = 0; i < tup.elements.length; i++) { elem_types.push(this.resolve_expr(tup.elements[i])); }
+        for (mut i: i64 = 0; i < tup.elements.length; i++) {
+            if (exp_tup != null) {
+                this.state.expected_type = exp_tup.elements[i];
+            } else {
+                // No usable tuple hint: clear rather than leak the enclosing one.
+                this.state.expected_type = TypeRef::invalid();
+            }
+            elem_types.push(this.resolve_expr(tup.elements[i]));
+            this.state.expected_type = saved_expected;
+        }
         return this.arena.get_tuple(elem_types);
     }
 

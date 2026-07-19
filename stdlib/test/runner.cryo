@@ -900,8 +900,12 @@ function append_u64(out: mut &String, x: u64) -> void {
 /// open doesn't hit a sharing violation.
 ![target(windows)]
 function read_capture_file(path: &String, out: mut &String) -> void {
+    // Delete sharing here too: this handle is open across the sibling tests'
+    // spawns, so without it their `DeleteFileA` calls fail and leak. See the
+    // capture-file creation in `run_one` for the full story.
     const h: u8* = syscall::CreateFileA(path.as_ptr(), syscall::GENERIC_READ,
-        syscall::FILE_SHARE_READ | syscall::FILE_SHARE_WRITE, null,
+        syscall::FILE_SHARE_READ | syscall::FILE_SHARE_WRITE
+            | syscall::FILE_SHARE_DELETE, null,
         syscall::OPEN_EXISTING, 0u32, null);
     if ((h as i64) == -1) { return; }   // local -1, not the cross-module const
     mut buf: u8[4096];
@@ -953,25 +957,56 @@ function run_one(d: TestDescriptor, idx: u64, timeout_secs: u32,
         mut dir_buf: u8[512];
         const dl: u32 = syscall::GetTempPathA(512u32, &dir_buf[0]);
         if (dl > 0u32 && dl < 512u32) {
-            mut name_buf: u8[512];
-            mut prefix: String = String::with_null(Str::new("cyt"));
-            // GetTempFileNameA creates a unique empty file and writes its full
-            // NUL-terminated path into name_buf.
-            const uniq: u32 = syscall::GetTempFileNameA(&dir_buf[0], prefix.as_ptr(),
-                                                        0u32, &name_buf[0]);
-            prefix.drop();
-            if (uniq != 0u32) {
-                mut sa: syscall::SECURITY_ATTRIBUTES = syscall::SECURITY_ATTRIBUTES {
-                    nLength: 24u32, lpSecurityDescriptor: null, bInheritHandle: 1
-                };
-                const h: u8* = syscall::CreateFileA(&name_buf[0], syscall::GENERIC_WRITE,
-                    syscall::FILE_SHARE_READ | syscall::FILE_SHARE_WRITE, &sa as u8*,
-                    syscall::CREATE_ALWAYS, 0u32, null);
-                if ((h as i64) != -1) {
-                    cap_handle = h;
-                    cap_path   = String::with_null(cstr_to_str(&name_buf[0]));
-                    have_cap   = true;
-                }
+            // Name the capture file DETERMINISTICALLY from (pid, test index)
+            // rather than asking `GetTempFileNameA` for a unique one.
+            //
+            // `GetTempFileNameA(uUnique = 0)` PROBES the filesystem: it derives a
+            // candidate from the clock and then increments and retries until it
+            // finds a name that does not exist. It can only ever mint 65535 of
+            // them (a 16-bit space). A run that is killed part-way leaks its
+            // capture files, so `%TEMP%` accumulates `cyt*` entries across runs -
+            // and once that space SATURATES, every call scans essentially all
+            // 65535 names before succeeding, on every test, from every worker.
+            //
+            // Observed here: 65535 stale files had built up over six days, and
+            // the same 25-test subset took 110s instead of 1.18s (~93x), with
+            // 12 workers slower than 1 because they all probed the same
+            // saturated directory. Deleting the leftovers restored it instantly.
+            //
+            // (pid, idx) is unique BY CONSTRUCTION: no probing, no 65535 ceiling,
+            // and leaked files are simply overwritten by `CREATE_ALWAYS` on a
+            // later run with the same pid rather than poisoning the namespace.
+            mut path: String = String::new();
+            path.push(cstr_to_str(&dir_buf[0]));        // GetTempPathA ends in `\`
+            path.push(Str::new("cyt"));
+            append_u64(&path, syscall::GetCurrentProcessId() as u64);
+            path.push_byte(95u8);                        // '_'
+            append_u64(&path, idx);
+            path.push(Str::new(".tmp"));
+            path.push_byte(0u8);
+
+            mut sa: syscall::SECURITY_ATTRIBUTES = syscall::SECURITY_ATTRIBUTES {
+                nLength: 24u32, lpSecurityDescriptor: null, bInheritHandle: 1
+            };
+            // FILE_SHARE_DELETE matters: `bInheritHandles = TRUE` hands EVERY
+            // in-flight capture handle to EVERY child, so while sibling tests
+            // are running this file has open handles in other processes. Without
+            // delete sharing, the `DeleteFileA` after the read fails with a
+            // sharing violation and the file is LEAKED - which is how `%TEMP%`
+            // accumulated 65535 `cyt*` files over six days and saturated
+            // `GetTempFileNameA`. Measured: 1481 tests leaked ~1481 files per
+            // run before this flag; zero after.
+            const share: u32 = syscall::FILE_SHARE_READ | syscall::FILE_SHARE_WRITE
+                             | syscall::FILE_SHARE_DELETE;
+            const h: u8* = syscall::CreateFileA(path.as_ptr(), syscall::GENERIC_WRITE,
+                share, &sa as u8*,
+                syscall::CREATE_ALWAYS, 0u32, null);
+            if ((h as i64) != -1) {
+                cap_handle = h;
+                cap_path   = path;
+                have_cap   = true;
+            } else {
+                path.drop();
             }
         }
     }
