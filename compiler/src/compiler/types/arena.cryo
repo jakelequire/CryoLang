@@ -377,7 +377,7 @@ type struct TypeArena {
                                 this.intern_entries[idx].aux1, &ops);
     }
 
-    /// D1 SELF-CHECK: canonical type identity.
+    /// Self-check on canonical type identity.
     ///
     /// Asserts the property the whole interner exists to provide - for any two
     /// `TypeRef`s denoting the same semantic type, `a.id == b.id` - by checking
@@ -386,15 +386,12 @@ type struct TypeArena {
     /// canonical.
     ///
     /// A violation means two entries share one key while denoting different
-    /// types, i.e. identity forked.  That is exactly the defect an earlier
-    /// version of this interner had: it re-derived each key from the type's
-    /// NODE, so once a node was mutated in place (`swap_wrapper_to_concrete`)
-    /// its entry stopped matching, `intern_find` probed past it, and a SECOND
-    /// id was minted for a type that already existed.  Measured on a 12-line
-    /// program, three keys had forked into two ids each.  The suite still
-    /// passed, because the GenericRegistry's independent string key silently
-    /// compensated - which is why this check exists rather than relying on
-    /// tests to notice.
+    /// types: identity has forked.  The failure mode that produces it is an
+    /// entry whose key no longer matches the one it was recorded under, so
+    /// `intern_find` probes past it and mints a SECOND id for a type that
+    /// already exists (see `InternEntry` on why the key is stored rather than
+    /// re-derived from the node).  Nothing downstream reports this on its own -
+    /// a forked id silently produces wrong output rather than a diagnostic.
     ///
     /// O(n) lookups over the table; call it from diagnostics, not per-compile.
     verify_canonical_identity(&this) -> i64 {
@@ -657,8 +654,19 @@ type struct TypeArena {
     /// `param_index` is still stored (first creation wins) but only feeds
     /// `display_name` (`T%lu`); the mangler encodes GenericParam by `param_name`
     /// alone, so first-index-wins is display-only and never perturbs emitted
-    /// symbols.  (Within any one template, param names are unique, so nothing
-    /// relies on two same-name params having distinct ids.)
+    /// symbols.
+    ///
+    /// LOAD-BEARING ASSUMPTION: GenericParam ids are canonical PER NAME, not per
+    /// BINDER.  Two params that share a name are one id even if they belong to
+    /// different templates.  That is sound only because a name can never be
+    /// bound twice along one substitution path: names are unique within a
+    /// template, and Cryo has no construct that nests one binder inside another
+    /// while allowing the inner to shadow the outer's name.  Adding
+    /// higher-ranked types, or any nested binder with shadowing names, would
+    /// break this - the inner and outer `T` would collide on one id and one
+    /// substitution would silently capture the other.  Such a feature must
+    /// re-key these leaves by binder identity (NOT by `index`; re-adding
+    /// `index`/`bounds` to this key reintroduces the divergence above).
     create_generic_param(mut &this, name: SymbolStr, index: u64) -> TypeRef {
         const key: u64 = name.id as u64;
 
@@ -776,6 +784,18 @@ type struct TypeArena {
     }
 
     /// Create an error type for type resolution failures.
+    ///
+    /// DELIBERATELY NOT INTERNED - the one `TypeKind` that opts out, so
+    /// `a.id == b.id` is not a total decision procedure for semantic equality.
+    /// That is intended, on both halves:
+    ///   * Error types are not interchangeable.  Each carries the `reason` and
+    ///     `SourceSpan` of the failure that produced it, which is what makes the
+    ///     resulting diagnostic point at the right code.  Deduping two failures
+    ///     that happen to share a reason string would attribute one to the
+    ///     other's span.
+    ///   * Nothing needs them to be.  `check_compatibility` short-circuits any
+    ///     error to universally-Compatible (to stop cascading diagnostics), so
+    ///     error types are never *compared* for identity in the first place.
     create_error(mut &this, reason: string, span: SourceSpan) -> TypeRef {
         return this.alloc_type(new ErrorType(this.next_id, reason, span));
     }
@@ -1722,10 +1742,9 @@ type struct TypeArena {
     // -- Intrinsic generic identity (the carrier-free accessors) ---------------
     //
     // A monomorphized aggregate carries its own `(generic_base, type_args)` - the
-    // rustc `TyKind::Adt(AdtDef, SubstsRef)` shape.  Prefer these over
-    // They read the type directly, so there is no side node to remember to
-    // consult (forgetting to chase such a node is precisely the defect class that
-    // produced the 2026-07-18 sweep).
+    // rustc `TyKind::Adt(AdtDef, SubstsRef)` shape.  Prefer these accessors over
+    // chasing a separate wrapper node: they read the identity off the type
+    // itself, so there is no side node a caller can forget to consult.
 
     /// The template `ty` is an instantiation of, or invalid when it is not one.
     /// Answers for BOTH representations: a pre-mono `InstantiatedType` wrapper

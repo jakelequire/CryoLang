@@ -2359,25 +2359,24 @@ public:
 
     /// Resolve a tuple literal, propagating the expected type per POSITION.
     ///
-    /// Tuples were the one aggregate literal never wired up for expected-type
-    /// propagation (arrays do it at `resolve_array_literal`, structs per field).
-    /// Two things went wrong without it.  First, an element never saw its own
-    /// expected type, so `return (1, 2)` from a `-> (i64, i64)` function typed
-    /// the `2` by the i32 default.  Second - and worse - the ENCLOSING hint was
-    /// not cleared either, so the whole `(i64, i64)` tuple type leaked in as the
-    /// hint for each element; `resolve_integer_literal` only adopts a hint whose
-    /// kind is `Int`, so a tuple-typed hint was silently ignored rather than
-    /// diagnosed.  The literal then defaulted to i32 and the mismatch was papered
-    /// over downstream by a structural coercion branch in `check_compatibility`
-    /// that miscompiled: it reported the tuple `ImplicitConvert` as a whole, but
-    /// codegen emitted no per-element cast, so the value was WRITTEN with the
-    /// source layout and READ with the target layout.  Element 0 shares offset 0
-    /// between the two layouts and looked correct; every later element was read
-    /// from the wrong offset.  That branch is now deleted (D1) and this is what
-    /// replaces it: elements adopt their expected type directly, so a correctly
-    /// typed tuple needs no coercion at all, and a genuinely mixed-width tuple
-    /// (a non-literal `i32` element in an `i64` slot) is now a hard E0200 instead
-    /// of silently wrong code.  Write the cast explicitly.
+    /// Each element is resolved under ITS OWN expected type, mirroring what
+    /// `resolve_array_literal` does per element and struct literals do per field.
+    /// The per-position hint is what makes `return (1, 2)` from a `-> (i64, i64)`
+    /// function type both elements as i64 rather than letting the second take the
+    /// i32 default.
+    ///
+    /// Setting the hint per position also matters for what it PREVENTS: the
+    /// enclosing hint must not survive into the elements.  `resolve_integer_literal`
+    /// only adopts a hint whose kind is `Int`, so a leaked `(i64, i64)` tuple hint
+    /// is ignored silently rather than diagnosed, and the element quietly falls
+    /// back to i32.
+    ///
+    /// Because elements adopt their expected type directly, a correctly typed
+    /// tuple needs no coercion downstream at all - which is what lets
+    /// `check_compatibility` refuse to coerce tuples element-wise (see the note
+    /// there; doing so miscompiles).  A genuinely mixed-width tuple - a
+    /// non-literal `i32` element in an `i64` slot - is a hard E0200 here; the
+    /// cast has to be written explicitly.
     resolve_tuple_literal(mut &this, tup: TupleLiteralNode*) -> TypeRef {
         mut exp_tup: TupleType* = null;
         if (this.state.expected_type.is_valid()) {

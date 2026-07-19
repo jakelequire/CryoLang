@@ -118,10 +118,20 @@ type struct TypeChecker {
         }
 
         // Dereference InstantiatedType -> resolved_type on both sides.
-        // After monomorphization, InstantiatedType(base=Pair, args=[string])
-        // has resolved_type pointing to the concrete Pair_string StructType.
-        // Without this, the concrete type and the instantiation have different
-        // TypeIDs and would always compare as Incompatible.
+        //
+        // This does NOT fire for monomorphized aggregates: `swap_wrapper_to_concrete`
+        // replaces the wrapper node with the concrete aggregate AT THE SAME arena
+        // id, so `Pair<string>` and `Pair_string` are one id and the identity
+        // check above already returned Identical.  The branch remains live, and
+        // necessary, for the wrappers that never collapse:
+        //   * un-monomorphized aggregate wrappers - resolved during sema (or by
+        //     the symbolic body walk) but not yet swapped, so the wrapper and
+        //     its resolution are still two ids;
+        //   * function-template wrappers - which NEVER collapse.  Their slot
+        //     holds the spec's signature `FunctionType`, a genuinely different
+        //     semantic type shared across every function with that signature
+        //     (see `InstantiatedType`'s signature accessors).  Comparing a spec
+        //     against a function/pointer type has to go through the signature.
         mut effective_from: TypeRef = from;
         mut effective_to:   TypeRef = to;
 
@@ -184,8 +194,8 @@ type struct TypeChecker {
             const from_arr: ArrayType* = from_type as ArrayType*;
             const to_arr: ArrayType* = to_type as ArrayType*;
             // Element identity is plain id equality: elements are interned
-            // through the arena's structural hash-cons table (D1), so one
-            // semantic element type has exactly one id.  This deliberately does
+            // through the arena's structural hash-cons table, so one semantic
+            // element type has exactly one id.  This deliberately does
             // NOT fall back to comparing element `kind`: two unrelated structs
             // are both `TypeKind::Struct`, which made `Foo[]` read as
             // `Compatible` with `Bar[]`, and `i32[]` -> `u8[]` `Compatible`
@@ -221,31 +231,25 @@ type struct TypeChecker {
             return TypeCompatibility::ImplicitConvert;
         }
 
-        // NOTE (D1): Reference, Tuple and InstantiatedType each used to carry a
-        // structural fallback here, justified by the arena minting duplicate ids
-        // for one logical type ("the arena may allocate duplicate ReferenceType
-        // objects", "the arena allocates a fresh TupleType every time",
-        // "distinct arg TypeIDs across the pre-/post-mono boundary").  All three
-        // kinds are now interned through the arena's structural hash-cons table,
-        // so one semantic type has exactly one id and the id-equality fast path
-        // at the top of this function already answers them.  They were deleted
-        // rather than left as dead belt-and-braces: while they existed they could
-        // mask a genuine identity fork, which is what D1 forbids.
+        // Reference, Tuple and InstantiatedType deliberately have NO structural
+        // fallback here.  All three are interned through the arena's structural
+        // hash-cons table, so one semantic type has exactly one id and the
+        // id-equality fast path at the top of this function already answers
+        // them.  Do not re-add one as belt-and-braces: a structural fallback
+        // here would mask a genuine identity fork rather than catch it.
         //
-        // The Tuple one additionally performed element-wise COERCION, reporting
-        // the tuple `ImplicitConvert` as a whole when only some elements needed
-        // converting.  That was not merely redundant, it was UNSOUND: codegen
-        // emits no per-element cast for it, so the tuple was written with the
-        // source layout and read with the target layout.  `return (a, 2)` with
-        // `a: i32` from a `-> (i64, i64)` function compiled clean and read every
-        // element after the first from the wrong offset (element 0 shares offset
-        // 0 between the two layouts, which is what made it look correct in a
-        // one-element spot check).  Verified against the pinned compiler, so it
-        // predates D1.
+        // For Tuple it would also be UNSOUND.  Such a fallback compares
+        // element-wise and reports the tuple `ImplicitConvert` as a whole when
+        // only some elements need converting - but codegen emits no per-element
+        // cast, so the tuple is WRITTEN with the source layout and READ with the
+        // target layout.  `return (a, 2)` with `a: i32` from a `-> (i64, i64)`
+        // function compiles clean and reads every element after the first from
+        // the wrong offset.  (Element 0 shares offset 0 between the two layouts,
+        // so a one-element spot check looks correct.)
         //
-        // Correctly typed tuple literals no longer need this branch at all:
-        // `resolve_tuple_literal` now propagates the expected type per position,
-        // so `return (1, 2)` types as `(i64, i64)` directly and matches by id.
+        // Correctly typed tuple literals need no such branch: `resolve_tuple_literal`
+        // propagates the expected type per position, so `return (1, 2)` types as
+        // `(i64, i64)` directly and matches by id.
         // A genuinely mixed-width tuple is now E0200 rather than silent
         // corruption - write `(a as i64, 2)`, which already lowered correctly.
 
@@ -364,7 +368,7 @@ type struct TypeChecker {
             // Referent and pointee are not required to be the SAME type, only a
             // compatible one: recursing here is what admits `&Derived -> Base*`
             // and enum equivalence.  This is a subtyping rule, not a duplicate-id
-            // workaround, so D1 leaves it in place.  Note it recurses rather than
+            // workaround.  Note it recurses rather than
             // comparing `kind`, deliberately, so unrelated structs that merely
             // share a TypeKind do not match.
             const pointee_compat: TypeCompatibility = this.check_compatibility(
