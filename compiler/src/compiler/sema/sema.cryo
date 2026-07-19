@@ -1792,10 +1792,38 @@ public:
         return (f_agg && t_scl) || (f_scl && t_agg);
     }
 
+    /// Arms of a value-producing branch have to agree on a type.  Neither arm is
+    /// the "expected" one, so compatibility is tested in both directions and only
+    /// a pair that is incompatible each way reports; a diverging arm carries
+    /// `Never`, which coerces to anything and therefore never fires here.
+    /// Without this check the resolver returns whichever arm happens to type
+    /// first, so arms of unrelated types (`char` vs `i8`) reach codegen and the
+    /// result is read at the wrong width.
+    check_branch_agreement(mut &this, first: TypeRef, first_span: SourceSpan,
+                           second: TypeRef, second_span: SourceSpan,
+                           context_msg: string) -> void {
+        if (!first.is_valid() || !second.is_valid()) { return; }
+        if (first.id == second.id) { return; }
+        // Inside a generic template an arm's type can still be a bare parameter
+        // or an unresolved projection; agreement is only decidable per
+        // instantiation, so defer exactly as the return-type check does.
+        if (this.symbolic.type_has_unresolved_projection(first)
+                || this.symbolic.type_has_unresolved_projection(second)
+                || this.symbolic.symbolic_defer_type(first)
+                || this.symbolic.symbolic_defer_type(second)) { return; }
+        if (this.checker.check_compatibility(first, second) != TypeCompatibility::Incompatible) { return; }
+        if (this.checker.check_compatibility(second, first) != TypeCompatibility::Incompatible) { return; }
+        this.diag.emit_type_mismatch(ErrorCode::E0238_BRANCH_TYPE_MISMATCH,
+            second_span, first, second, context_msg, first_span);
+    }
+
     resolve_if_expr(mut &this, if_expr: IfExprNode*) -> TypeRef {
         this.resolve_expr(if_expr.condition);
         const then_type: TypeRef = this.resolve_expr(if_expr.then_expr);
         const else_type: TypeRef = this.resolve_expr(if_expr.else_expr);
+        this.check_branch_agreement(then_type, if_expr.then_expr.span,
+            else_type, if_expr.else_expr.span,
+            "both branches of an `if` expression must produce the same type");
         if (then_type.is_valid()) { return then_type; }
         if (else_type.is_valid()) { return else_type; }
         return TypeRef::invalid();
@@ -1805,6 +1833,9 @@ public:
         this.resolve_expr(ternary.condition);
         const true_type: TypeRef = this.resolve_expr(ternary.true_expr);
         const false_type: TypeRef = this.resolve_expr(ternary.false_expr);
+        this.check_branch_agreement(true_type, ternary.true_expr.span,
+            false_type, ternary.false_expr.span,
+            "both arms of a conditional expression must produce the same type");
         if (true_type.is_valid()) { return true_type; }
         if (false_type.is_valid()) { return false_type; }
         return TypeRef::invalid();
@@ -1818,6 +1849,7 @@ public:
         this.patterns.check_duplicate_default_arm(match_expr.arms);
         const outer_expected: TypeRef = this.state.expected_type;
         mut result_type: TypeRef = TypeRef::invalid();
+        mut result_span: SourceSpan = match_expr.span;
         for (mut i: i64 = 0; i < match_expr.arms.length; i++) {
             const arm: MatchArmNode* = match_expr.arms[i];
             if (arm == null || arm.body == null) { continue; }
@@ -1833,12 +1865,20 @@ public:
                     this.dispatch_stmt(block.statements[j]);
                     if (j == last_idx) { this.state.expected_type = outer_expected; }
                 }
-                if (!result_type.is_valid() && block.statements.length > 0) {
+                if (block.statements.length > 0) {
                     const last: StatementNode* = block.statements[block.statements.length - 1];
                     if ((last as ASTNode*).kind == NodeKind::ExpressionStatement) {
                         const es: ExprStmtNode* = last as ExprStmtNode*;
                         if (es.expression != null && es.expression.has_resolved_type()) {
-                            result_type = es.expression.resolved_type;
+                            const arm_type: TypeRef = es.expression.resolved_type;
+                            if (!result_type.is_valid()) {
+                                result_type = arm_type;
+                                result_span = es.expression.span;
+                            } else {
+                                this.check_branch_agreement(result_type, result_span,
+                                    arm_type, es.expression.span,
+                                    "every arm of a `match` expression must produce the same type");
+                            }
                         }
                     }
                 }

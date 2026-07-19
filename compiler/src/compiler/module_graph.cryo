@@ -412,7 +412,17 @@ type struct ModuleGraph {
     /// resolve to no module (external / unresolved) are simply skipped.  Used
     /// by the per-module incremental cache to fold exactly the source hashes
     /// whose type layouts a non-spec-owning module's object file can depend on.
-    compute_import_closure(&this, root: u32, n: u32) -> boolean[] {
+    /// `out_incomplete` is set when a dependency name encountered during the
+    /// walk doesn't resolve to a module index in range.  The closure returned
+    /// is then a STRICT SUBSET of the real one, which is unsafe to key a cache
+    /// on: the unreached module's source hash never folds into the consumer's
+    /// key, so editing it leaves the key unchanged while the consumer's `.o`
+    /// still has the old declarations baked in.  Callers must decline to reuse
+    /// a cached object for that module rather than trust a short closure.
+    /// A missing edge is not a conservative approximation - it is the
+    /// non-conservative direction.
+    compute_import_closure(&this, root: u32, n: u32, out_incomplete: boolean*) -> boolean[] {
+        if (out_incomplete != null) { *out_incomplete = false; }
         mut visited: boolean[] = [];
         for (mut i: u32 = 0; i < n; i++) { visited.push(false); }
         if (root >= n) { return visited; }
@@ -427,7 +437,11 @@ type struct ModuleGraph {
             const info: ModuleInfo* = &this.modules[cur];
             for (mut d: i64 = 0; d < info.dependencies.length; d++) {
                 const didx: i64 = this.find_module_index(info.dependencies[d]);
-                if (didx >= 0 && didx < n as i64 && !visited[didx]) {
+                if (didx < 0 || didx >= n as i64) {
+                    if (out_incomplete != null) { *out_incomplete = true; }
+                    continue;
+                }
+                if (!visited[didx]) {
                     visited[didx] = true;
                     queue.push(didx as u32);
                 }

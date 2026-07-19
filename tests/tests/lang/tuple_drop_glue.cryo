@@ -1,0 +1,71 @@
+///! Tuples of owned values drop each element at scope exit.
+///!
+///! Drop glue for a tuple used to be a documented no-op returning "handled",
+///! so a tuple whose elements own heap resources leaked every one of them
+///! while structs, classes, enums and fixed arrays all dropped correctly.
+///! `OwnershipQuery::needs_drop` already reported such a tuple as droppable,
+///! so drop insertion scheduled the drop and the glue then emitted nothing.
+///!
+///! Each `Probe::drop()` bumps a module counter; the tests assert exact
+///! counts, so a leak and a double free both fail. Nested and mixed tuples
+///! are covered because glue recurses per element: an element without a user
+///! `drop` re-enters glue for its own fields.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::TupleDropGlue;
+
+import std::core::result;
+import std::core::drop;
+import std::test::error;
+import std::test::assert;
+
+mut g_drop_count: i32 = 0;
+function reset() -> void { g_drop_count = 0; }
+function count() -> i32  { return g_drop_count; }
+
+type struct Probe { tag: i32; }
+implement trait Drop for struct Probe {
+    drop(mut &this) -> void { g_drop_count = g_drop_count + 1; }
+}
+
+// No user `drop`: dropping a Wrap has to go through field glue, which is how
+// a tuple element with no drop of its own still reaches the Probe inside.
+type struct Wrap { p: Probe; }
+
+![test]
+function tuple_drops_every_owning_element() -> Result<(), TestError> {
+    reset();
+    {
+        mut t: (Probe, Probe) = (Probe { tag: 1 }, Probe { tag: 2 });
+    }
+    return expect_eq(count(), 2);
+}
+
+![test]
+function tuple_skips_non_owning_elements() -> Result<(), TestError> {
+    reset();
+    {
+        // The i32 slot owns nothing and must not be dropped; only the Probe
+        // counts, so a glue that dropped every slot blindly would fail here.
+        mut t: (i32, Probe) = (42, Probe { tag: 3 });
+    }
+    return expect_eq(count(), 1);
+}
+
+![test]
+function tuple_element_drop_recurses_through_field_glue() -> Result<(), TestError> {
+    reset();
+    {
+        mut t: (Wrap, Probe) = (Wrap { p: Probe { tag: 4 } }, Probe { tag: 5 });
+    }
+    return expect_eq(count(), 2);
+}
+
+![test]
+function tuple_of_plain_values_drops_nothing() -> Result<(), TestError> {
+    reset();
+    {
+        mut t: (i32, i32) = (1, 2);
+    }
+    return expect_eq(count(), 0);
+}
