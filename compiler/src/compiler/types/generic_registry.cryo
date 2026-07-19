@@ -189,17 +189,24 @@ type struct GenericRegistry {
     type_index: HashMap<u64, i64>;      // TypeID -> entry index
 
     // -- Instantiation cache --
+    //
+    // Keyed by the CANONICAL instantiation id: `arena.create_instantiation`
+    // interns by (base, args), so the TypeRef it returns is the one identity
+    // for that instantiation and its id is the key.  This replaced a
+    // `make_cache_key` that built a `"base<a,b>"` STRING mirroring the arena's
+    // own key - one of three byte-identical copies of that format.
+    //
     // Kept as arrays for ordered iteration in collect_unmonomorphized
-    cache_keys: string[];
+    cache_keys: u64[];
     cache_refs: TypeRef[];
-    cache_index: HashMap<string, i64>;  // cache_key -> index in cache_refs
+    cache_index: HashMap<u64, i64>;     // canonical inst id -> index in cache_refs
 
     // -- Monomorphization tracking --
-    mono_set: HashMap<string, boolean>; // cache_key -> true
+    mono_set: HashMap<u64, boolean>;    // canonical inst id -> true
 
     // -- Per-module instantiation demand tracking --
     // Records which modules requested each instantiation.
-    demand: Pair<string, u32>[];  // .first = cache_key, .second = SymbolStr.id of module
+    demand: Pair<u64, u32>[];  // .first = canonical inst id, .second = SymbolStr.id of module
 
     // -- Trait-impl registry (Phase B.3) --
     // Maps `(trait_name, target_name)` -> ImplBlockNode*. Populated during
@@ -308,8 +315,8 @@ type struct GenericRegistry {
             type_index:        HashMap<u64, i64>::new(),
             cache_keys:        [],
             cache_refs:        [],
-            cache_index:       HashMap<string, i64>::new(),
-            mono_set:          HashMap<string, boolean>::new(),
+            cache_index:       HashMap<u64, i64>::new(),
+            mono_set:          HashMap<u64, boolean>::new(),
             demand:            [],
             trait_impls:       [],
             trait_impl_index:  HashMap<u64, i64>::new(),
@@ -804,15 +811,16 @@ type struct GenericRegistry {
         if (this.arena.symbolic_no_demand_active) {
             return this.arena.create_instantiation(base, args);
         }
-        const key: string = this.make_cache_key(base, args);
+        // The arena interns by (base, args), so this both finds-or-creates the
+        // canonical instantiation AND yields the key to record it under.
+        const inst: TypeRef = this.arena.create_instantiation(base, args);
+        const key: u64 = inst.id;
 
         const cached: Option<i64> = this.cache_index.get(&key);
         if (cached.is_some()) {
             return this.cache_refs[cached.unwrap()];
         }
 
-        // Cache miss: create new InstantiatedType
-        const inst: TypeRef = this.arena.create_instantiation(base, args);
         const idx: i64 = this.cache_keys.length;
         this.cache_keys.push(key);
         this.cache_refs.push(inst);
@@ -832,16 +840,15 @@ type struct GenericRegistry {
         const result: TypeRef = this.instantiate(base, args);
         // Record the demand regardless of cache hit; a module that uses
         // an already-cached instantiation still needs it available at codegen.
-        const key: string = this.make_cache_key(base, args);
-        this.demand.push(Pair<string, u32>::new(key, module.id));
+        this.demand.push(Pair<u64, u32>::new(result.id, module.id));
         return result;
     }
 
     /// Get all modules that requested a specific instantiation.
-    get_modules_using(&this, cache_key: string) -> SymbolStr[] {
+    get_modules_using(&this, cache_key: u64) -> SymbolStr[] {
         mut result: SymbolStr[] = [];
         for (mut i: i64 = 0; i < this.demand.length; i++) {
-            if (this.demand[i].first.eq(cache_key)) {
+            if (this.demand[i].first == cache_key) {
                 const sym: SymbolStr = SymbolStr::from_id(this.demand[i].second);
                 // Deduplicate: skip if already in result
                 mut found: boolean = false;
@@ -862,16 +869,25 @@ type struct GenericRegistry {
     //  Monomorphization tracking
 
     /// Check if an instantiation has already been monomorphized.
+    /// Pure lookup: an instantiation that was never created cannot have been
+    /// monomorphized, so an absent canonical id answers false.
     is_monomorphized(&this, base: TypeRef, args: &TypeRef[]) -> boolean {
-        const key: string = this.make_cache_key(base, args);
-        return this.mono_set.contains_key(&key);
+        const inst: TypeRef = this.arena.find_instantiation(base, args);
+        if (!inst.is_valid()) { return false; }
+        return this.mono_set.contains_key(&inst.id);
     }
 
     /// Mark an instantiation as monomorphized (specialization completed).
+    ///
+    /// Resolves through `create_instantiation`, not the pure lookup: this must
+    /// mark unconditionally, exactly as the old string key did.  In every real
+    /// flow the instantiation already exists, so this is an interner hit and
+    /// mints nothing - but keying off a lookup that can MISS would silently
+    /// drop the mark and leave the instantiation on the worklist forever.
     mark_monomorphized(mut &this, base: TypeRef, args: &TypeRef[]) -> void {
-        const key: string = this.make_cache_key(base, args);
-        if (!this.mono_set.contains_key(&key)) {
-            this.mono_set.insert(key, true);
+        const inst: TypeRef = this.arena.create_instantiation(base, args);
+        if (!this.mono_set.contains_key(&inst.id)) {
+            this.mono_set.insert(inst.id, true);
         }
     }
 
@@ -880,8 +896,7 @@ type struct GenericRegistry {
     collect_unmonomorphized(&this) -> TypeRef[] {
         mut result: TypeRef[] = [];
         for (mut i: i64 = 0; i < this.cache_keys.length; i++) {
-            const key: string = this.cache_keys[i];
-            if (!this.mono_set.contains_key(&key)) {
+            if (!this.mono_set.contains_key(&this.cache_keys[i])) {
                 result.push(this.cache_refs[i]);
             }
         }
@@ -896,18 +911,6 @@ type struct GenericRegistry {
     /// Number of monomorphized instantiations.
     mono_count(&this) -> i64 {
         return this.mono_set.length() as i64;
-    }
-
-    make_cache_key(&this, base: TypeRef, args: &TypeRef[]) -> string {
-        mut key: string = format("%llu<", base.id);
-        for (mut i: i64 = 0; i < args.length; i++) {
-            if (i > 0) {
-                key += ",";
-            }
-            key += format("%llu", args[i].id);
-        }
-        key += ">";
-        return key;
     }
 
     /// Update the secondary TypeID index for an existing entry.

@@ -21,6 +21,34 @@ import std::core::option;
 import std::collections::hashmap;
 
 
+/// One entry in the canonical structural interner (a hash-cons table).
+///
+/// The entry owns an IMMUTABLE copy of the key it was interned under: `kind`,
+/// the scalar discriminators `aux0`/`aux1`, and its operand type ids, which
+/// live in the arena's flat `intern_ops` pool at
+/// `[ops_start, ops_start + ops_len)`.
+///
+/// Keeping the key here - rather than reading it back off `ty`'s node - is the
+/// whole point.  Type nodes are MUTATED IN PLACE by design
+/// (`swap_wrapper_to_concrete` replaces an `InstantiatedType` with a concrete
+/// aggregate at the same id; `populate_concrete_type` fills fields later).  An
+/// interner that re-derived its key from the node would stop recognising an
+/// entry the moment the node changed, probe past it, and mint a SECOND id for
+/// a type that already exists - measurably breaking `a.id == b.id` for one
+/// semantic type.  Storing the key makes identity independent of every
+/// subsequent mutation.
+///
+/// All fields are Copy (`TypeRef` is a handle), so entries are freely copied
+/// and no owning buffer is aliased.
+type struct InternEntry {
+    kind:      TypeKind;
+    aux0:      u64;
+    aux1:      u64;
+    ops_start: i64;
+    ops_len:   i64;
+    ty:        TypeRef;
+}
+
 type struct TypeArena {
     // -- Ownership --
     types:   Type*[];           // All types (indexed by allocation order)
@@ -60,28 +88,32 @@ type struct TypeArena {
     f32_type:  TypeRef;
     f64_type:  TypeRef;
 
-    // -- Compound type dedup caches (key -> TypeRef) --
-    pointer_cache:   HashMap<string, TypeRef>;
-    reference_cache: HashMap<string, TypeRef>;
-    /// Array cache key: `(element.id << 32) | (size + 1)`.  Uses an integer
-    /// composite key as a PERF optimization: it avoids a per-lookup `format()`
-    /// allocation + string hash.  (It is NOT a correctness requirement -
-    /// `HashMap<string, V>` deduplicates by CONTENT today via `Hash`/`Eq for
-    /// string`, verified empirically; the string-keyed caches below rely on
-    /// that.  An older comment here claimed string equality was pointer-based;
-    /// that predated the `Eq for string` impl and was stale.)
-    array_cache:     HashMap<u64, TypeRef>;
-    optional_cache:  HashMap<string, TypeRef>;
-    function_cache:  HashMap<string, TypeRef>;
-    tuple_cache:     HashMap<string, TypeRef>;
-    /// InstantiatedType cache key: "baseId<arg0Id,arg1Id,...>"; mirrors
-    /// GenericRegistry.cache_index so that the substituter's direct calls
-    /// (apply_instantiation in substitution.cryo) share the same arena
-    /// slot as the registry-driven instantiations.  Without this, sema
-    /// creates a fresh unresolved InstantiatedType every time a generic
-    /// annotation is substituted inside a specialized template body, and
-    /// codegen's scope-call fallback walks `resolved_type` into a dead end.
-    instantiated_cache: HashMap<string, TypeRef>;
+    // -- Canonical structural interner ------------------------------------
+    //
+    // ONE dedup path for every structurally-identified compound type: Pointer,
+    // Reference, Array, Optional, Function, Tuple, AssocProjection and
+    // InstantiatedType.  Identity is exactly `(kind, aux0, aux1, operand ids)`,
+    // and `entry_matches` is the single formal authority on what that means.
+    // It replaces eight ad-hoc `format()`-built string keys, so there is now one
+    // definition of "same type" rather than one per constructor.
+    //
+    // A hash-cons table: `intern_cache` maps a 64-bit structural hash (linear
+    // probed) to an index into `intern_entries`, each of which holds an
+    // immutable copy of its key, with operands in the flat `intern_ops` pool.
+    // A hit is confirmed by EXACT comparison against that stored key, so
+    // identity never depends on hash quality NOR on the current state of the
+    // type's node - see `InternEntry`.  No key is materialized as a string: no
+    // per-lookup allocation and no string hashing on these hot paths.
+    //
+    // Deliberately NOT used for:
+    //   * nominal types (Struct/Class/Enum/Trait/Alias) - keyed by qualified
+    //     name; see the file header on why module-prefixed keys are wrong.
+    //   * GenericParam / BoundedParam - keyed by NAME ONLY, dropping `index`
+    //     and `bounds`.  That is a correctness fix, not an oversight: see
+    //     `create_generic_param`.  Re-including them here would regress it.
+    intern_entries: InternEntry[];
+    intern_ops:     TypeRef[];          // flat operand pool, sliced by InternEntry
+    intern_cache:   HashMap<u64, i64>;  // structural hash (probed) -> intern_entries index
 
     // -- User-defined type caches (SymbolStr.id -> TypeRef) --
     struct_cache: HashMap<u32, TypeRef>;
@@ -100,7 +132,6 @@ type struct TypeArena {
     // raw `string` equality is pointer-compare was stale (pre-`Eq for string`).
     generic_param_cache:   HashMap<u64, TypeRef>;
     bounded_param_cache:   HashMap<u64, TypeRef>;
-    assoc_projection_cache: HashMap<string, TypeRef>;
 
     // -- Reverse index: bare leaf name -> qualified name --
     // Populated by create_struct/class/enum/trait/alias.
@@ -141,13 +172,9 @@ type struct TypeArena {
             f32_type:  TypeRef::invalid(),
             f64_type:  TypeRef::invalid(),
 
-            pointer_cache:       HashMap<string, TypeRef>::new(),
-            reference_cache:     HashMap<string, TypeRef>::new(),
-            array_cache:         HashMap<u64, TypeRef>::new(),
-            optional_cache:      HashMap<string, TypeRef>::new(),
-            function_cache:      HashMap<string, TypeRef>::new(),
-            tuple_cache:         HashMap<string, TypeRef>::new(),
-            instantiated_cache:  HashMap<string, TypeRef>::new(),
+            intern_entries:      [],
+            intern_ops:          [],
+            intern_cache:        HashMap<u64, i64>::new(),
             struct_cache:        HashMap<u32, TypeRef>::new(),
             class_cache:         HashMap<u32, TypeRef>::new(),
             enum_cache:          HashMap<u32, TypeRef>::new(),
@@ -156,7 +183,6 @@ type struct TypeArena {
             func_template_cache: HashMap<u32, TypeRef>::new(),
             generic_param_cache: HashMap<u64, TypeRef>::new(),
             bounded_param_cache: HashMap<u64, TypeRef>::new(),
-            assoc_projection_cache: HashMap<string, TypeRef>::new(),
             leaf_index:          HashMap<u32, u32>::new(),
         };
 
@@ -254,6 +280,162 @@ type struct TypeArena {
     }
 
 
+    // -- Canonical structural interning ------------------------------------
+    //
+    // Every structurally-identified compound type is created through exactly
+    // one shape:
+    //
+    //     const hit: TypeRef = this.intern_find(KIND, aux0, aux1, &ops);
+    //     if (hit.is_valid()) { return hit; }
+    //     const ref: TypeRef = this.alloc_type(new ...);
+    //     this.intern_record(KIND, aux0, aux1, &ops, ref);
+    //
+    // `ops` carries the operand types in a fixed per-kind order; `aux0`/`aux1`
+    // carry the scalar discriminators (constness, mutability, array size,
+    // variadic-ness, projection member/trait).  Nothing else participates in
+    // identity.
+
+    /// Mix one 64-bit value into a structural hash (FNV-1a over its bytes).
+    hash_mix(&this, acc: u64, v: u64) -> u64 {
+        mut h: u64 = acc;
+        mut x: u64 = v;
+        for (mut i: i64 = 0; i < 8; i++) {
+            h = (h ^ (x & 255)) * 1099511628211;
+            x = x >> 8;
+        }
+        return h;
+    }
+
+    /// Structural hash of a canonical type key.  Only ever a bucket selector -
+    /// `entry_matches` decides identity, so a poor hash costs probes, never
+    /// correctness.  The operand COUNT is mixed in so that `(a)` and `(a, a)`
+    /// cannot land on the same key by accident.
+    structural_hash(&this, kind: TypeKind, aux0: u64, aux1: u64, ops: &TypeRef[]) -> u64 {
+        mut h: u64 = 2166136261;
+        h = this.hash_mix(h, kind as u64);
+        h = this.hash_mix(h, aux0);
+        h = this.hash_mix(h, aux1);
+        for (mut i: i64 = 0; i < ops.length; i++) {
+            h = this.hash_mix(h, ops[i].id);
+        }
+        return this.hash_mix(h, ops.length as u64);
+    }
+
+    /// Exact comparison of a stored entry against a canonical key.
+    ///
+    /// THE authority on structural type identity.  Compares ONLY the entry's
+    /// own immutable copy of the key - it never looks at `ty`'s node.  That is
+    /// what makes identity stable across in-place node mutation
+    /// (`swap_wrapper_to_concrete`, `populate_concrete_type`); see
+    /// `InternEntry`.  It also means derived data such as `computed_size` /
+    /// `computed_align`, filled in later by TypeLowering, can never split one
+    /// semantic type into two.
+    entry_matches(&this, idx: i64, kind: TypeKind, aux0: u64, aux1: u64,
+                  ops: &TypeRef[]) -> boolean {
+        if (idx < 0 || idx >= this.intern_entries.length) { return false; }
+        if (this.intern_entries[idx].kind != kind) { return false; }
+        if (this.intern_entries[idx].aux0 != aux0) { return false; }
+        if (this.intern_entries[idx].aux1 != aux1) { return false; }
+        if (this.intern_entries[idx].ops_len != ops.length) { return false; }
+        const base_off: i64 = this.intern_entries[idx].ops_start;
+        for (mut i: i64 = 0; i < ops.length; i++) {
+            if (this.intern_ops[base_off + i].id != ops[i].id) { return false; }
+        }
+        return true;
+    }
+
+    /// The interned type for this canonical key, or invalid when absent.
+    ///
+    /// Linear probing over the hash keyspace.
+    intern_find(&this, kind: TypeKind, aux0: u64, aux1: u64, ops: &TypeRef[]) -> TypeRef {
+        mut k: u64 = this.structural_hash(kind, aux0, aux1, ops);
+        // Terminates: the map holds finitely many keys, so probing distinct
+        // successive keys reaches an absent one in at most `count + 1` steps.
+        while (true) {
+            const slot: Option<i64> = this.intern_cache.get(&k);
+            if (slot.is_none()) { return TypeRef::invalid(); }
+            const idx: i64 = slot.unwrap();
+            if (this.entry_matches(idx, kind, aux0, aux1, ops)) {
+                return this.intern_entries[idx].ty;
+            }
+            k += 1;
+        }
+        return TypeRef::invalid();
+    }
+
+    /// Re-look-up entry `idx` using its OWN stored key.
+    /// Used by `verify_canonical_identity`; see there for why.
+    intern_find_entry_key(&this, idx: i64) -> TypeRef {
+        if (idx < 0 || idx >= this.intern_entries.length) { return TypeRef::invalid(); }
+        mut ops: TypeRef[] = [];
+        const s: i64 = this.intern_entries[idx].ops_start;
+        for (mut i: i64 = 0; i < this.intern_entries[idx].ops_len; i++) {
+            ops.push(this.intern_ops[s + i]);
+        }
+        return this.intern_find(this.intern_entries[idx].kind,
+                                this.intern_entries[idx].aux0,
+                                this.intern_entries[idx].aux1, &ops);
+    }
+
+    /// D1 SELF-CHECK: canonical type identity.
+    ///
+    /// Asserts the property the whole interner exists to provide - for any two
+    /// `TypeRef`s denoting the same semantic type, `a.id == b.id` - by checking
+    /// that every interned entry is still reachable BY ITS OWN KEY and resolves
+    /// to itself.  Returns the number of violations; 0 means identity is
+    /// canonical.
+    ///
+    /// A violation means two entries share one key while denoting different
+    /// types, i.e. identity forked.  That is exactly the defect an earlier
+    /// version of this interner had: it re-derived each key from the type's
+    /// NODE, so once a node was mutated in place (`swap_wrapper_to_concrete`)
+    /// its entry stopped matching, `intern_find` probed past it, and a SECOND
+    /// id was minted for a type that already existed.  Measured on a 12-line
+    /// program, three keys had forked into two ids each.  The suite still
+    /// passed, because the GenericRegistry's independent string key silently
+    /// compensated - which is why this check exists rather than relying on
+    /// tests to notice.
+    ///
+    /// O(n) lookups over the table; call it from diagnostics, not per-compile.
+    verify_canonical_identity(&this) -> i64 {
+        mut violations: i64 = 0;
+        for (mut i: i64 = 0; i < this.intern_entries.length; i++) {
+            const found: TypeRef = this.intern_find_entry_key(i);
+            if (found.id != this.intern_entries[i].ty.id) { violations += 1; }
+        }
+        return violations;
+    }
+
+    /// Record `ty` under this canonical key, copying the key into the table.
+    /// Must follow a failed `intern_find` with the SAME key, so the probe
+    /// lands on the first free slot of that key's chain.
+    intern_record(mut &this, kind: TypeKind, aux0: u64, aux1: u64,
+                  ops: &TypeRef[], ty: TypeRef) -> void {
+        mut k: u64 = this.structural_hash(kind, aux0, aux1, ops);
+        while (true) {
+            const slot: Option<i64> = this.intern_cache.get(&k);
+            if (slot.is_none()) {
+                const start: i64 = this.intern_ops.length;
+                for (mut i: i64 = 0; i < ops.length; i++) {
+                    this.intern_ops.push(ops[i]);
+                }
+                const idx: i64 = this.intern_entries.length;
+                this.intern_entries.push(InternEntry {
+                    kind:      kind,
+                    aux0:      aux0,
+                    aux1:      aux1,
+                    ops_start: start,
+                    ops_len:   ops.length,
+                    ty:        ty,
+                });
+                this.intern_cache.insert(k, idx);
+                return;
+            }
+            k += 1;
+        }
+    }
+
+
     // Compound type factories (deduplicated)
 
     /// Get or create a (non-const) pointer type to the given pointee.
@@ -265,59 +447,57 @@ type struct TypeArena {
     /// `const T*` from `T*`. The two are separate interned types (so the
     /// checker can forbid dropping const) but mangle and lower identically.
     get_pointer_to_q(mut &this, pointee: TypeRef, const_pointee: boolean) -> TypeRef {
-        mut const_tag: string = "mut";
-        if (const_pointee) { const_tag = "const"; }
-        mut key: string = format("ptr_%s_%lu", const_tag, pointee.id);
+        mut ops: TypeRef[] = [pointee];
+        mut aux: u64 = 0;
+        if (const_pointee) { aux = 1; }
 
-        const cached: Option<TypeRef> = this.pointer_cache.get(&key);
-        if (cached.is_some()) { return cached.unwrap(); }
+        const hit: TypeRef = this.intern_find(TypeKind::Pointer, aux, 0, &ops);
+        if (hit.is_valid()) { return hit; }
 
-        mut ref: TypeRef = this.alloc_type(new PointerType(this.next_id, pointee, const_pointee));
-        this.pointer_cache.insert(key, ref);
+        const ref: TypeRef = this.alloc_type(new PointerType(this.next_id, pointee, const_pointee));
+        this.intern_record(TypeKind::Pointer, aux, 0, &ops, ref);
         return ref;
     }
 
     /// Get or create a reference type to the given referent.
     get_reference_to(mut &this, referent: TypeRef, mutability: RefMutability) -> TypeRef {
-        mut mut_tag: string = "imm";
-        if (mutability.is_mutable()) {
-            mut_tag = "mut";
-        }
-        mut key: string = format("ref_%s_%lu", mut_tag, referent.id);
+        mut ops: TypeRef[] = [referent];
+        mut aux: u64 = 0;
+        if (mutability.is_mutable()) { aux = 1; }
 
-        const cached: Option<TypeRef> = this.reference_cache.get(&key);
-        if (cached.is_some()) { return cached.unwrap(); }
+        const hit: TypeRef = this.intern_find(TypeKind::Reference, aux, 0, &ops);
+        if (hit.is_valid()) { return hit; }
 
-        mut ref: TypeRef = this.alloc_type(new ReferenceType(this.next_id, referent, mutability));
-        this.reference_cache.insert(key, ref);
+        const ref: TypeRef = this.alloc_type(new ReferenceType(this.next_id, referent, mutability));
+        this.intern_record(TypeKind::Reference, aux, 0, &ops, ref);
         return ref;
     }
 
     /// Get or create an array type with the given element type and size.
-    /// Key layout: high 32 bits = element TypeRef ID, low 32 bits = size
-    /// offset by +1 so `-1` (dynamic) and `0` (fixed zero-length) don't
-    /// collide.  Caps support to 32-bit element IDs and 31-bit sizes;
-    /// both fit real programs with headroom.
+    /// `size` goes into the key as its raw two's-complement bits, so `-1`
+    /// (dynamic) and `0` (fixed zero-length) stay distinct without the old
+    /// `+1` offset - and without its 32-bit element-id / 31-bit size ceiling.
     get_array_of(mut &this, element: TypeRef, size: i64) -> TypeRef {
-        const key: u64 = (element.id << 32) | ((size + 1) as u64 & 0xFFFFFFFF);
+        mut ops: TypeRef[] = [element];
+        const aux: u64 = size as u64;
 
-        const cached: Option<TypeRef> = this.array_cache.get(&key);
-        if (cached.is_some()) { return cached.unwrap(); }
+        const hit: TypeRef = this.intern_find(TypeKind::Array, aux, 0, &ops);
+        if (hit.is_valid()) { return hit; }
 
-        mut ref: TypeRef = this.alloc_type(new ArrayType(this.next_id, element, size));
-        this.array_cache.insert(key, ref);
+        const ref: TypeRef = this.alloc_type(new ArrayType(this.next_id, element, size));
+        this.intern_record(TypeKind::Array, aux, 0, &ops, ref);
         return ref;
     }
 
     /// Get or create an optional type wrapping the given type.
     get_optional_of(mut &this, wrapped: TypeRef) -> TypeRef {
-        mut key: string = format("opt_%lu", wrapped.id);
+        mut ops: TypeRef[] = [wrapped];
 
-        const cached: Option<TypeRef> = this.optional_cache.get(&key);
-        if (cached.is_some()) { return cached.unwrap(); }
+        const hit: TypeRef = this.intern_find(TypeKind::Optional, 0, 0, &ops);
+        if (hit.is_valid()) { return hit; }
 
-        mut ref: TypeRef = this.alloc_type(new OptionalType(this.next_id, wrapped));
-        this.optional_cache.insert(key, ref);
+        const ref: TypeRef = this.alloc_type(new OptionalType(this.next_id, wrapped));
+        this.intern_record(TypeKind::Optional, 0, 0, &ops, ref);
         return ref;
     }
 
@@ -328,38 +508,41 @@ type struct TypeArena {
     // the owning FunctionType (TypeRef is Copy, so this is a cheap shallow copy).
     get_function(mut &this, ret: TypeRef, params: &TypeRef[], is_variadic: boolean) -> TypeRef {
         LOG_DEBUG(LogComponent::TypeChecker, "[TypeArena] get_function() ret=%lu params=%lld", ret.id, params.length);
-        mut key: string = format("fn_ret_%lu", ret.id);
+        // ops[0] = return type, ops[1..] = parameters.
+        mut ops: TypeRef[] = [ret];
         for (mut i: i64 = 0; i < params.length; i++) {
-            key = format("%s_%lu", key, params[i].id);
+            ops.push(params[i]);
         }
-        if (is_variadic) {
-            key += "_var";
-        }
+        mut aux: u64 = 0;
+        if (is_variadic) { aux = 1; }
 
-        const cached: Option<TypeRef> = this.function_cache.get(&key);
-        if (cached.is_some()) { return cached.unwrap(); }
+        const hit: TypeRef = this.intern_find(TypeKind::Function, aux, 0, &ops);
+        if (hit.is_valid()) { return hit; }
 
         mut params_owned: TypeRef[] = [];
         for (mut i: i64 = 0; i < params.length; i++) {
             params_owned.push(params[i]);
         }
-        mut ref: TypeRef = this.alloc_type(new FunctionType(this.next_id, ret, params_owned, is_variadic));
-        this.function_cache.insert(key, ref);
+        const ref: TypeRef = this.alloc_type(new FunctionType(this.next_id, ret, params_owned, is_variadic));
+        this.intern_record(TypeKind::Function, aux, 0, &ops, ref);
         return ref;
     }
 
     /// Get or create a tuple type.
     get_tuple(mut &this, elements: TypeRef[]) -> TypeRef {
-        mut key: string = "tuple";
+        // `elements` is MOVED into the TupleType below, so snapshot the operand
+        // ids into an independent buffer first - `ops` must stay readable for
+        // `intern_record` after the move.
+        mut ops: TypeRef[] = [];
         for (mut i: i64 = 0; i < elements.length; i++) {
-            key = format("%s_%lu", key, elements[i].id);
+            ops.push(elements[i]);
         }
 
-        const cached: Option<TypeRef> = this.tuple_cache.get(&key);
-        if (cached.is_some()) { return cached.unwrap(); }
+        const hit: TypeRef = this.intern_find(TypeKind::Tuple, 0, 0, &ops);
+        if (hit.is_valid()) { return hit; }
 
-        mut ref: TypeRef = this.alloc_type(new TupleType(this.next_id, elements));
-        this.tuple_cache.insert(key, ref);
+        const ref: TypeRef = this.alloc_type(new TupleType(this.next_id, elements));
+        this.intern_record(TypeKind::Tuple, 0, 0, &ops, ref);
         return ref;
     }
 
@@ -507,13 +690,16 @@ type struct TypeArena {
     /// projection always shares one arena slot - important so the
     /// monomorphizer's `set_resolved_type` reaches every reference.
     create_assoc_projection(mut &this, base: TypeRef, member: SymbolStr, owning_trait: TypeRef) -> TypeRef {
-        const key: string = format("%llu::%u@%llu", base.id, member.id, owning_trait.id);
-        const cached: Option<TypeRef> = this.assoc_projection_cache.get(&key);
-        if (cached.is_some()) { return cached.unwrap(); }
+        mut ops: TypeRef[] = [base];
+        const aux0: u64 = member.id as u64;
+        const aux1: u64 = owning_trait.id;
 
-        mut ref: TypeRef = this.alloc_type(
+        const hit: TypeRef = this.intern_find(TypeKind::AssocProjection, aux0, aux1, &ops);
+        if (hit.is_valid()) { return hit; }
+
+        const ref: TypeRef = this.alloc_type(
             new AssocProjectionType(this.next_id, base, member, owning_trait));
-        this.assoc_projection_cache.insert(key, ref);
+        this.intern_record(TypeKind::AssocProjection, aux0, aux1, &ops, ref);
         return ref;
     }
 
@@ -534,21 +720,14 @@ type struct TypeArena {
     // is copied into the owning InstantiatedType (TypeRef is Copy).  Callers
     // keep ownership and can reuse the array for demand tracking.
     create_instantiation(mut &this, base: TypeRef, args: &TypeRef[]) -> TypeRef {
-        // Append in place (`+=`) rather than rebuilding via `format("%s...", key)`
-        // each iteration: the latter copies the whole accumulated key per arg,
-        // making a hot-path lookup quadratic in the arg count.  Matches
-        // `Monomorphizer::make_key_for`, which keys the same shape.
-        mut key: string = format("%llu<", base.id);
+        // ops[0] = generic base, ops[1..] = type arguments.
+        mut ops: TypeRef[] = [base];
         for (mut i: i64 = 0; i < args.length; i++) {
-            if (i > 0) { key += ","; }
-            key += format("%llu", args[i].id);
+            ops.push(args[i]);
         }
-        key += ">";
 
-        const cached: Option<TypeRef> = this.instantiated_cache.get(&key);
-        if (cached.is_some()) {
-            return cached.unwrap();
-        }
+        const hit: TypeRef = this.intern_find(TypeKind::InstantiatedType, 0, 0, &ops);
+        if (hit.is_valid()) { return hit; }
 
         mut args_owned: TypeRef[] = [];
         for (mut i: i64 = 0; i < args.length; i++) {
@@ -560,8 +739,20 @@ type struct TypeArena {
         // never-instantiated template and are never monomorphized/codegen'd).
         if (this.symbolic_no_demand_active) { inst_node.is_symbolic = true; }
         const ref: TypeRef = this.alloc_type(inst_node);
-        this.instantiated_cache.insert(key, ref);
+        this.intern_record(TypeKind::InstantiatedType, 0, 0, &ops, ref);
         return ref;
+    }
+
+    /// The canonical instantiation for (base, args) if one already exists,
+    /// else invalid.  A PURE lookup: unlike `create_instantiation` it never
+    /// mints a type, so callers that only need the identity KEY (registry
+    /// bookkeeping, mono tracking) cannot perturb the arena by asking.
+    find_instantiation(&this, base: TypeRef, args: &TypeRef[]) -> TypeRef {
+        mut ops: TypeRef[] = [base];
+        for (mut i: i64 = 0; i < args.length; i++) {
+            ops.push(args[i]);
+        }
+        return this.intern_find(TypeKind::InstantiatedType, 0, 0, &ops);
     }
 
     /// Create an error type for type resolution failures.
@@ -1263,11 +1454,12 @@ type struct TypeArena {
         cdebug("  Total:         %lld\n", this.types.length);
 
         cdebug("\n=== Dedup Caches ===\n");
-        cdebug("  Pointer: %lld | Reference: %lld | Array: %lld | Optional: %lld\n",
-            this.pointer_cache.length(), this.reference_cache.length(),
-            this.array_cache.length(), this.optional_cache.length());
-        cdebug("  Function: %lld | Tuple: %lld | GenericParam: %lld | BoundedParam: %lld\n",
-            this.function_cache.length(), this.tuple_cache.length(),
+        // One structural interner now covers ptr/ref/array/optional/fn/tuple/
+        // assoc-projection/instantiation; the per-kind counts it replaced are
+        // recoverable from the type census above.
+        cdebug("  Structural interner: %lld entries | canonical-identity violations: %lld\n",
+            this.intern_entries.length, this.verify_canonical_identity());
+        cdebug("  GenericParam: %lld | BoundedParam: %lld\n",
             this.generic_param_cache.length(), this.bounded_param_cache.length());
         cdebug("  Struct: %lld | Class: %lld | Enum: %lld | Trait: %lld | Alias: %lld\n",
             this.struct_cache.length(), this.class_cache.length(),
