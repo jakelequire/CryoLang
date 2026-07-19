@@ -101,6 +101,25 @@ type struct LiteralResolver {
                 }
                 return this.state.expected_type;
             }
+            // `char` is a 32-bit unsigned Unicode scalar, so an integer literal
+            // in a `char` position adopts `char` the same way one in a `u8`
+            // position adopts `u8`.  This is what keeps `buf[n] = 0` (writing a
+            // NUL terminator into a `char[]`) cast-free.  Without it the literal
+            // falls back to the `i32` default and then has to cross the
+            // Char/Int width lattice in `check_compatibility`, which correctly
+            // refuses a signed 32-bit value narrowing into an unsigned 32-bit
+            // one - turning every NUL terminator into an error.
+            if (exp != null && exp.kind == TypeKind::Char) {
+                const char_max: u64 = sema_int_unsigned_bound(32);
+                if (char_max != 0 && int_literal_exceeds(lit.value, char_max)) {
+                    this.ctx.emit_error_at(
+                        ErrorCode::E0010_NUMBER_TOO_LARGE,
+                        format("integer literal `%s` is out of range for type `char`",
+                            lit.value),
+                        lit.span);
+                }
+                return this.state.expected_type;
+            }
         }
         // No integer expected-type hint: pick the narrowest default width that
         // holds the literal's magnitude (i32 -> i64 -> u64).

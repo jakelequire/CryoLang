@@ -135,8 +135,9 @@ is written entirely in Cryo, and the public surface is frozen under semver.
 - **`collections`:** `Array<T>`, `String`, `HashMap<K,V>`, `HashSet<T>`,
   `Pair<A,B>`, `Slice<T>`, `Str`.
 - **`core`:** `Copy`/`Drop`/`Clone`/`Eq`/`Ord`/`Hash`/`Default`/`From`/`Into`/
-  `TryFrom`/`TryInto`/`Display`/`Debug`/`FmtWrite`/`Iterator`/`Error`
-  traits; `Option<T>` and `Result<T,E>`.
+  `TryFrom`/`TryInto`/`Display`/`Debug`/`FmtWrite`/`Iterator` traits;
+  `Option<T>`, `Result<T,E>`, and the catch-all `Error` struct (there is no
+  unifying `Error` *trait* — each module defines its own precise error type).
 - **`core::iter`:** `Iterator` with an associated `type Item` (one required
   `next() -> Option<This::Item>`); the legacy generic-param form `Iterator<T>`
   remains accepted as positional sugar for `Iterator<Item = T>` in impls,
@@ -147,8 +148,8 @@ is written entirely in Cryo, and the public surface is frozen under semver.
   `.enumerate()` / `.zip(other)` (returning `TakeIter` / `MapIter` /
   `FilterIter` / `ChainIter` / `EnumerateIter` / `ZipIter`); `f`/`pred` are
   non-capturing functions (E0458). `.enumerate()` yields `Pair<u64, Item>`,
-  `.zip(other)` yields `Pair<Item, B>` and stops at the shorter side (Cryo has
-  no heterogeneous tuple literal, so `Pair` is the element type). Combinators
+  `.zip(other)` yields `Pair<Item, B>` and stops at the shorter side (`Pair` is
+  the element type so the adapters stay monomorphization-friendly). Combinators
   chain freely (`r.take(n).map(f).filter(p)`, `r.chain(b).map(f)`,
   `a.zip(b).count()`, longer mixed chains) and feed `.count()` / `.fold(..)` /
   `for (x in ..)`. The adapters resolve on any concrete `Iterator` receiver,

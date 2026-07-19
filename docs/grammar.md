@@ -14,14 +14,14 @@ Namespace          ::= "namespace" QualName ";"
 
 TopLevelItem       ::= Import | ModuleDecl | VarDecl | FunctionDecl
                      | ExternDecl | CHeaderImport | IntrinsicDecl
-                     | AggregateDecl | EnumDecl | TraitDecl
+                     | AggregateDecl | UnionDecl | EnumDecl | TraitDecl
                      | TypeAlias | ImplBlock | StaticAssert
 
 Statement          ::= VarDecl | FunctionDecl
                      | AggregateDecl | EnumDecl | TraitDecl
                      | TypeAlias | ImplBlock
                      | If | While | For | "loop" Block | DoWhile
-                     | Match | Switch
+                     | Match | Switch | StaticMatch
                      | "break" ";" | "continue" ";" | Return
                      | "unsafe" Block | AsmBlock | Block | Expr ";"
 
@@ -252,6 +252,7 @@ Primary            ::= Literal
                      | "typeof"  "(" Expr ")"
                      | IfExpr
                      | Match
+                     | StaticMatch
                      | Lambda
                      | "delete" Expr           (* parsed; see cryo.md section 21 *)
                      | "await"  Expr           (* parsed; no async semantics yet *)

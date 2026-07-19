@@ -411,7 +411,20 @@ type struct TypeChecker {
             }
         }
 
-        // Char <-> integer conversions
+        // Char <-> integer conversions.
+        //
+        // Deliberately width-blind in BOTH directions, which means `i64 -> char`
+        // truncates silently (and outside the call-argument lossy-narrowing
+        // gate, so nothing else catches it).  This is a known hole, left open on
+        // purpose: closing it requires first deciding how wide `char` actually
+        // is, and the codebase currently disagrees with itself.
+        //   * `CharType::size_bytes`/`alignment` say 4, `map_type` lowers it to
+        //     `i32`, and `core/hash.cryo` folds it as "a 32-bit Unicode scalar".
+        //   * `string` is a NUL-terminated `i8*`, and the stdlib routinely reads
+        //     `this[i]` into an `i8` - i.e. treats `char` as one byte.
+        // Applying the integer width lattice here (the obvious fix) makes every
+        // one of those stdlib reads a narrowing error, so the lattice cannot be
+        // turned on until `char`'s width is settled one way or the other.
         if (from_type.kind == TypeKind::Char && to_type.kind == TypeKind::Int) {
             return TypeCompatibility::ImplicitConvert;
         }
@@ -491,12 +504,21 @@ type struct TypeChecker {
         mut from_int: IntType* = _from as IntType*;
         mut to_int: IntType*   = to as IntType*;
 
-        mut from_width: u64 = from_int.bit_width();
-        mut to_width: u64   = to_int.bit_width();
+        return TypeChecker::width_lattice(
+            from_int.bit_width(), from_int.is_signed(),
+            to_int.bit_width(),   to_int.is_signed());
+    }
 
-        mut from_signed: boolean = from_int.is_signed();
-        mut to_signed: boolean   = to_int.is_signed();
-
+    /// The integral conversion lattice, in terms of width and signedness
+    /// alone: widening is implicit, narrowing and any signedness change need
+    /// an explicit `as`.
+    ///
+    /// Split out from `check_int_compatibility` because `char` obeys the same
+    /// rules - it is a 32-bit unsigned Unicode scalar (`CharType::size_bytes`
+    /// is 4), not a free-converting type - and both callers must agree on
+    /// where truncation happens.
+    static width_lattice(from_width: u64, from_signed: boolean,
+                         to_width: u64,   to_signed: boolean) -> TypeCompatibility {
         // Same signedness
         if (from_signed == to_signed) {
             if (from_width < to_width) {
