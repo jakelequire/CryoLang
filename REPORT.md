@@ -78,13 +78,13 @@ string-keyed monomorphization era).
   `types/checker.cryo:470-475` — `i64 -> char` silently truncates outside the
   call-arg lossy-narrowing gate.
 
-- [ ] **No branch-type agreement checks in if/ternary/match expressions**
+- [x] **No branch-type agreement checks in if/ternary/match expressions**
   `sema/sema.cryo:1750-1766` (if/ternary return then-type or else-type with no
   compatibility check); `sema.cryo:1808-1810` (match returns `outer_expected`
   or the first arm's tail type; comment at :1866 admits arm agreement is
   assumed, never verified).
 
-- [ ] **Tuple drop glue is a silent no-op — tuples of owned values leak**
+- [x] **Tuple drop glue is a silent no-op — tuples of owned values leak**
   `codegen/ops/call_emitter.cryo:1280-1284` (documented in-code).
 
 ---
@@ -135,12 +135,12 @@ string-keyed monomorphization era).
   handling the match-expr path has**
   `codegen/ir_generator.cryo:1808-1842` vs `:1739-1773`.
 
-- [ ] **Raw `void*` LLVMTypeRef `==` comparisons at three coercion gates**
+- [x] **Raw `void*` LLVMTypeRef `==` comparisons at three coercion gates**
   contradict a comment claiming `==` on them lowers to strcmp
   (`ir_generator.cryo:2018-2021` vs `ops/expr_ops.cryo:869, 2141`,
   `call_emitter.cryo:1139`). Determine which is true; make it one way.
 
-- [ ] **Loop-resident dynamic allocas at ~10 spill sites** — unbounded stack
+- [x] **Loop-resident dynamic allocas at ~10 spill sites** — unbounded stack
   growth in hot loops.
 
 - [ ] **DirectPair expansion triggered by an arity-mismatch heuristic**
@@ -158,7 +158,7 @@ string-keyed monomorphization era).
   prelude-reachable layout change leaves a consumer's key unchanged while its
   `.o` has baked-in field offsets. Most likely future "impossible bug."
 
-- [ ] **Unresolvable dependency names silently dropped from the closure**
+- [x] **Unresolvable dependency names silently dropped from the closure**
   `module_graph.cryo:427-431` — a missing invalidation edge, not a
   conservative one. Note: the same skip is accidentally why import cycles
   work (`module_graph.cryo:351-353` + `module_loader.cryo:660-668`) — cycles
@@ -402,7 +402,7 @@ hazard classes above.
   (`CLI/commands.cryo:1753`) — a typo'd requirement silently changes
   semantics from "gated" to "always-on". Fail on unknown tokens.
 
-- [ ] **`make test` does not rebuild the compiler** when
+- [x] **`make test` does not rebuild the compiler** when
   `compiler/build/cryo` exists (`Makefile:375-378`) — stale-binary gating
   footgun; consider a fingerprint check.
 
@@ -445,7 +445,7 @@ hazard classes above.
   (`types/ownership.cryo:503-513`) — document that `Send` is advisory.
 - [x] **`->` contradiction**: cryo.md §5.6 + precedence table list
   `p->field`; `grammar.md:234` says "there is no `->` operator."
-- [ ] **`![derive(Trait, ...)]` listed (§17.1) with no list of derivable
+- [x] **`![derive(Trait, ...)]` listed (§17.1) with no list of derivable
   traits anywhere.**
 - [x] **Tuple story inconsistency**: cryo.md §2.6 documents heterogeneous
   tuple literals fully; CHANGELOG.md:151 says "Cryo has no heterogeneous

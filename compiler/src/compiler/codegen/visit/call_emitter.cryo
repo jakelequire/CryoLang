@@ -88,6 +88,22 @@ type struct CallEmitter {
     /// `&mut` borrow sees the caller's storage.  Otherwise (rvalue: a
     /// literal, a global like a string constant, a computed value) we spill
     /// it to a fresh stack slot and return that slot's address.
+    /// Stack slot for a value spilled so its address can be taken, allocated in
+    /// the function's entry block so a spill inside a loop body doesn't grow
+    /// the stack once per iteration.  Falls back to an in-place alloca when the
+    /// insert block has no parent function.
+    entry_spill_slot(&this, ty: LType, name: string) -> LValue {
+        const bb: LBasicBlock = this.cg.builder.get_insert_block();
+        if (bb.is_valid()) {
+            const fn: LValue = bb.get_parent();
+            if (fn.is_valid()) {
+                const slot: LValue = this.cg.flow.create_entry_alloca(fn, name, ty);
+                if (slot.is_valid()) { return slot; }
+            }
+        }
+        return this.cg.builder.build_alloca(ty, name);
+    }
+
     address_of_value(&this, v: LValue) -> LValue {
         // LLVMOpcode::Load == 27.  On non-instruction values (globals,
         // constants) GetInstructionOpcode won't return 27, so we fall
@@ -98,7 +114,11 @@ type struct CallEmitter {
             if (operand != null) { return LValue { raw: operand }; }
         }
         const ty: LType = LType { raw: llvm::LLVMTypeOf(v.raw) };
-        const slot: LValue = this.cg.builder.build_alloca(ty, "argref");
+        // Entry-block slot: allocas are only reclaimed at function exit, so
+        // spilling here for a call inside a loop body would allocate a fresh
+        // slot per iteration.  Only the alloca is hoisted - the store below
+        // stays at the current insert point.
+        const slot: LValue = this.entry_spill_slot(ty, "argref");
         this.cg.builder.build_store(v, slot);
         return slot;
     }
@@ -1003,7 +1023,7 @@ type struct CallEmitter {
                 // Spill it to a fresh slot so `this` points at real memory.
                 if (obj.is_valid() && !this.state.last_is_lvalue) {
                     const recv_ty: LType = LType { raw: llvm::LLVMTypeOf(obj.raw) };
-                    const recv_slot: LValue = this.cg.builder.build_alloca(recv_ty, "recvtmp");
+                    const recv_slot: LValue = this.entry_spill_slot(recv_ty, "recvtmp");
                     this.cg.builder.build_store(obj, recv_slot);
                     obj = recv_slot;
                 }
@@ -1277,11 +1297,48 @@ type struct CallEmitter {
             }
             return true;
         }
-        // Optional / tuple glue is not yet emitted.  Returning true (no-op)
-        // keeps these compiling with today's behavior rather than erroring;
-        // user-written `T?` desugars to Option<T> (an Enum, handled above),
-        // so this only affects bare tuples of owned elements.
+        if (t.kind == TypeKind::Tuple) {
+            const tt: TupleType* = t as TupleType*;
+            this.emit_tuple_element_drops(visitor, receiver, tt);
+            return true;
+        }
+        // User-written `T?` desugars to Option<T> (an Enum, handled above), so
+        // no Optional type reaches here; anything else that does owns nothing.
         return true;
+    }
+
+    /// Drop each owning element of a tuple in place via synthesized
+    /// `receiver.N.drop()` calls.  Tuple positional access is a member access
+    /// whose member symbol is the decimal index (see `place_emitter`'s Tuple
+    /// branch), so the element access is built exactly like a struct field's
+    /// and re-enters the normal `.drop()` lowering - elements without a user
+    /// drop recurse back through glue.
+    emit_tuple_element_drops(mut &this, visitor: ASTVisitor*,
+                             receiver: ExpressionNode*, tt: TupleType*) -> void {
+        if (tt == null) { return; }
+        const arena: TypeArena* = this.cg.get_arena();
+        if (arena == null) { return; }
+        const registry: GenericRegistry* = this.cg.ctx.generic_registry;
+        const intern: InternTable* = this.cg.get_intern();
+        const drop_sym: SymbolStr = intern.intern("drop");
+        for (mut i: i64 = 0; i < tt.elements.length; i++) {
+            const elem_type: TypeRef = tt.elements[i];
+            if (!OwnershipQuery::needs_drop(arena, registry, intern, elem_type)) {
+                continue;
+            }
+            const idx_sym: SymbolStr = intern.intern(format("%ld", i));
+            mut elem_access: MemberAccessNode* = new MemberAccessNode(
+                receiver, idx_sym, receiver.span, receiver.span);
+            elem_access.set_resolved_type(elem_type);
+            mut drop_access: MemberAccessNode* = new MemberAccessNode(
+                elem_access as ExpressionNode*, drop_sym,
+                receiver.span, receiver.span);
+            mut call: CallExprNode* = new CallExprNode(
+                drop_access as ExpressionNode*, receiver.span);
+            mut stmt: ExprStmtNode* = new ExprStmtNode(
+                call as ExpressionNode*, receiver.span);
+            stmt.accept(visitor);
+        }
     }
 
     /// Drop each element of a fixed-size array in place via synthesized

@@ -1,0 +1,69 @@
+///! Float literals passed to `f32` parameters adopt the parameter's width.
+///!
+///! A bare float literal defaults to f64. In argument position the call
+///! resolver only pushes the parameter type onto an allowlist of argument
+///! shapes and otherwise CLEARS the hint, so a float literal kept its f64
+///! default and the call handed the callee a `double` against a `float`
+///! signature. The integer path survives the same clearing because the call
+///! boundary carries an Integer<-Integer width coercion; there is no float
+///! twin, so this reached LLVM and failed module verification outright -
+///! `take_f32(1.5)` did not compile at all.
+///!
+///! Generics were incidental: the failure reproduced on a plain non-generic
+///! `f32` parameter. The generic cases are covered too because they were how
+///! it first surfaced (via `math/`'s type-suffixed `min_f32`/`clamp_f32`,
+///! which exist to work around exactly this).
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::F32LiteralArgs;
+
+import std::core::result;
+import std::test::error;
+import std::test::assert;
+
+function take_f32(a: f32) -> f32 { return a; }
+function add_f32(a: f32, b: f32) -> f32 { return a + b; }
+function ident<T>(a: T) -> T { return a; }
+
+function gmin<T>(a: T, b: T) -> T {
+    static match (T) {
+        _ => { if (a < b) { return a; } return b; }
+    }
+}
+
+// f32 carries ~7 significant digits, so compare with a tolerance rather than
+// for bit equality after the f64 -> f32 narrowing.
+function near(a: f32, b: f64) -> boolean {
+    const d: f64 = (a as f64) - b;
+    if (d < 0.0) { return (0.0 - d) < 0.0001; }
+    return d < 0.0001;
+}
+
+![test]
+function float_literal_arg_to_f32_param() -> Result<(), TestError> {
+    return expect(near(take_f32(1.5), 1.5), Str::new("take_f32(1.5)"));
+}
+
+![test]
+function multiple_float_literal_args() -> Result<(), TestError> {
+    return expect(near(add_f32(1.5, 2.25), 3.75), Str::new("add_f32(1.5, 2.25)"));
+}
+
+![test]
+function float_literal_arg_to_generic_at_f32() -> Result<(), TestError> {
+    return expect(near(ident<f32>(1.5), 1.5), Str::new("ident<f32>(1.5)"));
+}
+
+![test]
+function float_literal_arg_through_static_match() -> Result<(), TestError> {
+    return expect(near(gmin<f32>(1.5, 2.5), 1.5), Str::new("gmin<f32>(1.5, 2.5)"));
+}
+
+![test]
+function f64_params_still_take_full_precision() -> Result<(), TestError> {
+    // The hint is gated on a NARROWER-than-f64 slot, so an f64 parameter must
+    // keep the literal's full f64 default - no silent round-trip through f32.
+    const v: f64 = ident<f64>(0.1);
+    const d: f64 = v - 0.1;
+    return expect(d == 0.0, Str::new("f64 literal unchanged"));
+}

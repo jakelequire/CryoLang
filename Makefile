@@ -18,6 +18,16 @@ PIN        := $(ROOT)/bin/cryo
 STAGE2     := $(ROOT)/compiler/build/cryo
 LIBCRYO_A  := $(ROOT)/stdlib/.bin/libcryo.a
 
+# Every .cryo the self-hosted compiler is built from.  The stage-2 file rules
+# below depend on these so an existing `compiler/build/cryo[.exe]` is treated
+# as stale once any source changes: without prerequisites Make considers the
+# binary up to date merely because it exists, and `make test` then gates a
+# stale compiler while reporting green.  Pure-Make recursion (no `$(shell)`)
+# so the Windows host doesn't need a POSIX `find`.
+rwildcard = $(foreach d,$(wildcard $(1:=/*)),$(call rwildcard,$d,$2) $(filter $(subst *,%,$2),$d))
+CRYO_SOURCES := $(call rwildcard,$(ROOT)/compiler/src,*.cryo) \
+                $(call rwildcard,$(ROOT)/stdlib,*.cryo)
+
 # ---- Host detection ---------------------------------------------------
 # Decides which native flow runs (Linux vs Windows) and where WSL has to
 # step in.  Two probes:
@@ -197,13 +207,13 @@ endif
 # File-target rule so downstream targets (test, lsp) can depend on the
 # binary itself instead of the phony `cryo` target. If the binary is
 # present, Make treats it as up-to-date and skips the rebuild.
-$(STAGE2):
+$(STAGE2): $(CRYO_SOURCES)
 	@$(MAKE) --no-print-directory cryo
 
 # Windows counterpart: the native build emits `cryo.exe`, so a Windows-host
 # `test`/`test-list` depends on this path instead of $(STAGE2).  Same
 # delegate-to-`cryo` shape; `cryo` is host-branched so it builds correctly.
-$(STAGE2_EXE):
+$(STAGE2_EXE): $(CRYO_SOURCES)
 	@$(MAKE) --no-print-directory cryo
 
 # File-target rule for the stdlib static library so `test` rebuilds it

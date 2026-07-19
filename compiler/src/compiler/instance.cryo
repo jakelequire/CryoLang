@@ -1667,7 +1667,10 @@ type struct CompilerInstance {
                 Compiler::BuildManifest::ModuleKeyTable::read_module_keys(ctx.project_config.module_keys_path());
 
             // Per-module key (indexed by module index, parallel arrays).
-            for (mut m: u32 = 0; m < n; m++) { pm_cached.push(false); }
+            // `pm_closure_ok` clears for any module whose import closure came
+            // back short; such a module is never served from cache.
+            mut pm_closure_ok: boolean[] = [];
+            for (mut m: u32 = 0; m < n; m++) { pm_cached.push(false); pm_closure_ok.push(true); }
             for (mut m: u32 = 0; m < n; m++) {
                 const mi: ModuleInfo* = &ctx.module_graph.modules[m];
                 const ns: string = ctx.intern_table.resolve(mi.name);
@@ -1678,13 +1681,18 @@ type struct CompilerInstance {
                     k.fold(pm_global);
                 } else {
                     k.fold("leaf");
+                    mut clos_incomplete: boolean = false;
                     const clos: boolean[] =
-                        ctx.module_graph.compute_import_closure(m, n);
+                        ctx.module_graph.compute_import_closure(m, n, &clos_incomplete);
                     for (mut i: u32 = 0; i < n; i++) {
                         if (clos[order[i] as i64]) {
                             k.fold(pm_src_h[order[i] as i64]);
                         }
                     }
+                    // An unresolvable dependency name left the closure short, so
+                    // this key doesn't cover everything the module was compiled
+                    // against.  Rebuild rather than risk a stale `.o`.
+                    if (clos_incomplete) { pm_closure_ok[m as i64] = false; }
                 }
                 pm_key_names.push(ns);
                 pm_key_hex.push(k.finish().to_hex_padded_str(16));
@@ -1693,6 +1701,7 @@ type struct CompilerInstance {
             // Cached if the prior key matches AND the .o is still on disk.
             if (pm_active) {
                 for (mut m: u32 = 0; m < n; m++) {
+                    if (!pm_closure_ok[m as i64]) { continue; }
                     const mi: ModuleInfo* = &ctx.module_graph.modules[m];
                     const prior_k: string = pm_prior.lookup(pm_key_names[m as i64]);
                     if (prior_k == "") { continue; }
