@@ -567,6 +567,20 @@ type struct CallResolver {
 
     // -- Generic free-call inference (the keystone) --
 
+    /// The generic function template a bare call names, or null when that can't
+    /// be decided.
+    ///
+    /// Candidates are every registered template with a matching leaf name and
+    /// arity, which spans the WHOLE program - templates are registered
+    /// globally, not per importer. So two unrelated modules each defining a
+    /// generic `min` both land here for either one's callers, and preferring a
+    /// module-local definition only settles the case where the caller defines
+    /// one itself. The deciding question for everyone else is which definition
+    /// the caller's imports actually bring into scope; the name resolver's
+    /// scope chain already answers it. Without that tier a same-named generic
+    /// anywhere in the program makes every call to either one return null here,
+    /// which skips generic inference entirely and leaves the call typed at its
+    /// abstract return type (reported far away as `expected i32, found T`).
     find_fn_template_for_call(&this, name: SymbolStr, argc: i64) -> TemplateEntry* {
         const reg: GenericRegistry* = this.ctx.generic_registry;
         if (reg == null) { return null; }
@@ -574,7 +588,18 @@ type struct CallResolver {
         mut count: i64 = 0;
         mut module_match: TemplateEntry* = null;
         mut module_match_count: i64 = 0;
+        mut import_match: TemplateEntry* = null;
+        mut import_match_count: i64 = 0;
         const cur_mod: string = this.current_module_name();
+        // Empty when the name isn't a function visible from this scope, in
+        // which case no candidate can claim an import match and the ladder
+        // falls through to its previous behaviour.
+        mut vis_mod: string = "";
+        const resolver: Resolver* = this.ctx.get_resolver();
+        if (resolver != null) {
+            const vis_sym: SymbolStr = resolver.resolve_function_source_module(name);
+            if (vis_sym.is_valid()) { vis_mod = this.intern.resolve(vis_sym); }
+        }
         const total: i64 = reg.template_count();
         for (mut i: i64 = 0; i < total; i++) {
             const cand: TemplateEntry* = &reg.entries[i];
@@ -591,9 +616,16 @@ type struct CallResolver {
                 module_match = cand;
                 module_match_count = module_match_count + 1;
             }
+            if (vis_mod != "" && cand_mod.eq(vis_mod)) {
+                import_match = cand;
+                import_match_count = import_match_count + 1;
+            }
         }
         if (count == 1) { return found; }
+        // A definition in the caller's own module wins over an imported one:
+        // that is ordinary shadowing, and it is what the previous ladder did.
         if (module_match_count == 1) { return module_match; }
+        if (import_match_count == 1) { return import_match; }
         return null;
     }
 
@@ -694,6 +726,9 @@ type struct CallResolver {
         const tmpl: FunctionDeclNode* = entry.ast_node as FunctionDeclNode*;
         if (tmpl == null) { return TypeRef::invalid(); }
         if (entry.param_type_ids.length == 0) { return TypeRef::invalid(); }
+        // Record WHICH template won, not just the type args: only sema has the
+        // caller's import scope, so mono can't re-derive this choice.
+        call.set_resolved_template(entry.qualified_name);
 
         mut bindings: TypeRef[] = [];
         for (mut i: i64 = 0; i < entry.param_type_ids.length; i++) { bindings.push(TypeRef::invalid()); }

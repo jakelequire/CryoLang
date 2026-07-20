@@ -521,7 +521,7 @@ hazard classes above.
 - [ ] `ffi/libc.cryo:992-1000` — Windows `readlink` special-cases the literal
   `"/proc/self/exe"`, breaking the module's "mirrors headers verbatim"
   contract; `env::current_exe` depends on the magic string.
-- [ ] `math/` type-suffixed free functions (`min_f32`, `clamp_i64` —
+- [x] `math/` type-suffixed free functions (`min_f32`, `clamp_i64` —
   `math/_module.cryo:196-251`) against the codebase's own no-suffix
   direction (blocked on a generic-codegen limitation; note the blocker).
 - [ ] `core/error.cryo` — 22-line catch-all with raw `string` message;
