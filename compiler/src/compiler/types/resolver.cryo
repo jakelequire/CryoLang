@@ -19,6 +19,7 @@ import Compiler::AST;
 import Compiler::AST::{ Node, Declaration, Statement, Expression };
 import Compiler::Resolver::{ SymbolStr, InternTable, Resolver };
 import Compiler::DeclIndex;
+import Compiler::ConstTable;
 import Utils::Logger;
 import std::collections::pair;
 
@@ -108,6 +109,8 @@ type struct TypeResolver {
     module_registry:  ModuleTypeRegistry*;
     name_resolver:    Resolver*;
     decl_index:       DeclarationIndex*;
+    /// Folded module-level integer constants, for `T[NAME]` array sizes.
+    const_table:      ConstantTable*;
     diagnostics:      DiagnosticSink*;
     bootstrap_mode:   boolean;     // true during Phase 5 (TypeResolution) when DI is being populated
 
@@ -120,7 +123,8 @@ type struct TypeResolver {
                generic_registry: GenericRegistry*,
                module_registry: ModuleTypeRegistry*,
                name_resolver: Resolver*,
-               decl_index: DeclarationIndex*) -> TypeResolver {
+               decl_index: DeclarationIndex*,
+               const_table: ConstantTable*) -> TypeResolver {
         return TypeResolver {
             arena:            arena,
             intern_table:     intern_table,
@@ -128,6 +132,7 @@ type struct TypeResolver {
             module_registry:  module_registry,
             name_resolver:    name_resolver,
             decl_index:       decl_index,
+            const_table:      const_table,
             diagnostics:      null,
             bootstrap_mode:   true,
         };
@@ -147,6 +152,51 @@ type struct TypeResolver {
 
 
     // Main resolve entry point
+
+    /// The element count for an array annotation.
+    ///
+    /// A literal size and `T[]` are already authoritative.  A `T[NAME]` /
+    /// `T[NAME * 2]` arrives fixed-pending with its size expression intact and
+    /// is folded here, once names are bound; the result is written back to the
+    /// annotation so repeat resolutions are free.
+    ///
+    /// A size that will not fold is reported rather than left pending: a
+    /// pending size reaches codegen as an array descriptor with no storage
+    /// behind it, and every access through it is then a wild pointer.
+    array_size_of(&this, a: ArrayAnnotation*, ctx: ResolutionContext*) -> i64 {
+        if (a.size != ArrayAnnotation::fixed_pending_size()) { return a.size; }
+        if (a.size_expr == null) { return a.size; }
+
+        const module_ns: SymbolStr = if (this.intern_table != null) {
+            this.intern_table.intern(ctx.current_module)
+        } else { SymbolStr::empty() };
+
+        mut folded: i64 = 0;
+        if (ConstantTable::fold_i64(a.size_expr, this.const_table, module_ns,
+                                     this.intern_table, &folded)) {
+            if (folded < 0) {
+                if (this.diagnostics != null) {
+                    this.diagnostics.emit(Diagnostic::error(
+                        ErrorCode::E0239_NON_CONST_ARRAY_SIZE,
+                        format("array size must not be negative (folded to %ld)",
+                               folded)).at(a.span));
+                }
+                return 0;
+            }
+            a.size = folded;              // cache: fold once per annotation
+            return folded;
+        }
+
+        if (this.diagnostics != null) {
+            this.diagnostics.emit(Diagnostic::error(
+                ErrorCode::E0239_NON_CONST_ARRAY_SIZE,
+                "array size must be a compile-time integer constant")
+                .at(a.span)
+                .help("only integer literals and named integer constants "
+                      "may size an array"));
+        }
+        return 0;
+    }
 
     /// Resolve a TypeAnnotation to a TypeRef.
     resolve(&this, ann: TypeAnnotation*, ctx: ResolutionContext*) -> TypeRef {
@@ -201,7 +251,7 @@ type struct TypeResolver {
                 if (!elem.is_valid()) {
                     return TypeRef::invalid();
                 }
-                return this.arena.get_array_of(elem, a.size);
+                return this.arena.get_array_of(elem, this.array_size_of(a, ctx));
             }
             TypeAnnotation::Function(f) => {
                 this.resolve_function(f, ctx)

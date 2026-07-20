@@ -13,15 +13,30 @@
 ///!     declared on matching struct/class/impl blocks.
 ///!
 ///! Scope-resolution completion:
-///!   - Reads the identifier text immediately before `::`.
-///!   - Interns it to get a SymbolStr, then walks all modules to
-///!     enumerate static methods (struct/class/impl) and enum variants.
+///!   - Reads the whole scope path before `::` - every `seg::` group, not
+///!     just the last segment, so `Types::Foo::` and a bare `Foo::` stay
+///!     distinct scopes.
+///!   - Resolves that path to a qualified declaration name: an already-
+///!     qualified path is taken at face value, a bare leaf goes through the
+///!     compiler's own import-scoped resolution
+///!     (`DeclarationIndex::resolve_qualified_scoped`) against the editing
+///!     file's namespace.
+///!   - Walks all modules to enumerate static methods (struct/class/impl)
+///!     and enum variants on that declaration.
+///!   - When the path names a namespace rather than a type, enumerates the
+///!     declarations that namespace contains.
+///!
+///! Both member walks match a declaration on its module namespace AND its
+///! leaf whenever the target is qualified.  Matching on the leaf alone
+///! merges every same-named declaration in the program into one list, which
+///! is what made scope completion appear to work only sometimes.
 ///!
 ///! Falls back to a static keyword list when type info is unavailable.
 ///!
 ///! Member enumeration + item building hang off `CompletionEngine`, a
 ///! per-request object holding the module graph / intern table / type
-///! arena.  `handle_completion` is the only free function.
+///! arena / declaration index.  `handle_completion` is the only free
+///! function.
 
 namespace Lsp::Handlers::Completion;
 
@@ -33,6 +48,7 @@ import std::collections::array;
 import std::json::value;
 
 import Compiler::CompilationContext;
+import Compiler::DeclIndex;
 import Compiler::AST;
 import Compiler::AST::Node;
 import Compiler::AST::Expression;
@@ -59,8 +75,12 @@ import Lsp::Protocol::Conv;
 const CK_METHOD:      i64 = 2;
 const CK_FUNCTION:    i64 = 3;
 const CK_FIELD:       i64 = 5;
+const CK_CLASS:       i64 = 7;
+const CK_INTERFACE:   i64 = 8;
+const CK_ENUM:        i64 = 13;
 const CK_KEYWORD:     i64 = 14;
 const CK_ENUM_MEMBER: i64 = 20;
+const CK_STRUCT:      i64 = 22;
 
 
 // Public entry point
@@ -136,6 +156,22 @@ public function handle_completion(docs: &Docs, sessions: mut &SessionMap,
         ident_start = ident_start - 1;
     }
     if (ident_start == ident_end_excl) { return CompletionEngine::make_keyword_list(); }
+
+    // For `::` the qualifier is part of the name: keep walking back over
+    // preceding `seg::` groups so the whole path is captured.  Scraping only
+    // the last segment makes `A::Foo::` and `B::Foo::` indistinguishable.
+    if (is_scope) {
+        while (ident_start >= 2 && ptr[ident_start - 1] == COLON
+                                && ptr[ident_start - 2] == COLON) {
+            mut seg_start: u64 = ident_start - 2;
+            while (seg_start > 0 && CompletionEngine::is_ident_byte(ptr[seg_start - 1])) {
+                seg_start = seg_start - 1;
+            }
+            // A `::` with no identifier before it is not part of the path.
+            if (seg_start == ident_start - 2) { break; }
+            ident_start = seg_start;
+        }
+    }
 
     // Build NUL-terminated C-string from the identifier bytes
     const ident_len: u64 = ident_end_excl - ident_start;
@@ -229,10 +265,16 @@ public function handle_completion(docs: &Docs, sessions: mut &SessionMap,
             }
         }
     } else {
-        // Scope-resolution completion: enumerate static methods + enum variants.
-        const name_sym: SymbolStr = ctx.intern_table.intern(ident_cstr);
-        if (name_sym.is_valid()) {
-            eng.collect_scope_members(name_sym, &items);
+        // Scope-resolution completion: resolve the scraped path the way the
+        // editing module would, then enumerate static methods + enum variants
+        // on the declaration it names.
+        const target: SymbolStr = eng.resolve_scope_path(ident_cstr, ast.namespace_name);
+        if (target.is_valid()) {
+            eng.collect_scope_members(target, &items);
+        }
+        // A path that names no declaration may still name a namespace.
+        if (items.length == 0) {
+            eng.collect_namespace_members(ident_cstr, &items);
         }
     }
 
@@ -256,13 +298,38 @@ type struct CompletionEngine {
     graph:  ModuleGraph*;
     intern: InternTable*;
     arena:  TypeArena*;
+    decl:   DeclarationIndex*;
 
     static new(ctx: CompilationContext*) -> CompletionEngine {
         return CompletionEngine {
             graph:  ctx.module_graph,
             intern: ctx.intern_table,
             arena:  ctx.type_arena,
+            decl:   ctx.decl_index,
         };
+    }
+
+
+    // Scope-path resolution
+
+    /// Resolve the scope path scraped before `::` to the qualified
+    /// declaration name it refers to.  An already-qualified path is taken at
+    /// face value; a bare leaf goes through the compiler's own import-scoped
+    /// resolution against `use_site_ns`, so the members offered are the ones
+    /// this file would actually bind.
+    ///
+    /// A miss or an import-visible ambiguity yields the bare name unchanged.
+    /// The collectors key off whether the result carries a qualifier, so an
+    /// unresolved name degrades to a leaf match - the widest list that can be
+    /// offered honestly - rather than to nothing.
+    resolve_scope_path(&this, path: string, use_site_ns: string) -> SymbolStr {
+        if (this.intern == null) { return SymbolStr::empty(); }
+        const bare: SymbolStr = this.intern.intern(path);
+        if (this.decl == null || CompletionEngine::has_scope_separator(path)) {
+            return bare;
+        }
+        const ns: SymbolStr = this.intern.intern(use_site_ns);
+        return this.decl.resolve_qualified_scoped(bare, ns, this.intern).resolved_or(bare);
     }
 
 
@@ -272,31 +339,32 @@ type struct CompletionEngine {
     /// `type_sym` into `items`.
     collect_instance_members(&this, type_sym: SymbolStr,
                              items: mut &Array<JsonValue>) -> void {
-        if (this.graph == null) { return; }
-        const type_leaf: string = if (this.intern != null) {
-            CompletionEngine::leaf_after_separator(this.intern.resolve(type_sym))
-        } else { "" };
+        if (this.graph == null || this.intern == null) { return; }
+        const target: string   = this.intern.resolve(type_sym);
+        const leaf: string     = CompletionEngine::leaf_after_separator(target);
+        const exact: boolean   = CompletionEngine::has_scope_separator(target);
 
         const n: u32 = this.graph.module_count();
         for (mut mi: u32 = 0; mi < n; mi++) {
             const mod_ast: ProgramNode* = this.graph.get_module_ast(mi);
             if (mod_ast == null) { continue; }
+            const mod_ns: string = mod_ast.namespace_name;
             for (mut si: i64 = 0; si < mod_ast.statements.length; si++) {
                 const stmt: ASTNode* = CompletionEngine::unwrap_top_decl(mod_ast.statements[si]);
                 if (stmt == null) { continue; }
                 if (stmt.kind == NodeKind::StructDeclaration) {
                     const d: StructDeclNode* = stmt as StructDeclNode*;
-                    if (!this.names_match(d.name, type_sym, type_leaf)) { continue; }
+                    if (!this.decl_matches(d.name, mod_ns, target, leaf, exact)) { continue; }
                     this.add_fields(&d.fields, items);
                     this.add_instance_methods(&d.methods, items);
                 } else if (stmt.kind == NodeKind::ClassDeclaration) {
                     const d: ClassDeclNode* = stmt as ClassDeclNode*;
-                    if (!this.names_match(d.name, type_sym, type_leaf)) { continue; }
+                    if (!this.decl_matches(d.name, mod_ns, target, leaf, exact)) { continue; }
                     this.add_fields(&d.fields, items);
                     this.add_instance_methods(&d.methods, items);
                 } else if (stmt.kind == NodeKind::ImplementationBlock) {
                     const d: ImplBlockNode* = stmt as ImplBlockNode*;
-                    if (!this.names_match(d.target_type, type_sym, type_leaf)) { continue; }
+                    if (!this.ref_matches(d.target_type, mod_ns, target, leaf, exact)) { continue; }
                     this.add_instance_methods(&d.methods, items);
                 }
             }
@@ -307,34 +375,79 @@ type struct CompletionEngine {
     /// `name_sym` into `items`.
     collect_scope_members(&this, name_sym: SymbolStr,
                           items: mut &Array<JsonValue>) -> void {
-        if (this.graph == null) { return; }
-        const name_leaf: string = if (this.intern != null) {
-            CompletionEngine::leaf_after_separator(this.intern.resolve(name_sym))
-        } else { "" };
+        if (this.graph == null || this.intern == null) { return; }
+        const target: string = this.intern.resolve(name_sym);
+        const leaf: string   = CompletionEngine::leaf_after_separator(target);
+        const exact: boolean = CompletionEngine::has_scope_separator(target);
 
         const n: u32 = this.graph.module_count();
         for (mut mi: u32 = 0; mi < n; mi++) {
             const mod_ast: ProgramNode* = this.graph.get_module_ast(mi);
             if (mod_ast == null) { continue; }
+            const mod_ns: string = mod_ast.namespace_name;
             for (mut si: i64 = 0; si < mod_ast.statements.length; si++) {
                 const stmt: ASTNode* = CompletionEngine::unwrap_top_decl(mod_ast.statements[si]);
                 if (stmt == null) { continue; }
                 if (stmt.kind == NodeKind::EnumDeclaration) {
                     const d: EnumDeclNode* = stmt as EnumDeclNode*;
-                    if (!this.names_match(d.name, name_sym, name_leaf)) { continue; }
+                    if (!this.decl_matches(d.name, mod_ns, target, leaf, exact)) { continue; }
                     this.add_enum_variants(&d.variants, items);
                 } else if (stmt.kind == NodeKind::StructDeclaration) {
                     const d: StructDeclNode* = stmt as StructDeclNode*;
-                    if (!this.names_match(d.name, name_sym, name_leaf)) { continue; }
+                    if (!this.decl_matches(d.name, mod_ns, target, leaf, exact)) { continue; }
                     this.add_static_methods(&d.methods, items);
                 } else if (stmt.kind == NodeKind::ClassDeclaration) {
                     const d: ClassDeclNode* = stmt as ClassDeclNode*;
-                    if (!this.names_match(d.name, name_sym, name_leaf)) { continue; }
+                    if (!this.decl_matches(d.name, mod_ns, target, leaf, exact)) { continue; }
                     this.add_static_methods(&d.methods, items);
                 } else if (stmt.kind == NodeKind::ImplementationBlock) {
                     const d: ImplBlockNode* = stmt as ImplBlockNode*;
-                    if (!this.names_match(d.target_type, name_sym, name_leaf)) { continue; }
+                    if (!this.ref_matches(d.target_type, mod_ns, target, leaf, exact)) { continue; }
                     this.add_static_methods(&d.methods, items);
+                }
+            }
+        }
+    }
+
+    /// Walk all modules whose namespace is exactly `ns` and add the
+    /// declarations they contain.  This is what makes a path that names a
+    /// namespace (`Compiler::Types::`) complete to its contents instead of
+    /// falling through to the keyword list.
+    collect_namespace_members(&this, ns: string, items: mut &Array<JsonValue>) -> void {
+        if (this.graph == null || this.intern == null) { return; }
+        if (strlen(ns) == 0) { return; }
+
+        const n: u32 = this.graph.module_count();
+        for (mut mi: u32 = 0; mi < n; mi++) {
+            const mod_ast: ProgramNode* = this.graph.get_module_ast(mi);
+            if (mod_ast == null) { continue; }
+            if (strcmp(mod_ast.namespace_name, ns) != 0) { continue; }
+            for (mut si: i64 = 0; si < mod_ast.statements.length; si++) {
+                const stmt: ASTNode* = CompletionEngine::unwrap_top_decl(mod_ast.statements[si]);
+                if (stmt == null) { continue; }
+                if (stmt.kind == NodeKind::StructDeclaration) {
+                    const d: StructDeclNode* = stmt as StructDeclNode*;
+                    CompletionEngine::push_item(items, this.intern.resolve(d.name),
+                                                "struct", CK_STRUCT);
+                } else if (stmt.kind == NodeKind::ClassDeclaration) {
+                    const d: ClassDeclNode* = stmt as ClassDeclNode*;
+                    CompletionEngine::push_item(items, this.intern.resolve(d.name),
+                                                "class", CK_CLASS);
+                } else if (stmt.kind == NodeKind::EnumDeclaration) {
+                    const d: EnumDeclNode* = stmt as EnumDeclNode*;
+                    CompletionEngine::push_item(items, this.intern.resolve(d.name),
+                                                "enum", CK_ENUM);
+                } else if (stmt.kind == NodeKind::TraitDeclaration) {
+                    const d: TraitDeclNode* = stmt as TraitDeclNode*;
+                    CompletionEngine::push_item(items, this.intern.resolve(d.name),
+                                                "trait", CK_INTERFACE);
+                } else if (stmt.kind == NodeKind::FunctionDeclaration) {
+                    const d: FunctionDeclNode* = stmt as FunctionDeclNode*;
+                    const detail: string = if (this.arena != null) {
+                        "(...) -> " + this.arena.resolve_display_name_short(d.resolved_return_type.id)
+                    } else { "" };
+                    CompletionEngine::push_item(items, this.intern.resolve(d.name),
+                                                detail, CK_FUNCTION);
                 }
             }
         }
@@ -415,14 +528,57 @@ type struct CompletionEngine {
         return cur;
     }
 
-    /// True when `decl_name` matches `type_sym` either by SymbolStr id
-    /// or by string content versus the pre-extracted leaf segment.
-    names_match(&this, decl_name: SymbolStr, type_sym: SymbolStr,
-                type_leaf: string) -> boolean {
-        if (decl_name.equals(type_sym)) { return true; }
-        if (this.intern == null || strlen(type_leaf) == 0) { return false; }
+    /// True when the declaration `decl_name`, declared in module namespace
+    /// `mod_ns`, is the one `target` names.
+    ///
+    /// With a qualified target the namespace must agree as well as the leaf.
+    /// Leaf-only matching merges every same-named declaration in the program
+    /// into a single completion list; it is kept as the fallback for an
+    /// unqualified target, which is either a name that did not resolve or a
+    /// builtin registered without a namespace.
+    decl_matches(&this, decl_name: SymbolStr, mod_ns: string, target: string,
+                 target_leaf: string, exact: boolean) -> boolean {
+        if (this.intern == null) { return false; }
         const dn: string = this.intern.resolve(decl_name);
-        return strcmp(dn, type_leaf) == 0;
+        if (!exact) {
+            if (strlen(target_leaf) == 0) { return false; }
+            return strcmp(dn, target_leaf) == 0;
+        }
+        // `target` must read exactly "<mod_ns>::<dn>".
+        const nl: i64 = strlen(mod_ns) as i64;
+        if (nl == 0) { return false; }
+        for (mut i: i64 = 0; i < nl; i++) {
+            if (target[i] == 0 || target[i] != mod_ns[i]) { return false; }
+        }
+        if (target[nl] != ':' || target[nl + 1] != ':') { return false; }
+        return strcmp(dn, target + nl + 2) == 0;
+    }
+
+    /// True when a type *reference* written inside module namespace `mod_ns`
+    /// - an `implement` block's target - denotes the declaration `target`
+    /// names.  Unlike a declaration's own name, the reference may be bare and
+    /// bind to a type declared elsewhere, so it is resolved through the same
+    /// import-scoped lookup before comparison.
+    ref_matches(&this, ref_name: SymbolStr, mod_ns: string, target: string,
+                target_leaf: string, exact: boolean) -> boolean {
+        if (this.intern == null) { return false; }
+        const rn: string = this.intern.resolve(ref_name);
+        if (!exact) {
+            if (strlen(target_leaf) == 0) { return false; }
+            return strcmp(CompletionEngine::leaf_after_separator(rn), target_leaf) == 0;
+        }
+        const resolved: SymbolStr = this.resolve_scope_path(rn, mod_ns);
+        if (!resolved.is_valid()) { return false; }
+        return strcmp(this.intern.resolve(resolved), target) == 0;
+    }
+
+    /// True when `s` contains a `::` scope separator.
+    static has_scope_separator(s: string) -> boolean {
+        const len: i64 = strlen(s) as i64;
+        for (mut i: i64 = 0; i + 1 < len; i++) {
+            if (s[i] == ':' && s[i + 1] == ':') { return true; }
+        }
+        return false;
     }
 
 

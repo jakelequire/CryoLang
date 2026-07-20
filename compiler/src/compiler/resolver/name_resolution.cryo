@@ -11,7 +11,8 @@
 namespace Compiler::Resolver::NameResolution;
 
 import Compiler::Resolver;
-import Compiler::Resolver::{ SymbolID, SymbolStr, Symbol, Scope, Resolver, QualifiedName };
+import Compiler::Resolver::{ SymbolID, SymbolStr, Symbol, Scope, Resolver, QualifiedName, InternTable };
+import Compiler::ConstTable;
 import Compiler::Diag;
 import Compiler::Diag::{ Snapshot, SourceSpan };
 import Compiler::AST;
@@ -138,6 +139,9 @@ public:
                             var_node.name, var_node.span)
                     };
                     this.resolver.record_resolution(var_node.span, sym_id);
+                    if (!var_node.is_mutable) {
+                        this.record_const_value(var_node);
+                    }
                 }
             }
             NodeKind::ImportDeclaration => {
@@ -903,6 +907,34 @@ public:
     }
 
     /// Process an import declaration: bring imported names into current scope.
+    /// Fold a module-level `const NAME: <int> = expr;` and record its value.
+    ///
+    /// Fixed array sizes (`u8[NAME]`) are resolved long before codegen turns a
+    /// const into a runtime global, so the value has to be captured here or the
+    /// array's size is never known.  Statements are walked in source order, so
+    /// a constant defined in terms of an earlier one folds too.
+    ///
+    /// A non-integer or non-constant initializer is simply not recorded; only
+    /// a use that needs the value (an array size) reports anything.
+    record_const_value(&this, node: VarDeclNode*) -> void {
+        if (this.ctx == null || this.ctx.const_table == null) { return; }
+        const intern: InternTable* = this.ctx.intern_table;
+        if (intern == null) { return; }
+
+        mut value: i64 = 0;
+        if (!ConstantTable::fold_i64(node.initializer, this.ctx.const_table,
+                                      this.ctx.namespace_str, intern, &value)) {
+            return;
+        }
+
+        const qualified: SymbolStr = if (this.ctx.has_namespace()) {
+            ConstantTable::intern_qualified(intern, this.ctx.namespace_str, node.name)
+        } else {
+            node.name
+        };
+        this.ctx.const_table.register(qualified, node.name, value);
+    }
+
     process_import(node: ImportDeclNode*) -> void {
         const module_path: string = node.module_path;
         LOG_DEBUG(LogComponent::General, "[NameResolver] process_import() module='%s'", module_path);

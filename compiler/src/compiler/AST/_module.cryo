@@ -321,9 +321,13 @@ implement enum TypeAnnotation {
             }
             TypeAnnotation::Array(arr) => {
                 const a: ArrayAnnotation* = new ArrayAnnotation {
-                    element: TypeAnnotation::clone_ptr(arr.element),
-                    size:    arr.size,
-                    span:    arr.span,
+                    element:   TypeAnnotation::clone_ptr(arr.element),
+                    size:      arr.size,
+                    // Shared, not cloned: the size expression is read-only
+                    // input to the constant fold, and the fold result lands in
+                    // `size` on whichever copy resolves first.
+                    size_expr: arr.size_expr,
+                    span:      arr.span,
                 };
                 new TypeAnnotation::Array(a)
             }
@@ -461,13 +465,17 @@ type struct ReferenceAnnotation {
 type struct ArrayAnnotation {
     element: TypeAnnotation*;
     size:    i64;
+    /// The unfolded size expression for `T[CONST]` / `T[CONST * 2]`, kept
+    /// until the type resolver can bind names and fold it to `size`.  Null
+    /// once `size` is authoritative (a literal size, or `T[]`).
+    size_expr: ExpressionNode*;
     span:    SourceSpan;
 
     // Sentinel `size` values for the two `size < 0` array shapes; the
     // resolver copies `size` verbatim into `ArrayType`, whose matching
     // `heap_dynamic_size()` / `fixed_pending_size()` are authoritative.
     //   heap-dynamic `T[]`  : owns a heap buffer (droppable)
-    //   fixed-pending `T[N]`: named-const / computed N, resolved later
+    //   fixed-pending `T[N]`: named-const / computed N, awaiting the fold
     static heap_dynamic_size()  -> i64 { return -1; }
     static fixed_pending_size() -> i64 { return -2; }
 }

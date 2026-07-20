@@ -14,6 +14,8 @@
 namespace Compiler::Sema::Helpers;
 
 import Compiler::AST;
+import Compiler::ConstTable;
+import Compiler::Resolver::SymbolStr;
 import Compiler::AST::Node;
 import Compiler::AST::Expression;
 import Compiler::Lex;
@@ -284,79 +286,15 @@ public function int_literal_exceeds(s: string, max_mag: u64) -> boolean {
 
 /// Fold a compile-time-constant integer expression to its i64 value, for width
 /// selection only (the actual computation is left to codegen at the chosen
-/// width).  Accepts the same shapes as `is_constant_numeric_expr`.  Returns
-/// false (caller leaves width unchanged) for anything non-constant or whenever a
-/// step would overflow i64 or hit a constant divide-by-zero - bailing is always
-/// safe since it just preserves the existing default width.
+/// width).  Returns false - leaving the caller's width unchanged - for anything
+/// non-constant, and for any step that would overflow i64 or divide by a
+/// constant zero.
+///
+/// Literal arithmetic only: width selection runs before array sizes are folded
+/// and has no constant table to resolve a named constant against, so an
+/// identifier reads as non-constant here.
 public function try_fold_const_i64(expr: ExpressionNode*, out: i64*) -> boolean {
-    if (expr == null) { return false; }
-    const node: ASTNode* = expr as ASTNode*;
-    if (node.kind == NodeKind::Literal) {
-        const lit: LiteralNode* = expr as LiteralNode*;
-        if (lit.literal_kind != LiteralKind::Integer) { return false; }
-        mut v: u64 = 0;
-        if (!parse_int_literal_u64(lit.value, &v)) { return false; }
-        if (v > SEMA_I64_MAX_MAG) { return false; }   // needs > i64; bail
-        *out = v as i64;
-        return true;
-    }
-    if (node.kind == NodeKind::UnaryExpression) {
-        const u: UnaryExprNode* = expr as UnaryExprNode*;
-        mut a: i64 = 0;
-        if (!try_fold_const_i64(u.operand, &a)) { return false; }
-        if (u.op.lexeme == "-") { *out = 0 - a; return true; }
-        if (u.op.lexeme == "+") { *out = a; return true; }
-        if (u.op.lexeme == "~") { *out = ~a; return true; }
-        return false;
-    }
-    if (node.kind == NodeKind::BinaryExpression) {
-        const b: BinaryExprNode* = expr as BinaryExprNode*;
-        mut x: i64 = 0;
-        mut y: i64 = 0;
-        if (!try_fold_const_i64(b.left, &x)) { return false; }
-        if (!try_fold_const_i64(b.right, &y)) { return false; }
-        const op: string = b.op.lexeme;
-        const I64MAX: i64 = SEMA_I64_MAX_MAG as i64;
-        const I64MIN: i64 = (0 - I64MAX) - 1;
-        if (op == "+") {
-            if (y > 0 && x > I64MAX - y) { return false; }
-            if (y < 0 && x < I64MIN - y) { return false; }
-            *out = x + y; return true;
-        }
-        if (op == "-") {
-            if (y < 0 && x > I64MAX + y) { return false; }
-            if (y > 0 && x < I64MIN + y) { return false; }
-            *out = x - y; return true;
-        }
-        if (op == "*") {
-            if (x == 0 || y == 0) { *out = 0; return true; }
-            // Bail on the trap edge and on overflow (checked by re-division).
-            if (x == I64MIN || y == I64MIN) { return false; }
-            const p: i64 = x * y;
-            if (p / y != x) { return false; }
-            *out = p; return true;
-        }
-        if (op == "/" || op == "%") {
-            if (y == 0) { return false; }
-            if (x == I64MIN && y == 0 - 1) { return false; }
-            *out = if (op == "/") { x / y } else { x % y };
-            return true;
-        }
-        if (op == "<<") {
-            if (y < 0 || y >= 63 || x < 0) { return false; }
-            if (x > (I64MAX >> y)) { return false; }
-            *out = x << y; return true;
-        }
-        if (op == ">>") {
-            if (y < 0 || y >= 64) { return false; }
-            *out = x >> y; return true;
-        }
-        if (op == "&") { *out = x & y; return true; }
-        if (op == "|") { *out = x | y; return true; }
-        if (op == "^") { *out = x ^ y; return true; }
-        return false;
-    }
-    return false;
+    return ConstantTable::fold_i64(expr, null, SymbolStr::empty(), null, out);
 }
 
 /// Parse a member-name as a non-negative tuple index.  Returns -1 for any
