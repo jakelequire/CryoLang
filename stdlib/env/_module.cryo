@@ -18,6 +18,7 @@ import core::slice;
 import collections::array;
 import collections::str;
 import collections::string;
+import collections::pair;
 import ffi::libc;
 
 /// Filled in by the C runtime before `main` runs. These are weak
@@ -26,11 +27,23 @@ import ffi::libc;
 mut argc_global: i32 = 0;
 mut argv_global: u8** = null;
 
+/// The environment vector the C runtime passed as `main`'s third
+/// argument (`char** envp`), a NUL-terminated array of `KEY=VALUE`
+/// C strings. Null until the generated `main` prologue publishes it via
+/// `set_env`; `vars()` reads it.
+mut envp_global: u8** = null;
+
 /// Called by the generated `main` entry point to publish argv/argc.
 /// Ordinary code should never call this.
 function set_args(argc: i32, argv: u8**) -> void {
     argc_global = argc;
     argv_global = argv;
+}
+
+/// Called by the generated `main` entry point to publish the environment
+/// vector. Ordinary code should never call this.
+function set_env(envp: u8**) -> void {
+    envp_global = envp;
 }
 
 /// Program arguments as UTF-8 strings. The first element is the
@@ -56,6 +69,51 @@ function var(name: Str) -> Option<String> {
     const raw: u8* = libc::getenv(c_name.as_ptr());
     if (raw == null) { return Option::None; }
     return Option::Some(String::from_str(Str::from(raw as string)));
+}
+
+/// The process environment as `(key, value)` pairs, in the order the C
+/// runtime laid them out. Each pair owns copies of its key and value
+/// `String`s. Returns an empty array if the runtime hasn't published the
+/// environment yet (a freestanding entry that skips the generated `main`
+/// prologue). Panics on allocation failure.
+///
+/// Reflects the environment **inherited at process start** - the `envp`
+/// vector the C runtime handed `main`, the same view as
+/// `/proc/self/environ`. It does NOT track later `set_var`/`remove_var`:
+/// `setenv`/`unsetenv` build a fresh environ array and leave the
+/// start-time one (which this reads) untouched, so a variable you set at
+/// runtime will not appear here. Use `var(name)` for a live single-value
+/// read that goes through `getenv`.
+///
+/// Walk the result by shared borrow (`env::vars().iter_ref()`) to read
+/// the pairs without cloning, since `Pair<String, String>` is not `Copy`.
+///
+/// A malformed entry with no `=` keeps the whole entry as the key with an
+/// empty value; POSIX guarantees `KEY=VALUE`, so this is only a defensive
+/// fallback.
+function vars() -> Array<Pair<String, String>> {
+    mut out: Array<Pair<String, String>> = Array::new();
+    if (envp_global == null) { return out; }
+    const sep: Str = Str::new("=");
+    mut i: u64 = 0;
+    loop {
+        const raw: u8* = envp_global[i];
+        if (raw == null) { break; }
+        const entry: Str = Str::from(raw as string);
+        mut key: Str = entry;
+        mut val: Str = Str::new("");
+        match (entry.find(&sep)) {
+            Option::Some(eq) => {
+                key = entry.sub_bytes(0, eq);
+                val = entry.sub_bytes(eq + 1, entry.length());
+            }
+            Option::None => { }
+        }
+        out.push(Pair<String, String>::new(
+            String::from_str(key), String::from_str(val)));
+        i = i + 1;
+    }
+    return out;
 }
 
 /// Set `name = value`, overwriting any existing binding. Returns

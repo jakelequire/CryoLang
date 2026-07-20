@@ -421,23 +421,26 @@ type struct DeclarationEmitter {
         // parameters in source, so byval never applies there).
         mut plan_param_plans: ParamPlan[] = [];
         if (is_program_main && param_count == 0) {
-            // The C ABI entry point is `int main(int argc, char** argv)`.
-            // _start always passes argc/argv, and the stdlib's
-            // `std::env::args()` reads them through `set_args` (called
+            // The C ABI entry point is
+            // `int main(int argc, char** argv, char** envp)`.  The C
+            // runtime always passes all three, and the stdlib reads argv
+            // through `set_args` and envp through `set_env` (both called
             // from the synthesized prologue in `codegen_function_prologue`
-            // below).  User source still writes `function main() -> int`;
-            // we silently widen the LLVM signature to take argc/argv.
+            // below), backing `std::env::args()` / `std::env::vars()`.
+            // User source still writes `function main() -> int`; we
+            // silently widen the LLVM signature to take argc/argv/envp.
             // This widening is not expressible in the ABI seam (it adds
             // synthetic parameters not in the source signature), so it
-            // stays open-coded here.
+            // stays open-coded here.  `envp` shares argv's `char**` type.
             const ret_ty: LType = this.map_return_type(node);
             if (!ret_ty.is_valid()) { return; }
             const argv_ty: LType = LType::pointer_to(LType::pointer_to(LType::i8()));
-            const buf: void* = intrinsics::malloc(2 * 8);
+            const buf: void* = intrinsics::malloc(3 * 8);
             const slots: void** = buf as void**;
             slots[0] = LType::i32().raw;
             slots[1] = argv_ty.raw;
-            fn_type = LType::function_type(ret_ty, buf, 2, false);
+            slots[2] = argv_ty.raw;
+            fn_type = LType::function_type(ret_ty, buf, 3, false);
             intrinsics::free(buf);
         } else {
             mut params: TypeRef[] = [];
@@ -1796,6 +1799,7 @@ type struct DeclarationEmitter {
         const main_sym: SymbolStr = intern.intern("main");
         if (node.name.equals(main_sym) && CodegenUtil::fixed_param_count(node) == 0) {
             this.emit_set_args_call(fn_val);
+            this.emit_set_env_call(fn_val);
         }
 
         return fn_val;
@@ -1826,6 +1830,32 @@ type struct DeclarationEmitter {
         args.push(Pair<LValue, TypeRef>::new(argv, TypeRef::invalid()));
         mut result: LValue = LValue::null();
         result = this.expr_ops.codegen_call(set_args_fn, set_args_ty, args, "");
+    }
+
+    /// Emit `std::env::set_env(envp)` at the entry of the program's main,
+    /// publishing the environment pointer the C runtime passed as main's
+    /// third argument so `std::env::vars()` can enumerate it.  Mirrors
+    /// `emit_set_args_call`: looked up by qualified name (no hardcoded
+    /// mangle) and a silent no-op when the stdlib (or `set_env`) is absent,
+    /// so `--no-std` and freestanding mains still compile.  The main-widening
+    /// branch above gave main a synthetic third `char**` param at index 2.
+    emit_set_env_call(mut &this, main_fn: LValue) -> void {
+        const intern: InternTable* = this.get_intern();
+        const set_env_sym: SymbolStr = intern.intern("std::env::set_env");
+        const set_env_fn: LValue = this.resolver.resolve_function(set_env_sym);
+        if (!set_env_fn.is_valid()) { return; }
+
+        const set_env_ty: LType = LType {
+            raw: llvm::LLVMGlobalGetValueType(set_env_fn.raw),
+        };
+        if (!set_env_ty.is_valid()) { return; }
+
+        const envp: LValue = LValue { raw: llvm::LLVMGetParam(main_fn.raw, 2) };
+
+        mut args: Pair<LValue, TypeRef>[] = [];
+        args.push(Pair<LValue, TypeRef>::new(envp, TypeRef::invalid()));
+        mut result: LValue = LValue::null();
+        result = this.expr_ops.codegen_call(set_env_fn, set_env_ty, args, "");
     }
 
     /// Emit implicit void return ONLY for void/unit functions.

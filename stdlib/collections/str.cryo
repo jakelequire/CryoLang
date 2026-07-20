@@ -21,6 +21,7 @@ import core::convert;
 import core::hash;
 import core::iter;
 import collections::string;
+import collections::pair;
 
 type struct Str {
     bytes: u8*;
@@ -238,6 +239,30 @@ type struct Str {
         };
     }
 
+    /// Iterator over the Unicode scalar values of this string, decoding
+    /// UTF-8 on the fly. Each scalar is yielded as a `u32` in the range
+    /// `[0, 0x10FFFF]` (Cryo's `char` is a single byte, so a full scalar
+    /// is a `u32`, not a `char`). This is the scalar-level counterpart to
+    /// `byte_at`/`as_bytes`, which stay byte-level.
+    ///
+    /// Decoding is lenient: an invalid lead byte, a truncated or invalid
+    /// continuation, an overlong encoding, or a surrogate / out-of-range
+    /// scalar yields U+FFFD (the replacement character) and advances a
+    /// single byte, so the iterator always terminates and never reads
+    /// past the end of the view.
+    chars(&this) -> implement Iterator<u32> {
+        return Chars { bytes: this.bytes, length: this.length, pos: 0 };
+    }
+
+    /// Iterator over `(byte_offset, scalar)` pairs: the same scalars as
+    /// `chars`, each paired with the byte index at which it begins. The
+    /// pair is `Pair<u64, u32>` (`p.first` is the byte offset, `p.second`
+    /// the scalar). Byte offsets are into this view's bytes, so a
+    /// four-byte scalar advances the next offset by four.
+    char_indices(&this) -> implement Iterator<Pair<u64, u32>> {
+        return CharIndices { bytes: this.bytes, length: this.length, pos: 0 };
+    }
+
     try_to_hex(&this) -> Result<u64, ConversionError> {
         if (this.length() == 0) {
             return Result::Err(ConversionError::new("empty input"));
@@ -324,6 +349,112 @@ implement trait Iterator<Str> for struct SplitIter {
         };
         this.done = true;
         return Option::Some(tail);
+    }
+}
+
+/// The Unicode replacement character U+FFFD, substituted for any byte
+/// sequence that is not well-formed UTF-8 during scalar decoding.
+const REPLACEMENT_SCALAR: u32 = 0xFFFD;
+
+/// Decode one UTF-8 scalar beginning at byte `pos` of `[bytes, bytes+length)`.
+/// Returns `Pair { first: scalar, second: consumed }` where `consumed`
+/// is the number of bytes the scalar occupied (always `>= 1`, so callers
+/// that advance by it can never stall). Lenient per the `Str::chars`
+/// contract: any malformed sequence decodes to U+FFFD consuming exactly
+/// one byte. Precondition: `pos < length`.
+function decode_scalar(bytes: u8*, length: u64, pos: u64) -> Pair<u32, u64> {
+    const lead: u8 = bytes[pos];
+
+    // ASCII fast path: one byte, value is the scalar.
+    if (lead < 0x80) {
+        return Pair<u32, u64> { first: lead as u32, second: 1 };
+    }
+
+    // Continuation count and initial scalar bits from the lead byte's
+    // high prefix. `min` is the smallest scalar this length may legally
+    // encode; a decoded value below it is an overlong form.
+    mut needed: u64 = 0;
+    mut scalar: u32 = 0;
+    mut min: u32 = 0;
+    if ((lead & 0xE0) == 0xC0) {
+        needed = 1; scalar = (lead & 0x1F) as u32; min = 0x80;
+    } else if ((lead & 0xF0) == 0xE0) {
+        needed = 2; scalar = (lead & 0x0F) as u32; min = 0x800;
+    } else if ((lead & 0xF8) == 0xF0) {
+        needed = 3; scalar = (lead & 0x07) as u32; min = 0x10000;
+    } else {
+        // 10xxxxxx orphan continuation, or 11111xxx out of range.
+        return Pair<u32, u64> { first: REPLACEMENT_SCALAR, second: 1 };
+    }
+
+    // The continuation bytes must all be present within the view.
+    if (pos + 1 + needed > length) {
+        return Pair<u32, u64> { first: REPLACEMENT_SCALAR, second: 1 };
+    }
+
+    mut i: u64 = 1;
+    while (i <= needed) {
+        const b: u8 = bytes[pos + i];
+        if ((b & 0xC0) != 0x80) {
+            return Pair<u32, u64> { first: REPLACEMENT_SCALAR, second: 1 };
+        }
+        scalar = (scalar << 6) | ((b & 0x3F) as u32);
+        i = i + 1;
+    }
+
+    // Reject overlong encodings, surrogate halves, and values above the
+    // Unicode range - each is malformed UTF-8.
+    if (scalar < min) {
+        return Pair<u32, u64> { first: REPLACEMENT_SCALAR, second: 1 };
+    }
+    if (scalar >= 0xD800 && scalar <= 0xDFFF) {
+        return Pair<u32, u64> { first: REPLACEMENT_SCALAR, second: 1 };
+    }
+    if (scalar > 0x10FFFF) {
+        return Pair<u32, u64> { first: REPLACEMENT_SCALAR, second: 1 };
+    }
+
+    return Pair<u32, u64> { first: scalar, second: 1 + needed };
+}
+
+/// Lazy UTF-8 scalar iterator over a `Str`; see `Str::chars`. Borrows
+/// from the source `Str`, which must outlive the iterator.
+///
+/// Stays `public`: `String::chars` (`collections::string`) names it in
+/// its return type, a cross-module reference a `private` marking would
+/// reject. Reached only as the opaque `implement Iterator<u32>` that
+/// `Str::chars` returns.
+type struct Chars {
+    bytes:  u8*;
+    length: u64;
+    pos:    u64;
+}
+
+implement trait Iterator<u32> for struct Chars {
+    next(mut &this) -> Option<u32> {
+        if (this.pos >= this.length) { return Option::None; }
+        const step: Pair<u32, u64> = decode_scalar(this.bytes, this.length, this.pos);
+        this.pos = this.pos + step.second;
+        return Option::Some(step.first);
+    }
+}
+
+/// Lazy `(byte_offset, scalar)` iterator over a `Str`; see
+/// `Str::char_indices`. Borrows from the source `Str`. Public for the
+/// same cross-module reason as `Chars`.
+type struct CharIndices {
+    bytes:  u8*;
+    length: u64;
+    pos:    u64;
+}
+
+implement trait Iterator<Pair<u64, u32>> for struct CharIndices {
+    next(mut &this) -> Option<Pair<u64, u32>> {
+        if (this.pos >= this.length) { return Option::None; }
+        const start: u64 = this.pos;
+        const step: Pair<u32, u64> = decode_scalar(this.bytes, this.length, this.pos);
+        this.pos = this.pos + step.second;
+        return Option::Some(Pair<u64, u32> { first: start, second: step.first });
     }
 }
 
