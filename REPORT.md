@@ -494,11 +494,11 @@ hazard classes above.
 
 ### Stdlib gaps (ranked by user pain)
 
-- [ ] No Unicode scalar iterator on `Str` (`chars()`); text handling is
+- [x] No Unicode scalar iterator on `Str` (`chars()`); text handling is
   byte/ASCII-only (trim/case/split all documented byte-level).
-- [ ] No format specifiers in f-strings (width/precision/fill/hex) —
+- [x] No format specifiers in f-strings (width/precision/fill/hex) —
   `fmt/interp.cryo` supports `{expr}` / `{expr:?}` only.
-- [ ] `fmt::printf` is type-unchecked UB in the most-used API family
+- [x] `fmt::printf` is type-unchecked UB in the most-used API family
   (`fmt/_module.cryo:53-56` admits it); two parallel stdout paths
   (printf-family vs Display/`io::stdio` lock story).
 - [ ] Collections variety: no sorted map/BTree, no Deque, no `binary_search`,

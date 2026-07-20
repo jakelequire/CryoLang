@@ -32,8 +32,10 @@
 namespace std::fmt::interp;
 
 import core::result;
+import collections::str;
 import collections::string;
 import fmt::display;
+import fmt::spec;
 
 /// Start a fresh interpolation buffer.  The innermost call in an
 /// f-string desugar.
@@ -73,5 +75,40 @@ where T: Debug {
         Result::Ok(_)  => { }
         Result::Err(_) => { }
     }
+    return s;
+}
+
+/// Append a `{expr:spec}` hole carrying a non-trivial format spec
+/// (width / fill / align / precision / radix). `spec` is the raw spec
+/// text after the colon; the compiler emits this helper only when that
+/// text is a valid spec (a bare `{expr}` and a `{expr:?}` still lower to
+/// `fmt_append_display` / `fmt_append_debug`).
+///
+/// The per-type dispatch lives here: `static match (T)` selects a body
+/// builder (integer decimal/radix, float, or generic Display) from
+/// `fmt::spec`; `fmt_pad` then applies the field width. Integers are
+/// rendered at their own width so a radix of a negative or narrow value
+/// shows the correct two's-complement digits.
+function fmt_append_fmt<T>(out: String, value: &T, spec: string) -> String
+where T: Display {
+    mut s: String = out;
+    const fs: FmtSpec = fmt_parse_spec(Str::new(spec));
+    mut body: BodyText = static match (T) {
+        u8    => { fmt_uint_body(*value as u64, &fs) }
+        u16   => { fmt_uint_body(*value as u64, &fs) }
+        u32   => { fmt_uint_body(*value as u64, &fs) }
+        u64   => { fmt_uint_body(*value, &fs) }
+        usize => { fmt_uint_body(*value as u64, &fs) }
+        i8    => { fmt_sint_body(*value as i64, (*value as u8) as u64, &fs) }
+        i16   => { fmt_sint_body(*value as i64, (*value as u16) as u64, &fs) }
+        i32   => { fmt_sint_body(*value as i64, (*value as u32) as u64, &fs) }
+        i64   => { fmt_sint_body(*value, *value as u64, &fs) }
+        isize => { fmt_sint_body(*value as i64, *value as u64, &fs) }
+        f32   => { fmt_float_body(*value as f64, &fs) }
+        f64   => { fmt_float_body(*value, &fs) }
+        _     => { fmt_display_body<T>(value, &fs) }
+    };
+    fmt_pad(&s, body.text.as_str(), body.head_len, &fs);
+    body.drop();
     return s;
 }

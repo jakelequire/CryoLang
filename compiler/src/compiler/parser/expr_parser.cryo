@@ -763,7 +763,10 @@ public:
     ///
     /// `{{` / `}}` are literal braces; standard escapes (`\n`, `\t`, ...) in
     /// the literal chunks are processed via the same routine as plain
-    /// strings.  Only `{}` and `{:?}` specs are recognised for now.
+    /// strings.  A hole may carry a format spec after a `:` -
+    /// `{expr:[[fill]align][#][0][width][.precision][type]}` - lowered to
+    /// `fmt_append_fmt` with the spec as a string; `{expr}` and `{expr:?}`
+    /// still lower to `fmt_append_display` / `fmt_append_debug`.
     parse_fstring() -> ExpressionNode* {
         const tok: Token = this.advance();
         this.used_fstring = true;
@@ -825,12 +828,31 @@ public:
                 const hole_len: i64 = j - (i + 1);
                 const hole_src: string = raw.substr(i + 1, hole_len);
 
-                // Split off a trailing `:?` Debug spec, if present.
+                // Split off a trailing format spec after the first
+                // top-level `:` separator (`{expr:spec}`). `?` alone is
+                // Debug; a grammar-valid suffix is a format spec; anything
+                // else (e.g. a ternary's ` : b`) is not a spec and the
+                // whole hole stays the expression.
                 const tl: i64 = this.fstr_rstrip_len(hole_src);
-                const is_debug: boolean = this.fstr_spec_is_debug(hole_src, tl);
                 mut expr_src: string = hole_src;
-                if (is_debug) {
-                    expr_src = hole_src.substr(0, tl - 2);
+                mut spec_src:  string = "";
+                // Helper kind: 0 = Display, 1 = Debug, 2 = full spec.
+                mut helper_kind: i64 = 0;
+                const sep: i64 = this.fstr_find_spec_colon(hole_src, tl);
+                if (sep >= 0) {
+                    const spec_len: i64 = tl - (sep + 1);
+                    const suffix: string = hole_src.substr(sep + 1, spec_len);
+                    if (spec_len == 1 && (*(suffix) as char) == '?') {
+                        helper_kind = 1;
+                        expr_src = hole_src.substr(0, sep);
+                    } else if (spec_len == 0) {
+                        // `{x:}` - empty spec renders as plain Display.
+                        expr_src = hole_src.substr(0, sep);
+                    } else if (this.fstr_spec_is_valid(suffix)) {
+                        helper_kind = 2;
+                        spec_src = suffix;
+                        expr_src = hole_src.substr(0, sep);
+                    }
                 }
 
                 // Real source position of the hole's first byte (raw[i+1]) so
@@ -864,9 +886,14 @@ public:
                 mut ref_node: UnaryExprNode* = new UnaryExprNode(amp, inner, this.fstr_span);
                 ref_node.is_synthetic = true;
 
-                const helper: string =
-                    if (is_debug) { "fmt_append_debug" } else { "fmt_append_display" };
-                acc = this.fstr_call2(helper, acc, ref_node as ExpressionNode*);
+                if (helper_kind == 2) {
+                    acc = this.fstr_call_fmt(acc, ref_node as ExpressionNode*, spec_src);
+                } else {
+                    const helper: string =
+                        if (helper_kind == 1) { "fmt_append_debug" }
+                        else { "fmt_append_display" };
+                    acc = this.fstr_call2(helper, acc, ref_node as ExpressionNode*);
+                }
                 continue;
             }
 
@@ -952,14 +979,99 @@ public:
         return n;
     }
 
-    /// True if the hole text `s` (whose trimmed length is `tl`) ends with a
-    /// `:?` Debug spec.  Early-returns keep the `s + tl - 2` deref guarded by
-    /// the length check without relying on `&&` short-circuit evaluation.
-    fstr_spec_is_debug(s: string, tl: i64) -> boolean {
-        if (tl < 2) { return false; }
-        const c2: char = *(s + tl - 2) as char;
-        const c1: char = *(s + tl - 1) as char;
-        return c2 == ':' && c1 == '?';
+    /// Build the three-argument call `fmt_append_fmt(acc, ref, "spec")`
+    /// that lowers a `{expr:spec}` hole. `spec` is the raw spec text; it
+    /// is passed verbatim as a string literal (no escape processing) and
+    /// re-parsed at runtime by `std::fmt::spec::fmt_parse_spec`.
+    fstr_call_fmt(acc: ExpressionNode*, ref_node: ExpressionNode*,
+                  spec: string) -> ExpressionNode* {
+        const id: IdentifierNode* = new IdentifierNode(
+            this.ctx.intern("fmt_append_fmt"), this.fstr_span);
+        mut call: CallExprNode* = new CallExprNode(id as ExpressionNode*, this.fstr_span);
+        call.add_argument(acc);
+        call.add_argument(ref_node);
+        const lit: LiteralNode* = new LiteralNode(spec, LiteralKind::String, this.fstr_span);
+        call.add_argument(lit as ExpressionNode*);
+        return call as ExpressionNode*;
+    }
+
+    /// Index of the `:` that separates a hole's expression from its format
+    /// spec, or -1 if none.  It is the first `:` at bracket depth 0 that is
+    /// not inside a string/char literal and not part of a `::` path
+    /// separator.  A ternary's `:` is normally at depth 0 too, so a hole
+    /// mixing a bare ternary with a spec must parenthesise the ternary; an
+    /// idiomatic `a ? b : c` (spaces around `:`) is caught by the caller's
+    /// grammar check failing on the leading space, leaving the hole intact.
+    fstr_find_spec_colon(s: string, tl: i64) -> i64 {
+        mut depth: i64 = 0;
+        mut i: i64 = 0;
+        while (i < tl) {
+            const c: char = *(s + i) as char;
+            if (c == '"' || c == '\'') {
+                i = this.fstr_skip_quoted(s, tl, i, c);
+                continue;
+            }
+            if (c == '(' || c == '[' || c == '{') {
+                depth += 1;
+            } else if (c == ')' || c == ']' || c == '}') {
+                depth -= 1;
+            } else if (c == ':' && depth == 0) {
+                if (i + 1 < tl && (*(s + i + 1) as char) == ':') {
+                    i += 2;   // `::` path separator - skip both colons
+                    continue;
+                }
+                return i;
+            }
+            i += 1;
+        }
+        return -1;
+    }
+
+    /// True if `s` is a well-formed format spec:
+    /// `[[fill]align][#][0][width][.precision][type]`, where `align` is
+    /// `< > ^` and `type` is `x X o b`.  Rejecting an ill-formed suffix is
+    /// what lets a ternary's ` : b` fall back to being part of the
+    /// expression rather than a (broken) spec.
+    fstr_spec_is_valid(s: string) -> boolean {
+        const n: i64 = s.length() as i64;
+        if (n == 0) { return false; }
+        mut i: i64 = 0;
+        // [fill]align | align
+        if (n >= 2 && this.fstr_is_align(*(s + 1) as char)) {
+            i = 2;
+        } else if (this.fstr_is_align(*(s) as char)) {
+            i = 1;
+        }
+        // '#' alternate
+        if (i < n && (*(s + i) as char) == '#') { i += 1; }
+        // '0' flag
+        if (i < n && (*(s + i) as char) == '0') { i += 1; }
+        // width
+        while (i < n && this.fstr_is_digit(*(s + i) as char)) { i += 1; }
+        // .precision
+        if (i < n && (*(s + i) as char) == '.') {
+            i += 1;
+            mut pd: i64 = 0;
+            while (i < n && this.fstr_is_digit(*(s + i) as char)) { i += 1; pd += 1; }
+            if (pd == 0) { return false; }
+        }
+        // type
+        if (i < n) {
+            const t: char = *(s + i) as char;
+            if (t == 'x' || t == 'X' || t == 'o' || t == 'b') { i += 1; }
+            else { return false; }
+        }
+        return i == n;
+    }
+
+    /// True for an alignment sigil `< > ^`.
+    fstr_is_align(c: char) -> boolean {
+        return c == '<' || c == '>' || c == '^';
+    }
+
+    /// True for an ASCII digit.
+    fstr_is_digit(c: char) -> boolean {
+        return c >= '0' && c <= '9';
     }
 
     /// Advance past a string/char literal in a hole scan.  `j` indexes the

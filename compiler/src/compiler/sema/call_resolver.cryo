@@ -48,6 +48,19 @@ import Compiler::Sema::{
 import std::core::{ slice, option };
 import std::fmt;
 
+// Format-argument categories for the `printf`/`eprintf` directive checker.
+// A `%` conversion expects one of these; each variadic argument's resolved
+// type maps to one; a category mismatch (or a wrong argument count) is
+// reported as W0013.  `PF_NONE` doubles as "no argument" (for `%%` and
+// unknown conversions) and "cannot judge" (an unresolved/generic argument):
+// both mean "skip".
+const PF_NONE:    i64 = 0;
+const PF_INT:     i64 = 1;   // %d %i %u %x %X %o %c
+const PF_FLOAT:   i64 = 2;   // %f %e %g %a (and their capitals)
+const PF_STRING:  i64 = 3;   // %s  (a C `string`)
+const PF_POINTER: i64 = 4;   // %p
+const PF_STRUCT:  i64 = 5;   // an aggregate argument - never valid for C printf
+
 /// Scope class of a bare-call overload candidate relative to the use site,
 /// nearest first: `Imported` (the current module or an explicit import),
 /// `Prelude` (auto-in-scope via std::prelude, incl. declared intrinsics),
@@ -442,6 +455,10 @@ type struct CallResolver {
 
         this.flag_autoref_from_params(call, param_types);
 
+        // Type-check a `printf`/`eprintf` call's `%` directives against its
+        // variadic arguments now that each argument carries a resolved type.
+        this.check_printf_call(call);
+
         const callee: ExpressionNode* = call.callee;
         const callee_node: ASTNode* = callee as ASTNode*;
 
@@ -562,6 +579,212 @@ type struct CallResolver {
             if (this.types.is_ref_or_ptr_type(arg.resolved_type)) { continue; }
             arg.autoref = true;
         }
+    }
+
+    // -- printf/eprintf format-string checking (W0013) --
+    //
+    // The C variadic ABI does not type-check `printf`-family arguments, so a
+    // wrong specifier (`%s` on an integer, a `String` struct on `%s`, a
+    // missing or extra argument) is undefined behaviour.  When the format
+    // string is a literal we can parse its `%` conversions at compile time
+    // and warn on a category or count mismatch before it becomes UB.
+
+    /// Entry point: if `call` targets `printf`/`eprintf` with a string-literal
+    /// format, check its conversions against the variadic arguments.
+    check_printf_call(mut &this, call: CallExprNode*) -> void {
+        const leaf: SymbolStr = this.printf_callee_leaf(call.callee);
+        if (!leaf.is_valid()) { return; }
+        if (!(leaf.equals(this.intern.intern("printf"))
+              || leaf.equals(this.intern.intern("eprintf")))) {
+            return;
+        }
+        if (call.arguments.length == 0) { return; }
+        const fmt_arg: ExpressionNode* = call.arguments[0];
+        if (fmt_arg == null) { return; }
+        const fmt_ast: ASTNode* = fmt_arg as ASTNode*;
+        if (fmt_ast.kind != NodeKind::Literal) { return; }   // runtime format: not checkable
+        const lit: LiteralNode* = fmt_arg as LiteralNode*;
+        if (lit.literal_kind != LiteralKind::String) { return; }
+        this.check_printf_directives(call, lit);
+    }
+
+    /// The callee's leaf name, for a bare `printf(...)` (Identifier) or a
+    /// qualified `fmt::printf(...)` (ScopeResolution). Invalid otherwise.
+    printf_callee_leaf(&this, callee: ExpressionNode*) -> SymbolStr {
+        const node: ASTNode* = callee as ASTNode*;
+        if (node.kind == NodeKind::Identifier) {
+            return (callee as IdentifierNode*).name;
+        }
+        if (node.kind == NodeKind::ScopeResolution) {
+            return (callee as ScopeResolutionNode*).member_name;
+        }
+        return SymbolStr::empty();
+    }
+
+    /// Walk the format string's `%` conversions, checking each against the
+    /// corresponding variadic argument, then report a count mismatch.
+    check_printf_directives(mut &this, call: CallExprNode*, lit: LiteralNode*) -> void {
+        const fmt: string = lit.value;
+        const n: i64 = fmt.length() as i64;
+        const provided: i64 = call.arguments.length - 1;
+        mut arg_idx: i64 = 0;
+        mut i: i64 = 0;
+        while (i < n) {
+            if ((*(fmt + i) as char) != '%') { i += 1; continue; }
+            i += 1;
+            if (i >= n) { break; }                             // trailing '%'
+            if ((*(fmt + i) as char) == '%') { i += 1; continue; }  // %% literal
+
+            // flags
+            while (i < n && this.printf_is_flag(*(fmt + i) as char)) { i += 1; }
+            // width (a `*` takes an int argument)
+            if (i < n && (*(fmt + i) as char) == '*') {
+                arg_idx = this.printf_check_arg(call, arg_idx, provided, PF_INT, '*');
+                i += 1;
+            } else {
+                while (i < n && this.printf_is_digit(*(fmt + i) as char)) { i += 1; }
+            }
+            // precision
+            if (i < n && (*(fmt + i) as char) == '.') {
+                i += 1;
+                if (i < n && (*(fmt + i) as char) == '*') {
+                    arg_idx = this.printf_check_arg(call, arg_idx, provided, PF_INT, '*');
+                    i += 1;
+                } else {
+                    while (i < n && this.printf_is_digit(*(fmt + i) as char)) { i += 1; }
+                }
+            }
+            // length modifiers
+            while (i < n && this.printf_is_length(*(fmt + i) as char)) { i += 1; }
+            if (i >= n) { break; }
+            const conv: char = *(fmt + i) as char;
+            i += 1;
+            const cat: i64 = this.printf_conv_category(conv);
+            if (cat == PF_NONE) { continue; }   // unknown conversion: consumes no arg
+            arg_idx = this.printf_check_arg(call, arg_idx, provided, cat, conv);
+        }
+
+        // Only a shortfall (fewer arguments than conversions) is reported: a
+        // missing argument makes `printf` read a garbage value (real UB).
+        // An over-count is deliberately not flagged - it would false-positive
+        // whenever the format contains an embedded NUL, since Cryo's `\0`
+        // (and unsupported octal `\NNN`) escapes truncate the C string and
+        // hide the later conversions, e.g. an ANSI-colour `"\033[..."`
+        // literal. Truncation can only ever undercount conversions, so it
+        // never produces a false shortfall.
+        if (arg_idx > provided) {
+            this.emit_printf_too_few(lit, arg_idx, provided);
+        }
+    }
+
+    /// Check the argument at variadic position `arg_idx` against a directive
+    /// expecting `expected` (skipping when the argument is absent or its type
+    /// is unresolved), and return the next position.
+    printf_check_arg(mut &this, call: CallExprNode*, arg_idx: i64, provided: i64,
+                     expected: i64, conv: char) -> i64 {
+        if (arg_idx >= provided) { return arg_idx + 1; }   // missing: counted below
+        const arg: ExpressionNode* = call.arguments[1 + arg_idx];
+        if (arg == null) { return arg_idx + 1; }
+        const actual: i64 = this.printf_arg_category(arg.resolved_type);
+        if (actual == PF_NONE) { return arg_idx + 1; }     // unresolved/generic: skip
+        if (!this.printf_cat_compatible(expected, actual)) {
+            this.emit_printf_type_mismatch(arg, conv, expected, actual);
+        }
+        return arg_idx + 1;
+    }
+
+    /// True when an argument of category `actual` is acceptable for a
+    /// directive expecting `expected`. `%s`/`%p` accept either a C string or
+    /// a pointer (a `char*` is both); the numeric categories are exact.
+    printf_cat_compatible(&this, expected: i64, actual: i64) -> boolean {
+        if (expected == PF_INT)     { return actual == PF_INT; }
+        if (expected == PF_FLOAT)   { return actual == PF_FLOAT; }
+        if (expected == PF_STRING)  { return actual == PF_STRING || actual == PF_POINTER; }
+        if (expected == PF_POINTER) { return actual == PF_POINTER || actual == PF_STRING; }
+        return false;
+    }
+
+    /// A human-readable name for a format category, for diagnostics.
+    printf_cat_name(&this, cat: i64) -> string {
+        if (cat == PF_INT)     { return "an integer"; }
+        if (cat == PF_FLOAT)   { return "a float"; }
+        if (cat == PF_STRING)  { return "a C string (`string`)"; }
+        if (cat == PF_POINTER) { return "a pointer"; }
+        if (cat == PF_STRUCT)  { return "an aggregate (struct/array)"; }
+        return "a value";
+    }
+
+    printf_is_flag(&this, c: char) -> boolean {
+        return c == '-' || c == '+' || c == ' ' || c == '#' || c == '0';
+    }
+
+    printf_is_digit(&this, c: char) -> boolean {
+        return c >= '0' && c <= '9';
+    }
+
+    printf_is_length(&this, c: char) -> boolean {
+        return c == 'h' || c == 'l' || c == 'L' || c == 'z' || c == 'j' || c == 't';
+    }
+
+    /// The argument category a conversion character expects, or `PF_NONE`
+    /// for an unknown conversion (which we assume consumes no argument).
+    printf_conv_category(&this, c: char) -> i64 {
+        if (c == 'd' || c == 'i' || c == 'u' || c == 'x' || c == 'X'
+                || c == 'o' || c == 'c') { return PF_INT; }
+        if (c == 'f' || c == 'F' || c == 'e' || c == 'E'
+                || c == 'g' || c == 'G' || c == 'a' || c == 'A') { return PF_FLOAT; }
+        if (c == 's') { return PF_STRING; }
+        if (c == 'p' || c == 'n') { return PF_POINTER; }
+        return PF_NONE;
+    }
+
+    /// Map a resolved argument type to a format category. `PF_NONE` means the
+    /// type can't be judged (unresolved or still generic), so it is skipped.
+    printf_arg_category(&this, tref: TypeRef) -> i64 {
+        if (!tref.is_valid()) { return PF_NONE; }
+        const t: Type* = this.arena.lookup(tref.id);
+        if (t == null) { return PF_NONE; }
+        return match (t.kind) {
+            TypeKind::Int      => { PF_INT }
+            TypeKind::Char     => { PF_INT }
+            TypeKind::Bool     => { PF_INT }
+            TypeKind::Float    => { PF_FLOAT }
+            TypeKind::String   => { PF_STRING }
+            TypeKind::Pointer  => { PF_POINTER }
+            TypeKind::VaList   => { PF_POINTER }
+            TypeKind::Struct   => { PF_STRUCT }
+            TypeKind::Class    => { PF_STRUCT }
+            TypeKind::Enum     => { PF_STRUCT }
+            TypeKind::Array    => { PF_STRUCT }
+            TypeKind::Tuple    => { PF_STRUCT }
+            TypeKind::Optional => { PF_STRUCT }
+            _                  => { PF_NONE }
+        };
+    }
+
+    emit_printf_type_mismatch(mut &this, arg: ExpressionNode*, conv: char,
+                              expected: i64, actual: i64) -> void {
+        mut d: Diagnostic = Diagnostic::warning(
+            ErrorCode::W0013_FORMAT_STRING_MISMATCH,
+            format("`%%%c` expects %s, but this argument is %s",
+                conv as i64, this.printf_cat_name(expected), this.printf_cat_name(actual)));
+        d = d.at(arg.span);
+        if (actual == PF_STRUCT && expected == PF_STRING) {
+            d = d.with_note("`%s` needs a C `string` (`i8*`); `Str`/`String` are length-prefixed structs, not NUL-terminated pointers");
+            d = d.help("format via an f-string instead, e.g. `println(f\"{value}\")`, or pass `value.as_ptr()` / `value.with_null()`");
+        }
+        this.ctx.emit_diagnostic(d);
+    }
+
+    emit_printf_too_few(mut &this, lit: LiteralNode*,
+                        expected: i64, provided: i64) -> void {
+        mut d: Diagnostic = Diagnostic::warning(
+            ErrorCode::W0013_FORMAT_STRING_MISMATCH,
+            format("format string needs %lld argument(s), but only %lld were provided",
+                expected, provided));
+        d = d.at(lit.span);
+        d = d.with_note("a `%` conversion with no matching argument reads a garbage value at runtime");
+        this.ctx.emit_diagnostic(d);
     }
 
 
