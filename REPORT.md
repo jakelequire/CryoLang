@@ -437,7 +437,7 @@ hazard classes above.
   `io::Write::write<T>`. `docs/grammar.md:305-311` defines `StaticMatch` but
   never references it from `Statement`/`Primary` — an orphan production.
   **Single worst doc gap in the project.**
-- [ ] **`Send`/`Sync` semantics unspecified** — only module-table one-liners
+- [x] **`Send`/`Sync` semantics unspecified** — only module-table one-liners
   (cryo.md:2585, README:532). What derives, what enforces, what `!Send`
   means: undefined, for a language shipping threads+channels at 1.0. Note
   also the implementation stance: raw pointers and references are
@@ -450,7 +450,7 @@ hazard classes above.
 - [x] **Tuple story inconsistency**: cryo.md §2.6 documents heterogeneous
   tuple literals fully; CHANGELOG.md:151 says "Cryo has no heterogeneous
   tuple literal" (re `.zip`/`.enumerate` using `Pair`). One is stale.
-- [ ] **Closure capability boundary scattered across three documents**
+- [x] **Closure capability boundary scattered across three documents**
   (capturing closures advertised in §2.5; E0458 non-capturing iterator limit
   only in CHANGELOG "Known limitations").
 - [x] **`abi.md` covers SysV x86-64 only** — Win64 ships but is undocumented.

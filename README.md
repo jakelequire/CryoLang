@@ -529,7 +529,7 @@ for the full 1.0 release notes.
 - Lambdas and capturing closures (let-bound, inline, multi-capture, nested, closure-as-fn-arg).
 - Automatic drop synthesis at scope exit; explicit `delete` for heap pointees.
 - Allocator-generic standard library: `Array`, `String`, `HashMap`, `HashSet`, `Box`, `Arena`, `Pool`, `Rc`, `Arc`.
-- Synchronization primitives: a generic `Atomic<T>` (`T` = `u8` / `u32` / `u64` / `i32` / `i64` / `boolean`, dispatched at compile time via `static match`), `MemoryOrder`, `fence`, `Mutex<T>`, `RwLock<T>`, `CondVar`, `Once`, `Barrier`. `Send` / `Sync` auto-derive with call-site enforcement.
+- Synchronization primitives: a generic `Atomic<T>` (`T` = `u8` / `u32` / `u64` / `i32` / `i64` / `boolean`, dispatched at compile time via `static match`), `MemoryOrder`, `fence`, `Mutex<T>`, `RwLock<T>`, `CondVar`, `Once`, `Barrier`. `Send` / `Sync` are computed structurally (never declared) with call-site enforcement; raw pointers are unconditionally `Send`, so treat a `Send` bound as a checked-what-it-can-see signal rather than a safety proof - see [`docs/cryo.md` section 16.4](./docs/cryo.md#164-the-send-and-sync-traits).
 - `ThreadLocal<T>` via POSIX TLS; OS threads via `thread::spawn` / `try_spawn` / `JoinHandle<T>` / `spawn_with_attr`, a named `thread::Builder` (stack size + OS thread name), scoped threads (`thread::Scope`), and `sync::mpsc` channels.
 - I/O over `Read` / `Write` traits with buffered wrappers.
 - Networking: `TcpStream` / `TcpListener`, `UdpSocket`, and OpenSSL-backed `TlsStream`. HTTP/1.1 server (keep-alive, read timeouts), client, and router; HTTP/2 (HPACK + single-stream framing) and WebSocket (RFC 6455). JSON parser and serializer.

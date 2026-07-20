@@ -93,7 +93,11 @@ is written entirely in Cryo, and the public surface is frozen under semver.
   struct with a `__call__` method. Both forms call directly with zero
   overhead. Closures bound to a `(Args) -> Ret`-typed parameter are
   delivered via per-call-site receiver specialisation, so the body
-  dispatches through `__call__` without an indirect call. Generic
+  dispatches through `__call__` without an indirect call; that
+  specialisation is wired for non-generic free functions only, so a
+  *capturing* closure passed to a generic function, a method, or a
+  scope-resolution call is E0458 (non-capturing lambdas are function
+  pointers and bind anywhere). Generic
   type-parameter inference from function-typed arguments
   (`opt.map(lambda)` infers `U`).
 - **Modules:** `_module.cryo` aggregators, `public`/`private`/`protected`
@@ -146,8 +150,11 @@ is written entirely in Cryo, and the public surface is frozen under semver.
   combinator
   adapters `.take(n)` / `.map(f)` / `.filter(pred)` / `.chain(other)` /
   `.enumerate()` / `.zip(other)` (returning `TakeIter` / `MapIter` /
-  `FilterIter` / `ChainIter` / `EnumerateIter` / `ZipIter`); `f`/`pred` are
-  non-capturing functions (E0458). `.enumerate()` yields `Pair<u64, Item>`,
+  `FilterIter` / `ChainIter` / `EnumerateIter` / `ZipIter`); `f`/`pred` must
+  be non-capturing, since the adapters are methods and a capturing closure
+  may only be passed to a non-generic free function (E0458 - see
+  [`docs/cryo.md` section 2.5](./docs/cryo.md#25-function-types) for the
+  full boundary). `.enumerate()` yields `Pair<u64, Item>`,
   `.zip(other)` yields `Pair<Item, B>` and stops at the shorter side (`Pair` is
   the element type so the adapters stay monomorphization-friendly). Combinators
   chain freely (`r.take(n).map(f).filter(p)`, `r.chain(b).map(f)`,
