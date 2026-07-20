@@ -2705,16 +2705,24 @@ public:
                     // Heap-backed dynamic array: T[]
                     this.advance();
                     const arr_ann: ArrayAnnotation* = new ArrayAnnotation {
-                        element: result,
-                        size:    ArrayAnnotation::heap_dynamic_size(),
-                        span:    this.current_span(),
+                        element:   result,
+                        size:      ArrayAnnotation::heap_dynamic_size(),
+                        size_expr: null,
+                        span:      this.current_span(),
                     };
                     result = new TypeAnnotation::Array(arr_ann);
                 } else {
-                    // Fixed-size array: T[N] or T[CONST_NAME]
-                    // Parse the size as a numeric constant or identifier (const ref)
+                    // Fixed-size array: T[N], T[CONST_NAME], T[CONST * 2]
+                    //
+                    // A plain numeric literal is decoded here; anything else is
+                    // kept as an expression for the type resolver to constant-
+                    // fold once names are bound.  The expression MUST be
+                    // retained: discarding it leaves the size permanently
+                    // unknown, and an array whose size never resolves is
+                    // emitted as a descriptor with no storage behind it.
                     const size_tok: Token = this.current();
                     mut size: i64 = 0;
+                    mut size_expr: ExpressionNode* = null;
                     if (size_tok.kind == TokenType::NumericConstant) {
                         // Decode the full numeric lexeme: this honours the
                         // `0x`/`0o`/`0b` base prefixes and `_` separators that
@@ -2730,25 +2738,21 @@ public:
                         }
                         size = ParserBase::parse_numeric_lexeme_i64(size_tok.lexeme);
                         this.advance();
-                    } else if (size_tok.kind == TokenType::Identifier) {
-                        // Named constant: T[BTREE_MAX_KEYS].  Mark it
-                        // fixed-pending (size resolved later) - distinct from
-                        // a heap-backed `T[]` so ownership analysis does not
-                        // free its (nonexistent) heap buffer.  Still
-                        // `is_dynamic()`, so layout and codegen are unchanged.
-                        size = ArrayAnnotation::fixed_pending_size();
-                        this.advance();
                     } else {
-                        // Computed-size expression: also a fixed array
-                        // awaiting resolution.
-                        size = ArrayAnnotation::fixed_pending_size();
-                        this.advance();
+                        // Named constant or computed size: T[BTREE_MAX_KEYS],
+                        // T[CHUNK * 2].  Marked fixed-pending until the type
+                        // resolver folds `size_expr` - distinct from a
+                        // heap-backed `T[]` so ownership analysis does not free
+                        // its (nonexistent) heap buffer.
+                        size      = ArrayAnnotation::fixed_pending_size();
+                        size_expr = this.parse_expression();
                     }
                     this.consume(TokenType::RSquare, "']'");
                     const arr_ann: ArrayAnnotation* = new ArrayAnnotation {
-                        element: result,
-                        size:    size,
-                        span:    this.current_span(),
+                        element:   result,
+                        size:      size,
+                        size_expr: size_expr,
+                        span:      this.current_span(),
                     };
                     result = new TypeAnnotation::Array(arr_ann);
                 }
