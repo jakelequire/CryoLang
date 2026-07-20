@@ -47,38 +47,6 @@ type trait Hasher {
         }
     }
 
-    /// Finalize the hash and return the digest. After calling `finish`
-    /// the hasher should not be written to again.
-    finish(&this) -> u64;
-}
-
-type trait Hash {
-    hash<H>(&this, hasher: mut &H) -> void
-    where H: Hasher;
-}
-
-/// 64-bit FNV-1a. Simple; not DoS-resistant. Fine as a HashMap default
-/// when inputs are trusted.
-type struct DefaultHasher {
-    state: u64;
-
-    static new() -> DefaultHasher {
-        return DefaultHasher { state: FNV_OFFSET_BASIS };
-    }
-
-    /// Resume hashing from a previously-`finish`ed `u64` state. Lets an
-    /// incremental fold thread a running digest through several steps
-    /// (e.g. build fingerprinting) without re-deriving the FNV-1a
-    /// update inline.
-    static from_state(state: u64) -> DefaultHasher {
-        return DefaultHasher { state: state };
-    }
-
-    /// The FNV-1a offset basis: the initial state of a fresh hasher.
-    static offset_basis() -> u64 {
-        return FNV_OFFSET_BASIS;
-    }
-
     /// Fold one delimited value into the running digest, dispatched at compile
     /// time via `static match (T)` (no runtime cost, no trait bound - the arms
     /// ARE the accepted types). Lets a digest be composed from heterogeneous
@@ -96,6 +64,11 @@ type struct DefaultHasher {
     ///                   "a"+"bc").
     /// Fixed-width values need no separator; only the variable-length `string`
     /// arm appends one. Any non-primitive type is a compile error (no `_` arm).
+    ///
+    /// Lives on the trait rather than on one hasher because it is pure
+    /// composition over `write_u8` / `write_uint`: every implementation folds
+    /// values identically, and a digest of the same parts differs only by the
+    /// mixing function underneath.
     fold<T>(mut &this, value: T) -> void {
         static match (T) {
             // 1-byte
@@ -131,6 +104,39 @@ type struct DefaultHasher {
             }
         }
     }
+
+    /// Finalize the hash and return the digest. After calling `finish`
+    /// the hasher should not be written to again.
+    finish(&this) -> u64;
+}
+
+type trait Hash {
+    hash<H>(&this, hasher: mut &H) -> void
+    where H: Hasher;
+}
+
+/// 64-bit FNV-1a. Simple; not DoS-resistant. Fine as a HashMap default
+/// when inputs are trusted.
+type struct DefaultHasher {
+    state: u64;
+
+    static new() -> DefaultHasher {
+        return DefaultHasher { state: FNV_OFFSET_BASIS };
+    }
+
+    /// Resume hashing from a previously-`finish`ed `u64` state. Lets an
+    /// incremental fold thread a running digest through several steps
+    /// (e.g. build fingerprinting) without re-deriving the FNV-1a
+    /// update inline.
+    static from_state(state: u64) -> DefaultHasher {
+        return DefaultHasher { state: state };
+    }
+
+    /// The FNV-1a offset basis: the initial state of a fresh hasher.
+    static offset_basis() -> u64 {
+        return FNV_OFFSET_BASIS;
+    }
+
 }
 
 const FNV_PRIME:        u64 = 1099511628211;
@@ -144,6 +150,65 @@ implement trait Hasher for struct DefaultHasher {
 
     finish(&this) -> u64 {
         return this.state;
+    }
+}
+
+const FNV128_PRIME:        u128 = 309485009821345068724781371;
+const FNV128_OFFSET_BASIS: u128 = 144066263297769815596495629667062367629;
+
+/// 128-bit FNV-1a. Same construction as `DefaultHasher`, twice the width.
+///
+/// For digests where a collision is a CORRECTNESS failure rather than a
+/// slow bucket - the build's incremental cache keys being the motivating
+/// case, where two different inputs sharing a key means a stale object file
+/// is served and the program silently miscompiles. At 64 bits that risk is
+/// small but real and grows with the square of the number of keys; the extra
+/// width removes it from consideration. Still FNV, so still not DoS-resistant:
+/// this is width, not hardening.
+type struct Fnv128Hasher {
+    state: u128;
+
+    static new() -> Fnv128Hasher {
+        return Fnv128Hasher { state: FNV128_OFFSET_BASIS };
+    }
+
+    /// Resume from a previously-`finish128`ed state, so a digest can be
+    /// threaded through several steps without re-deriving the update.
+    static from_state(state: u128) -> Fnv128Hasher {
+        return Fnv128Hasher { state: state };
+    }
+
+    /// The full 128-bit digest. `finish` narrows to 64 bits to satisfy
+    /// `Hasher`; callers that want the width this type exists for use this.
+    finish128(&this) -> u128 {
+        return this.state;
+    }
+
+    /// The digest's two halves, high first, for callers rendering it as text.
+    /// Returned rather than formatted here so `core::hash` keeps depending on
+    /// nothing but `core` - hex formatting lives on `u64`, and pulling
+    /// `String` in for it would put the collections module underneath every
+    /// HashMap that uses this file.
+    high64(&this) -> u64 {
+        return (this.state >> 64) as u64;
+    }
+
+    low64(&this) -> u64 {
+        return this.state as u64;
+    }
+}
+
+implement trait Hasher for struct Fnv128Hasher {
+    write_u8(mut &this, value: u8) -> void {
+        this.state = this.state ^ (value as u128);
+        this.state = this.state * FNV128_PRIME;
+    }
+
+    /// The low half of the 128-bit state. Truncation is the right narrowing
+    /// for FNV-1a: the mixing runs high-to-low, so the low bits carry the
+    /// accumulated avalanche. Use `finish128` where the full width matters.
+    finish(&this) -> u64 {
+        return this.state as u64;
     }
 }
 

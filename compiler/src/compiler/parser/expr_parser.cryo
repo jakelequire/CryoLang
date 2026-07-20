@@ -989,8 +989,23 @@ public:
         const name: SymbolStr = this.intern_lexeme(tok);
         mut expr: ExpressionNode* = new IdentifierNode(name, this.span_from_token(tok));
 
-        // Check for generic args: Name<T, U>
-        if (this.check(TokenType::LAngle) && this.is_generic_call_ahead()) {
+        // Check for generic args: Name<T, U>.
+        //
+        // A name bound to a value - a parameter, a local, or a module-level
+        // global - is not a generic function or type, so its `<` is a
+        // comparison however much the following tokens resemble type
+        // arguments. This is what settles `f(a < b, c > (d))`, which the token
+        // scan alone reads as the generic call `a<b, c>(d)`. Names that bind
+        // no known value - including everything imported - still go to the
+        // scan.
+        if (this.check(TokenType::LAngle) && !this.binds_a_value(name) &&
+            this.is_generic_call_ahead()) {
+            // Record whether this was knowledge or a guess. Knowing the name is
+            // declared generic in this module settles it; otherwise only the
+            // token scan spoke, and the same text may have been comparisons.
+            if (!this.is_generic_decl_name(name)) {
+                (expr as IdentifierNode*).set_generic_angle_guessed(true);
+            }
             const gen_args: TypeAnnotation*[] = this.parse_generic_args();
 
             // After generic args, check what follows
@@ -2294,8 +2309,19 @@ public:
 
     /// Scan forward to determine if `<` begins generic type arguments.
     /// Returns true if we find a matching `>` followed by `(`, `{`, or `::`.
+    ///
+    /// The scan stays inside the grouping the `<` appeared in. A type argument
+    /// list is balanced with respect to `()` and `[]` - a tuple type `(i32,
+    /// i64)` or an array suffix `[]` nests, but nothing may close a group the
+    /// list did not open. So a closer arriving at depth zero means the `<` was
+    /// a comparison, and any `>` found beyond it belongs to something else
+    /// entirely. Without this the scan runs out of the enclosing argument list
+    /// and pairs the `<` with a `>` from a LATER argument: in
+    /// `f((a < b), (c > (d)))` it spans `a < b), (c >`, then generic-argument
+    /// parsing fails on the `)` it never expected to see.
     is_generic_call_ahead() -> boolean {
         mut angle_depth: int = 1;
+        mut group_depth: int = 0;
         mut offset: int = 1;
         const max_lookahead: int = 200;
 
@@ -2304,6 +2330,14 @@ public:
 
             // EOF: not a generic
             if (tok.kind == TokenType::EOF) { return false; }
+
+            if (tok.kind == TokenType::LParen || tok.kind == TokenType::LSquare) {
+                group_depth += 1;
+            } else if (tok.kind == TokenType::RParen ||
+                       tok.kind == TokenType::RSquare) {
+                if (group_depth == 0) { return false; }
+                group_depth -= 1;
+            }
 
             if (tok.kind == TokenType::LAngle) {
                 angle_depth += 1;
@@ -2373,6 +2407,40 @@ public:
         return false;
     }
 
+    /// Error recovery for a `<...>` that turned out not to hold type
+    /// arguments: advance past its closing `>` so the enclosing expression can
+    /// still be parsed. The opening `<` is already consumed, so nesting starts
+    /// at one. Stops at a closer that would leave the enclosing group, and at
+    /// the statement terminators, so a missing `>` cannot run away.
+    skip_past_generic_args() -> void {
+        mut angle_depth: int = 1;
+        mut group_depth: int = 0;
+        mut steps: int = 0;
+        while (angle_depth > 0 && !this.is_at_end() && steps < 200) {
+            const k: TokenType = this.current().kind;
+            if (k == TokenType::Semicolon || k == TokenType::LBrace) { return; }
+            if (k == TokenType::LParen || k == TokenType::LSquare) {
+                group_depth += 1;
+            } else if (k == TokenType::RParen || k == TokenType::RSquare) {
+                if (group_depth == 0) { return; }
+                group_depth -= 1;
+            } else if (k == TokenType::LAngle) {
+                angle_depth += 1;
+            } else if (k == TokenType::RAngle) {
+                angle_depth -= 1;
+            } else if (k == TokenType::GreaterGreater) {
+                angle_depth -= 2;
+            }
+            this.advance();
+            steps += 1;
+        }
+        // The cursor now sits at a known-good point - just past the `<...>` -
+        // which is what panic mode exists to find. Leaving it set would make
+        // the rest of the statement refuse to parse and report the fallout
+        // instead of the cause.
+        this.panic_mode = false;
+    }
+
     /// Parse generic type arguments: <T1, T2*, Array<int>, ...>
     /// Returns structured TypeAnnotation nodes, preserving pointer, array,
     /// optional, and nested generic structure.
@@ -2383,12 +2451,43 @@ public:
         while (!this.check(TokenType::RAngle) &&
                !this.check(TokenType::GreaterGreater) &&
                !this.is_at_end()) {
+            // A literal can never begin a type, so the `<` was a comparison
+            // that the lookahead misread - `f(x < 2, 3 > (4))` being the usual
+            // shape. Diagnosed here rather than in `parse_type_annotation`,
+            // which would first report a bare "expected type" from a position
+            // where the reader has no reason to expect one, leaving two errors
+            // for one mistake.
+            const lead: TokenType = this.current().kind;
+            if (lead == TokenType::NumericConstant ||
+                lead == TokenType::StringLiteral ||
+                lead == TokenType::FStringLiteral ||
+                lead == TokenType::CharConstant ||
+                lead == TokenType::KwTrue ||
+                lead == TokenType::KwFalse) {
+                this.report_error(ErrorCode::E0104_EXPECTED_TYPE,
+                    format("expected a type in generic arguments, found the value `%s`; if `<` was meant as a comparison, parenthesise the operands - `(x < y)`",
+                           this.current().lexeme));
+                // Resync past the matching `>` and return rather than break.
+                // Leaving the cursor on the offending token makes the enclosing
+                // expression fail too, burying the useful message under
+                // "expected ')'" / "expected ';'" cascades about the same
+                // mistake; stepping over the whole `<...>` lets the rest of the
+                // statement parse and keeps the diagnostics on the real error.
+                this.skip_past_generic_args();
+                return args;
+            }
             const ann: TypeAnnotation* = this.parse_type_annotation();
             if (ann != null) {
                 args.push(ann);
             } else {
+                // Reaching here means the `<` was committed to as opening type
+                // arguments and the contents turned out not to be a type. The
+                // same text is very often a comparison instead - `f(x < 2, 3 >
+                // (4))` - so lead with that rather than with a bare "expected
+                // type", which reads as though a type belonged here.
                 this.report_error(ErrorCode::E0104_EXPECTED_TYPE,
-                    format("expected type in generic arguments, found '%s'", this.current().lexeme));
+                    format("expected type in generic arguments, found '%s'; if `<` was meant as a comparison, parenthesise the operands - `(x < y)`",
+                           this.current().lexeme));
                 break;
             }
 

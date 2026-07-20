@@ -112,13 +112,29 @@ function current_dir() -> Option<String> {
 
 /// The running executable's absolute path as an owned `String`, or
 /// `None` if it couldn't be resolved (unreadable, or longer than the
-/// 4096-byte buffer). Uses `/proc/self/exe` on Unix and
-/// `GetModuleFileNameA` on Windows, both via the `readlink` intrinsic
-/// wrapper (see `core::intrinsics`).
+/// 4096-byte buffer).
+///
+/// There is no portable primitive for this, so the dispatch lives here
+/// rather than behind a uniform-looking libc wrapper: Unix reads the
+/// `/proc/self/exe` symlink, Windows asks kernel32 for the module path.
+![target(unix)]
 function current_exe() -> Option<String> {
     mut buf: u8[4096];
     const n: i64 = libc::readlink("/proc/self/exe", &buf[0], 4096u64);
     if (n <= 0 || n >= 4096) { return Option::None; }
+    // readlink does not NUL-terminate.
+    buf[n as u64] = 0;
+    return Option::Some(String::from_str(Str::from(&buf[0] as string)));
+}
+
+/// See the Unix variant above.
+![target(windows)]
+function current_exe() -> Option<String> {
+    mut buf: u8[4096];
+    // Returns the length written, or `nSize` on truncation - which is why
+    // the full-buffer case is rejected rather than accepted as a valid path.
+    const n: u32 = libc::GetModuleFileNameA(null, &buf[0], 4096u32);
+    if (n == 0u32 || n >= 4096u32) { return Option::None; }
     buf[n as u64] = 0;
     return Option::Some(String::from_str(Str::from(&buf[0] as string)));
 }

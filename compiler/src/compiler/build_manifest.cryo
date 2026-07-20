@@ -4,7 +4,7 @@
 ///! `<output_dir>/target/<profile>/` and a machine-readable fingerprint
 ///! sidecar under `<output_dir>/target/<profile>/local/incremental/<name>.fp`.
 ///!
-///! The fingerprint is a 64-bit FNV-1a digest over EVERY build input:
+///! The fingerprint is a 128-bit FNV-1a digest over EVERY build input:
 ///!   - the compiler binary's own bytes (so a changed compiler rebuilds),
 ///!   - the resolved knobs (opt level, debug info, emit-llvm, no-std,
 ///!     target triple, profile, and the `[link]` lists),
@@ -183,8 +183,8 @@ type struct Manifest {
     }
 
     /// Combined fingerprint over every build input.
-    compute_fingerprint(&this, modules: &ModuleEntry[]) -> u64 {
-        mut h: DefaultHasher = DefaultHasher::new();
+    compute_fingerprint(&this, modules: &ModuleEntry[]) -> u128 {
+        mut h: Fnv128Hasher = Fnv128Hasher::new();
         h.fold(Manifest::compiler_fingerprint());
         // Resolved knobs.
         h.fold(this.opt_level as u64);
@@ -213,7 +213,7 @@ type struct Manifest {
             h.fold(modules[i].origin_subdir);
             Manifest::fold_file(&h, modules[i].source_path);
         }
-        return h.finish();
+        return h.finish128();
     }
 
     /// True when the saved fingerprint matches `fp_hex` AND every artifact
@@ -253,8 +253,8 @@ type struct Manifest {
         ProjectConfig::mkdir_p(this.cfg.profile_dir());
         const path: string = this.cfg.manifest_path();
 
-        const cfp: u64 = Manifest::compiler_fingerprint();
-        const compiler_fp: string = cfp.to_hex_padded_str(16);
+        const cfp: u128 = Manifest::compiler_fingerprint();
+        const compiler_fp: string = Manifest::hex128(cfp);
 
         mut root: JsonObject = JsonObject::new();
         root.put("schema_version",       JsonValue::uint_value(2));
@@ -315,12 +315,22 @@ type struct Manifest {
         text.drop();
     }
 
+    /// A 128-bit digest as 32 lowercase hex characters, high half first.
+    /// The single renderer for every fingerprint the build records, so a
+    /// digest has one textual form wherever it appears - manifest, `.fp`
+    /// sidecar, or `.modkeys` table.
+    static hex128(d: u128) -> string {
+        const hi: u64 = (d >> 64) as u64;
+        const lo: u64 = d as u64;
+        return hi.to_hex_padded_str(16) + lo.to_hex_padded_str(16);
+    }
+
     /// Fold a file's full byte content (NULs included) into the running digest
     /// `h`. A missing or unreadable file folds a distinct marker so it still
     /// perturbs the fingerprint. The byte count is mixed in last as a length
     /// guard. File reading is compiler-specific, so this lives here and drives
-    /// the canonical `DefaultHasher::fold` for the actual byte mixing.
-    static fold_file(h: DefaultHasher*, path: string) -> void {
+    /// the canonical `Hasher::fold` for the actual byte mixing.
+    static fold_file(h: Fnv128Hasher*, path: string) -> void {
         if (!metadata::exists(Path::from(path))) {
             h.fold("<missing>");
             return;
@@ -354,15 +364,15 @@ type struct Manifest {
 
     /// FNV-1a digest of the running compiler's own bytes. Changes whenever the
     /// compiler changes, invalidating every cached build it produced.
-    static compiler_fingerprint() -> u64 {
+    static compiler_fingerprint() -> u128 {
         const exe: string = Manifest::self_exe_path();
-        mut h: DefaultHasher = DefaultHasher::new();
+        mut h: Fnv128Hasher = Fnv128Hasher::new();
         if (exe.length() == 0) {
             h.fold("<unknown-compiler>");
-            return h.finish();
+            return h.finish128();
         }
         Manifest::fold_file(&h, exe);
-        return h.finish();
+        return h.finish128();
     }
 
     /// FNV-1a digest of a SINGLE module's identity + content, mirroring exactly
@@ -371,12 +381,12 @@ type struct Manifest {
     /// cache key; folding `origin_subdir` means relocating a module between
     /// packages (which changes where its `.o` lands) invalidates its key.
     static module_source_hash(namespace_name: string, origin_subdir: string,
-                                source_path: string) -> u64 {
-        mut h: DefaultHasher = DefaultHasher::new();
+                                source_path: string) -> u128 {
+        mut h: Fnv128Hasher = Fnv128Hasher::new();
         h.fold(namespace_name);
         h.fold(origin_subdir);
         Manifest::fold_file(&h, source_path);
-        return h.finish();
+        return h.finish128();
     }
 
     /// FNV-1a digest of the toolchain inputs that affect EVERY object file: the
@@ -387,8 +397,8 @@ type struct Manifest {
     /// folds this, so a changed compiler or a `--dev`/`--release` switch
     /// invalidates the whole per-module cache.
     static toolchain_fingerprint(cfg: ProjectConfig*, opt_level: u32,
-                                   debug_info: boolean) -> u64 {
-        mut h: DefaultHasher = DefaultHasher::new();
+                                   debug_info: boolean) -> u128 {
+        mut h: Fnv128Hasher = Fnv128Hasher::new();
         h.fold(Manifest::compiler_fingerprint());
         h.fold(opt_level as u64);
         const dbg_b:  u8 = if (debug_info)    { 1 } else { 0 };
@@ -399,7 +409,7 @@ type struct Manifest {
         h.fold(nstd_b);
         h.fold(cfg.target_triple);
         h.fold(cfg.profile);
-        return h.finish();
+        return h.finish128();
     }
 
     /// Read a file's content with trailing whitespace/newlines stripped, or ""
