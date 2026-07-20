@@ -39,6 +39,7 @@ import alloc::allocator;
 const SEPARATOR:     u8 = 0x2F;  // '/'
 const BACKSLASH:     u8 = 0x5C;  // '\'
 const COLON:         u8 = 0x3A;  // ':'
+const DOT:           u8 = 0x2E;  // '.'
 
 // Whether this target uses Windows path syntax. A compile-time constant
 // rather than duplicated per-target method bodies: the parsing RULES differ,
@@ -178,6 +179,19 @@ type struct Path {
         return -1;
     }
 
+    /// Index of the last `.` in `name`, or -1 when there is none. `name` is a
+    /// single path component, not a whole path, so this never has to skip a
+    /// root or separators - the caller passes the output of `file_name`.
+    static last_dot(name: Str) -> i64 {
+        mut i: u64 = name.length();
+        while (i > 0) {
+            const j: u64 = i - 1;
+            if (Path::byte_or_zero(name, j) == DOT) { return j as i64; }
+            i = j;
+        }
+        return -1;
+    }
+
     /// Whether this path is absolute; see `is_absolute_str`.
     is_absolute(&this) -> boolean {
         return Path::is_absolute_str(this.inner);
@@ -219,6 +233,49 @@ type struct Path {
             return Option::Some(Path { inner: this.inner.sub_bytes(0, root) });
         }
         return Option::None;
+    }
+
+    /// Extension of the final component: the bytes after its last `.`, or
+    /// `None`. Mirrors Rust's `Path::extension`, so it consults only the file
+    /// name - `parent().extension()` cannot leak in a dot from a directory:
+    ///
+    ///   `foo.rs`     -> Some("rs")
+    ///   `foo.tar.gz` -> Some("gz")     (last dot only)
+    ///   `foo.`       -> Some("")       (trailing dot, empty extension)
+    ///   `foo`        -> None           (no dot)
+    ///   `.bashrc`    -> None           (leading dot is not an extension)
+    ///   `..`         -> None           (not a name with an extension)
+    ///   `a/b`        -> None           (path ends in a directory, no name)
+    ///
+    /// A leading dot only disqualifies when it is the ONLY dot: `.foo.rs`
+    /// still has extension `rs`.
+    extension(&this) -> Option<Str> {
+        match (this.file_name()) {
+            Option::None => { return Option::None; }
+            Option::Some(name) => {
+                const n: u64 = name.length();
+                const dot: i64 = Path::last_dot(name);
+                // No dot, or a dot only at index 0 (dotfile): no extension.
+                if (dot <= 0) { return Option::None; }
+                // `..` carries a dot at index 1 but names no extension.
+                if (n == 2 && Path::byte_or_zero(name, 0) == DOT
+                           && Path::byte_or_zero(name, 1) == DOT) {
+                    return Option::None;
+                }
+                return Option::Some(name.sub_bytes((dot as u64) + 1, n));
+            }
+        }
+    }
+
+    /// Append `segment` to a COPY of this path, leaving the borrowed path
+    /// untouched. The non-mutating twin of `PathBuf::push`, and it inherits
+    /// `push`'s root semantics: a `segment` carrying its own root - `/etc`,
+    /// `C:\dir`, `\\server\share` - replaces rather than extends, matching
+    /// Rust's `Path::join`.
+    join(&this, segment: Str) -> PathBuf {
+        mut buf: PathBuf = PathBuf::from(this.inner);
+        buf.push(segment);
+        return buf;
     }
 }
 
@@ -288,6 +345,18 @@ type struct PathBuf<A = GlobalAlloc> {
             }
             Option::None => { return false; }
         }
+    }
+
+    /// Append `segment` to a COPY of this path and return it, leaving `self`
+    /// intact. `push` mutates in place; `join` is the owning, non-mutating
+    /// twin. Same root semantics as `push` (a rooted `segment` replaces).
+    join(&this, segment: Str) -> PathBuf {
+        return this.as_path().join(segment);
+    }
+
+    /// Extension of the final component; see `Path::extension`.
+    extension(&this) -> Option<Str> {
+        return this.as_path().extension();
     }
 
     /// Consume the PathBuf and return its bytes as an owned, NUL-terminated
