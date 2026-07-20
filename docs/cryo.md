@@ -159,6 +159,29 @@ const s: String = f"x = {x}, opt = {opt:?}";   // "x = 42, opt = Some(7)"
   `Option`, `Result`, and `Array<T>`.
 - The embedded expression is a full expression: `f"{a + b}"`, `f"{p.x}"`,
   `f"{m.get(k)}"`.
+- A hole may carry a **format spec** after a colon, a subset of Rust's:
+
+  ```
+  {expr:[[fill]align][#][0][width][.precision][type]}
+  ```
+
+  - `align` is `<` (left), `>` (right), or `^` (centre); the default is
+    left. `fill` is any single character placed before the alignment
+    (`{n:*>6}` → `****42`).
+  - `width` is a minimum field width counted in Unicode scalars; shorter
+    values are padded with `fill` (space by default).
+  - A leading `0` zero-pads numbers, keeping the sign and any radix prefix
+    leftmost (`{−5:06}` → `-00005`, `{255:#06x}` → `0x00ff`).
+  - `.precision` truncates a Display value to that many scalars
+    (`{"hello":.3}` → `hel`) and sets the fractional digits of a float
+    (`{pi:.2}` → `3.14`).
+  - `type` selects an integer radix: `x`/`X` (hex), `o` (octal), `b`
+    (binary); `#` adds the `0x`/`0o`/`0b` prefix. A radix formats the
+    value's own-width two's-complement bits, so `{(-5i32):x}` → `fffffffb`.
+  - The spec separator is the first top-level `:`. A hole that mixes a
+    ternary with a spec must parenthesise the ternary
+    (`f"{(c ? a : b):>4}"`); a bare `a ? b : c` (spaces around `:`) is not
+    mistaken for a spec.
 - `{{` and `}}` produce literal `{` and `}`. Standard escape sequences in the
   literal text are processed as in a normal string.
 - The result is a heap-backed `String` the caller owns (and drops). The
