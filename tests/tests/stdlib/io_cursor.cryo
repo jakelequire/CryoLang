@@ -1,0 +1,182 @@
+///! Cursor - in-memory Read + Write + Seek byte buffer.
+///!
+///! Exercises the write/read round-trip, positional overwrite, the
+///! seek-past-end zero-fill, the negative-seek error, and `into_inner`.
+///! All hermetic: no fds, no syscalls.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::IoCursor;
+
+import std::core::result;
+import std::core::option;
+import std::core::slice;
+import std::core::drop;
+import std::collections::str;
+import std::collections::array;
+import std::io::error;
+import std::io::traits;
+import std::io::cursor;
+import std::test::error;
+import std::test::assert;
+
+// True if `slice` equals the bytes of `expected`.
+function bytes_eq(slice: Slice<u8>, expected: Str) -> boolean {
+    const want: Slice<u8> = expected.as_bytes();
+    if (slice.length() != want.length()) { return false; }
+    mut i: u64 = 0;
+    while (i < slice.length()) {
+        match (slice.get(i)) {
+            Option::Some(a) => {
+                match (want.get(i)) {
+                    Option::Some(b) => { if (a != b) { return false; } }
+                    Option::None => { return false; }
+                }
+            }
+            Option::None => { return false; }
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+![test]
+function write_then_read_roundtrips() -> Result<(), TestError> {
+    mut c: Cursor = Cursor::empty();
+    match (c.write(Str::new("hello"))) {
+        Result::Ok(_) => { } Result::Err(_) => { c.drop(); return bail(Str::new("write failed")); }
+    }
+    const len_after: u64 = c.len();
+    const pos_after: u64 = c.position();
+
+    match (c.seek(SeekFrom::Start(0))) {
+        Result::Ok(_) => { } Result::Err(_) => { c.drop(); return bail(Str::new("rewind failed")); }
+    }
+    mut buf: u8[8];
+    mut got: u64 = 0;
+    match (c.read(&buf[0], 8)) {
+        Result::Ok(n) => { got = n; } Result::Err(_) => { c.drop(); return bail(Str::new("read failed")); }
+    }
+    const ok: boolean = bytes_eq(Slice::from_raw(&buf[0], got), Str::new("hello"));
+    c.drop();
+
+    match (expect_eq(len_after, 5 as u64)) { Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); } }
+    match (expect_eq(pos_after, 5 as u64)) { Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); } }
+    match (expect_eq(got, 5 as u64)) { Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); } }
+    return expect(ok, Str::new("read back should equal 'hello'"));
+}
+
+![test]
+function read_past_end_is_eof() -> Result<(), TestError> {
+    mut c: Cursor = Cursor::new(Array<u8>::new());
+    match (c.write(Str::new("ab"))) {
+        Result::Ok(_) => { } Result::Err(_) => { c.drop(); return bail(Str::new("write failed")); }
+    }
+    // Cursor is at the end after writing; a read here must report EOF (0).
+    mut buf: u8[4];
+    mut got: u64 = 99;
+    match (c.read(&buf[0], 4)) {
+        Result::Ok(n) => { got = n; } Result::Err(_) => { c.drop(); return bail(Str::new("read failed")); }
+    }
+    c.drop();
+    return expect_eq(got, 0 as u64);
+}
+
+![test]
+function write_overwrites_at_position() -> Result<(), TestError> {
+    mut c: Cursor = Cursor::empty();
+    match (c.write(Str::new("hello"))) {
+        Result::Ok(_) => { } Result::Err(_) => { c.drop(); return bail(Str::new("write failed")); }
+    }
+    match (c.seek(SeekFrom::Start(0))) {
+        Result::Ok(_) => { } Result::Err(_) => { c.drop(); return bail(Str::new("seek failed")); }
+    }
+    match (c.write(Str::new("H"))) {
+        Result::Ok(_) => { } Result::Err(_) => { c.drop(); return bail(Str::new("overwrite failed")); }
+    }
+    const len_after: u64 = c.len();               // unchanged: overwrote in place
+    const ok: boolean = bytes_eq(c.as_bytes(), Str::new("Hello"));
+    c.drop();
+    match (expect_eq(len_after, 5 as u64)) { Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); } }
+    return expect(ok, Str::new("overwriting byte 0 should give 'Hello'"));
+}
+
+![test]
+function seek_past_end_zero_fills_on_write() -> Result<(), TestError> {
+    mut c: Cursor = Cursor::empty();
+    match (c.write(Str::new("hello"))) {
+        Result::Ok(_) => { } Result::Err(_) => { c.drop(); return bail(Str::new("write failed")); }
+    }
+    // Seek to 7 (two past the end) and write '!'; [5,7) must zero-fill.
+    match (c.seek(SeekFrom::Start(7))) {
+        Result::Ok(_) => { } Result::Err(_) => { c.drop(); return bail(Str::new("seek failed")); }
+    }
+    match (c.write(Str::new("!"))) {
+        Result::Ok(_) => { } Result::Err(_) => { c.drop(); return bail(Str::new("write failed")); }
+    }
+    const len_after: u64 = c.len();
+    // Expect "hello\0\0!" - eight bytes.
+    mut want: u8[8];
+    want[0] = 0x68; want[1] = 0x65; want[2] = 0x6C; want[3] = 0x6C;
+    want[4] = 0x6F; want[5] = 0; want[6] = 0; want[7] = 0x21;
+    const ok: boolean = bytes_eq(c.as_bytes(), Str::from_raw(&want[0], 8));
+    c.drop();
+    match (expect_eq(len_after, 8 as u64)) { Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); } }
+    return expect(ok, Str::new("seek-past-end write should zero-fill the gap"));
+}
+
+![test]
+function seek_end_and_current_deltas() -> Result<(), TestError> {
+    mut c: Cursor = Cursor::empty();
+    match (c.write(Str::new("hello"))) {
+        Result::Ok(_) => { } Result::Err(_) => { c.drop(); return bail(Str::new("write failed")); }
+    }
+    mut end_minus_one: u64 = 999;
+    match (c.seek(SeekFrom::End(0 - 1))) {
+        Result::Ok(p) => { end_minus_one = p; } Result::Err(_) => { c.drop(); return bail(Str::new("End seek failed")); }
+    }
+    mut cur_plus_one: u64 = 999;
+    match (c.seek(SeekFrom::Current(1))) {
+        Result::Ok(p) => { cur_plus_one = p; } Result::Err(_) => { c.drop(); return bail(Str::new("Current seek failed")); }
+    }
+    c.drop();
+    match (expect_eq(end_minus_one, 4 as u64)) { Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); } }
+    return expect_eq(cur_plus_one, 5 as u64);
+}
+
+![test]
+function negative_seek_is_invalid_input() -> Result<(), TestError> {
+    mut c: Cursor = Cursor::empty();
+    match (c.write(Str::new("hi"))) {
+        Result::Ok(_) => { } Result::Err(_) => { c.drop(); return bail(Str::new("write failed")); }
+    }
+    mut is_invalid_input: boolean = false;
+    match (c.seek(SeekFrom::Current(0 - 100))) {
+        Result::Ok(_) => { }
+        Result::Err(e) => {
+            match (e.kind) {
+                IoErrorKind::InvalidInput => { is_invalid_input = true; }
+                _ => { }
+            }
+        }
+    }
+    c.drop();
+    return expect(is_invalid_input,
+        Str::new("seeking to a negative offset should fail with InvalidInput"));
+}
+
+![test]
+function into_inner_returns_written_bytes() -> Result<(), TestError> {
+    mut c: Cursor = Cursor::empty();
+    match (c.write(Str::new("abc"))) {
+        Result::Ok(_) => { } Result::Err(_) => { c.drop(); return bail(Str::new("write failed")); }
+    }
+    mut bytes: Array<u8> = c.into_inner();
+    const taken_len: u64 = bytes.length();
+    const emptied: u64 = c.len();                 // into_inner leaves the cursor empty
+    const ok: boolean = bytes_eq(bytes.as_slice(), Str::new("abc"));
+    bytes.drop();
+    c.drop();
+    match (expect_eq(taken_len, 3 as u64)) { Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); } }
+    match (expect_eq(emptied, 0 as u64)) { Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); } }
+    return expect(ok, Str::new("into_inner should hand back 'abc'"));
+}

@@ -134,6 +134,64 @@ function seek_set_reads_from_offset() -> Result<(), TestError> {
 }
 
 ![test]
+function seek_trait_positions_via_seekfrom() -> Result<(), TestError> {
+    // Drive the same offsets through the `Seek` trait (`SeekFrom` +
+    // `rewind`/`stream_position`) rather than the inherent `seek_*`.
+    mut namebuf: i8[96];
+    const p: Path = temp_path(&namebuf[0], "seektrait");
+    const payload: Str = Str::new("Hello, Cryo!\n");   // 'C' at offset 7
+
+    match (File::create(p)) {
+        Result::Ok(handle) => {
+            mut f: File = handle;
+            match (f.write(payload.as_bytes())) {
+                Result::Ok(_)  => { }
+                Result::Err(_) => { f.drop(); libc::unlink(&namebuf[0] as u8*); return bail(Str::new("write failed")); }
+            }
+            f.drop();
+        }
+        Result::Err(_) => { return bail(Str::new("File::create failed")); }
+    }
+
+    mut readbuf: u8[64];
+    mut got: u64 = 0;
+    mut start_pos: u64 = 999;
+    mut after_rewind: u64 = 999;
+    mut ok: boolean = false;
+    match (File::open(p)) {
+        Result::Ok(handle) => {
+            mut f: File = handle;
+            // seek(Start(7)) via the trait.
+            match (f.seek(SeekFrom::Start(7))) {
+                Result::Ok(pos) => { start_pos = pos; }
+                Result::Err(_)  => { f.drop(); libc::unlink(&namebuf[0] as u8*); return bail(Str::new("seek(Start) failed")); }
+            }
+            match (f.read_all(&readbuf[0], 64)) {
+                Result::Ok(n)  => { got = n; }
+                Result::Err(_) => { f.drop(); libc::unlink(&namebuf[0] as u8*); return bail(Str::new("read after seek failed")); }
+            }
+            ok = slices_eq(Slice::from_raw(&readbuf[0], got), Str::new("Cryo!\n").as_bytes());
+            // rewind then confirm stream_position reports 0.
+            match (f.rewind()) {
+                Result::Ok(_)  => { }
+                Result::Err(_) => { f.drop(); libc::unlink(&namebuf[0] as u8*); return bail(Str::new("rewind failed")); }
+            }
+            match (f.stream_position()) {
+                Result::Ok(pos) => { after_rewind = pos; }
+                Result::Err(_)  => { f.drop(); libc::unlink(&namebuf[0] as u8*); return bail(Str::new("stream_position failed")); }
+            }
+            f.drop();
+        }
+        Result::Err(_) => { libc::unlink(&namebuf[0] as u8*); return bail(Str::new("File::open failed")); }
+    }
+    libc::unlink(&namebuf[0] as u8*);
+
+    match (expect_eq(start_pos, 7)) { Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); } }
+    match (expect_eq(after_rewind, 0 as u64)) { Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); } }
+    return expect(ok, Str::new("seek(Start(7)) should read \"Cryo!\\n\""));
+}
+
+![test]
 function copy_duplicates_contents() -> Result<(), TestError> {
     mut srcbuf: i8[96];
     mut dstbuf: i8[96];

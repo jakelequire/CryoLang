@@ -324,10 +324,13 @@ type struct TestMainCodegen {
 
         // Look up mangled names of the runtime entry points through the DI.
         const set_args_qualified: SymbolStr = intern.intern("std::env::set_args");
+        const set_env_qualified:  SymbolStr = intern.intern("std::env::set_env");
         const run_all_qualified:  SymbolStr = intern.intern("std::test::runner::run_all");
         const set_args_mangled:   SymbolStr = di.lookup_mangled_name(set_args_qualified);
+        const set_env_mangled:    SymbolStr = di.lookup_mangled_name(set_env_qualified);
         const run_all_mangled:    SymbolStr = di.lookup_mangled_name(run_all_qualified);
-        if (!set_args_mangled.is_valid() || !run_all_mangled.is_valid()) {
+        if (!set_args_mangled.is_valid() || !set_env_mangled.is_valid()
+                || !run_all_mangled.is_valid()) {
             // The stdlib's test/env modules weren't compiled into this build
             // (probably a `--no-std` or stdlib-misconfiguration scenario).
             // Surface a clear diagnostic instead of a confusing link failure.
@@ -336,6 +339,7 @@ type struct TestMainCodegen {
             return false;
         }
         const set_args_name: string = intern.resolve(set_args_mangled);
+        const set_env_name:  string = intern.resolve(set_env_mangled);
         const run_all_name:  string = intern.resolve(run_all_mangled);
 
         // Build the function signatures.
@@ -347,22 +351,27 @@ type struct TestMainCodegen {
         const void_ty: LType = LType::void_type();
 
         const set_args_ty: LType = TestMainCodegen::make_function_type_2(void_ty, i32_ty, ptr_ty);
+        const set_env_ty:  LType = TestMainCodegen::make_function_type_1(void_ty, ptr_ty);
         const run_all_ty:  LType = TestMainCodegen::make_function_type_4(i32_ty, i32_ty, ptr_ty, ptr_ty, i64_ty);
 
         // Declare the runner-side externs.
         const set_args_fn: LValue = test_mod.add_function(set_args_name, set_args_ty);
+        const set_env_fn:  LValue = test_mod.add_function(set_env_name,  set_env_ty);
         const run_all_fn:  LValue = test_mod.add_function(run_all_name,  run_all_ty);
 
-        // Declare main(i32, ptr) -> i32.
-        const main_ty: LType = TestMainCodegen::make_function_type_2(i32_ty, i32_ty, ptr_ty);
+        // Declare main(i32, ptr, ptr) -> i32.  The third `char** envp`
+        // param mirrors the user-program main-widening so `env::vars()`
+        // works under `cryo test`; the C runtime always passes it.
+        const main_ty: LType = TestMainCodegen::make_function_type_3(i32_ty, i32_ty, ptr_ty, ptr_ty);
         const main_fn: LValue = test_mod.add_function("main", main_ty);
         const entry:   LBasicBlock = LBasicBlock::append(main_fn, "entry");
         mut builder: LBuilder = LBuilder::create();
         builder.position_at_end(entry);
 
-        // argc = LLVMGetParam(main_fn, 0); argv = LLVMGetParam(main_fn, 1).
+        // argc = param 0; argv = param 1; envp = param 2.
         const argc: LValue = LValue { raw: llvm::LLVMGetParam(main_fn.raw, 0) };
         const argv: LValue = LValue { raw: llvm::LLVMGetParam(main_fn.raw, 1) };
+        const envp: LValue = LValue { raw: llvm::LLVMGetParam(main_fn.raw, 2) };
 
         // call set_args(argc, argv)
         {
@@ -371,6 +380,15 @@ type struct TestMainCodegen {
             slots[0] = argc.raw;
             slots[1] = argv.raw;
             builder.build_call(set_args_ty, set_args_fn, args_buf, 2, "");
+            intrinsics::free(args_buf);
+        }
+
+        // call set_env(envp)
+        {
+            const args_buf: void* = intrinsics::malloc(8);
+            const slots: void** = args_buf as void**;
+            slots[0] = envp.raw;
+            builder.build_call(set_env_ty, set_env_fn, args_buf, 1, "");
             intrinsics::free(args_buf);
         }
 
@@ -404,6 +422,16 @@ type struct TestMainCodegen {
         return true;
     }
 
+    /// Helper: build a `(p1) -> ret` LLVM function type.
+    static make_function_type_1(ret: LType, p1: LType) -> LType {
+        const buf: void* = intrinsics::malloc(8);
+        const slots: void** = buf as void**;
+        slots[0] = p1.raw;
+        const ty: LType = LType::function_type(ret, buf, 1, false);
+        intrinsics::free(buf);
+        return ty;
+    }
+
     /// Helper: build a `(p1, p2) -> ret` LLVM function type.
     static make_function_type_2(ret: LType, p1: LType, p2: LType) -> LType {
         const buf: void* = intrinsics::malloc(2 * 8);
@@ -411,6 +439,18 @@ type struct TestMainCodegen {
         slots[0] = p1.raw;
         slots[1] = p2.raw;
         const ty: LType = LType::function_type(ret, buf, 2, false);
+        intrinsics::free(buf);
+        return ty;
+    }
+
+    /// Helper: build a `(p1, p2, p3) -> ret` LLVM function type.
+    static make_function_type_3(ret: LType, p1: LType, p2: LType, p3: LType) -> LType {
+        const buf: void* = intrinsics::malloc(3 * 8);
+        const slots: void** = buf as void**;
+        slots[0] = p1.raw;
+        slots[1] = p2.raw;
+        slots[2] = p3.raw;
+        const ty: LType = LType::function_type(ret, buf, 3, false);
         intrinsics::free(buf);
         return ty;
     }

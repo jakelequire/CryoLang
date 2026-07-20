@@ -4,8 +4,10 @@
 namespace CryoTests::Tests::Stdlib::StringT;
 
 import std::core::result;
+import std::core::iter;
 import std::collections::str;
 import std::collections::string;
+import std::collections::pair;
 import std::test::error;
 import std::test::assert;
 
@@ -185,6 +187,114 @@ function str_sub_bytes_window() -> Result<(), TestError> {
         Str::new("sub_bytes(7,12) should be 'world'"))) {
         Result::Ok(_) => { }
         Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+// Return the number of Unicode scalars in `s` (drives `chars` to exhaustion).
+function scalar_count(s: Str) -> u64 {
+    mut it: implement Iterator<u32> = s.chars();
+    mut n: u64 = 0;
+    loop {
+        match (it.next()) {
+            Option::Some(_) => { n = n + 1; }
+            Option::None => { break; }
+        }
+    }
+    return n;
+}
+
+// Return the scalar at scalar-position `nth` (0-based), or 0 past the end.
+function scalar_at(s: Str, nth: u64) -> u32 {
+    mut it: implement Iterator<u32> = s.chars();
+    mut i: u64 = 0;
+    loop {
+        match (it.next()) {
+            Option::Some(cp) => {
+                if (i == nth) { return cp; }
+                i = i + 1;
+            }
+            Option::None => { return 0; }
+        }
+    }
+}
+
+![test]
+function chars_counts_scalars() -> Result<(), TestError> {
+    // "aé€😀" is 10 UTF-8 bytes but 4 scalars.
+    const s: Str = Str::new("aé€😀");
+    match (expect_eq(s.length(), 10 as u64)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(scalar_count(s), 4 as u64)) {
+        Result::Ok(_) => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function chars_decodes_scalar_values() -> Result<(), TestError> {
+    // U+0061, U+00E9, U+20AC, U+1F600.
+    const s: Str = Str::new("aé€😀");
+    match (expect_eq(scalar_at(s, 0), 0x61 as u32)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(scalar_at(s, 1), 0xE9 as u32)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(scalar_at(s, 2), 0x20AC as u32)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(scalar_at(s, 3), 0x1F600 as u32)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function char_indices_reports_byte_offsets() -> Result<(), TestError> {
+    // Offsets advance by each scalar's UTF-8 width: 1, 2, 3, 4.
+    const s: Str = Str::new("aé€😀");
+    mut it: implement Iterator<Pair<u64, u32>> = s.char_indices();
+    mut expected_off: u64 = 0;
+    mut widths: u64[4];
+    widths[0] = 1; widths[1] = 2; widths[2] = 3; widths[3] = 4;
+    mut i: u64 = 0;
+    loop {
+        match (it.next()) {
+            Option::Some(p) => {
+                match (expect_eq(p.first, expected_off)) {
+                    Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+                }
+                expected_off = expected_off + widths[i];
+                i = i + 1;
+            }
+            Option::None => { break; }
+        }
+    }
+    match (expect_eq(i, 4 as u64)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}
+
+![test]
+function chars_replaces_malformed_utf8() -> Result<(), TestError> {
+    // Lone continuation byte 0x80 followed by ASCII 'A' decodes to
+    // U+FFFD then U+0041, one byte at a time.
+    mut buf: u8[2];
+    buf[0] = 0x80; buf[1] = 0x41;
+    const s: Str = Str::from_raw(&buf[0], 2);
+    match (expect_eq(scalar_count(s), 2 as u64)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(scalar_at(s, 0), 0xFFFD as u32)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(scalar_at(s, 1), 0x41 as u32)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
     }
     return Result::Ok(());
 }
