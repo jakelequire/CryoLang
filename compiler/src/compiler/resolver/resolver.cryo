@@ -485,6 +485,36 @@ type struct Resolver {
         return this.resolve_type_qualified_name_bare(name);
     }
 
+    /// The defining module of the function a bare name resolves to here, or an
+    /// empty SymbolStr when the name isn't a function visible from this scope.
+    ///
+    /// This is the import-aware half of picking between same-named functions in
+    /// different modules: the scope chain already models what the current
+    /// module can see, so a candidate whose defining module this returns is the
+    /// one the source actually names. Without it, selection can only compare
+    /// candidate counts, and two same-named generics anywhere in the program
+    /// leave every caller of either one unresolvable.
+    resolve_function_source_module(&this, name: SymbolStr) -> SymbolStr {
+        mut scope_id: ScopeID = this.current_scope;
+        while (scope_id.is_valid()) {
+            const scope: Scope* = this.get_scope(scope_id);
+            const found: SymbolID = scope.find(name);
+            if (found.is_valid()) {
+                const sym: Symbol = this.get_symbol(found);
+                // `Import` is the kind a name brought in by `import` carries -
+                // an imported function is not re-declared as `Function` in the
+                // importer's scope. `resolve_type_qualified_name_bare` accepts
+                // it for the same reason.
+                if (sym.kind == SymbolKind::Function || sym.kind == SymbolKind::Import) {
+                    if (sym.source_module == "") { return SymbolStr::empty(); }
+                    return this.intern_table.intern(sym.source_module);
+                }
+            }
+            scope_id = scope.parent_id;
+        }
+        return SymbolStr::empty();
+    }
+
     /// Core qualified-name resolution for a bare (unqualified) type name.
     /// Walks scope chain and import aliases to find the symbol, then constructs
     /// the canonical qualified form: "module::name".
