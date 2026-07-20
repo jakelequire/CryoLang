@@ -33,13 +33,6 @@ public mut g_for_in_counter: u32 = 0;
 
 type class ExprParser : ParserBase {
 public:
-    /// Parse a brace-delimited block containing statements and expressions.
-    /// ExprParser provides a limited version (const/mut, return, expressions).
-    /// Parser overrides this with full statement parsing (for, if, while, etc.).
-    override parse_inner_block() -> BlockStmtNode* {
-        return this.parse_lambda_block_body();
-    }
-
     ExprParser(tokens: Token[], source_file: string, ctx: CompilationContext*)
         : ParserBase(tokens, source_file, ctx) {
     }
@@ -1333,11 +1326,9 @@ public:
         if (this.check(TokenType::LBrace)) {
             // Route through the virtual `parse_inner_block` hook so Parser's
             // full-statement override (if/while/for/loop/match/switch/break/
-            // continue, plus the const-mut-return-expr forms ExprParser can
-            // handle on its own) takes effect.  At runtime `this` is a
-            // Parser* whenever a top-down compile is in progress; the
-            // ExprParser-only fallback (`parse_lambda_block_body` below) is
-            // kept as the base for any standalone ExprParser instantiation.
+            // continue) takes effect.  Parser is the only concrete parser -
+            // ExprParser exists as its base, never standalone - so this always
+            // dispatches there.
             const block: BlockStmtNode* = this.parse_inner_block();
             lambda.set_body(block);
         } else {
@@ -1357,65 +1348,6 @@ public:
 
         lambda.span = this.span_from(start);
         return lambda;
-    }
-
-    /// Parse a lambda block body: { statement; statement; ... }
-    /// Simplified block parser for ExprParser (can't call Parser's parse_block_statement).
-    /// Handles return statements and expression statements.
-    parse_lambda_block_body() -> BlockStmtNode* {
-        const start: Token = this.advance(); // consume '{'
-        mut block: BlockStmtNode* = new BlockStmtNode(this.span_from_token(start));
-
-        while (!this.check(TokenType::RBrace) && !this.is_at_end()) {
-            // Return statement
-            if (this.check(TokenType::KwReturn)) {
-                const ret_start: Token = this.advance(); // consume 'return'
-                mut ret_expr: ExpressionNode* = null;
-                if (!this.check(TokenType::Semicolon) && !this.check(TokenType::RBrace)) {
-                    ret_expr = this.parse_expression();
-                }
-                this.consume(TokenType::Semicolon, "';'");
-                const ret: ReturnStmtNode* = new ReturnStmtNode(ret_expr, this.span_from(ret_start));
-                block.add_statement(ret);
-                continue;
-            }
-
-            // Variable declaration (const/mut)
-            if (this.check(TokenType::KwConst) || this.check(TokenType::KwMut)) {
-                const is_mut: boolean = this.check(TokenType::KwMut);
-                const decl_start: Token = this.advance(); // consume const/mut
-                const name_tok: Token = this.consume(TokenType::Identifier, "variable name");
-                const vname: SymbolStr = this.intern_lexeme(name_tok);
-                mut decl: VarDeclNode* = new VarDeclNode(vname, this.span_from_token(decl_start));
-                decl.set_mutable(is_mut);
-                decl.set_kw_span(this.span_from_token(decl_start));
-                if (this.match_tok(TokenType::Colon)) {
-                    decl.set_type_annotation(this.parse_type_annotation());
-                }
-                if (this.match_tok(TokenType::Equal)) {
-                    decl.set_initializer(this.parse_expression());
-                }
-                this.consume(TokenType::Semicolon, "';'");
-                const ds: DeclStmtNode* = new DeclStmtNode(decl, this.span_from(decl_start));
-                block.add_statement(ds);
-                continue;
-            }
-
-            // Expression statement
-            const expr: ExpressionNode* = this.parse_expression();
-            if (expr != null) {
-                this.consume(TokenType::Semicolon, "';'");
-                const es: ExprStmtNode* = new ExprStmtNode(expr, expr.span);
-                block.add_statement(es);
-            } else {
-                this.error_unexpected();
-                this.advance();
-            }
-        }
-
-        this.consume(TokenType::RBrace, "'}'");
-        block.span = this.span_from(start);
-        return block;
     }
 
     /// Parse an array literal: [ expr, expr, ... ]
@@ -1858,35 +1790,6 @@ public:
         return arm;
     }
 
-    /// Parse a variable declaration inside a match expression arm block.
-    /// Handles: const name: Type = expr;  /  mut name = expr;
-    /// Lightweight version that doesn't need full Parser::parse_declaration.
-    parse_match_arm_var_decl() -> VarDeclNode* {
-        const start: Token = this.current();
-        const is_mutable: boolean = this.check(TokenType::KwMut);
-        this.advance(); // consume const/mut
-
-        const name_tok: Token = this.consume(TokenType::Identifier, "variable name");
-        const name: SymbolStr = this.intern_lexeme(name_tok);
-        mut node: VarDeclNode* = new VarDeclNode(name, this.span_from_token(start));
-        node.set_mutable(is_mutable);
-        node.set_name_span(this.span_from_token(name_tok));
-        node.set_kw_span(this.span_from_token(start));
-
-        // Optional type annotation: `: Type`
-        if (this.match_tok(TokenType::Colon)) {
-            node.set_type_annotation(this.parse_type_annotation());
-        }
-
-        // Optional initializer: `= expr`
-        if (this.match_tok(TokenType::Equal)) {
-            node.set_initializer(this.parse_expression());
-        }
-
-        this.match_tok(TokenType::Semicolon);
-        node.span = this.span_from(start);
-        return node;
-    }
 
     /// Parse a pattern (internal, used by match expressions and statements).
     parse_pattern_internal() -> PatternNode* {
