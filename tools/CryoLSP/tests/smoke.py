@@ -218,17 +218,77 @@ def main():
          str(comp.get("error")))
 
     # --- semantic tokens --------------------------------------------------
-    st = srv.request("textDocument/semanticTokens/full", {
-        "textDocument": {"uri": doc_uri},
+    # Against a REAL file that the project's module graph contains, not the
+    # synthetic buffer above. Tokens are produced by walking the compiled AST,
+    # which is reached via `find_module_by_path`; a document that is not on
+    # disk (or is on disk but unreachable from the entry point) has no module
+    # to walk and correctly yields an empty list. Asserting tokens on the
+    # synthetic doc tested an impossible case and failed permanently.
+    # A small example project, not CryoLSP's own source: opening the latter
+    # compiles the whole compiler library and takes far longer than a smoke
+    # test should wait.
+    real_path = os.path.join(REPO_ROOT, "examples", "03-fibonacci", "src", "main.cryo")
+    real_uri = uri_for(real_path)
+    with open(real_path, "r", encoding="utf-8") as fh:
+        real_text = fh.read()
+    srv.notify("textDocument/didOpen", {
+        "textDocument": {"uri": real_uri, "languageId": "cryo",
+                         "version": 1, "text": real_text},
     })
+    st = srv.request("textDocument/semanticTokens/full", {
+        "textDocument": {"uri": real_uri},
+    }, timeout=120)
     c.ok("error" not in st, "semanticTokens/full does not error",
          str(st.get("error")))
     data = (st.get("result") or {}).get("data")
     c.ok(isinstance(data, list) and len(data) > 0,
          "semanticTokens/full returns tokens",
-         "got %r" % (type(data).__name__,))
+         "got %r len %s" % (type(data).__name__, len(data) if isinstance(data, list) else "n/a"))
     c.ok(isinstance(data, list) and len(data) % 5 == 0,
          "semantic token data is a multiple of 5")
+
+    # A document outside the module graph must answer cleanly rather than
+    # erroring or crashing.
+    ghost_uri = uri_for(os.path.join(REPO_ROOT, "examples", "03-fibonacci",
+                                     "src", "does_not_exist_on_disk.cryo"))
+    srv.notify("textDocument/didOpen", {
+        "textDocument": {"uri": ghost_uri, "languageId": "cryo", "version": 1,
+                         "text": "namespace Ghost::Doc;\n"},
+    })
+    gst = srv.request("textDocument/semanticTokens/full", {
+        "textDocument": {"uri": ghost_uri},
+    })
+    c.ok("error" not in gst and isinstance((gst.get("result") or {}).get("data"), list),
+         "semanticTokens on an unknown document answers cleanly")
+
+    # --- closing a document must not take the server down -----------------
+    # `did_close` releases the session's arena. That arena is also the one
+    # published to `GlobalArena`, whose `holds()` is dereferenced on every
+    # deallocation - so failing to retract it first turned the very next
+    # `free` into a wild read and killed the server mid-notification.
+    srv.notify("textDocument/didClose", {"textDocument": {"uri": ghost_uri}})
+    srv.notify("textDocument/didClose", {"textDocument": {"uri": real_uri}})
+    # Closing the example-project document sends the next request back through
+    # a full recompile of THIS project, so allow for a cold compile. A dead
+    # server never answers at all, so report that as a failed check rather than
+    # letting the harness die with a traceback.
+    try:
+        after_close = srv.request("textDocument/hover", {
+            "textDocument": {"uri": doc_uri},
+            "position": {"line": 10, "character": 13},
+        }, timeout=120)
+    except TimeoutError:
+        after_close = None
+    c.ok(after_close is not None
+         and ("result" in after_close or "error" in after_close),
+         "server survives didClose and still answers",
+         "no response - server exit code %r" % (srv.proc.poll(),))
+    if srv.proc.poll() is not None:
+        # Everything after this point would just raise on a closed pipe.
+        print("\n  server is gone (exit %r); skipping remaining checks"
+              % srv.proc.poll())
+        print("\n  passed %d, failed %d" % (c.passed, len(c.failed)))
+        return 1
 
     # --- a document the server must not choke on --------------------------
     # An incomplete buffer mid-edit, which is the normal state during typing.

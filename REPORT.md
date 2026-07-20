@@ -217,7 +217,7 @@ string-keyed monomorphization era).
   silently launch a stale `cryolsp`. Also `serverInfo.version = "0.1.0"`
   (`handlers/lifecycle.cryo:177`) contradicts package.json `1.0.0`.
 
-- [ ] **LSP `::` completion is still a lexical text-scrape** while `.` is
+- [x] **LSP `::` completion is still a lexical text-scrape** while `.` is
   semantic (`handlers/completion.cryo:15-18`) — the known "works sometimes"
   flakiness root cause (AUDIT F1).
 
