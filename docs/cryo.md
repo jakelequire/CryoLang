@@ -208,7 +208,7 @@ Every value in Cryo has a known type at compile time. A binding's type is either
 
 In performance-sensitive or cross-platform code, prefer the explicit-width forms (`i32`, `u64`, `f64`) so the layout is unambiguous. The shorthand aliases exist for ergonomics.
 
-`string` is a NUL-terminated raw byte pointer matching the C ABI. Inside the standard library, length-typed UTF-8 is modelled by [`Str`](#str) (borrowed) and [`String`](#string) (owned). The translation between them happens at the FFI boundary in `ffi::cstr`.
+`string` is a NUL-terminated raw byte pointer matching the C ABI. Inside the standard library, length-typed UTF-8 is modelled by [`Str`](#19-the-standard-library) (borrowed) and [`String`](#19-the-standard-library) (owned). The translation between them happens at the FFI boundary in `ffi::cstr`.
 
 ### 2.2 Pointer Types
 
@@ -312,6 +312,43 @@ apply((x: i32) -> i32 { return x + bias; }, 32);  // 42 - capturing closure
 apply((x: i32) -> i32 { return x * 2; }, 21);     // 42 - non-capturing lambda
 apply(tentimes, 4);                               // 40 - named function pointer
 ```
+
+#### Where a capturing closure may be passed
+
+The specialisation above happens per call site, and in 1.0 it is wired for
+one call shape: a **non-generic free function**. Passing a *capturing* closure
+anywhere else is rejected at compile time with **E0458** rather than silently
+falling back to an indirect call:
+
+| Callee | Capturing closure | Non-capturing lambda / named fn |
+|---|---|---|
+| Non-generic free function - `apply(c, x)` | **yes** | yes |
+| Generic free function - `apply<T>(c, x)` | E0458 | yes |
+| Method - `obj.run(c)` | E0458 | yes |
+| Scope-resolution call - `Type::run(c)` | E0458 | yes |
+| `extern "C"` callback parameter | never (no environment slot) | yes |
+
+The distinction is *capture*, not syntax. A lambda that captures nothing is an
+ordinary function pointer and binds anywhere a function pointer does, including
+every row above; a lambda that captures becomes an anonymous struct value, and
+only the first row knows how to specialise a receiver for it. This is why
+`opt.map((n: int) -> int { return n * 10; })` is fine while the same call with
+a lambda that closes over a local is E0458 - the callee is a method.
+
+Two ways around it:
+
+```cryo
+// 1. Pull the call into a free function that takes the closure.
+function run_with(f: (i32) -> i32, v: i32) -> i32 { return f(v); }
+run_with((x: i32) -> i32 { return x + bias; }, 32);
+
+// 2. Close over nothing - pass the value as an argument instead.
+opt.map((n: int) -> int { return n * 10; });
+```
+
+These are deferred capabilities, not bugs: the grammar and the closure
+representation already accommodate them, only the receiver-specialisation
+paths for generic, method, and scope-resolution callees are unimplemented.
 
 A combinator that infers a *new* type parameter from the callback's return
 type - for example `Option::map<U>` - does so automatically: `U` is bound from
@@ -614,7 +651,7 @@ function sum(count: i32, args...) -> i64 {
 }
 ```
 
-`va.next<T>()` is the explicit form; `va.next()` infers `T` from the expected type at the call site (see [section 17.x](#directives) on `![implicit]`). `va.as_ptr()` returns the raw `va_list` pointer for forwarding to a C `v*printf` callee - equivalently, pass the original `args` identifier.
+`va.next<T>()` is the explicit form; `va.next()` infers `T` from the expected type at the call site (see [section 17](#17-directives-and-attributes) on `![implicit]`). `va.as_ptr()` returns the raw `va_list` pointer for forwarding to a C `v*printf` callee - equivalently, pass the original `args` identifier.
 
 Two limits are inherited from C varargs and no wrapper can remove them:
 
@@ -2311,6 +2348,64 @@ Cryo has **no borrow checker**. References and raw pointers are unchecked: alias
 
 ---
 
+### 16.4 The `Send` and `Sync` Traits
+
+`Send` means a value may be moved to another thread; `Sync` means it may be
+shared between threads by reference. Like `Copy`, they are **decided by the
+compiler, never declared** - `implement trait Send for T { ... }` is not how a
+type becomes `Send`, and writing one has no effect. The declarations in
+`stdlib/core/marker.cryo` are empty marker traits that exist so bounds can
+name them.
+
+The rule is structural, and identical for both traits today (they are separate
+predicates so a future `&T: Send if T: Sync` distinction can land without an
+API change):
+
+- Primitives, references, function pointers, and **raw pointers** are `Send`
+  and `Sync`.
+- Arrays, optionals, and tuples are `Send`/`Sync` if every component is.
+- Structs, classes, and enums are `Send`/`Sync` if every field - or every
+  variant payload - is, **and** the type is not on the deny-list below.
+- Generic parameters and unresolved positions are conservatively **not**
+  `Send`/`Sync`; say `where T: Send` when a generic needs it.
+
+A small deny-list overrides the structural answer for types that are
+genuinely thread-unsafe despite being built from `Send` parts. It is matched
+on the fully-qualified name, so a type of your own merely *named* `Rc` is not
+caught by it:
+
+| Type | Why |
+|---|---|
+| `std::alloc::rc::Rc` | non-atomic refcount; use `Arc` across threads |
+| `std::sync::mutex::MutexGuard` | POSIX mutexes must be released by the acquiring thread |
+| `std::sync::rwlock::RwLockReadGuard` | as above |
+| `std::sync::rwlock::RwLockWriteGuard` | as above |
+
+#### `Send` is advisory at the edges
+
+Bounds are genuinely enforced: `Send`/`Sync` are checked at every explicit
+`where T: Send` / `where T: Sync`, and the thread entry points carry them -
+`thread::spawn`, `try_spawn`, and `spawn_with_attr` require `C: Send, T: Send`,
+`Scope::spawn` requires `C: Send`. Moving an `Rc<T>` or a lock guard into
+another thread is a compile error.
+
+What the rule does **not** do is make `Send` a safety guarantee:
+
+- **Raw pointers are unconditionally `Send + Sync`.** This is deliberate -
+  Cryo has no borrow checker, and the containers built on raw pointers
+  (`Box`, `Arc`, `Array`, `String`, `mpsc::Sender`) are structurally `Send`
+  because of it. A struct that hides a `T*` and reasons about it correctly
+  does not have to fight the type system; a struct that hides a `T*` and
+  reasons about it *incorrectly* is `Send` all the same.
+- **The deny-list is a fixed list, not a derivation.** A new thread-unsafe
+  type is `Send` until someone adds it.
+- **Lock constructors do not yet carry `T: Send` bounds**, so a
+  `Mutex<Rc<_>>` is still constructible. That is the known remaining edge.
+
+Treat a `Send` bound as "the compiler checked the parts it can see", not as
+proof that a value is safe to move across a thread. Where a type wraps a raw
+pointer whose target is not thread-safe, the obligation is the author's.
+
 ## 17. Directives and Attributes
 
 Directives are compile-time annotations attached to declarations using `![...]` syntax. They modify how the compiler treats the declaration without changing its semantic meaning at the call site.
@@ -2650,7 +2745,7 @@ The prelude is deliberately small. Anything else is an explicit `import` - notab
 | **`random`**      | `Rng`, a fast non-cryptographic xoshiro256** generator seeded via `from_seed(u64)` (reproducible) or `from_os()`: `next_u64`/`next_u32`/`next_bool`/`next_f64`, unbiased `below(bound)` / `range_u64(lo, hi)` (rejection-sampled), `fill_bytes`. `secure_bytes(buf, len)` fills from the kernel CSPRNG (`getrandom`); use it for keys/tokens/nonces - `Rng` is not cryptographic.                                                                                                                                                                                                                      |
 | **`net`**         | `IpV4Addr`, `IpV6Addr`, `IpAddr`, `SocketAddr`, `TcpStream` (`Read + Write`), `TcpListener`. **HTTP/1.1 layer (`net::http`):** `Method`, `StatusCode`, `Headers`, `Request`, `Response`, `Router`, `HttpServer` with keep-alive + `Connection: close` opt-out + per-connection read timeouts, `Client::get`/`post` with `send(addr, req)`. **TLS** (`net::tls`, OpenSSL-backed `TlsStream`), **UDP** (`UdpSocket`), **HTTP/2** (`net::http2`, HPACK + single-stream framing), and **WebSocket** (`net::ws`, RFC 6455) all ship in 1.0. IPv6 addressing is parsed and represented but not yet dialable. |
 | **`process`**     | POSIX subprocess spawning (`fork + execve`). `Command` builder (`arg`, `env`, `stdin`/`stdout`/`stderr`, `current_dir`), `Stdio` (`Inherit`, `Null`, `Piped`, `Fd`), `Child`, `ExitStatus`, `ChildStdin`/`ChildStdout`/`ChildStderr`, `Signal`. Windows is not yet supported.                                                                                                                                                                                                                                                                                                                          |
-| **`sync`**        | A generic `Atomic<T>` (`T` = `u8` / `u32` / `u64` / `i32` / `i64` / `boolean`, dispatched at compile time via `static match`; `load` / `store` / `swap` / `fetch_add` / `fetch_sub` / `fetch_and` / `fetch_or` / `fetch_xor` / `compare_exchange`), `MemoryOrder`, `fence`, `compiler_fence`, `Mutex<T, A>`, `RwLock<T, A>`, `CondVar`, `Once`, `Barrier`. RAII guards (`MutexGuard`, `RwLockReadGuard`, `RwLockWriteGuard`) are `!Send`. `Send` / `Sync` auto-derive with call-site enforcement.                                                                                                      |
+| **`sync`**        | A generic `Atomic<T>` (`T` = `u8` / `u32` / `u64` / `i32` / `i64` / `boolean`, dispatched at compile time via `static match`; `load` / `store` / `swap` / `fetch_add` / `fetch_sub` / `fetch_and` / `fetch_or` / `fetch_xor` / `compare_exchange`), `MemoryOrder`, `fence`, `compiler_fence`, `Mutex<T, A>`, `RwLock<T, A>`, `CondVar`, `Once`, `Barrier`. RAII guards (`MutexGuard`, `RwLockReadGuard`, `RwLockWriteGuard`) are `!Send`. `Send` / `Sync` are computed structurally with call-site enforcement - see [section 16.4](#164-the-send-and-sync-traits).                                    |
 | **`thread`**      | `ThreadLocal<T>` lazy per-thread storage via `pthread_key`. `thread::spawn` / `try_spawn` / `JoinHandle<T>` (returning the body's value on `join`), `spawn_with_attr`, scoped threads (`thread::Scope`), `thread::current` / `yield_now` / `sleep` / `sleep_ms`, plus `sync::mpsc` channels (`channel`, `Sender`, `Receiver`) all ship in 1.0, built on `pthread`. The `sync` primitives and `Arc<T>` ship alongside. `Builder` (`Builder::new().stack_size(bytes).name(str).spawn`/`try_spawn`) configures the stack size and OS thread name for a spawn.                                             |
 | **`test`**        | Built-in unit-test framework. Tests live in `<project>/tests/`, are marked `![test]`, and are discovered and run fork-per-test by `cryo test`. `expect`, `expect_eq`, `expect_ne`, `bail`, `bail_other`. See [section 20](#20-testing).                                                                                                                                                                                                                                                                                                                                                                      |
 
@@ -2768,7 +2863,7 @@ The lexer and grammar reserve the following forms because the language plans to 
 | `![weak]`                                     | Reserved. Will declare weak linkage.                                                                                                                                                              |
 | `![constructor]` / `![destructor]`            | Reserved. Will register functions that run before `main` / after `main` returns.                                                                                                                  |
 | `![repr(<int_type>)]` on enums                | Reserved. Use `type enum Foo : u8 { ... }` syntax for now; future versions may accept `![repr(u8)]` as an equivalent spelling.                                                                      |
-| `![derive(Trait, ...)]`                       | Reserved. The directive's argument list is parsed and validated (an unknown trait name is rejected), but nothing consumes it: no implementation is synthesized for any listed trait. `Copy` in particular is decided structurally, not declared - see [section 16](#16-ownership-and-memory-management). |
+| `![derive(Trait, ...)]`                       | Reserved. The directive's argument list is parsed and validated (an unknown trait name is rejected), but nothing consumes it: no implementation is synthesized for any listed trait. `Copy` in particular is decided structurally, not declared - see [section 16](#16-ownership-copy-and-drop). |
 
 When any of these moves out of "reserved" and into "implemented," it will be added to the relevant section of this document and removed from this table.
 
