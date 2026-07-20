@@ -4,13 +4,27 @@
 ///! NUL terminator; crossing into libc uses a NUL-terminated `String`
 ///! built with `String::with_null`.
 ///!
-///! Path semantics are POSIX-flavored: `/` is the separator, leading
-///! `/` means absolute. Windows-specific path forms such as drive
-///! letters and UNC paths are not currently supported. Note this is
-///! independent of file I/O: `File` / `metadata` / `read_dir` work on
-///! Windows, but the `Path` manipulation here (`is_absolute`, `parent`,
-///! `file_name`, `push`, ...) assumes `/`-separated paths, so passing a
-///! `C:\...`-style path to it will not split correctly.
+///! Path syntax is per-target. On Unix `/` separates and a leading `/`
+///! is absolute - the whole path is one flat sequence of segments. On
+///! Windows both `/` and `\` separate, and a path may open with a ROOT
+///! that is not a segment and must never be split off or reordered:
+///!
+///!   `C:\dir\file`     drive-absolute  - root `C:\`
+///!   `C:dir`           drive-relative  - root `C:`, resolved against the
+///!                                       drive's own working directory
+///!   `\dir`            rooted          - root `\`, but drive-relative, so
+///!                                       NOT absolute (matching Rust)
+///!   `\\server\share`  UNC             - root is the whole `\\server\share`
+///!
+///! Every operation below is defined in terms of that root: `parent` and
+///! `file_name` stop at it, `pop` cannot climb above it, and `push` of a
+///! rooted segment replaces rather than appends. Verbatim `\\?\` prefixes
+///! parse as UNC, which keeps them intact but does not give them their
+///! special "no normalisation" meaning.
+///!
+///! `push` writes `/` on every target. Windows accepts `/` throughout the
+///! Win32 file APIs, and the toolchain builds paths with `/` elsewhere, so
+///! emitting it keeps one convention; `\` is still understood on input.
 
 namespace std::fs::path;
 
@@ -22,7 +36,17 @@ import collections::str;
 import collections::string;
 import alloc::allocator;
 
-const SEPARATOR: u8 = 0x2F;  // '/'
+const SEPARATOR:     u8 = 0x2F;  // '/'
+const BACKSLASH:     u8 = 0x5C;  // '\'
+const COLON:         u8 = 0x3A;  // ':'
+
+// Whether this target uses Windows path syntax. A compile-time constant
+// rather than duplicated per-target method bodies: the parsing RULES differ,
+// the traversal logic does not.
+![target(windows)]
+const WINDOWS_SYNTAX: boolean = true;
+![target(unix)]
+const WINDOWS_SYNTAX: boolean = false;
 
 // Path: borrowed
 
@@ -50,64 +74,149 @@ type struct Path {
         return this.inner.is_empty();
     }
 
-    /// Absolute paths start with `/`.
+    /// Whether `byte` separates segments on this target.
+    static is_separator(byte: u8) -> boolean {
+        if (byte == SEPARATOR) { return true; }
+        if (WINDOWS_SYNTAX) { return byte == BACKSLASH; }
+        return false;
+    }
+
+    /// `source`'s byte at `index`, or 0 when out of range. Path syntax never
+    /// gives 0 a meaning, so callers can compare it without unwrapping.
+    static byte_or_zero(source: Str, index: u64) -> u8 {
+        match (source.byte_at(index)) {
+            Option::Some(byte) => { return byte; }
+            Option::None       => { return 0 as u8; }
+        }
+    }
+
+    static is_drive_letter(byte: u8) -> boolean {
+        if (byte >= 0x41 && byte <= 0x5A) { return true; }   // A-Z
+        return byte >= 0x61 && byte <= 0x7A;                 // a-z
+    }
+
+    /// Length of `source`'s leading root, including its trailing separator
+    /// when one is present; 0 when the path is fully relative.
+    ///
+    /// This is the floor for every traversal here: bytes below it are not a
+    /// segment and splitting them would change which volume the path names.
+    static root_len(source: Str) -> u64 {
+        const n: u64 = source.length();
+        if (n == 0) { return 0; }
+
+        if (!WINDOWS_SYNTAX) {
+            if (Path::is_separator(Path::byte_or_zero(source, 0))) { return 1; }
+            return 0;
+        }
+
+        // UNC `\\server\share`: two separators, a server, then a share. The
+        // share is part of the root - `\\server` alone names no filesystem,
+        // so `parent` must not hand it back as if it did.
+        if (n >= 2 && Path::is_separator(Path::byte_or_zero(source, 0))
+                   && Path::is_separator(Path::byte_or_zero(source, 1))) {
+            mut i: u64 = 2;
+            // server
+            while (i < n && !Path::is_separator(Path::byte_or_zero(source, i))) { i = i + 1; }
+            if (i < n) { i = i + 1; }                        // separator after server
+            // share
+            while (i < n && !Path::is_separator(Path::byte_or_zero(source, i))) { i = i + 1; }
+            if (i < n) { i = i + 1; }                        // trailing separator
+            return i;
+        }
+
+        // `C:\` (drive-absolute) or `C:` (drive-relative).
+        if (n >= 2 && Path::is_drive_letter(Path::byte_or_zero(source, 0))
+                   && Path::byte_or_zero(source, 1) == COLON) {
+            if (n >= 3 && Path::is_separator(Path::byte_or_zero(source, 2))) { return 3; }
+            return 2;
+        }
+
+        // A bare leading separator roots the path on the current drive.
+        if (Path::is_separator(Path::byte_or_zero(source, 0))) { return 1; }
+        return 0;
+    }
+
+    /// Whether `source` resolves without reference to a working DIRECTORY.
+    ///
+    /// `C:dir` is the one rooted form that does not: it names a path relative
+    /// to whatever directory that drive is currently sitting in, so it is
+    /// reported relative. Everything else with a root - `/dir`, `\dir`,
+    /// `C:\dir`, `\\server\share` - is absolute.
+    ///
+    /// This deliberately differs from Rust, which also calls `\dir` relative
+    /// because it does not name a drive. The distinction there is carried by
+    /// a prefix-aware `join`; with a plain `push`, the usual caller idiom
+    /// `if (!p.is_absolute()) { p = cwd.push(p) }` would prepend a second
+    /// root to `\dir` and produce nonsense. Reporting root-anchored paths as
+    /// absolute keeps that idiom correct, and keeps a `/`-style path - which
+    /// this toolchain passes around on every target - answering the same way
+    /// everywhere.
+    static is_absolute_str(source: Str) -> boolean {
+        const n: u64 = source.length();
+        if (n == 0) { return false; }
+
+        if (WINDOWS_SYNTAX && n >= 2
+                && Path::is_drive_letter(Path::byte_or_zero(source, 0))
+                && Path::byte_or_zero(source, 1) == COLON) {
+            return n >= 3 && Path::is_separator(Path::byte_or_zero(source, 2));
+        }
+        return Path::is_separator(Path::byte_or_zero(source, 0));
+    }
+
+    /// Index of the last separator at or after `floor`, or -1 when there is
+    /// none. Searching from `floor` is what keeps the root's own separators
+    /// from being mistaken for segment breaks. Signed so "none" stays
+    /// distinct from "found at `floor`" - both are reachable, and conflating
+    /// them is what makes a root look like an ordinary segment.
+    static last_separator(source: Str, floor: u64) -> i64 {
+        mut i: u64 = source.length();
+        while (i > floor) {
+            const j: u64 = i - 1;
+            if (Path::is_separator(Path::byte_or_zero(source, j))) { return j as i64; }
+            i = j;
+        }
+        return -1;
+    }
+
+    /// Whether this path is absolute; see `is_absolute_str`.
     is_absolute(&this) -> boolean {
-        if (this.inner.length() == 0) { return false; }
-        match (this.inner.byte_at(0)) {
-            Option::Some(byte) => { return byte == SEPARATOR; }
-            Option::None => { return false; }
-        }
+        return Path::is_absolute_str(this.inner);
     }
 
-    /// Last path segment, or `None` if the path ends with `/` or is
-    /// empty. Does not consult the filesystem.
+    /// Last path segment, or `None` if the path ends with a separator, is
+    /// empty, or is nothing but a root. Does not consult the filesystem.
     file_name(&this) -> Option<Str> {
-        if (this.inner.length() == 0) { return Option::None; }
-        mut i: u64 = this.inner.length();
-        while (i > 0) {
-            const j: u64 = i - 1;
-            match (this.inner.byte_at(j)) {
-                Option::Some(byte) => {
-                    if (byte == SEPARATOR) {
-                        if (j == this.inner.length() - 1) {
-                            return Option::None;
-                        }
-                        return Option::Some(
-                            this.inner.sub_bytes(j + 1, this.inner.length())
-                        );
-                    }
-                }
-                Option::None => { return Option::None; }
-            }
-            i = j;
-        }
-        return Option::Some(this.inner);
+        const n: u64 = this.inner.length();
+        const root: u64 = Path::root_len(this.inner);
+        if (n == 0 || n <= root) { return Option::None; }
+
+        const k: i64 = Path::last_separator(this.inner, root);
+        // No separator past the root: everything after the root is the name.
+        if (k < 0) { return Option::Some(this.inner.sub_bytes(root, n)); }
+        // Trailing separator: the path names a directory, not a file.
+        if ((k as u64) == n - 1) { return Option::None; }
+        return Option::Some(this.inner.sub_bytes((k as u64) + 1, n));
     }
 
-    /// Path minus its final segment, or `None` if there is no parent
-    /// (single-segment, root, or empty).
+    /// Path minus its final segment, or `None` if there is no parent - a
+    /// single relative segment, a bare root, or empty. A rooted path whose
+    /// last segment is stripped yields the root itself, never "".
     parent(&this) -> Option<Path> {
-        if (this.inner.length() == 0) { return Option::None; }
-        mut i: u64 = this.inner.length();
-        while (i > 0) {
-            const j: u64 = i - 1;
-            match (this.inner.byte_at(j)) {
-                Option::Some(byte) => {
-                    if (byte == SEPARATOR) {
-                        if (j == 0) {
-                            // Path is `/something`; parent is `/`.
-                            return Option::Some(Path {
-                                inner: this.inner.sub_bytes(0, 1)
-                            });
-                        }
-                        return Option::Some(Path {
-                            inner: this.inner.sub_bytes(0, j)
-                        });
-                    }
-                }
-                Option::None => { return Option::None; }
-            }
-            i = j;
+        const n: u64 = this.inner.length();
+        const root: u64 = Path::root_len(this.inner);
+        if (n == 0 || n <= root) { return Option::None; }
+
+        const k: i64 = Path::last_separator(this.inner, root);
+        if (k >= 0) {
+            // Cutting at the separator keeps the root's trailing separator
+            // when the split lands on it, so `/x` yields `/` and `C:\x`
+            // yields `C:\` rather than the volume-changing `C:`.
+            return Option::Some(Path { inner: this.inner.sub_bytes(0, k as u64) });
+        }
+        // No separator past the root. A rooted path falls back to its root;
+        // a single relative segment has no parent to give.
+        if (root > 0) {
+            return Option::Some(Path { inner: this.inner.sub_bytes(0, root) });
         }
         return Option::None;
     }
@@ -141,30 +250,29 @@ type struct PathBuf<A = GlobalAlloc> {
         return this.inner.is_empty();
     }
 
-    /// Append `segment`, inserting a `/` separator if needed. If
-    /// `segment` is absolute, it replaces the current path entirely.
+    /// Append `segment`, inserting a separator if needed. A segment carrying
+    /// a root of its own - `/etc`, `C:\dir`, `\dir`, `\\server\share` -
+    /// replaces the current path rather than extending it, since appending
+    /// one path's root inside another would name nothing.
     push(mut &this, segment: Str) -> void {
-        const abs: boolean = is_absolute_bytes(segment);
-        if (abs) {
+        if (Path::root_len(segment) > 0) {
             this.inner.clear();
             this.inner.push(segment);
             return;
         }
         if (!this.inner.is_empty()) {
-            match (this.inner.as_bytes().get(this.inner.length() - 1)) {
-                Option::Some(byte) => {
-                    if (byte != SEPARATOR) {
-                        this.inner.push_byte(SEPARATOR);
-                    }
-                }
-                Option::None => { }
+            const last: u8 = Path::byte_or_zero(this.inner.as_str(),
+                                                this.inner.length() - 1);
+            if (!Path::is_separator(last)) {
+                this.inner.push_byte(SEPARATOR);
             }
         }
         this.inner.push(segment);
     }
 
-    /// Remove the last segment. Returns `true` if anything was
-    /// popped.
+    /// Remove the last segment. Returns `true` if anything was popped;
+    /// `false` at a bare root or an empty path, so this cannot climb out
+    /// of the volume the path names.
     pop(mut &this) -> boolean {
         match (this.as_path().parent()) {
             Option::Some(parent) => {
@@ -205,13 +313,5 @@ implement<A> trait Drop for struct PathBuf<A>
 where A: Allocator {
     drop(mut &this) -> void {
         this.inner.drop();
-    }
-}
-
-function is_absolute_bytes(source: Str) -> boolean {
-    if (source.length() == 0) { return false; }
-    match (source.byte_at(0)) {
-        Option::Some(byte) => { return byte == SEPARATOR; }
-        Option::None => { return false; }
     }
 }

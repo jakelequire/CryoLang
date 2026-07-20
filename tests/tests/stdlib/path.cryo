@@ -182,3 +182,125 @@ function pathbuf_pop_empty_returns_false() -> Result<(), TestError> {
     }
     return Result::Ok(());
 }
+
+// ============================================================================
+// Windows path syntax
+//
+// Path SYNTAX is per-target, so these pin the answer the running target is
+// supposed to give rather than one platform's answer everywhere. Only the
+// expectations are target-gated - the test bodies, and so the test roster,
+// stay identical on every target.
+//
+// On Unix `C:\dir\file.txt` is a single segment with no separator in it at
+// all, which is the correct reading there: `\` is an ordinary filename byte.
+// ============================================================================
+
+/// Expected `parent()` of `C:\dir\file.txt`, "" meaning `None`.
+![target(windows)]
+function want_drive_parent() -> Str { return Str::new("C:\dir"); }
+![target(unix)]
+function want_drive_parent() -> Str { return Str::new(""); }
+
+/// Expected `file_name()` of `C:\dir\file.txt`.
+![target(windows)]
+function want_drive_file_name() -> Str { return Str::new("file.txt"); }
+![target(unix)]
+function want_drive_file_name() -> Str { return Str::new("C:\dir\file.txt"); }
+
+/// Expected `parent()` of `C:\dir` - the case that must NOT yield `C:`,
+/// which would name a different location (the drive's working directory).
+![target(windows)]
+function want_drive_root_parent() -> Str { return Str::new("C:\\"); }
+![target(unix)]
+function want_drive_root_parent() -> Str { return Str::new(""); }
+
+/// Whether the running target treats a drive-relative `C:dir` as absolute.
+/// It never should: it resolves against that drive's working directory.
+![target(windows)]
+function want_drive_relative_absolute() -> boolean { return false; }
+![target(unix)]
+function want_drive_relative_absolute() -> boolean { return false; }
+
+/// `parent()` rendered as a `String`, or "" for `None`, so a missing parent
+/// and an empty parent compare the same way.
+function parent_text(p: Path) -> String {
+    match (p.parent()) {
+        Option::Some(x) => { return String::from_str(x.as_str()); }
+        Option::None    => { return String::new(); }
+    }
+}
+
+![test]
+function drive_path_splits_per_target() -> Result<(), TestError> {
+    const p: Path = Path::from(Str::new("C:\dir\file.txt"));
+    mut got: String = parent_text(p);
+    const want: Str = want_drive_parent();
+    const eq: boolean = got.as_str().equals(&want);
+    got.drop();
+    return expect(eq, Str::new("parent of 'C:\dir\file.txt'"));
+}
+
+![test]
+function drive_path_file_name_per_target() -> Result<(), TestError> {
+    const p: Path = Path::from(Str::new("C:\dir\file.txt"));
+    const want: Str = want_drive_file_name();
+    match (p.file_name()) {
+        Option::Some(got) => {
+            return expect(got.equals(&want),
+                          Str::new("file_name of 'C:\dir\file.txt'"));
+        }
+        Option::None => {
+            return expect(false, Str::new("file_name of 'C:\dir\file.txt' was None"));
+        }
+    }
+}
+
+// The root must keep its trailing separator: `C:` and `C:\` name different
+// places, so stripping the last segment of `C:\dir` may not yield `C:`.
+![test]
+function drive_root_parent_keeps_separator() -> Result<(), TestError> {
+    const p: Path = Path::from(Str::new("C:\dir"));
+    mut got: String = parent_text(p);
+    const want: Str = want_drive_root_parent();
+    const eq: boolean = got.as_str().equals(&want);
+    got.drop();
+    return expect(eq, Str::new("parent of 'C:\dir' must not be 'C:'"));
+}
+
+![test]
+function drive_relative_is_not_absolute() -> Result<(), TestError> {
+    const p: Path = Path::from(Str::new("C:dir"));
+    return expect(p.is_absolute() == want_drive_relative_absolute(),
+                  Str::new("'C:dir' is drive-relative, not absolute"));
+}
+
+// A UNC share is entirely root: `\\server` alone names no filesystem, so
+// stripping `share` off must yield nothing rather than a half path. Four
+// source backslashes are two real ones - the UNC prefix.
+//
+// On Unix the same bytes hold no separator at all, so there is no parent
+// there either, and the expectation needs no target gate.
+![test]
+function unc_share_has_no_parent() -> Result<(), TestError> {
+    const p: Path = Path::from(Str::new("\\\\server\\share"));
+    mut got: String = parent_text(p);
+    const eq: boolean = got.is_empty();
+    got.drop();
+    return expect(eq, Str::new("a UNC share root has no parent"));
+}
+
+// Posix-shaped paths must answer identically on every target - the toolchain
+// passes `/`-separated paths around on Windows too.
+![test]
+function posix_form_splits_the_same_everywhere() -> Result<(), TestError> {
+    const p: Path = Path::from(Str::new("/usr/local/bin"));
+    mut got: String = parent_text(p);
+    const want: Str = Str::new("/usr/local");
+    const eq: boolean = got.as_str().equals(&want);
+    got.drop();
+    match (expect(eq, Str::new("parent of '/usr/local/bin'"))) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect(p.is_absolute(), Str::new("'/usr/local/bin' is absolute"));
+}

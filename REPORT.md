@@ -355,7 +355,7 @@ hazard classes above.
   `numeric_lexeme_overflows_u64` ~50 duplicated lines
   (`parser_base.cryo:426-518`).
 
-- [ ] **D12. Dead/vestigial code**: `TypeAnnotation::Optional` never
+- [x] **D12. Dead/vestigial code**: `TypeAnnotation::Optional` never
   constructed but matched in ~12 files; `SourceRange`
   (`lex/_module.cryo:1069-1086`); `parse_match_arm_var_decl`
   (`expr_parser.cryo:1794`); `parse_lambda_block_body` degraded duplicate
@@ -509,7 +509,7 @@ hazard classes above.
   calendar/date formatting; no `env::vars()` enumeration; no Weak refs
   (Rc/Arc leak cycles — documented); no mutex poisoning (documented);
   `Path::extension`/`join` deferred (documented).
-- [ ] **`fs/path.cryo` is POSIX-semantics-only** — `C:\...` doesn't split
+- [x] **`fs/path.cryo` is POSIX-semantics-only** — `C:\...` doesn't split
   correctly; the weakest cross-platform link in an otherwise Windows-serious
   stdlib.
 - [ ] **ABI-by-offset brittleness**: `struct stat` at hardcoded glibc-x86_64
