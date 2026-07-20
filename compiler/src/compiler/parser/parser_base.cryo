@@ -45,6 +45,31 @@ public:
     brace_depth:   int;
     paren_depth:   int;
     bracket_depth: int;
+    // Names bound as parameters or locals in the function being parsed, used
+    // to settle `ident <` in expression position.  `f(a < b, c > (d))` is a
+    // generic call and a pair of comparisons under the same grammar, and the
+    // token scan cannot tell them apart; knowing `a` names a local settles it,
+    // because a local is not a generic function or type.
+    //
+    // Reset per parameter list, so a name is only ever consulted inside the
+    // function that bound it.  Deliberately flat rather than a scope stack: a
+    // name declared in an inner block stays listed for the rest of the
+    // function, which only ever biases toward the comparison reading, and
+    // calling a generic whose name a local in the same function shadows is
+    // pathological either way.
+    local_names:   SymbolStr[];
+    // Module-level names collected up front by `scan_module_names`, which
+    // settles the same `ident <` question for names that are not locals.
+    // Gathered by a token pre-scan rather than as declarations are parsed
+    // because the parse is single-pass: a global or generic declared further
+    // down the file must still be known to a function above it.
+    //
+    // `global_value_names` bind values, so their `<` is a comparison;
+    // `generic_decl_names` are declared with type parameters, so theirs opens
+    // type arguments. A name in neither - anything imported, most obviously -
+    // falls through to the token scan.
+    global_value_names: SymbolStr[];
+    generic_decl_names: SymbolStr[];
     // Paren-less `if`/`while`/`for`/`match` conditions forbid a bare struct
     // literal (`if Foo { .. }` is the loop body, not a struct value).  When a
     // condition is parsed without surrounding `()`, this records the bracketing
@@ -140,6 +165,9 @@ public:
         this.brace_depth  = 0;
         this.paren_depth  = 0;
         this.bracket_depth = 0;
+        this.local_names  = [];
+        this.global_value_names = [];
+        this.generic_decl_names = [];
         this.no_struct_lit_depth = -1;
         this.unary_depth  = 0;
         this.expr_depth   = 0;
@@ -810,6 +838,123 @@ public:
     /// Decrement scope depth.
     exit_scope() -> void {
         this.scope_depth -= 1;
+    }
+
+    /// Forget the previous function's bindings. Called when a parameter list
+    /// starts, which is the one point every function and method passes through
+    /// before its body.
+    reset_local_names() -> void {
+        this.local_names = [];
+    }
+
+    /// Record `name` as bound in the function being parsed.
+    note_local_name(name: SymbolStr) -> void {
+        if (!name.is_valid()) { return; }
+        this.local_names.push(name);
+    }
+
+    /// Whether `name` is bound as a parameter or local here. A true answer
+    /// means an `ident <` that follows cannot open type arguments.
+    is_local_name(name: SymbolStr) -> boolean {
+        if (!name.is_valid()) { return false; }
+        for (mut i: int = 0; i < this.local_names.length; i++) {
+            if (this.local_names[i].id == name.id) { return true; }
+        }
+        return false;
+    }
+
+    /// Whether `name` is a module-level `const`/`mut` binding.
+    is_global_value_name(name: SymbolStr) -> boolean {
+        if (!name.is_valid()) { return false; }
+        for (mut i: int = 0; i < this.global_value_names.length; i++) {
+            if (this.global_value_names[i].id == name.id) { return true; }
+        }
+        return false;
+    }
+
+    /// Whether `name` is declared in this module WITH type parameters.
+    is_generic_decl_name(name: SymbolStr) -> boolean {
+        if (!name.is_valid()) { return false; }
+        for (mut i: int = 0; i < this.generic_decl_names.length; i++) {
+            if (this.generic_decl_names[i].id == name.id) { return true; }
+        }
+        return false;
+    }
+
+    /// Whether `name` is known to bind a VALUE rather than a function or type,
+    /// which makes a following `<` a comparison rather than type arguments.
+    binds_a_value(name: SymbolStr) -> boolean {
+        if (this.is_local_name(name)) { return true; }
+        // A local shadows a module-level declaration, so the generic check
+        // only applies to names no local has claimed.
+        if (this.is_generic_decl_name(name)) { return false; }
+        return this.is_global_value_name(name);
+    }
+
+    /// Collect module-level names before parsing, walking the token array
+    /// directly. Only nesting depth zero counts: a `const` inside a function
+    /// body is a local, and a `function` inside a type body is a method whose
+    /// name is reached through a receiver rather than bare.
+    ///
+    /// Both forms are recognised by shape alone, which is unambiguous in
+    /// declaration position - `function NAME <` and `type KIND NAME <` open
+    /// type parameters, with none of the guesswork the expression position
+    /// needs.
+    scan_module_names() -> void {
+        mut depth: int = 0;
+        mut i: int = 0;
+        while (i < this.tokens.length) {
+            const k: TokenType = this.tokens[i].kind;
+
+            if (k == TokenType::LBrace) { depth += 1; i += 1; continue; }
+            if (k == TokenType::RBrace) { depth -= 1; i += 1; continue; }
+
+            if (depth != 0) { i += 1; continue; }
+
+            // `const NAME` / `mut NAME` at depth zero: a module global.
+            if (k == TokenType::KwConst || k == TokenType::KwMut) {
+                if (i + 1 < this.tokens.length &&
+                    this.tokens[i + 1].kind == TokenType::Identifier) {
+                    this.global_value_names.push(
+                        this.ctx.intern(this.tokens[i + 1].lexeme));
+                }
+                i += 1;
+                continue;
+            }
+
+            // `function NAME <` : a generic function.
+            if (k == TokenType::KwFunction) {
+                if (i + 2 < this.tokens.length &&
+                    this.tokens[i + 1].kind == TokenType::Identifier &&
+                    this.tokens[i + 2].kind == TokenType::LAngle) {
+                    this.generic_decl_names.push(
+                        this.ctx.intern(this.tokens[i + 1].lexeme));
+                }
+                i += 1;
+                continue;
+            }
+
+            // `type KIND NAME <` : a generic struct/union/class/enum/trait.
+            // The alias form `type NAME<T> = ...` puts the name one slot
+            // earlier, so both offsets are checked.
+            if (k == TokenType::KwType) {
+                if (i + 3 < this.tokens.length &&
+                    this.tokens[i + 2].kind == TokenType::Identifier &&
+                    this.tokens[i + 3].kind == TokenType::LAngle) {
+                    this.generic_decl_names.push(
+                        this.ctx.intern(this.tokens[i + 2].lexeme));
+                } else if (i + 2 < this.tokens.length &&
+                           this.tokens[i + 1].kind == TokenType::Identifier &&
+                           this.tokens[i + 2].kind == TokenType::LAngle) {
+                    this.generic_decl_names.push(
+                        this.ctx.intern(this.tokens[i + 1].lexeme));
+                }
+                i += 1;
+                continue;
+            }
+
+            i += 1;
+        }
     }
 
     /// Handle `>>` splitting for nested generics.

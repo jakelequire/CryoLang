@@ -156,6 +156,11 @@ public:
 
     /// Parse the entire program, producing a ProgramNode.
     parse() -> ProgramNode* {
+        // Module-level names first: the parse is single-pass, but deciding
+        // whether an `ident <` opens type arguments needs to know about
+        // declarations further down the file.
+        this.scan_module_names();
+
         // Skip leading comments/doc comments
         this.collect_doc_comments();
         LOG_DEBUG(LogComponent::Parser, "[Parser] parse() starting parsing...");
@@ -505,6 +510,12 @@ public:
             name_tok = this.consume(TokenType::Identifier, "variable name");
         }
         const name: SymbolStr = this.intern_lexeme(name_tok);
+        // Only inside a function body: at depth 0 this is a module-level
+        // global, which shares a namespace with functions and types and so
+        // says nothing about whether a later `ident <` opens type arguments.
+        if (this.scope_depth > 0) {
+            this.note_local_name(name);
+        }
         mut node: VarDeclNode* = new VarDeclNode(name, this.span_from_token(start));
         node.set_mutable(is_mutable);
         node.set_name_span(this.span_from_token(name_tok));
@@ -735,6 +746,9 @@ public:
         mut params: VarDeclNode*[] = [];
         this.pending_bare_variadic  = false;
         this.pending_named_variadic = false;
+        // Every function and method reaches its body through here, so this is
+        // where the previous one's bindings stop being in scope.
+        this.reset_local_names();
 
         while (true) {
             // Bare variadic: `...` with no preceding name. Common in extern
@@ -747,6 +761,7 @@ public:
 
             const param: VarDeclNode* = this.parse_parameter();
             if (param != null) {
+                this.note_local_name(param.name);
                 params.push(param);
             }
 

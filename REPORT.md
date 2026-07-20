@@ -110,7 +110,7 @@ string-keyed monomorphization era).
   line plus a nonsense column (feeds doc-cluster gap logic at
   `parser/parser_base.cryo:748-756`).
 
-- [ ] **Generic-call lookahead misparse corner**
+- [x] **Generic-call lookahead misparse corner**
   `parser/expr_parser.cryo:2242-2319` — `f(a < b, c > (d))` misparses as a
   generic call. Follower-token list has grown by bugfix ("GAP 1a" comments).
 
@@ -152,7 +152,7 @@ string-keyed monomorphization era).
 
 ### Incremental compilation (stale-`.o` holes)
 
-- [ ] **Injected imports invisible to the leaf closure** — prelude/f-string
+- [x] **Injected imports invisible to the leaf closure** — prelude/f-string
   modules force-discovered with no dependency edge back to consumers
   (`instance.cryo:1153-1224`, `passes/pass_registry.cryo:1047-1058`). A
   prelude-reachable layout change leaves a consumer's key unchanged while its
@@ -164,7 +164,7 @@ string-keyed monomorphization era).
   work (`module_graph.cryo:351-353` + `module_loader.cryo:660-668`) — cycles
   survive iff the back-edge fails to resolve. Make cycle support intentional.
 
-- [ ] **64-bit FNV cache keys** vs rustc's 128-bit SipHash — collision =
+- [x] **64-bit FNV cache keys** vs rustc's 128-bit SipHash — collision =
   silent miscompile. Consider widening.
 
 ### Stdlib
@@ -212,7 +212,7 @@ string-keyed monomorphization era).
   justification (:19-23) only holds for headers; once Content-Length is known
   a bulk `read_exact` is safe. A 100 KB didChange ≈ 100k syscalls.
 
-- [ ] **CryoAnalyzer has no version handshake with the server binary**
+- [x] **CryoAnalyzer has no version handshake with the server binary**
   `tools/CryoAnalyzer/src/config.ts:59-150` — 7-location auto-probe can
   silently launch a stale `cryolsp`. Also `serverInfo.version = "0.1.0"`
   (`handlers/lifecycle.cryo:177`) contradicts package.json `1.0.0`.
@@ -518,13 +518,13 @@ hazard classes above.
   (`sync/mutex.cryo:96-99`, `sync/mpsc.cryo:118-122`). All documented, all
   one-arch; any new target is silent corruption. (The libc-weaning plan
   presumably subsumes this.)
-- [ ] `ffi/libc.cryo:992-1000` — Windows `readlink` special-cases the literal
+- [x] `ffi/libc.cryo:992-1000` — Windows `readlink` special-cases the literal
   `"/proc/self/exe"`, breaking the module's "mirrors headers verbatim"
   contract; `env::current_exe` depends on the magic string.
 - [x] `math/` type-suffixed free functions (`min_f32`, `clamp_i64` —
   `math/_module.cryo:196-251`) against the codebase's own no-suffix
   direction (blocked on a generic-codegen limitation; note the blocker).
-- [ ] `core/error.cryo` — 22-line catch-all with raw `string` message;
+- [x] `core/error.cryo` — 22-line catch-all with raw `string` message;
   vestigial next to per-module error types. Keep or delete deliberately.
 
 ### LSP / tooling roadmap

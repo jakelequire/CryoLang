@@ -1856,20 +1856,34 @@ type struct DeclarationEmitter {
     /// Non-void functions must have explicit returns from the source code.
     /// If a non-void function's block has no terminator, body generation
     /// failed; the caller will strip it back to a declare.
+    ///
+    /// `never` is the exception: it declares that control does not leave the
+    /// function normally, so falling off the end is unreachable rather than a
+    /// missing `return`.  The compiler cannot verify the claim - the divergent
+    /// primitives a `never` body ends in (`sys::exit`, `abort`) are typed
+    /// `void` - so the annotation is taken at its word, exactly as the call
+    /// side already does when it emits `unreachable` after a `never`-returning
+    /// call.  Without this the block stays unterminated and the body validator
+    /// discards the whole function.
     codegen_function_epilogue(mut &this, node: FunctionDeclNode*) -> void {
         const current_bb: LBasicBlock = this.builder.get_insert_block();
         if (current_bb.is_valid() && !current_bb.has_terminator()) {
             const ret_ty: TypeRef = node.resolved_return_type;
             mut is_void: boolean = ret_ty.is_invalid();
+            mut is_never: boolean = false;
             if (!is_void) {
                 const t: Type* = this.lookup_type_by_id(ret_ty.id);
                 is_void = t != null && (t.kind == TypeKind::Void || t.kind == TypeKind::Unit);
+                is_never = t != null && t.kind == TypeKind::Never;
             }
             if (is_void) {
                 this.expr_ops.emit_va_end_if_variadic(CodegenUtil::variadic_param_name(node));
                 this.builder.build_ret_void();
+            } else if (is_never) {
+                this.expr_ops.emit_va_end_if_variadic(CodegenUtil::variadic_param_name(node));
+                this.builder.build_unreachable();
             }
-            // Non-void: intentionally leave unterminated. The caller
+            // Other non-void: intentionally leave unterminated. The caller
             // detects this and strips the function body.
         }
 

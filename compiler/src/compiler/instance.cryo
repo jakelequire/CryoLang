@@ -800,6 +800,29 @@ type struct CompilerInstance {
         return CompilationResult::ok(last_output);
     }
 
+    /// Union the import closure of the compiler-injected module `ns` into
+    /// `out`, for folding into every per-module cache key.
+    ///
+    /// Absent is not an error: the prelude is skipped under `no_std` and the
+    /// f-string runtime is only discovered when an f-string is actually used,
+    /// so a missing module simply contributes nothing.  A closure that comes
+    /// back SHORT is different, and raises `out_short` - the widened key would
+    /// then be missing inputs exactly like an unresolvable dependency name,
+    /// and the caller declines to serve those modules from cache.
+    mark_implicit_closure(&this, ctx: CompilationContext*, ns: string, n: u32,
+                          out: boolean[]*, out_short: boolean*) -> void {
+        if (ctx == null || out == null) { return; }
+        const idx: i64 = ctx.module_graph.find_module_index(ctx.intern_table.intern(ns));
+        if (idx < 0 || idx >= n as i64) { return; }
+        mut short_walk: boolean = false;
+        const clos: boolean[] =
+            ctx.module_graph.compute_import_closure(idx as u32, n, &short_walk);
+        for (mut i: u32 = 0; i < n; i++) {
+            if (clos[i as i64]) { (*out)[i as i64] = true; }
+        }
+        if (short_walk && out_short != null) { *out_short = true; }
+    }
+
     /// Compile a single target view of a project.  Shared between the
     /// legacy single-target path and each iteration of
     /// `compile_project_multi`.
@@ -1433,8 +1456,8 @@ type struct CompilerInstance {
             const manifest: BuildManifest::Manifest = Compiler::BuildManifest::Manifest::new(
                 ctx.project_config, ctx.opt_level, ctx.emit_debug_info,
                 manifest_stdlib_archive);
-            const build_fp: u64 = manifest.compute_fingerprint(&mod_entries);
-            build_fp_hex = build_fp.to_hex_padded_str(16);
+            const build_fp: u128 = manifest.compute_fingerprint(&mod_entries);
+            build_fp_hex = Compiler::BuildManifest::Manifest::hex128(build_fp);
 
             if (manifest.is_up_to_date(build_fp_hex, &manifest_artifacts)) {
                 // Nothing changed and the artifact still exists: skip
@@ -1602,7 +1625,7 @@ type struct CompilerInstance {
             pm_active = true;
 
             // Per-module source hashes (indexed by module index).
-            mut pm_src_h: u64[] = [];
+            mut pm_src_h: u128[] = [];
             for (mut m: u32 = 0; m < n; m++) {
                 const mi: ModuleInfo* = &ctx.module_graph.modules[m];
                 pm_src_h.push(Compiler::BuildManifest::Manifest::module_source_hash(
@@ -1611,7 +1634,7 @@ type struct CompilerInstance {
                     mi.file_path));
             }
 
-            const pm_tool_fp: u64 = Compiler::BuildManifest::Manifest::toolchain_fingerprint(
+            const pm_tool_fp: u128 = Compiler::BuildManifest::Manifest::toolchain_fingerprint(
                 ctx.project_config, ctx.opt_level, ctx.emit_debug_info);
 
             // Spec ownership.  A spec whose owner can't be attributed to a
@@ -1656,12 +1679,12 @@ type struct CompilerInstance {
             }
 
             // Global digest over every module's source hash, in topo order.
-            mut pm_global_h: DefaultHasher = DefaultHasher::new();
+            mut pm_global_h: Fnv128Hasher = Fnv128Hasher::new();
             pm_global_h.fold(pm_tool_fp);
             for (mut i: u32 = 0; i < n; i++) {
                 pm_global_h.fold(pm_src_h[order[i] as i64]);
             }
-            const pm_global: u64 = pm_global_h.finish();
+            const pm_global: u128 = pm_global_h.finish128();
 
             const pm_prior: BuildManifest::ModuleKeyTable =
                 Compiler::BuildManifest::ModuleKeyTable::read_module_keys(ctx.project_config.module_keys_path());
@@ -1671,10 +1694,38 @@ type struct CompilerInstance {
             // back short; such a module is never served from cache.
             mut pm_closure_ok: boolean[] = [];
             for (mut m: u32 = 0; m < n; m++) { pm_cached.push(false); pm_closure_ok.push(true); }
+
+            // Modules the compiler imports on a module's behalf - the prelude,
+            // and the f-string runtime when an f-string appears anywhere - are
+            // force-discovered AFTER the import graph is built and never get a
+            // dependency edge from the modules that go on to import them.  The
+            // closure walk therefore cannot reach them, and unlike an
+            // unresolvable dependency name nothing reports the gap: the walk
+            // completes, just short.  A layout change to a prelude-reachable
+            // type would leave every consumer's key unchanged while its `.o`
+            // still had the old field offsets baked in.
+            //
+            // Folded into every leaf key rather than repaired by adding the
+            // edges: `dependencies` also drives name resolution and link
+            // order, and which modules actually receive the injection is not
+            // settled until AutoImport runs, so widening the key is the change
+            // that cannot be wrong in the dangerous direction.  Owner modules
+            // already fold the global digest and so are covered.
+            mut pm_implicit: boolean[] = [];
+            for (mut i: u32 = 0; i < n; i++) { pm_implicit.push(false); }
+            mut pm_implicit_short: boolean = false;
+            if (ctx.mode.auto_imports_enabled() && !config.no_std) {
+                this.mark_implicit_closure(ctx, "std::prelude", n,
+                                           &pm_implicit, &pm_implicit_short);
+                if (ctx.module_graph.uses_fstring) {
+                    this.mark_implicit_closure(ctx, "std::fmt::interp", n,
+                                               &pm_implicit, &pm_implicit_short);
+                }
+            }
             for (mut m: u32 = 0; m < n; m++) {
                 const mi: ModuleInfo* = &ctx.module_graph.modules[m];
                 const ns: string = ctx.intern_table.resolve(mi.name);
-                mut k: DefaultHasher = DefaultHasher::new();
+                mut k: Fnv128Hasher = Fnv128Hasher::new();
                 k.fold(pm_tool_fp);
                 if (pm_owns_spec[m as i64]) {
                     k.fold("owner");
@@ -1685,7 +1736,10 @@ type struct CompilerInstance {
                     const clos: boolean[] =
                         ctx.module_graph.compute_import_closure(m, n, &clos_incomplete);
                     for (mut i: u32 = 0; i < n; i++) {
-                        if (clos[order[i] as i64]) {
+                        // The implicit set is unioned in rather than folded
+                        // separately so a module reached BOTH ways still folds
+                        // exactly once and the key stays order-stable.
+                        if (clos[order[i] as i64] || pm_implicit[order[i] as i64]) {
                             k.fold(pm_src_h[order[i] as i64]);
                         }
                     }
@@ -1693,9 +1747,12 @@ type struct CompilerInstance {
                     // this key doesn't cover everything the module was compiled
                     // against.  Rebuild rather than risk a stale `.o`.
                     if (clos_incomplete) { pm_closure_ok[m as i64] = false; }
+                    // Same reasoning for the implicit set: if the prelude's own
+                    // closure came back short, the widened key is short too.
+                    if (pm_implicit_short) { pm_closure_ok[m as i64] = false; }
                 }
                 pm_key_names.push(ns);
-                pm_key_hex.push(k.finish().to_hex_padded_str(16));
+                pm_key_hex.push(Compiler::BuildManifest::Manifest::hex128(k.finish128()));
             }
 
             // Cached if the prior key matches AND the .o is still on disk.
