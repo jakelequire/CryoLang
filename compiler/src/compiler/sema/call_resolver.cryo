@@ -2508,8 +2508,17 @@ type struct CallResolver {
             return TypeRef::invalid();
         }
 
+        // A projection-bounded trait-default method (`min`/`max` with
+        // `where This::Item: Ord`) must NOT resolve on a concrete receiver whose
+        // Item does not satisfy the bound: skip the trait-default resolution so
+        // it falls through to a clean "no method" diagnostic (E0358) instead of
+        // resolving here and failing later at codegen (E0636). False for
+        // symbolic receivers / symbolic Item types (undecidable -> allow).
+        const proj_blocked: boolean =
+            this.binding.projection_default_unavailable(obj_type, member.member);
+
         const ret: TypeRef = this.binding.lookup_method_with_inheritance(lookup_ref, type_sym, member.member);
-        if (ret.is_valid()) {
+        if (ret.is_valid() && !proj_blocked) {
             const acc_span: SourceSpan = if (member.member_span.has_location()) { member.member_span } else { member.span };
             this.member.enforce_method_visibility(lookup_ref, member.member, acc_span);
             const refined: TypeRef = if (member.generic_args.length > 0) {
@@ -2548,7 +2557,7 @@ type struct CallResolver {
         }
 
         const inherited: TypeRef = this.binding.lookup_method_through_trait_impls(type_sym, member.member);
-        if (inherited.is_valid()) {
+        if (inherited.is_valid() && !proj_blocked) {
             const subst_inherited: TypeRef = this.binding.subst_this_in_type(inherited, obj_type);
             mut fin_inherited: TypeRef = subst_inherited;
             if (fin_inherited.is_valid() && this.types.contains_generic_param(fin_inherited)) {
