@@ -271,6 +271,7 @@ LLVMValueRef LLVMGetNextGlobal(LLVMValueRef GlobalVar);
 LLVMValueRef LLVMGetInitializer(LLVMValueRef GlobalVar);
 void         LLVMSetInitializer(LLVMValueRef GlobalVar, LLVMValueRef ConstantVal);
 void         LLVMSetGlobalConstant(LLVMValueRef GlobalVar, LLVMBool IsConstant);
+void         LLVMSetThreadLocal(LLVMValueRef GlobalVar, LLVMBool IsThreadLocal);
 void         LLVMSetUnnamedAddress(LLVMValueRef Global, int UnnamedAddr);
 
 

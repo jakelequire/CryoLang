@@ -246,6 +246,9 @@ type struct DirectiveProcessingPasses {
             // `_start`.  `![section("name")]`: place the symbol in a named
             // object-file section.  Effects applied in `apply_effects`.
             | "weak" | "naked" | "section"
+            // `![thread_local]`: emit a global with thread-local storage (each
+            // thread gets its own instance).  Zero args; variable-target.
+            | "thread_local"
             // Bare-atom forms of the cfg/config gate.  These are sugar for
             // `![config(<atom>)]` and are evaluated by the ConfigGating pass.
             | "windows" | "linux" | "macos" | "unix"
@@ -613,6 +616,17 @@ type struct DirectiveProcessingPasses {
                 }
                 if (target != DirectiveTarget::Function && target != DirectiveTarget::Method) {
                     DirectiveProcessingPasses::emit_placement_error(ctx, dir, name, "function or method", target);
+                }
+            }
+
+            // `![thread_local]`: zero args; variable-target only.  Applied in
+            // `apply_effects` onto the VarDeclNode.
+            "thread_local" => {
+                if (argc != 0) {
+                    DirectiveProcessingPasses::emit_arity_error(ctx, dir, name, 0, argc);
+                }
+                if (target != DirectiveTarget::Variable) {
+                    DirectiveProcessingPasses::emit_placement_error(ctx, dir, name, "global variable", target);
                 }
             }
 
@@ -1097,6 +1111,20 @@ type struct DirectiveProcessingPasses {
                 }
                 return;
             }
+        }
+
+        // `![thread_local]` on a global variable: mark it for thread-local
+        // emission (read by codegen_global_var and cross-module extern refs).
+        if (decl.kind == NodeKind::VariableDeclaration) {
+            const vd: VarDeclNode* = decl as VarDeclNode*;
+            if (name.eq("thread_local")) {
+                vd.is_thread_local = true;
+                // TypeResolution already registered this global (before
+                // directives run) with the flag false; update the DI record so
+                // cross-module extern refs are marked thread-local too.
+                ctx.decl_index.mark_global_thread_local(vd.name);
+            }
+            return;
         }
 
         // Layout effects on user-defined types.  The validator above has
