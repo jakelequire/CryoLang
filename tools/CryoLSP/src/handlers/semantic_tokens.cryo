@@ -231,6 +231,10 @@ type struct SemanticTokenizer {
             this.st_walk_node(us.block as ASTNode*);
             return;
         }
+        if (node.kind == NodeKind::AsmBlockStatement) {
+            this.walk_asm_block(node as AsmBlockStmtNode*);
+            return;
+        }
         if (node.kind == NodeKind::ReturnStatement) {
             const rs: ReturnStmtNode* = node as ReturnStmtNode*;
             this.walk_expr(rs.expression);
@@ -1082,6 +1086,350 @@ type struct SemanticTokenizer {
         if (length == 0 as u32) { return; }
 
         this.tokens.push(SemanticToken::new(line, start_byte, length, type_id, modifiers));
+    }
+
+
+    // Inline-asm block colouring
+    //
+    // The parser does NOT keep per-token spans for the assembly body - it
+    // stores a list of reconstructed text `pieces` (see AsmBlockStmtNode).
+    // So the AST walk can't drive colouring the way it does for real Cryo
+    // spans.  Instead we re-scan the block's source region straight out of
+    // the live editor buffer (which the tokenizer already holds for span
+    // validation) with a small asm-aware lexer, emitting tokens in 0-based
+    // BYTE coordinates via `emit_raw` (asm is ASCII, so byte == LSP char and
+    // there's no tab-cell translation to do).  The `${expr}` operands ARE
+    // real Cryo expressions with spans, so those go through `walk_expr`.
+
+    /// Push a token in 0-based LSP coordinates.  Used by the asm re-scanner,
+    /// which reads live-buffer bytes and therefore already has valid
+    /// character offsets - no cell-column translation or span validation
+    /// needed (positions come from within a known-good line).
+    emit_raw(mut &this, line0: u32, start_char: u32, length: u32,
+             type_id: u32, modifiers: u32) -> void {
+        if (length == 0 as u32) { return; }
+        this.tokens.push(SemanticToken::new(line0, start_char, length, type_id, modifiers));
+    }
+
+    walk_asm_block(mut &this, node: AsmBlockStmtNode*) -> void {
+        if (node == null) { return; }
+        // `${expr}` operands are real Cryo code - colour (and hover) them
+        // through the normal expression walker.
+        for (mut oi: i64 = 0; oi < node.operands.length; oi++) {
+            const op: AsmOperand* = node.operands[oi];
+            if (op != null) { this.walk_expr(op.expr); }
+        }
+        // Body colouring re-scans the source; it needs the live buffer.
+        if (this.line_index == null || this.doc_text == "") { return; }
+        const span: SourceSpan = node.span;
+        if (!span.has_location()) { return; }
+        if (span.start_line == 0 as u32) { return; }
+        // Same cross-file guard as emit_span: monomorphization can graft
+        // asm nodes from other files onto this ProgramNode.
+        if (this.doc_file != "" && span.file != ""
+                && !SemanticTokenizer::file_paths_equal(span.file, this.doc_file)) {
+            return;
+        }
+        const intel: boolean = match (node.dialect) {
+            AsmDialect::Intel => { true }
+            AsmDialect::ATT   => { false }
+        };
+        mut ln: u32 = span.start_line - 1 as u32;                 // 0-based
+        const last: u32 = if (span.end_line >= span.start_line) {
+            span.end_line - 1 as u32
+        } else { ln };
+        const total: u64 = this.line_index.line_count();
+        while (ln as u64 <= last as u64 && ln as u64 < total) {
+            this.scan_asm_line(ln, intel);
+            ln = ln + 1 as u32;
+        }
+    }
+
+    /// Tokenize one line of an asm block body and emit semantic tokens.
+    /// Handles AT&T and (best-effort) Intel: `%reg` registers, `$imm`
+    /// immediates and `$sym` address-of, bare numbers, `.directives`,
+    /// `label:` definitions, instruction mnemonics, symbol references,
+    /// comments (`#`, `//`, and `;` in Intel), string literals, and
+    /// punctuation.  `${...}` operand refs are skipped (walk_expr owns them).
+    scan_asm_line(mut &this, line0: u32, intel: boolean) -> void {
+        if (line0 as u64 >= this.line_index.line_count()) { return; }
+        const line_start: u64 = this.line_index.line_start(line0);
+        const line_end_raw: u64 = this.line_index.line_end(line0);
+        mut line_bytes: u64 = if (line_end_raw > line_start) {
+            line_end_raw - line_start
+        } else { 0 as u64 };
+        // Strip the trailing '\n' (line_end points past it for non-last lines).
+        if (line_bytes > 0 as u64 && line0 as u64 + 1 < this.line_index.line_count()) {
+            line_bytes = line_bytes - 1 as u64;
+        }
+        // Strip a trailing '\r' (CRLF).
+        if (line_bytes > 0 as u64 && (line_start + line_bytes - 1) < this.doc_text_length) {
+            const lb: u8 = this.doc_text[(line_start + line_bytes - 1) as i64] as u8;
+            if (lb == 13 as u8) { line_bytes = line_bytes - 1 as u64; }
+        }
+        if (line_bytes == 0 as u64) { return; }
+
+        const base: string = this.doc_text + line_start as i64;
+        const n: u32 = line_bytes as u32;
+        mut i: u32 = 0 as u32;
+        // False until the instruction's mnemonic has been emitted on this
+        // logical instruction; the first bare identifier becomes the mnemonic,
+        // later ones are operand symbols.  Reset by `{`/`}` and a `label:`.
+        mut instr_started: boolean = false;
+
+        while (i < n) {
+            const c: u8 = base[i as i64] as u8;
+
+            // Whitespace.
+            if (c == 32 as u8 || c == 9 as u8 || c == 13 as u8) {
+                i = i + 1 as u32; continue;
+            }
+            // Comments run to end-of-line.
+            if (c == 35 as u8) {                                  // '#'
+                this.emit_raw(line0, i, n - i,
+                    Lsp::Protocol::SemanticTokens::TYPE_COMMENT,
+                    Lsp::Protocol::SemanticTokens::MOD_NONE);
+                return;
+            }
+            if (c == 47 as u8 && i + 1 as u32 < n
+                    && (base[(i + 1 as u32) as i64] as u8) == 47 as u8) {   // '//'
+                this.emit_raw(line0, i, n - i,
+                    Lsp::Protocol::SemanticTokens::TYPE_COMMENT,
+                    Lsp::Protocol::SemanticTokens::MOD_NONE);
+                return;
+            }
+            if (intel && c == 59 as u8) {                         // ';' (Intel only)
+                this.emit_raw(line0, i, n - i,
+                    Lsp::Protocol::SemanticTokens::TYPE_COMMENT,
+                    Lsp::Protocol::SemanticTokens::MOD_NONE);
+                return;
+            }
+            // `${...}` operand reference - walk_expr already coloured the
+            // inner expression; skip the whole `${...}` span here.
+            if (c == 36 as u8 && i + 1 as u32 < n
+                    && (base[(i + 1 as u32) as i64] as u8) == 123 as u8) {   // '${'
+                mut depth: i64 = 0;
+                mut opened: boolean = false;
+                while (i < n) {
+                    const cc: u8 = base[i as i64] as u8;
+                    if (cc == 123 as u8) { depth = depth + 1; opened = true; }
+                    else if (cc == 125 as u8) { depth = depth - 1; }
+                    i = i + 1 as u32;
+                    if (opened && depth == 0) { break; }
+                }
+                instr_started = true;
+                continue;
+            }
+            // Block delimiters: `asm {` open and the closing `}`.  Reset the
+            // instruction state so an instruction sharing the `{`/`}` line
+            // (`asm { nop }`) still classifies its mnemonic correctly.
+            if (c == 123 as u8 || c == 125 as u8) {               // '{' '}'
+                instr_started = false; i = i + 1 as u32; continue;
+            }
+            // String literal.
+            if (c == 34 as u8) {                                  // '"'
+                mut j: u32 = i + 1 as u32;
+                while (j < n && (base[j as i64] as u8) != 34 as u8) {
+                    if ((base[j as i64] as u8) == 92 as u8 && j + 1 as u32 < n) {
+                        j = j + 1 as u32;                          // skip escape
+                    }
+                    j = j + 1 as u32;
+                }
+                if (j < n) { j = j + 1 as u32; }                  // closing quote
+                this.emit_raw(line0, i, j - i,
+                    Lsp::Protocol::SemanticTokens::TYPE_STRING,
+                    Lsp::Protocol::SemanticTokens::MOD_NONE);
+                i = j; continue;
+            }
+            // AT&T register: `%name`.
+            if (c == 37 as u8) {                                  // '%'
+                mut j: u32 = i + 1 as u32;
+                while (j < n && SemanticTokenizer::is_asm_ident_byte(base[j as i64] as u8)) {
+                    j = j + 1 as u32;
+                }
+                this.emit_raw(line0, i, j - i,
+                    Lsp::Protocol::SemanticTokens::TYPE_VARIABLE,
+                    Lsp::Protocol::SemanticTokens::MOD_DEFAULT_LIBRARY);
+                i = j; instr_started = true; continue;
+            }
+            // Immediate: `$number`, `$-number`, or `$symbol` (address-of).
+            if (c == 36 as u8) {                                  // '$' (not '${')
+                mut j: u32 = i + 1 as u32;
+                if (j < n) {
+                    const s: u8 = base[j as i64] as u8;
+                    if (s == 43 as u8 || s == 45 as u8) { j = j + 1 as u32; }  // sign
+                }
+                const sym_start: u32 = j;
+                if (j < n && SemanticTokenizer::is_asm_ident_start(base[j as i64] as u8)) {
+                    while (j < n && SemanticTokenizer::is_asm_ident_byte(base[j as i64] as u8)) {
+                        j = j + 1 as u32;
+                    }
+                    this.emit_raw(line0, i, 1 as u32,
+                        Lsp::Protocol::SemanticTokens::TYPE_OPERATOR,
+                        Lsp::Protocol::SemanticTokens::MOD_NONE);
+                    this.emit_raw(line0, sym_start, j - sym_start,
+                        Lsp::Protocol::SemanticTokens::TYPE_FUNCTION,
+                        Lsp::Protocol::SemanticTokens::MOD_NONE);
+                } else {
+                    while (j < n && SemanticTokenizer::is_asm_number_byte(base[j as i64] as u8)) {
+                        j = j + 1 as u32;
+                    }
+                    this.emit_raw(line0, i, j - i,
+                        Lsp::Protocol::SemanticTokens::TYPE_NUMBER,
+                        Lsp::Protocol::SemanticTokens::MOD_NONE);
+                }
+                i = j; instr_started = true; continue;
+            }
+            // Bare number (displacement `8(%rax)`, `-16`, `0x10`).
+            const is_neg_num: boolean = c == 45 as u8 && i + 1 as u32 < n
+                && SemanticTokenizer::is_asm_digit(base[(i + 1 as u32) as i64] as u8);
+            if (SemanticTokenizer::is_asm_digit(c) || is_neg_num) {
+                mut j: u32 = if (is_neg_num) { i + 1 as u32 } else { i };
+                while (j < n && SemanticTokenizer::is_asm_number_byte(base[j as i64] as u8)) {
+                    j = j + 1 as u32;
+                }
+                this.emit_raw(line0, i, j - i,
+                    Lsp::Protocol::SemanticTokens::TYPE_NUMBER,
+                    Lsp::Protocol::SemanticTokens::MOD_NONE);
+                i = j; instr_started = true; continue;
+            }
+            // Identifier: `.directive`, `label:`, mnemonic, or symbol ref.
+            if (SemanticTokenizer::is_asm_ident_start(c) || c == 46 as u8) {   // '.'
+                const start: u32 = i;
+                mut j: u32 = i;
+                if (c == 46 as u8) { j = j + 1 as u32; }          // leading '.'
+                while (j < n && SemanticTokenizer::is_asm_ident_byte(base[j as i64] as u8)) {
+                    j = j + 1 as u32;
+                }
+                const len: u32 = j - start;
+                if (len == 0 as u32) { i = i + 1 as u32; continue; }
+                const is_label: boolean = j < n && (base[j as i64] as u8) == 58 as u8;  // ':'
+                if (c == 46 as u8) {
+                    this.emit_raw(line0, start, len,
+                        Lsp::Protocol::SemanticTokens::TYPE_MACRO,
+                        Lsp::Protocol::SemanticTokens::MOD_NONE);
+                    instr_started = true;
+                } else if (is_label) {
+                    this.emit_raw(line0, start, len,
+                        Lsp::Protocol::SemanticTokens::TYPE_FUNCTION,
+                        Lsp::Protocol::SemanticTokens::MOD_DECLARATION);
+                    instr_started = false;                        // label isn't the instruction
+                } else if (!instr_started) {
+                    this.emit_raw(line0, start, len,
+                        Lsp::Protocol::SemanticTokens::TYPE_KEYWORD,
+                        Lsp::Protocol::SemanticTokens::MOD_NONE);  // mnemonic
+                    instr_started = true;
+                } else if (intel && SemanticTokenizer::is_intel_register(base, start, len)) {
+                    this.emit_raw(line0, start, len,
+                        Lsp::Protocol::SemanticTokens::TYPE_VARIABLE,
+                        Lsp::Protocol::SemanticTokens::MOD_DEFAULT_LIBRARY);
+                } else {
+                    this.emit_raw(line0, start, len,
+                        Lsp::Protocol::SemanticTokens::TYPE_FUNCTION,
+                        Lsp::Protocol::SemanticTokens::MOD_NONE);  // symbol ref (hover target)
+                }
+                i = j; continue;
+            }
+            // Operator punctuation.
+            if (c == 44 as u8 || c == 40 as u8 || c == 41 as u8 || c == 91 as u8
+                    || c == 93 as u8 || c == 43 as u8 || c == 45 as u8
+                    || c == 42 as u8 || c == 58 as u8) {          // , ( ) [ ] + - * :
+                this.emit_raw(line0, i, 1 as u32,
+                    Lsp::Protocol::SemanticTokens::TYPE_OPERATOR,
+                    Lsp::Protocol::SemanticTokens::MOD_NONE);
+                i = i + 1 as u32; continue;
+            }
+            // Anything else: skip one byte.
+            i = i + 1 as u32;
+        }
+    }
+
+    static is_asm_ident_start(b: u8) -> boolean {
+        return (b >= 65 as u8 && b <= 90 as u8)      // A-Z
+            || (b >= 97 as u8 && b <= 122 as u8)     // a-z
+            || b == 95 as u8;                         // _
+    }
+
+    static is_asm_ident_byte(b: u8) -> boolean {
+        return SemanticTokenizer::is_asm_ident_start(b)
+            || (b >= 48 as u8 && b <= 57 as u8)      // 0-9
+            || b == 46 as u8                          // .
+            || b == 36 as u8;                         // $ (mangled symbols)
+    }
+
+    static is_asm_digit(b: u8) -> boolean {
+        return b >= 48 as u8 && b <= 57 as u8;
+    }
+
+    static is_asm_number_byte(b: u8) -> boolean {
+        return SemanticTokenizer::is_asm_digit(b)
+            || (b >= 97 as u8 && b <= 102 as u8)     // a-f
+            || (b >= 65 as u8 && b <= 70 as u8)      // A-F
+            || b == 120 as u8 || b == 88 as u8        // x X (0x prefix)
+            || b == 95 as u8;                         // _ digit separator
+    }
+
+    /// True when `lit` (a NUL-terminated literal) exactly equals the byte
+    /// window `p[start .. start+len)`.
+    static region_eq(p: string, start: u32, len: u32, lit: string) -> boolean {
+        mut k: u32 = 0 as u32;
+        loop {
+            const lc: u8 = lit[k as i64] as u8;
+            if (lc == 0 as u8) { return k == len; }   // both ended together
+            if (k >= len) { return false; }
+            if ((p[(start + k) as i64] as u8) != lc) { return false; }
+            k = k + 1 as u32;
+        }
+        return false;
+    }
+
+    /// Best-effort recognition of an Intel-syntax register name (AT&T uses
+    /// `%`, handled directly).  Covers the common integer + vector registers;
+    /// exotic names fall through and colour as symbol references.
+    static is_intel_register(p: string, start: u32, len: u32) -> boolean {
+        if (len < 2 as u32 || len > 5 as u32) { return false; }
+        const c0: u8 = p[start as i64] as u8;
+        // Vector: xmm/ymm/zmm + index.
+        if (len >= 4 as u32
+                && (c0 == 120 as u8 || c0 == 121 as u8 || c0 == 122 as u8)   // x y z
+                && (p[(start + 1 as u32) as i64] as u8) == 109 as u8          // m
+                && (p[(start + 2 as u32) as i64] as u8) == 109 as u8) {       // m
+            return true;
+        }
+        // Extended GPRs r8..r15 (optional b/w/d suffix, e.g. r10d).
+        if (c0 == 114 as u8) {                                    // 'r'
+            const c1: u8 = p[(start + 1 as u32) as i64] as u8;
+            if (c1 >= 56 as u8 && c1 <= 57 as u8) { return true; }            // r8 r9
+            if (c1 == 49 as u8 && len >= 3 as u32) {                          // r1?
+                const c2: u8 = p[(start + 2 as u32) as i64] as u8;
+                if (c2 >= 48 as u8 && c2 <= 53 as u8) { return true; }        // r10..r15
+            }
+        }
+        return SemanticTokenizer::region_eq(p, start, len, "rax")
+            || SemanticTokenizer::region_eq(p, start, len, "rbx")
+            || SemanticTokenizer::region_eq(p, start, len, "rcx")
+            || SemanticTokenizer::region_eq(p, start, len, "rdx")
+            || SemanticTokenizer::region_eq(p, start, len, "rsi")
+            || SemanticTokenizer::region_eq(p, start, len, "rdi")
+            || SemanticTokenizer::region_eq(p, start, len, "rbp")
+            || SemanticTokenizer::region_eq(p, start, len, "rsp")
+            || SemanticTokenizer::region_eq(p, start, len, "rip")
+            || SemanticTokenizer::region_eq(p, start, len, "eax")
+            || SemanticTokenizer::region_eq(p, start, len, "ebx")
+            || SemanticTokenizer::region_eq(p, start, len, "ecx")
+            || SemanticTokenizer::region_eq(p, start, len, "edx")
+            || SemanticTokenizer::region_eq(p, start, len, "esi")
+            || SemanticTokenizer::region_eq(p, start, len, "edi")
+            || SemanticTokenizer::region_eq(p, start, len, "ebp")
+            || SemanticTokenizer::region_eq(p, start, len, "esp")
+            || SemanticTokenizer::region_eq(p, start, len, "ax")
+            || SemanticTokenizer::region_eq(p, start, len, "bx")
+            || SemanticTokenizer::region_eq(p, start, len, "cx")
+            || SemanticTokenizer::region_eq(p, start, len, "dx")
+            || SemanticTokenizer::region_eq(p, start, len, "al")
+            || SemanticTokenizer::region_eq(p, start, len, "bl")
+            || SemanticTokenizer::region_eq(p, start, len, "cl")
+            || SemanticTokenizer::region_eq(p, start, len, "dl");
     }
 
     /// In-place insertion sort by (line, start_char).  Token counts per
