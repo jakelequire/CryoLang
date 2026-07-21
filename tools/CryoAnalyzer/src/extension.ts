@@ -15,6 +15,7 @@ import { createStatusBar, updateStatus, disposeStatusBar } from './statusBar';
 import { registerCommands } from './commands';
 import { registerDiagnosticView } from './diagnosticView';
 import { extendMarkdownIt, initHighlighter } from './markdownPreview';
+import { initInactiveRegions, registerInactiveRegions } from './inactiveRegions';
 
 let client: LanguageClient | undefined;
 let outputChannel: vscode.OutputChannel;
@@ -102,6 +103,11 @@ export async function activate(
     // Both grab the LanguageClient lazily so they survive server
     // restarts without a re-registration step.
     registerDiagnosticView(context, () => client, outputChannel);
+
+    // Inactive-region dimming: create the fade decoration + keep newly-visible
+    // editors painted. The per-client notification subscription is set up in
+    // `startClient` (it needs the running client).
+    initInactiveRegions(context);
 
     // Hover-verbosity toggle: flip the expand flag and re-show the hover the
     // user is pointing at.  `editor.action.showHover` renders at the caret, not
@@ -307,6 +313,8 @@ async function startClient(context: vscode.ExtensionContext): Promise<void> {
     try {
         await client.start();
         outputChannel.appendLine('CryoLSP started successfully');
+        // Subscribe to inactive-region notifications for this client instance.
+        context.subscriptions.push(registerInactiveRegions(client));
         reportServerVersion(client, serverPath, context, outputChannel);
         updateStatus('ready');
     } catch (error) {

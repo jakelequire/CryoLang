@@ -10,11 +10,13 @@
 # Columns: SYMBOL | SIGNATURE | DEFINED-BY (tier) | STATUS
 #
 # ABI conventions (settled — see runtime/NOTES-capabilities.md §D):
-#   - Str      : fat pointer { ptr: i8*, len: u64 }, 16 bytes. Passed by value:
-#                SysV x86-64 -> two GP registers (DirectPair); Win64 -> pointer
-#                to the { ptr, len } struct (Indirect/ByVal). A handler reading
-#                a Str operand raw must branch on target ABI.
-#   - SourceLoc: POD { file: i8*, line: u32, col: u32 }, 16 bytes (see
+#   - string   : the primitive thin, NUL-terminated `i8*` (8 bytes). This is the
+#                panic message/file operand type. No compiler change: today's
+#                `@panic` already passes `i8*`, and message/file are always
+#                codegen-emitted static NUL-terminated literals, so the call
+#                sites build no fat pointer. (No embedded NUL / explicit length —
+#                fine for static panic strings.)
+#   - SourceLoc: POD { file: string, line: u32, col: u32 }, 16 bytes (see
 #                layout.def). Codegen constructs it zero-alloc from static data.
 #   - Message/file strings are static, codegen-emitted bytes — never heap.
 #   - The panic seam is abort-now / unwind-ready: the check helpers CALL
@@ -52,7 +54,7 @@ __main          | () -> void                                | core (freestanding
 # The single divergent sink. core/ only DECLARES it; panic/abort/ DEFINES it
 # (prints message+location, then aborts). The unwind profile redefines it with
 # no core/ change.
-__cryo_panic              | (msg: Str, file: Str, line: u32) -> never        | panic/abort | PENDING (P7)
+__cryo_panic              | (msg: string, file: string, line: u32) -> never  | panic/abort | PENDING (P7)
 
 # --- Check handlers (route raw operands through the funnel) -----------------
 # Each takes RAW operands (not a pre-formatted string) plus a SourceLoc, formats
@@ -63,7 +65,10 @@ __cryo_panic_div_zero     | (loc: SourceLoc) -> never                        | p
 __cryo_panic_no_match     | (loc: SourceLoc) -> never                        | panic/abort | PENDING (P6)
 
 # --- Allocator (weak / user-overridable) -----------------------------------
-# One resolver behind every heap site (replaces the six open-coded malloc
-# fallbacks). Weak so a user object can override.
-__cryo_alloc    | (size: u64, align: u64) -> void*          | alloc | PENDING (P8/P2)
-__cryo_dealloc  | (ptr: void*, size: u64, align: u64) -> void | alloc | PENDING (P8/P2)
+# The codegen funnel is in place (P8): every heap site routes through
+# ExprOps::emit_raw_alloc / emit_raw_dealloc (one resolver ladder:
+# arena / allocator::alloc / malloc) instead of an open-coded copy each. The
+# `__cryo_alloc`/`__cryo_dealloc` SYMBOLS land in Phase 3, when the funnel is
+# pointed at a weak, user-overridable definition.
+__cryo_alloc    | (size: u64, align: u64) -> void*          | alloc | PENDING (P2/P3; funnel done P8)
+__cryo_dealloc  | (ptr: void*, size: u64, align: u64) -> void | alloc | PENDING (P2/P3; funnel done P8)

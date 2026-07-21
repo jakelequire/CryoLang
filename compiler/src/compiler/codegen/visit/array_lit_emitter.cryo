@@ -182,34 +182,13 @@ type struct ArrayLitEmitter {
             const byte_count: LValue = this.cg.builder.build_mul(
                 count_val, elem_size_val, "bytecnt");
 
-            // Route the buffer through the arena-aware allocator (same as
-            // `new T[n]`): arena while the compiler builds itself, libc
-            // elsewhere, with a direct `malloc` fallback when the stdlib is not
-            // linked.  A raw `malloc` here would pin the buffer to libc for its
-            // whole life (`GlobalAlloc::reallocate`/`deallocate` key on
+            // Route the buffer through the shared allocation funnel (same as
+            // `new T[n]`).  A raw `malloc` here would pin the buffer to libc
+            // for its whole life (`GlobalAlloc::reallocate`/`deallocate` key on
             // `holds(ptr)`), so a literal-seeded, then-grown array would leak
             // with a leaked owner (the LSP per-recompile CompilationContext).
-            const alloc_fn: LValue = this.cg.resolver.resolve_function(
-                this.cg.intern_str("std::alloc::allocator::alloc"));
-            if (alloc_fn.is_valid()) {
-                const alloc_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(alloc_fn.raw) };
-                const align_val: LValue = LType::const_int(LType::i64(), 16, false);
-                mut alloc_args: Pair<LValue, TypeRef>[] = [];
-                alloc_args.push(Pair<LValue, TypeRef>::new(byte_count, TypeRef::invalid()));
-                alloc_args.push(Pair<LValue, TypeRef>::new(align_val, TypeRef::invalid()));
-                data_ptr = this.cg.expr_ops.codegen_call(alloc_fn, alloc_ty, alloc_args, "arrdata");
-            } else {
-                const malloc_fn: LValue = this.cg.resolver.resolve_function(this.cg.intern_str("malloc"));
-                if (!malloc_fn.is_valid()) {
-                    this.state.last_value     = LValue::null();
-                    this.state.last_is_lvalue = false;
-                    return;
-                }
-                const malloc_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(malloc_fn.raw) };
-                mut malloc_args: Pair<LValue, TypeRef>[] = [];
-                malloc_args.push(Pair<LValue, TypeRef>::new(byte_count, TypeRef::invalid()));
-                data_ptr = this.cg.expr_ops.codegen_call(malloc_fn, malloc_ty, malloc_args, "arrdata");
-            }
+            data_ptr = this.cg.expr_ops.emit_raw_alloc(
+                false, byte_count, 16, "arrdata", node.span, "array literal");
             if (!data_ptr.is_valid()) {
                 this.state.last_value     = LValue::null();
                 this.state.last_is_lvalue = false;
@@ -343,30 +322,10 @@ type struct ArrayLitEmitter {
             const byte_count: LValue = this.cg.builder.build_mul(
                 count_val, elem_size_val, "bytecnt");
 
-            // Arena-aware allocator (see the element-form path above for why a
-            // raw `malloc` would leak a literal-seeded, then-grown array).
-            mut data_ptr: LValue = LValue::null();
-            const alloc_fn: LValue = this.cg.resolver.resolve_function(
-                this.cg.intern_str("std::alloc::allocator::alloc"));
-            if (alloc_fn.is_valid()) {
-                const alloc_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(alloc_fn.raw) };
-                const align_val: LValue = LType::const_int(LType::i64(), 16, false);
-                mut alloc_args: Pair<LValue, TypeRef>[] = [];
-                alloc_args.push(Pair<LValue, TypeRef>::new(byte_count, TypeRef::invalid()));
-                alloc_args.push(Pair<LValue, TypeRef>::new(align_val, TypeRef::invalid()));
-                data_ptr = this.cg.expr_ops.codegen_call(alloc_fn, alloc_ty, alloc_args, "filldata");
-            } else {
-                const malloc_fn: LValue = this.cg.resolver.resolve_function(this.cg.intern_str("malloc"));
-                if (!malloc_fn.is_valid()) {
-                    this.state.last_value     = LValue::null();
-                    this.state.last_is_lvalue = false;
-                    return;
-                }
-                const malloc_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(malloc_fn.raw) };
-                mut malloc_args: Pair<LValue, TypeRef>[] = [];
-                malloc_args.push(Pair<LValue, TypeRef>::new(byte_count, TypeRef::invalid()));
-                data_ptr = this.cg.expr_ops.codegen_call(malloc_fn, malloc_ty, malloc_args, "filldata");
-            }
+            // Shared allocation funnel (see the element-form path above for why
+            // a raw `malloc` would leak a literal-seeded, then-grown array).
+            const data_ptr: LValue = this.cg.expr_ops.emit_raw_alloc(
+                false, byte_count, 16, "filldata", node.span, "array literal");
             if (!data_ptr.is_valid()) {
                 this.state.last_value     = LValue::null();
                 this.state.last_is_lvalue = false;
