@@ -377,7 +377,7 @@ hazard classes above.
   converts failures into passes. One tiny test CI asserts *fails* closes the
   trust loop.
 
-- [ ] **Diagnostics are pinned by error code only.** No message text, no
+- [x] **Diagnostics are pinned by error code only.** No message text, no
   span/line assertions, no stderr goldens (rustc `//~ ERROR` model). Wrong
   spans / garbled messages / cascades regress silently. Coverage: **63 of 217
   E-codes (~29%) have negative tests; 0 of 12 W-codes.**
