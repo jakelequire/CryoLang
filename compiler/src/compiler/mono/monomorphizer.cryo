@@ -77,9 +77,6 @@ type struct Monomorphizer {
     // (`spec_keys: string[]` used to sit here too; it was write-only and is gone.)
     spec_index:        HashMap<u64, i64>;      // key -> index in state.spec_entries
 
-    // -- Cycle detection --
-    in_progress:       HashMap<u64, boolean>;
-
     // -- Incremental injection tracking (for batch compilation) --
     injection_cursor:  i64;
 
@@ -112,7 +109,6 @@ type struct Monomorphizer {
             ast_resolver:          MonoAstResolver::null(),
             call_specializer:      MonoCallSpecializer::null(),
             spec_index:            HashMap<u64, i64>::new(),
-            in_progress:           HashMap<u64, boolean>::new(),
             injection_cursor:      0,
             current_module:        SymbolStr::empty(),
         };
@@ -227,15 +223,15 @@ type struct Monomorphizer {
             this.state.enqueue_from_type_ref(unprocessed[i]);
         }
 
-        // Worklist-iteration ceiling.  The cycle detection below only
-        // catches a request re-entering the SAME key while in progress; a
-        // *type-growing* template - one whose field/arg type gains a level
-        // of nesting at each instantiation (`Wrap<T> { f: Wrap<Wrap<T>> }`)
-        // - mints a fresh, ever-larger key every level and so never trips
-        // it, looping until the process exhausts memory.  Bound the loop to
-        // a generous multiple of the program's type count (far above any
-        // legitimate instantiation set) and report E0900 on exceed instead
-        // of hanging / OOMing with no diagnostic.
+        // Worklist-iteration ceiling.  A genuine instantiation cycle is
+        // collapsed by the `is_cached` check below (a re-requested key resolves
+        // to its cached concrete type).  What that does NOT bound is a
+        // *type-growing* template - one whose field/arg type gains a level of
+        // nesting at each instantiation (`Wrap<T> { f: Wrap<Wrap<T>> }`) - which
+        // mints a fresh, ever-larger key every level and would loop until the
+        // process exhausts memory.  Bound the loop to a generous multiple of the
+        // program's type count (far above any legitimate instantiation set) and
+        // report E0900 on exceed instead of hanging / OOMing with no diagnostic.
         const max_iterations: i64 = 100000 + this.arena.type_count() * 100;
         mut iterations: i64 = 0;
 
@@ -262,18 +258,7 @@ type struct Monomorphizer {
                 continue;
             }
 
-            // Cycle detection
-            if (this.is_in_progress(key)) {
-                this.diagnostics.emit(Diagnostic::error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                    format("monomorphization cycle detected for instantiation id %llu", key)));
-                this.state.error_count += 1;
-                continue;
-            }
-
-            // Mark as in-progress, specialize, then clear.
-            this.in_progress.insert(key, true);
             const success: boolean = this.specialize_request(request, key);
-            this.remove_in_progress(key);
 
             if (!success) {
                 this.state.error_count += 1;
@@ -317,10 +302,7 @@ type struct Monomorphizer {
                     this.generic_registry.mark_monomorphized(req.base_type, req.type_args);
                     continue;
                 }
-                if (this.is_in_progress(rkey)) { continue; }
-                this.in_progress.insert(rkey, true);
                 const rsuccess: boolean = this.specialize_request(req, rkey);
-                this.remove_in_progress(rkey);
                 if (!rsuccess) { this.state.error_count += 1; }
             }
         }
@@ -366,15 +348,7 @@ type struct Monomorphizer {
                 this.generic_registry.mark_monomorphized(request.base_type, request.type_args);
                 continue;
             }
-            if (this.is_in_progress(key)) {
-                this.diagnostics.emit(Diagnostic::error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                    format("monomorphization cycle detected for instantiation id %llu", key)));
-                errors += 1;
-                continue;
-            }
-            this.in_progress.insert(key, true);
             const ok: boolean = this.specialize_request(request, key);
-            this.remove_in_progress(key);
             if (!ok) { errors += 1; }
         }
         if (errors > 0) {
@@ -814,7 +788,6 @@ type struct Monomorphizer {
     /// and injection cursor.  Called between modules in StdlibBatch mode.
     reset_for_next_module(mut &this) -> void {
         this.state.reset_worklist();
-        this.in_progress = HashMap<u64, boolean>::new();
     }
 
     /// Number of specializations completed.
@@ -911,13 +884,4 @@ type struct Monomorphizer {
         }
     }
 
-    /// Check if a key is currently being processed (cycle detection).
-    is_in_progress(&this, key: u64) -> boolean {
-        return this.in_progress.get(&key).is_some();
-    }
-
-    /// Remove a key from the in-progress set.
-    remove_in_progress(mut &this, key: u64) -> void {
-        this.in_progress.remove(&key);
-    }
 }
