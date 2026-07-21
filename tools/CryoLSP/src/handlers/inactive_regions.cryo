@@ -1,0 +1,103 @@
+///! Inactive-region publishing.
+///!
+///! The ConfigGating pass strips top-level declarations, methods, and inline
+///! `![dir] { }` blocks gated to another OS (`![config(windows)]` on a Linux
+///! build, etc.) right after parsing, recording their source spans on
+///! `ctx.inactive_spans` before dropping them from the AST.  After every
+///! recompile we publish those spans (filtered to the URI's own file) as a
+///! custom `cryo/inactiveRegions` notification, which the extension renders as
+///! dimmed ("compiled out") ranges - the same treatment C/C++ and clangd give
+///! inactive `#ifdef` blocks.
+///!
+///! Always emits, even with no regions: an empty `regions: []` array clears
+///! stale dimming after an edit removes a gate, exactly like an empty
+///! `diagnostics: []` clears squiggles.
+
+namespace Lsp::Handlers::InactiveRegions;
+
+import std::core::result;
+import std::collections::str;
+import std::collections::string;
+import std::collections::array;
+import std::io::stdio;
+import std::json::value;
+
+import Compiler::CompilationContext;
+import Compiler::Diag::SourceSpan;
+
+import Lsp::Protocol::Framing;
+import Lsp::Protocol::JsonRpc;
+import Lsp::Protocol::Conv;
+
+
+// InactiveRegionsPublisher - build + frame + write cryo/inactiveRegions
+// notifications.  Stateless: the stdout sink is passed in, mirroring
+// DiagnosticPublisher.
+
+type struct InactiveRegionsPublisher {
+
+    /// Publish the inactive (OS-gated-away) ranges for `uri`, read from the
+    /// compilation context's `inactive_spans`.  Always emits - an empty array
+    /// clears the editor's dimming after a recompile that gated nothing.
+    static publish_for(writer: mut &Stdout, uri: Str,
+                       ctx: CompilationContext*) -> void {
+        if (ctx == null) {
+            InactiveRegionsPublisher::publish_empty(writer, uri);
+            return;
+        }
+
+        // Multi-module compiles record spans from EVERY module they touched,
+        // but each notification is per-URI on the wire - filter to this file
+        // so a buffer showing `main.cryo` isn't dimmed at positions belonging
+        // to a sibling module.
+        mut fs_path_owned: String = UriPath::uri_to_fs_path(uri);
+        const fs_path: Str = fs_path_owned.as_str();
+
+        mut arr: Array<JsonValue> =
+            Array<JsonValue>::with_capacity(ctx.inactive_spans.length as u64);
+        for (mut i: i64 = 0; i < ctx.inactive_spans.length; i++) {
+            const span: SourceSpan = ctx.inactive_spans[i];
+            if (InactiveRegionsPublisher::span_is_for_path(span, fs_path)) {
+                arr.push(DiagnosticConverter::range_json_from_span(span));
+            }
+        }
+        fs_path_owned.drop();
+
+        mut params: JsonObject = JsonObject::new();
+        params.put("uri", JsonValue::from(uri));
+        params.put("regions", JsonValue::Array(arr));
+        InactiveRegionsPublisher::send_notification(writer, JsonValue::Object(params));
+    }
+
+    /// Publish an empty region array for `uri` - clears any prior dimming
+    /// (used on didClose, or when there's no context to consult).
+    static publish_empty(writer: mut &Stdout, uri: Str) -> void {
+        mut params: JsonObject = JsonObject::new();
+        params.put("uri", JsonValue::from(uri));
+        params.put("regions", JsonValue::Array(Array<JsonValue>::with_capacity(0)));
+        InactiveRegionsPublisher::send_notification(writer, JsonValue::Object(params));
+    }
+
+    /// True when a stripped span belongs to `fs_path`.  Spanless entries
+    /// (`span.file == ""`) are dropped - `note_inactive` already skips
+    /// location-less spans, so this is belt-and-suspenders.
+    static span_is_for_path(span: SourceSpan, fs_path: Str) -> boolean {
+        const span_file: string = span.file;
+        if (span_file == "") { return false; }
+        if (strlen(span_file) == 0 as u64) { return false; }
+        return fs_path.equals(&Str::from(span_file));
+    }
+
+    /// Encode + frame + write a `cryo/inactiveRegions` notification.  Write
+    /// failures are swallowed (stdout is the wire; logging there corrupts it),
+    /// consistent with DiagnosticPublisher.
+    static send_notification(writer: mut &Stdout, params: JsonValue) -> void {
+        mut body: String = JsonRpcCodec::encode_notification(
+            Str::from("cryo/inactiveRegions"), params);
+        match (FrameCodec::write_message(writer, body.as_str())) {
+            Result::Ok(_)  => { }
+            Result::Err(_) => { }
+        }
+        body.drop();
+    }
+}

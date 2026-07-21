@@ -1315,10 +1315,18 @@ type struct SemanticTokenizer {
                         Lsp::Protocol::SemanticTokens::MOD_DECLARATION);
                     instr_started = false;                        // label isn't the instruction
                 } else if (!instr_started) {
+                    // Instruction mnemonic (or a prefix).  Positional: the
+                    // first identifier on the line is the mnemonic whatever it
+                    // is, so every instruction is covered without an allowlist.
+                    // A prefix (`lock`, `rep`, ...) precedes the real mnemonic,
+                    // so leave `instr_started` false to colour the next token
+                    // as a mnemonic too.
                     this.emit_raw(line0, start, len,
                         Lsp::Protocol::SemanticTokens::TYPE_KEYWORD,
-                        Lsp::Protocol::SemanticTokens::MOD_NONE);  // mnemonic
-                    instr_started = true;
+                        Lsp::Protocol::SemanticTokens::MOD_NONE);
+                    if (!SemanticTokenizer::is_asm_prefix(base, start, len)) {
+                        instr_started = true;
+                    }
                 } else if (intel && SemanticTokenizer::is_intel_register(base, start, len)) {
                     this.emit_raw(line0, start, len,
                         Lsp::Protocol::SemanticTokens::TYPE_VARIABLE,
@@ -1381,6 +1389,26 @@ type struct SemanticTokenizer {
             k = k + 1 as u32;
         }
         return false;
+    }
+
+    /// Instruction prefixes that precede the real mnemonic on the same line
+    /// (`lock cmpxchg`, `rep movsb`).  Kept as a small allowlist so the token
+    /// AFTER a prefix is still coloured as an instruction rather than a symbol
+    /// reference - the mnemonics themselves need no list (they're positional).
+    static is_asm_prefix(p: string, start: u32, len: u32) -> boolean {
+        if (len < 3 as u32 || len > 8 as u32) { return false; }
+        return SemanticTokenizer::region_eq(p, start, len, "lock")
+            || SemanticTokenizer::region_eq(p, start, len, "rep")
+            || SemanticTokenizer::region_eq(p, start, len, "repe")
+            || SemanticTokenizer::region_eq(p, start, len, "repz")
+            || SemanticTokenizer::region_eq(p, start, len, "repne")
+            || SemanticTokenizer::region_eq(p, start, len, "repnz")
+            || SemanticTokenizer::region_eq(p, start, len, "bnd")
+            || SemanticTokenizer::region_eq(p, start, len, "notrack")
+            || SemanticTokenizer::region_eq(p, start, len, "data16")
+            || SemanticTokenizer::region_eq(p, start, len, "addr32")
+            || SemanticTokenizer::region_eq(p, start, len, "xacquire")
+            || SemanticTokenizer::region_eq(p, start, len, "xrelease");
     }
 
     /// Best-effort recognition of an Intel-syntax register name (AT&T uses
