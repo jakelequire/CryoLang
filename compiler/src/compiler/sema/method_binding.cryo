@@ -257,6 +257,126 @@ type struct MethodBinding {
         }
     }
 
+    /// The head leaf name of a type annotation (`Pair<u64,X>` -> `Pair`,
+    /// `A` -> `A`), peeling references/pointers; empty for a projection or
+    /// other non-nameable shape.
+    ann_head_leaf(&this, ann: TypeAnnotation*) -> SymbolStr {
+        if (ann == null) { return SymbolStr::empty(); }
+        return match (*ann) {
+            TypeAnnotation::Named(n)     => { n.name }
+            TypeAnnotation::Generic(g)   => { this.ann_head_leaf(g.base) }
+            TypeAnnotation::Reference(r) => { this.ann_head_leaf(r.inner) }
+            TypeAnnotation::Pointer(p)   => { this.ann_head_leaf(p.inner) }
+            _ => { SymbolStr::empty() }
+        };
+    }
+
+    /// Whether `name` matches one of `impl_node`'s own head generic params.
+    impl_declares_param(&this, impl_node: ImplBlockNode*, name: SymbolStr) -> boolean {
+        if (impl_node == null || !name.is_valid()) { return false; }
+        for (mut i: i64 = 0; i < impl_node.generic_params.length; i++) {
+            const gp: GenericParamNode* = impl_node.generic_params[i];
+            if (gp != null && gp.name.equals(name)) { return true; }
+        }
+        return false;
+    }
+
+    /// Whether the concrete type named `type_name` is registered as implementing
+    /// `trait_name`. Conservative: true (assume satisfiable) with no registry.
+    name_implements(&this, type_name: SymbolStr, trait_name: SymbolStr) -> boolean {
+        if (this.ctx.generic_registry == null) { return true; }
+        const traits: SymbolStr[] = this.ctx.generic_registry.traits_implemented_by(type_name);
+        for (mut i: i64 = 0; i < traits.length; i++) {
+            if (traits[i].equals(trait_name)) { return true; }
+        }
+        return false;
+    }
+
+    /// True when a projection-bounded trait-DEFAULT method `method_name`
+    /// (`min`/`max` with `where This::Item: Ord`) is NOT applicable to the
+    /// concrete receiver `recv_type` because its Item does not implement a bound
+    /// trait. This lets sema reject `nonOrdIter.min()` cleanly (a normal
+    /// "no method" E0358) instead of resolving it via the trait default and
+    /// leaving it to fail at codegen (E0636). Mirrors the synthesize-time
+    /// default-filter applicability check, but on the CALL side. Returns false
+    /// (do not block) for symbolic receivers or symbolic Item types.
+    projection_default_unavailable(&this, recv_type: TypeRef, method_name: SymbolStr) -> boolean {
+        if (this.ctx.generic_registry == null || !method_name.is_valid()) { return false; }
+        const base_name: SymbolStr = this.trait_checker().bare_name_of(recv_type);
+        if (!base_name.is_valid()) { return false; }
+        const traits: SymbolStr[] = this.ctx.generic_registry.traits_implemented_by(base_name);
+        for (mut ti: i64 = 0; ti < traits.length; ti++) {
+            const tdecl: TraitDeclNode* = this.ctx.generic_registry.get_trait_decl(traits[ti]);
+            if (tdecl == null) { continue; }
+            // The trait's default-bodied method of this name, if projection-bounded.
+            mut mfunc: FunctionDeclNode* = null;
+            for (mut mi: i64 = 0; mi < tdecl.methods.length; mi++) {
+                const f: FunctionDeclNode* = tdecl.methods[mi];
+                if (f != null && f.name.equals(method_name) && f.has_body()) { mfunc = f; break; }
+            }
+            if (mfunc == null) { continue; }
+            const impl_node: ImplBlockNode* = OwnershipQuery::resolve_trait_impl_for_type(
+                this.arena, this.ctx.generic_registry, this.intern, traits[ti], recv_type);
+            if (impl_node == null) { continue; }
+            if (this.projection_bound_fails(mfunc, impl_node, tdecl)) { return true; }
+        }
+        return false;
+    }
+
+    /// Whether any projection-subject where-bound on `mfunc` has a CONCRETE Item
+    /// (drawn from `impl_node`'s positional trait args) that fails the bound
+    /// trait. Symbolic Item (a projection, or an impl generic param) -> false.
+    projection_bound_fails(&this, mfunc: FunctionDeclNode*, impl_node: ImplBlockNode*,
+                           tdecl: TraitDeclNode*) -> boolean {
+        if (mfunc == null || impl_node == null || tdecl == null) { return false; }
+        if (impl_node.trait_annotation == null) { return false; }
+        // The impl's positional trait-arg annotations.
+        mut has_args: boolean = false;
+        mut arg_len: i64 = 0;
+        match (*impl_node.trait_annotation) {
+            TypeAnnotation::Generic(g) => { has_args = true; arg_len = g.args.length; }
+            _ => { }
+        }
+        if (!has_args) { return false; }
+        for (mut bi: i64 = 0; bi < mfunc.trait_bounds.length; bi++) {
+            const b: TraitBound* = &mfunc.trait_bounds[bi];
+            if (!b.has_projection_subject()) { continue; }
+            const member: SymbolStr = this.projection_ann_member(b.subject_type);
+            if (!member.is_valid()) { continue; }
+            mut assoc_idx: i64 = -1;
+            for (mut a: i64 = 0; a < tdecl.assoc_types.length; a++) {
+                if (tdecl.assoc_types[a] != null && tdecl.assoc_types[a].name.equals(member)) {
+                    assoc_idx = a; break;
+                }
+            }
+            if (assoc_idx < 0) { continue; }
+            const arg_idx: i64 = tdecl.generic_params.length + assoc_idx;
+            if (arg_idx < 0 || arg_idx >= arg_len) { continue; }
+            mut item_ann: TypeAnnotation* = null;
+            match (*impl_node.trait_annotation) {
+                TypeAnnotation::Generic(g) => { item_ann = g.args[arg_idx]; }
+                _ => { }
+            }
+            if (item_ann == null) { continue; }
+            // Symbolic Item (projection or impl-declared param) -> undecidable, keep.
+            match (*item_ann) {
+                TypeAnnotation::Projection(_) => { continue; }
+                _ => { }
+            }
+            const head: SymbolStr = this.ann_head_leaf(item_ann);
+            if (!head.is_valid()) { continue; }
+            if (this.impl_declares_param(impl_node, head)) { continue; }
+            // Concrete Item: it must implement every bound trait.
+            for (mut ri: i64 = 0; ri < b.trait_refs.length; ri++) {
+                const tr: TraitRef* = &b.trait_refs[ri];
+                if (tr.path.length == 0) { continue; }
+                const need: SymbolStr = tr.path[tr.path.length - 1];
+                if (!this.name_implements(head, need)) { return true; }
+            }
+        }
+        return false;
+    }
+
     /// First matching trait-method return for `target_name` (qualified or bare),
     /// for default trait methods on a concrete type that doesn't override them.
     lookup_method_through_trait_impls(&this, target_name: SymbolStr,
