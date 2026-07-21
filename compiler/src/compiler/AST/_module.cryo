@@ -585,12 +585,29 @@ type struct TraitRef {
 /// `where T: Trait` is a single-element array; `where T: A + B` has two;
 /// each entry carries its own (possibly qualified) path.
 type struct TraitBound {
+    // The bound subject. A bare type parameter (`where T: Ord`) is named here
+    // and `subject_type` is null. An associated-type PROJECTION subject
+    // (`where This::Item: Ord`) leaves this empty and carries the projection
+    // annotation in `subject_type` instead - keeping `type_parameter` empty is
+    // what makes every param-name-matching consumer structurally skip a
+    // projection bound (an empty name never equals a real generic param).
     type_parameter: SymbolStr;
+    // Non-null only for a projection subject: the parsed `Base::Member`
+    // annotation (a `TypeAnnotation::Projection`). Null for a bare-param bound.
+    subject_type:   TypeAnnotation*;
     trait_refs:     TraitRef[];
     span:           SourceSpan;
 
+    /// True when the subject is an associated-type projection rather than a
+    /// bare type parameter.
+    has_projection_subject(&this) -> boolean {
+        return this.subject_type != null;
+    }
+
     /// Deep copy; clones each (owning) TraitRef into an independent buffer so
-    /// the result can be stored in a second owner without a double-free.
+    /// the result can be stored in a second owner without a double-free. The
+    /// projection subject, if any, is null-safe cloned so the spec re-resolves
+    /// `Base::Member` against its substituted base.
     clone(&this) -> TraitBound {
         mut refs_c: TraitRef[] = [];
         for (mut i: i64 = 0; i < this.trait_refs.length; i++) {
@@ -598,6 +615,7 @@ type struct TraitBound {
         }
         return TraitBound {
             type_parameter: this.type_parameter,
+            subject_type:   TypeAnnotation::clone_ptr(this.subject_type),
             trait_refs:     refs_c,
             span:           this.span,
         };

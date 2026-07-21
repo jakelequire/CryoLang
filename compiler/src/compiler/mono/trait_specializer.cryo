@@ -504,6 +504,87 @@ type struct MonoTraitSpecializer {
         return this.trait_checker.method_bounds_satisfied(func, subst);
     }
 
+    /// Drop conditionally-bounded trait-default methods whose associated-type
+    /// projection bound (`where This::Item: Ord`) is NOT satisfied by THIS
+    /// concrete impl's Item. `this_type` is the concrete Self (e.g.
+    /// `EnumerateIter<ConcreteIter>`), so `This::Item` reduces here to a
+    /// concrete type (e.g. `Pair<u64,u32>`) testable against the bound trait.
+    ///
+    /// This is the per-monomorphization companion to the projection skip in
+    /// `TraitChecker::bounds_satisfied`: that gate runs on a param->type `subst`
+    /// that carries no `This`/Item binding, so it cannot evaluate a projection
+    /// subject and defers; here the concrete Self IS in hand, so the real check
+    /// happens. Conservative: a method is dropped ONLY when its projected Item
+    /// reduces to a concrete type AND the bound trait is known-absent; an
+    /// unreducible projection keeps the method.
+    filter_projection_bound_methods(mut &this, decl: ImplBlockNode*,
+                                    this_type: TypeRef) -> void {
+        if (decl == null || !this_type.is_valid()) { return; }
+        // Fast path: nothing to do unless some method carries a projection bound.
+        mut any: boolean = false;
+        for (mut i: i64 = 0; i < decl.methods.length; i++) {
+            const m: MethodNode* = decl.methods[i];
+            if (m != null && m.func != null && this.func_has_projection_bound(m.func)) {
+                any = true;
+                break;
+            }
+        }
+        if (!any) { return; }
+
+        mut kept: MethodNode*[] = [];
+        for (mut i: i64 = 0; i < decl.methods.length; i++) {
+            const m: MethodNode* = decl.methods[i];
+            if (m == null || m.func == null) { kept.push(m); continue; }
+            if (this.method_projection_bounds_hold(m.func, this_type)) {
+                kept.push(m);
+            }
+        }
+        // Swap-relocate the owning array (see `filter_bounds_violating_methods`).
+        swap(&decl.methods, &kept);
+    }
+
+    /// Whether `func` carries at least one projection-subject where-bound.
+    func_has_projection_bound(&this, func: FunctionDeclNode*) -> boolean {
+        if (func == null) { return false; }
+        for (mut bi: i64 = 0; bi < func.trait_bounds.length; bi++) {
+            if (func.trait_bounds[bi].has_projection_subject()) { return true; }
+        }
+        return false;
+    }
+
+    /// True unless some projection-subject where-bound on `func` is concretely
+    /// violated by `this_type`'s corresponding associated type.
+    method_projection_bounds_hold(mut &this, func: FunctionDeclNode*,
+                                  this_type: TypeRef) -> boolean {
+        if (func == null) { return true; }
+        for (mut bi: i64 = 0; bi < func.trait_bounds.length; bi++) {
+            const b: TraitBound* = &func.trait_bounds[bi];
+            if (!b.has_projection_subject()) { continue; }
+            const member: SymbolStr = this.projection_ann_member(b.subject_type);
+            if (!member.is_valid()) { continue; }
+            const item: TypeRef = this.resolve_concrete_projection(this_type, member);
+            if (!item.is_valid()) { continue; }   // unreducible -> keep (conservative)
+            for (mut ti: i64 = 0; ti < b.trait_refs.length; ti++) {
+                const tr: TraitRef* = &b.trait_refs[ti];
+                if (tr.path.length == 0) { continue; }
+                const leaf: SymbolStr = tr.path[tr.path.length - 1];
+                if (!this.type_implements_trait(item, leaf, 0)) {
+                    return false;   // Item concretely fails the bound -> drop method
+                }
+            }
+        }
+        return true;
+    }
+
+    /// The projected member name of a projection type-annotation, or empty.
+    projection_ann_member(&this, ann: TypeAnnotation*) -> SymbolStr {
+        if (ann == null) { return SymbolStr::empty(); }
+        match (*ann) {
+            TypeAnnotation::Projection(pj) => { return pj.member; }
+            _ => { return SymbolStr::empty(); }
+        }
+    }
+
     /// Recursively check whether a concrete TypeRef implements a trait.  Forwards
     /// to the standalone `TraitChecker`.
     type_implements_trait(&this, ty: TypeRef, trait_name: SymbolStr, depth: i32) -> boolean {

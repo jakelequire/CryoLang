@@ -2337,7 +2337,27 @@ public:
         this.advance(); // consume 'where'
 
         while (true) {
-            const type_param_tok: Token = this.consume(TokenType::Identifier, "type parameter");
+            const start_tok: Token = this.current();
+
+            // Subject: a bare type parameter (`T`) or an associated-type
+            // projection (`This::Item`, `I::Item`). A projection routes through
+            // `parse_base_type` (which builds the Projection node) and leaves
+            // `type_parameter` empty; a bare param keeps the historical path so
+            // the param-name-keyed machinery downstream is unchanged.
+            mut type_param: SymbolStr = SymbolStr::empty();
+            mut subject: TypeAnnotation* = null;
+            const is_projection: boolean =
+                this.check(TokenType::KwThisType)
+                || (this.check(TokenType::Identifier)
+                    && this.peek_at(1).kind == TokenType::ColonColon);
+            if (is_projection) {
+                subject = this.parse_base_type();
+            } else {
+                const type_param_tok: Token =
+                    this.consume(TokenType::Identifier, "type parameter");
+                type_param = this.intern_lexeme(type_param_tok);
+            }
+
             this.consume(TokenType::Colon, "':'");
 
             mut refs: TraitRef[] = [];
@@ -2347,9 +2367,10 @@ public:
             }
 
             const bound: TraitBound = TraitBound {
-                type_parameter: this.intern_lexeme(type_param_tok),
+                type_parameter: type_param,
+                subject_type:   subject,
                 trait_refs:     refs,
-                span:           this.span_from(type_param_tok),
+                span:           this.span_from(start_tok),
             };
             bounds.push(bound);
 

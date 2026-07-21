@@ -1741,6 +1741,102 @@ type struct TypeResolutionPasses {
         };
     }
 
+    /// The projected member (`Item`) of a projection type-annotation, else empty.
+    static projection_member_of(ann: TypeAnnotation*) -> SymbolStr {
+        if (ann == null) { return SymbolStr::empty(); }
+        return match (*ann) {
+            TypeAnnotation::Projection(pj) => { pj.member }
+            _ => { SymbolStr::empty() }
+        };
+    }
+
+    /// Whether `ann` is an associated-type projection annotation (`I::Item`).
+    static is_projection_annotation(ann: TypeAnnotation*) -> boolean {
+        if (ann == null) { return false; }
+        return match (*ann) {
+            TypeAnnotation::Projection(_) => { true }
+            _ => { false }
+        };
+    }
+
+    /// Whether `name` is one of `impl_node`'s own head generic parameters.
+    static impl_declares_generic_param(impl_node: ImplBlockNode*, name: SymbolStr) -> boolean {
+        if (impl_node == null || !name.is_valid()) { return false; }
+        for (mut i: i64 = 0; i < impl_node.generic_params.length; i++) {
+            const gp: GenericParamNode* = impl_node.generic_params[i];
+            if (gp != null && gp.name.equals(name)) { return true; }
+        }
+        return false;
+    }
+
+    /// Whether the type named `type_name` is registered as implementing the
+    /// trait named `trait_name`. Conservative: true (assume satisfiable) when the
+    /// registry is unavailable, so a default method is only DROPPED on positive
+    /// evidence that a concrete Item type lacks the bound.
+    static name_implements_trait(ctx: CompilationContext*, type_name: SymbolStr,
+                                 trait_name: SymbolStr) -> boolean {
+        if (ctx == null || ctx.generic_registry == null) { return true; }
+        const traits: SymbolStr[] = ctx.generic_registry.traits_implemented_by(type_name);
+        for (mut i: i64 = 0; i < traits.length; i++) {
+            if (traits[i].equals(trait_name)) { return true; }
+        }
+        return false;
+    }
+
+    /// Whether a projection-bounded trait-default method (`min where This::Item:
+    /// Ord`) is applicable to THIS impl. Returns false ONLY when the impl's
+    /// concrete Item type definitively does not implement a bound trait - the
+    /// case that must be filtered so the default's body is never synthesized
+    /// (and then type-checked) for it (e.g. `EnumerateIter`/`ZipIter` whose Item
+    /// is `Pair`, which is never `Ord`). A SYMBOLIC Item - a bare impl generic
+    /// param (`A`), or an `I::Item` projection - is undecidable here and kept;
+    /// its applicability is settled at the trait-level symbolic pass or per
+    /// monomorphization. `args_ref` is the impl's trait-arg annotations.
+    static default_method_applies_to_impl(tfunc: FunctionDeclNode*,
+                                          impl_node: ImplBlockNode*,
+                                          trait_decl: TraitDeclNode*,
+                                          args_ref: &TypeAnnotation*[],
+                                          ctx: CompilationContext*) -> boolean {
+        if (tfunc == null || impl_node == null || trait_decl == null) { return true; }
+        for (mut bi: i64 = 0; bi < tfunc.trait_bounds.length; bi++) {
+            const b: TraitBound* = &tfunc.trait_bounds[bi];
+            if (!b.has_projection_subject()) { continue; }
+            const member: SymbolStr =
+                TypeResolutionPasses::projection_member_of(b.subject_type);
+            if (!member.is_valid()) { continue; }
+            // Position of `member` among the trait's associated types, then in
+            // the impl's positional trait-arg list (generic params first).
+            mut assoc_idx: i64 = -1;
+            for (mut a: i64 = 0; a < trait_decl.assoc_types.length; a++) {
+                if (trait_decl.assoc_types[a] != null
+                        && trait_decl.assoc_types[a].name.equals(member)) {
+                    assoc_idx = a; break;
+                }
+            }
+            if (assoc_idx < 0) { continue; }
+            const arg_idx: i64 = trait_decl.generic_params.length + assoc_idx;
+            if (arg_idx < 0 || arg_idx >= args_ref.length) { continue; }
+            const item_ann: TypeAnnotation* = args_ref[arg_idx];
+            if (item_ann == null) { continue; }
+            // Symbolic Item (projection or impl-declared generic param) -> keep.
+            if (TypeResolutionPasses::is_projection_annotation(item_ann)) { continue; }
+            const head: SymbolStr = TypeResolutionPasses::extract_trait_leaf(item_ann);
+            if (!head.is_valid()) { continue; }
+            if (TypeResolutionPasses::impl_declares_generic_param(impl_node, head)) { continue; }
+            // Concrete Item type: it must implement every bound trait, else the
+            // default cannot apply here.
+            for (mut ti: i64 = 0; ti < b.trait_refs.length; ti++) {
+                const tr: TraitRef* = &b.trait_refs[ti];
+                if (tr.path.length == 0) { continue; }
+                const need: SymbolStr = tr.path[tr.path.length - 1];
+                if (!TypeResolutionPasses::name_implements_trait(ctx, head, need)) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
     /// Positional index of `name` among `node`'s impl-head generic params,
     /// or -1 when it is not one of them.  Used to normalize a generic param
     /// to a position (`#0`) in the coherence key so that two otherwise
@@ -2023,6 +2119,19 @@ type struct TypeResolutionPasses {
                 }
             }
             if (already_present) { continue; }
+
+            // Skip cloning a projection-bounded default (`min`/`max` with
+            // `where This::Item: Ord`) into an impl whose CONCRETE Item type
+            // definitively lacks the bound trait - e.g. `EnumerateIter`/`ZipIter`
+            // yield `Pair`, which is never `Ord`. Without this the default body
+            // would be synthesized and then type-checked against a `Pair`
+            // receiver (`.compare()`), a spurious E0358. Symbolic Item types
+            // (a param `A`, or an `I::Item` projection) are kept and decided
+            // later.
+            if (!TypeResolutionPasses::default_method_applies_to_impl(
+                    tfunc, impl_node, trait_decl, args_ref, ctx)) {
+                continue;
+            }
 
             const cloned: FunctionDeclNode* = cloner.clone_func_decl(tfunc);
             if (cloned == null) { continue; }

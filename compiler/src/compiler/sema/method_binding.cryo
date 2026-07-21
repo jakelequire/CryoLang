@@ -202,6 +202,61 @@ type struct MethodBinding {
         return TypeRef::invalid();
     }
 
+    /// Projection-bounded dispatch: the associated-type-projection sibling of
+    /// `lookup_method_through_bounds`. When the receiver is an `AssocProjection`
+    /// (`This::Item`) and an enclosing where-bound constrains that same
+    /// projection (`where This::Item: Ord`), resolve `method_name` through the
+    /// bound trait(s). The bound is matched to the receiver by the projected
+    /// MEMBER name, which distinguishes e.g. `This::Item` from `This::Key`
+    /// inside one method's where-clause.
+    lookup_method_through_projection_bounds(&this, proj: AssocProjectionType*,
+                                            method_name: SymbolStr) -> TypeRef {
+        if (proj == null) { return TypeRef::invalid(); }
+        const member: SymbolStr = proj.member;
+        if (!member.is_valid()) { return TypeRef::invalid(); }
+        if (this.state.symbolic_current_func != null) {
+            const r: TypeRef = this.scan_projection_bounds(
+                &this.state.symbolic_current_func.trait_bounds, member, method_name);
+            if (r.is_valid()) { return r; }
+        }
+        if (this.state.symbolic_impl_node != null) {
+            const r: TypeRef = this.scan_projection_bounds(
+                &this.state.symbolic_impl_node.where_bounds, member, method_name);
+            if (r.is_valid()) { return r; }
+        }
+        return TypeRef::invalid();
+    }
+
+    /// Search `bounds` for a projection-subject bound whose projected member
+    /// equals `member`; return the first bound-trait method return for
+    /// `method_name`. Mirrors the trait-scan in `lookup_method_through_bounds`.
+    scan_projection_bounds(&this, bounds: &TraitBound[], member: SymbolStr,
+                           method_name: SymbolStr) -> TypeRef {
+        for (mut bi: i64 = 0; bi < bounds.length; bi++) {
+            const b: TraitBound* = &bounds[bi];
+            if (b.subject_type == null) { continue; }
+            if (!this.projection_ann_member(b.subject_type).equals(member)) { continue; }
+            for (mut ti: i64 = 0; ti < b.trait_refs.length; ti++) {
+                const tr: TraitRef* = &b.trait_refs[ti];
+                if (tr.path.length == 0) { continue; }
+                const leaf: SymbolStr = tr.path[tr.path.length - 1];
+                const ret: TypeRef = this.types.lookup_method_return(leaf, method_name);
+                if (ret.is_valid()) { return ret; }
+            }
+        }
+        return TypeRef::invalid();
+    }
+
+    /// The projected member name of a projection type-annotation, or empty for
+    /// any other annotation shape.
+    projection_ann_member(&this, ann: TypeAnnotation*) -> SymbolStr {
+        if (ann == null) { return SymbolStr::empty(); }
+        match (*ann) {
+            TypeAnnotation::Projection(pj) => { return pj.member; }
+            _ => { return SymbolStr::empty(); }
+        }
+    }
+
     /// First matching trait-method return for `target_name` (qualified or bare),
     /// for default trait methods on a concrete type that doesn't override them.
     lookup_method_through_trait_impls(&this, target_name: SymbolStr,
