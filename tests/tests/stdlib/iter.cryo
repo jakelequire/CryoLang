@@ -24,6 +24,7 @@ import std::core::option;
 import std::core::iter;
 import std::core::ops;
 import std::collections::pair;
+import std::collections::str;
 import std::test::error;
 import std::test::assert;
 
@@ -887,4 +888,115 @@ function opaque_iter_local_takes() -> Result<(), TestError> {
     }
     // 0 + 1 + 2 = 3
     return expect_eq(sum, 3);
+}
+
+// ============================================================================
+// min / max / skip
+//
+// `min`/`max` are trait-default methods bounded on `where This::Item: Ord`
+// (an associated-type projection bound). They are available on any iterator
+// whose element type is `Ord`, and absent from adapters whose element never
+// is (`enumerate`/`zip` yield `Pair`) - see the negative test in
+// tests/tests/negative/.
+// ============================================================================
+
+// A fixed, non-monotonic i32 sequence so min/max are not trivially the
+// endpoints (Range is monotonic).
+type struct FixedI32 {
+    data: i32[5];
+    pos: u64;
+    len: u64;
+
+    static five(a: i32, b: i32, c: i32, d: i32, e: i32) -> FixedI32 {
+        return FixedI32 { data: [a, b, c, d, e], pos: 0u64, len: 5u64 };
+    }
+    static empty() -> FixedI32 {
+        return FixedI32 { data: [0, 0, 0, 0, 0], pos: 0u64, len: 0u64 };
+    }
+}
+
+implement trait Iterator<i32> for struct FixedI32 {
+    next(mut &this) -> Option<i32> {
+        if (this.pos >= this.len) { return Option::None; }
+        const v: i32 = this.data[this.pos];
+        this.pos = this.pos + 1u64;
+        return Option::Some(v);
+    }
+}
+
+![test]
+function min_max_on_range() -> Result<(), TestError> {
+    mut r1: Range<i32> = Range::new(3, 9);   // 3,4,5,6,7,8
+    mut lo: i32 = -1;
+    match (r1.min()) { Option::Some(x) => { lo = x; } Option::None => { } }
+    mut r2: Range<i32> = Range::new(3, 9);
+    mut hi: i32 = -1;
+    match (r2.max()) { Option::Some(x) => { hi = x; } Option::None => { } }
+    match (expect_eq(lo, 3)) { Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); } }
+    return expect_eq(hi, 8);
+}
+
+![test]
+function min_max_non_monotonic() -> Result<(), TestError> {
+    mut a: FixedI32 = FixedI32::five(5, 2, 8, 2, 1);
+    mut lo: i32 = -1;
+    match (a.min()) { Option::Some(x) => { lo = x; } Option::None => { } }
+    mut b: FixedI32 = FixedI32::five(5, 2, 8, 2, 1);
+    mut hi: i32 = -1;
+    match (b.max()) { Option::Some(x) => { hi = x; } Option::None => { } }
+    match (expect_eq(lo, 1)) { Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); } }
+    return expect_eq(hi, 8);
+}
+
+![test]
+function min_max_empty_is_none() -> Result<(), TestError> {
+    mut a: FixedI32 = FixedI32::empty();
+    mut got_min_none: boolean = false;
+    match (a.min()) { Option::Some(_) => { } Option::None => { got_min_none = true; } }
+    mut b: FixedI32 = FixedI32::empty();
+    mut got_max_none: boolean = false;
+    match (b.max()) { Option::Some(_) => { } Option::None => { got_max_none = true; } }
+    match (expect_true(got_min_none, Str::new("min of empty is None"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_true(got_max_none, Str::new("max of empty is None"));
+}
+
+// min/max coexist with enumerate() (whose Pair element is never Ord and so
+// carries no min/max): this exercises the synthesize-time filter.
+![test]
+function enumerate_still_works_alongside_min() -> Result<(), TestError> {
+    mut r: Range<i32> = Range::new(0, 4);
+    const c: u64 = r.enumerate().count();
+    return expect_eq(c as i32, 4);
+}
+
+![test]
+function skip_drops_prefix() -> Result<(), TestError> {
+    // Range 0..5, skip 2 -> 2,3,4 (sum 9, count 3).
+    mut s: implement Iterator<i32> = Range<i32>::new(0, 5).skip(2);
+    mut sum: i32 = 0;
+    mut n: i32 = 0;
+    loop {
+        match (s.next()) {
+            Option::Some(v) => { sum = sum + v; n = n + 1; }
+            Option::None    => { break; }
+        }
+    }
+    match (expect_eq(sum, 9)) { Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); } }
+    return expect_eq(n, 3);
+}
+
+![test]
+function skip_past_end_is_empty() -> Result<(), TestError> {
+    // Skipping more than the length drains the iterator: no elements.
+    mut s: implement Iterator<i32> = Range<i32>::new(0, 3).skip(5);
+    mut n: i32 = 0;
+    loop {
+        match (s.next()) {
+            Option::Some(_) => { n = n + 1; }
+            Option::None    => { break; }
+        }
+    }
+    return expect_eq(n, 0);
 }
