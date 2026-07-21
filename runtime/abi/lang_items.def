@@ -47,8 +47,12 @@ NtTerminateProcess | (process: i64, status: i32) -> i32  (extern, ntdll) | ntdll
 # bootstrap). Empty for now; the ctor-array emitter (P3) will run ctors here.
 __main          | () -> void                                | core (freestanding, windows) | DONE (windows)
 #
-# __cryo_start is shared (both OSes): run `main`, exit with its return. Argument
-# capture deferred, so it takes no parameters on either target.
+# __cryo_start is shared (both OSes): capture argc/argv, run `main`, exit with
+# its return. Linux passes argc/argv in the SysV arg registers (rdi/rsi) set by
+# _start; Windows passes 0/null (Win64 rcx/rdx) pending PEB-based capture.
+# Programs read the captured values through these accessors.
+__cryo_argc     | () -> i64                                 | core (freestanding) | DONE (linux; windows=0 pending PEB)
+__cryo_argv     | () -> i8**                                | core (freestanding) | DONE (linux; windows=null pending PEB)
 
 # --- Panic funnel ----------------------------------------------------------
 # The single divergent sink: print "panicked at <file>:<line>: <msg>" to
@@ -65,12 +69,17 @@ __main          | () -> void                                | core (freestanding
 __cryo_panic              | (msg: string, file: string, line: u32) -> never  | panic/abort | DONE (runtime def, dual-OS; compiler swap deferred)
 
 # --- Check handlers (route raw operands through the funnel) -----------------
-# Each takes RAW operands (not a pre-formatted string) plus a SourceLoc, formats
-# its own message, and diverges via __cryo_panic (or llvm.trap under no_runtime).
-__cryo_panic_bounds_check | (loc: SourceLoc, index: u64, len: u64) -> never  | panic/abort | PENDING (P4)
-__cryo_panic_overflow     | (loc: SourceLoc, op: u32, lhs: u64, rhs: u64) -> never | panic/abort | PENDING (P5)
-__cryo_panic_div_zero     | (loc: SourceLoc) -> never                        | panic/abort | PENDING (P6)
-__cryo_panic_no_match     | (loc: SourceLoc) -> never                        | panic/abort | PENDING (P6)
+# Each takes RAW operands (not a pre-formatted string) plus a SourceLoc POD
+# ({file,line,col}, 16 bytes; see layout.def), formats its own message into a
+# stack buffer, and diverges via __cryo_panic. DEFINED in panic/abort, dual-OS.
+# The compiler does not yet EMIT calls to these: the four mute abort() traps
+# (P6) and the not-yet-emitted bounds/overflow guards (P4/P5) route here at
+# swap time. `op` is a raw arithmetic-op code; its value mapping is pinned when
+# P5 lands the emitter.
+__cryo_panic_bounds_check | (loc: SourceLoc, index: u64, len: u64) -> never  | panic/abort | DONE (runtime def, dual-OS; compiler emit deferred P4)
+__cryo_panic_overflow     | (loc: SourceLoc, op: u32, lhs: u64, rhs: u64) -> never | panic/abort | DONE (runtime def, dual-OS; compiler emit deferred P5)
+__cryo_panic_div_zero     | (loc: SourceLoc) -> never                        | panic/abort | DONE (runtime def, dual-OS; compiler emit deferred P6)
+__cryo_panic_no_match     | (loc: SourceLoc) -> never                        | panic/abort | DONE (runtime def, dual-OS; compiler emit deferred P6)
 
 # --- Allocator (weak / user-overridable) -----------------------------------
 # The codegen funnel is in place (P8): every heap site routes through
@@ -78,5 +87,13 @@ __cryo_panic_no_match     | (loc: SourceLoc) -> never                        | p
 # arena / allocator::alloc / malloc) instead of an open-coded copy each. The
 # `__cryo_alloc`/`__cryo_dealloc` SYMBOLS land in Phase 3, when the funnel is
 # pointed at a weak, user-overridable definition.
-__cryo_alloc    | (size: u64, align: u64) -> void*          | alloc | PENDING (P2/P3; funnel done P8)
-__cryo_dealloc  | (ptr: void*, size: u64, align: u64) -> void | alloc | PENDING (P2/P3; funnel done P8)
+__cryo_alloc    | (size: u64, align: u64) -> void*          | alloc | DONE (runtime def, weak, dual-OS; compiler funnel repoint deferred)
+__cryo_dealloc  | (ptr: void*, size: u64, align: u64) -> void | alloc | DONE (runtime def, weak, dual-OS; compiler funnel repoint deferred)
+
+# --- Backtrace / diagnostics -----------------------------------------------
+# Print one hex return address per stack frame to stderr. Raw addresses only;
+# symbolization (address -> name via ELF/DWARF) is a follow-up. Linux walks the
+# rbp chain (frame_address(0) + saved-rbp links, terminated by _start's zeroed
+# rbp); Windows uses ntdll RtlCaptureStackBackTrace (Win64 unwinding is
+# table-based, not frame-pointer based).
+__cryo_backtrace | () -> void                                | backtrace | DONE (runtime def, dual-OS; raw addrs, symbolization TODO)

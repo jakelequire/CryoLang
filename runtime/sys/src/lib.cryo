@@ -1,0 +1,176 @@
+///! runtime/sys — shared freestanding primitives for the runtime tiers.
+///!
+///! Not a standalone archive: this is shared SOURCE, made importable to every
+///! `[[lib]]` tier via `[project] source_paths = ["sys/src"]` in the workspace
+///! cryoconfig. A tier `import CryoRt::Sys;` and calls `Sys::write_cstr(...)`
+///! etc. — the helper is written once here instead of re-inlined per tier.
+///!
+///! Every function is `![weak]`: because the source is compiled into each tier
+///! that imports it, a program linking several tiers would otherwise see
+///! duplicate definitions of e.g. `Sys::write_cstr`. Weak linkage lets the
+///! linker keep one copy (the definitions are identical). This keeps each tier
+///! archive self-contained (no cross-archive undefined symbols) while the final
+///! link deduplicates.
+///!
+///! Freestanding: no libc, no stdlib. OS-specific primitives (`rt_write_bytes`,
+///! `rt_exit`) are gated `![config(linux)]` / `![config(windows)]`; the
+///! formatting helpers above them are OS-agnostic.
+
+namespace CryoRt::Sys;
+
+// --- Linux OS primitives ----------------------------------------------------
+
+/// Best-effort raw write to stderr (fd 2). Operands are register-pinned so the
+/// syscall's rax/rcx/r11 clobbers cannot corrupt buf/len before they are read.
+![weak] ![config(no_runtime)] ![config(linux)]
+function rt_write_bytes(buf: i64, len: u64) -> void {
+    const nr: i64 = 1;   // write
+    const fd: i64 = 2;   // stderr
+    mut ret: i64 = 0;
+    ![arch(x86_64, intel)]
+    ![clobber(rcx, r11, memory)]
+    asm {
+        mov rax, ${nr:"rax"}
+        mov rdi, ${fd:"rdi"}
+        mov rsi, ${buf:"rsi"}
+        mov rdx, ${len:"rdx"}
+        syscall
+        mov ${=ret:"rax"}, rax
+    }
+}
+
+/// Terminate the process with `code` via `exit_group` (syscall 231). Never
+/// returns; there is no libc, so no atexit/stdio flush runs.
+![weak] ![config(no_runtime)] ![config(linux)]
+function rt_exit(code: i32) -> never {
+    ![arch(x86_64, att)]
+    ![clobber(rcx, r11, memory)]
+    asm {
+        movl ${code}, %edi
+        movl $231, %eax
+        syscall
+    }
+    while (true) {}
+}
+
+// --- Windows OS primitives --------------------------------------------------
+
+/// kernel32 std-handle + file write for stderr output; ntdll process exit.
+![config(windows)]
+extern "C" {
+    function GetStdHandle(nStdHandle: i32) -> i64;
+    function WriteFile(handle: i64, buffer: i64, nbytes: i32,
+                       written: i32*, overlapped: i64) -> i32;
+    function NtTerminateProcess(process: i64, status: i32) -> i32;
+}
+
+![weak] ![config(no_runtime)] ![config(windows)]
+function rt_write_bytes(buf: i64, len: u64) -> void {
+    const STD_ERROR_HANDLE: i32 = -12;
+    mut written: i32 = 0;
+    const h: i64 = GetStdHandle(STD_ERROR_HANDLE);
+    WriteFile(h, buf, len as i32, &written, 0);
+}
+
+![weak] ![config(no_runtime)] ![config(windows)]
+function rt_exit(code: i32) -> never {
+    NtTerminateProcess(-1, code);
+    while (true) {}
+}
+
+// --- OS-agnostic formatting -------------------------------------------------
+
+/// Length of a NUL-terminated `string` (i8*), excluding the terminator.
+![weak]
+function cstr_len(s: string) -> u64 {
+    mut n: u64 = 0;
+    while (s[n] != 0) { n = n + 1; }
+    return n;
+}
+
+/// Write a NUL-terminated `string` (excluding the terminator).
+![weak]
+function write_cstr(s: string) -> void {
+    rt_write_bytes(s as i64, cstr_len(s));
+}
+
+/// Write `v` as decimal ASCII (least-significant-first into a stack buffer,
+/// then the filled suffix in one write).
+![weak]
+function write_u32(v: u32) -> void {
+    mut buf: u8[10];
+    if (v == 0) {
+        buf[0] = 48;
+        rt_write_bytes(&buf[0] as i64, 1);
+        return;
+    }
+    mut n: u32 = v;
+    mut i: i32 = 10;
+    while (n > 0) {
+        i = i - 1;
+        buf[i] = (48 + (n % 10)) as u8;
+        n = n / 10;
+    }
+    rt_write_bytes(&buf[i] as i64, (10 - i) as u64);
+}
+
+/// One hex nibble as ASCII.
+![weak]
+function hex_digit(d: u64) -> u8 {
+    if (d < 10) { return (48 + d) as u8; }       // '0'..'9'
+    return (97 + (d - 10)) as u8;                // 'a'..'f'
+}
+
+/// Write `v` as `0x` + 16 lowercase hex digits (fixed width, leading zeros).
+![weak]
+function write_hex(v: u64) -> void {
+    mut buf: u8[18];
+    buf[0] = 48;    // '0'
+    buf[1] = 120;   // 'x'
+    mut n: u64 = v;
+    mut i: i32 = 17;
+    mut k: i32 = 0;
+    while (k < 16) {
+        buf[i] = hex_digit(n & 15);
+        n = n >> 4;
+        i = i - 1;
+        k = k + 1;
+    }
+    rt_write_bytes(&buf[0] as i64, 18);
+}
+
+/// Append a NUL-terminated `string`'s bytes (excluding the terminator) to
+/// `buf` at `*pos`, advancing `*pos`.
+![weak]
+function append_cstr(buf: u8*, pos: u64*, s: string) -> void {
+    mut i: u64 = 0;
+    while (s[i] != 0) {
+        buf[*pos] = s[i] as u8;
+        *pos = *pos + 1;
+        i = i + 1;
+    }
+}
+
+/// Append `v` as decimal ASCII to `buf` at `*pos`, advancing `*pos`.
+![weak]
+function append_u64(buf: u8*, pos: u64*, v: u64) -> void {
+    if (v == 0) {
+        buf[*pos] = 48;   // '0'
+        *pos = *pos + 1;
+        return;
+    }
+    mut tmp: u8[20];
+    mut n: u64 = v;
+    mut k: i32 = 0;
+    while (n > 0) {
+        tmp[k] = (48 + (n % 10)) as u8;
+        n = n / 10;
+        k = k + 1;
+    }
+    mut j: i32 = k - 1;
+    while (j >= 0) {
+        buf[*pos] = tmp[j];
+        *pos = *pos + 1;
+        j = j - 1;
+    }
+}
