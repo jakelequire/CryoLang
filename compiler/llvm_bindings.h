@@ -202,6 +202,8 @@ void           LLVMDumpValue(LLVMValueRef Val);
 char          *LLVMPrintValueToString(LLVMValueRef Val);
 void           LLVMSetLinkage(LLVMValueRef Global, int Linkage);
 int            LLVMGetLinkage(LLVMValueRef Global);
+/* Object-file section placement (drives `![section("name")]`). */
+void           LLVMSetSection(LLVMValueRef Global, const char *Section);
 
 /* COMDAT - required for linkonce_odr / weak_odr to dedupe on COFF.
  * On ELF the linker auto-dedupes by section group; COFF requires an

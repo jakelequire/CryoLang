@@ -193,6 +193,9 @@ type struct AbiClassifier {
     /// Cached `LLVMGetEnumAttributeKindForName("noinline", 8)`.
     /// Drives `![noinline]`.  0 => unset.
     noinline_kind: u32;
+    /// Cached `LLVMGetEnumAttributeKindForName("naked", 5)`.
+    /// Drives `![naked]` (no prologue/epilogue).  0 => unset.
+    naked_kind:  u32;
 
     /// Stage 1 of two-phase init.  Produces an AbiClassifier with a
     /// null back-pointer; the parent calls `wire()` once it is at its
@@ -207,6 +210,7 @@ type struct AbiClassifier {
             byval_kind:    0,
             inline_kind:   0,
             noinline_kind: 0,
+            naked_kind:    0,
         };
     }
 
@@ -224,6 +228,7 @@ type struct AbiClassifier {
             byval_kind:    0,
             inline_kind:   0,
             noinline_kind: 0,
+            naked_kind:    0,
         };
     }
 
@@ -1029,6 +1034,13 @@ type struct AbiClassifier {
         return this.noinline_kind;
     }
 
+    naked_attr_kind(mut &this) -> u32 {
+        if (this.naked_kind == 0) {
+            this.naked_kind = llvm::LLVMGetEnumAttributeKindForName("naked", 5);
+        }
+        return this.naked_kind;
+    }
+
     /// Apply an `sret(%T)` type attribute to LLVM parameter slot 0 of a
     /// function declaration.  LLVM's attribute-index convention is
     /// 1-based, so "param 0" is index 1.
@@ -1097,6 +1109,18 @@ type struct AbiClassifier {
         if (!fn_val.is_valid()) { return; }
         const ctx: LContext = LContext::current();
         const kind: u32 = this.noinline_attr_kind();
+        const attr: void* = llvm::LLVMCreateEnumAttribute(ctx.raw, kind, 0 as u64);
+        llvm::LLVMAddAttributeAtIndex(fn_val.raw, 0xFFFFFFFF as u32, attr);
+    }
+
+    /// Apply the `naked` function attribute, the LLVM realization of
+    /// `![naked]`: the backend emits no prologue or epilogue, so the body
+    /// (a single `asm { }` block) runs with the stack exactly as the caller
+    /// left it.  Enum attribute at the function index, like `alwaysinline`.
+    apply_naked_attribute(mut &this, fn_val: LValue) -> void {
+        if (!fn_val.is_valid()) { return; }
+        const ctx: LContext = LContext::current();
+        const kind: u32 = this.naked_attr_kind();
         const attr: void* = llvm::LLVMCreateEnumAttribute(ctx.raw, kind, 0 as u64);
         llvm::LLVMAddAttributeAtIndex(fn_val.raw, 0xFFFFFFFF as u32, attr);
     }

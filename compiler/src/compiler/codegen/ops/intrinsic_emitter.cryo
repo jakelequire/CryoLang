@@ -138,6 +138,36 @@ type struct IntrinsicEmitter {
         return this.llvm_module.add_function(name, fn_ty);
     }
 
+    /// `declare void @name()` - zero-arg void intrinsics (llvm.trap /
+    /// llvm.debugtrap).
+    get_or_decl_void_noarg(mut &this, name: string) -> LValue {
+        mut fn: LValue = this.llvm_module.get_named_function(name);
+        if (fn.is_valid()) { return fn; }
+        const fn_ty: LType = LType::function_type(LType::void_type(), null, 0, false);
+        return this.llvm_module.add_function(name, fn_ty);
+    }
+
+    /// `declare ptr @name(i32)` - llvm.frameaddress.p0 / llvm.returnaddress.
+    /// Emits the call; `level` (a0) is the constant frame index.
+    emit_addr_intrinsic(mut &this, name: string, level: LValue) -> LValue {
+        const ptr_ty: LType = LType::pointer_to(LType::i8());
+        mut fn: LValue = this.llvm_module.get_named_function(name);
+        if (!fn.is_valid()) {
+            const dbuf: void* = intrinsics::malloc(8);
+            const dslots: void** = dbuf as void**;
+            dslots[0] = LType::i32().raw;
+            const decl_ty: LType = LType::function_type(ptr_ty, dbuf, 1, false);
+            intrinsics::free(dbuf);
+            fn = this.llvm_module.add_function(name, decl_ty);
+        }
+        const cbuf: void* = intrinsics::malloc(8);
+        const cslots: void** = cbuf as void**;
+        cslots[0] = LType::i32().raw;
+        const call_ty: LType = LType::function_type(ptr_ty, cbuf, 1, false);
+        intrinsics::free(cbuf);
+        return this.call1(fn, call_ty, level, "addr");
+    }
+
     // `declare i1 @llvm.is.fpclass.f64(double, i32)`.  The i32 test mask is
     // an immarg at the call site; the declared parameter type is plain i32.
     get_or_decl_fpclass(mut &this, name: string, val_ty: LType, mask_ty: LType) -> LValue {
@@ -428,6 +458,10 @@ type struct IntrinsicEmitter {
             IntrinsicKind::Vfprintf => { 3 }
             // fpclass(value: f64, test: i32): value + constant test mask.
             IntrinsicKind::FpClass      => { 2 }
+            // trap()/debugtrap(): zero args.  frame_address/return_address
+            // take one (constant) level arg and fall through to the default.
+            IntrinsicKind::Trap         => { 0 }
+            IntrinsicKind::DebugTrap    => { 0 }
             // copysign64(magnitude, sign); fma64(x, y, z).  The remaining
             // cheap-math intrinsics are unary and use the default below.
             IntrinsicKind::Copysign64   => { 2 }
@@ -444,8 +478,9 @@ type struct IntrinsicEmitter {
         // primitives.cryo.  No-op for the pointer-arg intrinsic
         // (PtrDiff) since src_type returns null for it.
         const src_ty: LType = kind.src_type();
-        mut a0: LValue = args[0];
-        if (src_ty.is_valid()) {
+        // Guard args[0]: zero-arg intrinsics (trap/debugtrap) have no args[0].
+        mut a0: LValue = if (args.length >= 1) { args[0] } else { LValue::null() };
+        if (src_ty.is_valid() && a0.is_valid()) {
             a0 = this.auto_deref_to(a0, src_ty);
         }
         // Second argument (rotate count) is i32; auto-deref if pointer.
@@ -563,6 +598,39 @@ type struct IntrinsicEmitter {
             //    x's IEEE-754 class is selected by the constant `test`
             //    bitmask.  Exception-free, unlike the old `(x-x)==0` trick. --
             IntrinsicKind::FpClass => { this.emit_fpclass(a0, a1) }
+
+            // -- trap(): `call void @llvm.trap()` then `unreachable`.  llvm.trap
+            //    lowers to `ud2` (SIGILL) with no libc dependency - the
+            //    divergent sink for a `no_runtime` check failure.  Declared
+            //    `-> never`, but the dispatcher's early return bypasses the
+            //    post-call divergent-name check (see Panic), so the
+            //    `unreachable` is emitted here. --
+            IntrinsicKind::Trap => {
+                const fn: LValue = this.get_or_decl_void_noarg("llvm.trap");
+                if (fn.is_valid()) {
+                    const fty: LType = LType::function_type(LType::void_type(), null, 0, false);
+                    this.builder.build_call(fty, fn, null, 0, "");
+                }
+                this.builder.build_unreachable();
+                LValue::null()
+            }
+
+            // -- debugtrap(): `call void @llvm.debugtrap()`.  A breakpoint that
+            //    RETURNS, so no trailing `unreachable`. --
+            IntrinsicKind::DebugTrap => {
+                const fn: LValue = this.get_or_decl_void_noarg("llvm.debugtrap");
+                if (fn.is_valid()) {
+                    const fty: LType = LType::function_type(LType::void_type(), null, 0, false);
+                    this.builder.build_call(fty, fn, null, 0, "");
+                }
+                LValue::null()
+            }
+
+            // -- frame_address(n) / return_address(n): `ptr @llvm.frameaddress.p0(i32)`
+            //    / `ptr @llvm.returnaddress(i32)`.  `n` (a0) must be a constant
+            //    (LLVM immarg); n=0 is the current frame.  For the backtrace. --
+            IntrinsicKind::FrameAddress  => { this.emit_addr_intrinsic("llvm.frameaddress.p0", a0) }
+            IntrinsicKind::ReturnAddress => { this.emit_addr_intrinsic("llvm.returnaddress", a0) }
 
             // -- Cheap IEEE-754 math: each lowers to the matching LLVM float
             //    intrinsic.  a0 is auto-deref'd via src_type above; the extra
