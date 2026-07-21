@@ -26,8 +26,7 @@ interface InactiveRegionsParams {
 }
 
 // One decoration type for the extension's lifetime. `opacity` fades the text
-// (matching the ~0.55 the C/C++ extension uses); a real dim, not a color, so
-// it reads correctly under any theme.
+// (0.6 - a real dim, not a color, so it reads correctly under any theme).
 let decorationType: vscode.TextEditorDecorationType | undefined;
 
 // Last-known inactive ranges per document URI, so an editor that becomes
@@ -38,7 +37,7 @@ const regionsByUri = new Map<string, vscode.Range[]>();
 function ensureDecoration(): vscode.TextEditorDecorationType {
     if (!decorationType) {
         decorationType = vscode.window.createTextEditorDecorationType({
-            opacity: '0.55',
+            opacity: '0.7',
             rangeBehavior: vscode.DecorationRangeBehavior.ClosedClosed,
         });
     }
