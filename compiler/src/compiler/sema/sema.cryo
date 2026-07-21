@@ -29,7 +29,7 @@ import Compiler::Diag::{
 };
 import Compiler::DeclIndex;
 import Compiler::AST;
-import Compiler::AST::{ Node, Expression, Statement, Declaration, Pattern, Visitor, NodeLocator };
+import Compiler::AST::{ Node, Expression, Statement, Declaration, Pattern, Visitor, NodeLocator, Cloner };
 import Compiler::Passes::PassID;
 import Compiler::CompilationContext;
 import Compiler::Lex;
@@ -2251,7 +2251,16 @@ public:
                     for (mut fi: i64 = 0; fi < lit.field_inits.length; fi++) {
                         if (lit.field_inits[fi].field_name.id == decl_name.id) { covered = true; break; }
                     }
-                    if (!covered) { missing_names.push(decl_name); }
+                    if (covered) { continue; }
+                    // An omitted field carrying a `= default` is filled in: clone the
+                    // default, resolve + type-check it, and append it as a synthetic
+                    // field-init so codegen materializes it.  Only an omitted field
+                    // WITHOUT a default is a missing-field error (E0355).
+                    if (fields_ptr[k].has_default()) {
+                        this.fill_field_default(lit, &fields_ptr[k], decl_name);
+                    } else {
+                        missing_names.push(decl_name);
+                    }
                 }
                 if (missing_names.length > 0) {
                     mut names_str: string = "";
@@ -2272,6 +2281,40 @@ public:
             }
         }
         return lit_type;
+    }
+
+    /// Materialize a struct field's `= default` at a construction site that omits
+    /// it: clone the default (each construction evaluates its own copy), resolve
+    /// and type-check it against the field type (E0200 on mismatch), then append
+    /// it to the literal as a synthetic field-init so codegen fills the field.
+    /// The default is a standalone expression - it never sees the other fields.
+    fill_field_default(mut &this, lit: StructLiteralNode*, field: FieldInfo*,
+                       name: SymbolStr) -> void {
+        if (field.default_value == null) { return; }
+        mut cloner: ASTCloner = ASTCloner();
+        const cloned: ExpressionNode* = cloner.clone_expr(field.default_value);
+        if (cloned == null) { return; }
+        const field_type: TypeRef = field.field_type;
+        const saved: TypeRef = this.state.expected_type;
+        if (field_type.is_valid()) { this.state.expected_type = field_type; }
+        else { this.state.expected_type = TypeRef::invalid(); }
+        const value_type: TypeRef = this.resolve_expr(cloned);
+        this.state.expected_type = saved;
+        if (field_type.is_valid() && value_type.is_valid()) {
+            const skip: boolean = this.types.contains_generic_param(value_type)
+                || this.types.contains_generic_param(field_type);
+            if (!skip && !this.checker.can_assign(value_type, field_type)) {
+                const nm: string = this.intern.resolve(name);
+                this.diag.emit_type_mismatch_with_value(
+                    ErrorCode::E0200_TYPE_MISMATCH, cloned.span, field_type, value_type,
+                    format("field `%s` default expects this type", nm), SourceSpan::none(), cloned);
+            }
+        }
+        lit.add_field_init(FieldInit {
+            field_name: name,
+            value:      cloned,
+            span:       lit.span,
+        });
     }
 
     resolve_scope_resolution(mut &this, scope: ScopeResolutionNode*) -> TypeRef {

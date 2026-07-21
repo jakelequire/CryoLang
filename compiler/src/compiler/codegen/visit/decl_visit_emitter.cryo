@@ -160,6 +160,18 @@ type struct DeclVisitEmitter {
 
     /// Generate a function body: prologue, block walk, epilogue, validate.
     generate_function_body(mut &this, visitor: ASTVisitor*, node: FunctionDeclNode*) -> void {
+        // `![naked]`: no prologue/epilogue.  Open the entry block, emit the
+        // body (a single `asm { }` block - the directive validator guaranteed
+        // this shape), then cap with `unreachable`: inline asm is not a
+        // terminator, and the asm itself performs the real control transfer
+        // (`ret`, a tail `jmp`, or a syscall that never returns).
+        if (node.is_naked) {
+            const nfn: LValue = this.cg.decl.codegen_naked_prologue(node);
+            if (!nfn.is_valid()) { return; }
+            this.dispatch.generate_block(visitor, node.body);
+            this.cg.builder.build_unreachable();
+            return;
+        }
         const fn_val: LValue = this.cg.decl.codegen_function_prologue(node);
         if (!fn_val.is_valid()) {
             cdebug("[IRGen]     func prologue failed\n"); fflush(null);

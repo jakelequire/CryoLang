@@ -493,7 +493,6 @@ CryoLang/
 +-- stdlib/               The standard library, written in Cryo
 +-- tools/
 |   +-- CryoLSP           Language Server (Cryo source); builds via `make lsp`
-|   +-- CryoFormat        Formatter (experimental; not built by default)
 |   +-- CryoAnalyzer      Semantic analyser
 +-- legacy/
 |   +-- bootstrap/        Retired C++23 bootstrap; kept for historical reference only

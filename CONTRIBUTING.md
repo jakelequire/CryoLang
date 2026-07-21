@@ -11,7 +11,6 @@ expect ongoing development on top of a stable surface.
 | `stdlib/` | Standard library (written in Cryo). **Active.** |
 | `tools/CryoLSP/` | Language Server Protocol implementation. Built via `make lsp`. **Active.** |
 | `tools/CryoAnalyzer/` | VS Code extension front-end for `cryolsp`. Built and installed via `make install-lsp`. **Active.** |
-| `tools/CryoFormat/` | Exploratory formatter; not built by default. |
 | `legacy/bootstrap/` | Retired C++23 bootstrap, kept in the tree for historical reference only. **Do not modify.** It will not build against the current language. |
 
 ## Building
@@ -93,6 +92,5 @@ A few conventions worth knowing:
 - `process::Command` is POSIX-first (`fork` + `execve`); a partial Windows
   (`CreateProcessA`) path exists with known gaps (`Stdio::Null` / `Fd` fall back
   to inherit, env/cwd not fully applied).
-- `tools/CryoFormat` is exploratory and not built by default. The shipped
-  tooling is `tools/CryoLSP` (the LSP server, `make lsp`) and
+- The shipped tooling is `tools/CryoLSP` (the LSP server, `make lsp`) and
   `tools/CryoAnalyzer` (the VS Code extension, `make install-lsp`).

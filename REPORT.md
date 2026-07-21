@@ -544,7 +544,7 @@ hazard classes above.
 - [ ] **Non-ASCII position desync** — utf-8 negotiated when offered, but the
   UTF-16 fallback treats byte offsets as UTF-16 units
   (`server/line_index.cryo:9-13`, documented TODO).
-- [ ] **CryoFormat is a dead-end prototype** (Rust, parses ~10% of the
+- [x] **CryoFormat is a dead-end prototype** (Rust, parses ~10% of the
   language, deletes comments by construction — `parser.rs:78-79`; AST-reprint
   architecture wrong for a formatter). Decide: kill it or rebuild
   token/trivia-preserving in Cryo. Shipping 1.0 with no `cryo fmt` is a

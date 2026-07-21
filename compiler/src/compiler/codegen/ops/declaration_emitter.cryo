@@ -344,6 +344,38 @@ type struct DeclarationEmitter {
         if (comdat != null) { llvm::LLVMSetComdat(fn_val.raw, comdat); }
     }
 
+    /// Apply the `![weak]` / `![naked]` / `![section("...")]` directive effects
+    /// to a just-declared function/method DEFINITION.  Shared by
+    /// declare_function and declare_method so all definition paths stay
+    /// consistent.  `fn_name` is the emitted LLVM symbol (used to key the weak
+    /// COMDAT).  Caller gates on the presence of a body: these only apply to
+    /// definitions, never bodyless externs.
+    apply_directive_effects(mut &this, fn_val: LValue, node: FunctionDeclNode*,
+                            fn_name: string) -> void {
+        if (node == null || !fn_val.is_valid()) { return; }
+        // `![weak]`: weak definition (WeakAny) so a strong definition in
+        // another object overrides it - the user-overridable runtime symbols
+        // (global allocator, panic handler).  Attach an any-selection COMDAT
+        // for the same COFF reason apply_spec_linkage does: without it,
+        // mingw-ld leaves a bare weak definition's weak-external alias
+        // unresolved on the Windows cross-link.
+        if (node.is_weak) {
+            fn_val.set_linkage(LLinkage::WeakAny);
+            const comdat: void* = llvm::LLVMGetOrInsertComdat(
+                this.llvm_module.raw, fn_name);
+            if (comdat != null) { llvm::LLVMSetComdat(fn_val.raw, comdat); }
+        }
+        // `![naked]`: the LLVM `naked` attribute; prologue/epilogue emission is
+        // separately skipped in the body pass (see codegen_function_prologue).
+        if (node.is_naked) {
+            this.abi.apply_naked_attribute(fn_val);
+        }
+        // `![section("name")]`: object-file section placement for the symbol.
+        if (node.link_section.length() > 0) {
+            llvm::LLVMSetSection(fn_val.raw, node.link_section);
+        }
+    }
+
     declare_function(mut &this, node: FunctionDeclNode*) -> void {
         // Skip generic templates.
         if (node.generic_params.length > 0) {
@@ -403,6 +435,14 @@ type struct DeclarationEmitter {
             if (this.ctx.mode.skip_user_main()) {
                 return;
             }
+        }
+        // `![no_mangle]` / `![symbol("...")]`: emit under the requested symbol
+        // instead of the mangled name.  `declare_method` (:966) and
+        // `declare_extern_block` (:1375) already honor this; `declare_function`
+        // historically did not, so the directive silently no-opped on free
+        // function definitions.  `main` keeps its C-runtime-mandated name above.
+        if (!is_program_main && node.has_link_name) {
+            fn_name = node.link_name;
         }
 
         // Build the LLVM function type via the ABI seam.  Phase 1 + 2:
@@ -522,10 +562,26 @@ type struct DeclarationEmitter {
             if (this.ctx.emit_debug_info) {
                 this.abi.apply_frame_pointer_attribute(fn_val);
             }
+            // `![weak]` / `![naked]` / `![section]` linkage-and-placement.
+            this.apply_directive_effects(fn_val, node, fn_name);
         }
 
         // Register under qualified name (module scope).
         this.functions.register(qualified, fn_val);
+        // `![no_mangle]` / `![symbol("...")]`: call sites resolve a free
+        // function through its Cryo mangled symbol
+        // (`resolve_function_by_mangled` on `node.resolved_callee`).  With a
+        // link-name override the LLVM definition is named `link_name`, not the
+        // mangled symbol, so also register this fn_val under the mangled key -
+        // mirroring `declare_method`, whose registration under the mangled key
+        // is what makes `![symbol]` "invisible to callers" (see
+        // symbol_resolver.cryo:249).  Without it the by-mangled lookup misses
+        // and synthesizes a phantom extern under the now-nonexistent mangled
+        // name, producing an undefined-reference link error.  Gated on
+        // has_link_name so normal functions are byte-unchanged.
+        if (node.has_link_name) {
+            this.functions.register(mangled_sym, fn_val);
+        }
     }
 
     /// Declare all methods in an impl block.
@@ -1266,6 +1322,8 @@ type struct DeclarationEmitter {
             if (this.ctx.emit_debug_info) {
                 this.abi.apply_frame_pointer_attribute(fn_val);
             }
+            // `![weak]` / `![section]` on a method (naked is function-only).
+            this.apply_directive_effects(fn_val, func, fn_name);
         }
 
         // Register under the combined key built above.  Also register against the
@@ -1624,6 +1682,30 @@ type struct DeclarationEmitter {
         const loc: void* = llvm::LLVMDIBuilderCreateDebugLocation(
             LContext::current().raw, line, col, sp, null);
         llvm::LLVMSetCurrentDebugLocation2(this.builder.raw, loc);
+    }
+
+    /// Minimal prologue for a `![naked]` function: resolve the declared LLVM
+    /// function (registered by declare_function under its qualified name) and
+    /// open its entry block.  Deliberately emits NO parameter allocas, NO
+    /// arg-setup prologue, and pushes NO value scope - a naked body is a single
+    /// `asm { }` block that runs on the caller's frame and cannot name its
+    /// parameters.  Returns null (with a diagnostic) when no declaration
+    /// exists.  The caller caps the entry block with `unreachable` after
+    /// emitting the asm (inline asm is not a terminator; the asm performs the
+    /// real control transfer).
+    codegen_naked_prologue(mut &this, node: FunctionDeclNode*) -> LValue {
+        const qualified: SymbolStr = this.fn_qualified_name(node);
+        const fn_val: LValue = this.functions.get(qualified);
+        if (!fn_val.is_valid()) {
+            const fname: string = this.resolve(node.name);
+            this.diag.emit_warning_at_span(ErrorCode::E0606_FUNCTION_GENERATION_ERROR,
+                format("codegen: naked function '%s' has no LLVM declaration in this module; body skipped.", fname),
+                node.span);
+            return LValue::null();
+        }
+        const entry_bb: LBasicBlock = LBasicBlock::append(fn_val, "entry");
+        this.builder.position_at_end(entry_bb);
+        return fn_val;
     }
 
     codegen_function_prologue(mut &this, node: FunctionDeclNode*) -> LValue {

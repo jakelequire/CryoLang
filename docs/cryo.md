@@ -1220,23 +1220,22 @@ Visibility may also be declared per-field with a leading `private` / `public`. W
 
 > Field visibility (a `private` *field* -> type-scoped, `E0353`) is a different axis from a top-level type being `private` (module-scoped, `E0503` - see [section 14.4](#144-visibility)). A `public` struct may have `private` fields, and a `private` struct's fields are public to the rest of its own module.
 
-Fields may declare **default values** with `= <expr>`.
-
-> **Status: reserved - see [section 21](#21-reserved-syntax).** The default-value
-> syntax parses, but defaults are **not yet applied** at construction: a
-> struct literal must still supply every field, and omitting a field that
-> has a default is an error (`E0355`). The syntax below is accepted by the
-> parser today purely so the eventual feature is forward-compatible.
+Fields may declare **default values** with `= <expr>`. When a struct literal
+omits a field that has a default, the default is used; a field with no default
+must still be supplied, and omitting one is `E0355`. A default is a standalone
+expression - it cannot reference the other fields - and is evaluated afresh at
+each construction that omits the field.
 
 ```cryo
 type struct Config {
-    debug:   boolean = false;   // default parsed, but NOT yet applied
+    debug:   boolean = false;
     verbose: boolean = false;
+    retries: i32     = 3;
 }
 
-// Today this is an error (E0355: missing fields `debug`, `verbose`);
-// when defaults are implemented it will construct Config { false, false }.
-const c: Config = Config {};
+const c: Config = Config {};              // -> { false, false, 3 }
+const d: Config = Config { retries: 5 };  // -> { false, false, 5 } (supplied value wins)
+// Omitting a field that has NO default is still `E0355`.
 ```
 
 ### 8.3 Methods
@@ -2876,7 +2875,6 @@ The lexer and grammar reserve the following forms because the language plans to 
 | Optional chaining `?.`                        | Token reserved; not consumed by the parser.                                                                                                                                                       |
 | Spread `...` in calls / literals              | The token exists for variadic parameter declarations only.                                                                                                                                        |
 | Pure-virtual class method (e.g. `= 0` syntax) | Not implemented. Use a `virtual` method without a body to declare an interface point.                                                                                                             |
-| Struct field defaults (`field: T = expr`)     | The `= expr` default syntax parses, but defaults are not applied at construction: every field must be supplied in a literal, and omitting one is `E0355`. See [section 8.2](#82-fields-and-visibility). |
 | Macros                                        | No macro system exists, and `macro` is **not** currently a reserved word (it lexes as an ordinary identifier). A future hygienic macro system may introduce one.                                  |
 | `![pure]`                                     | Reserved. Will assert the function has no observable side effects (enabling aggressive folding). Parsed as an unknown directive today (warning + no semantics).                                   |
 | `![const]`                                    | Reserved. Will mark a function as evaluable at compile time.                                                                                                                                      |
