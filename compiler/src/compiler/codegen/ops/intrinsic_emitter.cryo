@@ -36,20 +36,27 @@ type struct IntrinsicEmitter {
     /// forwarding form for the active target (SysV-amd64 vs Win64).
     /// Null between `null()` and `wire()`.
     abi:         AbiClassifier*;
+    /// `[compiler] no_runtime`: in a freestanding build there is no `@panic`
+    /// runtime (it prints via libc and `abort()`s), so `emit_panic_call`
+    /// routes divergent check failures through `llvm.trap` (`ud2`, no libc)
+    /// instead.  Wired from `ctx.project_no_runtime`.
+    no_runtime:  boolean;
 
     static null() -> IntrinsicEmitter {
         return IntrinsicEmitter {
             llvm_module: null,
             builder:     null,
             abi:         null,
+            no_runtime:  false,
         };
     }
 
     wire(mut &this, llvm_module: LModule*, builder: LBuilder*,
-         abi: AbiClassifier*) -> void {
+         abi: AbiClassifier*, no_runtime: boolean) -> void {
         this.llvm_module = llvm_module;
         this.builder     = builder;
         this.abi         = abi;
+        this.no_runtime  = no_runtime;
     }
 
 
@@ -750,6 +757,18 @@ type struct IntrinsicEmitter {
     /// Emit `call @panic(msg, file, line); unreachable`.  Ensures the
     /// `@panic` runtime function is declared in the current module first.
     emit_panic_call(mut &this, msg: LValue, file: LValue, line: LValue) -> LValue {
+        // Freestanding: no libc-backed `@panic` runtime.  A check failure
+        // diverges through `llvm.trap` (`ud2`/SIGILL) instead.  The message
+        // is discarded - there is nothing to print to.
+        if (this.no_runtime) {
+            const trap_fn: LValue = this.get_or_decl_void_noarg("llvm.trap");
+            if (trap_fn.is_valid()) {
+                const trap_fty: LType = LType::function_type(LType::void_type(), null, 0, false);
+                this.builder.build_call(trap_fty, trap_fn, null, 0, "");
+            }
+            this.builder.build_unreachable();
+            return LValue::null();
+        }
         this.emit_panic_runtime();
         const panic_fn: LValue = this.llvm_module.get_named_function("panic");
         if (!panic_fn.is_valid()) { return LValue::null(); }

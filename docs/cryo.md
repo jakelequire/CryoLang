@@ -2983,11 +2983,31 @@ Code-generation knobs.
 
 ```ini
 [compiler]
-debug     = false                   # verbose compiler logging
-optimize  = "O2"                    # O0 | O1 | O2 | O3 (default O2)
-emit_llvm = false                   # also write LLVM IR (.ll) beside the object
-no_std    = false                   # build without linking the standard library
+debug      = false                  # verbose compiler logging
+optimize   = "O2"                   # O0 | O1 | O2 | O3 (default O2)
+emit_llvm  = false                  # also write LLVM IR (.ll) beside the object
+no_std     = false                  # build without linking the standard library
+no_runtime = false                  # freestanding: no crt0 / libc / panic runtime
 ```
+
+**`no_std` vs `no_runtime`.** These are orthogonal knobs, each also settable
+per-build with `--no-std` / `--no-runtime` (the flag can force the option *on*,
+never off):
+
+| `no_std` | `no_runtime` | Result                                                                              |
+| -------- | ------------ | ----------------------------------------------------------------------------------- |
+| `false`  | `false`      | Default hosted build: prelude + stdlib linked, crt0 + libc, the `@panic` runtime.   |
+| `true`   | `false`      | No prelude/stdlib, but still hosted: crt0, libc, and the `@panic` runtime remain.   |
+| `false`  | `true`       | Freestanding link (no crt0/libc/`libcryo.a`) but the stdlib source is still in scope — rarely useful. |
+| `true`   | `true`       | Fully freestanding: no stdlib, no crt0/libc, `main` is not widened, and check failures diverge through `llvm.trap` instead of the libc-backed `@panic`. This is how a `runtime/core` tier is built. |
+
+`no_runtime = true` normally implies `no_std = true`: a freestanding link drops
+`libcryo.a`, so any stdlib symbol the program references would fail to resolve.
+A freestanding program supplies its own entry point (an `![naked] _start`);
+without one the linker warns that `_start` is missing.
+
+`![config(no_runtime)]` / `![config(not(no_runtime))]` gate a declaration on the
+freestanding build flag, exactly like the OS atoms (`![config(linux)]`, …).
 
 **Build profiles.** A build runs under a named *profile* that supplies a
 default optimization level and debug-info setting and names the per-profile

@@ -132,6 +132,13 @@ type struct CompilerConfig {
     /// force a freestanding build on, never off); for single-file builds
     /// it is the only way to opt out of the auto-imported stdlib.
     no_std:              boolean;
+    /// `--no-runtime`: freestanding build - suppress the implicit `main`
+    /// widening / prologue and the `@panic` runtime, route check failures to
+    /// `llvm.trap`, and link with `-nostartfiles -nostdlib -static`.  OR'd
+    /// with the cryoconfig `no_runtime` key for project builds (can force on,
+    /// never off).  How `runtime/core` is built.  Implies nothing about the
+    /// stdlib - pair with `--no-std` for a fully freestanding build.
+    no_runtime:          boolean;
     /// `--locked`: verify the `cryoconfig.lock` vendor section instead of
     /// updating it - the build FAILS if a resolved vendor binding's content
     /// hash drifts from the lock (or has no lock entry).  The reproducibility
@@ -163,6 +170,7 @@ type struct CompilerConfig {
             incremental:         true,
             release_static:      false,
             no_std:              false,
+            no_runtime:          false,
             locked:              false,
             codegen_threads_override: -1,
         };
@@ -186,6 +194,7 @@ type struct CompilerConfig {
             incremental:         true,
             release_static:      false,
             no_std:              false,
+            no_runtime:          false,
             locked:              false,
             codegen_threads_override: -1,
         };
@@ -429,6 +438,7 @@ type struct CompilerInstance {
         config.entry_point  = source.basename();
         config.project_name = source.stem();
         config.no_std       = this.config.no_std;
+        config.no_runtime   = this.config.no_runtime;
         config.emit_llvm    = this.config.emit_llvm;
         // Artifacts land NEXT TO THE SOURCE FILE, not in the invoking
         // directory: output_dir is consumed as-is by the build-layout
@@ -516,6 +526,7 @@ type struct CompilerInstance {
         config.entry_point  = source.basename();
         config.project_name = source.stem();
         config.no_std       = this.config.no_std;
+        config.no_runtime   = this.config.no_runtime;
         if (this.config.target_triple_override.length() > 0) {
             config.target_triple = this.config.target_triple_override;
         }
@@ -726,6 +737,10 @@ type struct CompilerInstance {
         if (this.config.no_std) {
             config.no_std = true;
         }
+        // Same one-directional force for `--no-runtime`.
+        if (this.config.no_runtime) {
+            config.no_runtime = true;
+        }
 
         // Mirror cryoconfig `debug = true` into the global compiler debug
         // gate so the [Tag] trace printfs fire.  Only flips it ON; CLI
@@ -829,8 +844,9 @@ type struct CompilerInstance {
     compile_project_with_config(&this, config: ProjectConfig) -> CompilationResult {
         const root_path: string = config.discovery_root_path();
 
-        cdebug("[Compiler] Project: %s (target: %s, root: %s, no_std: %d)\n",
-            config.project_name, config.target_type.label(), root_path, config.no_std as int);
+        cdebug("[Compiler] Project: %s (target: %s, root: %s, no_std: %d, no_runtime: %d)\n",
+            config.project_name, config.target_type.label(), root_path,
+            config.no_std as int, config.no_runtime as int);
 
         if (!metadata::exists(Path::from(root_path))) {
             // Route to stderr: stdout in LSP mode owns the JSON-RPC stream;
@@ -994,6 +1010,7 @@ type struct CompilerInstance {
         ctx.emit_debug_info = ProjectConfig::profile_base_debug_info(config.profile)
             || this.config.emit_debug_info;
         ctx.project_no_std = config.no_std;
+        ctx.project_no_runtime = config.no_runtime;
         ctx.target_triple = config.target_triple;
         // Distribution-only static link (see CompilerConfig.release_static).
         // Consumed at link time; has no effect on emitted IR.
