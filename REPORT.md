@@ -202,7 +202,7 @@ string-keyed monomorphization era).
   install. The bash installer stages + atomically swaps (`install.sh:243-247`);
   mirror that.
 
-- [ ] **Bindgen flat namespace drops colliding symbols** — C++ overloads and
+- [x] **Bindgen flat namespace drops colliding symbols** — C++ overloads and
   cross-namespace leaf-name collisions keep only the first symbol
   (`bindgen/generator.cryo:119-144`). Reported but not disambiguated; rename
   instead.
