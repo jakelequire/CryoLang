@@ -121,12 +121,12 @@ string-keyed monomorphization era).
 - [x] **Parallel emit failures discard the LLVM error string**
   `codegen/passes.cryo:1917`.
 
-- [ ] **`static match` arm pruning compares raw `TypeRef.id`**
+- [x] **`static match` arm pruning compares raw `TypeRef.id`**
   `mono/ast_resolver.cryo:445-452` — while the codebase elsewhere documents
   that TypeID identity ≠ logical identity across the mono boundary
   (`mono/call_specializer.cryo:1630-1632`).
 
-- [ ] **Mono fixpoint gaps**: convergence metric misses method-spec-only
+- [x] **Mono fixpoint gaps**: convergence metric misses method-spec-only
   progress; spec bodies walked once, not to fixpoint
   (`call_specializer.cryo:1303-1307`). Dead `in_progress` cycle detection can
   never fire (`monomorphizer.cryo:80, 266-271`).
@@ -143,7 +143,7 @@ string-keyed monomorphization era).
 - [x] **Loop-resident dynamic allocas at ~10 spill sites** — unbounded stack
   growth in hot loops.
 
-- [ ] **DirectPair expansion triggered by an arity-mismatch heuristic**
+- [x] **DirectPair expansion triggered by an arity-mismatch heuristic**
   `ops/expr_ops.cryo:653-664`, whose reduced inline coercion loop differs
   from the main path.
 
@@ -504,7 +504,7 @@ hazard classes above.
 - [ ] Collections variety: no sorted map/BTree, no Deque, no `binary_search`,
   iterator adapters missing `min/max/sum/rev/skip`; `from_iter` free-fn only
   (documented mono-divergence reason, `collections/array.cryo:562-569`).
-- [ ] No `io::Seek` trait (File has inherent seek methods) and no in-memory
+- [x] No `io::Seek` trait (File has inherent seek methods) and no in-memory
   Cursor; no URL parser (http client takes SocketAddr + path only); no
   calendar/date formatting; no `env::vars()` enumeration; no Weak refs
   (Rc/Arc leak cycles — documented); no mutex poisoning (documented);

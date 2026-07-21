@@ -1,8 +1,9 @@
 # Compile-fail tests
 
-Each `.cryo` file here is a **negative test**: a complete program that the
-compiler must *reject*. They are driven natively by `cryo test` - no scripts,
-no separate command.
+Each `.cryo` file here is a **negative test**: a complete program on which the
+compiler must emit a specific diagnostic - either an **error** that rejects the
+program (an `E`-code) or a **warning** it must raise (a `W`-code). They are
+driven natively by `cryo test` - no scripts, no separate command.
 
 ```cryo
 ![config(testing)]
@@ -21,22 +22,26 @@ function main() -> int {
 `cryo test` **skips this directory** when building the shared test binary
 (these files are intentionally malformed, so one would otherwise break the
 whole build). It then runs the compiler on each file on its own
-(`cryo check <file>`) and asserts the build fails with the declared code.
-Results appear in the normal `cryo test` output under `compile-fail result:`.
+(`cryo check <file>`) and asserts the compiler emits the declared code -
+`error[<CODE>]` for an `E`-code (which also fails the build), or
+`warning[<CODE>]` for a `W`-code (which does not fail the build; the assertion
+is on the emitted diagnostic, not the exit status). Results appear in the normal
+`cryo test` output under `compile-fail result:`.
 
 ## The directive
 
 ```
-![config(negative, <CODE>)]    // the file must fail with error[<CODE>]
+![config(negative, <CODE>)]    // output must contain error[<CODE>] / warning[<CODE>]
 ```
 
-A case **fails the suite** (honestly, as a red test) if the file compiles
-cleanly or emits a different code. `make test` is a required gate, so every
-file in this directory must fail with its declared code *today*. A diagnostic
-the compiler *should* emit but doesn't yet is tracked as an issue/TODO - it
-cannot live here as a permanently red test.
+A case **fails the suite** (honestly, as a red test) if the declared code is
+absent from the output - whether because nothing was emitted or a different code
+was. `make test` is a required gate, so every file in this directory must emit
+its declared code *today*. A diagnostic the compiler *should* emit but doesn't
+yet is tracked as an issue/TODO - it cannot live here as a permanently red test.
 
 Keep `![config(testing)]` too (every test file carries it). Use collision-proof
 names (`cf_`-prefixed) so a snippet can't accidentally shadow stdlib symbols.
 
-Name each file after the error code it asserts (e.g. `E0214_free_function.cryo`).
+Name each file after the code it asserts (e.g. `E0214_free_function.cryo`,
+`W0001_unused_variable.cryo`).

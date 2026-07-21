@@ -357,7 +357,8 @@ type struct SpecializationPasses {
         const root: ProgramNode* = ctx.artifacts.ast.root;
         if (root != null) {
             loop {
-                const before: i64 = mono_ptr.spec_count();
+                const before_specs: i64 = mono_ptr.spec_count();
+                const before_methods: i64 = mono_ptr.spec_owner_module_count();
                 mono_ptr.specialize_calls_in_module(root);
                 // Drain the pending worklist for any new instantiations queued
                 // by the walk.  We deliberately don't re-enter `process_all`
@@ -366,7 +367,19 @@ type struct SpecializationPasses {
                 // GenericParam at depth) and re-run post-pass marking.
                 const post_success: boolean = mono_ptr.drain_pending_worklist();
                 if (success) { success = post_success; }
-                if (mono_ptr.spec_count() == before) { break; }
+                // Fixpoint on BOTH progress metrics.  A pass whose only progress
+                // is materializing a generic-METHOD spec (pinning a static
+                // generic-owner call whose owner instantiation drained on the
+                // previous pass, or an adapter-chain receiver) grows
+                // `spec_owner_module_count` but leaves `spec_count` unchanged;
+                // breaking on `spec_count` alone stops before the call that
+                // method spec unblocks gets re-walked.  Both metrics are
+                // monotonic and bounded - each spec is recorded exactly once,
+                // behind the `method_spec_seen` guard - so this terminates.
+                if (mono_ptr.spec_count() == before_specs
+                        && mono_ptr.spec_owner_module_count() == before_methods) {
+                    break;
+                }
             }
         }
 
