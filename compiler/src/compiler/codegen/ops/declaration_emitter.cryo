@@ -460,7 +460,12 @@ type struct DeclarationEmitter {
         // builds `fn_type` open-coded (main can't have aggregate
         // parameters in source, so byval never applies there).
         mut plan_param_plans: ParamPlan[] = [];
-        if (is_program_main && param_count == 0) {
+        // Under `no_runtime` there is no C runtime calling `main`, so we do
+        // NOT widen its signature to argc/argv/envp (nor emit the
+        // set_args/set_env prologue below): a freestanding entry is a
+        // separate `![naked] _start`, and `main` - if present - keeps its
+        // declared signature.
+        if (is_program_main && param_count == 0 && !this.ctx.project_no_runtime) {
             // The C ABI entry point is
             // `int main(int argc, char** argv, char** envp)`.  The C
             // runtime always passes all three, and the stdlib reads argv
@@ -1878,8 +1883,12 @@ type struct DeclarationEmitter {
         // no parameters, so we read the synthetic params via LLVMGetParam
         // and forward them through the regular function-resolution path.
         // `intern` is already bound at the top of this function.
+        // Suppressed under `no_runtime`: main's signature was NOT widened
+        // (no argc/argv/envp), so there are no synthetic params to publish,
+        // and `std::env` is not linked in a freestanding build.
         const main_sym: SymbolStr = intern.intern("main");
-        if (node.name.equals(main_sym) && CodegenUtil::fixed_param_count(node) == 0) {
+        if (node.name.equals(main_sym) && CodegenUtil::fixed_param_count(node) == 0
+            && !this.ctx.project_no_runtime) {
             this.emit_set_args_call(fn_val);
             this.emit_set_env_call(fn_val);
         }

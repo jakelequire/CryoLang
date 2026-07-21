@@ -332,10 +332,19 @@ type struct CodegenPasses {
         // qualified name like every other cross-module runtime call; invalid
         // under `--no-std` (no stdlib linked), where the runtime keeps its libc
         // `vasprintf` buffer unchanged.
-        const gha_fn: LValue = cg.resolver.resolve_function(
-            cg.intern_str("std::alloc::allocator::alloc"));
-        cg.intrinsics.emit_format_runtime(gha_fn);
-        cg.intrinsics.emit_panic_runtime();
+        // Suppressed under `no_runtime`: both helpers reference libc (the
+        // `format` runtime forwards to `vasprintf`; `panic` prints via
+        // `printf`/`fflush` and `abort()`s), which a `-nostdlib` freestanding
+        // link cannot resolve.  A `no_runtime` build must not reference libc,
+        // so neither helper is emitted; `panic()` check-failures instead
+        // diverge through `llvm.trap` (see `emit_panic_call`), and the
+        // freestanding runtime tier provides its own formatting.
+        if (!ctx.project_no_runtime) {
+            const gha_fn: LValue = cg.resolver.resolve_function(
+                cg.intern_str("std::alloc::allocator::alloc"));
+            cg.intrinsics.emit_format_runtime(gha_fn);
+            cg.intrinsics.emit_panic_runtime();
+        }
 
         // Create the visitor and generate IR.  Heap-allocate via Box::leak
         // so sub-emitters can hold stable `state: VisitorState*` back-pointers
@@ -1069,6 +1078,14 @@ type struct CodegenPasses {
 
         mut cmd: string = format("%s -o %s @\"%s\"",
             link_cfg.driver, CodegenPasses::link_quote(exe_path), link_rsp_path);
+        // `no_runtime`: freestanding link.  `-nostartfiles` drops crt0 (the
+        // runtime provides its own `_start`), `-nostdlib` drops the default
+        // libc/libm and the compiler runtime, and `-static` removes the
+        // dynamic-loader dependency.  The stdlib archive and
+        // `extra_system_libs` are also suppressed below.
+        if (cfg.no_runtime) {
+            cmd = format("%s -nostartfiles -nostdlib -static", cmd);
+        }
         // Project-configured linking ([link] in cryoconfig).  -L and -l are
         // single-token args with the value glued to the flag, so the
         // quoting goes around the value only.  `search` -> -L (extra dirs for
@@ -1143,7 +1160,7 @@ type struct CodegenPasses {
         // and the per-target stdlib .o files are already in the link
         // line (cryo re-compiles every reachable std module when
         // target != host).
-        if (link_cfg.use_stdlib_archive && !cfg.no_std
+        if (link_cfg.use_stdlib_archive && !cfg.no_std && !cfg.no_runtime
                 && ctx.stdlib_root.length() > 0) {
             const stdlib_archive: string = format("%s/.bin/libcryo.a",
                 ctx.stdlib_root);
@@ -1153,8 +1170,12 @@ type struct CodegenPasses {
         // intrinsic (i32_to_i64, ptr_diff, format, bswap*, clz*, fpclass,
         // atomic_fence, dirent_*) is emitted directly into LLVM IR by
         // IntrinsicsCodegen.  No C runtime to link beyond what the
-        // active target's system library line provides.
-        cmd = format("%s %s", cmd, link_cfg.extra_system_libs);
+        // active target's system library line provides.  Under `no_runtime`
+        // there is no libc/libm to pull in (they were dropped by
+        // `-nostdlib` above), so the system-lib line is suppressed.
+        if (!cfg.no_runtime) {
+            cmd = format("%s %s", cmd, link_cfg.extra_system_libs);
+        }
 
         // `--release-static`: statically link libc (`-static`) and the C++
         // runtime (`-static-libstdc++ -static-libgcc`) so the produced binary
@@ -1283,17 +1304,25 @@ type struct CodegenPasses {
 
         mut cmd: string = format("%s -o %s @\"%s\"",
             link_cfg.driver, CodegenPasses::link_quote(exe_path), link_rsp_path);
+        // `no_runtime`: freestanding link (see run_linking).  In raw mode
+        // `ctx.project_no_runtime` carries the flag.
+        if (ctx.project_no_runtime) {
+            cmd = format("%s -nostartfiles -nostdlib -static", cmd);
+        }
         // Stdlib archive: same lookup as the project link path, and same
         // host-vs-cross gating.  Empty stdlib_root means single-file mode
         // never resolved one (e.g. user passed `--no-std` semantically by
         // stripping prelude resolution); skip the archive in that case
         // and let the linker error if the program needs stdlib symbols.
-        if (link_cfg.use_stdlib_archive && ctx.stdlib_root.length() > 0) {
+        if (link_cfg.use_stdlib_archive && !ctx.project_no_runtime
+                && ctx.stdlib_root.length() > 0) {
             const stdlib_archive: string = format("%s/.bin/libcryo.a",
                 ctx.stdlib_root);
             cmd = format("%s %s", cmd, CodegenPasses::link_quote(stdlib_archive));
         }
-        cmd = format("%s %s", cmd, link_cfg.extra_system_libs);
+        if (!ctx.project_no_runtime) {
+            cmd = format("%s %s", cmd, link_cfg.extra_system_libs);
+        }
 
         if (ctx.debug_mode) {
             cdebug("[Codegen] Single-file link -> %s\n", exe_path);
