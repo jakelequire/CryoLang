@@ -1,0 +1,119 @@
+///! Freestanding program entry.
+///!
+///! A `no_runtime` link passes `-nostartfiles`, so no crt0 supplies the entry.
+///! This module owns it. `main` is an external C-ABI symbol resolved from the
+///! user object at link time; under `no_runtime` the user's `main` keeps its
+///! declared zero-arg signature (not widened to argc/argv/envp) and emits under
+///! the unmangled symbol `main`, which this extern references — the same on
+///! every target.
+///!
+///! The x86-64 ISA is shared by AMD and Intel CPUs, so one x86-64 codepath
+///! covers both vendors; the split that matters is OS ABI. `_start` and the
+///! process exit are per-OS (gated `![config(linux)]` / `![config(windows)]`);
+///! `__cryo_start` — run `main`, exit with its return — is shared.
+///!
+///!   - Linux: the kernel enters `_start` with `%rsp` at argc; fully
+///!     freestanding — no libc, no imports; exit is the `exit_group` syscall.
+///!   - Windows: PE startup passes no stack args and has no stable raw-syscall
+///!     ABI. The entry links ntdll (its sole dependency) and exits via
+///!     `NtTerminateProcess`; argument capture (PEB / command line) is deferred.
+///!
+///! `![config(no_runtime)]` drops the whole entry in a hosted build (crt0 owns
+///! the entry there).
+
+namespace CryoRt::Core::Entry;
+
+/// The user program's C-ABI entry, resolved by the linker from the user object.
+extern "C" {
+    function main() -> i32;
+}
+
+// --- Linux ------------------------------------------------------------------
+
+/// ELF entry. Naked: no prologue/epilogue, so `%rsp` still points at the
+/// initial process stack when the body runs — argc at `(%rsp)`, argv at
+/// `8(%rsp)`, staged into rdi/rsi for the forthcoming argument capture. Clears
+/// `%rbp` to terminate stack-trace unwinding at the entry, realigns `%rsp` to
+/// 16 for the SysV call boundary, then tail-calls into Cryo.
+![naked] ![no_mangle] ![config(no_runtime)] ![config(linux)]
+function _start() {
+    ![arch(x86_64, att)]
+    asm {
+        xorq %rbp, %rbp
+        movq (%rsp), %rdi
+        leaq 8(%rsp), %rsi
+        andq $-16, %rsp
+        call __cryo_start
+    }
+}
+
+/// Freestanding process exit: `exit_group(code)` (syscall 231) issued straight
+/// to the kernel. There is no libc here, so no atexit handlers and no stdio
+/// flush run — a caller that buffered output must flush it before diverging.
+![config(no_runtime)] ![config(linux)]
+function rt_exit(code: i32) -> never {
+    ![arch(x86_64, att)]
+    ![clobber(rcx, r11, memory)]
+    asm {
+        movl ${code}, %edi
+        movl $231, %eax
+        syscall
+    }
+    // The syscall never returns; this satisfies the `never` result for the
+    // paths codegen cannot see through the asm block.
+    while (true) {}
+}
+
+// --- Windows ----------------------------------------------------------------
+
+/// ntdll: terminate the process with an exit status. Called with the
+/// current-process pseudo-handle `(HANDLE)-1`, for which it does not return.
+/// The handle is pointer-sized; an `i64` argument lands in rcx identically to a
+/// pointer and sidesteps an int-to-pointer cast. `NTSTATUS` is a 32-bit LONG.
+![config(windows)]
+extern "C" {
+    function NtTerminateProcess(process: i64, status: i32) -> i32;
+}
+
+/// PE entry. Naked: the Windows loader passes no stack arguments, so the body
+/// only establishes a valid call frame — clears `%rbp`, aligns `%rsp` to 16,
+/// and reserves the 32-byte register home ("shadow") space every Win64 callee
+/// requires — before tail-calling into Cryo.
+![naked] ![no_mangle] ![config(no_runtime)] ![config(windows)]
+function _start() {
+    ![arch(x86_64, att)]
+    asm {
+        xorq %rbp, %rbp
+        andq $-16, %rsp
+        subq $32, %rsp
+        call __cryo_start
+    }
+}
+
+/// Freestanding process exit via ntdll. `NtTerminateProcess((HANDLE)-1, code)`
+/// terminates the current process with `code` as its exit status and does not
+/// return.
+![config(no_runtime)] ![config(windows)]
+function rt_exit(code: i32) -> never {
+    NtTerminateProcess(-1, code);
+    while (true) {}
+}
+
+/// The mingw backend emits `call __main` in `main`'s prologue to run C global
+/// constructors. A freestanding build has no CRT to supply it; this empty
+/// definition satisfies that call. When the runtime gains constructor support
+/// (an `.init_array` / `global_ctors` emitter), the registered constructors
+/// run from here.
+![no_mangle] ![config(no_runtime)] ![config(windows)]
+function __main() {
+}
+
+// --- Shared -----------------------------------------------------------------
+
+/// Startup trampoline: run the user `main` and exit with its return value.
+/// Diverges — the process is gone before it could return. Argument capture is
+/// deferred, so this takes no parameters on either target.
+![no_mangle] ![config(no_runtime)]
+function __cryo_start() -> never {
+    rt_exit(main());
+}

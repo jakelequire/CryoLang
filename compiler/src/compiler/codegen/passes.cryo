@@ -1080,11 +1080,23 @@ type struct CodegenPasses {
             link_cfg.driver, CodegenPasses::link_quote(exe_path), link_rsp_path);
         // `no_runtime`: freestanding link.  `-nostartfiles` drops crt0 (the
         // runtime provides its own `_start`), `-nostdlib` drops the default
-        // libc/libm and the compiler runtime, and `-static` removes the
-        // dynamic-loader dependency.  The stdlib archive and
-        // `extra_system_libs` are also suppressed below.
+        // libc/libm and the compiler runtime.  The stdlib archive and
+        // `extra_system_libs` are also suppressed below.  The tail differs by
+        // OS ABI:
+        //   - Linux (and other ELF): `-static` removes the dynamic-loader
+        //     dependency; the result imports nothing.
+        //   - Windows: there is no stable raw-syscall ABI, so the entry reaches
+        //     the kernel through ntdll (`NtTerminateProcess`, and later the PEB
+        //     for arguments).  Link `-lntdll` — the sole dependency — and set
+        //     the PE entry to the runtime's `_start` (the mingw default,
+        //     `mainCRTStartup`, was dropped with crt0).  Not `-static`: ntdll
+        //     is always a DLL, reached through its import library.
         if (cfg.no_runtime) {
-            cmd = format("%s -nostartfiles -nostdlib -static", cmd);
+            if (effective_triple.contains("windows")) {
+                cmd = format("%s -nostartfiles -nostdlib -Wl,-e,_start -lntdll", cmd);
+            } else {
+                cmd = format("%s -nostartfiles -nostdlib -static", cmd);
+            }
         }
         // Project-configured linking ([link] in cryoconfig).  -L and -l are
         // single-token args with the value glued to the flag, so the
