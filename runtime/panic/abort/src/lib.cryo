@@ -1,0 +1,155 @@
+///! runtime/panic/abort — the abort panic strategy.
+///!
+///! Defines the panic funnel `__cryo_panic` (see `../../abi/lang_items.def`):
+///! write "panicked at <file>:<line>: <msg>" to stderr, then terminate. This
+///! tier is the abort strategy; a `panic/unwind` tier would define the same
+///! symbol to unwind instead, chosen at link time — callers never change.
+///!
+///! Freestanding: no libc, no stdlib. Output and process exit go straight to
+///! the OS. The x86-64 ISA is shared by AMD and Intel, so one x86-64 codepath
+///! covers both vendors; the split that matters is OS ABI, so the two OS
+///! primitives (`rt_write_bytes`, `rt_abort`) are gated
+///! `![config(linux)]` / `![config(windows)]` and config gating strips the
+///! inactive copy before name resolution. Everything above them —
+///! `__cryo_panic` and its formatting helpers — is OS-agnostic.
+///!
+///!   - Linux: `write(2, ...)` and `exit_group` issued as raw syscalls.
+///!   - Windows: `WriteFile` to the std-error handle (kernel32) and
+///!     `NtTerminateProcess` (ntdll), the entry's two dependencies.
+///!
+///! Message and file are the primitive `string` (thin, NUL-terminated i8*),
+///! matching the current `@panic` operand ABI — no fat pointer, no allocation.
+
+namespace CryoRt::Panic::Abort;
+
+// --- Linux OS primitives ----------------------------------------------------
+
+/// Best-effort raw write to stderr (fd 2). Operands are register-pinned so the
+/// allocator does not place `buf`/`len` in a register the body overwrites
+/// before it is read; the syscall clobbers rax/rcx/r11, and pinning rax as the
+/// (ignored) output covers rax's clobber. The return is discarded — panic
+/// output is best-effort.
+![config(no_runtime)] ![config(linux)]
+function rt_write_bytes(buf: i64, len: u64) -> void {
+    const nr: i64 = 1;   // write
+    const fd: i64 = 2;   // stderr
+    mut ret: i64 = 0;
+    ![arch(x86_64, intel)]
+    ![clobber(rcx, r11, memory)]
+    asm {
+        mov rax, ${nr:"rax"}
+        mov rdi, ${fd:"rdi"}
+        mov rsi, ${buf:"rsi"}
+        mov rdx, ${len:"rdx"}
+        syscall
+        mov ${=ret:"rax"}, rax
+    }
+}
+
+/// Terminate the process with `code` via `exit_group` (syscall 231). Never
+/// returns, so it may write edi/eax without declaring them clobbered — no
+/// later code observes the registers. There is no libc here, so no atexit and
+/// no stdio flush run; `__cryo_panic` writes its message before calling this.
+![config(no_runtime)] ![config(linux)]
+function rt_abort(code: i32) -> never {
+    ![arch(x86_64, att)]
+    ![clobber(rcx, r11, memory)]
+    asm {
+        movl ${code}, %edi
+        movl $231, %eax
+        syscall
+    }
+    // The syscall never returns; satisfies `never` for the path codegen cannot
+    // see through the asm block.
+    while (true) {}
+}
+
+// --- Windows OS primitives --------------------------------------------------
+
+/// kernel32: the std-handle fetch and file write used for stderr output.
+/// `nStdHandle` is a DWORD; `STD_ERROR_HANDLE` is -12 (0xFFFFFFF4). Handles are
+/// pointer-sized, carried as `i64`. `WriteFile`'s byte counts are DWORDs; the
+/// `written` out-param is required (a null pointer is rejected on some paths),
+/// so a stack `i32` is passed by address.
+![config(windows)]
+extern "C" {
+    function GetStdHandle(nStdHandle: i32) -> i64;
+    function WriteFile(handle: i64, buffer: i64, nbytes: i32,
+                       written: i32*, overlapped: i64) -> i32;
+}
+
+/// ntdll: terminate the current process. Called with the current-process
+/// pseudo-handle `(HANDLE)-1`, for which it does not return.
+![config(windows)]
+extern "C" {
+    function NtTerminateProcess(process: i64, status: i32) -> i32;
+}
+
+/// Best-effort write to the process std-error handle. If the handle is invalid
+/// (no console attached) `WriteFile` simply fails; panic output is best-effort.
+![config(no_runtime)] ![config(windows)]
+function rt_write_bytes(buf: i64, len: u64) -> void {
+    const STD_ERROR_HANDLE: i32 = -12;
+    mut written: i32 = 0;
+    const h: i64 = GetStdHandle(STD_ERROR_HANDLE);
+    WriteFile(h, buf, len as i32, &written, 0);
+}
+
+/// Terminate the process with `code`. Does not return.
+![config(no_runtime)] ![config(windows)]
+function rt_abort(code: i32) -> never {
+    NtTerminateProcess(-1, code);
+    while (true) {}
+}
+
+// --- OS-agnostic formatting + the funnel ------------------------------------
+
+/// Length of a NUL-terminated `string` (i8*), excluding the terminator.
+function cstr_len(s: string) -> u64 {
+    mut n: u64 = 0;
+    while (s[n] != 0) {
+        n = n + 1;
+    }
+    return n;
+}
+
+/// Write a NUL-terminated `string`, excluding the terminator.
+function write_cstr(s: string) -> void {
+    rt_write_bytes(s as i64, cstr_len(s));
+}
+
+/// Write a `u32` as decimal ASCII. Digits are produced least-significant first
+/// into the tail of a fixed 10-byte buffer (u32 max is 10 digits), then the
+/// filled suffix is written in one call.
+function write_u32(v: u32) -> void {
+    mut buf: u8[10];
+    if (v == 0) {
+        buf[0] = 48;   // '0'
+        rt_write_bytes(&buf[0] as i64, 1);
+        return;
+    }
+    mut n: u32 = v;
+    mut i: i32 = 10;
+    while (n > 0) {
+        i = i - 1;
+        buf[i] = (48 + (n % 10)) as u8;
+        n = n / 10;
+    }
+    rt_write_bytes(&buf[i] as i64, (10 - i) as u64);
+}
+
+/// The single panic sink. Prints `panicked at <file>:<line>: <msg>` to stderr
+/// and terminates. `core/` (and, later, the compiler-emitted check helpers)
+/// call this by its unmangled symbol; the `![no_mangle]` makes the source name
+/// the emitted symbol. Diverges: the process is gone before it could return.
+![no_mangle] ![config(no_runtime)]
+function __cryo_panic(msg: string, file: string, line: u32) -> never {
+    write_cstr("panicked at ");
+    write_cstr(file);
+    write_cstr(":");
+    write_u32(line);
+    write_cstr(": ");
+    write_cstr(msg);
+    write_cstr("\n");
+    rt_abort(101);
+}

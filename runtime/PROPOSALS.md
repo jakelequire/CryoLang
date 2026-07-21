@@ -138,6 +138,14 @@
 <a id="p7"></a>
 ### P7 — One runtime-library `__cryo_panic` symbol (replace per-module in-IR emission)
 
+- **Runtime side DONE (2026-07-21).** `panic/abort/` (its own `cryoconfig`, archive
+  `libcryort-panic-abort.a`) *defines* `__cryo_panic(msg, file, line)` freestanding and
+  dual-OS: Linux `write(2)`+`exit_group` syscalls, Windows kernel32 `WriteFile` + ntdll
+  `NtTerminateProcess`; register-pinned asm; zero undefined symbols (no libc). Prints
+  `panicked at <file>:<line>: <msg>` and exits 101. Verified both OSes
+  (`verify-freestanding.sh`, wine for Windows). **The compiler codegen swap below is
+  deferred** — per the repo owner, build the runtime out first, keep the compiler on its
+  libc `@panic`, integrate once the runtime is complete.
 - **Status:** PARTIAL (`NOTES` §1.2, §6). `@panic` is re-emitted `linkonce_odr` into *every*
   module (`emit_panic_runtime`, `intrinsic_emitter.cryo:1103`; body = printf+fflush+abort),
   collapsed by the linker — not linked from a runtime object.
@@ -344,6 +352,10 @@
   needed); a `thread_panicking` TLS flag.
 - **Alternative recorded:** setjmp/longjmp + a runtime cleanup-list is cheaper but worse
   (per-frame overhead on the happy path, and it hard-requires `![naked]` [P11]).
+- **Scope note (stackless, `NOTES` §D.8):** the coroutine model is stackless, so a panic
+  inside an `async fn` unwinds the *native* frame of the `poll()` caller — there is **no
+  coroutine stack to walk**. This unwinder therefore stays ordinary native-stack DWARF
+  unwinding; the stackless decision does not enlarge its scope.
 - **Escalate:** HANDOFF §10 — the drop findings show unwinding needs drop-emission rework;
   the owner should scope this deliberately.
 

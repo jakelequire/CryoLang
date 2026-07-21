@@ -521,11 +521,20 @@ audit surfaces more. They should be resolved (with the repo owner where flagged)
    `lang_items.def`; never spell it literally elsewhere.
 
 4. **Tiering as archive-per-tier, not path-deps (§1.6-A3).** Runtime tiers follow the
-   **stdlib archive model** (`core` built ahead with its own `cryoconfig
-   no_runtime=true` → `libcryort-core.a`, driver orders the tier archives on the link
-   line), because in-repo path-deps are source-harvested into one unified build and would
-   not honor a per-tier `no_runtime`. Recommend one archive per tier so link errors point
-   at a tier (matches HANDOFF §7 recommendation).
+   **stdlib archive model** (each tier built into its own `libcryort-<name>.a`), because
+   in-repo path-deps are source-harvested into one unified build and would not honor a
+   per-tier config. One archive per tier keeps the selectable/overridable boundaries
+   (panic strategy, weak allocator) and points link errors at a tier.
+   **Implemented as a `[[lib]]` workspace (2026-07-21):** one `runtime/cryoconfig`
+   declares each tier as a `[[lib]]` array-of-tables member (`name` + `source_dir`),
+   mirroring `[[bin]]`; one `cryo build` emits every `libcryort-<name>.a` into `.bin/`,
+   members inheriting the project `[compiler]` config. Distinct from the singular `[lib]`
+   (a project that also emits one library). Compiler side: `LibTarget[] libs` in
+   `project_config.cryo` + `make_lib_member_view`/workspace loop in
+   `compile_project_multi` (`instance.cryo`). Each member flows through the normal
+   library-target archive path — no new codegen. The driver still does not auto-order the
+   tier archives onto a user link line (outstanding P9-arc work; the workspace now knows
+   its members, which is what a fix would consume).
 
 5. **`no_runtime` ⇒ `no_std` matrix (HANDOFF §2).** With both flags real and orthogonal,
    document the four-way matrix. Recommended implication: `no_runtime=true` ⇒
@@ -547,3 +556,25 @@ audit surfaces more. They should be resolved (with the repo owner where flagged)
    means `core/` must only *declare* `__cryo_panic` and the check helpers must call it —
    never inline `abort`/`trap` in a way that assumes abort. Keep that discipline from
    Phase 3.
+
+8. **Coroutine model = stackless. LOCKED IN by Jake (2026-07-21).** The concurrency /
+   `async`-`await` model is **stackless** (compiler lowers an `async fn` to a poll-driven
+   state machine, Rust-style), **not** stackful (no per-coroutine stack, no stack-switch
+   trampoline, no green threads). Async itself is **future work — not built now or soon**;
+   the call is locked early because reversing it late is expensive (it reshapes codegen,
+   the unwinder, and TLS). Consequences that constrain *this* runtime project:
+   - **No stackful machinery is designed in.** Threads stay OS threads
+     (`pthread_create`/`CreateThread`, §1.5-Q4); there is no `makecontext`/`swapcontext`,
+     no `![naked]` stack-switch trampoline, no separate coroutine stacks. `![naked]` [P11]
+     stays scoped to `_start`/setjmp, not coroutine switching.
+   - **Unwinding [P12]–[P15] stays ordinary native-stack DWARF unwinding.** A panic inside
+     an `async fn` unwinds the *native* frame of whoever called `poll()` — there is no
+     coroutine stack to walk. So the stackless choice does **not** enlarge the unwinder
+     escalation; it keeps it to the standard landing-pad/personality design already
+     recorded. Record this in [P12]'s scope so it is not re-litigated.
+   - **No impact on the current panic funnel.** `__cryo_panic`'s ABI (§D.1) and the
+     abort/unwind seam (§D.7) are unchanged — stackless async will surface panics through
+     the same funnel via the poll boundary, whenever it is built.
+   - **TLS ([P10]):** stackless async keeps task-local state as ordinary struct fields in
+     the state machine, so it does not add a *new* TLS requirement beyond §1.5's; the
+     `thread_panicking` flag story is unchanged.
