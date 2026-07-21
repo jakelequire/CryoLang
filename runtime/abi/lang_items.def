@@ -51,10 +51,18 @@ __main          | () -> void                                | core (freestanding
 # capture deferred, so it takes no parameters on either target.
 
 # --- Panic funnel ----------------------------------------------------------
-# The single divergent sink. core/ only DECLARES it; panic/abort/ DEFINES it
-# (prints message+location, then aborts). The unwind profile redefines it with
-# no core/ change.
-__cryo_panic              | (msg: string, file: string, line: u32) -> never  | panic/abort | PENDING (P7)
+# The single divergent sink: print "panicked at <file>:<line>: <msg>" to
+# stderr, then terminate (exit code 101). panic/abort/ DEFINES it, freestanding
+# and dual-OS (Linux write(2)+exit_group syscalls; Windows kernel32 WriteFile +
+# ntdll NtTerminateProcess). A future panic/unwind/ tier redefines the same
+# symbol to unwind instead — chosen at link time, no caller change.
+#
+# The compiler is NOT yet routed here: it still emits its own per-module libc
+# `@panic` (printf+fflush+abort) inline, unchanged. Swapping codegen to a
+# `declare __cryo_panic` + link-resolved call is the integration step, deferred
+# until the whole runtime is complete. The core-side `extern` declaration
+# arrives with its first caller (a check helper, P4/P6), not before.
+__cryo_panic              | (msg: string, file: string, line: u32) -> never  | panic/abort | DONE (runtime def, dual-OS; compiler swap deferred)
 
 # --- Check handlers (route raw operands through the funnel) -----------------
 # Each takes RAW operands (not a pre-formatted string) plus a SourceLoc, formats

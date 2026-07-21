@@ -308,6 +308,14 @@ type struct ProjectConfig {
     /// executable per entry; the legacy `[project] target_type = "executable"`
     /// + `entry_point` are ignored in favour of these.
     bins: BinTarget[];
+    /// `[[lib]]` targets - the workspace form.  When non-empty, the project is
+    /// a workspace that builds one independent static-library archive per
+    /// entry (each from its own `source_dir` into `lib<name>.a`), instead of a
+    /// single output.  Distinct from the singular `[lib]` (`this.lib`), which
+    /// derives one archive from a project that also produces a `[[bin]]`/
+    /// executable.  Each member inherits the project-level `[compiler]` config
+    /// (`no_std`/`no_runtime`/optimize/...); the driver builds them in order.
+    libs: LibTarget[];
     /// `[dependencies]` entries.  Path deps point at a local directory;
     /// git deps point at a remote repository fetched into the global
     /// cache and pinned by `cryoconfig.lock`.  See `Dependency`.
@@ -376,6 +384,7 @@ type struct ProjectConfig {
             source_paths: [],
             lib:          LibTarget::empty(),
             bins:         [],
+            libs:         [],
             dependencies: [],
             vendor_pins:  [],
             test_format:  "",
@@ -402,6 +411,7 @@ type struct ProjectConfig {
         mut link_static_windows_c: string[] = [];
         mut source_paths_c:  string[]      = [];
         mut bins_c:          BinTarget[]   = [];
+        mut libs_c:          LibTarget[]   = [];
         mut deps_c:          Dependency[]  = [];
         mut vendor_pins_c:   VendorPin[]   = [];
         for (mut i: i64 = 0; i < this.link_system.length; i++)   { link_system_c.push(this.link_system[i]); }
@@ -415,6 +425,7 @@ type struct ProjectConfig {
         for (mut i: i64 = 0; i < this.link_static_windows.length; i++) { link_static_windows_c.push(this.link_static_windows[i]); }
         for (mut i: i64 = 0; i < this.source_paths.length; i++)  { source_paths_c.push(this.source_paths[i]); }
         for (mut i: i64 = 0; i < this.bins.length; i++)          { bins_c.push(this.bins[i]); }
+        for (mut i: i64 = 0; i < this.libs.length; i++)          { libs_c.push(this.libs[i]); }
         for (mut i: i64 = 0; i < this.dependencies.length; i++)  { deps_c.push(this.dependencies[i]); }
         for (mut i: i64 = 0; i < this.vendor_pins.length; i++)   { vendor_pins_c.push(this.vendor_pins[i]); }
         return ProjectConfig {
@@ -449,6 +460,7 @@ type struct ProjectConfig {
             source_paths:  source_paths_c,
             lib:           this.lib,
             bins:          bins_c,
+            libs:          libs_c,
             dependencies:  deps_c,
             vendor_pins:   vendor_pins_c,
             test_format:   this.test_format,
@@ -461,7 +473,16 @@ type struct ProjectConfig {
     /// `[[bin]]` blocks.  Multi-target projects bypass the legacy
     /// single-target dispatch in `compile_project`.
     is_multi_target(&this) -> boolean {
-        return this.lib.is_present() || this.bins.length > 0;
+        return this.lib.is_present() || this.bins.length > 0
+            || this.libs.length > 0;
+    }
+
+    /// True when the cryoconfig declares one or more `[[lib]]` array members -
+    /// the workspace form, where the project builds several independent
+    /// library archives (each from its own `source_dir`) rather than a single
+    /// output.  Drives the per-member build loop in the driver.
+    is_workspace(&this) -> boolean {
+        return this.libs.length > 0;
     }
 
     /// Whether this project requires an entry point (main function).
@@ -523,6 +544,11 @@ type struct ProjectConfig {
         // current_bin_idx is -1 when not inside a [[bin]] block.
         mut current_section: string = "";
         mut current_bin_idx:  i64    = -1;
+        // Index into config.libs for the current `[[lib]]` block, or -1 when
+        // not inside one (mirrors current_bin_idx).  Distinguishes an array
+        // `[[lib]]` member from the singular `[lib]` section, which share the
+        // section name "lib" but write to different fields.
+        mut current_lib_idx:  i64    = -1;
         // Index into config.vendor_pins for the current `[vendor.<Name>]`
         // section, or -1 when not inside one.  Set when the section header is
         // seen (mirrors current_bin_idx for `[[bin]]`).
@@ -552,14 +578,22 @@ type struct ProjectConfig {
                     && trimmed[t_len - 1] == 93            // ']'
                     && trimmed[t_len - 2] == 93;           // ']]'
                 if (is_array) {
-                    // [[bin]] -> current_section = "bin", push fresh BinTarget.
+                    // [[bin]] -> section "bin", push a fresh BinTarget;
+                    // [[lib]] -> section "lib", push a fresh LibTarget (the
+                    // workspace form, distinct from the singular `[lib]`).
                     current_section = trimmed.substr(2, t_len - 4);
                     current_vendor_idx = -1;
                     if (current_section.eq("bin")) {
                         config.bins.push(BinTarget::empty());
                         current_bin_idx = config.bins.length as i64 - 1;
+                        current_lib_idx = -1;
+                    } else if (current_section.eq("lib")) {
+                        config.libs.push(LibTarget::empty());
+                        current_lib_idx = config.libs.length as i64 - 1;
+                        current_bin_idx = -1;
                     } else {
                         current_bin_idx = -1;
+                        current_lib_idx = -1;
                     }
                 } else {
                     const close: i64 = trimmed.find_char(93 as i8);  // 93 = ']'
@@ -567,6 +601,7 @@ type struct ProjectConfig {
                         current_section = trimmed.substr(1, close - 1);
                     }
                     current_bin_idx = -1;
+                    current_lib_idx = -1;
                     current_vendor_idx = -1;
                     // `[vendor.<Name>]` -> push a fresh pin and track its index,
                     // so the dotted-section keys below land on the right pin.
@@ -695,10 +730,20 @@ type struct ProjectConfig {
                     }
                 }
                 "lib" => {
-                    match (key) {
-                        "name"       => { config.lib.name = val; }
-                        "source_dir" => { config.lib.source_dir = val; }
-                        _ => { ProjectConfig::report_unknown_key("lib", key); }
+                    // current_lib_idx >= 0 => inside a `[[lib]]` array member;
+                    // otherwise the singular `[lib]` section.
+                    if (current_lib_idx >= 0) {
+                        match (key) {
+                            "name"       => { config.libs[current_lib_idx].name = val; }
+                            "source_dir" => { config.libs[current_lib_idx].source_dir = val; }
+                            _ => { ProjectConfig::report_unknown_key("lib", key); }
+                        }
+                    } else {
+                        match (key) {
+                            "name"       => { config.lib.name = val; }
+                            "source_dir" => { config.lib.source_dir = val; }
+                            _ => { ProjectConfig::report_unknown_key("lib", key); }
+                        }
                     }
                 }
                 "bin" => {
