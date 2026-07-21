@@ -8,9 +8,9 @@
 #   panic  — a user `main` calling __cryo_panic, linked against the panic-abort
 #            tier + core, prints "panicked at ..." to stderr and exits 101.
 #
-#   Linux:   ELF, `-nostartfiles -nostdlib -static`, entry `_start`, syscalls.
+#   Linux:   ELF, `-nostartfiles -nostdlib -static -Wl,--gc-sections`, entry `_start`, syscalls.
 #            Run natively.
-#   Windows: PE, `-nostartfiles -nostdlib -Wl,-e,_start`, ntdll (core exit) +
+#   Windows: PE, `-nostartfiles -nostdlib -Wl,-e,_start -Wl,--gc-sections`, ntdll (core exit) +
 #            kernel32 (panic stderr). Run under wine. Skipped when the mingw
 #            toolchain or wine is unavailable.
 #
@@ -51,6 +51,26 @@ build_app() {  # <lib.cryo-body-file> <target-flags...>
     find "$WORK/app" -name '*.o' | head -1
 }
 
+# Build <body>, link freestanding against the panic + core archives, run, and
+# assert exit 101 with the expected substring on stderr. `abort_a`/`core_a` are
+# the caller's locals (bash dynamic scope). Returns 0 on match, 1 on failure.
+linux_expect() {  # <body-file> <label> <expect-substr>
+    local o; o="$(build_app "$1")"
+    "$CRYO_CC" -nostartfiles -nostdlib -static -Wl,--gc-sections "$o" "$abort_a" "$core_a" -o "$WORK/exe"
+    set +e; local m; m="$("$WORK/exe" 2>&1 1>/dev/null)"; local g=$?; set -e
+    if [ "$g" -eq 101 ] && [[ "$m" == *"$3"* ]]; then echo "linux $2 ok: [$m]"; return 0
+    else echo "linux $2 FAIL: exit $g stderr [$m] (want 101 + *$3*)"; return 1; fi
+}
+windows_expect() {  # <body-file> <label> <expect-substr>
+    local mingw="x86_64-w64-mingw32-gcc"; local tgt="x86_64-pc-windows-gnu"
+    local o; o="$(build_app "$1" --target="$tgt" --no-incremental)"
+    "$mingw" -nostartfiles -nostdlib -Wl,-e,_start -Wl,--gc-sections "$o" "$abort_a" "$core_a" \
+        -lkernel32 -lntdll -o "$WORK/app.exe"
+    set +e; local m; m="$(WINEDEBUG=-all wine "$WORK/app.exe" 2>&1 1>/dev/null)"; local g=$?; set -e
+    if [ "$g" -eq 101 ] && [[ "$m" == *"$3"* ]]; then echo "windows $2 ok: [$m] (wine)"; return 0
+    else echo "windows $2 FAIL: exit $g stderr [$m] (want 101 + *$3*)"; return 1; fi
+}
+
 # main returning a value — exercises the core entry's exit-code round-trip.
 cat > "$WORK/ret.cryo" <<'APP'
 namespace RtVerifyApp;
@@ -68,15 +88,109 @@ function main() -> int {
 }
 APP
 
+# Each check handler: construct a SourceLoc (16-byte {string,u32,u32} POD,
+# matching abi/layout.def) and call the handler by its unmangled symbol. The
+# app declares an identical SourceLoc so the by-value ABI matches the tier.
+cat > "$WORK/bounds.cryo" <<'APP'
+namespace RtVerifyApp;
+type struct SourceLoc { file: string; line: u32; col: u32; }
+extern "C" { function __cryo_panic_bounds_check(loc: SourceLoc, index: u64, len: u64) -> never; }
+function main() -> int {
+    const loc: SourceLoc = SourceLoc { file: "verify.cryo", line: 7, col: 3 };
+    __cryo_panic_bounds_check(loc, 5, 3);
+    return 0;
+}
+APP
+cat > "$WORK/divzero.cryo" <<'APP'
+namespace RtVerifyApp;
+type struct SourceLoc { file: string; line: u32; col: u32; }
+extern "C" { function __cryo_panic_div_zero(loc: SourceLoc) -> never; }
+function main() -> int {
+    const loc: SourceLoc = SourceLoc { file: "verify.cryo", line: 7, col: 3 };
+    __cryo_panic_div_zero(loc);
+    return 0;
+}
+APP
+cat > "$WORK/nomatch.cryo" <<'APP'
+namespace RtVerifyApp;
+type struct SourceLoc { file: string; line: u32; col: u32; }
+extern "C" { function __cryo_panic_no_match(loc: SourceLoc) -> never; }
+function main() -> int {
+    const loc: SourceLoc = SourceLoc { file: "verify.cryo", line: 7, col: 3 };
+    __cryo_panic_no_match(loc);
+    return 0;
+}
+APP
+cat > "$WORK/overflow.cryo" <<'APP'
+namespace RtVerifyApp;
+type struct SourceLoc { file: string; line: u32; col: u32; }
+extern "C" { function __cryo_panic_overflow(loc: SourceLoc, op: u32, lhs: u64, rhs: u64) -> never; }
+function main() -> int {
+    const loc: SourceLoc = SourceLoc { file: "verify.cryo", line: 7, col: 3 };
+    __cryo_panic_overflow(loc, 2, 4000000000, 4000000000);
+    return 0;
+}
+APP
+
+# Argument capture: main returns argc, so the process exit code is the argument
+# count (argv[0] included). Exercises __cryo_start's capture into the globals.
+cat > "$WORK/args.cryo" <<'APP'
+namespace RtVerifyApp;
+extern "C" { function __cryo_argc() -> i64; }
+function main() -> int { return __cryo_argc() as int; }
+APP
+
+# Backtrace: a 3-deep call chain into __cryo_backtrace. Built at -O0 (--dev) so
+# the chain is not inlined away and the frames are actually present to walk.
+cat > "$WORK/bt.cryo" <<'APP'
+namespace RtVerifyApp;
+extern "C" { function __cryo_backtrace() -> void; }
+function bt_level1() -> void { __cryo_backtrace(); }
+function bt_level2() -> void { bt_level1(); }
+function bt_level3() -> void { bt_level2(); }
+function main() -> int { bt_level3(); return 0; }
+APP
+
+# Allocator exercise: alloc, verify alignment, write+read a byte pattern, free,
+# then alloc/free again to prove the allocator survives a round-trip. Returns 0
+# on success; a distinct nonzero code per failure mode for diagnosis.
+cat > "$WORK/alloc.cryo" <<'APP'
+namespace RtVerifyApp;
+extern "C" {
+    function __cryo_alloc(size: u64, align: u64) -> u8*;
+    function __cryo_dealloc(ptr: u8*, size: u64, align: u64) -> void;
+}
+function main() -> int {
+    const n: u64 = 4096;
+    const p: u8* = __cryo_alloc(n, 64);
+    if (p == null) { return 1; }
+    if ((p as u64) % 64 != 0) { return 2; }
+    for (mut i: u64 = 0; i < n; i++) { p[i] = (i % 251) as u8; }
+    for (mut i: u64 = 0; i < n; i++) { if (p[i] != (i % 251) as u8) { return 3; } }
+    __cryo_dealloc(p, n, 64);
+    const q: u8* = __cryo_alloc(64, 8);
+    if (q == null) { return 4; }
+    if ((q as u64) % 8 != 0) { return 5; }
+    q[0] = 42;
+    q[63] = 99;
+    if (q[0] != 42 || q[63] != 99) { return 6; }
+    __cryo_dealloc(q, 64, 8);
+    return 0;
+}
+APP
+
 # --- Linux -----------------------------------------------------------------
 run_linux() {
     ( cd "$RT_DIR" && rm -rf .bin && "$CRYO" build >/dev/null )
     local core_a="$RT_DIR/.bin/libcryort-core.a"
     local abort_a="$RT_DIR/.bin/libcryort-panic-abort.a"
+    local alloc_a="$RT_DIR/.bin/libcryort-alloc.a"
+    local bt_a="$RT_DIR/.bin/libcryort-backtrace.a"
 
-    # The panic tier must reference no libc — fully freestanding.
-    local undef; undef="$(nm -u "$abort_a" 2>/dev/null | sed -n 's/.* U //p' | sort -u | tr '\n' ' ' || true)"
-    [ -z "${undef// }" ] || { echo "linux FAIL: panic tier has undefined syms: $undef"; return 1; }
+    # No-libc guarantee: every link below is `-nostdlib` (+ freestanding), so a
+    # stray libc dependency would fail to resolve at link time. The link
+    # succeeding IS the freestanding check. (Cross-tier Sys refs are weak and
+    # resolved intra-archive, so a naive `nm -u` over-reports them.)
 
     local fail=0
 
@@ -84,7 +198,7 @@ run_linux() {
     for expect in 0 7 42 200; do
         printf 'namespace RtVerifyApp;\nfunction main() -> int { return %s; }\n' "$expect" > "$WORK/ret.cryo"
         local o; o="$(build_app "$WORK/ret.cryo")"
-        "$CRYO_CC" -nostartfiles -nostdlib -static "$o" "$core_a" -o "$WORK/exe"
+        "$CRYO_CC" -nostartfiles -nostdlib -static -Wl,--gc-sections "$o" "$core_a" -o "$WORK/exe"
         set +e; "$WORK/exe"; local got=$?; set -e
         if [ "$got" -eq "$expect" ]; then echo "linux core ok: main $expect -> exit $got"
         else echo "linux core FAIL: main $expect -> exit $got"; fail=1; fi
@@ -92,11 +206,40 @@ run_linux() {
 
     # panic: message to stderr + exit 101.
     local o; o="$(build_app "$WORK/panic.cryo")"
-    "$CRYO_CC" -nostartfiles -nostdlib -static "$o" "$abort_a" "$core_a" -o "$WORK/exe"
+    "$CRYO_CC" -nostartfiles -nostdlib -static -Wl,--gc-sections "$o" "$abort_a" "$core_a" -o "$WORK/exe"
     set +e; local msg; msg="$("$WORK/exe" 2>&1 1>/dev/null)"; local got=$?; set -e
     [ "$got" -eq 101 ] || { echo "linux panic FAIL: exit $got (want 101)"; fail=1; }
     [ "$msg" = "$PANIC_MSG" ] || { echo "linux panic FAIL: stderr [$msg] (want [$PANIC_MSG])"; fail=1; }
     [ "$got" -eq 101 ] && [ "$msg" = "$PANIC_MSG" ] && echo "linux panic ok: exit 101, stderr [$msg]"
+
+    # check handlers: raw operands + SourceLoc, formatted through the funnel.
+    linux_expect "$WORK/bounds.cryo"   "bounds"   "panicked at verify.cryo:7: index 5 out of bounds for length 3" || fail=1
+    linux_expect "$WORK/divzero.cryo"  "div_zero" "panicked at verify.cryo:7: attempt to divide by zero" || fail=1
+    linux_expect "$WORK/nomatch.cryo"  "no_match" "panicked at verify.cryo:7: no matching pattern" || fail=1
+    linux_expect "$WORK/overflow.cryo" "overflow" "panicked at verify.cryo:7: arithmetic overflow (op 2): 4000000000, 4000000000" || fail=1
+
+    # alloc: exit 0 means alloc/align/write-read/free/re-alloc all held.
+    local ao; ao="$(build_app "$WORK/alloc.cryo")"
+    "$CRYO_CC" -nostartfiles -nostdlib -static -Wl,--gc-sections "$ao" "$alloc_a" "$core_a" -o "$WORK/exe"
+    set +e; "$WORK/exe"; local ag=$?; set -e
+    if [ "$ag" -eq 0 ]; then echo "linux alloc ok: mmap alloc/free round-trip"
+    else echo "linux alloc FAIL: exit $ag (0=ok; 1-6 = failure mode)"; fail=1; fi
+
+    # backtrace: "stack backtrace:" + >=3 frame addresses from the call chain.
+    local bo; bo="$(build_app "$WORK/bt.cryo" --dev)"
+    "$CRYO_CC" -nostartfiles -nostdlib -static -Wl,--gc-sections "$bo" "$bt_a" "$core_a" -o "$WORK/exe"
+    set +e; local bmsg; bmsg="$("$WORK/exe" 2>&1 1>/dev/null)"; local bg=$?; set -e
+    local bframes; bframes="$(printf '%s\n' "$bmsg" | grep -c '0x')"
+    if [ "$bg" -eq 0 ] && printf '%s' "$bmsg" | grep -q 'stack backtrace:' && [ "$bframes" -ge 3 ]; then
+        echo "linux backtrace ok: $bframes frames"
+    else echo "linux backtrace FAIL: exit $bg frames $bframes [$bmsg]"; fail=1; fi
+
+    # args: exit code == argc. Run with 3 extra args -> argc 4 (argv[0] + 3).
+    local go; go="$(build_app "$WORK/args.cryo")"
+    "$CRYO_CC" -nostartfiles -nostdlib -static -Wl,--gc-sections "$go" "$core_a" -o "$WORK/exe"
+    set +e; "$WORK/exe" one two three; local gg=$?; set -e
+    if [ "$gg" -eq 4 ]; then echo "linux args ok: argc 4 round-trips as exit code"
+    else echo "linux args FAIL: exit $gg (want 4)"; fail=1; fi
 
     return $fail
 }
@@ -111,6 +254,8 @@ run_windows() {
     ( cd "$RT_DIR" && rm -rf .bin && "$CRYO" build --target="$tgt" --no-incremental >/dev/null )
     local core_a="$RT_DIR/.bin/libcryort-core.a"
     local abort_a="$RT_DIR/.bin/libcryort-panic-abort.a"
+    local alloc_a="$RT_DIR/.bin/libcryort-alloc.a"
+    local bt_a="$RT_DIR/.bin/libcryort-backtrace.a"
 
     local fail=0
 
@@ -118,7 +263,7 @@ run_windows() {
     for expect in 0 7 42 200; do
         printf 'namespace RtVerifyApp;\nfunction main() -> int { return %s; }\n' "$expect" > "$WORK/ret.cryo"
         local o; o="$(build_app "$WORK/ret.cryo" --target="$tgt" --no-incremental)"
-        "$mingw" -nostartfiles -nostdlib -Wl,-e,_start "$o" "$core_a" -lntdll -o "$WORK/app.exe"
+        "$mingw" -nostartfiles -nostdlib -Wl,-e,_start -Wl,--gc-sections "$o" "$core_a" -lkernel32 -lntdll -o "$WORK/app.exe"
         set +e; WINEDEBUG=-all wine "$WORK/app.exe" 2>/dev/null; local got=$?; set -e
         if [ "$got" -eq "$expect" ]; then echo "windows core ok: main $expect -> exit $got (wine)"
         else echo "windows core FAIL: main $expect -> exit $got (wine)"; fail=1; fi
@@ -126,7 +271,7 @@ run_windows() {
 
     # panic: message to stderr + exit 101.
     local o; o="$(build_app "$WORK/panic.cryo" --target="$tgt" --no-incremental)"
-    "$mingw" -nostartfiles -nostdlib -Wl,-e,_start "$o" "$abort_a" "$core_a" \
+    "$mingw" -nostartfiles -nostdlib -Wl,-e,_start -Wl,--gc-sections "$o" "$abort_a" "$core_a" \
         -lkernel32 -lntdll -o "$WORK/app.exe"
     set +e; local msg; msg="$(WINEDEBUG=-all wine "$WORK/app.exe" 2>&1 1>/dev/null)"; local got=$?; set -e
     [ "$got" -eq 101 ] || { echo "windows panic FAIL: exit $got (want 101)"; fail=1; }
@@ -134,6 +279,39 @@ run_windows() {
         *"$PANIC_MSG"*) [ "$got" -eq 101 ] && echo "windows panic ok: exit 101 (wine), stderr contains message" ;;
         *) echo "windows panic FAIL: stderr missing [$PANIC_MSG]; got [$msg]"; fail=1 ;;
     esac
+
+    # A check handler cross-OS: exercises the SourceLoc by-value ABI + the
+    # message-builder path under Win64 (indirect struct passing).
+    windows_expect "$WORK/bounds.cryo" "bounds" "index 5 out of bounds for length 3" || fail=1
+
+    # alloc: VirtualAlloc/VirtualFree round-trip under wine.
+    local ao; ao="$(build_app "$WORK/alloc.cryo" --target="$tgt" --no-incremental)"
+    "$mingw" -nostartfiles -nostdlib -Wl,-e,_start -Wl,--gc-sections "$ao" "$alloc_a" "$core_a" \
+        -lkernel32 -lntdll -o "$WORK/app.exe"
+    set +e; WINEDEBUG=-all wine "$WORK/app.exe" 2>/dev/null; local ag=$?; set -e
+    if [ "$ag" -eq 0 ]; then echo "windows alloc ok: VirtualAlloc/VirtualFree round-trip (wine)"
+    else echo "windows alloc FAIL: exit $ag (0=ok; 1-6 = failure mode)"; fail=1; fi
+
+    # backtrace: best-effort on Windows. The tier must build, link, and run
+    # cleanly (header printed, exit 0); frame DEPTH is a known follow-up —
+    # Win64 uses table-based .pdata unwinding, so the rbp chain is often absent
+    # even at O0, and freestanding RtlCaptureStackBackTrace lacks TEB stack
+    # bounds. A depth of 0 is reported, not failed.
+    local bo; bo="$(build_app "$WORK/bt.cryo" --dev --target="$tgt" --no-incremental)"
+    "$mingw" -nostartfiles -nostdlib -Wl,-e,_start -Wl,--gc-sections "$bo" "$bt_a" "$core_a" \
+        -lkernel32 -lntdll -o "$WORK/app.exe"
+    set +e; local bmsg; bmsg="$(WINEDEBUG=-all wine "$WORK/app.exe" 2>&1 1>/dev/null)"; local bg=$?; set -e
+    local bframes; bframes="$(printf '%s\n' "$bmsg" | grep -c '0x')"
+    if [ "$bg" -eq 0 ] && printf '%s' "$bmsg" | grep -q 'stack backtrace:'; then
+        echo "windows backtrace ok: ran clean, $bframes frames (depth is a Win64 follow-up)"
+    else echo "windows backtrace FAIL: exit $bg frames $bframes [$bmsg]"; fail=1; fi
+
+    # args: Windows passes 0/null pending PEB capture, so argc is 0 (exit 0).
+    local go; go="$(build_app "$WORK/args.cryo" --target="$tgt" --no-incremental)"
+    "$mingw" -nostartfiles -nostdlib -Wl,-e,_start -Wl,--gc-sections "$go" "$core_a" -lkernel32 -lntdll -o "$WORK/app.exe"
+    set +e; WINEDEBUG=-all wine "$WORK/app.exe" one two three 2>/dev/null; local gg=$?; set -e
+    if [ "$gg" -eq 0 ]; then echo "windows args ok: argc 0 (PEB capture is a follow-up)"
+    else echo "windows args FAIL: exit $gg (want 0)"; fail=1; fi
 
     return $fail
 }

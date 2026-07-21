@@ -1,0 +1,53 @@
+///! runtime/backtrace — stack backtrace tier.
+///!
+///! Defines `__cryo_backtrace()` (see `../../abi/lang_items.def`): print
+///! "stack backtrace:" and one hex return address per frame to stderr. Raw
+///! addresses only; symbolization (address -> name via ELF/DWARF) is a
+///! follow-up.
+///!
+///! Walks the rbp frame-pointer chain on both OSes: `frame_address(0)` forces
+///! a frame pointer for this function, each x86-64 frame stores [saved rbp @0]
+///! [return addr @8], and both entries zero rbp in `_start`, so the chain
+///! terminates cleanly. Reliable while callers keep frame pointers (always at
+///! O0); a frame that omitted the pointer stops the walk via the monotonic-rbp
+///! guard rather than reading garbage.
+///!
+///! KNOWN LIMITATION — Windows frame depth: Win64 codegen commonly omits the
+///! rbp chain (unwinding is `.pdata`/RUNTIME_FUNCTION table driven), so the
+///! walk may capture zero frames on Windows even at O0. It still runs cleanly.
+///! Full Windows depth needs a `.pdata` unwinder or a TEB-populated
+///! `RtlCaptureStackBackTrace` — a follow-up.
+///!
+///! Write + hex formatting come from the shared `CryoRt::Sys` module.
+
+namespace CryoRt::Backtrace;
+
+import CryoRt::Sys;
+
+/// llvm.frameaddress.p0: base pointer of the frame `level` steps up. Only
+/// `level 0` is used (constant, as LLVM requires); the chain is walked by hand.
+intrinsic function frame_address(level: u32) -> u8*;
+
+/// Read the u64 stored at `addr`.
+function load64(addr: u64) -> u64 {
+    const p: u64* = addr as u64*;
+    return p[0];
+}
+
+![no_mangle] ![config(no_runtime)]
+function __cryo_backtrace() -> void {
+    Sys::write_cstr("stack backtrace:\n");
+    mut fp: u64 = frame_address(0) as u64;
+    mut depth: i32 = 0;
+    while (fp != 0 && depth < 64) {
+        const ret: u64 = load64(fp + 8);       // return address in the caller
+        if (ret == 0) { break; }
+        Sys::write_cstr("  ");
+        Sys::write_hex(ret);
+        Sys::write_cstr("\n");
+        const next_fp: u64 = load64(fp);       // caller's saved rbp
+        if (next_fp <= fp) { break; }
+        fp = next_fp;
+        depth = depth + 1;
+    }
+}

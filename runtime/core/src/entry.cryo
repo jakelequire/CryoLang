@@ -8,20 +8,22 @@
 ///! every target.
 ///!
 ///! The x86-64 ISA is shared by AMD and Intel CPUs, so one x86-64 codepath
-///! covers both vendors; the split that matters is OS ABI. `_start` and the
-///! process exit are per-OS (gated `![config(linux)]` / `![config(windows)]`);
-///! `__cryo_start` — run `main`, exit with its return — is shared.
+///! covers both vendors; the split that matters is OS ABI. `_start` is per-OS
+///! (gated `![config(linux)]` / `![config(windows)]`); `__cryo_start` — capture
+///! argc/argv, run `main`, exit with its return — is shared. Process exit runs
+///! through the shared `CryoRt::Sys::rt_exit`.
 ///!
 ///!   - Linux: the kernel enters `_start` with `%rsp` at argc; fully
-///!     freestanding — no libc, no imports; exit is the `exit_group` syscall.
+///!     freestanding — no libc, no imports.
 ///!   - Windows: PE startup passes no stack args and has no stable raw-syscall
-///!     ABI. The entry links ntdll (its sole dependency) and exits via
-///!     `NtTerminateProcess`; argument capture (PEB / command line) is deferred.
+///!     ABI; argument capture (PEB / command line) is deferred.
 ///!
 ///! `![config(no_runtime)]` drops the whole entry in a hosted build (crt0 owns
 ///! the entry there).
 
 namespace CryoRt::Core::Entry;
+
+import CryoRt::Sys;
 
 /// The user program's C-ABI entry, resolved by the linker from the user object.
 extern "C" {
@@ -32,9 +34,9 @@ extern "C" {
 
 /// ELF entry. Naked: no prologue/epilogue, so `%rsp` still points at the
 /// initial process stack when the body runs — argc at `(%rsp)`, argv at
-/// `8(%rsp)`, staged into rdi/rsi for the forthcoming argument capture. Clears
-/// `%rbp` to terminate stack-trace unwinding at the entry, realigns `%rsp` to
-/// 16 for the SysV call boundary, then tail-calls into Cryo.
+/// `8(%rsp)`, staged into rdi/rsi for `__cryo_start`. Clears `%rbp` to
+/// terminate stack-trace unwinding at the entry, realigns `%rsp` to 16 for the
+/// SysV call boundary, then tail-calls into Cryo.
 ![naked] ![no_mangle] ![config(no_runtime)] ![config(linux)]
 function _start() {
     ![arch(x86_64, att)]
@@ -47,56 +49,25 @@ function _start() {
     }
 }
 
-/// Freestanding process exit: `exit_group(code)` (syscall 231) issued straight
-/// to the kernel. There is no libc here, so no atexit handlers and no stdio
-/// flush run — a caller that buffered output must flush it before diverging.
-![config(no_runtime)] ![config(linux)]
-function rt_exit(code: i32) -> never {
-    ![arch(x86_64, att)]
-    ![clobber(rcx, r11, memory)]
-    asm {
-        movl ${code}, %edi
-        movl $231, %eax
-        syscall
-    }
-    // The syscall never returns; this satisfies the `never` result for the
-    // paths codegen cannot see through the asm block.
-    while (true) {}
-}
-
 // --- Windows ----------------------------------------------------------------
-
-/// ntdll: terminate the process with an exit status. Called with the
-/// current-process pseudo-handle `(HANDLE)-1`, for which it does not return.
-/// The handle is pointer-sized; an `i64` argument lands in rcx identically to a
-/// pointer and sidesteps an int-to-pointer cast. `NTSTATUS` is a 32-bit LONG.
-![config(windows)]
-extern "C" {
-    function NtTerminateProcess(process: i64, status: i32) -> i32;
-}
 
 /// PE entry. Naked: the Windows loader passes no stack arguments, so the body
 /// only establishes a valid call frame — clears `%rbp`, aligns `%rsp` to 16,
 /// and reserves the 32-byte register home ("shadow") space every Win64 callee
-/// requires — before tail-calling into Cryo.
+/// requires — before tail-calling into Cryo. rcx/rdx (the Win64 first two
+/// integer arg registers) are zeroed so `__cryo_start` sees argc=0/argv=null
+/// until PEB-based argument capture lands.
 ![naked] ![no_mangle] ![config(no_runtime)] ![config(windows)]
 function _start() {
     ![arch(x86_64, att)]
     asm {
         xorq %rbp, %rbp
+        xorq %rcx, %rcx
+        xorq %rdx, %rdx
         andq $-16, %rsp
         subq $32, %rsp
         call __cryo_start
     }
-}
-
-/// Freestanding process exit via ntdll. `NtTerminateProcess((HANDLE)-1, code)`
-/// terminates the current process with `code` as its exit status and does not
-/// return.
-![config(no_runtime)] ![config(windows)]
-function rt_exit(code: i32) -> never {
-    NtTerminateProcess(-1, code);
-    while (true) {}
 }
 
 /// The mingw backend emits `call __main` in `main`'s prologue to run C global
@@ -110,10 +81,33 @@ function __main() {
 
 // --- Shared -----------------------------------------------------------------
 
-/// Startup trampoline: run the user `main` and exit with its return value.
-/// Diverges — the process is gone before it could return. Argument capture is
-/// deferred, so this takes no parameters on either target.
+/// Captured process arguments, filled by `__cryo_start` before `main` runs.
+/// Linux reads them off the initial stack (staged by `_start`); Windows
+/// argument capture from the PEB is deferred, so there argc is 0 / argv null.
+/// Programs read them through `__cryo_argc` / `__cryo_argv`.
+mut g_argc: i64  = 0;
+mut g_argv: i8** = null;
+
+/// Number of process arguments (argv[0] included), or 0 when unavailable.
 ![no_mangle] ![config(no_runtime)]
-function __cryo_start() -> never {
-    rt_exit(main());
+function __cryo_argc() -> i64 {
+    return g_argc;
+}
+
+/// The argv vector (NUL-terminated, argv[0] = program name), or null.
+![no_mangle] ![config(no_runtime)]
+function __cryo_argv() -> i8** {
+    return g_argv;
+}
+
+/// Startup trampoline: capture argc/argv, run the user `main`, and exit with
+/// its return value. Diverges — the process is gone before it could return.
+/// Linux passes argc/argv in the SysV arg registers (rdi/rsi) set by `_start`;
+/// Windows passes 0/null in the Win64 arg registers (rcx/rdx) pending PEB
+/// capture. The parameters therefore use the target's own C-ABI arg registers.
+![no_mangle] ![config(no_runtime)]
+function __cryo_start(argc: i64, argv: i8**) -> never {
+    g_argc = argc;
+    g_argv = argv;
+    Sys::rt_exit(main());
 }
