@@ -195,6 +195,31 @@ type struct CodegenPasses {
         return format("\"%s\"", s);
     }
 
+    /// `--panic=unwind`: append the unwinding panic runtime tier archive to the
+    /// link command.  The tier archive lives in the runtime workspace's `.bin`,
+    /// located relative to the stdlib root (repo layout: `<root>/stdlib` sits
+    /// alongside `<root>/runtime`); a distribution-time locator is a follow-up.
+    /// Placed after the user objects + stdlib archive so it resolves their
+    /// undefined `__cryo_panic` / `__cryo_personality_v0`.
+    ///
+    /// No explicit `-lunwind`: the personality + `resume` reference the shared
+    /// Itanium `_Unwind_*` Level-1 ABI, which the gcc driver's always-linked
+    /// `libgcc_s` already provides for a hosted build (verified end-to-end).
+    /// Forcing `-lunwind` instead breaks the link on a standard gcc/glibc host
+    /// that ships `libunwind.so.8` but no `libunwind.so` dev symlink, for no
+    /// benefit (identical ABI).  An LLVM-libunwind / freestanding combination
+    /// that needs an explicit unwinder is a follow-up (a `[link]`-config knob).
+    /// Gated on `project_panic_unwind`: the default abort path appends nothing,
+    /// keeping the link line byte-identical.
+    static append_panic_unwind_libs(ctx: CompilationContext*, cmd: string) -> string {
+        if (!ctx.project_panic_unwind || ctx.stdlib_root.length() == 0) {
+            return cmd;
+        }
+        const unwind_archive: string = format(
+            "%s/../runtime/.bin/libcryort-panic-unwind.a", ctx.stdlib_root);
+        return format("%s %s", cmd, CodegenPasses::link_quote(unwind_archive));
+    }
+
     /// Copy the freshly-linked binary from the per-profile cache to the build
     /// root.  Cross-platform via `fs::file::copy`, which creates/truncates the
     /// destination and mirrors the source's Unix mode bits (so the hoisted
@@ -343,7 +368,14 @@ type struct CodegenPasses {
             const gha_fn: LValue = cg.resolver.resolve_function(
                 cg.intern_str("std::alloc::allocator::alloc"));
             cg.intrinsics.emit_format_runtime(gha_fn);
-            cg.intrinsics.emit_panic_runtime();
+            // Under `--panic=unwind` every panic is rerouted to the external
+            // raising `__cryo_panic` (see `emit_panic_call`), so the per-module
+            // libc `linkonce_odr @panic` body would be dead weight that still
+            // pulls in printf/abort; skip it. Default abort path emits it as
+            // before (byte-identical).
+            if (!ctx.project_panic_unwind) {
+                cg.intrinsics.emit_panic_runtime();
+            }
         }
 
         // Create the visitor and generate IR.  Heap-allocate via Box::leak
@@ -1178,6 +1210,7 @@ type struct CodegenPasses {
                 ctx.stdlib_root);
             cmd = format("%s %s", cmd, CodegenPasses::link_quote(stdlib_archive));
         }
+        cmd = CodegenPasses::append_panic_unwind_libs(ctx, cmd);
         // Cryo runtime support is fully inline-lowered: every bare-name
         // intrinsic (i32_to_i64, ptr_diff, format, bswap*, clz*, fpclass,
         // atomic_fence, dirent_*) is emitted directly into LLVM IR by
@@ -1332,6 +1365,7 @@ type struct CodegenPasses {
                 ctx.stdlib_root);
             cmd = format("%s %s", cmd, CodegenPasses::link_quote(stdlib_archive));
         }
+        cmd = CodegenPasses::append_panic_unwind_libs(ctx, cmd);
         if (!ctx.project_no_runtime) {
             cmd = format("%s %s", cmd, link_cfg.extra_system_libs);
         }

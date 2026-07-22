@@ -1,0 +1,276 @@
+///! runtime/panic/unwind — the unwinding panic strategy.
+///!
+///! Defines the panic funnel `__cryo_panic` (see `../../abi/lang_items.def`) to
+///! RAISE a foreign exception through the shared Itanium `_Unwind_*` Level-1 ABI
+///! (libunwind, linked `-lunwind`) instead of terminating. A panic then unwinds
+///! the native stack: each frame the compiler marked with a cleanup landing pad
+///! (`--panic=unwind`, see `compiler .../call_emitter.cryo`) runs its local
+///! destructors and `resume`s; a root `catch_unwind` (a later phase) stops the
+///! unwind and turns the panic into an error. This tier is chosen at LINK time —
+///! callers never change; swapping this archive for `panic/abort` swaps the
+///! strategy.
+///!
+///! `__cryo_personality_v0` is the language personality libunwind calls per
+///! frame. It parses the GCC `.gcc_except_table` LSDA (which LLVM's backend
+///! auto-emits once a function has an `invoke` + a personality) to map the
+///! current IP to its landing pad, and drives the Itanium two-phase protocol:
+///! phase 1 (search) reports a handler only where a catch clause exists; phase 2
+///! (cleanup) installs each frame's landing pad so its drops run.
+///!
+///! Windows SEH is deferred (a follow-up, like the `.pdata` backtrace): the
+///! `![config(windows)]` funnel here is an abort-style stub so a `--panic=unwind`
+///! Windows build still links and terminates cleanly.
+///!
+///! Write/format primitives come from the shared `CryoRt::Sys` module.
+
+namespace CryoRt::Panic::Unwind;
+
+import CryoRt::Sys;
+
+/// Source location passed to every check handler, matching `abi/layout.def`:
+/// `{ file: string @0, line: u32 @8, col: u32 @12 }`, 16 bytes. Identical to the
+/// abort tier's; the compiler emits the same call-site shape regardless of tier.
+type struct SourceLoc {
+    file: string;
+    line: u32;
+    col:  u32;
+}
+
+/// The Itanium base exception object (`struct _Unwind_Exception`). `private_1`/
+/// `private_2` are scratch the unwinder owns during a raise; `exception_cleanup`
+/// is a `void(*)(reason, exn)` destructor (0 here — the object is a static
+/// per-thread singleton, never freed).
+type struct UnwindException {
+    exception_class:   u64;
+    exception_cleanup: i64;
+    private_1:         u64;
+    private_2:         u64;
+}
+
+/// Vendor exception class, the 8 ASCII bytes "CRYOPAN1", identifying a Cryo
+/// panic to the personality (a foreign exception would carry a different class).
+const CRYO_EXCEPTION_CLASS: u64 = 0x4352594F50414E31;
+
+/// The in-flight panic's exception object. One panic is in flight per thread at
+/// a time, so a single global suffices for the current single-threaded use; this
+/// becomes `![thread_local]` once the async executor unwinds on worker threads
+/// (per-task isolation needs a distinct in-flight object per thread).
+mut g_exn: UnwindException = UnwindException {
+    exception_class: 0, exception_cleanup: 0, private_1: 0, private_2: 0,
+};
+
+// --- libunwind Level-1 ABI (linux; resolved from -lunwind) ------------------
+// All handles are opaque pointers passed as i64. `_Unwind_RaiseException`
+// returns only on FAILURE (no handler found / fatal error); on success it
+// transfers control to a landing pad and never returns to its caller.
+![config(linux)]
+extern "C" {
+    function _Unwind_RaiseException(exception_object: i64) -> i32;
+    function _Unwind_GetLanguageSpecificData(context: i64) -> i64;
+    function _Unwind_GetRegionStart(context: i64) -> i64;
+    function _Unwind_GetIP(context: i64) -> i64;
+    function _Unwind_SetIP(context: i64, new_value: i64) -> void;
+    function _Unwind_SetGR(context: i64, index: i32, new_value: i64) -> void;
+}
+
+/// Read a little-endian ULEB128 from `base[*off]`, advancing `*off` past it.
+/// The LSDA call-site and action tables are ULEB128-encoded.
+function read_uleb128(base: u8*, off: u64*) -> u64 {
+    mut result: u64 = 0;
+    mut shift:  u64 = 0;
+    while (true) {
+        const byte: u8 = base[*off];
+        *off = *off + 1;
+        result = result | (((byte & 0x7f) as u64) << shift);
+        if ((byte & 0x80) == 0) { break; }
+        shift = shift + 7;
+    }
+    return result;
+}
+
+/// Print `panicked at <file>:<line>: <msg>` to stderr. Shared by the raising
+/// (uncaught) and the Windows abort-stub funnels.
+function report_panic(msg: string, file: string, line: u32) -> void {
+    Sys::write_cstr("panicked at ");
+    Sys::write_cstr(file);
+    Sys::write_cstr(":");
+    Sys::write_u32(line);
+    Sys::write_cstr(": ");
+    Sys::write_cstr(msg);
+    Sys::write_cstr("\n");
+}
+
+// --- The panic funnel -------------------------------------------------------
+
+/// Linux: fill the per-thread exception object and raise it. On a normal
+/// (successful) raise this never returns — libunwind transfers to a landing pad.
+/// It returns only when phase 1 finds NO handler (an uncaught panic): by the
+/// Itanium contract phase-2 cleanups are then skipped, so nothing was dropped;
+/// print the report and terminate (exit 101). A root `catch_unwind` (later
+/// phase) installs a phase-1 handler so the unwind runs cleanups instead.
+![no_mangle] ![config(no_runtime)] ![config(linux)]
+function __cryo_panic(msg: string, file: string, line: u32) -> never {
+    g_exn.exception_class   = CRYO_EXCEPTION_CLASS;
+    g_exn.exception_cleanup = 0;
+    g_exn.private_1         = 0;
+    g_exn.private_2         = 0;
+    _Unwind_RaiseException(&g_exn as i64);
+    report_panic(msg, file, line);
+    Sys::rt_exit(101);
+}
+
+/// Windows: SEH-based unwinding is deferred, so the funnel prints and terminates
+/// like the abort tier. Keeps a `--panic=unwind` Windows build linkable.
+![no_mangle] ![config(no_runtime)] ![config(windows)]
+function __cryo_panic(msg: string, file: string, line: u32) -> never {
+    report_panic(msg, file, line);
+    Sys::rt_exit(101);
+}
+
+// --- The language personality (linux) ---------------------------------------
+
+/// The routine libunwind calls per frame during a raise. Parses the frame's
+/// LSDA to find the landing pad for the current IP and drives the two-phase
+/// protocol. Handles the encodings LLVM actually emits (lpStart omitted =>
+/// region-relative; call-site table ULEB128); any other encoding bails to
+/// `_URC_CONTINUE_UNWIND` (safe: the frame is skipped, never mis-installed).
+///
+/// The catch path (a non-zero call-site action = a `catch` clause, i.e. the
+/// root `catch_unwind`) reports a handler in phase 1 and installs it with a
+/// non-zero selector in phase 2. The action table's ttypeFilter is not yet read
+/// (a single catch-all root uses selector 1); typed catches are a follow-up.
+/// Cleanup-only frames (action 0) never report a handler.
+![no_mangle] ![config(no_runtime)] ![config(linux)]
+function __cryo_personality_v0(version: i32, actions: i32, exception_class: u64,
+                               exception_object: i64, context: i64) -> i32 {
+    const URC_HANDLER_FOUND:   i32 = 6;
+    const URC_INSTALL_CONTEXT: i32 = 7;
+    const URC_CONTINUE_UNWIND: i32 = 8;
+    const UA_SEARCH_PHASE:     i32 = 1;
+    const UA_CLEANUP_PHASE:    i32 = 2;
+
+    const lsda: i64 = _Unwind_GetLanguageSpecificData(context);
+    if (lsda == 0) { return URC_CONTINUE_UNWIND; }
+
+    const func_start: i64 = _Unwind_GetRegionStart(context);
+    // `_Unwind_GetIP` returns the return address (one past the call); step back
+    // to the call instruction so it lands inside the call site's IP range.
+    const ip: i64 = _Unwind_GetIP(context) - 1;
+    const ip_offset: u64 = (ip - func_start) as u64;
+
+    const base: u8* = lsda as u8*;
+    mut off: u64 = 0;
+
+    // LSDA header: landing-pad-start encoding. LLVM emits DW_EH_PE_omit (0xff),
+    // meaning landing-pad offsets are relative to the region start. Any other
+    // encoding needs a full DWARF-pointer reader we do not have; bail safely.
+    const lp_start_enc: u8 = base[off]; off = off + 1;
+    if (lp_start_enc != 0xff) { return URC_CONTINUE_UNWIND; }
+    const lp_start: i64 = func_start;
+
+    // Type-table encoding; when present (catch clauses exist) it is followed by
+    // a ULEB128 base offset. The catch-all path below does not dereference the
+    // type table, so we only need to skip past this field.
+    const ttype_enc: u8 = base[off]; off = off + 1;
+    if (ttype_enc != 0xff) { read_uleb128(base, &off); }
+
+    // Call-site table: encoding (LLVM uses DW_EH_PE_uleb128 = 0x01), then the
+    // table byte length, then the entries.
+    const cs_enc: u8 = base[off]; off = off + 1;
+    if (cs_enc != 0x01) { return URC_CONTINUE_UNWIND; }
+    const cs_table_len: u64 = read_uleb128(base, &off);
+    const cs_table_end: u64 = off + cs_table_len;
+
+    while (off < cs_table_end) {
+        const cs_start:  u64 = read_uleb128(base, &off);
+        const cs_len:    u64 = read_uleb128(base, &off);
+        const cs_lpad:   u64 = read_uleb128(base, &off);
+        const cs_action: u64 = read_uleb128(base, &off);
+
+        if (ip_offset >= cs_start && ip_offset < cs_start + cs_len) {
+            if (cs_lpad == 0) {
+                // In-range but no landing pad: nothing to run in this frame.
+                return URC_CONTINUE_UNWIND;
+            }
+            const landing_pad: i64 = lp_start + (cs_lpad as i64);
+
+            if ((actions & UA_SEARCH_PHASE) != 0) {
+                // A non-zero action = a catch clause (the root catch). Only such
+                // frames are handlers; cleanup-only frames keep unwinding.
+                if (cs_action != 0) { return URC_HANDLER_FOUND; }
+                return URC_CONTINUE_UNWIND;
+            }
+
+            if ((actions & UA_CLEANUP_PHASE) != 0) {
+                // Populate the EH data registers the landing pad reads back as
+                // `{ exn_ptr, selector }`: reg 0 = exception object, reg 1 =
+                // selector (0 drives cleanup-then-resume; 1 enters a catch arm).
+                _Unwind_SetGR(context, 0, exception_object);
+                mut selector: i64 = 0;
+                if (cs_action != 0) { selector = 1; }
+                _Unwind_SetGR(context, 1, selector);
+                _Unwind_SetIP(context, landing_pad);
+                return URC_INSTALL_CONTEXT;
+            }
+
+            return URC_CONTINUE_UNWIND;
+        }
+    }
+
+    // IP not covered by any call site in this frame: nothing to do here.
+    return URC_CONTINUE_UNWIND;
+}
+
+/// Windows personality stub (SEH deferred; unreferenced by SEH unwinding).
+/// Present so the symbol resolves if anything links against it.
+![no_mangle] ![config(no_runtime)] ![config(windows)]
+function __cryo_personality_v0(version: i32, actions: i32, exception_class: u64,
+                               exception_object: i64, context: i64) -> i32 {
+    return 8;   // _URC_CONTINUE_UNWIND
+}
+
+// --- Check handlers (route raw operands through the funnel) ------------------
+// OS-agnostic: each formats its message and diverges via `__cryo_panic`, which
+// is itself OS-gated above. Signatures mirror `panic/abort` exactly — the
+// compiler emits the identical call shape regardless of tier.
+
+/// Index out of bounds: "index <index> out of bounds for length <len>".
+![no_mangle] ![config(no_runtime)]
+function __cryo_panic_bounds_check(loc: SourceLoc, index: u64, len: u64) -> never {
+    mut buf: u8[128];
+    mut pos: u64 = 0;
+    Sys::append_cstr(&buf[0], &pos, "index ");
+    Sys::append_u64(&buf[0], &pos, index);
+    Sys::append_cstr(&buf[0], &pos, " out of bounds for length ");
+    Sys::append_u64(&buf[0], &pos, len);
+    buf[pos] = 0;
+    __cryo_panic(&buf[0] as string, loc.file, loc.line);
+}
+
+/// Arithmetic overflow. `op` is a raw operation code (mapping pinned later); the
+/// operands are printed so the failure is distinguishable now.
+![no_mangle] ![config(no_runtime)]
+function __cryo_panic_overflow(loc: SourceLoc, op: u32, lhs: u64, rhs: u64) -> never {
+    mut buf: u8[128];
+    mut pos: u64 = 0;
+    Sys::append_cstr(&buf[0], &pos, "arithmetic overflow (op ");
+    Sys::append_u64(&buf[0], &pos, op as u64);
+    Sys::append_cstr(&buf[0], &pos, "): ");
+    Sys::append_u64(&buf[0], &pos, lhs);
+    Sys::append_cstr(&buf[0], &pos, ", ");
+    Sys::append_u64(&buf[0], &pos, rhs);
+    buf[pos] = 0;
+    __cryo_panic(&buf[0] as string, loc.file, loc.line);
+}
+
+/// Division or remainder by zero (also the `INT_MIN / -1` case).
+![no_mangle] ![config(no_runtime)]
+function __cryo_panic_div_zero(loc: SourceLoc) -> never {
+    __cryo_panic("attempt to divide by zero", loc.file, loc.line);
+}
+
+/// Fell through a non-exhaustive match with no arm for the scrutinee.
+![no_mangle] ![config(no_runtime)]
+function __cryo_panic_no_match(loc: SourceLoc) -> never {
+    __cryo_panic("no matching pattern (non-exhaustive match)", loc.file, loc.line);
+}

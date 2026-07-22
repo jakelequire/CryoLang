@@ -42,21 +42,31 @@ type struct IntrinsicEmitter {
     /// instead.  Wired from `ctx.project_no_runtime`.
     no_runtime:  boolean;
 
+    /// `--panic=unwind`: route `emit_panic_call` to the external raising
+    /// `__cryo_panic` (linked from the `panic/unwind` runtime tier) instead of
+    /// the per-module `linkonce_odr` libc `@panic`, so a panic RAISES and the
+    /// Phase-C cleanup landing pads run as the unwind passes through their
+    /// frames.  Wired from `ctx.project_panic_unwind`; false on the default
+    /// abort path keeps the emitted IR byte-identical.
+    panic_unwind: boolean;
+
     static null() -> IntrinsicEmitter {
         return IntrinsicEmitter {
-            llvm_module: null,
-            builder:     null,
-            abi:         null,
-            no_runtime:  false,
+            llvm_module:  null,
+            builder:      null,
+            abi:          null,
+            no_runtime:   false,
+            panic_unwind: false,
         };
     }
 
     wire(mut &this, llvm_module: LModule*, builder: LBuilder*,
-         abi: AbiClassifier*, no_runtime: boolean) -> void {
-        this.llvm_module = llvm_module;
-        this.builder     = builder;
-        this.abi         = abi;
-        this.no_runtime  = no_runtime;
+         abi: AbiClassifier*, no_runtime: boolean, panic_unwind: boolean) -> void {
+        this.llvm_module  = llvm_module;
+        this.builder      = builder;
+        this.abi          = abi;
+        this.no_runtime   = no_runtime;
+        this.panic_unwind = panic_unwind;
     }
 
 
@@ -754,6 +764,24 @@ type struct IntrinsicEmitter {
 
     // Per-intrinsic emission paths
 
+    /// Get-or-declare the external raising panic funnel `__cryo_panic(msg, file,
+    /// line)` (defined by the `panic/unwind` runtime tier, resolved at link).
+    /// Signature `(ptr, ptr, i32) -> void`, matching the abort funnel's call
+    /// shape; the caller emits `unreachable` after the call since it diverges.
+    get_or_decl_cryo_panic(mut &this) -> LValue {
+        mut fn: LValue = this.llvm_module.get_named_function("__cryo_panic");
+        if (fn.is_valid()) { return fn; }
+        const ptr_ty: LType = LType::pointer_to(LType::i8());
+        const param_buf: void* = intrinsics::malloc(24);
+        const param_slots: void** = param_buf as void**;
+        param_slots[0] = ptr_ty.raw;
+        param_slots[1] = ptr_ty.raw;
+        param_slots[2] = LType::i32().raw;
+        const fty: LType = LType::function_type(LType::void_type(), param_buf, 3, false);
+        intrinsics::free(param_buf);
+        return this.llvm_module.add_function("__cryo_panic", fty);
+    }
+
     /// Emit `call @panic(msg, file, line); unreachable`.  Ensures the
     /// `@panic` runtime function is declared in the current module first.
     emit_panic_call(mut &this, msg: LValue, file: LValue, line: LValue) -> LValue {
@@ -769,10 +797,20 @@ type struct IntrinsicEmitter {
             this.builder.build_unreachable();
             return LValue::null();
         }
-        this.emit_panic_runtime();
-        const panic_fn: LValue = this.llvm_module.get_named_function("panic");
+        // Pick the panic funnel.  Default (abort): the per-module `linkonce_odr`
+        // libc `@panic` (print + abort).  `--panic=unwind`: the external raising
+        // `__cryo_panic` (declared here, defined by the linked `panic/unwind`
+        // tier) — it raises through libunwind so the Phase-C cleanup landing
+        // pads on the enclosing ordinary calls run as the unwind passes through.
+        // Both share the `(ptr, ptr, i32) -> void` signature and call shape.
+        mut panic_fn: LValue = LValue::null();
+        if (this.panic_unwind) {
+            panic_fn = this.get_or_decl_cryo_panic();
+        } else {
+            this.emit_panic_runtime();
+            panic_fn = this.llvm_module.get_named_function("panic");
+        }
         if (!panic_fn.is_valid()) { return LValue::null(); }
-        // Match emit_panic_runtime's declared signature: (ptr, ptr, i32) -> void.
         const ptr_ty: LType = LType::pointer_to(LType::i8());
         const param_buf: void* = intrinsics::malloc(24);
         const param_slots: void** = param_buf as void**;

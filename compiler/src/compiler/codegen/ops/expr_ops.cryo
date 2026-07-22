@@ -49,6 +49,18 @@ type struct ExprOps {
     /// function is not variadic.
     current_variadic_arg_id: u32;
 
+    /// Transient `invoke` swap state, armed by CallEmitter around a single
+    /// `codegen_call` when the current frame has live droppable locals under
+    /// `--panic=unwind`.  While `invoke_active`, `build_call_maybe_invoke`
+    /// emits an `invoke` (normal edge -> `invoke_normal`, unwind edge ->
+    /// `invoke_lpad`) in place of a plain `call`, repositions the builder at
+    /// the normal block, and clears the flag so at most one invoke is emitted
+    /// per activation.  Inactive on the default abort path => plain `call`,
+    /// byte-identical IR.
+    invoke_active: boolean;
+    invoke_normal: LBasicBlock;
+    invoke_lpad:   LBasicBlock;
+
     static null() -> ExprOps {
         return ExprOps {
             llvm_module: null,
@@ -63,6 +75,9 @@ type struct ExprOps {
             diag:        null,
             ctx:         null,
             current_variadic_arg_id: 0,
+            invoke_active: false,
+            invoke_normal: LBasicBlock::null(),
+            invoke_lpad:   LBasicBlock::null(),
         };
     }
 
@@ -907,6 +922,64 @@ type struct ExprOps {
         return arg_val;
     }
 
+    /// Emit the callee call, choosing `invoke` over `call` when CallEmitter
+    /// has armed the transient invoke state for this call (the frame has live
+    /// droppable locals under `--panic=unwind`).  On `invoke`, control returns
+    /// to `invoke_normal` on success and `invoke_lpad` (a cleanup landing pad)
+    /// on unwind; the builder is left at `invoke_normal` so post-call codegen
+    /// (sret load, byval attrs, return coercion) continues on the normal path,
+    /// NOT after the invoke terminator.  The flag is consumed on first use so a
+    /// single activation emits exactly one invoke (args are fully emitted
+    /// before this point, so no nested call re-enters the armed state).
+    build_call_maybe_invoke(mut &this, fn_ty: LType, fn_val: LValue,
+                            args: void*, num_args: u32, name: string) -> LValue {
+        if (this.invoke_active) {
+            this.invoke_active = false;
+            const then_bb: LBasicBlock = this.invoke_normal;
+            const catch_bb: LBasicBlock = this.invoke_lpad;
+            const inv: LValue = this.builder.build_invoke(
+                fn_ty, fn_val, args, num_args, then_bb, catch_bb, name);
+            this.builder.position_at_end(then_bb);
+            return inv;
+        }
+        return this.builder.build_call(fn_ty, fn_val, args, num_args, name);
+    }
+
+    /// Get-or-declare the exception personality routine `__cryo_personality_v0`
+    /// against the shared Itanium `_Unwind_*` Level-1 ABI:
+    /// `i32 (i32 version, i32 actions, i64 exn_class, ptr exn, ptr context)`.
+    /// Attached to every function that grows a cleanup landing pad; the
+    /// definition is linked in from the `panic/unwind` runtime tier under
+    /// `--panic=unwind`.
+    get_or_decl_personality(mut &this) -> LValue {
+        mut fn: LValue = this.llvm_module.get_named_function("__cryo_personality_v0");
+        if (fn.is_valid()) { return fn; }
+        const ptr_ty: LType = LType::pointer_to(LType::i8());
+        const param_buf: void* = intrinsics::malloc(40);
+        const param_slots: void** = param_buf as void**;
+        param_slots[0] = LType::i32().raw;
+        param_slots[1] = LType::i32().raw;
+        param_slots[2] = LType::i64().raw;
+        param_slots[3] = ptr_ty.raw;
+        param_slots[4] = ptr_ty.raw;
+        const fty: LType = LType::function_type(LType::i32(), param_buf, 5, false);
+        intrinsics::free(param_buf);
+        return this.llvm_module.add_function("__cryo_personality_v0", fty);
+    }
+
+    /// The `{ ptr, i32 }` landing-pad result type (exception object pointer +
+    /// selector).  LLVM uniques literal struct types by structure within a
+    /// context, so this returns the same type on every call in a module.
+    landingpad_type(mut &this) -> LType {
+        const elems_buf: void* = intrinsics::malloc(16);
+        const elems: void** = elems_buf as void**;
+        elems[0] = LType::pointer_to(LType::i8()).raw;
+        elems[1] = LType::i32().raw;
+        const t: LType = LType::literal_struct(elems_buf, 2, false);
+        intrinsics::free(elems_buf);
+        return t;
+    }
+
     /// The pre-Phase-1 call lowering: coerce integer widths to match
     /// the callee's expected param types, then `build_call`.  Split out
     /// of `codegen_call` so the sret-marshalling wrapper can call
@@ -916,7 +989,7 @@ type struct ExprOps {
         const n: u32 = args.length as u32;
 
         if (n == 0) {
-            out_value = this.builder.build_call(callee_type, callee, null, 0, name);
+            out_value = this.build_call_maybe_invoke(callee_type, callee, null, 0, name);
             return out_value;
         }
 
@@ -962,7 +1035,7 @@ type struct ExprOps {
         }
         if (param_types_buf != null) { intrinsics::free(param_types_buf); }
 
-        out_value = this.builder.build_call(callee_type, callee, buf, n, name);
+        out_value = this.build_call_maybe_invoke(callee_type, callee, buf, n, name);
         intrinsics::free(buf);
 
         // Phase 2 - propagate `byval(%T)` from the callee's parameter
@@ -1169,7 +1242,7 @@ type struct ExprOps {
             source_idx += 1;
         }
 
-        const out: LValue = this.builder.build_call(
+        const out: LValue = this.build_call_maybe_invoke(
             callee_type, callee, buf, expected_count, name);
         intrinsics::free(buf);
 
