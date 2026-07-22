@@ -59,6 +59,22 @@ mut g_exn: UnwindException = UnwindException {
     exception_class: 0, exception_cleanup: 0, private_1: 0, private_2: 0,
 };
 
+/// The in-flight panic's payload, stashed by `__cryo_panic` before it raises so
+/// a root `catch_unwind` can read it back for its `Err(PanicInfo)`. The raise
+/// transfers control straight to a landing pad, so the funnel can never return
+/// these values — hence the stash. Plain globals like `g_exn` (single in-flight
+/// panic per thread); they become `![thread_local]` alongside `g_exn` once the
+/// async executor unwinds on worker threads.
+///
+/// The two message/file pointers are held as `i64` (not `string`): a
+/// freestanding global initialized to a string literal would carry a data
+/// relocation this tier's zero-init global model does not emit, so the pointers
+/// are stored as integers that zero-init cleanly (exactly like `g_exn`'s
+/// fields) and cast back through the accessors.
+mut g_panic_msg:  i64 = 0;
+mut g_panic_file: i64 = 0;
+mut g_panic_line: u32 = 0;
+
 // --- libunwind Level-1 ABI (linux; resolved from -lunwind) ------------------
 // All handles are opaque pointers passed as i64. `_Unwind_RaiseException`
 // returns only on FAILURE (no handler found / fatal error); on success it
@@ -110,6 +126,12 @@ function report_panic(msg: string, file: string, line: u32) -> void {
 /// phase) installs a phase-1 handler so the unwind runs cleanups instead.
 ![no_mangle] ![config(no_runtime)] ![config(linux)]
 function __cryo_panic(msg: string, file: string, line: u32) -> never {
+    // Stash the payload BEFORE raising: the raise transfers control to a
+    // landing pad and never returns here, so a root `catch_unwind` reads these
+    // back through the accessors to build its `Err(PanicInfo)`.
+    g_panic_msg  = msg as i64;
+    g_panic_file = file as i64;
+    g_panic_line = line;
     g_exn.exception_class   = CRYO_EXCEPTION_CLASS;
     g_exn.exception_cleanup = 0;
     g_exn.private_1         = 0;
@@ -123,7 +145,37 @@ function __cryo_panic(msg: string, file: string, line: u32) -> never {
 /// like the abort tier. Keeps a `--panic=unwind` Windows build linkable.
 ![no_mangle] ![config(no_runtime)] ![config(windows)]
 function __cryo_panic(msg: string, file: string, line: u32) -> never {
+    g_panic_msg  = msg as i64;
+    g_panic_file = file as i64;
+    g_panic_line = line;
     report_panic(msg, file, line);
+    Sys::rt_exit(101);
+}
+
+// --- Caught-panic payload accessors -----------------------------------------
+// OS-agnostic reads of the stashed payload, called from the stdlib
+// `catch_unwind` Err arm (`core::panic_unwind`, declared there as `extern "C"`).
+// The i64 pointers are cast back to `string` (the inverse of the stash's
+// `string as i64`).
+
+![no_mangle] ![config(no_runtime)]
+function __cryo_panic_taken_message() -> string { return g_panic_msg as string; }
+
+![no_mangle] ![config(no_runtime)]
+function __cryo_panic_taken_file() -> string { return g_panic_file as string; }
+
+![no_mangle] ![config(no_runtime)]
+function __cryo_panic_taken_line() -> u32 { return g_panic_line; }
+
+/// Called by the compiler-synthesized root-catch `main` wrapper when a panic
+/// unwinds all the way out (uncaught by any `catch_unwind`). The raising funnel
+/// skipped its own report because the raise found the root handler, so report
+/// the stashed payload here, then terminate with the panic exit code (101).
+/// Never returns. The intermediate frames' cleanup pads have already run (phase
+/// 2), so all pending destructors executed before this point.
+![no_mangle] ![config(no_runtime)]
+function __cryo_panic_finish() -> never {
+    report_panic(g_panic_msg as string, g_panic_file as string, g_panic_line);
     Sys::rt_exit(101);
 }
 
