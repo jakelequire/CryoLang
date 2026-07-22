@@ -27,6 +27,20 @@ the execution checklist; tick items as they land.
   with TWO `FIXED POINT OK` (Linux-via-WSL stage3==stage4 + Windows native-PE stage3==stage4;
   233 modules, ~73.9 MB IR). Confirms the gated changes leave the default abort path
   byte-identical. Nothing committed. Clean base for Phase C.
+- **Phase C (invoke/landingpad/resume + personality), verified green.** `make cryo` clean;
+  `--panic=unwind --emit-llvm` on probes shows correct Itanium cleanup-invoke IR (LLVM verifier
+  accepts): `personality @__cryo_personality_v0`, `invoke ... to cont unwind lpad`, cleanup-only
+  `landingpad {ptr,i32}` replaying drops + `resume`; a local moved into the call is excluded from
+  the lpad (no double-free on unwind). Default abort build shows 0 EH constructs (plain `call`).
+  `make selfhost-check` exit 0, TWO `FIXED POINT OK` (Linux IR md5 efc42c06…; Windows 233 modules)
+  — default path stays byte-identical. Nothing committed. Clean base for Phase E.
+- **Phase E (unwind tier + compiler integration), verified green.** `verify-freestanding.sh` OK
+  (tier compiles both OSes; abort tier passes). `make selfhost-check` exit 0, TWO `FIXED POINT OK`,
+  Linux IR md5 STILL efc42c06… (byte-identical default path across all Phase-C/E changes). WSL
+  end-to-end (compiler full link pipeline): `--panic=unwind` panic → raise → phase-1 personality
+  LSDA parse → uncaught → `panicked at …: boom` + exit 101; default abort build of the same program
+  unchanged (SIGABRT/134). Nothing committed. Clean base for Phase D. NOTE: link wiring drops the
+  locked `-lunwind` for gcc/glibc hosts (libgcc_s provides the ABI) — flag for Jake.
 
 ## Phase checklist
 
@@ -52,7 +66,31 @@ the execution checklist; tick items as they land.
   NOT tracked — a LEAK on unwind, never a double-free/UAF (memory-safe). Follow-up: arg-temp drop
   flags. Also: only calls routed through `walk_expr_read` get a schedule; codegen-synthesized
   checks (bounds/overflow) are a separate origin — route them through invoke in a follow-up.
-- [ ] **C. invoke/landingpad/resume + personality** — DESIGN (grounded, ready to implement):
+- [x] **C. invoke/landingpad/resume + personality** — IMPLEMENTED as designed and IR-verified
+  under `--panic=unwind --emit-llvm` (LLVM verifier accepts; default abort path emits 0 EH
+  constructs = byte-identical). What landed:
+  - ExprOps gained transient invoke state (`invoke_active/invoke_normal/invoke_lpad`) + three new
+    helpers: `build_call_maybe_invoke` (wraps the THREE callee `build_call` sites — zero-arg, 1:1,
+    dp_expand — emitting `invoke ... to cont unwind lpad` then repositioning at cont when armed,
+    consuming the flag on first use), `get_or_decl_personality` (external `i32
+    @__cryo_personality_v0(i32,i32,i64,ptr,ptr)`), `landingpad_type` (`{ptr,i32}` literal struct).
+  - `call_emitter.cryo` `emit`: `needs_invoke = ctx.project_panic_unwind &&
+    node.unwind_cleanup.length>0`; appends `invoke.cont`/`invoke.lpad`, arms ExprOps state around the
+    single `codegen_call`, then `emit_cleanup_landingpad` (attaches personality, builds
+    cleanup-only `landingpad`, replays `node.unwind_cleanup` drops innermost-first, `resume`s;
+    restores builder to cont). `should_unreachable` still terminates cont for never-callees.
+  - **Verified:** ordinary call with a live droppable local → correct invoke+cleanup lpad; a local
+    MOVED into the call is excluded from the lpad (no double-free on unwind); drops run on both the
+    normal (scope-exit) and unwind (lpad) paths = dropped exactly once at runtime.
+  - **Discovered limitation (leak-only, memory-safe; extends the §B/§H follow-up):** a *direct*
+    `core::panic(...)` call is emitted by `intrinsic_emitter.cryo:759` `emit_panic_call` as a plain
+    `call @panic; unreachable`, on the intrinsics-first fast-path that never reaches the general
+    call path — so its DropInsertion-populated schedule is ignored and locals in a frame that
+    diverges only via a direct panic (or a codegen-synthesized bounds/overflow/div-zero/no-match
+    check) are NOT dropped on unwind. Routing these panic origins through `invoke` is the same
+    follow-up already noted for the synthesized checks; do it once Phase E's raising `__cryo_panic`
+    exists (until then panic printf+aborts and does not unwind at all).
+  - Original design (as built):
   - **Decision (call vs invoke):** in `call_emitter.cryo` main emit path (the method that holds
     `visitor` + `node`), `needs_invoke = cg.ctx.project_panic_unwind && node.unwind_cleanup.length>0`.
   - **Invoke swap choke-point:** add ExprOps transient state (`invoke_active/invoke_normal/
@@ -74,12 +112,46 @@ the execution checklist; tick items as they land.
   - **Personality:** declare external `i32 @__cryo_personality_v0(...)` (via the function-registry
     get-or-declare path); `current_fn.set_personality_fn(pers)` inside `emit_cleanup_landingpad`
     (idempotent). Under `--panic=unwind` the linker pulls the definition from the `panic/unwind` tier.
-- [ ] **E. runtime `panic/unwind/` tier** — new `[[lib]]` workspace member
-  (`runtime/cryoconfig` + `runtime/panic/unwind/src/lib.cryo`, ns `CryoRt::Panic::Unwind`).
-  Defines raising `__cryo_panic` (`_Unwind_RaiseException`), `__cryo_personality_v0` (LSDA
-  ULEB128 parse; cleanup + catch), the four check handlers funneling through `__cryo_panic`,
-  and a `![thread_local]` `thread_panicking` flag. `core/` declares `__cryo_panic` (unchanged
-  by strategy).
+- [x] **E. runtime `panic/unwind/` tier** — BUILT, compiler-integrated, and end-to-end validated
+  on WSL (uncaught-panic path). What landed:
+  - **Tier** `runtime/panic/unwind/src/lib.cryo` (ns `CryoRt::Panic::Unwind`) + `[[lib]]` member
+    `cryort-panic-unwind` in `runtime/cryoconfig`. Defines: raising `__cryo_panic`
+    (`_Unwind_RaiseException`; on return = uncaught → print + exit 101); `__cryo_personality_v0`
+    (LSDA `.gcc_except_table` ULEB128 parse — header + call-site table walk, IP→landing-pad,
+    two-phase cleanup/handler install; handles LLVM's encodings [lpStart omit, call-site uleb128],
+    other encodings bail-safe to CONTINUE_UNWIND); the four check handlers (mirror abort, funnel
+    through `__cryo_panic`); `_Unwind_*` `extern "C"` decls. Windows funnel is an abort-style stub
+    (SEH deferred). **NOTE (deviation, stated):** used plain globals for the in-flight exception
+    object, NOT `![thread_local]` — single-threaded first cut; becomes thread-local when the async
+    executor unwinds on worker threads. **NOTE:** action-table ttypeFilter not yet read (single
+    catch-all root uses selector 1); typed catches are a follow-up (Phase D refines).
+  - **Compiler reroute (gated on `project_panic_unwind`):** `IntrinsicEmitter` gained a
+    `panic_unwind` flag (wired from `ctx.project_panic_unwind` in `context.cryo`); `emit_panic_call`
+    now routes to an external `declare __cryo_panic` (via `get_or_decl_cryo_panic`) instead of the
+    per-module libc `linkonce_odr @panic`, so a panic RAISES. `passes.cryo` skips the eager
+    `emit_panic_runtime` under panic_unwind (the linkonce body would be dead). **IR-verified:** under
+    `--panic=unwind`, a panic origin emits `call @__cryo_panic`; the enclosing ordinary call is an
+    `invoke` with `personality @__cryo_personality_v0` + cleanup lpad; both symbols are `declare`d;
+    NO dead `@panic`. Default abort build unchanged (linkonce `@panic`, no EH).
+  - **Link wiring (gated):** `CodegenPasses::append_panic_unwind_libs` appends
+    `<stdlib_root>/../runtime/.bin/libcryort-panic-unwind.a -lunwind` in BOTH link paths
+    (`run_linking` + `run_linking_singlefile`); returns cmd unchanged off panic_unwind. Archive
+    locator is stdlib-root-relative (repo layout); a distribution-time locator is a follow-up.
+  - **`-lunwind` correction (deviation from locked flag, e2e-justified — flag for Jake):** the
+    link wiring links the tier archive but does NOT add `-lunwind`. On a standard gcc/glibc host
+    `libunwind.so.8` ships without a `libunwind.so` dev symlink, so a hardcoded `-lunwind` breaks
+    the link; the identical `_Unwind_*` ABI is already provided by gcc's always-linked `libgcc_s`
+    (the locked decision itself says the provider is a link-time-only choice). An explicit
+    unwinder for an LLVM-libunwind / freestanding combo is a `[link]`-config follow-up.
+  - **Validated:** `verify-freestanding.sh` OK (tier compiles both OSes; abort tier still passes).
+    `make selfhost-check` exit 0, TWO `FIXED POINT OK`, Linux IR md5 unchanged (efc42c06…) across
+    all Phase-C/E changes → default path byte-identical. End-to-end on WSL, BOTH via a manual
+    libgcc_s link AND the compiler's own full link pipeline: a `--panic=unwind` program panicking
+    through an ordinary call → raises, personality parses `main`'s LSDA in phase 1 (clean run =
+    correct call-site walk), uncaught → `panicked at …: boom` + exit 101. Default abort build of
+    the same program still links + runs (SIGABRT/134). **Phase-2 cleanup (drops actually running
+    on unwind) is validated with Phase D** — by the Itanium contract phase 2 is skipped until a
+    phase-1 handler (the root catch) exists.
 - [ ] **D. catch_unwind / root catch** — catch landing pad (`landingpad … catch ptr null`) at
   program/thread root; a `catch_unwind`-style seam returning ok/err. Personality returns
   HANDLER_FOUND (phase 1) / installs (phase 2) for the catch frame.

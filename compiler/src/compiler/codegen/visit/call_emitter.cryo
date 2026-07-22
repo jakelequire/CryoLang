@@ -1130,7 +1130,35 @@ type struct CallEmitter {
                                   ret_kind_is_void;
         const call_name: string = if (is_void) { "" } else { "calltmp" };
         mut result: LValue = LValue::null();
-        result = this.cg.expr_ops.codegen_call(callee_val, fn_ty, args, call_name);
+        // Under `--panic=unwind`, a call whose frame has live droppable locals
+        // must be an `invoke`: on unwind, control lands in a cleanup landing pad
+        // that drops those locals (innermost-first) then `resume`s into the
+        // caller.  DropInsertion recorded the cumulative schedule on
+        // `node.unwind_cleanup`; it is empty on the default abort path, so the
+        // else-branch below emits the identical plain `call` there.
+        const needs_invoke: boolean = this.cg.ctx.project_panic_unwind
+            && node.unwind_cleanup.length > 0;
+        if (needs_invoke) {
+            const cur_fn: LValue = this.get_current_function();
+            if (cur_fn.is_valid()) {
+                const cont_bb: LBasicBlock = LBasicBlock::append(cur_fn, "invoke.cont");
+                const lpad_bb: LBasicBlock = LBasicBlock::append(cur_fn, "invoke.lpad");
+                this.cg.expr_ops.invoke_active = true;
+                this.cg.expr_ops.invoke_normal = cont_bb;
+                this.cg.expr_ops.invoke_lpad   = lpad_bb;
+                result = this.cg.expr_ops.codegen_call(callee_val, fn_ty, args, call_name);
+                // Clear defensively in case an upstream error path returned
+                // before any callee call armed and consumed the flag.
+                this.cg.expr_ops.invoke_active = false;
+                this.emit_cleanup_landingpad(visitor, node, cur_fn, lpad_bb);
+                // `build_call_maybe_invoke` left the builder at `cont_bb`; the
+                // return coercion and any `unreachable` below emit there.
+            } else {
+                result = this.cg.expr_ops.codegen_call(callee_val, fn_ty, args, call_name);
+            }
+        } else {
+            result = this.cg.expr_ops.codegen_call(callee_val, fn_ty, args, call_name);
+        }
 
         // Phase 3 - small-aggregate return coercion.  When the callee
         // was declared with a register-shaped return (Direct-with-
@@ -1209,6 +1237,48 @@ type struct CallEmitter {
 
         this.state.last_value = result;
         this.state.last_is_lvalue = false;
+    }
+
+    /// Emit the cleanup landing pad for an `invoke` under `--panic=unwind`.
+    /// Builds the `{ ptr, i32 }` `landingpad` at the head of `lpad_bb`
+    /// (cleanup-only: no catch clause, so the personality runs destructors and
+    /// keeps unwinding rather than catching here), replays the call's drop
+    /// schedule (`node.unwind_cleanup`, innermost-first) so live locals are
+    /// freed on the unwind path, then `resume`s into the caller's frame.
+    /// Attaches `__cryo_personality_v0` to the enclosing function (idempotent).
+    /// The builder is restored to the block it was called in (the invoke's
+    /// normal continuation) so normal-path codegen resumes there.
+    ///
+    /// The `landingpad` must be the first instruction in `lpad_bb`, so it is
+    /// emitted before the drops; the drops themselves may open init-flag
+    /// branches, leaving the builder at a later merge block, so `resume` is
+    /// emitted wherever the last drop left off (still dominated by the
+    /// landingpad, which is legal).
+    emit_cleanup_landingpad(mut &this, visitor: ASTVisitor*, node: CallExprNode*,
+                            cur_fn: LValue, lpad_bb: LBasicBlock) -> void {
+        const saved_bb: LBasicBlock = this.cg.builder.get_insert_block();
+
+        // Any function with a landing pad needs the personality attached.
+        const pers: LValue = this.cg.expr_ops.get_or_decl_personality();
+        if (pers.is_valid()) { cur_fn.set_personality_fn(pers); }
+
+        this.cg.builder.position_at_end(lpad_bb);
+        const lpad_ty: LType = this.cg.expr_ops.landingpad_type();
+        const lp: LValue = this.cg.builder.build_landing_pad(lpad_ty, 0, "lpad");
+        lp.set_cleanup(true);
+
+        // Replay the cumulative drop schedule (each a synthesized drop-call
+        // statement, up-cast to `ASTNode*` on the node to dodge the
+        // Expr<->Stmt import cycle).  Plain calls: `invoke_active` is clear, so
+        // a drop that itself unwinds propagates without re-entering this pad.
+        for (mut i: i64 = 0; i < node.unwind_cleanup.length; i++) {
+            const d: ASTNode* = node.unwind_cleanup[i];
+            if (d != null) { (d as StatementNode*).accept(visitor); }
+        }
+
+        this.cg.builder.build_resume(lp);
+
+        if (saved_bb.is_valid()) { this.cg.builder.position_at_end(saved_bb); }
     }
 
     /// The callee's Cryo `FunctionType` when an argument MIGHT need the Win64
