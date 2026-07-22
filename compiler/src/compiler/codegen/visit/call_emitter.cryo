@@ -191,6 +191,22 @@ type struct CallEmitter {
                 for (mut ai: i64 = 0; ai < node.arguments.length; ai++) {
                     intr_args.push(this.dispatch.codegen_rvalue(visitor,node.arguments[ai]));
                 }
+                // `--panic=unwind` direct-panic drop-completeness: route the
+                // panic funnel through an invoke + cleanup landing pad so the
+                // frame's live droppable locals drop on unwind (the plain-call
+                // `emit_panic_call` path bypasses the invoke-swap and leaks
+                // them).  Gated on a hosted unwind build WITH live locals; every
+                // other case falls through to the byte-identical `try_emit`
+                // plain-call path below.
+                if (id.name.equals(intern.intern("panic"))
+                    && this.cg.ctx.project_panic_unwind
+                    && !this.cg.intrinsics.no_runtime
+                    && node.unwind_cleanup.length > 0
+                    && intr_args.length >= 3) {
+                    this.emit_panic_unwind(visitor, node,
+                        intr_args[0], intr_args[1], intr_args[2]);
+                    return;
+                }
                 match (this.cg.intrinsics.try_emit(intr_name_str, intr_args)) {
                     Option::Some(v) => {
                         this.state.last_value = v;
@@ -428,6 +444,19 @@ type struct CallEmitter {
                 mut sr_args: LValue[] = [];
                 for (mut sai: i64 = 0; sai < node.arguments.length; sai++) {
                     sr_args.push(this.dispatch.codegen_rvalue(visitor,node.arguments[sai]));
+                }
+                // `--panic=unwind` direct-panic drop-completeness (mirrors the
+                // Identifier branch): `intrinsics::panic(...)` / `core::panic`'s
+                // inner call arrive here as a ScopeResolution intrinsic.  Route
+                // through invoke + cleanup pad when the frame has live locals.
+                if (sr.member_name.equals(intern.intern("panic"))
+                    && this.cg.ctx.project_panic_unwind
+                    && !this.cg.intrinsics.no_runtime
+                    && node.unwind_cleanup.length > 0
+                    && sr_args.length >= 3) {
+                    this.emit_panic_unwind(visitor, node,
+                        sr_args[0], sr_args[1], sr_args[2]);
+                    return;
                 }
                 match (this.cg.intrinsics.try_emit(sr_leaf_str, sr_args)) {
                     Option::Some(v) => {
@@ -1274,6 +1303,18 @@ type struct CallEmitter {
     /// landingpad, which is legal).
     emit_cleanup_landingpad(mut &this, visitor: ASTVisitor*, node: CallExprNode*,
                             cur_fn: LValue, lpad_bb: LBasicBlock) -> void {
+        this.emit_cleanup_landingpad_sched(visitor, &node.unwind_cleanup, cur_fn, lpad_bb);
+    }
+
+    /// Schedule-driven core of `emit_cleanup_landingpad`.  Takes the drop
+    /// schedule directly (rather than reading it off a `CallExprNode`) so panic
+    /// origins that are NOT ordinary calls - a direct `panic()`, a synthesized
+    /// bounds/overflow/div-zero/no-match check - reuse the identical cleanup
+    /// landing pad. `sched` is a pointer to the origin node's cumulative
+    /// drop-schedule array (innermost-first, each a synthesized drop-call
+    /// statement up-cast to `ASTNode*`).
+    emit_cleanup_landingpad_sched(mut &this, visitor: ASTVisitor*, sched: ASTNode*[]*,
+                                  cur_fn: LValue, lpad_bb: LBasicBlock) -> void {
         const saved_bb: LBasicBlock = this.cg.builder.get_insert_block();
 
         // Any function with a landing pad needs the personality attached.
@@ -1289,14 +1330,64 @@ type struct CallEmitter {
         // statement, up-cast to `ASTNode*` on the node to dodge the
         // Expr<->Stmt import cycle).  Plain calls: `invoke_active` is clear, so
         // a drop that itself unwinds propagates without re-entering this pad.
-        for (mut i: i64 = 0; i < node.unwind_cleanup.length; i++) {
-            const d: ASTNode* = node.unwind_cleanup[i];
+        for (mut i: i64 = 0; i < sched.length; i++) {
+            const d: ASTNode* = sched[i];
             if (d != null) { (d as StatementNode*).accept(visitor); }
         }
 
         this.cg.builder.build_resume(lp);
 
         if (saved_bb.is_valid()) { this.cg.builder.position_at_end(saved_bb); }
+    }
+
+    /// Direct-panic origin under `--panic=unwind`: emit the raising
+    /// `__cryo_panic(msg,file,line)` funnel as an `invoke` into a cleanup
+    /// landing pad that drops the frame's live locals (innermost-first) before
+    /// the unwind continues, then `resume`s.  Without this the panic intrinsic
+    /// lowers to a plain `call` (`emit_panic_call`) that bypasses the ordinary
+    /// call's invoke-swap, so a droppable local live at the panic point leaks.
+    /// Reuses `node.unwind_cleanup` (DropInsertion populates it for EVERY call,
+    /// panic included).  Only taken when the frame has live droppable locals and
+    /// the hosted raising funnel applies; the plain-call fast-path (empty
+    /// schedule / abort mode / freestanding trap) stays byte-identical through
+    /// `emit_panic_call`.
+    emit_panic_unwind(mut &this, visitor: ASTVisitor*, node: CallExprNode*,
+                      msg: LValue, file: LValue, line: LValue) -> void {
+        const cur_fn: LValue = this.get_current_function();
+        if (!cur_fn.is_valid()) {
+            // No enclosing function to hang a landing pad on; diverge plainly.
+            this.cg.intrinsics.emit_panic_call(msg, file, line);
+            return;
+        }
+        const cont_bb: LBasicBlock = LBasicBlock::append(cur_fn, "panic.cont");
+        const lpad_bb: LBasicBlock = LBasicBlock::append(cur_fn, "panic.lpad");
+
+        const panic_fn: LValue = this.cg.intrinsics.get_or_decl_cryo_panic();
+        const fty: LType = LType { raw: llvm::LLVMGlobalGetValueType(panic_fn.raw) };
+        const arg_buf: void* = intrinsics::malloc(24);
+        const arg_slots: void** = arg_buf as void**;
+        arg_slots[0] = msg.raw;
+        arg_slots[1] = file.raw;
+        arg_slots[2] = line.raw;
+
+        // Arm the invoke swap so `build_call_maybe_invoke` emits
+        // `invoke @__cryo_panic(...) to cont unwind lpad` and leaves the builder
+        // at `cont`.
+        this.cg.expr_ops.invoke_active = true;
+        this.cg.expr_ops.invoke_normal = cont_bb;
+        this.cg.expr_ops.invoke_lpad   = lpad_bb;
+        this.cg.expr_ops.build_call_maybe_invoke(fty, panic_fn, arg_buf, 3, "");
+        this.cg.expr_ops.invoke_active = false;
+        intrinsics::free(arg_buf);
+
+        // The funnel is noreturn: its invoke normal-dest is unreachable.
+        this.cg.builder.build_unreachable();
+
+        // Cleanup pad: drop the frame's live locals, then resume the unwind.
+        this.emit_cleanup_landingpad(visitor, node, cur_fn, lpad_bb);
+
+        this.state.last_value = LValue::null();
+        this.state.last_is_lvalue = false;
     }
 
     /// Lower the `try_catch(body, data)` catch_unwind primitive.  `body` is an
