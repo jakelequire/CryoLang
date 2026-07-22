@@ -1301,43 +1301,13 @@ type struct CallEmitter {
     /// branches, leaving the builder at a later merge block, so `resume` is
     /// emitted wherever the last drop left off (still dominated by the
     /// landingpad, which is legal).
+    /// The schedule-driven core lives on `ExprOps` (reachable from the
+    /// synthesized-check origins too); this forwards the ordinary-call schedule
+    /// to it.
     emit_cleanup_landingpad(mut &this, visitor: ASTVisitor*, node: CallExprNode*,
                             cur_fn: LValue, lpad_bb: LBasicBlock) -> void {
-        this.emit_cleanup_landingpad_sched(visitor, &node.unwind_cleanup, cur_fn, lpad_bb);
-    }
-
-    /// Schedule-driven core of `emit_cleanup_landingpad`.  Takes the drop
-    /// schedule directly (rather than reading it off a `CallExprNode`) so panic
-    /// origins that are NOT ordinary calls - a direct `panic()`, a synthesized
-    /// bounds/overflow/div-zero/no-match check - reuse the identical cleanup
-    /// landing pad. `sched` is a pointer to the origin node's cumulative
-    /// drop-schedule array (innermost-first, each a synthesized drop-call
-    /// statement up-cast to `ASTNode*`).
-    emit_cleanup_landingpad_sched(mut &this, visitor: ASTVisitor*, sched: ASTNode*[]*,
-                                  cur_fn: LValue, lpad_bb: LBasicBlock) -> void {
-        const saved_bb: LBasicBlock = this.cg.builder.get_insert_block();
-
-        // Any function with a landing pad needs the personality attached.
-        const pers: LValue = this.cg.expr_ops.get_or_decl_personality();
-        if (pers.is_valid()) { cur_fn.set_personality_fn(pers); }
-
-        this.cg.builder.position_at_end(lpad_bb);
-        const lpad_ty: LType = this.cg.expr_ops.landingpad_type();
-        const lp: LValue = this.cg.builder.build_landing_pad(lpad_ty, 0, "lpad");
-        lp.set_cleanup(true);
-
-        // Replay the cumulative drop schedule (each a synthesized drop-call
-        // statement, up-cast to `ASTNode*` on the node to dodge the
-        // Expr<->Stmt import cycle).  Plain calls: `invoke_active` is clear, so
-        // a drop that itself unwinds propagates without re-entering this pad.
-        for (mut i: i64 = 0; i < sched.length; i++) {
-            const d: ASTNode* = sched[i];
-            if (d != null) { (d as StatementNode*).accept(visitor); }
-        }
-
-        this.cg.builder.build_resume(lp);
-
-        if (saved_bb.is_valid()) { this.cg.builder.position_at_end(saved_bb); }
+        this.cg.expr_ops.emit_cleanup_landingpad_sched(
+            visitor, &node.unwind_cleanup, cur_fn, lpad_bb);
     }
 
     /// Direct-panic origin under `--panic=unwind`: emit the raising
