@@ -1,0 +1,84 @@
+/// A `let` local declared inside a match-*expression* arm and NOT yielded as
+/// the arm value must be dropped exactly once at the arm's end - after the arm
+/// value expression has been materialised (it may still read the local), and
+/// without displacing the value statement. A local that IS yielded must be
+/// moved out and dropped once by the owner, never dropped a second time in the
+/// arm. The exit code encodes which invariant failed; 0 means all held.
+namespace MatchExprArmDrop::Main;
+
+import std::core::intrinsics;
+
+mut g_drops: i32 = 0;
+
+type struct Tracked {
+    id: i32;
+    drop(mut &this) -> void {
+        g_drops = g_drops + 1;
+        this.id = -999;   // poison: a use-after-drop becomes observable
+    }
+}
+
+function use_ref(t: Tracked*) -> i32 {
+    return (*t).id + 1;
+}
+
+// Non-yielded local; arm value is a Copy field read -> local dropped once.
+function pick_copy(n: i32) -> i32 {
+    return match (n) {
+        0 => {
+            const t: Tracked = Tracked { id: 99 };
+            t.id
+        }
+        _ => { -1 }
+    };
+}
+
+// Arm value reads the non-yielded local by borrow -> drop must run AFTER it.
+function pick_read(n: i32) -> i32 {
+    return match (n) {
+        0 => {
+            const t: Tracked = Tracked { id: 42 };
+            use_ref(&t)
+        }
+        _ => { -1 }
+    };
+}
+
+// Yielded local: moved out as the arm value -> dropped once by the owner.
+function pick_move(n: i32) -> Tracked {
+    return match (n) {
+        0 => {
+            const t: Tracked = Tracked { id: 7 };
+            t
+        }
+        _ => { Tracked { id: -1 } }
+    };
+}
+
+function take_and_drop() -> i32 {
+    mut owned: Tracked = pick_move(0);
+    return owned.id;   // read it; drops at scope exit
+}
+
+function main() -> int {
+    // 1) non-yielded Copy-value arm local: dropped exactly once.
+    g_drops = 0;
+    const r1: i32 = pick_copy(0);
+    if (r1 != 99) { return 10; }
+    if (g_drops != 1) { return 20 + g_drops; }
+
+    // 2) arm value reads the local by borrow: value seen BEFORE the drop.
+    g_drops = 0;
+    const r2: i32 = pick_read(0);
+    if (r2 != 43) { return 30; }          // -998 would mean the drop ran first
+    if (g_drops != 1) { return 40 + g_drops; }
+
+    // 3) yielded local moved out: dropped exactly once by the owner.
+    g_drops = 0;
+    const v: i32 = take_and_drop();
+    if (v != 7) { return 55; }
+    if (g_drops != 1) { return 60 + g_drops; }
+
+    intrinsics::printf("arm-drop ok: r1=%d r2=%d v=%d\n", r1, r2, v);
+    return 0;
+}

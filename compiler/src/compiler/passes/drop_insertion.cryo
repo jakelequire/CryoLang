@@ -654,10 +654,23 @@ type struct DropInserter {
         // in reverse declaration order, skipping any that have already
         // been moved on this path.  Suppressed when the block was
         // unconditionally terminated (drops were already emitted right
-        // before the early-exit), and for value blocks (a match-arm
-        // value statement must stay last; see `walk_value_block`).
-        if (!terminated && !value_block) {
-            this.append_top_scope_drops(&new_stmts);
+        // before the early-exit).
+        if (!terminated) {
+            if (value_block) {
+                // Match-expression arm: the arm's own non-yielded locals must
+                // still be dropped, but the value statement has to stay last
+                // for codegen's arm-value extraction and the drops have to run
+                // AFTER the value expression (which may read a local being
+                // dropped).  So stash them on the block; codegen replays them
+                // at block end once the arm value is materialised (see
+                // `generate_block` + `BlockStmtNode.synth_drops`).  A yielded
+                // local was marked moved by the value statement's move-context
+                // walk above, so `append_top_scope_drops` skips it - no
+                // double-free of the match result.
+                this.append_top_scope_drops(&block.synth_drops);
+            } else {
+                this.append_top_scope_drops(&new_stmts);
+            }
         }
 
         block.statements = new_stmts;

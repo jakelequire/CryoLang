@@ -109,6 +109,15 @@ type enum LLinkage : i32 {
     LinkerPrivateWeak   = 16;
 }
 
+/// Mirror of `LLVMUnnamedAddr` (`llvm-c/Core.h`).  Marks whether a global's
+/// address is significant; `Global` lets the linker merge identical
+/// constants - what `LLVMBuildGlobalStringPtr` sets on its string literals.
+type enum LUnnamedAddr : i32 {
+    None   = 0;
+    Local  = 1;
+    Global = 2;
+}
+
 /// Mirror of `LLVMVerifierFailureAction` (`llvm-c/Analysis.h`).
 type enum LVerifierAction : i32 {
     AbortProcess = 0;
@@ -876,6 +885,19 @@ type struct LValue {
         llvm::LLVMSetGlobalConstant(this.raw, is_const as i32);
     }
 
+    /// Set a global's unnamed-address kind (see LUnnamedAddr).  `Global`
+    /// tells the linker the address is not significant, so identical
+    /// constants may be merged - the mode `LLVMBuildGlobalStringPtr` uses
+    /// for its string globals.
+    set_unnamed_address(&this, addr: LUnnamedAddr) -> void {
+        llvm::LLVMSetUnnamedAddress(this.raw, addr as i32);
+    }
+
+    /// Set the alignment, in bytes, of a global or memory instruction.
+    set_alignment(&this, bytes: u32) -> void {
+        llvm::LLVMSetAlignment(this.raw, bytes);
+    }
+
     /// Mark a global as thread-local (each thread gets its own instance). LLVM
     /// picks the default (general-dynamic) TLS model and inserts the TLS
     /// lowering at every reference; the OS/loader provides the per-thread block.
@@ -1073,6 +1095,17 @@ type struct LType {
 
     static const_array(element_ty: LType, values: void*, count: u32) -> LValue {
         return LValue { raw: llvm::LLVMConstArray(element_ty.raw, values, count) };
+    }
+
+    /// Build a NUL-terminated `[len+1 x i8]` array constant from `text`
+    /// (`c"...\00"`).  `len` is the strlen of the C string, matching what
+    /// `LLVMBuildGlobalStringPtr` measures.  Interns the constant in the
+    /// current per-module context (not the implicit global one) so it stays
+    /// private to that module during parallel emit - same rationale as
+    /// `const_struct`.
+    static const_string(text: string) -> LValue {
+        return LValue { raw: llvm::LLVMConstStringInContext(
+            LContext::current().raw, text, text.length() as u32, 0) };
     }
 
     /// Typed wrapper around `LLVMGetTypeKind` for raw `LLVMTypeRef` handles
