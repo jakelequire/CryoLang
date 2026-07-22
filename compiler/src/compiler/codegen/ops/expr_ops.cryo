@@ -67,6 +67,30 @@ type struct ExprOps {
     invoke_normal: LBasicBlock;
     invoke_lpad:   LBasicBlock;
 
+    /// Live anonymous owning argument temporaries (`--panic=unwind` only).
+    /// `f(make(), boom())`: make()'s result is an owning temp with no AST
+    /// binding, so DropInsertion's name-keyed pending-arg machinery cannot
+    /// schedule its drop. CallEmitter spills each such temp to a stable slot,
+    /// registers it under a synthetic name in the value table, and pushes a
+    /// ready-made `<name>.drop()` statement here. A panic origin nested in a
+    /// LATER argument (a call that unwinds, or a synthesized div/bounds/no-match/
+    /// overflow check) drops the WHOLE live stack in its cleanup pad before the
+    /// unwind continues: at the panic point the enclosing calls have not run
+    /// (their args are still evaluating), so nobody else will drop these temps.
+    /// `arg_temp_frames[k]` records where the k-th in-progress call's temps
+    /// begin, so CallEmitter truncates them once that call is fully built (the
+    /// callee now owns them). Populated only under a hosted unwind build, so the
+    /// default abort path allocates nothing and its IR is unchanged.
+    arg_temp_drops:  ASTNode*[];
+    arg_temp_frames: i64[];
+
+    /// Set while a cleanup landing pad replays its drops. The synthesized
+    /// `<name>.drop()` calls route back through the ordinary call path, whose
+    /// invoke decision consults `arg_temp_drops`; without this guard a drop
+    /// emitted inside the pad would itself become an invoke that re-drops the
+    /// same stack. Suppresses only the arg-temp half of the invoke decision.
+    suppress_arg_temp_invoke: boolean;
+
     static null() -> ExprOps {
         return ExprOps {
             llvm_module: null,
@@ -84,6 +108,9 @@ type struct ExprOps {
             invoke_active: false,
             invoke_normal: LBasicBlock::null(),
             invoke_lpad:   LBasicBlock::null(),
+            arg_temp_drops:  [],
+            arg_temp_frames: [],
+            suppress_arg_temp_invoke: false,
         };
     }
 
@@ -986,14 +1013,58 @@ type struct ExprOps {
         return t;
     }
 
+    // ---- live anonymous arg-temp tracking (`--panic=unwind`) -------------
+    //
+    // A dedicated stack (kept in small methods so CallEmitter never manipulates
+    // it inline - an inline array-stack push/pop embedded in the large call
+    // emitter miscompiled the inc-4 named path). CallEmitter opens a frame per
+    // in-progress call, pushes a `<name>.drop()` statement per anonymous owning
+    // temp, and closes the frame once the call is fully built.
+
+    /// Open a frame for a call whose arguments are about to be evaluated.
+    open_arg_temp_frame(mut &this) -> void {
+        this.arg_temp_frames.push(this.arg_temp_drops.length);
+    }
+
+    /// Close the innermost frame: the call is fully built, so its argument
+    /// temporaries are now owned by the callee and drop out of the live set.
+    /// Read-then-truncate (mirrors DropInserter::close_pending_arg_frame).
+    close_arg_temp_frame(mut &this) -> void {
+        const top: i64 = this.arg_temp_frames.length;
+        if (top == 0) { return; }
+        const start: i64 = this.arg_temp_frames[top - 1];
+        this.arg_temp_frames.pop();
+        while (this.arg_temp_drops.length > start) {
+            this.arg_temp_drops.pop();
+        }
+    }
+
+    /// Record a ready-made `<name>.drop()` statement for a live anonymous owning
+    /// arg temp (built by CallEmitter, whose name is bound to the temp's slot in
+    /// the value table).
+    push_arg_temp_drop(mut &this, stmt: ASTNode*) -> void {
+        if (stmt != null) { this.arg_temp_drops.push(stmt); }
+    }
+
+    /// True when a panic origin must invoke into a cleanup pad to drop live
+    /// anonymous arg temps.  Suppressed while a pad is already replaying its
+    /// drops, so a drop-call emitted inside the pad does not re-invoke.
+    has_live_arg_temps(&this) -> boolean {
+        return this.arg_temp_drops.length > 0 && !this.suppress_arg_temp_invoke;
+    }
+
     /// Schedule-driven cleanup landing pad for `--panic=unwind`, shared by the
     /// ordinary-call path (CallEmitter forwards to here) and the synthesized
-    /// check origins.  Builds a cleanup-only `landingpad` at `lpad_bb`, replays
-    /// the drop schedule (`sched`, innermost-first, each a drop-call statement
-    /// up-cast to `ASTNode*`) via `accept(visitor)`, then `resume`s.  Attaches
-    /// the personality to `cur_fn` (idempotent) and restores the builder to
-    /// where it was called from.  `invoke_active` is clear here, so a drop that
-    /// itself unwinds propagates without re-entering this pad.
+    /// check origins.  Builds a cleanup-only `landingpad` at `lpad_bb`, drops the
+    /// live anonymous arg temps (whole stack, most-recent first - at the panic
+    /// point the enclosing calls have not run, so this pad is the only one that
+    /// frees them), replays the drop schedule (`sched`, innermost-first, each a
+    /// drop-call statement up-cast to `ASTNode*`) via `accept(visitor)`, then
+    /// `resume`s.  Attaches the personality to `cur_fn` (idempotent) and restores
+    /// the builder to where it was called from.  `invoke_active` is clear here,
+    /// so a drop that itself unwinds propagates without re-entering this pad; the
+    /// arg-temp invoke path is suppressed across both replays so a drop-call does
+    /// not re-drop the stack.
     emit_cleanup_landingpad_sched(mut &this, visitor: ASTVisitor*, sched: ASTNode*[]*,
                                   cur_fn: LValue, lpad_bb: LBasicBlock) -> void {
         const saved_bb: LBasicBlock = this.builder.get_insert_block();
@@ -1003,10 +1074,17 @@ type struct ExprOps {
         const lpad_ty: LType = this.landingpad_type();
         const lp: LValue = this.builder.build_landing_pad(lpad_ty, 0, "lpad");
         lp.set_cleanup(true);
+        const saved_suppress: boolean = this.suppress_arg_temp_invoke;
+        this.suppress_arg_temp_invoke = true;
+        for (mut a: i64 = this.arg_temp_drops.length - 1; a >= 0; a--) {
+            const t: ASTNode* = this.arg_temp_drops[a];
+            if (t != null) { (t as StatementNode*).accept(visitor); }
+        }
         for (mut i: i64 = 0; i < sched.length; i++) {
             const d: ASTNode* = sched[i];
             if (d != null) { (d as StatementNode*).accept(visitor); }
         }
+        this.suppress_arg_temp_invoke = saved_suppress;
         this.builder.build_resume(lp);
         if (saved_bb.is_valid()) { this.builder.position_at_end(saved_bb); }
     }
@@ -1037,7 +1115,12 @@ type struct ExprOps {
         arg_slots[1] = file.raw;
         arg_slots[2] = line.raw;
 
-        const has_cleanup: boolean = sched != null && sched.length > 0;
+        // Live anonymous arg temps also demand the invoke+pad path even when the
+        // frame has no named schedule (`sched` empty): a div/bounds/no-match/
+        // overflow check nested in a later argument must drop the temps built by
+        // earlier arguments before the unwind leaves the frame.
+        const has_cleanup: boolean = (sched != null && sched.length > 0)
+            || this.has_live_arg_temps();
         if (has_cleanup) {
             const cur_bb: LBasicBlock = this.builder.get_insert_block();
             const cur_fn: LValue = cur_bb.get_parent();
