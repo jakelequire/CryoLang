@@ -149,6 +149,17 @@ type struct CallEmitter {
         if (node.callee.kind == NodeKind::Identifier) {
             const id: IdentifierNode* = node.callee as IdentifierNode*;
 
+            // `try_catch(body, data)` - the catch_unwind primitive.  Needs an
+            // `invoke` + a catch-all landing pad + a phi (control flow the
+            // generic `try_emit` inline path cannot build), so it is special-
+            // lowered here rather than through `IntrinsicKind`.  Handles both
+            // the bare and `intrinsics::`-qualified call shapes (ScopeResolution
+            // branch below).
+            if (id.name.equals(intern.intern("try_catch"))) {
+                this.emit_catch_unwind(visitor, node);
+                return;
+            }
+
             // Intrinsics first: `i32_to_i64`, `ptr_diff`, `bswap32`, etc.
             // are emitted as inline LLVM IR, not as real function calls,
             // so they have no LLVM definition.  If sema pinned
@@ -386,6 +397,13 @@ type struct CallEmitter {
             // qualified type name, then build the combined key.
             const sr: ScopeResolutionNode* = node.callee as ScopeResolutionNode*;
             const di: DeclarationIndex* = this.cg.get_decl_index();
+
+            // `intrinsics::try_catch(body, data)` - the catch_unwind primitive.
+            // See the Identifier-branch twin for why this is special-lowered.
+            if (sr.member_name.equals(intern.intern("try_catch"))) {
+                this.emit_catch_unwind(visitor, node);
+                return;
+            }
 
             // Inline-lower intrinsics referenced via a namespace prefix
             // (e.g., `intrinsics::fpclass`, `intrinsics::ptr_diff`).  The
@@ -1279,6 +1297,128 @@ type struct CallEmitter {
         this.cg.builder.build_resume(lp);
 
         if (saved_bb.is_valid()) { this.cg.builder.position_at_end(saved_bb); }
+    }
+
+    /// Lower the `try_catch(body, data)` catch_unwind primitive.  `body` is an
+    /// opaque `(void*) -> void` trampoline (the stdlib `catch_unwind` wrapper
+    /// builds it, capturing the real body fn-ptr + the result slot in `data`),
+    /// so this lowering needs no knowledge of the caught value's type.
+    ///
+    /// Under `--panic=unwind`:
+    ///   invoke body(data) to cu.cont unwind cu.lpad
+    /// cu.cont:  br cu.done                        ; body returned normally
+    /// cu.lpad:  landingpad {ptr,i32} catch null   ; a panic unwound to here
+    ///           br cu.done
+    /// cu.done:  %caught = phi i1 [false,cu.cont],[true,cu.lpad]
+    /// yielding `%caught` (boolean).  The pad is catch-all + UNCONDITIONAL (it
+    /// never inspects the selector): every Cryo panic that unwinds this far is
+    /// caught.  Attaching a catch clause here is what makes this frame the
+    /// Itanium phase-1 handler, so the intermediate frames' cleanup landing
+    /// pads (Phase C) actually run their drops in phase 2.
+    ///
+    /// `catch_unwind` requires `--panic=unwind`: it is meaningless under the
+    /// abort strategy (a panic terminates the process rather than unwinding, so
+    /// there is nothing to catch) and its runtime payload accessors live only in
+    /// the unwind tier.  Off `--panic=unwind` this is a clear compile error
+    /// rather than a plain call that would fail to link with undefined
+    /// `__cryo_panic_taken_*` symbols.  The default path never reaches here (the
+    /// stdlib `catch_unwind` is generic and uninstantiated unless a program
+    /// calls it), so this leaves the default IR byte-identical.
+    emit_catch_unwind(mut &this, visitor: ASTVisitor*, node: CallExprNode*) -> void {
+        if (node.arguments.length != 2) {
+            this.cg.diag.emit_error_at_span(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL,
+                "codegen: try_catch expects exactly two arguments (body, data)",
+                node.span);
+            this.state.last_value = LValue::null();
+            this.state.last_is_lvalue = false;
+            return;
+        }
+
+        if (!this.cg.ctx.project_panic_unwind) {
+            this.cg.diag.emit_error_at_span(ErrorCode::E0600_CODEGEN_FAILED,
+                "`catch_unwind` requires the unwinding panic strategy; rebuild with `--panic=unwind` (or set `panic = \"unwind\"` in cryoconfig). Under the default `--panic=abort` a panic terminates the process, so there is nothing to catch.",
+                node.span);
+            this.state.last_value = LValue::null();
+            this.state.last_is_lvalue = false;
+            return;
+        }
+
+        const body_ptr: LValue = this.dispatch.codegen_rvalue(visitor, node.arguments[0]);
+        const data_ptr: LValue = this.dispatch.codegen_rvalue(visitor, node.arguments[1]);
+        if (!body_ptr.is_valid() || !data_ptr.is_valid()) {
+            this.state.last_value = LValue::null();
+            this.state.last_is_lvalue = false;
+            return;
+        }
+
+        // Trampoline LLVM type: `void (ptr)`.
+        const ptr_ty: LType = LType::pointer_to(LType::i8());
+        const param_buf: void* = intrinsics::malloc(8);
+        const param_slots: void** = param_buf as void**;
+        param_slots[0] = ptr_ty.raw;
+        const body_fty: LType = LType::function_type(LType::void_type(), param_buf, 1, false);
+        intrinsics::free(param_buf);
+
+        const arg_buf: void* = intrinsics::malloc(8);
+        const arg_slots: void** = arg_buf as void**;
+        arg_slots[0] = data_ptr.raw;
+
+        const bool_ty: LType = LType::i1();
+
+        const cur_fn: LValue = this.get_current_function();
+        if (!cur_fn.is_valid()) {
+            intrinsics::free(arg_buf);
+            this.state.last_value = LValue::null();
+            this.state.last_is_lvalue = false;
+            return;
+        }
+
+        const cont_bb: LBasicBlock = LBasicBlock::append(cur_fn, "cu.cont");
+        const lpad_bb: LBasicBlock = LBasicBlock::append(cur_fn, "cu.lpad");
+        const done_bb: LBasicBlock = LBasicBlock::append(cur_fn, "cu.done");
+
+        // Any function with a landing pad needs the personality attached.
+        const pers: LValue = this.cg.expr_ops.get_or_decl_personality();
+        if (pers.is_valid()) { cur_fn.set_personality_fn(pers); }
+
+        // `invoke` is a terminator; the builder must be repositioned to a real
+        // block before any further emission (done below at cont_bb).
+        this.cg.builder.build_invoke(body_fty, body_ptr, arg_buf, 1, cont_bb, lpad_bb, "");
+        intrinsics::free(arg_buf);
+
+        const false_val: LValue = LType::const_int(bool_ty, 0, false);
+        const true_val: LValue = LType::const_int(bool_ty, 1, false);
+
+        // Normal edge: body returned; nothing was caught.
+        this.cg.builder.position_at_end(cont_bb);
+        this.cg.builder.build_br(done_bb);
+
+        // Unwind edge: catch-all landing pad.  The landingpad must be the first
+        // non-phi instruction in the block.  No `set_cleanup` - the catch
+        // clause alone makes this the phase-1 handler.
+        this.cg.builder.position_at_end(lpad_bb);
+        const lpad_ty: LType = this.cg.expr_ops.landingpad_type();
+        const lp: LValue = this.cg.builder.build_landing_pad(lpad_ty, 1, "cu.eh");
+        lp.add_clause(LType::const_pointer_null(ptr_ty));
+        this.cg.builder.build_br(done_bb);
+
+        // Merge: caught flag.
+        this.cg.builder.position_at_end(done_bb);
+        const phi: LValue = this.cg.builder.build_phi(bool_ty, "cu.caught");
+        const vals_buf: void* = intrinsics::malloc(16);
+        const vals: void** = vals_buf as void**;
+        vals[0] = false_val.raw;
+        vals[1] = true_val.raw;
+        const blks_buf: void* = intrinsics::malloc(16);
+        const blks: void** = blks_buf as void**;
+        blks[0] = cont_bb.raw;
+        blks[1] = lpad_bb.raw;
+        phi.add_incoming(vals_buf, blks_buf, 2);
+        intrinsics::free(vals_buf);
+        intrinsics::free(blks_buf);
+
+        this.state.last_value = phi;
+        this.state.last_is_lvalue = false;
     }
 
     /// The callee's Cryo `FunctionType` when an argument MIGHT need the Win64

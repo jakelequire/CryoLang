@@ -1,0 +1,105 @@
+///! catch_unwind: turn a panic into a value.
+///!
+///! `catch_unwind(f)` runs `f` and, if a panic unwinds out of it, catches the
+///! unwind and returns `Err(PanicInfo)` instead of letting it reach the process
+///! root. It is the async task-isolation primitive (a panicking task becomes an
+///! error, not a process abort) AND the mechanism that makes destructors run on
+///! panic: by the Itanium two-phase contract, a catch is the phase-1 handler
+///! that lets every intermediate frame's cleanup landing pad run its drops in
+///! phase 2 (without a catch, an uncaught panic finds no handler and skips
+///! phase 2 entirely).
+///!
+///! Requires `--panic=unwind` (or `panic = "unwind"` in cryoconfig). Under the
+///! default `--panic=abort` strategy a panic terminates the process rather than
+///! unwinding, so there is nothing to catch: calling `catch_unwind` there is a
+///! compile error. Supporting it as a no-op-catch under abort (the body still
+///! runs; a panic still aborts) is a follow-up that needs the payload accessors
+///! made available off the unwind tier.
+///!
+///! `f` is a plain function pointer, not a capturing closure (a capturing
+///! closure passed to a generic does not yet compile) - bind captured state
+///! into a named function or a non-capturing lambda, exactly like
+///! `thread::spawn`.
+///!
+///! ## Implementation
+///!
+///! Intrinsics cannot be generic or take fn-ptr parameters, so the value is
+///! transported the way Rust's `try` intrinsic does it: the compiler primitive
+///! `intrinsics::try_catch(body, data)` invokes an OPAQUE `(void*) -> void`
+///! trampoline inside a catch-all landing pad and returns whether it caught.
+///! `catch_unwind` builds a per-`T` `CatchCtx` (the body fn-ptr + a pointer to
+///! an uninitialized result slot), points `data` at it, and passes the
+///! monomorphized `run_catch_body<T>` as the trampoline. The trampoline runs
+///! the body and stores its result through the raw `T*` - writing through the
+///! pointer avoids drop-synthesis on the uninitialized destination, the same
+///! idiom `thread::thread_body` uses. On a panic the store never runs and the
+///! result slot stays uninitialized (so it is never dropped on the `Err` path).
+
+namespace std::core::panic_unwind;
+
+import core::intrinsics;
+import core::result;
+
+/// The payload a caught panic reports: the panic message and the source
+/// location it was raised from. Mirrors the fields the runtime funnel
+/// (`runtime/panic/unwind`) stashes when it raises.
+type struct PanicInfo {
+    msg:  string;
+    file: string;
+    line: u32;
+}
+
+/// Per-`T` context handed to the opaque trampoline through one `void*`: the
+/// body to run and where to put its result. All-`Copy` (a fn-ptr plus a raw
+/// pointer), so it owns nothing and is never dropped regardless of `T`.
+type struct CatchCtx<T> {
+    body: () -> T;
+    out:  T*;
+}
+
+/// The void-returning trampoline `intrinsics::try_catch` invokes inside its
+/// catch pad. Recovers the context from `data`, runs the body, and stores the
+/// result through the raw `T*`. Writing through the pointer keeps the store
+/// invisible to drop-synthesis so the uninitialized destination is not dropped
+/// (same idiom as `thread::thread_body`'s `*rptr = body(c)`). If `body()`
+/// panics, control unwinds out before the store - straight through this frame,
+/// which owns no droppable locals - to the catch pad in `try_catch`'s frame.
+function run_catch_body<T>(data: u8*) -> void {
+    const ctx:  CatchCtx<T>* = data as CatchCtx<T>*;
+    const out:  T*     = (*ctx).out;
+    const body: () -> T = (*ctx).body;
+    *out = body();
+}
+
+/// The unwind runtime tier stashes the in-flight panic's message/file/line
+/// before it raises; these read them back to build a caught panic's
+/// `PanicInfo`. Defined in `runtime/panic/unwind` (linked under
+/// `--panic=unwind`). Referenced only from the generic `catch_unwind` below, so
+/// they stay unreferenced - and therefore unemitted - on the default abort path.
+extern "C" {
+    function __cryo_panic_taken_message() -> string;
+    function __cryo_panic_taken_file() -> string;
+    function __cryo_panic_taken_line() -> u32;
+}
+
+/// Run `f`, catching a panic that unwinds out of it. Returns `Ok(v)` with the
+/// body's result on a normal return, or `Err(info)` if `f` (or anything it
+/// transitively calls) panicked. See the module doc for the requirements and
+/// the abort-strategy caveat.
+function catch_unwind<T>(f: () -> T) -> Result<T, PanicInfo> {
+    // Uninitialized result slot: written only on the normal path (through the
+    // trampoline's raw `T*`, invisible to drop-synthesis) and moved out into
+    // `Ok` there; on the `Err` path it is never assigned, so it is not dropped.
+    mut result: T;
+    mut ctx: CatchCtx<T> = CatchCtx<T> { body: f, out: &result };
+    const tramp: (u8*) -> void = run_catch_body<T>;
+    const caught: boolean = intrinsics::try_catch(tramp as void*, &ctx as void*);
+    if (caught) {
+        return Result::Err(PanicInfo {
+            msg:  __cryo_panic_taken_message(),
+            file: __cryo_panic_taken_file(),
+            line: __cryo_panic_taken_line(),
+        });
+    }
+    return Result::Ok(result);
+}
