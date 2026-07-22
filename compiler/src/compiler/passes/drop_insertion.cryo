@@ -1871,6 +1871,26 @@ type struct DropInserter {
         this.append_drops_to_depth(out, 0);
     }
 
+    /// Snapshot the cumulative cleanup schedule (drops for every live
+    /// droppable local, to function root, innermost-first) onto a call node
+    /// so codegen can replay it in the call's `--panic=unwind` cleanup
+    /// landing pad.  Only already-declared live locals are included (the
+    /// binding arrays hold exactly those registered so far), so no drop of
+    /// not-yet-live storage is scheduled; the move/init flags handle the
+    /// conditional cases at runtime, identically to the normal-path drops.
+    /// An empty schedule (no live local needs dropping) tells codegen to
+    /// emit a plain `call` instead of an `invoke`.  Gated on panic=unwind by
+    /// the caller.  Stored as `ASTNode*` (up-cast from `StatementNode*`) to
+    /// match the node's cycle-avoiding field type.
+    populate_unwind_cleanup(mut &this, c: CallExprNode*) -> void {
+        if (c == null) { return; }
+        mut sched: StatementNode*[] = [];
+        this.append_cumulative_drops(&sched);
+        for (mut i: i64 = 0; i < sched.length; i++) {
+            if (sched[i] != null) { c.unwind_cleanup.push(sched[i] as ASTNode*); }
+        }
+    }
+
     /// Drops for scopes inside the current loop body.  Used before
     /// `break`/`continue`: those exit the enclosing loop only, so
     /// bindings declared OUTSIDE the loop must NOT be dropped here.
@@ -2725,7 +2745,15 @@ type struct DropInserter {
         if (expr == null) { return; }
         match (expr.kind) {
             NodeKind::Identifier         => { this.handle_ident(expr as IdentifierNode*, false);      }
-            NodeKind::CallExpression     => { this.read_call(expr as CallExprNode*);                   }
+            NodeKind::CallExpression     => {
+                const c: CallExprNode* = expr as CallExprNode*;
+                this.read_call(c);
+                // `--panic=unwind`: snapshot the cleanup schedule for this
+                // call's landing pad AFTER read_call has recorded its own
+                // receiver/arg moves, so a local moved into the call is
+                // excluded (the callee owns it now).
+                if (this.ctx.project_panic_unwind) { this.populate_unwind_cleanup(c); }
+            }
             NodeKind::BinaryExpression   => { this.read_binary(expr as BinaryExprNode*);               }
             NodeKind::UnaryExpression    => { this.read_unary(expr as UnaryExprNode*);                 }
             NodeKind::MemberAccess       => { this.read_member(expr as MemberAccessNode*);             }

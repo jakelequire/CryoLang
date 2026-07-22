@@ -502,6 +502,31 @@ LLVMValueRef LLVMBuildInsertValue(LLVMBuilderRef B, LLVMValueRef AggVal,
 
 
 /* ===================================================================
+ * Exception handling (DWARF unwinding)
+ *
+ * `invoke` terminates a block with a normal edge (`Then`) and an unwind
+ * edge (`Catch`, which must start with a `landingpad`).  The landing pad's
+ * result type is the `{ ptr, i32 }` exception/selector pair; `PersFn` is
+ * legacy and ignored by modern LLVM (the personality lives on the function,
+ * set via LLVMSetPersonalityFn) - pass null.  A `cleanup` landing pad runs
+ * destructors then `resume`s; a `catch` clause (LLVMAddClause with a type
+ * info value, or a null pointer for catch-all) stops the unwind.
+ * =================================================================== */
+
+LLVMValueRef LLVMBuildInvoke2(LLVMBuilderRef B, LLVMTypeRef Ty, LLVMValueRef Fn,
+                              LLVMValueRef *Args, unsigned NumArgs,
+                              LLVMBasicBlockRef Then, LLVMBasicBlockRef Catch,
+                              const char *Name);
+LLVMValueRef LLVMBuildLandingPad(LLVMBuilderRef B, LLVMTypeRef Ty,
+                                 LLVMValueRef PersFn, unsigned NumClauses,
+                                 const char *Name);
+LLVMValueRef LLVMBuildResume(LLVMBuilderRef B, LLVMValueRef Exn);
+void         LLVMAddClause(LLVMValueRef LandingPad, LLVMValueRef ClauseVal);
+void         LLVMSetCleanup(LLVMValueRef LandingPad, LLVMBool Val);
+void         LLVMSetPersonalityFn(LLVMValueRef Fn, LLVMValueRef PersonalityFn);
+
+
+/* ===================================================================
  * Inline Assembly
  *
  * `Dialect` is really `LLVMInlineAsmDialect` (0 = ATT, 1 = Intel) but is
