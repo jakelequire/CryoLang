@@ -193,6 +193,22 @@ type struct DropInserter {
     /// drop discarded owning temporaries (see emit_discarded_temp_drop).
     discard_seq:  i64;
 
+    /// In-flight call-argument moves (`--panic=unwind` only). When a call's
+    /// arguments are being walked, each bare-identifier owning argument that is
+    /// moved into a pending arg slot is pushed here, keyed by binding name id;
+    /// `pending_arg_frames[k]` records where the k-th enclosing in-progress
+    /// call's frame begins so read_call can truncate on return. A panic origin
+    /// nested in a LATER argument (`boom()` in `sink(g, boom())`) unwinds before
+    /// the enclosing call runs, so the callee never takes ownership of the
+    /// earlier args - `snapshot_unwind_cleanup` drops everything on this stack so
+    /// they are not leaked. The frame is popped when the call is fully walked, so
+    /// the call's OWN unwind_cleanup (snapshotted after) correctly excludes them
+    /// (it now owns them). Only bare-identifier owning args are tracked; an
+    /// anonymous owning temp (`sink(make(), boom())`) has no name to drop and
+    /// still leaks - a memory-safe leak whose fix needs temp materialization.
+    pending_arg_ids:    u32[];
+    pending_arg_frames: i64[];
+
     static new(ctx: CompilationContext*) -> DropInserter {
         return DropInserter {
             ctx:             ctx,
@@ -223,6 +239,8 @@ type struct DropInserter {
             fired:           0,
             inserted:        0,
             discard_seq:     0,
+            pending_arg_ids:    [],
+            pending_arg_frames: [],
         };
     }
 
@@ -260,6 +278,31 @@ type struct DropInserter {
     top_scope_start(&this) -> i64 {
         if (this.scope_start_idx.length == 0) { return 0; }
         return this.scope_start_idx[this.scope_start_idx.length - 1];
+    }
+
+    // ---- pending call-argument frames (`--panic=unwind`) -----------------
+    //
+    // A dedicated stack, managed exactly like push_scope/pop_scope, so read_call
+    // stays free of inline array manipulation (which miscompiled when embedded in
+    // that large function). See the `pending_arg_ids` field doc for the model.
+
+    /// Open a pending-arg frame for a call whose arguments are about to be
+    /// walked. Records where this call's recorded args begin.
+    open_pending_arg_frame(mut &this) -> void {
+        this.pending_arg_frames.push(this.pending_arg_ids.length);
+    }
+
+    /// Close the innermost pending-arg frame: the call is fully walked, so its
+    /// arguments are now owned by the callee and must drop from the pending set.
+    /// Read-then-truncate, mirroring pop_scope.
+    close_pending_arg_frame(mut &this) -> void {
+        const top: i64 = this.pending_arg_frames.length;
+        if (top == 0) { return; }
+        const start: i64 = this.pending_arg_frames[top - 1];
+        this.pending_arg_frames.pop();
+        while (this.pending_arg_ids.length > start) {
+            this.pending_arg_ids.pop();
+        }
     }
 
     register_binding(mut &this, name: SymbolStr, ty: TypeRef, span: SourceSpan) -> void {
@@ -1907,10 +1950,61 @@ type struct DropInserter {
     /// guards.
     snapshot_unwind_cleanup(mut &this, out: ASTNode*[]*) -> void {
         mut sched: StatementNode*[] = [];
+        // In-flight arguments of enclosing calls first - they were constructed
+        // most recently (dropped first) and the cumulative pass skips them (they
+        // are marked moved), so they must be added explicitly.
+        this.append_pending_arg_drops(&sched);
         this.append_cumulative_drops(&sched);
         for (mut i: i64 = 0; i < sched.length; i++) {
             if (sched[i] != null) { out.push(sched[i] as ASTNode*); }
         }
+    }
+
+    /// Drops for bindings moved into enclosing in-progress calls (see
+    /// `pending_arg_ids`). Emitted at a panic origin nested in a later argument:
+    /// those args were moved out of their source but the enclosing call has not
+    /// run, so nobody else drops them. Most-recently-moved first. Each is a
+    /// straight-line whole-binding move of an initialized owning local (MoveCheck
+    /// forbids moving an uninitialized or partially-moved value into a call), so a
+    /// plain `.drop()` with no init/move-flag guard is exact. The binding's
+    /// storage is untouched by the pending move (owning aggregates pass by
+    /// pointer to the source alloca; the callee never ran), so the drop is safe.
+    append_pending_arg_drops(mut &this, out: StatementNode*[]*) -> void {
+        for (mut i: i64 = this.pending_arg_ids.length - 1; i >= 0; i--) {
+            const key: u32 = this.pending_arg_ids[i];
+            if (key == (0 as u32)) { continue; }
+            const sym: SymbolStr = SymbolStr::from_id(key);
+            const ty:  TypeRef   = this.lookup_type(sym);
+            if (!this.type_needs_drop(ty)) { continue; }
+            const span: SourceSpan = this.binding_span_for(key);
+            const stmt: StatementNode* = this.make_drop_call(sym, ty, span);
+            if (stmt != null) { out.push(stmt); }
+        }
+    }
+
+    /// The declaration span of the live binding named `key` (innermost shadow
+    /// wins). Used to anchor a synthesized pending-arg drop; falls back to an
+    /// empty span if the binding is somehow no longer live (defensive - a pending
+    /// arg is always live when its drop is scheduled).
+    binding_span_for(&this, key: u32) -> SourceSpan {
+        for (mut i: i64 = this.binding_names.length - 1; i >= 0; i--) {
+            if (this.binding_names[i] == key) { return this.binding_spans[i]; }
+        }
+        return SourceSpan::none();
+    }
+
+    /// Track a bare-identifier owning argument just moved into an in-progress
+    /// call, so a panic during a later argument's evaluation drops it (the callee
+    /// never received it). No-op for a non-identifier (anonymous temp, which has
+    /// no name to drop - deferred), a Copy arg, or a non-droppable arg. Gated on
+    /// `--panic=unwind` by the callers so the default path allocates nothing.
+    record_pending_arg(mut &this, arg: ExpressionNode*) -> void {
+        if (arg == null) { return; }
+        if (arg.kind != NodeKind::Identifier) { return; }
+        const id: IdentifierNode* = arg as IdentifierNode*;
+        const ty: TypeRef = this.lookup_type(id.name);
+        if (!this.type_needs_drop(ty)) { return; }
+        this.pending_arg_ids.push(id.name.id);
     }
 
     populate_unwind_cleanup(mut &this, c: CallExprNode*) -> void {
@@ -2889,6 +2983,12 @@ type struct DropInserter {
                 }
             }
         }
+        // `--panic=unwind`: open a pending-arg frame for this call. Each
+        // bare-identifier owning argument moved below is recorded on it; a panic
+        // origin nested in a LATER argument drops them (the callee never ran).
+        // The frame is closed when the call is fully walked, so the call's own
+        // unwind_cleanup (snapshotted after) correctly excludes them.
+        if (this.ctx.project_panic_unwind) { this.open_pending_arg_frame(); }
         // General consuming-method case: any method whose receiver is
         // by-value (`mut this` / `this`) or that carries
         // `![sink]` consumes the LHS at the call site.
@@ -2919,6 +3019,10 @@ type struct DropInserter {
             }
             if (consumes && ma.object != null) {
                 this.walk_expr_move(ma.object);
+                // A consumed bare-identifier receiver is a pending arg too: on a
+                // panic in a later positional argument it was moved out but the
+                // callee never took it, so it must be dropped.
+                if (this.ctx.project_panic_unwind) { this.record_pending_arg(ma.object); }
                 receiver_moved = true;
             }
         }
@@ -2940,8 +3044,15 @@ type struct DropInserter {
                 this.walk_expr_read(arg);
             } else {
                 this.walk_expr_move(arg);
+                if (this.ctx.project_panic_unwind) { this.record_pending_arg(arg); }
             }
         }
+        // Close this call's pending-arg frame: its arguments are now owned by the
+        // callee, so the call's own cleanup schedule (snapshotted next by the
+        // caller) must not drop them. Any panic origin walked while the frame was
+        // open (a nested call/binary/etc. in a later argument) already captured
+        // them in its own schedule.
+        if (this.ctx.project_panic_unwind) { this.close_pending_arg_frame(); }
     }
 
     read_binary(mut &this, b: BinaryExprNode*) -> void {
