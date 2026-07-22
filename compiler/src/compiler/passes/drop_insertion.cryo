@@ -84,6 +84,38 @@ type struct DropInserter {
     binding_types:   TypeRef[];
     binding_spans:   SourceSpan[];
 
+    /// Init-flag name id per live binding, parallel to `binding_names`.
+    /// `0` (the reserved invalid SymbolStr id) means the binding is NOT
+    /// conditionally-initialized: it had an initializer, is Copy, or is
+    /// otherwise unconditionally live, so its scope-exit drop runs
+    /// unconditionally.  A nonzero id names a synthesized
+    /// `mut <name>__initflag<seq>: boolean = false;` local hoisted at the
+    /// binding's declaration; every assignment `<name> = ...` sets it true,
+    /// and the scope-exit drop is wrapped in `if (<flag>) { ... }` so it
+    /// fires only on paths that actually initialized the storage.  Without
+    /// this a droppable local declared without an initializer and assigned
+    /// on only some paths would drop uninitialized stack garbage (a free of
+    /// a junk pointer for a heap-owning type) on the unassigned path.  The
+    /// polarity is the inverse of the conditional-MOVE drop flag: default
+    /// false = "not initialized -> do NOT drop", guard `if (flag)`, and the
+    /// event that sets it is an assignment (a write), not a move-out.  This
+    /// array is truncated in lock-step with `binding_*` on scope pop, so the
+    /// mapping is naturally scoped (innermost shadow wins on a reverse scan).
+    binding_initflags: u32[];
+
+    /// Name ids disqualified from init-flag tracking in the current function:
+    /// locals whose storage may be initialized by something other than a
+    /// whole-binding `<name> = ...` assignment - element assignment
+    /// (`name[i] = ...`), field assignment (`name.f = ...`), or address-of
+    /// (`&name`, whose callee may write through the pointer).  For those the
+    /// per-assignment init flag cannot observe the write, so tracking would
+    /// suppress a needed drop (a leak); instead they keep the pre-existing
+    /// unconditional scope-exit drop.  Recomputed per function by a flow-
+    /// insensitive pre-scan (`collect_init_disqualifiers`); name-keyed, so a
+    /// name used this way anywhere disqualifies every local of that name
+    /// (conservative, fail-safe toward the prior behavior).
+    init_disq: u32[];
+
     /// Stack of "loop boundary depths".  When walk_while/walk_for/
     /// walk_loop is processing a loop body, the current scope_stack
     /// length at entry is pushed here; `break`/`continue` then know to
@@ -129,6 +161,11 @@ type struct DropInserter {
     /// names from this pass).
     flag_seq: i64;
 
+    /// Monotonic counter for naming synthesized init-flag locals; separate
+    /// from `flag_seq` only for readable IR (the `__initflag`/`__dropflag`
+    /// prefixes already disambiguate).
+    initflag_seq: i64;
+
     /// Partial-move set (the "allow + track + skip" half of the Rust model),
     /// mirroring MoveCheck's `pm_binding`/`pm_field`.  `pm_binding[i]` is the
     /// owning binding's name id, `pm_field[i]` a field moved out of it.  At the
@@ -169,6 +206,8 @@ type struct DropInserter {
             binding_names:   [],
             binding_types:   [],
             binding_spans:   [],
+            binding_initflags: [],
+            init_disq:       [],
             loop_boundary:   [],
             moved_keys:      [],
             moved_lines:     [],
@@ -177,6 +216,7 @@ type struct DropInserter {
             flag_binding_keys: [],
             flag_flag_keys:    [],
             flag_seq:        0,
+            initflag_seq:    0,
             pm_binding:      [],
             pm_field:        [],
             branch_depth:    0,
@@ -210,6 +250,7 @@ type struct DropInserter {
             this.binding_names.pop();
             this.binding_types.pop();
             this.binding_spans.pop();
+            this.binding_initflags.pop();
             this.types_keys.pop();
             this.types_refs.pop();
         }
@@ -244,6 +285,9 @@ type struct DropInserter {
         this.binding_names.push(name.id);
         this.binding_types.push(ty);
         this.binding_spans.push(span);
+        // No init flag by default; a conditionally-initialized droppable
+        // local upgrades this slot via attach_init_flag right after this call.
+        this.binding_initflags.push(0 as u32);
     }
 
     /// Same as register_binding but stores a type-only entry (no
@@ -441,6 +485,7 @@ type struct DropInserter {
         this.binding_names   = [];
         this.binding_types   = [];
         this.binding_spans   = [];
+        this.binding_initflags = [];
         this.loop_boundary   = [];
         this.moved_keys  = [];
         this.moved_lines = [];
@@ -450,6 +495,12 @@ type struct DropInserter {
         this.pm_binding       = [];
         this.pm_field         = [];
         this.branch_depth     = 0;
+        this.init_disq        = [];
+        // Flow-insensitive pre-scan: decide which uninitialized droppable
+        // locals CAN'T be soundly tracked with a per-assignment init flag
+        // (initialized element/field-wise or through a taken address) before
+        // any drop is emitted, so attach_init_flag can skip them.
+        this.collect_init_disqualifiers(func.body as StatementNode*);
 
         this.push_scope();
         // A by-value owning parameter is moved in at the call (the argument is
@@ -476,6 +527,10 @@ type struct DropInserter {
                 this.binding_names.push(p.name.id);
                 this.binding_types.push(p.resolved_type);
                 this.binding_spans.push(p.span);
+                // A by-value param is initialized by the caller's move-in, so
+                // it is unconditionally live - no init flag (keep the parallel
+                // array in lock-step; register_binding is bypassed here).
+                this.binding_initflags.push(0 as u32);
             }
         }
         // A base-class constructor initializer (`MyCtor(...) : Base(arg, ...)`)
@@ -660,19 +715,43 @@ type struct DropInserter {
                     this.emit_discarded_temp_drop(e.expression, out, stmt.span);
                 } else {
                     out.push(stmt);
+                    // `<x> = ...` where x is a conditionally-initialized
+                    // droppable local: record that this path initialized it, so
+                    // the scope-exit `if (<flag>) drop()` observes the write.
+                    const iflag: SymbolStr =
+                        this.init_flag_for_assignment_target(e.expression);
+                    if (iflag.is_valid()) {
+                        out.push(this.make_drop_flag_set(iflag, stmt.span));
+                    }
                 }
                 false
             }
             NodeKind::DeclarationStatement => {
                 const ds: DeclStmtNode* = stmt as DeclStmtNode*;
+                mut init_flag: SymbolStr = SymbolStr::empty();
                 if (ds.declaration != null) {
                     if (ds.declaration.kind == NodeKind::VariableDeclaration) {
-                        this.walk_var_decl(ds.declaration as VarDeclNode*);
+                        const vd: VarDeclNode* = ds.declaration as VarDeclNode*;
+                        this.walk_var_decl(vd);
+                        // A droppable local declared WITHOUT an initializer is
+                        // only conditionally initialized: assigned on some paths,
+                        // untouched on others.  Attach an init flag so its
+                        // scope-exit drop fires only where it was assigned;
+                        // otherwise the unconditional drop would free
+                        // uninitialized stack garbage on the untouched path.
+                        if (vd.initializer == null && !vd.is_global &&
+                            !vd.is_capture_alias &&
+                            this.type_needs_drop(vd.resolved_type)) {
+                            init_flag = this.attach_init_flag(vd.name, vd.span);
+                        }
                     } else if (ds.declaration.kind == NodeKind::DestructureDeclaration) {
                         this.walk_destructure_decl(ds.declaration as DestructureDeclNode*);
                     }
                 }
                 out.push(stmt);
+                if (init_flag.is_valid()) {
+                    out.push(this.make_drop_flag_decl(init_flag, ds.span));
+                }
                 false
             }
             NodeKind::BlockStatement => {
@@ -810,7 +889,7 @@ type struct DropInserter {
 
         mut then_diverges: boolean = false;
         if (it.then_stmt != null) {
-            it.then_stmt = this.wrap_early_exit(it.then_stmt);
+            it.then_stmt = this.wrap_for_init(this.wrap_early_exit(it.then_stmt));
             then_diverges = this.walk_stmt_in_place(it.then_stmt);
         }
         const then_keys:  u32[] = this.moves_since_keys(snap);
@@ -819,7 +898,7 @@ type struct DropInserter {
 
         mut else_diverges: boolean = false;
         if (it.else_stmt != null) {
-            it.else_stmt = this.wrap_early_exit(it.else_stmt);
+            it.else_stmt = this.wrap_for_init(this.wrap_early_exit(it.else_stmt));
             else_diverges = this.walk_stmt_in_place(it.else_stmt);
         }
         const else_keys:  u32[] = this.moves_since_keys(snap);
@@ -979,7 +1058,7 @@ type struct DropInserter {
         this.loop_boundary.push(this.scope_start_idx.length);
         this.branch_depth += 1;
         if (w.body != null) {
-            w.body = this.wrap_early_exit(w.body);
+            w.body = this.wrap_for_init(this.wrap_early_exit(w.body));
             this.walk_stmt_in_place(w.body);
         }
         this.branch_depth -= 1;
@@ -993,7 +1072,7 @@ type struct DropInserter {
         this.loop_boundary.push(this.scope_start_idx.length);
         this.branch_depth += 1;
         if (w.body != null) {
-            w.body = this.wrap_early_exit(w.body);
+            w.body = this.wrap_for_init(this.wrap_early_exit(w.body));
             this.walk_stmt_in_place(w.body);
         }
         this.branch_depth -= 1;
@@ -1018,7 +1097,7 @@ type struct DropInserter {
         this.loop_boundary.push(this.scope_start_idx.length);
         this.branch_depth += 1;
         if (f.body != null) {
-            f.body = this.wrap_early_exit(f.body);
+            f.body = this.wrap_for_init(this.wrap_early_exit(f.body));
             this.walk_stmt_in_place(f.body);
         }
         this.branch_depth -= 1;
@@ -1033,7 +1112,7 @@ type struct DropInserter {
         this.loop_boundary.push(this.scope_start_idx.length);
         this.branch_depth += 1;
         if (l.body != null) {
-            l.body = this.wrap_early_exit(l.body);
+            l.body = this.wrap_for_init(this.wrap_early_exit(l.body));
             this.walk_stmt_in_place(l.body);
         }
         this.branch_depth -= 1;
@@ -1225,6 +1304,9 @@ type struct DropInserter {
             // bindings it reads are seen as live.
             if (arm.guard != null) { this.walk_expr_read(arm.guard); }
             arm.body = this.wrap_early_exit(arm.body);
+            // Statement arms only: a value arm's braceless body IS the yielded
+            // value, so block-wrapping it would swallow the arm's result.
+            if (!is_expr) { arm.body = this.wrap_for_init(arm.body); }
             const arm_div: boolean = if (is_expr) {
                 this.walk_stmt_in_place_value(arm.body)
             } else {
@@ -2001,6 +2083,12 @@ type struct DropInserter {
         const span: SourceSpan = this.binding_spans[idx];
         if (!this.type_needs_drop(ty)) { return; }
         const sym: SymbolStr = SymbolStr::from_id(key);
+        // Build the core cleanup (whatever the move/partial-move state calls
+        // for) into a local buffer, then wrap the whole thing in the
+        // init-flag guard if the binding was only conditionally initialized.
+        // An unconditionally-moved binding produces no cleanup at all (its
+        // storage left this scope), so init state is moot - return early.
+        mut core: StatementNode*[] = [];
         // Conditional move: a drop-flag was hoisted for this binding by
         // a branch-join in this function.  Emit `if (!flag) drop();`
         // regardless of the moved-set state, since the flag is the
@@ -2011,25 +2099,35 @@ type struct DropInserter {
         if (flag.is_valid()) {
             const cstmt: StatementNode* = this.make_conditional_drop_call(
                 sym, ty, flag, span);
-            if (cstmt != null) {
-                out.push(cstmt);
+            if (cstmt != null) { core.push(cstmt); }
+        } else if (this.is_moved_id(key)) {
+            return;
+        } else if (this.pm_has_binding(key)) {
+            // Partially-moved binding: drop only its still-live fields, skipping
+            // the moved-out ones (which the source no longer owns).  MoveCheck
+            // forbids a partial move to coexist with a whole-binding move or a
+            // drop flag, so this is mutually exclusive with the branches above.
+            this.append_partial_drops(&core, sym, ty, key, span);
+        } else {
+            const stmt: StatementNode* = this.make_drop_call(sym, ty, span);
+            if (stmt != null) { core.push(stmt); }
+        }
+        if (core.length == 0) { return; }
+        // Init-flag guard: for a droppable local declared without an
+        // initializer, wrap the cleanup in `if (<flag>) { ... }` so it runs
+        // only on paths that assigned the storage.  Nesting with a move flag
+        // yields `if (init) { if (!moved) drop(); }` == drop iff initialized
+        // and not moved.  LLVM folds an always-true flag away.
+        const iflag_id: u32 = this.binding_initflags[idx];
+        if (iflag_id != (0 as u32)) {
+            const iflag: SymbolStr = SymbolStr::from_id(iflag_id);
+            out.push(this.wrap_in_init_guard(iflag, core, span));
+            this.inserted += 1;
+        } else {
+            for (mut i: i64 = 0; i < core.length; i++) {
+                out.push(core[i]);
                 this.inserted += 1;
             }
-            return;
-        }
-        if (this.is_moved_id(key))   { return; }
-        // Partially-moved binding: drop only its still-live fields, skipping the
-        // moved-out ones (which the source no longer owns).  MoveCheck forbids a
-        // partial move to coexist with a whole-binding move or a drop flag, so
-        // this branch is mutually exclusive with the two returns above.
-        if (this.pm_has_binding(key)) {
-            this.append_partial_drops(out, sym, ty, key, span);
-            return;
-        }
-        const stmt: StatementNode* = this.make_drop_call(sym, ty, span);
-        if (stmt != null) {
-            out.push(stmt);
-            this.inserted += 1;
         }
     }
 
@@ -2260,6 +2358,330 @@ type struct DropInserter {
         const named: string = format("%s__dropflag%lld", base, this.flag_seq);
         this.flag_seq = this.flag_seq + 1;
         return this.intern.intern(named);
+    }
+
+    // ---- init-flag tracking (inverse-polarity mirror of drop flags) ------
+
+    /// Allocate a fresh init-flag name for `binding` (`<name>__initflag<seq>`).
+    fresh_init_flag_name(mut &this, binding: SymbolStr) -> SymbolStr {
+        const base: string = this.intern.resolve(binding);
+        const named: string = format("%s__initflag%lld", base, this.initflag_seq);
+        this.initflag_seq = this.initflag_seq + 1;
+        return this.intern.intern(named);
+    }
+
+    /// Attach an init flag to the binding just registered as the tail entry of
+    /// `binding_*` (a droppable local declared without an initializer).  Names
+    /// the flag, records it in `binding_initflags`, and registers the
+    /// synthesized bool in the type map so later references type-resolve.  The
+    /// flag's `mut <flag>: boolean = false;` declaration is emitted by the
+    /// caller (which holds the enclosing statement buffer).
+    attach_init_flag(mut &this, name: SymbolStr, span: SourceSpan) -> SymbolStr {
+        const n: i64 = this.binding_initflags.length;
+        if (n == 0) { return SymbolStr::empty(); }
+        // The caller invokes this immediately after register_binding pushed the
+        // local as the tail entry.  If that push didn't happen (invalid name),
+        // the tail is some other binding - never stamp its flag.
+        if (this.binding_names[n - 1] != name.id) { return SymbolStr::empty(); }
+        // Element/field/address-initialized locals can't be tracked by a
+        // whole-binding-assignment flag; leave their drop unconditional.
+        if (this.is_init_disqualified(name)) { return SymbolStr::empty(); }
+        const flag: SymbolStr = this.fresh_init_flag_name(name);
+        this.binding_initflags[n - 1] = flag.id;
+        this.register_param_type(flag, this.arena.get_bool());
+        return flag;
+    }
+
+    is_init_disqualified(&this, name: SymbolStr) -> boolean {
+        if (!name.is_valid()) { return true; }
+        for (mut i: i64 = 0; i < this.init_disq.length; i++) {
+            if (this.init_disq[i] == name.id) { return true; }
+        }
+        return false;
+    }
+
+    disqualify_init(mut &this, name: SymbolStr) -> void {
+        if (!name.is_valid()) { return; }
+        for (mut i: i64 = 0; i < this.init_disq.length; i++) {
+            if (this.init_disq[i] == name.id) { return; }
+        }
+        this.init_disq.push(name.id);
+    }
+
+    /// Flow-insensitive scan of a function body: record every local name that
+    /// is element-assigned, field-assigned/read, or address-taken, so it is
+    /// excluded from init-flag tracking (its initialization can't be observed
+    /// through whole-binding assignment alone).  Reads/moves of a bare
+    /// identifier are fine - those don't initialize storage in place.
+    collect_init_disqualifiers(mut &this, stmt: StatementNode*) -> void {
+        if (stmt == null) { return; }
+        match (stmt.kind) {
+            NodeKind::BlockStatement => {
+                const b: BlockStmtNode* = stmt as BlockStmtNode*;
+                for (mut i: i64 = 0; i < b.statements.length; i++) {
+                    this.collect_init_disqualifiers(b.statements[i]);
+                }
+            }
+            NodeKind::UnsafeBlockStatement => {
+                const u: UnsafeBlockStmtNode* = stmt as UnsafeBlockStmtNode*;
+                if (u.block != null) {
+                    this.collect_init_disqualifiers(u.block as StatementNode*);
+                }
+            }
+            NodeKind::ExpressionStatement => {
+                this.disq_scan_expr((stmt as ExprStmtNode*).expression);
+            }
+            NodeKind::DeclarationStatement => {
+                const ds: DeclStmtNode* = stmt as DeclStmtNode*;
+                if (ds.declaration != null &&
+                    ds.declaration.kind == NodeKind::VariableDeclaration) {
+                    this.disq_scan_expr(
+                        (ds.declaration as VarDeclNode*).initializer);
+                } else if (ds.declaration != null &&
+                    ds.declaration.kind == NodeKind::DestructureDeclaration) {
+                    this.disq_scan_expr(
+                        (ds.declaration as DestructureDeclNode*).initializer);
+                }
+            }
+            NodeKind::ReturnStatement => {
+                this.disq_scan_expr((stmt as ReturnStmtNode*).expression);
+            }
+            NodeKind::IfStatement => {
+                const it: IfStmtNode* = stmt as IfStmtNode*;
+                this.disq_scan_expr(it.condition);
+                this.collect_init_disqualifiers(it.then_stmt);
+                this.collect_init_disqualifiers(it.else_stmt);
+            }
+            NodeKind::WhileStatement => {
+                const w: WhileStmtNode* = stmt as WhileStmtNode*;
+                this.disq_scan_expr(w.condition);
+                this.collect_init_disqualifiers(w.body);
+            }
+            NodeKind::DoWhileStatement => {
+                const w: DoWhileStmtNode* = stmt as DoWhileStmtNode*;
+                this.disq_scan_expr(w.condition);
+                this.collect_init_disqualifiers(w.body);
+            }
+            NodeKind::ForStatement => {
+                const f: ForStmtNode* = stmt as ForStmtNode*;
+                // f.init is an ASTNode* (usually a `mut i = 0` var decl); only
+                // its initializer can hold a disqualifying use.
+                if (f.init != null &&
+                    f.init.kind == NodeKind::VariableDeclaration) {
+                    this.disq_scan_expr((f.init as VarDeclNode*).initializer);
+                }
+                this.disq_scan_expr(f.condition);
+                this.disq_scan_expr(f.update);
+                this.collect_init_disqualifiers(f.body);
+            }
+            NodeKind::LoopStatement => {
+                this.collect_init_disqualifiers((stmt as LoopStmtNode*).body);
+            }
+            NodeKind::SwitchStatement => {
+                const sw: SwitchStmtNode* = stmt as SwitchStmtNode*;
+                this.disq_scan_expr(sw.expression);
+                for (mut i: i64 = 0; i < sw.cases.length; i++) {
+                    if (sw.cases[i] != null) {
+                        this.collect_init_disqualifiers(
+                            sw.cases[i].body as StatementNode*);
+                    }
+                }
+            }
+            NodeKind::MatchStatement => {
+                const m: MatchStmtNode* = stmt as MatchStmtNode*;
+                this.disq_scan_expr(m.subject);
+                for (mut i: i64 = 0; i < m.arms.length; i++) {
+                    if (m.arms[i] != null) {
+                        this.disq_scan_expr(m.arms[i].guard);
+                        this.collect_init_disqualifiers(m.arms[i].body);
+                    }
+                }
+            }
+            NodeKind::StaticMatchStatement => {
+                const sm: StaticMatchStmtNode* = stmt as StaticMatchStmtNode*;
+                for (mut i: i64 = 0; i < sm.arms.length; i++) {
+                    if (sm.arms[i] != null) {
+                        this.collect_init_disqualifiers(sm.arms[i].body);
+                    }
+                }
+            }
+            _ => { }
+        }
+    }
+
+    /// Recursive expression scan feeding `collect_init_disqualifiers`.  Marks a
+    /// name disqualified when it is the base of a member/array access or the
+    /// operand of an address-of; otherwise recurses into sub-expressions.
+    disq_scan_expr(mut &this, expr: ExpressionNode*) -> void {
+        if (expr == null) { return; }
+        match (expr.kind) {
+            NodeKind::Identifier => { }
+            NodeKind::MemberAccess => {
+                const ma: MemberAccessNode* = expr as MemberAccessNode*;
+                if (ma.object != null) {
+                    if (ma.object.kind == NodeKind::Identifier) {
+                        this.disqualify_init((ma.object as IdentifierNode*).name);
+                    }
+                    this.disq_scan_expr(ma.object);
+                }
+            }
+            NodeKind::ArrayAccess => {
+                const aa: ArrayAccessNode* = expr as ArrayAccessNode*;
+                if (aa.array != null) {
+                    if (aa.array.kind == NodeKind::Identifier) {
+                        this.disqualify_init((aa.array as IdentifierNode*).name);
+                    }
+                    this.disq_scan_expr(aa.array);
+                }
+                this.disq_scan_expr(aa.index);
+            }
+            NodeKind::UnaryExpression => {
+                const ue: UnaryExprNode* = expr as UnaryExprNode*;
+                if (ue.op.kind == TokenType::Amp && ue.operand != null &&
+                    ue.operand.kind == NodeKind::Identifier) {
+                    this.disqualify_init((ue.operand as IdentifierNode*).name);
+                }
+                this.disq_scan_expr(ue.operand);
+            }
+            NodeKind::BinaryExpression => {
+                const b: BinaryExprNode* = expr as BinaryExprNode*;
+                this.disq_scan_expr(b.left);
+                this.disq_scan_expr(b.right);
+            }
+            NodeKind::CastExpression => {
+                this.disq_scan_expr((expr as CastExprNode*).expression);
+            }
+            NodeKind::CallExpression => {
+                const c: CallExprNode* = expr as CallExprNode*;
+                this.disq_scan_expr(c.callee);
+                for (mut i: i64 = 0; i < c.arguments.length; i++) {
+                    this.disq_scan_expr(c.arguments[i]);
+                }
+            }
+            NodeKind::StructLiteral => {
+                const sl: StructLiteralNode* = expr as StructLiteralNode*;
+                for (mut i: i64 = 0; i < sl.field_inits.length; i++) {
+                    this.disq_scan_expr(sl.field_inits[i].value);
+                }
+            }
+            NodeKind::TupleLiteral => {
+                const tl: TupleLiteralNode* = expr as TupleLiteralNode*;
+                for (mut i: i64 = 0; i < tl.elements.length; i++) {
+                    this.disq_scan_expr(tl.elements[i]);
+                }
+            }
+            _ => {
+                // Any other expression shape (literals, etc.) either has no
+                // sub-identifier in a disqualifying position or is rare enough
+                // that a conservative miss is a leak-at-worst, never a
+                // use-after-free.  Whole-binding reads are intentionally NOT
+                // disqualifying.
+            }
+        }
+    }
+
+    /// The init flag for the innermost live binding named `name`, or an invalid
+    /// SymbolStr if that binding has none (unconditionally initialized, Copy,
+    /// or no such binding).  Reverse scan so an inner shadow wins.
+    get_init_flag_for_name(&this, name: SymbolStr) -> SymbolStr {
+        if (!name.is_valid()) { return SymbolStr::empty(); }
+        for (mut i: i64 = this.binding_names.length - 1; i >= 0; i--) {
+            if (this.binding_names[i] == name.id) {
+                const fid: u32 = this.binding_initflags[i];
+                if (fid == (0 as u32)) { return SymbolStr::empty(); }
+                return SymbolStr::from_id(fid);
+            }
+        }
+        return SymbolStr::empty();
+    }
+
+    /// If `expr` is a plain assignment `<ident> = ...` whose target is a
+    /// conditionally-initialized droppable local, return that local's init
+    /// flag; otherwise an invalid SymbolStr.  Compound assigns (`+=`, ...) read
+    /// the target first, so they can't be the initializing write.
+    init_flag_for_assignment_target(&this, expr: ExpressionNode*) -> SymbolStr {
+        if (expr == null) { return SymbolStr::empty(); }
+        if (expr.kind != NodeKind::BinaryExpression) { return SymbolStr::empty(); }
+        const b: BinaryExprNode* = expr as BinaryExprNode*;
+        if (b.op.kind != TokenType::Equal) { return SymbolStr::empty(); }
+        if (b.left == null || b.left.kind != NodeKind::Identifier) {
+            return SymbolStr::empty();
+        }
+        return this.get_init_flag_for_name((b.left as IdentifierNode*).name);
+    }
+
+    /// Wrap the cleanup statements `core` in `if (<flag>) { core... }` so they
+    /// run only where the binding was initialized.  Guard polarity is the
+    /// inverse of `make_conditional_drop_call` (`if (flag)`, not `if (!flag)`).
+    wrap_in_init_guard(mut &this, flag: SymbolStr, core: &StatementNode*[],
+                        span: SourceSpan) -> StatementNode* {
+        const flag_ident: IdentifierNode* = new IdentifierNode(flag, span);
+        flag_ident.set_resolved_type(this.arena.get_bool());
+        const body: BlockStmtNode* = new BlockStmtNode(span);
+        for (mut i: i64 = 0; i < core.length; i++) {
+            body.statements.push(core[i]);
+        }
+        const if_stmt: IfStmtNode* = new IfStmtNode(
+            flag_ident as ExpressionNode*, body as StatementNode*,
+            null as StatementNode*, span);
+        return if_stmt as StatementNode*;
+    }
+
+    /// Block-wrap a braceless control-flow body that assigns a
+    /// conditionally-initialized droppable local, so the `<flag> = true;`
+    /// synthesized after the assignment lands in a rebuilt statement list
+    /// instead of a throwaway (which `walk_stmt_in_place` uses for non-block
+    /// bodies).  Blocks already rebuild, so they pass through untouched.
+    wrap_for_init(mut &this, stmt: StatementNode*) -> StatementNode* {
+        if (stmt == null) { return stmt; }
+        if (stmt.kind == NodeKind::BlockStatement) { return stmt; }
+        if (!this.stmt_assigns_tracked_init(stmt)) { return stmt; }
+        const block: BlockStmtNode* = new BlockStmtNode(stmt.span);
+        block.statements.push(stmt);
+        return block as StatementNode*;
+    }
+
+    /// True if `stmt` (recursively) contains a plain assignment to a
+    /// conditionally-initialized droppable local currently in scope.
+    stmt_assigns_tracked_init(&this, stmt: StatementNode*) -> boolean {
+        if (stmt == null) { return false; }
+        match (stmt.kind) {
+            NodeKind::ExpressionStatement => {
+                const e: ExprStmtNode* = stmt as ExprStmtNode*;
+                return this.init_flag_for_assignment_target(e.expression).is_valid();
+            }
+            NodeKind::BlockStatement => {
+                const b: BlockStmtNode* = stmt as BlockStmtNode*;
+                for (mut i: i64 = 0; i < b.statements.length; i++) {
+                    if (this.stmt_assigns_tracked_init(b.statements[i])) { return true; }
+                }
+                return false;
+            }
+            NodeKind::IfStatement => {
+                const it: IfStmtNode* = stmt as IfStmtNode*;
+                if (this.stmt_assigns_tracked_init(it.then_stmt)) { return true; }
+                return it.else_stmt != null &&
+                       this.stmt_assigns_tracked_init(it.else_stmt);
+            }
+            NodeKind::WhileStatement => {
+                return this.stmt_assigns_tracked_init((stmt as WhileStmtNode*).body);
+            }
+            NodeKind::DoWhileStatement => {
+                return this.stmt_assigns_tracked_init((stmt as DoWhileStmtNode*).body);
+            }
+            NodeKind::ForStatement => {
+                return this.stmt_assigns_tracked_init((stmt as ForStmtNode*).body);
+            }
+            NodeKind::LoopStatement => {
+                return this.stmt_assigns_tracked_init((stmt as LoopStmtNode*).body);
+            }
+            NodeKind::UnsafeBlockStatement => {
+                const u: UnsafeBlockStmtNode* = stmt as UnsafeBlockStmtNode*;
+                return u.block != null &&
+                       this.stmt_assigns_tracked_init(u.block as StatementNode*);
+            }
+            _ => { return false; }
+        }
     }
 
     /// Build `binding.drop();` as ExprStmt(Call(MemberAccess(Ident, "drop"))).

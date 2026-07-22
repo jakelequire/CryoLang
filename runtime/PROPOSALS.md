@@ -360,21 +360,33 @@
   the owner should scope this deliberately.
 
 <a id="p13"></a>
-### P13 — Definite-initialization / init-flag tracking for droppable locals ⚠ ESCALATE
+### P13 — Definite-initialization / init-flag tracking for droppable locals ✅ DONE
 
-- **Status:** MISSING/unverified (`NOTES` §1.4-Q3). Drop flags track conditional *move-out*
-  but (apparently) not conditional *initialization*; `mut x: T;` assigned in one branch may
-  get an unconditional scope-exit drop of uninitialized storage.
-- **Why:** A latent normal-path soundness hole *and* a hard prerequisite for any cleanup
-  path (a landing pad between decl and conditional init would drop garbage). Also relevant
-  independent of unwinding.
-- **Sema/pass:** first *verify* whether sema already forbids conditionally-initialized
-  droppable locals; if not, add definite-assignment (or init-flag) tracking to
-  `drop_insertion.cryo`/`move_check.cryo`, symmetric to the existing move drop-flags.
-- **Alternative rejected:** ignoring it risks dropping uninitialized memory — a
-  memory-safety bug, not a leak.
-- **Escalate:** verify-first; if it's a real hole it should be fixed regardless of the
-  runtime project.
+- **Status:** DONE (uncommitted; pinned). The hole was real and verified (a droppable local
+  declared without an initializer and assigned on only some paths got an *unconditional*
+  scope-exit `.drop()`, freeing uninitialized stack garbage on the unassigned path).
+- **Fix (`drop_insertion.cryo`):** each such local gets a synthesized
+  `mut <name>__initflag: boolean = false;` at its declaration; every whole-binding assignment
+  sets it true (`init_flag_for_assignment_target` + `make_drop_flag_set`); the scope-exit drop
+  is wrapped `if (<flag>) { ... }` (`wrap_in_init_guard`). This is the inverse-polarity mirror
+  of the conditional-**move** drop flag: default false = "not initialized ⇒ do NOT drop",
+  guard `if (flag)` (not `if (!flag)`), set on assignment (not move). It **composes** with the
+  move flag as `if (init) { if (!moved) drop() }`. The flag is stored in `binding_initflags`,
+  a parallel array kept in lock-step with `binding_names` (register/reset/param sites) and
+  truncated on scope pop → naturally scoped (innermost shadow wins on reverse scan).
+- **Chosen "always-flag" over precise dataflow:** a runtime flag *is* the init state, so
+  never-/maybe-/definitely-init are all handled by one guard (LLVM O2 folds the always-true
+  flag). No per-branch init-set merge was added.
+- **Scope guards:** (a) locals initialized element-wise (`arr[i]=`), field-wise (`x.f=`), or
+  through a taken address (`&x`) can't be tracked by a whole-binding flag → excluded by a
+  flow-insensitive pre-scan (`collect_init_disqualifiers`), keeping their prior unconditional
+  drop. (b) Braceless branch bodies (`if (c) x=f();`) are block-wrapped (`wrap_for_init`) so
+  the synthesized flag-set isn't lost to `walk_stmt_in_place`'s throwaway buffer.
+- **Gates:** `make test` PASS; `make selfhost-check` FIXED POINT (Linux stage-3==4 + Windows,
+  233 modules); repinned + `verify-pin` OK. Regression test:
+  `tests/tests/lang/conditional_init_drop.cryo` (11 cases).
+- **`move_check.cryo`:** not touched — MoveCheck mirrors the move-set only; the reported hole
+  was the DROP (DropInsertion's job), and it doesn't reject reading uninit anyway.
 
 <a id="p14"></a>
 ### P14 — Persist a per-scope cleanup schedule (reusable by landing pads)
