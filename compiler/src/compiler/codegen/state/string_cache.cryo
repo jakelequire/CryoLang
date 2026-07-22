@@ -3,9 +3,10 @@
 /// Deduplicating cache for module-global string literals.  Identical
 /// `string`s share one LLVM global, named `.str.N` in append order.
 ///
-/// Leaf component: owns its array.  Takes the `LBuilder` by parameter on
-/// the create path - caching does not need a builder, only first-emission
-/// does, so the builder lives on the caller side.
+/// Leaf component: owns its array.  Emits each constant directly at module
+/// scope (no builder), so a `string` literal can be materialised in the
+/// global-variable phase - before any basic block exists - just as well as
+/// inside a function body.
 
 namespace Compiler::Codegen::State::StringCache;
 
@@ -20,7 +21,7 @@ type struct StringCache {
         return StringCache { entries: [] };
     }
 
-    get_or_create(mut &this, text: string, builder: LBuilder) -> LValue {
+    get_or_create(mut &this, text: string, module: LModule*) -> LValue {
         for (mut i: i64 = 0; i < this.entries.length; i++) {
             if (this.entries[i].first == text) {
                 return LValue { raw: this.entries[i].second };
@@ -28,10 +29,26 @@ type struct StringCache {
         }
 
         const name: string = format(".str.%d", this.entries.length);
-        const val: LValue = builder.build_global_string_ptr(text, name);
 
-        this.entries.push(Pair::new(text, val.raw));
+        // Emit a private, NUL-terminated `[N x i8]` constant global directly
+        // at module scope, reproducing what `LLVMBuildGlobalStringPtr` builds
+        // (private, unnamed_addr, constant, align 1, trailing NUL) but WITHOUT
+        // a builder.  That builder call reaches its module through the current
+        // insert block's parent function, so it null-derefs when no block is
+        // positioned - the case for a `string` global materialised in the
+        // global-variable phase.  Under opaque pointers the global itself is
+        // the `i8*`, so it is returned directly (the GEP to element 0 folds
+        // away to the global anyway).
+        const arr: LValue = LType::const_string(text);
+        const global: LValue = module.add_global(arr.type_of(), name);
+        global.set_initializer(arr);
+        global.set_global_constant(true);
+        global.set_linkage(LLinkage::Private);
+        global.set_unnamed_address(LUnnamedAddr::Global);
+        global.set_alignment(1);
 
-        return val;
+        this.entries.push(Pair::new(text, global.raw));
+
+        return global;
     }
 }

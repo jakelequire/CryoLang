@@ -64,6 +64,27 @@ type struct ExprDispatch {
                 this.generate_statement(visitor, stmt);
             }
         }
+        // Value-block drops (a match-expression arm's own non-yielded locals):
+        // stashed here by drop-insertion because they must run AFTER the arm's
+        // value statement (which left the arm value in `state.last_value`) yet
+        // before this scope is popped, so the drop calls still resolve the
+        // arm-local bindings.  Preserve `state.last_value` across them so the
+        // arm value survives to the match phi.  Empty for every non-value block.
+        // Skip if the block already terminated (an early exit emitted its own
+        // cumulative drops); replaying after a terminator would be unreachable.
+        if (block.synth_drops.length > 0) {
+            const cur: LBasicBlock = this.cg.builder.get_insert_block();
+            if (!(cur.is_valid() && cur.has_terminator())) {
+                const saved_val: LValue = this.state.last_value;
+                const saved_lv:  boolean = this.state.last_is_lvalue;
+                for (mut i: i64 = 0; i < block.synth_drops.length; i++) {
+                    const d: StatementNode* = block.synth_drops[i];
+                    if (d != null) { this.generate_statement(visitor, d); }
+                }
+                this.state.last_value = saved_val;
+                this.state.last_is_lvalue = saved_lv;
+            }
+        }
         this.cg.values.pop_scope();
     }
 
