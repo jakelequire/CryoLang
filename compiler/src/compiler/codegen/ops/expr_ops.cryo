@@ -23,6 +23,12 @@ import Compiler::Codegen::Ops::{ SymbolResolver, IntrinsicEmitter };
 import Compiler::CompilationContext;
 import Compiler::Diag;
 import Compiler::Diag::{ Diagnostic, SourceSpan };
+// AST access is otherwise avoided here (see the module doc), but the shared
+// `--panic=unwind` cleanup landing pad must replay drop-call statements via
+// `accept(visitor)`, which needs the node + visitor types.  This is a downward
+// dependency (Codegen already depends on AST), not a cycle.
+import Compiler::AST;
+import Compiler::AST::{ Node, Visitor, Statement };
 import Compiler::Types;
 import Compiler::Types::{ TypeRef, Type, Arena, Compound, UserDefined };
 import Compiler::Resolver::{ SymbolStr, InternTable };
@@ -980,6 +986,92 @@ type struct ExprOps {
         return t;
     }
 
+    /// Schedule-driven cleanup landing pad for `--panic=unwind`, shared by the
+    /// ordinary-call path (CallEmitter forwards to here) and the synthesized
+    /// check origins.  Builds a cleanup-only `landingpad` at `lpad_bb`, replays
+    /// the drop schedule (`sched`, innermost-first, each a drop-call statement
+    /// up-cast to `ASTNode*`) via `accept(visitor)`, then `resume`s.  Attaches
+    /// the personality to `cur_fn` (idempotent) and restores the builder to
+    /// where it was called from.  `invoke_active` is clear here, so a drop that
+    /// itself unwinds propagates without re-entering this pad.
+    emit_cleanup_landingpad_sched(mut &this, visitor: ASTVisitor*, sched: ASTNode*[]*,
+                                  cur_fn: LValue, lpad_bb: LBasicBlock) -> void {
+        const saved_bb: LBasicBlock = this.builder.get_insert_block();
+        const pers: LValue = this.get_or_decl_personality();
+        if (pers.is_valid()) { cur_fn.set_personality_fn(pers); }
+        this.builder.position_at_end(lpad_bb);
+        const lpad_ty: LType = this.landingpad_type();
+        const lp: LValue = this.builder.build_landing_pad(lpad_ty, 0, "lpad");
+        lp.set_cleanup(true);
+        for (mut i: i64 = 0; i < sched.length; i++) {
+            const d: ASTNode* = sched[i];
+            if (d != null) { (d as StatementNode*).accept(visitor); }
+        }
+        this.builder.build_resume(lp);
+        if (saved_bb.is_valid()) { this.builder.position_at_end(saved_bb); }
+    }
+
+    /// Emit a diverging raise through `__cryo_panic(msg, file, line)` for a
+    /// synthesized check (div-by-zero, non-exhaustive match, `new[]` overflow)
+    /// under `--panic=unwind`.  When the frame has live droppable locals
+    /// (`sched` non-empty) the raise is an `invoke` into a cleanup landing pad
+    /// that drops them before the unwind continues; otherwise a plain `call`.
+    /// Either way it diverges (`unreachable` on the normal edge).  Callers gate
+    /// this on `ctx.project_panic_unwind` and keep the `abort` trap on the
+    /// default path, so emitted IR is unchanged there.
+    emit_panic_diverge_cleanup(mut &this, visitor: ASTVisitor*, sched: ASTNode*[]*,
+                               msg: LValue, file: LValue, line: LValue) -> void {
+        const panic_fn: LValue = this.intrinsics.get_or_decl_cryo_panic();
+        if (!panic_fn.is_valid()) { return; }
+        const ptr_ty: LType = LType::pointer_to(LType::i8());
+        const param_buf: void* = intrinsics::malloc(24);
+        const param_slots: void** = param_buf as void**;
+        param_slots[0] = ptr_ty.raw;
+        param_slots[1] = ptr_ty.raw;
+        param_slots[2] = LType::i32().raw;
+        const fty: LType = LType::function_type(LType::void_type(), param_buf, 3, false);
+        intrinsics::free(param_buf);
+        const arg_buf: void* = intrinsics::malloc(24);
+        const arg_slots: void** = arg_buf as void**;
+        arg_slots[0] = msg.raw;
+        arg_slots[1] = file.raw;
+        arg_slots[2] = line.raw;
+
+        const has_cleanup: boolean = sched != null && sched.length > 0;
+        if (has_cleanup) {
+            const cur_bb: LBasicBlock = this.builder.get_insert_block();
+            const cur_fn: LValue = cur_bb.get_parent();
+            const cont_bb: LBasicBlock = LBasicBlock::append(cur_fn, "check.cont");
+            const lpad_bb: LBasicBlock = LBasicBlock::append(cur_fn, "check.lpad");
+            this.invoke_active = true;
+            this.invoke_normal = cont_bb;
+            this.invoke_lpad   = lpad_bb;
+            this.build_call_maybe_invoke(fty, panic_fn, arg_buf, 3, "");
+            this.invoke_active = false;
+            intrinsics::free(arg_buf);
+            this.builder.build_unreachable();
+            this.emit_cleanup_landingpad_sched(visitor, sched, cur_fn, lpad_bb);
+        } else {
+            this.builder.build_call(fty, panic_fn, arg_buf, 3, "");
+            intrinsics::free(arg_buf);
+            this.builder.build_unreachable();
+        }
+    }
+
+    /// Build the `(message, file, line)` args for a synthesized check from a
+    /// compile-time `message` and the origin's `span`, then raise + clean up via
+    /// `emit_panic_diverge_cleanup`.  The shared body of every synthesized-check
+    /// raise (div-by-zero, non-exhaustive match, `new[]` overflow).
+    emit_check_raise(mut &this, visitor: ASTVisitor*, sched: ASTNode*[]*,
+                     span: SourceSpan, message: string) -> void {
+        const msg: LValue = this.builder.build_global_string_ptr(message, "check.msg");
+        mut filename: string = span.file;
+        if (filename == null || filename.length() == 0) { filename = "<unknown>"; }
+        const file: LValue = this.builder.build_global_string_ptr(filename, "check.file");
+        const line: LValue = LType::const_int(LType::i32(), span.start_line as u64, false);
+        this.emit_panic_diverge_cleanup(visitor, sched, msg, file, line);
+    }
+
     /// The pre-Phase-1 call lowering: coerce integer widths to match
     /// the callee's expected param types, then `build_call`.  Split out
     /// of `codegen_call` so the sret-marshalling wrapper can call
@@ -1264,7 +1356,8 @@ type struct ExprOps {
 
     /// Generate IR for a binary expression.  Handles arithmetic,
     /// comparison, logical short-circuit, and assignment operators.
-    codegen_binary(mut &this, lhs_val: LValue, rhs_val: LValue, op_kind: TokenType, result_type: TypeRef, rhs_type: TypeRef) -> LValue {
+    codegen_binary(mut &this, lhs_val: LValue, rhs_val: LValue, op_kind: TokenType, result_type: TypeRef, rhs_type: TypeRef,
+                   visitor: ASTVisitor*, div_sched: ASTNode*[]*, div_span: SourceSpan) -> LValue {
         mut out_value: LValue = LValue::null();
         if (!lhs_val.is_valid() || !rhs_val.is_valid()) {
             out_value = LValue::null();
@@ -1577,7 +1670,7 @@ type struct ExprOps {
                 // integer sdiv/udiv on a zero divisor (and signed
                 // INT_MIN / -1) are LLVM UB and must trap explicitly.
                 if (!is_float) {
-                    this.emit_int_div_guard(lhs, rhs, is_signed);
+                    this.emit_int_div_guard(lhs, rhs, is_signed, visitor, div_sched, div_span);
                 }
                 out_value = if (is_float) {
                     this.builder.build_fdiv(lhs, rhs, "divtmp")
@@ -1589,7 +1682,7 @@ type struct ExprOps {
             }
             TokenType::Percent => {
                 if (!is_float) {
-                    this.emit_int_div_guard(lhs, rhs, is_signed);
+                    this.emit_int_div_guard(lhs, rhs, is_signed, visitor, div_sched, div_span);
                 }
                 out_value = if (is_float) {
                     this.builder.build_frem(lhs, rhs, "remtmp")
@@ -1782,7 +1875,8 @@ type struct ExprOps {
     /// constant divisors LLVM's optimizer folds the branch away in O2
     /// builds (default), so the guard has no steady-state runtime cost
     /// when the compiler can prove safety statically.
-    emit_int_div_guard(mut &this, lhs: LValue, rhs: LValue, is_signed: boolean) -> void {
+    emit_int_div_guard(mut &this, lhs: LValue, rhs: LValue, is_signed: boolean,
+                       visitor: ASTVisitor*, div_sched: ASTNode*[]*, div_span: SourceSpan) -> void {
         const rhs_ty_raw: void* = llvm::LLVMTypeOf(rhs.raw);
         if (rhs_ty_raw == null) { return; }
         const rhs_ty: LType = LType { raw: rhs_ty_raw };
@@ -1823,17 +1917,22 @@ type struct ExprOps {
 
         this.builder.build_cond_br(trap_cond, trap_bb, ok_bb);
 
-        // Trap arm: call @abort(); unreachable.  Same pattern as the
-        // match-no-default block in ir_generator: a bare `unreachable`
-        // lowers to no instruction on x86, which silently slides into
-        // adjacent code at runtime.  abort + unreachable guarantees a
-        // clean SIGABRT.
+        // Trap arm.  `--panic=unwind` (hosted): raise through `__cryo_panic`
+        // (call-or-invoke + cleanup) so the failure unwinds and drops the
+        // frame's live locals.  Default abort path: `call @abort();
+        // unreachable` - a bare `unreachable` lowers to no instruction on x86
+        // and would silently slide into adjacent code, so abort guarantees a
+        // clean SIGABRT.  Byte-identical on the default path.
         this.builder.position_at_end(trap_bb);
-        const abort_fn: LValue = this.intrinsics.get_or_decl_abort();
-        const abort_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(abort_fn.raw) };
-        mut a_args: Pair<LValue, TypeRef>[] = [];
-        this.codegen_call(abort_fn, abort_ty, a_args, "");
-        this.builder.build_unreachable();
+        if (this.ctx.project_panic_unwind && !this.intrinsics.no_runtime) {
+            this.emit_check_raise(visitor, div_sched, div_span, "attempt to divide by zero");
+        } else {
+            const abort_fn: LValue = this.intrinsics.get_or_decl_abort();
+            const abort_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(abort_fn.raw) };
+            mut a_args: Pair<LValue, TypeRef>[] = [];
+            this.codegen_call(abort_fn, abort_ty, a_args, "");
+            this.builder.build_unreachable();
+        }
 
         // OK arm: caller continues with the div/rem here.
         this.builder.position_at_end(ok_bb);
@@ -1852,7 +1951,8 @@ type struct ExprOps {
     /// (`new int[-1]`) reads as a huge value and traps too. 1-byte elements
     /// can never overflow, so the guard is elided. Leaves the builder at the
     /// ok block; mirrors `emit_int_div_guard`'s trap shape.
-    emit_array_mul_guard(mut &this, count_i64: LValue, elem_size: u64) -> void {
+    emit_array_mul_guard(mut &this, count_i64: LValue, elem_size: u64,
+                         visitor: ASTVisitor*, ovf_sched: ASTNode*[]*, ovf_span: SourceSpan) -> void {
         if (elem_size <= (1 as u64)) { return; }
         const u64_max: u64 = (0 as u64) - (1 as u64);
         const max_count: u64 = u64_max / elem_size;
@@ -1868,14 +1968,20 @@ type struct ExprOps {
 
         this.builder.build_cond_br(overflow, trap_bb, ok_bb);
 
-        // Trap arm: call @abort(); unreachable - a clean SIGABRT instead of
-        // a silently-truncated allocation.
+        // Trap arm.  `--panic=unwind` (hosted): raise + cleanup so the failure
+        // unwinds and drops the frame's live locals.  Default abort path: `call
+        // @abort(); unreachable` - a clean SIGABRT instead of a silently
+        // truncated allocation.  Byte-identical on the default path.
         this.builder.position_at_end(trap_bb);
-        const abort_fn: LValue = this.intrinsics.get_or_decl_abort();
-        const abort_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(abort_fn.raw) };
-        mut a_args: Pair<LValue, TypeRef>[] = [];
-        this.codegen_call(abort_fn, abort_ty, a_args, "");
-        this.builder.build_unreachable();
+        if (this.ctx.project_panic_unwind && !this.intrinsics.no_runtime) {
+            this.emit_check_raise(visitor, ovf_sched, ovf_span, "arithmetic overflow");
+        } else {
+            const abort_fn: LValue = this.intrinsics.get_or_decl_abort();
+            const abort_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(abort_fn.raw) };
+            mut a_args: Pair<LValue, TypeRef>[] = [];
+            this.codegen_call(abort_fn, abort_ty, a_args, "");
+            this.builder.build_unreachable();
+        }
 
         this.builder.position_at_end(ok_bb);
     }

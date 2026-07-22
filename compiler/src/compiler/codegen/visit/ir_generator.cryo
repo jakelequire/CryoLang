@@ -621,6 +621,16 @@ public:
         return this.dispatch.codegen_lvalue(this, subject_node);
     }
 
+    /// `--panic=unwind`: emit the non-exhaustive-match `no_match` raise through
+    /// `__cryo_panic` (call-or-invoke + cleanup landing pad), replacing the
+    /// `abort` trap so the failure unwinds and the frame's live locals drop.
+    /// `sched` is the match node's `unwind_cleanup` (empty => plain call).
+    /// Shared by the statement and expression match forms.
+    emit_no_match_raise(mut &this, span: SourceSpan, sched: ASTNode*[]*) -> void {
+        this.cg.expr_ops.emit_check_raise(this, sched, span,
+            "no matching pattern (non-exhaustive match)");
+    }
+
     override visit(mut &this, node: MatchStmtNode*) -> void {
         if (node.subject == null || node.arms.length == 0) { return; }
 
@@ -731,12 +741,19 @@ public:
         // LLVM elides the whole thing; either way the IR stays well-formed.
         if (!no_match_bb.has_terminator()) {
             this.cg.builder.position_at_end(no_match_bb);
-            const abort_fn: LValue = this.cg.intrinsics.get_or_decl_abort();
-            const abort_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(abort_fn.raw) };
-            mut a_args: Pair<LValue, TypeRef>[] = [];
-            mut a_res: LValue = LValue::null();
-            a_res = this.cg.expr_ops.codegen_call(abort_fn, abort_ty, a_args, "");
-            this.cg.builder.build_unreachable();
+            // `--panic=unwind` (hosted): raise through `__cryo_panic` so the
+            // failure unwinds and drops the frame's live locals; the default
+            // abort path stays byte-identical.
+            if (this.cg.ctx.project_panic_unwind && !this.cg.intrinsics.no_runtime) {
+                this.emit_no_match_raise(node.span, &node.unwind_cleanup);
+            } else {
+                const abort_fn: LValue = this.cg.intrinsics.get_or_decl_abort();
+                const abort_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(abort_fn.raw) };
+                mut a_args: Pair<LValue, TypeRef>[] = [];
+                mut a_res: LValue = LValue::null();
+                a_res = this.cg.expr_ops.codegen_call(abort_fn, abort_ty, a_args, "");
+                this.cg.builder.build_unreachable();
+            }
         }
 
         this.cg.builder.position_at_end(merge_bb);
@@ -1782,12 +1799,17 @@ public:
         // LLVM elides it.
         if (!default_bb.has_terminator()) {
             this.cg.builder.position_at_end(default_bb);
-            const abort_fn_e: LValue = this.cg.intrinsics.get_or_decl_abort();
-            const abort_ty_e: LType = LType { raw: llvm::LLVMGlobalGetValueType(abort_fn_e.raw) };
-            mut a_args_e: Pair<LValue, TypeRef>[] = [];
-            mut a_res_e: LValue = LValue::null();
-            a_res_e = this.cg.expr_ops.codegen_call(abort_fn_e, abort_ty_e, a_args_e, "");
-            this.cg.builder.build_unreachable();
+            // `--panic=unwind` (hosted): raise + cleanup instead of abort.
+            if (this.cg.ctx.project_panic_unwind && !this.cg.intrinsics.no_runtime) {
+                this.emit_no_match_raise(node.span, &node.unwind_cleanup);
+            } else {
+                const abort_fn_e: LValue = this.cg.intrinsics.get_or_decl_abort();
+                const abort_ty_e: LType = LType { raw: llvm::LLVMGlobalGetValueType(abort_fn_e.raw) };
+                mut a_args_e: Pair<LValue, TypeRef>[] = [];
+                mut a_res_e: LValue = LValue::null();
+                a_res_e = this.cg.expr_ops.codegen_call(abort_fn_e, abort_ty_e, a_args_e, "");
+                this.cg.builder.build_unreachable();
+            }
         }
 
         this.cg.builder.position_at_end(merge_bb);

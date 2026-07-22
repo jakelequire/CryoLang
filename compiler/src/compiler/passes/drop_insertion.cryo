@@ -1136,7 +1136,7 @@ type struct DropInserter {
     walk_match(mut &this, m: MatchStmtNode*,
                out: StatementNode*[]*) -> boolean {
         if (m == null) { return false; }
-        return this.walk_match_arms(m, m.subject, m.arms, false, out);
+        return this.walk_match_arms(m, m.subject, m.arms, false, out, &m.unwind_cleanup);
     }
 
     /// Walk a match's subject and arms as N independent control-flow
@@ -1225,8 +1225,16 @@ type struct DropInserter {
     walk_match_arms(mut &this, m: MatchStmtNode*,
                     subject: ExpressionNode*,
                     arms: &MatchArmNode*[], is_expr: boolean,
-                    out: StatementNode*[]*) -> boolean {
+                    out: StatementNode*[]*, cleanup_out: ASTNode*[]*) -> boolean {
         if (subject != null) { this.walk_expr_read(subject); }
+        // `--panic=unwind`: a non-exhaustive match emits a `no_match` guard that
+        // raises through `__cryo_panic`; snapshot the frame's live-local drops
+        // (after the subject is consumed, so a moved subject-local is excluded)
+        // for the guard's cleanup landing pad.  `cleanup_out` is the match
+        // node's `unwind_cleanup` array (null only if the caller opts out).
+        if (this.ctx.project_panic_unwind && cleanup_out != null) {
+            this.snapshot_unwind_cleanup(cleanup_out);
+        }
 
         // Subject-consumption tracking for drop-glue suppression.  When the
         // subject is a bare owning binding (e.g. `match (opt) { ... }` where
@@ -1885,23 +1893,29 @@ type struct DropInserter {
     }
 
     /// Snapshot the cumulative cleanup schedule (drops for every live
-    /// droppable local, to function root, innermost-first) onto a call node
-    /// so codegen can replay it in the call's `--panic=unwind` cleanup
-    /// landing pad.  Only already-declared live locals are included (the
-    /// binding arrays hold exactly those registered so far), so no drop of
-    /// not-yet-live storage is scheduled; the move/init flags handle the
-    /// conditional cases at runtime, identically to the normal-path drops.
-    /// An empty schedule (no live local needs dropping) tells codegen to
-    /// emit a plain `call` instead of an `invoke`.  Gated on panic=unwind by
+    /// droppable local, to function root, innermost-first) onto `out` - a
+    /// node's `unwind_cleanup` array - so codegen can replay it in the
+    /// `--panic=unwind` cleanup landing pad.  Only already-declared live locals
+    /// are included (the binding arrays hold exactly those registered so far),
+    /// so no drop of not-yet-live storage is scheduled; the move/init flags
+    /// handle the conditional cases at runtime, identically to the normal-path
+    /// drops.  An empty schedule (no live local needs dropping) tells codegen
+    /// to emit a plain `call` instead of an `invoke`.  Gated on panic=unwind by
     /// the caller.  Stored as `ASTNode*` (up-cast from `StatementNode*`) to
-    /// match the node's cycle-avoiding field type.
-    populate_unwind_cleanup(mut &this, c: CallExprNode*) -> void {
-        if (c == null) { return; }
+    /// match the node's cycle-avoiding field type.  Shared by every panic
+    /// origin: ordinary calls and the synthesized div/no-match/new-overflow
+    /// guards.
+    snapshot_unwind_cleanup(mut &this, out: ASTNode*[]*) -> void {
         mut sched: StatementNode*[] = [];
         this.append_cumulative_drops(&sched);
         for (mut i: i64 = 0; i < sched.length; i++) {
-            if (sched[i] != null) { c.unwind_cleanup.push(sched[i] as ASTNode*); }
+            if (sched[i] != null) { out.push(sched[i] as ASTNode*); }
         }
+    }
+
+    populate_unwind_cleanup(mut &this, c: CallExprNode*) -> void {
+        if (c == null) { return; }
+        this.snapshot_unwind_cleanup(&c.unwind_cleanup);
     }
 
     /// Drops for scopes inside the current loop body.  Used before
@@ -2795,7 +2809,7 @@ type struct DropInserter {
                 // link_payload, not outer-scope move detection).
                 mut throwaway_out: StatementNode*[] = [];
                 this.walk_match_arms(null, me.subject, me.arms, true,
-                    &throwaway_out);
+                    &throwaway_out, &me.unwind_cleanup);
             }
             NodeKind::StaticMatchExpression => {
                 // Single live arm post-monomorphization: instrument its block.
@@ -2959,6 +2973,18 @@ type struct DropInserter {
                 this.walk_expr_read(b.right);
             }
         }
+        // `--panic=unwind`: raw integer `/`, `%` and their compound-assign forms
+        // (`/=`, `%=`, which lower through the same base-op guard) emit a
+        // divide-by-zero / `INT_MIN / -1` guard that raises through
+        // `__cryo_panic`; snapshot the frame's live-local drops so the guard's
+        // cleanup landing pad runs them.  An operator-overloaded form
+        // (desugared_call set) lowers instead to an ordinary call that carries
+        // its own schedule.
+        if (this.ctx.project_panic_unwind && b.desugared_call == null
+            && (b.op.kind == TokenType::Slash        || b.op.kind == TokenType::Percent
+             || b.op.kind == TokenType::SlashEqual   || b.op.kind == TokenType::PercentEqual)) {
+            this.snapshot_unwind_cleanup(&b.unwind_cleanup);
+        }
     }
 
     read_unary(mut &this, u: UnaryExprNode*) -> void {
@@ -3031,6 +3057,11 @@ type struct DropInserter {
         // double free.  array_size (`new T[n]`) is a plain read.
         if (n.struct_init != null) { this.read_struct_lit(n.struct_init); }
         if (n.array_size != null)  { this.walk_expr_read(n.array_size); }
+        // `--panic=unwind`: `new T[n]` emits a size-overflow guard that raises;
+        // snapshot the frame's live-local drops for its cleanup landing pad.
+        if (this.ctx.project_panic_unwind && n.array_size != null) {
+            this.snapshot_unwind_cleanup(&n.unwind_cleanup);
+        }
     }
 
     handle_ident(mut &this, ident: IdentifierNode*, in_move_context: boolean) -> void {
