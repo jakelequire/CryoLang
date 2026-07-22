@@ -201,7 +201,8 @@ type struct CallEmitter {
                 if (id.name.equals(intern.intern("panic"))
                     && this.cg.ctx.project_panic_unwind
                     && !this.cg.intrinsics.no_runtime
-                    && node.unwind_cleanup.length > 0
+                    && (node.unwind_cleanup.length > 0
+                        || this.cg.expr_ops.has_live_arg_temps())
                     && intr_args.length >= 3) {
                     this.emit_panic_unwind(visitor, node,
                         intr_args[0], intr_args[1], intr_args[2]);
@@ -452,7 +453,8 @@ type struct CallEmitter {
                 if (sr.member_name.equals(intern.intern("panic"))
                     && this.cg.ctx.project_panic_unwind
                     && !this.cg.intrinsics.no_runtime
-                    && node.unwind_cleanup.length > 0
+                    && (node.unwind_cleanup.length > 0
+                        || this.cg.expr_ops.has_live_arg_temps())
                     && sr_args.length >= 3) {
                     this.emit_panic_unwind(visitor, node,
                         sr_args[0], sr_args[1], sr_args[2]);
@@ -1084,6 +1086,11 @@ type struct CallEmitter {
         // imported C `v*` consumer reads from the right slot instead of one
         // indirection off.  `va_forward_fn_type` returns null on SysV-amd64 and
         // for method calls, leaving the loop byte-identical there.
+        // `--panic=unwind`: open a frame for this call's argument temporaries.
+        // Each anonymous owning temp evaluated below is recorded so a panic
+        // origin nested in a LATER argument drops it on the unwind; the frame is
+        // closed once the call is built (the callee then owns them).
+        if (this.cg.ctx.project_panic_unwind) { this.cg.expr_ops.open_arg_temp_frame(); }
         const va_ft: FunctionType* = this.va_forward_fn_type(node);
         for (mut i: i64 = 0; i < node.arguments.length; i++) {
             mut arg: LValue = this.dispatch.codegen_rvalue(visitor,node.arguments[i]);
@@ -1101,8 +1108,19 @@ type struct CallEmitter {
                     arg = this.cg.abi.forward_va_list(&this.cg.builder, arg);
                 }
             }
+            // A by-value owning temp (a call / struct-literal result with no AST
+            // binding) is invisible to DropInsertion's name-keyed pending-arg
+            // machinery; record it so a later argument's panic drops it. Autoref
+            // args are borrows (the callee never owns them), so they are skipped.
+            if (this.cg.ctx.project_panic_unwind && !node.arguments[i].autoref) {
+                this.maybe_record_arg_temp(node.arguments[i], arg);
+            }
             args.push(Pair<LValue, TypeRef>::new(arg, node.arguments[i].resolved_type));
         }
+        // Close this call's arg-temp frame: its temporaries are now owned by the
+        // callee, so the call's own cleanup schedule must not drop them. A panic
+        // origin walked while the frame was open already captured them.
+        if (this.cg.ctx.project_panic_unwind) { this.cg.expr_ops.close_arg_temp_frame(); }
 
         const fn_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(callee_val.raw) };
         if (!fn_ty.is_valid()) {
@@ -1183,8 +1201,12 @@ type struct CallEmitter {
         // caller.  DropInsertion recorded the cumulative schedule on
         // `node.unwind_cleanup`; it is empty on the default abort path, so the
         // else-branch below emits the identical plain `call` there.
+        // Live anonymous arg temps in an enclosing in-progress call also force an
+        // invoke: if this call unwinds, its pad must drop them (the callee that
+        // would own them never runs on the unwind path).
         const needs_invoke: boolean = this.cg.ctx.project_panic_unwind
-            && node.unwind_cleanup.length > 0;
+            && (node.unwind_cleanup.length > 0
+                || this.cg.expr_ops.has_live_arg_temps());
         if (needs_invoke) {
             const cur_fn: LValue = this.get_current_function();
             if (cur_fn.is_valid()) {
@@ -1284,6 +1306,50 @@ type struct CallEmitter {
 
         this.state.last_value = result;
         this.state.last_is_lvalue = false;
+    }
+
+    /// Record a live anonymous owning argument temporary so a panic origin
+    /// nested in a LATER argument drops it on the unwind path.  `f(make(),
+    /// boom())`: make()'s result is an owning temp with no AST binding, so
+    /// DropInsertion's name-keyed pending-arg machinery (which handles NAMED
+    /// owning args) cannot schedule its drop.  Spill the value into a stable slot,
+    /// bind that slot to a synthetic name in the value table, and hand a
+    /// ready-made `<name>.drop()` statement to the arg-temp stack; the cleanup
+    /// landing pad replays it exactly like an ordinary local's drop (user drop,
+    /// Copy no-op, and recursive glue all fall out of the normal `.drop()`
+    /// lowering).  Only a genuine owning rvalue temp qualifies - a call or
+    /// struct-literal result, never an identifier (the named machinery already
+    /// covers it, and double-tracking would double-drop) nor a place expression
+    /// (which would alias tracked storage).  The callee still receives the value
+    /// and drops its own copy on the normal path, so this slot is dropped ONLY on
+    /// the unwind path.  Caller gates on `--panic=unwind` and skips autoref args.
+    maybe_record_arg_temp(mut &this, arg_expr: ExpressionNode*, arg_val: LValue) -> void {
+        if (arg_expr == null || !arg_val.is_valid()) { return; }
+        if (arg_expr.kind != NodeKind::CallExpression
+            && arg_expr.kind != NodeKind::StructLiteral) { return; }
+        const ty: TypeRef = arg_expr.resolved_type;
+        if (!ty.is_valid()) { return; }
+        const arena: TypeArena* = this.cg.get_arena();
+        if (arena == null) { return; }
+        if (!OwnershipQuery::needs_drop(arena, this.cg.ctx.generic_registry,
+                                        this.cg.get_intern(), ty)) { return; }
+        const lty: LType = this.cg.type_mapper.map_type(ty);
+        if (!lty.is_valid()) { return; }
+        const slot: LValue = this.entry_spill_slot(lty, "argtemp");
+        if (!slot.is_valid()) { return; }
+        this.cg.builder.build_store(arg_val, slot);
+        const intern: InternTable* = this.cg.get_intern();
+        const nm: SymbolStr = intern.intern(format("__argtemp_%d", this.glue_seq));
+        this.glue_seq = this.glue_seq + 1;
+        this.cg.values.set(nm, slot);
+        mut id_node: IdentifierNode* = new IdentifierNode(nm, arg_expr.span);
+        id_node.set_resolved_type(ty);
+        const drop_sym: SymbolStr = intern.intern("drop");
+        mut da: MemberAccessNode* = new MemberAccessNode(
+            id_node as ExpressionNode*, drop_sym, arg_expr.span, arg_expr.span);
+        mut call: CallExprNode* = new CallExprNode(da as ExpressionNode*, arg_expr.span);
+        mut stmt: ExprStmtNode* = new ExprStmtNode(call as ExpressionNode*, arg_expr.span);
+        this.cg.expr_ops.push_arg_temp_drop(stmt as ASTNode*);
     }
 
     /// Emit the cleanup landing pad for an `invoke` under `--panic=unwind`.
