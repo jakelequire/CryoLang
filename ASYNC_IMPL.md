@@ -41,22 +41,36 @@ not for routine judgement calls.
 
 Legend: ☐ not started · ◐ in progress · ✅ done+validated · ⏸ blocked (note why in the Progress Log).
 
-**Current HEAD baseline:** `b1414145` (`feat: Canonicalizes a Mod::Leaf name …` — the qualified re-export
-resolver fix, committed+repinned by Jake, on top of `3cedca8d` Inc-2 repin). Branch `ll-impl`. Pin verifies
-OK. Inc 3 is **DONE+validated, UNCOMMITTED** (one modified file: `sema/async_lower.cryo`; no repin).
-Tracks 1 (drop-completeness on unwind) and 2 (thread-local panic state) are **done + committed + repinned**
-— they are the prerequisites async plugs into (see §3).
+**Current HEAD baseline:** `5f2776af` (`Implement multi-await support…` — Inc 3, committed by Jake on top of
+`b1414145`). Branch `ll-impl`. Pin verifies OK. **UNCOMMITTED:** the `block_on` inference fix below (two
+files: `sema/call_resolver.cryo` + `types/inference.cryo`; no repin). Tracks 1 (drop-completeness on unwind)
+and 2 (thread-local panic state) are **done + committed + repinned** — they are the prerequisites async plugs
+into (see §3).
 
-**⚠ KNOWN BUG (pre-existing, NOT async-lowering, blocks the `block_on` driver):** `block_on(fut)` — and any
-generic free fn `f<F, R>(fut: F) -> R where F: Future<R>` — fails **codegen `E0636`** when called WITHOUT a
-turbofish, because `R` appears only in the return type + the where-bound (never in a parameter) and is not
-inferred from `F::Output`, so mono emits no specialization. **Turbofish works:** `block_on<ConcreteF,
-ConcreteR>(…)`. Reproduces on the committed pinned `bin/cryo` with a pure-stdlib `block_on(Ready<i32>::new(
-42))` (zero async) → independent of async. It is in the generic-inference layer, not `async_lower`. Since
-`block_on` on an anonymous async future can't be turbofished (the future type is unnameable), **async
-validation currently drives futures with an inline `loop { match f.poll(&cx) }` instead of `block_on`.** The
-Inc-1b/2 Progress-Log "no turbofish" claim no longer holds at HEAD. Fix is bound-directed inference (project
-the where-bound type arg from the receiver's assoc type) — a separate subsystem; left for Jake to triage.
+**✅ FIXED (2026-07-23) — `block_on` (and every where-bound-only-param generic) now infers without a
+turbofish.** Was: `block_on(fut)` — and any `f<F, R>(fut: F) -> R where F: Future<R>` — failed **codegen
+`E0636`** when `R` appeared only in the return type + where-bound (never a parameter), because argument
+inference bound `F` but nothing projected `R = F::Output`; the "all bound" gate then bailed without stashing,
+so mono couldn't specialize. Fix = a **bound-directed projection pass ("PASS D")** in
+`CallResolver::check_generic_free_call` + its qualified twin `infer_free_call_bindings`: after arg inference,
+for each where-bound `P: Trait<…, R, …>` whose subject `P` is bound to a concrete type, project the trait's
+positional-sugar associated type off `P` (`resolve_concrete_member(P, "Output")`) and fill the still-unbound
+arg param `R`. Mirrors the impl-side `TypeResolver::derive_where_assoc_bindings`. Now `block_on(fut)` (incl.
+on an **unnameable async future** — `block_on(add_two())`), `future::block_on(…)`, and `from_iter(it)` all
+resolve from arguments alone; turbofish / expected-type / non-`Future`-rejection paths unchanged. Gates: both
+OS fixed points, `win-s2` vs `win-s3` = 0 `.ll`, Linux normalized pinned-vs-new = 0 residual → **no repin**.
+**The inline `loop { match f.poll(&cx) }` async-validation workaround is retired — use `block_on`.**
+
+**Generic-METHOD analogue — deferred (NOT a simple mirror; deeper pre-existing blockers).** A method
+`m<F, R>(fut: F) -> R where F: Future<R>` (static `Owner::drive(fut)` or instance `obj.run(fut)`) is a bigger
+job than the free-fn fix: (1) `infer_generic_method_bindings` (the function the free-call fix's twin lives
+next to) is **not even reached** for these calls — static generic-method calls resolve through a different
+scope-resolution path; and (2) generic methods of this shape **fail even WITH a turbofish** (E0633/E0636
+cascade), and even a trivial `Bo::id<i32>(42)` on a non-generic owner fails **E0200** (return-type
+substitution) — so the generic-method-with-where-bound machinery has multiple independent gaps, of which
+inference is only one. Fixing it means untangling the static/instance generic-method resolution+mono paths,
+not adding one projection pass. Left as a separate effort. The free-function fix (which covers `block_on`,
+`from_iter`, and any `f<F,R> where F: Trait<R>` free call) fully lands the async driver.
 
 ---
 
@@ -658,3 +672,35 @@ IR should be unchanged — verify the `win-s2` vs `win-s3` `.ll` diff at each bo
   machine flattening vs. staged hard-error-await-in-loop-first) to Jake and get sign-off BEFORE coding.**
   Separately, the `block_on` where-bound-inference bug (§1) blocks the ergonomic async driver and is worth
   fixing (generic-inference layer, not async) — Jake to triage.
+
+- _2026-07-23_ — **`block_on` where-bound-only inference — FIXED (general generic-inference fix, not async).
+  No repin. UNCOMMITTED.** Baseline HEAD `5f2776af` (Inc 3, committed by Jake). Two files: NEW `PASS D` in
+  `sema/call_resolver.cryo` (+82; `project_where_bound_params` + `param_name_index` + `where_arg_param_index`,
+  wired into both `check_generic_free_call` and `infer_free_call_bindings`) and `InferCtx::bind_slot` in
+  `types/inference.cryo` (+10). **Root cause:** for `f<F, R>(fut: F) -> R where F: Future<R>`, `R` is a
+  functional dependency of `F` (positional sugar `Future<R>` = `Output = R`) that appears in NO value
+  parameter; PASS A bound `F` from the arg but nothing derived `R`, and the `all_bound` gate bailed to
+  `invalid` WITHOUT stashing type args → mono skipped the specialization → codegen `E0636`. Expected-type
+  context (`const r: i32 = block_on(fut);`, return position) already recovered `R` via PASS B, so the bug only
+  bit in context-free position (`block_on(fut) != 42`). **Fix:** after PASS A/B/C, project each still-unbound
+  where-bound arg param off its now-bound subject — resolve the trait decl (`get_trait_decl`), map the
+  positional arg slot `ai >= trait.generic_params.length` to `trait.assoc_types[ai - ngp]`, and
+  `resolve_concrete_member(subject, assoc_name)` (the same projection `resolve_await` uses). **Landmine paid:**
+  the subject guard must be `!contains_generic_param(subject)`, NOT `free_infer_type_concrete` — the latter
+  rejects a *pre-mono* `InstantiatedType` (`Ready<i32>`) whose monomorphized form doesn't exist yet
+  (`has_resolved_type()==false`), which is exactly the state the arg is in during sema; `resolve_concrete_member`
+  handles the pre-mono instantiation fine. **Validation:** `block_on(Ready<i32>::new(42))` (the bug),
+  `future::block_on(…)`, `block_on(PendingThenReady<…>)`, **`block_on(add_two())` on an unnameable async
+  future** (the real payoff — retires the inline-poll workaround), `String`-output, and `from_iter(it)` (the
+  other in-tree instance: `T = I::Item`) all → EXIT 0; turbofish + expected-type unchanged; non-`Future` arg
+  still rejected (E0306/E0636, no miscompile). **Gate:** `make selfhost-check` → exit 0, **BOTH fixed points**
+  (Linux `s3`==`s4`; Windows `FIXED POINT OK`, 235 modules — after freeing an OOM-pressuring `cryolsp` that
+  environmentally SIGTERM'd the wine build twice). `win-s2` (pinned-built) vs `win-s3` (new-built) = **0
+  differing `.ll`**; Linux normalized pinned-vs-new = 0 residual (only `FILE.str` `__FILE__`-path artifacts)
+  → the fix is inert for all existing code (every call that compiles today already binds all params, so PASS D
+  fills nothing) → **NO REPIN**. **Follow-up (investigated, deferred):** tried to mirror this onto the
+  generic-METHOD path and reverted — `infer_generic_method_bindings` is **not reached** for static
+  generic-method calls (`Owner::drive(fut)` resolves via a different scope-resolution path), and generic
+  methods of this shape fail even WITH a turbofish (E0633) — even trivial `Bo::id<i32>(42)` fails E0200. The
+  generic-method-with-where-bound path has multiple independent pre-existing gaps beyond inference; it needs
+  its own effort (see §1). Reverted cleanly to the validated free-fn-only fix (call_resolver +82, inference +10).
