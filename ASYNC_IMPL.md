@@ -33,7 +33,7 @@ doc current at every stop.
 |---|---|---|
 | 0 | Design lock-down (surface, trait shapes, lowering placement) — get Jake's sign-off | ✅ done — locked 2026-07-22 (§7 filled) |
 | 1 | Core types in stdlib (`Poll`/`Future`/`Context`/`Waker`) + `block_on` + hand-written futures | ✅ done+validated 2026-07-22 (no repin) |
-| 2 | Compiler: `async fn` parse + state-machine lowering + `await` desugar | ◐ in progress — parse + **no-await lowering (Inc 1b) DONE+validated**; awaits (Inc 2-4) next |
+| 2 | Compiler: `async fn` parse + state-machine lowering + `await` desugar | ◐ in progress — parse + no-await (Inc 1b) + **single straight-line `await` (Inc 2) DONE+validated**; Inc 3 (several awaits) next, then Inc 4 (branches/loops — Jake sign-off) |
 | 3 | Executor + `Waker` + `spawn`/`JoinHandle`; multi-thread; poll-boundary `catch_unwind` isolation | ☐ not started |
 | 4 | Reactor (epoll/IOCP) + async I/O over `std::net` + timers + `async fn main` + combinators | ☐ not started |
 
@@ -495,3 +495,65 @@ IR should be unchanged — verify the `win-s2` vs `win-s3` `.ll` diff at each bo
   NEXT: **Inc 2** — one `await`, straight-line (2 states; stash the awaited sub-future in a field; bind its
   result; suspend on `Pending`). Rewrite `AwaitExprNode` (kill the `ir_generator.cryo:1944` hard-error) +
   emit the `switch(this.state)` resume dispatcher.
+
+- _2026-07-23_ — **Inc 2 DONE + validated (both OSes). No repin (0 `.ll` diff).** Baseline HEAD `61ad4320`
+  (Inc 1b committed+repinned), pin verifies OK, tree = 4 modified source files (uncommitted). A single
+  straight-line `await` now lowers to a two-state resumable `poll`. Files:
+  - `stdlib/future/poll.cryo` — added `Poll<T>::into_ready(&this) -> T` (`![sink]`; aborts on `Pending`); the
+    lowering calls it only after an `is_pending` check already returned on the Pending path.
+  - `sema/sema.cryo` — `resolve_expr` now types `AwaitExpression` via new `resolve_await`: resolves the
+    operand `F`, projects `F::Output` with `type_resolver.resolve_concrete_member(F, "Output", &rc)` (the
+    same assoc-projection `check_assoc_decl_bounds` uses at `sema.cryo:469`), leaving `F` cached on the
+    operand and `A=Output` on the await node so `AsyncLower` reads both without re-projecting. Non-`Future`
+    operand → clean E0306.
+  - `sema/async_lower.cryo` — `lower()` now computes an await plan (count via `block_await_count`; locate the
+    single supported carrier via `stmt_toplevel_await`); 0 awaits → the Inc-1b body; exactly 1 supported
+    top-level await → the state machine; anything else → loud E0600. Added `fut_0: Option<F>` field
+    (`Option::None` in the ctor — the sub-future is created lazily on first poll), and
+    `build_poll_body_single_await` emitting: `if (this.state==0u32){ <pre>; this.fut_0=Option::Some(<e>);
+    this.state=1u32; }` then `mut __sub_0 = this.fut_0.take().unwrap(); mut __poll_0 = __sub_0.poll(cx); if
+    (__poll_0.is_pending()){ this.fut_0=Option::Some(__sub_0); return Poll::Pending; } const __await_0 =
+    __poll_0.into_ready();` then the carrier (its `await e` rewritten to read `__await_0`) + post statements
+    (returns wrapped `Poll::Ready`). Carriers: `const/mut x = await e;`, `return await e;`, `await e;`.
+  - `codegen/visit/ir_generator.cryo` — `visit(AwaitExprNode*)` hard-error message reworded: a surviving
+    `AwaitExprNode` at codegen now means the lowering did NOT rewrite it (await outside `async fn`, or async
+    control flow this increment doesn't handle) → it is a **defensive backstop**, deliberately kept (NOT
+    deleted), so the imperfect `block_await_count` can only degrade the diagnostic, never miscompile.
+  - **Validation:** scratchpad `async_inc2/` drives three async fns through `future::block_on` (no turbofish)
+    → EXIT 0: `delayed(3,41)→42` (decl-init await, 3 Pending polls then `+1`), `passthru(2,7)→7` (`return
+    await`), `withpre(1,20)→40` (pre-statement builds the future into a local, then awaits it). Negative
+    probes: two awaits and a nested `(await e)+5` both hit the E0600 gate loudly. `CRYO_CC=gcc make
+    selfhost-check` → exit 0, BOTH fixed points (Linux s3==s4; Windows FIXED POINT OK, 235 modules);
+    `win-s2` (pinned-built) vs `win-s3` (new-built) = **0 differing `.ll`** → lowering inert for async-free
+    code → **no repin**.
+  **Storage-model decision (durable):** the awaited sub-future is `fut_0: Option<F>`, NOT a plain `F`.
+  Cryo futures are lazy (body runs only on first poll), so `e` must be built on the FIRST poll (state 0),
+  not at construction — a plain field would need a constructor value that doesn't exist yet. `Option<F>`
+  = "not created yet" (`None`) → created (`Some(e)`) in state 0 → take/poll/put-back each poll. On `Ready`
+  the sub-future is left `None` (moved out), so a stray re-poll `unwrap()`s `None` → a clean
+  "polled-after-completion" abort, and dropping the completed machine drops `None` (no double-free).
+  **Implementation notes (durable):**
+  - **The whole poll body is method-calls + `if` + assignment + enum-ctor exprs — NO hand-built `match`/
+    pattern AST.** Chose `Option::take().unwrap()` + `Poll::is_pending()`/`into_ready()` over a synthesized
+    `match (fut.poll())` precisely to avoid authoring `MatchStmtNode`/`PatternElement`/mut-bindings by hand.
+    The injected impl is re-type-checked POST-mono (`sema.cryo:3051` sets `post_mono_verify` when
+    `MonomorphizationComplete`), and `resolve_expr` re-resolves from scratch in that mode (ignores cached
+    types, `sema.cryo:1147`), so every synthesized node must resolve BY NAME — method calls/idents/members
+    do; the pre-set `resolved_type`s are only pre-mono hints.
+  - **No-cross-await-locals is enforced by SCOPING, not a check:** `<pre>` lives inside the `if
+    (state==0)` block, so a pre-local used in `<post>` (outside the if) is a plain "not found" (E0201).
+    That is the Inc-2 boundary; Inc 3 promotes cross-await locals to `this.` fields.
+  - **`Poll::Pending` / `Option::None` construct fine as a bare typed `ScopeResolutionNode`** (no CallExpr);
+    the return/field-init expected-type context supplies the generic arg (`PendingThenReady::poll` already
+    returns a bare `Poll::Pending` in stdlib, so the shape is proven).
+  ⚠ **PRE-EXISTING BUG surfaced (NOT mine, NOT Inc 2):** the **module-qualified** generic static ctor
+  `future::PendingThenReady<i32>::new(...)` fails with **E0233 "no matching static method"** — and it fails
+  on the **pinned `bin/cryo` too**, so the Phase-1 log's claim that this form was "fixed + validated" does
+  NOT hold in the committed tree (the fix was for `future::Ready<i32>::new` and/or never actually landed).
+  The **unqualified** form (`import future::ready;` + `PendingThenReady<i32>::new(...)`) works — that is what
+  the Inc-2 probe uses. Flag for Jake; re-investigate the Phase-1 "qualified-generic-static-ctor" fix.
+  NEXT: **Inc 3** — several straight-line awaits (N states; real cross-await local promotion to `this.`
+  fields; per-await `fut_k`). Generalize `build_poll_body_single_await` to a sequence: fold the body into
+  segments split at each carrier, emit one take/poll/suspend block per await, promote any local live across
+  a later await to a struct field. Then **Inc 4 (awaits across branches/loops) — needs Jake to pick the CFG
+  approach (§10) BEFORE coding.**
