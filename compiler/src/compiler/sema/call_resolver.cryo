@@ -2843,6 +2843,13 @@ type struct CallResolver {
                 if (this.ctx.generic_registry.get_template(qscope) != null) { return true; }
             }
         }
+        // Module-qualified scope (`future::Ready`): leaf-canonicalize so a
+        // `module::Type` path finds its generic template, mirroring
+        // `resolve_scope_owner_template`'s cross-module fallback. Keeps the callee
+        // UNPINNED for mono to specialize instead of pinning the bare template name.
+        const xscope: SymbolStr = this.types.resolve_cross_module_name(scope_sym);
+        if (xscope.is_valid() && !xscope.equals(scope_sym)
+                && this.ctx.generic_registry.get_template(xscope) != null) { return true; }
         if (member_sym.is_valid()) {
             const scope_str: string = this.intern.resolve(scope_sym);
             const member_str: string = this.intern.resolve(member_sym);
@@ -2889,6 +2896,20 @@ type struct CallResolver {
             const q: SymbolStr = this.ctx.resolve_scoped_or(scope_sym);
             if (q.is_valid() && !q.equals(scope_sym)) {
                 tmpl = this.ctx.generic_registry.get_template(q);
+            }
+        }
+        // Module-qualified scope path (`future::Ready`): the import-scoped
+        // `resolve_scoped_or` only canonicalizes a BARE leaf, so a `module::Type`
+        // scope misses its template. Resolve it the way a type annotation does -
+        // leaf-canonicalized through the name resolver - which maps `future::Ready`
+        // to its registered generic template `std::future::ready::Ready`. Without
+        // this, an owner-generic static ctor written module-qualified
+        // (`future::Ready<i32>::new`) reaches mono with no owner-arg stash and
+        // codegen cannot resolve the never-emitted spec (E0636).
+        if (tmpl == null) {
+            const cross: SymbolStr = this.types.resolve_cross_module_name(scope_sym);
+            if (cross.is_valid() && !cross.equals(scope_sym)) {
+                tmpl = this.ctx.generic_registry.get_template(cross);
             }
         }
         return tmpl;

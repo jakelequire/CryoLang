@@ -1,0 +1,48 @@
+///! `Waker` and `Context`: how a stalled future gets re-scheduled.
+
+namespace std::future::waker;
+
+/// A handle a stalled future stores so it can be re-scheduled: `wake_fn(data)`
+/// tells the executor "poll my task again". This is the manual-vtable shape used
+/// throughout the runtime (a non-capturing function pointer plus an opaque data
+/// pointer) — it carries no ownership and is freely copyable. The executor sets
+/// `data` to whatever it needs to identify the task; `block_on` uses a no-op.
+type struct Waker {
+    wake_fn: (u8*) -> void;
+    data:    u8*;
+
+    /// A waker that does nothing when woken. Used by drivers (like `block_on`)
+    /// that re-poll unconditionally and never park a task.
+    static noop() -> Waker {
+        return Waker { wake_fn: waker_noop, data: null };
+    }
+
+    /// Build a waker from a callback and its context pointer.
+    static new(wake_fn: (u8*) -> void, data: u8*) -> Waker {
+        return Waker { wake_fn: wake_fn, data: data };
+    }
+
+    /// Request that the associated task be polled again.
+    wake(&this) -> void {
+        const f: (u8*) -> void = this.wake_fn;
+        f(this.data);
+    }
+}
+
+private function waker_noop(data: u8*) -> void { }
+
+/// The context threaded through a `poll` call. Holds the `Waker` a future
+/// registers when it returns `Pending`. Passed by pointer down the poll tree,
+/// matching the stdlib convention of moving aggregates by pointer.
+type struct Context {
+    waker: Waker;
+
+    static new(waker: Waker) -> Context {
+        return Context { waker: waker };
+    }
+
+    /// Borrow a copy of the current task's waker.
+    waker(&this) -> Waker {
+        return this.waker;
+    }
+}
