@@ -1039,25 +1039,8 @@ type struct CallResolver {
         }
 
         // E0306 - where-clause bound satisfaction for the bound type args.
-        for (mut bi: i64 = 0; bi < tmpl.trait_bounds.length; bi++) {
-            const bound: TraitBound* = &tmpl.trait_bounds[bi];
-            mut idx: i64 = -1;
-            for (mut pi: i64 = 0; pi < entry.param_names.length; pi++) {
-                if (entry.param_names[pi].equals(bound.type_parameter)) { idx = pi; break; }
-            }
-            if (idx < 0 || idx >= bindings.length) { continue; }
-            const concrete: TypeRef = bindings[idx];
-            if (!concrete.is_valid()) { continue; }
-            if (this.types.contains_generic_param(concrete)) { continue; }
-            for (mut ri: i64 = 0; ri < bound.trait_refs.length; ri++) {
-                const tref: TraitRef* = &bound.trait_refs[ri];
-                if (tref.path.length == 0) { continue; }
-                const trait_name: SymbolStr = tref.path[tref.path.length - 1];
-                if (!this.trait_checker().type_implements_trait(concrete, trait_name, 0)) {
-                    this.emit_free_call_bound_failure(call, tmpl, tref, concrete, trait_name);
-                    return TypeRef::invalid();
-                }
-            }
+        if (!this.check_call_where_bounds(call, tmpl, entry, &bindings)) {
+            return TypeRef::invalid();
         }
 
         // KEYSTONE: stash all-bound bindings + substitute into the template return.
@@ -1133,77 +1116,18 @@ type struct CallResolver {
         return out;
     }
 
-    /// Index of `name` in a template's parallel param-name list, or -1. The
-    /// name list, `param_type_ids`, and an `InferCtx`'s `bindings` share one
-    /// index space (all built from the template's generic params in order).
-    param_name_index(&this, entry: TemplateEntry*, name: SymbolStr) -> i64 {
-        for (mut i: i64 = 0; i < entry.param_names.length; i++) {
-            if (entry.param_names[i].equals(name)) { return i; }
-        }
-        return -1i64;
-    }
-
-    /// The template-param index a where-bound trait arg names, or -1 when it is
-    /// not a bare parameter reference (a wrapped/concrete arg derives nothing).
-    where_arg_param_index(&this, ta: TypeAnnotation*, entry: TemplateEntry*) -> i64 {
-        if (ta == null) { return -1i64; }
-        match (*ta) {
-            TypeAnnotation::Named(n) => { return this.param_name_index(entry, n.name); }
-            _                       => { return -1i64; }
-        }
-    }
-
-    /// Bound-directed projection ("PASS D"): a type param that appears ONLY in a
-    /// where-bound `P: Trait<…, R, …>` (never in a value parameter) is a
-    /// functional dependency of `P` - once `P` is bound to a concrete type, `R`
-    /// is that type's associated-type binding for the trait's positional-sugar
-    /// slot (`Future<R>` => `R = P::Output`; `Iterator<T>` => `T = P::Item`). For
-    /// each already-bound subject, project the trait's assoc type off it and fill
-    /// the still-unbound arg param, so argument inference alone can settle a
-    /// return-only / bound-only param without a turbofish or expected-type hint.
-    /// Only bare `Named` args are derived; an existing binding is kept. Mirrors
-    /// the impl-side `TypeResolver::derive_where_assoc_bindings`.
+    /// Bound-directed projection ("PASS D") for a generic FREE-function call:
+    /// fill a param that appears only in a where-bound (the `R` in
+    /// `where F: Future<R>`) by projecting it off the now-bound subject
+    /// (`R = F::Output`). Thin wrapper over the shared
+    /// `TypeResolver::project_where_bound_params_into`, which the static + instance
+    /// generic-method paths share; the template's `param_names` are index-aligned
+    /// with `ictx.bindings`, exactly as that helper requires.
     project_where_bound_params(mut &this, tmpl: FunctionDeclNode*, entry: TemplateEntry*,
                                ictx: InferCtx*) -> void {
-        if (this.ctx.type_resolver == null || this.ctx.generic_registry == null) { return; }
-        for (mut bi: i64 = 0; bi < tmpl.trait_bounds.length; bi++) {
-            const bound: TraitBound* = &tmpl.trait_bounds[bi];
-            if (bound.has_projection_subject()) { continue; }
-            const s: i64 = this.param_name_index(entry, bound.type_parameter);
-            if (s < 0 || s >= ictx.bindings.length) { continue; }
-            const subject: TypeRef = ictx.bindings[s];
-            // The subject need only be free of OPEN generic params (so its trait
-            // impl is findable) - NOT mono-resolved. `free_infer_type_concrete`
-            // would wrongly reject a pre-mono `Ready<i32>` whose monomorphized
-            // form does not exist yet; `resolve_concrete_member` handles the
-            // pre-mono instantiation directly (as `resolve_await` relies on).
-            if (!subject.is_valid() || this.types.contains_generic_param(subject)) { continue; }
-            for (mut ti: i64 = 0; ti < bound.trait_refs.length; ti++) {
-                const tr: TraitRef* = &bound.trait_refs[ti];
-                if (tr.path.length == 0) { continue; }
-                const trait_leaf: SymbolStr = tr.path[tr.path.length - 1];
-                const tdecl: TraitDeclNode* = this.ctx.generic_registry.get_trait_decl(trait_leaf);
-                if (tdecl == null) { continue; }
-                const ngp: i64 = tdecl.generic_params.length;
-                for (mut ai: i64 = 0; ai < tr.type_args.length; ai++) {
-                    // Positional args fill the trait's own generic params first,
-                    // then its associated types; only the assoc-type slots derive.
-                    if (ai < ngp) { continue; }
-                    const assoc_idx: i64 = ai - ngp;
-                    if (assoc_idx >= tdecl.assoc_types.length) { continue; }
-                    if (tdecl.assoc_types[assoc_idx] == null) { continue; }
-                    const j: i64 = this.where_arg_param_index(tr.type_args[ai], entry);
-                    if (j < 0 || j >= ictx.bindings.length || ictx.bindings[j].is_valid()) { continue; }
-                    mut rc: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
-                    const member: SymbolStr = tdecl.assoc_types[assoc_idx].name;
-                    const derived: TypeRef =
-                        this.ctx.type_resolver.resolve_concrete_member(subject, member, &rc);
-                    if (derived.is_valid() && !this.types.contains_generic_param(derived)) {
-                        ictx.bind_slot(j, derived);
-                    }
-                }
-            }
-        }
+        if (this.ctx.type_resolver == null) { return; }
+        this.ctx.type_resolver.project_where_bound_params_into(
+            &tmpl.trait_bounds, &entry.param_names, ictx, this.ctx.source_file);
     }
 
     /// PASS A/B/C argument inference returning the per-param bindings (no
@@ -1272,19 +1196,7 @@ type struct CallResolver {
         if (call == null || scope == null) { return; }
         if (call.resolved_type_args.length > 0) { return; }
         if (this.ctx.generic_registry == null || this.ctx.type_resolver == null) { return; }
-        const member_str: string = this.intern.resolve(scope.member_name);
-        mut entry: TemplateEntry* = null;
-        if (this.ctx.decl_index != null) {
-            const q: SymbolStr = this.ctx.resolve_scoped_or(scope.scope_name);
-            if (q.is_valid()) {
-                const qstr: string = this.intern.resolve(q) + "::" + member_str;
-                entry = this.ctx.generic_registry.get_template(this.intern.intern(qstr));
-            }
-        }
-        if (entry == null) {
-            const bstr: string = this.intern.resolve(scope.scope_name) + "::" + member_str;
-            entry = this.ctx.generic_registry.get_template(this.intern.intern(bstr));
-        }
+        const entry: TemplateEntry* = this.find_static_method_template(scope);
         if (entry == null || entry.node_kind != NodeKind::FunctionDeclaration) { return; }
         if (entry.param_type_ids.length == 0) { return; }
         const tmpl: FunctionDeclNode* = entry.ast_node as FunctionDeclNode*;
@@ -3081,6 +2993,16 @@ type struct CallResolver {
         // owner-only stash / DI-return branches below, which bail on generic methods.
         const gsm_ret: TypeRef = this.try_resolve_generic_static_method(scope, call);
         if (gsm_ret.is_valid()) { return gsm_ret; }
+        // A GENERIC static method on a NON-generic owner (`Bo::drive<F, R>`) is
+        // registered as its OWN function template keyed `Owner::method`
+        // (register_static_method_templates), so it resolves like a free function:
+        // infer the method's `<F, R>`, stash them, and substitute into the return.
+        // The owner has no params to instantiate; mono specializes the method
+        // template exactly as a free-function call.  Handled before the owner-only
+        // stash / `lookup_method_return` path, which returns the still-abstract
+        // method return type (`R`) and would trip E0200.
+        const smt_ret: TypeRef = this.try_resolve_static_method_template(scope, call);
+        if (smt_ret.is_valid()) { return smt_ret; }
         // Stash the owner's concrete type args for mono BEFORE the return-type
         // resolution below.  The stash must be produced on EVERY path: when the
         // return type resolves via the DI `lookup_method_return` branch (next
@@ -3132,6 +3054,159 @@ type struct CallResolver {
             return tmpl_ret;
         }
         return TypeRef::invalid();
+    }
+
+    /// True when `scope_name` resolves to a declared TYPE (as written or through
+    /// the caller's import scope), distinguishing a static-method scope (`Bo`)
+    /// from a module scope (`future`).  Used to keep the static-method-template
+    /// path off module-qualified free-function calls.
+    scope_names_a_type(&this, scope_name: SymbolStr) -> boolean {
+        if (this.types.lookup_type_by_sym(scope_name).is_valid()) { return true; }
+        const q: SymbolStr = this.ctx.resolve_scoped_or(scope_name);
+        if (q.is_valid() && !q.equals(scope_name)
+                && this.types.lookup_type_by_sym(q).is_valid()) { return true; }
+        return false;
+    }
+
+    /// Find the function template a `Owner::method` scope-resolution call names,
+    /// for a GENERIC static method on a NON-generic owner (registered by
+    /// `register_static_method_templates`, keyed `Owner::method`).  Tries the
+    /// import-scoped qualified owner, the written scope name, then the cross-module
+    /// leaf-canonical form - the same ladder `resolve_scope_owner_template` uses -
+    /// so a same-leaf or module-qualified owner still resolves.  Returns null when
+    /// no such template is registered.
+    find_static_method_template(&this, scope: ScopeResolutionNode*) -> TemplateEntry* {
+        if (this.ctx.generic_registry == null) { return null; }
+        const member_str: string = this.intern.resolve(scope.member_name);
+        mut entry: TemplateEntry* = null;
+        if (this.ctx.decl_index != null) {
+            const q: SymbolStr = this.ctx.resolve_scoped_or(scope.scope_name);
+            if (q.is_valid()) {
+                const qstr: string = this.intern.resolve(q) + "::" + member_str;
+                entry = this.ctx.generic_registry.get_template(this.intern.intern(qstr));
+            }
+        }
+        if (entry == null) {
+            const bstr: string = this.intern.resolve(scope.scope_name) + "::" + member_str;
+            entry = this.ctx.generic_registry.get_template(this.intern.intern(bstr));
+        }
+        if (entry == null) {
+            const cross: SymbolStr = this.types.resolve_cross_module_name(scope.scope_name);
+            if (cross.is_valid() && !cross.equals(scope.scope_name)) {
+                const cstr: string = this.intern.resolve(cross) + "::" + member_str;
+                entry = this.ctx.generic_registry.get_template(this.intern.intern(cstr));
+            }
+        }
+        return entry;
+    }
+
+    /// Resolve a call to a GENERIC static method on a NON-generic owner
+    /// (`Bo::drive<F, R>(fut)`).  Such a method is registered as its own function
+    /// template keyed `Owner::method`, so it resolves exactly like a generic free
+    /// function: infer the method's `<F, R>` (explicit turbofish -> argument types
+    /// -> where-bound projection via `infer_free_call_bindings`), stash them for
+    /// mono, and substitute them into the template return.  The owner has no type
+    /// params to instantiate, and the callee is LEFT UNPINNED: mono's
+    /// `specialize_free_call` re-finds this same `Owner::method` template (via the
+    /// pinned `resolved_template`) and materializes the spec.  Returns invalid -
+    /// falling through to the owner-only static paths - unless the scope names a
+    /// registered generic static-method template whose args fully infer.
+    try_resolve_static_method_template(mut &this, scope: ScopeResolutionNode*,
+                                       call: CallExprNode*) -> TypeRef {
+        if (call == null || scope == null) { return TypeRef::invalid(); }
+        if (this.ctx.generic_registry == null || this.ctx.type_resolver == null) {
+            return TypeRef::invalid();
+        }
+        // Fire ONLY when the scope names a TYPE (a static method).  A GENERIC
+        // FREE function called module-qualified (`future::block_on(fut)`) is ALSO
+        // registered as a qualified-name FunctionDeclaration template, but it is
+        // resolved - with its own where-bound projection AND same-leaf/arity/prefix
+        // disambiguation - by `resolve_module_qualified_function`; intercepting it
+        // here would bypass that disambiguation and mis-resolve an overloaded
+        // module function.  The owner of a static method is always a nominal type.
+        if (!this.scope_names_a_type(scope.scope_name)) { return TypeRef::invalid(); }
+        const entry: TemplateEntry* = this.find_static_method_template(scope);
+        if (entry == null || entry.node_kind != NodeKind::FunctionDeclaration) {
+            return TypeRef::invalid();
+        }
+        if (entry.param_type_ids.length == 0) { return TypeRef::invalid(); }
+        const tmpl: FunctionDeclNode* = entry.ast_node as FunctionDeclNode*;
+        if (tmpl == null || !tmpl.resolved_return_type.is_valid()) { return TypeRef::invalid(); }
+
+        // Infer the method's own type args: explicit turbofish (on the member or,
+        // as a fallback, the scope), else argument inference + where-bound
+        // projection (the free-function inference, which runs PASS D).
+        mut binds: TypeRef[] = [];
+        mut targs: &TypeAnnotation*[] = &call.generic_args;
+        if (targs.length == 0 && scope.generic_args.length > 0) { targs = &scope.generic_args; }
+        if (targs.length > 0) {
+            if (targs.length != entry.param_type_ids.length) { return TypeRef::invalid(); }
+            mut rc: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
+            this.symbolic.symbolic_bind_params(&rc);
+            for (mut i: i64 = 0; i < targs.length; i++) {
+                const tr: TypeRef = this.ctx.type_resolver.resolve(targs[i], &rc);
+                if (!tr.is_valid()) { return TypeRef::invalid(); }
+                binds.push(tr);
+            }
+        } else {
+            binds = this.infer_free_call_bindings(call, entry, tmpl);
+            if (binds.length != entry.param_type_ids.length) { return TypeRef::invalid(); }
+        }
+        for (mut i: i64 = 0; i < binds.length; i++) {
+            if (!binds[i].is_valid() || this.types.contains_generic_param(binds[i])) {
+                return TypeRef::invalid();
+            }
+        }
+
+        // E0306 - where-clause bound satisfaction for the bound method args, so an
+        // unsatisfied bound is a clean call-site error rather than a downstream miss.
+        if (!this.check_call_where_bounds(call, tmpl, entry, &binds)) {
+            return TypeRef::invalid();
+        }
+
+        // Stash for mono + record the winning template (mono can't re-derive the
+        // caller's import scope), then substitute into the return.  Callee stays
+        // UNPINNED: `specialize_free_call` pins the `$`-mangled spec symbol.
+        if (call.resolved_type_args.length == 0) {
+            mut stash: TypeRef[] = [];
+            for (mut i: i64 = 0; i < binds.length; i++) { stash.push(binds[i]); }
+            call.set_resolved_type_args(stash);
+        }
+        call.set_resolved_template(entry.qualified_name);
+        const ret: TypeRef = this.subst_free_call_return(entry, &binds, tmpl.resolved_return_type);
+        if (!ret.is_valid()) { return TypeRef::invalid(); }
+        scope.set_resolved_type(ret);
+        return ret;
+    }
+
+    /// E0306 where-clause bound check for a generic call whose bound args are in
+    /// `bindings` (declaration order, index-aligned with `entry.param_names`).
+    /// Emits the bound failure and returns false on the first unsatisfied bound;
+    /// true when every bound holds (or the arg is still abstract/skippable).
+    /// Shared by the free-function and static-method-template call paths.
+    check_call_where_bounds(mut &this, call: CallExprNode*, tmpl: FunctionDeclNode*,
+                            entry: TemplateEntry*, bindings: &TypeRef[]) -> boolean {
+        for (mut bi: i64 = 0; bi < tmpl.trait_bounds.length; bi++) {
+            const bound: TraitBound* = &tmpl.trait_bounds[bi];
+            mut idx: i64 = -1;
+            for (mut pi: i64 = 0; pi < entry.param_names.length; pi++) {
+                if (entry.param_names[pi].equals(bound.type_parameter)) { idx = pi; break; }
+            }
+            if (idx < 0 || idx >= bindings.length) { continue; }
+            const concrete: TypeRef = bindings[idx];
+            if (!concrete.is_valid()) { continue; }
+            if (this.types.contains_generic_param(concrete)) { continue; }
+            for (mut ri: i64 = 0; ri < bound.trait_refs.length; ri++) {
+                const tref: TraitRef* = &bound.trait_refs[ri];
+                if (tref.path.length == 0) { continue; }
+                const trait_name: SymbolStr = tref.path[tref.path.length - 1];
+                if (!this.trait_checker().type_implements_trait(concrete, trait_name, 0)) {
+                    this.emit_free_call_bound_failure(call, tmpl, tref, concrete, trait_name);
+                    return false;
+                }
+            }
+        }
+        return true;
     }
 
     /// Resolve a call to a GENERIC static method on a GENERIC-owner template
@@ -3280,6 +3355,13 @@ type struct CallResolver {
             if (f_idx >= 0 && ictx.bindings[f_idx].is_valid()) { continue; }
             ictx.unify(param.resolved_type, lit_actual);
         }
+        // PASS D - a method param that appears only in a where-bound (`R` in
+        // `make<F, R>(fut: F) -> R where F: Future<R>`) projects off its now-bound
+        // subject; `ictx.bindings[i]` is index-aligned with `func.generic_params[i]`.
+        mut method_names_d: SymbolStr[] = [];
+        for (mut i: i64 = 0; i < n; i++) { method_names_d.push(func.generic_params[i].name); }
+        this.ctx.type_resolver.project_where_bound_params_into(
+            &func.trait_bounds, &method_names_d, &ictx, this.ctx.source_file);
         mut bindings: TypeRef[] = [];
         for (mut i: i64 = 0; i < ictx.bindings.length; i++) { bindings.push(ictx.bindings[i]); }
         for (mut i: i64 = 0; i < bindings.length; i++) {

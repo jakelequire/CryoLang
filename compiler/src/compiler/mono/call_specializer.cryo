@@ -803,6 +803,29 @@ type struct MonoCallSpecializer {
             if (orig_method == null) {
                 orig_method = this.find_spec_inline_method(recv_type, ma.member, &inherent_owner_ast);
             }
+            // Generic method declared in a SEPARATE inherent `implement T { ... }`
+            // block on a non-generic USER type (`implement struct Driver {
+            // run<F,R>(..) }`). These live in the inherent-impl registry, not merged
+            // into the owner's AST methods, so the `find_inherent_method` owner walk
+            // above misses them. Sema resolves the call through this same registry
+            // (`find_inherent_impl_generic_method`); without the mono analogue the
+            // sema-stashed method args never drive a specialization and codegen
+            // reports E0636 "no method found". Route through the impl_node path
+            // (its inherent, non-trait impl gets the `$MG` pin + DI registration).
+            if (orig_method == null && this.generic_registry != null) {
+                const bare_i: SymbolStr = this.trait_spec.bare_name_of(recv_type);
+                if (bare_i.is_valid()) {
+                    orig_method = this.generic_registry.find_inherent_impl_generic_method(
+                        bare_i, ma.member, &impl_node);
+                }
+                if (orig_method == null) {
+                    const qbare_i: SymbolStr = this.arena.get_qualified_name(recv_type);
+                    if (qbare_i.is_valid() && !qbare_i.equals(bare_i)) {
+                        orig_method = this.generic_registry.find_inherent_impl_generic_method(
+                            qbare_i, ma.member, &impl_node);
+                    }
+                }
+            }
             if (orig_method == null) {
                 // Synthesized/hand-written generic trait method on a non-generic
                 // user type (e.g. a `Display::fmt<W>` keyed by the bare target).
