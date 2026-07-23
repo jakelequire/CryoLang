@@ -43,7 +43,7 @@ import Compiler::Resolver::{ SymbolStr, InternTable, QualifiedName, MangledName,
 import Compiler::Sema::{
     State, Helpers, ScopeManager, TypeUtils, LiteralResolver, Diagnostics,
     Dispatch, SymbolicChecker, MethodBinding, PatternResolver,
-    LambdaSynth, MemberResolver, CallResolver
+    LambdaSynth, AsyncLower, MemberResolver, CallResolver
 };
 import std::core::{ option, mem };
 import std::collections::hashmap;
@@ -146,6 +146,7 @@ public:
     binding:  MethodBinding;
     patterns: PatternResolver;
     lambda:   LambdaSynth;
+    async_lower: AsyncLower;
     member:   MemberResolver;
     calls:    CallResolver;
 
@@ -165,6 +166,7 @@ public:
         this.binding  = MethodBinding::null();
         this.patterns = PatternResolver::null();
         this.lambda   = LambdaSynth::null();
+        this.async_lower = AsyncLower::null();
         this.member   = MemberResolver::null();
         this.calls    = CallResolver::null();
     }
@@ -189,6 +191,7 @@ public:
                            &this.symbolic, &this.scopes);
         this.lambda.wire(this.arena, this.intern, this.ctx, &this.state, &this.symbolic,
                          &this.scopes, &this.dispatch);
+        this.async_lower.wire(this.arena, this.intern, this.ctx);
         this.member.wire(this.arena, this.intern, this.ctx, &this.checker, &this.state, &this.types,
                          &this.symbolic, &this.binding, &this.diag, &this.dispatch);
         this.calls.wire(this.arena, this.intern, this.ctx, &this.checker, &this.state, &this.types,
@@ -275,6 +278,11 @@ public:
         this.state.body_count += 1;
         this.check_function_returns(node);
         this.check_opaque_return_item(node);
+        // Lower an `async function` into a Future state machine AFTER its body is
+        // typed against the declared Output type. Generic async fns are deferred.
+        if (node.is_async && !node.is_generic()) {
+            this.async_lower.lower(node);
+        }
     }
 
     override visit(mut &this, node: StructDeclNode*) -> void {
