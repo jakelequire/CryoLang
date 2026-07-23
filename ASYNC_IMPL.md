@@ -546,14 +546,43 @@ IR should be unchanged — verify the `win-s2` vs `win-s3` `.ll` diff at each bo
   - **`Poll::Pending` / `Option::None` construct fine as a bare typed `ScopeResolutionNode`** (no CallExpr);
     the return/field-init expected-type context supplies the generic arg (`PendingThenReady::poll` already
     returns a bare `Poll::Pending` in stdlib, so the shape is proven).
-  ⚠ **PRE-EXISTING BUG surfaced (NOT mine, NOT Inc 2):** the **module-qualified** generic static ctor
-  `future::PendingThenReady<i32>::new(...)` fails with **E0233 "no matching static method"** — and it fails
-  on the **pinned `bin/cryo` too**, so the Phase-1 log's claim that this form was "fixed + validated" does
-  NOT hold in the committed tree (the fix was for `future::Ready<i32>::new` and/or never actually landed).
-  The **unqualified** form (`import future::ready;` + `PendingThenReady<i32>::new(...)`) works — that is what
-  the Inc-2 probe uses. Flag for Jake; re-investigate the Phase-1 "qualified-generic-static-ctor" fix.
+  ✅ **RETRACTED false alarm (2026-07-23): the qualified generic static ctor is NOT broken.** An earlier note
+  here claimed `future::PendingThenReady<i32>::new(...)` was broken (E0233). Root cause of the E0233 was an
+  **under-imported probe**, not a compiler bug: the probe imported only `import std::future;` (the parent),
+  which does NOT expose types defined in re-exported submodules. Importing the defining submodule
+  (`import future::ready;` or `import std::future::ready;`) makes BOTH qualified forms work on the **pinned
+  `bin/cryo`** — verified: `future::Ready<i32>::new(70)`→70 and `future::PendingThenReady<i32>::new(3,35)`→35.
+  So the Phase-1 "qualified-generic-static-ctor" fix DID land and works. This behavior is consistent across
+  the whole stdlib (`import std::collections;` alone likewise can't reach `collections::HashMap::new`; adding
+  `import collections::hashmap;` fixes it) — i.e. `public module <sub>;` in a parent `_module.cryo` does not
+  flatten the submodule's types into the parent for qualified `parent::Type::method` resolution. Whether it
+  SHOULD (an ergonomics/re-export design question) is open and separate; it is NOT a regression and NOT
+  async-specific. The trap for future sessions: a `future::Type` reference needs the submodule imported.
   NEXT: **Inc 3** — several straight-line awaits (N states; real cross-await local promotion to `this.`
   fields; per-await `fut_k`). Generalize `build_poll_body_single_await` to a sequence: fold the body into
   segments split at each carrier, emit one take/poll/suspend block per await, promote any local live across
   a later await to a struct field. Then **Inc 4 (awaits across branches/loops) — needs Jake to pick the CFG
   approach (§10) BEFORE coding.**
+
+- _2026-07-23_ — **Qualified `parent::Type` re-export resolution — FIXED (general module-system fix, not
+  async).** Refines the retraction above with the precise behavior + a real fix Jake asked for. Ground truth:
+  `import std::future;` (parent only) ALREADY exposes **bare** re-exported submodule types (`Ready`,
+  `PendingThenReady`, `Poll`, …) — the `public module future::ready;` re-exports flatten bare names, and
+  `Ready<i32>::new(70)`→70 works. What did NOT work was the **qualified** `future::Ready<i32>::new(...)` and
+  the annotation `future::Ready<i32>` (E0233 / E0203), because the qualified-name resolver
+  (`Resolver::resolve_type_qualified_name`, `resolver.cryo`) canonicalizes a `M::Leaf` name by resolving the
+  LEAF through the current scope chain, which misses a leaf that only entered as a re-export.
+  **Fix (committed-pending, +66 lines, resolver.cryo only):** when that leaf-scope resolution fails, a new
+  fallback `resolve_qualified_type_via_exports` scans the cross-module export table for a PUBLIC type whose
+  leaf is `Leaf` and whose declaring module is consistent with the `M` prefix (segment-aligned check
+  `module_ns_matches_prefix`, so `future::Ready`→`std::future::ready::Ready` but `collections::Ready` /
+  `bogus::Ready` correctly still fail E0233). One funnel fixes BOTH the annotation path
+  (`TypeResolver::resolve_named` → `resolve_type_qualified_name`) and the ctor path
+  (`TypeUtils::resolve_cross_module_name` → same). **Validated:** with ONLY the parent import,
+  `future::Ready<i32>::new(70)`→70, `future::PendingThenReady<i32>::new(3,35)`→35,
+  `collections::HashMap<i32,i32>::new()`→42, the qualified annotation compiles, unqualified unchanged, wrong
+  prefixes rejected. **Gate:** `make selfhost-check` exit 0, BOTH fixed points; `win-s2` vs `win-s3` = **0
+  differing `.ll`** and Linux `s3` vs `s4` = 0 → the change is inert for all existing code (the compiler's own
+  qualified names already resolved; the fallback never fires for them) → **NO REPIN**. This resolves the
+  "open ergonomics question" from the retraction: a `future::Type` reference now works with just
+  `import std::future;`.
