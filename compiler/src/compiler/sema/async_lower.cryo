@@ -34,6 +34,43 @@ import Compiler::CompilationContext;
 import std::core::{ option, mem };
 import std::fmt;
 
+/// The lowering plan for an `async function` body with N straight-line awaits.
+/// Computed once per function (`AsyncLower::build_plan`): the carrier statement
+/// indices, per-await sub-future storage/type info, and the set of locals that
+/// must be promoted to struct fields because they are read after a suspend.
+///
+/// State-block layout: a body with awaits at statement indices k0 < k1 < … kn
+/// splits into `m + 1` state-guarded blocks B0..Bm. B0 runs the pre-await
+/// statements; Bi (i >= 1) resumes await i-1 (polls `fut_{i-1}`), then runs the
+/// carrier at k_{i-1} and the statements up to the next await. `block_of(s)` =
+/// the number of carriers at index <= s = the block a statement runs in.
+type struct AsyncPlan {
+    m:           i64;                 // number of awaits (== carriers.length)
+    carriers:    i64[];               // body-statement index of each carrier
+    fut_syms:    SymbolStr[];         // `fut_i` field name (per await)
+    fut_inner:   TypeRef[];           // F_i, the awaited future's type
+    fut_opt:     TypeRef[];           // Option<F_i>, the field's type
+    await_out:   TypeRef[];           // F_i::Output, the await result type
+    await_nodes: AwaitExprNode*[];    // the await expression of each carrier
+
+    // Promoted cross-await locals, in declaration order (parallel arrays). A
+    // local declared in one block and read in a later one cannot live on the
+    // native stack across the suspend, so it is stored into a synthesized
+    // struct field (`prom_field`) at the end of its declaring block and reloaded
+    // at the top of each later block that reads it.
+    prom_names:      SymbolStr[];     // the user's local name (the shadow binding)
+    prom_field:      SymbolStr[];     // the synthesized struct-field name
+    prom_tys:        TypeRef[];       // the local's type (scalar Copy)
+    prom_decl_block: i64[];           // the block it is declared in
+    prom_reads:      boolean[];       // flattened read map [p * (m + 1) + block]
+    nprom:           i64;
+
+    /// True when promoted local `p` is read in state-block `b`.
+    reads_at(&this, p: i64, b: i64) -> boolean {
+        return this.prom_reads[p * (this.m + 1i64) + b];
+    }
+}
+
 type struct AsyncLower {
     arena:   TypeArena*;
     intern:  InternTable*;
@@ -349,10 +386,10 @@ type struct AsyncLower {
         return es as StatementNode*;
     }
 
-    /// `this.state == 0u32` (the first-poll guard).
-    state_eq_zero(&this, struct_ref: TypeRef, state: SymbolStr, u32_ty: TypeRef, span: SourceSpan) -> ExpressionNode* {
+    /// `this.state == <value>u32` (a state-block guard).
+    state_eq(&this, struct_ref: TypeRef, state: SymbolStr, u32_ty: TypeRef, value: u64, span: SourceSpan) -> ExpressionNode* {
         mut lhs: ExpressionNode* = this.member(this.this_ident(struct_ref, span), state, u32_ty, span);
-        mut rhs: ExpressionNode* = this.u32_lit(0u64, span);
+        mut rhs: ExpressionNode* = this.u32_lit(value, span);
         const eqeq: Token = Token::new(TokenType::EqualEqual, "==", span.start_line as int, span.start_col as int);
         mut cmp: BinaryExprNode* = new BinaryExprNode(eqeq, lhs, rhs, span);
         cmp.set_resolved_type(this.arena.get_bool());
@@ -435,77 +472,462 @@ type struct AsyncLower {
         return body;
     }
 
-    /// Single-await body: a two-state resumable `poll`. State 0 runs the pre-
-    /// await statements, lazily builds the awaited future into `this.fut_0`, and
-    /// advances to state 1; both first and resume polls then drive `fut_0`,
-    /// returning `Poll::Pending` (re-storing the sub-future) until it is `Ready`,
-    /// after which the post-await statements run and produce `Poll::Ready(E)`.
-    ///
-    /// Inc 2 handles a single straight-line await with NO locals live across it:
-    /// pre-await locals stay scoped to the state-0 block, so a post-await use of
-    /// one is a plain "not found" (cross-await promotion arrives in Inc 3).
-    build_poll_body_single_await(mut &this, node: FunctionDeclNode*, struct_ref: TypeRef,
-            poll_out: TypeRef, ctx_ptr_ty: TypeRef, state: SymbolStr, u32_ty: TypeRef,
-            fut: SymbolStr, fut_field_ty: TypeRef, fut_inner: TypeRef, await_out: TypeRef,
-            split_index: i64, await_node: AwaitExprNode*, span: SourceSpan) -> BlockStmtNode* {
-        const await_idx: u64 = 0u64;
+    // ---- cross-await promotion analysis (Inc 3) ----
+
+    /// True if `name` is read (appears as an identifier) anywhere in `e`. Walks
+    /// the expression kinds an awaited body realistically nests names under; a
+    /// missed kind can only UNDER-report, which leaves a cross-await local
+    /// unpromoted and surfaces as a plain "not found" at its later use — a loud
+    /// compile error, never a silent miscompile.
+    name_read_in_expr(&this, e: ExpressionNode*, name: SymbolStr) -> boolean {
+        if (e == null) { return false; }
+        const k: NodeKind = (e as ASTNode*).kind;
+        if (k == NodeKind::Identifier) {
+            return (e as IdentifierNode*).name.equals(name);
+        }
+        if (k == NodeKind::BinaryExpression) {
+            const b: BinaryExprNode* = e as BinaryExprNode*;
+            return this.name_read_in_expr(b.left, name) || this.name_read_in_expr(b.right, name);
+        }
+        if (k == NodeKind::UnaryExpression) {
+            return this.name_read_in_expr((e as UnaryExprNode*).operand, name);
+        }
+        if (k == NodeKind::CallExpression) {
+            const c: CallExprNode* = e as CallExprNode*;
+            if (this.name_read_in_expr(c.callee, name)) { return true; }
+            for (mut i: i64 = 0; i < c.arguments.length; i++) {
+                if (this.name_read_in_expr(c.arguments[i], name)) { return true; }
+            }
+            return false;
+        }
+        if (k == NodeKind::MemberAccess) {
+            return this.name_read_in_expr((e as MemberAccessNode*).object, name);
+        }
+        if (k == NodeKind::CastExpression) {
+            return this.name_read_in_expr((e as CastExprNode*).expression, name);
+        }
+        if (k == NodeKind::ArrayAccess) {
+            const a: ArrayAccessNode* = e as ArrayAccessNode*;
+            return this.name_read_in_expr(a.array, name) || this.name_read_in_expr(a.index, name);
+        }
+        if (k == NodeKind::TernaryExpression) {
+            const t: TernaryExprNode* = e as TernaryExprNode*;
+            return this.name_read_in_expr(t.condition, name)
+                || this.name_read_in_expr(t.true_expr, name)
+                || this.name_read_in_expr(t.false_expr, name);
+        }
+        if (k == NodeKind::StructLiteral) {
+            const sl: StructLiteralNode* = e as StructLiteralNode*;
+            for (mut i: i64 = 0; i < sl.field_inits.length; i++) {
+                if (this.name_read_in_expr(sl.field_inits[i].value, name)) { return true; }
+            }
+            return false;
+        }
+        if (k == NodeKind::AwaitExpression) {
+            return this.name_read_in_expr((e as AwaitExprNode*).operand, name);
+        }
+        return false;
+    }
+
+    /// True if `name` is read anywhere in statement `s`, recursing through the
+    /// (await-free) control-flow containers a straight-line segment may hold.
+    name_read_in_stmt(&this, s: StatementNode*, name: SymbolStr) -> boolean {
+        if (s == null) { return false; }
+        const k: NodeKind = s.kind;
+        if (k == NodeKind::ExpressionStatement) {
+            return this.name_read_in_expr((s as ExprStmtNode*).expression, name);
+        }
+        if (k == NodeKind::ReturnStatement) {
+            return this.name_read_in_expr((s as ReturnStmtNode*).expression, name);
+        }
+        if (k == NodeKind::DeclarationStatement) {
+            const ds: DeclStmtNode* = s as DeclStmtNode*;
+            if (ds.declaration != null && ds.declaration.kind == NodeKind::VariableDeclaration) {
+                return this.name_read_in_expr((ds.declaration as VarDeclNode*).initializer, name);
+            }
+            return false;
+        }
+        if (k == NodeKind::BlockStatement) {
+            const blk: BlockStmtNode* = s as BlockStmtNode*;
+            for (mut i: i64 = 0; i < blk.statements.length; i++) {
+                if (this.name_read_in_stmt(blk.statements[i], name)) { return true; }
+            }
+            return false;
+        }
+        if (k == NodeKind::IfStatement) {
+            const iff: IfStmtNode* = s as IfStmtNode*;
+            return this.name_read_in_expr(iff.condition, name)
+                || this.name_read_in_stmt(iff.then_stmt, name)
+                || this.name_read_in_stmt(iff.else_stmt, name);
+        }
+        if (k == NodeKind::WhileStatement) {
+            const w: WhileStmtNode* = s as WhileStmtNode*;
+            return this.name_read_in_expr(w.condition, name) || this.name_read_in_stmt(w.body, name);
+        }
+        if (k == NodeKind::DoWhileStatement) {
+            const d: DoWhileStmtNode* = s as DoWhileStmtNode*;
+            return this.name_read_in_expr(d.condition, name) || this.name_read_in_stmt(d.body, name);
+        }
+        if (k == NodeKind::ForStatement) {
+            const f: ForStmtNode* = s as ForStmtNode*;
+            if (f.init != null && this.name_read_in_stmt(f.init as StatementNode*, name)) { return true; }
+            return this.name_read_in_expr(f.condition, name)
+                || this.name_read_in_expr(f.update, name)
+                || this.name_read_in_stmt(f.body, name);
+        }
+        if (k == NodeKind::LoopStatement) {
+            return this.name_read_in_stmt((s as LoopStmtNode*).body, name);
+        }
+        if (k == NodeKind::MatchStatement) {
+            const m: MatchStmtNode* = s as MatchStmtNode*;
+            if (this.name_read_in_expr(m.subject, name)) { return true; }
+            for (mut i: i64 = 0; i < m.arms.length; i++) {
+                if (m.arms[i] != null && this.name_read_in_stmt(m.arms[i].body, name)) { return true; }
+            }
+            return false;
+        }
+        return false;
+    }
+
+    /// The variable declared by a top-level `const/mut x = …;` statement
+    /// (including an `await` carrier `const x = await e;`), or null if the
+    /// statement declares no local.
+    stmt_decl_var(&this, s: StatementNode*) -> VarDeclNode* {
+        if (s == null || s.kind != NodeKind::DeclarationStatement) { return null; }
+        const ds: DeclStmtNode* = s as DeclStmtNode*;
+        if (ds.declaration == null || ds.declaration.kind != NodeKind::VariableDeclaration) {
+            return null;
+        }
+        return ds.declaration as VarDeclNode*;
+    }
+
+    /// A promoted cross-await local must sit in a struct field the constructor
+    /// can zero-initialize without dropping garbage — i.e. a scalar Copy type.
+    /// (Aggregates / non-Copy owners are deferred; references are forbidden
+    /// across a suspend entirely — see §4.)
+    zeroable_kind(&this, k: TypeKind) -> boolean {
+        return k == TypeKind::Int || k == TypeKind::Bool
+            || k == TypeKind::Float || k == TypeKind::Pointer;
+    }
+
+    /// A zero value of `field_ty` for the constructor. The promoted field is
+    /// always written (`this.x = x`) before any read, so this initial value is
+    /// never observed — it exists only to satisfy "all fields initialized".
+    zero_value(&this, field_ty: TypeRef, span: SourceSpan) -> ExpressionNode* {
+        const t: Type* = this.arena.lookup(field_ty.id);
+        const k: TypeKind = if (t != null) { t.kind } else { TypeKind::Error };
+        mut lit: LiteralNode* = null;
+        if (k == TypeKind::Bool) {
+            lit = new LiteralNode("false", LiteralKind::Boolean, span);
+        } else if (k == TypeKind::Float) {
+            lit = new LiteralNode("0.0", LiteralKind::Float, span);
+        } else if (k == TypeKind::Pointer) {
+            lit = new LiteralNode("null", LiteralKind::Null, span);
+        } else {
+            lit = new LiteralNode("0", LiteralKind::Integer, span);
+        }
+        lit.set_resolved_type(field_ty);
+        return lit as ExpressionNode*;
+    }
+
+    /// Reload cross-await locals into block `b`: for each promoted local declared
+    /// in an earlier block and read in `b`, `const <name> = this.<field>;`, so
+    /// reads in this block resolve to the shadow rather than the (out-of-scope)
+    /// original binding.
+    emit_loads(mut &this, blk: BlockStmtNode*, struct_ref: TypeRef, plan: AsyncPlan*,
+               b: i64, span: SourceSpan) -> void {
+        for (mut p: i64 = 0; p < plan.nprom; p++) {
+            if (plan.prom_decl_block[p] < b && plan.reads_at(p, b)) {
+                const ty: TypeRef = plan.prom_tys[p];
+                mut ld: ExpressionNode* = this.member(
+                    this.this_ident(struct_ref, span), plan.prom_field[p], ty, span);
+                blk.add_statement(this.var_decl_stmt(plan.prom_names[p], false, ty, ld, span));
+            }
+        }
+    }
+
+    /// Persist cross-await locals declared in block `b` into their fields before
+    /// the block's suspend, so a later block can reload them: `this.<field> =
+    /// <name>;`. Promoted locals are immutable (mutable-across-await is deferred),
+    /// so a single store at the declaring block suffices.
+    emit_stores(mut &this, blk: BlockStmtNode*, struct_ref: TypeRef, plan: AsyncPlan*,
+                b: i64, span: SourceSpan) -> void {
+        for (mut p: i64 = 0; p < plan.nprom; p++) {
+            if (plan.prom_decl_block[p] == b) {
+                const ty: TypeRef = plan.prom_tys[p];
+                mut rhs: ExpressionNode* = this.ident(plan.prom_names[p], ty, span);
+                blk.add_statement(this.assign_member_stmt(struct_ref, plan.prom_field[p], ty, rhs, span));
+            }
+        }
+    }
+
+    /// Compute the lowering plan: await count/validation, per-await sub-future
+    /// typing, and the cross-await promotion set. Returns false (after emitting a
+    /// diagnostic) when the body uses `await` in a shape this increment does not
+    /// yet handle; `plan.m == 0` means "no await" (the Inc-1b run-to-completion
+    /// path).
+    build_plan(mut &this, node: FunctionDeclNode*, plan: AsyncPlan*) -> boolean {
+        if (node.body == null || node.body.kind != NodeKind::BlockStatement) { return true; }
+        const abody: BlockStmtNode* = node.body as BlockStmtNode*;
+        const total: i64 = this.block_await_count(abody);
+        if (total == 0i64) { return true; }
+
+        // Carriers: top-level statements whose top expression is an `await`.
+        mut carriers: i64[] = [];
+        mut await_nodes: AwaitExprNode*[] = [];
+        for (mut i: i64 = 0; i < abody.statements.length; i++) {
+            const aw: AwaitExprNode* = this.stmt_toplevel_await(abody.statements[i]);
+            if (aw != null) { carriers.push(i); await_nodes.push(aw); }
+        }
+        const m: i64 = carriers.length;
+        // Every await must be a simple top-level carrier: `total == m` rules out
+        // an `await` nested in an expression (one carrier, await-count > 1) and
+        // one inside a branch/loop (counted in `total`, never a carrier). Both
+        // are Inc 4 (control flow across a suspend).
+        if (total != m || m < 1i64) {
+            this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
+                "async: only straight-line top-level `await`s are supported here (as `const x = await e;`, `return await e;`, or `await e;`); an `await` nested in an expression or inside a branch/loop arrives in a later increment",
+                node.span);
+            return false;
+        }
+
+        const opt_base: TypeRef = this.lookup_future_type("Option");
+        if (!opt_base.is_valid()) {
+            this.ctx.emit_error_at(ErrorCode::E0233_UNDEFINED_SYMBOL,
+                "async: `Option` must be in scope to lower `await`", node.span);
+            return false;
+        }
+
+        mut fut_syms: SymbolStr[] = [];
+        mut fut_inner: TypeRef[] = [];
+        mut fut_opt: TypeRef[] = [];
+        mut await_out: TypeRef[] = [];
+        for (mut i: i64 = 0; i < m; i++) {
+            const aw: AwaitExprNode* = await_nodes[i];
+            if (aw.operand == null) {
+                this.ctx.emit_error_at(ErrorCode::E0306_TRAIT_BOUND_NOT_SATISFIED,
+                    "async: malformed `await` (no operand)", node.span);
+                return false;
+            }
+            const fi: TypeRef = aw.operand.resolved_type;
+            const ao: TypeRef = aw.resolved_type;
+            if (!fi.is_valid() || !ao.is_valid()) {
+                this.ctx.emit_error_at(ErrorCode::E0306_TRAIT_BOUND_NOT_SATISFIED,
+                    "async: could not resolve an awaited future's type (its operand must implement `Future`)",
+                    node.span);
+                return false;
+            }
+            mut opt_args: TypeRef[] = [fi];
+            fut_syms.push(this.intern.intern(format("fut_%lld", i)));
+            fut_inner.push(fi);
+            fut_opt.push(this.ctx.generic_registry.instantiate(opt_base, &opt_args));
+            await_out.push(ao);
+        }
+
+        // Per-statement state-block index and carrier ordinal, precomputed so
+        // the promotion scan reads them as plain values (passing the owning
+        // `carriers` array by value into a helper would move it). `block_of[s]`
+        // = the count of carriers at index <= s (the block s runs in);
+        // `carrier_of[s]` = the await ordinal if s is a carrier, else -1.
+        mut block_of: i64[] = [];
+        mut carrier_of: i64[] = [];
+        for (mut s: i64 = 0; s < abody.statements.length; s++) {
+            mut bo: i64 = 0i64;
+            mut co: i64 = -1i64;
+            for (mut c: i64 = 0; c < carriers.length; c++) {
+                if (carriers[c] <= s) { bo += 1i64; }
+                if (carriers[c] == s) { co = c; }
+            }
+            block_of.push(bo);
+            carrier_of.push(co);
+        }
+
+        // Cross-await promotion: a local declared in one block and read in a
+        // later one becomes a struct field (it cannot live on the native stack
+        // across a suspend). References are forbidden (§4); mutable / aggregate
+        // locals are deferred with a loud diagnostic.
+        const nblocks: i64 = m + 1i64;
+        mut prom_names: SymbolStr[] = [];
+        mut prom_field: SymbolStr[] = [];
+        mut prom_tys: TypeRef[] = [];
+        mut prom_decl_block: i64[] = [];
+        mut prom_reads: boolean[] = [];
+        for (mut d: i64 = 0; d < abody.statements.length; d++) {
+            const vd: VarDeclNode* = this.stmt_decl_var(abody.statements[d]);
+            if (vd == null) { continue; }
+            const nm: SymbolStr = vd.name;
+            const di: i64 = block_of[d];
+
+            // The blocks in which this local is read. A read inside a carrier's
+            // await-operand runs at the END of the previous block (the sub-future
+            // is built there, lazily), so it is attributed to that block, not the
+            // carrier's own.
+            mut reads: boolean[] = [];
+            for (mut b: i64 = 0; b < nblocks; b++) { reads.push(false); }
+            for (mut j: i64 = 0; j < abody.statements.length; j++) {
+                if (j == d) { continue; }
+                const ci: i64 = carrier_of[j];
+                if (ci >= 0i64) {
+                    const jw: AwaitExprNode* = await_nodes[ci];
+                    if (jw != null && jw.operand != null && this.name_read_in_expr(jw.operand, nm)) {
+                        reads[ci] = true;
+                    }
+                } else if (this.name_read_in_stmt(abody.statements[j], nm)) {
+                    reads[block_of[j]] = true;
+                }
+            }
+
+            mut promote: boolean = false;
+            for (mut b: i64 = di + 1i64; b < nblocks; b++) {
+                if (reads[b]) { promote = true; }
+            }
+            if (!promote) { continue; }
+
+            const lty: TypeRef = vd.resolved_type;
+            const lt: Type* = this.arena.lookup(lty.id);
+            const lk: TypeKind = if (lt != null) { lt.kind } else { TypeKind::Error };
+            if (lk == TypeKind::Reference) {
+                this.ctx.emit_error_at(ErrorCode::E0455_DANGLING_POINTER,
+                    "async: a reference cannot be held live across an `await` (owned values only); a suspended future may outlive the referent",
+                    vd.span);
+                return false;
+            }
+            if (vd.is_mutable) {
+                this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
+                    "async: a `mut` local carried across an `await` is not yet supported; bind the value with `const` (mutable-across-await promotion arrives in a later increment)",
+                    vd.span);
+                return false;
+            }
+            if (!this.zeroable_kind(lk)) {
+                this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
+                    "async: only a scalar (integer/bool/float/pointer) local may currently be held across an `await`; carrying an aggregate across a suspend arrives in a later increment",
+                    vd.span);
+                return false;
+            }
+
+            prom_names.push(nm);
+            prom_field.push(this.intern.intern(format("__cross_%lld_%s", di, this.intern.resolve(nm))));
+            prom_tys.push(lty);
+            prom_decl_block.push(di);
+            for (mut b: i64 = 0; b < nblocks; b++) { prom_reads.push(reads[b]); }
+        }
+
+        plan.m = m;
+        plan.nprom = prom_names.length;
+        plan.carriers = carriers;
+        plan.fut_syms = fut_syms;
+        plan.fut_inner = fut_inner;
+        plan.fut_opt = fut_opt;
+        plan.await_out = await_out;
+        plan.await_nodes = await_nodes;
+        plan.prom_names = prom_names;
+        plan.prom_field = prom_field;
+        plan.prom_tys = prom_tys;
+        plan.prom_decl_block = prom_decl_block;
+        plan.prom_reads = prom_reads;
+        return true;
+    }
+
+    /// Multi-await body: `m + 1` state-guarded blocks driving `m` straight-line
+    /// awaits. Each block sets `this.state` forward at its end, so a poll that
+    /// finds consecutive sub-futures immediately ready falls straight through
+    /// them; on a resume poll the state guard skips every already-completed
+    /// block and re-enters exactly the suspended one. Cross-await locals are
+    /// reloaded at each block top and persisted before each suspend.
+    build_poll_body_multi_await(mut &this, node: FunctionDeclNode*, struct_ref: TypeRef,
+            poll_out: TypeRef, ctx_ptr_ty: TypeRef, state_sym: SymbolStr, u32_ty: TypeRef,
+            plan: AsyncPlan*, span: SourceSpan) -> BlockStmtNode* {
+        const m: i64 = plan.m;
+        const orig: BlockStmtNode* = node.body as BlockStmtNode*;
+        const cx_sym: SymbolStr = this.intern.intern("cx");
+
         mut body: BlockStmtNode* = new BlockStmtNode(span);
         this.emit_shadow_prelude(node, body, struct_ref, span);
-        const orig: BlockStmtNode* = node.body as BlockStmtNode*;
 
-        // State 0: run pre-await statements, stash the sub-future, advance state.
-        mut s0: BlockStmtNode* = new BlockStmtNode(span);
-        for (mut i: i64 = 0; i < split_index; i++) {
-            s0.add_statement(orig.statements[i]);
+        for (mut i: i64 = 0; i <= m; i++) {
+            mut blk: BlockStmtNode* = new BlockStmtNode(span);
+
+            // Resume await i-1: take/poll its sub-future, suspend on Pending.
+            if (i >= 1i64) {
+                const ai: i64 = i - 1i64;
+                const fut_sym: SymbolStr = plan.fut_syms[ai];
+                const fut_opt: TypeRef = plan.fut_opt[ai];
+                const fut_in: TypeRef = plan.fut_inner[ai];
+                const aout: TypeRef = plan.await_out[ai];
+
+                const sub_sym: SymbolStr = this.intern.intern(format("__sub_%lld", ai));
+                mut take_call: ExpressionNode* = this.method_call0(
+                    this.member(this.this_ident(struct_ref, span), fut_sym, fut_opt, span),
+                    "take", fut_opt, span);
+                mut unwrap_call: ExpressionNode* = this.method_call0(take_call, "unwrap", fut_in, span);
+                blk.add_statement(this.var_decl_stmt(sub_sym, true, fut_in, unwrap_call, span));
+
+                const poll_sym: SymbolStr = this.intern.intern(format("__poll_%lld", ai));
+                mut poll_call: ExpressionNode* = this.method_call1(
+                    this.ident(sub_sym, fut_in, span), "poll",
+                    this.ident(cx_sym, ctx_ptr_ty, span), poll_out, span);
+                blk.add_statement(this.var_decl_stmt(poll_sym, true, poll_out, poll_call, span));
+
+                mut pend: BlockStmtNode* = new BlockStmtNode(span);
+                pend.add_statement(this.assign_member_stmt(struct_ref, fut_sym, fut_opt,
+                    this.option_some(this.ident(sub_sym, fut_in, span), fut_opt, span), span));
+                pend.add_statement(
+                    new ReturnStmtNode(this.poll_pending(poll_out, span), span) as StatementNode*);
+                blk.add_statement(new IfStmtNode(
+                    this.method_call0(this.ident(poll_sym, poll_out, span), "is_pending",
+                        this.arena.get_bool(), span),
+                    pend as StatementNode*, null, span) as StatementNode*);
+
+                const await_sym: SymbolStr = this.intern.intern(format("__await_%lld", ai));
+                blk.add_statement(this.var_decl_stmt(await_sym, false, aout,
+                    this.method_call0(this.ident(poll_sym, poll_out, span), "into_ready", aout, span), span));
+
+                // Reload cross-await locals read here, then run the carrier at
+                // carriers[ai] with its `await` rewritten to the resolved result.
+                this.emit_loads(blk, struct_ref, plan, i, span);
+                this.rewrite_carrier_await(orig.statements[plan.carriers[ai]],
+                    this.ident(await_sym, aout, span));
+                this.rewrite_returns(orig.statements[plan.carriers[ai]], poll_out, span);
+                blk.add_statement(orig.statements[plan.carriers[ai]]);
+            } else {
+                this.emit_loads(blk, struct_ref, plan, i, span);
+            }
+
+            // The block's plain segment statements (returns wrapped as Ready).
+            const seg_lo: i64 = if (i == 0i64) { 0i64 } else { plan.carriers[i - 1i64] + 1i64 };
+            const seg_hi: i64 = if (i == m) { orig.statements.length } else { plan.carriers[i] };
+            for (mut s: i64 = seg_lo; s < seg_hi; s++) {
+                this.rewrite_returns(orig.statements[s], poll_out, span);
+                blk.add_statement(orig.statements[s]);
+            }
+
+            // Persist cross-await locals declared here; then, if another await
+            // follows, lazily build its sub-future and advance the state.
+            this.emit_stores(blk, struct_ref, plan, i, span);
+            if (i <= m - 1i64) {
+                const nfut_sym: SymbolStr = plan.fut_syms[i];
+                const nfut_opt: TypeRef = plan.fut_opt[i];
+                mut some_e: ExpressionNode* = this.option_some(plan.await_nodes[i].operand, nfut_opt, span);
+                blk.add_statement(this.assign_member_stmt(struct_ref, nfut_sym, nfut_opt, some_e, span));
+                blk.add_statement(this.assign_member_stmt(struct_ref, state_sym, u32_ty,
+                    this.u32_lit((i + 1i64) as u64, span), span));
+            }
+
+            // Guard the whole block by its state value; consecutive blocks fall
+            // through in one poll because each sets the next state before the
+            // following guard tests it.
+            body.add_statement(new IfStmtNode(
+                this.state_eq(struct_ref, state_sym, u32_ty, i as u64, span),
+                blk as StatementNode*, null, span) as StatementNode*);
         }
-        mut some_e: ExpressionNode* = this.option_some(await_node.operand, fut_field_ty, span);
-        s0.add_statement(this.assign_member_stmt(struct_ref, fut, fut_field_ty, some_e, span));
-        s0.add_statement(this.assign_member_stmt(struct_ref, state, u32_ty,
-            this.u32_lit(await_idx + 1u64, span), span));
-        mut if0: IfStmtNode* = new IfStmtNode(
-            this.state_eq_zero(struct_ref, state, u32_ty, span), s0 as StatementNode*, null, span);
-        body.add_statement(if0 as StatementNode*);
 
-        // mut __sub_0 = this.fut_0.take().unwrap();   (move the sub-future out)
-        const sub_sym: SymbolStr = this.intern.intern(format("__sub_%llu", await_idx));
-        mut take_call: ExpressionNode* = this.method_call0(
-            this.member(this.this_ident(struct_ref, span), fut, fut_field_ty, span),
-            "take", fut_field_ty, span);
-        mut unwrap_call: ExpressionNode* = this.method_call0(take_call, "unwrap", fut_inner, span);
-        body.add_statement(this.var_decl_stmt(sub_sym, true, fut_inner, unwrap_call, span));
-
-        // mut __poll_0 = __sub_0.poll(cx);
-        const poll_sym: SymbolStr = this.intern.intern(format("__poll_%llu", await_idx));
-        const cx_sym: SymbolStr = this.intern.intern("cx");
-        mut poll_call: ExpressionNode* = this.method_call1(
-            this.ident(sub_sym, fut_inner, span), "poll",
-            this.ident(cx_sym, ctx_ptr_ty, span), poll_out, span);
-        body.add_statement(this.var_decl_stmt(poll_sym, true, poll_out, poll_call, span));
-
-        // if (__poll_0.is_pending()) { this.fut_0 = Option::Some(__sub_0); return Poll::Pending; }
-        mut pend: BlockStmtNode* = new BlockStmtNode(span);
-        pend.add_statement(this.assign_member_stmt(struct_ref, fut, fut_field_ty,
-            this.option_some(this.ident(sub_sym, fut_inner, span), fut_field_ty, span), span));
-        mut ret_pend: ReturnStmtNode* = new ReturnStmtNode(this.poll_pending(poll_out, span), span);
-        pend.add_statement(ret_pend as StatementNode*);
-        mut if_pend: IfStmtNode* = new IfStmtNode(
-            this.method_call0(this.ident(poll_sym, poll_out, span), "is_pending",
-                this.arena.get_bool(), span),
-            pend as StatementNode*, null, span);
-        body.add_statement(if_pend as StatementNode*);
-
-        // const __await_0 = __poll_0.into_ready();
-        const await_sym: SymbolStr = this.intern.intern(format("__await_%llu", await_idx));
-        body.add_statement(this.var_decl_stmt(await_sym, false, await_out,
-            this.method_call0(this.ident(poll_sym, poll_out, span), "into_ready", await_out, span), span));
-
-        // The carrier (its `await e` now reading __await_0) + the post-await
-        // statements, with every `return E` wrapped as `return Poll::Ready(E)`.
-        this.rewrite_carrier_await(orig.statements[split_index], this.ident(await_sym, await_out, span));
-        for (mut i: i64 = split_index; i < orig.statements.length; i++) {
-            this.rewrite_returns(orig.statements[i], poll_out, span);
-            body.add_statement(orig.statements[i]);
-        }
+        // Unreachable fallback: `this.state` is always in [0, m] and exactly one
+        // guarded block runs and returns each poll (a `Poll::Pending` suspend or
+        // the tail's `Poll::Ready`). The state guards are opaque to control-flow
+        // analysis, though, so a trailing return is required for it to see the
+        // body as total.
+        body.add_statement(
+            new ReturnStmtNode(this.poll_pending(poll_out, span), span) as StatementNode*);
         return body;
     }
 
@@ -539,51 +961,20 @@ type struct AsyncLower {
         const poll_out: TypeRef = this.ctx.generic_registry.instantiate(poll_base, &poll_args);
         const ctx_ptr_ty: TypeRef = this.arena.get_pointer_to(ctx_ref);
 
-        // ---- 0. Await plan: none (Inc 1b) or a single straight-line await ----
-        // Determine whether this body suspends and, if so, on which statement.
-        // A body with no await runs to completion in one poll; a body with a
-        // single supported top-level await becomes a two-state machine (needs an
-        // extra `fut_0: Option<F>` field). Anything richer is rejected loudly.
-        const fut_sym: SymbolStr = this.intern.intern("fut_0");
-        mut single_await: boolean = false;
-        mut split_index: i64 = -1i64;
-        mut await_node: AwaitExprNode* = null;
-        mut fut_inner: TypeRef = TypeRef::invalid();
-        mut fut_field_ty: TypeRef = TypeRef::invalid();
-        mut await_out: TypeRef = TypeRef::invalid();
-        if (node.body.kind == NodeKind::BlockStatement) {
-            const abody: BlockStmtNode* = node.body as BlockStmtNode*;
-            const total: i64 = this.block_await_count(abody);
-            if (total > 0i64) {
-                for (mut i: i64 = 0; i < abody.statements.length; i++) {
-                    const aw: AwaitExprNode* = this.stmt_toplevel_await(abody.statements[i]);
-                    if (aw != null && split_index < 0i64) { split_index = i; await_node = aw; }
-                }
-                if (total != 1i64 || split_index < 0i64 || await_node == null || await_node.operand == null) {
-                    this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
-                        "async: only a single straight-line `await` is currently supported (as `const x = await e;`, `return await e;`, or `await e;`); richer control flow arrives in a later increment",
-                        node.span);
-                    return;
-                }
-                fut_inner = await_node.operand.resolved_type;
-                await_out = await_node.resolved_type;
-                if (!fut_inner.is_valid() || !await_out.is_valid()) {
-                    this.ctx.emit_error_at(ErrorCode::E0306_TRAIT_BOUND_NOT_SATISFIED,
-                        "async: could not resolve the awaited future's type (its operand must implement `Future`)",
-                        node.span);
-                    return;
-                }
-                const opt_base: TypeRef = this.lookup_future_type("Option");
-                if (!opt_base.is_valid()) {
-                    this.ctx.emit_error_at(ErrorCode::E0233_UNDEFINED_SYMBOL,
-                        "async: `Option` must be in scope to lower `await`", node.span);
-                    return;
-                }
-                mut opt_args: TypeRef[] = [fut_inner];
-                fut_field_ty = this.ctx.generic_registry.instantiate(opt_base, &opt_args);
-                single_await = true;
-            }
-        }
+        // ---- 0. Await plan (Inc 1b: none; Inc 2/3: N straight-line awaits) ----
+        // Validate the body's `await` usage and compute per-await sub-future
+        // typing plus the cross-await local-promotion set. `plan.m == 0` => no
+        // await (the body runs to completion in one poll); otherwise an
+        // (m+1)-state resumable machine with one `fut_i: Option<F_i>` field per
+        // await and one field per promoted cross-await local.
+        mut plan: AsyncPlan = AsyncPlan {
+            m: 0i64, carriers: [], fut_syms: [], fut_inner: [], fut_opt: [],
+            await_out: [], await_nodes: [],
+            prom_names: [], prom_field: [], prom_tys: [], prom_decl_block: [],
+            prom_reads: [], nprom: 0i64,
+        };
+        if (!this.build_plan(node, &plan)) { return; }
+        const has_await: boolean = plan.m > 0i64;
 
         // ---- 1. Struct decl + fields (state + one per param) ----
         mut struct_decl: StructDeclNode* = new StructDeclNode(q_name, span);
@@ -605,13 +996,21 @@ type struct AsyncLower {
             f.set_resolved_type(p.resolved_type);
             struct_decl.add_field(f);
         }
-        // The awaited sub-future, created lazily on first poll (`Option::None`
-        // until state 0 stashes it), so the machine can suspend and resume it.
-        if (single_await) {
-            mut ff: FieldDeclNode* = new FieldDeclNode(fut_sym, span);
+        // One sub-future field per await, created lazily on first entry to its
+        // state (`Option::None` until then) so the machine can suspend/resume.
+        for (mut i: i64 = 0; i < plan.m; i++) {
+            mut ff: FieldDeclNode* = new FieldDeclNode(plan.fut_syms[i], span);
             ff.set_visibility(Visibility::Public);
-            ff.set_resolved_type(fut_field_ty);
+            ff.set_resolved_type(plan.fut_opt[i]);
             struct_decl.add_field(ff);
+        }
+        // One field per promoted cross-await local (a value read after a suspend
+        // cannot live on the native stack; see build_plan).
+        for (mut i: i64 = 0; i < plan.nprom; i++) {
+            mut pf: FieldDeclNode* = new FieldDeclNode(plan.prom_field[i], span);
+            pf.set_visibility(Visibility::Public);
+            pf.set_resolved_type(plan.prom_tys[i]);
+            struct_decl.add_field(pf);
         }
 
         // ---- 2. Arena StructType + FieldInfo ----
@@ -626,8 +1025,11 @@ type struct AsyncLower {
                 if (p == null || !p.resolved_type.is_valid()) { continue; }
                 infos.push(FieldInfo::new(p.name, p.resolved_type, true, false, false));
             }
-            if (single_await) {
-                infos.push(FieldInfo::new(fut_sym, fut_field_ty, true, false, false));
+            for (mut i: i64 = 0; i < plan.m; i++) {
+                infos.push(FieldInfo::new(plan.fut_syms[i], plan.fut_opt[i], true, false, false));
+            }
+            for (mut i: i64 = 0; i < plan.nprom; i++) {
+                infos.push(FieldInfo::new(plan.prom_field[i], plan.prom_tys[i], true, false, false));
             }
             st.set_fields(infos);
         }
@@ -641,13 +1043,12 @@ type struct AsyncLower {
         poll_fn.add_parameter(cx_param);
 
         // Body: arg-shadow prelude (`const p = this.p;`) + either the whole
-        // original body (no await) or the two-state resumable machine (single
-        // await). Built AFTER the struct/field setup so field types are known.
+        // original body (no await) or the (m+1)-state resumable machine. Built
+        // AFTER the struct/field setup so the field types are known.
         mut body_block: BlockStmtNode* = null;
-        if (single_await) {
-            body_block = this.build_poll_body_single_await(node, struct_ref, poll_out, ctx_ptr_ty,
-                state_sym, u32_ty, fut_sym, fut_field_ty, fut_inner, await_out,
-                split_index, await_node, span);
+        if (has_await) {
+            body_block = this.build_poll_body_multi_await(node, struct_ref, poll_out, ctx_ptr_ty,
+                state_sym, u32_ty, &plan, span);
         } else {
             body_block = this.build_poll_body_no_await(node, struct_ref, poll_out, span);
         }
@@ -725,9 +1126,16 @@ type struct AsyncLower {
             pid.set_resolved_type(p.resolved_type);
             ctor_lit.add_field_init(FieldInit { field_name: p.name, value: pid as ExpressionNode*, span: span });
         }
-        if (single_await) {
+        // Each sub-future starts empty (built lazily on first entry to its
+        // state); each promoted cross-await field starts zero (always written
+        // before it is read, so the initial value is never observed).
+        for (mut i: i64 = 0; i < plan.m; i++) {
             ctor_lit.add_field_init(FieldInit {
-                field_name: fut_sym, value: this.option_none(fut_field_ty, span), span: span });
+                field_name: plan.fut_syms[i], value: this.option_none(plan.fut_opt[i], span), span: span });
+        }
+        for (mut i: i64 = 0; i < plan.nprom; i++) {
+            ctor_lit.add_field_init(FieldInit {
+                field_name: plan.prom_field[i], value: this.zero_value(plan.prom_tys[i], span), span: span });
         }
         ctor_lit.set_resolved_type(struct_ref);
         mut ret: ReturnStmtNode* = new ReturnStmtNode(ctor_lit as ExpressionNode*, span);

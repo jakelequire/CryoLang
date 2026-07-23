@@ -24,7 +24,9 @@ doc current at every stop.
    dated/audit/phase/batch labels in code. This doc is the exception (it IS the narrative).
 5. Preferences: methods / namespaced statics over free functions; one generic method + `static match (T)`
    over type-suffixed names; avoid suffixed numeric literals (`5i64`); pass owning aggregates BY POINTER.
-
+6. When something genuinely needs Jake's opinion, ASK.** Use the question
+tool. For language-semantics / semver decisions with two defensible answers,
+not for routine judgement calls.
 ---
 
 ## 1. Status Dashboard  (update every session)
@@ -33,16 +35,28 @@ doc current at every stop.
 |---|---|---|
 | 0 | Design lock-down (surface, trait shapes, lowering placement) — get Jake's sign-off | ✅ done — locked 2026-07-22 (§7 filled) |
 | 1 | Core types in stdlib (`Poll`/`Future`/`Context`/`Waker`) + `block_on` + hand-written futures | ✅ done+validated 2026-07-22 (no repin) |
-| 2 | Compiler: `async fn` parse + state-machine lowering + `await` desugar | ◐ in progress — parse + no-await (Inc 1b) + **single straight-line `await` (Inc 2) DONE+validated**; Inc 3 (several awaits) next, then Inc 4 (branches/loops — Jake sign-off) |
+| 2 | Compiler: `async fn` parse + state-machine lowering + `await` desugar | ◐ in progress — parse + no-await (Inc 1b) + single await (Inc 2) + **N straight-line awaits + cross-await local promotion (Inc 3) DONE+validated**; next = Inc 4 (branches/loops — **needs Jake sign-off**) |
 | 3 | Executor + `Waker` + `spawn`/`JoinHandle`; multi-thread; poll-boundary `catch_unwind` isolation | ☐ not started |
 | 4 | Reactor (epoll/IOCP) + async I/O over `std::net` + timers + `async fn main` + combinators | ☐ not started |
 
 Legend: ☐ not started · ◐ in progress · ✅ done+validated · ⏸ blocked (note why in the Progress Log).
 
-**Current HEAD baseline:** `db1bbd4c` (`chore: cleanup old docs`, output-neutral, on top of `2248a22d` —
-Track 2 thread-local panic state). Branch `ll-impl`. Pin verifies OK. Tracks 1 (drop-completeness on
-unwind) and 2 (thread-local panic state) are **done + committed + repinned** — they are the prerequisites
-async plugs into (see §3).
+**Current HEAD baseline:** `b1414145` (`feat: Canonicalizes a Mod::Leaf name …` — the qualified re-export
+resolver fix, committed+repinned by Jake, on top of `3cedca8d` Inc-2 repin). Branch `ll-impl`. Pin verifies
+OK. Inc 3 is **DONE+validated, UNCOMMITTED** (one modified file: `sema/async_lower.cryo`; no repin).
+Tracks 1 (drop-completeness on unwind) and 2 (thread-local panic state) are **done + committed + repinned**
+— they are the prerequisites async plugs into (see §3).
+
+**⚠ KNOWN BUG (pre-existing, NOT async-lowering, blocks the `block_on` driver):** `block_on(fut)` — and any
+generic free fn `f<F, R>(fut: F) -> R where F: Future<R>` — fails **codegen `E0636`** when called WITHOUT a
+turbofish, because `R` appears only in the return type + the where-bound (never in a parameter) and is not
+inferred from `F::Output`, so mono emits no specialization. **Turbofish works:** `block_on<ConcreteF,
+ConcreteR>(…)`. Reproduces on the committed pinned `bin/cryo` with a pure-stdlib `block_on(Ready<i32>::new(
+42))` (zero async) → independent of async. It is in the generic-inference layer, not `async_lower`. Since
+`block_on` on an anonymous async future can't be turbofished (the future type is unnameable), **async
+validation currently drives futures with an inline `loop { match f.poll(&cx) }` instead of `block_on`.** The
+Inc-1b/2 Progress-Log "no turbofish" claim no longer holds at HEAD. Fix is bound-directed inference (project
+the where-bound type arg from the receiver's assoc type) — a separate subsystem; left for Jake to triage.
 
 ---
 
@@ -586,3 +600,61 @@ IR should be unchanged — verify the `win-s2` vs `win-s3` `.ll` diff at each bo
   qualified names already resolved; the fallback never fires for them) → **NO REPIN**. This resolves the
   "open ergonomics question" from the retraction: a `future::Type` reference now works with just
   `import std::future;`.
+
+- _2026-07-23_ — **Inc 3 DONE + validated (both OSes). No repin (0 `.ll` diff). UNCOMMITTED.** Baseline HEAD
+  `b1414145`, pin verifies OK, one modified file: `sema/async_lower.cryo` (+538/−130). `AsyncLower` now
+  lowers **N straight-line `await`s with cross-await local promotion** (generalizes Inc 2's single-await
+  path). Shape:
+  - **`build_plan(node, &plan)`** computes an `AsyncPlan` (new file-scope struct): the carrier statement
+    indices, per-await `fut_i`/`F_i`/`Option<F_i>`/`F_i::Output`, and the promoted-local set. Gate:
+    `total_awaits == carrier_count && count >= 1` — an `await` nested in an expression (carriers=1,
+    awaits>1) or inside a branch/loop (counted, never a carrier) fails `E0600` (Inc 4). `plan.m == 0` ⇒ the
+    Inc-1b no-await path.
+  - **`build_poll_body_multi_await`** emits `m+1` state-guarded blocks `if (this.state == i) { … }`. B0 runs
+    the pre-await statements + builds `fut_0`; Bi (i≥1) resumes await i-1 (`take/poll/is_pending→suspend/
+    into_ready`), runs the carrier at `carriers[i-1]` (await rewritten to `__await_{i-1}`) + the statements
+    up to the next await, then builds `fut_i` + `this.state = i+1`. **Each block sets state forward at its
+    end, so a poll finding consecutive sub-futures immediately ready falls straight through them; a resume
+    poll's state guard skips every completed block.** A trailing `return Poll::Pending` after the blocks is
+    an unreachable fallback required only because the state guards are opaque to control-flow analysis
+    (without it → `E0403` "reaches end without returning").
+  - **Cross-await promotion (the real new work).** A local declared in block Bi and READ in a later block
+    (`block_of(stmt) = #carriers ≤ index`) is promoted to a synthesized field `__cross_<blk>_<name>`,
+    **stored** (`this.__cross… = name`) at the end of its declaring block and **reloaded**
+    (`const name = this.__cross…`) at the top of each later block that reads it (so reads resolve to the
+    shadow, not the out-of-scope original; the synthetic field name also dodges param-name collisions). A
+    local read only in the **operand** of the next await stays a plain local (the operand is built lazily at
+    the END of the previous block, attributed there — **not** to the carrier's own block). Read-detection is
+    a by-name expr/stmt walker: a miss can only UNDER-promote → a loud "not found", never a silent
+    miscompile.
+  - **Storage model:** promoted locals are **plain `T` fields, scalar-Copy only** (Int/Bool/Float/Pointer),
+    zero-initialized in the ctor (the field is always written before read, so the value is never observed;
+    Copy ⇒ the `this.x = x` store never drops garbage). Sub-futures stay `fut_i: Option<F_i>` (lazy, `None`
+    in ctor). **Deferred/banned with loud diagnostics:** `mut` local across await → `E0600`; non-scalar
+    aggregate across await → `E0600`; **reference across await → `E0455`** (the §4 self-reference ban,
+    enforced at the promotion site — routing through `move_check` for the un-promoted reference-param case is
+    a later refinement).
+  - **Validation (inline direct-poll driver — see the `block_on` bug note in §1):** scratchpad `async_inc3/`
+    drives four async fns to EXIT 0 — `add_two` (two awaits, `a` promoted, await 0 pends 2×) → 42;
+    `compute(3)` (pre-await `scaled` + first-await `x` both promoted, param threaded, await 1 pends 3×) → 42;
+    `chain` (three awaits, mid-chain resume, `a`+`b` promoted) → 42; `dep` (`a` read only in the next await's
+    operand → stays local) → 42. Negative probes all fire the intended diagnostic: `mut`-cross-await→E0600,
+    ref-cross-await→E0455, await-in-branch→E0600, nested-await-in-expr→E0600.
+  - **Gate:** `CRYO_CC=gcc make selfhost-check` → exit 0, **BOTH fixed points** (Linux `s3`==`s4`; Windows
+    `FIXED POINT OK`, 235 modules) after an environmental exit-15 SIGTERM retry on the first Windows run.
+    `win-s2` (pinned-built) vs `win-s3` (new-built) = **0 differing `.ll`** → **NO REPIN** (the Linux
+    `build/` vs `s3` comparison shows only `__FILE__`-path `FILE.str` string diffs from the absolute-vs-
+    relative stage invocation, which normalize to 0 — a stage artifact, not IR movement).
+  **Durable notes for Inc 4:** (1) the `if (state==i)` fall-through structure is straight-line-only; a
+  resumable `switch` re-entering the MIDDLE of a loop/branch is what Inc 4 must solve (per §10, a one-way
+  door — get Jake's CFG-approach sign-off first). (2) The reference-across-await ban lives in `build_plan`'s
+  promotion check; a reference **param** used after an await (not a promoted local) is NOT yet caught — that
+  needs the move-checker route (§4). (3) `mut`-across-await needs load-at-entry/store-at-exit writeback in
+  every block of the live range (deferred). (4) Promoted non-scalar/Copy-struct locals need either
+  `Option<T>` fields with non-consuming reads or init-flag-guarded plain fields (deferred). (5) **`block_on`
+  is broken without a turbofish (§1) — validate with inline `poll` loops, not `block_on`.**
+
+  NEXT: **Inc 4 — awaits across branches/loops. ONE-WAY DOOR: bring §10's two options (full CFG-to-state-
+  machine flattening vs. staged hard-error-await-in-loop-first) to Jake and get sign-off BEFORE coding.**
+  Separately, the `block_on` where-bound-inference bug (§1) blocks the ergonomic async driver and is worth
+  fixing (generic-inference layer, not async) — Jake to triage.
