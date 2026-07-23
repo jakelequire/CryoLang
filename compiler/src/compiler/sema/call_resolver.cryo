@@ -1018,6 +1018,11 @@ type struct CallResolver {
                 }
                 ictx.unify(param.resolved_type, lit_actual);
             }
+            // PASS D - fill a param that appears only in a where-bound (the `R`
+            // in `where F: Future<R>`) by projecting it off the now-bound subject
+            // (`R = F::Output`), so a return-only bound param resolves from the
+            // arguments alone - no turbofish or expected-type context required.
+            this.project_where_bound_params(tmpl, entry, &ictx);
 
             for (mut i: i64 = 0; i < bindings.length; i++) { bindings[i] = ictx.bindings[i]; }
 
@@ -1128,6 +1133,79 @@ type struct CallResolver {
         return out;
     }
 
+    /// Index of `name` in a template's parallel param-name list, or -1. The
+    /// name list, `param_type_ids`, and an `InferCtx`'s `bindings` share one
+    /// index space (all built from the template's generic params in order).
+    param_name_index(&this, entry: TemplateEntry*, name: SymbolStr) -> i64 {
+        for (mut i: i64 = 0; i < entry.param_names.length; i++) {
+            if (entry.param_names[i].equals(name)) { return i; }
+        }
+        return -1i64;
+    }
+
+    /// The template-param index a where-bound trait arg names, or -1 when it is
+    /// not a bare parameter reference (a wrapped/concrete arg derives nothing).
+    where_arg_param_index(&this, ta: TypeAnnotation*, entry: TemplateEntry*) -> i64 {
+        if (ta == null) { return -1i64; }
+        match (*ta) {
+            TypeAnnotation::Named(n) => { return this.param_name_index(entry, n.name); }
+            _                       => { return -1i64; }
+        }
+    }
+
+    /// Bound-directed projection ("PASS D"): a type param that appears ONLY in a
+    /// where-bound `P: Trait<…, R, …>` (never in a value parameter) is a
+    /// functional dependency of `P` - once `P` is bound to a concrete type, `R`
+    /// is that type's associated-type binding for the trait's positional-sugar
+    /// slot (`Future<R>` => `R = P::Output`; `Iterator<T>` => `T = P::Item`). For
+    /// each already-bound subject, project the trait's assoc type off it and fill
+    /// the still-unbound arg param, so argument inference alone can settle a
+    /// return-only / bound-only param without a turbofish or expected-type hint.
+    /// Only bare `Named` args are derived; an existing binding is kept. Mirrors
+    /// the impl-side `TypeResolver::derive_where_assoc_bindings`.
+    project_where_bound_params(mut &this, tmpl: FunctionDeclNode*, entry: TemplateEntry*,
+                               ictx: InferCtx*) -> void {
+        if (this.ctx.type_resolver == null || this.ctx.generic_registry == null) { return; }
+        for (mut bi: i64 = 0; bi < tmpl.trait_bounds.length; bi++) {
+            const bound: TraitBound* = &tmpl.trait_bounds[bi];
+            if (bound.has_projection_subject()) { continue; }
+            const s: i64 = this.param_name_index(entry, bound.type_parameter);
+            if (s < 0 || s >= ictx.bindings.length) { continue; }
+            const subject: TypeRef = ictx.bindings[s];
+            // The subject need only be free of OPEN generic params (so its trait
+            // impl is findable) - NOT mono-resolved. `free_infer_type_concrete`
+            // would wrongly reject a pre-mono `Ready<i32>` whose monomorphized
+            // form does not exist yet; `resolve_concrete_member` handles the
+            // pre-mono instantiation directly (as `resolve_await` relies on).
+            if (!subject.is_valid() || this.types.contains_generic_param(subject)) { continue; }
+            for (mut ti: i64 = 0; ti < bound.trait_refs.length; ti++) {
+                const tr: TraitRef* = &bound.trait_refs[ti];
+                if (tr.path.length == 0) { continue; }
+                const trait_leaf: SymbolStr = tr.path[tr.path.length - 1];
+                const tdecl: TraitDeclNode* = this.ctx.generic_registry.get_trait_decl(trait_leaf);
+                if (tdecl == null) { continue; }
+                const ngp: i64 = tdecl.generic_params.length;
+                for (mut ai: i64 = 0; ai < tr.type_args.length; ai++) {
+                    // Positional args fill the trait's own generic params first,
+                    // then its associated types; only the assoc-type slots derive.
+                    if (ai < ngp) { continue; }
+                    const assoc_idx: i64 = ai - ngp;
+                    if (assoc_idx >= tdecl.assoc_types.length) { continue; }
+                    if (tdecl.assoc_types[assoc_idx] == null) { continue; }
+                    const j: i64 = this.where_arg_param_index(tr.type_args[ai], entry);
+                    if (j < 0 || j >= ictx.bindings.length || ictx.bindings[j].is_valid()) { continue; }
+                    mut rc: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
+                    const member: SymbolStr = tdecl.assoc_types[assoc_idx].name;
+                    const derived: TypeRef =
+                        this.ctx.type_resolver.resolve_concrete_member(subject, member, &rc);
+                    if (derived.is_valid() && !this.types.contains_generic_param(derived)) {
+                        ictx.bind_slot(j, derived);
+                    }
+                }
+            }
+        }
+    }
+
     /// PASS A/B/C argument inference returning the per-param bindings (no
     /// diagnostics), used by the module-scoped scope-resolution path.
     infer_free_call_bindings(mut &this, call: CallExprNode*, entry: TemplateEntry*,
@@ -1175,6 +1253,10 @@ type struct CallResolver {
             if (f_idx >= 0 && ictx.bindings[f_idx].is_valid()) { continue; }
             ictx.unify(param.resolved_type, lit_actual);
         }
+        // PASS D - project a where-bound-only param off its now-bound subject
+        // (mirrors `check_generic_free_call`; keeps the qualified scope path,
+        // e.g. `future::block_on(fut)`, in step with the bare-identifier path).
+        this.project_where_bound_params(tmpl, entry, &ictx);
         mut bindings: TypeRef[] = [];
         for (mut i: i64 = 0; i < ictx.bindings.length; i++) { bindings.push(ictx.bindings[i]); }
         for (mut i: i64 = 0; i < bindings.length; i++) {
