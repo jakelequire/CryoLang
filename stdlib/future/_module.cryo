@@ -1,0 +1,52 @@
+///! std::future: stackless async foundations — `Future`, `Poll`, `Context`,
+///! `Waker`, and a single-thread `block_on` driver.
+///!
+///! A `Future<Output>` is a value that computes an `Output` incrementally: each
+///! `poll` either yields `Poll::Ready(v)` (done) or `Poll::Pending` (not yet —
+///! try again after the paired `Waker` fires). Futures are lazy: nothing runs
+///! until something drives `poll`. `block_on` is that driver in its simplest
+///! form — it polls one future to completion on the calling thread.
+///!
+///! Sub-modules:
+///!   - `poll`   : `Poll<T>` (`Ready` / `Pending`)
+///!   - `waker`  : `Waker` (wake callback + data) and `Context`
+///!   - `traits` : the `Future` trait (`type Output`; `poll`)
+///!   - `ready`  : sample futures `Ready<T>` and `PendingThenReady<T>`
+///!
+///! The module is named `future` rather than `async` because `async` is a
+///! reserved keyword. Executor (`spawn`/`JoinHandle`) and reactor (epoll/IOCP)
+///! layers arrive in later phases; see `ASYNC_IMPL.md` for the full plan.
+///!
+///! Self-reference: Cryo forbids holding a reference live across an `await`
+///! (enforced once the compiler lowers `async fn`), so a future never contains a
+///! pointer into its own fields and is always safe to move — no `Pin` is needed.
+
+namespace std::future;
+
+import future::poll;
+import future::waker;
+import future::traits;
+import future::ready;
+
+public module future::poll;
+public module future::waker;
+public module future::traits;
+public module future::ready;
+
+/// Drive a single future to completion on the calling thread and return its
+/// value. The simplest possible executor: poll in a loop with a no-op waker,
+/// re-polling immediately on `Pending`. It has no reactor, so a future that
+/// stays `Pending` forever spins forever — real parking arrives with the
+/// Phase-3 executor. Sufficient for compute-only futures that make progress on
+/// every poll.
+function block_on<F, R>(fut: F) -> R
+where F: Future<R> {
+    mut f:  F       = fut;
+    mut cx: Context = Context::new(Waker::noop());
+    loop {
+        match (f.poll(&cx)) {
+            Poll::Ready(v) => { return v; }
+            Poll::Pending  => { }
+        }
+    }
+}
