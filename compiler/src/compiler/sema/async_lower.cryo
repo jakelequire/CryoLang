@@ -26,6 +26,7 @@ import Compiler::Types::{ TypeRef, Type, Arena, Compound, UserDefined, Ownership
 import Compiler::Resolver::{ SymbolStr, InternTable, QualifiedName, MangledName };
 import Compiler::AST;
 import Compiler::AST::{ Node, Visitor, Expression, Statement, Declaration, Cloner };
+import Compiler::Lex;
 import Compiler::Diag;
 import Compiler::Diag::{ Diagnostic, SourceSpan };
 import Compiler::Passes::TypeResolution;
@@ -142,6 +143,372 @@ type struct AsyncLower {
         }
     }
 
+    // ---- await discovery (Inc 2: a single straight-line await) ----
+
+    /// Count `await` sub-expressions in an expression tree. Covers the node
+    /// kinds an awaited-future expression realistically nests under; kinds not
+    /// walked can only UNDER-count, and any `await` the lowering leaves in place
+    /// is caught by codegen's `await`-not-implemented hard error, so an
+    /// imperfect count degrades only the diagnostic, never soundness.
+    expr_await_count(&this, e: ExpressionNode*) -> i64 {
+        if (e == null) { return 0i64; }
+        const k: NodeKind = (e as ASTNode*).kind;
+        if (k == NodeKind::AwaitExpression) {
+            return 1i64 + this.expr_await_count((e as AwaitExprNode*).operand);
+        }
+        if (k == NodeKind::BinaryExpression) {
+            const b: BinaryExprNode* = e as BinaryExprNode*;
+            return this.expr_await_count(b.left) + this.expr_await_count(b.right);
+        }
+        if (k == NodeKind::UnaryExpression) {
+            return this.expr_await_count((e as UnaryExprNode*).operand);
+        }
+        if (k == NodeKind::CallExpression) {
+            const c: CallExprNode* = e as CallExprNode*;
+            mut n: i64 = this.expr_await_count(c.callee);
+            for (mut i: i64 = 0; i < c.arguments.length; i++) {
+                n += this.expr_await_count(c.arguments[i]);
+            }
+            return n;
+        }
+        if (k == NodeKind::MemberAccess) {
+            return this.expr_await_count((e as MemberAccessNode*).object);
+        }
+        return 0i64;
+    }
+
+    /// Count `await`s in a statement, recursing through control-flow containers
+    /// so an `await` buried in a nested block/branch/loop is still tallied (and
+    /// therefore rejected — Inc 2 lowers only a single straight-line await).
+    stmt_await_count(&this, stmt: StatementNode*) -> i64 {
+        if (stmt == null) { return 0i64; }
+        const k: NodeKind = stmt.kind;
+        if (k == NodeKind::ExpressionStatement) {
+            return this.expr_await_count((stmt as ExprStmtNode*).expression);
+        }
+        if (k == NodeKind::ReturnStatement) {
+            return this.expr_await_count((stmt as ReturnStmtNode*).expression);
+        }
+        if (k == NodeKind::DeclarationStatement) {
+            const ds: DeclStmtNode* = stmt as DeclStmtNode*;
+            if (ds.declaration != null && ds.declaration.kind == NodeKind::VariableDeclaration) {
+                return this.expr_await_count((ds.declaration as VarDeclNode*).initializer);
+            }
+            return 0i64;
+        }
+        if (k == NodeKind::BlockStatement) {
+            return this.block_await_count(stmt as BlockStmtNode*);
+        }
+        if (k == NodeKind::IfStatement) {
+            const iff: IfStmtNode* = stmt as IfStmtNode*;
+            return this.expr_await_count(iff.condition)
+                 + this.stmt_await_count(iff.then_stmt)
+                 + this.stmt_await_count(iff.else_stmt);
+        }
+        if (k == NodeKind::WhileStatement) {
+            const w: WhileStmtNode* = stmt as WhileStmtNode*;
+            return this.expr_await_count(w.condition) + this.stmt_await_count(w.body);
+        }
+        if (k == NodeKind::DoWhileStatement) {
+            const d: DoWhileStmtNode* = stmt as DoWhileStmtNode*;
+            return this.expr_await_count(d.condition) + this.stmt_await_count(d.body);
+        }
+        if (k == NodeKind::ForStatement) {
+            return this.stmt_await_count((stmt as ForStmtNode*).body);
+        }
+        if (k == NodeKind::LoopStatement) {
+            return this.stmt_await_count((stmt as LoopStmtNode*).body);
+        }
+        if (k == NodeKind::MatchStatement) {
+            const m: MatchStmtNode* = stmt as MatchStmtNode*;
+            mut n: i64 = 0i64;
+            for (mut i: i64 = 0; i < m.arms.length; i++) {
+                if (m.arms[i] != null) { n += this.stmt_await_count(m.arms[i].body); }
+            }
+            return n;
+        }
+        return 0i64;
+    }
+
+    block_await_count(&this, blk: BlockStmtNode*) -> i64 {
+        if (blk == null) { return 0i64; }
+        mut n: i64 = 0i64;
+        for (mut i: i64 = 0; i < blk.statements.length; i++) {
+            n += this.stmt_await_count(blk.statements[i]);
+        }
+        return n;
+    }
+
+    /// If `stmt`'s TOP-LEVEL expression is an `await`, return that node; else
+    /// null. The three carriers Inc 2 supports: `const/mut x = await e;`,
+    /// `return await e;`, and a bare `await e;`. An await nested deeper in an
+    /// expression is intentionally not a carrier (the count gate rejects it).
+    stmt_toplevel_await(&this, stmt: StatementNode*) -> AwaitExprNode* {
+        if (stmt == null) { return null; }
+        if (stmt.kind == NodeKind::DeclarationStatement) {
+            const ds: DeclStmtNode* = stmt as DeclStmtNode*;
+            if (ds.declaration != null && ds.declaration.kind == NodeKind::VariableDeclaration) {
+                const vd: VarDeclNode* = ds.declaration as VarDeclNode*;
+                if (vd.initializer != null && vd.initializer.kind == NodeKind::AwaitExpression) {
+                    return vd.initializer as AwaitExprNode*;
+                }
+            }
+            return null;
+        }
+        if (stmt.kind == NodeKind::ReturnStatement) {
+            const rs: ReturnStmtNode* = stmt as ReturnStmtNode*;
+            if (rs.expression != null && rs.expression.kind == NodeKind::AwaitExpression) {
+                return rs.expression as AwaitExprNode*;
+            }
+            return null;
+        }
+        if (stmt.kind == NodeKind::ExpressionStatement) {
+            const es: ExprStmtNode* = stmt as ExprStmtNode*;
+            if (es.expression != null && es.expression.kind == NodeKind::AwaitExpression) {
+                return es.expression as AwaitExprNode*;
+            }
+            return null;
+        }
+        return null;
+    }
+
+    /// Replace the top-level `await e` in a carrier statement with `repl` (the
+    /// identifier bound to the awaited result). The carrier then runs, on
+    /// resume, reading the result instead of the (removed) await.
+    rewrite_carrier_await(&this, stmt: StatementNode*, repl: ExpressionNode*) -> void {
+        if (stmt == null) { return; }
+        if (stmt.kind == NodeKind::DeclarationStatement) {
+            const ds: DeclStmtNode* = stmt as DeclStmtNode*;
+            if (ds.declaration != null && ds.declaration.kind == NodeKind::VariableDeclaration) {
+                (ds.declaration as VarDeclNode*).initializer = repl;
+            }
+            return;
+        }
+        if (stmt.kind == NodeKind::ReturnStatement) {
+            (stmt as ReturnStmtNode*).expression = repl;
+            return;
+        }
+        if (stmt.kind == NodeKind::ExpressionStatement) {
+            (stmt as ExprStmtNode*).expression = repl;
+            return;
+        }
+    }
+
+    // ---- small typed-AST builders (shared by the poll-body synthesis) ----
+
+    this_ident(&this, struct_ref: TypeRef, span: SourceSpan) -> ExpressionNode* {
+        mut ti: IdentifierNode* = new IdentifierNode(this.intern.intern("this"), span);
+        ti.set_resolved_type(struct_ref);
+        return ti as ExpressionNode*;
+    }
+
+    ident(&this, name: SymbolStr, ty: TypeRef, span: SourceSpan) -> ExpressionNode* {
+        mut id: IdentifierNode* = new IdentifierNode(name, span);
+        id.set_resolved_type(ty);
+        return id as ExpressionNode*;
+    }
+
+    member(&this, obj: ExpressionNode*, field: SymbolStr, ty: TypeRef, span: SourceSpan) -> ExpressionNode* {
+        mut m: MemberAccessNode* = new MemberAccessNode(obj, field, span, span);
+        m.set_resolved_type(ty);
+        return m as ExpressionNode*;
+    }
+
+    u32_lit(&this, value: u64, span: SourceSpan) -> ExpressionNode* {
+        mut lit: LiteralNode* = new LiteralNode(format("%llu", value), LiteralKind::Integer, span);
+        lit.set_resolved_type(this.arena.get_u32());
+        return lit as ExpressionNode*;
+    }
+
+    /// `recv.name()` typed `ret_ty`. The member/call re-resolve by name during
+    /// the post-mono body re-check; `ret_ty` is the pre-mono hint.
+    method_call0(&this, recv: ExpressionNode*, name: string, ret_ty: TypeRef, span: SourceSpan) -> ExpressionNode* {
+        mut m: MemberAccessNode* = new MemberAccessNode(recv, this.intern.intern(name), span, span);
+        mut c: CallExprNode* = new CallExprNode(m as ExpressionNode*, span);
+        c.set_resolved_type(ret_ty);
+        return c as ExpressionNode*;
+    }
+
+    method_call1(&this, recv: ExpressionNode*, name: string, arg: ExpressionNode*,
+                 ret_ty: TypeRef, span: SourceSpan) -> ExpressionNode* {
+        mut m: MemberAccessNode* = new MemberAccessNode(recv, this.intern.intern(name), span, span);
+        mut c: CallExprNode* = new CallExprNode(m as ExpressionNode*, span);
+        c.add_argument(arg);
+        c.set_resolved_type(ret_ty);
+        return c as ExpressionNode*;
+    }
+
+    /// `this.<field> = <rhs>;` as a statement.
+    assign_member_stmt(&this, struct_ref: TypeRef, field: SymbolStr, field_ty: TypeRef,
+                       rhs: ExpressionNode*, span: SourceSpan) -> StatementNode* {
+        mut lhs: ExpressionNode* = this.member(this.this_ident(struct_ref, span), field, field_ty, span);
+        const eq: Token = Token::new(TokenType::Equal, "=", span.start_line as int, span.start_col as int);
+        mut assign: BinaryExprNode* = new BinaryExprNode(eq, lhs, rhs, span);
+        assign.set_resolved_type(this.arena.get_void());
+        mut es: ExprStmtNode* = new ExprStmtNode(assign as ExpressionNode*, span);
+        return es as StatementNode*;
+    }
+
+    /// `this.state == 0u32` (the first-poll guard).
+    state_eq_zero(&this, struct_ref: TypeRef, state: SymbolStr, u32_ty: TypeRef, span: SourceSpan) -> ExpressionNode* {
+        mut lhs: ExpressionNode* = this.member(this.this_ident(struct_ref, span), state, u32_ty, span);
+        mut rhs: ExpressionNode* = this.u32_lit(0u64, span);
+        const eqeq: Token = Token::new(TokenType::EqualEqual, "==", span.start_line as int, span.start_col as int);
+        mut cmp: BinaryExprNode* = new BinaryExprNode(eqeq, lhs, rhs, span);
+        cmp.set_resolved_type(this.arena.get_bool());
+        return cmp as ExpressionNode*;
+    }
+
+    /// `Option::Some(<value>)` typed `opt_ty`.
+    option_some(&this, value: ExpressionNode*, opt_ty: TypeRef, span: SourceSpan) -> ExpressionNode* {
+        mut scope: ScopeResolutionNode* = new ScopeResolutionNode(
+            this.intern.intern("Option"), this.intern.intern("Some"), span);
+        scope.set_resolved_type(opt_ty);
+        mut call: CallExprNode* = new CallExprNode(scope as ExpressionNode*, span);
+        call.add_argument(value);
+        call.set_resolved_type(opt_ty);
+        return call as ExpressionNode*;
+    }
+
+    /// `Option::None` typed `opt_ty`.
+    option_none(&this, opt_ty: TypeRef, span: SourceSpan) -> ExpressionNode* {
+        mut scope: ScopeResolutionNode* = new ScopeResolutionNode(
+            this.intern.intern("Option"), this.intern.intern("None"), span);
+        scope.set_resolved_type(opt_ty);
+        return scope as ExpressionNode*;
+    }
+
+    /// `Poll::Pending` typed `poll_ty`.
+    poll_pending(&this, poll_ty: TypeRef, span: SourceSpan) -> ExpressionNode* {
+        mut scope: ScopeResolutionNode* = new ScopeResolutionNode(
+            this.intern.intern("Poll"), this.intern.intern("Pending"), span);
+        scope.set_resolved_type(poll_ty);
+        return scope as ExpressionNode*;
+    }
+
+    var_decl_stmt(&this, name: SymbolStr, mutable: boolean, ty: TypeRef,
+                  init: ExpressionNode*, span: SourceSpan) -> StatementNode* {
+        mut vd: VarDeclNode* = new VarDeclNode(name, span);
+        vd.set_mutable(mutable);
+        vd.set_resolved_type(ty);
+        vd.set_initializer(init);
+        mut ds: DeclStmtNode* = new DeclStmtNode(vd as DeclarationNode*, span);
+        return ds as StatementNode*;
+    }
+
+    /// The arg-shadow prelude common to every generated `poll`: `const p =
+    /// this.p;` for each captured parameter, so the moved body resolves its
+    /// parameter names against the struct fields.
+    emit_shadow_prelude(&this, node: FunctionDeclNode*, body: BlockStmtNode*,
+                        struct_ref: TypeRef, span: SourceSpan) -> void {
+        const this_sym: SymbolStr = this.intern.intern("this");
+        for (mut i: i64 = 0; i < node.parameters.length; i++) {
+            const p: VarDeclNode* = node.parameters[i];
+            if (p == null || !p.resolved_type.is_valid()) { continue; }
+            mut this_ref: IdentifierNode* = new IdentifierNode(this_sym, span);
+            this_ref.set_resolved_type(struct_ref);
+            mut access: MemberAccessNode* = new MemberAccessNode(
+                this_ref as ExpressionNode*, p.name, span, span);
+            access.set_resolved_type(p.resolved_type);
+            mut shadow: VarDeclNode* = new VarDeclNode(p.name, span);
+            shadow.set_mutable(false);
+            shadow.set_resolved_type(p.resolved_type);
+            shadow.set_initializer(access as ExpressionNode*);
+            const shadow_stmt: DeclStmtNode* = new DeclStmtNode(shadow as DeclarationNode*, span);
+            body.add_statement(shadow_stmt as StatementNode*);
+        }
+    }
+
+    /// No-await body: shadow prelude + the original body with `return E`
+    /// rewritten to `return Poll::Ready(E)` (runs to completion in one poll).
+    build_poll_body_no_await(mut &this, node: FunctionDeclNode*, struct_ref: TypeRef,
+                             poll_out: TypeRef, span: SourceSpan) -> BlockStmtNode* {
+        mut body: BlockStmtNode* = new BlockStmtNode(span);
+        this.emit_shadow_prelude(node, body, struct_ref, span);
+        if (node.body.kind == NodeKind::BlockStatement) {
+            const orig: BlockStmtNode* = node.body as BlockStmtNode*;
+            for (mut bi: i64 = 0; bi < orig.statements.length; bi++) {
+                this.rewrite_returns(orig.statements[bi], poll_out, span);
+                body.add_statement(orig.statements[bi]);
+            }
+        }
+        return body;
+    }
+
+    /// Single-await body: a two-state resumable `poll`. State 0 runs the pre-
+    /// await statements, lazily builds the awaited future into `this.fut_0`, and
+    /// advances to state 1; both first and resume polls then drive `fut_0`,
+    /// returning `Poll::Pending` (re-storing the sub-future) until it is `Ready`,
+    /// after which the post-await statements run and produce `Poll::Ready(E)`.
+    ///
+    /// Inc 2 handles a single straight-line await with NO locals live across it:
+    /// pre-await locals stay scoped to the state-0 block, so a post-await use of
+    /// one is a plain "not found" (cross-await promotion arrives in Inc 3).
+    build_poll_body_single_await(mut &this, node: FunctionDeclNode*, struct_ref: TypeRef,
+            poll_out: TypeRef, ctx_ptr_ty: TypeRef, state: SymbolStr, u32_ty: TypeRef,
+            fut: SymbolStr, fut_field_ty: TypeRef, fut_inner: TypeRef, await_out: TypeRef,
+            split_index: i64, await_node: AwaitExprNode*, span: SourceSpan) -> BlockStmtNode* {
+        const await_idx: u64 = 0u64;
+        mut body: BlockStmtNode* = new BlockStmtNode(span);
+        this.emit_shadow_prelude(node, body, struct_ref, span);
+        const orig: BlockStmtNode* = node.body as BlockStmtNode*;
+
+        // State 0: run pre-await statements, stash the sub-future, advance state.
+        mut s0: BlockStmtNode* = new BlockStmtNode(span);
+        for (mut i: i64 = 0; i < split_index; i++) {
+            s0.add_statement(orig.statements[i]);
+        }
+        mut some_e: ExpressionNode* = this.option_some(await_node.operand, fut_field_ty, span);
+        s0.add_statement(this.assign_member_stmt(struct_ref, fut, fut_field_ty, some_e, span));
+        s0.add_statement(this.assign_member_stmt(struct_ref, state, u32_ty,
+            this.u32_lit(await_idx + 1u64, span), span));
+        mut if0: IfStmtNode* = new IfStmtNode(
+            this.state_eq_zero(struct_ref, state, u32_ty, span), s0 as StatementNode*, null, span);
+        body.add_statement(if0 as StatementNode*);
+
+        // mut __sub_0 = this.fut_0.take().unwrap();   (move the sub-future out)
+        const sub_sym: SymbolStr = this.intern.intern(format("__sub_%llu", await_idx));
+        mut take_call: ExpressionNode* = this.method_call0(
+            this.member(this.this_ident(struct_ref, span), fut, fut_field_ty, span),
+            "take", fut_field_ty, span);
+        mut unwrap_call: ExpressionNode* = this.method_call0(take_call, "unwrap", fut_inner, span);
+        body.add_statement(this.var_decl_stmt(sub_sym, true, fut_inner, unwrap_call, span));
+
+        // mut __poll_0 = __sub_0.poll(cx);
+        const poll_sym: SymbolStr = this.intern.intern(format("__poll_%llu", await_idx));
+        const cx_sym: SymbolStr = this.intern.intern("cx");
+        mut poll_call: ExpressionNode* = this.method_call1(
+            this.ident(sub_sym, fut_inner, span), "poll",
+            this.ident(cx_sym, ctx_ptr_ty, span), poll_out, span);
+        body.add_statement(this.var_decl_stmt(poll_sym, true, poll_out, poll_call, span));
+
+        // if (__poll_0.is_pending()) { this.fut_0 = Option::Some(__sub_0); return Poll::Pending; }
+        mut pend: BlockStmtNode* = new BlockStmtNode(span);
+        pend.add_statement(this.assign_member_stmt(struct_ref, fut, fut_field_ty,
+            this.option_some(this.ident(sub_sym, fut_inner, span), fut_field_ty, span), span));
+        mut ret_pend: ReturnStmtNode* = new ReturnStmtNode(this.poll_pending(poll_out, span), span);
+        pend.add_statement(ret_pend as StatementNode*);
+        mut if_pend: IfStmtNode* = new IfStmtNode(
+            this.method_call0(this.ident(poll_sym, poll_out, span), "is_pending",
+                this.arena.get_bool(), span),
+            pend as StatementNode*, null, span);
+        body.add_statement(if_pend as StatementNode*);
+
+        // const __await_0 = __poll_0.into_ready();
+        const await_sym: SymbolStr = this.intern.intern(format("__await_%llu", await_idx));
+        body.add_statement(this.var_decl_stmt(await_sym, false, await_out,
+            this.method_call0(this.ident(poll_sym, poll_out, span), "into_ready", await_out, span), span));
+
+        // The carrier (its `await e` now reading __await_0) + the post-await
+        // statements, with every `return E` wrapped as `return Poll::Ready(E)`.
+        this.rewrite_carrier_await(orig.statements[split_index], this.ident(await_sym, await_out, span));
+        for (mut i: i64 = split_index; i < orig.statements.length; i++) {
+            this.rewrite_returns(orig.statements[i], poll_out, span);
+            body.add_statement(orig.statements[i]);
+        }
+        return body;
+    }
+
     /// The lowering entry: gate on `node.is_async && !node.is_generic()` at the
     /// call site. Synthesizes the future struct + `Future` impl, registers them,
     /// and rewrites `node` into the constructor.
@@ -172,6 +539,52 @@ type struct AsyncLower {
         const poll_out: TypeRef = this.ctx.generic_registry.instantiate(poll_base, &poll_args);
         const ctx_ptr_ty: TypeRef = this.arena.get_pointer_to(ctx_ref);
 
+        // ---- 0. Await plan: none (Inc 1b) or a single straight-line await ----
+        // Determine whether this body suspends and, if so, on which statement.
+        // A body with no await runs to completion in one poll; a body with a
+        // single supported top-level await becomes a two-state machine (needs an
+        // extra `fut_0: Option<F>` field). Anything richer is rejected loudly.
+        const fut_sym: SymbolStr = this.intern.intern("fut_0");
+        mut single_await: boolean = false;
+        mut split_index: i64 = -1i64;
+        mut await_node: AwaitExprNode* = null;
+        mut fut_inner: TypeRef = TypeRef::invalid();
+        mut fut_field_ty: TypeRef = TypeRef::invalid();
+        mut await_out: TypeRef = TypeRef::invalid();
+        if (node.body.kind == NodeKind::BlockStatement) {
+            const abody: BlockStmtNode* = node.body as BlockStmtNode*;
+            const total: i64 = this.block_await_count(abody);
+            if (total > 0i64) {
+                for (mut i: i64 = 0; i < abody.statements.length; i++) {
+                    const aw: AwaitExprNode* = this.stmt_toplevel_await(abody.statements[i]);
+                    if (aw != null && split_index < 0i64) { split_index = i; await_node = aw; }
+                }
+                if (total != 1i64 || split_index < 0i64 || await_node == null || await_node.operand == null) {
+                    this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
+                        "async: only a single straight-line `await` is currently supported (as `const x = await e;`, `return await e;`, or `await e;`); richer control flow arrives in a later increment",
+                        node.span);
+                    return;
+                }
+                fut_inner = await_node.operand.resolved_type;
+                await_out = await_node.resolved_type;
+                if (!fut_inner.is_valid() || !await_out.is_valid()) {
+                    this.ctx.emit_error_at(ErrorCode::E0306_TRAIT_BOUND_NOT_SATISFIED,
+                        "async: could not resolve the awaited future's type (its operand must implement `Future`)",
+                        node.span);
+                    return;
+                }
+                const opt_base: TypeRef = this.lookup_future_type("Option");
+                if (!opt_base.is_valid()) {
+                    this.ctx.emit_error_at(ErrorCode::E0233_UNDEFINED_SYMBOL,
+                        "async: `Option` must be in scope to lower `await`", node.span);
+                    return;
+                }
+                mut opt_args: TypeRef[] = [fut_inner];
+                fut_field_ty = this.ctx.generic_registry.instantiate(opt_base, &opt_args);
+                single_await = true;
+            }
+        }
+
         // ---- 1. Struct decl + fields (state + one per param) ----
         mut struct_decl: StructDeclNode* = new StructDeclNode(q_name, span);
         struct_decl.repr_c = false;
@@ -192,6 +605,14 @@ type struct AsyncLower {
             f.set_resolved_type(p.resolved_type);
             struct_decl.add_field(f);
         }
+        // The awaited sub-future, created lazily on first poll (`Option::None`
+        // until state 0 stashes it), so the machine can suspend and resume it.
+        if (single_await) {
+            mut ff: FieldDeclNode* = new FieldDeclNode(fut_sym, span);
+            ff.set_visibility(Visibility::Public);
+            ff.set_resolved_type(fut_field_ty);
+            struct_decl.add_field(ff);
+        }
 
         // ---- 2. Arena StructType + FieldInfo ----
         const struct_ref: TypeRef = this.arena.create_struct(q_name, module_sym);
@@ -205,6 +626,9 @@ type struct AsyncLower {
                 if (p == null || !p.resolved_type.is_valid()) { continue; }
                 infos.push(FieldInfo::new(p.name, p.resolved_type, true, false, false));
             }
+            if (single_await) {
+                infos.push(FieldInfo::new(fut_sym, fut_field_ty, true, false, false));
+            }
             st.set_fields(infos);
         }
 
@@ -216,30 +640,16 @@ type struct AsyncLower {
         cx_param.set_resolved_type(ctx_ptr_ty);
         poll_fn.add_parameter(cx_param);
 
-        // Body: arg-shadow prelude (`const p = this.p;`) + rewritten original body.
-        mut body_block: BlockStmtNode* = new BlockStmtNode(span);
-        const this_sym: SymbolStr = this.intern.intern("this");
-        for (mut i: i64 = 0; i < node.parameters.length; i++) {
-            const p: VarDeclNode* = node.parameters[i];
-            if (p == null || !p.resolved_type.is_valid()) { continue; }
-            mut this_ident: IdentifierNode* = new IdentifierNode(this_sym, span);
-            this_ident.set_resolved_type(struct_ref);
-            mut access: MemberAccessNode* = new MemberAccessNode(
-                this_ident as ExpressionNode*, p.name, span, span);
-            access.set_resolved_type(p.resolved_type);
-            mut shadow: VarDeclNode* = new VarDeclNode(p.name, span);
-            shadow.set_mutable(false);
-            shadow.set_resolved_type(p.resolved_type);
-            shadow.set_initializer(access as ExpressionNode*);
-            const shadow_stmt: DeclStmtNode* = new DeclStmtNode(shadow as DeclarationNode*, span);
-            body_block.add_statement(shadow_stmt as StatementNode*);
-        }
-        if (node.body.kind == NodeKind::BlockStatement) {
-            const orig: BlockStmtNode* = node.body as BlockStmtNode*;
-            for (mut bi: i64 = 0; bi < orig.statements.length; bi++) {
-                this.rewrite_returns(orig.statements[bi], poll_out, span);
-                body_block.add_statement(orig.statements[bi]);
-            }
+        // Body: arg-shadow prelude (`const p = this.p;`) + either the whole
+        // original body (no await) or the two-state resumable machine (single
+        // await). Built AFTER the struct/field setup so field types are known.
+        mut body_block: BlockStmtNode* = null;
+        if (single_await) {
+            body_block = this.build_poll_body_single_await(node, struct_ref, poll_out, ctx_ptr_ty,
+                state_sym, u32_ty, fut_sym, fut_field_ty, fut_inner, await_out,
+                split_index, await_node, span);
+        } else {
+            body_block = this.build_poll_body_no_await(node, struct_ref, poll_out, span);
         }
         poll_fn.set_body(body_block);
 
@@ -314,6 +724,10 @@ type struct AsyncLower {
             mut pid: IdentifierNode* = new IdentifierNode(p.name, span);
             pid.set_resolved_type(p.resolved_type);
             ctor_lit.add_field_init(FieldInit { field_name: p.name, value: pid as ExpressionNode*, span: span });
+        }
+        if (single_await) {
+            ctor_lit.add_field_init(FieldInit {
+                field_name: fut_sym, value: this.option_none(fut_field_ty, span), span: span });
         }
         ctor_lit.set_resolved_type(struct_ref);
         mut ret: ReturnStmtNode* = new ReturnStmtNode(ctor_lit as ExpressionNode*, span);

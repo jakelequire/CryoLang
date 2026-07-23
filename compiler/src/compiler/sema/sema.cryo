@@ -1182,10 +1182,35 @@ public:
             }
             NodeKind::TryExpression     => { this.resolve_try_expr(expr as TryExprNode*) }
             NodeKind::LambdaExpression  => { this.lambda.resolve_lambda(this, expr as LambdaExprNode*) }
+            NodeKind::AwaitExpression   => { this.resolve_await(expr as AwaitExprNode*) }
             _ => { TypeRef::invalid() }
         };
         if (result.is_valid()) { expr.set_resolved_type(result); }
         return result;
+    }
+
+    /// Type an `await e`: `e` must be a `Future`, and the await evaluates to
+    /// that future's `Output` associated type. Projecting `F::Output` here (a)
+    /// types the body before `AsyncLower` runs so `const v = await e;` binds `v`
+    /// at the right type, and (b) leaves the projected type cached on the node
+    /// so the lowering can read the awaited future type (`operand`) and its
+    /// result type (this node) without re-projecting.
+    resolve_await(mut &this, node: AwaitExprNode*) -> TypeRef {
+        if (node == null || node.operand == null) { return TypeRef::invalid(); }
+        const fut_ty: TypeRef = this.resolve_expr(node.operand);
+        if (!fut_ty.is_valid()) { return TypeRef::invalid(); }
+        if (this.ctx.type_resolver == null) { return TypeRef::invalid(); }
+        const out_sym: SymbolStr = this.intern.intern("Output");
+        mut rc: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
+        const out_ty: TypeRef = this.ctx.type_resolver.resolve_concrete_member(fut_ty, out_sym, &rc);
+        if (!out_ty.is_valid()) {
+            const disp: string = this.arena.resolve_display_name(fut_ty.id);
+            this.ctx.emit_error_at(ErrorCode::E0306_TRAIT_BOUND_NOT_SATISFIED,
+                format("`await` requires an expression whose type implements `Future`; `%s` does not", disp),
+                node.span);
+            return TypeRef::invalid();
+        }
+        return out_ty;
     }
 
 
