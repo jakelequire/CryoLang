@@ -51,10 +51,14 @@ type struct UnwindException {
 /// panic to the personality (a foreign exception would carry a different class).
 const CRYO_EXCEPTION_CLASS: u64 = 0x4352594F50414E31;
 
-/// The in-flight panic's exception object. One panic is in flight per thread at
-/// a time, so a single global suffices for the current single-threaded use; this
-/// becomes `![thread_local]` once the async executor unwinds on worker threads
-/// (per-task isolation needs a distinct in-flight object per thread).
+/// The in-flight panic's exception object, per thread. libunwind writes its
+/// `private_1`/`private_2` scratch into this object during a raise, so two
+/// threads panicking at once must NOT share one object - each needs its own
+/// in-flight exception. `![thread_local]` gives each thread a distinct copy
+/// (the host C runtime - glibc here, since `--panic=unwind` links libunwind and
+/// is therefore always a hosted build - sets up the per-thread TLS block for the
+/// main thread and every `pthread_create`d worker).
+![thread_local]
 mut g_exn: UnwindException = UnwindException {
     exception_class: 0, exception_cleanup: 0, private_1: 0, private_2: 0,
 };
@@ -62,15 +66,17 @@ mut g_exn: UnwindException = UnwindException {
 /// The in-flight panic's payload, stashed by `__cryo_panic` before it raises so
 /// a root `catch_unwind` can read it back for its `Err(PanicInfo)`. The raise
 /// transfers control straight to a landing pad, so the funnel can never return
-/// these values — hence the stash. Plain globals like `g_exn` (single in-flight
-/// panic per thread); they become `![thread_local]` alongside `g_exn` once the
-/// async executor unwinds on worker threads.
+/// these values — hence the stash. Per-thread alongside `g_exn`: a `catch_unwind`
+/// on one thread must read ITS panic's message/file/line, not another thread's.
 ///
 /// `null`-initialized `string` pointers: they zero-init cleanly (a null pointer,
 /// like `g_exn`'s fields) and are only read after `__cryo_panic` has stashed a
 /// real message/file into them.
+![thread_local]
 mut g_panic_msg:  string = null;
+![thread_local]
 mut g_panic_file: string = null;
+![thread_local]
 mut g_panic_line: u32 = 0;
 
 // --- libunwind Level-1 ABI (linux; resolved from -lunwind) ------------------
