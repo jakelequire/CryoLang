@@ -1,0 +1,337 @@
+/// AsyncLower
+///
+/// Lowers a non-generic `async function` into a poll-driven state machine: a
+/// synthesized struct (the function's parameters as captured fields + a `state`
+/// discriminant) that implements `std::future::traits::Future`, plus a rewrite
+/// of the original function into a constructor returning that struct. The
+/// original body moves into the generated `poll` method with every `return E`
+/// rewritten to `return Poll::Ready(E)`.
+///
+/// Increment 1b handles the NO-AWAIT case: the body runs to completion in a
+/// single `poll`, so no `switch (state)` resume dispatcher is emitted yet.
+/// `await` suspend states, cross-await local promotion, and the resumable
+/// switch arrive in later increments.
+///
+/// Mirrors LambdaSynth's synthesize + register + inject machinery (a closure
+/// struct + `__call__`), adding the trait-impl registration a closure omits: the
+/// generated struct must formally implement `Future` so `block_on<F,R> where
+/// F: Future<R>` binds and `.poll()` dispatches. The two trait-registry keys are
+/// registered directly (dispatch keys on the struct's qualified name; the bound
+/// check on its qualified-name id), avoiding the DeclCollection/TypeResolution
+/// funnels whose target-name qualification assumes a parser-bare target.
+
+namespace Compiler::Sema::AsyncLower;
+
+import Compiler::Types::{ TypeRef, Type, Arena, Compound, UserDefined, Ownership, Resolver, GenericRegistry };
+import Compiler::Resolver::{ SymbolStr, InternTable, QualifiedName, MangledName };
+import Compiler::AST;
+import Compiler::AST::{ Node, Visitor, Expression, Statement, Declaration, Cloner };
+import Compiler::Diag;
+import Compiler::Diag::{ Diagnostic, SourceSpan };
+import Compiler::Passes::TypeResolution;
+import Compiler::CompilationContext;
+import std::core::{ option, mem };
+import std::fmt;
+
+type struct AsyncLower {
+    arena:   TypeArena*;
+    intern:  InternTable*;
+    ctx:     CompilationContext*;
+    counter: u64;
+
+    static null() -> AsyncLower {
+        return AsyncLower { arena: null, intern: null, ctx: null, counter: 0u64 };
+    }
+
+    wire(mut &this, arena: TypeArena*, intern: InternTable*, ctx: CompilationContext*) -> void {
+        this.arena  = arena;
+        this.intern = intern;
+        this.ctx    = ctx;
+    }
+
+    /// Resolve a stdlib future type by its import-visible leaf (`Poll`,
+    /// `Context`) to its arena TypeRef. Invalid if the module didn't import it.
+    lookup_future_type(&this, leaf: string) -> TypeRef {
+        const leaf_sym: SymbolStr = this.intern.intern(leaf);
+        const qual: SymbolStr = this.ctx.resolve_scoped_or(leaf_sym);
+        return this.ctx.decl_index.lookup_type(qual);
+    }
+
+    mint_bare(mut &this, base: string) -> SymbolStr {
+        const idx: u64 = this.counter;
+        this.counter += 1u64;
+        return this.intern.intern(format("%s$Future_%llu", base, idx));
+    }
+
+    /// Build a `Named` type annotation whose resolution short-circuits to `ty`
+    /// (via `pre_resolved`), so a synthesized annotation resolves without a name
+    /// lookup.
+    make_type_ann(&this, ty: TypeRef, span: SourceSpan) -> TypeAnnotation* {
+        const disp: string = this.arena.resolve_display_name(ty.id);
+        mut n: NamedAnnotation* = new NamedAnnotation {
+            name: this.intern.intern(disp), span: span, pre_resolved: ty,
+        };
+        return new TypeAnnotation::Named(n);
+    }
+
+    /// Wrap an already-typed value expression in `Poll::Ready(<expr>)` typed as
+    /// `Poll<Output>`.
+    make_poll_ready(&this, value: ExpressionNode*, poll_out: TypeRef, span: SourceSpan) -> ExpressionNode* {
+        mut scope: ScopeResolutionNode* = new ScopeResolutionNode(
+            this.intern.intern("Poll"), this.intern.intern("Ready"), span);
+        scope.set_resolved_type(poll_out);
+        mut call: CallExprNode* = new CallExprNode(scope as ExpressionNode*, span);
+        call.add_argument(value);
+        call.set_resolved_type(poll_out);
+        return call as ExpressionNode*;
+    }
+
+    /// Rewrite every `return E;` reachable in `stmt` to `return Poll::Ready(E);`,
+    /// recursing into blocks and every control-flow container so a return nested
+    /// in an if / loop / match is wrapped too. Return sites are found by a plain
+    /// structural walk (no await handling); `await` suspend points inside these
+    /// containers arrive with the later state-machine increments. Does NOT descend
+    /// into nested function-like bodies (a lambda's returns are its own, and a
+    /// lambda is an expression this statement walk never enters).
+    rewrite_returns(mut &this, stmt: StatementNode*, poll_out: TypeRef, span: SourceSpan) -> void {
+        if (stmt == null) { return; }
+        if (stmt.kind == NodeKind::ReturnStatement) {
+            const ret: ReturnStmtNode* = stmt as ReturnStmtNode*;
+            if (ret.expression != null) {
+                ret.expression = this.make_poll_ready(ret.expression, poll_out, span);
+            }
+            return;
+        }
+        if (stmt.kind == NodeKind::BlockStatement) {
+            const blk: BlockStmtNode* = stmt as BlockStmtNode*;
+            for (mut i: i64 = 0; i < blk.statements.length; i++) {
+                this.rewrite_returns(blk.statements[i], poll_out, span);
+            }
+            return;
+        }
+        if (stmt.kind == NodeKind::IfStatement) {
+            const iff: IfStmtNode* = stmt as IfStmtNode*;
+            this.rewrite_returns(iff.then_stmt, poll_out, span);
+            this.rewrite_returns(iff.else_stmt, poll_out, span);
+            return;
+        }
+        if (stmt.kind == NodeKind::WhileStatement) {
+            this.rewrite_returns((stmt as WhileStmtNode*).body, poll_out, span);
+            return;
+        }
+        if (stmt.kind == NodeKind::DoWhileStatement) {
+            this.rewrite_returns((stmt as DoWhileStmtNode*).body, poll_out, span);
+            return;
+        }
+        if (stmt.kind == NodeKind::ForStatement) {
+            this.rewrite_returns((stmt as ForStmtNode*).body, poll_out, span);
+            return;
+        }
+        if (stmt.kind == NodeKind::LoopStatement) {
+            this.rewrite_returns((stmt as LoopStmtNode*).body, poll_out, span);
+            return;
+        }
+        if (stmt.kind == NodeKind::MatchStatement) {
+            const m: MatchStmtNode* = stmt as MatchStmtNode*;
+            for (mut i: i64 = 0; i < m.arms.length; i++) {
+                if (m.arms[i] != null) {
+                    this.rewrite_returns(m.arms[i].body, poll_out, span);
+                }
+            }
+            return;
+        }
+    }
+
+    /// The lowering entry: gate on `node.is_async && !node.is_generic()` at the
+    /// call site. Synthesizes the future struct + `Future` impl, registers them,
+    /// and rewrites `node` into the constructor.
+    lower(mut &this, node: FunctionDeclNode*) -> void {
+        if (node == null || node.body == null) { return; }
+        const output_ref: TypeRef = node.resolved_return_type;
+        if (!output_ref.is_valid()) { return; }
+
+        // Future core types require the module to import them.
+        const poll_base: TypeRef = this.lookup_future_type("Poll");
+        const ctx_ref:   TypeRef = this.lookup_future_type("Context");
+        if (!poll_base.is_valid() || !ctx_ref.is_valid()) {
+            this.ctx.emit_error_at(ErrorCode::E0233_UNDEFINED_SYMBOL,
+                "an `async function` requires the future types in scope; add `import std::future;`",
+                node.span);
+            return;
+        }
+
+        const span: SourceSpan = node.span;
+        const module_sym: SymbolStr = this.intern.intern(this.ctx.source_file);
+        const bare: SymbolStr = this.mint_bare(this.intern.resolve(node.name));
+        const q_name: SymbolStr = this.ctx.qualify_symbol_sym(bare);
+
+        const state_sym: SymbolStr = this.intern.intern("state");
+        const u32_ty: TypeRef = this.arena.get_u32();
+
+        mut poll_args: TypeRef[] = [output_ref];
+        const poll_out: TypeRef = this.ctx.generic_registry.instantiate(poll_base, &poll_args);
+        const ctx_ptr_ty: TypeRef = this.arena.get_pointer_to(ctx_ref);
+
+        // ---- 1. Struct decl + fields (state + one per param) ----
+        mut struct_decl: StructDeclNode* = new StructDeclNode(q_name, span);
+        struct_decl.repr_c = false;
+        struct_decl.repr_packed = false;
+        struct_decl.repr_transparent = false;
+        struct_decl.min_alignment = 0;
+
+        mut state_field: FieldDeclNode* = new FieldDeclNode(state_sym, span);
+        state_field.set_visibility(Visibility::Public);
+        state_field.set_resolved_type(u32_ty);
+        struct_decl.add_field(state_field);
+
+        for (mut i: i64 = 0; i < node.parameters.length; i++) {
+            const p: VarDeclNode* = node.parameters[i];
+            if (p == null || !p.resolved_type.is_valid()) { continue; }
+            mut f: FieldDeclNode* = new FieldDeclNode(p.name, span);
+            f.set_visibility(Visibility::Public);
+            f.set_resolved_type(p.resolved_type);
+            struct_decl.add_field(f);
+        }
+
+        // ---- 2. Arena StructType + FieldInfo ----
+        const struct_ref: TypeRef = this.arena.create_struct(q_name, module_sym);
+        const struct_t: Type* = this.arena.lookup(struct_ref.id);
+        if (struct_t != null && struct_t.kind == TypeKind::Struct) {
+            const st: StructType* = struct_t as StructType*;
+            mut infos: FieldInfo[] = [];
+            infos.push(FieldInfo::new(state_sym, u32_ty, true, false, false));
+            for (mut i: i64 = 0; i < node.parameters.length; i++) {
+                const p: VarDeclNode* = node.parameters[i];
+                if (p == null || !p.resolved_type.is_valid()) { continue; }
+                infos.push(FieldInfo::new(p.name, p.resolved_type, true, false, false));
+            }
+            st.set_fields(infos);
+        }
+
+        // ---- 3. poll method: (mut &this, cx: Context*) -> Poll<Output> ----
+        mut poll_fn: FunctionDeclNode* = new FunctionDeclNode(this.intern.intern("poll"), span);
+        poll_fn.set_resolved_return_type(poll_out);
+        poll_fn.set_origin_trait(this.intern.intern("Future"));
+        mut cx_param: VarDeclNode* = new VarDeclNode(this.intern.intern("cx"), span);
+        cx_param.set_resolved_type(ctx_ptr_ty);
+        poll_fn.add_parameter(cx_param);
+
+        // Body: arg-shadow prelude (`const p = this.p;`) + rewritten original body.
+        mut body_block: BlockStmtNode* = new BlockStmtNode(span);
+        const this_sym: SymbolStr = this.intern.intern("this");
+        for (mut i: i64 = 0; i < node.parameters.length; i++) {
+            const p: VarDeclNode* = node.parameters[i];
+            if (p == null || !p.resolved_type.is_valid()) { continue; }
+            mut this_ident: IdentifierNode* = new IdentifierNode(this_sym, span);
+            this_ident.set_resolved_type(struct_ref);
+            mut access: MemberAccessNode* = new MemberAccessNode(
+                this_ident as ExpressionNode*, p.name, span, span);
+            access.set_resolved_type(p.resolved_type);
+            mut shadow: VarDeclNode* = new VarDeclNode(p.name, span);
+            shadow.set_mutable(false);
+            shadow.set_resolved_type(p.resolved_type);
+            shadow.set_initializer(access as ExpressionNode*);
+            const shadow_stmt: DeclStmtNode* = new DeclStmtNode(shadow as DeclarationNode*, span);
+            body_block.add_statement(shadow_stmt as StatementNode*);
+        }
+        if (node.body.kind == NodeKind::BlockStatement) {
+            const orig: BlockStmtNode* = node.body as BlockStmtNode*;
+            for (mut bi: i64 = 0; bi < orig.statements.length; bi++) {
+                this.rewrite_returns(orig.statements[bi], poll_out, span);
+                body_block.add_statement(orig.statements[bi]);
+            }
+        }
+        poll_fn.set_body(body_block);
+
+        mut poll_method: MethodNode* = new MethodNode(poll_fn, span);
+        poll_method.set_visibility(Visibility::Public);
+        poll_method.set_static(false);
+        poll_method.set_sink(false);
+
+        // StructType.methods so overload resolution sees `poll` on the receiver.
+        if (struct_t != null && struct_t.kind == TypeKind::Struct) {
+            const st: StructType* = struct_t as StructType*;
+            mut poll_param_types: TypeRef[] = [ctx_ptr_ty];
+            const poll_fn_ty: TypeRef = this.arena.get_function(poll_out, poll_param_types, false);
+            const minfo: MethodInfo = MethodInfo {
+                name:          this.intern.intern("poll"),
+                function_type: poll_fn_ty,
+                is_public:     true,
+                is_protected:  false,
+                is_static:     false,
+                is_virtual:    false,
+                is_override:   false,
+                param_types:   poll_param_types,
+                ast_node:      poll_method as void*,
+            };
+            st.add_method(minfo);
+        }
+
+        // ---- 4. `implement trait Future<Output> for struct <Q>` ----
+        mut impl: ImplBlockNode* = new ImplBlockNode(q_name, span);
+        mut future_named: NamedAnnotation* = new NamedAnnotation {
+            name: this.intern.intern("Future"), span: span, pre_resolved: TypeRef::invalid(),
+        };
+        mut future_base_ann: TypeAnnotation* = new TypeAnnotation::Named(future_named);
+        mut gen: GenericAnnotation* = new GenericAnnotation {
+            base: future_base_ann,
+            args: [this.make_type_ann(output_ref, span)],
+            span: span,
+        };
+        impl.set_trait_annotation(new TypeAnnotation::Generic(gen));
+        impl.add_assoc_binding(this.intern.intern("Output"), this.make_type_ann(output_ref, span));
+        impl.add_method(poll_method);
+
+        // ---- 5. Register struct + trait impl ----
+        this.ctx.decl_index.register_type_with_module(q_name, struct_ref, module_sym);
+        mut method_arr: MethodNode*[] = [poll_method];
+        this.ctx.decl_index.register_methods_with_module(
+            q_name, method_arr, module_sym, this.intern, this.arena);
+
+        const future_leaf: SymbolStr = this.intern.intern("Future");
+        // Dispatch key: `.poll()` resolution keys on the struct's qualified name.
+        this.ctx.generic_registry.register_trait_impl(future_leaf, q_name, impl);
+        // Bound-check key: `F: Future<R>` resolves via qualified-name id + leaf.
+        const tgt_leaf: SymbolStr = OwnershipQuery::registry_name_of(this.arena, this.intern, struct_ref);
+        const qual_id: u64 = OwnershipQuery::named_qualified_id(this.arena, this.intern, struct_ref);
+        this.ctx.generic_registry.register_trait_impl_typed(future_leaf, tgt_leaf, qual_id, impl);
+
+        // ---- 6. Inject so mono/codegen walk the struct + impl ----
+        if (this.ctx.artifacts.ast.root != null) {
+            this.ctx.artifacts.ast.root.add_statement(struct_decl as ASTNode*);
+            this.ctx.artifacts.ast.root.add_statement(impl as ASTNode*);
+        }
+
+        // ---- 7. Rewrite the async fn into the constructor ----
+        // Body: `return <Q> { state: 0u32, p0: p0, ... };`
+        mut ctor_lit: StructLiteralNode* = new StructLiteralNode(q_name, span);
+        mut zero: LiteralNode* = new LiteralNode("0", LiteralKind::Integer, span);
+        zero.set_resolved_type(u32_ty);
+        ctor_lit.add_field_init(FieldInit { field_name: state_sym, value: zero as ExpressionNode*, span: span });
+        for (mut i: i64 = 0; i < node.parameters.length; i++) {
+            const p: VarDeclNode* = node.parameters[i];
+            if (p == null || !p.resolved_type.is_valid()) { continue; }
+            mut pid: IdentifierNode* = new IdentifierNode(p.name, span);
+            pid.set_resolved_type(p.resolved_type);
+            ctor_lit.add_field_init(FieldInit { field_name: p.name, value: pid as ExpressionNode*, span: span });
+        }
+        ctor_lit.set_resolved_type(struct_ref);
+        mut ret: ReturnStmtNode* = new ReturnStmtNode(ctor_lit as ExpressionNode*, span);
+        mut new_body: BlockStmtNode* = new BlockStmtNode(span);
+        new_body.add_statement(ret as StatementNode*);
+
+        node.set_body(new_body);
+        node.set_resolved_return_type(struct_ref);
+        node.set_return_type_annotation(this.make_type_ann(struct_ref, span));
+        node.set_async(false);
+
+        // Re-register the function's now-future return type so callers of
+        // `<name>(...)` resolve to the state-machine struct, not the old Output.
+        // Drop the stale Output-return overload first (both the bare and
+        // qualified names it was registered under) so the new struct-return
+        // signature is the sole overload at call sites.
+        this.ctx.decl_index.reset_function_overloads(node.name);
+        this.ctx.decl_index.reset_function_overloads(this.ctx.qualify_symbol_sym(node.name));
+        TypeResolutionPasses::register_decl_in_index(node as ASTNode*, this.ctx, false, module_sym);
+    }
+}
