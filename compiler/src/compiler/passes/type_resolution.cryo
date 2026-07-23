@@ -441,6 +441,29 @@ type struct TypeResolutionRunner {
         this.resolver.resolve_method_signatures(methods, res_ctx, owner_type, owner_qname);
     }
 
+    /// Repair the signatures of a struct/union/class's *inline* methods during
+    /// the TypeResolution pass, once the owner type is available in the arena.
+    /// The DeclarationCollection FunctionSignature pass resolves these methods
+    /// before the owning type is registered, so its `decl_index`-based owner
+    /// lookup returns invalid and a by-value `this` receiver (which carries no
+    /// annotation) is left without a resolved_type.  The owner is sourced from
+    /// the arena here (populated by DeclarationCollection's type creation),
+    /// mirroring `register_decl_in_index`'s qualified-then-bare lookup, so the
+    /// receiver back-fill in `Resolver::resolve_method_signatures` runs.
+    /// Idempotent for already-resolved return/param types.
+    resolve_inline_method_signatures(&this, name: SymbolStr,
+                                     binding_namespace: SymbolStr,
+                                     methods: &MethodNode*[],
+                                     res_ctx: ResolutionContext*) -> void {
+        const qname: SymbolStr = this.ctx.qualify_binding_sym(name, binding_namespace);
+        mut owner: TypeRef = this.arena.lookup_by_name(qname);
+        if (owner.is_invalid()) {
+            owner = this.arena.lookup_by_name(name);
+        }
+        if (owner.is_invalid()) { return; }
+        this.resolver.resolve_method_signatures(methods, res_ctx, owner, qname);
+    }
+
     /// Resolves all function signatures (FunctionDeclNode*[]) on a trait.
     resolve_trait_method_signatures(&this, methods: &FunctionDeclNode*[],
                                     res_ctx: ResolutionContext*) -> void {
@@ -2706,6 +2729,18 @@ type struct TypeResolutionPasses {
                         node.generic_params, &runner.res_ctx);
                     runner.resolve_fields(node.fields, &struct_ctx);
                     field_count += node.fields.length;
+                    // Re-resolve the inline methods' signatures now that the
+                    // owner type exists in the arena.  The DeclarationCollection
+                    // FunctionSignature pass ran before this type was registered,
+                    // so its owner lookup was invalid and a by-value `this`
+                    // receiver (which carries no annotation) was left without a
+                    // resolved_type.  Impl-block methods are repaired by the
+                    // ImplementationBlock branch below; inline methods need the
+                    // same repair here, or a consuming method (`fn m(mut this)`)
+                    // reaches drop-insertion with an unresolved receiver and its
+                    // by-value `this` is never dropped - a leak on every call.
+                    runner.resolve_inline_method_signatures(
+                        node.name, node.binding_namespace, node.methods, &struct_ctx);
                 }
                 NodeKind::UnionDeclaration => {
                     const node: UnionDeclNode* = stmt as UnionDeclNode*;
@@ -2713,6 +2748,8 @@ type struct TypeResolutionPasses {
                         node.generic_params, &runner.res_ctx);
                     runner.resolve_fields(node.fields, &union_ctx);
                     field_count += node.fields.length;
+                    runner.resolve_inline_method_signatures(
+                        node.name, node.binding_namespace, node.methods, &union_ctx);
                 }
                 NodeKind::ClassDeclaration => {
                     const node: ClassDeclNode* = stmt as ClassDeclNode*;
@@ -2720,6 +2757,8 @@ type struct TypeResolutionPasses {
                         node.generic_params, &runner.res_ctx);
                     runner.resolve_fields(node.fields, &class_ctx);
                     field_count += node.fields.length;
+                    runner.resolve_inline_method_signatures(
+                        node.name, SymbolStr::empty(), node.methods, &class_ctx);
                 }
                 NodeKind::ImplementationBlock => {
                     const node: ImplBlockNode* = stmt as ImplBlockNode*;
