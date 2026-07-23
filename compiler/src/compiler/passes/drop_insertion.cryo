@@ -550,21 +550,20 @@ type struct DropInserter {
         // marked moved in the caller), so the callee owns it and drops it at
         // function exit unless it is moved out again (returned, stored, passed
         // on, or explicitly `.drop()`-ed) - the moved-set check in
-        // `maybe_append_drop` handles that. Two receiver forms are excluded
-        // because they do NOT transfer ownership to the callee:
-        //   - `&this` / `mut &this`: a Reference type; `needs_drop` is false
-        //     for references, so it's filtered at synthesis automatically.
-        //   - by-value `this`: the caller keeps the receiver and drops it, so
-        //     dropping it here too would double-free; excluded by name below.
-        // Copy and non-droppable params fall out via the `type_needs_drop`
+        // `maybe_append_drop` handles that. This includes a by-value `this`
+        // receiver (`fn m(mut this)` / `fn m(this)`): `read_call` marks the
+        // receiver moved at the call site, so the caller does NOT drop it - the
+        // callee owns and drops it here, exactly like any other by-value owning
+        // param. A `&this` / `mut &this` receiver is a Reference type, so
+        // `needs_drop` is false and it's filtered at synthesis automatically;
+        // Copy and non-droppable params fall out via the same `type_needs_drop`
         // gate, exactly like locals. Params are registered before body locals,
         // so reverse-order scope-exit drops them last (after the locals).
-        const this_recv: u32 = this.intern.intern("this").id;
         for (mut i: i64 = 0; i < func.parameters.length; i++) {
             const p: VarDeclNode* = func.parameters[i];
             if (p == null) { continue; }
             this.register_param_type(p.name, p.resolved_type);
-            if (p.name.is_valid() && p.name.id != this_recv
+            if (p.name.is_valid()
                     && this.type_needs_drop(p.resolved_type)
                     && this.param_drop_well_formed(p.resolved_type)) {
                 this.binding_names.push(p.name.id);

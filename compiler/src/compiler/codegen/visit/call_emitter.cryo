@@ -1050,6 +1050,13 @@ type struct CallEmitter {
         // param's LLVM width.  Receivers are pointer/reference-typed and
         // never hit the integer-widening path, but we record the receiver
         // type anyway to keep the array meaningful end-to-end.
+        // `--panic=unwind`: open a frame for this call's owning temporaries - the
+        // consumed receiver (recorded below) plus each positional owning temp
+        // (recorded in the arg loop). A panic origin nested in a LATER argument
+        // drops the whole live frame; it is closed once the call is built (the
+        // callee then owns them). Opened before the receiver so a consumed
+        // receiver temp joins this frame.
+        if (this.cg.ctx.project_panic_unwind) { this.cg.expr_ops.open_arg_temp_frame(); }
         mut args: Pair<LValue, TypeRef>[] = [];
         if (node.callee.kind == NodeKind::MemberAccess) {
             const ma: MemberAccessNode* = node.callee as MemberAccessNode*;
@@ -1075,6 +1082,22 @@ type struct CallEmitter {
                     const recv_slot: LValue = this.entry_spill_slot(recv_ty, "recvtmp");
                     this.cg.builder.build_store(obj, recv_slot);
                     obj = recv_slot;
+                    // A CONSUMED anonymous receiver temp (`make().consume(g())`)
+                    // is moved into the call; if a later argument panics before
+                    // the call runs, this frame must drop it (the callee never
+                    // took it). Record it like a positional owning temp. Gated on
+                    // the same consume check DropInsertion uses, so a receiver it
+                    // treats as borrowed (still owned elsewhere) is not recorded.
+                    if (this.cg.ctx.project_panic_unwind
+                        && (ma.object.kind == NodeKind::CallExpression
+                            || ma.object.kind == NodeKind::StructLiteral)
+                        && this.call_consumes_receiver(node, ma)
+                        && OwnershipQuery::needs_drop(this.cg.get_arena(),
+                               this.cg.ctx.generic_registry, this.cg.get_intern(),
+                               ma.object.resolved_type)) {
+                        this.record_arg_temp_slot(recv_slot, ma.object.resolved_type,
+                                                  ma.object.span);
+                    }
                 }
             }
             args.push(Pair<LValue, TypeRef>::new(obj, ma.object.resolved_type));
@@ -1086,11 +1109,6 @@ type struct CallEmitter {
         // imported C `v*` consumer reads from the right slot instead of one
         // indirection off.  `va_forward_fn_type` returns null on SysV-amd64 and
         // for method calls, leaving the loop byte-identical there.
-        // `--panic=unwind`: open a frame for this call's argument temporaries.
-        // Each anonymous owning temp evaluated below is recorded so a panic
-        // origin nested in a LATER argument drops it on the unwind; the frame is
-        // closed once the call is built (the callee then owns them).
-        if (this.cg.ctx.project_panic_unwind) { this.cg.expr_ops.open_arg_temp_frame(); }
         const va_ft: FunctionType* = this.va_forward_fn_type(node);
         for (mut i: i64 = 0; i < node.arguments.length; i++) {
             mut arg: LValue = this.dispatch.codegen_rvalue(visitor,node.arguments[i]);
@@ -1308,25 +1326,50 @@ type struct CallEmitter {
         this.state.last_is_lvalue = false;
     }
 
-    /// Record a live anonymous owning argument temporary so a panic origin
-    /// nested in a LATER argument drops it on the unwind path.  `f(make(),
-    /// boom())`: make()'s result is an owning temp with no AST binding, so
-    /// DropInsertion's name-keyed pending-arg machinery (which handles NAMED
-    /// owning args) cannot schedule its drop.  Spill the value into a stable slot,
-    /// bind that slot to a synthetic name in the value table, and hand a
-    /// ready-made `<name>.drop()` statement to the arg-temp stack; the cleanup
-    /// landing pad replays it exactly like an ordinary local's drop (user drop,
-    /// Copy no-op, and recursive glue all fall out of the normal `.drop()`
-    /// lowering).  Only a genuine owning rvalue temp qualifies - a call or
-    /// struct-literal result, never an identifier (the named machinery already
-    /// covers it, and double-tracking would double-drop) nor a place expression
-    /// (which would alias tracked storage).  The callee still receives the value
-    /// and drops its own copy on the normal path, so this slot is dropped ONLY on
-    /// the unwind path.  Caller gates on `--panic=unwind` and skips autoref args.
+    /// Register an already-materialized owning temp `slot` for drop on the unwind
+    /// path: bind it to a synthetic name in the value table and hand a ready-made
+    /// `<name>.drop()` statement to the arg-temp stack, which the cleanup landing
+    /// pad replays exactly like an ordinary local's drop (user drop, Copy no-op,
+    /// and recursive glue all fall out of the normal `.drop()` lowering).  Shared
+    /// by the positional-arg path (`maybe_record_arg_temp`) and the
+    /// consumed-receiver path (`make().consume(g())`).
+    record_arg_temp_slot(mut &this, slot: LValue, ty: TypeRef, span: SourceSpan) -> void {
+        if (!slot.is_valid() || !ty.is_valid()) { return; }
+        const intern: InternTable* = this.cg.get_intern();
+        const nm: SymbolStr = intern.intern(format("__argtemp_%d", this.glue_seq));
+        this.glue_seq = this.glue_seq + 1;
+        this.cg.values.set(nm, slot);
+        mut id_node: IdentifierNode* = new IdentifierNode(nm, span);
+        id_node.set_resolved_type(ty);
+        const drop_sym: SymbolStr = intern.intern("drop");
+        mut da: MemberAccessNode* = new MemberAccessNode(
+            id_node as ExpressionNode*, drop_sym, span, span);
+        mut call: CallExprNode* = new CallExprNode(da as ExpressionNode*, span);
+        mut stmt: ExprStmtNode* = new ExprStmtNode(call as ExpressionNode*, span);
+        this.cg.expr_ops.push_arg_temp_drop(stmt as ASTNode*);
+    }
+
+    /// Record a live owning argument temporary so a panic origin nested in a
+    /// LATER argument drops it on the unwind path.  `f(make(), boom())`: make()'s
+    /// result is an owning temp with no AST binding, so DropInsertion's name-keyed
+    /// pending-arg machinery (which handles NAMED owning args) cannot schedule its
+    /// drop.  Spill the value into a stable slot and register it for a pad drop;
+    /// the callee still receives the value and drops its own copy on the normal
+    /// path, so this slot is dropped ONLY on the unwind path.  Qualifying args:
+    ///   - a call / struct-literal result - a fresh owning rvalue temp; and
+    ///   - a member access that moves an owning field out of an owned aggregate
+    ///     (`f(p.first, g())`), a partial move.  Safe because the owner's drop
+    ///     glue already skips the moved-out field (the same poison that keeps the
+    ///     normal path from double-freeing it), so the pad drop is that field's
+    ///     only drop on the unwind path.
+    /// Never a bare identifier (the named machinery covers it; double-tracking
+    /// would double-drop).  Caller gates on `--panic=unwind` and skips autoref
+    /// (borrowed) args.
     maybe_record_arg_temp(mut &this, arg_expr: ExpressionNode*, arg_val: LValue) -> void {
         if (arg_expr == null || !arg_val.is_valid()) { return; }
         if (arg_expr.kind != NodeKind::CallExpression
-            && arg_expr.kind != NodeKind::StructLiteral) { return; }
+            && arg_expr.kind != NodeKind::StructLiteral
+            && arg_expr.kind != NodeKind::MemberAccess) { return; }
         const ty: TypeRef = arg_expr.resolved_type;
         if (!ty.is_valid()) { return; }
         const arena: TypeArena* = this.cg.get_arena();
@@ -1338,18 +1381,26 @@ type struct CallEmitter {
         const slot: LValue = this.entry_spill_slot(lty, "argtemp");
         if (!slot.is_valid()) { return; }
         this.cg.builder.build_store(arg_val, slot);
+        this.record_arg_temp_slot(slot, ty, arg_expr.span);
+    }
+
+    /// Does the method invoked by `node` consume its receiver by value (an
+    /// explicit by-value `this` or an `![sink]`)?  Mirrors DropInsertion's check
+    /// exactly (resolved method first, then a receiver-type + name fallback for
+    /// monomorphized generics) so the two passes agree on which receivers are
+    /// moved into the call - the invariant that keeps a consumed anonymous
+    /// receiver from being both dropped here and left for some other pass.
+    call_consumes_receiver(&this, node: CallExprNode*, ma: MemberAccessNode*) -> boolean {
+        const arena: TypeArena* = this.cg.get_arena();
+        if (arena == null) { return false; }
         const intern: InternTable* = this.cg.get_intern();
-        const nm: SymbolStr = intern.intern(format("__argtemp_%d", this.glue_seq));
-        this.glue_seq = this.glue_seq + 1;
-        this.cg.values.set(nm, slot);
-        mut id_node: IdentifierNode* = new IdentifierNode(nm, arg_expr.span);
-        id_node.set_resolved_type(ty);
-        const drop_sym: SymbolStr = intern.intern("drop");
-        mut da: MemberAccessNode* = new MemberAccessNode(
-            id_node as ExpressionNode*, drop_sym, arg_expr.span, arg_expr.span);
-        mut call: CallExprNode* = new CallExprNode(da as ExpressionNode*, arg_expr.span);
-        mut stmt: ExprStmtNode* = new ExprStmtNode(call as ExpressionNode*, arg_expr.span);
-        this.cg.expr_ops.push_arg_temp_drop(stmt as ASTNode*);
+        if (node.resolved_method != null) {
+            const m: MethodNode* = node.resolved_method as MethodNode*;
+            if (OwnershipQuery::method_consumes_receiver(arena, intern, m)) { return true; }
+        }
+        if (ma.object == null) { return false; }
+        return OwnershipQuery::type_method_consumes(arena, this.cg.ctx.generic_registry,
+                                                    intern, ma.object.resolved_type, ma.member);
     }
 
     /// Emit the cleanup landing pad for an `invoke` under `--panic=unwind`.
