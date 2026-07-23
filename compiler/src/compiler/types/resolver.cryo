@@ -574,6 +574,83 @@ type struct TypeResolver {
         }
     }
 
+    /// Bound-directed projection ("PASS D"), shared by the free-function and both
+    /// (static + instance) generic-method call paths. A type param that appears
+    /// ONLY in a where-bound `P: Trait<…, R, …>` (never in a value parameter) is a
+    /// functional dependency of `P`: once `P` is bound to a concrete subject, `R`
+    /// is that subject's associated-type binding for the trait's positional-sugar
+    /// slot (`Future<R>` ⇒ `R = P::Output`; `Iterator<T>` ⇒ `T = P::Item`). For
+    /// each still-unbound assoc-slot param, project the trait's assoc type off the
+    /// now-bound subject and fill it, so argument inference alone settles a
+    /// return-only / bound-only param without a turbofish or expected-type hint.
+    /// `param_names[i]` MUST align with `ictx.bindings[i]` (the caller builds the
+    /// InferCtx from the same ordered param list). Index-keyed analogue of the
+    /// impl-side `derive_where_assoc_bindings`: only bare `Named` args derive, and
+    /// an existing binding is kept.
+    ///
+    /// The subject need only be free of OPEN generic params (so its trait impl is
+    /// findable) — NOT mono-resolved: `resolve_concrete_member` handles a pre-mono
+    /// `Ready<i32>` whose monomorphized form does not exist yet (as `resolve_await`
+    /// relies on), so guarding on `contains_generic_param` rather than a
+    /// concreteness check is deliberate.
+    project_where_bound_params_into(&this, trait_bounds: &TraitBound[],
+                                    param_names: &SymbolStr[], ictx: InferCtx*,
+                                    source_file: string) -> void {
+        if (this.generic_registry == null) { return; }
+        for (mut bi: i64 = 0; bi < trait_bounds.length; bi++) {
+            const bound: TraitBound* = &trait_bounds[bi];
+            if (bound.has_projection_subject()) { continue; }
+            const s: i64 = this.param_name_slot(param_names, bound.type_parameter);
+            if (s < 0 || s >= ictx.bindings.length) { continue; }
+            const subject: TypeRef = ictx.bindings[s];
+            if (!subject.is_valid() || this.arena.contains_generic_param(subject)) { continue; }
+            for (mut ti: i64 = 0; ti < bound.trait_refs.length; ti++) {
+                const tr: TraitRef* = &bound.trait_refs[ti];
+                if (tr.path.length == 0) { continue; }
+                const trait_leaf: SymbolStr = tr.path[tr.path.length - 1];
+                const tdecl: TraitDeclNode* = this.generic_registry.get_trait_decl(trait_leaf);
+                if (tdecl == null) { continue; }
+                const ngp: i64 = tdecl.generic_params.length;
+                for (mut ai: i64 = 0; ai < tr.type_args.length; ai++) {
+                    // Positional args fill the trait's own generic params first,
+                    // then its associated types; only the assoc-type slots derive.
+                    if (ai < ngp) { continue; }
+                    const assoc_idx: i64 = ai - ngp;
+                    if (assoc_idx >= tdecl.assoc_types.length) { continue; }
+                    if (tdecl.assoc_types[assoc_idx] == null) { continue; }
+                    const j: i64 = this.where_arg_param_slot(tr.type_args[ai], param_names);
+                    if (j < 0 || j >= ictx.bindings.length || ictx.bindings[j].is_valid()) { continue; }
+                    mut rc: ResolutionContext = ResolutionContext::new(source_file, "");
+                    const member: SymbolStr = tdecl.assoc_types[assoc_idx].name;
+                    const derived: TypeRef = this.resolve_concrete_member(subject, member, &rc);
+                    if (derived.is_valid() && !this.arena.contains_generic_param(derived)) {
+                        ictx.bind_slot(j, derived);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Index of `name` in an ordered generic-param-name list, or -1. The list,
+    /// the caller's param-id list, and the InferCtx's `bindings` share one index
+    /// space (all built from the same ordered generic params).
+    param_name_slot(&this, param_names: &SymbolStr[], name: SymbolStr) -> i64 {
+        for (mut i: i64 = 0; i < param_names.length; i++) {
+            if (param_names[i].equals(name)) { return i; }
+        }
+        return -1i64;
+    }
+
+    /// The param-list index a where-bound trait arg names, or -1 when it is not a
+    /// bare `Named` parameter reference (a wrapped/concrete arg derives nothing).
+    where_arg_param_slot(&this, ta: TypeAnnotation*, param_names: &SymbolStr[]) -> i64 {
+        if (ta == null) { return -1i64; }
+        match (*ta) {
+            TypeAnnotation::Named(n) => { return this.param_name_slot(param_names, n.name); }
+            _                       => { return -1i64; }
+        }
+    }
+
     // Batch resolution helpers (shared by TypeResolution & Monomorphizer)
 
     /// Resolve a function's return type and parameter type annotations.
