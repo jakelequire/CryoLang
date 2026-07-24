@@ -1,0 +1,897 @@
+///! std::future::reactor: the I/O readiness driver behind async I/O.
+///!
+///! An `Executor` polls futures; a `Reactor` is what lets a future that cannot
+///! make progress *sleep* instead of spinning. A future whose I/O syscall
+///! reports "would block" registers the waker it took from its `Context` with
+///! the current reactor and returns `Pending`. Its task then parks — the stored
+///! waker holds a reference to it, so the executor keeps the task alive rather
+///! than reclaiming it. The reactor's own thread sits in the OS readiness call
+///! (`epoll_wait` on Linux, an IOCP wait on Windows) until the descriptor is
+///! ready, then fires the stored waker, which re-schedules the task for another
+///! poll. That second poll retries the syscall, which now succeeds.
+///!
+///! ## The readiness contract (identical on both platforms)
+///!
+///! `register(fd, direction, waker)` means "wake this waker once, when `fd` is
+///! next readable/writable", and it is **one-shot**: a delivered event disarms
+///! that direction, and a future that still cannot finish simply registers
+///! again. One-shot is the native shape of a Windows AFD poll and is requested
+///! explicitly (`EPOLLONESHOT`) on Linux, so neither backend can deliver a
+///! second event for an interest the reactor has already consumed.
+///!
+///! **The armed state is level-triggered, never edge-triggered, and that is a
+///! correctness requirement, not a preference.** A future attempts its syscall
+///! *before* it registers, so readiness can arrive in the window between the
+///! two. A level-triggered arm reports a descriptor that is *already* ready at
+///! arm time, which closes that window; an edge-triggered arm would report only
+///! the transition, and a future that registered a hair too late would park
+///! forever.
+///!
+///! Spurious wakes are always safe: a woken future retries its syscall, and if
+///! the descriptor was not really ready it registers again. Because of that,
+///! events are dispatched by descriptor number rather than by a pointer to the
+///! registration, so a stale event that names a since-closed (and possibly
+///! recycled) descriptor can at worst cause one extra poll — never a use of a
+///! freed registration.
+///!
+///! ## Reaching the reactor
+///!
+///! A reactor belongs to one `Executor`. Its worker threads publish it in a
+///! `![thread_local]` handle (`Reactor::current()`) for the duration of the
+///! thread, so an I/O future reaches it without the reactor appearing in
+///! `Context` (whose shape is fixed) and without an ambient process-wide
+///! runtime. `current()` is therefore null on any thread that is not an
+///! executor worker — a future that needs I/O must be run by an `Executor`.
+///!
+///! ## Locking
+///!
+///! One mutex guards the whole registration table, under one rule: **no waker is
+///! ever woken or dropped while the lock is held.** Both run arbitrary code —
+///! waking takes the executor's queue lock, and dropping a waker releases a task
+///! reference, which can be the last one and so can run the task's destructor,
+///! which drops its future, whose destructor deregisters. That last path would
+///! re-enter this lock and deadlock on it (it is not recursive). Every operation
+///! therefore moves the wakers it displaces into caller-owned locals and lets
+///! them fire and drop after the unlock.
+
+namespace std::future::reactor;
+
+import core::result;
+import core::ptr;
+import core::drop;
+import alloc::layout;
+import alloc::allocator;
+import sync::atomic;
+import ffi::libc;
+import sys::syscall;
+import core::mem;
+import future::waker;
+
+
+/// Interest/readiness bits. One `register` call arms exactly one direction;
+/// a descriptor may have both armed at once (by two futures, or one future
+/// waiting on each half of a socket).
+const INTEREST_READ:  u32 = 1u32;
+const INTEREST_WRITE: u32 = 2u32;
+
+/// Registration hash buckets. A power of two: the bucket index is `fd & 63`,
+/// which is near-perfect for descriptors (small, densely allocated integers).
+const REG_BUCKETS: i32 = 64;
+
+/// Readiness events drained from the OS per wait call.
+const RT_MAX_EVENTS: i32 = 64;
+
+
+/// One descriptor's slot in the reactor's table: which directions are armed,
+/// and the waker to fire for each. Heap-allocated and owned by the reactor
+/// (never by a future — futures move, and a backend may hand the OS a pointer
+/// into this block that must stay put until the operation completes).
+///
+/// A registration exists exactly while at least one direction is armed: it is
+/// created by the first `register` for a descriptor and freed when the last
+/// armed direction fires or is deregistered, so the table size tracks the
+/// number of parked operations and a leak is visible as an entry that outlives
+/// its future.
+type struct Registration {
+    fd:            i32;
+    interest:      u32;      // armed INTEREST_* bits
+    read_waker:    Waker;    // fired on readable; `Waker::noop()` when unarmed
+    write_waker:   Waker;    // fired on writable; `Waker::noop()` when unarmed
+    next:          Registration*;
+    backend_added: boolean;  // the OS knows this descriptor (epoll set membership)
+    os_state:      u8*;      // backend-owned per-registration block; null on Linux
+}
+
+/// Move the waker out of `slot`, leaving a no-op behind. The caller owns the
+/// result: dropping it releases the task reference the stored waker held.
+///
+/// Reading the old waker out is mandatory, not stylistic — assignment through a
+/// pointer does not drop the value it overwrites, so storing over a live waker
+/// would strand its task reference and the task would never be freed.
+private function take_waker(slot: Waker*) -> Waker {
+    const w: Waker = *slot;
+    *slot = Waker::noop();
+    return w;
+}
+
+/// Store `w` in `slot` and hand back the waker that was there (a future that
+/// re-registers before its previous registration fired replaces it).
+///
+/// The old waker is *returned* rather than dropped here because dropping it can
+/// run arbitrary code — see the "no waker drops under the lock" rule on
+/// `Reactor`. Callers park it in a local that outlives the unlock.
+private function swap_waker(slot: Waker*, w: Waker) -> Waker {
+    const old: Waker = *slot;
+    *slot = w;
+    return old;
+}
+
+
+/// The current thread's reactor: set by an executor worker for the lifetime of
+/// the thread, so a future being polled can reach the reactor from anywhere in
+/// the poll tree. Null on threads that do not poll (the thread that called
+/// `block_on`, or any thread outside an executor).
+![thread_local]
+mut g_current_reactor: Reactor* = null;
+
+
+/// The I/O readiness driver for one `Executor`. Heap-allocated: worker threads
+/// and parked futures hold raw pointers to it, and the backend hands the OS
+/// interior addresses, so it must not move.
+type struct Reactor {
+    mtx:      u8[40];              // guards the table (pthread_mutex_t / SRWLOCK)
+    buckets:  Registration*[64];   // REG_BUCKETS chains, keyed by `fd & 63`
+    poll_h:   i64;                 // epoll fd (Linux) / completion port (Windows)
+    kick_h:   i64;                 // eventfd (Linux) / unused (Windows)
+    aux_h:    i64;                 // unused (Linux) / AFD helper handle (Windows)
+    shutdown: Atomic<u8>;          // 1 once teardown has been signaled
+    thread:   u64;                 // the reactor thread (0 = not started)
+
+    /// Create a reactor, open its OS backend, and start its I/O thread.
+    /// Panics if the OS refuses any of the three: an executor without a working
+    /// reactor would park I/O futures that could never be woken, so failing
+    /// loudly at construction beats hanging later.
+    static start() -> Reactor* {
+        mut alloc: GlobalAlloc = GlobalAlloc::new();
+        mut rt: Reactor* = null;
+        match (alloc.allocate(Layout::of<Reactor>())) {
+            Result::Ok(raw) => { rt = raw.cast<Reactor>().as_ptr(); }
+            Result::Err(_)  => { panic("Reactor::start: allocation failed", FILE, LINE); }
+        }
+        if (rt_mtx_init(&rt.mtx[0]) != 0) {
+            panic("Reactor::start: table mutex init failed", FILE, LINE);
+        }
+        for (mut i: i32 = 0; i < REG_BUCKETS; i = i + 1) { rt.buckets[i] = null; }
+        rt.poll_h   = -1;
+        rt.kick_h   = -1;
+        rt.aux_h    = -1;
+        rt.shutdown = Atomic<u8>::new(0u8);
+        rt.thread   = 0;
+        if (!rt_backend_open(rt)) {
+            panic("Reactor::start: I/O readiness backend unavailable", FILE, LINE);
+        }
+        rt.thread = rt_thread_spawn(rt);
+        return rt;
+    }
+
+    /// Stop the reactor and release everything it owns. Signals shutdown, kicks
+    /// the thread out of its wait, joins it, then drops every registration still
+    /// standing — releasing their wakers, which is the last reference to any
+    /// task still parked on I/O, so those tasks are reclaimed rather than leaked.
+    ///
+    /// Must run AFTER the executor's tasks have been dropped: a future's drop
+    /// deregisters, and deregistering a dead reactor would touch freed memory.
+    static destroy(rt: Reactor*) -> void {
+        if (rt == null) { return; }
+        rt.shutdown.store(1u8, MemoryOrder::Release);
+        rt_kick(rt);
+        if (rt.thread != 0) {
+            rt_thread_join(rt.thread);
+            rt.thread = 0;
+        }
+        // The thread is gone, so the table has exactly one accessor: no lock.
+        // Releasing a still-armed waker here is what reclaims a task that parked
+        // on I/O and was never woken; that release runs the task's destructor,
+        // which drops its future, which deregisters — re-entering the table.
+        // Taking the wakers out and freeing the entry BEFORE they drop keeps
+        // that re-entry harmless: it finds the entry already gone.
+        for (mut b: i32 = 0; b < REG_BUCKETS; b = b + 1) {
+            loop {
+                const reg: Registration* = rt.buckets[b];
+                if (reg == null) { break; }
+                mut wr: Waker = take_waker(&reg.read_waker);
+                mut ww: Waker = take_waker(&reg.write_waker);
+                reg.interest = 0u32;
+                rt.remove(reg);
+                wr.drop();
+                ww.drop();
+            }
+        }
+        rt_backend_close(rt);
+        rt_mtx_destroy(&rt.mtx[0]);
+        mut alloc: GlobalAlloc = GlobalAlloc::new();
+        alloc.deallocate(NonNull::new(rt as u8*), Layout::of<Reactor>());
+    }
+
+    /// The reactor driving the current thread's polls, or null if this thread is
+    /// not an executor worker.
+    static current() -> Reactor* {
+        return g_current_reactor;
+    }
+
+    /// Publish `rt` as this thread's reactor. Called by an executor worker as it
+    /// starts, so every future it polls can reach the reactor.
+    static set_current(rt: Reactor*) -> void {
+        g_current_reactor = rt;
+    }
+
+    /// Arm `fd` for one wake in `direction` (exactly one INTEREST_* bit) and
+    /// store `w` as the waker to fire. Replaces any waker already stored for
+    /// that direction (a re-registering future supersedes its own earlier one).
+    ///
+    /// The caller must have attempted its syscall and seen "would block" first:
+    /// arming is level-triggered, so a descriptor that became ready in between
+    /// fires immediately rather than being missed.
+    register(mut &this, fd: i32, direction: u32, w: Waker) -> void {
+        // Wakers displaced below are parked in these and released after the
+        // unlock: `replaced` is a previous registration this one supersedes,
+        // `failed` is this one handed straight back when the OS refuses.
+        mut replaced: Waker = Waker::noop();
+        mut failed:   Waker = Waker::noop();
+        rt_mtx_lock(&this.mtx[0]);
+        mut reg: Registration* = this.find(fd);
+        if (reg == null) { reg = this.insert(fd); }
+        if ((direction & INTEREST_READ) != 0u32) { replaced = swap_waker(&reg.read_waker, w); }
+        else                                     { replaced = swap_waker(&reg.write_waker, w); }
+        reg.interest = reg.interest | direction;
+        // A descriptor the OS refuses to watch (closed, or not pollable) would
+        // park its future forever. Take the waker straight back out and fire it
+        // below: the future re-polls, its syscall reports the real error, and it
+        // fails instead of hanging.
+        if (!rt_arm(&this, reg)) {
+            if ((direction & INTEREST_READ) != 0u32) { failed = take_waker(&reg.read_waker); }
+            else                                     { failed = take_waker(&reg.write_waker); }
+            reg.interest = reg.interest & ~direction;
+            if (reg.interest == 0u32) { this.remove(reg); }
+        }
+        rt_mtx_unlock(&this.mtx[0]);
+        failed.wake();
+        // `replaced` and `failed` drop here, outside the lock.
+    }
+
+    /// Disarm one direction on `fd`, releasing the waker stored for it. Called
+    /// by an I/O future that is dropped while parked, so cancelling one half of
+    /// a socket leaves a future waiting on the other half untouched.
+    cancel(mut &this, fd: i32, direction: u32) -> void {
+        mut taken: Waker = Waker::noop();
+        rt_mtx_lock(&this.mtx[0]);
+        const reg: Registration* = this.find(fd);
+        if (reg != null && (reg.interest & direction) != 0u32) {
+            if ((direction & INTEREST_READ) != 0u32) { taken = take_waker(&reg.read_waker); }
+            else                                     { taken = take_waker(&reg.write_waker); }
+            reg.interest = reg.interest & ~direction;
+            if (reg.interest == 0u32) { this.remove(reg); }
+            else                      { rt_arm(&this, reg); }
+        }
+        rt_mtx_unlock(&this.mtx[0]);
+        // `taken` drops here, outside the lock.
+    }
+
+    /// Drop `fd`'s registration entirely, releasing every waker it held. Called
+    /// when the descriptor itself goes away — a recycled descriptor number must
+    /// never inherit a stale registration.
+    deregister(mut &this, fd: i32) -> void {
+        mut wr: Waker = Waker::noop();
+        mut ww: Waker = Waker::noop();
+        rt_mtx_lock(&this.mtx[0]);
+        const reg: Registration* = this.find(fd);
+        if (reg != null) {
+            wr = take_waker(&reg.read_waker);
+            ww = take_waker(&reg.write_waker);
+            reg.interest = 0u32;
+            this.remove(reg);
+        }
+        rt_mtx_unlock(&this.mtx[0]);
+        // `wr` and `ww` drop here, outside the lock.
+    }
+
+    /// Wait for readiness (up to `timeout_ms`; negative blocks indefinitely) and
+    /// fire the wakers of every descriptor that became ready. The reactor thread
+    /// calls this in a loop.
+    poll_once(mut &this, timeout_ms: i32) -> void {
+        mut fds:   i32[64] = [0; 64];
+        mut ready: u32[64] = [0; 64];
+        const n: i32 = rt_wait(&this, &fds[0], &ready[0], RT_MAX_EVENTS, timeout_ms);
+        for (mut i: i32 = 0; i < n; i = i + 1) {
+            this.dispatch(fds[i], ready[i]);
+        }
+    }
+
+    /// Consume one readiness event: take the wakers for the directions that
+    /// became ready, re-arm whatever is still parked, and fire them.
+    ///
+    /// The wakers are moved out under the table lock but woken after it is
+    /// released — waking takes the executor's queue lock, and the shorter the
+    /// window where a worker can be blocked behind the reactor, the better.
+    /// An event for an unknown descriptor is dropped: it named a registration
+    /// that was deregistered while the event was in flight.
+    private dispatch(mut &this, fd: i32, ready: u32) -> void {
+        mut wr: Waker = Waker::noop();
+        mut ww: Waker = Waker::noop();
+        rt_mtx_lock(&this.mtx[0]);
+        const reg: Registration* = this.find(fd);
+        if (reg != null) {
+            if ((ready & reg.interest & INTEREST_READ) != 0u32) {
+                wr = take_waker(&reg.read_waker);
+                reg.interest = reg.interest & ~INTEREST_READ;
+            }
+            if ((ready & reg.interest & INTEREST_WRITE) != 0u32) {
+                ww = take_waker(&reg.write_waker);
+                reg.interest = reg.interest & ~INTEREST_WRITE;
+            }
+            if (reg.interest == 0u32) { this.remove(reg); }
+            else                      { rt_arm(&this, reg); }
+        }
+        rt_mtx_unlock(&this.mtx[0]);
+        wr.wake();
+        ww.wake();
+        // Both wakers drop here, releasing the task references they held; the
+        // wake above already handed the ready queue a fresh reference.
+    }
+
+    /// The registration for `fd`, or null. Caller holds the table lock.
+    private find(&this, fd: i32) -> Registration* {
+        mut r: Registration* = this.buckets[fd & (REG_BUCKETS - 1)];
+        while (r != null) {
+            if (r.fd == fd) { return r; }
+            r = r.next;
+        }
+        return null;
+    }
+
+    /// Create an empty (nothing armed) registration for `fd` and link it into
+    /// its bucket. Caller holds the table lock and has checked there is none.
+    private insert(mut &this, fd: i32) -> Registration* {
+        mut alloc: GlobalAlloc = GlobalAlloc::new();
+        mut reg: Registration* = null;
+        match (alloc.allocate(Layout::of<Registration>())) {
+            Result::Ok(raw) => { reg = raw.cast<Registration>().as_ptr(); }
+            Result::Err(_)  => { panic("Reactor::register: registration allocation failed", FILE, LINE); }
+        }
+        reg.fd            = fd;
+        reg.interest      = 0u32;
+        reg.read_waker    = Waker::noop();
+        reg.write_waker   = Waker::noop();
+        reg.next          = null;
+        reg.backend_added = false;
+        reg.os_state      = null;
+        const b: i32 = fd & (REG_BUCKETS - 1);
+        reg.next = this.buckets[b];
+        this.buckets[b] = reg;
+        return reg;
+    }
+
+    /// Unlink `reg`, tell the OS to stop watching it, and free it. Caller holds
+    /// the table lock (or is the sole accessor during teardown).
+    ///
+    /// Only ever called with nothing armed: a waker is stored exactly while its
+    /// direction is armed, so `interest == 0` means both slots hold no-ops and
+    /// freeing the block loses nothing. A caller removing a registration that is
+    /// still armed (`deregister`, teardown) takes the wakers out into locals of
+    /// its own first, so they are released after the lock, never under it.
+    private remove(mut &this, reg: Registration*) -> void {
+        const b: i32 = reg.fd & (REG_BUCKETS - 1);
+        mut cur:  Registration* = this.buckets[b];
+        mut prev: Registration* = null;
+        while (cur != null) {
+            if (cur == reg) {
+                if (prev == null) { this.buckets[b] = cur.next; }
+                else              { prev.next = cur.next; }
+                break;
+            }
+            prev = cur;
+            cur  = cur.next;
+        }
+        rt_disarm(&this, reg);
+        mut alloc: GlobalAlloc = GlobalAlloc::new();
+        alloc.deallocate(NonNull::new(reg as u8*), Layout::of<Registration>());
+    }
+}
+
+
+/// The reactor thread: wait for readiness and fire wakers until teardown. A
+/// kick (see `rt_kick`) breaks the wait so shutdown is observed promptly.
+private function reactor_body(rt: Reactor*) -> void {
+    while (rt.shutdown.load(MemoryOrder::Acquire) == 0u8) {
+        rt.poll_once(-1);
+    }
+}
+
+// The OS thread entry ABIs differ (pthread returns `void*`, a Win32 start
+// routine returns `DWORD`), so each gets its own trampoline around the shared
+// body. Stored as a raw fn-ptr, hence free functions.
+![target(unix)]
+private function reactor_tramp(arg: u8*) -> u8* { reactor_body(arg as Reactor*); return null; }
+![target(windows)]
+private function reactor_tramp(arg: u8*) -> u32 { reactor_body(arg as Reactor*); return 0u32; }
+
+
+// ---------------------------------------------------------------------------
+// Per-OS thread + mutex primitives. These mirror the executor's: the reactor
+// keeps its own copies rather than importing them, so `future::reactor` stays
+// self-contained (importing `thread` into `future::*` would clash on the
+// `JoinHandle` leaf name). ConfigGating strips file-scope declarations only, so
+// every OS call lives in one of these gated free functions.
+// ---------------------------------------------------------------------------
+
+![target(unix)]
+private function rt_mtx_init(b: u8*) -> i32 { return libc::pthread_mutex_init(b, null); }
+![target(windows)]
+private function rt_mtx_init(b: u8*) -> i32 { syscall::InitializeSRWLock(b); return 0; }
+
+![target(unix)]
+private function rt_mtx_lock(b: u8*) -> void { libc::pthread_mutex_lock(b); }
+![target(windows)]
+private function rt_mtx_lock(b: u8*) -> void { syscall::AcquireSRWLockExclusive(b); }
+
+![target(unix)]
+private function rt_mtx_unlock(b: u8*) -> void { libc::pthread_mutex_unlock(b); }
+![target(windows)]
+private function rt_mtx_unlock(b: u8*) -> void { syscall::ReleaseSRWLockExclusive(b); }
+
+![target(unix)]
+private function rt_mtx_destroy(b: u8*) -> void { libc::pthread_mutex_destroy(b); }
+![target(windows)]
+private function rt_mtx_destroy(b: u8*) -> void { }
+
+/// Start the reactor thread on `rt`, returning its joinable id/handle.
+![target(unix)]
+private function rt_thread_spawn(rt: Reactor*) -> u64 {
+    mut tbuf: u8[8] = [0; 8];
+    const t: (u8*) -> u8* = reactor_tramp;
+    if (libc::pthread_create(&tbuf[0], null, t as void*, rt as u8*) != 0) {
+        panic("Reactor::start: reactor thread creation failed", FILE, LINE);
+    }
+    return *(&tbuf[0] as u64*);
+}
+![target(windows)]
+private function rt_thread_spawn(rt: Reactor*) -> u64 {
+    const t: (u8*) -> u32 = reactor_tramp;
+    const h: u8* = syscall::CreateThread(null, 0u64, t as void*, rt as u8*, 0u32, null);
+    if (h == null) {
+        panic("Reactor::start: reactor thread creation failed", FILE, LINE);
+    }
+    return h as u64;
+}
+
+![target(unix)]
+private function rt_thread_join(tid: u64) -> void {
+    mut ret: u8* = null;
+    libc::pthread_join(tid, &ret);
+}
+![target(windows)]
+private function rt_thread_join(tid: u64) -> void {
+    const h: u8* = tid as u8*;
+    syscall::WaitForSingleObject(h, 0xFFFFFFFFu32);
+    syscall::CloseHandle(h);
+}
+
+
+// ---------------------------------------------------------------------------
+// Linux backend: epoll + eventfd.
+//
+// The interest set is level-triggered and one-shot (`EPOLLONESHOT`): the kernel
+// disarms a descriptor as it delivers, so a consumed interest can never be
+// delivered twice, and re-arming is an explicit `EPOLL_CTL_MOD`. The user-data
+// word carries the descriptor number rather than a pointer, so an event that
+// outlives its registration cannot be turned into a dangling dereference.
+// ---------------------------------------------------------------------------
+
+/// Write a `struct epoll_event` into `slot`. The struct is packed on x86_64 (a
+/// u32 mask followed by an 8-byte union at offset 4), and Cryo does not model
+/// packed layout, so the 12 bytes are written by hand. The union carries a
+/// descriptor number, so both of its halves are written as u32s — a u64 store
+/// at offset 4 would be misaligned.
+![target(unix)]
+private function epoll_event_pack(slot: u8*, events: u32, fd: u32) -> void {
+    *(slot as u32*)       = events;
+    *((slot + 4) as u32*) = fd;
+    *((slot + 8) as u32*) = 0u32;
+}
+
+![target(unix)]
+private function rt_backend_open(rt: Reactor*) -> boolean {
+    const ep: i32 = libc::epoll_create1(libc::EPOLL_CLOEXEC);
+    if (ep < 0) { return false; }
+    // Counting eventfd, non-blocking so draining a kick never stalls the
+    // reactor. Armed level-triggered WITHOUT one-shot: it stays armed for the
+    // reactor's life, so any kick at any time breaks the wait.
+    const ev: i32 = libc::eventfd(0u32, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK);
+    if (ev < 0) {
+        libc::close(ep);
+        return false;
+    }
+    mut slot: u8[12] = [0; 12];
+    epoll_event_pack(&slot[0], libc::EPOLLIN, ev as u32);
+    if (libc::epoll_ctl(ep, libc::EpollOp::EPOLL_CTL_ADD, ev, &slot[0]) != 0) {
+        libc::close(ev);
+        libc::close(ep);
+        return false;
+    }
+    rt.poll_h = ep as i64;
+    rt.kick_h = ev as i64;
+    return true;
+}
+
+![target(unix)]
+private function rt_backend_close(rt: Reactor*) -> void {
+    if (rt.kick_h >= 0) { libc::close(rt.kick_h as i32); rt.kick_h = -1; }
+    if (rt.poll_h >= 0) { libc::close(rt.poll_h as i32); rt.poll_h = -1; }
+}
+
+/// Arm `reg`'s current interest set. Adds the descriptor on first use and
+/// modifies it thereafter; `EPOLLONESHOT` means every delivery must be followed
+/// by another arm before more events arrive.
+![target(unix)]
+private function rt_arm(rt: Reactor*, reg: Registration*) -> boolean {
+    mut events: u32 = libc::EPOLLONESHOT;
+    if ((reg.interest & INTEREST_READ) != 0u32) {
+        events = events | libc::EPOLLIN | libc::EPOLLRDHUP;
+    }
+    if ((reg.interest & INTEREST_WRITE) != 0u32) {
+        events = events | libc::EPOLLOUT;
+    }
+    mut slot: u8[12] = [0; 12];
+    epoll_event_pack(&slot[0], events, reg.fd as u32);
+    mut op: EpollOp = libc::EpollOp::EPOLL_CTL_MOD;
+    if (!reg.backend_added) { op = libc::EpollOp::EPOLL_CTL_ADD; }
+    if (libc::epoll_ctl(rt.poll_h as i32, op, reg.fd, &slot[0]) != 0) {
+        return false;
+    }
+    reg.backend_added = true;
+    return true;
+}
+
+![target(unix)]
+private function rt_disarm(rt: Reactor*, reg: Registration*) -> void {
+    if (!reg.backend_added) { return; }
+    // Pre-2.6.9 kernels reject a null event on DEL; pass a scratch one.
+    mut slot: u8[12] = [0; 12];
+    libc::epoll_ctl(rt.poll_h as i32, libc::EpollOp::EPOLL_CTL_DEL, reg.fd, &slot[0]);
+    reg.backend_added = false;
+}
+
+/// Break the reactor out of its wait (for shutdown, or so a fresh registration
+/// takes effect promptly). Writing to the eventfd makes it readable, which the
+/// wait reports and `rt_wait` drains.
+![target(unix)]
+private function rt_kick(rt: Reactor*) -> void {
+    if (rt.kick_h < 0) { return; }
+    mut one: u64 = 1;
+    libc::write(rt.kick_h as i32, &one as u8*, 8);
+}
+
+/// Wait for readiness and translate what the OS reports into (descriptor,
+/// readiness-bits) pairs. Returns how many pairs were written; kick events are
+/// consumed here and never reported. A timeout, an interrupted call, or an
+/// error all report zero — the caller simply waits again.
+![target(unix)]
+private function rt_wait(rt: Reactor*, out_fds: i32*, out_ready: u32*,
+                         max: i32, timeout_ms: i32) -> i32 {
+    mut buf: u8[768] = [0; 768];   // RT_MAX_EVENTS * sizeof(struct epoll_event)
+    mut cap: i32 = max;
+    if (cap > RT_MAX_EVENTS) { cap = RT_MAX_EVENTS; }
+    const n: i32 = libc::epoll_wait(rt.poll_h as i32, &buf[0], cap, timeout_ms);
+    if (n <= 0) { return 0; }
+    mut out: i32 = 0;
+    for (mut i: i32 = 0; i < n; i = i + 1) {
+        const p: u8* = &buf[0] + ((i as i64) * 12);
+        const events: u32 = *(p as u32*);
+        const fd: i32 = *((p + 4) as u32*) as i32;
+        if (fd == rt.kick_h as i32) {
+            mut sink: u64 = 0;
+            libc::read(rt.kick_h as i32, &sink as u8*, 8);
+            continue;
+        }
+        // A hangup or error wakes BOTH directions: the future retries its
+        // syscall and reports the real error rather than parking again.
+        mut ready: u32 = 0u32;
+        const rd: u32 = libc::EPOLLIN | libc::EPOLLRDHUP | libc::EPOLLHUP | libc::EPOLLERR;
+        const wr: u32 = libc::EPOLLOUT | libc::EPOLLHUP | libc::EPOLLERR;
+        if ((events & rd) != 0u32) { ready = ready | INTEREST_READ; }
+        if ((events & wr) != 0u32) { ready = ready | INTEREST_WRITE; }
+        out_fds[out]   = fd;
+        out_ready[out] = ready;
+        out = out + 1;
+    }
+    return out;
+}
+
+
+// ---------------------------------------------------------------------------
+// Windows backend: IOCP + AFD polling.
+//
+// Windows has no readiness API, so readiness is built out of completion
+// machinery the way `wepoll` and `mio` do it. A helper handle is opened on the
+// `\Device\Afd` driver that sits under every Winsock socket and is associated
+// with an I/O completion port. Arming a descriptor issues `IOCTL_AFD_POLL`
+// against that helper, naming the socket and the events of interest; when one
+// of them occurs the IOCTL completes and its packet arrives on the port. That
+// is a readiness notification in everything but spelling.
+//
+// AFD polls are inherently one-shot — exactly the contract the shared interface
+// requires — so re-arming is simply issuing another one. Each in-flight poll
+// owns an `AfdOp` block, because the OS writes into its buffers after the
+// arming call returns; the block therefore cannot live in the registration (or
+// in a future), which may be freed while the poll is still in flight. The block
+// is freed when its completion arrives, and closing the helper handle at
+// teardown cancels every outstanding poll so that all of them do arrive.
+//
+// Extra completions are harmless: a poll for an interest that has since been
+// consumed dispatches to a descriptor whose direction is no longer armed, and
+// the shared core ignores it. That is the same spurious-wake tolerance the
+// Linux path relies on, which is why arming never has to cancel a previous poll.
+// ---------------------------------------------------------------------------
+
+/// One in-flight AFD poll. `ovl` must be the first field: the completion packet
+/// hands back a pointer to it, which is cast straight back to this block.
+///
+/// An `OVERLAPPED`'s first 16 bytes ARE an `IO_STATUS_BLOCK` (`Internal` /
+/// `InternalHigh` overlay `Status` / `Information`), so one buffer serves as
+/// both, matching how the NT call wants them passed.
+///
+/// The buffers are `u64` arrays, not `u8` arrays, so the block is 8-byte
+/// aligned: the NT layer rejects a misaligned `IO_STATUS_BLOCK`, and a struct of
+/// byte arrays would only be byte-aligned when it comes off the heap.
+![target(windows)]
+type struct AfdOp {
+    ovl:  u64[4];   // OVERLAPPED (32 bytes), doubling as the IO_STATUS_BLOCK
+    info: u64[4];   // AFD_POLL_INFO (32 bytes) carrying exactly one handle
+    fd:   i32;      // descriptor this poll was armed for
+}
+
+/// The op's OVERLAPPED / IO_STATUS_BLOCK bytes.
+![target(windows)]
+private function afd_ovl(op: AfdOp*) -> u8* { return &op.ovl[0] as u8*; }
+
+/// The op's AFD_POLL_INFO bytes.
+![target(windows)]
+private function afd_info(op: AfdOp*) -> u8* { return &op.info[0] as u8*; }
+
+/// Write the UTF-16 device path `\Device\Afd\Cryo` into `out` and return its
+/// length in characters. Written out character by character because Cryo string
+/// literals are UTF-8 and the NT object manager takes UTF-16.
+![target(windows)]
+private function afd_device_path(out: u16*) -> u32 {
+    const ascii: string = "\\Device\\Afd\\Cryo";
+    mut i: u32 = 0u32;
+    while (ascii[i as u64] != 0u8) {
+        out[i as i64] = ascii[i as u64] as u16;
+        i = i + 1u32;
+    }
+    return i;
+}
+
+/// The base socket underneath `fd`. A layered service provider can wrap a
+/// socket, and AFD has to be pointed at the real handle beneath. Falls back to
+/// the socket itself when the query is unsupported, which is the common case for
+/// a plain Winsock socket.
+![target(windows)]
+private function afd_base_socket(fd: i32) -> u64 {
+    mut base:  u64 = 0;
+    mut bytes: u32 = 0u32;
+    if (syscall::WSAIoctl(fd as u64, syscall::SIO_BASE_HANDLE, null, 0u32,
+                          &base as u8*, 8u32, &bytes, null, null) == 0) {
+        return base;
+    }
+    return fd as u64;
+}
+
+![target(windows)]
+private function rt_backend_open(rt: Reactor*) -> boolean {
+    // INVALID_HANDLE_VALUE with no existing port creates a fresh port. It must
+    // be the full-width all-ones pointer: a narrower -1 widens to a merely
+    // invalid handle, which the call rejects instead of treating as "create".
+    const invalid: u8* = syscall::INVALID_HANDLE_VALUE as u8*;
+    const iocp: u8* = syscall::CreateIoCompletionPort(invalid, null, 0, 0u32);
+    if (iocp == null) { return false; }
+
+    mut path: u16[64] = [0; 64];
+    const chars: u32 = afd_device_path(&path[0]);
+
+    // UNICODE_STRING { u16 Length; u16 MaximumLength; u8* Buffer } — Length is
+    // in BYTES, not characters.
+    mut uni_buf: u64[2] = [0; 2];
+    const uni: u8* = &uni_buf[0] as u8*;
+    *(uni as u16*)         = (chars * 2u32) as u16;
+    *((uni + 2) as u16*)   = (chars * 2u32) as u16;
+    *((uni + 8) as u64*)   = &path[0] as u64;
+
+    // OBJECT_ATTRIBUTES { u32 Length; u8* RootDirectory; u8* ObjectName;
+    //                     u32 Attributes; u8* SecurityDescriptor;
+    //                     u8* SecurityQualityOfService }
+    mut oa_buf: u64[6] = [0; 6];
+    const oa: u8* = &oa_buf[0] as u8*;
+    *(oa as u32*)         = syscall::SIZEOF_OBJECT_ATTRIBUTES as u32;
+    *((oa + 16) as u64*)  = uni as u64;
+
+    mut iosb_buf: u64[2] = [0; 2];
+    const iosb: u8* = &iosb_buf[0] as u8*;
+    mut afd:  u8*    = null;
+    const st: u32 = syscall::NtCreateFile(&afd, syscall::SYNCHRONIZE, oa, iosb,
+                                          null, 0u32, syscall::FILE_SHARE_RW,
+                                          syscall::FILE_OPEN, 0u32, null, 0u32);
+    if (st != syscall::STATUS_SUCCESS || afd == null) {
+        syscall::CloseHandle(iocp);
+        return false;
+    }
+    // Route the helper's completions to our port. The key is unused: each poll
+    // is identified by its own overlapped pointer.
+    if (syscall::CreateIoCompletionPort(afd, iocp, 0, 0u32) == null) {
+        syscall::CloseHandle(afd);
+        syscall::CloseHandle(iocp);
+        return false;
+    }
+    rt.poll_h = iocp as i64;
+    rt.aux_h  = afd  as i64;
+    rt.kick_h = -1;             // the kick is a posted completion, not a handle
+    return true;
+}
+
+/// Close the helper first: that cancels every in-flight poll, and each one then
+/// arrives on the port as a cancelled completion, so draining afterwards frees
+/// all their blocks. Closing in the other order would strand them.
+![target(windows)]
+private function rt_backend_close(rt: Reactor*) -> void {
+    if (rt.aux_h >= 0) {
+        syscall::CloseHandle(rt.aux_h as u8*);
+        rt.aux_h = -1;
+    }
+    if (rt.poll_h >= 0) {
+        const iocp: u8* = rt.poll_h as u8*;
+        mut entries: u8[1024] = [0; 1024];   // 32 * SIZEOF_OVERLAPPED_ENTRY
+        loop {
+            mut removed: u32 = 0u32;
+            if (syscall::GetQueuedCompletionStatusEx(iocp, &entries[0], 32u32,
+                                                     &removed, 0u32, 0) == 0) {
+                break;
+            }
+            if (removed == 0u32) { break; }
+            for (mut i: u32 = 0u32; i < removed; i = i + 1u32) {
+                const e:   u8* = &entries[0] + ((i as i64) * 32i64);
+                const ovl: u8* = *((e + 8) as u64*) as u8*;
+                if (ovl != null) { afd_op_free(ovl as AfdOp*); }
+            }
+        }
+        syscall::CloseHandle(iocp);
+        rt.poll_h = -1;
+    }
+}
+
+![target(windows)]
+private function afd_op_free(op: AfdOp*) -> void {
+    mut alloc: GlobalAlloc = GlobalAlloc::new();
+    alloc.deallocate(NonNull::new(op as u8*), Layout::of<AfdOp>());
+}
+
+/// Arm `reg` by issuing one AFD poll for its current interest. Any poll already
+/// in flight is left alone: it is one-shot and, once this newer one is armed,
+/// its completion is at worst a spurious wake the shared core drops.
+![target(windows)]
+private function rt_arm(rt: Reactor*, reg: Registration*) -> boolean {
+    if (rt.aux_h < 0) { return false; }
+    // AFD reports the failure and shutdown events regardless, so ask for them
+    // explicitly and map them onto whichever direction is waiting: a future woken
+    // by a hangup retries its syscall and reports the real error.
+    mut events: u32 = syscall::AFD_POLL_ABORT | syscall::AFD_POLL_LOCAL_CLOSE
+                    | syscall::AFD_POLL_CONNECT_FAIL;
+    if ((reg.interest & INTEREST_READ) != 0u32) {
+        events = events | syscall::AFD_POLL_RECEIVE | syscall::AFD_POLL_RECEIVE_EXPEDITED
+                        | syscall::AFD_POLL_ACCEPT  | syscall::AFD_POLL_DISCONNECT;
+    }
+    if ((reg.interest & INTEREST_WRITE) != 0u32) {
+        events = events | syscall::AFD_POLL_SEND;
+    }
+
+    mut alloc: GlobalAlloc = GlobalAlloc::new();
+    mut op: AfdOp* = null;
+    match (alloc.allocate(Layout::of<AfdOp>())) {
+        Result::Ok(raw) => { op = raw.cast<AfdOp>().as_ptr(); }
+        Result::Err(_)  => { return false; }
+    }
+    mem::zero<AfdOp>(op, 1);
+    op.fd = reg.fd;
+
+    // AFD_POLL_INFO { i64 Timeout; u32 NumberOfHandles; u32 Exclusive;
+    //                 { u8* Handle; u32 Events; i32 Status } Handles[1] }
+    // Timeout is INT64_MAX: the wait belongs to the completion port, not to AFD.
+    const info: u8* = afd_info(op);
+    *(info as i64*)         = 9223372036854775807i64;
+    *((info + 8) as u32*)   = 1u32;
+    *((info + 12) as u32*)  = 0u32;
+    *((info + 16) as u64*)  = afd_base_socket(reg.fd);
+    *((info + 24) as u32*)  = events;
+    *((info + 28) as i32*)  = 0;
+
+    // `ApcContext` is the op block, so the completion identifies this poll; the
+    // overlapped's first 16 bytes serve as the IO_STATUS_BLOCK.
+    const st: u32 = syscall::NtDeviceIoControlFile(rt.aux_h as u8*, null, null,
+                                                   op as u8*, afd_ovl(op),
+                                                   syscall::IOCTL_AFD_POLL,
+                                                   info, syscall::SIZEOF_AFD_POLL_INFO as u32,
+                                                   info, syscall::SIZEOF_AFD_POLL_INFO as u32);
+    // Pending is the normal case; immediate success still queues a completion,
+    // because the handle was not set to skip it. Anything else failed outright
+    // and will never complete, so the block is freed here.
+    if (st != syscall::STATUS_PENDING && st != syscall::STATUS_SUCCESS) {
+        afd_op_free(op);
+        return false;
+    }
+    reg.backend_added = true;
+    return true;
+}
+
+/// Nothing to undo: an in-flight AFD poll is one-shot and its completion is
+/// ignored once the registration is gone (the shared core dispatches by
+/// descriptor and drops events for anything not armed). Letting it complete
+/// naturally is what keeps its block's lifetime simple — a cancellation would
+/// have to be waited for anyway.
+![target(windows)]
+private function rt_disarm(rt: Reactor*, reg: Registration*) -> void {
+    reg.backend_added = false;
+}
+
+/// Wake the reactor by queueing a completion with no overlapped, which the wait
+/// loop recognizes and skips.
+![target(windows)]
+private function rt_kick(rt: Reactor*) -> void {
+    if (rt.poll_h < 0) { return; }
+    syscall::PostQueuedCompletionStatus(rt.poll_h as u8*, 0u32, syscall::IOCP_KICK_KEY, null);
+}
+
+![target(windows)]
+private function rt_wait(rt: Reactor*, out_fds: i32*, out_ready: u32*,
+                         max: i32, timeout_ms: i32) -> i32 {
+    if (rt.poll_h < 0) { return 0; }
+    mut entries: u8[2048] = [0; 2048];   // RT_MAX_EVENTS * SIZEOF_OVERLAPPED_ENTRY
+    mut cap: i32 = max;
+    if (cap > RT_MAX_EVENTS) { cap = RT_MAX_EVENTS; }
+    // A negative timeout means "wait indefinitely", which Win32 spells INFINITE.
+    mut ms: u32 = 0xFFFFFFFFu32;
+    if (timeout_ms >= 0) { ms = timeout_ms as u32; }
+    mut removed: u32 = 0u32;
+    if (syscall::GetQueuedCompletionStatusEx(rt.poll_h as u8*, &entries[0], cap as u32,
+                                             &removed, ms, 0) == 0) {
+        return 0;   // timed out, or the port reported an error: just wait again
+    }
+    mut out: i32 = 0;
+    for (mut i: u32 = 0u32; i < removed; i = i + 1u32) {
+        const e:   u8* = &entries[0] + ((i as i64) * 32i64);
+        const ovl: u8* = *((e + 8) as u64*) as u8*;
+        if (ovl == null) { continue; }        // the kick
+        mut op: AfdOp* = ovl as AfdOp*;
+        // NumberOfHandles is 0 when the poll was cancelled rather than satisfied
+        // (the socket closed, or teardown): report nothing for it.
+        const info: u8* = afd_info(op);
+        const nhandles: u32 = *((info + 8) as u32*);
+        if (nhandles != 0u32) {
+            const events: u32 = *((info + 24) as u32*);
+            const rd: u32 = syscall::AFD_POLL_RECEIVE | syscall::AFD_POLL_RECEIVE_EXPEDITED
+                          | syscall::AFD_POLL_ACCEPT  | syscall::AFD_POLL_DISCONNECT
+                          | syscall::AFD_POLL_ABORT   | syscall::AFD_POLL_LOCAL_CLOSE
+                          | syscall::AFD_POLL_CONNECT_FAIL;
+            const wr: u32 = syscall::AFD_POLL_SEND    | syscall::AFD_POLL_ABORT
+                          | syscall::AFD_POLL_LOCAL_CLOSE | syscall::AFD_POLL_CONNECT_FAIL;
+            mut ready: u32 = 0u32;
+            if ((events & rd) != 0u32) { ready = ready | INTEREST_READ; }
+            if ((events & wr) != 0u32) { ready = ready | INTEREST_WRITE; }
+            if (ready != 0u32 && out < cap) {
+                out_fds[out]   = op.fd;
+                out_ready[out] = ready;
+                out = out + 1;
+            }
+        }
+        afd_op_free(op);
+    }
+    return out;
+}

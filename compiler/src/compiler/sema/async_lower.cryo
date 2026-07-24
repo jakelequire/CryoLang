@@ -50,7 +50,8 @@ import std::fmt;
 type struct PollSm {
     // configuration (set by `lower`)
     struct_ref: TypeRef;
-    poll_out:   TypeRef;
+    poll_out:   TypeRef;              // `Poll<Output>` of THIS function
+    poll_base:  TypeRef;              // the `Poll<>` base, for `Poll<F_k::Output>`
     ctx_ptr_ty: TypeRef;
     state_sym:  SymbolStr;
     u32_ty:     TypeRef;
@@ -1009,11 +1010,19 @@ type struct AsyncLower {
         mut unwrap_call: ExpressionNode* = this.method_call0(take_call, "unwrap", fi, span);
         sm.blocks[resume].add_statement(this.var_decl_stmt(sub_sym, true, fi, unwrap_call, span));
 
+        // The sub-future's `poll` yields `Poll<F_k::Output>`, which is the type of
+        // the awaited expression — NOT this function's own `Poll<Output>`. They
+        // coincide only when a function awaits a future that produces exactly what
+        // the function returns; typing the temp with `sm.poll_out` would reject
+        // every other await with a mismatched-type error.
+        mut sub_poll_args: TypeRef[] = [ao];
+        const sub_poll_out: TypeRef =
+            this.ctx.generic_registry.instantiate(sm.poll_base, &sub_poll_args);
         const poll_sym: SymbolStr = this.intern.intern(format("__poll_%lld", k));
         mut poll_call: ExpressionNode* = this.method_call1(
             this.ident(sub_sym, fi, span), "poll",
-            this.ident(sm.cx_sym, sm.ctx_ptr_ty, span), sm.poll_out, span);
-        sm.blocks[resume].add_statement(this.var_decl_stmt(poll_sym, true, sm.poll_out, poll_call, span));
+            this.ident(sm.cx_sym, sm.ctx_ptr_ty, span), sub_poll_out, span);
+        sm.blocks[resume].add_statement(this.var_decl_stmt(poll_sym, true, sub_poll_out, poll_call, span));
 
         mut pend: BlockStmtNode* = new BlockStmtNode(span);
         pend.add_statement(this.assign_member_stmt(sm.struct_ref, fut_sym, fut_opt,
@@ -1022,12 +1031,12 @@ type struct AsyncLower {
             this.u32_lit(resume as u64, span), span));
         pend.add_statement(new ReturnStmtNode(this.poll_pending(sm.poll_out, span), span) as StatementNode*);
         sm.blocks[resume].add_statement(new IfStmtNode(
-            this.method_call0(this.ident(poll_sym, sm.poll_out, span), "is_pending", this.arena.get_bool(), span),
+            this.method_call0(this.ident(poll_sym, sub_poll_out, span), "is_pending", this.arena.get_bool(), span),
             pend as StatementNode*, null, span) as StatementNode*);
 
         const await_sym: SymbolStr = this.intern.intern(format("__await_%lld", k));
         sm.blocks[resume].add_statement(this.var_decl_stmt(await_sym, false, ao,
-            this.method_call0(this.ident(poll_sym, sm.poll_out, span), "into_ready", ao, span), span));
+            this.method_call0(this.ident(poll_sym, sub_poll_out, span), "into_ready", ao, span), span));
 
         this.rewrite_carrier_await(stmt, this.ident(await_sym, ao, span));
         this.rewrite_returns(stmt, sm.poll_out, span);
@@ -2098,7 +2107,8 @@ type struct AsyncLower {
         } else { 0i64 };
 
         mut sm: PollSm = PollSm {
-            struct_ref: struct_ref, poll_out: poll_out, ctx_ptr_ty: ctx_ptr_ty,
+            struct_ref: struct_ref, poll_out: poll_out, poll_base: poll_base,
+            ctx_ptr_ty: ctx_ptr_ty,
             state_sym: state_sym, u32_ty: u32_ty, cx_sym: this.intern.intern("cx"),
             opt_base: TypeRef::invalid(), span: span,
             blocks: [], ok: true,

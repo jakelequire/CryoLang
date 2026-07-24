@@ -2138,9 +2138,121 @@ const WSAETIMEDOUT:    i32 = 10060;
 const WSAECONNABORTED: i32 = 10053;
 ![target(windows)]
 const WSAENOTCONN:     i32 = 10057;
+// A non-blocking connect reports its progress through these: the first call
+// returns WSAEWOULDBLOCK, a repeat while still connecting returns WSAEALREADY,
+// and one after success returns WSAEISCONN.
+![target(windows)]
+const WSAEALREADY:     i32 = 10037;
+![target(windows)]
+const WSAEISCONN:      i32 = 10056;
 // FIONBIO for ioctlsocket (non-blocking toggle).
 ![target(windows)]
 const FIONBIO: i32 = -2147195266;   // 0x8004667E
+
+// ---------------------------------------------------------------------------
+// I/O completion ports + AFD polling: the Windows readiness backend.
+//
+// Windows has no epoll. What it has is IOCP (completion notification) and, under
+// Winsock, the `\Device\Afd` driver every socket is built on. Issuing the
+// undocumented `IOCTL_AFD_POLL` against an AFD handle asks "tell me when this
+// socket becomes readable/writable" and completes through an IOCP — readiness
+// notification built out of completion machinery. It is what `wepoll` and Rust's
+// `mio` do, and it is the only way to get true epoll-equivalent readiness for
+// sockets on Windows.
+//
+// The NT-level entry points are undocumented but stable since Windows Vista.
+// Structures are handled as byte buffers with explicit offsets, the same way
+// this library treats `sockaddr` — Cryo does not model C struct layout, and
+// these have strict ABI offsets.
+// ---------------------------------------------------------------------------
+
+// IOCTL_AFD_POLL, and the poll event bits AFD reports.
+![target(windows)]
+const IOCTL_AFD_POLL: u32 = 0x00012024;
+
+![target(windows)]
+const AFD_POLL_RECEIVE:           u32 = 0x0001;
+![target(windows)]
+const AFD_POLL_RECEIVE_EXPEDITED: u32 = 0x0002;
+![target(windows)]
+const AFD_POLL_SEND:              u32 = 0x0004;
+![target(windows)]
+const AFD_POLL_DISCONNECT:        u32 = 0x0008;
+![target(windows)]
+const AFD_POLL_ABORT:             u32 = 0x0010;
+![target(windows)]
+const AFD_POLL_LOCAL_CLOSE:       u32 = 0x0020;
+![target(windows)]
+const AFD_POLL_ACCEPT:            u32 = 0x0080;
+![target(windows)]
+const AFD_POLL_CONNECT_FAIL:      u32 = 0x0100;
+
+// Byte sizes of the NT structures the reactor builds by hand (x86_64).
+![target(windows)]
+const SIZEOF_IO_STATUS_BLOCK:   u64 = 16;   // Status/Pointer union + Information
+![target(windows)]
+const SIZEOF_OVERLAPPED:        u64 = 32;   // Internal, InternalHigh, Pointer, hEvent
+![target(windows)]
+const SIZEOF_AFD_POLL_INFO:     u64 = 32;   // Timeout, NumberOfHandles, Exclusive, 1 handle
+![target(windows)]
+const SIZEOF_OBJECT_ATTRIBUTES: u64 = 48;
+![target(windows)]
+const SIZEOF_UNICODE_STRING:    u64 = 16;
+![target(windows)]
+const SIZEOF_OVERLAPPED_ENTRY:  u64 = 32;   // key, overlapped, internal, bytes
+
+// NtCreateFile arguments for opening the AFD device. `STATUS_SUCCESS` /
+// `STATUS_PENDING` are declared with the rest of the NT status codes above.
+![target(windows)]
+const SYNCHRONIZE:      u32 = 0x00100000;
+![target(windows)]
+const FILE_SHARE_RW:    u32 = 3;            // FILE_SHARE_READ | FILE_SHARE_WRITE
+![target(windows)]
+const FILE_OPEN:        u32 = 1;
+
+// Ask Winsock for the base handle underneath a socket: layered service
+// providers can wrap a socket, and AFD must be pointed at the real one.
+![target(windows)]
+const SIO_BASE_HANDLE:  u32 = 0x48000022;
+
+// Completion-port key reserved for the wake-up post, which carries no overlapped.
+![target(windows)]
+const IOCP_KICK_KEY:    u64 = 1;
+
+![target(windows)]
+![link("kernel32")]
+extern "C" {
+    /// Create a port, or associate `FileHandle` with an existing one. Creating
+    /// passes INVALID_HANDLE_VALUE and a null port.
+    function CreateIoCompletionPort(FileHandle: u8*, ExistingCompletionPort: u8*,
+                                    CompletionKey: u64,
+                                    NumberOfConcurrentThreads: u32) -> u8*;
+    /// Drain up to `ulCount` completions in one call.
+    function GetQueuedCompletionStatusEx(CompletionPort: u8*,
+                                         lpCompletionPortEntries: u8*,
+                                         ulCount: u32, ulNumEntriesRemoved: u32*,
+                                         dwMilliseconds: u32, fAlertable: i32) -> i32;
+    /// Queue a synthetic completion — the reactor's wake-up mechanism.
+    function PostQueuedCompletionStatus(CompletionPort: u8*,
+                                        dwNumberOfBytesTransferred: u32,
+                                        dwCompletionKey: u64, lpOverlapped: u8*) -> i32;
+}
+
+// `NtCreateFile` (which opens `\Device\Afd` — an NT path CreateFile cannot
+// reach) and `NtDeviceIoControlFile` (which issues the poll IOCTL) are declared
+// with the rest of the NT layer above. With a null Event on an IOCP-associated
+// handle, the IOCTL's `ApcContext` becomes the completion's `lpOverlapped`,
+// which is how the reactor recognizes which poll finished.
+
+![target(windows)]
+![link("ws2_32")]
+extern "C" {
+    function WSAIoctl(s: u64, dwIoControlCode: u32,
+                      lpvInBuffer: u8*, cbInBuffer: u32,
+                      lpvOutBuffer: u8*, cbOutBuffer: u32,
+                      lpcbBytesReturned: u32*, lpOverlapped: u8*,
+                      lpCompletionRoutine: u8*) -> i32;
+}
 
 ![target(windows)]
 ![link("ws2_32")]
