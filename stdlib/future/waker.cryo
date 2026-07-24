@@ -4,22 +4,59 @@ namespace std::future::waker;
 
 /// A handle a stalled future stores so it can be re-scheduled: `wake_fn(data)`
 /// tells the executor "poll my task again". This is the manual-vtable shape used
-/// throughout the runtime (a non-capturing function pointer plus an opaque data
-/// pointer) — it carries no ownership and is freely copyable. The executor sets
-/// `data` to whatever it needs to identify the task; `block_on` uses a no-op.
+/// throughout the runtime — non-capturing function pointers plus an opaque data
+/// pointer identifying the task.
+///
+/// The three fn-pointers mirror Rust's `RawWakerVTable`: `wake_fn` reschedules,
+/// `clone_fn` duplicates the `data` handle, `drop_fn` releases it. Today's
+/// wakers are **non-owning and freely copyable** — `data` points at a task the
+/// executor keeps alive for the whole window a waker could fire (Phase-3 wakers
+/// only fire synchronously from inside a `poll`, so no waker outlives its task),
+/// so `clone_fn` is identity and `drop_fn` is a no-op, which is the *correct*
+/// semantics for a non-owning `Copy` waker rather than a stub. When the reactor
+/// (Phase 4) stores a waker in an epoll registration it will outlive the poll;
+/// at that point `clone_fn`/`drop_fn` gain real bodies (bump/drop a task
+/// refcount) and a `Drop` impl is added — the field layout reserved here stays
+/// fixed, so that change does not ripple through `Context`, `block_on`, or the
+/// executor.
+///
+/// The vtable is inlined (three fn-ptr fields) rather than a pointer to a
+/// `static` vtable object: Cryo ignores non-zero global initializers, so a
+/// `static` vtable const of function pointers would not initialize correctly.
 type struct Waker {
-    wake_fn: (u8*) -> void;
-    data:    u8*;
+    wake_fn:  (u8*) -> void;
+    clone_fn: (u8*) -> u8*;
+    drop_fn:  (u8*) -> void;
+    data:     u8*;
 
     /// A waker that does nothing when woken. Used by drivers (like `block_on`)
     /// that re-poll unconditionally and never park a task.
     static noop() -> Waker {
-        return Waker { wake_fn: waker_noop, data: null };
+        return Waker { wake_fn:  waker_noop_wake,
+                       clone_fn: waker_noop_clone,
+                       drop_fn:  waker_noop_drop,
+                       data:     null };
     }
 
-    /// Build a waker from a callback and its context pointer.
-    static new(wake_fn: (u8*) -> void, data: u8*) -> Waker {
-        return Waker { wake_fn: wake_fn, data: data };
+    /// Build a waker from its vtable and context pointer. `wake_fn` reschedules
+    /// the task named by `data`; `clone_fn` duplicates the `data` handle;
+    /// `drop_fn` releases it.
+    static new(wake_fn:  (u8*) -> void,
+               clone_fn: (u8*) -> u8*,
+               drop_fn:  (u8*) -> void,
+               data:     u8*) -> Waker {
+        return Waker { wake_fn: wake_fn, clone_fn: clone_fn, drop_fn: drop_fn, data: data };
+    }
+
+    /// Build a non-owning waker: `data` is a borrowed pointer the executor keeps
+    /// alive for the whole window this waker could fire, so cloning is a plain
+    /// copy and dropping is a no-op. The common Phase-3 constructor (Phase-4
+    /// owned wakers use `new` with real `clone_fn`/`drop_fn`).
+    static new_nonowning(wake_fn: (u8*) -> void, data: u8*) -> Waker {
+        return Waker { wake_fn:  wake_fn,
+                       clone_fn: waker_noop_clone,
+                       drop_fn:  waker_noop_drop,
+                       data:     data };
     }
 
     /// Request that the associated task be polled again.
@@ -27,9 +64,31 @@ type struct Waker {
         const f: (u8*) -> void = this.wake_fn;
         f(this.data);
     }
+
+    /// Wake without consuming the waker. Identical to `wake` for a non-owning
+    /// waker; the distinction (avoiding an owned-waker drop) matters once
+    /// wakers become refcounted in Phase 4. Present now to fix the call sites.
+    wake_by_ref(&this) -> void {
+        const f: (u8*) -> void = this.wake_fn;
+        f(this.data);
+    }
+
+    /// Duplicate this waker. `clone_fn` produces the `data` handle for the copy
+    /// (identity today; a refcount bump once wakers are owned). Use this rather
+    /// than an implicit copy wherever a waker is stored, so Phase 4's move to a
+    /// refcounted, non-`Copy` waker needs no change at the call site.
+    clone(&this) -> Waker {
+        const c: (u8*) -> u8* = this.clone_fn;
+        return Waker { wake_fn:  this.wake_fn,
+                       clone_fn: this.clone_fn,
+                       drop_fn:  this.drop_fn,
+                       data:     c(this.data) };
+    }
 }
 
-private function waker_noop(data: u8*) -> void { }
+private function waker_noop_wake(data: u8*) -> void { }
+private function waker_noop_clone(data: u8*) -> u8* { return data; }
+private function waker_noop_drop(data: u8*) -> void { }
 
 /// The context threaded through a `poll` call. Holds the `Waker` a future
 /// registers when it returns `Pending`. Passed by pointer down the poll tree,

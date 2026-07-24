@@ -36,7 +36,7 @@ not for routine judgement calls.
 | 0 | Design lock-down (surface, trait shapes, lowering placement) — get Jake's sign-off | ✅ done — locked 2026-07-22 (§7 filled) |
 | 1 | Core types in stdlib (`Poll`/`Future`/`Context`/`Waker`) + `block_on` + hand-written futures | ✅ done+validated 2026-07-22 (no repin) |
 | 2 | Compiler: `async fn` parse + state-machine lowering + `await` desugar | ✅ DONE+validated (2026-07-23) — parse + no-await (1b) + single await (2) + N straight-line (3) + awaits across `if`/`else` (4a) + awaits across `while`/`for`/`loop`/`do-while` + `break`/`continue` + `mut` loop-carried promotion (4b) + scope-aware alpha-rename, all committed through `5e28a74f`. **Inc 4c DONE (2026-07-23): `await` inside a `match` arm — dispatch `match(subj)` → per-arm entry states → join; scalar pattern bindings captured to fields (aggregate→E0600, ref→E0455); pattern bindings alpha-renamed for by-name soundness; non-exhaustive match gets synth `_ => join`. Plus the bare-block-with-await warm-up. Both-OS fixed point, `win-s2`/`win-s3` = 0/235 `.ll` → NO REPIN, UNCOMMITTED.** All common control flow now lowers → Phase 2 complete. |
-| 3 | Executor + `Waker` + `spawn`/`JoinHandle`; multi-thread; poll-boundary `catch_unwind` isolation | ☐ not started |
+| 3 | Executor + `Waker` + `spawn`/`JoinHandle`; multi-thread; poll-boundary `catch_unwind` isolation | ◐ in progress — surface LOCKED 2026-07-23. **(a) single-thread executor + ready-queue + re-enqueueing Waker DONE+validated; (b) `spawn`/`JoinHandle` (Output via `TaskShared<O>`), `block_on`, `join`/`detach`/`abort`, drop=detach DONE+validated.** No repin (pure stdlib). NEXT: (c) multi-thread worker pool + per-task RUNNING state + `catch_unwind` poll-boundary isolation (validate under `--panic=unwind` in WSL). |
 | 4 | Reactor (epoll/IOCP) + async I/O over `std::net` + timers + `async fn main` + combinators | ☐ not started |
 
 Legend: ☐ not started · ◐ in progress · ✅ done+validated · ⏸ blocked (note why in the Progress Log).
@@ -996,3 +996,170 @@ IR should be unchanged — verify the `win-s2` vs `win-s3` `.ll` diff at each bo
   deferred with loud diagnostics, none blocking Phase 3): `await` nested in an expression (E0600), aggregate/
   reference locals **and** match bindings across a suspend (E0600/E0455), a `-> ()` async fn whose awaited body
   falls off its end (E0600), `await` in a `match`/loop-condition/guard (E0600).
+
+- _2026-07-23_ — **Phase 3 STARTED — executor surface LOCKED by Jake (one-way door closed).** Baseline HEAD
+  `10414486` (Phase 2 / Inc 4c committed+repinned by Jake), pin verifies OK, tree clean. Brought Jake a
+  recon-grounded surface proposal (recon sweep: `stdlib/future/*`, `stdlib/thread/_module.cryo`,
+  `stdlib/sync/{atomic,mpsc,condvar,mutex}.cryo`, `stdlib/core/panic_unwind.cryo`). Two rounds of sign-off
+  (the second after Jake brought a design-review second opinion framed as "Rust's semantics, C#'s allocation
+  strategy"). **The seven locked decisions:**
+  1. **Module home → `stdlib/future/executor.cryo`** (`namespace std::future::executor`; `public module
+     future::executor;` in `future/_module.cryo`). One `std::future` import surface, cohesive with
+     Poll/Future/Waker. (`stdlib/async/` is impossible — `async` lexes as `KwAsync`, can't be a namespace
+     segment; this is why Phase 1 used `future`.)
+  2. **Executor surface → explicit `Executor` handle; `spawn` is a METHOD; free `block_on` stays.** No implicit
+     global runtime for v1 (§7-5) ⇒ `spawn` can't be an ambient free-fn (nothing to find) ⇒ it's
+     `exec.spawn(fut)`. `exec.block_on(root)` drives root + spawned tasks; free `future::block_on(fut)` remains
+     the trivial single-future driver (stack slot, no heap). The explicit handle is ALSO the allocation hook:
+     `spawn` boxes into executor-owned storage → `Executor<A: Allocator = GlobalAlloc>` is a natural extension
+     (mirror `Mutex<T,A>`) — carry an allocator field from day one. This is the "C# allocation" boundary:
+     `block_on` = stack, `spawn` = box.
+  3. **`JoinHandle` drop = detach** (mirror `thread::JoinHandle` — reuse the `Shared<T>` + `Atomic<u8>`
+     LIVE/DONE/DETACHED 2-actor handshake verbatim). **REFINEMENT (design review): add `JoinHandle::abort()`**
+     — detach-only leaves a spawned task uncancellable. `abort()` sets a CANCELLED state; the worker drops the
+     boxed future before its next poll (sound TODAY: promoted locals are scalar-Copy-only, so no aggregate
+     drops; the only owned fields are `Option<sub-future>`s, which drop correctly via field glue). ⇒ **`join`
+     becomes `join(mut this) -> Result<T, JoinError>`** with `JoinError { Cancelled; Panicked(PanicInfo); }`
+     (tokio shape; `Panicked` only occurs under `--panic=unwind` — under abort a task panic aborts the process).
+     Note: `select`/`timeout` (Phase 4) cancel by DROPPING an un-spawned future one level down (a normal Cryo
+     drop), NOT via `abort` — `abort` is specifically stopping an already-*spawned* task from outside.
+  4. **Waker wakeup model → synchronous self-wake + re-enqueue.** `Waker.wake(data)` re-enqueues the task;
+     validation futures call `cx.waker.wake()` before returning `Pending`. **REFINEMENT (design review): reserve
+     the Rust `RawWakerVTable` shape NOW** even though Phase 3 won't exercise it — expand `Waker` to
+     `{ wake_fn: (u8*)->void; clone_fn: (u8*)->u8*; drop_fn: (u8*)->void; data: u8* }` with **noop clone/drop**
+     (the *correct* semantics for a non-owning Copy waker, not a stub), inline fn-ptrs (NOT a `static` vtable —
+     the "non-zero global inits ignored" gotcha makes a static-vtable-const a landmine). Keeps `Waker` POD/Copy
+     in Phase 3; provide `wake`/`wake_by_ref`/`clone` methods and use `clone()` at duplication sites so Phase 4
+     only fills in the fn-ptr bodies + adds a `Drop` impl (flipping Copy→non-Copy) — no field-layout change mid
+     epoll-bring-up. **Design-review correction (durable): "detach forces task refcounting in Phase 3" is
+     FALSE** — `thread::spawn` detaches with a 2-state swap, no refcount; Phase-3 self-wake-only wakers never
+     escape a `poll`, so no waker outlives a task. What Phase-3 *multi-thread* genuinely needs is a per-task
+     **atomic state machine** (IDLE/SCHEDULED/RUNNING/NOTIFIED) to stop two workers polling the same task after
+     a mid-poll self-wake — that lives on the task control block and does NOT touch the Waker shape. The
+     waker-held **refcount** (clone bumps / drop decrements) is exercised only when a waker is STORED beyond a
+     poll = the Phase-4 reactor.
+  5. **`poll` stays a public trait method — and that is SOUND for Cryo** (design-review correction, durable).
+     Rust gates `poll` behind `Pin<&mut Self>` because Rust futures ARE self-referential (borrows across
+     `await` are allowed). Cryo BANNED borrows across `await` (§4, enforced in `move_check`) ⇒ futures have no
+     self-references ⇒ unconditionally movable ⇒ the no-Pin soundness rests on the *move-checker ban*, NOT on
+     hiding `poll`. A user calling `fut.poll(&cx)` directly and moving the future between calls is sound; even
+     polling an aliased copy is memory-safe (panics on double-`take()`, not UB). `poll` is inherently public
+     anyway (trait method; hand-written futures impl it; the executor calls it cross-module).
+  6. **Async I/O → owned-handle style for v1** (design-review confirmation of §4). The idiomatic Rust
+     `stream.read(&self).await; use(stream)` IS a self-referential future (stored read-future field points at
+     the `stream` field) → E0455 under the ban. §4 already priced this in ("owned-value rewrites exist"): async
+     I/O uses `const (stream, n) = stream.read(buf).await;` (the read future OWNS the stream, hands it back) or
+     an `Arc<Resource>` clone — both sound + movable. Ban stays for v1; relax (real Pin/lifetimes) post-v1. Not
+     a Phase-3 concern (the executor hardens nothing either way), but consciously accepted now rather than
+     discovered at the first `TcpStream` adapter.
+  7. **Type erasure (locked mechanism)** — heterogeneous futures share one ready-queue via the `Waker`/
+     `catch_unwind`/`thread::spawn` vtable trick: heap-box the concrete `F`, plus a monomorphized poll thunk
+     `task_poll<F,O>(fut: u8*, shared: u8*, cx: Context*) -> u8` (0=Pending/1=Ready; stores `v` into the
+     type-erased `Shared<O>` via raw `O*`, same no-drop-synth idiom as `thread_body`), addressable via the
+     generic-function-reference mechanism (proven by `thread_trampoline<C,T>`). `JoinHandle<O>` wraps the
+     `Shared<O>`.
+  **Build plan (each: build → validate under `block_on`/inline driver → `make stdlib` green + `verify-pin` OK
+  → NO repin — Phase 3 is PURE STDLIB, touches no compiler source, so selfhost IR is definitionally unchanged;
+  a full `selfhost-check` is unnecessary unless compiler source is touched):**
+  - **(a)** single-thread `Executor` core: mutex-guarded ready-queue + type-erased `Task` + the re-enqueueing
+    `Waker` (expanded shape) + `block_on(root)`/`run()` draining on the calling thread. Validate self-waking
+    futures complete (observe via atomic counter).
+  - **(b)** `spawn<F>(fut) -> JoinHandle<F::Output>` via the `Shared<O>` handshake + type-erasure thunk;
+    `join -> Result<T, JoinError>`; `detach`; `abort`; drop=detach. Validate single-thread spawn/join outputs.
+  - **(c)** N `pthread` workers (mirror `thread::spawn`) + per-task atomic state machine (no concurrent poll) +
+    `catch_unwind` at the poll boundary → task isolation. Validate under `--panic=unwind` in WSL: a panicking
+    task yields `Err(Panicked)`, siblings survive.
+  NEXT: build stage (a). Start with the expanded `Waker` (grep `Waker {`/`Waker::` callers first), then the
+  `Executor`/`Task`/ready-queue in a new `stdlib/future/executor.cryo`.
+
+- _2026-07-23_ — **Phase 3 stage (a) DONE + validated. Pure stdlib, NO repin. UNCOMMITTED.** Baseline HEAD
+  `10414486`, pin verifies OK. Two files: `stdlib/future/waker.cryo` (expanded Waker) + NEW
+  `stdlib/future/executor.cryo`; `future/_module.cryo` registers the new module (148 stdlib modules).
+  - **Waker expanded to the reserved Rust-vtable shape** (decision 4): `{ wake_fn: (u8*)->void; clone_fn:
+    (u8*)->u8*; drop_fn: (u8*)->void; data: u8* }`, still POD/Copy, with `wake`/`wake_by_ref`/`clone` methods,
+    `noop()` (all-noop), `new(4 args)`, and **`new_nonowning(wake_fn, data)`** (fills identity clone + noop drop
+    — the Phase-3 executor constructor; encapsulates the private `waker_noop_clone`/`waker_noop_drop`). Blast
+    radius was tiny (only `block_on`'s `Waker::noop()` + the ctors themselves construct a Waker; sample futures
+    only receive `Context*`). `make stdlib` green in isolation before layering the executor.
+  - **`stdlib/future/executor.cryo` (the single-thread core):** `Task` (type-erased: `poll_fn (u8*,Context*)->u8`
+    [1=Ready/0=Pending] + `drop_fn (u8*)->void` + `fut: u8*` box + `next`/`exec`/`queued` queue linkage);
+    `ExecInner` (singly-linked FIFO `head`/`tail`); free fns `exec_enqueue` (with a `queued` guard so a self-wake
+    during a poll can't double-link) / `exec_dequeue`; `task_wake(data)` (data=Task*, re-enqueues via `exec`);
+    monomorphized `task_poll_thunk<F,O> where F: Future<O>` + `task_drop_thunk<F>` + `spawn_task<F,O>` (boxes the
+    future via `*fbox = fut` raw-write [no drop-synth, thread_body idiom], takes the generic-fn refs — proven
+    addressable-generic-fn shape); `Executor { inner }` with `new`/`spawn_detached<F,O>`/`run` + a `Drop` that
+    reclaims still-queued tasks.
+  - **`run()` ownership fix (real-solution, not a leak):** a task that returns `Pending` and **did not** arrange
+    a wake (its `queued` flag is still false after poll) is **unreschedulable** in this stage (no reactor, no
+    stored waker) → reclaimed immediately (its future's drop runs) rather than dequeued-then-leaked. The `!task.
+    queued` check is exactly where Phase 4's stored-waker/refcount ownership will move. A self-woke task
+    (`queued==true`) is owned by the queue and re-polled.
+  - **Validation (`scratchpad/async_exec_a`, built with pinned `bin/cryo.exe` + `CRYO_STDLIB`):** one `Executor`
+    + `run()` drives three **distinct** future structs in one type-erased queue → EXIT 0: `WakeCounter`
+    (self-wakes N times then adds to a shared `Atomic<i64>`; 0/3/7 pends → 1+20+300), `Immediate` (different
+    type, first-poll Ready → +1000), `Parked` (Pending-forever-no-wake, with a `Drop` that bumps a drop-counter).
+    Asserts `counter==1321 && parked_drops==1` — proving self-wake→re-enqueue→re-poll, heterogeneous-type erasure,
+    round-robin draining, AND reclaim-runs-drop for the unreschedulable task. `make stdlib` green (148 modules),
+    `verify-pin` OK. Pure stdlib (no compiler source touched) ⇒ selfhost IR definitionally unchanged ⇒ **NO
+    REPIN** (no selfhost-check needed).
+  - **Durable notes:** (1) `(*fut).poll(cx)` (method call on a deref'd raw pointer) type-checks — same shape as
+    `thread_body`'s `(*shared).state.swap(...)`. (2) A generic **method** (`Executor::spawn_detached<F,O>`)
+    delegating to a generic **free fn** (`spawn_task<F,O>`) that holds the generic-fn reference works — no
+    method-generic-fn-ref pitfall hit. (3) The probe's u32 arithmetic uses explicit `0u32`/`1u32` suffixes
+    (mirroring `ready.cryo`) to dodge literal-inference round-trips; committed stdlib code stays bare per
+    [[avoid-suffixed-numeric-literals]] where inference allows.
+  NEXT: **stage (b)** — `spawn<F,O>(fut) -> JoinHandle<O>` returning the future's Output via a `TaskShared<O>`
+  control block (non-generic `TaskCtl` header at offset 0 so the type-erased executor reads state/cancel without
+  knowing O); `Executor::block_on<F,O>(root) -> Result<O, JoinError>` (single-thread: pump the queue on the
+  calling thread until root's outcome is set); `JoinHandle` `join`/`detach`/`abort`/`is_finished`, drop=detach,
+  with `JoinError { Cancelled; Panicked(PanicInfo); }`. Single-thread `join`/`block_on` **pump** the queue
+  (there are no workers yet); stage (c) replaces the pump with a condvar wait + a per-task RUNNING state + the
+  `catch_unwind` poll boundary.
+
+- _2026-07-23_ — **Phase 3 stage (b) DONE + validated. Pure stdlib, NO repin. UNCOMMITTED.** Baseline HEAD
+  `10414486`, pin verifies OK. `stdlib/future/executor.cryo` rewritten (+~200 lines) to return the future's
+  Output via a control block; `waker.cryo` unchanged from stage (a). `make stdlib` green (148 modules),
+  `verify-pin` OK.
+  - **Control block:** `TaskShared<O> { ctl: TaskCtl; result: O }` where **`TaskCtl` (non-generic: 3×`Atomic<u8>`
+    — `outcome`/`hs`/`cancel`) sits at offset 0**, so the type-erased executor reads/writes state through a
+    `task.shared as TaskCtl*` without knowing `O`. `Task` gained `dispose_fn: (u8*, u8)->void` (the one
+    shared-block op the erased side can't do without `O`: optionally drop the stored `result`, then free the
+    `TaskShared<O>` — monomorphized `dispose_shared_thunk<O>`), and `shared: u8*`. `poll_fn` is now
+    `(fut, shared, cx)->u8`: on Ready it stores `v` into `(*sh).result` through a raw `O*` (thread_body
+    no-drop-synth idiom).
+  - **Two-actor handshake (mirror `thread::spawn`)** on `ctl.hs`: `HS_LIVE`→`HS_TASK_FIN` (task finishes) /
+    `HS_HANDLE_GONE` (handle detaches/drops). Whoever swaps in last frees `TaskShared`. `ctl.outcome`
+    (`PENDING`/`READY`/`CANCELLED`) is published by `finish_task` before its `hs.swap`; a joining handle reads
+    it to build `Result<O, JoinError{Cancelled; Panicked(PanicInfo)}>`. `ctl.cancel` is the handle→executor
+    abort request; `drive_task` checks it BEFORE polling (so `abort` stops even a forever-self-waking task
+    without polling it). A `Pending`-no-reschedule task → `finish_task(CANCELLED)` (unreschedulable — same
+    reclaim rule as stage (a), now routed through the handshake).
+  - **Surface (locked decisions realized):** `Executor::spawn<F,O>(fut)->JoinHandle<O>`,
+    `spawn_detached<F,O>` (= spawn+detach sugar; kept so the stage-(a) probe still regresses),
+    `block_on<F,O>(root)->O` (spawns root, **pumps the queue on the calling thread** via `pump_until`, unwraps —
+    panics if the root was cancelled), `run()` (drive-to-empty). `JoinHandle<O>`: `join(mut this)->Result<O,
+    JoinError>` (single-thread: `pump_until` then move the result out + free the block — destructures `this` to
+    suppress its `Drop`, like `thread::JoinHandle::join`), `detach(mut this)`, `abort(&this)` (non-consuming),
+    `is_finished(&this)`, **drop=detach** (`detach_shared<O>` in `Drop`). `Executor::drop` reclaims still-queued
+    tasks as CANCELLED (runs the handshake → no leak).
+  - **Validation (`scratchpad/async_exec_b`):** four tests → EXIT 0 — (A) `block_on(Compute(3,42))==42` (+ a
+    second `block_on` to prove the first didn't corrupt the heap); (B) spawn two `Compute` + `join` each →
+    10/20; (C) `abort` a forever-self-waking task → `join` returns `Err(Cancelled)` (no infinite poll — cancel
+    checked pre-poll); (D) detach a task with an **owned Output** (`Tracked` with a `Drop`) → the result is
+    dropped **exactly once** by the dispose path (`drops==1`). Stage-(a) probe (`async_exec_a`,
+    `spawn_detached`) still EXIT 0 (regression).
+  - **Durable gotchas:** (1) **A zero-sized future can't be boxed** — `Layout::of<F>()` for a fieldless struct
+    has size 0 and `GlobalAlloc.allocate(0)` returns `Err` → "future allocation failed" panic (on Windows
+    `abort()` exits **code 3**, which looked like a probe-branch return — watch for that). REAL lowered async
+    futures always carry a `state: u32` field so they're never zero-sized; a hand-written fieldless future is
+    the only trigger. **TODO (robustness, deferred):** handle ZST futures in `spawn_on` (Rust uses
+    `NonNull::dangling()` for ZSTs; skip the box + the dealloc when size==0). (2) A generic **method**
+    delegating to a generic **free fn** that returns a generic struct (`Executor::spawn<F,O>` → `spawn_on<F,O>
+    -> JoinHandle<O>`) works. (3) Storing the Ready value `*rptr = v` where `v` is a by-value `match` binding
+    moves it (no double-drop) — same as `mpsc::send`'s `*slot = value`.
+  NEXT: **stage (c)** — multi-thread. N `pthread` workers (mirror `thread::spawn`) pulling from a **mutex+condvar
+  guarded** ready-queue; a **per-task atomic RUNNING/NOTIFIED state** so a mid-poll self-wake (or a cross-thread
+  wake) can't let two workers poll one task; `join`/`block_on` **block on a condvar** (workers drive) instead of
+  pumping; **`catch_unwind` at the poll boundary** (a `run_poll(ctx)` trampoline mirroring `run_catch_body`) so a
+  panicking task yields `Err(Panicked)` and siblings survive. Validate task isolation under `--panic=unwind` in
+  WSL (`bin/cryo` is the Linux ELF). Keep the `--panic=abort` path working (task panic aborts, per §7-6).
