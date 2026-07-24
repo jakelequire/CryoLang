@@ -1322,11 +1322,9 @@ IR should be unchanged — verify the `win-s2` vs `win-s3` `.ll` diff at each bo
     whole `Owner::try_new`-style family, not just async. **Gate:** `make selfhost-check` → exit 0, BOTH fixed
     points (Linux s3==s4; Windows s3==s4 byte-identical, 235 modules); **win-s2 vs win-s3 = 0/235 differing
     `.ll`** → the compiler produces identical IR for all existing code. Compiler source changed ⇒ **REPINNED both
-    OS** (`make pin`, `verify-pin` OK). NOTE for the record: the earlier turbofish `Arc<Task,GlobalAlloc>::try_new`
-    is a SEPARATE still-open gap (E0200 in a generic body — the static-on-generic-owner turbofish cluster from §1);
-    the fix here makes the NON-turbofish inference path work, which is all Cryo idiom needs. And a THIRD, unrelated
-    gap surfaced in bisection: `Arc::try_new(x)` with NO expected type doesn't infer owner `T` from the arg (E0200)
-    — also left open (async always has an expected type).
+    OS** (`make pin`, `verify-pin` OK). This same default-backfill ALSO fixed the "no expected type" bisection case
+    (`Arc::try_new(x)` inferring owner `T` from a concrete arg then backfilling `A`) — confirmed post-commit. The
+    turbofish variant was fixed in the follow-up below.
   - **The 4a stdlib rewrite (Arc<Task> lifetime).** `arc.cryo`: `into_raw`/`from_raw`/`increment_strong_count`/
     `decrement_strong_count` (standard raw-Arc API; the manual-vtable waker needs to bump/drop the count from a
     `void*`). `waker.cryo`: `Waker` gains a `Drop` (runs `drop_fn(data)`) → **Copy→non-Copy**; `Context::waker()`
@@ -1366,3 +1364,29 @@ IR should be unchanged — verify the `win-s2` vs `win-s3` `.ll` diff at each bo
   recommendation BEFORE coding. Also: write the IOCP bindings (`CreateIoCompletionPort`/
   `GetQueuedCompletionStatus`/`WSARecv`/`WSASend`, absent today) and the per-Executor `![thread_local]`
   current-reactor handle (first stdlib use of the directive). `set_nonblocking` (fcntl/ioctlsocket) for 4c.
+
+- _2026-07-24_ — **Compiler follow-up: the two remaining owner-generic-static gaps CLOSED (Jake asked for the
+  root fixes before dispatching the Inc-4b agent). REPINNED both OS. UNCOMMITTED.** Baseline HEAD `3e62234e`
+  (Inc 4a committed by Jake). Re-characterized the "two open gaps" the 4a entry flagged, with the committed
+  compiler:
+  - **Gap A (owner `T` from a concrete arg, NO expected type) — already fixed by 4a.** `match (Arc::try_new(Thing
+    {…}))` with no annotation now compiles+runs (the default-backfill's prefix source binds `T` from the arg, then
+    backfills `A`). No new work; confirmed by probe.
+  - **Gap B (turbofish `Owner<Args>::static` with a NESTED-owner return) — FIXED here.** `Arc<Thing,
+    GlobalAlloc>::try_new(…)` typed as **`Result<Thing, GlobalAlloc>`** (E0200) instead of `Result<Arc<Thing,
+    GlobalAlloc>, AllocError>`. Root cause in `sema/call_resolver.cryo::try_resolve_generic_return`: the turbofish
+    branch did `generic_registry.instantiate(ret_inst.generic_base, turbofish_args)` — i.e. it substituted the
+    OWNER's turbofish args POSITIONALLY into the return's OUTERMOST generic. Valid ONLY when the return IS the
+    owner (`new() -> Arc<T, A>`); for a nested owner (`try_new() -> Result<Arc<T,GlobalAlloc>, E>`) it landed the
+    owner args on `Result`. It fired only because the arg counts coincidentally matched (2 owner args vs 2 outer
+    return args). **Fix:** map the turbofish args to the OWNER template's generic params
+    (`resolve_scope_owner_template` + `expand_default_type_args` for a partial turbofish) and
+    `TypeSubstitution::apply` them throughout the return — correct for BOTH return-is-owner and nested-owner, and
+    identical to the old behavior for the return-is-owner case. Guarded by
+    `generic_static_owner_binding.cryo::turbofish_binds_nested_owner_return` (+ the 4a
+    `nested_default_owner_param_binds`). **Gate:** `make selfhost-check` → exit 0, BOTH fixed points (Windows
+    s3==s4 byte-identical, 235 modules); **win-s2 vs win-s3 = 0/235 differing `.ll`** → inert for existing code;
+    `make test` → OVERALL PASS. Compiler source changed ⇒ **REPINNED both OS** (`bin/cryo` `3c28aa32…`,
+    `bin/cryo.exe` `fe981b8e…`), `verify-pin` OK. **Owner-generic static calls now resolve across all four shapes
+    (inference-from-args, no-expected-type, turbofish, nested-owner-return) — the Inc-4b agent needn't worry about
+    them.** UNCOMMITTED (only Jake commits). A fresh `HANDOFF.md` for Inc 4b is written.
