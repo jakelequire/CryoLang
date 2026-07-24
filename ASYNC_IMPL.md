@@ -35,7 +35,7 @@ not for routine judgement calls.
 |---|---|---|
 | 0 | Design lock-down (surface, trait shapes, lowering placement) — get Jake's sign-off | ✅ done — locked 2026-07-22 (§7 filled) |
 | 1 | Core types in stdlib (`Poll`/`Future`/`Context`/`Waker`) + `block_on` + hand-written futures | ✅ done+validated 2026-07-22 (no repin) |
-| 2 | Compiler: `async fn` parse + state-machine lowering + `await` desugar | ◐ in progress — parse + no-await (1b) + single await (2) + N straight-line awaits + promotion (3) done; **Inc 4a DONE+validated (2026-07-23): the whole lowering re-architected onto a `loop { match (this.state) {…} }` dispatcher (Jake's `match`, not switch); recursive state-machine builder handles awaits across `if`/`else` (branches, else-if, no-else, pre-branch local promotion). Both-OS fixed point, `win-s2`/`win-s3` = 0 `.ll` → NO REPIN, UNCOMMITTED.** Next = **Inc 4b (loops — back-edges + `break`/`continue` + `mut` loop-carried promotion)**; loops still E0600. [4c match-arm await deferred]. |
+| 2 | Compiler: `async fn` parse + state-machine lowering + `await` desugar | ◐ nearly done — parse + no-await (1b) + single await (2) + N straight-line (3) + awaits across `if`/`else` (4a, committed) done; **Inc 4b DONE+validated (2026-07-23): awaits across `while`/`for`/`loop`/`do-while` (header/body/[update]/after states + back-edges), `break`/`continue` → state edges (loop-target stack on `PollSm`), and `mut` loop-carried promotion (in-place `ident→this.field` rewrite; scalar-Copy only, else E0600/E0455). Both-OS fixed point (Linux+Windows s3==s4), `win-s2`/`win-s3` = 0/235 `.ll` → NO REPIN, UNCOMMITTED.** Only **Inc 4c (`await` inside a `match` arm)** remains; all common control flow now lowers. |
 | 3 | Executor + `Waker` + `spawn`/`JoinHandle`; multi-thread; poll-boundary `catch_unwind` isolation | ☐ not started |
 | 4 | Reactor (epoll/IOCP) + async I/O over `std::net` + timers + `async fn main` + combinators | ☐ not started |
 
@@ -827,3 +827,67 @@ IR should be unchanged — verify the `win-s2` vs `win-s3` `.ll` diff at each bo
   genuinely new piece Inc 3/4a deferred: a promoted `mut` local → rewrite every read AND write to `this.field`
   in place, so the field is the single source of truth — no load/store dance). Still scalar-Copy only;
   aggregate/non-Copy stays E0600. [4c: `await` inside a `match` arm, deferred.]
+
+- _2026-07-23_ — **Inc 4b DONE + validated (both OSes). No repin (0/235 `.ll` diff). UNCOMMITTED.** Baseline
+  HEAD `61f5beaa` (Inc 4a committed+repinned by Jake), pin verifies OK. One modified source file:
+  `sema/async_lower.cryo`. `AsyncLower` now lowers **awaits across all four loop forms** (`while`/`for`/`loop`/
+  `do-while`) with `break`/`continue` and **`mut` loop-carried promotion** — completing common-control-flow
+  async lowering (only Inc 4c, `await` inside a `match` arm, remains). Built on Inc 4a's `loop { match
+  (this.state) {…} }` dispatcher: a back-edge is just another `this.state = <header>;` forward-edge, so no new
+  dispatch mechanism was needed.
+  - **Loop lowering** (`lower_while_sm`/`lower_for_sm`/`lower_loop_sm`/`lower_do_while_sm`): each allocates
+    header/body-entry/[update]/after states. `while` = header tests cond (dispatch body-entry vs after) + body
+    + back-edge to header. `for` = init lowered into the current state, then header/body/update/after; the
+    update state runs the update expr then → header (so `continue` → update → re-test, correct). `loop{}` =
+    body-entry with a self back-edge (infinite; only `break` exits to after). `do-while` = body-entry (run
+    unconditionally) → tail-test state → after. Shared `emit_cond_dispatch` appends `if (cond) { state=t } else
+    { state=f }`. Await in a loop condition/update/`for`-init → E0600.
+  - **`break`/`continue`** → `this.state = <target>;` edges via a **loop-target stack** on `PollSm`
+    (`loop_cont`/`loop_brk`, pushed/popped around each exploded loop's body). A native `break`/`continue` would
+    break the dispatch `loop`/`match`, so they must lower to edges. **The stack top is always the innermost
+    EXPLODED loop:** an await-free nested loop is emitted wholesale (its break/continue stay native), so
+    break/continue only *reach* the state-machine lowerer when they target a loop currently being exploded.
+    Continue targets: `while`/`loop` header, `for` update state, `do-while` tail test; break target: the after
+    state.
+  - **`stmt_needs_explode`** now gates wholesale emission on `await OR a free break/continue` (not await
+    alone): an await-free `if (c) { break; }` inside an await-carrying loop must still be exploded (its `break`
+    can't stay native inside the dispatcher). `has_free_edge` walks if/block/match but NOT nested loops (they
+    capture their own break/continue).
+  - **Divergence moved to SOURCE AST.** `stmt_diverges` now covers `break`/`continue` (transfer control
+    elsewhere) and an infinite `loop{}` (`!has_free_break`). `lower_if_sm`'s join-suppression AND the loop
+    back-edges now test `stmt_diverges(SOURCE branch/body)`, not the lowered block's tail — a break-terminated
+    branch leaves a `this.state=<after>;` edge in its final state block, which is NOT a divergence marker, so
+    inspecting the lowered block would wrongly append a second (overwriting) edge and lose the break.
+    `lower_block_sm` also stops after a source-diverging statement (unreachable-after-terminator would
+    otherwise be emitted PAST the edge assignment and run before the arm falls off).
+  - **`mut` loop-carried promotion (the genuinely new piece).** A scalar-Copy `mut` local read/written across
+    states becomes a struct field that is the **single source of truth**: `promote_cross_state` (build-then-
+    scan) branches on mutability — const keeps the Inc-3 store-at-decl / load-at-reader model; **mut** replaces
+    its declaration with `this.<field> = <init>;` (`rewrite_mut_decl`) and rewrites every read AND write of the
+    name to `this.<field>` in place (`subst_name_expr`/`subst_name_stmt`, the mutating twins of the read-
+    detection walker — an assignment's LHS is an identifier, so one rewrite handles reads and writes uniformly,
+    incl. `i++` via the unary-operand case). Same guards: reference across suspend → E0455; aggregate/
+    non-scalar → E0600. New guard: a `mut` name re-declared in another state → E0600 (the by-name rewrite
+    can't disambiguate two live ranges).
+  - **Validation (via `future::block_on`, no turbofish):** scratchpad `async_inc4b/` drives 9 cases → EXIT 0:
+    `while`+mut counter/accumulator (immediate-Ready await), `while` with a genuine 2-Pending-per-iteration
+    suspension, `for`+`continue`(skip)+`break`(early exit)+suspend, `loop{}`+`break`, `do-while`, a **nested**
+    await-loop (`for` inside `while`; `total`/`i`/`j` all promoted), plus straight-line (Inc 3) and if/else
+    (Inc 4a) regressions. Negatives (`async_neg4b/`) fire clean E0600: await-in-`while`-condition, aggregate-
+    mut-across-await. Gotcha: a `for`-init needs an explicit type annotation (`for (mut i: i32 = 0; …)`) —
+    Cryo E0104; statement-level `mut x = 0` infers, a for-init does not.
+  - **Gate:** `CRYO_CC=gcc make selfhost-check` → exit 0, **BOTH fixed points** (Linux `s3`==`s4` md5
+    `5bacb46b83c166bc759794ee338a8c33`; Windows `s3`==`s4`, 235 modules). `win-s2` (pinned-built) vs `win-s3`
+    (new-built) = **0/235 differing `.ll`** → the lowering is inert for async-free code → **NO REPIN**. Pin
+    verifies OK; tree = `M async_lower.cryo` + `M ASYNC_IMPL.md`.
+  - **Durable limitation (shared with the const path since Inc 3/4a — NOT introduced by 4b):** cross-state
+    promotion is **by-name**. It under-promotes safely in most cases (a missed read surfaces as a loud "not
+    found"), but a promoted local that **shadows a same-named parameter** (or a sibling-scope local of the same
+    name, read before its decl-state) can be conflated by the global rewrite → a silent wrong value. The `mut`
+    path guards the re-declared-in-two-states case (E0600); the param-shadow case is unguarded in BOTH paths.
+    Proper fix = scope-aware promotion (bind promoted locals to fresh names / track scopes) covering const+mut
+    uniformly — recommended follow-up, deliberately NOT spot-guarded here to avoid an inconsistent mut-only
+    patch inconsistent with the shipped const path.
+  NEXT: **Inc 4c — `await` inside a `match` arm** (pattern bindings live across a suspend); currently E0600.
+  After 4c, Phase 2 is complete → **Phase 3** (executor + `spawn`/`JoinHandle` + multi-thread + poll-boundary
+  `catch_unwind` isolation).

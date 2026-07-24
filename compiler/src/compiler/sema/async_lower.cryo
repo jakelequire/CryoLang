@@ -73,6 +73,15 @@ type struct PollSm {
     prom_field: SymbolStr[];
     prom_tys:   TypeRef[];
     nprom:      i64;
+
+    // Loop-target stacks (innermost loop last). Entering an await-carrying loop
+    // pushes its continue-target (header / `for` update) and break-target (the
+    // after state); `break`/`continue` in the body lower to a `this.state = <top>;`
+    // edge. `break`/`continue` in an await-free nested loop stay native (that
+    // loop is emitted wholesale), so the top of the stack is always the innermost
+    // EXPLODED loop, which is exactly the source loop the edge targets.
+    loop_cont:  i64[];
+    loop_brk:   i64[];
 }
 
 type struct AsyncLower {
@@ -255,7 +264,17 @@ type struct AsyncLower {
             return this.expr_await_count(d.condition) + this.stmt_await_count(d.body);
         }
         if (k == NodeKind::ForStatement) {
-            return this.stmt_await_count((stmt as ForStmtNode*).body);
+            const f: ForStmtNode* = stmt as ForStmtNode*;
+            mut n: i64 = this.expr_await_count(f.condition) + this.expr_await_count(f.update)
+                       + this.stmt_await_count(f.body);
+            if (f.init != null) {
+                if ((f.init as ASTNode*).kind == NodeKind::VariableDeclaration) {
+                    n += this.expr_await_count((f.init as VarDeclNode*).initializer);
+                } else {
+                    n += this.expr_await_count(f.init as ExpressionNode*);
+                }
+            }
+            return n;
         }
         if (k == NodeKind::LoopStatement) {
             return this.stmt_await_count((stmt as LoopStmtNode*).body);
@@ -607,6 +626,170 @@ type struct AsyncLower {
         return false;
     }
 
+    // ---- in-place identifier rewrite (mut cross-state promotion) ----
+
+    /// Rewrite every read of identifier `name` in `e` to `this.<field>` (typed
+    /// `ty`), returning the (possibly replaced) expression for the caller's slot.
+    /// The mutating twin of `name_read_in_expr` — the promoted `mut` field is the
+    /// single source of truth, so reads AND assignment targets (`name = …`, whose
+    /// LHS is an identifier) both become `this.<field>`. Covers the same node
+    /// kinds; an unwalked kind leaves a `name` read in place, which surfaces as a
+    /// loud "not found" at its use, never a silent miscompile.
+    subst_name_expr(mut &this, e: ExpressionNode*, name: SymbolStr, field: SymbolStr,
+                    struct_ref: TypeRef, ty: TypeRef, span: SourceSpan) -> ExpressionNode* {
+        if (e == null) { return null; }
+        const k: NodeKind = (e as ASTNode*).kind;
+        if (k == NodeKind::Identifier) {
+            if ((e as IdentifierNode*).name.equals(name)) {
+                return this.member(this.this_ident(struct_ref, span), field, ty, span);
+            }
+            return e;
+        }
+        if (k == NodeKind::BinaryExpression) {
+            const b: BinaryExprNode* = e as BinaryExprNode*;
+            b.left  = this.subst_name_expr(b.left, name, field, struct_ref, ty, span);
+            b.right = this.subst_name_expr(b.right, name, field, struct_ref, ty, span);
+            return e;
+        }
+        if (k == NodeKind::UnaryExpression) {
+            const u: UnaryExprNode* = e as UnaryExprNode*;
+            u.operand = this.subst_name_expr(u.operand, name, field, struct_ref, ty, span);
+            return e;
+        }
+        if (k == NodeKind::CallExpression) {
+            const c: CallExprNode* = e as CallExprNode*;
+            c.callee = this.subst_name_expr(c.callee, name, field, struct_ref, ty, span);
+            for (mut i: i64 = 0; i < c.arguments.length; i++) {
+                c.arguments[i] = this.subst_name_expr(c.arguments[i], name, field, struct_ref, ty, span);
+            }
+            return e;
+        }
+        if (k == NodeKind::MemberAccess) {
+            const m: MemberAccessNode* = e as MemberAccessNode*;
+            m.object = this.subst_name_expr(m.object, name, field, struct_ref, ty, span);
+            return e;
+        }
+        if (k == NodeKind::CastExpression) {
+            const ce: CastExprNode* = e as CastExprNode*;
+            ce.expression = this.subst_name_expr(ce.expression, name, field, struct_ref, ty, span);
+            return e;
+        }
+        if (k == NodeKind::ArrayAccess) {
+            const a: ArrayAccessNode* = e as ArrayAccessNode*;
+            a.array = this.subst_name_expr(a.array, name, field, struct_ref, ty, span);
+            a.index = this.subst_name_expr(a.index, name, field, struct_ref, ty, span);
+            return e;
+        }
+        if (k == NodeKind::TernaryExpression) {
+            const t: TernaryExprNode* = e as TernaryExprNode*;
+            t.condition  = this.subst_name_expr(t.condition, name, field, struct_ref, ty, span);
+            t.true_expr  = this.subst_name_expr(t.true_expr, name, field, struct_ref, ty, span);
+            t.false_expr = this.subst_name_expr(t.false_expr, name, field, struct_ref, ty, span);
+            return e;
+        }
+        if (k == NodeKind::StructLiteral) {
+            const sl: StructLiteralNode* = e as StructLiteralNode*;
+            mut newf: FieldInit[] = [];
+            for (mut i: i64 = 0; i < sl.field_inits.length; i++) {
+                const fi: FieldInit = sl.field_inits[i];
+                newf.push(FieldInit {
+                    field_name: fi.field_name,
+                    value: this.subst_name_expr(fi.value, name, field, struct_ref, ty, span),
+                    span: fi.span });
+            }
+            sl.field_inits = newf;
+            return e;
+        }
+        if (k == NodeKind::AwaitExpression) {
+            const aw: AwaitExprNode* = e as AwaitExprNode*;
+            aw.operand = this.subst_name_expr(aw.operand, name, field, struct_ref, ty, span);
+            return e;
+        }
+        return e;
+    }
+
+    /// Rewrite every read of `name` in statement `s` to `this.<field>`, recursing
+    /// through control-flow containers (including await-free nested loops emitted
+    /// wholesale). Mutates the statement's expression slots in place.
+    subst_name_stmt(mut &this, s: StatementNode*, name: SymbolStr, field: SymbolStr,
+                    struct_ref: TypeRef, ty: TypeRef, span: SourceSpan) -> void {
+        if (s == null) { return; }
+        const k: NodeKind = s.kind;
+        if (k == NodeKind::ExpressionStatement) {
+            const es: ExprStmtNode* = s as ExprStmtNode*;
+            es.expression = this.subst_name_expr(es.expression, name, field, struct_ref, ty, span);
+            return;
+        }
+        if (k == NodeKind::ReturnStatement) {
+            const rs: ReturnStmtNode* = s as ReturnStmtNode*;
+            rs.expression = this.subst_name_expr(rs.expression, name, field, struct_ref, ty, span);
+            return;
+        }
+        if (k == NodeKind::DeclarationStatement) {
+            const ds: DeclStmtNode* = s as DeclStmtNode*;
+            if (ds.declaration != null && ds.declaration.kind == NodeKind::VariableDeclaration) {
+                const vd: VarDeclNode* = ds.declaration as VarDeclNode*;
+                vd.initializer = this.subst_name_expr(vd.initializer, name, field, struct_ref, ty, span);
+            }
+            return;
+        }
+        if (k == NodeKind::BlockStatement) {
+            const blk: BlockStmtNode* = s as BlockStmtNode*;
+            for (mut i: i64 = 0; i < blk.statements.length; i++) {
+                this.subst_name_stmt(blk.statements[i], name, field, struct_ref, ty, span);
+            }
+            return;
+        }
+        if (k == NodeKind::IfStatement) {
+            const iff: IfStmtNode* = s as IfStmtNode*;
+            iff.condition = this.subst_name_expr(iff.condition, name, field, struct_ref, ty, span);
+            this.subst_name_stmt(iff.then_stmt, name, field, struct_ref, ty, span);
+            this.subst_name_stmt(iff.else_stmt, name, field, struct_ref, ty, span);
+            return;
+        }
+        if (k == NodeKind::WhileStatement) {
+            const w: WhileStmtNode* = s as WhileStmtNode*;
+            w.condition = this.subst_name_expr(w.condition, name, field, struct_ref, ty, span);
+            this.subst_name_stmt(w.body, name, field, struct_ref, ty, span);
+            return;
+        }
+        if (k == NodeKind::DoWhileStatement) {
+            const d: DoWhileStmtNode* = s as DoWhileStmtNode*;
+            d.condition = this.subst_name_expr(d.condition, name, field, struct_ref, ty, span);
+            this.subst_name_stmt(d.body, name, field, struct_ref, ty, span);
+            return;
+        }
+        if (k == NodeKind::ForStatement) {
+            const f: ForStmtNode* = s as ForStmtNode*;
+            if (f.init != null) {
+                if ((f.init as ASTNode*).kind == NodeKind::VariableDeclaration) {
+                    const vd: VarDeclNode* = f.init as VarDeclNode*;
+                    vd.initializer = this.subst_name_expr(vd.initializer, name, field, struct_ref, ty, span);
+                } else {
+                    f.init = this.subst_name_expr(f.init as ExpressionNode*, name, field, struct_ref, ty, span) as ASTNode*;
+                }
+            }
+            f.condition = this.subst_name_expr(f.condition, name, field, struct_ref, ty, span);
+            f.update    = this.subst_name_expr(f.update, name, field, struct_ref, ty, span);
+            this.subst_name_stmt(f.body, name, field, struct_ref, ty, span);
+            return;
+        }
+        if (k == NodeKind::LoopStatement) {
+            this.subst_name_stmt((s as LoopStmtNode*).body, name, field, struct_ref, ty, span);
+            return;
+        }
+        if (k == NodeKind::MatchStatement) {
+            const m: MatchStmtNode* = s as MatchStmtNode*;
+            m.subject = this.subst_name_expr(m.subject, name, field, struct_ref, ty, span);
+            for (mut i: i64 = 0; i < m.arms.length; i++) {
+                if (m.arms[i] != null) {
+                    this.subst_name_stmt(m.arms[i].body, name, field, struct_ref, ty, span);
+                }
+            }
+            return;
+        }
+    }
+
     /// The variable declared by a top-level `const/mut x = …;` statement
     /// (including an `await` carrier `const x = await e;`), or null if the
     /// statement declares no local.
@@ -670,7 +853,12 @@ type struct AsyncLower {
         mut s: i64 = cur;
         for (mut i: i64 = 0; i < blk.statements.length; i++) {
             if (!sm.ok) { return s; }
-            s = this.lower_stmt_sm(sm, blk.statements[i], s);
+            const st: StatementNode* = blk.statements[i];
+            s = this.lower_stmt_sm(sm, st, s);
+            // A `return`/`break`/`continue` transfers control off this block; a
+            // following statement (unreachable source) would otherwise be emitted
+            // AFTER the edge assignment and silently run before the arm falls off.
+            if (this.stmt_diverges(st)) { return s; }
         }
         return s;
     }
@@ -691,18 +879,23 @@ type struct AsyncLower {
     /// expression, or inside a loop or `match`) -> E0600 (a later increment).
     lower_stmt_sm(mut &this, sm: PollSm*, stmt: StatementNode*, cur: i64) -> i64 {
         if (stmt == null) { return cur; }
-        if (this.stmt_await_count(stmt) == 0i64) {
+        const k: NodeKind = stmt.kind;
+        if (k == NodeKind::BreakStatement)    { return this.lower_break_sm(sm, cur, stmt.span); }
+        if (k == NodeKind::ContinueStatement) { return this.lower_continue_sm(sm, cur, stmt.span); }
+        if (!this.stmt_needs_explode(stmt)) {
             this.rewrite_returns(stmt, sm.poll_out, sm.span);
             sm.blocks[cur].add_statement(stmt);
             return cur;
         }
         const aw: AwaitExprNode* = this.stmt_toplevel_await(stmt);
         if (aw != null) { return this.lower_carrier_sm(sm, stmt, aw, cur); }
-        if (stmt.kind == NodeKind::IfStatement) {
-            return this.lower_if_sm(sm, stmt as IfStmtNode*, cur);
-        }
+        if (k == NodeKind::IfStatement)      { return this.lower_if_sm(sm, stmt as IfStmtNode*, cur); }
+        if (k == NodeKind::WhileStatement)   { return this.lower_while_sm(sm, stmt as WhileStmtNode*, cur); }
+        if (k == NodeKind::DoWhileStatement) { return this.lower_do_while_sm(sm, stmt as DoWhileStmtNode*, cur); }
+        if (k == NodeKind::ForStatement)     { return this.lower_for_sm(sm, stmt as ForStmtNode*, cur); }
+        if (k == NodeKind::LoopStatement)    { return this.lower_loop_sm(sm, stmt as LoopStmtNode*, cur); }
         this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
-            "async: this `await` shape is not supported yet; write it as `const x = await e;` / `return await e;` / `await e;`, or inside an `if`/`else` branch (an `await` nested in an expression, or inside a loop or `match`, arrives in a later increment)",
+            "async: this `await` shape is not supported yet; write it as `const x = await e;` / `return await e;` / `await e;`, inside an `if`/`else` branch, or inside a `while`/`for`/`loop`/`do-while` body (an `await` nested in an expression, or inside a `match` arm, arrives in a later increment)",
             stmt.span);
         sm.ok = false;
         return cur;
@@ -804,24 +997,205 @@ type struct AsyncLower {
         sm.blocks[cur].add_statement(new IfStmtNode(iff.condition,
             then_set as StatementNode*, else_set as StatementNode*, span) as StatementNode*);
 
+        // Whether a branch converges on the join is a property of the SOURCE
+        // branch (does it end in a `return`/`break`/`continue`?), not of the
+        // lowered block: a branch ending in `break` leaves its final state block
+        // holding a `this.state = <after>;` edge, which is not a divergence marker.
         const t_end: i64 = this.lower_branch_sm(sm, iff.then_stmt, then_entry);
         if (!sm.ok) { return cur; }
-        if (!this.block_diverges(sm.blocks[t_end])) { this.sm_goto(sm, t_end, join); }
+        if (!this.stmt_diverges(iff.then_stmt)) { this.sm_goto(sm, t_end, join); }
         if (else_entry >= 0i64) {
             const e_end: i64 = this.lower_branch_sm(sm, iff.else_stmt, else_entry);
             if (!sm.ok) { return cur; }
-            if (!this.block_diverges(sm.blocks[e_end])) { this.sm_goto(sm, e_end, join); }
+            if (!this.stmt_diverges(iff.else_stmt)) { this.sm_goto(sm, e_end, join); }
         }
         return join;
     }
 
-    /// True if the statement always diverges (returns), so a following state
-    /// transition would be unreachable dead code and must be suppressed.
-    /// Structural over `return` / block-tail / both-arm `if`.
+    /// Append `if (<cond>) { this.state = <t>; } else { this.state = <f>; }` to
+    /// state block `from` — a two-way state dispatch (a loop header's test, a
+    /// `do-while`'s tail test). The arm falls off after the assignment and the
+    /// enclosing loop re-dispatches the chosen state.
+    emit_cond_dispatch(mut &this, sm: PollSm*, from: i64, cond: ExpressionNode*,
+                       t: i64, f: i64, span: SourceSpan) -> void {
+        mut then_set: BlockStmtNode* = new BlockStmtNode(span);
+        then_set.add_statement(this.assign_member_stmt(sm.struct_ref, sm.state_sym, sm.u32_ty,
+            this.u32_lit(t as u64, span), span));
+        mut else_set: BlockStmtNode* = new BlockStmtNode(span);
+        else_set.add_statement(this.assign_member_stmt(sm.struct_ref, sm.state_sym, sm.u32_ty,
+            this.u32_lit(f as u64, span), span));
+        sm.blocks[from].add_statement(new IfStmtNode(cond,
+            then_set as StatementNode*, else_set as StatementNode*, span) as StatementNode*);
+    }
+
+    /// `break` -> jump to the innermost exploded loop's after state; `continue`
+    /// -> jump to its continue target (a `while`/`loop` header, a `for` update
+    /// state, a `do-while` tail test). A native `break`/`continue` would break
+    /// the dispatch `loop`/`match`, so these lower to `this.state = <target>;`.
+    lower_break_sm(mut &this, sm: PollSm*, cur: i64, span: SourceSpan) -> i64 {
+        if (sm.loop_brk.length == 0i64) {
+            this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
+                "async: `break` outside a loop", span);
+            sm.ok = false; return cur;
+        }
+        this.sm_goto(sm, cur, sm.loop_brk[sm.loop_brk.length - 1i64]);
+        return cur;
+    }
+
+    lower_continue_sm(mut &this, sm: PollSm*, cur: i64, span: SourceSpan) -> i64 {
+        if (sm.loop_cont.length == 0i64) {
+            this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
+                "async: `continue` outside a loop", span);
+            sm.ok = false; return cur;
+        }
+        this.sm_goto(sm, cur, sm.loop_cont[sm.loop_cont.length - 1i64]);
+        return cur;
+    }
+
+    /// `loop { body }` -> a body-entry state whose back-edge returns to itself
+    /// (an infinite loop; `break` exits to the after state, `continue` re-enters
+    /// the body). A suspend inside the body splits it into further states; the
+    /// back-edge re-dispatches the body from the top each iteration.
+    lower_loop_sm(mut &this, sm: PollSm*, lp: LoopStmtNode*, cur: i64) -> i64 {
+        const body_entry: i64 = this.sm_alloc(sm);
+        const after: i64 = this.sm_alloc(sm);
+        this.sm_goto(sm, cur, body_entry);
+        sm.loop_cont.push(body_entry);
+        sm.loop_brk.push(after);
+        const body_end: i64 = this.lower_branch_sm(sm, lp.body, body_entry);
+        sm.loop_cont.pop();
+        sm.loop_brk.pop();
+        if (!sm.ok) { return cur; }
+        if (!this.stmt_diverges(lp.body)) { this.sm_goto(sm, body_end, body_entry); }
+        return after;
+    }
+
+    /// `while (cond) { body }` -> a header state that tests `cond` (dispatching to
+    /// the body entry or the after state), a body sequence, and a back-edge from
+    /// the body tail to the header. `continue` re-tests at the header; `break`
+    /// exits to after.
+    lower_while_sm(mut &this, sm: PollSm*, w: WhileStmtNode*, cur: i64) -> i64 {
+        const span: SourceSpan = sm.span;
+        if (this.expr_await_count(w.condition) > 0i64) {
+            this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
+                "async: an `await` in a `while` condition is not supported; bind it first (`const c = await e; while (c) { … }`)",
+                span);
+            sm.ok = false; return cur;
+        }
+        const header: i64 = this.sm_alloc(sm);
+        const body_entry: i64 = this.sm_alloc(sm);
+        const after: i64 = this.sm_alloc(sm);
+        this.sm_goto(sm, cur, header);
+        this.emit_cond_dispatch(sm, header, w.condition, body_entry, after, span);
+        sm.loop_cont.push(header);
+        sm.loop_brk.push(after);
+        const body_end: i64 = this.lower_branch_sm(sm, w.body, body_entry);
+        sm.loop_cont.pop();
+        sm.loop_brk.pop();
+        if (!sm.ok) { return cur; }
+        if (!this.stmt_diverges(w.body)) { this.sm_goto(sm, body_end, header); }
+        return after;
+    }
+
+    /// `do { body } while (cond)` -> a body-entry state (run unconditionally
+    /// first), a tail-test state, and the after state. `continue` jumps to the
+    /// tail test; `break` exits to after.
+    lower_do_while_sm(mut &this, sm: PollSm*, d: DoWhileStmtNode*, cur: i64) -> i64 {
+        const span: SourceSpan = sm.span;
+        if (this.expr_await_count(d.condition) > 0i64) {
+            this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
+                "async: an `await` in a `do-while` condition is not supported; bind it first",
+                span);
+            sm.ok = false; return cur;
+        }
+        const body_entry: i64 = this.sm_alloc(sm);
+        const cond_state: i64 = this.sm_alloc(sm);
+        const after: i64 = this.sm_alloc(sm);
+        this.sm_goto(sm, cur, body_entry);
+        sm.loop_cont.push(cond_state);
+        sm.loop_brk.push(after);
+        const body_end: i64 = this.lower_branch_sm(sm, d.body, body_entry);
+        sm.loop_cont.pop();
+        sm.loop_brk.pop();
+        if (!sm.ok) { return cur; }
+        if (!this.stmt_diverges(d.body)) { this.sm_goto(sm, body_end, cond_state); }
+        this.emit_cond_dispatch(sm, cond_state, d.condition, body_entry, after, span);
+        return after;
+    }
+
+    /// `for (init; cond; update) { body }` -> lower `init` into the current
+    /// state, then a header (test `cond`), a body sequence, an update state, and
+    /// the after state. `continue` jumps to the update; `break` exits to after.
+    /// A null `cond` means "always enter the body" (an infinite `for (;;)`).
+    lower_for_sm(mut &this, sm: PollSm*, f: ForStmtNode*, cur: i64) -> i64 {
+        const span: SourceSpan = sm.span;
+        if (this.expr_await_count(f.condition) > 0i64 || this.expr_await_count(f.update) > 0i64) {
+            this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
+                "async: an `await` in a `for` condition or update expression is not supported; restructure the loop",
+                span);
+            sm.ok = false; return cur;
+        }
+        mut s0: i64 = cur;
+        if (f.init != null) {
+            if (this.expr_await_count(this.for_init_expr(f)) > 0i64) {
+                this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
+                    "async: an `await` in a `for` initializer is not supported; bind it before the loop",
+                    span);
+                sm.ok = false; return cur;
+            }
+            if ((f.init as ASTNode*).kind == NodeKind::VariableDeclaration) {
+                mut ds: DeclStmtNode* = new DeclStmtNode(f.init as DeclarationNode*, span);
+                s0 = this.lower_stmt_sm(sm, ds as StatementNode*, s0);
+            } else {
+                mut es: ExprStmtNode* = new ExprStmtNode(f.init as ExpressionNode*, span);
+                s0 = this.lower_stmt_sm(sm, es as StatementNode*, s0);
+            }
+            if (!sm.ok) { return cur; }
+        }
+        const header: i64 = this.sm_alloc(sm);
+        const body_entry: i64 = this.sm_alloc(sm);
+        const update_state: i64 = this.sm_alloc(sm);
+        const after: i64 = this.sm_alloc(sm);
+        this.sm_goto(sm, s0, header);
+        if (f.condition != null) {
+            this.emit_cond_dispatch(sm, header, f.condition, body_entry, after, span);
+        } else {
+            this.sm_goto(sm, header, body_entry);
+        }
+        sm.loop_cont.push(update_state);
+        sm.loop_brk.push(after);
+        const body_end: i64 = this.lower_branch_sm(sm, f.body, body_entry);
+        sm.loop_cont.pop();
+        sm.loop_brk.pop();
+        if (!sm.ok) { return cur; }
+        if (!this.stmt_diverges(f.body)) { this.sm_goto(sm, body_end, update_state); }
+        if (f.update != null) {
+            sm.blocks[update_state].add_statement(new ExprStmtNode(f.update, span) as StatementNode*);
+        }
+        this.sm_goto(sm, update_state, header);
+        return after;
+    }
+
+    /// The `for` initializer's initializer expression (for the await check), or
+    /// null when the init is absent or a bare expression with no sub-await.
+    for_init_expr(&this, f: ForStmtNode*) -> ExpressionNode* {
+        if (f.init == null) { return null; }
+        if ((f.init as ASTNode*).kind == NodeKind::VariableDeclaration) {
+            return (f.init as VarDeclNode*).initializer;
+        }
+        return f.init as ExpressionNode*;
+    }
+
+    /// True if the statement never falls through to whatever follows it, so a
+    /// following state transition (a branch join, a loop back-edge, or the rest
+    /// of a block) would be unreachable and must be suppressed. Structural over
+    /// `return` / `break` / `continue` (all transfer control elsewhere), a
+    /// block-tail, a both-arm `if`, and an infinite `loop` (no `break`).
     stmt_diverges(&this, stmt: StatementNode*) -> boolean {
         if (stmt == null) { return false; }
         const k: NodeKind = stmt.kind;
         if (k == NodeKind::ReturnStatement) { return true; }
+        if (k == NodeKind::BreakStatement || k == NodeKind::ContinueStatement) { return true; }
         if (k == NodeKind::BlockStatement) {
             const blk: BlockStmtNode* = stmt as BlockStmtNode*;
             if (blk.statements.length == 0i64) { return false; }
@@ -832,12 +1206,66 @@ type struct AsyncLower {
             if (iff.else_stmt == null) { return false; }
             return this.stmt_diverges(iff.then_stmt) && this.stmt_diverges(iff.else_stmt);
         }
+        if (k == NodeKind::LoopStatement) {
+            // A `loop {}` exits only via a `break` targeting it; with none, it is
+            // an infinite loop and control never reaches the following statement.
+            return !this.has_free_break((stmt as LoopStmtNode*).body);
+        }
         return false;
     }
 
     block_diverges(&this, blk: BlockStmtNode*) -> boolean {
         if (blk == null || blk.statements.length == 0i64) { return false; }
         return this.stmt_diverges(blk.statements[blk.statements.length - 1i64]);
+    }
+
+    /// True if `stmt` holds a `break`/`continue` that targets the ENCLOSING loop
+    /// (i.e. one not captured by a loop nested inside `stmt`). Used to decide
+    /// whether an otherwise await-free statement must still be exploded into
+    /// states (its edge cannot stay a native `break`, which would break the
+    /// dispatch `loop`/`match`), and — restricted to `break` — whether a `loop {}`
+    /// is infinite. Does NOT descend into nested loops (they capture their own).
+    has_free_edge(&this, stmt: StatementNode*, break_only: boolean) -> boolean {
+        if (stmt == null) { return false; }
+        const k: NodeKind = stmt.kind;
+        if (k == NodeKind::BreakStatement) { return true; }
+        if (k == NodeKind::ContinueStatement) { return !break_only; }
+        if (k == NodeKind::BlockStatement) {
+            const blk: BlockStmtNode* = stmt as BlockStmtNode*;
+            for (mut i: i64 = 0; i < blk.statements.length; i++) {
+                if (this.has_free_edge(blk.statements[i], break_only)) { return true; }
+            }
+            return false;
+        }
+        if (k == NodeKind::IfStatement) {
+            const iff: IfStmtNode* = stmt as IfStmtNode*;
+            return this.has_free_edge(iff.then_stmt, break_only)
+                || this.has_free_edge(iff.else_stmt, break_only);
+        }
+        if (k == NodeKind::MatchStatement) {
+            const m: MatchStmtNode* = stmt as MatchStmtNode*;
+            for (mut i: i64 = 0; i < m.arms.length; i++) {
+                if (m.arms[i] != null && this.has_free_edge(m.arms[i].body, break_only)) { return true; }
+            }
+            return false;
+        }
+        // While/For/Loop/DoWhile capture their own break/continue — not free here.
+        return false;
+    }
+
+    has_free_break(&this, stmt: StatementNode*) -> boolean {
+        return this.has_free_edge(stmt, true);
+    }
+
+    has_free_break_continue(&this, stmt: StatementNode*) -> boolean {
+        return this.has_free_edge(stmt, false);
+    }
+
+    /// A statement must be lowered into states (rather than emitted wholesale into
+    /// the current state) if it contains an `await` OR a `break`/`continue` that
+    /// targets an enclosing exploded loop.
+    stmt_needs_explode(&this, stmt: StatementNode*) -> boolean {
+        return this.stmt_await_count(stmt) > 0i64 || this.has_free_break_continue(stmt);
     }
 
     // ---- cross-state local promotion (build-then-scan) ----
@@ -857,6 +1285,28 @@ type struct AsyncLower {
         mut ld: ExpressionNode* = this.member(this.this_ident(struct_ref, span), field, ty, span);
         mut rebuilt: StatementNode*[] = [this.var_decl_stmt(name, false, ty, ld, span)];
         for (mut i: i64 = 0; i < blk.statements.length; i++) { rebuilt.push(blk.statements[i]); }
+        blk.statements = rebuilt;
+    }
+
+    /// Replace the `mut <name> = <init>;` declaration (located by node identity in
+    /// state block `ds`) with `this.<field> = <init>;`, so the promoted field —
+    /// not a stack local — receives the value. A declaration with no initializer
+    /// is dropped: the constructor already zero-initialized the field.
+    rewrite_mut_decl(mut &this, sm: PollSm*, ds: i64, vd: VarDeclNode*,
+                     field: SymbolStr, lty: TypeRef) -> void {
+        const span: SourceSpan = sm.span;
+        const blk: BlockStmtNode* = sm.blocks[ds];
+        mut rebuilt: StatementNode*[] = [];
+        for (mut i: i64 = 0; i < blk.statements.length; i++) {
+            const s: StatementNode* = blk.statements[i];
+            if (this.stmt_decl_var(s) == vd) {
+                if (vd.initializer != null) {
+                    rebuilt.push(this.assign_member_stmt(sm.struct_ref, field, lty, vd.initializer, span));
+                }
+            } else {
+                rebuilt.push(s);
+            }
+        }
         blk.statements = rebuilt;
     }
 
@@ -900,12 +1350,6 @@ type struct AsyncLower {
                     vd.span);
                 sm.ok = false; return;
             }
-            if (vd.is_mutable) {
-                this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
-                    "async: a `mut` local carried across an `await` is not yet supported; bind the value with `const` (mutable-across-await promotion arrives in a later increment)",
-                    vd.span);
-                sm.ok = false; return;
-            }
             if (!this.zeroable_kind(lk)) {
                 this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
                     "async: only a scalar (integer/bool/float/pointer) local may currently be held across an `await`; carrying an aggregate across a suspend arrives in a later increment",
@@ -913,6 +1357,43 @@ type struct AsyncLower {
                 sm.ok = false; return;
             }
 
+            if (vd.is_mutable) {
+                // A `mut` value written across states cannot live on the native
+                // stack (each state re-enters `poll` afresh), and the const
+                // store/load model would leave stale copies diverging from later
+                // writes. Promote to a field that is the SINGLE source of truth:
+                // replace the declaration with a field store and rewrite every
+                // read AND write of the name to `this.<field>` in place. A by-name
+                // rewrite is ambiguous if the name is re-declared in another state,
+                // so reject that (rare) case rather than conflate two live ranges.
+                mut decl_sites: i64 = 0i64;
+                for (mut d2: i64 = 0; d2 < d_names.length; d2++) {
+                    if (d_names[d2].equals(nm)) { decl_sites += 1i64; }
+                }
+                if (decl_sites > 1i64) {
+                    this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
+                        "async: a `mut` local whose name is re-declared in another state cannot be carried across an `await`; rename one of them",
+                        vd.span);
+                    sm.ok = false; return;
+                }
+                const mfield: SymbolStr = this.intern.intern(
+                    format("__mut_%lld_%s", ds, this.intern.resolve(nm)));
+                this.rewrite_mut_decl(sm, ds, vd, mfield, lty);
+                for (mut b: i64 = 0; b < sm.blocks.length; b++) {
+                    const blk2: BlockStmtNode* = sm.blocks[b];
+                    for (mut i: i64 = 0; i < blk2.statements.length; i++) {
+                        this.subst_name_stmt(blk2.statements[i], nm, mfield, sm.struct_ref, lty, span);
+                    }
+                }
+                sm.prom_field.push(mfield);
+                sm.prom_tys.push(lty);
+                sm.nprom += 1i64;
+                continue;
+            }
+
+            // A const scalar is written once, so a copy per reader is sound: keep
+            // the local, store its value at the end of the declaring block, and
+            // reload it at the top of every other block that reads it.
             const field: SymbolStr = this.intern.intern(
                 format("__cross_%lld_%s", ds, this.intern.resolve(nm)));
             sm.blocks[ds].add_statement(this.assign_member_stmt(
@@ -1025,6 +1506,7 @@ type struct AsyncLower {
             blocks: [], ok: true,
             fut_syms: [], fut_opt: [], naw: 0i64,
             prom_field: [], prom_tys: [], nprom: 0i64,
+            loop_cont: [], loop_brk: [],
         };
 
         mut body_block: BlockStmtNode* = null;
