@@ -35,7 +35,7 @@ not for routine judgement calls.
 |---|---|---|
 | 0 | Design lock-down (surface, trait shapes, lowering placement) — get Jake's sign-off | ✅ done — locked 2026-07-22 (§7 filled) |
 | 1 | Core types in stdlib (`Poll`/`Future`/`Context`/`Waker`) + `block_on` + hand-written futures | ✅ done+validated 2026-07-22 (no repin) |
-| 2 | Compiler: `async fn` parse + state-machine lowering + `await` desugar | ✅ DONE+validated (2026-07-23) — parse + no-await (1b) + single await (2) + N straight-line (3) + awaits across `if`/`else` (4a) + awaits across `while`/`for`/`loop`/`do-while` + `break`/`continue` + `mut` loop-carried promotion (4b) + scope-aware alpha-rename, all committed through `5e28a74f`. **Inc 4c DONE (2026-07-23): `await` inside a `match` arm — dispatch `match(subj)` → per-arm entry states → join; scalar pattern bindings captured to fields (aggregate→E0600, ref→E0455); pattern bindings alpha-renamed for by-name soundness; non-exhaustive match gets synth `_ => join`. Plus the bare-block-with-await warm-up. Both-OS fixed point, `win-s2`/`win-s3` = 0/235 `.ll` → NO REPIN, UNCOMMITTED.** All common control flow now lowers → Phase 2 complete. |
+| 2 | Compiler: `async fn` parse + state-machine lowering + `await` desugar | ✅ DONE+validated; **the deferred aggregate-across-await tail LANDED 2026-07-24 — an `async function` can now hold an aggregate across a suspend, take a droppable aggregate parameter, and be `spawn`ed on an `Executor`** (see the newest §9 entry). Earlier: DONE (2026-07-23) — parse + no-await (1b) + single await (2) + N straight-line (3) + awaits across `if`/`else` (4a) + awaits across `while`/`for`/`loop`/`do-while` + `break`/`continue` + `mut` loop-carried promotion (4b) + scope-aware alpha-rename, all committed through `5e28a74f`. **Inc 4c DONE (2026-07-23): `await` inside a `match` arm — dispatch `match(subj)` → per-arm entry states → join; scalar pattern bindings captured to fields (aggregate→E0600, ref→E0455); pattern bindings alpha-renamed for by-name soundness; non-exhaustive match gets synth `_ => join`. Plus the bare-block-with-await warm-up. Both-OS fixed point, `win-s2`/`win-s3` = 0/235 `.ll` → NO REPIN, UNCOMMITTED.** All common control flow now lowers → Phase 2 complete. |
 | 3 | Executor + `Waker` + `spawn`/`JoinHandle`; multi-thread; poll-boundary `catch_unwind` isolation | ✅ DONE+validated (2026-07-24) — surface LOCKED 2026-07-23. **(a)** single-thread executor + ready-queue + re-enqueueing Waker; **(b)** `spawn`/`JoinHandle` (Output via `TaskShared<O>`), `block_on`, `join`/`detach`/`abort`, drop=detach; **(c)** pthread worker pool + per-task atomic run-state (IDLE/SCHEDULED/RUNNING/NOTIFIED) + condvar `join`/`block_on` + `catch_unwind` poll-boundary isolation. Needed a NEW compiler `![config(panic_unwind)]` gating atom (see §9) → Phase-1 both-OS REPIN (selfhost fixed point, 235 `.ll`). Executor is self-contained (own pthread wrappers, no `thread::Scope` dep). Validated on Linux: regression 30/30, isolation 30/30. UNCOMMITTED. |
 | 4 | Reactor (epoll/IOCP) + async I/O over `std::net` + timers + `async fn main` + combinators | ◐ in progress 2026-07-24. **Inc 4b DONE on Linux (reactor + async TCP, stress+leak clean); Windows AFD backend written but UNVALIDATED (wine 9.0 cannot service `IOCTL_AFD_POLL` — needs a real Windows box).** Interface fork LOCKED by Jake: **one readiness interface both OSes, Windows via real AFD** (not WSAPoll, not a per-OS split). Sockets are to become **async-only with every consumer ported** (Jake, 2026-07-24) — that port is BLOCKED on the E0600 aggregate-across-await compiler increment. Forks LOCKED earlier: waker lifetime = **separate `Arc`-wrapper**; reactor = **dedicated thread, per-`Executor`** (`![thread_local]` current-reactor handle); platform = **both OSes (epoll + IOCP)**. **Inc 4a DONE+validated (2026-07-24): Arc-refcounted `Waker` (Copy→non-Copy) + `Arc<Task>` lifetime; finish-vs-park now implicit via `Task::drop` on the last decref. Needed a COMPILER fix (owner-generic static with a defaulted owner param + nested return → E0636; `call_resolver.cryo` default-backfill) → selfhost fixed point BOTH OS, win-s2 vs win-s3 = 0/235 `.ll`, REPINNED both OS. UNCOMMITTED.** NEXT = Inc 4b (the reactor: epoll+IOCP interface — bring Jake the readiness-vs-completion unification fork). |
 
@@ -1483,3 +1483,61 @@ IR should be unchanged — verify the `win-s2` vs `win-s3` `.ll` diff at each bo
   **(c)** only then delete the blocking surface from `tcp.cryo` and rename the async ops onto `read`/`write`/
   `accept`/`connect`. **(d)** validate the AFD backend on real Windows. Keeping the blocking API until (c) is what
   keeps the tree green; deleting it first would leave the whole net stack red across (a) and (b).
+
+- _2026-07-24_ — **The Phase-2 aggregate-across-await tail is DONE. REPINNED both OS. UNCOMMITTED.**
+  Baseline HEAD `ee2d284e` (Inc 4b committed by Jake); pin now `f8f58193…` / `9b856d78…`, `verify-pin` OK,
+  `make test` OVERALL PASS, both selfhost fixed points green, **win-s2 vs win-s3 = 0/235 differing `.ll`**
+  (inert for all existing code). Files: `sema/async_lower.cryo` (+~330), `future/executor.cryo`
+  (`task_drop_thunk`). **This is what unblocks the async-only socket port Jake ordered.**
+  - **What an `async function` can do now that it could not:** hold an aggregate live across a suspend
+    (`const io = await …;` then await again), take a **droppable aggregate parameter**
+    (`async function serve(l: TcpListener)`), and **be spawned on an `Executor`** at all.
+  - **The carrier.** A value that must survive a suspend has no zero value the constructor could give its
+    field, and the const-scalar strategy's copy-per-reader would drop an owning value once per copy. So it
+    lives in an **`Option<T>` field, `None` until first stored** — which is exactly what makes a future
+    dropped before the value exists have nothing to drop — and moves to a plain block-local via the same
+    take/put protocol the sub-future slots already use. Inside a state the value is an ordinary local, so
+    every use of it keeps its normal meaning; the hand-back is also inserted before `return Poll::Pending`,
+    which leaves a state before its tail runs.
+  - **Parameters.** The shadow prelude (`const p = this.p;`) is fine for a `Copy` parameter and wrong for
+    any other: it is a move out of a field, executed inside the dispatch loop, which the move checker
+    rightly rejects (E0452 "moved inside a loop"). Non-`Copy` parameters (`OwnershipQuery::is_copy`) are
+    therefore skipped there and carried in `Option<T>` slots like any other carried value.
+  - **Three rules that make it correct — each one was a real bug first:**
+    1. **Liveness, not mentions.** Only a state that *reads* a name before writing it needs the value
+       carried. The owned-handle I/O idiom hands the socket to the operation and takes it back out of the
+       result, so every state writes first and the socket is never carried at all — carrying it tried to
+       store a name the state had already moved away (E0452).
+    2. **A state that gives the value away must not hand it back** (`last_use_consumes`): the state that
+       passes the socket to an operation stays silent; the state that takes it back publishes the new one.
+    3. **Never synthesize an uninitialized droppable binding.** A state that produces its own value
+       declares it *at its first assignment*. The first attempt prepended `mut s: T;` at the top of the
+       state, and dropping that never-written binding ran `TcpListener::drop` on zeroed memory — calling
+       **`close(0)`**, closing stdin, which the kernel then handed out as the next socket. It presented as
+       an intermittent hang with sockets reporting fd 0, and **strace found it** (`close(0)`, then
+       `accept4(…) = 0`, then `close(0) = EBADF`) after several wrong theories. A first assignment nested
+       in a branch is now a clear E0600 diagnostic rather than unsafe code.
+  - **`task_drop_thunk` no longer calls `fut.drop()`.** Its comment claimed `.drop()` was drop glue valid
+    for any `F`; it is not — it requires `F` to *declare* a `drop` method, which a compiler-generated
+    future never does, so `spawn(async_fn())` could not compile (E0358). It now moves the boxed future
+    into a local and lets scope-exit glue run, which works for an explicit `Drop` impl, per-field drops, or
+    nothing at all. **A `where F: Drop` bound would have been the wrong fix** — it rejects exactly the
+    generated futures this needs to accept. Sound because futures are never self-referential (§4), so
+    relocating one cannot dangle an internal pointer.
+  - **Validated:** aggregate across an await, `mut` aggregate reassigned after a suspend, an aggregate
+    carried around a suspending loop, one held across a suspend inside an `if` branch (and not built in the
+    untaken branch), **cancellation** (a future dropped mid-flight drops its aggregate exactly once),
+    spawning a generated future on an executor, carried droppable parameters, and a **real async-function
+    TCP echo client + server** over loopback: 25 runs × 10 round-trips, zero failures, valgrind clean
+    (123 allocs / 123 frees, 0 errors).
+  - **Durable language facts established by probe** (add to the Inc-4b list): **reassigning a local does
+    NOT drop the overwritten value** (same as a field assignment — only the final value is dropped at scope
+    exit); **a struct with droppable fields but no explicit `Drop` impl DOES drop its fields at scope
+    exit** (which is why the `Option<T>` carrier is reclaimed correctly); **`Option::as_ref()` genuinely
+    aliases the payload in place** (`*opt.as_ref().unwrap()` is an assignable place — an alternative
+    field-resident design, not needed by the model chosen); and an uninitialized droppable local is guarded
+    by the P13 init-flag machinery in hand-written code but must never be *synthesized* by a lowering.
+  NEXT: the port itself (`net::http`, `net::http2`, `net::tls`, `net::ws`, `net::https` + the 4 net tests),
+  then delete the blocking socket surface. Known limitation to work around while porting: a value rebuilt
+  after an `await` must be assigned at the top level of that step, not inside a branch (clear E0600).
+  `net::tls` still needs its own design pass (OpenSSL blocking BIO → non-blocking + `WANT_READ`/`WANT_WRITE`).

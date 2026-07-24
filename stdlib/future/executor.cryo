@@ -540,16 +540,20 @@ where F: Future<O> {
     }
 }
 
-/// Monomorphized drop thunk for `F`: drop the future in place, free its box.
-/// `.drop()` is drop glue (valid for ANY `F`, whether or not it impls `Drop`) —
-/// the same unbounded-generic pattern as `thread::thread_body`, so NO
-/// `where F: Drop` bound (which would wrongly reject a future without an explicit
-/// `Drop`). A vtable fn-ptr, so a free function.
+/// Monomorphized drop thunk for `F`: drop the future, free its box.
+///
+/// The future is moved out of its box into a local, whose scope-exit drop runs
+/// whatever drop glue `F` has — an explicit `Drop` impl, per-field drops, or
+/// nothing at all. Calling `.drop()` on the box directly would instead require
+/// `F` to *declare* a `drop` method, which a hand-written future may but a
+/// compiler-generated one (an `async function`'s state machine) never does. A
+/// vtable fn-ptr, so a free function.
 function task_drop_thunk<F>(fut_raw: u8*) -> void {
     const fut: F* = fut_raw as F*;
-    fut.drop();
+    mut _owned: F = *fut;
     mut alloc: GlobalAlloc = GlobalAlloc::new();
     alloc.deallocate(NonNull::new(fut_raw), Layout::of<F>());
+    // `_owned` drops here, after its storage has been released.
 }
 
 /// Monomorphized dispose thunk for a shared block of result type `O`: optionally
