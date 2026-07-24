@@ -37,7 +37,7 @@ not for routine judgement calls.
 | 1 | Core types in stdlib (`Poll`/`Future`/`Context`/`Waker`) + `block_on` + hand-written futures | ✅ done+validated 2026-07-22 (no repin) |
 | 2 | Compiler: `async fn` parse + state-machine lowering + `await` desugar | ✅ DONE+validated (2026-07-23) — parse + no-await (1b) + single await (2) + N straight-line (3) + awaits across `if`/`else` (4a) + awaits across `while`/`for`/`loop`/`do-while` + `break`/`continue` + `mut` loop-carried promotion (4b) + scope-aware alpha-rename, all committed through `5e28a74f`. **Inc 4c DONE (2026-07-23): `await` inside a `match` arm — dispatch `match(subj)` → per-arm entry states → join; scalar pattern bindings captured to fields (aggregate→E0600, ref→E0455); pattern bindings alpha-renamed for by-name soundness; non-exhaustive match gets synth `_ => join`. Plus the bare-block-with-await warm-up. Both-OS fixed point, `win-s2`/`win-s3` = 0/235 `.ll` → NO REPIN, UNCOMMITTED.** All common control flow now lowers → Phase 2 complete. |
 | 3 | Executor + `Waker` + `spawn`/`JoinHandle`; multi-thread; poll-boundary `catch_unwind` isolation | ✅ DONE+validated (2026-07-24) — surface LOCKED 2026-07-23. **(a)** single-thread executor + ready-queue + re-enqueueing Waker; **(b)** `spawn`/`JoinHandle` (Output via `TaskShared<O>`), `block_on`, `join`/`detach`/`abort`, drop=detach; **(c)** pthread worker pool + per-task atomic run-state (IDLE/SCHEDULED/RUNNING/NOTIFIED) + condvar `join`/`block_on` + `catch_unwind` poll-boundary isolation. Needed a NEW compiler `![config(panic_unwind)]` gating atom (see §9) → Phase-1 both-OS REPIN (selfhost fixed point, 235 `.ll`). Executor is self-contained (own pthread wrappers, no `thread::Scope` dep). Validated on Linux: regression 30/30, isolation 30/30. UNCOMMITTED. |
-| 4 | Reactor (epoll/IOCP) + async I/O over `std::net` + timers + `async fn main` + combinators | ◐ in progress 2026-07-24. Forks LOCKED: waker lifetime = **separate `Arc`-wrapper**; reactor = **dedicated thread, per-`Executor`** (`![thread_local]` current-reactor handle); platform = **both OSes (epoll + IOCP)**. **Inc 4a DONE+validated (2026-07-24): Arc-refcounted `Waker` (Copy→non-Copy) + `Arc<Task>` lifetime; finish-vs-park now implicit via `Task::drop` on the last decref. Needed a COMPILER fix (owner-generic static with a defaulted owner param + nested return → E0636; `call_resolver.cryo` default-backfill) → selfhost fixed point BOTH OS, win-s2 vs win-s3 = 0/235 `.ll`, REPINNED both OS. UNCOMMITTED.** NEXT = Inc 4b (the reactor: epoll+IOCP interface — bring Jake the readiness-vs-completion unification fork). |
+| 4 | Reactor (epoll/IOCP) + async I/O over `std::net` + timers + `async fn main` + combinators | ◐ in progress 2026-07-24. **Inc 4b DONE on Linux (reactor + async TCP, stress+leak clean); Windows AFD backend written but UNVALIDATED (wine 9.0 cannot service `IOCTL_AFD_POLL` — needs a real Windows box).** Interface fork LOCKED by Jake: **one readiness interface both OSes, Windows via real AFD** (not WSAPoll, not a per-OS split). Sockets are to become **async-only with every consumer ported** (Jake, 2026-07-24) — that port is BLOCKED on the E0600 aggregate-across-await compiler increment. Forks LOCKED earlier: waker lifetime = **separate `Arc`-wrapper**; reactor = **dedicated thread, per-`Executor`** (`![thread_local]` current-reactor handle); platform = **both OSes (epoll + IOCP)**. **Inc 4a DONE+validated (2026-07-24): Arc-refcounted `Waker` (Copy→non-Copy) + `Arc<Task>` lifetime; finish-vs-park now implicit via `Task::drop` on the last decref. Needed a COMPILER fix (owner-generic static with a defaulted owner param + nested return → E0636; `call_resolver.cryo` default-backfill) → selfhost fixed point BOTH OS, win-s2 vs win-s3 = 0/235 `.ll`, REPINNED both OS. UNCOMMITTED.** NEXT = Inc 4b (the reactor: epoll+IOCP interface — bring Jake the readiness-vs-completion unification fork). |
 
 Legend: ☐ not started · ◐ in progress · ✅ done+validated · ⏸ blocked (note why in the Progress Log).
 
@@ -1390,3 +1390,96 @@ IR should be unchanged — verify the `win-s2` vs `win-s3` `.ll` diff at each bo
     `bin/cryo.exe` `fe981b8e…`), `verify-pin` OK. **Owner-generic static calls now resolve across all four shapes
     (inference-from-args, no-expected-type, turbofish, nested-owner-return) — the Inc-4b agent needn't worry about
     them.** UNCOMMITTED (only Jake commits). A fresh `HANDOFF.md` for Inc 4b is written.
+
+- _2026-07-24_ — **Inc 4b: the reactor + async TCP. Linux DONE + validated; Windows AFD backend WRITTEN but
+  UNVALIDATABLE HERE. Two COMPILER fixes → REPINNED both OS. UNCOMMITTED.** Baseline HEAD `beecc8da`; pin now
+  `e0e5aaed…` / `591c8f12…`, `verify-pin` OK, `make test` OVERALL PASS, both selfhost fixed points green
+  (Linux s3==s4; Windows s3==s4 byte-identical, 235 modules), **win-s2 vs win-s3 = 0/235 differing `.ll`** (the
+  compiler produces identical IR for all existing code — the repin exists to carry the new link flag and the
+  async fix, not an IR change). Files: NEW `stdlib/future/reactor.cryo`; `future/executor.cryo` (+reactor
+  lifecycle); `future/_module.cryo`; `net/socket/tcp.cryo` (async futures + `set_nonblocking`); `net/sys.cryo`
+  (+4 per-OS primitives); `sys/syscall.cryo` (IOCP/AFD bindings); `sema/async_lower.cryo` + `codegen/passes.cryo`
+  (the compiler fixes).
+  - **Jake's interface decision (the 4b one-way door):** presented readiness+WSAPoll vs readiness+AFD vs a per-OS
+    readiness/completion split, with WSAPoll recommended. **Jake chose readiness + real Windows AFD** (mio's
+    backend). Also asked for 4b scope = reactor core **plus** async TCP I/O in one increment. Recorded because the
+    recommendation was NOT the choice: the AFD route is the right long-term Windows answer and the reason the
+    interface is uniform, but it is what left Windows unvalidated (below).
+  - **Reactor core (`future/reactor.cryo`, both backends behind one interface).** `Reactor::start()` opens the OS
+    backend and runs a dedicated thread; `register(fd, direction, waker)` / `cancel(fd, direction)` /
+    `deregister(fd)` / `poll_once(timeout)`. Registrations are heap blocks in a 64-bucket table keyed `fd & 63`,
+    existing exactly while a direction is armed. Backends are `![target(...)]` free fns (`rt_backend_open/close`,
+    `rt_arm`, `rt_disarm`, `rt_kick`, `rt_wait`) reporting `(fd, ready-bits)` pairs, so the shared core is
+    OS-agnostic. **Linux:** epoll + eventfd kick, `EPOLLONESHOT` re-armed explicitly. **Windows:** IOCP + an
+    `\Device\Afd` helper handle, one `IOCTL_AFD_POLL` per arm, `PostQueuedCompletionStatus` as the kick.
+  - **Three invariants that are correctness, not taste** (all in the module doc): (1) **level-triggered, never
+    edge** — a future attempts its syscall *before* registering, so an arm must report already-ready descriptors
+    or a late registration parks forever; (2) **dispatch by descriptor number, never by a pointer to the
+    registration** — a stale event for a closed/recycled fd then costs one spurious poll instead of a
+    use-after-free; (3) **no waker is woken or dropped while the table lock is held** — dropping a waker releases
+    a task ref, which can run the task's destructor → the future's destructor → `deregister`, re-entering the
+    non-recursive lock. Every op moves displaced wakers into caller locals released after the unlock. (1) and (3)
+    were found by reasoning, not by a failing test; (3) was a real self-deadlock in the first draft.
+  - **Executor wiring.** `ExecInner` gains `reactor: Reactor*`; `worker_body` publishes it once per thread via the
+    `![thread_local]` handle (**first stdlib use of `![thread_local]` — it links and works cross-module**);
+    `Executor::drop` orders teardown join-workers → **stop reactor** → drain queue, because stopping the reactor
+    releases the wakers that are the last reference to tasks parked on I/O (reclaiming them), and draining first
+    would strand anything woken in the interim.
+  - **Async TCP in `net/socket/tcp.cryo`** (Jake: no separate `tcp_async` module). `TcpConnect` / `TcpAccept` /
+    `TcpRead` / `TcpWrite`, owned-handle style per §7-6: each future **owns** the socket and hands it back in
+    `TcpIo` / `TcpAccepted`, which expose it through `take_stream()` / `take_listener()` / `take_result()`.
+    Dropping a parked future cancels only its own direction and closes the socket it owns. Plus
+    `set_nonblocking` on both types and four per-OS primitives in `net::sys` (`os_set_nonblocking`,
+    `os_connect_pending`, `os_connect_done`, `os_sock_error`).
+  - **Validation (Linux).** Pipe park→wake, 8 concurrent parks, drop-while-parked, 20 re-park rounds, and a real
+    async echo (connect/accept/write/read over loopback, 11 round trips per run): **25–30 process runs each, zero
+    failures, and valgrind clean — 151 allocs / 151 frees, 0 errors**, including the drop-while-parked path where
+    a stranded registration or task ref would show.
+  - **COMPILER FIX 1 (the big one) — an `async function` could only await futures whose `Output` equalled its own
+    return type.** `async_lower.cryo` typed the sub-future's poll call and its `__poll_k` temp with `sm.poll_out`
+    (**this** function's `Poll<Output>`) instead of `Poll<awaited Output>`, so any other await died with E0200
+    ("expected `Poll<i64>`, found `Poll<Pair>`"). Every Phase-2 probe awaited `Ready<i64>` inside an `-> i64`
+    function, which is exactly the case where the two coincide — that is why four increments of validation missed
+    it. Fix: carry the `Poll<>` base in `PollSm` and instantiate `Poll<ao>` from the awaited expression's own type.
+    Now awaiting struct- and generic-enum-output futures compiles AND runs correctly (probe `awaitagg`).
+  - **COMPILER FIX 2 — Windows link line.** The reactor's backend needs `ntdll` (AFD lives under the NT layer) and
+    mingw auto-links it no more than it does Winsock, so `-lntdll` joins `-lws2_32` in both Windows
+    `LinkerConfig`s (`codegen/passes.cryo`), the same precedent and for the same reason.
+  - **⚠ WINDOWS IS UNVALIDATED — and this is a wine limitation, not a code defect.** The Windows stdlib compiles,
+    links (with `-lntdll`) and runs under wine 9.0; `CreateIoCompletionPort` works, `\Device\Afd\Cryo` **opens
+    successfully** (all three path spellings), sockets set up fine. But **`NtDeviceIoControlFile(IOCTL_AFD_POLL)`
+    never returns** — tried both via a `\Device\Afd` helper handle (wepoll/mio's design) and directly on an
+    IOCP-associated socket handle. Both hang, so an executor doing async I/O deadlocks under wine (the arm is
+    issued from `register()` on a worker). mio is likewise documented as not working under wine. **Verifying the
+    AFD backend requires a real Windows machine.** Two bugs WERE found and fixed along the way, so the path is
+    partly exercised: `INVALID_HANDLE_VALUE` must be the full-width all-ones pointer (`(0 - 1) as u8*` widens
+    wrong and `CreateIoCompletionPort` then fails), and the NT structures must be **8-byte aligned** — they are
+    now `u64`-backed buffers, since a struct of `u8` arrays is only byte-aligned off the heap and the NT layer
+    rejects a misaligned `IO_STATUS_BLOCK`.
+  - **Durable language/semantics facts established by probe** (all cost real debugging; the first four are the
+    reason the reactor and the socket futures are shaped the way they are):
+    1. **Assignment through a pointer does NOT drop the value it overwrites** — storing over a live `Waker` would
+       strand its task reference. Read the old value into a local first; that local's scope-exit drop releases it.
+    2. **A `_`-prefixed local still drops** (the underscore silences the lint only), and an explicit `.drop()`
+       does **not** double-drop (it marks the local consumed). Both idioms are safe.
+    3. **A `drop` method in a type body IS the destructor** — no `implement trait Drop` needed. `TcpStream` and
+       `TcpListener` are therefore droppable, which is why moving a field out of `TcpIo` is rejected and the
+       `take_*` (`mem::swap` with a closed placeholder) accessors exist.
+    4. **A by-value parameter that is not moved on drops at function exit.** `TcpRead::start(stream, …)` first
+       read `raw_fd()` and let the parameter die — closing the socket immediately. The futures now genuinely own
+       the handle. The probe caught this; nothing else would have.
+    5. **A future handed to `Executor::spawn` must implement `Drop`** (`task_drop_thunk` calls `fut.drop()`).
+    6. `join()` consumes its `JoinHandle`, so handles kept in an array must be taken out (`remove`), not indexed.
+  NEXT — **Jake has directed that sockets become async-only and every consumer be ported** (`net::http`,
+  `net::http2`, `net::tls`, `net::ws`, `net::https`, + the 4 net tests). Sequencing, in dependency order:
+  **(a)** the **E0600 aggregate-across-await** compiler increment — an `async function` still cannot hold an
+  aggregate across a suspend, and every ported protocol function must hold a `TcpStream` across awaits, so this
+  blocks the whole port. Design is clear: promote the aggregate to a struct field the `mut` way (single source of
+  truth, no copies), initialize it as `Option<T>` = `None` in the constructor (the proven `fut_k: Option<F_k>`
+  precedent) and take/put it around each block, which sidesteps both the missing zero value and any double-drop.
+  **(b)** port the protocol layers — they are mostly generic over `S: Read + Write` (`http2/connection.cryo`,
+  855 lines, has zero concrete socket uses), so the concrete touchpoints are few, BUT `net::tls` hands its fd to
+  OpenSSL's blocking BIO and needs a non-blocking BIO + `WANT_READ`/`WANT_WRITE` handling — its own design problem.
+  **(c)** only then delete the blocking surface from `tcp.cryo` and rename the async ops onto `read`/`write`/
+  `accept`/`connect`. **(d)** validate the AFD backend on real Windows. Keeping the blocking API until (c) is what
+  keeps the tree green; deleting it first would leave the whole net stack red across (a) and (b).

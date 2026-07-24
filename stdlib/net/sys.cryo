@@ -182,6 +182,72 @@ function os_set_broadcast(fd: i32, on: boolean) -> i32 {
     return syscall::setsockopt(fd as u64, 65535, 32, &v as u8*, 4);
 }
 
+// ---- non-blocking mode + in-flight connect status --------------------------
+// Async I/O needs sockets that report "would block" instead of sleeping the
+// calling thread: the reactor does the waiting. POSIX toggles a file-status
+// flag; Winsock has a dedicated ioctl and no way to read the mode back.
+
+![target(unix)]
+function os_set_nonblocking(fd: i32, on: boolean) -> i32 {
+    const cur: i32 = libc::fcntl(fd, libc::F_GETFL, 0 as i64);
+    if (cur < 0) { return -1; }
+    const next: i32 = if (on) { cur | libc::O_NONBLOCK } else { cur & ~libc::O_NONBLOCK };
+    return libc::fcntl(fd, libc::F_SETFL, next as i64);
+}
+![target(windows)]
+function os_set_nonblocking(fd: i32, on: boolean) -> i32 {
+    mut v: u32 = if (on) { 1u32 } else { 0u32 };
+    return syscall::ioctlsocket(fd as u64, syscall::FIONBIO, &v);
+}
+
+/// True when `err` from a `connect` means "started, ask again later" rather
+/// than a failure. POSIX reports `EINPROGRESS` (which maps to no dedicated
+/// `IoErrorKind`, so the raw code is matched); Winsock reports would-block.
+![target(unix)]
+function os_connect_pending(err: &IoError) -> boolean {
+    return err.os_code == libc::EINPROGRESS || err.os_code == libc::EALREADY;
+}
+![target(windows)]
+function os_connect_pending(err: &IoError) -> boolean {
+    return err.os_code == syscall::WSAEWOULDBLOCK || err.os_code == syscall::WSAEALREADY;
+}
+
+/// True when `err` from a *repeat* `connect` on an in-flight socket means the
+/// connection is already established. Re-calling `connect` is how an async
+/// connect future asks "are we there yet": it reports success, still-pending, or
+/// the real failure, on both platforms and without reading `SO_ERROR`.
+![target(unix)]
+function os_connect_done(err: &IoError) -> boolean {
+    return err.os_code == libc::EISCONN;
+}
+![target(windows)]
+function os_connect_done(err: &IoError) -> boolean {
+    return err.os_code == syscall::WSAEISCONN;
+}
+
+/// The pending error on `fd` (`SO_ERROR`), which is how a non-blocking connect
+/// reports its outcome once the socket becomes writable: 0 means connected.
+/// Returns -1 if the option itself could not be read.
+![target(unix)]
+function os_sock_error(fd: i32) -> i32 {
+    mut v: i32 = 0;
+    mut len: u32 = 4u32;
+    if (libc::getsockopt(fd, libc::SocketLevel::SOL_SOCKET, libc::SO_ERROR,
+                         &v as u8*, &len) != 0) {
+        return -1;
+    }
+    return v;
+}
+![target(windows)]
+function os_sock_error(fd: i32) -> i32 {
+    mut v: i32 = 0;
+    mut len: i32 = 4;
+    if (syscall::getsockopt(fd as u64, 65535, 4103, &v as u8*, &len) != 0) {   // SOL_SOCKET, SO_ERROR
+        return -1;
+    }
+    return v;
+}
+
 // SO_RCVTIMEO/SO_SNDTIMEO: POSIX wants a 16-byte `struct timeval` (two host-
 // order i64s); Winsock wants a 4-byte DWORD of milliseconds.
 ![target(unix)]
