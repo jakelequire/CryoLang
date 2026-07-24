@@ -36,7 +36,7 @@ not for routine judgement calls.
 | 0 | Design lock-down (surface, trait shapes, lowering placement) — get Jake's sign-off | ✅ done — locked 2026-07-22 (§7 filled) |
 | 1 | Core types in stdlib (`Poll`/`Future`/`Context`/`Waker`) + `block_on` + hand-written futures | ✅ done+validated 2026-07-22 (no repin) |
 | 2 | Compiler: `async fn` parse + state-machine lowering + `await` desugar | ✅ DONE+validated (2026-07-23) — parse + no-await (1b) + single await (2) + N straight-line (3) + awaits across `if`/`else` (4a) + awaits across `while`/`for`/`loop`/`do-while` + `break`/`continue` + `mut` loop-carried promotion (4b) + scope-aware alpha-rename, all committed through `5e28a74f`. **Inc 4c DONE (2026-07-23): `await` inside a `match` arm — dispatch `match(subj)` → per-arm entry states → join; scalar pattern bindings captured to fields (aggregate→E0600, ref→E0455); pattern bindings alpha-renamed for by-name soundness; non-exhaustive match gets synth `_ => join`. Plus the bare-block-with-await warm-up. Both-OS fixed point, `win-s2`/`win-s3` = 0/235 `.ll` → NO REPIN, UNCOMMITTED.** All common control flow now lowers → Phase 2 complete. |
-| 3 | Executor + `Waker` + `spawn`/`JoinHandle`; multi-thread; poll-boundary `catch_unwind` isolation | ◐ in progress — surface LOCKED 2026-07-23. **(a) single-thread executor + ready-queue + re-enqueueing Waker DONE+validated; (b) `spawn`/`JoinHandle` (Output via `TaskShared<O>`), `block_on`, `join`/`detach`/`abort`, drop=detach DONE+validated.** No repin (pure stdlib). NEXT: (c) multi-thread worker pool + per-task RUNNING state + `catch_unwind` poll-boundary isolation (validate under `--panic=unwind` in WSL). |
+| 3 | Executor + `Waker` + `spawn`/`JoinHandle`; multi-thread; poll-boundary `catch_unwind` isolation | ✅ DONE+validated (2026-07-24) — surface LOCKED 2026-07-23. **(a)** single-thread executor + ready-queue + re-enqueueing Waker; **(b)** `spawn`/`JoinHandle` (Output via `TaskShared<O>`), `block_on`, `join`/`detach`/`abort`, drop=detach; **(c)** pthread worker pool + per-task atomic run-state (IDLE/SCHEDULED/RUNNING/NOTIFIED) + condvar `join`/`block_on` + `catch_unwind` poll-boundary isolation. Needed a NEW compiler `![config(panic_unwind)]` gating atom (see §9) → Phase-1 both-OS REPIN (selfhost fixed point, 235 `.ll`). Executor is self-contained (own pthread wrappers, no `thread::Scope` dep). Validated on Linux: regression 30/30, isolation 30/30. UNCOMMITTED. |
 | 4 | Reactor (epoll/IOCP) + async I/O over `std::net` + timers + `async fn main` + combinators | ☐ not started |
 
 Legend: ☐ not started · ◐ in progress · ✅ done+validated · ⏸ blocked (note why in the Progress Log).
@@ -1163,3 +1163,79 @@ IR should be unchanged — verify the `win-s2` vs `win-s3` `.ll` diff at each bo
   pumping; **`catch_unwind` at the poll boundary** (a `run_poll(ctx)` trampoline mirroring `run_catch_body`) so a
   panicking task yields `Err(Panicked)` and siblings survive. Validate task isolation under `--panic=unwind` in
   WSL (`bin/cryo` is the Linux ELF). Keep the `--panic=abort` path working (task panic aborts, per §7-6).
+
+- _2026-07-24_ — **Phase 3 stage (c) DONE + validated: multi-thread worker pool + `catch_unwind` task
+  isolation.** Environment: fresh **Linux codespace** (not Jake's Windows box — the HANDOFF warned to verify;
+  `--panic=unwind` is native here, no WSL needed). **State discrepancy found at start:** commit `b159494e`
+  ("Implement multi-threaded executor … Phase 3 Stage c") + repin `b3ab958d` were already on `ll-impl`, but
+  `b159494e` actually committed the stage-(a)/(b) **single-thread** executor under a stage-(c) label (its own doc
+  said "single-thread core … no worker pool yet"; no pthread/atomic-state/`catch_unwind` in the code). Stage (c)
+  was genuinely still to do; this entry does it.
+  - **Jake's two decisions (asked up front):** (1) **compiler atom + full stage (c) with isolation** (over a
+    pure-stdlib-executor-first split); (2) **`Executor::new()` always spins workers** (over single-thread `new()`
+    + opt-in `with_threads`).
+  - **Compiler prerequisite (Phase 1, both-OS REPIN):** `catch_unwind`/`intrinsics::try_catch` is a hard compile
+    error under `--panic=abort` (`call_emitter.cryo` `emit_catch_unwind`, gated on `ctx.project_panic_unwind`),
+    and ConfigGating had no panic-strategy atom. Added **`panic_unwind` as a feature atom** to `CfgEnv`
+    (`config_gating.cryo`: field + `from_ctx` from `ctx.project_panic_unwind` + `is_feature_atom` +
+    `feature_active`) and to the `directive_processing.cryo` flavor validator. The `not(...)` combinator + bare
+    `config(atom)` already dispatch feature atoms generically, so `![config(panic_unwind)]` /
+    `![config(not(panic_unwind))]` both work with ZERO evaluator changes. selfhost-check GREEN (win s3==s4
+    byte-identical, 235 modules) → `make pin` both OS, `verify-pin` OK. This is the **2-phase repin ritual**: the
+    pinned compiler must understand the atom BEFORE the stdlib that uses it can build (old pin would keep both
+    gated `poll_boundary` variants → duplicate-def).
+  - **Executor rewrite (Phase 2, pure stdlib, NO further repin):** `stdlib/future/executor.cryo`. `ExecInner`
+    now embeds two pthread mutex+condvar pairs (`u8[40]`/`u8[48]`, mpsc idiom): a **queue** lock/cond (workers
+    park in `take()` until work or shutdown) and a **done** lock/cond (joiners park until a task finishes).
+    `Task` gains an `Atomic<u8> run_state` (**IDLE/SCHEDULED/RUNNING/NOTIFIED**) replacing the stage-a/b `queued`
+    bool: `task_wake` CAS `IDLE→SCHEDULED`(+enqueue) or `RUNNING→NOTIFIED`(defer); a worker CAS `SCHEDULED→RUNNING`
+    (done under the queue lock at dequeue), then on Pending CAS `RUNNING→IDLE` (quiet → reclaim CANCELLED,
+    unreschedulable in Phase 3) or `NOTIFIED→SCHEDULED`(+reenqueue). `join`/`block_on` **block on the done-cond
+    until `hs == HS_TASK_FIN`** (NOT merely `outcome != PENDING` — the finishing worker's hs.swap is its LAST
+    touch of the block, so waiting on hs closes the read-vs-free race), then read+free exactly as stage (b).
+    `finish_task` broadcasts the done-cond only on the HS_LIVE path (a live joiner), after the hs.swap.
+    `TaskCtl` gains a `panic: PanicInfo` field for the PANICKED path.
+  - **Poll-boundary isolation:** two file-scope `poll_boundary(poll_fn, fut, shared, cx, out_panic)` free fns
+    (ConfigGating strips decls, not method bodies): `![config(panic_unwind)]` runs the erased poll inside
+    `intrinsics::try_catch` via a `run_poll(void*)`/`PollCtx` trampoline (mirrors `run_catch_body`), and on a
+    caught panic reads `panic_unwind::taken_panic_info()` (NEW gated helper in `panic_unwind.cryo` that reads the
+    `__cryo_panic_taken_*` externs — gated so they stay unreferenced under abort) → status 2 → `finish PANICKED`
+    with the info stashed in `TaskCtl.panic`; the `![config(not(panic_unwind))]` twin is a plain direct poll
+    (task panic aborts the process — accepted, §7-6). The panic runtime tier `runtime/.bin/libcryort-panic-unwind.a`
+    must exist (`cd runtime && cryo build` — it was missing on this box; the `[[lib]] cryort-panic-unwind` member
+    builds it).
+  - **Self-contained (no `thread` dep):** `import thread` brought `thread::JoinHandle` into scope and its leaf
+    clashed with `executor::JoinHandle` — misresolving the destructure-annotation form AND (in a consumer's
+    dependency-build) `spawn_on`'s return type. Fix: **dropped `import thread` entirely**; the executor owns its
+    pool via gated `worker_tramp`/`exec_spawn_worker`/`exec_join_worker`/`exec_cpu_count` free fns (same
+    pthread/Win32 primitives `thread` uses) and stores worker tids in a `u64[]`; `Executor::drop` sets shutdown +
+    broadcasts + joins each worker + `drain_cancelled` + frees. `Executor::new()` = `with_threads(cpu_count())`.
+  - **Landmines hit + durable fixes:** (1) **`import thread` JoinHandle leaf-clash** → self-contain (above);
+    qualifying the annotation (`future::executor::JoinHandle`) does NOT help — the resolver binds the bare leaf to
+    the import. (2) `const {..}: T = this;` destructure REQUIRES the `: T` annotation (un-annotated is a parse
+    error), so where `T` clashes, read fields + null `this.shared` to neutralize the Drop instead. (3) **A static
+    method on a GENERIC owner reached only through another generic's instantiation is not monomorphized (E0636 at
+    codegen)** — `TaskShared<O>::detach` compiled in the lib build but failed in the probe; reverted to a free
+    `detach_shared<O>` (the stage-b proven form; `Atomic<u8>::new` works only because its owner arg is concrete).
+    (4) Verified empirically (scratchpad probe): **`ptr.drop()` auto-derefs a raw `F*` and runs drop glue even
+    when `F` has no `Drop`** — so `task_drop_thunk<F>` needs NO `where F: Drop` (a bound would wrongly reject
+    non-Drop futures), matching `thread_body`; executor now uses auto-deref style throughout per Jake.
+    (5) Empirically (probe): **`&this` inside a method IS the object's box address** (not a hidden ref-param
+    addr), and **a whole-struct move with a non-Copy `Atomic` field (`*p = T::new(...)`) works**. So `finish`
+    means every `Task` method is instance/constructor: `Task::new(...)` (constructor, `*task = Task::new(...)`,
+    passing the monomorphized thunks as fn-ptr args); `drive`/`finish`/`free` are `mut &this` — `drive` hands
+    `&this as u8*` to the waker + re-enqueues `&this`, `free` self-deallocs `&this` (sound: `Task` has no `Drop`,
+    so freeing the borrowed receiver synthesizes no double-drop). Behaviorally proven by the self-wake path
+    (30/30). No static+raw-pointer `Task` methods remain.
+  - **Validation (Linux, pinned `bin/cryo` + `CRYO_STDLIB`):** `make stdlib` green (148 modules) under default
+    abort; regression probe (block_on + spawn/join + self-wake + abort→Cancelled) exit 103 **30/30**; isolation
+    probe under `--panic=unwind` (3 compute siblings + 1 panicker) exit 61 **30/30** — the panicker's `join`
+    returns `Err(Panicked)`, siblings complete, process does not abort. Probes in scratchpad (`exec_probes/`).
+  - **Repin status:** Phase-1 compiler atom REPINNED both OS (`bin/cryo` f67be7b9…, `bin/cryo.exe` d79abcb9…),
+    `verify-pin` OK. Phase-2 stdlib needs NO repin — the compiler links neither `future::executor` (no future IR
+    in its build) nor `core::panic_unwind` (no import; the added helper is abort-stripped). UNCOMMITTED (only Jake
+    commits). **The committed `b159494e` mislabels stages (a)+(b) as stage (c) — Jake may want to amend the
+    message/history.**
+  NEXT: **Phase 4** — reactor (epoll/IOCP) + async I/O over `std::net` + timers + `async fn main` + combinators.
+  At that point wakers outlive a poll (stored in reactor registrations) → the `Waker` `clone_fn`/`drop_fn` gain
+  real refcount bodies + a `Drop` impl, and the per-task run-state gains a waker refcount (see waker.cryo doc).
