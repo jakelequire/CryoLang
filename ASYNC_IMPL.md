@@ -35,7 +35,7 @@ not for routine judgement calls.
 |---|---|---|
 | 0 | Design lock-down (surface, trait shapes, lowering placement) — get Jake's sign-off | ✅ done — locked 2026-07-22 (§7 filled) |
 | 1 | Core types in stdlib (`Poll`/`Future`/`Context`/`Waker`) + `block_on` + hand-written futures | ✅ done+validated 2026-07-22 (no repin) |
-| 2 | Compiler: `async fn` parse + state-machine lowering + `await` desugar | ◐ nearly done — parse + no-await (1b) + single await (2) + N straight-line (3) + awaits across `if`/`else` (4a, committed) done; **Inc 4b DONE+validated (2026-07-23): awaits across `while`/`for`/`loop`/`do-while` (header/body/[update]/after states + back-edges), `break`/`continue` → state edges (loop-target stack on `PollSm`), and `mut` loop-carried promotion (in-place `ident→this.field` rewrite; scalar-Copy only, else E0600/E0455). Both-OS fixed point (Linux+Windows s3==s4), `win-s2`/`win-s3` = 0/235 `.ll` → NO REPIN, UNCOMMITTED.** Only **Inc 4c (`await` inside a `match` arm)** remains; all common control flow now lowers. |
+| 2 | Compiler: `async fn` parse + state-machine lowering + `await` desugar | ✅ DONE+validated (2026-07-23) — parse + no-await (1b) + single await (2) + N straight-line (3) + awaits across `if`/`else` (4a) + awaits across `while`/`for`/`loop`/`do-while` + `break`/`continue` + `mut` loop-carried promotion (4b) + scope-aware alpha-rename, all committed through `5e28a74f`. **Inc 4c DONE (2026-07-23): `await` inside a `match` arm — dispatch `match(subj)` → per-arm entry states → join; scalar pattern bindings captured to fields (aggregate→E0600, ref→E0455); pattern bindings alpha-renamed for by-name soundness; non-exhaustive match gets synth `_ => join`. Plus the bare-block-with-await warm-up. Both-OS fixed point, `win-s2`/`win-s3` = 0/235 `.ll` → NO REPIN, UNCOMMITTED.** All common control flow now lowers → Phase 2 complete. |
 | 3 | Executor + `Waker` + `spawn`/`JoinHandle`; multi-thread; poll-boundary `catch_unwind` isolation | ☐ not started |
 | 4 | Reactor (epoll/IOCP) + async I/O over `std::net` + timers + `async fn main` + combinators | ☐ not started |
 
@@ -880,14 +880,119 @@ IR should be unchanged — verify the `win-s2` vs `win-s3` `.ll` diff at each bo
     `5bacb46b83c166bc759794ee338a8c33`; Windows `s3`==`s4`, 235 modules). `win-s2` (pinned-built) vs `win-s3`
     (new-built) = **0/235 differing `.ll`** → the lowering is inert for async-free code → **NO REPIN**. Pin
     verifies OK; tree = `M async_lower.cryo` + `M ASYNC_IMPL.md`.
-  - **Durable limitation (shared with the const path since Inc 3/4a — NOT introduced by 4b):** cross-state
-    promotion is **by-name**. It under-promotes safely in most cases (a missed read surfaces as a loud "not
-    found"), but a promoted local that **shadows a same-named parameter** (or a sibling-scope local of the same
-    name, read before its decl-state) can be conflated by the global rewrite → a silent wrong value. The `mut`
-    path guards the re-declared-in-two-states case (E0600); the param-shadow case is unguarded in BOTH paths.
-    Proper fix = scope-aware promotion (bind promoted locals to fresh names / track scopes) covering const+mut
-    uniformly — recommended follow-up, deliberately NOT spot-guarded here to avoid an inconsistent mut-only
-    patch inconsistent with the shipped const path.
+  - **Durable limitation (shared with the const path since Inc 3/4a — NOT introduced by 4b) — ✅ RESOLVED
+    2026-07-23 by the scope-aware alpha-rename (see the next Progress-Log entry):** cross-state promotion WAS
+    **by-name**. It under-promotes safely in most cases (a missed read surfaces as a loud "not found"), but a
+    promoted local that **shadowed a same-named parameter** (or a sibling-scope local of the same name) could be
+    conflated by the global rewrite → a silent wrong value. Now fixed: a pre-flattening alpha-rename makes every
+    local's name globally unique first, so the by-name promotion is exact for both paths.
   NEXT: **Inc 4c — `await` inside a `match` arm** (pattern bindings live across a suspend); currently E0600.
   After 4c, Phase 2 is complete → **Phase 3** (executor + `spawn`/`JoinHandle` + multi-thread + poll-boundary
   `catch_unwind` isolation).
+
+- _2026-07-23_ — **Cross-state promotion is now scope-aware — the by-name param/sibling conflation is FIXED. No
+  repin (0/235 `.ll` diff). UNCOMMITTED.** Baseline HEAD `ad20987e` (Inc 4b committed+repinned by Jake), pin OK.
+  One modified file: `sema/async_lower.cryo` (+~230). Closes the durable limitation flagged in the Inc 4b entry.
+  - **Root cause:** promotion (`promote_cross_state` + `subst_*`) rewrites by NAME, and `IdentifierNode` carries
+    only a `name` (no resolved-decl link), so after the body is flattened into state blocks — where lexical
+    scope structure is gone — a param read (`mut sum = p`) and a shadowing local (`mut p` inside a loop) both
+    read as `Identifier(p)` and were rewritten to the same field. Confirmed: `shadow(100)` returned 6 (0 + 1+2+3)
+    instead of 106 (100 + 1+2+3). Sibling same-name locals hit the `mut` re-declared guard (spurious E0600).
+  - **Fix = a pre-flattening scope-aware alpha-rename** (`disambiguate_locals`, first thing in
+    `build_poll_body_sm`, BEFORE the body is flattened). It walks the original NESTED body with a lexical scope
+    stack (`RenameCtx`: parallel `orig`/`repl` binding stack + `marks` scope boundaries) and renames every local
+    `VarDecl` (block + `for`-init) to a globally-unique name (`<orig>$L<n>`), rewriting uses via innermost-first
+    scope lookup. **Parameters are intentionally NOT renamed** — their uses fall through unchanged and resolve to
+    the shadow prelude (`const <param> = this.<param>`), so a local shadowing a param no longer shares its name
+    once flattened. After the rename every binding is uniquely named → the by-name promotion is EXACT and the
+    `mut` re-declared guard never fires for legitimate siblings. (Alpha-rename, not decl-identity keying, because
+    identifiers have no decl link — renaming reconstructs the disambiguation the lost scope structure provided.)
+  - **In-place + total coverage:** the walk mutates `IdentifierNode.name` / `VarDeclNode.name` in place (no slot
+    reassignment). `rn_expr` covers EVERY expression form that can hold a local read (the full cloner kind list:
+    identifier/binary/unary/ternary/if-expr/call/new/cast/struct-lit/array-lit/tuple-lit/array-access/member/
+    typeof/delete/await/try/match-expr/lambda + the `desugared_call` operator-overload slots); `rn_stmt` covers
+    block/unsafe-block/if/while/do-while/for/loop/match/switch + decl/expr/return. Scopes: block, branch (a bare
+    non-block branch gets its own frame), `for`-init (encloses cond/update/body), match-arm (pattern
+    `binding_name`s shadow), lambda (params shadow + captured-name rewrite). An unwalked form leaves a renamed
+    local's use un-renamed → a loud "not found", never a silent miscompile.
+  - **Validation:** `async_shadow/` → EXIT 0: `shadow(100)=106` (was 6), `sib(true/false)=7/13` (sibling case
+    now compiles + correct, was spurious E0600). `async_shadow2/` → EXIT 0: a `for`-init local shadowing a param
+    (param read first) and an `if`-branch local shadowing a param. Inc 4b regression (`async_inc4b/`, 9 cases)
+    and negatives (`async_neg4b/`, E0600) unchanged.
+  - **Gate:** `CRYO_CC=gcc make selfhost-check` → exit 0, BOTH fixed points (Linux `s3`==`s4` md5
+    `5bacb46b83c166bc759794ee338a8c33`; Windows `s3`==`s4`, 235 modules). `win-s2` (pinned-built) vs `win-s3`
+    (new-built) = **0/235 differing `.ll`** → the rename is inert for async-free code (the compiler has no
+    `async fn`) → **NO REPIN**. (The s3/s4 fixed-point IR size grew vs the Inc 4b baseline only because the
+    compiler SOURCE grew +~230 lines — win-s2 and win-s3 grew equally, so they still match byte-for-byte.)
+  - **Discovered gap (separate, NOT fixed here):** a BARE block `{ … }` containing an `await` is not lowered
+    (`lower_stmt_sm` → E0600); only `if`/loops/carriers explode. Trivial to add (`lower_block_sm` on a nested
+    `BlockStatement`) — noted as an Inc 4b follow-up.
+  NEXT: unchanged — **Inc 4c** (`await` in a `match` arm), then Phase 3.
+
+- _2026-07-23_ — **Inc 4c DONE + validated (both OSes). No repin (0/235 `.ll` diff). UNCOMMITTED. Phase 2 is
+  now COMPLETE.** Baseline HEAD `5e28a74f` (scope-aware fix committed+repinned by Jake), pin verifies OK. Two
+  modified source files: `sema/async_lower.cryo` (+304/−27) and `sema/sema.cryo` (+1, the wire). `AsyncLower`
+  now lowers **`await` inside a `match` arm**, plus the **bare-block-with-await** warm-up — closing all common
+  control flow. Jake signed off the binding-lifetime approach via the question tool: **"promote scalars, defer
+  aggregates"** (Option 1).
+  - **Warm-up (bare block):** `lower_stmt_sm` gained a `BlockStatement` case → `lower_block_sm` (a nested
+    `{ … await … }` block is just a statement sub-sequence; its locals already get their own scope frame from
+    `disambiguate_locals`). Was E0600 before.
+  - **`lower_match_sm` (the increment):** in `cur`, a **dispatch `match (subj)`** (reusing the original
+    patterns + guards) captures each awaiting arm's scalar pattern bindings into fields and sets
+    `this.state = <arm entry>`; each arm body runs as its own state sequence and, unless it diverges,
+    converges on a shared **join** state — structurally `lower_if_sm` generalized to N arms. An **await-free
+    arm runs wholesale** in the dispatch arm (its bindings stay native → aggregate/ref bindings in a non-await
+    arm are unrestricted). A **non-exhaustive** match gets a synthesized `_ => { this.state = join; }` so a
+    non-matching subject continues past the `match` rather than respinning the (unchanged) dispatch state.
+    Await in a match **subject** or **guard** → E0600 (bind it first / restructure).
+  - **Pattern-binding promotion (the genuinely new problem).** A payload binding (`v` in `Some(v)`) is an
+    lvalue-pointer into the scrutinee with **no cached type** and lives in `cur`'s scope, but its arm body runs
+    in a different state — so a scalar binding **read** in the arm body (`name_read_in_stmt`) is promoted to a
+    field: the dispatch arm captures `this.__bind_<entry>_<name> = <name>;` (reading the pattern binding, valid
+    in the dispatch arm's scope — a scalar read copies the value out), and the arm body's reads are rewritten
+    in place to `this.__bind…` via the existing `subst_name_stmt` (reused verbatim from the `mut`-local path;
+    field registered in `sm.prom_field`/`prom_tys` like any promoted scalar, zero-init in the ctor). An
+    **unused** binding is skipped (no field, no error → an unused aggregate binding in an awaiting arm is
+    fine). **Binding TYPE is re-derived** via `PatternResolver::resolve_variant_payload_types` (patterns carry
+    no `resolved_type`): `AsyncLower.wire` now takes the already-wired `&this.patterns` (sema.cryo:194); the
+    collectors mirror `bind_arm_patterns`/`bind_enum_pattern` (top-level identifier binding → subject type;
+    enum payload → `payload_types[j]`; nested `Sub` → recurse). Guards: aggregate binding across a suspend →
+    E0600, reference → E0455 (same limits as `mut`/aggregate/reference locals — Inc 3/4b).
+  - **Pattern bindings are now alpha-renamed too (soundness).** `subst_name_stmt` is by-name, so a nested
+    `match` re-binding the same name (`Some(v) => { await…; match(x){ Some(v)=>use(v) } }`) would be conflated
+    → silent wrong value. Fix: `rn_arm` (in `disambiguate_locals`) now renames every pattern binding to a
+    globally-unique `<orig>$L<n>` (mirroring the `VarDecl` rename), sharing one fresh name across OR-alternatives
+    (`A(v) | B(v)`); const-value identifier patterns (their `binding_name` cleared by name resolution) are not
+    renamed. New helpers `collect_pat_binding_names` + `rn_pat_apply` (mutate `PatternBinding.name` /
+    `PatternNode.binding_name` through the AST — `binding_at`/`sub_at` return the real payload pointers).
+  - **`stmt_diverges` gained a `MatchStatement` case:** a match never falls through iff `match_is_exhaustive`
+    (via the wired `PatternResolver`) AND every arm body diverges. Without it, an async body ending in an
+    exhaustive all-arms-return `match` (no `_`) tripped a spurious "must return on every path" E0600.
+  - **Validation (via `future::block_on`, no turbofish):** scratchpad `async_match/` drives 11 cases → EXIT 0:
+    scalar match with awaiting arms + no bindings; enum payload binding read after a suspend; mixed
+    wholesale+awaiting arms; binding read before AND after a suspend; the **`nested_bind` case (=105)** that
+    directly proves the alpha-rename (a nested `match` re-binding `v` — without the rename it returns 5); and a
+    match ending the body with all arms returning. `async_bareblock/` (2 cases) covers the warm-up incl.
+    cross-state promotion through a nested block. Negatives (`neg_subj`/`neg_guard`/`neg_agg`) fire clean E0600
+    for await-in-subject / await-in-guard / aggregate-binding-across-await. The E0455 reference-binding branch
+    mirrors the locals path and is present but not separately probed (a reference match binding is hard to
+    construct — same note as Inc 4a's E0455).
+  - **Gate:** `CRYO_CC=gcc make selfhost-check` → exit 0, **BOTH fixed points** (Linux `s3`==`s4`; Windows
+    `s3`==`s4` byte-identical IR). `win-s2` (pinned-built) vs `win-s3` (new-built) = **0/235 differing `.ll`**
+    → the lowering is inert for async-free code (the compiler has no `async fn`) → **NO REPIN**. Pin verifies
+    OK; tree = `M async_lower.cryo` + `M sema.cryo` + `M ASYNC_IMPL.md`.
+  - **Durable notes:** (1) pattern bindings carry NO cached type — re-derive via
+    `resolve_variant_payload_types`; they are lvalue-pointers into the scrutinee, so a scalar read in the
+    dispatch arm copies the value out (the subject need NOT stay alive across the suspend). (2) Cryo has NO
+    tuple patterns — positional bindings exist only as enum-variant payload elements. (3) The dispatch match
+    reuses the original patterns/guard (the source `match` node is discarded), so its exhaustiveness == the
+    original's; enum non-exhaustiveness is already E0405 pre-lowering, so only integer/partial matches reach
+    the synth-`_` path.
+  NEXT: **Phase 3 — executor.** `block_on` real single-thread executor + task queue; a `Waker` that re-enqueues
+  its task; `spawn(future) -> JoinHandle`; then multi-thread (worker pool over `pthread`) with `catch_unwind`
+  at the poll boundary (sound because of Track 2's thread-local panic state). Validate task isolation (a
+  panicking task yields an error, siblings survive) under `--panic=unwind`. Remaining Phase-2 tails (all
+  deferred with loud diagnostics, none blocking Phase 3): `await` nested in an expression (E0600), aggregate/
+  reference locals **and** match bindings across a suspend (E0600/E0455), a `-> ()` async fn whose awaited body
+  falls off its end (E0600), `await` in a `match`/loop-condition/guard (E0600).
