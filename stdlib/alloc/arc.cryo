@@ -207,6 +207,48 @@ type struct Arc<T, A = GlobalAlloc> {
         }
         return Option::None;
     }
+
+    /// Consume this handle without touching the strong count, yielding the raw
+    /// header it referenced.  The caller inherits the one strong reference this
+    /// handle held and MUST later balance it - recover a handle with `from_raw`
+    /// and drop it, or call `decrement_strong_count` - or the value leaks.  The
+    /// consumed handle's own drop is suppressed (its `inner` is nulled), so
+    /// yielding the pointer here is not itself a decrement.  Enables a raw
+    /// `ArcInner*` to be parked in a `void*` slot (e.g. a manual-vtable waker)
+    /// outside the type system while still owning a reference.
+    into_raw(mut this) -> ArcInner<T, A>* {
+        const p: ArcInner<T, A>* = this.inner;
+        this.inner = null;
+        return p;
+    }
+
+    /// Reconstitute a handle from a pointer returned by `into_raw`, taking back
+    /// ownership of exactly one strong reference; the returned handle's drop
+    /// balances it.  Undefined unless `p` came from `into_raw` (or an
+    /// `increment_strong_count`) on an `Arc<T, A>` of this exact type whose
+    /// reference has not already been balanced.
+    static from_raw(p: ArcInner<T, A>*) -> Arc<T, A> {
+        return Arc<T, A> { inner: p };
+    }
+
+    /// Add one to the strong count of an `into_raw`'d header held only as a raw
+    /// pointer (no live handle).  Pairs one-for-one with a later
+    /// `decrement_strong_count`.  `Relaxed` matches `clone`: the new owner
+    /// already shares a happens-before edge with the caller.
+    static increment_strong_count(p: ArcInner<T, A>*) -> void {
+        p.strong.fetch_add(1u64, MemoryOrder::Relaxed);
+    }
+
+    /// Remove one strong reference from a header held only as a raw pointer,
+    /// running the value's destructor and freeing the header if it was the
+    /// last.  Balances one `into_raw` or `increment_strong_count` by routing
+    /// through the handle `Drop`, so the release/acquire teardown ordering is
+    /// identical.  Undefined if the reference was already balanced.
+    static decrement_strong_count(p: ArcInner<T, A>*) -> void
+    where T: Drop, A: Allocator {
+        mut a: Arc<T, A> = Arc::from_raw(p);
+        a.drop();
+    }
 }
 
 /// A non-owning reference to an `Arc`-managed value.  Obtain one with

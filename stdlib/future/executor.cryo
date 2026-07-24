@@ -60,6 +60,7 @@ import core::drop;
 import core::panic_unwind;
 import alloc::layout;
 import alloc::allocator;
+import alloc::arc;
 import sync::atomic;
 import ffi::libc;
 import sys::syscall;
@@ -204,11 +205,14 @@ type struct Task {
     next:       Task*;
     exec:       ExecInner*;
     run_state:  Atomic<u8>;
+    self_arc:   ArcInner<Task, GlobalAlloc>*;   // the box's own Arc header (for incref/decref)
 
     /// Build a ready-to-enqueue task around a boxed future + its shared control
     /// block. `run_state` starts SCHEDULED (the caller enqueues immediately) and
     /// `next` is unlinked; the vtable fn-ptrs are the future's monomorphized
-    /// thunks. Returned by value and moved into `spawn_on`'s heap box.
+    /// thunks. `self_arc` is null here — `spawn_on` wires it after `Arc::new`
+    /// places this value in its header. Returned by value and moved into that
+    /// `Arc<Task>`.
     static new(poll_fn:    (u8*, u8*, Context*) -> u8,
                drop_fn:    (u8*) -> void,
                dispose_fn: (u8*, u8) -> void,
@@ -224,60 +228,73 @@ type struct Task {
             next:       null,
             exec:       exec,
             run_state:  Atomic<u8>::new(ST_SCHEDULED),
+            self_arc:   null,
         };
     }
 
-    /// Poll this task once and apply the result. Honors a pending abort (finish
-    /// CANCELLED without polling). Returns true when the task finished (the caller
-    /// then frees the box via `free`), false when it re-scheduled (the queue still
-    /// owns it). `&this` IS the heap box address, so the `Waker` carries it and
-    /// the reschedule re-enqueues it.
+    /// Poll this task once. Returns true when the task re-enqueued itself — a
+    /// self-wake during the poll transferred the scheduling reference back to
+    /// the queue, so the caller must NOT release it — and false when it finished
+    /// or parked, in which case the caller releases the scheduling reference via
+    /// `task_decref`. The last release runs `Task::drop`, which finishes a
+    /// still-unfinished (parked, never re-woken) task as CANCELLED before the
+    /// box is freed. Honors a pending abort without polling. `&this` IS the heap
+    /// box address, so the owning `Waker` carries it.
     drive(mut &this) -> boolean {
         const ctl: TaskCtl* = this.shared as TaskCtl*;
         if (ctl.cancel.load(MemoryOrder::Acquire) == 1u8) {
             this.finish(OUTCOME_CANCELLED);
-            return true;
+            return false;
         }
-        mut cx: Context = Context::new(Waker::new_nonowning(task_wake, &this as u8*));
+        // The poll's `Waker` owns one reference — bumped here, released when
+        // `cx` drops at the end of this method — so any clone the future stores
+        // is a genuine extra reference that keeps the task alive while parked.
+        // The worker's scheduling reference outlives this method, so this bump
+        // is never the last: `cx`'s drop cannot free the box mid-poll.
+        task_incref(&this);
+        mut cx: Context = Context::new(Waker::new(task_wake, waker_arc_clone,
+                                                  waker_arc_drop, &this as u8*));
         mut pinfo: PanicInfo = PanicInfo { msg: "", file: "", line: 0u32 };
         const status: u8 = poll_boundary(this.poll_fn, this.fut, this.shared, &cx, &pinfo);
         if (status == 2u8) {
             ctl.panic = pinfo;
             this.finish(OUTCOME_PANICKED);
-            return true;
+            return false;
         }
         if (status == 1u8) {
             this.finish(OUTCOME_READY);
-            return true;
+            return false;
         }
-        // Pending. A wake during the poll left the state NOTIFIED; reschedule.
-        // Otherwise it is still RUNNING: with no reactor to ever wake it
-        // (Phase 3), an unreschedulable Pending task is reclaimed as CANCELLED
-        // rather than leaked — the exact point Phase 4's stored-waker ownership
-        // will move to.
+        // Pending. A wake during the poll left the state NOTIFIED; reschedule,
+        // transferring the scheduling reference back to the queue. Otherwise the
+        // state is still RUNNING and the task parks: a stored waker will wake it,
+        // or none will and the final `task_decref` cancels it via `Task::drop`.
         match (this.run_state.compare_exchange(ST_RUNNING, ST_IDLE,
                                                MemoryOrder::AcqRel, MemoryOrder::Acquire)) {
             Result::Ok(_) => {
-                this.finish(OUTCOME_CANCELLED);
-                return true;
+                return false;
             }
             Result::Err(_) => {
                 this.run_state.store(ST_SCHEDULED, MemoryOrder::Release);
                 this.exec.enqueue(&this);
-                return false;
+                return true;
             }
         }
     }
 
     /// Finish this task: drop its future, publish `outcome`, run the shared-block
-    /// handshake, and wake any joiner. Does NOT free the task box (the caller
-    /// owns that — see `free`). On READY the future's `Output` was already
-    /// moved into the shared block; on CANCELLED/PANICKED there is no result.
+    /// handshake, and wake any joiner. Does NOT free the task box (the owning
+    /// `Arc<Task>` reclaims it when the last reference drops). Nulls `fut` after
+    /// dropping the future so `Task::drop` knows finishing already ran and does
+    /// not repeat it. On READY the future's `Output` was already moved into the
+    /// shared block; on CANCELLED/PANICKED there is no result. Called at most
+    /// once per task (from `drive`, or from `Task::drop` when `fut` is non-null).
     finish(mut &this, outcome: u8) -> void {
         const ctl:  TaskCtl*      = this.shared as TaskCtl*;
         const exec: ExecInner*    = this.exec;
         const df:   (u8*) -> void = this.drop_fn;
         df(this.fut);
+        this.fut = null;
         ctl.outcome.store(outcome, MemoryOrder::Release);
         const prev: u8 = ctl.hs.swap(HS_TASK_FIN, MemoryOrder::AcqRel);
         if (prev == HS_HANDLE_GONE) {
@@ -298,13 +315,19 @@ type struct Task {
         }
     }
 
-    /// Free this finished task's box (the future was already dropped via
-    /// `finish`). `&this` is the box address; the caller must not touch the task
-    /// after this. Sound because `Task` has no `Drop`, so freeing the borrowed
-    /// receiver synthesizes no double-drop.
-    free(mut &this) -> void {
-        mut alloc: GlobalAlloc = GlobalAlloc::new();
-        alloc.deallocate(NonNull::new(&this as u8*), Layout::of<Task>());
+}
+
+/// Reclaim a task whose last reference is dropping. If it never finished
+/// (`fut` still non-null — it parked and was never re-woken, or the executor is
+/// tearing down), finish it as CANCELLED first so its future is dropped and any
+/// joiner is released; a finished task (`fut` null) needs nothing more. The
+/// `Arc<Task>` frees the box itself after this runs. Invoked by the `Arc` teardown
+/// through `task_decref`, never directly.
+implement trait Drop for struct Task {
+    drop(mut &this) -> void {
+        if (this.fut != null) {
+            this.finish(OUTCOME_CANCELLED);
+        }
     }
 }
 
@@ -363,22 +386,52 @@ type struct ExecInner {
         return t;
     }
 
-    /// Reclaim every still-queued task as CANCELLED (called from `Executor::drop`
-    /// after the workers have joined, so no locking is needed). Runs each
-    /// future's drop and the shared-block handshake, then frees the task box —
-    /// tasks never driven would otherwise leak their boxed futures.
+    /// Reclaim every still-queued task (called from `Executor::drop` after the
+    /// workers have joined, so no locking is needed). Releasing each task's
+    /// scheduling reference — the last reference for a never-driven task — runs
+    /// `Task::drop`, which finishes it CANCELLED (its future's drop + the
+    /// shared-block handshake) and frees the box; tasks never driven would
+    /// otherwise leak their boxed futures.
     drain_cancelled(mut &this) -> void {
         loop {
             const t: Task* = this.head;
             if (t == null) { break; }
             this.head = t.next;
             if (this.head == null) { this.tail = null; }
-            t.finish(OUTCOME_CANCELLED);
-            t.free();
+            task_decref(t);
         }
     }
 }
 
+
+/// Acquire one strong reference to `task`'s box. The owning waker's `clone_fn`
+/// and the wake path (handing the ready queue its own reference) call this; it
+/// pairs one-for-one with `task_decref`.
+private function task_incref(task: Task*) -> void {
+    Arc<Task, GlobalAlloc>::increment_strong_count(task.self_arc);
+}
+
+/// Release one strong reference to `task`'s box. The last release runs
+/// `Task::drop` (finishing an unfinished task) and frees the box. Pairs with
+/// `task_incref`, the initial `Arc::new` scheduling reference, and each stored
+/// waker.
+private function task_decref(task: Task*) -> void {
+    Arc<Task, GlobalAlloc>::decrement_strong_count(task.self_arc);
+}
+
+/// `Waker` `clone_fn` for an owning task waker: acquire a reference and return
+/// the same `Task*` handle, so the clone keeps the task alive until it drops. A
+/// bare fn-ptr stored in the `Waker` vtable, so a free function.
+function waker_arc_clone(data: u8*) -> u8* {
+    task_incref(data as Task*);
+    return data;
+}
+
+/// `Waker` `drop_fn` for an owning task waker: release the reference the waker
+/// held. A bare fn-ptr stored in the `Waker` vtable, so a free function.
+function waker_arc_drop(data: u8*) -> void {
+    task_decref(data as Task*);
+}
 
 /// The waker callback: `data` is the `Task*`. Reschedule it via the atomic
 /// run-state so it is enqueued at most once and never polled by two workers —
@@ -393,7 +446,11 @@ function task_wake(data: u8*) -> void {
         if (s == ST_IDLE) {
             match (task.run_state.compare_exchange(ST_IDLE, ST_SCHEDULED,
                                                    MemoryOrder::AcqRel, MemoryOrder::Acquire)) {
-                Result::Ok(_)  => { task.exec.enqueue(task); return; }
+                // Waking a parked task hands the ready queue a fresh scheduling
+                // reference (the waker keeps its own); the worker that later
+                // drives it releases this one. Bump BEFORE enqueue so a worker
+                // cannot dequeue-drive-and-decref it to zero before the bump.
+                Result::Ok(_)  => { task_incref(task); task.exec.enqueue(task); return; }
                 Result::Err(_) => { }   // lost the race; re-read and retry
             }
         } else if (s == ST_RUNNING) {
@@ -515,8 +572,11 @@ function worker_body(inner: ExecInner*) -> void {
     loop {
         const task: Task* = inner.take();
         if (task == null) { return; }
-        const done: boolean = task.drive();
-        if (done) { task.free(); }
+        // `drive` returns true when it re-enqueued the task (the scheduling
+        // reference moved back to the queue), false when it finished or parked —
+        // then release the scheduling reference this worker held.
+        const rescheduled: boolean = task.drive();
+        if (!rescheduled) { task_decref(task); }
     }
 }
 
@@ -615,19 +675,32 @@ where F: Future<O> {
     }
     *fbox = fut;
 
-    mut task: Task* = null;
-    match (alloc.allocate(Layout::of<Task>())) {
-        Result::Ok(raw) => { task = raw.cast<Task>().as_ptr(); }
+    // Box the task inside an `Arc<Task>`: the strong count is the box's
+    // lifetime. `Arc::new`'s initial count of 1 IS the scheduling reference,
+    // handed to the ready queue by `into_raw` (which suppresses the handle's own
+    // drop). `self_arc` back-points at the header so `task_incref`/`task_decref`
+    // reach the count from any `Task*`.
+    // Box the task inside an `Arc<Task>`: the strong count is the box's
+    // lifetime. `Arc::new`'s initial count of 1 IS the scheduling reference,
+    // handed to the ready queue by `into_raw` (which suppresses the handle's own
+    // drop). `self_arc` back-points at the header so `task_incref`/`task_decref`
+    // reach the count from any `Task*`.
+    mut arc_res: Result<Arc<Task, GlobalAlloc>, AllocError> =
+        Arc::try_new(Task::new(task_poll_thunk<F, O>, task_drop_thunk<F>,
+                               dispose_shared_thunk<O>, fbox as u8*, sh as u8*, inner));
+    match (arc_res) {
+        Result::Ok(arc) => {
+            const ap: ArcInner<Task, GlobalAlloc>* = arc.into_raw();
+            ap.value.self_arc = ap;
+            inner.enqueue(&ap.value);
+        }
         Result::Err(_)  => {
-            fbox.drop();
-            alloc.deallocate(NonNull::new(fbox as u8*), Layout::of<F>());
+            // `try_new` dropped the Task value; its `Drop` finished it CANCELLED
+            // and dropped the boxed future, so only the shared block remains.
             alloc.deallocate(NonNull::new(sh as u8*), Layout::of<TaskShared<O>>());
             panic("Executor::spawn: task allocation failed", FILE, LINE);
         }
     }
-    *task = Task::new(task_poll_thunk<F, O>, task_drop_thunk<F>, dispose_shared_thunk<O>,
-                      fbox as u8*, sh as u8*, inner);
-    inner.enqueue(task);
 
     return JoinHandle<O> { shared: sh, exec: inner };
 }

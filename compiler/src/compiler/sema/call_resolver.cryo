@@ -3580,6 +3580,53 @@ type struct CallResolver {
         return bindings;
     }
 
+    /// Bind the LEADING owner params the call args + expected return determine and
+    /// return that contiguous, all-concrete PREFIX (stopping at the first param a
+    /// source leaves unbound).  Unlike `infer_static_owner_bindings_from_args` /
+    /// `_from_expected` (all-or-nothing), a prefix lets a trailing DEFAULTED owner
+    /// param be backfilled from its declared default when it appears in neither the
+    /// params nor the return (`Arc<T, A = GlobalAlloc>::try_new`, whose `A` is
+    /// hardcoded GlobalAlloc in the signature).  Empty when nothing binds.
+    infer_static_owner_prefix(mut &this, tmpl: TemplateEntry*, method: MethodNode*,
+                              call: CallExprNode*) -> TypeRef[] {
+        if (method == null || method.func == null) { return []; }
+        if (tmpl.param_type_ids.length == 0) { return []; }
+        mut pids: u64[] = [];
+        for (mut i: i64 = 0; i < tmpl.param_type_ids.length; i++) { pids.push(tmpl.param_type_ids[i]); }
+        mut ictx: InferCtx = InferCtx::for_template(this.arena, pids);
+        // Source A: concrete (non-literal, non-null) argument types.
+        if (method.func.parameters.length == call.arguments.length) {
+            for (mut i: i64 = 0; i < method.func.parameters.length; i++) {
+                const p: VarDeclNode* = method.func.parameters[i];
+                if (p == null || !p.resolved_type.is_valid()) { continue; }
+                const arg: ExpressionNode* = call.arguments[i];
+                if (arg == null) { continue; }
+                if (this.sema_arg_is_polymorphic_literal(arg)) { continue; }
+                if (this.sema_arg_is_null_literal(arg)) { continue; }
+                const actual: TypeRef = arg.resolved_type;
+                if (!actual.is_valid()) { continue; }
+                ictx.unify(p.resolved_type, actual);
+            }
+        }
+        // Source B: the abstract return unified against the expected type, which
+        // recovers a param the args don't determine (incl. one nested in the return).
+        if (this.state.expected_type.is_valid()) {
+            const abstract_ret: TypeRef = method.func.resolved_return_type;
+            if (abstract_ret.is_valid() && this.types.contains_generic_param(abstract_ret)) {
+                ictx.unify(abstract_ret, this.state.expected_type);
+            }
+        }
+        // Contiguous bound prefix: stop at the first unbound / still-abstract param
+        // so `expand_default_type_args` backfills the trailing defaulted params.
+        mut prefix: TypeRef[] = [];
+        for (mut i: i64 = 0; i < ictx.bindings.length; i++) {
+            const b: TypeRef = ictx.bindings[i];
+            if (!b.is_valid() || this.types.contains_generic_param(b)) { break; }
+            prefix.push(b);
+        }
+        return prefix;
+    }
+
     /// Compute a generic static-method call's owner type args (declaration order,
     /// all-concrete) from the highest-priority available source.  Priority:
     /// explicit scope turbofish (authoritative) -> inferred-from-args -> expected
@@ -3647,6 +3694,33 @@ type struct CallResolver {
                     && this.types.view_type_arg_count(exp_ref_s) == want
                     && !this.types.contains_generic_param(exp_ref_s)) {
                 return this.types.view_type_args_copy(exp_ref_s);
+            }
+        }
+
+        // 2b. A trailing DEFAULTED owner param that the args and return leave
+        // unbound, whose owner does NOT base-match the expected type because the
+        // owner is NESTED inside it: `Arc<T, A = GlobalAlloc>::try_new(x) ->
+        // Result<Arc<T, GlobalAlloc>, E>`.  `A` is hardcoded GlobalAlloc in the
+        // signature (so it appears in no parameter and no free return position) and
+        // the `Result<...>` expected type makes step 2's base-match miss it - so
+        // without this, `A` never binds, the stash stays empty, and mono cannot
+        // specialize the owner (codegen E0636).  Bind the leading params the
+        // args/return DO determine, then backfill the trailing defaulted params from
+        // their declared defaults.  Runs AFTER step 2 so a non-default owner arg from
+        // a base-matching expected type still wins.
+        if (this.ctx.type_resolver != null) {
+            const prefix: TypeRef[] = this.infer_static_owner_prefix(tmpl, method, call);
+            if (prefix.length > 0 && prefix.length < want) {
+                mut rc_d: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
+                this.symbolic.symbolic_bind_params(&rc_d);
+                mut filled: TypeRef[] = this.ctx.type_resolver.expand_default_type_args(tmpl, prefix, &rc_d);
+                if (filled.length == want) {
+                    mut all_ok: boolean = true;
+                    for (mut i: i64 = 0; i < filled.length; i++) {
+                        if (!filled[i].is_valid() || this.types.contains_generic_param(filled[i])) { all_ok = false; break; }
+                    }
+                    if (all_ok) { return filled; }
+                }
             }
         }
 
