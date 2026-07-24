@@ -35,17 +35,17 @@ not for routine judgement calls.
 |---|---|---|
 | 0 | Design lock-down (surface, trait shapes, lowering placement) — get Jake's sign-off | ✅ done — locked 2026-07-22 (§7 filled) |
 | 1 | Core types in stdlib (`Poll`/`Future`/`Context`/`Waker`) + `block_on` + hand-written futures | ✅ done+validated 2026-07-22 (no repin) |
-| 2 | Compiler: `async fn` parse + state-machine lowering + `await` desugar | ◐ in progress — parse + no-await (Inc 1b) + single await (Inc 2) + **N straight-line awaits + cross-await local promotion (Inc 3) DONE+validated**; next = Inc 4 (branches/loops — **needs Jake sign-off**) |
+| 2 | Compiler: `async fn` parse + state-machine lowering + `await` desugar | ◐ in progress — parse + no-await (1b) + single await (2) + N straight-line awaits + promotion (3) done; **Inc 4a DONE+validated (2026-07-23): the whole lowering re-architected onto a `loop { match (this.state) {…} }` dispatcher (Jake's `match`, not switch); recursive state-machine builder handles awaits across `if`/`else` (branches, else-if, no-else, pre-branch local promotion). Both-OS fixed point, `win-s2`/`win-s3` = 0 `.ll` → NO REPIN, UNCOMMITTED.** Next = **Inc 4b (loops — back-edges + `break`/`continue` + `mut` loop-carried promotion)**; loops still E0600. [4c match-arm await deferred]. |
 | 3 | Executor + `Waker` + `spawn`/`JoinHandle`; multi-thread; poll-boundary `catch_unwind` isolation | ☐ not started |
 | 4 | Reactor (epoll/IOCP) + async I/O over `std::net` + timers + `async fn main` + combinators | ☐ not started |
 
 Legend: ☐ not started · ◐ in progress · ✅ done+validated · ⏸ blocked (note why in the Progress Log).
 
-**Current HEAD baseline:** `5f2776af` (`Implement multi-await support…` — Inc 3, committed by Jake on top of
-`b1414145`). Branch `ll-impl`. Pin verifies OK. **UNCOMMITTED:** the `block_on` inference fix below (two
-files: `sema/call_resolver.cryo` + `types/inference.cryo`; no repin). Tracks 1 (drop-completeness on unwind)
-and 2 (thread-local panic state) are **done + committed + repinned** — they are the prerequisites async plugs
-into (see §3).
+**Current HEAD baseline:** `ce7456c6` (`bound-directed projection for where-bound parameters` — the
+generic-METHOD where-bound work, a SEPARATE effort landed by Jake, on top of the now-committed `block_on`
+free-fn fix `e931ea5d` and Inc 3 `5f2776af`). Branch `ll-impl`. Pin verifies OK, tree clean. The `block_on`
+inference fix is now COMMITTED (no longer uncommitted). Tracks 1 (drop-completeness on unwind) and 2
+(thread-local panic state) are done + committed + repinned — prerequisites async plugs into (see §3).
 
 **✅ FIXED (2026-07-23) — `block_on` (and every where-bound-only-param generic) now infers without a
 turbofish.** Was: `block_on(fut)` — and any `f<F, R>(fut: F) -> R where F: Future<R>` — failed **codegen
@@ -704,3 +704,126 @@ IR should be unchanged — verify the `win-s2` vs `win-s3` `.ll` diff at each bo
   methods of this shape fail even WITH a turbofish (E0633) — even trivial `Bo::id<i32>(42)` fails E0200. The
   generic-method-with-where-bound path has multiple independent pre-existing gaps beyond inference; it needs
   its own effort (see §1). Reverted cleanly to the validated free-fn-only fix (call_resolver +82, inference +10).
+
+- _2026-07-23_ — **Inc 4 design SIGNED OFF by Jake (one-way door closed). Building Inc 4a.** Baseline HEAD
+  `ce7456c6`, pin OK, tree clean. Took §10's two options to Jake; he chose the **dispatch-loop state machine
+  (option a)** — with one refinement: the dispatcher is a **`match (this.state)`, NOT a C-style `switch`**
+  (there is no `switch` in Cryo; `switch` in §10 was pseudocode). Also a standing style note from Jake:
+  **emit bare integer literals (`1`), never `1u32`** — the compiler infers the integer type from context
+  (the existing `u32_lit` helper already emits bare text `"1"` with a u32 `resolved_type` hint, so generated
+  code is already compliant; keep it that way). Feedback memory [[prefer-bare-int-literals]].
+  **The agreed generated shape** (replaces Inc-3's forward-only `if (this.state==i)` fall-through chain):
+  ```
+  poll(mut &this, cx: Context*) -> Poll<Out> {
+      <arg-shadow prelude>                         // const p = this.p; …  (outside the loop)
+      loop {
+          match (this.state) {
+              0 => { <block 0>;  this.state = k; }   // transition: set state, FALL THROUGH the match →
+              …                                      //   the enclosing loop re-iterates → re-matches new state
+              j => { … return Poll::Pending; }       // suspend: real return exits poll
+              n => { return Poll::Ready(v); }         // completion
+              _ => { return Poll::Pending; }          // unreachable state guard (exhaustiveness)
+          }
+      }
+  }
+  ```
+  **Key realizations (durable, drove the design):**
+  - **No `continue`/`break` synthesis needed for the dispatcher.** A `match` arm is a statement whose body,
+    if it doesn't return, falls through to the end of the `loop` body → the `loop` re-iterates → re-matches
+    the (just-updated) `this.state`. So a *transition* is just `this.state = k;` with no terminator; only
+    *suspend* (`return Poll::Pending`) and *completion* (`return Poll::Ready`) are real returns. This makes
+    every edge — forward, branch, and (Inc 4b) back-edge — the uniform `this.state = k;`.
+  - **`loop {}` with no `break` DIVERGES per Cryo's checker** (proof: stdlib `block_on` is
+    `fn -> R { loop { … return v … } }` with no trailing return). So the dispatch loop needs NO trailing
+    `return Poll::Pending` fallback for E0403 (the Inc-3 fall-through chain needed one because it wasn't a
+    loop). The `_ =>` arm supplies match exhaustiveness and a safe no-progress result for a corrupted state.
+  - **`match` on a raw integer with literal + `_` arms is first-class and used in stdlib** (errno match
+    `stdlib/thread/_module.cryo:413`: `1 => …  11 => …  _ => …`). Synthesis recipe mirrors the parser:
+    `MatchStmtNode(subject=this.state, span)` + `add_arm`; each arm `MatchArmNode(span)` +
+    `add_pattern(PatternNode(PatternKind::Literal))` with `set_value(intern("0"))` +
+    `set_literal_kind(LiteralKind::Integer)` (bare, no suffix), or `PatternNode(PatternKind::Wildcard)` for
+    `_`; `set_body(block)`. `LoopStmtNode(body, span)`. This is the ONE new-AST risk (Inc 2/3 deliberately
+    avoided synthesizing `match` — used `if` + `Option::take().unwrap()` — because the injected `poll` is
+    re-type-checked POST-mono and every node must resolve by name; the errno precedent proves the shape
+    type-checks from source, so it should re-resolve).
+  **Staged rollout (each = build → validate under `block_on` → selfhost gate → `.ll` diff → no repin):**
+  - **Inc 4a — acyclic (if/else across a suspend) + the whole `loop { match }` machine.** Internally
+    two-stepped to isolate risk: (4a-1) *replace* the Inc-3 fall-through builder with the `loop { match }`
+    dispatcher preserving EXACT straight-line semantics — re-validate the Inc 2/3 probes (proves the match/loop
+    synthesis on known-good cases); (4a-2) generalize `build_plan` + the builder to allocate states for
+    if/else branches + a join, with generalized cross-await promotion (a local live from one state into a
+    different state → field; acyclic + single-assignment const ⇒ decl-state dominates all read-states ⇒ the
+    Inc-3 store-after-decl / load-at-reader model still holds). Loops still hard-error E0600.
+  - **Inc 4b — loops** (`while`/`for`/`loop`/`do-while`): back-edges + `break`/`continue` → state transitions
+    + **mut loop-carried promotion** (deferred by Inc 3). Plan: a promoted `mut` local → rewrite every
+    occurrence (read AND write) to its `this.field` in place, so the field is the single source of truth (no
+    load/store-placement dance). Still scalar-Copy only; aggregate/non-Copy stays E0600.
+  - **Inc 4c (deferred) — `await` inside a `match` arm** (pattern bindings live across a suspend). Hard-error
+    past 4b.
+  **Risks to validate during 4a** (flagged, not hidden): (1) synthesized `MatchStmtNode`+literal patterns
+  re-resolving cleanly post-mono; (2) `_` satisfying the exhaustiveness/`no_match` checker (leave
+  `unwind_cleanup=[]`; abort path anyway); (3) synthesized `loop`+`match` control flow not confusing post-mono
+  MoveCheck/DropInsertion liveness (Inc 3 already runs `if`-blocks through them; loop+match is more CF);
+  (4) `-> ()` fall-through end of the last state needs an explicit `return Poll::Ready(())` terminator (the
+  loop won't fall off; a non-returning last arm would spin) — value-returning fns already return on all paths
+  (pre-lowering E0403), so only the unit case needs the synthesized tail.
+  NEXT: implement **Inc 4a-1** (swap fall-through → `loop { match }`, re-validate Inc 2/3 straight-line probes),
+  then **Inc 4a-2** (if/else). Do NOT commit; no repin unless the `win-s2` vs `win-s3` `.ll` diff moves.
+
+- _2026-07-23_ — **Inc 4a DONE + validated (both OSes). No repin (0 `.ll` diff). UNCOMMITTED.** Baseline HEAD
+  `ce7456c6`, pin verifies OK. One modified source file: `sema/async_lower.cryo` (+404/−353). The whole poll
+  lowering was **re-architected** from Inc-3's forward-only `if (this.state==i)` fall-through chain onto the
+  agreed **`loop { match (this.state) { i => <block i>, _ => Poll::Pending } }`** dispatcher, and a **recursive
+  state-machine builder** now handles `await`s across `if`/`else`. Done in two internal steps (each a green
+  boundary):
+  - **4a-1 (swap dispatcher, same surface).** Replaced the fall-through wrapping with `loop { match }`
+    (`match_arm_int`/`match_arm_wild` synthesize bare integer-literal + `_` patterns, mirroring
+    `expr_parser.cryo:1939`; `LoopStmtNode` wraps it). A transition is now a bare `this.state = k;` that falls
+    off its arm → the `loop` re-dispatches (no `continue` synthesis needed — a non-returning `match`-statement
+    arm falls through, exactly like stdlib `block_on`'s `Pending => {}`). Removed the Inc-3 trailing
+    `return Poll::Pending` (the `loop` diverges, so E0403 is satisfied — `block_on` precedent). Re-validated
+    the Inc 2/3 straight-line probes → EXIT 0.
+  - **4a-2 (branches).** Replaced the flat `build_plan` + `build_poll_body_multi_await` + `emit_loads`/
+    `emit_stores` + `AsyncPlan` with: a **`PollSm` accumulator** (config + `blocks` + `ok` flag + discovered
+    `fut_*`/`prom_*` inventory) and a recursive builder — `build_poll_body_sm` → `lower_block_sm` →
+    `lower_stmt_sm` dispatching to `lower_carrier_sm` (top-level await → resume state) / `lower_if_sm`
+    (`if`/`else` → per-branch entry states + a join; else-if via recursion; no-else → false path goes straight
+    to join). `sm_alloc` mints states on demand; `sm_goto` emits a forward `this.state = k;`.
+    `stmt_diverges`/`block_diverges` suppress the join transition after a branch that returns (else it would be
+    dead code after a `return`). `lower` was reordered: **create the struct `TypeRef` → build the body
+    (discovering the inventory) → set the fields** (the field types are known only after the build; member
+    accesses resolve by name post-mono, so fields need only exist by then).
+  - **Promotion re-done as build-then-scan** (`promote_cross_state`): after the blocks are built, a local read
+    in a state other than its declaring one is promoted — store appended to the declaring block, a
+    `const <name> = this.<field>;` load **prepended** (`prepend_load` rebuilds `blk.statements`) to each other
+    reading block. This subsumes Inc-3's carrier-operand attribution *for free* (an await operand is physically
+    emitted into the previous state's block, so a local read only there is same-state → not promoted) and
+    naturally covers a pre-`if` local read inside a branch (over-promotes across a branch dispatch even without
+    a suspend on that path — harmless, the store dominates). Same deferrals as Inc 3: `mut`-cross-state →
+    E0600, aggregate → E0600, reference → E0455 (guard **moved verbatim** into `promote_cross_state` — same
+    code path; the 4 E0600 negatives were re-probed, E0455 was not separately re-probed this session).
+  - **Durable realizations:** (1) `match`-statement arms **don't fall through C-style**; a non-returning arm
+    runs to its end then control leaves the `match` → the enclosing `loop` re-iterates → this IS the transition
+    mechanism (no `goto`/`continue`). (2) `loop {}` with no `break` **diverges** per Cryo's checker (stdlib
+    `block_on` proof), so no trailing return is needed; the `_ =>` arm is only for exhaustiveness + a corrupted
+    state. (3) An `async fn` with awaits that can **fall off its end** (implicit unit return) is rejected here
+    (E0600) — it would spin the loop / re-poll a taken sub-future; value fns always return (pre-lowering
+    E0403), so this only bites the deferred unit case. (4) Pushing to a `PollSm*` array field
+    (`sm.blocks.push`) mutates in place across recursive calls (same pattern as `BlockStmtNode.add_statement`).
+  - **Validation (via `block_on`, no turbofish):** straight-line probe (`add_two`/`compute`/`chain`/`dep` +
+    no-await `answer`) → EXIT 0 (no Inc 2/3 regression). Branch probe → EXIT 0: `pick` (await in one branch),
+    `both` (await in both, each returns), `prelocal` (pre-`if` local promoted across the branch dispatch AND a
+    suspend), `grade` (else-if chain), `guard` (no-else `if` whose then awaits+returns, with further awaits
+    after the `if` carried by the join). Negatives all fire: await-in-loop / await-in-`if`-condition /
+    `mut`-cross-state / nested-await-in-expression → E0600.
+  - **Gate:** `CRYO_CC=gcc make selfhost-check` → exit 0, **BOTH fixed points** (Linux `s3`==`s4`; Windows
+    `s3`==`s4` byte-identical IR). `win-s2` (pinned-built) vs `win-s3` (new-built) = **0 differing `.ll`** →
+    the lowering is inert for async-free code → **NO REPIN**. Pin verifies OK; tree = `M async_lower.cryo` +
+    `M ASYNC_IMPL.md`.
+  NEXT: **Inc 4b — loops** (`while`/`for`/`loop`/`do-while` with an await in the body). The `loop { match }`
+  dispatcher already supports back-edges (a back-edge is just `this.state = <header>;` — the same forward-edge
+  primitive), so 4b = add `lower_while_sm`/`lower_for_sm`/`lower_loop_sm` (header/body/after states + the
+  back-edge) + rewrite user `break`/`continue` to state transitions + **`mut` loop-carried promotion** (the one
+  genuinely new piece Inc 3/4a deferred: a promoted `mut` local → rewrite every read AND write to `this.field`
+  in place, so the field is the single source of truth — no load/store dance). Still scalar-Copy only;
+  aggregate/non-Copy stays E0600. [4c: `await` inside a `match` arm, deferred.]
