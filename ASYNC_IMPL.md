@@ -37,15 +37,14 @@ not for routine judgement calls.
 | 1 | Core types in stdlib (`Poll`/`Future`/`Context`/`Waker`) + `block_on` + hand-written futures | ✅ done+validated 2026-07-22 (no repin) |
 | 2 | Compiler: `async fn` parse + state-machine lowering + `await` desugar | ✅ DONE+validated (2026-07-23) — parse + no-await (1b) + single await (2) + N straight-line (3) + awaits across `if`/`else` (4a) + awaits across `while`/`for`/`loop`/`do-while` + `break`/`continue` + `mut` loop-carried promotion (4b) + scope-aware alpha-rename, all committed through `5e28a74f`. **Inc 4c DONE (2026-07-23): `await` inside a `match` arm — dispatch `match(subj)` → per-arm entry states → join; scalar pattern bindings captured to fields (aggregate→E0600, ref→E0455); pattern bindings alpha-renamed for by-name soundness; non-exhaustive match gets synth `_ => join`. Plus the bare-block-with-await warm-up. Both-OS fixed point, `win-s2`/`win-s3` = 0/235 `.ll` → NO REPIN, UNCOMMITTED.** All common control flow now lowers → Phase 2 complete. |
 | 3 | Executor + `Waker` + `spawn`/`JoinHandle`; multi-thread; poll-boundary `catch_unwind` isolation | ✅ DONE+validated (2026-07-24) — surface LOCKED 2026-07-23. **(a)** single-thread executor + ready-queue + re-enqueueing Waker; **(b)** `spawn`/`JoinHandle` (Output via `TaskShared<O>`), `block_on`, `join`/`detach`/`abort`, drop=detach; **(c)** pthread worker pool + per-task atomic run-state (IDLE/SCHEDULED/RUNNING/NOTIFIED) + condvar `join`/`block_on` + `catch_unwind` poll-boundary isolation. Needed a NEW compiler `![config(panic_unwind)]` gating atom (see §9) → Phase-1 both-OS REPIN (selfhost fixed point, 235 `.ll`). Executor is self-contained (own pthread wrappers, no `thread::Scope` dep). Validated on Linux: regression 30/30, isolation 30/30. UNCOMMITTED. |
-| 4 | Reactor (epoll/IOCP) + async I/O over `std::net` + timers + `async fn main` + combinators | ☐ not started |
+| 4 | Reactor (epoll/IOCP) + async I/O over `std::net` + timers + `async fn main` + combinators | ◐ in progress 2026-07-24. Forks LOCKED: waker lifetime = **separate `Arc`-wrapper**; reactor = **dedicated thread, per-`Executor`** (`![thread_local]` current-reactor handle); platform = **both OSes (epoll + IOCP)**. **Inc 4a DONE+validated (2026-07-24): Arc-refcounted `Waker` (Copy→non-Copy) + `Arc<Task>` lifetime; finish-vs-park now implicit via `Task::drop` on the last decref. Needed a COMPILER fix (owner-generic static with a defaulted owner param + nested return → E0636; `call_resolver.cryo` default-backfill) → selfhost fixed point BOTH OS, win-s2 vs win-s3 = 0/235 `.ll`, REPINNED both OS. UNCOMMITTED.** NEXT = Inc 4b (the reactor: epoll+IOCP interface — bring Jake the readiness-vs-completion unification fork). |
 
 Legend: ☐ not started · ◐ in progress · ✅ done+validated · ⏸ blocked (note why in the Progress Log).
 
-**Current HEAD baseline:** `ce7456c6` (`bound-directed projection for where-bound parameters` — the
-generic-METHOD where-bound work, a SEPARATE effort landed by Jake, on top of the now-committed `block_on`
-free-fn fix `e931ea5d` and Inc 3 `5f2776af`). Branch `ll-impl`. Pin verifies OK, tree clean. The `block_on`
-inference fix is now COMMITTED (no longer uncommitted). Tracks 1 (drop-completeness on unwind) and 2
-(thread-local panic state) are done + committed + repinned — prerequisites async plugs into (see §3).
+**Current HEAD baseline:** `8e5a7694` (Phase 3 stage (c) — multi-thread executor + `catch_unwind` isolation +
+the `panic_unwind` config atom — committed + repinned by Jake). Branch `ll-impl`. Pin verifies OK, tree clean
+(only `HANDOFF.md` touched). `make stdlib` = 148 modules green. Phases 0–3 done + committed. NOTE: the §9
+stage-(c) entry's "UNCOMMITTED" is stale — that work is committed in `8e5a7694`.
 
 **✅ FIXED (2026-07-23) — `block_on` (and every where-bound-only-param generic) now infers without a
 turbofish.** Was: `block_on(fut)` — and any `f<F, R>(fut: F) -> R where F: Future<R>` — failed **codegen
@@ -1239,3 +1238,131 @@ IR should be unchanged — verify the `win-s2` vs `win-s3` `.ll` diff at each bo
   NEXT: **Phase 4** — reactor (epoll/IOCP) + async I/O over `std::net` + timers + `async fn main` + combinators.
   At that point wakers outlive a poll (stored in reactor registrations) → the `Waker` `clone_fn`/`drop_fn` gain
   real refcount bodies + a `Drop` impl, and the per-task run-state gains a waker refcount (see waker.cryo doc).
+
+- _2026-07-24_ — **Phase 4 STARTED — three design forks LOCKED by Jake (one-way doors closed). Building Inc
+  4a.** Baseline HEAD `8e5a7694` (Phase 3 stage (c) committed+repinned by Jake), pin verifies OK, tree clean,
+  `make stdlib` = 148 modules green. New session on a **Linux codespace** (verified — not Jake's Windows box).
+  Reconciled a doc/git discrepancy: the stage-(c) §9 entry says "UNCOMMITTED", but the multi-thread executor +
+  `panic_unwind` atom ARE committed in `8e5a7694` (789-line `executor.cryo` rewrite +
+  `config_gating.cryo`/`directive_processing.cryo`/`panic_unwind.cryo` + repin) — the note predated the commit.
+  - **Recon-confirmed Phase-4 substrate (grep the symbols):** epoll (`sys_epoll_create1`/`_ctl`/`_wait`),
+    `eventfd2`, `timerfd_create`/`_settime`, `clock_gettime`+`CLOCK_MONOTONIC` all bound (`sys/syscall.cryo`);
+    `Arc<T, A=GlobalAlloc>` is a full thread-safe refcount (`alloc/arc.cryo`: `ArcInner{strong,weak:
+    Atomic<u64>}` + `new`/`clone`/`get`/`get_mut` + `Weak`/`upgrade`); `TcpStream` (`net/socket/tcp.cryo`) is
+    blocking (`sock_read`/`sock_write`), has `from_fd`/`raw_fd`/`Drop`(closes fd)/`set_read_timeout` but **NO
+    `set_nonblocking`** (add `fcntl`+`O_NONBLOCK`; Windows `ioctlsocket`+`FIONBIO` already bound). **IOCP
+    bindings ABSENT** — `OVERLAPPED`+`FILE_FLAG_OVERLAPPED`+`ioctlsocket` exist but
+    `CreateIoCompletionPort`/`GetQueuedCompletionStatus`/`WSARecv`/`WSASend` do NOT → "both OSes" means writing
+    them. `![thread_local]` is compiler-supported but **unused in `stdlib/`** (only `runtime/` panic state uses
+    it) → the per-Executor current-reactor handle is the first stdlib use (validate at 4b).
+  - **The Phase-4 one-way-door seam (in the committed executor):** `Task::drive` builds
+    `Waker::new_nonowning(task_wake, &this as u8*)` (data = raw `Task*`, clone/drop = noop); on a quiet `Pending`
+    (`RUNNING→IDLE`) it **reclaims the task as CANCELLED and frees the box** — because Phase 3 has no reactor to
+    ever re-wake it. Phase 4 changes exactly this: a task that parked on the reactor must survive that `Pending`
+    because a *stored* waker wakes it later. `run_state` (IDLE/SCHEDULED/RUNNING/NOTIFIED) stays as the
+    scheduling/concurrent-poll guard; the new refcount governs LIFETIME (orthogonal).
+  - **Jake's three locked decisions (via the question tool):**
+    1. **Waker lifetime → separate `Arc`-style wrapper** (NOT a refcount field embedded in the `Task` box). Wrap
+       the (non-generic, erased) `Task` in an `Arc<Task>`; the waker's `data` carries the raw `ArcInner<Task>*`
+       and `clone_fn`/`drop_fn` become real free fns that bump/drop the strong count (last drop → drop `Task` +
+       free). Reuses the tested `alloc/arc.cryo` machinery instead of hand-rolling a refcount. **4a design detail
+       to resolve:** whether `arc.cryo` exposes `into_raw`/`from_raw` (reconstruct an `Arc` from the raw inner so
+       its `Drop` does the decrement) or the free fns manipulate `ArcInner.strong` directly.
+    2. **Reactor → dedicated thread, per-`Executor`.** One background thread per `Executor` runs the
+       `epoll_wait`/IOCP loop; async I/O + timer futures reach it via a `![thread_local]` **current-reactor
+       handle** the worker sets around each poll (so `Context` — a Phase-0 lock — stays unchanged; no ambient
+       global runtime, honoring §7-5). Composes with `Executor::drop` (shutdown → join the reactor thread too,
+       alongside the worker join it already does).
+    3. **Platform → both OSes (epoll + IOCP) from day one** (NOT Linux-first-Windows-stub). ⇒ the reactor
+       interface must accommodate BOTH the readiness model (epoll: wake when the fd is *ready*, then the future
+       does the syscall) and the completion model (IOCP: the OS does the overlapped op and wakes on *completion*).
+       **This is itself the next one-way door (bring to Jake at the 4b boundary):** unify on a readiness
+       abstraction with Windows AFD emulation (mio's approach — complex) vs. a thin per-OS reactor interface with
+       OS-gated I/O futures (`![config(...)]` free fns) sharing only "register interest → get woken". Recon +
+       recommendation owed before coding 4b.
+  - **Refined increment breakdown (each: build → validate under `block_on`/inline driver → gate → repin only if
+    default-path `.ll` moves):** **4a** Arc waker refcount evolution (OS-independent; pure stdlib, no repin) —
+    real `clone_fn`/`drop_fn` + `Arc<Task>` ownership + `Drop`; `RUNNING→IDLE` stops freeing. **4b** the reactor
+    (epoll + IOCP behind the chosen interface; `![thread_local]` current-reactor handle; eventfd/IOCP-post kick).
+    **4c** async I/O over `std::net` (`set_nonblocking` + read/write/accept/connect futures, owned-handle style
+    §7-6). **4d** timers (`sleep`/`timeout` via `timerfd`/IOCP timer). **4e** `async fn main` (compiler lower →
+    **selfhost-check + repin**). **4f** combinators (`join!`/`select!`/`try_join!`).
+  - **Flagged dependency (bites at 4c, not before):** the idiomatic read-loop `const (s,n) = s.read(buf).await;
+    use(s)` keeps an **aggregate (`TcpStream`) live across a suspend** → currently `E0600` (a deferred Phase-2
+    tail: aggregate-across-await promotion). 4a/4b + hand-written I/O futures validate fine under `block_on`
+    without loops; *looping* async I/O inside an `async fn` needs that promotion first. Separable — schedule when
+    real I/O ergonomics are reached; not a 4a/4b blocker.
+  NEXT: implement **Inc 4a** — study `arc.cryo` (`into_raw`/`from_raw`?), wrap `Task` in `Arc<Task>`, give the
+  `Waker` real `clone_fn`/`drop_fn` (bump/drop the strong count) + a `Drop` impl, make `RUNNING→IDLE` release
+  the queue's Arc ref instead of finishing-CANCELLED. Validate: a hand-written future that clones its waker,
+  returns `Pending`, is woken later from another thread → re-polled to completion; strong count reaches 0
+  exactly once (no leak, no double-free), stress ≥25×. Pure stdlib → `make stdlib` + `verify-pin`, no repin.
+
+- _2026-07-24_ — **Inc 4a DONE + validated (both OSes). COMPILER fix (owner-default backfill) → REPINNED both
+  OS. UNCOMMITTED.** Baseline HEAD `8e5a7694`, pin now updated (new SHAs `188bc76e…` / `44fd1963…`),
+  `verify-pin` OK. The Arc-refcounted waker (the Phase-4 one-way door) is in and stress-proven. Files: NEW raw API
+  in `alloc/arc.cryo`; `future/waker.cryo` (Copy→non-Copy); `future/executor.cryo` (`Arc<Task>` lifetime);
+  `sema/call_resolver.cryo` (the compiler fix).
+  - **The compiler fix (root cause, not a workaround — Jake's call).** The recurring "static on a generic owner
+    reached through another generic's instantiation → E0636" (the same class that forced `detach_shared<O>` in
+    Phase 3) was, for this case, an **owner-arg inference gap**, NOT a mono-registration gap. `Arc::try_new`
+    (`static try_new(v: T) -> Result<Arc<T, GlobalAlloc>, AllocError>`) failed because owner param **`A` is
+    hardcoded `GlobalAlloc` in the signature** (appears in NO parameter and NO free return position) AND the
+    owner is **nested** in the expected type (`Result<Arc<Thing>, …>`), so `compute_static_owner_bindings`
+    step 2's base-match misses it → `A` never binds → empty stash → mono never emits the spec → codegen E0636.
+    `Arc::new` escaped ONLY because its expected type IS the owner (`Arc<Thing>`, step 2 base-matches). **Bisected
+    with a minimal repro** (`use_new` OK vs `use_try_new` E0636, same concrete owner) — the trigger is the
+    return SHAPE (owner-is-return vs owner-nested-in-return), NOT the generic-caller context (both non-generic and
+    generic callers failed identically). **Fix (`call_resolver.cryo`, +74):** a new `infer_static_owner_prefix`
+    (binds the leading owner params the args + expected-return-unify determine, returns the contiguous concrete
+    PREFIX) + a step **2b** in `compute_static_owner_bindings` that backfills the trailing DEFAULTED params from
+    their declared defaults via the existing `expand_default_type_args` (the same primitive the turbofish path
+    already used). Runs AFTER step 2 so a non-default owner arg from a base-matching expected type still wins;
+    fires only when every prior source left a defaulted param unbound → **inert for all existing code**. Fixes the
+    whole `Owner::try_new`-style family, not just async. **Gate:** `make selfhost-check` → exit 0, BOTH fixed
+    points (Linux s3==s4; Windows s3==s4 byte-identical, 235 modules); **win-s2 vs win-s3 = 0/235 differing
+    `.ll`** → the compiler produces identical IR for all existing code. Compiler source changed ⇒ **REPINNED both
+    OS** (`make pin`, `verify-pin` OK). NOTE for the record: the earlier turbofish `Arc<Task,GlobalAlloc>::try_new`
+    is a SEPARATE still-open gap (E0200 in a generic body — the static-on-generic-owner turbofish cluster from §1);
+    the fix here makes the NON-turbofish inference path work, which is all Cryo idiom needs. And a THIRD, unrelated
+    gap surfaced in bisection: `Arc::try_new(x)` with NO expected type doesn't infer owner `T` from the arg (E0200)
+    — also left open (async always has an expected type).
+  - **The 4a stdlib rewrite (Arc<Task> lifetime).** `arc.cryo`: `into_raw`/`from_raw`/`increment_strong_count`/
+    `decrement_strong_count` (standard raw-Arc API; the manual-vtable waker needs to bump/drop the count from a
+    `void*`). `waker.cryo`: `Waker` gains a `Drop` (runs `drop_fn(data)`) → **Copy→non-Copy**; `Context::waker()`
+    now returns `.clone()` (a plain field copy would alias one `clone_fn` under two `drop_fn`s). `executor.cryo`:
+    `Task` gains `self_arc: ArcInner<Task, GlobalAlloc>*` (back-pointer, so `task_incref`/`task_decref` reach the
+    count from any `Task*` — no container-of). `spawn_on` boxes the `Task` in `Arc::new` (count 1 = the scheduling
+    ref, handed to the queue by `into_raw`). The owning poll `Waker` = `{task_wake, waker_arc_clone,
+    waker_arc_drop, &this}`; `drive` bumps a ref for `cx` (balanced when `cx` drops at method end). `task_wake`
+    bumps on `IDLE→SCHEDULED` (the queue's scheduling ref, distinct from the waker's own). **The finish-vs-park
+    decision is now IMPLICIT:** on a quiet `Pending` the worker just `task_decref`s the scheduling ref — if a
+    stored waker holds a ref the task PARKS (survives), else the last decref runs **`Task::drop`**, which finishes
+    an unfinished task CANCELLED (drops its future, handshake) before the `Arc` frees the box. No `strong_count`
+    inspection, no race. `finish` nulls `fut` so `Task::drop` knows finishing already ran. `Task::free()` deleted
+    (the `Arc` frees). `wake`/`wake_by_ref` stay by-ref (no signature change) — the waker always keeps its own
+    ref, released by its `Drop`.
+  - **Refcount protocol (durable):** scheduling ref (spawn `Arc::new` → queue → worker, one ref that persists
+    until finish/park) + one ref per stored waker (`clone_fn`+1 / `drop_fn`−1) + a transient `cx`-waker ref per
+    poll (bumped in `drive`, released at `cx` scope-exit). Self-wake = `RUNNING→NOTIFIED`, no ref change, `drive`
+    reschedules (transfers the scheduling ref back). Park+foreign-wake = the waker's stored ref keeps the box
+    alive; the wake `IDLE→SCHEDULED` bumps a fresh scheduling ref. This is the textbook `async-task` model.
+  - **Validation:** minimal E0636 repro → EXIT 0; full 4a probe (`scratchpad/exec4a`) — block_on / spawn+join /
+    self-wake (`WakeCounter`) / **stored-waker park → foreign-thread wake → complete** (`Parker` + main-as-reactor)
+    / abort→`Cancelled` / `Parker` dropped exactly once — **625 rounds across 25 process runs + 250 more via the
+    repinned `bin/cryo`, zero failures** (no race/leak/double-free). Also proven: a `Pending`-without-a-waker
+    future now correctly parks-then-CANCELS on the Executor (it can never be woken) — so Executor probes must
+    self-wake or store the waker (`block_on`'s free driver still re-polls unconditionally, so `PendingThenReady`
+    works there). `make stdlib` = 148 green.
+  - **Durable compiler-fix landmine:** `compute_static_owner_bindings` sources were all-or-nothing; a defaulted
+    owner param bound by NO inference source (not in params, not free in the return, owner nested in the expected
+    type) needs the default-backfill (step 2b). Any future `Owner<..., A = Default>::ctor -> Wrapper<Owner<...>>`
+    depends on it.
+  NEXT: **Inc 4b — the reactor.** The three forks are locked, but "both OSes from day one" opens the **next
+  one-way door: the reactor interface must span readiness (epoll: wake when the fd is ready, then syscall) AND
+  completion (IOCP: OS does the overlapped op, wakes on completion).** Bring Jake the unification fork —
+  (a) readiness abstraction + Windows AFD emulation (mio's way; complex) vs. (b) thin per-OS reactor interface
+  with `![config(...)]`-gated I/O futures sharing only "register interest → get woken" — with a recon-grounded
+  recommendation BEFORE coding. Also: write the IOCP bindings (`CreateIoCompletionPort`/
+  `GetQueuedCompletionStatus`/`WSARecv`/`WSASend`, absent today) and the per-Executor `![thread_local]`
+  current-reactor handle (first stdlib use of the directive). `set_nonblocking` (fcntl/ioctlsocket) for 4c.

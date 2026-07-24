@@ -49,3 +49,32 @@ function turbofish_binds_owner() -> Result<(), TestError> {
     c.v = big();
     return expect_eq(c.get(), big());
 }
+
+// A DEFAULTED owner param bound by no inference source: `try_make` hardcodes
+// `A = DefAlloc` in its return (so `A` appears in no parameter and no free
+// return position), and the owner is NESTED inside the expected type
+// (`Result<Boxed<u64>, i32>`), so the base-match against the expected type
+// misses it.  This is the shape of `Arc<T, A = GlobalAlloc>::try_new ->
+// Result<Arc<T, GlobalAlloc>, E>`: before `compute_static_owner_bindings`
+// backfilled trailing defaulted params, `A` never bound, the owner stash stayed
+// empty, and mono never emitted the spec -> codegen E0636.  `T` binds from the
+// concrete argument; `A` must fall back to its declared default.
+type struct DefAlloc { tag: i32; }
+
+type struct Boxed<T, A = DefAlloc> {
+    v: T;
+    a: A;
+    static try_make(x: T) -> Result<Boxed<T, DefAlloc>, i32> {
+        return Result::Ok(Boxed<T, DefAlloc> { v: x, a: DefAlloc { tag: 1 } });
+    }
+    get(&this) -> T { return this.v; }
+}
+
+![test]
+function nested_default_owner_param_binds() -> Result<(), TestError> {
+    mut r: Result<Boxed<u64>, i32> = Boxed::try_make(big());
+    match (r) {
+        Result::Ok(b)  => { mut bb: Boxed<u64> = b; return expect_eq(bb.get(), big()); }
+        Result::Err(_) => { return expect_eq(1, 0); }
+    }
+}
