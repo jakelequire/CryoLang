@@ -31,6 +31,7 @@ import Compiler::Diag;
 import Compiler::Diag::{ Diagnostic, SourceSpan };
 import Compiler::Passes::TypeResolution;
 import Compiler::CompilationContext;
+import Compiler::Sema::{ PatternResolver };
 import std::core::{ option, mem };
 import std::fmt;
 
@@ -99,20 +100,66 @@ type struct RenameCtx {
     marks: i64[];
 }
 
-type struct AsyncLower {
-    arena:   TypeArena*;
-    intern:  InternTable*;
-    ctx:     CompilationContext*;
-    counter: u64;
+/// The distinct binding names of one `match` arm paired with the fresh,
+/// globally-unique names they are alpha-renamed to (`disambiguate_locals`).
+/// OR-alternatives (`A(v) | B(v)`) contribute the name once and share one
+/// fresh name so the arm body's uses resolve consistently.
+type struct BindingRename {
+    orig:  SymbolStr[];
+    fresh: SymbolStr[];
 
-    static null() -> AsyncLower {
-        return AsyncLower { arena: null, intern: null, ctx: null, counter: 0u64 };
+    push_orig(mut &this, name: SymbolStr) -> void {
+        for (mut i: i64 = 0; i < this.orig.length; i++) {
+            if (this.orig[i].equals(name)) { return; }
+        }
+        this.orig.push(name);
     }
 
-    wire(mut &this, arena: TypeArena*, intern: InternTable*, ctx: CompilationContext*) -> void {
-        this.arena  = arena;
-        this.intern = intern;
-        this.ctx    = ctx;
+    index_of(&this, name: SymbolStr) -> i64 {
+        for (mut i: i64 = 0; i < this.orig.length; i++) {
+            if (this.orig[i].equals(name)) { return i; }
+        }
+        return -1i64;
+    }
+}
+
+/// A `match` arm's distinct pattern bindings paired with their (re-derived)
+/// payload types, collected by `lower_match_sm` to promote each scalar binding
+/// read across a suspend to a struct field.
+type struct BindingCapture {
+    names: SymbolStr[];
+    tys:   TypeRef[];
+
+    push_unique(mut &this, name: SymbolStr, ty: TypeRef) -> void {
+        for (mut i: i64 = 0; i < this.names.length; i++) {
+            if (this.names[i].equals(name)) { return; }
+        }
+        this.names.push(name);
+        this.tys.push(ty);
+    }
+}
+
+type struct AsyncLower {
+    arena:    TypeArena*;
+    intern:   InternTable*;
+    ctx:      CompilationContext*;
+    // Borrowed sema peer: re-derives a `match`-arm pattern binding's payload
+    // type (`resolve_variant_payload_types`) and answers `match_is_exhaustive`,
+    // neither of which is cached on the AST. Used only by the `match`-arm await
+    // lowering; null for every other path.
+    patterns: PatternResolver*;
+    counter:  u64;
+
+    static null() -> AsyncLower {
+        return AsyncLower { arena: null, intern: null, ctx: null, patterns: null, counter: 0u64 };
+    }
+
+    wire(mut &this, arena: TypeArena*, intern: InternTable*, ctx: CompilationContext*,
+         patterns: PatternResolver*) -> void {
+        this.arena    = arena;
+        this.intern   = intern;
+        this.ctx      = ctx;
+        this.patterns = patterns;
     }
 
     /// Resolve a stdlib future type by its import-visible leaf (`Poll`,
@@ -904,13 +951,18 @@ type struct AsyncLower {
         }
         const aw: AwaitExprNode* = this.stmt_toplevel_await(stmt);
         if (aw != null) { return this.lower_carrier_sm(sm, stmt, aw, cur); }
+        // A bare `{ … await … }` block is just a nested statement sequence: lower
+        // it into the current state chain (its locals already got their own scope
+        // frame from the pre-flattening alpha-rename).
+        if (k == NodeKind::BlockStatement)   { return this.lower_block_sm(sm, stmt as BlockStmtNode*, cur); }
         if (k == NodeKind::IfStatement)      { return this.lower_if_sm(sm, stmt as IfStmtNode*, cur); }
         if (k == NodeKind::WhileStatement)   { return this.lower_while_sm(sm, stmt as WhileStmtNode*, cur); }
         if (k == NodeKind::DoWhileStatement) { return this.lower_do_while_sm(sm, stmt as DoWhileStmtNode*, cur); }
         if (k == NodeKind::ForStatement)     { return this.lower_for_sm(sm, stmt as ForStmtNode*, cur); }
         if (k == NodeKind::LoopStatement)    { return this.lower_loop_sm(sm, stmt as LoopStmtNode*, cur); }
+        if (k == NodeKind::MatchStatement)   { return this.lower_match_sm(sm, stmt as MatchStmtNode*, cur); }
         this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
-            "async: this `await` shape is not supported yet; write it as `const x = await e;` / `return await e;` / `await e;`, inside an `if`/`else` branch, or inside a `while`/`for`/`loop`/`do-while` body (an `await` nested in an expression, or inside a `match` arm, arrives in a later increment)",
+            "async: this `await` shape is not supported yet; write it as `const x = await e;` / `return await e;` / `await e;`, inside an `if`/`else` branch, inside a `while`/`for`/`loop`/`do-while` body, or inside a `match` arm (an `await` nested in an expression arrives in a later increment)",
             stmt.span);
         sm.ok = false;
         return cur;
@@ -1025,6 +1077,156 @@ type struct AsyncLower {
             if (!this.stmt_diverges(iff.else_stmt)) { this.sm_goto(sm, e_end, join); }
         }
         return join;
+    }
+
+    /// Lower a `match` whose arms contain `await`s. In `cur` a dispatch `match`
+    /// (reusing the original patterns + guards) captures each awaiting arm's
+    /// scalar pattern bindings into fields and jumps to a per-arm entry state;
+    /// each arm body runs as its own state sequence and, unless it diverges,
+    /// converges on a shared join state. An await-free arm runs wholesale in the
+    /// dispatch arm (its bindings stay native). A non-exhaustive match gets a
+    /// synthesized `_ => join` so a non-matching subject continues past the
+    /// `match` rather than spinning the dispatch loop.
+    lower_match_sm(mut &this, sm: PollSm*, m: MatchStmtNode*, cur: i64) -> i64 {
+        const span: SourceSpan = sm.span;
+        if (this.expr_await_count(m.subject) > 0i64) {
+            this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
+                "async: an `await` in a `match` subject is not supported; bind it first (`const s = await e; match (s) { … }`)",
+                span);
+            sm.ok = false; return cur;
+        }
+        const subject_type: TypeRef = m.subject.resolved_type;
+        const exhaustive: boolean = this.patterns.match_is_exhaustive(m.subject, m.arms);
+
+        const join: i64 = this.sm_alloc(sm);
+        mut dispatch: MatchStmtNode* = new MatchStmtNode(m.subject, span);
+        for (mut ai: i64 = 0; ai < m.arms.length; ai++) {
+            const arm: MatchArmNode* = m.arms[ai];
+            if (arm == null) { continue; }
+            if (this.expr_await_count(arm.guard) > 0i64) {
+                this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
+                    "async: an `await` in a `match`-arm guard is not supported; restructure the guard",
+                    span);
+                sm.ok = false; return cur;
+            }
+
+            mut cap: BlockStmtNode* = new BlockStmtNode(span);
+            if (!this.stmt_needs_explode(arm.body)) {
+                // No suspend and no edge into an enclosing exploded loop: run the
+                // arm body (bindings intact) directly in the dispatch arm, then
+                // converge on the join unless the body itself diverges.
+                this.rewrite_returns(arm.body, sm.poll_out, span);
+                cap.add_statement(arm.body);
+                if (!this.stmt_diverges(arm.body)) { this.append_goto(cap, sm, join, span); }
+            } else {
+                const entry: i64 = this.sm_alloc(sm);
+                // Promote every scalar binding this arm READS to a field: a
+                // binding is bound in `cur` but its body runs in `entry` (a
+                // different state), so it cannot live on the native stack. The
+                // capture reads the pattern-bound name (valid in the dispatch
+                // arm's scope); the body's reads are rewritten to the field.
+                mut bs: BindingCapture = BindingCapture { names: [], tys: [] };
+                this.collect_arm_bindings(arm, subject_type, &bs);
+                for (mut bi: i64 = 0; bi < bs.names.length; bi++) {
+                    const bname: SymbolStr = bs.names[bi];
+                    if (!this.name_read_in_stmt(arm.body, bname)) { continue; }
+                    const bt: TypeRef = bs.tys[bi];
+                    const bt_t: Type* = this.arena.lookup(bt.id);
+                    const bk: TypeKind = if (bt_t != null) { bt_t.kind } else { TypeKind::Error };
+                    if (!bt.is_valid() || bk == TypeKind::Error) {
+                        this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
+                            "async: could not resolve a `match`-arm binding's type to carry it across an `await`",
+                            span);
+                        sm.ok = false; return cur;
+                    }
+                    if (bk == TypeKind::Reference) {
+                        this.ctx.emit_error_at(ErrorCode::E0455_DANGLING_POINTER,
+                            "async: a `match`-arm binding that is a reference cannot be held live across an `await` (owned values only)",
+                            span);
+                        sm.ok = false; return cur;
+                    }
+                    if (!this.zeroable_kind(bk)) {
+                        this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
+                            "async: only a scalar (integer/bool/float/pointer) `match`-arm binding may currently be held across an `await`; carrying an aggregate arrives in a later increment",
+                            span);
+                        sm.ok = false; return cur;
+                    }
+                    const field: SymbolStr = this.intern.intern(
+                        format("__bind_%lld_%s", entry, this.intern.resolve(bname)));
+                    this.subst_name_stmt(arm.body, bname, field, sm.struct_ref, bt, span);
+                    cap.add_statement(this.assign_member_stmt(
+                        sm.struct_ref, field, bt, this.ident(bname, bt, span), span));
+                    sm.prom_field.push(field);
+                    sm.prom_tys.push(bt);
+                    sm.nprom += 1i64;
+                }
+                this.append_goto(cap, sm, entry, span);
+                const end: i64 = this.lower_branch_sm(sm, arm.body, entry);
+                if (!sm.ok) { return cur; }
+                if (!this.stmt_diverges(arm.body)) { this.sm_goto(sm, end, join); }
+            }
+
+            mut darm: MatchArmNode* = new MatchArmNode(span);
+            for (mut pi: i64 = 0; pi < arm.patterns.length; pi++) {
+                darm.add_pattern(arm.patterns[pi]);
+            }
+            if (arm.guard != null) { darm.set_guard(arm.guard); }
+            darm.set_body(cap as StatementNode*);
+            dispatch.add_arm(darm);
+        }
+        if (!sm.ok) { return cur; }
+
+        // A non-exhaustive `match` normally falls through to the following
+        // statement; in the flattened machine that must be an explicit edge to
+        // the join, or a non-matching subject would fall off the arm and respin
+        // the (unchanged) dispatch state forever.
+        if (!exhaustive) {
+            mut wblk: BlockStmtNode* = new BlockStmtNode(span);
+            this.append_goto(wblk, sm, join, span);
+            dispatch.add_arm(this.match_arm_wild(wblk, span));
+        }
+
+        sm.blocks[cur].add_statement(dispatch as StatementNode*);
+        return join;
+    }
+
+    /// Append `this.state = <to>;` to an arbitrary block (not a state-indexed
+    /// block, so `sm_goto` does not apply) — the transition that ends a dispatch
+    /// arm before the enclosing loop re-dispatches.
+    append_goto(mut &this, blk: BlockStmtNode*, sm: PollSm*, to: i64, span: SourceSpan) -> void {
+        blk.add_statement(this.assign_member_stmt(
+            sm.struct_ref, sm.state_sym, sm.u32_ty, this.u32_lit(to as u64, span), span));
+    }
+
+    /// Collect the distinct pattern bindings of `arm` (across OR-alternatives and
+    /// nested sub-patterns) paired with their payload types, re-deriving each type
+    /// via `PatternResolver::resolve_variant_payload_types` (patterns carry no
+    /// cached type). Mirrors `PatternResolver::bind_arm_patterns`.
+    collect_arm_bindings(mut &this, arm: MatchArmNode*, subject_type: TypeRef,
+                         bs: BindingCapture*) -> void {
+        for (mut i: i64 = 0; i < arm.patterns.length; i++) {
+            this.collect_pat_bindings(arm.patterns[i], subject_type, bs);
+        }
+    }
+
+    collect_pat_bindings(mut &this, pat: PatternNode*, value_type: TypeRef,
+                         bs: BindingCapture*) -> void {
+        if (pat == null) { return; }
+        if (pat.pattern_kind == PatternKind::Identifier && pat.binding_name.is_valid()) {
+            bs.push_unique(pat.binding_name, value_type);
+            return;
+        }
+        if (pat.pattern_kind != PatternKind::Enum) { return; }
+        const epat: EnumPatternNode* = pat as EnumPatternNode*;
+        const payloads: TypeRef[] = this.patterns.resolve_variant_payload_types(value_type, epat);
+        for (mut j: i64 = 0; j < epat.elements.length; j++) {
+            mut elem_ty: TypeRef = value_type;
+            if (j < payloads.length && payloads[j].is_valid()) { elem_ty = payloads[j]; }
+            const pb: PatternBinding* = epat.binding_at(j);
+            if (pb != null && pb.name.is_valid()) { bs.push_unique(pb.name, elem_ty); continue; }
+            const sub: PatternNode* = epat.sub_at(j);
+            if (sub != null) { this.collect_pat_bindings(sub, elem_ty, bs); }
+        }
     }
 
     /// Append `if (<cond>) { this.state = <t>; } else { this.state = <f>; }` to
@@ -1225,6 +1427,19 @@ type struct AsyncLower {
             // A `loop {}` exits only via a `break` targeting it; with none, it is
             // an infinite loop and control never reaches the following statement.
             return !this.has_free_break((stmt as LoopStmtNode*).body);
+        }
+        if (k == NodeKind::MatchStatement) {
+            // A `match` never falls through only if it is exhaustive (some subject
+            // always matches an arm) AND every arm body itself diverges. A
+            // guarded or partial arm leaves a fall-through path, which
+            // `match_is_exhaustive` accounts for.
+            const m: MatchStmtNode* = stmt as MatchStmtNode*;
+            if (m.arms.length == 0i64) { return false; }
+            if (!this.patterns.match_is_exhaustive(m.subject, m.arms)) { return false; }
+            for (mut i: i64 = 0; i < m.arms.length; i++) {
+                if (m.arms[i] == null || !this.stmt_diverges(m.arms[i].body)) { return false; }
+            }
+            return true;
         }
         return false;
     }
@@ -1492,22 +1707,75 @@ type struct AsyncLower {
         this.rc_leave(ctx);
     }
 
-    /// Walk a `match`/`match`-expression arm: pattern bindings shadow outer locals
-    /// within the arm (bound to themselves — never promoted, so not renamed; the
-    /// identity binding just stops an outer rename from leaking into a use the
-    /// pattern binding actually owns).
+    /// Walk a `match`/`match`-expression arm, alpha-renaming its pattern bindings
+    /// to globally-unique names (exactly as `rn_var_decl` renames a `VarDecl`) so
+    /// the by-name cross-state promotion in `lower_match_sm` cannot conflate this
+    /// arm's binding with a same-named binding in a nested `match`, a sibling arm,
+    /// or an outer local/param. Bindings shadow outer locals within the arm; the
+    /// fresh name is bound into the scope so uses in the guard and body rewrite to
+    /// it. OR-alternatives (`A(v) | B(v)`) share one fresh name for `v`.
     rn_arm(mut &this, ctx: RenameCtx*, arm: MatchArmNode*) -> void {
         if (arm == null) { return; }
         this.rc_enter(ctx);
+        mut map: BindingRename = BindingRename { orig: [], fresh: [] };
         for (mut i: i64 = 0; i < arm.patterns.length; i++) {
-            const pat: PatternNode* = arm.patterns[i];
-            if (pat != null && !pat.binding_name.equals(SymbolStr::empty())) {
-                this.rc_bind(ctx, pat.binding_name, pat.binding_name);
-            }
+            this.collect_pat_binding_names(arm.patterns[i], &map);
+        }
+        for (mut i: i64 = 0; i < map.orig.length; i++) {
+            const f: SymbolStr = this.mint_local(map.orig[i]);
+            map.fresh.push(f);
+            this.rc_bind(ctx, map.orig[i], f);
+        }
+        for (mut i: i64 = 0; i < arm.patterns.length; i++) {
+            this.rn_pat_apply(arm.patterns[i], &map);
         }
         this.rn_expr(ctx, arm.guard);
         this.rn_stmt(ctx, arm.body);
         this.rc_leave(ctx);
+    }
+
+    /// Collect the distinct binding names introduced by `pat` (a top-level
+    /// identifier binding, an enum-variant payload binding, or a nested
+    /// sub-pattern) into `map.orig`. A const-value identifier pattern (its
+    /// `binding_name` was cleared by name resolution) introduces no binding.
+    collect_pat_binding_names(&this, pat: PatternNode*, map: BindingRename*) -> void {
+        if (pat == null) { return; }
+        if (pat.pattern_kind == PatternKind::Identifier && pat.binding_name.is_valid()) {
+            map.push_orig(pat.binding_name);
+            return;
+        }
+        if (pat.pattern_kind != PatternKind::Enum) { return; }
+        const epat: EnumPatternNode* = pat as EnumPatternNode*;
+        for (mut j: i64 = 0; j < epat.elements.length; j++) {
+            const pb: PatternBinding* = epat.binding_at(j);
+            if (pb != null && pb.name.is_valid()) { map.push_orig(pb.name); continue; }
+            const sub: PatternNode* = epat.sub_at(j);
+            if (sub != null) { this.collect_pat_binding_names(sub, map); }
+        }
+    }
+
+    /// Rewrite each binding name in `pat` to its fresh name from `map`, in place
+    /// (mutating `PatternNode.binding_name` / `PatternBinding.name` through the
+    /// AST node). The mirror of `collect_pat_binding_names`.
+    rn_pat_apply(&this, pat: PatternNode*, map: BindingRename*) -> void {
+        if (pat == null) { return; }
+        if (pat.pattern_kind == PatternKind::Identifier && pat.binding_name.is_valid()) {
+            const idx: i64 = map.index_of(pat.binding_name);
+            if (idx >= 0i64) { pat.set_binding_name(map.fresh[idx]); }
+            return;
+        }
+        if (pat.pattern_kind != PatternKind::Enum) { return; }
+        const epat: EnumPatternNode* = pat as EnumPatternNode*;
+        for (mut j: i64 = 0; j < epat.elements.length; j++) {
+            mut pb: PatternBinding* = epat.binding_at(j);
+            if (pb != null && pb.name.is_valid()) {
+                const idx: i64 = map.index_of(pb.name);
+                if (idx >= 0i64) { pb.name = map.fresh[idx]; }
+                continue;
+            }
+            const sub: PatternNode* = epat.sub_at(j);
+            if (sub != null) { this.rn_pat_apply(sub, map); }
+        }
     }
 
     /// Walk a lambda: rename any capture that names a renamed outer local, then
