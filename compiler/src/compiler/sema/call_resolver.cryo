@@ -4087,18 +4087,35 @@ type struct CallResolver {
         if (ret_t == null || ret_t.kind != TypeKind::InstantiatedType) { return ret; }
         const ret_inst: InstantiatedType* = ret_t as InstantiatedType*;
         if (ret_inst.is_resolved()) { return ret; }
-        if (scope != null && scope.scope_generic_args.length > 0
-                && scope.scope_generic_args.length == ret_inst.type_args.length) {
-            mut resolved_args: TypeRef[] = [];
-            mut all_valid: boolean = true;
-            mut res_ctx: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
-            for (mut i: i64 = 0; i < scope.scope_generic_args.length; i++) {
-                const arg_ref: TypeRef = this.ctx.type_resolver.resolve(scope.scope_generic_args[i], &res_ctx);
-                if (!arg_ref.is_valid()) { all_valid = false; break; }
-                resolved_args.push(arg_ref);
-            }
-            if (all_valid) {
-                return this.ctx.generic_registry.instantiate(ret_inst.generic_base, resolved_args);
+        // Turbofish owner args (`Arc<Thing, GlobalAlloc>::try_new`): map them to the
+        // OWNER's generic params and substitute throughout the return type. This
+        // handles BOTH a return that IS the owner (`-> Arc<T, A>`) and one where the
+        // owner is NESTED (`-> Result<Arc<T, GlobalAlloc>, E>`). The former positional
+        // `instantiate(ret_base, args)` was valid only when the return's outermost
+        // base WAS the owner; for a nested owner it substituted the owner args into
+        // the OUTER generic - `Arc<Thing, GlobalAlloc>::try_new` typed as
+        // `Result<Thing, GlobalAlloc>` instead of `Result<Arc<Thing, GlobalAlloc>, E>`
+        // (it fired only because the arg counts coincidentally matched).
+        if (scope != null && scope.scope_generic_args.length > 0) {
+            mut tmpl: TemplateEntry* = this.resolve_scope_owner_template(scope_name);
+            if (tmpl != null && tmpl.param_type_ids.length >= scope.scope_generic_args.length) {
+                mut resolved_args: TypeRef[] = [];
+                mut all_valid: boolean = true;
+                mut res_ctx: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
+                this.symbolic.symbolic_bind_params(&res_ctx);
+                for (mut i: i64 = 0; i < scope.scope_generic_args.length; i++) {
+                    const arg_ref: TypeRef = this.ctx.type_resolver.resolve(scope.scope_generic_args[i], &res_ctx);
+                    if (!arg_ref.is_valid()) { all_valid = false; break; }
+                    resolved_args.push(arg_ref);
+                }
+                if (all_valid && resolved_args.length < tmpl.param_type_ids.length) {
+                    resolved_args = this.ctx.type_resolver.expand_default_type_args(tmpl, resolved_args, &res_ctx);
+                }
+                if (all_valid && resolved_args.length == tmpl.param_type_ids.length) {
+                    mut subst: TypeSubstitution = TypeSubstitution::from_params(tmpl.param_type_ids, resolved_args);
+                    const out: TypeRef = subst.apply(ret, this.arena);
+                    if (out.is_valid()) { return out; }
+                }
             }
         }
         if (!this.state.expected_type.is_valid()) { return ret; }
