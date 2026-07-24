@@ -84,6 +84,21 @@ type struct PollSm {
     loop_brk:   i64[];
 }
 
+/// Lexical scope stack for `disambiguate_locals`, the pre-lowering alpha-rename
+/// that makes every local binding's name globally unique before the body is
+/// flattened into state blocks (so the by-name cross-state promotion cannot
+/// conflate a promoted local with a same-named parameter or a sibling-scope
+/// local). `orig`/`repl` are a flat binding stack (parallel arrays: an original
+/// local name and the fresh name it was renamed to); `marks` records each
+/// scope's start index so leaving a scope pops exactly its bindings. A use
+/// resolves by scanning `orig` from the top (innermost binding first); a name in
+/// no frame is a parameter/global/outer and is left unchanged.
+type struct RenameCtx {
+    orig:  SymbolStr[];
+    repl:  SymbolStr[];
+    marks: i64[];
+}
+
 type struct AsyncLower {
     arena:   TypeArena*;
     intern:  InternTable*;
@@ -1409,6 +1424,316 @@ type struct AsyncLower {
         }
     }
 
+    // ---- pre-lowering local disambiguation (scope-aware alpha-rename) ----
+
+    rc_enter(&this, ctx: RenameCtx*) -> void { ctx.marks.push(ctx.orig.length); }
+
+    rc_leave(&this, ctx: RenameCtx*) -> void {
+        if (ctx.marks.length == 0i64) { return; }
+        const m: i64 = ctx.marks[ctx.marks.length - 1i64];
+        ctx.marks.pop();
+        while (ctx.orig.length > m) { ctx.orig.pop(); ctx.repl.pop(); }
+    }
+
+    rc_bind(&this, ctx: RenameCtx*, name: SymbolStr, fresh: SymbolStr) -> void {
+        ctx.orig.push(name);
+        ctx.repl.push(fresh);
+    }
+
+    /// Resolve a use: the innermost binding of `name`, or `name` unchanged if it
+    /// is bound in no active scope (a parameter / global / outer capture).
+    rc_lookup(&this, ctx: RenameCtx*, name: SymbolStr) -> SymbolStr {
+        mut i: i64 = ctx.orig.length - 1i64;
+        while (i >= 0i64) {
+            if (ctx.orig[i].equals(name)) { return ctx.repl[i]; }
+            i -= 1i64;
+        }
+        return name;
+    }
+
+    /// A fresh, globally-unique local name derived from the original (kept as a
+    /// prefix for readable generated IR). The `$L` marker never appears in source.
+    mint_local(mut &this, orig: SymbolStr) -> SymbolStr {
+        const idx: u64 = this.counter;
+        this.counter += 1u64;
+        return this.intern.intern(format("%s$L%llu", this.intern.resolve(orig), idx));
+    }
+
+    /// Rename a `const/mut <name> = <init>;` local: recurse into the initializer
+    /// FIRST (its identifiers resolve to the enclosing scope, so `const x = x`
+    /// reads the outer `x`), then mint a fresh name, rename the declaration in
+    /// place, and bind original->fresh so the rest of this scope sees the local.
+    rn_var_decl(mut &this, ctx: RenameCtx*, vd: VarDeclNode*) -> void {
+        if (vd == null) { return; }
+        this.rn_expr(ctx, vd.initializer);
+        const orig: SymbolStr = vd.name;
+        const fresh: SymbolStr = this.mint_local(orig);
+        vd.name = fresh;
+        this.rc_bind(ctx, orig, fresh);
+    }
+
+    /// Walk a block in its own scope.
+    rn_block(mut &this, ctx: RenameCtx*, blk: BlockStmtNode*) -> void {
+        if (blk == null) { return; }
+        this.rc_enter(ctx);
+        for (mut i: i64 = 0; i < blk.statements.length; i++) {
+            this.rn_stmt(ctx, blk.statements[i]);
+        }
+        this.rc_leave(ctx);
+    }
+
+    /// Walk a branch/loop body as a scope (a bare non-block statement still gets
+    /// its own frame, so a declaration in it does not leak to the enclosing scope).
+    rn_scoped(mut &this, ctx: RenameCtx*, s: StatementNode*) -> void {
+        if (s == null) { return; }
+        if (s.kind == NodeKind::BlockStatement) { this.rn_block(ctx, s as BlockStmtNode*); return; }
+        this.rc_enter(ctx);
+        this.rn_stmt(ctx, s);
+        this.rc_leave(ctx);
+    }
+
+    /// Walk a `match`/`match`-expression arm: pattern bindings shadow outer locals
+    /// within the arm (bound to themselves — never promoted, so not renamed; the
+    /// identity binding just stops an outer rename from leaking into a use the
+    /// pattern binding actually owns).
+    rn_arm(mut &this, ctx: RenameCtx*, arm: MatchArmNode*) -> void {
+        if (arm == null) { return; }
+        this.rc_enter(ctx);
+        for (mut i: i64 = 0; i < arm.patterns.length; i++) {
+            const pat: PatternNode* = arm.patterns[i];
+            if (pat != null && !pat.binding_name.equals(SymbolStr::empty())) {
+                this.rc_bind(ctx, pat.binding_name, pat.binding_name);
+            }
+        }
+        this.rn_expr(ctx, arm.guard);
+        this.rn_stmt(ctx, arm.body);
+        this.rc_leave(ctx);
+    }
+
+    /// Walk a lambda: rename any capture that names a renamed outer local, then
+    /// walk the body in a new scope where the lambda's own parameters shadow.
+    rn_lambda(mut &this, ctx: RenameCtx*, lam: LambdaExprNode*) -> void {
+        if (lam == null) { return; }
+        for (mut i: i64 = 0; i < lam.captured_names.length; i++) {
+            lam.captured_names[i] = this.rc_lookup(ctx, lam.captured_names[i]);
+        }
+        this.rc_enter(ctx);
+        for (mut i: i64 = 0; i < lam.parameters.length; i++) {
+            const p: VarDeclNode* = lam.parameters[i];
+            if (p != null) { this.rc_bind(ctx, p.name, p.name); }
+        }
+        this.rn_stmt(ctx, lam.body);
+        this.rc_leave(ctx);
+    }
+
+    /// Rename identifier uses in an expression in place (mutating `IdentifierNode.
+    /// name`), recursing through every expression form that can hold a local read.
+    /// A use bound in no active scope is left unchanged (parameter/global). An
+    /// unwalked form leaves a renamed local's use un-renamed, which surfaces as a
+    /// loud "not found" at that use — never a silent miscompile.
+    rn_expr(mut &this, ctx: RenameCtx*, e: ExpressionNode*) -> void {
+        if (e == null) { return; }
+        const k: NodeKind = (e as ASTNode*).kind;
+        if (k == NodeKind::Identifier) {
+            const id: IdentifierNode* = e as IdentifierNode*;
+            id.name = this.rc_lookup(ctx, id.name);
+            return;
+        }
+        if (k == NodeKind::BinaryExpression) {
+            const b: BinaryExprNode* = e as BinaryExprNode*;
+            this.rn_expr(ctx, b.left);
+            this.rn_expr(ctx, b.right);
+            this.rn_expr(ctx, b.desugared_call);
+            return;
+        }
+        if (k == NodeKind::UnaryExpression) {
+            const u: UnaryExprNode* = e as UnaryExprNode*;
+            this.rn_expr(ctx, u.operand);
+            this.rn_expr(ctx, u.desugared_call);
+            return;
+        }
+        if (k == NodeKind::TernaryExpression) {
+            const t: TernaryExprNode* = e as TernaryExprNode*;
+            this.rn_expr(ctx, t.condition);
+            this.rn_expr(ctx, t.true_expr);
+            this.rn_expr(ctx, t.false_expr);
+            return;
+        }
+        if (k == NodeKind::IfExpression) {
+            const ie: IfExprNode* = e as IfExprNode*;
+            this.rn_expr(ctx, ie.condition);
+            this.rn_expr(ctx, ie.then_expr);
+            this.rn_expr(ctx, ie.else_expr);
+            return;
+        }
+        if (k == NodeKind::CallExpression) {
+            const c: CallExprNode* = e as CallExprNode*;
+            this.rn_expr(ctx, c.callee);
+            for (mut i: i64 = 0; i < c.arguments.length; i++) { this.rn_expr(ctx, c.arguments[i]); }
+            return;
+        }
+        if (k == NodeKind::NewExpression) {
+            const ne: NewExprNode* = e as NewExprNode*;
+            for (mut i: i64 = 0; i < ne.arguments.length; i++) { this.rn_expr(ctx, ne.arguments[i]); }
+            if (ne.has_array_size()) { this.rn_expr(ctx, ne.array_size); }
+            if (ne.has_struct_init()) { this.rn_expr(ctx, ne.struct_init as ExpressionNode*); }
+            return;
+        }
+        if (k == NodeKind::CastExpression) {
+            this.rn_expr(ctx, (e as CastExprNode*).expression); return;
+        }
+        if (k == NodeKind::StructLiteral) {
+            const sl: StructLiteralNode* = e as StructLiteralNode*;
+            for (mut i: i64 = 0; i < sl.field_inits.length; i++) {
+                this.rn_expr(ctx, sl.field_inits[i].value);
+            }
+            return;
+        }
+        if (k == NodeKind::ArrayLiteral) {
+            const al: ArrayLiteralNode* = e as ArrayLiteralNode*;
+            for (mut i: i64 = 0; i < al.elements.length; i++) { this.rn_expr(ctx, al.elements[i]); }
+            if (al.repeat_count_expr != null) { this.rn_expr(ctx, al.repeat_count_expr); }
+            return;
+        }
+        if (k == NodeKind::TupleLiteral) {
+            const tl: TupleLiteralNode* = e as TupleLiteralNode*;
+            for (mut i: i64 = 0; i < tl.elements.length; i++) { this.rn_expr(ctx, tl.elements[i]); }
+            return;
+        }
+        if (k == NodeKind::ArrayAccess) {
+            const a: ArrayAccessNode* = e as ArrayAccessNode*;
+            this.rn_expr(ctx, a.array);
+            this.rn_expr(ctx, a.index);
+            this.rn_expr(ctx, a.desugared_call);
+            return;
+        }
+        if (k == NodeKind::MemberAccess) {
+            this.rn_expr(ctx, (e as MemberAccessNode*).object); return;
+        }
+        if (k == NodeKind::TypeofExpression) {
+            this.rn_expr(ctx, (e as TypeofExprNode*).operand); return;
+        }
+        if (k == NodeKind::DeleteExpression) {
+            this.rn_expr(ctx, (e as DeleteExprNode*).operand); return;
+        }
+        if (k == NodeKind::AwaitExpression) {
+            this.rn_expr(ctx, (e as AwaitExprNode*).operand); return;
+        }
+        if (k == NodeKind::TryExpression) {
+            const tr: TryExprNode* = e as TryExprNode*;
+            this.rn_expr(ctx, tr.operand);
+            this.rn_expr(ctx, tr.desugared);
+            return;
+        }
+        if (k == NodeKind::MatchExpression) {
+            const me: MatchExprNode* = e as MatchExprNode*;
+            this.rn_expr(ctx, me.subject);
+            for (mut i: i64 = 0; i < me.arms.length; i++) { this.rn_arm(ctx, me.arms[i]); }
+            return;
+        }
+        if (k == NodeKind::LambdaExpression) {
+            this.rn_lambda(ctx, e as LambdaExprNode*); return;
+        }
+        // Literal / ScopeResolution / Sizeof / Alignof / StaticMatch / Yield /
+        // Async carry no local identifier read to rename.
+    }
+
+    /// Rename identifier uses and local declarations in a statement in place,
+    /// tracking lexical scopes so a binding is visible only after its declaration
+    /// and only within its scope. Covers the control-flow containers an async fn
+    /// body uses; an unwalked container leaves a renamed local's use un-renamed
+    /// (a loud "not found"), never a silent miscompile.
+    rn_stmt(mut &this, ctx: RenameCtx*, s: StatementNode*) -> void {
+        if (s == null) { return; }
+        const k: NodeKind = s.kind;
+        if (k == NodeKind::ExpressionStatement) {
+            this.rn_expr(ctx, (s as ExprStmtNode*).expression); return;
+        }
+        if (k == NodeKind::ReturnStatement) {
+            this.rn_expr(ctx, (s as ReturnStmtNode*).expression); return;
+        }
+        if (k == NodeKind::DeclarationStatement) {
+            const ds: DeclStmtNode* = s as DeclStmtNode*;
+            if (ds.declaration != null && ds.declaration.kind == NodeKind::VariableDeclaration) {
+                this.rn_var_decl(ctx, ds.declaration as VarDeclNode*);
+            }
+            return;
+        }
+        if (k == NodeKind::BlockStatement) { this.rn_block(ctx, s as BlockStmtNode*); return; }
+        if (k == NodeKind::UnsafeBlockStatement) {
+            this.rn_block(ctx, (s as UnsafeBlockStmtNode*).block); return;
+        }
+        if (k == NodeKind::IfStatement) {
+            const iff: IfStmtNode* = s as IfStmtNode*;
+            this.rn_expr(ctx, iff.condition);
+            this.rn_scoped(ctx, iff.then_stmt);
+            this.rn_scoped(ctx, iff.else_stmt);
+            return;
+        }
+        if (k == NodeKind::WhileStatement) {
+            const w: WhileStmtNode* = s as WhileStmtNode*;
+            this.rn_expr(ctx, w.condition);
+            this.rn_scoped(ctx, w.body);
+            return;
+        }
+        if (k == NodeKind::DoWhileStatement) {
+            const d: DoWhileStmtNode* = s as DoWhileStmtNode*;
+            this.rn_scoped(ctx, d.body);
+            this.rn_expr(ctx, d.condition);
+            return;
+        }
+        if (k == NodeKind::ForStatement) {
+            const f: ForStmtNode* = s as ForStmtNode*;
+            this.rc_enter(ctx);   // the for-init scope encloses cond / update / body
+            if (f.init != null) {
+                if ((f.init as ASTNode*).kind == NodeKind::VariableDeclaration) {
+                    this.rn_var_decl(ctx, f.init as VarDeclNode*);
+                } else {
+                    this.rn_expr(ctx, f.init as ExpressionNode*);
+                }
+            }
+            this.rn_expr(ctx, f.condition);
+            this.rn_expr(ctx, f.update);
+            this.rn_scoped(ctx, f.body);
+            this.rc_leave(ctx);
+            return;
+        }
+        if (k == NodeKind::LoopStatement) {
+            this.rn_scoped(ctx, (s as LoopStmtNode*).body); return;
+        }
+        if (k == NodeKind::MatchStatement) {
+            const m: MatchStmtNode* = s as MatchStmtNode*;
+            this.rn_expr(ctx, m.subject);
+            for (mut i: i64 = 0; i < m.arms.length; i++) { this.rn_arm(ctx, m.arms[i]); }
+            return;
+        }
+        if (k == NodeKind::SwitchStatement) {
+            const sw: SwitchStmtNode* = s as SwitchStmtNode*;
+            this.rn_expr(ctx, sw.expression);
+            for (mut i: i64 = 0; i < sw.cases.length; i++) {
+                const cs: CaseStmtNode* = sw.cases[i];
+                if (cs != null) {
+                    this.rn_expr(ctx, cs.value);
+                    this.rn_block(ctx, cs.body);
+                }
+            }
+            return;
+        }
+        // Break / Continue / Asm carry no local read or declaration.
+    }
+
+    /// Alpha-rename every local declaration in the async body to a globally-unique
+    /// name before the body is flattened. Parameters are intentionally left
+    /// unbound: their uses fall through unchanged and resolve to the shadow
+    /// prelude (`const <param> = this.<param>`), so a local that shadows a
+    /// parameter no longer collides with it once the body is flattened and the
+    /// by-name cross-state promotion runs.
+    disambiguate_locals(mut &this, node: FunctionDeclNode*) -> void {
+        if (node.body == null || node.body.kind != NodeKind::BlockStatement) { return; }
+        mut ctx: RenameCtx = RenameCtx { orig: [], repl: [], marks: [] };
+        this.rn_block(&ctx, node.body as BlockStmtNode*);
+    }
+
     /// Build the state-machine `poll` body for a body with >= 1 `await`: the
     /// arg-shadow prelude, then `loop { match (this.state) { i => <block i>,
     /// _ => Poll::Pending } }`. Returns null (after a diagnostic) for an
@@ -1417,6 +1742,11 @@ type struct AsyncLower {
     /// `sm.prom_*`, which `lower` consumes to build the struct fields.
     build_poll_body_sm(mut &this, node: FunctionDeclNode*, sm: PollSm*) -> BlockStmtNode* {
         const span: SourceSpan = sm.span;
+        // Make every local's name globally unique BEFORE flattening, so the
+        // by-name cross-state promotion below cannot conflate a promoted local
+        // with a same-named parameter or a sibling-scope local.
+        this.disambiguate_locals(node);
+
         mut body: BlockStmtNode* = new BlockStmtNode(span);
         this.emit_shadow_prelude(node, body, sm.struct_ref, span);
 
