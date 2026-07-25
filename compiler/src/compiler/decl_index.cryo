@@ -100,6 +100,12 @@ type struct DeclarationIndex {
                                       // path so two modules can each declare the
                                       // same private `const NAME = ...` without
                                       // colliding at link time.
+    module_global_types:      TypeRef[];  // parallel to module_global_keys: the
+                                      // global's type AS DECLARED IN THAT module.
+                                      // `global_vars` is keyed by bare name and is
+                                      // last-write-wins, so it cannot answer "the
+                                      // `FIONBIO` declared in `sys::syscall`" when
+                                      // another module declares that leaf too.
     module_global_threadlocal: boolean[];  // parallel to module_global_keys:
                                       // whether the global is `![thread_local]`,
                                       // so a cross-module extern reference is
@@ -269,6 +275,7 @@ type struct DeclarationIndex {
             module_global_threadlocal: [],
             module_global_modules:    [],
             module_global_namespaces: [],
+            module_global_types:      [],
             mangled_names:       HashMap<u32, u32>::new(),
             overload_func_keys:    [],
             overload_func_types:   [],
@@ -745,6 +752,7 @@ type struct DeclarationIndex {
                 // registered before its namespace / thread-local flag was set.
                 this.module_global_namespaces[i] = namespace.id;
                 this.module_global_threadlocal[i] = thread_local;
+                this.module_global_types[i] = ty;
                 return;
             }
         }
@@ -752,6 +760,58 @@ type struct DeclarationIndex {
         this.module_global_modules.push(module.id);
         this.module_global_namespaces.push(namespace.id);
         this.module_global_threadlocal.push(thread_local);
+        this.module_global_types.push(ty);
+    }
+
+    /// The global `name` as declared by the module whose namespace's LAST
+    /// segment is `scope_leaf` — the module a qualified `scope_leaf::name`
+    /// actually names. `*out_ns` receives that module's namespace so codegen can
+    /// mangle the reference to the matching definition.
+    ///
+    /// A qualified reference must never be answered from the bare-name map:
+    /// that map is keyed by leaf and is last-write-wins across every module
+    /// declaring it, so `syscall::FIONBIO` would silently resolve to
+    /// `libc::FIONBIO` — a different value AND a different type.
+    ///
+    /// Returns an invalid TypeRef when no module matches, or when more than one
+    /// does (two namespaces ending in the same segment). Ambiguity is left to
+    /// the caller's existing behaviour rather than guessed at, which keeps this
+    /// lookup strictly additive.
+    find_global_in_scope(&this, name: SymbolStr, scope_leaf: SymbolStr,
+                         intern: InternTable*, out_ns: SymbolStr*,
+                         out_module: SymbolStr*) -> TypeRef {
+        const leaf: string = intern.resolve(scope_leaf);
+        if (leaf == "") { return TypeRef::invalid(); }
+        mut found: TypeRef = TypeRef::invalid();
+        mut hits: i64 = 0;
+        for (mut i: i64 = 0; i < this.module_global_keys.length; i++) {
+            if (this.module_global_keys[i] != name.id) { continue; }
+            const ns_sym: SymbolStr = SymbolStr::from_id(this.module_global_namespaces[i]);
+            if (!ns_sym.is_valid()) { continue; }
+            const ns: string = intern.resolve(ns_sym);
+            if (ns == "") { continue; }
+            if (!DeclarationIndex::namespace_leaf_is(ns, leaf)) { continue; }
+            hits = hits + 1;
+            if (hits > 1) { return TypeRef::invalid(); }
+            found = this.module_global_types[i];
+            *out_ns = ns_sym;
+            *out_module = SymbolStr::from_id(this.module_global_modules[i]);
+        }
+        if (hits != 1) { return TypeRef::invalid(); }
+        return found;
+    }
+
+    /// True when `ns`'s last `::` segment equals `leaf` (or `ns` IS `leaf`) —
+    /// how a one-segment scope qualifier names a module. Mirrors the
+    /// module-suffix match `CallResolver` uses for abbreviated namespaces.
+    static namespace_leaf_is(ns: string, leaf: string) -> boolean {
+        const ns_len: i64 = ns.length() as i64;
+        const leaf_len: i64 = leaf.length() as i64;
+        if (ns_len == leaf_len) { return ns.eq(leaf); }
+        if (ns_len <= leaf_len + 1) { return false; }
+        const suffix_start: i64 = ns_len - leaf_len;
+        if (ns[suffix_start - 1] != ':' || ns[suffix_start - 2] != ':') { return false; }
+        return (ns + suffix_start) == leaf;
     }
 
     /// Whether a registered global is `![thread_local]`. Used by

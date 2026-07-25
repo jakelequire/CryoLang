@@ -216,7 +216,22 @@ type struct AsyncLower {
         if (stmt.kind == NodeKind::ReturnStatement) {
             const ret: ReturnStmtNode* = stmt as ReturnStmtNode*;
             if (ret.expression != null) {
+                // The returned expression may itself hold a `match` expression
+                // whose arms return; rewrite those before wrapping this one, so
+                // the wrap sees a fully rewritten operand.
+                this.rewrite_returns_expr(ret.expression, poll_out, span);
                 ret.expression = this.make_poll_ready(ret.expression, poll_out, span);
+            }
+            return;
+        }
+        if (stmt.kind == NodeKind::ExpressionStatement) {
+            this.rewrite_returns_expr((stmt as ExprStmtNode*).expression, poll_out, span);
+            return;
+        }
+        if (stmt.kind == NodeKind::DeclarationStatement) {
+            const ds: DeclStmtNode* = stmt as DeclStmtNode*;
+            if (ds.declaration != null && ds.declaration.kind == NodeKind::VariableDeclaration) {
+                this.rewrite_returns_expr((ds.declaration as VarDeclNode*).initializer, poll_out, span);
             }
             return;
         }
@@ -229,20 +244,35 @@ type struct AsyncLower {
         }
         if (stmt.kind == NodeKind::IfStatement) {
             const iff: IfStmtNode* = stmt as IfStmtNode*;
+            this.rewrite_returns_expr(iff.condition, poll_out, span);
             this.rewrite_returns(iff.then_stmt, poll_out, span);
             this.rewrite_returns(iff.else_stmt, poll_out, span);
             return;
         }
         if (stmt.kind == NodeKind::WhileStatement) {
-            this.rewrite_returns((stmt as WhileStmtNode*).body, poll_out, span);
+            const w: WhileStmtNode* = stmt as WhileStmtNode*;
+            this.rewrite_returns_expr(w.condition, poll_out, span);
+            this.rewrite_returns(w.body, poll_out, span);
             return;
         }
         if (stmt.kind == NodeKind::DoWhileStatement) {
-            this.rewrite_returns((stmt as DoWhileStmtNode*).body, poll_out, span);
+            const d: DoWhileStmtNode* = stmt as DoWhileStmtNode*;
+            this.rewrite_returns(d.body, poll_out, span);
+            this.rewrite_returns_expr(d.condition, poll_out, span);
             return;
         }
         if (stmt.kind == NodeKind::ForStatement) {
-            this.rewrite_returns((stmt as ForStmtNode*).body, poll_out, span);
+            const f: ForStmtNode* = stmt as ForStmtNode*;
+            if (f.init != null) {
+                if ((f.init as ASTNode*).kind == NodeKind::VariableDeclaration) {
+                    this.rewrite_returns_expr((f.init as VarDeclNode*).initializer, poll_out, span);
+                } else {
+                    this.rewrite_returns_expr(f.init as ExpressionNode*, poll_out, span);
+                }
+            }
+            this.rewrite_returns_expr(f.condition, poll_out, span);
+            this.rewrite_returns(f.body, poll_out, span);
+            this.rewrite_returns_expr(f.update, poll_out, span);
             return;
         }
         if (stmt.kind == NodeKind::LoopStatement) {
@@ -251,11 +281,83 @@ type struct AsyncLower {
         }
         if (stmt.kind == NodeKind::MatchStatement) {
             const m: MatchStmtNode* = stmt as MatchStmtNode*;
+            this.rewrite_returns_expr(m.subject, poll_out, span);
             for (mut i: i64 = 0; i < m.arms.length; i++) {
                 if (m.arms[i] != null) {
+                    this.rewrite_returns_expr(m.arms[i].guard, poll_out, span);
                     this.rewrite_returns(m.arms[i].body, poll_out, span);
                 }
             }
+            return;
+        }
+    }
+
+    /// Statement half of `rewrite_returns` reached through an expression: only a
+    /// `match` used as an expression puts statements — and therefore `return`s —
+    /// inside an expression tree. Every other expression kind is walked purely to
+    /// reach a `match` expression nested within it.
+    rewrite_returns_expr(mut &this, e: ExpressionNode*, poll_out: TypeRef, span: SourceSpan) -> void {
+        if (e == null) { return; }
+        const k: NodeKind = (e as ASTNode*).kind;
+        if (k == NodeKind::MatchExpression) {
+            const me: MatchExprNode* = e as MatchExprNode*;
+            this.rewrite_returns_expr(me.subject, poll_out, span);
+            for (mut i: i64 = 0; i < me.arms.length; i++) {
+                if (me.arms[i] != null) {
+                    this.rewrite_returns_expr(me.arms[i].guard, poll_out, span);
+                    this.rewrite_returns(me.arms[i].body, poll_out, span);
+                }
+            }
+            return;
+        }
+        if (k == NodeKind::BinaryExpression) {
+            const b: BinaryExprNode* = e as BinaryExprNode*;
+            this.rewrite_returns_expr(b.left, poll_out, span);
+            this.rewrite_returns_expr(b.right, poll_out, span);
+            return;
+        }
+        if (k == NodeKind::UnaryExpression) {
+            this.rewrite_returns_expr((e as UnaryExprNode*).operand, poll_out, span);
+            return;
+        }
+        if (k == NodeKind::CallExpression) {
+            const c: CallExprNode* = e as CallExprNode*;
+            this.rewrite_returns_expr(c.callee, poll_out, span);
+            for (mut i: i64 = 0; i < c.arguments.length; i++) {
+                this.rewrite_returns_expr(c.arguments[i], poll_out, span);
+            }
+            return;
+        }
+        if (k == NodeKind::MemberAccess) {
+            this.rewrite_returns_expr((e as MemberAccessNode*).object, poll_out, span);
+            return;
+        }
+        if (k == NodeKind::CastExpression) {
+            this.rewrite_returns_expr((e as CastExprNode*).expression, poll_out, span);
+            return;
+        }
+        if (k == NodeKind::ArrayAccess) {
+            const a: ArrayAccessNode* = e as ArrayAccessNode*;
+            this.rewrite_returns_expr(a.array, poll_out, span);
+            this.rewrite_returns_expr(a.index, poll_out, span);
+            return;
+        }
+        if (k == NodeKind::TernaryExpression) {
+            const t: TernaryExprNode* = e as TernaryExprNode*;
+            this.rewrite_returns_expr(t.condition, poll_out, span);
+            this.rewrite_returns_expr(t.true_expr, poll_out, span);
+            this.rewrite_returns_expr(t.false_expr, poll_out, span);
+            return;
+        }
+        if (k == NodeKind::StructLiteral) {
+            const sl: StructLiteralNode* = e as StructLiteralNode*;
+            for (mut i: i64 = 0; i < sl.field_inits.length; i++) {
+                this.rewrite_returns_expr(sl.field_inits[i].value, poll_out, span);
+            }
+            return;
+        }
+        if (k == NodeKind::AwaitExpression) {
+            this.rewrite_returns_expr((e as AwaitExprNode*).operand, poll_out, span);
             return;
         }
     }
@@ -290,6 +392,21 @@ type struct AsyncLower {
         }
         if (k == NodeKind::MemberAccess) {
             return this.expr_await_count((e as MemberAccessNode*).object);
+        }
+        if (k == NodeKind::MatchExpression) {
+            // A `match` expression holds statement bodies, so an `await` can hide
+            // in an arm. Counting it is what routes the shape to the E0600 for an
+            // await nested in an expression, instead of leaving the `await` in
+            // place for codegen to reject with no source context.
+            const me: MatchExprNode* = e as MatchExprNode*;
+            mut n: i64 = this.expr_await_count(me.subject);
+            for (mut i: i64 = 0; i < me.arms.length; i++) {
+                if (me.arms[i] != null) {
+                    n += this.expr_await_count(me.arms[i].guard);
+                    n += this.stmt_await_count(me.arms[i].body);
+                }
+            }
+            return n;
         }
         return 0i64;
     }
@@ -633,6 +750,16 @@ type struct AsyncLower {
         if (k == NodeKind::AwaitExpression) {
             return this.name_read_in_expr((e as AwaitExprNode*).operand, name);
         }
+        if (k == NodeKind::MatchExpression) {
+            const me: MatchExprNode* = e as MatchExprNode*;
+            if (this.name_read_in_expr(me.subject, name)) { return true; }
+            for (mut i: i64 = 0; i < me.arms.length; i++) {
+                if (me.arms[i] == null) { continue; }
+                if (this.name_read_in_expr(me.arms[i].guard, name)) { return true; }
+                if (this.name_read_in_stmt(me.arms[i].body, name)) { return true; }
+            }
+            return false;
+        }
         return false;
     }
 
@@ -773,6 +900,16 @@ type struct AsyncLower {
         if (k == NodeKind::AwaitExpression) {
             const aw: AwaitExprNode* = e as AwaitExprNode*;
             aw.operand = this.subst_name_expr(aw.operand, name, field, struct_ref, ty, span);
+            return e;
+        }
+        if (k == NodeKind::MatchExpression) {
+            const me: MatchExprNode* = e as MatchExprNode*;
+            me.subject = this.subst_name_expr(me.subject, name, field, struct_ref, ty, span);
+            for (mut i: i64 = 0; i < me.arms.length; i++) {
+                if (me.arms[i] == null) { continue; }
+                me.arms[i].guard = this.subst_name_expr(me.arms[i].guard, name, field, struct_ref, ty, span);
+                this.subst_name_stmt(me.arms[i].body, name, field, struct_ref, ty, span);
+            }
             return e;
         }
         return e;
@@ -1035,6 +1172,19 @@ type struct AsyncLower {
         if (k == NodeKind::ForStatement)     { return this.lower_for_sm(sm, stmt as ForStmtNode*, cur); }
         if (k == NodeKind::LoopStatement)    { return this.lower_loop_sm(sm, stmt as LoopStmtNode*, cur); }
         if (k == NodeKind::MatchStatement)   { return this.lower_match_sm(sm, stmt as MatchStmtNode*, cur); }
+        // No `await` here means the statement was exploded for its `break`/
+        // `continue` alone, and the only expression form that can hold one is a
+        // `match` used as an expression. Its arms are part of an expression, so
+        // the edge cannot become a state transition the way a `match` STATEMENT
+        // arm's can; emitted as-is it would compile to a native `break` out of
+        // the state-dispatch loop rather than the user's loop.
+        if (this.stmt_await_count(stmt) == 0i64) {
+            this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
+                "async: a `break`/`continue` inside a `match` EXPRESSION arm is not supported inside a loop that awaits; write the `match` as a statement that assigns the value",
+                stmt.span);
+            sm.ok = false;
+            return cur;
+        }
         this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
             "async: this `await` shape is not supported yet; write it as `const x = await e;` / `return await e;` / `await e;`, inside an `if`/`else` branch, inside a `while`/`for`/`loop`/`do-while` body, or inside a `match` arm (an `await` nested in an expression arrives in a later increment)",
             stmt.span);
@@ -1496,6 +1646,16 @@ type struct AsyncLower {
         const k: NodeKind = stmt.kind;
         if (k == NodeKind::ReturnStatement) { return true; }
         if (k == NodeKind::BreakStatement || k == NodeKind::ContinueStatement) { return true; }
+        if (k == NodeKind::ExpressionStatement) {
+            return this.expr_diverges((stmt as ExprStmtNode*).expression);
+        }
+        if (k == NodeKind::DeclarationStatement) {
+            const ds: DeclStmtNode* = stmt as DeclStmtNode*;
+            if (ds.declaration != null && ds.declaration.kind == NodeKind::VariableDeclaration) {
+                return this.expr_diverges((ds.declaration as VarDeclNode*).initializer);
+            }
+            return false;
+        }
         if (k == NodeKind::BlockStatement) {
             const blk: BlockStmtNode* = stmt as BlockStmtNode*;
             if (blk.statements.length == 0i64) { return false; }
@@ -1532,6 +1692,24 @@ type struct AsyncLower {
         return this.stmt_diverges(blk.statements[blk.statements.length - 1i64]);
     }
 
+    /// An expression yields control to the next statement unless it is a `match`
+    /// expression that cannot fall through — the expression form of the rule
+    /// `stmt_diverges` applies to a `match` statement. Any other kind is reported
+    /// as falling through, which can only leave a hand-back store the state never
+    /// reaches; `needs_handback` is the sole consumer and over-reporting there
+    /// costs a dead store, never a missing one.
+    expr_diverges(&this, e: ExpressionNode*) -> boolean {
+        if (e == null) { return false; }
+        if ((e as ASTNode*).kind != NodeKind::MatchExpression) { return false; }
+        const me: MatchExprNode* = e as MatchExprNode*;
+        if (me.arms.length == 0i64) { return false; }
+        if (!this.patterns.match_is_exhaustive(me.subject, me.arms)) { return false; }
+        for (mut i: i64 = 0; i < me.arms.length; i++) {
+            if (me.arms[i] == null || !this.stmt_diverges(me.arms[i].body)) { return false; }
+        }
+        return true;
+    }
+
     /// True if `stmt` holds a `break`/`continue` that targets the ENCLOSING loop
     /// (i.e. one not captured by a loop nested inside `stmt`). Used to decide
     /// whether an otherwise await-free statement must still be exploded into
@@ -1552,17 +1730,93 @@ type struct AsyncLower {
         }
         if (k == NodeKind::IfStatement) {
             const iff: IfStmtNode* = stmt as IfStmtNode*;
-            return this.has_free_edge(iff.then_stmt, break_only)
+            return this.expr_has_free_edge(iff.condition, break_only)
+                || this.has_free_edge(iff.then_stmt, break_only)
                 || this.has_free_edge(iff.else_stmt, break_only);
         }
         if (k == NodeKind::MatchStatement) {
             const m: MatchStmtNode* = stmt as MatchStmtNode*;
+            if (this.expr_has_free_edge(m.subject, break_only)) { return true; }
             for (mut i: i64 = 0; i < m.arms.length; i++) {
                 if (m.arms[i] != null && this.has_free_edge(m.arms[i].body, break_only)) { return true; }
             }
             return false;
         }
+        if (k == NodeKind::ExpressionStatement) {
+            return this.expr_has_free_edge((stmt as ExprStmtNode*).expression, break_only);
+        }
+        if (k == NodeKind::ReturnStatement) {
+            return this.expr_has_free_edge((stmt as ReturnStmtNode*).expression, break_only);
+        }
+        if (k == NodeKind::DeclarationStatement) {
+            const ds: DeclStmtNode* = stmt as DeclStmtNode*;
+            if (ds.declaration != null && ds.declaration.kind == NodeKind::VariableDeclaration) {
+                return this.expr_has_free_edge((ds.declaration as VarDeclNode*).initializer, break_only);
+            }
+            return false;
+        }
         // While/For/Loop/DoWhile capture their own break/continue — not free here.
+        return false;
+    }
+
+    /// Expression half of `has_free_edge`: a `match` used as an expression holds
+    /// statement bodies, so a `break`/`continue` targeting the enclosing loop can
+    /// sit inside one. Missing it leaves the edge as a native `break`, which in an
+    /// exploded loop escapes the state-dispatch `loop` instead of the user's loop.
+    expr_has_free_edge(&this, e: ExpressionNode*, break_only: boolean) -> boolean {
+        if (e == null) { return false; }
+        const k: NodeKind = (e as ASTNode*).kind;
+        if (k == NodeKind::MatchExpression) {
+            const me: MatchExprNode* = e as MatchExprNode*;
+            if (this.expr_has_free_edge(me.subject, break_only)) { return true; }
+            for (mut i: i64 = 0; i < me.arms.length; i++) {
+                if (me.arms[i] != null && this.has_free_edge(me.arms[i].body, break_only)) { return true; }
+            }
+            return false;
+        }
+        if (k == NodeKind::BinaryExpression) {
+            const b: BinaryExprNode* = e as BinaryExprNode*;
+            return this.expr_has_free_edge(b.left, break_only)
+                || this.expr_has_free_edge(b.right, break_only);
+        }
+        if (k == NodeKind::UnaryExpression) {
+            return this.expr_has_free_edge((e as UnaryExprNode*).operand, break_only);
+        }
+        if (k == NodeKind::CallExpression) {
+            const c: CallExprNode* = e as CallExprNode*;
+            if (this.expr_has_free_edge(c.callee, break_only)) { return true; }
+            for (mut i: i64 = 0; i < c.arguments.length; i++) {
+                if (this.expr_has_free_edge(c.arguments[i], break_only)) { return true; }
+            }
+            return false;
+        }
+        if (k == NodeKind::MemberAccess) {
+            return this.expr_has_free_edge((e as MemberAccessNode*).object, break_only);
+        }
+        if (k == NodeKind::CastExpression) {
+            return this.expr_has_free_edge((e as CastExprNode*).expression, break_only);
+        }
+        if (k == NodeKind::ArrayAccess) {
+            const a: ArrayAccessNode* = e as ArrayAccessNode*;
+            return this.expr_has_free_edge(a.array, break_only)
+                || this.expr_has_free_edge(a.index, break_only);
+        }
+        if (k == NodeKind::TernaryExpression) {
+            const t: TernaryExprNode* = e as TernaryExprNode*;
+            return this.expr_has_free_edge(t.condition, break_only)
+                || this.expr_has_free_edge(t.true_expr, break_only)
+                || this.expr_has_free_edge(t.false_expr, break_only);
+        }
+        if (k == NodeKind::StructLiteral) {
+            const sl: StructLiteralNode* = e as StructLiteralNode*;
+            for (mut i: i64 = 0; i < sl.field_inits.length; i++) {
+                if (this.expr_has_free_edge(sl.field_inits[i].value, break_only)) { return true; }
+            }
+            return false;
+        }
+        if (k == NodeKind::AwaitExpression) {
+            return this.expr_has_free_edge((e as AwaitExprNode*).operand, break_only);
+        }
         return false;
     }
 
@@ -1708,6 +1962,23 @@ type struct AsyncLower {
             if (l != 0i64) { return l; }
             return this.expr_first_use(b.right, name);
         }
+        if (k == NodeKind::MatchExpression) {
+            // Same shape as the statement form: the subject runs first, then the
+            // arm that matched. Distinguishing a write in an arm from a read is
+            // what lets `block_cond_write` see it as a branch-nested write, whose
+            // skipped path still needs the previous state's value.
+            const me: MatchExprNode* = e as MatchExprNode*;
+            const r: i64 = this.expr_first_use(me.subject, name);
+            if (r != 0i64) { return r; }
+            for (mut i: i64 = 0; i < me.arms.length; i++) {
+                if (me.arms[i] == null) { continue; }
+                const g: i64 = this.expr_first_use(me.arms[i].guard, name);
+                if (g != 0i64) { return g; }
+                const a: i64 = this.stmt_first_use(me.arms[i].body, name);
+                if (a != 0i64) { return a; }
+            }
+            return 0i64;
+        }
         if (this.name_read_in_expr(e, name)) { return 1i64; }
         return 0i64;
     }
@@ -1807,6 +2078,10 @@ type struct AsyncLower {
             const m: MatchStmtNode* = s as MatchStmtNode*;
             this.mark_last_use_expr(m.subject, name, true, out);
             for (mut i: i64 = 0; i < m.arms.length; i++) {
+                if (m.arms[i] == null) { continue; }
+                // A guard runs before its body and only reads, so a name last
+                // mentioned there is still owned by the state.
+                this.mark_last_use_expr(m.arms[i].guard, name, false, out);
                 this.mark_last_use_stmt(m.arms[i].body, name, out);
             }
             return;
@@ -1880,8 +2155,41 @@ type struct AsyncLower {
             }
             return;
         }
+        if (k == NodeKind::MatchExpression) {
+            const me: MatchExprNode* = e as MatchExprNode*;
+            this.mark_last_use_expr(me.subject, name, true, out);
+            for (mut i: i64 = 0; i < me.arms.length; i++) {
+                if (me.arms[i] == null) { continue; }
+                this.mark_last_use_expr(me.arms[i].guard, name, false, out);
+                this.mark_last_use_arm(me.arms[i].body, name, by_value, out);
+            }
+            return;
+        }
         // Anything else: a mention can only be a read of the value in place.
         if (this.name_read_in_expr(e, name)) { *out = 1i64; }
+    }
+
+    /// Walk a match-EXPRESSION arm body. Its trailing expression is the arm's
+    /// value, so that expression sits in the match's own position: when the match
+    /// result is handed over, an arm yielding the name hands the name over too.
+    /// Every other statement in the body is an ordinary statement.
+    mark_last_use_arm(&this, body: StatementNode*, name: SymbolStr,
+                      by_value: boolean, out: i64*) -> void {
+        if (body == null) { return; }
+        if (body.kind != NodeKind::BlockStatement) {
+            this.mark_last_use_stmt(body, name, out);
+            return;
+        }
+        const blk: BlockStmtNode* = body as BlockStmtNode*;
+        const last: i64 = blk.statements.length - 1i64;
+        for (mut i: i64 = 0; i < blk.statements.length; i++) {
+            const s: StatementNode* = blk.statements[i];
+            if (i == last && s != null && s.kind == NodeKind::ExpressionStatement) {
+                this.mark_last_use_expr((s as ExprStmtNode*).expression, name, by_value, out);
+                continue;
+            }
+            this.mark_last_use_stmt(s, name, out);
+        }
     }
 
     /// Turn the state's first `<name> = <expr>;` into `mut <name> = <expr>;`, so

@@ -41,16 +41,28 @@ not for routine judgement calls.
 
 Legend: ☐ not started · ◐ in progress · ✅ done+validated · ⏸ blocked (note why in the Progress Log).
 
-**Current HEAD baseline:** `4927f327` (the Phase-2 aggregate-across-await tail — committed + repinned by
-Jake). Branch `ll-impl`. `make stdlib` = 149 modules green. Phases 0–3 done + committed.
+**Current HEAD baseline:** `eda79ddc` (the two root-cause compiler fixes of 2026-07-24 — `drop_insertion`
+no longer running destructors on uninitialized memory, and the async "rebuilt from inside a branch" E0600
+removed — committed by Jake). Branch `ll-impl`. `make stdlib` = 149 modules green. Phases 0–3 done +
+committed.
 
-**UNCOMMITTED on top of that (2026-07-24, see the newest §9 entry):** two root-cause compiler fixes —
-`drop_insertion` no longer runs destructors on uninitialized memory (a field READ or method call on an
-initializer-less droppable local was silently disqualifying its init-flag guard), and the async
-"rebuilt from inside a branch" **E0600 is removed** (a branch-nested write is now carried like a read
-rather than treated as a self-produced value). Also fixed a dead hand-back store that made every
-aggregate-carrying `async fn` emit a spurious `W0009` against the user's own source. `make test` OVERALL
-PASS, both selfhost fixed points, REPINNED both OS. **The async-only socket port is now unblocked.**
+**✅ The Windows AFD reactor is VALIDATED (2026-07-25) — 30/30 runs, 0 failures, 0 hangs.** Real Windows
+host, async TCP echo over loopback on a 2-thread `Executor` driving `TcpAccept`/`TcpRead`/`TcpWrite`/
+`TcpConnect` through IOCP + `\Device\Afd` + `IOCTL_AFD_POLL`. **The hang really was a wine limitation, not a
+bug in the backend** — the backend needed no changes. Getting there required one root-cause compiler fix
+(qualified-global resolution, see the newest §9 entry), because `set_nonblocking` was silently using the
+Linux `FIONBIO` on Windows.
+
+**UNCOMMITTED on top of that (2026-07-25, see the newest §9 entry):** the async lowering's
+**`MatchExpression` blind spot is closed** — every walker in `async_lower.cryo` that descends into a
+`MatchStatement` now descends equally into a `MatchExpression`. That clears both reported symptoms (a value
+read only as a match subject was never carried across a suspend → E0201; a `return` inside a match-expression
+arm was never rewritten to `Poll::Ready` → E0200 leaking the internal `Poll<T>`) **and a third, unreported
+silent miscompile**: `has_free_edge` was blind too, so a `break` in a match-expression arm inside an awaiting
+loop compiled to a native `break` that escaped the state-dispatch loop and trapped at runtime. `make test`
+OVERALL PASS (1633 unit / 144 compile-fail / 9 projects), both selfhost fixed points, repin delta **0/235
+compiler + 0/149 stdlib on both OS**, REPINNED both OS. **This was the last blocker on the async-only socket
+port** — the idiomatic Cryo unwrap of every async socket `Result` is a match expression.
 
 **✅ FIXED (2026-07-23) — `block_on` (and every where-bound-only-param generic) now infers without a
 turbofish.** Was: `block_on(fut)` — and any `f<F, R>(fut: F) -> R where F: Future<R>` — failed **codegen
@@ -1656,3 +1668,149 @@ IR should be unchanged — verify the `win-s2` vs `win-s3` `.ll` diff at each bo
   loopback on a 2-thread `Executor` — `TcpAccept`/`TcpRead`/`TcpWrite`/`TcpConnect`, owned-handle style,
   with a droppable value conditionally rebuilt from inside a branch carried across the same suspends.
   **30/30 runs pass**, exact drop count, valgrind clean (15 allocs / 15 frees, 0 errors).
+
+- _2026-07-25_ — **The `MatchExpression` blind spot in the async lowering is CLOSED, and it hid a third,
+  unreported miscompile. REPINNED both OS. UNCOMMITTED.** Baseline HEAD `eda79ddc`; tree was clean at start,
+  `verify-pin` OK. Files: `sema/async_lower.cryo` (+~300), `tests/tests/lang/async_carry_across_await.cryo`
+  (13 → 24 tests). **This unblocks the async-only socket port.**
+
+  **Environment note:** this session ran on **real Windows** (PowerShell 5.1, msys64 gcc), not the Linux
+  codespace of prior sessions. `make selfhost-check` on a Windows host runs the Windows 6-stage chain
+  natively and delegates the Linux chain to WSL — both need `wsl.exe` + `python.exe` on PATH, both present.
+  Consequence worth planning around: the Windows AFD reactor is finally testable on this host.
+
+  **The invariant, stated once:** a `match` used as an EXPRESSION is a `match` statement that also yields a
+  value. Every walker that descends into a `MatchStatement` must descend equally into a `MatchExpression` —
+  it is the one expression form that contains *statements*, so it is the one place a statement-shaped walker
+  can silently lose an entire subtree. Before this, `MatchExpression` appeared **once** in the file (the
+  alpha-renamer) against 11 `MatchStatement` sites.
+
+  Walkers given a `MatchExpression` arm: `rewrite_returns` (plus a new expression half `rewrite_returns_expr`,
+  plus the entirely missing `DeclarationStatement`/`ExpressionStatement`/condition descent), `expr_await_count`,
+  `name_read_in_expr`, `subst_name_expr`, `expr_first_use`, `mark_last_use_expr` (+ `mark_last_use_arm`),
+  `stmt_diverges` (+ `expr_diverges`), and `has_free_edge` (+ `expr_has_free_edge`).
+
+  **(1) The two reported symptoms.** `const v = match (r) { Ok(x) => { x } Err(_) => { return -1; } };` inside
+  an `async function`: E0201 "cannot find value `r`" (the use-analysis never saw the subject read, so a value
+  read ONLY as a match subject was never carried across the suspend) and E0200 "expected `Poll<i64>`, found
+  `i32`" (`rewrite_returns` walked statements only, so an arm's `return` was never wrapped — and the
+  diagnostic leaked the internal `Poll<T>` to a user who wrote `-> i64`). The discriminator that proves it is
+  the lowering and not the language: **the identical body compiles clean and returns the right answer when
+  not `async`.** Run that control first on anything in this area.
+
+  **(2) The unreported one — a silent miscompile, found by probing rather than from the audit list.**
+  `has_free_edge` (which decides whether an await-free statement must still be exploded into states because it
+  holds a `break`/`continue` targeting an enclosing loop) was blind to `MatchExpression` too. A `break` in a
+  match-expression arm inside an awaiting loop was therefore emitted as-is, and a native `break` inside the
+  generated `loop { match (state) { … } }` **escapes the state-dispatch loop, not the user's loop**. Probe:
+  sync returned 10, async **trapped** (`0xC0000003`). `break` in a match-expression arm is legal Cryo and
+  works correctly in a non-async function, so this was reachable, wrong, and silent.
+  - **Fix = diagnose, not lower.** A match-expression arm is part of an expression, so its edge cannot become
+    a state transition the way a `match` STATEMENT arm's can — lowering it is the same job as "await nested in
+    an expression", a separate increment. It now emits a distinct E0600 naming the remedy (write the `match`
+    as a statement assigning a pre-declared local), gated on `stmt_await_count == 0` so the pre-existing
+    await-shape message is not reused for a case with no `await` in it. Remedy verified: it compiles, and
+    async then matches sync exactly.
+
+  **(3) `await` inside a match-expression arm is now a clean E0600** at the right span. Previously
+  `expr_await_count` returned 0 for the whole subtree, so the shape was emitted as-is and the surviving
+  `await` hit codegen's "not implemented" hard error behind ~7 lines of `codegen failed for module N` noise.
+
+  **Two `mark_last_use` refinements, both semantic rather than cosmetic:** an arm body's TRAILING expression
+  IS the arm's value, so it inherits the match's own by-value position (`mark_last_use_arm`) — an arm yielding
+  a carried value into a by-value consumer really does give it away; and the `MatchStatement` arm now walks
+  arm GUARDS (a guard runs before its body and only reads, so a name last mentioned there is still owned by
+  the state), which it previously skipped.
+
+  **A warning that was NOT ours — reported, not folded in.** The guard probe drew `W0001 unused variable` on a
+  local read only by a match-arm guard. Probed before assuming: it fires identically for a `match` STATEMENT
+  guard and in a **non-async** function, while a read in an arm BODY is seen correctly. So **a name read only
+  in a match-arm guard is missing from the resolution map** that `dead_code.cryo`'s unused-local lint is built
+  from (`build_used`); `sema.cryo:resolve_match_expr` DOES resolve the guard, so the gap is in what the
+  resolution map records, not in whether the guard is visited. Pre-existing, language-wide, unrelated to
+  async, and codegen is correct (the guard evaluates). Left for Jake to scope; the permanent guard test
+  `_`-prefixes its binding so the suite does not enshrine the false positive.
+
+  **A language fact confirmed, not a bug:** conditionally moving a value out through one arm
+  (`const got = match (c) { true => { t } false => { Tag{…} } };`) warns `E0456` and drops exactly ONE value
+  on BOTH paths — `t` is treated as moved on every path once it is moved on any. Sync and async give
+  identical counts (1/1), which is the property that matters. An initial probe expectation of 2 was wrong
+  about the language, not about the lowering.
+
+  **Validated:** 21 assertions across 9 async shapes (subject-carry; arm-return; whole-match in return
+  position; guard-only read; arm-rebuild taken and skipped with exact drop counts; nested inside a `match`
+  STATEMENT arm; by-value arm yield; carry across TWO suspends), plus the droppable-aggregate subject
+  (`Result<Handle, u32>` — the `TcpConnect::Output` shape). **11 permanent tests added**, all confirmed to
+  actually execute (grep the run for `match_expr_`; do not trust a bare "unit: ok").
+  **Gates:** `make test` OVERALL PASS — 1633 unit / 144 compile-fail / 9 projects, 0 failed. Both selfhost
+  fixed points verified by DIRECT directory diff with denominators: Linux `s3` vs `s4` **0/236**, Windows
+  `win-s3` vs `win-s4` **0/235**. Repin delta `win-s2` vs `win-s3` = **0/235** compiler and **0/149** stdlib,
+  Linux stdlib `s2` vs `s3` = **0/149** — inert for all existing code.
+  **Repinned anyway, and here the reason is forward-looking rather than precedent:** `make stdlib` builds with
+  `bin/cryo`, so the first `match` expression the socket port writes inside an `async function` would fail the
+  build against a pinned compiler lacking this fix.
+
+  **Housekeeping note for Jake:** the pin sidecars record `worktree: dirty`, correctly — this work is
+  uncommitted. `python scripts/verify-pin.py --require-clean` will keep failing until the tree is committed
+  and repinned from clean; plain `verify-pin` passes.
+
+  NEXT: the async-only socket port (`net::http`, `net::http2`, `net::ws`, `net::https` + the 4 net tests),
+  then delete the blocking surface from `tcp.cryo`. Concrete socket touchpoints confirmed few outside
+  `tcp.cryo` itself (54): `http` 3+5+1+1, `http2` 3+5+1+1+1, `ws` 5+1+1, `https` 1 — and `tls` 12
+  (`context` 7 + `stream` 5), which still needs its own design pass (OpenSSL blocking BIO → non-blocking +
+  `WANT_READ`/`WANT_WRITE`) before anyone touches it.
+
+- _2026-07-25_ — **Windows AFD reactor VALIDATED (30/30), unblocked by a root-cause fix to qualified-global
+  resolution. REPINNED both OS. UNCOMMITTED.** Files: `decl_index.cryo`, `sema/type_utils.cryo`,
+  `sema/sema.cryo`, `codegen/ops/symbol_resolver.cryo`, `codegen/visit/ir_generator.cryo`. Jake chose the
+  root-cause fix over the narrower stdlib one when asked.
+
+  **Track 3 is DONE.** Async TCP echo over loopback on a 2-thread `Executor` — `TcpAccept`/`TcpRead`/
+  `TcpWrite`/`TcpConnect`, owned-handle style, every `Result` unwrapped with a **match EXPRESSION** (so this
+  doubles as end-to-end proof of the lowering fix above). **30/30 runs, 0 failures, 0 hangs.** The AFD
+  backend itself needed no changes: IOCP + `\Device\Afd` + `IOCTL_AFD_POLL` work exactly as designed on a
+  real Windows host. The wine hang was purely wine.
+
+  **The blocker it surfaced: a qualified `mod::CONST` reference silently bound to the WRONG module.**
+  `set_nonblocking` failed with `WSAEOPNOTSUPP`, because `syscall::FIONBIO` resolved to `libc::FIONBIO` —
+  the Linux ioctl `0x5421` instead of the Winsock `0x8004667E`. Proven by probe: `![target(windows)]` gating
+  works (a local marker returned its windows value), the windows-gated SIBLING `syscall::WSAEISCONN`
+  resolved correctly (nothing else declares that leaf), and `ioctlsocket` with the literal returned `rc=0`.
+  So: not gating, not the syscall, not the reactor — name resolution.
+  - **Root cause, in TWO places.** `sema.cryo:resolve_scope_resolution` and
+    `ir_generator.cryo:visit(ScopeResolutionNode*)` both ended in a **bare-leaf global lookup that discards
+    the qualifier**. `decl_index.global_vars` is keyed by bare name and is last-write-wins across every
+    module declaring that leaf, so the qualifier was decorative. The codegen fallback even stated the false
+    premise in a comment — *"Globals are unique LLVM symbols at link time"* — which is untrue precisely
+    because `register_global_with_module` mangles `C$<ns>.<name>` so that same-leaf globals DON'T collide.
+    Sema picking wrong gave the wrong TYPE (`u64` vs `i32`); codegen picking wrong gave the wrong VALUE.
+  - **Fix** uses data the index already recorded but nothing consulted: `module_global_namespaces`. Added a
+    parallel `module_global_types` (the bare map cannot answer "the `FIONBIO` declared in `sys::syscall`")
+    and `DeclarationIndex::find_global_in_scope`, which matches the scope segment against the declaring
+    namespace's last `::` segment — reusing `CallResolver`'s existing allocation-free module-suffix idiom
+    rather than inventing one. Both call sites try it BEFORE their bare fallback. **Strictly additive:** no
+    match, or ambiguity between two namespaces ending in the same segment, returns invalid and the old path
+    runs unchanged. Codegen caches under the namespace-qualified key, since the bare cache key belongs to
+    whichever module bound first. Type/enum scopes (`Result::Ok`) short-circuit earlier and are untouched.
+  - **Blast radius — I over-stated this when asking Jake, and the correction matters.** A scan found 9
+    cross-file const leaves with numerically differing values, and I said the 7 errno ones were "likely
+    wrong the same way". **They were not.** They are referenced BARE within their own module, where
+    `lookup_global_var` already prefers the current module via `qualify_symbol_sym`. Grepping for qualified
+    uses, `net/sys.cryo:200` is the **only** qualified reference among all 9 — so `FIONBIO` was the only
+    site actually miscompiling. The IR delta confirms it exactly: **one** stdlib `.ll` changed, and the diff
+    is two lines swapping `C$3std.3ffi.4libc.7FIONBIO` for `C$3std.3sys.7syscall.7FIONBIO`. The fix is still
+    worth having — it closes the class — but the damage was 1 site, not 8.
+  - **Gates:** `make test` OVERALL PASS (1633 / 144 / 9, 0 failed). Both fixed points by direct diff: Linux
+    `s3`vs`s4` **0/236**, Windows `win-s3`vs`win-s4` **0/235**. Compiler pin delta `win-s2`vs`win-s3`
+    **0/235**. stdlib Windows **1/149** (`std/net/sys.ll`); stdlib Linux **0/149** — expected, since the
+    reference sits in a `![target(windows)]` function stripped on Linux, which is exactly why this survived
+    every Linux-only session.
+
+  **MEASUREMENT TRAP — the repin recipe in §6 is right for the COMPILER and WRONG for stdlib.** For the
+  compiler, `win-s2` is built by the PINNED compiler and `win-s3` by the new one, so diffing them measures
+  the pin delta. For stdlib it does NOT: `.bin/self/win-s2` is stdlib built by stage-2 and `win-s3` by
+  stage-3, and **both stages are the current source**, so that diff is vacuously 0 no matter what changed.
+  The stdlib pin delta is **`win-s1` (via pinned) vs `win-s2` (via new)**. On Linux there is no `self/s1`
+  at all — stage 1 writes to `.bin/target/release/host/local/ir`, so the Linux pair is that vs
+  `.bin/self/s2/...`. Diffing the wrong pair here reports `0/0` or a vacuous `0/149` and reads exactly like
+  a clean pass.
