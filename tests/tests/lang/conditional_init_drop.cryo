@@ -31,6 +31,10 @@ implement struct CIProbe {
         ci_alive = ci_alive + 1;
         return CIProbe { tag: tag };
     }
+
+    tag_of(&this) -> i32 {
+        return this.tag;
+    }
 }
 
 implement trait Drop for struct CIProbe {
@@ -183,4 +187,98 @@ function cond_init_and_move_on_skip_path() -> Result<(), TestError> {
     }
     // Never initialized: no construct, no drop.
     return expect_eq(ci_drops, 0 as i32);
+}
+
+// --- reading the local must not cost it its init flag ----------------
+// The flag is dropped for locals whose storage can be initialized without a
+// whole-binding assignment.  A field READ or a method call initializes
+// nothing, so it must not disqualify: a local disqualified here gets an
+// UNGUARDED scope-exit drop, which the `return` below then runs over
+// uninitialized stack memory (for a socket-like type, a close() of a garbage
+// descriptor).  Each helper takes the early `return` on the uninitialized
+// path while still mentioning the local later in the body.
+
+function ci_read_field(early: boolean) -> i32 {
+    mut x: CIProbe;
+    if (early) { return 0 as i32; }
+    x = CIProbe::new(13);
+    return x.tag;
+}
+
+function ci_call_method(early: boolean) -> i32 {
+    mut x: CIProbe;
+    if (early) { return 0 as i32; }
+    x = CIProbe::new(14);
+    return x.tag_of();
+}
+
+![test]
+function field_read_keeps_guard_on_uninit_path() -> Result<(), TestError> {
+    ci_reset();
+    ci_read_field(true);
+    return expect_eq(ci_drops, 0 as i32);
+}
+
+![test]
+function field_read_still_drops_on_init_path() -> Result<(), TestError> {
+    ci_reset();
+    ci_read_field(false);
+    match (expect_eq(ci_drops, 1 as i32)) {
+        Result::Ok(_) => {}
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(ci_alive, 0 as i32);
+}
+
+![test]
+function method_call_keeps_guard_on_uninit_path() -> Result<(), TestError> {
+    ci_reset();
+    ci_call_method(true);
+    return expect_eq(ci_drops, 0 as i32);
+}
+
+![test]
+function method_call_still_drops_once_on_init_path() -> Result<(), TestError> {
+    ci_reset();
+    ci_call_method(false);
+    match (expect_eq(ci_drops, 1 as i32)) {
+        Result::Ok(_) => {}
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(ci_alive, 0 as i32);
+}
+
+// --- initialization the flag genuinely cannot observe ----------------
+// A field WRITE and an address-of both initialize storage without a
+// whole-binding assignment, so the local must stay OUT of init tracking.
+// If it were tracked, its flag would never be set and the value would leak;
+// these two assert the drop still happens.
+
+function ci_init_through(p: CIProbe*) -> void {
+    (*p) = CIProbe::new(16);
+}
+
+![test]
+function piecemeal_field_write_still_drops() -> Result<(), TestError> {
+    ci_reset();
+    {
+        mut x: CIProbe;
+        x.tag = 15 as i32;
+        ci_alive = ci_alive + 1;
+    }
+    return expect_eq(ci_drops, 1 as i32);
+}
+
+![test]
+function init_through_escaped_address_still_drops() -> Result<(), TestError> {
+    ci_reset();
+    {
+        mut x: CIProbe;
+        ci_init_through(&x);
+    }
+    match (expect_eq(ci_drops, 1 as i32)) {
+        Result::Ok(_) => {}
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(ci_alive, 0 as i32);
 }
