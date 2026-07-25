@@ -214,10 +214,37 @@ public:
     // -- Top-level + statement recursion seams --
 
     override visit(mut &this, node: ProgramNode*) -> void {
+        this.declare_async_futures(node);
         for (mut i: i64 = 0; i < node.statements.length; i++) {
             const stmt: ASTNode* = node.statements[i];
             if (stmt == null) { continue; }
             this.dispatch_top_level(stmt);
+        }
+    }
+
+    /// Give every `async function` in the module its future type before any body
+    /// is typed.
+    ///
+    /// The state machine can only be built from a typed body, so the lowering
+    /// runs at the end of each function's own visit. But an `await` resolves the
+    /// callee's return type through the declaration index, so a caller visited
+    /// before its callee would see the callee's pre-lowering signature and report
+    /// that its Output "does not implement `Future`". Declaring the whole module's
+    /// futures up front makes the order of declarations irrelevant, and lets an
+    /// `async function` await itself.
+    ///
+    /// Bounded to the statement list: the count of async fns per module is small,
+    /// and `declare` is idempotent per node.
+    declare_async_futures(mut &this, node: ProgramNode*) -> void {
+        for (mut i: i64 = 0; i < node.statements.length; i++) {
+            const stmt: ASTNode* = node.statements[i];
+            if (stmt == null || stmt.kind != NodeKind::FunctionDeclaration) { continue; }
+            const f: FunctionDeclNode* = stmt as FunctionDeclNode*;
+            // Generic async fns are rejected at their declaration, and a lowered
+            // one has already had `is_async` cleared.
+            if (f.is_async && !f.is_generic() && f.body != null) {
+                this.async_lower.declare(f);
+            }
         }
     }
 
@@ -264,6 +291,17 @@ public:
     override visit(mut &this, node: FunctionDeclNode*) -> void {
         if (node.body == null) { return; }
         if (node.is_generic()) {
+            // The state machine is built here, from the typed body. A generic
+            // body is still symbolic at this point — its awaited types, and hence
+            // the sub-future fields to carry them, are not known until
+            // monomorphization. Reported at the declaration: left to the use
+            // site, the missing lowering surfaces as an unresolved generic
+            // instantiation from deep inside the future machinery.
+            if (node.is_async) {
+                this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
+                    "async: a generic `async function` is not supported yet; its body is still symbolic when the state machine is built, so declare it with concrete types",
+                    node.span);
+            }
             this.symbolic_check_body(node, TypeRef::invalid(), TypeRef::invalid());
             return;
         }
@@ -279,8 +317,8 @@ public:
         this.check_function_returns(node);
         this.check_opaque_return_item(node);
         // Lower an `async function` into a Future state machine AFTER its body is
-        // typed against the declared Output type. Generic async fns are deferred.
-        if (node.is_async && !node.is_generic()) {
+        // typed against the declared Output type. The generic case returned above.
+        if (node.is_async) {
             this.async_lower.lower(node);
         }
     }

@@ -64,6 +64,25 @@ OVERALL PASS (1633 unit / 144 compile-fail / 9 projects), both selfhost fixed po
 compiler + 0/149 stdlib on both OS**, REPINNED both OS. **This was the last blocker on the async-only socket
 port** — the idiomatic Cryo unwrap of every async socket `Result` is a match expression.
 
+**UNCOMMITTED (2026-07-24) — four correctness/usability items on top of the above; see the newest §9 entry
+for the reasoning behind each.** (1) A raw pointer into the poll frame held across an `await` was a **silent
+miscompile** and is now `E0455`, with the sound shapes (pointer parameter, dynamic-array heap block, global)
+kept legal and tested. (2) `async function … -> void` now works — it was broken in *every* form, not just
+with awaits, and lowers with `Output = ()`. (3) **Declaration order no longer matters**: `lower` is split, and
+a new `declare` gives every `async fn` in the module its future type before any body is typed, which retires
+the misleading "`i64` does not implement `Future`" `E0306`. (4) That split exposed **recursive async fns as a
+silent miscompile** (they compiled, then re-polled a completed sub-future); direct and mutual recursion are
+now rejected at the `await` that closes the cycle. `make test` OVERALL PASS **1648 / 150 / 9** (from
+1633/144/9). Compiler-only — `stdlib/` has zero `async function`s, so no stdlib IR moves.
+
+**⏸ Generic `async function` — designed and mostly plumbed, NOT landed; still `E0600` at the declaration.**
+Jake wants it working. The WIP is preserved and §9 records exactly where it stops: the generic future
+template registers and `Fut<i64>` forms, but nothing DEMANDS its specialization, so its fields, `poll` and
+`Future` impl are never built. Next step is the free-function specialization path's missing
+`request_nested_instantiations` on the spec's return type. **The reusable lesson is in §9: a synthesized
+annotation built by `make_type_ann` is pre-resolved and therefore invisible to monomorphization's
+substitution** — anything mentioning a type parameter has to be spelled by name.
+
 **✅ FIXED (2026-07-23) — `block_on` (and every where-bound-only-param generic) now infers without a
 turbofish.** Was: `block_on(fut)` — and any `f<F, R>(fut: F) -> R where F: Future<R>` — failed **codegen
 `E0636`** when `R` appeared only in the return type + where-bound (never a parameter), because argument
@@ -1814,3 +1833,110 @@ IR should be unchanged — verify the `win-s2` vs `win-s3` `.ll` diff at each bo
   at all — stage 1 writes to `.bin/target/release/host/local/ir`, so the Linux pair is that vs
   `.bin/self/s2/...`. Diffing the wrong pair here reports `0/0` or a vacuous `0/149` and reads exactly like
   a clean pass.
+
+---
+
+- **2026-07-24 — soundness of pointers across a suspend (`E0455`), `-> void`, declaration order,
+  recursion; plus a scoped investigation of generic `async fn`.** Five items, four landed and gated.
+  `make test` OVERALL PASS **1648 unit / 150 compile-fail / 9 projects**, up from 1633/144/9 — 15 new unit
+  tests and 6 new compile-fail cases, all async. Every one is a new file; nothing existing changed except
+  `sema.cryo` and `async_lower.cryo`.
+
+  1. **A raw pointer into the poll frame held across an `await` was a SILENT miscompile — now `E0455`.**
+     Confirmed live before touching anything: `mut buf: u8[8]; const p = &buf[0]; await …; *p = 42;` moved
+     `&buf[0]` from `…FB30` to `…FB18` and the write landed on dead stack (result 0, not 42), while the
+     identical body without `async` returned 42. The cause is not a bug but the carry protocol itself:
+     `promote_cross_state` re-materializes every carried local per state (aggregates via `take().unwrap()`
+     into a fresh block-local, scalars via a `const x = this.field` copy), and each poll runs on a **new
+     native frame** — so no address of a frame local can outlive the state that took it.
+     Jake chose **diagnose now + buffer-owning I/O futures** over making carried locals address-stable;
+     address-stability would only hold while the future never moves after its first poll, which is exactly
+     what `Pin` enforces and `Pin` was already ruled infeasible here (§4). The check rejects the two ways an
+     address escapes its state — a carried value whose initializer or later assignment takes a frame address
+     (`reject_frame_addr_carry`, called from both the aggregate and the scalar promotion paths), and an
+     address handed to the awaited future itself (in `lower_carrier_sm`, which is the
+     `TcpRead::start(s, &buf[0], 64)` shape the socket port would otherwise have baked in everywhere).
+     It deliberately does **not** reject the transient `f(&local)` form, whose pointer never leaves the
+     state — passing owning aggregates by pointer is ordinary Cryo and banning it would be worse than no
+     check. Frame-rootedness is decided by walking the place and stopping at the first indirection
+     (`addr_place_root` / `place_leaves_frame`), so `&dyn_array[0]` (heap block), `&*ptr_param` (caller's
+     frame) and `&GLOBAL` stay legal — each verified by a test that writes through the pointer AFTER a
+     suspend and reads the value back. `frame_names` is populated from `mint_local`, the single funnel every
+     local and match-binding rename passes through, so the check cannot under-report by missing a nested
+     declaration.
+  2. **`async function … -> void` now works — it was broken in EVERY form, not just with awaits.** §5 listed
+     only "a body with awaits that falls off its end"; in fact even `async function f() -> void { }` failed
+     `E0403` ("`poll` reaches the end of its body without returning"), because a future has to hand a value
+     to `Poll::Ready` and `void` is the absence of one. `-> void` now lowers with **`Output = ()`**: unit is
+     a value, so the terminal return is well-formed, and a body that ends without a `return` gets that unit
+     completion synthesized. The append happens **after** `promote_cross_state`/`carry_params`, because both
+     append their hand-back stores to the end of a state and a `return` placed first would strand them
+     behind it. The old `E0600` survives only for a value-returning body the return analysis thinks can fall
+     off — a real disagreement with the pre-lowering check, not the void case.
+  3. **Declaration order no longer matters, and the misleading `E0306` is gone.** Lowering needs a typed
+     body so it runs at the end of each function's visit, but `await` resolves the callee through the
+     declaration index — so a caller visited first saw the callee's pre-lowering signature and was told its
+     Output "does not implement `Future`", naming a type the user never wrote. `lower` is now split: a new
+     **`declare`** establishes everything a CALLER needs (the state-machine struct, `poll`'s signature, the
+     `Future` impl, and the function's registered return type) and a module-wide pre-pass
+     (`SemaVisitor::declare_async_futures`) runs it for every `async fn` before any body is typed. The node's
+     own `resolved_return_type` deliberately keeps the DECLARED type — `enter_function` types the body's
+     returns against it and `check_function_returns` validates them, both before `lower` runs — so only the
+     index entry is repointed at the struct. Forward, backward and mixed awaits all resolve, as does a plain
+     function calling an `async fn` declared below it.
+  4. **Recursive async fns were a silent miscompile that this exposed, and are now diagnosed.** Before the
+     split, recursion failed with the same accidental `E0306`; removing that made `countdown(n-1)`
+     **compile** and then panic at runtime with "PendingThenReady polled after completion" — the
+     self-referential future has no finite size, and the layout that results overlaps the nested future with
+     the outer one. There is no boxing escape hatch to offer (`dyn` is post-1.0), so the recursion is
+     rejected at the `await` that closes the cycle. Detection walks an **awaits graph** over generated future
+     types (`edge_from`/`edge_to`, `future_reaches`) rather than comparing a pair of types, which is what
+     catches the mutual case: for a `ping`/`pong` pair the first future's fields are still empty when it
+     needs the answer, so a field-based check would miss it. Reported in whichever function lowers second.
+  5. **Generic `async fn`: INVESTIGATED, NOT LANDED — it still emits the clean `E0600` at the declaration.**
+     Jake asked for this working, not merely diagnosed. The design below is validated and got most of the way;
+     the remaining step is inside the monomorphizer and I stopped rather than keep guessing. **The full WIP is
+     preserved** as `WIP-async_lower-generic.cryo` and `WIP-sema-generic.cryo` (path in the handoff); the tree
+     was reverted to the gated-green state so nobody inherits a half-lowered compiler. Findings in the order
+     they will be needed:
+     - **`lambda_synth` is a dead end as a model.** HANDOFF suggested mirroring how closures inside generic
+       fns are handled; they are **rejected**, not supported (`lambda_synth.cryo:478-488`, `:544`).
+     - **The design that is right:** the future is generic in the SAME parameters as the function —
+       `identity$Future<T>` with `implement<T> trait Future<T> for identity$Future<T>` — registered as a
+       `TemplateEntry` (`NodeKind::StructDeclaration`, `base_type` = the `create_struct` base) so the
+       monomorphizer specializes `Fut<i32>` from the same demand that specializes `f<i32>`. Pass order
+       permits it: TemplateRegistration → TypeResolution → **sema** → **Monomorphization**, so a template
+       registered during sema is in time.
+     - **What already works with the WIP applied:** the template registers, `Fut<i64>` forms, and
+       `block_on`'s `F` binds to `main::identity$Future_0<i64>`.
+     - **The trap that cost the most, and the general lesson:** `make_type_ann` pre-resolves, which is what
+       lets a synthesized annotation skip name lookup — and pre-resolution makes it **opaque to
+       substitution**, because the monomorphizer specializes a template by rewriting the generic parameters
+       that appear in its ANNOTATIONS. Every synthesized type mentioning `T` must therefore be spelled by
+       name: the rewritten return annotation (`Fut<T>` as a `GenericAnnotation`), the ctor literal's
+       `generic_args`, `poll`'s `Poll<T>`, the impl's trait args and `Output` assoc binding, and each
+       parameter field (clone the parameter's own source annotation). Fixing the return annotation and then
+       the ctor args each visibly moved the error, which is how the diagnosis was confirmed.
+     - **Where it stops:** `Fut<i64>` is created but never SPECIALIZED — unsubstituted member type (`E0900`
+       "a member type of type #N did not resolve"), no `poll` on it (`E0358`), and `Output` still `T`
+       (`E0200`). All three are one fact: **nothing demands the specialization.**
+       `MonoState::enqueue_from_type_ref` would accept it (base is a Struct, `is_template` true, args
+       concrete), so the gap is upstream — whichever free-function specialization path should call
+       `request_nested_instantiations` on the spec's `resolved_return_type`. The METHOD path does exactly
+       that at `mono/ast_resolver.cryo:601`; the free-function analogue is around
+       `mono/monomorphizer.cryo:718-727`. **Start there.**
+     - **Two design consequences already settled, worth keeping:** (a) the symbolic generic-body walk becomes
+       load-bearing rather than additive, since the lowering consumes the resolved types it leaves on the
+       body — so it has to run even when `CRYO_NO_SYMBOLIC_CHECK` disables it (the WIP adds
+       `symbolic_check_body_forced`); (b) a carried local whose type is a bare type parameter cannot pick a
+       promotion strategy, because `zeroable_kind` cannot tell a scalar from an aggregate — route those to
+       the `Option<T>` carrier, which is correct for both.
+  - **Gates:** `make test` OVERALL PASS (1648 / 150 / 9, 0 failed) — run twice, once on the landed state and
+    again after the generic-async WIP was reverted out, so the tree as left is the gated one.
+    `make selfhost-check` exit 0 with **both** `FIXED POINT OK` markers (target-IR + native-PE). Pin deltas
+    by the §6 pairs: compiler `win-s2` vs `win-s3` = **0/235 `.ll`**, stdlib `win-s1` vs `win-s2` =
+    **0/149 `.ll`** (the correct stdlib pair; `win-s2` vs `win-s3` is the vacuous one — see the measurement
+    trap above). **So NO REPIN is needed**, which is the expected result for a compiler-only async change:
+    neither `stdlib/` nor the compiler's own source contains an `async function`, so nothing downstream of
+    the pin moves. The consequence to remember is that the pinned `bin/cryo` does not carry the new
+    diagnostics until someone repins.
