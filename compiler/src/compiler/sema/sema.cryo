@@ -236,15 +236,132 @@ public:
     /// Bounded to the statement list: the count of async fns per module is small,
     /// and `declare` is idempotent per node.
     declare_async_futures(mut &this, node: ProgramNode*) -> void {
+        // Only an impl block registers its methods under more than one owner
+        // name; every other owner shares this empty list.
+        const no_aliases: SymbolStr[] = [];
         for (mut i: i64 = 0; i < node.statements.length; i++) {
             const stmt: ASTNode* = node.statements[i];
-            if (stmt == null || stmt.kind != NodeKind::FunctionDeclaration) { continue; }
-            const f: FunctionDeclNode* = stmt as FunctionDeclNode*;
-            // A lowered one has already had `is_async` cleared.
-            if (f.is_async && f.body != null) {
-                this.async_lower.declare(f);
+            if (stmt == null) { continue; }
+            match (stmt.kind) {
+                NodeKind::FunctionDeclaration => {
+                    const f: FunctionDeclNode* = stmt as FunctionDeclNode*;
+                    // A lowered one has already had `is_async` cleared.
+                    if (f.is_async && f.body != null) { this.async_lower.declare(f); }
+                }
+                NodeKind::StructDeclaration => {
+                    const s: StructDeclNode* = stmt as StructDeclNode*;
+                    this.declare_async_methods(s.methods, s.generic_params,
+                        this.ctx.qualify_binding_sym(s.name, s.binding_namespace), no_aliases);
+                }
+                NodeKind::UnionDeclaration => {
+                    const u: UnionDeclNode* = stmt as UnionDeclNode*;
+                    this.declare_async_methods(u.methods, u.generic_params,
+                        this.ctx.qualify_binding_sym(u.name, u.binding_namespace), no_aliases);
+                }
+                NodeKind::ClassDeclaration => {
+                    const c: ClassDeclNode* = stmt as ClassDeclNode*;
+                    this.declare_async_methods(c.methods, c.generic_params,
+                        this.ctx.qualify_symbol_sym(c.name), no_aliases);
+                }
+                NodeKind::ImplementationBlock => {
+                    const ib: ImplBlockNode* = stmt as ImplBlockNode*;
+                    // Type resolution stamped the canonical target on the node;
+                    // the two other spellings it also registered the methods
+                    // under have to be repointed alongside it, or a call that
+                    // resolved through one of them keeps the old signature.
+                    const canonical: SymbolStr = if (ib.qualified_target_name.is_valid()) {
+                        ib.qualified_target_name
+                    } else { this.ctx.qualify_symbol_sym(ib.target_type) };
+                    mut aliases: SymbolStr[] = [ib.target_type,
+                                                this.ctx.qualify_symbol_sym(ib.target_type)];
+                    this.declare_async_methods(ib.methods, ib.generic_params,
+                                               canonical, aliases);
+                }
+                _ => { }
             }
         }
+    }
+
+    /// Declare the future of every `async` method in one owner's method list.
+    ///
+    /// `owner_params` are the OWNER's generic parameters, which the future must
+    /// carry as well as the method's own; `qname` / `aliases` are the keys the
+    /// declaration index registered the methods' signatures under.
+    declare_async_methods(mut &this, methods: &MethodNode*[],
+                          owner_params: &GenericParamNode*[],
+                          qname: SymbolStr, aliases: &SymbolStr[]) -> void {
+        if (!qname.is_valid()) { this.reject_undeclarable_async(methods, qname); return; }
+        const owner_ty: TypeRef = this.ctx.decl_index.lookup_type(qname);
+        if (!owner_ty.is_valid()) { this.reject_undeclarable_async(methods, qname); return; }
+        for (mut i: i64 = 0; i < methods.length; i++) {
+            const m: MethodNode* = methods[i];
+            if (m == null || m.func == null || m.func.body == null) { continue; }
+            if (!m.func.is_async) { continue; }
+            // Each override lowers to its OWN future struct, so they return
+            // different types and cannot share a vtable slot. Clearing the flag
+            // keeps the method compiling as an ordinary one instead of raising a
+            // second, less informative error from the lowering.
+            if (m.is_virtual || m.is_override) {
+                this.ctx.emit_error_at(ErrorCode::E0364_INVALID_ASYNC_MEMBER,
+                    "a `virtual` or `override` method cannot be `async`: each implementation returns its own future type, so the overrides have no common return type to dispatch through",
+                    m.func.span);
+                m.func.set_async(false);
+                continue;
+            }
+            mut own: AsyncOwner = AsyncOwner {
+                method: m,
+                ty: this.async_owner_instance(owner_ty, owner_params),
+                qname: qname,
+                alias_qnames: this.clone_symbols(aliases),
+                params: this.clone_generic_params(owner_params),
+            };
+            this.async_lower.declare_method(own);
+        }
+    }
+
+    /// Report every `async` method of an owner whose type could not be resolved,
+    /// and clear the flag.
+    ///
+    /// Skipping quietly is what must not happen: an `async` method left
+    /// undeclared reaches `lower` with no pending record, and that fallback
+    /// declares it as a FREE function — where the body's `this` would silently
+    /// resolve to the generated future instead of the receiver.
+    reject_undeclarable_async(mut &this, methods: &MethodNode*[], qname: SymbolStr) -> void {
+        const owner: string = if (qname.is_valid()) { this.intern.resolve(qname) } else { "?" };
+        for (mut i: i64 = 0; i < methods.length; i++) {
+            const m: MethodNode* = methods[i];
+            if (m == null || m.func == null || !m.func.is_async) { continue; }
+            this.ctx.emit_error_at(ErrorCode::E0203_UNDEFINED_TYPE,
+                format("cannot resolve the owner type `%s` of `async` method `%s`, so its future cannot be declared",
+                       owner, this.intern.resolve(m.func.name)),
+                m.func.span);
+            m.func.set_async(false);
+        }
+    }
+
+    clone_symbols(&this, syms: &SymbolStr[]) -> SymbolStr[] {
+        mut out: SymbolStr[] = [];
+        for (mut i: i64 = 0; i < syms.length; i++) { out.push(syms[i]); }
+        return out;
+    }
+
+    /// The owner type as a method body sees `this`: the type itself, or the
+    /// template instantiated over its own parameters for a generic owner
+    /// (`Box<T>`), which is what the symbolic walk binds `this` to.
+    async_owner_instance(mut &this, base: TypeRef, params: &GenericParamNode*[]) -> TypeRef {
+        if (!base.is_valid() || params.length == 0) { return base; }
+        const t: Type* = this.arena.lookup(base.id);
+        if (t == null || t.kind == TypeKind::InstantiatedType) { return base; }
+        mut refs: TypeRef[] = TypeResolutionPasses::create_generic_param_types(params, this.arena);
+        const inst: TypeRef = this.arena.create_instantiation(base, &refs);
+        refs.drop();
+        return inst;
+    }
+
+    clone_generic_params(&this, params: &GenericParamNode*[]) -> GenericParamNode*[] {
+        mut out: GenericParamNode*[] = [];
+        for (mut i: i64 = 0; i < params.length; i++) { out.push(params[i]); }
+        return out;
     }
 
     /// Dispatch a top-level node, swapping to the template's module/namespace
@@ -324,7 +441,7 @@ public:
 
     override visit(mut &this, node: StructDeclNode*) -> void {
         if (node.is_generic()) {
-            if (this.sema_symbolic_check_enabled()) {
+            if (this.owner_methods_need_walk(node.methods)) {
                 const sym: SymbolStr = this.ctx.qualify_symbol_sym(node.name);
                 const ty: TypeRef = this.ctx.decl_index.lookup_type(sym);
                 this.symbolic_check_owner_methods(node.methods, ty, node.generic_params);
@@ -338,7 +455,7 @@ public:
 
     override visit(mut &this, node: UnionDeclNode*) -> void {
         if (node.is_generic()) {
-            if (this.sema_symbolic_check_enabled()) {
+            if (this.owner_methods_need_walk(node.methods)) {
                 const sym: SymbolStr = this.ctx.qualify_symbol_sym(node.name);
                 const ty: TypeRef = this.ctx.decl_index.lookup_type(sym);
                 this.symbolic_check_owner_methods(node.methods, ty, node.generic_params);
@@ -352,7 +469,7 @@ public:
 
     override visit(mut &this, node: ClassDeclNode*) -> void {
         if (node.is_generic()) {
-            if (this.sema_symbolic_check_enabled()) {
+            if (this.owner_methods_need_walk(node.methods)) {
                 const sym: SymbolStr = this.ctx.qualify_symbol_sym(node.name);
                 const ty: TypeRef = this.ctx.decl_index.lookup_type(sym);
                 this.symbolic_check_owner_methods(node.methods, ty, node.generic_params);
@@ -390,7 +507,7 @@ public:
 
     override visit(mut &this, node: ImplBlockNode*) -> void {
         if (node.is_generic()) {
-            if (this.sema_symbolic_check_enabled()) {
+            if (this.owner_methods_need_walk(node.methods)) {
                 const impl_target: TypeRef = this.types.lookup_type_by_sym(node.target_type);
                 const saved_impl: ImplBlockNode* = this.state.symbolic_impl_node;
                 this.state.symbolic_impl_node = node;
@@ -431,7 +548,7 @@ public:
                 // generic params (the impl block has none of its own) so the
                 // receiver reads as a generic owner and the stash is produced
                 // independently of any other call site.
-                if (this.sema_symbolic_check_enabled() && tmpl.ast_node != null) {
+                if (this.owner_methods_need_walk(node.methods) && tmpl.ast_node != null) {
                     const owner_ty: TypeRef = this.types.lookup_type_by_sym(node.target_type);
                     const saved_impl: ImplBlockNode* = this.state.symbolic_impl_node;
                     this.state.symbolic_impl_node = node;
@@ -465,6 +582,16 @@ public:
             if (method == null || method.func == null || method.func.body == null) { continue; }
             if (method.func.is_generic()) {
                 const sym_this: TypeRef = if (method.is_static) { TypeRef::invalid() } else { owner_type };
+                // Same reasoning as the free-function case: an `async` body's
+                // state machine is built from the types the symbolic walk leaves
+                // on it, so that walk is not optional here.
+                if (method.func.is_async) {
+                    const displaced: TypeRef = this.async_lower.begin_body_check(method.func);
+                    this.symbolic_check_body_forced(method.func, sym_this, owner_type);
+                    this.async_lower.end_body_check(method.func, displaced);
+                    this.async_lower.lower(method.func);
+                    continue;
+                }
                 this.symbolic_check_body(method.func, sym_this, owner_type);
                 continue;
             }
@@ -472,6 +599,10 @@ public:
             const method_this: TypeRef = if (method.is_static) { TypeRef::invalid() } else { owner_type };
             const saved_owner: TypeRef = this.state.current_owner_type;
             this.state.current_owner_type = owner_type;
+            // An `async` method's node already carries its FUTURE type, so
+            // callers typed before it resolve correctly; its own body is still
+            // checked against the declared Output.
+            const displaced: TypeRef = this.async_lower.begin_body_check(method.func);
             this.enter_function(method.func, method_this);
             if (method.is_constructor && method.has_base_ctor()) {
                 for (mut k: i64 = 0; k < method.base_ctor_args.length; k++) {
@@ -483,6 +614,10 @@ public:
             if (!method.is_constructor && !method.is_destructor) {
                 this.check_function_returns(method.func);
             }
+            this.async_lower.end_body_check(method.func, displaced);
+            // Lower AFTER the body is typed against the declared Output type,
+            // exactly as `visit(FunctionDeclNode*)` does for a free function.
+            if (method.func.is_async) { this.async_lower.lower(method.func); }
             this.state.current_owner_type = saved_owner;
         }
     }
@@ -591,9 +726,29 @@ public:
         this.state.symbolic_total_would_emit += sink.errors_since(snap) as i64;
     }
 
+    /// Whether an owner's method bodies have to be walked symbolically.
+    ///
+    /// Everywhere else the walk is additive — it reports, ahead of any
+    /// instantiation, errors a generic body would produce — so
+    /// `CRYO_NO_SYMBOLIC_CHECK` may switch it off. An `async` method is the
+    /// exception, for the same reason `symbolic_check_body_forced` exists: this
+    /// walk is what puts resolved types on the body, and the state-machine build
+    /// CONSUMES them. Switching it off would leave the method unlowered, still
+    /// returning its declared Output while every caller has been repointed at
+    /// its future.
+    owner_methods_need_walk(&this, methods: &MethodNode*[]) -> boolean {
+        if (this.sema_symbolic_check_enabled()) { return true; }
+        for (mut i: i64 = 0; i < methods.length; i++) {
+            const m: MethodNode* = methods[i];
+            if (m == null || m.func == null || m.func.body == null) { continue; }
+            if (m.func.is_async) { return true; }
+        }
+        return false;
+    }
+
     symbolic_check_owner_methods(mut &this, methods: &MethodNode*[], owner_type: TypeRef,
                                  owner_params: &GenericParamNode*[]) -> void {
-        if (!this.sema_symbolic_check_enabled()) { return; }
+        if (!this.owner_methods_need_walk(methods)) { return; }
         const saved_owner_generic: boolean = this.state.symbolic_owner_is_generic;
         mut saved_owner_params: u32[] = [];
         mut saved_owner_nodes: GenericParamNode*[] = [];
@@ -613,6 +768,16 @@ public:
             if (method == null || method.func == null || method.func.body == null) { continue; }
             if (method.func.is_self_returning_default) { continue; }
             const sym_this: TypeRef = if (method.is_static) { TypeRef::invalid() } else { owner_type };
+            // A method on a GENERIC owner reaches sema only here, whether or not
+            // it has generic parameters of its own — so this is where an `async`
+            // one is lowered, off the types the walk just left on its body.
+            if (method.func.is_async) {
+                const displaced: TypeRef = this.async_lower.begin_body_check(method.func);
+                this.symbolic_check_body_forced(method.func, sym_this, owner_type);
+                this.async_lower.end_body_check(method.func, displaced);
+                this.async_lower.lower(method.func);
+                continue;
+            }
             this.symbolic_check_body(method.func, sym_this, owner_type);
         }
         swap(&this.state.symbolic_owner_param_ids, &saved_owner_params);

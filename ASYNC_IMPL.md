@@ -75,6 +75,14 @@ silent miscompile** (they compiled, then re-polled a completed sub-future); dire
 now rejected at the `await` that closes the cycle. `make test` OVERALL PASS **1648 / 150 / 9** (from
 1633/144/9). Compiler-only — `stdlib/` has zero `async function`s, so no stdlib IR moves.
 
+**✅ `async` METHODS WORK (2026-07-25) — `async` is a method modifier, not only a function one.** All three
+receiver forms (`this`, `&this`, `mut &this`), the implicit receiver, `static async`, methods delivered by an
+impl block, methods on a `type class`, and methods on a GENERIC owner (including a generic method on one, so
+the future carries the owner's parameters and its own). Declaration order is irrelevant for methods too, and
+an async method's future runs on a real multi-thread `Executor`. `async` on a constructor, destructor, field,
+trait method, or `virtual`/`override` method is rejected as **`E0364`**, a new code, with a message that says
+why. 17 permanent tests in `tests/tests/lang/async_method.cryo` + 5 negative tests. See the newest §9 entry.
+
 **✅ Generic `async function` WORKS (2026-07-25) — the stopgap `E0600` and its negative test are deleted.**
 Declared, instantiated at several types (including a struct and `f64`), inferred without a turbofish,
 awaited, `block_on`-able, awaiting concrete futures, awaiting futures named by its own parameter
@@ -2032,3 +2040,126 @@ own source contains an `async function`, and the `call_resolver` narrowing fires
 commits behind HEAD** (`776fc805`). Since no IR moves, a repin is not required by the repin rule — but the
 pinned compiler cannot itself COMPILE a generic `async function` until someone repins, which will matter the
 moment `stdlib/` grows one.
+
+### 2026-07-25 — `async` METHODS LANDED (the §4 / handoff mission)
+
+`async` was a top-level-function modifier only: `KwAsync` was consumed in exactly one place, and
+`async fetch(&this)` was a parse error. It is now a method modifier too, on every owner kind.
+
+**Surface.** All three receiver forms are allowed and `E0455` is NOT extended to the receiver (Jake's
+call, taken in the previous handoff): `&this` / `mut &this` make the future hold a pointer into the caller's
+object — the same unenforced contract `E0455` already blesses for pointer parameters — and banning them would
+leave no natural spelling for an async method. `static async`, the implicit receiver, impl-block methods,
+`type class` owners, generic owners and generic methods on generic owners all work.
+
+**The receiver is the whole new idea.** A method's body reads its receiver as a bare `this`, and inside the
+generated `poll` a bare `this` is the FUTURE — so leaving it alone is a silent miscompile, not a cosmetic
+issue. The receiver is captured into a future field named `this$recv` (a `$` name no user can write) and
+every `this` in the body is rewritten to the poll-frame binding the shadow prelude declares for it.
+
+  * **The rewrite must run FIRST**, before the poll body is built. The shadow prelude, the cross-state
+    promotion and the two carry passes all synthesize `this.<field>` accesses of their own; a receiver pass
+    run after them would rewrite the `this` inside those too.
+  * **A pointer receiver is read back through a deref** (`*(this$recv)`), not as a bare field read. Every use
+    in the body was typed by sema against the owner BY VALUE, so the deref keeps the body's types exactly as
+    they were — `f(this)` still copies, `this.m()` still binds an lvalue receiver. Spelling it as `T*` and
+    leaning on member-access auto-deref would have typed `f(this)` as passing a pointer. `subst_name_expr`
+    grew a `subst_mode` for this rather than a `deref` parameter threaded through ~30 recursive call sites.
+  * **The receiver is routed through the ORDINARY parameter machinery**, via three accessors
+    (`param_field_name` / `param_slot_type` / `param_has_slot`) used by all six parameter walks. That is what
+    makes a droppable by-value receiver carry across a suspend in an `Option<T>` slot and drop exactly once,
+    for free — it is just a non-Copy parameter as far as `carry_params` is concerned.
+  * **An implicit receiver has no parameter node to walk**, so `declare` synthesizes an explicit `&this` and
+    rotates it to the head of the list. `method_receiver_kind` already maps explicit-immutable-`&this` and
+    implicit to the same `ReceiverKind::ImmutRef`, so nothing downstream can tell the difference.
+  * The constructor the method becomes initializes the field with `&this` for a pointer receiver and `this`
+    for a by-value one. `&this` as an expression yields the true address of the receiver object (probed:
+    writes through it are visible to the caller, and `a == &c`).
+
+**Registration — the part with the real teeth.** A free function's callers resolve through the declaration
+index, so `declare` repoints the index and hands the node straight back to the body check with its DECLARED
+return type. **A method's callers resolve through the NODE**, so that trick silently reintroduced
+order-dependence: a caller typed before its callee (the callee declared lower in the type) saw the declared
+Output and reported "`i64` does not implement `Future`". Fixed by leaving the FUTURE type on a method's node
+permanently and lending the declared type back only for the body walk
+(`AsyncLower::begin_body_check` / `end_body_check`, called at the three sema sites that walk a method body).
+Alongside that, `repoint_method` rebuilds the owner's arena `MethodInfo.function_type` **in place** (found by
+AST identity — `add_method` appends, so re-adding would leave two entries) and re-registers the declaration
+index under the canonical owner name plus, for an impl block, the alias forms — through the *aliased* helper,
+so every form keeps one mangled symbol. Cross-module + impl-block calls were probed end-to-end precisely
+because a mismatch there is a link error, not a compile error.
+
+**A generator bug found on the way, affecting free functions too.** The generated `poll` body was being run
+through the unused-local lint (W0001), which is built from the RESOLVER's map — a pass that ran long before
+the body existed. Every shadow binding was therefore "unused", reported against the async function's own
+span. Free functions escaped only by accident: the shadow's span is the function's span, and any *call* to
+the function records that same span key as used. Methods have no such accident (method calls are
+type-directed and never enter the resolution map), so they warned. Fixed honestly with a new
+`FunctionDeclNode.is_synthesized_body`, set on `poll` and consulted by `DeadCodeChecker::is_body_resolved`
+next to the existing mono-clone and trait-default cases.
+
+**Rejections, all `E0364` (a new code) with a message that says why.** Constructor (must produce a fully
+initialized object before any caller can observe it), destructor (called by drop insertion where there is no
+executor), field (holds a value, not a computation), trait method and `virtual`/`override` method (each
+implementation lowers to its OWN future struct, so there is no common return type to declare or dispatch
+through). The first three are parser-side and use a new `report_invalid_at` that does NOT enter panic mode —
+the token stream is still synchronized, and panicking would abandon the member's body mid-expression and bury
+the real shape of the declaration. `virtual`/`override` is sema-side, because each keyword is individually
+fine and only the combination has no lowering.
+
+**Parser.** `at_method_modifier()` is the guard that makes this safe: a keyword may legally NAME a method
+(`as<T>()`, `type()`), so `static` / `async` read as modifiers only when the next token is neither `(` nor
+`<`. `consume_method_modifiers` takes a run in either order, so `static async f()` and `async static f()` are
+the same declaration — and `static async()` is still a static method *named* `async`. A leading `async` is
+consumed ahead of the member head so every member kind sees it and none drops it silently; `static` is
+deliberately NOT hoisted the same way, because `static Name()` has always meant a static method named after
+the type rather than a constructor.
+
+**Confirmed working (probes + tests):** `&this` with and without suspends; `mut &this` writing through to the
+caller across a suspend; by-value `this` (droppable, dropped exactly once); implicit receiver; `static async`;
+an async method awaiting another async method on the same object; branches and loops holding suspends inside
+a method; `-> void`; declaration order irrelevant on both structs and classes; impl-block methods;
+cross-module calls; generic owners at several type arguments including a struct payload; a generic method on
+a generic owner; `static async` on a generic owner; and an async method's future driven by a real
+2-thread `Executor`.
+
+**Known adjacent limitation, NOT introduced here and NOT async-specific:** a `&this` method returning an
+owning field BY VALUE (`get(&this) -> T { return this.v; }` on `Cell<String>`) double-frees — the returned
+value and the field both own the block. The control (the identical body without `async`) reproduces it
+exactly, so it is an ownership gap in the language, not in the lowering.
+
+**Two silent-miscompile paths found in review and closed, both in the `declare` walk.**
+
+  1. **An owner whose type could not be looked up was skipped quietly.** The method then reached `lower` with
+     no pending record, and that fallback declares a node as a FREE function — where the body's `this` would
+     resolve to the generated future instead of the receiver. It now reports (`E0203`) and clears `is_async`,
+     so the bad path is unreachable rather than merely unlikely.
+  2. **`CRYO_NO_SYMBOLIC_CHECK` switched off the lowering of an async method on a GENERIC owner.** A generic
+     owner's methods reach sema only through `symbolic_check_owner_methods`, which was gated on the
+     killswitch at five places. That is the same hazard `symbolic_check_body_forced` was introduced for: the
+     walk is what puts resolved types on the body, and the state-machine build consumes them, so switching it
+     off leaves the method unlowered while every caller has been repointed at its future. A new
+     `owner_methods_need_walk(methods)` keeps the gate honored for everything it was meant for and forces the
+     walk when the list holds an `async` method. **Verified by inspection only:** `CRYO_NO_SYMBOLIC_CHECK=1`
+     currently fails to build `stdlib/` for an unrelated pre-existing reason (`value.hash(&h)` on `&string`,
+     `codegen: no method 'hash'`), so that path cannot be exercised end to end today.
+
+**`E0455` and the receiver — both directions are now tested.** A pointer into a receiver held BY POINTER is
+sound across a suspend (the pointee is the caller's object, which does not move), and `addr_place_root` sees
+that correctly because it stops at the deref the receiver rewrite introduces. A pointer into a BY-VALUE
+receiver is NOT sound — that receiver is bound into a fresh poll frame on every poll — and is reported. The
+first is `async_method_holds_a_pointer_into_a_pointer_receiver`; the second is
+`negative/E0455_async_method_value_receiver_address.cryo`.
+
+**Gates (Linux host).** `make test` **OVERALL PASS** — unit ok, compile-fail **155** (149 + 6 new negatives),
+projects **11**. `tests/test-roster.txt` regenerated by MERGE, not `--update`: **1660 → 1678** (+18), with
+`ProcessCommand::output_large_stderr_no_deadlock_win` and all 14 `should_panic` entries preserved.
+`make roster-check` reports the documented Linux-only `1 missing, 0 new`.
+`make selfhost-check` exit 0 with **both** `FIXED POINT OK` markers (Linux target-IR + Windows native-PE).
+
+**Pin deltas by the §6 pairs — all zero, so NO REPIN.** Compiler `win-s2` vs `win-s3` = **0/161** local +
+**0/74** std `.ll`; stdlib `win-s1` vs `win-s2` = **0/149**. Expected: neither `stdlib/` nor the compiler's
+own source contains an `async` method, and every new parser/sema path is reached only by `async` code.
+`make test` builds with `compiler/build/cryo` (the stage-2 self-host), not with `bin/cryo`, so the new tests
+do not need a repin to run from a clean tree — but as with generic `async function`, the PINNED compiler
+cannot itself compile an `async` method until someone repins, which matters the moment `stdlib/` grows one.

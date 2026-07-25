@@ -16,6 +16,16 @@ import Compiler::Parser::{ ParserBase, ExprParser };
 import Utils::Logger;
 
 
+/// The `static` / `async` run parsed ahead of a method head.
+type struct MethodModifiers {
+    is_static: boolean;
+    is_async:  boolean;
+    /// Extent of the consumed keywords. They are read before the method node
+    /// exists, so they fall outside its own `span`; the member keeps them for
+    /// `outer_span()` (see `DeclarationNode::note_modifier_span`).
+    span:      SourceSpan;
+}
+
 type class Parser : ExprParser {
 public:
     /// Module-scope `static_assert(...)` items collected during the top-level
@@ -1109,11 +1119,35 @@ public:
             }
             if (this.check(TokenType::RBrace) || this.is_at_end()) { break; }
 
+            // A leading `async` is consumed ahead of the member head, so every
+            // member kind below sees it: only a method can carry it, and the
+            // kinds that cannot are rejected where they are built rather than
+            // dropping the keyword silently. `static` is deliberately NOT
+            // hoisted here — `static Name()` has always meant a static method
+            // named after the type, not a constructor, and hoisting it would
+            // change that.
+            mut member_is_async: boolean = false;
+            if (this.check(TokenType::KwAsync) && this.at_method_modifier()) {
+                member_is_async = true;
+                member_modifier_span = SourceSpan::covering(member_modifier_span,
+                    this.span_from_token(this.current()));
+                this.advance();
+            }
+
             // Constructor: ClassName(params) { body }
             if (this.check(TokenType::Identifier) && this.current().lexeme == this.current_type_name &&
                 this.peek_at(1).kind == TokenType::LParen) {
                 const method: MethodNode* = this.parse_constructor(member_visibility);
                 if (method != null) {
+                    // A constructor runs to completion at a fixed point in an
+                    // object's lifetime: it has no caller that could hold and
+                    // poll a future, and the object does not exist until it
+                    // returns.
+                    if (member_is_async) {
+                        this.report_invalid_at(ErrorCode::E0364_INVALID_ASYNC_MEMBER,
+                            "a constructor cannot be `async`: it must produce a fully initialized object before any caller can observe it, so there is nothing to suspend into",
+                            member_modifier_span);
+                    }
                     if (doc != "") { method.set_documentation(doc); }
                     for (mut pi: i64 = 0; pi < pending_dirs.length; pi++) {
                         method.add_directive(pending_dirs[pi]);
@@ -1130,6 +1164,13 @@ public:
             if (this.check(TokenType::Tilde)) {
                 const method: MethodNode* = this.parse_destructor(member_visibility);
                 if (method != null) {
+                    // A destructor is called by drop insertion at scope exit,
+                    // from contexts that have no executor and cannot wait.
+                    if (member_is_async) {
+                        this.report_invalid_at(ErrorCode::E0364_INVALID_ASYNC_MEMBER,
+                            "a destructor cannot be `async`: it is called by drop insertion at scope exit, where there is no executor to poll a future",
+                            member_modifier_span);
+                    }
                     if (doc != "") { method.set_documentation(doc); }
                     for (mut pi: i64 = 0; pi < pending_dirs.length; pi++) {
                         method.add_directive(pending_dirs[pi]);
@@ -1144,7 +1185,8 @@ public:
 
             // Static method or static field
             if (this.check(TokenType::KwStatic)) {
-                const method: MethodNode* = this.parse_method_with_modifiers(member_visibility, true, false, false);
+                const method: MethodNode* = this.parse_method_with_modifiers(
+                    member_visibility, true, false, false, member_is_async);
                 if (method != null) {
                     if (doc != "") { method.set_documentation(doc); }
                     for (mut pi: i64 = 0; pi < pending_dirs.length; pi++) {
@@ -1160,7 +1202,8 @@ public:
 
             // Virtual method
             if (this.check(TokenType::KwVirtual)) {
-                const method: MethodNode* = this.parse_method_with_modifiers(member_visibility, false, true, false);
+                const method: MethodNode* = this.parse_method_with_modifiers(
+                    member_visibility, false, true, false, member_is_async);
                 if (method != null) {
                     if (doc != "") { method.set_documentation(doc); }
                     for (mut pi: i64 = 0; pi < pending_dirs.length; pi++) {
@@ -1176,7 +1219,8 @@ public:
 
             // Override method
             if (this.check(TokenType::KwOverride)) {
-                const method: MethodNode* = this.parse_method_with_modifiers(member_visibility, false, false, true);
+                const method: MethodNode* = this.parse_method_with_modifiers(
+                    member_visibility, false, false, true, member_is_async);
                 if (method != null) {
                     if (doc != "") { method.set_documentation(doc); }
                     for (mut pi: i64 = 0; pi < pending_dirs.length; pi++) {
@@ -1203,6 +1247,7 @@ public:
                 if (next.kind == TokenType::LParen || next.kind == TokenType::LAngle) {
                     const method: MethodNode* = this.parse_method(member_visibility);
                     if (method != null) {
+                        if (member_is_async && method.func != null) { method.func.set_async(true); }
                         if (doc != "") { method.set_documentation(doc); }
                         for (mut pi: i64 = 0; pi < pending_dirs.length; pi++) {
                             method.add_directive(pending_dirs[pi]);
@@ -1213,6 +1258,11 @@ public:
                         if (union_node != null) { union_node.add_method(method); }
                     }
                 } else if (this.check(TokenType::Identifier)) {
+                    if (member_is_async) {
+                        this.report_invalid_at(ErrorCode::E0364_INVALID_ASYNC_MEMBER,
+                            "only a method can be `async`; a field holds a value, not a computation to suspend",
+                            member_modifier_span);
+                    }
                     const field: FieldDeclNode* = this.parse_field_declaration();
                     if (field != null) {
                         field.set_visibility(member_visibility);
@@ -1322,16 +1372,54 @@ public:
         return method;
     }
 
-    /// Parse a method with optional modifiers (static, virtual, override).
+    /// True when the current token is a method MODIFIER keyword rather than a
+    /// method NAME.
+    ///
+    /// A keyword may legally name a method (`as<T>()`, `type()`), so `static` /
+    /// `async` read as modifiers only when what follows is neither a parameter
+    /// list nor a generic-parameter list. Without this test, declaring a method
+    /// called `async` or `static` would stop parsing.
+    at_method_modifier() -> boolean {
+        if (!this.check(TokenType::KwStatic) && !this.check(TokenType::KwAsync)) { return false; }
+        const next: TokenType = this.peek_at(1).kind;
+        return next != TokenType::LParen && next != TokenType::LAngle;
+    }
+
+    /// Consume the run of `static` / `async` keywords at the cursor. They may
+    /// appear in either order and both may be present, so `static async f()`
+    /// and `async static f()` are the same declaration. `prefix` seeds the
+    /// returned extent, so a visibility keyword already consumed by the caller
+    /// stays part of the member's `outer_span()`.
+    consume_method_modifiers(prefix: SourceSpan) -> MethodModifiers {
+        mut m: MethodModifiers = MethodModifiers {
+            is_static: false, is_async: false, span: prefix };
+        while (this.at_method_modifier()) {
+            if (this.check(TokenType::KwStatic)) { m.is_static = true; } else { m.is_async = true; }
+            m.span = SourceSpan::covering(m.span, this.span_from_token(this.current()));
+            this.advance();
+        }
+        return m;
+    }
+
+    /// Parse a method with optional modifiers (static, async, virtual, override).
+    ///
+    /// The keyword that selected this path is still at the cursor and is
+    /// consumed here; a `static` / `async` run may follow it. `virtual async` /
+    /// `override async` are accepted by the grammar and rejected by sema, which
+    /// can say why (each override would return a different future type, so they
+    /// cannot share a vtable slot) instead of leaving a parse error on `async`.
     parse_method_with_modifiers(visibility: Visibility, is_static: boolean,
-                                 is_virtual: boolean, is_override: boolean) -> MethodNode* {
+                                 is_virtual: boolean, is_override: boolean,
+                                 is_async: boolean) -> MethodNode* {
         this.advance(); // consume modifier keyword
+        const extra: MethodModifiers = this.consume_method_modifiers(SourceSpan::none());
 
         const method: MethodNode* = this.parse_method(visibility);
         if (method != null) {
-            if (is_static) { method.set_static(true); }
+            if (is_static || extra.is_static) { method.set_static(true); }
             if (is_virtual) { method.set_virtual(true); }
             if (is_override) { method.set_override(true); }
+            if ((is_async || extra.is_async) && method.func != null) { method.func.set_async(true); }
         }
         return method;
     }
@@ -1569,11 +1657,19 @@ public:
                 continue;
             }
 
-            mut is_static: boolean = false;
-            if (this.check(TokenType::KwStatic)) {
-                is_static = true;
-                this.advance();
+            // A trait method cannot be `async`. Every impl would lower to its
+            // OWN future struct, so the trait has no single return type to
+            // declare and the overrides could not share a dispatch slot;
+            // expressing it needs a boxed `dyn Future`, which does not exist.
+            // Consume the keyword so the rest of the signature still parses and
+            // the reader gets one error instead of a cascade.
+            mut trait_mods: MethodModifiers = this.consume_method_modifiers(SourceSpan::none());
+            if (trait_mods.is_async) {
+                this.report_invalid_at(ErrorCode::E0364_INVALID_ASYNC_MEMBER,
+                    "a trait method cannot be `async`: each implementation returns its own future type, so there is no single return type for the trait to declare",
+                    trait_mods.span);
             }
+            const is_static: boolean = trait_mods.is_static;
 
             // Method name can be an identifier OR a keyword used as a name
             // (e.g. `from`, `default`, `into`). The leading `function`
@@ -2093,16 +2189,14 @@ public:
                     this.advance();
                 }
 
-                if (this.check(TokenType::KwStatic)) {
-                    is_static = true;
-                    modifier_span = SourceSpan::covering(modifier_span,
-                        this.span_from_token(this.current()));
-                    this.advance();
-                }
+                const mods: MethodModifiers = this.consume_method_modifiers(modifier_span);
+                is_static = mods.is_static;
+                modifier_span = mods.span;
 
                 const method: MethodNode* = this.parse_method(vis);
                 if (method != null) {
                     if (is_static) { method.set_static(true); }
+                    if (mods.is_async && method.func != null) { method.func.set_async(true); }
                     if (doc != "") { method.set_documentation(doc); }
                     for (mut pi: i64 = 0; pi < pending_dirs.length; pi++) {
                         method.add_directive(pending_dirs[pi]);

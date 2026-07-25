@@ -157,6 +157,39 @@ type struct BindingCapture {
     }
 }
 
+/// Where an `async function` lives, and — when it is a method — everything the
+/// future declaration needs to know about its owner.
+///
+/// A free function and a method differ in exactly three places: the future's
+/// name, how callers are repointed at the future type (a free function has an
+/// overload set to drop and rebuild; a method's signature lives in the owner's
+/// arena entry and under a combined `Owner::method` key instead), and the
+/// receiver, which the body reads as a bare `this`.
+type struct AsyncOwner {
+    /// Null for a free function.
+    method:       MethodNode*;
+    /// The owner type.
+    ty:           TypeRef;
+    /// The canonical qualified owner name: the key the declaration index
+    /// registered this method's signature under.
+    qname:        SymbolStr;
+    /// Further owner names the original registration aliased that key to (an
+    /// impl block registers up to three forms). Re-registered through the
+    /// aliased helper so every form keeps the canonical mangled symbol; the
+    /// un-aliased helper would recompute a different one per form, which links
+    /// only for whichever form a caller happened to use.
+    alias_qnames: SymbolStr[];
+    /// The owner's generic parameters. The future is generic in these as well
+    /// as in the method's own, since the body may mention either.
+    params:       GenericParamNode*[];
+
+    /// The owner of a free function: no method, no receiver, no owner keys.
+    static free() -> AsyncOwner {
+        return AsyncOwner { method: null, ty: TypeRef::invalid(),
+                            qname: SymbolStr::empty(), alias_qnames: [], params: [] };
+    }
+}
+
 /// What `declare` builds for one `async function` and `lower` finishes.
 ///
 /// The two run at different times on purpose: the future TYPE has to exist
@@ -181,10 +214,27 @@ type struct AsyncDecl {
     // field table, while `self_ty` is `Fut<T, …>` — what the function returns,
     // what the constructor literal builds, and the type of `this` inside `poll`.
     self_ty:     TypeRef;
-    // True when the function carries generic parameters, so the future is
-    // generic in the same ones and everything the lowering synthesizes must
-    // spell them BY NAME (see `future_type_ann`).
+    // True when the future carries generic parameters, so everything the
+    // lowering synthesizes must spell them BY NAME (see `future_type_ann`).
     generic:     boolean;
+    // The parameters the future is generic in: the owner's followed by the
+    // function's own. Empty when `generic` is false.
+    fut_params:  GenericParamNode*[];
+
+    // Null when this is a free function. Non-null makes `lower` capture the
+    // receiver and skip the free-function overload rebuild, which a method has
+    // no counterpart to.
+    method:      MethodNode*;
+    // The future field holding the receiver, invalid when there is none (a
+    // free function or a `static` method). Named with a `$` so no user field
+    // can collide with it.
+    recv_field:  SymbolStr;
+    // True when the receiver is held BY POINTER (`&this` / `mut &this`). The
+    // body was typed against the owner by value either way, so a pointer
+    // receiver is read back through a deref.
+    recv_ptr:    boolean;
+    // The owner type as the BODY sees the receiver: always by value.
+    recv_ty:     TypeRef;
     // The `Future`'s `Output`: the declared return type, or unit for `-> void`.
     output_ref:  TypeRef;
     // The return type as WRITTEN, which the body is still checked against.
@@ -238,11 +288,22 @@ type struct AsyncLower {
     // of them needs the answer.
     edge_from: u64[];
     edge_to:   u64[];
+    // Interned once by `wire`: the receiver spellings a method's parameter list
+    // and body use, and the future field a captured receiver lands in.
+    this_sym:     SymbolStr;
+    this_amp_sym: SymbolStr;
+    recv_sym:     SymbolStr;
+    // How `subst_name_expr` spells a substituted name. Defaults to the field
+    // form and is restored to it after the one pass that needs another; see
+    // `subst_target`.
+    subst_mode: i64;
 
     static null() -> AsyncLower {
         return AsyncLower { arena: null, intern: null, ctx: null, patterns: null, counter: 0u64,
                             frame_locals: [], frame_local_src: [], pending: [],
-                            edge_from: [], edge_to: [] };
+                            edge_from: [], edge_to: [],
+                            this_sym: SymbolStr::empty(), this_amp_sym: SymbolStr::empty(),
+                            recv_sym: SymbolStr::empty(), subst_mode: 0i64 };
     }
 
     /// True when a future of type `from` holds — directly or through the futures
@@ -269,6 +330,35 @@ type struct AsyncLower {
         return false;
     }
 
+    /// Put the DECLARED return type back on a pending `async` node for the
+    /// duration of its body walk, and return what was displaced.
+    ///
+    /// Only a METHOD needs this. A free function's callers resolve through the
+    /// declaration index, so `declare` can repoint the index and hand the node
+    /// straight back to the body check. A method's callers resolve through the
+    /// NODE, so `declare` has to leave the future type on it — otherwise a
+    /// caller whose body is typed before the callee's own (the callee declared
+    /// lower in the type) sees the declared Output and reports that it does not
+    /// implement `Future`. The body's `return`s still produce the Output, so
+    /// that type is swapped back in here and out again by `end_body_check`.
+    ///
+    /// Invalid (and a no-op) for anything that is not a pending `async` method.
+    begin_body_check(mut &this, node: FunctionDeclNode*) -> TypeRef {
+        const i: i64 = this.pending_index(node);
+        if (i < 0i64 || !this.pending[i].ok || this.pending[i].method == null) {
+            return TypeRef::invalid();
+        }
+        const displaced: TypeRef = node.resolved_return_type;
+        node.set_resolved_return_type(this.pending[i].declared_ref);
+        return displaced;
+    }
+
+    /// Undo `begin_body_check`. `displaced` invalid means it was a no-op.
+    end_body_check(mut &this, node: FunctionDeclNode*, displaced: TypeRef) -> void {
+        if (!displaced.is_valid()) { return; }
+        node.set_resolved_return_type(displaced);
+    }
+
     /// Index of `node`'s pending record, or -1.
     pending_index(&this, node: FunctionDeclNode*) -> i64 {
         for (mut i: i64 = 0; i < this.pending.length; i++) {
@@ -283,6 +373,48 @@ type struct AsyncLower {
         this.intern   = intern;
         this.ctx      = ctx;
         this.patterns = patterns;
+        this.this_sym     = intern.intern("this");
+        this.this_amp_sym = intern.intern("&this");
+        this.recv_sym     = intern.intern("this$recv");
+    }
+
+    /// True when `p` is a method's receiver slot rather than a user parameter.
+    ///
+    /// `&this` / `mut &this` are one parameter literally named `"&this"` and
+    /// semantically a `T*`; a by-value receiver is named `"this"` and is left
+    /// without a resolved type by type resolution. Neither name is a field name
+    /// the future can use, and neither is the name the body reads the receiver
+    /// by, so every parameter walk routes the receiver through `recv_field`.
+    is_receiver_param(&this, p: VarDeclNode*) -> boolean {
+        if (p == null || !p.name.is_valid()) { return false; }
+        return p.name.equals(this.this_amp_sym) || p.name.equals(this.this_sym);
+    }
+
+    /// The future field backing parameter `p`, and the name the poll body binds
+    /// it to: its own name, or the receiver field for a receiver.
+    param_field_name(&this, p: VarDeclNode*) -> SymbolStr {
+        if (this.is_receiver_param(p)) { return this.recv_sym; }
+        return p.name;
+    }
+
+    /// The type parameter `p` is stored and bound as. The receiver's is the one
+    /// `declare` settled (a pointer for `&this`, the owner by value otherwise);
+    /// type resolution leaves a by-value `this` with no resolved type at all.
+    param_slot_type(&this, d: AsyncDecl*, p: VarDeclNode*) -> TypeRef {
+        if (this.is_receiver_param(p)) {
+            if (d.recv_ptr) { return this.arena.get_pointer_to(d.recv_ty); }
+            return d.recv_ty;
+        }
+        return p.resolved_type;
+    }
+
+    /// True when `p` contributes a field to the future at all. Every parameter
+    /// does, except a receiver on a lowering that captured none — which cannot
+    /// happen, but keeps the walks total rather than depending on it.
+    param_has_slot(&this, d: AsyncDecl*, p: VarDeclNode*) -> boolean {
+        if (p == null) { return false; }
+        if (this.is_receiver_param(p)) { return d.recv_field.is_valid(); }
+        return p.resolved_type.is_valid();
     }
 
     /// Resolve a stdlib future type by its import-visible leaf (`Poll`,
@@ -329,10 +461,10 @@ type struct AsyncLower {
     /// form the monomorphizer's substituter rewrites. A fresh array of fresh
     /// nodes per call: substitution edits annotations IN PLACE, so two uses may
     /// not share one node.
-    generic_param_anns(&this, node: FunctionDeclNode*, span: SourceSpan) -> TypeAnnotation*[] {
+    generic_param_anns(&this, params: &GenericParamNode*[], span: SourceSpan) -> TypeAnnotation*[] {
         mut args: TypeAnnotation*[] = [];
-        for (mut i: i64 = 0; i < node.generic_params.length; i++) {
-            const gp: GenericParamNode* = node.generic_params[i];
+        for (mut i: i64 = 0; i < params.length; i++) {
+            const gp: GenericParamNode* = params[i];
             if (gp == null) { continue; }
             args.push(this.named_ann(gp.name, span));
         }
@@ -345,7 +477,7 @@ type struct AsyncLower {
         if (!d.generic) { return this.make_type_ann(d.struct_ref, span); }
         mut gen: GenericAnnotation* = new GenericAnnotation {
             base: this.named_ann(d.q_name, span),
-            args: this.generic_param_anns(d.node, span),
+            args: this.generic_param_anns(d.fut_params, span),
             span: span,
         };
         return new TypeAnnotation::Generic(gen);
@@ -820,6 +952,27 @@ type struct AsyncLower {
         return id as ExpressionNode*;
     }
 
+    /// `*(<e>)` typed `ty`. Marked synthetic: the address-of / deref checks
+    /// that constrain user syntax read that flag to skip compiler-built nodes.
+    deref(&this, e: ExpressionNode*, ty: TypeRef, span: SourceSpan) -> ExpressionNode* {
+        const star: Token = Token::new(TokenType::Star, "*",
+                                       span.start_line as int, span.start_col as int);
+        mut u: UnaryExprNode* = new UnaryExprNode(star, e, span);
+        u.is_synthetic = true;
+        u.set_resolved_type(ty);
+        return u as ExpressionNode*;
+    }
+
+    /// `&(<e>)` typed `ty`.
+    addr_of(&this, e: ExpressionNode*, ty: TypeRef, span: SourceSpan) -> ExpressionNode* {
+        const amp: Token = Token::new(TokenType::Amp, "&",
+                                      span.start_line as int, span.start_col as int);
+        mut u: UnaryExprNode* = new UnaryExprNode(amp, e, span);
+        u.is_synthetic = true;
+        u.set_resolved_type(ty);
+        return u as ExpressionNode*;
+    }
+
     member(&this, obj: ExpressionNode*, field: SymbolStr, ty: TypeRef, span: SourceSpan) -> ExpressionNode* {
         mut m: MemberAccessNode* = new MemberAccessNode(obj, field, span, span);
         m.set_resolved_type(ty);
@@ -925,23 +1078,24 @@ type struct AsyncLower {
     /// The arg-shadow prelude common to every generated `poll`: `const p =
     /// this.p;` for each captured parameter, so the moved body resolves its
     /// parameter names against the struct fields.
-    emit_shadow_prelude(&this, node: FunctionDeclNode*, body: BlockStmtNode*,
+    emit_shadow_prelude(&this, d: AsyncDecl*, node: FunctionDeclNode*, body: BlockStmtNode*,
                         struct_ref: TypeRef, skip_carried: boolean, span: SourceSpan) -> void {
-        const this_sym: SymbolStr = this.intern.intern("this");
         for (mut i: i64 = 0; i < node.parameters.length; i++) {
             const p: VarDeclNode* = node.parameters[i];
-            if (p == null || !p.resolved_type.is_valid()) { continue; }
+            if (!this.param_has_slot(d, p)) { continue; }
+            const slot_ty: TypeRef = this.param_slot_type(d, p);
             // A carried parameter is materialized per state by `carry_params`
             // instead: one shared shadow would be moved from inside the loop.
-            if (skip_carried && this.param_needs_carrier(p.resolved_type)) { continue; }
-            mut this_ref: IdentifierNode* = new IdentifierNode(this_sym, span);
+            if (skip_carried && this.param_needs_carrier(slot_ty)) { continue; }
+            const fname: SymbolStr = this.param_field_name(p);
+            mut this_ref: IdentifierNode* = new IdentifierNode(this.this_sym, span);
             this_ref.set_resolved_type(struct_ref);
             mut access: MemberAccessNode* = new MemberAccessNode(
-                this_ref as ExpressionNode*, p.name, span, span);
-            access.set_resolved_type(p.resolved_type);
-            mut shadow: VarDeclNode* = new VarDeclNode(p.name, span);
+                this_ref as ExpressionNode*, fname, span, span);
+            access.set_resolved_type(slot_ty);
+            mut shadow: VarDeclNode* = new VarDeclNode(fname, span);
             shadow.set_mutable(false);
-            shadow.set_resolved_type(p.resolved_type);
+            shadow.set_resolved_type(slot_ty);
             shadow.set_initializer(access as ExpressionNode*);
             const shadow_stmt: DeclStmtNode* = new DeclStmtNode(shadow as DeclarationNode*, span);
             body.add_statement(shadow_stmt as StatementNode*);
@@ -950,10 +1104,10 @@ type struct AsyncLower {
 
     /// No-await body: shadow prelude + the original body with `return E`
     /// rewritten to `return Poll::Ready(E)` (runs to completion in one poll).
-    build_poll_body_no_await(mut &this, node: FunctionDeclNode*, struct_ref: TypeRef,
+    build_poll_body_no_await(mut &this, d: AsyncDecl*, node: FunctionDeclNode*, struct_ref: TypeRef,
                              poll_out: TypeRef, span: SourceSpan) -> BlockStmtNode* {
         mut body: BlockStmtNode* = new BlockStmtNode(span);
-        this.emit_shadow_prelude(node, body, struct_ref, false, span);
+        this.emit_shadow_prelude(d, node, body, struct_ref, false, span);
         if (node.body.kind == NodeKind::BlockStatement) {
             const orig: BlockStmtNode* = node.body as BlockStmtNode*;
             for (mut bi: i64 = 0; bi < orig.statements.length; bi++) {
@@ -1105,13 +1259,38 @@ type struct AsyncLower {
     /// LHS is an identifier) both become `this.<field>`. Covers the same node
     /// kinds; an unwalked kind leaves a `name` read in place, which surfaces as a
     /// loud "not found" at its use, never a silent miscompile.
+    // -- Substitution spellings (`subst_mode`) --
+    //
+    // Everything a name may be rewritten INTO. `to_field` is the ordinary case:
+    // a promoted local or a carried parameter lives in the future, so its uses
+    // become `this.<field>`. The receiver is different — it is bound by the
+    // poll frame like a parameter, and a pointer receiver has to be read back
+    // by value, because the body was typed against the owner by value.
+    subst_to_field(&this)       -> i64 { return 0i64; }
+    subst_to_local(&this)       -> i64 { return 1i64; }
+    subst_to_local_deref(&this) -> i64 { return 2i64; }
+
+    /// What a substituted name becomes, per `subst_mode`. `ty` is always the
+    /// type the name had in the body, so the rewritten expression type-checks
+    /// exactly where the original did.
+    subst_target(mut &this, field: SymbolStr, struct_ref: TypeRef, ty: TypeRef,
+                 span: SourceSpan) -> ExpressionNode* {
+        if (this.subst_mode == this.subst_to_local()) {
+            return this.ident(field, ty, span);
+        }
+        if (this.subst_mode == this.subst_to_local_deref()) {
+            return this.deref(this.ident(field, this.arena.get_pointer_to(ty), span), ty, span);
+        }
+        return this.member(this.this_ident(struct_ref, span), field, ty, span);
+    }
+
     subst_name_expr(mut &this, e: ExpressionNode*, name: SymbolStr, field: SymbolStr,
                     struct_ref: TypeRef, ty: TypeRef, span: SourceSpan) -> ExpressionNode* {
         if (e == null) { return null; }
         const k: NodeKind = (e as ASTNode*).kind;
         if (k == NodeKind::Identifier) {
             if ((e as IdentifierNode*).name.equals(name)) {
-                return this.member(this.this_ident(struct_ref, span), field, ty, span);
+                return this.subst_target(field, struct_ref, ty, span);
             }
             return e;
         }
@@ -1323,17 +1502,18 @@ type struct AsyncLower {
     /// a state that only assigns it gets an empty binding to fill. Identical to
     /// how an aggregate local is carried across a suspend, except that the
     /// constructor — not a declaring state — put the first value in the slot.
-    carry_params(mut &this, sm: PollSm*, node: FunctionDeclNode*) -> void {
+    carry_params(mut &this, d: AsyncDecl*, sm: PollSm*, node: FunctionDeclNode*) -> void {
         const span: SourceSpan = sm.span;
         for (mut i: i64 = 0; i < node.parameters.length; i++) {
             const p: VarDeclNode* = node.parameters[i];
-            if (p == null || !p.resolved_type.is_valid()) { continue; }
-            if (!this.param_is_carried(sm, p.resolved_type)) { continue; }
-            const lty: TypeRef = p.resolved_type;
+            if (!this.param_has_slot(d, p)) { continue; }
+            const lty: TypeRef = this.param_slot_type(d, p);
+            if (!this.param_is_carried(sm, lty)) { continue; }
+            const pname: SymbolStr = this.param_field_name(p);
             const opt_ty: TypeRef = this.param_field_type(sm, lty);
             if (!opt_ty.is_valid() || opt_ty.id == lty.id) { continue; }
             for (mut b: i64 = 0; b < sm.blocks.length; b++) {
-                const use_kind: i64 = this.block_first_use(sm.blocks[b], p.name);
+                const use_kind: i64 = this.block_first_use(sm.blocks[b], pname);
                 if (use_kind == 0i64) { continue; }
                 // Same reasoning as a local: a reassignment nested in a branch
                 // keeps the incoming value on the path the branch skips, so the
@@ -1341,23 +1521,23 @@ type struct AsyncLower {
                 // constructor always publishes a parameter into its field, so
                 // the take on entry has something to find.
                 mut carried_in: boolean = (use_kind == 1i64);
-                if (!carried_in && this.block_cond_write(sm.blocks[b], p.name)) {
+                if (!carried_in && this.block_cond_write(sm.blocks[b], pname)) {
                     carried_in = true;
                 }
                 if (carried_in) {
-                    this.prepend_agg_take(sm.blocks[b], p.name, p.name, lty, opt_ty,
+                    this.prepend_agg_take(sm.blocks[b], pname, pname, lty, opt_ty,
                                           sm.struct_ref, true, span);
                     this.store_before_suspends(sm, sm.blocks[b] as StatementNode*,
-                                               p.name, opt_ty, p.name, lty, span);
-                } else if (!this.decl_at_first_assignment(sm.blocks[b], p.name, lty, span)) {
+                                               pname, opt_ty, pname, lty, span);
+                } else if (!this.decl_at_first_assignment(sm.blocks[b], pname, lty, span)) {
                     this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
                         "async: this parameter is reassigned after an `await` from inside a branch; assign it once at the top level of that step so the state machine can bind it there",
                         p.span);
                     sm.ok = false; return;
                 }
-                if (this.needs_handback(sm.blocks[b], p.name)) {
+                if (this.needs_handback(sm.blocks[b], pname)) {
                     sm.blocks[b].add_statement(
-                        this.agg_store_stmt(sm, p.name, opt_ty, p.name, lty, span));
+                        this.agg_store_stmt(sm, pname, opt_ty, pname, lty, span));
                 }
             }
         }
@@ -2687,10 +2867,11 @@ type struct AsyncLower {
     /// `match`-arm binding (renamed, and thereby recorded, by
     /// `disambiguate_locals`). Must run after that rename, so the recorded names
     /// are the ones the body now uses.
-    collect_frame_names(mut &this, sm: PollSm*, node: FunctionDeclNode*) -> void {
+    collect_frame_names(mut &this, d: AsyncDecl*, sm: PollSm*, node: FunctionDeclNode*) -> void {
         for (mut i: i64 = 0; i < node.parameters.length; i++) {
             const p: VarDeclNode* = node.parameters[i];
-            if (p != null && p.name.is_valid()) { sm.frame_names.push(p.name); }
+            if (!this.param_has_slot(d, p)) { continue; }
+            sm.frame_names.push(this.param_field_name(p));
         }
         for (mut i: i64 = 0; i < this.frame_locals.length; i++) {
             sm.frame_names.push(this.frame_locals[i]);
@@ -3525,7 +3706,7 @@ type struct AsyncLower {
     /// unsupported await shape, a body that can fall off its end, or a
     /// `mut`/aggregate/reference held across a suspend. Populates `sm.fut_*` /
     /// `sm.prom_*`, which `lower` consumes to build the struct fields.
-    build_poll_body_sm(mut &this, node: FunctionDeclNode*, sm: PollSm*) -> BlockStmtNode* {
+    build_poll_body_sm(mut &this, d: AsyncDecl*, node: FunctionDeclNode*, sm: PollSm*) -> BlockStmtNode* {
         const span: SourceSpan = sm.span;
         // Make every local's name globally unique BEFORE flattening, so the
         // by-name cross-state promotion below cannot conflate a promoted local
@@ -3534,10 +3715,10 @@ type struct AsyncLower {
         // Records what the frame owns, which the address-of checks below test
         // places against. Must follow the rename: it registers the names the
         // body now uses.
-        this.collect_frame_names(sm, node);
+        this.collect_frame_names(d, sm, node);
 
         mut body: BlockStmtNode* = new BlockStmtNode(span);
-        this.emit_shadow_prelude(node, body, sm.struct_ref, true, span);
+        this.emit_shadow_prelude(d, node, body, sm.struct_ref, true, span);
 
         const orig: BlockStmtNode* = node.body as BlockStmtNode*;
         const entry: i64 = this.sm_alloc(sm);   // state 0
@@ -3560,7 +3741,7 @@ type struct AsyncLower {
 
         this.promote_cross_state(sm);
         if (!sm.ok) { return null; }
-        this.carry_params(sm, node);
+        this.carry_params(d, sm, node);
         if (!sm.ok) { return null; }
 
         // Appended AFTER the two carry passes: both append their hand-back stores
@@ -3602,6 +3783,18 @@ type struct AsyncLower {
     /// False (with a diagnostic) if the future types are not in scope. The record
     /// is kept either way, so `lower` neither retries nor re-reports.
     declare(mut &this, node: FunctionDeclNode*) -> boolean {
+        return this.declare_in(node, AsyncOwner::free());
+    }
+
+    /// `declare` for an `async` METHOD. `owner` supplies the receiver's type,
+    /// the generic parameters the owner contributes to the future, and the
+    /// declaration-index keys the method's signature is registered under.
+    declare_method(mut &this, owner: AsyncOwner) -> boolean {
+        if (owner.method == null || owner.method.func == null) { return false; }
+        return this.declare_in(owner.method.func, owner);
+    }
+
+    declare_in(mut &this, node: FunctionDeclNode*, owner: AsyncOwner) -> boolean {
         if (node == null || node.body == null) { return false; }
         const existing: i64 = this.pending_index(node);
         if (existing >= 0i64) { return this.pending[existing].ok; }
@@ -3631,7 +3824,9 @@ type struct AsyncLower {
                 node: node, ok: false,
                 q_name: SymbolStr::empty(), module_sym: module_sym,
                 struct_ref: TypeRef::invalid(), self_ty: TypeRef::invalid(),
-                generic: false, output_ref: output_ref,
+                generic: false, fut_params: [], method: owner.method,
+                recv_field: SymbolStr::empty(), recv_ptr: false,
+                recv_ty: TypeRef::invalid(), output_ref: output_ref,
                 declared_ref: declared_ref, poll_out: TypeRef::invalid(),
                 poll_base: poll_base, ctx_ptr_ty: TypeRef::invalid(),
                 u32_ty: TypeRef::invalid(), state_sym: SymbolStr::empty(),
@@ -3640,11 +3835,30 @@ type struct AsyncLower {
             return false;
         }
 
-        const bare: SymbolStr = this.mint_bare(this.intern.resolve(node.name));
+        // A method's future is named for the owner as well, so two types with a
+        // same-named `async` method read apart in a diagnostic. (The counter in
+        // `mint_bare` already makes them distinct.)
+        const base_name: string = if (owner.method != null && owner.qname.is_valid()) {
+            format("%s$%s", this.intern.resolve(
+                       OwnershipQuery::leaf_segment(this.intern, owner.qname)),
+                   this.intern.resolve(node.name))
+        } else { this.intern.resolve(node.name) };
+        const bare: SymbolStr = this.mint_bare(base_name);
         const q_name: SymbolStr = this.ctx.qualify_symbol_sym(bare);
 
         const state_sym: SymbolStr = this.intern.intern("state");
         const u32_ty: TypeRef = this.arena.get_u32();
+
+        // The future is generic in the OWNER's parameters as well as the
+        // function's own: an `async` method on `Box<T>` may mention `T`
+        // anywhere its free-function counterpart could mention its own.
+        mut fut_params: GenericParamNode*[] = [];
+        for (mut oi: i64 = 0; oi < owner.params.length; oi++) {
+            if (owner.params[oi] != null) { fut_params.push(owner.params[oi]); }
+        }
+        for (mut gi: i64 = 0; gi < node.generic_params.length; gi++) {
+            if (node.generic_params[gi] != null) { fut_params.push(node.generic_params[gi]); }
+        }
 
         // A generic `async function` yields a future generic in the SAME
         // parameters, so every type built from here on may mention one. Those
@@ -3653,9 +3867,44 @@ type struct AsyncLower {
         // GenericValidation with an instantiation no specialization ever resolves.
         // The arena tags what it builds in this mode symbolic, which is what makes
         // it skippable. Restored before every return below.
-        const generic: boolean = node.is_generic();
+        const generic: boolean = fut_params.length > 0i64;
         const saved_no_demand: boolean = this.arena.symbolic_no_demand_active;
         if (generic) { this.arena.set_symbolic_no_demand(true); }
+
+        // The receiver, which the future has to hold for the body to reach it
+        // after a suspend. `&this` / `mut &this` are one parameter literally
+        // named `"&this"`, already resolved to `T*`; a by-value `this` is named
+        // `"this"` and type resolution leaves its type unset, so the owner
+        // supplies it. A non-static method with NEITHER has an implicit `&this`
+        // (see `method_receiver_kind`) and so no parameter node for the field
+        // walks to find — one is synthesized, which is what the implicit form
+        // already means to every consumer downstream.
+        mut recv_field: SymbolStr = SymbolStr::empty();
+        mut recv_ptr: boolean = false;
+        if (owner.method != null && !owner.method.is_static && owner.ty.is_valid()) {
+            mut recv: VarDeclNode* = null;
+            for (mut i: i64 = 0; i < node.parameters.length; i++) {
+                if (this.is_receiver_param(node.parameters[i])) { recv = node.parameters[i]; }
+            }
+            if (recv == null) {
+                recv = new VarDeclNode(this.this_amp_sym, span);
+                recv.set_mutable(false);
+                // The receiver leads the parameter list, which is where the
+                // consumers that index rather than search expect it.
+                node.add_parameter(recv);
+                for (mut i: i64 = node.parameters.length - 1i64; i > 0i64; i--) {
+                    node.parameters[i] = node.parameters[i - 1i64];
+                }
+                node.parameters[0] = recv;
+            }
+            recv_ptr = recv.name.equals(this.this_amp_sym);
+            if (!recv.resolved_type.is_valid()) {
+                recv.set_resolved_type(if (recv_ptr) {
+                    this.arena.get_pointer_to(owner.ty)
+                } else { owner.ty });
+            }
+            recv_field = this.recv_sym;
+        }
 
         mut poll_args: TypeRef[] = [output_ref];
         const poll_out: TypeRef = this.ctx.generic_registry.instantiate(poll_base, &poll_args);
@@ -3681,15 +3930,15 @@ type struct AsyncLower {
         // future's `T` the same arena type.
         mut self_ty: TypeRef = struct_ref;
         if (generic) {
-            for (mut gi: i64 = 0; gi < node.generic_params.length; gi++) {
-                struct_decl.add_generic_param(node.generic_params[gi]);
+            for (mut gi: i64 = 0; gi < fut_params.length; gi++) {
+                struct_decl.add_generic_param(fut_params[gi]);
             }
             const param_refs: TypeRef[] = TypeResolutionPasses::create_generic_param_types(
-                node.generic_params, this.arena);
+                fut_params, this.arena);
             mut param_names: SymbolStr[] = [];
             mut param_type_ids: u64[] = [];
-            for (mut gi: i64 = 0; gi < node.generic_params.length; gi++) {
-                param_names.push(node.generic_params[gi].name);
+            for (mut gi: i64 = 0; gi < fut_params.length; gi++) {
+                param_names.push(fut_params[gi].name);
                 param_type_ids.push(param_refs[gi].id);
             }
             // The NAMESPACE, not the file path: the monomorphizer's resolution
@@ -3709,6 +3958,8 @@ type struct AsyncLower {
             node: node, ok: true,
             q_name: q_name, module_sym: module_sym,
             struct_ref: struct_ref, self_ty: self_ty, generic: generic,
+            fut_params: fut_params, method: owner.method,
+            recv_field: recv_field, recv_ptr: recv_ptr, recv_ty: owner.ty,
             output_ref: output_ref, declared_ref: declared_ref,
             poll_out: poll_out, poll_base: poll_base, ctx_ptr_ty: ctx_ptr_ty,
             u32_ty: u32_ty, state_sym: state_sym,
@@ -3720,6 +3971,10 @@ type struct AsyncLower {
         mut poll_fn: FunctionDeclNode* = new FunctionDeclNode(this.intern.intern("poll"), span);
         poll_fn.set_resolved_return_type(poll_out);
         poll_fn.set_origin_trait(this.intern.intern("Future"));
+        // The body is built in `lower`, long after name resolution: its shadow
+        // bindings are absent from the resolution map, so the unused-local lint
+        // would report every one of them against the async function's own span.
+        poll_fn.set_synthesized_body(true);
         if (generic) {
             poll_fn.set_return_type_annotation(
                 this.poll_type_ann(this.output_type_ann(&d, span), span));
@@ -3771,12 +4026,12 @@ type struct AsyncLower {
         impl_node.add_assoc_binding(this.intern.intern("Output"), this.output_type_ann(&d, span));
         impl_node.add_method(poll_method);
         if (generic) {
-            for (mut gi: i64 = 0; gi < node.generic_params.length; gi++) {
-                impl_node.add_generic_param(node.generic_params[gi]);
+            for (mut gi: i64 = 0; gi < d.fut_params.length; gi++) {
+                impl_node.add_generic_param(d.fut_params[gi]);
             }
             // `target_args` is what makes `This` inside the impl resolve to the
             // full `Fut<T>` rather than the bare template base.
-            impl_node.set_target_args(this.generic_param_anns(node, span));
+            impl_node.set_target_args(this.generic_param_anns(d.fut_params, span));
             impl_node.qualified_target_name = q_name;
             // Hang the block off the template so the same demand that specializes
             // `Fut<i64>` specializes its `Future` impl. Without it the
@@ -3799,21 +4054,110 @@ type struct AsyncLower {
         const qual_id: u64 = OwnershipQuery::named_qualified_id(this.arena, this.intern, struct_ref);
         this.ctx.generic_registry.register_trait_impl_typed(future_leaf, tgt_leaf, qual_id, impl_node);
 
-        // Repoint callers at the future type. Drop the stale Output-return
-        // overload first (bare + qualified) so the struct-return signature is the
-        // sole overload at call sites. The node carries the struct type only for
-        // the duration of the registration, which reads it off the node.
-        this.ctx.decl_index.reset_function_overloads(node.name);
-        this.ctx.decl_index.reset_function_overloads(this.ctx.qualify_symbol_sym(node.name));
+        // Repoint callers at the future type.
         node.set_resolved_return_type(self_ty);
-        TypeResolutionPasses::register_decl_in_index(node as ASTNode*, this.ctx, false, module_sym);
-        node.set_resolved_return_type(declared_ref);
+        if (owner.method != null) {
+            this.repoint_method(&owner, node, module_sym);
+            // A method's callers read the NODE, so the future type STAYS on it;
+            // `begin_body_check` lends the declared type back for the body walk.
+        } else {
+            // Drop the stale Output-return overload first (bare + qualified) so
+            // the struct-return signature is the sole overload at call sites.
+            // The node itself carries the struct type only for the duration of
+            // the registration, which reads it off the node; the DECLARED type
+            // goes back afterwards, because the body is still typed and
+            // `check_function_returns`-checked against it.
+            this.ctx.decl_index.reset_function_overloads(node.name);
+            this.ctx.decl_index.reset_function_overloads(this.ctx.qualify_symbol_sym(node.name));
+            TypeResolutionPasses::register_decl_in_index(node as ASTNode*, this.ctx, false, module_sym);
+            node.set_resolved_return_type(declared_ref);
+        }
 
         d.poll_fn     = poll_fn;
         d.poll_method = poll_method;
         this.pending.push(d);
         if (generic) { this.arena.set_symbolic_no_demand(saved_no_demand); }
         return true;
+    }
+
+    /// The method's parameter types with the receiver excluded — the shape both
+    /// the owner's `MethodInfo` and the declaration index are built from.
+    method_param_types(&this, node: FunctionDeclNode*) -> TypeRef[] {
+        mut ptypes: TypeRef[] = [];
+        for (mut i: i64 = 0; i < node.parameters.length; i++) {
+            const p: VarDeclNode* = node.parameters[i];
+            if (p == null || this.is_receiver_param(p)) { continue; }
+            ptypes.push(p.resolved_type);
+        }
+        return ptypes;
+    }
+
+    /// Rebuild the owner's arena `MethodInfo` for `m` around the node's current
+    /// return type.
+    ///
+    /// The entry is found by AST identity, the key `type_resolution` built it
+    /// under — a name is not unique across overloads. Mutated in place:
+    /// `add_method` appends, so re-adding would leave two entries and make
+    /// overload resolution depend on which one it reached first.
+    rebuild_method_info(mut &this, owner_ty: TypeRef, m: MethodNode*,
+                        node: FunctionDeclNode*) -> void {
+        const t: Type* = this.arena.lookup(owner_ty.id);
+        if (t == null) { return; }
+        const fn_ty: TypeRef = this.arena.get_function(
+            node.resolved_return_type, this.method_param_types(node), node.is_variadic);
+        // A union is a StructType with `is_union`, so Struct covers it too.
+        if (t.kind == TypeKind::Struct) {
+            mut st: StructType* = t as StructType*;
+            for (mut i: i64 = 0; i < st.methods.length; i++) {
+                if (st.methods[i].ast_node != (m as void*)) { continue; }
+                st.methods[i].function_type = fn_ty;
+                return;
+            }
+            return;
+        }
+        if (t.kind == TypeKind::Class) {
+            mut ct: ClassType* = t as ClassType*;
+            for (mut i: i64 = 0; i < ct.methods.length; i++) {
+                if (ct.methods[i].ast_node != (m as void*)) { continue; }
+                ct.methods[i].function_type = fn_ty;
+                return;
+            }
+        }
+    }
+
+    /// Drop every overload registered under the combined `<owner>::<method>`
+    /// key. The free-function counterpart resets the plain name; a method's
+    /// overload set hangs off the combined key instead, and without this the
+    /// stale Output-return signature stays resolvable next to the new one.
+    reset_method_overloads(mut &this, owner_qname: SymbolStr, method_name: SymbolStr) -> void {
+        const combined: string = format("%s::%s", this.intern.resolve(owner_qname),
+                                        this.intern.resolve(method_name));
+        this.ctx.decl_index.reset_function_overloads(this.intern.intern(combined));
+    }
+
+    /// Point callers of an `async` METHOD at its future type.
+    ///
+    /// A free function's whole overload set is dropped and rebuilt from the
+    /// node; a method has no such set. Its signature lives in the owner's arena
+    /// entry (what overload resolution reads) and in the declaration index under
+    /// the combined `Owner::method` key (what cross-module callers and codegen
+    /// read). Both derive from the node's `resolved_return_type`, which the
+    /// caller has set to the future type around this call.
+    repoint_method(mut &this, owner: AsyncOwner*, node: FunctionDeclNode*,
+                   module_sym: SymbolStr) -> void {
+        this.rebuild_method_info(owner.ty, owner.method, node);
+
+        mut arr: MethodNode*[] = [owner.method];
+        this.reset_method_overloads(owner.qname, node.name);
+        this.ctx.decl_index.register_methods_with_module(
+            owner.qname, arr, module_sym, this.intern, this.arena);
+        for (mut i: i64 = 0; i < owner.alias_qnames.length; i++) {
+            const alias: SymbolStr = owner.alias_qnames[i];
+            if (!alias.is_valid() || alias.equals(owner.qname)) { continue; }
+            this.reset_method_overloads(alias, node.name);
+            this.ctx.decl_index.register_methods_with_module_aliased(
+                owner.qname, alias, arr, module_sym, this.intern, this.arena);
+        }
     }
 
     /// Append one field to the generated future's declaration.
@@ -3876,9 +4220,31 @@ type struct AsyncLower {
         mut struct_decl: StructDeclNode*   = this.pending[pi].struct_decl;
         mut impl:        ImplBlockNode*    = this.pending[pi].impl_node;
         mut poll_fn:     FunctionDeclNode* = this.pending[pi].poll_fn;
+        const method:      MethodNode* = this.pending[pi].method;
+        const recv_field:  SymbolStr   = this.pending[pi].recv_field;
         const span: SourceSpan = node.span;
 
-        // ---- 0. poll body ----
+        // ---- 0. Receiver ----
+        // A method's body reads its receiver as a bare `this`, which inside the
+        // generated `poll` would resolve to the FUTURE. Rewrite it to the frame
+        // binding the shadow prelude declares for the receiver field, restoring
+        // the by-value type the body was typed against when the receiver is held
+        // by pointer.
+        //
+        // This runs BEFORE the poll body is built, and so before every other
+        // rewrite: the shadow prelude, the cross-state promotion and the carry
+        // passes all synthesize `this.<field>` accesses of their own, and a
+        // receiver pass run after them would rewrite the `this` in those too.
+        if (recv_field.is_valid() && node.body.kind == NodeKind::BlockStatement) {
+            this.subst_mode = if (this.pending[pi].recv_ptr) {
+                this.subst_to_local_deref()
+            } else { this.subst_to_local() };
+            this.subst_name_stmt(node.body as StatementNode*, this.this_sym, recv_field,
+                                 self_ty, this.pending[pi].recv_ty, span);
+            this.subst_mode = this.subst_to_field();
+        }
+
+        // ---- 0b. poll body ----
         // No await => run to completion in one poll (Inc 1b). Otherwise the
         // recursive builder emits `loop { match (this.state) {…} }`, recording one
         // `fut_k: Option<F_k>` sub-future per await and one field per promoted
@@ -3917,9 +4283,10 @@ type struct AsyncLower {
                 if (generic) { this.arena.set_symbolic_no_demand(saved_no_demand); }
                 return;
             }
-            body_block = this.build_poll_body_sm(node, &sm);
+            body_block = this.build_poll_body_sm(&this.pending[pi], node, &sm);
         } else {
-            body_block = this.build_poll_body_no_await(node, self_ty, poll_out, span);
+            body_block = this.build_poll_body_no_await(
+                &this.pending[pi], node, self_ty, poll_out, span);
         }
         if (body_block == null) {   // a diagnostic was already emitted
             if (generic) { this.arena.set_symbolic_no_demand(saved_no_demand); }
@@ -3937,9 +4304,10 @@ type struct AsyncLower {
 
         for (mut i: i64 = 0; i < node.parameters.length; i++) {
             const p: VarDeclNode* = node.parameters[i];
-            if (p == null || !p.resolved_type.is_valid()) { continue; }
-            if (!this.add_future_field(struct_decl, p.name,
-                                       this.param_field_type(&sm, p.resolved_type), generic, span)) {
+            if (!this.param_has_slot(&this.pending[pi], p)) { continue; }
+            if (!this.add_future_field(struct_decl, this.param_field_name(p),
+                    this.param_field_type(&sm, this.param_slot_type(&this.pending[pi], p)),
+                    generic, span)) {
                 fields_ok = false;
             }
         }
@@ -3970,9 +4338,10 @@ type struct AsyncLower {
             infos.push(FieldInfo::new(state_sym, u32_ty, true, false, false));
             for (mut i: i64 = 0; i < node.parameters.length; i++) {
                 const p: VarDeclNode* = node.parameters[i];
-                if (p == null || !p.resolved_type.is_valid()) { continue; }
-                infos.push(FieldInfo::new(p.name, this.param_field_type(&sm, p.resolved_type),
-                                          true, false, false));
+                if (!this.param_has_slot(&this.pending[pi], p)) { continue; }
+                infos.push(FieldInfo::new(this.param_field_name(p),
+                    this.param_field_type(&sm, this.param_slot_type(&this.pending[pi], p)),
+                    true, false, false));
             }
             for (mut i: i64 = 0; i < sm.naw; i++) {
                 infos.push(FieldInfo::new(sm.fut_syms[i], sm.fut_opt[i], true, false, false));
@@ -4000,15 +4369,28 @@ type struct AsyncLower {
         ctor_lit.add_field_init(FieldInit { field_name: state_sym, value: zero as ExpressionNode*, span: span });
         for (mut i: i64 = 0; i < node.parameters.length; i++) {
             const p: VarDeclNode* = node.parameters[i];
-            if (p == null || !p.resolved_type.is_valid()) { continue; }
-            mut pid: IdentifierNode* = new IdentifierNode(p.name, span);
-            pid.set_resolved_type(p.resolved_type);
-            mut pval: ExpressionNode* = pid as ExpressionNode*;
-            const pfty: TypeRef = this.param_field_type(&sm, p.resolved_type);
-            if (this.param_is_carried(&sm, p.resolved_type)) {
+            if (!this.param_has_slot(&this.pending[pi], p)) { continue; }
+            const slot_ty: TypeRef = this.param_slot_type(&this.pending[pi], p);
+            // The receiver is not readable by its parameter name (`&this` is
+            // not an identifier), and a pointer receiver has to be the ADDRESS
+            // of the caller's object rather than a copy of it — this body still
+            // runs as the method, so `this` is that object.
+            mut pval: ExpressionNode* = if (this.is_receiver_param(p)) {
+                if (this.pending[pi].recv_ptr) {
+                    this.addr_of(this.ident(this.this_sym, this.pending[pi].recv_ty, span),
+                                 slot_ty, span)
+                } else {
+                    this.ident(this.this_sym, slot_ty, span)
+                }
+            } else {
+                this.ident(p.name, slot_ty, span)
+            };
+            const pfty: TypeRef = this.param_field_type(&sm, slot_ty);
+            if (this.param_is_carried(&sm, slot_ty)) {
                 pval = this.option_some(pval, pfty, span);
             }
-            ctor_lit.add_field_init(FieldInit { field_name: p.name, value: pval, span: span });
+            ctor_lit.add_field_init(FieldInit {
+                field_name: this.param_field_name(p), value: pval, span: span });
         }
         // Each sub-future starts empty (built lazily on first entry to its resume
         // state); each promoted field starts zero (always written before read).
@@ -4028,7 +4410,9 @@ type struct AsyncLower {
         // The literal's OWN type arguments, so it builds `Fut<T>` rather than the
         // bare template — without them the function's return type and the value
         // it returns stop matching.
-        if (generic) { ctor_lit.set_generic_args(this.generic_param_anns(node, span)); }
+        if (generic) {
+            ctor_lit.set_generic_args(this.generic_param_anns(this.pending[pi].fut_params, span));
+        }
         ctor_lit.set_resolved_type(self_ty);
         mut ret: ReturnStmtNode* = new ReturnStmtNode(ctor_lit as ExpressionNode*, span);
         mut new_body: BlockStmtNode* = new BlockStmtNode(span);
@@ -4044,9 +4428,16 @@ type struct AsyncLower {
         // the entry against the finished node rather than changing where calls
         // resolve. Dropping the stale overloads first (bare + qualified) keeps the
         // struct-return signature the sole one at call sites.
-        this.ctx.decl_index.reset_function_overloads(node.name);
-        this.ctx.decl_index.reset_function_overloads(this.ctx.qualify_symbol_sym(node.name));
-        TypeResolutionPasses::register_decl_in_index(node as ASTNode*, this.ctx, false, module_sym);
+        //
+        // A METHOD needs none of this: `declare` registered its signature with
+        // the future return type already, under keys that are stable across the
+        // rewrite, and re-running the registration would only append a second
+        // entry with the same mangled symbol.
+        if (method == null) {
+            this.ctx.decl_index.reset_function_overloads(node.name);
+            this.ctx.decl_index.reset_function_overloads(this.ctx.qualify_symbol_sym(node.name));
+            TypeResolutionPasses::register_decl_in_index(node as ASTNode*, this.ctx, false, module_sym);
+        }
 
         // The record has served its purpose; `is_async` is now false, so nothing
         // will look it up again.

@@ -1,0 +1,366 @@
+// `async` is a method modifier as well as a function one.  A method lowers to
+// the same future struct + `Future` impl a free `async function` does, with one
+// addition: the receiver.
+//
+// The receiver is the part that is easy to get wrong.  A method's body reads it
+// as a bare `this`, and inside the generated `poll` a bare `this` is the FUTURE,
+// so it has to be rewritten to a captured field.  The three receiver forms
+// capture differently: `&this` / `mut &this` are held BY POINTER (the caller's
+// object, which the caller must keep alive while the future is polled - the same
+// unenforced contract `E0455` blesses for pointer parameters), while a by-value
+// `this` is MOVED INTO the future and dropped with it.  Every use in the body
+// was typed against the owner by value, so a pointer receiver is read back
+// through a deref and the body's types are unchanged either way.
+//
+// The other half is registration.  A free function's callers resolve through the
+// declaration index; a method's resolve through the NODE, so the node has to
+// carry the future type from the moment the future is declared - otherwise a
+// caller typed before the callee's own body (the callee declared lower in the
+// type) sees the declared Output and reports that it does not implement
+// `Future`.  `declaration_order_is_irrelevant` is the test for that.
+![config(testing)]
+namespace CryoTests::Tests::Lang::AsyncMethod;
+
+import std::test;
+import std::core::result;
+import std::future;
+
+mut am_drops: i64 = 0;
+
+/// The first failure of two checks, or Ok.  Both operands are already-computed
+/// comparisons, so evaluating them eagerly costs nothing.
+function am_both(a: Result<(), TestError>, b: Result<(), TestError>) -> Result<(), TestError> {
+    match (a) {
+        Result::Ok(_)  => {}
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return b;
+}
+
+async function am_bump(n: i64) -> i64 {
+    return n + 1;
+}
+
+type struct AmProbe {
+    tag: i64;
+}
+
+implement trait Drop for struct AmProbe {
+    drop(mut &this) -> void { am_drops = am_drops + 1; }
+}
+
+type struct AmPair {
+    a: i64;
+    b: i64;
+}
+
+type struct AmClient {
+    base: i64;
+    hits: i64;
+
+    // `&this`, no suspend: exercises receiver capture, the `this` rewrite and
+    // the whole registration repoint with none of the state machine.
+    async peek(&this) -> i64 {
+        return this.base;
+    }
+
+    // `&this` across two suspends, alongside an ordinary parameter.
+    async fetch(&this, k: i64) -> i64 {
+        const a: i64 = await am_bump(this.base);
+        const b: i64 = await am_bump(a);
+        return b + k;
+    }
+
+    // `mut &this`: a write through the receiver must land in the CALLER's
+    // object, not in a copy the future kept.
+    async tick(mut &this) -> i64 {
+        const d: i64 = await am_bump(0);
+        this.hits = this.hits + d;
+        return this.hits;
+    }
+
+    // By-value `this`: the future owns the receiver.
+    async consume(this) -> i64 {
+        const d: i64 = await am_bump(this.base);
+        return d + this.base;
+    }
+
+    // No receiver at all.
+    static async make() -> i64 {
+        return await am_bump(99);
+    }
+
+    // No receiver IN THE PARAMETER LIST, but `this` in the body: the implicit
+    // `&this` every non-static method has.
+    async implicit() -> i64 {
+        return this.base + 1000;
+    }
+
+    // Awaiting another `async` method on the same object: the sub-future field
+    // is that method's generated future.
+    async chained(&this) -> i64 {
+        const p: i64 = await this.peek();
+        const q: i64 = await am_bump(p);
+        return p + q;
+    }
+
+    // Branch and loop, each holding a suspend, with the receiver read after it.
+    async branchy(&this, flag: boolean, n: i64) -> i64 {
+        mut acc: i64 = 0;
+        if (flag) {
+            const a: i64 = await am_bump(10);
+            acc = a;
+        } else {
+            const b: i64 = await am_bump(20);
+            acc = b;
+        }
+        mut i: i64 = 0;
+        while (i < n) {
+            const s: i64 = await am_bump(0);
+            acc = acc + s;
+            i = i + 1;
+        }
+        return acc + this.base;
+    }
+
+    // `-> void` on a method: `Output` is unit, exactly as for a free function.
+    async note(mut &this) -> void {
+        const d: i64 = await am_bump(0);
+        this.hits = this.hits + d;
+    }
+}
+
+// A pointer INTO a receiver held by pointer stays valid across a suspend: the
+// pointee is the caller's object, which does not move when a poll returns.  The
+// address-of check has to see that through the deref the receiver rewrite
+// introduces, or it would report `E0455` on sound code.
+type struct AmBuf {
+    slot: i64;
+
+    async through_receiver(&this) -> i64 {
+        const p: i64* = &this.slot;
+        const step: i64 = await am_bump(0);
+        return *p + step;
+    }
+}
+
+// The callee is declared BELOW its caller: the caller's body is typed first, so
+// it can only resolve `this.later()` as a future if the future was declared
+// ahead of every body in the module.
+type struct AmOrder {
+    v: i64;
+
+    async earlier(&this) -> i64 {
+        const a: i64 = await this.later();
+        return a * 2;
+    }
+
+    async later(&this) -> i64 {
+        return this.v + 1;
+    }
+}
+
+// A droppable receiver taken BY VALUE: moved into the future, dropped once when
+// the future is.
+type struct AmOwner {
+    p: AmProbe;
+
+    async take(this) -> i64 {
+        const a: i64 = await am_bump(this.p.tag);
+        return a + this.p.tag;
+    }
+}
+
+// A method delivered by an INHERENT IMPL BLOCK rather than inline in the type.
+// An impl block registers its methods under up to three owner names, all of
+// which have to be repointed at the future or a call that resolved through one
+// of the others keeps the declared Output.
+implement AmClient {
+    async via_impl(&this, k: i64) -> i64 {
+        const a: i64 = await am_bump(this.base);
+        return a * k;
+    }
+}
+
+// A GENERIC owner: the future is generic in the owner's parameters as well as
+// the method's own, so the demand that specializes `AmCell<i64>` specializes its
+// methods' futures too.
+type struct AmCell<T> {
+    v: T;
+
+    async get(&this) -> T {
+        return this.v;
+    }
+
+    async get_after(&this) -> T {
+        const _k: i64 = await am_bump(0);
+        return this.v;
+    }
+
+    // A generic method ON a generic owner: the future carries BOTH parameters.
+    async pick<U>(&this, u: U) -> U {
+        const _k: i64 = await am_bump(0);
+        return u;
+    }
+
+    static async zero() -> i64 {
+        return await am_bump(-1);
+    }
+}
+
+// A class receiver, whose methods live on a ClassType rather than a StructType.
+type class AmNode {
+public:
+    v: i64;
+
+    public async doubled(&this) -> i64 {
+        const a: i64 = await this.raw();
+        return a * 2;
+    }
+
+    public async raw(&this) -> i64 {
+        return this.v;
+    }
+}
+
+![test]
+function async_method_with_no_await_reads_its_receiver() -> Result<(), TestError> {
+    const c: AmClient = AmClient { base: 41, hits: 0 };
+    const r: i64 = future::block_on(c.peek());
+    return expect_eq(r, 41 as i64);
+}
+
+![test]
+function async_method_carries_its_receiver_across_suspends() -> Result<(), TestError> {
+    const c: AmClient = AmClient { base: 41, hits: 0 };
+    const r: i64 = future::block_on(c.fetch(8));
+    return expect_eq(r, 51 as i64);
+}
+
+// The point of `mut &this`: the future holds a POINTER to the caller's object,
+// so a write survives the future and is visible to the caller afterwards.
+![test]
+function async_method_mut_receiver_writes_through_to_the_caller() -> Result<(), TestError> {
+    mut c: AmClient = AmClient { base: 41, hits: 0 };
+    const first:  i64 = future::block_on(c.tick());
+    const second: i64 = future::block_on(c.tick());
+    return am_both(am_both(expect_eq(first, 1 as i64), expect_eq(second, 2 as i64)),
+                   expect_eq(c.hits, 2 as i64));
+}
+
+![test]
+function async_method_takes_its_receiver_by_value() -> Result<(), TestError> {
+    const c: AmClient = AmClient { base: 41, hits: 0 };
+    const r: i64 = future::block_on(c.consume());
+    return expect_eq(r, 83 as i64);
+}
+
+![test]
+function async_static_method_has_no_receiver() -> Result<(), TestError> {
+    const r: i64 = future::block_on(AmClient::make());
+    return expect_eq(r, 100 as i64);
+}
+
+// A non-static method with no receiver in its parameter list still has one.
+![test]
+function async_method_with_an_implicit_receiver() -> Result<(), TestError> {
+    const c: AmClient = AmClient { base: 41, hits: 0 };
+    const r: i64 = future::block_on(c.implicit());
+    return expect_eq(r, 1041 as i64);
+}
+
+![test]
+function async_method_awaits_another_method_on_the_same_object() -> Result<(), TestError> {
+    const c: AmClient = AmClient { base: 41, hits: 0 };
+    const r: i64 = future::block_on(c.chained());
+    return expect_eq(r, 83 as i64);
+}
+
+![test]
+function async_method_suspends_inside_branches_and_loops() -> Result<(), TestError> {
+    const c: AmClient = AmClient { base: 41, hits: 0 };
+    const t: i64 = future::block_on(c.branchy(true, 3));
+    const f: i64 = future::block_on(c.branchy(false, 2));
+    return am_both(expect_eq(t, 55 as i64), expect_eq(f, 64 as i64));
+}
+
+![test]
+function async_method_returning_void() -> Result<(), TestError> {
+    mut c: AmClient = AmClient { base: 41, hits: 0 };
+    future::block_on(c.note());
+    return expect_eq(c.hits, 1 as i64);
+}
+
+// The regression this file exists for: a caller typed before its callee.
+![test]
+function async_method_declaration_order_is_irrelevant() -> Result<(), TestError> {
+    const o: AmOrder = AmOrder { v: 4 };
+    const r: i64 = future::block_on(o.earlier());
+    return expect_eq(r, 10 as i64);
+}
+
+// A by-value receiver that owns a droppable field runs its drop exactly once,
+// when the future it was moved into is dropped.
+![test]
+function async_method_by_value_receiver_drops_once() -> Result<(), TestError> {
+    am_drops = 0;
+    const o: AmOwner = AmOwner { p: AmProbe { tag: 5 } };
+    const r: i64 = future::block_on(o.take());
+    return am_both(expect_eq(r, 11 as i64), expect_eq(am_drops, 1 as i64));
+}
+
+![test]
+function async_method_holds_a_pointer_into_a_pointer_receiver() -> Result<(), TestError> {
+    const b: AmBuf = AmBuf { slot: 12 };
+    const r: i64 = future::block_on(b.through_receiver());
+    return expect_eq(r, 13 as i64);
+}
+
+![test]
+function async_method_from_an_impl_block() -> Result<(), TestError> {
+    const c: AmClient = AmClient { base: 41, hits: 0 };
+    const r: i64 = future::block_on(c.via_impl(2));
+    return expect_eq(r, 84 as i64);
+}
+
+![test]
+function async_method_on_a_generic_owner() -> Result<(), TestError> {
+    const c: AmCell<i64> = AmCell<i64> { v: 7 };
+    const a: i64 = future::block_on(c.get());
+    const b: i64 = future::block_on(c.get_after());
+    return am_both(expect_eq(a, 7 as i64), expect_eq(b, 7 as i64));
+}
+
+// Two instantiations of one generic owner must not collapse onto each other,
+// and a struct payload must survive a suspend.
+![test]
+function async_method_on_a_generic_owner_at_several_types() -> Result<(), TestError> {
+    const ci: AmCell<i64>    = AmCell<i64> { v: 7 };
+    const cf: AmCell<f64>    = AmCell<f64> { v: 2.5 };
+    const cp: AmCell<AmPair> = AmCell<AmPair> { v: AmPair { a: 3, b: 4 } };
+    const a: i64    = future::block_on(ci.get_after());
+    const b: f64    = future::block_on(cf.get());
+    const p: AmPair = future::block_on(cp.get_after());
+    return am_both(am_both(expect_eq(a, 7 as i64), expect_eq(b, 2.5 as f64)),
+                   am_both(expect_eq(p.a, 3 as i64), expect_eq(p.b, 4 as i64)));
+}
+
+![test]
+function async_generic_method_on_a_generic_owner() -> Result<(), TestError> {
+    const c: AmCell<i64> = AmCell<i64> { v: 7 };
+    const u: i64 = future::block_on(c.pick<i64>(11));
+    return expect_eq(u, 11 as i64);
+}
+
+![test]
+function async_static_method_on_a_generic_owner() -> Result<(), TestError> {
+    const z: i64 = future::block_on(AmCell<i64>::zero());
+    return expect_eq(z, 0 as i64);
+}
+
+![test]
+function async_method_on_a_class() -> Result<(), TestError> {
+    const n: AmNode = AmNode { v: 10 };
+    const r: i64 = future::block_on(n.doubled());
+    return expect_eq(r, 20 as i64);
+}
