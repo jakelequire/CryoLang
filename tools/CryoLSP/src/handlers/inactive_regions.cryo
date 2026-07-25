@@ -39,8 +39,16 @@ type struct InactiveRegionsPublisher {
     /// Publish the inactive (OS-gated-away) ranges for `uri`, read from the
     /// compilation context's `inactive_spans`.  Always emits - an empty array
     /// clears the editor's dimming after a recompile that gated nothing.
+    ///
+    /// `version` is the document version these ranges were computed from
+    /// (`-1` when unknown).  Ranges are absolute positions, so applying them
+    /// to a buffer that has moved on paints the dimming over the wrong lines;
+    /// the client compares this against its own document version and drops
+    /// the update rather than mis-painting.  A compile takes long enough on a
+    /// real project for several keystrokes to land while it runs, so this is
+    /// the normal case during typing, not a rare race.
     static publish_for(writer: mut &Stdout, uri: Str,
-                       ctx: CompilationContext*) -> void {
+                       ctx: CompilationContext*, version: i32) -> void {
         if (ctx == null) {
             InactiveRegionsPublisher::publish_empty(writer, uri);
             return;
@@ -65,12 +73,17 @@ type struct InactiveRegionsPublisher {
 
         mut params: JsonObject = JsonObject::new();
         params.put("uri", JsonValue::from(uri));
+        if (version >= 0) {
+            params.put("version", JsonValue::int_value(version as i64));
+        }
         params.put("regions", JsonValue::Array(arr));
         InactiveRegionsPublisher::send_notification(writer, JsonValue::Object(params));
     }
 
     /// Publish an empty region array for `uri` - clears any prior dimming
-    /// (used on didClose, or when there's no context to consult).
+    /// (used on didClose, or when there's no context to consult).  Sent
+    /// unversioned: "nothing is inactive here" is true of every version of
+    /// the document, so the client should never hold it back as stale.
     static publish_empty(writer: mut &Stdout, uri: Str) -> void {
         mut params: JsonObject = JsonObject::new();
         params.put("uri", JsonValue::from(uri));

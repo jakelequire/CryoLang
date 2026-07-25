@@ -19,10 +19,22 @@ import { LanguageClient } from 'vscode-languageclient/node';
 /** Params for the server's `cryo/inactiveRegions` notification. */
 interface InactiveRegionsParams {
     uri: string;
+    /**
+     * Document version the ranges were computed from. Absent when the server
+     * couldn't determine one (and from older servers), which we treat as
+     * "applies to whatever is open" - the pre-versioning behaviour.
+     */
+    version?: number;
     regions: Array<{
         start: { line: number; character: number };
         end: { line: number; character: number };
     }>;
+}
+
+/** Ranges as of a given document version. */
+interface VersionedRegions {
+    version: number | undefined;
+    ranges: vscode.Range[];
 }
 
 // One decoration type for the extension's lifetime. `opacity` fades the text
@@ -31,8 +43,10 @@ let decorationType: vscode.TextEditorDecorationType | undefined;
 
 // Last-known inactive ranges per document URI, so an editor that becomes
 // visible later (split view, tab switch) can be painted immediately without
-// waiting for the server to resend.
-const regionsByUri = new Map<string, vscode.Range[]>();
+// waiting for the server to resend. Keyed with the document version they
+// describe: positions are absolute, so ranges from an older version land on
+// the wrong lines once the buffer moves on.
+const regionsByUri = new Map<string, VersionedRegions>();
 
 function ensureDecoration(): vscode.TextEditorDecorationType {
     if (!decorationType) {
@@ -44,9 +58,23 @@ function ensureDecoration(): vscode.TextEditorDecorationType {
     return decorationType;
 }
 
+/**
+ * Paint `editor` with the last ranges we heard about, unless they describe an
+ * older version of the document than the one on screen. Applying stale ranges
+ * is worse than applying none: they dim whatever text has since shifted into
+ * those positions, which reads as the dimming bleeding past the gated
+ * declaration. A newer publish always follows an edit, so skipping costs at
+ * most one compile's worth of delay.
+ */
 function applyToEditor(editor: vscode.TextEditor): void {
-    const ranges = regionsByUri.get(editor.document.uri.toString()) ?? [];
-    editor.setDecorations(ensureDecoration(), ranges);
+    const entry = regionsByUri.get(editor.document.uri.toString());
+    if (!entry) {
+        return;
+    }
+    if (entry.version !== undefined && entry.version !== editor.document.version) {
+        return;
+    }
+    editor.setDecorations(ensureDecoration(), entry.ranges);
 }
 
 function applyToAllVisible(uri: string): void {
@@ -66,9 +94,7 @@ export function initInactiveRegions(context: vscode.ExtensionContext): void {
     context.subscriptions.push(
         vscode.window.onDidChangeVisibleTextEditors((editors) => {
             for (const editor of editors) {
-                if (regionsByUri.has(editor.document.uri.toString())) {
-                    applyToEditor(editor);
-                }
+                applyToEditor(editor);
             }
         })
     );
@@ -106,7 +132,10 @@ export function registerInactiveRegions(client: LanguageClient): vscode.Disposab
                         r.end.character
                     )
             );
-            regionsByUri.set(params.uri, ranges);
+            regionsByUri.set(params.uri, {
+                version: params.version,
+                ranges,
+            });
             applyToAllVisible(params.uri);
         }
     );

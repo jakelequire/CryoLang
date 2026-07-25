@@ -151,6 +151,19 @@ public:
         };
     }
 
+    /// Record a leading modifier keyword (`public` / `private`) on a
+    /// declaration that has just been parsed.  The keyword is consumed
+    /// before the declaration's own parse begins, so it falls outside the
+    /// node's `span`; `DeclarationNode::outer_span` folds it back in for
+    /// consumers that need the full written extent.  Nodes that can't carry
+    /// one (a recovery `null`, a non-declaration) are ignored - the same
+    /// gate `is_attachable_decl` applies to directives.
+    static note_decl_modifier(node: ASTNode*, span: SourceSpan) -> void {
+        if (!Parser::is_attachable_decl(node)) { return; }
+        const decl: DeclarationNode* = node as DeclarationNode*;
+        decl.note_modifier_span(span);
+    }
+
 
     // Entry Point
 
@@ -314,15 +327,19 @@ public:
 
         // Public declarations
         if (tok.kind == TokenType::KwPublic) {
+            const vis_span: SourceSpan = this.span_from_token(tok);
             this.advance(); // consume 'public'
             const decl: ASTNode* = this.parse_declaration(true, doc);
+            Parser::note_decl_modifier(decl, vis_span);
             return decl;
         }
 
         // Private declarations
         if (tok.kind == TokenType::KwPrivate) {
+            const vis_span: SourceSpan = this.span_from_token(tok);
             this.advance();
             const decl: ASTNode* = this.parse_declaration(false, doc);
+            Parser::note_decl_modifier(decl, vis_span);
             return decl;
         }
 
@@ -404,10 +421,12 @@ public:
         // carrying the `is_async` flag; the async lowering in SemanticAnalysis
         // rewrites it into a state-machine struct + `Future` impl.
         if (tok.kind == TokenType::KwAsync && this.peek_at(1).kind == TokenType::KwFunction) {
+            const async_span: SourceSpan = this.span_from_token(tok);
             this.advance(); // consume 'async'
             const func: FunctionDeclNode* = this.parse_function_declaration(is_public);
             if (func != null) {
                 func.set_async(true);
+                func.note_modifier_span(async_span);
                 if (doc != "") { func.set_documentation(doc); }
             }
             return func;
@@ -477,10 +496,12 @@ public:
 
         // Static keyword before function
         if (tok.kind == TokenType::KwStatic && this.peek_at(1).kind == TokenType::KwFunction) {
+            const static_span: SourceSpan = this.span_from_token(tok);
             this.advance(); // consume 'static'
             const func: FunctionDeclNode* = this.parse_function_declaration(is_public);
             if (func != null) {
                 func.set_static(true);
+                func.note_modifier_span(static_span);
                 if (doc != "") { func.set_documentation(doc); }
             }
             return func;
@@ -1035,6 +1056,11 @@ public:
             // inline opt-out doesn't shift the rest of the section.
             mut member_visibility: Visibility = current_visibility;
             mut had_inline_visibility: boolean = false;
+            // Where that inline keyword sat, for the member's `outer_span()`:
+            // it is consumed here, before the member node exists, so nothing
+            // else records it.  Stays `none()` for block-form visibility,
+            // whose label is not part of any one member.
+            mut member_modifier_span: SourceSpan = SourceSpan::none();
             if (this.peek_at(1).kind != TokenType::Colon) {
                 mut matched: boolean = true;
                 match (this.current().kind) {
@@ -1052,6 +1078,7 @@ public:
                 }
                 if (matched) {
                     had_inline_visibility = true;
+                    member_modifier_span = this.span_from_token(this.current());
                     this.advance(); // consume keyword
                 }
             }
@@ -1091,6 +1118,7 @@ public:
                     for (mut pi: i64 = 0; pi < pending_dirs.length; pi++) {
                         method.add_directive(pending_dirs[pi]);
                     }
+                    method.note_modifier_span(member_modifier_span);
                     if (struct_node != null) { struct_node.add_method(method); }
                     if (class_node != null) { class_node.add_method(method); }
                     if (union_node != null) { union_node.add_method(method); }
@@ -1106,6 +1134,7 @@ public:
                     for (mut pi: i64 = 0; pi < pending_dirs.length; pi++) {
                         method.add_directive(pending_dirs[pi]);
                     }
+                    method.note_modifier_span(member_modifier_span);
                     if (struct_node != null) { struct_node.add_method(method); }
                     if (class_node != null) { class_node.add_method(method); }
                     if (union_node != null) { union_node.add_method(method); }
@@ -1121,6 +1150,7 @@ public:
                     for (mut pi: i64 = 0; pi < pending_dirs.length; pi++) {
                         method.add_directive(pending_dirs[pi]);
                     }
+                    method.note_modifier_span(member_modifier_span);
                     if (struct_node != null) { struct_node.add_method(method); }
                     if (class_node != null) { class_node.add_method(method); }
                     if (union_node != null) { union_node.add_method(method); }
@@ -1136,6 +1166,7 @@ public:
                     for (mut pi: i64 = 0; pi < pending_dirs.length; pi++) {
                         method.add_directive(pending_dirs[pi]);
                     }
+                    method.note_modifier_span(member_modifier_span);
                     if (struct_node != null) { struct_node.add_method(method); }
                     if (class_node != null) { class_node.add_method(method); }
                     if (union_node != null) { union_node.add_method(method); }
@@ -1151,6 +1182,7 @@ public:
                     for (mut pi: i64 = 0; pi < pending_dirs.length; pi++) {
                         method.add_directive(pending_dirs[pi]);
                     }
+                    method.note_modifier_span(member_modifier_span);
                     if (struct_node != null) { struct_node.add_method(method); }
                     if (class_node != null) { class_node.add_method(method); }
                     if (union_node != null) { union_node.add_method(method); }
@@ -1175,6 +1207,7 @@ public:
                         for (mut pi: i64 = 0; pi < pending_dirs.length; pi++) {
                             method.add_directive(pending_dirs[pi]);
                         }
+                        method.note_modifier_span(member_modifier_span);
                         if (struct_node != null) { struct_node.add_method(method); }
                         if (class_node != null) { class_node.add_method(method); }
                         if (union_node != null) { union_node.add_method(method); }
@@ -1187,6 +1220,7 @@ public:
                         for (mut pi: i64 = 0; pi < pending_dirs.length; pi++) {
                             field.add_directive(pending_dirs[pi]);
                         }
+                        field.note_modifier_span(member_modifier_span);
                         if (struct_node != null) { struct_node.add_field(field); }
                         if (class_node != null) { class_node.add_field(field); }
                         if (union_node != null) { union_node.add_field(field); }
@@ -2044,17 +2078,25 @@ public:
 
                 mut vis: Visibility = Visibility::Public;
                 mut is_static: boolean = false;
+                // These keywords are consumed before the method node exists,
+                // so they fall outside its `span`; keep their extent for
+                // `outer_span()` (see `DeclarationNode::note_modifier_span`).
+                mut modifier_span: SourceSpan = SourceSpan::none();
 
                 if (this.check(TokenType::KwPublic)) {
                     vis = Visibility::Public;
+                    modifier_span = this.span_from_token(this.current());
                     this.advance();
                 } else if (this.check(TokenType::KwPrivate)) {
                     vis = Visibility::Private;
+                    modifier_span = this.span_from_token(this.current());
                     this.advance();
                 }
 
                 if (this.check(TokenType::KwStatic)) {
                     is_static = true;
+                    modifier_span = SourceSpan::covering(modifier_span,
+                        this.span_from_token(this.current()));
                     this.advance();
                 }
 
@@ -2065,6 +2107,7 @@ public:
                     for (mut pi: i64 = 0; pi < pending_dirs.length; pi++) {
                         method.add_directive(pending_dirs[pi]);
                     }
+                    method.note_modifier_span(modifier_span);
                     node.add_method(method);
                 }
             } else {
