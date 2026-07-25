@@ -914,7 +914,16 @@ type struct AsyncLower {
             for (mut b: i64 = 0; b < sm.blocks.length; b++) {
                 const use_kind: i64 = this.block_first_use(sm.blocks[b], p.name);
                 if (use_kind == 0i64) { continue; }
-                if (use_kind == 1i64) {
+                // Same reasoning as a local: a reassignment nested in a branch
+                // keeps the incoming value on the path the branch skips, so the
+                // state carries it in rather than binding a fresh one. The
+                // constructor always publishes a parameter into its field, so
+                // the take on entry has something to find.
+                mut carried_in: boolean = (use_kind == 1i64);
+                if (!carried_in && this.block_cond_write(sm.blocks[b], p.name)) {
+                    carried_in = true;
+                }
+                if (carried_in) {
                     this.prepend_agg_take(sm.blocks[b], p.name, p.name, lty, opt_ty,
                                           sm.struct_ref, true, span);
                     this.store_before_suspends(sm, sm.blocks[b] as StatementNode*,
@@ -925,7 +934,7 @@ type struct AsyncLower {
                         p.span);
                     sm.ok = false; return;
                 }
-                if (!this.last_use_consumes(sm.blocks[b], p.name)) {
+                if (this.needs_handback(sm.blocks[b], p.name)) {
                     sm.blocks[b].add_statement(
                         this.agg_store_stmt(sm, p.name, opt_ty, p.name, lty, span));
                 }
@@ -1710,6 +1719,23 @@ type struct AsyncLower {
     /// where the value IS carried: the state that passes the socket to an
     /// operation stays silent, and the state that takes it back out of the
     /// result publishes the new one.
+    /// True when the state still has to hand the carried value back to its
+    /// carrier field as it falls off the end.
+    ///
+    /// Two states do not: one that gave the value away (`last_use_consumes`),
+    /// and one whose tail diverges — a block ending in `return` never reaches a
+    /// trailing statement, so a store appended there is dead code. It is not
+    /// harmless dead code either: every synthesized node carries the async
+    /// function's own span, so the dead-code lint reports an unreachable
+    /// statement against the user's `async function`, pointing at source that
+    /// looks perfectly reachable. Suspends are handled separately by
+    /// `store_before_suspends`, which stores BEFORE the `return Poll::Pending`,
+    /// so skipping the trailing store loses nothing on that path.
+    needs_handback(&this, blk: BlockStmtNode*, name: SymbolStr) -> boolean {
+        if (this.last_use_consumes(blk, name)) { return false; }
+        return !this.stmt_diverges(blk as StatementNode*);
+    }
+
     last_use_consumes(&this, blk: BlockStmtNode*, name: SymbolStr) -> boolean {
         mut kind: i64 = 0i64;
         for (mut i: i64 = 0; i < blk.statements.length; i++) {
@@ -1870,6 +1896,19 @@ type struct AsyncLower {
     /// descriptor number, so the drop closes an unrelated file.
     decl_at_first_assignment(mut &this, blk: BlockStmtNode*, name: SymbolStr,
                              lty: TypeRef, span: SourceSpan) -> boolean {
+        const i: i64 = this.top_level_assignment_index(blk, name);
+        if (i < 0i64) { return false; }
+        const b: BinaryExprNode* =
+            ((blk.statements[i] as ExprStmtNode*).expression) as BinaryExprNode*;
+        blk.statements[i] = this.var_decl_stmt(name, true, lty, b.right, span);
+        return true;
+    }
+
+    /// Index of the state's first `<name> = <expr>;` written at the TOP level of
+    /// the state, or -1. Top level is what makes the assignment unconditional:
+    /// it runs on every path through the state, so the state really does produce
+    /// its own value.
+    top_level_assignment_index(&this, blk: BlockStmtNode*, name: SymbolStr) -> i64 {
         for (mut i: i64 = 0; i < blk.statements.length; i++) {
             const s: StatementNode* = blk.statements[i];
             if (s == null || s.kind != NodeKind::ExpressionStatement) { continue; }
@@ -1879,10 +1918,25 @@ type struct AsyncLower {
             if (b.op.kind != TokenType::Equal) { continue; }
             if (b.left == null || (b.left as ASTNode*).kind != NodeKind::Identifier) { continue; }
             if (!(b.left as IdentifierNode*).name.equals(name)) { continue; }
-            blk.statements[i] = this.var_decl_stmt(name, true, lty, b.right, span);
-            return true;
+            return i;
         }
-        return false;
+        return -1i64;
+    }
+
+    /// True when a state's first touch of `name` is a write that is NOT
+    /// guaranteed to run — the assignment sits inside a branch, loop or match
+    /// arm rather than at the top level of the state.
+    ///
+    /// Such a state does not produce its own value: on the path where the write
+    /// is skipped the name still has to hold whatever the previous state left in
+    /// it, so the value is live across the suspend and must be carried exactly
+    /// like a value the state reads. Treating it as a self-produced value
+    /// instead would give the state a binding nobody wrote on that path, and the
+    /// hand-back at the end of the state would publish that garbage into the
+    /// carrier field for the next state to take.
+    block_cond_write(&this, blk: BlockStmtNode*, name: SymbolStr) -> boolean {
+        if (this.block_first_use(blk, name) != this.first_use_write()) { return false; }
+        return this.top_level_assignment_index(blk, name) < 0i64;
     }
 
     /// `this.<field> = Option::Some(<name>);` — hand a promoted aggregate from
@@ -2082,6 +2136,10 @@ type struct AsyncLower {
                 for (mut b: i64 = 0; b < sm.blocks.length; b++) {
                     if (b == ds) { continue; }
                     if (this.block_first_use(sm.blocks[b], nm) == 1i64) { needs_carry = true; }
+                    // A rebuild nested in a branch is not a self-produced value:
+                    // the path that skips the branch keeps the previous one, so
+                    // the value crosses the suspend either way.
+                    if (this.block_cond_write(sm.blocks[b], nm)) { needs_carry = true; }
                 }
 
                 if (!needs_carry) {
@@ -2118,7 +2176,11 @@ type struct AsyncLower {
                 // which case there is nothing of its own left to hand over. No
                 // hand-back before this state's own suspend either: that suspend
                 // is what produces the value, so it runs before it exists.
-                if (!this.last_use_consumes(sm.blocks[ds], nm)) {
+                // Read before the store below is appended: that store hands the
+                // value to `Option::Some` BY VALUE, so asking afterwards would
+                // report every declaring state as having given the value away.
+                const ds_publishes: boolean = this.needs_handback(sm.blocks[ds], nm);
+                if (ds_publishes) {
                     sm.blocks[ds].add_statement(
                         this.agg_store_stmt(sm, afield, opt_ty, nm, lty, span));
                 }
@@ -2132,7 +2194,26 @@ type struct AsyncLower {
                     if (b == ds) { continue; }
                     const use_kind: i64 = this.block_first_use(sm.blocks[b], nm);
                     if (use_kind == 0i64) { continue; }
-                    if (use_kind == 1i64) {
+                    // A conditional rebuild is carried in like a read: the take
+                    // gives the state the previous value, the nested assignment
+                    // replaces it only on the path that runs, and either way the
+                    // one live value is handed back on the way out.
+                    mut carried_in: boolean = (use_kind == 1i64);
+                    if (!carried_in && this.block_cond_write(sm.blocks[b], nm)) {
+                        // The take can only find a value the declaring state
+                        // actually published.  A state that gave the value away
+                        // stored nothing, so there is no previous value for the
+                        // skipped path to keep and the rebuild has to be
+                        // unconditional.
+                        if (!ds_publishes) {
+                            this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
+                                "async: this value is given away before the `await` and then rebuilt from inside a branch, so the branch that is not taken has nothing to keep; assign it once at the top level of that step (`x = …;`)",
+                                vd.span);
+                            sm.ok = false; return;
+                        }
+                        carried_in = true;
+                    }
+                    if (carried_in) {
                         this.prepend_agg_take(sm.blocks[b], nm, afield, lty, opt_ty,
                                               sm.struct_ref, true, span);
                         // Live from the top of this state, so a suspend partway
@@ -2145,7 +2226,7 @@ type struct AsyncLower {
                             vd.span);
                         sm.ok = false; return;
                     }
-                    if (!this.last_use_consumes(sm.blocks[b], nm)) {
+                    if (this.needs_handback(sm.blocks[b], nm)) {
                         sm.blocks[b].add_statement(
                             this.agg_store_stmt(sm, afield, opt_ty, nm, lty, span));
                     }

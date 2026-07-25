@@ -37,14 +37,20 @@ not for routine judgement calls.
 | 1 | Core types in stdlib (`Poll`/`Future`/`Context`/`Waker`) + `block_on` + hand-written futures | ✅ done+validated 2026-07-22 (no repin) |
 | 2 | Compiler: `async fn` parse + state-machine lowering + `await` desugar | ✅ DONE+validated; **the deferred aggregate-across-await tail LANDED 2026-07-24 — an `async function` can now hold an aggregate across a suspend, take a droppable aggregate parameter, and be `spawn`ed on an `Executor`** (see the newest §9 entry). Earlier: DONE (2026-07-23) — parse + no-await (1b) + single await (2) + N straight-line (3) + awaits across `if`/`else` (4a) + awaits across `while`/`for`/`loop`/`do-while` + `break`/`continue` + `mut` loop-carried promotion (4b) + scope-aware alpha-rename, all committed through `5e28a74f`. **Inc 4c DONE (2026-07-23): `await` inside a `match` arm — dispatch `match(subj)` → per-arm entry states → join; scalar pattern bindings captured to fields (aggregate→E0600, ref→E0455); pattern bindings alpha-renamed for by-name soundness; non-exhaustive match gets synth `_ => join`. Plus the bare-block-with-await warm-up. Both-OS fixed point, `win-s2`/`win-s3` = 0/235 `.ll` → NO REPIN, UNCOMMITTED.** All common control flow now lowers → Phase 2 complete. |
 | 3 | Executor + `Waker` + `spawn`/`JoinHandle`; multi-thread; poll-boundary `catch_unwind` isolation | ✅ DONE+validated (2026-07-24) — surface LOCKED 2026-07-23. **(a)** single-thread executor + ready-queue + re-enqueueing Waker; **(b)** `spawn`/`JoinHandle` (Output via `TaskShared<O>`), `block_on`, `join`/`detach`/`abort`, drop=detach; **(c)** pthread worker pool + per-task atomic run-state (IDLE/SCHEDULED/RUNNING/NOTIFIED) + condvar `join`/`block_on` + `catch_unwind` poll-boundary isolation. Needed a NEW compiler `![config(panic_unwind)]` gating atom (see §9) → Phase-1 both-OS REPIN (selfhost fixed point, 235 `.ll`). Executor is self-contained (own pthread wrappers, no `thread::Scope` dep). Validated on Linux: regression 30/30, isolation 30/30. UNCOMMITTED. |
-| 4 | Reactor (epoll/IOCP) + async I/O over `std::net` + timers + `async fn main` + combinators | ◐ in progress 2026-07-24. **Inc 4b DONE on Linux (reactor + async TCP, stress+leak clean); Windows AFD backend written but UNVALIDATED (wine 9.0 cannot service `IOCTL_AFD_POLL` — needs a real Windows box).** Interface fork LOCKED by Jake: **one readiness interface both OSes, Windows via real AFD** (not WSAPoll, not a per-OS split). Sockets are to become **async-only with every consumer ported** (Jake, 2026-07-24) — that port is BLOCKED on the E0600 aggregate-across-await compiler increment. Forks LOCKED earlier: waker lifetime = **separate `Arc`-wrapper**; reactor = **dedicated thread, per-`Executor`** (`![thread_local]` current-reactor handle); platform = **both OSes (epoll + IOCP)**. **Inc 4a DONE+validated (2026-07-24): Arc-refcounted `Waker` (Copy→non-Copy) + `Arc<Task>` lifetime; finish-vs-park now implicit via `Task::drop` on the last decref. Needed a COMPILER fix (owner-generic static with a defaulted owner param + nested return → E0636; `call_resolver.cryo` default-backfill) → selfhost fixed point BOTH OS, win-s2 vs win-s3 = 0/235 `.ll`, REPINNED both OS. UNCOMMITTED.** NEXT = Inc 4b (the reactor: epoll+IOCP interface — bring Jake the readiness-vs-completion unification fork). |
+| 4 | Reactor (epoll/IOCP) + async I/O over `std::net` + timers + `async fn main` + combinators | ◐ in progress 2026-07-24. **Inc 4b DONE on Linux (reactor + async TCP, stress+leak clean); Windows AFD backend written but UNVALIDATED (wine 9.0 cannot service `IOCTL_AFD_POLL` — needs a real Windows box).** Interface fork LOCKED by Jake: **one readiness interface both OSes, Windows via real AFD** (not WSAPoll, not a per-OS split). Sockets are to become **async-only with every consumer ported** (Jake, 2026-07-24) — that port is **UNBLOCKED as of 2026-07-24**: the aggregate-across-await tail landed, and the follow-on "rebuilt from inside a branch" E0600 is now removed too (newest §9 entry). Forks LOCKED earlier: waker lifetime = **separate `Arc`-wrapper**; reactor = **dedicated thread, per-`Executor`** (`![thread_local]` current-reactor handle); platform = **both OSes (epoll + IOCP)**. **Inc 4a DONE+validated (2026-07-24): Arc-refcounted `Waker` (Copy→non-Copy) + `Arc<Task>` lifetime; finish-vs-park now implicit via `Task::drop` on the last decref. Needed a COMPILER fix (owner-generic static with a defaulted owner param + nested return → E0636; `call_resolver.cryo` default-backfill) → selfhost fixed point BOTH OS, win-s2 vs win-s3 = 0/235 `.ll`, REPINNED both OS. UNCOMMITTED.** NEXT = Inc 4b (the reactor: epoll+IOCP interface — bring Jake the readiness-vs-completion unification fork). |
 
 Legend: ☐ not started · ◐ in progress · ✅ done+validated · ⏸ blocked (note why in the Progress Log).
 
-**Current HEAD baseline:** `8e5a7694` (Phase 3 stage (c) — multi-thread executor + `catch_unwind` isolation +
-the `panic_unwind` config atom — committed + repinned by Jake). Branch `ll-impl`. Pin verifies OK, tree clean
-(only `HANDOFF.md` touched). `make stdlib` = 148 modules green. Phases 0–3 done + committed. NOTE: the §9
-stage-(c) entry's "UNCOMMITTED" is stale — that work is committed in `8e5a7694`.
+**Current HEAD baseline:** `4927f327` (the Phase-2 aggregate-across-await tail — committed + repinned by
+Jake). Branch `ll-impl`. `make stdlib` = 149 modules green. Phases 0–3 done + committed.
+
+**UNCOMMITTED on top of that (2026-07-24, see the newest §9 entry):** two root-cause compiler fixes —
+`drop_insertion` no longer runs destructors on uninitialized memory (a field READ or method call on an
+initializer-less droppable local was silently disqualifying its init-flag guard), and the async
+"rebuilt from inside a branch" **E0600 is removed** (a branch-nested write is now carried like a read
+rather than treated as a self-produced value). Also fixed a dead hand-back store that made every
+aggregate-carrying `async fn` emit a spurious `W0009` against the user's own source. `make test` OVERALL
+PASS, both selfhost fixed points, REPINNED both OS. **The async-only socket port is now unblocked.**
 
 **✅ FIXED (2026-07-23) — `block_on` (and every where-bound-only-param generic) now infers without a
 turbofish.** Was: `block_on(fut)` — and any `f<F, R>(fut: F) -> R where F: Future<R>` — failed **codegen
@@ -1541,3 +1547,112 @@ IR should be unchanged — verify the `win-s2` vs `win-s3` `.ll` diff at each bo
   then delete the blocking socket surface. Known limitation to work around while porting: a value rebuilt
   after an `await` must be assigned at the top level of that step, not inside a branch (clear E0600).
   `net::tls` still needs its own design pass (OpenSSL blocking BIO → non-blocking + `WANT_READ`/`WANT_WRITE`).
+
+- _2026-07-24_ — **Two compiler bugs fixed at the root: the `drop_insertion` init-flag disqualifier, and the
+  async conditional-rebuild restriction (E0600 removed). REPINNED both OS. UNCOMMITTED.**
+  Baseline HEAD `4927f327`. Files: `passes/drop_insertion.cryo`, `sema/async_lower.cryo`, plus two test
+  files. `make test` OVERALL PASS, both selfhost fixed points green, valgrind clean.
+
+  **(1) `drop_insertion` ran destructors on uninitialized memory** — ordinary hand-written Cryo, nothing to
+  do with async. A droppable local declared without an initializer lost its init-flag guard whenever a
+  field of it was **read** (`r.id`) or a method called on it (`r.method()`), so its scope-exit drop was
+  emitted UNGUARDED and fired on `return` paths that never assigned it. For a socket type that is `close()`
+  on a garbage descriptor — it surfaced as `close(0)`, closing stdin, which the kernel then handed back out
+  as the next socket.
+  - **Root cause:** `disq_scan_expr`'s `MemberAccess`/`ArrayAccess` arms disqualified a local from
+    init-flag tracking on ANY access, reads included. The guard machinery itself was fine.
+  - **Fix:** `disq_scan_expr` is now the READ context and disqualifies nothing on its own; a new
+    `disq_scan_place(expr, escaping)` is entered ONLY from an assignment's LHS (`TokenType::Equal`) and
+    from `&`'s operand. It disqualifies the base local of a field/element chain, and at a bare identifier
+    only when the address escapes — so `r = …`, the whole-binding write the flag exists to observe, never
+    disqualifies itself. Exactly two shapes disqualify: a plain `=` to a sub-place and an address-of.
+  - **LANDMINE — compound assigns must NOT be treated as writes** (the pre-fix plan said to; it is wrong).
+    `r.f += v` and `r.f++` read the target first, so they cannot be the initializing write — the same
+    reasoning `init_flag_for_assignment_target` already applies on the positive side. Routing them to the
+    place-scan would re-introduce the unguarded drop for every local whose field is incremented after a
+    normal assignment. Cryo keeps `PlusEqual`/`PlusPlus` as distinct token kinds through to codegen (no
+    desugar to `Equal`), so only `Equal` reaches the place-scan.
+  - **Inert for existing code:** `win-s2` vs `win-s3` = **0/235** compiler `.ll` and **0/149** stdlib `.ll`
+    on BOTH OS — nothing in the repo tripped the path. Repinned anyway (the pinned compiler is what user
+    code is built with, and it still carried the bug).
+  - **KNOWN RESIDUAL, deliberately left:** piecemeal init (`mut r: Res; if (early) { return; } r.f = 5;`)
+    still disqualifies → unguarded drop → destructor on uninit memory on the early path. Not disqualifying
+    would leak instead. A real fix needs **per-field init tracking**, not a per-binding flag. The new test
+    asserts the leak-prevention property (a piecemeal-initialized value still drops exactly once) rather
+    than enshrining the uninit-drop count, so tightening this later will not fight the test.
+
+  **(2) The async "rebuilt from inside a branch" E0600 is gone** — and NOT for the reason the plan predicted.
+  - **The prediction was wrong.** Fixing (1) does not make "declare the name empty at the top of the state"
+    sound. The blocker was never the drop — it is the **carrier store**: a state that declares the value
+    empty and writes it only inside a branch runs `this.__agg_x = Option::Some(x);` at block exit on the
+    path that skipped the branch, publishing uninitialized memory into the field for the NEXT state to
+    take. No drop guard touches that.
+  - **Actual root cause = a misclassification.** `block_first_use` reported "write" for a write nested in an
+    `if`/loop/`match` arm, i.e. "this state produces its own value, no carry needed". False: on the path
+    that skips the branch the name must still hold what the previous state left, so the value IS live
+    across the suspend. Fix = `block_cond_write(blk, name)` (first use is a write AND
+    `top_level_assignment_index(blk, name) < 0`); such a state is routed through the existing carry path
+    (`prepend_agg_take` + `store_before_suspends`) exactly like a reader. Far lighter than the
+    field-resident-projection fallback. Applied to locals AND by-value parameters (same gap in both).
+  - **LANDMINE — ordering:** `last_use_consumes(blocks[ds])` must be read BEFORE the hand-back store is
+    appended to that block; the store passes the value to `Option::Some` BY VALUE, so asking afterwards
+    reports every declaring state as having given the value away.
+  - Locals keep a guard (declaring state gave the value away → nothing for the skipped path to keep → stays
+    E0600, rather than a runtime `unwrap()` on an empty carrier). Parameters do not need it: the
+    constructor always publishes a parameter into its field.
+
+  **(3) A dead hand-back store made every aggregate-carrying `async fn` emit `W0009`.** The store was
+  appended AFTER a state block's `return` — genuinely dead code that never ran; and because every
+  synthesized node carries the async function's own span, the dead-code lint reported an unreachable
+  statement against the **user's** `async function`, pointing at source that looks perfectly reachable.
+  Fix = `needs_handback(blk, name)` = `!last_use_consumes && !stmt_diverges(blk)`, used at all three append
+  sites. Behaviour-identical (the store never executed) and the emitted IR is strictly smaller. **A warning
+  on generated code is a bug report about the generator, not noise to filter.**
+
+  **Validated:** 13 async shapes — `if` taken/skipped, `if/else` both arms, `while` 0/2 iterations, `match`
+  arm with/without rebuild, top-level (owned-handle) rebuild unchanged, a suspend BETWEEN the carry-in and
+  the rebuild, and a droppable `mut` parameter taken/skipped — all with exact drop counts, valgrind 0
+  errors / 0 leaks, zero warnings. Plus an 11-case drop matrix for (1).
+  **New permanent tests:** `tests/tests/lang/async_carry_across_await.cryo` (13 tests — **the suite had NO
+  async tests at all before this**) and +6 in `tests/tests/lang/conditional_init_drop.cryo`.
+  Gotcha: a by-value parameter needs `mut v: T` to be reassignable (plain `v: T` → E0218).
+
+  NEXT: the async-only socket port (§5 TASK 3) — `net::http`, `net::http2`, `net::ws`, `net::https` + the 4
+  net tests, then delete the blocking surface. `net::tls` still needs its own design pass first (OpenSSL
+  blocking BIO → non-blocking + `WANT_READ`/`WANT_WRITE`). Windows AFD reactor still UNVALIDATED (needs a
+  real Windows box; wine 9.0 cannot service `IOCTL_AFD_POLL`).
+
+- _2026-07-25_ — **OPEN BLOCKER found while validating the above: `MatchExpression` is invisible to the
+  async lowering's walkers.** Not caused by the fixes above (`rewrite_returns` and the use-analysis walkers
+  are untouched by that diff) — a pre-existing gap, but it sits **directly on the critical path for the
+  async-only socket port**, because every async socket op returns a `Result` and the idiomatic Cryo unwrap
+  is a match EXPRESSION.
+  - **Evidence.** `MatchExpression` appears **once** in `sema/async_lower.cryo` (only in the alpha-renamer
+    `rn_expr`); `MatchStatement` appears 11 times. The identical function body compiles clean when not
+    `async`.
+  - **Two distinct failures from the one gap**, both on
+    `const v = match (r) { Result::Ok(x) => { x } Result::Err(_) => { return …; } };` inside an
+    `async function`:
+    1. **E0201 "cannot find value `r`"** — the use-analysis (`stmt_first_use`/`expr_first_use`,
+       `name_read_in_*`) never descends into a `MatchExpression`, so a parameter/local read ONLY as a match
+       subject is not seen as used by that state and is never carried across the suspend.
+    2. **E0200 "expected `Poll<i64>`, found `i32`"** — `rewrite_returns` walks statements only (it has no
+       `DeclarationStatement` arm at all and handles only `MatchStatement`), so a `return` inside a
+       match-expression arm is never rewritten to `Poll::Ready(…)`. The diagnostic also **leaks the
+       internal `Poll<T>` type** to a user who wrote `-> i64`.
+  - **Fix shape:** audit every walker in `async_lower.cryo` for `MatchExpression` alongside its
+    `MatchStatement` arm — `rewrite_returns` (plus the missing `DeclarationStatement`/`ExpressionStatement`
+    expression descent), `stmt_first_use`/`expr_first_use`, `name_read_in_stmt`/`name_read_in_expr`,
+    `mark_last_use_stmt`/`mark_last_use_expr`, `subst_name_*`, `stmt_await_count`, `stmt_diverges`. Treat an
+    `await` inside a match-expression arm as its own increment (it is a nested-in-expression await, which is
+    a separate documented E0600).
+  - **Workaround until fixed** (used by the validation probe): write the unwrap as a match STATEMENT that
+    assigns a pre-declared local — `mut s: T = <placeholder>; match (r) { Ok(v) => { s = v; } … }`.
+  - Also confirmed still-documented behaviour, hit while writing the probe: an `await` nested in an
+    expression (e.g. a match SUBJECT, `match (await f())`) is E0600 — hoist it to its own statement. The
+    diagnostic is preceded by ~7 lines of `codegen failed for module N` noise before the real E0600.
+
+  **Real-socket end-to-end validation of the fixes above (Linux):** async echo server + client over
+  loopback on a 2-thread `Executor` — `TcpAccept`/`TcpRead`/`TcpWrite`/`TcpConnect`, owned-handle style,
+  with a droppable value conditionally rebuilt from inside a branch carried across the same suspends.
+  **30/30 runs pass**, exact drop count, valgrind clean (15 allocs / 15 frees, 0 errors).

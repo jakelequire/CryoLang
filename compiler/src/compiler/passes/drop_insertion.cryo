@@ -2548,11 +2548,26 @@ type struct DropInserter {
         this.init_disq.push(name.id);
     }
 
-    /// Flow-insensitive scan of a function body: record every local name that
-    /// is element-assigned, field-assigned/read, or address-taken, so it is
-    /// excluded from init-flag tracking (its initialization can't be observed
-    /// through whole-binding assignment alone).  Reads/moves of a bare
-    /// identifier are fine - those don't initialize storage in place.
+    /// Flow-insensitive scan of a function body: record every local name whose
+    /// storage can be initialized WITHOUT a whole-binding assignment, so it is
+    /// excluded from init-flag tracking (a whole-binding flag can't observe
+    /// such an initialization, and a flag stuck at false would leak the value).
+    /// Exactly two shapes qualify: a plain `=` write to a sub-place of the
+    /// local (`r.f = v`, `r[i] = v`), and an address-of that hands the storage
+    /// out for a callee to fill (`&r`, `&r.f`).
+    ///
+    /// Reads never qualify, and admitting them is not merely imprecise - it is
+    /// unsound in the dangerous direction.  A disqualified local's scope-exit
+    /// drop is emitted UNGUARDED, so a `return` taken before the local is ever
+    /// assigned runs its destructor over uninitialized stack memory (for a
+    /// socket-like type, `close()` on a garbage descriptor).  `r.f`, `r[i]`
+    /// and `r.method()` initialize nothing and must leave the guard intact.
+    ///
+    /// Compound assignments (`r.f += v`) and `++`/`--` read the target before
+    /// writing it, so they can't be the initializing write either - the same
+    /// reasoning `init_flag_for_assignment_target` applies on the positive
+    /// side.  Treating them as writes would re-introduce the unguarded drop
+    /// for every local whose field is incremented after a normal assignment.
     collect_init_disqualifiers(mut &this, stmt: StatementNode*) -> void {
         if (stmt == null) { return; }
         match (stmt.kind) {
@@ -2649,43 +2664,39 @@ type struct DropInserter {
         }
     }
 
-    /// Recursive expression scan feeding `collect_init_disqualifiers`.  Marks a
-    /// name disqualified when it is the base of a member/array access or the
-    /// operand of an address-of; otherwise recurses into sub-expressions.
+    /// Recursive expression scan feeding `collect_init_disqualifiers`, in READ
+    /// context: nothing here disqualifies on its own.  The two disqualifying
+    /// contexts are entered explicitly - an assignment's left-hand side and an
+    /// address-of's operand both hand off to `disq_scan_place`.
     disq_scan_expr(mut &this, expr: ExpressionNode*) -> void {
         if (expr == null) { return; }
         match (expr.kind) {
             NodeKind::Identifier => { }
             NodeKind::MemberAccess => {
-                const ma: MemberAccessNode* = expr as MemberAccessNode*;
-                if (ma.object != null) {
-                    if (ma.object.kind == NodeKind::Identifier) {
-                        this.disqualify_init((ma.object as IdentifierNode*).name);
-                    }
-                    this.disq_scan_expr(ma.object);
-                }
+                this.disq_scan_expr((expr as MemberAccessNode*).object);
             }
             NodeKind::ArrayAccess => {
                 const aa: ArrayAccessNode* = expr as ArrayAccessNode*;
-                if (aa.array != null) {
-                    if (aa.array.kind == NodeKind::Identifier) {
-                        this.disqualify_init((aa.array as IdentifierNode*).name);
-                    }
-                    this.disq_scan_expr(aa.array);
-                }
+                this.disq_scan_expr(aa.array);
                 this.disq_scan_expr(aa.index);
             }
             NodeKind::UnaryExpression => {
                 const ue: UnaryExprNode* = expr as UnaryExprNode*;
-                if (ue.op.kind == TokenType::Amp && ue.operand != null &&
-                    ue.operand.kind == NodeKind::Identifier) {
-                    this.disqualify_init((ue.operand as IdentifierNode*).name);
+                if (ue.op.kind == TokenType::Amp) {
+                    // `&r` / `&r.f`: the callee can initialize through the
+                    // pointer, which no whole-binding flag can observe.
+                    this.disq_scan_place(ue.operand, true);
+                } else {
+                    this.disq_scan_expr(ue.operand);
                 }
-                this.disq_scan_expr(ue.operand);
             }
             NodeKind::BinaryExpression => {
                 const b: BinaryExprNode* = expr as BinaryExprNode*;
-                this.disq_scan_expr(b.left);
+                if (b.op.kind == TokenType::Equal) {
+                    this.disq_scan_place(b.left, false);
+                } else {
+                    this.disq_scan_expr(b.left);
+                }
                 this.disq_scan_expr(b.right);
             }
             NodeKind::CastExpression => {
@@ -2716,6 +2727,55 @@ type struct DropInserter {
                 // that a conservative miss is a leak-at-worst, never a
                 // use-after-free.  Whole-binding reads are intentionally NOT
                 // disqualifying.
+            }
+        }
+    }
+
+    /// Scan `expr` as a place being written or having its address taken, and
+    /// disqualify the local at the base of the place chain when that base is
+    /// initialized without a whole-binding assignment.
+    ///
+    /// `escaping` distinguishes the two entry points at the BARE-IDENTIFIER
+    /// leaf, which is the only spot where they differ: `&r` hands out the
+    /// storage (disqualify), while `r = ...` IS the whole-binding write the
+    /// init flag exists to observe (do not disqualify, or every tracked local
+    /// would disqualify itself).  Once the chain goes through a field or an
+    /// element, both contexts disqualify - the flag can observe neither
+    /// `r.f = v` nor `&r.f`.
+    disq_scan_place(mut &this, expr: ExpressionNode*, escaping: boolean) -> void {
+        if (expr == null) { return; }
+        match (expr.kind) {
+            NodeKind::Identifier => {
+                if (escaping) {
+                    this.disqualify_init((expr as IdentifierNode*).name);
+                }
+            }
+            NodeKind::MemberAccess => {
+                const ma: MemberAccessNode* = expr as MemberAccessNode*;
+                if (ma.object != null) {
+                    if (ma.object.kind == NodeKind::Identifier) {
+                        this.disqualify_init((ma.object as IdentifierNode*).name);
+                    } else {
+                        this.disq_scan_place(ma.object, escaping);
+                    }
+                }
+            }
+            NodeKind::ArrayAccess => {
+                const aa: ArrayAccessNode* = expr as ArrayAccessNode*;
+                if (aa.array != null) {
+                    if (aa.array.kind == NodeKind::Identifier) {
+                        this.disqualify_init((aa.array as IdentifierNode*).name);
+                    } else {
+                        this.disq_scan_place(aa.array, escaping);
+                    }
+                }
+                this.disq_scan_expr(aa.index);
+            }
+            _ => {
+                // Not a place rooted in a local (`*p = v`, `f().x = v`, ...):
+                // nothing of the local's own storage is being initialized, so
+                // fall back to the read scan to catch nested `&`/assignments.
+                this.disq_scan_expr(expr);
             }
         }
     }
