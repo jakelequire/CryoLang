@@ -184,3 +184,133 @@ function param_branch_rebuild_skipped_keeps_argument() -> Result<(), TestError> 
     ac_drops = 0;
     return ac_check(future::block_on(param_rebuilt_in_if(Tag { id: 1 }, false)), 31 as u32);
 }
+
+// A `match` used as an EXPRESSION holds statement bodies, so every walker that
+// descends into a `match` statement has to descend into it equally.  Two
+// distinct failures follow from missing it: a value read only as the match
+// SUBJECT is not seen as used by its state and so is never carried across the
+// suspend, and a `return` inside an arm is never rewritten to `Poll::Ready`,
+// which surfaces as a type error naming the internal `Poll` type against a
+// function the user wrote as `-> i64`.  Each case below compiles clean and
+// yields the same answer as the identical non-async body.
+
+// The subject is a carried parameter, and one arm returns.
+async function me_subject_and_return(r: Result<i64, i64>) -> i64 {
+    const a = await PendingThenReady<i64>::new(1, 7);
+    const v: i64 = match (r) {
+        Result::Ok(x)  => { x }
+        Result::Err(_) => { return -1; }
+    };
+    return v + a;
+}
+
+// The whole `match` sits in return position, with an arm that returns.
+async function me_in_return_position(r: Result<i64, i64>) -> i64 {
+    const a = await PendingThenReady<i64>::new(1, 7);
+    return match (r) {
+        Result::Ok(x)  => { x + a }
+        Result::Err(_) => { return -1; }
+    };
+}
+
+// A carried local whose ONLY reader is an arm GUARD, which is what makes this
+// case prove the guard is walked.  The name is `_`-prefixed because a read from
+// a match-arm guard is missing from the resolution map the unused-local lint is
+// built from, so any other spelling draws a bogus W0001; that gap is not async's
+// and applies to a `match` statement guard identically.
+async function me_guard_reads_carried(n: i64) -> i64 {
+    const _g: i64 = n * 3;
+    const a = await PendingThenReady<i64>::new(1, 7);
+    const v: i64 = match (n) {
+        1 if (_g > 2) => { 10 }
+        _             => { 20 }
+    };
+    return v + a;
+}
+
+// An arm writes the carried value.  The write is branch-nested, so the arm that
+// skips it must still see what the previous state left.
+async function me_arm_rebuilds(c: u32) -> u32 {
+    mut v = Tag { id: 1 };
+    const a = await PendingThenReady<u32>::new(1, 10);
+    const k: u32 = match (c) {
+        0 => { 0 }
+        _ => { v = Tag { id: 9 }; 1 }
+    };
+    const b = await PendingThenReady<u32>::new(1, 20);
+    return v.id + a + b + k;
+}
+
+// A match expression nested inside a match STATEMENT arm, both reading the
+// carried parameter, with an inner arm that returns.
+async function me_nested_in_match_stmt(r: Result<i64, i64>, sel: i64) -> i64 {
+    const a = await PendingThenReady<i64>::new(1, 7);
+    mut out: i64 = 0;
+    match (sel) {
+        0 => {
+            out = match (r) {
+                Result::Ok(x)  => { x }
+                Result::Err(_) => { return -1; }
+            };
+        }
+        _ => { out = 99; }
+    }
+    return out + a;
+}
+
+![test]
+function match_expr_subject_is_carried_across_await() -> Result<(), TestError> {
+    return expect_eq(future::block_on(me_subject_and_return(Result::Ok(5))), 12 as i64);
+}
+
+![test]
+function match_expr_arm_return_yields_poll_ready() -> Result<(), TestError> {
+    return expect_eq(future::block_on(me_subject_and_return(Result::Err(0))), -1 as i64);
+}
+
+![test]
+function match_expr_in_return_position_ok_arm() -> Result<(), TestError> {
+    return expect_eq(future::block_on(me_in_return_position(Result::Ok(5))), 12 as i64);
+}
+
+![test]
+function match_expr_in_return_position_returning_arm() -> Result<(), TestError> {
+    return expect_eq(future::block_on(me_in_return_position(Result::Err(0))), -1 as i64);
+}
+
+![test]
+function match_expr_guard_reads_carried_local() -> Result<(), TestError> {
+    return expect_eq(future::block_on(me_guard_reads_carried(1)), 17 as i64);
+}
+
+![test]
+function match_expr_guard_false_falls_to_wildcard() -> Result<(), TestError> {
+    return expect_eq(future::block_on(me_guard_reads_carried(2)), 27 as i64);
+}
+
+![test]
+function match_expr_arm_rebuild_taken_uses_new_value() -> Result<(), TestError> {
+    ac_drops = 0;
+    return ac_check(future::block_on(me_arm_rebuilds(1)), 40 as u32);
+}
+
+![test]
+function match_expr_arm_rebuild_skipped_keeps_previous() -> Result<(), TestError> {
+    ac_drops = 0;
+    return ac_check(future::block_on(me_arm_rebuilds(0)), 31 as u32);
+}
+
+![test]
+function match_expr_nested_in_match_statement_arm() -> Result<(), TestError> {
+    return expect_eq(future::block_on(me_nested_in_match_stmt(Result::Ok(5), 0)), 12 as i64);
+}
+
+![test]
+function match_expr_nested_return_escapes_both_matches() -> Result<(), TestError> {
+    return expect_eq(future::block_on(me_nested_in_match_stmt(Result::Err(0), 0)), -1 as i64);
+}
+
+![test]
+function match_expr_nested_unselected_arm() -> Result<(), TestError> {
+    return expect_eq(future::block_on(me_nested_in_match_stmt(Result::Ok(5), 1)), 106 as i64);
+}
