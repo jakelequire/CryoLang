@@ -1,0 +1,599 @@
+// State-machine lowering: where an `await` may appear.
+//
+// The lowering explodes a body into states around suspends, and a state
+// boundary can only fall between STATEMENTS.  An `await` nested inside an
+// expression is therefore reduced first, into a temporary bound immediately
+// before the statement that used it, so the state machine only ever meets
+// `const x = await e;`, `return await e;` or `await e;`.
+//
+// Two properties of that reduction are load-bearing and are what most of these
+// cases assert, because getting either wrong is silent rather than a build
+// failure:
+//
+//   * ORDER.  Lifting `await f()` out of `h() + await f()` moves the suspend
+//     above `h()`.  Anything to the left of a lifted `await` that could have an
+//     effect is lifted with it, so effects keep their source order.
+//
+//   * CONDITIONALITY.  `&&`, `||` and `?:` evaluate their right side only for
+//     some values of their left, and a `match` arm runs only when its pattern
+//     matched.  Lifting a suspend out of one of those would run it
+//     unconditionally, so they become branches instead of temporaries.
+//
+// A loop's condition and update are re-evaluated every iteration and `continue`
+// re-enters them, so they are lowered inside the states they belong to rather
+// than lifted out ahead of the loop; the `continue` cases below are what pins
+// that down.
+![config(testing)]
+namespace CryoTests::Tests::Lang::AsyncAwaitShapes;
+
+import std::test;
+import std::core::result;
+import std::future;
+
+// An ordered trace of side effects: each effect appends its own digit, so the
+// accumulated number IS the order the effects ran in.  A test that only checked
+// the final value would pass whether or not the suspend moved.
+mut aw_trace: i64 = 0;
+
+function aw_mark(d: i64) -> i64 {
+    aw_trace = aw_trace * 10 + d;
+    return d;
+}
+
+function aw_reset() -> void {
+    aw_trace = 0;
+}
+
+function aw_both(a: Result<(), TestError>, b: Result<(), TestError>) -> Result<(), TestError> {
+    match (a) {
+        Result::Ok(_)  => {}
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return b;
+}
+
+// Every await below suspends at least once, so each case crosses a real state
+// boundary rather than completing inside one poll.
+async function aw_one(v: i64) -> i64 {
+    return await PendingThenReady<i64>::new(1, v);
+}
+
+async function aw_mark_async(d: i64) -> i64 {
+    return await PendingThenReady<i64>::new(1, aw_mark(d));
+}
+
+async function aw_true() -> boolean {
+    return await PendingThenReady<boolean>::new(1, true);
+}
+
+async function aw_lt(n: i64, limit: i64) -> boolean {
+    return await PendingThenReady<boolean>::new(1, n < limit);
+}
+
+async function aw_false() -> boolean {
+    return await PendingThenReady<boolean>::new(1, false);
+}
+
+// ---- an `await` that is not the whole right-hand side ----
+
+async function assign_from_await() -> i64 {
+    mut acc: i64 = 0;
+    acc = await aw_one(41);
+    return acc;
+}
+
+![test]
+function await_as_an_assignment_right_hand_side() -> Result<(), TestError> {
+    return expect_eq(future::block_on(assign_from_await()), 41 as i64);
+}
+
+async function compound_expression() -> i64 {
+    mut acc: i64 = 5;
+    acc = acc + await aw_one(37);
+    return acc;
+}
+
+![test]
+function await_nested_in_an_assigned_expression() -> Result<(), TestError> {
+    return expect_eq(future::block_on(compound_expression()), 42 as i64);
+}
+
+async function returned_expression() -> i64 {
+    return 40 + await aw_one(2);
+}
+
+![test]
+function await_nested_in_a_returned_expression() -> Result<(), TestError> {
+    return expect_eq(future::block_on(returned_expression()), 42 as i64);
+}
+
+async function initializer_expression() -> i64 {
+    const x: i64 = 40 + await aw_one(2);
+    return x;
+}
+
+![test]
+function await_nested_in_an_initializer() -> Result<(), TestError> {
+    return expect_eq(future::block_on(initializer_expression()), 42 as i64);
+}
+
+async function two_awaits_one_expression() -> i64 {
+    const x: i64 = await aw_one(20) + await aw_one(22);
+    return x;
+}
+
+![test]
+function two_awaits_in_one_expression() -> Result<(), TestError> {
+    return expect_eq(future::block_on(two_awaits_one_expression()), 42 as i64);
+}
+
+function aw_double(n: i64) -> i64 {
+    return n * 2;
+}
+
+async function await_as_argument() -> i64 {
+    const x: i64 = aw_double(await aw_one(21));
+    return x;
+}
+
+![test]
+function await_as_a_call_argument() -> Result<(), TestError> {
+    return expect_eq(future::block_on(await_as_argument()), 42 as i64);
+}
+
+async function nested_await_operand() -> i64 {
+    const x: i64 = await aw_one(await aw_one(42));
+    return x;
+}
+
+![test]
+function await_inside_an_awaited_operand() -> Result<(), TestError> {
+    return expect_eq(future::block_on(nested_await_operand()), 42 as i64);
+}
+
+type struct AwPair {
+    a: i64;
+    b: i64;
+}
+
+async function struct_literal_field() -> i64 {
+    const p: AwPair = AwPair { a: 40, b: await aw_one(2) };
+    return p.a + p.b;
+}
+
+![test]
+function await_in_a_struct_literal_field() -> Result<(), TestError> {
+    return expect_eq(future::block_on(struct_literal_field()), 42 as i64);
+}
+
+async function member_assignment() -> i64 {
+    mut p: AwPair = AwPair { a: 0, b: 2 };
+    p.a = await aw_one(40);
+    return p.a + p.b;
+}
+
+![test]
+function await_assigned_into_a_field() -> Result<(), TestError> {
+    return expect_eq(future::block_on(member_assignment()), 42 as i64);
+}
+
+// ---- order: an effect left of a lifted `await` stays left of it ----
+
+async function order_call_then_await() -> i64 {
+    const x: i64 = aw_mark(1) + await aw_mark_async(2);
+    return x;
+}
+
+![test]
+function an_effect_left_of_an_await_runs_first() -> Result<(), TestError> {
+    aw_reset();
+    const v: i64 = future::block_on(order_call_then_await());
+    return aw_both(expect_eq(v, 3 as i64), expect_eq(aw_trace, 12 as i64));
+}
+
+async function order_three_arguments() -> i64 {
+    return aw_mark(1) + await aw_mark_async(2) + aw_mark(3);
+}
+
+![test]
+function effects_around_an_await_keep_source_order() -> Result<(), TestError> {
+    aw_reset();
+    const v: i64 = future::block_on(order_three_arguments());
+    return aw_both(expect_eq(v, 6 as i64), expect_eq(aw_trace, 123 as i64));
+}
+
+// ---- conditionality: `&&` / `||` ----
+
+async function and_short_circuits(c: boolean) -> i64 {
+    if (c && await aw_true()) { return 1; }
+    return 0;
+}
+
+![test]
+function and_does_not_await_when_the_left_is_false() -> Result<(), TestError> {
+    return aw_both(expect_eq(future::block_on(and_short_circuits(false)), 0 as i64),
+                   expect_eq(future::block_on(and_short_circuits(true)), 1 as i64));
+}
+
+async function and_right_decides() -> i64 {
+    if (true && await aw_false()) { return 1; }
+    return 7;
+}
+
+![test]
+function and_uses_the_awaited_right_hand_side() -> Result<(), TestError> {
+    return expect_eq(future::block_on(and_right_decides()), 7 as i64);
+}
+
+async function or_short_circuits(c: boolean) -> i64 {
+    if (c || await aw_false()) { return 1; }
+    return 0;
+}
+
+![test]
+function or_does_not_await_when_the_left_is_true() -> Result<(), TestError> {
+    return aw_both(expect_eq(future::block_on(or_short_circuits(true)), 1 as i64),
+                   expect_eq(future::block_on(or_short_circuits(false)), 0 as i64));
+}
+
+async function or_traces(c: boolean) -> i64 {
+    if (c || await aw_mark_async(9) > 0) { return 1; }
+    return 0;
+}
+
+![test]
+function a_short_circuited_await_leaves_no_trace() -> Result<(), TestError> {
+    aw_reset();
+    const taken: i64 = future::block_on(or_traces(true));
+    const skipped: i64 = aw_trace;
+    aw_reset();
+    const run: i64 = future::block_on(or_traces(false));
+    return aw_both(aw_both(expect_eq(taken, 1 as i64), expect_eq(skipped, 0 as i64)),
+                   aw_both(expect_eq(run, 1 as i64), expect_eq(aw_trace, 9 as i64)));
+}
+
+// ---- conditionality: `?:` ----
+
+async function ternary_arm(c: boolean) -> i64 {
+    const x: i64 = c ? await aw_mark_async(1) : 7;
+    return x;
+}
+
+![test]
+function ternary_awaits_only_the_taken_arm() -> Result<(), TestError> {
+    aw_reset();
+    const t: i64 = future::block_on(ternary_arm(true));
+    const after_taken: i64 = aw_trace;
+    aw_reset();
+    const f: i64 = future::block_on(ternary_arm(false));
+    return aw_both(aw_both(expect_eq(t, 1 as i64), expect_eq(after_taken, 1 as i64)),
+                   aw_both(expect_eq(f, 7 as i64), expect_eq(aw_trace, 0 as i64)));
+}
+
+// ---- conditions and subjects ----
+
+async function await_in_if_condition() -> i64 {
+    if (await aw_true()) { return 42; }
+    return 0;
+}
+
+![test]
+function await_in_an_if_condition() -> Result<(), TestError> {
+    return expect_eq(future::block_on(await_in_if_condition()), 42 as i64);
+}
+
+async function await_in_match_subject() -> i64 {
+    match (await aw_one(2)) {
+        2 => { return 42; }
+        _ => { return 0; }
+    }
+}
+
+![test]
+function await_in_a_match_subject() -> Result<(), TestError> {
+    return expect_eq(future::block_on(await_in_match_subject()), 42 as i64);
+}
+
+// ---- `match` used as an expression ----
+
+async function match_expression_arm(n: i64) -> i64 {
+    const v: i64 = match (n) {
+        1 => { await aw_mark_async(5) }
+        _ => { 7 }
+    };
+    return v;
+}
+
+![test]
+function await_in_a_match_expression_arm() -> Result<(), TestError> {
+    aw_reset();
+    const taken: i64 = future::block_on(match_expression_arm(1));
+    const after_taken: i64 = aw_trace;
+    aw_reset();
+    const other: i64 = future::block_on(match_expression_arm(2));
+    return aw_both(aw_both(expect_eq(taken, 5 as i64), expect_eq(after_taken, 5 as i64)),
+                   aw_both(expect_eq(other, 7 as i64), expect_eq(aw_trace, 0 as i64)));
+}
+
+async function match_expression_unwraps_a_result() -> i64 {
+    const r: Result<i64, i64> = Result::Ok(await aw_one(42));
+    const v: i64 = match (r) {
+        Result::Ok(x)  => { x }
+        Result::Err(e) => { e }
+    };
+    return v;
+}
+
+![test]
+function a_match_expression_unwrap_after_an_await() -> Result<(), TestError> {
+    return expect_eq(future::block_on(match_expression_unwraps_a_result()), 42 as i64);
+}
+
+// ---- loop conditions, initializers and updates ----
+
+async function while_condition() -> i64 {
+    mut i: i64 = 0;
+    while (await aw_lt(i, 3)) { i = i + 1; }
+    return i;
+}
+
+![test]
+function await_in_a_while_condition() -> Result<(), TestError> {
+    return expect_eq(future::block_on(while_condition()), 3 as i64);
+}
+
+async function while_condition_with_break() -> i64 {
+    mut i: i64 = 0;
+    while (await aw_lt(i, 100)) {
+        i = i + 1;
+        if (i == 4) { break; }
+    }
+    return i;
+}
+
+![test]
+function break_out_of_a_loop_whose_condition_awaits() -> Result<(), TestError> {
+    return expect_eq(future::block_on(while_condition_with_break()), 4 as i64);
+}
+
+async function do_while_condition() -> i64 {
+    mut i: i64 = 0;
+    do { i = i + 1; } while (await aw_lt(i, 3));
+    return i;
+}
+
+![test]
+function await_in_a_do_while_condition() -> Result<(), TestError> {
+    return expect_eq(future::block_on(do_while_condition()), 3 as i64);
+}
+
+// `continue` in a `do-while` jumps to the tail test, not back to the body.  A
+// desugar that re-entered the body instead would still terminate here, and
+// would count 5 rather than 2.
+async function do_while_continue() -> i64 {
+    mut i: i64 = 0;
+    mut c: i64 = 0;
+    do {
+        i = i + 1;
+        if (i % 2 == 1) { continue; }
+        c = c + 1;
+    } while (await aw_lt(i, 5));
+    return c;
+}
+
+![test]
+function continue_in_a_do_while_whose_condition_awaits() -> Result<(), TestError> {
+    return expect_eq(future::block_on(do_while_continue()), 2 as i64);
+}
+
+async function for_condition() -> i64 {
+    mut c: i64 = 0;
+    for (mut i: i64 = 0; await aw_lt(i, 3); i++) { c = c + 1; }
+    return c;
+}
+
+![test]
+function await_in_a_for_condition() -> Result<(), TestError> {
+    return expect_eq(future::block_on(for_condition()), 3 as i64);
+}
+
+// `continue` in a `for` runs the update before re-testing.  A desugar that
+// jumped straight back to the condition would not advance `i` and would hang.
+async function for_continue() -> i64 {
+    mut c: i64 = 0;
+    for (mut i: i64 = 0; await aw_lt(i, 5); i++) {
+        if (i % 2 == 1) { continue; }
+        c = c + 1;
+    }
+    return c;
+}
+
+![test]
+function continue_in_a_for_whose_condition_awaits() -> Result<(), TestError> {
+    return expect_eq(future::block_on(for_continue()), 3 as i64);
+}
+
+async function for_update() -> i64 {
+    mut c: i64 = 0;
+    for (mut i: i64 = 0; i < 3; i = await aw_one(i + 1)) { c = c + 1; }
+    return c;
+}
+
+![test]
+function await_in_a_for_update() -> Result<(), TestError> {
+    return expect_eq(future::block_on(for_update()), 3 as i64);
+}
+
+async function for_initializer() -> i64 {
+    mut c: i64 = 0;
+    for (mut i: i64 = await aw_one(1); i < 4; i++) { c = c + 1; }
+    return c;
+}
+
+![test]
+function await_in_a_for_initializer() -> Result<(), TestError> {
+    return expect_eq(future::block_on(for_initializer()), 3 as i64);
+}
+
+async function loop_body_accumulates() -> i64 {
+    mut acc: i64 = 0;
+    for (mut i: i64 = 0; i < 3; i++) { acc = acc + await aw_one(i + 1); }
+    return acc;
+}
+
+![test]
+function an_assignment_from_an_await_inside_a_loop() -> Result<(), TestError> {
+    return expect_eq(future::block_on(loop_body_accumulates()), 6 as i64);
+}
+
+// ---- `match`-arm bindings that outlive a suspend ----
+
+// A binding is bound in the dispatch state but its arm body runs in another, so
+// it cannot stay on the native stack.  A scalar is re-read from a field; an
+// aggregate cannot be, because re-reading one copies it and a copy of a value
+// that owns a resource frees it twice.  It moves through an `Option` carrier
+// instead.
+async function aggregate_arm_binding(o: Option<AwPair>) -> i64 {
+    match (o) {
+        Option::Some(p) => { const n: i64 = await aw_one(1); return p.a + p.b + n; }
+        Option::None    => { return 0; }
+    }
+}
+
+![test]
+function an_aggregate_match_arm_binding_survives_an_await() -> Result<(), TestError> {
+    const v: i64 = future::block_on(aggregate_arm_binding(Option::Some(AwPair { a: 2, b: 3 })));
+    return expect_eq(v, 6 as i64);
+}
+
+async function aggregate_arm_binding_two_suspends(o: Option<AwPair>) -> i64 {
+    match (o) {
+        Option::Some(p) => {
+            const n: i64 = await aw_one(1);
+            const m: i64 = await aw_one(1);
+            return p.a + p.b + n + m;
+        }
+        Option::None => { return 0; }
+    }
+}
+
+![test]
+function an_aggregate_arm_binding_survives_two_awaits() -> Result<(), TestError> {
+    const v: i64 = future::block_on(aggregate_arm_binding_two_suspends(
+        Option::Some(AwPair { a: 2, b: 3 })));
+    return expect_eq(v, 7 as i64);
+}
+
+// The carrier hands the value over rather than copying it, so the payload is
+// destroyed exactly once however many states it crossed.
+async function droppable_arm_binding(o: Option<AwTag>) -> i64 {
+    match (o) {
+        Option::Some(t) => { const n: i64 = await aw_one(1); return t.id + n; }
+        Option::None    => { return 0; }
+    }
+}
+
+![test]
+function a_droppable_arm_binding_is_destroyed_once() -> Result<(), TestError> {
+    aw_drops = 0;
+    const v: i64 = future::block_on(droppable_arm_binding(Option::Some(AwTag { id: 41 })));
+    return aw_both(expect_eq(v, 42 as i64), expect_eq(aw_drops, 1 as i32));
+}
+
+async function result_payload_across_await(r: Result<AwPair, i64>) -> i64 {
+    match (r) {
+        Result::Ok(p)  => { const n: i64 = await aw_one(1); return p.a + p.b + n; }
+        Result::Err(e) => { return e; }
+    }
+}
+
+![test]
+function a_result_payload_unwrapped_across_an_await() -> Result<(), TestError> {
+    const v: i64 = future::block_on(result_payload_across_await(
+        Result::Ok(AwPair { a: 2, b: 3 })));
+    return expect_eq(v, 6 as i64);
+}
+
+// ---- a subject that suspends, and arms that suspend after it ----
+
+async function subject_and_arm_both_await() -> i64 {
+    match (await aw_one(2)) {
+        2 => { const x: i64 = await aw_one(40); return x + 2; }
+        _ => { return 0; }
+    }
+}
+
+![test]
+function a_match_subject_and_an_arm_may_both_await() -> Result<(), TestError> {
+    return expect_eq(future::block_on(subject_and_arm_both_await()), 42 as i64);
+}
+
+// ---- a loop edge taken from inside a `match` EXPRESSION arm ----
+
+// In an exploded loop a `break` is a state transition, which only a `match`
+// STATEMENT arm can carry; left an expression it would compile to a native break
+// out of the state-dispatch loop rather than the user's.
+async function break_from_a_match_expression_arm() -> i64 {
+    mut c: i64 = 0;
+    loop {
+        c = c + await aw_one(1);
+        const v: i64 = match (c) {
+            3 => { break; }
+            _ => { 0 }
+        };
+        c = c + v;
+    }
+    return c;
+}
+
+![test]
+function break_inside_a_match_expression_arm() -> Result<(), TestError> {
+    return expect_eq(future::block_on(break_from_a_match_expression_arm()), 3 as i64);
+}
+
+async function continue_from_a_match_expression_arm() -> i64 {
+    mut i: i64 = 0;
+    mut acc: i64 = 0;
+    while (i < 5) {
+        i = i + await aw_one(1);
+        const v: i64 = match (i % 2) {
+            1 => { continue; }
+            _ => { 10 }
+        };
+        acc = acc + v;
+    }
+    return acc;
+}
+
+![test]
+function continue_inside_a_match_expression_arm() -> Result<(), TestError> {
+    return expect_eq(future::block_on(continue_from_a_match_expression_arm()), 20 as i64);
+}
+
+// ---- a lifted temporary must not move an owning local ----
+
+mut aw_drops: i32 = 0;
+
+type struct AwTag {
+    id: i64;
+
+    drop(mut &this) -> void {
+        aw_drops = aw_drops + 1;
+    }
+}
+
+// `t.id` is a read to the left of a suspend.  Reads stay where they are: lifting
+// one into a temporary would move `t` out and leave the addition reading a
+// binding that no longer owns anything.
+async function reads_an_owning_local_across_a_lift() -> i64 {
+    const t: AwTag = AwTag { id: 40 };
+    const x: i64 = t.id + await aw_one(2);
+    return x;
+}
+
+![test]
+function a_read_left_of_an_await_does_not_move_its_owner() -> Result<(), TestError> {
+    aw_drops = 0;
+    const v: i64 = future::block_on(reads_an_owning_local_across_a_lift());
+    return aw_both(expect_eq(v, 42 as i64), expect_eq(aw_drops, 1 as i32));
+}

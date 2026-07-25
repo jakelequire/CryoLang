@@ -141,6 +141,28 @@ type struct BindingRename {
     }
 }
 
+/// The statements one rewrite step lifted out of an expression, in the order
+/// they must run. The `await` hoisting pass threads one of these through an
+/// expression tree and splices it in ahead of the statement that owned the tree;
+/// a construct that must keep a suspend conditional (`&&`, `||`, `?:`) gives its
+/// conditional part a fresh one and empties it into a branch block instead.
+type struct HoistPre {
+    stmts: StatementNode*[];
+
+    push(mut &this, s: StatementNode*) -> void {
+        if (s != null) { this.stmts.push(s); }
+    }
+}
+
+/// What remains of an expression after its `await`s were lifted into their own
+/// statements, paired with the state those statements ended in — which is the
+/// state the remainder must be evaluated in, since a suspend between the two
+/// splits them across a poll.
+type struct HoistedExpr {
+    expr: ExpressionNode*;
+    end:  i64;
+}
+
 /// A `match` arm's distinct pattern bindings paired with their (re-derived)
 /// payload types, collected by `lower_match_sm` to promote each scalar binding
 /// read across a suspend to a struct field.
@@ -793,6 +815,38 @@ type struct AsyncLower {
         if (k == NodeKind::MemberAccess) {
             return this.expr_await_count((e as MemberAccessNode*).object);
         }
+        if (k == NodeKind::TernaryExpression) {
+            const t: TernaryExprNode* = e as TernaryExprNode*;
+            return this.expr_await_count(t.condition)
+                 + this.expr_await_count(t.true_expr)
+                 + this.expr_await_count(t.false_expr);
+        }
+        if (k == NodeKind::CastExpression) {
+            return this.expr_await_count((e as CastExprNode*).expression);
+        }
+        if (k == NodeKind::ArrayAccess) {
+            const a: ArrayAccessNode* = e as ArrayAccessNode*;
+            return this.expr_await_count(a.array) + this.expr_await_count(a.index);
+        }
+        if (k == NodeKind::ArrayLiteral) {
+            const al: ArrayLiteralNode* = e as ArrayLiteralNode*;
+            mut n: i64 = 0i64;
+            for (mut i: i64 = 0; i < al.elements.length; i++) {
+                n += this.expr_await_count(al.elements[i]);
+            }
+            return n;
+        }
+        if (k == NodeKind::StructLiteral) {
+            const sl: StructLiteralNode* = e as StructLiteralNode*;
+            mut n: i64 = 0i64;
+            for (mut i: i64 = 0; i < sl.field_inits.length; i++) {
+                n += this.expr_await_count(sl.field_inits[i].value);
+            }
+            return n;
+        }
+        // A lambda body is a separate function: an `await` in one belongs to
+        // that function, not to this one, and counting it here would make this
+        // body try to explode a suspend it does not contain.
         if (k == NodeKind::MatchExpression) {
             // A `match` expression holds statement bodies, so an `await` can hide
             // in an arm. Counting it is what routes the shape to the E0600 for an
@@ -865,9 +919,15 @@ type struct AsyncLower {
         }
         if (k == NodeKind::MatchStatement) {
             const m: MatchStmtNode* = stmt as MatchStmtNode*;
-            mut n: i64 = 0i64;
+            // The subject and the guards count too: an `await` left uncounted
+            // anywhere sends the whole function down the no-await path, where
+            // nothing rewrites it and codegen meets it with no state to resume.
+            mut n: i64 = this.expr_await_count(m.subject);
             for (mut i: i64 = 0; i < m.arms.length; i++) {
-                if (m.arms[i] != null) { n += this.stmt_await_count(m.arms[i].body); }
+                if (m.arms[i] != null) {
+                    n += this.expr_await_count(m.arms[i].guard);
+                    n += this.stmt_await_count(m.arms[i].body);
+                }
             }
             return n;
         }
@@ -1764,20 +1824,19 @@ type struct AsyncLower {
     /// state sequence and, unless it returns, converges on a shared join state.
     lower_if_sm(mut &this, sm: PollSm*, iff: IfStmtNode*, cur: i64) -> i64 {
         const span: SourceSpan = sm.span;
-        if (this.expr_await_count(iff.condition) > 0i64) {
-            this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
-                "async: an `await` in an `if` condition is not supported; bind it first (`const c = await e; if (c) { … }`)",
-                span);
-            sm.ok = false; return cur;
-        }
+        // The condition is evaluated once, before either branch, so a suspend in
+        // it runs as its own states ahead of the dispatch.
+        const hc: HoistedExpr = this.lower_hoisted(sm, iff.condition, cur);
+        if (!sm.ok) { return cur; }
+        const at: i64 = hc.end;
         const then_entry: i64 = this.sm_alloc(sm);
         mut else_entry: i64 = -1i64;
         if (iff.else_stmt != null) { else_entry = this.sm_alloc(sm); }
         const join: i64 = this.sm_alloc(sm);
 
-        // `cur`: evaluate the condition and set the taken branch's entry state
+        // In `at`: evaluate the condition and set the taken branch's entry state
         // (or the join directly when there is no else), then fall off to
-        // re-dispatch. Both arms assign, so `cur` always advances.
+        // re-dispatch. Both arms assign, so `at` always advances.
         mut then_set: BlockStmtNode* = new BlockStmtNode(span);
         then_set.add_statement(this.assign_member_stmt(sm.struct_ref, sm.state_sym, sm.u32_ty,
             this.u32_lit(then_entry as u64, span), span));
@@ -1785,7 +1844,7 @@ type struct AsyncLower {
         mut else_set: BlockStmtNode* = new BlockStmtNode(span);
         else_set.add_statement(this.assign_member_stmt(sm.struct_ref, sm.state_sym, sm.u32_ty,
             this.u32_lit(else_target as u64, span), span));
-        sm.blocks[cur].add_statement(new IfStmtNode(iff.condition,
+        sm.blocks[at].add_statement(new IfStmtNode(hc.expr,
             then_set as StatementNode*, else_set as StatementNode*, span) as StatementNode*);
 
         // Whether a branch converges on the join is a property of the SOURCE
@@ -1813,17 +1872,16 @@ type struct AsyncLower {
     /// `match` rather than spinning the dispatch loop.
     lower_match_sm(mut &this, sm: PollSm*, m: MatchStmtNode*, cur: i64) -> i64 {
         const span: SourceSpan = sm.span;
-        if (this.expr_await_count(m.subject) > 0i64) {
-            this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
-                "async: an `await` in a `match` subject is not supported; bind it first (`const s = await e; match (s) { … }`)",
-                span);
-            sm.ok = false; return cur;
-        }
-        const subject_type: TypeRef = m.subject.resolved_type;
-        const exhaustive: boolean = this.patterns.match_is_exhaustive(m.subject, m.arms);
+        // The subject is evaluated once, before any arm, so a suspend in it runs
+        // as its own states ahead of the dispatch.
+        const hs: HoistedExpr = this.lower_hoisted(sm, m.subject, cur);
+        if (!sm.ok) { return cur; }
+        const at: i64 = hs.end;
+        const subject_type: TypeRef = hs.expr.resolved_type;
+        const exhaustive: boolean = this.patterns.match_is_exhaustive(hs.expr, m.arms);
 
         const join: i64 = this.sm_alloc(sm);
-        mut dispatch: MatchStmtNode* = new MatchStmtNode(m.subject, span);
+        mut dispatch: MatchStmtNode* = new MatchStmtNode(hs.expr, span);
         for (mut ai: i64 = 0; ai < m.arms.length; ai++) {
             const arm: MatchArmNode* = m.arms[ai];
             if (arm == null) { continue; }
@@ -1870,10 +1928,40 @@ type struct AsyncLower {
                         sm.ok = false; return cur;
                     }
                     if (!this.zeroable_kind(bk)) {
-                        this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
-                            "async: only a scalar (integer/bool/float/pointer) `match`-arm binding may currently be held across an `await`; carrying an aggregate arrives in a later increment",
-                            span);
-                        sm.ok = false; return cur;
+                        // An aggregate cannot be re-read from a field the way a
+                        // scalar can — reading one copies it, and a copy of a
+                        // value that owns a resource frees it twice. It moves
+                        // through an `Option` carrier instead: the dispatch arm
+                        // hands the binding over, and the arm's own state takes
+                        // it back as a local. The body then reads an ordinary
+                        // local, which is what lets the generic cross-state
+                        // promotion carry it further if a later state needs it.
+                        //
+                        // The local is given a NAME OF ITS OWN and the body's
+                        // reads are pointed at it, so the pattern's name occurs
+                        // only in the hand-over. A local sharing the pattern's
+                        // name would make that hand-over look like a read of the
+                        // local from a state before the one declaring it, and
+                        // the promotion would insert a take of a field nothing
+                        // had stored yet.
+                        const afield: SymbolStr = this.intern.intern(
+                            format("__bind_%lld_%s", entry, this.intern.resolve(bname)));
+                        mut bopt_args: TypeRef[] = [bt];
+                        const bopt_ty: TypeRef =
+                            this.ctx.generic_registry.instantiate(sm.opt_base, &bopt_args);
+                        const blocal: SymbolStr = this.mint_temp(
+                            format("%s$bind", this.intern.resolve(bname)));
+                        this.subst_mode = this.subst_to_local();
+                        this.subst_name_stmt(arm.body, bname, blocal, sm.struct_ref, bt, span);
+                        this.subst_mode = this.subst_to_field();
+                        cap.add_statement(this.agg_store_stmt(sm, afield, bopt_ty, bname, bt, span));
+                        this.prepend_agg_take(sm.blocks[entry], blocal, afield, bt, bopt_ty,
+                                              sm.struct_ref, false, span);
+                        sm.prom_field.push(afield);
+                        sm.prom_tys.push(bopt_ty);
+                        sm.prom_opt.push(true);
+                        sm.nprom += 1i64;
+                        continue;
                     }
                     const field: SymbolStr = this.intern.intern(
                         format("__bind_%lld_%s", entry, this.intern.resolve(bname)));
@@ -1911,7 +1999,7 @@ type struct AsyncLower {
             dispatch.add_arm(this.match_arm_wild(wblk, span));
         }
 
-        sm.blocks[cur].add_statement(dispatch as StatementNode*);
+        sm.blocks[at].add_statement(dispatch as StatementNode*);
         return join;
     }
 
@@ -2018,17 +2106,13 @@ type struct AsyncLower {
     /// exits to after.
     lower_while_sm(mut &this, sm: PollSm*, w: WhileStmtNode*, cur: i64) -> i64 {
         const span: SourceSpan = sm.span;
-        if (this.expr_await_count(w.condition) > 0i64) {
-            this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
-                "async: an `await` in a `while` condition is not supported; bind it first (`const c = await e; while (c) { … }`)",
-                span);
-            sm.ok = false; return cur;
-        }
         const header: i64 = this.sm_alloc(sm);
         const body_entry: i64 = this.sm_alloc(sm);
         const after: i64 = this.sm_alloc(sm);
         this.sm_goto(sm, cur, header);
-        this.emit_cond_dispatch(sm, header, w.condition, body_entry, after, span);
+        const hc: HoistedExpr = this.lower_hoisted(sm, w.condition, header);
+        if (!sm.ok) { return cur; }
+        this.emit_cond_dispatch(sm, hc.end, hc.expr, body_entry, after, span);
         sm.loop_cont.push(header);
         sm.loop_brk.push(after);
         const body_end: i64 = this.lower_branch_sm(sm, w.body, body_entry);
@@ -2044,12 +2128,6 @@ type struct AsyncLower {
     /// tail test; `break` exits to after.
     lower_do_while_sm(mut &this, sm: PollSm*, d: DoWhileStmtNode*, cur: i64) -> i64 {
         const span: SourceSpan = sm.span;
-        if (this.expr_await_count(d.condition) > 0i64) {
-            this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
-                "async: an `await` in a `do-while` condition is not supported; bind it first",
-                span);
-            sm.ok = false; return cur;
-        }
         const body_entry: i64 = this.sm_alloc(sm);
         const cond_state: i64 = this.sm_alloc(sm);
         const after: i64 = this.sm_alloc(sm);
@@ -2061,7 +2139,9 @@ type struct AsyncLower {
         sm.loop_brk.pop();
         if (!sm.ok) { return cur; }
         if (!this.stmt_diverges(d.body)) { this.sm_goto(sm, body_end, cond_state); }
-        this.emit_cond_dispatch(sm, cond_state, d.condition, body_entry, after, span);
+        const hc: HoistedExpr = this.lower_hoisted(sm, d.condition, cond_state);
+        if (!sm.ok) { return cur; }
+        this.emit_cond_dispatch(sm, hc.end, hc.expr, body_entry, after, span);
         return after;
     }
 
@@ -2071,20 +2151,8 @@ type struct AsyncLower {
     /// A null `cond` means "always enter the body" (an infinite `for (;;)`).
     lower_for_sm(mut &this, sm: PollSm*, f: ForStmtNode*, cur: i64) -> i64 {
         const span: SourceSpan = sm.span;
-        if (this.expr_await_count(f.condition) > 0i64 || this.expr_await_count(f.update) > 0i64) {
-            this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
-                "async: an `await` in a `for` condition or update expression is not supported; restructure the loop",
-                span);
-            sm.ok = false; return cur;
-        }
         mut s0: i64 = cur;
         if (f.init != null) {
-            if (this.expr_await_count(this.for_init_expr(f)) > 0i64) {
-                this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
-                    "async: an `await` in a `for` initializer is not supported; bind it before the loop",
-                    span);
-                sm.ok = false; return cur;
-            }
             if ((f.init as ASTNode*).kind == NodeKind::VariableDeclaration) {
                 mut ds: DeclStmtNode* = new DeclStmtNode(f.init as DeclarationNode*, span);
                 s0 = this.lower_stmt_sm(sm, ds as StatementNode*, s0);
@@ -2100,7 +2168,9 @@ type struct AsyncLower {
         const after: i64 = this.sm_alloc(sm);
         this.sm_goto(sm, s0, header);
         if (f.condition != null) {
-            this.emit_cond_dispatch(sm, header, f.condition, body_entry, after, span);
+            const hc: HoistedExpr = this.lower_hoisted(sm, f.condition, header);
+            if (!sm.ok) { return cur; }
+            this.emit_cond_dispatch(sm, hc.end, hc.expr, body_entry, after, span);
         } else {
             this.sm_goto(sm, header, body_entry);
         }
@@ -2111,21 +2181,39 @@ type struct AsyncLower {
         sm.loop_brk.pop();
         if (!sm.ok) { return cur; }
         if (!this.stmt_diverges(f.body)) { this.sm_goto(sm, body_end, update_state); }
+        mut update_end: i64 = update_state;
         if (f.update != null) {
-            sm.blocks[update_state].add_statement(new ExprStmtNode(f.update, span) as StatementNode*);
+            const hu: HoistedExpr = this.lower_hoisted(sm, f.update, update_state);
+            if (!sm.ok) { return cur; }
+            update_end = hu.end;
+            if (hu.expr != null) {
+                sm.blocks[update_end].add_statement(new ExprStmtNode(hu.expr, span) as StatementNode*);
+            }
         }
-        this.sm_goto(sm, update_state, header);
+        this.sm_goto(sm, update_end, header);
         return after;
     }
 
-    /// The `for` initializer's initializer expression (for the await check), or
-    /// null when the init is absent or a bare expression with no sub-await.
-    for_init_expr(&this, f: ForStmtNode*) -> ExpressionNode* {
-        if (f.init == null) { return null; }
-        if ((f.init as ASTNode*).kind == NodeKind::VariableDeclaration) {
-            return (f.init as VarDeclNode*).initializer;
+    /// Lower the statements that lifting `e`'s `await`s produced into the state
+    /// chain starting at `at`, and hand back what remains of `e` together with
+    /// the state it must be evaluated in.
+    ///
+    /// A loop's condition and update are rewritten HERE rather than by the
+    /// pre-lowering hoist because both are re-evaluated every iteration: lifting
+    /// them out to before the loop would run them once, and `continue` has to
+    /// re-enter them — which is exactly what their own state already is.
+    lower_hoisted(mut &this, sm: PollSm*, e: ExpressionNode*, at: i64) -> HoistedExpr {
+        if (e == null || this.expr_await_count(e) == 0i64) {
+            return HoistedExpr { expr: e, end: at };
         }
-        return f.init as ExpressionNode*;
+        mut pre: HoistPre = HoistPre { stmts: [] };
+        mut rest: ExpressionNode* = this.hoist_expr(e, &pre);
+        mut end: i64 = at;
+        for (mut i: i64 = 0; i < pre.stmts.length; i++) {
+            end = this.lower_stmt_sm(sm, pre.stmts[i], end);
+            if (!sm.ok) { return HoistedExpr { expr: rest, end: end }; }
+        }
+        return HoistedExpr { expr: rest, end: end };
     }
 
     /// True if the statement never falls through to whatever follows it, so a
@@ -3332,6 +3420,536 @@ type struct AsyncLower {
         }
     }
 
+    // ---- pre-lowering `await` hoisting (statement-level ANF) ----
+
+    /// A fresh frame temporary for a hoisted subexpression.
+    ///
+    /// `disambiguate_locals` runs after this pass and renames these along with
+    /// the user's own locals, which is what registers them as frame locals — so
+    /// every check downstream, the address-of-across-suspend one included,
+    /// treats a temp exactly as it treats a local the user wrote.
+    mint_temp(mut &this, base: string) -> SymbolStr {
+        const idx: u64 = this.counter;
+        this.counter += 1u64;
+        const fresh: SymbolStr = this.intern.intern(format("%s$H%llu", base, idx));
+        // Registered as a frame local so the address-of-across-suspend check
+        // sees a temp exactly as it sees a local. Harmless for the pre-rename
+        // pass, whose registrations `disambiguate_locals` clears before making
+        // its own; load-bearing for the temps minted during lowering itself,
+        // which the rename has already run past.
+        this.frame_locals.push(fresh);
+        this.frame_local_src.push(fresh);
+        return fresh;
+    }
+
+    /// `<name> = <rhs>;` against a local.
+    assign_local_stmt(&this, name: SymbolStr, ty: TypeRef, rhs: ExpressionNode*,
+                      span: SourceSpan) -> StatementNode* {
+        mut lhs: ExpressionNode* = this.ident(name, ty, span);
+        const eq: Token = Token::new(TokenType::Equal, "=",
+                                     span.start_line as int, span.start_col as int);
+        mut assign: BinaryExprNode* = new BinaryExprNode(eq, lhs, rhs, span);
+        assign.set_resolved_type(this.arena.get_void());
+        mut es: ExprStmtNode* = new ExprStmtNode(assign as ExpressionNode*, span);
+        return es as StatementNode*;
+    }
+
+    /// `!(<e>)`. Marked synthetic for the same reason `deref`/`addr_of` are: the
+    /// checks that constrain user syntax skip compiler-built nodes.
+    not_expr(&this, e: ExpressionNode*, span: SourceSpan) -> ExpressionNode* {
+        const bang: Token = Token::new(TokenType::Exclaim, "!",
+                                       span.start_line as int, span.start_col as int);
+        mut u: UnaryExprNode* = new UnaryExprNode(bang, e, span);
+        u.is_synthetic = true;
+        u.set_resolved_type(this.arena.get_bool());
+        return u as ExpressionNode*;
+    }
+
+    /// True when evaluating `e` produces no effect the surrounding order can
+    /// observe, so leaving it in place while an `await` to its RIGHT is lifted
+    /// out above it preserves what the program does.
+    ///
+    /// Reads qualify, and not merely as an optimization — they MUST stay in
+    /// place. Lifting `acc` out of `acc = acc + await f()` into a temporary
+    /// would MOVE a droppable local out of `acc`, leaving the assignment to read
+    /// a binding that no longer owns anything. Their value also cannot change
+    /// across the suspend: reaching this frame from elsewhere needs a pointer
+    /// into it held across the `await`, which `E0455` rejects.
+    await_transparent(&this, e: ExpressionNode*) -> boolean {
+        if (e == null) { return true; }
+        const k: NodeKind = (e as ASTNode*).kind;
+        if (k == NodeKind::Literal || k == NodeKind::Identifier ||
+            k == NodeKind::ScopeResolution || k == NodeKind::SizeofExpression ||
+            k == NodeKind::AlignofExpression) { return true; }
+        if (k == NodeKind::MemberAccess) {
+            return this.await_transparent((e as MemberAccessNode*).object);
+        }
+        if (k == NodeKind::CastExpression) {
+            return this.await_transparent((e as CastExprNode*).expression);
+        }
+        if (k == NodeKind::ArrayAccess) {
+            const aa: ArrayAccessNode* = e as ArrayAccessNode*;
+            // An overloaded `[]` is a call, and a call is not transparent.
+            if (aa.desugared_call != null) { return false; }
+            return this.await_transparent(aa.array) && this.await_transparent(aa.index);
+        }
+        if (k == NodeKind::UnaryExpression) {
+            const u: UnaryExprNode* = e as UnaryExprNode*;
+            // `++`/`--` write, and an overloaded operator is a call.
+            if (u.op.kind == TokenType::PlusPlus || u.op.kind == TokenType::MinusMinus) {
+                return false;
+            }
+            if (u.desugared_call != null) { return false; }
+            return this.await_transparent(u.operand);
+        }
+        if (k == NodeKind::BinaryExpression) {
+            const b: BinaryExprNode* = e as BinaryExprNode*;
+            if (b.op.kind.is_assignment_op() || b.desugared_call != null) { return false; }
+            return this.await_transparent(b.left) && this.await_transparent(b.right);
+        }
+        return false;
+    }
+
+    /// Lift `e` into a temporary when something to its right will suspend
+    /// (`force`) and it is not a pure read. Returns what the parent should hold
+    /// in its place.
+    hoist_operand(mut &this, e: ExpressionNode*, force: boolean,
+                  pre: HoistPre*) -> ExpressionNode* {
+        mut r: ExpressionNode* = this.hoist_expr(e, pre);
+        if (!force || r == null) { return r; }
+        if (this.await_transparent(r)) { return r; }
+        const ty: TypeRef = r.resolved_type;
+        // Without a type there is no well-formed temporary to declare. The shape
+        // that produced it is already ill-typed, so leaving it in place lets the
+        // real diagnostic stand instead of adding a confusing second one.
+        if (!ty.is_valid()) { return r; }
+        const t: SymbolStr = this.mint_temp("__ord");
+        pre.push(this.var_decl_stmt(t, false, ty, r, (r as ASTNode*).span));
+        return this.ident(t, ty, (r as ASTNode*).span);
+    }
+
+    /// True when any of `args[from..]` holds an `await`, i.e. whether evaluating
+    /// argument `from - 1` happens before a suspend.
+    args_await_after(&this, args: &ExpressionNode*[], from: i64) -> boolean {
+        for (mut i: i64 = from; i < args.length; i++) {
+            if (this.expr_await_count(args[i]) > 0i64) { return true; }
+        }
+        return false;
+    }
+
+    /// Lift every `await` nested inside `e` into its own statement appended to
+    /// `pre`, returning the expression the parent should hold instead.
+    ///
+    /// Operands are visited strictly left to right, and any operand to the left
+    /// of a lifted `await` that is not a pure read is lifted with it — so no
+    /// effect ever crosses the suspend it originally preceded.
+    hoist_expr(mut &this, e: ExpressionNode*, pre: HoistPre*) -> ExpressionNode* {
+        if (e == null) { return null; }
+        // A `break`/`continue` in a `match` EXPRESSION arm needs the same
+        // rewrite an `await` there does, for the same reason: in an exploded
+        // loop the edge is a state transition, which only a `match` STATEMENT
+        // arm can carry. Left an expression it would compile to a native break
+        // out of the state-dispatch loop rather than the user's.
+        if (this.expr_await_count(e) == 0i64 && !this.expr_has_free_edge(e, false)) { return e; }
+        const k: NodeKind = (e as ASTNode*).kind;
+        const span: SourceSpan = (e as ASTNode*).span;
+
+        if (k == NodeKind::AwaitExpression) {
+            mut aw: AwaitExprNode* = e as AwaitExprNode*;
+            aw.operand = this.hoist_expr(aw.operand, pre);
+            const ao: TypeRef = aw.resolved_type;
+            if (!ao.is_valid()) { return e; }
+            const t: SymbolStr = this.mint_temp("__aw");
+            pre.push(this.var_decl_stmt(t, false, ao, e, span));
+            return this.ident(t, ao, span);
+        }
+
+        if (k == NodeKind::BinaryExpression) {
+            mut b: BinaryExprNode* = e as BinaryExprNode*;
+            // `&&`/`||` only evaluate their right operand for some values of the
+            // left, so lifting an `await` out of it would run the suspend
+            // unconditionally. Becomes a branch instead.
+            if ((b.op.kind == TokenType::AmpAmp || b.op.kind == TokenType::PipePipe) &&
+                this.expr_await_count(b.right) > 0i64) {
+                return this.hoist_short_circuit(b, pre);
+            }
+            if (b.op.kind.is_assignment_op()) {
+                b.left  = this.hoist_place(b.left, this.expr_await_count(b.right) > 0i64, pre);
+                b.right = this.hoist_expr(b.right, pre);
+                return e;
+            }
+            b.left  = this.hoist_operand(b.left, this.expr_await_count(b.right) > 0i64, pre);
+            b.right = this.hoist_expr(b.right, pre);
+            return e;
+        }
+
+        if (k == NodeKind::TernaryExpression) {
+            mut t: TernaryExprNode* = e as TernaryExprNode*;
+            // Same reason as `&&`: an arm runs only for one value of the
+            // condition, so its `await` cannot be lifted above the test.
+            if (this.expr_await_count(t.true_expr) > 0i64 ||
+                this.expr_await_count(t.false_expr) > 0i64) {
+                return this.hoist_ternary(t, pre);
+            }
+            t.condition = this.hoist_expr(t.condition, pre);
+            return e;
+        }
+
+        if (k == NodeKind::UnaryExpression) {
+            mut u: UnaryExprNode* = e as UnaryExprNode*;
+            u.operand = this.hoist_expr(u.operand, pre);
+            return e;
+        }
+
+        if (k == NodeKind::CastExpression) {
+            mut c: CastExprNode* = e as CastExprNode*;
+            c.expression = this.hoist_expr(c.expression, pre);
+            return e;
+        }
+
+        if (k == NodeKind::CallExpression) {
+            mut c: CallExprNode* = e as CallExprNode*;
+            // The callee is evaluated first. A method call's callee is a member
+            // access on the receiver, which `await_transparent` keeps in place —
+            // lifting it would copy (and so move out of) the receiver.
+            c.callee = this.hoist_operand(c.callee, this.args_await_after(&c.arguments, 0i64), pre);
+            for (mut i: i64 = 0; i < c.arguments.length; i++) {
+                c.arguments[i] = this.hoist_operand(
+                    c.arguments[i], this.args_await_after(&c.arguments, i + 1i64), pre);
+            }
+            return e;
+        }
+
+        if (k == NodeKind::MemberAccess) {
+            mut m: MemberAccessNode* = e as MemberAccessNode*;
+            m.object = this.hoist_expr(m.object, pre);
+            return e;
+        }
+
+        if (k == NodeKind::MatchExpression) {
+            mut me: MatchExprNode* = e as MatchExprNode*;
+            mut in_arms: i64 = 0i64;
+            for (mut i: i64 = 0; i < me.arms.length; i++) {
+                if (me.arms[i] != null) {
+                    in_arms += this.expr_await_count(me.arms[i].guard);
+                    in_arms += this.stmt_await_count(me.arms[i].body);
+                    if (this.has_free_edge(me.arms[i].body, false)) { in_arms += 1i64; }
+                }
+            }
+            // Only an arm that suspends or leaves the loop needs the expression
+            // to become a statement; an `await` confined to the subject lifts
+            // like any other operand and leaves the `match` an expression.
+            if (in_arms == 0i64) {
+                me.subject = this.hoist_expr(me.subject, pre);
+                return e;
+            }
+            return this.hoist_match_expr(me, pre);
+        }
+
+        if (k == NodeKind::ArrayAccess) {
+            mut a: ArrayAccessNode* = e as ArrayAccessNode*;
+            a.array = this.hoist_operand(a.array, this.expr_await_count(a.index) > 0i64, pre);
+            a.index = this.hoist_expr(a.index, pre);
+            return e;
+        }
+
+        if (k == NodeKind::ArrayLiteral) {
+            mut al: ArrayLiteralNode* = e as ArrayLiteralNode*;
+            for (mut i: i64 = 0; i < al.elements.length; i++) {
+                al.elements[i] = this.hoist_operand(
+                    al.elements[i], this.args_await_after(&al.elements, i + 1i64), pre);
+            }
+            return e;
+        }
+
+        if (k == NodeKind::StructLiteral) {
+            mut sl: StructLiteralNode* = e as StructLiteralNode*;
+            for (mut i: i64 = 0; i < sl.field_inits.length; i++) {
+                mut rest: boolean = false;
+                for (mut j: i64 = i + 1i64; j < sl.field_inits.length; j++) {
+                    if (this.expr_await_count(sl.field_inits[j].value) > 0i64) { rest = true; }
+                }
+                sl.field_inits[i].value = this.hoist_operand(sl.field_inits[i].value, rest, pre);
+            }
+            return e;
+        }
+
+        return e;
+    }
+
+    /// A place expression (an assignment's left side). Its subexpressions are
+    /// evaluated for an address, not a value, so only the parts that ARE values
+    /// — an index, the object of a member access — are lifted. Lifting the place
+    /// itself would assign to a copy.
+    hoist_place(mut &this, e: ExpressionNode*, force: boolean,
+                pre: HoistPre*) -> ExpressionNode* {
+        if (e == null) { return null; }
+        const k: NodeKind = (e as ASTNode*).kind;
+        if (k == NodeKind::ArrayAccess) {
+            mut a: ArrayAccessNode* = e as ArrayAccessNode*;
+            a.array = this.hoist_place(a.array, force, pre);
+            a.index = this.hoist_operand(a.index, force, pre);
+            return e;
+        }
+        if (k == NodeKind::MemberAccess) {
+            mut m: MemberAccessNode* = e as MemberAccessNode*;
+            m.object = this.hoist_place(m.object, force, pre);
+            return e;
+        }
+        if (k == NodeKind::UnaryExpression) {
+            mut u: UnaryExprNode* = e as UnaryExprNode*;
+            u.operand = this.hoist_operand(u.operand, force, pre);
+            return e;
+        }
+        return this.hoist_expr(e, pre);
+    }
+
+    /// `L && R` / `L || R` where `R` awaits, as the branch it already means:
+    ///
+    ///     mut $sc = L;  if ($sc) { … $sc = R; }        // `&&`
+    ///     mut $sc = L;  if (!$sc) { … $sc = R; }       // `||`
+    ///
+    /// `R`'s own lifted statements go INSIDE the branch, which is what keeps the
+    /// suspend conditional.
+    hoist_short_circuit(mut &this, b: BinaryExprNode*, pre: HoistPre*) -> ExpressionNode* {
+        const span: SourceSpan = (b as ASTNode*).span;
+        const bool_ty: TypeRef = this.arena.get_bool();
+        mut left: ExpressionNode* = this.hoist_expr(b.left, pre);
+        const t: SymbolStr = this.mint_temp("__sc");
+        pre.push(this.var_decl_stmt(t, true, bool_ty, left, span));
+
+        mut inner: HoistPre = HoistPre { stmts: [] };
+        mut right: ExpressionNode* = this.hoist_expr(b.right, &inner);
+        mut blk: BlockStmtNode* = new BlockStmtNode(span);
+        for (mut i: i64 = 0; i < inner.stmts.length; i++) { blk.add_statement(inner.stmts[i]); }
+        blk.add_statement(this.assign_local_stmt(t, bool_ty, right, span));
+
+        mut test: ExpressionNode* = this.ident(t, bool_ty, span);
+        if (b.op.kind == TokenType::PipePipe) { test = this.not_expr(test, span); }
+        pre.push(new IfStmtNode(test, blk as StatementNode*, null, span) as StatementNode*);
+        return this.ident(t, bool_ty, span);
+    }
+
+    /// `C ? A : B` where an arm awaits, as the branch it already means:
+    ///
+    ///     mut $tv: T;  if (C) { … $tv = A; } else { … $tv = B; }
+    ///
+    /// The temporary is declared without an initializer on purpose: both arms
+    /// assign it, so it is always initialized before its use, and giving it a
+    /// placeholder value would mean synthesizing one for a type that may own a
+    /// resource.
+    hoist_ternary(mut &this, t: TernaryExprNode*, pre: HoistPre*) -> ExpressionNode* {
+        const span: SourceSpan = (t as ASTNode*).span;
+        const vty: TypeRef = (t as ExpressionNode*).resolved_type;
+        if (!vty.is_valid()) { return t as ExpressionNode*; }
+        mut cond: ExpressionNode* = this.hoist_expr(t.condition, pre);
+        const tv: SymbolStr = this.mint_temp("__tv");
+        pre.push(this.var_decl_stmt(tv, true, vty, null, span));
+
+        mut then_blk: BlockStmtNode* = this.hoist_arm_block(t.true_expr, tv, vty, span);
+        mut else_blk: BlockStmtNode* = this.hoist_arm_block(t.false_expr, tv, vty, span);
+        pre.push(new IfStmtNode(cond, then_blk as StatementNode*,
+                                else_blk as StatementNode*, span) as StatementNode*);
+        return this.ident(tv, vty, span);
+    }
+
+    /// A `match` EXPRESSION whose arms suspend, as the `match` STATEMENT it
+    /// already means:
+    ///
+    ///     mut $mv: T;
+    ///     match (S) { p => { … $mv = <arm value>; } … }
+    ///
+    /// The state machine already lowers a `match` STATEMENT arm into its own
+    /// states, so turning each arm's value into an assignment is the whole of
+    /// what an awaiting arm needs. The value has to become the assignment BEFORE
+    /// the arm block is rewritten: a bare `await f()` in value position would
+    /// otherwise lift into a carrier whose result nothing reads.
+    hoist_match_expr(mut &this, me: MatchExprNode*, pre: HoistPre*) -> ExpressionNode* {
+        const span: SourceSpan = (me as ASTNode*).span;
+        const vty: TypeRef = (me as ExpressionNode*).resolved_type;
+        if (!vty.is_valid()) { return me as ExpressionNode*; }
+        // A guard runs per arm, after that arm's pattern matched, so its `await`
+        // cannot be lifted above the `match`. Left in place so the diagnostic
+        // names the shape the user wrote.
+        for (mut gi: i64 = 0; gi < me.arms.length; gi++) {
+            if (me.arms[gi] != null && this.expr_await_count(me.arms[gi].guard) > 0i64) {
+                return me as ExpressionNode*;
+            }
+        }
+        mut subject: ExpressionNode* = this.hoist_expr(me.subject, pre);
+        const tv: SymbolStr = this.mint_temp("__mv");
+        pre.push(this.var_decl_stmt(tv, true, vty, null, span));
+
+        mut ms: MatchStmtNode* = new MatchStmtNode(subject, span);
+        for (mut i: i64 = 0; i < me.arms.length; i++) {
+            mut arm: MatchArmNode* = me.arms[i];
+            if (arm == null) { continue; }
+            arm.body = this.arm_value_to_assign(arm.body, tv, vty);
+            arm.body = this.hoist_branch(arm.body);
+            ms.add_arm(arm);
+        }
+        pre.push(ms as StatementNode*);
+        return this.ident(tv, vty, span);
+    }
+
+    /// Rewrite a `match`-expression arm body so it ASSIGNS the arm's value to
+    /// `tv` instead of producing it. The value is the block's trailing
+    /// expression statement, which is how an arm value is recorded; an arm that
+    /// diverges instead has none and is returned untouched.
+    arm_value_to_assign(mut &this, body: StatementNode*, tv: SymbolStr,
+                        vty: TypeRef) -> StatementNode* {
+        if (body == null) { return null; }
+        if (body.kind == NodeKind::ExpressionStatement) {
+            const es: ExprStmtNode* = body as ExprStmtNode*;
+            return this.assign_local_stmt(tv, vty, es.expression, body.span);
+        }
+        if (body.kind != NodeKind::BlockStatement) { return body; }
+        mut blk: BlockStmtNode* = body as BlockStmtNode*;
+        const n: i64 = blk.statements.length;
+        if (n == 0i64) { return body; }
+        const last: StatementNode* = blk.statements[n - 1i64];
+        if (last == null || last.kind != NodeKind::ExpressionStatement) { return body; }
+        const es: ExprStmtNode* = last as ExprStmtNode*;
+        blk.statements[n - 1i64] = this.assign_local_stmt(tv, vty, es.expression, last.span);
+        return body;
+    }
+
+    /// `{ <lifted statements of `value`>; <tv> = <value>; }` — one arm of a
+    /// lowered `?:`.
+    hoist_arm_block(mut &this, value: ExpressionNode*, tv: SymbolStr, vty: TypeRef,
+                    span: SourceSpan) -> BlockStmtNode* {
+        mut inner: HoistPre = HoistPre { stmts: [] };
+        mut v: ExpressionNode* = this.hoist_expr(value, &inner);
+        mut blk: BlockStmtNode* = new BlockStmtNode(span);
+        for (mut i: i64 = 0; i < inner.stmts.length; i++) { blk.add_statement(inner.stmts[i]); }
+        blk.add_statement(this.assign_local_stmt(tv, vty, v, span));
+        return blk;
+    }
+
+    /// Rewrite every statement of `blk` in place, splicing each one's lifted
+    /// statements in immediately before it.
+    hoist_block(mut &this, blk: BlockStmtNode*) -> void {
+        if (blk == null) { return; }
+        mut acc: HoistPre = HoistPre { stmts: [] };
+        for (mut i: i64 = 0; i < blk.statements.length; i++) {
+            this.hoist_stmt(blk.statements[i], &acc);
+        }
+        blk.statements = acc.stmts;
+    }
+
+    /// A branch body (a block, a bare statement, or an `else if`) rewritten into
+    /// a block, so a statement that lifts anything has somewhere to put it.
+    hoist_branch(mut &this, s: StatementNode*) -> StatementNode* {
+        if (s == null) { return null; }
+        if (s.kind == NodeKind::BlockStatement) {
+            this.hoist_block(s as BlockStmtNode*);
+            return s;
+        }
+        mut out: HoistPre = HoistPre { stmts: [] };
+        this.hoist_stmt(s, &out);
+        if (out.stmts.length == 1i64) { return out.stmts[0]; }
+        mut blk: BlockStmtNode* = new BlockStmtNode(s.span);
+        for (mut i: i64 = 0; i < out.stmts.length; i++) { blk.add_statement(out.stmts[i]); }
+        return blk as StatementNode*;
+    }
+
+    /// Rewrite one statement, appending what it lifts and then the statement
+    /// itself to `out`. A statement holding no `await` anywhere is untouched.
+    hoist_stmt(mut &this, s: StatementNode*, out: HoistPre*) -> void {
+        if (s == null) { return; }
+        if (this.stmt_await_count(s) == 0i64 && !this.has_free_break_continue(s)) {
+            out.push(s); return;
+        }
+        const k: NodeKind = s.kind;
+        mut pre: HoistPre = HoistPre { stmts: [] };
+
+        if (k == NodeKind::DeclarationStatement) {
+            const ds: DeclStmtNode* = s as DeclStmtNode*;
+            if (ds.declaration != null && ds.declaration.kind == NodeKind::VariableDeclaration) {
+                mut vd: VarDeclNode* = ds.declaration as VarDeclNode*;
+                vd.initializer = this.hoist_toplevel(vd.initializer, &pre);
+            }
+        } else if (k == NodeKind::ReturnStatement) {
+            mut rs: ReturnStmtNode* = s as ReturnStmtNode*;
+            rs.expression = this.hoist_toplevel(rs.expression, &pre);
+        } else if (k == NodeKind::ExpressionStatement) {
+            mut es: ExprStmtNode* = s as ExprStmtNode*;
+            es.expression = this.hoist_toplevel(es.expression, &pre);
+        } else if (k == NodeKind::BlockStatement) {
+            this.hoist_block(s as BlockStmtNode*);
+        } else if (k == NodeKind::IfStatement) {
+            mut iff: IfStmtNode* = s as IfStmtNode*;
+            // The condition is evaluated once, before either branch, so its
+            // lifted statements belong ahead of the whole `if`.
+            iff.condition = this.hoist_expr(iff.condition, &pre);
+            iff.then_stmt = this.hoist_branch(iff.then_stmt);
+            iff.else_stmt = this.hoist_branch(iff.else_stmt);
+        } else if (k == NodeKind::MatchStatement) {
+            mut m: MatchStmtNode* = s as MatchStmtNode*;
+            m.subject = this.hoist_expr(m.subject, &pre);
+            for (mut i: i64 = 0; i < m.arms.length; i++) {
+                if (m.arms[i] != null) { m.arms[i].body = this.hoist_branch(m.arms[i].body); }
+            }
+        } else if (k == NodeKind::LoopStatement) {
+            mut lp: LoopStmtNode* = s as LoopStmtNode*;
+            lp.body = this.hoist_branch(lp.body);
+        } else if (k == NodeKind::WhileStatement) {
+            mut w: WhileStmtNode* = s as WhileStmtNode*;
+            w.body = this.hoist_branch(w.body);
+        } else if (k == NodeKind::DoWhileStatement) {
+            mut dw: DoWhileStmtNode* = s as DoWhileStmtNode*;
+            dw.body = this.hoist_branch(dw.body);
+        } else if (k == NodeKind::ForStatement) {
+            mut f: ForStmtNode* = s as ForStmtNode*;
+            // The initializer runs once, before the loop, so what it lifts
+            // belongs ahead of the whole `for`. The condition and the update run
+            // per iteration and are rewritten during lowering instead, inside
+            // the states `continue` re-enters.
+            if (f.init != null) {
+                if ((f.init as ASTNode*).kind == NodeKind::VariableDeclaration) {
+                    mut vd: VarDeclNode* = f.init as VarDeclNode*;
+                    vd.initializer = this.hoist_toplevel(vd.initializer, &pre);
+                } else {
+                    f.init = this.hoist_toplevel(f.init as ExpressionNode*, &pre) as ASTNode*;
+                }
+            }
+            f.body = this.hoist_branch(f.body);
+        }
+
+        for (mut i: i64 = 0; i < pre.stmts.length; i++) { out.push(pre.stmts[i]); }
+        out.push(s);
+    }
+
+    /// The expression a carrier statement holds. A top-level `await` is left
+    /// where it is — that IS the shape the state machine explodes — and only its
+    /// operand is rewritten.
+    hoist_toplevel(mut &this, e: ExpressionNode*, pre: HoistPre*) -> ExpressionNode* {
+        if (e == null) { return null; }
+        if ((e as ASTNode*).kind == NodeKind::AwaitExpression) {
+            mut aw: AwaitExprNode* = e as AwaitExprNode*;
+            aw.operand = this.hoist_expr(aw.operand, pre);
+            return e;
+        }
+        return this.hoist_expr(e, pre);
+    }
+
+    /// Rewrite the body so every surviving `await` sits at the top level of a
+    /// statement the state machine already explodes: `const x = await e;`,
+    /// `return await e;`, or `await e;`.
+    ///
+    ///     acc = g() + await f();   ->   const $g = g();
+    ///                                   const $a = await f();
+    ///                                   acc = $g + $a;
+    ///
+    /// Runs before `disambiguate_locals`, so the temporaries it introduces go
+    /// through the same alpha-rename and frame registration as the body's own
+    /// locals and are indistinguishable from them afterwards.
+    hoist_awaits(mut &this, node: FunctionDeclNode*) -> void {
+        if (node == null || node.body == null) { return; }
+        if (node.body.kind != NodeKind::BlockStatement) { return; }
+        this.hoist_block(node.body as BlockStmtNode*);
+    }
+
     // ---- pre-lowering local disambiguation (scope-aware alpha-rename) ----
 
     rc_enter(&this, ctx: RenameCtx*) -> void { ctx.marks.push(ctx.orig.length); }
@@ -3708,6 +4326,11 @@ type struct AsyncLower {
     /// `sm.prom_*`, which `lower` consumes to build the struct fields.
     build_poll_body_sm(mut &this, d: AsyncDecl*, node: FunctionDeclNode*, sm: PollSm*) -> BlockStmtNode* {
         const span: SourceSpan = sm.span;
+        // Reduce every `await` to one of the three carrier shapes the state
+        // machine explodes, so the passes below never meet one nested in an
+        // expression. First, because the temporaries it introduces have to go
+        // through the rename and frame registration that follow.
+        this.hoist_awaits(node);
         // Make every local's name globally unique BEFORE flattening, so the
         // by-name cross-state promotion below cannot conflate a promoted local
         // with a same-named parameter or a sibling-scope local.
