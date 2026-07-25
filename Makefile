@@ -298,21 +298,28 @@ endif
 
 # ---- Cryo-language LSP server -----------------------------------------
 # Builds tools/CryoLSP/ (entirely Cryo source) into bin/cryolsp.
-# Depends on the stage-2 binary as a file so an existing compiler build
-# is reused. Run `make cryo` first if you want to pick up compiler changes.
+# Drives off the committed pin only: the LSP pulls the compiler in as a
+# *library* dependency (tools/CryoLSP/cryoconfig -> path = "../../compiler"),
+# so the stage-2 compiler *binary* is not an input here.  Depending on it
+# would drag `make cryo` (stdlib + full self-host) in front of every LSP
+# build for no benefit.  $(LIBCRYO_A) is a file target, so the stdlib
+# archive is only built when it is actually missing.
+# Run `make cryo` / `make pin` first if you want compiler changes reflected
+# in the pin used to build; the LSP's own copy of the compiler library is
+# always rebuilt from current source by the project build.
 ifeq ($(HOST_OS),windows)
 # Windows host: recipes run under cmd, which has no `cp`.  `$(PIN)` (bin/cryo,
 # no extension) launches via PATHEXT -> bin/cryo.exe.  The built binary is
 # `cryolsp.exe`; copy it to the pin with the `copy` builtin (backslash paths,
-# stdout silenced).  `$(STAGE2)` is the Linux ELF and isn't a real
-# prerequisite here, so this target stands alone.
+# stdout silenced).  Windows recipes can't run the POSIX `$(LIBCRYO_A)`
+# delegate, so this target stands alone.
 lsp:
 	@echo "==> Building CryoLSP via bin/cryo.exe"
 	cd tools/CryoLSP && "$(PIN)" build
 	copy /Y "$(subst /,\,$(LSP_BIN))" "$(subst /,\,$(LSP_PIN))" >NUL
 	@echo "==> bin/cryolsp.exe ready"
 else
-lsp: $(STAGE2)
+lsp: $(PIN) $(LIBCRYO_A)
 	@echo "==> Building CryoLSP via bin/cryo"
 	@cd tools/CryoLSP && "$(PIN)" build
 	@cp "$(LSP_BIN)" "$(LSP_PIN)"

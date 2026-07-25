@@ -1106,13 +1106,24 @@ type struct CallResolver {
                            tmpl_ret: TypeRef) -> TypeRef {
         if (!tmpl_ret.is_valid()) { return TypeRef::invalid(); }
         if (bindings.length != entry.param_type_ids.length) { return TypeRef::invalid(); }
+        // A still-generic result is meaningless to a CONCRETE caller typed
+        // pre-mono, so it is rejected there. Inside the symbolic generic-body
+        // walk it is the correct answer: the caller's own parameters are abstract,
+        // so `mk<T>(v)` genuinely has type `W<T>`, and monomorphization
+        // substitutes it along with the rest of the body. Rejecting it there
+        // leaves the call untyped, which only shows up where something needs the
+        // type — `await f<T>(x)`, whose operand type IS the answer.
+        const symbolic: boolean = this.state.in_symbolic_check;
         for (mut i: i64 = 0; i < bindings.length; i++) {
             if (!bindings[i].is_valid()) { return TypeRef::invalid(); }
-            if (this.types.contains_generic_param(bindings[i])) { return TypeRef::invalid(); }
+            if (!symbolic && this.types.contains_generic_param(bindings[i])) {
+                return TypeRef::invalid();
+            }
         }
         mut subst: TypeSubstitution = TypeSubstitution::from_params(entry.param_type_ids, bindings);
         const out: TypeRef = subst.apply(tmpl_ret, this.arena);
-        if (!out.is_valid() || this.types.contains_generic_param(out)) { return TypeRef::invalid(); }
+        if (!out.is_valid()) { return TypeRef::invalid(); }
+        if (!symbolic && this.types.contains_generic_param(out)) { return TypeRef::invalid(); }
         return out;
     }
 

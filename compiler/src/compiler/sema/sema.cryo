@@ -240,9 +240,8 @@ public:
             const stmt: ASTNode* = node.statements[i];
             if (stmt == null || stmt.kind != NodeKind::FunctionDeclaration) { continue; }
             const f: FunctionDeclNode* = stmt as FunctionDeclNode*;
-            // Generic async fns are rejected at their declaration, and a lowered
-            // one has already had `is_async` cleared.
-            if (f.is_async && !f.is_generic() && f.body != null) {
+            // A lowered one has already had `is_async` cleared.
+            if (f.is_async && f.body != null) {
                 this.async_lower.declare(f);
             }
         }
@@ -291,16 +290,16 @@ public:
     override visit(mut &this, node: FunctionDeclNode*) -> void {
         if (node.body == null) { return; }
         if (node.is_generic()) {
-            // The state machine is built here, from the typed body. A generic
-            // body is still symbolic at this point — its awaited types, and hence
-            // the sub-future fields to carry them, are not known until
-            // monomorphization. Reported at the declaration: left to the use
-            // site, the missing lowering surfaces as an unresolved generic
-            // instantiation from deep inside the future machinery.
+            // A generic body is typed by the symbolic walk, against abstract
+            // parameter refs. For an `async function` that walk is not optional:
+            // the state machine is built from the resolved types it leaves on the
+            // body, and the future it produces is generic in the same parameters,
+            // so the monomorphizer specializes it from the same demand that
+            // specializes the function.
             if (node.is_async) {
-                this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
-                    "async: a generic `async function` is not supported yet; its body is still symbolic when the state machine is built, so declare it with concrete types",
-                    node.span);
+                this.symbolic_check_body_forced(node, TypeRef::invalid(), TypeRef::invalid());
+                this.async_lower.lower(node);
+                return;
             }
             this.symbolic_check_body(node, TypeRef::invalid(), TypeRef::invalid());
             return;
@@ -530,6 +529,19 @@ public:
 
     symbolic_check_body(mut &this, func: FunctionDeclNode*, this_type: TypeRef, owner_type: TypeRef) -> void {
         if (!this.sema_symbolic_check_enabled()) { return; }
+        this.symbolic_check_body_forced(func, this_type, owner_type);
+    }
+
+    /// The walk itself, run whether or not the check is enabled.
+    ///
+    /// Everywhere else the walk is additive — it reports, ahead of any
+    /// instantiation, errors a generic body would produce — so `CRYO_NO_SYMBOLIC_CHECK`
+    /// may switch it off. Lowering a generic `async function` is the exception:
+    /// the walk is what puts resolved types on the body, and the state-machine
+    /// build CONSUMES them. Skipping it there would not lose a diagnostic, it
+    /// would build the machine out of untyped nodes.
+    symbolic_check_body_forced(mut &this, func: FunctionDeclNode*, this_type: TypeRef,
+                               owner_type: TypeRef) -> void {
         if (func == null || func.body == null) { return; }
         const sink: DiagnosticSink* = this.ctx.diagnostics;
         if (sink == null) { return; }
