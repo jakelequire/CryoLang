@@ -26,12 +26,20 @@ public:
     /// Directives written as `![name(args)]` immediately preceding this
     /// declaration in source order.
     attached_directives: DirectiveNode*[];
+    /// Extent of the leading modifier keywords (`public` / `private` /
+    /// `protected` / `async` / `static`) the parser consumed before reaching
+    /// this declaration's own first token.  `span` starts at that first
+    /// token (`function`, `type`, the method name), so the modifiers fall
+    /// outside it; `outer_span()` folds them back in.  `none()` when the
+    /// declaration carries no modifier.
+    modifier_span:       SourceSpan;
 
     DeclarationNode(kind: NodeKind, span: SourceSpan) : ASTNode(kind, span) {
         this.documentation       = "";
         this.source_module       = "";
         this.name_span           = SourceSpan::none();
         this.attached_directives = [];
+        this.modifier_span       = SourceSpan::none();
     }
 
     has_documentation() -> boolean { return this.documentation != ""; }
@@ -44,6 +52,31 @@ public:
     set_name_span(span: SourceSpan) -> void { this.name_span = span; }
     add_directive(d: DirectiveNode*) -> void {
         if (d != null) { this.attached_directives.push(d); }
+    }
+
+    /// Record the span of one leading modifier keyword.  Called once per
+    /// keyword as the parser consumes it, so the recorded extent grows to
+    /// cover all of them however they nest (`public async function` records
+    /// `async` from the inner parse, then `public` from the outer one).
+    note_modifier_span(span: SourceSpan) -> void {
+        this.modifier_span = SourceSpan::covering(this.modifier_span, span);
+    }
+
+    /// The declaration's full written extent: `span` widened to cover the
+    /// leading modifier keywords and every attached `![...]` directive.
+    /// `span` alone starts at `function` / `type` - the right thing to
+    /// underline in a diagnostic, but not what a reader sees as "the
+    /// declaration".  Anything highlighting the declaration as a whole (the
+    /// LSP's inactive-region dimming) needs this instead.
+    outer_span(&this) -> SourceSpan {
+        mut out: SourceSpan = SourceSpan::covering(this.span, this.modifier_span);
+        for (mut i: i64 = 0; i < this.attached_directives.length; i++) {
+            const d: DirectiveNode* = this.attached_directives[i];
+            if (d != null) {
+                out = SourceSpan::covering(out, d.span);
+            }
+        }
+        return out;
     }
 
     find_directive(&this, name: string) -> DirectiveNode* {
