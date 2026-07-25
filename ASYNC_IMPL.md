@@ -75,13 +75,16 @@ silent miscompile** (they compiled, then re-polled a completed sub-future); dire
 now rejected at the `await` that closes the cycle. `make test` OVERALL PASS **1648 / 150 / 9** (from
 1633/144/9). Compiler-only — `stdlib/` has zero `async function`s, so no stdlib IR moves.
 
-**⏸ Generic `async function` — designed and mostly plumbed, NOT landed; still `E0600` at the declaration.**
-Jake wants it working. The WIP is preserved and §9 records exactly where it stops: the generic future
-template registers and `Fut<i64>` forms, but nothing DEMANDS its specialization, so its fields, `poll` and
-`Future` impl are never built. Next step is the free-function specialization path's missing
-`request_nested_instantiations` on the spec's return type. **The reusable lesson is in §9: a synthesized
-annotation built by `make_type_ann` is pre-resolved and therefore invisible to monomorphization's
-substitution** — anything mentioning a type parameter has to be spelled by name.
+**✅ Generic `async function` WORKS (2026-07-25) — the stopgap `E0600` and its negative test are deleted.**
+Declared, instantiated at several types (including a struct and `f64`), inferred without a turbofish,
+awaited, `block_on`-able, awaiting concrete futures, awaiting futures named by its own parameter
+(`Ready<T>`), and awaiting other generic `async function`s. `-> void`, branches, loops, and a droppable
+aggregate carried across a suspend all work generically. 12 permanent tests in
+`tests/tests/lang/async_generic_function.cryo`. Two root causes, both fixed in a shared layer rather than at
+a call site — see the newest §9 entry. **The reusable lesson stands and is now enforced by construction:
+a synthesized annotation built by `make_type_ann` is pre-resolved and therefore invisible to
+monomorphization's substitution**, so `AsyncLower::type_ann_for` now spells any type mentioning a parameter
+BY NAME and pre-resolves only fully-concrete subtrees.
 
 **✅ FIXED (2026-07-23) — `block_on` (and every where-bound-only-param generic) now infers without a
 turbofish.** Was: `block_on(fut)` — and any `f<F, R>(fut: F) -> R where F: Future<R>` — failed **codegen
@@ -1940,3 +1943,92 @@ IR should be unchanged — verify the `win-s2` vs `win-s3` `.ll` diff at each bo
     neither `stdlib/` nor the compiler's own source contains an `async function`, so nothing downstream of
     the pin moves. The consequence to remember is that the pinned `bin/cryo` does not carry the new
     diagnostics until someone repins.
+
+---
+
+### 2026-07-25 — Generic `async function` LANDED (the §4 mission)
+
+The previous session's design was right and is unchanged; what was missing was two root causes, both one
+layer below the async lowering. The stopgap `E0600` at the declaration and its negative test
+(`E0600_async_generic_function.cryo`) are **deleted**.
+
+**The design (as previously specified, now built).** The future is generic in the same parameters as the
+function — `identity$Future<T>` with `implement<T> trait Future<T> for identity$Future<T>` — registered as a
+`TemplateEntry` (`NodeKind::StructDeclaration`, `base_type` = the `create_struct` base), so the monomorphizer
+specializes `Fut<i64>` from the same demand that specializes `identity<i64>`. `AsyncDecl` gained `self_ty`
+(the instantiated `Fut<T>`, what a VALUE of the future is) and `generic`; `struct_ref` stays the
+uninstantiated base that the template registers against and that carries the arena field table. `self_ty`
+is used for the function's registered and final return type, the constructor literal's resolved type, and
+`sm.struct_ref` (the type of `this` inside `poll`). The impl block gets `generic_params` + `target_args`
+(so `This` resolves to the full `Fut<T>`) and is hung off the template with `register_impl_block`, so the
+specialization gets its `Future` impl rather than existing without a `poll`. Everything the lowering builds
+that can mention a parameter runs under `arena.set_symbolic_no_demand(true)`, restored on every exit path.
+
+**Root cause 1 — nothing demanded the specialization.** The previous session left this pointing at the
+monomorphizer's free-function `request_nested_instantiations`. That was a red herring: that path is fine.
+Once the *annotations* were spelled correctly the demand arrived on its own, because the specialized
+function's return annotation resolves to `Fut<i64>` and the existing signature walk enqueues it. The real
+work was the annotation spelling, generalized:
+
+  * **`type_ann_for(ty)` replaces per-site annotation building.** A subtree with no generic parameter is
+    pre-resolved (cheap, and skips a name lookup a synthesized name might not survive); a subtree that
+    mentions one is rebuilt structurally down to the parameter, which is spelled by NAME. It returns null
+    for a shape with no annotation spelling, and `add_future_field` reports that rather than emitting a
+    field that would silently stay generic in the specialization. This covers the future's fields, the
+    `Option<F_k>` sub-futures, promoted locals, `Poll<Output>`, and the impl's `Output` binding uniformly —
+    the previous plan's list of hand-written cases.
+  * **Why it must be by name at all:** the ASTCloner deliberately drops every `resolved_type`
+    (`clone_field_decl`: "resolved_type left as TypeRef::invalid()"), and `resolve_fields` only re-resolves a
+    field that HAS an annotation. A specialization therefore sees annotations and nothing else.
+
+**Root cause 2 — `subst_free_call_return` refused to answer inside a symbolic body.** `await inner<T>(v)`
+reported "`await` requires an expression whose type implements `Future`; `T` does not", because
+`CallResolver::subst_free_call_return` returns invalid whenever a binding or the result still contains a
+generic param. That guard is right for a CONCRETE caller typed pre-mono and is now narrowed to exactly that
+(`!state.in_symbolic_check`). Inside the symbolic walk the caller's own parameters are abstract, so
+`mk<T>(v)` genuinely HAS type `W<T>`. **This was pre-existing and not async-specific** — the control
+(`const w: W<T> = mk<T>(v);` in a plain generic fn) appeared to work only because the explicit annotation
+supplied the type and nothing consulted the call's own; `await` is the first construct that needs it.
+
+**A pre-existing bug found on the way:** `param_field_type` built the `Option<T>` carrier from `sm.opt_base`
+without checking it is valid. `opt_base` is only looked up when the body has an `await`, so a **no-await**
+async fn with a droppable parameter minted a garbage `?<T>` instantiation. A body with no suspend has
+nothing to carry, so the carrier predicate is now `param_is_carried` = `opt_base.is_valid() &&
+param_needs_carrier`, used by the field type, the constructor, and `carry_params` alike.
+
+**Two things the previous session predicted that did NOT materialize.** (a) The `zeroable_kind` concern —
+a carried local of bare parameter type — needed no special casing; the existing promotion already routes it
+correctly, and `via_local<String>` (droppable `T`) round-trips and drops exactly once. (b) `lambda_synth`
+was correctly identified as a dead end and was not touched.
+
+**Also required:** `symbolic_check_body_forced` (the walk is load-bearing for async — it puts the resolved
+types the state-machine build consumes on the body — so `CRYO_NO_SYMBOLIC_CHECK` must not switch it off
+there), and `declare_async_futures` no longer skips generic fns, so declaration order stays irrelevant.
+
+**Known adjacent limitation, NOT introduced here and NOT async-specific:** a generic stdlib type reached
+through a re-export (`import std::future;` → `public module future::ready;`) does not resolve
+`Ready<T>::new` inside a generic body; importing `std::future::ready` directly works. The same body with
+`Ready<i64>::new` resolves under either import, so it is the re-export + type-parameter combination.
+
+**Gates (Linux host).** `make test` **OVERALL PASS** — unit 12/12 new + full suite ok, compile-fail 149
+(150 − the deleted negative test), projects 11. `make selfhost-check` Linux stage-3 ≡ stage-4 byte-identical
+IR. `tests/test-roster.txt` regenerated by MERGE, not `--update`: `--update` on Linux would silently DELETE
+`ProcessCommand::output_large_stderr_no_deadlock_win`, which Linux cannot discover — the roster is
+platform-sensitive, and that entry is in the committed golden at HEAD. Net +12 entries (1648 → 1660).
+
+`make selfhost-check` exit 0 with **both** `FIXED POINT OK` markers (Linux target-IR + Windows native-PE).
+
+**Pin deltas by the §6 pairs — all zero, so NO REPIN.** Compiler `win-s2` vs `win-s3` = **0/161 `.ll`**;
+stdlib `win-s1` vs `win-s2` = **0/149**; Linux stdlib `target` vs `self/s2` = **0/149**. The Linux compiler
+pair (`build/target` vs `build/self/s3`) shows 57 files differing **for a non-semantic reason worth
+recording**: the `FILE` macro embeds the stdlib path as the invoking stage passed it — absolute
+(`/workspaces/CryoLang/bin/../stdlib/…`) from the pinned `bin/cryo`, relative (`./../stdlib/…`) from
+`compiler/build/cryo` — so the string and its `[N x i8]` length differ. Normalizing just that path yields
+**0/161 residual**. This is expected for a compiler-only async change: neither `stdlib/` nor the compiler's
+own source contains an `async function`, and the `call_resolver` narrowing fires only under
+`in_symbolic_check`, which is a check-only walk that emits no code.
+
+**Pin note (pre-existing, not caused here).** `bin/cryo` / `bin/cryo.exe` are pinned at `89a57b30`, **two
+commits behind HEAD** (`776fc805`). Since no IR moves, a repin is not required by the repin rule — but the
+pinned compiler cannot itself COMPILE a generic `async function` until someone repins, which will matter the
+moment `stdlib/` grows one.

@@ -1,0 +1,203 @@
+// A generic `async function` lowers to a future generic in the SAME parameters,
+// registered as an ordinary struct template.  The demand that specializes
+// `identity<i64>` is therefore the demand that specializes `identity$Future<i64>`
+// - one mechanism, not a parallel one.
+//
+// The thing this has to get right, and the reason it is easy to get wrong: the
+// monomorphizer substitutes generic parameters that appear in ANNOTATIONS, and a
+// synthesized annotation may skip name lookup by carrying a pre-resolved
+// TypeRef.  Pre-resolving is invisible to substitution, so anything the lowering
+// synthesizes that mentions a parameter - the function's return type, the
+// constructor literal's type arguments, `poll`'s return, the impl's trait
+// argument and `Output` binding, every captured field - must be spelled BY NAME.
+// Get one wrong and the specialization silently keeps `T`, which surfaces far
+// away as an unresolved member type or a missing `poll`.
+![config(testing)]
+namespace CryoTests::Tests::Lang::AsyncGenericFunction;
+
+import std::test;
+import std::core::result;
+import std::future;
+import std::future::ready;
+
+type struct GfPoint {
+    x: i64;
+    y: i64;
+}
+
+mut gf_hits: i64 = 0;
+
+/// The first failure of two checks, or Ok.  Both operands are already-computed
+/// comparisons, so evaluating them eagerly costs nothing and keeps a test that
+/// asserts over several instantiations readable.
+function gf_both(a: Result<(), TestError>, b: Result<(), TestError>) -> Result<(), TestError> {
+    match (a) {
+        Result::Ok(_)  => {}
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return b;
+}
+
+// No await: exercises the whole template / impl / specialization path with none
+// of the suspend machinery.
+async function gf_identity<T>(v: T) -> T {
+    return v;
+}
+
+// Awaits a CONCRETE future from inside a generic body.
+async function gf_const_step<T>(v: T, n: i64) -> i64 {
+    const step: i64 = await PendingThenReady<i64>::new(2, n);
+    return step;
+}
+
+// Awaits a future whose type MENTIONS the parameter (`Ready<T>`), so the
+// sub-future field is `Option<Ready<T>>`.
+async function gf_echo<T>(v: T) -> T {
+    const x: T = await Ready<T>::new(v);
+    return x;
+}
+
+// Awaits another generic `async function` at the caller's own parameter, so the
+// sub-future's type is the callee's generated future instantiated at `T`.
+async function gf_outer<T>(v: T) -> T {
+    const x: T = await gf_identity<T>(v);
+    return x;
+}
+
+// A local of bare type-parameter type, live across a suspend: it cannot stay on
+// the poll frame (every poll runs on a new one), so it is carried in a field.
+async function gf_via_local<T>(v: T) -> T {
+    const kept: T = v;
+    const step: i64 = await PendingThenReady<i64>::new(1, 1);
+    if (step != 1) { return kept; }
+    return kept;
+}
+
+// `-> void` in a generic fn, with and without a suspend: `Output` is unit.
+async function gf_void_no_await<T>(v: T) -> void {
+    gf_hits = gf_hits + 1;
+}
+
+async function gf_void_await<T>(v: T, n: i64) -> void {
+    const step: i64 = await PendingThenReady<i64>::new(1, n);
+    gf_hits = gf_hits + step;
+}
+
+// A droppable aggregate parameter carried across a suspend, alongside `T`.
+async function gf_with_string<T>(v: T, s: String) -> i64 {
+    const step: i64 = await PendingThenReady<i64>::new(2, 100);
+    return step + (s.length() as i64);
+}
+
+// Branches and a loop, each holding a suspend, inside a generic body.
+async function gf_branchy<T>(v: T, flag: boolean) -> i64 {
+    mut acc: i64 = 0;
+    if (flag) {
+        const a: i64 = await PendingThenReady<i64>::new(1, 10);
+        acc = a;
+    } else {
+        const b: i64 = await PendingThenReady<i64>::new(2, 20);
+        acc = b;
+    }
+    mut i: i64 = 0;
+    while (i < 3) {
+        const s: i64 = await PendingThenReady<i64>::new(1, 1);
+        acc = acc + s;
+        i = i + 1;
+    }
+    return acc;
+}
+
+![test]
+function generic_async_no_await_returns_its_argument() -> Result<(), TestError> {
+    const a: i64 = future::block_on(gf_identity<i64>(7));
+    return expect_eq(a, 7 as i64);
+}
+
+// Two instantiations of one generic async fn must not collapse onto each other.
+![test]
+function generic_async_instantiates_at_several_types() -> Result<(), TestError> {
+    const a: i64 = future::block_on(gf_identity<i64>(7));
+    const b: u32 = future::block_on(gf_identity<u32>(9));
+    const c: f64 = future::block_on(gf_identity<f64>(2.5));
+    return gf_both(gf_both(expect_eq(a, 7 as i64), expect_eq(b, 9 as u32)),
+                   expect_eq(c, 2.5 as f64));
+}
+
+// A struct type argument: the captured field is an aggregate, not a scalar.
+![test]
+function generic_async_accepts_a_struct_type_argument() -> Result<(), TestError> {
+    const p: GfPoint = future::block_on(gf_identity<GfPoint>(GfPoint { x: 3, y: 4 }));
+    return gf_both(expect_eq(p.x, 3 as i64), expect_eq(p.y, 4 as i64));
+}
+
+// No turbofish: the parameter is inferred from the argument, and must reach the
+// same specialization the explicit form does.
+![test]
+function generic_async_infers_its_type_argument() -> Result<(), TestError> {
+    const a: i64 = future::block_on(gf_identity(11));
+    return expect_eq(a, 11 as i64);
+}
+
+![test]
+function generic_async_awaits_a_concrete_future() -> Result<(), TestError> {
+    const a: i64 = future::block_on(gf_const_step<i64>(1, 10));
+    const b: i64 = future::block_on(gf_const_step<u32>(3, 12));
+    return gf_both(expect_eq(a, 10 as i64), expect_eq(b, 12 as i64));
+}
+
+![test]
+function generic_async_awaits_a_future_named_by_its_parameter() -> Result<(), TestError> {
+    const a: i64 = future::block_on(gf_echo<i64>(7));
+    const b: u32 = future::block_on(gf_echo<u32>(9));
+    return gf_both(expect_eq(a, 7 as i64), expect_eq(b, 9 as u32));
+}
+
+![test]
+function generic_async_awaits_another_generic_async() -> Result<(), TestError> {
+    const a: i64 = future::block_on(gf_outer<i64>(7));
+    const b: u32 = future::block_on(gf_outer<u32>(9));
+    return gf_both(expect_eq(a, 7 as i64), expect_eq(b, 9 as u32));
+}
+
+![test]
+function generic_async_carries_a_parameter_typed_local_across_a_suspend()
+        -> Result<(), TestError> {
+    const a: i64 = future::block_on(gf_via_local<i64>(7));
+    return expect_eq(a, 7 as i64);
+}
+
+// The same carry with a DROPPABLE `T`: the slot must hand the value back
+// intact, and must not drop it twice.
+![test]
+function generic_async_carries_a_droppable_parameter_typed_local()
+        -> Result<(), TestError> {
+    mut s: String = future::block_on(gf_via_local<String>(String::from("hey")));
+    const n: u64 = s.length();
+    s.drop();
+    return expect_eq(n, 3 as u64);
+}
+
+![test]
+function generic_async_returning_void_runs() -> Result<(), TestError> {
+    gf_hits = 0;
+    future::block_on(gf_void_no_await<i64>(1));
+    const no_await: i64 = gf_hits;
+    gf_hits = 0;
+    future::block_on(gf_void_await<u32>(2, 5));
+    return gf_both(expect_eq(no_await, 1 as i64), expect_eq(gf_hits, 5 as i64));
+}
+
+![test]
+function generic_async_carries_a_droppable_parameter_across_a_suspend()
+        -> Result<(), TestError> {
+    const a: i64 = future::block_on(gf_with_string<i64>(1, String::from("abcd")));
+    return expect_eq(a, 104 as i64);
+}
+
+![test]
+function generic_async_lowers_branches_and_loops() -> Result<(), TestError> {
+    const a: i64 = future::block_on(gf_branchy<i64>(1, true));
+    const b: i64 = future::block_on(gf_branchy<u32>(1, false));
+    return gf_both(expect_eq(a, 13 as i64), expect_eq(b, 23 as i64));
+}
