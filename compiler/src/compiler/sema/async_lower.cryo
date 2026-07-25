@@ -87,6 +87,20 @@ type struct PollSm {
     // EXPLODED loop, which is exactly the source loop the edge targets.
     loop_cont:  i64[];
     loop_brk:   i64[];
+
+    // Names whose storage lives in the poll frame: the body's locals and
+    // `match`-arm bindings (re-materialized on every poll) plus the parameters
+    // (re-bound by the shadow prelude on every poll). An address rooted in one
+    // of these is invalid once the poll that produced it returns, so it may not
+    // be held across a suspend; an address rooted anywhere else (a global, the
+    // future struct's own fields, a pointee in the caller's frame or on the
+    // heap) is untouched by a suspend.
+    frame_names: SymbolStr[];
+
+    // True when the function was declared `-> void`, so `Output` is unit and a
+    // body that ends without a `return` completes with `Poll::Ready(())` rather
+    // than being rejected for having no value to hand back.
+    unit_output: boolean;
 }
 
 /// Lexical scope stack for `disambiguate_locals`, the pre-lowering alpha-rename
@@ -143,6 +157,41 @@ type struct BindingCapture {
     }
 }
 
+/// What `declare` builds for one `async function` and `lower` finishes.
+///
+/// The two run at different times on purpose: the future TYPE has to exist
+/// before any body in the module is typed (an `await` on a callee declared lower
+/// in the file resolves through the declaration index), while the state machine
+/// can only be built from a body sema has already walked. So `declare` creates
+/// the struct, the `poll` signature and the `Future` impl and registers them,
+/// and `lower` fills in the struct's fields, `poll`'s body, and the constructor.
+///
+/// `ok` is false when `declare` failed; the record is still kept so `lower`
+/// knows not to retry and re-report.
+type struct AsyncDecl {
+    node:        FunctionDeclNode*;
+    ok:          boolean;
+
+    q_name:      SymbolStr;
+    module_sym:  SymbolStr;
+    struct_ref:  TypeRef;
+    // The `Future`'s `Output`: the declared return type, or unit for `-> void`.
+    output_ref:  TypeRef;
+    // The return type as WRITTEN, which the body is still checked against.
+    declared_ref: TypeRef;
+    poll_out:    TypeRef;
+    poll_base:   TypeRef;
+    ctx_ptr_ty:  TypeRef;
+    u32_ty:      TypeRef;
+    state_sym:   SymbolStr;
+
+    // Nodes created empty by `declare` and completed by `lower`.
+    struct_decl: StructDeclNode*;
+    impl_node:   ImplBlockNode*;
+    poll_fn:     FunctionDeclNode*;
+    poll_method: MethodNode*;
+}
+
 type struct AsyncLower {
     arena:    TypeArena*;
     intern:   InternTable*;
@@ -153,9 +202,69 @@ type struct AsyncLower {
     // lowering; null for every other path.
     patterns: PatternResolver*;
     counter:  u64;
+    // Every name `mint_local` hands out for the async body currently being
+    // lowered — i.e. exactly the body's locals and `match`-arm bindings, which
+    // are the values that live in the poll frame rather than in the future
+    // struct. Reset per function by `disambiguate_locals`, the sole caller-side
+    // funnel; consumed by the address-of-across-suspend check, which must know
+    // whether a place is rooted in the frame (moves on every poll) or in a
+    // global (does not).
+    frame_locals: SymbolStr[];
+    // Parallel to `frame_locals`: the source spelling each minted name replaced,
+    // so a diagnostic about a local can name it as the user wrote it instead of
+    // showing the internal `$L` suffix.
+    frame_local_src: SymbolStr[];
+    // One record per `async function` this module has declared but not yet
+    // lowered. Keyed by node identity rather than name: a name is not unique
+    // across overloads, and the record has to reach exactly the visit that owns
+    // the body.
+    pending: AsyncDecl[];
+    // The "awaits" graph over generated future types, as arena type-id pairs
+    // (`edge_from[i]` holds a sub-future of type `edge_to[i]`). A cycle in it
+    // means a state machine would contain itself and have no finite size, so the
+    // edge that would close one is rejected. Recorded here rather than recovered
+    // from the struct fields because a future's fields are populated only when
+    // ITS body is lowered, which for a mutually recursive pair is after the first
+    // of them needs the answer.
+    edge_from: u64[];
+    edge_to:   u64[];
 
     static null() -> AsyncLower {
-        return AsyncLower { arena: null, intern: null, ctx: null, patterns: null, counter: 0u64 };
+        return AsyncLower { arena: null, intern: null, ctx: null, patterns: null, counter: 0u64,
+                            frame_locals: [], frame_local_src: [], pending: [],
+                            edge_from: [], edge_to: [] };
+    }
+
+    /// True when a future of type `from` holds — directly or through the futures
+    /// it awaits — a future of type `target`. Depth-first over the recorded edges
+    /// with a visited set, so an already-recorded cycle cannot spin.
+    future_reaches(&this, from: u64, target: u64) -> boolean {
+        if (from == target) { return true; }
+        mut stack: u64[] = [from];
+        mut seen:  u64[] = [from];
+        while (stack.length > 0i64) {
+            const cur: u64 = stack[stack.length - 1i64];
+            stack.pop();
+            for (mut i: i64 = 0; i < this.edge_from.length; i++) {
+                if (this.edge_from[i] != cur) { continue; }
+                const next: u64 = this.edge_to[i];
+                if (next == target) { return true; }
+                mut known: boolean = false;
+                for (mut s: i64 = 0; s < seen.length; s++) {
+                    if (seen[s] == next) { known = true; }
+                }
+                if (!known) { seen.push(next); stack.push(next); }
+            }
+        }
+        return false;
+    }
+
+    /// Index of `node`'s pending record, or -1.
+    pending_index(&this, node: FunctionDeclNode*) -> i64 {
+        for (mut i: i64 = 0; i < this.pending.length; i++) {
+            if (this.pending[i].node == node) { return i; }
+        }
+        return -1i64;
     }
 
     wire(mut &this, arena: TypeArena*, intern: InternTable*, ctx: CompilationContext*,
@@ -191,6 +300,29 @@ type struct AsyncLower {
         return new TypeAnnotation::Named(n);
     }
 
+    is_void_type(&this, ty: TypeRef) -> boolean {
+        if (!ty.is_valid()) { return false; }
+        const t: Type* = this.arena.lookup(ty.id);
+        if (t == null) { return false; }
+        return t.kind == TypeKind::Void;
+    }
+
+    /// The unit value `()`. Spelled the way the parser spells it, so the rest of
+    /// the pipeline sees an ordinary unit literal rather than a shape unique to
+    /// the async lowering.
+    unit_value(&this, span: SourceSpan) -> ExpressionNode* {
+        mut lit: LiteralNode* = new LiteralNode("void", LiteralKind::Null, span);
+        lit.set_resolved_type(this.arena.get_unit());
+        return lit as ExpressionNode*;
+    }
+
+    /// `return Poll::Ready(());` — the terminal return of a `-> void` async fn,
+    /// whose `Output` is unit.
+    unit_ready_return(&this, poll_out: TypeRef, span: SourceSpan) -> StatementNode* {
+        return new ReturnStmtNode(
+            this.make_poll_ready(this.unit_value(span), poll_out, span), span) as StatementNode*;
+    }
+
     /// Wrap an already-typed value expression in `Poll::Ready(<expr>)` typed as
     /// `Poll<Output>`.
     make_poll_ready(&this, value: ExpressionNode*, poll_out: TypeRef, span: SourceSpan) -> ExpressionNode* {
@@ -220,6 +352,12 @@ type struct AsyncLower {
                 // the wrap sees a fully rewritten operand.
                 this.rewrite_returns_expr(ret.expression, poll_out, span);
                 ret.expression = this.make_poll_ready(ret.expression, poll_out, span);
+            } else {
+                // A bare `return;` only type-checks in a `-> void` function, whose
+                // `Output` is unit — so the value `Poll::Ready` carries is `()`.
+                // `poll` returns a value on every path, so the bare form cannot
+                // survive into the generated body.
+                ret.expression = this.make_poll_ready(this.unit_value(span), poll_out, span);
             }
             return;
         }
@@ -690,6 +828,11 @@ type struct AsyncLower {
             for (mut bi: i64 = 0; bi < orig.statements.length; bi++) {
                 this.rewrite_returns(orig.statements[bi], poll_out, span);
                 body.add_statement(orig.statements[bi]);
+            }
+            // A void body may end without a `return`, but `poll` may not: give it
+            // the unit completion the source left implicit.
+            if (!this.block_diverges(orig)) {
+                body.add_statement(this.unit_ready_return(poll_out, span));
             }
         }
         return body;
@@ -1209,6 +1352,34 @@ type struct AsyncLower {
                 "async: could not resolve an awaited future's type (its operand must implement `Future`)", span);
             sm.ok = false; return cur;
         }
+        // The sub-future is stashed in a field and polled again from a later
+        // state's frame, so an address of the current frame handed to it is
+        // dangling by the time the operation writes through it — and writes to a
+        // dead frame slot corrupt silently instead of faulting.
+        const op_root: SymbolStr = this.frame_addr_root_expr(sm, aw.operand);
+        if (op_root.is_valid()) {
+            this.ctx.emit_error_at(ErrorCode::E0455_DANGLING_POINTER,
+                format("async: this `await` hands the address of the local or parameter `%s` to a future that outlives the current step; each poll runs on a fresh frame, so the address is dangling when the future resumes — have the caller own the storage and pass a pointer parameter, or use an operation that owns the buffer itself",
+                       this.intern.resolve(this.strip_local_marker(op_root))),
+                aw.span);
+            sm.ok = false; return cur;
+        }
+
+        // A future stores every future it awaits as a field, so awaiting one that
+        // (transitively) stores THIS one would make the state machine contain
+        // itself: no finite size, and the layout that results overlaps the nested
+        // future with the outer one and re-polls a completed sub-future at
+        // runtime. There is no boxing escape hatch to offer yet, so the recursion
+        // itself has to go.
+        if (this.future_reaches(fi.id, sm.struct_ref.id)) {
+            this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
+                "async: this `await` would make the state machine contain itself, which has no finite size (the awaited future leads back to this one); rewrite the recursion as a loop",
+                aw.span);
+            sm.ok = false; return cur;
+        }
+        this.edge_from.push(sm.struct_ref.id);
+        this.edge_to.push(fi.id);
+
         const k: i64 = sm.naw;
         sm.naw += 1i64;
         const fut_sym: SymbolStr = this.intern.intern(format("fut_%lld", k));
@@ -2367,6 +2538,238 @@ type struct AsyncLower {
         blk.statements = rebuilt;
     }
 
+    // ---- address-of-across-a-suspend soundness ----
+
+    /// Record the names whose storage is the poll frame: the parameters (re-bound
+    /// by the shadow prelude on entry to every poll) and every local and
+    /// `match`-arm binding (renamed, and thereby recorded, by
+    /// `disambiguate_locals`). Must run after that rename, so the recorded names
+    /// are the ones the body now uses.
+    collect_frame_names(mut &this, sm: PollSm*, node: FunctionDeclNode*) -> void {
+        for (mut i: i64 = 0; i < node.parameters.length; i++) {
+            const p: VarDeclNode* = node.parameters[i];
+            if (p != null && p.name.is_valid()) { sm.frame_names.push(p.name); }
+        }
+        for (mut i: i64 = 0; i < this.frame_locals.length; i++) {
+            sm.frame_names.push(this.frame_locals[i]);
+        }
+    }
+
+    is_frame_name(&this, sm: PollSm*, name: SymbolStr) -> boolean {
+        for (mut i: i64 = 0; i < sm.frame_names.length; i++) {
+            if (sm.frame_names[i].equals(name)) { return true; }
+        }
+        return false;
+    }
+
+    /// True when a place built on `base` reaches storage the poll frame does not
+    /// own, because `base` is itself an indirection: a pointer or reference names
+    /// its pointee, and a dynamic array names its heap block. Neither moves when
+    /// a poll returns, so `&p[0]` / `&p.f` / `&*p` on such a base is sound to
+    /// hold across a suspend even though `p` itself lives in the frame.
+    place_leaves_frame(&this, base: ExpressionNode*) -> boolean {
+        if (base == null) { return true; }
+        const bt: TypeRef = base.resolved_type;
+        if (!bt.is_valid()) { return false; }
+        const t: Type* = this.arena.lookup(bt.id);
+        if (t == null) { return false; }
+        if (t.kind == TypeKind::Pointer || t.kind == TypeKind::Reference) { return true; }
+        if (t.kind == TypeKind::Array) { return (t as ArrayType*).is_dynamic(); }
+        return false;
+    }
+
+    /// The frame-resident local or parameter whose own storage the place `e`
+    /// names, or the empty symbol when `e` names storage elsewhere. Each step is
+    /// tested against the type it indexes into, so a place stops being rooted in
+    /// the frame at the first indirection it passes through.
+    addr_place_root(&this, sm: PollSm*, e: ExpressionNode*) -> SymbolStr {
+        if (e == null) { return SymbolStr::empty(); }
+        const k: NodeKind = (e as ASTNode*).kind;
+        if (k == NodeKind::Identifier) {
+            const nm: SymbolStr = (e as IdentifierNode*).name;
+            if (this.is_frame_name(sm, nm)) { return nm; }
+            return SymbolStr::empty();
+        }
+        if (k == NodeKind::MemberAccess) {
+            const ma: MemberAccessNode* = e as MemberAccessNode*;
+            if (this.place_leaves_frame(ma.object)) { return SymbolStr::empty(); }
+            return this.addr_place_root(sm, ma.object);
+        }
+        if (k == NodeKind::ArrayAccess) {
+            const aa: ArrayAccessNode* = e as ArrayAccessNode*;
+            if (this.place_leaves_frame(aa.array)) { return SymbolStr::empty(); }
+            return this.addr_place_root(sm, aa.array);
+        }
+        // A dereference (`&*p`), a call result, a cast: not frame storage a name
+        // owns. `*p` in particular is the caller-owned-buffer idiom this check
+        // steers users toward, so it must not be reported.
+        return SymbolStr::empty();
+    }
+
+    /// The frame-resident root of the first user-written `&` anywhere in `e`, or
+    /// the empty symbol if `e` takes no such address. Synthesized `&` nodes are
+    /// skipped: the compiler materializes those for a receiver or a comparison
+    /// temp that it consumes within the same expression, so they never outlive
+    /// the state that built them.
+    frame_addr_root_expr(&this, sm: PollSm*, e: ExpressionNode*) -> SymbolStr {
+        if (e == null) { return SymbolStr::empty(); }
+        const k: NodeKind = (e as ASTNode*).kind;
+        if (k == NodeKind::UnaryExpression) {
+            const u: UnaryExprNode* = e as UnaryExprNode*;
+            if (u.op.lexeme == "&" && !u.is_synthetic) {
+                const root: SymbolStr = this.addr_place_root(sm, u.operand);
+                if (root.is_valid()) { return root; }
+            }
+            return this.frame_addr_root_expr(sm, u.operand);
+        }
+        if (k == NodeKind::BinaryExpression) {
+            const b: BinaryExprNode* = e as BinaryExprNode*;
+            const l: SymbolStr = this.frame_addr_root_expr(sm, b.left);
+            if (l.is_valid()) { return l; }
+            return this.frame_addr_root_expr(sm, b.right);
+        }
+        if (k == NodeKind::CallExpression) {
+            const c: CallExprNode* = e as CallExprNode*;
+            const cl: SymbolStr = this.frame_addr_root_expr(sm, c.callee);
+            if (cl.is_valid()) { return cl; }
+            for (mut i: i64 = 0; i < c.arguments.length; i++) {
+                const a: SymbolStr = this.frame_addr_root_expr(sm, c.arguments[i]);
+                if (a.is_valid()) { return a; }
+            }
+            return SymbolStr::empty();
+        }
+        if (k == NodeKind::MemberAccess) {
+            return this.frame_addr_root_expr(sm, (e as MemberAccessNode*).object);
+        }
+        if (k == NodeKind::CastExpression) {
+            return this.frame_addr_root_expr(sm, (e as CastExprNode*).expression);
+        }
+        if (k == NodeKind::ArrayAccess) {
+            const aa: ArrayAccessNode* = e as ArrayAccessNode*;
+            const av: SymbolStr = this.frame_addr_root_expr(sm, aa.array);
+            if (av.is_valid()) { return av; }
+            return this.frame_addr_root_expr(sm, aa.index);
+        }
+        if (k == NodeKind::TernaryExpression) {
+            const t: TernaryExprNode* = e as TernaryExprNode*;
+            const c1: SymbolStr = this.frame_addr_root_expr(sm, t.condition);
+            if (c1.is_valid()) { return c1; }
+            const c2: SymbolStr = this.frame_addr_root_expr(sm, t.true_expr);
+            if (c2.is_valid()) { return c2; }
+            return this.frame_addr_root_expr(sm, t.false_expr);
+        }
+        if (k == NodeKind::StructLiteral) {
+            const sl: StructLiteralNode* = e as StructLiteralNode*;
+            for (mut i: i64 = 0; i < sl.field_inits.length; i++) {
+                const f: SymbolStr = this.frame_addr_root_expr(sm, sl.field_inits[i].value);
+                if (f.is_valid()) { return f; }
+            }
+            return SymbolStr::empty();
+        }
+        if (k == NodeKind::AwaitExpression) {
+            return this.frame_addr_root_expr(sm, (e as AwaitExprNode*).operand);
+        }
+        if (k == NodeKind::MatchExpression) {
+            const me: MatchExprNode* = e as MatchExprNode*;
+            const s: SymbolStr = this.frame_addr_root_expr(sm, me.subject);
+            if (s.is_valid()) { return s; }
+            for (mut i: i64 = 0; i < me.arms.length; i++) {
+                if (me.arms[i] == null) { continue; }
+                const g: SymbolStr = this.frame_addr_root_expr(sm, me.arms[i].guard);
+                if (g.is_valid()) { return g; }
+                const b2: SymbolStr = this.frame_addr_root_stmt(sm, me.arms[i].body);
+                if (b2.is_valid()) { return b2; }
+            }
+            return SymbolStr::empty();
+        }
+        return SymbolStr::empty();
+    }
+
+    /// Statement twin of `frame_addr_root_expr`, for the value-block body of a
+    /// `match` expression arm.
+    frame_addr_root_stmt(&this, sm: PollSm*, s: StatementNode*) -> SymbolStr {
+        if (s == null) { return SymbolStr::empty(); }
+        const k: NodeKind = s.kind;
+        if (k == NodeKind::ExpressionStatement) {
+            return this.frame_addr_root_expr(sm, (s as ExprStmtNode*).expression);
+        }
+        if (k == NodeKind::ReturnStatement) {
+            return this.frame_addr_root_expr(sm, (s as ReturnStmtNode*).expression);
+        }
+        if (k == NodeKind::DeclarationStatement) {
+            const ds: DeclStmtNode* = s as DeclStmtNode*;
+            if (ds.declaration != null && ds.declaration.kind == NodeKind::VariableDeclaration) {
+                return this.frame_addr_root_expr(sm, (ds.declaration as VarDeclNode*).initializer);
+            }
+            return SymbolStr::empty();
+        }
+        if (k == NodeKind::BlockStatement) {
+            const blk: BlockStmtNode* = s as BlockStmtNode*;
+            for (mut i: i64 = 0; i < blk.statements.length; i++) {
+                const r: SymbolStr = this.frame_addr_root_stmt(sm, blk.statements[i]);
+                if (r.is_valid()) { return r; }
+            }
+            return SymbolStr::empty();
+        }
+        return SymbolStr::empty();
+    }
+
+    /// The frame-resident address root assigned into `name` by a `<name> = <expr>;`
+    /// anywhere in `blk`, or the empty symbol. Complements the declaration
+    /// initializer: a pointer may be declared null and filled in later.
+    assigned_frame_addr_root(&this, sm: PollSm*, blk: BlockStmtNode*, name: SymbolStr) -> SymbolStr {
+        for (mut i: i64 = 0; i < blk.statements.length; i++) {
+            const s: StatementNode* = blk.statements[i];
+            if (s == null || s.kind != NodeKind::ExpressionStatement) { continue; }
+            const e: ExpressionNode* = (s as ExprStmtNode*).expression;
+            if (e == null || (e as ASTNode*).kind != NodeKind::BinaryExpression) { continue; }
+            const b: BinaryExprNode* = e as BinaryExprNode*;
+            if (b.op.kind != TokenType::Equal) { continue; }
+            if (b.left == null || (b.left as ASTNode*).kind != NodeKind::Identifier) { continue; }
+            if (!(b.left as IdentifierNode*).name.equals(name)) { continue; }
+            const r: SymbolStr = this.frame_addr_root_expr(sm, b.right);
+            if (r.is_valid()) { return r; }
+        }
+        return SymbolStr::empty();
+    }
+
+    /// Reject a value that is about to be carried across a suspend when what it
+    /// holds is the address of something in the poll frame.
+    ///
+    /// Every poll runs on a fresh native frame, and a carried local is
+    /// re-materialized at a new address in each state, so an address taken in one
+    /// state names storage that is dead by the time a later state dereferences
+    /// it. The write then lands on unrelated stack instead of faulting, which is
+    /// why this has to be a compile error rather than something a test catches.
+    /// Returns true when it reported, leaving the caller to unwind.
+    reject_frame_addr_carry(mut &this, sm: PollSm*, vd: VarDeclNode*, nm: SymbolStr) -> boolean {
+        mut root: SymbolStr = this.frame_addr_root_expr(sm, vd.initializer);
+        if (!root.is_valid()) {
+            for (mut b: i64 = 0; b < sm.blocks.length; b++) {
+                if (root.is_valid()) { continue; }
+                root = this.assigned_frame_addr_root(sm, sm.blocks[b], nm);
+            }
+        }
+        if (!root.is_valid()) { return false; }
+        this.ctx.emit_error_at(ErrorCode::E0455_DANGLING_POINTER,
+            format("async: `%s` holds the address of the local or parameter `%s` and is live across an `await`; each poll runs on a fresh frame, so that address is dangling by the time a later step uses it — have the caller own the storage and pass a pointer parameter, whose pointee the suspend does not move",
+                   this.intern.resolve(this.strip_local_marker(nm)),
+                   this.intern.resolve(this.strip_local_marker(root))),
+            vd.span);
+        sm.ok = false;
+        return true;
+    }
+
+    /// A local's source spelling, recovered from the rename `mint_local`
+    /// recorded, so a diagnostic never shows the internal `$L` suffix. A name
+    /// that was never renamed (a parameter, a global) passes through.
+    strip_local_marker(&this, name: SymbolStr) -> SymbolStr {
+        for (mut i: i64 = 0; i < this.frame_locals.length; i++) {
+            if (this.frame_locals[i].equals(name)) { return this.frame_local_src[i]; }
+        }
+        return name;
+    }
+
     /// After the state blocks are built, promote every top-level local read in a
     /// state other than the one it is declared in to a struct field: a value
     /// cannot live on the native stack across a suspend. The store goes at the
@@ -2466,6 +2869,8 @@ type struct AsyncLower {
                     continue;
                 }
 
+                if (this.reject_frame_addr_carry(sm, vd, nm)) { return; }
+
                 mut agg_args: TypeRef[] = [lty];
                 const opt_ty: TypeRef = this.ctx.generic_registry.instantiate(sm.opt_base, &agg_args);
                 if (!opt_ty.is_valid()) {
@@ -2544,6 +2949,11 @@ type struct AsyncLower {
                 sm.nprom += 1i64;
                 continue;
             }
+
+            // Reaching here the value is a scalar that one of the two paths below
+            // will carry, so an address of the frame inside it would outlive the
+            // storage it names.
+            if (this.reject_frame_addr_carry(sm, vd, nm)) { return; }
 
             if (vd.is_mutable) {
                 // A `mut` value written across states cannot live on the native
@@ -2631,7 +3041,10 @@ type struct AsyncLower {
     mint_local(mut &this, orig: SymbolStr) -> SymbolStr {
         const idx: u64 = this.counter;
         this.counter += 1u64;
-        return this.intern.intern(format("%s$L%llu", this.intern.resolve(orig), idx));
+        const fresh: SymbolStr = this.intern.intern(format("%s$L%llu", this.intern.resolve(orig), idx));
+        this.frame_locals.push(fresh);
+        this.frame_local_src.push(orig);
+        return fresh;
     }
 
     /// Rename a `const/mut <name> = <init>;` local: recurse into the initializer
@@ -2957,6 +3370,8 @@ type struct AsyncLower {
     /// parameter no longer collides with it once the body is flattened and the
     /// by-name cross-state promotion runs.
     disambiguate_locals(mut &this, node: FunctionDeclNode*) -> void {
+        this.frame_locals = [];
+        this.frame_local_src = [];
         if (node.body == null || node.body.kind != NodeKind::BlockStatement) { return; }
         mut ctx: RenameCtx = RenameCtx { orig: [], repl: [], marks: [] };
         this.rn_block(&ctx, node.body as BlockStmtNode*);
@@ -2974,22 +3389,29 @@ type struct AsyncLower {
         // by-name cross-state promotion below cannot conflate a promoted local
         // with a same-named parameter or a sibling-scope local.
         this.disambiguate_locals(node);
+        // Records what the frame owns, which the address-of checks below test
+        // places against. Must follow the rename: it registers the names the
+        // body now uses.
+        this.collect_frame_names(sm, node);
 
         mut body: BlockStmtNode* = new BlockStmtNode(span);
         this.emit_shadow_prelude(node, body, sm.struct_ref, true, span);
 
         const orig: BlockStmtNode* = node.body as BlockStmtNode*;
         const entry: i64 = this.sm_alloc(sm);   // state 0
-        this.lower_block_sm(sm, orig, entry);
+        const tail: i64 = this.lower_block_sm(sm, orig, entry);
         if (!sm.ok) { return null; }
 
-        // Every terminal state must return: a value async fn does (the
-        // pre-lowering return check guarantees it), but a body that can fall off
-        // its end (implicit unit return) would spin the dispatch loop or re-poll
-        // a taken sub-future, so reject it rather than miscompile.
-        if (!this.stmt_diverges(orig as StatementNode*)) {
+        // Every terminal state must return, or the dispatch loop would spin on it
+        // and re-poll an already-taken sub-future. A void body legitimately ends
+        // without a `return`, and its terminal state gets the unit completion
+        // appended below. A value-returning body reaching here means the return
+        // analysis disagrees with the pre-lowering check, which is a shape this
+        // lowering cannot express — report it rather than miscompile.
+        const falls_off: boolean = !this.stmt_diverges(orig as StatementNode*);
+        if (falls_off && !sm.unit_output) {
             this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
-                "async: an `async function` with `await`s must return on every path; a body that falls off its end (implicit unit return) is not yet supported here",
+                "async: an `async function` with `await`s must return on every path; this body can fall off its end without producing its return value",
                 span);
             return null;
         }
@@ -2998,6 +3420,13 @@ type struct AsyncLower {
         if (!sm.ok) { return null; }
         this.carry_params(sm, node);
         if (!sm.ok) { return null; }
+
+        // Appended AFTER the two carry passes: both append their hand-back stores
+        // to the end of a state, and a `return` placed before those would strand
+        // them behind it.
+        if (falls_off) {
+            sm.blocks[tail].add_statement(this.unit_ready_return(sm.poll_out, span));
+        }
 
         // Assemble `loop { match (this.state) { i => <block i>, _ => Pending } }`.
         mut dispatch: MatchStmtNode* = new MatchStmtNode(
@@ -3015,13 +3444,39 @@ type struct AsyncLower {
         return body;
     }
 
-    /// The lowering entry: gate on `node.is_async && !node.is_generic()` at the
-    /// call site. Synthesizes the future struct + `Future` impl, registers them,
-    /// and rewrites `node` into the constructor.
-    lower(mut &this, node: FunctionDeclNode*) -> void {
-        if (node == null || node.body == null) { return; }
-        const output_ref: TypeRef = node.resolved_return_type;
-        if (!output_ref.is_valid()) { return; }
+    /// Give an `async function` its future type, ahead of any body being typed.
+    ///
+    /// Everything a CALLER needs is established here — the state-machine struct,
+    /// its `poll` signature, the `Future` impl, and the function's registered
+    /// return type — so `await f()` resolves whether `f` is declared above the
+    /// caller, below it, or is the caller itself. What needs a typed body (the
+    /// struct's fields, `poll`'s body, the constructor) waits for `lower`.
+    ///
+    /// The node's own `resolved_return_type` deliberately keeps the DECLARED
+    /// type: `enter_function` types the body's `return`s against it and
+    /// `check_function_returns` validates them, both before `lower` runs. Only
+    /// the index entry is repointed at the struct.
+    ///
+    /// False (with a diagnostic) if the future types are not in scope. The record
+    /// is kept either way, so `lower` neither retries nor re-reports.
+    declare(mut &this, node: FunctionDeclNode*) -> boolean {
+        if (node == null || node.body == null) { return false; }
+        const existing: i64 = this.pending_index(node);
+        if (existing >= 0i64) { return this.pending[existing].ok; }
+
+        const declared_ref: TypeRef = node.resolved_return_type;
+        if (!declared_ref.is_valid()) { return false; }
+        // A future has to produce a value for `Poll::Ready` to carry, and `void`
+        // is the absence of one. `-> void` therefore yields `Output = ()`: unit
+        // IS a value, so the terminal `return` has something to hand back and
+        // `poll`'s own return type stays well-formed. Awaiting such a function
+        // yields `()`, which callers discard exactly as they do a void call.
+        const output_ref: TypeRef = if (this.is_void_type(declared_ref)) {
+            this.arena.get_unit()
+        } else { declared_ref };
+
+        const span: SourceSpan = node.span;
+        const module_sym: SymbolStr = this.intern.intern(this.ctx.source_file);
 
         // Future core types require the module to import them.
         const poll_base: TypeRef = this.lookup_future_type("Poll");
@@ -3030,11 +3485,18 @@ type struct AsyncLower {
             this.ctx.emit_error_at(ErrorCode::E0233_UNDEFINED_SYMBOL,
                 "an `async function` requires the future types in scope; add `import std::future;`",
                 node.span);
-            return;
+            this.pending.push(AsyncDecl {
+                node: node, ok: false,
+                q_name: SymbolStr::empty(), module_sym: module_sym,
+                struct_ref: TypeRef::invalid(), output_ref: output_ref,
+                declared_ref: declared_ref, poll_out: TypeRef::invalid(),
+                poll_base: poll_base, ctx_ptr_ty: TypeRef::invalid(),
+                u32_ty: TypeRef::invalid(), state_sym: SymbolStr::empty(),
+                struct_decl: null, impl_node: null, poll_fn: null, poll_method: null,
+            });
+            return false;
         }
 
-        const span: SourceSpan = node.span;
-        const module_sym: SymbolStr = this.intern.intern(this.ctx.source_file);
         const bare: SymbolStr = this.mint_bare(this.intern.resolve(node.name));
         const q_name: SymbolStr = this.ctx.qualify_symbol_sym(bare);
 
@@ -3045,10 +3507,129 @@ type struct AsyncLower {
         const poll_out: TypeRef = this.ctx.generic_registry.instantiate(poll_base, &poll_args);
         const ctx_ptr_ty: TypeRef = this.arena.get_pointer_to(ctx_ref);
 
-        // The future struct's TypeRef is needed by the poll-body build (its
-        // `this.<field>` accesses); its FIELDS are set only afterwards, once the
-        // build has discovered the sub-future + promoted-local inventory.
+        // The struct's TypeRef is needed by the poll-body build (its
+        // `this.<field>` accesses) and by every caller's return type; its FIELDS
+        // are set in `lower`, once the body build has discovered the sub-future
+        // and promoted-local inventory.
         const struct_ref: TypeRef = this.arena.create_struct(q_name, module_sym);
+
+        mut struct_decl: StructDeclNode* = new StructDeclNode(q_name, span);
+        struct_decl.repr_c = false;
+        struct_decl.repr_packed = false;
+        struct_decl.repr_transparent = false;
+        struct_decl.min_alignment = 0;
+
+        // `poll`'s signature, whose body `lower` supplies.
+        mut poll_fn: FunctionDeclNode* = new FunctionDeclNode(this.intern.intern("poll"), span);
+        poll_fn.set_resolved_return_type(poll_out);
+        poll_fn.set_origin_trait(this.intern.intern("Future"));
+        mut cx_param: VarDeclNode* = new VarDeclNode(this.intern.intern("cx"), span);
+        cx_param.set_resolved_type(ctx_ptr_ty);
+        poll_fn.add_parameter(cx_param);
+
+        mut poll_method: MethodNode* = new MethodNode(poll_fn, span);
+        poll_method.set_visibility(Visibility::Public);
+        poll_method.set_static(false);
+        poll_method.set_sink(false);
+
+        // StructType.methods so overload resolution sees `poll` on the receiver.
+        const struct_t: Type* = this.arena.lookup(struct_ref.id);
+        if (struct_t != null && struct_t.kind == TypeKind::Struct) {
+            const st: StructType* = struct_t as StructType*;
+            mut poll_param_types: TypeRef[] = [ctx_ptr_ty];
+            const poll_fn_ty: TypeRef = this.arena.get_function(poll_out, poll_param_types, false);
+            const minfo: MethodInfo = MethodInfo {
+                name:          this.intern.intern("poll"),
+                function_type: poll_fn_ty,
+                is_public:     true,
+                is_protected:  false,
+                is_static:     false,
+                is_virtual:    false,
+                is_override:   false,
+                param_types:   poll_param_types,
+                ast_node:      poll_method as void*,
+            };
+            st.add_method(minfo);
+        }
+
+        // `implement trait Future<Output> for struct <Q>`
+        mut impl_node: ImplBlockNode* = new ImplBlockNode(q_name, span);
+        mut future_named: NamedAnnotation* = new NamedAnnotation {
+            name: this.intern.intern("Future"), span: span, pre_resolved: TypeRef::invalid(),
+        };
+        mut future_base_ann: TypeAnnotation* = new TypeAnnotation::Named(future_named);
+        mut gen: GenericAnnotation* = new GenericAnnotation {
+            base: future_base_ann,
+            args: [this.make_type_ann(output_ref, span)],
+            span: span,
+        };
+        impl_node.set_trait_annotation(new TypeAnnotation::Generic(gen));
+        impl_node.add_assoc_binding(this.intern.intern("Output"), this.make_type_ann(output_ref, span));
+        impl_node.add_method(poll_method);
+
+        // Register struct + trait impl.
+        this.ctx.decl_index.register_type_with_module(q_name, struct_ref, module_sym);
+        mut method_arr: MethodNode*[] = [poll_method];
+        this.ctx.decl_index.register_methods_with_module(
+            q_name, method_arr, module_sym, this.intern, this.arena);
+
+        const future_leaf: SymbolStr = this.intern.intern("Future");
+        // Dispatch key: `.poll()` resolution keys on the struct's qualified name.
+        this.ctx.generic_registry.register_trait_impl(future_leaf, q_name, impl_node);
+        // Bound-check key: `F: Future<R>` resolves via qualified-name id + leaf.
+        const tgt_leaf: SymbolStr = OwnershipQuery::registry_name_of(this.arena, this.intern, struct_ref);
+        const qual_id: u64 = OwnershipQuery::named_qualified_id(this.arena, this.intern, struct_ref);
+        this.ctx.generic_registry.register_trait_impl_typed(future_leaf, tgt_leaf, qual_id, impl_node);
+
+        // Repoint callers at the future type. Drop the stale Output-return
+        // overload first (bare + qualified) so the struct-return signature is the
+        // sole overload at call sites. The node carries the struct type only for
+        // the duration of the registration, which reads it off the node.
+        this.ctx.decl_index.reset_function_overloads(node.name);
+        this.ctx.decl_index.reset_function_overloads(this.ctx.qualify_symbol_sym(node.name));
+        node.set_resolved_return_type(struct_ref);
+        TypeResolutionPasses::register_decl_in_index(node as ASTNode*, this.ctx, false, module_sym);
+        node.set_resolved_return_type(declared_ref);
+
+        this.pending.push(AsyncDecl {
+            node: node, ok: true,
+            q_name: q_name, module_sym: module_sym,
+            struct_ref: struct_ref, output_ref: output_ref, declared_ref: declared_ref,
+            poll_out: poll_out, poll_base: poll_base, ctx_ptr_ty: ctx_ptr_ty,
+            u32_ty: u32_ty, state_sym: state_sym,
+            struct_decl: struct_decl, impl_node: impl_node,
+            poll_fn: poll_fn, poll_method: poll_method,
+        });
+        return true;
+    }
+
+    /// Build the state machine for an `async function` whose body sema has now
+    /// typed: fill in the struct's fields, `poll`'s body, and the constructor the
+    /// function itself becomes. Requires `declare` to have run (it is called here
+    /// if the module pre-pass did not reach this node).
+    lower(mut &this, node: FunctionDeclNode*) -> void {
+        if (node == null || node.body == null) { return; }
+        mut pi: i64 = this.pending_index(node);
+        if (pi < 0i64) {
+            this.declare(node);
+            pi = this.pending_index(node);
+            if (pi < 0i64) { return; }
+        }
+        if (!this.pending[pi].ok) { return; }
+
+        const q_name:      SymbolStr = this.pending[pi].q_name;
+        const module_sym:  SymbolStr = this.pending[pi].module_sym;
+        const struct_ref:  TypeRef   = this.pending[pi].struct_ref;
+        const declared_ref: TypeRef  = this.pending[pi].declared_ref;
+        const poll_out:    TypeRef   = this.pending[pi].poll_out;
+        const poll_base:   TypeRef   = this.pending[pi].poll_base;
+        const ctx_ptr_ty:  TypeRef   = this.pending[pi].ctx_ptr_ty;
+        const u32_ty:      TypeRef   = this.pending[pi].u32_ty;
+        const state_sym:   SymbolStr = this.pending[pi].state_sym;
+        mut struct_decl: StructDeclNode*   = this.pending[pi].struct_decl;
+        mut impl:        ImplBlockNode*    = this.pending[pi].impl_node;
+        mut poll_fn:     FunctionDeclNode* = this.pending[pi].poll_fn;
+        const span: SourceSpan = node.span;
 
         // ---- 0. poll body ----
         // No await => run to completion in one poll (Inc 1b). Otherwise the
@@ -3068,6 +3649,8 @@ type struct AsyncLower {
             fut_syms: [], fut_opt: [], naw: 0i64,
             prom_field: [], prom_tys: [], prom_opt: [], nprom: 0i64,
             loop_cont: [], loop_brk: [],
+            frame_names: [],
+            unit_output: this.is_void_type(declared_ref),
         };
 
         mut body_block: BlockStmtNode* = null;
@@ -3085,12 +3668,6 @@ type struct AsyncLower {
         if (body_block == null) { return; }   // a diagnostic was already emitted
 
         // ---- 1. Struct decl fields (state + params + sub-futures + promoted) ----
-        mut struct_decl: StructDeclNode* = new StructDeclNode(q_name, span);
-        struct_decl.repr_c = false;
-        struct_decl.repr_packed = false;
-        struct_decl.repr_transparent = false;
-        struct_decl.min_alignment = 0;
-
         mut state_field: FieldDeclNode* = new FieldDeclNode(state_sym, span);
         state_field.set_visibility(Visibility::Public);
         state_field.set_resolved_type(u32_ty);
@@ -3142,75 +3719,16 @@ type struct AsyncLower {
             st.set_fields(infos);
         }
 
-        // ---- 3. poll method: (mut &this, cx: Context*) -> Poll<Output> ----
-        mut poll_fn: FunctionDeclNode* = new FunctionDeclNode(this.intern.intern("poll"), span);
-        poll_fn.set_resolved_return_type(poll_out);
-        poll_fn.set_origin_trait(this.intern.intern("Future"));
-        mut cx_param: VarDeclNode* = new VarDeclNode(this.intern.intern("cx"), span);
-        cx_param.set_resolved_type(ctx_ptr_ty);
-        poll_fn.add_parameter(cx_param);
+        // ---- 3. poll body into the signature `declare` registered ----
         poll_fn.set_body(body_block);
 
-        mut poll_method: MethodNode* = new MethodNode(poll_fn, span);
-        poll_method.set_visibility(Visibility::Public);
-        poll_method.set_static(false);
-        poll_method.set_sink(false);
-
-        // StructType.methods so overload resolution sees `poll` on the receiver.
-        if (struct_t != null && struct_t.kind == TypeKind::Struct) {
-            const st: StructType* = struct_t as StructType*;
-            mut poll_param_types: TypeRef[] = [ctx_ptr_ty];
-            const poll_fn_ty: TypeRef = this.arena.get_function(poll_out, poll_param_types, false);
-            const minfo: MethodInfo = MethodInfo {
-                name:          this.intern.intern("poll"),
-                function_type: poll_fn_ty,
-                is_public:     true,
-                is_protected:  false,
-                is_static:     false,
-                is_virtual:    false,
-                is_override:   false,
-                param_types:   poll_param_types,
-                ast_node:      poll_method as void*,
-            };
-            st.add_method(minfo);
-        }
-
-        // ---- 4. `implement trait Future<Output> for struct <Q>` ----
-        mut impl: ImplBlockNode* = new ImplBlockNode(q_name, span);
-        mut future_named: NamedAnnotation* = new NamedAnnotation {
-            name: this.intern.intern("Future"), span: span, pre_resolved: TypeRef::invalid(),
-        };
-        mut future_base_ann: TypeAnnotation* = new TypeAnnotation::Named(future_named);
-        mut gen: GenericAnnotation* = new GenericAnnotation {
-            base: future_base_ann,
-            args: [this.make_type_ann(output_ref, span)],
-            span: span,
-        };
-        impl.set_trait_annotation(new TypeAnnotation::Generic(gen));
-        impl.add_assoc_binding(this.intern.intern("Output"), this.make_type_ann(output_ref, span));
-        impl.add_method(poll_method);
-
-        // ---- 5. Register struct + trait impl ----
-        this.ctx.decl_index.register_type_with_module(q_name, struct_ref, module_sym);
-        mut method_arr: MethodNode*[] = [poll_method];
-        this.ctx.decl_index.register_methods_with_module(
-            q_name, method_arr, module_sym, this.intern, this.arena);
-
-        const future_leaf: SymbolStr = this.intern.intern("Future");
-        // Dispatch key: `.poll()` resolution keys on the struct's qualified name.
-        this.ctx.generic_registry.register_trait_impl(future_leaf, q_name, impl);
-        // Bound-check key: `F: Future<R>` resolves via qualified-name id + leaf.
-        const tgt_leaf: SymbolStr = OwnershipQuery::registry_name_of(this.arena, this.intern, struct_ref);
-        const qual_id: u64 = OwnershipQuery::named_qualified_id(this.arena, this.intern, struct_ref);
-        this.ctx.generic_registry.register_trait_impl_typed(future_leaf, tgt_leaf, qual_id, impl);
-
-        // ---- 6. Inject so mono/codegen walk the struct + impl ----
+        // ---- 4. Inject so mono/codegen walk the struct + impl ----
         if (this.ctx.artifacts.ast.root != null) {
             this.ctx.artifacts.ast.root.add_statement(struct_decl as ASTNode*);
             this.ctx.artifacts.ast.root.add_statement(impl as ASTNode*);
         }
 
-        // ---- 7. Rewrite the async fn into the constructor ----
+        // ---- 5. Rewrite the async fn into the constructor ----
         // Body: `return <Q> { state: 0, p0: p0, …, fut_k: Option::None, … };`
         mut ctor_lit: StructLiteralNode* = new StructLiteralNode(q_name, span);
         mut zero: LiteralNode* = new LiteralNode("0", LiteralKind::Integer, span);
@@ -3253,12 +3771,17 @@ type struct AsyncLower {
         node.set_return_type_annotation(this.make_type_ann(struct_ref, span));
         node.set_async(false);
 
-        // Re-register the now-future return type so callers of `<name>(...)`
-        // resolve to the state-machine struct, not the old Output. Drop the stale
-        // Output-return overload first (bare + qualified) so the struct-return
-        // signature is the sole overload at call sites.
+        // Re-register now that the node itself carries the struct return type and
+        // its annotation. `declare` already pointed callers here, so this settles
+        // the entry against the finished node rather than changing where calls
+        // resolve. Dropping the stale overloads first (bare + qualified) keeps the
+        // struct-return signature the sole one at call sites.
         this.ctx.decl_index.reset_function_overloads(node.name);
         this.ctx.decl_index.reset_function_overloads(this.ctx.qualify_symbol_sym(node.name));
         TypeResolutionPasses::register_decl_in_index(node as ASTNode*, this.ctx, false, module_sym);
+
+        // The record has served its purpose; `is_async` is now false, so nothing
+        // will look it up again.
+        this.pending[pi].ok = false;
     }
 }
