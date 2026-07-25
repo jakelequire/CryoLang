@@ -205,12 +205,6 @@ public:
                                  this.intern, this.ctx.diagnostics);
     }
 
-    /// Whether the symbolic generic-body check is enabled.
-    sema_symbolic_check_enabled(&this) -> boolean {
-        return this.symbolic.sema_symbolic_check_enabled();
-    }
-
-
     // -- Top-level + statement recursion seams --
 
     override visit(mut &this, node: ProgramNode*) -> void {
@@ -408,17 +402,15 @@ public:
         if (node.body == null) { return; }
         if (node.is_generic()) {
             // A generic body is typed by the symbolic walk, against abstract
-            // parameter refs. For an `async function` that walk is not optional:
-            // the state machine is built from the resolved types it leaves on the
-            // body, and the future it produces is generic in the same parameters,
-            // so the monomorphizer specializes it from the same demand that
-            // specializes the function.
-            if (node.is_async) {
-                this.symbolic_check_body_forced(node, TypeRef::invalid(), TypeRef::invalid());
-                this.async_lower.lower(node);
-                return;
-            }
+            // parameter refs. An `async function`'s state machine is then built
+            // from the resolved types that walk leaves on the body, and the
+            // future it produces is generic in the same parameters, so the
+            // monomorphizer specializes it from the same demand that specializes
+            // the function.
             this.symbolic_check_body(node, TypeRef::invalid(), TypeRef::invalid());
+            if (node.is_async) {
+                this.async_lower.lower(node);
+            }
             return;
         }
         this.member.check_annotation_visibility(node.return_type_annotation);
@@ -441,11 +433,9 @@ public:
 
     override visit(mut &this, node: StructDeclNode*) -> void {
         if (node.is_generic()) {
-            if (this.owner_methods_need_walk(node.methods)) {
-                const sym: SymbolStr = this.ctx.qualify_symbol_sym(node.name);
-                const ty: TypeRef = this.ctx.decl_index.lookup_type(sym);
-                this.symbolic_check_owner_methods(node.methods, ty, node.generic_params);
-            }
+            const sym: SymbolStr = this.ctx.qualify_symbol_sym(node.name);
+            const ty: TypeRef = this.ctx.decl_index.lookup_type(sym);
+            this.symbolic_check_owner_methods(node.methods, ty, node.generic_params);
             return;
         }
         const qualified_sym: SymbolStr = this.ctx.qualify_symbol_sym(node.name);
@@ -455,11 +445,9 @@ public:
 
     override visit(mut &this, node: UnionDeclNode*) -> void {
         if (node.is_generic()) {
-            if (this.owner_methods_need_walk(node.methods)) {
-                const sym: SymbolStr = this.ctx.qualify_symbol_sym(node.name);
-                const ty: TypeRef = this.ctx.decl_index.lookup_type(sym);
-                this.symbolic_check_owner_methods(node.methods, ty, node.generic_params);
-            }
+            const sym: SymbolStr = this.ctx.qualify_symbol_sym(node.name);
+            const ty: TypeRef = this.ctx.decl_index.lookup_type(sym);
+            this.symbolic_check_owner_methods(node.methods, ty, node.generic_params);
             return;
         }
         const qualified_sym: SymbolStr = this.ctx.qualify_symbol_sym(node.name);
@@ -469,11 +457,9 @@ public:
 
     override visit(mut &this, node: ClassDeclNode*) -> void {
         if (node.is_generic()) {
-            if (this.owner_methods_need_walk(node.methods)) {
-                const sym: SymbolStr = this.ctx.qualify_symbol_sym(node.name);
-                const ty: TypeRef = this.ctx.decl_index.lookup_type(sym);
-                this.symbolic_check_owner_methods(node.methods, ty, node.generic_params);
-            }
+            const sym: SymbolStr = this.ctx.qualify_symbol_sym(node.name);
+            const ty: TypeRef = this.ctx.decl_index.lookup_type(sym);
+            this.symbolic_check_owner_methods(node.methods, ty, node.generic_params);
             return;
         }
         const qualified_sym: SymbolStr = this.ctx.qualify_symbol_sym(node.name);
@@ -492,9 +478,8 @@ public:
             // in its body; that has to be walked SYMBOLICALLY (in_symbolic_check),
             // exactly like a struct/impl generic method (visit_methods), so the
             // arms are deferred to monomorphization instead of tripping E0645
-            // ("static match outside a generic context").  symbolic_check_body
-            // is a no-op when the symbolic check is disabled; mono then checks
-            // the concrete body.  Non-generic defaults keep the plain walk.
+            // ("static match outside a generic context").  Non-generic defaults
+            // keep the plain walk.
             if (func.is_generic()) {
                 this.symbolic_check_body(func, this_placeholder, this_placeholder);
                 continue;
@@ -507,13 +492,11 @@ public:
 
     override visit(mut &this, node: ImplBlockNode*) -> void {
         if (node.is_generic()) {
-            if (this.owner_methods_need_walk(node.methods)) {
-                const impl_target: TypeRef = this.types.lookup_type_by_sym(node.target_type);
-                const saved_impl: ImplBlockNode* = this.state.symbolic_impl_node;
-                this.state.symbolic_impl_node = node;
-                this.symbolic_check_owner_methods(node.methods, impl_target, node.generic_params);
-                this.state.symbolic_impl_node = saved_impl;
-            }
+            const impl_target: TypeRef = this.types.lookup_type_by_sym(node.target_type);
+            const saved_impl: ImplBlockNode* = this.state.symbolic_impl_node;
+            this.state.symbolic_impl_node = node;
+            this.symbolic_check_owner_methods(node.methods, impl_target, node.generic_params);
+            this.state.symbolic_impl_node = saved_impl;
             return;
         }
         const greg: GenericRegistry* = this.ctx.generic_registry;
@@ -548,7 +531,7 @@ public:
                 // generic params (the impl block has none of its own) so the
                 // receiver reads as a generic owner and the stash is produced
                 // independently of any other call site.
-                if (this.owner_methods_need_walk(node.methods) && tmpl.ast_node != null) {
+                if (tmpl.ast_node != null) {
                     const owner_ty: TypeRef = this.types.lookup_type_by_sym(node.target_type);
                     const saved_impl: ImplBlockNode* = this.state.symbolic_impl_node;
                     this.state.symbolic_impl_node = node;
@@ -582,17 +565,17 @@ public:
             if (method == null || method.func == null || method.func.body == null) { continue; }
             if (method.func.is_generic()) {
                 const sym_this: TypeRef = if (method.is_static) { TypeRef::invalid() } else { owner_type };
-                // Same reasoning as the free-function case: an `async` body's
-                // state machine is built from the types the symbolic walk leaves
-                // on it, so that walk is not optional here.
-                if (method.func.is_async) {
-                    const displaced: TypeRef = this.async_lower.begin_body_check(method.func);
-                    this.symbolic_check_body_forced(method.func, sym_this, owner_type);
-                    this.async_lower.end_body_check(method.func, displaced);
-                    this.async_lower.lower(method.func);
-                    continue;
-                }
+                // Same shape as the free-function case: the walk types the body,
+                // and an `async` one's state machine is then built from what it
+                // left there.  `begin_body_check` lends the declared Output back
+                // for the walk and is a no-op for anything not a pending `async`
+                // method.
+                const displaced: TypeRef = this.async_lower.begin_body_check(method.func);
                 this.symbolic_check_body(method.func, sym_this, owner_type);
+                this.async_lower.end_body_check(method.func, displaced);
+                if (method.func.is_async) {
+                    this.async_lower.lower(method.func);
+                }
                 continue;
             }
             if (method.func.is_self_returning_default) { continue; }
@@ -662,21 +645,18 @@ public:
 
     // -- Symbolic generic-body walk drivers (drive visit(body); stay here) --
 
-    symbolic_check_body(mut &this, func: FunctionDeclNode*, this_type: TypeRef, owner_type: TypeRef) -> void {
-        if (!this.sema_symbolic_check_enabled()) { return; }
-        this.symbolic_check_body_forced(func, this_type, owner_type);
-    }
-
-    /// The walk itself, run whether or not the check is enabled.
+    /// Type-check one generic body against abstract parameter refs.
     ///
-    /// Everywhere else the walk is additive — it reports, ahead of any
-    /// instantiation, errors a generic body would produce — so `CRYO_NO_SYMBOLIC_CHECK`
-    /// may switch it off. Lowering a generic `async function` is the exception:
-    /// the walk is what puts resolved types on the body, and the state-machine
-    /// build CONSUMES them. Skipping it there would not lose a diagnostic, it
-    /// would build the machine out of untyped nodes.
-    symbolic_check_body_forced(mut &this, func: FunctionDeclNode*, this_type: TypeRef,
-                               owner_type: TypeRef) -> void {
+    /// This is the ONLY pass that types a generic template body, and what it
+    /// leaves on that body is load-bearing twice over: it reports, ahead of any
+    /// instantiation, errors the body would produce, AND it is the resolution
+    /// monomorphization and codegen consume downstream — a where-bound call in a
+    /// template (`value.hash(&h)` in `digest<T>`) reaches codegen with no
+    /// resolved callee if the body was never walked, and lowering a generic
+    /// `async function` builds its state machine out of these very types. So the
+    /// walk is unconditional; it is not a diagnostic add-on to be switched off.
+    symbolic_check_body(mut &this, func: FunctionDeclNode*, this_type: TypeRef,
+                        owner_type: TypeRef) -> void {
         if (func == null || func.body == null) { return; }
         const sink: DiagnosticSink* = this.ctx.diagnostics;
         if (sink == null) { return; }
@@ -726,29 +706,11 @@ public:
         this.state.symbolic_total_would_emit += sink.errors_since(snap) as i64;
     }
 
-    /// Whether an owner's method bodies have to be walked symbolically.
-    ///
-    /// Everywhere else the walk is additive — it reports, ahead of any
-    /// instantiation, errors a generic body would produce — so
-    /// `CRYO_NO_SYMBOLIC_CHECK` may switch it off. An `async` method is the
-    /// exception, for the same reason `symbolic_check_body_forced` exists: this
-    /// walk is what puts resolved types on the body, and the state-machine build
-    /// CONSUMES them. Switching it off would leave the method unlowered, still
-    /// returning its declared Output while every caller has been repointed at
-    /// its future.
-    owner_methods_need_walk(&this, methods: &MethodNode*[]) -> boolean {
-        if (this.sema_symbolic_check_enabled()) { return true; }
-        for (mut i: i64 = 0; i < methods.length; i++) {
-            const m: MethodNode* = methods[i];
-            if (m == null || m.func == null || m.func.body == null) { continue; }
-            if (m.func.is_async) { return true; }
-        }
-        return false;
-    }
-
+    /// Walk every method body of a GENERIC owner symbolically.  A method on a
+    /// generic owner reaches sema only here, so this is also where an `async` one
+    /// is lowered, off the types the walk leaves on its body.
     symbolic_check_owner_methods(mut &this, methods: &MethodNode*[], owner_type: TypeRef,
                                  owner_params: &GenericParamNode*[]) -> void {
-        if (!this.owner_methods_need_walk(methods)) { return; }
         const saved_owner_generic: boolean = this.state.symbolic_owner_is_generic;
         mut saved_owner_params: u32[] = [];
         mut saved_owner_nodes: GenericParamNode*[] = [];
@@ -771,14 +733,12 @@ public:
             // A method on a GENERIC owner reaches sema only here, whether or not
             // it has generic parameters of its own — so this is where an `async`
             // one is lowered, off the types the walk just left on its body.
-            if (method.func.is_async) {
-                const displaced: TypeRef = this.async_lower.begin_body_check(method.func);
-                this.symbolic_check_body_forced(method.func, sym_this, owner_type);
-                this.async_lower.end_body_check(method.func, displaced);
-                this.async_lower.lower(method.func);
-                continue;
-            }
+            const displaced: TypeRef = this.async_lower.begin_body_check(method.func);
             this.symbolic_check_body(method.func, sym_this, owner_type);
+            this.async_lower.end_body_check(method.func, displaced);
+            if (method.func.is_async) {
+                this.async_lower.lower(method.func);
+            }
         }
         swap(&this.state.symbolic_owner_param_ids, &saved_owner_params);
         swap(&this.state.symbolic_owner_param_nodes, &saved_owner_nodes);
@@ -3303,7 +3263,7 @@ type struct SemanticPasses {
         if (ctx.debug_mode) {
             cdebug("[Sema] Type-checked %lld function bodies\n", v.state.body_count);
         }
-        if (ctx.debug_mode && v.sema_symbolic_check_enabled()) {
+        if (ctx.debug_mode) {
             cdebug("[symbolic-check] walked %lld generic bodies, emitted %lld errors\n",
                 v.state.symbolic_bodies_walked, v.state.symbolic_total_would_emit);
         }
