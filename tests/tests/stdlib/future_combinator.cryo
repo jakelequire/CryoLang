@@ -1,0 +1,208 @@
+///! std::future::combinator - `Join`, `Select`, `Timeout`.
+///!
+///! Timing assertions follow the same rule as the timer tests: lower bounds are
+///! the real correctness property (a combinator must not report completion
+///! before its children are done), and the few upper bounds are set far enough
+///! above the concurrent time to distinguish it from the serial time without
+///! being sensitive to load.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::FutureCombinator;
+
+import std::core::result;
+import std::future;
+import std::test::error;
+import std::test::assert;
+import std::time;
+
+async function nap_v(ms: u64, v: i64) -> i64 {
+    await Sleep::new(Duration::from_millis(ms));
+    return v;
+}
+
+async function ok_after(ms: u64, v: i64) -> Result<i64, i64> {
+    await Sleep::new(Duration::from_millis(ms));
+    return Result::Ok(v);
+}
+
+async function err_after(ms: u64, e: i64) -> Result<i64, i64> {
+    await Sleep::new(Duration::from_millis(ms));
+    return Result::Err(e);
+}
+
+async function join_two(ms: u64) -> i64 {
+    const r: (i64, i64) = await Futures::join(nap_v(ms, 10), nap_v(ms, 32));
+    return r.0 + r.1;
+}
+
+// Which side won, encoded: 100+v for the first, 200+v for the second.
+async function select_two(a_ms: u64, b_ms: u64) -> i64 {
+    const s: Selected<i64, i64> = await Futures::select(nap_v(a_ms, 1), nap_v(b_ms, 2));
+    return match (s) {
+        Selected::First(v)  => { 100 + v }
+        Selected::Second(v) => { 200 + v }
+    };
+}
+
+async function timeout_of(limit_ms: u64, work_ms: u64) -> i64 {
+    const r: Result<i64, Elapsed> =
+        await Futures::timeout(Duration::from_millis(limit_ms), nap_v(work_ms, 9));
+    return match (r) {
+        Result::Ok(v)  => { v }
+        // A deadline is only meaningful if it was actually carried through.
+        Result::Err(e) => { e.deadline_nanos() > 0 ? -1 : -2 }
+    };
+}
+
+// Three futures joined by nesting, which is how arity above two is expressed.
+async function join_three(ms: u64) -> i64 {
+    const r: (i64, (i64, i64)) =
+        await Futures::join(nap_v(ms, 1), Futures::join(nap_v(ms, 2), nap_v(ms, 4)));
+    return r.0 + r.1.0 + r.1.1;
+}
+
+// `join` over two fallible futures: both results arrive, each matched
+// separately. This is what stands in for `try_join` (see the module doc).
+async function join_results() -> i64 {
+    const r: (Result<i64, i64>, Result<i64, i64>) =
+        await Futures::join(ok_after(40u64, 3), err_after(60u64, 66));
+    mut acc: i64 = 0;
+    match (r.0) { Result::Ok(v)  => { acc = acc + v * 10; } Result::Err(_) => { } }
+    match (r.1) { Result::Ok(_)  => { }                     Result::Err(e) => { acc = acc + e; } }
+    return acc;
+}
+
+// The loser is an hour-long sleep. `select` must return as soon as the fast side
+// finishes, and dropping the combinator must disarm the loser's timer.
+async function select_abandons_a_long_loser() -> i64 {
+    const s: Selected<i64, i64> =
+        await Futures::select(nap_v(3600000u64, 1), nap_v(50u64, 2));
+    return match (s) {
+        Selected::First(v)  => { 100 + v }
+        Selected::Second(v) => { 200 + v }
+    };
+}
+
+![test]
+function join_waits_for_both_and_yields_both() -> Result<(), TestError> {
+    mut ex: Executor = Executor::new();
+    const t0: Instant = Instant::now();
+    const r: i64 = ex.block_on(join_two(400u64));
+    const ms: u64 = t0.elapsed().as_millis();
+    ex.drop();
+    match (expect_eq(r, 42 as i64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_true(ms >= 390u64, "join completed before its children did");
+}
+
+![test]
+function join_runs_its_children_concurrently() -> Result<(), TestError> {
+    // Serially these two would take ~800ms.
+    mut ex: Executor = Executor::new();
+    const t0: Instant = Instant::now();
+    const r: i64 = ex.block_on(join_two(400u64));
+    const ms: u64 = t0.elapsed().as_millis();
+    ex.drop();
+    match (expect_eq(r, 42 as i64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_true(ms < 700u64, "join ran its children serially");
+}
+
+![test]
+function join_nests_for_three_futures() -> Result<(), TestError> {
+    mut ex: Executor = Executor::new();
+    const t0: Instant = Instant::now();
+    const r: i64 = ex.block_on(join_three(300u64));
+    const ms: u64 = t0.elapsed().as_millis();
+    ex.drop();
+    match (expect_eq(r, 7 as i64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_true(ms >= 290u64, "a nested join completed early")) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_true(ms < 800u64, "a nested join serialized its children");
+}
+
+![test]
+function join_carries_both_results_of_fallible_children() -> Result<(), TestError> {
+    mut ex: Executor = Executor::new();
+    const r: i64 = ex.block_on(join_results());
+    ex.drop();
+    return expect_eq(r, 96 as i64);   // 3*10 from the Ok half + 66 from the Err half
+}
+
+![test]
+function select_completes_with_the_faster_side() -> Result<(), TestError> {
+    mut ex: Executor = Executor::new();
+    const t0: Instant = Instant::now();
+    const r: i64 = ex.block_on(select_two(600u64, 50u64));
+    const ms: u64 = t0.elapsed().as_millis();
+    ex.drop();
+    match (expect_eq(r, 202 as i64)) {   // the SECOND side, value 2
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_true(ms < 500u64, "select waited for the slower side");
+}
+
+![test]
+function select_reports_the_first_side_when_it_wins() -> Result<(), TestError> {
+    mut ex: Executor = Executor::new();
+    const r: i64 = ex.block_on(select_two(50u64, 600u64));
+    ex.drop();
+    return expect_eq(r, 101 as i64);   // the FIRST side, value 1
+}
+
+![test]
+function select_abandons_the_losing_future() -> Result<(), TestError> {
+    // The loser sleeps for an hour. Returning at all proves `select` did not
+    // wait for it; tearing the executor down promptly afterwards proves the
+    // loser's timer registration was released when the combinator dropped,
+    // rather than pinning the task until its deadline.
+    mut ex: Executor = Executor::new();
+    const t0: Instant = Instant::now();
+    const r: i64 = ex.block_on(select_abandons_a_long_loser());
+    ex.drop();
+    const ms: u64 = t0.elapsed().as_millis();
+    match (expect_eq(r, 202 as i64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_true(ms < 10000u64, "select or teardown waited on the abandoned loser");
+}
+
+![test]
+function timeout_passes_a_fast_operation_through() -> Result<(), TestError> {
+    mut ex: Executor = Executor::new();
+    const r: i64 = ex.block_on(timeout_of(600u64, 50u64));
+    ex.drop();
+    return expect_eq(r, 9 as i64);
+}
+
+![test]
+function timeout_reports_elapsed_for_a_slow_operation() -> Result<(), TestError> {
+    // -1 is the Err arm having found a real deadline on the `Elapsed`; -2 would
+    // mean the deadline came back as zero, which is how a zero-sized error type
+    // used to fail here.
+    mut ex: Executor = Executor::new();
+    const t0: Instant = Instant::now();
+    const r: i64 = ex.block_on(timeout_of(100u64, 3600000u64));
+    const ms: u64 = t0.elapsed().as_millis();
+    ex.drop();
+    match (expect_eq(r, -1 as i64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_true(ms >= 90u64, "timeout fired before its deadline")) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_true(ms < 10000u64, "timeout did not abandon the slow operation");
+}
