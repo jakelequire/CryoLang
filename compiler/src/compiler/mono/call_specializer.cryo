@@ -440,6 +440,21 @@ type struct MonoCallSpecializer {
     }
 
 
+    /// Concretize one stashed type-arg: apply the active specialization, then
+    /// reduce any associated-type projection the substitution left standing.
+    ///
+    /// Substitution rewrites a projection's BASE (`S::ReadFut` ->
+    /// `Ticker::ReadFut`) but never the projection itself, and a projection is
+    /// free of generic params once its base is concrete - so it survives the
+    /// `contains_generic_param` guards and gets MANGLED into the specialized
+    /// callee name, which names a specialization nothing ever emits (E0636).
+    /// Reducing it here yields the impl's bound member (`ReadyN`).
+    concretize_stashed_arg(mut &this, b_in: TypeRef, subst: TypeSubstitution*) -> TypeRef {
+        mut b: TypeRef = b_in;
+        if (subst != null) { b = subst.apply(b, this.arena); }
+        return this.trait_spec.reduce_projections(b);
+    }
+
     // -- Free-function call specialization (consumes call.resolved_type_args) --
 
     /// Pin a specialized callee on a generic free-function call so codegen can
@@ -550,8 +565,7 @@ type struct MonoCallSpecializer {
         mut bindings: TypeRef[] = [];
         mut all_bound: boolean = true;
         for (mut i: i64 = 0; i < call.resolved_type_args.length; i++) {
-            mut b: TypeRef = call.resolved_type_args[i];
-            if (subst != null) { b = subst.apply(b, this.arena); }
+            const b: TypeRef = this.concretize_stashed_arg(call.resolved_type_args[i], subst);
             if (!b.is_valid()) { all_bound = false; break; }
             bindings.push(b);
         }
@@ -912,8 +926,7 @@ type struct MonoCallSpecializer {
         if (call.resolved_type_args.length == n_method_params && n_method_params > 0) {
             m_from_stash = true;
             for (mut i: i64 = 0; i < n_method_params; i++) {
-                mut sv: TypeRef = call.resolved_type_args[i];
-                if (subst != null) { sv = subst.apply(sv, this.arena); }
+                const sv: TypeRef = this.concretize_stashed_arg(call.resolved_type_args[i], subst);
                 if (!sv.is_valid()) { m_from_stash = false; break; }
                 bindings[i] = sv;
             }
@@ -1257,8 +1270,7 @@ type struct MonoCallSpecializer {
             if (call.resolved_type_args.length != entry.param_type_ids.length) { return false; }
             mut binds: TypeRef[] = [];
             for (mut i: i64 = 0; i < call.resolved_type_args.length; i++) {
-                mut b: TypeRef = call.resolved_type_args[i];
-                if (subst != null) { b = subst.apply(b, this.arena); }
+                const b: TypeRef = this.concretize_stashed_arg(call.resolved_type_args[i], subst);
                 if (!b.is_valid() || this.arena.contains_generic_param(b)) { return false; }
                 binds.push(b);
             }
@@ -1313,8 +1325,7 @@ type struct MonoCallSpecializer {
         if (call.resolved_type_args.length != n_method) { return false; }
         mut method_binds: TypeRef[] = [];
         for (mut i: i64 = 0; i < n_method; i++) {
-            mut b: TypeRef = call.resolved_type_args[i];
-            if (subst != null) { b = subst.apply(b, this.arena); }
+            const b: TypeRef = this.concretize_stashed_arg(call.resolved_type_args[i], subst);
             if (!b.is_valid() || this.arena.contains_generic_param(b)) { return false; }
             method_binds.push(b);
         }

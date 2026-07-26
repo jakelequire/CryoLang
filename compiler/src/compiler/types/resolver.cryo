@@ -593,9 +593,18 @@ type struct TypeResolver {
     /// `Ready<i32>` whose monomorphized form does not exist yet (as `resolve_await`
     /// relies on), so guarding on `contains_generic_param` rather than a
     /// concreteness check is deliberate.
+    ///
+    /// `symbolic` (the caller's symbolic-walk flag) admits an ABSTRACT subject.
+    /// Handing `block_on<F, R>` an argument typed `S::ReadFut` binds `F` to that
+    /// projection, and `R` is then legitimately `(S::ReadFut)::Output` — abstract,
+    /// but the correct answer inside a generic body, and monomorphization
+    /// substitutes it with the rest. Refusing to derive it leaves `R` unbound, the
+    /// caller discards the whole binding set, and the call reaches codegen
+    /// unspecialized (E0636). Outside the symbolic walk an abstract subject has no
+    /// findable impl, so it still derives nothing.
     project_where_bound_params_into(&this, trait_bounds: &TraitBound[],
                                     param_names: &SymbolStr[], ictx: InferCtx*,
-                                    source_file: string) -> void {
+                                    source_file: string, symbolic: boolean) -> void {
         if (this.generic_registry == null) { return; }
         for (mut bi: i64 = 0; bi < trait_bounds.length; bi++) {
             const bound: TraitBound* = &trait_bounds[bi];
@@ -603,7 +612,9 @@ type struct TypeResolver {
             const s: i64 = this.param_name_slot(param_names, bound.type_parameter);
             if (s < 0 || s >= ictx.bindings.length) { continue; }
             const subject: TypeRef = ictx.bindings[s];
-            if (!subject.is_valid() || this.arena.contains_generic_param(subject)) { continue; }
+            if (!subject.is_valid()) { continue; }
+            const subject_abstract: boolean = this.arena.contains_generic_param(subject);
+            if (subject_abstract && !symbolic) { continue; }
             for (mut ti: i64 = 0; ti < bound.trait_refs.length; ti++) {
                 const tr: TraitRef* = &bound.trait_refs[ti];
                 if (tr.path.length == 0) { continue; }
@@ -622,6 +633,13 @@ type struct TypeResolver {
                     if (j < 0 || j >= ictx.bindings.length || ictx.bindings[j].is_valid()) { continue; }
                     mut rc: ResolutionContext = ResolutionContext::new(source_file, "");
                     const member: SymbolStr = tdecl.assoc_types[assoc_idx].name;
+                    if (subject_abstract) {
+                        // `project_member` keeps an abstract base symbolic, giving
+                        // the projection mono reduces once the base specializes.
+                        const sym_d: TypeRef = this.project_member(subject, member, &rc);
+                        if (sym_d.is_valid()) { ictx.bind_slot(j, sym_d); }
+                        continue;
+                    }
                     const derived: TypeRef = this.resolve_concrete_member(subject, member, &rc);
                     if (derived.is_valid() && !this.arena.contains_generic_param(derived)) {
                         ictx.bind_slot(j, derived);

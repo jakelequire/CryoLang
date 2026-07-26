@@ -48,7 +48,7 @@ not for routine judgement calls.
 
 | 5b-tls | Async TLS (the port's prerequisite) | ✅ DONE+validated 2026-07-25. `stdlib/net/tls/future.cryo`: `TlsHandshake` / `TlsRead` / `TlsWrite` / `TlsIo`, plus `TlsConnector::connect_async` and `TlsAcceptor::accept_async`. Each `WANT_READ`/`WANT_WRITE` becomes a reactor registration rather than a spin; the interest to arm is read off the SSL error code (a read CAN want writability), and each future records the one direction it armed so its `Drop` cancels only that half. Sound only because §5a made the read/write futures own their buffer — OpenSSL requires a `WANT_*` retry to repeat the same call with the SAME arguments, and a future moves between polls. 1 test: loopback handshake + encrypted echo with **both sides as tasks on ONE `Executor`**, which the blocking TLS test cannot do (it needs a thread, or `SSL_connect` blocks before `SSL_accept` runs). |
 | 5b-port | Socket port + delete the blocking surface | ☐ NOT STARTED — and now **gated on 5c (async trait methods)**, per Jake's 2026-07-26 call. Remaining: port `net/http/{client,server}`, `net/http2/{client,server,connection}`, `net/https.cryo`, `net/ws/conn.cryo`, then delete `TcpStream::connect/read/write`, `TcpListener::bind/accept` and the blocking TLS entry points. One-way API break: every `HttpClient::get`-shaped call becomes `async`. **Re-derived consumer list (2026-07-26): far smaller than "19 files" — most of the greps that produced that count are doc-comment mentions. `net/dns.cryo`, `net/addr/ip.cryo` and `net/socket/udp.cryo` name `TcpStream` ONLY in prose and need no port.** |
-| 5c | Async trait methods (the port's prerequisite) | ☐ NOT STARTED — designed + foundation probed 2026-07-26. **Jake chose this** over poll-traits-plus-adapters and over de-genericizing to an `AsyncStream` union. Forced by two facts: `Http2Connection<S>` / `WebSocket<S>` hold `inner: S*` (BORROWED — `E0455` rejects that across a suspend, so the transport must be owned), and `async` on a trait method is currently rejected outright (`E0364`, parser). Design: `async read(&this, n) -> T` desugars to an implicit associated type plus a projection return (`type ReadFut; read(&this, n) -> This::ReadFut`), each impl binding it to its own synthesized future via the existing positional trait-arg sugar. See the §9 entry for the three probed gaps that block it. |
+| 5c | Async trait methods (the port's prerequisite) | ✅ DONE+validated 2026-07-26. First the **three blocking projection gaps — six defects** — were fixed across parser/sema/type-resolver/mono, so projection-typed dispatch, `block_on` on a projection and `await` on a projection all work. Then the feature itself: `E0364` lifted for trait methods (`virtual`/`override` still rejected), `desugar_async_trait_methods` synthesizing the implicit `<Method>Fut` + projection return, `bind_async_trait_assoc` binding each impl's own future, and E0309 taught the binding is implicit. **Default bodies included** — they cost almost nothing because `synthesize_default_trait_methods` already clones them per-impl, so no future generic over `This` was needed. 6 tests; the obsolete `E0364_async_trait_method` negative deleted. Two §9 entries. **Jake chose this** over poll-traits-plus-adapters and over de-genericizing to an `AsyncStream` union. Forced by two facts: `Http2Connection<S>` / `WebSocket<S>` hold `inner: S*` (BORROWED — `E0455` rejects that across a suspend, so the transport must be owned), and `async` on a trait method is currently rejected outright (`E0364`, parser). Design: `async read(&this, n) -> T` desugars to an implicit associated type plus a projection return (`type ReadFut; read(&this, n) -> This::ReadFut`), each impl binding it to its own synthesized future via the existing positional trait-arg sugar. Jake's scope calls (2026-07-26): default bodies ARE in scope (one future generic over `This`), and `S: AsyncRead` alone must IMPLY the future's bound — the latter already works as a consequence of the gap fixes, verified by a probe carrying only `where S: AsyncRead`. |
 
 Legend: ☐ not started · ◐ in progress · ✅ done+validated · ⏸ blocked (note why in the Progress Log).
 
@@ -2556,3 +2556,163 @@ The lesson worth keeping: the earlier `Maker`/`Tick` probe that "proved projecti
 works" proved no such thing — instrumentation showed `m.tick()` resolving on a CONCRETE `Ticker`,
 because specialization had already reduced `S::Made`. It never exercised the projection path at all.
 Any future claim that this machinery works needs a trace, not a green probe.
+
+
+### 2026-07-26 — All THREE projection gaps FIXED; async trait methods scoped by Jake
+
+The §4 mission of the handoff. Every gap that blocked projection-typed dispatch is fixed, each one
+diagnosed by instrumenting the compiler rather than inferred from a probe's exit code. Six defects,
+not three — the chain was longer than the handoff's characterisation.
+
+**Gap 1a — the abstract-receiver early return preempts BOTH rescues.** `resolve_method_call` bailed
+at `symbolic_type_unresolved(obj_type)`, which is true for a projection receiver AND for a
+bounded/where-constrained param, so the `AssocProjection` and `BoundedParam` rescues written further
+down (past the type-symbol lookup) were unreachable in a symbolic walk and every use site read
+`void`. Replaced with `MethodBinding::abstract_receiver_method_return`, called AFTER
+`stash_abstract_receiver_method` so the existing method-type-arg stash is untouched and the change is
+strictly additive: previously invalid, now a type.
+
+**Gap 1b — a where-bound subject `S::Member` was not a Projection annotation.** `parse_trait_bounds`
+already commits to the projection reading for `Identifier ::`, but delegated to `parse_base_type`,
+which flattens an identifier base into a qualified `Named` ("S::ReadFut"). FOUR independent decoders
+(`projection_ann_member` ×2, `projection_member_of`, `is_projection_annotation`) pattern-match
+`TypeAnnotation::Projection` and silently read that flat form as "not a projection", so the bound was
+inert; only `This::Item` worked, because `This` is a keyword taking `parse_base_type`'s Projection
+branch. Fixed at the parser with `parse_projection_subject`, scoped to where-clause subject position —
+the one place the grammar can disambiguate a projection from a module path, and the fix that repairs
+all four decoders at once instead of duplicating string-splitting into each with no scope to judge it.
+
+**Gap 1c — the bound-trait method return came back RAW.** `Future::poll` declares
+`-> Poll<This::Output>` and nothing substituted `Output := i64`. Added `subst_bound_assoc_args`
+(associated types are trailing POSITIONAL trait args, `generic_params.length + assoc_idx`) plus a
+`subst_assoc_by_member` walker. It deliberately does NOT cache onto the `AssocProjectionType`:
+`This::Output` is trait-relative and interned once, so pinning one bound's answer would leak into
+every other bound over that trait.
+
+**Also 1c — `This` was never rebased onto the receiver.** `AsyncRead::read` declares
+`-> This::ReadFut`; on a receiver typed `S` the answer must be `S::ReadFut`, the same projection the
+caller's bound resolves to. `subst_this_in_trait_return` substitutes the canonical
+`GenericParam("This", sentinel)` (one deduplicated arena entry, per `resolve_trait_method_signatures`)
+via a plain `TypeSubstitution` — no third copy of the structural walker.
+
+**Also 1a — a where-clause-bounded param is a plain `GenericParam`, not a `BoundedParam`.** Its
+bounds live on the enclosing function/impl node, so `lookup_method_through_bounds` (which reads a
+`BoundedParamType`'s own list) never saw them, and `s.read(3)` under `where S: AsyncRead` resolved to
+nothing. Added `lookup_method_through_param_bounds` / `scan_param_bounds`, the bare-subject sibling of
+the projection scan.
+
+**Gap 2 — a projection-typed value could not bind another generic fn's param.** Two defects. In sema,
+`project_where_bound_params_into` skipped an abstract subject and demanded a concrete derivation, so
+`block_on<F, R>`'s `R` never bound, the caller discarded the whole binding set, and the call reached
+codegen unspecialized (E0636 — not the E0633 the handoff recorded; gap 1's fix moves it further
+along). Inside the symbolic walk `R = (S::ReadFut)::Output` is the correct answer, so a `symbolic`
+flag now admits it — the same reasoning already written into `subst_free_call_return`. In mono, the
+stash was substituted but never REDUCED: substitution rewrites a projection's base
+(`S::ReadFut` → `Ticker::ReadFut`) and a projection over a concrete base contains no generic param, so
+it survived the `contains_generic_param` guards and got MANGLED into a callee name nothing emits.
+`CallSpecializer::concretize_stashed_arg` now applies-then-reduces at all FOUR stash-consuming sites.
+
+**Gap 3 — `await` on a projection-typed operand.** `resolve_await` used only
+`resolve_concrete_member`, which has no impl to read for `S::ReadFut`. Inside the symbolic walk the
+Output is the nested projection `(S::ReadFut)::Output`; a concrete operand that fails the lookup
+genuinely is not a `Future` and still gets the clean E0306. Plus the missing
+`TypeKind::AssocProjection` case in `AsyncLower::type_ann_for`, spelled as a Projection annotation so
+the substituter rewrites its base on specialization.
+
+**Validation.** Six scratch probes, each RUN (not merely compiled) with its value checked, and each
+built on the evidence rule from the previous entry — behaviour was confirmed by `cdebug` traces
+showing the intended function running, and gap 1c was proved by a probe that FAILS without the fix:
+two projections over one trait with different Outputs (`Future<i64>` vs `Future<boolean>`) collide
+into a single arena type when the return is raw. A negative variant confirms the substitution TIGHTENS
+typing — `expected i64, found boolean`, where it previously said `found This::Output`.
+`make test` OVERALL PASS at the exact baseline (unit 1753, compile-fail 158, projects 12). All traces
+removed before gating.
+
+**Jake's two scope calls for §5** (asked 2026-07-26; he took the thorough option on both):
+
+1. **Async trait DEFAULT bodies ARE in scope.** A default body synthesizes ONE future struct generic
+   over `This` with a per-impl assoc binding, so `AsyncRead` can carry `read_exact`/`read_all` written
+   once over `read`, mirroring `io::Read`.
+2. **The future's bound is IMPLIED by the trait.** `where S: AsyncRead` alone must typecheck
+   `await s.read(3)`; writing `where S::ReadFut: Future<i64>` at each use site was the cheaper option
+   and was rejected as verbose and prone to drifting from the trait. **This already works as a
+   consequence of the gap fixes above** — `scan_param_bounds` types the call through the trait bound
+   and `resolve_await` projects the Output symbolically — verified by a probe carrying only
+   `where S: AsyncRead`.
+
+**Known design risk for §5, not yet resolved:** a default-bodied async trait method takes `&this`, so
+its future holds the receiver across a suspend. Whether `E0455`'s `frame_addr_root_expr` rejects
+`await this.read(n)` inside such a body needs checking before that piece is built.
+
+
+### 2026-07-26 — Async TRAIT METHODS landed (§5), default bodies included
+
+`E0364` no longer rejects an `async` trait method. It desugars to an implicit associated type plus a
+projection return, and each impl binds that type to the future its own `async` method lowers to — so
+two implementations return two different concrete future types while the trait still declares one
+signature:
+
+```cryo
+type trait AsyncRead {
+    async read(&this, n: i64) -> i64;          // => type ReadFut;  read(..) -> This::ReadFut
+    async read_twice(&this, n: i64) -> i64 {   // DEFAULT body, awaits through `this` twice
+        const a: i64 = await this.read(n);
+        return await this.read(a);
+    }
+}
+async function pump<S>(s: S) -> i64 where S: AsyncRead { return await s.read(3); }
+```
+
+Four pieces:
+
+1. **Parser** — the trait-method `E0364` is lifted and `is_async` kept on the node. The
+   `virtual`/`override` rejection STAYS: those genuinely share a vtable slot and each override would
+   return its own future. Its negative test still passes.
+2. **TypeResolution — `desugar_async_trait_methods`** synthesizes `<Method>Fut` (`read` -> `ReadFut`,
+   `read_exact` -> `ReadExactFut`) unless the trait declares it explicitly, and rewrites the method's
+   **resolved** return to `This::<Method>Fut`. **The ANNOTATION deliberately keeps the user's
+   `-> i64`** — see the trap below. Name-casing goes through explicit alphabet tables, not `c - 32`:
+   `CharType` is 4 bytes here while the stdlib treats a char as 1.
+3. **`AsyncLower::bind_async_trait_assoc`** — after an impl's `async` method lowers, its future is
+   bound to `<Method>Fut` on the enclosing trait impl via the existing `add_assoc_binding`, which
+   `resolve_concrete_member` already consults (`impl_node.lookup_assoc_binding`) after the positional
+   sugar. `AsyncOwner` gained an `impl_node` field to carry the block down. An explicit hand-written
+   binding wins, so `implement trait AsyncRead<MyFut>` stays authoritative.
+4. **E0309** — `impl_binds_assoc_via_async` teaches the unbound-associated-type check that this
+   binding is implicit. Without it EVERY async trait impl is an error, because E0309 runs in
+   TypeResolution and the binding is added by the sema-time lowering long afterwards.
+
+**The trap worth keeping.** The desugaring must NOT rewrite the return ANNOTATION.
+`synthesize_default_trait_methods` clones a default-bodied trait method into each impl *carrying its
+annotations*, and that clone has to lower as an ordinary `async` method whose future's Output is
+`i64`. Rewriting the annotation would make the clone's future's Output be its own future type —
+circular. Rewriting only the resolved return keeps callers seeing `This::<Method>Fut` while the impl
+side still sees the Output.
+
+**Default bodies cost almost nothing**, which was not obvious up front: because
+`synthesize_default_trait_methods` already CLONES them into each impl during TypeResolution, each
+clone lowers exactly like an ordinary impl-side async method and binds its own future. No future
+generic over `This` was needed — the design risk recorded in the previous entry dissolved. The
+related E0455 worry also proved unfounded: an `async` method with a `&this` receiver awaiting THROUGH
+`this` twice compiles and runs (probed directly), because the receiver is a parameter pointer the
+existing async-method machinery already carries, not a frame address.
+
+**Jake's "implied bound" call needed no work at all.** `where S: AsyncRead` alone types
+`await s.read(3)`, as a consequence of the §4 gap fixes: `scan_param_bounds` types the call through
+the trait bound and `resolve_await` projects the Output symbolically.
+
+**Tests.** `tests/tests/negative/E0364_async_trait_method.cryo` DELETED — it asserted the rejection
+that is now lifted. New `tests/tests/lang/async_trait_method.cryo` with 6 tests: dispatch to the
+impl's own future, a DISTINCT future per impl (a shared one would make both answers equal), an
+`async` body with no `await` at all, the default body running for the non-overriding impl, override
+precedence, and a call on a concrete receiver. Gates: `make test` OVERALL PASS (unit **1759**,
+compile-fail 157 — one fewer by the deletion, projects 12); roster regenerated **by merge** with a
+golden-only count of **0**; `roster-check: OK (1759 tests)`.
+
+**Not done, and next:** §6 (port every socket consumer onto these traits) and §7 (delete the blocking
+surface). The §6 surface is now mapped precisely: `Http2Connection<S>` and `WebSocket<S>` hold
+`inner: S*` (must become owned, and their `drop` must then drop it); 8 generic entry points across
+`ws/frame.cryo`, `http2/frame.cryo`, `http/request.cryo`, `http/response.cryo`; and six direct
+consumers (`http/client`, `http/server`, `http2/client`, `http2/server`, `https`, `ws/conn`).
+Re-derived from code hits with doc comments excluded, confirming `net/dns.cryo`, `net/addr/ip.cryo`
+and `net/socket/udp.cryo` name `TcpStream` only in prose and need no port.

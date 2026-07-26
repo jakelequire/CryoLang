@@ -1657,18 +1657,13 @@ public:
                 continue;
             }
 
-            // A trait method cannot be `async`. Every impl would lower to its
-            // OWN future struct, so the trait has no single return type to
-            // declare and the overrides could not share a dispatch slot;
-            // expressing it needs a boxed `dyn Future`, which does not exist.
-            // Consume the keyword so the rest of the signature still parses and
-            // the reader gets one error instead of a cascade.
+            // An `async` trait method IS allowed: it desugars to an implicit
+            // associated type plus a projection return (`type ReadFut;` and
+            // `read(&this, n) -> This::ReadFut`), which each impl binds to its
+            // own synthesized future. `is_async` is kept on the node and
+            // `TypeResolutionPasses::desugar_async_trait_methods` performs that
+            // rewrite once the trait's signatures resolve.
             mut trait_mods: MethodModifiers = this.consume_method_modifiers(SourceSpan::none());
-            if (trait_mods.is_async) {
-                this.report_invalid_at(ErrorCode::E0364_INVALID_ASYNC_MEMBER,
-                    "a trait method cannot be `async`: each implementation returns its own future type, so there is no single return type for the trait to declare",
-                    trait_mods.span);
-            }
             const is_static: boolean = trait_mods.is_static;
 
             // Method name can be an identifier OR a keyword used as a name
@@ -1680,6 +1675,7 @@ public:
                 const func: FunctionDeclNode* = this.parse_function_declaration(false);
                 if (func != null) {
                     if (is_static) { func.set_static(true); }
+                    if (trait_mods.is_async) { func.set_async(true); }
                     node.add_method(func);
                 }
             } else {
@@ -2491,9 +2487,9 @@ public:
 
             // Subject: a bare type parameter (`T`) or an associated-type
             // projection (`This::Item`, `I::Item`). A projection routes through
-            // `parse_base_type` (which builds the Projection node) and leaves
-            // `type_parameter` empty; a bare param keeps the historical path so
-            // the param-name-keyed machinery downstream is unchanged.
+            // `parse_projection_subject` (which builds the Projection node) and
+            // leaves `type_parameter` empty; a bare param keeps the historical
+            // path so the param-name-keyed machinery downstream is unchanged.
             mut type_param: SymbolStr = SymbolStr::empty();
             mut subject: TypeAnnotation* = null;
             const is_projection: boolean =
@@ -2501,7 +2497,7 @@ public:
                 || (this.check(TokenType::Identifier)
                     && this.peek_at(1).kind == TokenType::ColonColon);
             if (is_projection) {
-                subject = this.parse_base_type();
+                subject = this.parse_projection_subject();
             } else {
                 const type_param_tok: Token =
                     this.consume(TokenType::Identifier, "type parameter");

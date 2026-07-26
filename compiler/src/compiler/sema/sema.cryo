@@ -251,17 +251,17 @@ public:
                 NodeKind::StructDeclaration => {
                     const s: StructDeclNode* = stmt as StructDeclNode*;
                     this.declare_async_methods(s.methods, s.generic_params,
-                        this.ctx.qualify_binding_sym(s.name, s.binding_namespace), no_aliases);
+                        this.ctx.qualify_binding_sym(s.name, s.binding_namespace), no_aliases, null);
                 }
                 NodeKind::UnionDeclaration => {
                     const u: UnionDeclNode* = stmt as UnionDeclNode*;
                     this.declare_async_methods(u.methods, u.generic_params,
-                        this.ctx.qualify_binding_sym(u.name, u.binding_namespace), no_aliases);
+                        this.ctx.qualify_binding_sym(u.name, u.binding_namespace), no_aliases, null);
                 }
                 NodeKind::ClassDeclaration => {
                     const c: ClassDeclNode* = stmt as ClassDeclNode*;
                     this.declare_async_methods(c.methods, c.generic_params,
-                        this.ctx.qualify_symbol_sym(c.name), no_aliases);
+                        this.ctx.qualify_symbol_sym(c.name), no_aliases, null);
                 }
                 NodeKind::ImplementationBlock => {
                     const ib: ImplBlockNode* = stmt as ImplBlockNode*;
@@ -275,7 +275,7 @@ public:
                     mut aliases: SymbolStr[] = [ib.target_type,
                                                 this.ctx.qualify_symbol_sym(ib.target_type)];
                     this.declare_async_methods(ib.methods, ib.generic_params,
-                                               canonical, aliases);
+                                               canonical, aliases, ib);
                 }
                 _ => { }
             }
@@ -287,9 +287,13 @@ public:
     /// `owner_params` are the OWNER's generic parameters, which the future must
     /// carry as well as the method's own; `qname` / `aliases` are the keys the
     /// declaration index registered the methods' signatures under.
+    /// `impl_node` is the enclosing impl block when the owner is one (null
+    /// otherwise); a trait impl uses it to bind the trait's implicit
+    /// `<Method>Fut` associated type to the future each method lowers to.
     declare_async_methods(mut &this, methods: &MethodNode*[],
                           owner_params: &GenericParamNode*[],
-                          qname: SymbolStr, aliases: &SymbolStr[]) -> void {
+                          qname: SymbolStr, aliases: &SymbolStr[],
+                          impl_node: ImplBlockNode*) -> void {
         if (!qname.is_valid()) { this.reject_undeclarable_async(methods, qname); return; }
         const owner_ty: TypeRef = this.ctx.decl_index.lookup_type(qname);
         if (!owner_ty.is_valid()) { this.reject_undeclarable_async(methods, qname); return; }
@@ -314,6 +318,7 @@ public:
                 qname: qname,
                 alias_qnames: this.clone_symbols(aliases),
                 params: this.clone_generic_params(owner_params),
+                impl_node: impl_node,
             };
             this.async_lower.declare_method(own);
         }
@@ -1384,6 +1389,19 @@ public:
         const out_sym: SymbolStr = this.intern.intern("Output");
         mut rc: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
         const out_ty: TypeRef = this.ctx.type_resolver.resolve_concrete_member(fut_ty, out_sym, &rc);
+        if (out_ty.is_valid()) { return out_ty; }
+        // An operand typed by an associated-type projection (`s.read(n)` typed
+        // `S::ReadFut` inside a generic body) has no impl to read a binding from
+        // yet. Its Output is the nested projection `(S::ReadFut)::Output` —
+        // abstract, but precisely what monomorphization reduces once `S` is
+        // bound, and the lowering needs a valid type to build the frame field
+        // from. Restricted to the symbolic walk: a CONCRETE operand that fails
+        // the lookup genuinely does not implement `Future` and must still be
+        // diagnosed below.
+        if (this.state.in_symbolic_check && this.arena.contains_generic_param(fut_ty)) {
+            const sym_out: TypeRef = this.ctx.type_resolver.project_member(fut_ty, out_sym, &rc);
+            if (sym_out.is_valid()) { return sym_out; }
+        }
         if (!out_ty.is_valid()) {
             const disp: string = this.arena.resolve_display_name(fut_ty.id);
             this.ctx.emit_error_at(ErrorCode::E0306_TRAIT_BOUND_NOT_SATISFIED,
