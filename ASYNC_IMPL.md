@@ -39,6 +39,9 @@ not for routine judgement calls.
 | 3 | Executor + `Waker` + `spawn`/`JoinHandle`; multi-thread; poll-boundary `catch_unwind` isolation | ✅ DONE+validated (2026-07-24) — surface LOCKED 2026-07-23. **(a)** single-thread executor + ready-queue + re-enqueueing Waker; **(b)** `spawn`/`JoinHandle` (Output via `TaskShared<O>`), `block_on`, `join`/`detach`/`abort`, drop=detach; **(c)** pthread worker pool + per-task atomic run-state (IDLE/SCHEDULED/RUNNING/NOTIFIED) + condvar `join`/`block_on` + `catch_unwind` poll-boundary isolation. Needed a NEW compiler `![config(panic_unwind)]` gating atom (see §9) → Phase-1 both-OS REPIN (selfhost fixed point, 235 `.ll`). Executor is self-contained (own pthread wrappers, no `thread::Scope` dep). Validated on Linux: regression 30/30, isolation 30/30. UNCOMMITTED. |
 | 4 | Reactor (epoll/IOCP) + async I/O over `std::net` + timers + `async fn main` + combinators | ◐ in progress 2026-07-24. **Inc 4b DONE on Linux (reactor + async TCP, stress+leak clean); Windows AFD backend written but UNVALIDATED (wine 9.0 cannot service `IOCTL_AFD_POLL` — needs a real Windows box).** Interface fork LOCKED by Jake: **one readiness interface both OSes, Windows via real AFD** (not WSAPoll, not a per-OS split). Sockets are to become **async-only with every consumer ported** (Jake, 2026-07-24) — that port is **UNBLOCKED as of 2026-07-24**: the aggregate-across-await tail landed, and the follow-on "rebuilt from inside a branch" E0600 is now removed too (newest §9 entry). Forks LOCKED earlier: waker lifetime = **separate `Arc`-wrapper**; reactor = **dedicated thread, per-`Executor`** (`![thread_local]` current-reactor handle); platform = **both OSes (epoll + IOCP)**. **Inc 4a DONE+validated (2026-07-24): Arc-refcounted `Waker` (Copy→non-Copy) + `Arc<Task>` lifetime; finish-vs-park now implicit via `Task::drop` on the last decref. Needed a COMPILER fix (owner-generic static with a defaulted owner param + nested return → E0636; `call_resolver.cryo` default-backfill) → selfhost fixed point BOTH OS, win-s2 vs win-s3 = 0/235 `.ll`, REPINNED both OS. UNCOMMITTED.** NEXT = Inc 4b (the reactor: epoll+IOCP interface — bring Jake the readiness-vs-completion unification fork). |
 
+| 4d | Timers — reactor deadline chain + `Sleep` | ✅ DONE+validated 2026-07-26. Deadline-sorted chain on `Reactor` (`register_timer`/`cancel_timer`), reactor thread bounds its wait by the earliest deadline instead of `-1`, fires expired wakers after the wait, kicks on a new-earliest arming. `stdlib/future/timer.cryo`: `Sleep::new(dur)` / `Sleep::until(instant)`, absolute deadlines, saturating construction, `Drop` disarms. Self-wakes under a reactor-less driver so `future::block_on` still completes it. Also fixed a real teardown UAF: `Executor::drop` freed the `Reactor` before `drain_cancelled()`, so a task woken by readiness but not yet driven dereferenced freed memory in its future's `drop` — split into `Reactor::stop` / `Reactor::free`. 10 tests. |
+| 4f | Combinators — `join` / `select` / `timeout` | ✅ DONE+validated 2026-07-26. `stdlib/future/combinator.cryo`; built through the `Futures` namespace (`Futures::join`/`select`/`timeout`/`timeout_at`). Cancellation is a plain drop — the `Select` loser and the `Timeout` victim are released with the combinator, which is what disarms a `Sleep` and releases an I/O registration. Arity 2, higher arities nest (tested). 9 tests. **`try_join` NOT shipped:** blocked on an inference gap — a generic static whose return type mentions the future params AND params reachable only by destructuring a nested generic in the bound leaves the nested ones abstract (minimal repro in §9). |
+
 Legend: ☐ not started · ◐ in progress · ✅ done+validated · ⏸ blocked (note why in the Progress Log).
 
 **Current HEAD baseline:** `eda79ddc` (the two root-cause compiler fixes of 2026-07-24 — `drop_insertion`
@@ -2163,3 +2166,74 @@ own source contains an `async` method, and every new parser/sema path is reached
 `make test` builds with `compiler/build/cryo` (the stage-2 self-host), not with `bin/cryo`, so the new tests
 do not need a repin to run from a clean tree — but as with generic `async function`, the PINNED compiler
 cannot itself compile an `async` method until someone repins, which matters the moment `stdlib/` grows one.
+
+### 2026-07-26 — Timers (4d) + combinators (4f) LANDED; two compiler bugs found, one fixed
+
+**Timers (`stdlib/future/timer.cryo`, `reactor.cryo`).** The reactor grew a deadline-sorted chain of
+`Timer` blocks (`register_timer(deadline, waker) -> id` / `cancel_timer(id)`), mirroring the
+`Registration` table's shape and its no-waker-under-the-lock rule — `fire_expired` unlinks and frees
+ONE timer per lock acquisition and wakes it after the unlock, which avoids collecting an unbounded
+number of wakers into caller-owned locals. `reactor_body` now calls `run_once`, which bounds
+`poll_once` by the earliest deadline (rounding UP, so a wait never ends early) instead of passing
+`-1`, and `register_timer` kicks the reactor when the new timer becomes the head. `Sleep` holds an
+absolute deadline, so re-polling never extends it; `Drop` disarms, which is what makes it usable as a
+`select` loser. With no reactor on the thread (`future::block_on`) it self-wakes rather than parking
+with nowhere to register — that driver's documented contract is "makes progress on every poll", and
+checking the clock is progress.
+
+**A real teardown use-after-free, fixed on the way.** `Executor::drop` called `Reactor::destroy`
+(which freed the block) BEFORE `inner.drain_cancelled()`. A task that readiness had already woken is
+still in the ready queue at that point; draining it runs its future's `Drop`, which cancels against
+the reactor — freed memory. Split into `Reactor::stop` (signal, join the thread, release every
+registration AND timer, close the backend, leave the block and its lock alive) and `Reactor::free`,
+with the free moved after the drain. The pre-existing ordering rationale (stop the reactor before
+draining, or a task woken in the interim sits in the queue forever) is preserved.
+
+**Combinators (`stdlib/future/combinator.cryo`).** `Join`, `Select`, `Timeout`, built through the
+`Futures` namespace — a namespace rather than free functions because a child produced by an
+`async function` has a compiler-generated type no caller can name, so the constructors' bounds have
+to infer the whole parameter set. Cancellation needs no mechanism: a combinator owns its children, so
+the `Select` loser and the `Timeout` victim are released when the combinator drops, and that drop is
+exactly where a `Sleep` disarms and an I/O future deregisters. Arity is 2 and higher arities nest
+(`Futures::join(a, Futures::join(b, c))`, tested) — Cryo has no variadic generics and a `Join3/4/...`
+tower would say nothing new. `Timeout` polls the OPERATION before the deadline, so a future that
+becomes ready on the same poll the timer fires reports its value rather than a timeout; it did
+complete, and for an I/O future the side effect has already happened.
+
+**Compiler bug #1 — a zero-sized type as a `Future`'s `Output` payload MISCOMPILES.** Discriminated
+minimally: `Result<i64, Empty>` as a plain value is correct, and `Result<T, NonEmpty>` as a future's
+`Output` is correct, but `Result<T, Empty>` as a future's `Output` hands back a garbage `T` and a
+misread discriminant (a `Timeout` that should have said `Err` said `Ok` with junk). Unit `()` is
+fine, so unit is special-cased somewhere a user-declared empty struct is not. Worked around
+*by design*: `Elapsed` carries the monotonic deadline it missed, which is non-zero-sized and more
+useful than the empty marker it would otherwise be. **Do not simplify `Elapsed` back to
+`type struct Elapsed { }`.**
+
+**Compiler bug #2 — nested-bound inference gap; `try_join` is NOT shipped because of it.**
+
+```cryo
+static direct<A,B,OA,OB>(a:A,b:B) -> W4<A,B,OA,OB> where A: Future<OA>, B: Future<OB>          // infers
+static nested<A,B,T1,T2,E>(a:A,b:B) -> W5<A,B,T1,T2,E>
+    where A: Future<Result<T1,E>>, B: Future<Result<T2,E>>                                     // does NOT
+```
+
+Every call to the second fails `E0200 expected Result<(i64,i64),boolean>, found Result<(T1,T2),E>`.
+Narrowed: a nested bound infers fine when the return type does NOT also mention `A`/`B`; two bounds
+sharing `E` is fine; the Output shape `Result<(T1,T2),E>` is fine on its own — it is the combination.
+The compiler already does exactly this recovery for generic OWNERS in
+`infer_static_owner_bindings_from_expected` (unify the declared return against the expected type);
+the same applied to a method's own parameters would unblock `try_join`. Rather than ship an
+unconstructible type, `try_join` was left out and the module documents the stand-in: `join` over two
+`Result` futures gives the concurrency and both results, just not sibling-cancellation on first
+error.
+
+**Validation.** 10 timer tests + 9 combinator tests, all passing. Probes confirmed three parallel
+300ms sleeps take ~300ms (not 900ms), a `select` loser sleeping for an hour neither blocks the
+`select` nor wedges teardown, and a timer armed at teardown is released rather than waited out.
+No repin taken this session — the compiler is unchanged since `3e84658b`; everything here is stdlib
+plus tests.
+
+**Still open from this session:** the same-leaf caller-scope resolution bug (`Executor::spawn`
+returning `thread::JoinHandle` when a program imports both `std::future` and `std::thread`) is PARKED
+at Jake's direction, diagnosed in agent memory with a 3-file minimal repro. It is why the timer tests
+reach for `spawn_detached` in one place.
