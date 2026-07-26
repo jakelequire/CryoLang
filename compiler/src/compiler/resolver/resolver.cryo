@@ -452,8 +452,10 @@ type struct Resolver {
     /// can be used for TypeArena/DeclarationIndex lookup, or empty if not found.
     ///
     /// Handles both bare names ("Vec2") and already-qualified names
-    /// ("Math::Vec2::Vec2").  For qualified input, extracts the leaf segment
-    /// and resolves that, then validates the prefix matches the symbol's module.
+    /// ("Math::Vec2::Vec2").  For qualified input, extracts the leaf segment and
+    /// resolves that, then validates the written prefix against the module the
+    /// symbol was declared in — two modules may export the same leaf name, and
+    /// the leaf-keyed scope chain cannot tell them apart on its own.
     resolve_type_qualified_name(&this, name: SymbolStr) -> SymbolStr {
         const name_str: string = this.intern_table.resolve(name);
         LOG_DEBUG(LogComponent::Resolver,
@@ -470,11 +472,19 @@ type struct Resolver {
             // or arena lookup by the caller.
             // If the caller's lookup fails, it will try bare-name fallback.
 
-            // Extract the leaf (last segment) and resolve it
+            // Extract the leaf (last segment) and resolve it. The scope chain is
+            // keyed by leaf alone, so this can land on a same-named type from an
+            // entirely different module — `executor::JoinHandle` reaching
+            // `thread::JoinHandle` in a program that imports both. Accept the
+            // result only when its declaring module agrees with the qualifier
+            // that was actually written; otherwise fall through to the export
+            // scan below, which searches BY prefix. Without that check the winner
+            // is whichever module registered the leaf last, which is not a
+            // property the source mentions.
             const leaf_sym: SymbolStr = this.extract_leaf(name_str);
             if (leaf_sym.is_valid()) {
                 const resolved: SymbolStr = this.resolve_type_qualified_name_bare(leaf_sym);
-                if (resolved.is_valid()) {
+                if (resolved.is_valid() && this.qualifier_agrees(resolved, name_str)) {
                     return resolved;
                 }
             }
@@ -527,6 +537,35 @@ type struct Resolver {
             }
         }
         return SymbolStr::empty();
+    }
+
+    /// True when the module `resolved` was declared in is consistent with the
+    /// qualifier written in `written_str`. `resolved` is a canonical
+    /// `Module::Leaf`; `written_str` is the `Prefix::Leaf` the source spelled.
+    ///
+    /// An unqualified `written_str` agrees with anything — there is no qualifier
+    /// to contradict. A `resolved` with no module of its own agrees with nothing
+    /// qualified, since a written prefix cannot name the global namespace.
+    qualifier_agrees(&this, resolved: SymbolStr, written_str: string) -> boolean {
+        const written_prefix: string = this.prefix_of(written_str);
+        if ((written_prefix.length() as i64) == 0) { return true; }
+        const resolved_mod: string = this.prefix_of(this.intern_table.resolve(resolved));
+        if ((resolved_mod.length() as i64) == 0) { return false; }
+        return this.module_ns_matches_prefix(resolved_mod, written_prefix);
+    }
+
+    /// Everything before the final "::" in `s`, or empty when there is none.
+    /// E.g. "std::future::executor::JoinHandle" -> "std::future::executor".
+    prefix_of(&this, s: string) -> string {
+        const len: i64 = s.length() as i64;
+        mut last_sep: i64 = -1;
+        for (mut i: i64 = 0; i + 1 < len; i++) {
+            if (s[i] == ':' && s[i + 1] == ':') {
+                last_sep = i;
+            }
+        }
+        if (last_sep <= 0) { return ""; }
+        return s.substring(0, last_sep);
     }
 
     /// True when `prefix` occurs in the module namespace `mod_str` as a run of

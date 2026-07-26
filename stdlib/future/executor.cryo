@@ -882,14 +882,20 @@ type struct Executor {
 /// block leaks. Shutdown MUST be signaled before the workers are joined, or the
 /// join would block forever waiting on threads that never leave `take()`.
 ///
-/// The three steps are ordered so nothing can be resurrected after it is
-/// reclaimed. Joining the workers first stops all polling. Stopping the reactor
-/// next joins its thread — after which no wake can be generated — and releases
-/// its registrations, whose wakers are the last reference to any task parked on
-/// I/O, so those tasks are finished and freed here (a task's drop deregisters,
-/// which the teardown tolerates re-entrantly). Only then is the queue drained:
-/// draining before the reactor stopped would leave a task woken in the interim
-/// sitting in the queue forever.
+/// The steps are ordered so nothing can be resurrected after it is reclaimed.
+/// Joining the workers first stops all polling. Stopping the reactor next joins
+/// its thread — after which no wake can be generated — and releases its
+/// registrations and timers, whose wakers are the last reference to any task
+/// parked on I/O or a deadline, so those tasks are finished and freed here (a
+/// task's drop deregisters, which the teardown tolerates re-entrantly). Only
+/// then is the queue drained: draining before the reactor stopped would leave a
+/// task woken in the interim sitting in the queue forever.
+///
+/// The reactor block is freed last, after the drain rather than as part of the
+/// stop. A task that readiness had already woken is still sitting in the queue
+/// at that point, and dropping it runs its future's `Drop`, which cancels
+/// against the reactor it registered with; that cancellation has to find a live
+/// (if empty) table rather than freed memory.
 implement trait Drop for struct Executor {
     drop(mut &this) -> void {
         if (this.inner == null) { return; }
@@ -906,10 +912,14 @@ implement trait Drop for struct Executor {
             exec_join_worker(this.worker_tids[i]);
         }
         this.worker_tids.drop();
-        Reactor::destroy(inner.reactor);
-        inner.reactor = null;
-        // No workers and no reactor remain: safe to reclaim without locking.
+        Reactor::stop(inner.reactor);
+        // No workers and no reactor thread remain: safe to reclaim without
+        // locking. The reactor block stays alive across this drain because a
+        // queued task's future may still cancel a registration or timer against
+        // it as it is dropped; `Reactor::free` releases it once that is past.
         inner.drain_cancelled();
+        Reactor::free(inner.reactor);
+        inner.reactor = null;
         exec_cond_destroy(&inner.d_cond[0]);
         exec_mtx_destroy(&inner.d_mutex[0]);
         exec_cond_destroy(&inner.q_cond[0]);
