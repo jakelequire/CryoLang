@@ -42,6 +42,13 @@ not for routine judgement calls.
 | 4d | Timers — reactor deadline chain + `Sleep` | ✅ DONE+validated 2026-07-26. Deadline-sorted chain on `Reactor` (`register_timer`/`cancel_timer`), reactor thread bounds its wait by the earliest deadline instead of `-1`, fires expired wakers after the wait, kicks on a new-earliest arming. `stdlib/future/timer.cryo`: `Sleep::new(dur)` / `Sleep::until(instant)`, absolute deadlines, saturating construction, `Drop` disarms. Self-wakes under a reactor-less driver so `future::block_on` still completes it. Also fixed a real teardown UAF: `Executor::drop` freed the `Reactor` before `drain_cancelled()`, so a task woken by readiness but not yet driven dereferenced freed memory in its future's `drop` — split into `Reactor::stop` / `Reactor::free`. 10 tests. |
 | 4f | Combinators — `join` / `select` / `timeout` | ✅ DONE+validated 2026-07-26. `stdlib/future/combinator.cryo`; built through the `Futures` namespace (`Futures::join`/`select`/`timeout`/`timeout_at`). Cancellation is a plain drop — the `Select` loser and the `Timeout` victim are released with the combinator, which is what disarms a `Sleep` and releases an I/O registration. Arity 2, higher arities nest (tested). 9 tests. **`try_join` NOT shipped:** blocked on an inference gap — a generic static whose return type mentions the future params AND params reachable only by destructuring a nested generic in the bound leaves the nested ones abstract (minimal repro in §9). |
 
+| 4g | `async function main` | ✅ DONE+validated 2026-07-25. Renamed out of the entry-point slot (`main` → `main$async`) with a synchronous `main` synthesized in its place, driving it on an `Executor` LOCAL to `main` — a runtime scoped to the entry point, whose `Drop` tears it down at exit. `-> i32` and `-> void` both land on an `i32` entry point; parameters are forwarded, so argc/argv behaviour is identical to a synchronous `main`. New `E0365` for a generic `main` or a return type that is neither. `AsyncLower::desugar_async_main`, called before `declare`. 3 projects + 2 negative tests. |
+| 5a | Buffer-owning `TcpRead` / `TcpWrite` | ✅ DONE+validated 2026-07-25. Both futures now OWN an `Array<u8>` as they already owned the socket, handing it back via `TcpIo::take_buf()`; a read truncates it to the bytes that arrived, a write returns it untouched. Makes the async socket API sound BY CONSTRUCTION — a future moves between polls, so a caller-frame `u8*` was written through a stale address. Needed the missing `Array<T>::resize`. **Closed a total test gap: there were zero tests AND zero consumers of the async socket futures in the tree.** 2 tests (loopback echo round trip + read-timeout cancellation). |
+| 6 | `await` in a `match`-arm guard | ✅ DONE+validated 2026-07-25 — the last rejected `await` position. Such a `match` lowers to a DECISION CHAIN (one test state per arm, a false guard falling to the next test) instead of the single dispatch, which every other `match` keeps. Subject evaluated once into a chain-owned field; fall-through arm emitted only when the arm can fail to match; `hoist_match_expr`'s matching bail-out removed so the expression form works too. 14 tests. **One sub-case rejected with a precise diagnostic rather than lowered:** an arm binding an OWNING payload out of the subject, which a later test would then re-match hollowed-out. |
+
+| 5b-tls | Async TLS (the port's prerequisite) | ✅ DONE+validated 2026-07-25. `stdlib/net/tls/future.cryo`: `TlsHandshake` / `TlsRead` / `TlsWrite` / `TlsIo`, plus `TlsConnector::connect_async` and `TlsAcceptor::accept_async`. Each `WANT_READ`/`WANT_WRITE` becomes a reactor registration rather than a spin; the interest to arm is read off the SSL error code (a read CAN want writability), and each future records the one direction it armed so its `Drop` cancels only that half. Sound only because §5a made the read/write futures own their buffer — OpenSSL requires a `WANT_*` retry to repeat the same call with the SAME arguments, and a future moves between polls. 1 test: loopback handshake + encrypted echo with **both sides as tasks on ONE `Executor`**, which the blocking TLS test cannot do (it needs a thread, or `SSL_connect` blocks before `SSL_accept` runs). |
+| 5b-port | Socket port + delete the blocking surface | ☐ NOT STARTED. Jake's call (2026-07-25) was **"do TLS first, then delete"** — TLS is now done, so this is unblocked. Remaining: port `net/http/*`, `net/http2/*`, `net/ws/*`, `net/https.cryo`, `net/dns.cryo`, `net/socket/udp.cryo` (~7,400 lines / 19 files), then delete `TcpStream::connect/read/write`, `TcpListener::bind/accept` and the blocking TLS entry points. One-way API break: every `HttpClient::get`-shaped call becomes `async`. Decide first what an async `Read`/`Write` looks like — `http2/connection.cryo` (855 lines) is generic over `S: Read + Write`. |
+
 Legend: ☐ not started · ◐ in progress · ✅ done+validated · ⏸ blocked (note why in the Progress Log).
 
 **Current HEAD baseline:** `eda79ddc` (the two root-cause compiler fixes of 2026-07-24 — `drop_insertion`
@@ -2237,3 +2244,203 @@ plus tests.
 returning `thread::JoinHandle` when a program imports both `std::future` and `std::thread`) is PARKED
 at Jake's direction, diagnosed in agent memory with a 3-file minimal repro. It is why the timer tests
 reach for `spawn_detached` in one place.
+
+---
+
+### 2026-07-25 — `async fn main`, buffer-owning I/O futures, and `await` in a `match`-arm guard
+
+Three things landed: the entry point, the last unsound corner of the async socket API, and the last
+rejected `await` position. Compiler + stdlib + tests; UNCOMMITTED.
+
+#### `async function main` (Jake's decision: `Executor` + `block_on`)
+
+An `async function` lowers to a constructor returning its future, which for `main` would leave the
+program's entry point returning a struct. So the async `main` is **renamed out of the entry-point
+slot** (`main` -> `main$async`) and a synchronous `main` is synthesized in its place:
+
+```
+function main() -> i32 {
+    mut ex: Executor = Executor::new();
+    const main$out: i32 = ex.block_on(main$async());
+    return main$out;
+}
+```
+
+`-> void` drops the binding and returns `0`, so the synthesized entry point returns `i32` either way.
+An `Executor` rather than `future::block_on` because `Reactor::set_current` is only called in
+`worker_body`: under `future::block_on` there is no current reactor and every I/O or timer future
+would park with nowhere to register. The executor is a LOCAL of `main`, so its `Drop` tears the
+runtime down at exit — a runtime scoped to the entry point, not the ambient global one §7-5 ruled
+out — and it drops only after the root's value has been bound.
+
+Lives in `AsyncLower::desugar_async_main`, called from `Sema::declare_async_futures` BEFORE
+`declare`: `declare` registers the future under whatever name the node carries, so renaming
+afterwards would key that registration to `main`.
+
+Details worth keeping:
+
+- **Parameters are forwarded, not rejected.** The wrapper takes the same parameter list and passes it
+  through, so an `async main` behaves exactly as a synchronous one: codegen widens a ZERO-parameter
+  `main` to `(argc, argv, envp)` and publishes them to `std::env`, and a `main` that declares
+  parameters opts out of that on either path. The cloned parameters need
+  `set_resolved_type(p.resolved_type)` re-stamped — a clone keeps the annotation and DROPS the
+  resolved type, and type resolution has already run, so without it codegen cannot lower the
+  parameter and **skips the entry point's body entirely** (an LLVM "block has no terminator"
+  failure).
+- **`set_synthesized_body(true)`** on the wrapper: name resolution has already run, so the
+  unused-local lint has no evidence for the locals this body declares and would report the executor
+  and the root's value as unused.
+- **New code `E0365_INVALID_ASYNC_MAIN`** for a `main` that is generic, or returns anything but
+  `i32` / `void`. A missing `import std::future;` is left to `declare`'s existing message so one
+  cause produces one diagnostic.
+- Codegen needed NO change: it keys everything off the name `main` (unmangled symbol, argc/argv
+  widening, the `--panic=unwind` `__cryo_user_main` wrapper, `cryo test`'s `skip_user_main`), and the
+  synthesized wrapper is the thing named `main`.
+
+Tests: three PROJECTS (`async_main`, `async_main_void`, `async_main_params`) — the entry point cannot
+be a unit test, since the unit-test binary supplies its own `main`. Plus two negative tests
+(`E0365_async_main_bad_return`, `E0365_async_main_generic`).
+
+#### Buffer-owning `TcpRead` / `TcpWrite`
+
+`TcpRead`/`TcpWrite` took `buf: u8*` + `len`. A future is moved between polls, so a buffer named by a
+raw pointer into the caller's frame is written through a stale address — and since `E0455` now
+rejects `&local[0]` into an awaited future, the API could not be used in its idiomatic spelling at
+all. They now OWN an `Array<u8>` exactly as they own the socket, and hand it back through `TcpIo`
+(`take_buf()`). The bytes land in the array's heap block, which the moves do not disturb, so the API
+is sound BY CONSTRUCTION rather than by discipline.
+
+- A read hands the buffer back TRUNCATED to what arrived, so its length is the byte count.
+- A write hands it back untouched, so a caller with a short write still has the bytes it has not
+  sent.
+- Both `Drop`s free the buffer alongside closing the socket.
+- Needed `Array<T>::resize(new_length, value) where T: Copy + Drop` (+ `try_resize`), which the type
+  was simply missing: an array exposes only `[0, length)`, so `with_capacity` alone yields nothing to
+  read INTO.
+
+**There were ZERO tests and ZERO consumers of the async socket futures in the tree** — the "30/30 on
+real Windows" validation was a scratch probe that did not survive its session. That gap is now
+closed: `tests/tests/stdlib/net_tcp_async.cryo` runs a real loopback echo round trip
+(`TcpConnect`/`TcpAccept`/`TcpRead`/`TcpWrite` joined on one `Executor`) and a cancellation test where
+a read times out, exercising the drop path that deregisters the waker, closes the socket and frees
+the buffer.
+
+#### `await` in a `match`-arm guard (Jake chose "build it properly")
+
+The last rejected `await` position. A guard runs after its own pattern matched and before the next
+arm is tried, so it cannot be lifted above the `match`, and it cannot live inside the dispatch
+`match` either — a `match` has no way to resume into the middle of itself.
+
+Such a `match` now lowers to a **decision chain** (`AsyncLower::lower_match_chain_sm`), one test
+state per arm:
+
+```
+t_k : match (subj) { pat_k => { capture; -> g_k }   _ => { -> t_k+1 } }
+g_k : <guard, may suspend>;  true -> entry_k,  false -> t_k+1
+t_n : -> join
+```
+
+which is exactly what "a false guard tries the next arm" means once the guard is no longer something
+the dispatch can evaluate in one go. Every other `match` keeps the single dispatch, which costs one
+state rather than one per arm. An arm whose guard does NOT suspend keeps that guard on its pattern,
+where a false guard already falls through to the same `_ =>`.
+
+Three things this had to get right, each of which a plausible chain gets wrong:
+
+1. **The subject is evaluated once.** It is stored in a field of the future that the chain OWNS —
+   deliberately not left to `promote_cross_state`, which treats a `match` subject as CONSUMED by the
+   match (true of the single dispatch, which matches it once) and would therefore publish nothing,
+   leaving the second test to take from an empty carrier. That was the first failure mode observed:
+   `called Option::unwrap() on a None value`. A scalar subject sits in a plain field and each test
+   reads a copy; anything else rides the `Option` carrier, taken at the top of a test into a local
+   named per-state (so the generic promotion sees a single-block local and leaves it alone) and
+   handed back at the bottom.
+2. **The fall-through arm is only emitted when the arm can fail to match.** An irrefutable pattern
+   whose guard was lifted out always matches, so a synthesized `_ =>` beside it is both dead code and
+   a second wildcard arm — `E0114 duplicate _ arm`, which is what the first build reported.
+3. **`hoist_match_expr` had a matching bail-out** that left a match EXPRESSION with an awaiting guard
+   in place so the old diagnostic could name it. Removed, so the expression form goes through the
+   chain like the statement form.
+
+`capture_arm_bindings` was factored out of `lower_match_sm` and is now shared by both shapes; it
+additionally rewrites the GUARD's reads of a binding to the promoted field when the guard was lifted
+into a state of its own.
+
+**One sub-case is rejected rather than lowered, precisely and with a stated rewrite:** an arm that
+binds an OWNING payload out of the subject. A scalar binding copies and leaves the subject whole; an
+owning one moves it, and the next test would match a hollowed-out value (and the chain would hand a
+moved-from value back to a field the future still drops). The message points at binding inside the
+arm body with a nested `match`, where the subject is no longer re-tested. Negative test
+`E0600_async_guard_moves_owning_payload`. Lowering this properly means testing the pattern WITHOUT
+binding and re-matching in the entry state once the guard passes; it is the one piece of guard
+support not built.
+
+Tests: `tests/tests/lang/async_match_guard.cryo`, 14 cases — guard true/false, a false guard falling
+to a later arm with the SAME pattern, a guard reading its own pattern's binding, two guards, a guard
+plus a suspending body, a guard inside a loop, a plain guard beside an awaiting one, the match
+EXPRESSION form, and the two ORDER properties (the subject is evaluated exactly once; a guard on an
+arm whose pattern did not match never runs).
+
+#### Async TLS — the §5B prerequisite (Jake chose "do TLS first, then delete")
+
+`net::tls` was the reason the blocking socket surface could not be deleted: OpenSSL is handed the
+raw fd through a socket BIO, and the blocking path spins on `WANT_READ`/`WANT_WRITE` because its
+socket blocks and those codes only appear transiently mid-record. Putting the socket in non-blocking
+mode — which async requires — turns them into the normal "transport not ready" answer, and the spin
+becomes a busy-loop that never yields.
+
+`stdlib/net/tls/future.cryo` (new) mirrors the TCP futures exactly:
+
+- `TlsHandshake` (Output `Result<TlsStream, IoError>`) — re-issues `SSL_connect`/`SSL_accept` on
+  every poll, which is precisely what OpenSSL wants after a `WANT_*`. Carries the blocking path's
+  belt-and-suspenders `SSL_get_verify_result` gate.
+- `TlsRead` / `TlsWrite` (Output `TlsIo`) — own the stream AND an `Array<u8>`, handed back through
+  `TlsIo::take_stream()` / `take_buf()`. A read truncates the buffer to what arrived; a write returns
+  it untouched. `SSL_ERROR_ZERO_RETURN` is reported as `Ok(0)` — the TLS equivalent of EOF.
+- `TlsConnector::connect_async` / `TlsAcceptor::accept_async` set the socket non-blocking, mint the
+  `SSL*` with the same SNI + verification wiring as the blocking constructors, and return the
+  handshake future. Everything up to the first `SSL_connect` happens there rather than on first poll,
+  so a setup failure reaches the caller directly instead of being carried inside the future.
+- `TlsStream` gained `ssl_ptr()` and `raw_fd()` so the futures can drive `SSL_*` and register
+  readiness without reaching into its fields.
+
+Two things this had to get right:
+
+1. **The interest to arm is OpenSSL's to choose, not ours.** An `SSL_read` can return `WANT_WRITE`
+   (a renegotiation needs to send) and an `SSL_write` can return `WANT_READ`. `interest_for(code)` is
+   the single place that decides, and each future records the one direction it armed so its `Drop`
+   cancels exactly that half — never the other operation's registration on the same socket.
+2. **OpenSSL requires a `WANT_*` retry to repeat the same call with the SAME arguments.** A future is
+   moved between polls, so this is only sound because the read/write futures OWN their buffer: an
+   array's heap block keeps its address across those moves. The buffer-ownership change was therefore
+   a genuine prerequisite for TLS, not merely a soundness tidy-up.
+
+**Test:** `tests/tests/stdlib/net_tls_async.cryo` — a loopback handshake plus an encrypted echo round
+trip. The blocking TLS test has to spawn a THREAD for the client, because `SSL_connect` would block
+before the server ever reached `SSL_accept`; the async test runs **both sides as tasks on ONE
+`Executor`** with no thread at all. That is the result under test, not an incidental simplification —
+a handshake that failed to interleave would deadlock rather than fail. 8/8 clean runs.
+
+**Still to do for §5B:** nothing has been ported and nothing deleted yet. The blocking surface
+(`TcpStream::connect/read/write`, `TcpListener::bind/accept`, `TlsConnector::connect`,
+`TlsAcceptor::accept`, `TlsStream`'s `Read`/`Write` impls) is all still in place, which is what keeps
+the tree green. The remaining work is the consumer port — `net/http/*`, `net/http2/*`, `net/ws/*`,
+`net/https.cryo`, `net/dns.cryo`, `net/socket/udp.cryo` (~7,400 lines over 19 files) — and it is a
+one-way API break: every `HttpClient::get`-shaped call becomes `async`. `http2/connection.cryo` (855
+lines) is generic over `S: Read + Write` with no concrete socket use, so it needs an async
+`Read`/`Write` equivalent decided before it can move.
+
+#### Also found, not fixed
+
+- **`Executor::block_on` mis-codegens when one program instantiates it at BOTH a unit `Output` and a
+  non-unit one, in that order.** `%calltmp = call void @...` — a void call given a name, which LLVM
+  rejects (`Instruction has a name, but provides a void value!`). Order-dependent: the unit
+  instantiation FIRST fails, i32-first compiles. Minimal repro is an `async fn` returning `void` and
+  one returning `i32`, both driven through `ex.block_on` in one function. Pre-existing; the
+  free-function `future::block_on` is unaffected (its unit case is covered by the suite).
+- **`PendingThenReady` returns `Pending` without waking**, so it cannot be driven by a real
+  `Executor` — only by `future::block_on`, which re-polls immediately. Worth a doc note; it silently
+  turns an Executor-based test into a hang or a "root future did not complete" panic.
+- **`--panic=unwind` does not link on Windows at all**, with or without async (`__cryo_panic`,
+  `__cryo_panic_finish`, `__cryo_personality_v0` undefined). Confirmed against a plain non-async
+  `main`, so it is Track 4 (Win SEH) still being open, not anything from this session.

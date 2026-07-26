@@ -1,0 +1,316 @@
+///! Async TLS: the futures that drive OpenSSL on a NON-BLOCKING socket.
+///!
+///! The blocking path (`TlsConnector::connect`, `TlsStream`'s `Read`/`Write`)
+///! spins on `WANT_READ`/`WANT_WRITE` because its socket blocks and those codes
+///! only appear transiently mid-record. On a non-blocking socket they are the
+///! normal way OpenSSL says "the transport is not ready" — so each one becomes a
+///! reactor registration and a `Pending` instead of a retry, and the task sleeps
+///! until the OS reports readiness.
+///!
+///! Which readiness matters is OpenSSL's to say, not ours: a `SSL_read` can
+///! return `WANT_WRITE` (a renegotiation needs to send) and a `SSL_write` can
+///! return `WANT_READ`. The code names the interest to arm; nothing here assumes
+///! reads wait on readability.
+///!
+///! An operation OWNS everything it works on — the stream, and for a read or a
+///! write the buffer — and hands it back in its output, exactly as the TCP
+///! futures do. For TLS the buffer ownership is not merely tidy: OpenSSL requires
+///! that a call which returned `WANT_*` be retried with the SAME arguments, and a
+///! future is moved between polls. An owned array's heap block keeps its address
+///! across those moves, so the retry passes OpenSSL the pointer it was promised.
+///!
+///! These futures park only where a reactor exists — an `Executor`'s worker
+///! threads. Polling one where there is no current reactor panics rather than
+///! parking a task that could never be woken.
+
+namespace std::net::tls::future;
+
+import core::option;
+import core::result;
+import core::mem;
+import collections::str;
+import collections::string;
+import io::error;
+import ffi::libc;
+import ffi::openssl;
+import net::socket::tcp;
+import net::tls::stream;
+import future::poll;
+import future::waker;
+import future::traits;
+import future::reactor;
+
+/// The current thread's reactor, or a panic explaining that async TLS needs one.
+/// A future that returned `Pending` with nowhere to register its waker would
+/// never be polled again.
+private function require_reactor() -> Reactor* {
+    mut rt: Reactor* = Reactor::current();
+    if (rt == null) {
+        panic("async TLS requires an Executor: no reactor on this thread", FILE, LINE);
+    }
+    return rt;
+}
+
+/// The interest an `SSL_get_error` code asks us to wait on, or 0 if the code is
+/// not a "wait" at all. Kept as one function so no caller has to remember that
+/// a read can want writability.
+private function interest_for(code: i32) -> u32 {
+    if (code == openssl::SSL_ERROR_WANT_READ)  { return INTEREST_READ; }
+    if (code == openssl::SSL_ERROR_WANT_WRITE) { return INTEREST_WRITE; }
+    return 0u32;
+}
+
+/// The outcome of an async TLS read or write: the stream and the buffer handed
+/// back, plus how many bytes moved (or why none did). Both come out through
+/// their `take_*` methods — a `TlsStream` owns its `SSL*` and its socket and
+/// closes both when dropped, so the compiler refuses to let a field be moved out
+/// of the outcome while the outcome itself would still drop it.
+type struct TlsIo {
+    tls:    TlsStream;
+    buf:    Array<u8>;
+    result: Result<u64, IoError>;
+
+    /// Take the stream back. Calling it twice yields a closed placeholder the
+    /// second time — the outcome holds the stream exactly once.
+    take_stream(mut &this) -> TlsStream {
+        mut out: TlsStream = TlsStream::from_parts(null, TcpStream::from_fd(-1));
+        mem::swap<TlsStream>(&out, &this.tls);
+        return out;
+    }
+
+    /// Take the buffer back. After a read it holds exactly the bytes that
+    /// arrived; after a write it is untouched, so a caller with a short write
+    /// still has the bytes it has not sent yet.
+    take_buf(mut &this) -> Array<u8> {
+        mut out: Array<u8> = Array<u8>::new();
+        mem::swap<Array<u8>>(&out, &this.buf);
+        return out;
+    }
+
+    /// How many bytes moved, or why none did.
+    outcome(&this) -> Result<u64, IoError> {
+        return this.result;
+    }
+}
+
+/// Drive a TLS handshake to completion without blocking. `SSL_connect` (client)
+/// or `SSL_accept` (server) is re-issued on every poll — which is exactly what
+/// OpenSSL wants after a `WANT_*` — until it reports success or a real failure.
+///
+/// The socket must already be non-blocking; `TlsConnector::connect_async` and
+/// `TlsAcceptor::accept_async` set that up along with the `SSL*`.
+type struct TlsHandshake {
+    tls:       TlsStream;
+    is_client: boolean;
+    verify:    boolean;   // assert the verified result once the handshake lands
+    rt:        Reactor*;  // set while parked; null once the operation is over
+    armed:     u32;       // the one direction registered with `rt`
+
+    /// Begin a handshake on `tls`, which this future owns until it completes.
+    static start(tls: TlsStream, is_client: boolean, verify: boolean) -> TlsHandshake {
+        return TlsHandshake { tls: tls, is_client: is_client, verify: verify, rt: null, armed: 0u32 };
+    }
+
+    /// Move the stream out, leaving a placeholder that owns nothing, so this
+    /// future's `Drop` does not tear down what it has just handed over.
+    private release(mut &this) -> TlsStream {
+        this.rt = null;
+        mut out: TlsStream = TlsStream::from_parts(null, TcpStream::from_fd(-1));
+        mem::swap<TlsStream>(&out, &this.tls);
+        return out;
+    }
+}
+
+implement trait Future for struct TlsHandshake {
+    type Output = Result<TlsStream, IoError>;
+
+    poll(mut &this, cx: Context*) -> Poll<Result<TlsStream, IoError>> {
+        const fd: i32 = this.tls.raw_fd();
+        openssl::ERR_clear_error();
+        const rc: i32 = if (this.is_client) {
+            openssl::SSL_connect(this.tls.ssl_ptr())
+        } else {
+            openssl::SSL_accept(this.tls.ssl_ptr())
+        };
+        if (rc == 1) {
+            // Belt-and-suspenders verification gate, mirroring the blocking
+            // path: with SSL_VERIFY_PEER + SSL_set1_host a bad chain already
+            // fails the handshake, but asserting the verified result explicitly
+            // keeps a future change from silently handing back an unverified
+            // peer.
+            if (this.verify
+                    && openssl::SSL_get_verify_result(this.tls.ssl_ptr()) != openssl::X509_V_OK) {
+                mut bad: TlsStream = this.release();
+                bad.drop();
+                return Poll::Ready(Result::Err(IoError::new(IoErrorKind::Other, 0)));
+            }
+            return Poll::Ready(Result::Ok(this.release()));
+        }
+        const code: i32 = openssl::SSL_get_error(this.tls.ssl_ptr(), rc);
+        const want: u32 = interest_for(code);
+        if (want != 0u32) {
+            mut rt: Reactor* = require_reactor();
+            this.rt = rt;
+            this.armed = want;
+            rt.register(fd, want, cx.waker());
+            return Poll::Pending;
+        }
+        const err: IoError = stream::ssl_error(code);
+        mut failed: TlsStream = this.release();
+        failed.drop();
+        return Poll::Ready(Result::Err(err));
+    }
+}
+
+/// A handshake abandoned before it completed releases its registration and tears
+/// the connection down: nothing else holds that socket.
+implement trait Drop for struct TlsHandshake {
+    drop(mut &this) -> void {
+        if (this.rt != null) {
+            this.rt.cancel(this.tls.raw_fd(), this.armed);
+            this.rt = null;
+            this.armed = 0u32;
+        }
+        this.tls.drop();
+    }
+}
+
+/// Read decrypted bytes as soon as the connection has some. Completes with the
+/// byte count — 0 means the peer sent `close_notify`, the TLS equivalent of EOF
+/// — or the error that ended it.
+type struct TlsRead {
+    tls:   TlsStream;
+    buf:   Array<u8>;
+    rt:    Reactor*;
+    armed: u32;
+
+    /// Begin a read on `tls`, filling `buf` — both owned by this future until it
+    /// completes.
+    ///
+    /// It reads up to `buf.length()` bytes. An array exposes only `[0, length)`,
+    /// so a buffer from `with_capacity` alone has nothing to read into: size it
+    /// with `resize(n, 0)`.
+    static start(tls: TlsStream, buf: Array<u8>) -> TlsRead {
+        return TlsRead { tls: tls, buf: buf, rt: null, armed: 0u32 };
+    }
+
+    /// `kept` is how much of the buffer holds bytes that actually arrived;
+    /// everything above it is whatever the buffer held beforehand, so it is
+    /// dropped rather than left for the caller to mistake for data.
+    private finish(mut &this, kept: u64, result: Result<u64, IoError>) -> Poll<TlsIo> {
+        this.rt = null;
+        this.buf.truncate(kept);
+        mut s: TlsStream = TlsStream::from_parts(null, TcpStream::from_fd(-1));
+        mem::swap<TlsStream>(&s, &this.tls);
+        mut b: Array<u8> = Array<u8>::new();
+        mem::swap<Array<u8>>(&b, &this.buf);
+        return Poll::Ready(TlsIo { tls: s, buf: b, result: result });
+    }
+}
+
+implement trait Future for struct TlsRead {
+    type Output = TlsIo;
+
+    poll(mut &this, cx: Context*) -> Poll<TlsIo> {
+        const fd: i32 = this.tls.raw_fd();
+        const want_len: u64 = this.buf.length();
+        openssl::ERR_clear_error();
+        const n: i32 = openssl::SSL_read(this.tls.ssl_ptr(), this.buf.as_ptr(),
+                                         clamp_io(want_len));
+        if (n > 0) { return this.finish(n as u64, Result::Ok(n as u64)); }
+        const code: i32 = openssl::SSL_get_error(this.tls.ssl_ptr(), n);
+        if (code == openssl::SSL_ERROR_ZERO_RETURN) {
+            return this.finish(0u64, Result::Ok(0u64));   // clean TLS close -> EOF
+        }
+        const interest: u32 = interest_for(code);
+        if (interest != 0u32) {
+            mut rt: Reactor* = require_reactor();
+            this.rt = rt;
+            this.armed = interest;
+            rt.register(fd, interest, cx.waker());
+            return Poll::Pending;
+        }
+        return this.finish(0u64, Result::Err(stream::ssl_error(code)));
+    }
+}
+
+implement trait Drop for struct TlsRead {
+    drop(mut &this) -> void {
+        if (this.rt != null) {
+            this.rt.cancel(this.tls.raw_fd(), this.armed);
+            this.rt = null;
+            this.armed = 0u32;
+        }
+        this.tls.drop();
+        this.buf.drop();
+    }
+}
+
+/// Write plaintext as soon as the connection has room for the resulting record.
+/// Completes with the number of bytes accepted, which may be fewer than asked
+/// for — a caller with more to send starts another write for the remainder,
+/// which is why the buffer comes back untouched.
+type struct TlsWrite {
+    tls:   TlsStream;
+    buf:   Array<u8>;
+    rt:    Reactor*;
+    armed: u32;
+
+    /// Begin a write of every byte in `buf` on `tls` — both owned by this future
+    /// until it completes.
+    static start(tls: TlsStream, buf: Array<u8>) -> TlsWrite {
+        return TlsWrite { tls: tls, buf: buf, rt: null, armed: 0u32 };
+    }
+
+    private finish(mut &this, result: Result<u64, IoError>) -> Poll<TlsIo> {
+        this.rt = null;
+        mut s: TlsStream = TlsStream::from_parts(null, TcpStream::from_fd(-1));
+        mem::swap<TlsStream>(&s, &this.tls);
+        mut b: Array<u8> = Array<u8>::new();
+        mem::swap<Array<u8>>(&b, &this.buf);
+        return Poll::Ready(TlsIo { tls: s, buf: b, result: result });
+    }
+}
+
+implement trait Future for struct TlsWrite {
+    type Output = TlsIo;
+
+    poll(mut &this, cx: Context*) -> Poll<TlsIo> {
+        const fd: i32 = this.tls.raw_fd();
+        const want_len: u64 = this.buf.length();
+        if (want_len == 0u64) { return this.finish(Result::Ok(0u64)); }
+        openssl::ERR_clear_error();
+        const n: i32 = openssl::SSL_write(this.tls.ssl_ptr(), this.buf.as_ptr(),
+                                          clamp_io(want_len));
+        if (n > 0) { return this.finish(Result::Ok(n as u64)); }
+        const code: i32 = openssl::SSL_get_error(this.tls.ssl_ptr(), n);
+        const interest: u32 = interest_for(code);
+        if (interest != 0u32) {
+            mut rt: Reactor* = require_reactor();
+            this.rt = rt;
+            this.armed = interest;
+            rt.register(fd, interest, cx.waker());
+            return Poll::Pending;
+        }
+        return this.finish(Result::Err(stream::ssl_error(code)));
+    }
+}
+
+implement trait Drop for struct TlsWrite {
+    drop(mut &this) -> void {
+        if (this.rt != null) {
+            this.rt.cancel(this.tls.raw_fd(), this.armed);
+            this.rt = null;
+            this.armed = 0u32;
+        }
+        this.tls.drop();
+        this.buf.drop();
+    }
+}
+
+/// OpenSSL's length argument is a C `int`; cap at `INT_MAX` and let a caller
+/// with more to move start another operation for the remainder.
+private function clamp_io(n: u64) -> i32 {
+    if (n > 2147483647u64) { return 2147483647; }
+    return n as i32;
+}

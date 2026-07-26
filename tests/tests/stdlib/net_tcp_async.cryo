@@ -1,0 +1,206 @@
+///! Async TCP - `TcpConnect` / `TcpAccept` / `TcpRead` / `TcpWrite` over
+///! loopback, driven by a real `Executor` (worker pool + reactor).
+///!
+///! Every test binds an EPHEMERAL port (`:0`) and reads the kernel-assigned port
+///! back via `local_addr()`, so concurrent runs never collide.
+///!
+///! What these cover that a hand-inspection cannot: the read and write futures
+///! OWN their buffer. A future is moved between polls, so a buffer named by a
+///! raw pointer into the caller's frame would be written through a stale
+///! address; handing the array in and getting it back is what removes that
+///! possibility. The round trip proves the transfer works, and the timeout test
+///! proves the cancellation path - a dropped read releases its reactor
+///! registration, closes its socket, and frees its buffer - so a cancelled
+///! operation leaves nothing behind.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::NetTcpAsync;
+
+import std::core::option;
+import std::core::result;
+import std::core::drop;
+import std::collections::str;
+import std::future;
+import std::net::addr::socket_addr;
+import std::net::socket::tcp;
+import std::test::error;
+import std::test::assert;
+import std::time;
+
+// Every failure is a distinct negative number so a red test names its own step
+// instead of just reporting "not 0".
+
+/// Accept one connection, read what arrives, echo it straight back. Yields the
+/// number of bytes echoed.
+async function serve_echo(listener: TcpListener) -> i64 {
+    mut acc: TcpAccepted = await TcpAccept::start(listener);
+    mut lst: TcpListener = acc.take_listener();
+    lst.drop();
+
+    mut stream: TcpStream = TcpStream::from_fd(-1);
+    match (acc.take_result()) {
+        Result::Ok(s)  => { stream = s; }
+        Result::Err(_) => { return -1; }
+    }
+
+    // Sized with `resize`, not `with_capacity`: an array exposes only
+    // `[0, length)`, so a capacity-only buffer has nothing to read into.
+    mut rbuf: Array<u8> = Array<u8>::new();
+    rbuf.resize(64u64, 0u8);
+    mut rio: TcpIo = await TcpRead::start(stream, rbuf);
+    mut s2:  TcpStream  = rio.take_stream();
+    mut got: Array<u8>  = rio.take_buf();
+    match (rio.outcome()) {
+        Result::Ok(_)  => { }
+        Result::Err(_) => { s2.drop(); got.drop(); return -2; }
+    }
+
+    mut wio: TcpIo = await TcpWrite::start(s2, got);
+    mut s3:   TcpStream = wio.take_stream();
+    mut back: Array<u8> = wio.take_buf();
+    back.drop();
+    s3.drop();
+    match (wio.outcome()) {
+        Result::Ok(k)  => { return k as i64; }
+        Result::Err(_) => { return -3; }
+    }
+}
+
+/// Connect, send five bytes, read the echo back, and check both the length and
+/// the content survived the round trip.
+async function echo_client(port: u16) -> i64 {
+    mut stream: TcpStream = TcpStream::from_fd(-1);
+    match (await TcpConnect::start(SocketAddr::localhost_v4(port))) {
+        Result::Ok(s)  => { stream = s; }
+        Result::Err(_) => { return -10; }
+    }
+
+    mut out: Array<u8> = Array<u8>::new();
+    out.push(72u8); out.push(69u8); out.push(76u8); out.push(76u8); out.push(79u8);
+    mut wio: TcpIo = await TcpWrite::start(stream, out);
+    mut s2:   TcpStream = wio.take_stream();
+    mut sent: Array<u8> = wio.take_buf();
+    // A write hands the buffer back untouched, so a short write still has the
+    // bytes it has not sent.
+    const sent_len: u64 = sent.length();
+    sent.drop();
+    if (sent_len != 5u64) { s2.drop(); return -11; }
+    match (wio.outcome()) {
+        Result::Ok(k)  => { if (k != 5u64) { s2.drop(); return -12; } }
+        Result::Err(_) => { s2.drop(); return -13; }
+    }
+
+    mut rbuf: Array<u8> = Array<u8>::new();
+    rbuf.resize(64u64, 0u8);
+    mut rio: TcpIo = await TcpRead::start(s2, rbuf);
+    mut s3: TcpStream = rio.take_stream();
+    s3.drop();
+    // A read hands back a buffer TRUNCATED to what arrived, so its length is the
+    // byte count - a 64-byte buffer that received 5 bytes comes back at 5.
+    mut echoed: Array<u8> = rio.take_buf();
+    const len: u64 = echoed.length();
+    mut first: u8 = 0u8;
+    match (echoed.get(0u64)) {
+        Option::Some(v) => { first = v; }
+        Option::None    => { }
+    }
+    echoed.drop();
+    if (len != 5u64)   { return -14; }
+    if (first != 72u8) { return -15; }
+    return 5;
+}
+
+async function echo_round_trip(port: u16, listener: TcpListener) -> i64 {
+    const pair: (i64, i64) = await Futures::join(serve_echo(listener), echo_client(port));
+    if (pair.0 != 5) { return pair.0; }
+    if (pair.1 != 5) { return pair.1; }
+    return 0;
+}
+
+/// Accept one connection and hold it open, sending nothing, so a peer's read has
+/// genuinely nothing to complete on.
+async function accept_and_hold(listener: TcpListener, hold_ms: u64) -> i64 {
+    mut acc: TcpAccepted = await TcpAccept::start(listener);
+    mut lst: TcpListener = acc.take_listener();
+    lst.drop();
+    mut stream: TcpStream = TcpStream::from_fd(-1);
+    match (acc.take_result()) {
+        Result::Ok(s)  => { stream = s; }
+        Result::Err(_) => { return -20; }
+    }
+    await Sleep::new(Duration::from_millis(hold_ms));
+    stream.drop();
+    return 1;
+}
+
+/// Connect, then read with a deadline the peer will never meet. The timeout
+/// drops the `TcpRead`, which is the whole cancellation path: deregister the
+/// waker, close the socket, free the buffer.
+async function read_until_timeout(port: u16) -> i64 {
+    mut stream: TcpStream = TcpStream::from_fd(-1);
+    match (await TcpConnect::start(SocketAddr::localhost_v4(port))) {
+        Result::Ok(s)  => { stream = s; }
+        Result::Err(_) => { return -30; }
+    }
+    mut rbuf: Array<u8> = Array<u8>::new();
+    rbuf.resize(32u64, 0u8);
+    match (await Futures::timeout(Duration::from_millis(80u64),
+                                  TcpRead::start(stream, rbuf))) {
+        Result::Ok(io)  => {
+            // Bytes arrived from a peer that sends none - or the socket ended.
+            mut done: TcpIo = io;
+            mut s: TcpStream = done.take_stream();
+            mut b: Array<u8> = done.take_buf();
+            s.drop();
+            b.drop();
+            return -31;
+        }
+        Result::Err(_) => { return 1; }
+    }
+}
+
+async function timed_out_read(port: u16, listener: TcpListener) -> i64 {
+    const pair: (i64, i64) = await Futures::join(accept_and_hold(listener, 400u64),
+                                                 read_until_timeout(port));
+    if (pair.0 != 1) { return pair.0; }
+    if (pair.1 != 1) { return pair.1; }
+    return 0;
+}
+
+![test]
+function async_tcp_echo_round_trip() -> Result<(), TestError> {
+    mut listener: TcpListener = match (TcpListener::bind(SocketAddr::localhost_v4(0u16))) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { return bail(Str::new("bind 127.0.0.1:0 failed")); }
+    };
+    // The accept future needs a non-blocking listener; an accepted socket is put
+    // in non-blocking mode by `TcpAccept` itself.
+    listener.set_nonblocking(true);
+    const port: u16 = match (listener.local_addr()) {
+        Result::Ok(a)  => { a.port }
+        Result::Err(_) => { listener.drop(); return bail(Str::new("local_addr failed")); }
+    };
+
+    mut ex: Executor = Executor::new();
+    const r: i64 = ex.block_on(echo_round_trip(port, listener));
+    ex.drop();
+    return expect_eq(r, 0 as i64);
+}
+
+![test]
+function async_tcp_read_timeout_cancels_cleanly() -> Result<(), TestError> {
+    mut listener: TcpListener = match (TcpListener::bind(SocketAddr::localhost_v4(0u16))) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { return bail(Str::new("bind 127.0.0.1:0 failed")); }
+    };
+    listener.set_nonblocking(true);
+    const port: u16 = match (listener.local_addr()) {
+        Result::Ok(a)  => { a.port }
+        Result::Err(_) => { listener.drop(); return bail(Str::new("local_addr failed")); }
+    };
+
+    mut ex: Executor = Executor::new();
+    const r: i64 = ex.block_on(timed_out_read(port, listener));
+    ex.drop();
+    return expect_eq(r, 0 as i64);
+}

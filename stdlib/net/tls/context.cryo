@@ -17,6 +17,7 @@ import ffi::libc;
 import ffi::openssl;
 import net::socket::tcp;
 import net::tls::stream;
+import net::tls::future;
 
 // ALPN wire form for "h2" then "http/1.1": each name is length-prefixed.
 //   0x02 'h' '2'   0x08 'h' 't' 't' 'p' '/' '1' '.' '1'
@@ -104,6 +105,38 @@ type struct TlsConnector {
         return Result::Ok(TlsStream::from_parts(ssl, inner));
     }
 
+    /// The async counterpart of `connect`: set the socket non-blocking, mint the
+    /// `SSL*` with the same SNI and verification wiring, and hand back the future
+    /// that drives the handshake against a reactor instead of spinning on
+    /// `WANT_READ`/`WANT_WRITE`.
+    ///
+    /// Everything up to the first `SSL_connect` happens here rather than on the
+    /// first poll, so a setup failure is reported to the caller directly instead
+    /// of having to be carried inside the future.
+    connect_async(&this, stream: TcpStream, hostname: Str) -> Result<TlsHandshake, IoError> {
+        mut inner: TcpStream = stream;
+        match (inner.set_nonblocking(true)) {
+            Result::Ok(_)  => { }
+            Result::Err(e) => { inner.drop(); return Result::Err(e); }
+        }
+        const ssl: void* = openssl::SSL_new(this.ctx);
+        if (ssl == null) {
+            inner.drop();
+            return Result::Err(IoError::new(IoErrorKind::Other, 0));
+        }
+        openssl::SSL_set_fd(ssl, inner.raw_fd());
+
+        mut host_c: String = String::with_null(hostname);
+        openssl::ssl_set_sni(ssl, host_c.as_ptr());
+        if (this.verify) {
+            openssl::SSL_set1_host(ssl, host_c.as_ptr());
+            openssl::SSL_set_verify(ssl, openssl::SSL_VERIFY_PEER, null);
+        }
+        host_c.drop();
+        return Result::Ok(TlsHandshake::start(TlsStream::from_parts(ssl, inner),
+                                              true, this.verify));
+    }
+
     /// Release the context. Streams already minted keep their own
     /// reference and remain valid.
     drop(mut &this) -> void {
@@ -166,6 +199,25 @@ type struct TlsAcceptor {
             return Result::Err(err);
         }
         return Result::Ok(TlsStream::from_parts(ssl, inner));
+    }
+
+    /// The async counterpart of `accept`. A socket handed over by `TcpAccept` is
+    /// already non-blocking, but one from the blocking `TcpListener::accept` is
+    /// not, so it is set here rather than assumed.
+    accept_async(&this, stream: TcpStream) -> Result<TlsHandshake, IoError> {
+        mut inner: TcpStream = stream;
+        match (inner.set_nonblocking(true)) {
+            Result::Ok(_)  => { }
+            Result::Err(e) => { inner.drop(); return Result::Err(e); }
+        }
+        const ssl: void* = openssl::SSL_new(this.ctx);
+        if (ssl == null) {
+            inner.drop();
+            return Result::Err(IoError::new(IoErrorKind::Other, 0));
+        }
+        openssl::SSL_set_fd(ssl, inner.raw_fd());
+        return Result::Ok(TlsHandshake::start(TlsStream::from_parts(ssl, inner),
+                                              false, false));
     }
 
     drop(mut &this) -> void {

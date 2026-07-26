@@ -1,0 +1,174 @@
+///! Async TLS - `connect_async` / `accept_async` / `TlsRead` / `TlsWrite` over
+///! loopback, driven by a real `Executor`.
+///!
+///! The blocking TLS test has to spawn a THREAD for the client, because a TLS
+///! handshake is bidirectional and `SSL_connect` would block before the server
+///! ever reached `SSL_accept`. That constraint is exactly what the async layer
+///! removes: on non-blocking sockets both sides are futures, each parking on the
+///! readiness OpenSSL asks for, so client and server run as two tasks on ONE
+///! executor and the handshake interleaves itself. No thread here is the result
+///! under test, not an incidental simplification.
+///!
+///! Requires `ssl` + `crypto` in `tests/cryoconfig` link_libs and the fixture
+///! cert/key under `fixtures/tls/` (cwd is the `tests/` project root when
+///! `cryo test` runs).
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::NetTlsAsync;
+
+import std::core::option;
+import std::core::result;
+import std::core::drop;
+import std::collections::str;
+import std::future;
+import std::net::addr::socket_addr;
+import std::net::socket::tcp;
+import std::net::tls::context;
+import std::net::tls::stream;
+import std::net::tls::future;
+import std::test::error;
+import std::test::assert;
+
+// Distinct negative markers so a red test names its own step.
+
+/// Server: accept one connection, complete the TLS handshake, read one record,
+/// echo it back. Yields the number of bytes echoed.
+async function tls_serve_echo(listener: TcpListener, acceptor: TlsAcceptor) -> i64 {
+    mut acc: TcpAccepted = await TcpAccept::start(listener);
+    mut lst: TcpListener = acc.take_listener();
+    lst.drop();
+
+    mut sock: TcpStream = TcpStream::from_fd(-1);
+    match (acc.take_result()) {
+        Result::Ok(s)  => { sock = s; }
+        Result::Err(_) => { return -1; }
+    }
+
+    mut ac: TlsAcceptor = acceptor;
+    mut hs: TlsHandshake = match (ac.accept_async(sock)) {
+        Result::Ok(h)  => { h }
+        Result::Err(_) => { ac.drop(); return -2; }
+    };
+    ac.drop();
+
+    mut tls: TlsStream = match (await hs) {
+        Result::Ok(t)  => { t }
+        Result::Err(_) => { return -3; }
+    };
+
+    mut rbuf: Array<u8> = Array<u8>::new();
+    rbuf.resize(64u64, 0u8);
+    mut rio: TlsIo = await TlsRead::start(tls, rbuf);
+    mut t2:  TlsStream = rio.take_stream();
+    mut got: Array<u8> = rio.take_buf();
+    match (rio.outcome()) {
+        Result::Ok(_)  => { }
+        Result::Err(_) => { t2.drop(); got.drop(); return -4; }
+    }
+
+    mut wio: TlsIo = await TlsWrite::start(t2, got);
+    mut t3:   TlsStream = wio.take_stream();
+    mut back: Array<u8> = wio.take_buf();
+    back.drop();
+    t3.drop();
+    match (wio.outcome()) {
+        Result::Ok(k)  => { return k as i64; }
+        Result::Err(_) => { return -5; }
+    }
+}
+
+/// Client: connect, complete the TLS handshake, send five bytes, read the echo
+/// and check it survived the encrypted round trip.
+async function tls_echo_client(port: u16, connector: TlsConnector) -> i64 {
+    mut sock: TcpStream = TcpStream::from_fd(-1);
+    match (await TcpConnect::start(SocketAddr::localhost_v4(port))) {
+        Result::Ok(s)  => { sock = s; }
+        Result::Err(_) => { return -10; }
+    }
+
+    mut cn: TlsConnector = connector;
+    mut hs: TlsHandshake = match (cn.connect_async(sock, Str::new("localhost"))) {
+        Result::Ok(h)  => { h }
+        Result::Err(_) => { cn.drop(); return -11; }
+    };
+    cn.drop();
+
+    mut tls: TlsStream = match (await hs) {
+        Result::Ok(t)  => { t }
+        Result::Err(_) => { return -12; }
+    };
+
+    mut out: Array<u8> = Array<u8>::new();
+    out.push(72u8); out.push(69u8); out.push(76u8); out.push(76u8); out.push(79u8);
+    mut wio: TlsIo = await TlsWrite::start(tls, out);
+    mut t2:   TlsStream = wio.take_stream();
+    mut sent: Array<u8> = wio.take_buf();
+    sent.drop();
+    match (wio.outcome()) {
+        Result::Ok(k)  => { if (k != 5u64) { t2.drop(); return -13; } }
+        Result::Err(_) => { t2.drop(); return -14; }
+    }
+
+    mut rbuf: Array<u8> = Array<u8>::new();
+    rbuf.resize(64u64, 0u8);
+    mut rio: TlsIo = await TlsRead::start(t2, rbuf);
+    mut t3: TlsStream = rio.take_stream();
+    t3.drop();
+    mut echoed: Array<u8> = rio.take_buf();
+    const len: u64 = echoed.length();
+    mut first: u8 = 0u8;
+    match (echoed.get(0u64)) {
+        Option::Some(v) => { first = v; }
+        Option::None    => { }
+    }
+    echoed.drop();
+    if (len != 5u64)   { return -15; }
+    if (first != 72u8) { return -16; }
+    return 5;
+}
+
+/// Both sides as tasks on ONE executor: the handshake completes only because
+/// each side parks instead of blocking.
+async function tls_round_trip(port: u16, listener: TcpListener,
+                              acceptor: TlsAcceptor, connector: TlsConnector) -> i64 {
+    const pair: (i64, i64) = await Futures::join(tls_serve_echo(listener, acceptor),
+                                                 tls_echo_client(port, connector));
+    if (pair.0 != 5) { return pair.0; }
+    if (pair.1 != 5) { return pair.1; }
+    return 0;
+}
+
+![test]
+function async_tls_loopback_round_trip() -> Result<(), TestError> {
+    mut acceptor: TlsAcceptor = match (TlsAcceptor::new(Str::new("fixtures/tls/cert.pem"),
+                                                        Str::new("fixtures/tls/key.pem"))) {
+        Result::Ok(a)  => { a }
+        Result::Err(_) => { return bail(Str::new("TlsAcceptor::new failed (fixture cert/key)")); }
+    };
+    // The fixture certificate is self-signed, so the client cannot verify it.
+    mut connector: TlsConnector = match (TlsConnector::new()) {
+        Result::Ok(c)  => { c.danger_accept_invalid_certs() }
+        Result::Err(_) => { acceptor.drop(); return bail(Str::new("TlsConnector::new failed")); }
+    };
+
+    mut listener: TcpListener = match (TcpListener::bind(SocketAddr::localhost_v4(0u16))) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => {
+            acceptor.drop(); connector.drop();
+            return bail(Str::new("bind 127.0.0.1:0 failed"));
+        }
+    };
+    listener.set_nonblocking(true);
+    const port: u16 = match (listener.local_addr()) {
+        Result::Ok(a)  => { a.port }
+        Result::Err(_) => {
+            listener.drop(); acceptor.drop(); connector.drop();
+            return bail(Str::new("local_addr failed"));
+        }
+    };
+
+    mut ex: Executor = Executor::new();
+    const r: i64 = ex.block_on(tls_round_trip(port, listener, acceptor, connector));
+    ex.drop();
+    return expect_eq(r, 0 as i64);
+}
