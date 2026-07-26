@@ -225,6 +225,12 @@ type struct TypeResolutionRunner {
             const adecl: AssocTypeDeclNode* = trait_decl.assoc_types[i];
             if (adecl == null) { continue; }
             if (impl_node.lookup_assoc_binding(adecl.name) != null) { continue; }
+            // The implicit `<Method>Fut` of an `async` trait method is bound by
+            // the impl's own `async` method, not written by the user — and that
+            // binding is added by the sema-time lowering, which has not run yet.
+            // Requiring it here would make every async trait impl an error.
+            if (TypeResolutionPasses::impl_binds_assoc_via_async(
+                    impl_node, trait_decl, adecl.name, this.ctx)) { continue; }
             const aname: string = intern.resolve(adecl.name);
             this.ctx.emit_error_at(
                 ErrorCode::E0309_ASSOC_TYPE_NOT_BOUND,
@@ -1764,6 +1770,105 @@ type struct TypeResolutionPasses {
         };
     }
 
+    /// The implicit associated-type name an `async` trait method's future is
+    /// bound to: `read` -> `ReadFut`, `read_exact` -> `ReadExactFut`. Each
+    /// `_`-separated word is capitalised and the separators dropped, so the name
+    /// reads as an ordinary Cryo type and cannot collide with the method name.
+    /// Case-mapped through explicit alphabet tables rather than char arithmetic:
+    /// `CharType` is 4 bytes here while the stdlib treats a char as 1, so
+    /// `c - 32` is not a portable way to upper-case in this codebase.
+    static async_fut_assoc_name(ctx: CompilationContext*, method: SymbolStr) -> SymbolStr {
+        const lower: string = "abcdefghijklmnopqrstuvwxyz";
+        const upper: string = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        const src: string = ctx.get_intern_table().resolve(method);
+        const n: i64 = src.length() as i64;
+        mut out: string = "";
+        mut upper_next: boolean = true;
+        for (mut i: i64 = 0; i < n; i++) {
+            if (src[i] == '_') { upper_next = true; continue; }
+            mut piece: string = src.substring(i, 1);
+            if (upper_next) {
+                for (mut k: i64 = 0; k < 26; k++) {
+                    if (src[i] == lower[k]) { piece = upper.substring(k, 1); break; }
+                }
+            }
+            out = format("%s%s", out, piece);
+            upper_next = false;
+        }
+        return ctx.intern(format("%sFut", out));
+    }
+
+    /// Whether `assoc` is the implicit future type of an `async` trait method
+    /// that `impl_node` supplies — either with its own `async` method, or with a
+    /// default body inherited from the trait.
+    ///
+    /// Such a binding is added by the sema-time async lowering (which mints the
+    /// future struct), long after E0309 runs, so the check has to recognise it
+    /// as satisfied here rather than demanding the user write it.
+    static impl_binds_assoc_via_async(impl_node: ImplBlockNode*, trait_decl: TraitDeclNode*,
+                                      assoc: SymbolStr, ctx: CompilationContext*) -> boolean {
+        if (impl_node == null || trait_decl == null || ctx == null) { return false; }
+        for (mut ti: i64 = 0; ti < trait_decl.methods.length; ti++) {
+            const tfunc: FunctionDeclNode* = trait_decl.methods[ti];
+            if (tfunc == null || !tfunc.is_async) { continue; }
+            if (!TypeResolutionPasses::async_fut_assoc_name(ctx, tfunc.name).equals(assoc)) {
+                continue;
+            }
+            // The impl overrides it with its own `async` method...
+            for (mut mi: i64 = 0; mi < impl_node.methods.length; mi++) {
+                const m: MethodNode* = impl_node.methods[mi];
+                if (m == null || m.func == null) { continue; }
+                if (m.func.name.equals(tfunc.name) && m.func.is_async) { return true; }
+            }
+            // ...or inherits the trait's default body, which
+            // `synthesize_default_trait_methods` clones in as an `async` method.
+            if (tfunc.has_body()) { return true; }
+        }
+        return false;
+    }
+
+    /// Desugar every `async` method on a trait declaration.
+    ///
+    /// `async read(&this, n: i64) -> i64` becomes an implicit `type ReadFut;`
+    /// plus a projection return (`read(&this, n: i64) -> This::ReadFut`), which
+    /// each impl binds to the future its own `async read` lowers to.
+    ///
+    /// Only the RESOLVED return is rewritten — the ANNOTATION deliberately keeps
+    /// the user's `-> i64`. `synthesize_default_trait_methods` clones a
+    /// default-bodied trait method into each impl carrying its annotations, and
+    /// that clone must lower as an ordinary `async` method whose future's Output
+    /// is `i64`. Rewriting the annotation would make the clone return its own
+    /// future type, which is circular.
+    static desugar_async_trait_methods(node: TraitDeclNode*, ctx: CompilationContext*,
+                                       arena: TypeArena*) -> void {
+        if (node == null || ctx == null || arena == null) { return; }
+        const this_ty: TypeRef = arena.create_generic_param(
+            ctx.intern("This"), 0xFFFFFFFF as u64);
+        if (!this_ty.is_valid()) { return; }
+        for (mut i: i64 = 0; i < node.methods.length; i++) {
+            const func: FunctionDeclNode* = node.methods[i];
+            if (func == null || !func.is_async) { continue; }
+            const assoc: SymbolStr =
+                TypeResolutionPasses::async_fut_assoc_name(ctx, func.name);
+            if (!assoc.is_valid()) { continue; }
+            // A trait may legitimately declare the associated type itself; only
+            // synthesize the one that is missing, so an explicit `type ReadFut;`
+            // keeps its declaration-site bounds.
+            if (node.lookup_assoc_type(assoc) == null) {
+                mut adecl: AssocTypeDeclNode* =
+                    malloc(sizeof(AssocTypeDeclNode)) as AssocTypeDeclNode*;
+                *adecl = AssocTypeDeclNode {
+                    name:   assoc,
+                    bounds: [],
+                    span:   func.span,
+                };
+                node.add_assoc_type(adecl);
+            }
+            func.set_resolved_return_type(
+                arena.create_assoc_projection(this_ty, assoc, TypeRef::invalid()));
+        }
+    }
+
     /// The projected member (`Item`) of a projection type-annotation, else empty.
     static projection_member_of(ann: TypeAnnotation*) -> SymbolStr {
         if (ann == null) { return SymbolStr::empty(); }
@@ -2308,6 +2413,13 @@ type struct TypeResolutionPasses {
                     mut trait_ctx: ResolutionContext = runner.make_generic_context(
                         node.generic_params, &runner.res_ctx);
                     runner.resolve_trait_method_signatures(node.methods, &trait_ctx);
+                    // Rewrite each `async` method's resolved return to its
+                    // implicit `This::<Method>Fut` projection AFTER the ordinary
+                    // resolution, so callers see the future type while the
+                    // annotation still spells the Output for impl-side lowering.
+                    // Must precede the `required_methods` population below,
+                    // which snapshots these signatures onto the TraitType.
+                    TypeResolutionPasses::desugar_async_trait_methods(node, ctx, arena);
                     sig_count += node.methods.length;
 
                     // Populate the TraitType's required_methods array so the

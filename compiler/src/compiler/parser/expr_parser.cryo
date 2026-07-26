@@ -2636,6 +2636,46 @@ public:
         return new TypeAnnotation::ImplTrait(imp);
     }
 
+    /// Parse a where-clause bound SUBJECT that is an associated-type projection:
+    /// `This::Item`, `S::ReadFut`, or a chain (`S::ReadFut::Output`).
+    ///
+    /// In subject position a `Base::Member` path is unambiguously a projection -
+    /// a where-bound constrains a type parameter or a projection off one, never a
+    /// module-qualified concrete type - so the disambiguation the general type
+    /// grammar cannot make is available here. `parse_base_type` would flatten an
+    /// identifier base into a qualified `Named` ("S::ReadFut"), a shape that every
+    /// projection consumer (`projection_ann_member`, `projection_member_of`,
+    /// `is_projection_annotation`) silently reads as "not a projection", leaving
+    /// the bound inert. Only `This::Item` survived that, because `This` is a
+    /// keyword and so takes `parse_base_type`'s Projection branch.
+    parse_projection_subject() -> TypeAnnotation* {
+        // `This::Item` already builds a Projection chain.
+        if (this.check(TokenType::KwThisType)) { return this.parse_base_type(); }
+
+        const head_tok: Token = this.consume(TokenType::Identifier, "type parameter");
+        mut base_ann: TypeAnnotation* = new TypeAnnotation::Named(
+            new NamedAnnotation {
+                name:         this.intern_lexeme(head_tok),
+                span:         this.span_from_token(head_tok),
+                pre_resolved: TypeRef::invalid(),
+            }
+        );
+        while (this.check(TokenType::ColonColon)) {
+            this.advance(); // consume '::'
+            const mem_tok: Token = this.consume(TokenType::Identifier,
+                "associated type name after '::'");
+            const pj: ProjectionAnnotation* = new ProjectionAnnotation {
+                base:         base_ann,
+                member:       this.intern_lexeme(mem_tok),
+                owning_trait: SymbolStr::empty(),
+                resolved:     TypeRef::invalid(),
+                span:         this.span_from(head_tok),
+            };
+            base_ann = new TypeAnnotation::Projection(pj);
+        }
+        return base_ann;
+    }
+
     /// Parse a base type (primitive, `This`, or named).
     parse_base_type() -> TypeAnnotation* {
         const tok: Token = this.current();

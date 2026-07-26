@@ -1138,7 +1138,8 @@ type struct CallResolver {
                                ictx: InferCtx*) -> void {
         if (this.ctx.type_resolver == null) { return; }
         this.ctx.type_resolver.project_where_bound_params_into(
-            &tmpl.trait_bounds, &entry.param_names, ictx, this.ctx.source_file);
+            &tmpl.trait_bounds, &entry.param_names, ictx, this.ctx.source_file,
+            this.state.in_symbolic_check);
     }
 
     /// PASS A/B/C argument inference returning the per-param bindings (no
@@ -2458,6 +2459,14 @@ type struct CallResolver {
         }
         if (this.symbolic.symbolic_type_unresolved(obj_type)) {
             this.binding.stash_abstract_receiver_method(obj_type, member, call);
+            // The stash solves the method's own type args but yields no RETURN
+            // type, so every use of the result reads `void`. A bounded-param or
+            // projection receiver is constrained enough to type the call exactly;
+            // this early return sits before both rescues further down (past the
+            // type-symbol lookup), making them unreachable in a symbolic walk.
+            const abs_ret: TypeRef =
+                this.binding.abstract_receiver_method_return(obj_type, member.member);
+            if (abs_ret.is_valid()) { member.set_resolved_type(abs_ret); return abs_ret; }
             return TypeRef::invalid();
         }
         this.binding.stash_method_call_bindings(obj_type, member, call);
@@ -2487,7 +2496,7 @@ type struct CallResolver {
         if (!type_sym.is_valid()) {
             if (base_t != null && base_t.kind == TypeKind::BoundedParam) {
                 const trait_ret: TypeRef = this.binding.lookup_method_through_bounds(
-                    base_t as BoundedParamType*, member.member);
+                    base_t as BoundedParamType*, lookup_ref, member.member);
                 if (trait_ret.is_valid()) { member.set_resolved_type(trait_ret); return trait_ret; }
             }
             // Associated-type-projection receiver (`value: This::Item`) whose
@@ -2496,7 +2505,7 @@ type struct CallResolver {
             // sibling of the BoundedParam rescue directly above.
             if (base_t != null && base_t.kind == TypeKind::AssocProjection) {
                 const proj_ret: TypeRef = this.binding.lookup_method_through_projection_bounds(
-                    base_t as AssocProjectionType*, member.member);
+                    base_t as AssocProjectionType*, lookup_ref, member.member);
                 if (proj_ret.is_valid()) { member.set_resolved_type(proj_ret); return proj_ret; }
             }
             if (base_t != null && base_t.kind == TypeKind::InstantiatedType) {
@@ -2557,7 +2566,7 @@ type struct CallResolver {
 
         if (base_t != null && base_t.kind == TypeKind::BoundedParam) {
             const trait_ret: TypeRef = this.binding.lookup_method_through_bounds(
-                base_t as BoundedParamType*, member.member);
+                base_t as BoundedParamType*, lookup_ref, member.member);
             if (trait_ret.is_valid()) { member.set_resolved_type(trait_ret); return trait_ret; }
         }
 
@@ -3372,7 +3381,8 @@ type struct CallResolver {
         mut method_names_d: SymbolStr[] = [];
         for (mut i: i64 = 0; i < n; i++) { method_names_d.push(func.generic_params[i].name); }
         this.ctx.type_resolver.project_where_bound_params_into(
-            &func.trait_bounds, &method_names_d, &ictx, this.ctx.source_file);
+            &func.trait_bounds, &method_names_d, &ictx, this.ctx.source_file,
+            this.state.in_symbolic_check);
         mut bindings: TypeRef[] = [];
         for (mut i: i64 = 0; i < ictx.bindings.length; i++) { bindings.push(ictx.bindings[i]); }
         for (mut i: i64 = 0; i < bindings.length; i++) {

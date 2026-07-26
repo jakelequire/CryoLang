@@ -1,0 +1,149 @@
+// An `async` method on a TRAIT desugars to an implicit associated type plus a
+// projection return: `async read(&this, n: i64) -> i64` becomes
+// `type ReadFut;` + `read(&this, n: i64) -> This::ReadFut`.  Each impl binds
+// that associated type to the future its own `async read` lowers to, so two
+// implementations return two different concrete future types while the trait
+// still declares one signature.
+//
+// The split that makes this work, and the thing that is easy to get wrong: the
+// desugaring rewrites only the trait method's RESOLVED return.  Its ANNOTATION
+// deliberately keeps the user's `-> i64`, because `synthesize_default_trait_methods`
+// clones a default-bodied trait method into each impl carrying its annotations,
+// and that clone has to lower as an ordinary `async` method whose future's
+// Output is `i64`.  Rewriting the annotation would make the clone return its own
+// future type, which is circular.
+//
+// A generic consumer needs only `where S: AsyncRead`: the future's own bound is
+// implied by the trait rather than respelled at each use site.
+![config(testing)]
+namespace CryoTests::Tests::Lang::AsyncTraitMethod;
+
+import std::test;
+import std::core::result;
+import std::future;
+import std::future::ready;
+
+/// The first failure of two checks, or Ok.
+function atm_both(a: Result<(), TestError>, b: Result<(), TestError>) -> Result<(), TestError> {
+    match (a) {
+        Result::Ok(_)  => {}
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return b;
+}
+
+type trait AtmRead {
+    async read(&this, n: i64) -> i64;
+
+    /// A DEFAULT body, written once over `read` and awaiting through `this`
+    /// twice, so the receiver is live across two suspends.
+    async read_twice(&this, n: i64) -> i64 {
+        const a: i64 = await this.read(n);
+        const b: i64 = await this.read(a);
+        return b;
+    }
+}
+
+type struct AtmTicker {
+    base: i64;
+}
+
+implement trait AtmRead for AtmTicker {
+    async read(&this, n: i64) -> i64 {
+        const bump: i64 = await PendingThenReady<i64>::new(1, this.base);
+        return bump + n;
+    }
+}
+
+type struct AtmDoubler {
+    base: i64;
+}
+
+implement trait AtmRead for AtmDoubler {
+    async read(&this, n: i64) -> i64 {
+        const bump: i64 = await PendingThenReady<i64>::new(1, this.base);
+        return (bump + n) * 2;
+    }
+
+    /// Overrides the default, so this impl's own future must win over the
+    /// clone the trait would otherwise supply.
+    async read_twice(&this, n: i64) -> i64 {
+        const a: i64 = await this.read(n);
+        return a + 1;
+    }
+}
+
+/// A method with no `await` at all still has to lower to a future, since the
+/// trait's return is the projection either way.
+type struct AtmPlain {
+    base: i64;
+}
+
+implement trait AtmRead for AtmPlain {
+    async read(&this, n: i64) -> i64 {
+        return this.base + n;
+    }
+}
+
+/// The generic consumer: only `S: AtmRead`, no projection bound spelled.
+async function atm_pump<S>(s: S) -> i64
+where S: AtmRead {
+    const r: i64 = await s.read(3);
+    return r;
+}
+
+/// Drives the default-bodied method through the same bound.
+async function atm_pump_twice<S>(s: S) -> i64
+where S: AtmRead {
+    const r: i64 = await s.read_twice(3);
+    return r;
+}
+
+![test]
+function async_trait_method_dispatches_to_the_impls_own_future() -> Result<(), TestError> {
+    const t: i64 = future::block_on(atm_pump<AtmTicker>(AtmTicker { base: 4 }));
+    return expect_eq(t, 7 as i64);
+}
+
+// Two implementors must bind DIFFERENT future types; a shared one would make
+// both answers equal.
+![test]
+function async_trait_method_binds_a_distinct_future_per_impl() -> Result<(), TestError> {
+    const t: i64 = future::block_on(atm_pump<AtmTicker>(AtmTicker { base: 4 }));
+    const d: i64 = future::block_on(atm_pump<AtmDoubler>(AtmDoubler { base: 4 }));
+    return atm_both(expect_eq(t, 7 as i64), expect_eq(d, 14 as i64));
+}
+
+// An `async` trait method whose body never awaits still lowers to a future.
+![test]
+function async_trait_method_without_await_still_lowers() -> Result<(), TestError> {
+    const p: i64 = future::block_on(atm_pump<AtmPlain>(AtmPlain { base: 5 }));
+    return expect_eq(p, 8 as i64);
+}
+
+// The default body is cloned into the impl that does not override it, and
+// lowers there like any other `async` method.
+![test]
+function async_trait_default_body_runs_for_the_non_overriding_impl()
+        -> Result<(), TestError> {
+    // read(3) = 4 + 3 = 7 ; read(7) = 4 + 7 = 11
+    const t: i64 = future::block_on(atm_pump_twice<AtmTicker>(AtmTicker { base: 4 }));
+    return expect_eq(t, 11 as i64);
+}
+
+// An impl that DOES override the default must use its own body, not the clone.
+![test]
+function async_trait_default_body_is_overridable() -> Result<(), TestError> {
+    // Doubler::read(3) = (4 + 3) * 2 = 14, then + 1
+    const d: i64 = future::block_on(atm_pump_twice<AtmDoubler>(AtmDoubler { base: 4 }));
+    return expect_eq(d, 15 as i64);
+}
+
+// Calling through the concrete type (no generic parameter in sight) has to reach
+// the same future as the projection-typed generic path.
+![test]
+function async_trait_method_callable_on_a_concrete_receiver() -> Result<(), TestError> {
+    const t: AtmTicker = AtmTicker { base: 2 };
+    const v: i64 = future::block_on(t.read(3));
+    return expect_eq(v, 5 as i64);
+}

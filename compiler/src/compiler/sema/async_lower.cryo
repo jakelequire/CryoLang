@@ -204,11 +204,16 @@ type struct AsyncOwner {
     /// The owner's generic parameters. The future is generic in these as well
     /// as in the method's own, since the body may mention either.
     params:       GenericParamNode*[];
+    /// The enclosing impl block when the owner is one, else null. Carried so an
+    /// `async` method implementing an `async` TRAIT method can bind the trait's
+    /// implicit `<Method>Fut` associated type to the future it lowers to.
+    impl_node:    ImplBlockNode*;
 
     /// The owner of a free function: no method, no receiver, no owner keys.
     static free() -> AsyncOwner {
         return AsyncOwner { method: null, ty: TypeRef::invalid(),
-                            qname: SymbolStr::empty(), alias_qnames: [], params: [] };
+                            qname: SymbolStr::empty(), alias_qnames: [], params: [],
+                            impl_node: null };
     }
 }
 
@@ -505,6 +510,34 @@ type struct AsyncLower {
         return new TypeAnnotation::Generic(gen);
     }
 
+    /// Bind the trait's implicit `<Method>Fut` associated type to the future this
+    /// `async` method just lowered to.
+    ///
+    /// `async read(&this, n) -> i64` on a TRAIT desugars to `type ReadFut;` plus a
+    /// `This::ReadFut` return (`desugar_async_trait_methods`); the impl side closes
+    /// that loop here, so `Ticker::ReadFut` reduces to the synthesized future and a
+    /// generic caller's `await s.read(n)` resolves. An explicit binding already on
+    /// the impl wins — a hand-written `implement trait AsyncRead<MyFut>` stays
+    /// authoritative. No-op unless this method belongs to a trait impl whose trait
+    /// declares that associated type.
+    bind_async_trait_assoc(mut &this, owner: AsyncOwner*, node: FunctionDeclNode*,
+                           fut_ann: TypeAnnotation*) -> void {
+        if (owner == null || node == null || fut_ann == null) { return; }
+        if (owner.impl_node == null || !owner.impl_node.is_trait_impl()) { return; }
+        if (this.ctx.generic_registry == null) { return; }
+        const leaf: SymbolStr =
+            TypeResolutionPasses::extract_trait_leaf(owner.impl_node.trait_annotation);
+        if (!leaf.is_valid()) { return; }
+        const tdecl: TraitDeclNode* = this.ctx.generic_registry.get_trait_decl(leaf);
+        if (tdecl == null) { return; }
+        const assoc: SymbolStr =
+            TypeResolutionPasses::async_fut_assoc_name(this.ctx, node.name);
+        if (!assoc.is_valid()) { return; }
+        if (tdecl.lookup_assoc_type(assoc) == null) { return; }
+        if (owner.impl_node.lookup_assoc_binding(assoc) != null) { return; }
+        owner.impl_node.add_assoc_binding(assoc, fut_ann);
+    }
+
     /// An annotation for the `Future`'s `Output` — the declared return type, or
     /// unit for `-> void`.
     output_type_ann(mut &this, d: AsyncDecl*, span: SourceSpan) -> TypeAnnotation* {
@@ -556,6 +589,24 @@ type struct AsyncLower {
             if (elem == null) { return null; }
             return new TypeAnnotation::Array(new ArrayAnnotation {
                 element: elem, size: a.size, size_expr: null, span: span,
+            });
+        }
+        // An associated-type projection (`S::ReadFut`, or the nested
+        // `(S::ReadFut)::Output` an `await` on one produces) is spelled as a
+        // Projection annotation so the substituter rewrites its BASE when the
+        // enclosing template specializes; mono then reduces the projection.
+        // Without this the frame field for such an `await` cannot be spelled at
+        // all and the whole lowering is refused.
+        if (t.kind == TypeKind::AssocProjection) {
+            const proj: AssocProjectionType* = t as AssocProjectionType*;
+            mut base: TypeAnnotation* = this.type_ann_for(proj.base, span);
+            if (base == null) { return null; }
+            return new TypeAnnotation::Projection(new ProjectionAnnotation {
+                base:         base,
+                member:       proj.member,
+                owning_trait: SymbolStr::empty(),
+                resolved:     TypeRef::invalid(),
+                span:         span,
             });
         }
         if (t.kind == TypeKind::InstantiatedType) {
@@ -5066,6 +5117,7 @@ type struct AsyncLower {
             this.ctx.generic_registry.register_impl_block(q_name, impl_node);
         }
         d.impl_node = impl_node;
+        this.bind_async_trait_assoc(&owner, node, this.future_type_ann(&d, span));
 
         // Register struct + trait impl.
         this.ctx.decl_index.register_type_with_module(q_name, struct_ref, module_sym);
