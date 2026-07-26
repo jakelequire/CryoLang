@@ -131,11 +131,7 @@ type struct PatternEmitter {
         }
 
         // ADT enum: we need a ptr to do struct GEP for tag and payload.
-        // Only alloca when the subject is a raw struct value.  Alloca goes in
-        // the current block (not the entry block) so it stays before the
-        // match's own control flow; `create_entry_alloca` can't be used here
-        // because if visit_match_stmt runs mid-function the entry block already
-        // has a terminator.
+        // Only alloca when the subject is a raw struct value.
         if (is_ptr) {
             info.subject_ptr = subject;
         } else if (subject_addr.is_valid()) {
@@ -148,7 +144,21 @@ type struct PatternEmitter {
             // the drop to free the original's stale pointer (double free).
             info.subject_ptr = subject_addr;
         } else {
-            info.subject_ptr = this.cg.builder.build_alloca(info.enum_llvm, "match.subj");
+            // The scratch copy's slot is hoisted to the entry block, while the
+            // store below stays here, where the subject value is live. A `match`
+            // reached from inside a loop would otherwise allocate a fresh slot on
+            // every iteration and never reclaim it — the stack grows without
+            // bound until it overflows, which is a crash rather than a slowdown.
+            // Reusing one slot across iterations is safe because the store
+            // precedes every read of it within an iteration.
+            if (current_fn.is_valid()) {
+                info.subject_ptr = this.cg.flow.create_entry_alloca(
+                    current_fn, "match.subj", info.enum_llvm);
+            } else {
+                // No enclosing function to hoist into — extremely unusual; a
+                // local alloca still lowers correctly, it just cannot be hoisted.
+                info.subject_ptr = this.cg.builder.build_alloca(info.enum_llvm, "match.subj");
+            }
             if (info.subject_ptr.is_valid()) {
                 this.cg.builder.build_store(subject, info.subject_ptr);
             }

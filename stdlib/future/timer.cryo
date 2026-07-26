@@ -1,0 +1,149 @@
+///! std::future::timer: `Sleep`, the future that completes when a deadline
+///! arrives.
+///!
+///! A `Sleep` is the timer counterpart of an I/O future: instead of asking the
+///! reactor to wake it when a descriptor becomes ready, it asks to be woken at a
+///! point on the monotonic clock. The reactor keeps those deadlines in a sorted
+///! chain and bounds its readiness wait by the earliest one, so a sleeping task
+///! costs no thread and no polling — the wait the reactor was already in simply
+///! ends sooner.
+///!
+///! Deadlines are absolute, not durations: `Sleep::new(dur)` resolves `dur`
+///! against the clock once, when it is constructed. A `Sleep` that is polled
+///! late, or polled many times, therefore still completes at the instant it was
+///! created to complete at, and re-polling never extends it.
+///!
+///! ## Cancellation
+///!
+///! Dropping a `Sleep` disarms its registration. That is what makes it usable as
+///! the losing half of a `select` — the timer that did not win is dropped, and
+///! its waker (which owns a reference to the task) is released immediately
+///! rather than lingering until the deadline passes.
+///!
+///! ## Driving without a reactor
+///!
+///! `Reactor::current()` is null on any thread that is not an executor worker.
+///! Rather than park with nowhere to register — which would hang — a `Sleep`
+///! polled there wakes itself and returns `Pending`, so a spinning driver such as
+///! `future::block_on` still completes it at the right time. That is a busy wait,
+///! and it is the documented contract of that driver ("sufficient for futures
+///! that make progress on every poll"): checking the clock IS progress. Run a
+///! `Sleep` on an `Executor` for it to cost nothing while it waits.
+
+namespace std::future::timer;
+
+import core::drop;
+import future::poll;
+import future::waker;
+import future::traits;
+import future::reactor;
+import time::clock;
+import time::duration;
+
+/// The largest monotonic-nanosecond reading, used as the saturated deadline for
+/// a duration too long to land inside the clock's range.
+const DEADLINE_MAX: i64 = 9223372036854775807;
+
+/// The largest whole-second count whose nanosecond product still fits an `i64`.
+const DEADLINE_MAX_SECS: u64 = 9223372036u64;
+
+/// `now + dur` as a monotonic-nanosecond deadline, saturating at `DEADLINE_MAX`
+/// at every step.
+///
+/// Built from the `(secs, nanos)` pair rather than `Duration::as_nanos`, whose
+/// own `secs * 1e9` product wraps a `u64` past roughly 584 years; a wrapped
+/// deadline would land in the past and fire immediately, which is the opposite
+/// of what an over-long sleep should do.
+private function deadline_after(dur: Duration) -> i64 {
+    const now: i64 = Instant::now().as_nanos();
+    if (dur.secs > DEADLINE_MAX_SECS) { return DEADLINE_MAX; }
+    const secs_ns: i64 = (dur.secs as i64) * 1000000000;
+    const nanos:   i64 = dur.nanos as i64;
+    if (nanos > DEADLINE_MAX - secs_ns) { return DEADLINE_MAX; }
+    const add: i64 = secs_ns + nanos;
+    if (add > DEADLINE_MAX - now) { return DEADLINE_MAX; }
+    return now + add;
+}
+
+/// A future that completes once the monotonic clock reaches its deadline.
+///
+/// `rt` and `id` together name the arming held in the reactor: `id` is 0 and
+/// `rt` null whenever nothing is armed, which is the state a freshly constructed,
+/// a completed, and a never-polled `Sleep` are all in — so dropping any of them
+/// disarms nothing and is free.
+type struct Sleep {
+    deadline: i64;        // monotonic nanoseconds
+    id:       u64;        // reactor timer id; 0 when nothing is armed
+    rt:       Reactor*;   // the reactor holding that arming; null when none
+
+    /// Complete once `dur` has elapsed from now. A zero (or already-elapsed)
+    /// duration completes on the first poll without touching the reactor.
+    static new(dur: Duration) -> Sleep {
+        return Sleep { deadline: deadline_after(dur), id: 0u64, rt: null };
+    }
+
+    /// Complete at `deadline` on the monotonic clock. A deadline already in the
+    /// past completes on the first poll.
+    static until(deadline: Instant) -> Sleep {
+        return Sleep { deadline: deadline.as_nanos(), id: 0u64, rt: null };
+    }
+
+    /// The instant this sleep is due, in the raw monotonic nanoseconds the
+    /// reactor's deadline chain is keyed on.
+    deadline_nanos(&this) -> i64 {
+        return this.deadline;
+    }
+
+    /// True once the deadline has passed, whether or not this future has been
+    /// polled since.
+    is_elapsed(&this) -> boolean {
+        return Instant::now().as_nanos() >= this.deadline;
+    }
+
+    /// Release the arming held in the reactor, if any. Cancelling an id whose
+    /// timer already fired is a no-op in the reactor, so this needs no record of
+    /// whether it did — which is what lets `poll` and `drop` share one path.
+    private disarm(mut &this) -> void {
+        if (this.rt != null) {
+            this.rt.cancel_timer(this.id);
+            this.rt = null;
+        }
+        this.id = 0u64;
+    }
+}
+
+implement trait Future for struct Sleep {
+    type Output = ();
+
+    poll(mut &this, cx: Context*) -> Poll<()> {
+        if (Instant::now().as_nanos() >= this.deadline) {
+            this.disarm();
+            return Poll::Ready(());
+        }
+        mut rt: Reactor* = Reactor::current();
+        if (rt == null) {
+            // Nowhere to park. Self-waking keeps a spinning driver coming back
+            // (see the module doc); returning `Pending` without it would hang.
+            const w: Waker = cx.waker();
+            w.wake();
+            return Poll::Pending;
+        }
+        // Re-arm from scratch rather than keeping an earlier arming. That one may
+        // already have fired — leaving a stale id that cancels nothing — or may
+        // still hold the waker of a poll that a different wake superseded. Either
+        // way the waker that must fire is the one this poll was handed.
+        this.disarm();
+        this.rt = rt;
+        this.id = rt.register_timer(this.deadline, cx.waker());
+        return Poll::Pending;
+    }
+}
+
+/// Dropping a sleep disarms it, releasing the waker the reactor held — and with
+/// it that waker's reference to the task. Without this, a `select` loser would
+/// keep its task alive until its deadline passed.
+implement trait Drop for struct Sleep {
+    drop(mut &this) -> void {
+        this.disarm();
+    }
+}

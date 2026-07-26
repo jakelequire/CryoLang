@@ -66,6 +66,7 @@ import ffi::libc;
 import sys::syscall;
 import core::mem;
 import future::waker;
+import time::clock;
 
 
 /// Interest/readiness bits. One `register` call arms exactly one direction;
@@ -100,6 +101,21 @@ type struct Registration {
     next:          Registration*;
     backend_added: boolean;  // the OS knows this descriptor (epoll set membership)
     os_state:      u8*;      // backend-owned per-registration block; null on Linux
+}
+
+/// One armed timer: fire `waker` once the monotonic clock reaches `deadline`.
+/// Heap-allocated and owned by the reactor for the same reason a `Registration`
+/// is — a future moves, so it holds only the `id`, never a pointer to this block.
+///
+/// The list is kept sorted by deadline. That makes the reactor's next wait bound
+/// `timers.deadline` (O(1)) and expiry a pop from the front, at the cost of an
+/// O(n) walk on insert; the wait bound is recomputed on every loop iteration
+/// while an insert happens once per armed sleep, so the cheap side is the hot one.
+type struct Timer {
+    id:       u64;      // identifies this arming; never 0, never reused
+    deadline: i64;      // monotonic nanoseconds, as `Instant::as_nanos` reports
+    waker:    Waker;
+    next:     Timer*;
 }
 
 /// Move the waker out of `slot`, leaving a no-op behind. The caller owns the
@@ -146,6 +162,8 @@ type struct Reactor {
     aux_h:    i64;                 // unused (Linux) / AFD helper handle (Windows)
     shutdown: Atomic<u8>;          // 1 once teardown has been signaled
     thread:   u64;                 // the reactor thread (0 = not started)
+    timers:   Timer*;              // deadline-sorted chain; head is the earliest
+    timer_seq: u64;                // last id handed out (0 means "nothing armed")
 
     /// Create a reactor, open its OS backend, and start its I/O thread.
     /// Panics if the OS refuses any of the three: an executor without a working
@@ -167,6 +185,8 @@ type struct Reactor {
         rt.aux_h    = -1;
         rt.shutdown = Atomic<u8>::new(0u8);
         rt.thread   = 0;
+        rt.timers    = null;
+        rt.timer_seq = 0u64;
         if (!rt_backend_open(rt)) {
             panic("Reactor::start: I/O readiness backend unavailable", FILE, LINE);
         }
@@ -174,14 +194,19 @@ type struct Reactor {
         return rt;
     }
 
-    /// Stop the reactor and release everything it owns. Signals shutdown, kicks
-    /// the thread out of its wait, joins it, then drops every registration still
-    /// standing — releasing their wakers, which is the last reference to any
-    /// task still parked on I/O, so those tasks are reclaimed rather than leaked.
+    /// Stop the reactor and release everything it owns, leaving the block itself
+    /// allocated. Signals shutdown, kicks the thread out of its wait, joins it,
+    /// then drops every registration and timer still standing — releasing their
+    /// wakers, which is the last reference to any task still parked on I/O or a
+    /// deadline, so those tasks are reclaimed rather than leaked.
     ///
-    /// Must run AFTER the executor's tasks have been dropped: a future's drop
-    /// deregisters, and deregistering a dead reactor would touch freed memory.
-    static destroy(rt: Reactor*) -> void {
+    /// The block and its table lock stay usable on purpose. A task that was woken
+    /// but never driven is dropped later, when the executor drains its queue, and
+    /// that drop runs the future's `Drop` — which still calls `cancel` /
+    /// `cancel_timer` against this reactor. Those find an empty table and do
+    /// nothing, which they could not do safely against freed memory. `free`
+    /// releases the block once that drain is past.
+    static stop(rt: Reactor*) -> void {
         if (rt == null) { return; }
         rt.shutdown.store(1u8, MemoryOrder::Release);
         rt_kick(rt);
@@ -207,7 +232,25 @@ type struct Reactor {
                 ww.drop();
             }
         }
+        // Same shape for the deadline chain: unlink and free each block before
+        // releasing its waker, so a task reclaimed by that release re-enters a
+        // list that no longer names it.
+        loop {
+            const t: Timer* = rt.timers;
+            if (t == null) { break; }
+            rt.timers = t.next;
+            mut tw: Waker = take_waker(&t.waker);
+            mut alloc: GlobalAlloc = GlobalAlloc::new();
+            alloc.deallocate(NonNull::new(t as u8*), Layout::of<Timer>());
+            tw.drop();
+        }
         rt_backend_close(rt);
+    }
+
+    /// Release the reactor block. Must run only after every future that could
+    /// still cancel against this reactor has been dropped — see `stop`.
+    static free(rt: Reactor*) -> void {
+        if (rt == null) { return; }
         rt_mtx_destroy(&rt.mtx[0]);
         mut alloc: GlobalAlloc = GlobalAlloc::new();
         alloc.deallocate(NonNull::new(rt as u8*), Layout::of<Reactor>());
@@ -307,6 +350,129 @@ type struct Reactor {
         }
     }
 
+    /// One iteration of the reactor thread: wait for readiness, but no longer
+    /// than the earliest armed timer allows, dispatch whatever became ready, then
+    /// fire every timer that came due. Keeping the wait bound here leaves
+    /// `poll_once` a pure "wait at most this long" primitive.
+    run_once(mut &this) -> void {
+        this.poll_once(this.next_timeout_ms(Instant::now().as_nanos()));
+        this.fire_expired(Instant::now().as_nanos());
+    }
+
+    /// Arm a one-shot timer firing `w` at `deadline` (monotonic nanoseconds, the
+    /// scale `Instant::as_nanos` reports) and return the id that disarms it.
+    ///
+    /// Ids start at 1 and are never reused, so a stale id — one whose timer has
+    /// already fired — cancels nothing instead of disarming an unrelated timer
+    /// that happened to land in the same slot.
+    ///
+    /// Kicks the reactor when the new timer becomes the earliest: the thread may
+    /// already be waiting on a bound computed from a later deadline, or on no
+    /// bound at all, and nothing else would break that wait in time.
+    register_timer(mut &this, deadline: i64, w: Waker) -> u64 {
+        mut alloc: GlobalAlloc = GlobalAlloc::new();
+        mut t: Timer* = null;
+        match (alloc.allocate(Layout::of<Timer>())) {
+            Result::Ok(raw) => { t = raw.cast<Timer>().as_ptr(); }
+            Result::Err(_)  => { panic("Reactor::register_timer: allocation failed", FILE, LINE); }
+        }
+        t.deadline = deadline;
+        t.waker    = w;
+        t.next     = null;
+        rt_mtx_lock(&this.mtx[0]);
+        this.timer_seq = this.timer_seq + 1u64;
+        t.id = this.timer_seq;
+        const id: u64 = t.id;
+        mut prev: Timer* = null;
+        mut cur:  Timer* = this.timers;
+        while (cur != null && cur.deadline <= deadline) {
+            prev = cur;
+            cur  = cur.next;
+        }
+        t.next = cur;
+        mut is_head: boolean = false;
+        if (prev == null) { this.timers = t; is_head = true; }
+        else              { prev.next   = t; }
+        rt_mtx_unlock(&this.mtx[0]);
+        if (is_head) { rt_kick(&this); }
+        return id;
+    }
+
+    /// Disarm the timer with `id`, releasing the waker it held. A no-op when the
+    /// timer has already fired or was never armed, which is what lets a dropped
+    /// `Sleep` cancel unconditionally without tracking whether it fired.
+    cancel_timer(mut &this, id: u64) -> void {
+        if (id == 0u64) { return; }
+        mut taken: Waker  = Waker::noop();
+        mut found: Timer* = null;
+        rt_mtx_lock(&this.mtx[0]);
+        mut prev: Timer* = null;
+        mut cur:  Timer* = this.timers;
+        while (cur != null) {
+            if (cur.id == id) {
+                if (prev == null) { this.timers = cur.next; }
+                else              { prev.next   = cur.next; }
+                taken = take_waker(&cur.waker);
+                found = cur;
+                break;
+            }
+            prev = cur;
+            cur  = cur.next;
+        }
+        rt_mtx_unlock(&this.mtx[0]);
+        if (found != null) {
+            mut alloc: GlobalAlloc = GlobalAlloc::new();
+            alloc.deallocate(NonNull::new(found as u8*), Layout::of<Timer>());
+        }
+        // `taken` drops here, outside the lock.
+    }
+
+    /// How long the reactor may wait before the earliest timer comes due, in
+    /// milliseconds, or -1 when none is armed (wait indefinitely).
+    ///
+    /// Rounds UP, so the wait never ends before the deadline it was computed
+    /// from; ending early would only cost another loop iteration, but ending
+    /// late is what a caller of `sleep` would actually notice. A deadline
+    /// already past yields 0 — poll what is ready, then fire it.
+    private next_timeout_ms(mut &this, now: i64) -> i32 {
+        rt_mtx_lock(&this.mtx[0]);
+        const head: Timer* = this.timers;
+        const armed: boolean = head != null;
+        mut due: i64 = 0;
+        if (armed) { due = head.deadline; }
+        rt_mtx_unlock(&this.mtx[0]);
+        if (!armed) { return -1; }
+        const delta: i64 = due - now;
+        if (delta <= 0) { return 0; }
+        const ms: i64 = (delta + 999999) / 1000000;
+        if (ms > 2147483647) { return 2147483647; }
+        return ms as i32;
+    }
+
+    /// Fire every timer whose deadline has passed. One timer is unlinked per lock
+    /// acquisition and its waker fired after the unlock, which honors the
+    /// no-waker-under-the-lock rule without having to collect an unbounded number
+    /// of wakers into caller-owned locals the way `dispatch` does for its two.
+    private fire_expired(mut &this, now: i64) -> void {
+        loop {
+            mut w: Waker = Waker::noop();
+            mut expired: Timer* = null;
+            rt_mtx_lock(&this.mtx[0]);
+            const head: Timer* = this.timers;
+            if (head != null && head.deadline <= now) {
+                this.timers = head.next;
+                w = take_waker(&head.waker);
+                expired = head;
+            }
+            rt_mtx_unlock(&this.mtx[0]);
+            if (expired == null) { return; }
+            mut alloc: GlobalAlloc = GlobalAlloc::new();
+            alloc.deallocate(NonNull::new(expired as u8*), Layout::of<Timer>());
+            w.wake();
+            // `w` drops at the end of this iteration, outside the lock.
+        }
+    }
+
     /// Consume one readiness event: take the wakers for the directions that
     /// became ready, re-arm whatever is still parked, and fire them.
     ///
@@ -399,11 +565,12 @@ type struct Reactor {
 }
 
 
-/// The reactor thread: wait for readiness and fire wakers until teardown. A
-/// kick (see `rt_kick`) breaks the wait so shutdown is observed promptly.
+/// The reactor thread: wait for readiness or a deadline and fire wakers until
+/// teardown. A kick (see `rt_kick`) breaks the wait so shutdown — and a newly
+/// armed earliest timer — is observed promptly.
 private function reactor_body(rt: Reactor*) -> void {
     while (rt.shutdown.load(MemoryOrder::Acquire) == 0u8) {
-        rt.poll_once(-1);
+        rt.run_once();
     }
 }
 
