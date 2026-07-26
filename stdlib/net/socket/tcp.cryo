@@ -14,13 +14,17 @@
 ///! non-blocking mode (`set_nonblocking(true)`) before using it this way —
 ///! `TcpConnect` and `TcpAccept` do it for the sockets they produce.
 ///!
-///! An operation takes the handle it works on and hands it back in its output
-///! (`TcpIo`, `TcpAccepted`) rather than borrowing it. Cryo has no lifetimes, so
-///! a borrowing future could not express "the socket outlives this operation",
-///! and holding a reference across a suspend point is forbidden outright.
-///! Passing the handle through also states the discipline: while an operation is
-///! in flight nobody else holds that socket, so two reads cannot interleave on
-///! one connection.
+///! An operation takes everything it works on — the handle, and for a read or a
+///! write the buffer too — and hands it back in its output (`TcpIo`,
+///! `TcpAccepted`) rather than borrowing it. Cryo has no lifetimes, so a
+///! borrowing future could not express "the socket outlives this operation", and
+///! holding a reference across a suspend point is forbidden outright. Owning the
+///! buffer additionally makes the transfer SOUND rather than merely disciplined:
+///! a future is moved between polls, so a buffer named by a raw pointer into the
+///! caller's frame would be written through a stale address, whereas an array's
+///! heap block does not move with it. Passing the handle through also states the
+///! discipline: while an operation is in flight nobody else holds that socket,
+///! so two reads cannot interleave on one connection.
 ///!
 ///! These futures park only where a reactor exists — an `Executor`'s worker
 ///! threads. Polling one where there is no current reactor panics rather than
@@ -291,6 +295,7 @@ type struct TcpListener {
 /// nothing behind to close.
 type struct TcpIo {
     stream: TcpStream;
+    buf:    Array<u8>;
     result: Result<u64, IoError>;
 
     /// Take the socket back. Calling it twice yields a closed stream the second
@@ -298,6 +303,16 @@ type struct TcpIo {
     take_stream(mut &this) -> TcpStream {
         mut out: TcpStream = TcpStream::from_fd(-1);
         mem::swap<TcpStream>(&out, &this.stream);
+        return out;
+    }
+
+    /// Take the buffer back. After a read it holds exactly the bytes that
+    /// arrived; after a write it is untouched, so a caller with a short write
+    /// still has the bytes it has not sent yet. Calling it twice yields an empty
+    /// buffer the second time.
+    take_buf(mut &this) -> Array<u8> {
+        mut out: Array<u8> = Array<u8>::new();
+        mem::swap<Array<u8>>(&out, &this.buf);
         return out;
     }
 
@@ -342,31 +357,50 @@ private function require_reactor() -> Reactor* {
 
 
 
-/// Read into `buf` as soon as the socket has anything to give. Completes with
-/// the byte count — 0 means the peer closed its end — or the error that ended it.
+/// Read as soon as the socket has anything to give. Completes with the byte
+/// count — 0 means the peer closed its end — or the error that ended it.
 ///
-/// The future owns the socket for the whole operation and hands it back in its
-/// `TcpIo`. Dropping the future before it completes therefore closes the
-/// connection: cancelling a read on a socket nobody else holds destroys it.
+/// The future owns the socket AND the buffer for the whole operation and hands
+/// both back in its `TcpIo`. Owning the buffer is what makes the operation sound
+/// rather than merely careful: a future may be moved between polls (and the poll
+/// frame of an `async fn` holding it certainly is), so a buffer identified by a
+/// raw pointer into the caller's frame would be written through an address that
+/// no longer belongs to it. Here the bytes land in the array's own heap block,
+/// which the moves do not disturb.
+///
+/// Dropping the future before it completes closes the connection and releases
+/// the buffer: cancelling a read on a socket nobody else holds destroys it.
 type struct TcpRead {
     stream: TcpStream;
-    buf:    u8*;
-    len:    u64;
+    buf:    Array<u8>;
     rt:     Reactor*;   // set while parked; null once the operation is over
 
-    /// Begin a read on `stream`, which this future owns until it completes.
-    static start(stream: TcpStream, buf: u8*, len: u64) -> TcpRead {
-        return TcpRead { stream: stream, buf: buf, len: len, rt: null };
+    /// Begin a read on `stream`, filling `buf` — both owned by this future until
+    /// it completes.
+    ///
+    /// It reads up to `buf.length()` bytes. An array exposes only `[0, length)`,
+    /// so a buffer from `with_capacity` alone has nothing to read into: size it
+    /// with `resize(n, 0)`.
+    static start(stream: TcpStream, buf: Array<u8>) -> TcpRead {
+        return TcpRead { stream: stream, buf: buf, rt: null };
     }
 
-    /// Move the socket out, leaving a closed placeholder, and pair it with the
-    /// operation's result. Clearing the field is what keeps this future's `Drop`
-    /// from closing a descriptor it has just handed to the caller.
-    private finish(mut &this, result: Result<u64, IoError>) -> Poll<TcpIo> {
+    /// Move the socket and the buffer out, leaving harmless placeholders, and
+    /// pair them with the operation's result. Clearing the fields is what keeps
+    /// this future's `Drop` from closing a descriptor and freeing a block it has
+    /// just handed to the caller.
+    ///
+    /// `kept` is how much of the buffer holds bytes that actually arrived;
+    /// everything above it is whatever the buffer was filled with beforehand, so
+    /// it is dropped rather than left for the caller to mistake for data.
+    private finish(mut &this, kept: u64, result: Result<u64, IoError>) -> Poll<TcpIo> {
         this.rt = null;
+        this.buf.truncate(kept);
         mut out: TcpStream = TcpStream::from_fd(-1);
         mem::swap<TcpStream>(&out, &this.stream);
-        return Poll::Ready(TcpIo { stream: out, result: result });
+        mut b: Array<u8> = Array<u8>::new();
+        mem::swap<Array<u8>>(&b, &this.buf);
+        return Poll::Ready(TcpIo { stream: out, buf: b, result: result });
     }
 }
 
@@ -375,8 +409,8 @@ implement trait Future for struct TcpRead {
 
     poll(mut &this, cx: Context*) -> Poll<TcpIo> {
         const fd: i32 = this.stream.raw_fd();
-        match (sys::sock_read(fd, this.buf, this.len)) {
-            Result::Ok(n)  => { return this.finish(Result::Ok(n)); }
+        match (sys::sock_read(fd, this.buf.as_ptr(), this.buf.length())) {
+            Result::Ok(n)  => { return this.finish(n, Result::Ok(n)); }
             Result::Err(e) => {
                 match (e.kind) {
                     IoErrorKind::WouldBlock => {
@@ -388,7 +422,7 @@ implement trait Future for struct TcpRead {
                         rt.register(fd, INTEREST_READ, cx.waker());
                         return Poll::Pending;
                     }
-                    _ => { return this.finish(Result::Err(e)); }
+                    _ => { return this.finish(0, Result::Err(e)); }
                 }
             }
         }
@@ -397,8 +431,8 @@ implement trait Future for struct TcpRead {
 
 /// Dropping a parked read releases its registration, so a cancelled read leaves
 /// no waker behind for a task that is gone; only the read half is cancelled, so
-/// a write parked on the same socket keeps waiting. The socket itself is closed
-/// unless the operation completed and handed it back.
+/// a write parked on the same socket keeps waiting. The socket is closed and the
+/// buffer freed unless the operation completed and handed them back.
 implement trait Drop for struct TcpRead {
     drop(mut &this) -> void {
         if (this.rt != null) {
@@ -406,30 +440,34 @@ implement trait Drop for struct TcpRead {
             this.rt = null;
         }
         this.stream.drop();
+        this.buf.drop();
     }
 }
 
 
-/// Write from `buf` as soon as the socket has room. Completes with the number of
-/// bytes accepted, which may be fewer than asked for — a caller with more to
-/// send starts another write for the remainder. Owns the socket exactly as
-/// `TcpRead` does.
+/// Write as soon as the socket has room. Completes with the number of bytes
+/// accepted, which may be fewer than asked for — a caller with more to send
+/// starts another write for the remainder, which is why the buffer comes back
+/// untouched. Owns the socket and the buffer exactly as `TcpRead` does, and for
+/// the same reason.
 type struct TcpWrite {
     stream: TcpStream;
-    buf:    u8*;
-    len:    u64;
+    buf:    Array<u8>;
     rt:     Reactor*;
 
-    /// Begin a write on `stream`, which this future owns until it completes.
-    static start(stream: TcpStream, buf: u8*, len: u64) -> TcpWrite {
-        return TcpWrite { stream: stream, buf: buf, len: len, rt: null };
+    /// Begin a write of every byte in `buf` on `stream` — both owned by this
+    /// future until it completes.
+    static start(stream: TcpStream, buf: Array<u8>) -> TcpWrite {
+        return TcpWrite { stream: stream, buf: buf, rt: null };
     }
 
     private finish(mut &this, result: Result<u64, IoError>) -> Poll<TcpIo> {
         this.rt = null;
         mut out: TcpStream = TcpStream::from_fd(-1);
         mem::swap<TcpStream>(&out, &this.stream);
-        return Poll::Ready(TcpIo { stream: out, result: result });
+        mut b: Array<u8> = Array<u8>::new();
+        mem::swap<Array<u8>>(&b, &this.buf);
+        return Poll::Ready(TcpIo { stream: out, buf: b, result: result });
     }
 }
 
@@ -438,7 +476,7 @@ implement trait Future for struct TcpWrite {
 
     poll(mut &this, cx: Context*) -> Poll<TcpIo> {
         const fd: i32 = this.stream.raw_fd();
-        match (sys::sock_write(fd, this.buf, this.len)) {
+        match (sys::sock_write(fd, this.buf.as_ptr(), this.buf.length())) {
             Result::Ok(n)  => { return this.finish(Result::Ok(n)); }
             Result::Err(e) => {
                 match (e.kind) {
@@ -462,6 +500,7 @@ implement trait Drop for struct TcpWrite {
             this.rt = null;
         }
         this.stream.drop();
+        this.buf.drop();
     }
 }
 

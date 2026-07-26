@@ -1,0 +1,45 @@
+/// `async function main` is rewritten into a synchronous entry point that drives
+/// the async one on an `Executor` local to `main`. This project proves the
+/// rewrite end-to-end: the async body really runs, its awaits really suspend and
+/// resume on the executor's worker pool + reactor, the value it returns really
+/// becomes the process exit status, and the entry point still receives the
+/// argc/argv/envp the runtime publishes to `std::env` — which codegen supplies
+/// only to a ZERO-parameter `main`, so it is the synthesized wrapper's own
+/// parameter list that has to stay empty.
+namespace AsyncMain::Main;
+
+import std::core::intrinsics;
+import std::env;
+import std::future;
+import std::time;
+
+async function nap(ms: u64, v: i64) -> i64 {
+    await Sleep::new(Duration::from_millis(ms));
+    return v;
+}
+
+async function main() -> i32 {
+    // Two timers that must overlap: `join` polls both, so the pair completes in
+    // about one nap rather than two.
+    const j: (i64, i64) = await Futures::join(nap(40u64, 3), nap(40u64, 2));
+
+    // A timeout the operation beats, and one it loses to.
+    const won: Result<i64, Elapsed> =
+        await Futures::timeout(Duration::from_millis(2000u64), nap(10u64, 2));
+    const lost: Result<i64, Elapsed> =
+        await Futures::timeout(Duration::from_millis(20u64), nap(4000u64, 99));
+
+    mut acc: i64 = j.0 + j.1;
+    match (won)  { Result::Ok(v)  => { acc = acc + v; } Result::Err(_) => { return 1; } }
+    match (lost) { Result::Ok(_)  => { return 2; }      Result::Err(_) => { } }
+
+    // `env::args()` is empty unless the entry point got the runtime-init
+    // prologue, which is gated on `main` declaring no parameters.
+    mut a: Array<String> = env::args();
+    const argc: u64 = a.length();
+    a.drop();
+    if (argc == 0u64) { return 3; }
+
+    intrinsics::printf("async main ran\n");
+    return acc as i32;   // (3 + 2) + 2 = 7
+}

@@ -431,6 +431,44 @@ type struct Array<T, A = GlobalAlloc> {
         return Result::Ok(());
     }
 
+    /// Set the length to exactly `new_length`, filling any new slots with
+    /// `value`. Shrinking drops the elements above `new_length`, exactly as
+    /// `truncate` does; growing leaves every slot initialized, so the whole
+    /// `[0, new_length)` range is readable afterwards.
+    ///
+    /// This is how a fixed-size read buffer is built: an array only exposes
+    /// `[0, length)`, so `with_capacity` alone yields nothing to read INTO.
+    ///
+    /// Gated on `T: Copy` for the same reason as `append` - each new slot is a
+    /// bitwise copy of `value`, so for an owning `T` every one of them would own
+    /// the same heap buffer and they would all free it.
+    resize(mut &this, new_length: u64, value: T) -> void where T: Copy + Drop {
+        match (this.try_resize(new_length, value)) {
+            Result::Ok(_)  => { return; }
+            Result::Err(_) => {
+                core::panic("Array::resize: allocation failed", FILE, LINE);
+            }
+        }
+    }
+
+    /// Fallible `resize`. Reserves the whole growth up front, so the array is
+    /// either resized or left exactly as it was - never partially grown.
+    try_resize(mut &this, new_length: u64, value: T) -> Result<(), AllocError>
+    where T: Copy + Drop {
+        if (new_length <= this.length) {
+            this.truncate(new_length);
+            return Result::Ok(());
+        }
+        this.reserve_grow(new_length - this.length)?;
+        mut i: u64 = this.length;
+        while (i < new_length) {
+            this.ptr[i] = value;
+            i++;
+        }
+        this.length = new_length;
+        return Result::Ok(());
+    }
+
     reserve(mut &this, additional: u64) -> Result<(), AllocError> {
         return this.reserve_grow(additional);
     }

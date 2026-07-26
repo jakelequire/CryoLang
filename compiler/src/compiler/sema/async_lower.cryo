@@ -1870,7 +1870,19 @@ type struct AsyncLower {
     /// dispatch arm (its bindings stay native). A non-exhaustive match gets a
     /// synthesized `_ => join` so a non-matching subject continues past the
     /// `match` rather than spinning the dispatch loop.
+    ///
+    /// A guard that itself suspends cannot be evaluated inside that dispatch, so
+    /// such a `match` takes the decision-chain form instead
+    /// (`lower_match_chain_sm`). The two produce the same behaviour; the dispatch
+    /// is kept for every other match because it costs one state rather than one
+    /// per arm.
     lower_match_sm(mut &this, sm: PollSm*, m: MatchStmtNode*, cur: i64) -> i64 {
+        for (mut gi: i64 = 0; gi < m.arms.length; gi++) {
+            if (m.arms[gi] != null && this.expr_await_count(m.arms[gi].guard) > 0i64) {
+                return this.lower_match_chain_sm(sm, m, cur);
+            }
+        }
+
         const span: SourceSpan = sm.span;
         // The subject is evaluated once, before any arm, so a suspend in it runs
         // as its own states ahead of the dispatch.
@@ -1885,12 +1897,6 @@ type struct AsyncLower {
         for (mut ai: i64 = 0; ai < m.arms.length; ai++) {
             const arm: MatchArmNode* = m.arms[ai];
             if (arm == null) { continue; }
-            if (this.expr_await_count(arm.guard) > 0i64) {
-                this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
-                    "async: an `await` in a `match`-arm guard is not supported; restructure the guard",
-                    span);
-                sm.ok = false; return cur;
-            }
 
             mut cap: BlockStmtNode* = new BlockStmtNode(span);
             if (!this.stmt_needs_explode(arm.body)) {
@@ -1902,77 +1908,8 @@ type struct AsyncLower {
                 if (!this.stmt_diverges(arm.body)) { this.append_goto(cap, sm, join, span); }
             } else {
                 const entry: i64 = this.sm_alloc(sm);
-                // Promote every scalar binding this arm READS to a field: a
-                // binding is bound in `cur` but its body runs in `entry` (a
-                // different state), so it cannot live on the native stack. The
-                // capture reads the pattern-bound name (valid in the dispatch
-                // arm's scope); the body's reads are rewritten to the field.
-                mut bs: BindingCapture = BindingCapture { names: [], tys: [] };
-                this.collect_arm_bindings(arm, subject_type, &bs);
-                for (mut bi: i64 = 0; bi < bs.names.length; bi++) {
-                    const bname: SymbolStr = bs.names[bi];
-                    if (!this.name_read_in_stmt(arm.body, bname)) { continue; }
-                    const bt: TypeRef = bs.tys[bi];
-                    const bt_t: Type* = this.arena.lookup(bt.id);
-                    const bk: TypeKind = if (bt_t != null) { bt_t.kind } else { TypeKind::Error };
-                    if (!bt.is_valid() || bk == TypeKind::Error) {
-                        this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
-                            "async: could not resolve a `match`-arm binding's type to carry it across an `await`",
-                            span);
-                        sm.ok = false; return cur;
-                    }
-                    if (bk == TypeKind::Reference) {
-                        this.ctx.emit_error_at(ErrorCode::E0455_DANGLING_POINTER,
-                            "async: a `match`-arm binding that is a reference cannot be held live across an `await` (owned values only)",
-                            span);
-                        sm.ok = false; return cur;
-                    }
-                    if (!this.zeroable_kind(bk)) {
-                        // An aggregate cannot be re-read from a field the way a
-                        // scalar can — reading one copies it, and a copy of a
-                        // value that owns a resource frees it twice. It moves
-                        // through an `Option` carrier instead: the dispatch arm
-                        // hands the binding over, and the arm's own state takes
-                        // it back as a local. The body then reads an ordinary
-                        // local, which is what lets the generic cross-state
-                        // promotion carry it further if a later state needs it.
-                        //
-                        // The local is given a NAME OF ITS OWN and the body's
-                        // reads are pointed at it, so the pattern's name occurs
-                        // only in the hand-over. A local sharing the pattern's
-                        // name would make that hand-over look like a read of the
-                        // local from a state before the one declaring it, and
-                        // the promotion would insert a take of a field nothing
-                        // had stored yet.
-                        const afield: SymbolStr = this.intern.intern(
-                            format("__bind_%lld_%s", entry, this.intern.resolve(bname)));
-                        mut bopt_args: TypeRef[] = [bt];
-                        const bopt_ty: TypeRef =
-                            this.ctx.generic_registry.instantiate(sm.opt_base, &bopt_args);
-                        const blocal: SymbolStr = this.mint_temp(
-                            format("%s$bind", this.intern.resolve(bname)));
-                        this.subst_mode = this.subst_to_local();
-                        this.subst_name_stmt(arm.body, bname, blocal, sm.struct_ref, bt, span);
-                        this.subst_mode = this.subst_to_field();
-                        cap.add_statement(this.agg_store_stmt(sm, afield, bopt_ty, bname, bt, span));
-                        this.prepend_agg_take(sm.blocks[entry], blocal, afield, bt, bopt_ty,
-                                              sm.struct_ref, false, span);
-                        sm.prom_field.push(afield);
-                        sm.prom_tys.push(bopt_ty);
-                        sm.prom_opt.push(true);
-                        sm.nprom += 1i64;
-                        continue;
-                    }
-                    const field: SymbolStr = this.intern.intern(
-                        format("__bind_%lld_%s", entry, this.intern.resolve(bname)));
-                    this.subst_name_stmt(arm.body, bname, field, sm.struct_ref, bt, span);
-                    cap.add_statement(this.assign_member_stmt(
-                        sm.struct_ref, field, bt, this.ident(bname, bt, span), span));
-                    sm.prom_field.push(field);
-                    sm.prom_tys.push(bt);
-                    sm.prom_opt.push(false);
-                    sm.nprom += 1i64;
-                }
+                this.capture_arm_bindings(sm, arm, subject_type, entry, cap, false, false);
+                if (!sm.ok) { return cur; }
                 this.append_goto(cap, sm, entry, span);
                 const end: i64 = this.lower_branch_sm(sm, arm.body, entry);
                 if (!sm.ok) { return cur; }
@@ -2000,6 +1937,319 @@ type struct AsyncLower {
         }
 
         sm.blocks[at].add_statement(dispatch as StatementNode*);
+        return join;
+    }
+
+    /// Promote every scalar binding of `arm` that its body — or, when the guard
+    /// runs in a state of its own, its guard — reads into a struct field,
+    /// appending the capture stores to `cap` and repointing those reads at the
+    /// field.
+    ///
+    /// A binding is bound where the pattern matched but read in a DIFFERENT state
+    /// (the arm's body at `entry`, and the guard's own state before it), so it
+    /// cannot live on the native stack. The capture reads the pattern-bound name,
+    /// which is valid in the dispatch arm's scope; every read elsewhere is
+    /// rewritten.
+    ///
+    /// `rewrite_guard` must be set exactly when the guard was lifted out of the
+    /// pattern arm. A guard still ATTACHED to its pattern has the pattern's names
+    /// in scope and would break if they were rewritten to fields the arm has not
+    /// stored yet.
+    capture_arm_bindings(mut &this, sm: PollSm*, arm: MatchArmNode*, subject_type: TypeRef,
+                         entry: i64, cap: BlockStmtNode*, rewrite_guard: boolean,
+                         no_move_out: boolean) -> void {
+        const span: SourceSpan = sm.span;
+        mut bs: BindingCapture = BindingCapture { names: [], tys: [] };
+        this.collect_arm_bindings(arm, subject_type, &bs);
+        for (mut bi: i64 = 0; bi < bs.names.length; bi++) {
+            const bname: SymbolStr = bs.names[bi];
+            const in_guard: boolean = rewrite_guard && this.name_read_in_expr(arm.guard, bname);
+            if (!this.name_read_in_stmt(arm.body, bname) && !in_guard) { continue; }
+            const bt: TypeRef = bs.tys[bi];
+            const bt_t: Type* = this.arena.lookup(bt.id);
+            const bk: TypeKind = if (bt_t != null) { bt_t.kind } else { TypeKind::Error };
+            if (!bt.is_valid() || bk == TypeKind::Error) {
+                this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
+                    "async: could not resolve a `match`-arm binding's type to carry it across an `await`",
+                    span);
+                sm.ok = false; return;
+            }
+            if (bk == TypeKind::Reference) {
+                this.ctx.emit_error_at(ErrorCode::E0455_DANGLING_POINTER,
+                    "async: a `match`-arm binding that is a reference cannot be held live across an `await` (owned values only)",
+                    span);
+                sm.ok = false; return;
+            }
+            if (!this.zeroable_kind(bk)) {
+                // An aggregate cannot be re-read from a field the way a scalar
+                // can — reading one copies it, and a copy of a value that owns a
+                // resource frees it twice. It moves through an `Option` carrier
+                // instead: the dispatch arm hands the binding over, and the arm's
+                // own state takes it back as a local. The body then reads an
+                // ordinary local, which is what lets the generic cross-state
+                // promotion carry it further if a later state needs it.
+                //
+                // The local is given a NAME OF ITS OWN and the body's reads are
+                // pointed at it, so the pattern's name occurs only in the
+                // hand-over. A local sharing the pattern's name would make that
+                // hand-over look like a read of the local from a state before the
+                // one declaring it, and the promotion would insert a take of a
+                // field nothing had stored yet.
+                //
+                // A guard cannot take part in this: the take happens on entry to
+                // ONE state, and the guard's state runs before the body's and may
+                // fall through to the next arm without ever reaching it, which
+                // would leave the carrier empty for an arm that still owns it.
+                if (in_guard) {
+                    this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
+                        "async: a `match`-arm guard that awaits cannot read an aggregate binding of its own pattern; test it in the arm body instead",
+                        span);
+                    sm.ok = false; return;
+                }
+                // Taking an owning payload out of the subject leaves the subject
+                // moved-from, and in a guarded chain the subject is matched again
+                // by every later test. A scalar binding copies and is fine; this
+                // one would hand the next test a hollowed-out value.
+                if (no_move_out) {
+                    this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
+                        "async: a `match` with an awaiting arm guard cannot bind an owning payload out of its subject, because a guard that fails re-matches that subject against the following arms; bind it in a nested `match` inside the arm body instead",
+                        span);
+                    sm.ok = false; return;
+                }
+                const afield: SymbolStr = this.intern.intern(
+                    format("__bind_%lld_%s", entry, this.intern.resolve(bname)));
+                mut bopt_args: TypeRef[] = [bt];
+                const bopt_ty: TypeRef =
+                    this.ctx.generic_registry.instantiate(sm.opt_base, &bopt_args);
+                const blocal: SymbolStr = this.mint_temp(
+                    format("%s$bind", this.intern.resolve(bname)));
+                this.subst_mode = this.subst_to_local();
+                this.subst_name_stmt(arm.body, bname, blocal, sm.struct_ref, bt, span);
+                this.subst_mode = this.subst_to_field();
+                cap.add_statement(this.agg_store_stmt(sm, afield, bopt_ty, bname, bt, span));
+                this.prepend_agg_take(sm.blocks[entry], blocal, afield, bt, bopt_ty,
+                                      sm.struct_ref, false, span);
+                sm.prom_field.push(afield);
+                sm.prom_tys.push(bopt_ty);
+                sm.prom_opt.push(true);
+                sm.nprom += 1i64;
+                continue;
+            }
+            const field: SymbolStr = this.intern.intern(
+                format("__bind_%lld_%s", entry, this.intern.resolve(bname)));
+            this.subst_name_stmt(arm.body, bname, field, sm.struct_ref, bt, span);
+            if (in_guard) {
+                arm.guard = this.subst_name_expr(arm.guard, bname, field,
+                                                 sm.struct_ref, bt, span);
+            }
+            cap.add_statement(this.assign_member_stmt(
+                sm.struct_ref, field, bt, this.ident(bname, bt, span), span));
+            sm.prom_field.push(field);
+            sm.prom_tys.push(bt);
+            sm.prom_opt.push(false);
+            sm.nprom += 1i64;
+        }
+    }
+
+    /// Lower a `match` in which some arm's GUARD suspends.
+    ///
+    /// The ordinary lowering emits ONE dispatch `match` reusing the source
+    /// patterns AND guards. A suspending guard cannot live there: it runs after
+    /// its own pattern matched and before the next arm is tried, so its suspend
+    /// would land in the middle of the dispatch — and a `match` has no way to
+    /// resume into the middle of itself.
+    ///
+    /// The match therefore becomes a DECISION CHAIN, one test state per arm:
+    ///
+    ///     t_k : match (subj) { pat_k => { capture; -> g_k }   _ => { -> t_k+1 } }
+    ///     g_k : <guard, may suspend>;  true -> entry_k,  false -> t_k+1
+    ///     t_n : -> join                                  (nothing matched)
+    ///
+    /// which is precisely what "a false guard tries the next arm" means once the
+    /// guard is no longer something the dispatch can evaluate in one go. An arm
+    /// whose guard does NOT suspend keeps that guard on its pattern, where a
+    /// false guard already falls through to the same `_ => -> t_k+1` — so only
+    /// the arms that need states cost states.
+    ///
+    /// The subject is evaluated ONCE — re-evaluating it per arm would run its
+    /// side effects once per arm tried — and stored in a field of the future,
+    /// which every test reads. The chain owns that field rather than leaving it
+    /// to the cross-state promotion: the promotion treats a `match` subject as
+    /// CONSUMED by the match (true of the single dispatch, which matches it
+    /// once), so it would publish nothing and the second test would take from an
+    /// empty carrier. Here the subject is deliberately still live after a test
+    /// that did not match, so it is handed back after every one.
+    ///
+    /// That hand-back is only sound while no test moves out of the subject, which
+    /// is why an arm binding an aggregate payload is rejected below: a scalar
+    /// binding copies out and leaves the subject whole, an owning one does not,
+    /// and a later test would then match a moved-from value.
+    lower_match_chain_sm(mut &this, sm: PollSm*, m: MatchStmtNode*, cur: i64) -> i64 {
+        const span: SourceSpan = sm.span;
+        const hs: HoistedExpr = this.lower_hoisted(sm, m.subject, cur);
+        if (!sm.ok) { return cur; }
+        const at: i64 = hs.end;
+        const subject_type: TypeRef = hs.expr.resolved_type;
+        if (!subject_type.is_valid()) {
+            this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
+                "async: could not resolve the type of a `match` subject whose arm guard awaits",
+                span);
+            sm.ok = false; return cur;
+        }
+        const join: i64 = this.sm_alloc(sm);
+
+        // The subject's home for the length of the chain. A scalar sits in a
+        // plain field and every test reads a copy; anything else has no zero
+        // value the constructor could give the field, so it rides in the same
+        // `Option` carrier an aggregate local uses — taken at the top of a test
+        // and handed back at the bottom.
+        const subj_t: Type* = this.arena.lookup(subject_type.id);
+        const subj_kind: TypeKind = if (subj_t != null) { subj_t.kind } else { TypeKind::Error };
+        const subj_scalar: boolean = this.zeroable_kind(subj_kind);
+        // Minted rather than derived from the state index: two chains that begin
+        // in the same state would otherwise share a field and overwrite each
+        // other's subject.
+        const subj_field: SymbolStr = this.mint_temp("__msubj");
+        mut subj_opt_ty: TypeRef = TypeRef::invalid();
+        if (subj_scalar) {
+            sm.blocks[at].add_statement(this.assign_member_stmt(
+                sm.struct_ref, subj_field, subject_type, hs.expr, span));
+            sm.prom_field.push(subj_field);
+            sm.prom_tys.push(subject_type);
+            sm.prom_opt.push(false);
+        } else {
+            mut subj_args: TypeRef[] = [subject_type];
+            subj_opt_ty = this.ctx.generic_registry.instantiate(sm.opt_base, &subj_args);
+            if (!subj_opt_ty.is_valid()) {
+                this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
+                    "async: could not build the carrier for a `match` subject whose arm guard awaits",
+                    span);
+                sm.ok = false; return cur;
+            }
+            const seed: SymbolStr = this.mint_temp("match$subj");
+            sm.blocks[at].add_statement(
+                this.var_decl_stmt(seed, false, subject_type, hs.expr, span));
+            sm.blocks[at].add_statement(
+                this.agg_store_stmt(sm, subj_field, subj_opt_ty, seed, subject_type, span));
+            sm.prom_field.push(subj_field);
+            sm.prom_tys.push(subj_opt_ty);
+            sm.prom_opt.push(true);
+        }
+        sm.nprom += 1i64;
+
+        // One test state per arm, all allocated up front: a failed test or a
+        // false guard jumps to the NEXT arm's test, so every target has to exist
+        // before any arm is emitted. The subject's state only publishes and then
+        // enters the chain, which keeps every test block the same shape.
+        mut tests: i64[] = [];
+        for (mut ai: i64 = 0; ai < m.arms.length; ai++) { tests.push(this.sm_alloc(sm)); }
+
+        // Where each arm goes when it does not match: the next arm that HAS a
+        // test, or the join. A null arm is emitted by nothing, so its state stays
+        // empty — and an empty state does not fall through, it re-dispatches
+        // itself forever. Resolved back-to-front so a run of them is skipped.
+        mut nexts: i64[] = [];
+        for (mut ai: i64 = 0; ai < m.arms.length; ai++) { nexts.push(join); }
+        mut after: i64 = join;
+        for (mut ai: i64 = m.arms.length - 1i64; ai >= 0i64; ai--) {
+            nexts[ai] = after;
+            if (m.arms[ai] != null) { after = tests[ai]; }
+        }
+        this.sm_goto(sm, at, after);
+
+        for (mut ai: i64 = 0; ai < m.arms.length; ai++) {
+            const arm: MatchArmNode* = m.arms[ai];
+            if (arm == null) { continue; }
+            const next: i64 = nexts[ai];
+            const guard_suspends: boolean = this.expr_await_count(arm.guard) > 0i64;
+
+            mut cap: BlockStmtNode* = new BlockStmtNode(span);
+            if (!guard_suspends && !this.stmt_needs_explode(arm.body)) {
+                // Neither the guard nor the body needs a state: the arm runs
+                // whole inside its own test, exactly as in the dispatch form.
+                this.rewrite_returns(arm.body, sm.poll_out, span);
+                cap.add_statement(arm.body);
+                if (!this.stmt_diverges(arm.body)) { this.append_goto(cap, sm, join, span); }
+            } else {
+                const entry: i64 = this.sm_alloc(sm);
+                this.capture_arm_bindings(sm, arm, subject_type, entry, cap,
+                                          guard_suspends, !subj_scalar);
+                if (!sm.ok) { return cur; }
+                if (guard_suspends) {
+                    // The pattern matched, so the guard decides; it gets the
+                    // state the dispatch could not give it.
+                    const gstate: i64 = this.sm_alloc(sm);
+                    this.append_goto(cap, sm, gstate, span);
+                    const ghs: HoistedExpr = this.lower_hoisted(sm, arm.guard, gstate);
+                    if (!sm.ok) { return cur; }
+                    this.emit_cond_dispatch(sm, ghs.end, ghs.expr, entry, next, span);
+                } else {
+                    this.append_goto(cap, sm, entry, span);
+                }
+                const end: i64 = this.lower_branch_sm(sm, arm.body, entry);
+                if (!sm.ok) { return cur; }
+                if (!this.stmt_diverges(arm.body)) { this.sm_goto(sm, end, join); }
+            }
+
+            // The subject this test matches. The scalar form reads the field
+            // directly (a copy, so nothing has to be given back); the carrier
+            // form takes it into a local of THIS state — a fresh name per test,
+            // so the cross-state promotion sees a local declared and used in one
+            // block and leaves it alone — and hands it back below.
+            mut subj_local: SymbolStr = SymbolStr::empty();
+            mut subj_read: ExpressionNode* = null;
+            if (subj_scalar) {
+                subj_read = this.member(this.this_ident(sm.struct_ref, span),
+                                        subj_field, subject_type, span);
+            } else {
+                subj_local = this.mint_temp("match$subj");
+                this.prepend_agg_take(sm.blocks[tests[ai]], subj_local, subj_field,
+                                      subject_type, subj_opt_ty, sm.struct_ref, false, span);
+                subj_read = this.ident(subj_local, subject_type, span);
+            }
+            mut test: MatchStmtNode* = new MatchStmtNode(subj_read, span);
+            mut darm: MatchArmNode* = new MatchArmNode(span);
+            for (mut pi: i64 = 0; pi < arm.patterns.length; pi++) {
+                darm.add_pattern(arm.patterns[pi]);
+            }
+            // A guard that stayed on its pattern still decides the arm: when it
+            // is false the arm does not match and the wildcard below carries the
+            // subject to the next test, which is the same fall-through the source
+            // `match` would have done.
+            if (!guard_suspends && arm.guard != null) { darm.set_guard(arm.guard); }
+            darm.set_body(cap as StatementNode*);
+            test.add_arm(darm);
+
+            // The fall-through to the next test, but ONLY when this arm can fail
+            // to match. An irrefutable pattern whose guard was lifted out always
+            // matches, so a `_` here would be a second wildcard arm next to the
+            // first (E0114) as well as dead code — the guard's own state is what
+            // reaches `next` in that shape.
+            mut one: MatchArmNode*[] = [darm];
+            if (!this.patterns.match_is_exhaustive(subj_read, one)) {
+                mut miss: BlockStmtNode* = new BlockStmtNode(span);
+                this.append_goto(miss, sm, next, span);
+                test.add_arm(this.match_arm_wild(miss, span));
+            }
+
+            sm.blocks[tests[ai]].add_statement(test as StatementNode*);
+            // Hand the subject back for the next test. No test moves out of it
+            // (an aggregate binding is rejected in chain mode), so the value put
+            // back is the whole one that was taken. On a path that left the
+            // future entirely — an inline arm body that returns — this never
+            // runs, which is correct: nothing will look for it again.
+            if (!subj_scalar) {
+                sm.blocks[tests[ai]].add_statement(
+                    this.agg_store_stmt(sm, subj_field, subj_opt_ty, subj_local,
+                                        subject_type, span));
+            }
+        }
+
+        // Exhaustiveness needs no separate handling here, unlike the dispatch
+        // form: every test already carries its own `_ =>` fall-through, and the
+        // last one targets the join. A subject that matches nothing walks the
+        // chain and lands there, which is the fall-through a non-exhaustive
+        // `match` means.
         return join;
     }
 
@@ -3768,14 +4018,10 @@ type struct AsyncLower {
         const span: SourceSpan = (me as ASTNode*).span;
         const vty: TypeRef = (me as ExpressionNode*).resolved_type;
         if (!vty.is_valid()) { return me as ExpressionNode*; }
-        // A guard runs per arm, after that arm's pattern matched, so its `await`
-        // cannot be lifted above the `match`. Left in place so the diagnostic
-        // names the shape the user wrote.
-        for (mut gi: i64 = 0; gi < me.arms.length; gi++) {
-            if (me.arms[gi] != null && this.expr_await_count(me.arms[gi].guard) > 0i64) {
-                return me as ExpressionNode*;
-            }
-        }
+        // A guard is left ON its arm rather than lifted: it runs per arm, after
+        // that arm's pattern matched, so it cannot be evaluated above the
+        // `match`. One that suspends is why the statement this becomes may lower
+        // to a decision chain instead of a dispatch (`lower_match_chain_sm`).
         mut subject: ExpressionNode* = this.hoist_expr(me.subject, pre);
         const tv: SymbolStr = this.mint_temp("__mv");
         pre.push(this.var_decl_stmt(tv, true, vty, null, span));
@@ -4388,6 +4634,164 @@ type struct AsyncLower {
         loop_body.add_statement(dispatch as StatementNode*);
         body.add_statement(new LoopStmtNode(loop_body as StatementNode*, span) as StatementNode*);
         return body;
+    }
+
+    /// Rewrite `async function main` into a synchronous entry point that drives
+    /// the async one to completion on an `Executor` scoped to `main`.
+    ///
+    /// An `async function` lowers to a constructor returning its future, which
+    /// for `main` would leave the program's entry point returning a struct. The
+    /// async `main` is therefore renamed out of the entry-point slot and a
+    /// synchronous `main` is synthesized in its place:
+    ///
+    ///     function main() -> i32 {
+    ///         mut ex: Executor = Executor::new();
+    ///         const main$out: i32 = ex.block_on(main$async());
+    ///         return main$out;
+    ///     }
+    ///
+    /// A `-> void` async `main` drops the binding and returns `0`, so the
+    /// synthesized entry point returns `i32` either way.
+    ///
+    /// An `Executor` rather than `future::block_on`, because the current-reactor
+    /// handle is published by a worker thread as it comes up: under
+    /// `future::block_on` there is none, and every I/O or timer future would park
+    /// with nowhere to register. The executor is a LOCAL of `main`, so its `Drop`
+    /// tears the runtime down at exit — a runtime scoped to the entry point
+    /// rather than an ambient global one — and it drops only after the root's
+    /// value has been bound, which is what keeps that value readable.
+    ///
+    /// Parameters are forwarded rather than rejected: codegen widens a
+    /// ZERO-parameter `main` to `(argc, argv, envp)` and publishes them to
+    /// `std::env`, and a `main` that declares parameters opts out of that. Both
+    /// behaviours are keyed off the synthesized entry point's own parameter list,
+    /// so an `async main` behaves exactly as the synchronous one it replaces.
+    ///
+    /// MUST run before `declare`, which registers the future under whatever name
+    /// the node carries; renaming afterwards would leave that registration keyed
+    /// to `main`. False (nothing rewritten) when `node` is not an `async main`.
+    desugar_async_main(mut &this, node: FunctionDeclNode*) -> boolean {
+        if (node == null || node.body == null || !node.is_async) { return false; }
+        const main_sym: SymbolStr = this.intern.intern("main");
+        if (!node.name.equals(main_sym)) { return false; }
+
+        // Without `std::future` the module has no future types at all, and
+        // `declare` reports that with the message naming the missing import; bow
+        // out silently rather than reporting one cause twice.
+        if (!this.lookup_future_type("Poll").is_valid()) { return false; }
+        const exec_ty: TypeRef = this.lookup_future_type("Executor");
+        if (!exec_ty.is_valid()) {
+            this.ctx.emit_error_at(ErrorCode::E0233_UNDEFINED_SYMBOL,
+                "`async function main` is driven by an `Executor`; add `import std::future;`",
+                node.span);
+            return false;
+        }
+
+        if (node.generic_params.length > 0i64) {
+            this.ctx.emit_error_at(ErrorCode::E0365_INVALID_ASYNC_MAIN,
+                "`async function main` cannot be generic: the entry point is called with no type arguments",
+                node.span);
+            return false;
+        }
+
+        // The entry point hands its value to the process exit status, so the
+        // async root has to produce one that fits: an `i32`, or nothing at all.
+        const declared: TypeRef = node.resolved_return_type;
+        const i32_ty: TypeRef = this.arena.get_i32();
+        const returns_void: boolean = this.is_void_type(declared);
+        if (!returns_void && !declared.equals(i32_ty)) {
+            this.ctx.emit_error_at(ErrorCode::E0365_INVALID_ASYNC_MAIN,
+                format("`async function main` must return `i32` or `void`; found `%s`",
+                       this.arena.resolve_display_name(declared.id)),
+                node.span);
+            return false;
+        }
+
+        const span: SourceSpan = node.span;
+        const inner_sym: SymbolStr = this.intern.intern("main$async");
+        const ex_sym: SymbolStr = this.intern.intern("ex");
+        node.set_name(inner_sym);
+
+        mut wrapper: FunctionDeclNode* = new FunctionDeclNode(main_sym, span);
+        wrapper.set_resolved_return_type(i32_ty);
+        wrapper.set_return_type_annotation(this.make_type_ann(i32_ty, span));
+
+        // The forwarded arguments are read off the WRAPPER's own parameters, so
+        // each is an ordinary identifier the synthesized body binds.
+        mut cloner: ASTCloner = ASTCloner();
+        mut fwd: ExpressionNode*[] = [];
+        for (mut i: i64 = 0; i < node.parameters.length; i++) {
+            const p: VarDeclNode* = node.parameters[i];
+            if (p == null) { continue; }
+            const cloned: ASTNode* = cloner.clone_node(p as ASTNode*);
+            if (cloned == null || cloned.kind != NodeKind::VariableDeclaration) { continue; }
+            mut cp: VarDeclNode* = cloned as VarDeclNode*;
+            // A clone keeps the annotation but drops the resolved type, and type
+            // resolution has already run — codegen would meet a parameter it
+            // cannot lower and skip the entry point's body entirely.
+            cp.set_resolved_type(p.resolved_type);
+            wrapper.add_parameter(cp);
+            fwd.push(new IdentifierNode(p.name, span) as ExpressionNode*);
+        }
+
+        mut body: BlockStmtNode* = new BlockStmtNode(span);
+
+        // `mut ex: Executor = Executor::new();`
+        mut ex_new: CallExprNode* = new CallExprNode(
+            new ScopeResolutionNode(this.intern.intern("Executor"),
+                                    this.intern.intern("new"), span) as ExpressionNode*, span);
+        mut ex_decl: VarDeclNode* = new VarDeclNode(ex_sym, span);
+        ex_decl.set_mutable(true);
+        ex_decl.set_type_annotation(this.make_type_ann(exec_ty, span));
+        ex_decl.set_initializer(ex_new as ExpressionNode*);
+        body.add_statement(new DeclStmtNode(ex_decl as DeclarationNode*, span) as StatementNode*);
+
+        // `ex.block_on(main$async(<forwarded>))`
+        mut root: CallExprNode* = new CallExprNode(
+            new IdentifierNode(inner_sym, span) as ExpressionNode*, span);
+        for (mut i: i64 = 0; i < fwd.length; i++) { root.add_argument(fwd[i]); }
+        mut drive: CallExprNode* = new CallExprNode(
+            new MemberAccessNode(new IdentifierNode(ex_sym, span) as ExpressionNode*,
+                                 this.intern.intern("block_on"), span, span) as ExpressionNode*, span);
+        drive.add_argument(root as ExpressionNode*);
+
+        if (returns_void) {
+            body.add_statement(new ExprStmtNode(drive as ExpressionNode*, span) as StatementNode*);
+            body.add_statement(new ReturnStmtNode(
+                new LiteralNode("0", LiteralKind::Integer, span) as ExpressionNode*,
+                span) as StatementNode*);
+        } else {
+            // Bound to a local rather than returned directly: the binding's
+            // annotation is the expected type that fixes `block_on`'s `O`, which
+            // is otherwise reachable only through its where-bound.
+            const out_sym: SymbolStr = this.intern.intern("main$out");
+            mut out_decl: VarDeclNode* = new VarDeclNode(out_sym, span);
+            out_decl.set_mutable(false);
+            out_decl.set_type_annotation(this.make_type_ann(i32_ty, span));
+            out_decl.set_initializer(drive as ExpressionNode*);
+            body.add_statement(new DeclStmtNode(out_decl as DeclarationNode*, span) as StatementNode*);
+            body.add_statement(new ReturnStmtNode(
+                new IdentifierNode(out_sym, span) as ExpressionNode*, span) as StatementNode*);
+        }
+        wrapper.set_body(body);
+        // Name resolution has already run, so the resolution map holds no entry
+        // for the locals this body declares and the unused-local lint has no
+        // evidence to judge them by — it would report the executor and the
+        // root's value as unused even though both are read here.
+        wrapper.set_synthesized_body(true);
+
+        if (this.ctx.artifacts.ast.root != null) {
+            this.ctx.artifacts.ast.root.add_statement(wrapper as ASTNode*);
+        }
+        // The index still holds the pre-rewrite `main` — the async function's
+        // DECLARED signature, which no definition answers to any more. Dropping
+        // it leaves the synthesized entry point the only `main` a caller or
+        // codegen can resolve.
+        this.ctx.decl_index.reset_function_overloads(main_sym);
+        this.ctx.decl_index.reset_function_overloads(this.ctx.qualify_symbol_sym(main_sym));
+        TypeResolutionPasses::register_decl_in_index(wrapper as ASTNode*, this.ctx, false,
+                                                     this.intern.intern(this.ctx.source_file));
+        return true;
     }
 
     /// Give an `async function` its future type, ahead of any body being typed.
