@@ -108,6 +108,69 @@ async function gf_branchy<T>(v: T, flag: boolean) -> i64 {
     return acc;
 }
 
+// Awaits a future built by a struct LITERAL rather than by a static call.  The
+// literal is its own resolution path: it is typed from its own generic
+// arguments, and those name the enclosing function's parameter.  Typing it as
+// the bare base instead erases them, and the lowering reads the awaited
+// operand's type DIRECTLY - so the sub-future field would become
+// `Option<GfBox>`, which mentions no parameter for specialization to rewrite,
+// while the body still mints `GfBox<i64>` that nothing then monomorphizes.
+type struct GfBox<T> {
+    v:     T;
+    fired: boolean;
+}
+
+implement<T> trait Future<i64> for struct GfBox<T> {
+    poll(mut &this, cx: Context*) -> Poll<i64> {
+        if (!this.fired) {
+            this.fired = true;
+            return Poll::Pending;
+        }
+        return Poll::Ready(7);
+    }
+}
+
+async function gf_literal<T>(v: T) -> i64 {
+    const x: i64 = await GfBox<T> { v: v, fired: false };
+    return x;
+}
+
+type trait GfTick {
+    tick(mut &this) -> i64;
+}
+
+type struct GfCounter {
+    n: i64;
+}
+
+implement trait GfTick for struct GfCounter {
+    tick(mut &this) -> i64 {
+        this.n = this.n + 1;
+        return this.n;
+    }
+}
+
+// The same literal, awaited through a future whose `poll` dispatches on a trait
+// BOUND over the parameter: the specialization has to carry the bound with it.
+type struct GfBoundedBox<T> {
+    v: T;
+}
+
+implement<T> trait Future<i64> for struct GfBoundedBox<T>
+where T: GfTick {
+    poll(mut &this, cx: Context*) -> Poll<i64> {
+        const n: i64 = this.v.tick();
+        if (n < 3) { return Poll::Pending; }
+        return Poll::Ready(n);
+    }
+}
+
+async function gf_literal_bounded<T>(v: T) -> i64
+where T: GfTick {
+    const x: i64 = await GfBoundedBox<T> { v: v };
+    return x;
+}
+
 ![test]
 function generic_async_no_await_returns_its_argument() -> Result<(), TestError> {
     const a: i64 = future::block_on(gf_identity<i64>(7));
@@ -200,4 +263,20 @@ function generic_async_lowers_branches_and_loops() -> Result<(), TestError> {
     const a: i64 = future::block_on(gf_branchy<i64>(1, true));
     const b: i64 = future::block_on(gf_branchy<u32>(1, false));
     return gf_both(expect_eq(a, 13 as i64), expect_eq(b, 23 as i64));
+}
+
+// Two instantiations, so a specialization that kept the parameter would be
+// caught rather than coinciding with the only one in play.
+![test]
+function generic_async_awaits_a_future_built_by_a_literal() -> Result<(), TestError> {
+    const a: i64 = future::block_on(gf_literal<i64>(1));
+    const b: i64 = future::block_on(gf_literal<GfPoint>(GfPoint { x: 1, y: 2 }));
+    return gf_both(expect_eq(a, 7 as i64), expect_eq(b, 7 as i64));
+}
+
+![test]
+function generic_async_awaits_a_bounded_future_built_by_a_literal()
+        -> Result<(), TestError> {
+    const a: i64 = future::block_on(gf_literal_bounded<GfCounter>(GfCounter { n: 0 }));
+    return expect_eq(a, 3 as i64);
 }

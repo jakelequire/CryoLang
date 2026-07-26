@@ -2349,22 +2349,32 @@ public:
             return TypeRef::invalid();
         }
         mut rc: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
+        // Inside a template body the args may name the enclosing generic
+        // parameters, which resolve only against their bindings; binding them also
+        // marks the context demand-free, so an abstract instantiation registers no
+        // monomorphization demand. Outside the symbolic walk this is a no-op.
+        this.symbolic.symbolic_bind_params(&rc);
         mut arg_refs: TypeRef[] = [];
         for (mut i: i64 = 0; i < lit.generic_args.length; i++) {
             const a: TypeRef = this.ctx.type_resolver.resolve(lit.generic_args[i], &rc);
-            if (!a.is_valid() || this.arena.contains_generic_param(a)) {
-                return TypeRef::invalid();
-            }
+            if (!a.is_valid()) { return TypeRef::invalid(); }
             arg_refs.push(a);
         }
-        // Demand-FREE: return the canonical arena slot for (base, concrete args) -
-        // the SAME slot the annotation `Foo<Args>` minted and demanded.  The
-        // literal only REFERENCES the type; its monomorphization demand comes from
-        // the declared type it flows into.  Adding a fresh demand here
-        // (instantiate_for_module) perturbs the mono worklist and can strand a
-        // sibling method spec's owner binding (an Option::Some payload lost its
-        // instantiation).  create_instantiation dedups by (base, arg ids), so this
-        // is the concrete post-swap slot on a cache hit.
+        // Demand-FREE: return the canonical arena slot for (base, args) - the SAME
+        // slot the annotation `Foo<Args>` minted and demanded.  The literal only
+        // REFERENCES the type; its monomorphization demand comes from the declared
+        // type it flows into.  Adding a fresh demand here (instantiate_for_module)
+        // perturbs the mono worklist and can strand a sibling method spec's owner
+        // binding (an Option::Some payload lost its instantiation).
+        // create_instantiation dedups by (base, arg ids), so this is the concrete
+        // post-swap slot on a cache hit.
+        //
+        // An arg that mentions a generic parameter yields the template-internal
+        // instantiation (`Foo<T>`), which is what the literal denotes inside a
+        // template body and what specialization rewrites.  Falling back to the bare
+        // base instead would erase the arguments: a consumer reading the literal's
+        // type directly would see `Foo`, and a type built from it (`Option<Foo>`)
+        // mentions no parameter at all, so specialization leaves it untouched.
         return this.arena.create_instantiation(base_ref, &arg_refs);
     }
 
