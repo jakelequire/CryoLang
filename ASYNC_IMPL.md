@@ -47,7 +47,8 @@ not for routine judgement calls.
 | 6 | `await` in a `match`-arm guard | ✅ DONE+validated 2026-07-25 — the last rejected `await` position. Such a `match` lowers to a DECISION CHAIN (one test state per arm, a false guard falling to the next test) instead of the single dispatch, which every other `match` keeps. Subject evaluated once into a chain-owned field; fall-through arm emitted only when the arm can fail to match; `hoist_match_expr`'s matching bail-out removed so the expression form works too. 14 tests. **One sub-case rejected with a precise diagnostic rather than lowered:** an arm binding an OWNING payload out of the subject, which a later test would then re-match hollowed-out. |
 
 | 5b-tls | Async TLS (the port's prerequisite) | ✅ DONE+validated 2026-07-25. `stdlib/net/tls/future.cryo`: `TlsHandshake` / `TlsRead` / `TlsWrite` / `TlsIo`, plus `TlsConnector::connect_async` and `TlsAcceptor::accept_async`. Each `WANT_READ`/`WANT_WRITE` becomes a reactor registration rather than a spin; the interest to arm is read off the SSL error code (a read CAN want writability), and each future records the one direction it armed so its `Drop` cancels only that half. Sound only because §5a made the read/write futures own their buffer — OpenSSL requires a `WANT_*` retry to repeat the same call with the SAME arguments, and a future moves between polls. 1 test: loopback handshake + encrypted echo with **both sides as tasks on ONE `Executor`**, which the blocking TLS test cannot do (it needs a thread, or `SSL_connect` blocks before `SSL_accept` runs). |
-| 5b-port | Socket port + delete the blocking surface | ☐ NOT STARTED. Jake's call (2026-07-25) was **"do TLS first, then delete"** — TLS is now done, so this is unblocked. Remaining: port `net/http/*`, `net/http2/*`, `net/ws/*`, `net/https.cryo`, `net/dns.cryo`, `net/socket/udp.cryo` (~7,400 lines / 19 files), then delete `TcpStream::connect/read/write`, `TcpListener::bind/accept` and the blocking TLS entry points. One-way API break: every `HttpClient::get`-shaped call becomes `async`. Decide first what an async `Read`/`Write` looks like — `http2/connection.cryo` (855 lines) is generic over `S: Read + Write`. |
+| 5b-port | Socket port + delete the blocking surface | ☐ NOT STARTED — and now **gated on 5c (async trait methods)**, per Jake's 2026-07-26 call. Remaining: port `net/http/{client,server}`, `net/http2/{client,server,connection}`, `net/https.cryo`, `net/ws/conn.cryo`, then delete `TcpStream::connect/read/write`, `TcpListener::bind/accept` and the blocking TLS entry points. One-way API break: every `HttpClient::get`-shaped call becomes `async`. **Re-derived consumer list (2026-07-26): far smaller than "19 files" — most of the greps that produced that count are doc-comment mentions. `net/dns.cryo`, `net/addr/ip.cryo` and `net/socket/udp.cryo` name `TcpStream` ONLY in prose and need no port.** |
+| 5c | Async trait methods (the port's prerequisite) | ☐ NOT STARTED — designed + foundation probed 2026-07-26. **Jake chose this** over poll-traits-plus-adapters and over de-genericizing to an `AsyncStream` union. Forced by two facts: `Http2Connection<S>` / `WebSocket<S>` hold `inner: S*` (BORROWED — `E0455` rejects that across a suspend, so the transport must be owned), and `async` on a trait method is currently rejected outright (`E0364`, parser). Design: `async read(&this, n) -> T` desugars to an implicit associated type plus a projection return (`type ReadFut; read(&this, n) -> This::ReadFut`), each impl binding it to its own synthesized future via the existing positional trait-arg sugar. See the §9 entry for the three probed gaps that block it. |
 
 Legend: ☐ not started · ◐ in progress · ✅ done+validated · ⏸ blocked (note why in the Progress Log).
 
@@ -2444,3 +2445,114 @@ lines) is generic over `S: Read + Write` with no concrete socket use, so it need
 - **`--panic=unwind` does not link on Windows at all**, with or without async (`__cryo_panic`,
   `__cryo_panic_finish`, `__cryo_personality_v0` undefined). Confirmed against a plain non-async
   `main`, so it is Track 4 (Win SEH) still being open, not anything from this session.
+
+### 2026-07-26 — Generic-literal typing bug FIXED; async trait methods chosen and scoped
+
+**Jake's design call, asked and answered.** For getting the generic transport consumers onto async he
+chose **async trait methods** (§5c) over two cheaper options: `AsyncRead`/`AsyncWrite` poll-traits
+plus generic owning adapter futures, and de-genericizing to a single `AsyncStream` union. He also
+chose to FIX the monomorphization bug found on the way rather than route around it.
+
+**Two facts, both probed, that decide the design.** `Http2Connection<S>` and `WebSocket<S>` hold
+`inner: S*` — the transport is BORROWED — and `E0455` rejects constructing that from a local across
+an `await` ("`k` holds the address of the local or parameter `c` and is live across an `await`"). So
+the transport has to be OWNED by the connection whatever else changes. And `async` on a trait method
+is rejected today (`E0364`, parser) for exactly the reason this phase has to solve: each impl lowers
+to its own future struct, so there is no single return type to declare.
+
+#### The compiler bug (FIXED)
+
+A generic struct literal written INSIDE a generic body was typed as the **bare base**: `Wrap<S> { .. }`
+denoted `Wrap`, not `Wrap<S>`. `Sema::resolve_struct_literal_type` built a `ResolutionContext` with no
+generic bindings, so resolving the argument `S` failed and it bailed (there was an explicit
+`contains_generic_param` early-out too), leaving `resolve_struct_literal` to fall back to
+`lookup_type_by_sym` = the base.
+
+It stayed invisible almost everywhere because a literal's type is normally supplied by the declared
+type it flows into. `AsyncLower::lower_carrier_sm` is the exception — it reads
+`aw.operand.resolved_type` DIRECTLY — so a generic `async function` awaiting a literal-built future
+got the sub-future field `Option<Wrap>`, which mentions no generic parameter for specialization to
+rewrite, while the body still minted `Wrap<Counter>` that nothing then monomorphized:
+`E0900 unresolved generic instantiation after monomorphization`.
+
+**Fix:** call `symbolic.symbolic_bind_params(&rc)` before resolving the args and return
+`create_instantiation(base_ref, &arg_refs)` even when an arg mentions a parameter. `symbolic_bind_params`
+is a no-op unless `state.in_symbolic_check`, which scopes the change to template bodies, and it sets
+`rc.symbolic_no_demand`, so an abstract instantiation registers no monomorphization demand.
+
+**Why the existing coverage missed it:** `async_generic_function.cryo`'s `gf_echo` awaits
+`Ready<T>::new(v)` — a static CALL, which resolved correctly all along. Only the LITERAL form was
+broken. Two tests added there (`generic_async_awaits_a_future_built_by_a_literal`, and the bounded
+variant whose `poll` dispatches through a trait bound on the parameter).
+
+Four controls are what located it, each PASSING and so eliminating a suspect: the same body without
+`async`; a generic `async fn` awaiting a non-generic future; a NON-generic `async fn` awaiting the
+generic future; and a nested generic field (`Option<Cell<S>>`) in both a hand-written struct and a
+promoted async frame slot.
+
+#### Async trait methods — design settled, three gaps block the build
+
+The desugaring, using machinery that already exists: an `async` trait method gets an implicit
+associated type for the future it returns and a projection return type.
+
+```
+type trait AsyncRead { type ReadFut; read(&this, n: i64) -> This::ReadFut; }
+implement trait AsyncRead<TickFut> for struct Sock { ... }   // positional assoc sugar
+```
+
+Associated types are already modelled as trailing positional trait arguments (the same sugar
+`implement trait Iterator<i32>` uses; `MethodBinding` computes `generic_params.length + assoc_idx`),
+`ImplBlockNode::add_assoc_binding` already exists, and `async_lower` already calls it for `Output`.
+
+**Probed GREEN:** a trait associated type used as a method's return type, bound positionally by an
+impl, projected in generic code over an abstract base (`mut m: S::Made = s.make();`), and dispatched
+through a projection bound (`where S: Maker, S::Made: Tick` → `m.tick()`).
+
+**Probed RED — the three gaps, in build order:**
+
+1. **A method return resolved through a projection bound drops the bound's own type arguments.**
+   With `f: S::ReadFut` and `where S::ReadFut: Future<i64>`, `f.poll(&cx)` types as **`void`**.
+   `MethodBinding::scan_projection_bounds` returns `types.lookup_method_return(leaf, method_name)`
+   raw; `Future::poll` returns `Poll<This::Output>` and nothing substitutes `Output := i64` from the
+   bound. The green `Maker`/`Tick` probe above passed only because `tick` returns a plain `i64` — no
+   associated type in its return — so it never exercised this.
+2. **A projection-typed value cannot bind another generic function's parameter.**
+   `future::block_on(f)` with `f: S::ReadFut` gives `E0633 ... left 1 of 1 basic block(s)
+   unterminated; body discarded` plus an LLVM verifier failure — the same silent whole-body-skip
+   signature as the ASTCloner `resolved_type` trap.
+3. **`await` on a projection-typed operand** — `E0306 async: could not resolve an awaited future's
+   type`. Independently, `AsyncLower::type_ann_for` has no `TypeKind::AssocProjection` case, so the
+   `Option<S::ReadFut>` frame field could not be spelled even once the type resolved.
+
+Then the desugaring itself (trait side), the impl-side assoc binding, and lifting the `E0364`
+parser rejection. **Async trait DEFAULT bodies** — one future generic over `This` — are a further
+sub-case: ASK Jake before assuming they are in or out of scope.
+
+#### Correction to gap 1 above — the real chain (investigated 2026-07-26, NOT fixed)
+
+Gap 1 was characterised from black-box probes as "`scan_projection_bounds` returns the method return
+raw". Instrumenting the compiler showed that is only the THIRD link, and the first two have to be
+fixed before it is even reachable. In order:
+
+1. **`resolve_method_call` returns early for a projection receiver.** `call_resolver.cryo` bails at
+   `if (symbolic.symbolic_type_unresolved(obj_type)) { stash_abstract_receiver_method(...); return
+   invalid; }` — an `AssocProjection` receiver is "unresolved", so the call yields no type and the
+   use site reads `void`. This PREEMPTS the `AssocProjection` rescue further down (past the
+   type-symbol lookup) that was plainly written for exactly this receiver. A rescue placed before the
+   early return does make `lookup_method_through_projection_bounds` fire (verified by trace).
+2. **A where-bound subject `S::Member` is not a projection annotation.** With the rescue in place the
+   scan runs but matches nothing: `projection_ann_member(b.subject_type)` is EMPTY for
+   `where S::ReadFut: Future<i64>`. `parse_trait_bounds` does take the projection branch for
+   `Identifier ::` (parser.cryo ~2499), but `parse_base_type` then builds a qualified **Named**
+   annotation rather than a `Projection` for a non-`This` base — `This::Item` works only because
+   `KwThisType` is unambiguous. So the bound never matches the receiver's member.
+3. **Only then** does the original gap-1 statement apply: the return looked up on the bound trait is
+   `Poll<This::Output>` and nothing substitutes `Output := i64` from `Future<i64>`. A fix for this
+   was written and compiles (a `subst_bound_assoc_args` + a `subst_assoc_by_member` walker mirroring
+   `reduce_assoc_projections`), but it cannot be validated until 1 and 2 land, so it was REVERTED
+   rather than left in the tree unverified.
+
+The lesson worth keeping: the earlier `Maker`/`Tick` probe that "proved projection-bounded dispatch
+works" proved no such thing — instrumentation showed `m.tick()` resolving on a CONCRETE `Ticker`,
+because specialization had already reduced `S::Made`. It never exercised the projection path at all.
+Any future claim that this machinery works needs a trace, not a green probe.
