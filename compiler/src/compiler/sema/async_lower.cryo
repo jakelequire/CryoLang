@@ -1775,8 +1775,24 @@ type struct AsyncLower {
     /// by-value receiver holds the object itself, which cannot go stale. The
     /// slot's pointer-ness is the test rather than its name, because a by-value
     /// receiver lands in a slot of the same name.
+    ///
+    /// A future generic in its owner arrives here as an `InstantiatedType`: its
+    /// fields are filled in by specialization, which has not run yet, so the slot
+    /// is looked for on the TEMPLATE the instantiation came from — the struct
+    /// `lower` did populate. Answering from the instantiation alone would find no
+    /// field and silently skip the refresh, leaving the method writing through a
+    /// pointer to storage the frame has since stopped using.
+    ///
+    /// The type returned is therefore the template's, which for such a future
+    /// still mentions the owner's parameters. It answers "is there a receiver
+    /// pointer to refresh"; the pointer type to store at a given call site comes
+    /// from the receiver place there (see `lower_carrier_sm`).
     awaited_recv_ptr_type(&this, fi: TypeRef) -> TypeRef {
-        const t: Type* = this.arena.lookup(fi.id);
+        mut t: Type* = this.arena.lookup(fi.id);
+        if (t != null && t.kind != TypeKind::Struct) {
+            const base: TypeRef = this.arena.inst_generic_base(fi);
+            t = if (base.is_valid()) { this.arena.lookup(base.id) } else { null };
+        }
         if (t == null || t.kind != TypeKind::Struct) { return TypeRef::invalid(); }
         const st: StructType* = t as StructType*;
         mut f: FieldInfo* = st.get_field(this.recv_sym);
@@ -1924,8 +1940,8 @@ type struct AsyncLower {
         // it an `async` method with a `&this` receiver reads and writes through a
         // stale pointer from its second poll onwards, corrupting silently instead
         // of faulting.
-        const recv_ptr_ty: TypeRef = this.awaited_recv_ptr_type(fi);
-        if (recv_ptr_ty.is_valid()) {
+        const recv_slot_ty: TypeRef = this.awaited_recv_ptr_type(fi);
+        if (recv_slot_ty.is_valid()) {
             mut place: ExpressionNode* = this.awaited_recv_place(aw.operand);
             if (place == null) {
                 this.ctx.emit_error_at(ErrorCode::E0455_DANGLING_POINTER,
@@ -1943,8 +1959,20 @@ type struct AsyncLower {
             // A receiver reached through a pointer already IS the address the
             // callee stored; taking its address again would hand over the slot
             // holding the pointer instead of the object.
-            const via_ptr: boolean = place.resolved_type.is_valid() &&
-                                     place.resolved_type.id == recv_ptr_ty.id;
+            //
+            // The pointer's type comes from the place rather than from the slot:
+            // the slot's is the template's, and for a future generic in its owner
+            // that still mentions the owner's parameters, which cannot type a node
+            // in a caller that is already concrete. The place is the receiver
+            // itself, so its type is the owner's here.
+            const place_ty: TypeRef = place.resolved_type;
+            mut place_t: Type* = null;
+            if (place_ty.is_valid()) { place_t = this.arena.lookup(place_ty.id); }
+            const via_ptr: boolean = place_t != null && place_t.kind == TypeKind::Pointer;
+            mut recv_ptr_ty: TypeRef = recv_slot_ty;
+            if (place_ty.is_valid()) {
+                recv_ptr_ty = if (via_ptr) { place_ty } else { this.arena.get_pointer_to(place_ty) };
+            }
             mut recv_val: ExpressionNode* = fresh;
             if (!via_ptr) { recv_val = this.addr_of(fresh, recv_ptr_ty, span); }
             sm.blocks[resume].add_statement(this.assign_field_of_stmt(

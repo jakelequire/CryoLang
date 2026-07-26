@@ -52,6 +52,8 @@ not for routine judgement calls.
 
 | 5d | Receiver-pointer refresh at resume (soundness hole opened by 5c) | ✅ DONE+validated 2026-07-26. An `async` method with a `&this` / `mut &this` receiver stores the receiver's ADDRESS in a `this$recv` field of the future it lowers to, written once at construction. That contradicted §4's load-bearing invariant (no self-references ⇒ futures freely movable ⇒ **no address-stability requirement**) and design-review item 6, which says this exact shape must be `E0455`. It was also wrong for a reason stronger than movability: an owning receiver promoted across states is **taken into a fresh block-local on every poll** and handed back on the way out, so the address legitimately changes each poll. Jake chose refresh-at-resume over making the sugar consuming or adopting an address-stability contract. `lower_carrier_sm` now re-addresses `this$recv` from the enclosing frame's own storage immediately before every poll (single site — there is exactly one sub-future stash/poll point). A receiver reached through a pointer is passed through rather than addressed twice. Two shapes that cannot be re-addressed are now rejected instead of silently corrupting: a receiver that names no storage (temporary / call result), and awaiting a method future the awaited expression did not itself produce. 4 tests + 2 negatives. **Proof:** a probe polling by hand and dirtying the stack between polls returns `15`/garbage pre-fix and the correct values post-fix (pre-fix `FAILMASK=11`, post-fix `0`), and the emitted IR shows `store ptr %h, ptr %fieldptr` into `this$recv` ahead of the poll. |
 
+| 5e | Receiver refresh for a GENERIC owner (silent miscompile) | ✅ DONE+validated 2026-07-26. An `async` method on a **generic** struct lost every write made through `mut &this` — the exact shape of every consumer §5b-port has to port (`Http2Connection<S>`, `WebSocket<S>`), so the port would have been built on sand. Distinct from 5d, not a gap in it: the axis is the owner being generic, **not** the suspend (generic+sync ✅, concrete+async ✅, generic+async ❌ with or without a suspend). Cause: `awaited_recv_ptr_type` looked for the `this$recv` slot on the awaited future's arena struct, but a future generic in its owner arrives as an **`InstantiatedType`, not a `Struct`** (specialization fills its fields, and that runs after sema), so the guard rejected it and 5d's refresh was silently skipped — the method then wrote through a pointer to a block-local the frame had stopped using. Fix: resolve to the TEMPLATE via `arena.inst_generic_base` for the "is there a slot" question, and take the pointer's TYPE from the receiver place (the template's still mentions the owner's parameters, so it cannot type a node in an already-concrete caller). `PendingThenReady<i64>` is an `InstantiatedType` too and keeps being rejected — its base has no `this$recv` — which guards against over-firing. 3 tests. **Proof:** the 4 existing 5d tests only READ through the receiver and cannot catch this; the new ones observe a WRITE from the caller, and reverting the compiler change makes 2 of the 3 FAIL (`81` vs `82`) and restoring it makes them pass. IR confirms one `store ptr %"<local>", ptr %fieldptr` per awaited method receiver where the generic ones previously had none. |
+
 Legend: ☐ not started · ◐ in progress · ✅ done+validated · ⏸ blocked (note why in the Progress Log).
 
 **Current HEAD baseline:** `eda79ddc` (the two root-cause compiler fixes of 2026-07-24 — `drop_insertion`
@@ -2814,3 +2816,82 @@ constraints: the future must OWN the buffer (§5a), while the transport may now 
 (§5d), i.e. `async read(mut &this, buf: Array<u8>) -> AsyncIo` handing the buffer back the way
 `TcpIo::take_buf()` does. `io::Read`/`io::Write` take `u8*` / `Slice<u8>` and so cannot be mirrored
 directly.
+
+- _2026-07-26_ — **5e: the generic-owner half of the receiver refresh (a silent miscompile) — FIXED.**
+Baseline HEAD `9ad93caf`, clean, pins a matched pair at `2ec4dedf-dirty`, `verify-pin.py` OK; Jake
+confirmed he ran `selfhost-check` green at that HEAD, closing the §7a gap the handoff flagged.
+
+Found while probing the shape §5b-port needs, BEFORE writing any of it. **An `async` method on a
+GENERIC struct lost every write made through `mut &this`.** That is precisely the shape every consumer
+to port has (`Http2Connection<S>`, `WebSocket<S>`), so the port would have been built on sand.
+
+The axis is the owner being generic, **not** the suspend — which is what makes it a different defect
+from 5d rather than a gap in it:
+
+| owner | method | write lands? |
+|---|---|---|
+| generic | sync | yes |
+| concrete | async, no suspend | yes |
+| concrete | async + suspend | yes |
+| generic | async + suspend | **NO** |
+| generic | async, no suspend | **NO** |
+
+**Root cause.** `awaited_recv_ptr_type` answered "does this awaited future store a receiver pointer to
+refresh?" from the future's arena struct. A future generic in its owner arrives as an
+**`InstantiatedType` (kind 22), not a `Struct` (kind 15)** — specialization fills its fields, and that
+runs after sema — so the `t.kind != TypeKind::Struct` guard rejected it, 5d's refresh was skipped, and
+the method wrote through a pointer to a block-local the enclosing frame had stopped using. Confirmed by
+`cdebug` trace (kind 22 rejected, `inst_generic_base` resolving to the right template) and by the IR:
+the caller's poll emits one `store ptr %"<local>", ptr %fieldptr` per awaited method receiver, and the
+generic ones had none. Future struct layouts and poll bodies are byte-for-byte equivalent
+concrete-vs-generic — the whole difference is at the caller.
+
+**Fix**, both in `async_lower.cryo`: (1) `awaited_recv_ptr_type` falls back to
+`arena.inst_generic_base(fi)` and looks for the slot on the TEMPLATE, which `lower` did populate;
+(2) the template's slot type still mentions the owner's parameters and so cannot type a node in an
+already-concrete caller, so `lower_carrier_sm` now takes the pointer type from the receiver PLACE —
+already-a-pointer passes through, otherwise `get_pointer_to(place_ty)`. That also replaced the identity
+test `place_ty.id == recv_ptr_ty.id` with a Pointer-kind test, provably equivalent because the concrete
+slot type is `get_pointer_to(place_ty)` by construction. `PendingThenReady<i64>` is an
+`InstantiatedType` too and must keep being rejected; resolving to its base finds no `this$recv`, so it
+still is — a built-in guard against over-firing.
+
+**Why the existing tests missed it:** all four 5d tests only READ through the receiver, and a read
+mostly still looks right (the stale copy holds what the receiver held when the future was built). The
+3 added tests observe a WRITE from the caller after completion. **Verified the hard way** — reverted
+the compiler change, rebuilt, re-ran: 2 of the 3 FAIL (`81` vs `82`, the lost increment), then restored
+and rebuilt to green. The pointer-receiver test passes either way; it is a guard on the `via_ptr`
+branch, not a discriminator, because a pointer parameter into storage owned outside the async frame is
+stable regardless.
+
+Files: `compiler/src/compiler/sema/async_lower.cryo` (`awaited_recv_ptr_type` + the place-derived
+pointer type at the single await site); `tests/tests/lang/async_receiver_refresh.cryo` (+3 tests).
+
+Cryo authoring trap paid for here: **`else if` is not valid in expression position** (`const x = if (a)
+{..} else if (b) {..}` → "expected expression, found ';'"); use a `mut` plus a statement-level `if`.
+
+**§5b-port design — Jake's call, 2026-07-26: the connection owns a persistent internal buffer.** The
+trait primitive fills a buffer the transport-owner already holds (reached through the refreshed
+`this`), so no buffer crosses the API and no layer threads an `Array<u8>` in and out; the hand-back
+`TcpIo::take_buf()` does is confined to the one place that calls `TcpRead::start`. Rejected: the
+caller-supplied `read(buf) -> AsyncIo` mirroring `TcpIo` exactly (a looping `read_exact` then needs a
+cursor in the outcome), and a both-ways surface.
+
+```cryo
+type trait AsyncRead {
+    async fill(mut &this) -> Result<u64, IoError>;                  // fills this.buf
+    async read_exact(mut &this, n: u64) -> Result<(), IoError> { }  // default body
+}
+type struct Conn<S> { inner: S; buf: Array<u8>; }
+```
+
+**And the constraint that forces owned transports, now verified by probe rather than inferred:** a
+borrowed transport through a generic entry point is a hard error. `async function via_ref<R>(r: mut &R)`
+awaited as `await via_ref<Src>(&s)` from an async fn is **`E0455`**; the identical code with a
+non-async caller compiles and runs. So the 9 generic entry points (`ws/frame.cryo`,
+`http2/frame.cryo`, `http/request.cryo`, `http/response.cryo`) cannot stay free functions taking
+`mut &R` once their callers are async, and `Http2Connection<S>` / `WebSocket<S>` must own `inner: S`
+rather than borrow `inner: S*` — which also retires `Http2Connection::drop`'s "the borrowed transport
+belongs to the caller" comment. E0455 names one escape hatch ("have the caller own the storage and pass
+a pointer parameter"), but it needs the transport owned outside every async frame, which a
+task-per-connection server cannot do.

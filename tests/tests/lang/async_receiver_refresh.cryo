@@ -122,3 +122,101 @@ function async_receiver_refreshes_through_a_field_chain() -> Result<(), TestErro
         inner: ArrHolder { base: 100, buf: Array<u8>::new() }, tag: 7 }));
     return expect_eq(d, 122 as i64);
 }
+
+
+// A future generic in its OWNER reaches the refresh as an instantiation whose
+// fields specialization has not filled in yet, so the receiver slot has to be
+// looked for on the template the instantiation came from.  Answering from the
+// instantiation alone finds no slot and skips the refresh, and the method then
+// writes through a pointer to a block-local the frame has stopped using -- the
+// writes are simply never seen again.
+//
+// Reads mostly survive that (the stale copy still holds what the receiver held
+// when the future was built), which is why the tests above do not catch it.
+// These observe a WRITE made through `mut &this` from the caller afterwards.
+
+type trait GenTick {
+    async tick(mut &this, n: i64) -> i64;
+}
+
+/// Owns an aggregate, so the receiver takes the promoted-across-states path.
+type struct GenLeaf {
+    hits: i64;
+    buf:  Array<u8>;
+}
+
+implement trait GenTick for GenLeaf {
+    async tick(mut &this, n: i64) -> i64 {
+        const a: i64 = await PendingThenReady<i64>::new(3, 10);
+        this.hits = this.hits + 1;
+        return this.hits + n + a;
+    }
+}
+
+/// Generic in its transport and owning it: the shape of every protocol layer
+/// that runs over an async transport.
+type struct GenConn<S> {
+    inner: S;
+    seen:  i64;
+
+    async pump(mut &this, n: i64) -> i64 where S: GenTick {
+        const v: i64 = await this.inner.tick(n);
+        this.seen = this.seen + v;
+        return v;
+    }
+
+    /// Suspends nowhere itself.  The refresh is still required: the caller
+    /// stashes and polls this future exactly as it does a suspending one, so the
+    /// receiver it holds is a block-local of the state that built it either way.
+    async touch(mut &this) -> i64 {
+        this.seen = this.seen + 1;
+        return this.seen;
+    }
+}
+
+async function gen_drive_mutation() -> i64 {
+    mut c: GenConn<GenLeaf> = GenConn<GenLeaf> {
+        inner: GenLeaf { hits: 0, buf: Array<u8>::new() }, seen: 0 };
+    const v: i64 = await c.pump(5);
+    return v + c.seen + c.inner.hits;
+}
+
+async function gen_drive_no_suspend() -> i64 {
+    mut c: GenConn<GenLeaf> = GenConn<GenLeaf> {
+        inner: GenLeaf { hits: 0, buf: Array<u8>::new() }, seen: 40 };
+    const v: i64 = await c.touch();
+    return v + c.seen;
+}
+
+async function gen_drive_ptr(c: GenConn<GenLeaf>*) -> i64 {
+    const v: i64 = await c.pump(5);
+    return v + c.seen + c.inner.hits;
+}
+
+// A write made through `mut &this` by an `async` method on a generic owner is
+// visible to the caller once the future completes.  `pump` returns
+// 1 (hits) + 5 (n) + 10 (awaited) == 16, stores it in `seen`, and the leaf's own
+// `hits` write must have landed too.
+![test]
+function async_generic_owner_receiver_write_is_visible() -> Result<(), TestError> {
+    const a: i64 = arr_block_on(gen_drive_mutation());
+    return expect_eq(a, 33 as i64);
+}
+
+// The same, for a method on a generic owner that never suspends.
+![test]
+function async_generic_owner_receiver_write_without_a_suspend() -> Result<(), TestError> {
+    const b: i64 = arr_block_on(gen_drive_no_suspend());
+    return expect_eq(b, 82 as i64);
+}
+
+// A generic owner reached through a pointer: the place already IS the address
+// the callee stored, so it is passed through rather than addressed again.
+![test]
+function async_generic_owner_through_a_pointer_is_not_double_addressed()
+        -> Result<(), TestError> {
+    mut owned: GenConn<GenLeaf> = GenConn<GenLeaf> {
+        inner: GenLeaf { hits: 0, buf: Array<u8>::new() }, seen: 0 };
+    const c: i64 = arr_block_on(gen_drive_ptr(&owned));
+    return expect_eq(c, 33 as i64);
+}
