@@ -35,12 +35,13 @@ The rest of this document is organised by feature area. Examples are runnable ag
 - [16. Ownership, Copy, and Drop](#16-ownership-copy-and-drop)
 - [17. Directives and Attributes](#17-directives-and-attributes)
 - [18. Foreign Function Interface](#18-foreign-function-interface)
-- [19. The Standard Library](#19-the-standard-library)
-- [20. Testing](#20-testing)
-- [21. Reserved Syntax](#21-reserved-syntax)
-- [22. Grammar Summary](#22-grammar-summary)
-- [23. Project Configuration (cryoconfig)](#23-project-configuration-cryoconfig)
-- [24. Command-Line Interface](#24-command-line-interface)
+- [19. Asynchronous Programming](#19-asynchronous-programming)
+- [20. The Standard Library](#20-the-standard-library)
+- [21. Testing](#21-testing)
+- [22. Reserved Syntax](#22-reserved-syntax)
+- [23. Grammar Summary](#23-grammar-summary)
+- [24. Project Configuration (cryoconfig)](#24-project-configuration-cryoconfig)
+- [25. Command-Line Interface](#25-command-line-interface)
 
 ---
 
@@ -69,23 +70,25 @@ Keywords are reserved identifiers. They cannot be used as variable, function, or
 | Control flow | Declarations    |             | Modifiers   | Operator keywords | Special values | Reserved for future use |
 | ------------ | --------------- | ----------- | ----------- | ----------------- | -------------- | ----------------------- |
 | `if`         | `function`      | `from`      | `const`     | `new`             | `true`         | `yield`                 |
-| `else`       | `class`         | `as`        | `mut`       | `delete`          | `false`        | `async`                 |
-| `switch`     | `struct`        | `implement` | `static`    | `sizeof`          | `null`         | `await`                 |
-| `case`       | `enum`          | `intrinsic` | `public`    | `alignof`         | `this`         | `auto`                  |
-| `default`    | `trait`         | `where`     | `private`   | `typeof`          | `This`         | `unsigned`              |
-| `match`      | `type`          | `extern`    | `protected` | `in`              |                | `tuple`                 |
-| `while`      | `namespace`     |             | `virtual`   | `as`              |                | `optional`              |
-| `for`        | `module`        |             | `override`  |                   |                | `with`                  |
+| `else`       | `class`         | `as`        | `mut`       | `delete`          | `false`        | `auto`                  |
+| `switch`     | `struct`        | `implement` | `static`    | `sizeof`          | `null`         | `unsigned`              |
+| `case`       | `enum`          | `intrinsic` | `public`    | `alignof`         | `this`         | `tuple`                 |
+| `default`    | `trait`         | `where`     | `private`   | `typeof`          | `This`         | `optional`              |
+| `match`      | `type`          | `extern`    | `protected` | `in`              |                | `with`                  |
+| `while`      | `namespace`     |             | `virtual`   | `as`              |                |                         |
+| `for`        | `module`        |             | `override`  | `await`           |                |                         |
 | `loop`       | `import`        |             | `inline`    |                   |                |                         |
 | `do`         | `export`        |             | `unsafe`    |                   |                |                         |
 | `break`      | `static_assert` |             | `move`      |                   |                |                         |
-| `continue`   | `union`         |             |             |                   |                |                         |
+| `continue`   | `union`         |             | `async`     |                   |                |                         |
 | `return`     |                 |             |             |                   |                |                         |
 | `asm`        |                 |             |             |                   |                |                         |
 
 `move` marks a closure that captures its environment by move (see [section 16.3](#163-move-checking)).
 
-Reserved-for-future-use keywords are recognised by the lexer; the parser may accept them in places that have no semantic implementation. See [section 21](#21-reserved-syntax).
+`async` marks a function, method, or trait method whose body is compiled into a state machine and whose call returns a future; `await` suspends the enclosing `async` body until a future completes (see [section 19](#19-asynchronous-programming)).
+
+Reserved-for-future-use keywords are recognised by the lexer; the parser may accept them in places that have no semantic implementation. See [section 22](#22-reserved-syntax).
 
 ### 1.3 Comments
 
@@ -141,7 +144,7 @@ Strings are enclosed in double quotes; characters in single quotes. Both share t
 '\x41'                     // hex byte: equivalent to 'A'
 ```
 
-**Escape sequences:** `\n` `\t` `\r` `\0` `\\` `\'` `\"` `\xHH` (hex byte). Raw strings (`r"..."`) and the additional C escapes `\a \b \f \v` are reserved but not yet implemented - see [section 21](#21-reserved-syntax).
+**Escape sequences:** `\n` `\t` `\r` `\0` `\\` `\'` `\"` `\xHH` (hex byte). Raw strings (`r"..."`) and the additional C escapes `\a \b \f \v` are reserved but not yet implemented - see [section 22](#22-reserved-syntax).
 
 #### f-strings (string interpolation)
 
@@ -231,7 +234,7 @@ Every value in Cryo has a known type at compile time. A binding's type is either
 
 In performance-sensitive or cross-platform code, prefer the explicit-width forms (`i32`, `u64`, `f64`) so the layout is unambiguous. The shorthand aliases exist for ergonomics.
 
-`string` is a NUL-terminated raw byte pointer matching the C ABI. Inside the standard library, length-typed UTF-8 is modelled by [`Str`](#19-the-standard-library) (borrowed) and [`String`](#19-the-standard-library) (owned). The translation between them happens at the FFI boundary in `ffi::cstr`.
+`string` is a NUL-terminated raw byte pointer matching the C ABI. Inside the standard library, length-typed UTF-8 is modelled by [`Str`](#20-the-standard-library) (borrowed) and [`String`](#20-the-standard-library) (owned). The translation between them happens at the FFI boundary in `ffi::cstr`.
 
 ### 2.2 Pointer Types
 
@@ -802,7 +805,7 @@ Only `mut` bindings can be assigned to.
 | `typeof(expr)` | Compile-time type of `expr`, used in type position (decltype-style).                                                                          |
 | `new` `delete` | Heap allocation / deallocation.                                                                                                               |
 
-> **Reserved.** `?.` and `...` in call position are recognised by the lexer but not yet lowered. See [section 21](#21-reserved-syntax). (The range operators `..` / `..=` *are* fully lowered - see [section 5.7](#57-operator-precedence).)
+> **Reserved.** `?.` and `...` in call position are recognised by the lexer but not yet lowered. See [section 22](#22-reserved-syntax). (The range operators `..` / `..=` *are* fully lowered - see [section 5.7](#57-operator-precedence).)
 
 **Pipeline (`|>`, `<|`).** The pipeline operators thread a value into a call. `x |> f` is `f(x)`; with an argument list the piped value is **prepended** - `x |> f(a, b)` is `f(x, a, b)`. The backward form **appends** instead - `f(a, b) <| x` is `f(a, b, x)`. Pipes are left-associative, so `x |> f |> g` is `g(f(x))`. They are a compile-time rewrite to an ordinary call, with no runtime cost.
 
@@ -2464,7 +2467,7 @@ type struct AlignedData {
 | `![section("name")]`                                     | function / method         | Place the emitted symbol in object-file section `name`.                                                                                                                                                                                                                                                                                                                                                                     |
 | `![naked]`                                                | function                  | Emit no prologue/epilogue (sets LLVM's `naked` attribute); the body must be a single `asm { … }` block that provides its own `ret`/`jmp`/exit. For a freestanding `_start` and other raw entry points. A non-`asm` body is an error (`E0151`).                                                                                                                                                                                |
 | `![allow(name)]` / `![warn(name)]` / `![deny(name)]`      | any decl                  | Intended to adjust a named lint's level. *Parsed and validated; lint-level adjustment is not yet implemented.*                                                                                                                                                                                                                                                                                                              |
-| `![derive(Trait, ...)]`                                     | struct / class / enum     | Intended to auto-derive one or more traits. *Parsed and validated; no trait is actually synthesized.* See [section 21](#21-reserved-syntax).                                                                                                                                                                                                                                                                                 |
+| `![derive(Trait, ...)]`                                     | struct / class / enum     | Intended to auto-derive one or more traits. *Parsed and validated; no trait is actually synthesized.* See [section 22](#22-reserved-syntax).                                                                                                                                                                                                                                                                                 |
 | `![sink]`                                                 | method                    | Marks a method as consuming its receiver, even when the receiver is syntactically `&this` or `mut &this`. Useful for methods that semantically take ownership but want the borrow-style call ergonomics.                                                                                                                                                                                                                    |
 | `![implicit]`                                             | generic function / method | Lets a call omit its generic type arguments: the compiler recovers them by unifying the declared return type against the call's *expected* type (the type of the `const x: T = ...` it initialises). Every type parameter must appear in the return type. A call with no expected type reports `E0307`; write the arguments explicitly (`f<T>(...)`) there. Used by `VaArgs::next` so `const n: i64 = va.next()` reads cleanly. |
 | `![config(<atom>)]` / `![target(<atom>)]` / `![<atom>]`   | any decl                  | Platform / build-flavor gate. `<atom>` is `windows`, `linux`, `macos`, `unix`, or `not(<atom>)`. The bare-atom form (`![windows]`) is sugar for `![config(windows)]`. The decl is stripped from the AST when the gate doesn't match.                                                                                                                                                                                        |
@@ -2475,11 +2478,11 @@ type struct AlignedData {
 
 The test-mode directives (`![config(testing)]`, `![test]`, `![ignore]`, `![should_panic]`) are documented in the next subsection.
 
-Other names that appear with `![...]` syntax are accepted by the parser and recorded so user tooling can observe them, but the compiler emits a warning for any non-builtin name and applies no semantics. A list of reserved-but-unimplemented directive names is in [section 21](#21-reserved-syntax).
+Other names that appear with `![...]` syntax are accepted by the parser and recorded so user tooling can observe them, but the compiler emits a warning for any non-builtin name and applies no semantics. A list of reserved-but-unimplemented directive names is in [section 22](#22-reserved-syntax).
 
 ### 17.2 Test Directives
 
-The test framework introduces a small set of directives recognised by the compiler ([section 20](#20-testing) covers usage):
+The test framework introduces a small set of directives recognised by the compiler ([section 21](#21-testing) covers usage):
 
 | Directive            | Description                                                        |
 | -------------------- | ------------------------------------------------------------------ |
@@ -2733,11 +2736,326 @@ static_assert(sizeof(Color) == 4, "Color must be 4 bytes to match the C ABI");
 
 ---
 
-## 19. The Standard Library
+## 19. Asynchronous Programming
+
+Cryo supports `async` / `await` as a first-class language feature. An `async` function is compiled into a state machine: its body is split at every suspension point, the values that must survive a suspension become fields of a generated struct, and calling the function builds that struct instead of running the body. Nothing runs until the resulting future is polled.
+
+The model is **stackless**. A future is an ordinary struct with no hidden heap allocation, no separate stack, and no runtime machinery of its own - `async` is a compile-time transformation, and the executor that drives futures is an ordinary library (`std::future`), not part of the language.
+
+### 19.1 Async Functions
+
+`async` before `function` makes the function asynchronous. The declared return type is the value the function eventually produces, **not** the future:
+
+```cryo
+import std::future;
+
+async function add_later(a: i64, b: i64) -> i64 {
+    const base: i64 = await ready_value(a);
+    return base + b;
+}
+```
+
+`add_later(1, 2)` returns a future whose output is `i64`. The body has not begun.
+
+An `async` function may return `void`, be generic, and be declared in any order relative to its callers:
+
+```cryo
+async function log_it(msg: Str) -> void { ... }
+
+async function first<T>(a: T, b: T) -> T { ... }
+```
+
+### 19.2 The `await` Operator
+
+`await` suspends the enclosing `async` body until its operand - which must implement `Future` - completes, and evaluates to that future's output.
+
+```cryo
+const n: i64 = await add_later(1, 2);
+```
+
+`await` is an ordinary prefix operator and may appear **anywhere an expression may appear**: in a condition, a loop body, an operand of a larger expression, a `match` subject, a `match` arm body, and a `match` arm guard.
+
+```cryo
+async function drain(mut q: Queue) -> i64 {
+    mut total: i64 = 0;
+    while (await q.has_more()) {
+        total = total + (await q.pop()) * 2;
+    }
+    match (await q.status()) {
+        Status::Clean          => { return total; }
+        Status::Dirty(n) if await q.can_retry() => { return total - n; }
+        _                      => { return 0; }
+    }
+}
+```
+
+`await` is only legal inside an `async` function or method. Using it elsewhere is an error.
+
+### 19.3 The `Future` Trait
+
+`await` is defined in terms of one trait, from `std::future`:
+
+```cryo
+type trait Future {
+    type Output;
+    poll(mut &this, cx: Context*) -> Poll<Output>;
+}
+```
+
+| Type | Meaning |
+| ---- | ------- |
+| `Poll<T>` | `Poll::Ready(T)` or `Poll::Pending`. Helpers: `is_pending()`, `is_ready()`, `into_ready()`. |
+| `Context` | The poll context. `cx.waker()` yields the `Waker` to register for a wake-up. |
+| `Waker` | A handle that reschedules the task. `Waker::noop()` is the no-op waker used by simple drivers. |
+
+`poll` returns `Poll::Pending` only after arranging for `cx.waker()` to be invoked when progress becomes possible; a future that returns `Pending` without registering a waker will never be polled again by a real executor.
+
+The bound is written `Future<T>`, which binds the associated `Output` positionally (see [section 11.5](#115-associated-types)):
+
+```cryo
+function drive<F, R>(fut: F) -> R where F: Future<R> { ... }
+```
+
+Hand-written futures are ordinary types implementing the trait, and are indistinguishable to `await` from compiler-generated ones:
+
+```cryo
+implement trait Future for struct Countdown {
+    type Output = i64;
+
+    poll(mut &this, cx: Context*) -> Poll<i64> {
+        if (this.n == 0) { return Poll::Ready(this.total); }
+        this.n = this.n - 1;
+        cx.waker().wake();
+        return Poll::Pending;
+    }
+}
+```
+
+### 19.4 How an Async Function Is Compiled
+
+Each `async` function generates one struct - the state machine - plus a `Future` implementation for it. The original function becomes a constructor returning that struct.
+
+- A `state` field records which suspension point to resume at. Each poll dispatches on it and re-enters there.
+- Every parameter, and every local that is live across a suspension, becomes a field. A local used only between two suspensions stays an ordinary stack local.
+- Every awaited sub-future is stored in a field and polled from the resuming state.
+- `Poll::Pending` from a sub-future records the state and returns `Pending`; the next poll resumes at that state.
+
+Two consequences are worth stating because they are guarantees, not implementation details:
+
+- **No hidden allocation.** The state machine is a value type. Its size is known at compile time, and a future is only heap-allocated if you put it somewhere that allocates (spawning it as a task, for example).
+- **Futures are freely movable.** Cryo futures are never self-referential, so no pinning discipline exists and none is needed - there is no `Pin` type. This is guaranteed by the restrictions in [section 19.7](#197-restrictions), which reject the constructs that would create a self-reference. Moving a future between polls, including polling it by hand, is well defined.
+
+### 19.5 Async Methods
+
+`async` applies to methods in `type struct`, `type class`, and `implement` blocks, with any receiver form:
+
+```cryo
+type struct Counter {
+    base: i64;
+
+    async bump(&this, n: i64) -> i64 {
+        const step: i64 = await tick();
+        return this.base + n + step;
+    }
+
+    async consume(this) -> i64 { ... }
+
+    static async make(n: i64) -> Counter { ... }
+}
+```
+
+A `&this` / `mut &this` receiver stays borrowed for the whole operation, including across suspensions: the enclosing frame re-establishes the receiver's address before every poll, so a method may read and write through `this` after an `await` exactly as it does before one. The receiver must be a place the caller can name again - see [section 19.7](#197-restrictions).
+
+### 19.6 Async Trait Methods
+
+A trait method may be `async`, with or without a default body:
+
+```cryo
+type trait AsyncRead {
+    async read(mut &this, buf: Array<u8>) -> AsyncIo;
+
+    /// A default body, written once over `read`.
+    async read_exact(mut &this, buf: Array<u8>) -> AsyncIo {
+        mut io: AsyncIo = await this.read(buf);
+        while (io.is_short()) {
+            io = await this.read(io.take_buf());
+        }
+        return io;
+    }
+}
+```
+
+Each implementation's `async` method lowers to its own state machine, so two implementors return two *different* concrete future types while the trait declares one signature. This is expressed with an implicit associated type: `async read(...) -> AsyncIo` declares an associated future type and returns it, and each `implement trait` block binds that associated type to its own generated future. Default bodies are instantiated per implementation and may be overridden.
+
+A generic consumer needs only the trait bound. The future's own bound is implied by the trait and is never respelled at the use site:
+
+```cryo
+async function slurp<S>(mut s: S, buf: Array<u8>) -> AsyncIo
+where S: AsyncRead {
+    return await s.read(buf);
+}
+```
+
+`async` may not be combined with `virtual` or `override` (`E0364`): those share a vtable slot, and each implementation's future is a distinct type.
+
+### 19.7 Restrictions
+
+The rules below exist to keep futures free of self-references, which is what makes them movable and removes the need for a pinning discipline.
+
+| Rule | Diagnostic |
+| ---- | ---------- |
+| A reference may not be held live across an `await`. Owned values are unrestricted. | `E0455` |
+| The address of a local or parameter of the current frame may not be handed to a future that outlives the current step. | `E0455` |
+| An `async` method must be awaited on a receiver that names storage - a local, parameter, field, or dereference. A temporary or call result must be bound to a local first. | `E0455` |
+| An `async` method's future must be awaited at the call, not stored and awaited later. | `E0455` |
+| An `async` function may not await itself, directly or transitively - the state machine would contain itself and have no finite size. Rewrite the recursion as a loop. | `E0600` |
+| `async` may not be combined with `virtual` or `override`, and there are no `async` constructors, destructors, or fields. | `E0364` |
+
+Each suspension runs on a fresh frame, which is why frame addresses do not survive one:
+
+```cryo
+async function bad(n: i64) -> i64 {
+    const p: i64* = &n;          // address into this frame
+    const step: i64 = await tick();
+    return *p + step;            // E0455: `p` is dangling here
+}
+
+async function good(n: i64) -> i64 {
+    const step: i64 = await tick();
+    return n + step;             // the owned value is carried for you
+}
+```
+
+The owned-value rewrite is always available, and it is the idiom the standard library's async I/O follows: an operation that needs a buffer *owns* the buffer for the duration and hands it back on completion, rather than borrowing one from the caller's frame.
+
+### 19.8 `async function main`
+
+`main` may be declared `async`:
+
+```cryo
+import std::future;
+
+async function main() -> i32 {
+    const body: Str = await fetch("example.com");
+    return body.length() as i32;
+}
+```
+
+The compiler renames the asynchronous body out of the entry-point slot and synthesises a synchronous `main` in its place that creates an `Executor` scoped to the entry point, drives the body to completion on it, and tears the runtime down at exit. Parameters are forwarded, so argument handling is identical to a synchronous `main`.
+
+`-> i32` and `-> void` are both accepted. A generic `main`, or any other return type, is an error (`E0365`).
+
+### 19.9 Driving Futures
+
+A future does nothing until something polls it. `std::future` provides two drivers.
+
+**`block_on`** runs a single future to completion on the calling thread, polling in a loop with a no-op waker. It has no reactor, so it suits compute-only futures that make progress on every poll:
+
+```cryo
+import std::future;
+
+const n: i64 = future::block_on(add_later(1, 2));
+```
+
+**`Executor`** is the real runtime: a worker pool with a ready queue, a reactor for I/O and timer readiness, and `catch_unwind` isolation at the poll boundary so one panicking task cannot take down a worker.
+
+```cryo
+mut ex: Executor = Executor::new();
+
+mut h1: JoinHandle<i64> = ex.spawn(work(1));
+mut h2: JoinHandle<i64> = ex.spawn(work(2));
+
+const a: i64 = h1.join();
+const b: i64 = h2.join();
+```
+
+| Operation | Meaning |
+| --------- | ------- |
+| `Executor::new()` | Create a runtime with a default worker pool and its reactor. |
+| `ex.spawn(fut)` | Schedule `fut` as an independent task; returns a `JoinHandle<T>`. |
+| `ex.block_on(fut)` | Drive one future to completion on this executor and return its output. |
+| `h.join()` | Wait for the task and take its output. |
+| `h.abort()` | Cancel the task. |
+| `h.detach()` | Let the task run without holding the handle. Dropping a handle detaches. |
+
+`Executor` implements `Drop`, so an executor held in a local tears its runtime down at the end of that scope; join the work you care about before then. Timer and I/O futures require an executor's reactor, so they cannot be driven by the plain `block_on`.
+
+### 19.10 Timers and Combinators
+
+`Sleep` completes after a delay, using the reactor's deadline chain rather than blocking a thread:
+
+```cryo
+import std::time;
+
+await Sleep::new(Duration::from_millis(50));
+await Sleep::until(deadline);
+```
+
+The `Futures` namespace composes futures. Each takes two futures and nests for higher arities:
+
+| Combinator | Behaviour |
+| ---------- | --------- |
+| `Futures::join(a, b)` | Completes when both complete; yields both outputs. |
+| `Futures::select(a, b)` | Completes with whichever finishes first; the loser is dropped. |
+| `Futures::timeout(fut, dur)` | `fut`'s output, or `Elapsed` if the deadline passes first. |
+| `Futures::timeout_at(fut, instant)` | The same against an absolute deadline. |
+
+```cryo
+match (await Futures::timeout(fetch(url), Duration::from_secs(5))) {
+    Result::Ok(body) => { ... }
+    Result::Err(_)   => { ... }   // timed out
+}
+```
+
+### 19.11 Cancellation
+
+Cancellation is **a plain drop**. There is no cancellation token and no separate cancel operation: dropping a future before it completes cancels the operation it represents, and the future's `Drop` releases whatever it holds - deregistering a waker from the reactor, disarming a timer, closing a socket it owns. This is why `select` cancels its loser and `timeout` cancels its victim simply by releasing them, and why `Executor::drop` cancels tasks still parked.
+
+Because a future owns the resources of an in-flight operation, cancellation is complete by construction: there is no window in which a cancelled read is still writing into a buffer someone else now owns.
+
+### 19.12 Async I/O
+
+`std::net` is asynchronous. The reactor is `epoll` on Linux and IOCP with `\Device\Afd` on Windows, presented through one interface.
+
+Async I/O futures **own the handle and the buffer** for the duration of the operation and hand both back on completion. That is what makes them sound rather than merely careful: a future may move between polls, so a buffer identified by a pointer into the caller's frame would be written through a stale address.
+
+```cryo
+mut io: TcpIo = await TcpRead::start(stream, buf);
+mut stream: TcpStream  = io.take_stream();
+mut buf:    Array<u8>  = io.take_buf();
+match (io.outcome()) {
+    Result::Ok(n)  => { ... }      // n == 0 means the peer closed
+    Result::Err(e) => { ... }
+}
+```
+
+| Future | Completes with |
+| ------ | -------------- |
+| `TcpConnect` | A connected `TcpStream`. |
+| `TcpAccept` | `TcpAccepted` - the listener back, plus the accepted connection. |
+| `TcpRead` / `TcpWrite` | `TcpIo` - the socket and buffer back, plus the byte count or error. |
+| `TlsHandshake` | A negotiated `TlsIo`. |
+| `TlsRead` / `TlsWrite` | `TlsIo`, with the same hand-back contract. |
+
+The `AsyncRead` and `AsyncWrite` traits ([section 19.6](#196-async-trait-methods)) abstract over transports, so protocol code is written once and runs over plain TCP or TLS:
+
+```cryo
+async function greet<S>(mut conn: S) -> Result<(), IoError>
+where S: AsyncWrite {
+    await conn.write_all(Str::new("HELLO\r\n").as_bytes().to_array());
+    return Result::Ok(());
+}
+```
+
+`TlsConnector::connect_async` and `TlsAcceptor::accept_async` drive a TLS handshake asynchronously: each `WANT_READ` / `WANT_WRITE` becomes a reactor registration rather than a spin, and the direction to wait on is taken from the TLS error code.
+
+---
+
+## 20. The Standard Library
 
 The standard library is written entirely in Cryo and ships with the compiler as a single static library plus its sources. It is organised into a small `core` (no allocation, no I/O), a heap-allocation layer (`alloc`), a collection layer (`collections`), and a set of domain-specific modules. The complete top-level manifest with one-line descriptions lives in [`stdlib/lib.cryo`](../stdlib/lib.cryo).
 
-### 19.1 The Prelude
+### 20.1 The Prelude
 
 The prelude is auto-imported into every Cryo source file. Currently:
 
@@ -2758,7 +3076,7 @@ The prelude is auto-imported into every Cryo source file. Currently:
 
 The prelude is deliberately small. Anything else is an explicit `import` - notably, the `print` / `println` / `eprint` / `eprintln` family lives in `std::fmt` and is **not** auto-imported. Examples in this document that use `println` assume `import std::fmt;` is in scope.
 
-### 19.2 Module Map
+### 20.2 Module Map
 
 | Module            | Highlights                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
@@ -2778,9 +3096,9 @@ The prelude is deliberately small. Anything else is an explicit `import` - notab
 | **`process`**     | POSIX subprocess spawning (`fork + execve`). `Command` builder (`arg`, `env`, `stdin`/`stdout`/`stderr`, `current_dir`), `Stdio` (`Inherit`, `Null`, `Piped`, `Fd`), `Child`, `ExitStatus`, `ChildStdin`/`ChildStdout`/`ChildStderr`, `Signal`. Windows is not yet supported.                                                                                                                                                                                                                                                                                                                          |
 | **`sync`**        | A generic `Atomic<T>` (`T` = `u8` / `u32` / `u64` / `i32` / `i64` / `boolean`, dispatched at compile time via `static match`; `load` / `store` / `swap` / `fetch_add` / `fetch_sub` / `fetch_and` / `fetch_or` / `fetch_xor` / `compare_exchange`), `MemoryOrder`, `fence`, `compiler_fence`, `Mutex<T, A>`, `RwLock<T, A>`, `CondVar`, `Once`, `Barrier`. RAII guards (`MutexGuard`, `RwLockReadGuard`, `RwLockWriteGuard`) are `!Send`. `Send` / `Sync` are computed structurally with call-site enforcement - see [section 16.4](#164-the-send-and-sync-traits).                                    |
 | **`thread`**      | `ThreadLocal<T>` lazy per-thread storage via `pthread_key`. `thread::spawn` / `try_spawn` / `JoinHandle<T>` (returning the body's value on `join`), `spawn_with_attr`, scoped threads (`thread::Scope`), `thread::current` / `yield_now` / `sleep` / `sleep_ms`, plus `sync::mpsc` channels (`channel`, `Sender`, `Receiver`) all ship in 1.0, built on `pthread`. The `sync` primitives and `Arc<T>` ship alongside. `Builder` (`Builder::new().stack_size(bytes).name(str).spawn`/`try_spawn`) configures the stack size and OS thread name for a spawn.                                             |
-| **`test`**        | Built-in unit-test framework. Tests live in `<project>/tests/`, are marked `![test]`, and are discovered and run fork-per-test by `cryo test`. `expect`, `expect_eq`, `expect_ne`, `bail`, `bail_other`. See [section 20](#20-testing).                                                                                                                                                                                                                                                                                                                                                                      |
+| **`test`**        | Built-in unit-test framework. Tests live in `<project>/tests/`, are marked `![test]`, and are discovered and run fork-per-test by `cryo test`. `expect`, `expect_eq`, `expect_ne`, `bail`, `bail_other`. See [section 21](#21-testing).                                                                                                                                                                                                                                                                                                                                                                      |
 
-### 19.3 Naming Conventions in the Standard Library
+### 20.3 Naming Conventions in the Standard Library
 
 The standard library follows a small set of conventions that user code is encouraged to mirror.
 
@@ -2791,7 +3109,7 @@ The standard library follows a small set of conventions that user code is encour
 
 ---
 
-## 20. Testing
+## 21. Testing
 
 Cryo ships a built-in unit-test framework. Tests live in `<project>/tests/` files whose namespace declaration carries the `![config(testing)]` directive. Inside such a file, every function marked `![test]` is auto-discovered by the compiler and run fork-per-test by `cryo test`.
 
@@ -2871,7 +3189,7 @@ color  = "auto"     # one of: auto  | always | never
 
 ---
 
-## 21. Reserved Syntax
+## 22. Reserved Syntax
 
 The lexer and grammar reserve the following forms because the language plans to use them. The compiler does not yet lower them; using them today either errors at parse time or is silently ignored by later passes. Treat this list as a roadmap, not as features.
 
@@ -2879,8 +3197,7 @@ The lexer and grammar reserve the following forms because the language plans to 
 | --------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Raw strings `r"..."`                          | Reserved. Will treat backslashes literally (no escape processing). Today an `r` prefix lexes as a separate identifier followed by an ordinary string literal.                                     |
 | Escapes `\a` `\b` `\f` `\v`                   | Reserved. The lexer does not yet recognise them; they pass through as a literal backslash plus the following character. The implemented escapes are `\n` `\t` `\r` `\0` `\\` `\'` `\"` `\xHH`.    |
-| `async` / `await`                             | Lexer recognises them; parser will accept `await expr`, but the type system has no `Future` / `Promise` and codegen does not implement coroutines.                                                |
-| `yield`                                       | Parser accepts a `yield` expression; no generator semantics exist.                                                                                                                                |
+| `yield`                                       | Parser accepts a `yield` expression; no generator semantics exist. `async` / `await` are fully implemented - see [section 19](#19-asynchronous-programming).                                      |
 | Optional chaining `?.`                        | Token reserved; not consumed by the parser.                                                                                                                                                       |
 | Spread `...` in calls / literals              | The token exists for variadic parameter declarations only.                                                                                                                                        |
 | Pure-virtual class method (e.g. `= 0` syntax) | Not implemented. Use a `virtual` method without a body to declare an interface point.                                                                                                             |
@@ -2896,11 +3213,11 @@ When any of these moves out of "reserved" and into "implemented," it will be add
 
 ---
 
-## 22. Grammar Summary
+## 23. Grammar Summary
 
 The complete formal grammar is in [`docs/grammar.md`](grammar.md), written in EBNF following ISO/IEC 14977. What follows is a condensed overview of the major productions.
 
-### 22.1 Program Structure
+### 23.1 Program Structure
 
 ```
 program         = { directive } [ namespace_decl ] { top_level_item }
@@ -2912,7 +3229,7 @@ top_level_item  = import_decl | module_decl | var_declaration
                 | type_alias_declaration | implementation_block
 ```
 
-### 22.2 Statements
+### 23.2 Statements
 
 ```
 statement       = var_declaration | function_declaration | struct_declaration
@@ -2930,7 +3247,7 @@ static_match_arm = ( type { "|" type } | "_" ) "=>" ( block | expression )
 
 `static_match` is also an expression form (see section 12.7).
 
-### 22.3 Expression Hierarchy
+### 23.3 Expression Hierarchy
 
 Expressions are stratified by precedence; each level delegates to the next-higher-precedence level.
 
@@ -2959,13 +3276,13 @@ For the full grammar, including type and pattern productions, see [`grammar.md`]
 
 ---
 
-## 23. Project Configuration (cryoconfig)
+## 24. Project Configuration (cryoconfig)
 
 A project is a directory containing a `cryoconfig` file. `cryo build`, `cryo run`, and `cryo test` search upward from the working directory for it, then build the project it describes. Scaffold a starter file with `cryo init`.
 
 `cryoconfig` is an INI-like file: `[section]` headers, `key = value` lines, `#` comments. List values use TOML-style arrays (`["a", "b"]`). Unknown keys are ignored with a warning; keys removed in 1.0 are a hard error that names the replacement.
 
-### 23.1 `[project]`
+### 24.1 `[project]`
 
 Project identity and source layout.
 
@@ -2983,7 +3300,7 @@ stdlib_root   = ""                  # project-pinned stdlib root (see section 24
 
 `target_triple` (e.g. `"x86_64-pc-windows-gnu"`) cross-compiles: it is threaded into LLVM and selects the target ABI and toolchain. For `x86_64-pc-windows-gnu` the build drives a full mingw-w64 link to a `.exe`; for triples without a known toolchain (aarch64, riscv, windows-msvc, ...) the host link step is skipped and the object files are left for a manual link. The CLI `--target=TRIPLE` overrides it.
 
-### 23.2 `[compiler]`
+### 24.2 `[compiler]`
 
 Code-generation knobs.
 
@@ -3067,7 +3384,7 @@ the compiler binary, or the linked stdlib) and the artifact still exists, the
 build is skipped (`<name> is up to date`). Pass `--no-incremental` to force a
 full rebuild and refresh the manifest.
 
-### 23.3 `[link]`
+### 24.3 `[link]`
 
 Native libraries to link, named by *intent* rather than by raw linker flag - so a project never has to juggle two similar lists.
 
@@ -3100,7 +3417,7 @@ system = ["ws2_32"]                  # winsock, windows targets only
 
 > Migrating from pre-1.0: `link_libs` -> `[link] system`, `link_paths` -> `[link] search` (or `[link] static` for a local archive). The old `[compiler] args = ["--emit-llvm"]` flag-smuggling is gone - set `emit_llvm = true`. `[compiler] include_paths` -> `[project] source_paths`. `[project] target` -> `[project] target_triple`.
 
-### 23.4 Multi-target: `[lib]` and `[[bin]]`
+### 24.4 Multi-target: `[lib]` and `[[bin]]`
 
 A project can build a library and one or more executables from one source tree. `[lib]` declares the library; each `[[bin]]` (array-of-tables) declares an executable. When present these take precedence over the single-target `[project] target_type` / `entry_point`.
 
@@ -3114,7 +3431,7 @@ name        = "mytool"
 entry_point = "src/main.cryo"
 ```
 
-### 23.5 `[dependencies]`
+### 24.5 `[dependencies]`
 
 Each entry is an inline table - a local path dependency or a git dependency. `cryo fetch` resolves them and writes `cryoconfig.lock`.
 
@@ -3126,7 +3443,7 @@ remote   = { git = "https://example.com/lib.git", tag = "v0.1.0", alias = "Remot
 
 A git dependency requires exactly one of `version`, `tag`, `branch`, or `rev`, and may set `subdir` (the path to the dependency's `cryoconfig` inside the repo). `alias` is the top-level namespace the consumer imports.
 
-### 23.6 `[test]`
+### 24.6 `[test]`
 
 Defaults for the test runner; forwarded to the spawned test binary unless overridden on the CLI.
 
@@ -3138,11 +3455,11 @@ color  = "auto"                     # auto | always | never
 
 ---
 
-## 24. Command-Line Interface
+## 25. Command-Line Interface
 
 `cryo` is a single binary: the compiler, package manager, test runner, and dependency resolver. Run `cryo` (or `cryo --help`) for a command overview, `cryo help <command>` for one command, and `cryo help <topic>` for the topics below.
 
-### 24.1 Commands
+### 25.1 Commands
 
 | Command                  | Purpose                                                                                    |
 | ------------------------ | ------------------------------------------------------------------------------------------ |
@@ -3160,7 +3477,7 @@ color  = "auto"                     # auto | always | never
 
 Running `cryo <file.cryo>` with no command compiles that file directly.
 
-### 24.2 Build flags
+### 25.2 Build flags
 
 Accepted by `build` / `run` / `test` / `check` as noted; run `cryo help flags` or `cryo help <flag>` for detail.
 
@@ -3184,7 +3501,7 @@ Accepted by `build` / `run` / `test` / `check` as noted; run `cryo help flags` o
 
 Test-only flags: `--ignored`, `--list`, `--exact`, `-q` / `--quiet`.
 
-### 24.3 Standard-library lookup
+### 25.3 Standard-library lookup
 
 The compiler resolves the stdlib root from the first source that matches:
 
