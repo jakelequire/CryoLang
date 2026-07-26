@@ -47,8 +47,10 @@ not for routine judgement calls.
 | 6 | `await` in a `match`-arm guard | ✅ DONE+validated 2026-07-25 — the last rejected `await` position. Such a `match` lowers to a DECISION CHAIN (one test state per arm, a false guard falling to the next test) instead of the single dispatch, which every other `match` keeps. Subject evaluated once into a chain-owned field; fall-through arm emitted only when the arm can fail to match; `hoist_match_expr`'s matching bail-out removed so the expression form works too. 14 tests. **One sub-case rejected with a precise diagnostic rather than lowered:** an arm binding an OWNING payload out of the subject, which a later test would then re-match hollowed-out. |
 
 | 5b-tls | Async TLS (the port's prerequisite) | ✅ DONE+validated 2026-07-25. `stdlib/net/tls/future.cryo`: `TlsHandshake` / `TlsRead` / `TlsWrite` / `TlsIo`, plus `TlsConnector::connect_async` and `TlsAcceptor::accept_async`. Each `WANT_READ`/`WANT_WRITE` becomes a reactor registration rather than a spin; the interest to arm is read off the SSL error code (a read CAN want writability), and each future records the one direction it armed so its `Drop` cancels only that half. Sound only because §5a made the read/write futures own their buffer — OpenSSL requires a `WANT_*` retry to repeat the same call with the SAME arguments, and a future moves between polls. 1 test: loopback handshake + encrypted echo with **both sides as tasks on ONE `Executor`**, which the blocking TLS test cannot do (it needs a thread, or `SSL_connect` blocks before `SSL_accept` runs). |
-| 5b-port | Socket port + delete the blocking surface | ☐ NOT STARTED — and now **gated on 5c (async trait methods)**, per Jake's 2026-07-26 call. Remaining: port `net/http/{client,server}`, `net/http2/{client,server,connection}`, `net/https.cryo`, `net/ws/conn.cryo`, then delete `TcpStream::connect/read/write`, `TcpListener::bind/accept` and the blocking TLS entry points. One-way API break: every `HttpClient::get`-shaped call becomes `async`. **Re-derived consumer list (2026-07-26): far smaller than "19 files" — most of the greps that produced that count are doc-comment mentions. `net/dns.cryo`, `net/addr/ip.cryo` and `net/socket/udp.cryo` name `TcpStream` ONLY in prose and need no port.** |
+| 5b-port | Socket port + delete the blocking surface | ☐ NOT STARTED — and now **gated on 5c (async trait methods)**, per Jake's 2026-07-26 call. Remaining: port `net/http/{client,server}`, `net/http2/{client,server,connection}`, `net/https.cryo`, `net/ws/conn.cryo`, then delete `TcpStream::connect/read/write`, `TcpListener::bind/accept` and the blocking TLS entry points. One-way API break: every `HttpClient::get`-shaped call becomes `async`. **Re-derived consumer list (2026-07-26): far smaller than "19 files" — most of the greps that produced that count are doc-comment mentions. `net/dns.cryo`, `net/addr/ip.cryo` and `net/socket/udp.cryo` name `TcpStream` ONLY in prose and need no port.** **Scope correction (2026-07-26): there are no `AsyncRead`/`AsyncWrite` traits in the tree yet** — the async surface is concrete futures (`TcpRead`/`TcpWrite`/`TlsRead`/`TlsWrite`), so step 1 of the port is to DESIGN those traits, not to retarget onto existing ones. The shape follows from two settled constraints: the future must OWN the buffer (§5a — a caller-frame `u8*` is written through a stale address), while the transport may now stay in `mut &this` (§5d makes a receiver held across a suspend sound), i.e. `async read(mut &this, buf: Array<u8>) -> AsyncIo` handing the buffer back the way `TcpIo::take_buf()` already does. The blocking `io::Read`/`io::Write` take `u8*` / `Slice<u8>`, so they cannot simply be mirrored. ~3,300 non-comment lines of consumer code plus tests. |
 | 5c | Async trait methods (the port's prerequisite) | ✅ DONE+validated 2026-07-26. First the **three blocking projection gaps — six defects** — were fixed across parser/sema/type-resolver/mono, so projection-typed dispatch, `block_on` on a projection and `await` on a projection all work. Then the feature itself: `E0364` lifted for trait methods (`virtual`/`override` still rejected), `desugar_async_trait_methods` synthesizing the implicit `<Method>Fut` + projection return, `bind_async_trait_assoc` binding each impl's own future, and E0309 taught the binding is implicit. **Default bodies included** — they cost almost nothing because `synthesize_default_trait_methods` already clones them per-impl, so no future generic over `This` was needed. 6 tests; the obsolete `E0364_async_trait_method` negative deleted. Two §9 entries. **Jake chose this** over poll-traits-plus-adapters and over de-genericizing to an `AsyncStream` union. Forced by two facts: `Http2Connection<S>` / `WebSocket<S>` hold `inner: S*` (BORROWED — `E0455` rejects that across a suspend, so the transport must be owned), and `async` on a trait method is currently rejected outright (`E0364`, parser). Design: `async read(&this, n) -> T` desugars to an implicit associated type plus a projection return (`type ReadFut; read(&this, n) -> This::ReadFut`), each impl binding it to its own synthesized future via the existing positional trait-arg sugar. Jake's scope calls (2026-07-26): default bodies ARE in scope (one future generic over `This`), and `S: AsyncRead` alone must IMPLY the future's bound — the latter already works as a consequence of the gap fixes, verified by a probe carrying only `where S: AsyncRead`. |
+
+| 5d | Receiver-pointer refresh at resume (soundness hole opened by 5c) | ✅ DONE+validated 2026-07-26. An `async` method with a `&this` / `mut &this` receiver stores the receiver's ADDRESS in a `this$recv` field of the future it lowers to, written once at construction. That contradicted §4's load-bearing invariant (no self-references ⇒ futures freely movable ⇒ **no address-stability requirement**) and design-review item 6, which says this exact shape must be `E0455`. It was also wrong for a reason stronger than movability: an owning receiver promoted across states is **taken into a fresh block-local on every poll** and handed back on the way out, so the address legitimately changes each poll. Jake chose refresh-at-resume over making the sugar consuming or adopting an address-stability contract. `lower_carrier_sm` now re-addresses `this$recv` from the enclosing frame's own storage immediately before every poll (single site — there is exactly one sub-future stash/poll point). A receiver reached through a pointer is passed through rather than addressed twice. Two shapes that cannot be re-addressed are now rejected instead of silently corrupting: a receiver that names no storage (temporary / call result), and awaiting a method future the awaited expression did not itself produce. 4 tests + 2 negatives. **Proof:** a probe polling by hand and dirtying the stack between polls returns `15`/garbage pre-fix and the correct values post-fix (pre-fix `FAILMASK=11`, post-fix `0`), and the emitted IR shows `store ptr %h, ptr %fieldptr` into `this$recv` ahead of the poll. |
 
 Legend: ☐ not started · ◐ in progress · ✅ done+validated · ⏸ blocked (note why in the Progress Log).
 
@@ -2716,3 +2718,99 @@ surface). The §6 surface is now mapped precisely: `Http2Connection<S>` and `Web
 consumers (`http/client`, `http/server`, `http2/client`, `http2/server`, `https`, `ws/conn`).
 Re-derived from code hits with doc comments excluded, confirming `net/dns.cryo`, `net/addr/ip.cryo`
 and `net/socket/udp.cryo` name `TcpStream` only in prose and need no port.
+
+---
+
+### 2026-07-26 — Receiver-pointer refresh at resume (5d): the soundness hole 5c opened, FIXED
+
+**The question, and why it was blocking.** The handoff asked whether a `&this` receiver held across a
+suspend stays valid once the enclosing future moves. It does not, and the repo already said so in three
+places that had drifted apart:
+
+- `async_lower.cryo` keeps a by-pointer receiver in a `this$recv` field (`AsyncDecl.recv_ptr`), written
+  ONCE at construction — the ctor sets `this$recv = &this` from the callee's own receiver.
+- §4 (DECIDED) rests the whole no-`Pin` argument on futures having **no self-references**, hence being
+  "freely movable ⇒ no address-stability requirement"; design-review item 5 explicitly blesses polling a
+  future by hand and **moving it between calls**.
+- Design-review item 6 says the idiomatic `stream.read(&self).await` "**IS** a self-referential future
+  (stored read-future field points at the `stream` field) → **E0455** under the ban."
+
+So 5c shipped exactly the shape item 6 says must be rejected. `frame_addr_root_expr` misses it by
+design: its `!u.is_synthetic` guard skips compiler-built `&` nodes because those "never outlive the state
+that built them" — true for every synthesized `&` EXCEPT an async method's receiver, which now does.
+
+**It is worse than a move hazard, and that is what makes it reachable.** An owning receiver promoted
+across states does not live in the frame while it is in use: `promote_cross_state` gives it an
+`Option<T>` field and it is **taken into a fresh block-local on entry to each state and handed back on
+the way out**. The IR is unambiguous — state 0 does `Option::take` → `unwrap` → `store … ptr %h` and
+calls the method with `ptr %h`, an `alloca`. So the receiver's address legitimately CHANGES on every
+poll, and the stored `this$recv` is stale from the second poll onward regardless of whether anything
+moved the future.
+
+**Why a first probe looked green — recorded so it is not re-learned.** State 0 and the resume state are
+both reached from the same `loop.body` dispatch within ONE poll call, and `future::block_on` re-polls in
+a tight loop, so poll 2's frame is laid out at the same addresses as poll 1's and the dead `alloca` still
+holds the right bytes. The bug reads stale-but-intact memory. A probe only exposes it once something
+dirties that stack between polls.
+
+**Jake's call (asked, since §4 and 5c genuinely contradicted): refresh the receiver pointer at resume**
+— over (b) making the sugar consuming like `TcpRead`/`TcpIo`, and over (c) adopting an address-stability
+contract, which Cryo cannot enforce and §4 already rejected as safety theater.
+
+**The fix.** There is exactly ONE sub-future stash/poll site (`lower_carrier_sm`), so the change is
+single-point: after `__sub_k` is materialized and before it is polled, re-address its receiver from this
+frame's own storage. `awaited_recv_ptr_type` decides whether there is anything to refresh by testing
+that the awaited future has a `this$recv` field whose type is a POINTER — a by-value receiver lands in a
+slot of the same name, so pointer-ness is the test, not the name. `awaited_recv_place` pulls the receiver
+out of `Call(callee = MemberAccess(object = …))`; the `&` is implicit in the call ABI, so the place
+itself is what gets re-addressed. `rebuild_place` makes a FRESH copy (identifier / member / `*p` only):
+the original already has a parent in the state that built the sub-future, and only pure reads may be
+re-evaluated once per poll. A receiver reached through a pointer already IS the address the callee
+stored, so it is passed through instead of addressed twice.
+
+Two shapes cannot be re-addressed and are now rejected instead of corrupting silently, each naming its
+rewrite: a receiver that names no storage (temporary or call result → bind it to a local), and awaiting
+a method future the awaited expression did not itself produce (`mut f = h.bump(5); await f;` → await the
+call directly). Both rewrites were verified to compile and run.
+
+**Proof (a probe that FAILS without the fix, per the handoff's standard).** A hand-written `block_on`
+that dirties the stack between polls with a `format`-based recursive churn — polling by hand is
+documented-sound, item 5. Four shapes, same source, only the compiler differing:
+
+| Shape | pinned (pre-fix) | fixed |
+|---|---|---|
+| owning aggregate PARAMETER receiver, 3 suspends | `15` (base read as 0) | `115` |
+| owning aggregate LOCAL receiver | `1489753375663` | `115` |
+| receiver through a pointer | `115` | `115` |
+| nested field chain (`this.inner.bump(n)` in an `async` method) | `140696103232269` | `122` |
+
+`FAILMASK=11` pre-fix, `0` post-fix. The pointer case passing in BOTH is the control: it names stable
+caller storage, and the `via_ptr` branch must not double-address it. The emitted IR confirms the
+mechanism rather than the outcome only — drive's resume state now contains
+`%fieldptr28 = getelementptr %Holder$twice$Future_0, ptr %__sub_0, i32 0, i32 1` /
+`store ptr %h21, ptr %fieldptr28` (field 1 is `this$recv`) immediately ahead of the poll.
+
+Note `negative/E0455_async_method_value_receiver_address.cryo`'s comment says the `&this` counterpart is
+legal because "the caller's object … does not move". That is now true BY CONSTRUCTION (the frame
+re-addresses it) rather than by assumption; left as-is.
+
+Files: `compiler/src/compiler/sema/async_lower.cryo` (4 helpers + the refresh at the single await site);
+NEW `tests/tests/lang/async_receiver_refresh.cryo` (4 tests); NEW
+`tests/tests/negative/E0455_async_temporary_receiver.cryo`,
+`tests/tests/negative/E0455_async_stored_method_future.cryo`.
+
+**Gates (Windows host).** `make test` **OVERALL PASS** — unit **1763** (1759 + 4), compile-fail **159**
+(157 + 2), projects **12**, exit 0. Roster regenerated **by merge**, golden-only count **0**, +4 entries
+(1759 → 1763), `git diff --numstat` = `4 0` (no line-ending flip); `roster-check: OK (1763 tests)`.
+**Repin expectation: NONE.** The compiler contains no `async fn` and — verified this session — neither
+does the stdlib (0 hits), so the lowering is inert for both and the `win-s2` vs `win-s3` pair should be
+0/235, as it has been for every prior async increment. `make selfhost-check` + the pin-delta measurement
+NOT yet run this session (it exceeds the 10-minute tool cap; left for Jake per the handoff).
+
+**Next is unchanged: §6 the socket port, then §7 delete the blocking surface.** One scope correction
+found while surveying: **there are no `AsyncRead`/`AsyncWrite` traits in the tree** — the async surface
+is concrete futures, so the port's first step is to DESIGN them. The shape is pinned by two settled
+constraints: the future must OWN the buffer (§5a), while the transport may now stay in `mut &this`
+(§5d), i.e. `async read(mut &this, buf: Array<u8>) -> AsyncIo` handing the buffer back the way
+`TcpIo::take_buf()` does. `io::Read`/`io::Write` take `u8*` / `Slice<u8>` and so cannot be mirrored
+directly.

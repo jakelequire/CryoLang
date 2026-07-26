@@ -1,0 +1,33 @@
+// E0455: an `async` method's future cannot be stored first and awaited later.
+//
+// A `&this` method's future holds the ADDRESS of its receiver, which is only
+// correct for the state that built it: the enclosing frame therefore re-addresses
+// that pointer from its own storage before every poll. It can only do so when the
+// awaited expression IS the method call, because that is what tells it which
+// receiver to re-address. Awaiting a future that was produced somewhere else
+// leaves the frame no way to find the receiver, so the stored pointer would go
+// stale on the second poll.
+//
+// The rewrite is to await the call directly, which is the ordinary form and is
+// covered in `lang/async_receiver_refresh.cryo`.
+![config(testing)]
+![config(negative, E0455)]
+namespace CryoTests::Negative::E0455AsyncStoredMethodFuture;
+
+import std::future;
+
+type struct SmfHolder {
+    base: i64;
+
+    async bump(&this, n: i64) -> i64 {
+        const a: i64 = await PendingThenReady<i64>::new(1, 10);
+        return this.base + n + a;
+    }
+}
+
+async function smf_drive(h: SmfHolder) -> i64 {
+    mut f = h.bump(5);
+    return await f;   //~ ERROR[E0455] polls an `async` method's future that the awaited expression did not itself produce
+}
+
+function main() -> int { return 0; }

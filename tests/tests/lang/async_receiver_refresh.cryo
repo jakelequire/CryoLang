@@ -1,0 +1,124 @@
+// An `async` method with a `&this` receiver stores the ADDRESS of that receiver
+// in the future it lowers to.  That address is only correct for the state that
+// built it: an owning receiver promoted across states lives in a fresh
+// block-local on every poll (taken from its frame field on entry, handed back on
+// the way out), and a future may additionally be moved between polls, since Cryo
+// futures are documented as freely movable and carry no address-stability
+// requirement.
+//
+// So the enclosing frame re-addresses the receiver from its own storage before
+// every poll.  Without that, the second poll of a suspending `&this` method
+// reads and writes through a pointer into a frame that is gone -- which corrupts
+// silently rather than faulting, because the stack slot is usually still intact.
+//
+// These tests therefore drive their futures with a hand-written `block_on` that
+// dirties the stack between polls, which is what makes a stale receiver pointer
+// observable at all.  Polling a future by hand is a supported way to drive one.
+![config(testing)]
+namespace CryoTests::Tests::Lang::AsyncReceiverRefresh;
+
+import std::test;
+import std::core::result;
+import std::fmt;
+import std::future;
+import std::future::ready;
+
+/// An owning aggregate: it reaches the promoted-across-states path, so it is
+/// taken into a fresh block-local on every poll.
+type struct ArrHolder {
+    base: i64;
+    buf:  Array<u8>;
+
+    /// Three suspends, so the receiver round-trips through the frame repeatedly
+    /// rather than only once.
+    async bump(&this, n: i64) -> i64 {
+        const a: i64 = await PendingThenReady<i64>::new(3, 10);
+        return this.base + n + a;
+    }
+}
+
+/// A receiver one field hop further in, which is the shape of a connection that
+/// owns its transport.
+type struct ArrOuter {
+    inner: ArrHolder;
+    tag:   i64;
+
+    async run(&this, n: i64) -> i64 {
+        const v: i64 = await this.inner.bump(n);
+        return v + this.tag;
+    }
+}
+
+async function arr_drive_param(h: ArrHolder) -> i64 {
+    return await h.bump(5);
+}
+
+async function arr_drive_local() -> i64 {
+    const h: ArrHolder = ArrHolder { base: 100, buf: Array<u8>::new() };
+    return await h.bump(5);
+}
+
+async function arr_drive_ptr(h: ArrHolder*) -> i64 {
+    return await h.bump(5);
+}
+
+async function arr_drive_nested(o: ArrOuter) -> i64 {
+    return await o.run(5);
+}
+
+/// Write over the stack the poll that just returned was using, at the depth the
+/// next poll will run at.  A real executor does this for free by polling another
+/// task in between; `format` is here so the writes survive optimization.
+function arr_churn(d: i64) -> i64 {
+    const s: String = format("churn %lld deadbeef", d);
+    mut n: i64 = s.length() as i64;
+    if (d > 0) { n = n + arr_churn(d - 1); }
+    return n;
+}
+
+/// `future::block_on`, except it dirties the stack between polls.
+function arr_block_on<F, R>(fut: F) -> R
+where F: Future<R> {
+    mut f:  F       = fut;
+    mut cx: Context = Context::new(Waker::noop());
+    loop {
+        match (f.poll(&cx)) {
+            Poll::Ready(v) => { return v; }
+            Poll::Pending  => { const _dirty: i64 = arr_churn(6); }
+        }
+    }
+}
+
+// The receiver is a carried aggregate PARAMETER, live across three suspends.
+![test]
+function async_receiver_survives_suspend_as_a_parameter() -> Result<(), TestError> {
+    const a: i64 = arr_block_on(arr_drive_param(
+        ArrHolder { base: 100, buf: Array<u8>::new() }));
+    return expect_eq(a, 115 as i64);
+}
+
+// The receiver is a LOCAL of the async function rather than a parameter.
+![test]
+function async_receiver_survives_suspend_as_a_local() -> Result<(), TestError> {
+    const b: i64 = arr_block_on(arr_drive_local());
+    return expect_eq(b, 115 as i64);
+}
+
+// A receiver reached through a pointer already IS the address the callee stores,
+// so it must be passed through rather than addressed a second time.
+![test]
+function async_receiver_through_a_pointer_is_not_double_addressed()
+        -> Result<(), TestError> {
+    mut owned: ArrHolder = ArrHolder { base: 100, buf: Array<u8>::new() };
+    const c: i64 = arr_block_on(arr_drive_ptr(&owned));
+    return expect_eq(c, 115 as i64);
+}
+
+// Two levels: an `async` method awaiting an `async` method on its own field.
+// Each level re-addresses its own receiver, so the chain stays valid.
+![test]
+function async_receiver_refreshes_through_a_field_chain() -> Result<(), TestError> {
+    const d: i64 = arr_block_on(arr_drive_nested(ArrOuter {
+        inner: ArrHolder { base: 100, buf: Array<u8>::new() }, tag: 7 }));
+    return expect_eq(d, 122 as i64);
+}

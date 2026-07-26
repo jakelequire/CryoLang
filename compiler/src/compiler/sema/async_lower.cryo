@@ -1767,6 +1767,85 @@ type struct AsyncLower {
         return cur;
     }
 
+    /// The type of the receiver pointer the future `fi` stores, or an invalid ref
+    /// when it stores none.
+    ///
+    /// Only an `async` method with a `&this` / `mut &this` receiver keeps one: a
+    /// free function and a `static` method have no receiver slot at all, and a
+    /// by-value receiver holds the object itself, which cannot go stale. The
+    /// slot's pointer-ness is the test rather than its name, because a by-value
+    /// receiver lands in a slot of the same name.
+    awaited_recv_ptr_type(&this, fi: TypeRef) -> TypeRef {
+        const t: Type* = this.arena.lookup(fi.id);
+        if (t == null || t.kind != TypeKind::Struct) { return TypeRef::invalid(); }
+        const st: StructType* = t as StructType*;
+        mut f: FieldInfo* = st.get_field(this.recv_sym);
+        if (f == null) { return TypeRef::invalid(); }
+        const ft: Type* = this.arena.lookup(f.field_type.id);
+        if (ft == null || ft.kind != TypeKind::Pointer) { return TypeRef::invalid(); }
+        return f.field_type;
+    }
+
+    /// The receiver place of `e` when `e` is a method call, or null otherwise.
+    ///
+    /// A method call is `Call(callee = MemberAccess(object = <receiver>))`, and
+    /// the `&` that turns the receiver into the callee's receiver pointer is
+    /// implicit in the call ABI. The place itself is therefore what has to be
+    /// re-addressed; there is no `&` node to find.
+    awaited_recv_place(&this, e: ExpressionNode*) -> ExpressionNode* {
+        if (e == null || (e as ASTNode*).kind != NodeKind::CallExpression) { return null; }
+        const c: CallExprNode* = e as CallExprNode*;
+        if (c.callee == null || (c.callee as ASTNode*).kind != NodeKind::MemberAccess) {
+            return null;
+        }
+        return (c.callee as MemberAccessNode*).object;
+    }
+
+    /// A fresh copy of the pure-read place `e`, or null when `e` is not one.
+    ///
+    /// Fresh nodes rather than the originals: the place already has a parent in
+    /// the state that builds the sub-future, and a node reachable from two
+    /// parents is walked — and drop-analysed — twice. Only pure reads qualify,
+    /// because this copy is re-evaluated on every poll and repeating a call or an
+    /// assignment would repeat its effect.
+    rebuild_place(mut &this, e: ExpressionNode*) -> ExpressionNode* {
+        if (e == null) { return null; }
+        const k: NodeKind = (e as ASTNode*).kind;
+        const ty: TypeRef = e.resolved_type;
+        const span: SourceSpan = (e as ASTNode*).span;
+        if (k == NodeKind::Identifier) {
+            return this.ident((e as IdentifierNode*).name, ty, span);
+        }
+        if (k == NodeKind::MemberAccess) {
+            const ma: MemberAccessNode* = e as MemberAccessNode*;
+            mut obj: ExpressionNode* = this.rebuild_place(ma.object);
+            if (obj == null) { return null; }
+            return this.member(obj, ma.member, ty, span);
+        }
+        if (k == NodeKind::UnaryExpression) {
+            const u: UnaryExprNode* = e as UnaryExprNode*;
+            // Only `*p` is a place: `&x` names no storage of its own, `++`/`--`
+            // write, and an overloaded operator is a call.
+            if (u.op.kind != TokenType::Star || u.desugared_call != null) { return null; }
+            mut inner: ExpressionNode* = this.rebuild_place(u.operand);
+            if (inner == null) { return null; }
+            return this.deref(inner, ty, span);
+        }
+        return null;
+    }
+
+    /// `<obj>.<field> = <rhs>;` — the arbitrary-object twin of
+    /// `assign_member_stmt`, which can only write through `this`.
+    assign_field_of_stmt(&this, obj: ExpressionNode*, field: SymbolStr, field_ty: TypeRef,
+                         rhs: ExpressionNode*, span: SourceSpan) -> StatementNode* {
+        mut lhs: ExpressionNode* = this.member(obj, field, field_ty, span);
+        const eq: Token = Token::new(TokenType::Equal, "=", span.start_line as int, span.start_col as int);
+        mut assign: BinaryExprNode* = new BinaryExprNode(eq, lhs, rhs, span);
+        assign.set_resolved_type(this.arena.get_void());
+        mut es: ExprStmtNode* = new ExprStmtNode(assign as ExpressionNode*, span);
+        return es as StatementNode*;
+    }
+
     /// Lower a top-level `await` carrier (`const/mut x = await e;`,
     /// `return await e;`, `await e;`): stash the sub-future in `cur`, allocate a
     /// resume state that polls it (suspending on `Pending`, re-entering itself),
@@ -1835,6 +1914,42 @@ type struct AsyncLower {
             "take", fut_opt, span);
         mut unwrap_call: ExpressionNode* = this.method_call0(take_call, "unwrap", fi, span);
         sm.blocks[resume].add_statement(this.var_decl_stmt(sub_sym, true, fi, unwrap_call, span));
+
+        // The sub-future recorded the ADDRESS of its receiver when it was built,
+        // and that address is only right for the state that built it. An owning
+        // receiver promoted across states lives in a fresh block-local on every
+        // poll — taken from its frame field on entry, handed back on the way out
+        // — and the frame itself may have been moved between polls. So re-address
+        // the receiver from this frame's own storage before every poll. Without
+        // it an `async` method with a `&this` receiver reads and writes through a
+        // stale pointer from its second poll onwards, corrupting silently instead
+        // of faulting.
+        const recv_ptr_ty: TypeRef = this.awaited_recv_ptr_type(fi);
+        if (recv_ptr_ty.is_valid()) {
+            mut place: ExpressionNode* = this.awaited_recv_place(aw.operand);
+            if (place == null) {
+                this.ctx.emit_error_at(ErrorCode::E0455_DANGLING_POINTER,
+                    "async: this `await` polls an `async` method's future that the awaited expression did not itself produce, so the receiver it points at cannot be re-addressed when the future resumes; await the method call directly (`await r.m(...)`) rather than storing its future first",
+                    aw.span);
+                sm.ok = false; return cur;
+            }
+            mut fresh: ExpressionNode* = this.rebuild_place(place);
+            if (fresh == null) {
+                this.ctx.emit_error_at(ErrorCode::E0455_DANGLING_POINTER,
+                    "async: this `await` calls an `async` method on a receiver that names no storage (a temporary, or the result of a call), so the receiver dies with the step that built the future; bind it to a local and await on that (`mut r = <expr>; await r.m(...);`)",
+                    aw.span);
+                sm.ok = false; return cur;
+            }
+            // A receiver reached through a pointer already IS the address the
+            // callee stored; taking its address again would hand over the slot
+            // holding the pointer instead of the object.
+            const via_ptr: boolean = place.resolved_type.is_valid() &&
+                                     place.resolved_type.id == recv_ptr_ty.id;
+            mut recv_val: ExpressionNode* = fresh;
+            if (!via_ptr) { recv_val = this.addr_of(fresh, recv_ptr_ty, span); }
+            sm.blocks[resume].add_statement(this.assign_field_of_stmt(
+                this.ident(sub_sym, fi, span), this.recv_sym, recv_ptr_ty, recv_val, span));
+        }
 
         // The sub-future's `poll` yields `Poll<F_k::Output>`, which is the type of
         // the awaited expression — NOT this function's own `Poll<Output>`. They
