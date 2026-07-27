@@ -382,11 +382,20 @@ type struct CallResolver {
         // would adopt the unbound `T` verbatim, producing a size-0 unresolved
         // argument value that miscompiles (DirectPair `hi` becomes a null
         // operand at codegen).
-        param_types = this.substitute_explicit_generic_param_types(call, &param_types);
+        // Indices whose formal came from an EXPLICIT turbofish. Those must be
+        // pushed as the argument's expected type unconditionally: for a generic
+        // callee the argument's own type is what selects the specialization, so
+        // the literal-clearing default below (which a non-generic callee
+        // survives via the call boundary's integer width coercion) would bind
+        // the call to the wrong specialization.
+        mut forced_expected: boolean[] = [];
+        param_types = this.substitute_explicit_generic_param_types(
+            call, &param_types, &forced_expected);
 
         const saved_expected: TypeRef = this.state.expected_type;
         for (mut i: i64 = 0; i < call.arguments.length; i++) {
             mut push_expected: boolean = false;
+            if (i < forced_expected.length && forced_expected[i]) { push_expected = true; }
             const arg: ExpressionNode* = call.arguments[i];
             if (arg != null && i < param_types.length && param_types[i].is_valid()) {
                 const arg_node: ASTNode* = arg as ASTNode*;
@@ -1062,12 +1071,25 @@ type struct CallResolver {
     /// No-op when the callee isn't an identifier, has no explicit generic args,
     /// names no function template, or any binding fails to resolve.
     substitute_explicit_generic_param_types(mut &this, call: CallExprNode*,
-                                            param_types: &TypeRef[]) -> TypeRef[] {
+                                            param_types: &TypeRef[],
+                                            forced: mut &boolean[]) -> TypeRef[] {
         mut out: TypeRef[] = sema_copy_type_refs(param_types);
+        for (mut i: i64 = 0; i < out.length; i++) { forced.push(false); }
         if (out.length == 0) { return out; }
-        if (call.generic_args.length == 0) { return out; }
         if (this.ctx.generic_registry == null || this.ctx.type_resolver == null) { return out; }
         const callee_node: ASTNode* = call.callee as ASTNode*;
+        // A METHOD call carries its turbofish on the MemberAccess
+        // (`b.queue<u8>(0x42)`), not on the call node, so the identifier path
+        // below never sees one.  It needs the same substitution and for the
+        // same reason: leaving the formal `data: T` abstract pushes no expected
+        // type onto the argument, so a bare integer literal keeps its `i32`
+        // default -- and a wrongly typed argument then resolves the call to a
+        // SIBLING instantiation of the same method rather than the one the
+        // turbofish named.
+        if (callee_node.kind == NodeKind::MemberAccess) {
+            return this.substitute_explicit_method_param_types(call, &out, forced);
+        }
+        if (call.generic_args.length == 0) { return out; }
         if (callee_node.kind != NodeKind::Identifier) { return out; }
         const ident: IdentifierNode* = call.callee as IdentifierNode*;
         const entry: TemplateEntry* = this.find_fn_template_for_call(
@@ -1095,7 +1117,93 @@ type struct CallResolver {
             const sub: TypeRef = subst.apply(out[pi], this.arena);
             if (sub.is_valid() && !this.types.contains_generic_param(sub)) {
                 out[pi] = sub;
+                if (pi < forced.length) { forced[pi] = true; }
             }
+        }
+        return out;
+    }
+
+    /// Substitute a METHOD call's explicit turbofish (`recv.m<u8>(x)`) into the
+    /// method's formal parameter types, so expected-type propagation pushes a
+    /// CONCRETE type onto each argument.
+    ///
+    /// Without it a polymorphic integer literal never learns the type the
+    /// turbofish named and falls back to `i32`, which does not match any
+    /// parameter shape of the intended specialization; the call then binds to
+    /// whichever sibling specialization of the same method the argument's type
+    /// happens to select, and the literal is passed in THAT spec's parameter
+    /// shape. That is a silent miscompile rather than a diagnostic: a
+    /// `queue<u8>(0x42)` bound to `queue<Slice<u8>>` hands the callee 66 as a
+    /// pointer.
+    ///
+    /// No-op unless the callee is a member access carrying a full-arity
+    /// turbofish for a locatable generic method whose args all resolve
+    /// concretely — every miss leaves the caller's types untouched.
+    substitute_explicit_method_param_types(mut &this, call: CallExprNode*,
+                                           param_types: &TypeRef[],
+                                           forced: mut &boolean[]) -> TypeRef[] {
+        mut out: TypeRef[] = sema_copy_type_refs(param_types);
+        const member: MemberAccessNode* = call.callee as MemberAccessNode*;
+        if (member == null || member.generic_args.length == 0) { return out; }
+        if (member.object == null) { return out; }
+        const recv_type: TypeRef = member.object.resolved_type;
+        if (!recv_type.is_valid()) { return out; }
+
+        mut orig_func: FunctionDeclNode* = null;
+        mut owner_ctx: ResolutionContext =
+            this.binding.find_generic_method_for_call(recv_type, member, &orig_func);
+        if (orig_func == null) { return out; }
+        const n_method_params: i64 = orig_func.generic_params.length;
+        if (n_method_params == 0) { return out; }
+        if (member.generic_args.length != n_method_params) { return out; }
+
+        // Resolve the turbofish in the CALLER's scope, not through `owner_ctx`:
+        // an owner binding would shadow an enclosing parameter that happens to
+        // share the receiver's parameter name. Mirrors the same choice in
+        // `MethodBinding::solve_method_bindings`.
+        mut tf_ctx: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
+        this.symbolic.symbolic_bind_params(&tf_ctx);
+        mut bindings: TypeRef[] = [];
+        for (mut i: i64 = 0; i < n_method_params; i++) {
+            const tr: TypeRef = this.ctx.type_resolver.resolve(member.generic_args[i], &tf_ctx);
+            if (!tr.is_valid()) { return out; }
+            // A still-abstract binding cannot type an argument in a concrete
+            // caller; leave the formals alone and let inference/mono decide.
+            if (this.types.contains_generic_param(tr)) { return out; }
+            bindings.push(tr);
+        }
+
+        // Re-resolve the formals with owner args concrete AND the method's own
+        // params bound, rather than substituting into the already-resolved
+        // types: resolution handles a param nested inside another type
+        // (`Array<T>`, `Option<T>`) for free.
+        mut pctx: ResolutionContext = owner_ctx.clone();
+        for (mut i: i64 = 0; i < n_method_params; i++) {
+            const gp: GenericParamNode* = orig_func.generic_params[i];
+            if (gp == null) { return out; }
+            pctx.add_binding(gp.name, bindings[i]);
+        }
+        pctx.set_this_type(recv_type);
+
+        const this_amp: SymbolStr = this.intern.intern("&this");
+        const this_val: SymbolStr = this.intern.intern("this");
+        mut explicit_params: VarDeclNode*[] = [];
+        for (mut i: i64 = 0; i < orig_func.parameters.length; i++) {
+            const p: VarDeclNode* = orig_func.parameters[i];
+            if (p == null) { continue; }
+            if (p.name.equals(this_amp) || p.name.equals(this_val)) { continue; }
+            explicit_params.push(p);
+        }
+        if (explicit_params.length != out.length) { return out; }
+
+        for (mut i: i64 = 0; i < out.length; i++) {
+            const p: VarDeclNode* = explicit_params[i];
+            if (p == null || p.type_annotation == null) { continue; }
+            const formal: TypeRef = this.ctx.type_resolver.resolve(p.type_annotation, &pctx);
+            if (!formal.is_valid()) { continue; }
+            if (this.types.contains_generic_param(formal)) { continue; }
+            out[i] = formal;
+            if (i < forced.length) { forced[i] = true; }
         }
         return out;
     }
