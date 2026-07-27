@@ -1216,18 +1216,30 @@ type struct AsyncLower {
     /// The arg-shadow prelude common to every generated `poll`: `const p =
     /// this.p;` for each captured parameter, so the moved body resolves its
     /// parameter names against the struct fields.
-    emit_shadow_prelude(&this, d: AsyncDecl*, node: FunctionDeclNode*, body: BlockStmtNode*,
-                        struct_ref: TypeRef, skip_carried: boolean, span: SourceSpan) -> void {
+    ///
+    /// A parameter with a destructor is not readable that way — the read would
+    /// copy it and leave both the field and the frame owning it. Such a parameter
+    /// lives in an `Option` slot and is MOVED out with a `take`. The state-machine
+    /// path skips those here and lets `carry_params` materialize one per state; a
+    /// body with no `await` has no states, so its single poll takes them here.
+    emit_shadow_prelude(mut &this, d: AsyncDecl*, node: FunctionDeclNode*, body: BlockStmtNode*,
+                        sm: PollSm*, skip_carried: boolean, span: SourceSpan) -> void {
         for (mut i: i64 = 0; i < node.parameters.length; i++) {
             const p: VarDeclNode* = node.parameters[i];
             if (!this.param_has_slot(d, p)) { continue; }
             const slot_ty: TypeRef = this.param_slot_type(d, p);
+            const carried: boolean = this.param_is_carried(sm, slot_ty);
             // A carried parameter is materialized per state by `carry_params`
             // instead: one shared shadow would be moved from inside the loop.
-            if (skip_carried && this.param_needs_carrier(slot_ty)) { continue; }
+            if (skip_carried && carried) { continue; }
             const fname: SymbolStr = this.param_field_name(p);
+            if (carried) {
+                body.add_statement(this.agg_take_stmt(fname, fname, slot_ty,
+                    this.param_field_type(sm, slot_ty), sm.struct_ref, true, span));
+                continue;
+            }
             mut this_ref: IdentifierNode* = new IdentifierNode(this.this_sym, span);
-            this_ref.set_resolved_type(struct_ref);
+            this_ref.set_resolved_type(sm.struct_ref);
             mut access: MemberAccessNode* = new MemberAccessNode(
                 this_ref as ExpressionNode*, fname, span, span);
             access.set_resolved_type(slot_ty);
@@ -1242,10 +1254,10 @@ type struct AsyncLower {
 
     /// No-await body: shadow prelude + the original body with `return E`
     /// rewritten to `return Poll::Ready(E)` (runs to completion in one poll).
-    build_poll_body_no_await(mut &this, d: AsyncDecl*, node: FunctionDeclNode*, struct_ref: TypeRef,
+    build_poll_body_no_await(mut &this, d: AsyncDecl*, node: FunctionDeclNode*, sm: PollSm*,
                              poll_out: TypeRef, span: SourceSpan) -> BlockStmtNode* {
         mut body: BlockStmtNode* = new BlockStmtNode(span);
-        this.emit_shadow_prelude(d, node, body, struct_ref, false, span);
+        this.emit_shadow_prelude(d, node, body, sm, false, span);
         if (node.body.kind == NodeKind::BlockStatement) {
             const orig: BlockStmtNode* = node.body as BlockStmtNode*;
             for (mut bi: i64 = 0; bi < orig.statements.length; bi++) {
@@ -1626,13 +1638,26 @@ type struct AsyncLower {
                                         this.intern, ty);
     }
 
+    /// True when any by-value parameter has a destructor, and so has to MOVE out
+    /// of its field on entry to `poll` rather than be copied out of it. Such a
+    /// parameter needs an `Option` slot whether or not the body ever suspends.
+    params_need_carrier(&this, d: AsyncDecl*, node: FunctionDeclNode*) -> boolean {
+        for (mut i: i64 = 0; i < node.parameters.length; i++) {
+            const p: VarDeclNode* = node.parameters[i];
+            if (!this.param_has_slot(d, p)) { continue; }
+            if (this.param_needs_carrier(this.param_slot_type(d, p))) { return true; }
+        }
+        return false;
+    }
+
     /// True when this lowering actually carries a parameter of `ty` in a slot.
     ///
-    /// The carrier only exists to survive a suspend, and it is built out of
-    /// `Option`, which is looked up only when the body has an `await`. A body
-    /// with none runs to completion in a single poll and reads its parameters
-    /// straight out of their fields, so there is nothing to carry — and no
-    /// `Option` base to carry it in.
+    /// A carrier does two jobs: it lets a value survive a suspend, and it keeps
+    /// the field and the poll frame from owning it at the same time. Only the
+    /// first is about `await`, so a body with no suspension point still carries a
+    /// parameter that has a destructor. The guard on `opt_base` is what makes this
+    /// answer agree with the field types, the constructor and the prelude, which
+    /// all consult it — they must never disagree about where a value lives.
     param_is_carried(&this, sm: PollSm*, ty: TypeRef) -> boolean {
         return sm.opt_base.is_valid() && this.param_needs_carrier(ty);
     }
@@ -1674,6 +1699,12 @@ type struct AsyncLower {
                 if (!carried_in && this.block_cond_write(sm.blocks[b], pname)) {
                     carried_in = true;
                 }
+                // Read before this pass stores anything into the block: the store
+                // `store_before_suspends` adds passes the value to `Option::Some`
+                // by value and would otherwise be mistaken for the state's own
+                // last use, suppressing the tail hand-back. Same hazard, and same
+                // ordering rule, as a promoted local.
+                const handback: boolean = this.needs_handback(sm.blocks[b], pname);
                 if (carried_in) {
                     this.prepend_agg_take(sm.blocks[b], pname, pname, lty, opt_ty,
                                           sm.struct_ref, true, span);
@@ -1685,7 +1716,7 @@ type struct AsyncLower {
                         p.span);
                     sm.ok = false; return;
                 }
-                if (this.needs_handback(sm.blocks[b], pname)) {
+                if (handback) {
                     sm.blocks[b].add_statement(
                         this.agg_store_stmt(sm, pname, opt_ty, pname, lty, span));
                 }
@@ -3333,6 +3364,20 @@ type struct AsyncLower {
             this.option_some(this.ident(name, lty, span), opt_ty, span), span);
     }
 
+    /// `mut <name> = this.<field>.take().unwrap();` — the value MOVES out of its
+    /// carrier field into an ordinary local, leaving the field empty, so exactly
+    /// one place owns it. Reading `this.<field>` directly would copy it instead
+    /// and leave the future and the poll frame each believing they own it, which
+    /// runs the destructor twice.
+    agg_take_stmt(mut &this, name: SymbolStr, field: SymbolStr, lty: TypeRef,
+                  opt_ty: TypeRef, struct_ref: TypeRef, mutable: boolean,
+                  span: SourceSpan) -> StatementNode* {
+        mut fld: ExpressionNode* = this.member(this.this_ident(struct_ref, span), field, opt_ty, span);
+        mut take_call: ExpressionNode* = this.method_call0(fld, "take", opt_ty, span);
+        mut unwrap_call: ExpressionNode* = this.method_call0(take_call, "unwrap", lty, span);
+        return this.var_decl_stmt(name, mutable, lty, unwrap_call, span);
+    }
+
     /// Prepend `<name> = this.<field>.take().unwrap();` so the state opens with
     /// the value back in an ordinary local. `take` empties the field, so the
     /// value is never reachable through two places at once. Mirrors how a
@@ -3340,10 +3385,8 @@ type struct AsyncLower {
     prepend_agg_take(mut &this, blk: BlockStmtNode*, name: SymbolStr, field: SymbolStr,
                      lty: TypeRef, opt_ty: TypeRef, struct_ref: TypeRef,
                      mutable: boolean, span: SourceSpan) -> void {
-        mut fld: ExpressionNode* = this.member(this.this_ident(struct_ref, span), field, opt_ty, span);
-        mut take_call: ExpressionNode* = this.method_call0(fld, "take", opt_ty, span);
-        mut unwrap_call: ExpressionNode* = this.method_call0(take_call, "unwrap", lty, span);
-        mut rebuilt: StatementNode*[] = [this.var_decl_stmt(name, mutable, lty, unwrap_call, span)];
+        mut rebuilt: StatementNode*[] = [this.agg_take_stmt(name, field, lty, opt_ty,
+                                                           struct_ref, mutable, span)];
         for (mut i: i64 = 0; i < blk.statements.length; i++) { rebuilt.push(blk.statements[i]); }
         blk.statements = rebuilt;
     }
@@ -3817,6 +3860,20 @@ type struct AsyncLower {
                     if (b == ds) { continue; }
                     const use_kind: i64 = this.block_first_use(sm.blocks[b], nm);
                     if (use_kind == 0i64) { continue; }
+                    // Whether the state still owns the value as it falls off its
+                    // end is a property of the code the user wrote, so it must be
+                    // read BEFORE this pass adds any store of its own — for the
+                    // same reason the declaring state reads it early. A hand-back
+                    // store hands the value to `Option::Some` BY VALUE, so the
+                    // store `store_before_suspends` inserts on the suspend path
+                    // would otherwise read as the state's last use and report it
+                    // as having given the value away, suppressing the tail store
+                    // the fall-through path needs. That leaves the carrier empty
+                    // and the next state's `take().unwrap()` panics — the shape
+                    // that reaches it is an `await` on a carried receiver whose
+                    // block does not mention the value again after the suspend,
+                    // i.e. every `await c.m()` inside a loop.
+                    const handback: boolean = this.needs_handback(sm.blocks[b], nm);
                     // A conditional rebuild is carried in like a read: the take
                     // gives the state the previous value, the nested assignment
                     // replaces it only on the path that runs, and either way the
@@ -3849,7 +3906,7 @@ type struct AsyncLower {
                             vd.span);
                         sm.ok = false; return;
                     }
-                    if (this.needs_handback(sm.blocks[b], nm)) {
+                    if (handback) {
                         sm.blocks[b].add_statement(
                             this.agg_store_stmt(sm, afield, opt_ty, nm, lty, span));
                     }
@@ -4857,7 +4914,7 @@ type struct AsyncLower {
         this.collect_frame_names(d, sm, node);
 
         mut body: BlockStmtNode* = new BlockStmtNode(span);
-        this.emit_shadow_prelude(d, node, body, sm.struct_ref, true, span);
+        this.emit_shadow_prelude(d, node, body, sm, true, span);
 
         const orig: BlockStmtNode* = node.body as BlockStmtNode*;
         const entry: i64 = this.sm_alloc(sm);   // state 0
@@ -5572,19 +5629,24 @@ type struct AsyncLower {
             unit_output: this.is_void_type(declared_ref),
         };
 
+        // `Option` backs the sub-future slots AND every by-value parameter that
+        // has a destructor, so it is needed by a body with no `await` too: such a
+        // parameter has to move out of its field on the single poll, and only a
+        // slot that can be left empty records that the future no longer owns it.
         mut body_block: BlockStmtNode* = null;
+        sm.opt_base = this.lookup_future_type("Option");
+        if (!sm.opt_base.is_valid()
+            && (total_await > 0i64 || this.params_need_carrier(&this.pending[pi], node))) {
+            this.ctx.emit_error_at(ErrorCode::E0233_UNDEFINED_SYMBOL,
+                "async: `Option` must be in scope to lower an `async function`", span);
+            if (generic) { this.arena.set_symbolic_no_demand(saved_no_demand); }
+            return;
+        }
         if (total_await > 0i64) {
-            sm.opt_base = this.lookup_future_type("Option");
-            if (!sm.opt_base.is_valid()) {
-                this.ctx.emit_error_at(ErrorCode::E0233_UNDEFINED_SYMBOL,
-                    "async: `Option` must be in scope to lower `await`", span);
-                if (generic) { this.arena.set_symbolic_no_demand(saved_no_demand); }
-                return;
-            }
             body_block = this.build_poll_body_sm(&this.pending[pi], node, &sm);
         } else {
             body_block = this.build_poll_body_no_await(
-                &this.pending[pi], node, self_ty, poll_out, span);
+                &this.pending[pi], node, &sm, poll_out, span);
         }
         if (body_block == null) {   // a diagnostic was already emitted
             if (generic) { this.arena.set_symbolic_no_demand(saved_no_demand); }

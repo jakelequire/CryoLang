@@ -187,6 +187,97 @@ async function ntc_truncated(port: u16, listener: TcpListener) -> i64 {
     return 0;
 }
 
+/// A flood: the sender queues N framed records and flushes ONCE, then waits for
+/// an ack in the reverse direction. The receiver reads them back one at a time
+/// IN A LOOP.
+///
+/// This is the shape every protocol read loop has, and the one nothing else here
+/// covered: the other tests call `read_line` exactly once per connection, so the
+/// connection was never an owning local awaited on more than once from inside a
+/// loop. That gap is what hid the carrier bug this test now guards — a state
+/// suspending inside a loop left its carrier empty, and the next poll unwrapped
+/// a `None`. The failure was originally blamed on `Futures::join`, which is only
+/// the lens it was seen through.
+async function ntc_flood_send(port: u16, n: i64) -> i64 {
+    mut sock: TcpStream = match (await TcpConnect::start(SocketAddr::localhost_v4(port))) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { return -60; }
+    };
+    mut c: BufConn<TcpStream> = BufConn<TcpStream>::of(sock);
+
+    mut i: i64 = 0;
+    while (i < n) {
+        match (c.queue<string>("REC 3\r\nabc")) { Result::Ok(_) => { } Result::Err(_) => { return -61; } }
+        i = i + 1;
+    }
+    match (await c.flush()) { Result::Ok(_) => { } Result::Err(_) => { return -62; } }
+
+    mut ack: String = match (await c.read_line(64)) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { return -63; }
+    };
+    if (ack.as_str() != Str::new("ACK")) { return -64; }
+    return n;
+}
+
+async function ntc_flood_recv(listener: TcpListener, n: i64) -> i64 {
+    mut acc: TcpAccepted = await TcpAccept::start(listener);
+    mut lst: TcpListener = acc.take_listener();
+    lst.drop();
+    mut stream: TcpStream = TcpStream::from_fd(-1);
+    match (acc.take_result()) {
+        Result::Ok(s)  => { stream = s; }
+        Result::Err(_) => { return -70; }
+    }
+    mut c: BufConn<TcpStream> = BufConn<TcpStream>::of(stream);
+
+    // Two suspending reads per iteration, both on the connection itself, so the
+    // carrier is taken and handed back four times per record.
+    mut got: i64 = 0;
+    while (got < n) {
+        mut head: String = match (await c.read_line(64)) {
+            Result::Ok(v)  => { v }
+            Result::Err(_) => { return -71; }
+        };
+        if (head.as_str() != Str::new("REC 3")) { return -72; }
+        mut body: Array<u8> = match (await c.read_exact(3)) {
+            Result::Ok(v)  => { v }
+            Result::Err(_) => { return -73; }
+        };
+        if (!ntc_bytes_eq(&body, "abc")) { return -74; }
+        got = got + 1;
+    }
+
+    match (c.queue<string>("ACK\r\n")) { Result::Ok(_) => { } Result::Err(_) => { return -75; } }
+    match (await c.flush())            { Result::Ok(_) => { } Result::Err(_) => { return -76; } }
+    return got;
+}
+
+async function ntc_flood(port: u16, listener: TcpListener, n: i64) -> i64 {
+    const pair: (i64, i64) = await Futures::join(ntc_flood_recv(listener, n),
+                                                 ntc_flood_send(port, n));
+    if (pair.0 != n) { return pair.0; }
+    if (pair.1 != n) { return pair.1; }
+    return 0;
+}
+
+![test]
+function tcp_conn_flood_of_records_read_one_at_a_time() -> Result<(), TestError> {
+    mut listener: TcpListener = match (TcpListener::bind(SocketAddr::localhost_v4(0u16))) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { return bail(Str::new("bind 127.0.0.1:0 failed")); }
+    };
+    listener.set_nonblocking(true);
+    const port: u16 = match (listener.local_addr()) {
+        Result::Ok(a)  => { a.port }
+        Result::Err(_) => { listener.drop(); return bail(Str::new("local_addr failed")); }
+    };
+    mut ex: Executor = Executor::new();
+    const r: i64 = ex.block_on(ntc_flood(port, listener, 16 as i64));
+    ex.drop();
+    return expect_eq(r, 0 as i64);
+}
+
 ![test]
 function tcp_conn_reports_a_truncated_record_as_eof() -> Result<(), TestError> {
     mut listener: TcpListener = match (TcpListener::bind(SocketAddr::localhost_v4(0u16))) {

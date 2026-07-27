@@ -35,7 +35,7 @@ not for routine judgement calls.
 |---|---|---|
 | 0 | Design lock-down (surface, trait shapes, lowering placement) — get Jake's sign-off | ✅ done — locked 2026-07-22 (§7 filled) |
 | 1 | Core types in stdlib (`Poll`/`Future`/`Context`/`Waker`) + `block_on` + hand-written futures | ✅ done+validated 2026-07-22 (no repin) |
-| 2 | Compiler: `async fn` parse + state-machine lowering + `await` desugar | ✅ DONE+validated; **the deferred aggregate-across-await tail LANDED 2026-07-24 — an `async function` can now hold an aggregate across a suspend, take a droppable aggregate parameter, and be `spawn`ed on an `Executor`** (see the newest §9 entry). Earlier: DONE (2026-07-23) — parse + no-await (1b) + single await (2) + N straight-line (3) + awaits across `if`/`else` (4a) + awaits across `while`/`for`/`loop`/`do-while` + `break`/`continue` + `mut` loop-carried promotion (4b) + scope-aware alpha-rename, all committed through `5e28a74f`. **Inc 4c DONE (2026-07-23): `await` inside a `match` arm — dispatch `match(subj)` → per-arm entry states → join; scalar pattern bindings captured to fields (aggregate→E0600, ref→E0455); pattern bindings alpha-renamed for by-name soundness; non-exhaustive match gets synth `_ => join`. Plus the bare-block-with-await warm-up. Both-OS fixed point, `win-s2`/`win-s3` = 0/235 `.ll` → NO REPIN, UNCOMMITTED.** All common control flow now lowers → Phase 2 complete. |
+| 2 | Compiler: `async fn` parse + state-machine lowering + `await` desugar | ✅ DONE+validated. **Two carried-aggregate soundness bugs fixed 2026-07-27** — (1) `await <method>` on an owning local inside a LOOP left its carrier empty (`unwrap` on `None`): the pass asked "did this state give the value away?" AFTER inserting its own by-value hand-back store, and mistook that store for the answer; (2) an `async fn` with NO awaits COPIED an owning parameter out of its field instead of moving it, double-freeing it. Both fixed at the root in `async_lower.cryo`; the `Join` diagnosis recorded under `TcpConn` was wrong and is corrected. New permanent coverage: `async_stress_shapes.cryo` (31 tests, asserted numbers + counted drops, every shape paired with a control) and the flood test. See the newest §9 entry. Earlier: DONE+validated; **the deferred aggregate-across-await tail LANDED 2026-07-24 — an `async function` can now hold an aggregate across a suspend, take a droppable aggregate parameter, and be `spawn`ed on an `Executor`** (see the newest §9 entry). Earlier: DONE (2026-07-23) — parse + no-await (1b) + single await (2) + N straight-line (3) + awaits across `if`/`else` (4a) + awaits across `while`/`for`/`loop`/`do-while` + `break`/`continue` + `mut` loop-carried promotion (4b) + scope-aware alpha-rename, all committed through `5e28a74f`. **Inc 4c DONE (2026-07-23): `await` inside a `match` arm — dispatch `match(subj)` → per-arm entry states → join; scalar pattern bindings captured to fields (aggregate→E0600, ref→E0455); pattern bindings alpha-renamed for by-name soundness; non-exhaustive match gets synth `_ => join`. Plus the bare-block-with-await warm-up. Both-OS fixed point, `win-s2`/`win-s3` = 0/235 `.ll` → NO REPIN, UNCOMMITTED.** All common control flow now lowers → Phase 2 complete. |
 | 3 | Executor + `Waker` + `spawn`/`JoinHandle`; multi-thread; poll-boundary `catch_unwind` isolation | ✅ DONE+validated (2026-07-24) — surface LOCKED 2026-07-23. **(a)** single-thread executor + ready-queue + re-enqueueing Waker; **(b)** `spawn`/`JoinHandle` (Output via `TaskShared<O>`), `block_on`, `join`/`detach`/`abort`, drop=detach; **(c)** pthread worker pool + per-task atomic run-state (IDLE/SCHEDULED/RUNNING/NOTIFIED) + condvar `join`/`block_on` + `catch_unwind` poll-boundary isolation. Needed a NEW compiler `![config(panic_unwind)]` gating atom (see §9) → Phase-1 both-OS REPIN (selfhost fixed point, 235 `.ll`). Executor is self-contained (own pthread wrappers, no `thread::Scope` dep). Validated on Linux: regression 30/30, isolation 30/30. UNCOMMITTED. |
 | 4 | Reactor (epoll/IOCP) + async I/O over `std::net` + timers + `async fn main` + combinators | ◐ in progress 2026-07-24. **Inc 4b DONE on Linux (reactor + async TCP, stress+leak clean); Windows AFD backend written but UNVALIDATED (wine 9.0 cannot service `IOCTL_AFD_POLL` — needs a real Windows box).** Interface fork LOCKED by Jake: **one readiness interface both OSes, Windows via real AFD** (not WSAPoll, not a per-OS split). Sockets are to become **async-only with every consumer ported** (Jake, 2026-07-24) — that port is **UNBLOCKED as of 2026-07-24**: the aggregate-across-await tail landed, and the follow-on "rebuilt from inside a branch" E0600 is now removed too (newest §9 entry). Forks LOCKED earlier: waker lifetime = **separate `Arc`-wrapper**; reactor = **dedicated thread, per-`Executor`** (`![thread_local]` current-reactor handle); platform = **both OSes (epoll + IOCP)**. **Inc 4a DONE+validated (2026-07-24): Arc-refcounted `Waker` (Copy→non-Copy) + `Arc<Task>` lifetime; finish-vs-park now implicit via `Task::drop` on the last decref. Needed a COMPILER fix (owner-generic static with a defaulted owner param + nested return → E0636; `call_resolver.cryo` default-backfill) → selfhost fixed point BOTH OS, win-s2 vs win-s3 = 0/235 `.ll`, REPINNED both OS. UNCOMMITTED.** NEXT = Inc 4b (the reactor: epoll+IOCP interface — bring Jake the readiness-vs-completion unification fork). |
 
@@ -3111,31 +3111,30 @@ surfacing as `UnexpectedEof`. The framed shape is deliberate: reading a header l
 of the same buffer is exactly what the blocking `http::request::read_line` cannot do — its own doc comment
 records that limitation — so it is the behaviour the port depends on.
 
-#### OPEN — a third test was written, failed, and was REMOVED rather than left red or weakened
+#### RESOLVED 2026-07-27 — the "flood" failure was the carrier bug, NOT `Join`
 
 A "flood" scenario (N length-prefixed records written without reading, receiver reading them one at a time,
-then an ack in the reverse direction) panics with **`called Option::unwrap() on a None value`**. Not
-landed; recorded here with what has been ruled out, because it is unresolved rather than understood.
+then an ack in the reverse direction) panicked with **`called Option::unwrap() on a None value`**. It was
+written, failed, and was removed rather than left red.
 
-- The panic can only be `combinator.cryo:117-118` (`Join`'s `a_out.take().unwrap()` /
-  `b_out.take().unwrap()`). Every other `unwrap()` reachable from this path is either guarded by an
-  explicit `is_ok` / range panic with a different message (`Array::set`, `alloc`) or not in it at all
-  (`process::command`).
-- It is **not** volume or compaction: it reproduces identically at 3 records and at 400.
-- It is **not** `Futures::join` with staggered completion in general — a no-socket probe joining two
-  futures that finish 8 polls apart returns the correct pair under `future::block_on`. The distinguishing
-  factor is the real multi-threaded `Executor`, and both `Join` fields are written in the same `poll` call
-  that reads them back, so a lost write across polls is the shape to look at first.
-- Rewriting the scenario onto `Executor::spawn` + `JoinHandle::join` — which is also how a real server
-  would express it — is **blocked by the PARKED same-leaf bug**: naming `JoinHandle` in a program that
-  also pulls in `std::thread` makes `Executor::spawn`'s own bare return re-resolve to
-  `std::thread::JoinHandle`, failing inside `executor.cryo` itself with E0200. See
-  `same-leaf-type-caller-scope-bug-2026-07-26`.
+**The diagnosis recorded here was wrong.** It read:
 
-The two landed tests exercise the same `TcpConn` code paths (fill, compact, buffered/consume, queue,
-flush) on the same `Executor`, so the transport itself is covered; what is NOT covered is a long
-bidirectional stream with an ack handshake. Worth resolving before the HTTP/2 and WebSocket layers, which
-are exactly that shape.
+> The panic can only be `combinator.cryo:117-118` (`Join`'s `a_out.take().unwrap()` /
+> `b_out.take().unwrap()`). Every other `unwrap()` reachable from this path is either guarded […]
+
+`Join` had nothing to do with it. The same panic reproduces in 40 lines with **no `Join`, no `Executor`
+and no socket** — an `async fn` that awaits a method on an owning local inside a `while` loop. What was
+right in the old entry is that it is not volume and not staggered completion; what was wrong is the
+conclusion, reached by elimination over the `unwrap()` call sites that were *visible in source*. The
+failing `unwrap` was in code the compiler had SYNTHESIZED, so it was not in that list at all. A gdb
+backtrace names the frame in seconds and would have settled it immediately.
+
+Root cause and fix: see the 2026-07-27 entry "Carried aggregates across a suspend inside a loop" in §9.
+
+The flood scenario is now a landed test — `tcp_conn_flood_of_records_read_one_at_a_time` in
+`tests/tests/stdlib/net_tcp_conn.cryo`, 16 framed records over a real `Executor`. It fails on the
+pre-fix compiler with exactly the original message and passes on the fixed one, which is what confirms
+the two failures were the same bug.
 
 ---
 
@@ -3326,3 +3325,87 @@ after the merge. `selfhost-check` and the pin-delta measurement are still owed.
 **Not started:** §5 proper — the six direct consumers, the two borrowed-transport holders
 (`Http2Connection<S>` / `WebSocket<S>`, both of which must become owning), the nine by-reference generic
 entry points, and the deletion of the blocking socket/TLS surface.
+
+---
+
+### 2026-07-27 — Carried aggregates across a suspend inside a loop: two soundness bugs, both fixed at the root
+
+Baseline HEAD `40c31609`, pin current and a matched pair at `2ab5347e` (clean), tree otherwise clean.
+Both fixes are in `compiler/src/compiler/sema/async_lower.cryo`. No stdlib change, so no two-phase repin.
+
+#### Bug 1 — a state's own hand-back store was mistaken for the user giving the value away
+
+`await c.m()`, where `c` is an owning local and the `await` is inside a loop, panicked with `called
+Option::unwrap() on a None value` from the AGGREGATE carrier. One iteration was enough; the same three
+awaits written straight-line were fine.
+
+An aggregate held across a suspend lives in an `Option<T>` field: taken on entry to a state, handed back
+as the state falls off. Two things decide whether the hand-back is emitted — `needs_handback`, which asks
+whether the state still owns the value at its tail, and `store_before_suspends`, which inserts an extra
+hand-back before each `return Poll::Pending` because a suspend leaves the state before its tail runs.
+
+`promote_cross_state` ran them in that order: insert first, ask second. The inserted store is
+`this.__agg_c = Option::Some(c);`, which passes `c` to `Option::Some` **by value**, so the "did this state
+give the value away?" walk found the compiler's own store as the last mention of `c` and answered yes.
+The tail hand-back was then skipped, `c` fell out of scope and was dropped, and the next state's
+`take().unwrap()` met a `None`.
+
+The declaring state already guards exactly this hazard — its `needs_handback` is read before its own store
+is appended, with a comment saying why. The guard was simply missing on the other two paths. Both now read
+the answer before any synthesized store exists: `promote_cross_state` for promoted locals, and
+`carry_params` for aggregate parameters, which had the identical ordering.
+
+Why the straight-line control passed: there, the block after the suspend goes on to build the NEXT
+`c.bump()`, and a receiver is a borrow, so the last mention re-marked `c` as still owned. In a loop the
+next `await` lives in a different state, so nothing after the suspend mentions `c` at all.
+
+**Tell, for next time:** the failing `unwrap` was in synthesized code, so eliminating over the `unwrap()`
+call sites visible in source — which is how the `Join` misdiagnosis above was reached — cannot find it.
+`gdb -q -batch -ex run -ex bt` named the frame immediately, and `--emit-llvm` on a 40-line probe showed
+the generated `poll` with the store missing from the fall-through path and a `Counter::drop` in its place.
+`--ast` was useless (post-lowering tree, identifier names blank), as recorded.
+
+#### Bug 2 — an `async fn` with NO awaits copied an owning parameter out of its field
+
+A body with no suspension point runs to completion in one poll and read its parameters with the shadow
+prelude's `const p = this.p;`. For a value with a destructor that is a COPY, not a move: the future's
+field and the poll frame each own it, and it is destroyed twice. Broader than first reported — it needs
+neither a move-out nor a return, a read-only owning parameter double-frees just the same.
+
+The state-machine path never had this: `carry_params` gives such a parameter an `Option<T>` slot and
+`take`s it out. The no-await path skipped that for one incidental reason — the carrier is built out of
+`Option`, and `Option` was only looked up when the body contained an `await`.
+
+Fixed by making the model uniform rather than by special-casing the no-await path: `Option` is now looked
+up for every `async fn`, so a parameter with a destructor gets a carrier slot whether or not the body
+suspends, and the shadow prelude emits `mut p = this.p.take().unwrap();` for it. Field types, the
+constructor's `Option::Some` wrap and the prelude all consult `param_is_carried`, so they stay in
+agreement. The `Option`-not-found error now fires when a carrier is actually needed, not only on `await`.
+
+#### Coverage — the hole, not just the bug
+
+The reason both survived is that the async tests exercised *async* rather than *code that happens to
+suspend*: nothing looped over a connection (`read_line` was called once per connection), and nothing
+awaited a method on an owning local inside a loop at all.
+
+**New: `tests/tests/stdlib/async_stress_shapes.cryo`, 31 tests.** The cross product of what is awaited
+(free fn, method on a local, on `this`, on a struct FIELD, trait required method, trait DEFAULT body,
+generic owner, three-deep nesting), what is carried (scalar, non-droppable aggregate, droppable
+aggregate, `Option`-wrapped, generic owner, the awaited call's own receiver, a value given away and
+retaken) and the control flow around it (straight-line, `if`/`else`, `while`, `loop`+`break`, `for`,
+`match` arm, nested loops, early `return`, `continue`, `?`). Every test asserts a NUMBER, every ownership
+test COUNTS destructor calls, and every shape is paired with a control one step simpler — no loop, no
+await, or a non-generic owner — so a red cell names the variable responsible.
+
+**New: `tcp_conn_flood_of_records_read_one_at_a_time`** in `net_tcp_conn.cryo` — the flood scenario that
+was removed as unexplained (see the correction above), now landed.
+
+Verified red-before / green-after by building the same sources with `bin/cryo` (the pre-fix pin) and with
+the rebuilt compiler: the flood test panics with the original message on the pin and passes after.
+
+#### A pre-existing defect found while writing the tests, NOT async and NOT fixed
+
+Calling `.drop()` explicitly on a FIELD of a live owner that still has drop glue runs the destructor
+twice — the owner's glue drops the field again. It behaves identically in SYNC code, so it is the known
+partial-move tracking limit rather than anything to do with suspension, and is out of scope here. It is
+worth knowing because it looks exactly like an async carrier bug when it happens inside an `async fn`.
