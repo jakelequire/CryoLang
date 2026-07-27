@@ -1,0 +1,46 @@
+/// The type-side twin of the `pick` collision: two modules export the same
+/// generic type leaf, and a callee's BARE return annotation must keep meaning
+/// what its OWN module says even though this file imports the other one.
+///
+/// Importing `WidgetOther` is load-bearing -- it is what puts a second `Widget`
+/// in this module's scope. Without the import the annotation resolves correctly
+/// for the uninteresting reason that there is nothing else it could be.
+![config(testing)]
+namespace GenericNameCollision::WidgetTest;
+
+import std::core::result;
+import std::test::error;
+import std::test::assert;
+
+import GenericNameCollision::WidgetMid;
+import GenericNameCollision::WidgetOther;
+
+// Inferred call: the return annotation is re-resolved while checking THIS
+// module, whose scope also binds `WidgetOther::Widget`.
+![test]
+function inferred_call_keeps_the_callees_own_widget() -> Result<(), TestError> {
+    mut m: Maker = Maker::new();
+    mut w: GenericNameCollision::WidgetDeep::Widget<i64> = m.make(7);
+    expect_eq(w.unwrap(), 7 as i64)?;
+    return Result::Ok(());
+}
+
+// Explicit type arguments take a different re-resolution path in sema, so the
+// two are separate regressions and both are pinned here.
+![test]
+function turbofish_call_keeps_the_callees_own_widget() -> Result<(), TestError> {
+    mut m: Maker = Maker::new();
+    mut w: GenericNameCollision::WidgetDeep::Widget<i64> = m.make_tf<i64>(9);
+    expect_eq(w.unwrap(), 9 as i64)?;
+    return Result::Ok(());
+}
+
+// The colliding type must still be reachable from here by its own name, so the
+// fix cannot work by simply preferring the callee's module everywhere.
+![test]
+function the_colliding_widget_is_still_usable() -> Result<(), TestError> {
+    mut o: GenericNameCollision::WidgetOther::Widget<i64> =
+        GenericNameCollision::WidgetOther::Widget<i64> { other_v: 5 };
+    expect_eq(o.other_v, 5 as i64)?;
+    return Result::Ok(());
+}

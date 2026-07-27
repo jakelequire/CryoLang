@@ -457,10 +457,18 @@ type struct Resolver {
     /// symbol was declared in — two modules may export the same leaf name, and
     /// the leaf-keyed scope chain cannot tell them apart on its own.
     resolve_type_qualified_name(&this, name: SymbolStr) -> SymbolStr {
+        return this.resolve_type_qualified_name_from(this.current_scope, name);
+    }
+
+    /// `resolve_type_qualified_name`, but resolving the leaf from an EXPLICIT
+    /// scope rather than the ambient cursor.  See
+    /// `resolve_type_qualified_name_bare_from` for why the scope is a parameter.
+    resolve_type_qualified_name_from(&this, start: ScopeID,
+                                     name: SymbolStr) -> SymbolStr {
         const name_str: string = this.intern_table.resolve(name);
         LOG_DEBUG(LogComponent::Resolver,
             "[resolve_type_qn] looking for '%s' starting at scope %llu",
-            name_str, this.current_scope.id);
+            name_str, start.id);
 
         // If the name is already qualified (contains "::"), try it as-is first
         // (it may already be the canonical form), then fall back to extracting
@@ -483,7 +491,8 @@ type struct Resolver {
             // property the source mentions.
             const leaf_sym: SymbolStr = this.extract_leaf(name_str);
             if (leaf_sym.is_valid()) {
-                const resolved: SymbolStr = this.resolve_type_qualified_name_bare(leaf_sym);
+                const resolved: SymbolStr =
+                    this.resolve_type_qualified_name_bare_from(start, leaf_sym);
                 if (resolved.is_valid() && this.qualifier_agrees(resolved, name_str)) {
                     return resolved;
                 }
@@ -504,7 +513,7 @@ type struct Resolver {
             return name;
         }
 
-        return this.resolve_type_qualified_name_bare(name);
+        return this.resolve_type_qualified_name_bare_from(start, name);
     }
 
     /// Resolve a module-qualified type name (`Module::Leaf`) to its canonical
@@ -624,8 +633,27 @@ type struct Resolver {
     /// Walks scope chain and import aliases to find the symbol, then constructs
     /// the canonical qualified form: "module::name".
     resolve_type_qualified_name_bare(&this, name: SymbolStr) -> SymbolStr {
-        // 1. Walk scope chain from current scope for Type/TypeAlias/Import symbols.
-        mut scope_id: ScopeID = this.current_scope;
+        return this.resolve_type_qualified_name_bare_from(this.current_scope, name);
+    }
+
+    /// `resolve_type_qualified_name_bare`, but walking from an EXPLICIT scope
+    /// instead of the resolver's ambient cursor.
+    ///
+    /// A bare leaf in a type annotation means what the annotation's OWN module
+    /// says: that module's declarations, then its imports, then the prelude. The
+    /// ambient cursor answers for whatever module a pass happens to be walking,
+    /// which is the caller's at any re-resolution site - so two modules exporting
+    /// the same leaf silently bind to the wrong one.
+    ///
+    /// Taking the start scope as a PARAMETER is what makes this safe where a
+    /// cursor swap is not: resolution recurses (a type's arguments, a function
+    /// annotation's parameters), and each nested resolution carries its own
+    /// start scope. Repointing the shared cursor instead leaks the switch into
+    /// every nested resolution underneath it.
+    resolve_type_qualified_name_bare_from(&this, start: ScopeID,
+                                          name: SymbolStr) -> SymbolStr {
+        // 1. Walk scope chain from `start` for Type/TypeAlias/Import symbols.
+        mut scope_id: ScopeID = start;
         while (scope_id.is_valid()) {
             const scope: Scope* = this.get_scope(scope_id);
             const found: SymbolID = scope.find(name);
@@ -645,15 +673,25 @@ type struct Resolver {
             scope_id = scope.parent_id;
         }
 
-        // 2. Check import aliases
-        const alias_id: SymbolID = this.lookup_import_alias(name);
-        if (alias_id.is_valid()) {
-            const alias_sym: Symbol = this.get_symbol(alias_id);
-            const resolved: string = this.intern_table.resolve(alias_sym.name);
-            if (alias_sym.source_module != "") {
-                return this.intern_table.intern(alias_sym.source_module + "::" + resolved);
+        // 2. Check import aliases.
+        //    `import_aliases` is resolver-global and reset per module, so it holds
+        //    the aliases of the module the cursor is on - not of `start`. Consult
+        //    it only when those are the same module; for a foreign start scope an
+        //    alias hit would be the CALLER's `import X as Y`, which is exactly the
+        //    kind of cross-module leak this overload exists to prevent. (Aliases
+        //    are not yet stored per-scope, so a foreign module's own aliases are
+        //    simply not visible here; the caller falls through to its next
+        //    lookup rather than binding something wrong.)
+        if (start.id == this.current_scope.id) {
+            const alias_id: SymbolID = this.lookup_import_alias(name);
+            if (alias_id.is_valid()) {
+                const alias_sym: Symbol = this.get_symbol(alias_id);
+                const resolved: string = this.intern_table.resolve(alias_sym.name);
+                if (alias_sym.source_module != "") {
+                    return this.intern_table.intern(alias_sym.source_module + "::" + resolved);
+                }
+                return alias_sym.name;
             }
-            return alias_sym.name;
         }
 
         // 3. Not found

@@ -1,0 +1,51 @@
+///! std::future::executor - `Executor::spawn` and its `JoinHandle`.
+///!
+///! This file imports `std::thread` alongside `std::future` on purpose. Both
+///! export a `JoinHandle` leaf, and a callee's bare return leaf used to be
+///! re-resolved against the importing module's scope rather than its own, so
+///! `Executor::spawn` (declared `-> JoinHandle<O>` in `future::executor`) bound
+///! to `thread::JoinHandle` and failed to type-check inside `executor.cryo`
+///! itself. Every test file is compiled into one binary, so a single import of
+///! `std::thread` anywhere was enough to poison `spawn` for the whole suite.
+///! Keep both imports and keep a `thread::spawn` call here: together they are
+///! what makes the two same-leaf types coexist.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::FutureExecutor;
+
+import std::core::result;
+import std::future;
+import std::thread;
+import std::test::error;
+import std::test::assert;
+
+async function doubled(n: i64) -> i64 {
+    return n * 2;
+}
+
+/// Naming the future's handle by its qualified path is what a caller importing
+/// both modules must write; the bare leaf is genuinely ambiguous here.
+![test]
+function spawn_returns_the_executors_own_join_handle() -> Result<(), TestError> {
+    mut ex: Executor = Executor::new();
+    mut h: future::executor::JoinHandle<i64> = ex.spawn(doubled(21));
+    const joined: Result<i64, JoinError> = h.join();
+    ex.drop();
+    match (joined) {
+        Result::Ok(v)  => { return expect_eq(v, 42 as i64); }
+        Result::Err(_) => {
+            return expect_true(false, "spawned task did not complete");
+        }
+    }
+}
+
+/// The thread handle of the same leaf name, resolved in the same file, must
+/// still be the thread one - the fix must not overcorrect in the other
+/// direction.
+![test]
+function thread_spawn_returns_the_thread_join_handle() -> Result<(), TestError> {
+    mut th: thread::JoinHandle<i64> =
+        thread::spawn<i64, i64>(21, (n: i64) -> i64 { return n * 2; });
+    const v: i64 = th.join();
+    return expect_eq(v, 42 as i64);
+}
