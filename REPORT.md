@@ -162,7 +162,7 @@ string-keyed monomorphization era).
   `module_graph.cryo:427-431` — a missing invalidation edge, not a
   conservative one. Note: the same skip is accidentally why import cycles
   work (`module_graph.cryo:351-353` + `module_loader.cryo:660-668`) — cycles
-  survive iff the back-edge fails to resolve. Make cycle support intentional.
+  survive if the back-edge fails to resolve. Make cycle support intentional.
 
 - [x] **64-bit FNV cache keys** vs rustc's 128-bit SipHash — collision =
   silent miscompile. Consider widening.

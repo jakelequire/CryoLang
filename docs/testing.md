@@ -314,7 +314,7 @@ for any package: `[link]`, `[dependencies]`, target type), and `test.json` is
 
 - **`collect`** - build the package and run *its own* `![test]` functions
   (its `tests/` dir, discovered exactly as for a top-level project). The project
-  passes iff all of them pass. This is the common case: a multi-module package
+  passes if all of them pass. This is the common case: a multi-module package
   whose tests exercise cross-module behavior.
 
   ```json
