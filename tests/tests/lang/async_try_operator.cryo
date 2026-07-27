@@ -227,3 +227,56 @@ function async_try_operator_propagates_err_through_a_generic_owner()
     // `frames` is incremented past the `?`, so a propagated error leaves it 0.
     return ato_both(expect_eq(v, -1000 as i64), expect_eq(c.frames, 0 as i64));
 }
+
+// A droppable binding GIVEN AWAY inside a `?`, in an earlier state than the one
+// its drop lands in.
+//
+// The lowering carries an aggregate parameter in an `Option` field: each state
+// takes it out on entry and hands it back on the way out. A state that gave the
+// value away must stay silent instead, and that is decided by classifying the
+// LAST mention of the name -- which for `expr?` lives in the desugar, not on the
+// `?` node. Reading the node itself finds the mention but reads it as a borrow,
+// so the state hands back a value it no longer owns: the carry-back reads a
+// moved-from binding (rejected as a use-after-move against the `async` keyword,
+// since every synthesized node carries the function's own span) and, were it to
+// compile, would drop it a second time.
+//
+// `?` without a suspend, and a suspend placed BEFORE the `?`, both always
+// worked -- only a move that lands in an earlier state than its drop is
+// affected, so the count below is what makes this test meaningful.
+
+/// Counts destructions, so a double-drop is observed rather than inferred.
+mut ATO_DROPS: i64 = 0;
+
+type struct AtoOwned {
+    v: i64;
+}
+
+implement trait Drop for struct AtoOwned {
+    drop(mut &this) -> void {
+        ATO_DROPS = ATO_DROPS + 1;
+    }
+}
+
+/// Consumes its argument, so applying `?` to the call gives the binding away.
+function ato_consume(o: AtoOwned) -> Result<i64, IoError> {
+    mut owned: AtoOwned = o;
+    const out: i64 = owned.v;
+    owned.drop();
+    return Result::Ok(out);
+}
+
+async function ato_move_under_try(o: AtoOwned) -> Result<i64, IoError> {
+    const seed: i64 = (ato_consume(o))?;
+    const w: i64 = await PendingThenReady<i64>::new(1, 1);
+    return Result::Ok(seed + w);
+}
+
+![test]
+function async_try_operator_moves_a_droppable_param_before_a_suspend()
+        -> Result<(), TestError> {
+    ATO_DROPS = 0;
+    const v: i64 = ato_val(future::block_on(ato_move_under_try(AtoOwned { v: 5 })));
+    // 5 + 1, and the value is destroyed exactly once -- inside `ato_consume`.
+    return ato_both(expect_eq(v, 6 as i64), expect_eq(ATO_DROPS, 1 as i64));
+}

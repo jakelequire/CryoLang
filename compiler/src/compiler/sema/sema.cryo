@@ -274,7 +274,8 @@ public:
                     } else { this.ctx.qualify_symbol_sym(ib.target_type) };
                     mut aliases: SymbolStr[] = [ib.target_type,
                                                 this.ctx.qualify_symbol_sym(ib.target_type)];
-                    this.declare_async_methods(ib.methods, ib.generic_params,
+                    mut owner_params: GenericParamNode*[] = this.impl_owner_params(ib);
+                    this.declare_async_methods(ib.methods, owner_params,
                                                canonical, aliases, ib);
                 }
                 _ => { }
@@ -361,6 +362,44 @@ public:
         const inst: TypeRef = this.arena.create_instantiation(base, &refs);
         refs.drop();
         return inst;
+    }
+
+    /// The generic parameters the OWNER of an impl block's methods actually has.
+    ///
+    /// An impl block on a generic template writes them on the TARGET
+    /// (`implement trait Sink for struct Buf<S>`), not on the block itself, so
+    /// `generic_params` is empty there while the method bodies may still mention
+    /// `S`. A future lowered from such a method has to be generic in `S` too: the
+    /// future's own impl block is what decides whether sema walks its `poll` body
+    /// symbolically, and a body walked concretely while an abstract projection
+    /// (`S::ReadFut::Output`) is still in it fails every check against that
+    /// projection instead of deferring until monomorphization resolves it.
+    impl_owner_params(mut &this, ib: ImplBlockNode*) -> GenericParamNode*[] {
+        if (ib.generic_params.length > 0) {
+            return this.clone_generic_params(ib.generic_params);
+        }
+        const greg: GenericRegistry* = this.ctx.generic_registry;
+        if (greg == null) { return []; }
+        mut qualified: SymbolStr = ib.target_type;
+        const target_str: string = this.intern.resolve(ib.target_type);
+        if (!target_str.contains("::")) {
+            qualified = this.ctx.qualify_symbol_sym(ib.target_type);
+        }
+        const tmpl: TemplateEntry* = greg.get_template(qualified);
+        if (tmpl == null || tmpl.ast_node == null) { return []; }
+        if (tmpl.node_kind == NodeKind::StructDeclaration) {
+            return this.clone_generic_params((tmpl.ast_node as StructDeclNode*).generic_params);
+        }
+        if (tmpl.node_kind == NodeKind::ClassDeclaration) {
+            return this.clone_generic_params((tmpl.ast_node as ClassDeclNode*).generic_params);
+        }
+        if (tmpl.node_kind == NodeKind::EnumDeclaration) {
+            return this.clone_generic_params((tmpl.ast_node as EnumDeclNode*).generic_params);
+        }
+        if (tmpl.node_kind == NodeKind::UnionDeclaration) {
+            return this.clone_generic_params((tmpl.ast_node as UnionDeclNode*).generic_params);
+        }
+        return [];
     }
 
     clone_generic_params(&this, params: &GenericParamNode*[]) -> GenericParamNode*[] {

@@ -3136,3 +3136,93 @@ The two landed tests exercise the same `TcpConn` code paths (fill, compact, buff
 flush) on the same `Executor`, so the transport itself is covered; what is NOT covered is a long
 bidirectional stream with an ack handshake. Worth resolving before the HTTP/2 and WebSocket layers, which
 are exactly that shape.
+
+---
+
+### Two generic-owner resolution defects fixed (blocking the no-mirror connection design)
+
+Jake ruled that the stdlib async port must **never build a mirror**: no `TlsConn` twinning `TcpConn`, and
+no async path added alongside a blocking one to be demolished later. Each layer converts in place and its
+tests move with it. That makes the buffered connection GENERIC in its transport, which in turn requires it
+to IMPLEMENT `AsyncRead`/`AsyncWrite` (protocol layers are generic over `S: AsyncRead`) rather than merely
+carry inherent methods. Two defects blocked exactly that, both now fixed.
+
+**1. A generic owner's params never reached the future of an `async` method in a trait-impl block.**
+`sema.cryo`'s `ImplementationBlock` arm passed `ib.generic_params` to `declare_async_methods`. For
+`implement trait Sink for struct Buf<S>` the parameters are written on the TARGET, not on the block, so
+that list is empty — the lowered future was declared non-generic, its own impl block was then walked
+CONCRETELY, and the still-abstract `S::PullFut::Output` in its `poll` body failed every check instead of
+deferring to monomorphization (`E0200`, `expected Transfer, found S::PullFut::Output`). The identical body
+as an INHERENT method was always fine, which is what made it look like a projection bug rather than a
+declaration one. Fixed with `impl_owner_params`, which falls back to the target template's own parameters
+— the same shape as the existing bare-impl-on-template-target rescue a few lines below it.
+
+**2. `abstract_receiver_method_return` had no `InstantiatedType` arm.** During a symbolic walk a receiver
+typed `H<S>` (a generic owner instantiated at a still-abstract argument, e.g. built inside a generic
+function) is "unresolved" only in its ARGUMENTS; its base is a known template whose method list types the
+call exactly. With no arm for it the symbolic path returned invalid, the call typed as nothing, and an
+enclosing `await` reported `E0306` "operand must implement `Future`". A non-async method on the same
+receiver resolved fine, which is why this surfaced only through `await`. Fixed by routing that case to the
+existing `resolve_method_return_via_template`, which deliberately leaves the return abstract while the
+receiver's args are abstract — precisely what a symbolic walk wants.
+
+Both verified by observing VALUES, not exit codes: the generic-owner class is a silent-miscompile class,
+so each probe reports writes made through `mut &this` at both levels and is checked against an expected
+number. Guarded permanently by two tests in `tests/tests/lang/async_trait_method.cryo`
+(`async_trait_method_on_a_generic_owner_normalizes_the_projection`,
+`async_trait_impl_on_a_generic_owner_satisfies_a_second_bound`) — that file previously covered generic
+FUNCTIONS only, never a trait impl on a generic OWNER.
+
+Unit suite green in full (882 `Tests::Lang` + 915 `Tests::Stdlib` = 1797, the merged roster); roster
+merged, not `--update`d, golden-only count 0. Compiler changed, so the pin delta is UNMEASURED — that
+needs `selfhost-check` plus the §2 file-count/`@FILE.str` normalization before any repin.
+
+**Still open (unchanged by this work):** a droppable binding moved inside a `?` in an earlier state than
+its drop lands in is rejected `E0452`. Each ingredient passes alone; `await` placed BEFORE the `?` is
+accepted; the no-`?` variant is correct at runtime (verified with a drop counter), so it is a real defect
+and not a correct refusal. `match` expresses the same thing, which is what `TcpConn::connect` already does.
+
+### `?` that gives a droppable binding away before a suspend — fixed
+
+The last open defect from that session. A droppable binding moved inside a `?` in an EARLIER state than
+the one its drop lands in was rejected `E0452`, pointing at the `async` keyword:
+
+```cryo
+async function combo(r: Res) -> Result<i64, i64> {
+    const seed: i64 = (try_consume(r))?;   // gives `r` away
+    const w: i64 = await nothing();        // suspend AFTER the move
+    return Result::Ok(seed + w);
+}
+```
+
+**Root cause: `mark_last_use_expr` had no `TryExpression` arm** — one more member of the `try_live` family.
+The lowering carries an aggregate parameter in an `Option` field, each state taking it out on entry and
+handing it back on the way out; a state that gave the value away must stay silent instead, which
+`needs_handback` decides from `last_use_consumes` → `mark_last_use_expr`. For `expr?` the real expression
+lives in `desugared`, not on the `?` node, so the walk fell through to its catch-all — which calls
+`name_read_in_expr` (that one DOES walk the desugar). So the mention was seen, but classified as a BORROW
+rather than a give-away. The state then appended a hand-back reading a moved-from binding: rejected as a
+use-after-move, and had it compiled it would have dropped the value a second time.
+
+Fixed by forwarding to `try_live(e)` with `by_value` preserved. The desugar's subject is the operand, so
+the existing `MatchExpression` arm classifies it exactly as it would without the `?`.
+
+This also explains the shape of the symptom set: `?` with no suspend never split into states, and a suspend
+placed BEFORE the `?` left the move in the same state as the drop — only a move landing in an earlier state
+than its drop reached the faulty hand-back.
+
+**Audited the rest of the family** rather than assuming this was the last one. Five other `NodeKind`
+dispatchers in `async_lower.cryo` have no `TryExpression` arm and each is correct as written:
+`expr_diverges` (only all-arms-diverge exhaustive matches; a `?` desugar's Ok arm yields a value, so
+`false` either way), `expr_first_use` (catch-all reaches `name_read_in_expr` and reports a READ, the right
+carry-in answer), `awaited_recv_place` (requires exactly a `CallExpression`, else null), `await_transparent`
+(defaults `false`, the conservative direction), and `top_level_assignment_index` /
+`assigned_frame_addr_root` (scan for bare `name = expr` statements; the latter delegates to
+`frame_addr_root_expr`, which already handles `?`).
+
+Guarded by `async_try_operator_moves_a_droppable_param_before_a_suspend`, which asserts the VALUE and a
+drop COUNT of exactly 1 — a wrong fix here double-drops silently rather than erroring.
+
+Whole `make test` gate green, run in pieces: unit 1798 (883 `Tests::Lang` + 915 `Tests::Stdlib`),
+compile-fail 159, projects 12/12 Windows-eligible. `selfhost-check` and the pin-delta measurement are still
+outstanding — the compiler changed in three places, so the delta is NOT known to be zero.

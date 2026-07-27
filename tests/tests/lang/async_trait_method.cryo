@@ -147,3 +147,70 @@ function async_trait_method_callable_on_a_concrete_receiver() -> Result<(), Test
     const v: i64 = future::block_on(t.read(3));
     return expect_eq(v, 5 as i64);
 }
+
+// The consumers above are all generic FUNCTIONS. A generic OWNER that
+// implements a trait is a different path: the owner's parameters are written on
+// the impl block's TARGET (`for struct AtmHolder<S>`), not on the block, so the
+// block itself carries none. A future lowered from such a method still has to be
+// generic in `S`, because the future's own impl block is what decides whether
+// sema walks its `poll` body symbolically -- and a body walked concretely while
+// `S::ReadFut::Output` is still abstract fails every check against that
+// projection instead of deferring until monomorphization resolves it.
+//
+// This is the shape every buffered connection and protocol layer has: own a
+// transport, be generic in it, and satisfy a trait so the next layer up can be
+// generic over you in turn.
+
+type trait AtmDrain {
+    async drain(mut &this, n: i64) -> i64;
+}
+
+type struct AtmHolder<S> {
+    inner: S;
+    seen:  i64;
+}
+
+implement trait AtmDrain for struct AtmHolder<S> {
+    async drain(mut &this, n: i64) -> i64 where S: AtmRead {
+        const v: i64 = await this.inner.read(n);
+        this.seen = this.seen + v;
+        return v;
+    }
+}
+
+/// Builds the owner from a bare `S` and drains it twice, reporting the value
+/// AND the accumulated field -- a write made through `mut &this` on a generic
+/// owner is lost silently rather than faulting, so it has to be observed.
+async function atm_hold_and_drain<S>(s: S) -> i64
+where S: AtmRead {
+    mut h: AtmHolder<S> = AtmHolder<S> { inner: s, seen: 0 };
+    const a: i64 = await h.drain(3);
+    const b: i64 = await h.drain(a);
+    return b * 100 + h.seen;
+}
+
+/// Consumes the owner through the SECOND trait only, which is how a protocol
+/// layer sees the connection underneath it.
+async function atm_via_drain<D>(d: D) -> i64
+where D: AtmDrain {
+    mut owned: D = d;
+    const a: i64 = await owned.drain(3);
+    return a;
+}
+
+// read(3) = 4+3 = 7 (seen 7) ; read(7) = 4+7 = 11 (seen 18) -> 11*100 + 18
+![test]
+function async_trait_method_on_a_generic_owner_normalizes_the_projection()
+        -> Result<(), TestError> {
+    const v: i64 = future::block_on(atm_hold_and_drain<AtmTicker>(AtmTicker { base: 4 }));
+    return expect_eq(v, 1118 as i64);
+}
+
+// The generic owner's trait impl must satisfy a bound in its own right.
+![test]
+function async_trait_impl_on_a_generic_owner_satisfies_a_second_bound()
+        -> Result<(), TestError> {
+    const v: i64 = future::block_on(atm_via_drain<AtmHolder<AtmTicker>>(
+        AtmHolder<AtmTicker> { inner: AtmTicker { base: 4 }, seen: 0 }));
+    return expect_eq(v, 7 as i64);
+}
