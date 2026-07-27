@@ -380,12 +380,25 @@ public:
         }
         const greg: GenericRegistry* = this.ctx.generic_registry;
         if (greg == null) { return []; }
-        mut qualified: SymbolStr = ib.target_type;
-        const target_str: string = this.intern.resolve(ib.target_type);
-        if (!target_str.contains("::")) {
-            qualified = this.ctx.qualify_symbol_sym(ib.target_type);
+        // The canonical target first, then the written name qualified against
+        // the CURRENT module. The target is written bare (`BufConn`), so
+        // qualifying it here only finds the template when the impl block sits in
+        // the module that declares it; an impl written anywhere else missed,
+        // handed back no parameters, and left the future non-generic in `S`
+        // while the body still mentioned it. A sync method recovers `S` by
+        // another route, so only `async` ones failed.
+        mut tmpl: TemplateEntry* = null;
+        if (ib.qualified_target_name.is_valid()) {
+            tmpl = greg.get_template(ib.qualified_target_name);
         }
-        const tmpl: TemplateEntry* = greg.get_template(qualified);
+        if (tmpl == null) {
+            mut qualified: SymbolStr = ib.target_type;
+            const target_str: string = this.intern.resolve(ib.target_type);
+            if (!target_str.contains("::")) {
+                qualified = this.ctx.qualify_symbol_sym(ib.target_type);
+            }
+            tmpl = greg.get_template(qualified);
+        }
         if (tmpl == null || tmpl.ast_node == null) { return []; }
         if (tmpl.node_kind == NodeKind::StructDeclaration) {
             return this.clone_generic_params((tmpl.ast_node as StructDeclNode*).generic_params);
@@ -2449,6 +2462,14 @@ public:
         } else { this.state.return_type };
         const fn_shape: i32 = this.enum_try_shape(fn_ret);
         if (fn_shape != operand_shape) {
+            // A return type that still mentions an abstract parameter cannot
+            // settle this. An `async` trait default body is walked once with its
+            // return type ALREADY rewritten to the future it lowers to
+            // (`This::…Fut`), before the walk that sees the declared output, and
+            // judging a `?` against the future would reject every one of them.
+            // Deferring is what the shape check does with any not-yet-concrete
+            // type — the concrete walk is where a `?` can be shaped at all.
+            if (this.arena.contains_generic_param(fn_ret)) { return TypeRef::invalid(); }
             if (this.symbolic.symbolic_type_unresolved(fn_ret)
                     || this.symbolic.symbolic_type_unresolved(operand_type)) {
                 return TypeRef::invalid();
