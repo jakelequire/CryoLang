@@ -759,6 +759,27 @@ public:
 
     // -- Per-function frame setup --
 
+    /// Module the body currently being checked was written in.
+    ///
+    /// Type annotations inside a body mean what that body's OWN module says.
+    /// Inside a method that is the owner's module - and the owner is what makes
+    /// this differ from the module being compiled, because a specialized method
+    /// body is re-checked while the walk sits in the module that demanded the
+    /// specialization.  Outside a method there is no owner and the module being
+    /// compiled is the right answer.
+    body_home_module(&this) -> string {
+        const owner_ns: string = this.arena.module_ns_of(this.state.current_owner_type);
+        if ((owner_ns.length() as i64) > 0) { return owner_ns; }
+        return this.ctx.namespace_display();
+    }
+
+    /// A resolution context for annotations written in the body being checked.
+    body_res_ctx(&this) -> ResolutionContext {
+        mut rc: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
+        rc.set_home_module(this.body_home_module());
+        return rc;
+    }
+
     enter_function(mut &this, func: FunctionDeclNode*, fn_this_type: TypeRef) -> void {
         this.state.locals         = HashMap<u32, TypeRef>::new();
         this.state.local_muts     = HashMap<u32, boolean>::new();
@@ -1049,7 +1070,7 @@ public:
 
         if (!var_node.has_resolved_type() && var_node.type_annotation != null && this.ctx.type_resolver != null) {
             this.prime_typeof_annotation(var_node.type_annotation);
-            mut res_ctx: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
+            mut res_ctx: ResolutionContext = this.body_res_ctx();
             this.symbolic.symbolic_bind_params(&res_ctx);
             const vtype: TypeRef = this.ctx.type_resolver.resolve(var_node.type_annotation, &res_ctx);
             if (vtype.is_valid()) { var_node.resolved_type = vtype; }
@@ -1187,7 +1208,7 @@ public:
 
     override visit(mut &this, node: DestructureDeclNode*) -> void {
         if (!node.has_resolved_type() && node.type_annotation != null && this.ctx.type_resolver != null) {
-            mut res_ctx: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
+            mut res_ctx: ResolutionContext = this.body_res_ctx();
             this.symbolic.symbolic_bind_params(&res_ctx);
             const ttype: TypeRef = this.ctx.type_resolver.resolve(node.type_annotation, &res_ctx);
             if (ttype.is_valid()) { node.resolved_type = ttype; }

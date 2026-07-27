@@ -39,6 +39,25 @@ type struct ResolutionContext {
     /// Invalid outside trait/impl scopes; using `This` there is an error.
     this_type:        TypeRef;
 
+    /// Module namespace the annotation being resolved was WRITTEN in, or "" when
+    /// unknown.
+    ///
+    /// A type annotation is syntax, and a bare leaf in it means whatever that
+    /// leaf means in ITS module - not in whichever module the resolver's ambient
+    /// scope cursor happens to be parked on. Those coincide while a pass walks
+    /// declarations in order, and diverge whenever an annotation is re-resolved
+    /// from somewhere else: sema re-deriving a callee's return type while
+    /// checking a caller, mono re-resolving a template signature while
+    /// specializing. There the ambient cursor names the CALLER's module, and a
+    /// bare leaf both modules define binds to the wrong one - silently, since
+    /// both resolutions succeed.
+    ///
+    /// Set this to the annotation's owning module at any such re-resolution and
+    /// `resolve_named` will prefer that module's own declaration of the leaf.
+    /// Empty means "resolve as before, against the ambient scope chain", so a
+    /// site that does not know its home module keeps today's behavior.
+    home_module:      string;
+
     /// Demand-free (symbolic) resolution mode. When set, `resolve_generic`
     /// builds an arena-only `InstantiatedType` (via `arena.create_instantiation`)
     /// instead of routing through `generic_registry.instantiate_for_module`. The
@@ -56,8 +75,15 @@ type struct ResolutionContext {
             import_modules:   [],
             generic_bindings: [],
             this_type:        TypeRef::invalid(),
+            home_module:      "",
             symbolic_no_demand: false,
         };
+    }
+
+    /// Declare which module the annotations resolved through this context were
+    /// written in.  See `home_module`.
+    set_home_module(mut &this, module_ns: string) -> void {
+        this.home_module = module_ns;
     }
 
     /// Add a generic binding (e.g., T -> i32).
@@ -92,6 +118,7 @@ type struct ResolutionContext {
         mut out: ResolutionContext =
             ResolutionContext::new(this.current_module, this.source_file);
         out.this_type = this.this_type;
+        out.home_module = this.home_module;
         out.symbolic_no_demand = this.symbolic_no_demand;
         for (mut i: i64 = 0; i < this.generic_bindings.length; i++) {
             out.add_binding(this.generic_bindings[i].first,
@@ -1151,6 +1178,41 @@ private:
         return current;
     }
 
+    /// Length of `ctx.home_module`, or 0 when the context is absent.
+    home_module_len(&this, ctx: ResolutionContext*) -> i64 {
+        if (ctx == null) { return 0; }
+        return ctx.home_module.length() as i64;
+    }
+
+    /// Scope of the module the annotation was written in, or an invalid scope
+    /// when the context does not name one (or it has no scope of its own).
+    home_scope_of(&this, ctx: ResolutionContext*) -> ScopeID {
+        if (this.home_module_len(ctx) == 0 || this.name_resolver == null) {
+            return ScopeID::invalid();
+        }
+        const sid: u64 = this.name_resolver.find_module_scope(ctx.home_module);
+        if (sid == 0) { return ScopeID::invalid(); }
+        return ScopeID { id: sid };
+    }
+
+    /// Canonical `<module>::<leaf>` for `name`, resolved as the annotation's OWN
+    /// module sees it whenever the context says which module that is.
+    ///
+    /// This is the step that stops annotation resolution depending on where the
+    /// compiler happens to be standing.  The ambient scope chain is consulted
+    /// only when the context cannot say - a site that has not yet been taught
+    /// its home module, which then behaves exactly as it did before.
+    canonical_type_name(&this, name: SymbolStr, ctx: ResolutionContext*) -> SymbolStr {
+        if (this.name_resolver == null) { return SymbolStr::empty(); }
+        const home: ScopeID = this.home_scope_of(ctx);
+        if (home.is_valid()) {
+            const via_home: SymbolStr =
+                this.name_resolver.resolve_type_qualified_name_from(home, name);
+            if (via_home.is_valid()) { return via_home; }
+        }
+        return this.name_resolver.resolve_type_qualified_name(name);
+    }
+
     /// Resolve a named type (user-defined or generic binding).
     ///
     /// Fallback chain:
@@ -1206,6 +1268,39 @@ private:
             return prim;
         }
 
+        // 2c. Home-module preference.  A BARE leaf in an annotation means that
+        //     leaf as its OWN module sees it.  Every lookup below this point
+        //     goes through the ambient scope chain / leaf index, both of which
+        //     answer for whatever module the resolver cursor is currently on -
+        //     the caller's, at any re-resolution site.  When the caller told us
+        //     where the annotation actually lives, the module's own declaration
+        //     of the leaf is authoritative and settles the tie before the
+        //     module-blind paths can pick the wrong same-leaf type.
+        //
+        //     Runs ahead of the ambiguity check: a leaf the HOME module declares
+        //     is not ambiguous just because the module being compiled imports a
+        //     second one under the same name.
+        //
+        //     Only for bare leaves - a written qualifier is handled
+        //     authoritatively by 3a - and only on an exact hit, so a home module
+        //     that does not declare the leaf falls through unchanged.
+        if ((this.home_module_len(ctx) > 0)
+                && this.name_resolver != null
+                && !this.name_resolver.contains_separator(name_str)) {
+            const home_qn: SymbolStr =
+                this.intern_table.intern(ctx.home_module + "::" + name_str);
+            if (this.decl_index != null) {
+                const home_di: TypeRef = this.decl_index.lookup_type(home_qn);
+                if (home_di.is_valid()) {
+                    return this.follow_alias(home_di);
+                }
+            }
+            const home_arena: TypeRef = this.arena.lookup_by_name(home_qn);
+            if (home_arena.is_valid()) {
+                return this.follow_alias(home_arena);
+            }
+        }
+
         // 2b. Ambiguity check: if this name was imported from multiple
         //     modules, emit an error telling the user to qualify it.
         if (this.name_resolver != null && this.name_resolver.is_ambiguous(name)) {
@@ -1258,9 +1353,10 @@ private:
                     return this.follow_alias(di_literal);
                 }
             }
-            // Try qualified name first
+            // Try qualified name first, canonicalized against the annotation's
+            // own module when the context names one.
             if (this.name_resolver != null) {
-                const qualified: SymbolStr = this.name_resolver.resolve_type_qualified_name(name);
+                const qualified: SymbolStr = this.canonical_type_name(name, ctx);
                 if (qualified.is_valid()) {
                     const di_found: TypeRef = this.decl_index.lookup_type(qualified);
                     if (di_found.is_valid()) {
@@ -1301,7 +1397,7 @@ private:
         //     Uses the Resolver's scope chain to get a qualified name, then
         //     looks it up in the arena.  Same bootstrap concern as step 4.
         if (this.bootstrap_mode && this.name_resolver != null) {
-            const qualified: SymbolStr = this.name_resolver.resolve_type_qualified_name(name);
+            const qualified: SymbolStr = this.canonical_type_name(name, ctx);
             if (qualified.is_valid()) {
                 found = this.arena.lookup_by_name(qualified);
                 if (found.is_valid()) {
