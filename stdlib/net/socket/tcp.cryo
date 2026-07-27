@@ -665,3 +665,44 @@ implement trait Drop for struct TcpConnect {
         }
     }
 }
+
+
+/// The raw async byte channel, so `BufConn<TcpStream>` buffers a plaintext
+/// socket with the same code that buffers a TLS session.
+///
+/// `TcpRead`/`TcpWrite` own the socket for the duration of one operation, so
+/// each method swaps a closed placeholder into the receiver while its future is
+/// in flight and swaps the real socket back before returning. Doing it here
+/// rather than in the connection is what keeps the trait about bytes: a
+/// buffered connection never holds a placeholder, and only this module knows
+/// what a closed `TcpStream` looks like.
+///
+/// The consequence, and it is deliberate: while an operation is in flight the
+/// future owns the socket, so dropping that future closes the connection.
+implement trait AsyncTransport for struct TcpStream {
+    async read_into(mut &this, buf: Array<u8>) -> Transfer {
+        mut s: TcpStream = TcpStream::from_fd(-1);
+        mem::swap<TcpStream>(&s, this);
+
+        mut io: TcpIo = await TcpRead::start(s, buf);
+
+        // Put the socket back before anything else: every exit below must leave
+        // the receiver holding its real socket rather than the placeholder.
+        mut spare: TcpStream = io.take_stream();
+        mem::swap<TcpStream>(&spare, this);
+
+        return Transfer { buf: io.take_buf(), result: io.outcome() };
+    }
+
+    async write_from(mut &this, buf: Array<u8>) -> Transfer {
+        mut s: TcpStream = TcpStream::from_fd(-1);
+        mem::swap<TcpStream>(&s, this);
+
+        mut io: TcpIo = await TcpWrite::start(s, buf);
+
+        mut spare: TcpStream = io.take_stream();
+        mem::swap<TcpStream>(&spare, this);
+
+        return Transfer { buf: io.take_buf(), result: io.outcome() };
+    }
+}
