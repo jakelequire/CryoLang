@@ -769,6 +769,7 @@ public:
         this.state.undo_kw_spans  = [];
         this.state.return_type     = func.resolved_return_type;
         this.state.return_type_ann = func.return_type_annotation;
+        this.state.async_poll_output = this.async_poll_output_of(func);
         this.state.this_type       = fn_this_type;
         this.state.this_is_mut = false;
         this.state.payload_binding_ids = [];
@@ -2246,6 +2247,44 @@ public:
         return save;
     }
 
+    /// `Poll::Ready(value)`, typed as `poll_out`. Mirrors the wrapper the async
+    /// lowering puts on every `return` it moves into a `poll` body.
+    make_poll_ready(&this, value: ExpressionNode*, poll_out: TypeRef,
+                    span: SourceSpan) -> ExpressionNode* {
+        mut scope: ScopeResolutionNode* = new ScopeResolutionNode(
+            this.intern.intern("Poll"), this.intern.intern("Ready"), span);
+        scope.set_resolved_type(poll_out);
+        mut call: CallExprNode* = new CallExprNode(scope as ExpressionNode*, span);
+        call.add_argument(value);
+        call.set_resolved_type(poll_out);
+        return call as ExpressionNode*;
+    }
+
+    /// `func`'s Output if it is the `poll` an `async fn` was lowered into,
+    /// otherwise invalid.
+    ///
+    /// The lowering moves the async function's own statements into this body, so
+    /// a construct whose legality depends on the enclosing return type — `?` —
+    /// must be judged against what the source function returned. Identified by
+    /// the three marks `declare` puts on the generated method (a synthesized
+    /// body, `Future`'s `poll`), never by shape alone: a hand-written
+    /// `-> Poll<Result<..>>` is a real function and keeps the ordinary rule.
+    async_poll_output_of(&this, func: FunctionDeclNode*) -> TypeRef {
+        if (func == null) { return TypeRef::invalid(); }
+        if (!func.is_synthesized_body) { return TypeRef::invalid(); }
+        if (!func.origin_trait.equals(this.intern.intern("Future"))) { return TypeRef::invalid(); }
+        if (!func.name.equals(this.intern.intern("poll"))) { return TypeRef::invalid(); }
+        // Read the Output off `Poll::Ready`'s payload rather than the return
+        // type's generic argument: once monomorphization has specialized it,
+        // `Poll<Output>` is a plain enum with no instantiation left to peel.
+        const e: Type* = this.types.unwrap_to_enum(func.resolved_return_type);
+        if (e == null || e.kind != TypeKind::Enum) { return TypeRef::invalid(); }
+        const et: EnumType* = e as EnumType*;
+        const ready: EnumVariantInfo* = et.get_variant(this.intern.intern("Ready"));
+        if (ready == null || ready.payload_types.length != 1i64) { return TypeRef::invalid(); }
+        return ready.payload_types[0];
+    }
+
     enum_try_shape(&this, ty: TypeRef) -> i32 {
         mut e: Type* = this.types.unwrap_to_enum(ty);
         if (e == null) {
@@ -2297,6 +2336,14 @@ public:
         } else {
             ret_value = new ScopeResolutionNode(enum_name, err_variant, span) as ExpressionNode*;
         }
+        // Inside the `poll` an `async fn` was lowered into, every `return`
+        // carries `Poll::Ready(...)`. The lowering wrapped the returns it could
+        // see, but this desugar is built after it ran — a `?` in a GENERIC body
+        // can only be shaped once its operand's `Result`/`Option` type is
+        // concrete, which is after specialization — so it wraps its own.
+        if (this.state.async_poll_output.is_valid()) {
+            ret_value = this.make_poll_ready(ret_value, this.state.return_type, span);
+        }
         mut err_arm: MatchArmNode* = new MatchArmNode(span);
         err_arm.add_pattern(err_pat as PatternNode*);
         const ret_stmt: ReturnStmtNode* = new ReturnStmtNode(ret_value, span);
@@ -2308,10 +2355,22 @@ public:
     }
 
     resolve_try_expr(mut &this, node: TryExprNode*) -> TypeRef {
+        // The operand is resolved on EVERY visit, including one that reuses an
+        // existing desugar: call-specialization and dispatch annotation both
+        // walk `operand` (never `desugared`), so a specialization whose operand
+        // went unresolved here reaches codegen with an unresolvable call.
         const saved_expected: TypeRef = this.state.expected_type;
         this.state.expected_type = TypeRef::invalid();
         const operand_type: TypeRef = this.resolve_expr(node.operand);
         this.state.expected_type = saved_expected;
+
+        // Already desugared: that desugar IS the expression from here on, and it
+        // is kept rather than rebuilt — the async lowering has since rewritten
+        // it in place (awaits hoisted out, `return`s wrapped in `Poll::Ready`,
+        // bindings alpha-renamed), and a fresh one would throw all of that away.
+        // Re-resolving it re-derives the types a specialization clone dropped.
+        if (node.desugared != null) { return this.resolve_expr(node.desugared); }
+
         if (!operand_type.is_valid()) { return TypeRef::invalid(); }
 
         const operand_shape: i32 = this.enum_try_shape(operand_type);
@@ -2323,9 +2382,14 @@ public:
                 format("the `?` operator requires a `Result` or `Option` value, but the operand has type '%s'", disp), node.span);
             return TypeRef::invalid();
         }
-        const fn_shape: i32 = this.enum_try_shape(this.state.return_type);
+        // Inside a lowered `poll`, the async function's Output is what `?`
+        // propagates out of; everywhere else it is the function's own return.
+        const fn_ret: TypeRef = if (this.state.async_poll_output.is_valid()) {
+            this.state.async_poll_output
+        } else { this.state.return_type };
+        const fn_shape: i32 = this.enum_try_shape(fn_ret);
         if (fn_shape != operand_shape) {
-            if (this.symbolic.symbolic_type_unresolved(this.state.return_type)
+            if (this.symbolic.symbolic_type_unresolved(fn_ret)
                     || this.symbolic.symbolic_type_unresolved(operand_type)) {
                 return TypeRef::invalid();
             }

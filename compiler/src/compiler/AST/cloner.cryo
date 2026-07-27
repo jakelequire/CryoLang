@@ -457,6 +457,21 @@ public:
         // post-sema clone stays self-consistent.
         if (node.desugared != null) {
             c.desugared = this.clone_expr(node.desugared);
+            // The desugared `match` takes the operand node ITSELF as its
+            // subject. Cloning the two independently splits that sharing, and
+            // the halves are read by different consumers: call specialization
+            // and dispatch annotation walk `operand`, while codegen emits
+            // `desugared`. A split clone therefore emits a call that nothing
+            // specialized — `?` on a generic free function stopped resolving at
+            // codegen. Re-point the copy so the invariant survives the clone.
+            //
+            // The async lowering deliberately breaks the sharing (it hoists an
+            // `await` out of the subject into a temp), so this only re-points
+            // when the original still holds it.
+            if (node.desugared.kind == NodeKind::MatchExpression
+                    && (node.desugared as MatchExprNode*).subject == node.operand) {
+                (c.desugared as MatchExprNode*).subject = c.operand;
+            }
         }
         c.has_error = node.has_error;
         this.result = c;
@@ -1020,14 +1035,22 @@ public:
         c.high_value   = node.high_value;
         c.enum_name    = node.enum_name;
         c.variant_name = node.variant_name;
-        // Deep-clone the elements. Leaf elements (Binding/Wildcard/Literal*)
-        // are immutable parse metadata, so sharing the inner pointer is safe;
-        // but a `Sub` element OWNS a nested PatternNode that the substituter
-        // rewrites in place, so two specializations must not alias it. Rebuild
-        // the array element-wise (also avoids aliasing the whole buffer) and
-        // recursively clone each nested sub-pattern. (Before this, nested
-        // patterns like `Some(Some(n))` aliased the template and skipped
-        // substitution -> a generic body miscompiled to invalid IR.)
+        // Deep-clone the elements. A `Sub` element OWNS a nested PatternNode
+        // that the substituter rewrites in place, so two specializations must
+        // not alias it. (Before this, nested patterns like `Some(Some(n))`
+        // aliased the template and skipped substitution -> a generic body
+        // miscompiled to invalid IR.)
+        //
+        // A `Binding` is rewritten in place too: the async lowering
+        // alpha-renames every arm binding of a body it turns into a state
+        // machine. A shared `PatternBinding` therefore lets one copy's rename
+        // reach the others, whose bodies still read the original name — the
+        // shape that made an `async` trait DEFAULT body with both an `await`
+        // and a bound arm fail to resolve that binding in every impl.
+        //
+        // The remaining leaves (Wildcard/Literal*) introduce no name and are
+        // never rewritten, so they stay shared. Rebuilding the array
+        // element-wise also avoids aliasing the whole buffer.
         mut new_elems: PatternElement[] = [];
         for (mut i: i64 = 0; i < node.elements.length; i++) {
             const el: PatternElement = node.elements[i];
@@ -1041,6 +1064,13 @@ public:
                         ns.pattern = this.clone_pattern(sub.pattern as PatternNode*) as void*;
                     }
                     new_elems.push(PatternElement::Sub(ns));
+                }
+                PatternElement::Binding(pb) => {
+                    const nb: PatternBinding* = new PatternBinding {
+                        name: pb.name,
+                        span: pb.span,
+                    };
+                    new_elems.push(PatternElement::Binding(nb));
                 }
                 _ => { new_elems.push(el); }
             }
