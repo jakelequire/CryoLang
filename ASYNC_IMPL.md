@@ -1034,7 +1034,7 @@ IR should be unchanged — verify the `win-s2` vs `win-s3` `.ll` diff at each bo
     (`A(v) | B(v)`); const-value identifier patterns (their `binding_name` cleared by name resolution) are not
     renamed. New helpers `collect_pat_binding_names` + `rn_pat_apply` (mutate `PatternBinding.name` /
     `PatternNode.binding_name` through the AST — `binding_at`/`sub_at` return the real payload pointers).
-  - **`stmt_diverges` gained a `MatchStatement` case:** a match never falls through iff `match_is_exhaustive`
+  - **`stmt_diverges` gained a `MatchStatement` case:** a match never falls through if `match_is_exhaustive`
     (via the wired `PatternResolver`) AND every arm body diverges. Without it, an async body ending in an
     exhaustive all-arms-return `match` (no `_`) tripped a spurious "must return on every path" E0600.
   - **Validation (via `future::block_on`, no turbofish):** scratchpad `async_match/` drives 11 cases → EXIT 0:
