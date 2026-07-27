@@ -47,12 +47,14 @@ not for routine judgement calls.
 | 6 | `await` in a `match`-arm guard | ✅ DONE+validated 2026-07-25 — the last rejected `await` position. Such a `match` lowers to a DECISION CHAIN (one test state per arm, a false guard falling to the next test) instead of the single dispatch, which every other `match` keeps. Subject evaluated once into a chain-owned field; fall-through arm emitted only when the arm can fail to match; `hoist_match_expr`'s matching bail-out removed so the expression form works too. 14 tests. **One sub-case rejected with a precise diagnostic rather than lowered:** an arm binding an OWNING payload out of the subject, which a later test would then re-match hollowed-out. |
 
 | 5b-tls | Async TLS (the port's prerequisite) | ✅ DONE+validated 2026-07-25. `stdlib/net/tls/future.cryo`: `TlsHandshake` / `TlsRead` / `TlsWrite` / `TlsIo`, plus `TlsConnector::connect_async` and `TlsAcceptor::accept_async`. Each `WANT_READ`/`WANT_WRITE` becomes a reactor registration rather than a spin; the interest to arm is read off the SSL error code (a read CAN want writability), and each future records the one direction it armed so its `Drop` cancels only that half. Sound only because §5a made the read/write futures own their buffer — OpenSSL requires a `WANT_*` retry to repeat the same call with the SAME arguments, and a future moves between polls. 1 test: loopback handshake + encrypted echo with **both sides as tasks on ONE `Executor`**, which the blocking TLS test cannot do (it needs a thread, or `SSL_connect` blocks before `SSL_accept` runs). |
-| 5b-port | Socket port + delete the blocking surface | ☐ NOT STARTED — and now **gated on 5c (async trait methods)**, per Jake's 2026-07-26 call. Remaining: port `net/http/{client,server}`, `net/http2/{client,server,connection}`, `net/https.cryo`, `net/ws/conn.cryo`, then delete `TcpStream::connect/read/write`, `TcpListener::bind/accept` and the blocking TLS entry points. One-way API break: every `HttpClient::get`-shaped call becomes `async`. **Re-derived consumer list (2026-07-26): far smaller than "19 files" — most of the greps that produced that count are doc-comment mentions. `net/dns.cryo`, `net/addr/ip.cryo` and `net/socket/udp.cryo` name `TcpStream` ONLY in prose and need no port.** **Scope correction (2026-07-26): there are no `AsyncRead`/`AsyncWrite` traits in the tree yet** — the async surface is concrete futures (`TcpRead`/`TcpWrite`/`TlsRead`/`TlsWrite`), so step 1 of the port is to DESIGN those traits, not to retarget onto existing ones. The shape follows from two settled constraints: the future must OWN the buffer (§5a — a caller-frame `u8*` is written through a stale address), while the transport may now stay in `mut &this` (§5d makes a receiver held across a suspend sound), i.e. `async read(mut &this, buf: Array<u8>) -> AsyncIo` handing the buffer back the way `TcpIo::take_buf()` already does. The blocking `io::Read`/`io::Write` take `u8*` / `Slice<u8>`, so they cannot simply be mirrored. ~3,300 non-comment lines of consumer code plus tests. |
+| 5b-port | Socket port + delete the blocking surface | ☐ NOT STARTED — and now **gated on 5c (async trait methods)**, per Jake's 2026-07-26 call. Remaining: port `net/http/{client,server}`, `net/http2/{client,server,connection}`, `net/https.cryo`, `net/ws/conn.cryo`, then delete `TcpStream::connect/read/write`, `TcpListener::bind/accept` and the blocking TLS entry points. One-way API break: every `HttpClient::get`-shaped call becomes `async`. **Re-derived consumer list (2026-07-26): far smaller than "19 files" — most of the greps that produced that count are doc-comment mentions. `net/dns.cryo`, `net/addr/ip.cryo` and `net/socket/udp.cryo` name `TcpStream` ONLY in prose and need no port.** **Scope correction (2026-07-26): there are no `AsyncRead`/`AsyncWrite` traits in the tree yet** — the async surface is concrete futures (`TcpRead`/`TcpWrite`/`TlsRead`/`TlsWrite`), so step 1 of the port is to DESIGN those traits, not to retarget onto existing ones. The shape follows from two settled constraints: the future must OWN the buffer (§5a — a caller-frame `u8*` is written through a stale address), while the transport may now stay in `mut &this` (§5d makes a receiver held across a suspend sound), i.e. `async read(mut &this, buf: Array<u8>) -> AsyncIo` handing the buffer back the way `TcpIo::take_buf()` already does. The blocking `io::Read`/`io::Write` take `u8*` / `Slice<u8>`, so they cannot simply be mirrored. ~3,300 non-comment lines of consumer code plus tests. **Unblocked 2026-07-26 by 5f** — `?` did not work in any `async` function, which no amount of stdlib care would have worked around; the trait shape above is now proven to compile AND run (see 5f). Writing the traits into `stdlib/` is the next step and has NOT been done. |
 | 5c | Async trait methods (the port's prerequisite) | ✅ DONE+validated 2026-07-26. First the **three blocking projection gaps — six defects** — were fixed across parser/sema/type-resolver/mono, so projection-typed dispatch, `block_on` on a projection and `await` on a projection all work. Then the feature itself: `E0364` lifted for trait methods (`virtual`/`override` still rejected), `desugar_async_trait_methods` synthesizing the implicit `<Method>Fut` + projection return, `bind_async_trait_assoc` binding each impl's own future, and E0309 taught the binding is implicit. **Default bodies included** — they cost almost nothing because `synthesize_default_trait_methods` already clones them per-impl, so no future generic over `This` was needed. 6 tests; the obsolete `E0364_async_trait_method` negative deleted. Two §9 entries. **Jake chose this** over poll-traits-plus-adapters and over de-genericizing to an `AsyncStream` union. Forced by two facts: `Http2Connection<S>` / `WebSocket<S>` hold `inner: S*` (BORROWED — `E0455` rejects that across a suspend, so the transport must be owned), and `async` on a trait method is currently rejected outright (`E0364`, parser). Design: `async read(&this, n) -> T` desugars to an implicit associated type plus a projection return (`type ReadFut; read(&this, n) -> This::ReadFut`), each impl binding it to its own synthesized future via the existing positional trait-arg sugar. Jake's scope calls (2026-07-26): default bodies ARE in scope (one future generic over `This`), and `S: AsyncRead` alone must IMPLY the future's bound — the latter already works as a consequence of the gap fixes, verified by a probe carrying only `where S: AsyncRead`. |
 
 | 5d | Receiver-pointer refresh at resume (soundness hole opened by 5c) | ✅ DONE+validated 2026-07-26. An `async` method with a `&this` / `mut &this` receiver stores the receiver's ADDRESS in a `this$recv` field of the future it lowers to, written once at construction. That contradicted §4's load-bearing invariant (no self-references ⇒ futures freely movable ⇒ **no address-stability requirement**) and design-review item 6, which says this exact shape must be `E0455`. It was also wrong for a reason stronger than movability: an owning receiver promoted across states is **taken into a fresh block-local on every poll** and handed back on the way out, so the address legitimately changes each poll. Jake chose refresh-at-resume over making the sugar consuming or adopting an address-stability contract. `lower_carrier_sm` now re-addresses `this$recv` from the enclosing frame's own storage immediately before every poll (single site — there is exactly one sub-future stash/poll point). A receiver reached through a pointer is passed through rather than addressed twice. Two shapes that cannot be re-addressed are now rejected instead of silently corrupting: a receiver that names no storage (temporary / call result), and awaiting a method future the awaited expression did not itself produce. 4 tests + 2 negatives. **Proof:** a probe polling by hand and dirtying the stack between polls returns `15`/garbage pre-fix and the correct values post-fix (pre-fix `FAILMASK=11`, post-fix `0`), and the emitted IR shows `store ptr %h, ptr %fieldptr` into `this$recv` ahead of the poll. |
 
 | 5e | Receiver refresh for a GENERIC owner (silent miscompile) | ✅ DONE+validated 2026-07-26. An `async` method on a **generic** struct lost every write made through `mut &this` — the exact shape of every consumer §5b-port has to port (`Http2Connection<S>`, `WebSocket<S>`), so the port would have been built on sand. Distinct from 5d, not a gap in it: the axis is the owner being generic, **not** the suspend (generic+sync ✅, concrete+async ✅, generic+async ❌ with or without a suspend). Cause: `awaited_recv_ptr_type` looked for the `this$recv` slot on the awaited future's arena struct, but a future generic in its owner arrives as an **`InstantiatedType`, not a `Struct`** (specialization fills its fields, and that runs after sema), so the guard rejected it and 5d's refresh was silently skipped — the method then wrote through a pointer to a block-local the frame had stopped using. Fix: resolve to the TEMPLATE via `arena.inst_generic_base` for the "is there a slot" question, and take the pointer's TYPE from the receiver place (the template's still mentions the owner's parameters, so it cannot type a node in an already-concrete caller). `PendingThenReady<i64>` is an `InstantiatedType` too and keeps being rejected — its base has no `this$recv` — which guards against over-firing. 3 tests. **Proof:** the 4 existing 5d tests only READ through the receiver and cannot catch this; the new ones observe a WRITE from the caller, and reverting the compiler change makes 2 of the 3 FAIL (`81` vs `82`) and restoring it makes them pass. IR confirms one `store ptr %"<local>", ptr %fieldptr` per awaited method receiver where the generic ones previously had none. |
+
+| 5f | `?` inside `async` (blocker found while designing §4's traits) | ✅ DONE+validated 2026-07-26. **The `?` operator did not work in ANY `async` function** — `E0235` on the simplest possible form, in the pinned compiler too, because no test and no stdlib code had ever used `?` in an `async` fn. A hard blocker on §5b-port, whose ~3,300 consumer lines are `?`-dense. Five defects: (1) the shape gate re-judged an already-typed `?` against the lowered `poll`'s `Poll<Output>` return, since sema walks each module twice and `lower` moves the body into `poll` in between; (2) `TryExpression` was a blind spot in NINE of the lowering's ten expression walkers — an uncounted `await` in a `?` operand sent the body down the no-await path, the desugar's `Err`-arm `return` was never wrapped in `Poll::Ready`, and `rn_expr` alpha-renamed the operand twice; (3) `ASTCloner` SHARED `PatternElement::Binding` pointers between a trait default body and its per-impl clones while the lowering renames them in place, so a bound `match` arm in an `async` default body with an `await` failed `E0201` in every impl; (4) a `?` in a GENERIC body is first desugared INSIDE the already-lowered `poll` (its operand type is abstract until specialization), so that desugar now wraps its own `return`; (5) cloning split the `desugared.subject IS operand` invariant that call specialization (walks `operand`) and codegen (emits `desugared`) both depend on — which broke `hashmap.cryo`'s `alloc_entry(...)?` at codegen. 10 tests. **Proves the §4 shape**: a trait with sync `buffered`/`consume` + `async fill`, async default bodies using `?`/loops/match bindings, and a `Codec<S>` that owns its transport and mutates through `mut &this` across suspends. |
 
 Legend: ☐ not started · ◐ in progress · ✅ done+validated · ⏸ blocked (note why in the Progress Log).
 
@@ -2895,3 +2897,95 @@ rather than borrow `inner: S*` — which also retires `Http2Connection::drop`'s 
 belongs to the caller" comment. E0455 names one escape hatch ("have the caller own the storage and pass
 a pointer parameter"), but it needs the transport owned outside every async frame, which a
 task-per-connection server cannot do.
+
+### 2026-07-26 — `?` inside `async` did not work AT ALL; three compiler defects fixed (unblocks §4/§5)
+
+**The finding, and why it stopped the port before it started.** The §4 trait shape was written out as a
+probe — an `AsyncRead` trait with two sync required methods, one `async` required primitive, and async
+default bodies over them — and it did not compile. Minimizing produced something much larger than a
+probe bug: **the `?` operator was rejected in EVERY `async` function.** The smallest form is
+
+```cryo
+async function outer(n: i64) -> Result<i64, IoError> {
+    const a: i64 = plain(n)?;          // error[E0235]: the `?` operator can only be
+    return Result::Ok(a);              // used in a function that returns `Result`
+}
+```
+
+with the identical body in a NON-async function compiling. It is not a regression: the pinned compiler
+rejects it identically. It had simply never been exercised — **no test under `tests/tests/lang/` used
+`?` in an `async` function**, and `stdlib/` had no `async` code to catch it. Since the §5 consumers are
+~3,300 lines of `?`-dense code, this was a hard blocker on the whole port, and working around it (an
+explicit `match` per fallible call) is exactly the "cheap workaround" §0 forbids.
+
+**Root cause 1 — the shape gate judged the WRONG function.** `cdebug` on `resolve_try_expr` showed
+`state.return_type` at the rejected `?` was `Poll<Result<i64, IoError>>`. Sema walks each module TWICE:
+pass 1 types the async function against its declared Output (the `?` resolves fine there), then `lower`
+moves those very statements into the generated `poll`; pass 2 walks that `poll`, whose return is
+`Poll<Output>`, and re-judges the same `TryExprNode` against it. So a `?` that was correct where it was
+written is rejected by the mechanical transform of the function containing it.
+
+Fixed by giving sema the source function's Output while it is inside a lowered `poll`:
+`SemaState.async_poll_output`, set in `enter_function` from `async_poll_output_of(func)`. That reads the
+Output off **`Poll::Ready`'s payload**, not the return type's generic argument — after monomorphization
+`Poll<Output>` is a plain enum with no instantiation left to peel — and it identifies a lowered `poll` by
+the three marks `declare` puts on it (`is_synthesized_body`, `origin_trait == Future`, name `poll`),
+never by shape, so a hand-written `-> Poll<Result<..>>` keeps the ordinary rule. Saved/restored around a
+lambda body, which returns for itself.
+
+**Root cause 2 — a `?` node was invisible to nine of the lowering's ten expression walkers.** Exactly the
+blind-spot class §8 of the handoff warns about, and `TryExpression` was handled in `rn_expr` only.
+Consequences, each real: `expr_await_count` did not see an `await` in a `?` operand, so `(await f())?`
+sent the function down the **no-await path** and codegen met an `await` with no state to resume;
+`rewrite_returns_expr` never reached the `return` the desugar carries in its `Err` arm, so it stayed
+un-wrapped in a body where every return must be `Poll::Ready(...)`; and `rn_expr` walked BOTH `operand`
+and `desugared`, alpha-renaming the same subtree twice, because the desugared `match` takes the operand
+node **itself** as its subject.
+
+Fixed with one helper, `try_live`, and a `TryExpression` arm in each of the nine walkers, following the
+idiom every other pass already uses (`move_check`, `drop_insertion` and codegen all read `desugared` and
+never `operand`). `hoist_expr` hoists INTO the node rather than replacing it with its desugar — a bare
+`match` left in its place has to re-derive its type from its arms after a specialization clone has
+dropped every `resolved_type`, and an arm that fails to re-type yields the SUBJECT's type, i.e. the
+un-unwrapped `Result`. That was observed, not theorised: it is what the first attempt did.
+
+**Root cause 3 — the cloner SHARED a `PatternBinding` across a trait default body and its impl clones.**
+Found while proving the trait shape: a `match` arm binding read after an `await` inside an `async` trait
+DEFAULT body failed with `E0201 cannot find value 'v'`, in the pinned compiler too. `ASTCloner`
+deliberately shared `PatternElement::Binding` pointers as "immutable parse metadata" — a premise the
+async lowering falsifies, because `rn_pat_apply` alpha-renames arm bindings **in place** (`pb.name = …`).
+So lowering any one copy renamed the binding for every copy, while each copy's arm BODY was renamed only
+in its own — the pattern bound `v$L2`, the body still read `v`. The rule this produced is exact and
+matches every observation: an async trait default body + any `await` + any NAMED arm binding fails, in
+whatever order, and a wildcard arm is fine. `Binding` is now deep-cloned like `Sub`; `Wildcard`/`Literal*`
+introduce no name and stay shared.
+
+**A fourth defect, found by the fix and fixed with it: a desugar built AFTER lowering.** In a GENERIC
+body the `?` cannot be shaped during the symbolic walk — awaiting a trait method yields
+`S::Fut::Output`, which is genuinely abstract, so `resolve_try_expr` bails before desugaring. The desugar
+is then first built inside the already-lowered `poll`, where nothing will come back to wrap its `return`.
+It now wraps its own: `build_try_desugar` emits `Poll::Ready(...)` when `async_poll_output` is valid.
+
+**And a fifth, which the first attempt exposed: cloning split an invariant two consumers depend on.**
+Reusing an existing desugar instead of rebuilding it broke `stdlib/collections/hashmap.cryo`'s
+`alloc_entry(this, h, key, value)?` with `E0636 cannot resolve function` at codegen. Call specialization
+and dispatch annotation walk `te.operand`; codegen emits `te.desugared`. Those are the same node —
+the desugared `match`'s subject IS the operand — but `ASTCloner` cloned the two halves independently, so
+a specialization emitted the copy nobody had specialized. Sema had been hiding it by rebuilding the
+desugar from the operand on every visit. The cloner now re-points the clone's subject at the clone's
+operand when the original still holds the sharing (the async lowering deliberately breaks it when it
+hoists an `await` out of the subject). `resolve_try_expr` also resolves the operand on EVERY visit,
+including one that reuses a desugar, for the same reason.
+
+**Validation.** `tests/tests/lang/async_try_operator.cryo`, 10 tests, all of which fail without these
+changes: `?` with no await, `?` in a state machine, `await` INSIDE the `?` operand, `?` in a loop, `Err`
+propagation out of a lowered `poll` (both flavours), `Option`-flavoured `?`, `?` in a trait default body,
+a `match` arm binding after an `await` in a default body, and `?` in an `async` method on a GENERIC owner
+(value and error paths, checking that the post-`?` statement did not run). Roster regenerated **by merge**
+— golden-only count 0, `git diff --numstat` = `10 0` — 1766 → 1776.
+
+**What this unblocks.** The §4 design shape now compiles AND runs: an `AsyncRead` trait with sync
+`buffered`/`consume` plus an `async fill`, async default bodies (`ensure`, `take_u16`) using `?`, loops
+and match bindings over them, and a `Codec<S>` protocol layer that OWNS its transport, mutates through
+`mut &this` across suspends, and propagates EOF as an `Err` through the whole `?` chain. §4 can be
+written against it.

@@ -1,0 +1,229 @@
+// The `?` operator inside an `async` function.
+//
+// `?` is desugared by sema into a `match` whose `Err`/`None` arm `return`s, and
+// the async lowering then moves the whole body into the generated `poll`.  Three
+// things have to line up for that to work, and each has a test here:
+//
+//   - The shape gate ("does the enclosing function return a `Result`?") must be
+//     judged against the async function's OUTPUT.  Inside the lowered `poll` the
+//     return type is `Poll<Output>`, so testing it directly rejects every `?`
+//     that was correct where it was written.
+//   - The lowering's expression walks must treat a `?` node as its desugar.  The
+//     desugar carries the `return` that has to be wrapped in `Poll::Ready`, and
+//     it may carry the `await` that decides whether the function needs a state
+//     machine at all -- an uncounted one sends the body down the no-await path.
+//   - A `?` in a GENERIC body cannot be shaped until its operand's type is
+//     concrete, which is after the lowering has already run.  Such a desugar has
+//     to wrap its own `return`, because nothing will come back to do it.
+![config(testing)]
+namespace CryoTests::Tests::Lang::AsyncTryOperator;
+
+import std::test;
+import std::core::result;
+import std::core::option;
+import std::io::error;
+import std::future;
+import std::future::ready;
+
+/// A plain fallible call, so `?` can be exercised without an `await` in it.
+function ato_plain(n: i64) -> Result<i64, IoError> {
+    if (n < 0) { return Result::Err(IoError::new(IoErrorKind::InvalidData, 0)); }
+    return Result::Ok(n);
+}
+
+/// An `async` fallible callee, so `?` can be applied to an awaited `Result`.
+async function ato_step(n: i64) -> Result<i64, IoError> {
+    const v: i64 = await PendingThenReady<i64>::new(1, n);
+    if (v < 0) { return Result::Err(IoError::new(IoErrorKind::UnexpectedEof, 0)); }
+    return Result::Ok(v + 1);
+}
+
+/// `?` in an `async` function that never awaits.
+async function ato_no_await(n: i64) -> Result<i64, IoError> {
+    const a: i64 = ato_plain(n)?;
+    return Result::Ok(a);
+}
+
+/// `?` on a synchronous operand, in a function that awaits elsewhere -- so the
+/// body IS a state machine and the desugar lands inside `poll`.
+async function ato_with_await(n: i64) -> Result<i64, IoError> {
+    const a: i64 = ato_plain(n)?;
+    const b: i64 = await PendingThenReady<i64>::new(1, 10);
+    return Result::Ok(a + b);
+}
+
+/// The `await` sits INSIDE the `?` operand, so the hoisting pass has to find it
+/// through the try node and lift it into its own suspend point.
+async function ato_await_inside(n: i64) -> Result<i64, IoError> {
+    const a: i64 = (await ato_step(n))?;
+    return Result::Ok(a * 2);
+}
+
+/// `?` with an `await` in its operand, inside a loop.
+async function ato_in_loop(n: i64) -> Result<i64, IoError> {
+    mut total: i64 = 0;
+    mut i: i64 = 0;
+    while (i < 3) {
+        total = total + (await ato_step(n))?;
+        i++;
+    }
+    return Result::Ok(total);
+}
+
+/// The `Option` flavour of `?`, whose desugar returns a bare `Option::None`.
+async function ato_option(n: i64) -> Option<i64> {
+    const src: Option<i64> = Option::Some(n);
+    const a: i64 = src?;
+    const b: i64 = await PendingThenReady<i64>::new(1, 5);
+    return Option::Some(a + b);
+}
+
+type trait AtoRead {
+    async fill(mut &this) -> Result<i64, IoError>;
+
+    /// A DEFAULT body using `?` on an awaited trait-method call. The clone this
+    /// becomes in each impl is lowered like any other `async` method.
+    async twice(mut &this) -> Result<i64, IoError> {
+        const a: i64 = (await this.fill())?;
+        const b: i64 = (await this.fill())?;
+        return Result::Ok(a + b);
+    }
+
+    /// A default body that binds a `match` arm AFTER an `await`. The arm's
+    /// binding is alpha-renamed in place by the lowering, so the clone must own
+    /// its own binding rather than share the trait's -- otherwise one copy's
+    /// rename lands in every other copy, whose body still reads the old name.
+    async bind_after_await(mut &this) -> Result<i64, IoError> {
+        const a: i64 = (await this.fill())?;
+        const o: Option<i64> = Option::Some(a);
+        mut r: i64 = 0;
+        match (o) { Option::Some(v) => { r = v; } Option::None => { } }
+        return Result::Ok(r);
+    }
+}
+
+type struct AtoCounter {
+    step:  i64;
+    calls: i64;
+}
+
+implement trait AtoRead for AtoCounter {
+    async fill(mut &this) -> Result<i64, IoError> {
+        const bump: i64 = await PendingThenReady<i64>::new(1, this.step);
+        this.calls = this.calls + 1;
+        if (this.step < 0) { return Result::Err(IoError::new(IoErrorKind::Other, 0)); }
+        return Result::Ok(bump);
+    }
+}
+
+/// A protocol layer that OWNS its transport and is GENERIC in it: the shape in
+/// which `?` cannot be desugared until specialization has made the awaited
+/// trait-method's Output concrete.
+type struct AtoCodec<S> {
+    inner:  S;
+    frames: i64;
+
+    async pump(mut &this) -> Result<i64, IoError> where S: AtoRead {
+        const v: i64 = (await this.inner.twice())?;
+        this.frames = this.frames + 1;      // must survive both suspends
+        return Result::Ok(v);
+    }
+}
+
+/// The first failure of two checks, or Ok.
+function ato_both(a: Result<(), TestError>, b: Result<(), TestError>) -> Result<(), TestError> {
+    match (a) {
+        Result::Ok(_)  => {}
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return b;
+}
+
+/// The value, or a sentinel that no test expects.
+function ato_val(r: Result<i64, IoError>) -> i64 {
+    match (r) {
+        Result::Ok(v)  => { return v; }
+        Result::Err(_) => { return -1000; }
+    }
+}
+
+![test]
+function async_try_operator_without_await() -> Result<(), TestError> {
+    return expect_eq(ato_val(future::block_on(ato_no_await(3))), 3 as i64);
+}
+
+![test]
+function async_try_operator_in_a_state_machine() -> Result<(), TestError> {
+    return expect_eq(ato_val(future::block_on(ato_with_await(3))), 13 as i64);
+}
+
+// The `await` inside the `?` operand must be counted and hoisted; if it were
+// not, the body would take the no-await path and codegen would meet an `await`
+// with no state to resume.
+![test]
+function async_try_operator_awaits_inside_its_operand() -> Result<(), TestError> {
+    return expect_eq(ato_val(future::block_on(ato_await_inside(3))), 8 as i64);
+}
+
+![test]
+function async_try_operator_inside_a_loop() -> Result<(), TestError> {
+    return expect_eq(ato_val(future::block_on(ato_in_loop(3))), 12 as i64);
+}
+
+// The `Err` path returns out of the lowered `poll`, so the desugar's `return`
+// must be wrapped in `Poll::Ready`.
+![test]
+function async_try_operator_propagates_err() -> Result<(), TestError> {
+    return ato_both(
+        expect_eq(ato_val(future::block_on(ato_no_await(-1))), -1000 as i64),
+        expect_eq(ato_val(future::block_on(ato_await_inside(-5))), -1000 as i64));
+}
+
+![test]
+function async_try_operator_option_flavour() -> Result<(), TestError> {
+    mut got: i64 = -1;
+    match (future::block_on(ato_option(7))) {
+        Option::Some(v) => { got = v; }
+        Option::None    => { got = -1; }
+    }
+    return expect_eq(got, 12 as i64);
+}
+
+![test]
+function async_try_operator_in_a_trait_default_body() -> Result<(), TestError> {
+    mut c: AtoCounter = AtoCounter { step: 4, calls: 0 };
+    const v: i64 = ato_val(future::block_on(c.twice()));
+    return ato_both(expect_eq(v, 8 as i64), expect_eq(c.calls, 2 as i64));
+}
+
+// A `match` arm binding read after an `await`, inside a trait DEFAULT body.
+// Sharing the pattern binding between the trait's copy and the impl's clone
+// made this fail to resolve the binding at all.
+![test]
+function async_try_operator_binds_a_match_arm_after_await() -> Result<(), TestError> {
+    mut c: AtoCounter = AtoCounter { step: 6, calls: 0 };
+    return expect_eq(ato_val(future::block_on(c.bind_after_await())), 6 as i64);
+}
+
+// `?` inside an `async` method on a GENERIC owner. Its operand's type is only
+// concrete after specialization, i.e. after the lowering has run, so the
+// desugar built there has to wrap its own `return`.
+![test]
+function async_try_operator_on_a_generic_owner() -> Result<(), TestError> {
+    mut c: AtoCodec<AtoCounter> =
+        AtoCodec<AtoCounter> { inner: AtoCounter { step: 4, calls: 0 }, frames: 0 };
+    const v: i64 = ato_val(future::block_on(c.pump()));
+    return ato_both(expect_eq(v, 8 as i64), expect_eq(c.frames, 1 as i64));
+}
+
+// The same generic owner on an impl whose `fill` fails: the error has to travel
+// out through the trait default's `?` and then the generic method's `?`.
+![test]
+function async_try_operator_propagates_err_through_a_generic_owner()
+        -> Result<(), TestError> {
+    mut c: AtoCodec<AtoCounter> =
+        AtoCodec<AtoCounter> { inner: AtoCounter { step: -1, calls: 0 }, frames: 0 };
+    const v: i64 = ato_val(future::block_on(c.pump()));
+    // `frames` is incremented past the `?`, so a propagated error leaves it 0.
+    return ato_both(expect_eq(v, -1000 as i64), expect_eq(c.frames, 0 as i64));
+}

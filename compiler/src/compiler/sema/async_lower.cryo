@@ -765,6 +765,26 @@ type struct AsyncLower {
         }
     }
 
+    /// The expression a `?` actually evaluates to.
+    ///
+    /// Sema replaces `expr?` with an equivalent `match` and stores it on
+    /// `desugared`; every pass downstream reads that and never the operand
+    /// (codegen emits it, move-check and drop insertion walk it), so the
+    /// lowering must too. Walking BOTH would visit the operand twice, because
+    /// the desugared `match` takes the very same operand node as its subject.
+    ///
+    /// The desugar carries a `return` in its `Err`/`None` arm and may hold an
+    /// `await` in its subject, so a walk that stopped at the `?` node would
+    /// leave that `return` unwrapped and that `await` uncounted.
+    ///
+    /// A null `desugared` means sema rejected the operand and has already
+    /// reported it; the operand is walked so the traversal stays total.
+    try_live(&this, e: ExpressionNode*) -> ExpressionNode* {
+        const t: TryExprNode* = e as TryExprNode*;
+        if (t.desugared != null) { return t.desugared; }
+        return t.operand;
+    }
+
     /// Statement half of `rewrite_returns` reached through an expression: only a
     /// `match` used as an expression puts statements — and therefore `return`s —
     /// inside an expression tree. Every other expression kind is walked purely to
@@ -772,6 +792,10 @@ type struct AsyncLower {
     rewrite_returns_expr(mut &this, e: ExpressionNode*, poll_out: TypeRef, span: SourceSpan) -> void {
         if (e == null) { return; }
         const k: NodeKind = (e as ASTNode*).kind;
+        if (k == NodeKind::TryExpression) {
+            this.rewrite_returns_expr(this.try_live(e), poll_out, span);
+            return;
+        }
         if (k == NodeKind::MatchExpression) {
             const me: MatchExprNode* = e as MatchExprNode*;
             this.rewrite_returns_expr(me.subject, poll_out, span);
@@ -847,6 +871,9 @@ type struct AsyncLower {
         const k: NodeKind = (e as ASTNode*).kind;
         if (k == NodeKind::AwaitExpression) {
             return 1i64 + this.expr_await_count((e as AwaitExprNode*).operand);
+        }
+        if (k == NodeKind::TryExpression) {
+            return this.expr_await_count(this.try_live(e));
         }
         if (k == NodeKind::BinaryExpression) {
             const b: BinaryExprNode* = e as BinaryExprNode*;
@@ -1288,6 +1315,9 @@ type struct AsyncLower {
         if (k == NodeKind::AwaitExpression) {
             return this.name_read_in_expr((e as AwaitExprNode*).operand, name);
         }
+        if (k == NodeKind::TryExpression) {
+            return this.name_read_in_expr(this.try_live(e), name);
+        }
         if (k == NodeKind::MatchExpression) {
             const me: MatchExprNode* = e as MatchExprNode*;
             if (this.name_read_in_expr(me.subject, name)) { return true; }
@@ -1463,6 +1493,15 @@ type struct AsyncLower {
         if (k == NodeKind::AwaitExpression) {
             const aw: AwaitExprNode* = e as AwaitExprNode*;
             aw.operand = this.subst_name_expr(aw.operand, name, field, struct_ref, ty, span);
+            return e;
+        }
+        if (k == NodeKind::TryExpression) {
+            mut tr: TryExprNode* = e as TryExprNode*;
+            if (tr.desugared != null) {
+                tr.desugared = this.subst_name_expr(tr.desugared, name, field, struct_ref, ty, span);
+            } else {
+                tr.operand = this.subst_name_expr(tr.operand, name, field, struct_ref, ty, span);
+            }
             return e;
         }
         if (k == NodeKind::MatchExpression) {
@@ -2841,6 +2880,9 @@ type struct AsyncLower {
         if (k == NodeKind::AwaitExpression) {
             return this.expr_has_free_edge((e as AwaitExprNode*).operand, break_only);
         }
+        if (k == NodeKind::TryExpression) {
+            return this.expr_has_free_edge(this.try_live(e), break_only);
+        }
         return false;
     }
 
@@ -3524,6 +3566,9 @@ type struct AsyncLower {
         if (k == NodeKind::AwaitExpression) {
             return this.frame_addr_root_expr(sm, (e as AwaitExprNode*).operand);
         }
+        if (k == NodeKind::TryExpression) {
+            return this.frame_addr_root_expr(sm, this.try_live(e));
+        }
         if (k == NodeKind::MatchExpression) {
             const me: MatchExprNode* = e as MatchExprNode*;
             const s: SymbolStr = this.frame_addr_root_expr(sm, me.subject);
@@ -3998,6 +4043,23 @@ type struct AsyncLower {
         const k: NodeKind = (e as ASTNode*).kind;
         const span: SourceSpan = (e as ASTNode*).span;
 
+        // Hoist INTO the `?` node rather than replacing it with its desugar: the
+        // node stays the one that types the expression, and sema derives that
+        // type from the operand's `Result`/`Option` shape. A bare `match` left in
+        // its place would have to re-derive the same type from its arms after a
+        // specialization clone has dropped every `resolved_type` — and an arm
+        // that fails to re-type yields the SUBJECT's type, i.e. the un-unwrapped
+        // `Result`.
+        if (k == NodeKind::TryExpression) {
+            mut tr: TryExprNode* = e as TryExprNode*;
+            if (tr.desugared != null) {
+                tr.desugared = this.hoist_expr(tr.desugared, pre);
+            } else {
+                tr.operand = this.hoist_expr(tr.operand, pre);
+            }
+            return e;
+        }
+
         if (k == NodeKind::AwaitExpression) {
             mut aw: AwaitExprNode* = e as AwaitExprNode*;
             aw.operand = this.hoist_expr(aw.operand, pre);
@@ -4365,6 +4427,9 @@ type struct AsyncLower {
     /// operand is rewritten.
     hoist_toplevel(mut &this, e: ExpressionNode*, pre: HoistPre*) -> ExpressionNode* {
         if (e == null) { return null; }
+        // A `?` is never the top-level `await` shape the state machine explodes:
+        // its own `await` sits inside the operand and must be lifted out, which
+        // is `hoist_expr`'s TryExpression arm.
         if ((e as ASTNode*).kind == NodeKind::AwaitExpression) {
             mut aw: AwaitExprNode* = e as AwaitExprNode*;
             aw.operand = this.hoist_expr(aw.operand, pre);
@@ -4642,9 +4707,9 @@ type struct AsyncLower {
             this.rn_expr(ctx, (e as AwaitExprNode*).operand); return;
         }
         if (k == NodeKind::TryExpression) {
-            const tr: TryExprNode* = e as TryExprNode*;
-            this.rn_expr(ctx, tr.operand);
-            this.rn_expr(ctx, tr.desugared);
+            // Only the live half: the desugared `match` holds the operand as its
+            // subject, so renaming both would alpha-rename that subtree twice.
+            this.rn_expr(ctx, this.try_live(e));
             return;
         }
         if (k == NodeKind::MatchExpression) {
