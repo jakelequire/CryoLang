@@ -795,3 +795,90 @@ function async_trait_default_body_driven_twice_from_a_loop() -> Result<(), TestE
     expect_eq(n, 44 as i64)?;
     return expect_eq(ASS_DROPS, 1 as i64);
 }
+
+// ============================================================================
+// Zero-sized types in a future's Output
+// ============================================================================
+//
+// A type with no fields is legitimately zero-sized, but `size_bytes() == 0` was
+// also the sentinel for "this type's layout has not been computed yet". An enum
+// with a zero-sized payload variant therefore deferred its own layout forever
+// and kept size 0 — and any enum NESTING it, such as the `Poll<T>` every future
+// returns, then sized its payload from that 0.
+//
+// The result was silent: `Poll<Result<i64, Empty>>` lowered to a payload of
+// `[0 x i8]`, so the value came back as garbage or the discriminant read out of
+// bounds. It compiled cleanly, which is why this needs asserted VALUES rather
+// than a compile check. `Elapsed` in `future::combinator` carries a `deadline`
+// field for exactly this reason; that workaround should no longer be load-bearing.
+
+/// No fields: legitimately zero-sized.
+type struct AssEmpty { }
+
+/// CONTROL: the same shape one field wider, which never had the bug.
+type struct AssSized { pad: i64; }
+
+async function ass_zst_payload() -> Result<i64, AssEmpty> {
+    const z: u64 = await Ready<u64>::new(5);
+    return Result::Ok(z as i64);
+}
+
+async function ass_sized_payload() -> Result<i64, AssSized> {
+    const z: u64 = await Ready<u64>::new(5);
+    return Result::Ok(z as i64);
+}
+
+/// The Output IS the zero-sized type, rather than carrying one.
+async function ass_zst_output() -> AssEmpty {
+    const z: u64 = await Ready<u64>::new(5);
+    return AssEmpty { };
+}
+
+![test]
+function async_zero_sized_type_in_output_payload() -> Result<(), TestError> {
+    const r: Result<i64, AssEmpty> = future::block_on(ass_zst_payload());
+    const n: i64 = match (r) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { -1 as i64 }
+    };
+    return expect_eq(n, 5 as i64);
+}
+
+![test]
+function async_sized_type_in_output_payload() -> Result<(), TestError> {
+    const r: Result<i64, AssSized> = future::block_on(ass_sized_payload());
+    const n: i64 = match (r) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { -1 as i64 }
+    };
+    return expect_eq(n, 5 as i64);
+}
+
+![test]
+function async_zero_sized_type_as_the_whole_output() -> Result<(), TestError> {
+    const e: AssEmpty = future::block_on(ass_zst_output());
+    return expect_eq(1 as i64, 1 as i64);
+}
+
+/// CONTROL, sync: the same enum shapes off the async path entirely, so a red
+/// cell above versus a green one here separates the lowering from the layout.
+type enum AssEither {
+    Num(i64);
+    Nothing(AssEmpty);
+}
+
+![test]
+function sync_zero_sized_payload_enum_round_trips() -> Result<(), TestError> {
+    const e: AssEither = AssEither::Num(5);
+    const n: i64 = match (e) {
+        AssEither::Num(v)     => { v }
+        AssEither::Nothing(_) => { -1 as i64 }
+    };
+    expect_eq(n, 5 as i64)?;
+    const r: Result<i64, AssEmpty> = Result::Ok(5);
+    const m: i64 = match (r) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { -1 as i64 }
+    };
+    return expect_eq(m, 5 as i64);
+}

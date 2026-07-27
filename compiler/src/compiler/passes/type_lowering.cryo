@@ -368,6 +368,15 @@ type struct TypeLoweringPasses {
     /// yet", parent-struct lowering treats the legitimately-zero field as
     /// pending and stays deferred forever, leaving the parent at size=0
     /// and breaking enum payload sizing downstream.
+    ///
+    /// `computed_align` is the sentinel every `compute_*_layout` already guards
+    /// itself with, and each of them sets it non-zero, so it is the one reliable
+    /// answer for every layout-bearing kind. Ask ALL of them rather than a
+    /// hand-picked few: a kind left off this list is reported pending forever, so
+    /// its CONTAINER never gets a layout either, and anything NESTING that
+    /// container is then sized from the container's uncomputed 0. That is a
+    /// silent wrong size — no compile error, just a payload read from the wrong
+    /// offset — so the cost of an omission here is not a deferred build.
     static layout_settled(ty: Type*) -> boolean {
         if (ty == null) { return true; }
         if (ty.size_bytes() > 0) { return true; }
@@ -378,6 +387,33 @@ type struct TypeLoweringPasses {
         if (ty.kind == TypeKind::Class) {
             const cl: ClassType* = ty as ClassType*;
             return cl.computed_align > 0;
+        }
+        if (ty.kind == TypeKind::Enum) {
+            const en: EnumType* = ty as EnumType*;
+            return en.computed_align > 0;
+        }
+        if (ty.kind == TypeKind::Tuple) {
+            const tt: TupleType* = ty as TupleType*;
+            return tt.computed_align > 0;
+        }
+        if (ty.kind == TypeKind::Optional) {
+            const ot: OptionalType* = ty as OptionalType*;
+            return ot.computed_align > 0;
+        }
+        if (ty.kind == TypeKind::TypeAlias) {
+            const al: TypeAliasType* = ty as TypeAliasType*;
+            return al.computed_align > 0;
+        }
+        if (ty.kind == TypeKind::InstantiatedType) {
+            const it: InstantiatedType* = ty as InstantiatedType*;
+            return it.computed_align > 0;
+        }
+        if (ty.kind == TypeKind::Array) {
+            const arr: ArrayType* = ty as ArrayType*;
+            // Only a fixed array carries a layout; a dynamic one is a fat
+            // pointer and is always sized.
+            if (!arr.is_fixed()) { return true; }
+            return arr.computed_align > 0;
         }
         return !TypeLoweringPasses::needs_layout(ty);
     }
@@ -648,13 +684,17 @@ type struct TypeLoweringPasses {
             const variant: EnumVariantInfo* = &en.variants[i];
             if (!variant.has_payload()) { continue; }
 
-            // Defer until every payload type has a computed layout (the
-            // driver re-runs this pass to a fixpoint).  Checked on the RAW
-            // arena node, exactly as before the math was unified below.
+            // Defer until every payload type has a computed layout (the driver
+            // re-runs this pass to a fixpoint).  `size_bytes() == 0` cannot ask
+            // that question: it is equally true of a payload whose turn has not
+            // come and of one that is legitimately empty.  A zero-sized payload
+            // read the second way defers this enum forever, so it keeps size 0 —
+            // which then silently mis-sizes every enum nesting IT, because the
+            // payload sizing below reads that 0 as a real width.
             for (mut j: i64 = 0; j < variant.payload_types.length; j++) {
                 const pt: Type* = arena.lookup(variant.payload_types[j].id);
                 if (pt == null) { continue; }
-                if (pt.size_bytes() == 0 && TypeLoweringPasses::needs_layout(pt)) { return false; }
+                if (!TypeLoweringPasses::layout_settled(pt)) { return false; }
             }
 
             // Per-field offset/size math lives in the single layout

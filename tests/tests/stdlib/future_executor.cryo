@@ -49,3 +49,52 @@ function thread_spawn_returns_the_thread_join_handle() -> Result<(), TestError> 
     const v: i64 = th.join();
     return expect_eq(v, 42 as i64);
 }
+
+/// `Executor::block_on` instantiated at BOTH a unit and a non-unit `Output`,
+/// with the UNIT one written FIRST.
+///
+/// A generic method's return type is looked up by NAME, and once the method has
+/// been instantiated at several types that lookup can hand back a SIBLING
+/// specialization's return. Sema re-derives the right one per call, but only
+/// adopts the re-derivation for a CANONICAL return type — one whose arena
+/// TypeID re-derivation cannot change. `()` was missing from that set, so the
+/// correct `()` was computed and then thrown away, leaving the unit call typed
+/// as the sibling's `i64`. Codegen then emitted a NAMED call to a
+/// void-returning function and LLVM rejected the module outright.
+///
+/// The ordering matters and is the whole point: writing the non-unit call first
+/// compiles either way. So does either call on its own. Keep all three shapes.
+async function fe_unit_root() -> void {
+    const z: u64 = await Ready<u64>::new(1);
+}
+
+async function fe_int_root() -> i64 {
+    const z: u64 = await Ready<u64>::new(2);
+    return z as i64;
+}
+
+![test]
+function block_on_at_unit_then_non_unit_output() -> Result<(), TestError> {
+    mut ex: Executor = Executor::new();
+    ex.block_on(fe_unit_root());
+    const n: i64 = ex.block_on(fe_int_root());
+    ex.drop();
+    return expect_eq(n, 2 as i64);
+}
+
+![test]
+function block_on_at_non_unit_then_unit_output() -> Result<(), TestError> {
+    mut ex: Executor = Executor::new();
+    const n: i64 = ex.block_on(fe_int_root());
+    ex.block_on(fe_unit_root());
+    ex.drop();
+    return expect_eq(n, 2 as i64);
+}
+
+![test]
+function block_on_at_unit_output_alone() -> Result<(), TestError> {
+    mut ex: Executor = Executor::new();
+    ex.block_on(fe_unit_root());
+    ex.drop();
+    return expect_eq(1 as i64, 1 as i64);
+}

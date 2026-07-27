@@ -2218,14 +2218,27 @@ tower would say nothing new. `Timeout` polls the OPERATION before the deadline, 
 becomes ready on the same poll the timer fires reports its value rather than a timeout; it did
 complete, and for an I/O future the side effect has already happened.
 
-**Compiler bug #1 — a zero-sized type as a `Future`'s `Output` payload MISCOMPILES.** Discriminated
-minimally: `Result<i64, Empty>` as a plain value is correct, and `Result<T, NonEmpty>` as a future's
-`Output` is correct, but `Result<T, Empty>` as a future's `Output` hands back a garbage `T` and a
-misread discriminant (a `Timeout` that should have said `Err` said `Ok` with junk). Unit `()` is
-fine, so unit is special-cased somewhere a user-declared empty struct is not. Worked around
-*by design*: `Elapsed` carries the monotonic deadline it missed, which is non-zero-sized and more
-useful than the empty marker it would otherwise be. **Do not simplify `Elapsed` back to
-`type struct Elapsed { }`.**
+**Compiler bug #1 — a zero-sized type as a `Future`'s `Output` payload MISCOMPILES. ✅ FIXED
+2026-07-27.** Discriminated minimally: `Result<i64, Empty>` as a plain value is correct, and
+`Result<T, NonEmpty>` as a future's `Output` is correct, but `Result<T, Empty>` as a future's `Output`
+handed back a garbage `T` and a misread discriminant (a `Timeout` that should have said `Err` said
+`Ok` with junk).
+
+Root cause was NOT async and not unit-vs-empty-struct special-casing. `compute_enum_layout` deferred
+an enum whose payload type still had `size_bytes() == 0`, using that as "layout not computed yet".
+For a legitimately zero-sized payload that is *permanently* true, so `Result<i64, Empty>` never got a
+layout and kept size 0. `TypeMapper::map_enum` recomputes from the leaf field types, which is why one
+level looked fine — but the OUTER `Poll<Result<i64, Empty>>` read the inner enum's uncomputed 0 as a
+real width and lowered its payload to `[0 x i8]`.
+
+`layout_settled` already existed for exactly this hazard (its doc comment describes it) but was only
+consulted by struct lowering, and only knew about Struct and Class. It now covers every layout-bearing
+kind, and `compute_enum_layout` asks it instead of testing the size. Tests:
+`async_zero_sized_type_in_output_payload` + a sized control + a sync control, in
+`async_stress_shapes.cryo`.
+
+`Elapsed` keeping its `deadline` field is now a design choice rather than a workaround — it is more
+useful than an empty marker — but it is no longer load-bearing.
 
 **Compiler bug #2 — nested-bound inference gap; `try_join` is NOT shipped because of it.**
 
@@ -2444,11 +2457,22 @@ lines) is generic over `S: Read + Write` with no concrete socket use, so it need
 #### Also found, not fixed
 
 - **`Executor::block_on` mis-codegens when one program instantiates it at BOTH a unit `Output` and a
-  non-unit one, in that order.** `%calltmp = call void @...` — a void call given a name, which LLVM
-  rejects (`Instruction has a name, but provides a void value!`). Order-dependent: the unit
-  instantiation FIRST fails, i32-first compiles. Minimal repro is an `async fn` returning `void` and
-  one returning `i32`, both driven through `ex.block_on` in one function. Pre-existing; the
-  free-function `future::block_on` is unaffected (its unit case is covered by the suite).
+  non-unit one, in that order. ✅ FIXED 2026-07-27.** `%calltmp = call void @...` — a void call given
+  a name, which LLVM rejects (`Instruction has a name, but provides a void value!`). Order-dependent:
+  the unit instantiation FIRST failed, i32-first compiled, and either alone compiled.
+
+  Codegen was not at fault, and neither was mono — the callee was mangled correctly (`$Ru`, specialized
+  at unit) in both orders. Sema was handing the call node the SIBLING specialization's return type. A
+  generic method's return is looked up by NAME, and once the method exists at several instantiations
+  that lookup can return another one's; `call_resolver` re-derives the right type per call and then
+  decides whether to adopt it. It only adopted a CANONICAL return — one whose arena TypeID cannot
+  change under re-derivation — and the accepted set was Int/Float/Bool/Char. So the re-derivation
+  produced the correct `()`, the adoption test rejected it for not being a scalar, and the leaked
+  `i64` stayed on a call whose callee returns void.
+
+  `generic_scalar_return` is now `generic_canonical_return` and accepts Unit/Void/Never alongside the
+  scalars. Compound / instantiated returns stay excluded for the original reason (re-deriving them
+  mints a distinct TypeID from mono's). Tests: all three orderings in `future_executor.cryo`.
 - **`PendingThenReady` returns `Pending` without waking**, so it cannot be driven by a real
   `Executor` — only by `future::block_on`, which re-polls immediately. Worth a doc note; it silently
   turns an Executor-based test into a hang or a "root future did not complete" panic.
@@ -3409,3 +3433,55 @@ Calling `.drop()` explicitly on a FIELD of a live owner that still has drop glue
 twice — the owner's glue drops the field again. It behaves identically in SYNC code, so it is the known
 partial-move tracking limit rather than anything to do with suspension, and is out of scope here. It is
 worth knowing because it looks exactly like an async carrier bug when it happens inside an `async fn`.
+
+---
+
+### 2026-07-27 (later) — Two codegen-visible defects closed: ZST enum payloads, and the unit/non-unit `block_on` leak
+
+Both were open items carried by every recent handoff; both are fixed at the root and test-guarded.
+Neither is in `async_lower.cryo` — they sit under it, which is why the async work kept tripping on them.
+
+#### Zero-sized payload → wrong enum layout (the SILENT one)
+
+`size_bytes() == 0` was doing double duty: "layout not computed yet" and "computed, and genuinely
+empty". `compute_enum_layout` deferred on the first meaning, so any enum with a legitimately zero-sized
+payload variant deferred forever and kept size 0. One level of nesting hid it — `TypeMapper::map_enum`
+recomputes from the leaf field types, so `Result<i64, Empty>` itself lowered correctly — but the outer
+`Poll<Result<i64, Empty>>` read the inner enum's uncomputed 0 as a real width and emitted `[0 x i8]`.
+Compiles clean, returns garbage.
+
+`layout_settled` already existed for this hazard, with a doc comment describing it, but was consulted
+only by struct lowering and only knew Struct and Class. It now answers for every layout-bearing kind
+off the `computed_align` sentinel that each `compute_*_layout` already guards itself with, and
+`compute_enum_layout` asks it instead of testing the size. Widening it is the point: a kind left off
+that list is reported pending forever, so its container never gets a layout, and anything nesting the
+container is then sized from a 0 — silently.
+
+#### Sibling-specialization leak on a unit return (the LOUD one)
+
+`ex.block_on(unit_task()); ex.block_on(int_task());` failed to build; the same two lines in the other
+order compiled, and either alone compiled. The callee mangling was right in both orders, so mono was
+fine — sema was putting the sibling's `i64` on the unit call's node. `call_resolver` already knows this
+leak class (its comment names `next_range<u64>` reading `next_range<i64>`'s `i64`) and re-derives the
+type per call, but only ADOPTS the re-derivation when the result is canonical, and the accepted set
+omitted unit. So the right answer was computed and discarded. `generic_scalar_return` →
+`generic_canonical_return`, now accepting Unit/Void/Never; compound returns stay excluded for the
+original arena-TypeID reason.
+
+#### Tests
+
+`async_stress_shapes.cryo` 31 → 35 (ZST payload, sized control, ZST as the whole Output, sync control);
+`future_executor.cryo` 2 → 5 (all three orderings — unit-first, non-unit-first, unit alone — because
+only one of them ever failed and a single test would not have caught it).
+
+Red-before confirmed: the pinned pre-fix compiler cannot BUILD the suite with these tests, failing with
+exactly `Instruction has a name, but provides a void value!`. The ZST case was confirmed separately on
+a probe (garbage payload, then an `abort` out of a `match` whose discriminant matched no arm).
+
+#### Method note
+
+Both were found by reading emitted IR against a control, not by reasoning about the passes. The ZST bug
+showed up as a one-line type diff (`{ i32, [0 x i8] }` vs `{ i32, [2 x i64] }`); the leak showed up by
+printing the call node's resolved type under `--debug` in both orderings and seeing `Int` where the
+working order said `Unit`. In both cases the fix location was then obvious, and in both cases a comment
+already in the file described the hazard — the guard just did not cover the case.
