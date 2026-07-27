@@ -1,0 +1,450 @@
+///! AsyncRead / AsyncWrite -- the default bodies, against in-memory doubles.
+///!
+///! Hermetic: the doubles never touch a socket, so these need no reactor and
+///! run under `future::block_on`. `MockSource::chunk` is deliberately tiny so a
+///! read of any size takes SEVERAL fills; that is what grows the buffer and
+///! moves its heap block, which is the condition a stale `buffered()` slice
+///! would need to go wrong. A default body that cached the slice across its
+///! `await` would read freed memory here rather than pass by luck.
+///!
+///! `MockSource` also counts fills, so a default body that over-reads (filling
+///! when it already had enough buffered) is visible as a count, not just as a
+///! wrong answer.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::IoAsyncTraits;
+
+import std::core::result;
+import std::core::option;
+import std::core::slice;
+import std::collections::str;
+import std::collections::string;
+import std::collections::array;
+import std::io::error;
+import std::io::async_traits;
+import std::future;
+import std::future::ready;
+import std::test::error;
+import std::test::assert;
+
+// ============================================================================
+// In-memory doubles
+// ============================================================================
+
+/// A scripted byte source handing out at most `chunk` bytes per fill.
+type struct MockSource {
+    data:  Array<u8>;
+    pos:   u64;
+    buf:   Array<u8>;
+    rpos:  u64;
+    chunk: u64;
+    fills: i64;
+
+    static of(text: string, chunk: u64) -> MockSource {
+        mut d: Array<u8> = Array<u8>::new();
+        const b: Slice<u8> = Str::new(text).as_bytes();
+        mut i: u64 = 0;
+        while (i < b.length()) {
+            match (b.get(i)) {
+                Option::Some(byte) => { d.push(byte); }
+                Option::None       => { }
+            }
+            i = i + 1;
+        }
+        return MockSource { data: d, pos: 0, buf: Array<u8>::new(), rpos: 0,
+                            chunk: chunk, fills: 0 };
+    }
+
+    /// Append a length-prefixed record: 2-byte big-endian length, then the
+    /// payload. Built byte by byte rather than from a `string` literal because
+    /// such a header contains NUL bytes, and a C string ends at the first one.
+    push_record(mut &this, text: string) -> void {
+        const b: Slice<u8> = Str::new(text).as_bytes();
+        const len: u64 = b.length();
+        this.data.push((len >> 8) as u8);
+        this.data.push(len as u8);
+        mut i: u64 = 0;
+        while (i < len) {
+            match (b.get(i)) {
+                Option::Some(byte) => { this.data.push(byte); }
+                Option::None       => { }
+            }
+            i = i + 1;
+        }
+    }
+
+    drop(mut &this) -> void {
+        this.data.drop();
+        this.buf.drop();
+    }
+}
+
+implement trait AsyncRead for MockSource {
+    /// Suspends on every call, so each default body is resumed across at least
+    /// one state boundary rather than running straight through.
+    async fill(mut &this) -> Result<u64, IoError> {
+        const _tick: i64 = await PendingThenReady<i64>::new(1, 0);
+        this.fills = this.fills + 1;
+        mut take: u64 = this.data.length() - this.pos;
+        if (take > this.chunk) { take = this.chunk; }
+        mut i: u64 = 0;
+        while (i < take) {
+            match (this.data.get(this.pos + i)) {
+                Option::Some(byte) => { this.buf.push(byte); }
+                Option::None       => { }
+            }
+            i = i + 1;
+        }
+        this.pos = this.pos + take;
+        return Result::Ok(take);
+    }
+
+    buffered(&this) -> Slice<u8> {
+        return Slice<u8>::from_raw(this.buf.as_ptr() + this.rpos,
+                                   this.buf.length() - this.rpos);
+    }
+
+    consume(mut &this, count: u64) -> void {
+        this.rpos = this.rpos + count;
+    }
+}
+
+/// A sink that records everything flushed to it and counts the flushes, so
+/// "queue is synchronous, one suspension per flush" is observable.
+type struct MockSink {
+    out:     Array<u8>;
+    sent:    Array<u8>;
+    flushes: i64;
+
+    static new() -> MockSink {
+        return MockSink { out: Array<u8>::new(), sent: Array<u8>::new(), flushes: 0 };
+    }
+
+    drop(mut &this) -> void {
+        this.out.drop();
+        this.sent.drop();
+    }
+}
+
+implement trait AsyncWrite for MockSink {
+    pending(mut &this) -> Array<u8>* { return &this.out; }
+
+    async flush(mut &this) -> Result<(), IoError> {
+        const _tick: i64 = await PendingThenReady<i64>::new(1, 0);
+        this.flushes = this.flushes + 1;
+        mut i: u64 = 0;
+        while (i < this.out.length()) {
+            match (this.out.get(i)) {
+                Option::Some(byte) => { this.sent.push(byte); }
+                Option::None       => { }
+            }
+            i = i + 1;
+        }
+        this.out.clear();
+        return Result::Ok(());
+    }
+}
+
+/// A protocol layer that OWNS its transport and is generic in it -- the shape
+/// every ported socket consumer takes. `seen` is written through `mut &this`
+/// across a suspend on a GENERIC owner, which is the case a missing receiver
+/// refresh silently drops.
+type struct MockLayer<S> {
+    inner: S;
+    seen:  u64;
+
+    async next_record(mut &this) -> Result<Array<u8>, IoError> where S: AsyncRead {
+        (await this.inner.ensure(2))?;
+        const head: Slice<u8> = this.inner.buffered();
+        mut len: u64 = 0;
+        match (head.get(0)) { Option::Some(b) => { len = (b as u64) << 8; } Option::None => { } }
+        match (head.get(1)) { Option::Some(b) => { len = len | (b as u64); } Option::None => { } }
+        this.inner.consume(2);
+        mut payload: Array<u8> = (await this.inner.read_exact(len))?;
+        this.seen = this.seen + payload.length();
+        return Result::Ok(payload);
+    }
+}
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+function iat_bytes_eq(a: &Array<u8>, text: string) -> boolean {
+    const b: Slice<u8> = Str::new(text).as_bytes();
+    if (a.length() != b.length()) { return false; }
+    mut i: u64 = 0;
+    while (i < a.length()) {
+        mut x: u8 = 0;
+        mut y: u8 = 1;
+        match (a.get(i)) { Option::Some(v) => { x = v; } Option::None => { } }
+        match (b.get(i)) { Option::Some(v) => { y = v; } Option::None => { } }
+        if (x != y) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+function iat_both(a: Result<(), TestError>, b: Result<(), TestError>) -> Result<(), TestError> {
+    match (a) {
+        Result::Ok(_)  => { return b; }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+}
+
+// ============================================================================
+// AsyncRead
+// ============================================================================
+
+/// `ensure` leaves the bytes buffered for an in-place read, and stops filling
+/// as soon as it has enough.
+async function iat_ensure() -> i64 {
+    mut src: MockSource = MockSource::of("0123456789", 3);
+    match (await src.ensure(5)) {
+        Result::Ok(_)  => { }
+        Result::Err(_) => { return -1; }
+    }
+    // 2 fills of 3 reach 6 >= 5; a third would mean it over-read.
+    if (src.fills != 2) { return -2; }
+    return src.buffered().length() as i64;
+}
+
+![test]
+function async_read_ensure_buffers_without_over_reading() -> Result<(), TestError> {
+    return expect_eq(future::block_on(iat_ensure()), 6 as i64);
+}
+
+/// `read_exact` spanning many fills, then `skip`, then a short stream.
+async function iat_exact_skip_eof() -> i64 {
+    mut src: MockSource = MockSource::of("0123456789ABCDEF", 3);
+    mut a: Array<u8> = match (await src.read_exact(10)) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { return -1; }
+    };
+    if (!iat_bytes_eq(&a, "0123456789")) { return -2; }
+    match (await src.skip(4)) {
+        Result::Ok(_)  => { }
+        Result::Err(_) => { return -3; }
+    }
+    mut rest: Array<u8> = match (await src.read_exact(2)) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { return -4; }
+    };
+    if (!iat_bytes_eq(&rest, "EF")) { return -5; }
+    // Past the end: a defined UnexpectedEof, not a hang and not a short read.
+    match (await src.read_exact(1)) {
+        Result::Ok(_)  => { return -6; }
+        Result::Err(e) => {
+            match (e.kind) {
+                IoErrorKind::UnexpectedEof => { }
+                _ => { return -7; }
+            }
+        }
+    }
+    return 1;
+}
+
+![test]
+function async_read_exact_skip_and_eof() -> Result<(), TestError> {
+    return expect_eq(future::block_on(iat_exact_skip_eof()), 1 as i64);
+}
+
+/// CRLF line framing, one byte per fill -- the HTTP/1 header path.
+async function iat_lines() -> i64 {
+    mut src: MockSource = MockSource::of("GET / HTTP/1.1\r\nHost: x\r\n\r\nBODY", 1);
+    mut l1: String = match (await src.read_line(1024)) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { return -1; }
+    };
+    if (l1.as_str() != Str::new("GET / HTTP/1.1")) { return -2; }
+    mut l2: String = match (await src.read_line(1024)) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { return -3; }
+    };
+    if (l2.as_str() != Str::new("Host: x")) { return -4; }
+    // The blank line that ends a header block.
+    mut l3: String = match (await src.read_line(1024)) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { return -5; }
+    };
+    if (!l3.is_empty()) { return -6; }
+    // The body continues from the SAME buffer -- no bytes lost at the handover.
+    mut tail: Array<u8> = match (await src.read_some(64)) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { return -7; }
+    };
+    if (!iat_bytes_eq(&tail, "B")) { return -8; }
+    return 1;
+}
+
+![test]
+function async_read_line_strips_crlf_and_keeps_the_tail() -> Result<(), TestError> {
+    return expect_eq(future::block_on(iat_lines()), 1 as i64);
+}
+
+/// `read_some` at EOF is an empty result, not an error -- the terminating
+/// condition of a streaming copy.
+async function iat_read_some_eof() -> i64 {
+    mut src: MockSource = MockSource::of("ab", 8);
+    mut first: Array<u8> = match (await src.read_some(64)) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { return -1; }
+    };
+    if (!iat_bytes_eq(&first, "ab")) { return -2; }
+    mut second: Array<u8> = match (await src.read_some(64)) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { return -3; }
+    };
+    if (!second.is_empty()) { return -4; }
+    return 1;
+}
+
+![test]
+function async_read_some_reports_eof_as_empty() -> Result<(), TestError> {
+    return expect_eq(future::block_on(iat_read_some_eof()), 1 as i64);
+}
+
+/// A peer that never sends the delimiter must hit the limit, not exhaust
+/// memory, and a truncated record must be UnexpectedEof.
+async function iat_until_limits() -> i64 {
+    mut src: MockSource = MockSource::of("no delimiter here at all", 4);
+    match (await src.read_until(0x7C, 8)) {
+        Result::Ok(_)  => { return -1; }
+        Result::Err(e) => {
+            match (e.kind) {
+                IoErrorKind::InvalidData => { }
+                _ => { return -2; }
+            }
+        }
+    }
+    mut trunc: MockSource = MockSource::of("abc", 4);
+    match (await trunc.read_until(0x7C, 1024)) {
+        Result::Ok(_)  => { return -3; }
+        Result::Err(e) => {
+            match (e.kind) {
+                IoErrorKind::UnexpectedEof => { }
+                _ => { return -4; }
+            }
+        }
+    }
+    return 1;
+}
+
+![test]
+function async_read_until_enforces_its_limit() -> Result<(), TestError> {
+    return expect_eq(future::block_on(iat_until_limits()), 1 as i64);
+}
+
+/// A generic owner that owns its transport: header parsed in place, payload
+/// copied out, and `seen` accumulated through `mut &this` across suspends.
+async function iat_layer() -> i64 {
+    mut feed: MockSource = MockSource::of("", 2);
+    feed.push_record("hello");
+    feed.push_record("abc");
+    mut layer: MockLayer<MockSource> = MockLayer<MockSource> { inner: feed, seen: 0 };
+    mut r1: Array<u8> = match (await layer.next_record()) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { return -1; }
+    };
+    if (!iat_bytes_eq(&r1, "hello")) { return -2; }
+    mut r2: Array<u8> = match (await layer.next_record()) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { return -3; }
+    };
+    if (!iat_bytes_eq(&r2, "abc")) { return -4; }
+    return layer.seen as i64;
+}
+
+![test]
+function async_read_through_a_generic_owning_layer() -> Result<(), TestError> {
+    return expect_eq(future::block_on(iat_layer()), 8 as i64);
+}
+
+// ============================================================================
+// AsyncWrite
+// ============================================================================
+
+/// Queue several payload kinds synchronously, then suspend exactly once.
+async function iat_queue_then_flush() -> i64 {
+    mut sink: MockSink = MockSink::new();
+    match (sink.queue<Str>(Str::new("HTTP/1.1 "))) { Result::Ok(_) => { } Result::Err(_) => { return -1; } }
+    match (sink.queue<u8>(0x32))                    { Result::Ok(_) => { } Result::Err(_) => { return -2; } }
+    match (sink.queue<string>("00 OK"))             { Result::Ok(_) => { } Result::Err(_) => { return -3; } }
+    match (sink.queue<Slice<u8>>(Str::new("\r\n").as_bytes())) { Result::Ok(_) => { } Result::Err(_) => { return -4; } }
+    // Nothing has been sent yet: queuing does not suspend.
+    if (sink.flushes != 0) { return -5; }
+    if (sink.pending().length() != 17) { return -6; }
+    match (await sink.flush()) { Result::Ok(_) => { } Result::Err(_) => { return -7; } }
+    if (!iat_bytes_eq(&sink.sent, "HTTP/1.1 200 OK\r\n")) { return -8; }
+    if (sink.pending().length() != 0) { return -9; }
+    return sink.flushes;
+}
+
+// The `u8` arm is passed a BARE LITERAL on purpose: a method turbofish whose
+// argument is an untyped literal used to bind to a sibling specialization.
+![test]
+function async_write_queues_synchronously_and_flushes_once() -> Result<(), TestError> {
+    return expect_eq(future::block_on(iat_queue_then_flush()), 1 as i64);
+}
+
+/// `send<T>` -- an async generic default body over a method generic.
+async function iat_send() -> i64 {
+    mut sink: MockSink = MockSink::new();
+    match (await sink.send<Str>(Str::new("one"))) { Result::Ok(_) => { } Result::Err(_) => { return -1; } }
+    match (await sink.send<u8>(0x2D))             { Result::Ok(_) => { } Result::Err(_) => { return -2; } }
+    match (await sink.send<string>("two"))        { Result::Ok(_) => { } Result::Err(_) => { return -3; } }
+    if (!iat_bytes_eq(&sink.sent, "one-two")) { return -4; }
+    return sink.flushes;
+}
+
+![test]
+function async_write_send_queues_and_flushes_each_payload() -> Result<(), TestError> {
+    return expect_eq(future::block_on(iat_send()), 3 as i64);
+}
+
+/// An encoder building a whole frame directly in the connection's outgoing
+/// buffer -- the zero-copy path `pending()` exists for.
+async function iat_encode_in_place() -> i64 {
+    mut sink: MockSink = MockSink::new();
+    mut out: Array<u8>* = sink.pending();
+    out.push(0x81);
+    out.push(0x03);
+    out.append(Str::new("abc").as_bytes());
+    match (await sink.flush()) { Result::Ok(_) => { } Result::Err(_) => { return -1; } }
+    if (sink.sent.length() != 5) { return -2; }
+    mut head: u8 = 0;
+    match (sink.sent.get(0)) { Option::Some(v) => { head = v; } Option::None => { } }
+    if (head != 0x81) { return -3; }
+    return 1;
+}
+
+![test]
+function async_write_pending_allows_in_place_framing() -> Result<(), TestError> {
+    return expect_eq(future::block_on(iat_encode_in_place()), 1 as i64);
+}
+
+/// Read and write halves on one connection, the full request/response turn.
+async function iat_round_trip() -> i64 {
+    mut src: MockSource = MockSource::of("PING 4\r\ndata", 2);
+    mut sink: MockSink = MockSink::new();
+    mut line: String = match (await src.read_line(64)) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { return -1; }
+    };
+    if (line.as_str() != Str::new("PING 4")) { return -2; }
+    mut body: Array<u8> = match (await src.read_exact(4)) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { return -3; }
+    };
+    if (!iat_bytes_eq(&body, "data")) { return -4; }
+    match (sink.queue<string>("PONG "))                { Result::Ok(_) => { } Result::Err(_) => { return -5; } }
+    match (sink.queue<Slice<u8>>(body.as_slice()))     { Result::Ok(_) => { } Result::Err(_) => { return -6; } }
+    match (await sink.flush())                         { Result::Ok(_) => { } Result::Err(_) => { return -7; } }
+    if (!iat_bytes_eq(&sink.sent, "PONG data")) { return -8; }
+    return 1;
+}
+
+![test]
+function async_read_and_write_round_trip() -> Result<(), TestError> {
+    return expect_eq(future::block_on(iat_round_trip()), 1 as i64);
+}

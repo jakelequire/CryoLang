@@ -1,0 +1,166 @@
+// An explicit turbofish on a METHOD generic must decide the argument's type.
+//
+// A method call carries its turbofish on the member access (`b.take<u8>(0x42)`),
+// not on the call node, so the substitution that makes a free call's explicit
+// type args concrete used to skip method calls entirely. The formal `data: T`
+// then stayed abstract, no expected type reached the argument, and a bare
+// integer literal fell back to its `i32` default.
+//
+// That mistyped argument is not a local problem: for a generic callee the
+// argument's type is what selects the specialization, so the call bound to
+// whichever SIBLING specialization of the same method the wrong type happened to
+// pick, and the literal was passed in that specialization's parameter shape --
+// `take<u8>(0x42)` dispatched to `take<Slice<u8>>`, handing the callee 66 as a
+// pointer. Silent miscompile, no diagnostic; a typed local worked, so only a
+// literal argument exposed it.
+//
+// Every test here therefore passes a BARE LITERAL and checks which arm actually
+// ran. The sibling instantiations must exist in the same program for the
+// mis-selection to have somewhere to go, which is why each trait keeps several.
+![config(testing)]
+namespace CryoTests::Tests::Lang::MethodGenericTurbofishLiteral;
+
+import std::test;
+import std::core::result;
+import std::core::option;
+import std::core::slice;
+import std::collections::str;
+import std::collections::array;
+
+/// Reports which `static match (T)` arm the call selected, so a wrong-arm
+/// dispatch is observable as a value rather than as a crash.
+type trait MgtlTag {
+    tag<T>(&this, data: T) -> i64 {
+        return static match (T) {
+            Slice<u8> => { 1 + (data.length() as i64) }
+            Str       => { 2 }
+            string    => { 3 }
+            u8        => { 4 + (data as i64) }
+            i64       => { 5 + data }
+        };
+    }
+}
+
+type struct MgtlProbe { seen: i64; }
+
+implement trait MgtlTag for MgtlProbe { }
+
+/// The same shape on an INHERENT method: inherent and trait-impl generic
+/// methods take different specialization paths, so both need covering.
+type struct MgtlInherent {
+    seen: i64;
+
+    pick<T>(&this, data: T) -> i64 {
+        return static match (T) {
+            Slice<u8> => { 1 + (data.length() as i64) }
+            Str       => { 2 }
+            u8        => { 4 + (data as i64) }
+            i64       => { 5 + data }
+        };
+    }
+}
+
+/// A generic method whose argument is consumed by VALUE into a buffer -- the
+/// shape the miscompile actually corrupted (the literal arrived as a pointer).
+type trait MgtlSink {
+    bucket(mut &this) -> Array<u8>*;
+
+    put<T>(mut &this, data: T) -> u64 {
+        const bytes: Slice<u8> = static match (T) {
+            Slice<u8> => { data }
+            Str       => { data.as_bytes() }
+            string    => { Str::new(data).as_bytes() }
+            u8        => { Slice<u8>::from_raw(&data, 1) }
+        };
+        mut out: Array<u8>* = this.bucket();
+        out.append(bytes);
+        return out.length();
+    }
+}
+
+type struct MgtlBag { out: Array<u8>; }
+
+implement trait MgtlSink for MgtlBag {
+    bucket(mut &this) -> Array<u8>* { return &this.out; }
+}
+
+/// Force the sibling specializations to exist. Without them the wrong-arm
+/// dispatch has nothing to land on and the bug hides.
+function mgtl_siblings(p: &MgtlProbe) -> i64 {
+    return p.tag<Str>(Str::new("s"))
+         + p.tag<string>("c")
+         + p.tag<Slice<u8>>(Str::new("ab").as_bytes());
+}
+
+// A bare literal with a `u8` turbofish must run the `u8` arm.
+![test]
+function method_generic_turbofish_binds_a_bare_u8_literal() -> Result<(), TestError> {
+    const p: MgtlProbe = MgtlProbe { seen: 0 };
+    const siblings: i64 = mgtl_siblings(&p);
+    // 2 + 3 + (1 + 2) = 8; guards that the siblings really were instantiated.
+    match (expect_eq(siblings, 8 as i64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(p.tag<u8>(0x42), 70 as i64);   // 4 + 66
+}
+
+// The same call with a TYPED local always worked; it must still work, and it
+// must agree with the literal form.
+![test]
+function method_generic_turbofish_agrees_with_a_typed_local() -> Result<(), TestError> {
+    const p: MgtlProbe = MgtlProbe { seen: 0 };
+    const _s: i64 = mgtl_siblings(&p);
+    const typed: u8 = 0x42;
+    return expect_eq(p.tag<u8>(typed), p.tag<u8>(0x42));
+}
+
+// A widening turbofish (`i64`) on a literal that would otherwise default to
+// `i32` must select the `i64` arm, not the default-typed one.
+![test]
+function method_generic_turbofish_binds_a_bare_i64_literal() -> Result<(), TestError> {
+    const p: MgtlProbe = MgtlProbe { seen: 0 };
+    const _s: i64 = mgtl_siblings(&p);
+    return expect_eq(p.tag<i64>(7), 12 as i64);     // 5 + 7
+}
+
+![test]
+function method_generic_turbofish_on_an_inherent_method() -> Result<(), TestError> {
+    const p: MgtlInherent = MgtlInherent { seen: 0 };
+    const siblings: i64 = p.pick<Str>(Str::new("s"))
+                        + p.pick<Slice<u8>>(Str::new("ab").as_bytes());
+    match (expect_eq(siblings, 5 as i64)) {        // 2 + (1 + 2)
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(p.pick<u8>(0x42), 70 as i64);
+}
+
+// The by-value payload path: the literal must arrive as one BYTE, not as a
+// `Slice<u8>` reinterpretation of its numeric value.
+![test]
+function method_generic_turbofish_passes_a_literal_byvalue() -> Result<(), TestError> {
+    mut b: MgtlBag = MgtlBag { out: Array<u8>::new() };
+    const after_str: u64 = b.put<Str>(Str::new("AB"));
+    const after_lit: u64 = b.put<u8>(0x43);
+    const after_sl:  u64 = b.put<Slice<u8>>(Str::new("DE").as_bytes());
+    match (expect_eq(after_str, 2 as u64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(after_lit, 3 as u64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(after_sl, 5 as u64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    // The literal landed as the byte 0x43 between "AB" and "DE".
+    mut got: u8 = 0;
+    match (b.out.get(2)) {
+        Option::Some(v) => { got = v; }
+        Option::None    => { }
+    }
+    return expect_eq(got, 0x43 as u8);
+}

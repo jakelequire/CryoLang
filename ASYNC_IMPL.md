@@ -56,6 +56,10 @@ not for routine judgement calls.
 
 | 5f | `?` inside `async` (blocker found while designing §4's traits) | ✅ DONE+validated 2026-07-26. **The `?` operator did not work in ANY `async` function** — `E0235` on the simplest possible form, in the pinned compiler too, because no test and no stdlib code had ever used `?` in an `async` fn. A hard blocker on §5b-port, whose ~3,300 consumer lines are `?`-dense. Five defects: (1) the shape gate re-judged an already-typed `?` against the lowered `poll`'s `Poll<Output>` return, since sema walks each module twice and `lower` moves the body into `poll` in between; (2) `TryExpression` was a blind spot in NINE of the lowering's ten expression walkers — an uncounted `await` in a `?` operand sent the body down the no-await path, the desugar's `Err`-arm `return` was never wrapped in `Poll::Ready`, and `rn_expr` alpha-renamed the operand twice; (3) `ASTCloner` SHARED `PatternElement::Binding` pointers between a trait default body and its per-impl clones while the lowering renames them in place, so a bound `match` arm in an `async` default body with an `await` failed `E0201` in every impl; (4) a `?` in a GENERIC body is first desugared INSIDE the already-lowered `poll` (its operand type is abstract until specialization), so that desugar now wraps its own `return`; (5) cloning split the `desugared.subject IS operand` invariant that call specialization (walks `operand`) and codegen (emits `desugared`) both depend on — which broke `hashmap.cryo`'s `alloc_entry(...)?` at codegen. 10 tests. **Proves the §4 shape**: a trait with sync `buffered`/`consume` + `async fill`, async default bodies using `?`/loops/match bindings, and a `Codec<S>` that owns its transport and mutates through `mut &this` across suspends. |
 
+| 5g | `AsyncRead` / `AsyncWrite` in `stdlib/` (§4 of the handoff) | ✅ DONE+validated 2026-07-26. `stdlib/io/async_traits.cryo`, registered in `io/_module.cryo`. Shape is Jake's 2026-07-26 call — the connection owns a persistent buffer and **no buffer crosses the API**. `AsyncRead` requires `async fill` + sync `buffered`/`consume`; `ensure` / `read_exact` / `read_some` / `read_until` / `read_line` / `skip` are default bodies over them, with the scan-and-copy steps factored into SYNC helpers (`scan_for`, `take_front`) so a `buffered()` slice is provably never live at a suspension point. `AsyncWrite` inverts the split: sync `pending()` + generic `queue<T>` (`static match` over `Slice<u8>`/`Str`/`string`/`u8`) so an encoder builds a whole frame without suspending, and one `async flush`. 10 tests against in-memory doubles whose fill chunk is 1–4 bytes, so every read spans several fills and moves the buffer's heap block. Found and fixed a pre-existing compiler miscompile on the way (5h). |
+
+| 5h | Method turbofish ignored for a literal argument (silent miscompile, PRE-EXISTING) | ✅ DONE+validated 2026-07-26. `recv.m<u8>(0x42)` — explicit turbofish, bare integer literal — bound to a **sibling specialization** of the same method and passed the literal in that spec's parameter shape: observed as `queue<u8>(0x42)` dispatched to `queue<Slice<u8>>` with `inttoptr (i32 66 to ptr)`, i.e. 66 handed over as a pointer → access violation. No diagnostic; a typed local worked, so only a literal argument exposed it. Reproduced identically under the PINNED compiler, so it long predates the async work — it had simply never been hit, because the one stdlib method of this shape (`io::Write::write<T>`) is never called with a literal at a type its `static match` also has a `Slice<u8>` arm for. Cause: `substitute_explicit_generic_param_types` handled only the free-function form (turbofish on the CALL node, callee an identifier). A method call carries its turbofish on the MEMBER ACCESS, so the formal `data: T` stayed abstract, no expected type reached the argument, and the literal fell back to `i32` — and for a generic callee the argument's type is what SELECTS the specialization. Fix: substitute a method call's turbofish into the method's formals by re-resolving each parameter annotation with the owner args and the method's own params bound (handles a param nested in another type for free), and force the expected type onto exactly the arguments whose formal came from a turbofish — the literal-clearing default is survivable for a non-generic callee (the call boundary has an integer width coercion) but not for a generic one. 5 tests; pre-fix they return `71` instead of `70`. |
+
 Legend: ☐ not started · ◐ in progress · ✅ done+validated · ⏸ blocked (note why in the Progress Log).
 
 **Current HEAD baseline:** `eda79ddc` (the two root-cause compiler fixes of 2026-07-24 — `drop_insertion`
@@ -2989,3 +2993,86 @@ a `match` arm binding after an `await` in a default body, and `?` in an `async` 
 and match bindings over them, and a `Codec<S>` protocol layer that OWNS its transport, mutates through
 `mut &this` across suspends, and propagates EOF as an `Err` through the whole `?` chain. §4 can be
 written against it.
+
+---
+
+### 2026-07-26 — `AsyncRead` / `AsyncWrite` LANDED in `stdlib/` (§4); a pre-existing turbofish miscompile found and fixed
+
+**§4 is done.** `stdlib/io/async_traits.cryo` (registered in `io/_module.cryo`), built to Jake's settled
+shape: the transport-owning connection keeps ONE persistent buffer and no buffer crosses the API.
+
+**`AsyncRead`** requires three primitives — `async fill(mut &this) -> Result<u64, IoError>` (pull more
+bytes; 0 = EOF), sync `buffered(&this) -> Slice<u8>`, sync `consume(mut &this, count)`. Everything else is
+a default body: `ensure` (leaves the bytes in the buffer, so a fixed-size header is parsed in place with no
+copy), `read_exact`, `read_some`, `read_until`, `read_line`, `skip`.
+
+**The discipline that makes it sound, stated in the trait's own doc comment:** a `buffered()` slice must
+never be held across an `await`, because a `fill` can grow the buffer and move its heap block. The default
+bodies do not merely avoid it by inspection — the scan and the copy are factored into SYNC helpers
+(`scan_for`, `take_front`) so no slice is even in scope at a suspension point. The one place resumption
+state is carried across a fill is an integer offset (`read_until`'s `scanned`), which is why the trait
+documents that a successful `fill` only APPENDS to what `buffered()` reports: that is what lets the scan
+resume instead of rescanning, and it stays true under an implementor that compacts its storage.
+
+**`AsyncWrite`** inverts the split deliberately: sync `pending(mut &this) -> Array<u8>*` and a generic sync
+`queue<T>` (`static match` over `Slice<u8>` / `Str` / `string` / `u8`), plus one `async flush`. An encoder
+therefore builds an entire frame — header, length prefix, payload — with zero suspension points, and the
+layer suspends once. `pending()` is exposed rather than wrapped so a frame can be built directly in the
+outgoing buffer instead of into a scratch array that is then copied.
+
+**Tests: 10**, `tests/tests/stdlib/io_async_traits.cryo`, against in-memory doubles (no reactor, so they run
+under `future::block_on`). The doubles' fill chunk is 1–4 bytes, so every read spans SEVERAL fills — which
+is what grows the buffer and moves its block, the condition a stale slice would need to go wrong. The
+source also counts fills, so an over-reading default body is visible as a count rather than only as a wrong
+answer. Coverage includes a `MockLayer<S>` that owns its transport, parses a header in place and
+accumulates through `mut &this` across suspends (the §5e generic-owner receiver-refresh shape).
+
+#### The compiler bug this uncovered — an explicit method turbofish was ignored for a literal argument
+
+Writing the write side's `queue<u8>(0x32)` produced an **access violation**. Isolating it took the full
+bisect, and the answer was not async at all.
+
+`recv.m<u8>(0x42)` — explicit turbofish, **bare integer literal** argument — bound to a **sibling
+specialization of the same method** and passed the literal in THAT specialization's parameter shape. The
+IR is unambiguous: four call sites in source order `Str`, `u8`, `string`, `Slice<u8>` emitted calls to
+`Str`, **`Slice<u8>`**, `string`, `Slice<u8>`, with the second passing
+`ptr byval(%Slice) inttoptr (i32 66 to ptr)` — the number 66 handed to the callee as a pointer, which then
+reads a `Slice` header out of address 66. Silent: no diagnostic, and a **typed local worked**, so only a
+literal argument exposed it.
+
+**It is pre-existing.** The same minimal repro miscompiles identically under the PINNED compiler, so it
+predates every line of the async work. It had simply never been hit: the one stdlib method of this shape
+(`io::Write::write<T>`) is never called with a bare literal, and a repro needs a sibling `Slice<u8>`
+instantiation in the same program for the mis-dispatch to have somewhere to land.
+
+**Cause.** `substitute_explicit_generic_param_types` (`sema/call_resolver.cryo`) makes a call's explicit
+type args concrete in the callee's formals so expected-type propagation can push a concrete type onto each
+argument. It handled only the FREE-function form: turbofish on the call node, callee an identifier. A
+method call carries its turbofish on the **member access**, so the function returned immediately, the
+formal `data: T` stayed abstract, and — since a bare integer literal only receives an expected type in a
+few special cases — the literal fell back to its `i32` default. For a non-generic callee that is harmless
+(the call boundary has an integer width coercion, which is exactly why the existing code comments say the
+integer path "survives the same clearing"). For a **generic** callee it is fatal, because the argument's
+type is what SELECTS the specialization.
+
+**Fix, in two halves — both needed, the first alone changes nothing.**
+1. `substitute_explicit_method_param_types`: locate the method via the existing
+   `MethodBinding::find_generic_method_for_call`, resolve the turbofish in the CALLER's scope (an owner
+   context would shadow an enclosing param sharing the receiver's param name — the same choice
+   `solve_method_bindings` documents), then **re-resolve each parameter annotation** with the owner args
+   and the method's own params bound. Re-resolving rather than substituting into the already-resolved
+   types handles a param nested inside another type (`Array<T>`, `Option<T>`) for free.
+2. Force the expected type onto exactly those arguments whose formal came from a turbofish. The
+   literal-clearing default in `resolve_call` is deliberate and stays for everything else; a
+   `forced_expected` flag marks the substituted indices, and the free-function path sets it too — the same
+   latent hole existed there.
+
+**Tests: 5**, `tests/tests/lang/method_generic_turbofish_literal.cryo`. Each passes a bare literal and
+checks WHICH `static match` arm ran, with sibling instantiations kept live in the same program so a
+mis-dispatch has somewhere to go; trait-impl and inherent methods are covered separately (different
+specialization paths), plus the by-value payload path where the corruption was originally observed.
+Pre-fix they fail with a wrong VALUE (`71` where `70` is correct) rather than a crash, which is the
+honest characterisation of the bug.
+
+**Relevance to §5.** This is squarely on the port's path: an HTTP/1 writer queuing `0x0D` / `0x0A`, or a
+WebSocket encoder queuing an opcode byte, is exactly `queue<u8>(<literal>)`.
