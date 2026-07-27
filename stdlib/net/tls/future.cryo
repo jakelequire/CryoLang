@@ -31,6 +31,7 @@ import core::mem;
 import collections::str;
 import collections::string;
 import io::error;
+import io::traits;
 import ffi::libc;
 import ffi::openssl;
 import net::socket::tcp;
@@ -313,4 +314,40 @@ implement trait Drop for struct TlsWrite {
 private function clamp_io(n: u64) -> i32 {
     if (n > 2147483647u64) { return 2147483647; }
     return n as i32;
+}
+
+
+/// The raw async byte channel, so `BufConn<TlsStream>` is buffered by exactly
+/// the same code as a plaintext socket — the difference between the two is how
+/// bytes move, not how they are buffered.
+///
+/// The swap is inside these methods for the same reason as the TCP impl, and
+/// with an extra one: a placeholder `TlsStream` is a null `SSL*` over a closed
+/// socket, which only this layer should have to know how to spell.
+implement trait AsyncTransport for struct TlsStream {
+    async read_into(mut &this, buf: Array<u8>) -> Transfer {
+        mut s: TlsStream = TlsStream::from_parts(null, TcpStream::from_fd(-1));
+        mem::swap<TlsStream>(&s, this);
+
+        mut io: TlsIo = await TlsRead::start(s, buf);
+
+        // Put the stream back before anything else: every exit below must leave
+        // the receiver holding its real session rather than the placeholder.
+        mut spare: TlsStream = io.take_stream();
+        mem::swap<TlsStream>(&spare, this);
+
+        return Transfer { buf: io.take_buf(), result: io.outcome() };
+    }
+
+    async write_from(mut &this, buf: Array<u8>) -> Transfer {
+        mut s: TlsStream = TlsStream::from_parts(null, TcpStream::from_fd(-1));
+        mem::swap<TlsStream>(&s, this);
+
+        mut io: TlsIo = await TlsWrite::start(s, buf);
+
+        mut spare: TlsStream = io.take_stream();
+        mem::swap<TlsStream>(&spare, this);
+
+        return Transfer { buf: io.take_buf(), result: io.outcome() };
+    }
 }

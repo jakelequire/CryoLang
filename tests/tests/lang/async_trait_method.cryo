@@ -163,6 +163,19 @@ function async_trait_method_callable_on_a_concrete_receiver() -> Result<(), Test
 
 type trait AtmDrain {
     async drain(mut &this, n: i64) -> i64;
+
+    /// A DEFAULT body on the same trait, awaiting the required method through
+    /// `this`. The impl below is on a GENERIC owner, and `drain` is delivered
+    /// by that impl block rather than by the owner's own method list -- so
+    /// resolving this `await` means finding a method the owner TEMPLATE does
+    /// not declare. Leaving it unresolved is survivable for a synchronous call
+    /// (monomorphization retypes it once `S` is bound) but not for an awaited
+    /// one: the state machine needs the sub-future's type to give it a field.
+    async drain_twice(mut &this, n: i64) -> i64 {
+        const a: i64 = await this.drain(n);
+        const b: i64 = await this.drain(a);
+        return b;
+    }
 }
 
 type struct AtmHolder<S> {
@@ -213,4 +226,23 @@ function async_trait_impl_on_a_generic_owner_satisfies_a_second_bound()
     const v: i64 = future::block_on(atm_via_drain<AtmHolder<AtmTicker>>(
         AtmHolder<AtmTicker> { inner: AtmTicker { base: 4 }, seen: 0 }));
     return expect_eq(v, 7 as i64);
+}
+
+/// Drives the trait's DEFAULT body on a generic owner. The value alone would
+/// not catch a lost write, so `seen` -- accumulated through `mut &this` across
+/// both suspends, one state machine nested inside another -- is reported too.
+async function atm_default_body_on_generic_owner<S>(s: S) -> i64
+where S: AtmRead {
+    mut h: AtmHolder<S> = AtmHolder<S> { inner: s, seen: 0 };
+    const v: i64 = await h.drain_twice(3);
+    return v * 100 + h.seen;
+}
+
+// drain(3) = 4+3 = 7 (seen 7) ; drain(7) = 4+7 = 11 (seen 18) -> 11*100 + 18
+![test]
+function async_trait_default_body_awaits_a_required_method_on_a_generic_owner()
+        -> Result<(), TestError> {
+    const v: i64 = future::block_on(
+        atm_default_body_on_generic_owner<AtmTicker>(AtmTicker { base: 4 }));
+    return expect_eq(v, 1118 as i64);
 }

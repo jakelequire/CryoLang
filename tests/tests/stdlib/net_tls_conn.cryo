@@ -1,0 +1,187 @@
+///! `BufConn<TlsStream>` — the SAME buffered connection as `BufConn<TcpStream>`,
+///! over an encrypted transport instead of a plaintext one.
+///!
+///! That is the claim under test, and it is the whole point of the
+///! `AsyncTransport` seam: the buffering, the compaction, the short-write
+///! requeue and every `AsyncRead`/`AsyncWrite` default body are written once and
+///! reused, so a TLS connection is not a second implementation to keep in step.
+///! The framing exercised here is deliberately identical to `net_tcp_conn`'s —
+///! a CRLF-framed header line followed by a fixed-length body, read through ONE
+///! buffer — so a divergence between the two transports shows up as one of these
+///! failing while its twin passes.
+///!
+///! Both sides run as tasks on ONE `Executor`: a TLS handshake is bidirectional,
+///! and only because each side parks instead of blocking can they complete
+///! without a thread.
+///!
+///! Requires `ssl` + `crypto` in `tests/cryoconfig` link_libs and the fixture
+///! cert/key under `fixtures/tls/` (cwd is the `tests/` project root when
+///! `cryo test` runs).
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::NetTlsConn;
+
+import std::core::option;
+import std::core::result;
+import std::core::drop;
+import std::core::slice;
+import std::collections::str;
+import std::collections::string;
+import std::collections::array;
+import std::future;
+import std::io::error;
+import std::io::traits;
+import std::io::buf;
+import std::net::addr::socket_addr;
+import std::net::socket::tcp;
+import std::net::tls::context;
+import std::net::tls::stream;
+import std::net::tls::future;
+import std::test::error;
+import std::test::assert;
+
+// Every failure is a distinct negative number so a red test names its own step.
+
+function ntls_bytes_eq(a: &Array<u8>, text: string) -> boolean {
+    const b: Slice<u8> = Str::new(text).as_bytes();
+    if (a.length() != b.length()) { return false; }
+    mut i: u64 = 0;
+    while (i < a.length()) {
+        mut x: u8 = 0;
+        mut y: u8 = 1;
+        match (a.get(i)) { Option::Some(v) => { x = v; } Option::None => { } }
+        match (b.get(i)) { Option::Some(v) => { y = v; } Option::None => { } }
+        if (x != y) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// Accept one connection, complete the handshake, then read a `NAME len\r\n`
+/// header line plus exactly `len` body bytes and answer with the same framing.
+/// Both reads come out of the one connection buffer.
+async function ntls_serve(listener: TcpListener, acceptor: TlsAcceptor) -> i64 {
+    mut acc: TcpAccepted = await TcpAccept::start(listener);
+    mut lst: TcpListener = acc.take_listener();
+    lst.drop();
+
+    mut sock: TcpStream = TcpStream::from_fd(-1);
+    match (acc.take_result()) {
+        Result::Ok(s)  => { sock = s; }
+        Result::Err(_) => { return -1; }
+    }
+
+    mut ac: TlsAcceptor = acceptor;
+    mut hs: TlsHandshake = match (ac.accept_async(sock)) {
+        Result::Ok(h)  => { h }
+        Result::Err(_) => { ac.drop(); return -2; }
+    };
+    ac.drop();
+
+    mut tls: TlsStream = match (await hs) {
+        Result::Ok(t)  => { t }
+        Result::Err(_) => { return -3; }
+    };
+    mut c: BufConn<TlsStream> = BufConn<TlsStream>::of(tls);
+
+    mut head: String = match (await c.read_line(256)) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { return -4; }
+    };
+    if (head.as_str() != Str::new("ECHO 5")) { return -5; }
+
+    // A TLS record carries the header and the body together, so the body is
+    // already buffered: reading it must come out of the SAME buffer rather than
+    // off the wire again.
+    mut body: Array<u8> = match (await c.read_exact(5)) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { return -6; }
+    };
+    if (!ntls_bytes_eq(&body, "HELLO")) { return -7; }
+
+    match (c.queue<string>("BACK 5\r\n"))       { Result::Ok(_) => { } Result::Err(_) => { return -8; } }
+    match (c.queue<Slice<u8>>(body.as_slice())) { Result::Ok(_) => { } Result::Err(_) => { return -9; } }
+    match (await c.flush())                     { Result::Ok(_) => { } Result::Err(_) => { return -10; } }
+    return 5;
+}
+
+async function ntls_client(port: u16, connector: TlsConnector) -> i64 {
+    mut sock: TcpStream = TcpStream::from_fd(-1);
+    match (await TcpConnect::start(SocketAddr::localhost_v4(port))) {
+        Result::Ok(s)  => { sock = s; }
+        Result::Err(_) => { return -20; }
+    }
+
+    mut cn: TlsConnector = connector;
+    mut hs: TlsHandshake = match (cn.connect_async(sock, Str::new("localhost"))) {
+        Result::Ok(h)  => { h }
+        Result::Err(_) => { cn.drop(); return -21; }
+    };
+    cn.drop();
+
+    mut tls: TlsStream = match (await hs) {
+        Result::Ok(t)  => { t }
+        Result::Err(_) => { return -22; }
+    };
+    mut c: BufConn<TlsStream> = BufConn<TlsStream>::of(tls);
+
+    match (c.queue<string>("ECHO 5\r\nHELLO")) { Result::Ok(_) => { } Result::Err(_) => { return -23; } }
+    match (await c.flush())                    { Result::Ok(_) => { } Result::Err(_) => { return -24; } }
+
+    mut head: String = match (await c.read_line(256)) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { return -25; }
+    };
+    if (head.as_str() != Str::new("BACK 5")) { return -26; }
+
+    mut body: Array<u8> = match (await c.read_exact(5)) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { return -27; }
+    };
+    if (!ntls_bytes_eq(&body, "HELLO")) { return -28; }
+    return 5;
+}
+
+async function ntls_round_trip(port: u16, listener: TcpListener,
+                               acceptor: TlsAcceptor, connector: TlsConnector) -> i64 {
+    const pair: (i64, i64) = await Futures::join(ntls_serve(listener, acceptor),
+                                                  ntls_client(port, connector));
+    if (pair.0 != 5) { return pair.0; }
+    if (pair.1 != 5) { return pair.1; }
+    return 0;
+}
+
+![test]
+function tls_conn_framed_round_trip() -> Result<(), TestError> {
+    mut acceptor: TlsAcceptor = match (TlsAcceptor::new(Str::new("fixtures/tls/cert.pem"),
+                                                        Str::new("fixtures/tls/key.pem"))) {
+        Result::Ok(a)  => { a }
+        Result::Err(_) => { return bail(Str::new("TlsAcceptor::new failed (fixture cert/key)")); }
+    };
+    // The fixture certificate is self-signed, so the client cannot verify it.
+    mut connector: TlsConnector = match (TlsConnector::new()) {
+        Result::Ok(c)  => { c.danger_accept_invalid_certs() }
+        Result::Err(_) => { acceptor.drop(); return bail(Str::new("TlsConnector::new failed")); }
+    };
+
+    mut listener: TcpListener = match (TcpListener::bind(SocketAddr::localhost_v4(0u16))) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => {
+            acceptor.drop(); connector.drop();
+            return bail(Str::new("bind 127.0.0.1:0 failed"));
+        }
+    };
+    listener.set_nonblocking(true);
+    const port: u16 = match (listener.local_addr()) {
+        Result::Ok(a)  => { a.port }
+        Result::Err(_) => {
+            listener.drop(); acceptor.drop(); connector.drop();
+            return bail(Str::new("local_addr failed"));
+        }
+    };
+
+    mut ex: Executor = Executor::new();
+    const r: i64 = ex.block_on(ntls_round_trip(port, listener, acceptor, connector));
+    ex.drop();
+    return expect_eq(r, 0 as i64);
+}

@@ -10,6 +10,10 @@
 ///! caller retains ownership of the underlying sink and is responsible
 ///! for eventually dropping it. Wrapping and unwrapping is free.
 ///!
+///! `BufConn<S>` at the end of this module is the non-blocking
+///! counterpart: it OWNS its transport rather than borrowing it, because
+///! a borrowed transport cannot be held across a suspension point.
+///!
 ///! Ownership protocol: every type in this module exposes
 ///! `drop(mut &this)` that releases the heap buffer. `BufWriter::drop`
 ///! also flushes any pending bytes; call it before the wrapped sink
@@ -18,6 +22,7 @@
 namespace std::io::buf;
 
 import core::intrinsics;
+import core::mem;
 import core::option;
 import core::result;
 import core::slice;
@@ -29,6 +34,10 @@ import collections::str;
 import collections::string;
 import io::error;
 import io::traits;
+import collections::array;
+import future::poll;
+import future::waker;
+import future::traits;
 
 /// Default buffer size. Matches stdio's block-buffered default on
 /// most Unixes. Large enough that a typical line of output fits in
@@ -431,5 +440,194 @@ implement<R> trait Drop for struct BufReader<R> {
             this.position = 0;
             this.filled = 0;
         }
+    }
+}
+
+
+// ============================================================================
+// `BufConn<S>` — the buffered connection for the non-blocking family.
+//
+// The wrappers above borrow their inner reader/writer by pointer. That is
+// exactly what cannot cross a suspension point (E0455), so a connection driving
+// `AsyncRead` / `AsyncWrite` OWNS its transport instead. Everything else is the
+// same idea: coalesce many small transport operations into few large ones.
+//
+// There is exactly one of these for every transport. A plaintext socket and a
+// TLS session differ in how bytes move, not in how they are buffered, so the
+// buffering, the compaction, the short-write requeue and both trait contracts
+// are written once here and the transport supplies only `read_into` /
+// `write_from`.
+//
+// The read buffer is compacted (the consumed prefix dropped) at the START of a
+// fill, never at the end, so `buffered()`'s view never shifts underneath a
+// caller part-way through parsing a record. An `rpos` cursor is what keeps
+// `consume` O(1) between those compactions.
+//
+// Cancellation is inherited from the transport: while an operation is in flight
+// the transport holds a closed placeholder and the future owns the real handle,
+// so dropping that future closes the connection. Nothing else holds the handle,
+// so this is coherent — but a caller that wants to keep the connection must not
+// cancel an operation on it.
+// ============================================================================
+
+/// Bytes requested per `fill`. One page: large enough that a header block or a
+/// small frame arrives in a single transport operation, small enough that many
+/// idle connections do not each pin a large buffer.
+const FILL_CHUNK: u64 = 4096;
+
+type struct BufConn<S> {
+    inner:   S;
+    rbuf:    Array<u8>;
+    rpos:    u64;        // start of the unconsumed region within `rbuf`
+    scratch: Array<u8>;  // reused fill buffer; empty while a fill is in flight
+    wbuf:    Array<u8>;
+
+    /// Wrap an already-connected transport.
+    static of(inner: S) -> BufConn<S> {
+        return BufConn<S> {
+            inner:   inner,
+            rbuf:    Array<u8>::new(),
+            rpos:    0,
+            scratch: Array<u8>::new(),
+            wbuf:    Array<u8>::new()
+        };
+    }
+
+    /// Drop the consumed prefix so a long-lived connection's buffer tracks what
+    /// is live rather than everything ever read. Called only at the start of a
+    /// fill: moving bytes at any other time would shift `buffered()` under a
+    /// caller mid-parse. (Internal to the connection, but not `private` — the
+    /// trait impl blocks are separate scopes and could not reach it.)
+    compact(mut &this) -> void {
+        if (this.rpos == 0) { return; }
+        const live: u64 = this.rbuf.length() - this.rpos;
+        if (live == 0) {
+            this.rbuf.clear();
+            this.rpos = 0;
+            return;
+        }
+        const p: u8* = this.rbuf.as_ptr();
+        mut i: u64 = 0;
+        while (i < live) {
+            p[i] = p[this.rpos + i];
+            i = i + 1;
+        }
+        this.rbuf.truncate(live);
+        this.rpos = 0;
+    }
+
+    /// The transport, for callers that need it directly (socket options, the
+    /// negotiated ALPN protocol). Not for reading or writing — that would
+    /// desynchronize the buffers.
+    transport(mut &this) -> S* {
+        return &this.inner;
+    }
+}
+
+implement trait AsyncRead for struct BufConn<S> {
+    async fill(mut &this) -> Result<u64, IoError> where S: AsyncTransport {
+        this.compact();
+
+        // An array exposes only `[0, length)`, so a capacity-only buffer has
+        // nothing to read into: size it with `resize`.
+        mut sc: Array<u8> = Array<u8>::new();
+        mem::swap<Array<u8>>(&sc, &this.scratch);
+        sc.resize(FILL_CHUNK, 0u8);
+
+        mut t: Transfer = await this.inner.read_into(sc);
+
+        mut got: Array<u8> = t.take_buf();
+        const n: u64 = got.length();
+        mut failed: boolean = false;
+        mut err: IoError = IoError::new(IoErrorKind::Other, 0);
+        match (t.outcome()) {
+            Result::Ok(_)  => { }
+            Result::Err(e) => { failed = true; err = e; }
+        }
+        if (!failed && n > 0) {
+            match (this.rbuf.try_append(got.as_slice())) {
+                Result::Ok(_)  => { }
+                Result::Err(_) => {
+                    failed = true;
+                    err = IoError::new(IoErrorKind::OutOfMemory, 0);
+                }
+            }
+        }
+        // Keep the block for the next fill; `got` is left holding the old empty
+        // scratch and released with the frame.
+        got.clear();
+        mem::swap<Array<u8>>(&got, &this.scratch);
+
+        if (failed) { return Result::Err(err); }
+        return Result::Ok(n);
+    }
+
+    buffered(&this) -> Slice<u8> {
+        return Slice<u8>::from_raw(this.rbuf.as_ptr() + this.rpos,
+                                   this.rbuf.length() - this.rpos);
+    }
+
+    consume(mut &this, count: u64) -> void {
+        this.rpos = this.rpos + count;
+    }
+}
+
+implement trait AsyncWrite for struct BufConn<S> {
+    pending(mut &this) -> Array<u8>* {
+        return &this.wbuf;
+    }
+
+    async flush(mut &this) -> Result<(), IoError> where S: AsyncTransport {
+        while (this.wbuf.length() > 0) {
+            mut out: Array<u8> = Array<u8>::new();
+            mem::swap<Array<u8>>(&out, &this.wbuf);
+
+            mut t: Transfer = await this.inner.write_from(out);
+
+            // The transport hands the buffer back UNTOUCHED, so a short write
+            // still has every byte it has not sent yet; requeue the tail.
+            mut sent_buf: Array<u8> = t.take_buf();
+            mut moved: u64 = 0;
+            mut failed: boolean = false;
+            mut err: IoError = IoError::new(IoErrorKind::Other, 0);
+            match (t.outcome()) {
+                Result::Ok(k)  => { moved = k; }
+                Result::Err(e) => { failed = true; err = e; }
+            }
+            // A sink that repeatedly refuses progress is reported rather than
+            // spun on.
+            if (!failed && moved == 0) {
+                failed = true;
+                err = IoError::new(IoErrorKind::WriteZero, 0);
+            }
+
+            mut rest: Array<u8> = Array<u8>::new();
+            const total: u64 = sent_buf.length();
+            const keep_from: u64 = if (failed) { 0 } else { moved };
+            if (keep_from < total) {
+                match (rest.try_append(sent_buf.as_slice().subslice(keep_from, total))) {
+                    Result::Ok(_)  => { }
+                    Result::Err(_) => {
+                        failed = true;
+                        err = IoError::new(IoErrorKind::OutOfMemory, 0);
+                    }
+                }
+            }
+            mem::swap<Array<u8>>(&rest, &this.wbuf);
+
+            // On failure the unsent bytes are back in `wbuf`, so a caller that
+            // can retry still has them.
+            if (failed) { return Result::Err(err); }
+        }
+        return Result::Ok(());
+    }
+}
+
+implement trait Drop for struct BufConn<S> {
+    drop(mut &this) -> void {
+        this.inner.drop();
+        this.rbuf.drop();
+        this.scratch.drop();
+        this.wbuf.drop();
     }
 }
