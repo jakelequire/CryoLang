@@ -3076,3 +3076,63 @@ honest characterisation of the bug.
 
 **Relevance to §5.** This is squarely on the port's path: an HTTP/1 writer queuing `0x0D` / `0x0A`, or a
 WebSocket encoder queuing an opcode byte, is exactly `queue<u8>(<literal>)`.
+
+---
+
+### 2026-07-26 — `TcpConn`: the concrete transport for the port (§5 foundation)
+
+`stdlib/net/socket/conn.cryo`, registered in `net/socket/_module.cryo`. `TcpConn` owns a `TcpStream` and
+implements both `AsyncRead` and `AsyncWrite`, so it is the concrete thing every protocol layer will be
+generic over (`Conn<S> where S: AsyncRead + AsyncWrite`).
+
+**What it exists to absorb.** `TcpRead::start` / `TcpWrite::start` take the socket AND the buffer BY VALUE
+and hand both back in a `TcpIo`, because a future is moved between polls and cannot hold a pointer into
+anyone's frame. Sound, but every single operation is a move-out / await / move-back. `TcpConn` writes that
+dance once, with `mem::swap` against placeholders, and every exit path — including both error paths —
+restores the socket before returning.
+
+**Two decisions worth keeping.**
+- **Compaction happens at the START of a fill, never at the end.** The read buffer keeps an `rpos` cursor
+  so `consume` is O(1); the consumed prefix is dropped on the next fill. Doing it after a read would shift
+  `buffered()` underneath a caller part-way through parsing a record, which is precisely what the trait's
+  "a fill only APPENDS to what `buffered()` reports" contract forbids.
+- **A failed flush leaves the unsent bytes queued**, so a caller that can retry still has them; a write
+  that moves 0 bytes is reported as `WriteZero` rather than spun on.
+
+**Cancellation semantics, stated because it is a real consequence rather than an oversight:** while an
+operation is in flight the connection holds a closed placeholder and the future owns the real socket, so
+dropping the future closes the connection. That is coherent — nothing else holds the socket, and a
+half-consumed read cannot be resumed against a peer that has already sent the bytes — but it means a
+cancelled read cancels the connection, and a caller wanting to keep the connection must not cancel it.
+
+**Tests: 2**, `tests/tests/stdlib/net_tcp_conn.cryo`, real loopback sockets on a real `Executor`. A framed
+round trip (CRLF header line + fixed-length body, both read through ONE buffer) and a truncated record
+surfacing as `UnexpectedEof`. The framed shape is deliberate: reading a header line and then the body out
+of the same buffer is exactly what the blocking `http::request::read_line` cannot do — its own doc comment
+records that limitation — so it is the behaviour the port depends on.
+
+#### OPEN — a third test was written, failed, and was REMOVED rather than left red or weakened
+
+A "flood" scenario (N length-prefixed records written without reading, receiver reading them one at a time,
+then an ack in the reverse direction) panics with **`called Option::unwrap() on a None value`**. Not
+landed; recorded here with what has been ruled out, because it is unresolved rather than understood.
+
+- The panic can only be `combinator.cryo:117-118` (`Join`'s `a_out.take().unwrap()` /
+  `b_out.take().unwrap()`). Every other `unwrap()` reachable from this path is either guarded by an
+  explicit `is_ok` / range panic with a different message (`Array::set`, `alloc`) or not in it at all
+  (`process::command`).
+- It is **not** volume or compaction: it reproduces identically at 3 records and at 400.
+- It is **not** `Futures::join` with staggered completion in general — a no-socket probe joining two
+  futures that finish 8 polls apart returns the correct pair under `future::block_on`. The distinguishing
+  factor is the real multi-threaded `Executor`, and both `Join` fields are written in the same `poll` call
+  that reads them back, so a lost write across polls is the shape to look at first.
+- Rewriting the scenario onto `Executor::spawn` + `JoinHandle::join` — which is also how a real server
+  would express it — is **blocked by the PARKED same-leaf bug**: naming `JoinHandle` in a program that
+  also pulls in `std::thread` makes `Executor::spawn`'s own bare return re-resolve to
+  `std::thread::JoinHandle`, failing inside `executor.cryo` itself with E0200. See
+  `same-leaf-type-caller-scope-bug-2026-07-26`.
+
+The two landed tests exercise the same `TcpConn` code paths (fill, compact, buffered/consume, queue,
+flush) on the same `Executor`, so the transport itself is covered; what is NOT covered is a long
+bidirectional stream with an ack handshake. Worth resolving before the HTTP/2 and WebSocket layers, which
+are exactly that shape.

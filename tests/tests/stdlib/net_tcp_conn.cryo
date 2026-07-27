@@ -1,0 +1,203 @@
+///! `TcpConn` — the socket-owning `AsyncRead` + `AsyncWrite` — over real
+///! loopback sockets, driven by a real `Executor` (worker pool + reactor).
+///!
+///! The in-memory trait tests (`io_async_traits`) prove the DEFAULT BODIES
+///! against a scripted source. These prove the other half: that the concrete
+///! transport honours the contract those bodies rely on. Specifically that a
+///! `fill` only ever APPENDS to what `buffered()` reports even though the
+///! connection compacts its storage underneath, and that the socket is back in
+///! the connection — not still owned by a completed future — after every
+///! operation.
+///!
+///! Every test binds an EPHEMERAL port (`:0`) and reads the kernel-assigned port
+///! back, so concurrent runs never collide.
+///!
+///! The request/response shape is chosen on purpose: a CRLF-framed header line
+///! followed by a fixed-length body, read through ONE buffer. That is exactly
+///! what the blocking `http::request::read_line` could not do without losing
+///! the bytes it had already buffered past the header — the limitation its own
+///! doc comment records — so it is the behaviour the port depends on.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::NetTcpConn;
+
+import std::core::option;
+import std::core::result;
+import std::core::drop;
+import std::core::slice;
+import std::collections::str;
+import std::collections::string;
+import std::collections::array;
+import std::future;
+import std::io::error;
+import std::io::async_traits;
+import std::net::addr::socket_addr;
+import std::net::socket::tcp;
+import std::net::socket::conn;
+import std::test::error;
+import std::test::assert;
+
+// Every failure is a distinct negative number so a red test names its own step.
+
+function ntc_bytes_eq(a: &Array<u8>, text: string) -> boolean {
+    const b: Slice<u8> = Str::new(text).as_bytes();
+    if (a.length() != b.length()) { return false; }
+    mut i: u64 = 0;
+    while (i < a.length()) {
+        mut x: u8 = 0;
+        mut y: u8 = 1;
+        match (a.get(i)) { Option::Some(v) => { x = v; } Option::None => { } }
+        match (b.get(i)) { Option::Some(v) => { y = v; } Option::None => { } }
+        if (x != y) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// Accept one connection, read a `NAME len\r\n` header line plus exactly `len`
+/// body bytes, and answer with the same framing. Both reads come out of the one
+/// connection buffer.
+async function ntc_serve(listener: TcpListener) -> i64 {
+    mut acc: TcpAccepted = await TcpAccept::start(listener);
+    mut lst: TcpListener = acc.take_listener();
+    lst.drop();
+
+    mut stream: TcpStream = TcpStream::from_fd(-1);
+    match (acc.take_result()) {
+        Result::Ok(s)  => { stream = s; }
+        Result::Err(_) => { return -1; }
+    }
+    mut c: TcpConn = TcpConn::of(stream);
+
+    mut head: String = match (await c.read_line(256)) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { return -2; }
+    };
+    if (head.as_str() != Str::new("ECHO 5")) { return -3; }
+
+    // The body was very likely already in the buffer alongside the header: the
+    // fill reads a whole chunk, not a line. Reading it must therefore come out
+    // of the SAME buffer rather than off the wire again.
+    mut body: Array<u8> = match (await c.read_exact(5)) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { return -4; }
+    };
+    if (!ntc_bytes_eq(&body, "HELLO")) { return -5; }
+
+    // Queue header and body separately, flush once: queuing is synchronous, so
+    // a whole reply costs exactly one suspension.
+    match (c.queue<string>("BACK 5\r\n"))            { Result::Ok(_) => { } Result::Err(_) => { return -6; } }
+    match (c.queue<Slice<u8>>(body.as_slice()))      { Result::Ok(_) => { } Result::Err(_) => { return -7; } }
+    match (await c.flush())                          { Result::Ok(_) => { } Result::Err(_) => { return -8; } }
+    return 5;
+}
+
+async function ntc_client(port: u16) -> i64 {
+    mut c: TcpConn = match (await TcpConn::connect(SocketAddr::localhost_v4(port))) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { return -10; }
+    };
+
+    match (c.queue<string>("ECHO 5\r\nHELLO")) { Result::Ok(_) => { } Result::Err(_) => { return -11; } }
+    match (await c.flush())                    { Result::Ok(_) => { } Result::Err(_) => { return -12; } }
+
+    mut head: String = match (await c.read_line(256)) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { return -13; }
+    };
+    if (head.as_str() != Str::new("BACK 5")) { return -14; }
+
+    mut body: Array<u8> = match (await c.read_exact(5)) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { return -15; }
+    };
+    if (!ntc_bytes_eq(&body, "HELLO")) { return -16; }
+    return 5;
+}
+
+async function ntc_round_trip(port: u16, listener: TcpListener) -> i64 {
+    const pair: (i64, i64) = await Futures::join(ntc_serve(listener), ntc_client(port));
+    if (pair.0 != 5) { return pair.0; }
+    if (pair.1 != 5) { return pair.1; }
+    return 0;
+}
+
+![test]
+function tcp_conn_framed_round_trip() -> Result<(), TestError> {
+    mut listener: TcpListener = match (TcpListener::bind(SocketAddr::localhost_v4(0u16))) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { return bail(Str::new("bind 127.0.0.1:0 failed")); }
+    };
+    listener.set_nonblocking(true);
+    const port: u16 = match (listener.local_addr()) {
+        Result::Ok(a)  => { a.port }
+        Result::Err(_) => { listener.drop(); return bail(Str::new("local_addr failed")); }
+    };
+    mut ex: Executor = Executor::new();
+    const r: i64 = ex.block_on(ntc_round_trip(port, listener));
+    ex.drop();
+    return expect_eq(r, 0 as i64);
+}
+
+/// A peer that closes without sending the record it announced must surface as
+/// `UnexpectedEof` from `read_exact`, not as a hang and not as a short read.
+async function ntc_truncated_send(port: u16) -> i64 {
+    mut c: TcpConn = match (await TcpConn::connect(SocketAddr::localhost_v4(port))) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { return -40; }
+    };
+    match (c.queue<string>("REC 4\r\nab")) { Result::Ok(_) => { } Result::Err(_) => { return -41; } }
+    match (await c.flush())                { Result::Ok(_) => { } Result::Err(_) => { return -42; } }
+    return 1;   // dropping `c` here closes the socket mid-record
+}
+
+async function ntc_truncated_recv(listener: TcpListener) -> i64 {
+    mut acc: TcpAccepted = await TcpAccept::start(listener);
+    mut lst: TcpListener = acc.take_listener();
+    lst.drop();
+    mut stream: TcpStream = TcpStream::from_fd(-1);
+    match (acc.take_result()) {
+        Result::Ok(s)  => { stream = s; }
+        Result::Err(_) => { return -50; }
+    }
+    mut c: TcpConn = TcpConn::of(stream);
+    mut head: String = match (await c.read_line(64)) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { return -51; }
+    };
+    if (head.as_str() != Str::new("REC 4")) { return -52; }
+    match (await c.read_exact(4)) {
+        Result::Ok(_)  => { return -53; }
+        Result::Err(e) => {
+            match (e.kind) {
+                IoErrorKind::UnexpectedEof => { return 1; }
+                _ => { return -54; }
+            }
+        }
+    }
+}
+
+async function ntc_truncated(port: u16, listener: TcpListener) -> i64 {
+    const pair: (i64, i64) = await Futures::join(ntc_truncated_recv(listener),
+                                                 ntc_truncated_send(port));
+    if (pair.0 != 1) { return pair.0; }
+    if (pair.1 != 1) { return pair.1; }
+    return 0;
+}
+
+![test]
+function tcp_conn_reports_a_truncated_record_as_eof() -> Result<(), TestError> {
+    mut listener: TcpListener = match (TcpListener::bind(SocketAddr::localhost_v4(0u16))) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { return bail(Str::new("bind 127.0.0.1:0 failed")); }
+    };
+    listener.set_nonblocking(true);
+    const port: u16 = match (listener.local_addr()) {
+        Result::Ok(a)  => { a.port }
+        Result::Err(_) => { listener.drop(); return bail(Str::new("local_addr failed")); }
+    };
+    mut ex: Executor = Executor::new();
+    const r: i64 = ex.block_on(ntc_truncated(port, listener));
+    ex.drop();
+    return expect_eq(r, 0 as i64);
+}
