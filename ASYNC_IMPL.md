@@ -47,7 +47,7 @@ not for routine judgement calls.
 | 6 | `await` in a `match`-arm guard | ✅ DONE+validated 2026-07-25 — the last rejected `await` position. Such a `match` lowers to a DECISION CHAIN (one test state per arm, a false guard falling to the next test) instead of the single dispatch, which every other `match` keeps. Subject evaluated once into a chain-owned field; fall-through arm emitted only when the arm can fail to match; `hoist_match_expr`'s matching bail-out removed so the expression form works too. 14 tests. **One sub-case rejected with a precise diagnostic rather than lowered:** an arm binding an OWNING payload out of the subject, which a later test would then re-match hollowed-out. |
 
 | 5b-tls | Async TLS (the port's prerequisite) | ✅ DONE+validated 2026-07-25. `stdlib/net/tls/future.cryo`: `TlsHandshake` / `TlsRead` / `TlsWrite` / `TlsIo`, plus `TlsConnector::connect_async` and `TlsAcceptor::accept_async`. Each `WANT_READ`/`WANT_WRITE` becomes a reactor registration rather than a spin; the interest to arm is read off the SSL error code (a read CAN want writability), and each future records the one direction it armed so its `Drop` cancels only that half. Sound only because §5a made the read/write futures own their buffer — OpenSSL requires a `WANT_*` retry to repeat the same call with the SAME arguments, and a future moves between polls. 1 test: loopback handshake + encrypted echo with **both sides as tasks on ONE `Executor`**, which the blocking TLS test cannot do (it needs a thread, or `SSL_connect` blocks before `SSL_accept` runs). |
-| 5b-port | Socket port + delete the blocking surface | ◐ IN PROGRESS — **increment 1 DONE 2026-07-27** (one generic `BufConn<S>` over an `AsyncTransport` seam; `TcpConn` deleted; `io::async_traits` and `io::buf_conn` dissolved into `io::traits` / `io::buf` per Jake's module-structure ruling; needed one compiler fix — a trait `async` default body could not await a required method when the impl was on a GENERIC owner. See the newest §9 entry). Consumers NOT yet ported. Earlier: gated on 5c (async trait methods), per Jake's 2026-07-26 call. Remaining: port `net/http/{client,server}`, `net/http2/{client,server,connection}`, `net/https.cryo`, `net/ws/conn.cryo`, then delete `TcpStream::connect/read/write`, `TcpListener::bind/accept` and the blocking TLS entry points. One-way API break: every `HttpClient::get`-shaped call becomes `async`. **Re-derived consumer list (2026-07-26): far smaller than "19 files" — most of the greps that produced that count are doc-comment mentions. `net/dns.cryo`, `net/addr/ip.cryo` and `net/socket/udp.cryo` name `TcpStream` ONLY in prose and need no port.** **Scope correction (2026-07-26): there are no `AsyncRead`/`AsyncWrite` traits in the tree yet** — the async surface is concrete futures (`TcpRead`/`TcpWrite`/`TlsRead`/`TlsWrite`), so step 1 of the port is to DESIGN those traits, not to retarget onto existing ones. The shape follows from two settled constraints: the future must OWN the buffer (§5a — a caller-frame `u8*` is written through a stale address), while the transport may now stay in `mut &this` (§5d makes a receiver held across a suspend sound), i.e. `async read(mut &this, buf: Array<u8>) -> AsyncIo` handing the buffer back the way `TcpIo::take_buf()` already does. The blocking `io::Read`/`io::Write` take `u8*` / `Slice<u8>`, so they cannot simply be mirrored. ~3,300 non-comment lines of consumer code plus tests. **Unblocked 2026-07-26 by 5f** — `?` did not work in any `async` function, which no amount of stdlib care would have worked around; the trait shape above is now proven to compile AND run (see 5f). Writing the traits into `stdlib/` is the next step and has NOT been done. |
+| 5b-port | Socket port + delete the blocking surface | ◐ IN PROGRESS — **increment 2 DONE 2026-07-28: `net/http` HTTP/1.1 framing on `BufConn<S>`.** Sync encoders (`Headers`/`Request`/`Response::encode_into` into an `Array<u8>*`), grammar extracted once (`from_request_line` / `from_status_line`, shared with the blocking `parse` during the migration), async readers as METHODS on the connection (`net/http/conn.cryo`, `type trait HttpConn` implemented for `BufConn<S>`), and `Client::get`/`post`/`send` now `async` over `TcpConnect::start`. **Two async-lowering bugs fixed at the root** — (1) a `return` in ONE `if`/`match` branch made a state disown a carried aggregate on paths that never ran (unwrap-on-`None`); (2) **PRE-EXISTING and the real blocker: the receiver refresh was silently skipped for an `async` TRAIT method on a GENERIC receiver, so NO `BufConn<S>` could survive more than one write-then-read cycle** (socket swapped back into dead stack memory → `EBADF`). Nothing caught it because every existing test flushed at most once per connection. 8 new tests in `net_http_conn.cryo`, all asserting numbers (incl. a FILL COUNT of exactly 1 for two pipelined responses, with a one-byte-per-fill control). `make test` 1846/1846 + 159 compile-fail + 14 projects PASS. **Repin owed (compiler changed); selfhost-check not yet run.** Still to port: `net/http/server.cryo`, `net/https.cryo`, `net/ws/conn.cryo`, `net/http2/*`, then delete the blocking surface. Earlier: **increment 1 DONE 2026-07-27** (one generic `BufConn<S>` over an `AsyncTransport` seam; `TcpConn` deleted; `io::async_traits` and `io::buf_conn` dissolved into `io::traits` / `io::buf` per Jake's module-structure ruling; needed one compiler fix — a trait `async` default body could not await a required method when the impl was on a GENERIC owner. See the newest §9 entry). Consumers NOT yet ported. Earlier: gated on 5c (async trait methods), per Jake's 2026-07-26 call. Remaining: port `net/http/{client,server}`, `net/http2/{client,server,connection}`, `net/https.cryo`, `net/ws/conn.cryo`, then delete `TcpStream::connect/read/write`, `TcpListener::bind/accept` and the blocking TLS entry points. One-way API break: every `HttpClient::get`-shaped call becomes `async`. **Re-derived consumer list (2026-07-26): far smaller than "19 files" — most of the greps that produced that count are doc-comment mentions. `net/dns.cryo`, `net/addr/ip.cryo` and `net/socket/udp.cryo` name `TcpStream` ONLY in prose and need no port.** **Scope correction (2026-07-26): there are no `AsyncRead`/`AsyncWrite` traits in the tree yet** — the async surface is concrete futures (`TcpRead`/`TcpWrite`/`TlsRead`/`TlsWrite`), so step 1 of the port is to DESIGN those traits, not to retarget onto existing ones. The shape follows from two settled constraints: the future must OWN the buffer (§5a — a caller-frame `u8*` is written through a stale address), while the transport may now stay in `mut &this` (§5d makes a receiver held across a suspend sound), i.e. `async read(mut &this, buf: Array<u8>) -> AsyncIo` handing the buffer back the way `TcpIo::take_buf()` already does. The blocking `io::Read`/`io::Write` take `u8*` / `Slice<u8>`, so they cannot simply be mirrored. ~3,300 non-comment lines of consumer code plus tests. **Unblocked 2026-07-26 by 5f** — `?` did not work in any `async` function, which no amount of stdlib care would have worked around; the trait shape above is now proven to compile AND run (see 5f). Writing the traits into `stdlib/` is the next step and has NOT been done. |
 | 5c | Async trait methods (the port's prerequisite) | ✅ DONE+validated 2026-07-26. First the **three blocking projection gaps — six defects** — were fixed across parser/sema/type-resolver/mono, so projection-typed dispatch, `block_on` on a projection and `await` on a projection all work. Then the feature itself: `E0364` lifted for trait methods (`virtual`/`override` still rejected), `desugar_async_trait_methods` synthesizing the implicit `<Method>Fut` + projection return, `bind_async_trait_assoc` binding each impl's own future, and E0309 taught the binding is implicit. **Default bodies included** — they cost almost nothing because `synthesize_default_trait_methods` already clones them per-impl, so no future generic over `This` was needed. 6 tests; the obsolete `E0364_async_trait_method` negative deleted. Two §9 entries. **Jake chose this** over poll-traits-plus-adapters and over de-genericizing to an `AsyncStream` union. Forced by two facts: `Http2Connection<S>` / `WebSocket<S>` hold `inner: S*` (BORROWED — `E0455` rejects that across a suspend, so the transport must be owned), and `async` on a trait method is currently rejected outright (`E0364`, parser). Design: `async read(&this, n) -> T` desugars to an implicit associated type plus a projection return (`type ReadFut; read(&this, n) -> This::ReadFut`), each impl binding it to its own synthesized future via the existing positional trait-arg sugar. Jake's scope calls (2026-07-26): default bodies ARE in scope (one future generic over `This`), and `S: AsyncRead` alone must IMPLY the future's bound — the latter already works as a consequence of the gap fixes, verified by a probe carrying only `where S: AsyncRead`. |
 
 | 5d | Receiver-pointer refresh at resume (soundness hole opened by 5c) | ✅ DONE+validated 2026-07-26. An `async` method with a `&this` / `mut &this` receiver stores the receiver's ADDRESS in a `this$recv` field of the future it lowers to, written once at construction. That contradicted §4's load-bearing invariant (no self-references ⇒ futures freely movable ⇒ **no address-stability requirement**) and design-review item 6, which says this exact shape must be `E0455`. It was also wrong for a reason stronger than movability: an owning receiver promoted across states is **taken into a fresh block-local on every poll** and handed back on the way out, so the address legitimately changes each poll. Jake chose refresh-at-resume over making the sugar consuming or adopting an address-stability contract. `lower_carrier_sm` now re-addresses `this$recv` from the enclosing frame's own storage immediately before every poll (single site — there is exactly one sub-future stash/poll point). A receiver reached through a pointer is passed through rather than addressed twice. Two shapes that cannot be re-addressed are now rejected instead of silently corrupting: a receiver that names no storage (temporary / call result), and awaiting a method future the awaited expression did not itself produce. 4 tests + 2 negatives. **Proof:** a probe polling by hand and dirtying the stack between polls returns `15`/garbage pre-fix and the correct values post-fix (pre-fix `FAILMASK=11`, post-fix `0`), and the emitted IR shows `store ptr %h, ptr %fieldptr` into `this$recv` ahead of the poll. |
@@ -3485,3 +3485,81 @@ showed up as a one-line type diff (`{ i32, [0 x i8] }` vs `{ i32, [2 x i64] }`);
 printing the call node's resolved type under `--debug` in both orderings and seeing `Int` where the
 working order said `Unit`. In both cases the fix location was then obvious, and in both cases a comment
 already in the file described the hazard — the guard just did not cover the case.
+
+### 2026-07-28 — §5b-port increment 2: HTTP/1.1 framing on `BufConn<S>`; two async-lowering bugs fixed at the root
+
+**Shipped.** `net/http` now frames messages over the async connection seam:
+
+- **Sync encoders.** `Headers::encode_into`, `Request::encode_into`, `Response::encode_into` build a whole
+  message into a caller-supplied `Array<u8>*` — normally the connection's `pending()`. A message is
+  therefore assembled with **no suspension point inside it**, and the caller suspends exactly once, in
+  `flush`. `headers::push_all` is the one OOM-checked append they share. `Headers::content_length` reads
+  the declared body size once, reporting a non-numeric value as `InvalidData` rather than guessing zero.
+- **Grammar extracted once.** `Request::from_request_line` / `Response::from_status_line` parse a single
+  line into a message with empty headers and no body. The blocking `parse<R: Read>` and the new async
+  reader now share them, so the grammar has exactly ONE implementation while both paths coexist during the
+  migration.
+- **Async readers are methods on the connection.** New `net/http/conn.cryo` declares `type trait HttpConn`
+  with `read_request` / `read_response`, implemented for `BufConn<S>`. This is forced, not stylistic: a
+  parser written as a static taking `mut &BufConn<S>` cannot be called by an async caller holding the
+  connection as a local (E0455 — only the RECEIVER is re-supplied on every poll).
+- **`Client::get` / `post` / `send` are now `async`**, over `TcpConnect::start` + `BufConn<TcpStream>`.
+  `send_over` is untouched this increment; the server still uses the blocking path, so `write_to` / `parse`
+  stay until increment 3 retires them.
+
+**Bug 1 — a `return` in one branch made a state disown a value it still held (found by the new tests).**
+`last_use_consumes` walks a state block's statements in source order and keeps the last answer, but
+alternatives are not sequential: it walked BOTH arms of an `if` and EVERY arm of a `match`. One arm that
+returned the carried value therefore set the marker for paths that never execute it, `needs_handback`
+concluded the state had given the value away, the tail hand-back was skipped, and the next state's
+`take().unwrap()` found a `None`. Shape:
+
+```
+mut resp: Response = ...;            // carried across the header loop
+match (declared) {
+    Option::Some(n) => { length = n; }
+    Option::None    => { return Result::Ok(resp); }   // <-- poisoned the other path
+}
+if (length > 0) { mut body = (await this.read_exact(length))?; resp.body = body; }
+```
+
+Fixed by skipping branches that `return`: a path that never reaches the tail cannot describe what the
+state does on the way out. The new `stmt_returns` is deliberately NARROWER than `stmt_diverges` — the
+latter also reports `break`/`continue`, which land at the end of a loop that is still inside the same
+block, so a value given away just before one of those DOES reach the tail and must not be handed back.
+
+**Bug 2 — the receiver refresh was silently skipped for an `async` trait method on a generic receiver
+(PRE-EXISTING; confirmed identical under the pinned compiler).** This is the one that mattered: **no
+`BufConn<S>` could survive more than one write-then-read cycle**, on any protocol. Nothing caught it
+because every existing test flushes at most once per connection.
+
+`await this.inner.write_from(out)` inside a method of `BufConn<S>` awaits `S::write_from`, whose future
+`desugar_async_trait_methods` expressed as the projection `S::WriteFromFut`. `awaited_recv_ptr_type`
+answers "does this future keep a receiver pointer?" from the future's own layout — and a projection over a
+generic parameter has no layout yet, so it answered "no" and `lower_carrier_sm` emitted no refresh.
+Monomorphization then produced a future that DOES store one. The sub-future kept the `&this.inner` it
+recorded when it was built; the caller's carried `BufConn` moves between polls (taken out of its `Option`
+carrier into a fresh local each time), so `write_from` swapped the socket back into **dead stack memory**
+while the live connection kept the closed placeholder — `EBADF (9)` on the next write, and a hang on the
+peer.
+
+The declaration settles what the abstract type cannot: `awaited_keeps_recv_ptr` recognises the awaited
+projection as this method's own future (via the canonical `async_fut_assoc_name`), then reads the receiver
+form off the trait's declaration. `resolved_method` is NOT usable here — overload resolution needs a
+concrete owner, so it is null for exactly these calls.
+
+**Method.** Bug 2 was found by bisecting downward, not by reading passes: 4 write/read cycles failed
+through `BufConn<TcpStream>` (0/6) but passed driving `AsyncTransport` directly (3/3), which put the fault
+between them; the emitted IR then showed the resume path going `take` → `unwrap` → `poll` with no receiver
+store between, and a `--debug` print of the awaited type named `AssocProjection` / `GenericParam` /
+`WriteFromFut`. Comparing against `bin/cryo` proved it pre-dated the session's changes.
+
+**Coverage** — `tests/tests/stdlib/net_http_conn.cryo`, 8 tests, every one asserting a number:
+two pipelined responses out of ONE fill assert a **fill count of exactly 1**, with the same pair split
+**one byte per fill** as the control (fill count == byte count); truncated body → `UnexpectedEof`;
+non-numeric `Content-Length` → `InvalidData`; encode→parse round trip; **four exchanges on one
+connection** over a real `Executor` and reactor, with the one-exchange control beside it; and
+`Client::get` end to end over loopback.
+
+**LANDMINE recorded.** A pipe swallows a hung probe's output even after `fflush` — `timeout 15 ./probe |
+tail` printed NOTHING while `> out.log` captured every marker. Redirect to a FILE when diagnosing a hang.
