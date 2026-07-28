@@ -1,13 +1,17 @@
-///! Async TLS - `connect_async` / `accept_async` / `TlsRead` / `TlsWrite` over
+///! Async TLS - `start_connect` / `start_accept` / `TlsRead` / `TlsWrite` over
 ///! loopback, driven by a real `Executor`.
 ///!
-///! The blocking TLS test has to spawn a THREAD for the client, because a TLS
-///! handshake is bidirectional and `SSL_connect` would block before the server
-///! ever reached `SSL_accept`. That constraint is exactly what the async layer
-///! removes: on non-blocking sockets both sides are futures, each parking on the
-///! readiness OpenSSL asks for, so client and server run as two tasks on ONE
-///! executor and the handshake interleaves itself. No thread here is the result
-///! under test, not an incidental simplification.
+///! A TLS handshake is bidirectional, so on blocking sockets it needs a THREAD
+///! per side: `SSL_connect` would block before the server ever reached
+///! `SSL_accept`. That constraint is exactly what this layer removes — on
+///! non-blocking sockets both sides are futures, each parking on the readiness
+///! OpenSSL asks for, so client and server run as two tasks on ONE executor and
+///! the handshake interleaves itself. No thread here is the result under test,
+///! not an incidental simplification.
+///!
+///! These drive the TWO-STEP form, which is what a caller needs when it must own
+///! the handshake future itself; `TlsConnector::connect` wraps both steps and is
+///! covered by `net_https`.
 ///!
 ///! Requires `ssl` + `crypto` in `tests/cryoconfig` link_libs and the fixture
 ///! cert/key under `fixtures/tls/` (cwd is the `tests/` project root when
@@ -45,7 +49,7 @@ async function tls_serve_echo(listener: TcpListener, acceptor: TlsAcceptor) -> i
     }
 
     mut ac: TlsAcceptor = acceptor;
-    mut hs: TlsHandshake = match (ac.accept_async(sock)) {
+    mut hs: TlsHandshake = match (ac.start_accept(sock)) {
         Result::Ok(h)  => { h }
         Result::Err(_) => { ac.drop(); return -2; }
     };
@@ -87,7 +91,7 @@ async function tls_echo_client(port: u16, connector: TlsConnector) -> i64 {
     }
 
     mut cn: TlsConnector = connector;
-    mut hs: TlsHandshake = match (cn.connect_async(sock, Str::new("localhost"))) {
+    mut hs: TlsHandshake = match (cn.start_connect(sock, Str::new("localhost"))) {
         Result::Ok(h)  => { h }
         Result::Err(_) => { cn.drop(); return -11; }
     };
