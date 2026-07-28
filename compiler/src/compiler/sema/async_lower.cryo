@@ -1705,20 +1705,27 @@ type struct AsyncLower {
                 // last use, suppressing the tail hand-back. Same hazard, and same
                 // ordering rule, as a promoted local.
                 const handback: boolean = this.needs_handback(sm.blocks[b], pname);
+                // The name the value lives under in THIS state: the carried name
+                // when the state took it, or the fresh binding a declaring state
+                // was given.
+                mut local: SymbolStr = pname;
                 if (carried_in) {
                     this.prepend_agg_take(sm.blocks[b], pname, pname, lty, opt_ty,
                                           sm.struct_ref, true, span);
                     this.store_before_suspends(sm, sm.blocks[b] as StatementNode*,
                                                pname, opt_ty, pname, lty, span);
-                } else if (!this.decl_at_first_assignment(sm.blocks[b], pname, lty, span)) {
-                    this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
-                        "async: this parameter is reassigned after an `await` from inside a branch; assign it once at the top level of that step so the state machine can bind it there",
-                        p.span);
-                    sm.ok = false; return;
+                } else {
+                    local = this.decl_at_first_assignment(sm.blocks[b], pname, lty, span);
+                    if (!local.is_valid()) {
+                        this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
+                            "async: this parameter is reassigned after an `await` from inside a branch; assign it once at the top level of that step so the state machine can bind it there",
+                            p.span);
+                        sm.ok = false; return;
+                    }
                 }
                 if (handback) {
                     sm.blocks[b].add_statement(
-                        this.agg_store_stmt(sm, pname, opt_ty, pname, lty, span));
+                        this.agg_store_stmt(sm, pname, opt_ty, local, lty, span));
                 }
             }
         }
@@ -3595,14 +3602,36 @@ type struct AsyncLower {
     /// binding is whatever the stack held, and dropping it would run that
     /// destructor on garbage. For a socket, "garbage" can be a perfectly valid
     /// descriptor number, so the drop closes an unrelated file.
+    /// The declaration is bound to a FRESH name, and the rest of the state is
+    /// rewritten onto it. Reusing the carried local's name would give several
+    /// states a declaration spelled the same way, and codegen keys a local's
+    /// drop flag by name: the states would then share ONE flag while owning
+    /// separate storage, so a flag raised where one state initialized its copy
+    /// enables the scope-exit drop in another that never did. With two such
+    /// states it happens to survive; with three — an `if`/`else` whose arms both
+    /// write the value — the same heap block is released twice.
+    ///
+    /// Returns the fresh name, or the empty symbol when the state has no
+    /// top-level assignment to convert. Callers must hand the value back under
+    /// the name returned here, not the one they passed in.
     decl_at_first_assignment(mut &this, blk: BlockStmtNode*, name: SymbolStr,
-                             lty: TypeRef, span: SourceSpan) -> boolean {
+                             lty: TypeRef, span: SourceSpan) -> SymbolStr {
         const i: i64 = this.top_level_assignment_index(blk, name);
-        if (i < 0i64) { return false; }
+        if (i < 0i64) { return SymbolStr::empty(); }
         const b: BinaryExprNode* =
             ((blk.statements[i] as ExprStmtNode*).expression) as BinaryExprNode*;
-        blk.statements[i] = this.var_decl_stmt(name, true, lty, b.right, span);
-        return true;
+        const fresh: SymbolStr = this.mint_local(this.strip_local_marker(name));
+        blk.statements[i] = this.var_decl_stmt(fresh, true, lty, b.right, span);
+        // Only what FOLLOWS the declaration: this is the state's first mention of
+        // the name, so nothing before it can refer to the binding.
+        const saved: i64 = this.subst_mode;
+        this.subst_mode = this.subst_to_local();
+        for (mut j: i64 = i + 1i64; j < blk.statements.length; j++) {
+            this.subst_name_stmt(blk.statements[j], name, fresh,
+                                 TypeRef::invalid(), lty, span);
+        }
+        this.subst_mode = saved;
+        return fresh;
     }
 
     /// Index of the state's first `<name> = <expr>;` written at the TOP level of
@@ -3667,6 +3696,10 @@ type struct AsyncLower {
     /// the value back in an ordinary local. `take` empties the field, so the
     /// value is never reachable through two places at once. Mirrors how a
     /// sub-future is taken out of its slot at the top of a resume state.
+    ///
+    /// Several states may open with a take of the SAME carried value, and they
+    /// all declare it under `name` — see the note above this function for why
+    /// they cannot each be given their own binding, and what that costs.
     prepend_agg_take(mut &this, blk: BlockStmtNode*, name: SymbolStr, field: SymbolStr,
                      lty: TypeRef, opt_ty: TypeRef, struct_ref: TypeRef,
                      mutable: boolean, span: SourceSpan) -> void {
@@ -3675,6 +3708,16 @@ type struct AsyncLower {
         for (mut i: i64 = 0; i < blk.statements.length; i++) { rebuilt.push(blk.statements[i]); }
         blk.statements = rebuilt;
     }
+
+    // A state that TAKES a carried value cannot be given a per-state binding
+    // the way a state that produces one is (`decl_at_first_assignment`). The
+    // states share AST statement nodes — a loop body reached from several
+    // states is the same node list — so renaming per state rewrites a node
+    // that another state also reads, and the second state's take then declares
+    // a name nothing refers to while the shared statements name a binding that
+    // is not in their scope (E0201). De-sharing those nodes, or keying drop
+    // flags per declaration rather than by name in codegen, is what would let
+    // the taking states be separated.
 
     /// Insert the hand-back store before every `return Poll::Pending` inside
     /// `s`. A suspend leaves `poll` from the middle of a state, so the store at
@@ -4109,7 +4152,7 @@ type struct AsyncLower {
                     for (mut b: i64 = 0; b < sm.blocks.length; b++) {
                         if (b == ds) { continue; }
                         if (this.block_first_use(sm.blocks[b], nm) == 0i64) { continue; }
-                        if (!this.decl_at_first_assignment(sm.blocks[b], nm, lty, span)) {
+                        if (!this.decl_at_first_assignment(sm.blocks[b], nm, lty, span).is_valid()) {
                             this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
                                 "async: this value is rebuilt after an `await` from inside a branch; assign it once at the top level of that step (`x = …;`) so the state machine can bind it there",
                                 vd.span);
@@ -4189,22 +4232,29 @@ type struct AsyncLower {
                         }
                         carried_in = true;
                     }
+                    // The name the value lives under in THIS state: the carried
+                    // name when the state took it, or the fresh binding a
+                    // declaring state was given.
+                    mut local: SymbolStr = nm;
                     if (carried_in) {
                         this.prepend_agg_take(sm.blocks[b], nm, afield, lty, opt_ty,
                                               sm.struct_ref, true, span);
                         // Live from the top of this state, so a suspend partway
                         // through has to hand it back first.
                         this.store_before_suspends(sm, sm.blocks[b] as StatementNode*,
-                                                   afield, opt_ty, nm, lty, span);
-                    } else if (!this.decl_at_first_assignment(sm.blocks[b], nm, lty, span)) {
-                        this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
-                            "async: this value is rebuilt after an `await` from inside a branch; assign it once at the top level of that step (`x = …;`) so the state machine can bind it there",
-                            vd.span);
-                        sm.ok = false; return;
+                                                   afield, opt_ty, local, lty, span);
+                    } else {
+                        local = this.decl_at_first_assignment(sm.blocks[b], nm, lty, span);
+                        if (!local.is_valid()) {
+                            this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
+                                "async: this value is rebuilt after an `await` from inside a branch; assign it once at the top level of that step (`x = …;`) so the state machine can bind it there",
+                                vd.span);
+                            sm.ok = false; return;
+                        }
                     }
                     if (handback) {
                         sm.blocks[b].add_statement(
-                            this.agg_store_stmt(sm, afield, opt_ty, nm, lty, span));
+                            this.agg_store_stmt(sm, afield, opt_ty, local, lty, span));
                     }
                 }
                 sm.prom_field.push(afield);

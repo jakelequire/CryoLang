@@ -1,25 +1,29 @@
 ///! An owning value written into a local from inside a BRANCH of an `async`
-///! function is miscompiled.
+///! function used to be miscompiled: heap corruption from a double free.
 ///!
-///! **These tests are expected to fail.** They are a finding, not a
-///! regression: the shape below produces heap corruption or an
-///! `unwrap() on a None value`, depending on which side of the carrier
-///! hand-back gets it wrong, and it is what currently prevents
-///! `net::http::server` from putting a deadline on a connection read
-///! (`Futures::timeout` around the read forces exactly this shape).
+///! A state whose first touch of a carried local is a top-level write does not
+///! take the value out of the carrier — it produces its own — so the lowering
+///! turns that write into a declaration. It used to bind the SAME alpha-renamed
+///! name in every such state, and codegen keys a local's drop flag BY NAME, so
+///! several states shared one flag while owning separate storage. A flag raised
+///! where one state initialized its copy then enabled the scope-exit drop in a
+///! state that never did.
 ///!
-///! The carrier is per-state: an owning local is taken out of its frame field
-///! when a state is entered and handed back as the state falls off the end,
-///! unless that state gave the value away. A local written from an `await`
-///! inside a branch is written in one state and read in another, and the
-///! hand-back decision for the branch states comes out wrong -- too eager and
-///! the value is dropped twice, too shy and the next state's `take().unwrap()`
-///! finds `None`.
+///! The arithmetic of it is why an `if`/`else` is the shape that breaks: one
+///! declaring state is fine, two survive, and three — the entry state plus one
+///! per arm — release the same heap block twice. Each declaring state now binds
+///! a fresh name and hands the value back under it.
+///!
+///! Only the states that PRODUCE the value are separated. States that TAKE a
+///! carried value still share one binding, and several of those in one function
+///! still collide; the note above `prepend_agg_take` in `sema/async_lower.cryo`
+///! records why they cannot simply be renamed too. That remainder is what keeps
+///! `HttpServer::with_read_timeout` unenforced.
 ///!
 ///! `carried_owning_local_written_outside_any_branch` is the CONTROL: the same
-///! function with the branch removed. It passes. That is what identifies the
-///! branch, rather than the loop or the await or the owning payload, as the
-///! variable that matters.
+///! function with the branch removed. It passed throughout, which is what
+///! identified the branch — rather than the loop, the await, or the owning
+///! payload — as the variable that mattered.
 
 ![config(testing)]
 namespace CryoTests::Tests::Stdlib::AsyncBranchOwningLocal;
