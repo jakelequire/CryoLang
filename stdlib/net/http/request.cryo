@@ -100,20 +100,19 @@ type struct Request {
         );
     }
 
-    /// Parse from a `Read` impl. Consumes bytes up to and including
-    /// the body (if any). Fails with `InvalidData` on malformed
-    /// input; that's a protocol error the server surfaces as 400.
-    static parse<R>(reader: mut &R) -> Result<Request, IoError>
-    where R: Read {
-        mut line: String = String::new();
-        read_line(reader, &line, MAX_HEADER_LINE)?;
-
-        // Request-Line: METHOD SP PATH SP VERSION
+    /// Parse a Request-Line (`METHOD SP PATH SP VERSION`, no CRLF) into
+    /// a request with empty headers and no body. Malformed input is
+    /// `InvalidData`, which a server surfaces as 400.
+    ///
+    /// Split out from the message parse so the grammar has exactly one
+    /// implementation: the blocking `parse` below and the connection's
+    /// `read_request` differ only in how they obtain the line.
+    static from_request_line(line: Str) -> Result<Request, IoError> {
         mut first_sp: u64 = line.length();
         mut second_sp: u64 = line.length();
         mut i: u64 = 0;
         while (i < line.length()) {
-            match (line.as_str().byte_at(i)) {
+            match (line.byte_at(i)) {
                 Option::Some(byte) => {
                     if (byte == 0x20) {
                         if (first_sp == line.length()) { first_sp = i; }
@@ -128,9 +127,9 @@ type struct Request {
             return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
         }
 
-        const method_str: Str = line.as_str().sub_bytes(0, first_sp);
-        const path_str: Str = line.as_str().sub_bytes(first_sp + 1, second_sp);
-        const version_str: Str = line.as_str().sub_bytes(second_sp + 1, line.length());
+        const method_str: Str = line.sub_bytes(0, first_sp);
+        const path_str: Str = line.sub_bytes(first_sp + 1, second_sp);
+        const version_str: Str = line.sub_bytes(second_sp + 1, line.length());
 
         mut parsed_method: Method = Method::Get;
         match (Method::parse(method_str)) {
@@ -140,14 +139,25 @@ type struct Request {
             }
         }
 
-        mut req: Request = Request {
+        return Result::Ok(Request {
             method:  parsed_method,
             path:    String::from_str(path_str),
             version: String::from_str(version_str),
             headers: Headers::new(),
             body:    Array::new(),
             params:  HashMap::new()
-        };
+        });
+    }
+
+    /// Parse from a `Read` impl. Consumes bytes up to and including
+    /// the body (if any). Fails with `InvalidData` on malformed
+    /// input; that's a protocol error the server surfaces as 400.
+    static parse<R>(reader: mut &R) -> Result<Request, IoError>
+    where R: Read {
+        mut line: String = String::new();
+        read_line(reader, &line, MAX_HEADER_LINE)?;
+
+        mut req: Request = Request::from_request_line(line.as_str())?;
 
         // Header block: lines until an empty one.  The loop body owns
         // each `header_line` String; auto-drop synthesis emits the
@@ -203,6 +213,42 @@ type struct Request {
         }
 
         return Result::Ok(req);
+    }
+
+    /// Append the whole message — request line, headers, blank line,
+    /// body — to `out`, normally the connection's `pending()` buffer.
+    ///
+    /// Synchronous by design: an entire request is assembled with no
+    /// suspension point inside it, so a caller sending one suspends
+    /// exactly once, in the following `flush`. That is also what makes
+    /// a partially-encoded message impossible to put on the wire — an
+    /// `OutOfMemory` here leaves `out` short, and nothing has been sent.
+    encode_into(&this, out: Array<u8>*) -> Result<(), IoError> {
+        const crlf: Slice<u8> = Slice::from_raw("\r\n", 2);
+        const sp: Slice<u8> = Slice::from_raw(" ", 1);
+        // HTTP/1.1 is the only version this stdlib emits.  Going
+        // through `this.version` would force every callsite to keep a
+        // valid `String` for the version field, but module-level const
+        // init for `HTTP_VERSION` is fragile (the bytes can come back
+        // empty after `String::from_str`), so write the constant
+        // directly.  Servers ignore the textual version anyway for
+        // dispatch purposes.
+        const http11: Slice<u8> = Slice::from_raw("HTTP/1.1", 8);
+
+        headers::push_all(out, this.method.as_str().as_bytes())?;
+        headers::push_all(out, sp)?;
+        headers::push_all(out, this.path.as_bytes())?;
+        headers::push_all(out, sp)?;
+        headers::push_all(out, http11)?;
+        headers::push_all(out, crlf)?;
+
+        this.headers.encode_into(out)?;
+
+        headers::push_all(out, crlf)?;
+        if (!this.body.is_empty()) {
+            headers::push_all(out, this.body.as_slice())?;
+        }
+        return Result::Ok(());
     }
 
     /// Write to a `Write` impl. Emits request line, headers, CRLF,

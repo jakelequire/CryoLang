@@ -29,6 +29,10 @@ import net::http::method;
 import net::http::request;
 import net::http::response;
 import net::http::headers;
+import net::http::conn;
+import future::poll;
+import future::waker;
+import future::traits;
 
 type struct Client {
     static new() -> Client {
@@ -36,20 +40,20 @@ type struct Client {
     }
 
     /// `GET addr/path`. Sets Host to `addr`'s address:port.
-    get(&this, addr: SocketAddr, path: Str) -> Result<Response, IoError> {
+    async get(&this, addr: SocketAddr, path: Str) -> Result<Response, IoError> {
         mut req: Request = Request::new(Method::Get, path);
         apply_host_header(&req, &addr);
-        return send(addr, req);
+        return await send(addr, req);
     }
 
     /// `POST addr/path` with body bytes. Sets Host and passes the
     /// supplied Content-Type through unchanged; if the caller didn't
     /// set one, the server may fall back to octet-stream.
-    post(&this,
-         addr: SocketAddr,
-         path: Str,
-         content_type: Str,
-         body: Array<u8>) -> Result<Response, IoError> {
+    async post(&this,
+               addr: SocketAddr,
+               path: Str,
+               content_type: Str,
+               body: Array<u8>) -> Result<Response, IoError> {
         mut req: Request = Request::new(Method::Post, path);
         apply_host_header(&req, &addr);
         req.headers.insert(
@@ -57,34 +61,44 @@ type struct Client {
             content_type
         );
         req.set_body(body);
-        return send(addr, req);
+        return await send(addr, req);
     }
 }
 
-/// Open a connection, write the request, parse one response, close.
+/// Open a connection, send the request, read one response, close.
 /// Emits `Connection: close` (RFC 7230 section 6.1) so the server knows this
 /// is a one-shot exchange and can free its half of the socket as soon
 /// as the response is written.  Without this header, servers that
 /// default to HTTP/1.1 keep-alive will sit holding the connection open
 /// until their idle timeout fires.
-function send(addr: SocketAddr, req: Request) -> Result<Response, IoError> {
+///
+/// The whole request is encoded into the connection's outgoing buffer
+/// first and flushed once, so sending costs one suspension however many
+/// headers it carries. The response then comes back through the SAME
+/// buffer that the flush drained, which is what lets the header block
+/// and a Content-Length body be read without losing bytes that arrived
+/// in the same fill.
+async function send(addr: SocketAddr, req: Request) -> Result<Response, IoError> {
     mut request_local: Request = req;
     request_local.headers.insert(
         Str::new("Connection"),
         Str::new("close")
     );
-    mut s: TcpStream = TcpStream::connect(addr)?;
-    request_local.write_to(&s)?;
-    match (s.shutdown_write()) {
+
+    mut sock: TcpStream = (await TcpConnect::start(addr))?;
+    mut c: BufConn<TcpStream> = BufConn<TcpStream>::of(sock);
+
+    request_local.encode_into(c.pending())?;
+    (await c.flush())?;
+    // Half-close so a server that reads to EOF sees the request end.
+    // Not required for a Content-Length-framed request, and a failure
+    // here is not one the caller can act on: the bytes are already sent.
+    match (c.transport().shutdown_write()) {
         Result::Ok(_) => { }
         Result::Err(_) => { }
     }
-    // Buffer the response read: header scanning and the Content-Length
-    // body both pull through one buffer, so a typical response costs a
-    // few syscalls instead of one per header byte. `br` borrows `s`
-    // (frees only its own buffer on drop); `s` is closed by its own Drop.
-    mut br: BufReader<TcpStream> = BufReader::new(&s);
-    return Response::parse(&br);
+
+    return await c.read_response();
 }
 
 /// Send a request over an already-established stream and parse one

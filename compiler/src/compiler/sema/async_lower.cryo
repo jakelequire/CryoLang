@@ -1872,6 +1872,68 @@ type struct AsyncLower {
         return f.field_type;
     }
 
+    /// True when the future awaited by `e` keeps a receiver pointer that has to
+    /// be re-addressed before every poll.
+    ///
+    /// `awaited_recv_ptr_type` answers this from the future's own layout, which
+    /// works whenever that layout can be reached at lowering time. It cannot be
+    /// when the receiver's type is a bare generic parameter — `await
+    /// this.inner.write_from(b)` inside a method of `BufConn<S>` awaits
+    /// `S::write_from`, whose future is not a struct at all until `S` is known.
+    /// Asking the type alone then answers "no receiver" and the refresh is
+    /// dropped, even though monomorphization goes on to emit a future that does
+    /// store one. The method DECLARATION settles it regardless of how abstract
+    /// the owner still is: an `async` method whose receiver is spelled `&this`
+    /// or `mut &this` stores a pointer, and nothing else does.
+    ///
+    /// Getting this wrong is silent. The stale pointer addresses storage the
+    /// frame has stopped using, so the callee's writes — for a transport, the
+    /// socket it swaps back after an operation — land in dead memory while the
+    /// live object keeps the placeholder the callee swapped in.
+    awaited_keeps_recv_ptr(&this, e: ExpressionNode*, slot_ty: TypeRef) -> boolean {
+        if (slot_ty.is_valid()) { return true; }
+        if (e == null || (e as ASTNode*).kind != NodeKind::CallExpression) { return false; }
+        const c: CallExprNode* = e as CallExprNode*;
+        if (c.callee == null || (c.callee as ASTNode*).kind != NodeKind::MemberAccess) {
+            return false;
+        }
+        const mname: SymbolStr = (c.callee as MemberAccessNode*).member;
+        if (!mname.is_valid()) { return false; }
+
+        // A call on a receiver of still-generic type leaves `resolved_method`
+        // unset — overload resolution needs a concrete owner — so the shape of
+        // the awaited TYPE is what identifies the callee. `async` trait methods
+        // are the only ones desugared to return `This::<Method>Fut`, so an
+        // awaited projection naming exactly this method's future is one.
+        const t: Type* = this.arena.lookup(e.resolved_type.id);
+        if (t == null || t.kind != TypeKind::AssocProjection) { return false; }
+        const ap: AssocProjectionType* = t as AssocProjectionType*;
+        const want: SymbolStr =
+            TypeResolutionPasses::async_fut_assoc_name(this.ctx, mname);
+        if (!want.is_valid() || !ap.member.equals(want)) { return false; }
+
+        // The trait's declaration settles the receiver form, which the abstract
+        // future cannot.
+        if (this.ctx.generic_registry == null) { return false; }
+        const trait_leaf: SymbolStr =
+            this.ctx.generic_registry.find_trait_defining_method(mname);
+        if (!trait_leaf.is_valid()) { return false; }
+        const tdecl: TraitDeclNode* = this.ctx.generic_registry.get_trait_decl(trait_leaf);
+        if (tdecl == null) { return false; }
+        for (mut i: i64 = 0; i < tdecl.methods.length; i++) {
+            const f: FunctionDeclNode* = tdecl.methods[i];
+            if (f == null || !f.is_async || !f.name.equals(mname)) { continue; }
+            for (mut j: i64 = 0; j < f.parameters.length; j++) {
+                const p: VarDeclNode* = f.parameters[j];
+                if (p == null || !p.name.is_valid()) { continue; }
+                // Only the by-pointer spelling keeps a pointer; a by-value
+                // `this` holds the object itself and cannot go stale.
+                if (p.name.equals(this.this_amp_sym)) { return true; }
+            }
+        }
+        return false;
+    }
+
     /// The receiver place of `e` when `e` is a method call, or null otherwise.
     ///
     /// A method call is `Call(callee = MemberAccess(object = <receiver>))`, and
@@ -2011,7 +2073,7 @@ type struct AsyncLower {
         // stale pointer from its second poll onwards, corrupting silently instead
         // of faulting.
         const recv_slot_ty: TypeRef = this.awaited_recv_ptr_type(fi);
-        if (recv_slot_ty.is_valid()) {
+        if (this.awaited_keeps_recv_ptr(aw.operand, recv_slot_ty)) {
             mut place: ExpressionNode* = this.awaited_recv_place(aw.operand);
             if (place == null) {
                 this.ctx.emit_error_at(ErrorCode::E0455_DANGLING_POINTER,
@@ -2043,6 +2105,11 @@ type struct AsyncLower {
             if (place_ty.is_valid()) {
                 recv_ptr_ty = if (via_ptr) { place_ty } else { this.arena.get_pointer_to(place_ty) };
             }
+            // The slot's type is unavailable for a receiver of still-generic
+            // type, so the place supplies it. With neither, sema failed to
+            // resolve the place and has already reported why; typing the store
+            // with an invalid ref would only add noise on top of that.
+            if (!recv_ptr_ty.is_valid()) { sm.ok = false; return cur; }
             mut recv_val: ExpressionNode* = fresh;
             if (!via_ptr) { recv_val = this.addr_of(fresh, recv_ptr_ty, span); }
             sm.blocks[resume].add_statement(this.assign_field_of_stmt(
@@ -2786,6 +2853,40 @@ type struct AsyncLower {
         return this.stmt_diverges(blk.statements[blk.statements.length - 1i64]);
     }
 
+    /// True if the statement leaves the enclosing STATE BLOCK outright, so
+    /// nothing it does can describe how that state reaches its tail.
+    ///
+    /// Deliberately narrower than `stmt_diverges`, which also reports `break`
+    /// and `continue`. Those land at the end of a loop that is still inside
+    /// this same block — a loop carrying no suspension point is not split into
+    /// states — so a value given away just before one of them DOES reach the
+    /// tail and must not be handed back. Only `return` leaves the block.
+    stmt_returns(&this, stmt: StatementNode*) -> boolean {
+        if (stmt == null) { return false; }
+        const k: NodeKind = stmt.kind;
+        if (k == NodeKind::ReturnStatement) { return true; }
+        if (k == NodeKind::BlockStatement) {
+            const blk: BlockStmtNode* = stmt as BlockStmtNode*;
+            if (blk.statements.length == 0i64) { return false; }
+            return this.stmt_returns(blk.statements[blk.statements.length - 1i64]);
+        }
+        if (k == NodeKind::IfStatement) {
+            const iff: IfStmtNode* = stmt as IfStmtNode*;
+            if (iff.else_stmt == null) { return false; }
+            return this.stmt_returns(iff.then_stmt) && this.stmt_returns(iff.else_stmt);
+        }
+        if (k == NodeKind::MatchStatement) {
+            const m: MatchStmtNode* = stmt as MatchStmtNode*;
+            if (m.arms.length == 0i64) { return false; }
+            if (!this.patterns.match_is_exhaustive(m.subject, m.arms)) { return false; }
+            for (mut i: i64 = 0; i < m.arms.length; i++) {
+                if (m.arms[i] == null || !this.stmt_returns(m.arms[i].body)) { return false; }
+            }
+            return true;
+        }
+        return false;
+    }
+
     /// An expression yields control to the next statement unless it is a `match`
     /// expression that cannot fall through — the expression form of the rule
     /// `stmt_diverges` applies to a `match` statement. Any other kind is reported
@@ -3115,6 +3216,14 @@ type struct AsyncLower {
     /// Record how each mention of `name` uses it, in execution order; the last
     /// write to `*out` describes the final mention. 1 = borrowed/overwritten
     /// (the state still owns the value), 2 = given away.
+    ///
+    /// Alternatives are NOT sequential, and this walk sees them in source order,
+    /// so a branch that `return`s is skipped: it never reaches the state's tail,
+    /// and letting it write `*out` would report a value as given away on paths
+    /// that still own it. That is not a benign over-report — the tail hand-back
+    /// is then omitted, the carrier field stays empty, and the next state's
+    /// `take().unwrap()` finds a `None`. A branch that falls through is walked
+    /// normally, since it does reach the tail.
     mark_last_use_stmt(&this, s: StatementNode*, name: SymbolStr, out: i64*) -> void {
         if (s == null) { return; }
         const k: NodeKind = s.kind;
@@ -3143,8 +3252,12 @@ type struct AsyncLower {
         if (k == NodeKind::IfStatement) {
             const iff: IfStmtNode* = s as IfStmtNode*;
             this.mark_last_use_expr(iff.condition, name, false, out);
-            this.mark_last_use_stmt(iff.then_stmt, name, out);
-            this.mark_last_use_stmt(iff.else_stmt, name, out);
+            if (!this.stmt_returns(iff.then_stmt)) {
+                this.mark_last_use_stmt(iff.then_stmt, name, out);
+            }
+            if (!this.stmt_returns(iff.else_stmt)) {
+                this.mark_last_use_stmt(iff.else_stmt, name, out);
+            }
             return;
         }
         if (k == NodeKind::WhileStatement) {
@@ -3179,7 +3292,9 @@ type struct AsyncLower {
                 // A guard runs before its body and only reads, so a name last
                 // mentioned there is still owned by the state.
                 this.mark_last_use_expr(m.arms[i].guard, name, false, out);
-                this.mark_last_use_stmt(m.arms[i].body, name, out);
+                if (!this.stmt_returns(m.arms[i].body)) {
+                    this.mark_last_use_stmt(m.arms[i].body, name, out);
+                }
             }
             return;
         }
