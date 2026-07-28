@@ -5,11 +5,19 @@
 ///! forced rather than stylistic:
 ///!
 ///!   - **Reads are methods on the connection.** A parser written as a
-///!     static taking `mut &BufConn<S>` cannot be called from an async
+///!     static taking `mut &BufStream<S>` cannot be called from an async
 ///!     caller holding the connection as a local: handing the address of
 ///!     a local to a future that outlives the current poll is refused
 ///!     (E0455), and only the RECEIVER is re-supplied on every poll. So
-///!     the parse lives here, as a trait implemented for the connection.
+///!     the parse lives here, as methods on the connection.
+///!
+///!     Being a METHOD is what is forced; being a TRAIT is not. These are
+///!     an inherent impl on a type this module does not declare, which
+///!     Cryo allows across modules, generically, and for `async` methods
+///!     with a `where` bound. A trait with one implementor and no bound
+///!     that names it would buy nothing and would read like a second
+///!     connection type sitting next to `BufStream`, which is the one thing
+///!     this layer must not grow.
 ///!   - **Writes are not here at all.** Encoding is synchronous — see
 ///!     `Request::encode_into` — so a whole message is assembled into
 ///!     `pending()` with no suspension point inside it, and the caller
@@ -43,19 +51,12 @@ import future::traits;
 
 /// Reading a whole HTTP/1.1 message off a buffered connection.
 ///
-/// Implemented for `BufConn<S>` over any async transport, so a plaintext
+/// Written once for `BufStream<S>` over any async transport, so a plaintext
 /// socket and a TLS session are served by the same framing code.
-type trait HttpConn {
+implement struct BufStream<S> {
     /// Read one complete request: request line, headers, and the body
     /// sized by `Content-Length`. A peer that closes mid-message is
     /// `UnexpectedEof`; one that sends a malformed line is `InvalidData`.
-    async read_request(mut &this) -> Result<Request, IoError>;
-
-    /// Read one complete response, framed the same way.
-    async read_response(mut &this) -> Result<Response, IoError>;
-}
-
-implement trait HttpConn for struct BufConn<S> {
     async read_request(mut &this) -> Result<Request, IoError>
     where S: AsyncTransport {
         mut line: String = (await this.read_line(request::MAX_HEADER_LINE))?;
@@ -94,6 +95,7 @@ implement trait HttpConn for struct BufConn<S> {
         return Result::Ok(req);
     }
 
+    /// Read one complete response, framed the same way.
     async read_response(mut &this) -> Result<Response, IoError>
     where S: AsyncTransport {
         mut line: String = (await this.read_line(request::MAX_HEADER_LINE))?;
