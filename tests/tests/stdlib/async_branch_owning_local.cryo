@@ -1,0 +1,126 @@
+///! An owning value written into a local from inside a BRANCH of an `async`
+///! function is miscompiled.
+///!
+///! **These tests are expected to fail.** They are a finding, not a
+///! regression: the shape below produces heap corruption or an
+///! `unwrap() on a None value`, depending on which side of the carrier
+///! hand-back gets it wrong, and it is what currently prevents
+///! `net::http::server` from putting a deadline on a connection read
+///! (`Futures::timeout` around the read forces exactly this shape).
+///!
+///! The carrier is per-state: an owning local is taken out of its frame field
+///! when a state is entered and handed back as the state falls off the end,
+///! unless that state gave the value away. A local written from an `await`
+///! inside a branch is written in one state and read in another, and the
+///! hand-back decision for the branch states comes out wrong -- too eager and
+///! the value is dropped twice, too shy and the next state's `take().unwrap()`
+///! finds `None`.
+///!
+///! `carried_owning_local_written_outside_any_branch` is the CONTROL: the same
+///! function with the branch removed. It passes. That is what identifies the
+///! branch, rather than the loop or the await or the owning payload, as the
+///! variable that matters.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::AsyncBranchOwningLocal;
+
+import std::core::option;
+import std::core::result;
+import std::collections::str;
+import std::collections::string;
+import std::collections::array;
+import std::future;
+import std::time;
+import std::test::error;
+import std::test::assert;
+
+/// Churn the allocator so a double free shows up as corruption here rather
+/// than as a quiet inconsistency that surfaces somewhere unrelated.
+function abol_churn() -> u64 {
+    mut total: u64 = 0;
+    mut i: i64 = 0;
+    while (i < 200) {
+        mut a: Array<u8> = Array<u8>::with_capacity(128);
+        a.push(1u8);
+        total = total + a.length();
+        a.drop();
+        i = i + 1;
+    }
+    return total;
+}
+
+/// An owner with heap content, so a stale or doubly-dropped payload is a real
+/// memory fault rather than a wrong number.
+type struct Source {
+    s: String;
+
+    /// Hands back an OWNING payload across a suspend.
+    async give(mut &this) -> Result<String, i64> {
+        await Sleep::new(Duration::from_millis(2u64));
+        mut out: String = String::from_str(Str::new("owned"));
+        out.push_byte(0x42u8);
+        return Result::Ok(out);
+    }
+}
+
+implement trait Drop for struct Source {
+    drop(mut &this) -> void { this.s.drop(); }
+}
+
+/// The control: the owning local is written at statement level, never inside a
+/// branch. Six payload bytes plus 200 from the churn, per iteration.
+async function abol_no_branch(iters: i64) -> u64 {
+    mut r: Source = Source { s: String::from_str(Str::new("hello")) };
+    mut total: u64 = 0;
+    mut k: i64 = 0;
+    while (k < iters) {
+        mut got: Result<String, i64> = Result::Err(0);
+        got = await r.give();
+        match (got) {
+            Result::Ok(s)  => { mut owned: String = s; total = total + owned.length(); }
+            Result::Err(_) => { }
+        }
+        total = total + abol_churn();
+        k = k + 1;
+    }
+    return total;
+}
+
+/// The failing shape: identical, except the write happens inside an `if`/`else`
+/// whose arms both produce the value.
+async function abol_in_branch(flag: boolean, iters: i64) -> u64 {
+    mut r: Source = Source { s: String::from_str(Str::new("hello")) };
+    mut total: u64 = 0;
+    mut k: i64 = 0;
+    while (k < iters) {
+        mut got: Result<String, i64> = Result::Err(0);
+        if (flag) {
+            got = await r.give();
+        } else {
+            got = await r.give();
+        }
+        match (got) {
+            Result::Ok(s)  => { mut owned: String = s; total = total + owned.length(); }
+            Result::Err(_) => { }
+        }
+        total = total + abol_churn();
+        k = k + 1;
+    }
+    return total;
+}
+
+![test]
+function carried_owning_local_written_outside_any_branch() -> Result<(), TestError> {
+    mut ex: Executor = Executor::new();
+    const r: u64 = ex.block_on(abol_no_branch(2 as i64));
+    ex.drop();
+    return expect_eq(r, 412u64);
+}
+
+![test]
+function carried_owning_local_written_inside_a_branch() -> Result<(), TestError> {
+    mut ex: Executor = Executor::new();
+    const r: u64 = ex.block_on(abol_in_branch(false, 2 as i64));
+    ex.drop();
+    return expect_eq(r, 412u64);
+}

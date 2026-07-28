@@ -1724,6 +1724,20 @@ type struct AsyncLower {
         }
     }
 
+    /// True when a value of `ty` has no room to store an address, so carrying
+    /// one across a suspend cannot keep a frame address alive.
+    ///
+    /// Deliberately only the scalars. An aggregate, a pointer, a reference or
+    /// anything still generic could hold one somewhere, and a type that failed
+    /// to resolve has to be assumed to as well.
+    type_cannot_hold_address(&this, ty: TypeRef) -> boolean {
+        if (!ty.is_valid()) { return false; }
+        const t: Type* = this.arena.lookup(ty.id);
+        if (t == null) { return false; }
+        return t.kind == TypeKind::Int || t.kind == TypeKind::Bool
+            || t.kind == TypeKind::Float || t.kind == TypeKind::Char;
+    }
+
     zeroable_kind(&this, k: TypeKind) -> boolean {
         return k == TypeKind::Int || k == TypeKind::Bool
             || k == TypeKind::Float || k == TypeKind::Pointer;
@@ -1878,7 +1892,7 @@ type struct AsyncLower {
     /// `awaited_recv_ptr_type` answers this from the future's own layout, which
     /// works whenever that layout can be reached at lowering time. It cannot be
     /// when the receiver's type is a bare generic parameter — `await
-    /// this.inner.write_from(b)` inside a method of `BufConn<S>` awaits
+    /// this.inner.write_from(b)` inside a method of `BufStream<S>` awaits
     /// `S::write_from`, whose future is not a struct at all until `S` is known.
     /// Asking the type alone then answers "no receiver" and the refresh is
     /// dropped, even though monomorphization goes on to emit a future that does
@@ -1932,6 +1946,100 @@ type struct AsyncLower {
             }
         }
         return false;
+    }
+
+    /// True when `e` is — or encloses, as an argument of a constructing call —
+    /// an `async` method call whose future keeps a receiver pointer.
+    ///
+    /// The search follows call ARGUMENTS and nothing else, because that is the
+    /// only way one future reaches another at an await site: a combinator is
+    /// built by handing it its children (`Futures::timeout(d, c.read())`).
+    /// Anything that stored a future somewhere first would have had to name it,
+    /// and awaiting a NAMED future is already refused — the receiver it points
+    /// at cannot be re-addressed from the await site.
+    expr_has_recv_call(&this, e: ExpressionNode*) -> boolean {
+        if (e == null) { return false; }
+        if (this.awaited_keeps_recv_ptr(e, this.awaited_recv_ptr_type(e.resolved_type))) {
+            return true;
+        }
+        if ((e as ASTNode*).kind != NodeKind::CallExpression) { return false; }
+        const c: CallExprNode* = e as CallExprNode*;
+        for (mut i: i64 = 0; i < c.arguments.length; i++) {
+            if (this.expr_has_recv_call(c.arguments[i])) { return true; }
+        }
+        return false;
+    }
+
+    /// The field of the struct returned by `c`'s callee that receives that
+    /// callee's parameter number `argi`, or an invalid symbol when it cannot be
+    /// established.
+    ///
+    /// A combinator is constructed by a static that hands its parameters
+    /// straight to a struct literal — `Futures::join(a, b)` returns
+    /// `Join { a: a, b: b, ... }` — and the field a child future lands in is
+    /// the one the receiver refresh has to address. Reading it from the
+    /// callee's DECLARATION is what makes the answer available at all: the
+    /// constructed type is an `InstantiatedType` here and its template's fields
+    /// are not populated until specialization, so the layout cannot answer.
+    ///
+    /// Mapping through the PARAMETER rather than through the field's type also
+    /// keeps sibling children apart: `Futures::join(a.read(), b.read())` builds
+    /// two futures of the same type, and only the parameter each was passed as
+    /// says which receiver belongs to which field.
+    ///
+    /// Deliberately narrow: a single `return <StructLiteral>` whose field
+    /// initializer is the bare parameter. A wrapper, a computed value or a
+    /// conditional leaves the position unproven, and the caller reports rather
+    /// than guessing — guessing here is a silent wrong-address store.
+    ctor_field_for_param(&this, c: CallExprNode*, argi: i64) -> SymbolStr {
+        if (this.ctx.generic_registry == null) { return SymbolStr::empty(); }
+        // Sema leaves `resolved_template` unset for a generic static called
+        // from a body walked symbolically, so the constructor cannot be
+        // reached from inside a generic impl. That is reported rather than
+        // guessed at -- an unprovable field position is a wrong-address store.
+        if (!c.resolved_template.is_valid()) { return SymbolStr::empty(); }
+        const te: TemplateEntry* = this.ctx.generic_registry.get_template(c.resolved_template);
+        if (te == null || te.node_kind != NodeKind::FunctionDeclaration) {
+            return SymbolStr::empty();
+        }
+        const fd: FunctionDeclNode* = te.ast_node as FunctionDeclNode*;
+        if (fd == null || fd.body == null) { return SymbolStr::empty(); }
+        if (argi < 0i64 || argi >= fd.parameters.length) { return SymbolStr::empty(); }
+        // A receiver parameter would shift argument numbering against the
+        // parameter list. Combinators are statics; anything else is a shape
+        // this cannot vouch for.
+        if (fd.parameters.length > 0i64) {
+            const p0: VarDeclNode* = fd.parameters[0];
+            if (p0 != null && (p0.name.equals(this.this_sym) || p0.name.equals(this.this_amp_sym))) {
+                return SymbolStr::empty();
+            }
+        }
+        const pd: VarDeclNode* = fd.parameters[argi];
+        if (pd == null || !pd.name.is_valid()) { return SymbolStr::empty(); }
+
+        // Exactly one `return`, and it must build the struct directly. A second
+        // return means the constructed value depends on a path this cannot see.
+        mut lit: StructLiteralNode* = null;
+        for (mut i: i64 = 0; i < fd.body.statements.length; i++) {
+            mut s: StatementNode* = fd.body.statements[i];
+            if (s == null || (s as ASTNode*).kind != NodeKind::ReturnStatement) { continue; }
+            if (lit != null) { return SymbolStr::empty(); }
+            mut v: ExpressionNode* = (s as ReturnStmtNode*).expression;
+            if (v == null || (v as ASTNode*).kind != NodeKind::StructLiteral) {
+                return SymbolStr::empty();
+            }
+            lit = v as StructLiteralNode*;
+        }
+        if (lit == null) { return SymbolStr::empty(); }
+
+        for (mut i: i64 = 0; i < lit.field_inits.length; i++) {
+            mut val: ExpressionNode* = lit.field_inits[i].value;
+            if (val == null || (val as ASTNode*).kind != NodeKind::Identifier) { continue; }
+            if ((val as IdentifierNode*).name.equals(pd.name)) {
+                return lit.field_inits[i].field_name;
+            }
+        }
+        return SymbolStr::empty();
     }
 
     /// The receiver place of `e` when `e` is a method call, or null otherwise.
@@ -1992,6 +2100,107 @@ type struct AsyncLower {
         assign.set_resolved_type(this.arena.get_void());
         mut es: ExprStmtNode* = new ExprStmtNode(assign as ExpressionNode*, span);
         return es as StatementNode*;
+    }
+
+    /// Emit into state `resume` the receiver refreshes for every `async`-method
+    /// future the awaited expression `e` placed inside the sub-future named by
+    /// `base`.
+    ///
+    /// `base` names the future at this nesting level. A method call awaited
+    /// directly is `base` itself; one handed to a combinator
+    /// (`await Futures::timeout(d, c.read())`) sits in a field of it, so each
+    /// level descends through the field the constructing call put its argument
+    /// in and the store lands on `__sub.fut.this$recv`. Refreshing only the
+    /// outermost future would leave the nested one writing through the address
+    /// its receiver had when it was built, which is dead storage from the first
+    /// poll onwards — and silently, since nothing faults.
+    ///
+    /// False when a receiver pointer is present but its position cannot be
+    /// proven; a diagnostic has already been emitted. Answering "no receiver"
+    /// in that case is what made this class of bug silent, so an unprovable
+    /// path is an error rather than a skip.
+    emit_recv_refresh(mut &this, sm: PollSm*, resume: i64, e: ExpressionNode*,
+                      base: ExpressionNode*, err_span: SourceSpan,
+                      span: SourceSpan) -> boolean {
+        if (e == null || base == null) { return true; }
+
+        const recv_slot_ty: TypeRef = this.awaited_recv_ptr_type(e.resolved_type);
+        if (this.awaited_keeps_recv_ptr(e, recv_slot_ty)) {
+            mut place: ExpressionNode* = this.awaited_recv_place(e);
+            if (place == null) {
+                this.ctx.emit_error_at(ErrorCode::E0455_DANGLING_POINTER,
+                    "async: this `await` polls an `async` method's future that the awaited expression did not itself produce, so the receiver it points at cannot be re-addressed when the future resumes; await the method call directly (`await r.m(...)`) rather than storing its future first",
+                    err_span);
+                return false;
+            }
+            mut fresh: ExpressionNode* = this.rebuild_place(place);
+            if (fresh == null) {
+                this.ctx.emit_error_at(ErrorCode::E0455_DANGLING_POINTER,
+                    "async: this `await` calls an `async` method on a receiver that names no storage (a temporary, or the result of a call), so the receiver dies with the step that built the future; bind it to a local and await on that (`mut r = <expr>; await r.m(...);`)",
+                    err_span);
+                return false;
+            }
+            // A receiver reached through a pointer already IS the address the
+            // callee stored; taking its address again would hand over the slot
+            // holding the pointer instead of the object.
+            //
+            // The pointer's type comes from the place rather than from the slot:
+            // the slot's is the template's, and for a future generic in its owner
+            // that still mentions the owner's parameters, which cannot type a node
+            // in a caller that is already concrete. The place is the receiver
+            // itself, so its type is the owner's here.
+            const place_ty: TypeRef = place.resolved_type;
+            mut place_t: Type* = null;
+            if (place_ty.is_valid()) { place_t = this.arena.lookup(place_ty.id); }
+            const via_ptr: boolean = place_t != null && place_t.kind == TypeKind::Pointer;
+            mut recv_ptr_ty: TypeRef = recv_slot_ty;
+            if (place_ty.is_valid()) {
+                recv_ptr_ty = if (via_ptr) { place_ty } else { this.arena.get_pointer_to(place_ty) };
+            }
+            // The slot's type is unavailable for a receiver of still-generic
+            // type, so the place supplies it. With neither, sema failed to
+            // resolve the place and has already reported why; typing the store
+            // with an invalid ref would only add noise on top of that.
+            if (!recv_ptr_ty.is_valid()) { return false; }
+            mut recv_val: ExpressionNode* = fresh;
+            if (!via_ptr) { recv_val = this.addr_of(fresh, recv_ptr_ty, span); }
+            sm.blocks[resume].add_statement(this.assign_field_of_stmt(
+                base, this.recv_sym, recv_ptr_ty, recv_val, span));
+            return true;
+        }
+
+        // Nothing below this point holds a receiver, so there is nothing to
+        // re-address and `base` goes unused.
+        if (!this.expr_has_recv_call(e)) { return true; }
+
+        if ((e as ASTNode*).kind == NodeKind::CallExpression) {
+            const c: CallExprNode* = e as CallExprNode*;
+            for (mut i: i64 = 0; i < c.arguments.length; i++) {
+                mut a: ExpressionNode* = c.arguments[i];
+                if (!this.expr_has_recv_call(a)) { continue; }
+                const fld: SymbolStr = this.ctor_field_for_param(c, i);
+                if (!fld.is_valid()) {
+                    this.ctx.emit_error_at(ErrorCode::E0455_DANGLING_POINTER,
+                        "async: this `await` hands an `async` method's future to a call that does not put it straight into a field of what it returns, so the receiver the method points at cannot be re-addressed when the future resumes; await the method call directly, or bind its result before combining it",
+                        err_span);
+                    return false;
+                }
+                // A fresh copy per child: a node reachable from two parents is
+                // walked — and drop-analysed — twice.
+                mut nb: ExpressionNode* = this.rebuild_place(base);
+                if (nb == null) { return false; }
+                mut into: ExpressionNode* = this.member(nb, fld, a.resolved_type, span);
+                if (!this.emit_recv_refresh(sm, resume, a, into, err_span, span)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        this.ctx.emit_error_at(ErrorCode::E0455_DANGLING_POINTER,
+            "async: this `await` reaches an `async` method's future through an expression that is not a call, so the receiver it points at cannot be re-addressed when the future resumes; await the method call directly",
+            err_span);
+        return false;
     }
 
     /// Lower a top-level `await` carrier (`const/mut x = await e;`,
@@ -2072,48 +2281,9 @@ type struct AsyncLower {
         // it an `async` method with a `&this` receiver reads and writes through a
         // stale pointer from its second poll onwards, corrupting silently instead
         // of faulting.
-        const recv_slot_ty: TypeRef = this.awaited_recv_ptr_type(fi);
-        if (this.awaited_keeps_recv_ptr(aw.operand, recv_slot_ty)) {
-            mut place: ExpressionNode* = this.awaited_recv_place(aw.operand);
-            if (place == null) {
-                this.ctx.emit_error_at(ErrorCode::E0455_DANGLING_POINTER,
-                    "async: this `await` polls an `async` method's future that the awaited expression did not itself produce, so the receiver it points at cannot be re-addressed when the future resumes; await the method call directly (`await r.m(...)`) rather than storing its future first",
-                    aw.span);
-                sm.ok = false; return cur;
-            }
-            mut fresh: ExpressionNode* = this.rebuild_place(place);
-            if (fresh == null) {
-                this.ctx.emit_error_at(ErrorCode::E0455_DANGLING_POINTER,
-                    "async: this `await` calls an `async` method on a receiver that names no storage (a temporary, or the result of a call), so the receiver dies with the step that built the future; bind it to a local and await on that (`mut r = <expr>; await r.m(...);`)",
-                    aw.span);
-                sm.ok = false; return cur;
-            }
-            // A receiver reached through a pointer already IS the address the
-            // callee stored; taking its address again would hand over the slot
-            // holding the pointer instead of the object.
-            //
-            // The pointer's type comes from the place rather than from the slot:
-            // the slot's is the template's, and for a future generic in its owner
-            // that still mentions the owner's parameters, which cannot type a node
-            // in a caller that is already concrete. The place is the receiver
-            // itself, so its type is the owner's here.
-            const place_ty: TypeRef = place.resolved_type;
-            mut place_t: Type* = null;
-            if (place_ty.is_valid()) { place_t = this.arena.lookup(place_ty.id); }
-            const via_ptr: boolean = place_t != null && place_t.kind == TypeKind::Pointer;
-            mut recv_ptr_ty: TypeRef = recv_slot_ty;
-            if (place_ty.is_valid()) {
-                recv_ptr_ty = if (via_ptr) { place_ty } else { this.arena.get_pointer_to(place_ty) };
-            }
-            // The slot's type is unavailable for a receiver of still-generic
-            // type, so the place supplies it. With neither, sema failed to
-            // resolve the place and has already reported why; typing the store
-            // with an invalid ref would only add noise on top of that.
-            if (!recv_ptr_ty.is_valid()) { sm.ok = false; return cur; }
-            mut recv_val: ExpressionNode* = fresh;
-            if (!via_ptr) { recv_val = this.addr_of(fresh, recv_ptr_ty, span); }
-            sm.blocks[resume].add_statement(this.assign_field_of_stmt(
-                this.ident(sub_sym, fi, span), this.recv_sym, recv_ptr_ty, recv_val, span));
+        if (!this.emit_recv_refresh(sm, resume, aw.operand,
+                                    this.ident(sub_sym, fi, span), aw.span, span)) {
+            sm.ok = false; return cur;
         }
 
         // The sub-future's `poll` yields `Poll<F_k::Output>`, which is the type of
@@ -3811,7 +3981,18 @@ type struct AsyncLower {
     /// it. The write then lands on unrelated stack instead of faulting, which is
     /// why this has to be a compile error rather than something a test catches.
     /// Returns true when it reported, leaving the caller to unwind.
+    ///
+    /// The search for an address is syntactic — the first user-written `&`
+    /// anywhere in the initializer — because without lifetimes there is no way
+    /// to prove a callee did not retain what it was handed. That is the right
+    /// default, but it is an over-approximation whenever the value being
+    /// carried could not hold an address in the first place: passing `&local`
+    /// to a predicate and keeping its `boolean` answer across a suspend carries
+    /// nothing. A NUMBER, a `boolean` or a `char` has no room for a pointer, so
+    /// for those the address provably died with the call that consumed it.
+    /// Every other type stays conservative.
     reject_frame_addr_carry(mut &this, sm: PollSm*, vd: VarDeclNode*, nm: SymbolStr) -> boolean {
+        if (this.type_cannot_hold_address(vd.resolved_type)) { return false; }
         mut root: SymbolStr = this.frame_addr_root_expr(sm, vd.initializer);
         if (!root.is_valid()) {
             for (mut b: i64 = 0; b < sm.blocks.length; b++) {
