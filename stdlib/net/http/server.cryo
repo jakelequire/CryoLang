@@ -29,13 +29,12 @@
 ///! byte at a time pins the loop indefinitely. Do not put this server in front
 ///! of untrusted clients until the cap is restored.
 ///!
-///! It is a gap, not a decision. Expressing it needs the per-request read
-///! wrapped in `Futures::timeout`, and that requires parking the framed
-///! request in a local shared by two branches -- a shape the async lowering
-///! miscompiles today (heap corruption or an unwrap-on-None, depending on
-///! which side of the carrier hand-back gets it wrong). The regression test
-///! `async_branch_owning_local` pins the underlying bug; this cap comes back
-///! with it.
+///! It is a gap, not a decision. Enforcing it wraps the per-request read in
+///! `Futures::timeout`, which writes the framed request into a local from
+///! inside a branch; the states that TAKE a carried value still share one
+///! binding, so several of them share one drop flag and release the same heap
+///! block twice. The note above `prepend_agg_take` in `sema/async_lower.cryo`
+///! records what has to change. The cap comes back with it.
 ///!
 ///! When it does return, note that a read which hits the cap is abandoned, and
 ///! abandoning an in-flight read closes the connection: the transport holds a
@@ -246,9 +245,10 @@ type struct HttpServer {
 
             // NO DEADLINE IS APPLIED HERE, and that is a gap rather than a
             // decision -- see `read_timeout_secs`. The request is matched
-            // straight off the `await`: parking it in a local first, which is
-            // what wrapping the read in `Futures::timeout` would require, is
-            // miscompiled today (see `async_branch_owning_local`).
+            // straight off the `await`: wrapping the read in `Futures::timeout`
+            // needs the framed request written into a local from inside a
+            // branch, and a state that TAKES a carried value cannot yet be
+            // given a binding of its own (see the note above `prepend_agg_take`).
             match (await c.read_request()) {
                 Result::Ok(req) => {
                     mut request_local: Request = req;

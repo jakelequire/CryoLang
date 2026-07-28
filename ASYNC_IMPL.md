@@ -3642,3 +3642,47 @@ Fix: resolve the callee from its `ScopeResolution` spelling when `resolved_templ
 `HttpServer$serve_connection$Future_2` — the receiver rewrite does not reach into that position.
 Statement-level `if` works. Same walker-coverage family as the standing warning about adding a node kind
 to ALL walkers.
+
+---
+
+## 2026-07-28 (later) — the branch-owning-local double free, half fixed
+
+**Fixed: states that PRODUCE a carried value now bind their own name.**
+
+A state whose first touch of a carried local is a top-level write does not take the value out of the
+carrier — it produces its own — so `decl_at_first_assignment` turns that write into a declaration. It
+bound the SAME alpha-renamed name in every such state, and **codegen keys a local's drop flag by
+name**, so several states shared one flag while owning separate storage. A flag raised where one state
+initialized its copy then enabled the scope-exit drop in a state that never did.
+
+The arithmetic is why an `if`/`else` is the shape that broke: one declaring state is fine, two survive,
+three — the entry state plus one per arm — release the same heap block twice. `decl_at_first_assignment`
+now mints a fresh name per declaring state, rewrites that state onto it, and returns it so the caller
+hands the value back under the right name.
+
+`tests/tests/stdlib/async_branch_owning_local.cryo` was RED and is now GREEN. `make test`:
+**1853 unit / 159 compile-fail / 12 projects, zero failures.**
+
+**Method.** The IR named it, not reasoning about the passes. Counting `alloca`s for the local against
+`load i1 ... dropflag` sites per function: control 3/1, one-arm branch 4/2, both-arms branch 5/3 — drop
+sites scaling with declaring states while the flag count stayed at one. (A first pass at this miscounted
+because the `awk` window spilled into the next function and made it look like one variable had become
+two; bounding each `define` fixed that.)
+
+**NOT fixed: states that TAKE a carried value still share one binding.**
+
+The same collision exists on the take side — every state opening with
+`mut x = this.field.take().unwrap()` declares `x` — and it cannot be fixed the same way. The state
+blocks SHARE AST statement nodes: a loop body reached from several states is one node list, so renaming
+per state rewrites a node another state also reads. The second state's take then declares a name nothing
+refers to, while the shared statements name a binding that is not in their scope (E0201 in
+`ass_try_in_loop`, `cannot find value c$L10`). Confirmed by tracing the rebinds: blocks 2/3/4 of one
+function were handed `c$L10`/`c$L11`/`c$L12` over shared statements.
+
+Two ways out, neither attempted: de-share the statement nodes across state blocks, or key drop flags per
+DECLARATION rather than by name in codegen. The note above `prepend_agg_take` records this at the site.
+
+**Consequence, unchanged:** `HttpServer::with_read_timeout` remains stored and NOT enforced — wrapping
+the read in `Futures::timeout` needs the framed request written into a local from inside a branch, and
+that trips the remaining half. The server therefore still has no slow-loris defence, and says so at the
+top of `server.cryo` and on the setter.
