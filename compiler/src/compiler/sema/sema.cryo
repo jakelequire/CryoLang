@@ -846,6 +846,8 @@ public:
         this.state.this_type       = fn_this_type;
         this.state.this_is_mut = false;
         this.state.payload_binding_ids = [];
+        this.state.alias_binding_ids = [];
+        this.state.this_is_by_ref = false;
         this.state.param_ids = [];
         this.state.in_lambda_depth     = 0;
         this.state.lambda_outer_locals = HashMap<u32, TypeRef>::new();
@@ -864,6 +866,7 @@ public:
             const param_name: string = this.intern.resolve(param.name);
             if (param_name == "&this") {
                 this.state.this_is_mut = param.is_mutable;
+                this.state.this_is_by_ref = true;
             } else {
                 this.scopes.register_local_with_mut(param.name, ty, param.is_mutable);
                 this.scopes.record_local_kw_span(param.name, param.kw_span);
@@ -1035,11 +1038,12 @@ public:
         this.state.resolving_match_subject = true;
         const subject_type: TypeRef = this.resolve_expr(node.subject);
         this.state.resolving_match_subject = saved_rms;
+        const caller_backed: boolean = this.subject_is_caller_backed(node.subject);
         for (mut i: i64 = 0; i < node.arms.length; i++) {
             const arm: MatchArmNode* = node.arms[i];
             if (arm == null) { continue; }
             const save: i64 = this.scopes.save_scope();
-            this.patterns.bind_arm_patterns(arm, subject_type);
+            this.patterns.bind_arm_patterns(arm, subject_type, caller_backed);
             if (arm.guard != null) { this.resolve_expr(arm.guard); }
             if (arm.body != null) { this.dispatch_stmt(arm.body); }
             this.scopes.restore_scope(save);
@@ -2160,6 +2164,7 @@ public:
         this.state.resolving_match_subject = true;
         const subject_type: TypeRef = this.resolve_expr(match_expr.subject);
         this.state.resolving_match_subject = saved_rms;
+        const caller_backed: boolean = this.subject_is_caller_backed(match_expr.subject);
         this.patterns.check_duplicate_default_arm(match_expr.arms);
         const outer_expected: TypeRef = this.state.expected_type;
         mut result_type: TypeRef = TypeRef::invalid();
@@ -2168,7 +2173,7 @@ public:
             const arm: MatchArmNode* = match_expr.arms[i];
             if (arm == null || arm.body == null) { continue; }
             const save: i64 = this.scopes.save_scope();
-            this.patterns.bind_arm_patterns(arm, subject_type);
+            this.patterns.bind_arm_patterns(arm, subject_type, caller_backed);
             if (arm.guard != null) { this.resolve_expr(arm.guard); }
             const body_node: ASTNode* = arm.body as ASTNode*;
             if (body_node.kind == NodeKind::BlockStatement) {
@@ -3166,6 +3171,51 @@ public:
         return false;
     }
 
+    /// Whether a `match` subject's storage belongs to the CALLER rather than to
+    /// this frame, so a payload binding taken from it aliases storage that
+    /// outlives the function and `&binding` may legitimately be returned.
+    ///
+    /// True only for a subject reached through a by-reference receiver
+    /// (`match (&this)` in a `&this` / `mut &this` method) or a pointer/reference
+    /// parameter (`match (slot)` where `slot: Option<T>*`) - the same
+    /// caller-backed reasoning that already exempts `&param` from the check.
+    /// A BY-VALUE parameter does NOT qualify: it lives in this frame like any
+    /// local, so a pointer into its payload dangles once the frame is gone.
+    subject_is_caller_backed(&this, e: ExpressionNode*) -> boolean {
+        if (e == null) { return false; }
+        const k: NodeKind = e.kind;
+        if (k == NodeKind::Identifier) {
+            const id: IdentifierNode* = e as IdentifierNode*;
+            if (id.name.id == this.this_sym.id) { return this.state.this_is_by_ref; }
+            if (!this.scopes.is_param(id.name)) { return false; }
+            return this.type_is_indirect(id.resolved_type);
+        }
+        // `&subject` / `*subject` keep naming the same storage; a member or
+        // element of caller-backed storage is caller-backed too.
+        if (k == NodeKind::UnaryExpression) {
+            const u: UnaryExprNode* = e as UnaryExprNode*;
+            if (u.desugared_call != null) { return false; }
+            if (u.op.lexeme != "&" && u.op.lexeme != "*") { return false; }
+            return this.subject_is_caller_backed(u.operand);
+        }
+        if (k == NodeKind::MemberAccess) {
+            return this.subject_is_caller_backed((e as MemberAccessNode*).object);
+        }
+        if (k == NodeKind::ArrayAccess) {
+            return this.subject_is_caller_backed((e as ArrayAccessNode*).array);
+        }
+        return false;
+    }
+
+    /// Whether `ty` is a pointer or a reference — storage reached through it is
+    /// somebody else's.
+    type_is_indirect(&this, ty: TypeRef) -> boolean {
+        if (!ty.is_valid()) { return false; }
+        const t: Type* = this.arena.lookup(ty.id);
+        if (t == null) { return false; }
+        return t.kind == TypeKind::Pointer || t.kind == TypeKind::Reference;
+    }
+
     check_return_stack_address(mut &this, e: ExpressionNode*) -> void {
         if (e == null) { return; }
         if (e.kind == NodeKind::IfExpression) {
@@ -3196,6 +3246,10 @@ public:
             const u: UnaryExprNode* = e as UnaryExprNode*;
             if (u.op.lexeme == "&" && u.operand != null && u.operand.kind == NodeKind::Identifier) {
                 const id: IdentifierNode* = u.operand as IdentifierNode*;
+                // A payload binding over a caller-backed subject names the
+                // caller's storage, not a copy in this frame, so its address
+                // survives the return — that is exactly an in-place accessor.
+                if (this.scopes.is_aliasing_binding(id.name)) { return; }
                 if (this.scopes.is_local_or_param(id.name) && !this.scopes.is_param(id.name)) {
                     this.ctx.emit_error_at(ErrorCode::E0455_DANGLING_POINTER,
                         "cannot return the address of a local variable: it lives on this function's stack frame and is freed when the function returns. Return the value by move, or a heap allocation, instead.",

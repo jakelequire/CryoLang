@@ -59,19 +59,34 @@ type struct PatternResolver {
     /// Bind the names introduced by a match arm's top-level patterns against a
     /// value of `subject_type`.  An identifier pattern binds the whole subject; an
     /// enum pattern recurses into its payload.
-    bind_arm_patterns(mut &this, arm: MatchArmNode*, subject_type: TypeRef) -> void {
+    ///
+    /// `caller_backed` says the subject's storage outlives this frame (it was
+    /// reached through a by-reference parameter), which makes every binding taken
+    /// from it an alias of the caller's storage rather than of a frame copy.  The
+    /// return-escape check needs that distinction to tell an in-place accessor
+    /// from a dangling one.
+    bind_arm_patterns(mut &this, arm: MatchArmNode*, subject_type: TypeRef,
+                      caller_backed: boolean) -> void {
         for (mut i: i64 = 0; i < arm.patterns.length; i++) {
             const pat: PatternNode* = arm.patterns[i];
             if (pat == null) { continue; }
             if (pat.pattern_kind == PatternKind::Identifier && pat.binding_name.is_valid()) {
                 if (subject_type.is_valid()) {
                     this.scopes.register_local(pat.binding_name, subject_type);
+                    this.note_alias_binding(pat.binding_name, caller_backed);
                 }
                 continue;
             }
             if (pat.pattern_kind != PatternKind::Enum) { continue; }
-            this.bind_enum_pattern(pat as EnumPatternNode*, subject_type);
+            this.bind_enum_pattern(pat as EnumPatternNode*, subject_type, caller_backed);
         }
+    }
+
+    /// Record that `name` aliases caller storage, so `return &name` is not a
+    /// dangling return.
+    note_alias_binding(mut &this, name: SymbolStr, caller_backed: boolean) -> void {
+        if (!caller_backed || !name.is_valid()) { return; }
+        this.state.alias_binding_ids.push(name.id);
     }
 
     /// Resolve the positional payload types of `enum_pat`'s variant against a value
@@ -172,7 +187,8 @@ type struct PatternResolver {
 
     /// Bind the names of an enum pattern matched against a value of `value_type`,
     /// recursing into nested sub-patterns; each element binds against its payload.
-    bind_enum_pattern(mut &this, enum_pat: EnumPatternNode*, value_type: TypeRef) -> void {
+    bind_enum_pattern(mut &this, enum_pat: EnumPatternNode*, value_type: TypeRef,
+                      caller_backed: boolean) -> void {
         const payload_types: TypeRef[] = this.resolve_variant_payload_types(value_type, enum_pat);
         for (mut j: i64 = 0; j < enum_pat.elements.length; j++) {
             mut elem_ty: TypeRef = this.arena.get_void();
@@ -187,23 +203,28 @@ type struct PatternResolver {
                 // Remember the binding so a `return &payload` is caught (E0455).
                 if (pb.name.is_valid()) { this.state.payload_binding_ids.push(pb.name.id); }
                 this.scopes.register_local(pb.name, elem_ty);
+                this.note_alias_binding(pb.name, caller_backed);
                 continue;
             }
             const sub: PatternNode* = enum_pat.sub_at(j);
-            if (sub != null) { this.bind_subpattern(sub, elem_ty); }
+            if (sub != null) { this.bind_subpattern(sub, elem_ty, caller_backed); }
         }
     }
 
     /// Bind names in an arbitrary nested pattern matched against `value_type`.
     /// Only identifier bindings and nested enum patterns introduce names.
-    bind_subpattern(mut &this, pat: PatternNode*, value_type: TypeRef) -> void {
+    bind_subpattern(mut &this, pat: PatternNode*, value_type: TypeRef,
+                    caller_backed: boolean) -> void {
         if (pat == null) { return; }
         if (pat.pattern_kind == PatternKind::Identifier && pat.binding_name.is_valid()) {
-            if (value_type.is_valid()) { this.scopes.register_local(pat.binding_name, value_type); }
+            if (value_type.is_valid()) {
+                this.scopes.register_local(pat.binding_name, value_type);
+                this.note_alias_binding(pat.binding_name, caller_backed);
+            }
             return;
         }
         if (pat.pattern_kind == PatternKind::Enum) {
-            this.bind_enum_pattern(pat as EnumPatternNode*, value_type);
+            this.bind_enum_pattern(pat as EnumPatternNode*, value_type, caller_backed);
         }
     }
 
