@@ -26,6 +26,7 @@ import std::collections::string;
 import std::collections::array;
 import std::future;
 import std::time;
+import std::time::clock;
 import std::io::error;
 import std::io::traits;
 import std::io::buf;
@@ -247,10 +248,52 @@ function server_answers_a_truncated_request_with_400() -> Result<(), TestError> 
     return expect_eq(r, 400 as i64);
 }
 
-// A read-deadline test belongs here and is deliberately ABSENT: the server
-// does not enforce `with_read_timeout` yet. Wrapping the read in
-// `Futures::timeout` writes the framed request into a local from inside a
-// branch, and the states that TAKE a carried value still share one binding
-// (see the note above `prepend_agg_take` in `sema/async_lower.cryo`). The
-// declaring-state half of that bug is pinned by `async_branch_owning_local`;
-// a deadline test would only restate the remaining half from further away.
+/// Connect, then say NOTHING. The server's read cap is what has to end this;
+/// the client only reports how long the server took to hang up. A server that
+/// closed immediately (no cap applied, or the connection dropped for an
+/// unrelated reason) reports a small number, which is why the assertion is a
+/// lower bound rather than "it closed".
+async function hs_idle_client(port: u16) -> i64 {
+    mut sock: TcpStream = match (await TcpConnect::start(SocketAddr::localhost_v4(port))) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { return -10; }
+    };
+    mut c: BufStream<TcpStream> = BufStream<TcpStream>::of(sock);
+    const started: Instant = Instant::now();
+    // Never answered: the server has no request to reply to, so this resolves
+    // only when the capped read abandons the connection and closes it.
+    match (await c.read_response()) {
+        Result::Ok(_)  => { return -11; }
+        Result::Err(_) => { }
+    }
+    return (started.elapsed().as_millis()) as i64;
+}
+
+/// A ONE-second cap, so the test spends about a second rather than the 30 the
+/// default would cost.
+async function hs_idle(listener: TcpListener, port: u16) -> i64 {
+    mut s: HttpServer = HttpServer::new(SocketAddr::localhost_v4(port), hs_echo_path);
+    s.with_read_timeout(1 as i64);
+    const sel: Selected<Result<(), IoError>, i64> =
+        await Futures::select(s.run_on(listener), hs_idle_client(port));
+    return match (sel) {
+        Selected::First(_)  => { -1 }
+        Selected::Second(v) => { v }
+    };
+}
+
+![test]
+function server_read_timeout_closes_an_idle_connection() -> Result<(), TestError> {
+    mut l: TcpListener = match (hs_bind()) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { return bail(Str::new("bind 127.0.0.1:0 failed")); }
+    };
+    const port: u16 = hs_port(&l);
+    if (port == 0u16) { l.drop(); return bail(Str::new("local_addr failed")); }
+    mut ex: Executor = Executor::new();
+    const ms: i64 = ex.block_on(hs_idle(l, port));
+    ex.drop();
+    if (ms < 0) { return bail(Str::new("idle client failed before the cap")); }
+    // The cap is one second. A server that hangs up straight away cannot pass.
+    return expect_true(ms >= 900, Str::new("read cap closed the connection early"));
+}

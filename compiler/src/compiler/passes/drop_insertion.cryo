@@ -142,19 +142,28 @@ type struct DropInserter {
     link_payload: u32[];
     link_subject: u32[];
 
-    /// Conditional-move drop flags: a binding moved on some control-flow
-    /// paths but not others gets a synthesized `mut <name>__dropflag:
-    /// boolean = false;` hoisted before the branching statement, plus a
-    /// `<flag> = true;` appended to every moving arm.  At scope exit the
-    /// binding's drop is wrapped in `if (!<flag>) { ... }` so it runs on
-    /// the not-moved path and is skipped on the moved path - the
-    /// canonical "drop flag" technique.  Parallel arrays keyed by
-    /// SymbolStr id: `flag_binding_keys[i]` is the owning binding's name
-    /// id, `flag_flag_keys[i]` is the synthesized boolean local's name
-    /// id.  Lookup is linear; functions rarely have many conditional
-    /// moves, so the array is short.
-    flag_binding_keys: u32[];
-    flag_flag_keys:    u32[];
+    /// Conditional-move drop flag name id per live binding, parallel to
+    /// `binding_names` (exactly like `binding_initflags`).  A binding moved on
+    /// some control-flow paths but not others gets a synthesized
+    /// `mut <name>__dropflag<seq>: boolean = false;` hoisted before the
+    /// branching statement, plus a `<flag> = true;` appended to every moving
+    /// arm.  At scope exit the binding's drop is wrapped in `if (!<flag>) {...}`
+    /// so it runs on the not-moved path and is skipped on the moved path - the
+    /// canonical "drop flag" technique.  `0` (the reserved invalid SymbolStr id)
+    /// means the binding has no drop flag and its scope-exit drop is governed by
+    /// the static moved-set instead.
+    ///
+    /// Keyed by DECLARATION - the binding's slot - rather than by name, and
+    /// truncated in lock-step with `binding_*` on scope pop.  Name-keying is
+    /// wrong as soon as one function declares the same name more than once:
+    /// each declaration owns SEPARATE storage, so they must not share a flag.
+    /// A flag raised where one declaration moved its value would otherwise
+    /// suppress - or, with the inverse polarity, enable - the drop of another
+    /// declaration's, releasing the same block twice.  An `async` function makes
+    /// this routine rather than exotic: its state blocks all live in one lowered
+    /// `poll`, and every state that takes a carried value across a suspend
+    /// declares it under the same name.
+    binding_dropflags: u32[];
 
     /// Monotonic counter for naming synthesized drop-flag locals (avoid
     /// clashing with anything the user wrote or with other synthetic
@@ -229,8 +238,7 @@ type struct DropInserter {
             moved_lines:     [],
             link_payload:    [],
             link_subject:    [],
-            flag_binding_keys: [],
-            flag_flag_keys:    [],
+            binding_dropflags: [],
             flag_seq:        0,
             initflag_seq:    0,
             pm_binding:      [],
@@ -269,6 +277,7 @@ type struct DropInserter {
             this.binding_types.pop();
             this.binding_spans.pop();
             this.binding_initflags.pop();
+            this.binding_dropflags.pop();
             this.types_keys.pop();
             this.types_refs.pop();
         }
@@ -331,6 +340,9 @@ type struct DropInserter {
         // No init flag by default; a conditionally-initialized droppable
         // local upgrades this slot via attach_init_flag right after this call.
         this.binding_initflags.push(0 as u32);
+        // No drop flag by default; a branch-join that finds this binding moved
+        // on some paths only upgrades the slot via register_drop_flag.
+        this.binding_dropflags.push(0 as u32);
     }
 
     /// Same as register_binding but stores a type-only entry (no
@@ -532,8 +544,7 @@ type struct DropInserter {
         this.loop_boundary   = [];
         this.moved_keys  = [];
         this.moved_lines = [];
-        this.flag_binding_keys = [];
-        this.flag_flag_keys    = [];
+        this.binding_dropflags = [];
         this.flag_seq         = 0;
         this.pm_binding       = [];
         this.pm_field         = [];
@@ -571,8 +582,9 @@ type struct DropInserter {
                 this.binding_spans.push(p.span);
                 // A by-value param is initialized by the caller's move-in, so
                 // it is unconditionally live - no init flag (keep the parallel
-                // array in lock-step; register_binding is bypassed here).
+                // arrays in lock-step; register_binding is bypassed here).
                 this.binding_initflags.push(0 as u32);
+                this.binding_dropflags.push(0 as u32);
             }
         }
         // A base-class constructor initializer (`MyCtor(...) : Base(arg, ...)`)
@@ -2229,13 +2241,16 @@ type struct DropInserter {
         // An unconditionally-moved binding produces no cleanup at all (its
         // storage left this scope), so init state is moot - return early.
         mut core: StatementNode*[] = [];
-        // Conditional move: a drop-flag was hoisted for this binding by
+        // Conditional move: a drop-flag was hoisted for THIS declaration by
         // a branch-join in this function.  Emit `if (!flag) drop();`
         // regardless of the moved-set state, since the flag is the
         // ground truth.  The moved_keys tracking still serves other
         // analyses (e.g. mark_moved short-circuit) but is overridden
-        // here for the drop decision.
-        const flag: SymbolStr = this.get_drop_flag(sym);
+        // here for the drop decision.  Read from the slot, not by name: a
+        // function may declare this name several times (an `async` poll takes
+        // a carried value under one name in every state that needs it), and
+        // each declaration's storage must be governed by its own flag.
+        const flag: SymbolStr = SymbolStr::from_id(this.binding_dropflags[idx]);
         if (flag.is_valid()) {
             const cstmt: StatementNode* = this.make_conditional_drop_call(
                 sym, ty, flag, span);
@@ -2358,27 +2373,40 @@ type struct DropInserter {
     // conditional drop.  LLVM's O2 default folds the flag away when it
     // can prove the move state statically.
 
-    /// Look up the drop-flag local synthesized for `binding`, or return
-    /// an invalid SymbolStr if there is none.
-    get_drop_flag(&this, binding: SymbolStr) -> SymbolStr {
-        if (!binding.is_valid()) { return SymbolStr::empty(); }
-        for (mut i: i64 = 0; i < this.flag_binding_keys.length; i++) {
-            if (this.flag_binding_keys[i] == binding.id) {
-                return SymbolStr::from_id(this.flag_flag_keys[i]);
-            }
+    /// Slot index of the innermost live binding named `binding`, or -1.
+    /// Reverse scan, so an inner declaration shadowing an outer one of the
+    /// same name resolves to the inner - the declaration a reference at this
+    /// point actually names.
+    innermost_binding_slot(&this, binding: SymbolStr) -> i64 {
+        if (!binding.is_valid()) { return -1; }
+        for (mut i: i64 = this.binding_names.length - 1; i >= 0; i--) {
+            if (this.binding_names[i] == binding.id) { return i; }
         }
-        return SymbolStr::empty();
+        return -1;
     }
 
-    /// Register a binding -> flag mapping (idempotent on the binding
-    /// key; the first flag wins).
+    /// Look up the drop-flag local synthesized for the innermost live
+    /// declaration of `binding`, or return an invalid SymbolStr if there is
+    /// none.  Callers that already hold the slot index (`maybe_append_drop`)
+    /// read `binding_dropflags` directly instead - exact, and immune to a
+    /// later same-named declaration shadowing the one being dropped.
+    get_drop_flag(&this, binding: SymbolStr) -> SymbolStr {
+        const idx: i64 = this.innermost_binding_slot(binding);
+        if (idx < 0) { return SymbolStr::empty(); }
+        return SymbolStr::from_id(this.binding_dropflags[idx]);
+    }
+
+    /// Record `flag` as the drop flag of the innermost live declaration of
+    /// `binding`.  Idempotent per declaration: the first flag wins, so two
+    /// sibling branches that each conditionally move the same binding keep
+    /// sharing one flag (they share the storage too).  A DIFFERENT declaration
+    /// of the same name owns a different slot and so gets its own flag.
     register_drop_flag(mut &this, binding: SymbolStr, flag: SymbolStr) -> void {
-        if (!binding.is_valid() || !flag.is_valid()) { return; }
-        for (mut i: i64 = 0; i < this.flag_binding_keys.length; i++) {
-            if (this.flag_binding_keys[i] == binding.id) { return; }
-        }
-        this.flag_binding_keys.push(binding.id);
-        this.flag_flag_keys.push(flag.id);
+        if (!flag.is_valid()) { return; }
+        const idx: i64 = this.innermost_binding_slot(binding);
+        if (idx < 0) { return; }
+        if (this.binding_dropflags[idx] != (0 as u32)) { return; }
+        this.binding_dropflags[idx] = flag.id;
     }
 
     /// Build `mut <flag>: boolean = false;` as a DeclStmt.  The boolean

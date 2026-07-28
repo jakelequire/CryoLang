@@ -3603,13 +3603,9 @@ type struct AsyncLower {
     /// destructor on garbage. For a socket, "garbage" can be a perfectly valid
     /// descriptor number, so the drop closes an unrelated file.
     /// The declaration is bound to a FRESH name, and the rest of the state is
-    /// rewritten onto it. Reusing the carried local's name would give several
-    /// states a declaration spelled the same way, and codegen keys a local's
-    /// drop flag by name: the states would then share ONE flag while owning
-    /// separate storage, so a flag raised where one state initialized its copy
-    /// enables the scope-exit drop in another that never did. With two such
-    /// states it happens to survive; with three — an `if`/`else` whose arms both
-    /// write the value — the same heap block is released twice.
+    /// rewritten onto it, so each declaring state's binding is distinct all the
+    /// way down rather than several declarations spelled the same way sharing
+    /// whatever downstream bookkeeping is keyed by name.
     ///
     /// Returns the fresh name, or the empty symbol when the state has no
     /// top-level assignment to convert. Callers must hand the value back under
@@ -3698,8 +3694,14 @@ type struct AsyncLower {
     /// sub-future is taken out of its slot at the top of a resume state.
     ///
     /// Several states may open with a take of the SAME carried value, and they
-    /// all declare it under `name` — see the note above this function for why
-    /// they cannot each be given their own binding, and what that costs.
+    /// all declare it under `name`. That is sound because drop-flag bookkeeping
+    /// is keyed per DECLARATION rather than by name (`binding_dropflags` in
+    /// `passes/drop_insertion.cryo`), so each state's declaration governs its
+    /// own storage. Giving them distinct names instead is NOT an option: the
+    /// state blocks share AST statement nodes — a loop body reached from
+    /// several states is one node list — so renaming per state rewrites a node
+    /// another state also reads, leaving that state naming a binding outside
+    /// its scope.
     prepend_agg_take(mut &this, blk: BlockStmtNode*, name: SymbolStr, field: SymbolStr,
                      lty: TypeRef, opt_ty: TypeRef, struct_ref: TypeRef,
                      mutable: boolean, span: SourceSpan) -> void {
@@ -3708,16 +3710,6 @@ type struct AsyncLower {
         for (mut i: i64 = 0; i < blk.statements.length; i++) { rebuilt.push(blk.statements[i]); }
         blk.statements = rebuilt;
     }
-
-    // A state that TAKES a carried value cannot be given a per-state binding
-    // the way a state that produces one is (`decl_at_first_assignment`). The
-    // states share AST statement nodes — a loop body reached from several
-    // states is the same node list — so renaming per state rewrites a node
-    // that another state also reads, and the second state's take then declares
-    // a name nothing refers to while the shared statements name a binding that
-    // is not in their scope (E0201). De-sharing those nodes, or keying drop
-    // flags per declaration rather than by name in codegen, is what would let
-    // the taking states be separated.
 
     /// Insert the hand-back store before every `return Poll::Pending` inside
     /// `s`. A suspend leaves `poll` from the middle of a state, so the store at
