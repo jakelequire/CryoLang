@@ -1,0 +1,92 @@
+// A `match`-arm binding taken from a subject the CALLER owns aliases that
+// storage rather than a copy in this frame, so its address may be returned.
+//
+// This is what an in-place accessor is: `payload_ptr(&this) -> T*` hands back a
+// pointer INTO the receiver's payload, so a write through it is a write to the
+// caller's value.  The return-escape check (E0455) rejects `return &binding`
+// whenever the binding is a frame local, and a payload binding registers as
+// one - correctly when the subject is a local or a temporary, wrongly when the
+// subject was reached through a by-reference parameter.
+//
+// Every case below writes through a returned interior pointer and then reads
+// the ORIGINAL back, so a copy would be observable: the counters would stay at
+// their initial values instead of accumulating.  The rejected counterparts -
+// local subject, temporary subject, by-value parameter - live in
+// tests/negative/E0455_return_*.cryo.
+![config(testing)]
+namespace CryoTests::Tests::Lang::MatchBindingAlias;
+
+import std::test;
+import std::core::result;
+
+type struct Cell { n: i64; }
+
+type enum Slot<T> { Filled(T); Empty; }
+
+implement enum Slot<T> {
+    // Subject reached through the `&this` receiver.
+    payload_ptr(&this) -> T* {
+        match (&this) {
+            Slot::Filled(value) => { return &value; }
+            Slot::Empty => { core::panic("payload_ptr on an Empty slot", FILE, LINE); }
+        }
+    }
+}
+
+// Subject reached through a pointer parameter rather than a receiver.
+function slot_ptr(s: Slot<Cell>*) -> Cell* {
+    match (s) {
+        Slot::Filled(value) => { return &value; }
+        Slot::Empty => { core::panic("slot_ptr on an Empty slot", FILE, LINE); }
+    }
+}
+
+// A nested binding is a binding into the same caller-owned subject.
+type enum Outer { Wrap(Slot<Cell>); Nothing; }
+
+![test]
+function receiver_accessor_aliases_the_payload() -> Result<(), TestError> {
+    mut s: Slot<Cell> = Slot::Filled(Cell { n: 0 });
+    const p: Cell* = s.payload_ptr();
+    p.n = 7;
+    // Read the ORIGINAL back: a copy would still hold 0.
+    const q: Cell* = s.payload_ptr();
+    return expect_eq(q.n, 7 as i64);
+}
+
+![test]
+function repeated_accessor_calls_accumulate() -> Result<(), TestError> {
+    mut s: Slot<Cell> = Slot::Filled(Cell { n: 0 });
+    // Three independent calls, each writing through its own pointer. If any of
+    // them addressed a copy, the total would be short.
+    const a: Cell* = s.payload_ptr();
+    a.n = a.n + 1;
+    const b: Cell* = s.payload_ptr();
+    b.n = b.n + 1;
+    const c: Cell* = s.payload_ptr();
+    c.n = c.n + 1;
+    const final: Cell* = s.payload_ptr();
+    return expect_eq(final.n, 3 as i64);
+}
+
+![test]
+function pointer_parameter_subject_aliases() -> Result<(), TestError> {
+    mut s: Slot<Cell> = Slot::Filled(Cell { n: 10 });
+    const p: Cell* = slot_ptr(&s);
+    p.n = p.n + 5;
+    const q: Cell* = s.payload_ptr();
+    return expect_eq(q.n, 15 as i64);
+}
+
+![test]
+function accessor_and_direct_read_agree() -> Result<(), TestError> {
+    mut s: Slot<Cell> = Slot::Filled(Cell { n: 1 });
+    const p: Cell* = slot_ptr(&s);
+    p.n = 99;
+    // Observe through an ordinary match over the value, not through a pointer.
+    const seen: i64 = match (&s) {
+        Slot::Filled(v) => { v.n }
+        Slot::Empty => { 0 }
+    };
+    return expect_eq(seen, 99 as i64);
+}
