@@ -1511,6 +1511,10 @@ type struct AsyncLower {
             mut tr: TryExprNode* = e as TryExprNode*;
             if (tr.desugared != null) {
                 tr.desugared = this.subst_name_expr(tr.desugared, name, field, struct_ref, ty, span);
+                // A promoted name in the subject became `this.<field>`, and
+                // `operand` is the same slot: left alone it would keep naming
+                // the local whose declaration this pass has just removed.
+                tr.resync_operand();
             } else {
                 tr.operand = this.subst_name_expr(tr.operand, name, field, struct_ref, ty, span);
             }
@@ -1704,7 +1708,7 @@ type struct AsyncLower {
                 // by value and would otherwise be mistaken for the state's own
                 // last use, suppressing the tail hand-back. Same hazard, and same
                 // ordering rule, as a promoted local.
-                const handback: boolean = this.needs_handback(sm.blocks[b], pname);
+                const handback: boolean = this.needs_handback(sm.blocks[b], pname, lty);
                 // The name the value lives under in THIS state: the carried name
                 // when the state took it, or the fresh binding a declaring state
                 // was given.
@@ -3377,12 +3381,53 @@ type struct AsyncLower {
     /// looks perfectly reachable. Suspends are handled separately by
     /// `store_before_suspends`, which stores BEFORE the `return Poll::Pending`,
     /// so skipping the trailing store loses nothing on that path.
-    needs_handback(&this, blk: BlockStmtNode*, name: SymbolStr) -> boolean {
-        if (this.last_use_consumes(blk, name)) { return false; }
+    needs_handback(&this, blk: BlockStmtNode*, name: SymbolStr, lty: TypeRef) -> boolean {
+        if (this.last_use_consumes(blk, name, lty)) { return false; }
         return !this.stmt_diverges(blk as StatementNode*);
     }
 
-    last_use_consumes(&this, blk: BlockStmtNode*, name: SymbolStr) -> boolean {
+    /// Whether a value of `ty` can be given away at all.
+    ///
+    /// Only a value with a destructor can: handing one over transfers the
+    /// obligation to run it, so the giver must not keep a second claim. A type
+    /// with no destructor — a payload-free enum, a struct of scalars, a `Slice`
+    /// view — is COPIED by every by-value use, so the state keeps its own
+    /// intact and there is nothing for a second claim to double-free. Mirrors
+    /// `move_check::type_needs_drop`, which reaches the same conclusion for
+    /// reuse after a by-value move.
+    ///
+    /// Anything whose ownership cannot be READ here counts as givable. A
+    /// generic parameter, and an instantiation specialization has not filled in
+    /// yet, both answer "no destructor" to `needs_drop` because they are not
+    /// concrete value positions — not because they own nothing. Trusting that
+    /// would force a hand-back of a value the state really did move away, which
+    /// the move checker rejects (E0452). Guessing wrong in this direction costs
+    /// only the hand-back this predicate was added to restore.
+    carried_can_be_given_away(&this, ty: TypeRef) -> boolean {
+        if (!ty.is_valid()) { return true; }
+        if (this.arena.contains_generic_param(ty)) { return true; }
+        if (this.ownership_unreadable(ty)) { return true; }
+        return OwnershipQuery::needs_drop(this.arena, this.ctx.generic_registry,
+                                          this.intern, ty);
+    }
+
+    /// True when `ty` is an instantiation whose concrete shape specialization
+    /// has not produced yet: its fields are empty at lowering time, so reading
+    /// them would report every generic aggregate as owning nothing.
+    ownership_unreadable(&this, ty: TypeRef) -> boolean {
+        const t: Type* = this.arena.lookup(ty.id);
+        if (t == null) { return true; }
+        if (t.kind != TypeKind::InstantiatedType) { return false; }
+        return !(t as InstantiatedType*).has_resolved_type();
+    }
+
+    last_use_consumes(&this, blk: BlockStmtNode*, name: SymbolStr, lty: TypeRef) -> boolean {
+        // A copy is not a give-away. Reporting one as such suppresses the
+        // hand-back, and the carrier the next state takes from is then empty —
+        // `take().unwrap()` on a `None`. This is why the declaring state of
+        // `const op: OpCode = …; if (is_control(op)) { … } await …;` has to
+        // publish: `is_control(op)` reads a copy and leaves `op` where it was.
+        if (!this.carried_can_be_given_away(lty)) { return false; }
         mut kind: i64 = 0i64;
         for (mut i: i64 = 0; i < blk.statements.length; i++) {
             this.mark_last_use_stmt(blk.statements[i], name, &kind);
@@ -4176,7 +4221,7 @@ type struct AsyncLower {
                 // Read before the store below is appended: that store hands the
                 // value to `Option::Some` BY VALUE, so asking afterwards would
                 // report every declaring state as having given the value away.
-                const ds_publishes: boolean = this.needs_handback(sm.blocks[ds], nm);
+                const ds_publishes: boolean = this.needs_handback(sm.blocks[ds], nm, lty);
                 if (ds_publishes) {
                     sm.blocks[ds].add_statement(
                         this.agg_store_stmt(sm, afield, opt_ty, nm, lty, span));
@@ -4204,7 +4249,7 @@ type struct AsyncLower {
                     // that reaches it is an `await` on a carried receiver whose
                     // block does not mention the value again after the suspend,
                     // i.e. every `await c.m()` inside a loop.
-                    const handback: boolean = this.needs_handback(sm.blocks[b], nm);
+                    const handback: boolean = this.needs_handback(sm.blocks[b], nm, lty);
                     // A conditional rebuild is carried in like a read: the take
                     // gives the state the previous value, the nested assignment
                     // replaces it only on the path that runs, and either way the
@@ -4460,6 +4505,10 @@ type struct AsyncLower {
             mut tr: TryExprNode* = e as TryExprNode*;
             if (tr.desugared != null) {
                 tr.desugared = this.hoist_expr(tr.desugared, pre);
+                // The subject just became the hoisted temporary, and `operand`
+                // is the same slot: left alone it would keep naming the await
+                // that has moved to its own statement in an earlier state.
+                tr.resync_operand();
             } else {
                 tr.operand = this.hoist_expr(tr.operand, pre);
             }

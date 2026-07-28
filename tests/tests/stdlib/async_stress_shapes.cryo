@@ -882,3 +882,194 @@ function sync_zero_sized_payload_enum_round_trips() -> Result<(), TestError> {
     };
     return expect_eq(m, 5 as i64);
 }
+
+// ============================================================================
+// `?` on an awaited call
+// ============================================================================
+//
+// `?` is not a syntax the state machine sees. Sema replaces it with a `match`
+// whose SUBJECT is the `?`'s operand — the very same expression node, held in
+// two slots at once. The async lowering then hoists the `await` out of that
+// subject into its own statement, which replaces the subject node and left the
+// operand slot naming the pre-hoist tree.
+//
+// Nothing walks the operand at RUNTIME, so the symptom was a name error rather
+// than a wrong answer: the resolver still reads the operand (call
+// specialization and dispatch annotation read it and never the desugar), and
+// there it found an `await` that had moved to an earlier state, reading locals
+// that no longer exist where it sits. `(await f(n))?` where `n` is any local
+// was rejected outright.
+//
+// These pin the shape by VALUE rather than by "it compiled", because the same
+// desync also mis-specializes a generic callee, which no compile check catches.
+
+async function ass_try_step(n: i64) -> Result<i64, i64> {
+    const v: i64 = await PendingThenReady<i64>::new(1, n);
+    if (v < 0) { return Result::Err(v); }
+    return Result::Ok(v * 2);
+}
+
+/// `?` on an awaited call whose argument list reads a `mut` local.
+async function ass_try_mut_local_arg() -> Result<i64, i64> {
+    mut n: i64 = 0;
+    n = 3;
+    const a: i64 = (await ass_try_step(n))?;
+    return Result::Ok(a);
+}
+
+/// The same with a `const` local, and with the local inside an expression
+/// rather than alone — the operand slot holds the whole argument tree.
+async function ass_try_const_local_arg() -> Result<i64, i64> {
+    const n: i64 = 3;
+    const a: i64 = (await ass_try_step(n + 0))?;
+    return Result::Ok(a);
+}
+
+/// Two of them, with a value read out of the first result feeding the second
+/// call's arguments — the frame-reader shape.
+async function ass_try_chained() -> Result<i64, i64> {
+    const a: i64 = (await ass_try_step(2))?;
+    mut b: i64 = 0;
+    const held: Option<i64> = Option::Some(a);
+    match (held) { Option::Some(v) => { b = v; } Option::None => { } }
+    const c: i64 = (await ass_try_step(b))?;
+    return Result::Ok(c);
+}
+
+/// CONTROL: the same call hand-hoisted, which never had the bug. If this is
+/// green and the three above are red, the fault is the `?` desugar's operand.
+async function ass_try_hand_hoisted() -> Result<i64, i64> {
+    mut n: i64 = 0;
+    n = 3;
+    const r: Result<i64, i64> = await ass_try_step(n);
+    const a: i64 = r?;
+    return Result::Ok(a);
+}
+
+function ass_try_value(r: Result<i64, i64>) -> i64 {
+    match (r) {
+        Result::Ok(v)  => { return v; }
+        Result::Err(e) => { return e - 1000; }
+    }
+}
+
+![test]
+function async_try_on_awaited_call_reading_a_mut_local() -> Result<(), TestError> {
+    return expect_eq(ass_try_value(future::block_on(ass_try_mut_local_arg())), 6 as i64);
+}
+
+![test]
+function async_try_on_awaited_call_reading_a_const_local() -> Result<(), TestError> {
+    return expect_eq(ass_try_value(future::block_on(ass_try_const_local_arg())), 6 as i64);
+}
+
+![test]
+function async_try_chained_across_two_suspends() -> Result<(), TestError> {
+    return expect_eq(ass_try_value(future::block_on(ass_try_chained())), 8 as i64);
+}
+
+![test]
+function async_try_hand_hoisted_control() -> Result<(), TestError> {
+    return expect_eq(ass_try_value(future::block_on(ass_try_hand_hoisted())), 6 as i64);
+}
+
+// ============================================================================
+// Carrying a value that has no destructor
+// ============================================================================
+//
+// A value crossing a suspend rides either a scalar field or an `Option<T>`
+// carrier, and the carrier is emptied on entry to a state and refilled on the
+// way out — unless that state GAVE THE VALUE AWAY, in which case it has nothing
+// left to hand back.
+//
+// "Gave away" was read off the syntax alone: any by-value use counted. For a
+// value with a destructor that is right, it IS a move. For one without —a
+// payload-free enum, a struct of scalars, a `Slice` view— a by-value use is a
+// COPY and the state still holds its own. Reporting it as given away suppressed
+// the hand-back, so the next state took an empty carrier and `unwrap` panicked
+// on a `None`.
+//
+// The shape that reaches it is ordinary: read a tag out of a header, check it,
+// then await the body. Every test below asserts the value SURVIVED the suspend,
+// not merely that the function returned.
+
+type enum AssTag : u8 {
+    Zero = 0x0;
+    One  = 0x1;
+    Two  = 0x2;
+}
+
+/// By VALUE, so the read is exactly the "give-away" the walk used to see.
+function ass_tag_num(t: AssTag) -> u64 {
+    match (t) {
+        AssTag::Zero => { return 0; }
+        AssTag::One  => { return 1; }
+        AssTag::Two  => { return 2; }
+    }
+}
+
+/// A struct with no destructor, read the same way.
+type struct AssPlain { v: u64; }
+function ass_plain_num(p: AssPlain) -> u64 { return p.v; }
+
+/// Declare, read by value, suspend, read again. The middle read is what made
+/// the declaring state skip publishing the carrier.
+async function ass_nodrop_enum_read_then_await() -> u64 {
+    const tag: AssTag = AssTag::Two;
+    if (ass_tag_num(tag) > 99) { return 0; }
+    const _a: u64 = await PendingThenReady<u64>::new(1, 1);
+    return ass_tag_num(tag);
+}
+
+async function ass_nodrop_struct_read_then_await() -> u64 {
+    const p: AssPlain = AssPlain { v: 2 };
+    if (ass_plain_num(p) > 99) { return 0; }
+    const _a: u64 = await PendingThenReady<u64>::new(1, 1);
+    return ass_plain_num(p);
+}
+
+/// The same with a branch that suspends between the two reads, on the path that
+/// SKIPS it — the branch is where this first showed up.
+async function ass_nodrop_enum_over_skipped_branch(take: boolean) -> u64 {
+    const tag: AssTag = AssTag::Two;
+    mut extra: u64 = 0;
+    if (take) {
+        extra = await PendingThenReady<u64>::new(1, 7);
+    }
+    if (ass_tag_num(tag) > 99) { return 0; }
+    const _a: u64 = await PendingThenReady<u64>::new(1, 1);
+    return ass_tag_num(tag) + extra;
+}
+
+/// CONTROL: no read before the suspend, which always worked. Green here with a
+/// red above names the middle read rather than the carrier itself.
+async function ass_nodrop_enum_no_early_read() -> u64 {
+    const tag: AssTag = AssTag::Two;
+    const _a: u64 = await PendingThenReady<u64>::new(1, 1);
+    return ass_tag_num(tag);
+}
+
+![test]
+function async_carries_a_payload_free_enum_read_before_the_suspend() -> Result<(), TestError> {
+    return expect_eq(future::block_on(ass_nodrop_enum_read_then_await()) as i64, 2 as i64);
+}
+
+![test]
+function async_carries_a_destructorless_struct_read_before_the_suspend() -> Result<(), TestError> {
+    return expect_eq(future::block_on(ass_nodrop_struct_read_then_await()) as i64, 2 as i64);
+}
+
+![test]
+function async_carries_an_enum_past_a_branch_that_was_not_taken() -> Result<(), TestError> {
+    return expect_eq(future::block_on(ass_nodrop_enum_over_skipped_branch(false)) as i64, 2 as i64);
+}
+
+![test]
+function async_carries_an_enum_past_a_branch_that_was_taken() -> Result<(), TestError> {
+    return expect_eq(future::block_on(ass_nodrop_enum_over_skipped_branch(true)) as i64, 9 as i64);
+}
+
+![test]
+function async_carries_an_enum_with_no_early_read_control() -> Result<(), TestError> {
+    return expect_eq(future::block_on(ass_nodrop_enum_no_early_read()) as i64, 2 as i64);
+}
