@@ -5,6 +5,14 @@
 ///! is a fluent builder: `TlsConnector::new()?.with_alpn_h2()` etc.
 ///! One context can produce many streams; `SSL_new` reference-counts
 ///! the `SSL_CTX`, so a stream outlives the connector if it has to.
+///!
+///! Handshakes are async. `connect` / `accept` run one to completion; the
+///! `start_connect` / `start_accept` pair stops one step short and hands back
+///! the `TlsHandshake` future, for a caller that has to own it (to select over
+///! it, or to give it a deadline). There is no blocking form: driving a
+///! handshake by spinning on `WANT_READ`/`WANT_WRITE` burns a thread per
+///! connection, and a bidirectional handshake on blocking sockets cannot run
+///! both sides on one thread at all.
 
 namespace std::net::tls::context;
 
@@ -63,57 +71,27 @@ type struct TlsConnector {
         return this;
     }
 
-    /// Wrap an established `TcpStream` in TLS, performing the client
-    /// handshake with SNI set to `hostname` (also the name verified
-    /// against the peer certificate when verification is on). Consumes
-    /// the `TcpStream`; on failure it is closed before returning.
-    connect(&this, stream: TcpStream, hostname: Str) -> Result<TlsStream, IoError> {
-        mut inner: TcpStream = stream;
-        const ssl: void* = openssl::SSL_new(this.ctx);
-        if (ssl == null) {
-            inner.drop();
-            return Result::Err(IoError::new(IoErrorKind::Other, 0));
-        }
-        openssl::SSL_set_fd(ssl, inner.raw_fd());
-
-        mut host_c: String = String::with_null(hostname);
-        openssl::ssl_set_sni(ssl, host_c.as_ptr());
-        if (this.verify) {
-            openssl::SSL_set1_host(ssl, host_c.as_ptr());
-            openssl::SSL_set_verify(ssl, openssl::SSL_VERIFY_PEER, null);
-        }
-
-        const rc: i32 = drive_handshake(ssl, true);
-        host_c.drop();
-        if (rc != 0) {
-            const err: IoError = stream::ssl_error(rc);
-            openssl::SSL_free(ssl);
-            inner.drop();
-            return Result::Err(err);
-        }
-        // Belt-and-suspenders verification gate. With SSL_VERIFY_PEER +
-        // SSL_set1_host a bad chain or hostname mismatch already fails the
-        // handshake (rc != 0 above), so this is not the primary check - but
-        // assert the verified result explicitly so a future change to the
-        // handshake path can't silently hand back an unverified peer.
-        if (this.verify
-                && openssl::SSL_get_verify_result(ssl) != openssl::X509_V_OK) {
-            openssl::SSL_free(ssl);
-            inner.drop();
-            return Result::Err(IoError::new(IoErrorKind::Other, 0));
-        }
-        return Result::Ok(TlsStream::from_parts(ssl, inner));
+    /// Wrap an established `TcpStream` in TLS, performing the client handshake
+    /// with SNI set to `hostname` (also the name verified against the peer
+    /// certificate when verification is on). Consumes the `TcpStream`; on
+    /// failure it is closed before returning.
+    ///
+    /// Each `WANT_READ`/`WANT_WRITE` becomes a reactor registration rather than
+    /// a spin, so the handshake shares its thread with every other task.
+    async connect(&this, stream: TcpStream, hostname: Str) -> Result<TlsStream, IoError> {
+        const hs: TlsHandshake = this.start_connect(stream, hostname)?;
+        return await hs;
     }
 
-    /// The async counterpart of `connect`: set the socket non-blocking, mint the
-    /// `SSL*` with the same SNI and verification wiring, and hand back the future
-    /// that drives the handshake against a reactor instead of spinning on
-    /// `WANT_READ`/`WANT_WRITE`.
+    /// Set the socket non-blocking and mint the `SSL*` with the SNI and
+    /// verification wiring, handing back the future that drives the handshake.
     ///
     /// Everything up to the first `SSL_connect` happens here rather than on the
     /// first poll, so a setup failure is reported to the caller directly instead
-    /// of having to be carried inside the future.
-    connect_async(&this, stream: TcpStream, hostname: Str) -> Result<TlsHandshake, IoError> {
+    /// of having to be carried inside the future. Callers wanting the whole
+    /// handshake in one step want `connect`; this exists for a caller that has
+    /// to own the future itself (to select over it, or to time it out).
+    start_connect(&this, stream: TcpStream, hostname: Str) -> Result<TlsHandshake, IoError> {
         mut inner: TcpStream = stream;
         match (inner.set_nonblocking(true)) {
             Result::Ok(_)  => { }
@@ -183,28 +161,15 @@ type struct TlsAcceptor {
 
     /// Complete the server handshake over an accepted `TcpStream`.
     /// Consumes it; closes it on failure.
-    accept(&this, stream: TcpStream) -> Result<TlsStream, IoError> {
-        mut inner: TcpStream = stream;
-        const ssl: void* = openssl::SSL_new(this.ctx);
-        if (ssl == null) {
-            inner.drop();
-            return Result::Err(IoError::new(IoErrorKind::Other, 0));
-        }
-        openssl::SSL_set_fd(ssl, inner.raw_fd());
-        const rc: i32 = drive_handshake(ssl, false);
-        if (rc != 0) {
-            const err: IoError = stream::ssl_error(rc);
-            openssl::SSL_free(ssl);
-            inner.drop();
-            return Result::Err(err);
-        }
-        return Result::Ok(TlsStream::from_parts(ssl, inner));
+    async accept(&this, stream: TcpStream) -> Result<TlsStream, IoError> {
+        const hs: TlsHandshake = this.start_accept(stream)?;
+        return await hs;
     }
 
-    /// The async counterpart of `accept`. A socket handed over by `TcpAccept` is
-    /// already non-blocking, but one from the blocking `TcpListener::accept` is
-    /// not, so it is set here rather than assumed.
-    accept_async(&this, stream: TcpStream) -> Result<TlsHandshake, IoError> {
+    /// Mint the `SSL*` and hand back the handshake future, the server-side
+    /// mirror of `start_connect`. A socket handed over by `TcpAccept` is
+    /// already non-blocking, but it is set here rather than assumed.
+    start_accept(&this, stream: TcpStream) -> Result<TlsHandshake, IoError> {
         mut inner: TcpStream = stream;
         match (inner.set_nonblocking(true)) {
             Result::Ok(_)  => { }
@@ -238,25 +203,3 @@ function ignore_sigpipe() -> void {
     libc::signal(libc::SIGPIPE, libc::SIG_IGN as void*);
 }
 
-/// Drive `SSL_connect` (client) or `SSL_accept` (server) to completion.
-/// Returns 0 on success, or the `SSL_get_error` code on failure (which
-/// `stream::ssl_error` maps to an `IoError`). Sockets are blocking, so
-/// `WANT_READ`/`WANT_WRITE` only appear transiently mid-handshake and
-/// are retried.
-function drive_handshake(ssl: void*, is_client: boolean) -> i32 {
-    loop {
-        openssl::ERR_clear_error();
-        const rc: i32 = if (is_client) {
-            openssl::SSL_connect(ssl)
-        } else {
-            openssl::SSL_accept(ssl)
-        };
-        if (rc == 1) { return 0; }
-        const code: i32 = openssl::SSL_get_error(ssl, rc);
-        if (code == openssl::SSL_ERROR_WANT_READ ||
-            code == openssl::SSL_ERROR_WANT_WRITE) {
-            continue;
-        }
-        return code;
-    }
-}

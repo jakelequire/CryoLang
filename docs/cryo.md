@@ -3047,7 +3047,7 @@ where S: AsyncWrite {
 }
 ```
 
-`TlsConnector::connect_async` and `TlsAcceptor::accept_async` drive a TLS handshake asynchronously: each `WANT_READ` / `WANT_WRITE` becomes a reactor registration rather than a spin, and the direction to wait on is taken from the TLS error code.
+`TlsConnector::connect` and `TlsAcceptor::accept` are `async` and drive a TLS handshake without blocking: each `WANT_READ` / `WANT_WRITE` becomes a reactor registration rather than a spin, and the direction to wait on is taken from the TLS error code. `start_connect` / `start_accept` stop one step short and return the `TlsHandshake` future itself, for a caller that needs to select over it or give it a deadline.
 
 ---
 
