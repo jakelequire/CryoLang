@@ -32,7 +32,7 @@ import Compiler::Lex;
 import Compiler::Passes::PassID;
 import Compiler::CompilationContext;
 import Compiler::Types;
-import Compiler::Types::{ Arena, TypeRef, Type, GenericRegistry, Ownership };
+import Compiler::Types::{ Arena, TypeRef, Type, GenericRegistry, Ownership, TraitChecker };
 import Compiler::Resolver::{ SymbolStr, InternTable };
 import std::core::option;
 import std::collections::hashmap;
@@ -64,6 +64,24 @@ type struct MoveChecker {
     /// site in a combined rustc-style multi-span snippet.
     moved_keys:  u32[];
     moved_spans: SourceSpan[];
+    /// Bindings that have been `poll`ed, i.e. futures whose storage must now
+    /// hold still.  A poll runs the state machine's own body, which may take
+    /// the address of one of its fields and keep it in another field across the
+    /// suspend; moving the future afterwards leaves that pointer naming the old
+    /// storage.  Before the first poll there is nothing to point at, so the
+    /// construct-then-hand-over moves (`block_on(f)`, `spawn(f)`,
+    /// `Futures::join(a, b)`) stay legal - the rule is "not after a poll", not
+    /// "never".
+    ///
+    /// Deliberately append-only: it is never truncated by `restore_moves` and
+    /// never revived.  Accumulating across sibling branches IS the union the
+    /// join needs, and the only imprecision that buys is a poll in one branch
+    /// being visible to a move in the other - which over-reports on code that
+    /// polls and moves the same future in mutually exclusive branches.  That is
+    /// the safe direction, and it keeps this out of `merge_branches`, where the
+    /// meet-over-paths reasoning is subtle enough already.
+    polled_keys:  u32[];
+    polled_spans: SourceSpan[];
     /// Parallel to `moved_keys`: whether the move was *storage-
     /// duplicating* (a `let`/`var` initializer, an assignment RHS, or an
     /// aggregate-literal field - all of which bitwise-copy the value into
@@ -138,6 +156,8 @@ type struct MoveChecker {
             types:       HashMap<u32, TypeRef>::new(),
             moved_keys:  [],
             moved_spans: [],
+            polled_keys:  [],
+            polled_spans: [],
             moved_real:  [],
             suppress_emit:      false,
             capture_decls:      false,
@@ -156,6 +176,8 @@ type struct MoveChecker {
         this.types       = HashMap<u32, TypeRef>::new();
         this.moved_keys  = [];
         this.moved_spans = [];
+        this.polled_keys  = [];
+        this.polled_spans = [];
         this.moved_real  = [];
         this.suppress_emit      = false;
         this.capture_decls      = false;
@@ -287,6 +309,90 @@ type struct MoveChecker {
         if (this.is_copy(ty)) { return false; }
         return OwnershipQuery::needs_drop(this.arena, this.registry,
                                           this.intern, ty);
+    }
+
+    is_polled(&this, name: SymbolStr) -> boolean {
+        if (!name.is_valid()) { return false; }
+        for (mut i: i64 = 0; i < this.polled_keys.length; i++) {
+            if (this.polled_keys[i] == name.id) { return true; }
+        }
+        return false;
+    }
+
+    polled_at_span(&this, name: SymbolStr) -> SourceSpan {
+        for (mut i: i64 = 0; i < this.polled_keys.length; i++) {
+            if (this.polled_keys[i] == name.id) { return this.polled_spans[i]; }
+        }
+        return SourceSpan::none();
+    }
+
+    mark_polled(mut &this, name: SymbolStr, span: SourceSpan) -> void {
+        if (!name.is_valid() || this.is_polled(name)) { return; }
+        this.polled_keys.push(name.id);
+        this.polled_spans.push(span);
+    }
+
+    /// Whether `ty` is a future - the receiver types this rule governs.  Asked
+    /// of the CONCRETE type: this pass runs after monomorphization, so an
+    /// `async fn`'s generated state machine and a hand-written `Future` impl
+    /// both answer here, and a type that merely happens to have a method named
+    /// `poll` does not.
+    type_implements_future(&this, ty: TypeRef) -> boolean {
+        if (!ty.is_valid()) { return false; }
+        // A pointer receiver addresses storage the caller owns; moving the
+        // POINTER does not move the future, so it is not this rule's business.
+        const t: Type* = this.arena.lookup(ty.id);
+        if (t == null) { return false; }
+        if (t.kind == TypeKind::Pointer || t.kind == TypeKind::Reference) { return false; }
+        mut checker: TraitChecker = TraitChecker::new(
+            this.arena, this.registry, this.intern, this.ctx.diagnostics);
+        return checker.type_implements_trait(ty, this.intern.intern("Future"), 0);
+    }
+
+    /// Record `<local>.poll(cx)` so a later move of that local is rejected.
+    /// Only an identifier receiver matters: a field or a temporary is not a
+    /// binding this pass can see moved.
+    note_poll_receiver(mut &this, c: CallExprNode*) -> void {
+        if (c == null || c.callee == null || this.intern == null) { return; }
+        if (c.callee.kind != NodeKind::MemberAccess) { return; }
+        const ma: MemberAccessNode* = c.callee as MemberAccessNode*;
+        if (ma.member.id != this.intern.intern("poll").id) { return; }
+        if (ma.object == null || ma.object.kind != NodeKind::Identifier) { return; }
+        const nm: SymbolStr = (ma.object as IdentifierNode*).name;
+        if (!this.type_implements_future(this.lookup_type(nm))) { return; }
+        this.mark_polled(nm, (c as ASTNode*).span);
+    }
+
+    /// A future whose `poll` has run may have handed out a pointer into its own
+    /// storage, so moving it now leaves that pointer naming the old bytes.
+    emit_moved_after_poll(mut &this, name: SymbolStr, move_span: SourceSpan) -> void {
+        const headline: string = format(
+            "future '%s' is moved after it has been polled",
+            this.intern.resolve(name));
+        mut diag: Diagnostic = Diagnostic::error(
+            ErrorCode::E0459_MOVED_AFTER_POLL, headline);
+        diag = diag.at_with_label(move_span, "moved here");
+        const pspan: SourceSpan = this.polled_at_span(name);
+        if (pspan.has_location()) {
+            diag = diag.also_at(pspan, "polled here, fixing its address");
+        }
+        diag = diag.help(
+            "a future may hold a pointer into its own storage once it has run, so it must stay put; hand it over before the first poll (`block_on(f)`, `spawn(f)`, `Futures::join(a, b)`) rather than after");
+        this.ctx.emit_diagnostic(diag);
+        this.fired += 1;
+        this.fatal += 1;
+    }
+
+    /// A polled future must not change address.  Both a storage-duplicating
+    /// move and a by-value COPY do exactly that, which is why this cannot ride
+    /// on the move-set: a state machine whose fields are all scalars is `Copy`,
+    /// and Copy types never enter that set at all.
+    check_polled_move(mut &this, expr: ExpressionNode*) -> void {
+        if (expr == null || this.suppress_emit) { return; }
+        if (expr.kind != NodeKind::Identifier) { return; }
+        const nm: SymbolStr = (expr as IdentifierNode*).name;
+        if (!this.is_polled(nm)) { return; }
+        this.emit_moved_after_poll(nm, expr.span);
     }
 
     mark_moved(mut &this, name: SymbolStr, span: SourceSpan, real: boolean) -> void {
@@ -999,6 +1105,7 @@ type struct MoveChecker {
         if (expr == null) { return; }
         // A storage-duplicating move of a non-Copy field out of an owned
         // value is a double free (no partial-move tracking). Reject it.
+        if (real) { this.check_polled_move(expr); }
         if (real) { this.check_field_move_out(expr); }
         // Same hazard for an array element read by value: the array keeps
         // ownership of the element, so the duplicated handle is freed twice.
@@ -1126,6 +1233,10 @@ type struct MoveChecker {
         // is null for free functions, scope-resolution calls, and
         // calls sema couldn't resolve; those fall through to the
         // standard read+arg-move walk below.
+        // Recorded before the receiver is walked: a consuming `poll` would mark
+        // the receiver moved below, and the question here is what the call does
+        // to the value's ADDRESS, not to its ownership.
+        this.note_poll_receiver(c);
         mut receiver_moved: boolean = false;
         if (c.resolved_method != null && c.callee != null
                 && c.callee.kind == NodeKind::MemberAccess) {
@@ -1176,6 +1287,10 @@ type struct MoveChecker {
             if (!arg.autoref && this.type_needs_drop(arg.resolved_type)) {
                 this.walk_expr_move(arg, true);
             } else {
+                // A non-autoref argument is passed by value, so the callee
+                // works on a copy at a different address - the same hazard as a
+                // move, and the path a `Copy` state machine actually takes.
+                if (!arg.autoref) { this.check_polled_move(arg); }
                 this.walk_expr_read(arg);
             }
         }
@@ -1335,6 +1450,10 @@ type struct MoveChecker {
             if (!arg.autoref && this.type_needs_drop(arg.resolved_type)) {
                 this.walk_expr_move(arg, true);
             } else {
+                // A non-autoref argument is passed by value, so the callee
+                // works on a copy at a different address - the same hazard as a
+                // move, and the path a `Copy` state machine actually takes.
+                if (!arg.autoref) { this.check_polled_move(arg); }
                 this.walk_expr_read(arg);
             }
         }

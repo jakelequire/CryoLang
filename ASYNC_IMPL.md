@@ -4108,3 +4108,165 @@ mono cannot recover the receiver type), both of which must be fixed together. No
 Then `net/http2/{client,server,connection}` — `connection.cryo` is 855 lines and BORROWS its transport,
 so (b) above is directly relevant to porting it. Then delete the blocking surface (keep
 `TcpListener::bind`).
+
+---
+
+## 2026-07-28 (later) — `Pin` mission, step 0: an in-place accessor could not be written at all
+
+Jake's call on the address-stability forks, taken before any code was written:
+
+1. **No `Pin` type.** Address stability is enforced by a **move-check rule** — a future may not be moved
+   once it has been polled. `Future::poll` keeps `mut &this`, so there is **no API break** and no `Unpin`
+   analogue is needed (the rule is a restriction, never a hole, so it is safe for the self-reference-free
+   futures too).
+2. **Uniform in-place carrier.** A droppable local carried across a suspend stops being taken out of its
+   `Option<T>` field into a block-local each poll; it lives in the field, with a P13-style init flag
+   carrying the bit the `Option` discriminant carries today.
+3. **No migration flag** — land increment by increment.
+
+### The substrate is in far better shape than §1's "three movers" implied — VERIFIED, not assumed
+
+Every poll site in the tree was read before any of the above was proposed:
+
+| Poll site | Moves the future between polls? |
+|---|---|
+| `block_on` (`future/_module.cryo:55`) | **No** — `mut f: F = fut;` once, then polls `f` in place forever |
+| `spawn` → `task_poll_thunk` (`executor.cryo:531`) | **No** — `const fut: F* = fut_raw as F*; fut.poll(cx)` |
+| `Join` / `Select` / `Timeout` (`combinator.cryo:105,149,184`) | **No** — `this.a.poll(cx)` through the field |
+| compiler-generated sub-future (`async_lower.cryo:2300`) | **YES** — `take().unwrap()` out, put back on `Pending` |
+| compiler-generated carried aggregate (`prepend_agg_take`) | **YES** — into a fresh block-local each poll |
+
+The entire hand-written runtime is already address-stable. **Only the lowering moves anything**, which is
+why the chosen mechanism is a move-check rule rather than a type: there is nothing to retrofit onto the
+API, only two emitted patterns to stop emitting.
+
+### Increment 1 (poll sub-futures in place) is blocked on a defect BELOW async, now fixed
+
+Polling the sub-future where it lives needs an `F_k*` into the payload of `this.fut_k: Option<F_k>`.
+Every route was blocked, and the two obstacles are worth recording because neither is async-specific:
+
+- **`Option::as_ref` is invisible on a lowering-created instantiation.** It returns `Option<T*>`, a
+  structural superterm, so `is_self_growing_instantiation` marks it `lazy_self_growing` and defers it to a
+  mono call site (`types/resolver.cryo:932`). Sema then reports *no method named `as_ref` found on type
+  `Option<…$Future_0>`* while `as_ref` on a user-written `Option<Cell>` resolves normally. **Still open**
+  — it did not need fixing once the defect below was.
+- **The return-escape check rejected every in-place accessor.** `check_return_stack_address`
+  (`sema/sema.cryo:3197`) rejects `return &<ident>` whenever the ident is a local and not a parameter, and
+  a `match`-arm payload binding registers as a local. So `payload_ptr(&this) -> T*` could not be written.
+  Writing it via `as_ref` instead **towers infinitely** (`Option<T*>` → `Option<T**>` → …, killed the
+  stdlib build twice — as an instance method AND as a static, so the anti-tower guard is not the escape).
+
+**The check's premise is false for a subject reached through a reference, and the stdlib already depends
+on that.** A payload binding over `match (&this)` *aliases the receiver's payload* — proven at
+`--opt-level=0` as well as `-O2`, by three separate calls each mutating through a returned interior
+pointer and the caller observing `1,2,3` rather than `1,1,1`. `Option::as_ref` relies on exactly this
+aliasing and only compiles because wrapping in `Option::Some(...)` hides the `return &binding` from a
+syntactic check. `ScopeManager::is_payload_binding`'s doc asserted the opposite ("Such a binding aliases a
+stack temporary, so returning a pointer/reference to it dangles") and was wrong for that case.
+
+**Fixed at the root.** The `match` subject's provenance is now threaded into pattern binding
+(`bind_arm_patterns` / `bind_enum_pattern` / `bind_subpattern` take a `caller_backed` flag), bindings taken
+from caller-owned storage are recorded in `SemaState.alias_binding_ids`, and `check_return_stack_address`
+exempts them. The rule is deliberately narrow — **the subject must be reached through a by-reference
+receiver (`&this` / `mut &this`, tracked by the new `this_is_by_ref`) or a pointer/reference parameter**.
+It is the same caller-backed reasoning that already exempts `&param`. A **by-value** parameter does NOT
+qualify: it is copied into this frame like any local. `check_return_payload_escape` is untouched.
+
+Coverage: `lang/match_binding_alias.cryo` (4 tests; each writes through a returned interior pointer and
+reads the ORIGINAL back, so a copy would be observable as a short total), plus three negatives locking the
+boundary — `E0455_return_local_subject_binding`, `E0455_return_temporary_subject_binding`,
+`E0455_return_byvalue_param_binding`. `make test`: **1879 / 163 / 14, 0 failed**.
+
+**Not yet done:** increment 1 itself. The accessor is now writable, so the next step is `Option::unwrap_ptr`
+plus the `lower_carrier_sm` rewrite (poll through the field; suspend without the put-back; take the
+completed sub-future out on the ready path so a loop's rebuild does not overwrite a live value — an
+assignment does not drop what it replaces).
+
+---
+
+## 2026-07-28 (later still) — increment 1 LANDED: sub-futures are polled in place
+
+The state machine no longer moves an awaited sub-future between polls. `lower_carrier_sm` used to open
+each resume state with `mut __sub_k = this.fut_k.take().unwrap();`, poll that block-local, and store it
+back with `this.fut_k = Option::Some(__sub_k);` on `Pending`. The sub-future therefore had one address
+while running and a different one while suspended, so any pointer into its storage that outlived a single
+poll named a dead stack slot.
+
+Now the resume state takes an interior pointer (`Option::unwrap_ptr`, new — see the previous entry for why
+`as_ref` cannot be used here), polls through it, and on `Pending` writes only the state and returns. The
+sub-future stays in its field, so its address is the field's.
+
+**Two consequences that had to be handled, not just the poll site:**
+
+- **`Pending` no longer stores anything back.** The value never left, so the put-back would now be a
+  self-assignment — and, more importantly, the whole point is that the storage is not rebuilt.
+- **`Ready` now takes the sub-future OUT** (`__done_k`), which the old code got for free from the take at
+  the top. Without it a loop's next `this.fut_k = Option::Some(<new>)` would overwrite a live value, and
+  **an assignment does not drop what it replaces** — a leak of one sub-future per iteration, which for a
+  `Sleep` or a socket future is a leaked registration, not just memory. Drop timing is unchanged: the
+  taken value dies at the end of the resume block, exactly where `__sub_k` used to.
+
+### The test that matters, and why the obvious one is worthless
+
+**An address comparison cannot see this bug.** A future that records `&this.field` on each poll and
+compares reports "stable" under BOTH lowerings — a driver re-entering `poll` from the same loop reuses the
+same stack region, so the block-local lands at the same address every time. That probe was written first
+and reported `subfuture_moves=0` against the pinned compiler too; it is recorded here because it is the
+trap this class of bug sets.
+
+What does discriminate: a **third party writing through a pointer the sub-future published, while the
+sub-future is suspended**. `lang/async_future_address_stable.cryo` drives the future by hand (`block_on`
+offers no hook between polls) and writes `55` through the published pointer at every suspend. **New
+compiler: 55. Pinned compiler: 0** — the write landed on the dead stack copy and the next poll's
+`take().unwrap()` overwrote it. Two more tests count destructor runs to guard the release path: one per
+loop iteration, so removing the `Ready`-path take shows up as a short count rather than a silent leak.
+
+`make test`: **1883 / 163 / 14, 0 failed.**
+
+`emit_recv_refresh` is NOT yet dead and was not removed. It re-addresses the receiver a sub-future points
+AT, and a carried receiver still lives in a block-local taken from its field on every poll — that is
+increment 4 (the uniform in-place carrier), not this one. Its comment has been corrected to say so rather
+than claiming the frame itself may have moved.
+
+---
+
+## 2026-07-28 (later still) — increment 2 LANDED: E0459, a polled future may not move
+
+Jake's fork-1 answer implemented: **no `Pin` type**. `Future::poll` is untouched (`mut &this`), no `Unpin`
+analogue exists, and no hand-written future changed — **zero API break**. Address stability is enforced by
+a new move-check rule instead.
+
+**The rule.** `MoveChecker` gains a `polled` set beside its `moved` set. A `<local>.poll(cx)` on a receiver
+whose type implements `Future` marks that local polled; moving or copying it afterwards is
+**E0459**. Before the first poll nothing points inward yet, so the construct-then-hand-over moves stay
+legal — `block_on(f)`, `spawn(f)`, `Futures::join(a, b)` all take a future by value and are how one is
+meant to be handed over. The rule is "not after a poll", not "never".
+
+**Two things that were NOT obvious and would each have made the rule useless:**
+
+- **It cannot ride on the move-set.** `handle_ident` returns early for `Copy` types, and a generated state
+  machine whose fields are all scalars **is Copy** — so the first version compiled, ran, and detected
+  nothing at all. Worse, Copy is not a reason to allow it: copying a polled future is precisely the address
+  change the rule exists to stop. The check therefore sits in `check_polled_move`, called from
+  `walk_expr_move` on every storage-duplicating site AND on every non-autoref call argument, ahead of the
+  Copy guard.
+- **The `Future` question must be asked of a concrete type.** MoveCheck runs *after* monomorphization
+  (`pass_registry.cryo:311-315`), which is what makes `TraitChecker::type_implements_trait` answer at all —
+  and what stops a user type that merely has a method named `poll` from being caught. A pointer or
+  reference receiver is excluded up front: moving the POINTER does not move the future.
+
+**Deliberate conservatism, recorded so it is not mistaken for an oversight.** The polled set is
+append-only — never truncated by `restore_moves`, never revived. Accumulating across sibling branches IS
+the union a join needs; the only imprecision bought is that a poll in one branch is visible to a move in
+the other, over-reporting on code that polls and moves the same future in mutually exclusive branches.
+That is the safe direction and it keeps this out of `merge_branches`, whose meet-over-paths reasoning has
+already produced one double-free bug.
+
+**Known limit:** only LOCALS are tracked, so `this.a.poll(cx)` in a combinator marks nothing. The
+combinators do not move their children, and a field is not a binding this pass can see moved — but a rule
+covering fields would need partial-move-style tracking and is not attempted here.
+
+Coverage: `negative/E0459_future_moved_after_poll.cryo`, plus a positive
+`future_may_be_handed_over_before_its_first_poll` stating the boundary from the other side. **Zero false
+positives across stdlib, tests and projects** — the full suite was run specifically looking for E0459 in
+the output before any test was added. `make test`: **1884 / 164 / 14, 0 failed.**

@@ -2290,26 +2290,34 @@ type struct AsyncLower {
         const resume: i64 = this.sm_alloc(sm);
         this.sm_goto(sm, cur, resume);
 
-        // Resume state: take/poll the sub-future; on `Pending` put it back, mark
-        // this state, and suspend; else bind the ready value and run the carrier.
-        const sub_sym: SymbolStr = this.intern.intern(format("__sub_%lld", k));
-        mut take_call: ExpressionNode* = this.method_call0(
+        // Resume state: poll the sub-future WHERE IT LIVES — in its own field —
+        // marking this state and suspending on `Pending`, else releasing it,
+        // binding the ready value and running the carrier.
+        //
+        // Polling a copy taken out of the field would give the sub-future a
+        // different address on every poll, so a pointer it holds into its own
+        // storage, and any pointer the frame holds into it, would name a dead
+        // copy from the second poll onwards — silently, because the copy is live
+        // stack. `unwrap_ptr` aliases the payload instead of copying it, so the
+        // sub-future's address is the field's and holds still for as long as the
+        // enclosing future does.
+        const subp_sym: SymbolStr = this.intern.intern(format("__subp_%lld", k));
+        const fi_ptr: TypeRef = this.arena.get_pointer_to(fi);
+        mut subp_call: ExpressionNode* = this.method_call0(
             this.member(this.this_ident(sm.struct_ref, span), fut_sym, fut_opt, span),
-            "take", fut_opt, span);
-        mut unwrap_call: ExpressionNode* = this.method_call0(take_call, "unwrap", fi, span);
-        sm.blocks[resume].add_statement(this.var_decl_stmt(sub_sym, true, fi, unwrap_call, span));
+            "unwrap_ptr", fi_ptr, span);
+        sm.blocks[resume].add_statement(this.var_decl_stmt(subp_sym, true, fi_ptr, subp_call, span));
 
         // The sub-future recorded the ADDRESS of its receiver when it was built,
         // and that address is only right for the state that built it. An owning
-        // receiver promoted across states lives in a fresh block-local on every
-        // poll — taken from its frame field on entry, handed back on the way out
-        // — and the frame itself may have been moved between polls. So re-address
-        // the receiver from this frame's own storage before every poll. Without
-        // it an `async` method with a `&this` receiver reads and writes through a
-        // stale pointer from its second poll onwards, corrupting silently instead
-        // of faulting.
+        // receiver promoted across states still lives in a fresh block-local on
+        // every poll — taken from its frame field on entry, handed back on the
+        // way out — so re-address the receiver from this frame's own storage
+        // before every poll. Without it an `async` method with a `&this`
+        // receiver reads and writes through a stale pointer from its second poll
+        // onwards, corrupting silently instead of faulting.
         if (!this.emit_recv_refresh(sm, resume, aw.operand,
-                                    this.ident(sub_sym, fi, span), aw.span, span)) {
+                                    this.ident(subp_sym, fi_ptr, span), aw.span, span)) {
             sm.ok = false; return cur;
         }
 
@@ -2323,19 +2331,30 @@ type struct AsyncLower {
             this.ctx.generic_registry.instantiate(sm.poll_base, &sub_poll_args);
         const poll_sym: SymbolStr = this.intern.intern(format("__poll_%lld", k));
         mut poll_call: ExpressionNode* = this.method_call1(
-            this.ident(sub_sym, fi, span), "poll",
+            this.ident(subp_sym, fi_ptr, span), "poll",
             this.ident(sm.cx_sym, sm.ctx_ptr_ty, span), sub_poll_out, span);
         sm.blocks[resume].add_statement(this.var_decl_stmt(poll_sym, true, sub_poll_out, poll_call, span));
 
+        // Suspending leaves the sub-future in its field untouched, so both the
+        // state it accumulated and its address survive to the next poll.
         mut pend: BlockStmtNode* = new BlockStmtNode(span);
-        pend.add_statement(this.assign_member_stmt(sm.struct_ref, fut_sym, fut_opt,
-            this.option_some(this.ident(sub_sym, fi, span), fut_opt, span), span));
         pend.add_statement(this.assign_member_stmt(sm.struct_ref, sm.state_sym, sm.u32_ty,
             this.u32_lit(resume as u64, span), span));
         pend.add_statement(new ReturnStmtNode(this.poll_pending(sm.poll_out, span), span) as StatementNode*);
         sm.blocks[resume].add_statement(new IfStmtNode(
             this.method_call0(this.ident(poll_sym, sub_poll_out, span), "is_pending", this.arena.get_bool(), span),
             pend as StatementNode*, null, span) as StatementNode*);
+
+        // A completed sub-future is moved out of its field so its destructor runs
+        // with this state rather than with the whole state machine — which is
+        // what releases a timer registration or a parked socket — and so that a
+        // loop awaiting again finds the slot empty: the rebuild assigns over the
+        // field, and an assignment overwrites without dropping what was there.
+        const done_sym: SymbolStr = this.intern.intern(format("__done_%lld", k));
+        mut done_take: ExpressionNode* = this.method_call0(
+            this.member(this.this_ident(sm.struct_ref, span), fut_sym, fut_opt, span),
+            "take", fut_opt, span);
+        sm.blocks[resume].add_statement(this.var_decl_stmt(done_sym, true, fut_opt, done_take, span));
 
         const await_sym: SymbolStr = this.intern.intern(format("__await_%lld", k));
         sm.blocks[resume].add_statement(this.var_decl_stmt(await_sym, false, ao,

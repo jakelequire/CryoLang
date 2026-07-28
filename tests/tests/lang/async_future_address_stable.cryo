@@ -1,0 +1,157 @@
+// A sub-future is polled where it lives, so its address does not change between
+// polls.
+//
+// The state machine used to take each awaited sub-future OUT of its field into a
+// block-local, poll that, and store it back on `Pending`. The sub-future then
+// had one address while running and another while suspended, so any pointer into
+// its storage that outlived a single poll named a dead stack slot.
+//
+// That is invisible to the future itself: a driver re-entering `poll` from the
+// same loop reuses the same stack region, so the block-local lands at the same
+// address every time and an address comparison reports "stable" either way. The
+// beacon tests below instead have a THIRD party write through a pointer the
+// sub-future published, while the sub-future is suspended - which is the only
+// way the difference becomes observable. They report 55 when the future held
+// still and 0 when it was polled through a copy.
+![config(testing)]
+namespace CryoTests::Tests::Lang::AsyncFutureAddressStable;
+
+import std::test;
+import std::core::result;
+import std::future;
+
+// A pointer into the sub-future's own storage, published by the sub-future.
+mut g_slot: i64* = null;
+
+// Destructor runs of the completed sub-futures, to catch a slot that is
+// overwritten without releasing what it held.
+mut g_drops: i64 = 0;
+
+type struct Beacon {
+    canary: i64;
+    left:   i64;
+
+    static new(n: i64) -> Beacon {
+        return Beacon { canary: 0, left: n };
+    }
+}
+
+implement trait Future for struct Beacon {
+    type Output = i64;
+
+    poll(mut &this, cx: Context*) -> Poll<i64> {
+        // Publish a pointer into whatever storage this poll is running on.
+        g_slot = &this.canary;
+        if (this.left > 0) {
+            this.left = this.left - 1;
+            return Poll::Pending;
+        }
+        // Reads the write the driver made while this future was suspended -
+        // but only if the future is still where it was when it published.
+        return Poll::Ready(this.canary);
+    }
+}
+
+type struct Tracked {
+    left: i64;
+    val:  i64;
+
+    static new(v: i64) -> Tracked {
+        return Tracked { left: 1, val: v };
+    }
+
+    drop(mut &this) -> void {
+        g_drops = g_drops + 1;
+    }
+}
+
+implement trait Future for struct Tracked {
+    type Output = i64;
+
+    poll(mut &this, cx: Context*) -> Poll<i64> {
+        if (this.left > 0) {
+            this.left = this.left - 1;
+            return Poll::Pending;
+        }
+        return Poll::Ready(this.val);
+    }
+}
+
+async function one_await() -> i64 {
+    const seen: i64 = await Beacon::new(2);
+    return seen;
+}
+
+async function two_awaits() -> i64 {
+    const a: i64 = await Beacon::new(1);
+    const b: i64 = await Beacon::new(1);
+    return a + b;
+}
+
+async function loop_awaits(n: i64) -> i64 {
+    mut total: i64 = 0;
+    for (mut i: i64 = 0; i < n; i++) {
+        total = total + await Tracked::new(3);
+    }
+    return total;
+}
+
+/// Drive `f` by hand, writing through the published pointer at every suspend.
+/// `block_on` gives no hook between polls, which is exactly where the write has
+/// to happen.
+function drive_writing<F>(f: F) -> i64
+where F: Future<i64> {
+    mut fut: F = f;
+    mut cx: Context = Context::new(Waker::noop());
+    loop {
+        match (fut.poll(&cx)) {
+            Poll::Ready(v) => { return v; }
+            Poll::Pending => {
+                if (g_slot != null) { *g_slot = 55; }
+            }
+        }
+    }
+}
+
+![test]
+function subfuture_storage_survives_a_suspend() -> Result<(), TestError> {
+    g_slot = null;
+    // 55 means the driver's write reached the storage the resumed poll read.
+    return expect_eq(drive_writing(one_await()), 55 as i64);
+}
+
+![test]
+function each_of_two_subfutures_holds_still() -> Result<(), TestError> {
+    g_slot = null;
+    // Both awaits observe their own write: 55 + 55.
+    return expect_eq(drive_writing(two_awaits()), 110 as i64);
+}
+
+![test]
+function completed_subfuture_is_released_each_iteration() -> Result<(), TestError> {
+    g_drops = 0;
+    const total: i64 = future::block_on(loop_awaits(4));
+    if (total != 12) { return expect_eq(total, 12 as i64); }
+    // One destructor per iteration: the slot is emptied when the sub-future
+    // completes, not left for the next iteration's assignment to overwrite.
+    return expect_eq(g_drops, 4 as i64);
+}
+
+![test]
+function future_may_be_handed_over_before_its_first_poll() -> Result<(), TestError> {
+    // The permitted side of E0459: a future has nothing pointing into it until
+    // it has run, so binding it to a local and only THEN handing it to a driver
+    // by value is fine. Moving it after a poll is rejected - see
+    // negative/E0459_future_moved_after_poll.cryo.
+    mut f = loop_awaits(2);
+    g_drops = 0;
+    return expect_eq(future::block_on(f), 6 as i64);
+}
+
+![test]
+function single_completed_subfuture_is_released() -> Result<(), TestError> {
+    g_drops = 0;
+    const total: i64 = future::block_on(loop_awaits(1));
+    if (total != 3) { return expect_eq(total, 3 as i64); }
+    return expect_eq(g_drops, 1 as i64);
+}
