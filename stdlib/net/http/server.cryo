@@ -24,23 +24,16 @@
 ///! before the first `accept`; use it to log the listening address or
 ///! signal a readiness probe.
 ///!
-///! **`.with_read_timeout(secs)` IS NOT ENFORCED.** The setting is accepted
-///! and stored, and the accept loop ignores it: a single slow peer sending one
-///! byte at a time pins the loop indefinitely. Do not put this server in front
-///! of untrusted clients until the cap is restored.
+///! `.with_read_timeout(secs)` caps how long one request may take to arrive,
+///! which is what keeps a peer dribbling a request out a byte at a time from
+///! pinning the connection — and, since connections are served one at a time,
+///! the accept loop behind it. `secs == 0` disables the cap.
 ///!
-///! It is a gap, not a decision. Enforcing it wraps the per-request read in
-///! `Futures::timeout`, which writes the framed request into a local from
-///! inside a branch; the states that TAKE a carried value still share one
-///! binding, so several of them share one drop flag and release the same heap
-///! block twice. The note above `prepend_agg_take` in `sema/async_lower.cryo`
-///! records what has to change. The cap comes back with it.
-///!
-///! When it does return, note that a read which hits the cap is abandoned, and
-///! abandoning an in-flight read closes the connection: the transport holds a
-///! closed placeholder while the read future owns the real socket. The cap is
-///! therefore a hard close, not a recoverable error, so nothing after it can
-///! reply on that socket.
+///! A read that hits the cap is abandoned, and abandoning an in-flight read
+///! closes the connection: the transport is left holding a closed placeholder
+///! while the read future owns the real socket. The cap is therefore a hard
+///! close, not a recoverable error, so nothing after it can reply on that
+///! socket.
 ///!
 ///! `.run()` never completes normally, returning only on a fatal
 ///! listener-level error (e.g. EMFILE). Per-connection failures (parse
@@ -72,6 +65,8 @@ import net::http::router;
 import future::poll;
 import future::waker;
 import future::traits;
+import future::combinator;
+import time::duration;
 
 /// Hard cap on requests served per accepted connection.  Without this
 /// a misbehaving client could hold a connection open indefinitely with
@@ -79,8 +74,7 @@ import future::traits;
 const MAX_REQUESTS_PER_CONNECTION: u64 = 100;
 
 /// Default per-connection read cap.  Long enough for slow consumer networks
-/// but short enough that a single slow-loris peer can't pin the accept loop --
-/// once the cap is enforced again; see the module doc.
+/// but short enough that a single slow-loris peer can't pin the accept loop.
 const DEFAULT_READ_TIMEOUT_SECS: i64 = 30;
 
 /// A configured HTTP server ready to bind and run.
@@ -109,7 +103,7 @@ type struct HttpServer {
     /// Owned by the caller; the Router must outlive this server.
     router:   Router*;
     on_ready: Option<() -> void>;
-    /// Per-accepted-connection `SO_RCVTIMEO` (whole seconds).  Zero
+    /// Deadline applied to each request read (whole seconds).  Zero
     /// disables; defaults to `DEFAULT_READ_TIMEOUT_SECS`.
     read_timeout_secs: i64;
 
@@ -152,8 +146,8 @@ type struct HttpServer {
     /// Override the per-connection read timeout.  `secs == 0` disables;
     /// the default is `DEFAULT_READ_TIMEOUT_SECS`.
     ///
-    /// **Currently stored and not enforced** -- see the module doc for why and
-    /// for what has to land before it takes effect again.
+    /// Reaching the cap closes the connection outright rather than answering
+    /// with a 408 -- see the module doc for why a timed-out read cannot reply.
     with_read_timeout(mut &this, secs: i64) -> &HttpServer {
         this.read_timeout_secs = secs;
         return &this;
@@ -236,20 +230,37 @@ type struct HttpServer {
     /// same fill as the previous body are still there to be parsed, not lost.
     async serve_connection(mut &this, conn: BufStream<TcpStream>) -> void {
         mut c: BufStream<TcpStream> = conn;
-        // `None` disables the deadline. Built once, outside the loop, so the
-        // per-request read is a single call rather than a branch that writes a
-        // shared local.
         mut served: u64 = 0;
         loop {
             served = served + 1;
 
-            // NO DEADLINE IS APPLIED HERE, and that is a gap rather than a
-            // decision -- see `read_timeout_secs`. The request is matched
-            // straight off the `await`: wrapping the read in `Futures::timeout`
-            // needs the framed request written into a local from inside a
-            // branch, and a state that TAKES a carried value cannot yet be
-            // given a binding of its own (see the note above `prepend_agg_take`).
-            match (await c.read_request()) {
+            // The read is capped so one peer dribbling a request out a byte at
+            // a time cannot pin this connection (and, since connections are
+            // served one at a time, the accept loop behind it) forever.
+            // `read_timeout_secs == 0` disables the cap.
+            //
+            // Hitting the cap ABANDONS the read, and abandoning an in-flight
+            // read closes the connection: the transport is left holding a
+            // closed placeholder while the read future owns the real socket.
+            // The cap is therefore a hard close, not a recoverable error --
+            // nothing after it can reply on this socket, so the timeout arm
+            // returns rather than trying to write a 408.
+            mut got: Result<Request, IoError> =
+                Result::Err(IoError::new(IoErrorKind::TimedOut, 0));
+            if (this.read_timeout_secs > 0) {
+                const capped: Result<Result<Request, IoError>, Elapsed> =
+                    await Futures::timeout(
+                        Duration::from_secs(this.read_timeout_secs as u64),
+                        c.read_request());
+                match (capped) {
+                    Result::Ok(inner) => { got = inner; }
+                    Result::Err(_)    => { return; }
+                }
+            } else {
+                got = await c.read_request();
+            }
+
+            match (got) {
                 Result::Ok(req) => {
                     mut request_local: Request = req;
                     const keep_alive: boolean = should_keep_alive(&request_local, served);
