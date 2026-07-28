@@ -27,7 +27,10 @@ namespace CryoTests::Tests::Stdlib::AsyncStressShapes;
 
 import std::core::result;
 import std::core::option;
+import std::core::slice;
 import std::collections::array;
+import std::collections::str;
+import std::collections::string;
 import std::future;
 import std::future::ready;
 import std::test::error;
@@ -1072,4 +1075,217 @@ function async_carries_an_enum_past_a_branch_that_was_taken() -> Result<(), Test
 ![test]
 function async_carries_an_enum_with_no_early_read_control() -> Result<(), TestError> {
     return expect_eq(future::block_on(ass_nodrop_enum_no_early_read()) as i64, 2 as i64);
+}
+
+// ============================================================================
+// Shape: a non-owning view borrowed from a local, handed to an awaited call
+// ============================================================================
+//
+// The future built from `t.view()` is stashed in a field and first polled a
+// state LATER, but `t` was mentioned only inside that operand -- so the
+// lowering used to end its live range with the block that built the future and
+// run its destructor there, freeing the storage the view points into. The value
+// read back was whatever the allocator handed out next, which is why this
+// presents as a wrong NUMBER far from the borrow rather than as a crash.
+//
+// Every shape below is paired with a control that was already green, so a red
+// cell names the borrow rather than the surrounding control flow.
+
+/// An owning aggregate whose destructor is counted and whose heap buffer a view
+/// can point into. Separate from `Tok` so these tests cannot perturb the
+/// receiver-carrier matrix above.
+type struct AssBorrowed {
+    buf: Array<u8>;
+
+    static make(a: u8, b: u8) -> AssBorrowed {
+        mut v: Array<u8> = Array<u8>::new();
+        v.push(a);
+        v.push(b);
+        return AssBorrowed { buf: v };
+    }
+
+    drop(mut &this) -> void {
+        ASS_DROPS = ASS_DROPS + 1;
+        this.buf.drop();
+    }
+
+    /// A borrow: the returned `Slice` points into `buf`'s heap block and records
+    /// nothing about the value it came from.
+    view(&this) -> Slice<u8> { return this.buf.as_slice(); }
+}
+
+/// Suspends BEFORE reading the view, so the read lands after the caller's
+/// declaring state has fallen off its end.
+async function ass_eat(bytes: Slice<u8>) -> u64 {
+    const _t: u64 = await PendingThenReady<u64>::new(1, 0);
+    mut sum: u64 = 0;
+    mut i: u64 = 0;
+    while (i < bytes.length()) {
+        mut b: u8 = 0;
+        match (bytes.get(i)) { Option::Some(x) => { b = x; } Option::None => { } }
+        sum = sum * 256 + (b as u64);
+        i = i + 1;
+    }
+    return sum;
+}
+
+/// Takes the value BY VALUE, so the local is moved away rather than borrowed.
+/// Carrying it as well would leave the frame a second claim on it.
+async function ass_swallow(t: AssBorrowed) -> u64 {
+    const _z: u64 = await PendingThenReady<u64>::new(1, 0);
+    mut sum: u64 = 0;
+    mut i: u64 = 0;
+    while (i < t.buf.length() as u64) {
+        mut b: u8 = 0;
+        match (t.buf.get(i)) { Option::Some(x) => { b = x; } Option::None => { } }
+        sum = sum * 256 + (b as u64);
+        i = i + 1;
+    }
+    return sum;
+}
+
+/// The defect: borrowed into the awaited call and never mentioned again.
+async function ass_borrow_only() -> u64 {
+    const t: AssBorrowed = AssBorrowed::make(0x6d, 0x30);
+    const got: u64 = await ass_eat(t.view());
+    return got;
+}
+
+![test]
+function async_borrowed_view_outlives_the_suspend() -> Result<(), TestError> {
+    ASS_DROPS = 0;
+    const n: u64 = future::block_on(ass_borrow_only());
+    expect_eq(n as i64, 27952 as i64)?;
+    return expect_eq(ASS_DROPS, 1 as i64);
+}
+
+/// CONTROL: the same borrow, but the local is mentioned AFTER the await. That
+/// mention alone used to be what kept the value alive, which is exactly why the
+/// defect was invisible.
+async function ass_borrow_then_read() -> u64 {
+    const t: AssBorrowed = AssBorrowed::make(0x6d, 0x30);
+    const got: u64 = await ass_eat(t.view());
+    const n: u64 = t.buf.length() as u64;
+    return got + n * 0;
+}
+
+![test]
+function async_borrowed_view_mentioned_after_the_await_control() -> Result<(), TestError> {
+    ASS_DROPS = 0;
+    const n: u64 = future::block_on(ass_borrow_then_read());
+    expect_eq(n as i64, 27952 as i64)?;
+    return expect_eq(ASS_DROPS, 1 as i64);
+}
+
+/// CONTROL: moved by value, not borrowed. One destructor run, not two -- the
+/// carry must not fire for a value the state gave away.
+async function ass_moved_into_await() -> u64 {
+    const t: AssBorrowed = AssBorrowed::make(0x6d, 0x30);
+    const got: u64 = await ass_swallow(t);
+    return got;
+}
+
+![test]
+function async_value_moved_into_an_awaited_call_is_not_also_carried() -> Result<(), TestError> {
+    ASS_DROPS = 0;
+    const n: u64 = future::block_on(ass_moved_into_await());
+    expect_eq(n as i64, 27952 as i64)?;
+    return expect_eq(ASS_DROPS, 1 as i64);
+}
+
+/// Borrowed, then MOVED after the await: the carrier has to hand the value back
+/// so the move finds it, and it must still be dropped exactly once.
+async function ass_borrow_then_move() -> u64 {
+    const t: AssBorrowed = AssBorrowed::make(0x6d, 0x30);
+    const a: u64 = await ass_eat(t.view());
+    const b: u64 = await ass_swallow(t);
+    return a + b;
+}
+
+![test]
+function async_borrowed_view_then_moved() -> Result<(), TestError> {
+    ASS_DROPS = 0;
+    const n: u64 = future::block_on(ass_borrow_then_move());
+    expect_eq(n as i64, 55904 as i64)?;
+    return expect_eq(ASS_DROPS, 1 as i64);
+}
+
+/// The borrow inside a LOOP body, where the local is declared outside it.
+async function ass_borrow_in_loop() -> u64 {
+    const t: AssBorrowed = AssBorrowed::make(0x6d, 0x30);
+    mut acc: u64 = 0;
+    mut i: i64 = 0;
+    while (i < 3) {
+        acc = acc + await ass_eat(t.view());
+        i = i + 1;
+    }
+    return acc;
+}
+
+![test]
+function async_borrowed_view_in_a_loop() -> Result<(), TestError> {
+    ASS_DROPS = 0;
+    const n: u64 = future::block_on(ass_borrow_in_loop());
+    expect_eq(n as i64, 83856 as i64)?;
+    return expect_eq(ASS_DROPS, 1 as i64);
+}
+
+/// A `Slice<u8>` taken straight off an `Array<u8>` local -- no wrapper struct,
+/// so the borrow is of a stdlib container rather than of a user destructor.
+async function ass_borrow_array_local() -> u64 {
+    mut arr: Array<u8> = Array<u8>::new();
+    arr.push(0x6d);
+    arr.push(0x30);
+    const got: u64 = await ass_eat(arr.as_slice());
+    return got;
+}
+
+![test]
+function async_borrowed_slice_from_an_array_local() -> Result<(), TestError> {
+    return expect_eq(future::block_on(ass_borrow_array_local()) as i64, 27952 as i64);
+}
+
+/// A `Str` view of a `String` local. `String`'s destructor is not counted by
+/// `ASS_DROPS`, so this shape asserts the bytes only -- a freed buffer reads
+/// back as whatever the allocator reissued.
+async function ass_borrow_string_local() -> u64 {
+    mut msg: String = String::from_str(Str::new("m"));
+    msg.push_byte(0x30);
+    const got: u64 = await ass_eat(msg.as_str().as_bytes());
+    return got;
+}
+
+![test]
+function async_borrowed_str_from_a_string_local() -> Result<(), TestError> {
+    return expect_eq(future::block_on(ass_borrow_string_local()) as i64, 27952 as i64);
+}
+
+/// CONTROL: a view of a static literal borrows no local at all, so it must keep
+/// working whatever the carry rule does.
+async function ass_borrow_static_literal() -> u64 {
+    const got: u64 = await ass_eat(Str::new("m0").as_bytes());
+    return got;
+}
+
+![test]
+function async_view_of_a_static_literal_control() -> Result<(), TestError> {
+    return expect_eq(future::block_on(ass_borrow_static_literal()) as i64, 27952 as i64);
+}
+
+/// CONTROL: a SCALAR derived from the local and handed to the await. Nothing
+/// points back into the value, so it must not be carried -- a green cell here
+/// with a red one above separates "borrowed" from "merely mentioned".
+async function ass_scalar_derived_from_local() -> u64 {
+    const t: AssBorrowed = AssBorrowed::make(0x6d, 0x30);
+    const n: u64 = t.buf.length() as u64;
+    const _z: u64 = await PendingThenReady<u64>::new(1, 0);
+    return n;
+}
+
+![test]
+function async_scalar_derived_from_a_local_control() -> Result<(), TestError> {
+    ASS_DROPS = 0;
+    const n: u64 = future::block_on(ass_scalar_derived_from_local());
+    expect_eq(n as i64, 2 as i64)?;
+    return expect_eq(ASS_DROPS, 1 as i64);
 }

@@ -97,6 +97,15 @@ type struct PollSm {
     // heap) is untouched by a suspend.
     frame_names: SymbolStr[];
 
+    // The operand of every `await` the body suspends on — the expression that
+    // BUILDS the sub-future, recorded as it is stashed. A future constructed
+    // from a place may hold a non-owning view into it (`msg.as_str()`,
+    // `arr.as_slice()`), and nothing in the type system records that borrow, so
+    // every frame name the operand mentions is treated as live for as long as
+    // the future is: the sub-future is polled from a LATER state, whereas the
+    // local would otherwise die with the block that built it.
+    borrow_ops:  ExpressionNode*[];
+
     // True when the function was declared `-> void`, so `Output` is unit and a
     // body that ends without a `return` completes with `Poll::Ready(())` rather
     // than being rejected for having no value to hand back.
@@ -2257,6 +2266,13 @@ type struct AsyncLower {
                 aw.span);
             sm.ok = false; return cur;
         }
+        // Recorded before the operand is stashed, so `promote_cross_state` can
+        // ask which frame names this future was built from. Cryo has no
+        // lifetimes, so a view the operand derived (`msg.as_str()`) carries no
+        // link back to the storage it borrows — the operand's own text is the
+        // only record that a borrow could have been taken at all.
+        sm.borrow_ops.push(aw.operand);
+
         this.edge_from.push(sm.struct_ref.id);
         this.edge_to.push(fi.id);
 
@@ -3411,6 +3427,42 @@ type struct AsyncLower {
                                           this.intern, ty);
     }
 
+    /// True when some awaited operand was built from `name`, so the future it
+    /// produced may hold a view into the storage `name` owns.
+    borrowed_by_awaited_future(&this, sm: PollSm*, name: SymbolStr) -> boolean {
+        for (mut i: i64 = 0; i < sm.borrow_ops.length; i++) {
+            if (this.name_read_in_expr(sm.borrow_ops[i], name)) { return true; }
+        }
+        return false;
+    }
+
+    /// Whether a local handed to an awaited future has to outlive the suspend.
+    ///
+    /// Only a value with a destructor does. Its destructor releases the storage
+    /// a view would point into, and the state split moved that destructor to the
+    /// end of the block that built the future — which runs BEFORE the future is
+    /// ever polled. A value with no destructor releases nothing when its block
+    /// ends, so a view derived from it stays valid whether it is carried or not,
+    /// and carrying it would only cost a field.
+    ///
+    /// A view into the value's own INLINE storage (rather than a heap block it
+    /// owns) is a different hazard — the frame moves between polls — and belongs
+    /// to `reject_frame_addr_carry`, which rejects it rather than carrying it.
+    /// Asked in the opposite polarity to `carried_can_be_given_away`, and that
+    /// is why it consults `needs_drop` directly rather than guarding on
+    /// `ownership_unreadable` first. A destructor `needs_drop` reports is one
+    /// the type really has; what an abstract type costs is a destructor it
+    /// FAILS to report. Under-reporting here only leaves the drop where the
+    /// state split put it — the behaviour before this rule existed — whereas
+    /// treating every unreadable type as owning would carry values a generic
+    /// `async function` cannot carry at all, and turn code that compiles today
+    /// into a hard error.
+    borrow_outlives_suspend(&this, ty: TypeRef) -> boolean {
+        if (!ty.is_valid()) { return false; }
+        return OwnershipQuery::needs_drop(this.arena, this.ctx.generic_registry,
+                                          this.intern, ty);
+    }
+
     /// True when `ty` is an instantiation whose concrete shape specialization
     /// has not produced yet: its fields are empty at lowering time, so reading
     /// them would report every generic aggregate as owning nothing.
@@ -3922,6 +3974,39 @@ type struct AsyncLower {
         return SymbolStr::empty();
     }
 
+    /// The frame-resident place a CALL hands out a pointer into, or the empty
+    /// symbol when it hands out none.
+    ///
+    /// An accessor that returns a pointer or reference derived from its
+    /// receiver (`ws.connection()`, `o.pending()`) is an address-of that no `&`
+    /// marks, so the syntactic walk cannot see it — yet the result aliases the
+    /// receiver's storage exactly as `&o.field` would. A carried local is taken
+    /// into a fresh block-local on every poll, so that storage genuinely moves
+    /// and the pointer is stale by the next state; unlike a view into a heap
+    /// block, no amount of keeping the owner alive can repair it, which is why
+    /// this is rejected rather than carried.
+    ///
+    /// The receiver being an indirection itself — a pointer, a reference, or a
+    /// dynamic array naming its heap block — stops the walk: the pointee does
+    /// not move when a poll returns, so `arr.as_ptr()` and `this.conn.pending()`
+    /// stay sound and must not be reported.
+    call_frame_addr_root(&this, sm: PollSm*, c: CallExprNode*) -> SymbolStr {
+        const rt: TypeRef = (c as ExpressionNode*).resolved_type;
+        if (!rt.is_valid()) { return SymbolStr::empty(); }
+        const t: Type* = this.arena.lookup(rt.id);
+        if (t == null) { return SymbolStr::empty(); }
+        if (t.kind != TypeKind::Pointer && t.kind != TypeKind::Reference) {
+            return SymbolStr::empty();
+        }
+        if (c.callee == null) { return SymbolStr::empty(); }
+        if ((c.callee as ASTNode*).kind != NodeKind::MemberAccess) {
+            return SymbolStr::empty();
+        }
+        const recv: ExpressionNode* = (c.callee as MemberAccessNode*).object;
+        if (this.place_leaves_frame(recv)) { return SymbolStr::empty(); }
+        return this.addr_place_root(sm, recv);
+    }
+
     /// The frame-resident root of the first user-written `&` anywhere in `e`, or
     /// the empty symbol if `e` takes no such address. Synthesized `&` nodes are
     /// skipped: the compiler materializes those for a receiver or a comparison
@@ -3946,6 +4031,8 @@ type struct AsyncLower {
         }
         if (k == NodeKind::CallExpression) {
             const c: CallExprNode* = e as CallExprNode*;
+            const cr: SymbolStr = this.call_frame_addr_root(sm, c);
+            if (cr.is_valid()) { return cr; }
             const cl: SymbolStr = this.frame_addr_root_expr(sm, c.callee);
             if (cl.is_valid()) { return cl; }
             for (mut i: i64 = 0; i < c.arguments.length; i++) {
@@ -4125,13 +4212,24 @@ type struct AsyncLower {
             const ds: i64 = d_states[d];
             const vd: VarDeclNode* = d_nodes[d];
 
+            const lty: TypeRef = vd.resolved_type;
+
             mut cross: boolean = false;
             for (mut b: i64 = 0; b < sm.blocks.length; b++) {
                 if (b != ds && this.block_reads_name(sm.blocks[b], nm)) { cross = true; }
             }
+            // "Read in a later state" is only a proxy for "still live there", and
+            // it misses the local a future was BUILT from and that the body never
+            // mentions again: the future holds a view into it, is stashed in a
+            // field, and is first polled a state later — after the block that
+            // declared the local has run its destructor. Nothing observes the
+            // borrow, so the value has to be kept alive on the strength of the
+            // operand alone.
+            const borrowed: boolean = this.borrow_outlives_suspend(lty)
+                                   && this.borrowed_by_awaited_future(sm, nm);
+            if (borrowed) { cross = true; }
             if (!cross) { continue; }
 
-            const lty: TypeRef = vd.resolved_type;
             const lt: Type* = this.arena.lookup(lty.id);
             const lk: TypeKind = if (lt != null) { lt.kind } else { TypeKind::Error };
             if (lk == TypeKind::Reference) {
@@ -4181,6 +4279,10 @@ type struct AsyncLower {
                     // the value crosses the suspend either way.
                     if (this.block_cond_write(sm.blocks[b], nm)) { needs_carry = true; }
                 }
+                // A borrowed value has no later reader to detect — that is the
+                // whole defect. It is carried so that it stays owned, and dies
+                // with the future rather than with the block that lent it out.
+                if (borrowed) { needs_carry = true; }
 
                 if (!needs_carry) {
                     // Nothing reads it across a state boundary: leave the value
@@ -6012,7 +6114,7 @@ type struct AsyncLower {
             fut_syms: [], fut_opt: [], naw: 0i64,
             prom_field: [], prom_tys: [], prom_opt: [], nprom: 0i64,
             loop_cont: [], loop_brk: [],
-            frame_names: [],
+            frame_names: [], borrow_ops: [],
             unit_output: this.is_void_type(declared_ref),
         };
 

@@ -1,12 +1,25 @@
-///! WebSocket (RFC 6455): the hermetic accept-key vector plus a real
-///! masked-client -> unmasked-server text frame over a TCP loopback.
+///! WebSocket (RFC 6455): the hermetic accept-key vector, plus the full
+///! non-blocking client/server pair over a TCP loopback.
 ///!
-///! The framing exercises `WebSocket<TcpStream>`'s generic methods
-///! (`send_text` -> `frame::encode_frame<TcpStream>`, `recv` ->
-///! `frame::read_frame<TcpStream>`), the nested-generic-dispatch path that
-///! the monomorphizer fix unblocked. Mirrors `net_tls`'s thread layout:
-///! main is the server (binds + listens before spawning), the spawned
-///! thread is the client.
+///! What these pin that a hand-inspection cannot:
+///!
+///!   - **The handshake and the first frame may arrive in ONE write.** Because
+///!     `WebSocket<S>` OWNS its `BufStream<S>`, the read buffer outlives the
+///!     handshake, so frame bytes that landed in the same fill as the
+///!     terminating blank line survive into the first `recv`. The borrowed,
+///!     byte-at-a-time version could only avoid over-reading by never
+///!     buffering; this one has to KEEP what it over-read.
+///!     `pipelined_upgrade_and_frame_round_trip` sends the upgrade request and
+///!     the first frame in a single flush and still expects the message.
+///!   - **The connection survives several frames.** `recv` carries its
+///!     accumulator, and `read_frame` carries a masking key and a length,
+///!     across suspension points inside a loop. A desynchronized carrier shows
+///!     up as a wrong count, so every test asserts numbers.
+///!   - **Control frames are serviced inline.** A Ping mid-stream is answered
+///!     with a Pong and does not consume the data message behind it.
+///!
+///! Every failure is a distinct negative number, so a red test names its own
+///! step rather than only its assertion.
 
 ![config(testing)]
 namespace CryoTests::Tests::Stdlib::NetWs;
@@ -17,14 +30,15 @@ import std::core::slice;
 import std::collections::str;
 import std::collections::string;
 import std::collections::array;
+import std::future;
 import std::io::error;
 import std::io::traits;
+import std::io::buf;
 import std::net::addr::socket_addr;
 import std::net::socket::tcp;
+import std::net::ws::frame;
 import std::net::ws::conn;
 import std::net::ws::handshake;
-import std::thread;
-import std::ffi::libc;
 import std::test::error;
 import std::test::assert;
 
@@ -41,72 +55,326 @@ function accept_key_rfc6455_vector() -> Result<(), TestError> {
     return expect(ok, Str::new("compute_accept must match the RFC 6455 vector"));
 }
 
-/// Client thread: wrap the connected socket as a masking client and send a
-/// single text frame. Returns 1 on success.
-function ws_client(port: i32) -> i32 {
-    mut tcp: TcpStream = match (TcpStream::connect(SocketAddr::localhost_v4(port as u16))) {
-        Result::Ok(s)  => { s }
-        Result::Err(_) => { return 0; }
+// ============================================================================
+// Loopback helpers
+// ============================================================================
+
+/// Bind an ephemeral port. Port 0 is what keeps concurrent runs of the suite
+/// from colliding. The listener comes back whole rather than paired with its
+/// port: moving one field out of a tuple that owns a destructor would leave
+/// the other to be dropped twice.
+function ws_bind() -> Result<TcpListener, IoError> {
+    mut l: TcpListener = TcpListener::bind(SocketAddr::localhost_v4(0u16))?;
+    l.set_nonblocking(true);
+    return Result::Ok(l);
+}
+
+/// The port the kernel assigned, or 0 if it cannot be read.
+function ws_port(l: &TcpListener) -> u16 {
+    return match (l.local_addr()) {
+        Result::Ok(a)  => { a.port }
+        Result::Err(_) => { 0u16 }
     };
-    mut ws: WebSocket<TcpStream> = WebSocket<TcpStream>::from_upgraded(&tcp, true);
-    mut sent: i32 = 0;
-    match (ws.send_text(Str::new("hello ws"))) {
-        Result::Ok(_)  => { sent = 1; }
-        Result::Err(_) => { }
+}
+
+/// Accept one connection off `listener` and hand back the socket. The listener
+/// is consumed: these tests serve exactly one client.
+async function ws_accept_one(listener: TcpListener) -> Result<TcpStream, IoError> {
+    mut acc: TcpAccepted = await TcpAccept::start(listener);
+    mut lst: TcpListener = acc.take_listener();
+    lst.drop();
+    return acc.take_result();
+}
+
+/// Read one message and report whether it decoded as `expect_text`. Consumes
+/// the message's owned payload on every path.
+function ws_message_is(msg: Message, expect_text: string) -> boolean {
+    match (msg) {
+        Message::Text(s) => {
+            mut owned: String = s;
+            const ok: boolean = owned.as_str().equals(&Str::new(expect_text));
+            owned.drop();
+            return ok;
+        }
+        Message::Binary(b) => { mut bb: Array<u8> = b; bb.drop(); return false; }
+        Message::Close     => { return false; }
     }
-    tcp.drop();
+}
+
+// ============================================================================
+// Full upgrade + framing, both directions
+// ============================================================================
+
+/// Client: connect, upgrade, send `n` distinct text messages, then read the
+/// server's echo of each. Returns `n`, or a negative step code.
+async function ws_client_n(port: u16, n: i64) -> i64 {
+    mut sock: TcpStream = match (await TcpConnect::start(SocketAddr::localhost_v4(port))) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { return -10; }
+    };
+    mut ws: WebSocket<TcpStream> = match (await connect(sock, Str::new("127.0.0.1"),
+                                                        Str::new("/chat"))) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { return -11; }
+    };
+
+    mut sent: i64 = 0;
+    while (sent < n) {
+        mut msg: String = String::from_str(Str::new("m"));
+        msg.push_byte((0x30 + sent) as u8);
+        match (await ws.send_text(msg.as_str())) {
+            Result::Ok(_)  => { }
+            Result::Err(_) => { return -12; }
+        }
+        mut back: Message = match (await ws.recv()) {
+            Result::Ok(v)  => { v }
+            Result::Err(_) => { return -13; }
+        };
+        // The server echoes what it received, so a desynchronized connection
+        // shows up as the WRONG message rather than as a read error.
+        if (!ws_message_is(back, msg_text(sent))) { return -14; }
+        sent = sent + 1;
+    }
     return sent;
 }
 
-/// Read one message off the server view and report whether it decoded as
-/// the expected text. Each arm returns explicitly so the message's owned
-/// payload is consumed on every path.
-function server_reads_hello(ws: WebSocket<TcpStream>*) -> boolean {
-    match (ws.recv()) {
-        Result::Ok(msg) => {
-            match (msg) {
-                Message::Text(s) => {
-                    mut owned: String = s;
-                    const ok: boolean = owned.as_str().equals(&Str::new("hello ws"));
-                    owned.drop();
-                    return ok;
-                }
-                Message::Binary(b) => { mut bb: Array<u8> = b; bb.drop(); return false; }
-                Message::Close => { return false; }
-            }
-        }
-        Result::Err(_) => { return false; }
+/// The text of the `i`th client message, as a literal the checker can compare
+/// against. Kept in one place so the client and its assertion cannot drift.
+function msg_text(i: i64) -> string {
+    match (i) {
+        0 => { return "m0"; }
+        1 => { return "m1"; }
+        2 => { return "m2"; }
+        _ => { return "m?"; }
     }
 }
 
-![test]
-function masked_text_frame_loopback_round_trip() -> Result<(), TestError> {
-    const port: u16 = (29000 + (libc::getpid() % 20000)) as u16;
-
-    mut listener: TcpListener = match (TcpListener::bind(SocketAddr::localhost_v4(port))) {
-        Result::Ok(l)  => { l }
-        Result::Err(_) => { return bail(Str::new("bind 127.0.0.1 failed")); }
+/// Server: accept, upgrade, echo `n` messages back. Returns `n`, or a negative
+/// step code offset by -100 so a server failure is distinguishable from a
+/// client one in the same test.
+async function ws_server_n(listener: TcpListener, n: i64) -> i64 {
+    mut sock: TcpStream = match (await ws_accept_one(listener)) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { return -100; }
+    };
+    mut ws: WebSocket<TcpStream> = match (await accept(sock)) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { return -101; }
     };
 
-    const handle: thread::JoinHandle<i32> =
-        thread::spawn<i32, i32>(port as i32, ws_client);
-
-    mut tcp_server: TcpStream = match (listener.accept()) {
-        Result::Ok(s)  => { s }
-        Result::Err(_) => { handle.join(); listener.drop(); return bail(Str::new("accept failed")); }
-    };
-
-    // Unmasked server view; read the message the client framed.
-    mut ws_server: WebSocket<TcpStream> = WebSocket<TcpStream>::from_upgraded(&tcp_server, false);
-    const text_ok: boolean = server_reads_hello(&ws_server);
-
-    const client_sent: i32 = handle.join();
-    tcp_server.drop();
-    listener.drop();
-
-    match (expect(client_sent == 1, Str::new("client should frame and send the text message"))) {
-        Result::Ok(_)  => { }
-        Result::Err(e) => { return Result::Err(e); }
+    mut seen: i64 = 0;
+    while (seen < n) {
+        mut msg: Message = match (await ws.recv()) {
+            Result::Ok(v)  => { v }
+            Result::Err(_) => { return -102; }
+        };
+        mut echo: String = String::new();
+        match (msg) {
+            Message::Text(s)   => { mut owned: String = s; echo.push(owned.as_str()); owned.drop(); }
+            Message::Binary(b) => { mut bb: Array<u8> = b; bb.drop(); return -103; }
+            Message::Close     => { return -104; }
+        }
+        match (await ws.send_text(echo.as_str())) {
+            Result::Ok(_)  => { }
+            Result::Err(_) => { return -105; }
+        }
+        seen = seen + 1;
     }
-    return expect(text_ok, Str::new("server should decode the unmasked text frame as \"hello ws\""));
+    return seen;
+}
+
+/// Both halves on ONE executor. `Futures::join` completes with a TUPLE.
+async function ws_pair(listener: TcpListener, port: u16, n: i64) -> i64 {
+    const pair: (i64, i64) = await Futures::join(ws_server_n(listener, n),
+                                                 ws_client_n(port, n));
+    if (pair.0 != n) { return pair.0; }
+    if (pair.1 != n) { return pair.1; }
+    return n;
+}
+
+/// One message each way: the control for the loop below. If this passes and
+/// the three-message test does not, the fault is in carrying the connection
+/// round the recv loop rather than in the upgrade or the framing.
+![test]
+function upgrade_and_one_text_frame_round_trip() -> Result<(), TestError> {
+    mut l: TcpListener = match (ws_bind()) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { return bail(Str::new("bind 127.0.0.1:0 failed")); }
+    };
+    const port: u16 = ws_port(&l);
+    if (port == 0u16) { l.drop(); return bail(Str::new("local_addr failed")); }
+    mut ex: Executor = Executor::new();
+    const r: i64 = ex.block_on(ws_pair(l, port, 1 as i64));
+    ex.drop();
+    return expect_eq(r, 1 as i64);
+}
+
+/// Three messages each way down ONE connection, each body distinct. A
+/// connection whose buffered state desynchronized between frames decodes the
+/// wrong body, which the client checks per message.
+![test]
+function three_text_frames_on_one_connection() -> Result<(), TestError> {
+    mut l: TcpListener = match (ws_bind()) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { return bail(Str::new("bind 127.0.0.1:0 failed")); }
+    };
+    const port: u16 = ws_port(&l);
+    if (port == 0u16) { l.drop(); return bail(Str::new("local_addr failed")); }
+    mut ex: Executor = Executor::new();
+    const r: i64 = ex.block_on(ws_pair(l, port, 3 as i64));
+    ex.drop();
+    return expect_eq(r, 3 as i64);
+}
+
+// ============================================================================
+// The pipelined upgrade: request and first frame in ONE write
+// ============================================================================
+
+/// Client that writes the upgrade request AND its first data frame into the
+/// SAME flush, then reads the 101 and the echo. This is the case a
+/// byte-at-a-time handshake read cannot serve: the frame bytes arrive in the
+/// same fill as the blank line, so they only survive if the connection - not
+/// the handshake - owns the buffer.
+async function ws_pipelined_client(port: u16) -> i64 {
+    mut sock: TcpStream = match (await TcpConnect::start(SocketAddr::localhost_v4(port))) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { return -10; }
+    };
+    // The handshake is driven on the CONNECTION, which is only wrapped in a
+    // `WebSocket` once the upgrade is complete. Holding a `BufStream<S>*` into
+    // the wrapper instead would not survive: an owning local is carried across
+    // each suspend, so a pointer taken before the first `await` addresses a
+    // copy the later states have stopped using.
+    mut c: BufStream<TcpStream> = BufStream<TcpStream>::of(sock);
+
+    // Hand-built request so the frame can be appended to the SAME buffer
+    // before anything is sent. The key is the RFC's worked example, so the
+    // accept value the server computes is the known constant.
+    mut req: String = String::with_capacity(200);
+    req.push(Str::new("GET /chat HTTP/1.1\r\n"));
+    req.push(Str::new("Host: 127.0.0.1\r\n"));
+    req.push(Str::new("Upgrade: websocket\r\n"));
+    req.push(Str::new("Connection: Upgrade\r\n"));
+    req.push(Str::new("Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"));
+    req.push(Str::new("Sec-WebSocket-Version: 13\r\n\r\n"));
+    match (c.pending().try_append(req.as_str().as_bytes())) {
+        Result::Ok(_)  => { }
+        Result::Err(_) => { return -11; }
+    }
+    match (c.queue_frame(true, OpCode::Text, Str::new("pipelined").as_bytes(), true)) {
+        Result::Ok(_)  => { }
+        Result::Err(_) => { return -12; }
+    }
+    match (await c.flush()) {
+        Result::Ok(_)  => { }
+        Result::Err(_) => { return -13; }
+    }
+
+    // Read the 101 head back a line at a time, then the server's echo.
+    mut status: String = match (await c.read_line(4096u64)) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { return -14; }
+    };
+    if (!status.as_str().equals(&Str::new("HTTP/1.1 101 Switching Protocols"))) { return -15; }
+    mut accept_seen: boolean = false;
+    loop {
+        mut line: String = match (await c.read_line(4096u64)) {
+            Result::Ok(v)  => { v }
+            Result::Err(_) => { return -16; }
+        };
+        if (line.is_empty()) { break; }
+        if (line.as_str().equals(
+                &Str::new("Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo="))) {
+            accept_seen = true;
+        }
+    }
+    if (!accept_seen) { return -17; }
+
+    // The upgrade is done and the frame the server echoes may already be
+    // sitting in `c`'s buffer -- wrapping it now is what carries those bytes
+    // into `recv` instead of discarding them with a handshake-owned buffer.
+    mut ws: WebSocket<TcpStream> = WebSocket<TcpStream>::of(c, true);
+    mut echoed: Message = match (await ws.recv()) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { return -18; }
+    };
+    if (!ws_message_is(echoed, "pipelined")) { return -19; }
+    return 1;
+}
+
+async function ws_pipelined_pair(listener: TcpListener, port: u16) -> i64 {
+    const pair: (i64, i64) = await Futures::join(ws_server_n(listener, 1 as i64),
+                                                 ws_pipelined_client(port));
+    if (pair.0 != 1) { return pair.0; }
+    return pair.1;
+}
+
+![test]
+function pipelined_upgrade_and_frame_round_trip() -> Result<(), TestError> {
+    mut l: TcpListener = match (ws_bind()) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { return bail(Str::new("bind 127.0.0.1:0 failed")); }
+    };
+    const port: u16 = ws_port(&l);
+    if (port == 0u16) { l.drop(); return bail(Str::new("local_addr failed")); }
+    mut ex: Executor = Executor::new();
+    const r: i64 = ex.block_on(ws_pipelined_pair(l, port));
+    ex.drop();
+    return expect_eq(r, 1 as i64);
+}
+
+// ============================================================================
+// Control frames
+// ============================================================================
+
+/// Client that sends a Ping BEFORE its text message. The server must answer
+/// the Ping with a Pong from inside `recv` and still deliver the text, so the
+/// client sees its echo AND a Pong-free message stream.
+async function ws_ping_client(port: u16) -> i64 {
+    mut sock: TcpStream = match (await TcpConnect::start(SocketAddr::localhost_v4(port))) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { return -10; }
+    };
+    mut ws: WebSocket<TcpStream> = match (await connect(sock, Str::new("127.0.0.1"),
+                                                        Str::new("/chat"))) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { return -11; }
+    };
+    match (await ws.ping(Str::new("hi").as_bytes())) {
+        Result::Ok(_)  => { }
+        Result::Err(_) => { return -12; }
+    }
+    match (await ws.send_text(Str::new("m0"))) {
+        Result::Ok(_)  => { }
+        Result::Err(_) => { return -13; }
+    }
+    // The server's Pong is a control frame; `recv` skips it and yields the
+    // echo, so one `recv` is enough.
+    mut back: Message = match (await ws.recv()) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { return -14; }
+    };
+    if (!ws_message_is(back, "m0")) { return -15; }
+    return 1;
+}
+
+async function ws_ping_pair(listener: TcpListener, port: u16) -> i64 {
+    const pair: (i64, i64) = await Futures::join(ws_server_n(listener, 1 as i64),
+                                                 ws_ping_client(port));
+    if (pair.0 != 1) { return pair.0; }
+    return pair.1;
+}
+
+![test]
+function ping_is_answered_inline_without_losing_the_message() -> Result<(), TestError> {
+    mut l: TcpListener = match (ws_bind()) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { return bail(Str::new("bind 127.0.0.1:0 failed")); }
+    };
+    const port: u16 = ws_port(&l);
+    if (port == 0u16) { l.drop(); return bail(Str::new("local_addr failed")); }
+    mut ex: Executor = Executor::new();
+    const r: i64 = ex.block_on(ws_ping_pair(l, port));
+    ex.drop();
+    return expect_eq(r, 1 as i64);
 }
