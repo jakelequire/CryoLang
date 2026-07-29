@@ -1,12 +1,29 @@
 ///! HTTP/2 connection (RFC 7540).
 ///!
-///! `Http2Connection<S>` drives the HTTP/2 protocol over any
-///! `Read + Write` transport `S` (a `TcpStream` for h2c, a `TlsStream`
-///! for h2). It owns the HPACK encoder/decoder, performs the connection
-///! preface + SETTINGS handshake, and exposes `request` (client) and
-///! `serve` (server). Requests and responses are the same `net::http`
-///! `Request` / `Response` types used by the HTTP/1.1 layer, so handlers
-///! and clients are written once.
+///! `Http2Connection<S>` drives the HTTP/2 protocol over any async transport
+///! `S` (a `TcpStream` for h2c, a `TlsStream` for h2). It owns the HPACK
+///! encoder/decoder, performs the connection preface + SETTINGS handshake, and
+///! exposes `request` (client) and `serve` (server). Requests and responses are
+///! the same `net::http` `Request` / `Response` types used by the HTTP/1.1
+///! layer, so handlers and clients are written once.
+///!
+///! It **OWNS** its `BufStream<S>`, as `WebSocket<S>` does and for the same
+///! reason: the type carries per-connection protocol state (the HPACK tables,
+///! the flow-control windows, the next stream id), and an `async` method may
+///! only re-address its OWN receiver between polls. A borrowed transport would
+///! be a second address the state machine has no way to refresh, and handing
+///! the address of a caller's local to a future that outlives the current poll
+///! is refused outright (E0455).
+///!
+///! Owning the connection is also what gives the read side one buffer for the
+///! whole connection: bytes of the next frame that arrived in the same fill as
+///! the previous one are still there to be parsed rather than lost.
+///!
+///! The write side is synchronous throughout — `queue_settings`,
+///! `queue_header_block`, `queue_ack_data` and `process_control` only append to
+///! `pending()` — so a whole HEADERS block plus its CONTINUATION fragments is
+///! assembled with no suspension point inside it and the connection suspends
+///! exactly once, in `flush`.
 ///!
 ///! Scope: streams are processed sequentially within a connection (one
 ///! outstanding request/response at a time), which is the common keep-
@@ -24,6 +41,7 @@ import core::convert;
 import core::mem;
 import io::error;
 import io::traits;
+import io::buf;
 import collections::array;
 import collections::string;
 import collections::str;
@@ -36,6 +54,9 @@ import net::http::response;
 import net::http2::frame;
 import net::http2::hpack;
 import net::http2::settings;
+import future::poll;
+import future::waker;
+import future::traits;
 
 /// The 24-octet client connection preface (RFC 7540 section 3.5).
 const PREFACE_LEN: u64 = 24;
@@ -55,9 +76,10 @@ const LOCAL_MAX_HEADER_LIST_SIZE: u32 = 262144;    // 256 KiB
 // Cap on an assembled DATA body (the sum of all DATA frame payloads on a
 // stream).  Without it a peer streams DATA frames without END_STREAM and
 // grows the buffer without bound (a remote memory-exhaustion DoS), because
-// `ack_data` replenishes the flow-control window after every frame.  Mirrors
-// the HTTP/1.1 `MAX_BODY` cap (16 MiB).  Checked at the top of the read loop,
-// so it overshoots by at most one frame before we stop replenishing and fail.
+// `queue_ack_data` replenishes the flow-control window after every frame.
+// Mirrors the HTTP/1.1 `MAX_BODY` cap (16 MiB).  Checked at the top of the read
+// loop, so it overshoots by at most one frame before we stop replenishing and
+// fail.
 const LOCAL_MAX_BODY_SIZE: u64 = 16777216;         // 16 MiB
 
 /// The connection-level flow-control window initial value is fixed at
@@ -73,7 +95,7 @@ type struct RequestOnStream {
 }
 
 type struct Http2Connection<S> {
-    inner:                 S*;
+    conn:                  BufStream<S>;
     encoder:               HpackEncoder;
     decoder:               HpackDecoder;
     is_client:             boolean;
@@ -86,18 +108,19 @@ type struct Http2Connection<S> {
     conn_send_window:      i64;
     stream_send_window:    i64;
 
-    /// Release the HPACK encoder/decoder tables. The borrowed transport
-    /// `inner` belongs to the caller and is not dropped here.
+    /// Release the HPACK encoder/decoder tables and the transport. The
+    /// connection owns the transport, so dropping this closes the socket.
     drop(mut &this) -> void {
+        this.conn.drop();
         this.encoder.drop();
         this.decoder.drop();
     }
 
-    /// New client-side connection over `stream`. The caller owns the
-    /// transport. Call `handshake` before issuing requests.
-    static new_client(stream: S*) -> Http2Connection<S> {
+    /// New client-side connection taking ownership of `conn`. Call
+    /// `handshake_client` before issuing requests.
+    static new_client(conn: BufStream<S>) -> Http2Connection<S> {
         return Http2Connection<S> {
-            inner:                 stream,
+            conn:                  conn,
             encoder:               HpackEncoder::new(LOCAL_HEADER_TABLE_SIZE as u64),
             decoder:               HpackDecoder::new(LOCAL_HEADER_TABLE_SIZE as u64),
             is_client:             true,
@@ -110,10 +133,10 @@ type struct Http2Connection<S> {
         };
     }
 
-    /// New server-side connection over an accepted `stream`.
-    static new_server(stream: S*) -> Http2Connection<S> {
+    /// New server-side connection over an accepted, already-buffered transport.
+    static new_server(conn: BufStream<S>) -> Http2Connection<S> {
         return Http2Connection<S> {
-            inner:                 stream,
+            conn:                  conn,
             encoder:               HpackEncoder::new(LOCAL_HEADER_TABLE_SIZE as u64),
             decoder:               HpackDecoder::new(LOCAL_HEADER_TABLE_SIZE as u64),
             is_client:             false,
@@ -126,51 +149,74 @@ type struct Http2Connection<S> {
         };
     }
 
+    /// The buffered connection, for callers that need the transport itself
+    /// (socket options, the negotiated ALPN protocol). Not for reading or
+    /// writing — that would desynchronize the framing.
+    connection(mut &this) -> BufStream<S>* {
+        return &this.conn;
+    }
+
+    /// Has the peer sent a GOAWAY on this connection?
+    goaway_seen(&this) -> boolean {
+        return this.goaway_received;
+    }
+
     // ---- handshake --------------------------------------------------------
 
-    /// Client preface + SETTINGS exchange. Writes the magic and our
-    /// SETTINGS, then reads frames (acking the peer's SETTINGS) until the
-    /// peer's initial SETTINGS frame has been seen.
-    handshake_client(mut &this) -> Result<(), IoError>
-    where S: Read + Write {
-        this.inner.write(preface_bytes())?;
-        this.send_settings()?;
-        return this.await_peer_settings();
+    /// Client preface + SETTINGS exchange. Queues the magic and our SETTINGS
+    /// and sends both in one flush, then reads frames (acking the peer's
+    /// SETTINGS) until the peer's initial SETTINGS frame has been seen.
+    async handshake_client(mut &this) -> Result<(), IoError>
+    where S: AsyncTransport {
+        push_all(this.conn.pending(), preface_bytes())?;
+        this.queue_settings()?;
+        (await this.conn.flush())?;
+        return await this.await_peer_settings();
     }
 
     /// Server side: validate the client preface, send our SETTINGS, then
     /// read frames (acking the peer's SETTINGS) until the client's
     /// initial SETTINGS frame has been seen.
-    handshake_server(mut &this) -> Result<(), IoError>
-    where S: Read + Write {
-        mut magic: u8[24];
-        this.inner.read_exact(&magic[0], PREFACE_LEN)?;
-        const got: Slice<u8> = Slice::from_raw(&magic[0], PREFACE_LEN);
-        if (!slice_eq(got, preface_bytes())) {
+    async handshake_server(mut &this) -> Result<(), IoError>
+    where S: AsyncTransport {
+        (await this.conn.ensure(PREFACE_LEN))?;
+        // The buffer may already hold the client's SETTINGS frame behind the
+        // preface, so compare exactly the preface's worth of it. Nothing
+        // suspends between here and the `consume`.
+        const got: Slice<u8> = this.conn.buffered().subslice(0, PREFACE_LEN);
+        const good: boolean = slice_eq(got, preface_bytes());
+        this.conn.consume(PREFACE_LEN);
+        if (!good) {
             return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
         }
-        this.send_settings()?;
-        return this.await_peer_settings();
+        this.queue_settings()?;
+        (await this.conn.flush())?;
+        return await this.await_peer_settings();
     }
 
-    await_peer_settings(mut &this) -> Result<(), IoError>
-    where S: Read + Write {
+    /// Read frames until the peer's initial (non-ACK) SETTINGS frame arrives,
+    /// handling every control frame that precedes it.
+    async await_peer_settings(mut &this) -> Result<(), IoError>
+    where S: AsyncTransport {
         loop {
-            mut fr: Frame = frame::read_frame(this.inner, LOCAL_MAX_FRAME_SIZE as u64)?;
+            mut fr: Frame = (await this.conn.read_h2_frame(LOCAL_MAX_FRAME_SIZE as u64))?;
             const is_settings: boolean = (fr.ftype == frame::FRAME_SETTINGS)
                                        && !fr.has_flag(frame::FLAG_ACK);
-            match (this.process_control(&fr)) {
-                Result::Ok(_)  => { }
-                Result::Err(e) => { fr.drop(); return Result::Err(e); }
-            }
+            // `process_control` only queues, so the frame is released before
+            // the flush below rather than being carried across it.
+            const outcome: Result<boolean, IoError> = this.process_control(&fr);
             fr.drop();
+            match (outcome) {
+                Result::Ok(_)  => { }
+                Result::Err(e) => { return Result::Err(e); }
+            }
+            (await this.conn.flush())?;
             if (is_settings) { return Result::Ok(()); }
         }
     }
 
-    /// Send our advertised SETTINGS frame.
-    send_settings(mut &this) -> Result<(), IoError>
-    where S: Read + Write {
+    /// Queue our advertised SETTINGS frame. Synchronous; the caller flushes.
+    queue_settings(mut &this) -> Result<(), IoError> {
         mut payload: Array<u8> = Array<u8>::new();
         settings::push_entry(&payload, settings::SETTINGS_HEADER_TABLE_SIZE, LOCAL_HEADER_TABLE_SIZE);
         settings::push_entry(&payload, settings::SETTINGS_ENABLE_PUSH, LOCAL_ENABLE_PUSH);
@@ -178,7 +224,7 @@ type struct Http2Connection<S> {
         settings::push_entry(&payload, settings::SETTINGS_MAX_FRAME_SIZE, LOCAL_MAX_FRAME_SIZE);
         settings::push_entry(&payload, settings::SETTINGS_MAX_HEADER_LIST_SIZE, LOCAL_MAX_HEADER_LIST_SIZE);
         const r: Result<(), IoError> =
-            frame::write_frame(this.inner, frame::FRAME_SETTINGS, 0, 0, payload.as_slice());
+            this.conn.queue_h2_frame(frame::FRAME_SETTINGS, 0, 0, payload.as_slice());
         payload.drop();
         return r;
     }
@@ -189,8 +235,12 @@ type struct Http2Connection<S> {
     /// frame was fully handled here (SETTINGS, PING, WINDOW_UPDATE,
     /// GOAWAY, PRIORITY, PUSH_PROMISE); false for stream frames the
     /// caller must process (HEADERS, CONTINUATION, DATA, RST_STREAM).
-    process_control(mut &this, fr: &Frame) -> Result<boolean, IoError>
-    where S: Read + Write {
+    ///
+    /// Synchronous on purpose. The acknowledgements it owes the peer (SETTINGS
+    /// ACK, PING ACK) are QUEUED, and the caller flushes once it has released
+    /// the frame — so the borrowed `fr` never has to survive a suspension, and
+    /// this stays callable from every read loop without one.
+    process_control(mut &this, fr: &Frame) -> Result<boolean, IoError> {
         if (fr.ftype == frame::FRAME_SETTINGS) {
             if (fr.has_flag(frame::FLAG_ACK)) { return Result::Ok(true); }
             mut s: Settings = Settings::defaults();
@@ -200,14 +250,14 @@ type struct Http2Connection<S> {
             // Our encoder must not exceed the peer's decoder table size.
             this.encoder.set_capacity(s.header_table_size as u64);
             // Acknowledge.
-            frame::write_frame(this.inner, frame::FRAME_SETTINGS, frame::FLAG_ACK, 0,
-                               Slice::from_raw(null as u8*, 0))?;
+            this.conn.queue_h2_frame(frame::FRAME_SETTINGS, frame::FLAG_ACK, 0,
+                                     Slice::from_raw(null as u8*, 0))?;
             return Result::Ok(true);
         }
         if (fr.ftype == frame::FRAME_PING) {
             if (fr.has_flag(frame::FLAG_ACK)) { return Result::Ok(true); }
-            frame::write_frame(this.inner, frame::FRAME_PING, frame::FLAG_ACK, 0,
-                               fr.payload.as_slice())?;
+            this.conn.queue_h2_frame(frame::FRAME_PING, frame::FLAG_ACK, 0,
+                                     fr.payload.as_slice())?;
             return Result::Ok(true);
         }
         if (fr.ftype == frame::FRAME_WINDOW_UPDATE) {
@@ -245,51 +295,71 @@ type struct Http2Connection<S> {
 
     // ---- sending ----------------------------------------------------------
 
-    /// Send a header block on `stream_id`, splitting into HEADERS +
+    /// Queue a header block on `stream_id`, splitting into HEADERS +
     /// CONTINUATION frames to respect the peer's max frame size. Sets
     /// END_STREAM on the HEADERS frame when `end_stream` is set.
-    send_header_block(mut &this, stream_id: u32, block: Slice<u8>, end_stream: boolean) -> Result<(), IoError>
-    where S: Read + Write {
+    ///
+    /// Synchronous: however many fragments a block needs, they are assembled
+    /// with no suspension between them and go out in one flush, so a peer never
+    /// sees a header block interleaved with anything else.
+    queue_header_block(mut &this, stream_id: u32, block: Slice<u8>,
+                       end_stream: boolean) -> Result<(), IoError> {
         const total: u64 = block.length();
         const max: u64 = this.remote_max_frame;
         if (total <= max) {
             mut flags: u8 = frame::FLAG_END_HEADERS;
             if (end_stream) { flags = flags | frame::FLAG_END_STREAM; }
-            return frame::write_frame(this.inner, frame::FRAME_HEADERS, flags, stream_id, block);
+            return this.conn.queue_h2_frame(frame::FRAME_HEADERS, flags, stream_id, block);
         }
         // First fragment: HEADERS without END_HEADERS.
         mut first_flags: u8 = 0;
         if (end_stream) { first_flags = first_flags | frame::FLAG_END_STREAM; }
-        frame::write_frame(this.inner, frame::FRAME_HEADERS, first_flags, stream_id,
-                           block.subslice(0, max))?;
+        this.conn.queue_h2_frame(frame::FRAME_HEADERS, first_flags, stream_id,
+                                 block.subslice(0, max))?;
         mut pos: u64 = max;
         while (pos < total) {
             mut end: u64 = pos + max;
             if (end > total) { end = total; }
             const last: boolean = end >= total;
             const cflags: u8 = if (last) { frame::FLAG_END_HEADERS } else { 0 };
-            frame::write_frame(this.inner, frame::FRAME_CONTINUATION, cflags, stream_id,
-                               block.subslice(pos, end))?;
+            this.conn.queue_h2_frame(frame::FRAME_CONTINUATION, cflags, stream_id,
+                                     block.subslice(pos, end))?;
             pos = end;
         }
         return Result::Ok(());
     }
 
     /// Send a message body as DATA frames on `stream_id`, honouring the
-    /// connection and stream send windows and the peer's max frame size.
-    send_body(mut &this, stream_id: u32, body: Slice<u8>, end_stream: boolean) -> Result<(), IoError>
-    where S: Read + Write {
-        const total: u64 = body.length();
+    /// connection and stream send windows and the peer's max frame size, and
+    /// put everything queued on the wire.
+    ///
+    /// Takes the body BY VALUE. A `Slice<u8>` into a caller's array would be a
+    /// borrowed view crossing every suspension in the loop below; owning the
+    /// bytes means the view is re-derived from this future's own storage after
+    /// each one, which is what makes the window wait safe.
+    ///
+    /// Always flushes, even for an empty body, because the caller's header
+    /// block is queued behind it and this is what puts it on the wire.
+    async send_body(mut &this, stream_id: u32, body: Array<u8>,
+                    end_stream: boolean) -> Result<(), IoError>
+    where S: AsyncTransport {
+        mut b: Array<u8> = body;
+        const total: u64 = b.length();
         if (total == 0) {
             if (end_stream) {
-                return frame::write_frame(this.inner, frame::FRAME_DATA,
-                                          frame::FLAG_END_STREAM, stream_id, Slice::from_raw(null as u8*, 0));
+                this.conn.queue_h2_frame(frame::FRAME_DATA, frame::FLAG_END_STREAM,
+                                         stream_id, Slice::from_raw(null as u8*, 0))?;
             }
-            return Result::Ok(());
+            return await this.conn.flush();
         }
+        // Put the queued header block on the wire BEFORE the first window wait:
+        // `ensure_send_window` reads, and a peer that has not yet seen our
+        // headers has no reason to enlarge the window.
+        (await this.conn.flush())?;
+
         mut pos: u64 = 0;
         while (pos < total) {
-            this.ensure_send_window()?;
+            (await this.ensure_send_window())?;
             mut avail: u64 = this.remote_max_frame;
             const remaining: u64 = total - pos;
             if (remaining < avail) { avail = remaining; }
@@ -299,43 +369,49 @@ type struct Http2Connection<S> {
             const end: u64 = pos + avail;
             const last: boolean = end >= total;
             const flags: u8 = if (last && end_stream) { frame::FLAG_END_STREAM } else { 0 };
-            frame::write_frame(this.inner, frame::FRAME_DATA, flags, stream_id,
-                               body.subslice(pos, end))?;
+            // The slice is taken from `b` AFTER the suspension above handed the
+            // array back, and consumed by a synchronous queue before the next
+            // one, so no view is ever live across a fill.
+            this.conn.queue_h2_frame(frame::FRAME_DATA, flags, stream_id,
+                                     b.as_slice().subslice(pos, end))?;
             this.stream_send_window = this.stream_send_window - (avail as i64);
             this.conn_send_window = this.conn_send_window - (avail as i64);
             pos = end;
+            (await this.conn.flush())?;
         }
         return Result::Ok(());
     }
 
-    /// Block until both the stream and connection send windows are
-    /// positive, processing incoming control frames (chiefly
-    /// WINDOW_UPDATE) while we wait.
-    ensure_send_window(mut &this) -> Result<(), IoError>
-    where S: Read + Write {
+    /// Wait until both the stream and connection send windows are positive,
+    /// processing incoming control frames (chiefly WINDOW_UPDATE) while we
+    /// wait.
+    async ensure_send_window(mut &this) -> Result<(), IoError>
+    where S: AsyncTransport {
         while (this.stream_send_window <= 0 || this.conn_send_window <= 0) {
-            mut fr: Frame = frame::read_frame(this.inner, LOCAL_MAX_FRAME_SIZE as u64)?;
-            match (this.process_control(&fr)) {
-                Result::Ok(_)  => { }
-                Result::Err(e) => { fr.drop(); return Result::Err(e); }
-            }
+            mut fr: Frame = (await this.conn.read_h2_frame(LOCAL_MAX_FRAME_SIZE as u64))?;
+            const outcome: Result<boolean, IoError> = this.process_control(&fr);
             fr.drop();
+            match (outcome) {
+                Result::Ok(_)  => { }
+                Result::Err(e) => { return Result::Err(e); }
+            }
+            (await this.conn.flush())?;
         }
         return Result::Ok(());
     }
 
-    /// Replenish our receive windows after consuming `n` octets of DATA.
-    ack_data(mut &this, stream_id: u32, n: u64) -> Result<(), IoError>
-    where S: Read + Write {
+    /// Queue the WINDOW_UPDATEs that replenish our receive windows after
+    /// consuming `n` octets of DATA. Synchronous; the caller flushes.
+    queue_ack_data(mut &this, stream_id: u32, n: u64) -> Result<(), IoError> {
         if (n == 0) { return Result::Ok(()); }
-        mut conn: u8[4];
-        write_u31(&conn[0], n as u32);
-        frame::write_frame(this.inner, frame::FRAME_WINDOW_UPDATE, 0, 0,
-                           Slice::from_raw(&conn[0], 4))?;
-        mut strm: u8[4];
-        write_u31(&strm[0], n as u32);
-        return frame::write_frame(this.inner, frame::FRAME_WINDOW_UPDATE, 0, stream_id,
-                                  Slice::from_raw(&strm[0], 4));
+        mut conn_inc: u8[4];
+        write_u31(&conn_inc[0], n as u32);
+        this.conn.queue_h2_frame(frame::FRAME_WINDOW_UPDATE, 0, 0,
+                                 Slice::from_raw(&conn_inc[0], 4))?;
+        mut strm_inc: u8[4];
+        write_u31(&strm_inc[0], n as u32);
+        return this.conn.queue_h2_frame(frame::FRAME_WINDOW_UPDATE, 0, stream_id,
+                                        Slice::from_raw(&strm_inc[0], 4));
     }
 
     // ---- client request ---------------------------------------------------
@@ -343,8 +419,8 @@ type struct Http2Connection<S> {
     /// Issue one request and read its response. `scheme` is "http" (h2c)
     /// or "https" (h2); `authority` becomes the `:authority` pseudo-
     /// header. Consumes `req`.
-    request(mut &this, req: Request, scheme: Str, authority: Str) -> Result<Response, IoError>
-    where S: Read + Write {
+    async request(mut &this, req: Request, scheme: Str, authority: Str) -> Result<Response, IoError>
+    where S: AsyncTransport {
         mut request_local: Request = req;
         const sid: u32 = this.next_stream_id;
         this.next_stream_id = this.next_stream_id + 2;
@@ -354,24 +430,29 @@ type struct Http2Connection<S> {
         this.encode_request_headers(&block, &request_local, scheme, authority);
         const has_body: boolean = !request_local.body.is_empty();
 
-        match (this.send_header_block(sid, block.as_slice(), !has_body)) {
-            Result::Ok(_)  => { }
-            Result::Err(e) => { block.drop(); request_local.drop(); return Result::Err(e); }
-        }
-        block.drop();
-
-        if (has_body) {
-            match (this.send_body(sid, request_local.body.as_slice(), true)) {
-                Result::Ok(_)  => { }
-                Result::Err(e) => { request_local.drop(); return Result::Err(e); }
-            }
-        }
+        // Take the body out and release the request before anything suspends:
+        // only the bytes have to survive into `send_body`, and a request left
+        // live across the flush would be carried for nothing.
+        mut body_bytes: Array<u8> = Array<u8>::new();
+        mem::swap<Array<u8>>(&body_bytes, &request_local.body);
         request_local.drop();
-        return this.read_response(sid);
+
+        const queued: Result<(), IoError> =
+            this.queue_header_block(sid, block.as_slice(), !has_body);
+        block.drop();
+        queued?;
+
+        // `send_body` flushes whether or not there are DATA frames, so the
+        // header block goes out either way and an empty body costs no extra
+        // suspension.
+        (await this.send_body(sid, body_bytes, has_body))?;
+        return await this.read_response(sid);
     }
 
-    read_response(mut &this, sid: u32) -> Result<Response, IoError>
-    where S: Read + Write {
+    /// Read frames until the response on `sid` completes, assembling its header
+    /// block and body.
+    async read_response(mut &this, sid: u32) -> Result<Response, IoError>
+    where S: AsyncTransport {
         mut block: Array<u8> = Array<u8>::new();
         mut body: Array<u8> = Array<u8>::new();
         mut headers_done: boolean = false;
@@ -383,21 +464,23 @@ type struct Http2Connection<S> {
             // most one frame).
             if (block.length() > LOCAL_MAX_HEADER_LIST_SIZE as u64
                 || body.length() > LOCAL_MAX_BODY_SIZE) {
-                block.drop(); body.drop();
                 return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
             }
-            mut fr: Frame = match (frame::read_frame(this.inner, LOCAL_MAX_FRAME_SIZE as u64)) {
-                Result::Ok(f)  => { f }
-                Result::Err(e) => { block.drop(); body.drop(); return Result::Err(e); }
-            };
-            const handled: boolean = match (this.process_control(&fr)) {
-                Result::Ok(h)  => { h }
-                Result::Err(e) => { fr.drop(); block.drop(); body.drop(); return Result::Err(e); }
-            };
-            if (handled) { fr.drop(); continue; }
+            mut fr: Frame = (await this.conn.read_h2_frame(LOCAL_MAX_FRAME_SIZE as u64))?;
+            const control: Result<boolean, IoError> = this.process_control(&fr);
+            mut handled: boolean = false;
+            match (control) {
+                Result::Ok(h)  => { handled = h; }
+                Result::Err(e) => { fr.drop(); return Result::Err(e); }
+            }
+            if (handled) {
+                fr.drop();
+                (await this.conn.flush())?;
+                continue;
+            }
 
             if (fr.ftype == frame::FRAME_RST_STREAM && fr.stream_id == sid) {
-                fr.drop(); block.drop(); body.drop();
+                fr.drop();
                 return Result::Err(IoError::new(IoErrorKind::ConnectionReset, 0));
             } else if (fr.ftype == frame::FRAME_HEADERS && fr.stream_id == sid) {
                 block.append(header_fragment(&fr));
@@ -413,10 +496,8 @@ type struct Http2Connection<S> {
                 const consumed: u64 = fr.payload.length();
                 const end: boolean = fr.has_flag(frame::FLAG_END_STREAM);
                 fr.drop();
-                match (this.ack_data(sid, consumed)) {
-                    Result::Ok(_)  => { }
-                    Result::Err(e) => { block.drop(); body.drop(); return Result::Err(e); }
-                }
+                this.queue_ack_data(sid, consumed)?;
+                (await this.conn.flush())?;
                 if (end) { stream_done = true; }
             } else {
                 fr.drop();
@@ -436,36 +517,32 @@ type struct Http2Connection<S> {
     /// Serve requests on this connection, dispatching each to `handler`,
     /// until the peer closes the connection or sends GOAWAY. Performs the
     /// server handshake first.
-    serve(mut &this, handler: (Request) -> Response) -> Result<(), IoError>
-    where S: Read + Write {
-        this.handshake_server()?;
+    async serve(mut &this, handler: (Request) -> Response) -> Result<(), IoError>
+    where S: AsyncTransport {
+        (await this.handshake_server())?;
         loop {
-            match (this.read_request()) {
-                Result::Ok(maybe) => {
-                    match (maybe) {
-                        Option::Some(ros) => {
-                            mut on_stream: RequestOnStream = ros;
-                            const sid: u32 = on_stream.stream_id;
-                            // Move the assembled request out, leaving a
-                            // throwaway in its place for the struct's
-                            // implicit destructor to reclaim.
-                            mut req: Request = Request::new(Method::Get, Str::new("/"));
-                            mem::swap(&req, &on_stream.req);
-                            const resp: Response = (handler)(req);
-                            this.send_response(sid, resp)?;
-                        }
-                        Option::None => { return Result::Ok(()); }
-                    }
+            mut maybe: Option<RequestOnStream> = (await this.read_request())?;
+            match (maybe) {
+                Option::Some(ros) => {
+                    mut on_stream: RequestOnStream = ros;
+                    const sid: u32 = on_stream.stream_id;
+                    // Move the assembled request out, leaving a
+                    // throwaway in its place for the struct's
+                    // implicit destructor to reclaim.
+                    mut req: Request = Request::new(Method::Get, Str::new("/"));
+                    mem::swap<Request>(&req, &on_stream.req);
+                    const resp: Response = (handler)(req);
+                    (await this.send_response(sid, resp))?;
                 }
-                Result::Err(e) => { return Result::Err(e); }
+                Option::None => { return Result::Ok(()); }
             }
         }
     }
 
     /// Read frames until one stream completes (END_STREAM), returning the
     /// assembled request. `None` means the connection closed cleanly.
-    read_request(mut &this) -> Result<Option<RequestOnStream>, IoError>
-    where S: Read + Write {
+    async read_request(mut &this) -> Result<Option<RequestOnStream>, IoError>
+    where S: AsyncTransport {
         mut block: Array<u8> = Array<u8>::new();
         mut body: Array<u8> = Array<u8>::new();
         mut sid: u32 = 0;
@@ -479,27 +556,30 @@ type struct Http2Connection<S> {
             // most one frame).
             if (block.length() > LOCAL_MAX_HEADER_LIST_SIZE as u64
                 || body.length() > LOCAL_MAX_BODY_SIZE) {
-                block.drop(); body.drop();
                 return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
             }
-            mut fr: Frame = match (frame::read_frame(this.inner, LOCAL_MAX_FRAME_SIZE as u64)) {
+            mut fr: Frame = match (await this.conn.read_h2_frame(LOCAL_MAX_FRAME_SIZE as u64)) {
                 Result::Ok(f)  => { f }
                 Result::Err(e) => {
-                    block.drop(); body.drop();
+                    // A peer that closes before starting a stream has simply
+                    // finished with the connection.
                     if (e.kind == IoErrorKind::UnexpectedEof && !have_stream) {
                         return Result::Ok(Option::None);
                     }
                     return Result::Err(e);
                 }
             };
-            const handled: boolean = match (this.process_control(&fr)) {
-                Result::Ok(h)  => { h }
-                Result::Err(e) => { fr.drop(); block.drop(); body.drop(); return Result::Err(e); }
-            };
+            const control: Result<boolean, IoError> = this.process_control(&fr);
+            mut handled: boolean = false;
+            match (control) {
+                Result::Ok(h)  => { handled = h; }
+                Result::Err(e) => { fr.drop(); return Result::Err(e); }
+            }
             if (handled) {
                 const closing: boolean = this.goaway_received && !have_stream;
                 fr.drop();
-                if (closing) { block.drop(); body.drop(); return Result::Ok(Option::None); }
+                if (closing) { return Result::Ok(Option::None); }
+                (await this.conn.flush())?;
                 continue;
             }
 
@@ -520,10 +600,8 @@ type struct Http2Connection<S> {
                 const consumed: u64 = fr.payload.length();
                 const end: boolean = fr.has_flag(frame::FLAG_END_STREAM);
                 fr.drop();
-                match (this.ack_data(sid, consumed)) {
-                    Result::Ok(_)  => { }
-                    Result::Err(e) => { block.drop(); body.drop(); return Result::Err(e); }
-                }
+                this.queue_ack_data(sid, consumed)?;
+                (await this.conn.flush())?;
                 if (end) { stream_done = true; }
             } else {
                 fr.drop();
@@ -540,8 +618,9 @@ type struct Http2Connection<S> {
         }
     }
 
-    send_response(mut &this, sid: u32, resp: Response) -> Result<(), IoError>
-    where S: Read + Write {
+    /// Send a response on `sid`. Consumes `resp`.
+    async send_response(mut &this, sid: u32, resp: Response) -> Result<(), IoError>
+    where S: AsyncTransport {
         mut response: Response = resp;
         this.stream_send_window = this.remote_initial_window;
 
@@ -549,34 +628,33 @@ type struct Http2Connection<S> {
         this.encode_response_headers(&block, &response);
         const has_body: boolean = !response.body.is_empty();
 
-        match (this.send_header_block(sid, block.as_slice(), !has_body)) {
-            Result::Ok(_)  => { }
-            Result::Err(e) => { block.drop(); response.drop(); return Result::Err(e); }
-        }
-        block.drop();
-
-        if (has_body) {
-            match (this.send_body(sid, response.body.as_slice(), true)) {
-                Result::Ok(_)  => { }
-                Result::Err(e) => { response.drop(); return Result::Err(e); }
-            }
-        }
+        // As in `request`: take the bytes, release the message, and only then
+        // suspend.
+        mut body_bytes: Array<u8> = Array<u8>::new();
+        mem::swap<Array<u8>>(&body_bytes, &response.body);
         response.drop();
-        return Result::Ok(());
+
+        const queued: Result<(), IoError> =
+            this.queue_header_block(sid, block.as_slice(), !has_body);
+        block.drop();
+        queued?;
+
+        return await this.send_body(sid, body_bytes, has_body);
     }
 
     /// Send a GOAWAY with the given last-stream-id and error code, then
     /// stop. Best-effort; transport teardown is the caller's.
-    send_goaway(mut &this, last_stream_id: u32, error_code: u32) -> Result<(), IoError>
-    where S: Read + Write {
+    async send_goaway(mut &this, last_stream_id: u32, error_code: u32) -> Result<(), IoError>
+    where S: AsyncTransport {
         mut payload: u8[8];
         write_u31(&payload[0], last_stream_id);
         payload[4] = (error_code >> 24) as u8;
         payload[5] = (error_code >> 16) as u8;
         payload[6] = (error_code >> 8) as u8;
         payload[7] = (error_code) as u8;
-        return frame::write_frame(this.inner, frame::FRAME_GOAWAY, 0, 0,
-                                  Slice::from_raw(&payload[0], 8));
+        this.conn.queue_h2_frame(frame::FRAME_GOAWAY, 0, 0,
+                                 Slice::from_raw(&payload[0], 8))?;
+        return await this.conn.flush();
     }
 
     // ---- header (de)serialization ----------------------------------------
@@ -619,6 +697,15 @@ type struct Http2Connection<S> {
 }
 
 // ---- free helpers ---------------------------------------------------------
+
+/// Append every byte or report `OutOfMemory`; the outgoing buffer is the one
+/// place a preface's bytes can fail to fit.
+function push_all(out: Array<u8>*, bytes: Slice<u8>) -> Result<(), IoError> {
+    match (out.try_append(bytes)) {
+        Result::Ok(_)  => { return Result::Ok(()); }
+        Result::Err(_) => { return Result::Err(IoError::new(IoErrorKind::OutOfMemory, 0)); }
+    }
+}
 
 /// The connection preface octets. Built inline because a module-level
 /// `const Str` initialised from a literal is unreliable at runtime.

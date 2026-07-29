@@ -182,6 +182,89 @@ type struct CallResolver {
 
     /// Arity-matching method overloads' non-receiver param types for `member`, as
     /// an expected-type hint (a position-wise merge where all overloads agree).
+    /// Declared parameter types of `method_name` on the GENERIC TEMPLATE whose
+    /// uninstantiated arena type is `base`, read from the template's own AST.
+    ///
+    /// A template's arena node holds no methods: TypeResolution skips generic
+    /// declarations, because their field and parameter types still mention
+    /// unbound parameters and baking those in would size the type wrongly. Only
+    /// the specializations get populated, and they do not exist while the
+    /// symbolic walk is still looking at the template. The declaration does.
+    ///
+    /// The types handed back may still mention the template's own parameters.
+    /// That is enough for what this feeds — `classify_args_from_params` asks
+    /// only whether a parameter is a reference or a pointer, and substituting
+    /// type arguments never changes that. A parameter whose type has not been
+    /// resolved at all comes back invalid, which that caller already skips, so
+    /// such a slot is left exactly as unclassified as it was before.
+    ///
+    /// Both places a template's instance methods can be declared are searched:
+    /// its own body, and any `implement` block registered against it.
+    param_types_from_template_decl(mut &this, base: TypeRef, method_name: SymbolStr,
+                                   arg_count: i64) -> TypeRef[] {
+        const greg: GenericRegistry* = this.ctx.generic_registry;
+        if (greg == null || !base.is_valid()) { return []; }
+        const bt: Type* = this.arena.lookup(base.id);
+        if (bt == null) { return []; }
+        mut owner: SymbolStr = SymbolStr::empty();
+        if (bt.kind == TypeKind::Struct) {
+            owner = (bt as StructType*).qualified_name;
+        } else if (bt.kind == TypeKind::Class) {
+            owner = (bt as ClassType*).qualified_name;
+        } else {
+            return [];
+        }
+        const tmpl: TemplateEntry* = greg.get_template(owner);
+        if (tmpl == null) { return []; }
+
+        if (tmpl.ast_node != null) {
+            if (tmpl.node_kind == NodeKind::StructDeclaration) {
+                const r: TypeRef[] = this.scan_decl_method_param_types(
+                    &(tmpl.ast_node as StructDeclNode*).methods, method_name, arg_count);
+                if (r.length > 0) { return r; }
+            } else if (tmpl.node_kind == NodeKind::ClassDeclaration) {
+                const r: TypeRef[] = this.scan_decl_method_param_types(
+                    &(tmpl.ast_node as ClassDeclNode*).methods, method_name, arg_count);
+                if (r.length > 0) { return r; }
+            }
+        }
+        for (mut i: i64 = 0; i < tmpl.impl_blocks.length; i++) {
+            const ib: ImplBlockNode* = tmpl.impl_blocks[i];
+            if (ib == null) { continue; }
+            const r: TypeRef[] = this.scan_decl_method_param_types(
+                &ib.methods, method_name, arg_count);
+            if (r.length > 0) { return r; }
+        }
+        return [];
+    }
+
+    /// The non-self parameter types of the first method in `methods` named
+    /// `method_name` and taking `arg_count` of them. The receiver is excluded,
+    /// because `MethodInfo.param_types` is by contract the non-self parameters
+    /// and this stands in for it.
+    scan_decl_method_param_types(mut &this, methods: &MethodNode*[],
+                                 method_name: SymbolStr, arg_count: i64) -> TypeRef[] {
+        const this_amp: SymbolStr = this.ctx.intern_table.intern("&this");
+        const this_val: SymbolStr = this.ctx.intern_table.intern("this");
+        for (mut i: i64 = 0; i < methods.length; i++) {
+            const mnode: MethodNode* = methods[i];
+            if (mnode == null || mnode.func == null) { continue; }
+            const fn_node: FunctionDeclNode* = mnode.func;
+            if (!fn_node.name.equals(method_name)) { continue; }
+            mut ptypes: TypeRef[] = [];
+            for (mut pi: i64 = 0; pi < fn_node.parameters.length; pi++) {
+                const pp: VarDeclNode* = fn_node.parameters[pi];
+                if (pp == null) { continue; }
+                if (pp.name.equals(this_amp)) { continue; }
+                if (pp.name.equals(this_val)) { continue; }
+                ptypes.push(pp.resolved_type);
+            }
+            if (ptypes.length != arg_count) { continue; }
+            return ptypes;
+        }
+        return [];
+    }
+
     lookup_method_param_types(mut &this, visitor: ASTVisitor*, member: MemberAccessNode*,
                               arg_count: i64) -> TypeRef[] {
         const obj_type: TypeRef = this.dispatch.resolve_expr(visitor, member.object);
@@ -194,8 +277,29 @@ type struct CallResolver {
                 TypeKind::Reference => { base_t = this.arena.lookup((base_t as ReferenceType*).referent.id); }
                 TypeKind::InstantiatedType => {
                     const inst: InstantiatedType* = base_t as InstantiatedType*;
-                    if (!inst.has_resolved_type()) { break; }
-                    base_t = this.arena.lookup(inst.resolved_type.id);
+                    if (inst.has_resolved_type()) {
+                        base_t = this.arena.lookup(inst.resolved_type.id);
+                    } else {
+                        // A SYMBOLIC instantiation - `Gen<S>` seen from inside
+                        // `Gen<S>`'s own body - has no resolved type: nothing has
+                        // monomorphized it yet, and its arena node carries no
+                        // methods either, because TypeResolution skips generic
+                        // declarations outright. Its DECLARATION is the only place
+                        // the signature exists yet, so read it from there.
+                        //
+                        // Left unhandled this returned NO parameter types, so every
+                        // argument of `this.m(x)` inside a generic owner's own body
+                        // stayed `Unclassified` - and the two consumers of that
+                        // default disagree by design: the async substitution reads
+                        // an unclassified by-value argument as a BORROW and emits a
+                        // pointer read, which the move passes then see as moving an
+                        // owning value out of a pointer (E0453). Same failure, same
+                        // cause and same fix as the `GenericParam` arm below, one
+                        // level out: there the receiver IS a generic parameter,
+                        // here it is an instantiation mentioning one.
+                        return this.param_types_from_template_decl(
+                            inst.generic_base, member.member, arg_count);
+                    }
                 }
                 _ => { break; }
             }

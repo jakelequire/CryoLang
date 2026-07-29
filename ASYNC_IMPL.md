@@ -47,7 +47,7 @@ not for routine judgement calls.
 | 6 | `await` in a `match`-arm guard | ✅ DONE+validated 2026-07-25 — the last rejected `await` position. Such a `match` lowers to a DECISION CHAIN (one test state per arm, a false guard falling to the next test) instead of the single dispatch, which every other `match` keeps. Subject evaluated once into a chain-owned field; fall-through arm emitted only when the arm can fail to match; `hoist_match_expr`'s matching bail-out removed so the expression form works too. 14 tests. **One sub-case rejected with a precise diagnostic rather than lowered:** an arm binding an OWNING payload out of the subject, which a later test would then re-match hollowed-out. |
 
 | 5b-tls | Async TLS (the port's prerequisite) | ✅ DONE+validated 2026-07-25. `stdlib/net/tls/future.cryo`: `TlsHandshake` / `TlsRead` / `TlsWrite` / `TlsIo`, plus `TlsConnector::connect_async` and `TlsAcceptor::accept_async`. Each `WANT_READ`/`WANT_WRITE` becomes a reactor registration rather than a spin; the interest to arm is read off the SSL error code (a read CAN want writability), and each future records the one direction it armed so its `Drop` cancels only that half. Sound only because §5a made the read/write futures own their buffer — OpenSSL requires a `WANT_*` retry to repeat the same call with the SAME arguments, and a future moves between polls. 1 test: loopback handshake + encrypted echo with **both sides as tasks on ONE `Executor`**, which the blocking TLS test cannot do (it needs a thread, or `SSL_connect` blocks before `SSL_accept` runs). |
-| 5b-port | Socket port + delete the blocking surface | ◐ IN PROGRESS — **increment 5 (`net/ws`) LANDED 2026-07-28, 5/5 green, and the two borrow-across-a-suspend defects that blocked it are FIXED.** (a) A non-owning view (`Str`/`Slice`) borrowed from a local and handed to an awaited call was dropped with the block that built the future, not with the local's source scope — silent use-after-free, pre-existing, reproducible under the pin in 40 lines, and reaching every `async` fn with a view parameter. `promote_cross_state` used "read in a LATER state" as its liveness proxy, and the last mention of `msg` in `await consume(msg.as_str())` sits in the DECLARING block. Fixed by recording each awaited operand (`PollSm.borrow_ops`) and carrying any mentioned local that has a destructor, so its drop moves past the suspension — Jake's calls: conservative promotion rather than a diagnostic, scoped to frame locals and parameters. (b) A pointer taken through a CALL (`ws.connection()`) addressed a STALE copy once its owner was carried: writes landed on a copy the later states had stopped reading. Reduced to 40 lines returning `11012011` instead of `11012013`. No silent repair exists — the address changes, not the lifetime — so `call_frame_addr_root` now treats such a call as the address-of it is, the existing `&local` rule applied to a form the syntactic walk could not see (Jake's call). New negative `E0455_async_pointer_from_accessor.cryo`. **LANDMINE: the previous session's hermetic ws verification (mock `AsyncTransport`) passed all five shapes while the real-socket pipelined test HUNG — a transport double cannot exhibit (b) at all.** 9 new stress tests + 5 ws tests; `make test` **1875 / 160 / 14, 0 failed**. Remaining: `net/http2/{client,server,connection}` (`connection.cryo` is 855 lines and BORROWS its transport, so (b) applies directly), then delete the blocking surface (KEEP `TcpListener::bind`). Earlier that day: **its blocker was root-caused and TWO async-lowering bugs were fixed.** The previously-recorded axis (a generic-owner method whose suspensions are DEFAULT trait methods on `this`) is **WRONG** — every part of it reduces GREEN. The real triggers were (1) **the `?` operator**: sema builds the `?` desugar with the match's SUBJECT and the `?`'s `operand` as the SAME node, and the async lowering's two in-place rewrites (`hoist_expr` lifting the `await` out, `subst_name_expr` promoting a local) replaced the subject and left `operand` naming the pre-rewrite tree, which the resolver still walks — so `(await f(local))?` was rejected outright (E0201). Fixed by `TryExprNode::resync_operand()`. (2) **a carried value with no destructor was never handed back**: `last_use_consumes` read "gave the value away" off the syntax alone, so a by-value READ of a payload-free enum / scalar-only struct / `Slice` — a COPY, not a move — suppressed the hand-back and the next state's `take().unwrap()` found `None`. Fixed by gating on `OwnershipQuery::needs_drop`, conservative for anything abstract. 9 new tests. Finding 2 (E0636 on a generic method whose receiver mentions the enclosing generic param) is reproduced, reduced to 50 SYNC lines, traced to two specific places (sema never stashes the method type args; mono cannot recover the receiver type in a spec body) and deliberately left unfixed — independent of async, and not on the port's critical path. Findings 4 and 5 could NOT be reproduced. See the newest §9 entry. Earlier: **increment 4 DONE 2026-07-28: `net/https.cryo` async on `BufStream<TlsStream>`, and the blocking TLS twins deleted in the same increment** (`TlsConnector::connect` / `TlsAcceptor::accept` ARE the async ones; the old `*_async` pair is renamed `start_connect` / `start_accept` for callers that must own the handshake future; `drive_handshake` and `client::send_over` deleted). `net_https.cryo` rewritten onto the async stack and now covers the shipped `HttpsClient`, which previously had NONE. `net_tls.cryo` deleted — its whole subject was the blocking surface and its behaviour is already asserted by `net_tls_async`. Remaining: `net/ws/conn.cryo`, then `net/http2/*`. Earlier: **increment 3 DONE 2026-07-28: `net/http/server.cryo` on the async transport.** `async run` / `run_on(listener)` / `serve_connection(conn)` taking the connection BY VALUE; `BufConn<S>` renamed **`BufStream<S>`**; `HttpConn` trait replaced by a cross-module inherent impl (Jake's call — protocol state ⇒ owning wrapper, stateless framing ⇒ inherent impl). Two compiler fixes: the **transitive receiver refresh** (a combinator-wrapped `async` method silently skipped it — the field path comes from the constructing static's DECLARATION, since the awaited `Timeout` is an `InstantiatedType` whose template has zero fields at lowering time) and a **scalar narrowing of the frame-address check**. **selfhost-check: TWO `FIXED POINT OK`; repin taken and verified — the pin now carries the compiler fixes.** 4 new server tests. Of the three findings that increment opened, (1) is **CLOSED**: `async_branch_owning_local` was red because several state blocks binding one carried local shared ONE drop flag while owning separate storage. Both halves are fixed — declaring states bind a fresh name each, and drop flags are now keyed per DECLARATION rather than by name (`binding_dropflags`, `passes/drop_insertion.cryo`), which closes the taking side too. **`HttpServer::with_read_timeout` is ENFORCED again.** Still open: (2) the transitive refresh does not reach generic contexts (`resolved_template` unset in a symbolic walk) — rejects loudly rather than miscompiling; (3) `this` in an if-EXPRESSION initializer resolves to the generated Future. Still to port: `net/https.cryo`, `net/ws/conn.cryo`, `net/http2/*`, then delete the blocking surface. Earlier: **increment 2 DONE 2026-07-28: `net/http` HTTP/1.1 framing on `BufStream<S>`.** Sync encoders (`Headers`/`Request`/`Response::encode_into` into an `Array<u8>*`), grammar extracted once (`from_request_line` / `from_status_line`, shared with the blocking `parse` during the migration), async readers as METHODS on the connection (`net/http/conn.cryo`, `type trait HttpConn` implemented for `BufStream<S>`), and `Client::get`/`post`/`send` now `async` over `TcpConnect::start`. **Two async-lowering bugs fixed at the root** — (1) a `return` in ONE `if`/`match` branch made a state disown a carried aggregate on paths that never ran (unwrap-on-`None`); (2) **PRE-EXISTING and the real blocker: the receiver refresh was silently skipped for an `async` TRAIT method on a GENERIC receiver, so NO `BufStream<S>` could survive more than one write-then-read cycle** (socket swapped back into dead stack memory → `EBADF`). Nothing caught it because every existing test flushed at most once per connection. 8 new tests in `net_http_conn.cryo`, all asserting numbers (incl. a FILL COUNT of exactly 1 for two pipelined responses, with a one-byte-per-fill control). `make test` 1846/1846 + 159 compile-fail + 14 projects PASS. **Repin owed (compiler changed); selfhost-check not yet run.** Still to port: `net/http/server.cryo`, `net/https.cryo`, `net/ws/conn.cryo`, `net/http2/*`, then delete the blocking surface. Earlier: **increment 1 DONE 2026-07-27** (one generic `BufStream<S>` over an `AsyncTransport` seam; `TcpConn` deleted; `io::async_traits` and `io::buf_conn` dissolved into `io::traits` / `io::buf` per Jake's module-structure ruling; needed one compiler fix — a trait `async` default body could not await a required method when the impl was on a GENERIC owner. See the newest §9 entry). Consumers NOT yet ported. Earlier: gated on 5c (async trait methods), per Jake's 2026-07-26 call. Remaining: port `net/http/{client,server}`, `net/http2/{client,server,connection}`, `net/https.cryo`, `net/ws/conn.cryo`, then delete `TcpStream::connect/read/write`, `TcpListener::bind/accept` and the blocking TLS entry points. One-way API break: every `HttpClient::get`-shaped call becomes `async`. **Re-derived consumer list (2026-07-26): far smaller than "19 files" — most of the greps that produced that count are doc-comment mentions. `net/dns.cryo`, `net/addr/ip.cryo` and `net/socket/udp.cryo` name `TcpStream` ONLY in prose and need no port.** **Scope correction (2026-07-26): there are no `AsyncRead`/`AsyncWrite` traits in the tree yet** — the async surface is concrete futures (`TcpRead`/`TcpWrite`/`TlsRead`/`TlsWrite`), so step 1 of the port is to DESIGN those traits, not to retarget onto existing ones. The shape follows from two settled constraints: the future must OWN the buffer (§5a — a caller-frame `u8*` is written through a stale address), while the transport may now stay in `mut &this` (§5d makes a receiver held across a suspend sound), i.e. `async read(mut &this, buf: Array<u8>) -> AsyncIo` handing the buffer back the way `TcpIo::take_buf()` already does. The blocking `io::Read`/`io::Write` take `u8*` / `Slice<u8>`, so they cannot simply be mirrored. ~3,300 non-comment lines of consumer code plus tests. **Unblocked 2026-07-26 by 5f** — `?` did not work in any `async` function, which no amount of stdlib care would have worked around; the trait shape above is now proven to compile AND run (see 5f). Writing the traits into `stdlib/` is the next step and has NOT been done. |
+| 5b-port | Socket port + delete the blocking surface | ✅ **DONE 2026-07-29 — `net/http2` ported and the blocking surface DELETED. `net` is fully async.** `Http2Connection<S>` now OWNS a `BufStream<S>` (it borrowed an `S*`), reads are `async` inherent methods on `BufStream<S>` (`read_h2_frame`, named apart because `ws::frame` already owns `read_frame` on that type), and the whole write side is SYNCHRONOUS — `queue_settings` / `queue_header_block` / `queue_ack_data` / `process_control` only append to `pending()`, so a HEADERS block plus its CONTINUATION fragments is assembled with no suspension inside it and goes out in one `flush`. `send_body` takes the body BY VALUE for a real reason: a `Slice<u8>` into a caller's array would be a borrowed view crossing every window wait, so the slice is re-derived from the future's own storage after each one. DELETED: `TcpStream::connect`, both `Read`/`Write` impls for `TcpStream`, both for `TlsStream`, `TcpListener::accept`, `TcpStream::set_read_timeout`/`set_write_timeout` (they bounded a blocking read that no longer exists), `Headers/Request/Response::write_to`, `Request/Response::parse`, `request::read_line`. **`TcpListener::bind` KEPT** (binding does not wait). **One compiler bug found and fixed at the root — see the newest §9 entry:** an owning value handed BY VALUE to an `async` method of a GENERIC owner was refused with `E0453`, because `lookup_method_param_types` returned nothing for a receiver whose type is a symbolic `InstantiatedType`, so every such argument stayed `Unclassified` — and the two consumers of that default disagree by design. **2-PHASE REPIN.** Phase 1 (compiler alone, clean stdlib): `make test` **1920 / 166 / 14, 0 failed**, TWO `FIXED POINT OK`, pinned + verified. Phase 2 (the port): `make test` **1924 / 166 / 14, 0 failed**. 5 new h2c loopback tests over REAL sockets — 100 KB echoed through connection-window exhaustion, a header block split across CONTINUATION frames, 4 sequential requests on one connection, and a clean client close read as end-of-stream; 3 blocking-surface tests ported to the async path rather than deleted. Earlier: **increment 5 (`net/ws`) LANDED 2026-07-28, 5/5 green, and the two borrow-across-a-suspend defects that blocked it are FIXED.** (a) A non-owning view (`Str`/`Slice`) borrowed from a local and handed to an awaited call was dropped with the block that built the future, not with the local's source scope — silent use-after-free, pre-existing, reproducible under the pin in 40 lines, and reaching every `async` fn with a view parameter. `promote_cross_state` used "read in a LATER state" as its liveness proxy, and the last mention of `msg` in `await consume(msg.as_str())` sits in the DECLARING block. Fixed by recording each awaited operand (`PollSm.borrow_ops`) and carrying any mentioned local that has a destructor, so its drop moves past the suspension — Jake's calls: conservative promotion rather than a diagnostic, scoped to frame locals and parameters. (b) A pointer taken through a CALL (`ws.connection()`) addressed a STALE copy once its owner was carried: writes landed on a copy the later states had stopped reading. Reduced to 40 lines returning `11012011` instead of `11012013`. No silent repair exists — the address changes, not the lifetime — so `call_frame_addr_root` now treats such a call as the address-of it is, the existing `&local` rule applied to a form the syntactic walk could not see (Jake's call). New negative `E0455_async_pointer_from_accessor.cryo`. **LANDMINE: the previous session's hermetic ws verification (mock `AsyncTransport`) passed all five shapes while the real-socket pipelined test HUNG — a transport double cannot exhibit (b) at all.** 9 new stress tests + 5 ws tests; `make test` **1875 / 160 / 14, 0 failed**. Remaining: `net/http2/{client,server,connection}` (`connection.cryo` is 855 lines and BORROWS its transport, so (b) applies directly), then delete the blocking surface (KEEP `TcpListener::bind`). Earlier that day: **its blocker was root-caused and TWO async-lowering bugs were fixed.** The previously-recorded axis (a generic-owner method whose suspensions are DEFAULT trait methods on `this`) is **WRONG** — every part of it reduces GREEN. The real triggers were (1) **the `?` operator**: sema builds the `?` desugar with the match's SUBJECT and the `?`'s `operand` as the SAME node, and the async lowering's two in-place rewrites (`hoist_expr` lifting the `await` out, `subst_name_expr` promoting a local) replaced the subject and left `operand` naming the pre-rewrite tree, which the resolver still walks — so `(await f(local))?` was rejected outright (E0201). Fixed by `TryExprNode::resync_operand()`. (2) **a carried value with no destructor was never handed back**: `last_use_consumes` read "gave the value away" off the syntax alone, so a by-value READ of a payload-free enum / scalar-only struct / `Slice` — a COPY, not a move — suppressed the hand-back and the next state's `take().unwrap()` found `None`. Fixed by gating on `OwnershipQuery::needs_drop`, conservative for anything abstract. 9 new tests. Finding 2 (E0636 on a generic method whose receiver mentions the enclosing generic param) is reproduced, reduced to 50 SYNC lines, traced to two specific places (sema never stashes the method type args; mono cannot recover the receiver type in a spec body) and deliberately left unfixed — independent of async, and not on the port's critical path. Findings 4 and 5 could NOT be reproduced. See the newest §9 entry. Earlier: **increment 4 DONE 2026-07-28: `net/https.cryo` async on `BufStream<TlsStream>`, and the blocking TLS twins deleted in the same increment** (`TlsConnector::connect` / `TlsAcceptor::accept` ARE the async ones; the old `*_async` pair is renamed `start_connect` / `start_accept` for callers that must own the handshake future; `drive_handshake` and `client::send_over` deleted). `net_https.cryo` rewritten onto the async stack and now covers the shipped `HttpsClient`, which previously had NONE. `net_tls.cryo` deleted — its whole subject was the blocking surface and its behaviour is already asserted by `net_tls_async`. Remaining: `net/ws/conn.cryo`, then `net/http2/*`. Earlier: **increment 3 DONE 2026-07-28: `net/http/server.cryo` on the async transport.** `async run` / `run_on(listener)` / `serve_connection(conn)` taking the connection BY VALUE; `BufConn<S>` renamed **`BufStream<S>`**; `HttpConn` trait replaced by a cross-module inherent impl (Jake's call — protocol state ⇒ owning wrapper, stateless framing ⇒ inherent impl). Two compiler fixes: the **transitive receiver refresh** (a combinator-wrapped `async` method silently skipped it — the field path comes from the constructing static's DECLARATION, since the awaited `Timeout` is an `InstantiatedType` whose template has zero fields at lowering time) and a **scalar narrowing of the frame-address check**. **selfhost-check: TWO `FIXED POINT OK`; repin taken and verified — the pin now carries the compiler fixes.** 4 new server tests. Of the three findings that increment opened, (1) is **CLOSED**: `async_branch_owning_local` was red because several state blocks binding one carried local shared ONE drop flag while owning separate storage. Both halves are fixed — declaring states bind a fresh name each, and drop flags are now keyed per DECLARATION rather than by name (`binding_dropflags`, `passes/drop_insertion.cryo`), which closes the taking side too. **`HttpServer::with_read_timeout` is ENFORCED again.** Still open: (2) the transitive refresh does not reach generic contexts (`resolved_template` unset in a symbolic walk) — rejects loudly rather than miscompiling; (3) `this` in an if-EXPRESSION initializer resolves to the generated Future. Still to port: `net/https.cryo`, `net/ws/conn.cryo`, `net/http2/*`, then delete the blocking surface. Earlier: **increment 2 DONE 2026-07-28: `net/http` HTTP/1.1 framing on `BufStream<S>`.** Sync encoders (`Headers`/`Request`/`Response::encode_into` into an `Array<u8>*`), grammar extracted once (`from_request_line` / `from_status_line`, shared with the blocking `parse` during the migration), async readers as METHODS on the connection (`net/http/conn.cryo`, `type trait HttpConn` implemented for `BufStream<S>`), and `Client::get`/`post`/`send` now `async` over `TcpConnect::start`. **Two async-lowering bugs fixed at the root** — (1) a `return` in ONE `if`/`match` branch made a state disown a carried aggregate on paths that never ran (unwrap-on-`None`); (2) **PRE-EXISTING and the real blocker: the receiver refresh was silently skipped for an `async` TRAIT method on a GENERIC receiver, so NO `BufStream<S>` could survive more than one write-then-read cycle** (socket swapped back into dead stack memory → `EBADF`). Nothing caught it because every existing test flushed at most once per connection. 8 new tests in `net_http_conn.cryo`, all asserting numbers (incl. a FILL COUNT of exactly 1 for two pipelined responses, with a one-byte-per-fill control). `make test` 1846/1846 + 159 compile-fail + 14 projects PASS. **Repin owed (compiler changed); selfhost-check not yet run.** Still to port: `net/http/server.cryo`, `net/https.cryo`, `net/ws/conn.cryo`, `net/http2/*`, then delete the blocking surface. Earlier: **increment 1 DONE 2026-07-27** (one generic `BufStream<S>` over an `AsyncTransport` seam; `TcpConn` deleted; `io::async_traits` and `io::buf_conn` dissolved into `io::traits` / `io::buf` per Jake's module-structure ruling; needed one compiler fix — a trait `async` default body could not await a required method when the impl was on a GENERIC owner. See the newest §9 entry). Consumers NOT yet ported. Earlier: gated on 5c (async trait methods), per Jake's 2026-07-26 call. Remaining: port `net/http/{client,server}`, `net/http2/{client,server,connection}`, `net/https.cryo`, `net/ws/conn.cryo`, then delete `TcpStream::connect/read/write`, `TcpListener::bind/accept` and the blocking TLS entry points. One-way API break: every `HttpClient::get`-shaped call becomes `async`. **Re-derived consumer list (2026-07-26): far smaller than "19 files" — most of the greps that produced that count are doc-comment mentions. `net/dns.cryo`, `net/addr/ip.cryo` and `net/socket/udp.cryo` name `TcpStream` ONLY in prose and need no port.** **Scope correction (2026-07-26): there are no `AsyncRead`/`AsyncWrite` traits in the tree yet** — the async surface is concrete futures (`TcpRead`/`TcpWrite`/`TlsRead`/`TlsWrite`), so step 1 of the port is to DESIGN those traits, not to retarget onto existing ones. The shape follows from two settled constraints: the future must OWN the buffer (§5a — a caller-frame `u8*` is written through a stale address), while the transport may now stay in `mut &this` (§5d makes a receiver held across a suspend sound), i.e. `async read(mut &this, buf: Array<u8>) -> AsyncIo` handing the buffer back the way `TcpIo::take_buf()` already does. The blocking `io::Read`/`io::Write` take `u8*` / `Slice<u8>`, so they cannot simply be mirrored. ~3,300 non-comment lines of consumer code plus tests. **Unblocked 2026-07-26 by 5f** — `?` did not work in any `async` function, which no amount of stdlib care would have worked around; the trait shape above is now proven to compile AND run (see 5f). Writing the traits into `stdlib/` is the next step and has NOT been done. |
 | 5c | Async trait methods (the port's prerequisite) | ✅ DONE+validated 2026-07-26. First the **three blocking projection gaps — six defects** — were fixed across parser/sema/type-resolver/mono, so projection-typed dispatch, `block_on` on a projection and `await` on a projection all work. Then the feature itself: `E0364` lifted for trait methods (`virtual`/`override` still rejected), `desugar_async_trait_methods` synthesizing the implicit `<Method>Fut` + projection return, `bind_async_trait_assoc` binding each impl's own future, and E0309 taught the binding is implicit. **Default bodies included** — they cost almost nothing because `synthesize_default_trait_methods` already clones them per-impl, so no future generic over `This` was needed. 6 tests; the obsolete `E0364_async_trait_method` negative deleted. Two §9 entries. **Jake chose this** over poll-traits-plus-adapters and over de-genericizing to an `AsyncStream` union. Forced by two facts: `Http2Connection<S>` / `WebSocket<S>` hold `inner: S*` (BORROWED — `E0455` rejects that across a suspend, so the transport must be owned), and `async` on a trait method is currently rejected outright (`E0364`, parser). Design: `async read(&this, n) -> T` desugars to an implicit associated type plus a projection return (`type ReadFut; read(&this, n) -> This::ReadFut`), each impl binding it to its own synthesized future via the existing positional trait-arg sugar. Jake's scope calls (2026-07-26): default bodies ARE in scope (one future generic over `This`), and `S: AsyncRead` alone must IMPLY the future's bound — the latter already works as a consequence of the gap fixes, verified by a probe carrying only `where S: AsyncRead`. |
 
 | 5d | Receiver-pointer refresh at resume (soundness hole opened by 5c) | ✅ DONE+validated 2026-07-26. An `async` method with a `&this` / `mut &this` receiver stores the receiver's ADDRESS in a `this$recv` field of the future it lowers to, written once at construction. That contradicted §4's load-bearing invariant (no self-references ⇒ futures freely movable ⇒ **no address-stability requirement**) and design-review item 6, which says this exact shape must be `E0455`. It was also wrong for a reason stronger than movability: an owning receiver promoted across states is **taken into a fresh block-local on every poll** and handed back on the way out, so the address legitimately changes each poll. Jake chose refresh-at-resume over making the sugar consuming or adopting an address-stability contract. `lower_carrier_sm` now re-addresses `this$recv` from the enclosing frame's own storage immediately before every poll (single site — there is exactly one sub-future stash/poll point). A receiver reached through a pointer is passed through rather than addressed twice. Two shapes that cannot be re-addressed are now rejected instead of silently corrupting: a receiver that names no storage (temporary / call result), and awaiting a method future the awaited expression did not itself produce. 4 tests + 2 negatives. **Proof:** a probe polling by hand and dirtying the stack between polls returns `15`/garbage pre-fix and the correct values post-fix (pre-fix `FAILMASK=11`, post-fix `0`), and the emitted IR shows `store ptr %h, ptr %fieldptr` into `this$recv` ahead of the poll. |
@@ -4813,4 +4813,192 @@ Roster merged with `--merge`, 1911 entries, the Windows-only entry kept.
 The use-after-give-away-inside-one-state gap from the entry above is to be closed by **hoisting the take
 into a named local at the give-away site**, so MoveCheck sees an ordinary move and its existing
 flow-sensitive tracking reports E0452 unchanged. Rejected: re-implementing flow reasoning inside the
-lowering, which would be a second, weaker move analysis in a different pass. Not yet implemented.
+lowering, which would be a second, weaker move analysis in a different pass.
+
+## 2026-07-29 (later still) — the E0452 give-away gap is CLOSED for the straight-line case
+
+`d32f4771`. Jake's decision above, implemented — with one correction found before writing any of it.
+
+### Hoisting ALONE does not close the gap
+
+A by-value mention becomes the take, but a BORROW mention returns `subst_target`, which in
+`subst_to_local_deref` mode is `*<nm>$p` **unconditionally**, with no knowledge that a give-away already
+happened. So `foo(c); bar(&c);` would lower to `mut __gv = ...take().unwrap(); foo(__gv); bar(&(*c$p));`
+— the borrow never mentions the hoisted local and MoveCheck still cannot connect them. The hoisted local
+has to BECOME the representation for the rest of the run, which also fixes a latent bad READ: after a
+take the field is empty, so `*c$p` was reading emptied storage. Jake approved the expanded version.
+
+### What landed
+
+- `hoist_giveaway` records `mut <nm>$gv<N> = this.<carrier>.take().unwrap();` for the enclosing statement
+  list to splice in ahead of the current statement, and returns the local in the mention's place.
+- `subst_hoist_name` then stands in for the value in **every** position, so a second by-value use is an
+  ordinary double move and a later borrow an ordinary use-after-move. `E0452` comes from the existing
+  pass rather than being re-derived.
+- A whole-value rebuild republishes the field and CLEARS the hoist.
+- `subst_can_hoist` is a structural guard: a hoist exists only while `subst_stmt_list` is the immediate
+  driver, i.e. exactly when a list is standing by to receive the declaration.
+
+**Two conservative limits, each forgoing an improvement and neither able to break working code:** a
+statement containing an `await` is skipped (it is torn across state blocks), and the rebinding never
+crosses into a nested construct. The conditional and cross-state forms are therefore exactly as before —
+cross-state remains a loud `unwrap`-on-`None`, not silent.
+
+### The bug that nearly killed it, and the belief it corrected
+
+The first build failed the stdlib with `cannot find value 'got$L17$gv3'`. I attributed it to
+`prepend_agg_take`'s documented *"state blocks share AST statement nodes"* and reverted. **Measured, that
+was wrong here:** dumping the address of every top-level statement in each state block of
+`serve_connection` gave all-distinct addresses across blocks 1, 5, 6, 7.
+
+The real cause was in the new helper. `subst_stmt_list` nulls the pending-declaration slot before each
+statement, so when the `match (got)` subject hoisted and the walk descended into an arm body, the INNER
+`subst_stmt_list` cleared the OUTER statement's pending declaration — dropped, while `m.subject` had
+already been rebound to it. Fixed by saving and restoring the caller's pending slot across the walk.
+Lesson recorded in the handoff: instrument before theorising, and **stash rather than revert**.
+
+### Diagnostic quality
+
+The first cut reported at `async function drive()`, because every synthesized node inherits the async
+function's span and MoveCheck reports a move at the span of the node that made it. The hoisted
+declaration and the rebound identifier now carry the **mention's** span, so the error lands on the
+offending line with the caret under the value.
+
+### Tests
+
+`negative/E0452_async_giveaway_then_borrow_same_state.cryo` (0 diagnostics under the old pin), and
+`lang/async_giveaway_use_after_move_controls.cryo` — five shapes that must all still compile AND run with
+asserted drop counts: give-away with no later use, borrow-only, give-away then rebuild, and give-away on
+one branch driven both ways. The controls are the load-bearing half: over-rejecting is the easy way to
+make the negative pass and the wrong one.
+
+### Gates
+
+`make test` → **1915 unit / 0 failed, compile-fail 166, projects 14** (Linux). `make selfhost-check` →
+exit 0, **two** `FIXED POINT OK`. `make pin` taken, both halves, sidecars a matched pair at
+`5de98212-dirty` (the pin predates Jake's commit of this work; content is correct).
+**`make verify-pin` was NOT run** — the harness's shell went unavailable at that moment. It is the first
+action in the handoff.
+
+## 2026-07-29 (later still) — `net/http2` ported; the blocking surface is GONE; one compiler bug root-caused
+
+`net` is now async end to end. The last consumer was `net/http2/{client,server,connection}`.
+
+### The shape, and why each part of it is forced
+
+`Http2Connection<S>` **owns** a `BufStream<S>` where it used to hold `inner: S*`. Owning is not a
+preference: the type carries per-connection protocol state (the HPACK tables, both flow-control windows,
+the next stream id), an `async` method may only re-address its OWN receiver between polls, and handing a
+caller's local address to a future that outlives the current poll is refused outright (E0455). A borrowed
+transport would be a second address the state machine has no way to refresh. Same conclusion `WebSocket<S>`
+reached, so `http`, `ws` and `http2` now present ONE connection shape.
+
+Reads are `async` inherent methods on `BufStream<S>`, declared from the http2 module — `read_h2_frame`,
+named apart from `ws::frame`'s `read_frame` because `BufStream<S>` hosts the framing for three protocols
+and two inherent methods cannot share a name on one type. The nine header bytes are copied into scalars
+and consumed before the payload's suspension, so no `buffered()` view is live when a fill can move it.
+
+The whole write side is **synchronous**: `queue_settings`, `queue_header_block`, `queue_ack_data` and
+`process_control` only append to `pending()`. Two things fall out. A HEADERS block and every CONTINUATION
+fragment it needs are assembled with no suspension between them, so a peer can never see a header block
+interleaved with anything else. And `process_control` — which owes the peer a SETTINGS or PING ack — no
+longer needs its borrowed `&Frame` to survive a suspension: it queues, the caller drops the frame, and the
+caller flushes. Every read loop calls it without one.
+
+`send_body` takes the body **by value**. A `Slice<u8>` into the caller's array would be a borrowed view
+crossing every iteration of the window wait; owning the bytes means the slice is re-derived from this
+future's own storage after each suspension and consumed by a synchronous queue before the next. It also
+flushes unconditionally, including for an empty body, because the caller's header block is queued behind it
+— which is what lets `request`/`send_response` cost ONE suspension for a bodyless message.
+
+### Deleted
+
+`TcpStream::connect`, `implement trait Read/Write for TcpStream`, both impls for `TlsStream`,
+`TcpListener::accept`, and `TcpStream::set_read_timeout`/`set_write_timeout` — those last two existed only
+to bound a blocking read, and documented an effect that is now impossible. Plus the transitional HTTP/1.1
+duplicates: `Headers/Request/Response::write_to`, `Request/Response::parse`, `request::read_line`.
+**`TcpListener::bind` is KEPT**, per Jake: binding does not wait.
+
+### The compiler bug: an owning argument to an async method of a generic owner
+
+The port hit four `E0453` "cannot move a value that owns a destructor out of a pointer", every one reported
+at the enclosing `async` function's HEADER rather than at any statement — the synthesized-node span
+landmine again. Bisecting by construction across six probes isolated the axis exactly:
+
+| owner | callee | result |
+| --- | --- | --- |
+| non-generic | method on `this` | compiles |
+| generic | free function | compiles |
+| **generic** | **method on `this`** | **E0453** |
+
+Not the `where` bound, and not method-vs-free-function: the combination. `cdebug` on
+`lookup_method_param_types` showed the receiver's type arriving as `TypeKind::InstantiatedType` and falling
+into the final `else { return [] }`. Peeling to `generic_base` was not enough — the TEMPLATE's arena node
+carries **zero** methods (`probe5::Gen` id 206, 0 methods; `Gen<TcpStream>` id 2550, 8), because
+`TypeResolution` skips generic declarations outright: their field and parameter types still mention unbound
+parameters and baking those in would size the type wrongly.
+
+So `classify_args_from_params` was never reached and every argument of `this.m(x)` inside a generic owner's
+body stayed `Unclassified` — and `async_lower.cryo` says in its own comment that the two consumers of that
+default disagree deliberately: the substitution reads an unclassified by-value argument as a **borrow** and
+emits a pointer read, "whereas leaving an owning argument aliased surfaces as `E0453` at compile time".
+**The diagnostic was the designed signal that sema had a hole**, so the fix belongs in the classification,
+not in http2 and not in the lowering.
+
+`param_types_from_template_decl` reads the signature from the template's own AST through the
+`GenericRegistry` — its declaration body and any `implement` block registered against it. The types may
+still mention the template's parameters, which is fine for the only question asked here: whether a
+parameter is a reference or a pointer, which substitution never changes. A parameter that has not been
+resolved comes back invalid, which the caller already skips, so such a slot is left exactly as unclassified
+as before. This is the same failure, cause and fix as the `GenericParam` arm one level out, which
+`f9e7eebc` added for the case where the receiver IS a generic parameter.
+
+### Gates — 2-phase repin, because the stdlib now needs the fix
+
+Phase 1, the compiler alone against a clean stdlib: `make test` **1920 unit / 0 failed**, compile-fail 166,
+projects 14; `make selfhost-check` exit 0 with **two** `FIXED POINT OK`; `make pin` both halves,
+`make verify-pin` OK, sidecars a matched pair at `d32f4771-dirty`; and the pinned binary itself proven by
+compiling the repro and running it — `a=6 b=11 c=6 d=6 e=6 drops=5`, one drop per shape.
+
+Phase 2, the port: `make test` **1924 unit / 0 failed**, compile-fail 166, projects 14.
+
+Regression test `tests/lang/async_generic_owner_byvalue_arg.cryo`: 2 `E0453` under the old pin, green after,
+with the controls carrying the weight — a non-generic owner, a free callee reached from a generic owner, and
+a BORROWED argument that must not read as a move. Drop counts asserted throughout, because classifying a
+borrow as a transfer is a double free and the reverse is a leak, and neither is a compile error.
+
+**A control I got wrong, worth recording:** the first borrow control was `await this.peek(&r)`, which E0455
+rightly refused — an address may not be handed to a future at all. An `async` borrow control cannot be
+written; it has to be a synchronous borrow plus a carried read after the suspend.
+
+### Testing the port — 5 h2c shapes over REAL loopback sockets
+
+Both ends run as two futures joined inside ONE `Executor` on an ephemeral port. A mock could not have
+carried this: the `ws` port passed every hermetic mock test and then hung on loopback.
+
+- a plain GET: preface, SETTINGS handshake, HPACK, empty body;
+- **100 KB echoed both ways** — DATA split across many frames and, because the connection-level send window
+  is fixed at 65535 octets regardless of SETTINGS, an `ensure_send_window` wait that must read and apply the
+  peer's WINDOW_UPDATEs mid-send. Every byte verified against a prime-stride pattern;
+- a header block past the 16384-octet max frame size: HEADERS + CONTINUATION, reassembled;
+- **4 sequential requests on one connection** — the connection is an owning local awaited on repeatedly
+  from inside a loop, which is the shape that hid the carrier bug this whole layer was built on;
+- a client that handshakes and closes: the server's read loop must report a clean end, which is also the
+  proof the client's connection was really DROPPED — a leaked one holds the socket open and the server waits
+  forever.
+
+Three of the five were initially red on their header COUNTS (2 vs 1, 302 vs 301, 8 vs 4) — all three my
+arithmetic, not the protocol. The server synthesizes exactly **two** headers onto every request it rebuilds:
+`host` mapped back from `:authority`, and `content-length` installed by `set_body` when the decoded body is
+attached. Now a named constant, so a change in either place moves the counts and is noticed.
+
+The three tests that exercised the deleted blocking surface were **ported, not deleted**: `net_tcp.cryo`
+onto `TcpConnect`/`TcpAccept` (keeping the IPv6 `[::1]` dial path and the refused-connect case, which
+nothing else covers), and `http_buffered_parse.cryo` / `net_http_response_cap.cryo` onto `BufStream` over an
+in-memory `AsyncTransport`. `http_buffered_parse` now asserts a FILL COUNT — two pipelined requests in
+exactly ONE transport read, with a one-byte-per-fill control — which is strictly stronger than what it
+asserted before, and is the property the blocking parser could not provide at all.
+
+Roster merged with `--merge`, 1925 entries. **`--merge` kept the renamed `loopback_h2c_round_trip` as an
+"other platform" entry** — it cannot tell a deleted test from a Windows-only one — so that one line was
+removed by hand and `ProcessCommand::output_large_stderr_no_deadlock_win` left alone.

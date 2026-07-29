@@ -1,0 +1,213 @@
+// An owning value handed BY VALUE to an `async` method of a GENERIC owner.
+//
+// `resolve_call` asks `lookup_method_param_types` how each argument binds to the
+// parameter it lands on. For a receiver whose type is a SYMBOLIC instantiation -
+// `Box<T>` seen from inside `Box<T>`'s own body - that lookup used to return
+// nothing: a template's arena node carries no methods, because TypeResolution
+// skips generic declarations outright, and the specializations that do carry
+// them do not exist yet while the symbolic walk is looking at the template.
+//
+// Every argument of `this.m(x)` therefore stayed `Unclassified`, and the two
+// consumers of that default disagree by design: the async substitution reads an
+// unclassified by-value argument as a BORROW and emits a pointer read, which the
+// move passes then see as moving an owning value out of a pointer - E0453,
+// reported at the async function's own header because a synthesized node
+// inherits it. Nothing was unsound; a sound program was refused.
+//
+// The controls matter as much as the subjects. Making the lookup answer means it
+// now answers for MANY more calls than before, so the shapes that were already
+// fine must stay fine: a non-generic owner, a free function reached from inside
+// a generic owner, and a borrowed argument that must NOT be treated as a move.
+//
+// Destructor runs are counted throughout. Classifying an argument as by-value
+// when the parameter only borrows would show up as a double drop, and the
+// reverse as a leak - neither of which is a compile error.
+![config(testing)]
+namespace CryoTests::Tests::Lang::AsyncGenericOwnerByValueArg;
+
+import std::test;
+import std::core::result;
+import future::executor;
+
+mut g_drops: i64 = 0;
+
+type struct Res {
+    id: i64;
+
+    static new(id: i64) -> Res { return Res { id: id }; }
+
+    drop(mut &this) -> void { g_drops = g_drops + 1; }
+}
+
+async function ready(v: i64) -> i64 { return v; }
+
+/// A free async callee that CONSUMES its argument.
+async function free_eat(r: Res) -> i64 {
+    mut local: Res = r;
+    const n: i64 = local.id;
+    const z: i64 = await ready(1);
+    return n + z;
+}
+
+// ---- generic owner: the subject ------------------------------------------
+
+type struct Box<T> {
+    slot: T;
+
+    static of(slot: T) -> Box<T> { return Box<T> { slot: slot }; }
+
+    /// Consumes the value; the local auto-drops at exit, so exactly one run.
+    async eat(mut &this, r: Res) -> i64 {
+        mut local: Res = r;
+        const n: i64 = local.id;
+        const z: i64 = await ready(1);
+        return n + z;
+    }
+
+    /// Only BORROWS. A parameter behind `&` must never read as a transfer, or
+    /// the caller's value would be dropped twice.
+    ///
+    /// Synchronous by necessity, not by preference: handing the address of a
+    /// caller's local to a future that outlives the current poll is refused
+    /// outright (E0455), so an `async` borrow control cannot be written. It goes
+    /// through the same argument classification either way.
+    peek(mut &this, r: &Res) -> i64 {
+        return r.id;
+    }
+
+    /// The subject: a named owning local handed by value to an async method of
+    /// this same generic owner, awaited on `this`.
+    async hand_over(mut &this) -> i64 {
+        mut r: Res = Res::new(5);
+        return await this.eat(r);
+    }
+
+    /// The same give-away with the awaited result BOUND rather than returned,
+    /// so the statement is torn differently.
+    async hand_over_bound(mut &this) -> i64 {
+        mut r: Res = Res::new(5);
+        const got: i64 = await this.eat(r);
+        return got;
+    }
+
+    /// Control: the value is only lent, then CARRIED across a suspend and read
+    /// again. It must still be alive after the suspend, and this frame is the
+    /// one that drops it.
+    async lend(mut &this) -> i64 {
+        mut r: Res = Res::new(5);
+        const got: i64 = this.peek(&r);
+        const z: i64 = await ready(1);
+        const after: i64 = r.id;
+        return got + z + after;
+    }
+
+    /// Control: a FREE async callee reached from inside a generic owner. This
+    /// shape always worked, because a free function's parameter types come from
+    /// its own function type rather than through the receiver.
+    async hand_to_free(mut &this) -> i64 {
+        mut r: Res = Res::new(5);
+        return await free_eat(r);
+    }
+}
+
+// ---- non-generic owner: the other control --------------------------------
+
+type struct Plain {
+    tag: i64;
+
+    static of(tag: i64) -> Plain { return Plain { tag: tag }; }
+
+    async eat(mut &this, r: Res) -> i64 {
+        mut local: Res = r;
+        const n: i64 = local.id;
+        const z: i64 = await ready(1);
+        return n + z;
+    }
+
+    async hand_over(mut &this) -> i64 {
+        mut r: Res = Res::new(5);
+        return await this.eat(r);
+    }
+}
+
+// ---- drivers -------------------------------------------------------------
+
+async function drive_generic_hand_over() -> i64 {
+    mut b: Box<i64> = Box<i64>::of(7);
+    return await b.hand_over();
+}
+
+async function drive_generic_hand_over_bound() -> i64 {
+    mut b: Box<i64> = Box<i64>::of(7);
+    return await b.hand_over_bound();
+}
+
+async function drive_generic_lend() -> i64 {
+    mut b: Box<i64> = Box<i64>::of(7);
+    return await b.lend();
+}
+
+async function drive_generic_hand_to_free() -> i64 {
+    mut b: Box<i64> = Box<i64>::of(7);
+    return await b.hand_to_free();
+}
+
+async function drive_plain_hand_over() -> i64 {
+    mut p: Plain = Plain::of(7);
+    return await p.hand_over();
+}
+
+// ---- tests ---------------------------------------------------------------
+
+![test]
+function generic_owner_takes_a_by_value_owning_argument() -> Result<(), TestError> {
+    g_drops = 0;
+    mut ex: Executor = Executor::new();
+    const got: i64 = ex.block_on(drive_generic_hand_over());
+    ex.drop();
+    if (got != 6) { return expect_eq(got, 6 as i64); }
+    // Handed over exactly once, so the callee's local is the only owner.
+    return expect_eq(g_drops, 1 as i64);
+}
+
+![test]
+function generic_owner_by_value_argument_with_bound_result() -> Result<(), TestError> {
+    g_drops = 0;
+    mut ex: Executor = Executor::new();
+    const got: i64 = ex.block_on(drive_generic_hand_over_bound());
+    ex.drop();
+    if (got != 6) { return expect_eq(got, 6 as i64); }
+    return expect_eq(g_drops, 1 as i64);
+}
+
+![test]
+function generic_owner_borrowed_argument_is_not_a_move() -> Result<(), TestError> {
+    g_drops = 0;
+    mut ex: Executor = Executor::new();
+    const got: i64 = ex.block_on(drive_generic_lend());
+    ex.drop();
+    // 5 + 1 from `peek`, plus the value still being readable afterwards.
+    if (got != 11) { return expect_eq(got, 11 as i64); }
+    // Lent, never given away: the lending frame drops it, exactly once.
+    return expect_eq(g_drops, 1 as i64);
+}
+
+![test]
+function generic_owner_hands_to_a_free_async_function() -> Result<(), TestError> {
+    g_drops = 0;
+    mut ex: Executor = Executor::new();
+    const got: i64 = ex.block_on(drive_generic_hand_to_free());
+    ex.drop();
+    if (got != 6) { return expect_eq(got, 6 as i64); }
+    return expect_eq(g_drops, 1 as i64);
+}
+
+![test]
+function non_generic_owner_takes_a_by_value_owning_argument() -> Result<(), TestError> {
+    g_drops = 0;
+    mut ex: Executor = Executor::new();
+    const got: i64 = ex.block_on(drive_plain_hand_over());
+    ex.drop();
+    if (got != 6) { return expect_eq(got, 6 as i64); }
+    return expect_eq(g_drops, 1 as i64);
+}
