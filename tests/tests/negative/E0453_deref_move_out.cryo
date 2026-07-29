@@ -1,0 +1,34 @@
+// E0453: a value that owns a destructor cannot be moved out of a pointer.
+//
+// `consume(*p)` bitwise-copies the pointee into the callee's storage while
+// whoever owns the storage `p` names keeps its own claim on it, so the
+// destructor runs twice. Cryo has no lifetimes, so the pointer carries no
+// record of who owns what it points at, and the compiler cannot tell this from
+// a legitimate take - the two are spelled identically.
+//
+// Measured before the rule existed: one value, two destructor runs, for a
+// pointer to caller storage, a pointer to a local in the same frame, and a
+// deref bound to a local alike.
+//
+// The permitted side is `unsafe`, where the programmer states that the storage
+// really is theirs to empty - see lang/deref_take_in_unsafe.cryo.
+![config(testing)]
+![config(negative, E0453)]
+namespace CryoTests::Negative::DerefMoveOut;
+
+type struct Res {
+    id: i64;
+
+    static new(id: i64) -> Res { return Res { id: id }; }
+
+    drop(mut &this) -> void { }
+}
+
+function consume(r: Res) -> i64 { return r.id; }
+
+function main() -> int {
+    mut a: Res = Res::new(7);
+    mut p: Res* = &a;
+    const n: i64 = consume(*p);     // `a` is still dropped at scope exit
+    return n as int;
+}

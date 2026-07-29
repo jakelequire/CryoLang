@@ -132,6 +132,45 @@ type struct MoveChecker {
     pm_binding: u32[];
     pm_field:   u32[];
 
+    /// Depth of enclosing `unsafe` blocks.
+    ///
+    /// `unsafe` does NOT turn the pass off - a use-after-move is a
+    /// use-after-move wherever it is written, and the two things this pass
+    /// shares with drop_insertion (the move set and the partial-move set) have
+    /// to stay in agreement inside an `unsafe` block as much as outside one.
+    /// What it marks is narrower: the programmer taking responsibility for
+    /// ownership the compiler cannot follow, which in a language without
+    /// lifetimes means exactly the ownership reached through a raw pointer.
+    /// Only `check_deref_move_out` consults it.
+    ///
+    /// Before this existed the pass had no `UnsafeBlockStatement` case at all,
+    /// so it never descended and `unsafe` silently disabled move checking
+    /// wholesale - while drop_insertion, which does walk the block, went on
+    /// suppressing drops for moves this pass never saw.  That divergence is
+    /// the leak-or-double-free both passes' comments warn about.
+    unsafe_depth: i64;
+
+    /// Set while walking an argument whose parameter sema could NOT resolve.
+    ///
+    /// The move set and the raw-pointer rejection want OPPOSITE defaults for
+    /// such a slot, because their costs are opposite.  Guessing "by value" for
+    /// the move set over-reports a move, which costs a diagnostic; guessing
+    /// "borrow" would silently double-free.  Guessing "by value" for a hard
+    /// rejection breaks a build that was correct; guessing "borrow" only leaves
+    /// the pre-existing hazard in place.  So the move set treats an
+    /// unclassified slot as a transfer and `check_deref_move_out` stands down
+    /// on it: the rule fires only where by-value is CERTAIN - a return, a `let`
+    /// initializer, an assignment RHS, an aggregate-literal element (all of
+    /// which copy unconditionally, no parameter involved), or an argument whose
+    /// parameter sema actually resolved.
+    ///
+    /// The shape that forced this: the async lowering rewrites a `&this`
+    /// receiver into `*this$recv`, and the calls it lands in include
+    /// `mem::swap<T>(&s, this)` - a qualified generic free call, for which
+    /// `resolve_call` produces no parameter types at all, so the slot stays
+    /// unclassified even though the parameter is plainly a `T*` borrow.
+    arg_binding_unknown: boolean;
+
     /// Depth of enclosing conditional / loop bodies.  A partial field move is
     /// tracked only at `branch_depth == 0`; inside any `if`/`match`/`switch`/
     /// loop body it stays a hard E0453, because drop-skip without per-field
@@ -167,6 +206,8 @@ type struct MoveChecker {
             pm_binding:         [],
             pm_field:           [],
             branch_depth:       0,
+            unsafe_depth:        0,
+            arg_binding_unknown: false,
             fired: 0,
             fatal: 0,
         };
@@ -187,6 +228,8 @@ type struct MoveChecker {
         this.pm_binding         = [];
         this.pm_field           = [];
         this.branch_depth       = 0;
+        this.unsafe_depth       = 0;
+        this.arg_binding_unknown = false;
         for (mut i: i64 = 0; i < func.parameters.length; i++) {
             const param: VarDeclNode* = func.parameters[i];
             if (param == null) { continue; }
@@ -772,6 +815,14 @@ type struct MoveChecker {
             NodeKind::BlockStatement => {
                 this.walk_block(stmt as BlockStmtNode*);
             }
+            NodeKind::UnsafeBlockStatement => {
+                // Walked like any other block, with `unsafe_depth` raised so
+                // the raw-pointer rules stand down inside it.  Everything else
+                // this pass checks stays in force.
+                this.unsafe_depth += 1;
+                this.walk_block((stmt as UnsafeBlockStmtNode*).block);
+                this.unsafe_depth -= 1;
+            }
             NodeKind::ReturnStatement => {
                 const r: ReturnStmtNode* = stmt as ReturnStmtNode*;
                 if (r.expression != null) {
@@ -1096,6 +1147,59 @@ type struct MoveChecker {
         }
     }
 
+    /// True when passing `arg` hands the callee the VALUE rather than just an
+    /// address.  A by-value (`T`) parameter duplicates the caller's storage and
+    /// the callee drops its own copy, so reusing the caller's binding afterwards
+    /// frees the same storage twice; a `&T` or `T*` parameter carries only an
+    /// address and takes no ownership of the pointee.
+    ///
+    /// Sema records which of the two it resolved (`arg_binding`).  An
+    /// unclassified slot - an unresolved callee, a variadic tail, or a call a
+    /// later pass synthesized - reads as a transfer: over-reporting a move
+    /// costs a diagnostic, under-reporting one is a double free.
+    ///
+    /// This must not be answered from `autoref`.  That flag is a codegen
+    /// directive meaning "take this argument's address", so it is set only for a
+    /// `&T` parameter and never for a `T*` one - which classified every
+    /// pointer-parameter argument, `mem::swap<T>(a: T*, b: T*)` included, as a
+    /// by-value transfer of a value the callee never takes.
+    arg_transfers_value(&this, arg: ExpressionNode*) -> boolean {
+        if (arg == null) { return false; }
+        if (arg.arg_binding == ArgBinding::Borrowed) { return false; }
+        return true;
+    }
+
+    /// Walk an argument expression with the ownership effect its parameter
+    /// gives it.  Shared by call and `new` arguments so the two cannot drift.
+    /// Only a transfer whose type actually needs drop can double-free on reuse;
+    /// tracking non-droppable by-value arguments (e.g. builtin `string`) as
+    /// moves would flag harmless reuse as use-after-move.  DropInsertion
+    /// suppresses those drops the same way (its by-value-param drop is gated on
+    /// `type_needs_drop`), so gating here keeps the two passes on the identical
+    /// move set.
+    walk_argument(mut &this, arg: ExpressionNode*) -> void {
+        if (arg == null) { return; }
+        if (!this.arg_transfers_value(arg)) {
+            this.walk_expr_read(arg);
+            return;
+        }
+        if (this.type_needs_drop(arg.resolved_type)) {
+            // Tracked as a move either way, but only a parameter sema actually
+            // resolved is grounds for REJECTING a move out of a pointer here.
+            // See `arg_binding_unknown` for why the two defaults differ.
+            const prev_unknown: boolean = this.arg_binding_unknown;
+            this.arg_binding_unknown = (arg.arg_binding == ArgBinding::Unclassified);
+            this.walk_expr_move(arg, true);
+            this.arg_binding_unknown = prev_unknown;
+            return;
+        }
+        // Passed by value without needing drop: the callee still works on a
+        // copy at a different address - the same hazard as a move for a rule
+        // about addresses, and the path a `Copy` state machine actually takes.
+        this.check_polled_move(arg);
+        this.walk_expr_read(arg);
+    }
+
     /// Walk an expression in "move" context: bare identifiers of
     /// non-Copy types are marked Moved, sub-expressions descend in
     /// "read" context.  `real` marks storage-duplicating move sites
@@ -1107,6 +1211,10 @@ type struct MoveChecker {
         // value is a double free (no partial-move tracking). Reject it.
         if (real) { this.check_polled_move(expr); }
         if (real) { this.check_field_move_out(expr); }
+        // Same hazard for a value read out THROUGH a pointer: the pointee is
+        // duplicated into an independently-dropped place while whoever owns
+        // that storage keeps its own claim on it.
+        if (real) { this.check_deref_move_out(expr); }
         // Same hazard for an array element read by value: the array keeps
         // ownership of the element, so the duplicated handle is freed twice.
         if (real) { this.check_array_move_out(expr); }
@@ -1255,44 +1363,24 @@ type struct MoveChecker {
         if (!receiver_moved && c.callee != null) {
             this.walk_expr_read(c.callee);
         }
-        // An argument's ownership effect depends on the parameter it binds
-        // to, a decision sema records as `arg.autoref`:
-        //   - autoref'd (lands on a `&T` parameter): codegen passes the
-        //     address and the callee never takes ownership - a borrow.  Walk
-        //     it in READ context: this still flags passing an already-moved
-        //     value, but does not itself mark the argument moved.
-        //   - genuine by-value (lands on a `T` parameter): the value is moved
-        //     into the callee, which drops it at its scope exit (see
-        //     drop_insertion's by-value-param drop).  This is a storage-
-        //     duplicating move of the caller's binding, so reusing it
-        //     afterwards drops the same storage twice.  Walk it in MOVE
+        // An argument's ownership effect depends on the parameter it binds to,
+        // which sema records as `arg_binding` (see `arg_transfers_value`):
+        //   - a borrow (`&T` / `T*` parameter): only an address crosses the
+        //     call, so walk it in READ context.  That still flags passing an
+        //     already-moved value, but does not itself mark the argument moved.
+        //   - a by-value transfer (`T` parameter): the value is moved into the
+        //     callee, which drops it at its scope exit (see drop_insertion's
+        //     by-value-param drop).  This duplicates the caller's storage, so
+        //     reusing the binding afterwards drops it twice.  Walk it in MOVE
         //     context (real=true) so a later use reports use-after-move and a
         //     loop-carried reuse - a guaranteed double free - is a hard error.
         // This mirrors drop_insertion::read_call so both passes agree on which
         // arguments transfer ownership; a mismatch (move_check seeing a borrow,
         // drop_insertion a move) would silently double-free by-value owning
-        // arguments.  The `autoref` gate is what keeps this precise: walking
-        // every argument as a move would record spurious moves on borrows.
-        // Copy args and explicit `&x`/pointer args
-        // fall out via the Copy / address-of guards in `walk_expr_move`.
-        // Only a by-value argument whose type actually needs drop can
-        // double-free on reuse; tracking non-droppable by-value args (e.g.
-        // builtin `string`) as moves would flag harmless reuse as use-after-
-        // move.  The drop side suppresses those drops the same way (its
-        // by-value-param drop is gated on `type_needs_drop`), so gating here
-        // keeps the two passes tracking the identical move set.
+        // arguments.  Copy args and explicit `&x`/pointer args fall out via the
+        // Copy / address-of guards in `walk_expr_move`.
         for (mut i: i64 = 0; i < c.arguments.length; i++) {
-            const arg: ExpressionNode* = c.arguments[i];
-            if (arg == null) { continue; }
-            if (!arg.autoref && this.type_needs_drop(arg.resolved_type)) {
-                this.walk_expr_move(arg, true);
-            } else {
-                // A non-autoref argument is passed by value, so the callee
-                // works on a copy at a different address - the same hazard as a
-                // move, and the path a `Copy` state machine actually takes.
-                if (!arg.autoref) { this.check_polled_move(arg); }
-                this.walk_expr_read(arg);
-            }
+            this.walk_argument(c.arguments[i]);
         }
         return;
     }
@@ -1303,8 +1391,11 @@ type struct MoveChecker {
             // `lhs = rhs` moves the RHS into the LHS place, regardless of
             // whether the LHS is a bare binding or a field / index target:
             // the RHS is a storage-duplicating move.  A field-move-out on the
-            // RHS double-frees, so check for it explicitly.
+            // RHS double-frees, so check for it explicitly.  So does a
+            // move-out through a pointer, and for the same reason: the walk
+            // below passes `real=false`, which skips both checks.
             if (b.right != null) { this.check_field_move_out(b.right); }
+            if (b.right != null) { this.check_deref_move_out(b.right); }
             if (b.left != null && b.left.kind == NodeKind::Identifier) {
                 // Plain assignment to a bare identifier is a pure write: it
                 // reinitializes the binding rather than reading it.  MOVE the
@@ -1441,21 +1532,10 @@ type struct MoveChecker {
         // accepted even though drop_insertion::read_new already treats the same
         // argument as a move and suppresses its scope-exit drop - the two
         // passes disagreed on the move-set.  Mirror read_call (and
-        // drop_insertion::read_new) so they track the identical set: an
-        // autoref'd borrow stays a read, a by-value droppable argument is a
-        // real move.
+        // drop_insertion::read_new) so they track the identical set: a borrow
+        // stays a read, a by-value droppable argument is a real move.
         for (mut i: i64 = 0; i < n.arguments.length; i++) {
-            const arg: ExpressionNode* = n.arguments[i];
-            if (arg == null) { continue; }
-            if (!arg.autoref && this.type_needs_drop(arg.resolved_type)) {
-                this.walk_expr_move(arg, true);
-            } else {
-                // A non-autoref argument is passed by value, so the callee
-                // works on a copy at a different address - the same hazard as a
-                // move, and the path a `Copy` state machine actually takes.
-                if (!arg.autoref) { this.check_polled_move(arg); }
-                this.walk_expr_read(arg);
-            }
+            this.walk_argument(n.arguments[i]);
         }
         // `new T { field: local }` field initializers live in struct_init,
         // not arguments, and store-by-value (move for owning fields) exactly
@@ -1665,6 +1745,61 @@ type struct MoveChecker {
             return;
         }
         this.emit_move_out_error(ma);
+    }
+
+    /// Reject a by-value read of `*p` when the pointee owns a destructor.
+    ///
+    /// `consume(*p)`, `const x: T = *p;` and `return *p;` bitwise-copy the
+    /// pointee into an independently-dropped place while whoever owns the
+    /// storage `p` names keeps its own claim on it, so the value's destructor
+    /// runs twice.  Nothing in the type system records that the copy aliases,
+    /// so this is silent: measured on a three-line reduction, one value with a
+    /// destructor is freed twice for every shape of pointer (a parameter
+    /// pointing at caller storage, a pointer to a local in the same frame, and
+    /// a deref bound to a local).
+    ///
+    /// Cryo has no lifetimes, so the pointer carries no record of who owns the
+    /// storage it names; the pass cannot tell a take (the owner is finished
+    /// with it, or is about to be overwritten) from a copy (the owner will
+    /// still drop it), and the two are spelled identically.  That judgement
+    /// belongs to the programmer, and `unsafe` is where they make it: inside
+    /// one, this rule stands down and the destructive read is written plainly
+    /// as `*p`.  The block is the right granularity because the argument for
+    /// soundness usually spans more than the read - in `mem::swap` it is the
+    /// store that immediately replaces what was taken.
+    ///
+    /// Only reached from a storage-duplicating (`real`) position, so a borrow
+    /// - `p.field`, `p.method()`, `&*p`, an argument bound to a `&T`/`T*`
+    /// parameter - never gets here.  That gate is exactly why argument
+    /// classification had to become sound first: while a `T*` parameter still
+    /// looked like a by-value transfer, this rule fired on arguments the callee
+    /// never takes.
+    check_deref_move_out(mut &this, expr: ExpressionNode*) -> void {
+        if (this.unsafe_depth > 0) { return; }
+        if (expr == null || expr.kind != NodeKind::UnaryExpression) { return; }
+        if (this.arg_binding_unknown) { return; }
+        const u: UnaryExprNode* = expr as UnaryExprNode*;
+        if (u.is_postfix || u.op.lexeme != "*") { return; }
+        if (u.operand == null) { return; }
+        // Only a pointee that owns a resource can be freed twice.  A Copy or
+        // non-droppable pointee is bitwise-independent of the source.
+        const pointee_ty: TypeRef = expr.resolved_type;
+        if (!pointee_ty.is_valid() || this.is_copy(pointee_ty)) { return; }
+        if (!this.type_needs_drop(pointee_ty)) { return; }
+        if (this.suppress_emit) { return; }
+        this.emit_deref_move_out_error(u);
+    }
+
+    emit_deref_move_out_error(mut &this, u: UnaryExprNode*) -> void {
+        mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0453_DOUBLE_FREE,
+            "cannot move a value that owns a destructor out of a pointer");
+        diag = diag.at_with_label(u.span,
+            "reading the pointee by value copies its owning handle; the storage this points at is still dropped by its owner (double free)");
+        diag = diag.help(
+            "borrow it instead (`p.field`, `p.method()`), or clone it; if this really is a take - the storage is yours to empty, or you overwrite it straight after - say so with an `unsafe` block around the sequence that makes it sound");
+        this.ctx.emit_diagnostic(diag);
+        this.fired += 1;
+        this.fatal += 1;
     }
 
     emit_move_out_error(mut &this, ma: MemberAccessNode*) -> void {

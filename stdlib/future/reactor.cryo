@@ -125,9 +125,13 @@ type struct Timer {
 /// pointer does not drop the value it overwrites, so storing over a live waker
 /// would strand its task reference and the task would never be freed.
 private function take_waker(slot: Waker*) -> Waker {
-    const w: Waker = mem::take_ptr(slot);
-    *slot = Waker::noop();
-    return w;
+    // The no-op store is what makes the read a take: it leaves nothing in the
+    // slot that could release the task reference a second time.
+    unsafe {
+        const w: Waker = *slot;
+        *slot = Waker::noop();
+        return w;
+    }
 }
 
 /// Store `w` in `slot` and hand back the waker that was there (a future that
@@ -137,9 +141,13 @@ private function take_waker(slot: Waker*) -> Waker {
 /// run arbitrary code — see the "no waker drops under the lock" rule on
 /// `Reactor`. Callers park it in a local that outlives the unlock.
 private function swap_waker(slot: Waker*, w: Waker) -> Waker {
-    const old: Waker = mem::take_ptr(slot);
-    *slot = w;
-    return old;
+    // Same balance as `take_waker`: the incoming waker replaces what was read
+    // out, so the slot never co-owns the returned one.
+    unsafe {
+        const old: Waker = *slot;
+        *slot = w;
+        return old;
+    }
 }
 
 

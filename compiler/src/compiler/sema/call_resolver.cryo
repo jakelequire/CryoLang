@@ -462,7 +462,7 @@ type struct CallResolver {
         }
         this.state.expected_type = saved_expected;
 
-        this.flag_autoref_from_params(call, param_types);
+        this.classify_args_from_params(call, param_types);
 
         // Type-check a `printf`/`eprintf` call's `%` directives against its
         // variadic arguments now that each argument carries a resolved type.
@@ -573,20 +573,40 @@ type struct CallResolver {
         return this.dispatch.resolve_expr(visitor, callee);
     }
 
-    /// Mark by-value args bound to `&T` params with `autoref` (codegen takes the
-    /// address); leave explicit refs/pointers untouched.
-    flag_autoref_from_params(mut &this, call: CallExprNode*, param_types: TypeRef[]) -> void {
+    /// Record how each argument binds to the parameter it lands on.
+    ///
+    /// Two separate answers come out of the same parameter type:
+    ///   - `arg_binding` is the OWNERSHIP answer the move passes need.  A `&T`
+    ///     or `T*` parameter only ever receives an address, so the callee takes
+    ///     no ownership of the pointee; a bare `T` parameter receives the value
+    ///     and drops its own copy.
+    ///   - `autoref` is the narrower CODEGEN directive: take the address of a
+    ///     by-value argument standing in a `&T` slot.  A `T*` parameter needs no
+    ///     such fixup (the argument is already an address), which is why it must
+    ///     not be used to answer the ownership question - doing so classified
+    ///     every pointer-parameter argument as a by-value transfer.
+    ///
+    /// Arguments past the declared parameters (a variadic tail) are left
+    /// unclassified, which the move passes read as a transfer.
+    classify_args_from_params(mut &this, call: CallExprNode*, param_types: TypeRef[]) -> void {
         const lim: i64 = if (param_types.length < call.arguments.length) {
             param_types.length
         } else {
             call.arguments.length
         };
         for (mut j: i64 = 0; j < lim; j++) {
-            if (!this.types.is_reference_type(param_types[j])) { continue; }
             const arg: ExpressionNode* = call.arguments[j];
             if (arg == null) { continue; }
-            if (this.types.is_ref_or_ptr_type(arg.resolved_type)) { continue; }
-            arg.autoref = true;
+            if (!param_types[j].is_valid()) { continue; }
+            if (!this.types.is_ref_or_ptr_type(param_types[j])) {
+                arg.arg_binding = ArgBinding::ByValue;
+                continue;
+            }
+            arg.arg_binding = ArgBinding::Borrowed;
+            if (this.types.is_reference_type(param_types[j])
+                && !this.types.is_ref_or_ptr_type(arg.resolved_type)) {
+                arg.autoref = true;
+            }
         }
     }
 

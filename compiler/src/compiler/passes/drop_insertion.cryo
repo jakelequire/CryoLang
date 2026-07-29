@@ -3042,6 +3042,38 @@ type struct DropInserter {
         }
     }
 
+    /// True when passing `arg` hands the callee the VALUE rather than just an
+    /// address, so the callee owns and drops its own copy and this frame's
+    /// scope-exit drop for the binding must be suppressed.  A `&T` or `T*`
+    /// parameter carries only an address: walking it as a move would suppress
+    /// the caller's drop and leak the value.
+    ///
+    /// MUST answer identically to `MoveCheck::arg_transfers_value` - a slot one
+    /// pass calls a borrow and the other a move is either a leak or a double
+    /// free.  Both read the `arg_binding` sema resolved from the parameter
+    /// type, and both read an unclassified slot as a transfer.  Neither may use
+    /// `autoref`, which is a codegen directive set only for `&T` and therefore
+    /// blind to every `T*` parameter.
+    arg_transfers_value(&this, arg: ExpressionNode*) -> boolean {
+        if (arg == null) { return false; }
+        if (arg.arg_binding == ArgBinding::Borrowed) { return false; }
+        return true;
+    }
+
+    /// Walk an argument with the ownership effect its parameter gives it, and
+    /// report whether it transferred.  Shared by call and `new` arguments so
+    /// the two cannot drift.  The pending-arg bookkeeping stays with the caller
+    /// because only `read_call` opens a pending-arg frame to record onto.
+    walk_argument(mut &this, arg: ExpressionNode*) -> boolean {
+        if (arg == null) { return false; }
+        if (!this.arg_transfers_value(arg)) {
+            this.walk_expr_read(arg);
+            return false;
+        }
+        this.walk_expr_move(arg);
+        return true;
+    }
+
     read_call(mut &this, c: CallExprNode*) -> void {
         if (c == null) { return; }
         // Recognise `<ident>.drop()` and treat it as a move: the user
@@ -3117,21 +3149,9 @@ type struct DropInserter {
             this.walk_expr_read(c.callee);
         }
         for (mut i: i64 = 0; i < c.arguments.length; i++) {
-            const arg: ExpressionNode* = c.arguments[i];
-            if (arg == null) { continue; }
-            // Honor the autoref decision sema recorded.  A by-value argument
-            // bound to a `&T` parameter is a *borrow*: sema set `autoref` so
-            // codegen passes its address, and the callee never takes
-            // ownership (the documented borrow model, ref section 16.4).  Walking it
-            // in move context would mark the caller's binding as moved and
-            // suppress its scope-exit drop, leaking it.  Walk autoref'd
-            // borrows in read context; only genuine by-value (`T` param)
-            // arguments transfer ownership and are walked as moves.
-            if (arg.autoref) {
-                this.walk_expr_read(arg);
-            } else {
-                this.walk_expr_move(arg);
-                if (this.ctx.project_panic_unwind) { this.record_pending_arg(arg); }
+            const transferred: boolean = this.walk_argument(c.arguments[i]);
+            if (transferred && this.ctx.project_panic_unwind) {
+                this.record_pending_arg(c.arguments[i]);
             }
         }
         // Close this call's pending-arg frame: its arguments are now owned by the
@@ -3251,8 +3271,11 @@ type struct DropInserter {
 
     read_new(mut &this, n: NewExprNode*) -> void {
         if (n == null) { return; }
+        // Constructor arguments transfer ownership exactly like call arguments,
+        // and are classified the same way - mirrors MoveCheck::read_new so the
+        // two passes track the identical move set.
         for (mut i: i64 = 0; i < n.arguments.length; i++) {
-            this.walk_expr_move(n.arguments[i]);
+            const _t: boolean = this.walk_argument(n.arguments[i]);
         }
         // `new T { field: local }` carries its field initializers in
         // struct_init, not arguments.  An owning field-init MOVES the local
