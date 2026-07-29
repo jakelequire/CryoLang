@@ -1,12 +1,31 @@
-///! HTTP/2 over h2c (cleartext) - loopback request/response.
+///! HTTP/2 over h2c (cleartext) — loopback request/response on a REAL socket.
 ///!
-///! The main thread is the server: it binds + listens FIRST, then spawns
-///! the client thread, so `connect` can't race ahead of `accept`. The
-///! client issues one `GET /hello` over a prior-knowledge h2c connection;
-///! the server dispatches it to a handler that replies `200 OK` with a
-///! known body. This exercises the full stack end to end: the connection
-///! preface, the SETTINGS handshake, HPACK-encoded HEADERS, DATA framing,
-///! and flow-control WINDOW_UPDATEs, in both directions.
+///! A mock transport cannot catch this class of bug: the `net/ws` port passed
+///! every hermetic mock-transport test and then hung on loopback. So every test
+///! here binds an EPHEMERAL port (`:0`), reads the kernel-assigned port back, and
+///! drives both ends as two futures joined inside ONE `Executor`, whose reactor
+///! is what the accept and every read register with.
+///!
+///! The shapes are chosen for what each one forces the port through:
+///!
+///!   - a plain GET: preface, SETTINGS handshake, HPACK HEADERS, an empty body;
+///!   - a 100 KB echoed POST: DATA split across many frames in BOTH directions,
+///!     and — because the connection-level send window is fixed at 65535 octets
+///!     regardless of SETTINGS — an `ensure_send_window` wait that has to read
+///!     and apply the peer's WINDOW_UPDATEs mid-send;
+///!   - a header block over the 16384-octet max frame size: HEADERS plus
+///!     CONTINUATION fragments, assembled back into one block by the reader;
+///!   - four sequential requests on ONE connection: an owning local awaited on
+///!     repeatedly from inside a loop, which is the shape that hid the carrier
+///!     bug the async layer was built on;
+///!   - a client that handshakes and closes without asking for anything: the
+///!     server's read loop must report a clean end rather than an error, which is
+///!     also the proof that the client's connection was really DROPPED — a leaked
+///!     one would hold the socket open and the server would wait forever.
+///!
+///! Counts are asserted, never booleans: a handler that ran twice, a body that
+///! came back one byte short, or a header lost in a CONTINUATION fragment each
+///! surface as a specific number rather than as "not ok".
 
 ![config(testing)]
 namespace CryoTests::Tests::Stdlib::NetHttp2;
@@ -14,48 +33,69 @@ namespace CryoTests::Tests::Stdlib::NetHttp2;
 import std::core::result;
 import std::core::option;
 import std::core::slice;
+import std::core::drop;
 import std::collections::array;
 import std::collections::str;
+import std::collections::string;
+import std::future;
 import std::io::error;
-import std::net::addr::ip;
+import std::io::traits;
+import std::io::buf;
 import std::net::addr::socket_addr;
+import std::net::socket::tcp;
 import std::net::http::method;
 import std::net::http::status;
 import std::net::http::request;
 import std::net::http::response;
 import std::net::http2::client;
 import std::net::http2::server;
-import std::thread;
-import std::ffi::libc;
+import std::net::http2::connection;
 import std::test::error;
 import std::test::assert;
 
-const BODY: Str = Str::new("Hello, HTTP/2!");
+/// What the handlers observed, so a test can assert on the SERVER side too and
+/// not just on what came back over the wire.
+mut g_served:       i64 = 0;
+mut g_body_seen:    i64 = 0;
+mut g_headers_seen: i64 = 0;
 
-/// Server handler: reply 200 OK with a fixed body. Consumes the request.
+/// The fixed reply body. 14 octets.
+const REPLY_LEN: i64 = 14;
+
+/// Headers the SERVER synthesizes onto every request it rebuilds, over and above
+/// whatever the client sent: `host`, mapped back from the `:authority`
+/// pseudo-header, and `content-length`, which `set_body` installs when the
+/// decoded body is attached. Measured, not assumed — a change in either of those
+/// two places should move these counts and be noticed.
+const SYNTHESIZED_HEADERS: i64 = 2;
+
+/// Reply `200 OK` with a fixed body, recording what arrived. Consumes the
+/// request.
 function h2_handler(req: Request) -> Response {
     mut request_local: Request = req;
+    g_served = g_served + 1;
+    g_body_seen = g_body_seen + (request_local.body.length() as i64);
+    g_headers_seen = g_headers_seen + (request_local.headers.length() as i64);
     const resp: Response = Response::text(StatusCode::ok(), Str::new("Hello, HTTP/2!"));
     request_local.drop();
     return resp;
 }
 
-/// Client thread: one h2c GET; returns 1 on a verified 200 + body.
-function h2_client(port: i32) -> i32 {
-    const c: Http2Client = Http2Client::new();
-    const addr: SocketAddr = SocketAddr::localhost_v4(port as u16);
-    mut resp: Response = match (c.get(addr, Str::new("localhost"), Str::new("/hello"))) {
-        Result::Ok(r)  => { r }
-        Result::Err(_) => { return 0; }
-    };
-    mut ok: boolean = resp.status.as_u16() == 200;
-    ok = ok && body_eq(&resp.body, Str::new("Hello, HTTP/2!"));
-    resp.drop();
-    if (ok) { return 1; }
-    return 0;
+/// Reply `200 OK` echoing the request body back, so a large payload is framed,
+/// flow-controlled and reassembled in BOTH directions within one exchange.
+function h2_echo_handler(req: Request) -> Response {
+    mut request_local: Request = req;
+    g_served = g_served + 1;
+    g_body_seen = g_body_seen + (request_local.body.length() as i64);
+    mut echo: Array<u8> = Array<u8>::new();
+    echo.append(request_local.body.as_slice());
+    request_local.drop();
+    mut resp: Response = Response::new(StatusCode::ok());
+    resp.set_body(echo);
+    return resp;
 }
 
-function body_eq(body: &Array<u8>, expected: Str) -> boolean {
+function h2_body_eq(body: &Array<u8>, expected: Str) -> boolean {
     if (body.length() != expected.length()) { return false; }
     const eb: Slice<u8> = expected.as_bytes();
     mut i: u64 = 0;
@@ -74,42 +114,330 @@ function body_eq(body: &Array<u8>, expected: Str) -> boolean {
     return true;
 }
 
-![test]
-function loopback_h2c_round_trip() -> Result<(), TestError> {
-    // Find a free loopback port: try a PID-derived base in a band distinct
-    // from the other net tests, walking upward on failure. A single fixed
-    // PID-derived port flaked with "h2 server bind failed" when it happened to
-    // be busy or in TIME_WAIT from a prior run; the retry makes the bind
-    // deterministic.
-    const base: u16 = (44000 + (libc::getpid() % 20000)) as u16;
-    mut port: u16 = base;
-    mut server_opt: Option<Http2Server> = Option::None;
-    mut attempt: u16 = 0;
-    while (attempt < 50) {
-        port = base + attempt;
-        match (Http2Server::bind(SocketAddr::localhost_v4(port))) {
-            Result::Ok(s)  => { server_opt = Option::Some(s); break; }
-            Result::Err(_) => { }
-        }
-        attempt = attempt + 1;
+/// The byte a given offset of the generated payload must hold. A prime stride
+/// so a frame boundary landing anywhere still shows up as a mismatch rather
+/// than aliasing onto the right value.
+function h2_pattern_byte(index: u64) -> u8 {
+    return (index % 251) as u8;
+}
+
+function h2_push_decimal(out: mut &String, value: u64) -> void {
+    mut temp: u8[24];
+    const digits: u64 = value.to_decimal_buf(&temp[0]);
+    mut i: u64 = 0;
+    while (i < digits) {
+        out.push_byte(temp[i]);
+        i++;
     }
-    mut server: Http2Server = match (server_opt) {
-        Option::Some(s) => { s }
-        Option::None    => { return bail(Str::new("h2 server bind failed")); }
+}
+
+// ---- the two ends -----------------------------------------------------------
+
+/// Accept one connection and serve it to completion. Returns 1 on a clean end.
+/// The server is consumed, so its listener is closed when this future finishes.
+async function h2_serve_one(server: Http2Server, handler: (Request) -> Response) -> i64 {
+    mut s: Http2Server = server;
+    match (await s.serve_one(handler)) {
+        Result::Ok(_)  => { return 1; }
+        Result::Err(_) => { return -1; }
+    }
+}
+
+/// One h2c GET through the public one-shot client. Returns the response body
+/// length on a verified `200`.
+async function h2_get(port: u16, path: Str) -> i64 {
+    const c: Http2Client = Http2Client::new();
+    mut resp: Response = match (await c.get(SocketAddr::localhost_v4(port),
+                                            Str::new("localhost"), path)) {
+        Result::Ok(r)  => { r }
+        Result::Err(_) => { return -10; }
     };
+    const status_ok: boolean = resp.status.as_u16() == 200;
+    const body_ok: boolean = h2_body_eq(&resp.body, Str::new("Hello, HTTP/2!"));
+    const got: i64 = resp.body.length() as i64;
+    resp.drop();
+    if (!status_ok) { return -11; }
+    if (!body_ok)   { return -12; }
+    return got;
+}
 
-    const handle: thread::JoinHandle<i32> =
-        thread::spawn<i32, i32>(port as i32, h2_client);
+/// POST `n` generated octets and verify the same octets come back. Returns the
+/// echoed length.
+async function h2_post_echo(port: u16, n: u64) -> i64 {
+    const c: Http2Client = Http2Client::new();
+    mut body: Array<u8> = Array<u8>::new();
+    mut i: u64 = 0;
+    while (i < n) { body.push(h2_pattern_byte(i)); i = i + 1; }
 
-    // Serve exactly one connection (the client's), then return.
-    const server_result: Result<(), IoError> = server.serve_one(h2_handler);
-    server.drop();
-
-    const client_ok: i32 = handle.join();
-
-    match (server_result) {
-        Result::Ok(_)  => { }
-        Result::Err(_) => { return bail(Str::new("h2 server failed to serve the connection")); }
+    // `body` is handed to the request before anything suspends, so the bytes
+    // belong to the client connection from here on.
+    mut resp: Response = match (await c.post(SocketAddr::localhost_v4(port),
+                                             Str::new("localhost"), Str::new("/echo"),
+                                             Str::new("application/octet-stream"), body)) {
+        Result::Ok(r)  => { r }
+        Result::Err(_) => { return -20; }
+    };
+    const status_ok: boolean = resp.status.as_u16() == 200;
+    const got: u64 = resp.body.length();
+    mut mismatches: i64 = 0;
+    mut j: u64 = 0;
+    while (j < got) {
+        match (resp.body.get(j)) {
+            Option::Some(b) => { if (b != h2_pattern_byte(j)) { mismatches = mismatches + 1; } }
+            Option::None    => { mismatches = mismatches + 1; }
+        }
+        j = j + 1;
     }
-    return expect(client_ok == 1, Str::new("client should receive 200 with the expected body"));
+    resp.drop();
+    if (!status_ok)      { return -21; }
+    if (mismatches != 0) { return -22; }
+    return got as i64;
+}
+
+/// One GET carrying `count` padded headers, so the encoded block runs well past
+/// the 16384-octet max frame size and has to be split into HEADERS +
+/// CONTINUATION fragments.
+async function h2_many_headers(port: u16, count: u64) -> i64 {
+    mut sock: TcpStream = match (await TcpConnect::start(SocketAddr::localhost_v4(port))) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { return -30; }
+    };
+    mut conn: Http2Connection<TcpStream> =
+        Http2Connection<TcpStream>::new_client(BufStream<TcpStream>::of(sock));
+    match (await conn.handshake_client()) {
+        Result::Ok(_)  => { }
+        Result::Err(_) => { return -31; }
+    }
+
+    mut pad: String = String::with_capacity(210);
+    mut k: u64 = 0;
+    while (k < 200) { pad.push_byte((0x61 + (k % 26)) as u8); k = k + 1; }
+
+    mut req: Request = Request::new(Method::Get, Str::new("/hdrs"));
+    mut i: u64 = 0;
+    while (i < count) {
+        mut name: String = String::with_capacity(16);
+        name.push(Str::new("x-pad-"));
+        h2_push_decimal(&name, i);
+        req.headers.insert(name.as_str(), pad.as_str());
+        name.drop();
+        i = i + 1;
+    }
+    pad.drop();
+
+    mut resp: Response = match (await conn.request(req, Str::new("http"), Str::new("localhost"))) {
+        Result::Ok(r)  => { r }
+        Result::Err(_) => { return -32; }
+    };
+    const status_ok: boolean = resp.status.as_u16() == 200;
+    const got: i64 = resp.body.length() as i64;
+    resp.drop();
+    if (!status_ok) { return -33; }
+    return got;
+}
+
+/// `n` sequential requests on ONE connection: the connection is an owning local
+/// awaited on twice per iteration from inside a loop, so its carrier is taken and
+/// handed back on every request rather than once for the whole future.
+async function h2_sequential(port: u16, n: i64) -> i64 {
+    mut sock: TcpStream = match (await TcpConnect::start(SocketAddr::localhost_v4(port))) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { return -40; }
+    };
+    mut conn: Http2Connection<TcpStream> =
+        Http2Connection<TcpStream>::new_client(BufStream<TcpStream>::of(sock));
+    match (await conn.handshake_client()) {
+        Result::Ok(_)  => { }
+        Result::Err(_) => { return -41; }
+    }
+
+    mut done: i64 = 0;
+    while (done < n) {
+        mut req: Request = Request::new(Method::Get, Str::new("/seq"));
+        mut resp: Response = match (await conn.request(req, Str::new("http"), Str::new("localhost"))) {
+            Result::Ok(r)  => { r }
+            Result::Err(_) => { return -42; }
+        };
+        const status_ok: boolean = resp.status.as_u16() == 200;
+        const body_ok: boolean = h2_body_eq(&resp.body, Str::new("Hello, HTTP/2!"));
+        resp.drop();
+        if (!status_ok) { return -43; }
+        if (!body_ok)   { return -44; }
+        done = done + 1;
+    }
+    return done;
+}
+
+/// Handshake and leave. Nothing drops the connection explicitly — it is released
+/// when this future finishes, and that release is what the server observes as a
+/// clean end of stream.
+async function h2_handshake_then_close(port: u16) -> i64 {
+    mut sock: TcpStream = match (await TcpConnect::start(SocketAddr::localhost_v4(port))) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { return -50; }
+    };
+    mut conn: Http2Connection<TcpStream> =
+        Http2Connection<TcpStream>::new_client(BufStream<TcpStream>::of(sock));
+    match (await conn.handshake_client()) {
+        Result::Ok(_)  => { return 1; }
+        Result::Err(_) => { return -51; }
+    }
+}
+
+// ---- joins ------------------------------------------------------------------
+
+async function h2_join_get(port: u16, server: Http2Server) -> i64 {
+    const pair: (i64, i64) = await Futures::join(h2_serve_one(server, h2_handler),
+                                                 h2_get(port, Str::new("/hello")));
+    if (pair.0 != 1) { return pair.0; }
+    return pair.1;
+}
+
+async function h2_join_echo(port: u16, server: Http2Server, n: u64) -> i64 {
+    const pair: (i64, i64) = await Futures::join(h2_serve_one(server, h2_echo_handler),
+                                                 h2_post_echo(port, n));
+    if (pair.0 != 1) { return pair.0; }
+    return pair.1;
+}
+
+async function h2_join_headers(port: u16, server: Http2Server, count: u64) -> i64 {
+    const pair: (i64, i64) = await Futures::join(h2_serve_one(server, h2_handler),
+                                                 h2_many_headers(port, count));
+    if (pair.0 != 1) { return pair.0; }
+    return pair.1;
+}
+
+async function h2_join_sequential(port: u16, server: Http2Server, n: i64) -> i64 {
+    const pair: (i64, i64) = await Futures::join(h2_serve_one(server, h2_handler),
+                                                 h2_sequential(port, n));
+    if (pair.0 != 1) { return pair.0; }
+    return pair.1;
+}
+
+async function h2_join_close(port: u16, server: Http2Server) -> i64 {
+    const pair: (i64, i64) = await Futures::join(h2_serve_one(server, h2_handler),
+                                                 h2_handshake_then_close(port));
+    if (pair.0 != 1) { return pair.0; }
+    return pair.1;
+}
+
+// ---- tests ------------------------------------------------------------------
+
+/// Bind `127.0.0.1:0` and read back the kernel-assigned port, so concurrent runs
+/// never collide and no retry loop is needed.
+function h2_bind() -> Result<Http2Server, IoError> {
+    return Http2Server::bind(SocketAddr::localhost_v4(0u16));
+}
+
+![test]
+function h2c_loopback_get_round_trip() -> Result<(), TestError> {
+    g_served = 0; g_body_seen = 0; g_headers_seen = 0;
+    mut server: Http2Server = match (h2_bind()) {
+        Result::Ok(s)  => { s }
+        Result::Err(_) => { return bail(Str::new("h2 bind 127.0.0.1:0 failed")); }
+    };
+    const port: u16 = match (server.local_addr()) {
+        Result::Ok(a)  => { a.port }
+        Result::Err(_) => { server.drop(); return bail(Str::new("local_addr failed")); }
+    };
+    mut ex: Executor = Executor::new();
+    const r: i64 = ex.block_on(h2_join_get(port, server));
+    ex.drop();
+    if (r != REPLY_LEN) { return expect_eq(r, REPLY_LEN); }
+    // Exactly one dispatch, no body, and only the two headers the server
+    // synthesizes — the client sent none of its own.
+    if (g_served != 1)    { return expect_eq(g_served, 1 as i64); }
+    if (g_body_seen != 0) { return expect_eq(g_body_seen, 0 as i64); }
+    return expect_eq(g_headers_seen, SYNTHESIZED_HEADERS);
+}
+
+![test]
+function h2c_loopback_echoes_a_large_body_through_flow_control() -> Result<(), TestError> {
+    g_served = 0; g_body_seen = 0; g_headers_seen = 0;
+    // Past the fixed 65535-octet connection send window, so the send has to wait
+    // on a WINDOW_UPDATE and apply it, in both directions.
+    const n: u64 = 100000;
+    mut server: Http2Server = match (h2_bind()) {
+        Result::Ok(s)  => { s }
+        Result::Err(_) => { return bail(Str::new("h2 bind 127.0.0.1:0 failed")); }
+    };
+    const port: u16 = match (server.local_addr()) {
+        Result::Ok(a)  => { a.port }
+        Result::Err(_) => { server.drop(); return bail(Str::new("local_addr failed")); }
+    };
+    mut ex: Executor = Executor::new();
+    const r: i64 = ex.block_on(h2_join_echo(port, server, n));
+    ex.drop();
+    if (r != n as i64) { return expect_eq(r, n as i64); }
+    if (g_served != 1) { return expect_eq(g_served, 1 as i64); }
+    return expect_eq(g_body_seen, n as i64);
+}
+
+![test]
+function h2c_loopback_header_block_spanning_continuation_frames() -> Result<(), TestError> {
+    g_served = 0; g_body_seen = 0; g_headers_seen = 0;
+    // 300 fields of a ~200-octet value encode to far more than the 16384-octet
+    // max frame size, so the block cannot go out in a single HEADERS frame.
+    const count: u64 = 300;
+    mut server: Http2Server = match (h2_bind()) {
+        Result::Ok(s)  => { s }
+        Result::Err(_) => { return bail(Str::new("h2 bind 127.0.0.1:0 failed")); }
+    };
+    const port: u16 = match (server.local_addr()) {
+        Result::Ok(a)  => { a.port }
+        Result::Err(_) => { server.drop(); return bail(Str::new("local_addr failed")); }
+    };
+    mut ex: Executor = Executor::new();
+    const r: i64 = ex.block_on(h2_join_headers(port, server, count));
+    ex.drop();
+    if (r != REPLY_LEN) { return expect_eq(r, REPLY_LEN); }
+    if (g_served != 1)  { return expect_eq(g_served, 1 as i64); }
+    // Every padded field survived the split and was reassembled from the
+    // CONTINUATION fragments, plus the two the server synthesizes. One field
+    // lost in a fragment boundary shows up here as a number.
+    return expect_eq(g_headers_seen, (count as i64) + SYNTHESIZED_HEADERS);
+}
+
+![test]
+function h2c_loopback_serves_several_requests_on_one_connection() -> Result<(), TestError> {
+    g_served = 0; g_body_seen = 0; g_headers_seen = 0;
+    const n: i64 = 4;
+    mut server: Http2Server = match (h2_bind()) {
+        Result::Ok(s)  => { s }
+        Result::Err(_) => { return bail(Str::new("h2 bind 127.0.0.1:0 failed")); }
+    };
+    const port: u16 = match (server.local_addr()) {
+        Result::Ok(a)  => { a.port }
+        Result::Err(_) => { server.drop(); return bail(Str::new("local_addr failed")); }
+    };
+    mut ex: Executor = Executor::new();
+    const r: i64 = ex.block_on(h2_join_sequential(port, server, n));
+    ex.drop();
+    if (r != n) { return expect_eq(r, n); }
+    // One dispatch per request, and the synthesized pair on each — so a request
+    // silently served twice, or one whose headers leaked into the next, moves
+    // this count.
+    if (g_served != n) { return expect_eq(g_served, n); }
+    return expect_eq(g_headers_seen, n * SYNTHESIZED_HEADERS);
+}
+
+![test]
+function h2c_loopback_client_close_ends_the_server_loop() -> Result<(), TestError> {
+    g_served = 0; g_body_seen = 0; g_headers_seen = 0;
+    mut server: Http2Server = match (h2_bind()) {
+        Result::Ok(s)  => { s }
+        Result::Err(_) => { return bail(Str::new("h2 bind 127.0.0.1:0 failed")); }
+    };
+    const port: u16 = match (server.local_addr()) {
+        Result::Ok(a)  => { a.port }
+        Result::Err(_) => { server.drop(); return bail(Str::new("local_addr failed")); }
+    };
+    mut ex: Executor = Executor::new();
+    const r: i64 = ex.block_on(h2_join_close(port, server));
+    ex.drop();
+    // The client handshook and left; the server's read loop reported a clean end
+    // (pair.0 == 1) rather than an error, which it can only see if the client's
+    // connection was actually released.
+    if (r != 1) { return expect_eq(r, 1 as i64); }
+    return expect_eq(g_served, 0 as i64);
 }
