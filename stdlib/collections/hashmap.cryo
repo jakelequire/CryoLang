@@ -22,6 +22,7 @@ import core::result;
 import core::cmp;
 import core::hash;
 import core::drop;
+import core::mem;
 import core::clone;
 import core::default;
 import core::iter;
@@ -353,13 +354,11 @@ type struct HashMap<K, V, A = GlobalAlloc> {
         loop {
             if (node == null) { break; }
             if (node.hash == h && node.key.equals(&key)) {
-                // Move the old value out and hand it back. Read through a
-                // pointer (not a direct field read) so the move-checker does
-                // not mistake this for an aliasing copy: ownership transfers
+                // Move the old value out and hand it back. Ownership transfers
                 // cleanly because `node.value` is overwritten on the next line,
                 // so the slot never co-owns the buffer now held by `previous`.
                 const slot: V* = &node.value;
-                const previous: V = *slot;
+                const previous: V = mem::take_ptr(slot);
                 node.value = value;
                 return Result::Ok(Option::Some(previous));
             }
@@ -459,11 +458,11 @@ type struct HashMap<K, V, A = GlobalAlloc> {
             if (node == null) { break; }
             if (node.hash == h && node.key.equals(key)) {
                 *cursor = node.next;               // unlink: single store
-                // Move the value out through a pointer (see `insert`): the node
-                // is freed just below, so `removed` becomes the sole owner of
-                // the buffer - no aliasing copy, no double free.
+                // Move the value out (see `insert`): the node is freed just
+                // below without running the slot's destructor, so `removed`
+                // becomes the sole owner of the buffer.
                 const slot: V* = &node.value;
-                const removed: V = *slot;
+                const removed: V = mem::take_ptr(slot);
                 node.key.drop();
                 free_entry(this, node);
                 this.length = this.length - 1;
