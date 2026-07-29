@@ -23,34 +23,18 @@ function zero<T>(dest: T*, count: u64) -> void {
     intrinsics::memset(dest, 0, count * sizeof(T));
 }
 
-/// Destructively read the value at `src`.
-///
-/// The returned value becomes the SOLE owner of whatever `*src` held. The
-/// caller must guarantee the storage at `src` is never dropped afterwards -
-/// by overwriting it, by freeing its containing allocation without running
-/// the pointee's destructor, or because it was leaked and nothing drops it.
-/// Breaking that guarantee frees the same resource twice.
-///
-/// This is the explicit form of a move out of a pointer. Reading `*src` by
-/// value directly is rejected (E0453) precisely because the compiler cannot
-/// see which of those guarantees the caller is relying on; naming this
-/// function is the caller stating that one of them holds.
-///
-/// The value is copied BYTEWISE into fresh storage rather than read through
-/// the pointer, which is what keeps the source out of move-checked position.
-function take_ptr<T>(src: T*) -> T {
-    mut result: T;
-    intrinsics::memcpy(&result, src, sizeof(T));
-    return result;
-}
-
 /// Swap the values at `a` and `b`.
 function swap<T>(a: T*, b: T*) -> void {
-    // A permutation, not a duplication: `a`'s value is taken out before `a` is
-    // overwritten, so no storage is ever owned twice.
-    const temp: T = take_ptr(a);
-    *a = *b;
-    *b = temp;
+    // A permutation, not a duplication: every value read out through a pointer
+    // is replaced by the store that follows it, so no storage is ever owned
+    // twice. That balance is the whole safety argument, which is why the
+    // `unsafe` block spans all three statements rather than each read - a read
+    // on its own would be a genuine double free.
+    unsafe {
+        const temp: T = *a;
+        *a = *b;
+        *b = temp;
+    }
 }
 
 /// Offset a typed pointer by `count` elements (not bytes). Negative

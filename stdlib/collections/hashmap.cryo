@@ -22,7 +22,6 @@ import core::result;
 import core::cmp;
 import core::hash;
 import core::drop;
-import core::mem;
 import core::clone;
 import core::default;
 import core::iter;
@@ -358,7 +357,11 @@ type struct HashMap<K, V, A = GlobalAlloc> {
                 // cleanly because `node.value` is overwritten on the next line,
                 // so the slot never co-owns the buffer now held by `previous`.
                 const slot: V* = &node.value;
-                const previous: V = mem::take_ptr(slot);
+                mut previous: V;
+                // Sound because of the store on the next line: the slot is
+                // overwritten before anything can drop it, so `previous`
+                // becomes the sole owner of what it held.
+                unsafe { previous = *slot; }
                 node.value = value;
                 return Result::Ok(Option::Some(previous));
             }
@@ -462,7 +465,11 @@ type struct HashMap<K, V, A = GlobalAlloc> {
                 // below without running the slot's destructor, so `removed`
                 // becomes the sole owner of the buffer.
                 const slot: V* = &node.value;
-                const removed: V = mem::take_ptr(slot);
+                mut removed: V;
+                // Sound because `free_entry` below releases the node without
+                // running the slot's destructor, so `removed` becomes the sole
+                // owner of what the slot held.
+                unsafe { removed = *slot; }
                 node.key.drop();
                 free_entry(this, node);
                 this.length = this.length - 1;
