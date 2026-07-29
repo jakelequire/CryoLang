@@ -9,7 +9,7 @@ Cryo is a statically-typed, compiled systems language. It targets native machine
 
 2. **One toolchain.** Build, run, test, fetch, init, and check are subcommands of a single `cryo` binary. The package manager, the test runner, and the dependency resolver ship with the compiler.
 
-3. **Pay for what you use.** Cryo provides single-inheritance classes with virtual dispatch *and* a trait system with monomorphic dispatch. Use a class when the program needs runtime polymorphism over a heterogeneous collection; use a trait when you want compile-time abstraction.
+3. **Ownership without lifetimes.** Cryo tracks ownership statically - `Copy` and `Drop` are inferred structurally, destructors are synthesised at every scope exit, and using a value after it has moved is a hard error - but there is no borrow checker, no lifetime annotations, and no garbage collector. Raw pointers stay unchecked and aliasing stays the programmer's responsibility. The model buys deterministic destruction and use-after-move rejection without asking you to prove your program correct to the compiler.
 
 The rest of this document is organised by feature area. Examples are runnable against the current compiler; anything aspirational is marked.
 

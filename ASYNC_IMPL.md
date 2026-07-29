@@ -35,7 +35,7 @@ not for routine judgement calls.
 |---|---|---|
 | 0 | Design lock-down (surface, trait shapes, lowering placement) — get Jake's sign-off | ✅ done — locked 2026-07-22 (§7 filled) |
 | 1 | Core types in stdlib (`Poll`/`Future`/`Context`/`Waker`) + `block_on` + hand-written futures | ✅ done+validated 2026-07-22 (no repin) |
-| 2 | Compiler: `async fn` parse + state-machine lowering + `await` desugar | ✅ DONE+validated. **Address stability (increment 4) NOT done — BLOCKED 2026-07-28.** A carried droppable local still moves between its `Option<T>` field and a fresh block-local on every poll, so a pointer into an async fn's own frame does not survive a suspend; the red probe is `.todo/async_carrier_address_probe.cryo` (reads `0`, must read `55`). The design IS settled and does **not** need flag-gated drops — keep the `Option<T>` field and reach the payload in place via `unwrap_ptr`. **Its blocker is now REMOVED (2026-07-28, later).** In-place residency turns a missed give-away from a loud `unwrap`-on-`None` into a **silent double free**, so it needed a rejection of by-value moves out of `*p`, which in turn needed sound argument classification. Both landed: arguments are now classified from real **parameter types** (`ArgBinding`, set in sema, consumed in lockstep by all four argument loops), `!autoref` is gone as a by-value proxy, and `check_deref_move_out` is in the tree and does **not** misfire on the lowering's own `*this$recv`. `unsafe` became the escape hatch and `core::mem::take_ptr` was **deleted** (Jake's call — it was byte-identical to `*p` and existed only to be invisible to the checker). Two pre-existing defects fixed on the way: `unsafe { }` silently disabled move checking wholesale, and a generic call reachable only from inside an `unsafe` block was never specialized. See the newest §9 entry. Earlier: **Two carried-aggregate soundness bugs fixed 2026-07-27** — (1) `await <method>` on an owning local inside a LOOP left its carrier empty (`unwrap` on `None`): the pass asked "did this state give the value away?" AFTER inserting its own by-value hand-back store, and mistook that store for the answer; (2) an `async fn` with NO awaits COPIED an owning parameter out of its field instead of moving it, double-freeing it. Both fixed at the root in `async_lower.cryo`; the `Join` diagnosis recorded under `TcpConn` was wrong and is corrected. New permanent coverage: `async_stress_shapes.cryo` (31 tests, asserted numbers + counted drops, every shape paired with a control) and the flood test. See the newest §9 entry. Earlier: DONE+validated; **the deferred aggregate-across-await tail LANDED 2026-07-24 — an `async function` can now hold an aggregate across a suspend, take a droppable aggregate parameter, and be `spawn`ed on an `Executor`** (see the newest §9 entry). Earlier: DONE (2026-07-23) — parse + no-await (1b) + single await (2) + N straight-line (3) + awaits across `if`/`else` (4a) + awaits across `while`/`for`/`loop`/`do-while` + `break`/`continue` + `mut` loop-carried promotion (4b) + scope-aware alpha-rename, all committed through `5e28a74f`. **Inc 4c DONE (2026-07-23): `await` inside a `match` arm — dispatch `match(subj)` → per-arm entry states → join; scalar pattern bindings captured to fields (aggregate→E0600, ref→E0455); pattern bindings alpha-renamed for by-name soundness; non-exhaustive match gets synth `_ => join`. Plus the bare-block-with-await warm-up. Both-OS fixed point, `win-s2`/`win-s3` = 0/235 `.ll` → NO REPIN, UNCOMMITTED.** All common control flow now lowers → Phase 2 complete. |
+| 2 | Compiler: `async fn` parse + state-machine lowering + `await` desugar | ✅ DONE+validated. **Address stability (increment 4b) LANDED 2026-07-28 for the shapes the in-place spelling can express.** A carried aggregate is now BUILT INTO its `Option<T>` carrier field and every state reaches it through `unwrap_ptr`, so its address is the future's own and a pointer into it survives a suspend; the acceptance probe reads `55` (it reads `0` under the pin) and is promoted to `lang/async_carried_local_address_stable.cryo`. Two `E0455` negatives were INVERTED into positive tests. **Still on the moving carrier:** a value a state GIVES AWAY, and one a state REBUILDS — both need a position-aware substitution (`subst_name_expr`/`subst_name_stmt`, 47 call sites, no by-value/borrow flag), which is the next increment. Until it lands the rest of the frame-address subsystem and `emit_recv_refresh` stay live and stay needed. Drop TIMING is restored explicitly by `release_before_ready` — deferring a carried socket's close to future-drop deadlocked a real test. The design IS settled and does **not** need flag-gated drops — keep the `Option<T>` field and reach the payload in place via `unwrap_ptr`. **Its blocker is now REMOVED (2026-07-28, later).** In-place residency turns a missed give-away from a loud `unwrap`-on-`None` into a **silent double free**, so it needed a rejection of by-value moves out of `*p`, which in turn needed sound argument classification. Both landed: arguments are now classified from real **parameter types** (`ArgBinding`, set in sema, consumed in lockstep by all four argument loops), `!autoref` is gone as a by-value proxy, and `check_deref_move_out` is in the tree and does **not** misfire on the lowering's own `*this$recv`. `unsafe` became the escape hatch and `core::mem::take_ptr` was **deleted** (Jake's call — it was byte-identical to `*p` and existed only to be invisible to the checker). Two pre-existing defects fixed on the way: `unsafe { }` silently disabled move checking wholesale, and a generic call reachable only from inside an `unsafe` block was never specialized. See the newest §9 entry. Earlier: **Two carried-aggregate soundness bugs fixed 2026-07-27** — (1) `await <method>` on an owning local inside a LOOP left its carrier empty (`unwrap` on `None`): the pass asked "did this state give the value away?" AFTER inserting its own by-value hand-back store, and mistook that store for the answer; (2) an `async fn` with NO awaits COPIED an owning parameter out of its field instead of moving it, double-freeing it. Both fixed at the root in `async_lower.cryo`; the `Join` diagnosis recorded under `TcpConn` was wrong and is corrected. New permanent coverage: `async_stress_shapes.cryo` (31 tests, asserted numbers + counted drops, every shape paired with a control) and the flood test. See the newest §9 entry. Earlier: DONE+validated; **the deferred aggregate-across-await tail LANDED 2026-07-24 — an `async function` can now hold an aggregate across a suspend, take a droppable aggregate parameter, and be `spawn`ed on an `Executor`** (see the newest §9 entry). Earlier: DONE (2026-07-23) — parse + no-await (1b) + single await (2) + N straight-line (3) + awaits across `if`/`else` (4a) + awaits across `while`/`for`/`loop`/`do-while` + `break`/`continue` + `mut` loop-carried promotion (4b) + scope-aware alpha-rename, all committed through `5e28a74f`. **Inc 4c DONE (2026-07-23): `await` inside a `match` arm — dispatch `match(subj)` → per-arm entry states → join; scalar pattern bindings captured to fields (aggregate→E0600, ref→E0455); pattern bindings alpha-renamed for by-name soundness; non-exhaustive match gets synth `_ => join`. Plus the bare-block-with-await warm-up. Both-OS fixed point, `win-s2`/`win-s3` = 0/235 `.ll` → NO REPIN, UNCOMMITTED.** All common control flow now lowers → Phase 2 complete. |
 | 3 | Executor + `Waker` + `spawn`/`JoinHandle`; multi-thread; poll-boundary `catch_unwind` isolation | ✅ DONE+validated (2026-07-24) — surface LOCKED 2026-07-23. **(a)** single-thread executor + ready-queue + re-enqueueing Waker; **(b)** `spawn`/`JoinHandle` (Output via `TaskShared<O>`), `block_on`, `join`/`detach`/`abort`, drop=detach; **(c)** pthread worker pool + per-task atomic run-state (IDLE/SCHEDULED/RUNNING/NOTIFIED) + condvar `join`/`block_on` + `catch_unwind` poll-boundary isolation. Needed a NEW compiler `![config(panic_unwind)]` gating atom (see §9) → Phase-1 both-OS REPIN (selfhost fixed point, 235 `.ll`). Executor is self-contained (own pthread wrappers, no `thread::Scope` dep). Validated on Linux: regression 30/30, isolation 30/30. UNCOMMITTED. |
 | 4 | Reactor (epoll/IOCP) + async I/O over `std::net` + timers + `async fn main` + combinators | ◐ in progress 2026-07-24. **Inc 4b DONE on Linux (reactor + async TCP, stress+leak clean); Windows AFD backend written but UNVALIDATED (wine 9.0 cannot service `IOCTL_AFD_POLL` — needs a real Windows box).** Interface fork LOCKED by Jake: **one readiness interface both OSes, Windows via real AFD** (not WSAPoll, not a per-OS split). Sockets are to become **async-only with every consumer ported** (Jake, 2026-07-24) — that port is **UNBLOCKED as of 2026-07-24**: the aggregate-across-await tail landed, and the follow-on "rebuilt from inside a branch" E0600 is now removed too (newest §9 entry). Forks LOCKED earlier: waker lifetime = **separate `Arc`-wrapper**; reactor = **dedicated thread, per-`Executor`** (`![thread_local]` current-reactor handle); platform = **both OSes (epoll + IOCP)**. **Inc 4a DONE+validated (2026-07-24): Arc-refcounted `Waker` (Copy→non-Copy) + `Arc<Task>` lifetime; finish-vs-park now implicit via `Task::drop` on the last decref. Needed a COMPILER fix (owner-generic static with a defaulted owner param + nested return → E0636; `call_resolver.cryo` default-backfill) → selfhost fixed point BOTH OS, win-s2 vs win-s3 = 0/235 `.ll`, REPINNED both OS. UNCOMMITTED.** NEXT = Inc 4b (the reactor: epoll+IOCP interface — bring Jake the readiness-vs-completion unification fork). |
 
@@ -4439,3 +4439,149 @@ reach the payload in place via `unwrap_ptr`, no flag-gated drops). What is now a
 a missed give-away in the generated body surfaces as `E0453` instead of a silent double free — subject
 to the classification gap above, which is why closing that gap is the natural next step before the
 carrier rewrite.
+
+### 2026-07-28 (later still) — classification reaches module calls; the in-place carrier LANDS for the shapes it can express
+
+Two things, in the order the previous handoff asked for.
+
+#### 1. Argument classification now reaches a module-qualified call — and it was hiding a silent LEAK
+
+The gap was wider than it had been written down as. It is not "a qualified *generic* free call": it is
+**every call whose scope names a MODULE by a suffix of its namespace**, generic or not — which is how
+nearly every stdlib free function is spelled (`mem::swap`, `hash::digest`, `intrinsics::frexp`).
+`resolve_call` had three sources for the callee's parameter types; two ask for a type-scoped name and
+the third for an enum-variant payload, so a module scope fell through all three and **every argument of
+such a call stayed `Unclassified`**.
+
+`Unclassified` reads as a *transfer* to the move passes — the right default when the answer is a move
+set — so a value merely **lent** to such a function was recorded as moved and its scope-exit drop
+suppressed. Same file, both compilers:
+
+```
+hash::digest<Res>(r)     // digest<T>(value: &T) — a borrow
+  pinned   hash_drops=0     <- leaked
+  fixed    hash_drops=1
+
+mem::drop<Res>(*p)       // drop<T>(_v: T) — by value
+  pinned   No errors found
+  fixed    error[E0453]
+```
+
+**The fix** is a fourth source, `lookup_module_qualified_param_types`, resolved through the module
+graph. The module-selection walk (suffix match, then arity, then longest shared namespace prefix) was
+extracted out of `resolve_module_qualified_function` into `resolve_module_qualified_symbol` and is now
+**shared**, so parameter-type lookup and return-type resolution cannot pick different modules —
+classifying an argument against one module's signature while the call resolves to another's would hand
+the move passes an ownership answer for a function that is not being called.
+
+Verified where it mattered: instrumenting `walk_argument` and building the whole stdlib, all **16**
+`*this$recv` deref-arguments report `BORROWED`, having previously reported `Unclassified`.
+
+New coverage: `lang/qualified_module_call_arg_binding.cryo` (5 tests, all counting destructor runs) and
+`negative/E0453_deref_move_out_qualified_call.cryo`. The lending test is rejected outright by the pinned
+compiler (`E0452: use of moved value`) — that is its discrimination proof.
+
+#### 2. Increment 4b: a carried aggregate lives in its field
+
+`promote_cross_state`'s aggregate branch now has an in-place path. The value is **built directly into**
+its `Option<T>` carrier field, and every state — the declaring one included — opens by binding
+`mut <nm>$p: T* = this.__agg_<ds>_<nm>.unwrap_ptr();` and reads through `*<nm>$p`. No take, no
+hand-back, no `store_before_suspends`. One pointer name across all states, because the state blocks
+share AST statement nodes; safe here in a way an owning local is not, since the binding owns nothing.
+
+**The acceptance test passes.** The probe is promoted into
+`lang/async_carried_local_address_stable.cryo` (3 tests) and `.todo/async_carrier_address_probe.cryo` is
+deleted. Same source, both compilers:
+
+```
+                      pinned      fixed
+one_suspend_saw          0          55      drops=1 / drops=1
+untouched_saw            0           0      drops=1 / drops=1     <- control
+two_suspends_saw         0          77      drops=1 / drops=1
+```
+
+The control reads 0 under both, as it must: what discriminates is a **third party writing through a
+pointer the value published while the future is parked**, never an address comparison — a driver
+re-entering `poll` from the same loop reuses the same stack region, so a block-local copy lands at the
+same address every time and the moving carrier reports "stable" too.
+
+**Two `E0455` negatives were INVERTED, not deleted.** `E0455_async_pointer_to_carried_local` and
+`E0455_async_pointer_from_accessor` now compile and are correct, so both became positive tests at the
+end of `lang/async_pointer_across_await.cryo`, each asserting the value written through the pointer.
+The other frame-address rejections still fire and are still needed.
+
+**What is NOT in place, and why.** Two shapes still take the moving path, recognised by
+`carrier_can_live_in_place`:
+
+- a state that **gives the value away**. In place, the field owns the value outright, so a by-value use
+  must **empty the field at that site** (`take().unwrap()`); a bare alias would leave the callee and the
+  field both owning it.
+- a state that **rebuilds** it (a write before any read, top-level or branch-nested). Publishing a
+  second value has to drop the first, and an assignment does not.
+
+Both need a position-aware substitution — one that knows whether a mention sits in a by-value or a
+borrow position. `subst_name_expr`/`subst_name_stmt` have 47 call sites between them and thread no such
+flag; that is its own increment and was deliberately not bundled. **Until it lands, none of the
+remaining §4 deletions are possible** — `emit_recv_refresh` and the rest of the frame-address subsystem
+are still live and still needed.
+
+#### Three findings, each measured rather than reasoned
+
+**1. §2's guarantee worked the first time it fired.** The first build with an *unconditional* in-place
+carrier failed with
+
+```
+error[E0453]: cannot move a value that owns a destructor out of a pointer
+  --> stdlib/net/ws/conn.cryo:211  (async recv)
+```
+
+— a give-away surfacing as a loud compile error instead of a silent double free. That is what exposed
+the hole in the first eligibility predicate: `last_use_consumes` answers *"does the state still own the
+value as it falls off its end"*, and in-place residency needs the stronger *"does ANY mention hand it
+over"*. Hence `any_use_gives_away`, which drives the same walker with a sticky flag — a by-value mention
+no longer downgraded by a later borrow, and no branch skipped for returning.
+
+**2. Drop TIMING is load-bearing, and a test said so out loud.** Leaving the value in its field defers
+its destructor to the future's own drop. `NetTcpConn::tcp_conn_reports_a_truncated_record_as_eof`
+**deadlocked** on that: the sending half ends `return 1;   // dropping c here closes the socket
+mid-record`, and with the close deferred the receiving half waited on an EOF that never came. So the
+release is not cosmetic and is now implemented — `release_before_ready` rewrites each completion return
+to
+
+```
+mut <rv>: <Output> = <value>;
+this.<field>.take();          // one per in-place carrier
+return Poll::Ready(<rv>);
+```
+
+Three things about that shape were each learned by breaking it:
+
+- **The payload must be HOISTED first.** Releasing before it is evaluated empties the very field the
+  value is read through, and the address-stability probe went straight back to `0`.
+- **The PAYLOAD is hoisted, not the whole `Poll::Ready(...)`.** Binding the wrapper needs to spell
+  `Poll<Output>`, and the lowering's `poll_out` is the bare `Poll` in generic and trait-method contexts
+  — fine as a return expression, not as a declared local type.
+- **The release is a DISCARDED temporary.** Binding it to `mut <tmp>: Option<T>` made the declaration
+  the authority on the type and sema then resolved the `take` call to a different `Option`
+  instantiation. See finding 3.
+
+The only payload released *ahead of* the return is a bare literal, which names no storage. Asking
+instead whether the payload mentions a carrier pointer is a **different and wrong** question: a pointer
+derived from the carrier earlier in the function (`p = owner.conn()`) reads that storage without naming
+it, and the accessor test returned 2 instead of 3. A payload whose type is still abstract is not hoisted
+at all and simply keeps the old timing — the previous behaviour, not a new hazard.
+
+**3. NEW, pre-existing, and NOT an async defect: `Option<u8[8]>` and `Option<u8[]>` collide.**
+Instantiating `Option` over both a sized and a dynamic array in one compilation unit produces
+`expected u8[8]*, found &u8[]` from inside `option.cryo`. **Reproduces identically under the pinned
+compiler**, with no async involved:
+
+```
+mut a: Option<u8[8]> = Option::Some([0; 8]);   mut ta: Option<u8[8]> = a.take();
+mut b: Option<u8[]>  = Option::Some([1,2,3]);  mut tb: Option<u8[]>  = b.take();
+```
+
+Either alone is fine. It only surfaced now because carrying a `u8[8]` across an `await` used to be
+rejected outright, so the instantiation was never reached. The inverted test wraps its array in a struct
+to avoid provoking an unrelated bug; the shape itself is untouched. Type identity for array types is its
+own increment.
