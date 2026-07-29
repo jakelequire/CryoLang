@@ -4737,3 +4737,80 @@ site so MoveCheck sees an ordinary move — sound, but hoisting out of an arbitr
 (`return`, nested call argument, match arm) is real work; or (b) reject a mention that follows a
 give-away in the lowering, with branch-precision so a give-away on a returning path does not
 false-positive. **This is a soundness-contract call and it is Jake's.**
+
+## 2026-07-29 (later) — array LENGTH is part of a type's identity: `T[N]` vs `T[]` no longer collide
+
+Jake's named ask, and it was **pre-existing and fully synchronous** — not an async defect.
+
+### The defect
+
+`MangleContext::encode_type_ref` encoded every array as `A` + element and threw `a.size` away, so
+`u8[8]`, `u8[16]` and `u8[]` all encoded as `Ah`. `specialized_identifier` — *the* key for every
+monomorphized type and function — is built from that encoding, so the three types shared ONE key: one
+specialization, and whichever instantiation was registered first answered for all of them.
+
+Twelve lines reproduce it under the old pin; either declaration ALONE is fine:
+
+```cryo
+mut a: Option<u8[8]> = Option::Some([0; 8]);
+mut ta: Option<u8[8]> = a.take();      // error[E0200]: expected `Option<u8[8]>`, found `Option<u8[]>`
+mut b: Option<u8[]>  = Option::Some([1, 2, 3]);
+mut tb: Option<u8[]> = b.take();
+```
+
+The arena was never at fault: `get_array_of` interns on the raw two's-complement `size` bits, so the
+three types were always three distinct `TypeRef`s — the diagnostic even printed them differently. Purely
+a key collision.
+
+### The fix — two sites, in lockstep
+
+- `resolver/mangled_name.cryo`: a FIXED array encodes as `A$L<N>$G` + element; a dynamic `T[]` keeps the
+  bare `A` + element. The length is bracketed in the existing `$L`/`$G` pair rather than written bare
+  because no type code may begin with `$`, so the form is self-delimiting and round-trips — a bare `A8h`
+  could not be told from an element code beginning with a digit.
+- `resolver/demangler.cryo`: the mirror. `A$L<N>$G<elem>` renders `elem[N]`, bare `A<elem>` renders
+  `elem[]`.
+- `docs/cryo-mangling-spec.md`: both rows updated.
+
+Keeping the dynamic form byte-identical is what made this cheap: **the stdlib's symbol set is unchanged.**
+Verified, not assumed — `nm` over `libcryo.a` built by the old pin and by the new compiler diffs to
+**zero lines** (7905 symbols), because the stdlib never puts a fixed-size array in a mangled position.
+So there was no bootstrap hazard and no 2-phase repin was needed.
+
+### The `-2` fixed-pending trap, reasoned about and closed
+
+A `T[NAME]` parses with `size = ArrayAnnotation::fixed_pending_size()` (-2) until its size expression is
+folded. Had that reached the mangler, a length-bearing key would split ONE type across two keys
+(pending vs resolved) and turn a collision bug into a "no specialization found" bug.
+
+It cannot. `arena.get_array_of` is the only constructor of an arena `ArrayType`, and the only annotation
+path into it (`types/resolver.cryo:281`) goes through `TypeResolver::array_size_of`, which folds `-2` to
+a concrete length or reports E0239 rather than leaving it pending. The parser always pairs the `-2`
+marker with a `size_expr`, so the one pass-through branch is unreachable in a program that compiles. The
+other `get_array_of` callers are substitution walkers that copy an existing arena size. The reasoning is
+recorded in the comment at the encode site. `ArrayType::fixed_pending_size()` is defined but read by
+nothing — left alone deliberately; `is_dynamic()`'s grouping of -1 and -2 was NOT touched.
+
+### Tests — and they discriminate
+
+`tests/lang/array_length_type_identity.cryo`, 7 tests asserting lengths and element values rather than
+merely compiling: fixed+dynamic together, two fixed lengths (`u8[8]` vs `u8[16]` — the case Jake named),
+all three spellings at once, the same collision through a user generic rather than `Option`, plus three
+controls — same length different elements, one length written twice (must stay ONE type, guarding against
+over-splitting), and a zero-length `u8[0]` (so `0` is not confused with the dynamic marker).
+
+The file draws **17 errors under the old pin** and passes 7/7 under the new compiler. Round-trip proven
+on real generated symbols: `takes_fixed` → `A$L8$Gh`, `takes_big` → `A$L16$Gh`, `takes_dyn` → `Ah`, and
+`cryo demangle` renders `u8[8]` / `u8[16]` / `u8[]` respectively.
+
+### Gates
+
+`make test` → **1910 unit / 0 failed, compile-fail 165, projects 14** (Linux; 1903 baseline + 7 new).
+Roster merged with `--merge`, 1911 entries, the Windows-only entry kept.
+
+### DECIDED by Jake — the E0452 gap gets fix (a)
+
+The use-after-give-away-inside-one-state gap from the entry above is to be closed by **hoisting the take
+into a named local at the give-away site**, so MoveCheck sees an ordinary move and its existing
+flow-sensitive tracking reports E0452 unchanged. Rejected: re-implementing flow reasoning inside the
+lowering, which would be a second, weaker move analysis in a different pass. Not yet implemented.
