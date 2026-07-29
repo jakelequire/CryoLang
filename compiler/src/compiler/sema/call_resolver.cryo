@@ -374,6 +374,17 @@ type struct CallResolver {
                 param_types = this.lookup_scope_variant_payload_types(call.callee as ScopeResolutionNode*);
             }
         }
+        // A scope that names a MODULE rather than a type or enum reaches none of
+        // the above: the first two ask for a type-scoped name and the third for
+        // an enum variant.  Resolved through the module graph so a namespace
+        // written as a suffix (`mem` for `std::core::mem`) is found.
+        if (param_types.length == 0) {
+            const callee_node: ASTNode* = call.callee as ASTNode*;
+            if (callee_node.kind == NodeKind::ScopeResolution) {
+                param_types = this.lookup_module_qualified_param_types(
+                    call.callee as ScopeResolutionNode*, call);
+            }
+        }
         // For an EXPLICIT generic free call (`passthru<i32>(...)`), the param
         // types above came from the template fn type and still carry the
         // template's generic params (e.g. `Option<Option<T>>`).  Substitute the
@@ -4090,14 +4101,24 @@ type struct CallResolver {
         return TypeRef::invalid();
     }
 
-    /// Resolve a module-qualified function (`intrinsics::frexp`) via the module
-    /// graph, disambiguating same-leaf collisions by arity then namespace prefix.
-    resolve_module_qualified_function(mut &this, scope_name: SymbolStr, member_name: SymbolStr,
-                                      call: CallExprNode*, scope: ScopeResolutionNode*) -> TypeRef {
+    /// The fully-qualified `namespace::member` symbol a module-qualified call
+    /// (`intrinsics::frexp`, `mem::swap`) names, or the empty symbol when no
+    /// module matches.  The scope written at the call site may be a SUFFIX of
+    /// the defining namespace (`mem` for `std::core::mem`), so the module graph
+    /// is walked rather than the name being interned directly; same-leaf
+    /// collisions are broken by arity, then by longest shared namespace prefix
+    /// with the current module.
+    ///
+    /// Shared by return-type resolution and by parameter-type lookup so the two
+    /// cannot pick different modules: classifying an argument against one
+    /// module's signature while the call resolves to another's would hand the
+    /// move passes an ownership answer for a function that is not being called.
+    resolve_module_qualified_symbol(mut &this, scope_name: SymbolStr, member_name: SymbolStr,
+                                    call: CallExprNode*) -> SymbolStr {
         const scope_str: string = this.intern.resolve(scope_name);
         const member_str: string = this.intern.resolve(member_name);
         const scope_len: i64 = scope_str.length() as i64;
-        if (scope_len == 0) { return TypeRef::invalid(); }
+        if (scope_len == 0) { return SymbolStr::empty(); }
         const mg: ModuleGraph* = this.ctx.module_graph;
         const modules: &ModuleInfo[] = &mg.modules;
         const call_arity: i64 = if (call != null) { call.arguments.length } else { -1 };
@@ -4138,10 +4159,48 @@ type struct CallResolver {
         mut chosen_i: i64 = first_i;
         if (arity_count == 1) { chosen_i = arity_i; }
         else if (prefix_ties == 1 && prefix_i >= 0) { chosen_i = prefix_i; }
-        if (chosen_i < 0) { return TypeRef::invalid(); }
+        if (chosen_i < 0) { return SymbolStr::empty(); }
 
         const chosen_ns: string = this.intern.resolve(modules[chosen_i].namespace_name);
-        const q_sym: SymbolStr = this.ctx.intern(chosen_ns + "::" + member_str);
+        return this.ctx.intern(chosen_ns + "::" + member_str);
+    }
+
+    /// The declared parameter types of a module-qualified free function, for
+    /// expected-type propagation and argument classification.
+    ///
+    /// `lookup_callee_function_type` cannot answer this shape: its
+    /// `ScopeResolution` branch interns the call site's own spelling
+    /// (`mem::swap`) and asks `resolve_scoped_or` to canonicalize the scope,
+    /// which resolves TYPE scopes only.  A scope that names a MODULE by a
+    /// suffix of its namespace therefore found nothing, and every argument of
+    /// such a call stayed unclassified - so the move passes read each one as a
+    /// transfer and the `*p` move-out rejection stood down on the exact call
+    /// shape (`mem::swap<T>(&s, this)`) it exists to police.  Generic or not is
+    /// irrelevant: `helper::eat_res(*p)` missed it too.
+    ///
+    /// For a generic template the parameters still carry the template's own
+    /// generic params (`T*`); the caller substitutes any turbofish args, and
+    /// either way the ownership answer is the same, since substitution cannot
+    /// turn a pointer parameter into a by-value one.
+    lookup_module_qualified_param_types(mut &this, scope: ScopeResolutionNode*,
+                                        call: CallExprNode*) -> TypeRef[] {
+        if (this.ctx.decl_index == null || this.ctx.module_graph == null) { return []; }
+        const q_sym: SymbolStr = this.resolve_module_qualified_symbol(
+            scope.scope_name, scope.member_name, call);
+        if (!q_sym.is_valid()) { return []; }
+        const ft: TypeRef = this.ctx.decl_index.lookup_func_type(q_sym);
+        if (!ft.is_valid()) { return []; }
+        const ft_raw: Type* = this.arena.lookup(ft.id);
+        if (ft_raw == null || ft_raw.kind != TypeKind::Function) { return []; }
+        return sema_copy_type_refs(&(ft_raw as FunctionType*).param_types);
+    }
+
+    /// Resolve a module-qualified function (`intrinsics::frexp`) via the module
+    /// graph, disambiguating same-leaf collisions by arity then namespace prefix.
+    resolve_module_qualified_function(mut &this, scope_name: SymbolStr, member_name: SymbolStr,
+                                      call: CallExprNode*, scope: ScopeResolutionNode*) -> TypeRef {
+        const q_sym: SymbolStr = this.resolve_module_qualified_symbol(scope_name, member_name, call);
+        if (!q_sym.is_valid()) { return TypeRef::invalid(); }
         const ret: TypeRef = this.types.lookup_func_return(q_sym);
         if (!ret.is_valid()) { return TypeRef::invalid(); }
 

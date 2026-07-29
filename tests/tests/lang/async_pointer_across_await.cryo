@@ -88,3 +88,68 @@ function global_pointer_survives_suspend() -> Result<(), TestError> {
 function transient_local_address_is_allowed() -> Result<(), TestError> {
     return expect_eq(future::block_on(transient_local_address()), 2 as i64);
 }
+
+// -- Pointers into the async fn's OWN frame, once carried values stopped moving --
+//
+// Both shapes below used to be hard errors (E0455), and rightly so: a carried
+// local was copied into a fresh block-local on every poll, so an address taken
+// before a suspend named storage a later state had stopped reading. Writes
+// through it landed on an abandoned copy and reported a plausible wrong value
+// rather than faulting.
+//
+// A carried aggregate now lives in its `Option<T>` carrier field for the whole
+// life of the future, so its address is the future's own and holds still. These
+// are the inverted forms of what were negative/E0455_async_pointer_to_carried_local
+// and negative/E0455_async_pointer_from_accessor; each asserts the value written
+// through the pointer, so a pointer that went stale would report the old one.
+
+type struct Inner { n: u64; }
+
+type struct Owner {
+    inner: Inner;
+
+    static make() -> Owner { return Owner { inner: Inner { n: 1 } }; }
+
+    /// Hands out a pointer into `this` - an address-of with no `&` at the call site.
+    conn(mut &this) -> Inner* { return &this.inner; }
+
+    async touch(mut &this) -> u64 {
+        const z: u64 = await PendingThenReady<u64>::new(1, 1);
+        return this.inner.n + z;
+    }
+}
+
+// Wrapped in a struct rather than a bare `u8[8]` local: instantiating BOTH
+// `Option<u8[8]>` and `Option<u8[]>` in one compilation unit collides on type
+// identity, and `writes_heap_block` above already carries a `u8[]`. That defect
+// is pre-existing, reproduces identically under the pinned compiler, and has
+// nothing to do with async - see the finding recorded in ASYNC_IMPL.md.
+type struct Buf { bytes: u8[8]; }
+
+async function ptr_into_carried_local() -> i64 {
+    mut b: Buf = Buf { bytes: [0; 8] };
+    const p: u8* = &b.bytes[0];
+    const _z: i64 = await PendingThenReady<i64>::new(2, 1);
+    *p = 42;
+    // Read back through the local, not the pointer: the two must name one
+    // storage location, which is the whole point.
+    return b.bytes[0] as i64;
+}
+
+async function ptr_from_accessor() -> u64 {
+    mut owner: Owner = Owner::make();
+    mut p: Inner* = owner.conn();
+    const a: u64 = await owner.touch();
+    return a + p.n;
+}
+
+![test]
+function pointer_into_carried_local_survives_suspend() -> Result<(), TestError> {
+    return expect_eq(future::block_on(ptr_into_carried_local()), 42 as i64);
+}
+
+![test]
+function pointer_from_accessor_survives_suspend() -> Result<(), TestError> {
+    // `touch` yields 1 and adds `inner.n` (1), so `a` is 2; `p.n` is still 1.
+    return expect_eq(future::block_on(ptr_from_accessor()) as i64, 3 as i64);
+}
