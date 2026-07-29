@@ -17,7 +17,11 @@
 #                sites build no fat pointer. (No embedded NUL / explicit length —
 #                fine for static panic strings.)
 #   - SourceLoc: POD { file: string, line: u32, col: u32 }, 16 bytes (see
-#                layout.def). Codegen constructs it zero-alloc from static data.
+#                layout.def), passed BY POINTER to a static constant. Codegen
+#                emits one private global per site from compile-time data, so it
+#                is still zero-alloc; by-pointer avoids classifying a 16-byte
+#                POD by hand under two different C ABIs (SysV vs Win64), which
+#                is the only reason the by-value form was ever attractive.
 #   - Message/file strings are static, codegen-emitted bytes — never heap.
 #   - The panic seam is abort-now / unwind-ready: the check helpers CALL
 #     __cryo_panic; nothing inlines abort/trap assuming the abort strategy.
@@ -72,14 +76,15 @@ __cryo_panic              | (msg: string, file: string, line: u32) -> never  | p
 # Each takes RAW operands (not a pre-formatted string) plus a SourceLoc POD
 # ({file,line,col}, 16 bytes; see layout.def), formats its own message into a
 # stack buffer, and diverges via __cryo_panic. DEFINED in panic/abort, dual-OS.
-# The compiler does not yet EMIT calls to these: the four mute abort() traps
-# (P6) and the not-yet-emitted bounds/overflow guards (P4/P5) route here at
-# swap time. `op` is a raw arithmetic-op code; its value mapping is pinned when
-# P5 lands the emitter.
-__cryo_panic_bounds_check | (loc: SourceLoc, index: u64, len: u64) -> never  | panic/abort | DONE (runtime def, dual-OS; compiler emit deferred P4)
-__cryo_panic_overflow     | (loc: SourceLoc, op: u32, lhs: u64, rhs: u64) -> never | panic/abort | DONE (runtime def, dual-OS; compiler emit deferred P5)
-__cryo_panic_div_zero     | (loc: SourceLoc) -> never                        | panic/abort | DONE (runtime def, dual-OS; compiler emit deferred P6)
-__cryo_panic_no_match     | (loc: SourceLoc) -> never                        | panic/abort | DONE (runtime def, dual-OS; compiler emit deferred P6)
+# The compiler EMITS these under `no_runtime`. Before that it emitted a libc
+# `abort()` at each of the five check sites, which cannot link freestanding --
+# there is no libc to resolve it -- so every panic tier failed this workspace's
+# own acceptance check while still compiling cleanly. `op` is a raw arithmetic-op
+# code; 2 = multiply (the array-size guard) is the only value emitted so far.
+__cryo_panic_bounds_check | (loc: SourceLoc*, index: u64, len: u64) -> never | panic/abort | DONE (runtime def + compiler emit, dual-OS)
+__cryo_panic_overflow     | (loc: SourceLoc*, op: u32, lhs: u64, rhs: u64) -> never | panic/abort | DONE (runtime def + compiler emit, dual-OS)
+__cryo_panic_div_zero     | (loc: SourceLoc*) -> never                       | panic/abort | DONE (runtime def + compiler emit, dual-OS)
+__cryo_panic_no_match     | (loc: SourceLoc*) -> never                       | panic/abort | DONE (runtime def + compiler emit, dual-OS)
 
 # --- Allocator (weak / user-overridable) -----------------------------------
 # The codegen funnel is in place (P8): every heap site routes through

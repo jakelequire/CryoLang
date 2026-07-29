@@ -1206,6 +1206,109 @@ type struct IntrinsicEmitter {
         return this.llvm_module.add_function("llvm.va_end.p0", fty);
     }
 
+    // -- Freestanding check handlers (`runtime/abi/lang_items.def`) -----------
+    //
+    // Under `no_runtime` a failed check has no libc to fall back on: a `call
+    // @abort` cannot be resolved by a `-nostdlib` link at all, which is what
+    // made every panic tier of `runtime/` fail its own acceptance check while
+    // still compiling. These route the five check sites to the runtime's own
+    // handlers instead, which format the operands and diverge through
+    // `__cryo_panic` (exit 101 for the abort tier, an unwind for the unwind
+    // tier — chosen by which archive is on the link line, no caller change).
+
+    /// A private constant `SourceLoc` — `{ i8* file, i32 line, i32 col }`, the
+    /// `layout.def` POD — for one check site, returning its ADDRESS.
+    ///
+    /// Passed by pointer rather than by value so neither side has to classify a
+    /// 16-byte POD by hand under two different C ABIs. Still zero-alloc: the
+    /// initializer is entirely compile-time data, so this is a `.rodata` entry,
+    /// not a runtime construction.
+    emit_source_loc_ptr(mut &this, span: SourceSpan) -> LValue {
+        mut filename: string = span.file;
+        if (filename == null || filename.length() == 0) { filename = "<unknown>"; }
+        const file: LValue = this.builder.build_global_string_ptr(filename, "srcloc.file");
+        const line: LValue = LType::const_int(LType::i32(), span.start_line as u64, false);
+        const col:  LValue = LType::const_int(LType::i32(), span.start_col as u64, false);
+
+        const buf: void* = intrinsics::malloc(24);
+        const slots: void** = buf as void**;
+        slots[0] = file.raw;
+        slots[1] = line.raw;
+        slots[2] = col.raw;
+        const init: LValue = LType::const_struct(buf, 3, false);
+        intrinsics::free(buf);
+
+        mut g: LValue = this.llvm_module.add_global(init.type_of(), "srcloc");
+        g.set_initializer(init);
+        g.set_global_constant(true);
+        g.set_linkage(LLinkage::Private);
+        return g;
+    }
+
+    /// Get-or-declare one of the runtime's check handlers. Every one takes the
+    /// `SourceLoc*` first and returns void (declared `-> never` on the runtime
+    /// side; the caller emits the `unreachable`).
+    get_or_decl_check_handler(mut &this, name: string, extra: i64) -> LValue {
+        mut fn: LValue = this.llvm_module.get_named_function(name);
+        if (fn.is_valid()) { return fn; }
+        const count: i64 = 1 + extra;
+        const param_buf: void* = intrinsics::malloc((count * 8) as u64);
+        const slots: void** = param_buf as void**;
+        slots[0] = LType::pointer_to(LType::i8()).raw;
+        // `op` is the only u32 operand and it is always the FIRST extra; the
+        // rest are u64. Matches the `lang_items.def` signatures exactly.
+        for (mut i: i64 = 1; i < count; i++) {
+            if (name == "__cryo_panic_overflow" && i == 1) {
+                slots[i] = LType::i32().raw;
+            } else {
+                slots[i] = LType::i64().raw;
+            }
+        }
+        const fty: LType = LType::function_type(LType::void_type(), param_buf,
+                                                count as u32, false);
+        intrinsics::free(param_buf);
+        return this.llvm_module.add_function(name, fty);
+    }
+
+    /// `call @<handler>(&srcloc, <operands...>); unreachable`.
+    ///
+    /// Returns false when there is no handler for this shape, so the caller can
+    /// keep its previous behaviour rather than emit a call to nothing.
+    emit_check_handler_call(mut &this, name: string, span: SourceSpan,
+                            operands: &LValue[]) -> boolean {
+        const fn: LValue = this.get_or_decl_check_handler(name, operands.length);
+        if (!fn.is_valid()) { return false; }
+        const loc: LValue = this.emit_source_loc_ptr(span);
+
+        const count: i64 = 1 + operands.length;
+        const arg_buf: void* = intrinsics::malloc((count * 8) as u64);
+        const slots: void** = arg_buf as void**;
+        slots[0] = loc.raw;
+        for (mut i: i64 = 0; i < operands.length; i++) {
+            slots[i + 1] = operands[i].raw;
+        }
+        const fty: LType = LType { raw: llvm::LLVMGlobalGetValueType(fn.raw) };
+        this.builder.build_call(fty, fn, arg_buf, count as u32, "");
+        intrinsics::free(arg_buf);
+        this.builder.build_unreachable();
+        return true;
+    }
+
+    /// The freestanding sink for a check site: route to the runtime handler when
+    /// `no_runtime`, else the libc `abort` the hosted abort strategy has always
+    /// used. `operands` are the handler's extra arguments, already widened to
+    /// the declared types.
+    emit_check_sink(mut &this, name: string, span: SourceSpan,
+                    operands: &LValue[]) -> void {
+        if (this.no_runtime) {
+            if (this.emit_check_handler_call(name, span, operands)) { return; }
+        }
+        const abort_fn: LValue = this.get_or_decl_abort();
+        const abort_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(abort_fn.raw) };
+        this.builder.build_call(abort_ty, abort_fn, null, 0, "");
+        this.builder.build_unreachable();
+    }
+
     /// Declare libc `abort` extern: `void abort(void) __attribute__((noreturn))`.
     get_or_decl_abort(mut &this) -> LValue {
         mut fn: LValue = this.llvm_module.get_named_function("abort");

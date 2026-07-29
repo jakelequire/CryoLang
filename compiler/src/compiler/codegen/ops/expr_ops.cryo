@@ -2010,11 +2010,8 @@ type struct ExprOps {
         if (this.ctx.project_panic_unwind && !this.intrinsics.no_runtime) {
             this.emit_check_raise(visitor, div_sched, div_span, "attempt to divide by zero");
         } else {
-            const abort_fn: LValue = this.intrinsics.get_or_decl_abort();
-            const abort_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(abort_fn.raw) };
-            mut a_args: Pair<LValue, TypeRef>[] = [];
-            this.codegen_call(abort_fn, abort_ty, a_args, "");
-            this.builder.build_unreachable();
+            mut dz_ops: LValue[] = [];
+            this.intrinsics.emit_check_sink("__cryo_panic_div_zero", div_span, &dz_ops);
         }
 
         // OK arm: caller continues with the div/rem here.
@@ -2059,11 +2056,15 @@ type struct ExprOps {
         if (this.ctx.project_panic_unwind && !this.intrinsics.no_runtime) {
             this.emit_check_raise(visitor, ovf_sched, ovf_span, "arithmetic overflow");
         } else {
-            const abort_fn: LValue = this.intrinsics.get_or_decl_abort();
-            const abort_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(abort_fn.raw) };
-            mut a_args: Pair<LValue, TypeRef>[] = [];
-            this.codegen_call(abort_fn, abort_ty, a_args, "");
-            this.builder.build_unreachable();
+            // `op` 2 = multiply: this guard is the array-size product. The
+            // handler formats "arithmetic overflow (op 2): <lhs>, <rhs>", so it
+            // takes the raw operands rather than a pre-baked message.
+            mut ovf_ops: LValue[] = [
+                LType::const_int(LType::i32(), 2, false),
+                count_i64,
+                LType::const_int(LType::i64(), elem_size, false)
+            ];
+            this.intrinsics.emit_check_sink("__cryo_panic_overflow", ovf_span, &ovf_ops);
         }
 
         this.builder.position_at_end(ok_bb);
