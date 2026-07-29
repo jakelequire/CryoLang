@@ -140,7 +140,7 @@ EXT_ID        := cryolang.cryo-analyzer
 EXT_VSIX      := $(EXT_DIR)/cryo-analyzer.vsix
 
 .DEFAULT_GOAL := help
-.PHONY: help stdlib cryo cryo-exe selfhost-check test test-list roster-check examples examples-golden valgrind-check pin \
+.PHONY: help stdlib cryo cryo-exe selfhost-check test test-list roster-check examples examples-golden valgrind-check verify-freestanding pin \
         pin-linux-impl pin-windows-impl _pin-windows-do \
         install uninstall clean lsp install-lsp release release-linux release-windows
 
@@ -159,6 +159,8 @@ help:
 	@echo "  make test              Run the repo-level test suite (tests/) via cryo test"
 	@echo "  make test-list         List the discovered test cases without running them"
 	@echo "  make examples          Compile every examples/*/ project (CI smoke gate)"
+	@echo "  make verify-freestanding  Build runtime/ tiers + run the freestanding"
+	@echo "                         acceptance check (entry, panic, alloc, backtrace)"
 	@echo "  make cryo-exe          Cross-build cryo.exe (x86_64-pc-windows-gnu)"
 	@echo "  make install           Symlink bin/cryo + stdlib system-wide (sudo)"
 	@echo "  make uninstall         Remove the install.sh symlinks"
@@ -506,6 +508,19 @@ else
 valgrind-check: $(STAGE2) $(LIBCRYO_A)
 	@CRYO="$(STAGE2)" CRYO_STDLIB="$(ROOT)/stdlib" bash scripts/valgrind-check.sh
 endif
+
+# ---- freestanding runtime gate ----------------------------------------
+# Build every `runtime/` tier and run its acceptance check on both supported
+# OSes.  `runtime/` is a SEPARATE freestanding workspace with its own
+# cryoconfig, so nothing else in this Makefile compiles it — which is exactly
+# how it silently rotted once: the tiers still built, but codegen had moved on
+# and the panic tier no longer linked.  This target is what makes that loud.
+#
+# The script skips the Windows half when the mingw toolchain or wine is
+# unavailable, so it is meaningful on a bare Linux box too.  Set
+# `FREESTANDING_LINUX_ONLY=1` to skip the Windows half deliberately.
+verify-freestanding: $(STAGE2)
+	@CRYO="$(STAGE2)" CRYO_STDLIB="$(ROOT)/stdlib" bash runtime/verify-freestanding.sh
 
 # ---- release packaging -------------------------------------------------
 # Build distributable archives under dist/.  `release` does the host
