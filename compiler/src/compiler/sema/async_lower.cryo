@@ -347,6 +347,27 @@ type struct AsyncLower {
     // such a value is COPIED by a by-value use, so emptying the field would
     // strand every later state's `unwrap_ptr` on a `None`.
     subst_carrier_takes:  boolean;
+    // A give-away empties the carrier field, so from that point on in the same
+    // straight-line run the value no longer lives there and `*<nm>$p` would
+    // read emptied storage. The take is therefore hoisted into a named local
+    // and every later mention in that run is rebound to it, which both keeps
+    // the reads correct and puts the value back in a form MoveCheck can track:
+    // a second by-value use is an ordinary double move and a later borrow an
+    // ordinary use-after-move, so `E0452` is reported by the existing pass
+    // rather than re-derived here.
+    subst_hoist_name: SymbolStr;
+    subst_hoist_stmt: StatementNode*;
+    subst_hoist_seq:  i64;
+    // Nonzero inside a position that is only CONDITIONALLY evaluated, or one
+    // the state machine will tear apart. A hoist there would be spliced ahead
+    // of the whole statement and so would empty the field on paths the
+    // give-away never ran on, stranding a later `unwrap_ptr` on a `None`.
+    subst_cond_depth: i64;
+    // True only while `subst_stmt_list` is the immediate driver of a statement
+    // walk, i.e. exactly when a statement list is standing by to receive the
+    // declaration. Every other entry into the substitution would drop it while
+    // still rebinding the mention, leaving it naming a local never declared.
+    subst_can_hoist: boolean;
 
     static null() -> AsyncLower {
         return AsyncLower { arena: null, intern: null, ctx: null, patterns: null, counter: 0u64,
@@ -357,7 +378,10 @@ type struct AsyncLower {
                             subst_carrier_field: SymbolStr::empty(),
                             subst_carrier_opt: TypeRef::invalid(),
                             subst_carrier_struct: TypeRef::invalid(),
-                            subst_carrier_takes: false };
+                            subst_carrier_takes: false,
+                            subst_hoist_name: SymbolStr::empty(),
+                            subst_hoist_stmt: null, subst_hoist_seq: 0i64,
+                            subst_cond_depth: 0i64, subst_can_hoist: false };
     }
 
     /// True when a future of type `from` holds — directly or through the futures
@@ -1487,6 +1511,46 @@ type struct AsyncLower {
         return this.method_call0(take_call, "unwrap", ty, span);
     }
 
+    /// Whether the carried value currently lives in a hoisted local rather than
+    /// in its carrier field.
+    subst_hoist_active(&this) -> boolean {
+        return !this.subst_hoist_name.is_empty();
+    }
+
+    /// Hand the value out of its field through a NAMED local instead of inline:
+    /// records `mut <gv> = this.<carrier>.take().unwrap();` for the enclosing
+    /// statement list to splice in ahead of the current statement, and returns
+    /// `<gv>` to stand in the give-away's place.
+    ///
+    /// Hoisting is what lets the rest of the run refer to the value at all. The
+    /// field is empty after a take, so an inline take leaves a later `*<nm>$p`
+    /// reading emptied storage, and leaves MoveCheck - which runs long after
+    /// this pass - with two unrelated expressions and no move to track.
+    /// `use_span` is the span of the MENTION being replaced, and the hoisted
+    /// declaration is given it rather than the async function's own span. Every
+    /// synthesized node otherwise carries the function's span, and MoveCheck
+    /// reports a move at the span of the node that made it - so the diagnostic
+    /// would point at `async function f()` instead of at the line that handed
+    /// the value away, naming a place the reader cannot find.
+    hoist_giveaway(mut &this, name: SymbolStr, ty: TypeRef, use_span: SourceSpan,
+                   span: SourceSpan) -> ExpressionNode* {
+        // No list to receive the declaration, or a position that only runs on
+        // some paths: keep the take inline, exactly as before this existed.
+        if (this.subst_cond_depth > 0 || !this.subst_can_hoist) {
+            return this.subst_giveaway_target(ty, span);
+        }
+        // Named after the SOURCE binding, because MoveCheck reports the moved
+        // place by name and the programmer has to recognise it: `c$gv0` reads
+        // as the `c` they wrote, the way `c$p` already does.
+        const gv: SymbolStr = this.intern.intern(
+            format("%s$gv%lld", this.intern.resolve(name), this.subst_hoist_seq));
+        this.subst_hoist_seq  = this.subst_hoist_seq + 1;
+        this.subst_hoist_name = gv;
+        this.subst_hoist_stmt = this.var_decl_stmt(
+            gv, true, ty, this.subst_giveaway_target(ty, use_span), use_span);
+        return this.ident(gv, ty, use_span);
+    }
+
     /// `this.<carrier>` — the carrier field as a place.
     carrier_field_expr(mut &this, span: SourceSpan) -> ExpressionNode* {
         return this.member(this.this_ident(this.subst_carrier_struct, span),
@@ -1521,9 +1585,19 @@ type struct AsyncLower {
         const k: NodeKind = (e as ASTNode*).kind;
         if (k == NodeKind::Identifier) {
             if ((e as IdentifierNode*).name.equals(name)) {
+                // The mention's OWN span, so a later use is reported where the
+                // programmer wrote it rather than at the function header.
+                const use_span: SourceSpan = (e as ASTNode*).span;
                 mut target: ExpressionNode* = null;
-                if (by_value && this.subst_carrier_takes) {
-                    target = this.subst_giveaway_target(ty, span);
+                if (this.subst_hoist_active()) {
+                    // Already handed out of its field earlier in this run, so
+                    // the hoisted local is the only place the value is. Every
+                    // position spells it the same way: a by-value mention here
+                    // is a second move of that local and a borrow is a use of
+                    // it after the move - exactly what MoveCheck needs to see.
+                    target = this.ident(this.subst_hoist_name, ty, use_span);
+                } else if (by_value && this.subst_carrier_takes) {
+                    target = this.hoist_giveaway(name, ty, use_span, span);
                 } else {
                     target = this.subst_target(field, struct_ref, ty, span);
                 }
@@ -1560,6 +1634,9 @@ type struct AsyncLower {
                     b.right = this.option_some(b.right, this.subst_carrier_opt, span);
                     b.left  = this.carrier_field_expr(span);
                     b.set_resolved_type(this.subst_carrier_opt);
+                    // The value lives in its field again, so later mentions go
+                    // back to reaching it there.
+                    this.subst_hoist_name = SymbolStr::empty();
                     return e;
                 }
                 b.left  = this.subst_name_expr(b.left, name, field, struct_ref, ty, span, false);
@@ -1612,8 +1689,12 @@ type struct AsyncLower {
         if (k == NodeKind::TernaryExpression) {
             const t: TernaryExprNode* = e as TernaryExprNode*;
             t.condition  = this.subst_name_expr(t.condition, name, field, struct_ref, ty, span, false);
+            // Only one arm runs, so neither may hoist its take out to the
+            // enclosing statement.
+            this.subst_cond_depth = this.subst_cond_depth + 1;
             t.true_expr  = this.subst_name_expr(t.true_expr, name, field, struct_ref, ty, span, by_value);
             t.false_expr = this.subst_name_expr(t.false_expr, name, field, struct_ref, ty, span, by_value);
+            this.subst_cond_depth = this.subst_cond_depth - 1;
             return e;
         }
         if (k == NodeKind::StructLiteral) {
@@ -1662,11 +1743,80 @@ type struct AsyncLower {
                 if (me.arms[i] == null) { continue; }
                 me.arms[i].guard = this.subst_name_expr(me.arms[i].guard, name, field,
                                                        struct_ref, ty, span, false);
-                this.subst_name_stmt(me.arms[i].body, name, field, struct_ref, ty, span);
+                this.subst_nested_stmt(me.arms[i].body, name, field, struct_ref, ty, span);
             }
             return e;
         }
         return e;
+    }
+
+    /// Walk a statement nested inside a control construct, then settle what the
+    /// hoist state is where the paths rejoin.
+    ///
+    /// Only a BLOCK can absorb a hoisted declaration, because only a block has a
+    /// statement list to splice it into; anywhere else the declaration would be
+    /// lifted out of the construct and the take would run unconditionally.
+    ///
+    /// The hoist does not cross INTO a nested construct: a loop body or a match
+    /// arm can be reached from several states, and rebinding a mention there
+    /// would rewrite a node another state also reads while the declaration only
+    /// ever reaches this state's block. At the join a give-away made inside is
+    /// abandoned for the same reason, and because it may not have run.
+    subst_nested_stmt(mut &this, s: StatementNode*, name: SymbolStr, field: SymbolStr,
+                      struct_ref: TypeRef, ty: TypeRef, span: SourceSpan) -> void {
+        if (s == null) { return; }
+        const absorbs: boolean = (s.kind == NodeKind::BlockStatement);
+        const saved: SymbolStr = this.subst_hoist_name;
+        this.subst_hoist_name = SymbolStr::empty();
+        if (!absorbs) { this.subst_cond_depth = this.subst_cond_depth + 1; }
+        this.subst_name_stmt(s, name, field, struct_ref, ty, span);
+        if (!absorbs) { this.subst_cond_depth = this.subst_cond_depth - 1; }
+        if (!this.subst_hoist_name.is_empty()) {
+            this.subst_hoist_name = SymbolStr::empty();
+        } else {
+            this.subst_hoist_name = saved;
+        }
+    }
+
+    /// Substitute each statement of `blk` from `from` on, splicing any hoisted
+    /// give-away declaration in AHEAD of the statement that consumes it.
+    ///
+    /// The caller's pending declaration is saved across the whole walk. A
+    /// statement that hoists and then descends into a nested block reaches this
+    /// function again for that block, and without the save the inner walk would
+    /// clear the outer statement's pending declaration - which is then never
+    /// spliced in, while the mention it feeds has already been rebound to it.
+    subst_stmt_list(mut &this, blk: BlockStmtNode*, from: i64, name: SymbolStr,
+                    field: SymbolStr, struct_ref: TypeRef, ty: TypeRef,
+                    span: SourceSpan) -> void {
+        const outer_pending: StatementNode* = this.subst_hoist_stmt;
+        const saved_can: boolean = this.subst_can_hoist;
+        mut rebuilt: StatementNode*[] = [];
+        for (mut i: i64 = 0; i < from; i++) { rebuilt.push(blk.statements[i]); }
+        for (mut i: i64 = from; i < blk.statements.length; i++) {
+            const st: StatementNode* = blk.statements[i];
+            // A statement containing an `await` is torn into several state
+            // blocks, so neither a declaration spliced in here nor a local
+            // declared earlier is guaranteed to reach the mention. The value
+            // goes back to being reached in its field across such a statement.
+            const splits: boolean = (this.stmt_await_count(st) > 0i64);
+            if (splits) {
+                this.subst_hoist_name = SymbolStr::empty();
+                this.subst_cond_depth = this.subst_cond_depth + 1;
+            }
+            this.subst_hoist_stmt = null;
+            this.subst_can_hoist  = true;
+            this.subst_name_stmt(st, name, field, struct_ref, ty, span);
+            this.subst_can_hoist  = saved_can;
+            if (splits) { this.subst_cond_depth = this.subst_cond_depth - 1; }
+            if (this.subst_hoist_stmt != null) {
+                rebuilt.push(this.subst_hoist_stmt);
+                this.subst_hoist_stmt = null;
+            }
+            rebuilt.push(st);
+        }
+        blk.statements = rebuilt;
+        this.subst_hoist_stmt = outer_pending;
     }
 
     /// Rewrite every read of `name` in statement `s` to `this.<field>`, recursing
@@ -1700,30 +1850,27 @@ type struct AsyncLower {
             return;
         }
         if (k == NodeKind::BlockStatement) {
-            const blk: BlockStmtNode* = s as BlockStmtNode*;
-            for (mut i: i64 = 0; i < blk.statements.length; i++) {
-                this.subst_name_stmt(blk.statements[i], name, field, struct_ref, ty, span);
-            }
+            this.subst_stmt_list(s as BlockStmtNode*, 0i64, name, field, struct_ref, ty, span);
             return;
         }
         if (k == NodeKind::IfStatement) {
             const iff: IfStmtNode* = s as IfStmtNode*;
             iff.condition = this.subst_name_expr(iff.condition, name, field, struct_ref, ty, span,
                                                  false);
-            this.subst_name_stmt(iff.then_stmt, name, field, struct_ref, ty, span);
-            this.subst_name_stmt(iff.else_stmt, name, field, struct_ref, ty, span);
+            this.subst_nested_stmt(iff.then_stmt, name, field, struct_ref, ty, span);
+            this.subst_nested_stmt(iff.else_stmt, name, field, struct_ref, ty, span);
             return;
         }
         if (k == NodeKind::WhileStatement) {
             const w: WhileStmtNode* = s as WhileStmtNode*;
             w.condition = this.subst_name_expr(w.condition, name, field, struct_ref, ty, span, false);
-            this.subst_name_stmt(w.body, name, field, struct_ref, ty, span);
+            this.subst_nested_stmt(w.body, name, field, struct_ref, ty, span);
             return;
         }
         if (k == NodeKind::DoWhileStatement) {
             const d: DoWhileStmtNode* = s as DoWhileStmtNode*;
             d.condition = this.subst_name_expr(d.condition, name, field, struct_ref, ty, span, false);
-            this.subst_name_stmt(d.body, name, field, struct_ref, ty, span);
+            this.subst_nested_stmt(d.body, name, field, struct_ref, ty, span);
             return;
         }
         if (k == NodeKind::ForStatement) {
@@ -1740,11 +1887,11 @@ type struct AsyncLower {
             }
             f.condition = this.subst_name_expr(f.condition, name, field, struct_ref, ty, span, false);
             f.update    = this.subst_name_expr(f.update, name, field, struct_ref, ty, span, false);
-            this.subst_name_stmt(f.body, name, field, struct_ref, ty, span);
+            this.subst_nested_stmt(f.body, name, field, struct_ref, ty, span);
             return;
         }
         if (k == NodeKind::LoopStatement) {
-            this.subst_name_stmt((s as LoopStmtNode*).body, name, field, struct_ref, ty, span);
+            this.subst_nested_stmt((s as LoopStmtNode*).body, name, field, struct_ref, ty, span);
             return;
         }
         if (k == NodeKind::MatchStatement) {
@@ -1753,7 +1900,7 @@ type struct AsyncLower {
             m.subject = this.subst_name_expr(m.subject, name, field, struct_ref, ty, span, true);
             for (mut i: i64 = 0; i < m.arms.length; i++) {
                 if (m.arms[i] != null) {
-                    this.subst_name_stmt(m.arms[i].body, name, field, struct_ref, ty, span);
+                    this.subst_nested_stmt(m.arms[i].body, name, field, struct_ref, ty, span);
                 }
             }
             return;
@@ -4019,10 +4166,14 @@ type struct AsyncLower {
         this.subst_carrier_opt     = opt_ty;
         this.subst_carrier_struct  = sm.struct_ref;
         this.subst_carrier_takes   = this.carried_can_be_given_away(lty);
-        for (mut j: i64 = from; j < blk.statements.length; j++) {
-            this.subst_name_stmt(blk.statements[j], nm, ptr_name,
-                                 TypeRef::invalid(), lty, span);
-        }
+        // Every state opens with the value in its field; a hoist left over from
+        // another state's rewrite would name a local declared in that state.
+        this.subst_hoist_name = SymbolStr::empty();
+        this.subst_hoist_stmt = null;
+        this.subst_cond_depth = 0i64;
+        this.subst_stmt_list(blk, from, nm, ptr_name, TypeRef::invalid(), lty, span);
+        this.subst_hoist_name = SymbolStr::empty();
+        this.subst_hoist_stmt = null;
         this.subst_mode           = saved_mode;
         this.subst_carrier_field  = saved_field;
         this.subst_carrier_opt    = saved_opt;
