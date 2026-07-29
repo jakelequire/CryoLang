@@ -333,12 +333,20 @@ type struct AsyncLower {
     // form and is restored to it after the one pass that needs another; see
     // `subst_target`.
     subst_mode: i64;
-    // Which question `mark_last_use_*` is answering. Cleared by default: the
-    // walk reports the state's FINAL mention of a name, which is what decides
-    // whether the state still owns the value as it falls off its end. Set, a
-    // by-value mention STICKS and no branch is skipped, which answers the
-    // different question in-place residency asks; see `any_use_gives_away`.
-    mark_giveaway_sticky: boolean;
+    // The carrier field `subst_carried_from` is currently rewriting a block
+    // against, and empty outside such a rewrite. A mention that REBUILDS the
+    // whole value republishes this field rather than writing through the
+    // pointer, because the field may be empty at that point.
+    subst_carrier_field:  SymbolStr;
+    subst_carrier_opt:    TypeRef;
+    subst_carrier_struct: TypeRef;
+    // Whether a BY-VALUE mention must additionally empty the field. A value
+    // living in its field is owned by it, so handing it to someone else has to
+    // take it out; aliasing it there would leave the callee and the field each
+    // believing they own it. False for a carrier whose type has no destructor —
+    // such a value is COPIED by a by-value use, so emptying the field would
+    // strand every later state's `unwrap_ptr` on a `None`.
+    subst_carrier_takes:  boolean;
 
     static null() -> AsyncLower {
         return AsyncLower { arena: null, intern: null, ctx: null, patterns: null, counter: 0u64,
@@ -346,7 +354,10 @@ type struct AsyncLower {
                             edge_from: [], edge_to: [],
                             this_sym: SymbolStr::empty(), this_amp_sym: SymbolStr::empty(),
                             recv_sym: SymbolStr::empty(), subst_mode: 0i64,
-                            mark_giveaway_sticky: false };
+                            subst_carrier_field: SymbolStr::empty(),
+                            subst_carrier_opt: TypeRef::invalid(),
+                            subst_carrier_struct: TypeRef::invalid(),
+                            subst_carrier_takes: false };
     }
 
     /// True when a future of type `from` holds — directly or through the futures
@@ -675,16 +686,31 @@ type struct AsyncLower {
             this.make_poll_ready(this.unit_value(span), poll_out, span), span) as StatementNode*;
     }
 
+    /// `<scope>::<member>(<value>)` typed `ty` — a synthesized enum-variant
+    /// constructor.
+    ///
+    /// The payload slot of a variant constructor takes ownership, so the
+    /// argument is classified BY VALUE here. A synthesized call never passes
+    /// through `classify_args_from_params`, and a slot left `Unclassified` is
+    /// only guessed at downstream — the move passes read it as a transfer while
+    /// the carrier substitution reads it as a borrow. Saying what it actually is
+    /// keeps every consumer on the same move set.
+    variant_call1(&this, scope_name: string, member_name: string, value: ExpressionNode*,
+                  ty: TypeRef, span: SourceSpan) -> ExpressionNode* {
+        mut scope: ScopeResolutionNode* = new ScopeResolutionNode(
+            this.intern.intern(scope_name), this.intern.intern(member_name), span);
+        scope.set_resolved_type(ty);
+        mut call: CallExprNode* = new CallExprNode(scope as ExpressionNode*, span);
+        if (value != null) { value.arg_binding = ArgBinding::ByValue; }
+        call.add_argument(value);
+        call.set_resolved_type(ty);
+        return call as ExpressionNode*;
+    }
+
     /// Wrap an already-typed value expression in `Poll::Ready(<expr>)` typed as
     /// `Poll<Output>`.
     make_poll_ready(&this, value: ExpressionNode*, poll_out: TypeRef, span: SourceSpan) -> ExpressionNode* {
-        mut scope: ScopeResolutionNode* = new ScopeResolutionNode(
-            this.intern.intern("Poll"), this.intern.intern("Ready"), span);
-        scope.set_resolved_type(poll_out);
-        mut call: CallExprNode* = new CallExprNode(scope as ExpressionNode*, span);
-        call.add_argument(value);
-        call.set_resolved_type(poll_out);
-        return call as ExpressionNode*;
+        return this.variant_call1("Poll", "Ready", value, poll_out, span);
     }
 
     /// Rewrite every `return E;` reachable in `stmt` to `return Poll::Ready(E);`,
@@ -1194,13 +1220,7 @@ type struct AsyncLower {
 
     /// `Option::Some(<value>)` typed `opt_ty`.
     option_some(&this, value: ExpressionNode*, opt_ty: TypeRef, span: SourceSpan) -> ExpressionNode* {
-        mut scope: ScopeResolutionNode* = new ScopeResolutionNode(
-            this.intern.intern("Option"), this.intern.intern("Some"), span);
-        scope.set_resolved_type(opt_ty);
-        mut call: CallExprNode* = new CallExprNode(scope as ExpressionNode*, span);
-        call.add_argument(value);
-        call.set_resolved_type(opt_ty);
-        return call as ExpressionNode*;
+        return this.variant_call1("Option", "Some", value, opt_ty, span);
     }
 
     /// `Option::None` typed `opt_ty`.
@@ -1453,13 +1473,60 @@ type struct AsyncLower {
         return this.member(this.this_ident(struct_ref, span), field, ty, span);
     }
 
+    /// `this.<carrier>.take().unwrap()` — the spelling a BY-VALUE mention of a
+    /// carried value gets while it lives in its field.
+    ///
+    /// The field owns the value outright, so handing it to someone else has to
+    /// empty the field at that site: `take` clears the discriminant, leaving
+    /// exactly one owner. Aliasing the payload instead would give the callee
+    /// and the field each a claim on it, and both would run its destructor.
+    subst_giveaway_target(mut &this, ty: TypeRef, span: SourceSpan) -> ExpressionNode* {
+        mut fld: ExpressionNode* = this.carrier_field_expr(span);
+        mut take_call: ExpressionNode* =
+            this.method_call0(fld, "take", this.subst_carrier_opt, span);
+        return this.method_call0(take_call, "unwrap", ty, span);
+    }
+
+    /// `this.<carrier>` — the carrier field as a place.
+    carrier_field_expr(mut &this, span: SourceSpan) -> ExpressionNode* {
+        return this.member(this.this_ident(this.subst_carrier_struct, span),
+                           this.subst_carrier_field, this.subst_carrier_opt, span);
+    }
+
+    /// Whether `subst_carried_from` currently has a carrier field to rewrite
+    /// against.
+    subst_carrier_armed(&this) -> boolean {
+        return !this.subst_carrier_field.is_empty();
+    }
+
+    /// True when `e` names the WHOLE carried value rather than a part of it.
+    /// `x = …` republishes the carrier; `x.f = …` and `x[i] = …` write into the
+    /// payload that is already there and must keep going through the pointer.
+    name_is_whole_place(&this, e: ExpressionNode*, name: SymbolStr) -> boolean {
+        if (e == null) { return false; }
+        if ((e as ASTNode*).kind != NodeKind::Identifier) { return false; }
+        return (e as IdentifierNode*).name.equals(name);
+    }
+
+    /// `by_value` says whether a bare mention in THIS position hands the value
+    /// over (a by-value call argument, an initializer, a returned expression, a
+    /// `match` subject) or merely reaches into it (a receiver, a field access,
+    /// an address-of, an operand). The positions mirror `mark_last_use_expr`,
+    /// which answers the same question for the eligibility walk — the two must
+    /// agree, or a mention counted as a give-away there is aliased here.
     subst_name_expr(mut &this, e: ExpressionNode*, name: SymbolStr, field: SymbolStr,
-                    struct_ref: TypeRef, ty: TypeRef, span: SourceSpan) -> ExpressionNode* {
+                    struct_ref: TypeRef, ty: TypeRef, span: SourceSpan,
+                    by_value: boolean) -> ExpressionNode* {
         if (e == null) { return null; }
         const k: NodeKind = (e as ASTNode*).kind;
         if (k == NodeKind::Identifier) {
             if ((e as IdentifierNode*).name.equals(name)) {
-                mut target: ExpressionNode* = this.subst_target(field, struct_ref, ty, span);
+                mut target: ExpressionNode* = null;
+                if (by_value && this.subst_carrier_takes) {
+                    target = this.subst_giveaway_target(ty, span);
+                } else {
+                    target = this.subst_target(field, struct_ref, ty, span);
+                }
                 // The replacement stands in the same argument slot as the name
                 // it replaces, so it binds to the same parameter. `autoref`
                 // records that sema chose to pass this argument's ADDRESS and
@@ -1476,44 +1543,77 @@ type struct AsyncLower {
         }
         if (k == NodeKind::BinaryExpression) {
             const b: BinaryExprNode* = e as BinaryExprNode*;
-            b.left  = this.subst_name_expr(b.left, name, field, struct_ref, ty, span);
-            b.right = this.subst_name_expr(b.right, name, field, struct_ref, ty, span);
+            if (b.op.kind == TokenType::Equal) {
+                // The right-hand side is handed to the name; the left is the
+                // place being written, which reaches into the value rather
+                // than handing it over.
+                b.right = this.subst_name_expr(b.right, name, field, struct_ref, ty, span, true);
+                // Rebuilding the whole carried value republishes the field
+                // rather than writing through the pointer, because the field
+                // may be EMPTY here: a state that handed the value away and
+                // then reclaims it (`l = accepted.take_listener()`) has nothing
+                // to write through. Storing `Some(...)` is also what the source
+                // assignment means — overwriting a binding does not run the old
+                // value's destructor, so publishing a second payload the same
+                // way keeps the lowered code faithful to it.
+                if (this.subst_carrier_armed() && this.name_is_whole_place(b.left, name)) {
+                    b.right = this.option_some(b.right, this.subst_carrier_opt, span);
+                    b.left  = this.carrier_field_expr(span);
+                    b.set_resolved_type(this.subst_carrier_opt);
+                    return e;
+                }
+                b.left  = this.subst_name_expr(b.left, name, field, struct_ref, ty, span, false);
+                return e;
+            }
+            b.left  = this.subst_name_expr(b.left, name, field, struct_ref, ty, span, false);
+            b.right = this.subst_name_expr(b.right, name, field, struct_ref, ty, span, false);
             return e;
         }
         if (k == NodeKind::UnaryExpression) {
             const u: UnaryExprNode* = e as UnaryExprNode*;
-            u.operand = this.subst_name_expr(u.operand, name, field, struct_ref, ty, span);
+            u.operand = this.subst_name_expr(u.operand, name, field, struct_ref, ty, span, false);
             return e;
         }
         if (k == NodeKind::CallExpression) {
             const c: CallExprNode* = e as CallExprNode*;
-            c.callee = this.subst_name_expr(c.callee, name, field, struct_ref, ty, span);
+            // A receiver is reached into; an argument is handed over only when
+            // the parameter it binds to takes ownership. `arg_binding` is the
+            // authority, and an UNCLASSIFIED slot must read as a borrow here:
+            // emptying the field for a parameter that only borrows strands
+            // every later `unwrap_ptr` on a `None`, whereas leaving an owning
+            // argument aliased surfaces as `E0453` at compile time. That is the
+            // opposite default from the move passes, and deliberately so.
+            c.callee = this.subst_name_expr(c.callee, name, field, struct_ref, ty, span, false);
             for (mut i: i64 = 0; i < c.arguments.length; i++) {
-                c.arguments[i] = this.subst_name_expr(c.arguments[i], name, field, struct_ref, ty, span);
+                const owns: boolean = (c.arguments[i] != null &&
+                                       c.arguments[i].arg_binding == ArgBinding::ByValue);
+                c.arguments[i] = this.subst_name_expr(c.arguments[i], name, field,
+                                                     struct_ref, ty, span, owns);
             }
             return e;
         }
         if (k == NodeKind::MemberAccess) {
             const m: MemberAccessNode* = e as MemberAccessNode*;
-            m.object = this.subst_name_expr(m.object, name, field, struct_ref, ty, span);
+            m.object = this.subst_name_expr(m.object, name, field, struct_ref, ty, span, false);
             return e;
         }
         if (k == NodeKind::CastExpression) {
             const ce: CastExprNode* = e as CastExprNode*;
-            ce.expression = this.subst_name_expr(ce.expression, name, field, struct_ref, ty, span);
+            ce.expression = this.subst_name_expr(ce.expression, name, field, struct_ref, ty, span,
+                                                 by_value);
             return e;
         }
         if (k == NodeKind::ArrayAccess) {
             const a: ArrayAccessNode* = e as ArrayAccessNode*;
-            a.array = this.subst_name_expr(a.array, name, field, struct_ref, ty, span);
-            a.index = this.subst_name_expr(a.index, name, field, struct_ref, ty, span);
+            a.array = this.subst_name_expr(a.array, name, field, struct_ref, ty, span, false);
+            a.index = this.subst_name_expr(a.index, name, field, struct_ref, ty, span, false);
             return e;
         }
         if (k == NodeKind::TernaryExpression) {
             const t: TernaryExprNode* = e as TernaryExprNode*;
-            t.condition  = this.subst_name_expr(t.condition, name, field, struct_ref, ty, span);
-            t.true_expr  = this.subst_name_expr(t.true_expr, name, field, struct_ref, ty, span);
-            t.false_expr = this.subst_name_expr(t.false_expr, name, field, struct_ref, ty, span);
+            t.condition  = this.subst_name_expr(t.condition, name, field, struct_ref, ty, span, false);
+            t.true_expr  = this.subst_name_expr(t.true_expr, name, field, struct_ref, ty, span, by_value);
+            t.false_expr = this.subst_name_expr(t.false_expr, name, field, struct_ref, ty, span, by_value);
             return e;
         }
         if (k == NodeKind::StructLiteral) {
@@ -1523,7 +1623,8 @@ type struct AsyncLower {
                 const fi: FieldInit = sl.field_inits[i];
                 newf.push(FieldInit {
                     field_name: fi.field_name,
-                    value: this.subst_name_expr(fi.value, name, field, struct_ref, ty, span),
+                    // A field initializer moves its operand into the aggregate.
+                    value: this.subst_name_expr(fi.value, name, field, struct_ref, ty, span, true),
                     span: fi.span });
             }
             sl.field_inits = newf;
@@ -1531,28 +1632,36 @@ type struct AsyncLower {
         }
         if (k == NodeKind::AwaitExpression) {
             const aw: AwaitExprNode* = e as AwaitExprNode*;
-            aw.operand = this.subst_name_expr(aw.operand, name, field, struct_ref, ty, span);
+            // The operand is MOVED into the sub-future field the resume state
+            // polls (`this.fut_N = Option::Some(<operand>)`), so awaiting a
+            // future held in a local hands that future over.
+            aw.operand = this.subst_name_expr(aw.operand, name, field, struct_ref, ty, span, true);
             return e;
         }
         if (k == NodeKind::TryExpression) {
             mut tr: TryExprNode* = e as TryExprNode*;
             if (tr.desugared != null) {
-                tr.desugared = this.subst_name_expr(tr.desugared, name, field, struct_ref, ty, span);
+                tr.desugared = this.subst_name_expr(tr.desugared, name, field, struct_ref, ty, span,
+                                                   by_value);
                 // A promoted name in the subject became `this.<field>`, and
                 // `operand` is the same slot: left alone it would keep naming
                 // the local whose declaration this pass has just removed.
                 tr.resync_operand();
             } else {
-                tr.operand = this.subst_name_expr(tr.operand, name, field, struct_ref, ty, span);
+                tr.operand = this.subst_name_expr(tr.operand, name, field, struct_ref, ty, span,
+                                                 by_value);
             }
             return e;
         }
         if (k == NodeKind::MatchExpression) {
             const me: MatchExprNode* = e as MatchExprNode*;
-            me.subject = this.subst_name_expr(me.subject, name, field, struct_ref, ty, span);
+            // A match-arm binding copies the payload out of the subject, so the
+            // subject is consumed — the same reading `mark_last_use_expr` takes.
+            me.subject = this.subst_name_expr(me.subject, name, field, struct_ref, ty, span, true);
             for (mut i: i64 = 0; i < me.arms.length; i++) {
                 if (me.arms[i] == null) { continue; }
-                me.arms[i].guard = this.subst_name_expr(me.arms[i].guard, name, field, struct_ref, ty, span);
+                me.arms[i].guard = this.subst_name_expr(me.arms[i].guard, name, field,
+                                                       struct_ref, ty, span, false);
                 this.subst_name_stmt(me.arms[i].body, name, field, struct_ref, ty, span);
             }
             return e;
@@ -1569,19 +1678,24 @@ type struct AsyncLower {
         const k: NodeKind = s.kind;
         if (k == NodeKind::ExpressionStatement) {
             const es: ExprStmtNode* = s as ExprStmtNode*;
-            es.expression = this.subst_name_expr(es.expression, name, field, struct_ref, ty, span);
+            es.expression = this.subst_name_expr(es.expression, name, field, struct_ref, ty, span,
+                                                 false);
             return;
         }
         if (k == NodeKind::ReturnStatement) {
             const rs: ReturnStmtNode* = s as ReturnStmtNode*;
-            rs.expression = this.subst_name_expr(rs.expression, name, field, struct_ref, ty, span);
+            // Returning the value hands it to the caller.
+            rs.expression = this.subst_name_expr(rs.expression, name, field, struct_ref, ty, span,
+                                                 true);
             return;
         }
         if (k == NodeKind::DeclarationStatement) {
             const ds: DeclStmtNode* = s as DeclStmtNode*;
             if (ds.declaration != null && ds.declaration.kind == NodeKind::VariableDeclaration) {
                 const vd: VarDeclNode* = ds.declaration as VarDeclNode*;
-                vd.initializer = this.subst_name_expr(vd.initializer, name, field, struct_ref, ty, span);
+                // Initializing another binding from it moves the value there.
+                vd.initializer = this.subst_name_expr(vd.initializer, name, field, struct_ref,
+                                                     ty, span, true);
             }
             return;
         }
@@ -1594,20 +1708,21 @@ type struct AsyncLower {
         }
         if (k == NodeKind::IfStatement) {
             const iff: IfStmtNode* = s as IfStmtNode*;
-            iff.condition = this.subst_name_expr(iff.condition, name, field, struct_ref, ty, span);
+            iff.condition = this.subst_name_expr(iff.condition, name, field, struct_ref, ty, span,
+                                                 false);
             this.subst_name_stmt(iff.then_stmt, name, field, struct_ref, ty, span);
             this.subst_name_stmt(iff.else_stmt, name, field, struct_ref, ty, span);
             return;
         }
         if (k == NodeKind::WhileStatement) {
             const w: WhileStmtNode* = s as WhileStmtNode*;
-            w.condition = this.subst_name_expr(w.condition, name, field, struct_ref, ty, span);
+            w.condition = this.subst_name_expr(w.condition, name, field, struct_ref, ty, span, false);
             this.subst_name_stmt(w.body, name, field, struct_ref, ty, span);
             return;
         }
         if (k == NodeKind::DoWhileStatement) {
             const d: DoWhileStmtNode* = s as DoWhileStmtNode*;
-            d.condition = this.subst_name_expr(d.condition, name, field, struct_ref, ty, span);
+            d.condition = this.subst_name_expr(d.condition, name, field, struct_ref, ty, span, false);
             this.subst_name_stmt(d.body, name, field, struct_ref, ty, span);
             return;
         }
@@ -1616,13 +1731,15 @@ type struct AsyncLower {
             if (f.init != null) {
                 if ((f.init as ASTNode*).kind == NodeKind::VariableDeclaration) {
                     const vd: VarDeclNode* = f.init as VarDeclNode*;
-                    vd.initializer = this.subst_name_expr(vd.initializer, name, field, struct_ref, ty, span);
+                    vd.initializer = this.subst_name_expr(vd.initializer, name, field, struct_ref,
+                                                         ty, span, true);
                 } else {
-                    f.init = this.subst_name_expr(f.init as ExpressionNode*, name, field, struct_ref, ty, span) as ASTNode*;
+                    f.init = this.subst_name_expr(f.init as ExpressionNode*, name, field,
+                                                 struct_ref, ty, span, false) as ASTNode*;
                 }
             }
-            f.condition = this.subst_name_expr(f.condition, name, field, struct_ref, ty, span);
-            f.update    = this.subst_name_expr(f.update, name, field, struct_ref, ty, span);
+            f.condition = this.subst_name_expr(f.condition, name, field, struct_ref, ty, span, false);
+            f.update    = this.subst_name_expr(f.update, name, field, struct_ref, ty, span, false);
             this.subst_name_stmt(f.body, name, field, struct_ref, ty, span);
             return;
         }
@@ -1632,7 +1749,8 @@ type struct AsyncLower {
         }
         if (k == NodeKind::MatchStatement) {
             const m: MatchStmtNode* = s as MatchStmtNode*;
-            m.subject = this.subst_name_expr(m.subject, name, field, struct_ref, ty, span);
+            // As for a match EXPRESSION: an arm binding copies the payload out.
+            m.subject = this.subst_name_expr(m.subject, name, field, struct_ref, ty, span, true);
             for (mut i: i64 = 0; i < m.arms.length; i++) {
                 if (m.arms[i] != null) {
                     this.subst_name_stmt(m.arms[i].body, name, field, struct_ref, ty, span);
@@ -2605,7 +2723,7 @@ type struct AsyncLower {
             this.subst_name_stmt(arm.body, bname, field, sm.struct_ref, bt, span);
             if (in_guard) {
                 arm.guard = this.subst_name_expr(arm.guard, bname, field,
-                                                 sm.struct_ref, bt, span);
+                                                 sm.struct_ref, bt, span, false);
             }
             cap.add_statement(this.assign_member_stmt(
                 sm.struct_ref, field, bt, this.ident(bname, bt, span), span));
@@ -3510,27 +3628,6 @@ type struct AsyncLower {
         return !(t as InstantiatedType*).has_resolved_type();
     }
 
-    /// True when ANY mention of `name` in `blk` hands the value over by value.
-    ///
-    /// A stronger question than `last_use_consumes`, and the one in-place
-    /// residency has to ask. The moving carrier only needs to know whether the
-    /// state still owns the value as it falls off its end, because a give-away
-    /// earlier on is followed by a rebuild the state then hands back. With the
-    /// value living in its field there is no local to rebuild: a single
-    /// by-value use has to empty the field at that site, or the callee and the
-    /// field both own it.
-    any_use_gives_away(mut &this, blk: BlockStmtNode*, name: SymbolStr, lty: TypeRef) -> boolean {
-        if (!this.carried_can_be_given_away(lty)) { return false; }
-        const saved: boolean = this.mark_giveaway_sticky;
-        this.mark_giveaway_sticky = true;
-        mut kind: i64 = 0i64;
-        for (mut i: i64 = 0; i < blk.statements.length; i++) {
-            this.mark_last_use_stmt(blk.statements[i], name, &kind);
-        }
-        this.mark_giveaway_sticky = saved;
-        return kind == 2i64;
-    }
-
     last_use_consumes(&this, blk: BlockStmtNode*, name: SymbolStr, lty: TypeRef) -> boolean {
         // A copy is not a give-away. Reporting one as such suppresses the
         // hand-back, and the carrier the next state takes from is then empty —
@@ -3585,12 +3682,11 @@ type struct AsyncLower {
             const iff: IfStmtNode* = s as IfStmtNode*;
             this.mark_last_use_expr(iff.condition, name, false, out);
             // A branch that returns never reaches the state's tail, so it cannot
-            // describe what the state still owns there. It CAN still hand the
-            // value over on its own path, which is what sticky mode asks about.
-            if (this.mark_giveaway_sticky || !this.stmt_returns(iff.then_stmt)) {
+            // describe what the state still owns there.
+            if (!this.stmt_returns(iff.then_stmt)) {
                 this.mark_last_use_stmt(iff.then_stmt, name, out);
             }
-            if (this.mark_giveaway_sticky || !this.stmt_returns(iff.else_stmt)) {
+            if (!this.stmt_returns(iff.else_stmt)) {
                 this.mark_last_use_stmt(iff.else_stmt, name, out);
             }
             return;
@@ -3627,7 +3723,7 @@ type struct AsyncLower {
                 // A guard runs before its body and only reads, so a name last
                 // mentioned there is still owned by the state.
                 this.mark_last_use_expr(m.arms[i].guard, name, false, out);
-                if (this.mark_giveaway_sticky || !this.stmt_returns(m.arms[i].body)) {
+                if (!this.stmt_returns(m.arms[i].body)) {
                     this.mark_last_use_stmt(m.arms[i].body, name, out);
                 }
             }
@@ -3644,8 +3740,7 @@ type struct AsyncLower {
         const k: NodeKind = (e as ASTNode*).kind;
         if (k == NodeKind::Identifier) {
             if ((e as IdentifierNode*).name.equals(name)) {
-                if (by_value) { *out = 2i64; }
-                else if (!(this.mark_giveaway_sticky && *out == 2i64)) { *out = 1i64; }
+                if (by_value) { *out = 2i64; } else { *out = 1i64; }
             }
             return;
         }
@@ -3863,6 +3958,26 @@ type struct AsyncLower {
         return this.var_decl_stmt(ptr_name, true, lty_ptr, call, span);
     }
 
+    /// Insert the pointer binding at statement `at`, unless the block never
+    /// reads through it.
+    ///
+    /// A state whose every mention of the value was a give-away or a republish
+    /// has no reader left after substitution, and binding a pointer anyway
+    /// leaves an unused local. That is not merely untidy: every synthesized node
+    /// carries the async function's own span, so the dead-code lint would report
+    /// it against the user's `async function`, naming source that declares
+    /// nothing of the kind.
+    bind_carrier_ptr(mut &this, sm: PollSm*, blk: BlockStmtNode*, at: i64, pnm: SymbolStr,
+                     field: SymbolStr, opt_ty: TypeRef, lty_ptr: TypeRef,
+                     span: SourceSpan) -> void {
+        if (this.block_first_use(blk, pnm) == 0i64) { return; }
+        mut opened: StatementNode*[] = [];
+        for (mut i: i64 = 0; i < at; i++) { opened.push(blk.statements[i]); }
+        opened.push(this.agg_bind_ptr_stmt(sm, pnm, field, opt_ty, lty_ptr, span));
+        for (mut i: i64 = at; i < blk.statements.length; i++) { opened.push(blk.statements[i]); }
+        blk.statements = opened;
+    }
+
     /// The pointer binding a carried value is reached through, in EVERY state.
     ///
     /// One name for all states, because the state blocks share AST statement
@@ -3875,37 +3990,6 @@ type struct AsyncLower {
         return this.intern.intern(format("%s$p", this.intern.resolve(nm)));
     }
 
-    /// Whether a carried aggregate can live in its field for the whole life of
-    /// the future, rather than moving between the field and a block-local on
-    /// every poll.
-    ///
-    /// In-place residency is what makes a pointer into an async fn's own frame
-    /// survive a suspend, so it is the preferred shape and the conditions here
-    /// are the ones the in-place spelling cannot yet express - not a preference:
-    ///
-    ///   - The declaration must be a top-level `mut x = <init>;` with an
-    ///     initializer, since the value is built by moving that initializer into
-    ///     `Option::Some`. A declaration without one has nothing to build from.
-    ///   - No state may GIVE the value away. In place, the field owns the value
-    ///     outright, so a by-value use has to empty the field at that site; a
-    ///     bare alias there would leave the callee and the field both owning it.
-    ///   - No state may REBUILD it (a write before any read, whether at the top
-    ///     level or nested in a branch). Publishing a second value into the
-    ///     field has to drop the first, and an assignment does not.
-    carrier_can_live_in_place(mut &this, sm: PollSm*, ds: i64, nm: SymbolStr,
-                              lty: TypeRef, vd: VarDeclNode*) -> boolean {
-        if (vd.initializer == null) { return false; }
-        if (this.decl_stmt_index(sm.blocks[ds], vd) < 0i64) { return false; }
-        for (mut b: i64 = 0; b < sm.blocks.length; b++) {
-            const use_kind: i64 = this.block_first_use(sm.blocks[b], nm);
-            if (b != ds && use_kind == 0i64) { continue; }
-            if (this.any_use_gives_away(sm.blocks[b], nm, lty)) { return false; }
-            if (b != ds && use_kind == this.first_use_write()) { return false; }
-            if (b != ds && this.block_cond_write(sm.blocks[b], nm)) { return false; }
-        }
-        return true;
-    }
-
     /// Index of the top-level statement in `blk` that declares `vd`, or -1.
     decl_stmt_index(&this, blk: BlockStmtNode*, vd: VarDeclNode*) -> i64 {
         for (mut i: i64 = 0; i < blk.statements.length; i++) {
@@ -3914,18 +3998,36 @@ type struct AsyncLower {
         return -1i64;
     }
 
-    /// Rewrite every mention of `nm` in `blk` from statement `from` onwards into
-    /// `*<ptr_name>`, so a carried value is read and written through its field
-    /// rather than through a stack copy of it.
-    subst_carried_from(mut &this, blk: BlockStmtNode*, from: i64, nm: SymbolStr,
-                       ptr_name: SymbolStr, lty: TypeRef, span: SourceSpan) -> void {
-        const saved: i64 = this.subst_mode;
-        this.subst_mode = this.subst_to_local_deref();
+    /// Rewrite every mention of `nm` in `blk` from statement `from` onwards so a
+    /// carried value is reached where it lives rather than through a stack copy
+    /// of it: a mention that only reaches into the value becomes `*<ptr_name>`,
+    /// and one that hands it over becomes a `take` out of `field`.
+    ///
+    /// A carried value whose type has no destructor is COPIED by a by-value use,
+    /// so the field must keep its payload and no take is armed: emptying it
+    /// would leave every later state's `unwrap_ptr` looking at a `None`.
+    subst_carried_from(mut &this, sm: PollSm*, blk: BlockStmtNode*, from: i64, nm: SymbolStr,
+                       ptr_name: SymbolStr, field: SymbolStr, lty: TypeRef, opt_ty: TypeRef,
+                       span: SourceSpan) -> void {
+        const saved_mode:   i64       = this.subst_mode;
+        const saved_field:  SymbolStr = this.subst_carrier_field;
+        const saved_opt:    TypeRef   = this.subst_carrier_opt;
+        const saved_struct: TypeRef   = this.subst_carrier_struct;
+        const saved_takes:  boolean   = this.subst_carrier_takes;
+        this.subst_mode            = this.subst_to_local_deref();
+        this.subst_carrier_field   = field;
+        this.subst_carrier_opt     = opt_ty;
+        this.subst_carrier_struct  = sm.struct_ref;
+        this.subst_carrier_takes   = this.carried_can_be_given_away(lty);
         for (mut j: i64 = from; j < blk.statements.length; j++) {
             this.subst_name_stmt(blk.statements[j], nm, ptr_name,
                                  TypeRef::invalid(), lty, span);
         }
-        this.subst_mode = saved;
+        this.subst_mode           = saved_mode;
+        this.subst_carrier_field  = saved_field;
+        this.subst_carrier_opt    = saved_opt;
+        this.subst_carrier_struct = saved_struct;
+        this.subst_carrier_takes  = saved_takes;
     }
 
     /// Prepend `<name> = this.<field>.take().unwrap();` so the state opens with
@@ -4553,12 +4655,12 @@ type struct AsyncLower {
                 // const path's copy-per-reader would drop an owning value once
                 // per copy. It lives in an `Option<T>` field instead — `None`
                 // until first stored, so a future dropped before that has
-                // nothing to drop — and moves between that field and a plain
-                // block-local: taken on entry to a state, handed back on the way
-                // out. Exactly one live copy at any moment, and inside a block
-                // the value is an ordinary local, so every use of it (method
-                // call, field access, reassignment, partial move, scope-exit
-                // drop) keeps its normal meaning.
+                // nothing to drop — and it STAYS there for the life of the
+                // future. Every state reaches the one storage location rather
+                // than a copy of it, which is what lets a pointer the value
+                // published outlive a suspend, and the `Option`'s own glue drops
+                // the payload conditionally so the future needs no drop of its
+                // own.
                 //
                 // A by-name protocol needs the name to identify one value, so a
                 // name declared in two states is rejected rather than conflated.
@@ -4623,154 +4725,90 @@ type struct AsyncLower {
                 const afield: SymbolStr = this.intern.intern(
                     format("__agg_%lld_%s", ds, this.intern.resolve(nm)));
 
-                // Preferred residency: the value is BUILT in its carrier field
-                // and never leaves it, so its address is the future's own and a
-                // pointer into it survives a suspend. Moving it between the
-                // field and a block-local on every poll is what makes a pointer
-                // the value published name a dead stack slot from the second
-                // poll onwards - silently, because the slot is live stack.
+                // The value is BUILT in its carrier field and never leaves it,
+                // so its address is the future's own and a pointer into it
+                // survives a suspend. Moving it between the field and a
+                // block-local on every poll is what made a pointer the value
+                // published name a dead stack slot from the second poll onwards
+                // — silently, because the slot is live stack.
                 //
-                // Two shapes still take the moving path below, because reaching
-                // the value in place changes where ownership lives and both
-                // need that to be spelled out rather than assumed:
-                //   - a state that GIVES the value away owes the callee the
-                //     value itself, so the field has to be emptied at that site
-                //     rather than aliased;
-                //   - a state that REBUILDS it produces a second value, and the
-                //     store that publishes it would have to drop the first.
-                // Both are recognised here and left alone; see §9.
-                if (this.carrier_can_live_in_place(sm, ds, nm, lty, vd)) {
-                    const lty_ptr: TypeRef = this.arena.get_pointer_to(lty);
-                    const pnm: SymbolStr = this.agg_ptr_name(nm);
-                    const di: i64 = this.decl_stmt_index(sm.blocks[ds], vd);
+                // Every way of reaching the value is expressible here because
+                // the substitution knows what POSITION each mention sits in: a
+                // mention that only reaches into the value goes through the
+                // pointer, one that hands it over takes it out of the field, and
+                // one that rebuilds it republishes the field.
+                const lty_ptr: TypeRef = this.arena.get_pointer_to(lty);
+                const pnm: SymbolStr = this.agg_ptr_name(nm);
+                const di: i64 = this.decl_stmt_index(sm.blocks[ds], vd);
 
-                    // The declaring state builds the value straight into the
-                    // field, then binds the pointer the rest of the state reads
-                    // through. The initializer moves into `Option::Some`, so it
-                    // is evaluated exactly where the declaration used to be.
-                    mut rebuilt: StatementNode*[] = [];
-                    for (mut i: i64 = 0; i < di; i++) { rebuilt.push(sm.blocks[ds].statements[i]); }
-                    rebuilt.push(this.assign_member_stmt(sm.struct_ref, afield, opt_ty,
-                        this.option_some(vd.initializer, opt_ty, span), span));
-                    rebuilt.push(this.agg_bind_ptr_stmt(sm, pnm, afield, opt_ty, lty_ptr, span));
-                    for (mut i: i64 = di + 1i64; i < sm.blocks[ds].statements.length; i++) {
-                        rebuilt.push(sm.blocks[ds].statements[i]);
-                    }
-                    sm.blocks[ds].statements = rebuilt;
-                    // From past the two statements just inserted: the store's
-                    // own operand is the initializer, which cannot mention the
-                    // name it is initialising, and anything BEFORE the
-                    // declaration refers to a different binding entirely.
-                    this.subst_carried_from(sm.blocks[ds], di + 2i64, nm, pnm, lty, span);
-
-                    // Every other state that touches it opens by re-binding the
-                    // pointer from the field. Nothing is handed back, on any
-                    // path: the value never left.
-                    for (mut b: i64 = 0; b < sm.blocks.length; b++) {
-                        if (b == ds) { continue; }
-                        if (this.block_first_use(sm.blocks[b], nm) == 0i64) { continue; }
-                        mut opened: StatementNode*[] =
-                            [this.agg_bind_ptr_stmt(sm, pnm, afield, opt_ty, lty_ptr, span)];
-                        for (mut i: i64 = 0; i < sm.blocks[b].statements.length; i++) {
-                            opened.push(sm.blocks[b].statements[i]);
-                        }
-                        sm.blocks[b].statements = opened;
-                        this.subst_carried_from(sm.blocks[b], 1i64, nm, pnm, lty, span);
-                    }
-
-                    inplace_fields.push(afield);
-                    inplace_opts.push(opt_ty);
-                    inplace_ptrs.push(pnm);
-
-                    sm.prom_field.push(afield);
-                    sm.prom_tys.push(opt_ty);
-                    sm.prom_opt.push(true);
-                    sm.nprom += 1i64;
-                    continue;
+                // The declaring state builds the value straight into the
+                // field. The initializer moves into `Option::Some`, so it is
+                // evaluated exactly where the declaration used to be.
+                //
+                // A declaration with no initializer opens the field as
+                // `None`: the discriminant is the init flag, so the value is
+                // uninitialised in exactly the way the source says, a future
+                // dropped before the first assignment has nothing to drop,
+                // and the assignment that follows republishes the field.
+                mut init_val: ExpressionNode* = this.option_none(opt_ty, span);
+                if (vd.initializer != null) {
+                    init_val = this.option_some(vd.initializer, opt_ty, span);
                 }
-
-                // Declaring state: the local is built as written, then handed to
-                // the field as the state falls off — unless the state gave the
-                // value away (passed it to the operation it is awaiting), in
-                // which case there is nothing of its own left to hand over. No
-                // hand-back before this state's own suspend either: that suspend
-                // is what produces the value, so it runs before it exists.
-                // Read before the store below is appended: that store hands the
-                // value to `Option::Some` BY VALUE, so asking afterwards would
-                // report every declaring state as having given the value away.
-                const ds_publishes: boolean = this.needs_handback(sm.blocks[ds], nm, lty);
-                if (ds_publishes) {
-                    sm.blocks[ds].add_statement(
-                        this.agg_store_stmt(sm, afield, opt_ty, nm, lty, span));
+                mut rebuilt: StatementNode*[] = [];
+                for (mut i: i64 = 0; i < di; i++) { rebuilt.push(sm.blocks[ds].statements[i]); }
+                rebuilt.push(this.assign_member_stmt(sm.struct_ref, afield, opt_ty,
+                    init_val, span));
+                for (mut i: i64 = di + 1i64; i < sm.blocks[ds].statements.length; i++) {
+                    rebuilt.push(sm.blocks[ds].statements[i]);
                 }
+                sm.blocks[ds].statements = rebuilt;
+                // An uninitialised declaration leaves the field `None`, so
+                // the pointer can only be bound once the first assignment
+                // has filled it. Asked before substitution rewrites that
+                // assignment into the store.
+                mut ds_at: i64 = di + 1i64;
+                if (vd.initializer == null) {
+                    const dwi: i64 = this.top_level_assignment_index(sm.blocks[ds], nm);
+                    if (dwi >= 0i64) { ds_at = dwi + 1i64; }
+                }
+                // From past the store just inserted: its own operand is the
+                // initializer, which cannot mention the name it is
+                // initialising, and anything BEFORE the declaration refers
+                // to a different binding entirely.
+                this.subst_carried_from(sm, sm.blocks[ds], di + 1i64, nm, pnm,
+                                        afield, lty, opt_ty, span);
+                this.bind_carrier_ptr(sm, sm.blocks[ds], ds_at, pnm, afield,
+                                      opt_ty, lty_ptr, span);
 
-                // Every other state that touches it: a reader takes it back on
-                // entry, a writer gets a fresh binding to fill; either way the
-                // value is handed over again on the way out — including before a
-                // suspend, which returns before the block's tail runs and would
-                // otherwise leave the field empty for the next poll.
+                // Every other state that touches it reaches the value
+                // through the same pointer. Nothing is handed back, on any
+                // path: the value never left.
                 for (mut b: i64 = 0; b < sm.blocks.length; b++) {
                     if (b == ds) { continue; }
                     const use_kind: i64 = this.block_first_use(sm.blocks[b], nm);
                     if (use_kind == 0i64) { continue; }
-                    // Whether the state still owns the value as it falls off its
-                    // end is a property of the code the user wrote, so it must be
-                    // read BEFORE this pass adds any store of its own — for the
-                    // same reason the declaring state reads it early. A hand-back
-                    // store hands the value to `Option::Some` BY VALUE, so the
-                    // store `store_before_suspends` inserts on the suspend path
-                    // would otherwise read as the state's last use and report it
-                    // as having given the value away, suppressing the tail store
-                    // the fall-through path needs. That leaves the carrier empty
-                    // and the next state's `take().unwrap()` panics — the shape
-                    // that reaches it is an `await` on a carried receiver whose
-                    // block does not mention the value again after the suspend,
-                    // i.e. every `await c.m()` inside a loop.
-                    const handback: boolean = this.needs_handback(sm.blocks[b], nm, lty);
-                    // A conditional rebuild is carried in like a read: the take
-                    // gives the state the previous value, the nested assignment
-                    // replaces it only on the path that runs, and either way the
-                    // one live value is handed back on the way out.
-                    mut carried_in: boolean = (use_kind == 1i64);
-                    if (!carried_in && this.block_cond_write(sm.blocks[b], nm)) {
-                        // The take can only find a value the declaring state
-                        // actually published.  A state that gave the value away
-                        // stored nothing, so there is no previous value for the
-                        // skipped path to keep and the rebuild has to be
-                        // unconditional.
-                        if (!ds_publishes) {
-                            this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
-                                "async: this value is given away before the `await` and then rebuilt from inside a branch, so the branch that is not taken has nothing to keep; assign it once at the top level of that step (`x = …;`)",
-                                vd.span);
-                            sm.ok = false; return;
-                        }
-                        carried_in = true;
+                    // A state that REPUBLISHES the value before reading it
+                    // may find the field empty on entry — it is the state
+                    // that refills it, the other half of the owned-handle
+                    // idiom whose first half handed the value away. Its
+                    // pointer is bound after that store rather than before,
+                    // or `unwrap_ptr` would panic on a `None`. Asked before
+                    // substitution rewrites the assignment into the store.
+                    mut at: i64 = 0i64;
+                    if (use_kind == this.first_use_write()) {
+                        const wi: i64 = this.top_level_assignment_index(sm.blocks[b], nm);
+                        if (wi >= 0i64) { at = wi + 1i64; }
                     }
-                    // The name the value lives under in THIS state: the carried
-                    // name when the state took it, or the fresh binding a
-                    // declaring state was given.
-                    mut local: SymbolStr = nm;
-                    if (carried_in) {
-                        this.prepend_agg_take(sm.blocks[b], nm, afield, lty, opt_ty,
-                                              sm.struct_ref, true, span);
-                        // Live from the top of this state, so a suspend partway
-                        // through has to hand it back first.
-                        this.store_before_suspends(sm, sm.blocks[b] as StatementNode*,
-                                                   afield, opt_ty, local, lty, span);
-                    } else {
-                        local = this.decl_at_first_assignment(sm.blocks[b], nm, lty, span);
-                        if (!local.is_valid()) {
-                            this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
-                                "async: this value is rebuilt after an `await` from inside a branch; assign it once at the top level of that step (`x = …;`) so the state machine can bind it there",
-                                vd.span);
-                            sm.ok = false; return;
-                        }
-                    }
-                    if (handback) {
-                        sm.blocks[b].add_statement(
-                            this.agg_store_stmt(sm, afield, opt_ty, local, lty, span));
-                    }
+                    this.subst_carried_from(sm, sm.blocks[b], 0i64, nm, pnm,
+                                            afield, lty, opt_ty, span);
+                    this.bind_carrier_ptr(sm, sm.blocks[b], at, pnm, afield,
+                                          opt_ty, lty_ptr, span);
                 }
+
+                inplace_fields.push(afield);
+                inplace_opts.push(opt_ty);
+                inplace_ptrs.push(pnm);
+
                 sm.prom_field.push(afield);
                 sm.prom_tys.push(opt_ty);
                 sm.prom_opt.push(true);

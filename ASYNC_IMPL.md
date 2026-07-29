@@ -35,7 +35,7 @@ not for routine judgement calls.
 |---|---|---|
 | 0 | Design lock-down (surface, trait shapes, lowering placement) — get Jake's sign-off | ✅ done — locked 2026-07-22 (§7 filled) |
 | 1 | Core types in stdlib (`Poll`/`Future`/`Context`/`Waker`) + `block_on` + hand-written futures | ✅ done+validated 2026-07-22 (no repin) |
-| 2 | Compiler: `async fn` parse + state-machine lowering + `await` desugar | ✅ DONE+validated. **Address stability (increment 4b) LANDED 2026-07-28 for the shapes the in-place spelling can express.** A carried aggregate is now BUILT INTO its `Option<T>` carrier field and every state reaches it through `unwrap_ptr`, so its address is the future's own and a pointer into it survives a suspend; the acceptance probe reads `55` (it reads `0` under the pin) and is promoted to `lang/async_carried_local_address_stable.cryo`. Two `E0455` negatives were INVERTED into positive tests. **Still on the moving carrier:** a value a state GIVES AWAY, and one a state REBUILDS — both need a position-aware substitution (`subst_name_expr`/`subst_name_stmt`, 47 call sites, no by-value/borrow flag), which is the next increment. Until it lands the rest of the frame-address subsystem and `emit_recv_refresh` stay live and stay needed. Drop TIMING is restored explicitly by `release_before_ready` — deferring a carried socket's close to future-drop deadlocked a real test. The design IS settled and does **not** need flag-gated drops — keep the `Option<T>` field and reach the payload in place via `unwrap_ptr`. **Its blocker is now REMOVED (2026-07-28, later).** In-place residency turns a missed give-away from a loud `unwrap`-on-`None` into a **silent double free**, so it needed a rejection of by-value moves out of `*p`, which in turn needed sound argument classification. Both landed: arguments are now classified from real **parameter types** (`ArgBinding`, set in sema, consumed in lockstep by all four argument loops), `!autoref` is gone as a by-value proxy, and `check_deref_move_out` is in the tree and does **not** misfire on the lowering's own `*this$recv`. `unsafe` became the escape hatch and `core::mem::take_ptr` was **deleted** (Jake's call — it was byte-identical to `*p` and existed only to be invisible to the checker). Two pre-existing defects fixed on the way: `unsafe { }` silently disabled move checking wholesale, and a generic call reachable only from inside an `unsafe` block was never specialized. See the newest §9 entry. Earlier: **Two carried-aggregate soundness bugs fixed 2026-07-27** — (1) `await <method>` on an owning local inside a LOOP left its carrier empty (`unwrap` on `None`): the pass asked "did this state give the value away?" AFTER inserting its own by-value hand-back store, and mistook that store for the answer; (2) an `async fn` with NO awaits COPIED an owning parameter out of its field instead of moving it, double-freeing it. Both fixed at the root in `async_lower.cryo`; the `Join` diagnosis recorded under `TcpConn` was wrong and is corrected. New permanent coverage: `async_stress_shapes.cryo` (31 tests, asserted numbers + counted drops, every shape paired with a control) and the flood test. See the newest §9 entry. Earlier: DONE+validated; **the deferred aggregate-across-await tail LANDED 2026-07-24 — an `async function` can now hold an aggregate across a suspend, take a droppable aggregate parameter, and be `spawn`ed on an `Executor`** (see the newest §9 entry). Earlier: DONE (2026-07-23) — parse + no-await (1b) + single await (2) + N straight-line (3) + awaits across `if`/`else` (4a) + awaits across `while`/`for`/`loop`/`do-while` + `break`/`continue` + `mut` loop-carried promotion (4b) + scope-aware alpha-rename, all committed through `5e28a74f`. **Inc 4c DONE (2026-07-23): `await` inside a `match` arm — dispatch `match(subj)` → per-arm entry states → join; scalar pattern bindings captured to fields (aggregate→E0600, ref→E0455); pattern bindings alpha-renamed for by-name soundness; non-exhaustive match gets synth `_ => join`. Plus the bare-block-with-await warm-up. Both-OS fixed point, `win-s2`/`win-s3` = 0/235 `.ll` → NO REPIN, UNCOMMITTED.** All common control flow now lowers → Phase 2 complete. |
+| 2 | Compiler: `async fn` parse + state-machine lowering + `await` desugar | ✅ DONE+validated. **Address stability COMPLETE 2026-07-29 — the in-place carrier is UNIVERSAL and `carrier_can_live_in_place` is DELETED.** Every carried aggregate is BUILT INTO its `Option<T>` field and stays there for the life of the future; the moving carrier is gone, not bypassed. The two shapes that used to force it — a state that GIVES the value away, one that REBUILDS it — are now expressible because `subst_name_expr`/`subst_name_stmt` carry a **`by_value` position flag**: a mention that reaches into the value becomes `*<nm>$p`, one that hands it over becomes `take().unwrap()`, one that rebuilds it republishes the field. A by-value argument is classified from `arg_binding`, and an `Unclassified` slot reads as a BORROW (the opposite default from the move passes — over-reporting strands the next `unwrap_ptr` on a `None`, under-reporting is a loud `E0453`). Needed three non-async root-cause fixes: synthesized `Option::Some`/`Poll::Ready` payloads were `Unclassified`; trait `MethodInfo.param_types` wrongly included the receiver, breaking its documented non-self contract; and argument classification never reached a bare generic param bounded by a `where` clause. `make test` **1903 / 165 / 14, 0 failed**. **FINDING — the frame-address subsystem and `emit_recv_refresh` are NOT dead and were NOT deleted:** residency applies only to values that are actually CARRIED, and both `E0455_async_*` negatives address a local that is never read after the suspend, so it is not carried and still dies with the poll frame. Inverting them would accept unsound code. The payoff is already collected anyway — `addr_place_root` stops at the first indirection, so `&c.canary` on a carried local becomes `&(*c$p).canary` and is allowed (proven: `got=99 drops=1`), now pinned by a test. **OPEN (Jake's call):** use-after-give-away *within one state* no longer reports `E0452`, because the take and the later borrow are unrelated expressions to MoveCheck; see the newest §9 entry for the two candidate fixes. Earlier (2026-07-28): the acceptance probe reads `55` (it reads `0` under the old pin) and is `lang/async_carried_local_address_stable.cryo`; two `E0455` negatives were INVERTED into positive tests. Drop TIMING is restored explicitly by `release_before_ready` — deferring a carried socket's close to future-drop deadlocked a real test. The design IS settled and does **not** need flag-gated drops — keep the `Option<T>` field and reach the payload in place via `unwrap_ptr`. **Its blocker is now REMOVED (2026-07-28, later).** In-place residency turns a missed give-away from a loud `unwrap`-on-`None` into a **silent double free**, so it needed a rejection of by-value moves out of `*p`, which in turn needed sound argument classification. Both landed: arguments are now classified from real **parameter types** (`ArgBinding`, set in sema, consumed in lockstep by all four argument loops), `!autoref` is gone as a by-value proxy, and `check_deref_move_out` is in the tree and does **not** misfire on the lowering's own `*this$recv`. `unsafe` became the escape hatch and `core::mem::take_ptr` was **deleted** (Jake's call — it was byte-identical to `*p` and existed only to be invisible to the checker). Two pre-existing defects fixed on the way: `unsafe { }` silently disabled move checking wholesale, and a generic call reachable only from inside an `unsafe` block was never specialized. See the newest §9 entry. Earlier: **Two carried-aggregate soundness bugs fixed 2026-07-27** — (1) `await <method>` on an owning local inside a LOOP left its carrier empty (`unwrap` on `None`): the pass asked "did this state give the value away?" AFTER inserting its own by-value hand-back store, and mistook that store for the answer; (2) an `async fn` with NO awaits COPIED an owning parameter out of its field instead of moving it, double-freeing it. Both fixed at the root in `async_lower.cryo`; the `Join` diagnosis recorded under `TcpConn` was wrong and is corrected. New permanent coverage: `async_stress_shapes.cryo` (31 tests, asserted numbers + counted drops, every shape paired with a control) and the flood test. See the newest §9 entry. Earlier: DONE+validated; **the deferred aggregate-across-await tail LANDED 2026-07-24 — an `async function` can now hold an aggregate across a suspend, take a droppable aggregate parameter, and be `spawn`ed on an `Executor`** (see the newest §9 entry). Earlier: DONE (2026-07-23) — parse + no-await (1b) + single await (2) + N straight-line (3) + awaits across `if`/`else` (4a) + awaits across `while`/`for`/`loop`/`do-while` + `break`/`continue` + `mut` loop-carried promotion (4b) + scope-aware alpha-rename, all committed through `5e28a74f`. **Inc 4c DONE (2026-07-23): `await` inside a `match` arm — dispatch `match(subj)` → per-arm entry states → join; scalar pattern bindings captured to fields (aggregate→E0600, ref→E0455); pattern bindings alpha-renamed for by-name soundness; non-exhaustive match gets synth `_ => join`. Plus the bare-block-with-await warm-up. Both-OS fixed point, `win-s2`/`win-s3` = 0/235 `.ll` → NO REPIN, UNCOMMITTED.** All common control flow now lowers → Phase 2 complete. |
 | 3 | Executor + `Waker` + `spawn`/`JoinHandle`; multi-thread; poll-boundary `catch_unwind` isolation | ✅ DONE+validated (2026-07-24) — surface LOCKED 2026-07-23. **(a)** single-thread executor + ready-queue + re-enqueueing Waker; **(b)** `spawn`/`JoinHandle` (Output via `TaskShared<O>`), `block_on`, `join`/`detach`/`abort`, drop=detach; **(c)** pthread worker pool + per-task atomic run-state (IDLE/SCHEDULED/RUNNING/NOTIFIED) + condvar `join`/`block_on` + `catch_unwind` poll-boundary isolation. Needed a NEW compiler `![config(panic_unwind)]` gating atom (see §9) → Phase-1 both-OS REPIN (selfhost fixed point, 235 `.ll`). Executor is self-contained (own pthread wrappers, no `thread::Scope` dep). Validated on Linux: regression 30/30, isolation 30/30. UNCOMMITTED. |
 | 4 | Reactor (epoll/IOCP) + async I/O over `std::net` + timers + `async fn main` + combinators | ◐ in progress 2026-07-24. **Inc 4b DONE on Linux (reactor + async TCP, stress+leak clean); Windows AFD backend written but UNVALIDATED (wine 9.0 cannot service `IOCTL_AFD_POLL` — needs a real Windows box).** Interface fork LOCKED by Jake: **one readiness interface both OSes, Windows via real AFD** (not WSAPoll, not a per-OS split). Sockets are to become **async-only with every consumer ported** (Jake, 2026-07-24) — that port is **UNBLOCKED as of 2026-07-24**: the aggregate-across-await tail landed, and the follow-on "rebuilt from inside a branch" E0600 is now removed too (newest §9 entry). Forks LOCKED earlier: waker lifetime = **separate `Arc`-wrapper**; reactor = **dedicated thread, per-`Executor`** (`![thread_local]` current-reactor handle); platform = **both OSes (epoll + IOCP)**. **Inc 4a DONE+validated (2026-07-24): Arc-refcounted `Waker` (Copy→non-Copy) + `Arc<Task>` lifetime; finish-vs-park now implicit via `Task::drop` on the last decref. Needed a COMPILER fix (owner-generic static with a defaulted owner param + nested return → E0636; `call_resolver.cryo` default-backfill) → selfhost fixed point BOTH OS, win-s2 vs win-s3 = 0/235 `.ll`, REPINNED both OS. UNCOMMITTED.** NEXT = Inc 4b (the reactor: epoll+IOCP interface — bring Jake the readiness-vs-completion unification fork). |
 
@@ -4585,3 +4585,155 @@ Either alone is fine. It only surfaced now because carrying a `u8[8]` across an 
 rejected outright, so the instantiation was never reached. The inverted test wraps its array in a struct
 to avoid provoking an unrelated bug; the shape itself is untouched. Type identity for array types is its
 own increment.
+
+## 2026-07-29 — the in-place carrier is UNIVERSAL: `carrier_can_live_in_place` is gone
+
+**Every carried aggregate now lives in its `Option<T>` carrier field for the whole life of the future.**
+The moving carrier — copy the value out into a block-local at the top of each state, hand it back on the
+way out — is deleted, not merely bypassed. `make test` **1903 unit / 0 failed, 165 compile-fail, 14
+projects** on Linux (1898 before, +5 new tests).
+
+### What made the two remaining shapes expressible
+
+`subst_name_expr` / `subst_name_stmt` now carry a **`by_value` position flag**, mirroring the positions
+`mark_last_use_expr` already distinguishes for the eligibility walk — the two must agree, or a mention
+counted as a give-away by one is aliased by the other. Three spellings come out of it:
+
+| position | spelling |
+|---|---|
+| reaches into the value (receiver, field, address-of, operand, condition) | `*<nm>$p` |
+| hands it over (by-value argument, initializer, `return`, `match` subject, struct-literal field, `await` operand) | `this.__agg_<ds>_<nm>.take().unwrap()` |
+| rebuilds the whole value (`<nm> = <new>`) | `this.__agg_<ds>_<nm> = Option::Some(<new>)` |
+
+A **by-value argument is classified from `arg_binding`, and an `Unclassified` slot reads as a BORROW** —
+the opposite default from the move passes, deliberately. Over-reporting empties the field for a parameter
+that only borrows and strands the next `unwrap_ptr` on a `None`; under-reporting surfaces as a loud
+`E0453` at compile time. That asymmetry is the whole safety argument for the default.
+
+The take is armed **only when the carrier's type can be given away at all** (`carried_can_be_given_away`).
+A value with no destructor is COPIED by a by-value use, so emptying its field would strand every later
+state. The republish is armed unconditionally — it is correct for both.
+
+**Rebuild timing.** A state whose FIRST touch of the name is a top-level assignment may find the field
+EMPTY (it is the state that refills it — the other half of the owned-handle idiom), so its pointer is
+bound *after* that store rather than before. The index is read BEFORE substitution rewrites the
+assignment into the store. Same treatment for a declaration with no initializer, which now opens the
+field as `Option::None`: the discriminant IS the init flag.
+
+**A republish does not drop what it replaces, and that is correct.** Verified against the language rather
+than assumed: `mut r: Res = Res::of(1); r = Res::of(2);` reports `drops=0` at the assignment and `drops=1`
+at scope exit. Overwriting a binding does not run the old value's destructor, so storing a second payload
+the same way keeps the lowered code faithful to the source.
+
+`bind_carrier_ptr` skips the pointer binding entirely when substitution left no reader — a state whose
+every mention was a give-away or a republish. Not merely untidy: synthesized nodes carry the async
+function's own span, so an unused local is reported by the dead-code lint against the user's source.
+
+### Three root-cause fixes it needed, none of them async-specific
+
+1. **A synthesized variant constructor left its payload `Unclassified`.** `Option::Some(x)` and
+   `Poll::Ready(x)` are built by the lowering and never pass through `classify_args_from_params`, so the
+   axis was unset and each consumer guessed differently. Both now go through one `variant_call1` helper
+   that classifies the payload `ByValue` — which is what a variant payload slot actually is.
+
+2. **`MethodInfo.param_types` is by contract the NON-SELF parameters; trait registration included the
+   receiver** (`passes/type_resolution.cryo`). An instance trait method therefore looked like it took one
+   parameter too many, so `lookup_method_param_types` matched nothing and every argument of a call on a
+   bounded receiver stayed `Unclassified`. Fixed to filter the receiver exactly as the struct and class
+   method tables already do. Only two readers exist and both want the non-self list.
+
+3. **Argument classification did not reach a bare generic parameter bounded by a WHERE clause.** `S` in
+   `where S: AsyncTransport` stays a plain `GenericParam` whose bounds live on the enclosing function/impl
+   node, so `this.inner.write_from(buf)` found no signature. New
+   `MethodBinding::param_types_through_param_bounds` — the parameter-list sibling of the existing
+   `lookup_method_through_param_bounds`, sharing its bound-scanning shape rather than mirroring it.
+
+E0453 was the guide throughout, exactly as the previous session predicted: each miss surfaced as a loud
+compile error naming the site, never as a silent double free.
+
+### FINDING: the frame-address subsystem is NOT dead. Do not delete it.
+
+The previous handoff scheduled `reject_frame_addr_carry` / `frame_addr_root_expr` / `addr_place_root` /
+`call_frame_addr_root` / `place_leaves_frame` and `emit_recv_refresh` for deletion once the carrier went
+universal, and both `E0455_async_pointer_outlives_local` and `E0455_async_address_into_awaited_future` for
+inversion into positive tests. **That premise is wrong, and inverting those tests would make the compiler
+accept genuinely unsound code.**
+
+In-place residency applies only to values that are actually CARRIED, and a value is carried only when a
+later state READS it (or it is a droppable local a borrowed view was taken from —
+`borrow_outlives_suspend`, i.e. `needs_drop`). Both negatives are the opposite shape: the addressed local
+is *never read after the suspend*, so it is not carried at all and its storage still dies with the poll
+frame. The first test's own comment says exactly this — *"the check must key on the pointer being live
+across the suspend, not on whether its referent happens to be carried"* — and it is still right.
+
+`emit_recv_refresh` survives for the same reason: a receiver with **no destructor** whose only mention is
+the awaited operand fails the `needs_drop` gate at `async_lower.cryo:4669`, so it is never carried, stays
+frame-resident, and still needs re-addressing each poll.
+
+**The checks are already precisely calibrated, and the payoff is already collected.** `addr_place_root`
+stops at the first indirection a place passes through, so once a value IS field-resident the substitution
+turns `&c.canary` into `&(*c$p).canary`, which is rooted in the future's own storage and correctly
+allowed. Proven end-to-end, not argued: a probe taking the address syntactically returns `got=99
+drops=1`. New test `source_taken_address_of_carried_local_survives` pins it.
+
+### New tests — and they discriminate
+
+`lang/async_giveaway_carrier_address_stable.cryo` (4 tests) covers the two shapes that were on the moving
+path, each paired with a control that drives the same future without writing, each asserting the
+destructor count. Verified against **both** compilers, which is the bar this class of bug keeps failing:
+
+```
+                 OLD pin (56894861)              NEW
+giveaway         seen=0   drops=1        seen=55  drops=1
+rebuild          seen=0   drops=1        seen=77  drops=1
+```
+
+The drop counts are identical under both, so the tests are measuring address stability and nothing else.
+
+### Gates
+
+`make test` **1903 / 165 / 14, 0 failed**. `make selfhost-check` **TWO `FIXED POINT OK`** — this session
+ran on a Linux container where the Windows 6-stage chain DOES complete under wine (unlike the WSL box of
+2026-07-28, which lacked `wine32`). Plain `make pin` taken with both halves built (`mingw` +
+`.toolchains/llvm-win` present), `make verify-pin` OK, sidecars a matched pair at `004c7918-dirty`.
+
+The pinned binary is proven to BEHAVE, not just to be named right: `bin/cryo` itself compiles the
+give-away/rebuild probe to `55`/`77` with `drops=1` (the previous pin gives `0`/`0`), compiles the
+syntactic-address probe to `99`, and still fires `E0455` on both async pointer negatives.
+
+Dead code removed in the same increment and re-gated: `any_use_gives_away` lost its only caller when
+`carrier_can_live_in_place` went, and `mark_giveaway_sticky` existed only to serve it. Both deleted;
+`mark_last_use_stmt` no longer has a sticky mode. `last_use_consumes` / `needs_handback` stay — the
+PARAMETER carrier and the match-binding carrier still use the moving protocol.
+
+### Not done
+
+- `net/http2/{client,server,connection}` still unported — now genuinely unblocked, since
+  `connection.cryo` borrows its transport and that is exactly what in-place residency makes tractable.
+- `mark_last_use_expr` still marks EVERY call argument `by_value=true`. The previous handoff flagged this
+  as worth correcting from `arg_binding`, but it is no longer the shared hazard it was: its only
+  remaining consumers are `last_use_consumes` / `needs_handback`, which serve the two carriers that still
+  move. Correcting it would change THEIR hand-back decisions and buys nothing for the in-place carrier,
+  which reads position directly.
+
+### OPEN: use-after-give-away inside ONE state is no longer a compile error
+
+With the value in a field, a by-value use becomes `this.<field>.take().unwrap()` and a later borrow
+becomes `*<nm>$p` — two unrelated expressions to MoveCheck, which runs long after the lowering. So:
+
+```cryo
+mut c = make();
+foo(c);        // give-away  -> take().unwrap()
+bar(&c);       // same state, after the move -> &(*c$p), reads moved-from storage
+await ...;
+```
+
+no longer reports `E0452`. Scope is narrow — it needs the give-away and the reuse in the same state, i.e.
+with no `await` between them — and the CROSS-state form is unchanged (both old and new lower to an
+`unwrap` on `None`, a loud panic). But it is a real loss of a real check and it is not a workaround away:
+once the value lives behind an `Option` reached by method calls, flow-sensitive move tracking of it is
+gone by construction. The two defensible fixes are (a) hoist the take into a named local at the give-away
+site so MoveCheck sees an ordinary move — sound, but hoisting out of an arbitrary expression context
+(`return`, nested call argument, match arm) is real work; or (b) reject a mention that follows a
+give-away in the lowering, with branch-precision so a give-away on a returning path does not
+false-positive. **This is a soundness-contract call and it is Jake's.**

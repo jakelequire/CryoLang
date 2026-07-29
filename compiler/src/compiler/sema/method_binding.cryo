@@ -366,6 +366,68 @@ type struct MethodBinding {
         return TypeRef::invalid();
     }
 
+    /// The PARAMETER types of `method_name` as the trait(s) a where-clause binds
+    /// the bare generic parameter `param` to declare them.
+    ///
+    /// The parameter-list sibling of `lookup_method_through_param_bounds`, which
+    /// answers the same question for the return type. Argument classification
+    /// needs the parameters: without them a call on a where-bounded receiver
+    /// (`this.inner.write_from(buf)` under `where S: AsyncTransport`) leaves
+    /// every argument `Unclassified`, and each consumer then guesses — the move
+    /// passes read a transfer, the async carrier substitution reads a borrow.
+    ///
+    /// A parameter constrained by a WHERE clause rather than inline stays a
+    /// plain `GenericParam` whose bounds live on the enclosing function/impl
+    /// node, so the receiver's own type cannot answer this.
+    param_types_through_param_bounds(mut &this, param: SymbolStr, method_name: SymbolStr,
+                                     arg_count: i64) -> TypeRef[] {
+        if (!param.is_valid()) { return []; }
+        if (this.state.symbolic_current_func != null) {
+            const r: TypeRef[] = this.scan_param_bound_param_types(
+                &this.state.symbolic_current_func.trait_bounds, param, method_name, arg_count);
+            if (r.length > 0) { return r; }
+        }
+        if (this.state.symbolic_impl_node != null) {
+            const r: TypeRef[] = this.scan_param_bound_param_types(
+                &this.state.symbolic_impl_node.where_bounds, param, method_name, arg_count);
+            if (r.length > 0) { return r; }
+        }
+        return [];
+    }
+
+    /// Search `bounds` for a BARE-parameter bound on `param` and return the
+    /// first bound trait's declaration of `method_name` taking `arg_count`
+    /// arguments. The parameter-list sibling of `scan_param_bounds`.
+    scan_param_bound_param_types(mut &this, bounds: &TraitBound[], param: SymbolStr,
+                                 method_name: SymbolStr, arg_count: i64) -> TypeRef[] {
+        for (mut bi: i64 = 0; bi < bounds.length; bi++) {
+            const b: TraitBound* = &bounds[bi];
+            if (b.has_projection_subject()) { continue; }
+            if (!b.type_parameter.equals(param)) { continue; }
+            for (mut ti: i64 = 0; ti < b.trait_refs.length; ti++) {
+                const tr: TraitRef* = &b.trait_refs[ti];
+                if (tr.path.length == 0) { continue; }
+                const leaf: SymbolStr = tr.path[tr.path.length - 1];
+                const tref: TypeRef = this.types.lookup_type_by_sym(leaf);
+                if (!tref.is_valid()) { continue; }
+                const t: Type* = this.arena.lookup(tref.id);
+                if (t == null || t.kind != TypeKind::Trait) { continue; }
+                const tt: TraitType* = t as TraitType*;
+                for (mut mi: i64 = 0; mi < tt.required_methods.length; mi++) {
+                    const m: MethodInfo* = &tt.required_methods[mi];
+                    if (!m.name.equals(method_name)) { continue; }
+                    if (m.param_types.length != arg_count) { continue; }
+                    mut out: TypeRef[] = [];
+                    for (mut pi: i64 = 0; pi < m.param_types.length; pi++) {
+                        out.push(m.param_types[pi]);
+                    }
+                    return out;
+                }
+            }
+        }
+        return [];
+    }
+
     /// Search `bounds` for a projection-subject bound whose projected member
     /// equals `member`; return the first bound-trait method return for
     /// `method_name`. Mirrors the trait-scan in `lookup_method_through_bounds`.
