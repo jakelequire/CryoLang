@@ -717,8 +717,34 @@ type struct MangleContext {
             return "R" + this.encode_type_ref(r.referent, "Reference.referent");
         }
         if (ty.kind == TypeKind::Array) {
+            // A fixed array carries its length: `T[8]`, `T[16]` and `T[]` are
+            // three distinct types, and `specialized_identifier` keys every
+            // monomorphization off this encoding.  Dropping the length gave
+            // them one key, so whichever instantiation was registered first
+            // answered for all of them - `Option<u8[8]>` silently resolving
+            // to `Option<u8[]>`.
+            //
+            // The length is bracketed in `$L`/`$G` rather than written bare:
+            // no type code may begin with `$`, so the form is self-delimiting
+            // and round-trips, where a bare `A8h` could not be told from an
+            // element code beginning with a digit.  A dynamic `T[]` keeps the
+            // bare `A` + element form, leaving every heap-array symbol
+            // byte-unchanged.
+            //
+            // `size` is authoritative here.  The fixed-pending marker (-2, a
+            // `T[NAME]` whose size expression has not yet been folded) lives
+            // on `ArrayAnnotation`, and `TypeResolver::array_size_of` folds it
+            // at the one site that builds an arena array - so a pending size
+            // cannot reach the mangler and split one type across two keys.
             const a: ArrayType* = ty as ArrayType*;
-            return "A" + this.encode_type_ref(a.element, "Array.element");
+            const elem_a: string = this.encode_type_ref(a.element, "Array.element");
+            if (a.is_dynamic()) { return "A" + elem_a; }
+            const len_a: u64 = a.size as u64;
+            mut buf_a: string = "A$L";
+            buf_a += len_a.to_decimal_str();
+            buf_a += "$G";
+            buf_a += elem_a;
+            return buf_a;
         }
         if (ty.kind == TypeKind::Optional) {
             // Optional<T>: encode as a synthetic named generic so the form
