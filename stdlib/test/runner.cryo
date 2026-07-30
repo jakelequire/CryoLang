@@ -712,7 +712,7 @@ function num_cpus() -> u32 {
 function drain_fd_into(fd: i32, out: mut &String) -> void {
     mut buf: u8[4096];
     loop {
-        const n: i64 = libc::read(fd, &buf[0], 4096u64);
+        const n: i64 = libc::read(fd, &buf[0], 4096);
         if (n > 0) {
             out.push(Str::from_raw(&buf[0], n as u64));
         } else if (n == 0) {
@@ -736,7 +736,7 @@ function run_one(d: TestDescriptor, idx: u64, timeout_secs: u32,
     // path stays async-signal-safe (dup2/close/execv + _exit only).
     mut exe_buf: u8[4096];
     mut exe_path: String = String::with_null(Str::new("/proc/self/exe"));
-    const exe_n: i64 = libc::readlink(exe_path.as_ptr(), &exe_buf[0], 4095u64);
+    const exe_n: i64 = libc::readlink(exe_path.as_ptr(), &exe_buf[0], 4095);
     exe_path.drop();
     if (exe_n <= 0) {
         return TestRun::bare(TestOutcome::RunnerError(libc::errno()));
@@ -749,13 +749,13 @@ function run_one(d: TestDescriptor, idx: u64, timeout_secs: u32,
     mut timeout_arg: String = String::new();
     timeout_arg.push(Str::new("--timeout="));
     append_u64(&timeout_arg, timeout_secs as u64);
-    timeout_arg.push_byte(0u8);
+    timeout_arg.push_byte(0);
 
     // `--test-runner-child=<idx>`: selects the single test to run.
     mut child_arg: String = String::new();
     child_arg.push(Str::new("--test-runner-child="));
     append_u64(&child_arg, idx);
-    child_arg.push_byte(0u8);
+    child_arg.push_byte(0);
 
     mut argv: command::ArgvBuf = command::ArgvBuf::new();
     match (argv.push(&exe_buf[0]))         { Result::Ok(_) => { } Result::Err(_) => { } }
@@ -880,7 +880,7 @@ function run_child_single(idx: u64, descriptors: TestDescriptor*, count: u64,
 /// Append a `u64` as decimal digits to a `String`.  Used to build the
 /// `--test-runner-child=<idx>` argument for the Windows re-exec.
 function append_u64(out: mut &String, x: u64) -> void {
-    if (x == 0) { out.push_byte(0x30u8); return; }
+    if (x == 0) { out.push_byte(0x30); return; }
     mut tmp: u8[24];
     mut ti: u64 = 0;
     mut v: u64 = x;
@@ -906,12 +906,12 @@ function read_capture_file(path: &String, out: mut &String) -> void {
     const h: u8* = syscall::CreateFileA(path.as_ptr(), syscall::GENERIC_READ,
         syscall::FILE_SHARE_READ | syscall::FILE_SHARE_WRITE
             | syscall::FILE_SHARE_DELETE, null,
-        syscall::OPEN_EXISTING, 0u32, null);
+        syscall::OPEN_EXISTING, 0, null);
     if ((h as i64) == -1) { return; }   // local -1, not the cross-module const
     mut buf: u8[4096];
     loop {
         mut nread: u32 = 0;
-        const ok: i32 = syscall::ReadFile(h, &buf[0], 4096u32, &nread, null);
+        const ok: i32 = syscall::ReadFile(h, &buf[0], 4096, &nread, null);
         if (ok == 0) { break; }          // read error
         if (nread == 0) { break; }    // EOF
         out.push(Str::from_raw(&buf[0], nread as u64));
@@ -933,20 +933,20 @@ function run_one(d: TestDescriptor, idx: u64, timeout_secs: u32,
     libc::fflush(null);
 
     mut exe_buf: u8[1024];
-    const n: u32 = libc::GetModuleFileNameA(null, &exe_buf[0], 1024u32);
+    const n: u32 = libc::GetModuleFileNameA(null, &exe_buf[0], 1024);
     if (n == 0 || n >= 1024) { return TestRun::bare(TestOutcome::RunnerError(0)); }
     exe_buf[n as u64] = 0;
 
     // Command line:  "<exe>" --test-runner-child=<idx>\0   (CreateProcessA may
     // modify the buffer, so it's an owned String).
     mut cmd: String = String::new();
-    cmd.push_byte(34u8);
+    cmd.push_byte(34);
     mut k: u64 = 0;
     while (k < n as u64) { cmd.push_byte(exe_buf[k]); k = k + 1; }
-    cmd.push_byte(34u8);
+    cmd.push_byte(34);
     cmd.push(Str::new(" --test-runner-child="));
     append_u64(&cmd, idx);
-    cmd.push_byte(0u8);
+    cmd.push_byte(0);
 
     // Capture: redirect the child's stdout+stderr to a per-test temp file.
     // A setup failure falls back to inherited stdio (have_cap stays false).
@@ -955,7 +955,7 @@ function run_one(d: TestDescriptor, idx: u64, timeout_secs: u32,
     mut have_cap:   boolean = false;
     if (capture) {
         mut dir_buf: u8[512];
-        const dl: u32 = syscall::GetTempPathA(512u32, &dir_buf[0]);
+        const dl: u32 = syscall::GetTempPathA(512, &dir_buf[0]);
         if (dl > 0 && dl < 512) {
             // Name the capture file DETERMINISTICALLY from (pid, test index)
             // rather than asking `GetTempFileNameA` for a unique one.
@@ -980,10 +980,10 @@ function run_one(d: TestDescriptor, idx: u64, timeout_secs: u32,
             path.push(cstr_to_str(&dir_buf[0]));        // GetTempPathA ends in `\`
             path.push(Str::new("cyt"));
             append_u64(&path, syscall::GetCurrentProcessId() as u64);
-            path.push_byte(95u8);                        // '_'
+            path.push_byte(95);                        // '_'
             append_u64(&path, idx);
             path.push(Str::new(".tmp"));
-            path.push_byte(0u8);
+            path.push_byte(0);
 
             mut sa: syscall::SECURITY_ATTRIBUTES = syscall::SECURITY_ATTRIBUTES {
                 nLength: 24, lpSecurityDescriptor: null, bInheritHandle: 1
@@ -1000,7 +1000,7 @@ function run_one(d: TestDescriptor, idx: u64, timeout_secs: u32,
                              | syscall::FILE_SHARE_DELETE;
             const h: u8* = syscall::CreateFileA(path.as_ptr(), syscall::GENERIC_WRITE,
                 share, &sa as u8*,
-                syscall::CREATE_ALWAYS, 0u32, null);
+                syscall::CREATE_ALWAYS, 0, null);
             if ((h as i64) != -1) {
                 cap_handle = h;
                 cap_path   = path;
@@ -1032,7 +1032,7 @@ function run_one(d: TestDescriptor, idx: u64, timeout_secs: u32,
         hProcess: null, hThread: null, dwProcessId: 0, dwThreadId: 0
     };
     const ok: i32 = syscall::CreateProcessA(null, cmd.as_ptr(), null, null,
-                                            inherit, 0u32, null, null, &si, &pi);
+                                            inherit, 0, null, null, &si, &pi);
     cmd.drop();
     if (ok == 0) {
         if (have_cap) {
@@ -1047,8 +1047,8 @@ function run_one(d: TestDescriptor, idx: u64, timeout_secs: u32,
     const ms: u32 = if (timeout_secs > 0) { timeout_secs * 1000 } else { 0xFFFFFFFF };
     const w: u32 = syscall::WaitForSingleObject(pi.hProcess, ms);
     if (w == 0x102) {   // WAIT_TIMEOUT
-        syscall::TerminateProcess(pi.hProcess, 1u32);
-        syscall::WaitForSingleObject(pi.hProcess, 0xFFFFFFFFu32);
+        syscall::TerminateProcess(pi.hProcess, 1);
+        syscall::WaitForSingleObject(pi.hProcess, 0xFFFFFFFF);
         syscall::CloseHandle(pi.hProcess);
         mut cap_to: String = String::new();
         if (have_cap) {
