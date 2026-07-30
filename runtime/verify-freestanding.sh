@@ -140,10 +140,37 @@ APP
 
 # Argument capture: main returns argc, so the process exit code is the argument
 # count (argv[0] included). Exercises __cryo_start's capture into the globals.
+#
+# Content is asserted too, not just the count: on Windows the arguments are
+# parsed out of the PEB's single UTF-16 command line, so a correct argc proves
+# very little on its own -- the quoting rules and the UTF-16 -> UTF-8 transcode
+# are what can actually be wrong. `two words` arrives quoted, so it also pins
+# the "quoted argument stays one argument" case on both OSes. A distinct exit
+# code per failure mode identifies which argument was wrong.
 cat > "$WORK/args.cryo" <<'APP'
 namespace RtVerifyApp;
-extern "C" { function __cryo_argc() -> i64; }
-function main() -> int { return __cryo_argc() as int; }
+extern "C" {
+    function __cryo_argc() -> i64;
+    function __cryo_argv() -> i8**;
+}
+function streq(a: i8*, b: string) -> boolean {
+    mut i: i64 = 0;
+    while (a[i] == b[i]) {
+        if (a[i] == 0) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+function main() -> int {
+    const n: i64 = __cryo_argc();
+    const v: i8** = __cryo_argv();
+    if (n != 4) { return 90; }
+    if (v == null) { return 94; }
+    if (!streq(v[1], "one")) { return 91; }
+    if (!streq(v[2], "two words")) { return 92; }
+    if (!streq(v[3], "three")) { return 93; }
+    return n as int;
+}
 APP
 
 # Backtrace: a 3-deep call chain into __cryo_backtrace. Built at -O0 (--dev) so
@@ -247,9 +274,9 @@ run_linux() {
     # args: exit code == argc. Run with 3 extra args -> argc 4 (argv[0] + 3).
     local go; go="$(build_app "$WORK/args.cryo")"
     "$CRYO_CC" -nostartfiles -nostdlib -static -Wl,--gc-sections "$go" "$core_a" "$abort_a" -o "$WORK/exe"
-    set +e; "$WORK/exe" one two three; local gg=$?; set -e
-    if [ "$gg" -eq 4 ]; then echo "linux args ok: argc 4 round-trips as exit code"
-    else echo "linux args FAIL: exit $gg (want 4)"; fail=1; fi
+    set +e; "$WORK/exe" one "two words" three; local gg=$?; set -e
+    if [ "$gg" -eq 4 ]; then echo "linux args ok: argc 4 + argv contents match"
+    else echo "linux args FAIL: exit $gg (want 4; 90=argc 91-93=argv[n] 94=null)"; fail=1; fi
 
     return $fail
 }
@@ -307,9 +334,12 @@ run_windows() {
 
     # backtrace: best-effort on Windows. The tier must build, link, and run
     # cleanly (header printed, exit 0); frame DEPTH is a known follow-up —
-    # Win64 uses table-based .pdata unwinding, so the rbp chain is often absent
-    # even at O0, and freestanding RtlCaptureStackBackTrace lacks TEB stack
-    # bounds. A depth of 0 is reported, not failed.
+    # Win64 uses table-based .pdata unwinding, so the rbp chain is absent even
+    # at O0. Delegating to RtlCaptureStackBackTrace is not the fix: from a
+    # freestanding image it runs away and exhausts the stack (the TEB is fine;
+    # the image just has no language exception handler, so a fault inside the
+    # unwinder cannot be dispatched). A depth of 0 is reported, not failed, and
+    # stays visible here until a bounded RtlVirtualUnwind walk replaces it.
     local bo; bo="$(build_app "$WORK/bt.cryo" --dev --target="$tgt" --no-incremental)"
     "$mingw" -nostartfiles -nostdlib -Wl,-e,_start -Wl,--gc-sections "$bo" "$bt_a" "$abort_a" "$core_a" \
         -lkernel32 -lntdll -o "$WORK/app.exe"
@@ -319,12 +349,12 @@ run_windows() {
         echo "windows backtrace ok: ran clean, $bframes frames (depth is a Win64 follow-up)"
     else echo "windows backtrace FAIL: exit $bg frames $bframes [$bmsg]"; fail=1; fi
 
-    # args: Windows passes 0/null pending PEB capture, so argc is 0 (exit 0).
+    # args: parsed out of the PEB command line -- same assertion as Linux.
     local go; go="$(build_app "$WORK/args.cryo" --target="$tgt" --no-incremental)"
     "$mingw" -nostartfiles -nostdlib -Wl,-e,_start -Wl,--gc-sections "$go" "$core_a" "$abort_a" -lkernel32 -lntdll -o "$WORK/app.exe"
-    set +e; WINEDEBUG=-all wine "$WORK/app.exe" one two three 2>/dev/null; local gg=$?; set -e
-    if [ "$gg" -eq 0 ]; then echo "windows args ok: argc 0 (PEB capture is a follow-up)"
-    else echo "windows args FAIL: exit $gg (want 0)"; fail=1; fi
+    set +e; WINEDEBUG=-all wine "$WORK/app.exe" one "two words" three 2>/dev/null; local gg=$?; set -e
+    if [ "$gg" -eq 4 ]; then echo "windows args ok: argc 4 + argv contents match (wine)"
+    else echo "windows args FAIL: exit $gg (want 4; 90=argc 91-93=argv[n] 94=null)"; fail=1; fi
 
     return $fail
 }
