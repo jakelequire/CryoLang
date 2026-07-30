@@ -9,14 +9,18 @@
 ///!
 ///! The x86-64 ISA is shared by AMD and Intel CPUs, so one x86-64 codepath
 ///! covers both vendors; the split that matters is OS ABI. `_start` is per-OS
-///! (gated `![config(linux)]` / `![config(windows)]`); `__cryo_start` — capture
-///! argc/argv, run `main`, exit with its return — is shared. Process exit runs
-///! through the shared `CryoRt::Sys::rt_exit`.
+///! (gated `![config(linux)]` / `![config(windows)]`), and so is argument
+///! capture, because the two OSes hand arguments over by different mechanisms.
+///! `__cryo_start` — capture arguments, run `main`, exit with its return — is
+///! shared. Process exit runs through the shared `CryoRt::Sys::rt_exit`.
 ///!
 ///!   - Linux: the kernel enters `_start` with `%rsp` at argc; fully
-///!     freestanding — no libc, no imports.
-///!   - Windows: PE startup passes no stack args and has no stable raw-syscall
-///!     ABI; argument capture (PEB / command line) is deferred.
+///!     freestanding — no libc, no imports. `_start` stages argc/argv into the
+///!     SysV arg registers and capture just records them.
+///!   - Windows: PE startup passes no stack arguments at all, so there is
+///!     nothing for `_start` to stage. Arguments come from the PEB instead —
+///!     `ProcessParameters.CommandLine`, split per the CRT's quoting rules and
+///!     transcoded UTF-16 -> UTF-8 (see `capture_os_args`).
 ///!
 ///! `![config(no_runtime)]` drops the whole entry in a hosted build (crt0 owns
 ///! the entry there).
@@ -55,8 +59,9 @@ function _start() {
 /// only establishes a valid call frame — clears `%rbp`, aligns `%rsp` to 16,
 /// and reserves the 32-byte register home ("shadow") space every Win64 callee
 /// requires — before tail-calling into Cryo. rcx/rdx (the Win64 first two
-/// integer arg registers) are zeroed so `__cryo_start` sees argc=0/argv=null
-/// until PEB-based argument capture lands.
+/// integer arg registers) are zeroed because there is nothing to stage into
+/// them: `__cryo_start`'s parameters are unused on this OS, and the real
+/// arguments are read from the PEB by `capture_os_args`.
 ![naked] ![no_mangle] ![config(no_runtime)] ![config(windows)]
 function _start() {
     ![arch(x86_64, att)]
@@ -79,14 +84,248 @@ function _start() {
 function __main() {
 }
 
+/// ntdll process-heap allocation, used to size the argv vector to the actual
+/// command line instead of a fixed cap. The Windows loader creates the process
+/// heap before the PE entry runs, so this is available to the entry itself —
+/// no allocator tier required, and the tier's dependency contract stays at
+/// kernel32 + ntdll (notably: no shell32, which `CommandLineToArgvW` needs).
+![config(windows)]
+extern "C" {
+    function RtlAllocateHeap(heap: u64, flags: u32, size: u64) -> u8*;
+}
+
+/// The PEB, read from the TEB's `ProcessEnvironmentBlock` slot. The TEB is
+/// addressed through `%gs` on x86-64, so the PEB pointer is a single load from
+/// `%gs:0x60` — no import and no syscall, which is what makes it usable this
+/// early.
+![config(windows)]
+function current_peb() -> u64 {
+    mut peb: u64 = 0;
+    ![arch(x86_64, att)]
+    asm {
+        movq %gs:0x60, %rax
+        movq %rax, ${=peb:"rax"}
+    }
+    return peb;
+}
+
+/// Read the u64 stored at `addr`.
+![config(windows)]
+function load64(addr: u64) -> u64 {
+    const p: u64* = addr as u64*;
+    return p[0];
+}
+
+/// Read the u16 stored at `addr`, widened. Used for both `UNICODE_STRING`
+/// byte lengths and individual UTF-16 code units.
+![config(windows)]
+function load16(addr: u64) -> u32 {
+    const p: u16* = addr as u16*;
+    return p[0] as u32;
+}
+
+/// Append `cp` to `buf` at `*pos` as UTF-8, advancing `*pos`. A code point
+/// needs at most 4 bytes, and reaching the 4-byte form costs two UTF-16 units,
+/// so the output never exceeds 3 bytes per input unit — the bound the caller's
+/// buffer is sized against.
+![config(windows)]
+function append_utf8(buf: u8*, pos: u64*, cp: u32) -> void {
+    if (cp < 128) {
+        buf[*pos] = cp as u8;                            *pos = *pos + 1;
+        return;
+    }
+    if (cp < 2048) {
+        buf[*pos] = (192 + (cp >> 6)) as u8;             *pos = *pos + 1;
+        buf[*pos] = (128 + (cp & 63)) as u8;             *pos = *pos + 1;
+        return;
+    }
+    if (cp < 65536) {
+        buf[*pos] = (224 + (cp >> 12)) as u8;            *pos = *pos + 1;
+        buf[*pos] = (128 + ((cp >> 6) & 63)) as u8;      *pos = *pos + 1;
+        buf[*pos] = (128 + (cp & 63)) as u8;             *pos = *pos + 1;
+        return;
+    }
+    buf[*pos] = (240 + (cp >> 18)) as u8;                *pos = *pos + 1;
+    buf[*pos] = (128 + ((cp >> 12) & 63)) as u8;         *pos = *pos + 1;
+    buf[*pos] = (128 + ((cp >> 6) & 63)) as u8;          *pos = *pos + 1;
+    buf[*pos] = (128 + (cp & 63)) as u8;                 *pos = *pos + 1;
+}
+
+/// Transcode the UTF-16 code unit at `*i` into `buf` and advance `*i` past the
+/// unit(s) consumed. A high surrogate immediately followed by a low surrogate
+/// is combined into the one code point it encodes; an unpaired surrogate is
+/// passed through as-is rather than dropped, so a malformed command line still
+/// round-trips its byte count instead of silently losing an argument.
+![config(windows)]
+function emit_unit(cmd: u64, n: u64, i: u64*, buf: u8*, pos: u64*) -> void {
+    const hi: u32 = load16(cmd + (*i) * 2);
+    *i = *i + 1;
+    if (hi >= 0xD800 && hi < 0xDC00 && *i < n) {
+        const lo: u32 = load16(cmd + (*i) * 2);
+        if (lo >= 0xDC00 && lo < 0xE000) {
+            *i = *i + 1;
+            append_utf8(buf, pos, 0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00));
+            return;
+        }
+    }
+    append_utf8(buf, pos, hi);
+}
+
+/// Capture arguments from the PEB's `ProcessParameters.CommandLine`.
+///
+/// The command line arrives as one UTF-16 `UNICODE_STRING`, so this owns both
+/// the split and the encoding conversion. The split follows the CRT's documented
+/// quoting rules, which `CommandLineToArgvW` also implements:
+///
+///   - `2n` backslashes before a quote produce `n` backslashes and the quote
+///     acts as a delimiter; `2n+1` produce `n` backslashes and a literal quote.
+///   - Backslashes not followed by a quote are literal (they are path
+///     separators on this OS, not escapes).
+///   - Inside quotes, `""` is a literal quote and whitespace is ordinary text.
+///   - `argv[0]` uses the simpler rule the CRT applies to it: a leading quote
+///     runs to the next quote, otherwise the token ends at the first
+///     whitespace, and backslash is never an escape.
+///
+/// Both buffers are sized from the actual command-line length and allocated
+/// once, so no valid command line can overflow them and nothing is silently
+/// truncated: the text needs at most 3 bytes per unit plus one NUL per
+/// argument, and every argument after `argv[0]` costs at least a character and
+/// a separator, bounding the count at `n/2 + 3`.
+///
+/// A failure to reach the PEB, or a heap allocation failure, leaves argc 0 /
+/// argv null — the same "unavailable" state callers already handle — rather
+/// than a partially built vector.
+![config(no_runtime)] ![config(windows)]
+function capture_os_args(argc: i64, argv: i8**) -> void {
+    const peb: u64 = current_peb();
+    if (peb == 0) { return; }
+    const params: u64 = load64(peb + 0x20);
+    if (params == 0) { return; }
+    const cmd: u64 = load64(params + 0x78);
+    const n: u64 = (load16(params + 0x70) / 2) as u64;
+    if (cmd == 0 || n == 0) { return; }
+
+    const heap: u64 = load64(peb + 0x30);
+    if (heap == 0) { return; }
+    const slots_cap: u64 = n / 2 + 3;
+    const buf: u8* = RtlAllocateHeap(heap, 0, n * 3 + slots_cap + 1);
+    if (buf == null) { return; }
+    const slots: u8* = RtlAllocateHeap(heap, 0, slots_cap * 8);
+    if (slots == null) { return; }
+    const vec: i8** = slots as i8**;
+
+    mut pos: u64 = 0;
+    mut i: u64 = 0;
+    mut count: i64 = 0;
+
+    // argv[0].
+    vec[0] = ((buf as u64) + pos) as i8*;
+    if (load16(cmd) == 34) {
+        i = 1;
+        while (i < n && load16(cmd + i * 2) != 34) {
+            emit_unit(cmd, n, &i, buf, &pos);
+        }
+        if (i < n) { i = i + 1; }
+    } else {
+        while (i < n) {
+            const c: u32 = load16(cmd + i * 2);
+            if (c == 32 || c == 9) { break; }
+            emit_unit(cmd, n, &i, buf, &pos);
+        }
+    }
+    buf[pos] = 0;
+    pos = pos + 1;
+    count = 1;
+
+    // Remaining arguments.
+    while (true) {
+        while (i < n) {
+            const c: u32 = load16(cmd + i * 2);
+            if (c != 32 && c != 9) { break; }
+            i = i + 1;
+        }
+        if (i >= n) { break; }
+        if ((count as u64) + 1 >= slots_cap) { break; }
+
+        vec[count] = ((buf as u64) + pos) as i8*;
+        mut in_quotes: boolean = false;
+        while (i < n) {
+            const c: u32 = load16(cmd + i * 2);
+            if (!in_quotes && (c == 32 || c == 9)) { break; }
+            if (c == 92) {
+                mut nslash: u64 = 0;
+                while (i < n && load16(cmd + i * 2) == 92) {
+                    nslash = nslash + 1;
+                    i = i + 1;
+                }
+                if (i < n && load16(cmd + i * 2) == 34) {
+                    mut k: u64 = 0;
+                    while (k < nslash / 2) {
+                        buf[pos] = 92;
+                        pos = pos + 1;
+                        k = k + 1;
+                    }
+                    if (nslash % 2 == 1) {
+                        buf[pos] = 34;
+                        pos = pos + 1;
+                        i = i + 1;
+                    } else {
+                        if (in_quotes && i + 1 < n && load16(cmd + (i + 1) * 2) == 34) {
+                            buf[pos] = 34;
+                            pos = pos + 1;
+                            i = i + 2;
+                        } else {
+                            in_quotes = !in_quotes;
+                            i = i + 1;
+                        }
+                    }
+                } else {
+                    mut k: u64 = 0;
+                    while (k < nslash) {
+                        buf[pos] = 92;
+                        pos = pos + 1;
+                        k = k + 1;
+                    }
+                }
+            } else if (c == 34) {
+                if (in_quotes && i + 1 < n && load16(cmd + (i + 1) * 2) == 34) {
+                    buf[pos] = 34;
+                    pos = pos + 1;
+                    i = i + 2;
+                } else {
+                    in_quotes = !in_quotes;
+                    i = i + 1;
+                }
+            } else {
+                emit_unit(cmd, n, &i, buf, &pos);
+            }
+        }
+        buf[pos] = 0;
+        pos = pos + 1;
+        count = count + 1;
+    }
+
+    g_argc = count;
+    g_argv = vec;
+}
+
 // --- Shared -----------------------------------------------------------------
 
-/// Captured process arguments, filled by `__cryo_start` before `main` runs.
-/// Linux reads them off the initial stack (staged by `_start`); Windows
-/// argument capture from the PEB is deferred, so there argc is 0 / argv null.
-/// Programs read them through `__cryo_argc` / `__cryo_argv`.
+/// Captured process arguments, filled by `__cryo_start` before `main` runs, or
+/// left 0 / null when the OS could not supply them. Programs read them through
+/// `__cryo_argc` / `__cryo_argv`.
 mut g_argc: i64  = 0;
 mut g_argv: i8** = null;
+
+/// Record the arguments the kernel already placed on the initial stack, which
+/// `_start` staged into the SysV arg registers. Nothing to decode: the vector
+/// is already a NUL-terminated byte-string array, which is exactly what
+/// `__cryo_argv` returns.
+![config(no_runtime)] ![config(linux)]
+function capture_os_args(argc: i64, argv: i8**) -> void {
+    g_argc = argc;
+    g_argv = argv;
+}
 
 /// Number of process arguments (argv[0] included), or 0 when unavailable.
 ![no_mangle] ![config(no_runtime)]
@@ -100,14 +339,13 @@ function __cryo_argv() -> i8** {
     return g_argv;
 }
 
-/// Startup trampoline: capture argc/argv, run the user `main`, and exit with
+/// Startup trampoline: capture arguments, run the user `main`, and exit with
 /// its return value. Diverges — the process is gone before it could return.
-/// Linux passes argc/argv in the SysV arg registers (rdi/rsi) set by `_start`;
-/// Windows passes 0/null in the Win64 arg registers (rcx/rdx) pending PEB
-/// capture. The parameters therefore use the target's own C-ABI arg registers.
+/// The parameters carry the target's own C-ABI arg registers, which is where
+/// Linux's `_start` staged argc/argv; on Windows they are zero and
+/// `capture_os_args` sources the arguments from the PEB instead.
 ![no_mangle] ![config(no_runtime)]
 function __cryo_start(argc: i64, argv: i8**) -> never {
-    g_argc = argc;
-    g_argv = argv;
+    capture_os_args(argc, argv);
     Sys::rt_exit(main());
 }

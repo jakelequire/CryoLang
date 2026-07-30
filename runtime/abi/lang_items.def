@@ -9,7 +9,7 @@
 #
 # Columns: SYMBOL | SIGNATURE | DEFINED-BY (tier) | STATUS
 #
-# ABI conventions (settled — see runtime/NOTES-capabilities.md §D):
+# ABI conventions (settled; this file is their source of truth):
 #   - string   : the primitive thin, NUL-terminated `i8*` (8 bytes). This is the
 #                panic message/file operand type. No compiler change: today's
 #                `@panic` already passes `i8*`, and message/file are always
@@ -42,8 +42,14 @@ __cryo_start    | (argc: i64, argv: i8**) -> never          | core (freestanding
 #
 # Windows: PE startup passes no stack args and has no stable raw-syscall ABI, so
 # the entry links ntdll (its sole dependency) and exits via NtTerminateProcess.
-# Argument capture (PEB / command line) is deferred. The driver's no_runtime link
-# emits `-nostartfiles -nostdlib -Wl,-e,_start -lntdll` for a windows target.
+# Because the loader passes nothing on the stack, arguments are read from the PEB
+# instead: ProcessParameters.CommandLine is one UTF-16 UNICODE_STRING, so the
+# entry owns both the split (the CRT's documented quoting rules) and the
+# UTF-16 -> UTF-8 transcode. The process heap (also from the PEB) sizes the argv
+# vector, so nothing is capped or truncated. This deliberately avoids shell32's
+# CommandLineToArgvW, which would parse for us but add a third DLL dependency.
+# The driver's no_runtime link emits
+# `-nostartfiles -nostdlib -Wl,-e,_start -lntdll` for a windows target.
 _start          | ![naked] () -> void  (PE entry, /entry=_start) | core (freestanding, windows) | DONE (windows)
 # ntdll import, called by the windows exit path with (HANDLE)-1.
 NtTerminateProcess | (process: i64, status: i32) -> i32  (extern, ntdll) | ntdll | (system)
@@ -51,12 +57,15 @@ NtTerminateProcess | (process: i64, status: i32) -> i32  (extern, ntdll) | ntdll
 # bootstrap). Empty for now; the ctor-array emitter (P3) will run ctors here.
 __main          | () -> void                                | core (freestanding, windows) | DONE (windows)
 #
-# __cryo_start is shared (both OSes): capture argc/argv, run `main`, exit with
-# its return. Linux passes argc/argv in the SysV arg registers (rdi/rsi) set by
-# _start; Windows passes 0/null (Win64 rcx/rdx) pending PEB-based capture.
-# Programs read the captured values through these accessors.
-__cryo_argc     | () -> i64                                 | core (freestanding) | DONE (linux; windows=0 pending PEB)
-__cryo_argv     | () -> i8**                                | core (freestanding) | DONE (linux; windows=null pending PEB)
+# __cryo_start is shared (both OSes): capture arguments, run `main`, exit with
+# its return. Capture itself is per-OS, because the two OSes hand arguments over
+# by different mechanisms: Linux's _start stages the kernel-supplied argc/argv
+# into the SysV arg registers (rdi/rsi) and capture only records them; Windows
+# receives nothing on the stack (rcx/rdx are zeroed) and parses the PEB command
+# line instead. Programs read the captured values through these accessors, which
+# report 0 / null if the OS could not supply arguments.
+__cryo_argc     | () -> i64                                 | core (freestanding) | DONE (dual-OS)
+__cryo_argv     | () -> i8**                                | core (freestanding) | DONE (dual-OS)
 
 # --- Panic funnel ----------------------------------------------------------
 # The single divergent sink: print "panicked at <file>:<line>: <msg>" to
@@ -97,8 +106,18 @@ __cryo_dealloc  | (ptr: void*, size: u64, align: u64) -> void | alloc | DONE (ru
 
 # --- Backtrace / diagnostics -----------------------------------------------
 # Print one hex return address per stack frame to stderr. Raw addresses only;
-# symbolization (address -> name via ELF/DWARF) is a follow-up. Linux walks the
-# rbp chain (frame_address(0) + saved-rbp links, terminated by _start's zeroed
-# rbp); Windows uses ntdll RtlCaptureStackBackTrace (Win64 unwinding is
-# table-based, not frame-pointer based).
-__cryo_backtrace | () -> void                                | backtrace | DONE (runtime def, dual-OS; raw addrs, symbolization TODO)
+# symbolization (address -> name via ELF/DWARF) is a follow-up. BOTH OSes walk
+# the rbp chain today (frame_address(0) + saved-rbp links, terminated by
+# _start's zeroed rbp). That is why Linux reports real frames and Windows
+# reports none: Win64 unwinding is table-based (.pdata/RUNTIME_FUNCTION), so
+# codegen omits the rbp chain and there is nothing to walk.
+#
+# ntdll RtlCaptureStackBackTrace was the intended Windows mechanism, but it is
+# NOT usable from a freestanding image as it stands: called from a
+# `-nostartfiles -nostdlib` PE it runs away and exhausts the whole 2 MB stack.
+# The TEB is NOT the problem -- it is present with valid StackBase/StackLimit,
+# and adding .seh_proc unwind info to _start does not change the outcome. The
+# image carries no language exception handler, so a fault inside the unwinder
+# cannot be dispatched. A Windows implementation must bound the walk itself (an
+# explicit RtlVirtualUnwind loop with stack-range checks).
+__cryo_backtrace | () -> void                                | backtrace | DONE (linux: real frames; windows: runs clean, 0 frames -- see above)
