@@ -55,6 +55,45 @@ implement enum TargetType {
 }
 
 
+/// What a panic does: run each frame's destructors on the way out, or terminate
+/// where it stands.  `Unspecified` is a real state, not a placeholder — it is
+/// what lets a CLI `--panic=` override be distinguished from a project that
+/// simply never mentioned the key, so the two can be merged without inventing a
+/// parallel "was it set" flag.
+type enum PanicStrategy {
+    Unspecified;
+    Abort;
+    Unwind;
+}
+
+implement enum PanicStrategy {
+    label(&this) -> string {
+        return match (this) {
+            PanicStrategy::Unspecified => { "unspecified" }
+            PanicStrategy::Abort       => { "abort"       }
+            PanicStrategy::Unwind      => { "unwind"      }
+        };
+    }
+
+    /// Parse a `[compiler] panic` / `--panic=` value.  Anything unrecognized is
+    /// `Abort`, the conservative reading: a typo must not silently hand a build
+    /// an unwinder it never asked for.
+    static from_string(s: string) -> PanicStrategy {
+        if (s.eq("unwind")) { return PanicStrategy::Unwind; }
+        return PanicStrategy::Abort;
+    }
+
+    /// True when `other` should replace this one in a merge: an explicit choice
+    /// wins over an unspecified one, in either direction.
+    static pick(base: PanicStrategy, override_: PanicStrategy) -> PanicStrategy {
+        return match (override_) {
+            PanicStrategy::Unspecified => { base }
+            _                          => { override_ }
+        };
+    }
+}
+
+
 // LibTarget / BinTarget: multi-target output declarations
 
 /// One library output produced from a project.  Empty `name` means the
@@ -233,12 +272,17 @@ type struct ProjectConfig {
     /// This is how `runtime/core` can be written in Cryo. Recommended to pair
     /// with `no_std = true`.
     no_runtime:   boolean;
-    /// `[compiler] panic = "unwind"` / CLI `--panic=unwind`: emit DWARF
-    /// unwinding (invoke/landingpad cleanup edges + `__cryo_personality_v0`)
-    /// and link the `panic/unwind` runtime tier instead of `panic/abort`.
-    /// Default false = abort, which is byte-identical to the historical panic
-    /// path (so the whole feature is off unless explicitly requested).
-    panic_unwind: boolean;
+    /// `[compiler] panic = "abort" | "unwind"` / CLI `--panic=`.  A CHOICE, not
+    /// a switch, so it carries its own "nobody said" state: this same struct
+    /// holds both a parsed cryoconfig and the CLI overrides, and merging them
+    /// requires telling "the user asked for unwind" apart from "unwind is
+    /// merely the default".  A boolean cannot express that, which is why the
+    /// merge used to be a one-directional "force ON if set" that silently
+    /// ignored `--panic=abort` the moment unwind became the default.
+    ///
+    /// Read it through `resolve_panic_unwind`, never directly: that is where the
+    /// default and the freestanding coupling live, in one place.
+    panic:        PanicStrategy;
     native_alloc: boolean;
     emit_llvm:    boolean;
     /// `[compiler] codegen_threads = N` - worker count for parallel object
@@ -370,7 +414,7 @@ type struct ProjectConfig {
             profile:      "release",
             no_std:       false,
             no_runtime:   false,
-            panic_unwind: false,
+            panic:        PanicStrategy::Unspecified,
             native_alloc: false,
             emit_llvm:    false,
             codegen_threads: -1,
@@ -447,7 +491,7 @@ type struct ProjectConfig {
             profile:       this.profile,
             no_std:        this.no_std,
             no_runtime:    this.no_runtime,
-            panic_unwind:  this.panic_unwind,
+            panic:         this.panic,
             native_alloc:  this.native_alloc,
             emit_llvm:     this.emit_llvm,
             codegen_threads: this.codegen_threads,
@@ -474,6 +518,24 @@ type struct ProjectConfig {
             test_format:   this.test_format,
             test_color:    this.test_color,
             error_count:   this.error_count,
+        };
+    }
+
+    /// Resolve the panic strategy to the single boolean the rest of the
+    /// compiler consumes: does this build unwind?
+    ///
+    /// The default (unwind) and its one hard exception both live here, so no
+    /// caller has to re-derive either.  Freestanding always aborts: a
+    /// `no_runtime` link passes `-nostdlib`, so nothing resolves the `_Unwind_*`
+    /// calls LLVM lowers `resume` into, and asking for unwind there fails at
+    /// LINK time on symbols the user never wrote.  Unwind is the default
+    /// everywhere else because under abort a panic leaks every live value.
+    resolve_panic_unwind(&this) -> boolean {
+        if (this.no_runtime) { return false; }
+        return match (this.panic) {
+            PanicStrategy::Abort       => { false }
+            PanicStrategy::Unwind      => { true  }
+            PanicStrategy::Unspecified => { true  }
         };
     }
 
@@ -679,7 +741,7 @@ type struct ProjectConfig {
                         }
                         "no_std"    => { config.no_std    = ProjectConfig::parse_bool(val); }
                         "no_runtime" => { config.no_runtime = ProjectConfig::parse_bool(val); }
-                        "panic"     => { config.panic_unwind = ProjectConfig::parse_panic(val); }
+                        "panic"     => { config.panic = PanicStrategy::from_string(val); }
                         "emit_llvm" => { config.emit_llvm = ProjectConfig::parse_bool(val); }
                         "codegen_threads" => {
                             config.codegen_threads = ProjectConfig::parse_codegen_threads(val);
@@ -1017,10 +1079,6 @@ type struct ProjectConfig {
     /// Parse a `[compiler] panic = "..."` / CLI `--panic=...` value into the
     /// unwind flag.  `"unwind"` selects DWARF unwinding; anything else (incl.
     /// `"abort"`) keeps the default abort strategy.
-    static parse_panic(s: string) -> boolean {
-        return s == "unwind";
-    }
-
     /// Parse a `[compiler] optimize` value into an LLVM optimization level
     /// 0..3. Accepts C-style `O0`/`O1`/`O2`/`O3` (case-insensitive), a bare
     /// `0`..`3`, and the legacy booleans (`true`/`yes` => O2, `false`/`no` =>
