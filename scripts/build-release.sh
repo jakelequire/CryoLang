@@ -61,6 +61,35 @@ stage_common() {
     echo "$VER" > "${stage}/VERSION"
 }
 
+stage_runtime_tiers() {
+    # $1 = staging dir, $2 = target triple to build the tiers for.
+    #
+    # HARD requirement, not an extra: codegen emits a call to the external
+    # `__cryo_panic` for every panic, and the definition comes from a panic tier
+    # archive on the link line.  A distribution without these archives produces a
+    # compiler that cannot link ANY program - it fails on an undefined
+    # `__cryo_panic`.  They go in lib/cryo/<triple>/, which is the
+    # `<bindir>/../lib/cryo` candidate the tier locator already searches, under
+    # the per-triple subdirectory it prefers.
+    local stage="$1" triple="$2"
+    local cryo="${ROOT}/compiler/build/cryo"
+    local dest="${stage}/lib/cryo/${triple}"
+
+    echo "[build-release] building runtime tiers for ${triple}"
+    ( cd "${ROOT}/runtime"        && "$cryo" build --target="$triple" >/dev/null )
+    ( cd "${ROOT}/runtime/hosted" && "$cryo" build --target="$triple" >/dev/null )
+
+    mkdir -p "$dest"
+    local a found=0
+    for a in "${ROOT}"/runtime/.bin/libcryort-*.a; do
+        [ -f "$a" ] || continue
+        cp "$a" "$dest/"; found=1
+    done
+    [ "$found" = 1 ] || { echo "error: no runtime tier archives produced for ${triple}" >&2; exit 1; }
+    [ -f "${dest}/libcryort-panic-abort-hosted.a" ] \
+        || { echo "error: hosted panic tier missing for ${triple} - user programs would not link" >&2; exit 1; }
+}
+
 stage_third_party_licenses() {
     # libLLVM is redistributed (statically linked into the Linux cryo, shipped
     # as LLVM-C.dll on Windows). Its Apache-2.0-with-LLVM-exceptions license
@@ -107,6 +136,7 @@ build_linux() {
     fi
 
     stage_common "$stage"
+    stage_runtime_tiers "$stage" "x86_64-unknown-linux-gnu"
 
     local archive="${DIST}/cryo-${VER}-linux-x86_64.tar.gz"
     ( cd "$DIST" && tar -czf "$archive" "cryo-${VER}-linux-x86_64" )
@@ -140,6 +170,7 @@ build_windows() {
     ( cd "${ROOT}/stdlib" && tar --exclude='.bin' -cf - . ) | ( cd "${stage}/stdlib" && tar -xf - )
     [ -f "${ROOT}/LICENSE" ] && cp "${ROOT}/LICENSE" "${stage}/LICENSE" || true
     stage_third_party_licenses "$stage"
+    stage_runtime_tiers "$stage" "x86_64-pc-windows-gnu"
     echo "$VER" > "${stage}/VERSION"
 
     local archive="${DIST}/cryo-${VER}-windows-x86_64.zip"

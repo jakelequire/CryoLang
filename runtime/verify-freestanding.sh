@@ -263,7 +263,10 @@ APP
 
 # --- Linux -----------------------------------------------------------------
 run_linux() {
+    # Hosted tier rebuilt too: the wipe takes it with the freestanding ones, and
+    # every hosted link needs it to resolve `__cryo_panic`.
     ( cd "$RT_DIR" && rm -rf .bin && "$CRYO" build >/dev/null )
+    ( cd "$RT_DIR/hosted" && "$CRYO" build >/dev/null )
     local core_a="$RT_DIR/.bin/libcryort-core.a"
     local abort_a="$RT_DIR/.bin/libcryort-panic-abort.a"
     local alloc_a="$RT_DIR/.bin/libcryort-alloc.a"
@@ -352,7 +355,12 @@ run_windows() {
         echo "windows: SKIPPED (need $mingw and wine)"; return 0
     fi
     local tgt="x86_64-pc-windows-gnu"
+    # The `rm -rf .bin` also removes the hosted abort tier, which lives in the
+    # same directory and which every HOSTED link needs to resolve `__cryo_panic`.
+    # Rebuild it alongside so this gate leaves a tree that can still link an
+    # ordinary program, not just a freestanding one.
     ( cd "$RT_DIR" && rm -rf .bin && "$CRYO" build --target="$tgt" --no-incremental >/dev/null )
+    ( cd "$RT_DIR/hosted" && "$CRYO" build --target="$tgt" --no-incremental >/dev/null )
     local core_a="$RT_DIR/.bin/libcryort-core.a"
     local abort_a="$RT_DIR/.bin/libcryort-panic-abort.a"
     local alloc_a="$RT_DIR/.bin/libcryort-alloc.a"

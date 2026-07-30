@@ -797,19 +797,13 @@ type struct IntrinsicEmitter {
             this.builder.build_unreachable();
             return LValue::null();
         }
-        // Pick the panic funnel.  Default (abort): the per-module `linkonce_odr`
-        // libc `@panic` (print + abort).  `--panic=unwind`: the external raising
-        // `__cryo_panic` (declared here, defined by the linked `panic/unwind`
-        // tier) — it raises through libunwind so the Phase-C cleanup landing
-        // pads on the enclosing ordinary calls run as the unwind passes through.
-        // Both share the `(ptr, ptr, i32) -> void` signature and call shape.
-        mut panic_fn: LValue = LValue::null();
-        if (this.panic_unwind) {
-            panic_fn = this.get_or_decl_cryo_panic();
-        } else {
-            this.emit_panic_runtime();
-            panic_fn = this.llvm_module.get_named_function("panic");
-        }
+        // Every panic goes through the external `__cryo_panic`, declared here and
+        // defined by whichever panic tier the link line names: `panic/abort`
+        // prints and terminates, `panic/unwind` raises through libunwind so the
+        // cleanup landing pads on the enclosing calls run as the unwind passes
+        // through.  Which strategy a program gets is a link-time choice, not a
+        // codegen one, which is why nothing here branches on it.
+        const panic_fn: LValue = this.get_or_decl_cryo_panic();
         if (!panic_fn.is_valid()) { return LValue::null(); }
         const ptr_ty: LType = LType::pointer_to(LType::i8());
         const param_buf: void* = intrinsics::malloc(24);
@@ -1009,35 +1003,6 @@ type struct IntrinsicEmitter {
         const fty: LType = LType::function_type(LType::i32(), buf, 3, false);
         intrinsics::free(buf);
         return this.llvm_module.add_function("vfprintf", fty);
-    }
-
-    /// Declare libc `int printf(const char* fmt, ...)` if absent.  Used by
-    /// the `panic` runtime to report the message before aborting.
-    get_or_decl_printf(mut &this) -> LValue {
-        mut fn: LValue = this.llvm_module.get_named_function("printf");
-        if (fn.is_valid()) { return fn; }
-        const ptr_ty: LType = LType::pointer_to(LType::i8());
-        const buf: void* = intrinsics::malloc(8);
-        const slots: void** = buf as void**;
-        slots[0] = ptr_ty.raw;   // const char* fmt
-        const fty: LType = LType::function_type(LType::i32(), buf, 1, true);
-        intrinsics::free(buf);
-        return this.llvm_module.add_function("printf", fty);
-    }
-
-    /// Declare libc `int fflush(FILE* stream)` if absent.  `fflush(NULL)`
-    /// flushes every open output stream - the `panic` runtime uses it so
-    /// the panic report survives the abort() that follows.
-    get_or_decl_fflush(mut &this) -> LValue {
-        mut fn: LValue = this.llvm_module.get_named_function("fflush");
-        if (fn.is_valid()) { return fn; }
-        const ptr_ty: LType = LType::pointer_to(LType::i8());
-        const buf: void* = intrinsics::malloc(8);
-        const slots: void** = buf as void**;
-        slots[0] = ptr_ty.raw;   // FILE* (null = all streams)
-        const fty: LType = LType::function_type(LType::i32(), buf, 1, false);
-        intrinsics::free(buf);
-        return this.llvm_module.add_function("fflush", fty);
     }
 
     /// Pluck the next variadic argument of type `ty` from the va_list `va`
@@ -1351,88 +1316,6 @@ type struct IntrinsicEmitter {
                                                 3, false);
         intrinsics::free(param_buf);
         return this.llvm_module.add_function("__cryo_dealloc", fty);
-    }
-
-    /// Emit the `@panic(msg, file, line)` runtime function into the current
-    /// module if it hasn't been emitted yet.  Idempotent.  Backs the bare
-    /// `intrinsics::panic` calls emitted by `std::prelude::panic` and the
-    /// `Option::unwrap`/`Result::unwrap` family; those produce a direct
-    /// `call @panic(...)` with no body; without this, the linker fails on
-    /// `undefined reference to 'panic'`.
-    ///
-    /// The body prints `panic: <msg>\n  at <file>:<line>` via libc printf,
-    /// flushes every open stream (`fflush(NULL)`) so the report survives
-    /// the abort, then calls `abort()` and emits `unreachable`.  Before
-    /// the print landed, every unwrap failure was a mute SIGABRT.
-    emit_panic_runtime(mut &this) -> void {
-        mut panic_fn: LValue = this.llvm_module.get_named_function("panic");
-        if (panic_fn.is_valid()) {
-            const first_bb: void* = llvm::LLVMGetFirstBasicBlock(panic_fn.raw);
-            if (first_bb != null) { return; }
-        }
-
-        // Declare panic as `(ptr msg, ptr file, i32 line) -> void` if not
-        // already present.
-        const ptr_ty: LType = LType::pointer_to(LType::i8());
-        if (!panic_fn.is_valid()) {
-            const param_buf: void* = intrinsics::malloc(24);
-            const param_slots: void** = param_buf as void**;
-            param_slots[0] = ptr_ty.raw;
-            param_slots[1] = ptr_ty.raw;
-            param_slots[2] = LType::i32().raw;
-            const fty: LType = LType::function_type(LType::void_type(), param_buf, 3, false);
-            intrinsics::free(param_buf);
-            panic_fn = this.llvm_module.add_function("panic", fty);
-        }
-        if (!panic_fn.is_valid()) { return; }
-
-        // linkonce_odr: every module gets a copy; linker collapses them.
-        panic_fn.set_linkage(LLinkage::LinkOnceODR);
-        this.attach_runtime_comdat(panic_fn, "panic");
-
-        const saved_bb: LBasicBlock = this.builder.get_insert_block();
-        const entry_bb: LBasicBlock = LBasicBlock::append(panic_fn, "entry");
-        this.builder.position_at_end(entry_bb);
-
-        // Report the panic before dying - a mute SIGABRT on every unwrap
-        // failure is undebuggable.  printf + fflush(NULL) (flush ALL open
-        // output streams) because abort() skips stream teardown.
-        const printf_fn: LValue = this.get_or_decl_printf();
-        const fmt_ptr: LValue = this.builder.build_global_string_ptr(
-            "\npanic: %s\n  at %s:%d\n", "panic.fmt");
-        if (printf_fn.is_valid() && fmt_ptr.is_valid()) {
-            const printf_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(printf_fn.raw) };
-            const abuf: void* = intrinsics::malloc(32);
-            const aslots: void** = abuf as void**;
-            aslots[0] = fmt_ptr.raw;
-            aslots[1] = panic_fn.get_param(0).raw;
-            aslots[2] = panic_fn.get_param(1).raw;
-            aslots[3] = panic_fn.get_param(2).raw;
-            this.builder.build_call(printf_ty, printf_fn, abuf, 4, "");
-            intrinsics::free(abuf);
-        }
-        const fflush_fn: LValue = this.get_or_decl_fflush();
-        if (fflush_fn.is_valid()) {
-            const fflush_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(fflush_fn.raw) };
-            const fbuf: void* = intrinsics::malloc(8);
-            const fslots: void** = fbuf as void**;
-            fslots[0] = LType::const_null(LType::pointer_to(LType::i8())).raw;
-            this.builder.build_call(fflush_ty, fflush_fn, fbuf, 1, "");
-            intrinsics::free(fbuf);
-        }
-
-        // Direct LLVM call to abort() - no need for the full codegen_call
-        // machinery here (the abort signature is fixed and we have zero
-        // args).  This also keeps IntrinsicEmitter free of any
-        // CodegenContext back-pointer that would create a module cycle.
-        const abort_fn: LValue = this.get_or_decl_abort();
-        const abort_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(abort_fn.raw) };
-        this.builder.build_call(abort_ty, abort_fn, null, 0, "");
-        this.builder.build_unreachable();
-
-        if (saved_bb.is_valid()) {
-            this.builder.position_at_end(saved_bb);
-        }
     }
 
     /// Emit the `@format` runtime function into the current module if it

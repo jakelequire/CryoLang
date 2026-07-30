@@ -85,17 +85,22 @@ __cryo_argv     | () -> i8**                                | core (freestanding
 
 # --- Panic funnel ----------------------------------------------------------
 # The single divergent sink: print "panicked at <file>:<line>: <msg>" to
-# stderr, then terminate (exit code 101). panic/abort/ DEFINES it, freestanding
-# and dual-OS (Linux write(2)+exit_group syscalls; Windows kernel32 WriteFile +
-# ntdll NtTerminateProcess). A future panic/unwind/ tier redefines the same
-# symbol to unwind instead — chosen at link time, no caller change.
+# stderr, then terminate (exit code 101). panic/abort/ DEFINES it, dual-OS.
+# The panic/unwind/ tier redefines the same symbol to unwind instead — chosen at
+# link time, no caller change.
 #
-# The compiler is NOT yet routed here: it still emits its own per-module libc
-# `@panic` (printf+fflush+abort) inline, unchanged. Swapping codegen to a
-# `declare __cryo_panic` + link-resolved call is the integration step, deferred
-# until the whole runtime is complete. The core-side `extern` declaration
-# arrives with its first caller (a check helper, P4/P6), not before.
-__cryo_panic              | (msg: string, file: string, line: u32) -> never  | panic/abort | DONE (runtime def, dual-OS; compiler swap deferred)
+# The tier is built TWICE from the same source. Freestanding it writes with
+# Linux write(2) / Windows WriteFile and exits via exit_group / NtTerminateProcess.
+# Hosted (runtime/hosted/, `no_runtime = false`) it keeps the same write path but
+# exits through libc `exit`, which runs atexit handlers and flushes stdio — a raw
+# exit there would silently discard whatever the panicking program had buffered.
+# The divergence lives entirely in CryoRt::Sys; the funnel itself is identical.
+#
+# Codegen is routed here: `emit_panic_call` emits a call to the external
+# `__cryo_panic` for every panic, hosted or freestanding, and the link line names
+# exactly one panic tier (`append_hosted_panic_lib` / `append_runtime_tier_libs`).
+# The per-module libc `@panic` body it used to emit is gone.
+__cryo_panic              | (msg: string, file: string, line: u32) -> never  | panic/abort | DONE (runtime def dual-OS + dual-config; compiler routed)
 
 # --- Check handlers (route raw operands through the funnel) -----------------
 # Each takes RAW operands (not a pre-formatted string) plus a SourceLoc POD

@@ -122,6 +122,24 @@ class Stage:
 def make_stages():
     return [
         # ------------------------------------------------------------------
+        # Round 0: runtime tiers.  Every stage from stage-2 on emits a call to
+        # the external `__cryo_panic`, so LINKING those compilers needs a panic
+        # tier archive; without this round the chain dies at stage-2 on an
+        # undefined symbol.  Built by the pin (the only compiler that exists
+        # yet) and into the flat `.bin`, which is why each chain rebuilds them
+        # for its own target rather than sharing one directory.
+        # ------------------------------------------------------------------
+        Stage(
+            src="runtime", via="pinned", to=".bin",
+            cwd=ROOT / "runtime",
+            cmd=[str(BOOT), "build", "--no-incremental"],
+        ),
+        Stage(
+            src="runtime", via="pinned", to=".bin (hosted)",
+            cwd=ROOT / "runtime" / "hosted",
+            cmd=[str(BOOT), "build", "--no-incremental"],
+        ),
+        # ------------------------------------------------------------------
         # Round 1: pinned boot -> stage-2  (default build dirs)
         # ------------------------------------------------------------------
         Stage(
@@ -476,7 +494,15 @@ def make_windows_stages(runner: list, env: dict) -> list:
         return cmd
 
     sl, cm = ROOT / "stdlib", ROOT / "compiler"
+    rt = ROOT / "runtime"
+    # Runtime tiers first, for the same reason as the Linux chain: stage-2
+    # onwards link against `__cryo_panic`.  Rebuilt here with the WINDOWS boot
+    # compiler because both chains share the flat `runtime/.bin`, so whichever
+    # ran last owns it - each chain must re-establish its own target's archives.
+    tiers = [str(x) for x in (boot, "build", "--no-incremental")]
     return [
+        Stage("runtime",  "pinned",  ".bin",              rt,      list(runner) + tiers, env),
+        Stage("runtime",  "pinned",  ".bin (hosted)",     rt / "hosted", list(runner) + tiers, env),
         Stage("stdlib",   "pinned",  ".bin/self/win-s1",  sl, build(boot, ".bin/self/win-s1"), env),
         Stage("compiler", "pinned",  "build/self/win-s2", cm, build(boot, "build/self/win-s2"), env),
         Stage("stdlib",   "stage-2", ".bin/self/win-s2",  sl, build(s2,   ".bin/self/win-s2"), env),
