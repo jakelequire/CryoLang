@@ -2736,6 +2736,22 @@ type struct CallResolver {
         }
         if (this.symbolic.symbolic_type_unresolved(obj_type)) {
             this.binding.stash_abstract_receiver_method(obj_type, member, call);
+            // `symbolic_type_unresolved` is true for any receiver that merely
+            // CONTAINS a generic param, so a generic INSTANTIATION (`Inner<S>`
+            // inside `f<S>`, or a field of `Owner<S>`) lands here too - but it is
+            // not abstract for method lookup: its base template is known, and its
+            // methods resolve through that template rather than through the
+            // receiver's trait bounds, which is all the stash above consults.  A
+            // bare param / projection receiver keeps that bounds lookup (it is the
+            // only thing that can name its methods), so this fills in ONLY when the
+            // bounds lookup produced nothing.  Without it such a call got no stash
+            // in the PRE-mono sema pass, and sema's stash is the sole producer of
+            // method-spec demand, so mono minted no specialization and codegen
+            // reported E0636 "no method found".  The post-mono sema pass does stash
+            // it, which is far too late to drive specialization.
+            if (call.resolved_type_args.length == 0) {
+                this.binding.stash_method_call_bindings(obj_type, member, call);
+            }
             // The stash solves the method's own type args but yields no RETURN
             // type, so every use of the result reads `void`. A bounded-param or
             // projection receiver is constrained enough to type the call exactly;
