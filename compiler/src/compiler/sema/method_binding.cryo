@@ -1224,9 +1224,21 @@ type struct MethodBinding {
         // has no template and would drop the call onto the shared symbolic return.
         const recv_base: TypeRef = this.types.view_generic_base(recv_type);
         const recv_nargs: i64 = this.types.view_type_arg_count(recv_type);
+        // A receiver type-arg that still mentions an enclosing generic param
+        // (`Inner<S>` inside `f<S>`, or a field of `Owner<S>`) can never yield a
+        // CONCRETE owner binding, so the consumers that demand one must bail.
+        // Inside the symbolic walk the bindings are allowed to stay symbolic:
+        // `solve_method_bindings` admits an abstract binding under
+        // `in_symbolic_check`, and the substituter concretizes the stash when the
+        // enclosing generic specializes - the same contract
+        // `stash_owner_generic_method_bindings` relies on for `this.m()`.  Bailing
+        // unconditionally left every such call unstashed, and mono takes a
+        // method's bindings SOLELY from that stash, so the specialization was
+        // never minted and codegen reported E0636 "no method found".
         for (mut i: i64 = 0; i < recv_nargs; i++) {
             if (this.types.contains_generic_param(this.types.view_type_arg_at(recv_type, i))) {
-                return owner_ctx;
+                if (!this.state.in_symbolic_check) { return owner_ctx; }
+                break;
             }
         }
 

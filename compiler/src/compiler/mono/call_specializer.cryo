@@ -1039,15 +1039,12 @@ type struct MonoCallSpecializer {
             spec_method, pin_target);
         if (this.state.method_spec_seen(spec_sym)) {
             call.set_resolved_method(spec_method as ASTNode*);
-            // Inherent specs pin the precise symbol; trait-impl specs normally
-            // rely on the already-present DI entry (their mangle can diverge from
-            // the emitted symbol), exactly as the first materialization did below.
-            // EXCEPTION: a trait-impl method whose type param is return-only
-            // (`!method_generic_in_value_param`) MUST pin its `$MG` symbol - its
-            // unmangled DI key is identical across instantiations and would
-            // otherwise collapse every spec onto the first (see the stamping
-            // comment above and the matching pin below).
-            if ((inherent_pin || !method_generic_in_value_param) && spec_sym.is_valid()) {
+            // Pin the precise symbol, exactly as the first materialization does
+            // below.  This is unconditional because the unmangled `Type::method`
+            // key codegen falls back to is the SAME for every instantiation of one
+            // method on one owner, so any unpinned call resolves to whichever spec
+            // happened to be emitted first.
+            if (spec_sym.is_valid()) {
                 call.set_resolved_callee(spec_sym);
             }
             return;
@@ -1104,18 +1101,17 @@ type struct MonoCallSpecializer {
             }
         } else {
             this.register_spec_method_in_di(spec_method, recv_type, impl_node);
-            // Inherent (non-trait) generic method on a primitive/fixed receiver
-            // (`string::parse_int<u64>` vs `<i64>`): like the inherent-owner case
-            // above, pin the precise return-distinct mangle.  Without this,
-            // codegen falls back to the unmangled `Type::method` key and every
-            // instantiation collapses onto whichever spec was emitted first.
-            // Trait-impl / combinator specs stay unpinned (their DI mangle can
-            // diverge from the emitted definition symbol) - EXCEPT a trait-impl
-            // method with a return-only type param, which shares one unmangled DI
-            // key across all instantiations and so must pin its distinct `$MG`
-            // symbol (matching the stamped `spec_type_args` + the emitted def).
-            if ((!impl_node.is_trait_impl() || !method_generic_in_value_param)
-                    && spec_sym.is_valid()) {
+            // Pin the precise mangle for EVERY generic-method spec, trait-impl
+            // included.  Codegen's fallback key is the unmangled `Type::method`,
+            // which cannot tell two instantiations of one method on one owner
+            // apart, so an unpinned call silently resolves to whichever spec was
+            // emitted first - `CGen<i32>::put<u64>` running the `put<u32>` body
+            // and returning its answer.  `spec_sym` is safe to pin because it is
+            // built by the same `for_method_or_trait_impl` path the definition is
+            // emitted under (same `origin_trait`, same `spec_type_args`), and it
+            // is the very key this pass records in `mark_method_spec`.  Pinning
+            // adds no symbol: it only names the one already being emitted.
+            if (spec_sym.is_valid()) {
                 call.set_resolved_callee(spec_sym);
             }
         }
