@@ -200,34 +200,69 @@ function os_set_nonblocking(fd: i32, on: boolean) -> i32 {
     return syscall::ioctlsocket(fd as u64, syscall::FIONBIO, &v);
 }
 
-/// True when `err` from a `connect` means "started, ask again later" rather
-/// than a failure. POSIX reports `EINPROGRESS` (which maps to no dedicated
-/// `IoErrorKind`, so the raw code is matched); Winsock reports would-block.
-![target(unix)]
-function os_connect_pending(err: &IoError) -> boolean {
-    return err.os_code == libc::EINPROGRESS || err.os_code == libc::EALREADY;
-}
-![target(windows)]
-function os_connect_pending(err: &IoError) -> boolean {
-    return err.os_code == syscall::WSAEWOULDBLOCK || err.os_code == syscall::WSAEALREADY;
+/// How an in-flight non-blocking connect is progressing. `Failed` carries the
+/// error the caller should surface; the socket is left open either way, so the
+/// caller owns closing it.
+type enum ConnectStatus {
+    Connected;
+    Pending;
+    Failed(IoError);
 }
 
-/// True when `err` from a *repeat* `connect` on an in-flight socket means the
-/// connection is already established. Re-calling `connect` is how an async
-/// connect future asks "are we there yet": it reports success, still-pending, or
-/// the real failure, on both platforms and without reading `SO_ERROR`.
+/// Ask an in-flight non-blocking connect how it went, without blocking.
+///
+/// POSIX answers by re-issuing the `connect`: it reports `EISCONN` once the
+/// handshake lands, `EINPROGRESS`/`EALREADY` while it is outstanding, and the
+/// real failure otherwise, so the packed sockaddr is replayed here.
 ![target(unix)]
-function os_connect_done(err: &IoError) -> boolean {
-    return err.os_code == libc::EISCONN;
-}
-![target(windows)]
-function os_connect_done(err: &IoError) -> boolean {
-    return err.os_code == syscall::WSAEISCONN;
+function os_connect_status(fd: i32, addr: u8*, addrlen: u32) -> ConnectStatus {
+    if (os_connect(fd, addr, addrlen) >= 0) { return ConnectStatus::Connected; }
+    const e: IoError = last_io_error();
+    if (e.os_code == libc::EISCONN) { return ConnectStatus::Connected; }
+    if (e.os_code == libc::EINPROGRESS || e.os_code == libc::EALREADY) {
+        return ConnectStatus::Pending;
+    }
+    match (e.kind) {
+        IoErrorKind::Interrupted => { return ConnectStatus::Pending; }
+        _                        => { }
+    }
+    return ConnectStatus::Failed(e);
 }
 
-/// The pending error on `fd` (`SO_ERROR`), which is how a non-blocking connect
-/// reports its outcome once the socket becomes writable: 0 means connected.
-/// Returns -1 if the option itself could not be read.
+/// Winsock cannot be asked the same way: a repeat `connect` on a socket whose
+/// attempt already failed does not report that failure - it restarts the
+/// attempt and clears the latched `SO_ERROR`, so a poll loop built on re-issuing
+/// `connect` only ever sees WSAEWOULDBLOCK/WSAEALREADY and waits forever. The
+/// status is read off the socket instead, leaving the attempt untouched:
+/// `SO_ERROR` is the outcome once it is non-zero, and until then
+/// `SO_CONNECT_TIME` distinguishes an established connection from one still in
+/// flight (the socket never becomes writable when the peer refuses).
+![target(windows)]
+function os_connect_status(fd: i32, addr: u8*, addrlen: u32) -> ConnectStatus {
+    const se: i32 = os_sock_error(fd);
+    if (se > 0) { return ConnectStatus::Failed(io_error_from_wsa(se)); }
+    if (os_sock_connected(fd)) { return ConnectStatus::Connected; }
+    return ConnectStatus::Pending;
+}
+
+/// True once the handshake has completed. `SO_CONNECT_TIME` reads back
+/// `SO_CONNECT_TIME_NEVER` until then; an unreadable option is reported as
+/// not-yet-connected so the caller keeps waiting rather than inventing success.
+![target(windows)]
+function os_sock_connected(fd: i32) -> boolean {
+    mut secs: u32 = 0u32;
+    mut len: i32 = 4;
+    if (syscall::getsockopt(fd as u64, syscall::SOL_SOCKET, syscall::SO_CONNECT_TIME,
+                            &secs as u8*, &len) != 0) {
+        return false;
+    }
+    return secs != syscall::SO_CONNECT_TIME_NEVER;
+}
+
+/// The latched error on `fd` (`SO_ERROR`): non-zero is a failed operation, zero
+/// means nothing has failed *yet* - for a connect still in flight it is zero
+/// too, so zero alone does not mean connected. Returns -1 if the option itself
+/// could not be read.
 ![target(unix)]
 function os_sock_error(fd: i32) -> i32 {
     mut v: i32 = 0;
@@ -242,7 +277,8 @@ function os_sock_error(fd: i32) -> i32 {
 function os_sock_error(fd: i32) -> i32 {
     mut v: i32 = 0;
     mut len: i32 = 4;
-    if (syscall::getsockopt(fd as u64, 65535, 4103, &v as u8*, &len) != 0) {   // SOL_SOCKET, SO_ERROR
+    if (syscall::getsockopt(fd as u64, syscall::SOL_SOCKET, syscall::SO_ERROR,
+                            &v as u8*, &len) != 0) {
         return -1;
     }
     return v;
@@ -292,8 +328,13 @@ function pack_i64_le(out: u8*, value: i64) -> void {
 ![target(unix)]
 function last_io_error() -> IoError { return IoError::from_errno(libc::errno()); }
 ![target(windows)]
-function last_io_error() -> IoError {
-    const e: i32 = syscall::WSAGetLastError();
+function last_io_error() -> IoError { return io_error_from_wsa(syscall::WSAGetLastError()); }
+
+/// Classify a Winsock error code. Split from `last_io_error` because a connect
+/// failure is read back from `SO_ERROR` rather than `WSAGetLastError()`, and
+/// both paths must produce the same `IoErrorKind` for the same code.
+![target(windows)]
+function io_error_from_wsa(e: i32) -> IoError {
     if (e == syscall::WSAEWOULDBLOCK)  { return IoError::new(IoErrorKind::WouldBlock, e); }
     if (e == syscall::WSAEINTR)        { return IoError::new(IoErrorKind::Interrupted, e); }
     if (e == syscall::WSAECONNREFUSED) { return IoError::new(IoErrorKind::ConnectionRefused, e); }

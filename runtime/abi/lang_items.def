@@ -85,17 +85,44 @@ __cryo_argv     | () -> i8**                                | core (freestanding
 
 # --- Panic funnel ----------------------------------------------------------
 # The single divergent sink: print "panicked at <file>:<line>: <msg>" to
-# stderr, then terminate (exit code 101). panic/abort/ DEFINES it, freestanding
-# and dual-OS (Linux write(2)+exit_group syscalls; Windows kernel32 WriteFile +
-# ntdll NtTerminateProcess). A future panic/unwind/ tier redefines the same
-# symbol to unwind instead — chosen at link time, no caller change.
+# stderr, then terminate (exit code 101). panic/abort/ DEFINES it, dual-OS.
+# The panic/unwind/ tier redefines the same symbol to unwind instead — chosen at
+# link time, no caller change.
 #
-# The compiler is NOT yet routed here: it still emits its own per-module libc
-# `@panic` (printf+fflush+abort) inline, unchanged. Swapping codegen to a
-# `declare __cryo_panic` + link-resolved call is the integration step, deferred
-# until the whole runtime is complete. The core-side `extern` declaration
-# arrives with its first caller (a check helper, P4/P6), not before.
-__cryo_panic              | (msg: string, file: string, line: u32) -> never  | panic/abort | DONE (runtime def, dual-OS; compiler swap deferred)
+# The tier is built TWICE from the same source. Freestanding it writes with
+# Linux write(2) / Windows WriteFile and exits via exit_group / NtTerminateProcess.
+# Hosted (runtime/hosted/, `no_runtime = false`) it keeps the same write path but
+# exits through libc `exit`, which runs atexit handlers and flushes stdio — a raw
+# exit there would silently discard whatever the panicking program had buffered.
+# The divergence lives entirely in CryoRt::Sys; the funnel itself is identical.
+#
+# Codegen is routed here: `emit_panic_call` emits a call to the external
+# `__cryo_panic` for every panic, hosted or freestanding, and the link line names
+# exactly one panic tier (`append_hosted_panic_lib` / `append_runtime_tier_libs`).
+# The per-module libc `@panic` body it used to emit is gone.
+__cryo_panic              | (msg: string, file: string, line: u32) -> never  | panic/abort | DONE (runtime def dual-OS + dual-config; compiler routed)
+
+# --- Unwind surface ---------------------------------------------------------
+# BOTH panic tiers export every symbol below, and differ only in behaviour: that
+# is what makes the strategy a pure link-time swap. The abort tier's copies are
+# reachable-but-inert stubs, present because `libcryo.a` is built ONCE with the
+# default strategy, so an `--panic=abort` program can still be handed stdlib
+# objects that name a personality or the caught-panic accessors. Dropping them
+# from either tier turns a strategy switch into an undefined-symbol link error.
+#
+# `__cryo_personality_v0` is the one lang item whose SIGNATURE is per-OS. Linux
+# names it as the LLVM `personality` and the SysV unwinder calls it with the
+# Itanium 5-argument form. Windows-gnu emits the same symbol into `.xdata` as the
+# frame's language handler, so the OS calls it with the 4-argument SEH form; the
+# unwind tier bridges that to the shared Itanium logic via mingw's
+# `_GCC_specific_handler`, which is how libstdc++'s `__gxx_personality_seh0`
+# works. Declaring the Itanium form on Windows would read garbage arguments.
+# Emitted by codegen (`ExprOps::get_or_decl_personality`), not hand-typed.
+__cryo_personality_v0     | per-OS: Itanium (linux) / SEH (windows)           | panic/*     | DONE (both tiers, dual-OS; SEH-backed on windows)
+__cryo_panic_finish       | () -> never                                        | panic/*     | DONE (both tiers; root-catch tail, emitted under unwind)
+__cryo_panic_taken_message| () -> string                                       | panic/*     | DONE (both tiers; abort's returns null - unreachable there)
+__cryo_panic_taken_file   | () -> string                                       | panic/*     | DONE (both tiers; abort's returns null - unreachable there)
+__cryo_panic_taken_line   | () -> u32                                          | panic/*     | DONE (both tiers; abort's returns 0 - unreachable there)
 
 # --- Check handlers (route raw operands through the funnel) -----------------
 # Each takes RAW operands (not a pre-formatted string) plus a SourceLoc POD
@@ -134,18 +161,18 @@ __cryo_dealloc  | (ptr: void*, size: u64, align: u64) -> void | alloc | DONE (ru
 
 # --- Backtrace / diagnostics -----------------------------------------------
 # Print one hex return address per stack frame to stderr. Raw addresses only;
-# symbolization (address -> name via ELF/DWARF) is a follow-up. BOTH OSes walk
-# the rbp chain today (frame_address(0) + saved-rbp links, terminated by
-# _start's zeroed rbp). That is why Linux reports real frames and Windows
-# reports none: Win64 unwinding is table-based (.pdata/RUNTIME_FUNCTION), so
-# codegen omits the rbp chain and there is nothing to walk.
+# symbolization (address -> name via ELF/DWARF) is a follow-up. The WALK is
+# per-OS because the two ABIs record frames differently: Linux follows the rbp
+# chain (frame_address(0) + saved-rbp links, terminated by _start's zeroed rbp),
+# while Win64 unwinding is table-based, so codegen omits the rbp chain entirely
+# and there is nothing to follow -- Windows walks the .pdata RUNTIME_FUNCTION
+# tables with a bounded RtlVirtualUnwind loop instead.
 #
-# ntdll RtlCaptureStackBackTrace was the intended Windows mechanism, but it is
-# NOT usable from a freestanding image as it stands: called from a
-# `-nostartfiles -nostdlib` PE it runs away and exhausts the whole 2 MB stack.
-# The TEB is NOT the problem -- it is present with valid StackBase/StackLimit,
-# and adding .seh_proc unwind info to _start does not change the outcome. The
-# image carries no language exception handler, so a fault inside the unwinder
-# cannot be dispatched. A Windows implementation must bound the walk itself (an
-# explicit RtlVirtualUnwind loop with stack-range checks).
-__cryo_backtrace | () -> void                                | backtrace | DONE (linux: real frames; windows: runs clean, 0 frames -- see above)
+# ntdll RtlCaptureStackBackTrace was the intended Windows mechanism and is NOT
+# usable from a freestanding image: called from a `-nostartfiles -nostdlib` PE it
+# runs away and exhausts the whole 2 MB stack. The TEB is NOT the problem -- it
+# is present with valid StackBase/StackLimit, and adding .seh_proc unwind info to
+# _start does not change the outcome. The image carries no language exception
+# handler, so a fault inside the unwinder cannot be dispatched. Hence the
+# self-bounded walk. Do not re-try RtlCaptureStackBackTrace.
+__cryo_backtrace | () -> void                                | backtrace | DONE (dual-OS: linux rbp chain, windows bounded RtlVirtualUnwind over .pdata)
