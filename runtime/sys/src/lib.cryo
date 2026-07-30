@@ -22,7 +22,11 @@ namespace CryoRt::Sys;
 
 /// Best-effort raw write to stderr (fd 2). Operands are register-pinned so the
 /// syscall's rax/rcx/r11 clobbers cannot corrupt buf/len before they are read.
-![weak] ![config(no_runtime)] ![config(linux)]
+///
+/// Not gated on `no_runtime`: writing straight to the descriptor is correct in a
+/// hosted build too, and it deliberately bypasses libc's stdio so a panic report
+/// cannot be swallowed by a buffer that never gets flushed.
+![weak] ![config(linux)]
 function rt_write_bytes(buf: i64, len: u64) -> void {
     const nr: i64 = 1;   // write
     const fd: i64 = 2;   // stderr
@@ -64,7 +68,7 @@ extern "C" {
     function NtTerminateProcess(process: i64, status: i32) -> i32;
 }
 
-![weak] ![config(no_runtime)] ![config(windows)]
+![weak] ![config(windows)]
 function rt_write_bytes(buf: i64, len: u64) -> void {
     const STD_ERROR_HANDLE: i32 = -12;
     mut written: i32 = 0;
@@ -75,6 +79,27 @@ function rt_write_bytes(buf: i64, len: u64) -> void {
 ![weak] ![config(no_runtime)] ![config(windows)]
 function rt_exit(code: i32) -> never {
     NtTerminateProcess(-1, code);
+    while (true) {}
+}
+
+// --- Hosted termination -----------------------------------------------------
+
+![config(not(no_runtime))]
+extern "C" {
+    function exit(code: i32) -> void;
+}
+
+/// Terminate a HOSTED process, where libc owns the exit path. Going through
+/// `exit` rather than the raw OS primitive is load bearing: it runs `atexit`
+/// handlers and flushes every open stdio stream, so a program that printed to a
+/// buffered stdout before panicking still gets that output out. Terminating
+/// with `exit_group`/`NtTerminateProcess` would silently discard it.
+///
+/// One definition for both OSes - the difference this covers is libc-vs-raw, not
+/// Linux-vs-Windows.
+![weak] ![config(not(no_runtime))]
+function rt_exit(code: i32) -> never {
+    exit(code);
     while (true) {}
 }
 

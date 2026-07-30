@@ -1,0 +1,51 @@
+# runtime/hosted — the runtime tiers, rebuilt for a HOSTED (libc-linked) link.
+#
+# Same sources as the freestanding workspace one level up; the only difference
+# is `no_runtime = false`, which flips the `![config(no_runtime)]` /
+# `![config(not(no_runtime))]` gates in `CryoRt::Sys`. A hosted `__cryo_panic`
+# must terminate through libc `exit` so the panicking program's buffered stdio is
+# flushed; the freestanding one exits via raw `exit_group`/`NtTerminateProcess`,
+# which would discard it. Everything above that seam — the panic funnel itself,
+# the check handlers, the formatting helpers — compiles unchanged from the same
+# files, which is the point of putting the divergence in `Sys`.
+#
+# Both panic tiers are rebuilt here. A hosted program gets its allocator and its
+# entry from libc, so `alloc`/`core` have no hosted counterpart; `backtrace` is
+# freestanding-only for the same reason.
+#
+# The unwind tier needs a hosted build for the same reason the abort tier does:
+# an UNCAUGHT panic still terminates, through `__cryo_panic_finish`, and doing
+# that with a raw exit would discard the program's buffered stdio.
+#
+# `no_std` stays true: these tiers must not pull in libcryo.a, or every hosted
+# program would drag the stdlib in through its panic path.
+#
+# Build:            cryo build          (from this directory)
+# Archives land in: .bin/libcryort-<name>.a
+
+# Archives land in the SAME directory as the freestanding tiers, under a
+# `-hosted` name, so the tier locator needs no second search layout: one
+# directory holds every tier, and the link line picks by filename.
+[project]
+project_name = "cryort-hosted"
+output_dir = "../.bin"
+source_paths = ["../sys/src"]
+
+[compiler]
+no_std = true
+no_runtime = false
+emit_llvm = true
+# Same reasoning as the freestanding workspace: a panic tier must not be built
+# with the strategy it implements.
+panic = "abort"
+
+# Panic strategy = abort: __cryo_panic prints and terminates via libc exit.
+[[lib]]
+name = "cryort-panic-abort-hosted"
+source_dir = "../panic/abort/src"
+
+# Panic strategy = unwind: __cryo_panic raises through the Itanium _Unwind_* ABI
+# (SEH-backed on Windows); the terminating paths exit via libc.
+[[lib]]
+name = "cryort-panic-unwind-hosted"
+source_dir = "../panic/unwind/src"

@@ -550,36 +550,27 @@ implement trait Future for struct TcpConnect {
         if (this.fd < 0) {
             return Poll::Ready(Result::Err(this.err));
         }
-        // Re-issuing `connect` is the portable way to read an in-flight
-        // connection's status: it succeeds (or reports "already connected") once
-        // the handshake lands, keeps reporting "in progress" until then, and
-        // surfaces the real failure otherwise.
-        if (sys::os_connect(this.fd, &this.addr[0], this.addrlen) >= 0) {
-            return this.succeed();
+        // Asking the OS how the handshake is going is per-OS (see
+        // `os_connect_status`); what to do with each answer is not.
+        match (sys::os_connect_status(this.fd, &this.addr[0], this.addrlen)) {
+            ConnectStatus::Connected => { return this.succeed(); }
+            ConnectStatus::Pending   => {
+                mut rt: Reactor* = require_reactor();
+                this.rt = rt;
+                rt.register(this.fd, INTEREST_WRITE, cx.waker());
+                return Poll::Pending;
+            }
+            ConnectStatus::Failed(e) => {
+                // Close the half-open socket rather than leaking it — the caller
+                // gets an error, not a handle it could close itself.
+                const failed: i32 = this.fd;
+                this.fd  = -1;
+                this.rt  = null;
+                this.err = e;
+                sys::os_close_sock(failed);
+                return Poll::Ready(Result::Err(e));
+            }
         }
-        const e: IoError = sys::last_io_error();
-        if (sys::os_connect_done(&e)) {
-            return this.succeed();
-        }
-        mut retry: boolean = sys::os_connect_pending(&e);
-        match (e.kind) {
-            IoErrorKind::Interrupted => { retry = true; }
-            _                        => { }
-        }
-        if (retry) {
-            mut rt: Reactor* = require_reactor();
-            this.rt = rt;
-            rt.register(this.fd, INTEREST_WRITE, cx.waker());
-            return Poll::Pending;
-        }
-        // A real failure: close the half-open socket rather than leaking it —
-        // the caller gets an error, not a handle it could close itself.
-        const failed: i32 = this.fd;
-        this.fd  = -1;
-        this.rt  = null;
-        this.err = e;
-        sys::os_close_sock(failed);
-        return Poll::Ready(Result::Err(e));
     }
 }
 

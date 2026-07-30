@@ -200,12 +200,17 @@ type struct CodegenPasses {
         return format("\"%s\"", s);
     }
 
-    /// `--panic=unwind`: append the unwinding panic runtime tier archive to the
-    /// link command.  The tier archive lives in the runtime workspace's `.bin`,
-    /// located relative to the stdlib root (repo layout: `<root>/stdlib` sits
-    /// alongside `<root>/runtime`); a distribution-time locator is a follow-up.
-    /// Placed after the user objects + stdlib archive so it resolves their
-    /// undefined `__cryo_panic` / `__cryo_personality_v0`.
+    /// Append the panic tier a HOSTED link needs, placed after the user objects
+    /// and the stdlib archive so it resolves their undefined `__cryo_panic`
+    /// (and, under unwind, `__cryo_personality_v0`).
+    ///
+    /// Which archive depends on the strategy, but BOTH are the `-hosted` builds
+    /// rather than the freestanding ones: the two builds differ in how they
+    /// terminate, and only the hosted build exits through libc `exit`, which
+    /// flushes the panicking program's buffered stdio.  Linking a freestanding
+    /// archive here would silently discard anything the program had printed —
+    /// and that applies to unwind too, since an uncaught panic still terminates
+    /// (through `__cryo_panic_finish`).
     ///
     /// No explicit `-lunwind`: the personality + `resume` reference the shared
     /// Itanium `_Unwind_*` Level-1 ABI, which the gcc driver's always-linked
@@ -214,19 +219,18 @@ type struct CodegenPasses {
     /// that ships `libunwind.so.8` but no `libunwind.so` dev symlink, for no
     /// benefit (identical ABI).  An LLVM-libunwind / freestanding combination
     /// that needs an explicit unwinder is a follow-up (a `[link]`-config knob).
-    /// Gated on `project_panic_unwind`: the default abort path appends nothing,
-    /// keeping the link line byte-identical.
-    static append_panic_unwind_libs(ctx: CompilationContext*, cmd: string) -> string {
-        if (!ctx.project_panic_unwind) {
-            return cmd;
-        }
-        const lib_dir: string = CodegenPasses::resolve_runtime_lib_dir(
-            ctx, CodegenPasses::effective_triple(ctx));
+    static append_hosted_panic_lib(ctx: CompilationContext*, cmd: string,
+                                   triple: string) -> string {
+        const lib_dir: string = CodegenPasses::resolve_runtime_lib_dir(ctx, triple);
         if (lib_dir.length() == 0) {
             return cmd;
         }
-        const unwind_archive: string = format("%s/libcryort-panic-unwind.a", lib_dir);
-        return format("%s %s", cmd, CodegenPasses::link_quote(unwind_archive));
+        const archive: string = match (ctx.project_panic_unwind) {
+            true  => { "libcryort-panic-unwind-hosted.a" }
+            false => { "libcryort-panic-abort-hosted.a" }
+        };
+        return format("%s %s", cmd, CodegenPasses::link_quote(
+            format("%s/%s", lib_dir, archive)));
     }
 
     /// A directory holds the runtime tiers when the base tier archive is in it.
@@ -509,25 +513,16 @@ type struct CodegenPasses {
         // qualified name like every other cross-module runtime call; invalid
         // under `--no-std` (no stdlib linked), where the runtime keeps its libc
         // `vasprintf` buffer unchanged.
-        // Suppressed under `no_runtime`: both helpers reference libc (the
-        // `format` runtime forwards to `vasprintf`; `panic` prints via
-        // `printf`/`fflush` and `abort()`s), which a `-nostdlib` freestanding
-        // link cannot resolve.  A `no_runtime` build must not reference libc,
-        // so neither helper is emitted; `panic()` check-failures instead
-        // diverge through `llvm.trap` (see `emit_panic_call`), and the
-        // freestanding runtime tier provides its own formatting.
+        // Suppressed under `no_runtime`: the `format` runtime forwards to libc
+        // `vasprintf`, which a `-nostdlib` freestanding link cannot resolve, and
+        // the freestanding runtime tier provides its own formatting instead.
+        // The panic funnel is no longer emitted per-module at all — every panic
+        // calls the external `__cryo_panic` supplied by the linked panic tier
+        // (see `emit_panic_call`).
         if (!ctx.project_no_runtime) {
             const gha_fn: LValue = cg.resolver.resolve_function(
                 cg.intern_str("std::alloc::allocator::alloc"));
             cg.intrinsics.emit_format_runtime(gha_fn);
-            // Under `--panic=unwind` every panic is rerouted to the external
-            // raising `__cryo_panic` (see `emit_panic_call`), so the per-module
-            // libc `linkonce_odr @panic` body would be dead weight that still
-            // pulls in printf/abort; skip it. Default abort path emits it as
-            // before (byte-identical).
-            if (!ctx.project_panic_unwind) {
-                cg.intrinsics.emit_panic_runtime();
-            }
         }
 
         // Create the visitor and generate IR.  Heap-allocate via Box::leak
@@ -1365,13 +1360,15 @@ type struct CodegenPasses {
             cmd = format("%s %s", cmd, CodegenPasses::link_quote(stdlib_archive));
         }
         // A freestanding link has no libc to satisfy the panic/alloc/backtrace
-        // lang items, so the tier archives ARE the runtime and must be on the
-        // line; a hosted link only needs the unwind tier, and only when the
-        // project selected that panic strategy.
+        // lang items, so the tier archives ARE the runtime and must all be on
+        // the line.  A hosted link takes its allocator and entry from libc but
+        // still needs the panic funnel: every panic calls the external
+        // `__cryo_panic`, so exactly one panic tier must be named or the link
+        // fails on an undefined symbol.
         if (cfg.no_runtime) {
             cmd = CodegenPasses::append_runtime_tier_libs(ctx, cmd, effective_triple);
         } else {
-            cmd = CodegenPasses::append_panic_unwind_libs(ctx, cmd);
+            cmd = CodegenPasses::append_hosted_panic_lib(ctx, cmd, effective_triple);
         }
         // Cryo runtime support is fully inline-lowered: every bare-name
         // intrinsic (i32_to_i64, ptr_diff, format, bswap*, clz*, fpclass,
@@ -1537,7 +1534,7 @@ type struct CodegenPasses {
         if (ctx.project_no_runtime) {
             cmd = CodegenPasses::append_runtime_tier_libs(ctx, cmd, raw_triple);
         } else {
-            cmd = CodegenPasses::append_panic_unwind_libs(ctx, cmd);
+            cmd = CodegenPasses::append_hosted_panic_lib(ctx, cmd, raw_triple);
             cmd = format("%s %s", cmd, link_cfg.extra_system_libs);
         }
 
