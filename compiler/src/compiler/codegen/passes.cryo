@@ -11,6 +11,7 @@ import std::core::slice;
 import std::fs::dir;
 import std::fs::path;
 import std::fs::file;
+import std::fs::metadata;
 import std::process::command;
 import std::process::child;
 import std::core::slice;
@@ -216,12 +217,159 @@ type struct CodegenPasses {
     /// Gated on `project_panic_unwind`: the default abort path appends nothing,
     /// keeping the link line byte-identical.
     static append_panic_unwind_libs(ctx: CompilationContext*, cmd: string) -> string {
-        if (!ctx.project_panic_unwind || ctx.stdlib_root.length() == 0) {
+        if (!ctx.project_panic_unwind) {
             return cmd;
         }
-        const unwind_archive: string = format(
-            "%s/../runtime/.bin/libcryort-panic-unwind.a", ctx.stdlib_root);
+        const lib_dir: string = CodegenPasses::resolve_runtime_lib_dir(
+            ctx, CodegenPasses::effective_triple(ctx));
+        if (lib_dir.length() == 0) {
+            return cmd;
+        }
+        const unwind_archive: string = format("%s/libcryort-panic-unwind.a", lib_dir);
         return format("%s %s", cmd, CodegenPasses::link_quote(unwind_archive));
+    }
+
+    /// A directory holds the runtime tiers when the base tier archive is in it.
+    static runtime_dir_has_core(dir: string) -> boolean {
+        return metadata::exists(Path::from(format("%s/libcryort-core.a", dir)));
+    }
+
+    /// Prefer `<dir>/<triple>`, fall back to `<dir>`, else "".  Always returns a
+    /// freshly allocated path: callers build candidates from borrowed env-var
+    /// views that drop at the end of their match arm.
+    static runtime_dir_pick(dir: string, triple: string) -> string {
+        const per_target: string = format("%s/%s", dir, triple);
+        if (CodegenPasses::runtime_dir_has_core(per_target)) {
+            return per_target;
+        }
+        if (CodegenPasses::runtime_dir_has_core(dir)) {
+            return format("%s", dir);
+        }
+        return "";
+    }
+
+    /// Locate the directory holding the runtime tier archives for `triple`, or
+    /// "" when none can be found (the caller then links no tiers, exactly as
+    /// before this locator existed).
+    ///
+    /// The priority chain mirrors `resolve_stdlib_root`'s so an installed
+    /// toolchain resolves as readily as a dev tree, and every candidate prefers
+    /// a per-triple SUBDIRECTORY over a flat one.  That preference is load
+    /// bearing, not defensive: a project's final artifacts are hoisted to the
+    /// root of its `output_dir`, so building the runtime workspace for a second
+    /// target overwrites the first target's archives in place.  Linking a flat
+    /// directory therefore risks handing the linker another architecture's
+    /// objects, which fails as a pile of undefined symbols that look like a
+    /// runtime bug.  The flat fallback is what a single-target tree looks like.
+    static resolve_runtime_lib_dir(ctx: CompilationContext*, triple: string) -> string {
+        // 0. Explicit override, for a runtime built somewhere else entirely.
+        match (env::var(Str::new("CRYO_RUNTIME"))) {
+            Option::Some(v) => {
+                mut s: String = v;
+                const hit: string = CodegenPasses::runtime_dir_pick(
+                    s.as_cstr() as string, triple);
+                if (hit.length() > 0) { return hit; }
+            }
+            Option::None => {}
+        }
+        // 1. Install root.  install.sh writes CRYO_HOME into the user's shell
+        //    rc; the tiers ship beside the other target libraries.
+        match (env::var(Str::new("CRYO_HOME"))) {
+            Option::Some(v) => {
+                mut s: String = v;
+                const home: string = s.as_cstr() as string;
+                const hit_lib: string = CodegenPasses::runtime_dir_pick(
+                    format("%s/lib/cryo", home), triple);
+                if (hit_lib.length() > 0) { return hit_lib; }
+                const hit_rt: string = CodegenPasses::runtime_dir_pick(
+                    format("%s/runtime/.bin", home), triple);
+                if (hit_rt.length() > 0) { return hit_rt; }
+            }
+            Option::None => {}
+        }
+        // 2. Beside the running compiler.  This is the candidate that carries
+        //    the common case: a freestanding project sets `no_std`, which means
+        //    no stdlib root is ever resolved, so the stdlib-relative candidate
+        //    below cannot fire for exactly the projects that need the tiers.
+        //    `<bin>/../lib/cryo` is the install layout; the two dev-tree depths
+        //    cover `bin/cryo` and `compiler/build/cryo`.
+        mut self_exe: string = "";
+        match (env::current_exe()) {
+            Option::Some(s) => { self_exe = s.into_raw(); }
+            Option::None    => {}
+        }
+        const exe_len: i64 = self_exe.length() as i64;
+        if (exe_len > 0) {
+            mut exe_buf: i8* = self_exe as i8*;
+            // dirname: both separators terminate the scan, because
+            // `current_exe()` yields a backslash path on Windows.
+            mut dir_end: u64 = (exe_len - 1) as u64;
+            while (dir_end > 0) {
+                if (self_exe[dir_end] == '/' || self_exe[dir_end] == '\\') { break; }
+                dir_end -= 1;
+            }
+            if (dir_end > 0) {
+                exe_buf[dir_end] = 0;
+                const bindir: string = exe_buf as string;
+                const hit_inst: string = CodegenPasses::runtime_dir_pick(
+                    format("%s/../lib/cryo", bindir), triple);
+                if (hit_inst.length() > 0) { return hit_inst; }
+                const hit_dev: string = CodegenPasses::runtime_dir_pick(
+                    format("%s/../runtime/.bin", bindir), triple);
+                if (hit_dev.length() > 0) { return hit_dev; }
+                const hit_dev2: string = CodegenPasses::runtime_dir_pick(
+                    format("%s/../../runtime/.bin", bindir), triple);
+                if (hit_dev2.length() > 0) { return hit_dev2; }
+            }
+        }
+        // 3. Beside the resolved stdlib.  Covers an install that keeps the two
+        //    together but places neither relative to the binary.
+        if (ctx.stdlib_root.length() > 0) {
+            const hit: string = CodegenPasses::runtime_dir_pick(
+                format("%s/../runtime/.bin", ctx.stdlib_root), triple);
+            if (hit.length() > 0) { return hit; }
+        }
+        return "";
+    }
+
+    /// Append the runtime tier archives, plus the system libraries they import,
+    /// to a freestanding link command.
+    ///
+    /// Order matters and is not arbitrary: ld resolves left to right, so a tier
+    /// must precede whatever satisfies its undefined symbols.  The panic tier
+    /// goes LAST because every other tier can reach it — `core`'s and
+    /// `backtrace`'s own formatting helpers carry bounds checks, and a bounds
+    /// check calls `__cryo_panic_bounds_check`.  WHICH panic archive lands here
+    /// is the panic strategy; that is the entire reason the tiers ship as
+    /// separate archives rather than one.
+    ///
+    /// The system libraries follow the archives for the same reason: the tiers
+    /// import `NtTerminateProcess`/`RtlVirtualUnwind` (ntdll) and
+    /// `WriteFile`/`VirtualAlloc` (kernel32), so naming those first would leave
+    /// the tiers' references unresolved.
+    static append_runtime_tier_libs(ctx: CompilationContext*, cmd: string,
+                                     triple: string) -> string {
+        const lib_dir: string = CodegenPasses::resolve_runtime_lib_dir(ctx, triple);
+        if (lib_dir.length() == 0) {
+            return cmd;
+        }
+        mut out: string = cmd;
+        out = format("%s %s", out, CodegenPasses::link_quote(
+            format("%s/libcryort-alloc.a", lib_dir)));
+        out = format("%s %s", out, CodegenPasses::link_quote(
+            format("%s/libcryort-backtrace.a", lib_dir)));
+        out = format("%s %s", out, CodegenPasses::link_quote(
+            format("%s/libcryort-core.a", lib_dir)));
+        const panic_tier: string = match (ctx.project_panic_unwind) {
+            true  => { "libcryort-panic-unwind.a" }
+            false => { "libcryort-panic-abort.a" }
+        };
+        out = format("%s %s", out, CodegenPasses::link_quote(
+            format("%s/%s", lib_dir, panic_tier)));
+        if (triple.contains("windows")) {
+            out = format("%s -lkernel32 -lntdll", out);
+        }
+        return out;
     }
 
     /// Copy the freshly-linked binary from the per-profile cache to the build
@@ -1122,14 +1270,16 @@ type struct CodegenPasses {
         //   - Linux (and other ELF): `-static` removes the dynamic-loader
         //     dependency; the result imports nothing.
         //   - Windows: there is no stable raw-syscall ABI, so the entry reaches
-        //     the kernel through ntdll (`NtTerminateProcess`, and later the PEB
-        //     for arguments).  Link `-lntdll` — the sole dependency — and set
-        //     the PE entry to the runtime's `_start` (the mingw default,
-        //     `mainCRTStartup`, was dropped with crt0).  Not `-static`: ntdll
-        //     is always a DLL, reached through its import library.
+        //     the kernel through ntdll and kernel32.  Set the PE entry to the
+        //     runtime's `_start` (the mingw default, `mainCRTStartup`, was
+        //     dropped with crt0).  Not `-static`: ntdll is always a DLL,
+        //     reached through its import library.  The import libraries
+        //     themselves are named by `append_runtime_tier_libs`, AFTER the
+        //     tier archives that reference them — naming them here would put
+        //     them ahead of those references, which ld would not resolve.
         if (cfg.no_runtime) {
             if (effective_triple.contains("windows")) {
-                cmd = format("%s -nostartfiles -nostdlib -Wl,-e,_start -lntdll", cmd);
+                cmd = format("%s -nostartfiles -nostdlib -Wl,-e,_start", cmd);
             } else {
                 cmd = format("%s -nostartfiles -nostdlib -static", cmd);
             }
@@ -1214,7 +1364,15 @@ type struct CodegenPasses {
                 ctx.stdlib_root);
             cmd = format("%s %s", cmd, CodegenPasses::link_quote(stdlib_archive));
         }
-        cmd = CodegenPasses::append_panic_unwind_libs(ctx, cmd);
+        // A freestanding link has no libc to satisfy the panic/alloc/backtrace
+        // lang items, so the tier archives ARE the runtime and must be on the
+        // line; a hosted link only needs the unwind tier, and only when the
+        // project selected that panic strategy.
+        if (cfg.no_runtime) {
+            cmd = CodegenPasses::append_runtime_tier_libs(ctx, cmd, effective_triple);
+        } else {
+            cmd = CodegenPasses::append_panic_unwind_libs(ctx, cmd);
+        }
         // Cryo runtime support is fully inline-lowered: every bare-name
         // intrinsic (i32_to_i64, ptr_diff, format, bswap*, clz*, fpclass,
         // atomic_fence, dirent_*) is emitted directly into LLVM IR by
@@ -1354,9 +1512,16 @@ type struct CodegenPasses {
         mut cmd: string = format("%s -o %s @\"%s\"",
             link_cfg.driver, CodegenPasses::link_quote(exe_path), link_rsp_path);
         // `no_runtime`: freestanding link (see run_linking).  In raw mode
-        // `ctx.project_no_runtime` carries the flag.
+        // `ctx.project_no_runtime` carries the flag.  Same per-OS split as the
+        // project path: a PE cannot be `-static` (ntdll is always a DLL) and
+        // needs its entry pointed at the runtime's `_start`.
+        const raw_triple: string = CodegenPasses::effective_triple(ctx);
         if (ctx.project_no_runtime) {
-            cmd = format("%s -nostartfiles -nostdlib -static", cmd);
+            if (raw_triple.contains("windows")) {
+                cmd = format("%s -nostartfiles -nostdlib -Wl,-e,_start", cmd);
+            } else {
+                cmd = format("%s -nostartfiles -nostdlib -static", cmd);
+            }
         }
         // Stdlib archive: same lookup as the project link path, and same
         // host-vs-cross gating.  Empty stdlib_root means single-file mode
@@ -1369,8 +1534,10 @@ type struct CodegenPasses {
                 ctx.stdlib_root);
             cmd = format("%s %s", cmd, CodegenPasses::link_quote(stdlib_archive));
         }
-        cmd = CodegenPasses::append_panic_unwind_libs(ctx, cmd);
-        if (!ctx.project_no_runtime) {
+        if (ctx.project_no_runtime) {
+            cmd = CodegenPasses::append_runtime_tier_libs(ctx, cmd, raw_triple);
+        } else {
+            cmd = CodegenPasses::append_panic_unwind_libs(ctx, cmd);
             cmd = format("%s %s", cmd, link_cfg.extra_system_libs);
         }
 
