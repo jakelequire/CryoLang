@@ -194,7 +194,7 @@ type struct Reactor {
         rt.shutdown = Atomic<u8>::new(0u8);
         rt.thread   = 0;
         rt.timers    = null;
-        rt.timer_seq = 0u64;
+        rt.timer_seq = 0;
         if (!rt_backend_open(rt)) {
             panic("Reactor::start: I/O readiness backend unavailable", FILE, LINE);
         }
@@ -234,7 +234,7 @@ type struct Reactor {
                 if (reg == null) { break; }
                 mut wr: Waker = take_waker(&reg.read_waker);
                 mut ww: Waker = take_waker(&reg.write_waker);
-                reg.interest = 0u32;
+                reg.interest = 0;
                 rt.remove(reg);
                 wr.drop();
                 ww.drop();
@@ -292,7 +292,7 @@ type struct Reactor {
         rt_mtx_lock(&this.mtx[0]);
         mut reg: Registration* = this.find(fd);
         if (reg == null) { reg = this.insert(fd); }
-        if ((direction & INTEREST_READ) != 0u32) { replaced = swap_waker(&reg.read_waker, w); }
+        if ((direction & INTEREST_READ) != 0) { replaced = swap_waker(&reg.read_waker, w); }
         else                                     { replaced = swap_waker(&reg.write_waker, w); }
         reg.interest = reg.interest | direction;
         // A descriptor the OS refuses to watch (closed, or not pollable) would
@@ -300,10 +300,10 @@ type struct Reactor {
         // below: the future re-polls, its syscall reports the real error, and it
         // fails instead of hanging.
         if (!rt_arm(&this, reg)) {
-            if ((direction & INTEREST_READ) != 0u32) { failed = take_waker(&reg.read_waker); }
+            if ((direction & INTEREST_READ) != 0) { failed = take_waker(&reg.read_waker); }
             else                                     { failed = take_waker(&reg.write_waker); }
             reg.interest = reg.interest & ~direction;
-            if (reg.interest == 0u32) { this.remove(reg); }
+            if (reg.interest == 0) { this.remove(reg); }
         }
         rt_mtx_unlock(&this.mtx[0]);
         failed.wake();
@@ -317,11 +317,11 @@ type struct Reactor {
         mut taken: Waker = Waker::noop();
         rt_mtx_lock(&this.mtx[0]);
         const reg: Registration* = this.find(fd);
-        if (reg != null && (reg.interest & direction) != 0u32) {
-            if ((direction & INTEREST_READ) != 0u32) { taken = take_waker(&reg.read_waker); }
+        if (reg != null && (reg.interest & direction) != 0) {
+            if ((direction & INTEREST_READ) != 0) { taken = take_waker(&reg.read_waker); }
             else                                     { taken = take_waker(&reg.write_waker); }
             reg.interest = reg.interest & ~direction;
-            if (reg.interest == 0u32) { this.remove(reg); }
+            if (reg.interest == 0) { this.remove(reg); }
             else                      { rt_arm(&this, reg); }
         }
         rt_mtx_unlock(&this.mtx[0]);
@@ -339,7 +339,7 @@ type struct Reactor {
         if (reg != null) {
             wr = take_waker(&reg.read_waker);
             ww = take_waker(&reg.write_waker);
-            reg.interest = 0u32;
+            reg.interest = 0;
             this.remove(reg);
         }
         rt_mtx_unlock(&this.mtx[0]);
@@ -388,7 +388,7 @@ type struct Reactor {
         t.waker    = w;
         t.next     = null;
         rt_mtx_lock(&this.mtx[0]);
-        this.timer_seq = this.timer_seq + 1u64;
+        this.timer_seq = this.timer_seq + 1;
         t.id = this.timer_seq;
         const id: u64 = t.id;
         mut prev: Timer* = null;
@@ -410,7 +410,7 @@ type struct Reactor {
     /// timer has already fired or was never armed, which is what lets a dropped
     /// `Sleep` cancel unconditionally without tracking whether it fired.
     cancel_timer(mut &this, id: u64) -> void {
-        if (id == 0u64) { return; }
+        if (id == 0) { return; }
         mut taken: Waker  = Waker::noop();
         mut found: Timer* = null;
         rt_mtx_lock(&this.mtx[0]);
@@ -495,15 +495,15 @@ type struct Reactor {
         rt_mtx_lock(&this.mtx[0]);
         const reg: Registration* = this.find(fd);
         if (reg != null) {
-            if ((ready & reg.interest & INTEREST_READ) != 0u32) {
+            if ((ready & reg.interest & INTEREST_READ) != 0) {
                 wr = take_waker(&reg.read_waker);
                 reg.interest = reg.interest & ~INTEREST_READ;
             }
-            if ((ready & reg.interest & INTEREST_WRITE) != 0u32) {
+            if ((ready & reg.interest & INTEREST_WRITE) != 0) {
                 ww = take_waker(&reg.write_waker);
                 reg.interest = reg.interest & ~INTEREST_WRITE;
             }
-            if (reg.interest == 0u32) { this.remove(reg); }
+            if (reg.interest == 0) { this.remove(reg); }
             else                      { rt_arm(&this, reg); }
         }
         rt_mtx_unlock(&this.mtx[0]);
@@ -533,7 +533,7 @@ type struct Reactor {
             Result::Err(_)  => { panic("Reactor::register: registration allocation failed", FILE, LINE); }
         }
         reg.fd            = fd;
-        reg.interest      = 0u32;
+        reg.interest      = 0;
         reg.read_waker    = Waker::noop();
         reg.write_waker   = Waker::noop();
         reg.next          = null;
@@ -577,7 +577,7 @@ type struct Reactor {
 /// teardown. A kick (see `rt_kick`) breaks the wait so shutdown — and a newly
 /// armed earliest timer — is observed promptly.
 private function reactor_body(rt: Reactor*) -> void {
-    while (rt.shutdown.load(MemoryOrder::Acquire) == 0u8) {
+    while (rt.shutdown.load(MemoryOrder::Acquire) == 0) {
         rt.run_once();
     }
 }
@@ -588,7 +588,7 @@ private function reactor_body(rt: Reactor*) -> void {
 ![target(unix)]
 private function reactor_tramp(arg: u8*) -> u8* { reactor_body(arg as Reactor*); return null; }
 ![target(windows)]
-private function reactor_tramp(arg: u8*) -> u32 { reactor_body(arg as Reactor*); return 0u32; }
+private function reactor_tramp(arg: u8*) -> u32 { reactor_body(arg as Reactor*); return 0; }
 
 
 // ---------------------------------------------------------------------------
@@ -671,7 +671,7 @@ private function rt_thread_join(tid: u64) -> void {
 private function epoll_event_pack(slot: u8*, events: u32, fd: u32) -> void {
     *(slot as u32*)       = events;
     *((slot + 4) as u32*) = fd;
-    *((slot + 8) as u32*) = 0u32;
+    *((slot + 8) as u32*) = 0;
 }
 
 ![target(unix)]
@@ -710,10 +710,10 @@ private function rt_backend_close(rt: Reactor*) -> void {
 ![target(unix)]
 private function rt_arm(rt: Reactor*, reg: Registration*) -> boolean {
     mut events: u32 = libc::EPOLLONESHOT;
-    if ((reg.interest & INTEREST_READ) != 0u32) {
+    if ((reg.interest & INTEREST_READ) != 0) {
         events = events | libc::EPOLLIN | libc::EPOLLRDHUP;
     }
-    if ((reg.interest & INTEREST_WRITE) != 0u32) {
+    if ((reg.interest & INTEREST_WRITE) != 0) {
         events = events | libc::EPOLLOUT;
     }
     mut slot: u8[12] = [0; 12];
@@ -770,11 +770,11 @@ private function rt_wait(rt: Reactor*, out_fds: i32*, out_ready: u32*,
         }
         // A hangup or error wakes BOTH directions: the future retries its
         // syscall and reports the real error rather than parking again.
-        mut ready: u32 = 0u32;
+        mut ready: u32 = 0;
         const rd: u32 = libc::EPOLLIN | libc::EPOLLRDHUP | libc::EPOLLHUP | libc::EPOLLERR;
         const wr: u32 = libc::EPOLLOUT | libc::EPOLLHUP | libc::EPOLLERR;
-        if ((events & rd) != 0u32) { ready = ready | INTEREST_READ; }
-        if ((events & wr) != 0u32) { ready = ready | INTEREST_WRITE; }
+        if ((events & rd) != 0) { ready = ready | INTEREST_READ; }
+        if ((events & wr) != 0) { ready = ready | INTEREST_WRITE; }
         out_fds[out]   = fd;
         out_ready[out] = ready;
         out = out + 1;
@@ -839,10 +839,10 @@ private function afd_info(op: AfdOp*) -> u8* { return &op.info[0] as u8*; }
 ![target(windows)]
 private function afd_device_path(out: u16*) -> u32 {
     const ascii: string = "\\Device\\Afd\\Cryo";
-    mut i: u32 = 0u32;
+    mut i: u32 = 0;
     while (ascii[i as u64] != 0u8) {
         out[i as i64] = ascii[i as u64] as u16;
-        i = i + 1u32;
+        i = i + 1;
     }
     return i;
 }
@@ -854,7 +854,7 @@ private function afd_device_path(out: u16*) -> u32 {
 ![target(windows)]
 private function afd_base_socket(fd: i32) -> u64 {
     mut base:  u64 = 0;
-    mut bytes: u32 = 0u32;
+    mut bytes: u32 = 0;
     if (syscall::WSAIoctl(fd as u64, syscall::SIO_BASE_HANDLE, null, 0u32,
                           &base as u8*, 8u32, &bytes, null, null) == 0) {
         return base;
@@ -878,8 +878,8 @@ private function rt_backend_open(rt: Reactor*) -> boolean {
     // in BYTES, not characters.
     mut uni_buf: u64[2] = [0; 2];
     const uni: u8* = &uni_buf[0] as u8*;
-    *(uni as u16*)         = (chars * 2u32) as u16;
-    *((uni + 2) as u16*)   = (chars * 2u32) as u16;
+    *(uni as u16*)         = (chars * 2) as u16;
+    *((uni + 2) as u16*)   = (chars * 2) as u16;
     *((uni + 8) as u64*)   = &path[0] as u64;
 
     // OBJECT_ATTRIBUTES { u32 Length; u8* RootDirectory; u8* ObjectName;
@@ -926,14 +926,14 @@ private function rt_backend_close(rt: Reactor*) -> void {
         const iocp: u8* = rt.poll_h as u8*;
         mut entries: u8[1024] = [0; 1024];   // 32 * SIZEOF_OVERLAPPED_ENTRY
         loop {
-            mut removed: u32 = 0u32;
+            mut removed: u32 = 0;
             if (syscall::GetQueuedCompletionStatusEx(iocp, &entries[0], 32u32,
                                                      &removed, 0u32, 0) == 0) {
                 break;
             }
-            if (removed == 0u32) { break; }
-            for (mut i: u32 = 0u32; i < removed; i = i + 1u32) {
-                const e:   u8* = &entries[0] + ((i as i64) * 32i64);
+            if (removed == 0) { break; }
+            for (mut i: u32 = 0u32; i < removed; i = i + 1) {
+                const e:   u8* = &entries[0] + ((i as i64) * 32);
                 const ovl: u8* = *((e + 8) as u64*) as u8*;
                 if (ovl != null) { afd_op_free(ovl as AfdOp*); }
             }
@@ -960,11 +960,11 @@ private function rt_arm(rt: Reactor*, reg: Registration*) -> boolean {
     // by a hangup retries its syscall and reports the real error.
     mut events: u32 = syscall::AFD_POLL_ABORT | syscall::AFD_POLL_LOCAL_CLOSE
                     | syscall::AFD_POLL_CONNECT_FAIL;
-    if ((reg.interest & INTEREST_READ) != 0u32) {
+    if ((reg.interest & INTEREST_READ) != 0) {
         events = events | syscall::AFD_POLL_RECEIVE | syscall::AFD_POLL_RECEIVE_EXPEDITED
                         | syscall::AFD_POLL_ACCEPT  | syscall::AFD_POLL_DISCONNECT;
     }
-    if ((reg.interest & INTEREST_WRITE) != 0u32) {
+    if ((reg.interest & INTEREST_WRITE) != 0) {
         events = events | syscall::AFD_POLL_SEND;
     }
 
@@ -981,9 +981,9 @@ private function rt_arm(rt: Reactor*, reg: Registration*) -> boolean {
     //                 { u8* Handle; u32 Events; i32 Status } Handles[1] }
     // Timeout is INT64_MAX: the wait belongs to the completion port, not to AFD.
     const info: u8* = afd_info(op);
-    *(info as i64*)         = 9223372036854775807i64;
-    *((info + 8) as u32*)   = 1u32;
-    *((info + 12) as u32*)  = 0u32;
+    *(info as i64*)         = 9223372036854775807;
+    *((info + 8) as u32*)   = 1;
+    *((info + 12) as u32*)  = 0;
     *((info + 16) as u64*)  = afd_base_socket(reg.fd);
     *((info + 24) as u32*)  = events;
     *((info + 28) as i32*)  = 0;
@@ -1032,16 +1032,16 @@ private function rt_wait(rt: Reactor*, out_fds: i32*, out_ready: u32*,
     mut cap: i32 = max;
     if (cap > RT_MAX_EVENTS) { cap = RT_MAX_EVENTS; }
     // A negative timeout means "wait indefinitely", which Win32 spells INFINITE.
-    mut ms: u32 = 0xFFFFFFFFu32;
+    mut ms: u32 = 0xFFFFFFFF;
     if (timeout_ms >= 0) { ms = timeout_ms as u32; }
-    mut removed: u32 = 0u32;
+    mut removed: u32 = 0;
     if (syscall::GetQueuedCompletionStatusEx(rt.poll_h as u8*, &entries[0], cap as u32,
                                              &removed, ms, 0) == 0) {
         return 0;   // timed out, or the port reported an error: just wait again
     }
     mut out: i32 = 0;
-    for (mut i: u32 = 0u32; i < removed; i = i + 1u32) {
-        const e:   u8* = &entries[0] + ((i as i64) * 32i64);
+    for (mut i: u32 = 0u32; i < removed; i = i + 1) {
+        const e:   u8* = &entries[0] + ((i as i64) * 32);
         const ovl: u8* = *((e + 8) as u64*) as u8*;
         if (ovl == null) { continue; }        // the kick
         mut op: AfdOp* = ovl as AfdOp*;
@@ -1049,7 +1049,7 @@ private function rt_wait(rt: Reactor*, out_fds: i32*, out_ready: u32*,
         // (the socket closed, or teardown): report nothing for it.
         const info: u8* = afd_info(op);
         const nhandles: u32 = *((info + 8) as u32*);
-        if (nhandles != 0u32) {
+        if (nhandles != 0) {
             const events: u32 = *((info + 24) as u32*);
             const rd: u32 = syscall::AFD_POLL_RECEIVE | syscall::AFD_POLL_RECEIVE_EXPEDITED
                           | syscall::AFD_POLL_ACCEPT  | syscall::AFD_POLL_DISCONNECT
@@ -1057,10 +1057,10 @@ private function rt_wait(rt: Reactor*, out_fds: i32*, out_ready: u32*,
                           | syscall::AFD_POLL_CONNECT_FAIL;
             const wr: u32 = syscall::AFD_POLL_SEND    | syscall::AFD_POLL_ABORT
                           | syscall::AFD_POLL_LOCAL_CLOSE | syscall::AFD_POLL_CONNECT_FAIL;
-            mut ready: u32 = 0u32;
-            if ((events & rd) != 0u32) { ready = ready | INTEREST_READ; }
-            if ((events & wr) != 0u32) { ready = ready | INTEREST_WRITE; }
-            if (ready != 0u32 && out < cap) {
+            mut ready: u32 = 0;
+            if ((events & rd) != 0) { ready = ready | INTEREST_READ; }
+            if ((events & wr) != 0) { ready = ready | INTEREST_WRITE; }
+            if (ready != 0 && out < cap) {
                 out_fds[out]   = op.fd;
                 out_ready[out] = ready;
                 out = out + 1;

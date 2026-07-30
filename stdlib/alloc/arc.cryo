@@ -82,7 +82,7 @@ where A: Allocator {
 private function release_weak<T, A>(inner_ptr: ArcInner<T, A>*) -> void
 where A: Allocator {
     const prev: u64 = inner_ptr.weak.fetch_sub(1u64, MemoryOrder::Release);
-    if (prev == 1u64) {
+    if (prev == 1) {
         atomic::fence(MemoryOrder::Acquire);
         free_arc_inner<T, A>(inner_ptr);
     }
@@ -177,7 +177,7 @@ type struct Arc<T, A = GlobalAlloc> {
     /// Number of live `Weak` handles (advisory).  The strong group's shared
     /// unit is excluded, so this is 0 when no `Weak` has been created.
     weak_count(&this) -> u64 {
-        return this.inner.weak.load(MemoryOrder::SeqCst) - 1u64;
+        return this.inner.weak.load(MemoryOrder::SeqCst) - 1;
     }
 
     /// Raw pointer to the shared value.  Valid for as long as *any*
@@ -201,8 +201,8 @@ type struct Arc<T, A = GlobalAlloc> {
     /// holds an `Arc` to clone or downgrade from, so once both counts read 1
     /// the access is exclusive; otherwise `None`.
     get_mut(mut &this) -> Option<T*> {
-        if (this.inner.strong.load(MemoryOrder::Acquire) == 1u64
-                && this.inner.weak.load(MemoryOrder::Acquire) == 1u64) {
+        if (this.inner.strong.load(MemoryOrder::Acquire) == 1
+                && this.inner.weak.load(MemoryOrder::Acquire) == 1) {
             return Option::Some(&this.inner.value);
         }
         return Option::None;
@@ -279,9 +279,9 @@ type struct Weak<T, A = GlobalAlloc> {
         const inner_ptr: ArcInner<T, A>* = this.inner;
         mut n: u64 = inner_ptr.strong.load(MemoryOrder::Relaxed);
         loop {
-            if (n == 0u64) { return Option::None; }
+            if (n == 0) { return Option::None; }
             match (inner_ptr.strong.compare_exchange(
-                       n, n + 1u64, MemoryOrder::Acquire, MemoryOrder::Relaxed)) {
+                       n, n + 1, MemoryOrder::Acquire, MemoryOrder::Relaxed)) {
                 Result::Ok(_)       => { return Option::Some(Arc<T, A> { inner: inner_ptr }); }
                 Result::Err(actual) => { n = actual; }
             }
@@ -299,7 +299,7 @@ type struct Weak<T, A = GlobalAlloc> {
 
     /// Live strong count, or 0 for a dangling `Weak`.  Advisory.
     strong_count(&this) -> u64 {
-        if (this.inner == null) { return 0u64; }
+        if (this.inner == null) { return 0; }
         return this.inner.strong.load(MemoryOrder::SeqCst);
     }
 }
@@ -322,7 +322,7 @@ where T: Drop, A: Allocator {
         // `fetch_sub` returns the value BEFORE the decrement, so the
         // last owner is the one that observes `1` here.
         const prev: u64 = inner_ptr.strong.fetch_sub(1u64, MemoryOrder::Release);
-        if (prev == 1u64) {
+        if (prev == 1) {
             // We are the last strong owner.  Acquire-fence to pair with the
             // Release decrements of every prior thread, run the destructor,
             // then release the strong group's shared weak unit (which frees
