@@ -28,7 +28,7 @@ import Compiler::Resolver::{ SymbolStr, InternTable };
 import Compiler::AST;
 import Compiler::AST::{ Node, Expression, Statement, Declaration };
 import Compiler::CompilationContext;
-import Compiler::Sema::{ State, TypeUtils, SymbolicChecker };
+import Compiler::Sema::{ State, TypeUtils, SymbolicChecker, Helpers };
 import std::fmt;
 
 type struct MethodBinding {
@@ -1368,6 +1368,8 @@ type struct MethodBinding {
     /// Mirrors `CallResolver::sema_arg_is_polymorphic_literal` for the method path.
     method_arg_is_polymorphic_literal(&this, expr: ExpressionNode*) -> boolean {
         if (expr == null) { return false; }
+        // A suffixed literal names its own type - see the free-function mirror.
+        if (sema_expr_has_numeric_suffix(expr)) { return false; }
         const node: ASTNode* = expr as ASTNode*;
         if (node.kind == NodeKind::Literal) {
             const lit: LiteralNode* = expr as LiteralNode*;
@@ -1470,12 +1472,12 @@ type struct MethodBinding {
                 formal = this.reduce_assoc_projections(formal);
                 formals.push(formal);
             }
-            // PASS A - bind from NON-literal args. A polymorphic numeric literal
-            // (`100u64`; the suffix is only a hint for generic inference - see
-            // `sema_arg_is_polymorphic_literal`) carries its DEFAULT type (`i32`)
-            // in `resolved_type`, so unifying `T` against it would wrongly pin
-            // `T = i32`. Skip literals here and let context/adoption bind them,
-            // exactly as the free-function inference path does.
+            // PASS A - bind from NON-literal args. A BARE numeric literal (`100`)
+            // carries its DEFAULT type (`i32`) in `resolved_type`, so unifying
+            // `T` against it would wrongly pin `T = i32`. Skip those here and let
+            // context/adoption bind them, exactly as the free-function inference
+            // path does. A SUFFIXED literal (`100u64`) is not skipped: the suffix
+            // is its type, so it binds `T` like any other typed argument.
             for (mut i: i64 = 0; i < call.arguments.length; i++) {
                 const arg: ExpressionNode* = call.arguments[i];
                 if (arg == null) { return []; }

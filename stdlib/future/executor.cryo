@@ -243,7 +243,7 @@ type struct Task {
     /// box address, so the owning `Waker` carries it.
     drive(mut &this) -> boolean {
         const ctl: TaskCtl* = this.shared as TaskCtl*;
-        if (ctl.cancel.load(MemoryOrder::Acquire) == 1u8) {
+        if (ctl.cancel.load(MemoryOrder::Acquire) == 1) {
             this.finish(OUTCOME_CANCELLED);
             return false;
         }
@@ -255,14 +255,14 @@ type struct Task {
         task_incref(&this);
         mut cx: Context = Context::new(Waker::new(task_wake, waker_arc_clone,
                                                   waker_arc_drop, &this as u8*));
-        mut pinfo: PanicInfo = PanicInfo { msg: "", file: "", line: 0u32 };
+        mut pinfo: PanicInfo = PanicInfo { msg: "", file: "", line: 0 };
         const status: u8 = poll_boundary(this.poll_fn, this.fut, this.shared, &cx, &pinfo);
-        if (status == 2u8) {
+        if (status == 2) {
             ctl.panic = pinfo;
             this.finish(OUTCOME_PANICKED);
             return false;
         }
-        if (status == 1u8) {
+        if (status == 1) {
             this.finish(OUTCOME_READY);
             return false;
         }
@@ -302,8 +302,8 @@ type struct Task {
             // No handle will read the block: dispose it here (drop the stored
             // result only on READY). This swap was our last touch of the block.
             const disp: (u8*, u8) -> void = this.dispose_fn;
-            mut drop_result: u8 = 0u8;
-            if (outcome == OUTCOME_READY) { drop_result = 1u8; }
+            mut drop_result: u8 = 0;
+            if (outcome == OUTCOME_READY) { drop_result = 1; }
             disp(this.shared, drop_result);
         } else {
             // Handle live: a joiner may be blocked on the completion condvar. The
@@ -500,12 +500,12 @@ function run_poll(data: u8*) -> void {
 function poll_boundary(poll_fn: (u8*, u8*, Context*) -> u8, fut: u8*, shared: u8*,
                        cx: Context*, out_panic: PanicInfo*) -> u8 {
     mut pc: PollCtx = PollCtx { poll_fn: poll_fn, fut: fut, shared: shared,
-                               cx: cx, status: 0u8 };
+                               cx: cx, status: 0 };
     const tramp: (u8*) -> void = run_poll;
     const caught: boolean = intrinsics::try_catch(tramp as void*, &pc as void*);
     if (caught) {
         *out_panic = panic_unwind::taken_panic_info();
-        return 2u8;
+        return 2;
     }
     return pc.status;
 }
@@ -534,9 +534,9 @@ where F: Future<O> {
             const sh: TaskShared<O>* = shared_raw as TaskShared<O>*;
             const rptr: O* = &sh.result;
             *rptr = v;
-            return 1u8;
+            return 1;
         }
-        Poll::Pending => { return 0u8; }
+        Poll::Pending => { return 0; }
     }
 }
 
@@ -565,7 +565,7 @@ function task_drop_thunk<F>(fut_raw: u8*) -> void {
 /// is captured as a per-`O` vtable fn-ptr.
 function dispose_shared_thunk<O>(shared_raw: u8*, drop_result: u8) -> void {
     const sh: TaskShared<O>* = shared_raw as TaskShared<O>*;
-    if (drop_result == 1u8) {
+    if (drop_result == 1) {
         const rp: O* = &sh.result;
         rp.drop();
     }
@@ -605,7 +605,7 @@ function worker_body(inner: ExecInner*) -> void {
 ![target(unix)]
 function worker_tramp(arg: u8*) -> u8* { worker_body(arg as ExecInner*); return null; }
 ![target(windows)]
-function worker_tramp(arg: u8*) -> u32 { worker_body(arg as ExecInner*); return 0u32; }
+function worker_tramp(arg: u8*) -> u32 { worker_body(arg as ExecInner*); return 0; }
 
 /// Create one worker thread running `worker_tramp(inner)`, writing its joinable
 /// id/handle into `tbuf` (8 bytes). Returns 0 on success, non-zero on failure.
@@ -641,20 +641,20 @@ private function exec_join_worker(tid: u64) -> void {
 ![target(unix)]
 private function exec_cpu_count() -> u32 {
     const n: i64 = libc::sysconf(84);   // _SC_NPROCESSORS_ONLN on Linux/glibc + BSD
-    if (n <= 0) { return 1u32; }
+    if (n <= 0) { return 1; }
     return n as u32;
 }
 ![target(windows)]
 private function exec_cpu_count() -> u32 {
     mut si: syscall::SYSTEM_INFO_PARTIAL = syscall::SYSTEM_INFO_PARTIAL {
-        wProcessorArchitecture: 0u16, wReserved: 0u16, dwPageSize: 0u32,
+        wProcessorArchitecture: 0, wReserved: 0, dwPageSize: 0,
         lpMinimumApplicationAddress: null, lpMaximumApplicationAddress: null,
-        dwActiveProcessorMask: 0u64, dwNumberOfProcessors: 0u32,
-        dwProcessorType: 0u32, dwAllocationGranularity: 0u32,
-        wProcessorLevel: 0u16, wProcessorRevision: 0u16
+        dwActiveProcessorMask: 0, dwNumberOfProcessors: 0,
+        dwProcessorType: 0, dwAllocationGranularity: 0,
+        wProcessorLevel: 0, wProcessorRevision: 0
     };
     syscall::GetSystemInfo(&si as u8*);
-    if (si.dwNumberOfProcessors == 0) { return 1u32; }
+    if (si.dwNumberOfProcessors == 0) { return 1; }
     return si.dwNumberOfProcessors;
 }
 
@@ -676,7 +676,7 @@ where F: Future<O> {
     sh.ctl.outcome = Atomic<u8>::new(OUTCOME_PENDING);
     sh.ctl.hs      = Atomic<u8>::new(HS_LIVE);
     sh.ctl.cancel  = Atomic<u8>::new(0u8);
-    sh.ctl.panic   = PanicInfo { msg: "", file: "", line: 0u32 };
+    sh.ctl.panic   = PanicInfo { msg: "", file: "", line: 0 };
 
     mut fbox: F* = null;
     match (alloc.allocate(Layout::of<F>())) {
@@ -823,7 +823,7 @@ type struct Executor {
     /// pool always makes progress).
     static with_threads(n: u32) -> Executor {
         mut count: u32 = n;
-        if (count == 0u32) { count = 1u32; }
+        if (count == 0) { count = 1; }
         mut alloc: GlobalAlloc = GlobalAlloc::new();
         mut inner: ExecInner* = null;
         match (alloc.allocate(Layout::of<ExecInner>())) {
@@ -840,14 +840,14 @@ type struct Executor {
         // Before any worker starts: each publishes this handle as it comes up.
         inner.reactor  = Reactor::start();
         mut tids: u64[] = [];
-        mut i: u32 = 0u32;
+        mut i: u32 = 0;
         while (i < count) {
-            mut tbuf: u8[8] = [0u8; 8];
+            mut tbuf: u8[8] = [0; 8];
             if (exec_spawn_worker(inner, &tbuf[0]) != 0) {
                 panic("Executor: worker thread creation failed", FILE, LINE);
             }
             tids.push(*(&tbuf[0] as u64*));
-            i = i + 1u32;
+            i = i + 1;
         }
         return Executor { inner: inner, worker_tids: tids };
     }

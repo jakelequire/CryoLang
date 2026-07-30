@@ -62,6 +62,57 @@ public function sema_default_int_type(arena: TypeArena*, value: string) -> TypeR
     return arena.get_u64();
 }
 
+/// The type named by a numeric literal's type suffix (`"u64"` -> `u64`), or an
+/// invalid ref when the literal carries none.  A suffix is a written-down type,
+/// so it settles the literal outright: neither the expected-type adoption above
+/// nor the magnitude default applies.  The suffix set is the lexer's
+/// (`Lexer::is_valid_numeric_suffix`); anything outside it never reaches here.
+public function sema_numeric_suffix_type(arena: TypeArena*, suffix: string) -> TypeRef {
+    if (suffix == "")     { return TypeRef::invalid(); }
+    if (suffix == "i8")   { return arena.get_i8();   }
+    if (suffix == "i16")  { return arena.get_i16();  }
+    if (suffix == "i32")  { return arena.get_i32();  }
+    if (suffix == "i64")  { return arena.get_i64();  }
+    if (suffix == "i128") { return arena.get_i128(); }
+    if (suffix == "u8")   { return arena.get_u8();   }
+    if (suffix == "u16")  { return arena.get_u16();  }
+    if (suffix == "u32")  { return arena.get_u32();  }
+    if (suffix == "u64")  { return arena.get_u64();  }
+    if (suffix == "u128") { return arena.get_u128(); }
+    if (suffix == "f32")  { return arena.get_f32();  }
+    if (suffix == "f64")  { return arena.get_f64();  }
+    return TypeRef::invalid();
+}
+
+/// True when `expr` is a numeric literal written with a type suffix (`7u64`),
+/// including one reached through a sign/bitwise-not prefix (`-7i8`).  Such a
+/// literal is NOT width-polymorphic, so the generic-inference paths must bind
+/// a type parameter from it rather than skipping it as an adoptable default.
+public function sema_expr_has_numeric_suffix(expr: ExpressionNode*) -> boolean {
+    if (expr == null) { return false; }
+    const node: ASTNode* = expr as ASTNode*;
+    if (node.kind == NodeKind::Literal) {
+        const lit: LiteralNode* = expr as LiteralNode*;
+        return lit.suffix != "";
+    }
+    if (node.kind == NodeKind::UnaryExpression) {
+        const u: UnaryExprNode* = expr as UnaryExprNode*;
+        if (u.op.lexeme == "-" || u.op.lexeme == "+" || u.op.lexeme == "~") {
+            return sema_expr_has_numeric_suffix(u.operand);
+        }
+        return false;
+    }
+    // An arithmetic constant is suffix-typed when EITHER operand names a type:
+    // `1u64 << 40` is a u64 shift, and treating the whole expression as
+    // polymorphic would re-type it back to the default width.
+    if (node.kind == NodeKind::BinaryExpression) {
+        const b: BinaryExprNode* = expr as BinaryExprNode*;
+        return sema_expr_has_numeric_suffix(b.left)
+            || sema_expr_has_numeric_suffix(b.right);
+    }
+    return false;
+}
+
 
 // -- Numeric-shape predicates over AST nodes --
 
