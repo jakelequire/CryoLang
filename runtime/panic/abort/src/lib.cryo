@@ -46,6 +46,59 @@ function __cryo_panic(msg: string, file: string, line: u32) -> never {
     Sys::rt_exit(101);
 }
 
+// --- Unwind-surface stubs ---------------------------------------------------
+// Both panic tiers export the SAME symbol surface and differ only in behaviour;
+// that is what lets one archive be swapped for the other at link time. These
+// five exist in the unwind tier because unwinding needs them, and here because
+// the symbols are still REFERENCED under abort: the stdlib archive is built once
+// with the default strategy, so an `--panic=abort` program can be handed stdlib
+// objects that name a personality and the caught-panic accessors. Without these
+// the link fails on undefined symbols that no abort-strategy program could ever
+// actually call.
+//
+// Deliberately storage-free: no `![thread_local]`, because this tier is also
+// linked `-nostdlib` into freestanding programs, where a TLS reference would
+// drag in a C-runtime symbol (`_tls_index` on Windows) that such a link cannot
+// resolve.
+
+/// Under abort a panic never returns and never unwinds, so no `catch_unwind` can
+/// observe one and these are unreachable. They report "no panic taken" rather
+/// than inventing a payload.
+![no_mangle]
+function __cryo_panic_taken_message() -> string { return null; }
+
+![no_mangle]
+function __cryo_panic_taken_file() -> string { return null; }
+
+![no_mangle]
+function __cryo_panic_taken_line() -> u32 { return 0; }
+
+/// The unwind tier's root-catch tail. Unreachable here — the compiler only
+/// synthesizes the root-catch `main` wrapper that calls it under `--panic=unwind`
+/// — but terminate with the panic exit code rather than returning into a caller
+/// that assumed divergence.
+![no_mangle]
+function __cryo_panic_finish() -> never {
+    Sys::rt_exit(101);
+}
+
+/// The language personality, in each OS's calling convention: Linux is called
+/// with the Itanium 5-argument signature, Windows through `.xdata` with the
+/// 4-argument SEH one. Nothing in an abort build raises, so the only way to
+/// arrive here is a genuine hardware exception, and the correct answer for a
+/// tier with no handlers is "keep searching".
+![no_mangle] ![config(linux)]
+function __cryo_personality_v0(version: i32, actions: i32, exception_class: u64,
+                               exception_object: i64, context: i64) -> i32 {
+    return 8;   // _URC_CONTINUE_UNWIND
+}
+
+![no_mangle] ![config(windows)]
+function __cryo_personality_v0(ms_exc: i64, this_frame: i64,
+                               ms_orig_context: i64, ms_disp: i64) -> i32 {
+    return 1;   // ExceptionContinueSearch
+}
+
 // --- Check handlers ---------------------------------------------------------
 
 /// Index out of bounds: "index <index> out of bounds for length <len>".

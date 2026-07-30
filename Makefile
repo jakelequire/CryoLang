@@ -140,7 +140,7 @@ EXT_ID        := cryolang.cryo-analyzer
 EXT_VSIX      := $(EXT_DIR)/cryo-analyzer.vsix
 
 .DEFAULT_GOAL := help
-.PHONY: help stdlib cryo cryo-exe selfhost-check test test-list roster-check examples examples-golden valgrind-check verify-freestanding pin \
+.PHONY: help stdlib cryo cryo-exe selfhost-check test test-list roster-check examples examples-golden valgrind-check verify-freestanding runtime-tiers runtime-tiers-win pin \
         pin-linux-impl pin-windows-impl _pin-windows-do \
         install uninstall clean lsp install-lsp release release-linux release-windows
 
@@ -159,6 +159,8 @@ help:
 	@echo "  make test              Run the repo-level test suite (tests/) via cryo test"
 	@echo "  make test-list         List the discovered test cases without running them"
 	@echo "  make examples          Compile every examples/*/ project (CI smoke gate)"
+	@echo "  make runtime-tiers     Build the runtime tier archives (freestanding +"
+	@echo "                         hosted); every link needs the panic tier"
 	@echo "  make verify-freestanding  Build runtime/ tiers + run the freestanding"
 	@echo "                         acceptance check (entry, panic, alloc, backtrace)"
 	@echo "  make cryo-exe          Cross-build cryo.exe (x86_64-pc-windows-gnu)"
@@ -194,13 +196,16 @@ stdlib: $(PIN)
 endif
 
 # ---- self-hosted compiler via the pin ---------------------------------
+# Depends on `runtime-tiers` because linking ANY hosted binary - including this
+# compiler - needs the panic tier to resolve `__cryo_panic`.  Harmless before the
+# pin emits that call; required the moment it does.
 ifeq ($(HOST_OS),windows)
-cryo: stdlib
+cryo: stdlib runtime-tiers
 	@echo "==> Building self-hosted cryo via bin/cryo.exe"
 	@cd compiler && "$(subst /,\,$(PIN_EXE))" build
 	@echo "==> Self-hosted cryo built: $(STAGE2_EXE)"
 else
-cryo: stdlib
+cryo: stdlib runtime-tiers
 	@echo "==> Building self-hosted cryo via bin/cryo"
 	@cd compiler && "$(PIN)" build
 	@echo "==> Self-hosted cryo built: $(STAGE2)"
@@ -249,7 +254,9 @@ $(LIBCRYO_A):
 # Cross-compile the self-hosted compiler to cryo.exe (mingw-w64 + the
 # .toolchains/llvm-win import lib).  Requires the cross toolchain + the
 # fetched windows libLLVM-C; prints an actionable hint and fails if absent.
-cryo-exe: cryo
+# Depends on `runtime-tiers-win`: this is a CROSS link, so it needs the tiers
+# built for the windows triple to resolve `__cryo_panic`, not the host ones.
+cryo-exe: cryo runtime-tiers-win
 	@command -v $(MINGW_GCC) >/dev/null 2>&1 || { echo "ERROR: $(MINGW_GCC) not found (install gcc-mingw-w64-x86-64)."; exit 1; }
 	@test -f "$(WIN_LLVM_LIB)" || { echo "ERROR: windows libLLVM-C import lib missing at"; echo "       $(WIN_LLVM_LIB)"; echo "       Run: scripts/fetch-windows-llvm.sh"; exit 1; }
 	@test -f "$(WIN_CLANG_LIB)" || { echo "ERROR: windows libclang import lib missing at"; echo "       $(WIN_CLANG_LIB)"; echo "       Run: scripts/fetch-windows-llvm.sh"; exit 1; }
@@ -374,10 +381,14 @@ ifeq ($(HOST_OS),windows)
 # The wrapper checks for python + wsl.exe, then drives selfhost-check.py.
 # Same single-line shape as `pin` so it Just Works whether you invoked
 # `make` from cmd / PowerShell or from MSYS2 / Git Bash.
-selfhost-check:
+# `runtime-tiers` first: the check's stage-2 and stage-3 rounds are hosted links
+# that need libcryort-panic-abort-hosted.a to resolve `__cryo_panic`.  It wipes
+# stdlib/.bin and compiler/build but not runtime/.bin, so building the tiers up
+# front survives every round.
+selfhost-check: runtime-tiers
 	scripts\selfhost-check-windows.cmd
 else
-selfhost-check: $(PIN)
+selfhost-check: $(PIN) runtime-tiers
 	@python3 scripts/selfhost-check.py
 endif
 
@@ -434,7 +445,7 @@ ifeq ($(HOST_OS),windows)
 # and $(LIBCRYO_A) are file targets, so the compiler/stdlib are rebuilt only
 # when missing, matching the Linux semantics.
 STAGE2_EXE_WIN := $(subst /,\,$(STAGE2_EXE))
-test: $(STAGE2_EXE) $(LIBCRYO_A) $(TEST_HELPERS_A)
+test: $(STAGE2_EXE) $(LIBCRYO_A) $(TEST_HELPERS_A) runtime-tiers
 	@cd tests && "$(STAGE2_EXE_WIN)" test $(ARGS)
 
 test-list: $(STAGE2_EXE) $(LIBCRYO_A) $(TEST_HELPERS_A)
@@ -443,7 +454,7 @@ test-list: $(STAGE2_EXE) $(LIBCRYO_A) $(TEST_HELPERS_A)
 roster-check: $(STAGE2_EXE) $(LIBCRYO_A) $(TEST_HELPERS_A)
 	@python scripts/roster-check.py "$(STAGE2_EXE_WIN)" $(ARGS)
 else
-test: $(STAGE2) $(LIBCRYO_A) $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A)
+test: $(STAGE2) $(LIBCRYO_A) $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A) runtime-tiers
 	@cd tests && "$(STAGE2)" test $(ARGS)
 
 test-list: $(STAGE2) $(LIBCRYO_A) $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A)
@@ -508,6 +519,48 @@ else
 valgrind-check: $(STAGE2) $(LIBCRYO_A)
 	@CRYO="$(STAGE2)" CRYO_STDLIB="$(ROOT)/stdlib" bash scripts/valgrind-check.sh
 endif
+
+# ---- runtime tier archives --------------------------------------------
+# NOT optional, and not only for freestanding projects: codegen emits a call to
+# the external `__cryo_panic` for every panic, so a HOSTED link needs
+# libcryort-panic-abort-hosted.a on the line or it fails on an undefined symbol.
+# Built with the PIN, not the self-hosted compiler, and that is load bearing:
+# once the pin itself emits `__cryo_panic`, LINKING the self-hosted compiler
+# needs these archives, so making them depend on that compiler would be a
+# bootstrap cycle (tiers -> cryo -> tiers).  The pin is a known-good compiler
+# and the tier sources do not depend on any newer codegen.
+#
+# Two workspaces over the same sources: `runtime/` builds them freestanding,
+# `runtime/hosted/` rebuilds the abort tier with `no_runtime = false` so its
+# `__cryo_panic` exits through libc (flushing stdio) instead of a raw syscall.
+# Both write into runtime/.bin, so one directory holds every tier.
+ifeq ($(HOST_OS),windows)
+runtime-tiers:
+	@echo "==> Building runtime tiers via bin/cryo.exe"
+	@cd runtime && "$(subst /,\,$(PIN_EXE))" build
+	@cd runtime\hosted && "$(subst /,\,$(PIN_EXE))" build
+else
+runtime-tiers: $(PIN)
+	@echo "==> Building runtime tiers via bin/cryo"
+	@cd runtime && "$(PIN)" build
+	@cd runtime/hosted && "$(PIN)" build
+endif
+
+# The same tiers cross-built for the windows triple, for `cryo-exe`.  A project's
+# artifacts hoist to the root of its output_dir, so this OVERWRITES the host
+# archives in runtime/.bin rather than sitting beside them - which is safe only
+# because the two are never needed at once: `pin` finishes the whole host half
+# before `cryo-exe` runs, and the next host build re-establishes them through
+# `runtime-tiers`.  Skipped (not failed) without the cross toolchain, matching
+# how `pin-windows-impl` treats a Linux-only checkout.
+runtime-tiers-win: $(PIN)
+	@if command -v $(MINGW_GCC) >/dev/null 2>&1; then \
+		echo "==> Building runtime tiers for $(WIN_TRIPLE) via bin/cryo"; \
+		( cd runtime && "$(PIN)" build --target=$(WIN_TRIPLE) --no-incremental >/dev/null ); \
+		( cd runtime/hosted && "$(PIN)" build --target=$(WIN_TRIPLE) --no-incremental >/dev/null ); \
+	else \
+		echo "==> [skip] windows runtime tiers: $(MINGW_GCC) absent."; \
+	fi
 
 # ---- freestanding runtime gate ----------------------------------------
 # Build every `runtime/` tier and run its acceptance check on both supported
