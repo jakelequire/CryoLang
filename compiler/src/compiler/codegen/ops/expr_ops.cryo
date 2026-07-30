@@ -2238,6 +2238,22 @@ type struct ExprOps {
             return this.codegen_call(raw_fn, raw_ty, raw_args, label);
         }
 
+        // Freestanding: `-nostdlib` means there is no libc `malloc` to fall
+        // back to, and `no_std` means the stdlib allocator above never resolves
+        // either — so without this step every `new` in a freestanding program
+        // fails codegen with "'malloc' not declared".  Route to the allocator
+        // lang item, which the alloc tier supplies.
+        if (this.intrinsics != null && this.intrinsics.no_runtime) {
+            const rt_fn: LValue = this.intrinsics.get_or_decl_cryo_alloc();
+            if (rt_fn.is_valid()) {
+                const rt_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(rt_fn.raw) };
+                mut rt_args: Pair<LValue, TypeRef>[] = [];
+                rt_args.push(Pair<LValue, TypeRef>::new(size_val, TypeRef::invalid()));
+                rt_args.push(Pair<LValue, TypeRef>::new(align_val, TypeRef::invalid()));
+                return this.codegen_call(rt_fn, rt_ty, rt_args, label);
+            }
+        }
+
         const malloc_fn: LValue = this.resolver.resolve_function(this.intern_str("malloc"));
         if (!malloc_fn.is_valid()) {
             this.diag.emit_error_at_span(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL,
@@ -2262,6 +2278,28 @@ type struct ExprOps {
     /// direct libc `free` (`{ptr}`) when the stdlib is not linked. A null or
     /// invalid pointer is a silent no-op (nothing was allocated).
     emit_raw_dealloc(mut &this, ptr: LValue, align: u64, span: SourceSpan) -> void {
+        // Freestanding: pair with the `__cryo_alloc` the allocation went
+        // through, for the same reason there is no libc `free` here either.
+        // The lang item's `size` parameter is passed 0: a `delete` site does not
+        // carry the allocation size, and the tier recovers the exact mapping
+        // from its own header rather than the argument.
+        if (this.intrinsics != null && this.intrinsics.no_runtime && ptr.is_valid()) {
+            const rt_fn: LValue = this.intrinsics.get_or_decl_cryo_dealloc();
+            if (rt_fn.is_valid()) {
+                const rt_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(rt_fn.raw) };
+                const rt_ptr: LValue = this.builder.build_pointer_cast(
+                    ptr, LType::pointer_to(LType::i8()), "delcast");
+                mut rt_args: Pair<LValue, TypeRef>[] = [];
+                rt_args.push(Pair<LValue, TypeRef>::new(rt_ptr, TypeRef::invalid()));
+                rt_args.push(Pair<LValue, TypeRef>::new(
+                    LType::const_int(LType::i64(), 0, false), TypeRef::invalid()));
+                rt_args.push(Pair<LValue, TypeRef>::new(
+                    LType::const_int(LType::i64(), align, false), TypeRef::invalid()));
+                this.codegen_call(rt_fn, rt_ty, rt_args, "");
+                return;
+            }
+        }
+
         mut free_fn: LValue = this.resolver.resolve_function(
             this.intern_str("std::alloc::allocator::free"));
         const free_via_shim: boolean = free_fn.is_valid();

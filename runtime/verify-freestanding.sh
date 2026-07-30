@@ -212,6 +212,55 @@ function main() -> int {
 }
 APP
 
+# The driver's OWN link line. Every check above hand-links, which proves the
+# archives are correct but says nothing about whether the compiler can produce a
+# freestanding binary on its own -- it could not until the driver learned to
+# locate and order the tiers. This project is built by `cryo build` with no
+# linker arguments from us at all, so it exercises the locator, the archive
+# ORDER (panic tier last, since core/backtrace bounds checks reach it), and the
+# system libraries the tiers import. It exits with argc, and returns 70 if the
+# allocator tier failed, so one exit code covers entry + alloc + args.
+mkdir -p "$WORK/exeapp/src"
+cat > "$WORK/exeapp/cryoconfig" <<CFG
+[project]
+project_name = "rt-verify-exe"
+output_dir = ".bin"
+
+[[bin]]
+name = "rt-verify-exe"
+entry_point = "src/main.cryo"
+
+[compiler]
+no_std = true
+no_runtime = true
+CFG
+cat > "$WORK/exeapp/src/main.cryo" <<'APP'
+namespace RtVerifyExe;
+type struct Box { v: i64; }
+extern "C" {
+    function __cryo_argc() -> i64;
+    function __cryo_backtrace() -> void;
+    function __cryo_alloc(size: u64, align: u64) -> u8*;
+    function __cryo_dealloc(ptr: u8*, size: u64, align: u64) -> void;
+}
+function main() -> int {
+    __cryo_backtrace();
+    const p: u8* = __cryo_alloc(256, 16);
+    if (p == null) { return 70; }
+    p[0] = 9;
+    __cryo_dealloc(p, 256, 16);
+    // Language-level heap, which reaches the same lang item through codegen's
+    // allocation funnel rather than an explicit extern call. Freestanding, this
+    // is the path that used to fail outright: there is no libc `malloc` to fall
+    // back to, so every `new` was a codegen error until the funnel learned to
+    // route to __cryo_alloc.
+    mut b: Box* = new Box { v: 41 };
+    if (b.v != 41) { return 71; }
+    delete b;
+    return __cryo_argc() as int;
+}
+APP
+
 # --- Linux -----------------------------------------------------------------
 run_linux() {
     ( cd "$RT_DIR" && rm -rf .bin && "$CRYO" build >/dev/null )
@@ -278,6 +327,18 @@ run_linux() {
     if [ "$gg" -eq 4 ]; then echo "linux args ok: argc 4 + argv contents match"
     else echo "linux args FAIL: exit $gg (want 4; 90=argc 91-93=argv[n] 94=null)"; fail=1; fi
 
+    # driver-link: no linker arguments from us — `cryo build` alone.
+    set +e
+    ( cd "$WORK/exeapp" && rm -rf .bin && "$CRYO" build ) > "$WORK/drv-linux.log" 2>&1
+    "$WORK/exeapp/.bin/rt-verify-exe" one two; local dg=$?
+    set -e
+    if [ "$dg" -eq 3 ]; then echo "linux driver-link ok: cryo build produced a running freestanding exe"
+    else
+        echo "linux driver-link FAIL: exit $dg (want 3; 70=alloc)"
+        sed 's/^/    | /' "$WORK/drv-linux.log" | tail -15
+        fail=1
+    fi
+
     return $fail
 }
 
@@ -332,21 +393,20 @@ run_windows() {
     if [ "$ag" -eq 0 ]; then echo "windows alloc ok: VirtualAlloc/VirtualFree round-trip (wine)"
     else echo "windows alloc FAIL: exit $ag (0=ok; 1-6 = failure mode)"; fail=1; fi
 
-    # backtrace: best-effort on Windows. The tier must build, link, and run
-    # cleanly (header printed, exit 0); frame DEPTH is a known follow-up —
-    # Win64 uses table-based .pdata unwinding, so the rbp chain is absent even
-    # at O0. Delegating to RtlCaptureStackBackTrace is not the fix: from a
-    # freestanding image it runs away and exhausts the stack (the TEB is fine;
-    # the image just has no language exception handler, so a fault inside the
-    # unwinder cannot be dispatched). A depth of 0 is reported, not failed, and
-    # stays visible here until a bounded RtlVirtualUnwind walk replaces it.
+    # backtrace: same assertion as Linux — ">=3 frames" is what proves the walk
+    # actually unwinds rather than just printing a header. Windows gets there by
+    # a bounded .pdata/RtlVirtualUnwind walk, since Win64 omits the rbp chain
+    # the Linux walk follows. Delegating to RtlCaptureStackBackTrace is NOT an
+    # option here: from a freestanding image it runs away and exhausts the whole
+    # stack (the TEB is fine; the image carries no language exception handler,
+    # so a fault inside the unwinder cannot be dispatched).
     local bo; bo="$(build_app "$WORK/bt.cryo" --dev --target="$tgt" --no-incremental)"
     "$mingw" -nostartfiles -nostdlib -Wl,-e,_start -Wl,--gc-sections "$bo" "$bt_a" "$abort_a" "$core_a" \
         -lkernel32 -lntdll -o "$WORK/app.exe"
     set +e; local bmsg; bmsg="$(WINEDEBUG=-all wine "$WORK/app.exe" 2>&1 1>/dev/null)"; local bg=$?; set -e
     local bframes; bframes="$(printf '%s\n' "$bmsg" | grep -c '0x')"
-    if [ "$bg" -eq 0 ] && printf '%s' "$bmsg" | grep -q 'stack backtrace:'; then
-        echo "windows backtrace ok: ran clean, $bframes frames (depth is a Win64 follow-up)"
+    if [ "$bg" -eq 0 ] && printf '%s' "$bmsg" | grep -q 'stack backtrace:' && [ "$bframes" -ge 3 ]; then
+        echo "windows backtrace ok: $bframes frames"
     else echo "windows backtrace FAIL: exit $bg frames $bframes [$bmsg]"; fail=1; fi
 
     # args: parsed out of the PEB command line -- same assertion as Linux.
@@ -355,6 +415,25 @@ run_windows() {
     set +e; WINEDEBUG=-all wine "$WORK/app.exe" one "two words" three 2>/dev/null; local gg=$?; set -e
     if [ "$gg" -eq 4 ]; then echo "windows args ok: argc 4 + argv contents match (wine)"
     else echo "windows args FAIL: exit $gg (want 4; 90=argc 91-93=argv[n] 94=null)"; fail=1; fi
+
+    # driver-link: no linker arguments from us — `cryo build` alone.
+    #
+    # CRYO_CC is dropped for this one invocation. It is exported at the top of
+    # this script as the driver for the HAND-links, which are host-native; but
+    # it overrides the C driver for every target, so leaving it set would point
+    # a windows cross-link at host gcc and fail on `cannot find -lkernel32`.
+    # Choosing the per-target driver is part of what this check verifies, so it
+    # has to be the compiler's choice and not ours.
+    set +e
+    ( cd "$WORK/exeapp" && rm -rf .bin && env -u CRYO_CC "$CRYO" build --target="$tgt" --no-incremental ) > "$WORK/drv-win.log" 2>&1
+    WINEDEBUG=-all wine "$WORK/exeapp/.bin/rt-verify-exe.exe" one two 2>/dev/null; local dg=$?
+    set -e
+    if [ "$dg" -eq 3 ]; then echo "windows driver-link ok: cryo build produced a running freestanding exe (wine)"
+    else
+        echo "windows driver-link FAIL: exit $dg (want 3; 70=alloc)"
+        sed 's/^/    | /' "$WORK/drv-win.log" | tail -15
+        fail=1
+    fi
 
     return $fail
 }

@@ -1317,6 +1317,42 @@ type struct IntrinsicEmitter {
         return this.llvm_module.add_function("abort", fty);
     }
 
+    /// Declare the allocator lang item `__cryo_alloc(u64 size, u64 align) ->
+    /// void*` (see `runtime/abi/lang_items.def`).  Idempotent.
+    ///
+    /// The alloc tier defines this `![weak]`, so a program that wants its own
+    /// allocator supplies a strong definition and the linker prefers it — which
+    /// is the whole point of routing allocation through a named symbol instead
+    /// of open-coding a `malloc` call.
+    get_or_decl_cryo_alloc(mut &this) -> LValue {
+        mut fn: LValue = this.llvm_module.get_named_function("__cryo_alloc");
+        if (fn.is_valid()) { return fn; }
+        const param_buf: void* = intrinsics::malloc(16);
+        const slots: void** = param_buf as void**;
+        slots[0] = LType::i64().raw;
+        slots[1] = LType::i64().raw;
+        const fty: LType = LType::function_type(
+            LType::pointer_to(LType::i8()), param_buf, 2, false);
+        intrinsics::free(param_buf);
+        return this.llvm_module.add_function("__cryo_alloc", fty);
+    }
+
+    /// Declare the deallocator lang item
+    /// `__cryo_dealloc(void* ptr, u64 size, u64 align)`.  Idempotent.
+    get_or_decl_cryo_dealloc(mut &this) -> LValue {
+        mut fn: LValue = this.llvm_module.get_named_function("__cryo_dealloc");
+        if (fn.is_valid()) { return fn; }
+        const param_buf: void* = intrinsics::malloc(24);
+        const slots: void** = param_buf as void**;
+        slots[0] = LType::pointer_to(LType::i8()).raw;
+        slots[1] = LType::i64().raw;
+        slots[2] = LType::i64().raw;
+        const fty: LType = LType::function_type(LType::void_type(), param_buf,
+                                                3, false);
+        intrinsics::free(param_buf);
+        return this.llvm_module.add_function("__cryo_dealloc", fty);
+    }
+
     /// Emit the `@panic(msg, file, line)` runtime function into the current
     /// module if it hasn't been emitted yet.  Idempotent.  Backs the bare
     /// `intrinsics::panic` calls emitted by `std::prelude::panic` and the

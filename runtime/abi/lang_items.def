@@ -67,6 +67,22 @@ __main          | () -> void                                | core (freestanding
 __cryo_argc     | () -> i64                                 | core (freestanding) | DONE (dual-OS)
 __cryo_argv     | () -> i8**                                | core (freestanding) | DONE (dual-OS)
 
+# --- Link line -------------------------------------------------------------
+# The driver composes the tier archives itself; a freestanding program links by
+# `cryo build` alone, with no linker arguments from the user.
+# CodegenPasses::resolve_runtime_lib_dir locates them (CRYO_RUNTIME, then
+# CRYO_HOME, then relative to the compiler binary, then relative to the stdlib),
+# preferring a per-triple SUBDIRECTORY at every candidate -- a project's final
+# artifacts hoist to the root of its output_dir, so building the runtime for a
+# second target overwrites the first target's archives in place, and linking a
+# flat directory can hand the linker another architecture's objects.
+#
+# append_runtime_tier_libs fixes the ORDER: alloc, backtrace, core, then the
+# panic tier LAST, because ld resolves left to right and every other tier can
+# reach the panic handlers (core's and backtrace's own formatting helpers carry
+# bounds checks). The tiers' imported system libraries (kernel32/ntdll) follow
+# the archives for the same reason.
+
 # --- Panic funnel ----------------------------------------------------------
 # The single divergent sink: print "panicked at <file>:<line>: <msg>" to
 # stderr, then terminate (exit code 101). panic/abort/ DEFINES it, freestanding
@@ -96,13 +112,25 @@ __cryo_panic_div_zero     | (loc: SourceLoc*) -> never                       | p
 __cryo_panic_no_match     | (loc: SourceLoc*) -> never                       | panic/abort | DONE (runtime def + compiler emit, dual-OS)
 
 # --- Allocator (weak / user-overridable) -----------------------------------
-# The codegen funnel is in place (P8): every heap site routes through
-# ExprOps::emit_raw_alloc / emit_raw_dealloc (one resolver ladder:
-# arena / allocator::alloc / malloc) instead of an open-coded copy each. The
-# `__cryo_alloc`/`__cryo_dealloc` SYMBOLS land in Phase 3, when the funnel is
-# pointed at a weak, user-overridable definition.
-__cryo_alloc    | (size: u64, align: u64) -> void*          | alloc | DONE (runtime def, weak, dual-OS; compiler funnel repoint deferred)
-__cryo_dealloc  | (ptr: void*, size: u64, align: u64) -> void | alloc | DONE (runtime def, weak, dual-OS; compiler funnel repoint deferred)
+# Every heap site routes through ExprOps::emit_raw_alloc / emit_raw_dealloc
+# rather than an open-coded copy each. The resolver ladder is
+# arena / allocator::alloc / __cryo_alloc / malloc, and the lang-item step fires
+# under `no_runtime`.
+#
+# Freestanding that step is not an optimisation, it is the only option:
+# `-nostdlib` leaves no libc `malloc` and `no_std` leaves no stdlib allocator,
+# so before it existed EVERY `new` in a freestanding program failed codegen with
+# "'malloc' not declared" -- the language's own heap syntax was unusable.
+#
+# A hosted build keeps the malloc-backed ladder. Repointing it too would make
+# every hosted allocation an mmap/VirtualAlloc (this tier maps once PER
+# ALLOCATION), so a hosted repoint waits on a segment/free-list allocator behind
+# the same symbol.
+#
+# `size` is passed 0 at `delete` sites: the site does not carry the allocation
+# size, and the tier recovers the exact mapping from its own header instead.
+__cryo_alloc    | (size: u64, align: u64) -> void*          | alloc | DONE (runtime def weak dual-OS + compiler funnel, no_runtime)
+__cryo_dealloc  | (ptr: void*, size: u64, align: u64) -> void | alloc | DONE (runtime def weak dual-OS + compiler funnel, no_runtime)
 
 # --- Backtrace / diagnostics -----------------------------------------------
 # Print one hex return address per stack frame to stderr. Raw addresses only;

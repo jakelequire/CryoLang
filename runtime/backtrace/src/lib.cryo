@@ -5,27 +5,33 @@
 ///! addresses only; symbolization (address -> name via ELF/DWARF) is a
 ///! follow-up.
 ///!
-///! Walks the rbp frame-pointer chain on both OSes: `frame_address(0)` forces
-///! a frame pointer for this function, each x86-64 frame stores [saved rbp @0]
-///! [return addr @8], and both entries zero rbp in `_start`, so the chain
-///! terminates cleanly. Reliable while callers keep frame pointers (always at
-///! O0); a frame that omitted the pointer stops the walk via the monotonic-rbp
-///! guard rather than reading garbage.
+///! The walk is per-OS because the two ABIs record frames differently, and
+///! using one mechanism for both is what previously made Windows report zero
+///! frames:
 ///!
-///! KNOWN LIMITATION — Windows frame depth: Win64 codegen commonly omits the
-///! rbp chain (unwinding is `.pdata`/RUNTIME_FUNCTION table driven), so the
-///! walk captures zero frames on Windows even at O0. It still runs cleanly.
+///!   - Linux walks the rbp frame-pointer chain. `frame_address(0)` forces a
+///!     frame pointer for this function, each x86-64 frame stores
+///!     [saved rbp @0] [return addr @8], and `_start` zeroes rbp, so the chain
+///!     terminates cleanly. Reliable while callers keep frame pointers (always
+///!     at O0); a frame that omitted the pointer stops the walk via the
+///!     monotonic-rbp guard rather than reading garbage.
 ///!
-///! The obvious fix — ntdll's `RtlCaptureStackBackTrace` — does not work from a
-///! freestanding image as it stands. Called from a `-nostartfiles -nostdlib`
-///! PE it runs away and exhausts the entire 2 MB stack. The cause is NOT a
-///! missing or unpopulated TEB: the TEB is present with valid
-///! StackBase/StackLimit, and giving `_start` real `.seh_proc` unwind info does
-///! not change the outcome. The image carries no language exception handler, so
-///! a fault taken inside the unwinder cannot be dispatched and the walk never
-///! terminates. A Windows implementation must therefore bound the walk itself —
-///! an explicit `RtlVirtualUnwind` loop with stack-range checks — rather than
-///! delegate to `RtlCaptureStackBackTrace`.
+///!   - Windows unwinds the `.pdata`/RUNTIME_FUNCTION tables, because Win64
+///!     codegen omits the rbp chain — there is no chain to walk. Each step
+///!     looks the PC up with `RtlLookupFunctionEntry` and advances the CONTEXT
+///!     with `RtlVirtualUnwind`; a PC with no table entry is a leaf, whose
+///!     return address sits at [rsp].
+///!
+///! The Windows walk is bounded HERE rather than delegated to ntdll's
+///! `RtlCaptureStackBackTrace`, which cannot be used from a freestanding image:
+///! called from a `-nostartfiles -nostdlib` PE it runs away and exhausts the
+///! entire stack. The cause is not a missing TEB (it is present, with valid
+///! StackBase/StackLimit) and not missing unwind info on `_start` (adding
+///! `.seh_proc` changes nothing) — the image carries no language exception
+///! handler, so a fault taken inside the unwinder cannot be dispatched and the
+///! walk never terminates. Every step here is therefore range-checked against
+///! the TEB's own stack bounds and capped at a fixed depth, so a frame that
+///! cannot be unwound ends the walk instead of running off.
 ///!
 ///! Write + hex formatting come from the shared `CryoRt::Sys` module.
 
@@ -35,6 +41,7 @@ import CryoRt::Sys;
 
 /// llvm.frameaddress.p0: base pointer of the frame `level` steps up. Only
 /// `level 0` is used (constant, as LLVM requires); the chain is walked by hand.
+![config(linux)]
 intrinsic function frame_address(level: u32) -> u8*;
 
 /// Read the u64 stored at `addr`.
@@ -43,12 +50,18 @@ function load64(addr: u64) -> u64 {
     return p[0];
 }
 
-![no_mangle] ![config(no_runtime)]
+/// Deepest frame count any walk will report, so a corrupt or unwindable-forever
+/// stack still terminates.
+const MAX_FRAMES: i32 = 64;
+
+// --- Linux ------------------------------------------------------------------
+
+![no_mangle] ![config(no_runtime)] ![config(linux)]
 function __cryo_backtrace() -> void {
     Sys::write_cstr("stack backtrace:\n");
     mut fp: u64 = frame_address(0) as u64;
     mut depth: i32 = 0;
-    while (fp != 0 && depth < 64) {
+    while (fp != 0 && depth < MAX_FRAMES) {
         const ret: u64 = load64(fp + 8);       // return address in the caller
         if (ret == 0) { break; }
         Sys::write_cstr("  ");
@@ -57,6 +70,106 @@ function __cryo_backtrace() -> void {
         const next_fp: u64 = load64(fp);       // caller's saved rbp
         if (next_fp <= fp) { break; }
         fp = next_fp;
+        depth = depth + 1;
+    }
+}
+
+// --- Windows ----------------------------------------------------------------
+
+/// ntdll table-driven unwinding. `RtlCaptureContext` seeds a CONTEXT from the
+/// current registers; `RtlLookupFunctionEntry` finds the RUNTIME_FUNCTION
+/// covering a PC (null for a leaf); `RtlVirtualUnwind` steps the CONTEXT up one
+/// frame. Addresses are passed as raw `u64` because this tier never inspects
+/// the structures' interiors — only the CONTEXT slots named below.
+![config(windows)]
+extern "C" {
+    function RtlCaptureContext(ctx: u64) -> void;
+    function RtlLookupFunctionEntry(pc: u64, image_base: u64*, history: u64) -> u64;
+    function RtlVirtualUnwind(handler_type: u32, image_base: u64, pc: u64,
+                              entry: u64, ctx: u64, handler_data: u64*,
+                              establisher: u64*, ctx_pointers: u64) -> void;
+}
+
+/// CONTEXT field offsets (x86-64) and size. Verified against the SDK's own
+/// `offsetof` rather than transcribed: the record is 1232 bytes and must be
+/// 16-byte aligned, because `RtlCaptureContext` stores the XMM registers with
+/// aligned moves.
+const CTX_SIZE:  u64 = 1232;
+const CTX_RSP:   u64 = 0x98;
+const CTX_RIP:   u64 = 0xF8;
+
+/// Backing store for the CONTEXT. Static rather than heap-allocated: a
+/// backtrace is usually printed while panicking, and an allocation on that path
+/// could fail or re-enter. Over-sized by one 16-byte slot so the base can be
+/// aligned by hand, which keeps the alignment guarantee independent of how the
+/// compiler happens to align a global.
+![config(windows)]
+mut g_ctx: u64[156];
+
+/// Write `val` to the u64 at `addr`.
+![config(windows)]
+function store64(addr: u64, val: u64) -> void {
+    mut p: u64* = addr as u64*;
+    p[0] = val;
+}
+
+/// The TEB, addressed through `%gs` on x86-64. `NtTib.StackBase` (+0x08) and
+/// `NtTib.StackLimit` (+0x10) give the live thread's stack range, which bounds
+/// every unwind step below.
+![config(windows)]
+function current_teb() -> u64 {
+    mut teb: u64 = 0;
+    ![arch(x86_64, att)]
+    asm {
+        movq %gs:0x30, %rax
+        movq %rax, ${=teb:"rax"}
+    }
+    return teb;
+}
+
+![no_mangle] ![config(no_runtime)] ![config(windows)]
+function __cryo_backtrace() -> void {
+    const teb: u64 = current_teb();
+    if (teb == 0) {
+        Sys::write_cstr("stack backtrace:\n");
+        return;
+    }
+    const stack_hi: u64 = load64(teb + 0x08);
+    const stack_lo: u64 = load64(teb + 0x10);
+
+    const raw: u64 = &g_ctx[0] as u64;
+    const ctx: u64 = raw + ((16 - (raw % 16)) % 16);
+    RtlCaptureContext(ctx);
+
+    Sys::write_cstr("stack backtrace:\n");
+    mut depth: i32 = 0;
+    while (depth < MAX_FRAMES) {
+        const pc: u64 = load64(ctx + CTX_RIP);
+        if (pc == 0) { break; }
+        Sys::write_cstr("  ");
+        Sys::write_hex(pc);
+        Sys::write_cstr("\n");
+
+        mut image_base: u64 = 0;
+        const entry: u64 = RtlLookupFunctionEntry(pc, &image_base, 0);
+        const rsp: u64 = load64(ctx + CTX_RSP);
+        if (entry == 0) {
+            // No unwind entry: a leaf frame, whose return address is at [rsp].
+            if (rsp < stack_lo || rsp + 8 > stack_hi) { break; }
+            store64(ctx + CTX_RIP, load64(rsp));
+            store64(ctx + CTX_RSP, rsp + 8);
+        } else {
+            mut handler_data: u64 = 0;
+            mut establisher: u64 = 0;
+            RtlVirtualUnwind(0, image_base, pc, entry, ctx,
+                             &handler_data, &establisher, 0);
+        }
+
+        // Every step must leave rsp inside the thread's own stack; anything
+        // else means the frame could not be unwound and the walk ends here
+        // rather than following an unrelated address.
+        const next_rsp: u64 = load64(ctx + CTX_RSP);
+        if (next_rsp < stack_lo || next_rsp > stack_hi) { break; }
         depth = depth + 1;
     }
 }
