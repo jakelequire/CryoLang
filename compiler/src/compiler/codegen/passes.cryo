@@ -229,8 +229,42 @@ type struct CodegenPasses {
             true  => { "libcryort-panic-unwind-hosted.a" }
             false => { "libcryort-panic-abort-hosted.a" }
         };
-        return format("%s %s", cmd, CodegenPasses::link_quote(
+        mut out: string = format("%s %s", cmd, CodegenPasses::link_quote(
             format("%s/%s", lib_dir, archive)));
+        // Windows resolves the `_Unwind_*` ABI through LLVM's libunwind rather
+        // than libgcc_s, and the mingw clang driver links it SHARED whenever the
+        // toolchain ships `libunwind.dll.a` - which makes every binary we emit
+        // carry a runtime `libunwind.dll` import.  That is wrong twice over: a
+        // shipped `cryo.exe` would need a loose DLL beside it, and any stage of
+        // the self-host chain that runs a freshly linked compiler dies before
+        // main with STATUS_DLL_NOT_FOUND (c0000135) and an empty log.  Take the
+        // static `libunwind.a` instead: `--unwindlib=none` stops the driver
+        // adding its own shared one, and the `-Bstatic`/`-Bdynamic` bracket
+        // pins OUR `-lunwind` to the archive while leaving every other library
+        // (kernel32, ntdll, the CRT) dynamic.  `-lunwind` stays un-pathed so it
+        // resolves from the active toolchain's own lib dir.
+        //
+        // Scoped to windows on purpose: a hosted glibc link must NOT gain an
+        // explicit `-lunwind` (see this function's contract above) - such hosts
+        // ship `libunwind.so.8` with no `.so` dev symlink and the link fails.
+        //
+        // Scoped to a CLANG driver too, and that is not cosmetic: the default
+        // windows-gnu driver is `x86_64-w64-mingw32-gcc`, which resolves
+        // `_Unwind_*` from its own libgcc, ships no libunwind to link, and
+        // rejects `--unwindlib` outright ("unrecognized command line option").
+        // Adding these unconditionally turns a working mingw-gcc cross-link
+        // into a hard failure.  Resolved through `pick_link_driver` with the
+        // same default the windows link config uses, so this sees exactly the
+        // driver the command was built with - including a `CRYO_CC` override,
+        // which is how the self-host chain selects llvm-mingw's clang.
+        if (triple.contains("windows")) {
+            const driver: string =
+                CodegenPasses::pick_link_driver("x86_64-w64-mingw32-gcc");
+            if (driver.contains("clang")) {
+                out = format("%s --unwindlib=none -Wl,-Bstatic -lunwind -Wl,-Bdynamic", out);
+            }
+        }
+        return out;
     }
 
     /// A directory holds the runtime tiers when the base tier archive is in it.
