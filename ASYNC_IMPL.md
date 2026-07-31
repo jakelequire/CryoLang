@@ -5069,7 +5069,7 @@ wrong one.
 short-circuit against an hour-long sibling with a prompt-teardown assertion (the cancellation
 property), and an error arriving after the other side already succeeded.
 
-### Found on the way, NOT fixed — a pre-existing silent miscompile
+### Found on the way — a pre-existing silent miscompile (FIXED, see the entry below)
 
 A `match` **expression** used as the value of an enclosing match arm is miscompiled, and it has
 nothing to do with async or with this fix — it reproduces identically under the pin at `b298197b`:
@@ -5101,3 +5101,76 @@ carry the fix by compiling the new lang test with `bin/cryo.exe`.
 This needed the documented **2-phase repin**: `make cryo` builds the stdlib with the PIN, so
 `try_join` could not go in until the pin carried the inference fix. Phase 2 (stdlib + tests) then
 bootstrapped cleanly.
+
+## 2026-07-31 (later) — the nested-match miscompile found above is FIXED
+
+Not an async defect; recorded here because the previous entry opened it. Jake asked for it directly.
+
+### What was wrong
+
+A match-expression arm's braced body is a **value block**: codegen reads the arm's value out of
+`state.last_value` after emitting the body, i.e. from whatever its LAST statement left behind. That
+contract is already documented on `BlockStmtNode.synth_drops` ("the value statement, which stays last
+for codegen's arm-value extraction").
+
+`parse_expr_match_arm` parses that body with `parse_inner_block()`, and inside a block `match` parses
+in **statement** position. The statement lowering merges no value, so the outer phi took whatever the
+inner match's last arm happened to emit — for every input:
+
+```llvm
+match.end:  ; preds = %match.arm1, %match.arm0      <- no phi at all
+  br label %mexpr.end
+mexpr.end:
+  %mexpr.val = phi i64 [ 8, %match.end ], [ -1, %mexpr.arm1 ]   <- hardcoded 8
+```
+
+Constant arms compiled and returned the wrong number; arms reading a bound payload failed LLVM
+verification instead, because the incoming value was defined inside an inner ARM rather than the
+block the phi named.
+
+### The fix
+
+`ExprParser::promote_value_block_tail` re-forms such a tail as the `MatchExprNode` it is being used
+as, so it lowers with its own phi and the outer one legitimately reads it. `MatchStmtNode` and
+`MatchExprNode` carry identical components (`subject` / `arms` / `unwind_cleanup`), so this re-wraps
+rather than rebuilds — the arms move across by pointer and keep their identity, which later passes
+depend on.
+
+Two properties are load-bearing:
+
+- **Only the TAIL is promoted.** An earlier `match` in the same block really is a statement run for
+  effect; promoting those would change what the block does.
+- **It RECURSES into the promoted node's arms.** They were parsed in statement context, so their own
+  bodies were never treated as value blocks. Without the recursion, two levels worked and three did
+  not — caught by `tail_match_promotion_nests_three_deep`, not by reasoning. The recursion is
+  idempotent on an arm already parsed in expression context (its tail is an `ExpressionStatement` by
+  then and no longer matches).
+
+The parser is the complete fix site: the only other `MatchExprNode` constructors are `ASTCloner`, the
+`??` desugar and the `?` desugar, and all three build or copy arms that are already correct.
+
+### Scope, measured rather than assumed
+
+Unaffected, each checked directly: the **unbraced** arm form (`p => match (x) {…}`) always parsed as
+an expression; **`static match`** in tail position is fine because it reduces to a single live arm;
+`if`-expression branches parse via `parse_expression()`. A tail `if` in a braced arm body and a bare
+nested block are **parse errors** in Cryo, not miscompiles.
+
+**Nothing in the tree contained the shape.** Comparing the IR the PINNED (buggy) compiler emits
+against the fixed one: **0 of 153 stdlib modules and 0 of 238 compiler modules differ** — only the
+linked `cryo.exe` differs, which is the nondeterministic link artifact the gate deliberately ignores.
+So the fix moved no existing code; it makes a construct that previously miscompiled compile
+correctly.
+
+### Tests
+
+`tests/tests/lang/match_expr_tail_in_arm_body.cryo`, 8 tests. The file **fails to BUILD under the old
+pin** (E0900 from the payload case), which is its discrimination proof; the silent-value form was
+measured separately (`881` vs the correct `781`). Controls: a non-tail match must stay a statement, an
+arm whose tail match fully diverges must still be excluded from the phi, a mixed diverge/value tail,
+and the unbraced form that always worked.
+
+### Gates
+
+`make test` → **1966 unit / 0 failed, compile-fail 169, projects 13**. `make selfhost-check` → exit 0,
+**two** `FIXED POINT OK`. Repinned both halves and verified.

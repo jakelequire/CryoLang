@@ -1899,7 +1899,8 @@ public:
         // Block bodies are parsed via parse_inner_block(), which Parser
         // overrides to support full statements (for, if, while, etc.).
         if (this.check(TokenType::LBrace)) {
-            const block: BlockStmtNode* = this.parse_inner_block();
+            mut block: BlockStmtNode* = this.parse_inner_block();
+            this.promote_value_block_tail(block);
             arm.set_body(block);
         } else {
             const body_expr: ExpressionNode* = this.parse_expression();
@@ -1913,6 +1914,46 @@ public:
 
         arm.span = this.span_from(start);
         return arm;
+    }
+
+    /// A match-expression arm's braced body is a VALUE block: codegen takes the
+    /// arm's value from whatever its LAST statement left behind (the same
+    /// contract `BlockStmtNode.synth_drops` is built around).  Inside that
+    /// block, `match` parses in statement position, and the statement lowering
+    /// merges no value — so an arm whose tail is a `match` would silently adopt
+    /// whichever value that match's last arm happened to emit, regardless of
+    /// which arm actually ran.  Re-form such a tail as the expression it is
+    /// being used as, so it lowers with its own phi.
+    ///
+    /// Only the TAIL is rewritten. An earlier `match` in the same block really
+    /// is a statement, evaluated for effect, and must keep lowering as one.
+    /// The unbraced arm form (`p => match (x) { .. }`) already parses as an
+    /// expression and never reaches here.
+    promote_value_block_tail(block: BlockStmtNode*) -> void {
+        if (block == null || block.statements.length == 0) { return; }
+        const last: i64 = block.statements.length - 1;
+        const s: StatementNode* = block.statements[last];
+        if (s == null || s.kind != NodeKind::MatchStatement) { return; }
+        const ms: MatchStmtNode* = s as MatchStmtNode*;
+        // Both nodes carry the same components, so this re-wraps rather than
+        // rebuilding: the arms move across by pointer and keep their bindings,
+        // guards and bodies (and their identity, which later passes rely on).
+        mut me: MatchExprNode* = new MatchExprNode(ms.subject, ms.span);
+        for (mut i: i64 = 0; i < ms.arms.length; i++) {
+            const a: MatchArmNode* = ms.arms[i];
+            // These arms were parsed in STATEMENT context, so their own bodies
+            // were never treated as value blocks.  Promoting this node makes
+            // them value blocks, so their tails need the same treatment — which
+            // is what carries the promotion to arbitrary depth.  Idempotent on
+            // an arm already parsed in expression context: its tail is an
+            // ExpressionStatement by then and no longer matches.
+            if (a != null && a.body != null && a.body.kind == NodeKind::BlockStatement) {
+                this.promote_value_block_tail(a.body as BlockStmtNode*);
+            }
+            me.add_arm(a);
+        }
+        block.statements[last] =
+            new ExprStmtNode(me as ExpressionNode*, ms.span) as StatementNode*;
     }
 
 
