@@ -220,3 +220,75 @@ function async_generic_owner_through_a_pointer_is_not_double_addressed()
     const c: i64 = arr_block_on(gen_drive_ptr(&owned));
     return expect_eq(c, 33 as i64);
 }
+
+
+// A receiver held one level down, inside a combinator the awaited expression
+// built: the refresh has to walk into the constructed future and re-address the
+// child's receiver slot, which means knowing WHICH field of the combinator the
+// child was put in.  That answer is read off the constructing static's
+// declaration, and inside a generic impl the static's type arguments still
+// mention the owner's parameter -- so sema never records which template won and
+// the callee has to be re-found from how it is spelled.
+//
+// A combinator of this file's own rather than `Futures::timeout`: the real one
+// needs a reactor, and an `Executor`'s `block_on` polls from one reused frame,
+// which is the condition under which a stale receiver pointer still reads
+// correctly.  `arr_block_on` dirties the stack instead.  (`Futures::timeout` in
+// this exact position is covered by `future_combinator.cryo`.)
+
+/// `tally` sits ahead of `fut` in the declaration while `fut` is initialized
+/// first in the literal, and the child is argument 1 rather than argument 0 --
+/// so a refresh that matched on either position instead of on the parameter the
+/// child was passed as would address the wrong field.
+type struct GenBoxed<F, O> {
+    tally: i64;
+    fut:   F;
+}
+
+implement<F, O> trait Future<O> for struct GenBoxed<F, O>
+where F: Future<O> {
+    poll(mut &this, cx: Context*) -> Poll<O> {
+        match (this.fut.poll(cx)) {
+            Poll::Ready(v) => { return Poll::Ready(v); }
+            Poll::Pending  => { }
+        }
+        this.tally = this.tally + 1;
+        return Poll::Pending;
+    }
+}
+
+/// The same shape as `Futures::timeout`: a generic static handing its future
+/// parameter straight into a field of the struct it returns.
+type struct GenCombine {
+    static boxed<F, O>(pad: i64, fut: F) -> GenBoxed<F, O>
+    where F: Future<O> {
+        return GenBoxed<F, O> { fut: fut, tally: pad };
+    }
+}
+
+implement struct GenConn<S> {
+    /// `pump`'s receiver is this owner, so the combinator's `fut` field holds a
+    /// pointer that has to be re-addressed on every poll -- and the write `pump`
+    /// makes through `mut &this` only lands if it was.
+    async wrapped(mut &this, n: i64) -> i64 where S: GenTick {
+        const v: i64 = await GenCombine::boxed(0, this.pump(n));
+        this.seen = this.seen + 1000;
+        return v;
+    }
+}
+
+async function gen_drive_wrapped() -> i64 {
+    mut c: GenConn<GenLeaf> = GenConn<GenLeaf> {
+        inner: GenLeaf { hits: 0, buf: Array<u8>::new() }, seen: 0 };
+    const v: i64 = await c.wrapped(5);
+    return v + c.seen + c.inner.hits;
+}
+
+// `pump` returns 1 (hits) + 5 (n) + 10 (awaited) == 16 and stores it in `seen`;
+// `wrapped` then adds 1000 to `seen` through the same receiver.  16 + 1016 + 1.
+![test]
+function async_generic_owner_refreshes_through_a_combinator()
+        -> Result<(), TestError> {
+    const a: i64 = arr_block_on(gen_drive_wrapped());
+    return expect_eq(a, 1033 as i64);
+}

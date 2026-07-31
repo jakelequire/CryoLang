@@ -283,3 +283,115 @@ function timeout_reports_elapsed_for_a_slow_operation() -> Result<(), TestError>
     }
     return expect_true(ms < 10000, "timeout did not abandon the slow operation");
 }
+
+
+// A combinator awaited inside a GENERIC impl, wrapping one of the owner's own
+// `async` methods.  Two things have to hold at once here that do not inside a
+// concrete impl: the static's type arguments still mention the owner's `S` when
+// its body is walked, so nothing about the call is concrete yet; and the child
+// future carries a pointer to the owner, which the enclosing frame has to
+// re-address before every poll by walking into the combinator's own field.
+//
+// This is the shape `HttpServer` caps a request read with, one layer down --
+// `await Futures::timeout(d, this.read_request())` inside `BufStream<S>`.
+
+type trait GenStep {
+    async step(mut &this, n: i64) -> i64;
+}
+
+type struct GenSrc {
+    hits: i64;
+    buf:  Array<u8>;
+}
+
+implement trait GenStep for GenSrc {
+    async step(mut &this, n: i64) -> i64 {
+        await Sleep::new(Duration::from_millis(20));
+        this.hits = this.hits + 1;
+        return this.hits + n + 10;
+    }
+}
+
+/// Generic in its transport and owning it: every protocol layer in `net` has
+/// this shape.
+type struct GenLayer<S> {
+    inner: S;
+    seen:  i64;
+
+    async pump(mut &this, n: i64) -> i64 where S: GenStep {
+        const v: i64 = await this.inner.step(n);
+        this.seen = this.seen + v;
+        return v;
+    }
+
+    async capped(mut &this, n: i64) -> i64 where S: GenStep {
+        const r: Result<i64, Elapsed> =
+            await Futures::timeout(Duration::from_millis(3000), this.pump(n));
+        this.seen = this.seen + 1000;
+        return match (r) {
+            Result::Ok(v)  => { v }
+            Result::Err(_) => { -1 }
+        };
+    }
+
+    /// Never completes within any test's lifetime; the cap is what ends it.
+    async slow(mut &this, n: i64) -> i64 {
+        await Sleep::new(Duration::from_millis(3600000));
+        this.seen = this.seen + n;
+        return n;
+    }
+
+    /// The cap actually firing: the child outlives the deadline, so the arm that
+    /// abandons it runs -- with the abandoned child still holding a pointer to
+    /// this receiver.
+    async capped_expires(mut &this, n: i64) -> i64 {
+        const r: Result<i64, Elapsed> =
+            await Futures::timeout(Duration::from_millis(20), this.slow(n));
+        this.seen = this.seen + 1000;
+        return match (r) {
+            Result::Ok(_)  => { 1 }
+            Result::Err(e) => { e.deadline_nanos() > 0 ? -1 : -2 }
+        };
+    }
+}
+
+async function gen_layer_capped() -> i64 {
+    mut c: GenLayer<GenSrc> = GenLayer<GenSrc> {
+        inner: GenSrc { hits: 0, buf: Array<u8>::new() }, seen: 0 };
+    const v: i64 = await c.capped(5);
+    return v + c.seen + c.inner.hits;
+}
+
+async function gen_layer_expires() -> i64 {
+    mut c: GenLayer<GenSrc> = GenLayer<GenSrc> {
+        inner: GenSrc { hits: 0, buf: Array<u8>::new() }, seen: 0 };
+    const v: i64 = await c.capped_expires(5);
+    return v + c.seen;
+}
+
+// `pump` returns 1 (hits) + 5 (n) + 10 == 16 and writes it to `seen` through
+// `mut &this`; `capped` then adds 1000 to `seen` through the same receiver.
+// 16 + 1016 + 1 -- so a receiver refresh that never reached into the combinator
+// would lose one of those writes and land short.
+![test]
+function timeout_wraps_an_owner_method_inside_a_generic_impl()
+        -> Result<(), TestError> {
+    mut ex: Executor = Executor::new();
+    const r: i64 = ex.block_on(gen_layer_capped());
+    ex.drop();
+    return expect_eq(r, 1033 as i64);
+}
+
+![test]
+function timeout_inside_a_generic_impl_still_expires() -> Result<(), TestError> {
+    mut ex: Executor = Executor::new();
+    const t0: Instant = Instant::now();
+    const r: i64 = ex.block_on(gen_layer_expires());
+    const ms: u64 = t0.elapsed().as_millis();
+    ex.drop();
+    match (expect_eq(r, 999 as i64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_true(ms < 10000, "timeout did not abandon the slow operation");
+}

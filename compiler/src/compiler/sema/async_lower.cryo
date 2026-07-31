@@ -21,8 +21,8 @@
 /// funnels whose target-name qualification assumes a parser-bare target.
 namespace Compiler::Sema::AsyncLower;
 
-import Compiler::Types::{ TypeRef, Type, Arena, Compound, UserDefined, Ownership, Resolver, GenericRegistry };
-import Compiler::Resolver::{ SymbolStr, InternTable, QualifiedName, MangledName };
+import Compiler::Types::{ TypeRef, Type, Arena, Compound, UserDefined, Ownership, GenericRegistry };
+import Compiler::Resolver::{ SymbolStr, InternTable, QualifiedName, MangledName, Resolver };
 import Compiler::AST;
 import Compiler::AST::{ Node, Visitor, Expression, Statement, Declaration, Pattern, Cloner };
 import Compiler::Lex;
@@ -912,6 +912,19 @@ type struct AsyncLower {
             this.rewrite_returns_expr(t.false_expr, poll_out, span);
             return;
         }
+        // `if` used as an EXPRESSION is the ternary's block-bodied twin — same
+        // three sub-expressions, same obligations — so every walker here that
+        // descends into a ternary descends into this identically. It is spelled
+        // out at each site rather than normalized once because each walker's
+        // per-arm treatment differs (see the condition-depth guard in
+        // `subst_name_expr` and the await lift in `hoist_expr`).
+        if (k == NodeKind::IfExpression) {
+            const ife: IfExprNode* = e as IfExprNode*;
+            this.rewrite_returns_expr(ife.condition, poll_out, span);
+            this.rewrite_returns_expr(ife.then_expr, poll_out, span);
+            this.rewrite_returns_expr(ife.else_expr, poll_out, span);
+            return;
+        }
         if (k == NodeKind::StructLiteral) {
             const sl: StructLiteralNode* = e as StructLiteralNode*;
             for (mut i: i64 = 0; i < sl.field_inits.length; i++) {
@@ -964,6 +977,12 @@ type struct AsyncLower {
             return this.expr_await_count(t.condition)
                  + this.expr_await_count(t.true_expr)
                  + this.expr_await_count(t.false_expr);
+        }
+        if (k == NodeKind::IfExpression) {
+            const ife: IfExprNode* = e as IfExprNode*;
+            return this.expr_await_count(ife.condition)
+                 + this.expr_await_count(ife.then_expr)
+                 + this.expr_await_count(ife.else_expr);
         }
         if (k == NodeKind::CastExpression) {
             return this.expr_await_count((e as CastExprNode*).expression);
@@ -1377,6 +1396,12 @@ type struct AsyncLower {
                 || this.name_read_in_expr(t.true_expr, name)
                 || this.name_read_in_expr(t.false_expr, name);
         }
+        if (k == NodeKind::IfExpression) {
+            const ife: IfExprNode* = e as IfExprNode*;
+            return this.name_read_in_expr(ife.condition, name)
+                || this.name_read_in_expr(ife.then_expr, name)
+                || this.name_read_in_expr(ife.else_expr, name);
+        }
         if (k == NodeKind::StructLiteral) {
             const sl: StructLiteralNode* = e as StructLiteralNode*;
             for (mut i: i64 = 0; i < sl.field_inits.length; i++) {
@@ -1694,6 +1719,15 @@ type struct AsyncLower {
             this.subst_cond_depth = this.subst_cond_depth + 1;
             t.true_expr  = this.subst_name_expr(t.true_expr, name, field, struct_ref, ty, span, by_value);
             t.false_expr = this.subst_name_expr(t.false_expr, name, field, struct_ref, ty, span, by_value);
+            this.subst_cond_depth = this.subst_cond_depth - 1;
+            return e;
+        }
+        if (k == NodeKind::IfExpression) {
+            const ife: IfExprNode* = e as IfExprNode*;
+            ife.condition = this.subst_name_expr(ife.condition, name, field, struct_ref, ty, span, false);
+            this.subst_cond_depth = this.subst_cond_depth + 1;
+            ife.then_expr = this.subst_name_expr(ife.then_expr, name, field, struct_ref, ty, span, by_value);
+            ife.else_expr = this.subst_name_expr(ife.else_expr, name, field, struct_ref, ty, span, by_value);
             this.subst_cond_depth = this.subst_cond_depth - 1;
             return e;
         }
@@ -2273,6 +2307,54 @@ type struct AsyncLower {
         return false;
     }
 
+    /// The template `c`'s callee names, or null when none can be identified.
+    ///
+    /// Sema pins the winning template on the call node (`resolved_template`)
+    /// because only sema has the caller's import scope, and reading that pin is
+    /// the answer whenever it exists. It does not always exist: a generic static
+    /// called with a type argument that is still abstract — a combinator awaited
+    /// inside `implement struct BufStream<S>`, whose child future's type mentions
+    /// `S` — makes `try_resolve_static_method_template` bail before it pins
+    /// anything, so the pin stays empty for exactly the generic contexts this
+    /// pass has to serve.
+    ///
+    /// The fallback re-runs that lookup from the callee's own `Scope::member`
+    /// spelling, probing in the same order sema does (import-scoped, bare, then
+    /// the resolver's cross-module qualification) so a same-leaf collision lands
+    /// on the same declaration sema would have chosen. It only decides WHICH
+    /// declaration is read; the shape the caller demands of that declaration is
+    /// unchanged, so a wrong guess still cannot become a silent wrong-address
+    /// store.
+    callee_template(&this, c: CallExprNode*) -> TemplateEntry* {
+        if (this.ctx.generic_registry == null) { return null; }
+        if (c.resolved_template.is_valid()) {
+            return this.ctx.generic_registry.get_template(c.resolved_template);
+        }
+        if (c.callee == null || (c.callee as ASTNode*).kind != NodeKind::ScopeResolution) {
+            return null;
+        }
+        const sr: ScopeResolutionNode* = c.callee as ScopeResolutionNode*;
+        if (!sr.scope_name.is_valid() || !sr.member_name.is_valid()) { return null; }
+        const member: string = this.intern.resolve(sr.member_name);
+
+        const scoped: SymbolStr = this.ctx.resolve_scoped_or(sr.scope_name);
+        if (scoped.is_valid()) {
+            mut te: TemplateEntry* = this.ctx.generic_registry.get_template(
+                this.intern.intern(this.intern.resolve(scoped) + "::" + member));
+            if (te != null) { return te; }
+        }
+        mut bare: TemplateEntry* = this.ctx.generic_registry.get_template(
+            this.intern.intern(this.intern.resolve(sr.scope_name) + "::" + member));
+        if (bare != null) { return bare; }
+
+        const resolver: Resolver* = this.ctx.get_resolver();
+        if (resolver == null) { return null; }
+        const cross: SymbolStr = resolver.resolve_type_qualified_name(sr.scope_name);
+        if (!cross.is_valid() || cross.equals(sr.scope_name)) { return null; }
+        return this.ctx.generic_registry.get_template(
+            this.intern.intern(this.intern.resolve(cross) + "::" + member));
+    }
+
     /// The field of the struct returned by `c`'s callee that receives that
     /// callee's parameter number `argi`, or an invalid symbol when it cannot be
     /// established.
@@ -2296,12 +2378,7 @@ type struct AsyncLower {
     /// than guessing — guessing here is a silent wrong-address store.
     ctor_field_for_param(&this, c: CallExprNode*, argi: i64) -> SymbolStr {
         if (this.ctx.generic_registry == null) { return SymbolStr::empty(); }
-        // Sema leaves `resolved_template` unset for a generic static called
-        // from a body walked symbolically, so the constructor cannot be
-        // reached from inside a generic impl. That is reported rather than
-        // guessed at -- an unprovable field position is a wrong-address store.
-        if (!c.resolved_template.is_valid()) { return SymbolStr::empty(); }
-        const te: TemplateEntry* = this.ctx.generic_registry.get_template(c.resolved_template);
+        const te: TemplateEntry* = this.callee_template(c);
         if (te == null || te.node_kind != NodeKind::FunctionDeclaration) {
             return SymbolStr::empty();
         }
@@ -3501,6 +3578,12 @@ type struct AsyncLower {
                 || this.expr_has_free_edge(t.true_expr, break_only)
                 || this.expr_has_free_edge(t.false_expr, break_only);
         }
+        if (k == NodeKind::IfExpression) {
+            const ife: IfExprNode* = e as IfExprNode*;
+            return this.expr_has_free_edge(ife.condition, break_only)
+                || this.expr_has_free_edge(ife.then_expr, break_only)
+                || this.expr_has_free_edge(ife.else_expr, break_only);
+        }
         if (k == NodeKind::StructLiteral) {
             const sl: StructLiteralNode* = e as StructLiteralNode*;
             for (mut i: i64 = 0; i < sl.field_inits.length; i++) {
@@ -3936,6 +4019,13 @@ type struct AsyncLower {
             this.mark_last_use_expr(t.condition, name, false, out);
             this.mark_last_use_expr(t.true_expr, name, by_value, out);
             this.mark_last_use_expr(t.false_expr, name, by_value, out);
+            return;
+        }
+        if (k == NodeKind::IfExpression) {
+            const ife: IfExprNode* = e as IfExprNode*;
+            this.mark_last_use_expr(ife.condition, name, false, out);
+            this.mark_last_use_expr(ife.then_expr, name, by_value, out);
+            this.mark_last_use_expr(ife.else_expr, name, by_value, out);
             return;
         }
         if (k == NodeKind::StructLiteral) {
@@ -4618,6 +4708,14 @@ type struct AsyncLower {
             if (c2.is_valid()) { return c2; }
             return this.frame_addr_root_expr(sm, t.false_expr);
         }
+        if (k == NodeKind::IfExpression) {
+            const ife: IfExprNode* = e as IfExprNode*;
+            const i1: SymbolStr = this.frame_addr_root_expr(sm, ife.condition);
+            if (i1.is_valid()) { return i1; }
+            const i2: SymbolStr = this.frame_addr_root_expr(sm, ife.then_expr);
+            if (i2.is_valid()) { return i2; }
+            return this.frame_addr_root_expr(sm, ife.else_expr);
+        }
         if (k == NodeKind::StructLiteral) {
             const sl: StructLiteralNode* = e as StructLiteralNode*;
             for (mut i: i64 = 0; i < sl.field_inits.length; i++) {
@@ -5226,9 +5324,19 @@ type struct AsyncLower {
             // condition, so its `await` cannot be lifted above the test.
             if (this.expr_await_count(t.true_expr) > 0 ||
                 this.expr_await_count(t.false_expr) > 0) {
-                return this.hoist_ternary(t, pre);
+                return this.hoist_branch_expr(e, t.condition, t.true_expr, t.false_expr, pre);
             }
             t.condition = this.hoist_expr(t.condition, pre);
+            return e;
+        }
+
+        if (k == NodeKind::IfExpression) {
+            mut ife: IfExprNode* = e as IfExprNode*;
+            if (this.expr_await_count(ife.then_expr) > 0 ||
+                this.expr_await_count(ife.else_expr) > 0) {
+                return this.hoist_branch_expr(e, ife.condition, ife.then_expr, ife.else_expr, pre);
+            }
+            ife.condition = this.hoist_expr(ife.condition, pre);
             return e;
         }
 
@@ -5367,7 +5475,8 @@ type struct AsyncLower {
         return this.ident(t, bool_ty, span);
     }
 
-    /// `C ? A : B` where an arm awaits, as the branch it already means:
+    /// `C ? A : B` — and `if (C) { A } else { B }`, which means the same thing —
+    /// where an arm awaits, as the branch it already means:
     ///
     ///     mut $tv: T;  if (C) { … $tv = A; } else { … $tv = B; }
     ///
@@ -5375,16 +5484,18 @@ type struct AsyncLower {
     /// assign it, so it is always initialized before its use, and giving it a
     /// placeholder value would mean synthesizing one for a type that may own a
     /// resource.
-    hoist_ternary(mut &this, t: TernaryExprNode*, pre: HoistPre*) -> ExpressionNode* {
-        const span: SourceSpan = (t as ASTNode*).span;
-        const vty: TypeRef = (t as ExpressionNode*).resolved_type;
-        if (!vty.is_valid()) { return t as ExpressionNode*; }
-        mut cond: ExpressionNode* = this.hoist_expr(t.condition, pre);
+    hoist_branch_expr(mut &this, e: ExpressionNode*, cond_in: ExpressionNode*,
+                      then_in: ExpressionNode*, else_in: ExpressionNode*,
+                      pre: HoistPre*) -> ExpressionNode* {
+        const span: SourceSpan = (e as ASTNode*).span;
+        const vty: TypeRef = e.resolved_type;
+        if (!vty.is_valid()) { return e; }
+        mut cond: ExpressionNode* = this.hoist_expr(cond_in, pre);
         const tv: SymbolStr = this.mint_temp("__tv");
         pre.push(this.var_decl_stmt(tv, true, vty, null, span));
 
-        mut then_blk: BlockStmtNode* = this.hoist_arm_block(t.true_expr, tv, vty, span);
-        mut else_blk: BlockStmtNode* = this.hoist_arm_block(t.false_expr, tv, vty, span);
+        mut then_blk: BlockStmtNode* = this.hoist_arm_block(then_in, tv, vty, span);
+        mut else_blk: BlockStmtNode* = this.hoist_arm_block(else_in, tv, vty, span);
         pre.push(new IfStmtNode(cond, then_blk as StatementNode*,
                                 else_blk as StatementNode*, span) as StatementNode*);
         return this.ident(tv, vty, span);

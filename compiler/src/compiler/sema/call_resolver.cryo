@@ -1215,11 +1215,25 @@ type struct CallResolver {
 
     /// Whether a call argument's `resolved_type` is authoritative enough pre-mono
     /// to drive an inference conflict / bound error.
+    ///
+    /// Inside a template body an abstract call type is not provisional - it IS
+    /// this walk's answer, and nothing before mono sharpens it. `this.pump(n)`
+    /// in `implement struct PConn<S>` is `PConn$pump$Future<S>`, and refusing it
+    /// left the ENCLOSING call's parameters unbound, so
+    /// `Futures::timeout(d, this.pump(n))` resolved to nothing at all inside a
+    /// generic impl. Outside a symbolic walk the old rule stands: a generic
+    /// param in a concrete body's call type means inference has not finished.
+    ///
+    /// This only decides whether the argument may BIND. Both callers gate their
+    /// conflict report on `free_infer_type_concrete` for each side separately,
+    /// so admitting an abstract type here cannot turn into a spurious E0214.
     free_infer_arg_reliable(&this, arg: ExpressionNode*) -> boolean {
         if (arg == null) { return false; }
         const node: ASTNode* = arg as ASTNode*;
         if (node.kind == NodeKind::CallExpression) {
-            return arg.resolved_type.is_valid() && !this.types.contains_generic_param(arg.resolved_type);
+            if (!arg.resolved_type.is_valid()) { return false; }
+            if (this.state.in_symbolic_check) { return true; }
+            return !this.types.contains_generic_param(arg.resolved_type);
         }
         return true;
     }
@@ -3598,10 +3612,19 @@ type struct CallResolver {
             binds = this.infer_free_call_bindings(call, entry, tmpl);
             if (binds.length != entry.param_type_ids.length) { return TypeRef::invalid(); }
         }
+        // Every arg must BIND; it need not yet be CONCRETE.  Called from inside a
+        // generic body the args carry the enclosing template's parameters
+        // (`Futures::timeout(d, this.read())` in `implement struct BufStream<S>`
+        // binds `F` to a future type mentioning `S`), and demanding concreteness
+        // here abandoned the call: the return type then fell through to the
+        // owner-only static paths, which answer with the template's own abstract
+        // return and report it as `void`.  Mono is built for the symbolic case -
+        // `specialize_free_call` runs every stashed arg through
+        // `concretize_stashed_arg` with the active specialization, a no-op on an
+        // already-concrete stash - and this mirrors the free-function path, which
+        // has always resolved with abstract bindings.
         for (mut i: i64 = 0; i < binds.length; i++) {
-            if (!binds[i].is_valid() || this.types.contains_generic_param(binds[i])) {
-                return TypeRef::invalid();
-            }
+            if (!binds[i].is_valid()) { return TypeRef::invalid(); }
         }
 
         // E0306 - where-clause bound satisfaction for the bound method args, so an
