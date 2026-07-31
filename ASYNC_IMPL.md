@@ -37,7 +37,7 @@ not for routine judgement calls.
 | 1 | Core types in stdlib (`Poll`/`Future`/`Context`/`Waker`) + `block_on` + hand-written futures | ✅ done+validated 2026-07-22 (no repin) |
 | 2 | Compiler: `async fn` parse + state-machine lowering + `await` desugar | ✅ DONE+validated. **Address stability COMPLETE 2026-07-29 — the in-place carrier is UNIVERSAL and `carrier_can_live_in_place` is DELETED.** Every carried aggregate is BUILT INTO its `Option<T>` field and stays there for the life of the future; the moving carrier is gone, not bypassed. The two shapes that used to force it — a state that GIVES the value away, one that REBUILDS it — are now expressible because `subst_name_expr`/`subst_name_stmt` carry a **`by_value` position flag**: a mention that reaches into the value becomes `*<nm>$p`, one that hands it over becomes `take().unwrap()`, one that rebuilds it republishes the field. A by-value argument is classified from `arg_binding`, and an `Unclassified` slot reads as a BORROW (the opposite default from the move passes — over-reporting strands the next `unwrap_ptr` on a `None`, under-reporting is a loud `E0453`). Needed three non-async root-cause fixes: synthesized `Option::Some`/`Poll::Ready` payloads were `Unclassified`; trait `MethodInfo.param_types` wrongly included the receiver, breaking its documented non-self contract; and argument classification never reached a bare generic param bounded by a `where` clause. `make test` **1903 / 165 / 14, 0 failed**. **FINDING — the frame-address subsystem and `emit_recv_refresh` are NOT dead and were NOT deleted:** residency applies only to values that are actually CARRIED, and both `E0455_async_*` negatives address a local that is never read after the suspend, so it is not carried and still dies with the poll frame. Inverting them would accept unsound code. The payoff is already collected anyway — `addr_place_root` stops at the first indirection, so `&c.canary` on a carried local becomes `&(*c$p).canary` and is allowed (proven: `got=99 drops=1`), now pinned by a test. **OPEN (Jake's call):** use-after-give-away *within one state* no longer reports `E0452`, because the take and the later borrow are unrelated expressions to MoveCheck; see the newest §9 entry for the two candidate fixes. Earlier (2026-07-28): the acceptance probe reads `55` (it reads `0` under the old pin) and is `lang/async_carried_local_address_stable.cryo`; two `E0455` negatives were INVERTED into positive tests. Drop TIMING is restored explicitly by `release_before_ready` — deferring a carried socket's close to future-drop deadlocked a real test. The design IS settled and does **not** need flag-gated drops — keep the `Option<T>` field and reach the payload in place via `unwrap_ptr`. **Its blocker is now REMOVED (2026-07-28, later).** In-place residency turns a missed give-away from a loud `unwrap`-on-`None` into a **silent double free**, so it needed a rejection of by-value moves out of `*p`, which in turn needed sound argument classification. Both landed: arguments are now classified from real **parameter types** (`ArgBinding`, set in sema, consumed in lockstep by all four argument loops), `!autoref` is gone as a by-value proxy, and `check_deref_move_out` is in the tree and does **not** misfire on the lowering's own `*this$recv`. `unsafe` became the escape hatch and `core::mem::take_ptr` was **deleted** (Jake's call — it was byte-identical to `*p` and existed only to be invisible to the checker). Two pre-existing defects fixed on the way: `unsafe { }` silently disabled move checking wholesale, and a generic call reachable only from inside an `unsafe` block was never specialized. See the newest §9 entry. Earlier: **Two carried-aggregate soundness bugs fixed 2026-07-27** — (1) `await <method>` on an owning local inside a LOOP left its carrier empty (`unwrap` on `None`): the pass asked "did this state give the value away?" AFTER inserting its own by-value hand-back store, and mistook that store for the answer; (2) an `async fn` with NO awaits COPIED an owning parameter out of its field instead of moving it, double-freeing it. Both fixed at the root in `async_lower.cryo`; the `Join` diagnosis recorded under `TcpConn` was wrong and is corrected. New permanent coverage: `async_stress_shapes.cryo` (31 tests, asserted numbers + counted drops, every shape paired with a control) and the flood test. See the newest §9 entry. Earlier: DONE+validated; **the deferred aggregate-across-await tail LANDED 2026-07-24 — an `async function` can now hold an aggregate across a suspend, take a droppable aggregate parameter, and be `spawn`ed on an `Executor`** (see the newest §9 entry). Earlier: DONE (2026-07-23) — parse + no-await (1b) + single await (2) + N straight-line (3) + awaits across `if`/`else` (4a) + awaits across `while`/`for`/`loop`/`do-while` + `break`/`continue` + `mut` loop-carried promotion (4b) + scope-aware alpha-rename, all committed through `5e28a74f`. **Inc 4c DONE (2026-07-23): `await` inside a `match` arm — dispatch `match(subj)` → per-arm entry states → join; scalar pattern bindings captured to fields (aggregate→E0600, ref→E0455); pattern bindings alpha-renamed for by-name soundness; non-exhaustive match gets synth `_ => join`. Plus the bare-block-with-await warm-up. Both-OS fixed point, `win-s2`/`win-s3` = 0/235 `.ll` → NO REPIN, UNCOMMITTED.** All common control flow now lowers → Phase 2 complete. |
 | 3 | Executor + `Waker` + `spawn`/`JoinHandle`; multi-thread; poll-boundary `catch_unwind` isolation | ✅ DONE+validated (2026-07-24) — surface LOCKED 2026-07-23. **(a)** single-thread executor + ready-queue + re-enqueueing Waker; **(b)** `spawn`/`JoinHandle` (Output via `TaskShared<O>`), `block_on`, `join`/`detach`/`abort`, drop=detach; **(c)** pthread worker pool + per-task atomic run-state (IDLE/SCHEDULED/RUNNING/NOTIFIED) + condvar `join`/`block_on` + `catch_unwind` poll-boundary isolation. Needed a NEW compiler `![config(panic_unwind)]` gating atom (see §9) → Phase-1 both-OS REPIN (selfhost fixed point, 235 `.ll`). Executor is self-contained (own pthread wrappers, no `thread::Scope` dep). Validated on Linux: regression 30/30, isolation 30/30. UNCOMMITTED. |
-| 4 | Reactor (epoll/IOCP) + async I/O over `std::net` + timers + `async fn main` + combinators | ◐ in progress 2026-07-24. **Inc 4b DONE on Linux (reactor + async TCP, stress+leak clean); Windows AFD backend written but UNVALIDATED (wine 9.0 cannot service `IOCTL_AFD_POLL` — needs a real Windows box).** Interface fork LOCKED by Jake: **one readiness interface both OSes, Windows via real AFD** (not WSAPoll, not a per-OS split). Sockets are to become **async-only with every consumer ported** (Jake, 2026-07-24) — that port is **UNBLOCKED as of 2026-07-24**: the aggregate-across-await tail landed, and the follow-on "rebuilt from inside a branch" E0600 is now removed too (newest §9 entry). Forks LOCKED earlier: waker lifetime = **separate `Arc`-wrapper**; reactor = **dedicated thread, per-`Executor`** (`![thread_local]` current-reactor handle); platform = **both OSes (epoll + IOCP)**. **Inc 4a DONE+validated (2026-07-24): Arc-refcounted `Waker` (Copy→non-Copy) + `Arc<Task>` lifetime; finish-vs-park now implicit via `Task::drop` on the last decref. Needed a COMPILER fix (owner-generic static with a defaulted owner param + nested return → E0636; `call_resolver.cryo` default-backfill) → selfhost fixed point BOTH OS, win-s2 vs win-s3 = 0/235 `.ll`, REPINNED both OS. UNCOMMITTED.** NEXT = Inc 4b (the reactor: epoll+IOCP interface — bring Jake the readiness-vs-completion unification fork). |
+| 4 | Reactor (epoll/IOCP) + async I/O over `std::net` + timers + `async fn main` + combinators | ◐ in progress — every named sub-part (4x/5x/6) is ✅; what remains is DNS blocking the executor and the unported UDP surface (see the root `HANDOFF.md` §2 items 5 and 6). **The Windows AFD reactor is VALIDATED (2026-07-25, 30/30 runs, 0 failures, 0 hangs, real Windows host) — do NOT re-validate it. The earlier "written but UNVALIDATED" reading was a wine 9.0 limitation (`IOCTL_AFD_POLL` unserviceable), never a code defect. Inc 4b DONE on both OSes.** Interface fork LOCKED by Jake: **one readiness interface both OSes, Windows via real AFD** (not WSAPoll, not a per-OS split). Sockets are to become **async-only with every consumer ported** (Jake, 2026-07-24) — that port is **UNBLOCKED as of 2026-07-24**: the aggregate-across-await tail landed, and the follow-on "rebuilt from inside a branch" E0600 is now removed too (newest §9 entry). Forks LOCKED earlier: waker lifetime = **separate `Arc`-wrapper**; reactor = **dedicated thread, per-`Executor`** (`![thread_local]` current-reactor handle); platform = **both OSes (epoll + IOCP)**. **Inc 4a DONE+validated (2026-07-24): Arc-refcounted `Waker` (Copy→non-Copy) + `Arc<Task>` lifetime; finish-vs-park now implicit via `Task::drop` on the last decref. Needed a COMPILER fix (owner-generic static with a defaulted owner param + nested return → E0636; `call_resolver.cryo` default-backfill) → selfhost fixed point BOTH OS, win-s2 vs win-s3 = 0/235 `.ll`, REPINNED both OS. UNCOMMITTED.** NEXT = Inc 4b (the reactor: epoll+IOCP interface — bring Jake the readiness-vs-completion unification fork). |
 
 | 4d | Timers — reactor deadline chain + `Sleep` | ✅ DONE+validated 2026-07-26. Deadline-sorted chain on `Reactor` (`register_timer`/`cancel_timer`), reactor thread bounds its wait by the earliest deadline instead of `-1`, fires expired wakers after the wait, kicks on a new-earliest arming. `stdlib/future/timer.cryo`: `Sleep::new(dur)` / `Sleep::until(instant)`, absolute deadlines, saturating construction, `Drop` disarms. Self-wakes under a reactor-less driver so `future::block_on` still completes it. Also fixed a real teardown UAF: `Executor::drop` freed the `Reactor` before `drain_cancelled()`, so a task woken by readiness but not yet driven dereferenced freed memory in its future's `drop` — split into `Reactor::stop` / `Reactor::free`. 10 tests. |
 | 4f | Combinators — `join` / `select` / `timeout` | ✅ DONE+validated 2026-07-26. `stdlib/future/combinator.cryo`; built through the `Futures` namespace (`Futures::join`/`select`/`timeout`/`timeout_at`). Cancellation is a plain drop — the `Select` loser and the `Timeout` victim are released with the combinator, which is what disarms a `Sleep` and releases an I/O registration. Arity 2, higher arities nest (tested). 9 tests. **`try_join` SHIPPED 2026-07-31** — the inference gap that blocked it is FIXED at the root, so the combinator set is complete. `Futures::try_join(a, b)` completes with both values or the first error, abandoning the sibling; the abandoned child is released by the combinator's own drop, exactly as `Select` releases its loser. A value that arrived before the error is dropped with the combinator — the output is one `Result`, and `join` remains the way to see every outcome. `TryJoin` carries a `done` flag distinct from `a_done`/`b_done` because an error completes it with the other side still unfinished. 3 tests (both-ok value + concurrency bound, short-circuit against an hour-long sibling with prompt teardown, error-after-success). **The compiler fix is in `TypeResolver::project_where_bound_params_into`, not where this file previously guessed** — see the newest §9 entry. |
@@ -5174,3 +5174,97 @@ and the unbraced form that always worked.
 
 `make test` → **1966 unit / 0 failed, compile-fail 169, projects 13**. `make selfhost-check` → exit 0,
 **two** `FIXED POINT OK`. Repinned both halves and verified.
+
+---
+
+## 2026-07-31 (later still) — handoff items (1) and (2) FIXED; a SILENT `E0455` hole found on the way
+
+Both are compiler fixes. `make test` **1973 unit / 170 compile-fail / 13 projects, 0 failed**,
+`make selfhost-check` exit 0 with **two** `FIXED POINT OK`, repinned both halves and verified
+(the two sidecars agree with each other, not just with `verify-pin` — see §4 of the root handoff).
+
+### Item (1): a combinator awaited inside a generic impl — THREE walls, not one
+
+The recorded fix ("resolve the callee from its `ScopeResolution` spelling when `resolved_template` is
+empty") was necessary and **not sufficient**. It cleared the reported `E0455`, and clearing it exposed
+the next two, each of which independently prevented
+`await Futures::timeout(d, this.pump(n))` from working inside `implement struct PConn<S>`:
+
+1. **`ctor_field_for_param` could not find the constructor.** `async_lower.cryo` grew
+   `callee_template()`: sema's pin when it exists, else sema's own three-probe lookup
+   (import-scoped → bare → resolver cross-module) from the callee's `Scope::member` spelling. The
+   lookup only decides WHICH declaration is read; the shape demanded of that declaration is
+   unchanged, so a wrong answer still cannot become a silent wrong-address store.
+
+2. **`try_resolve_static_method_template` demanded every inferred type arg be CONCRETE**
+   (`contains_generic_param` → bail). Inside a generic body that is never true — `F` binds to a future
+   type mentioning `S`. The call was abandoned, fell through to the owner-only static paths, and the
+   expression resolved to **`void`**, which then surfaced as `no field or method 'fut' on type 'void'`
+   and `no method named 'poll' on type 'void'` pointed at the method declaration. Relaxed to "must
+   BIND, need not be concrete": mono is already built for a symbolic stash
+   (`concretize_stashed_arg` applies the active specialization, a no-op on a concrete stash), and this
+   simply matches what the free-function path has always done. The guard was introduced wholesale with
+   the function in `ce7456c6`, not as a fix for any specific bug.
+
+3. **`free_infer_arg_reliable` refused any CALL argument whose type mentions a generic param**, so
+   `this.pump(n)` never bound `F`, PASS D never projected `O` off `F: Future<O>`, and inference
+   returned nothing. Inside a template body an abstract call type is not provisional — it IS the
+   answer, and nothing before mono sharpens it. Now admitted when `in_symbolic_check`. Safe for
+   diagnostics: both callers gate their conflict report on `free_infer_type_concrete` per side,
+   independently of this predicate, so an abstract type cannot produce a spurious E0214.
+
+**Method.** A trace on the bail sites was what separated (2) from (3): the projection itself was
+fine (`project_member` on the argument's type returned `i64` on demand), so the missing binding had to
+be `F`, not `O`.
+
+**Stale claim corrected:** the handoff said this left `HttpServer::with_read_timeout` stored but not
+enforced. It **is** enforced (`stdlib/net/http/server.cryo:250`) — restored by the earlier drop-flag
+fix. Item (1) was an expressiveness hole, not a live security hole.
+
+**Tests.** `tests/tests/lang/async_receiver_refresh.cryo` gains
+`async_generic_owner_refreshes_through_a_combinator`, driven by the file's stack-dirtying
+`arr_block_on` (an `Executor`'s `block_on` reuses one frame, which is exactly the condition a stale
+receiver pointer survives) — the combinator is local, with the child at argument 1 but field 0, so a
+position-based match picks the wrong field. `tests/tests/stdlib/future_combinator.cryo` gains
+`timeout_wraps_an_owner_method_inside_a_generic_impl` and
+`timeout_inside_a_generic_impl_still_expires` on the real `Futures::timeout`. All three fail under the
+old pin with `E0455`.
+
+### Item (2): `IfExpression` was a blind spot in EIGHT of nine expression walkers
+
+`if` used as an expression is the ternary's block-bodied twin — same three sub-expressions. Of the
+nine walkers in `async_lower.cryo` that descend into a `TernaryExpression`, exactly **one** (`rn_expr`)
+also descended into an `IfExpression`. Fixed as a sweep, not a patch: `rewrite_returns_expr`,
+`expr_await_count`, `name_read_in_expr`, `subst_name_expr`, `expr_has_free_edge`,
+`mark_last_use_expr`, `frame_addr_root_expr`, `hoist_expr`. `hoist_ternary` became
+`hoist_branch_expr` — both forms lower to the same `mut $tv; if (C) {…} else {…}`.
+
+Four loud failures, each verified red under the old pin: `E0204` for `this` in an arm (the reported
+one), `E0201` for a local read only inside an if-expression, `E0201` for a value given away in an arm,
+`E0600` at codegen for an `await` in an arm.
+
+**The fifth was SILENT, and it is why this had to be a sweep.** `frame_addr_root_expr` — the
+address-of-across-suspend check — did not descend either, so
+
+```cryo
+const p: u8* = if (c) { &buf[0] } else { null };
+const _z: i64 = await PendingThenReady<i64>::new(2, 1);
+if (p != null) { *p = 42; }
+```
+
+**compiled, ran, and reported success under the pin** — a raw pointer into the poll frame, written
+through after the frame was gone. That is precisely what `E0455` exists to reject. Now
+`tests/tests/negative/E0455_async_address_in_if_expression.cryo`; the four positive shapes are
+`tests/tests/lang/async_if_expression.cryo`.
+
+`expr_diverges` and `expr_first_use` were deliberately left alone: neither handles `TernaryExpression`
+either, so adding only `IfExpression` there would be arbitrary, and both fall back to
+`name_read_in_expr`, which now descends correctly. Not representable in the grammar, so not a gap:
+`return`/`break` directly in an arm (an arm holds an expression, not statements).
+
+### Unrelated finding, NOT fixed and NOT async
+
+`match (Option::Some(a)) { Option::Some(x) => { x + 1 } … }` types the arm binding `x` as `T`
+(`E0238`, "expected `T`, found `i64`") when the subject is an **inline** `Option::Some(<local>)`.
+Reproduces in plain synchronous code with no `async` and no if-expression anywhere; binding the
+subject to an annotated local first works. Its own item.
