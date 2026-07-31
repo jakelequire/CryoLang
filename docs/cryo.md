@@ -2957,7 +2957,9 @@ import std::future;
 const n: i64 = future::block_on(add_later(1, 2));
 ```
 
-**`Executor`** is the real runtime: a worker pool with a ready queue, a reactor for I/O and timer readiness, and `catch_unwind` isolation at the poll boundary so one panicking task cannot take down a worker.
+**`Executor`** is the real runtime: a worker pool with a ready queue, a reactor for I/O and timer readiness, a blocking pool for work no reactor can drive, and `catch_unwind` isolation at the poll boundary so one panicking task cannot take down a worker.
+
+The blocking pool exists because readiness is not universal. `getaddrinfo` has no non-blocking form on either platform, and a regular file is always "ready" as far as `epoll` is concerned, so neither can be parked on the reactor. Calling one directly inside a `poll` stalls a worker for its whole duration — on a single-threaded executor, the whole runtime. `std::future::blocking` runs such calls on threads nobody polls on and fires a `Waker` when they finish; `dns::Resolve` is the one that ships using it, so an `async` name lookup costs a worker nothing while it waits.
 
 ```cryo
 mut ex: Executor = Executor::new();
@@ -2996,12 +2998,15 @@ The `Futures` namespace composes futures. Each takes two futures and nests for h
 | Combinator | Behaviour |
 | ---------- | --------- |
 | `Futures::join(a, b)` | Completes when both complete; yields both outputs. |
+| `Futures::try_join(a, b)` | Completes on the first error, abandoning the sibling; otherwise both outputs. |
 | `Futures::select(a, b)` | Completes with whichever finishes first; the loser is dropped. |
-| `Futures::timeout(fut, dur)` | `fut`'s output, or `Elapsed` if the deadline passes first. |
-| `Futures::timeout_at(fut, instant)` | The same against an absolute deadline. |
+| `Futures::timeout(dur, fut)` | `fut`'s output, or `Elapsed` if the deadline passes first. |
+| `Futures::timeout_at(instant, fut)` | The same against an absolute deadline. |
+
+The duration comes first, so the deadline reads before the work it bounds:
 
 ```cryo
-match (await Futures::timeout(fetch(url), Duration::from_secs(5))) {
+match (await Futures::timeout(Duration::from_secs(5), fetch(url))) {
     Result::Ok(body) => { ... }
     Result::Err(_)   => { ... }   // timed out
 }
@@ -3092,7 +3097,7 @@ The prelude is deliberately small. Anything else is an explicit `import` - notab
 | **`math`**        | Thin libm wrappers: `sqrt`, `cbrt`, `pow`, `exp` / `exp2`, `ln`, `log2` / `log10`, `sin` / `cos` / `tan` (plus the `a*` inverses and `*h` hyperbolics), `floor`, `ceil`, `round`, `trunc`, `fabs`, integer `abs_i32` / `abs_i64`, `min` / `max` / `clamp`, `f32` variants (`sqrt_f32`, `fabs_f32`, ...), and the constants `PI`, `TAU`, `E`.                                                                                                                                                                                                                                                             |
 | **`time`**        | `Duration` (normalized seconds + sub-second nanoseconds; `from_secs`/`from_millis`/`from_micros`/`from_nanos`, `as_secs`/`as_millis`/`as_micros`/`as_nanos`/`subsec_*`, `add`/`saturating_sub`/`is_zero`, `Eq` + `Ord`). `Instant` (monotonic `CLOCK_MONOTONIC`; `now`, `elapsed`, `duration_since`). `SystemTime` (wall `CLOCK_REALTIME`; `now`, `unix_epoch`, `duration_since_epoch`, `duration_since`). `sleep(Duration)` (EINTR-restarting). All clock differences saturate at zero.                                                                                                               |
 | **`random`**      | `Rng`, a fast non-cryptographic xoshiro256** generator seeded via `from_seed(u64)` (reproducible) or `from_os()`: `next_u64`/`next_u32`/`next_bool`/`next_f64`, unbiased `below(bound)` / `range_u64(lo, hi)` (rejection-sampled), `fill_bytes`. `secure_bytes(buf, len)` fills from the kernel CSPRNG (`getrandom`); use it for keys/tokens/nonces - `Rng` is not cryptographic.                                                                                                                                                                                                                      |
-| **`net`**         | `IpV4Addr`, `IpV6Addr`, `IpAddr`, `SocketAddr`, `TcpStream` (`Read + Write`), `TcpListener`. **HTTP/1.1 layer (`net::http`):** `Method`, `StatusCode`, `Headers`, `Request`, `Response`, `Router`, `HttpServer` with keep-alive + `Connection: close` opt-out + per-connection read timeouts, `Client::get`/`post` with `send(addr, req)`. **TLS** (`net::tls`, OpenSSL-backed `TlsStream`), **UDP** (`UdpSocket`), **HTTP/2** (`net::http2`, HPACK + single-stream framing), and **WebSocket** (`net::ws`, RFC 6455) all ship in 1.0. IPv6 addressing is parsed and represented but not yet dialable. |
+| **`net`**         | `IpV4Addr`, `IpV6Addr`, `IpAddr`, `SocketAddr`, `TcpStream` (`AsyncTransport`), `TcpListener`. **Every operation that can wait is a future** driven by an `Executor` — there is no blocking socket surface. **HTTP/1.1 layer (`net::http`):** `Method`, `StatusCode`, `Headers`, `Request`, `Response`, `Router`, `HttpServer` with keep-alive + `Connection: close` opt-out + per-connection read timeouts, `Client::get`/`post` with `send(addr, req)`. **TLS** (`net::tls`, OpenSSL-backed `TlsStream`), **UDP** (`UdpSocket`, datagram send/receive futures), **DNS** (`net::dns`; `Resolve` runs `getaddrinfo` on the executor's blocking pool rather than stalling a worker), **HTTP/2** (`net::http2`, HPACK + single-stream framing), and **WebSocket** (`net::ws`, RFC 6455) all ship in 1.0. IPv6 addressing is parsed and represented but not yet dialable. |
 | **`process`**     | POSIX subprocess spawning (`fork + execve`). `Command` builder (`arg`, `env`, `stdin`/`stdout`/`stderr`, `current_dir`), `Stdio` (`Inherit`, `Null`, `Piped`, `Fd`), `Child`, `ExitStatus`, `ChildStdin`/`ChildStdout`/`ChildStderr`, `Signal`. Windows is not yet supported.                                                                                                                                                                                                                                                                                                                          |
 | **`sync`**        | A generic `Atomic<T>` (`T` = `u8` / `u32` / `u64` / `i32` / `i64` / `boolean`, dispatched at compile time via `static match`; `load` / `store` / `swap` / `fetch_add` / `fetch_sub` / `fetch_and` / `fetch_or` / `fetch_xor` / `compare_exchange`), `MemoryOrder`, `fence`, `compiler_fence`, `Mutex<T, A>`, `RwLock<T, A>`, `CondVar`, `Once`, `Barrier`. RAII guards (`MutexGuard`, `RwLockReadGuard`, `RwLockWriteGuard`) are `!Send`. `Send` / `Sync` are computed structurally with call-site enforcement - see [section 16.4](#164-the-send-and-sync-traits).                                    |
 | **`thread`**      | `ThreadLocal<T>` lazy per-thread storage via `pthread_key`. `thread::spawn` / `try_spawn` / `JoinHandle<T>` (returning the body's value on `join`), `spawn_with_attr`, scoped threads (`thread::Scope`), `thread::current` / `yield_now` / `sleep` / `sleep_ms`, plus `sync::mpsc` channels (`channel`, `Sender`, `Receiver`) all ship in 1.0, built on `pthread`. The `sync` primitives and `Arc<T>` ship alongside. `Builder` (`Builder::new().stack_size(bytes).name(str).spawn`/`try_spawn`) configures the stack size and OS thread name for a spawn.                                             |

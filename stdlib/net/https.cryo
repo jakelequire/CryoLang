@@ -89,8 +89,11 @@ type struct HttpsClient {
     async send(&this, host: Str, port: u16, req: Request) -> Result<Response, IoError> {
         mut request_local: Request = req;
         // The socket layer is IPv4-only, so pick the first A record even
-        // if the resolver preference-orders a AAAA ahead of it.
-        const addr: SocketAddr = match (first_ipv4(host, port)) {
+        // if the resolver preference-orders a AAAA ahead of it. Awaited rather
+        // than called: `getaddrinfo` blocks, so `Resolve` runs it on the
+        // executor's blocking pool instead of stalling this worker inside the
+        // slowest step of the request.
+        const addr: SocketAddr = match (await first_ipv4(host, port)) {
             Result::Ok(a)  => { a }
             Result::Err(e) => { request_local.drop(); return Result::Err(e); }
         };
@@ -120,25 +123,12 @@ type struct HttpsClient {
     }
 }
 
-/// Resolve `host` and return the first IPv4 address paired with `port`.
-/// IPv6 results are skipped until the socket layer can dial them; if
-/// none are IPv4, fails `Unsupported`.
-function first_ipv4(host: Str, port: u16) -> Result<SocketAddr, IoError> {
-    mut resolved: ResolvedAddrs = dns::resolve(host)?;
-    mut chosen: Option<SocketAddr> = Option::None;
-    mut i: u64 = 0;
-    while (i < resolved.length()) {
-        match (resolved.get(i)) {
-            Option::Some(ip) => {
-                if (ip.is_ipv4()) {
-                    chosen = Option::Some(SocketAddr::new(ip, port));
-                    i = resolved.length();   // stop at the first match
-                }
-            }
-            Option::None => { }
-        }
-        i++;
-    }
+/// Resolve `host` off the executor and return the first IPv4 address paired
+/// with `port`. IPv6 results are skipped until the socket layer can dial them;
+/// if none are IPv4, fails `Unsupported`.
+async function first_ipv4(host: Str, port: u16) -> Result<SocketAddr, IoError> {
+    mut resolved: ResolvedAddrs = (await Resolve::start(host))?;
+    const chosen: Option<SocketAddr> = resolved.first_ipv4(port);
     resolved.drop();
     match (chosen) {
         Option::Some(addr) => { return Result::Ok(addr); }
