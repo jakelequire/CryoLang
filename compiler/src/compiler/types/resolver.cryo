@@ -415,6 +415,15 @@ type struct TypeResolver {
         }
         const qname: SymbolStr = this.arena.get_qualified_name(ty);
         if (!qname.is_valid()) { return SymbolStr::empty(); }
+        return this.symbol_bare_leaf(qname);
+    }
+
+    /// Trailing `::`-separated segment of an interned name (`core::result::Result`
+    /// -> `Result`), or the name itself when unqualified. Shared by the type-side
+    /// key (`proj_bare_name`) and the annotation-side one so a bound written with
+    /// a qualified base compares equal to the type it projects to.
+    symbol_bare_leaf(&this, qname: SymbolStr) -> SymbolStr {
+        if (!qname.is_valid()) { return SymbolStr::empty(); }
         const qstr: string = this.intern_table.resolve(qname);
         const qlen: i64 = qstr.length() as i64;
         mut last_sep: i64 = -1;
@@ -612,8 +621,14 @@ type struct TypeResolver {
     /// return-only / bound-only param without a turbofish or expected-type hint.
     /// `param_names[i]` MUST align with `ictx.bindings[i]` (the caller builds the
     /// InferCtx from the same ordered param list). Index-keyed analogue of the
-    /// impl-side `derive_where_assoc_bindings`: only bare `Named` args derive, and
-    /// an existing binding is kept.
+    /// impl-side `derive_where_assoc_bindings`; an existing binding is kept.
+    ///
+    /// The slot arg need not BE a param. A COMPOUND arg
+    /// (`A: Future<Result<T1, E>>`) mentions its params only inside a nested
+    /// generic, and those are recovered by pairing the annotation against the
+    /// projected type (`bind_where_arg_params_from`) rather than adopting it
+    /// whole. Without that, such a param stays abstract and the whole binding set
+    /// is discarded — the gap that made `Futures::try_join` unconstructible.
     ///
     /// The subject need only be free of OPEN generic params (so its trait impl is
     /// findable) — NOT mono-resolved: `resolve_concrete_member` handles a pre-mono
@@ -656,20 +671,39 @@ type struct TypeResolver {
                     const assoc_idx: i64 = ai - ngp;
                     if (assoc_idx >= tdecl.assoc_types.length) { continue; }
                     if (tdecl.assoc_types[assoc_idx] == null) { continue; }
-                    const j: i64 = this.where_arg_param_slot(tr.type_args[ai], param_names);
-                    if (j < 0 || j >= ictx.bindings.length || ictx.bindings[j].is_valid()) { continue; }
+                    const arg_ann: TypeAnnotation* = tr.type_args[ai];
+                    // A BARE `Named` arg is the direct functional dependency: the
+                    // whole assoc type IS the param (`Future<R>` => `R = P::Output`).
+                    // A COMPOUND arg (`Future<Result<T1, E>>`) reaches its params
+                    // only by destructuring what the projection yields, which
+                    // `bind_where_arg_params_from` does below. Both need the same
+                    // projection, so decide which case this is, then project once.
+                    const j: i64 = this.where_arg_param_slot(arg_ann, param_names);
+                    if (j >= 0) {
+                        if (j >= ictx.bindings.length || ictx.bindings[j].is_valid()) { continue; }
+                    } else {
+                        // Nothing left to solve in this arg: don't pay for a lookup.
+                        if (!this.where_arg_has_unbound_param(arg_ann, param_names, ictx)) { continue; }
+                    }
                     mut rc: ResolutionContext = ResolutionContext::new(source_file, "");
                     const member: SymbolStr = tdecl.assoc_types[assoc_idx].name;
                     if (subject_abstract) {
                         // `project_member` keeps an abstract base symbolic, giving
                         // the projection mono reduces once the base specializes.
+                        // Only a bare param can adopt that opaque projection whole;
+                        // a compound arg has no structure to pair against until the
+                        // base specializes, so it derives nothing here.
+                        if (j < 0) { continue; }
                         const sym_d: TypeRef = this.project_member(subject, member, &rc);
                         if (sym_d.is_valid()) { ictx.bind_slot(j, sym_d); }
                         continue;
                     }
                     const derived: TypeRef = this.resolve_concrete_member(subject, member, &rc);
-                    if (derived.is_valid() && !this.arena.contains_generic_param(derived)) {
+                    if (!derived.is_valid() || this.arena.contains_generic_param(derived)) { continue; }
+                    if (j >= 0) {
                         ictx.bind_slot(j, derived);
+                    } else {
+                        this.bind_where_arg_params_from(arg_ann, param_names, derived, ictx);
                     }
                 }
             }
@@ -693,6 +727,72 @@ type struct TypeResolver {
         match (*ta) {
             TypeAnnotation::Named(n) => { return this.param_name_slot(param_names, n.name); }
             _                       => { return -1; }
+        }
+    }
+
+    /// True when `ta` names, at any depth, a param this context has not solved
+    /// yet. Gates the associated-type projection in
+    /// `project_where_bound_params_into`: an arg that can bind nothing new must
+    /// not pay for the lookup, which keeps the cost of the compound case on the
+    /// bounds that actually need it.
+    where_arg_has_unbound_param(&this, ta: TypeAnnotation*, param_names: &SymbolStr[],
+                                ictx: InferCtx*) -> boolean {
+        if (ta == null) { return false; }
+        match (*ta) {
+            TypeAnnotation::Named(n) => {
+                const s: i64 = this.param_name_slot(param_names, n.name);
+                if (s < 0 || s >= ictx.bindings.length) { return false; }
+                return !ictx.bindings[s].is_valid();
+            }
+            TypeAnnotation::Generic(g) => {
+                for (mut i: i64 = 0; i < g.args.length; i++) {
+                    if (this.where_arg_has_unbound_param(g.args[i], param_names, ictx)) { return true; }
+                }
+                return false;
+            }
+            _ => { return false; }
+        }
+    }
+
+    /// Pair a COMPOUND where-bound trait arg against the type projected off the
+    /// now-bound subject, binding each param the annotation names at the position
+    /// it occupies: `A: Future<Result<T1, E>>` with `A::Output = Result<i64, bool>`
+    /// binds `T1 = i64` and `E = bool`. Without this a param reachable only by
+    /// destructuring a nested generic in the bound stays abstract, the caller
+    /// discards the incomplete binding set, and the call reaches codegen
+    /// unspecialized (E0636) or fails E0200 against the still-abstract shape —
+    /// which is what kept `Futures::try_join` unconstructible.
+    ///
+    /// Positional pairing is only sound when the two sides are the same
+    /// constructor, so the bases are compared by bare leaf; `Result<T1, E>` must
+    /// not bind its params off a `Pair<i64, bool>` that merely has two args. Any
+    /// shape mismatch is a silent no-op rather than an error: this is inference,
+    /// and `check_call_where_bounds` is what rejects a bound the subject really
+    /// fails to satisfy.
+    bind_where_arg_params_from(&this, ta: TypeAnnotation*, param_names: &SymbolStr[],
+                               actual: TypeRef, ictx: InferCtx*) -> void {
+        if (ta == null || !actual.is_valid()) { return; }
+        match (*ta) {
+            TypeAnnotation::Named(n) => {
+                const s: i64 = this.param_name_slot(param_names, n.name);
+                if (s >= 0) { ictx.bind_slot(s, actual); }
+            }
+            TypeAnnotation::Generic(g) => {
+                if (g.base == null) { return; }
+                const want: SymbolStr = match (*g.base) {
+                    TypeAnnotation::Named(bn) => { this.symbol_bare_leaf(bn.name) }
+                    _                         => { SymbolStr::empty() }
+                };
+                if (!want.is_valid()) { return; }
+                const got: SymbolStr = this.proj_bare_name(actual);
+                if (!got.is_valid() || !got.equals(want)) { return; }
+                if (this.arena.inst_type_arg_count(actual) != g.args.length) { return; }
+                for (mut i: i64 = 0; i < g.args.length; i++) {
+                    this.bind_where_arg_params_from(g.args[i], param_names,
+                                                    this.arena.inst_type_arg_at(actual, i), ictx);
+                }
+            }
+            _ => { }
         }
     }
 

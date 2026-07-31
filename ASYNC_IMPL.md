@@ -40,7 +40,7 @@ not for routine judgement calls.
 | 4 | Reactor (epoll/IOCP) + async I/O over `std::net` + timers + `async fn main` + combinators | ◐ in progress 2026-07-24. **Inc 4b DONE on Linux (reactor + async TCP, stress+leak clean); Windows AFD backend written but UNVALIDATED (wine 9.0 cannot service `IOCTL_AFD_POLL` — needs a real Windows box).** Interface fork LOCKED by Jake: **one readiness interface both OSes, Windows via real AFD** (not WSAPoll, not a per-OS split). Sockets are to become **async-only with every consumer ported** (Jake, 2026-07-24) — that port is **UNBLOCKED as of 2026-07-24**: the aggregate-across-await tail landed, and the follow-on "rebuilt from inside a branch" E0600 is now removed too (newest §9 entry). Forks LOCKED earlier: waker lifetime = **separate `Arc`-wrapper**; reactor = **dedicated thread, per-`Executor`** (`![thread_local]` current-reactor handle); platform = **both OSes (epoll + IOCP)**. **Inc 4a DONE+validated (2026-07-24): Arc-refcounted `Waker` (Copy→non-Copy) + `Arc<Task>` lifetime; finish-vs-park now implicit via `Task::drop` on the last decref. Needed a COMPILER fix (owner-generic static with a defaulted owner param + nested return → E0636; `call_resolver.cryo` default-backfill) → selfhost fixed point BOTH OS, win-s2 vs win-s3 = 0/235 `.ll`, REPINNED both OS. UNCOMMITTED.** NEXT = Inc 4b (the reactor: epoll+IOCP interface — bring Jake the readiness-vs-completion unification fork). |
 
 | 4d | Timers — reactor deadline chain + `Sleep` | ✅ DONE+validated 2026-07-26. Deadline-sorted chain on `Reactor` (`register_timer`/`cancel_timer`), reactor thread bounds its wait by the earliest deadline instead of `-1`, fires expired wakers after the wait, kicks on a new-earliest arming. `stdlib/future/timer.cryo`: `Sleep::new(dur)` / `Sleep::until(instant)`, absolute deadlines, saturating construction, `Drop` disarms. Self-wakes under a reactor-less driver so `future::block_on` still completes it. Also fixed a real teardown UAF: `Executor::drop` freed the `Reactor` before `drain_cancelled()`, so a task woken by readiness but not yet driven dereferenced freed memory in its future's `drop` — split into `Reactor::stop` / `Reactor::free`. 10 tests. |
-| 4f | Combinators — `join` / `select` / `timeout` | ✅ DONE+validated 2026-07-26. `stdlib/future/combinator.cryo`; built through the `Futures` namespace (`Futures::join`/`select`/`timeout`/`timeout_at`). Cancellation is a plain drop — the `Select` loser and the `Timeout` victim are released with the combinator, which is what disarms a `Sleep` and releases an I/O registration. Arity 2, higher arities nest (tested). 9 tests. **`try_join` NOT shipped:** blocked on an inference gap — a generic static whose return type mentions the future params AND params reachable only by destructuring a nested generic in the bound leaves the nested ones abstract (minimal repro in §9). |
+| 4f | Combinators — `join` / `select` / `timeout` | ✅ DONE+validated 2026-07-26. `stdlib/future/combinator.cryo`; built through the `Futures` namespace (`Futures::join`/`select`/`timeout`/`timeout_at`). Cancellation is a plain drop — the `Select` loser and the `Timeout` victim are released with the combinator, which is what disarms a `Sleep` and releases an I/O registration. Arity 2, higher arities nest (tested). 9 tests. **`try_join` SHIPPED 2026-07-31** — the inference gap that blocked it is FIXED at the root, so the combinator set is complete. `Futures::try_join(a, b)` completes with both values or the first error, abandoning the sibling; the abandoned child is released by the combinator's own drop, exactly as `Select` releases its loser. A value that arrived before the error is dropped with the combinator — the output is one `Result`, and `join` remains the way to see every outcome. `TryJoin` carries a `done` flag distinct from `a_done`/`b_done` because an error completes it with the other side still unfinished. 3 tests (both-ok value + concurrency bound, short-circuit against an hour-long sibling with prompt teardown, error-after-success). **The compiler fix is in `TypeResolver::project_where_bound_params_into`, not where this file previously guessed** — see the newest §9 entry. |
 
 | 4g | `async function main` | ✅ DONE+validated 2026-07-25. Renamed out of the entry-point slot (`main` → `main$async`) with a synchronous `main` synthesized in its place, driving it on an `Executor` LOCAL to `main` — a runtime scoped to the entry point, whose `Drop` tears it down at exit. `-> i32` and `-> void` both land on an `i32` entry point; parameters are forwarded, so argc/argv behaviour is identical to a synchronous `main`. New `E0365` for a generic `main` or a return type that is neither. `AsyncLower::desugar_async_main`, called before `declare`. 3 projects + 2 negative tests. |
 | 5a | Buffer-owning `TcpRead` / `TcpWrite` | ✅ DONE+validated 2026-07-25. Both futures now OWN an `Array<u8>` as they already owned the socket, handing it back via `TcpIo::take_buf()`; a read truncates it to the bytes that arrived, a write returns it untouched. Makes the async socket API sound BY CONSTRUCTION — a future moves between polls, so a caller-frame `u8*` was written through a stale address. Needed the missing `Array<T>::resize`. **Closed a total test gap: there were zero tests AND zero consumers of the async socket futures in the tree.** 2 tests (loopback echo round trip + read-timeout cancellation). |
@@ -2241,6 +2241,8 @@ kind, and `compute_enum_layout` asks it instead of testing the size. Tests:
 useful than an empty marker — but it is no longer load-bearing.
 
 **Compiler bug #2 — nested-bound inference gap; `try_join` is NOT shipped because of it.**
+**FIXED 2026-07-31 — `try_join` now ships. The diagnosis below is preserved for the symptom
+record, but its guess at the fix site was wrong; see the newest §9 entry for the real one.**
 
 ```cryo
 static direct<A,B,OA,OB>(a:A,b:B) -> W4<A,B,OA,OB> where A: Future<OA>, B: Future<OB>          // infers
@@ -5002,3 +5004,100 @@ asserted before, and is the property the blocking parser could not provide at al
 Roster merged with `--merge`, 1925 entries. **`--merge` kept the renamed `loopback_h2c_round_trip` as an
 "other platform" entry** — it cannot tell a deleted test from a Windows-only one — so that one line was
 removed by hand and `ProcessCommand::output_large_stderr_no_deadlock_win` left alone.
+
+## 2026-07-31 — Compiler bug #2 FIXED at the root; `try_join` ships
+
+`try_join` was the last engineering item on the async list. It is now in `stdlib/future/combinator.cryo`
+and the combinator set is complete.
+
+### The gap was one line of policy, and not where this file guessed
+
+The recorded diagnosis pointed at `infer_static_owner_bindings_from_expected` — "unify the declared
+return against the expected type; the same applied to a method's own parameters would unblock
+`try_join`". That is the wrong layer. The parameters were never the problem: the recovery already
+exists, in the bound-directed projection (`TypeResolver::project_where_bound_params_into`, "PASS D"),
+which is what makes `block_on<F, R>` infer `R` from `F: Future<R>` with no turbofish.
+
+It just refused to look inside the bound's argument. `where_arg_param_slot` returns a slot only for a
+**bare `Named`** trait arg:
+
+- `A: Future<R>` — the assoc-slot arg IS the param, so `R = A::Output` binds. This is `join`'s shape.
+- `A: Future<Result<T1, E>>` — the arg is compound, `where_arg_param_slot` answers -1, and the loop
+  `continue`s having derived **nothing**. `T1`/`E` stay abstract, the caller discards the whole
+  incomplete binding set, and the call dies as `E0636` (codegen cannot resolve) or as the `E0200
+  … found Result<(T1, T2), E>` recorded above.
+
+So the axis was never "the return type also mentions `A`/`B`". A minimal repro with the return type
+free of `A`/`B` fails too — it merely fails as `E0636` instead of `E0200`, which is why the earlier
+narrowing read it as a different case.
+
+### The fix
+
+Project the associated type off the now-bound subject exactly as before, then, when the slot arg is
+compound, **pair the annotation against the projected type** instead of adopting it whole:
+`bind_where_arg_params_from` walks `Result<T1, E>` against a concrete `Result<i64, bool>` and binds
+`T1 = i64`, `E = bool`. Recursive, so `Option<Result<T, E>>` works too.
+
+Four things are load-bearing:
+
+- **Bases are compared by bare leaf** (`symbol_bare_leaf`, factored out of `proj_bare_name` so the
+  type side and the annotation side answer the same question), plus an arg-count check. Positional
+  pairing is only sound between the same constructor — without this, `Result<T1, E>` would happily
+  take its params from any other two-parameter type. A mismatch is a silent no-op, not an error:
+  this is inference, and `check_call_where_bounds` is what rejects a bound the subject really fails.
+- **`where_arg_has_unbound_param` gates the projection**, so an arg that can bind nothing new never
+  pays for an associated-type lookup.
+- **The symbolic / abstract-subject path is unchanged** — it still accepts only a bare param, because
+  `project_member` yields an opaque projection with no structure to pair against. Behaviour there is
+  identical, by construction.
+- **The bare-`Named` branch is behaviourally untouched.** Only the branch structure moved (decide the
+  case, then project once), so `block_on` and every other direct bound take the same path they did.
+
+### Tests, and what they discriminate
+
+`tests/tests/lang/where_bound_nested_param_inference.cryo` — 7 tests, fully SYNCHRONOUS (a user trait
+with one associated type standing in for `Future`, no executor, no suspension), because the defect is
+plain generic inference and reproducing it through async would only obscure it. The file draws **7
+`E0200`s under the old pin** and passes 7/7 with the fix: that is its discrimination proof.
+
+The controls are the half that matters: the direct-bound shape (`join`'s) must still infer, a
+concrete position inside the nested type must fill no slot, and two instantiations of one static in
+one program must infer independently. Over-binding is the easy way to make the new cases pass and the
+wrong one.
+
+`tests/tests/stdlib/future_combinator.cryo` — 3 `try_join` tests: both-ok with a concurrency bound,
+short-circuit against an hour-long sibling with a prompt-teardown assertion (the cancellation
+property), and an error arriving after the other side already succeeded.
+
+### Found on the way, NOT fixed — a pre-existing silent miscompile
+
+A `match` **expression** used as the value of an enclosing match arm is miscompiled, and it has
+nothing to do with async or with this fix — it reproduces identically under the pin at `b298197b`:
+
+```cryo
+match (r) {
+    Option::Some(inner) => { match (inner) { Result::Ok(_) => { 7 } Result::Err(_) => { 8 } } }
+    Option::None => { -1 }
+}   // Some(Ok(9)) yields 8, not 7
+```
+
+Constant arms compile and **return the wrong arm's value**. Arms that read a bound payload fail loudly
+instead (`E0900`, LLVM "Instruction does not dominate all uses" — the outer phi names the inner
+match's join block but takes a value defined inside an inner arm). Nested match STATEMENTS are
+correct. 25 sync lines, no generics. The whole suite is green with this live, so nothing in the tree
+currently nests a match expression in a match arm; `where_bound_nested_param_inference.cryo` uses the
+statement form deliberately, with a comment saying why. **Jake's call whether to take it next** — it
+is the same "match expression treated as if it were a statement" theme as the `MatchExpression`
+blind-spot family, but in codegen rather than the async lowering.
+
+### Gates
+
+Compiler fix alone (phase 1): `make test` → **1948 unit / 0 failed, compile-fail 169, projects 13**,
+identical to the pre-change baseline. `make selfhost-check` → exit 0, **two** `FIXED POINT OK`
+(Windows stage-3 == stage-4, 238 modules). `make pin` taken via WSL and **`verify-pin` run: OK**,
+both sidecars at `0a253b0d` (`-dirty`, since the fix is uncommitted). The pin was then proven to
+carry the fix by compiling the new lang test with `bin/cryo.exe`.
+
+This needed the documented **2-phase repin**: `make cryo` builds the stdlib with the PIN, so
+`try_join` could not go in until the pin carried the inference fix. Phase 2 (stdlib + tests) then
+bootstrapped cleanly.

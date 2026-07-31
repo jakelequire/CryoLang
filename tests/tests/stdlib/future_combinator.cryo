@@ -72,6 +72,36 @@ async function join_results() -> i64 {
     return acc;
 }
 
+async function try_join_two(ms: u64) -> i64 {
+    const r: Result<(i64, i64), i64> =
+        await Futures::try_join(ok_after(ms, 3), ok_after(ms, 4));
+    return match (r) {
+        Result::Ok(p)  => { p.0 * 10 + p.1 }
+        Result::Err(e) => { -e }
+    };
+}
+
+// The failing side finishes while the sibling is an hour from done, so the error
+// can only come back by abandoning it.
+async function try_join_short_circuits() -> i64 {
+    const r: Result<(i64, i64), i64> =
+        await Futures::try_join(ok_after(3600000, 3), err_after(50, 66));
+    return match (r) {
+        Result::Ok(p)  => { p.0 * 10 + p.1 }
+        Result::Err(e) => { -e }
+    };
+}
+
+// The success lands FIRST and is discarded when the other side then fails.
+async function try_join_error_after_success() -> i64 {
+    const r: Result<(i64, i64), i64> =
+        await Futures::try_join(ok_after(40, 3), err_after(150, 66));
+    return match (r) {
+        Result::Ok(p)  => { p.0 * 10 + p.1 }
+        Result::Err(e) => { -e }
+    };
+}
+
 // The loser is an hour-long sleep. `select` must return as soon as the fast side
 // finishes, and dropping the combinator must disarm the loser's timer.
 async function select_abandons_a_long_loser() -> i64 {
@@ -136,6 +166,53 @@ function join_carries_both_results_of_fallible_children() -> Result<(), TestErro
     const r: i64 = ex.block_on(join_results());
     ex.drop();
     return expect_eq(r, 96 as i64);   // 3*10 from the Ok half + 66 from the Err half
+}
+
+![test]
+function try_join_yields_both_values_when_both_succeed() -> Result<(), TestError> {
+    // Serially these two would take ~800ms.
+    mut ex: Executor = Executor::new();
+    const t0: Instant = Instant::now();
+    const r: i64 = ex.block_on(try_join_two(400));
+    const ms: u64 = t0.elapsed().as_millis();
+    ex.drop();
+    match (expect_eq(r, 34 as i64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_true(ms >= 390, "try_join completed before its children did")) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_true(ms < 700, "try_join ran its children serially");
+}
+
+![test]
+function try_join_reports_the_first_error_without_waiting_for_the_sibling()
+        -> Result<(), TestError> {
+    // The sibling sleeps for an hour. Returning at all proves `try_join` did not
+    // wait for it; tearing the executor down promptly afterwards proves the
+    // sibling's timer registration was released when the combinator dropped,
+    // rather than pinning the task until its deadline.
+    mut ex: Executor = Executor::new();
+    const t0: Instant = Instant::now();
+    const r: i64 = ex.block_on(try_join_short_circuits());
+    ex.drop();
+    const ms: u64 = t0.elapsed().as_millis();
+    match (expect_eq(r, -66 as i64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_true(ms < 2000, "try_join waited for the abandoned sibling");
+}
+
+![test]
+function try_join_reports_an_error_arriving_after_the_other_side_succeeded()
+        -> Result<(), TestError> {
+    mut ex: Executor = Executor::new();
+    const r: i64 = ex.block_on(try_join_error_after_success());
+    ex.drop();
+    return expect_eq(r, -66 as i64);
 }
 
 ![test]

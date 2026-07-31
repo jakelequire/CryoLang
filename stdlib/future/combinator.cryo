@@ -1,5 +1,5 @@
 ///! std::future::combinator: running futures against each other — `Join`,
-///! `Select`, and `Timeout`.
+///! `TryJoin`, `Select`, and `Timeout`.
 ///!
 ///! Each of these is an ordinary future that OWNS the futures it composes and
 ///! drives them from its own `poll`. Every child is polled with the same
@@ -32,19 +32,12 @@
 ///! second poll has nothing to return — and would re-poll children that already
 ///! finished, which is itself a contract violation.
 ///!
-///! ## No `try_join` yet
+///! ## Fallible children
 ///!
-///! Joining two fallible futures and short-circuiting on the first error would
-///! need `try_join<A, B, T1, T2, E>(a, b) -> TryJoin<A, B, T1, T2, E>
-///! where A: Future<Result<T1, E>>, ...`. Inference cannot currently recover
-///! `T1`/`T2`/`E` there: a generic static whose return type mentions the future
-///! parameters AND parameters reachable only by destructuring a nested generic
-///! in the bound leaves the nested ones abstract, so every call fails E0200 with
-///! `Result<(T1, T2), E>`. (The same signature with DIRECTLY bound outputs —
-///! `join` — infers fine, and a nested bound infers fine when the return type
-///! does not also mention `A`/`B`.) Until that is fixed, `join` over two
-///! `Result`-producing futures gives the concurrency and both results; what it
-///! does not give is cancelling the sibling the moment one side fails.
+///! `join` waits for both children and hands back both `Result`s; `try_join`
+///! completes on the first error and abandons the sibling. Neither substitutes
+///! for the other — `join` is for a caller that needs every outcome, `try_join`
+///! for one that has nothing left to do once either side has failed.
 
 namespace std::future::combinator;
 
@@ -123,6 +116,73 @@ where A: Future<OA>, B: Future<OB> {
 }
 
 
+/// Runs two fallible futures concurrently and completes with both values, or
+/// with the FIRST error either of them reports.
+///
+/// The error completes this future immediately: neither child is polled again,
+/// and the sibling is dropped with this future, which is what cancels it — the
+/// same plain-drop cancellation `Select` gives its loser, so an in-flight I/O
+/// registration or an armed timer is released rather than left running behind a
+/// result nobody will read.
+///
+/// A value that arrived before the error is dropped with this future too. There
+/// is nowhere to hand it back: the output is a single `Result`, and reporting
+/// the error is what joining fallibly asked for. A caller that needs every
+/// outcome wants `join`, which waits for both sides and yields both `Result`s.
+///
+/// `a` is polled first on every poll, the same documented bias `Select` carries:
+/// when both sides fail on one poll, the error reported is `a`'s.
+type struct TryJoin<A, B, T1, T2, E> {
+    a:      A;
+    b:      B;
+    a_out:  Option<T1>;   // the value `a` produced, waiting for `b`
+    b_out:  Option<T2>;
+    a_done: boolean;      // stays true after `a_out` is filled, so `a` is never re-polled
+    b_done: boolean;
+    /// Set by BOTH completion paths. `a_done && b_done` cannot stand in for it:
+    /// an error completes this future with the other side still unfinished, so
+    /// without a separate flag a later poll would drive a child again after this
+    /// future had already reported.
+    done:   boolean;
+}
+
+implement<A, B, T1, T2, E> trait Future<Result<(T1, T2), E>> for struct TryJoin<A, B, T1, T2, E>
+where A: Future<Result<T1, E>>, B: Future<Result<T2, E>> {
+    poll(mut &this, cx: Context*) -> Poll<Result<(T1, T2), E>> {
+        if (this.done) {
+            panic("future::TryJoin polled after completion", FILE, LINE);
+        }
+        if (!this.a_done) {
+            match (this.a.poll(cx)) {
+                Poll::Ready(r) => {
+                    match (r) {
+                        Result::Ok(v)  => { this.a_out = Option::Some(v); this.a_done = true; }
+                        Result::Err(e) => { this.done = true; return Poll::Ready(Result::Err(e)); }
+                    }
+                }
+                Poll::Pending  => { }
+            }
+        }
+        if (!this.b_done) {
+            match (this.b.poll(cx)) {
+                Poll::Ready(r) => {
+                    match (r) {
+                        Result::Ok(v)  => { this.b_out = Option::Some(v); this.b_done = true; }
+                        Result::Err(e) => { this.done = true; return Poll::Ready(Result::Err(e)); }
+                    }
+                }
+                Poll::Pending  => { }
+            }
+        }
+        if (this.a_done && this.b_done) {
+            mut x: T1 = this.a_out.take().unwrap();
+            mut y: T2 = this.b_out.take().unwrap();
+            this.done = true;
+            return Poll::Ready(Result::Ok((x, y)));
+        }
+        return Poll::Pending;
+    }
+}
 
 
 /// Runs two futures concurrently and completes as soon as EITHER finishes,
@@ -215,6 +275,17 @@ type struct Futures {
         };
     }
 
+
+    /// Run `a` and `b` concurrently; complete with both values, or with the
+    /// first error either reports, dropping the sibling.
+    static try_join<A, B, T1, T2, E>(a: A, b: B) -> TryJoin<A, B, T1, T2, E>
+    where A: Future<Result<T1, E>>, B: Future<Result<T2, E>> {
+        return TryJoin<A, B, T1, T2, E> {
+            a: a, b: b,
+            a_out: Option::None, b_out: Option::None,
+            a_done: false, b_done: false, done: false,
+        };
+    }
 
     /// Run `a` and `b` concurrently; complete as soon as either does, dropping
     /// the other.
