@@ -30,7 +30,7 @@
 # --- Entry (freestanding profile) ------------------------------------------
 # Per-OS. AMD and Intel share the x86-64 ISA -> one x86-64 codepath covers both
 # vendors; the split that matters is OS ABI (Linux vs Windows). Present only in
-# no_runtime builds; a hosted program uses crt0's entry instead.
+# no_runtime builds; a hosted program starts at the hosted entry below.
 #
 # Linux: the ELF entry the linker resolves under `-nostartfiles`. Reads argc/argv
 # off the initial stack, hands them to __cryo_start. Fully freestanding (no libc,
@@ -54,7 +54,9 @@ _start          | ![naked] () -> void  (PE entry, /entry=_start) | core (freesta
 # ntdll import, called by the windows exit path with (HANDLE)-1.
 NtTerminateProcess | (process: i64, status: i32) -> i32  (extern, ntdll) | ntdll | (system)
 # Satisfies the mingw backend's `call __main` in main's prologue (C global-ctor
-# bootstrap). Empty for now; the ctor-array emitter (P3) will run ctors here.
+# bootstrap). Empty in a freestanding build because there is no CRT and Cryo
+# emits no constructors, so there is genuinely nothing to run; a hosted build
+# does NOT define this -- it calls mingw's real __main instead.
 __main          | () -> void                                | core (freestanding, windows) | DONE (windows)
 #
 # __cryo_start is shared (both OSes): capture arguments, run `main`, exit with
@@ -66,6 +68,46 @@ __main          | () -> void                                | core (freestanding
 # report 0 / null if the OS could not supply arguments.
 __cryo_argc     | () -> i64                                 | core (freestanding) | DONE (dual-OS)
 __cryo_argv     | () -> i8**                                | core (freestanding) | DONE (dual-OS)
+
+# --- Entry (hosted profile) -------------------------------------------------
+# A hosted program starts in Cryo too. The link KEEPS the crt objects and only
+# retargets the entry symbol (`-Wl,-e,__cryo_entry`); it does NOT pass
+# -nostartfiles. Dropping them takes __dso_handle + _init (linux) and atexit +
+# _pei386_runtime_relocator (windows) with them, and each of those is a LINK
+# failure -- `atexit` unconditionally so, because libmingwex references it. `-e`
+# also EXTRACTS the entry from the tier archive: ld enters the entry symbol as an
+# undefined reference.
+#
+# Entering past crt0 means owning what its startup would have driven, which is
+# per-OS. Linux: walk .preinit_array, call _init (crti.o), walk .init_array --
+# glibc's call_init order -- each entry receiving (argc, argv, envp). Windows:
+# call _pei386_runtime_relocator (fixes auto-imported DLL *data*; msvcrt's
+# _environ reads as garbage without it) then mingw's real __main (C global ctors,
+# idempotent). Skipping either leaves every static constructor unrun.
+#
+# Linux is `![naked]` for the same reason `_start` is (kernel entry, argc at
+# %rsp); Windows is NOT, because the loader `call`s the entry on an ordinary
+# frame -- and a real frame carries the .pdata unwind info a naked stub lacks.
+#
+# ONE EXCEPTION, forced not chosen: `--release-static` keeps crt0's entry. It
+# passes `-static`, and a fully static glibc sets up its own thread control block
+# inside __libc_start_main -- the job ld.so does before the entry runs in a
+# dynamic link. Entering past it leaves TLS unmapped and the program dies on the
+# first thread-local access (the unwind tier's panic state is thread-local).
+# Measured: a static binary with a retargeted entry segfaults before `main`.
+# Nothing else emits `-static`, so the exception is exactly as narrow as the flag.
+__cryo_entry        | ![naked] () -> void (linux) / () -> never (windows) | core (hosted) | DONE (dual-OS)
+# Shared startup trampoline: image fixups, capture arguments, run static
+# constructors, then `main` -- which here carries the WIDENED C signature
+# `int main(int, char**, char**)` codegen emits for a hosted program, not the
+# zero-arg freestanding form. Terminates through libc `exit`, which is what
+# flushes buffered stdio and runs atexit handlers.
+__cryo_hosted_start | (argc: i64, argv: i8**) -> never       | core (hosted) | DONE (dual-OS)
+# Startup services the retained crt objects provide, called BY the hosted entry
+# rather than defined by it (windows only).
+_pei386_runtime_relocator | () -> void  (extern, crt2.o)     | mingw crt | (system)
+__p__environ              | () -> i8***  (extern, msvcrt)    | msvcrt    | (system)
+_init                     | () -> void  (extern, crti.o)     | glibc crt | (system)
 
 # --- Link line -------------------------------------------------------------
 # The driver composes the tier archives itself; a freestanding program links by
@@ -82,6 +124,17 @@ __cryo_argv     | () -> i8**                                | core (freestanding
 # reach the panic handlers (core's and backtrace's own formatting helpers carry
 # bounds checks). The tiers' imported system libraries (kernel32/ntdll) follow
 # the archives for the same reason.
+#
+# append_hosted_runtime_libs is its hosted counterpart: core-hosted, then the
+# panic tier, then `-Wl,-e,__cryo_entry`. The windows `extra_system_libs`
+# (-lntdll) already follows on both link paths, which the core tier needs for the
+# PEB argv parse.
+#
+# The locator is asked which KIND of tier set it is looking for, because the two
+# ship different archives and a directory holding only the other kind is not a
+# hit. That matters more for hosted than freestanding: `-e` naming a symbol
+# nothing defines is a linker WARNING, so a wrong directory would still produce a
+# binary -- one that starts at whatever address ld defaulted to.
 
 # --- Panic funnel ----------------------------------------------------------
 # The single divergent sink: print "panicked at <file>:<line>: <msg>" to
@@ -98,7 +151,7 @@ __cryo_argv     | () -> i8**                                | core (freestanding
 #
 # Codegen is routed here: `emit_panic_call` emits a call to the external
 # `__cryo_panic` for every panic, hosted or freestanding, and the link line names
-# exactly one panic tier (`append_hosted_panic_lib` / `append_runtime_tier_libs`).
+# exactly one panic tier (`append_hosted_runtime_libs` / `append_runtime_tier_libs`).
 # The per-module libc `@panic` body it used to emit is gone.
 __cryo_panic              | (msg: string, file: string, line: u32) -> never  | panic/abort | DONE (runtime def dual-OS + dual-config; compiler routed)
 

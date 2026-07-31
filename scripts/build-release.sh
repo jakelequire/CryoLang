@@ -71,6 +71,11 @@ stage_runtime_tiers() {
     # `__cryo_panic`.  They go in lib/cryo/<triple>/, which is the
     # `<bindir>/../lib/cryo` candidate the tier locator already searches, under
     # the per-triple subdirectory it prefers.
+    #
+    # The hosted CORE tier is checked separately below, because its absence fails
+    # differently and worse: the locator would decline the directory, the link
+    # would omit both the archive and `-Wl,-e,__cryo_entry`, and the program would
+    # quietly go back to starting at crt0 rather than fail.
     local stage="$1" triple="$2"
     local cryo="${ROOT}/compiler/build/cryo"
     local dest="${stage}/lib/cryo/${triple}"
@@ -88,6 +93,10 @@ stage_runtime_tiers() {
     [ "$found" = 1 ] || { echo "error: no runtime tier archives produced for ${triple}" >&2; exit 1; }
     [ -f "${dest}/libcryort-panic-abort-hosted.a" ] \
         || { echo "error: hosted panic tier missing for ${triple} - user programs would not link" >&2; exit 1; }
+    [ -f "${dest}/libcryort-core-hosted.a" ] \
+        || { echo "error: hosted core tier missing for ${triple} - user programs would not start at the Cryo entry" >&2; exit 1; }
+    [ -f "${dest}/libcryort-core.a" ] \
+        || { echo "error: freestanding core tier missing for ${triple}" >&2; exit 1; }
 }
 
 stage_third_party_licenses() {
