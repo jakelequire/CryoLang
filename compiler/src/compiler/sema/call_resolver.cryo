@@ -459,6 +459,115 @@ type struct CallResolver {
         return result;
     }
 
+    /// `call`'s declared parameter types viewed through its OWNER's type
+    /// arguments, for expected-type propagation only.  Invalid at every position
+    /// needing no substitution, so the caller falls back to the declared type.
+    ///
+    /// A method or static declared on a generic owner states its formals in the
+    /// OWNER's parameters - `Atomic<T>::store(val: T, ..)` - and they arrive at
+    /// `resolve_call` unsubstituted, because the signature it reads is the
+    /// template's.  The numeric rules there require a CONCRETE numeric slot, so
+    /// none of them fire on an abstract `T`: `a.store(1, ..)` leaves the literal
+    /// at its i32 default even though the receiver already states the width, and
+    /// the caller has to spell it out.
+    ///
+    /// Deliberately a SEPARATE array rather than a rewrite of `param_types`:
+    /// those same types feed `classify_args_from_params`, which derives each
+    /// argument's move/borrow classification from them, so substituting in place
+    /// would flip classifications for every call on a generic owner in the
+    /// program.  Only a substitution landing on an adoptable numeric type is
+    /// recorded - the sole kind the propagation can consume - so no other
+    /// consumer of the call's typing can observe this.
+    ///
+    /// Owner parameters are matched by NAME against the template's declared
+    /// list, never by `param_index`: a METHOD-level parameter carries an index
+    /// into the method's own list, and reading the owner's argument at that
+    /// index would substitute an unrelated type.  A name the owner does not
+    /// declare yields no hint, which is what keeps `NlsBox<S>::take<T>(v: T)`
+    /// inferring `T` from the argument as before.
+    owner_generic_numeric_hints(mut &this, call: CallExprNode*,
+                                param_types: &TypeRef[]) -> TypeRef[] {
+        mut out: TypeRef[] = [];
+        for (mut i: i64 = 0; i < param_types.length; i++) { out.push(TypeRef::invalid()); }
+        if (out.length == 0) { return out; }
+        if (this.ctx.generic_registry == null) { return out; }
+
+        mut any_abstract: boolean = false;
+        for (mut i: i64 = 0; i < param_types.length; i++) {
+            if (param_types[i].is_valid() && this.types.contains_generic_param(param_types[i])) {
+                any_abstract = true;
+                break;
+            }
+        }
+        if (!any_abstract) { return out; }
+
+        // The owner's (declared params, bound args).  An instance call reads
+        // them off the receiver; a static call off the scope's turbofish, which
+        // is the only place they are written.
+        mut tmpl: TemplateEntry* = null;
+        mut owner_args: TypeRef[] = [];
+        const callee_node: ASTNode* = call.callee as ASTNode*;
+        if (callee_node.kind == NodeKind::MemberAccess) {
+            const member: MemberAccessNode* = call.callee as MemberAccessNode*;
+            if (member.object == null) { return out; }
+            const recv: TypeRef = member.object.resolved_type;
+            // Generic-identity view, not a raw kind test: the receiver may be a
+            // pre-mono `InstantiatedType` wrapper or a post-mono concrete
+            // aggregate, and both answer through it.  Pointer/reference layers
+            // are peeled for free.
+            const base: TypeRef = this.types.view_generic_base(recv);
+            if (!base.is_valid()) { return out; }
+            tmpl = this.ctx.generic_registry.get_template_by_type_id(base.id);
+            owner_args = this.types.view_type_args_copy(recv);
+        } else if (callee_node.kind == NodeKind::ScopeResolution) {
+            const sr: ScopeResolutionNode* = call.callee as ScopeResolutionNode*;
+            if (sr.scope_generic_args.length == 0) { return out; }
+            if (this.ctx.type_resolver == null) { return out; }
+            tmpl = this.lookup_scope_template(sr.scope_name);
+            if (tmpl == null) { return out; }
+            mut res_ctx: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
+            this.symbolic.symbolic_bind_params(&res_ctx);
+            for (mut i: i64 = 0; i < sr.scope_generic_args.length; i++) {
+                owner_args.push(this.ctx.type_resolver.resolve(sr.scope_generic_args[i], &res_ctx));
+            }
+            if (owner_args.length < tmpl.param_count) {
+                owner_args = this.ctx.type_resolver.expand_default_type_args(
+                    tmpl, owner_args, &res_ctx);
+            }
+        } else {
+            return out;
+        }
+        if (tmpl == null) { return out; }
+        if (tmpl.param_names.length != owner_args.length) { return out; }
+
+        for (mut i: i64 = 0; i < param_types.length; i++) {
+            if (!param_types[i].is_valid()) { continue; }
+            const pt: Type* = this.arena.lookup(param_types[i].id);
+            if (pt == null) { continue; }
+            mut pname: SymbolStr = SymbolStr::empty();
+            mut named: boolean = false;
+            if (pt.kind == TypeKind::GenericParam) {
+                pname = (pt as GenericParamType*).param_name;
+                named = true;
+            } else if (pt.kind == TypeKind::BoundedParam) {
+                pname = (pt as BoundedParamType*).param_name;
+                named = true;
+            }
+            if (!named) { continue; }
+            for (mut p: i64 = 0; p < tmpl.param_names.length; p++) {
+                if (!tmpl.param_names[p].equals(pname)) { continue; }
+                // Inside the owner's own template body the argument is still the
+                // symbolic parameter, which is not numeric - so the body's own
+                // literals keep defaulting, exactly as before.
+                if (is_adoptable_numeric_type(this.arena, owner_args[p])) {
+                    out[i] = owner_args[p];
+                }
+                break;
+            }
+        }
+        return out;
+    }
+
 
     // -- The central dispatcher --
 
@@ -517,12 +626,25 @@ type struct CallResolver {
         param_types = this.substitute_explicit_generic_param_types(
             call, &param_types, &forced_expected);
 
+        // A formal stated in a generic OWNER's parameters (`Atomic<T>::store(val: T, ..)`)
+        // is abstract here, so every numeric rule below rejects it.  This is the
+        // same list viewed through the receiver's / turbofish's type arguments,
+        // filled only where that view is a concrete numeric slot; `param_types`
+        // itself must stay as declared, because `classify_args_from_params`
+        // reads it.  Empty for a non-generic owner.
+        const owner_hints: TypeRef[] = this.owner_generic_numeric_hints(call, &param_types);
+
         const saved_expected: TypeRef = this.state.expected_type;
         for (mut i: i64 = 0; i < call.arguments.length; i++) {
             mut push_expected: boolean = false;
             if (i < forced_expected.length && forced_expected[i]) { push_expected = true; }
             const arg: ExpressionNode* = call.arguments[i];
-            if (arg != null && i < param_types.length && param_types[i].is_valid()) {
+            // The slot this argument actually binds: the owner-substituted view
+            // where there is one, the declared type otherwise.
+            mut slot: TypeRef = TypeRef::invalid();
+            if (i < param_types.length) { slot = param_types[i]; }
+            if (i < owner_hints.length && owner_hints[i].is_valid()) { slot = owner_hints[i]; }
+            if (arg != null && slot.is_valid()) {
                 const arg_node: ASTNode* = arg as ASTNode*;
                 if (arg_node.kind == NodeKind::ArrayLiteral) {
                     push_expected = true;
@@ -540,16 +662,16 @@ type struct CallResolver {
                         || arg_node.kind == NodeKind::ScopeResolution) {
                     push_expected = true;
                 } else if (is_negative_numeric_literal_expr(arg)
-                        && this.literals.is_signed_int_type(param_types[i])) {
+                        && this.literals.is_signed_int_type(slot)) {
                     push_expected = true;
                 } else if ((arg_node.kind == NodeKind::BinaryExpression
                             || arg_node.kind == NodeKind::UnaryExpression)
                         && is_constant_numeric_expr(arg)
                         && !is_negative_numeric_literal_expr(arg)
-                        && is_wide_int_type(this.arena, param_types[i])) {
+                        && is_wide_int_type(this.arena, slot)) {
                     push_expected = true;
                 } else if (arg_node.kind == NodeKind::Literal
-                        && is_adoptable_numeric_type(this.arena, param_types[i])) {
+                        && is_adoptable_numeric_type(this.arena, slot)) {
                     // A numeric literal argument adopts the PARAMETER's type, the
                     // same way one adopts a declaration's annotation.  The `else`
                     // below otherwise CLEARS the hint, leaving the literal at its
@@ -575,7 +697,7 @@ type struct CallResolver {
                     // bytes. Scoped to a literal operand so `&place` / `&mut`
                     // argument typing is untouched.
                     const u_arg: UnaryExprNode* = arg as UnaryExprNode*;
-                    const pt_ref: Type* = this.arena.lookup(param_types[i].id);
+                    const pt_ref: Type* = this.arena.lookup(slot.id);
                     if (u_arg.op.lexeme == "&" && u_arg.operand != null
                         && u_arg.operand.kind == NodeKind::Literal
                         && pt_ref != null && pt_ref.kind == TypeKind::Reference) {
@@ -584,7 +706,7 @@ type struct CallResolver {
                 }
             }
             if (push_expected) {
-                this.state.expected_type = param_types[i];
+                this.state.expected_type = slot;
             } else {
                 this.state.expected_type = TypeRef::invalid();
             }
@@ -4418,6 +4540,35 @@ type struct CallResolver {
         return out;
     }
 
+    /// The generic template a scope-call's scope names (`Atomic` in
+    /// `Atomic<u64>::new(..)`), or null.  The scope arrives as written, so all
+    /// four keys it can be registered under are tried: verbatim, through the
+    /// module graph, qualified into the current namespace, and as a
+    /// cross-module leaf.
+    lookup_scope_template(&this, base_name: SymbolStr) -> TemplateEntry* {
+        if (this.ctx.generic_registry == null) { return null; }
+        mut entry: TemplateEntry* = this.ctx.generic_registry.get_template(base_name);
+        if (entry == null) {
+            const di_qual: SymbolStr = this.ctx.resolve_scoped_or(base_name);
+            if (di_qual.is_valid() && !di_qual.equals(base_name)) {
+                entry = this.ctx.generic_registry.get_template(di_qual);
+            }
+        }
+        if (entry == null) {
+            const qualified: SymbolStr = this.ctx.qualify_symbol_sym(base_name);
+            if (!qualified.equals(base_name)) {
+                entry = this.ctx.generic_registry.get_template(qualified);
+            }
+        }
+        if (entry == null) {
+            const cross_sym: SymbolStr = this.types.resolve_cross_module_name(base_name);
+            if (cross_sym.is_valid()) {
+                entry = this.ctx.generic_registry.get_template(cross_sym);
+            }
+        }
+        return entry;
+    }
+
     resolve_generic_scope_name(&this, base_name: SymbolStr, generic_args: &TypeAnnotation*[]) -> SymbolStr {
         if (this.ctx.type_resolver == null) { return SymbolStr::empty(); }
         mut res_ctx: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
@@ -4428,25 +4579,9 @@ type struct CallResolver {
             if (!arg_ref.is_valid()) { return SymbolStr::empty(); }
             arg_refs.push(arg_ref);
         }
-        if (this.ctx.generic_registry != null) {
-            mut entry: TemplateEntry* = this.ctx.generic_registry.get_template(base_name);
-            if (entry == null) {
-                const di_qual: SymbolStr = this.ctx.resolve_scoped_or(base_name);
-                if (di_qual.is_valid() && !di_qual.equals(base_name)) {
-                    entry = this.ctx.generic_registry.get_template(di_qual);
-                }
-            }
-            if (entry == null) {
-                const qualified: SymbolStr = this.ctx.qualify_symbol_sym(base_name);
-                if (!qualified.equals(base_name)) { entry = this.ctx.generic_registry.get_template(qualified); }
-            }
-            if (entry == null) {
-                const cross_sym: SymbolStr = this.types.resolve_cross_module_name(base_name);
-                if (cross_sym.is_valid()) { entry = this.ctx.generic_registry.get_template(cross_sym); }
-            }
-            if (entry != null && arg_refs.length < entry.param_count) {
-                arg_refs = this.ctx.type_resolver.expand_default_type_args(entry, arg_refs, &res_ctx);
-            }
+        const entry: TemplateEntry* = this.lookup_scope_template(base_name);
+        if (entry != null && arg_refs.length < entry.param_count) {
+            arg_refs = this.ctx.type_resolver.expand_default_type_args(entry, arg_refs, &res_ctx);
         }
         const base_qname: QualifiedName = QualifiedName::from_symbol(base_name);
         return MangledName::specialized_identifier(this.intern, this.arena, base_qname, arg_refs);
