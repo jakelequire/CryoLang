@@ -37,7 +37,7 @@ not for routine judgement calls.
 | 1 | Core types in stdlib (`Poll`/`Future`/`Context`/`Waker`) + `block_on` + hand-written futures | ✅ done+validated 2026-07-22 (no repin) |
 | 2 | Compiler: `async fn` parse + state-machine lowering + `await` desugar | ✅ DONE+validated. **Address stability COMPLETE 2026-07-29 — the in-place carrier is UNIVERSAL and `carrier_can_live_in_place` is DELETED.** Every carried aggregate is BUILT INTO its `Option<T>` field and stays there for the life of the future; the moving carrier is gone, not bypassed. The two shapes that used to force it — a state that GIVES the value away, one that REBUILDS it — are now expressible because `subst_name_expr`/`subst_name_stmt` carry a **`by_value` position flag**: a mention that reaches into the value becomes `*<nm>$p`, one that hands it over becomes `take().unwrap()`, one that rebuilds it republishes the field. A by-value argument is classified from `arg_binding`, and an `Unclassified` slot reads as a BORROW (the opposite default from the move passes — over-reporting strands the next `unwrap_ptr` on a `None`, under-reporting is a loud `E0453`). Needed three non-async root-cause fixes: synthesized `Option::Some`/`Poll::Ready` payloads were `Unclassified`; trait `MethodInfo.param_types` wrongly included the receiver, breaking its documented non-self contract; and argument classification never reached a bare generic param bounded by a `where` clause. `make test` **1903 / 165 / 14, 0 failed**. **FINDING — the frame-address subsystem and `emit_recv_refresh` are NOT dead and were NOT deleted:** residency applies only to values that are actually CARRIED, and both `E0455_async_*` negatives address a local that is never read after the suspend, so it is not carried and still dies with the poll frame. Inverting them would accept unsound code. The payoff is already collected anyway — `addr_place_root` stops at the first indirection, so `&c.canary` on a carried local becomes `&(*c$p).canary` and is allowed (proven: `got=99 drops=1`), now pinned by a test. **OPEN (Jake's call):** use-after-give-away *within one state* no longer reports `E0452`, because the take and the later borrow are unrelated expressions to MoveCheck; see the newest §9 entry for the two candidate fixes. Earlier (2026-07-28): the acceptance probe reads `55` (it reads `0` under the old pin) and is `lang/async_carried_local_address_stable.cryo`; two `E0455` negatives were INVERTED into positive tests. Drop TIMING is restored explicitly by `release_before_ready` — deferring a carried socket's close to future-drop deadlocked a real test. The design IS settled and does **not** need flag-gated drops — keep the `Option<T>` field and reach the payload in place via `unwrap_ptr`. **Its blocker is now REMOVED (2026-07-28, later).** In-place residency turns a missed give-away from a loud `unwrap`-on-`None` into a **silent double free**, so it needed a rejection of by-value moves out of `*p`, which in turn needed sound argument classification. Both landed: arguments are now classified from real **parameter types** (`ArgBinding`, set in sema, consumed in lockstep by all four argument loops), `!autoref` is gone as a by-value proxy, and `check_deref_move_out` is in the tree and does **not** misfire on the lowering's own `*this$recv`. `unsafe` became the escape hatch and `core::mem::take_ptr` was **deleted** (Jake's call — it was byte-identical to `*p` and existed only to be invisible to the checker). Two pre-existing defects fixed on the way: `unsafe { }` silently disabled move checking wholesale, and a generic call reachable only from inside an `unsafe` block was never specialized. See the newest §9 entry. Earlier: **Two carried-aggregate soundness bugs fixed 2026-07-27** — (1) `await <method>` on an owning local inside a LOOP left its carrier empty (`unwrap` on `None`): the pass asked "did this state give the value away?" AFTER inserting its own by-value hand-back store, and mistook that store for the answer; (2) an `async fn` with NO awaits COPIED an owning parameter out of its field instead of moving it, double-freeing it. Both fixed at the root in `async_lower.cryo`; the `Join` diagnosis recorded under `TcpConn` was wrong and is corrected. New permanent coverage: `async_stress_shapes.cryo` (31 tests, asserted numbers + counted drops, every shape paired with a control) and the flood test. See the newest §9 entry. Earlier: DONE+validated; **the deferred aggregate-across-await tail LANDED 2026-07-24 — an `async function` can now hold an aggregate across a suspend, take a droppable aggregate parameter, and be `spawn`ed on an `Executor`** (see the newest §9 entry). Earlier: DONE (2026-07-23) — parse + no-await (1b) + single await (2) + N straight-line (3) + awaits across `if`/`else` (4a) + awaits across `while`/`for`/`loop`/`do-while` + `break`/`continue` + `mut` loop-carried promotion (4b) + scope-aware alpha-rename, all committed through `5e28a74f`. **Inc 4c DONE (2026-07-23): `await` inside a `match` arm — dispatch `match(subj)` → per-arm entry states → join; scalar pattern bindings captured to fields (aggregate→E0600, ref→E0455); pattern bindings alpha-renamed for by-name soundness; non-exhaustive match gets synth `_ => join`. Plus the bare-block-with-await warm-up. Both-OS fixed point, `win-s2`/`win-s3` = 0/235 `.ll` → NO REPIN, UNCOMMITTED.** All common control flow now lowers → Phase 2 complete. |
 | 3 | Executor + `Waker` + `spawn`/`JoinHandle`; multi-thread; poll-boundary `catch_unwind` isolation | ✅ DONE+validated (2026-07-24) — surface LOCKED 2026-07-23. **(a)** single-thread executor + ready-queue + re-enqueueing Waker; **(b)** `spawn`/`JoinHandle` (Output via `TaskShared<O>`), `block_on`, `join`/`detach`/`abort`, drop=detach; **(c)** pthread worker pool + per-task atomic run-state (IDLE/SCHEDULED/RUNNING/NOTIFIED) + condvar `join`/`block_on` + `catch_unwind` poll-boundary isolation. Needed a NEW compiler `![config(panic_unwind)]` gating atom (see §9) → Phase-1 both-OS REPIN (selfhost fixed point, 235 `.ll`). Executor is self-contained (own pthread wrappers, no `thread::Scope` dep). Validated on Linux: regression 30/30, isolation 30/30. UNCOMMITTED. |
-| 4 | Reactor (epoll/IOCP) + async I/O over `std::net` + timers + `async fn main` + combinators | ◐ in progress — every named sub-part (4x/5x/6) is ✅; what remains is DNS blocking the executor and the unported UDP surface (see the root `HANDOFF.md` §2 items 5 and 6). **The Windows AFD reactor is VALIDATED (2026-07-25, 30/30 runs, 0 failures, 0 hangs, real Windows host) — do NOT re-validate it. The earlier "written but UNVALIDATED" reading was a wine 9.0 limitation (`IOCTL_AFD_POLL` unserviceable), never a code defect. Inc 4b DONE on both OSes.** Interface fork LOCKED by Jake: **one readiness interface both OSes, Windows via real AFD** (not WSAPoll, not a per-OS split). Sockets are to become **async-only with every consumer ported** (Jake, 2026-07-24) — that port is **UNBLOCKED as of 2026-07-24**: the aggregate-across-await tail landed, and the follow-on "rebuilt from inside a branch" E0600 is now removed too (newest §9 entry). Forks LOCKED earlier: waker lifetime = **separate `Arc`-wrapper**; reactor = **dedicated thread, per-`Executor`** (`![thread_local]` current-reactor handle); platform = **both OSes (epoll + IOCP)**. **Inc 4a DONE+validated (2026-07-24): Arc-refcounted `Waker` (Copy→non-Copy) + `Arc<Task>` lifetime; finish-vs-park now implicit via `Task::drop` on the last decref. Needed a COMPILER fix (owner-generic static with a defaulted owner param + nested return → E0636; `call_resolver.cryo` default-backfill) → selfhost fixed point BOTH OS, win-s2 vs win-s3 = 0/235 `.ll`, REPINNED both OS. UNCOMMITTED.** NEXT = Inc 4b (the reactor: epoll+IOCP interface — bring Jake the readiness-vs-completion unification fork). |
+| 4 | Reactor (epoll/IOCP) + async I/O over `std::net` + timers + `async fn main` + combinators | ✅ **DONE 2026-07-31.** Every named sub-part (4x/5x/6) was already ✅; the two that held the row open are closed. **(5) DNS no longer blocks the executor:** `getaddrinfo` has no non-blocking form on either platform, so the answer is a **blocking thread pool** (`future::blocking`, new) whose completion fires a `Waker` — `dns::Resolve` is the async spelling and `https::first_ipv4` awaits it. The pool is per-`Executor`, reached through a `![thread_local]` handle exactly as the reactor is, starts with **zero** threads and grows on demand to 8. Job blocks are **refcounted, not handshaken**: releasing a stored waker can reclaim its task, which drops the future, which lets go of the same block RE-ENTRANTLY, and a last-one-frees handshake would free it underneath that drop. **(6) UDP ported:** `UdpSend`/`UdpSendTo`/`UdpRecv`/`UdpRecvFrom` on the existing readiness reactor, blocking `send`/`recv` deleted, sockets non-blocking from `bind`/`unbound`; `net` has no sync island left. Three copies of `require_reactor` folded into `Reactor::require`, and reactor.cryo's private waker-slot helpers into `Waker::take`/`Waker::replace`. **The Windows AFD reactor is VALIDATED (2026-07-25, 30/30 runs, 0 failures, 0 hangs, real Windows host) — do NOT re-validate it. The earlier "written but UNVALIDATED" reading was a wine 9.0 limitation (`IOCTL_AFD_POLL` unserviceable), never a code defect.** Interface fork LOCKED by Jake: one readiness interface both OSes, Windows via real AFD. Waker lifetime = separate `Arc`-wrapper; reactor = dedicated thread, per-`Executor`. **Out of scope by Jake's 2026-07-31 scope call: `process`, `stdio` and `fs` async are follow-on projects** — `fs` in particular does NOT fit a readiness reactor (epoll always reports a regular file ready) and needs either this blocking pool or a second backend. |
 
 | 4d | Timers — reactor deadline chain + `Sleep` | ✅ DONE+validated 2026-07-26. Deadline-sorted chain on `Reactor` (`register_timer`/`cancel_timer`), reactor thread bounds its wait by the earliest deadline instead of `-1`, fires expired wakers after the wait, kicks on a new-earliest arming. `stdlib/future/timer.cryo`: `Sleep::new(dur)` / `Sleep::until(instant)`, absolute deadlines, saturating construction, `Drop` disarms. Self-wakes under a reactor-less driver so `future::block_on` still completes it. Also fixed a real teardown UAF: `Executor::drop` freed the `Reactor` before `drain_cancelled()`, so a task woken by readiness but not yet driven dereferenced freed memory in its future's `drop` — split into `Reactor::stop` / `Reactor::free`. 10 tests. |
 | 4f | Combinators — `join` / `select` / `timeout` | ✅ DONE+validated 2026-07-26. `stdlib/future/combinator.cryo`; built through the `Futures` namespace (`Futures::join`/`select`/`timeout`/`timeout_at`). Cancellation is a plain drop — the `Select` loser and the `Timeout` victim are released with the combinator, which is what disarms a `Sleep` and releases an I/O registration. Arity 2, higher arities nest (tested). 9 tests. **`try_join` SHIPPED 2026-07-31** — the inference gap that blocked it is FIXED at the root, so the combinator set is complete. `Futures::try_join(a, b)` completes with both values or the first error, abandoning the sibling; the abandoned child is released by the combinator's own drop, exactly as `Select` releases its loser. A value that arrived before the error is dropped with the combinator — the output is one `Result`, and `join` remains the way to see every outcome. `TryJoin` carries a `done` flag distinct from `a_done`/`b_done` because an error completes it with the other side still unfinished. 3 tests (both-ok value + concurrency bound, short-circuit against an hour-long sibling with prompt teardown, error-after-success). **The compiler fix is in `TypeResolver::project_where_bound_params_into`, not where this file previously guessed** — see the newest §9 entry. |
@@ -5268,3 +5268,110 @@ either, so adding only `IfExpression` there would be arbitrary, and both fall ba
 (`E0238`, "expected `T`, found `i64`") when the subject is an **inline** `Option::Some(<local>)`.
 Reproduces in plain synchronous code with no `async` and no if-expression anywhere; binding the
 subject to an annotated local first works. Its own item.
+
+---
+
+## 2026-07-31 — Phase 4 CLOSED: the blocking pool, async DNS, async UDP
+
+Handoff items (5) and (6) — the last two things holding the Phase-4 row at `◐`. Both are
+stdlib-only; the compiler's IR does not move, so **no repin is owed**.
+
+### (5) DNS was blocking the executor — a live defect in shipped async code
+
+`HttpsClient::send` is `async`, and at `https.cryo:93` it called `first_ipv4` → `dns::resolve` →
+`getaddrinfo`, a synchronous call with no non-blocking form on either platform. Every async HTTPS
+request therefore stalled an executor worker for the whole lookup — the slowest and most
+latency-variable step in opening a connection — and on a single-threaded `Executor`, the whole
+runtime.
+
+The fix is the standard one: **a blocking thread pool**, `stdlib/future/blocking.cryo` (new).
+
+- **Reached like the reactor.** `BlockingPool::current()` is a `![thread_local]` an executor worker
+  publishes as it starts, alongside `Reactor::set_current`. `Context`'s shape is fixed, so this is
+  how a future deep in a poll tree finds either driver.
+- **Costs nothing unused.** `BlockingPool::start()` creates **zero** threads; the first `submit`
+  creates one, and growth happens only when no thread is already idle, to a ceiling of 8. The
+  ceiling is sized for concurrent *waits*, not for CPUs — a pool thread is asleep in a syscall.
+- **Type-erased the way `Task` and `Waker` are.** A `BlockingJob` header carrying
+  `run_fn`/`drop_fn`, with the caller's block laid out around it and the header at offset 0.
+
+**The one real design decision: the job block is REFCOUNTED, not handshaken.** A blocking job cannot
+be cancelled — once a thread is inside `getaddrinfo` it returns when it returns — so the block
+outlives any future that gives up on it and both sides must let go independently. The obvious shape
+is `TaskShared`'s two-actor handshake (whoever swaps last frees). **It is wrong here**, and subtly:
+releasing a stored waker can be the last release of its task, which runs the task's destructor,
+which drops its future, which lets go of *this same block* **re-entrantly**. A handshake frees the
+block underneath the very drop that triggered it. A refcount survives, because the side running the
+re-entrant drop is still holding a reference of its own. The reactor solves the same re-entrancy by
+making its callers look up an `fd`/`id` in a table rather than hold a pointer; a job has to hand back
+a *payload*, so indirection was not available and the refcount is what replaces it.
+
+`dns::Resolve` is the async spelling. Two smaller decisions inside it:
+
+- The job owns a `String` **copy** of the host, not the caller's `Str`. The future that asked may be
+  long gone — along with whatever the `Str` pointed into — by the time a pool thread reads it.
+- The answer is stored as its two halves (`addrs` + `err` + `produced`/`ok` flags) rather than as a
+  `Result`. `Result` has no `Drop` impl, so `op.drop()` through a pointer is `E0358`; only the halves
+  have a `drop` the block's teardown can call. Collecting swaps an empty `ResolvedAddrs` in, so the
+  teardown stays correct whether or not anyone was still waiting.
+- **No pool → run inline and complete on the first poll**, mirroring what `Sleep` does with no
+  reactor. The free `future::block_on` driver is already a blocking driver, so this is honest there
+  rather than a hang.
+
+`Executor::drop` gained one ordering constraint, and it is load-bearing: **the blocking pool stops
+BEFORE the reactor.** Cancelling a queued job releases its waker, which can reclaim a task, whose
+future's drop may cancel a *reactor* registration — so the reactor has to still be standing. Both
+blocks are freed after the queue drain, as the reactor's already was.
+
+### (6) UDP ported
+
+`udp.cryo` had zero `async`. It now mirrors `tcp.cryo` exactly: `UdpSend` / `UdpSendTo` / `UdpRecv` /
+`UdpRecvFrom`, each owning its socket and buffer for one datagram and handing both back in a `UdpIo`
+(or `UdpReceived`, which adds the peer). The blocking `send`/`recv`/`send_to`/`recv_from` are
+deleted, so `net` has no synchronous island left.
+
+`bind`/`unbound` now set non-blocking mode themselves. With the blocking surface gone there is no
+other correct setting, and leaving it to the caller would be a silent worker-stall trap.
+`set_read_timeout` is deleted — `SO_RCVTIMEO` never fires on a non-blocking socket, and the async
+answer is `Futures::timeout`. `net::sys::set_timeout` is left in place: it is the documented OS seam,
+not dead code, though UDP was its only caller.
+
+### Two duplications folded up on the way through
+
+- `require_reactor` existed **three** times (tcp, tls, and about to be a fourth in udp) →
+  `Reactor::require()`.
+- `take_waker` / `swap_waker` were private to `reactor.cryo` → `Waker::take` / `Waker::replace`, so
+  the pool's waker slot obeys the same rule from the same implementation.
+
+### Tests
+
+`tests/tests/stdlib/future_blocking.cryo` is the one that matters. The property under test is not
+"the job finished" but "**the job did not run on the thread that submitted it**", and a job that
+merely sleeps cannot tell those apart without timing the test. So the job **blocks on a flag only
+another task on the same executor can set**, and the executor is given exactly **one** worker:
+offloaded → the sibling runs, sets the flag, the job completes; not offloaded → the single worker is
+stuck inside the job, the sibling never runs, and the job gives up at its own 3s bound and reports 0.
+**The bound is what keeps the failure mode a red test rather than a hung CI.** The sibling waits on a
+`Sleep` before setting, so this proves offload rather than `join`'s polling order.
+
+Offload and **concurrency are separate claims**, and the first draft of the four-job test conflated
+them — waiting on the flag alone, a pool that serialized onto one thread would have passed it, because
+whoever waits the flag out leaves it set for everyone behind them. The concurrency test therefore adds
+a **barrier**: every job bumps a shared arrival count and refuses to finish until all four have
+arrived, so a serializing pool deadlocks its first job against three that never start and reports 0 at
+its bound. Worth recording because the test *passed* in both forms — only the claim in its comment was
+wrong.
+
+Also: a future dropped mid-flight whose block the pool still owns (the refcount path, plus the
+shutdown join). That test takes a reference **of its own** before handing the pointer over; without
+it, naming the block afterwards would be a use-after-free the instant the job happened to end. That
+`retain()` is the API's own rule, not a test trick.
+
+`net_dns.cryo` gains four async tests — the async answer must match the blocking one, unknown names
+must still fail, two lookups in flight at once, and the no-pool inline path. Deliberately **no timing
+assertion**: localhost answers too fast for one to mean anything, which is exactly why the structural
+test above exists. `net_udp.cryo` is rewritten onto the futures.
+
+### Gates
+
+See the session's handoff. `make cryo` first, always.

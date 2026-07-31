@@ -118,37 +118,11 @@ type struct Timer {
     next:     Timer*;
 }
 
-/// Move the waker out of `slot`, leaving a no-op behind. The caller owns the
-/// result: dropping it releases the task reference the stored waker held.
-///
-/// Reading the old waker out is mandatory, not stylistic — assignment through a
-/// pointer does not drop the value it overwrites, so storing over a live waker
-/// would strand its task reference and the task would never be freed.
-private function take_waker(slot: Waker*) -> Waker {
-    // The no-op store is what makes the read a take: it leaves nothing in the
-    // slot that could release the task reference a second time.
-    unsafe {
-        const w: Waker = *slot;
-        *slot = Waker::noop();
-        return w;
-    }
-}
-
-/// Store `w` in `slot` and hand back the waker that was there (a future that
-/// re-registers before its previous registration fired replaces it).
-///
-/// The old waker is *returned* rather than dropped here because dropping it can
-/// run arbitrary code — see the "no waker drops under the lock" rule on
-/// `Reactor`. Callers park it in a local that outlives the unlock.
-private function swap_waker(slot: Waker*, w: Waker) -> Waker {
-    // Same balance as `take_waker`: the incoming waker replaces what was read
-    // out, so the slot never co-owns the returned one.
-    unsafe {
-        const old: Waker = *slot;
-        *slot = w;
-        return old;
-    }
-}
+// Stored wakers are taken out and swapped with `Waker::take` / `Waker::replace`
+// (see `future::waker`): a slot holding a live waker may never simply be
+// assigned over, and a displaced waker may never be dropped under this
+// module's lock. A future that re-registers before its previous registration
+// fired replaces it, which is what `Waker::replace` returns.
 
 
 /// The current thread's reactor: set by an executor worker for the lifetime of
@@ -232,8 +206,8 @@ type struct Reactor {
             loop {
                 const reg: Registration* = rt.buckets[b];
                 if (reg == null) { break; }
-                mut wr: Waker = take_waker(&reg.read_waker);
-                mut ww: Waker = take_waker(&reg.write_waker);
+                mut wr: Waker = Waker::take(&reg.read_waker);
+                mut ww: Waker = Waker::take(&reg.write_waker);
                 reg.interest = 0;
                 rt.remove(reg);
                 wr.drop();
@@ -247,7 +221,7 @@ type struct Reactor {
             const t: Timer* = rt.timers;
             if (t == null) { break; }
             rt.timers = t.next;
-            mut tw: Waker = take_waker(&t.waker);
+            mut tw: Waker = Waker::take(&t.waker);
             mut alloc: GlobalAlloc = GlobalAlloc::new();
             alloc.deallocate(NonNull::new(t as u8*), Layout::of<Timer>());
             tw.drop();
@@ -276,6 +250,18 @@ type struct Reactor {
         g_current_reactor = rt;
     }
 
+    /// The current thread's reactor, or a panic explaining that async I/O needs
+    /// one. Called by a future at the moment it is about to park: returning
+    /// `Pending` with nowhere to register a waker would hang the task forever,
+    /// so failing loudly here beats failing silently later.
+    static require() -> Reactor* {
+        mut rt: Reactor* = g_current_reactor;
+        if (rt == null) {
+            panic("async I/O requires an Executor: no reactor on this thread", FILE, LINE);
+        }
+        return rt;
+    }
+
     /// Arm `fd` for one wake in `direction` (exactly one INTEREST_* bit) and
     /// store `w` as the waker to fire. Replaces any waker already stored for
     /// that direction (a re-registering future supersedes its own earlier one).
@@ -292,16 +278,16 @@ type struct Reactor {
         rt_mtx_lock(&this.mtx[0]);
         mut reg: Registration* = this.find(fd);
         if (reg == null) { reg = this.insert(fd); }
-        if ((direction & INTEREST_READ) != 0) { replaced = swap_waker(&reg.read_waker, w); }
-        else                                     { replaced = swap_waker(&reg.write_waker, w); }
+        if ((direction & INTEREST_READ) != 0) { replaced = Waker::replace(&reg.read_waker, w); }
+        else                                     { replaced = Waker::replace(&reg.write_waker, w); }
         reg.interest = reg.interest | direction;
         // A descriptor the OS refuses to watch (closed, or not pollable) would
         // park its future forever. Take the waker straight back out and fire it
         // below: the future re-polls, its syscall reports the real error, and it
         // fails instead of hanging.
         if (!rt_arm(&this, reg)) {
-            if ((direction & INTEREST_READ) != 0) { failed = take_waker(&reg.read_waker); }
-            else                                     { failed = take_waker(&reg.write_waker); }
+            if ((direction & INTEREST_READ) != 0) { failed = Waker::take(&reg.read_waker); }
+            else                                     { failed = Waker::take(&reg.write_waker); }
             reg.interest = reg.interest & ~direction;
             if (reg.interest == 0) { this.remove(reg); }
         }
@@ -318,8 +304,8 @@ type struct Reactor {
         rt_mtx_lock(&this.mtx[0]);
         const reg: Registration* = this.find(fd);
         if (reg != null && (reg.interest & direction) != 0) {
-            if ((direction & INTEREST_READ) != 0) { taken = take_waker(&reg.read_waker); }
-            else                                     { taken = take_waker(&reg.write_waker); }
+            if ((direction & INTEREST_READ) != 0) { taken = Waker::take(&reg.read_waker); }
+            else                                     { taken = Waker::take(&reg.write_waker); }
             reg.interest = reg.interest & ~direction;
             if (reg.interest == 0) { this.remove(reg); }
             else                      { rt_arm(&this, reg); }
@@ -337,8 +323,8 @@ type struct Reactor {
         rt_mtx_lock(&this.mtx[0]);
         const reg: Registration* = this.find(fd);
         if (reg != null) {
-            wr = take_waker(&reg.read_waker);
-            ww = take_waker(&reg.write_waker);
+            wr = Waker::take(&reg.read_waker);
+            ww = Waker::take(&reg.write_waker);
             reg.interest = 0;
             this.remove(reg);
         }
@@ -420,7 +406,7 @@ type struct Reactor {
             if (cur.id == id) {
                 if (prev == null) { this.timers = cur.next; }
                 else              { prev.next   = cur.next; }
-                taken = take_waker(&cur.waker);
+                taken = Waker::take(&cur.waker);
                 found = cur;
                 break;
             }
@@ -469,7 +455,7 @@ type struct Reactor {
             const head: Timer* = this.timers;
             if (head != null && head.deadline <= now) {
                 this.timers = head.next;
-                w = take_waker(&head.waker);
+                w = Waker::take(&head.waker);
                 expired = head;
             }
             rt_mtx_unlock(&this.mtx[0]);
@@ -496,11 +482,11 @@ type struct Reactor {
         const reg: Registration* = this.find(fd);
         if (reg != null) {
             if ((ready & reg.interest & INTEREST_READ) != 0) {
-                wr = take_waker(&reg.read_waker);
+                wr = Waker::take(&reg.read_waker);
                 reg.interest = reg.interest & ~INTEREST_READ;
             }
             if ((ready & reg.interest & INTEREST_WRITE) != 0) {
-                ww = take_waker(&reg.write_waker);
+                ww = Waker::take(&reg.write_waker);
                 reg.interest = reg.interest & ~INTEREST_WRITE;
             }
             if (reg.interest == 0) { this.remove(reg); }

@@ -69,6 +69,7 @@ import future::poll;
 import future::waker;
 import future::traits;
 import future::reactor;
+import future::blocking;
 
 
 // Task outcome (published by the executor when a task finishes), read by a
@@ -345,6 +346,7 @@ type struct ExecInner {
     tail:     Task*;    // enqueue end
     shutdown: boolean;  // set at Executor drop; guarded by q_mutex
     reactor:  Reactor*; // the I/O driver this pool's workers publish while polling
+    blocking: BlockingPool*;   // where workers offload calls the reactor cannot drive
 
     /// Link `task` at the tail of the ready queue and wake one worker. The
     /// caller has already set `task.run_state = ST_SCHEDULED`, so a concurrent
@@ -578,10 +580,13 @@ function dispose_shared_thunk<O>(shared_raw: u8*, drop_result: u8) -> void {
 /// entry (a `(ExecInner*) -> void` fn-ptr handed to `thread::Scope::spawn`), so
 /// a free function.
 function worker_body(inner: ExecInner*) -> void {
-    // Publish this pool's reactor for the thread's lifetime: every future this
-    // worker polls reaches it through `Reactor::current()`, so an I/O future can
-    // park without the reactor being threaded through `Context`.
+    // Publish this pool's reactor and blocking pool for the thread's lifetime:
+    // every future this worker polls reaches them through `Reactor::current()` /
+    // `BlockingPool::current()`, so an I/O future can park — and a future whose
+    // work has no readiness form can offload it — without either driver being
+    // threaded through `Context`, whose shape is fixed.
     Reactor::set_current(inner.reactor);
+    BlockingPool::set_current(inner.blocking);
     loop {
         const task: Task* = inner.take();
         if (task == null) { return; }
@@ -837,8 +842,11 @@ type struct Executor {
         inner.head     = null;
         inner.tail     = null;
         inner.shutdown = false;
-        // Before any worker starts: each publishes this handle as it comes up.
+        // Before any worker starts: each publishes these handles as it comes up.
+        // The blocking pool starts empty — it creates its first thread only if
+        // something actually offloads work — so this costs an allocation.
         inner.reactor  = Reactor::start();
+        inner.blocking = BlockingPool::start();
         mut tids: u64[] = [];
         mut i: u32 = 0;
         while (i < count) {
@@ -880,25 +888,33 @@ type struct Executor {
     }
 }
 
-/// Signal shutdown, join the workers, stop the reactor, then reclaim any tasks
-/// still queued (never driven) as CANCELLED so their futures' drops run and no
-/// block leaks. Shutdown MUST be signaled before the workers are joined, or the
-/// join would block forever waiting on threads that never leave `take()`.
+/// Signal shutdown, join the workers, stop the two drivers, then reclaim any
+/// tasks still queued (never driven) as CANCELLED so their futures' drops run
+/// and no block leaks. Shutdown MUST be signaled before the workers are joined,
+/// or the join would block forever waiting on threads that never leave `take()`.
 ///
 /// The steps are ordered so nothing can be resurrected after it is reclaimed.
-/// Joining the workers first stops all polling. Stopping the reactor next joins
-/// its thread — after which no wake can be generated — and releases its
-/// registrations and timers, whose wakers are the last reference to any task
-/// parked on I/O or a deadline, so those tasks are finished and freed here (a
-/// task's drop deregisters, which the teardown tolerates re-entrantly). Only
-/// then is the queue drained: draining before the reactor stopped would leave a
-/// task woken in the interim sitting in the queue forever.
+/// Joining the workers first stops all polling.
 ///
-/// The reactor block is freed last, after the drain rather than as part of the
-/// stop. A task that readiness had already woken is still sitting in the queue
-/// at that point, and dropping it runs its future's `Drop`, which cancels
-/// against the reactor it registered with; that cancellation has to find a live
-/// (if empty) table rather than freed memory.
+/// The blocking pool stops next, and before the reactor. Its threads cannot be
+/// interrupted, so this waits out any call already in flight; cancelling what is
+/// merely queued releases those jobs' wakers, which can be the last reference to
+/// a task, whose future's drop may then cancel a reactor registration — so the
+/// reactor has to still be standing when that happens.
+///
+/// Stopping the reactor then joins its thread — after which no wake can be
+/// generated — and releases its registrations and timers, whose wakers are the
+/// last reference to any task parked on I/O or a deadline, so those tasks are
+/// finished and freed here (a task's drop deregisters, which the teardown
+/// tolerates re-entrantly). Only then is the queue drained: draining before the
+/// drivers stopped would leave a task woken in the interim sitting in the queue
+/// forever.
+///
+/// Both driver blocks are freed last, after the drain rather than as part of
+/// their stop. A task that readiness had already woken is still sitting in the
+/// queue at that point, and dropping it runs its future's `Drop`, which cancels
+/// against the reactor it registered with or lets go of a blocking job; those
+/// have to find live (if empty) structures rather than freed memory.
 implement trait Drop for struct Executor {
     drop(mut &this) -> void {
         if (this.inner == null) { return; }
@@ -915,6 +931,7 @@ implement trait Drop for struct Executor {
             exec_join_worker(this.worker_tids[i]);
         }
         this.worker_tids.drop();
+        BlockingPool::stop(inner.blocking);
         Reactor::stop(inner.reactor);
         // No workers and no reactor thread remain: safe to reclaim without
         // locking. The reactor block stays alive across this drain because a
@@ -923,6 +940,8 @@ implement trait Drop for struct Executor {
         inner.drain_cancelled();
         Reactor::free(inner.reactor);
         inner.reactor = null;
+        BlockingPool::free(inner.blocking);
+        inner.blocking = null;
         exec_cond_destroy(&inner.d_cond[0]);
         exec_mtx_destroy(&inner.d_mutex[0]);
         exec_cond_destroy(&inner.q_cond[0]);

@@ -274,18 +274,6 @@ type struct TcpAccepted {
     }
 }
 
-/// The current thread's reactor, or a panic explaining that async socket I/O
-/// needs one. A future that returned `Pending` with nowhere to register its
-/// waker would never be polled again.
-private function require_reactor() -> Reactor* {
-    mut rt: Reactor* = Reactor::current();
-    if (rt == null) {
-        panic("async socket I/O requires an Executor: no reactor on this thread", FILE, LINE);
-    }
-    return rt;
-}
-
-
 
 /// Read as soon as the socket has anything to give. Completes with the byte
 /// count — 0 means the peer closed its end — or the error that ended it.
@@ -347,7 +335,7 @@ implement trait Future for struct TcpRead {
                         // Registering AFTER the failed attempt is what makes the
                         // race safe: readiness that arrived in between is still
                         // reported, because the reactor arms level-triggered.
-                        mut rt: Reactor* = require_reactor();
+                        mut rt: Reactor* = Reactor::require();
                         this.rt = rt;
                         rt.register(fd, INTEREST_READ, cx.waker());
                         return Poll::Pending;
@@ -411,7 +399,7 @@ implement trait Future for struct TcpWrite {
             Result::Err(e) => {
                 match (e.kind) {
                     IoErrorKind::WouldBlock => {
-                        mut rt: Reactor* = require_reactor();
+                        mut rt: Reactor* = Reactor::require();
                         this.rt = rt;
                         rt.register(fd, INTEREST_WRITE, cx.waker());
                         return Poll::Pending;
@@ -474,7 +462,7 @@ implement trait Future for struct TcpAccept {
             match (e.kind) {
                 IoErrorKind::Interrupted => { }   // retry immediately
                 IoErrorKind::WouldBlock  => {
-                    mut rt: Reactor* = require_reactor();
+                    mut rt: Reactor* = Reactor::require();
                     this.rt = rt;
                     rt.register(fd, INTEREST_READ, cx.waker());
                     return Poll::Pending;
@@ -555,7 +543,7 @@ implement trait Future for struct TcpConnect {
         match (sys::os_connect_status(this.fd, &this.addr[0], this.addrlen)) {
             ConnectStatus::Connected => { return this.succeed(); }
             ConnectStatus::Pending   => {
-                mut rt: Reactor* = require_reactor();
+                mut rt: Reactor* = Reactor::require();
                 this.rt = rt;
                 rt.register(this.fd, INTEREST_WRITE, cx.waker());
                 return Poll::Pending;

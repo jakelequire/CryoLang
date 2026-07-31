@@ -12,11 +12,30 @@
 ///!   ai_flags @0  ai_family @4  ai_socktype @8  ai_protocol @12
 ///!   ai_addrlen @16  ai_addr @24 (sockaddr*)  ai_canonname @32
 ///!   ai_next @40 (addrinfo*).
+///!
+///! ## Blocking and async
+///!
+///! `resolve` / `lookup` / `resolve_one` block the calling thread. `getaddrinfo`
+///! has no non-blocking form on either platform and a name lookup is the
+///! slowest, most latency-variable step in opening a connection, so calling one
+///! of them from inside an `async` function stalls an executor worker for the
+///! whole query — on a single-threaded `Executor`, the whole runtime.
+///!
+///! `Resolve` is the async spelling: it hands the same lookup to the executor's
+///! `BlockingPool`, which runs it on a thread nobody polls on, and parks the
+///! task until the answer arrives. Await that from async code; the blocking
+///! entry points remain for synchronous programs, and are what the pool thread
+///! ends up calling.
 
 namespace std::net::dns;
 
 import core::option;
 import core::result;
+import core::mem;
+import core::ptr;
+import core::drop;
+import alloc::layout;
+import alloc::allocator;
 import collections::str;
 import collections::string;
 import collections::array;
@@ -25,6 +44,10 @@ import ffi::libc;
 import net::addr::ip;
 import net::addr::socket_addr;
 import net::sys;
+import future::poll;
+import future::waker;
+import future::traits;
+import future::blocking;
 
 // AF_INET is 2 on every platform; AF_INET6 differs (Linux/BSD = 10,
 // Windows = 23). `getaddrinfo` reports the OS family value in `ai_family`,
@@ -48,6 +71,24 @@ type struct ResolvedAddrs {
     /// The i-th resolved address, or `None` if out of range.
     get(&this, index: u64) -> Option<IpAddr> {
         return this.addrs.get(index);
+    }
+
+    /// The first IPv4 address in the result, paired with `port`, or `None` if
+    /// the name resolved only to AAAA records. Callers that can dial a v6
+    /// address should walk `get` instead; this exists for the layers that
+    /// cannot yet.
+    first_ipv4(&this, port: u16) -> Option<SocketAddr> {
+        mut i: u64 = 0;
+        while (i < this.addrs.length()) {
+            match (this.addrs.get(i)) {
+                Option::Some(ip) => {
+                    if (ip.is_ipv4()) { return Option::Some(SocketAddr::new(ip, port)); }
+                }
+                Option::None => { }
+            }
+            i++;
+        }
+        return Option::None;
     }
 
     drop(mut &this) -> void {
@@ -139,6 +180,168 @@ function resolve_one(host: Str) -> Result<IpAddr, IoError> {
     match (first) {
         Option::Some(ip) => { return Result::Ok(ip); }
         Option::None     => { return Result::Err(IoError::new(IoErrorKind::NotFound, 0)); }
+    }
+}
+
+/// The block a `Resolve` hands to the blocking pool: the pool's job header, the
+/// request, and the slot the answer lands in.
+///
+/// `job` must be the first field — the pool is given its address and casts it
+/// back to this type, which is only sound at offset 0. The block is owned by
+/// whichever of {the pool, the future} lets go of it last, so `host` is an owned
+/// copy rather than a borrowed `Str`: the future that asked for the lookup may
+/// be long gone, along with whatever the `Str` pointed into, by the time a pool
+/// thread reads it.
+/// The answer is stored as its two halves rather than as a `Result`: only the
+/// halves have a `drop` the teardown below can call, and a `Result` in a raw
+/// block would need drop glue synthesized on a value the compiler cannot see is
+/// initialized. `produced` says whether either half was written at all — the
+/// pool can cancel a job before it ever runs — and `ok` says which one.
+type struct ResolveJob {
+    job:      BlockingJob;
+    host:     String;
+    addrs:    ResolvedAddrs;   // valid when `produced && ok`
+    err:      IoError;         // valid when `produced && !ok`
+    produced: boolean;
+    ok:       boolean;
+}
+
+/// `run_fn` for a `ResolveJob`: the blocking lookup, on a pool thread. A bare
+/// fn-ptr in the job's vtable, so it must be a free function.
+///
+/// `produced` is set last. Everything the collecting side reads is written
+/// before it, and the pool publishes the job's terminal status under its lock
+/// after this returns, which is what orders the two.
+function resolve_job_run(raw: u8*) -> void {
+    mut j: ResolveJob* = raw as ResolveJob*;
+    match (resolve(j.host.as_str())) {
+        Result::Ok(a)  => { j.addrs = a; j.ok = true;  }
+        Result::Err(e) => { j.err   = e; j.ok = false; }
+    }
+    j.produced = true;
+}
+
+/// `drop_fn` for a `ResolveJob`: release the request, release an answer nobody
+/// collected, and free the block. Runs on whichever side let go of the block
+/// last. A collected answer leaves an empty `ResolvedAddrs` behind, so this
+/// stays correct whether or not anyone was still waiting.
+function resolve_job_free(raw: u8*) -> void {
+    mut j: ResolveJob* = raw as ResolveJob*;
+    j.host.drop();
+    if (j.produced && j.ok) {
+        j.addrs.drop();
+    }
+    mut alloc: GlobalAlloc = GlobalAlloc::new();
+    alloc.deallocate(NonNull::new(raw), Layout::of<ResolveJob>());
+}
+
+/// Resolve `host` without stalling the executor: the lookup runs on the
+/// `BlockingPool`'s threads and the task parks until it answers.
+///
+/// ## Cancellation
+///
+/// Dropping a `Resolve` in flight abandons the answer; it does NOT stop the
+/// query, because `getaddrinfo` cannot be interrupted. The pool thread finishes
+/// the lookup and releases the block itself, so nothing leaks — but a
+/// `Futures::timeout` around one bounds how long the *task* waits, not how long
+/// the thread is busy.
+///
+/// ## Driving without a pool
+///
+/// `BlockingPool::current()` is null on any thread that is not an executor
+/// worker. Rather than park with nowhere to submit — which would hang — a
+/// `Resolve` polled there performs the lookup inline and completes on that first
+/// poll, so the spinning `future::block_on` driver still works. That is a
+/// blocking call on the polling thread, which is exactly what that driver
+/// already is. Run it on an `Executor` to get the offload.
+type struct Resolve {
+    host: Str;           // the request, until the job takes an owned copy
+    job:  ResolveJob*;   // null before the first poll and once the result is taken
+
+    /// Begin resolving `host`. Nothing is submitted until the first poll, so a
+    /// `Resolve` that is never awaited costs nothing.
+    static start(host: Str) -> Resolve {
+        return Resolve { host: host, job: null };
+    }
+
+    /// Hand the block back to the pool's ownership rules and forget it. Shared
+    /// by the completion path and `Drop`: `release` frees the block only if this
+    /// was its last reference, so a lookup still running keeps it alive.
+    private let_go(mut &this) -> void {
+        if (this.job == null) { return; }
+        const j: ResolveJob* = this.job;
+        this.job = null;
+        j.job.release();
+    }
+}
+
+implement trait Future for struct Resolve {
+    type Output = Result<ResolvedAddrs, IoError>;
+
+    poll(mut &this, cx: Context*) -> Poll<Result<ResolvedAddrs, IoError>> {
+        if (this.job == null) {
+            mut pool: BlockingPool* = BlockingPool::current();
+            if (pool == null) {
+                return Poll::Ready(resolve(this.host));
+            }
+            mut alloc: GlobalAlloc = GlobalAlloc::new();
+            mut j: ResolveJob* = null;
+            match (alloc.allocate(Layout::of<ResolveJob>())) {
+                Result::Ok(raw) => { j = raw.cast<ResolveJob>().as_ptr(); }
+                Result::Err(_)  => {
+                    return Poll::Ready(Result::Err(IoError::new(IoErrorKind::OutOfMemory, 0)));
+                }
+            }
+            BlockingJob::init(&j.job, resolve_job_run, resolve_job_free);
+            j.host     = String::from_str(this.host);
+            j.produced = false;
+            j.ok       = false;
+            if (!pool.submit(&j.job)) {
+                // The pool is shutting down or could not create a thread, so
+                // nothing would ever run this job. Release the block (which
+                // drops the request copy) and do the lookup here instead —
+                // slow, but an answer rather than a hang.
+                j.job.release();
+                return Poll::Ready(resolve(this.host));
+            }
+            this.job = j;
+        }
+        // Arming re-reads the job's status under the pool's lock, so a lookup
+        // that finished between polls is collected here rather than parked on
+        // again — and a waker stored a moment before the answer landed cannot be
+        // the one nobody fires.
+        mut j: ResolveJob* = this.job;
+        if (j.job.arm(cx.waker()) == JOB_PENDING) {
+            return Poll::Pending;
+        }
+        // Finished. `Interrupted` stands for "the pool shut down before reaching
+        // this job", the one terminal state that produces no answer at all.
+        mut out: Result<ResolvedAddrs, IoError> =
+            Result::Err(IoError::new(IoErrorKind::Interrupted, 0));
+        if (j.produced) {
+            if (j.ok) {
+                // Swap rather than read: the block may outlive this future (a
+                // pool thread could still be releasing it), and leaving an empty
+                // `ResolvedAddrs` behind is what stops its teardown from
+                // freeing the array twice.
+                mut taken: ResolvedAddrs = ResolvedAddrs { addrs: Array<IpAddr>::new() };
+                mem::swap<ResolvedAddrs>(&taken, &j.addrs);
+                out = Result::Ok(taken);
+            } else {
+                out = Result::Err(j.err);
+            }
+        }
+        this.let_go();
+        return Poll::Ready(out);
+    }
+}
+
+/// Abandoning a lookup releases this side's claim on the block. The query may
+/// still be running on a pool thread, which is why this is a reference release
+/// and not a free.
+implement trait Drop for struct Resolve {
+    drop(mut &this) -> void {
+        this.let_go();
     }
 }
 
