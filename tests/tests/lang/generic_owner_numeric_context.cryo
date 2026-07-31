@@ -1,0 +1,75 @@
+// A method or static declared on a GENERIC OWNER states its formals in the
+// owner's parameters, so `Cell<T>::set(nv: T)` reaches call resolution as an
+// abstract `T`. Expected-type propagation onto an argument requires a CONCRETE
+// numeric slot, so none of it fired for these calls: the literal fell back to
+// its default width and every caller had to write the type out, even though the
+// receiver (or the turbofish) already states it.
+//
+// The float cases are what make this file FAIL rather than merely warn on a
+// compiler that does not substitute: unlike integers there is no float width
+// coercion at the call boundary, so a bare `1.5` bound to an `f32` slot is a
+// hard mismatch. The integer cases assert NUMBERS THAT DEPEND ON THE TYPE - a
+// shift past the default width, and a slot narrower than the default.
+![config(testing)]
+namespace CryoTests::Tests::Lang::GenericOwnerNumericContext;
+
+import std::core::result;
+import std::test::error;
+import std::test::assert;
+
+type struct GonCell<T> {
+    v: T;
+    static new(initial: T) -> GonCell<T> { return GonCell<T> { v: initial }; }
+    set(mut &this, nv: T) -> void { this.v = nv; }
+
+    // A METHOD-level parameter, deliberately named differently from the
+    // owner's. It is not the owner's `T` and must go on inferring from the
+    // argument.
+    weigh<U>(&this, x: U) -> u64 { return sizeof(U) as u64; }
+}
+
+// The turbofish is the only place the owner's argument is written.
+![test]
+function owner_static_types_a_float_arg() -> Result<(), TestError> {
+    mut c: GonCell<f32> = GonCell<f32>::new(1.5);
+    return expect_eq((c.v as f64 * 4.0) as i64, 6);
+}
+
+// The receiver states it instead.
+![test]
+function owner_method_types_a_float_arg() -> Result<(), TestError> {
+    mut c: GonCell<f32> = GonCell<f32>::new(0.0);
+    c.set(2.5);
+    return expect_eq((c.v as f64 * 4.0) as i64, 10);
+}
+
+// A shift past 31 is meaningless if the literal falls back to the i32 default,
+// and 250 does not survive a signed narrowing.
+![test]
+function owner_generic_slot_types_an_integer_arg() -> Result<(), TestError> {
+    mut u: GonCell<u64> = GonCell<u64>::new(1);
+    u.set(1 << 40);
+    match (expect_eq(u.v as i64, 1099511627776)) {
+        Result::Ok(_)  => {}
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    mut b: GonCell<u8> = GonCell<u8>::new(200);
+    b.set(250);
+    return expect_eq(b.v as i64, 250);
+}
+
+// The control that keeps the substitution honest. `U` is the METHOD's parameter,
+// not the owner's, so its bare literal must stay polymorphic and take the i32
+// default. Matching the owner's parameters by INDEX rather than by name would
+// hand this the owner's `u64` - the method's `U` is also at index 0 - and the
+// answer would be 8.
+![test]
+function method_level_param_still_infers_from_the_argument() -> Result<(), TestError> {
+    mut c: GonCell<u64> = GonCell<u64>::new(0);
+    match (expect_eq(c.weigh(7) as i64, 4)) {
+        Result::Ok(_)  => {}
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    // Still binds from a written type when the argument names one.
+    return expect_eq(c.weigh(7u16) as i64, 2);
+}
