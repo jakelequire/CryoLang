@@ -1,37 +1,69 @@
-///! Freestanding program entry.
+///! Program entry — both tiers.
 ///!
-///! A `no_runtime` link passes `-nostartfiles`, so no crt0 supplies the entry.
-///! This module owns it. `main` is an external C-ABI symbol resolved from the
-///! user object at link time; under `no_runtime` the user's `main` keeps its
-///! declared zero-arg signature (not widened to argc/argv/envp) and emits under
-///! the unmangled symbol `main`, which this extern references — the same on
-///! every target.
+///! This module owns the entry. `main` is an external C-ABI symbol resolved from
+///! the user object at link time; the entry calls it and terminates with its
+///! return value through `CryoRt::Sys::rt_exit`.
+///!
+///! One link does not use it: a fully static glibc (`--release-static`) sets its
+///! own thread control block up inside `__libc_start_main`, which is the job
+///! ld.so does before the entry runs in a dynamic link, so entering past it
+///! leaves TLS unmapped. That link keeps crt0's entry; the driver decides, and
+///! nothing here changes.
 ///!
 ///! The x86-64 ISA is shared by AMD and Intel CPUs, so one x86-64 codepath
-///! covers both vendors; the split that matters is OS ABI. `_start` is per-OS
-///! (gated `![config(linux)]` / `![config(windows)]`), and so is argument
-///! capture, because the two OSes hand arguments over by different mechanisms.
-///! `__cryo_start` — capture arguments, run `main`, exit with its return — is
-///! shared. Process exit runs through the shared `CryoRt::Sys::rt_exit`.
+///! covers both vendors; the split that matters is OS ABI. The entry stub and
+///! argument capture are per-OS (gated `![config(linux)]` / `![config(windows)]`)
+///! because the two OSes hand arguments over by different mechanisms:
 ///!
-///!   - Linux: the kernel enters `_start` with `%rsp` at argc; fully
-///!     freestanding — no libc, no imports. `_start` stages argc/argv into the
-///!     SysV arg registers and capture just records them.
-///!   - Windows: PE startup passes no stack arguments at all, so there is
-///!     nothing for `_start` to stage. Arguments come from the PEB instead —
-///!     `ProcessParameters.CommandLine`, split per the CRT's quoting rules and
-///!     transcoded UTF-16 -> UTF-8 (see `capture_os_args`).
+///!   - Linux: the kernel enters with `%rsp` at argc. The stub is `![naked]` so
+///!     `%rsp` still points at the initial process stack when its body runs, and
+///!     stages argc/argv into the SysV arg registers.
+///!   - Windows: PE startup passes no stack arguments at all — the loader
+///!     `call`s the entry like an ordinary function. Arguments come from the PEB
+///!     instead: `ProcessParameters.CommandLine`, split per the CRT's quoting
+///!     rules and transcoded UTF-16 -> UTF-8 (see `capture_os_args`).
 ///!
-///! `![config(no_runtime)]` drops the whole entry in a hosted build (crt0 owns
-///! the entry there).
+///! The two tiers differ in what stands between the OS and `main`:
+///!
+///!   - FREESTANDING (`no_runtime`): the link passes `-nostartfiles -nostdlib`,
+///!     so nothing else exists. `_start` is the entry, `main` keeps its declared
+///!     zero-arg signature (not widened to argc/argv/envp), and exit is a raw
+///!     kernel call. See `__cryo_start`.
+///!   - HOSTED: libc and the crt objects ARE linked — only their `main`-calling
+///!     startup is bypassed, by pointing the linker's entry at `__cryo_entry`.
+///!     `main` carries the widened C signature and the entry owns the pre-`main`
+///!     initialisation crt0 would otherwise have done. See `__cryo_hosted_start`.
+///!
+///! A hosted link deliberately does NOT pass `-nostartfiles`. Dropping the crt
+///! objects removes far more than an entry point: on Linux it takes
+///! `__dso_handle` (crtbegin.o) and `_init` (crti.o), on Windows `atexit` and
+///! `_pei386_runtime_relocator` (crt2.o) — and `atexit` is referenced
+///! unconditionally by `libmingwex.a`, so it cannot be dodged by not calling it.
+///! Every one of those is a LINK failure, and re-providing them from here would
+///! mean reimplementing libc's exit machinery. Retaining the crt objects and
+///! overriding only the entry symbol keeps them all, at the cost of some unused
+///! startup code in the image.
 
 namespace CryoRt::Core::Entry;
 
 import CryoRt::Sys;
 
 /// The user program's C-ABI entry, resolved by the linker from the user object.
+///
+/// The signature follows what codegen emitted, which differs by tier: a
+/// freestanding `main` keeps the zero-arg form the user wrote, while a hosted
+/// one is widened to the C ABI's `int main(int, char**, char**)` (and carries a
+/// prologue publishing argv/envp to the stdlib). Declaring the wrong arity here
+/// would not fail to link — `main` is C-ABI — it would hand `main` uninitialised
+/// argument registers.
+![config(no_runtime)]
 extern "C" {
     function main() -> i32;
+}
+
+![config(not(no_runtime))]
+extern "C" {
+    function main(argc: i32, argv: i8**, envp: i8**) -> i32;
 }
 
 // --- Linux ------------------------------------------------------------------
@@ -50,6 +82,109 @@ function _start() {
         leaq 8(%rsp), %rsi
         andq $-16, %rsp
         call __cryo_start
+    }
+}
+
+/// ELF entry for a HOSTED link. Naked for the same reason `_start` is: the
+/// kernel enters with `%rsp` at argc rather than on a call frame, so the body
+/// must run before any prologue disturbs it.
+///
+/// Named `__cryo_entry` rather than `_start` because a hosted link retains
+/// crt1.o, which already defines `_start`; the linker is aimed here with
+/// `-Wl,-e,__cryo_entry`, which also pulls this member out of the tier archive.
+![naked] ![no_mangle] ![config(not(no_runtime))] ![config(linux)]
+function __cryo_entry() {
+    ![arch(x86_64, att)]
+    asm {
+        xorq %rbp, %rbp
+        movq (%rsp), %rdi
+        leaq 8(%rsp), %rsi
+        andq $-16, %rsp
+        call __cryo_hosted_start
+    }
+}
+
+/// The legacy DT_INIT hook, from crti.o. glibc's `call_init` runs it between the
+/// two initializer arrays, so this tier does too.
+![config(not(no_runtime))] ![config(linux)]
+extern "C" {
+    function _init() -> void;
+}
+
+/// One entry of an ELF initializer array: a pointer-sized slot holding an
+/// initializer that takes the process arguments.
+///
+/// The slot is described as a struct rather than read as a raw integer and cast,
+/// because `as` accepts no function type — casting to `(i32, i8**, i8**) -> void`
+/// does not parse. Loading the field gives the same call through a typed handle.
+![config(not(no_runtime))] ![config(linux)]
+type struct InitSlot {
+    run: (i32, i8**, i8**) -> void;
+}
+
+/// Bounds of the two initializer arrays.
+///
+/// These four symbols have no declaration to import: ld synthesises them around
+/// the `.preinit_array` / `.init_array` output sections, and they exist only as
+/// addresses — there is no object behind them to give a Cryo type. A
+/// RIP-relative LEA is how you name such a symbol without declaring it. Each is
+/// `![weak]`-equivalent by construction: ld defines start == end when the
+/// section is absent, so an empty array walks zero entries rather than failing
+/// to link.
+![config(not(no_runtime))] ![config(linux)]
+function preinit_array_start() -> u64 {
+    mut a: u64 = 0;
+    ![arch(x86_64, att)]
+    asm {
+        leaq __preinit_array_start(%rip), %rax
+        movq %rax, ${=a:"rax"}
+    }
+    return a;
+}
+
+![config(not(no_runtime))] ![config(linux)]
+function preinit_array_end() -> u64 {
+    mut a: u64 = 0;
+    ![arch(x86_64, att)]
+    asm {
+        leaq __preinit_array_end(%rip), %rax
+        movq %rax, ${=a:"rax"}
+    }
+    return a;
+}
+
+![config(not(no_runtime))] ![config(linux)]
+function init_array_start() -> u64 {
+    mut a: u64 = 0;
+    ![arch(x86_64, att)]
+    asm {
+        leaq __init_array_start(%rip), %rax
+        movq %rax, ${=a:"rax"}
+    }
+    return a;
+}
+
+![config(not(no_runtime))] ![config(linux)]
+function init_array_end() -> u64 {
+    mut a: u64 = 0;
+    ![arch(x86_64, att)]
+    asm {
+        leaq __init_array_end(%rip), %rax
+        movq %rax, ${=a:"rax"}
+    }
+    return a;
+}
+
+/// Run every initializer in `[lo, hi)`, in order, each receiving the process
+/// arguments. Entries are pointer-sized, hence the 8-byte stride.
+![config(not(no_runtime))] ![config(linux)]
+function run_init_range(lo: u64, hi: u64, argc: i32, argv: i8**, envp: i8**) -> void {
+    mut p: u64 = lo;
+    while (p < hi) {
+        const slot: InitSlot* = p as InitSlot*;
+        const init: (i32, i8**, i8**) -> void = slot.run;
+        init(argc, argv, envp);
+        p = p + 8;
     }
 }
 
@@ -82,6 +217,42 @@ function _start() {
 /// run from here.
 ![no_mangle] ![config(no_runtime)] ![config(windows)]
 function __main() {
+}
+
+/// PE entry for a HOSTED link. Not `![naked]`: the Windows loader `call`s the
+/// entry on an ordinary, aligned call frame, so a normal function body is a
+/// valid entry — and a real frame carries the `.pdata` unwind info a naked stub
+/// would not.
+///
+/// Its parameters are the ones `__cryo_hosted_start` ignores on this OS; zero is
+/// passed because the arguments come from the PEB (see `capture_os_args`).
+![no_mangle] ![config(not(no_runtime))] ![config(windows)]
+function __cryo_entry() -> never {
+    __cryo_hosted_start(0, null);
+}
+
+/// Startup services the retained crt objects provide, which a retargeted entry
+/// must invoke itself because mingw's own startup — the code that normally calls
+/// them — is exactly what was bypassed.
+///
+///   - `_pei386_runtime_relocator` applies the pseudo-relocations backing
+///     auto-imported DLL *data*, which the user's program may well have even
+///     though this tier no longer does.
+///   - `__main` runs the C global constructors. It is idempotent (it guards on a
+///     static flag), so calling it here is safe alongside the `call __main` the
+///     mingw backend emits into `main`'s own prologue.
+///
+/// Nothing here reaches for the CRT's environment block. `__p__environ` exists
+/// only in UCRT and the MSVC-runtime import libraries; `_environ` only in
+/// msvcrt. Which of the two a given mingw-w64 ships varies by build — binding to
+/// either one links on one toolchain and fails on the next, which is precisely
+/// how the cross-compile broke while the native build stayed green. The
+/// environment comes from the PEB instead (see `capture_os_envp`), the same
+/// place argv already comes from.
+![config(not(no_runtime))] ![config(windows)]
+extern "C" {
+    function _pei386_runtime_relocator() -> void;
+    function __main() -> void;
 }
 
 /// ntdll process-heap allocation, used to size the argv vector to the actual
@@ -195,7 +366,12 @@ function emit_unit(cmd: u64, n: u64, i: u64*, buf: u8*, pos: u64*) -> void {
 /// A failure to reach the PEB, or a heap allocation failure, leaves argc 0 /
 /// argv null — the same "unavailable" state callers already handle — rather
 /// than a partially built vector.
-![config(no_runtime)] ![config(windows)]
+///
+/// Shared by both tiers, not just the freestanding one. A hosted build could
+/// have taken argv from the CRT instead, but `__getmainargs` yields codepage-
+/// mangled ANSI text; this parser yields UTF-8, which is what Cryo wants, and
+/// keeping one implementation means one set of quoting rules to be right about.
+![config(windows)]
 function capture_os_args(argc: i64, argv: i8**) -> void {
     const peb: u64 = current_peb();
     if (peb == 0) { return; }
@@ -311,17 +487,18 @@ function capture_os_args(argc: i64, argv: i8**) -> void {
 
 // --- Shared -----------------------------------------------------------------
 
-/// Captured process arguments, filled by `__cryo_start` before `main` runs, or
-/// left 0 / null when the OS could not supply them. Programs read them through
-/// `__cryo_argc` / `__cryo_argv`.
+/// Captured process arguments, filled by the entry before `main` runs, or left
+/// 0 / null when the OS could not supply them. A freestanding program reads them
+/// through `__cryo_argc` / `__cryo_argv`; a hosted one gets them as `main`'s own
+/// arguments.
 mut g_argc: i64  = 0;
 mut g_argv: i8** = null;
 
 /// Record the arguments the kernel already placed on the initial stack, which
-/// `_start` staged into the SysV arg registers. Nothing to decode: the vector
-/// is already a NUL-terminated byte-string array, which is exactly what
+/// the entry stub staged into the SysV arg registers. Nothing to decode: the
+/// vector is already a NUL-terminated byte-string array, which is exactly what
 /// `__cryo_argv` returns.
-![config(no_runtime)] ![config(linux)]
+![config(linux)]
 function capture_os_args(argc: i64, argv: i8**) -> void {
     g_argc = argc;
     g_argv = argv;
@@ -348,4 +525,177 @@ function __cryo_argv() -> i8** {
 function __cryo_start(argc: i64, argv: i8**) -> never {
     capture_os_args(argc, argv);
     Sys::rt_exit(main());
+}
+
+// --- Shared, hosted ---------------------------------------------------------
+
+/// Apply the image relocations the entry cannot assume are already in place.
+///
+/// Linux: none. ld.so fully relocates the image — and sets up the thread control
+/// block and `__environ` — before it transfers control to the entry, so there is
+/// nothing left to fix up here.
+![config(not(no_runtime))] ![config(linux)]
+function run_image_fixups() -> void {
+}
+
+/// Windows: mingw's auto-import scheme leaves references to DLL *data* pointing
+/// at their import thunks until `_pei386_runtime_relocator` rewrites them in
+/// place. It runs before anything else because any later step may read such a
+/// symbol — msvcrt's `_environ` is one, and reads as garbage without it. Only
+/// data is affected; the loader binds function imports through the IAT.
+![config(not(no_runtime))] ![config(windows)]
+function run_image_fixups() -> void {
+    _pei386_runtime_relocator();
+}
+
+/// The environment vector `main` receives as its third argument.
+///
+/// Linux: the kernel lays the initial stack out as `argc`, `argv[0..argc]`,
+/// a NULL, then `envp[0..]`, so the environment begins one slot past argv's
+/// terminator.
+![config(not(no_runtime))] ![config(linux)]
+function capture_os_envp(argc: i64, argv: i8**) -> i8** {
+    if (argv == null) { return null; }
+    return &argv[argc + 1];
+}
+
+/// Is the environment entry starting at UTF-16 unit `at` one of Windows'
+/// hidden per-drive working directories?
+///
+/// The raw block begins with entries of the form `=C:=C:\some\path` — one per
+/// drive the process has a current directory on. They are not environment
+/// variables: every CRT filters them out of `environ` and `getenv`, so a program
+/// has never seen them, and `std::env::vars()` splits on the first `=` and would
+/// yield an EMPTY key for each. Reading the block raw is what exposes them, so
+/// the filtering the CRT used to do has to happen here instead.
+///
+/// A leading `=` is the whole test, which is also how Windows itself marks them.
+![config(not(no_runtime))] ![config(windows)]
+function env_entry_is_hidden(env: u64, at: u64) -> boolean {
+    return load16(env + at * 2) == 61;      // '='
+}
+
+/// Windows: from the PEB's `ProcessParameters.Environment`, transcoded the same
+/// way the command line is.
+///
+/// Taking it from the CRT instead would mean binding to `_environ` or
+/// `__p__environ`, and NEITHER is portable: `__p__environ` ships only in UCRT
+/// and the MSVC-runtime import libraries, `_environ` only in msvcrt, and which
+/// one a given mingw-w64 provides varies by build. Binding to either links on
+/// one toolchain and fails on the next — the native build stayed green while the
+/// cross-compile failed on an undefined `__p__environ`. The PEB is the same on
+/// every CRT flavour and needs no import at all, which is why argv is read from
+/// it too.
+///
+/// The block is a run of UTF-16 `KEY=VALUE` strings, each NUL-terminated, the
+/// whole run closed by a second NUL — so its extent is found by scanning, not
+/// from a length field. Sizing follows `capture_os_args`: at most 3 UTF-8 bytes
+/// per UTF-16 unit (reaching the 4-byte form costs two units), plus the NUL each
+/// entry already contributes, and one vector slot per entry plus the terminator.
+///
+/// Entries the CRT hides are dropped here — see `env_entry_is_hidden`.
+///
+/// The parameters are the shared caller's; this OS takes nothing from the stack.
+/// A failure to reach the PEB, or a heap allocation failure, yields null — the
+/// same "unavailable" state a program handles when the environment is empty.
+![config(not(no_runtime))] ![config(windows)]
+function capture_os_envp(argc: i64, argv: i8**) -> i8** {
+    const peb: u64 = current_peb();
+    if (peb == 0) { return null; }
+    const params: u64 = load64(peb + 0x20);
+    if (params == 0) { return null; }
+    const env: u64 = load64(params + 0x80);
+    if (env == 0) { return null; }
+
+    // Measure: count UTF-16 units up to the closing double NUL, and the entries
+    // worth keeping. `units` counts every unit, including those of skipped
+    // entries — it only bounds the output buffer, so over-counting is harmless.
+    // An empty block (immediate NUL) has no entries.
+    mut units: u64 = 0;
+    mut entries: u64 = 0;
+    while (true) {
+        if (load16(env + units * 2) == 0) { break; }
+        const keep: boolean = !env_entry_is_hidden(env, units);
+        while (load16(env + units * 2) != 0) { units = units + 1; }
+        units = units + 1;          // the entry's own NUL
+        if (keep) { entries = entries + 1; }
+    }
+    if (entries == 0) { return null; }
+
+    const heap: u64 = load64(peb + 0x30);
+    if (heap == 0) { return null; }
+    const buf: u8* = RtlAllocateHeap(heap, 0, units * 3 + 1);
+    if (buf == null) { return null; }
+    const slots: u8* = RtlAllocateHeap(heap, 0, (entries + 1) * 8);
+    if (slots == null) { return null; }
+    const vec: i8** = slots as i8**;
+
+    // Transcode. Driven by the block terminator rather than by `entries`, and
+    // applying the SAME skip predicate as the measure pass, so the two cannot
+    // disagree about which entry is which.
+    mut pos: u64 = 0;
+    mut i:   u64 = 0;
+    mut n:   i64 = 0;
+    while (load16(env + i * 2) != 0) {
+        if (env_entry_is_hidden(env, i)) {
+            while (load16(env + i * 2) != 0) { i = i + 1; }
+            i = i + 1;              // step over the entry's NUL
+            continue;
+        }
+        vec[n] = ((buf as u64) + pos) as i8*;
+        while (load16(env + i * 2) != 0) {
+            emit_unit(env, units, &i, buf, &pos);
+        }
+        i = i + 1;                  // step over the entry's NUL
+        buf[pos] = 0;
+        pos = pos + 1;
+        n = n + 1;
+    }
+    vec[n] = null;                  // the vector's own terminator
+    return vec;
+}
+
+/// Run the program's static constructors — the work crt0 would have driven.
+///
+/// Linux: `.preinit_array`, then the legacy `_init` hook, then `.init_array`,
+/// each entry receiving the process arguments. That is exactly glibc's
+/// `call_init` order. Skipping it leaves every static constructor unrun,
+/// including crtbegin.o's `frame_dummy`, and a statically linked C++ library's
+/// initializers with it.
+![config(not(no_runtime))] ![config(linux)]
+function run_static_ctors(argc: i32, argv: i8**, envp: i8**) -> void {
+    run_init_range(preinit_array_start(), preinit_array_end(), argc, argv, envp);
+    _init();
+    run_init_range(init_array_start(), init_array_end(), argc, argv, envp);
+}
+
+/// Windows: mingw collects constructors behind `__main`, which takes no
+/// arguments and guards against running twice.
+![config(not(no_runtime))] ![config(windows)]
+function run_static_ctors(argc: i32, argv: i8**, envp: i8**) -> void {
+    __main();
+}
+
+/// Hosted startup: fix up the image, capture the process arguments, run the
+/// static constructors, then hand off to `main` and terminate with its result.
+/// Diverges — the process is gone before it could return.
+///
+/// The order is load bearing. Constructors are handed `(argc, argv, envp)`, so
+/// the arguments must be captured before they run; `main` must come after them
+/// or it observes a half-initialised program.
+///
+/// Termination goes through `Sys::rt_exit`, which in this tier is libc `exit`:
+/// that is what flushes the program's buffered stdio and runs its `atexit`
+/// handlers. Returning to the caller is not an option — nothing called us.
+///
+/// The parameters carry the target's own C-ABI arg registers, which is where
+/// Linux's entry stub staged argc/argv; on Windows they are zero and
+/// `capture_os_args` sources the arguments from the PEB instead.
+![no_mangle] ![config(not(no_runtime))]
+function __cryo_hosted_start(argc: i64, argv: i8**) -> never {
+    run_image_fixups();
+    capture_os_args(argc, argv);
+    const envp: i8** = capture_os_envp(g_argc, g_argv);
+    run_static_ctors(g_argc as i32, g_argv, envp);
+    Sys::rt_exit(main(g_argc as i32, g_argv, envp));
 }
