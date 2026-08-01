@@ -825,8 +825,21 @@ type struct Executor {
     }
 
     /// Create an executor with exactly `n` worker threads (clamped to >= 1 so the
-    /// pool always makes progress).
+    /// pool always makes progress) and the default blocking-pool ceiling.
     static with_threads(n: u32) -> Executor {
+        return Executor::with_threads_and_blocking(n, BLOCKING_DEFAULT_THREADS);
+    }
+
+    /// Create an executor with `n` worker threads and a blocking pool that will
+    /// grow to at most `blocking` threads.
+    ///
+    /// The two counts size unrelated things and should not be derived from each
+    /// other: workers are CPU-bound pollers, so their count tracks hardware
+    /// parallelism, while a blocking thread is asleep in a syscall and its count
+    /// tracks how many uninterruptible calls are outstanding at once. A program
+    /// that offloads more concurrent blocking work than `blocking` allows does
+    /// not slow down evenly — the excess queues behind the running jobs.
+    static with_threads_and_blocking(n: u32, blocking: u32) -> Executor {
         mut count: u32 = n;
         if (count == 0) { count = 1; }
         mut alloc: GlobalAlloc = GlobalAlloc::new();
@@ -846,7 +859,7 @@ type struct Executor {
         // The blocking pool starts empty — it creates its first thread only if
         // something actually offloads work — so this costs an allocation.
         inner.reactor  = Reactor::start();
-        inner.blocking = BlockingPool::start();
+        inner.blocking = BlockingPool::with_max(blocking);
         mut tids: u64[] = [];
         mut i: u32 = 0;
         while (i < count) {

@@ -5375,3 +5375,87 @@ test above exists. `net_udp.cryo` is rewritten onto the futures.
 ### Gates
 
 See the session's handoff. `make cryo` first, always.
+
+---
+
+## 2026-07-31 (later) — the blocking pool's thread ceiling: raised, made configurable, and pinned by tests
+
+Prep for `process` async, done first because the answer to "can the blocking pool carry Windows
+process I/O?" depended on it. Stdlib + tests + docs only — **0 files under `compiler/`, so no repin is
+owed by construction**, not by IR diff.
+
+### Why the ceiling mattered before any process code was written
+
+`Reactor::register` is a **readiness** driver, and on Windows that means **socket-only**: arming goes
+through `afd_base_socket` → `WSAIoctl(fd, SIO_BASE_HANDLE)` (`reactor.cryo:841`). `Command`'s pipes are
+`CreatePipe` anonymous pipes bridged to CRT fds via `_open_osfhandle` (`command.cryo:1023`), and a
+process HANDLE is not a socket either — so **neither half of `process` fits the reactor on Windows**.
+The scoping note in the previous handoff ("`Stdio::Piped` gives pollable pipes; fits the reactor")
+holds on **Linux only**, where a pipe fd is epoll-able and `sys_pidfd_open` (`syscall.cryo:986`)
+already exists.
+
+One part is not a choice: a process HANDLE cannot be attached to IOCP or AFD, so a Windows
+process-exit wait **needs a thread regardless**. That makes the blocking pool load-bearing for
+`process` — and at `BLOCKING_MAX_THREADS = 8` it could not carry it: a child needs up to three
+concurrent blocking ops (stdout, stderr, wait), so the pool topped out around **two concurrent
+children**.
+
+### The change
+
+- `BLOCKING_MAX_THREADS: u32 = 8` → `BLOCKING_DEFAULT_THREADS: u32 = 512`.
+- `tids: u64[8]` → `tids: u64*`, a heap table sized to a runtime `max`, released in `free`. A raw
+  allocation rather than a dynamic `u64[]` **on purpose**: the pool block is raw memory that worker
+  threads and submitted jobs hold pointers into, and the sibling raw-allocated block (`Reactor`) holds
+  no owning aggregates either — fixed inline arrays and intrusive `Registration*`/`Timer*` chains only.
+  `Executor::worker_tids: u64[]` is not a counterexample: it lives in the **value** struct, not in raw
+  `ExecInner`.
+- `BlockingPool::with_max(n)`; `BlockingPool::start()` delegates with the default.
+- `Executor::with_threads_and_blocking(n, m)`, with `with_threads` delegating. Without this the
+  ceiling was configurable in principle and unreachable from user code.
+
+The two counts size unrelated things and must not be derived from each other: a worker is a CPU-bound
+poller, a blocking thread is asleep in a syscall. Threads are still created **only on demand and only
+when none is idle**, so a generous ceiling costs nothing until the work arrives.
+
+### Tests — and two that passed for the wrong reason
+
+Three added to `future_blocking.cryo`, each verified by **breaking the property on purpose**:
+
+| test | green | red |
+|---|---|---|
+| `default_ceiling_admits_more_than_eight` | default 512 | default forced to 8 |
+| `a_configured_ceiling_is_enforced` | `with_max(2)` | `with_max(3)` |
+| `executor_blocking_ceiling_reaches_the_pool` | `with_threads_and_blocking(1, 2)` | `(1, 3)` |
+
+Neither of the first two pins the behaviour alone — a pool that ignored `max` entirely would pass the
+first, and one that never grew would pass the second.
+
+**The enforcement test was a false pass in its first form.** It called `BlockingPool::stop()`
+immediately after `submit()`, and `take()` returns null the moment shutdown is set **even with a
+non-empty queue** — so all three jobs were cancelled before running and `saw` simply kept its initial
+`0`, which is exactly the reading the test asserted. It passed at `max=2` **and** at `max=3`. Only
+running the deliberate-break check exposed it. The fix: wait for every job to leave `JOB_PENDING`
+before stopping, assert `c.saw == 1` as well so "the ceiling held `c` back" is distinguishable from
+"`c` never ran", and treat an expired wait as its own failure rather than a result to interpret.
+
+**Then it failed only in the full suite, green in isolation.** Root cause was again the test, not the
+pool: every wait loop in this file counted `clock::sleep(5ms)` iterations as if they were 5ms of real
+time. Under suite load a 5ms sleep stretches — and **not by the same factor on the test thread as on
+the pool threads** — so the outer 8000-"ms" bound could expire in real time while the jobs were still
+inside their 3000-"ms" one. `stop()` then cancelled the queued job and the failure surfaced as
+`c.saw != 1`, pointing at the wrong thing. All three loops now measure real elapsed time with
+`Instant::elapsed()`, which `clock.cryo` documents as the tool for exactly this; the pre-existing
+tests in the file had the same latent fragility and are fixed by the same change.
+
+### Still open — the `process` design fork itself
+
+The ceiling is no longer the blocker: at 512 the pool covers ~170 concurrent children at three ops
+each, and it is tunable. What remains is Jake's call on **Windows pipe I/O**: blocking-pool `ReadFile`
+(cheap, uniform with the process-exit wait that needs a thread anyway) versus overlapped
+`CreateNamedPipeA` + IOCP (scalable, but adds a completion-based model beside the reactor's readiness
+model — the architectural fork flagged for `fs`). Bindings for the latter already exist
+(`CreateNamedPipeA`, `FILE_FLAG_OVERLAPPED`, `CreateIoCompletionPort`).
+
+### Gates
+
+`make test` **1983 / 0**, compile-fail **170 / 0**, projects **13 / 0**. Roster 1983 (+3).

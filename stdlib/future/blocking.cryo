@@ -80,11 +80,18 @@ const JOB_PENDING:   u8 = 0;
 const JOB_DONE:      u8 = 1;   // `run_fn` completed; the payload holds a result
 const JOB_CANCELLED: u8 = 2;   // the pool shut down before the job was reached
 
-/// Ceiling on pool threads. Blocking-pool threads are asleep in a syscall
-/// rather than competing for CPU, so this is sized for concurrent *waits* (how
-/// many name lookups a program has in flight at once) and not for the hardware
-/// thread count. Jobs beyond it queue.
-const BLOCKING_MAX_THREADS: u32 = 8;
+/// Default ceiling on pool threads. A pool thread is asleep in a syscall rather
+/// than competing for CPU, so this is sized for how many blocking calls a
+/// program has in flight at once, not for the hardware thread count. Jobs beyond
+/// the ceiling queue behind the ones already running.
+///
+/// One pool serves every offloading caller in an executor, so the ceiling has to
+/// cover their combined in-flight count rather than any one caller's. Too low a
+/// value does not degrade throughput gracefully: it serializes unrelated callers
+/// behind each other, and it deadlocks outright any caller that holds one job
+/// while waiting on a second. Threads are still created only on demand, so a
+/// generous ceiling costs nothing until the work actually arrives.
+const BLOCKING_DEFAULT_THREADS: u32 = 512;
 
 
 /// The header of a blocking job: the erased vtable, the waker to fire when the
@@ -204,32 +211,50 @@ type struct BlockingPool {
     live:     u32;      // threads created so far
     idle:     u32;      // threads currently waiting on `cv`
     max:      u32;      // ceiling on `live`
-    tids:     u64[8];   // joinable ids of `live` threads (BLOCKING_MAX_THREADS)
+    // Joinable ids of the `live` threads, `max` entries wide. A raw allocation
+    // rather than a dynamic array: the pool block is raw memory that worker
+    // threads and submitted jobs hold a pointer into, so it holds no owning
+    // aggregate whose drop would have to be synthesized. `free` releases it.
+    tids:     u64*;
 
-    /// Create an empty pool. No thread is started here — the first `submit`
-    /// creates one, so a program that never offloads anything never pays for a
-    /// thread. Panics only if the OS refuses the lock primitives, which would
-    /// make every later `submit` unsound.
+    /// Create an empty pool with the default thread ceiling.
     static start() -> BlockingPool* {
+        return BlockingPool::with_max(BLOCKING_DEFAULT_THREADS);
+    }
+
+    /// Create an empty pool that will grow to at most `max` threads (clamped to
+    /// >= 1: a pool that could never create a thread would accept jobs and never
+    /// reach them). No thread is started here — the first `submit` creates one,
+    /// so a program that never offloads anything never pays for a thread, and
+    /// `max` costs only its slot in the id table. Panics only if the OS refuses
+    /// the lock primitives or the allocator refuses that table, either of which
+    /// would make every later `submit` unsound.
+    static with_max(max: u32) -> BlockingPool* {
+        mut count: u32 = max;
+        if (count == 0) { count = 1; }
         mut alloc: GlobalAlloc = GlobalAlloc::new();
         mut p: BlockingPool* = null;
         match (alloc.allocate(Layout::of<BlockingPool>())) {
             Result::Ok(raw) => { p = raw.cast<BlockingPool>().as_ptr(); }
-            Result::Err(_)  => { panic("BlockingPool::start: allocation failed", FILE, LINE); }
+            Result::Err(_)  => { panic("BlockingPool::with_max: allocation failed", FILE, LINE); }
         }
         if (bp_mtx_init(&p.mtx[0]) != 0) {
-            panic("BlockingPool::start: mutex init failed", FILE, LINE);
+            panic("BlockingPool::with_max: mutex init failed", FILE, LINE);
         }
         if (bp_cond_init(&p.cv[0]) != 0) {
-            panic("BlockingPool::start: condition variable init failed", FILE, LINE);
+            panic("BlockingPool::with_max: condition variable init failed", FILE, LINE);
         }
         p.head     = null;
         p.tail     = null;
         p.shutdown = false;
         p.live     = 0;
         p.idle     = 0;
-        p.max      = BLOCKING_MAX_THREADS;
-        for (mut i: u32 = 0; i < BLOCKING_MAX_THREADS; i = i + 1) { p.tids[i] = 0; }
+        p.max      = count;
+        match (alloc.allocate(Layout::array<u64>(count as u64))) {
+            Result::Ok(raw) => { p.tids = raw.cast<u64>().as_ptr(); }
+            Result::Err(_)  => { panic("BlockingPool::with_max: thread table allocation failed", FILE, LINE); }
+        }
+        for (mut i: u32 = 0; i < count; i = i + 1) { p.tids[i] = 0; }
         return p;
     }
 
@@ -277,6 +302,12 @@ type struct BlockingPool {
         bp_cond_destroy(&p.cv[0]);
         bp_mtx_destroy(&p.mtx[0]);
         mut alloc: GlobalAlloc = GlobalAlloc::new();
+        // The id table is sized by `max`, so it must be released before the
+        // block that records it.
+        if (p.tids != null) {
+            alloc.deallocate(NonNull::new(p.tids as u8*), Layout::array<u64>(p.max as u64));
+            p.tids = null;
+        }
         alloc.deallocate(NonNull::new(p as u8*), Layout::of<BlockingPool>());
     }
 

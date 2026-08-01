@@ -32,6 +32,7 @@ import std::core::ptr;
 import std::alloc::layout;
 import std::alloc::allocator;
 import std::sync::atomic;
+import std::collections::array;
 import std::collections::str;
 import std::future;
 import std::time;
@@ -72,8 +73,13 @@ type struct FlagJob {
 function flag_job_run(raw: u8*) -> void {
     mut j: FlagJob* = raw as FlagJob*;
     if (j.barrier != null) { j.barrier.fetch_add(1, MemoryOrder::AcqRel); }
-    mut waited: u64 = 0;
-    while (waited < FLAG_WAIT_MS) {
+    // The bound is real elapsed time, not a count of 5ms sleeps. Under a loaded
+    // machine a 5ms sleep takes many times that, and it does not stretch by the
+    // same factor on every thread — so counting iterations makes one waiter's
+    // bound outlast another's by an amount that depends on scheduling, which is
+    // precisely what a test comparing two waiters must not depend on.
+    const started: Instant = Instant::now();
+    while (started.elapsed().as_millis() < FLAG_WAIT_MS) {
         mut group_ready: boolean = true;
         if (j.barrier != null) {
             group_ready = j.barrier.load(MemoryOrder::Acquire) >= j.need;
@@ -83,7 +89,6 @@ function flag_job_run(raw: u8*) -> void {
             return;
         }
         clock::sleep(Duration::from_millis(5));
-        waited = waited + 5;
     }
     j.saw = 0;
 }
@@ -265,6 +270,179 @@ async function abandon_in_flight(j: FlagJob*) -> i64 {
         Result::Ok(_)  => { return -20; }   // the flag is never set here
         Result::Err(_) => { return 1; }
     }
+}
+
+/// How many simultaneously-running jobs the default ceiling is probed with.
+/// Above any plausible small fixed ceiling, so a pool that reverted to one would
+/// fail this rather than merely being slower.
+const CEILING_PROBE: u32 = 16;
+
+/// Bound on waiting for a group of jobs to finish when some of them are expected
+/// to time out at `FLAG_WAIT_MS` first and the rest only run afterwards. Real
+/// elapsed time, so the margin over `FLAG_WAIT_MS` is a real one and does not
+/// shrink when the machine is loaded.
+const CEILING_WAIT_MS: u64 = 20000;
+
+/// The pool's ceiling, from both sides.
+///
+/// These two tests drive a `BlockingPool` directly rather than through an
+/// `Executor`: the claim is about the pool's thread ceiling, and a pool built
+/// here can be given an explicit one. Both use the same barrier the concurrency
+/// test does — a job will not finish until `need` jobs have ARRIVED — so "the
+/// ceiling is N" is observable as "N jobs can be in `run_fn` at once", which is
+/// the only form of the claim that a serializing pool cannot also satisfy.
+///
+/// `default_ceiling_admits_more_than_eight` is the one that would go red if the
+/// ceiling were lowered; `a_configured_ceiling_is_enforced` is the one that
+/// would go red if `max` stopped bounding anything. Neither alone pins the
+/// behaviour: a pool that ignored `max` entirely would pass the first.
+![test]
+function blocking_pool_default_ceiling_admits_more_than_eight() -> Result<(), TestError> {
+    mut pool: BlockingPool* = BlockingPool::start();
+    const arrived: Atomic<u32>* = counter_new();
+    if (arrived == null) {
+        BlockingPool::stop(pool);
+        BlockingPool::free(pool);
+        return bail(Str::new("barrier allocation failed"));
+    }
+    mut jobs: FlagJob*[] = [];
+    mut i: u32 = 0;
+    while (i < CEILING_PROBE) {
+        const j: FlagJob* = flag_job_new(arrived, CEILING_PROBE);
+        if (j == null) { break; }
+        jobs.push(j);
+        i = i + 1;
+    }
+    mut ok: boolean = jobs.length == CEILING_PROBE as u64;
+    // The flag is set up front: the barrier, not the flag, is what these jobs
+    // are really waiting on, and it can only be satisfied by concurrency.
+    i = 0;
+    while (i < jobs.length as u32) {
+        jobs[i].flag.store(1, MemoryOrder::Release);
+        if (!pool.submit(&jobs[i].job)) { ok = false; }
+        i = i + 1;
+    }
+    const started: Instant = Instant::now();
+    while (started.elapsed().as_millis() < FLAG_WAIT_MS) {
+        if (arrived.load(MemoryOrder::Acquire) >= CEILING_PROBE) { break; }
+        clock::sleep(Duration::from_millis(5));
+    }
+    // Stop before reading `saw`: it joins every pool thread, so each job has
+    // left `run_fn` and its payload is final.
+    BlockingPool::stop(pool);
+    i = 0;
+    while (i < jobs.length as u32) {
+        if (jobs[i].saw != 1) { ok = false; }
+        jobs[i].job.release();
+        i = i + 1;
+    }
+    BlockingPool::free(pool);
+    counter_free(arrived);
+    return expect_true(ok, Str::new("pool did not run 16 jobs at once"));
+}
+
+![test]
+function blocking_pool_a_configured_ceiling_is_enforced() -> Result<(), TestError> {
+    // Two threads, three jobs that each demand all three be running. The third
+    // cannot start until one of the first two finishes, so the barrier is
+    // unreachable while they wait and they must both give up at their bound.
+    mut pool: BlockingPool* = BlockingPool::with_max(2);
+    const arrived: Atomic<u32>* = counter_new();
+    if (arrived == null) {
+        BlockingPool::stop(pool);
+        BlockingPool::free(pool);
+        return bail(Str::new("barrier allocation failed"));
+    }
+    const a: FlagJob* = flag_job_new(arrived, 3);
+    const b: FlagJob* = flag_job_new(arrived, 3);
+    const c: FlagJob* = flag_job_new(arrived, 3);
+    if (a == null || b == null || c == null) {
+        BlockingPool::stop(pool);
+        BlockingPool::free(pool);
+        counter_free(arrived);
+        return bail(Str::new("FlagJob allocation failed"));
+    }
+    a.flag.store(1, MemoryOrder::Release);
+    b.flag.store(1, MemoryOrder::Release);
+    c.flag.store(1, MemoryOrder::Release);
+    mut ok: boolean = pool.submit(&a.job) && pool.submit(&b.job) && pool.submit(&c.job);
+    // Every job must be allowed to RUN before the pool is stopped. `take`
+    // returns null the moment shutdown is set, even with the queue non-empty, so
+    // stopping here instead would cancel all three and leave every `saw` at its
+    // initial 0 — which is the same reading this test expects from `a` and `b`,
+    // and would pass it without the ceiling having been exercised at all.
+    mut all_ran: boolean = false;
+    const started: Instant = Instant::now();
+    while (started.elapsed().as_millis() < CEILING_WAIT_MS) {
+        if (a.job.status.load(MemoryOrder::Acquire) != JOB_PENDING
+         && b.job.status.load(MemoryOrder::Acquire) != JOB_PENDING
+         && c.job.status.load(MemoryOrder::Acquire) != JOB_PENDING) {
+            all_ran = true;
+            break;
+        }
+        clock::sleep(Duration::from_millis(5));
+    }
+    // A bound reached here is its own failure, not a result to interpret: the
+    // readings below would then describe cancelled jobs rather than the ceiling.
+    if (!all_ran) { ok = false; }
+    BlockingPool::stop(pool);
+    // `a` and `b` ran together and timed out at a barrier the third job could
+    // not reach; `c` then ran alone and found all three arrivals counted, so it
+    // saw its condition met. `c` is asserted too: it is what distinguishes "the
+    // ceiling held `c` back" from "`c` never ran at all".
+    if (a.saw != 0) { ok = false; }
+    if (b.saw != 0) { ok = false; }
+    if (c.saw != 1) { ok = false; }
+    a.job.release();
+    b.job.release();
+    c.job.release();
+    BlockingPool::free(pool);
+    counter_free(arrived);
+    return expect_true(ok, Str::new("a max=2 pool ran three jobs at once"));
+}
+
+/// Three jobs that each demand all three be running, on an executor whose
+/// blocking ceiling is two. The first two get threads and time out at a barrier
+/// the third cannot reach; the third runs once they release their threads and
+/// finds every arrival counted.
+async function three_flags(x: FlagJob*, y: FlagJob*, z: FlagJob*) -> i64 {
+    const p: ((i64, i64), i64) =
+        await Futures::join(Futures::join(FlagFuture::start(x), FlagFuture::start(y)),
+                            FlagFuture::start(z));
+    if (p.0.0 != 0) { return -30; }
+    if (p.0.1 != 0) { return -31; }
+    if (p.1 != 1)   { return -32; }
+    return 0;
+}
+
+/// The `Executor` knob, end to end.
+///
+/// The pool-level tests above build a `BlockingPool` directly, so they say
+/// nothing about whether an executor hands its own ceiling down to the pool its
+/// futures actually reach. This one goes through `block_on`: if
+/// `with_threads_and_blocking` dropped the argument and used the default, all
+/// three jobs would run together and every one would report 1.
+![test]
+function executor_blocking_ceiling_reaches_the_pool() -> Result<(), TestError> {
+    const arrived: Atomic<u32>* = counter_new();
+    if (arrived == null) { return bail(Str::new("barrier allocation failed")); }
+    const x: FlagJob* = flag_job_new(arrived, 3);
+    const y: FlagJob* = flag_job_new(arrived, 3);
+    const z: FlagJob* = flag_job_new(arrived, 3);
+    if (x == null || y == null || z == null) {
+        counter_free(arrived);
+        return bail(Str::new("FlagJob allocation failed"));
+    }
+    // Pre-set: the barrier, not the flag, is what these jobs wait on, and only
+    // concurrency can satisfy it.
+    x.flag.store(1, MemoryOrder::Release);
+    y.flag.store(1, MemoryOrder::Release);
+    z.flag.store(1, MemoryOrder::Release);
+    mut ex: Executor = Executor::with_threads_and_blocking(1, 2);
+    const r: i64 = ex.block_on(three_flags(x, y, z));
+    ex.drop();
+    counter_free(arrived);
+    return expect_eq(r, 0 as i64);
 }
 
 ![test]
