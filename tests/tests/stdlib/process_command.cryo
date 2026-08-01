@@ -13,6 +13,7 @@ import std::core::result;
 import std::core::option;
 import std::core::slice;
 import std::core::drop;
+import std::core::mem;
 import std::collections::array;
 import std::collections::str;
 import std::io::error;
@@ -174,7 +175,13 @@ function echo_stdout_via_pipe() -> Result<(), TestError> {
     match (cmd.spawn()) {
         Result::Ok(handle) => {
             mut c: Child = handle;
-            match (c.stdout) {
+            // Take the pipe handle OUT of the child before reading it. Matching
+            // `c.stdout` in place would leave `c` holding a second claim on the
+            // same descriptor, so the arm's handle and the child's teardown
+            // would both close it.
+            mut so: Option<ChildStdout> = Option::None;
+            mem::swap<Option<ChildStdout>>(&so, &c.stdout);
+            match (so) {
                 Option::Some(mut h) => {
                     loop {
                         match (h.read(&chunk[0], 64)) {
@@ -192,7 +199,6 @@ function echo_stdout_via_pipe() -> Result<(), TestError> {
                 }
                 Option::None => { }
             }
-            c.stdout = Option::None;
             match (c.wait()) {
                 Result::Ok(st) => { success = st.success(); }
                 Result::Err(_) => { c.drop(); cmd.drop(); acc.drop(); return bail(Str::new("wait failed")); }

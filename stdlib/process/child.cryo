@@ -32,6 +32,8 @@ import core::result;
 import core::slice;
 import core::drop;
 import core::ptr;
+import core::mem;
+import collections::array;
 import alloc::layout;
 import alloc::allocator;
 import io::error;
@@ -706,6 +708,319 @@ implement trait Future for struct ChildWait {
 implement trait Drop for struct ChildWait {
     drop(mut &this) -> void {
         this.disarm();
+        this.let_go();
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// PipeDrain: read one captured pipe to EOF without stalling the executor.
+// ---------------------------------------------------------------------------
+
+/// Whether a captured pipe can be watched by the reactor.
+///
+/// A pipe is pollable on Linux, so a drain parks on the reactor and occupies no
+/// thread at all. The Windows reactor is built on AFD, which can only arm
+/// SOCKET handles; an anonymous `CreatePipe` end bridged to a CRT descriptor is
+/// not one, so there the drain has to occupy a pool thread instead. This is a
+/// property of the descriptor, not of the executor, which is why it is answered
+/// per target rather than by asking the reactor.
+![target(unix)]
+private function pipe_fits_reactor() -> boolean { return true; }
+
+![target(windows)]
+private function pipe_fits_reactor() -> boolean { return false; }
+
+/// Put `fd` in non-blocking mode so a drain can read it until it reports
+/// `WouldBlock` and only then park. Best-effort: a descriptor the kernel will
+/// not take the flag on still works, it just blocks in `read` once per park.
+/// Only the reactor route needs it — the pool route WANTS to block.
+![target(unix)]
+private function pipe_set_nonblock(fd: i32) -> void {
+    const cur: i32 = libc::fcntl(fd, libc::F_GETFL, 0 as i64);
+    if (cur < 0) { return; }
+    libc::fcntl(fd, libc::F_SETFL, (cur | libc::O_NONBLOCK) as i64);
+}
+
+![target(windows)]
+private function pipe_set_nonblock(fd: i32) -> void { return; }
+
+/// Read `fd` to EOF, appending into `buf`. Blocks the calling thread, so this
+/// is the body of a pool job and of the no-executor fallback — never of a poll
+/// that has a reactor to park on.
+private function pipe_drain_blocking(fd: i32, buf: mut &Array<u8>) -> Result<(), IoError> {
+    mut chunk: u8[4096];
+    loop {
+        match (fd::read_fd(fd, &chunk[0], 4096)) {
+            Result::Ok(n) => {
+                if (n == 0) { return Result::Ok(()); }
+                mut i: u64 = 0;
+                while (i < n) { buf.push(chunk[i]); i = i + 1; }
+            }
+            Result::Err(e) => {
+                match (e.kind) {
+                    IoErrorKind::Interrupted => { }
+                    _ => { return Result::Err(e); }
+                }
+            }
+        }
+    }
+}
+
+/// The block a `PipeDrain` hands to the blocking pool: the pool's job header,
+/// the descriptor to drain, and the bytes it collected.
+///
+/// `job` must be the first field — the pool is given its address and casts it
+/// back to this type, which is only sound at offset 0. The block OWNS the
+/// descriptor rather than borrowing the `Child`'s: a cancelled drain releases
+/// its side immediately while the pool thread is still inside `read`, so a
+/// borrowed descriptor could be closed out from under that thread and its
+/// number reused by an unrelated open.
+type struct PipeDrainJob {
+    job:      BlockingJob;
+    fd:       i32;         // this block's own descriptor; closed by `_free`
+    buf:      Array<u8>;   // valid when `produced && ok`
+    err:      IoError;     // valid when `produced && !ok`
+    produced: boolean;
+    ok:       boolean;
+}
+
+/// `run_fn` for a `PipeDrainJob`: the blocking drain, on a pool thread. A bare
+/// fn-ptr in the job's vtable, so it must be a free function.
+///
+/// `produced` is set last. Everything the collecting side reads is written
+/// before it, and the pool publishes the job's terminal status under its lock
+/// after this returns, which is what orders the two.
+function pipe_drain_job_run(raw: u8*) -> void {
+    mut j: PipeDrainJob* = raw as PipeDrainJob*;
+    match (pipe_drain_blocking(j.fd, &j.buf)) {
+        Result::Ok(_)  => { j.ok = true;  }
+        Result::Err(e) => { j.err = e; j.ok = false; }
+    }
+    j.produced = true;
+}
+
+/// `drop_fn` for a `PipeDrainJob`: close this block's descriptor and free it,
+/// including any bytes nobody collected. Runs on whichever side let go last.
+function pipe_drain_job_free(raw: u8*) -> void {
+    mut j: PipeDrainJob* = raw as PipeDrainJob*;
+    if (j.fd >= 0) {
+        fd::close_fd(j.fd);
+        j.fd = -1;
+    }
+    j.buf.drop();
+    mut alloc: GlobalAlloc = GlobalAlloc::new();
+    alloc.deallocate(NonNull::new(raw), Layout::of<PipeDrainJob>());
+}
+
+/// Read one captured pipe to EOF without stalling the executor. The machinery
+/// behind `Command::collect`; await that rather than driving this directly.
+///
+/// ## Routes
+///
+/// Linux parks on the reactor and costs no thread. Windows hands the descriptor
+/// to the blocking pool, because its reactor cannot arm a pipe (see
+/// `pipe_fits_reactor`). `Command::collect` runs the two pipes concurrently, so
+/// a child captured on Windows occupies two pool threads while it is draining —
+/// and that concurrency is required, not incidental: draining one pipe to EOF
+/// before starting the other deadlocks any child that fills the second pipe's
+/// buffer in the meantime.
+///
+/// ## Ownership
+///
+/// This future owns the descriptor outright — `Command::collect` moves it out
+/// of the `Child` rather than leaving a second closer behind. It is closed when
+/// the drain completes or when the future is dropped, whichever happens first,
+/// except on the pool route, where the job block owns it instead.
+///
+/// ## Driving without an executor
+///
+/// `Reactor::current()` and `BlockingPool::current()` are both null on a thread
+/// that is not an executor worker. Rather than park with nowhere to register —
+/// which would hang — a `PipeDrain` polled there drains inline and completes on
+/// that first poll. That blocks the polling thread, which is exactly what the
+/// spinning `future::block_on` driver already does.
+type struct PipeDrain {
+    fd:         i32;            // owned here until the job or `finish` takes it
+    buf:        Array<u8>;
+    rt:         Reactor*;       // non-null while a registration is live
+    job:        PipeDrainJob*;  // non-null while a pool job is in flight
+    routed:     boolean;        // true once the first poll chose a route
+    on_reactor: boolean;        // which route that was
+
+    /// Begin draining `raw_fd`, which this future now owns. Nothing is read or
+    /// submitted until the first poll, so a `PipeDrain` that is never awaited
+    /// costs nothing beyond closing the descriptor.
+    static start(raw_fd: i32) -> PipeDrain {
+        return PipeDrain {
+            fd: raw_fd,
+            buf: Array::new(),
+            rt: null,
+            job: null,
+            routed: false,
+            on_reactor: false
+        };
+    }
+
+    /// Drop the reactor registration so a cancelled drain leaves no waker
+    /// behind for a task that is gone. Idempotent — the completion path and
+    /// `Drop` both call it.
+    private disarm(mut &this) -> void {
+        if (this.rt != null) {
+            this.rt.cancel(this.fd, INTEREST_READ);
+            this.rt = null;
+        }
+    }
+
+    /// Hand the block back to the pool's ownership rules and forget it.
+    /// `release` frees it only if this was its last reference, so a drain still
+    /// running on a pool thread keeps it alive.
+    private let_go(mut &this) -> void {
+        if (this.job == null) { return; }
+        const j: PipeDrainJob* = this.job;
+        this.job = null;
+        j.job.release();
+    }
+
+    /// Close the descriptor and move the bytes out, pairing them with the
+    /// result. Clearing both is what keeps this future's `Drop` from closing a
+    /// descriptor twice and freeing a buffer it has just handed to the caller.
+    private finish(mut &this, result: Result<(), IoError>) -> Poll<Result<Array<u8>, IoError>> {
+        this.disarm();
+        if (this.fd >= 0) {
+            fd::close_fd(this.fd);
+            this.fd = -1;
+        }
+        mut b: Array<u8> = Array<u8>::new();
+        mem::swap<Array<u8>>(&b, &this.buf);
+        match (result) {
+            Result::Ok(_)  => { return Poll::Ready(Result::Ok(b)); }
+            Result::Err(e) => {
+                b.drop();
+                return Poll::Ready(Result::Err(e));
+            }
+        }
+    }
+}
+
+implement trait Future for struct PipeDrain {
+    type Output = Result<Array<u8>, IoError>;
+
+    poll(mut &this, cx: Context*) -> Poll<Result<Array<u8>, IoError>> {
+        if (this.job == null) {
+            if (!this.routed) {
+                this.routed = true;
+                this.on_reactor = pipe_fits_reactor() && (Reactor::current() != null);
+                if (this.on_reactor) { pipe_set_nonblock(this.fd); }
+            }
+
+            if (this.on_reactor) {
+                mut chunk: u8[4096];
+                loop {
+                    match (fd::read_fd(this.fd, &chunk[0], 4096)) {
+                        Result::Ok(n) => {
+                            // A pipe reports EOF only once every write end has
+                            // closed, which for a captured stream means the
+                            // child has exited or closed it deliberately.
+                            if (n == 0) { return this.finish(Result::Ok(())); }
+                            mut i: u64 = 0;
+                            while (i < n) { this.buf.push(chunk[i]); i = i + 1; }
+                        }
+                        Result::Err(e) => {
+                            match (e.kind) {
+                                IoErrorKind::Interrupted => { }
+                                IoErrorKind::WouldBlock  => {
+                                    // Registering AFTER the failed read is what
+                                    // makes the race safe: bytes that arrived in
+                                    // between are still reported, because the
+                                    // reactor arms level-triggered.
+                                    mut rt: Reactor* = Reactor::require();
+                                    this.rt = rt;
+                                    rt.register(this.fd, INTEREST_READ, cx.waker());
+                                    return Poll::Pending;
+                                }
+                                _ => { return this.finish(Result::Err(e)); }
+                            }
+                        }
+                    }
+                }
+            }
+
+            mut pool: BlockingPool* = BlockingPool::current();
+            if (pool == null) {
+                mut inline_r: Result<(), IoError> = pipe_drain_blocking(this.fd, &this.buf);
+                return this.finish(inline_r);
+            }
+            mut alloc: GlobalAlloc = GlobalAlloc::new();
+            mut j: PipeDrainJob* = null;
+            match (alloc.allocate(Layout::of<PipeDrainJob>())) {
+                Result::Ok(raw) => { j = raw.cast<PipeDrainJob>().as_ptr(); }
+                Result::Err(_)  => {
+                    return this.finish(Result::Err(IoError::new(IoErrorKind::OutOfMemory, 0)));
+                }
+            }
+            BlockingJob::init(&j.job, pipe_drain_job_run, pipe_drain_job_free);
+            j.fd       = this.fd;
+            j.buf      = Array<u8>::new();
+            j.err      = IoError::new(IoErrorKind::Other, 0);
+            j.produced = false;
+            j.ok       = false;
+            // The block owns the descriptor from here, so this side must not
+            // close it — including on the submit-failure path below, which
+            // takes it back explicitly.
+            this.fd = -1;
+            if (!pool.submit(&j.job)) {
+                // The pool is shutting down or could not create a thread, so
+                // nothing would ever run this job. Take the descriptor back and
+                // drain here instead.
+                this.fd = j.fd;
+                j.fd    = -1;
+                j.job.release();
+                mut fallback_r: Result<(), IoError> = pipe_drain_blocking(this.fd, &this.buf);
+                return this.finish(fallback_r);
+            }
+            this.job = j;
+        }
+        // Arming re-reads the job's status under the pool's lock, so a drain
+        // that finished between polls is collected here rather than parked on
+        // again — and a waker stored a moment before the pipe closed cannot be
+        // the one nobody fires.
+        mut jc: PipeDrainJob* = this.job;
+        if (jc.job.arm(cx.waker()) == JOB_PENDING) {
+            return Poll::Pending;
+        }
+        // Finished. `Interrupted` stands for "the pool shut down before
+        // reaching this job", the one terminal state that produces no answer.
+        mut out: Result<Array<u8>, IoError> =
+            Result::Err(IoError::new(IoErrorKind::Interrupted, 0));
+        if (jc.produced) {
+            if (jc.ok) {
+                // Move the bytes out before letting go: `release` may free the
+                // block, and the buffer must not be freed with it.
+                mut b: Array<u8> = Array<u8>::new();
+                mem::swap<Array<u8>>(&b, &jc.buf);
+                out = Result::Ok(b);
+            } else {
+                out = Result::Err(jc.err);
+            }
+        }
+        this.let_go();
+        return Poll::Ready(out);
+    }
+}
+
+/// Abandoning a drain closes the descriptor it still owns, frees what it had
+/// already read, and releases this side's claim on a pool block. The pool's
+/// drain may still be running, which is why that half is a reference release
+/// and not a free — and why the descriptor it took is closed by the block.
+implement trait Drop for struct PipeDrain {
+    drop(mut &this) -> void {
+        this.disarm();
+        if (this.fd >= 0) {
+            fd::close_fd(this.fd);
+            this.fd = -1;
+        }
+        this.buf.drop();
         this.let_go();
     }
 }

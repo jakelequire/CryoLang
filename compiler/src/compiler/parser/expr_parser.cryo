@@ -353,33 +353,53 @@ public:
 
         while (this.check(TokenType::KwAs)) {
             this.advance();
-            // `as const T*` casts to a pointer-to-const; the const binds to the
-            // first pointer suffix (threaded via parse_type_suffixes_q).
-            mut pending_const: boolean = false;
-            if (this.check(TokenType::KwConst)) {
-                this.advance();
-                pending_const = true;
-            }
-            // Parse base type first, then selectively apply suffixes.
-            // This resolves the ambiguity: `x as u64 * 8` should be
-            // (x as u64) * 8, not x as (u64*) followed by orphaned 8.
-            // We consume * as pointer suffix only if it's NOT followed
-            // by a token that could start an expression (number, ident, etc.).
-            mut target: TypeAnnotation* = this.parse_base_type();
-            if (target == null) {
-                this.report_error(ErrorCode::E0104_EXPECTED_TYPE,
-                    "expected type after 'as'");
-                return expr;
-            }
-            // Apply pointer/array suffixes only when * is not an operator.
-            // Disambiguate: `x as u64 * 8` -> (x as u64) * 8, not x as (u64*)
-            // Heuristic: * is a pointer suffix if followed by a non-expression
-            // token (;  )  }  ]  ,  as  EOF).  Otherwise it's multiplication.
-            if (this.check(TokenType::Star) && this.is_star_pointer_suffix()) {
-                target = this.parse_type_suffixes_q(target, pending_const);
-            } else if (!this.check(TokenType::Star)) {
-                // Non-star suffixes ([], ?) are unambiguous
-                target = this.parse_type_suffixes_q(target, pending_const);
+            mut target: TypeAnnotation* = null;
+            // A parenthesized cast target - function `(T) -> R`, tuple
+            // `(T, U)`, unit `()`, or grouping `(T)` - cannot be reached
+            // through parse_base_type, which has no LParen branch.  The
+            // narrow entry below is deliberate for bare base types (it keeps
+            // `x as u64 * 8` parsing as `(x as u64) * 8`), but that ambiguity
+            // needs a base type sitting to the left of the `*`; a leading `(`
+            // can never be a binary operator, so delegate to the same paren
+            // parser the annotation grammar uses.  It consumes its own
+            // suffixes, so the `*` disambiguation must not run over it again.
+            if (this.check(TokenType::LParen)) {
+                target = this.parse_paren_type();
+                if (target == null) {
+                    this.report_error(ErrorCode::E0104_EXPECTED_TYPE,
+                        "expected type after 'as'");
+                    return expr;
+                }
+            } else {
+                // `as const T*` casts to a pointer-to-const; the const binds
+                // to the first pointer suffix (threaded via
+                // parse_type_suffixes_q).
+                mut pending_const: boolean = false;
+                if (this.check(TokenType::KwConst)) {
+                    this.advance();
+                    pending_const = true;
+                }
+                // Parse base type first, then selectively apply suffixes.
+                // This resolves the ambiguity: `x as u64 * 8` should be
+                // (x as u64) * 8, not x as (u64*) followed by orphaned 8.
+                // We consume * as pointer suffix only if it's NOT followed
+                // by a token that could start an expression (number, ident, etc.).
+                target = this.parse_base_type();
+                if (target == null) {
+                    this.report_error(ErrorCode::E0104_EXPECTED_TYPE,
+                        "expected type after 'as'");
+                    return expr;
+                }
+                // Apply pointer/array suffixes only when * is not an operator.
+                // Disambiguate: `x as u64 * 8` -> (x as u64) * 8, not x as (u64*)
+                // Heuristic: * is a pointer suffix if followed by a non-expression
+                // token (;  )  }  ]  ,  as  EOF).  Otherwise it's multiplication.
+                if (this.check(TokenType::Star) && this.is_star_pointer_suffix()) {
+                    target = this.parse_type_suffixes_q(target, pending_const);
+                } else if (!this.check(TokenType::Star)) {
+                    // Non-star suffixes ([], ?) are unambiguous
+                    target = this.parse_type_suffixes_q(target, pending_const);
+                }
             }
             const span: SourceSpan = ParserBase::merge_spans(expr.span, this.current_span());
             expr = new CastExprNode(expr, target, span);

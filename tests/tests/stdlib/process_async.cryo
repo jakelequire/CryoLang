@@ -18,6 +18,8 @@ namespace CryoTests::Tests::Stdlib::ProcessAsync;
 import std::core::result;
 import std::core::option;
 import std::core::drop;
+import std::core::slice;
+import std::collections::array;
 import std::collections::str;
 import std::collections::string;
 import std::io::error;
@@ -238,4 +240,120 @@ function join_then_a_blocking_wait_both_report() -> Result<(), TestError> {
         Result::Err(e) => { return Result::Err(e); }
     }
     return expect_eq(code, 7 as i64);
+}
+
+// ---------------------------------------------------------------------------
+// `Command::collect` / `Command::run` - the async spellings of `output` and
+// `status`.
+// ---------------------------------------------------------------------------
+
+// A command that writes `OUT` to stdout and `ERR` to stderr, then exits 0.
+// Both streams are written, because the point of `collect` is that neither
+// drain can starve the other.
+![target(unix)]
+function cmd_two_streams() -> Command {
+    mut c: Command = Command::new(Str::new("/bin/sh"));
+    c.arg(Str::new("-c"));
+    c.arg(Str::new("printf OUT; printf ERR 1>&2"));
+    return c;
+}
+![target(windows)]
+function cmd_two_streams() -> Command {
+    mut c: Command = Command::new(Str::new("cmd"));
+    c.arg(Str::new("/c"));
+    c.arg(Str::new("echo OUT& echo ERR 1>&2"));
+    return c;
+}
+
+// `cmd /c echo` appends CRLF and `printf` does not, so the captures are
+// compared by PREFIX - the bytes each shell is asked to produce - rather than
+// for equality against a platform-specific trailer.
+function starts_with_ascii(s: Slice<u8>, want: string) -> boolean {
+    const p: u8* = want as u8*;
+    const q: u8* = s.as_ptr();
+    mut i: u64 = 0;
+    while (p[i] != 0) {
+        if (i >= s.length()) { return false; }
+        if (q[i] != p[i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// Capture both streams through `collect`. Returns a bitmask so a failure
+/// names which half went wrong rather than just "not 7": 1 = stdout, 2 =
+/// stderr, 4 = exit status.
+async function collect_streams() -> i64 {
+    mut c: Command = cmd_two_streams();
+    mut r: Result<Output, IoError> = await c.collect();
+    c.drop();
+    mut out: i64 = -1;
+    match (r) {
+        Result::Ok(o) => {
+            out = 0;
+            if (starts_with_ascii(o.stdout(), "OUT"))      { out = out + 1; }
+            if (starts_with_ascii(o.stderr(), "ERR"))      { out = out + 2; }
+            if (o.status().exit_code().unwrap_or(-1) == 0) { out = out + 4; }
+        }
+        Result::Err(_) => { out = -2; }
+    }
+    return out;
+}
+
+/// Spawn and await through `run`, reporting the exit code.
+async function run_code(cmd: Command) -> i64 {
+    mut c: Command = cmd;
+    mut r: Result<ExitStatus, IoError> = await c.run();
+    c.drop();
+    mut out: i64 = -4;
+    match (r) {
+        Result::Ok(st) => { out = st.exit_code().unwrap_or(-3) as i64; }
+        Result::Err(_) => { out = -4; }
+    }
+    return out;
+}
+
+/// Both captures arrive intact and the status is the child's own. A drain that
+/// closed the wrong descriptor, or handed its buffer away twice, fails here.
+![test]
+function collect_captures_both_streams() -> Result<(), TestError> {
+    mut ex: Executor = Executor::new();
+    const mask: i64 = ex.block_on(collect_streams());
+    ex.drop();
+    return expect_eq(mask, 7 as i64);
+}
+
+/// `collect` reports the same status `output` does; the async spelling changes
+/// who blocks, not what is observed.
+![test]
+function collect_agrees_with_the_blocking_output() -> Result<(), TestError> {
+    mut cmd: Command = cmd_two_streams();
+    mut sync_r: Result<Output, IoError> = cmd.output();
+    cmd.drop();
+    mut sync_code: i64 = -1;
+    match (sync_r) {
+        Result::Ok(o)  => { sync_code = o.status().exit_code().unwrap_or(-1) as i64; }
+        Result::Err(_) => { sync_code = -2; }
+    }
+    mut ex: Executor = Executor::new();
+    const mask: i64 = ex.block_on(collect_streams());
+    ex.drop();
+    if (mask != 7) { return expect_eq(mask, 7 as i64); }
+    return expect_eq(sync_code, 0 as i64);
+}
+
+![test]
+function run_reports_a_clean_exit() -> Result<(), TestError> {
+    mut ex: Executor = Executor::new();
+    const code: i64 = ex.block_on(run_code(cmd_exit(0)));
+    ex.drop();
+    return expect_eq(code, 0 as i64);
+}
+
+![test]
+function run_reports_a_failing_exit() -> Result<(), TestError> {
+    mut ex: Executor = Executor::new();
+    const code: i64 = ex.block_on(run_code(cmd_exit(6)));
+    ex.drop();
+    return expect_eq(code, 6 as i64);
 }

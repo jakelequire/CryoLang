@@ -3989,10 +3989,26 @@ type struct AsyncLower {
         }
         if (k == NodeKind::CallExpression) {
             const c: CallExprNode* = e as CallExprNode*;
-            // A receiver is reached into, an argument is handed over.
+            // A receiver is reached into; an argument is handed over only when
+            // the parameter it binds to takes ownership, which `arg_binding`
+            // records. Reading the position instead classified an argument
+            // standing in a `&T` slot as a give-away, so a state whose last
+            // mention of a carried value only lent it out was reported as no
+            // longer owning it and skipped its hand-back — leaving the carrier
+            // field empty for every later state that reads it.
+            //
+            // The predicate has to match `subst_name_expr`'s exactly, down to
+            // an UNCLASSIFIED slot reading as a borrow: that walk rewrites the
+            // mentions this one counts, so a give-away counted here and a
+            // borrow substituted there aliases the value. Erring towards a
+            // borrow publishes a value the state may have given away, which
+            // MoveCheck catches as E0453; erring the other way strands the
+            // field, which nothing catches until a `None` is unwrapped.
             this.mark_last_use_expr(c.callee, name, false, out);
             for (mut i: i64 = 0; i < c.arguments.length; i++) {
-                this.mark_last_use_expr(c.arguments[i], name, true, out);
+                const owns: boolean = (c.arguments[i] != null &&
+                                       c.arguments[i].arg_binding == ArgBinding::ByValue);
+                this.mark_last_use_expr(c.arguments[i], name, owns, out);
             }
             return;
         }
