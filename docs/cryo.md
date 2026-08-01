@@ -2961,6 +2961,8 @@ const n: i64 = future::block_on(add_later(1, 2));
 
 The blocking pool exists because readiness is not universal. `getaddrinfo` has no non-blocking form on either platform, and a regular file is always "ready" as far as `epoll` is concerned, so neither can be parked on the reactor. Calling one directly inside a `poll` stalls a worker for its whole duration — on a single-threaded executor, the whole runtime. `std::future::blocking` runs such calls on threads nobody polls on and fires a `Waker` when they finish; `dns::Resolve` is the one that ships using it, so an `async` name lookup costs a worker nothing while it waits.
 
+The pool creates threads only on demand and only when none is idle, so its ceiling costs nothing until the work arrives; jobs beyond it queue. Because one pool serves every offloading caller in an executor, that ceiling has to cover their combined in-flight count — a caller that holds one job while waiting on a second deadlocks against a ceiling too low to run both. The default is deliberately generous; `Executor::with_threads_and_blocking` overrides it.
+
 ```cryo
 mut ex: Executor = Executor::new();
 
@@ -2974,6 +2976,8 @@ const b: i64 = h2.join();
 | Operation | Meaning |
 | --------- | ------- |
 | `Executor::new()` | Create a runtime with a default worker pool and its reactor. |
+| `Executor::with_threads(n)` | Same, with exactly `n` worker threads (clamped to >= 1). |
+| `Executor::with_threads_and_blocking(n, m)` | Same, and cap the blocking pool at `m` threads instead of the default. |
 | `ex.spawn(fut)` | Schedule `fut` as an independent task; returns a `JoinHandle<T>`. |
 | `ex.block_on(fut)` | Drive one future to completion on this executor and return its output. |
 | `h.join()` | Wait for the task and take its output. |
