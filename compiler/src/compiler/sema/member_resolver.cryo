@@ -603,6 +603,39 @@ type struct MemberResolver {
         return false;
     }
 
+    /// The type whose method body a generated `async` future carries, or null
+    /// when `owner` is not such a future.
+    ///
+    /// Lowering an `async` METHOD moves its statements verbatim into the `poll`
+    /// of a synthesized future struct.  From that point the enclosing type is the
+    /// future rather than the method's owner, so a body that reads its own type's
+    /// private fields would be judged an outsider (E0353) - even though nothing
+    /// about it left the type, and the very same statements passed the check
+    /// before lowering.  Granting the future its origin's access is what keeps
+    /// `async` from being a visibility downgrade.
+    ///
+    /// The origin is read off the receiver slot the future stores it in, named
+    /// `this$recv`.  `$` cannot appear in a source identifier, so no
+    /// user-written struct can claim this; and a free `async function`'s future
+    /// has no receiver slot, so it inherits nothing.
+    async_origin_owner(&this, owner: TypeRef) -> Type* {
+        mut t: Type* = this.arena.lookup(owner.id);
+        if (t != null && t.kind != TypeKind::Struct) {
+            // A future generic in its owner arrives as an `InstantiatedType`
+            // whose fields specialization has not filled in yet; the template it
+            // came from is what carries the slot.
+            const base: TypeRef = this.arena.inst_generic_base(owner);
+            t = if (base.is_valid()) { this.arena.lookup(base.id) } else { null };
+        }
+        if (t == null || t.kind != TypeKind::Struct) { return null; }
+        const st: StructType* = t as StructType*;
+        const recv: FieldInfo* = st.get_field(this.intern.intern("this$recv"));
+        if (recv == null) { return null; }
+        // The slot is a pointer for a `&this` receiver and the owner by value
+        // otherwise; either way this peels to the owner itself.
+        return this.types.unwrap_to_base_type(recv.field_type);
+    }
+
     /// Emit E0353 when a private/protected field is accessed outside its declaring
     /// type (allowing `protected` from subclasses).  No-op for public/non-aggregate.
     enforce_field_visibility(mut &this, recv_type: TypeRef,
@@ -648,6 +681,11 @@ type struct MemberResolver {
             if (owner != null && declaring_t != null) {
                 if (owner.id == declaring_t.id) { return; }
                 if (field.is_protected && this.is_subclass_of(owner, declaring_t.id)) { return; }
+            }
+            const origin: Type* = this.async_origin_owner(this.state.current_owner_type);
+            if (origin != null && declaring_t != null) {
+                if (origin.id == declaring_t.id) { return; }
+                if (field.is_protected && this.is_subclass_of(origin, declaring_t.id)) { return; }
             }
         }
 
@@ -704,6 +742,11 @@ type struct MemberResolver {
             if (owner != null && declaring_t != null) {
                 if (owner.id == declaring_t.id) { return; }
                 if (method.is_protected && this.is_subclass_of(owner, declaring_t.id)) { return; }
+            }
+            const origin: Type* = this.async_origin_owner(this.state.current_owner_type);
+            if (origin != null && declaring_t != null) {
+                if (origin.id == declaring_t.id) { return; }
+                if (method.is_protected && this.is_subclass_of(origin, declaring_t.id)) { return; }
             }
         }
 

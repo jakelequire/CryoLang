@@ -5459,3 +5459,124 @@ model — the architectural fork flagged for `fs`). Bindings for the latter alre
 ### Gates
 
 `make test` **1983 / 0**, compile-fail **170 / 0**, projects **13 / 0**. Roster 1983 (+3).
+
+## 2026-07-31 (later still) — `process` increment 1: `Child::join`, and a visibility hole in `async` methods
+
+`Child::wait` blocked the calling thread for the child's whole lifetime; inside an `async fn` that
+stalled an executor worker, and on a single-threaded `Executor` the whole runtime. `Child::join` is
+the async spelling. Increment 1 is `wait` only — piped `stdout`/`stderr` reads and the
+`Command::output` / `status` wrappers stay synchronous, so the per-platform split is validated before
+any pipe work lands on top of it.
+
+### The two routes, and why there have to be two
+
+`Reactor::register` looks platform-neutral and is not. The Linux backend is `epoll_ctl` on a plain
+fd, so **any** epoll-able descriptor works — and `pidfd_open` yields exactly that: a descriptor that
+becomes read-ready when the child exits. One registration, no extra thread.
+
+Nothing equivalent exists elsewhere. The Windows backend arms through
+`WSAIoctl(fd, SIO_BASE_HANDLE)` and is **socket-only**; a process HANDLE is not a socket and cannot
+attach to IOCP either. A Windows process-exit wait needs a thread, and so does a pre-5.3 Linux kernel
+where `pidfd_open` returns `-ENOSYS` from a raw syscall with no libc fallback. Both take the
+`BlockingPool` route. The route is chosen on the first poll and does not change.
+
+Three things the pidfd route gets right that a naive version would not:
+
+- **Readiness is not reaping.** A ready pidfd says only that the child became waitable; the status
+  still comes from `waitpid`, which is also what releases the zombie. Every poll reaps first through
+  the existing `os_proc_try_wait`, so `decode_wstatus` and the `wstatus_is_alive` stop/continue guard
+  are reused rather than re-derived.
+- **The registration is re-armed on every park**, because the backend is one-shot.
+- **The pidfd is closed** by `disarm`, on both the completion path and `Drop`.
+
+### The Windows hazard that needed a duplicate
+
+The pool job outlives the future that submitted it — a blocking wait cannot be cancelled. On Windows
+the job would then be sitting in `WaitForSingleObject` on a HANDLE that `Child::drop` closes exactly
+once. So the job takes its own reference via `os_proc_dup` (`DuplicateHandle`) and releases it in its
+`drop_fn`. On POSIX the identity is the pid, there is nothing to duplicate, and the `Option<u64>`
+return carries the "OS refused" case that only Windows has.
+
+`os_proc_dup` returning the raw `handle` on POSIX was the first shape, and it was wrong: `handle` is
+always 0 there, which is also the Windows failure sentinel.
+
+### No new blocking-wait code
+
+The pool job's `run_fn` calls the existing `os_proc_wait(pid, handle)`. That is already gated
+unix/windows, so the pool route needed **no** new platform split — the only new gated helpers are
+`os_proc_exit_fd` / `os_proc_close_exit_fd` (`linux` vs `not(linux)`) and the dup pair.
+
+### The compiler defect this uncovered: `async` was a silent visibility downgrade
+
+`Child::join` reads `this.pid`, `this.handle`, and writes `this.waited` — all `private`. It did not
+compile: **E0353, three times, on a method of the very type that declares them.**
+
+Reproduced in ~20 lines with no `process` involved, and it fires even with **no `await` in the body**.
+Root cause, confirmed by instrumenting `enforce_field_visibility` to print the owner: lowering moves
+an `async` method's statements verbatim into the `poll` of a generated future struct, and sema then
+walks that body again with `current_owner_type` = the **future** (`main::Holder$plain$Future_0`)
+rather than the method's owner. The first walk, with the correct owner, passes silently; the second
+one rejects.
+
+Fixed in `member_resolver.cryo` by giving the generated future its origin's access:
+`async_origin_owner` reads the owner off the receiver slot the future stores it in, `this$recv`. `$`
+cannot appear in a source identifier, so no user-written struct can claim the privilege, and a free
+`async function`'s future has no receiver slot and so inherits nothing. Both `enforce_field_visibility`
+and `enforce_method_visibility` consult it.
+
+It is an **extension** of the check, not a hole in it: an `async` method reading an *unrelated*
+type's private field is still E0353. That is
+`negative/E0353_private_field_async_foreign.cryo`, and it was verified to still fire.
+
+This needs a **repin**: the stdlib change cannot be built by a pin that lacks the compiler fix
+(the two-phase bootstrap ordering).
+
+### Tests, and what they discriminate
+
+`tests/stdlib/process_async.cryo` (6) and two added to `lang/async_method.cryo`.
+
+`two_children_join_concurrently` is the one that earns the feature: one executor worker, two sleeping
+children, asserting a **ratio** against a single child measured the same way rather than an absolute
+time. Its first form used an absolute 1700 ms bound and failed — not because `join` serialized but
+because `ping -n 3` takes ~2.1 s, not the ~1 s assumed. Measured both ways:
+
+| body of `join_code` | one child | two children | ratio |
+|---|---|---|---|
+| `await child.join()` | 2094 ms | 2115 ms | **1.01** |
+| `child.wait()` (counterfactual) | 2085 ms | 4152 ms | **1.99** |
+
+The 1.6 threshold sits between them with room on both sides, and it is self-calibrating across
+platforms where the sleep command costs something different. `one_ms >= 300` is asserted separately,
+so a sleep command that failed to spawn and returned instantly cannot make any pair time look
+concurrent.
+
+The Linux half cannot be run from a Windows host, so it was swept with
+`--target=x86_64-unknown-linux-gnu` — and the sweep was itself verified by breaking the
+`![target(linux)]` arm on purpose: the Linux build failed on it while the Windows build of the same
+tree still succeeded.
+
+### Gates
+
+`cryo test` **1991 / 0** unit (1983 + 6 + 2), compile-fail **171 / 0** (+1), projects **13 / 0**.
+
+Run the suite from **bash**, not the PowerShell tool: `EnvT::vars_finds_path_variable` matches
+`"PATH"` case-sensitively, and PowerShell exposes the variable as `Path`, so it reports a spurious
+single failure that looks exactly like a regression. `make test` runs under cmd and is unaffected.
+
+### Still open in `process`
+
+Piped `stdout`/`stderr` async reads and the `Command::output` / `status` wrappers. Jake's call on
+Windows pipe I/O is already made — **blocking pool, not overlapped IOCP** — so `command.cryo`'s
+existing `CreatePipe` path is not to be rewritten.
+
+### Repin
+
+Needed a **double** repin, not the single cycle the bootstrap-ordering note describes: that shortcut
+holds only when the compiler does not link the changed stdlib module, and
+`compiler/src/compiler/codegen/passes.cryo:16` imports `std::process::child`. Confirmed empirically —
+`bin/cryo` was 5,572,920 bytes after phase 1 and 5,597,496 after phase 2, so a single cycle would
+have left a pin that is not a fixed point.
+
+`make selfhost-check` exit 0, **`FIXED POINT OK` × 2** (Linux and Windows stage-3 == stage-4 IR).
+Both sidecars at `016e0530-dirty`, built 3 min apart; `verify-pin.py` OK. `worktree: dirty` is
+expected — the agent pins, Jake commits, so `--require-clean` fails until after the commit.

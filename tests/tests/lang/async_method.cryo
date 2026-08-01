@@ -364,3 +364,50 @@ function async_method_on_a_class() -> Result<(), TestError> {
     const r: i64 = future::block_on(n.doubled());
     return expect_eq(r, 20 as i64);
 }
+
+// Lowering moves an `async` method's statements into the `poll` of a generated
+// future struct, so from that point the enclosing type is the future rather than
+// the method's owner.  Visibility must not notice: a body reading its own type's
+// private fields is the same code it was before lowering, and rejecting it would
+// make `async` a silent visibility downgrade.  Both sides of a suspension are
+// exercised, because the receiver is re-addressed at resume and a read after the
+// await goes through that refreshed pointer.
+//
+// The complementary half - that this is the ORIGIN owner's access and not a
+// blanket exemption - is `negative/E0353_private_field_async_foreign.cryo`.
+type struct AmVault {
+    private: locked: i64;
+    public: static am_new(v: i64) -> AmVault { return AmVault { locked: v }; }
+
+    public: async take_after(mut &this, add: i64) -> i64 {
+        const before: i64 = this.locked;
+        const bumped: i64 = await am_bump(add);
+        this.locked = before + bumped;
+        return this.locked;
+    }
+
+    private: secret_double(&this) -> i64 { return this.locked * 2; }
+
+    public: async doubled_after(mut &this) -> i64 {
+        const step: i64 = await am_bump(0);
+        return this.secret_double() + step - 1;
+    }
+
+    public: value(&this) -> i64 { return this.locked; }
+}
+
+// `am_bump(5)` yields 6, so 10 + 6 == 16 - and the write landed on the object,
+// not on a stale copy, which is what reading it back through `value` checks.
+![test]
+function async_method_reads_its_own_private_field() -> Result<(), TestError> {
+    mut v: AmVault = AmVault::am_new(10);
+    const r: i64 = future::block_on(v.take_after(5));
+    return am_both(expect_eq(r, 16 as i64), expect_eq(v.value(), 16 as i64));
+}
+
+![test]
+function async_method_calls_its_own_private_method() -> Result<(), TestError> {
+    mut v: AmVault = AmVault::am_new(21);
+    const r: i64 = future::block_on(v.doubled_after());
+    return expect_eq(r, 42 as i64);
+}
