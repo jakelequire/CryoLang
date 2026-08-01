@@ -1947,14 +1947,18 @@ public:
     // `last_value` so downstream code fails loudly rather than wrongly.
 
     override visit(mut &this, node: AwaitExprNode*) -> void {
-        // The async lowering (`sema/async_lower.cryo`) rewrites every `await` in a
-        // supported `async function` into an explicit poll state machine, so a
-        // surviving `AwaitExprNode` here means it was NOT lowered: an `await`
-        // outside an `async function`, or in an async body whose control flow the
-        // current increment does not yet handle. Fail loudly rather than emit a
-        // stale value.
+        // The async lowering (`sema/async_lower.cryo`) rewrites every `await` in
+        // an `async function` into an explicit poll state machine, so a surviving
+        // `AwaitExprNode` here was never lowered. Two causes: an `await` outside
+        // an `async function` (a lambda body is its own function, so an `await`
+        // there is this case), or one enclosed in a form the lowering's walkers
+        // do not descend into - never counted as a suspension, so the body is
+        // lowered around it and the node arrives here intact. That set is
+        // whatever `expr_await_count` / `stmt_await_count` skip, today an
+        // `unsafe` block, `switch`, `static match`, a tuple literal, and
+        // `delete`. Fail loudly rather than emit a stale value.
         this.cg.diag.emit_error_at_span(ErrorCode::E0600_CODEGEN_FAILED,
-            "codegen: reached an `await` the async lowering did not rewrite (an `await` outside an `async function`, or unsupported async control flow)",
+            "codegen: this `await` was never lowered; it is either outside an `async function` or inside a form the async lowering does not walk (an `unsafe` block, `switch`, `static match`, a tuple literal, `delete`) - lift it out of that form, or bind it to a `const` before it",
             node.span);
         this.state.last_value     = LValue::null();
         this.state.last_is_lvalue = false;

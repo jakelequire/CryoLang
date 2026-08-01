@@ -473,8 +473,13 @@ hazard classes above.
   (zero uses outside parser + one test), `unsafe` as a committed permanent
   no-op (used once in the entire tree), `switch` redundant with `match`,
   parse-only struct field defaults (E0355), parse-only `async`/`await`/
-  `yield`. §21's candor is exemplary; freezing unused syntax into 1.0 semver
+  `yield`. §22's candor is exemplary; freezing unused syntax into 1.0 semver
   is still debt.
+  **Since this review:** `async` / `await` are implemented, lowered, and
+  documented (`docs/cryo.md` §19), and `unsafe` is no longer a no-op - it is
+  where a by-value move out of a dereference is permitted, which the move
+  checker otherwise rejects (`check_deref_move_out`). The frozen surface that
+  remains is `|>` / `<|`, `switch`, struct field defaults, and `yield`.
 - [ ] **Documented literal-widening trap** (§1.4): integer literals over
   `i64::MAX` wrap negative against `u64` operands — shipped as a "Trap"
   rather than fixed.
