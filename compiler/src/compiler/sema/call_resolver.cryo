@@ -4296,15 +4296,16 @@ type struct CallResolver {
         if (concrete_t == null || concrete_t.kind != TypeKind::Enum) { return TypeRef::invalid(); }
         const promoted: TypeRef = this.promote_to_expected_instantiation(type_ref);
         // `promote` only specialises when an expected type supplies the args.
-        // With no expected type - the inline `match (Option::Some(<expr>))`
-        // subject - it returns the generic base, so the variant binding lands as
-        // the raw param `T`.  A `T`-typed binding hides a `Drop`-field move-out
-        // from move-check (a real double-free).  Recover the concrete
-        // instantiation from the constructor's argument types.  Gated to the
-        // match subject AND a destructor-owning payload: exactly the unsound set,
-        // so Copy-payload subjects keep the generic-base path (no mono/codegen
-        // ripple).
-        if (promoted.id == type_ref.id && this.state.resolving_match_subject) {
+        // With none - an inline `Option::Some(<expr>)` standing as a `match`
+        // subject, or initializing an unannotated local - it returns the
+        // generic base, so the variant binding lands as the raw param `T`.
+        // That is wrong in two ways: a `T`-typed binding hides a `Drop`-field
+        // move-out from move-check (a real double-free), and a bare `T` payload
+        // has no layout to lower, so the construction is rejected at codegen
+        // (E0600) rather than losing its payload silently.  The constructor's
+        // own argument types determine the instantiation, so recover it from
+        // them whenever nothing else supplied one.
+        if (promoted.id == type_ref.id) {
             const inferred: TypeRef = this.infer_variant_instantiation(type_ref, scope.member_name, call);
             if (inferred.is_valid()) { scope.set_resolved_type(inferred); return inferred; }
         }
@@ -4335,7 +4336,6 @@ type struct CallResolver {
 
         mut bindings: TypeRef[] = [];
         for (mut p: i64 = 0; p < tmpl.param_count; p++) { bindings.push(TypeRef::invalid()); }
-        mut any_needs_drop: boolean = false;
 
         for (mut i: i64 = 0; i < variant.payload_types.length; i++) {
             const pt: Type* = this.arena.lookup(variant.payload_types[i].id);
@@ -4348,18 +4348,34 @@ type struct CallResolver {
             const arg: ExpressionNode* = call.arguments[i];
             if (arg == null || !arg.has_resolved_type()) { continue; }
             const arg_ty: TypeRef = arg.resolved_type;
-            if (this.types.contains_generic_param(arg_ty)) { continue; }
-            if (OwnershipQuery::needs_drop(this.arena, this.ctx.generic_registry, this.intern, arg_ty)) {
-                any_needs_drop = true;
-            }
+            // Only a fully concrete argument may bind. A generic param would
+            // instantiate the enum over a parameter rather than a type, and an
+            // instantiation that has not resolved its own shape yet would
+            // demand `Option<?>` - a specialization monomorphization cannot
+            // produce, which then fails the codegen module as an ICE rather
+            // than as a source error. Both stay on the generic-base path,
+            // where the enclosing template's specialization binds them later.
+            if (!this.types.arg_type_is_concrete(arg_ty)) { continue; }
             for (mut p: i64 = 0; p < tmpl.param_count; p++) {
                 if (tmpl.param_names[p].equals(pname)) { bindings[p] = arg_ty; break; }
             }
         }
 
-        if (!any_needs_drop) { return TypeRef::invalid(); }
+        // Every parameter must come out bound. A partially-bound enum has no
+        // layout, so returning one would only move the failure downstream.
         for (mut p: i64 = 0; p < tmpl.param_count; p++) {
             if (!bindings[p].is_valid()) { return TypeRef::invalid(); }
+        }
+        // Minting an instantiation is only safe while monomorphization still
+        // has a worklist to put it on. Sema runs a second time AFTER mono to
+        // re-resolve these nodes, and a specialization first demanded there is
+        // never produced: it survives to the generic validator as an
+        // unresolved instantiation and fails the build as an ICE. So after
+        // mono, reuse only what the earlier pass already demanded - a pure
+        // lookup - and leave anything else on the generic-base path it was
+        // already taking.
+        if (this.state.post_mono_verify) {
+            return this.arena.find_instantiation(base_ref, &bindings);
         }
         // Record the demand (keyed by source file, like TypeResolution) so the
         // instantiation is monomorphized for codegen; instantiate_for_module

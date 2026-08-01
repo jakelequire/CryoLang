@@ -3965,10 +3965,17 @@ has the machinery to notice an address of a frame local escaping (`frame_addr_ro
 is not syntactically an address-of. The conservative shape of the fix is to treat every local mentioned
 in an awaited call's arguments as live into the resume state.
 
-### Finding 2 (E0636) — reproduced, reduced, diagnosed, NOT fixed
+### Finding 2 (E0636) — FIXED (verified 2026-08-01)
 
-It is real and it is NOT the same root as Finding 1. It is not an async bug at all — here it is fully
-synchronous, and it reproduces under the pinned compiler:
+**Closed by later work; the diagnosis below is kept for the record but no longer describes the
+compiler.** Both halves it names — sema not stashing the method type args, mono not recovering the
+receiver type in a spec body — were fixed as part of the symbolic-receiver work, and the shape is
+guarded by `tests/tests/lang/generic_method_symbolic_receiver.cryo`. The reduction below compiles
+and runs correctly, with a bare `7` as well as the suffixed `7u32`, on an inherent method and on a
+generic trait default alike.
+
+It was real and it was NOT the same root as Finding 1. It was not an async bug at all — here it is
+fully synchronous, and it reproduced under the pinned compiler:
 
 ```cryo
 type struct Inner<S> { seed: S; }

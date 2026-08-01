@@ -22,6 +22,7 @@ import core::option;
 import core::result;
 import core::slice;
 import core::drop;
+import core::mem;
 import io::error;
 import io::fd;
 import io::traits;
@@ -34,6 +35,10 @@ import ffi::libc;
 import sys::syscall;
 import alloc::layout;
 import process::child;
+import future::poll;
+import future::waker;
+import future::traits;
+import future::combinator;
 
 // ArgvBuf: owned grow-on-push buffer of `u8*` for execvp's argv.
 //
@@ -176,6 +181,114 @@ type struct Command {
         const handle: Child = this.spawn()?;
         mut c: Child = handle;
         return c.wait();
+    }
+
+    /// Spawn, capture both streams, and await the exit without blocking the
+    /// calling thread: the async spelling of `output`.
+    ///
+    /// The two pipes are drained CONCURRENTLY. Draining one to EOF before
+    /// starting the other deadlocks any child that fills the second pipe's
+    /// buffer in the meantime — the kernel blocks the child's write, so the
+    /// child never exits and the first pipe never reaches EOF. That is the same
+    /// hazard the synchronous `output` interleaves its drains to avoid.
+    ///
+    /// The exit is awaited only after both pipes report EOF, which they do once
+    /// the child has closed them. Ordering it that way keeps the blocking cost
+    /// to the drains: on Windows a captured child occupies two pool threads
+    /// while draining (one per pipe — its reactor cannot watch a pipe, see
+    /// `PipeDrain`) and one while joining, never all three at once. On Linux
+    /// the drains and the exit all sit on the reactor and occupy no pool thread
+    /// at all. A program running N children concurrently should still size the
+    /// pool for 2N on Windows.
+    ///
+    /// Cancelling mid-drain closes the captured pipes and leaves the child
+    /// running — precisely the state `Child::drop` already handles.
+    async collect(&this) -> Result<Output, IoError> {
+        mut configured: Command = clone_command(this);
+        configured.stdout_cfg = Stdio::Piped;
+        configured.stderr_cfg = Stdio::Piped;
+        const handle: Child = configured.spawn()?;
+        mut c: Child = handle;
+
+        // Hand each descriptor to its drain and neuter the handle it came from.
+        // The handle stays in its slot so the `Child`'s teardown still runs, but
+        // with `-1` it closes nothing — the drain owns the descriptor now, and
+        // closing it twice could land on a number an unrelated open has reused.
+        mut so_fd: i32 = -1;
+        if (c.stdout.is_some()) {
+            mut hp: ChildStdout* = c.stdout.unwrap_ptr();
+            so_fd = hp.fd;
+            hp.fd = -1;
+        }
+        mut se_fd: i32 = -1;
+        if (c.stderr.is_some()) {
+            mut hp2: ChildStderr* = c.stderr.unwrap_ptr();
+            se_fd = hp2.fd;
+            hp2.fd = -1;
+        }
+
+        mut drained: (Result<Array<u8>, IoError>, Result<Array<u8>, IoError>) =
+            await Futures::join(PipeDrain::start(so_fd), PipeDrain::start(se_fd));
+
+        // Swap each half out rather than reading `drained.0` / `drained.1`
+        // directly: a tuple that owns a destructor still drops both fields at
+        // scope exit, so moving one out would leave the tuple to free it a
+        // second time. The placeholders left behind own nothing.
+        mut r_out: Result<Array<u8>, IoError> = Result::Err(IoError::new(IoErrorKind::Other, 0));
+        mut r_err: Result<Array<u8>, IoError> = Result::Err(IoError::new(IoErrorKind::Other, 0));
+        mem::swap<Result<Array<u8>, IoError>>(&r_out, &drained.0);
+        mem::swap<Result<Array<u8>, IoError>>(&r_err, &drained.1);
+
+        mut out_buf: Array<u8> = Array::new();
+        mut err_buf: Array<u8> = Array::new();
+        mut failed:  Option<IoError> = Option::None;
+        match (r_out) {
+            Result::Ok(b)  => { out_buf = b; }
+            Result::Err(e) => { failed = Option::Some(e); }
+        }
+        match (r_err) {
+            Result::Ok(b)  => { err_buf = b; }
+            Result::Err(e) => { failed = Option::Some(e); }
+        }
+        // Both halves are consumed before reporting either failure, so the
+        // buffer belonging to the half that succeeded is released rather than
+        // leaked on the error path.
+        match (failed) {
+            Option::Some(e) => {
+                out_buf.drop();
+                err_buf.drop();
+                return Result::Err(e);
+            }
+            Option::None => { }
+        }
+
+        mut joined: Result<ExitStatus, IoError> = await c.join();
+        match (joined) {
+            Result::Ok(status) => {
+                return Result::Ok(Output {
+                    status: status,
+                    stdout: out_buf,
+                    stderr: err_buf
+                });
+            }
+            Result::Err(e) => {
+                out_buf.drop();
+                err_buf.drop();
+                return Result::Err(e);
+            }
+        }
+    }
+
+    /// Spawn and await the exit without capturing anything: the async spelling
+    /// of `status`. Stdio goes wherever the caller configured it.
+    ///
+    /// A child whose output is left `Piped` and never drained can still fill a
+    /// pipe buffer and stop making progress; use `collect` when anything is
+    /// captured.
+    async run(&this) -> Result<ExitStatus, IoError> {
+        const handle: Child = this.spawn()?;
+        mut c: Child = handle;
+        return await c.join();
     }
 
     /// Run `command` through the platform shell (`/bin/sh -c` on POSIX,
