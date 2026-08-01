@@ -62,10 +62,16 @@ not for routine judgement calls.
 
 Legend: ☐ not started · ◐ in progress · ✅ done+validated · ⏸ blocked (note why in the Progress Log).
 
-**Current HEAD baseline:** `eda79ddc` (the two root-cause compiler fixes of 2026-07-24 — `drop_insertion`
-no longer running destructors on uninitialized memory, and the async "rebuilt from inside a branch" E0600
-removed — committed by Jake). Branch `ll-impl`. `make stdlib` = 149 modules green. Phases 0–3 done +
-committed.
+**Current HEAD baseline:** `45d8e759` (2026-08-01). Branch `ll-impl`. `make stdlib` = 154 modules
+green; `make test` = **2005 unit / 172 compile-fail / 15 projects, 0 failed**; `make selfhost-check` =
+`FIXED POINT OK` × 2 (Linux + Windows). Every phase 0–6 is done, validated, and committed, and the
+pin carries them. **Async is feature-complete against this plan** — what remains is not lowering
+work: the five forms §9's 2026-08-01 entry lists as unwalked, async `fs` / `stdio` (scoped out
+2026-07-31), and the merge bookkeeping.
+
+Earlier baseline, for the record: `eda79ddc` (the two root-cause compiler fixes of 2026-07-24 —
+`drop_insertion` no longer running destructors on uninitialized memory, and the async "rebuilt from
+inside a branch" E0600 removed).
 
 **✅ The Windows AFD reactor is VALIDATED (2026-07-25) — 30/30 runs, 0 failures, 0 hangs.** Real Windows
 host, async TCP echo over loopback on a 2-thread `Executor` driving `TcpAccept`/`TcpRead`/`TcpWrite`/
@@ -4724,6 +4730,9 @@ PARAMETER carrier and the match-binding carrier still use the moving protocol.
   remaining consumers are `last_use_consumes` / `needs_handback`, which serve the two carriers that still
   move. Correcting it would change THEIR hand-back decisions and buys nothing for the in-place carrier,
   which reads position directly.
+  **CORRECTED and FIXED in `f97ac164`** (see the 2026-08-01 entry): "buys nothing" was wrong. A carried
+  value whose last mention in a state merely LENT it to a `&T` parameter was read as given away, so the
+  state skipped its hand-back and stranded the carrier field for every later state.
 
 ### OPEN: use-after-give-away inside ONE state is no longer a compile error
 
@@ -5269,12 +5278,17 @@ either, so adding only `IfExpression` there would be arbitrary, and both fall ba
 `name_read_in_expr`, which now descends correctly. Not representable in the grammar, so not a gap:
 `return`/`break` directly in an arm (an arm holds an expression, not statements).
 
-### Unrelated finding, NOT fixed and NOT async
+### Unrelated finding, NOT async — FIXED in `f97ac164` (see the 2026-08-01 entry)
 
 `match (Option::Some(a)) { Option::Some(x) => { x + 1 } … }` types the arm binding `x` as `T`
 (`E0238`, "expected `T`, found `i64`") when the subject is an **inline** `Option::Some(<local>)`.
 Reproduces in plain synchronous code with no `async` and no if-expression anywhere; binding the
 subject to an annotated local first works. Its own item.
+
+**Closed:** an inline constructor with no expected type resolved to the generic base. The
+instantiation is recoverable from the constructor's argument types, and the fix also closed a second
+failure mode this reading missed — an unannotated `mut x = Option::Some(v);` has no layout to lower
+and was rejected at codegen.
 
 ---
 
@@ -5576,6 +5590,9 @@ Piped `stdout`/`stderr` async reads and the `Command::output` / `status` wrapper
 Windows pipe I/O is already made — **blocking pool, not overlapped IOCP** — so `command.cryo`'s
 existing `CreatePipe` path is not to be rewritten.
 
+**All of this landed in `f97ac164`** as `PipeDrain` / `Command::collect` / `Command::run` — see the
+2026-08-01 entry, which supersedes this list.
+
 ### Repin
 
 Needed a **double** repin, not the single cycle the bootstrap-ordering note describes: that shortcut
@@ -5587,3 +5604,143 @@ have left a pin that is not a fixed point.
 `make selfhost-check` exit 0, **`FIXED POINT OK` × 2** (Linux and Windows stage-3 == stage-4 IR).
 Both sidecars at `016e0530-dirty`, built 3 min apart; `verify-pin.py` OK. `worktree: dirty` is
 expected — the agent pins, Jake commits, so `--require-clean` fails until after the commit.
+
+## 2026-08-01 — `process` increment 2: async pipe capture; four compiler fixes; and the lowering's five blind spots
+
+`f97ac164`. Increment 1 made the exit wait async and deliberately left the captured pipes
+synchronous so the per-platform split could be validated before pipe work landed on top of it. This
+closes that: `PipeDrain` reads a captured pipe without blocking, `Command::collect` is the async
+`output`, and `Command::run` is the async `status`. `process` now has no blocking wait left in the
+paths an `async fn` reaches.
+
+### The two drains must overlap, and that is a correctness rule rather than a throughput one
+
+`collect` drains `stdout` and `stderr` CONCURRENTLY. Draining one to EOF before starting the other
+deadlocks any child that fills the second pipe's buffer meanwhile: the kernel blocks the child's
+write, the child never exits, and the first pipe never reaches EOF. The synchronous `output` already
+interleaves its drains for exactly this reason — the async spelling had to inherit the property, not
+rediscover it. The exit is awaited only after both pipes report EOF, which bounds the blocking cost:
+on Windows a captured child holds two pool threads while draining and one while joining, never three
+at once; on Linux the drains and the exit all sit on the reactor and hold no pool thread at all. A
+program running N children concurrently should still size the pool for 2N on Windows.
+
+`PipeDrain` OWNS the descriptor it drains — `collect` moves it out of the `Child` rather than leaving
+a second closer behind — and the pool route hands ownership to the job block, because the block
+outlives the future that submitted it. Polled on a thread that is not an executor worker (both
+`Reactor::current()` and `BlockingPool::current()` null), it drains inline and completes on that
+first poll rather than parking with nowhere to register, which would hang; blocking the polling
+thread is exactly what the spinning `future::block_on` driver already does.
+
+### Four compiler defects, three of them pre-existing and none of them async-specific
+
+**(1) A `match` subject that PROJECTS out of an owned place double-freed it.** The subject is
+evaluated into a drop-glued temporary before any arm runs, so `match (p.0)`, `match (arr[i])`,
+`match (*ptr)` handed one owning handle to two owners: the temporary and the source's own scope-exit
+glue. The assignment spelling of the identical projection was already rejected; only the `match`
+spelling reached the arms unchecked, built cleanly, and corrupted the heap at runtime. Fixed by
+`check_subject_move_out` (`move_check.cryo`), which applies the four projection rules to the subject.
+**NOT gated on an arm binding the payload** — the copy into the temporary happens whether or not a
+pattern names it, so `Some(_)` double-frees exactly like `Some(v)`. Only the PROJECTION checks run:
+walking the subject as a full move would mark a bare identifier subject `Moved`, and `match (x)` does
+not consume `x`. This restores an asymmetry rather than inventing a rule — `DropInsertion` already
+hoists an owning non-identifier subject and walks it in MOVE context, and the two passes MUST agree
+on that set or the difference is a double free or a leak.
+
+**(2) An inline enum constructor lost its instantiation.** `Option::Some(<expr>)` with no expected
+type resolved to the generic BASE, so a variant binding landed as the raw parameter `T`. Two
+failures, not one: a `T`-typed binding hides a `Drop`-field move-out from move-check (the
+double-free), and a bare `T` payload has no layout to lower, so an unannotated `mut x = Option::Some(v);`
+was rejected at codegen. The instantiation is recoverable from the constructor's own argument types,
+so `infer_variant_instantiation` now runs whenever nothing else supplied one. The
+`resolving_match_subject` state flag and its needs-drop gate are **deleted** — they narrowed the fix
+to the one shape that had been reported, and the second failure mode is what showed the narrowing was
+wrong. This is the finding recorded as "Unrelated finding, NOT fixed and NOT async" in the 07-31
+entry above; it is fixed.
+
+**(3) A parenthesized cast target could not be parsed at all.** `x as (i32) -> i32`, `x as (i32, i32)`,
+`x as (T)` — `parse_base_type` has no `(` branch, so none of them reached a type. The `*`
+disambiguation that keeps `x as u64 * 8` parsing as `(x as u64) * 8` needs a base type sitting to the
+LEFT of the `*`; a leading `(` can never be a binary operator, so the paren form delegates to the same
+paren parser the annotation grammar uses and skips the suffix pass. Independent of `process` — found
+while writing the increment, not required by it.
+
+**(4) `mark_last_use_expr` marked EVERY call argument a give-away.** This is the item the 07-29 entry
+listed under "Not done" and judged not worth correcting; the increment proved otherwise. An argument
+standing in a `&T` slot was read as handed over, so a state whose last mention of a carried value only
+LENT it out was recorded as no longer owning it, skipped its hand-back, and left the carrier field
+empty for every later state. Now classified from `arg_binding`. **The predicate has to match
+`subst_name_expr`'s exactly, down to an UNCLASSIFIED slot reading as a borrow** — that walk rewrites
+the mentions this one counts, so a give-away counted here against a borrow substituted there aliases
+the value. Erring toward a borrow publishes a value the state may have given away, which MoveCheck
+catches as `E0453`; erring the other way strands the field, and nothing catches that until a `None` is
+unwrapped.
+
+### Tests
+
+`stdlib/process_async.cryo` +4 (`collect_captures_both_streams`,
+`collect_agrees_with_the_blocking_output`, `run_reports_a_clean_exit`, `run_reports_a_failing_exit`),
+`lang/casts.cryo` +3, `lang/enum_ctor_arg_inference.cryo` (5), `lang/match_subject_owned_place.cryo`
+(3), `negative/E0453_match_subject_field_move.cryo`. Roster +15.
+
+`collect_agrees_with_the_blocking_output` is the one that earns the feature: the async and
+synchronous captures of the same command must produce the same bytes, so a drain that truncates or
+reorders fails against a reference the test did not have to hand-write. The
+`match_subject_owned_place` trio are controls for (1) — a bare local subject, a swapped-out field, and
+a tracked partial move must all still compile and drop exactly once, because over-rejecting is the
+easy way to make the negative pass and the wrong one.
+
+### Gates
+
+`make test` **2005 unit / 172 compile-fail / 15 projects, 0 failed** (Linux, measured at this commit
+under the committed pin). `make selfhost-check` exit 0, **`FIXED POINT OK` × 2**.
+
+**Measured, not assumed: no repin was owed for this commit.** Pin-built and source-built IR are
+byte-identical across all 154 stdlib modules, and across the compiler's own 161 modules every
+differing line is an embedded `__FILE__` path string — zero codegen differences. The four fixes widen
+what the compiler accepts and rejects; they do not move the default-path IR of what it emits.
+
+### FINDING: five forms the async lowering does not walk, and the sema-time fallback is unreachable
+
+`lower_stmt_sm`'s "this `await` shape is not supported yet" branch cannot fire. **`expr_await_count`
+and `hoist_expr` walk an IDENTICAL set of 13 expression kinds**, so an `await` this pass can see is
+one the hoist has already lifted to a statement of its own; there is no "counted but not liftable"
+case, which is the only route to that error. The same holds a level up: `stmt_await_count` and
+`lower_stmt_sm` agree on their statement kinds.
+
+The consequence is that an `await` in any form OUTSIDE those sets is not diagnosed early — it is
+invisible. Never counted as a suspension, the body lowers around it, and the `AwaitExprNode` survives
+to codegen (`ir_generator.cryo`, `E0600`). Five shapes reproduce, all verified at this commit:
+
+```cryo
+unsafe { t = await tick(1); }                          // UnsafeBlockStatement
+const t: (i64, i64) = (await tick(1), 2);              // TupleLiteral
+switch (c) { case 1: { t = await tick(1); } … }        // SwitchStatement
+static match (T) { i64 => { t = await tick(1); } … }   // StaticMatchStatement
+delete (await mk(1));                                  // DeleteExpression
+```
+
+`new Foo(await tick(1))` is fine. An `await` in a LAMBDA body is the legitimate "outside an `async
+function`" case, not a blind spot — the lambda is its own function.
+
+**This is the 07-31 `IfExpression` sweep's shape exactly:** `rn_expr` / `rn_stmt` know all five kinds,
+and the other eight walkers know none of them. The failure is loud and correctly spanned, so nothing
+miscompiles, but two of the five trail a spurious `E0614`. The diagnostics on both sides were reworded
+in `16ebe0b7` — the sema fallback no longer promises "a later increment" and documents why it must
+stay (a kind added to one walker and not the other lands there instead of reaching codegen), and the
+codegen message names the real cause instead of telling the user their `await` is outside an `async
+function`.
+
+**Not fixed, because two of the five need a decision first.** A sweep across the nine walkers plus
+`lower_stmt_sm` handles the tuple literal and `delete` mechanically. `static match` is the one that
+matters most in practice — one generic method plus `static match (T)` is the idiom this codebase
+prefers, so an `await` in a static-match arm inside a generic `async` method is code someone will
+write. `unsafe` needs a semantics call: the block is split across states, so the `unsafe` scope does
+not survive the explosion, and re-wrapping each fragment is a different rule from the one the
+programmer wrote. `switch` is frozen surface and may deserve a precise rejection rather than a
+lowering.
+
+### Still open in `process`
+
+Nothing from the increment-1 list: piped `stdout`/`stderr` reads and the `output` / `status` wrappers
+all landed here. What remains is unchanged and outside `process` — async `fs` and `stdio` are the
+follow-on projects Jake scoped out on 07-31, and `fs` in particular does not fit a readiness reactor.

@@ -49,6 +49,29 @@ Refresh **only** when `compiler/src/` has actually adopted something the
 existing pin can't handle. Do not refresh just because a new build exists -
 the pin is for compatibility, not freshness.
 
+### After a pin refresh or a Windows build: rebuild the runtime tiers
+
+`runtime/.bin` is a **single flat directory shared by every target**. A Windows
+build - the second half of `make pin`, or the Windows half of
+`make selfhost-check` - overwrites the host tier archives with PE objects, and
+the host recipe that is supposed to re-establish them builds incrementally, sees
+its own objects unchanged, and skips the re-archive. The archives stay PE, and
+the next Linux build fails at link time with a wall of `undefined reference to
+RtlAllocateHeap` and `dangerous relocation: R_AMD64_IMAGEBASE`.
+
+Deleting the directory is what forces the rebuild:
+
+```bash
+rm -rf runtime/.bin && make runtime-tiers
+```
+
+`file` on the archive does not tell you which target it holds - it prints
+`current ar archive` either way. Check a member:
+
+```bash
+ar p runtime/.bin/libcryort-core-hosted.a Entry.o | file -
+```
+
 ## Filing issues
 
 Use the GitHub issue tracker. The bug-report template asks for:
