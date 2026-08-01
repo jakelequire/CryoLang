@@ -2742,6 +2742,8 @@ Cryo supports `async` / `await` as a first-class language feature. An `async` fu
 
 The model is **stackless**. A future is an ordinary struct with no hidden heap allocation, no separate stack, and no runtime machinery of its own - `async` is a compile-time transformation, and the executor that drives futures is an ordinary library (`std::future`), not part of the language.
 
+This section describes the surface. For how the lowering and the runtime are built - and why there is no `Pin` - see [`docs/async-internals.md`](./async-internals.md).
+
 ### 19.1 Async Functions
 
 `async` before `function` makes the function asynchronous. The declared return type is the value the function eventually produces, **not** the future:

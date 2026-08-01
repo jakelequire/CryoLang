@@ -45,6 +45,15 @@ CRYO_SOURCES := $(call rwildcard,$(ROOT)/compiler/src,*.cryo) \
 ifeq ($(OS),Windows_NT)
     HOST_OS := windows
     UNAME_S := Windows_NT
+    # Pin the recipe shell to cmd.  Every HOST_OS==windows recipe below is
+    # written in cmd syntax (`if exist`, `rmdir /s /q`, `copy`, backslash
+    # paths), but make picks `sh.exe` whenever one is on PATH - and a Windows
+    # box with Git installed always has one.  Under that shell a cmd `if`
+    # becomes `syntax error: unexpected end of file`, which is what breaks
+    # `make stdlib` on a stock Windows CI runner while a developer box without
+    # Git Bash on PATH builds fine.
+    SHELL := cmd.exe
+    .SHELLFLAGS := /C
 else
     UNAME_S := $(shell uname -s 2>/dev/null || echo Unknown)
     ifeq ($(UNAME_S),Linux)
