@@ -102,6 +102,16 @@ is written entirely in Cryo, and the public surface is frozen under semver.
   (`opt.map(lambda)` infers `U`).
 - **Modules:** `_module.cryo` aggregators, `public`/`private`/`protected`
   visibility, import cycle detection.
+- **`async` / `await`.** `async` functions, methods, and trait methods are
+  compiled into state machines, and `await` may appear anywhere an expression
+  may appear - in a condition, a loop body, an operand of a larger expression,
+  a `match` subject, an arm body, and an arm guard. `async function main` is
+  renamed out of the entry-point slot and driven on an `Executor` scoped to
+  the program. A future is an ordinary movable struct with no hidden
+  allocation and no pinning discipline, which the language buys by rejecting
+  a reference held live across a suspend (`E0455`); owned values are carried
+  across it for you. See
+  [`docs/cryo.md` section 19](./docs/cryo.md#19-asynchronous-programming).
 
 ### Build system
 
@@ -174,16 +184,33 @@ is written entirely in Cryo, and the public surface is frozen under semver.
   `create_dir`/`create_dir_all`, `remove_dir`/`remove_dir_all`, `read_dir`,
   `canonicalize`) over `Path`/`PathBuf`; `metadata`/`symlink_metadata`/
   `exists`/`is_file`/`is_dir` backed by `stat`/`lstat`/`access`.
+- **`future`:** the async runtime - `Future`/`Poll`/`Context`/`Waker`; a
+  worker-pool `Executor` with `spawn`/`JoinHandle` and `block_on` (under
+  `--panic=unwind`, a `catch_unwind` boundary at every poll keeps one
+  panicking task from taking a worker down with it); a readiness reactor over
+  `epoll` on Linux and `\Device\Afd` + IOCP on Windows; `Sleep` timers; a
+  blocking thread pool for work no reactor can drive; and the
+  `join`/`try_join`/`select`/`timeout` combinators. Cancelling is a plain
+  drop - releasing a combinator disarms its timer and releases its I/O
+  registration.
 - **`net`:** `TcpStream`, `TcpListener`, `UdpSocket`, `IpAddr`/`IpV4Addr`/
   `IpV6Addr`, `SocketAddr`; `dns` name resolution; `tls` (OpenSSL) with
-  `https` on top; `ws` (RFC 6455) over any `Read + Write` transport. HTTP/1.1
+  `https` on top; `ws` (RFC 6455) over any async transport. HTTP/1.1
   server with keep-alive and read timeouts, HTTP client, router with route
   registration. HTTP/2 (`net::http2`): HPACK (RFC 7541), framing (RFC 7540),
-  h2c client + server over any stream, generic over the transport.
+  h2c client + server over any stream, generic over the transport. Every
+  operation that waits is `async` and parks on the reactor; there is no
+  blocking socket API. A future that needs a buffer owns it for the duration
+  and hands it back on completion, because a future moves between polls and a
+  borrowed caller-frame buffer would be written through a stale address.
 - **`json`:** parser and serializer for `JsonValue`/`JsonObject`/`JsonNumber`;
   round-trip clean.
 - **`process`:** `Command`/`Child`/`ExitStatus` via `fork + execve`;
-  `spawn`/`status`/`output`/`wait`/`try_wait`/`kill`/`send_signal`.
+  `spawn`/`status`/`output`/`wait`/`try_wait`/`kill`/`send_signal`, plus the
+  async spellings `Child::join`, `Command::collect`, and `Command::run`. A
+  captured pipe is drained by `PipeDrain`, and `collect` drains `stdout` and
+  `stderr` concurrently - draining one to EOF first deadlocks a child that
+  fills the other pipe's buffer meanwhile.
 - **`env`:** `args()`, `var`, `set_var`, `remove_var`, `process_exit`.
 - **`sync`:** a generic `Atomic<T>` (`T` = `u8`/`u32`/`u64`/`i32`/`i64`/`boolean`,
   dispatched at compile time via `static match`), `MemoryOrder`, `fence`,
@@ -276,10 +303,9 @@ nor `CRYO_STDLIB`.
 
 These are not bugs against 1.0 - the language deliberately ships
 without them and the grammar reserves the relevant syntax. See
-[`docs/cryo.md` section 21](./docs/cryo.md#21-reserved-syntax) for the
+[`docs/cryo.md` section 22](./docs/cryo.md#22-reserved-syntax) for the
 authoritative list.
 
-- Async / await / coroutines.
 - Macros / user-defined `![attr]` directives.
 - macOS / Darwin targets (no Mach-O backend or toolchain wiring yet). See
   **Target triples** above for the supported set.

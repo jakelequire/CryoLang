@@ -2143,9 +2143,14 @@ type struct AsyncLower {
     }
 
     /// Lower a single statement. await-free -> emit as-is (returns wrapped in
-    /// `Poll::Ready`); a top-level `await` carrier or an `if` holding an `await`
-    /// -> explode into states; any other await-carrying shape (nested in an
-    /// expression, or inside a loop or `match`) -> E0600 (a later increment).
+    /// `Poll::Ready`); a statement whose `await` stands at the top level -> a
+    /// carrier state; a block, `if`, loop, or `match` holding one -> exploded
+    /// into states.
+    ///
+    /// An `await` nested inside an expression does not arrive here still
+    /// nested: `hoist_expr` has already lifted it into a statement of its own
+    /// ahead of this one. The reduction is what lets a state boundary fall
+    /// between statements, which is the only place it can fall.
     lower_stmt_sm(mut &this, sm: PollSm*, stmt: StatementNode*, cur: i64) -> i64 {
         if (stmt == null) { return cur; }
         const k: NodeKind = stmt.kind;
@@ -2181,8 +2186,15 @@ type struct AsyncLower {
             sm.ok = false;
             return cur;
         }
+        // Defensive: a statement counted as await-carrying that is neither a
+        // top-level carrier nor a control-flow form the builder explodes.
+        // `expr_await_count` and `hoist_expr` walk the same set of expression
+        // kinds, so a nested `await` this pass can SEE is one the hoist has
+        // already lifted - which is what makes this branch unreachable today
+        // and why it must stay: an expression kind added to one walker and not
+        // the other lands here instead of reaching codegen unrewritten.
         this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
-            "async: this `await` shape is not supported yet; write it as `const x = await e;` / `return await e;` / `await e;`, inside an `if`/`else` branch, inside a `while`/`for`/`loop`/`do-while` body, or inside a `match` arm (an `await` nested in an expression arrives in a later increment)",
+            "async: this statement holds an `await` the lowering could not reduce to a statement boundary; bind it to its own `const x = await …;` ahead of this statement",
             stmt.span);
         sm.ok = false;
         return cur;

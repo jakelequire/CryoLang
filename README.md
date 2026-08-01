@@ -531,22 +531,23 @@ for the full 1.0 release notes.
 - Synchronization primitives: a generic `Atomic<T>` (`T` = `u8` / `u32` / `u64` / `i32` / `i64` / `boolean`, dispatched at compile time via `static match`), `MemoryOrder`, `fence`, `Mutex<T>`, `RwLock<T>`, `CondVar`, `Once`, `Barrier`. `Send` / `Sync` are computed structurally (never declared) with call-site enforcement; raw pointers are unconditionally `Send`, so treat a `Send` bound as a checked-what-it-can-see signal rather than a safety proof - see [`docs/cryo.md` section 16.4](./docs/cryo.md#164-the-send-and-sync-traits).
 - `ThreadLocal<T>` via POSIX TLS; OS threads via `thread::spawn` / `try_spawn` / `JoinHandle<T>` / `spawn_with_attr`, a named `thread::Builder` (stack size + OS thread name), scoped threads (`thread::Scope`), and `sync::mpsc` channels.
 - I/O over `Read` / `Write` traits with buffered wrappers.
-- Networking: `TcpStream` / `TcpListener`, `UdpSocket`, and OpenSSL-backed `TlsStream`. HTTP/1.1 server (keep-alive, read timeouts), client, and router; HTTP/2 (HPACK + single-stream framing) and WebSocket (RFC 6455). JSON parser and serializer.
+- `async` / `await` as a first-class language feature: `async` functions, methods, and trait methods compiled into state machines, `await` anywhere an expression may appear, and `async function main`. Futures are ordinary movable structs - no hidden allocation, no pinning discipline - which the language buys by rejecting a reference held live across a suspend (`E0455`) and carrying owned values across it for you. See [`docs/cryo.md` section 19](./docs/cryo.md#19-asynchronous-programming).
+- `std::future`: a worker-pool `Executor` with `spawn` / `JoinHandle`, a readiness reactor (epoll on Linux, `\Device\Afd` + IOCP on Windows), `Sleep` timers, a blocking thread pool for work no reactor can drive, and the `join` / `try_join` / `select` / `timeout` combinators. Cancelling a future is a plain drop.
+- Networking, async throughout: `TcpStream` / `TcpListener`, `UdpSocket`, and OpenSSL-backed `TlsStream`. HTTP/1.1 server (keep-alive, read timeouts), client, and router; HTTP/2 (HPACK + single-stream framing) and WebSocket (RFC 6455). JSON parser and serializer.
 - Filesystem: `File` / `OpenOptions`, whole-path `read` / `write` / `copy`, `remove_file`, `create_dir` / `create_dir_all`, `read_dir`, `rename`, `canonicalize`, and `metadata` / `symlink_metadata`.
 - `time` (`Duration`, `Instant`, `SystemTime`, `sleep`) and `random` (xoshiro256\*\* `Rng` plus a `getrandom`-backed CSPRNG).
-- POSIX subprocess spawning with `fork + execve`.
+- POSIX subprocess spawning with `fork + execve`, with async spellings for the operations that wait: `Child::join`, `Command::collect`, `Command::run`.
 - Git-backed dependencies with a lockfile and content-addressed cache.
 - Built-in test framework with `cryo test`, `![test]`, `![ignore]`, `![should_panic]`.
 - Language Server Protocol implementation (`make lsp`).
 
 **Beyond 1.0 (post-stable):**
 
-- Async / await / coroutines (currently parser-only).
 - Re-adapting an opaque-typed iterator **local**. The adapters `.map`, `.filter`, `.take`, `.chain`, `.enumerate`, `.zip` (plus `.copied` / `.cloned`) ship in 1.0 and compose when chained directly off the source (`src.map(f).filter(g)`), consumed by `.count` / `.fold` / `.for_each` / `for-in` or gathered with `from_iter`. The residual limitation is binding an adapter to a local and re-adapting it (`let it = src.map(f); it.filter(g)`) - see [`docs/cryo.md` section 2.11](./docs/cryo.md). `for (x in iter)` over ranges, `Array<T>`, `Slice<T>`, fixed-size arrays, and any `Iterator`, plus range expressions `a..b` / `a..=b`, ship in 1.0.
 - Dialable IPv6 (the `IpAddr::V6` representation and DNS resolution exist in 1.0; connecting over v6 does not yet).
 - macOS / Darwin targets. (x86_64 Linux and x86_64 Windows - native builds plus Linux->Windows cross via mingw-w64 - ship in 1.0.)
 
-A precise list of features the grammar reserves but the compiler does not yet lower lives in [`docs/cryo.md` section 21](./docs/cryo.md#21-reserved-syntax).
+A precise list of features the grammar reserves but the compiler does not yet lower lives in [`docs/cryo.md` section 22](./docs/cryo.md#22-reserved-syntax).
 
 ---
 
