@@ -30,15 +30,35 @@ filesystem enumeration order differences across OSes cannot break it.
                ADDING tests.  Prints the golden-only entries so a genuine
                deletion is still visible rather than silently preserved.
 
+Because the golden is a union, the CHECK waives golden entries whose test is
+gated to a different OS: it reads the `![target(<os>)]` directive attached to
+each `![test]` function under tests/tests/ and treats those as absent by design
+rather than deleted.  Without that, a union golden fails everywhere -- it lists
+Windows-only tests Linux cannot compile, and CI runs roster-check on Linux.
+The waiver is narrow: a test gated to THIS host, or carrying no gate at all,
+still fails when it disappears, which is the discovery breakage this gate exists
+to catch.
+
 Exit codes: 0 roster matches (or golden updated); 1 mismatch or failure.
 """
 import os
+import re
 import subprocess
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TESTS_DIR = os.path.join(ROOT, "tests")
+TESTS_SRC = os.path.join(TESTS_DIR, "tests")
 GOLDEN = os.path.join(TESTS_DIR, "test-roster.txt")
+
+HOST_TARGET = (
+    "windows" if sys.platform.startswith("win")
+    else "macos" if sys.platform == "darwin"
+    else "linux"
+)
+
+_DIRECTIVE_RE = re.compile(r"^\s*!\[\s*(\w+)\s*(?:\(([^)]*)\))?\s*\]\s*$")
+_FUNCTION_RE = re.compile(r"^\s*(?:public\s+|private\s+)?function\s+(\w+)\s*\(")
 
 
 def resolve_cryo(cryo):
@@ -78,6 +98,56 @@ def roster(cryo):
         sys.stderr.write("roster-check: --list produced no test entries; discovery is broken\n")
         sys.exit(1)
     return entries
+
+
+def gated_tests():
+    """Map each `![test]` function's leaf name -> the OS it is gated to.
+
+    The golden is a UNION across platforms -- `--merge` deliberately keeps
+    entries this host cannot see -- but `cryo test --list` only ever reports
+    what the CURRENT host compiles.  Without this map every OS-gated test reads
+    as a deletion, so a union golden could never pass on any host.
+
+    Only a `![target(<os>)]` sharing the contiguous directive run directly above
+    a `![test]` function counts; a comment or blank line ends the run.
+    """
+    gated = {}
+    for dirpath, _dirnames, filenames in os.walk(TESTS_SRC):
+        for name in filenames:
+            if not name.endswith(".cryo"):
+                continue
+            try:
+                with open(os.path.join(dirpath, name), "r",
+                          encoding="utf-8", errors="replace") as f:
+                    lines = f.read().splitlines()
+            except OSError:
+                continue
+            for i, line in enumerate(lines):
+                fn = _FUNCTION_RE.match(line)
+                if not fn:
+                    continue
+                is_test, target, j = False, None, i - 1
+                while j >= 0:
+                    d = _DIRECTIVE_RE.match(lines[j])
+                    if not d:
+                        break
+                    if d.group(1) == "test":
+                        is_test = True
+                    elif d.group(1) == "target" and d.group(2):
+                        target = d.group(2).strip().strip('"').strip("'")
+                    j -= 1
+                if not (is_test and target):
+                    continue
+                leaf = fn.group(1)
+                # Two same-named tests gated to different systems would make
+                # "absent here" ambiguous; refuse to excuse either.
+                gated[leaf] = target if gated.get(leaf, target) == target else None
+    return gated
+
+
+def leaf_name(entry):
+    """`CryoTests::Tests::Stdlib::Foo::bar: test` -> `bar`."""
+    return entry.rsplit(": test", 1)[0].rsplit("::", 1)[-1].strip()
 
 
 def golden_entries():
@@ -130,8 +200,24 @@ def main(argv):
     got_set, want_set = set(entries), set(want)
     missing = sorted(want_set - got_set)
     extra = sorted(got_set - want_set)
+
+    # An entry gated to a different OS is absent BY DESIGN on this host, not
+    # deleted.  A test gated to THIS host that went missing is still a failure,
+    # and so is one with no gate at all -- only the other platform's are waived.
+    gated = gated_tests()
+
+    def other_platform(ln):
+        g = gated.get(leaf_name(ln))
+        return g is not None and g != HOST_TARGET
+
+    waived = [ln for ln in missing if other_platform(ln)]
+    missing = [ln for ln in missing if not other_platform(ln)]
+    for ln in waived:
+        print("roster-check: gated   %s (not built on %s)" % (ln, HOST_TARGET))
+
     if not missing and not extra:
-        print("roster-check: OK (%d tests)" % len(entries))
+        print("roster-check: OK (%d tests, %d gated to another platform)"
+              % (len(entries), len(waived)))
         return 0
     for ln in missing:
         sys.stderr.write("roster-check: MISSING  %s\n" % ln)
