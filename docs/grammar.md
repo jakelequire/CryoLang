@@ -21,7 +21,7 @@ Statement          ::= VarDecl | FunctionDecl
                      | AggregateDecl | EnumDecl | TraitDecl
                      | TypeAlias | ImplBlock
                      | If | While | For | "loop" Block | DoWhile
-                     | Match | Switch | StaticMatch
+                     | Match | StaticMatch
                      | "break" ";" | "continue" ";" | Return
                      | "unsafe" Block | AsmBlock | Block | Expr ";"
 
@@ -300,9 +300,6 @@ Match              ::= "match" Cond "{" MatchArm* "}"
 MatchArm           ::= Pattern ("|" Pattern)* Guard? "=>" (Block | Expr ","?)
 Guard              ::= "if" Cond   (* checked after the pattern matches *)
 
-Switch             ::= "switch" Cond "{" CaseClause* "}"
-CaseClause         ::= ("case" Expr | "default") ":" Statement*
-
 StaticMatch        ::= "static" "match" "(" Type ")" "{" StaticMatchArm* "}"
                        (* compile-time type dispatch; usable in statement or
                           expression position inside a generic body *)
@@ -403,16 +400,16 @@ Ident              ::= /* [a-zA-Z_][a-zA-Z0-9_]*                */
 (*  `cryo.md` for the reserved-syntax table.                        *)
 (*                                                                  *)
 (*  alignof    as         asm        async     auto      await     *)
-(*  boolean    break      case      char      class     const     *)
-(*  continue   default    delete    do        double    else      *)
-(*  enum       export     extern    f32       f64       false     *)
-(*  float      for        from      function  i8        i16       *)
-(*  i32        i64        i128      if        implement import    *)
-(*  in         inline     int       intrinsic loop      match     *)
-(*  module     move       mut       namespace new       null      *)
-(*  optional   override   private   protected public    return    *)
-(*  sizeof     static     string    struct    switch    this      *)
-(*  This       trait      true      tuple     type      typeof    *)
-(*  u8         u16        u32       u64       u128      uint      *)
-(*  union      unsafe     unsigned  virtual   void      where     *)
-(*  while      with       yield                                   *)
+(*  boolean    break      char       class     const     continue  *)
+(*  default    delete     do         double    else      enum      *)
+(*  export     extern     f32        f64       false     float     *)
+(*  for        from       function   i8        i16       i32       *)
+(*  i64        i128       if         implement import    in        *)
+(*  inline     int        intrinsic  loop      match     module    *)
+(*  move       mut        namespace  new       null      optional  *)
+(*  override   private    protected  public    return    sizeof    *)
+(*  static     string     struct     this      This      trait     *)
+(*  true       tuple      type       typeof    u8        u16       *)
+(*  u32        u64        u128       uint      union     unsafe    *)
+(*  unsigned   virtual    void       where     while     with      *)
+(*  yield                                                          *)
