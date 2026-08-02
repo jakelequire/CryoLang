@@ -1,6 +1,6 @@
 ///! fs metadata + directory operations + read_to_string + seek.
 ///!
-///! Each test uses PID-unique paths under /tmp and cleans up after
+///! Each test uses PID-unique paths under the OS temp dir and cleans up after
 ///! itself so the suite leaves no residue.
 
 ![config(testing)]
@@ -24,14 +24,29 @@ import std::ffi::libc;
 import std::test::error;
 import std::test::assert;
 
+// Scratch directory for test files.  A hardcoded "/tmp" is not portable:
+// on Windows it resolves against the current drive, so a checkout on any
+// drive without a top-level \tmp (a CI workspace on D:, say) fails every
+// create.  Take the OS temp directory instead.
+![target(linux)]
+function temp_root() -> u8* { return "/tmp" as u8*; }
+
+![target(windows)]
+function temp_root() -> u8* {
+    const t: u8* = libc::getenv("TEMP" as u8*);
+    if (t != null) { return t; }
+    return "C:/Windows/Temp" as u8*;
+}
+
 function tmp_file(buf: i8*, tag: string) -> Path {
-    const n: i32 = intrinsics::snprintf(buf, 96, "/tmp/cryo_md_%s_%d.dat", tag, libc::getpid());
+    const n: i32 = intrinsics::snprintf(buf, 256, "%s/cryo_md_%s_%d.dat",
+                                        temp_root(), tag, libc::getpid());
     return Path::from(Str::from_raw(buf as u8*, n as u64));
 }
 
 ![test]
 function read_to_string_roundtrip() -> Result<(), TestError> {
-    mut namebuf: i8[96];
+    mut namebuf: i8[256];
     const p: Path = tmp_file(&namebuf[0], "rts");
     const payload: Str = Str::new("line one\nline two\n");
     match (write(p, payload.as_bytes())) {
@@ -52,7 +67,7 @@ function read_to_string_roundtrip() -> Result<(), TestError> {
 
 ![test]
 function metadata_reports_file() -> Result<(), TestError> {
-    mut namebuf: i8[96];
+    mut namebuf: i8[256];
     const p: Path = tmp_file(&namebuf[0], "meta");
     const payload: Str = Str::new("12345");   // 5 bytes
     match (write(p, payload.as_bytes())) {
@@ -75,7 +90,7 @@ function metadata_reports_file() -> Result<(), TestError> {
 
 ![test]
 function exists_true_and_false() -> Result<(), TestError> {
-    mut namebuf: i8[96];
+    mut namebuf: i8[256];
     const p: Path = tmp_file(&namebuf[0], "exists");
     // Not created yet.
     expect_true(!exists(p), Str::new("absent before create"))?;
@@ -91,8 +106,9 @@ function exists_true_and_false() -> Result<(), TestError> {
 
 ![test]
 function create_read_remove_dir() -> Result<(), TestError> {
-    mut dirbuf: i8[96];
-    const dn: i32 = intrinsics::snprintf(&dirbuf[0], 96, "/tmp/cryo_md_dir_%d", libc::getpid());
+    mut dirbuf: i8[256];
+    const dn: i32 = intrinsics::snprintf(&dirbuf[0], 256, "%s/cryo_md_dir_%d",
+                                         temp_root(), libc::getpid());
     const dpath: Path = Path::from(Str::from_raw((&dirbuf[0]) as u8*, dn as u64));
 
     match (create_dir(dpath)) {
@@ -101,8 +117,9 @@ function create_read_remove_dir() -> Result<(), TestError> {
     }
 
     // A file inside the directory.
-    mut filebuf: i8[128];
-    const fn2: i32 = intrinsics::snprintf(&filebuf[0], 128, "/tmp/cryo_md_dir_%d/entry.dat", libc::getpid());
+    mut filebuf: i8[256];
+    const fn2: i32 = intrinsics::snprintf(&filebuf[0], 256, "%s/cryo_md_dir_%d/entry.dat",
+                                          temp_root(), libc::getpid());
     const fpath: Path = Path::from(Str::from_raw((&filebuf[0]) as u8*, fn2 as u64));
     match (write(fpath, Str::new("hi").as_bytes())) {
         Result::Ok(_)  => { }
@@ -145,7 +162,7 @@ function create_read_remove_dir() -> Result<(), TestError> {
 
 ![test]
 function file_seek_cur_end_and_position() -> Result<(), TestError> {
-    mut namebuf: i8[96];
+    mut namebuf: i8[256];
     const p: Path = tmp_file(&namebuf[0], "seek");
     match (write(p, Str::new("0123456789").as_bytes())) {
         Result::Ok(_)  => { }

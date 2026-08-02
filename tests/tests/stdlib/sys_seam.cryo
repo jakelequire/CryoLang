@@ -11,16 +11,39 @@
 namespace CryoTests::Tests::Stdlib::SysSeam;
 
 import std::core::result;
+import std::core::intrinsics;
 import std::sys;
 import ffi::libc;
 import std::test::error;
 import std::test::assert;
 
+// Scratch directory for test files.  A hardcoded "/tmp" is not portable:
+// on Windows it resolves against the current drive, so a checkout on any
+// drive without a top-level \tmp (a CI workspace on D:, say) fails every
+// create.  Take the OS temp directory instead.
+![target(linux)]
+function temp_root() -> u8* { return "/tmp" as u8*; }
+
+![target(windows)]
+function temp_root() -> u8* {
+    const t: u8* = libc::getenv("TEMP" as u8*);
+    if (t != null) { return t; }
+    return "C:/Windows/Temp" as u8*;
+}
+
+// Build "<temp>/<name>" into `buf`.  The returned pointer borrows `buf`,
+// so the caller must keep it alive for as long as the path is used.
+function temp_file(buf: i8*, name: string) -> u8* {
+    intrinsics::snprintf(buf, 256, "%s/%s", temp_root(), name);
+    return buf as u8*;
+}
+
 // Round-trip: open/write/close through the seam, read back through plain
 // libc, byte for byte.
 ![test]
 function seam_write_libc_readback() -> Result<(), TestError> {
-    const path: u8* = "/tmp/cryo_sys_seam_test.txt" as u8*;
+    mut pathbuf: i8[256];
+    const path: u8* = temp_file(&pathbuf[0], "cryo_sys_seam_test.txt");
     const payload: u8* = "seam round trip\n" as u8*;
     const payload_len: u64 = 16;
 
@@ -60,7 +83,8 @@ function seam_write_libc_readback() -> Result<(), TestError> {
 // Reverse direction: libc writes, the seam reads.
 ![test]
 function libc_write_seam_readback() -> Result<(), TestError> {
-    const path: u8* = "/tmp/cryo_sys_seam_test2.txt" as u8*;
+    mut pathbuf: i8[256];
+    const path: u8* = temp_file(&pathbuf[0], "cryo_sys_seam_test2.txt");
     const payload: u8* = "reverse trip\n" as u8*;
     const payload_len: u64 = 13;
 
