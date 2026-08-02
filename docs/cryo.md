@@ -71,18 +71,20 @@ Keywords are reserved identifiers. They cannot be used as variable, function, or
 | ------------ | --------------- | ----------- | ----------- | ----------------- | -------------- | ----------------------- |
 | `if`         | `function`      | `from`      | `const`     | `new`             | `true`         | `yield`                 |
 | `else`       | `class`         | `as`        | `mut`       | `delete`          | `false`        | `auto`                  |
-| `switch`     | `struct`        | `implement` | `static`    | `sizeof`          | `null`         | `unsigned`              |
-| `case`       | `enum`          | `intrinsic` | `public`    | `alignof`         | `this`         | `tuple`                 |
-| `default`    | `trait`         | `where`     | `private`   | `typeof`          | `This`         | `optional`              |
-| `match`      | `type`          | `extern`    | `protected` | `in`              |                | `with`                  |
-| `while`      | `namespace`     |             | `virtual`   | `as`              |                |                         |
-| `for`        | `module`        |             | `override`  | `await`           |                |                         |
-| `loop`       | `import`        |             | `inline`    |                   |                |                         |
-| `do`         | `export`        |             | `unsafe`    |                   |                |                         |
-| `break`      | `static_assert` |             | `move`      |                   |                |                         |
-| `continue`   | `union`         |             | `async`     |                   |                |                         |
-| `return`     |                 |             |             |                   |                |                         |
-| `asm`        |                 |             |             |                   |                |                         |
+| `match`      | `struct`        | `implement` | `static`    | `sizeof`          | `null`         | `unsigned`              |
+| `while`      | `enum`          | `intrinsic` | `public`    | `alignof`         | `this`         | `tuple`                 |
+| `for`        | `trait`         | `where`     | `private`   | `typeof`          | `This`         | `optional`              |
+| `loop`       | `type`          | `extern`    | `protected` | `in`              |                | `with`                  |
+| `do`         | `namespace`     |             | `virtual`   | `as`              |                |                         |
+| `break`      | `module`        |             | `override`  | `await`           |                |                         |
+| `continue`   | `import`        |             | `inline`    |                   |                |                         |
+| `return`     | `export`        |             | `unsafe`    |                   |                |                         |
+| `asm`        | `static_assert` |             | `move`      |                   |                |                         |
+|              | `union`         |             | `async`     |                   |                |                         |
+|              | `default`       |             |             |                   |                |                         |
+
+`default` appears in exactly one position: `~Type() = default;`, which asks the compiler to
+synthesize the destructor rather than take a written body.
 
 `move` marks a closure that captures its environment by move (see [section 16.3](#163-move-checking)).
 
@@ -996,23 +998,7 @@ const name: string = match (n) {
 };
 ```
 
-### 6.9 Switch / Case
-
-A traditional `switch` is also available for **integer, `char`, `bool`, and fieldless enum** values - anything compared by value. There is no implicit fallthrough; each case is independent.
-
-```cryo
-switch (value) {
-    case 1: { println("one");   }
-    case 2: { println("two");   }
-    default: { println("other"); }
-}
-```
-
-A `switch` on anything else is a compile error that points you at the right tool: enums whose variants carry payloads, strings, and other structured types require a `match` (which destructures and checks exhaustiveness), and floating-point values require explicit comparisons.
-
-In idiomatic code, prefer `match`; it supports richer patterns and enforces exhaustiveness. `switch` is provided for familiarity and for low-level integer dispatch.
-
-### 6.10 Ternary
+### 6.9 Ternary
 
 ```cryo
 const abs: int = x >= 0 ? x : -x;
@@ -1020,7 +1006,7 @@ const abs: int = x >= 0 ? x : -x;
 
 The ternary is right-associative: `a ? b : c ? d : e` parses as `a ? b : (c ? d : e)`.
 
-### 6.11 Return
+### 6.10 Return
 
 ```cryo
 function add(a: int, b: int) -> int {
@@ -1030,7 +1016,7 @@ function add(a: int, b: int) -> int {
 
 `return` exits the current function. If the function has a non-`void` return type, a value is required.
 
-### 6.12 Unsafe Blocks
+### 6.11 Unsafe Blocks
 
 `unsafe { ... }` is recognised at parse time and lowers identically to a plain block. It serves as a **documentation marker**: a visible signal that the enclosed code performs raw pointer arithmetic, calls `extern` functions, or otherwise sits at the edge of the language's safety story. The compiler does not currently impose any extra restriction outside an `unsafe` block, and does not relax any check inside one - every operation Cryo permits today is permitted everywhere.
 
@@ -1043,7 +1029,7 @@ unsafe {
 
 This is the committed 1.0 behavior: `unsafe` is a documentation marker and nothing more. It is **not** reserved to silently become enforcing - 1.0 code will not break under a future release on account of `unsafe`. Should later versions add safety checks around raw pointer dereference, raw-to-pointer `as`-casts, or `extern` calls, they would arrive compatibly (as an opt-in lint/warning first), not as a breaking change to code that already compiles.
 
-### 6.13 Inline Assembly
+### 6.12 Inline Assembly
 
 `asm { ... }` embeds target assembly directly, lowering to an LLVM inline-assembly call. The block body is **raw assembly** - written without string quoting - and Cryo values are bound into it through `${ ... }` operand holes. Bare `{` and `}` are literal assembly text, so target syntax that uses braces (AVX-512 mask registers such as `{k1}`, for instance) passes straight through.
 
@@ -2473,7 +2459,7 @@ type struct AlignedData {
 | `![config(<atom>)]` / `![target(<atom>)]` / `![<atom>]`   | any decl                  | Platform / build-flavor gate. `<atom>` is `windows`, `linux`, `macos`, `unix`, or `not(<atom>)`. The bare-atom form (`![windows]`) is sugar for `![config(windows)]`. The decl is stripped from the AST when the gate doesn't match.                                                                                                                                                                                        |
 | `![repr(C)]` / `![repr(packed)]` / `![repr(transparent)]` | struct / class / enum     | Memory layout control. See [section 17.3](#173-memory-layout).                                                                                                                                                                                                                                                                                                                                                                    |
 | `![align(N)]`                                             | struct / class / variable | Minimum alignment in bytes; N must be a power of two. See [section 17.3](#173-memory-layout).                                                                                                                                                                                                                                                                                                                                     |
-| `![arch(<arch>, <dialect>)]`                              | asm block                 | Required directly above an `asm { ... }` block (see [section 6.13](#613-inline-assembly)). Names the target architecture - which *gates* the block, like `![config]` - and the assembly dialect (`intel` or `att`).                                                                                                                                                                                                               |
+| `![arch(<arch>, <dialect>)]`                              | asm block                 | Required directly above an `asm { ... }` block (see [section 6.12](#612-inline-assembly)). Names the target architecture - which *gates* the block, like `![config]` - and the assembly dialect (`intel` or `att`).                                                                                                                                                                                                               |
 | `![clobber(...)]`                                         | asm block                 | Lists registers, `flags`, or `memory` that an `asm` block overwrites but does not bind as operands.                                                                                                                                                                                                                                                                                                                         |
 
 The test-mode directives (`![config(testing)]`, `![test]`, `![ignore]`, `![should_panic]`) are documented in the next subsection.

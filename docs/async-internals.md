@@ -104,10 +104,6 @@ beyond a correct `Drop`.
 
 ## 7. Known gaps
 
-- **One form the lowering does not walk: `switch`.** An `await` inside it is never counted as a
-  suspension, so the body lowers around it and the surviving node is rejected at codegen (`E0600`)
-  rather than in sema. Loud, never a miscompile. Left unwalked deliberately - `switch`/`case` is
-  frozen surface with no use anywhere in the compiler or stdlib, and is slated for removal.
 - **Two forms are counted and rejected in sema,** each with its own span and message, because
   neither can survive the state explosion:
   - An **`unsafe` block** is a scope, not a control-flow form. Split across resume points it would

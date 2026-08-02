@@ -192,7 +192,7 @@ type struct DropInserter {
 
     /// Enclosing conditional / loop body depth; a partial move is tracked only
     /// at depth 0 (mirrors MoveCheck::branch_depth).  Bumped around the branch
-    /// walks (`walk_if`/`walk_match_arms`/`walk_switch`/loop walkers).
+    /// walks (`walk_if`/`walk_match_arms`/loop walkers).
     branch_depth: i64;
 
     fired:        i64;
@@ -895,14 +895,7 @@ type struct DropInserter {
                 out.push(stmt);
                 smd
             }
-            NodeKind::SwitchStatement => {
-                // Walk the case bodies so owned locals inside them are dropped
-                // and outer-binding moves are tracked.
-                const d: boolean = this.walk_switch(stmt as SwitchStmtNode*);
-                out.push(stmt);
-                d
-            }
-            // CaseStatement and any other shapes pass through.
+            // Any other shape passes through.
             _ => {
                 out.push(stmt);
                 false
@@ -984,113 +977,6 @@ type struct DropInserter {
             else_keys, else_lines, has_else, else_diverges);
         this.branch_depth -= 1;
         return both_diverge;
-    }
-
-    /// Divergence of a switch CASE body w.r.t. the switch merge. Mirrors
-    /// MoveCheck::switch_case_diverges: a `break` is NOT divergence (it jumps
-    /// to the merge, so the case's moves reach the code after the switch);
-    /// only `return` / `continue` leave the switch entirely. Used to decide
-    /// which cases' moves escape to the post-switch state.
-    switch_case_diverges(mut &this, stmt: StatementNode*) -> boolean {
-        if (stmt == null) { return false; }
-        match (stmt.kind) {
-            NodeKind::ReturnStatement   => { return true;  }
-            NodeKind::ContinueStatement => { return true;  }
-            NodeKind::BreakStatement    => { return false; }
-            NodeKind::BlockStatement => {
-                const b: BlockStmtNode* = stmt as BlockStmtNode*;
-                for (mut i: i64 = 0; i < b.statements.length; i++) {
-                    if (this.switch_case_diverges(b.statements[i])) { return true; }
-                }
-                return false;
-            }
-            NodeKind::IfStatement => {
-                const it: IfStmtNode* = stmt as IfStmtNode*;
-                if (it.else_stmt == null) { return false; }
-                return this.switch_case_diverges(it.then_stmt) &&
-                       this.switch_case_diverges(it.else_stmt);
-            }
-            NodeKind::MatchStatement => {
-                const m: MatchStmtNode* = stmt as MatchStmtNode*;
-                if (m.arms.length == 0) { return false; }
-                for (mut i: i64 = 0; i < m.arms.length; i++) {
-                    const arm: MatchArmNode* = m.arms[i];
-                    if (arm == null || !this.switch_case_diverges(arm.body)) {
-                        return false;
-                    }
-                }
-                return true;
-            }
-            NodeKind::StaticMatchStatement => {
-                const sm: StaticMatchStmtNode* = stmt as StaticMatchStmtNode*;
-                if (sm.arms.length == 0 || sm.arms[0] == null) { return false; }
-                return this.switch_case_diverges(sm.arms[0].body);
-            }
-            _ => { return false; }
-        }
-    }
-
-    /// Instrument a switch's case bodies. Cryo's switch has no fallthrough,
-    /// so each case is an independent block: walking each body via `walk_block`
-    /// synthesizes scope-exit drops for the owned LOCALS declared inside it. A
-    /// `break` inside a case is handled like a loop break that targets the
-    /// switch: we push a loop boundary so it drops only the case-local scope,
-    /// not the enclosing loop's bindings (which survive the switch).
-    ///
-    /// For OUTER bindings moved inside a case, we conservatively mark the union
-    /// of moves (from cases that reach the merge) as moved after the switch, so
-    /// their scope-exit drops are suppressed. This may leak on a path whose
-    /// case did not move the binding, but never double-frees; MoveCheck (fatal,
-    /// runs first) reports the explicit use-after-move cases with the same
-    /// per-case divergence rule, so the two passes track a consistent move-set.
-    walk_switch(mut &this, sw: SwitchStmtNode*) -> boolean {
-        if (sw == null) { return false; }
-        this.branch_depth += 1;
-        if (sw.expression != null) { this.walk_expr_read(sw.expression); }
-        const snap: i64 = this.snapshot_moves();
-        // Outer bindings (registered before the switch): only their moves may
-        // escape; case-local moves disappear with the case scope.
-        mut outer_names: u32[] = [];
-        for (mut i: i64 = 0; i < this.binding_names.length; i++) {
-            outer_names.push(this.binding_names[i]);
-        }
-        // Treat the switch as a break target like a loop (codegen pushes
-        // merge_bb as the break destination): a `break` inside a case drops
-        // back to here, not to the enclosing loop.
-        this.loop_boundary.push(this.scope_start_idx.length);
-
-        mut union_keys: u32[] = [];
-        for (mut i: i64 = 0; i < sw.cases.length; i++) {
-            const c: CaseStmtNode* = sw.cases[i];
-            if (c == null || c.body == null) { continue; }
-            this.walk_block(c.body);
-            if (!this.switch_case_diverges(c.body as StatementNode*)) {
-                const keys: u32[] = this.moves_since_keys(snap);
-                for (mut k: i64 = 0; k < keys.length; k++) {
-                    mut in_outer: boolean = false;
-                    for (mut o: i64 = 0; o < outer_names.length; o++) {
-                        if (outer_names[o] == keys[k]) { in_outer = true; break; }
-                    }
-                    if (!in_outer) { continue; }
-                    mut found: boolean = false;
-                    for (mut u: i64 = 0; u < union_keys.length; u++) {
-                        if (union_keys[u] == keys[k]) { found = true; break; }
-                    }
-                    if (!found) { union_keys.push(keys[k]); }
-                }
-            }
-            this.restore_moves(snap);
-        }
-        this.loop_boundary.pop();
-        // Suppress post-switch scope-exit drops for the moved union.
-        for (mut i: i64 = 0; i < union_keys.length; i++) {
-            this.mark_moved(SymbolStr::from_id(union_keys[i]), sw.span);
-        }
-        // Code after the switch is reachable unless every path diverges; we
-        // conservatively report non-divergence (extra drops in dead code are
-        // harmless).
-        this.branch_depth -= 1;
-        return false;
     }
 
     /// If `stmt` is a bare early-exit (return/break/continue), wrap it
@@ -2659,16 +2545,6 @@ type struct DropInserter {
             }
             NodeKind::LoopStatement => {
                 this.collect_init_disqualifiers((stmt as LoopStmtNode*).body);
-            }
-            NodeKind::SwitchStatement => {
-                const sw: SwitchStmtNode* = stmt as SwitchStmtNode*;
-                this.disq_scan_expr(sw.expression);
-                for (mut i: i64 = 0; i < sw.cases.length; i++) {
-                    if (sw.cases[i] != null) {
-                        this.collect_init_disqualifiers(
-                            sw.cases[i].body as StatementNode*);
-                    }
-                }
             }
             NodeKind::MatchStatement => {
                 const m: MatchStmtNode* = stmt as MatchStmtNode*;

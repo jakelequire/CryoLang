@@ -13,11 +13,7 @@
 ///! past the join is reported. Branches that diverge (`return`/`break`/
 ///! `continue`, or all sub-branches diverge) never reach the join, so their
 ///! moves are dropped - that is what keeps the `if (c) { consume(x); return; }
-///! use(x);` guard pattern false-positive-free. `switch` cases ARE merged too
-///! (`merge_switch_cases`), with a switch-specific divergence rule
-///! (`switch_case_diverges`): a `break` ends a case by jumping to the merge, so
-///! a break-terminated case still contributes its moves to the join, while only
-///! `return`/`continue` (which leave the switch entirely) drop a case's moves.
+///! use(x);` guard pattern false-positive-free.
 ///! Every diagnostic is an unambiguous (or, across a branch join, a possible)
 ///! double-free; within-iteration, across-branch, and loop-carried
 ///! use-after-move are all hard errors.
@@ -172,10 +168,10 @@ type struct MoveChecker {
     arg_binding_unknown: boolean;
 
     /// Depth of enclosing conditional / loop bodies.  A partial field move is
-    /// tracked only at `branch_depth == 0`; inside any `if`/`match`/`switch`/
+    /// tracked only at `branch_depth == 0`; inside any `if`/`match`/
     /// loop body it stays a hard E0453, because drop-skip without per-field
     /// drop flags is sound only for an *unconditional* move.  Incremented
-    /// around `merge_branches` / `merge_switch_cases` / `walk_loop_body`;
+    /// around `merge_branches` / `walk_loop_body`;
     /// mirrored in drop_insertion.
     branch_depth: i64;
 
@@ -526,8 +522,6 @@ type struct MoveChecker {
     /// use(x);` guard pattern sound and false-positive-free. `break`/`continue`
     /// count as divergence here because, for an `if`/`match`, they jump to
     /// (or past) the enclosing loop, bypassing the code that follows the
-    /// join. (This rule does NOT hold for `switch`, whose cases reach the
-    /// join via `break`; switch is intentionally not merged.)
     always_diverges(&this, stmt: StatementNode*) -> boolean {
         if (stmt == null) { return false; }
         match (stmt.kind) {
@@ -918,158 +912,8 @@ type struct MoveChecker {
                 const lp: LoopStmtNode* = stmt as LoopStmtNode*;
                 this.walk_loop_body(lp.body);
             }
-            NodeKind::SwitchStatement => {
-                // Moves inside switch case bodies must be tracked, or a
-                // double-move within one case - or a move in a case reused after
-                // the switch - would silently double-free/use-after-free at
-                // runtime. Cryo's switch has no
-                // fallthrough (each case is an independent block), so cases are
-                // mutually-exclusive branches like match arms: read the subject
-                // once, then merge the case bodies. The subject is always a Copy
-                // scalar (sema restricts it to int/char/bool/fieldless-enum), so
-                // it never itself moves.
-                const sw: SwitchStmtNode* = stmt as SwitchStmtNode*;
-                if (sw.expression != null) { this.walk_expr_read(sw.expression); }
-                this.merge_switch_cases(sw.cases);
-            }
             _ => {}
         }
-    }
-
-    /// Divergence of a switch CASE body with respect to the switch's own
-    /// merge point. Unlike `always_diverges`, a `break` is NOT divergence
-    /// here: in a switch a `break` jumps to the merge (the normal way to end
-    /// a case), so the case's moves still reach the code after the switch and
-    /// must be counted at the join. Only `return` / `continue` leave the
-    /// switch entirely (to the function / an enclosing loop), so those cases'
-    /// moves do not escape to the post-switch state.
-    switch_case_diverges(mut &this, stmt: StatementNode*) -> boolean {
-        if (stmt == null) { return false; }
-        match (stmt.kind) {
-            NodeKind::ReturnStatement   => { return true;  }
-            NodeKind::ContinueStatement => { return true;  }
-            NodeKind::BreakStatement    => { return false; }
-            NodeKind::BlockStatement => {
-                const b: BlockStmtNode* = stmt as BlockStmtNode*;
-                for (mut i: i64 = 0; i < b.statements.length; i++) {
-                    if (this.switch_case_diverges(b.statements[i])) { return true; }
-                }
-                return false;
-            }
-            NodeKind::IfStatement => {
-                const it: IfStmtNode* = stmt as IfStmtNode*;
-                if (it.else_stmt == null) { return false; }
-                return this.switch_case_diverges(it.then_stmt) &&
-                       this.switch_case_diverges(it.else_stmt);
-            }
-            NodeKind::MatchStatement => {
-                const m: MatchStmtNode* = stmt as MatchStmtNode*;
-                if (m.arms.length == 0) { return false; }
-                for (mut i: i64 = 0; i < m.arms.length; i++) {
-                    const arm: MatchArmNode* = m.arms[i];
-                    if (arm == null || !this.switch_case_diverges(arm.body)) {
-                        return false;
-                    }
-                }
-                return true;
-            }
-            NodeKind::StaticMatchStatement => {
-                const sm: StaticMatchStmtNode* = stmt as StaticMatchStmtNode*;
-                if (sm.arms.length == 0 || sm.arms[0] == null) { return false; }
-                return this.switch_case_diverges(sm.arms[0].body);
-            }
-            _ => { return false; }
-        }
-    }
-
-    /// Merge the move-sets of a switch's case bodies at the switch join.
-    /// Mirrors `merge_branches` (each case walked from the same pre-switch
-    /// state, intra-case use-after-move still fires, branch-local bindings
-    /// excluded from the union, possibly-moved -> Moved at the join), but uses
-    /// `switch_case_diverges` so a `break`-terminated case still contributes
-    /// its moves (it reaches the merge). A switch is not required to be
-    /// exhaustive; the implicit "no case matched" fall-through moves nothing,
-    /// which the union models correctly (a one-sided move stays *possibly*
-    /// moved and is conservatively treated as Moved).
-    merge_switch_cases(mut &this, cases: &CaseStmtNode*[]) -> void {
-        this.branch_depth += 1;
-        // Full pre-switch snapshot (see `merge_branches` for why a length
-        // checkpoint is unsound when a case revives a pre-switch move).
-        mut pre_keys:  u32[]        = [];
-        mut pre_spans: SourceSpan[] = [];
-        mut pre_real:  boolean[]    = [];
-        for (mut i: i64 = 0; i < this.moved_keys.length; i++) {
-            pre_keys.push(this.moved_keys[i]);
-            pre_spans.push(this.moved_spans[i]);
-            pre_real.push(this.moved_real[i]);
-        }
-        const pre_len: i64 = pre_keys.length;
-
-        const prev_capture: boolean = this.capture_decls;
-        mut u_keys:  u32[]        = [];
-        mut u_spans: SourceSpan[] = [];
-        mut u_real:  boolean[]    = [];
-        for (mut i: i64 = 0; i < cases.length; i++) {
-            const c: CaseStmtNode* = cases[i];
-            if (c == null || c.body == null) { continue; }
-            const branch_cap_start: i64 = this.captured_decl_keys.length;
-            this.capture_decls = true;
-            this.walk_stmt(c.body as StatementNode*);
-            this.capture_decls = prev_capture;
-            if (!this.switch_case_diverges(c.body as StatementNode*)) {
-                // Contribute this case's FULL end-set (not just moves past a
-                // checkpoint) so a pre-switch move the case did not revive
-                // survives the join. See merge_branches.
-                for (mut j: i64 = 0; j < this.moved_keys.length; j++) {
-                    const k: u32 = this.moved_keys[j];
-                    if (this.is_body_local(k, branch_cap_start)) { continue; }
-                    const real: boolean = this.moved_real[j];
-                    mut found: boolean = false;
-                    for (mut u: i64 = 0; u < u_keys.length; u++) {
-                        if (u_keys[u] == k) {
-                            if (real) { u_real[u] = true; }
-                            found = true;
-                            break;
-                        }
-                    }
-                    if (!found) {
-                        u_keys.push(k);
-                        u_spans.push(this.moved_spans[j]);
-                        u_real.push(real);
-                    }
-                }
-            }
-            this.restore_full(pre_keys, pre_spans, pre_real);
-            if (!prev_capture) { this.truncate_captured(branch_cap_start); }
-        }
-        // A switch need not be exhaustive: the implicit "no case matched"
-        // fall-through moves and revives nothing, so its end-set is the
-        // pre-switch set. Contributing it keeps every pre-switch move alive
-        // across the switch (a case's revival cannot leak past the join).
-        for (mut j: i64 = 0; j < pre_len; j++) {
-            const k: u32 = pre_keys[j];
-            const real: boolean = pre_real[j];
-            mut found: boolean = false;
-            for (mut u: i64 = 0; u < u_keys.length; u++) {
-                if (u_keys[u] == k) {
-                    if (real) { u_real[u] = true; }
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) {
-                u_keys.push(k);
-                u_spans.push(pre_spans[j]);
-                u_real.push(real);
-            }
-        }
-        this.moved_keys  = [];
-        this.moved_spans = [];
-        this.moved_real  = [];
-        for (mut i: i64 = 0; i < u_keys.length; i++) {
-            this.mark_moved(SymbolStr::from_id(u_keys[i]), u_spans[i], u_real[i]);
-        }
-        this.branch_depth -= 1;
     }
 
     /// Walk a loop body with loop-carried-move detection.

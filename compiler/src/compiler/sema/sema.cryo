@@ -991,9 +991,9 @@ public:
     }
 
     override visit(mut &this, node: BreakStmtNode*) -> void {
-        if (this.state.loop_depth == 0 && this.state.switch_depth == 0) {
+        if (this.state.loop_depth == 0) {
             this.ctx.emit_error_at(ErrorCode::E0400_INVALID_BREAK,
-                "`break` outside of a loop or switch", node.span);
+                "`break` outside of a loop", node.span);
         }
     }
 
@@ -1081,19 +1081,6 @@ public:
                 this.scopes.restore_scope(sv);
             }
         }
-    }
-
-    override visit(mut &this, node: SwitchStmtNode*) -> void {
-        const subject_type: TypeRef = this.resolve_expr(node.expression);
-        this.state.switch_depth += 1;
-        for (mut i: i64 = 0; i < node.cases.length; i++) {
-            const cs: CaseStmtNode* = node.cases[i];
-            if (cs == null) { continue; }
-            if (cs.value != null) { this.resolve_expr(cs.value); }
-            if (cs.body != null)  { this.visit(cs.body); }
-        }
-        this.state.switch_depth -= 1;
-        this.check_switch_applicable(node, subject_type);
     }
 
     override visit(mut &this, node: DeclStmtNode*) -> void {
@@ -3015,17 +3002,6 @@ public:
                 if (!this.block_contains_break(ls.body)) { return true; }
                 return this.block_always_returns(ls.body);
             }
-            NodeKind::SwitchStatement => {
-                const sw: SwitchStmtNode* = stmt as SwitchStmtNode*;
-                mut has_default: boolean = false;
-                for (mut i: i64 = 0; i < sw.cases.length; i++) {
-                    const c: CaseStmtNode* = sw.cases[i];
-                    if (c == null) { return false; }
-                    if (c.is_default) { has_default = true; }
-                    if (!this.stmt_always_returns(c.body as StatementNode*)) { return false; }
-                }
-                return has_default;
-            }
             NodeKind::DoWhileStatement => { return this.stmt_always_returns((stmt as DoWhileStmtNode*).body); }
             NodeKind::ExpressionStatement => { return this.expr_is_divergent((stmt as ExprStmtNode*).expression); }
             _ => {}
@@ -3251,84 +3227,6 @@ public:
                 }
             }
         }
-    }
-
-
-    // -- Switch applicability --
-
-    switch_type_class(&this, base: Type*) -> i32 {
-        if (base == null) { return -1; }
-        match (base.kind) {
-            TypeKind::Int    => { return 0; }
-            TypeKind::Char   => { return 0; }
-            TypeKind::Bool   => { return 0; }
-            TypeKind::Float  => { return 4; }
-            TypeKind::String => { return 3; }
-            TypeKind::Enum   => {
-                if ((base as EnumType*).is_simple_enum()) { return 1; }
-                return 2;
-            }
-            _ => { return 5; }
-        }
-    }
-
-    check_switch_applicable(mut &this, node: SwitchStmtNode*, subject_type: TypeRef) -> void {
-        if (!subject_type.is_valid()) { return; }
-        const base: Type* = this.types.unwrap_to_enum(subject_type);
-        const sc: i32 = this.switch_type_class(base);
-        if (sc == -1) { return; }
-        if (sc != 0 && sc != 1) {
-            this.emit_switch_subject_error(node, subject_type, sc);
-            return;
-        }
-        for (mut i: i64 = 0; i < node.cases.length; i++) {
-            const cs: CaseStmtNode* = node.cases[i];
-            if (cs == null || cs.is_default || cs.value == null) { continue; }
-            const ct: TypeRef = cs.value.resolved_type;
-            if (!ct.is_valid()) { continue; }
-            const cbase: Type* = this.types.unwrap_to_enum(ct);
-            const cc: i32 = this.switch_type_class(cbase);
-            mut ok: boolean = false;
-            if (sc == 0) { ok = (cc == 0); } else { ok = (cc == 1 && cbase == base); }
-            if (!ok) {
-                mut d: Diagnostic = Diagnostic::error(ErrorCode::E0200_TYPE_MISMATCH,
-                    format("`case` value of type `%s` is not comparable to the switch subject of type `%s`",
-                        this.types.type_display_name(ct), this.types.type_display_name(subject_type)));
-                d = d.at(cs.value.span);
-                d = d.with_note("every `case` value must have the same type as the value being switched on");
-                this.ctx.diagnostics.emit(d);
-            }
-        }
-    }
-
-    emit_switch_subject_error(mut &this, node: SwitchStmtNode*, subject_type: TypeRef, sc: i32) -> void {
-        const name: string = this.types.type_display_name(subject_type);
-        const span: SourceSpan = node.expression.span;
-        mut msg:   string = "";
-        mut note1: string = "";
-        mut note2: string = "";
-        if (sc == 2) {
-            msg   = format("`switch` cannot match on enum `%s`: it has variants that carry payloads", name);
-            note1 = "`switch` compares by value and cannot bind variant payloads";
-            note2 = "use a `match` expression instead - it destructures variant fields and checks exhaustiveness";
-        } else if (sc == 3) {
-            msg   = format("`switch` cannot match on `%s` values", name);
-            note1 = "`switch` compares by value, so it would test string addresses rather than contents";
-            note2 = "use a `match` expression with string patterns instead";
-        } else if (sc == 4) {
-            msg   = format("`switch` cannot match on floating-point type `%s`", name);
-            note1 = "floating-point equality is unreliable, so `switch` does not allow it";
-            note2 = "use `if` / `else if` comparisons instead";
-        } else {
-            msg   = format("`switch` cannot match on type `%s`", name);
-            note1 = "`switch` supports integer, char, bool, and fieldless enum values";
-            note2 = "use a `match` expression for structured types";
-        }
-        mut d: Diagnostic = Diagnostic::error(ErrorCode::E0209_INVALID_OPERATION, msg);
-        d = d.at(span);
-        d = d.with_note(note1);
-        d = d.with_note(note2);
-        this.ctx.diagnostics.emit(d);
     }
 
 
