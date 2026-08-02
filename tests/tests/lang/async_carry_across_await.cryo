@@ -1,0 +1,316 @@
+// State-machine lowering regression: a value that must survive an `await`.
+//
+// An `async function` lowers to a poll-driven state machine, so a local that
+// outlives a suspend cannot stay on the native stack - it lives in an
+// `Option<T>` carrier field and moves back to a plain block-local at the top of
+// each state that touches it.  Which states carry it is decided per state by
+// how that state FIRST touches the name: a state that reads it needs the
+// previous value, and so does a state whose only write sits inside a branch -
+// the path that skips the branch still has to see what the previous state left.
+//
+// Getting that second case wrong is silent: the state would bind a value nobody
+// wrote and then publish it into the carrier for the next state to take.
+![config(testing)]
+namespace CryoTests::Tests::Lang::AsyncCarryAcrossAwait;
+
+import std::test;
+import std::core::result;
+import std::future;
+
+// Drop accounting, so each case asserts an exact destructor count rather than
+// merely a correct result.
+mut ac_drops: i32 = 0;
+
+type struct Tag {
+    id: u32;
+
+    drop(mut &this) -> void {
+        ac_drops = ac_drops + 1;
+    }
+}
+
+// Two suspends, so the value has to survive a real state transition.
+async function rebuilt_in_if(c: boolean) -> u32 {
+    mut v = Tag { id: 1 };
+    const a = await PendingThenReady<u32>::new(1, 10);
+    if (c) { v = Tag { id: 2 }; }
+    const b = await PendingThenReady<u32>::new(1, 20);
+    return v.id + a + b;
+}
+
+async function rebuilt_in_if_else(c: boolean) -> u32 {
+    mut v = Tag { id: 1 };
+    const a = await PendingThenReady<u32>::new(1, 10);
+    if (c) { v = Tag { id: 5 }; } else { v = Tag { id: 7 }; }
+    const b = await PendingThenReady<u32>::new(1, 20);
+    return v.id + a + b;
+}
+
+async function rebuilt_in_loop(n: u32) -> u32 {
+    mut v = Tag { id: 1 };
+    const a = await PendingThenReady<u32>::new(1, 10);
+    mut i: u32 = 0;
+    while (i < n) { v = Tag { id: 40 }; i = i + 1; }
+    const b = await PendingThenReady<u32>::new(1, 20);
+    return v.id + a + b;
+}
+
+async function rebuilt_in_match(c: u32) -> u32 {
+    mut v = Tag { id: 1 };
+    const a = await PendingThenReady<u32>::new(1, 10);
+    match (c) {
+        0 => { }
+        _ => { v = Tag { id: 9 }; }
+    }
+    const b = await PendingThenReady<u32>::new(1, 20);
+    return v.id + a + b;
+}
+
+// The unconditional shape: the state produces its own value and binds it
+// fresh, with no carrier take.  This is the owned-handle I/O idiom.
+async function rebuilt_at_top_level() -> u32 {
+    mut v = Tag { id: 1 };
+    const a = await PendingThenReady<u32>::new(1, 10);
+    v = Tag { id: 3 };
+    const b = await PendingThenReady<u32>::new(1, 20);
+    return v.id + a + b;
+}
+
+// A suspend between the carry-in and the rebuild: the hand-back inserted
+// before `return Poll::Pending` must publish the value, or the next poll takes
+// an empty carrier.
+async function suspend_between(c: boolean) -> u32 {
+    mut v = Tag { id: 1 };
+    const a = await PendingThenReady<u32>::new(1, 10);
+    const m = await PendingThenReady<u32>::new(2, 100);
+    if (c) { v = Tag { id: 4 }; }
+    const b = await PendingThenReady<u32>::new(1, 20);
+    return v.id + a + b + m;
+}
+
+// A droppable by-value parameter takes the same route as a local.
+async function param_rebuilt_in_if(mut v: Tag, c: boolean) -> u32 {
+    const a = await PendingThenReady<u32>::new(1, 10);
+    if (c) { v = Tag { id: 6 }; }
+    const b = await PendingThenReady<u32>::new(1, 20);
+    return v.id + a + b;
+}
+
+// Reassigning a local does not drop the overwritten value (only the final value
+// dies at scope exit), so every case below ends at exactly one drop.
+function ac_check(got: u32, want: u32) -> Result<(), TestError> {
+    match (expect_eq(got, want)) {
+        Result::Ok(_) => {}
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(ac_drops, 1 as i32);
+}
+
+![test]
+function branch_rebuild_taken_uses_new_value() -> Result<(), TestError> {
+    ac_drops = 0;
+    return ac_check(future::block_on(rebuilt_in_if(true)), 32 as u32);
+}
+
+// The path that skips the branch must still see the value state 0 built.
+![test]
+function branch_rebuild_skipped_keeps_previous_value() -> Result<(), TestError> {
+    ac_drops = 0;
+    return ac_check(future::block_on(rebuilt_in_if(false)), 31 as u32);
+}
+
+![test]
+function if_else_rebuild_then_branch() -> Result<(), TestError> {
+    ac_drops = 0;
+    return ac_check(future::block_on(rebuilt_in_if_else(true)), 35 as u32);
+}
+
+![test]
+function if_else_rebuild_else_branch() -> Result<(), TestError> {
+    ac_drops = 0;
+    return ac_check(future::block_on(rebuilt_in_if_else(false)), 37 as u32);
+}
+
+![test]
+function loop_rebuild_zero_iterations_keeps_previous() -> Result<(), TestError> {
+    ac_drops = 0;
+    return ac_check(future::block_on(rebuilt_in_loop(0)), 31 as u32);
+}
+
+![test]
+function loop_rebuild_runs_uses_new_value() -> Result<(), TestError> {
+    ac_drops = 0;
+    return ac_check(future::block_on(rebuilt_in_loop(2)), 70 as u32);
+}
+
+![test]
+function match_arm_rebuild_uses_new_value() -> Result<(), TestError> {
+    ac_drops = 0;
+    return ac_check(future::block_on(rebuilt_in_match(1)), 39 as u32);
+}
+
+![test]
+function match_arm_without_rebuild_keeps_previous() -> Result<(), TestError> {
+    ac_drops = 0;
+    return ac_check(future::block_on(rebuilt_in_match(0)), 31 as u32);
+}
+
+![test]
+function top_level_rebuild_binds_fresh_value() -> Result<(), TestError> {
+    ac_drops = 0;
+    return ac_check(future::block_on(rebuilt_at_top_level()), 33 as u32);
+}
+
+![test]
+function suspend_between_carry_and_rebuild_taken() -> Result<(), TestError> {
+    ac_drops = 0;
+    return ac_check(future::block_on(suspend_between(true)), 134 as u32);
+}
+
+![test]
+function suspend_between_carry_and_rebuild_skipped() -> Result<(), TestError> {
+    ac_drops = 0;
+    return ac_check(future::block_on(suspend_between(false)), 131 as u32);
+}
+
+![test]
+function param_branch_rebuild_taken() -> Result<(), TestError> {
+    ac_drops = 0;
+    return ac_check(future::block_on(param_rebuilt_in_if(Tag { id: 1 }, true)), 36 as u32);
+}
+
+![test]
+function param_branch_rebuild_skipped_keeps_argument() -> Result<(), TestError> {
+    ac_drops = 0;
+    return ac_check(future::block_on(param_rebuilt_in_if(Tag { id: 1 }, false)), 31 as u32);
+}
+
+// A `match` used as an EXPRESSION holds statement bodies, so every walker that
+// descends into a `match` statement has to descend into it equally.  Two
+// distinct failures follow from missing it: a value read only as the match
+// SUBJECT is not seen as used by its state and so is never carried across the
+// suspend, and a `return` inside an arm is never rewritten to `Poll::Ready`,
+// which surfaces as a type error naming the internal `Poll` type against a
+// function the user wrote as `-> i64`.  Each case below compiles clean and
+// yields the same answer as the identical non-async body.
+
+// The subject is a carried parameter, and one arm returns.
+async function me_subject_and_return(r: Result<i64, i64>) -> i64 {
+    const a = await PendingThenReady<i64>::new(1, 7);
+    const v: i64 = match (r) {
+        Result::Ok(x)  => { x }
+        Result::Err(_) => { return -1; }
+    };
+    return v + a;
+}
+
+// The whole `match` sits in return position, with an arm that returns.
+async function me_in_return_position(r: Result<i64, i64>) -> i64 {
+    const a = await PendingThenReady<i64>::new(1, 7);
+    return match (r) {
+        Result::Ok(x)  => { x + a }
+        Result::Err(_) => { return -1; }
+    };
+}
+
+// A carried local whose ONLY reader is an arm GUARD, which is what makes this
+// case prove the guard is walked.  The name is `_`-prefixed because a read from
+// a match-arm guard is missing from the resolution map the unused-local lint is
+// built from, so any other spelling draws a bogus W0001; that gap is not async's
+// and applies to a `match` statement guard identically.
+async function me_guard_reads_carried(n: i64) -> i64 {
+    const _g: i64 = n * 3;
+    const a = await PendingThenReady<i64>::new(1, 7);
+    const v: i64 = match (n) {
+        1 if (_g > 2) => { 10 }
+        _             => { 20 }
+    };
+    return v + a;
+}
+
+// An arm writes the carried value.  The write is branch-nested, so the arm that
+// skips it must still see what the previous state left.
+async function me_arm_rebuilds(c: u32) -> u32 {
+    mut v = Tag { id: 1 };
+    const a = await PendingThenReady<u32>::new(1, 10);
+    const k: u32 = match (c) {
+        0 => { 0 }
+        _ => { v = Tag { id: 9 }; 1 }
+    };
+    const b = await PendingThenReady<u32>::new(1, 20);
+    return v.id + a + b + k;
+}
+
+// A match expression nested inside a match STATEMENT arm, both reading the
+// carried parameter, with an inner arm that returns.
+async function me_nested_in_match_stmt(r: Result<i64, i64>, sel: i64) -> i64 {
+    const a = await PendingThenReady<i64>::new(1, 7);
+    mut out: i64 = 0;
+    match (sel) {
+        0 => {
+            out = match (r) {
+                Result::Ok(x)  => { x }
+                Result::Err(_) => { return -1; }
+            };
+        }
+        _ => { out = 99; }
+    }
+    return out + a;
+}
+
+![test]
+function match_expr_subject_is_carried_across_await() -> Result<(), TestError> {
+    return expect_eq(future::block_on(me_subject_and_return(Result::Ok(5))), 12 as i64);
+}
+
+![test]
+function match_expr_arm_return_yields_poll_ready() -> Result<(), TestError> {
+    return expect_eq(future::block_on(me_subject_and_return(Result::Err(0))), -1 as i64);
+}
+
+![test]
+function match_expr_in_return_position_ok_arm() -> Result<(), TestError> {
+    return expect_eq(future::block_on(me_in_return_position(Result::Ok(5))), 12 as i64);
+}
+
+![test]
+function match_expr_in_return_position_returning_arm() -> Result<(), TestError> {
+    return expect_eq(future::block_on(me_in_return_position(Result::Err(0))), -1 as i64);
+}
+
+![test]
+function match_expr_guard_reads_carried_local() -> Result<(), TestError> {
+    return expect_eq(future::block_on(me_guard_reads_carried(1)), 17 as i64);
+}
+
+![test]
+function match_expr_guard_false_falls_to_wildcard() -> Result<(), TestError> {
+    return expect_eq(future::block_on(me_guard_reads_carried(2)), 27 as i64);
+}
+
+![test]
+function match_expr_arm_rebuild_taken_uses_new_value() -> Result<(), TestError> {
+    ac_drops = 0;
+    return ac_check(future::block_on(me_arm_rebuilds(1)), 40 as u32);
+}
+
+![test]
+function match_expr_arm_rebuild_skipped_keeps_previous() -> Result<(), TestError> {
+    ac_drops = 0;
+    return ac_check(future::block_on(me_arm_rebuilds(0)), 31 as u32);
+}
+
+![test]
+function match_expr_nested_in_match_statement_arm() -> Result<(), TestError> {
+    return expect_eq(future::block_on(me_nested_in_match_stmt(Result::Ok(5), 0)), 12 as i64);
+}
+
+![test]
+function match_expr_nested_return_escapes_both_matches() -> Result<(), TestError> {
+    return expect_eq(future::block_on(me_nested_in_match_stmt(Result::Err(0), 0)), -1 as i64);
+}
+
+![test]
+function match_expr_nested_unselected_arm() -> Result<(), TestError> {
+    return expect_eq(future::block_on(me_nested_in_match_stmt(Result::Ok(5), 1)), 106 as i64);
+}

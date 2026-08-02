@@ -2,7 +2,8 @@
 ///
 /// Inline-lowering for the bare-name intrinsics declared in
 /// `stdlib/core/intrinsics.cryo` (sign-extension, pointer arithmetic,
-/// rotates, ctlz/cttz, fp/int conversions, atomic_fence, isfinite,
+/// rotates, ctlz/cttz, fp/int conversions, atomic_fence, fpclass,
+/// cheap fp math (fabs/floor/ceil/ftrunc/round/copysign/sqrt/fma),
 /// dirent_name/type, panic).  Also emits the per-module `@panic` and
 /// `@format` runtime helpers as `linkonce_odr` definitions so the linker
 /// can collapse copies across translation units.
@@ -35,20 +36,37 @@ type struct IntrinsicEmitter {
     /// forwarding form for the active target (SysV-amd64 vs Win64).
     /// Null between `null()` and `wire()`.
     abi:         AbiClassifier*;
+    /// `[compiler] no_runtime`: in a freestanding build there is no `@panic`
+    /// runtime (it prints via libc and `abort()`s), so `emit_panic_call`
+    /// routes divergent check failures through `llvm.trap` (`ud2`, no libc)
+    /// instead.  Wired from `ctx.project_no_runtime`.
+    no_runtime:  boolean;
+
+    /// `--panic=unwind`: route `emit_panic_call` to the external raising
+    /// `__cryo_panic` (linked from the `panic/unwind` runtime tier) instead of
+    /// the per-module `linkonce_odr` libc `@panic`, so a panic RAISES and the
+    /// Phase-C cleanup landing pads run as the unwind passes through their
+    /// frames.  Wired from `ctx.project_panic_unwind`; false on the default
+    /// abort path keeps the emitted IR byte-identical.
+    panic_unwind: boolean;
 
     static null() -> IntrinsicEmitter {
         return IntrinsicEmitter {
-            llvm_module: null,
-            builder:     null,
-            abi:         null,
+            llvm_module:  null,
+            builder:      null,
+            abi:          null,
+            no_runtime:   false,
+            panic_unwind: false,
         };
     }
 
     wire(mut &this, llvm_module: LModule*, builder: LBuilder*,
-         abi: AbiClassifier*) -> void {
-        this.llvm_module = llvm_module;
-        this.builder     = builder;
-        this.abi         = abi;
+         abi: AbiClassifier*, no_runtime: boolean, panic_unwind: boolean) -> void {
+        this.llvm_module  = llvm_module;
+        this.builder      = builder;
+        this.abi          = abi;
+        this.no_runtime   = no_runtime;
+        this.panic_unwind = panic_unwind;
     }
 
 
@@ -108,7 +126,23 @@ type struct IntrinsicEmitter {
         return this.llvm_module.add_function(name, fn_ty);
     }
 
-    get_or_decl_funnel_shift(mut &this, name: string, ty: LType) -> LValue {
+    /// `declare T @name(T, T)` - homogeneous binary LLVM intrinsics
+    /// (llvm.copysign.*).
+    get_or_decl_binary_intrinsic(mut &this, name: string, ty: LType) -> LValue {
+        mut fn: LValue = this.llvm_module.get_named_function(name);
+        if (fn.is_valid()) { return fn; }
+        const param_buf: void* = intrinsics::malloc(16);
+        const param_slots: void** = param_buf as void**;
+        param_slots[0] = ty.raw;
+        param_slots[1] = ty.raw;
+        const fn_ty: LType = LType::function_type(ty, param_buf, 2, false);
+        intrinsics::free(param_buf);
+        return this.llvm_module.add_function(name, fn_ty);
+    }
+
+    /// `declare T @name(T, T, T)` - homogeneous ternary LLVM intrinsics
+    /// (llvm.fshl/fshr funnel shifts, llvm.fma.*).
+    get_or_decl_ternary_intrinsic(mut &this, name: string, ty: LType) -> LValue {
         mut fn: LValue = this.llvm_module.get_named_function(name);
         if (fn.is_valid()) { return fn; }
         const param_buf: void* = intrinsics::malloc(24);
@@ -117,6 +151,50 @@ type struct IntrinsicEmitter {
         param_slots[1] = ty.raw;
         param_slots[2] = ty.raw;
         const fn_ty: LType = LType::function_type(ty, param_buf, 3, false);
+        intrinsics::free(param_buf);
+        return this.llvm_module.add_function(name, fn_ty);
+    }
+
+    /// `declare void @name()` - zero-arg void intrinsics (llvm.trap /
+    /// llvm.debugtrap).
+    get_or_decl_void_noarg(mut &this, name: string) -> LValue {
+        mut fn: LValue = this.llvm_module.get_named_function(name);
+        if (fn.is_valid()) { return fn; }
+        const fn_ty: LType = LType::function_type(LType::void_type(), null, 0, false);
+        return this.llvm_module.add_function(name, fn_ty);
+    }
+
+    /// `declare ptr @name(i32)` - llvm.frameaddress.p0 / llvm.returnaddress.
+    /// Emits the call; `level` (a0) is the constant frame index.
+    emit_addr_intrinsic(mut &this, name: string, level: LValue) -> LValue {
+        const ptr_ty: LType = LType::pointer_to(LType::i8());
+        mut fn: LValue = this.llvm_module.get_named_function(name);
+        if (!fn.is_valid()) {
+            const dbuf: void* = intrinsics::malloc(8);
+            const dslots: void** = dbuf as void**;
+            dslots[0] = LType::i32().raw;
+            const decl_ty: LType = LType::function_type(ptr_ty, dbuf, 1, false);
+            intrinsics::free(dbuf);
+            fn = this.llvm_module.add_function(name, decl_ty);
+        }
+        const cbuf: void* = intrinsics::malloc(8);
+        const cslots: void** = cbuf as void**;
+        cslots[0] = LType::i32().raw;
+        const call_ty: LType = LType::function_type(ptr_ty, cbuf, 1, false);
+        intrinsics::free(cbuf);
+        return this.call1(fn, call_ty, level, "addr");
+    }
+
+    // `declare i1 @llvm.is.fpclass.f64(double, i32)`.  The i32 test mask is
+    // an immarg at the call site; the declared parameter type is plain i32.
+    get_or_decl_fpclass(mut &this, name: string, val_ty: LType, mask_ty: LType) -> LValue {
+        mut fn: LValue = this.llvm_module.get_named_function(name);
+        if (fn.is_valid()) { return fn; }
+        const param_buf: void* = intrinsics::malloc(16);
+        const param_slots: void** = param_buf as void**;
+        param_slots[0] = val_ty.raw;
+        param_slots[1] = mask_ty.raw;
+        const fn_ty: LType = LType::function_type(LType::i1(), param_buf, 2, false);
         intrinsics::free(param_buf);
         return this.llvm_module.add_function(name, fn_ty);
     }
@@ -198,7 +276,7 @@ type struct IntrinsicEmitter {
     }
 
     emit_rotate(mut &this, iname: string, ty: LType, x: LValue, n: LValue) -> LValue {
-        const fn: LValue = this.get_or_decl_funnel_shift(iname, ty);
+        const fn: LValue = this.get_or_decl_ternary_intrinsic(iname, ty);
         if (!fn.is_valid()) { return LValue::null(); }
         const param_buf: void* = intrinsics::malloc(24);
         const param_slots: void** = param_buf as void**;
@@ -219,6 +297,62 @@ type struct IntrinsicEmitter {
             shift = this.builder.build_zext(shift, LType::i64(), "rot.shift.zext");
         }
         return this.call3(fn, fn_ty, x, x, shift, "rot");
+    }
+
+    /// Emit `call T @iname(T x, T y)` for a homogeneous binary LLVM
+    /// intrinsic (llvm.copysign.f64).
+    emit_binary_llvm(mut &this, iname: string, ty: LType, x: LValue, y: LValue, label: string) -> LValue {
+        const fn: LValue = this.get_or_decl_binary_intrinsic(iname, ty);
+        if (!fn.is_valid()) { return LValue::null(); }
+        const param_buf: void* = intrinsics::malloc(16);
+        const param_slots: void** = param_buf as void**;
+        param_slots[0] = ty.raw;
+        param_slots[1] = ty.raw;
+        const fn_ty: LType = LType::function_type(ty, param_buf, 2, false);
+        intrinsics::free(param_buf);
+        return this.call2(fn, fn_ty, x, y, label);
+    }
+
+    /// Emit `call T @iname(T x, T y, T z)` for a homogeneous ternary LLVM
+    /// intrinsic (llvm.fma.f64).
+    emit_ternary_llvm(mut &this, iname: string, ty: LType, x: LValue, y: LValue, z: LValue, label: string) -> LValue {
+        const fn: LValue = this.get_or_decl_ternary_intrinsic(iname, ty);
+        if (!fn.is_valid()) { return LValue::null(); }
+        const param_buf: void* = intrinsics::malloc(24);
+        const param_slots: void** = param_buf as void**;
+        param_slots[0] = ty.raw;
+        param_slots[1] = ty.raw;
+        param_slots[2] = ty.raw;
+        const fn_ty: LType = LType::function_type(ty, param_buf, 3, false);
+        intrinsics::free(param_buf);
+        return this.call3(fn, fn_ty, x, y, z, label);
+    }
+
+    // Emit `call i1 @llvm.is.fpclass.f64(double x, i32 <mask>)`.
+    //
+    // The test mask must be an LLVM immarg (compile-time constant): stdlib
+    // callers always pass an integer literal, so we read the constant value
+    // out of `mask_val` and rebuild it as a fresh i32 constant operand.  A
+    // non-constant mask is unreachable in practice (the intrinsic is stdlib-
+    // internal); it degrades to mask 0 (always-false) rather than emitting
+    // invalid IR, mirroring the atomic-ordering fallback.
+    emit_fpclass(mut &this, x: LValue, mask_val: LValue) -> LValue {
+        const val_ty:  LType = LType::f64();
+        const mask_ty: LType = LType::i32();
+        const fn: LValue = this.get_or_decl_fpclass("llvm.is.fpclass.f64", val_ty, mask_ty);
+        if (!fn.is_valid()) { return LValue::null(); }
+        mut mask_bits: u64 = 0;
+        if (mask_val.is_valid() && llvm::LLVMIsConstant(mask_val.raw) != 0) {
+            mask_bits = llvm::LLVMConstIntGetZExtValue(mask_val.raw);
+        }
+        const mask_const: LValue = LType::const_int(mask_ty, mask_bits, false);
+        const param_buf: void* = intrinsics::malloc(16);
+        const param_slots: void** = param_buf as void**;
+        param_slots[0] = val_ty.raw;
+        param_slots[1] = mask_ty.raw;
+        const fn_ty: LType = LType::function_type(LType::i1(), param_buf, 2, false);
+        intrinsics::free(param_buf);
+        return this.call2(fn, fn_ty, x, mask_const, "fpclass");
     }
 
 
@@ -339,8 +473,18 @@ type struct IntrinsicEmitter {
             // vprintf(fmt, va) - 2 args; vfprintf(file, fmt, va) - 3 args.
             IntrinsicKind::Vprintf  => { 2 }
             IntrinsicKind::Vfprintf => { 3 }
-            // atomic_fence(order: i32): single arg.  isfinite, dirent_*
-            // also single arg, so they fall through to the default below.
+            // fpclass(value: f64, test: i32): value + constant test mask.
+            IntrinsicKind::FpClass      => { 2 }
+            // trap()/debugtrap(): zero args.  frame_address/return_address
+            // take one (constant) level arg and fall through to the default.
+            IntrinsicKind::Trap         => { 0 }
+            IntrinsicKind::DebugTrap    => { 0 }
+            // copysign64(magnitude, sign); fma64(x, y, z).  The remaining
+            // cheap-math intrinsics are unary and use the default below.
+            IntrinsicKind::Copysign64   => { 2 }
+            IntrinsicKind::Fma64        => { 3 }
+            // atomic_fence(order: i32): single arg.  dirent_* also single
+            // arg, so they fall through to the default below.
             _                           => { 1 }
         };
         if (expected < 0)            { return Option::None; }
@@ -351,8 +495,9 @@ type struct IntrinsicEmitter {
         // primitives.cryo.  No-op for the pointer-arg intrinsic
         // (PtrDiff) since src_type returns null for it.
         const src_ty: LType = kind.src_type();
-        mut a0: LValue = args[0];
-        if (src_ty.is_valid()) {
+        // Guard args[0]: zero-arg intrinsics (trap/debugtrap) have no args[0].
+        mut a0: LValue = if (args.length >= 1) { args[0] } else { LValue::null() };
+        if (src_ty.is_valid() && a0.is_valid()) {
             a0 = this.auto_deref_to(a0, src_ty);
         }
         // Second argument (rotate count) is i32; auto-deref if pointer.
@@ -466,13 +611,64 @@ type struct IntrinsicEmitter {
                 LValue::null()
             }
 
-            // -- isfinite(x): fcmp oeq (x - x), 0; true if x is finite.
-            //    NaN/+/-inf produce NaN in `x - x`, and oeq with NaN is
-            //    false. --
-            IntrinsicKind::IsFinite => {
-                const diff: LValue = this.builder.build_fsub(a0, a0, "is_fin.diff");
-                const zero: LValue = LType::const_real(LType::f64(), 0.0);
-                this.builder.build_fcmp(LRealPredicate::OEQ, diff, zero, "is_fin")
+            // -- fpclass(x, test): llvm.is.fpclass.f64(x, test); true when
+            //    x's IEEE-754 class is selected by the constant `test`
+            //    bitmask.  Exception-free, unlike the old `(x-x)==0` trick. --
+            IntrinsicKind::FpClass => { this.emit_fpclass(a0, a1) }
+
+            // -- trap(): `call void @llvm.trap()` then `unreachable`.  llvm.trap
+            //    lowers to `ud2` (SIGILL) with no libc dependency - the
+            //    divergent sink for a `no_runtime` check failure.  Declared
+            //    `-> never`, but the dispatcher's early return bypasses the
+            //    post-call divergent-name check (see Panic), so the
+            //    `unreachable` is emitted here. --
+            IntrinsicKind::Trap => {
+                const fn: LValue = this.get_or_decl_void_noarg("llvm.trap");
+                if (fn.is_valid()) {
+                    const fty: LType = LType::function_type(LType::void_type(), null, 0, false);
+                    this.builder.build_call(fty, fn, null, 0, "");
+                }
+                this.builder.build_unreachable();
+                LValue::null()
+            }
+
+            // -- debugtrap(): `call void @llvm.debugtrap()`.  A breakpoint that
+            //    RETURNS, so no trailing `unreachable`. --
+            IntrinsicKind::DebugTrap => {
+                const fn: LValue = this.get_or_decl_void_noarg("llvm.debugtrap");
+                if (fn.is_valid()) {
+                    const fty: LType = LType::function_type(LType::void_type(), null, 0, false);
+                    this.builder.build_call(fty, fn, null, 0, "");
+                }
+                LValue::null()
+            }
+
+            // -- frame_address(n) / return_address(n): `ptr @llvm.frameaddress.p0(i32)`
+            //    / `ptr @llvm.returnaddress(i32)`.  `n` (a0) must be a constant
+            //    (LLVM immarg); n=0 is the current frame.  For the backtrace. --
+            IntrinsicKind::FrameAddress  => { this.emit_addr_intrinsic("llvm.frameaddress.p0", a0) }
+            IntrinsicKind::ReturnAddress => { this.emit_addr_intrinsic("llvm.returnaddress", a0) }
+
+            // -- Cheap IEEE-754 math: each lowers to the matching LLVM float
+            //    intrinsic.  a0 is auto-deref'd via src_type above; the extra
+            //    value args of copysign64/fma64 are deref'd here since the
+            //    shared a1 path only handles the rotate count. --
+            IntrinsicKind::Fabs64   => { this.emit_unary_llvm("llvm.fabs.f64",  LType::f64(), a0, false, "fabs") }
+            IntrinsicKind::Fabs32   => { this.emit_unary_llvm("llvm.fabs.f32",  LType::f32(), a0, false, "fabs") }
+            IntrinsicKind::Floor64  => { this.emit_unary_llvm("llvm.floor.f64", LType::f64(), a0, false, "floor") }
+            IntrinsicKind::Ceil64   => { this.emit_unary_llvm("llvm.ceil.f64",  LType::f64(), a0, false, "ceil") }
+            IntrinsicKind::FTrunc64 => { this.emit_unary_llvm("llvm.trunc.f64", LType::f64(), a0, false, "ftrunc") }
+            IntrinsicKind::Round64  => { this.emit_unary_llvm("llvm.round.f64", LType::f64(), a0, false, "round") }
+            IntrinsicKind::Sqrt64   => { this.emit_unary_llvm("llvm.sqrt.f64",  LType::f64(), a0, false, "sqrt") }
+            IntrinsicKind::Sqrt32   => { this.emit_unary_llvm("llvm.sqrt.f32",  LType::f32(), a0, false, "sqrt") }
+            IntrinsicKind::Copysign64 => {
+                const sign: LValue = this.auto_deref_to(a1, LType::f64());
+                this.emit_binary_llvm("llvm.copysign.f64", LType::f64(), a0, sign, "copysign")
+            }
+            IntrinsicKind::Fma64 => {
+                const y: LValue = this.auto_deref_to(a1, LType::f64());
+                const z: LValue = this.auto_deref_to(args[2], LType::f64());
+                this.emit_ternary_llvm("llvm.fma.f64", LType::f64(), a0, y, z, "fma")
             }
 
             // -- dirent_name(entry) -> entry == null ? "" : (entry + 19).
@@ -568,13 +764,47 @@ type struct IntrinsicEmitter {
 
     // Per-intrinsic emission paths
 
+    /// Get-or-declare the external raising panic funnel `__cryo_panic(msg, file,
+    /// line)` (defined by the `panic/unwind` runtime tier, resolved at link).
+    /// Signature `(ptr, ptr, i32) -> void`, matching the abort funnel's call
+    /// shape; the caller emits `unreachable` after the call since it diverges.
+    get_or_decl_cryo_panic(mut &this) -> LValue {
+        mut fn: LValue = this.llvm_module.get_named_function("__cryo_panic");
+        if (fn.is_valid()) { return fn; }
+        const ptr_ty: LType = LType::pointer_to(LType::i8());
+        const param_buf: void* = intrinsics::malloc(24);
+        const param_slots: void** = param_buf as void**;
+        param_slots[0] = ptr_ty.raw;
+        param_slots[1] = ptr_ty.raw;
+        param_slots[2] = LType::i32().raw;
+        const fty: LType = LType::function_type(LType::void_type(), param_buf, 3, false);
+        intrinsics::free(param_buf);
+        return this.llvm_module.add_function("__cryo_panic", fty);
+    }
+
     /// Emit `call @panic(msg, file, line); unreachable`.  Ensures the
     /// `@panic` runtime function is declared in the current module first.
     emit_panic_call(mut &this, msg: LValue, file: LValue, line: LValue) -> LValue {
-        this.emit_panic_runtime();
-        const panic_fn: LValue = this.llvm_module.get_named_function("panic");
+        // Freestanding: no libc-backed `@panic` runtime.  A check failure
+        // diverges through `llvm.trap` (`ud2`/SIGILL) instead.  The message
+        // is discarded - there is nothing to print to.
+        if (this.no_runtime) {
+            const trap_fn: LValue = this.get_or_decl_void_noarg("llvm.trap");
+            if (trap_fn.is_valid()) {
+                const trap_fty: LType = LType::function_type(LType::void_type(), null, 0, false);
+                this.builder.build_call(trap_fty, trap_fn, null, 0, "");
+            }
+            this.builder.build_unreachable();
+            return LValue::null();
+        }
+        // Every panic goes through the external `__cryo_panic`, declared here and
+        // defined by whichever panic tier the link line names: `panic/abort`
+        // prints and terminates, `panic/unwind` raises through libunwind so the
+        // cleanup landing pads on the enclosing calls run as the unwind passes
+        // through.  Which strategy a program gets is a link-time choice, not a
+        // codegen one, which is why nothing here branches on it.
+        const panic_fn: LValue = this.get_or_decl_cryo_panic();
         if (!panic_fn.is_valid()) { return LValue::null(); }
-        // Match emit_panic_runtime's declared signature: (ptr, ptr, i32) -> void.
         const ptr_ty: LType = LType::pointer_to(LType::i8());
         const param_buf: void* = intrinsics::malloc(24);
         const param_slots: void** = param_buf as void**;
@@ -941,6 +1171,109 @@ type struct IntrinsicEmitter {
         return this.llvm_module.add_function("llvm.va_end.p0", fty);
     }
 
+    // -- Freestanding check handlers (`runtime/abi/lang_items.def`) -----------
+    //
+    // Under `no_runtime` a failed check has no libc to fall back on: a `call
+    // @abort` cannot be resolved by a `-nostdlib` link at all, which is what
+    // made every panic tier of `runtime/` fail its own acceptance check while
+    // still compiling. These route the five check sites to the runtime's own
+    // handlers instead, which format the operands and diverge through
+    // `__cryo_panic` (exit 101 for the abort tier, an unwind for the unwind
+    // tier — chosen by which archive is on the link line, no caller change).
+
+    /// A private constant `SourceLoc` — `{ i8* file, i32 line, i32 col }`, the
+    /// `layout.def` POD — for one check site, returning its ADDRESS.
+    ///
+    /// Passed by pointer rather than by value so neither side has to classify a
+    /// 16-byte POD by hand under two different C ABIs. Still zero-alloc: the
+    /// initializer is entirely compile-time data, so this is a `.rodata` entry,
+    /// not a runtime construction.
+    emit_source_loc_ptr(mut &this, span: SourceSpan) -> LValue {
+        mut filename: string = span.file;
+        if (filename == null || filename.length() == 0) { filename = "<unknown>"; }
+        const file: LValue = this.builder.build_global_string_ptr(filename, "srcloc.file");
+        const line: LValue = LType::const_int(LType::i32(), span.start_line as u64, false);
+        const col:  LValue = LType::const_int(LType::i32(), span.start_col as u64, false);
+
+        const buf: void* = intrinsics::malloc(24);
+        const slots: void** = buf as void**;
+        slots[0] = file.raw;
+        slots[1] = line.raw;
+        slots[2] = col.raw;
+        const init: LValue = LType::const_struct(buf, 3, false);
+        intrinsics::free(buf);
+
+        mut g: LValue = this.llvm_module.add_global(init.type_of(), "srcloc");
+        g.set_initializer(init);
+        g.set_global_constant(true);
+        g.set_linkage(LLinkage::Private);
+        return g;
+    }
+
+    /// Get-or-declare one of the runtime's check handlers. Every one takes the
+    /// `SourceLoc*` first and returns void (declared `-> never` on the runtime
+    /// side; the caller emits the `unreachable`).
+    get_or_decl_check_handler(mut &this, name: string, extra: i64) -> LValue {
+        mut fn: LValue = this.llvm_module.get_named_function(name);
+        if (fn.is_valid()) { return fn; }
+        const count: i64 = 1 + extra;
+        const param_buf: void* = intrinsics::malloc((count * 8) as u64);
+        const slots: void** = param_buf as void**;
+        slots[0] = LType::pointer_to(LType::i8()).raw;
+        // `op` is the only u32 operand and it is always the FIRST extra; the
+        // rest are u64. Matches the `lang_items.def` signatures exactly.
+        for (mut i: i64 = 1; i < count; i++) {
+            if (name == "__cryo_panic_overflow" && i == 1) {
+                slots[i] = LType::i32().raw;
+            } else {
+                slots[i] = LType::i64().raw;
+            }
+        }
+        const fty: LType = LType::function_type(LType::void_type(), param_buf,
+                                                count as u32, false);
+        intrinsics::free(param_buf);
+        return this.llvm_module.add_function(name, fty);
+    }
+
+    /// `call @<handler>(&srcloc, <operands...>); unreachable`.
+    ///
+    /// Returns false when there is no handler for this shape, so the caller can
+    /// keep its previous behaviour rather than emit a call to nothing.
+    emit_check_handler_call(mut &this, name: string, span: SourceSpan,
+                            operands: &LValue[]) -> boolean {
+        const fn: LValue = this.get_or_decl_check_handler(name, operands.length);
+        if (!fn.is_valid()) { return false; }
+        const loc: LValue = this.emit_source_loc_ptr(span);
+
+        const count: i64 = 1 + operands.length;
+        const arg_buf: void* = intrinsics::malloc((count * 8) as u64);
+        const slots: void** = arg_buf as void**;
+        slots[0] = loc.raw;
+        for (mut i: i64 = 0; i < operands.length; i++) {
+            slots[i + 1] = operands[i].raw;
+        }
+        const fty: LType = LType { raw: llvm::LLVMGlobalGetValueType(fn.raw) };
+        this.builder.build_call(fty, fn, arg_buf, count as u32, "");
+        intrinsics::free(arg_buf);
+        this.builder.build_unreachable();
+        return true;
+    }
+
+    /// The freestanding sink for a check site: route to the runtime handler when
+    /// `no_runtime`, else the libc `abort` the hosted abort strategy has always
+    /// used. `operands` are the handler's extra arguments, already widened to
+    /// the declared types.
+    emit_check_sink(mut &this, name: string, span: SourceSpan,
+                    operands: &LValue[]) -> void {
+        if (this.no_runtime) {
+            if (this.emit_check_handler_call(name, span, operands)) { return; }
+        }
+        const abort_fn: LValue = this.get_or_decl_abort();
+        const abort_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(abort_fn.raw) };
+        this.builder.build_call(abort_ty, abort_fn, null, 0, "");
+        this.builder.build_unreachable();
+    }
+
     /// Declare libc `abort` extern: `void abort(void) __attribute__((noreturn))`.
     get_or_decl_abort(mut &this) -> LValue {
         mut fn: LValue = this.llvm_module.get_named_function("abort");
@@ -949,58 +1282,40 @@ type struct IntrinsicEmitter {
         return this.llvm_module.add_function("abort", fty);
     }
 
-    /// Emit the `@panic(msg, file, line)` runtime function into the current
-    /// module if it hasn't been emitted yet.  Idempotent.  Backs the bare
-    /// `intrinsics::panic` calls emitted by `std::prelude::panic` and the
-    /// `Option::unwrap`/`Result::unwrap` family; those produce a direct
-    /// `call @panic(...)` with no body; without this, the linker fails on
-    /// `undefined reference to 'panic'`.
+    /// Declare the allocator lang item `__cryo_alloc(u64 size, u64 align) ->
+    /// void*` (see `runtime/abi/lang_items.def`).  Idempotent.
     ///
-    /// The body just calls libc `abort()` and emits `unreachable`; on a
-    /// future iteration we can route through `fprintf(stderr, ...)` to
-    /// print the message, but that requires extra externs.
-    emit_panic_runtime(mut &this) -> void {
-        mut panic_fn: LValue = this.llvm_module.get_named_function("panic");
-        if (panic_fn.is_valid()) {
-            const first_bb: void* = llvm::LLVMGetFirstBasicBlock(panic_fn.raw);
-            if (first_bb != null) { return; }
-        }
+    /// The alloc tier defines this `![weak]`, so a program that wants its own
+    /// allocator supplies a strong definition and the linker prefers it — which
+    /// is the whole point of routing allocation through a named symbol instead
+    /// of open-coding a `malloc` call.
+    get_or_decl_cryo_alloc(mut &this) -> LValue {
+        mut fn: LValue = this.llvm_module.get_named_function("__cryo_alloc");
+        if (fn.is_valid()) { return fn; }
+        const param_buf: void* = intrinsics::malloc(16);
+        const slots: void** = param_buf as void**;
+        slots[0] = LType::i64().raw;
+        slots[1] = LType::i64().raw;
+        const fty: LType = LType::function_type(
+            LType::pointer_to(LType::i8()), param_buf, 2, false);
+        intrinsics::free(param_buf);
+        return this.llvm_module.add_function("__cryo_alloc", fty);
+    }
 
-        // Declare panic as `(ptr msg, ptr file, i32 line) -> void` if not
-        // already present.
-        const ptr_ty: LType = LType::pointer_to(LType::i8());
-        if (!panic_fn.is_valid()) {
-            const param_buf: void* = intrinsics::malloc(24);
-            const param_slots: void** = param_buf as void**;
-            param_slots[0] = ptr_ty.raw;
-            param_slots[1] = ptr_ty.raw;
-            param_slots[2] = LType::i32().raw;
-            const fty: LType = LType::function_type(LType::void_type(), param_buf, 3, false);
-            intrinsics::free(param_buf);
-            panic_fn = this.llvm_module.add_function("panic", fty);
-        }
-        if (!panic_fn.is_valid()) { return; }
-
-        // linkonce_odr: every module gets a copy; linker collapses them.
-        panic_fn.set_linkage(LLinkage::LinkOnceODR);
-        this.attach_runtime_comdat(panic_fn, "panic");
-
-        const saved_bb: LBasicBlock = this.builder.get_insert_block();
-        const entry_bb: LBasicBlock = LBasicBlock::append(panic_fn, "entry");
-        this.builder.position_at_end(entry_bb);
-
-        // Direct LLVM call to abort() - no need for the full codegen_call
-        // machinery here (the abort signature is fixed and we have zero
-        // args).  This also keeps IntrinsicEmitter free of any
-        // CodegenContext back-pointer that would create a module cycle.
-        const abort_fn: LValue = this.get_or_decl_abort();
-        const abort_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(abort_fn.raw) };
-        this.builder.build_call(abort_ty, abort_fn, null, 0, "");
-        this.builder.build_unreachable();
-
-        if (saved_bb.is_valid()) {
-            this.builder.position_at_end(saved_bb);
-        }
+    /// Declare the deallocator lang item
+    /// `__cryo_dealloc(void* ptr, u64 size, u64 align)`.  Idempotent.
+    get_or_decl_cryo_dealloc(mut &this) -> LValue {
+        mut fn: LValue = this.llvm_module.get_named_function("__cryo_dealloc");
+        if (fn.is_valid()) { return fn; }
+        const param_buf: void* = intrinsics::malloc(24);
+        const slots: void** = param_buf as void**;
+        slots[0] = LType::pointer_to(LType::i8()).raw;
+        slots[1] = LType::i64().raw;
+        slots[2] = LType::i64().raw;
+        const fty: LType = LType::function_type(LType::void_type(), param_buf,
+                                                3, false);
+        intrinsics::free(param_buf);
+        return this.llvm_module.add_function("__cryo_dealloc", fty);
     }
 
     /// Emit the `@format` runtime function into the current module if it

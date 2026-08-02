@@ -1,0 +1,65 @@
+///! Struct field defaults: `field: T = expr` fills the field when a struct
+///! literal omits it, so only an omitted field with NO default is a missing-field
+///! error (E0355, pinned by tests/negative/E0355_missing_field_init.cryo). The
+///! default is a standalone expression, cloned and re-evaluated at each
+///! construction that omits the field; a supplied value overrides it.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::StructFieldDefaults;
+
+import std::core::result;
+import std::test::error;
+import std::test::assert;
+
+type struct Config {
+    width:  i32;
+    height: i32 = 480;
+    scale:  i32 = 2 * 3;
+}
+
+// A module counter so the fresh-evaluation contract is observable: each omitted
+// `id` runs `next_id()` once, at its own construction site.
+mut g_dflt_calls: i32 = 0;
+function next_id() -> i32 { g_dflt_calls = g_dflt_calls + 1; return g_dflt_calls; }
+
+type struct Widget {
+    name: i32;
+    id:   i32 = next_id();
+}
+
+// An omitted defaulted field takes its default.
+![test]
+function omitted_field_uses_default() -> Result<(), TestError> {
+    const c: Config = Config { width: 640 };
+    return expect_eq(c.height, 480);
+}
+
+// A non-literal default expression is evaluated (`2 * 3` -> 6).
+![test]
+function default_expression_is_evaluated() -> Result<(), TestError> {
+    const c: Config = Config { width: 640 };
+    return expect_eq(c.scale, 6);
+}
+
+// A supplied value overrides the default.
+![test]
+function provided_field_overrides_default() -> Result<(), TestError> {
+    const c: Config = Config { width: 640, height: 100 };
+    return expect_eq(c.height, 100);
+}
+
+// Every defaulted field can be omitted at once.
+![test]
+function all_defaults_omitted() -> Result<(), TestError> {
+    const c: Config = Config { width: 1 };
+    return expect_eq(c.height + c.scale, 486);
+}
+
+// The default is re-evaluated per construction: two Widgets get distinct ids.
+![test]
+function default_reevaluated_each_construction() -> Result<(), TestError> {
+    g_dflt_calls = 0;
+    const a: Widget = Widget { name: 1 };
+    const b: Widget = Widget { name: 2 };
+    return expect_eq(a.id + b.id, 3);
+}

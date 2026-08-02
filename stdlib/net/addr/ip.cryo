@@ -1,0 +1,364 @@
+///! IP addresses.
+///!
+///! `IpV4Addr` is four octets; `IpV6Addr` is sixteen. `IpAddr` is the
+///! discriminated union. Parsing accepts the canonical `a.b.c.d`
+///! form for v4.
+///!
+///! IPv6 (v1.0): `IpV6Addr` stores sixteen octets in network byte order
+///! and `parse` accepts the canonical text forms - full `a:b:...:h`,
+///! `::`-compressed, and trailing embedded-v4 (`::ffff:1.2.3.4`).
+///! `IpAddr::parse` routes any colon-bearing input to the v6 parser. The
+///! socket layer packs a 28-byte `sockaddr_in6`, so an `IpAddr::V6` is
+///! dialable through `TcpConnect::start`, `TcpListener::bind`, and the
+///! HTTP `Client`.
+
+namespace std::net::addr::ip;
+
+import core::intrinsics;
+import core::option;
+import core::result;
+import core::convert;
+import collections::str;
+
+type struct IpV4Addr {
+    a: u8;
+    b: u8;
+    c: u8;
+    d: u8;
+
+    static new(a: u8, b: u8, c: u8, d: u8) -> IpV4Addr {
+        return IpV4Addr { a: a, b: b, c: c, d: d };
+    }
+
+    /// `0.0.0.0`: "any interface" for a bound listener.
+    static unspecified() -> IpV4Addr {
+        return IpV4Addr { a: 0, b: 0, c: 0, d: 0 };
+    }
+
+    /// `127.0.0.1`.
+    static localhost() -> IpV4Addr {
+        return IpV4Addr { a: 127, b: 0, c: 0, d: 1 };
+    }
+
+    /// `255.255.255.255`.
+    static broadcast() -> IpV4Addr {
+        return IpV4Addr { a: 255, b: 255, c: 255, d: 255 };
+    }
+
+    /// Returns the four octets in big-endian (network) order.
+    octet(&this, index: u64) -> u8 {
+        if (index == 0) { return this.a; }
+        if (index == 1) { return this.b; }
+        if (index == 2) { return this.c; }
+        if (index == 3) { return this.d; }
+        core::panic("IpV4Addr::octet: index out of range", FILE, LINE);
+    }
+
+    is_loopback(&this) -> boolean {
+        return this.a == 127;
+    }
+
+    is_unspecified(&this) -> boolean {
+        return this.a == 0 && this.b == 0 && this.c == 0 && this.d == 0;
+    }
+
+    /// Host-byte-order u32 representation. High byte is `a`.
+    to_u32(&this) -> u32 {
+        return ((this.a as u32) << 24)
+             | ((this.b as u32) << 16)
+             | ((this.c as u32) << 8)
+             | (this.d as u32);
+    }
+
+    /// Parse canonical `a.b.c.d`. Returns `Err(ConversionError)` on any
+    /// failure (extra whitespace, out-of-range octets, missing or extra dots,
+    /// leading/trailing separators); the error is describable/printable. Use
+    /// `parse_opt` if you only need presence, not the reason.
+    static parse(source: Str) -> Result<IpV4Addr, ConversionError> {
+        match (IpV4Addr::parse_opt(source)) {
+            Option::Some(addr) => { return Result::Ok(addr); }
+            Option::None       => { return Result::Err(ConversionError::new("invalid IPv4 address")); }
+        }
+    }
+
+    /// Detail-free variant of `parse`: `None` on any failure. Backs `parse`
+    /// and suits callers that branch only on success/failure.
+    static parse_opt(source: Str) -> Option<IpV4Addr> {
+        mut parts: u8[4];
+        mut part_index: u64 = 0;
+        mut segment_start: u64 = 0;
+        mut i: u64 = 0;
+        while (i < source.length()) {
+            match (source.byte_at(i)) {
+                Option::Some(byte) => {
+                    if (byte == 0x2E) { // '.'
+                        if (part_index >= 3) { return Option::None; }
+                        const segment: Str = source.sub_bytes(segment_start, i);
+                        match (u8::try_from(segment)) {
+                            Result::Ok(octet) => {
+                                parts[part_index] = octet;
+                                part_index = part_index + 1;
+                                segment_start = i + 1;
+                            }
+                            Result::Err(_) => { return Option::None; }
+                        }
+                    }
+                }
+                Option::None => { return Option::None; }
+            }
+            i++;
+        }
+        if (part_index != 3) { return Option::None; }
+        const tail: Str = source.sub_bytes(segment_start, source.length());
+        match (u8::try_from(tail)) {
+            Result::Ok(octet) => { parts[3] = octet; }
+            Result::Err(_) => { return Option::None; }
+        }
+        return Option::Some(IpV4Addr {
+            a: parts[0], b: parts[1], c: parts[2], d: parts[3]
+        });
+    }
+}
+
+/// Sixteen octets in network byte order. `parse` accepts the canonical
+/// text forms (full 8-group, `::`-compressed, and trailing embedded-v4);
+/// addresses may also be constructed directly.
+type struct IpV6Addr {
+    segments: u8[16];
+
+    static unspecified() -> IpV6Addr {
+        mut segments: u8[16];
+        mut i: u64 = 0;
+        while (i < 16) { segments[i] = 0; i++; }
+        return IpV6Addr { segments: segments };
+    }
+
+    static localhost() -> IpV6Addr {
+        mut segments: u8[16];
+        mut i: u64 = 0;
+        while (i < 15) { segments[i] = 0; i++; }
+        segments[15] = 1;
+        return IpV6Addr { segments: segments };
+    }
+
+    /// Build from sixteen network-order octets at `p[0..16]` (e.g. the
+    /// `sin6_addr` of a kernel-filled `sockaddr_in6`).
+    static from_buf(p: u8*) -> IpV6Addr {
+        mut segments: u8[16];
+        mut i: u64 = 0;
+        while (i < 16) { segments[i] = p[i]; i = i + 1; }
+        return IpV6Addr { segments: segments };
+    }
+
+    /// The two-byte group at `group` (0..8), big-endian (segments are in
+    /// network order, so the high byte comes first).
+    group_at(&this, group: u64) -> u16 {
+        const hi: u16 = this.segments[group * 2] as u16;
+        const lo: u16 = this.segments[group * 2 + 1] as u16;
+        return (hi << 8) | lo;
+    }
+
+    /// `::1`.
+    is_loopback(&this) -> boolean {
+        mut i: u64 = 0;
+        while (i < 15) { if (this.segments[i] != 0) { return false; } i++; }
+        return this.segments[15] == 1;
+    }
+
+    /// `::`.
+    is_unspecified(&this) -> boolean {
+        mut i: u64 = 0;
+        while (i < 16) { if (this.segments[i] != 0) { return false; } i++; }
+        return true;
+    }
+
+    /// Parse canonical IPv6 text: full `a:b:c:d:e:f:g:h`, `::`-compressed
+    /// (one run at most), and a trailing embedded IPv4 (`::ffff:1.2.3.4`).
+    /// Returns `Err(ConversionError)` on any malformed input; use `parse_opt`
+    /// for the detail-free variant.
+    static parse(source: Str) -> Result<IpV6Addr, ConversionError> {
+        match (IpV6Addr::parse_opt(source)) {
+            Option::Some(addr) => { return Result::Ok(addr); }
+            Option::None       => { return Result::Err(ConversionError::new("invalid IPv6 address")); }
+        }
+    }
+
+    /// Detail-free variant of `parse`: `None` on any malformed input.
+    static parse_opt(source: Str) -> Option<IpV6Addr> {
+        const n: u64 = source.length();
+        if (n < 2) { return Option::None; }   // shortest legal is "::"
+
+        // Locate the single "::" compression run (if any).
+        mut dcolon: u64 = n;             // index of the first ':' of "::", or n
+        mut i: u64 = 0;
+        while (i + 1 < n) {
+            if (ip_byte_eq(source, i, 0x3A) && ip_byte_eq(source, i + 1, 0x3A)) {
+                if (dcolon != n) { return Option::None; }   // two "::" runs
+                dcolon = i;
+                i = i + 2;
+            } else {
+                i = i + 1;
+            }
+        }
+
+        mut head: u16[8];                // groups before "::"
+        mut tail: u16[8];                // groups after "::"
+        mut head_n: u64 = 0;
+        mut tail_n: u64 = 0;
+
+        if (dcolon == n) {
+            // No compression: exactly 8 groups (a trailing embedded v4
+            // contributes 2 of them).
+            match (ip_parse_groups(source, 0, n, &head[0])) {
+                Option::Some(cnt) => { head_n = cnt; }
+                Option::None      => { return Option::None; }
+            }
+            if (head_n != 8) { return Option::None; }
+        } else {
+            if (dcolon > 0) {
+                match (ip_parse_groups(source, 0, dcolon, &head[0])) {
+                    Option::Some(cnt) => { head_n = cnt; }
+                    Option::None      => { return Option::None; }
+                }
+            }
+            const rstart: u64 = dcolon + 2;
+            if (rstart < n) {
+                match (ip_parse_groups(source, rstart, n, &tail[0])) {
+                    Option::Some(cnt) => { tail_n = cnt; }
+                    Option::None      => { return Option::None; }
+                }
+            }
+            // "::" must stand for at least one zero group.
+            if (head_n + tail_n >= 8) { return Option::None; }
+        }
+
+        mut segs: u8[16];
+        mut k: u64 = 0;
+        while (k < 16) { segs[k] = 0; k = k + 1; }
+        // Head groups at the front.
+        mut g: u64 = 0;
+        while (g < head_n) {
+            segs[g * 2]     = (head[g] >> 8) as u8;
+            segs[g * 2 + 1] = (head[g] & 0xFF) as u8;
+            g = g + 1;
+        }
+        // Tail groups flush to the end.
+        const tail_base: u64 = 8 - tail_n;
+        g = 0;
+        while (g < tail_n) {
+            const slot: u64 = tail_base + g;
+            segs[slot * 2]     = (tail[g] >> 8) as u8;
+            segs[slot * 2 + 1] = (tail[g] & 0xFF) as u8;
+            g = g + 1;
+        }
+        return Option::Some(IpV6Addr { segments: segs });
+    }
+}
+
+/// `source[index] == byte`, false if out of range.
+function ip_byte_eq(source: Str, index: u64, byte: u8) -> boolean {
+    match (source.byte_at(index)) {
+        Option::Some(b) => { return b == byte; }
+        Option::None    => { return false; }
+    }
+}
+
+/// True if `source[start..end]` contains a '.'.
+function ip_range_has_dot(source: Str, start: u64, end: u64) -> boolean {
+    mut i: u64 = start;
+    while (i < end) {
+        if (ip_byte_eq(source, i, 0x2E)) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// Parse the colon-separated 16-bit hex groups in `source[start..end]`
+/// into `out`, returning the group count, or `None` on malformed input.
+/// A trailing dotted-quad (embedded IPv4) expands into two groups.
+/// Rejects empty groups, >4 hex digits, and a v4 tail that isn't last.
+function ip_parse_groups(source: Str, start: u64, end: u64, out: u16*) -> Option<u64> {
+    mut count: u64 = 0;
+    mut seg_start: u64 = start;
+    mut i: u64 = start;
+    while (i <= end) {
+        const at_sep: boolean = (i == end) || ip_byte_eq(source, i, 0x3A);
+        if (at_sep) {
+            if (i == seg_start) { return Option::None; }   // empty group
+            if (ip_range_has_dot(source, seg_start, i)) {
+                // Embedded IPv4: only legal as the final piece, needs 2 slots.
+                if (i != end) { return Option::None; }
+                if (count > 6) { return Option::None; }
+                const quad: Str = source.sub_bytes(seg_start, i);
+                match (IpV4Addr::parse_opt(quad)) {
+                    Option::Some(v4) => {
+                        out[count]     = ((v4.a as u16) << 8) | (v4.b as u16);
+                        out[count + 1] = ((v4.c as u16) << 8) | (v4.d as u16);
+                        count = count + 2;
+                    }
+                    Option::None => { return Option::None; }
+                }
+            } else {
+                if (i - seg_start > 4) { return Option::None; }
+                if (count >= 8) { return Option::None; }
+                const piece: Str = source.sub_bytes(seg_start, i);
+                match (piece.try_to_hex()) {
+                    Result::Ok(v)  => { out[count] = v as u16; count = count + 1; }
+                    Result::Err(_) => { return Option::None; }
+                }
+            }
+            seg_start = i + 1;
+        }
+        i = i + 1;
+    }
+    return Option::Some(count);
+}
+
+type enum IpAddr {
+    V4(IpV4Addr);
+    V6(IpV6Addr);
+}
+
+implement enum IpAddr {
+    is_ipv4(&this) -> boolean {
+        match (&this) {
+            IpAddr::V4(_) => { return true; }
+            IpAddr::V6(_) => { return false; }
+        }
+    }
+
+    is_ipv6(&this) -> boolean {
+        match (&this) {
+            IpAddr::V4(_) => { return false; }
+            IpAddr::V6(_) => { return true; }
+        }
+    }
+
+    /// Parse textual form. A ':' routes to the v6 parser; otherwise v4.
+    /// Returns `Err(ConversionError)` if the selected parser rejects the
+    /// input; use `parse_opt` for the detail-free variant.
+    static parse(source: Str) -> Result<IpAddr, ConversionError> {
+        match (IpAddr::parse_opt(source)) {
+            Option::Some(addr) => { return Result::Ok(addr); }
+            Option::None       => { return Result::Err(ConversionError::new("invalid IP address")); }
+        }
+    }
+
+    /// Detail-free variant of `parse`: `None` if the selected parser rejects.
+    static parse_opt(source: Str) -> Option<IpAddr> {
+        mut i: u64 = 0;
+        while (i < source.length()) {
+            if (ip_byte_eq(source, i, 0x3A)) {
+                match (IpV6Addr::parse_opt(source)) {
+                    Option::Some(v6) => { return Option::Some(IpAddr::V6(v6)); }
+                    Option::None     => { return Option::None; }
+                }
+            }
+            i = i + 1;
+        }
+        match (IpV4Addr::parse_opt(source)) {
+            Option::Some(v4) => { return Option::Some(IpAddr::V4(v4)); }
+            Option::None => { return Option::None; }
+        }
+    }
+}

@@ -1,5 +1,13 @@
-///! Read / Write: the two traits every byte sink or source
-///! implements.
+///! The byte-source and byte-sink traits, blocking and non-blocking.
+///!
+///! `Read` / `Write` / `Seek` are the blocking family, implemented by
+///! files, cursors and the standard streams. `AsyncRead` / `AsyncWrite`
+///! are the non-blocking family, implemented by connections that own
+///! their transport and buffer their bytes internally; `AsyncTransport`
+///! is the raw channel such a connection sits on. The two families live
+///! together here because one cannot be expressed in terms of the other
+///! — see the section banner further down for why — not because a byte
+///! source needs two spellings.
 ///!
 ///! Both report failure as `Result<_, IoError>`. The byte count in
 ///! `read` / `write_some` is the number actually transferred: fewer
@@ -16,6 +24,7 @@
 namespace std::io::traits;
 
 import core::intrinsics;
+import core::mem;
 import core::option;
 import core::result;
 import core::slice;
@@ -24,6 +33,9 @@ import collections::str;
 import collections::string;
 import collections::array;
 import alloc::allocator;
+import future::poll;
+import future::waker;
+import future::traits;
 
 /// Initial capacity bump for `read_to_end` when the caller hasn't
 /// pre-reserved. Large enough that a one-call read from a small file
@@ -326,4 +338,370 @@ type trait Write {
         }
         return Result::Ok(());
     }
+}
+
+/// Anchor for a `Seek::seek`. The seek target is one of: an absolute
+/// byte offset from the start (`Start`, always non-negative), a signed
+/// delta from the current position (`Current`), or a signed delta from
+/// the end (`End`). `Current`/`End` deltas may be negative; seeking to a
+/// negative absolute offset is an error.
+type enum SeekFrom {
+    Start(u64);
+    Current(i64);
+    End(i64);
+}
+
+/// A byte stream whose read/write cursor can be repositioned. Absolute
+/// positions are `u64` offsets from the start; every `seek` returns the
+/// resulting absolute position.
+type trait Seek {
+    /// Reposition the cursor and return the new absolute offset from the
+    /// start of the stream. Seeking past the end is permitted; the effect
+    /// of a later read/write there is sink-specific (a `File` leaves a
+    /// sparse gap the OS zero-fills; an in-memory `Cursor` zero-fills on
+    /// the next write). Seeking to a negative absolute offset fails with
+    /// `InvalidInput`.
+    seek(mut &this, from: SeekFrom) -> Result<u64, IoError>;
+
+    /// Current absolute offset, without moving. Default: `seek(Current(0))`.
+    stream_position(mut &this) -> Result<u64, IoError> {
+        return this.seek(SeekFrom::Current(0));
+    }
+
+    /// Reposition to the start of the stream. Default: `seek(Start(0))`.
+    rewind(mut &this) -> Result<(), IoError> {
+        match (this.seek(SeekFrom::Start(0))) {
+            Result::Ok(_)  => { return Result::Ok(()); }
+            Result::Err(e) => { return Result::Err(e); }
+        }
+    }
+}
+
+
+// ============================================================================
+// The non-blocking family.
+//
+// `AsyncRead` / `AsyncWrite` are NOT an async mirror of `Read` / `Write`, and
+// the difference is forced rather than stylistic: those take a caller-supplied
+// `u8*` / `Slice<u8>`, and neither a raw pointer into the caller's frame nor a
+// borrowed receiver survives a suspension point.
+//
+//   - A future is moved between polls, so a buffer named by a pointer into the
+//     caller's frame would be written through an address that no longer belongs
+//     to it. (OpenSSL is stricter still: a call that returned `WANT_*` must be
+//     retried with the SAME arguments.)
+//   - Handing the address of a local to a future that outlives the current step
+//     is refused outright (E0455), so a protocol layer cannot hold its transport
+//     by pointer the way `BufReader` does.
+//
+// So the transport-owning connection keeps ONE persistent buffer and no buffer
+// crosses the API. `fill` pulls bytes into it and the caller reads them where
+// they landed:
+//
+//     await conn.ensure(9)?;              // at least 9 bytes present
+//     const head: Slice<u8> = conn.buffered();
+//     const len: u64 = head.get(0) ... ;  // parse in place, no copy
+//     conn.consume(9);
+//
+// **Never hold a `buffered()` slice across an `await`.** A `fill` may grow the
+// buffer and move its heap block, leaving the slice pointing at freed memory.
+// Re-fetch it after every suspension. The default bodies below observe this:
+// every one of them scans and copies inside a synchronous helper (`scan_for`,
+// `take_front`) so no slice is ever live at a suspension point.
+//
+// The write side inverts the split: `queue` is synchronous and only appends to
+// the connection's outgoing buffer, so an encoder builds a whole frame without
+// suspending once, and `flush` is the single async call that puts it on the
+// wire.
+// ============================================================================
+
+/// ASCII carriage return. `AsyncRead::read_line` strips one sitting
+/// immediately before the `BYTE_LF` it stops at, so CRLF-framed and
+/// LF-framed input read alike.
+const BYTE_CR: u8 = 0x0D;
+
+/// A byte source that buffers what it reads inside itself.
+///
+/// Implementors provide the three primitives; everything else is a
+/// default body written once against them.
+///
+/// The buffer's contract, which the default bodies rely on: a successful
+/// `fill` only ever APPENDS to what `buffered()` reports. Every byte it
+/// already held is still there, at the same index within that view, when
+/// the call returns. (An implementor is free to compact its storage —
+/// that moves bytes within the backing array, not within the view.) That
+/// is what lets `read_until` resume its scan where it stopped instead of
+/// rescanning the whole buffer after every fill.
+type trait AsyncRead {
+    /// Pull more bytes from the transport into the connection's buffer
+    /// and return how many arrived. Zero means the peer closed its end:
+    /// no later `fill` will produce anything either.
+    ///
+    /// Blocking is the one thing it must not do — it suspends instead.
+    async fill(mut &this) -> Result<u64, IoError>;
+
+    /// The bytes that have been read but not yet consumed.
+    ///
+    /// Valid only until the next `fill` or `consume`; see the module
+    /// note on holding one across an `await`.
+    buffered(&this) -> Slice<u8>;
+
+    /// Discard the first `count` buffered bytes, which the caller has
+    /// finished with. `count` must not exceed `buffered().length()`.
+    consume(mut &this, count: u64) -> void;
+
+    /// Index just past the first `delimiter` at or after `from`, or 0
+    /// when it is not in the buffer yet.
+    ///
+    /// Synchronous by construction: the slice it scans never outlives
+    /// the call, so no `fill` can move the buffer underneath it.
+    scan_for(&this, delimiter: u8, from: u64) -> u64 {
+        const view: Slice<u8> = this.buffered();
+        mut i: u64 = from;
+        while (i < view.length()) {
+            match (view.get(i)) {
+                Option::Some(byte) => {
+                    if (byte == delimiter) { return i + 1; }
+                }
+                Option::None => { return 0; }
+            }
+            i = i + 1;
+        }
+        return 0;
+    }
+
+    /// Copy the first `count` buffered bytes out and consume them.
+    /// Callers that can parse in place should read `buffered()` directly
+    /// and call `consume` themselves; this is for the cases that need to
+    /// keep the bytes past the next fill.
+    ///
+    /// Synchronous, for the same reason as `scan_for`.
+    take_front(mut &this, count: u64) -> Result<Array<u8>, IoError> {
+        mut out: Array<u8> = Array<u8>::with_capacity(count);
+        match (out.try_append(this.buffered().subslice(0, count))) {
+            Result::Ok(_)  => { }
+            Result::Err(_) => {
+                out.drop();
+                return Result::Err(IoError::new(IoErrorKind::OutOfMemory, 0));
+            }
+        }
+        this.consume(count);
+        return Result::Ok(out);
+    }
+
+    /// Fill until at least `count` bytes are buffered. EOF before that
+    /// is `UnexpectedEof`: the caller asked for bytes the peer will
+    /// never send.
+    ///
+    /// The bytes are left in the buffer for the caller to read through
+    /// `buffered()` — this is the zero-copy path for fixed-size headers.
+    async ensure(mut &this, count: u64) -> Result<(), IoError> {
+        while (this.buffered().length() < count) {
+            const n: u64 = (await this.fill())?;
+            if (n == 0) {
+                return Result::Err(IoError::new(IoErrorKind::UnexpectedEof, 0));
+            }
+        }
+        return Result::Ok(());
+    }
+
+    /// Read exactly `count` bytes and hand them back. A short stream is
+    /// `UnexpectedEof`.
+    async read_exact(mut &this, count: u64) -> Result<Array<u8>, IoError> {
+        (await this.ensure(count))?;
+        return this.take_front(count);
+    }
+
+    /// Read whatever is available, up to `limit` bytes, suspending only
+    /// if nothing is buffered yet. An empty result means EOF — it is the
+    /// terminating condition for a streaming copy, not an error.
+    async read_some(mut &this, limit: u64) -> Result<Array<u8>, IoError> {
+        if (this.buffered().is_empty()) {
+            const n: u64 = (await this.fill())?;
+            if (n == 0) {
+                return Result::Ok(Array<u8>::new());
+            }
+        }
+        mut take: u64 = this.buffered().length();
+        if (take > limit) { take = limit; }
+        return this.take_front(take);
+    }
+
+    /// Read up to and including the first `delimiter`. The delimiter is
+    /// part of the returned bytes.
+    ///
+    /// `limit` caps how much may be buffered while looking for it, so a
+    /// peer that never sends one cannot drive the buffer to exhaust
+    /// memory; exceeding it is `InvalidData`. EOF before the delimiter
+    /// is `UnexpectedEof` — a truncated record, not a short one.
+    async read_until(mut &this, delimiter: u8, limit: u64) -> Result<Array<u8>, IoError> {
+        mut scanned: u64 = 0;
+        mut take: u64 = this.scan_for(delimiter, 0);
+        while (take == 0) {
+            scanned = this.buffered().length();
+            if (scanned > limit) {
+                return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
+            }
+            const n: u64 = (await this.fill())?;
+            if (n == 0) {
+                return Result::Err(IoError::new(IoErrorKind::UnexpectedEof, 0));
+            }
+            // Resume the scan at `scanned`: a fill only appends, so the
+            // bytes already rejected cannot have become the delimiter.
+            take = this.scan_for(delimiter, scanned);
+        }
+        return this.take_front(take);
+    }
+
+    /// Read one `\n`-terminated line, without the terminator. A `\r`
+    /// immediately before it is stripped too, so this reads CRLF and LF
+    /// framing alike. `limit` caps the line length as in `read_until`.
+    async read_line(mut &this, limit: u64) -> Result<String, IoError> {
+        mut raw: Array<u8> = (await this.read_until(BYTE_LF, limit))?;
+        mut end: u64 = raw.length();
+        if (end > 0) { end = end - 1; }
+        if (end > 0) {
+            match (raw.get(end - 1)) {
+                Option::Some(byte) => {
+                    if (byte == BYTE_CR) { end = end - 1; }
+                }
+                Option::None => { }
+            }
+        }
+        mut out: String = String::new();
+        match (out.try_push(Str::from_raw(raw.as_ptr(), end))) {
+            Result::Ok(_)  => { }
+            Result::Err(_) => {
+                out.drop();
+                raw.drop();
+                return Result::Err(IoError::new(IoErrorKind::OutOfMemory, 0));
+            }
+        }
+        raw.drop();
+        return Result::Ok(out);
+    }
+
+    /// Discard exactly `count` bytes. Cheaper than `read_exact` for
+    /// payload a caller is required to consume but does not want, such
+    /// as frame padding.
+    async skip(mut &this, count: u64) -> Result<(), IoError> {
+        mut remaining: u64 = count;
+        while (remaining > 0) {
+            if (this.buffered().is_empty()) {
+                const n: u64 = (await this.fill())?;
+                if (n == 0) {
+                    return Result::Err(IoError::new(IoErrorKind::UnexpectedEof, 0));
+                }
+            }
+            mut take: u64 = this.buffered().length();
+            if (take > remaining) { take = remaining; }
+            this.consume(take);
+            remaining = remaining - take;
+        }
+        return Result::Ok(());
+    }
+}
+
+/// A byte sink that buffers what it is given until told to send it.
+///
+/// The asymmetry with `AsyncRead` is deliberate: queuing is synchronous,
+/// so a frame encoder builds its whole output — header, length prefix,
+/// payload — without a single suspension point, and the layer suspends
+/// once, in `flush`.
+type trait AsyncWrite {
+    /// The connection's outgoing buffer, for `queue` to append to and
+    /// `flush` to drain. Exposed rather than wrapped so an encoder can
+    /// build a frame directly in place instead of into a scratch array
+    /// that is then copied.
+    ///
+    /// Valid only until the next `flush`; the same rule as `buffered()`
+    /// applies — do not hold it across an `await`.
+    pending(mut &this) -> Array<u8>*;
+
+    /// Put every queued byte on the wire, suspending as often as the
+    /// transport needs, and clear the buffer. A failure leaves the
+    /// unsent bytes queued, so a caller that can retry still has them.
+    async flush(mut &this) -> Result<(), IoError>;
+
+    /// Append `data` to the outgoing buffer without sending anything.
+    /// Generic over the payload and dispatched at compile time: a raw
+    /// `Slice<u8>`, a `Str` view, a NUL-terminated C `string`, or a
+    /// single `u8`.
+    queue<T>(mut &this, data: T) -> Result<(), IoError> {
+        const bytes: Slice<u8> = static match (T) {
+            Slice<u8> => { data }
+            Str       => { data.as_bytes() }
+            string    => { Str::new(data).as_bytes() }
+            u8        => { Slice<u8>::from_raw(&data, 1) }
+        };
+        mut out: Array<u8>* = this.pending();
+        match (out.try_append(bytes)) {
+            Result::Ok(_)  => { return Result::Ok(()); }
+            Result::Err(_) => {
+                return Result::Err(IoError::new(IoErrorKind::OutOfMemory, 0));
+            }
+        }
+    }
+
+    /// Queue `data` and send it immediately. The one-shot convenience
+    /// for a caller with nothing else to add; a caller with several
+    /// pieces should `queue` each and `flush` once.
+    async send<T>(mut &this, data: T) -> Result<(), IoError> {
+        this.queue<T>(data)?;
+        return await this.flush();
+    }
+}
+
+/// What a transport hands back from one operation: the buffer it was lent,
+/// plus how many bytes moved.
+///
+/// The buffer makes the round trip because a future is moved between polls,
+/// so an operation cannot write through a pointer into anyone's frame — it
+/// owns the array for the duration and returns it. After a read the array
+/// holds exactly the bytes that arrived; after a write it is untouched, so a
+/// caller whose write was short still has the bytes it has not sent.
+///
+/// The buffer comes out through `take_buf` rather than by reading the field:
+/// an `Array<u8>` frees its block when dropped, so the compiler refuses to let
+/// it be moved out of a value that would still drop it.
+type struct Transfer {
+    buf:    Array<u8>;
+    result: Result<u64, IoError>;
+
+    /// Take the buffer back. Calling it twice yields an empty array the second
+    /// time — the transfer holds the buffer exactly once.
+    take_buf(mut &this) -> Array<u8> {
+        mut out: Array<u8> = Array<u8>::new();
+        mem::swap<Array<u8>>(&out, &this.buf);
+        return out;
+    }
+
+    /// How many bytes moved, or why none did.
+    outcome(&this) -> Result<u64, IoError> {
+        return this.result;
+    }
+}
+
+/// One raw, unbuffered async byte channel: what `BufStream<S>` needs of a
+/// transport, and nothing more.
+///
+/// This is the seam that lets a plaintext socket and a TLS session share ONE
+/// buffered connection. Everything above it — the read buffer, the compaction,
+/// the short-write requeue, the `AsyncRead`/`AsyncWrite` contracts — is written
+/// once against these two operations.
+///
+/// **An implementor performs the move-out/await/move-back itself.** The
+/// underlying futures own the handle for the duration of an operation, so the
+/// implementor swaps its own closed placeholder into `this` while one is in
+/// flight, and swaps the real handle back before returning. Keeping that inside
+/// the impl is what lets the trait describe bytes only: a buffered connection
+/// never holds a placeholder, and the trait needs no way to spell one.
+type trait AsyncTransport {
+    /// Read into `buf`, completing with the bytes that arrived. Zero means the
+    /// peer closed its end.
+    async read_into(mut &this, buf: Array<u8>) -> Transfer;
+
+    /// Write from `buf`, completing with the bytes accepted, which may be fewer
+    /// than offered — the caller sends the remainder in another operation.
+    async write_from(mut &this, buf: Array<u8>) -> Transfer;
 }

@@ -1,0 +1,248 @@
+// A where-bound can name a type parameter only from INSIDE a nested generic:
+// `A: Prod<Result<T1, E>>` constrains `T1` and `E` though neither appears in a
+// value parameter nor at the top of the bound.  Recovering them needs the
+// bound-directed projection to DESTRUCTURE what it projects — project `A`'s
+// associated type, then pair `Result<T1, E>` against the concrete
+// `Result<i64, i64>` it yields.  Adopting the projection whole only works when
+// the slot arg IS the param (`Prod<OA>`), which is the shape `join` uses.
+//
+// Left unrecovered, such a param stays abstract, the caller discards the
+// incomplete binding set, and the call dies at codegen (E0636) or reports E0200
+// against the still-abstract shape (`found Result<(T1, T2), E>`).  That is what
+// kept `Futures::try_join` out of the standard library, so `Combine` below is a
+// deliberately synchronous reduction of `TryJoin`: same bound shape, same
+// return shape, no executor and no suspension.
+//
+// The controls carry as much weight as the new case.  `directly_bound_*` pins
+// the pre-existing shape the fix reorganised around, `..._concrete_position_...`
+// pins that a fixed position in the nested type fills no slot, and
+// `two_instantiations_*` pins that a second call at different types is inferred
+// independently rather than adopting the first one's bindings.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::WhereBoundNestedParamInference;
+
+import std::core::result;
+import std::core::option;
+import std::test::error;
+import std::test::assert;
+
+/// Stand-in for `Future`: one associated type, filled by the positional sugar a
+/// where-bound writes (`Prod<R>` means `Out = R`).
+type trait Prod {
+    type Out;
+
+    take_out(mut &this) -> This::Out;
+}
+
+type struct Src<O> {
+    v: O;
+}
+
+implement<O> trait Prod<O> for struct Src<O> {
+    take_out(mut &this) -> O { return this.v; }
+}
+
+/// Lets each shape below expose its result through one assoc-typed method, so
+/// the bound that matters stays on the impl block — exactly where `TryJoin`
+/// carries it.
+type trait Run {
+    type Val;
+
+    run(mut &this) -> This::Val;
+}
+
+
+/// The `try_join` shape: the type mentions the source params AND the params
+/// reachable only through the nested `Result` in the bound.
+type struct Combine<A, B, T1, T2, E> {
+    a: A;
+    b: B;
+}
+
+implement<A, B, T1, T2, E> trait Run<Result<(T1, T2), E>> for struct Combine<A, B, T1, T2, E>
+where A: Prod<Result<T1, E>>, B: Prod<Result<T2, E>> {
+    /// Both values, or the first error — `try_join`'s contract, run eagerly.
+    run(mut &this) -> Result<(T1, T2), E> {
+        mut x: T1 = match (this.a.take_out()) {
+            Result::Ok(v)  => { v }
+            Result::Err(e) => { return Result::Err(e); }
+        };
+        mut y: T2 = match (this.b.take_out()) {
+            Result::Ok(v)  => { v }
+            Result::Err(e) => { return Result::Err(e); }
+        };
+        return Result::Ok((x, y));
+    }
+}
+
+/// The `join` shape: the slot arg IS the param. Pre-existing, must keep working.
+type struct Pair<A, B, OA, OB> {
+    a: A;
+    b: B;
+}
+
+implement<A, B, OA, OB> trait Run<(OA, OB)> for struct Pair<A, B, OA, OB>
+where A: Prod<OA>, B: Prod<OB> {
+    run(mut &this) -> (OA, OB) {
+        mut x: OA = this.a.take_out();
+        mut y: OB = this.b.take_out();
+        return (x, y);
+    }
+}
+
+/// Two levels of nesting, so the pairing recursion is exercised past one step.
+type struct Deep<A, T, E> {
+    a: A;
+}
+
+implement<A, T, E> trait Run<Option<Result<T, E>>> for struct Deep<A, T, E>
+where A: Prod<Option<Result<T, E>>> {
+    run(mut &this) -> Option<Result<T, E>> { return this.a.take_out(); }
+}
+
+/// A nested arg with one open and one FIXED position: `boolean` names no param
+/// and must fill no slot, while `T1` still binds.
+type struct HalfOpen<A, T1> {
+    a: A;
+}
+
+implement<A, T1> trait Run<Result<T1, boolean>> for struct HalfOpen<A, T1>
+where A: Prod<Result<T1, boolean>> {
+    run(mut &this) -> Result<T1, boolean> { return this.a.take_out(); }
+}
+
+
+type struct Mk {
+    static combine<A, B, T1, T2, E>(a: A, b: B) -> Combine<A, B, T1, T2, E>
+    where A: Prod<Result<T1, E>>, B: Prod<Result<T2, E>> {
+        return Combine<A, B, T1, T2, E> { a: a, b: b };
+    }
+
+    static pair<A, B, OA, OB>(a: A, b: B) -> Pair<A, B, OA, OB>
+    where A: Prod<OA>, B: Prod<OB> {
+        return Pair<A, B, OA, OB> { a: a, b: b };
+    }
+
+    static deep<A, T, E>(a: A) -> Deep<A, T, E>
+    where A: Prod<Option<Result<T, E>>> {
+        return Deep<A, T, E> { a: a };
+    }
+
+    static half<A, T1>(a: A) -> HalfOpen<A, T1>
+    where A: Prod<Result<T1, boolean>> {
+        return HalfOpen<A, T1> { a: a };
+    }
+}
+
+
+// The core case: no turbofish anywhere, `T1`/`T2`/`E` recovered only by
+// destructuring the bound's nested `Result`.
+![test]
+function nested_bound_params_infer_without_a_turbofish() -> Result<(), TestError> {
+    mut c = Mk::combine(Src<Result<i64, i64>> { v: Result::Ok(3) },
+                        Src<Result<i64, i64>> { v: Result::Ok(4) });
+    const r: Result<(i64, i64), i64> = c.run();
+    const got: i64 = match (r) {
+        Result::Ok(p)  => { p.0 * 10 + p.1 }
+        Result::Err(e) => { -e }
+    };
+    return expect_eq(got, 34 as i64);
+}
+
+// The error path of the same instantiation: `E` really bound to `i64`.
+![test]
+function nested_bound_error_channel_carries_the_inferred_error_type() -> Result<(), TestError> {
+    mut c = Mk::combine(Src<Result<i64, i64>> { v: Result::Ok(3) },
+                        Src<Result<i64, i64>> { v: Result::Err(7) });
+    const r: Result<(i64, i64), i64> = c.run();
+    const got: i64 = match (r) {
+        Result::Ok(p)  => { p.0 * 10 + p.1 }
+        Result::Err(e) => { -e }
+    };
+    return expect_eq(got, -7 as i64);
+}
+
+// The two sides may carry DIFFERENT success types while sharing one error type,
+// which is what makes `T1` and `T2` separate parameters rather than one.
+![test]
+function nested_bound_infers_distinct_success_types_sharing_one_error() -> Result<(), TestError> {
+    mut c = Mk::combine(Src<Result<i64, i64>> { v: Result::Ok(5) },
+                        Src<Result<boolean, i64>> { v: Result::Ok(true) });
+    const r: Result<(i64, boolean), i64> = c.run();
+    const got: i64 = match (r) {
+        Result::Ok(p)  => { p.1 ? p.0 : -p.0 }
+        Result::Err(e) => { -e }
+    };
+    return expect_eq(got, 5 as i64);
+}
+
+// Recursion past one level of nesting.
+//
+// The unwrap is written as nested match STATEMENTS assigning `got`, not as a
+// match expression whose arm is another match expression: that shape is
+// miscompiled independently of anything this file tests (the inner expression
+// yields the wrong arm's value, or fails LLVM verification when an arm reads a
+// bound payload), so writing it here would report a codegen defect as an
+// inference failure.
+![test]
+function doubly_nested_bound_param_infers() -> Result<(), TestError> {
+    mut d = Mk::deep(Src<Option<Result<i64, i64>>> { v: Option::Some(Result::Ok(9)) });
+    const r: Option<Result<i64, i64>> = d.run();
+    mut got: i64 = -1;
+    match (r) {
+        Option::Some(inner) => {
+            match (inner) {
+                Result::Ok(v)  => { got = v; }
+                Result::Err(e) => { got = -e; }
+            }
+        }
+        Option::None => { }
+    }
+    return expect_eq(got, 9 as i64);
+}
+
+// CONTROL: a fixed position inside the nested type fills no slot, and the open
+// one still binds.
+![test]
+function nested_bound_with_a_concrete_position_infers_only_the_open_one() -> Result<(), TestError> {
+    mut h = Mk::half(Src<Result<i64, boolean>> { v: Result::Ok(6) });
+    const r: Result<i64, boolean> = h.run();
+    const got: i64 = match (r) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { -1 }
+    };
+    return expect_eq(got, 6 as i64);
+}
+
+// CONTROL: the pre-existing direct shape (`join`'s) must infer exactly as
+// before — the fix reorganised the branch it takes.
+![test]
+function directly_bound_output_params_still_infer() -> Result<(), TestError> {
+    mut p = Mk::pair(Src<i64> { v: 11 }, Src<boolean> { v: true });
+    const r: (i64, boolean) = p.run();
+    const got: i64 = r.1 ? r.0 : -r.0;
+    return expect_eq(got, 11 as i64);
+}
+
+// CONTROL: bindings are per call. Two instantiations of one static in the same
+// program must each infer their own; a leaked binding would type the second
+// call's result as the first's.
+![test]
+function two_instantiations_of_one_static_infer_independently() -> Result<(), TestError> {
+    mut c1 = Mk::combine(Src<Result<i64, i64>> { v: Result::Ok(1) },
+                         Src<Result<i64, i64>> { v: Result::Ok(2) });
+    mut c2 = Mk::combine(Src<Result<boolean, i64>> { v: Result::Ok(false) },
+                         Src<Result<i64, i64>> { v: Result::Ok(8) });
+    const r1: Result<(i64, i64), i64> = c1.run();
+    const r2: Result<(boolean, i64), i64> = c2.run();
+    const a: i64 = match (r1) {
+        Result::Ok(p)  => { p.0 * 10 + p.1 }
+        Result::Err(e) => { -e }
+    };
+    const b: i64 = match (r2) {
+        Result::Ok(p)  => { p.0 ? p.1 : -p.1 }
+        Result::Err(e) => { -e }
+    };
+    return expect_eq(a * 100 + b, 1192 as i64);
+}

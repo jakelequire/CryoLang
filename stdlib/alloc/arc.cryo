@@ -1,9 +1,9 @@
-///! Arc<T, A>: atomic reference counting.
+///! Arc<T, A>: atomic reference counting, with weak references.
 ///!
 ///! `Arc<T, A>` is the thread-safe sibling of `Rc<T, A>`: it shares
 ///! ownership of a heap-allocated value among many holders, but the
-///! reference count is an `Atomic<u64>`, so multiple threads can clone
-///! and drop `Arc` handles concurrently without a data race.  `A`
+///! reference counts are `Atomic<u64>`, so multiple threads can clone
+///! and drop `Arc`/`Weak` handles concurrently without a data race.  `A`
 ///! defaults to `GlobalAlloc`, matching `Rc`.
 ///!
 ///! `Arc<T, A>` itself is structurally `Send + Sync` if both `T` and
@@ -22,8 +22,24 @@
 ///! mutation made by any thread that has already dropped its own
 ///! handle.
 ///!
-///! Like `Rc`, `Arc` does **not** support weak references.  Cycles
-///! through `Arc` pointers leak; callers must break them manually.
+///! ## Weak references
+///!
+///! `Weak<T, A>` is a non-owning handle from `Arc::downgrade`; recover a
+///! strong `Arc` with `upgrade` (a compare-exchange loop that fails once
+///! the strong count has reached 0, so it never resurrects a dead value).
+///! Weak references break `Arc` cycles, which would otherwise leak.
+///!
+///! ## Teardown in two phases
+///!
+///! `strong` counts live `Arc` handles.  `weak` counts live `Weak` handles
+///! PLUS one shared unit owned by the strong group, so `weak >= 1` while any
+///! `Arc` lives.  When `strong` hits 0 the value is dropped and the strong
+///! group's shared unit is released through the SAME atomic `weak` counter;
+///! whichever decrement takes `weak` to 0 - that release or the last
+///! surviving `Weak::drop` - frees the header.  Routing every header-free
+///! decision through the one atomic counter is what makes the race between
+///! "last `Arc` drops" and "a `Weak` drops" safe: there is never a moment
+///! where two threads read two separate counters and both decide to free.
 
 namespace std::alloc::arc;
 
@@ -36,15 +52,40 @@ import alloc::layout;
 import alloc::allocator;
 import sync::atomic;
 
-/// Heap-resident header shared by every `Arc<T, A>` clone.  The
-/// allocator instance lives here, not in the handle, so all clones
-/// agree on who frees the inner when the last refcount drops.  The
-/// `count` field is an `Atomic<u64>` for thread-safe increments and
-/// decrements.
+/// Heap-resident header shared by every `Arc<T, A>` and `Weak<T, A>` for one
+/// value.  The allocator instance lives here, not in the handles, so all of
+/// them agree on who frees the inner when the last reference drops.  Both
+/// counts are `Atomic<u64>` for lock-free increments and decrements; see the
+/// module docs for what `strong` and `weak` mean.
 type struct ArcInner<T, A> {
-    count: Atomic<u64>;
-    value: T;
-    alloc: A;
+    strong: Atomic<u64>;
+    weak:   Atomic<u64>;
+    value:  T;
+    alloc:  A;
+}
+
+/// Free the header through its own stored allocator, after the value has
+/// already been dropped and `weak` has reached 0.  The allocator is moved to
+/// a stack local before `deallocate` so the call does not reach into the
+/// memory it is reclaiming.
+private function free_arc_inner<T, A>(inner_ptr: ArcInner<T, A>*) -> void
+where A: Allocator {
+    mut alloc: A = inner_ptr.alloc;
+    const header: Layout = Layout::of<ArcInner<T, A>>();
+    alloc.deallocate(NonNull::new(inner_ptr as u8*), header);
+}
+
+/// Release one unit of the weak count (a `Weak` handle, or the strong
+/// group's shared unit) and free the header if it was the last.  The
+/// `Release` on the decrement plus the `Acquire` fence on the final path
+/// order the free after every prior weak release from any thread.
+private function release_weak<T, A>(inner_ptr: ArcInner<T, A>*) -> void
+where A: Allocator {
+    const prev: u64 = inner_ptr.weak.fetch_sub(1, MemoryOrder::Release);
+    if (prev == 1) {
+        atomic::fence(MemoryOrder::Acquire);
+        free_arc_inner<T, A>(inner_ptr);
+    }
 }
 
 type struct Arc<T, A = GlobalAlloc> {
@@ -82,54 +123,71 @@ type struct Arc<T, A = GlobalAlloc> {
         const raw: NonNull<u8> = alloc.allocate(header)?;
         const typed: NonNull<ArcInner<T, GlobalAlloc>> = raw.cast<ArcInner<T, GlobalAlloc>>();
         const inner_ptr: ArcInner<T, GlobalAlloc>* = typed.as_ptr();
-        inner_ptr.count = Atomic<u64>::new(1u64);
-        inner_ptr.value = value;
-        inner_ptr.alloc = alloc;
+        inner_ptr.strong = Atomic<u64>::new(1);
+        inner_ptr.weak   = Atomic<u64>::new(1);
+        inner_ptr.value  = value;
+        inner_ptr.alloc  = alloc;
         return Result::Ok(Arc<T, GlobalAlloc> { inner: inner_ptr });
     }
 
     /// Fallible constructor with a caller-supplied allocator.  The
     /// allocator instance is stored in the inner header and is used
-    /// to free the inner when the last refcount drops.
+    /// to free the inner when the last reference drops.
     static try_new_in(value: T, alloc: A) -> Result<Arc<T, A>, AllocError> {
         mut a: A = alloc;
         const header: Layout = Layout::of<ArcInner<T, A>>();
         const raw: NonNull<u8> = a.allocate(header)?;
         const typed: NonNull<ArcInner<T, A>> = raw.cast<ArcInner<T, A>>();
         const inner_ptr: ArcInner<T, A>* = typed.as_ptr();
-        inner_ptr.count = Atomic<u64>::new(1u64);
-        inner_ptr.value = value;
-        inner_ptr.alloc = a;
+        inner_ptr.strong = Atomic<u64>::new(1);
+        inner_ptr.weak   = Atomic<u64>::new(1);
+        inner_ptr.value  = value;
+        inner_ptr.alloc  = a;
         return Result::Ok(Arc<T, A> { inner: inner_ptr });
     }
 
     /// Produce another `Arc` pointing at the same value.  The two
-    /// handles are interchangeable; the refcount is incremented
+    /// handles are interchangeable; the strong count is incremented
     /// atomically with `Relaxed` ordering - the canonical Boost/Rust
     /// pattern: the new owner already shares a happens-before with
     /// the cloning thread, so no further synchronization is needed at
     /// clone time.
     clone(&this) -> Arc<T, A> {
         const inner_ptr: ArcInner<T, A>* = this.inner;
-        inner_ptr.count.fetch_add(1u64, MemoryOrder::Relaxed);
+        inner_ptr.strong.fetch_add(1, MemoryOrder::Relaxed);
         return Arc<T, A> { inner: this.inner };
+    }
+
+    /// A non-owning `Weak` handle to the same value.  Bumps the weak count
+    /// (`Relaxed` suffices: the new `Weak` shares a happens-before with this
+    /// thread already) but not the strong count.
+    downgrade(&this) -> Weak<T, A> {
+        const inner_ptr: ArcInner<T, A>* = this.inner;
+        inner_ptr.weak.fetch_add(1, MemoryOrder::Relaxed);
+        return Weak<T, A> { inner: this.inner };
     }
 
     /// Current strong-reference count.  Reads the atomic with
     /// `SeqCst`; treat this as advisory - by the time the caller
     /// uses the value another thread may have changed it.
     strong_count(&this) -> u64 {
-        return this.inner.count.load(MemoryOrder::SeqCst);
+        return this.inner.strong.load(MemoryOrder::SeqCst);
+    }
+
+    /// Number of live `Weak` handles (advisory).  The strong group's shared
+    /// unit is excluded, so this is 0 when no `Weak` has been created.
+    weak_count(&this) -> u64 {
+        return this.inner.weak.load(MemoryOrder::SeqCst) - 1;
     }
 
     /// Raw pointer to the shared value.  Valid for as long as *any*
-    /// clone of this `Arc` is still alive; dereferencing after the
+    /// strong clone of this `Arc` is still alive; dereferencing after the
     /// last `drop` is undefined.
     as_ptr(&this) -> T* {
         return &this.inner.value;
     }
 
-    /// Shared borrow of the value. Sound for reads while any clone is
+    /// Shared borrow of the value. Sound for reads while any strong clone is
     /// alive. For mutation use `get_mut` (gated on uniqueness); note
     /// that even with unique ownership, interior mutation visible across
     /// threads needs the value itself to be `Sync` (e.g. an atomic).
@@ -137,32 +195,125 @@ type struct Arc<T, A = GlobalAlloc> {
         return &this.inner.value;
     }
 
-    /// Mutable borrow only when this is the sole owner
-    /// (`strong_count == 1`, read with `Acquire` so the load is ordered
-    /// after any prior clone's release); otherwise `None`.
+    /// Mutable borrow only when this is the sole owner: exactly one strong
+    /// reference AND no outstanding `Weak` (`strong == 1 && weak == 1`, both
+    /// read with `Acquire`). With a single strong reference no other thread
+    /// holds an `Arc` to clone or downgrade from, so once both counts read 1
+    /// the access is exclusive; otherwise `None`.
     get_mut(mut &this) -> Option<T*> {
-        if (this.inner.count.load(MemoryOrder::Acquire) == 1u64) {
+        if (this.inner.strong.load(MemoryOrder::Acquire) == 1
+                && this.inner.weak.load(MemoryOrder::Acquire) == 1) {
             return Option::Some(&this.inner.value);
         }
         return Option::None;
     }
+
+    /// Consume this handle without touching the strong count, yielding the raw
+    /// header it referenced.  The caller inherits the one strong reference this
+    /// handle held and MUST later balance it - recover a handle with `from_raw`
+    /// and drop it, or call `decrement_strong_count` - or the value leaks.  The
+    /// consumed handle's own drop is suppressed (its `inner` is nulled), so
+    /// yielding the pointer here is not itself a decrement.  Enables a raw
+    /// `ArcInner*` to be parked in a `void*` slot (e.g. a manual-vtable waker)
+    /// outside the type system while still owning a reference.
+    into_raw(mut this) -> ArcInner<T, A>* {
+        const p: ArcInner<T, A>* = this.inner;
+        this.inner = null;
+        return p;
+    }
+
+    /// Reconstitute a handle from a pointer returned by `into_raw`, taking back
+    /// ownership of exactly one strong reference; the returned handle's drop
+    /// balances it.  Undefined unless `p` came from `into_raw` (or an
+    /// `increment_strong_count`) on an `Arc<T, A>` of this exact type whose
+    /// reference has not already been balanced.
+    static from_raw(p: ArcInner<T, A>*) -> Arc<T, A> {
+        return Arc<T, A> { inner: p };
+    }
+
+    /// Add one to the strong count of an `into_raw`'d header held only as a raw
+    /// pointer (no live handle).  Pairs one-for-one with a later
+    /// `decrement_strong_count`.  `Relaxed` matches `clone`: the new owner
+    /// already shares a happens-before edge with the caller.
+    static increment_strong_count(p: ArcInner<T, A>*) -> void {
+        p.strong.fetch_add(1, MemoryOrder::Relaxed);
+    }
+
+    /// Remove one strong reference from a header held only as a raw pointer,
+    /// running the value's destructor and freeing the header if it was the
+    /// last.  Balances one `into_raw` or `increment_strong_count` by routing
+    /// through the handle `Drop`, so the release/acquire teardown ordering is
+    /// identical.  Undefined if the reference was already balanced.
+    static decrement_strong_count(p: ArcInner<T, A>*) -> void
+    where T: Drop, A: Allocator {
+        mut a: Arc<T, A> = Arc::from_raw(p);
+        a.drop();
+    }
 }
 
-/// Decrement the refcount atomically; when the count reaches zero,
-/// call `T::drop()` on the shared value and free the underlying
-/// storage.  The `Release` ordering on `fetch_sub` plus the
-/// `Acquire` fence on the last-decrement path establishes a
-/// happens-before edge that synchronizes the final destructor with
-/// every prior write made by any thread that has already dropped its
-/// own handle.
+/// A non-owning reference to an `Arc`-managed value.  Obtain one with
+/// `Arc::downgrade`; recover a strong `Arc` (if the value still lives) with
+/// `upgrade`.  Holding a `Weak` keeps the header mapped but not the value.
+type struct Weak<T, A = GlobalAlloc> {
+    // Nullable, like `Arc::inner`: a dangling `Weak::new()` carries null and
+    // a dropped handle is nulled for idempotency.
+    inner: ArcInner<T, A>*;
+
+    /// A `Weak` that never upgrades.  Allocates nothing; `upgrade` always
+    /// returns `None`.
+    static new() -> Weak<T, GlobalAlloc> {
+        return Weak<T, GlobalAlloc> { inner: null };
+    }
+
+    /// Try to obtain a strong `Arc`.  Returns `None` once the last strong
+    /// reference has gone, or for a dangling `Weak::new()`.
+    ///
+    /// The compare-exchange loop reads the strong count and bumps it only if
+    /// it is still non-zero, retrying if a racing thread changed it in
+    /// between.  A `0` is final - the value has been dropped - so upgrade can
+    /// never resurrect it.  `Acquire` on success pairs with the release in
+    /// the drop that last touched the value, ordering this handle's reads
+    /// after the producer's writes.
+    upgrade(&this) -> Option<Arc<T, A>> {
+        if (this.inner == null) { return Option::None; }
+        const inner_ptr: ArcInner<T, A>* = this.inner;
+        mut n: u64 = inner_ptr.strong.load(MemoryOrder::Relaxed);
+        loop {
+            if (n == 0) { return Option::None; }
+            match (inner_ptr.strong.compare_exchange(
+                       n, n + 1, MemoryOrder::Acquire, MemoryOrder::Relaxed)) {
+                Result::Ok(_)       => { return Option::Some(Arc<T, A> { inner: inner_ptr }); }
+                Result::Err(actual) => { n = actual; }
+            }
+        }
+    }
+
+    /// Another `Weak` to the same value.  Bumps the weak count.
+    clone(&this) -> Weak<T, A> {
+        if (this.inner != null) {
+            const inner_ptr: ArcInner<T, A>* = this.inner;
+            inner_ptr.weak.fetch_add(1, MemoryOrder::Relaxed);
+        }
+        return Weak<T, A> { inner: this.inner };
+    }
+
+    /// Live strong count, or 0 for a dangling `Weak`.  Advisory.
+    strong_count(&this) -> u64 {
+        if (this.inner == null) { return 0; }
+        return this.inner.strong.load(MemoryOrder::SeqCst);
+    }
+}
+
+/// Decrement the strong count atomically.  When it reaches zero, run
+/// `T::drop()` on the shared value and release the strong group's shared
+/// weak unit; freeing the header falls to whichever weak release is last.
+/// The `Release` on `fetch_sub` plus the `Acquire` fence on the
+/// last-strong path establishes the happens-before edge that synchronizes
+/// the final destructor with every prior write from a thread that already
+/// dropped its own handle.
 ///
-/// As with `Rc`, the allocator instance lives in the inner header,
-/// so it must be moved out to a stack local *before* `deallocate`;
-/// otherwise the deallocate would free memory still being used by
-/// the allocator's own state.
-///
-/// Ownership obligation: every `Arc` handle must have `drop` called
-/// exactly once before going out of scope.
+/// Ownership obligation: every `Arc` handle must have `drop` called exactly
+/// once before going out of scope.
 implement<T, A> trait Drop for struct Arc<T, A>
 where T: Drop, A: Allocator {
     drop(mut &this) -> void {
@@ -170,17 +321,30 @@ where T: Drop, A: Allocator {
         const inner_ptr: ArcInner<T, A>* = this.inner;
         // `fetch_sub` returns the value BEFORE the decrement, so the
         // last owner is the one that observes `1` here.
-        const prev: u64 = inner_ptr.count.fetch_sub(1u64, MemoryOrder::Release);
-        if (prev == 1u64) {
-            // We are the last owner.  Acquire-fence to pair with the
-            // Release decrements of every prior thread, then run
-            // the destructor and free the inner.
+        const prev: u64 = inner_ptr.strong.fetch_sub(1, MemoryOrder::Release);
+        if (prev == 1) {
+            // We are the last strong owner.  Acquire-fence to pair with the
+            // Release decrements of every prior thread, run the destructor,
+            // then release the strong group's shared weak unit (which frees
+            // the header if no `Weak` outlives us).
             atomic::fence(MemoryOrder::Acquire);
             inner_ptr.value.drop();
-            mut alloc: A = inner_ptr.alloc;
-            const header: Layout = Layout::of<ArcInner<T, A>>();
-            alloc.deallocate(NonNull::new(this.inner as u8*), header);
+            release_weak<T, A>(inner_ptr);
         }
+        this.inner = null;
+    }
+}
+
+/// Decrement the weak count atomically; the last weak release frees the
+/// header.  By the time `weak` can reach 0 the strong group has already
+/// released its shared unit, so the value is gone and only the header
+/// remains to reclaim.
+implement<T, A> trait Drop for struct Weak<T, A>
+where T: Drop, A: Allocator {
+    drop(mut &this) -> void {
+        if (this.inner == null) { return; }
+        const inner_ptr: ArcInner<T, A>* = this.inner;
+        release_weak<T, A>(inner_ptr);
         this.inner = null;
     }
 }

@@ -5,6 +5,10 @@ on:
     branches: [main]
   push:
     branches: [main]
+  # Run CI on a branch without opening a PR first. Without this the workflow
+  # only ever fires against `main`, so a long-lived branch reaches the merge
+  # with no CI result at all.
+  workflow_dispatch:
 
 # Cancel superseded PR runs: a new push to a PR aborts its in-flight CI rather
 # than running redundant 20-40 min jobs to completion. Push runs on `main` are
@@ -51,6 +55,9 @@ jobs:
       - name: Run the test suite at -O0 (catch opt-level-dependent miscompiles)
         run: make test ARGS="--opt-level=0"
 
+      - name: Assert the discovered test roster matches the committed golden
+        run: make roster-check
+
       - name: Build the example projects (examples/*/ smoke gate)
         run: make examples
 
@@ -72,7 +79,13 @@ jobs:
           # cryolsp is a stdio JSON-RPC server (no --help). Smoke = it starts
           # and exits on its own when stdin closes, rather than hanging
           # (timeout -> 124) or dying on a signal (128+N).
-          printf '' | timeout 10 bin/cryolsp >/dev/null 2>&1; code=$?
+          #
+          # `|| code=$?` rather than `; code=$?`: the step runs under `bash -e`,
+          # where a bare failing command aborts before the tolerance check below
+          # can read its status - so an ordinary non-zero exit (cryolsp returns 1
+          # on EOF) failed the step with no diagnostic at all.
+          code=0
+          printf '' | timeout 10 bin/cryolsp >/dev/null 2>&1 || code=$?
           if [ "$code" -ge 124 ]; then
             echo "cryolsp hung or crashed on EOF (exit $code)"; exit 1
           fi

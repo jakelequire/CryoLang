@@ -16,12 +16,15 @@
 /// demand.  `resolve_call` + the method/arg-check methods that recurse into
 /// argument resolution take `visitor: ASTVisitor*`.
 ///
-/// GATED (R1/R2 - mono-after-sema): `try_resolve_static_method` +
-/// `resolve_static_method_return_via_template` + `infer_static_owner_return_from_args`
-/// (the literal-default-guess / Atomic<u64> trap) carry pre-mono re-derivation;
-/// `scope_is_generic_template` + `try_pin_overload_mangled_callee`'s no-op-on-template
-/// are the two-resolver "decline to pin" seams.  Tagged; the
-/// 3 inference copies collapse + the literal-default site hardens once mono-after-sema lands.
+/// R1/R2 (mono-after-sema): `compute_static_owner_bindings` is the SINGLE authority
+/// for owner type-arg inference on a generic-owner static call - it feeds the stash
+/// that mono consumes AND (via substitution into the abstract return) the return type
+/// in `resolve_static_method_return_via_template`; the return path no longer re-derives.
+/// The literal-default site is HARDENED: an unannotated literal-only owner binding is
+/// E0307 (`emit_static_owner_literal_default`), not a silent i32 guess; range-literal
+/// sugar is exempt (`owner_is_range_family`).  `scope_is_generic_template` +
+/// `try_pin_overload_mangled_callee`'s no-op-on-template remain the "decline to pin"
+/// seams (sema must not pin the un-specialized template form mono will pin).
 
 namespace Compiler::Sema::CallResolver;
 
@@ -44,6 +47,31 @@ import Compiler::Sema::{
 };
 import std::core::{ slice, option };
 import std::fmt;
+
+// Format-argument categories for the `printf`/`eprintf` directive checker.
+// A `%` conversion expects one of these; each variadic argument's resolved
+// type maps to one; a category mismatch (or a wrong argument count) is
+// reported as W0013.  `PF_NONE` doubles as "no argument" (for `%%` and
+// unknown conversions) and "cannot judge" (an unresolved/generic argument):
+// both mean "skip".
+const PF_NONE:    i64 = 0;
+const PF_INT:     i64 = 1;   // %d %i %u %x %X %o %c
+const PF_FLOAT:   i64 = 2;   // %f %e %g %a (and their capitals)
+const PF_STRING:  i64 = 3;   // %s  (a C `string`)
+const PF_POINTER: i64 = 4;   // %p
+const PF_STRUCT:  i64 = 5;   // an aggregate argument - never valid for C printf
+
+/// Scope class of a bare-call overload candidate relative to the use site,
+/// nearest first: `Imported` (the current module or an explicit import),
+/// `Prelude` (auto-in-scope via std::prelude, incl. declared intrinsics),
+/// `Global` (un-namespaced legacy claims), `Hidden` (a module the use site
+/// never imported - must not capture a bare call).
+type enum BareCandidateScope {
+    Imported;
+    Prelude;
+    Global;
+    Hidden;
+}
 
 type struct CallResolver {
     arena:    TypeArena*;
@@ -110,10 +138,28 @@ type struct CallResolver {
         const n: ASTNode* = callee as ASTNode*;
         if (n.kind == NodeKind::Identifier) {
             const ident: IdentifierNode* = callee as IdentifierNode*;
-            const bare: TypeRef = this.ctx.decl_index.lookup_func_type(ident.name);
-            if (bare.is_valid()) { return bare; }
+            // A local binding (closure, fn-pointer, plain value) shadows any
+            // free function sharing its leaf name: hint from the local's own
+            // type when it is callable, never from the free-function index.
+            const local: TypeRef = this.scopes.lookup_local(ident.name);
+            if (local.is_valid()) {
+                const local_t: Type* = this.arena.lookup(local.id);
+                if (local_t != null && local_t.kind == TypeKind::Function) { return local; }
+                return TypeRef::invalid();
+            }
+            // Current module's own signature FIRST: the bare `func_type_refs`
+            // slot is single-slot last-write-wins across EVERY module that
+            // defines this leaf, and module registration order is not
+            // meaningful (it varies with host path/enumeration order).  An
+            // unqualified call in a defining module must take the module-local
+            // signature; a wrong same-leaf signature here poisons
+            // expected-type propagation into the arguments - a generic-enum
+            // literal arg (`classify(Option::Some(-3))`) then never
+            // instantiates and codegen drops its payload store entirely.
             const q_sym: SymbolStr = this.ctx.qualify_symbol_sym(ident.name);
-            return this.ctx.decl_index.lookup_func_type(q_sym);
+            const qual: TypeRef = this.ctx.decl_index.lookup_func_type(q_sym);
+            if (qual.is_valid()) { return qual; }
+            return this.ctx.decl_index.lookup_func_type(ident.name);
         }
         if (n.kind == NodeKind::ScopeResolution) {
             const sr: ScopeResolutionNode* = callee as ScopeResolutionNode*;
@@ -136,6 +182,89 @@ type struct CallResolver {
 
     /// Arity-matching method overloads' non-receiver param types for `member`, as
     /// an expected-type hint (a position-wise merge where all overloads agree).
+    /// Declared parameter types of `method_name` on the GENERIC TEMPLATE whose
+    /// uninstantiated arena type is `base`, read from the template's own AST.
+    ///
+    /// A template's arena node holds no methods: TypeResolution skips generic
+    /// declarations, because their field and parameter types still mention
+    /// unbound parameters and baking those in would size the type wrongly. Only
+    /// the specializations get populated, and they do not exist while the
+    /// symbolic walk is still looking at the template. The declaration does.
+    ///
+    /// The types handed back may still mention the template's own parameters.
+    /// That is enough for what this feeds — `classify_args_from_params` asks
+    /// only whether a parameter is a reference or a pointer, and substituting
+    /// type arguments never changes that. A parameter whose type has not been
+    /// resolved at all comes back invalid, which that caller already skips, so
+    /// such a slot is left exactly as unclassified as it was before.
+    ///
+    /// Both places a template's instance methods can be declared are searched:
+    /// its own body, and any `implement` block registered against it.
+    param_types_from_template_decl(mut &this, base: TypeRef, method_name: SymbolStr,
+                                   arg_count: i64) -> TypeRef[] {
+        const greg: GenericRegistry* = this.ctx.generic_registry;
+        if (greg == null || !base.is_valid()) { return []; }
+        const bt: Type* = this.arena.lookup(base.id);
+        if (bt == null) { return []; }
+        mut owner: SymbolStr = SymbolStr::empty();
+        if (bt.kind == TypeKind::Struct) {
+            owner = (bt as StructType*).qualified_name;
+        } else if (bt.kind == TypeKind::Class) {
+            owner = (bt as ClassType*).qualified_name;
+        } else {
+            return [];
+        }
+        const tmpl: TemplateEntry* = greg.get_template(owner);
+        if (tmpl == null) { return []; }
+
+        if (tmpl.ast_node != null) {
+            if (tmpl.node_kind == NodeKind::StructDeclaration) {
+                const r: TypeRef[] = this.scan_decl_method_param_types(
+                    &(tmpl.ast_node as StructDeclNode*).methods, method_name, arg_count);
+                if (r.length > 0) { return r; }
+            } else if (tmpl.node_kind == NodeKind::ClassDeclaration) {
+                const r: TypeRef[] = this.scan_decl_method_param_types(
+                    &(tmpl.ast_node as ClassDeclNode*).methods, method_name, arg_count);
+                if (r.length > 0) { return r; }
+            }
+        }
+        for (mut i: i64 = 0; i < tmpl.impl_blocks.length; i++) {
+            const ib: ImplBlockNode* = tmpl.impl_blocks[i];
+            if (ib == null) { continue; }
+            const r: TypeRef[] = this.scan_decl_method_param_types(
+                &ib.methods, method_name, arg_count);
+            if (r.length > 0) { return r; }
+        }
+        return [];
+    }
+
+    /// The non-self parameter types of the first method in `methods` named
+    /// `method_name` and taking `arg_count` of them. The receiver is excluded,
+    /// because `MethodInfo.param_types` is by contract the non-self parameters
+    /// and this stands in for it.
+    scan_decl_method_param_types(mut &this, methods: &MethodNode*[],
+                                 method_name: SymbolStr, arg_count: i64) -> TypeRef[] {
+        const this_amp: SymbolStr = this.ctx.intern_table.intern("&this");
+        const this_val: SymbolStr = this.ctx.intern_table.intern("this");
+        for (mut i: i64 = 0; i < methods.length; i++) {
+            const mnode: MethodNode* = methods[i];
+            if (mnode == null || mnode.func == null) { continue; }
+            const fn_node: FunctionDeclNode* = mnode.func;
+            if (!fn_node.name.equals(method_name)) { continue; }
+            mut ptypes: TypeRef[] = [];
+            for (mut pi: i64 = 0; pi < fn_node.parameters.length; pi++) {
+                const pp: VarDeclNode* = fn_node.parameters[pi];
+                if (pp == null) { continue; }
+                if (pp.name.equals(this_amp)) { continue; }
+                if (pp.name.equals(this_val)) { continue; }
+                ptypes.push(pp.resolved_type);
+            }
+            if (ptypes.length != arg_count) { continue; }
+            return ptypes;
+        }
+        return [];
+    }
+
     lookup_method_param_types(mut &this, visitor: ASTVisitor*, member: MemberAccessNode*,
                               arg_count: i64) -> TypeRef[] {
         const obj_type: TypeRef = this.dispatch.resolve_expr(visitor, member.object);
@@ -148,8 +277,29 @@ type struct CallResolver {
                 TypeKind::Reference => { base_t = this.arena.lookup((base_t as ReferenceType*).referent.id); }
                 TypeKind::InstantiatedType => {
                     const inst: InstantiatedType* = base_t as InstantiatedType*;
-                    if (!inst.has_resolved_type()) { break; }
-                    base_t = this.arena.lookup(inst.resolved_type.id);
+                    if (inst.has_resolved_type()) {
+                        base_t = this.arena.lookup(inst.resolved_type.id);
+                    } else {
+                        // A SYMBOLIC instantiation - `Gen<S>` seen from inside
+                        // `Gen<S>`'s own body - has no resolved type: nothing has
+                        // monomorphized it yet, and its arena node carries no
+                        // methods either, because TypeResolution skips generic
+                        // declarations outright. Its DECLARATION is the only place
+                        // the signature exists yet, so read it from there.
+                        //
+                        // Left unhandled this returned NO parameter types, so every
+                        // argument of `this.m(x)` inside a generic owner's own body
+                        // stayed `Unclassified` - and the two consumers of that
+                        // default disagree by design: the async substitution reads
+                        // an unclassified by-value argument as a BORROW and emits a
+                        // pointer read, which the move passes then see as moving an
+                        // owning value out of a pointer (E0453). Same failure, same
+                        // cause and same fix as the `GenericParam` arm below, one
+                        // level out: there the receiver IS a generic parameter,
+                        // here it is an instantiation mentioning one.
+                        return this.param_types_from_template_decl(
+                            inst.generic_base, member.member, arg_count);
+                    }
                 }
                 _ => { break; }
             }
@@ -181,6 +331,16 @@ type struct CallResolver {
                     if (m.name.equals(member.member) && m.param_types.length == arg_count) { found.push(m); }
                 }
             }
+        } else if (base_t.kind == TypeKind::GenericParam) {
+            // A parameter bounded by a WHERE clause rather than inline stays a
+            // plain `GenericParam` — its bounds live on the enclosing function
+            // or impl node, not on the type — so the receiver cannot answer
+            // this and the enclosing bounds must. Left unhandled, every
+            // argument of `this.inner.write_from(buf)` under
+            // `where S: AsyncTransport` stays `Unclassified` and each consumer
+            // guesses its own answer.
+            return this.binding.param_types_through_param_bounds(
+                (base_t as GenericParamType*).param_name, member.member, arg_count);
         } else {
             return [];
         }
@@ -230,11 +390,13 @@ type struct CallResolver {
                     const alias: TypeAliasType* = exp_t as TypeAliasType*;
                     if (alias.has_target()) { exp_ref = alias.target; exp_t = this.arena.lookup(exp_ref.id); }
                 }
-                if (exp_t != null && exp_t.kind == TypeKind::InstantiatedType) {
-                    const exp_inst: InstantiatedType* = exp_t as InstantiatedType*;
-                    if (exp_inst.generic_base.id == type_ref.id && exp_inst.has_resolved_type()) {
-                        enum_t = this.arena.lookup(exp_inst.resolved_type.id);
-                    }
+                // Generic-identity view, not a raw `kind == InstantiatedType` test:
+                // under single-id identity the expected type may already BE the
+                // concrete specialization sitting at the former wrapper's id, and
+                // a concrete carries its own base + args.
+                if (this.types.view_generic_base(exp_ref).id == type_ref.id) {
+                    const spec: TypeRef = this.types.view_concrete_of(exp_ref);
+                    if (spec.is_valid()) { enum_t = this.arena.lookup(spec.id); }
                 }
             }
         }
@@ -249,11 +411,14 @@ type struct CallResolver {
                 const alias2: TypeAliasType* = exp_t2 as TypeAliasType*;
                 if (alias2.has_target()) { exp_ref2 = alias2.target; exp_t2 = this.arena.lookup(exp_ref2.id); }
             }
-            if (exp_t2 != null && exp_t2.kind == TypeKind::InstantiatedType) {
-                const exp_inst2: InstantiatedType* = exp_t2 as InstantiatedType*;
-                if (exp_inst2.generic_base.id == type_ref.id) {
-                    return this.substitute_payload_types(variant.payload_types, type_ref, exp_inst2.type_args);
-                }
+            // Same single-id concern as above: a post-mono concrete expected type
+            // still yields its `(generic_base, type_args)` through the view, so a
+            // nested construction (`Result::Ok(Option::Some(x))`) gets the
+            // SUBSTITUTED payload (`Option<u8>`) pushed as its argument hint
+            // instead of falling through to the abstract `T` below.
+            if (this.types.view_generic_base(exp_ref2).id == type_ref.id) {
+                const exp_args: TypeRef[] = this.types.view_type_args_copy(exp_ref2);
+                return this.substitute_payload_types(variant.payload_types, type_ref, &exp_args);
             }
         }
         return sema_copy_type_refs(&variant.payload_types);
@@ -294,6 +459,115 @@ type struct CallResolver {
         return result;
     }
 
+    /// `call`'s declared parameter types viewed through its OWNER's type
+    /// arguments, for expected-type propagation only.  Invalid at every position
+    /// needing no substitution, so the caller falls back to the declared type.
+    ///
+    /// A method or static declared on a generic owner states its formals in the
+    /// OWNER's parameters - `Atomic<T>::store(val: T, ..)` - and they arrive at
+    /// `resolve_call` unsubstituted, because the signature it reads is the
+    /// template's.  The numeric rules there require a CONCRETE numeric slot, so
+    /// none of them fire on an abstract `T`: `a.store(1, ..)` leaves the literal
+    /// at its i32 default even though the receiver already states the width, and
+    /// the caller has to spell it out.
+    ///
+    /// Deliberately a SEPARATE array rather than a rewrite of `param_types`:
+    /// those same types feed `classify_args_from_params`, which derives each
+    /// argument's move/borrow classification from them, so substituting in place
+    /// would flip classifications for every call on a generic owner in the
+    /// program.  Only a substitution landing on an adoptable numeric type is
+    /// recorded - the sole kind the propagation can consume - so no other
+    /// consumer of the call's typing can observe this.
+    ///
+    /// Owner parameters are matched by NAME against the template's declared
+    /// list, never by `param_index`: a METHOD-level parameter carries an index
+    /// into the method's own list, and reading the owner's argument at that
+    /// index would substitute an unrelated type.  A name the owner does not
+    /// declare yields no hint, which is what keeps `NlsBox<S>::take<T>(v: T)`
+    /// inferring `T` from the argument as before.
+    owner_generic_numeric_hints(mut &this, call: CallExprNode*,
+                                param_types: &TypeRef[]) -> TypeRef[] {
+        mut out: TypeRef[] = [];
+        for (mut i: i64 = 0; i < param_types.length; i++) { out.push(TypeRef::invalid()); }
+        if (out.length == 0) { return out; }
+        if (this.ctx.generic_registry == null) { return out; }
+
+        mut any_abstract: boolean = false;
+        for (mut i: i64 = 0; i < param_types.length; i++) {
+            if (param_types[i].is_valid() && this.types.contains_generic_param(param_types[i])) {
+                any_abstract = true;
+                break;
+            }
+        }
+        if (!any_abstract) { return out; }
+
+        // The owner's (declared params, bound args).  An instance call reads
+        // them off the receiver; a static call off the scope's turbofish, which
+        // is the only place they are written.
+        mut tmpl: TemplateEntry* = null;
+        mut owner_args: TypeRef[] = [];
+        const callee_node: ASTNode* = call.callee as ASTNode*;
+        if (callee_node.kind == NodeKind::MemberAccess) {
+            const member: MemberAccessNode* = call.callee as MemberAccessNode*;
+            if (member.object == null) { return out; }
+            const recv: TypeRef = member.object.resolved_type;
+            // Generic-identity view, not a raw kind test: the receiver may be a
+            // pre-mono `InstantiatedType` wrapper or a post-mono concrete
+            // aggregate, and both answer through it.  Pointer/reference layers
+            // are peeled for free.
+            const base: TypeRef = this.types.view_generic_base(recv);
+            if (!base.is_valid()) { return out; }
+            tmpl = this.ctx.generic_registry.get_template_by_type_id(base.id);
+            owner_args = this.types.view_type_args_copy(recv);
+        } else if (callee_node.kind == NodeKind::ScopeResolution) {
+            const sr: ScopeResolutionNode* = call.callee as ScopeResolutionNode*;
+            if (sr.scope_generic_args.length == 0) { return out; }
+            if (this.ctx.type_resolver == null) { return out; }
+            tmpl = this.lookup_scope_template(sr.scope_name);
+            if (tmpl == null) { return out; }
+            mut res_ctx: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
+            this.symbolic.symbolic_bind_params(&res_ctx);
+            for (mut i: i64 = 0; i < sr.scope_generic_args.length; i++) {
+                owner_args.push(this.ctx.type_resolver.resolve(sr.scope_generic_args[i], &res_ctx));
+            }
+            if (owner_args.length < tmpl.param_count) {
+                owner_args = this.ctx.type_resolver.expand_default_type_args(
+                    tmpl, owner_args, &res_ctx);
+            }
+        } else {
+            return out;
+        }
+        if (tmpl == null) { return out; }
+        if (tmpl.param_names.length != owner_args.length) { return out; }
+
+        for (mut i: i64 = 0; i < param_types.length; i++) {
+            if (!param_types[i].is_valid()) { continue; }
+            const pt: Type* = this.arena.lookup(param_types[i].id);
+            if (pt == null) { continue; }
+            mut pname: SymbolStr = SymbolStr::empty();
+            mut named: boolean = false;
+            if (pt.kind == TypeKind::GenericParam) {
+                pname = (pt as GenericParamType*).param_name;
+                named = true;
+            } else if (pt.kind == TypeKind::BoundedParam) {
+                pname = (pt as BoundedParamType*).param_name;
+                named = true;
+            }
+            if (!named) { continue; }
+            for (mut p: i64 = 0; p < tmpl.param_names.length; p++) {
+                if (!tmpl.param_names[p].equals(pname)) { continue; }
+                // Inside the owner's own template body the argument is still the
+                // symbolic parameter, which is not numeric - so the body's own
+                // literals keep defaulting, exactly as before.
+                if (is_adoptable_numeric_type(this.arena, owner_args[p])) {
+                    out[i] = owner_args[p];
+                }
+                break;
+            }
+        }
+        return out;
+    }
+
 
     // -- The central dispatcher --
 
@@ -323,6 +597,17 @@ type struct CallResolver {
                 param_types = this.lookup_scope_variant_payload_types(call.callee as ScopeResolutionNode*);
             }
         }
+        // A scope that names a MODULE rather than a type or enum reaches none of
+        // the above: the first two ask for a type-scoped name and the third for
+        // an enum variant.  Resolved through the module graph so a namespace
+        // written as a suffix (`mem` for `std::core::mem`) is found.
+        if (param_types.length == 0) {
+            const callee_node: ASTNode* = call.callee as ASTNode*;
+            if (callee_node.kind == NodeKind::ScopeResolution) {
+                param_types = this.lookup_module_qualified_param_types(
+                    call.callee as ScopeResolutionNode*, call);
+            }
+        }
         // For an EXPLICIT generic free call (`passthru<i32>(...)`), the param
         // types above came from the template fn type and still carry the
         // template's generic params (e.g. `Option<Option<T>>`).  Substitute the
@@ -331,27 +616,75 @@ type struct CallResolver {
         // would adopt the unbound `T` verbatim, producing a size-0 unresolved
         // argument value that miscompiles (DirectPair `hi` becomes a null
         // operand at codegen).
-        param_types = this.substitute_explicit_generic_param_types(call, &param_types);
+        // Indices whose formal came from an EXPLICIT turbofish. Those must be
+        // pushed as the argument's expected type unconditionally: for a generic
+        // callee the argument's own type is what selects the specialization, so
+        // the literal-clearing default below (which a non-generic callee
+        // survives via the call boundary's integer width coercion) would bind
+        // the call to the wrong specialization.
+        mut forced_expected: boolean[] = [];
+        param_types = this.substitute_explicit_generic_param_types(
+            call, &param_types, &forced_expected);
+
+        // A formal stated in a generic OWNER's parameters (`Atomic<T>::store(val: T, ..)`)
+        // is abstract here, so every numeric rule below rejects it.  This is the
+        // same list viewed through the receiver's / turbofish's type arguments,
+        // filled only where that view is a concrete numeric slot; `param_types`
+        // itself must stay as declared, because `classify_args_from_params`
+        // reads it.  Empty for a non-generic owner.
+        const owner_hints: TypeRef[] = this.owner_generic_numeric_hints(call, &param_types);
 
         const saved_expected: TypeRef = this.state.expected_type;
         for (mut i: i64 = 0; i < call.arguments.length; i++) {
             mut push_expected: boolean = false;
+            if (i < forced_expected.length && forced_expected[i]) { push_expected = true; }
             const arg: ExpressionNode* = call.arguments[i];
-            if (arg != null && i < param_types.length && param_types[i].is_valid()) {
+            // The slot this argument actually binds: the owner-substituted view
+            // where there is one, the declared type otherwise.
+            mut slot: TypeRef = TypeRef::invalid();
+            if (i < param_types.length) { slot = param_types[i]; }
+            if (i < owner_hints.length && owner_hints[i].is_valid()) { slot = owner_hints[i]; }
+            if (arg != null && slot.is_valid()) {
                 const arg_node: ASTNode* = arg as ASTNode*;
                 if (arg_node.kind == NodeKind::ArrayLiteral) {
+                    push_expected = true;
+                } else if (arg_node.kind == NodeKind::TupleLiteral) {
+                    // Same reason as ArrayLiteral: an aggregate literal needs the
+                    // parameter type to hint its ELEMENTS, and
+                    // `resolve_tuple_literal` destructures it per position.
+                    // Without this the `else` below actively CLEARS the hint, so
+                    // a tuple literal in argument position had no hint by
+                    // construction and its integer elements defaulted to i32 -
+                    // which then relied on a tuple coercion branch in
+                    // `check_compatibility` that lowered to the wrong layout.
                     push_expected = true;
                 } else if (arg_node.kind == NodeKind::CallExpression
                         || arg_node.kind == NodeKind::ScopeResolution) {
                     push_expected = true;
                 } else if (is_negative_numeric_literal_expr(arg)
-                        && this.literals.is_signed_int_type(param_types[i])) {
+                        && this.literals.is_signed_int_type(slot)) {
                     push_expected = true;
                 } else if ((arg_node.kind == NodeKind::BinaryExpression
                             || arg_node.kind == NodeKind::UnaryExpression)
                         && is_constant_numeric_expr(arg)
                         && !is_negative_numeric_literal_expr(arg)
-                        && is_wide_int_type(this.arena, param_types[i])) {
+                        && is_wide_int_type(this.arena, slot)) {
+                    push_expected = true;
+                } else if (arg_node.kind == NodeKind::Literal
+                        && is_adoptable_numeric_type(this.arena, slot)) {
+                    // A numeric literal argument adopts the PARAMETER's type, the
+                    // same way one adopts a declaration's annotation.  The `else`
+                    // below otherwise CLEARS the hint, leaving the literal at its
+                    // default width: for floats that is fatal (a bare `1.5` takes
+                    // f64 and passes a `double` against a `float` signature, since
+                    // unlike integers there is no float coercion at the call
+                    // boundary, so `take_f32(1.5)` fails module verification), and
+                    // for integers it forces the caller to write the width by hand
+                    // - the parameter already states it, so `f(1)` binding a `u64`
+                    // slot should not need `f(1u64)`.  Restricted to a concrete
+                    // numeric slot: an unresolved generic parameter is a different
+                    // type kind, so the argument's own type still selects the
+                    // specialization.
                     push_expected = true;
                 } else if (arg_node.kind == NodeKind::UnaryExpression) {
                     // Address-of-a-literal arg (`&<literal>`) bound to a `&T`
@@ -364,7 +697,7 @@ type struct CallResolver {
                     // bytes. Scoped to a literal operand so `&place` / `&mut`
                     // argument typing is untouched.
                     const u_arg: UnaryExprNode* = arg as UnaryExprNode*;
-                    const pt_ref: Type* = this.arena.lookup(param_types[i].id);
+                    const pt_ref: Type* = this.arena.lookup(slot.id);
                     if (u_arg.op.lexeme == "&" && u_arg.operand != null
                         && u_arg.operand.kind == NodeKind::Literal
                         && pt_ref != null && pt_ref.kind == TypeKind::Reference) {
@@ -373,7 +706,7 @@ type struct CallResolver {
                 }
             }
             if (push_expected) {
-                this.state.expected_type = param_types[i];
+                this.state.expected_type = slot;
             } else {
                 this.state.expected_type = TypeRef::invalid();
             }
@@ -381,7 +714,11 @@ type struct CallResolver {
         }
         this.state.expected_type = saved_expected;
 
-        this.flag_autoref_from_params(call, param_types);
+        this.classify_args_from_params(call, param_types);
+
+        // Type-check a `printf`/`eprintf` call's `%` directives against its
+        // variadic arguments now that each argument carries a resolved type.
+        this.check_printf_call(call);
 
         const callee: ExpressionNode* = call.callee;
         const callee_node: ASTNode* = callee as ASTNode*;
@@ -395,6 +732,32 @@ type struct CallResolver {
             if (call.resolved_callee.is_valid()) {
                 const spec_ret: TypeRef = this.types.lookup_func_return(call.resolved_callee);
                 if (spec_ret.is_valid()) { return spec_ret; }
+                // The pin is ground truth: on a re-resolution of an
+                // already-pinned call (a match subject is resolved once
+                // standalone and once for arm binding), the name-based
+                // fallbacks below would re-derive the type from the BARE
+                // single-slot maps, which can belong to a different
+                // same-leaf declaration (an intrinsic-owned leaf keeps the
+                // intrinsic's i64, not the pinned `fs::write`'s Result).
+                // Read the pinned overload entry's own signature instead.
+                const pinned_ft: TypeRef =
+                    this.ctx.decl_index.lookup_func_type_by_mangled(call.resolved_callee);
+                if (pinned_ft.is_valid()) {
+                    const pinned_ret: TypeRef = this.overload_return_type(pinned_ft);
+                    if (pinned_ret.is_valid()) {
+                        // Returning early must not skip `![implicit]`
+                        // converter insertion for the pinned signature (a
+                        // call pinned outside the normal identifier flow
+                        // never reached check_call_arity).  Errorless: the
+                        // authoritative arg-check pass owns diagnostics.
+                        const pt_raw: Type* = this.arena.lookup(pinned_ft.id);
+                        if (pt_raw != null && pt_raw.kind == TypeKind::Function) {
+                            this.apply_implicit_conversions_only(visitor, call,
+                                (pt_raw as FunctionType*).param_types.as_slice());
+                        }
+                        return pinned_ret;
+                    }
+                }
             }
             if (inferred_generic_ret.is_valid()) { return inferred_generic_ret; }
             if (call.generic_args.length > 0) {
@@ -431,11 +794,11 @@ type struct CallResolver {
             const mret: TypeRef = this.resolve_method_call(visitor, callee as MemberAccessNode*, call);
             // A pinned non-generic method's return type overrides `mret` for a
             // genuine overload, but NOT when `mret` is a generic method's per-call
-            // primitive-scalar return: there the pin can be a SIBLING spec of a
-            // different instantiation, and `mret` is authoritative
-            // (`generic_scalar_return`).
+            // canonical (scalar or unit) return: there the pin can be a SIBLING
+            // spec of a different instantiation, and `mret` is authoritative
+            // (`generic_canonical_return`).
             if (mret.is_valid() && call.resolved_method != null
-                    && !this.generic_scalar_return(call, mret)) {
+                    && !this.generic_canonical_return(call, mret)) {
                 const ovl_rm: MethodNode* = call.resolved_method as MethodNode*;
                 if (ovl_rm != null && ovl_rm.func != null
                         && ovl_rm.func.generic_params.length == 0
@@ -462,26 +825,266 @@ type struct CallResolver {
         return this.dispatch.resolve_expr(visitor, callee);
     }
 
-    /// Mark by-value args bound to `&T` params with `autoref` (codegen takes the
-    /// address); leave explicit refs/pointers untouched.
-    flag_autoref_from_params(mut &this, call: CallExprNode*, param_types: TypeRef[]) -> void {
+    /// Record how each argument binds to the parameter it lands on.
+    ///
+    /// Two separate answers come out of the same parameter type:
+    ///   - `arg_binding` is the OWNERSHIP answer the move passes need.  A `&T`
+    ///     or `T*` parameter only ever receives an address, so the callee takes
+    ///     no ownership of the pointee; a bare `T` parameter receives the value
+    ///     and drops its own copy.
+    ///   - `autoref` is the narrower CODEGEN directive: take the address of a
+    ///     by-value argument standing in a `&T` slot.  A `T*` parameter needs no
+    ///     such fixup (the argument is already an address), which is why it must
+    ///     not be used to answer the ownership question - doing so classified
+    ///     every pointer-parameter argument as a by-value transfer.
+    ///
+    /// Arguments past the declared parameters (a variadic tail) are left
+    /// unclassified, which the move passes read as a transfer.
+    classify_args_from_params(mut &this, call: CallExprNode*, param_types: TypeRef[]) -> void {
         const lim: i64 = if (param_types.length < call.arguments.length) {
             param_types.length
         } else {
             call.arguments.length
         };
         for (mut j: i64 = 0; j < lim; j++) {
-            if (!this.types.is_reference_type(param_types[j])) { continue; }
             const arg: ExpressionNode* = call.arguments[j];
             if (arg == null) { continue; }
-            if (this.types.is_ref_or_ptr_type(arg.resolved_type)) { continue; }
-            arg.autoref = true;
+            if (!param_types[j].is_valid()) { continue; }
+            if (!this.types.is_ref_or_ptr_type(param_types[j])) {
+                arg.arg_binding = ArgBinding::ByValue;
+                continue;
+            }
+            arg.arg_binding = ArgBinding::Borrowed;
+            if (this.types.is_reference_type(param_types[j])
+                && !this.types.is_ref_or_ptr_type(arg.resolved_type)) {
+                arg.autoref = true;
+            }
         }
+    }
+
+    // -- printf/eprintf format-string checking (W0013) --
+    //
+    // The C variadic ABI does not type-check `printf`-family arguments, so a
+    // wrong specifier (`%s` on an integer, a `String` struct on `%s`, a
+    // missing or extra argument) is undefined behaviour.  When the format
+    // string is a literal we can parse its `%` conversions at compile time
+    // and warn on a category or count mismatch before it becomes UB.
+
+    /// Entry point: if `call` targets `printf`/`eprintf` with a string-literal
+    /// format, check its conversions against the variadic arguments.
+    check_printf_call(mut &this, call: CallExprNode*) -> void {
+        const leaf: SymbolStr = this.printf_callee_leaf(call.callee);
+        if (!leaf.is_valid()) { return; }
+        if (!(leaf.equals(this.intern.intern("printf"))
+              || leaf.equals(this.intern.intern("eprintf")))) {
+            return;
+        }
+        if (call.arguments.length == 0) { return; }
+        const fmt_arg: ExpressionNode* = call.arguments[0];
+        if (fmt_arg == null) { return; }
+        const fmt_ast: ASTNode* = fmt_arg as ASTNode*;
+        if (fmt_ast.kind != NodeKind::Literal) { return; }   // runtime format: not checkable
+        const lit: LiteralNode* = fmt_arg as LiteralNode*;
+        if (lit.literal_kind != LiteralKind::String) { return; }
+        this.check_printf_directives(call, lit);
+    }
+
+    /// The callee's leaf name, for a bare `printf(...)` (Identifier) or a
+    /// qualified `fmt::printf(...)` (ScopeResolution). Invalid otherwise.
+    printf_callee_leaf(&this, callee: ExpressionNode*) -> SymbolStr {
+        const node: ASTNode* = callee as ASTNode*;
+        if (node.kind == NodeKind::Identifier) {
+            return (callee as IdentifierNode*).name;
+        }
+        if (node.kind == NodeKind::ScopeResolution) {
+            return (callee as ScopeResolutionNode*).member_name;
+        }
+        return SymbolStr::empty();
+    }
+
+    /// Walk the format string's `%` conversions, checking each against the
+    /// corresponding variadic argument, then report a count mismatch.
+    check_printf_directives(mut &this, call: CallExprNode*, lit: LiteralNode*) -> void {
+        const fmt: string = lit.value;
+        const n: i64 = fmt.length() as i64;
+        const provided: i64 = call.arguments.length - 1;
+        mut arg_idx: i64 = 0;
+        mut i: i64 = 0;
+        while (i < n) {
+            if ((*(fmt + i) as char) != '%') { i += 1; continue; }
+            i += 1;
+            if (i >= n) { break; }                             // trailing '%'
+            if ((*(fmt + i) as char) == '%') { i += 1; continue; }  // %% literal
+
+            // flags
+            while (i < n && this.printf_is_flag(*(fmt + i) as char)) { i += 1; }
+            // width (a `*` takes an int argument)
+            if (i < n && (*(fmt + i) as char) == '*') {
+                arg_idx = this.printf_check_arg(call, arg_idx, provided, PF_INT, '*');
+                i += 1;
+            } else {
+                while (i < n && this.printf_is_digit(*(fmt + i) as char)) { i += 1; }
+            }
+            // precision
+            if (i < n && (*(fmt + i) as char) == '.') {
+                i += 1;
+                if (i < n && (*(fmt + i) as char) == '*') {
+                    arg_idx = this.printf_check_arg(call, arg_idx, provided, PF_INT, '*');
+                    i += 1;
+                } else {
+                    while (i < n && this.printf_is_digit(*(fmt + i) as char)) { i += 1; }
+                }
+            }
+            // length modifiers
+            while (i < n && this.printf_is_length(*(fmt + i) as char)) { i += 1; }
+            if (i >= n) { break; }
+            const conv: char = *(fmt + i) as char;
+            i += 1;
+            const cat: i64 = this.printf_conv_category(conv);
+            if (cat == PF_NONE) { continue; }   // unknown conversion: consumes no arg
+            arg_idx = this.printf_check_arg(call, arg_idx, provided, cat, conv);
+        }
+
+        // Only a shortfall (fewer arguments than conversions) is reported: a
+        // missing argument makes `printf` read a garbage value (real UB).
+        // An over-count is deliberately not flagged - it would false-positive
+        // whenever the format contains an embedded NUL, since Cryo's `\0`
+        // (and unsupported octal `\NNN`) escapes truncate the C string and
+        // hide the later conversions, e.g. an ANSI-colour `"\033[..."`
+        // literal. Truncation can only ever undercount conversions, so it
+        // never produces a false shortfall.
+        if (arg_idx > provided) {
+            this.emit_printf_too_few(lit, arg_idx, provided);
+        }
+    }
+
+    /// Check the argument at variadic position `arg_idx` against a directive
+    /// expecting `expected` (skipping when the argument is absent or its type
+    /// is unresolved), and return the next position.
+    printf_check_arg(mut &this, call: CallExprNode*, arg_idx: i64, provided: i64,
+                     expected: i64, conv: char) -> i64 {
+        if (arg_idx >= provided) { return arg_idx + 1; }   // missing: counted below
+        const arg: ExpressionNode* = call.arguments[1 + arg_idx];
+        if (arg == null) { return arg_idx + 1; }
+        const actual: i64 = this.printf_arg_category(arg.resolved_type);
+        if (actual == PF_NONE) { return arg_idx + 1; }     // unresolved/generic: skip
+        if (!this.printf_cat_compatible(expected, actual)) {
+            this.emit_printf_type_mismatch(arg, conv, expected, actual);
+        }
+        return arg_idx + 1;
+    }
+
+    /// True when an argument of category `actual` is acceptable for a
+    /// directive expecting `expected`. `%s`/`%p` accept either a C string or
+    /// a pointer (a `char*` is both); the numeric categories are exact.
+    printf_cat_compatible(&this, expected: i64, actual: i64) -> boolean {
+        if (expected == PF_INT)     { return actual == PF_INT; }
+        if (expected == PF_FLOAT)   { return actual == PF_FLOAT; }
+        if (expected == PF_STRING)  { return actual == PF_STRING || actual == PF_POINTER; }
+        if (expected == PF_POINTER) { return actual == PF_POINTER || actual == PF_STRING; }
+        return false;
+    }
+
+    /// A human-readable name for a format category, for diagnostics.
+    printf_cat_name(&this, cat: i64) -> string {
+        if (cat == PF_INT)     { return "an integer"; }
+        if (cat == PF_FLOAT)   { return "a float"; }
+        if (cat == PF_STRING)  { return "a C string (`string`)"; }
+        if (cat == PF_POINTER) { return "a pointer"; }
+        if (cat == PF_STRUCT)  { return "an aggregate (struct/array)"; }
+        return "a value";
+    }
+
+    printf_is_flag(&this, c: char) -> boolean {
+        return c == '-' || c == '+' || c == ' ' || c == '#' || c == '0';
+    }
+
+    printf_is_digit(&this, c: char) -> boolean {
+        return c >= '0' && c <= '9';
+    }
+
+    printf_is_length(&this, c: char) -> boolean {
+        return c == 'h' || c == 'l' || c == 'L' || c == 'z' || c == 'j' || c == 't';
+    }
+
+    /// The argument category a conversion character expects, or `PF_NONE`
+    /// for an unknown conversion (which we assume consumes no argument).
+    printf_conv_category(&this, c: char) -> i64 {
+        if (c == 'd' || c == 'i' || c == 'u' || c == 'x' || c == 'X'
+                || c == 'o' || c == 'c') { return PF_INT; }
+        if (c == 'f' || c == 'F' || c == 'e' || c == 'E'
+                || c == 'g' || c == 'G' || c == 'a' || c == 'A') { return PF_FLOAT; }
+        if (c == 's') { return PF_STRING; }
+        if (c == 'p' || c == 'n') { return PF_POINTER; }
+        return PF_NONE;
+    }
+
+    /// Map a resolved argument type to a format category. `PF_NONE` means the
+    /// type can't be judged (unresolved or still generic), so it is skipped.
+    printf_arg_category(&this, tref: TypeRef) -> i64 {
+        if (!tref.is_valid()) { return PF_NONE; }
+        const t: Type* = this.arena.lookup(tref.id);
+        if (t == null) { return PF_NONE; }
+        return match (t.kind) {
+            TypeKind::Int      => { PF_INT }
+            TypeKind::Char     => { PF_INT }
+            TypeKind::Bool     => { PF_INT }
+            TypeKind::Float    => { PF_FLOAT }
+            TypeKind::String   => { PF_STRING }
+            TypeKind::Pointer  => { PF_POINTER }
+            TypeKind::VaList   => { PF_POINTER }
+            TypeKind::Struct   => { PF_STRUCT }
+            TypeKind::Class    => { PF_STRUCT }
+            TypeKind::Enum     => { PF_STRUCT }
+            TypeKind::Array    => { PF_STRUCT }
+            TypeKind::Tuple    => { PF_STRUCT }
+            TypeKind::Optional => { PF_STRUCT }
+            _                  => { PF_NONE }
+        };
+    }
+
+    emit_printf_type_mismatch(mut &this, arg: ExpressionNode*, conv: char,
+                              expected: i64, actual: i64) -> void {
+        mut d: Diagnostic = Diagnostic::warning(
+            ErrorCode::W0013_FORMAT_STRING_MISMATCH,
+            format("`%%%c` expects %s, but this argument is %s",
+                conv as i64, this.printf_cat_name(expected), this.printf_cat_name(actual)));
+        d = d.at(arg.span);
+        if (actual == PF_STRUCT && expected == PF_STRING) {
+            d = d.with_note("`%s` needs a C `string` (`i8*`); `Str`/`String` are length-prefixed structs, not NUL-terminated pointers");
+            d = d.help("format via an f-string instead, e.g. `println(f\"{value}\")`, or pass `value.as_ptr()` / `value.with_null()`");
+        }
+        this.ctx.emit_diagnostic(d);
+    }
+
+    emit_printf_too_few(mut &this, lit: LiteralNode*,
+                        expected: i64, provided: i64) -> void {
+        mut d: Diagnostic = Diagnostic::warning(
+            ErrorCode::W0013_FORMAT_STRING_MISMATCH,
+            format("format string needs %lld argument(s), but only %lld were provided",
+                expected, provided));
+        d = d.at(lit.span);
+        d = d.with_note("a `%` conversion with no matching argument reads a garbage value at runtime");
+        this.ctx.emit_diagnostic(d);
     }
 
 
     // -- Generic free-call inference (the keystone) --
 
+    /// The generic function template a bare call names, or null when that can't
+    /// be decided.
+    ///
+    /// Candidates are every registered template with a matching leaf name and
+    /// arity, which spans the WHOLE program - templates are registered
+    /// globally, not per importer. So two unrelated modules each defining a
+    /// generic `min` both land here for either one's callers, and preferring a
+    /// module-local definition only settles the case where the caller defines
+    /// one itself. The deciding question for everyone else is which definition
+    /// the caller's imports actually bring into scope; the name resolver's
+    /// scope chain already answers it. Without that tier a same-named generic
+    /// anywhere in the program makes every call to either one return null here,
+    /// which skips generic inference entirely and leaves the call typed at its
+    /// abstract return type (reported far away as `expected i32, found T`).
     find_fn_template_for_call(&this, name: SymbolStr, argc: i64) -> TemplateEntry* {
         const reg: GenericRegistry* = this.ctx.generic_registry;
         if (reg == null) { return null; }
@@ -489,7 +1092,18 @@ type struct CallResolver {
         mut count: i64 = 0;
         mut module_match: TemplateEntry* = null;
         mut module_match_count: i64 = 0;
+        mut import_match: TemplateEntry* = null;
+        mut import_match_count: i64 = 0;
         const cur_mod: string = this.current_module_name();
+        // Empty when the name isn't a function visible from this scope, in
+        // which case no candidate can claim an import match and the ladder
+        // falls through to its previous behaviour.
+        mut vis_mod: string = "";
+        const resolver: Resolver* = this.ctx.get_resolver();
+        if (resolver != null) {
+            const vis_sym: SymbolStr = resolver.resolve_function_source_module(name);
+            if (vis_sym.is_valid()) { vis_mod = this.intern.resolve(vis_sym); }
+        }
         const total: i64 = reg.template_count();
         for (mut i: i64 = 0; i < total; i++) {
             const cand: TemplateEntry* = &reg.entries[i];
@@ -506,9 +1120,16 @@ type struct CallResolver {
                 module_match = cand;
                 module_match_count = module_match_count + 1;
             }
+            if (vis_mod != "" && cand_mod.eq(vis_mod)) {
+                import_match = cand;
+                import_match_count = import_match_count + 1;
+            }
         }
         if (count == 1) { return found; }
+        // A definition in the caller's own module wins over an imported one:
+        // that is ordinary shadowing, and it is what the previous ladder did.
         if (module_match_count == 1) { return module_match; }
+        if (import_match_count == 1) { return import_match; }
         return null;
     }
 
@@ -516,6 +1137,12 @@ type struct CallResolver {
     /// generic inference (adopts whatever a non-literal arg or context binds).
     sema_arg_is_polymorphic_literal(&this, expr: ExpressionNode*) -> boolean {
         if (expr == null) { return false; }
+        // A written-down type suffix is not a default to be adopted: it is the
+        // argument's type, and it is the ONLY signal available where the callee's
+        // type parameter is reachable from no other argument or context
+        // (`ident(7u64)`).  Skipping it here bound the parameter to the
+        // magnitude default instead, silently returning a wrong answer.
+        if (sema_expr_has_numeric_suffix(expr)) { return false; }
         const node: ASTNode* = expr as ASTNode*;
         if (node.kind == NodeKind::Literal) {
             const lit: LiteralNode* = expr as LiteralNode*;
@@ -588,11 +1215,25 @@ type struct CallResolver {
 
     /// Whether a call argument's `resolved_type` is authoritative enough pre-mono
     /// to drive an inference conflict / bound error.
+    ///
+    /// Inside a template body an abstract call type is not provisional - it IS
+    /// this walk's answer, and nothing before mono sharpens it. `this.pump(n)`
+    /// in `implement struct PConn<S>` is `PConn$pump$Future<S>`, and refusing it
+    /// left the ENCLOSING call's parameters unbound, so
+    /// `Futures::timeout(d, this.pump(n))` resolved to nothing at all inside a
+    /// generic impl. Outside a symbolic walk the old rule stands: a generic
+    /// param in a concrete body's call type means inference has not finished.
+    ///
+    /// This only decides whether the argument may BIND. Both callers gate their
+    /// conflict report on `free_infer_type_concrete` for each side separately,
+    /// so admitting an abstract type here cannot turn into a spurious E0214.
     free_infer_arg_reliable(&this, arg: ExpressionNode*) -> boolean {
         if (arg == null) { return false; }
         const node: ASTNode* = arg as ASTNode*;
         if (node.kind == NodeKind::CallExpression) {
-            return arg.resolved_type.is_valid() && !this.types.contains_generic_param(arg.resolved_type);
+            if (!arg.resolved_type.is_valid()) { return false; }
+            if (this.state.in_symbolic_check) { return true; }
+            return !this.types.contains_generic_param(arg.resolved_type);
         }
         return true;
     }
@@ -609,6 +1250,9 @@ type struct CallResolver {
         const tmpl: FunctionDeclNode* = entry.ast_node as FunctionDeclNode*;
         if (tmpl == null) { return TypeRef::invalid(); }
         if (entry.param_type_ids.length == 0) { return TypeRef::invalid(); }
+        // Record WHICH template won, not just the type args: only sema has the
+        // caller's import scope, so mono can't re-derive this choice.
+        call.set_resolved_template(entry.qualified_name);
 
         mut bindings: TypeRef[] = [];
         for (mut i: i64 = 0; i < entry.param_type_ids.length; i++) { bindings.push(TypeRef::invalid()); }
@@ -675,6 +1319,11 @@ type struct CallResolver {
                 }
                 ictx.unify(param.resolved_type, lit_actual);
             }
+            // PASS D - fill a param that appears only in a where-bound (the `R`
+            // in `where F: Future<R>`) by projecting it off the now-bound subject
+            // (`R = F::Output`), so a return-only bound param resolves from the
+            // arguments alone - no turbofish or expected-type context required.
+            this.project_where_bound_params(tmpl, entry, &ictx);
 
             for (mut i: i64 = 0; i < bindings.length; i++) { bindings[i] = ictx.bindings[i]; }
 
@@ -691,25 +1340,8 @@ type struct CallResolver {
         }
 
         // E0306 - where-clause bound satisfaction for the bound type args.
-        for (mut bi: i64 = 0; bi < tmpl.trait_bounds.length; bi++) {
-            const bound: TraitBound* = &tmpl.trait_bounds[bi];
-            mut idx: i64 = -1;
-            for (mut pi: i64 = 0; pi < entry.param_names.length; pi++) {
-                if (entry.param_names[pi].equals(bound.type_parameter)) { idx = pi; break; }
-            }
-            if (idx < 0 || idx >= bindings.length) { continue; }
-            const concrete: TypeRef = bindings[idx];
-            if (!concrete.is_valid()) { continue; }
-            if (this.types.contains_generic_param(concrete)) { continue; }
-            for (mut ri: i64 = 0; ri < bound.trait_refs.length; ri++) {
-                const tref: TraitRef* = &bound.trait_refs[ri];
-                if (tref.path.length == 0) { continue; }
-                const trait_name: SymbolStr = tref.path[tref.path.length - 1];
-                if (!this.trait_checker().type_implements_trait(concrete, trait_name, 0)) {
-                    this.emit_free_call_bound_failure(call, tmpl, tref, concrete, trait_name);
-                    return TypeRef::invalid();
-                }
-            }
+        if (!this.check_call_where_bounds(call, tmpl, entry, &bindings)) {
+            return TypeRef::invalid();
         }
 
         // KEYSTONE: stash all-bound bindings + substitute into the template return.
@@ -731,12 +1363,25 @@ type struct CallResolver {
     /// No-op when the callee isn't an identifier, has no explicit generic args,
     /// names no function template, or any binding fails to resolve.
     substitute_explicit_generic_param_types(mut &this, call: CallExprNode*,
-                                            param_types: &TypeRef[]) -> TypeRef[] {
+                                            param_types: &TypeRef[],
+                                            forced: mut &boolean[]) -> TypeRef[] {
         mut out: TypeRef[] = sema_copy_type_refs(param_types);
+        for (mut i: i64 = 0; i < out.length; i++) { forced.push(false); }
         if (out.length == 0) { return out; }
-        if (call.generic_args.length == 0) { return out; }
         if (this.ctx.generic_registry == null || this.ctx.type_resolver == null) { return out; }
         const callee_node: ASTNode* = call.callee as ASTNode*;
+        // A METHOD call carries its turbofish on the MemberAccess
+        // (`b.queue<u8>(0x42)`), not on the call node, so the identifier path
+        // below never sees one.  It needs the same substitution and for the
+        // same reason: leaving the formal `data: T` abstract pushes no expected
+        // type onto the argument, so a bare integer literal keeps its `i32`
+        // default -- and a wrongly typed argument then resolves the call to a
+        // SIBLING instantiation of the same method rather than the one the
+        // turbofish named.
+        if (callee_node.kind == NodeKind::MemberAccess) {
+            return this.substitute_explicit_method_param_types(call, &out, forced);
+        }
+        if (call.generic_args.length == 0) { return out; }
         if (callee_node.kind != NodeKind::Identifier) { return out; }
         const ident: IdentifierNode* = call.callee as IdentifierNode*;
         const entry: TemplateEntry* = this.find_fn_template_for_call(
@@ -764,7 +1409,93 @@ type struct CallResolver {
             const sub: TypeRef = subst.apply(out[pi], this.arena);
             if (sub.is_valid() && !this.types.contains_generic_param(sub)) {
                 out[pi] = sub;
+                if (pi < forced.length) { forced[pi] = true; }
             }
+        }
+        return out;
+    }
+
+    /// Substitute a METHOD call's explicit turbofish (`recv.m<u8>(x)`) into the
+    /// method's formal parameter types, so expected-type propagation pushes a
+    /// CONCRETE type onto each argument.
+    ///
+    /// Without it a polymorphic integer literal never learns the type the
+    /// turbofish named and falls back to `i32`, which does not match any
+    /// parameter shape of the intended specialization; the call then binds to
+    /// whichever sibling specialization of the same method the argument's type
+    /// happens to select, and the literal is passed in THAT spec's parameter
+    /// shape. That is a silent miscompile rather than a diagnostic: a
+    /// `queue<u8>(0x42)` bound to `queue<Slice<u8>>` hands the callee 66 as a
+    /// pointer.
+    ///
+    /// No-op unless the callee is a member access carrying a full-arity
+    /// turbofish for a locatable generic method whose args all resolve
+    /// concretely — every miss leaves the caller's types untouched.
+    substitute_explicit_method_param_types(mut &this, call: CallExprNode*,
+                                           param_types: &TypeRef[],
+                                           forced: mut &boolean[]) -> TypeRef[] {
+        mut out: TypeRef[] = sema_copy_type_refs(param_types);
+        const member: MemberAccessNode* = call.callee as MemberAccessNode*;
+        if (member == null || member.generic_args.length == 0) { return out; }
+        if (member.object == null) { return out; }
+        const recv_type: TypeRef = member.object.resolved_type;
+        if (!recv_type.is_valid()) { return out; }
+
+        mut orig_func: FunctionDeclNode* = null;
+        mut owner_ctx: ResolutionContext =
+            this.binding.find_generic_method_for_call(recv_type, member, &orig_func);
+        if (orig_func == null) { return out; }
+        const n_method_params: i64 = orig_func.generic_params.length;
+        if (n_method_params == 0) { return out; }
+        if (member.generic_args.length != n_method_params) { return out; }
+
+        // Resolve the turbofish in the CALLER's scope, not through `owner_ctx`:
+        // an owner binding would shadow an enclosing parameter that happens to
+        // share the receiver's parameter name. Mirrors the same choice in
+        // `MethodBinding::solve_method_bindings`.
+        mut tf_ctx: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
+        this.symbolic.symbolic_bind_params(&tf_ctx);
+        mut bindings: TypeRef[] = [];
+        for (mut i: i64 = 0; i < n_method_params; i++) {
+            const tr: TypeRef = this.ctx.type_resolver.resolve(member.generic_args[i], &tf_ctx);
+            if (!tr.is_valid()) { return out; }
+            // A still-abstract binding cannot type an argument in a concrete
+            // caller; leave the formals alone and let inference/mono decide.
+            if (this.types.contains_generic_param(tr)) { return out; }
+            bindings.push(tr);
+        }
+
+        // Re-resolve the formals with owner args concrete AND the method's own
+        // params bound, rather than substituting into the already-resolved
+        // types: resolution handles a param nested inside another type
+        // (`Array<T>`, `Option<T>`) for free.
+        mut pctx: ResolutionContext = owner_ctx.clone();
+        for (mut i: i64 = 0; i < n_method_params; i++) {
+            const gp: GenericParamNode* = orig_func.generic_params[i];
+            if (gp == null) { return out; }
+            pctx.add_binding(gp.name, bindings[i]);
+        }
+        pctx.set_this_type(recv_type);
+
+        const this_amp: SymbolStr = this.intern.intern("&this");
+        const this_val: SymbolStr = this.intern.intern("this");
+        mut explicit_params: VarDeclNode*[] = [];
+        for (mut i: i64 = 0; i < orig_func.parameters.length; i++) {
+            const p: VarDeclNode* = orig_func.parameters[i];
+            if (p == null) { continue; }
+            if (p.name.equals(this_amp) || p.name.equals(this_val)) { continue; }
+            explicit_params.push(p);
+        }
+        if (explicit_params.length != out.length) { return out; }
+
+        for (mut i: i64 = 0; i < out.length; i++) {
+            const p: VarDeclNode* = explicit_params[i];
+            if (p == null || p.type_annotation == null) { continue; }
+            const formal: TypeRef = this.ctx.type_resolver.resolve(p.type_annotation, &pctx);
+            if (!formal.is_valid()) { continue; }
+            if (this.types.contains_generic_param(formal)) { continue; }
+            out[i] = formal;
+            if (i < forced.length) { forced[i] = true; }
         }
         return out;
     }
@@ -775,14 +1506,40 @@ type struct CallResolver {
                            tmpl_ret: TypeRef) -> TypeRef {
         if (!tmpl_ret.is_valid()) { return TypeRef::invalid(); }
         if (bindings.length != entry.param_type_ids.length) { return TypeRef::invalid(); }
+        // A still-generic result is meaningless to a CONCRETE caller typed
+        // pre-mono, so it is rejected there. Inside the symbolic generic-body
+        // walk it is the correct answer: the caller's own parameters are abstract,
+        // so `mk<T>(v)` genuinely has type `W<T>`, and monomorphization
+        // substitutes it along with the rest of the body. Rejecting it there
+        // leaves the call untyped, which only shows up where something needs the
+        // type — `await f<T>(x)`, whose operand type IS the answer.
+        const symbolic: boolean = this.state.in_symbolic_check;
         for (mut i: i64 = 0; i < bindings.length; i++) {
             if (!bindings[i].is_valid()) { return TypeRef::invalid(); }
-            if (this.types.contains_generic_param(bindings[i])) { return TypeRef::invalid(); }
+            if (!symbolic && this.types.contains_generic_param(bindings[i])) {
+                return TypeRef::invalid();
+            }
         }
         mut subst: TypeSubstitution = TypeSubstitution::from_params(entry.param_type_ids, bindings);
         const out: TypeRef = subst.apply(tmpl_ret, this.arena);
-        if (!out.is_valid() || this.types.contains_generic_param(out)) { return TypeRef::invalid(); }
+        if (!out.is_valid()) { return TypeRef::invalid(); }
+        if (!symbolic && this.types.contains_generic_param(out)) { return TypeRef::invalid(); }
         return out;
+    }
+
+    /// Bound-directed projection ("PASS D") for a generic FREE-function call:
+    /// fill a param that appears only in a where-bound (the `R` in
+    /// `where F: Future<R>`) by projecting it off the now-bound subject
+    /// (`R = F::Output`). Thin wrapper over the shared
+    /// `TypeResolver::project_where_bound_params_into`, which the static + instance
+    /// generic-method paths share; the template's `param_names` are index-aligned
+    /// with `ictx.bindings`, exactly as that helper requires.
+    project_where_bound_params(mut &this, tmpl: FunctionDeclNode*, entry: TemplateEntry*,
+                               ictx: InferCtx*) -> void {
+        if (this.ctx.type_resolver == null) { return; }
+        this.ctx.type_resolver.project_where_bound_params_into(
+            &tmpl.trait_bounds, &entry.param_names, ictx, this.ctx.source_file,
+            this.state.in_symbolic_check);
     }
 
     /// PASS A/B/C argument inference returning the per-param bindings (no
@@ -832,6 +1589,10 @@ type struct CallResolver {
             if (f_idx >= 0 && ictx.bindings[f_idx].is_valid()) { continue; }
             ictx.unify(param.resolved_type, lit_actual);
         }
+        // PASS D - project a where-bound-only param off its now-bound subject
+        // (mirrors `check_generic_free_call`; keeps the qualified scope path,
+        // e.g. `future::block_on(fut)`, in step with the bare-identifier path).
+        this.project_where_bound_params(tmpl, entry, &ictx);
         mut bindings: TypeRef[] = [];
         for (mut i: i64 = 0; i < ictx.bindings.length; i++) { bindings.push(ictx.bindings[i]); }
         for (mut i: i64 = 0; i < bindings.length; i++) {
@@ -847,19 +1608,7 @@ type struct CallResolver {
         if (call == null || scope == null) { return; }
         if (call.resolved_type_args.length > 0) { return; }
         if (this.ctx.generic_registry == null || this.ctx.type_resolver == null) { return; }
-        const member_str: string = this.intern.resolve(scope.member_name);
-        mut entry: TemplateEntry* = null;
-        if (this.ctx.decl_index != null) {
-            const q: SymbolStr = this.ctx.resolve_scoped_or(scope.scope_name);
-            if (q.is_valid()) {
-                const qstr: string = this.intern.resolve(q) + "::" + member_str;
-                entry = this.ctx.generic_registry.get_template(this.intern.intern(qstr));
-            }
-        }
-        if (entry == null) {
-            const bstr: string = this.intern.resolve(scope.scope_name) + "::" + member_str;
-            entry = this.ctx.generic_registry.get_template(this.intern.intern(bstr));
-        }
+        const entry: TemplateEntry* = this.find_static_method_template(scope);
         if (entry == null || entry.node_kind != NodeKind::FunctionDeclaration) { return; }
         if (entry.param_type_ids.length == 0) { return; }
         const tmpl: FunctionDeclNode* = entry.ast_node as FunctionDeclNode*;
@@ -1090,15 +1839,17 @@ type struct CallResolver {
         } else {
             mut sr: ScopeResolutionNode* = new ScopeResolutionNode(
                 SymbolStr::from_id(type_name_id), SymbolStr::from_id(method_name_id), sp);
-            const tt: Type* = this.arena.lookup(to_ty.id);
-            if (tt != null && tt.kind == TypeKind::InstantiatedType) {
-                const it: InstantiatedType* = tt as InstantiatedType*;
+            // Generic-identity view: a post-mono concrete target still needs its
+            // type_args stamped onto the synthesized scope, or the converter call
+            // resolves against the bare generic scope name.
+            const n_args: i64 = this.types.view_type_arg_count(to_ty);
+            if (n_args > 0) {
                 mut gargs: TypeAnnotation*[] = [];
-                for (mut gi: i64 = 0; gi < it.type_args.length; gi++) {
+                for (mut gi: i64 = 0; gi < n_args; gi++) {
                     mut na: NamedAnnotation* = new NamedAnnotation {
                         name:         SymbolStr::empty(),
                         span:         sp,
-                        pre_resolved: it.type_args[gi],
+                        pre_resolved: this.types.view_type_arg_at(to_ty, gi),
                     };
                     gargs.push(new TypeAnnotation::Named(na));
                 }
@@ -1119,7 +1870,7 @@ type struct CallResolver {
     }
 
     /// Rewrite `call.arguments[idx]` through an implicit converter when one bridges
-    /// `arg_ty -> param_ty`; returns true iff converted.
+    /// `arg_ty -> param_ty`; returns true if converted.
     try_apply_implicit_conversion(mut &this, visitor: ASTVisitor*, call: CallExprNode*, idx: i64,
                                   arg: ExpressionNode*, arg_ty: TypeRef, param_ty: TypeRef) -> boolean {
         const c: ExpressionNode* = this.build_implicit_conversion(visitor, arg, arg_ty, param_ty);
@@ -1442,9 +2193,17 @@ type struct CallResolver {
         const qualified: SymbolStr = this.ctx.qualify_symbol_sym(ident.name);
         mut overloads: TypeRef[] = di.lookup_func_type_overloads(qualified);
         mut lookup_key: SymbolStr = qualified;
+        // Bare fallback: candidates may span modules (per-owner entries), so
+        // binding becomes import-scoped - see the candidate selection below.
+        mut scoped_bare: boolean = false;
+        mut owners:   u32[] = [];
+        mut mangleds: u32[] = [];
         if (overloads.length == 0) {
             overloads = di.lookup_func_type_overloads(ident.name);
+            owners    = di.lookup_func_overload_owners(ident.name);
+            mangleds  = di.lookup_func_overload_mangleds(ident.name);
             lookup_key = ident.name;
+            scoped_bare = true;
         }
         if (overloads.length == 0) { return TypeRef::invalid(); }
         if (overloads.length == 1) {
@@ -1453,6 +2212,8 @@ type struct CallResolver {
             if (unique_mangled.is_valid()) { call.set_resolved_callee(unique_mangled); }
             return this.overload_return_type(overloads[0]);
         }
+        // Signature-matching candidates (indices into the parallel arrays).
+        mut matches: i64[] = [];
         for (mut oi: i64 = 0; oi < overloads.length; oi++) {
             const ot: Type* = this.arena.lookup(overloads[oi].id);
             if (ot == null || ot.kind != TypeKind::Function) { continue; }
@@ -1469,11 +2230,165 @@ type struct CallResolver {
                 }
             }
             if (!all_match) { continue; }
+            matches.push(oi);
+        }
+        if (matches.length == 0) {
+            if (!scoped_bare) { return TypeRef::invalid(); }
+            // No exact signature match - commonly an integer literal narrower
+            // than the parameter (`realloc(p, 4096)`: i32 literal vs u64).
+            // The pre-scoping behavior pinned a globally-UNIQUE candidate
+            // blind (argument conversion is checked/handled downstream); with
+            // per-owner entries a leaf can be globally plural yet still
+            // unique in the nearest visible scope tier - preserve the blind
+            // pin at that granularity.  Hidden (unimported) candidates never
+            // bind.
+            mut t_imported: i64[] = [];
+            mut t_prelude:  i64[] = [];
+            mut t_legacy:   i64[] = [];
+            for (mut oi: i64 = 0; oi < overloads.length; oi++) {
+                const owner: u32 = if (owners.length > oi) { owners[oi] } else { 0 };
+                if (owner == 0) { t_legacy.push(oi); continue; }
+                match (this.bare_candidate_scope(owner)) {
+                    BareCandidateScope::Imported => { t_imported.push(oi); }
+                    BareCandidateScope::Prelude  => { t_prelude.push(oi); }
+                    BareCandidateScope::Global   => { t_legacy.push(oi); }
+                    BareCandidateScope::Hidden   => { }
+                }
+            }
+            mut tier_len: i64 = t_legacy.length;
+            mut tier_first: i64 = if (t_legacy.length > 0) { t_legacy[0] } else { 0 };
+            if (t_prelude.length > 0) {
+                tier_len = t_prelude.length;
+                tier_first = t_prelude[0];
+            }
+            if (t_imported.length > 0) {
+                tier_len = t_imported.length;
+                tier_first = t_imported[0];
+            }
+            if (tier_len != 1) { return TypeRef::invalid(); }
+            const oi: i64 = tier_first;
+            const owner: u32 = if (owners.length > oi) { owners[oi] } else { 0 };
+            mut mangled: SymbolStr = SymbolStr::empty();
+            if (owner != 0) {
+                mangled = di.lookup_overload_mangled_owned(lookup_key, overloads[oi], owner);
+            }
+            if (!mangled.is_valid()) {
+                mangled = di.lookup_overload_mangled(lookup_key, overloads[oi]);
+            }
+            if (!mangled.is_valid()) { mangled = di.lookup_mangled_name(lookup_key); }
+            if (mangled.is_valid()) { call.set_resolved_callee(mangled); }
+            return this.overload_return_type(overloads[oi]);
+        }
+
+        if (!scoped_bare || matches.length == 1) {
+            // Qualified key, or a unique signature match: pin it directly
+            // (the qualified path's entries all belong to one declaration
+            // family; no cross-module scoping applies).
+            const oi: i64 = matches[0];
+            mut mangled: SymbolStr = SymbolStr::empty();
+            if (scoped_bare && owners.length > oi && owners[oi] != 0) {
+                mangled = di.lookup_overload_mangled_owned(
+                    lookup_key, overloads[oi], owners[oi]);
+            }
+            if (!mangled.is_valid()) {
+                mangled = di.lookup_overload_mangled(lookup_key, overloads[oi]);
+            }
+            if (mangled.is_valid()) { call.set_resolved_callee(mangled); }
+            return this.overload_return_type(overloads[oi]);
+        }
+
+        // Bare leaf with SEVERAL signature-matching candidates: import-scoped
+        // selection, nearest scope wins.
+        //   1. a candidate from the CURRENT module or an EXPLICIT import -
+        //      two of those with the same signature are a genuine ambiguity
+        //      (E0154: qualify);
+        //   2. else the prelude/intrinsic candidate - an explicit import
+        //      shadows the implicit prelude silently (standard nearer-scope
+        //      shadowing: `import std::fmt` makes bare `printf` fmt's even
+        //      though the `printf` intrinsic is prelude-visible);
+        //   3. else owner-0 entries (extern "C" twins and other global
+        //      claims), which keep their legacy first-match behavior;
+        //   4. a candidate in a module the use site never imported must NOT
+        //      capture the call.
+        mut imported_owned: i64[] = [];
+        mut prelude_owned:  i64[] = [];
+        mut legacy: i64[] = [];
+        for (mut mi: i64 = 0; mi < matches.length; mi++) {
+            const oi: i64 = matches[mi];
+            const owner: u32 = if (owners.length > oi) { owners[oi] } else { 0 };
+            if (owner == 0) { legacy.push(oi); continue; }
+            match (this.bare_candidate_scope(owner)) {
+                BareCandidateScope::Imported => { imported_owned.push(oi); }
+                BareCandidateScope::Prelude  => { prelude_owned.push(oi); }
+                BareCandidateScope::Global   => { legacy.push(oi); }
+                BareCandidateScope::Hidden   => { }
+            }
+        }
+        if (imported_owned.length >= 2) {
+            // Two or more same-signature functions equally in scope: the
+            // author must qualify.  (Each owner is a distinct declaration -
+            // one function has one signature entry per owner.)
+            this.emit_ambiguous_bare_call(call, ident,
+                owners[imported_owned[0]], owners[imported_owned[1]]);
+            return TypeRef::invalid();
+        }
+        if (imported_owned.length == 1 || prelude_owned.length >= 1) {
+            // A unique import-scoped candidate, else the prelude one.  Two
+            // same-signature PRELUDE candidates cannot arise: prelude
+            // modules' leaves are curated (and an intrinsic leaf claims sole
+            // bare ownership), so taking the first is exact.
+            const oi: i64 = if (imported_owned.length == 1) { imported_owned[0] }
+                            else { prelude_owned[0] };
+            mut mangled: SymbolStr = di.lookup_overload_mangled_owned(
+                lookup_key, overloads[oi], owners[oi]);
+            if (!mangled.is_valid()) {
+                mangled = di.lookup_overload_mangled(lookup_key, overloads[oi]);
+            }
+            if (mangled.is_valid()) { call.set_resolved_callee(mangled); }
+            return this.overload_return_type(overloads[oi]);
+        }
+        if (legacy.length > 0) {
+            const oi: i64 = legacy[0];
             const mangled: SymbolStr = di.lookup_overload_mangled(lookup_key, overloads[oi]);
             if (mangled.is_valid()) { call.set_resolved_callee(mangled); }
             return this.overload_return_type(overloads[oi]);
         }
+        // Only candidates from unimported modules remain: never bind them.
         return TypeRef::invalid();
+    }
+
+    /// Scope class of a bare-call overload candidate owned by `owner` (a
+    /// qualified function-name id) relative to the module being checked.
+    /// Mirrors the type-side `resolve_qualified_scoped` visibility rules,
+    /// with explicit imports ranked NEARER than the implicit prelude.
+    bare_candidate_scope(&this, owner: u32) -> BareCandidateScope {
+        const di: DeclarationIndex* = this.ctx.decl_index;
+        const owner_sym: SymbolStr = SymbolStr::from_id(owner);
+        const c_ns: SymbolStr = di.namespace_of(owner_sym, this.intern);
+        if (!c_ns.is_valid()) { return BareCandidateScope::Global; }
+        const use_ns: SymbolStr = this.ctx.current_module_ns();
+        if (c_ns.id == use_ns.id) { return BareCandidateScope::Imported; }
+        if (di.ns_imports(use_ns, c_ns)) { return BareCandidateScope::Imported; }
+        if (di.is_prelude_ns(c_ns)) { return BareCandidateScope::Prelude; }
+        return BareCandidateScope::Hidden;
+    }
+
+    /// E0154 for a bare call that matches two or more same-signature
+    /// functions visible from the use site: demand qualification.
+    emit_ambiguous_bare_call(mut &this, call: CallExprNode*, ident: IdentifierNode*,
+                             owner_a: u32, owner_b: u32) -> void {
+        if (this.state.in_symbolic_check) { return; }
+        const name_str: string = this.intern.resolve(ident.name);
+        const a_str: string = this.intern.resolve(SymbolStr::from_id(owner_a));
+        const b_str: string = this.intern.resolve(SymbolStr::from_id(owner_b));
+        mut diag: Diagnostic = Diagnostic::error(
+            ErrorCode::E0154_AMBIGUOUS_CALL,
+            format("call to `%s` is ambiguous: multiple same-signature functions named `%s` are in scope",
+                name_str, name_str));
+        diag = diag.at_with_label(call.span,
+            format("`%s` could be `%s` or `%s`", name_str, a_str, b_str));
+        diag = diag.with_note("qualify the callee with its module path, e.g. `module::function(...)`");
+        this.ctx.emit_diagnostic(diag);
     }
 
     overload_return_type(&this, fn_ref: TypeRef) -> TypeRef {
@@ -1534,6 +2449,15 @@ type struct CallResolver {
             ErrorCode::E0202_UNDEFINED_FUNCTION,
             format("cannot find function `%s` in this scope", name));
         diag = diag.at_with_label(ident.span, "not found in this scope");
+        // The call may not be a call at all: `f(a < b, c > (d))` reads as the
+        // generic call `a<b, c>(d)` under the same grammar, and that reading is
+        // what produced this lookup. Say so, because the reader is otherwise
+        // sent looking for a function they never wrote.
+        if (ident.generic_angle_guessed) {
+            diag = diag.with_note(format(
+                "`<` after `%s` was read as the start of generic type arguments; if a comparison was meant, parenthesise the operands - `(x < y)`",
+                name));
+        }
         const cands: string[] = this.diag.collect_bare_callable_names();
         diag = this.diag.attach_did_you_mean(diag, name, cands, "function", ident.span);
         this.ctx.emit_diagnostic(diag);
@@ -1910,13 +2834,21 @@ type struct CallResolver {
     /// are EXCLUDED: re-deriving them mints a DISTINCT arena TypeID from mono's
     /// materialized one (iterator adapters like `ChainIter`/`ZipIter`/`TakeIter`),
     /// which would spuriously mismatch, so their pin stays authoritative.
-    generic_scalar_return(&this, call: CallExprNode*, t: TypeRef) -> boolean {
+    /// A unit-shaped return belongs here for the same reason a scalar does: it
+    /// is canonical, so re-deriving it cannot mint a distinct TypeID either.
+    /// Leaving it out silently loses the repair — the re-derivation produces the
+    /// right `()` and this predicate then refuses to adopt it, so the leaked
+    /// sibling scalar stays. That reaches codegen as a NAMED call to a
+    /// void-returning function, which LLVM rejects outright.
+    generic_canonical_return(&this, call: CallExprNode*, t: TypeRef) -> boolean {
         if (call == null || call.resolved_type_args.length == 0) { return false; }
         if (!t.is_valid()) { return false; }
         const ty: Type* = this.arena.lookup(t.id);
         if (ty == null) { return false; }
         return ty.kind == TypeKind::Int || ty.kind == TypeKind::Float
-            || ty.kind == TypeKind::Bool || ty.kind == TypeKind::Char;
+            || ty.kind == TypeKind::Bool || ty.kind == TypeKind::Char
+            || ty.kind == TypeKind::Unit || ty.kind == TypeKind::Void
+            || ty.kind == TypeKind::Never;
     }
 
     resolve_method_call(mut &this, visitor: ASTVisitor*, member: MemberAccessNode*,
@@ -1929,12 +2861,52 @@ type struct CallResolver {
             // substituter concretizes them when the enclosing method specializes, so
             // mono can specialize the nested call (else codegen E0636).
             this.binding.stash_owner_generic_method_bindings(obj_type, member, call);
-            const mret: TypeRef = this.symbolic.symbolic_resolve_owner_method_return(obj_type, member.member);
+            mut mret: TypeRef = this.symbolic.symbolic_resolve_owner_method_return(obj_type, member.member);
+            if (!mret.is_valid()) {
+                // A method delivered by a trait impl ON the owner
+                // (`implement trait AsyncRead for struct BufStream<S>`) is not in
+                // the template's own method list, so the owner-template lookup
+                // above cannot see it. The instantiation resolver reads the
+                // declaration index and the owner's trait impls, which is where
+                // such a method IS recorded.
+                //
+                // Leaving it unresolved is survivable for a synchronous call —
+                // monomorphization retypes it once the owner's argument is
+                // bound — but not for an awaited one: the state machine has to
+                // know the sub-future's type to give it a field, so an
+                // unresolved receiver method surfaces as "operand does not
+                // implement `Future`" at the `await` instead.
+                mret = this.binding.resolve_method_return_via_template(obj_type, member.member);
+            }
             if (mret.is_valid()) { member.set_resolved_type(mret); return mret; }
             return TypeRef::invalid();
         }
         if (this.symbolic.symbolic_type_unresolved(obj_type)) {
             this.binding.stash_abstract_receiver_method(obj_type, member, call);
+            // `symbolic_type_unresolved` is true for any receiver that merely
+            // CONTAINS a generic param, so a generic INSTANTIATION (`Inner<S>`
+            // inside `f<S>`, or a field of `Owner<S>`) lands here too - but it is
+            // not abstract for method lookup: its base template is known, and its
+            // methods resolve through that template rather than through the
+            // receiver's trait bounds, which is all the stash above consults.  A
+            // bare param / projection receiver keeps that bounds lookup (it is the
+            // only thing that can name its methods), so this fills in ONLY when the
+            // bounds lookup produced nothing.  Without it such a call got no stash
+            // in the PRE-mono sema pass, and sema's stash is the sole producer of
+            // method-spec demand, so mono minted no specialization and codegen
+            // reported E0636 "no method found".  The post-mono sema pass does stash
+            // it, which is far too late to drive specialization.
+            if (call.resolved_type_args.length == 0) {
+                this.binding.stash_method_call_bindings(obj_type, member, call);
+            }
+            // The stash solves the method's own type args but yields no RETURN
+            // type, so every use of the result reads `void`. A bounded-param or
+            // projection receiver is constrained enough to type the call exactly;
+            // this early return sits before both rescues further down (past the
+            // type-symbol lookup), making them unreachable in a symbolic walk.
+            const abs_ret: TypeRef =
+                this.binding.abstract_receiver_method_return(obj_type, member.member);
+            if (abs_ret.is_valid()) { member.set_resolved_type(abs_ret); return abs_ret; }
             return TypeRef::invalid();
         }
         this.binding.stash_method_call_bindings(obj_type, member, call);
@@ -1964,8 +2936,17 @@ type struct CallResolver {
         if (!type_sym.is_valid()) {
             if (base_t != null && base_t.kind == TypeKind::BoundedParam) {
                 const trait_ret: TypeRef = this.binding.lookup_method_through_bounds(
-                    base_t as BoundedParamType*, member.member);
+                    base_t as BoundedParamType*, lookup_ref, member.member);
                 if (trait_ret.is_valid()) { member.set_resolved_type(trait_ret); return trait_ret; }
+            }
+            // Associated-type-projection receiver (`value: This::Item`) whose
+            // projection is constrained by an enclosing `where This::Item: Ord`
+            // bound: resolve the method through that bound trait. The projection
+            // sibling of the BoundedParam rescue directly above.
+            if (base_t != null && base_t.kind == TypeKind::AssocProjection) {
+                const proj_ret: TypeRef = this.binding.lookup_method_through_projection_bounds(
+                    base_t as AssocProjectionType*, lookup_ref, member.member);
+                if (proj_ret.is_valid()) { member.set_resolved_type(proj_ret); return proj_ret; }
             }
             if (base_t != null && base_t.kind == TypeKind::InstantiatedType) {
                 const gret: TypeRef = this.binding.resolve_generic_method_return(
@@ -1981,8 +2962,17 @@ type struct CallResolver {
             return TypeRef::invalid();
         }
 
+        // A projection-bounded trait-default method (`min`/`max` with
+        // `where This::Item: Ord`) must NOT resolve on a concrete receiver whose
+        // Item does not satisfy the bound: skip the trait-default resolution so
+        // it falls through to a clean "no method" diagnostic (E0358) instead of
+        // resolving here and failing later at codegen (E0636). False for
+        // symbolic receivers / symbolic Item types (undecidable -> allow).
+        const proj_blocked: boolean =
+            this.binding.projection_default_unavailable(obj_type, member.member);
+
         const ret: TypeRef = this.binding.lookup_method_with_inheritance(lookup_ref, type_sym, member.member);
-        if (ret.is_valid()) {
+        if (ret.is_valid() && !proj_blocked) {
             const acc_span: SourceSpan = if (member.member_span.has_location()) { member.member_span } else { member.span };
             this.member.enforce_method_visibility(lookup_ref, member.member, acc_span);
             const refined: TypeRef = if (member.generic_args.length > 0) {
@@ -1996,18 +2986,18 @@ type struct CallResolver {
             // call's args and prefer that ONLY when it is a primitive scalar - a
             // sibling spec of a different instantiation can otherwise leak in (a
             // `next_range<u64>` call seeing `next_range<i64>`'s `i64`). Compound
-            // returns keep `refined` (see `generic_scalar_return`).
+            // returns keep `refined` (see `generic_canonical_return`).
             mut final_ret: TypeRef = refined;
             if (refined.is_valid() && this.types.contains_generic_param(refined)) {
                 final_ret = this.binding.resolve_generic_method_return(obj_type, member, call, refined);
-            } else if (this.generic_scalar_return(call, refined)) {
+            } else if (this.generic_canonical_return(call, refined)) {
                 // Only when the by-name lookup already returned a concrete SCALAR
                 // for a generic method (a possible sibling-spec leak). Gating the
                 // genret CALL on a scalar `refined` matters: re-deriving a compound
                 // return (iterator adapters) has arena side effects that break mono.
                 const grt: TypeRef =
                     this.binding.resolve_generic_method_return(obj_type, member, call, refined);
-                if (this.generic_scalar_return(call, grt)) { final_ret = grt; }
+                if (this.generic_canonical_return(call, grt)) { final_ret = grt; }
             }
             final_ret = this.binding.finalize_assoc_return(obj_type, member, final_ret);
             member.set_resolved_type(final_ret);
@@ -2016,12 +3006,12 @@ type struct CallResolver {
 
         if (base_t != null && base_t.kind == TypeKind::BoundedParam) {
             const trait_ret: TypeRef = this.binding.lookup_method_through_bounds(
-                base_t as BoundedParamType*, member.member);
+                base_t as BoundedParamType*, lookup_ref, member.member);
             if (trait_ret.is_valid()) { member.set_resolved_type(trait_ret); return trait_ret; }
         }
 
         const inherited: TypeRef = this.binding.lookup_method_through_trait_impls(type_sym, member.member);
-        if (inherited.is_valid()) {
+        if (inherited.is_valid() && !proj_blocked) {
             const subst_inherited: TypeRef = this.binding.subst_this_in_type(inherited, obj_type);
             mut fin_inherited: TypeRef = subst_inherited;
             if (fin_inherited.is_valid() && this.types.contains_generic_param(fin_inherited)) {
@@ -2307,6 +3297,13 @@ type struct CallResolver {
                 if (this.ctx.generic_registry.get_template(qscope) != null) { return true; }
             }
         }
+        // Module-qualified scope (`future::Ready`): leaf-canonicalize so a
+        // `module::Type` path finds its generic template, mirroring
+        // `resolve_scope_owner_template`'s cross-module fallback. Keeps the callee
+        // UNPINNED for mono to specialize instead of pinning the bare template name.
+        const xscope: SymbolStr = this.types.resolve_cross_module_name(scope_sym);
+        if (xscope.is_valid() && !xscope.equals(scope_sym)
+                && this.ctx.generic_registry.get_template(xscope) != null) { return true; }
         if (member_sym.is_valid()) {
             const scope_str: string = this.intern.resolve(scope_sym);
             const member_str: string = this.intern.resolve(member_sym);
@@ -2353,6 +3350,20 @@ type struct CallResolver {
             const q: SymbolStr = this.ctx.resolve_scoped_or(scope_sym);
             if (q.is_valid() && !q.equals(scope_sym)) {
                 tmpl = this.ctx.generic_registry.get_template(q);
+            }
+        }
+        // Module-qualified scope path (`future::Ready`): the import-scoped
+        // `resolve_scoped_or` only canonicalizes a BARE leaf, so a `module::Type`
+        // scope misses its template. Resolve it the way a type annotation does -
+        // leaf-canonicalized through the name resolver - which maps `future::Ready`
+        // to its registered generic template `std::future::ready::Ready`. Without
+        // this, an owner-generic static ctor written module-qualified
+        // (`future::Ready<i32>::new`) reaches mono with no owner-arg stash and
+        // codegen cannot resolve the never-emitted spec (E0636).
+        if (tmpl == null) {
+            const cross: SymbolStr = this.types.resolve_cross_module_name(scope_sym);
+            if (cross.is_valid() && !cross.equals(scope_sym)) {
+                tmpl = this.ctx.generic_registry.get_template(cross);
             }
         }
         return tmpl;
@@ -2442,6 +3453,16 @@ type struct CallResolver {
         // owner-only stash / DI-return branches below, which bail on generic methods.
         const gsm_ret: TypeRef = this.try_resolve_generic_static_method(scope, call);
         if (gsm_ret.is_valid()) { return gsm_ret; }
+        // A GENERIC static method on a NON-generic owner (`Bo::drive<F, R>`) is
+        // registered as its OWN function template keyed `Owner::method`
+        // (register_static_method_templates), so it resolves like a free function:
+        // infer the method's `<F, R>`, stash them, and substitute into the return.
+        // The owner has no params to instantiate; mono specializes the method
+        // template exactly as a free-function call.  Handled before the owner-only
+        // stash / `lookup_method_return` path, which returns the still-abstract
+        // method return type (`R`) and would trip E0200.
+        const smt_ret: TypeRef = this.try_resolve_static_method_template(scope, call);
+        if (smt_ret.is_valid()) { return smt_ret; }
         // Stash the owner's concrete type args for mono BEFORE the return-type
         // resolution below.  The stash must be produced on EVERY path: when the
         // return type resolves via the DI `lookup_method_return` branch (next
@@ -2493,6 +3514,168 @@ type struct CallResolver {
             return tmpl_ret;
         }
         return TypeRef::invalid();
+    }
+
+    /// True when `scope_name` resolves to a declared TYPE (as written or through
+    /// the caller's import scope), distinguishing a static-method scope (`Bo`)
+    /// from a module scope (`future`).  Used to keep the static-method-template
+    /// path off module-qualified free-function calls.
+    scope_names_a_type(&this, scope_name: SymbolStr) -> boolean {
+        if (this.types.lookup_type_by_sym(scope_name).is_valid()) { return true; }
+        const q: SymbolStr = this.ctx.resolve_scoped_or(scope_name);
+        if (q.is_valid() && !q.equals(scope_name)
+                && this.types.lookup_type_by_sym(q).is_valid()) { return true; }
+        return false;
+    }
+
+    /// Find the function template a `Owner::method` scope-resolution call names,
+    /// for a GENERIC static method on a NON-generic owner (registered by
+    /// `register_static_method_templates`, keyed `Owner::method`).  Tries the
+    /// import-scoped qualified owner, the written scope name, then the cross-module
+    /// leaf-canonical form - the same ladder `resolve_scope_owner_template` uses -
+    /// so a same-leaf or module-qualified owner still resolves.  Returns null when
+    /// no such template is registered.
+    find_static_method_template(&this, scope: ScopeResolutionNode*) -> TemplateEntry* {
+        if (this.ctx.generic_registry == null) { return null; }
+        const member_str: string = this.intern.resolve(scope.member_name);
+        mut entry: TemplateEntry* = null;
+        if (this.ctx.decl_index != null) {
+            const q: SymbolStr = this.ctx.resolve_scoped_or(scope.scope_name);
+            if (q.is_valid()) {
+                const qstr: string = this.intern.resolve(q) + "::" + member_str;
+                entry = this.ctx.generic_registry.get_template(this.intern.intern(qstr));
+            }
+        }
+        if (entry == null) {
+            const bstr: string = this.intern.resolve(scope.scope_name) + "::" + member_str;
+            entry = this.ctx.generic_registry.get_template(this.intern.intern(bstr));
+        }
+        if (entry == null) {
+            const cross: SymbolStr = this.types.resolve_cross_module_name(scope.scope_name);
+            if (cross.is_valid() && !cross.equals(scope.scope_name)) {
+                const cstr: string = this.intern.resolve(cross) + "::" + member_str;
+                entry = this.ctx.generic_registry.get_template(this.intern.intern(cstr));
+            }
+        }
+        return entry;
+    }
+
+    /// Resolve a call to a GENERIC static method on a NON-generic owner
+    /// (`Bo::drive<F, R>(fut)`).  Such a method is registered as its own function
+    /// template keyed `Owner::method`, so it resolves exactly like a generic free
+    /// function: infer the method's `<F, R>` (explicit turbofish -> argument types
+    /// -> where-bound projection via `infer_free_call_bindings`), stash them for
+    /// mono, and substitute them into the template return.  The owner has no type
+    /// params to instantiate, and the callee is LEFT UNPINNED: mono's
+    /// `specialize_free_call` re-finds this same `Owner::method` template (via the
+    /// pinned `resolved_template`) and materializes the spec.  Returns invalid -
+    /// falling through to the owner-only static paths - unless the scope names a
+    /// registered generic static-method template whose args fully infer.
+    try_resolve_static_method_template(mut &this, scope: ScopeResolutionNode*,
+                                       call: CallExprNode*) -> TypeRef {
+        if (call == null || scope == null) { return TypeRef::invalid(); }
+        if (this.ctx.generic_registry == null || this.ctx.type_resolver == null) {
+            return TypeRef::invalid();
+        }
+        // Fire ONLY when the scope names a TYPE (a static method).  A GENERIC
+        // FREE function called module-qualified (`future::block_on(fut)`) is ALSO
+        // registered as a qualified-name FunctionDeclaration template, but it is
+        // resolved - with its own where-bound projection AND same-leaf/arity/prefix
+        // disambiguation - by `resolve_module_qualified_function`; intercepting it
+        // here would bypass that disambiguation and mis-resolve an overloaded
+        // module function.  The owner of a static method is always a nominal type.
+        if (!this.scope_names_a_type(scope.scope_name)) { return TypeRef::invalid(); }
+        const entry: TemplateEntry* = this.find_static_method_template(scope);
+        if (entry == null || entry.node_kind != NodeKind::FunctionDeclaration) {
+            return TypeRef::invalid();
+        }
+        if (entry.param_type_ids.length == 0) { return TypeRef::invalid(); }
+        const tmpl: FunctionDeclNode* = entry.ast_node as FunctionDeclNode*;
+        if (tmpl == null || !tmpl.resolved_return_type.is_valid()) { return TypeRef::invalid(); }
+
+        // Infer the method's own type args: explicit turbofish (on the member or,
+        // as a fallback, the scope), else argument inference + where-bound
+        // projection (the free-function inference, which runs PASS D).
+        mut binds: TypeRef[] = [];
+        mut targs: &TypeAnnotation*[] = &call.generic_args;
+        if (targs.length == 0 && scope.generic_args.length > 0) { targs = &scope.generic_args; }
+        if (targs.length > 0) {
+            if (targs.length != entry.param_type_ids.length) { return TypeRef::invalid(); }
+            mut rc: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
+            this.symbolic.symbolic_bind_params(&rc);
+            for (mut i: i64 = 0; i < targs.length; i++) {
+                const tr: TypeRef = this.ctx.type_resolver.resolve(targs[i], &rc);
+                if (!tr.is_valid()) { return TypeRef::invalid(); }
+                binds.push(tr);
+            }
+        } else {
+            binds = this.infer_free_call_bindings(call, entry, tmpl);
+            if (binds.length != entry.param_type_ids.length) { return TypeRef::invalid(); }
+        }
+        // Every arg must BIND; it need not yet be CONCRETE.  Called from inside a
+        // generic body the args carry the enclosing template's parameters
+        // (`Futures::timeout(d, this.read())` in `implement struct BufStream<S>`
+        // binds `F` to a future type mentioning `S`), and demanding concreteness
+        // here abandoned the call: the return type then fell through to the
+        // owner-only static paths, which answer with the template's own abstract
+        // return and report it as `void`.  Mono is built for the symbolic case -
+        // `specialize_free_call` runs every stashed arg through
+        // `concretize_stashed_arg` with the active specialization, a no-op on an
+        // already-concrete stash - and this mirrors the free-function path, which
+        // has always resolved with abstract bindings.
+        for (mut i: i64 = 0; i < binds.length; i++) {
+            if (!binds[i].is_valid()) { return TypeRef::invalid(); }
+        }
+
+        // E0306 - where-clause bound satisfaction for the bound method args, so an
+        // unsatisfied bound is a clean call-site error rather than a downstream miss.
+        if (!this.check_call_where_bounds(call, tmpl, entry, &binds)) {
+            return TypeRef::invalid();
+        }
+
+        // Stash for mono + record the winning template (mono can't re-derive the
+        // caller's import scope), then substitute into the return.  Callee stays
+        // UNPINNED: `specialize_free_call` pins the `$`-mangled spec symbol.
+        if (call.resolved_type_args.length == 0) {
+            mut stash: TypeRef[] = [];
+            for (mut i: i64 = 0; i < binds.length; i++) { stash.push(binds[i]); }
+            call.set_resolved_type_args(stash);
+        }
+        call.set_resolved_template(entry.qualified_name);
+        const ret: TypeRef = this.subst_free_call_return(entry, &binds, tmpl.resolved_return_type);
+        if (!ret.is_valid()) { return TypeRef::invalid(); }
+        scope.set_resolved_type(ret);
+        return ret;
+    }
+
+    /// E0306 where-clause bound check for a generic call whose bound args are in
+    /// `bindings` (declaration order, index-aligned with `entry.param_names`).
+    /// Emits the bound failure and returns false on the first unsatisfied bound;
+    /// true when every bound holds (or the arg is still abstract/skippable).
+    /// Shared by the free-function and static-method-template call paths.
+    check_call_where_bounds(mut &this, call: CallExprNode*, tmpl: FunctionDeclNode*,
+                            entry: TemplateEntry*, bindings: &TypeRef[]) -> boolean {
+        for (mut bi: i64 = 0; bi < tmpl.trait_bounds.length; bi++) {
+            const bound: TraitBound* = &tmpl.trait_bounds[bi];
+            mut idx: i64 = -1;
+            for (mut pi: i64 = 0; pi < entry.param_names.length; pi++) {
+                if (entry.param_names[pi].equals(bound.type_parameter)) { idx = pi; break; }
+            }
+            if (idx < 0 || idx >= bindings.length) { continue; }
+            const concrete: TypeRef = bindings[idx];
+            if (!concrete.is_valid()) { continue; }
+            if (this.types.contains_generic_param(concrete)) { continue; }
+            for (mut ri: i64 = 0; ri < bound.trait_refs.length; ri++) {
+                const tref: TraitRef* = &bound.trait_refs[ri];
+                if (tref.path.length == 0) { continue; }
+                const trait_name: SymbolStr = tref.path[tref.path.length - 1];
+                if (!this.trait_checker().type_implements_trait(concrete, trait_name, 0)) {
+                    this.emit_free_call_bound_failure(call, tmpl, tref, concrete, trait_name);
+                    return false;
+                }
+            }
+        }
+        return true;
     }
 
     /// Resolve a call to a GENERIC static method on a GENERIC-owner template
@@ -2641,6 +3824,14 @@ type struct CallResolver {
             if (f_idx >= 0 && ictx.bindings[f_idx].is_valid()) { continue; }
             ictx.unify(param.resolved_type, lit_actual);
         }
+        // PASS D - a method param that appears only in a where-bound (`R` in
+        // `make<F, R>(fut: F) -> R where F: Future<R>`) projects off its now-bound
+        // subject; `ictx.bindings[i]` is index-aligned with `func.generic_params[i]`.
+        mut method_names_d: SymbolStr[] = [];
+        for (mut i: i64 = 0; i < n; i++) { method_names_d.push(func.generic_params[i].name); }
+        this.ctx.type_resolver.project_where_bound_params_into(
+            &func.trait_bounds, &method_names_d, &ictx, this.ctx.source_file,
+            this.state.in_symbolic_check);
         mut bindings: TypeRef[] = [];
         for (mut i: i64 = 0; i < ictx.bindings.length; i++) { bindings.push(ictx.bindings[i]); }
         for (mut i: i64 = 0; i < bindings.length; i++) {
@@ -2736,44 +3927,28 @@ type struct CallResolver {
             matched = m;
         }
         if (found_count != 1 || !abstract_ret.is_valid()) { return TypeRef::invalid(); }
-        // Stash the owner's concrete type args (declaration order, all-concrete) so
-        // the monomorphizer specializes the owner WITHOUT re-deriving them - sema is
-        // the sole source of truth for resolved types (mono-after-sema).  Additive:
-        // the return-type resolution below is unchanged; absence of a stash means
-        // mono cannot specialize this owner-generic static call.
+        // Owner type args come from ONE authority: `compute_static_owner_bindings`
+        // (turbofish -> concrete args -> expected-type unify -> expected-base ->
+        // literal-default; it also emits the E0307 for a literal-only binding).  Its
+        // result is stashed on the call so the monomorphizer specializes the owner
+        // WITHOUT re-deriving it - sema is the sole source of truth (mono-after-sema).
+        // Idempotent: `stash_static_owner_bindings_for` already ran first on every
+        // static call, so this normally no-ops; it just guarantees the stash on any
+        // path that reaches us without the pre-stash (absence of a stash means mono
+        // cannot specialize this owner-generic static call).
         this.stash_static_owner_bindings(scope, call, tmpl, matched);
         if (!this.types.contains_generic_param(abstract_ret)) { return abstract_ret; }
 
-        // CONCRETE args only here - the literal-default guess is demoted to the
-        // last resort below so it can't preempt the expected type / turbofish.
-        if (call != null) {
-            const inferred: TypeRef = this.infer_static_owner_return_from_args(tmpl, matched, abstract_ret, call, false);
-            if (inferred.is_valid() && !this.types.contains_generic_param(inferred)) { return inferred; }
-        }
-        const ret_inst: InstantiatedType* = this.types.peel_to_instantiation(abstract_ret);
-        if (this.state.expected_type.is_valid() && ret_inst != null) {
-            const exp_inst: InstantiatedType* = this.types.peel_to_instantiation(this.state.expected_type);
-            if (exp_inst != null && exp_inst.generic_base.id == ret_inst.generic_base.id
-                    && !this.types.contains_generic_param(this.state.expected_type)) {
-                return this.state.expected_type;
-            }
-        }
-        mut owner_concrete: TypeRef = TypeRef::invalid();
-        if (scope.scope_generic_args.length > 0) {
-            const spec_sym: SymbolStr = this.resolve_generic_scope_name(scope.scope_name, scope.scope_generic_args);
-            if (spec_sym.is_valid()) { owner_concrete = this.types.lookup_type_by_sym(spec_sym); }
-        }
-        if (!owner_concrete.is_valid()) { owner_concrete = this.types.lookup_type_by_sym(scope.scope_name); }
-        if (owner_concrete.is_valid()) {
-            const via_recv: TypeRef = this.binding.subst_method_return_from_receiver(owner_concrete, abstract_ret);
-            if (via_recv.is_valid() && !this.types.contains_generic_param(via_recv)) { return via_recv; }
-        }
-        // LAST RESORT: the literal-default GUESS (emits E0307).  Only reached when
-        // turbofish, concrete args, expected type, and owner-scope lookup all failed
-        // to pin a concrete return (e.g. unannotated `Atomic::new(0)`).
-        if (call != null) {
-            const guessed: TypeRef = this.infer_static_owner_return_from_args(tmpl, matched, abstract_ret, call, true);
-            if (guessed.is_valid() && !this.types.contains_generic_param(guessed)) { return guessed; }
+        // B2a: the return type is the abstract return with the SAME owner bindings the
+        // stash holds substituted in - no independent re-derivation.  The stash is in
+        // `tmpl.param_type_ids` declaration order, so it maps the owner params directly.
+        // This collapses the former concrete-args / expected-type / owner-scope /
+        // literal-default return-typing copies (each of which re-ran a subset of
+        // `compute_static_owner_bindings`) into the single authority.
+        if (call != null && call.resolved_type_args.length == tmpl.param_type_ids.length) {
+            mut subst: TypeSubstitution = TypeSubstitution::from_params(tmpl.param_type_ids, call.resolved_type_args);
+            const out: TypeRef = subst.apply(abstract_ret, this.arena);
+            if (out.is_valid() && !this.types.contains_generic_param(out)) { return out; }
         }
         return TypeRef::invalid();
     }
@@ -2787,9 +3962,12 @@ type struct CallResolver {
     /// `Atomic<u64>::new(0)` miscompile trap).  Because it is a guess, callers pass
     /// `false` for the authoritative pass and only run it (`true`) as a LAST RESORT,
     /// AFTER turbofish + concrete args + the expected type have all failed - otherwise
-    /// `RwLock<i32> = RwLock::new(0)` would guess+warn (E0307) instead of taking the
-    /// owner arg from the `<i32>` annotation.  The guess is applied silently
-    /// (i32 IS the language-defined default for an unsuffixed literal).
+    /// `RwLock<i32> = RwLock::new(0)` would error (E0307) instead of taking the owner
+    /// arg from the `<i32>` annotation.  This method stays a PURE inference primitive:
+    /// it never emits.  The DECISION that a literal-only owner binding is an error
+    /// lives in `compute_static_owner_bindings` step 3, which calls this with `true`
+    /// solely to detect the case, then emits E0307 (an unannotated literal is no
+    /// longer accepted as the sole source for a generic owner's type argument).
     infer_static_owner_bindings_from_args(mut &this, tmpl: TemplateEntry*, method: MethodNode*,
                                           call: CallExprNode*, allow_literal_default: boolean) -> TypeRef[] {
         if (method == null || method.func == null) { return []; }
@@ -2812,12 +3990,13 @@ type struct CallResolver {
         }
         // Pass 2 (GATED literal-default - last resort only): a still-unbound owner
         // param adopts a polymorphic literal's default type (`0` -> i32).  This runs
-        // ONLY after turbofish + concrete args + the expected type all failed, so by
-        // the time we reach it there is no other information and i32 IS the language-
-        // defined default for an unsuffixed literal (`0..5` -> `Range<i32>`).  The
+        // ONLY after turbofish + concrete args + the expected type all failed.  The
         // dangerous `Atomic<u64>::new(0)` case is bound by the expected-type/turbofish
-        // sources BEFORE this guess, so applying the standard default here is correct
-        // and NOT warned about (warning here would be a spurious E0307 on idiomatic code).
+        // sources BEFORE the guess, so those never reach Pass 2.  This pass stays a
+        // pure detector: it binds i32 so the caller can SEE that a literal-only owner
+        // binding would complete, but the caller (`compute_static_owner_bindings` step
+        // 3) then rejects that with E0307 - an unannotated literal is no longer an
+        // accepted source for a generic owner's type argument.  No emission here.
         if (allow_literal_default) {
             for (mut i: i64 = 0; i < method.func.parameters.length; i++) {
                 const p2: VarDeclNode* = method.func.parameters[i];
@@ -2871,18 +4050,51 @@ type struct CallResolver {
         return bindings;
     }
 
-    /// Substitute a generic static-constructor's return type using owner bindings
-    /// inferred from the call args.  Invalid if the owner args can't be inferred.
-    /// `allow_literal_default` forwards to the binding inference (see that method):
-    /// the caller passes `false` for the authoritative attempt and `true` only as a
-    /// last resort, so the literal-default guess never preempts the expected type.
-    infer_static_owner_return_from_args(mut &this, tmpl: TemplateEntry*, method: MethodNode*,
-                                        abstract_ret: TypeRef, call: CallExprNode*,
-                                        allow_literal_default: boolean) -> TypeRef {
-        const bindings: TypeRef[] = this.infer_static_owner_bindings_from_args(tmpl, method, call, allow_literal_default);
-        if (bindings.length != tmpl.param_type_ids.length) { return TypeRef::invalid(); }
-        mut subst: TypeSubstitution = TypeSubstitution::from_params(tmpl.param_type_ids, bindings);
-        return subst.apply(abstract_ret, this.arena);
+    /// Bind the LEADING owner params the call args + expected return determine and
+    /// return that contiguous, all-concrete PREFIX (stopping at the first param a
+    /// source leaves unbound).  Unlike `infer_static_owner_bindings_from_args` /
+    /// `_from_expected` (all-or-nothing), a prefix lets a trailing DEFAULTED owner
+    /// param be backfilled from its declared default when it appears in neither the
+    /// params nor the return (`Arc<T, A = GlobalAlloc>::try_new`, whose `A` is
+    /// hardcoded GlobalAlloc in the signature).  Empty when nothing binds.
+    infer_static_owner_prefix(mut &this, tmpl: TemplateEntry*, method: MethodNode*,
+                              call: CallExprNode*) -> TypeRef[] {
+        if (method == null || method.func == null) { return []; }
+        if (tmpl.param_type_ids.length == 0) { return []; }
+        mut pids: u64[] = [];
+        for (mut i: i64 = 0; i < tmpl.param_type_ids.length; i++) { pids.push(tmpl.param_type_ids[i]); }
+        mut ictx: InferCtx = InferCtx::for_template(this.arena, pids);
+        // Source A: concrete (non-literal, non-null) argument types.
+        if (method.func.parameters.length == call.arguments.length) {
+            for (mut i: i64 = 0; i < method.func.parameters.length; i++) {
+                const p: VarDeclNode* = method.func.parameters[i];
+                if (p == null || !p.resolved_type.is_valid()) { continue; }
+                const arg: ExpressionNode* = call.arguments[i];
+                if (arg == null) { continue; }
+                if (this.sema_arg_is_polymorphic_literal(arg)) { continue; }
+                if (this.sema_arg_is_null_literal(arg)) { continue; }
+                const actual: TypeRef = arg.resolved_type;
+                if (!actual.is_valid()) { continue; }
+                ictx.unify(p.resolved_type, actual);
+            }
+        }
+        // Source B: the abstract return unified against the expected type, which
+        // recovers a param the args don't determine (incl. one nested in the return).
+        if (this.state.expected_type.is_valid()) {
+            const abstract_ret: TypeRef = method.func.resolved_return_type;
+            if (abstract_ret.is_valid() && this.types.contains_generic_param(abstract_ret)) {
+                ictx.unify(abstract_ret, this.state.expected_type);
+            }
+        }
+        // Contiguous bound prefix: stop at the first unbound / still-abstract param
+        // so `expand_default_type_args` backfills the trailing defaulted params.
+        mut prefix: TypeRef[] = [];
+        for (mut i: i64 = 0; i < ictx.bindings.length; i++) {
+            const b: TypeRef = ictx.bindings[i];
+            if (!b.is_valid() || this.types.contains_generic_param(b)) { break; }
+            prefix.push(b);
+        }
+        return prefix;
     }
 
     /// Compute a generic static-method call's owner type args (declaration order,
@@ -2940,23 +4152,105 @@ type struct CallResolver {
 
         // 2. Expected-type derived (e.g. `const s: Slice<i32> = Slice::from_raw(..)`).
         if (this.state.expected_type.is_valid()) {
-            const exp_inst: InstantiatedType* = this.types.peel_to_instantiation(this.state.expected_type);
-            if (exp_inst != null && exp_inst.generic_base.id == tmpl.base_type.id
-                    && exp_inst.type_args.length == want
-                    && !this.types.contains_generic_param(this.state.expected_type)) {
-                mut eb: TypeRef[] = [];
-                for (mut i: i64 = 0; i < exp_inst.type_args.length; i++) { eb.push(exp_inst.type_args[i]); }
-                return eb;
+            // Generic-identity view, not `peel_to_instantiation`: under single-id
+            // identity the expected type is often the post-mono CONCRETE aggregate
+            // sitting at the former wrapper's id, for which `peel` returns null.
+            // The view reads `(generic_base, type_args)` off the concrete itself,
+            // so a bare static call on a generic owner (`RawBuffer::new()` typed by
+            // the field annotation `RawBuffer<u8, GlobalAlloc>`) still binds its
+            // owner params here instead of falling through to the literal-default guess.
+            const exp_ref_s: TypeRef = this.state.expected_type;
+            if (this.types.view_generic_base(exp_ref_s).id == tmpl.base_type.id
+                    && this.types.view_type_arg_count(exp_ref_s) == want
+                    && !this.types.contains_generic_param(exp_ref_s)) {
+                return this.types.view_type_args_copy(exp_ref_s);
             }
         }
 
-        // 3. LAST RESORT: the literal-default GUESS (`Atomic::new(0)` with no turbofish
-        // and no expected type -> i32).  Runs only after every authoritative source
-        // failed.  Demoting it here is what stops a spurious E0307 on
-        // `RwLock<i32> = RwLock::new(0)` (step 2 binds it from `<i32>`).
+        // 2b. A trailing DEFAULTED owner param that the args and return leave
+        // unbound, whose owner does NOT base-match the expected type because the
+        // owner is NESTED inside it: `Arc<T, A = GlobalAlloc>::try_new(x) ->
+        // Result<Arc<T, GlobalAlloc>, E>`.  `A` is hardcoded GlobalAlloc in the
+        // signature (so it appears in no parameter and no free return position) and
+        // the `Result<...>` expected type makes step 2's base-match miss it - so
+        // without this, `A` never binds, the stash stays empty, and mono cannot
+        // specialize the owner (codegen E0636).  Bind the leading params the
+        // args/return DO determine, then backfill the trailing defaulted params from
+        // their declared defaults.  Runs AFTER step 2 so a non-default owner arg from
+        // a base-matching expected type still wins.
+        if (this.ctx.type_resolver != null) {
+            const prefix: TypeRef[] = this.infer_static_owner_prefix(tmpl, method, call);
+            if (prefix.length > 0 && prefix.length < want) {
+                mut rc_d: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
+                this.symbolic.symbolic_bind_params(&rc_d);
+                mut filled: TypeRef[] = this.ctx.type_resolver.expand_default_type_args(tmpl, prefix, &rc_d);
+                if (filled.length == want) {
+                    mut all_ok: boolean = true;
+                    for (mut i: i64 = 0; i < filled.length; i++) {
+                        if (!filled[i].is_valid() || this.types.contains_generic_param(filled[i])) { all_ok = false; break; }
+                    }
+                    if (all_ok) { return filled; }
+                }
+            }
+        }
+
+        // 3. LAST RESORT: the literal-default GUESS (`Wrap::new(0)` with no turbofish,
+        // no concrete arg, and no expected type -> the owner arg would default to i32
+        // from a polymorphic literal).  Reached only after every authoritative source
+        // (turbofish, concrete args, expected type) has failed; demoting it here is
+        // what stops a spurious E0307 on `RwLock<i32> = RwLock::new(0)` (step 2 binds
+        // it from `<i32>`).  With mono-after-sema live, an unannotated literal-only
+        // owner binding is now HARDENED into an error: E0307, not a silent i32 guess.
+        // We still return the guessed bindings so sema types the call as i32 and does
+        // not cascade; the emitted error aborts the build.  Single-fire: `stash_*`
+        // sets `resolved_type_args` from these bindings, so its idempotency guard
+        // short-circuits every later `compute` for this call before it re-emits.
         const lb: TypeRef[] = this.infer_static_owner_bindings_from_args(tmpl, method, call, true);
-        if (lb.length == want) { return lb; }
+        if (lb.length == want) {
+            // EXEMPTION: a range literal (`0..5` / `1..=4`) is lowered by the parser
+            // into `Range::new` / `RangeInclusive::new` (see expr_parser.cryo), and its
+            // element type follows the ordinary integer-literal default (i32) - a
+            // language-defined default, not a guess.  Erroring here would reject every
+            // unannotated `for (i in 0..N)`.  Keep the silent i32 default for the range
+            // family; only USER generic owners (`Atomic::new(0)`) get E0307.
+            if (!this.owner_is_range_family(scope)) {
+                this.emit_static_owner_literal_default(scope, call);
+            }
+            return lb;
+        }
         return [];
+    }
+
+    /// Whether a generic-owner static call targets one of the built-in range types
+    /// whose element type is defined to default to the integer-literal default (i32).
+    /// These are the parser's range-literal lowering targets (`Range`, `RangeInclusive`
+    /// - see expr_parser.cryo's `..`/`..=` desugar); a literal-only owner binding on
+    /// them is intended, so they are exempt from the E0307 literal-default hardening.
+    owner_is_range_family(&this, scope: ScopeResolutionNode*) -> boolean {
+        if (scope == null) { return false; }
+        const name: string = this.intern.resolve(scope.scope_name);
+        return name == "Range" || name == "RangeInclusive";
+    }
+
+    /// E0307 for a generic-owner static call whose owner type argument could only be
+    /// bound from a polymorphic literal's default (`Wrap::new(0)` in a context with no
+    /// turbofish, no concrete argument, and no expected type).  Pre-mono-after-sema
+    /// this was a silent i32 guess (the `Atomic<u64>::new(0)` trap); it is now an
+    /// error.  Emitted at most once per call (see `compute_static_owner_bindings`
+    /// step 3).  `scope.scope_name` is the owner, `scope.member_name` the method.
+    emit_static_owner_literal_default(mut &this, scope: ScopeResolutionNode*,
+                                      call: CallExprNode*) -> void {
+        const owner_str:  string = this.intern.resolve(scope.scope_name);
+        const method_str: string = this.intern.resolve(scope.member_name);
+        mut d: Diagnostic = Diagnostic::error(
+            ErrorCode::E0307_CANNOT_INFER_TYPE_ARG,
+            format("cannot infer the owner type argument for `%s::%s` from a polymorphic literal",
+                owner_str, method_str));
+        d = d.at(call.span);
+        d = d.with_note("the owner type argument would default to `i32` from an unsuffixed literal; a bare literal is no longer accepted as the only source for a generic owner's type argument");
+        d = d.help(format("write the owner type argument explicitly, e.g. `%s<i64>::%s(...)`, or give the call an expected type (`const x: %s<i64> = ...`)",
+            owner_str, method_str, owner_str));
+        this.ctx.emit_diagnostic(d);
     }
 
     /// Stash a generic static-method call's owner type args on the call node so the
@@ -3002,15 +4296,16 @@ type struct CallResolver {
         if (concrete_t == null || concrete_t.kind != TypeKind::Enum) { return TypeRef::invalid(); }
         const promoted: TypeRef = this.promote_to_expected_instantiation(type_ref);
         // `promote` only specialises when an expected type supplies the args.
-        // With no expected type - the inline `match (Option::Some(<expr>))`
-        // subject - it returns the generic base, so the variant binding lands as
-        // the raw param `T`.  A `T`-typed binding hides a `Drop`-field move-out
-        // from move-check (a real double-free).  Recover the concrete
-        // instantiation from the constructor's argument types.  Gated to the
-        // match subject AND a destructor-owning payload: exactly the unsound set,
-        // so Copy-payload subjects keep the generic-base path (no mono/codegen
-        // ripple).
-        if (promoted.id == type_ref.id && this.state.resolving_match_subject) {
+        // With none - an inline `Option::Some(<expr>)` standing as a `match`
+        // subject, or initializing an unannotated local - it returns the
+        // generic base, so the variant binding lands as the raw param `T`.
+        // That is wrong in two ways: a `T`-typed binding hides a `Drop`-field
+        // move-out from move-check (a real double-free), and a bare `T` payload
+        // has no layout to lower, so the construction is rejected at codegen
+        // (E0600) rather than losing its payload silently.  The constructor's
+        // own argument types determine the instantiation, so recover it from
+        // them whenever nothing else supplied one.
+        if (promoted.id == type_ref.id) {
             const inferred: TypeRef = this.infer_variant_instantiation(type_ref, scope.member_name, call);
             if (inferred.is_valid()) { scope.set_resolved_type(inferred); return inferred; }
         }
@@ -3041,7 +4336,6 @@ type struct CallResolver {
 
         mut bindings: TypeRef[] = [];
         for (mut p: i64 = 0; p < tmpl.param_count; p++) { bindings.push(TypeRef::invalid()); }
-        mut any_needs_drop: boolean = false;
 
         for (mut i: i64 = 0; i < variant.payload_types.length; i++) {
             const pt: Type* = this.arena.lookup(variant.payload_types[i].id);
@@ -3054,18 +4348,34 @@ type struct CallResolver {
             const arg: ExpressionNode* = call.arguments[i];
             if (arg == null || !arg.has_resolved_type()) { continue; }
             const arg_ty: TypeRef = arg.resolved_type;
-            if (this.types.contains_generic_param(arg_ty)) { continue; }
-            if (OwnershipQuery::needs_drop(this.arena, this.ctx.generic_registry, this.intern, arg_ty)) {
-                any_needs_drop = true;
-            }
+            // Only a fully concrete argument may bind. A generic param would
+            // instantiate the enum over a parameter rather than a type, and an
+            // instantiation that has not resolved its own shape yet would
+            // demand `Option<?>` - a specialization monomorphization cannot
+            // produce, which then fails the codegen module as an ICE rather
+            // than as a source error. Both stay on the generic-base path,
+            // where the enclosing template's specialization binds them later.
+            if (!this.types.arg_type_is_concrete(arg_ty)) { continue; }
             for (mut p: i64 = 0; p < tmpl.param_count; p++) {
                 if (tmpl.param_names[p].equals(pname)) { bindings[p] = arg_ty; break; }
             }
         }
 
-        if (!any_needs_drop) { return TypeRef::invalid(); }
+        // Every parameter must come out bound. A partially-bound enum has no
+        // layout, so returning one would only move the failure downstream.
         for (mut p: i64 = 0; p < tmpl.param_count; p++) {
             if (!bindings[p].is_valid()) { return TypeRef::invalid(); }
+        }
+        // Minting an instantiation is only safe while monomorphization still
+        // has a worklist to put it on. Sema runs a second time AFTER mono to
+        // re-resolve these nodes, and a specialization first demanded there is
+        // never produced: it survives to the generic validator as an
+        // unresolved instantiation and fails the build as an ICE. So after
+        // mono, reuse only what the earlier pass already demanded - a pure
+        // lookup - and leave anything else on the generic-base path it was
+        // already taking.
+        if (this.state.post_mono_verify) {
+            return this.arena.find_instantiation(base_ref, &bindings);
         }
         // Record the demand (keyed by source file, like TypeResolution) so the
         // instantiation is monomorphized for codegen; instantiate_for_module
@@ -3093,14 +4403,24 @@ type struct CallResolver {
         return TypeRef::invalid();
     }
 
-    /// Resolve a module-qualified function (`intrinsics::frexp`) via the module
-    /// graph, disambiguating same-leaf collisions by arity then namespace prefix.
-    resolve_module_qualified_function(mut &this, scope_name: SymbolStr, member_name: SymbolStr,
-                                      call: CallExprNode*, scope: ScopeResolutionNode*) -> TypeRef {
+    /// The fully-qualified `namespace::member` symbol a module-qualified call
+    /// (`intrinsics::frexp`, `mem::swap`) names, or the empty symbol when no
+    /// module matches.  The scope written at the call site may be a SUFFIX of
+    /// the defining namespace (`mem` for `std::core::mem`), so the module graph
+    /// is walked rather than the name being interned directly; same-leaf
+    /// collisions are broken by arity, then by longest shared namespace prefix
+    /// with the current module.
+    ///
+    /// Shared by return-type resolution and by parameter-type lookup so the two
+    /// cannot pick different modules: classifying an argument against one
+    /// module's signature while the call resolves to another's would hand the
+    /// move passes an ownership answer for a function that is not being called.
+    resolve_module_qualified_symbol(mut &this, scope_name: SymbolStr, member_name: SymbolStr,
+                                    call: CallExprNode*) -> SymbolStr {
         const scope_str: string = this.intern.resolve(scope_name);
         const member_str: string = this.intern.resolve(member_name);
         const scope_len: i64 = scope_str.length() as i64;
-        if (scope_len == 0) { return TypeRef::invalid(); }
+        if (scope_len == 0) { return SymbolStr::empty(); }
         const mg: ModuleGraph* = this.ctx.module_graph;
         const modules: &ModuleInfo[] = &mg.modules;
         const call_arity: i64 = if (call != null) { call.arguments.length } else { -1 };
@@ -3141,10 +4461,48 @@ type struct CallResolver {
         mut chosen_i: i64 = first_i;
         if (arity_count == 1) { chosen_i = arity_i; }
         else if (prefix_ties == 1 && prefix_i >= 0) { chosen_i = prefix_i; }
-        if (chosen_i < 0) { return TypeRef::invalid(); }
+        if (chosen_i < 0) { return SymbolStr::empty(); }
 
         const chosen_ns: string = this.intern.resolve(modules[chosen_i].namespace_name);
-        const q_sym: SymbolStr = this.ctx.intern(chosen_ns + "::" + member_str);
+        return this.ctx.intern(chosen_ns + "::" + member_str);
+    }
+
+    /// The declared parameter types of a module-qualified free function, for
+    /// expected-type propagation and argument classification.
+    ///
+    /// `lookup_callee_function_type` cannot answer this shape: its
+    /// `ScopeResolution` branch interns the call site's own spelling
+    /// (`mem::swap`) and asks `resolve_scoped_or` to canonicalize the scope,
+    /// which resolves TYPE scopes only.  A scope that names a MODULE by a
+    /// suffix of its namespace therefore found nothing, and every argument of
+    /// such a call stayed unclassified - so the move passes read each one as a
+    /// transfer and the `*p` move-out rejection stood down on the exact call
+    /// shape (`mem::swap<T>(&s, this)`) it exists to police.  Generic or not is
+    /// irrelevant: `helper::eat_res(*p)` missed it too.
+    ///
+    /// For a generic template the parameters still carry the template's own
+    /// generic params (`T*`); the caller substitutes any turbofish args, and
+    /// either way the ownership answer is the same, since substitution cannot
+    /// turn a pointer parameter into a by-value one.
+    lookup_module_qualified_param_types(mut &this, scope: ScopeResolutionNode*,
+                                        call: CallExprNode*) -> TypeRef[] {
+        if (this.ctx.decl_index == null || this.ctx.module_graph == null) { return []; }
+        const q_sym: SymbolStr = this.resolve_module_qualified_symbol(
+            scope.scope_name, scope.member_name, call);
+        if (!q_sym.is_valid()) { return []; }
+        const ft: TypeRef = this.ctx.decl_index.lookup_func_type(q_sym);
+        if (!ft.is_valid()) { return []; }
+        const ft_raw: Type* = this.arena.lookup(ft.id);
+        if (ft_raw == null || ft_raw.kind != TypeKind::Function) { return []; }
+        return sema_copy_type_refs(&(ft_raw as FunctionType*).param_types);
+    }
+
+    /// Resolve a module-qualified function (`intrinsics::frexp`) via the module
+    /// graph, disambiguating same-leaf collisions by arity then namespace prefix.
+    resolve_module_qualified_function(mut &this, scope_name: SymbolStr, member_name: SymbolStr,
+                                      call: CallExprNode*, scope: ScopeResolutionNode*) -> TypeRef {
+        const q_sym: SymbolStr = this.resolve_module_qualified_symbol(scope_name, member_name, call);
+        if (!q_sym.is_valid()) { return TypeRef::invalid(); }
         const ret: TypeRef = this.types.lookup_func_return(q_sym);
         if (!ret.is_valid()) { return TypeRef::invalid(); }
 
@@ -3221,6 +4579,35 @@ type struct CallResolver {
         return out;
     }
 
+    /// The generic template a scope-call's scope names (`Atomic` in
+    /// `Atomic<u64>::new(..)`), or null.  The scope arrives as written, so all
+    /// four keys it can be registered under are tried: verbatim, through the
+    /// module graph, qualified into the current namespace, and as a
+    /// cross-module leaf.
+    lookup_scope_template(&this, base_name: SymbolStr) -> TemplateEntry* {
+        if (this.ctx.generic_registry == null) { return null; }
+        mut entry: TemplateEntry* = this.ctx.generic_registry.get_template(base_name);
+        if (entry == null) {
+            const di_qual: SymbolStr = this.ctx.resolve_scoped_or(base_name);
+            if (di_qual.is_valid() && !di_qual.equals(base_name)) {
+                entry = this.ctx.generic_registry.get_template(di_qual);
+            }
+        }
+        if (entry == null) {
+            const qualified: SymbolStr = this.ctx.qualify_symbol_sym(base_name);
+            if (!qualified.equals(base_name)) {
+                entry = this.ctx.generic_registry.get_template(qualified);
+            }
+        }
+        if (entry == null) {
+            const cross_sym: SymbolStr = this.types.resolve_cross_module_name(base_name);
+            if (cross_sym.is_valid()) {
+                entry = this.ctx.generic_registry.get_template(cross_sym);
+            }
+        }
+        return entry;
+    }
+
     resolve_generic_scope_name(&this, base_name: SymbolStr, generic_args: &TypeAnnotation*[]) -> SymbolStr {
         if (this.ctx.type_resolver == null) { return SymbolStr::empty(); }
         mut res_ctx: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
@@ -3231,25 +4618,9 @@ type struct CallResolver {
             if (!arg_ref.is_valid()) { return SymbolStr::empty(); }
             arg_refs.push(arg_ref);
         }
-        if (this.ctx.generic_registry != null) {
-            mut entry: TemplateEntry* = this.ctx.generic_registry.get_template(base_name);
-            if (entry == null) {
-                const di_qual: SymbolStr = this.ctx.resolve_scoped_or(base_name);
-                if (di_qual.is_valid() && !di_qual.equals(base_name)) {
-                    entry = this.ctx.generic_registry.get_template(di_qual);
-                }
-            }
-            if (entry == null) {
-                const qualified: SymbolStr = this.ctx.qualify_symbol_sym(base_name);
-                if (!qualified.equals(base_name)) { entry = this.ctx.generic_registry.get_template(qualified); }
-            }
-            if (entry == null) {
-                const cross_sym: SymbolStr = this.types.resolve_cross_module_name(base_name);
-                if (cross_sym.is_valid()) { entry = this.ctx.generic_registry.get_template(cross_sym); }
-            }
-            if (entry != null && arg_refs.length < entry.param_count) {
-                arg_refs = this.ctx.type_resolver.expand_default_type_args(entry, arg_refs, &res_ctx);
-            }
+        const entry: TemplateEntry* = this.lookup_scope_template(base_name);
+        if (entry != null && arg_refs.length < entry.param_count) {
+            arg_refs = this.ctx.type_resolver.expand_default_type_args(entry, arg_refs, &res_ctx);
         }
         const base_qname: QualifiedName = QualifiedName::from_symbol(base_name);
         return MangledName::specialized_identifier(this.intern, this.arena, base_qname, arg_refs);
@@ -3263,18 +4634,35 @@ type struct CallResolver {
         if (ret_t == null || ret_t.kind != TypeKind::InstantiatedType) { return ret; }
         const ret_inst: InstantiatedType* = ret_t as InstantiatedType*;
         if (ret_inst.is_resolved()) { return ret; }
-        if (scope != null && scope.scope_generic_args.length > 0
-                && scope.scope_generic_args.length == ret_inst.type_args.length) {
-            mut resolved_args: TypeRef[] = [];
-            mut all_valid: boolean = true;
-            mut res_ctx: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
-            for (mut i: i64 = 0; i < scope.scope_generic_args.length; i++) {
-                const arg_ref: TypeRef = this.ctx.type_resolver.resolve(scope.scope_generic_args[i], &res_ctx);
-                if (!arg_ref.is_valid()) { all_valid = false; break; }
-                resolved_args.push(arg_ref);
-            }
-            if (all_valid) {
-                return this.ctx.generic_registry.instantiate(ret_inst.generic_base, resolved_args);
+        // Turbofish owner args (`Arc<Thing, GlobalAlloc>::try_new`): map them to the
+        // OWNER's generic params and substitute throughout the return type. This
+        // handles BOTH a return that IS the owner (`-> Arc<T, A>`) and one where the
+        // owner is NESTED (`-> Result<Arc<T, GlobalAlloc>, E>`). The former positional
+        // `instantiate(ret_base, args)` was valid only when the return's outermost
+        // base WAS the owner; for a nested owner it substituted the owner args into
+        // the OUTER generic - `Arc<Thing, GlobalAlloc>::try_new` typed as
+        // `Result<Thing, GlobalAlloc>` instead of `Result<Arc<Thing, GlobalAlloc>, E>`
+        // (it fired only because the arg counts coincidentally matched).
+        if (scope != null && scope.scope_generic_args.length > 0) {
+            mut tmpl: TemplateEntry* = this.resolve_scope_owner_template(scope_name);
+            if (tmpl != null && tmpl.param_type_ids.length >= scope.scope_generic_args.length) {
+                mut resolved_args: TypeRef[] = [];
+                mut all_valid: boolean = true;
+                mut res_ctx: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
+                this.symbolic.symbolic_bind_params(&res_ctx);
+                for (mut i: i64 = 0; i < scope.scope_generic_args.length; i++) {
+                    const arg_ref: TypeRef = this.ctx.type_resolver.resolve(scope.scope_generic_args[i], &res_ctx);
+                    if (!arg_ref.is_valid()) { all_valid = false; break; }
+                    resolved_args.push(arg_ref);
+                }
+                if (all_valid && resolved_args.length < tmpl.param_type_ids.length) {
+                    resolved_args = this.ctx.type_resolver.expand_default_type_args(tmpl, resolved_args, &res_ctx);
+                }
+                if (all_valid && resolved_args.length == tmpl.param_type_ids.length) {
+                    mut subst: TypeSubstitution = TypeSubstitution::from_params(tmpl.param_type_ids, resolved_args);
+                    const out: TypeRef = subst.apply(ret, this.arena);
+                    if (out.is_valid()) { return out; }
+                }
             }
         }
         if (!this.state.expected_type.is_valid()) { return ret; }
@@ -3284,11 +4672,15 @@ type struct CallResolver {
             const alias: TypeAliasType* = exp_t as TypeAliasType*;
             if (alias.has_target()) { exp_ref = alias.target; exp_t = this.arena.lookup(exp_ref.id); }
         }
-        if (exp_t == null || exp_t.kind != TypeKind::InstantiatedType) { return ret; }
-        const exp_inst: InstantiatedType* = exp_t as InstantiatedType*;
-        if (ret_inst.generic_base.id != exp_inst.generic_base.id) { return ret; }
+        // Sibling of the expected-type peel in `compute_static_owner_bindings`:
+        // via the generic-identity view so a post-mono concrete expected type still
+        // yields its type_args.  Without it this returns the still-abstract `ret`.
+        const exp_base: TypeRef = this.types.view_generic_base(exp_ref);
+        if (!exp_base.is_valid()) { return ret; }
+        if (ret_inst.generic_base.id != exp_base.id) { return ret; }
+        const exp_args: TypeRef[] = this.types.view_type_args_copy(exp_ref);
         const scope_qname: QualifiedName = QualifiedName::from_symbol(scope_name);
-        const spec_sym: SymbolStr = MangledName::specialized_identifier(this.intern, this.arena, scope_qname, exp_inst.type_args);
+        const spec_sym: SymbolStr = MangledName::specialized_identifier(this.intern, this.arena, scope_qname, exp_args);
         const spec_ret: TypeRef = this.types.lookup_method_return(spec_sym, member_name);
         if (spec_ret.is_valid()) { return spec_ret; }
         return this.state.expected_type;
@@ -3305,22 +4697,16 @@ type struct CallResolver {
             if (alias.has_target()) { exp_ref = alias.target; exp_t = this.arena.lookup(exp_ref.id); }
         }
         if (exp_t == null) { return found; }
-        if (exp_t.kind == TypeKind::InstantiatedType) {
-            const exp_inst: InstantiatedType* = exp_t as InstantiatedType*;
-            if (exp_inst.generic_base.equals(found)) { return exp_ref; }
-            return found;
-        }
-        if (exp_t.kind == TypeKind::Enum || exp_t.kind == TypeKind::Struct || exp_t.kind == TypeKind::Class) {
-            const count: i64 = this.arena.type_count();
-            for (mut i: i64 = 0; i < count; i++) {
-                const t: Type* = this.arena.types[i];
-                if (t == null || t.kind != TypeKind::InstantiatedType) { continue; }
-                const inst: InstantiatedType* = t as InstantiatedType*;
-                if (!inst.generic_base.equals(found)) { continue; }
-                if (!inst.has_resolved_type()) { continue; }
-                if (inst.resolved_type.id == exp_ref.id) { return exp_ref; }
-            }
-        }
+        // One O(1) question for both representations: is the expected type an
+        // instantiation OF `found`?  A pre-mono wrapper and a post-mono concrete
+        // both answer from their own generic identity.
+        //
+        // This replaces an O(arena) scan that looked for an InstantiatedType whose
+        // `resolved_type` was the expected concrete - i.e. it depended on the
+        // origin-carrier node existing, and silently found nothing once the
+        // concrete carried its identity itself.
+        const exp_base: TypeRef = this.types.view_generic_base(exp_ref);
+        if (exp_base.is_valid() && exp_base.equals(found)) { return exp_ref; }
         return found;
     }
 

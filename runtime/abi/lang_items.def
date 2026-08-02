@@ -1,0 +1,231 @@
+# runtime/abi/lang_items.def — canonical lang-item symbol registry
+#
+# The single source of truth for every `__cryo_`-prefixed runtime symbol the
+# compiler emits calls into. A symbol's spelling lives here and nowhere else in
+# prose: runtime code defines each item as a `![no_mangle]` function whose
+# source name IS the symbol, and generated code references it by codegen, never
+# by a hand-typed string. When adding or changing a lang item, edit this file
+# first, then the definition.
+#
+# Columns: SYMBOL | SIGNATURE | DEFINED-BY (tier) | STATUS
+#
+# ABI conventions (settled; this file is their source of truth):
+#   - string   : the primitive thin, NUL-terminated `i8*` (8 bytes). This is the
+#                panic message/file operand type. No compiler change: today's
+#                `@panic` already passes `i8*`, and message/file are always
+#                codegen-emitted static NUL-terminated literals, so the call
+#                sites build no fat pointer. (No embedded NUL / explicit length —
+#                fine for static panic strings.)
+#   - SourceLoc: POD { file: string, line: u32, col: u32 }, 16 bytes (see
+#                layout.def), passed BY POINTER to a static constant. Codegen
+#                emits one private global per site from compile-time data, so it
+#                is still zero-alloc; by-pointer avoids classifying a 16-byte
+#                POD by hand under two different C ABIs (SysV vs Win64), which
+#                is the only reason the by-value form was ever attractive.
+#   - Message/file strings are static, codegen-emitted bytes — never heap.
+#   - The panic seam is abort-now / unwind-ready: the check helpers CALL
+#     __cryo_panic; nothing inlines abort/trap assuming the abort strategy.
+#     Adding `--panic=unwind` later must require no change to any core/ file.
+
+# --- Entry (freestanding profile) ------------------------------------------
+# Per-OS. AMD and Intel share the x86-64 ISA -> one x86-64 codepath covers both
+# vendors; the split that matters is OS ABI (Linux vs Windows). Present only in
+# no_runtime builds; a hosted program starts at the hosted entry below.
+#
+# Linux: the ELF entry the linker resolves under `-nostartfiles`. Reads argc/argv
+# off the initial stack, hands them to __cryo_start. Fully freestanding (no libc,
+# no imports). Exit = `exit_group` syscall.
+_start          | ![naked] () -> void                       | core (freestanding, linux) | DONE (linux)
+# Startup trampoline: runs the user `main` and exits with its return. `main` is
+# an external C-ABI symbol resolved from the user object.
+__cryo_start    | (argc: i64, argv: i8**) -> never          | core (freestanding, linux) | DONE (linux)
+#
+# Windows: PE startup passes no stack args and has no stable raw-syscall ABI, so
+# the entry links ntdll (its sole dependency) and exits via NtTerminateProcess.
+# Because the loader passes nothing on the stack, arguments are read from the PEB
+# instead: ProcessParameters.CommandLine is one UTF-16 UNICODE_STRING, so the
+# entry owns both the split (the CRT's documented quoting rules) and the
+# UTF-16 -> UTF-8 transcode. The process heap (also from the PEB) sizes the argv
+# vector, so nothing is capped or truncated. This deliberately avoids shell32's
+# CommandLineToArgvW, which would parse for us but add a third DLL dependency.
+# The driver's no_runtime link emits
+# `-nostartfiles -nostdlib -Wl,-e,_start -lntdll` for a windows target.
+_start          | ![naked] () -> void  (PE entry, /entry=_start) | core (freestanding, windows) | DONE (windows)
+# ntdll import, called by the windows exit path with (HANDLE)-1.
+NtTerminateProcess | (process: i64, status: i32) -> i32  (extern, ntdll) | ntdll | (system)
+# Satisfies the mingw backend's `call __main` in main's prologue (C global-ctor
+# bootstrap). Empty in a freestanding build because there is no CRT and Cryo
+# emits no constructors, so there is genuinely nothing to run; a hosted build
+# does NOT define this -- it calls mingw's real __main instead.
+__main          | () -> void                                | core (freestanding, windows) | DONE (windows)
+#
+# __cryo_start is shared (both OSes): capture arguments, run `main`, exit with
+# its return. Capture itself is per-OS, because the two OSes hand arguments over
+# by different mechanisms: Linux's _start stages the kernel-supplied argc/argv
+# into the SysV arg registers (rdi/rsi) and capture only records them; Windows
+# receives nothing on the stack (rcx/rdx are zeroed) and parses the PEB command
+# line instead. Programs read the captured values through these accessors, which
+# report 0 / null if the OS could not supply arguments.
+__cryo_argc     | () -> i64                                 | core (freestanding) | DONE (dual-OS)
+__cryo_argv     | () -> i8**                                | core (freestanding) | DONE (dual-OS)
+
+# --- Entry (hosted profile) -------------------------------------------------
+# A hosted program starts in Cryo too. The link KEEPS the crt objects and only
+# retargets the entry symbol (`-Wl,-e,__cryo_entry`); it does NOT pass
+# -nostartfiles. Dropping them takes __dso_handle + _init (linux) and atexit +
+# _pei386_runtime_relocator (windows) with them, and each of those is a LINK
+# failure -- `atexit` unconditionally so, because libmingwex references it. `-e`
+# also EXTRACTS the entry from the tier archive: ld enters the entry symbol as an
+# undefined reference.
+#
+# Entering past crt0 means owning what its startup would have driven, which is
+# per-OS. Linux: walk .preinit_array, call _init (crti.o), walk .init_array --
+# glibc's call_init order -- each entry receiving (argc, argv, envp). Windows:
+# call _pei386_runtime_relocator (fixes auto-imported DLL *data*; msvcrt's
+# _environ reads as garbage without it) then mingw's real __main (C global ctors,
+# idempotent). Skipping either leaves every static constructor unrun.
+#
+# Linux is `![naked]` for the same reason `_start` is (kernel entry, argc at
+# %rsp); Windows is NOT, because the loader `call`s the entry on an ordinary
+# frame -- and a real frame carries the .pdata unwind info a naked stub lacks.
+#
+# ONE EXCEPTION, forced not chosen: `--release-static` keeps crt0's entry. It
+# passes `-static`, and a fully static glibc sets up its own thread control block
+# inside __libc_start_main -- the job ld.so does before the entry runs in a
+# dynamic link. Entering past it leaves TLS unmapped and the program dies on the
+# first thread-local access (the unwind tier's panic state is thread-local).
+# Measured: a static binary with a retargeted entry segfaults before `main`.
+# Nothing else emits `-static`, so the exception is exactly as narrow as the flag.
+__cryo_entry        | ![naked] () -> void (linux) / () -> never (windows) | core (hosted) | DONE (dual-OS)
+# Shared startup trampoline: image fixups, capture arguments, run static
+# constructors, then `main` -- which here carries the WIDENED C signature
+# `int main(int, char**, char**)` codegen emits for a hosted program, not the
+# zero-arg freestanding form. Terminates through libc `exit`, which is what
+# flushes buffered stdio and runs atexit handlers.
+__cryo_hosted_start | (argc: i64, argv: i8**) -> never       | core (hosted) | DONE (dual-OS)
+# Startup services the retained crt objects provide, called BY the hosted entry
+# rather than defined by it (windows only).
+_pei386_runtime_relocator | () -> void  (extern, crt2.o)     | mingw crt | (system)
+__p__environ              | () -> i8***  (extern, msvcrt)    | msvcrt    | (system)
+_init                     | () -> void  (extern, crti.o)     | glibc crt | (system)
+
+# --- Link line -------------------------------------------------------------
+# The driver composes the tier archives itself; a freestanding program links by
+# `cryo build` alone, with no linker arguments from the user.
+# CodegenPasses::resolve_runtime_lib_dir locates them (CRYO_RUNTIME, then
+# CRYO_HOME, then relative to the compiler binary, then relative to the stdlib),
+# preferring a per-triple SUBDIRECTORY at every candidate -- a project's final
+# artifacts hoist to the root of its output_dir, so building the runtime for a
+# second target overwrites the first target's archives in place, and linking a
+# flat directory can hand the linker another architecture's objects.
+#
+# append_runtime_tier_libs fixes the ORDER: alloc, backtrace, core, then the
+# panic tier LAST, because ld resolves left to right and every other tier can
+# reach the panic handlers (core's and backtrace's own formatting helpers carry
+# bounds checks). The tiers' imported system libraries (kernel32/ntdll) follow
+# the archives for the same reason.
+#
+# append_hosted_runtime_libs is its hosted counterpart: core-hosted, then the
+# panic tier, then `-Wl,-e,__cryo_entry`. The windows `extra_system_libs`
+# (-lntdll) already follows on both link paths, which the core tier needs for the
+# PEB argv parse.
+#
+# The locator is asked which KIND of tier set it is looking for, because the two
+# ship different archives and a directory holding only the other kind is not a
+# hit. That matters more for hosted than freestanding: `-e` naming a symbol
+# nothing defines is a linker WARNING, so a wrong directory would still produce a
+# binary -- one that starts at whatever address ld defaulted to.
+
+# --- Panic funnel ----------------------------------------------------------
+# The single divergent sink: print "panicked at <file>:<line>: <msg>" to
+# stderr, then terminate (exit code 101). panic/abort/ DEFINES it, dual-OS.
+# The panic/unwind/ tier redefines the same symbol to unwind instead — chosen at
+# link time, no caller change.
+#
+# The tier is built TWICE from the same source. Freestanding it writes with
+# Linux write(2) / Windows WriteFile and exits via exit_group / NtTerminateProcess.
+# Hosted (runtime/hosted/, `no_runtime = false`) it keeps the same write path but
+# exits through libc `exit`, which runs atexit handlers and flushes stdio — a raw
+# exit there would silently discard whatever the panicking program had buffered.
+# The divergence lives entirely in CryoRt::Sys; the funnel itself is identical.
+#
+# Codegen is routed here: `emit_panic_call` emits a call to the external
+# `__cryo_panic` for every panic, hosted or freestanding, and the link line names
+# exactly one panic tier (`append_hosted_runtime_libs` / `append_runtime_tier_libs`).
+# The per-module libc `@panic` body it used to emit is gone.
+__cryo_panic              | (msg: string, file: string, line: u32) -> never  | panic/abort | DONE (runtime def dual-OS + dual-config; compiler routed)
+
+# --- Unwind surface ---------------------------------------------------------
+# BOTH panic tiers export every symbol below, and differ only in behaviour: that
+# is what makes the strategy a pure link-time swap. The abort tier's copies are
+# reachable-but-inert stubs, present because `libcryo.a` is built ONCE with the
+# default strategy, so an `--panic=abort` program can still be handed stdlib
+# objects that name a personality or the caught-panic accessors. Dropping them
+# from either tier turns a strategy switch into an undefined-symbol link error.
+#
+# `__cryo_personality_v0` is the one lang item whose SIGNATURE is per-OS. Linux
+# names it as the LLVM `personality` and the SysV unwinder calls it with the
+# Itanium 5-argument form. Windows-gnu emits the same symbol into `.xdata` as the
+# frame's language handler, so the OS calls it with the 4-argument SEH form; the
+# unwind tier bridges that to the shared Itanium logic via mingw's
+# `_GCC_specific_handler`, which is how libstdc++'s `__gxx_personality_seh0`
+# works. Declaring the Itanium form on Windows would read garbage arguments.
+# Emitted by codegen (`ExprOps::get_or_decl_personality`), not hand-typed.
+__cryo_personality_v0     | per-OS: Itanium (linux) / SEH (windows)           | panic/*     | DONE (both tiers, dual-OS; SEH-backed on windows)
+__cryo_panic_finish       | () -> never                                        | panic/*     | DONE (both tiers; root-catch tail, emitted under unwind)
+__cryo_panic_taken_message| () -> string                                       | panic/*     | DONE (both tiers; abort's returns null - unreachable there)
+__cryo_panic_taken_file   | () -> string                                       | panic/*     | DONE (both tiers; abort's returns null - unreachable there)
+__cryo_panic_taken_line   | () -> u32                                          | panic/*     | DONE (both tiers; abort's returns 0 - unreachable there)
+
+# --- Check handlers (route raw operands through the funnel) -----------------
+# Each takes RAW operands (not a pre-formatted string) plus a SourceLoc POD
+# ({file,line,col}, 16 bytes; see layout.def), formats its own message into a
+# stack buffer, and diverges via __cryo_panic. DEFINED in panic/abort, dual-OS.
+# The compiler EMITS these under `no_runtime`. Before that it emitted a libc
+# `abort()` at each of the five check sites, which cannot link freestanding --
+# there is no libc to resolve it -- so every panic tier failed this workspace's
+# own acceptance check while still compiling cleanly. `op` is a raw arithmetic-op
+# code; 2 = multiply (the array-size guard) is the only value emitted so far.
+__cryo_panic_bounds_check | (loc: SourceLoc*, index: u64, len: u64) -> never | panic/abort | DONE (runtime def + compiler emit, dual-OS)
+__cryo_panic_overflow     | (loc: SourceLoc*, op: u32, lhs: u64, rhs: u64) -> never | panic/abort | DONE (runtime def + compiler emit, dual-OS)
+__cryo_panic_div_zero     | (loc: SourceLoc*) -> never                       | panic/abort | DONE (runtime def + compiler emit, dual-OS)
+__cryo_panic_no_match     | (loc: SourceLoc*) -> never                       | panic/abort | DONE (runtime def + compiler emit, dual-OS)
+
+# --- Allocator (weak / user-overridable) -----------------------------------
+# Every heap site routes through ExprOps::emit_raw_alloc / emit_raw_dealloc
+# rather than an open-coded copy each. The resolver ladder is
+# arena / allocator::alloc / __cryo_alloc / malloc, and the lang-item step fires
+# under `no_runtime`.
+#
+# Freestanding that step is not an optimisation, it is the only option:
+# `-nostdlib` leaves no libc `malloc` and `no_std` leaves no stdlib allocator,
+# so before it existed EVERY `new` in a freestanding program failed codegen with
+# "'malloc' not declared" -- the language's own heap syntax was unusable.
+#
+# A hosted build keeps the malloc-backed ladder. Repointing it too would make
+# every hosted allocation an mmap/VirtualAlloc (this tier maps once PER
+# ALLOCATION), so a hosted repoint waits on a segment/free-list allocator behind
+# the same symbol.
+#
+# `size` is passed 0 at `delete` sites: the site does not carry the allocation
+# size, and the tier recovers the exact mapping from its own header instead.
+__cryo_alloc    | (size: u64, align: u64) -> void*          | alloc | DONE (runtime def weak dual-OS + compiler funnel, no_runtime)
+__cryo_dealloc  | (ptr: void*, size: u64, align: u64) -> void | alloc | DONE (runtime def weak dual-OS + compiler funnel, no_runtime)
+
+# --- Backtrace / diagnostics -----------------------------------------------
+# Print one hex return address per stack frame to stderr. Raw addresses only;
+# symbolization (address -> name via ELF/DWARF) is a follow-up. The WALK is
+# per-OS because the two ABIs record frames differently: Linux follows the rbp
+# chain (frame_address(0) + saved-rbp links, terminated by _start's zeroed rbp),
+# while Win64 unwinding is table-based, so codegen omits the rbp chain entirely
+# and there is nothing to follow -- Windows walks the .pdata RUNTIME_FUNCTION
+# tables with a bounded RtlVirtualUnwind loop instead.
+#
+# ntdll RtlCaptureStackBackTrace was the intended Windows mechanism and is NOT
+# usable from a freestanding image: called from a `-nostartfiles -nostdlib` PE it
+# runs away and exhausts the whole 2 MB stack. The TEB is NOT the problem -- it
+# is present with valid StackBase/StackLimit, and adding .seh_proc unwind info to
+# _start does not change the outcome. The image carries no language exception
+# handler, so a fault inside the unwinder cannot be dispatched. Hence the
+# self-bounded walk. Do not re-try RtlCaptureStackBackTrace.
+__cryo_backtrace | () -> void                                | backtrace | DONE (dual-OS: linux rbp chain, windows bounded RtlVirtualUnwind over .pdata)

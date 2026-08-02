@@ -1,0 +1,294 @@
+// An `async` method with a `&this` receiver stores the ADDRESS of that receiver
+// in the future it lowers to.  That address is only correct for the state that
+// built it: an owning receiver promoted across states lives in a fresh
+// block-local on every poll (taken from its frame field on entry, handed back on
+// the way out), and a future may additionally be moved between polls, since Cryo
+// futures are documented as freely movable and carry no address-stability
+// requirement.
+//
+// So the enclosing frame re-addresses the receiver from its own storage before
+// every poll.  Without that, the second poll of a suspending `&this` method
+// reads and writes through a pointer into a frame that is gone -- which corrupts
+// silently rather than faulting, because the stack slot is usually still intact.
+//
+// These tests therefore drive their futures with a hand-written `block_on` that
+// dirties the stack between polls, which is what makes a stale receiver pointer
+// observable at all.  Polling a future by hand is a supported way to drive one.
+![config(testing)]
+namespace CryoTests::Tests::Lang::AsyncReceiverRefresh;
+
+import std::test;
+import std::core::result;
+import std::fmt;
+import std::future;
+import std::future::ready;
+
+/// An owning aggregate: it reaches the promoted-across-states path, so it is
+/// taken into a fresh block-local on every poll.
+type struct ArrHolder {
+    base: i64;
+    buf:  Array<u8>;
+
+    /// Three suspends, so the receiver round-trips through the frame repeatedly
+    /// rather than only once.
+    async bump(&this, n: i64) -> i64 {
+        const a: i64 = await PendingThenReady<i64>::new(3, 10);
+        return this.base + n + a;
+    }
+}
+
+/// A receiver one field hop further in, which is the shape of a connection that
+/// owns its transport.
+type struct ArrOuter {
+    inner: ArrHolder;
+    tag:   i64;
+
+    async run(&this, n: i64) -> i64 {
+        const v: i64 = await this.inner.bump(n);
+        return v + this.tag;
+    }
+}
+
+async function arr_drive_param(h: ArrHolder) -> i64 {
+    return await h.bump(5);
+}
+
+async function arr_drive_local() -> i64 {
+    const h: ArrHolder = ArrHolder { base: 100, buf: Array<u8>::new() };
+    return await h.bump(5);
+}
+
+async function arr_drive_ptr(h: ArrHolder*) -> i64 {
+    return await h.bump(5);
+}
+
+async function arr_drive_nested(o: ArrOuter) -> i64 {
+    return await o.run(5);
+}
+
+/// Write over the stack the poll that just returned was using, at the depth the
+/// next poll will run at.  A real executor does this for free by polling another
+/// task in between; `format` is here so the writes survive optimization.
+function arr_churn(d: i64) -> i64 {
+    const s: String = format("churn %lld deadbeef", d);
+    mut n: i64 = s.length() as i64;
+    if (d > 0) { n = n + arr_churn(d - 1); }
+    return n;
+}
+
+/// `future::block_on`, except it dirties the stack between polls.
+function arr_block_on<F, R>(fut: F) -> R
+where F: Future<R> {
+    mut f:  F       = fut;
+    mut cx: Context = Context::new(Waker::noop());
+    loop {
+        match (f.poll(&cx)) {
+            Poll::Ready(v) => { return v; }
+            Poll::Pending  => { const _dirty: i64 = arr_churn(6); }
+        }
+    }
+}
+
+// The receiver is a carried aggregate PARAMETER, live across three suspends.
+![test]
+function async_receiver_survives_suspend_as_a_parameter() -> Result<(), TestError> {
+    const a: i64 = arr_block_on(arr_drive_param(
+        ArrHolder { base: 100, buf: Array<u8>::new() }));
+    return expect_eq(a, 115 as i64);
+}
+
+// The receiver is a LOCAL of the async function rather than a parameter.
+![test]
+function async_receiver_survives_suspend_as_a_local() -> Result<(), TestError> {
+    const b: i64 = arr_block_on(arr_drive_local());
+    return expect_eq(b, 115 as i64);
+}
+
+// A receiver reached through a pointer already IS the address the callee stores,
+// so it must be passed through rather than addressed a second time.
+![test]
+function async_receiver_through_a_pointer_is_not_double_addressed()
+        -> Result<(), TestError> {
+    mut owned: ArrHolder = ArrHolder { base: 100, buf: Array<u8>::new() };
+    const c: i64 = arr_block_on(arr_drive_ptr(&owned));
+    return expect_eq(c, 115 as i64);
+}
+
+// Two levels: an `async` method awaiting an `async` method on its own field.
+// Each level re-addresses its own receiver, so the chain stays valid.
+![test]
+function async_receiver_refreshes_through_a_field_chain() -> Result<(), TestError> {
+    const d: i64 = arr_block_on(arr_drive_nested(ArrOuter {
+        inner: ArrHolder { base: 100, buf: Array<u8>::new() }, tag: 7 }));
+    return expect_eq(d, 122 as i64);
+}
+
+
+// A future generic in its OWNER reaches the refresh as an instantiation whose
+// fields specialization has not filled in yet, so the receiver slot has to be
+// looked for on the template the instantiation came from.  Answering from the
+// instantiation alone finds no slot and skips the refresh, and the method then
+// writes through a pointer to a block-local the frame has stopped using -- the
+// writes are simply never seen again.
+//
+// Reads mostly survive that (the stale copy still holds what the receiver held
+// when the future was built), which is why the tests above do not catch it.
+// These observe a WRITE made through `mut &this` from the caller afterwards.
+
+type trait GenTick {
+    async tick(mut &this, n: i64) -> i64;
+}
+
+/// Owns an aggregate, so the receiver takes the promoted-across-states path.
+type struct GenLeaf {
+    hits: i64;
+    buf:  Array<u8>;
+}
+
+implement trait GenTick for GenLeaf {
+    async tick(mut &this, n: i64) -> i64 {
+        const a: i64 = await PendingThenReady<i64>::new(3, 10);
+        this.hits = this.hits + 1;
+        return this.hits + n + a;
+    }
+}
+
+/// Generic in its transport and owning it: the shape of every protocol layer
+/// that runs over an async transport.
+type struct GenConn<S> {
+    inner: S;
+    seen:  i64;
+
+    async pump(mut &this, n: i64) -> i64 where S: GenTick {
+        const v: i64 = await this.inner.tick(n);
+        this.seen = this.seen + v;
+        return v;
+    }
+
+    /// Suspends nowhere itself.  The refresh is still required: the caller
+    /// stashes and polls this future exactly as it does a suspending one, so the
+    /// receiver it holds is a block-local of the state that built it either way.
+    async touch(mut &this) -> i64 {
+        this.seen = this.seen + 1;
+        return this.seen;
+    }
+}
+
+async function gen_drive_mutation() -> i64 {
+    mut c: GenConn<GenLeaf> = GenConn<GenLeaf> {
+        inner: GenLeaf { hits: 0, buf: Array<u8>::new() }, seen: 0 };
+    const v: i64 = await c.pump(5);
+    return v + c.seen + c.inner.hits;
+}
+
+async function gen_drive_no_suspend() -> i64 {
+    mut c: GenConn<GenLeaf> = GenConn<GenLeaf> {
+        inner: GenLeaf { hits: 0, buf: Array<u8>::new() }, seen: 40 };
+    const v: i64 = await c.touch();
+    return v + c.seen;
+}
+
+async function gen_drive_ptr(c: GenConn<GenLeaf>*) -> i64 {
+    const v: i64 = await c.pump(5);
+    return v + c.seen + c.inner.hits;
+}
+
+// A write made through `mut &this` by an `async` method on a generic owner is
+// visible to the caller once the future completes.  `pump` returns
+// 1 (hits) + 5 (n) + 10 (awaited) == 16, stores it in `seen`, and the leaf's own
+// `hits` write must have landed too.
+![test]
+function async_generic_owner_receiver_write_is_visible() -> Result<(), TestError> {
+    const a: i64 = arr_block_on(gen_drive_mutation());
+    return expect_eq(a, 33 as i64);
+}
+
+// The same, for a method on a generic owner that never suspends.
+![test]
+function async_generic_owner_receiver_write_without_a_suspend() -> Result<(), TestError> {
+    const b: i64 = arr_block_on(gen_drive_no_suspend());
+    return expect_eq(b, 82 as i64);
+}
+
+// A generic owner reached through a pointer: the place already IS the address
+// the callee stored, so it is passed through rather than addressed again.
+![test]
+function async_generic_owner_through_a_pointer_is_not_double_addressed()
+        -> Result<(), TestError> {
+    mut owned: GenConn<GenLeaf> = GenConn<GenLeaf> {
+        inner: GenLeaf { hits: 0, buf: Array<u8>::new() }, seen: 0 };
+    const c: i64 = arr_block_on(gen_drive_ptr(&owned));
+    return expect_eq(c, 33 as i64);
+}
+
+
+// A receiver held one level down, inside a combinator the awaited expression
+// built: the refresh has to walk into the constructed future and re-address the
+// child's receiver slot, which means knowing WHICH field of the combinator the
+// child was put in.  That answer is read off the constructing static's
+// declaration, and inside a generic impl the static's type arguments still
+// mention the owner's parameter -- so sema never records which template won and
+// the callee has to be re-found from how it is spelled.
+//
+// A combinator of this file's own rather than `Futures::timeout`: the real one
+// needs a reactor, and an `Executor`'s `block_on` polls from one reused frame,
+// which is the condition under which a stale receiver pointer still reads
+// correctly.  `arr_block_on` dirties the stack instead.  (`Futures::timeout` in
+// this exact position is covered by `future_combinator.cryo`.)
+
+/// `tally` sits ahead of `fut` in the declaration while `fut` is initialized
+/// first in the literal, and the child is argument 1 rather than argument 0 --
+/// so a refresh that matched on either position instead of on the parameter the
+/// child was passed as would address the wrong field.
+type struct GenBoxed<F, O> {
+    tally: i64;
+    fut:   F;
+}
+
+implement<F, O> trait Future<O> for struct GenBoxed<F, O>
+where F: Future<O> {
+    poll(mut &this, cx: Context*) -> Poll<O> {
+        match (this.fut.poll(cx)) {
+            Poll::Ready(v) => { return Poll::Ready(v); }
+            Poll::Pending  => { }
+        }
+        this.tally = this.tally + 1;
+        return Poll::Pending;
+    }
+}
+
+/// The same shape as `Futures::timeout`: a generic static handing its future
+/// parameter straight into a field of the struct it returns.
+type struct GenCombine {
+    static boxed<F, O>(pad: i64, fut: F) -> GenBoxed<F, O>
+    where F: Future<O> {
+        return GenBoxed<F, O> { fut: fut, tally: pad };
+    }
+}
+
+implement struct GenConn<S> {
+    /// `pump`'s receiver is this owner, so the combinator's `fut` field holds a
+    /// pointer that has to be re-addressed on every poll -- and the write `pump`
+    /// makes through `mut &this` only lands if it was.
+    async wrapped(mut &this, n: i64) -> i64 where S: GenTick {
+        const v: i64 = await GenCombine::boxed(0, this.pump(n));
+        this.seen = this.seen + 1000;
+        return v;
+    }
+}
+
+async function gen_drive_wrapped() -> i64 {
+    mut c: GenConn<GenLeaf> = GenConn<GenLeaf> {
+        inner: GenLeaf { hits: 0, buf: Array<u8>::new() }, seen: 0 };
+    const v: i64 = await c.wrapped(5);
+    return v + c.seen + c.inner.hits;
+}
+
+// `pump` returns 1 (hits) + 5 (n) + 10 (awaited) == 16 and stores it in `seen`;
+// `wrapped` then adds 1000 to `seen` through the same receiver.  16 + 1016 + 1.
+![test]
+function async_generic_owner_refreshes_through_a_combinator()
+        -> Result<(), TestError> {
+    const a: i64 = arr_block_on(gen_drive_wrapped());
+    return expect_eq(a, 1033 as i64);
+}

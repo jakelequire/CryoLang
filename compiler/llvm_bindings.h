@@ -202,6 +202,8 @@ void           LLVMDumpValue(LLVMValueRef Val);
 char          *LLVMPrintValueToString(LLVMValueRef Val);
 void           LLVMSetLinkage(LLVMValueRef Global, int Linkage);
 int            LLVMGetLinkage(LLVMValueRef Global);
+/* Object-file section placement (drives `![section("name")]`). */
+void           LLVMSetSection(LLVMValueRef Global, const char *Section);
 
 /* COMDAT - required for linkonce_odr / weak_odr to dedupe on COFF.
  * On ELF the linker auto-dedupes by section group; COFF requires an
@@ -269,6 +271,7 @@ LLVMValueRef LLVMGetNextGlobal(LLVMValueRef GlobalVar);
 LLVMValueRef LLVMGetInitializer(LLVMValueRef GlobalVar);
 void         LLVMSetInitializer(LLVMValueRef GlobalVar, LLVMValueRef ConstantVal);
 void         LLVMSetGlobalConstant(LLVMValueRef GlobalVar, LLVMBool IsConstant);
+void         LLVMSetThreadLocal(LLVMValueRef GlobalVar, LLVMBool IsThreadLocal);
 void         LLVMSetUnnamedAddress(LLVMValueRef Global, int UnnamedAddr);
 
 
@@ -496,6 +499,31 @@ LLVMValueRef LLVMBuildExtractValue(LLVMBuilderRef B, LLVMValueRef AggVal,
                                    unsigned Index, const char *Name);
 LLVMValueRef LLVMBuildInsertValue(LLVMBuilderRef B, LLVMValueRef AggVal,
                                   LLVMValueRef EltVal, unsigned Index, const char *Name);
+
+
+/* ===================================================================
+ * Exception handling (DWARF unwinding)
+ *
+ * `invoke` terminates a block with a normal edge (`Then`) and an unwind
+ * edge (`Catch`, which must start with a `landingpad`).  The landing pad's
+ * result type is the `{ ptr, i32 }` exception/selector pair; `PersFn` is
+ * legacy and ignored by modern LLVM (the personality lives on the function,
+ * set via LLVMSetPersonalityFn) - pass null.  A `cleanup` landing pad runs
+ * destructors then `resume`s; a `catch` clause (LLVMAddClause with a type
+ * info value, or a null pointer for catch-all) stops the unwind.
+ * =================================================================== */
+
+LLVMValueRef LLVMBuildInvoke2(LLVMBuilderRef B, LLVMTypeRef Ty, LLVMValueRef Fn,
+                              LLVMValueRef *Args, unsigned NumArgs,
+                              LLVMBasicBlockRef Then, LLVMBasicBlockRef Catch,
+                              const char *Name);
+LLVMValueRef LLVMBuildLandingPad(LLVMBuilderRef B, LLVMTypeRef Ty,
+                                 LLVMValueRef PersFn, unsigned NumClauses,
+                                 const char *Name);
+LLVMValueRef LLVMBuildResume(LLVMBuilderRef B, LLVMValueRef Exn);
+void         LLVMAddClause(LLVMValueRef LandingPad, LLVMValueRef ClauseVal);
+void         LLVMSetCleanup(LLVMValueRef LandingPad, LLVMBool Val);
+void         LLVMSetPersonalityFn(LLVMValueRef Fn, LLVMValueRef PersonalityFn);
 
 
 /* ===================================================================

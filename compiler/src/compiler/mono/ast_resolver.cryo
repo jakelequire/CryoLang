@@ -71,6 +71,10 @@ type struct MonoAstResolver {
             module_name = this.intern_table.resolve(entry.module_name);
         }
         mut res_ctx: ResolutionContext = ResolutionContext::new(module_name, "");
+        // The template's own module owns every annotation in this AST; the
+        // ambient scope chain still points at whichever module demanded the
+        // specialization.
+        res_ctx.set_home_module(module_name);
 
         match (node_kind) {
             NodeKind::StructDeclaration => {
@@ -117,6 +121,12 @@ type struct MonoAstResolver {
                 // Persist the concrete trait-element bindings onto the spec'd impl
                 // (self-returning defaults are instantiated lazily and re-seed these).
                 this.trait_spec.cache_derived_trait_params(decl, &res_ctx);
+                // Drop conditionally-bounded trait defaults (`min`/`max` with
+                // `where This::Item: Ord`) whose concrete Item does not satisfy
+                // the bound for THIS monomorphization (e.g. `EnumerateIter`'s
+                // `Pair` Item is not `Ord`) - before their bodies are resolved,
+                // so `.compare()` on a non-`Ord` element never reaches type check.
+                this.trait_spec.filter_projection_bound_methods(decl, this_type);
                 // Rewrite where-bound-derived generics (`A`) inside the impl's method
                 // BODIES so a struct literal `Pair<A, A>{..}` becomes concrete before
                 // body resolution.  Run before resolve_methods.
@@ -442,6 +452,9 @@ type struct MonoAstResolver {
     /// True if the scrutinee's TypeID equals any of `arm`'s `|`-separated type
     /// patterns.  A `static match` arm may list several types that share one body
     /// (`u8 | u16 | u32 => ...`); the arm is live if the scrutinee matches any.
+    /// Plain id equality is sufficient: the arena hash-conses types, so one
+    /// semantic type has exactly one id, and aliases and resolved instantiations
+    /// are already collapsed to their underlying entry before mono runs.
     arm_matches_scrutinee(mut &this, arm: StaticMatchArmNode*, scrut: TypeRef,
                           res_ctx: ResolutionContext*) -> boolean {
         for (mut p: i64 = 0; p < arm.type_patterns.length; p++) {

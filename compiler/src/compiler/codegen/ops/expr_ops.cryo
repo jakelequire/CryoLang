@@ -23,6 +23,12 @@ import Compiler::Codegen::Ops::{ SymbolResolver, IntrinsicEmitter };
 import Compiler::CompilationContext;
 import Compiler::Diag;
 import Compiler::Diag::{ Diagnostic, SourceSpan };
+// AST access is otherwise avoided here (see the module doc), but the shared
+// `--panic=unwind` cleanup landing pad must replay drop-call statements via
+// `accept(visitor)`, which needs the node + visitor types.  This is a downward
+// dependency (Codegen already depends on AST), not a cycle.
+import Compiler::AST;
+import Compiler::AST::{ Node, Visitor, Statement };
 import Compiler::Types;
 import Compiler::Types::{ TypeRef, Type, Arena, Compound, UserDefined };
 import Compiler::Resolver::{ SymbolStr, InternTable };
@@ -49,6 +55,42 @@ type struct ExprOps {
     /// function is not variadic.
     current_variadic_arg_id: u32;
 
+    /// Transient `invoke` swap state, armed by CallEmitter around a single
+    /// `codegen_call` when the current frame has live droppable locals under
+    /// `--panic=unwind`.  While `invoke_active`, `build_call_maybe_invoke`
+    /// emits an `invoke` (normal edge -> `invoke_normal`, unwind edge ->
+    /// `invoke_lpad`) in place of a plain `call`, repositions the builder at
+    /// the normal block, and clears the flag so at most one invoke is emitted
+    /// per activation.  Inactive on the default abort path => plain `call`,
+    /// byte-identical IR.
+    invoke_active: boolean;
+    invoke_normal: LBasicBlock;
+    invoke_lpad:   LBasicBlock;
+
+    /// Live anonymous owning argument temporaries (`--panic=unwind` only).
+    /// `f(make(), boom())`: make()'s result is an owning temp with no AST
+    /// binding, so DropInsertion's name-keyed pending-arg machinery cannot
+    /// schedule its drop. CallEmitter spills each such temp to a stable slot,
+    /// registers it under a synthetic name in the value table, and pushes a
+    /// ready-made `<name>.drop()` statement here. A panic origin nested in a
+    /// LATER argument (a call that unwinds, or a synthesized div/bounds/no-match/
+    /// overflow check) drops the WHOLE live stack in its cleanup pad before the
+    /// unwind continues: at the panic point the enclosing calls have not run
+    /// (their args are still evaluating), so nobody else will drop these temps.
+    /// `arg_temp_frames[k]` records where the k-th in-progress call's temps
+    /// begin, so CallEmitter truncates them once that call is fully built (the
+    /// callee now owns them). Populated only under a hosted unwind build, so the
+    /// default abort path allocates nothing and its IR is unchanged.
+    arg_temp_drops:  ASTNode*[];
+    arg_temp_frames: i64[];
+
+    /// Set while a cleanup landing pad replays its drops. The synthesized
+    /// `<name>.drop()` calls route back through the ordinary call path, whose
+    /// invoke decision consults `arg_temp_drops`; without this guard a drop
+    /// emitted inside the pad would itself become an invoke that re-drops the
+    /// same stack. Suppresses only the arg-temp half of the invoke decision.
+    suppress_arg_temp_invoke: boolean;
+
     static null() -> ExprOps {
         return ExprOps {
             llvm_module: null,
@@ -63,6 +105,12 @@ type struct ExprOps {
             diag:        null,
             ctx:         null,
             current_variadic_arg_id: 0,
+            invoke_active: false,
+            invoke_normal: LBasicBlock::null(),
+            invoke_lpad:   LBasicBlock::null(),
+            arg_temp_drops:  [],
+            arg_temp_frames: [],
+            suppress_arg_temp_invoke: false,
         };
     }
 
@@ -623,6 +671,490 @@ type struct ExprOps {
         return call_val;
     }
 
+    /// Stack slot for an ABI coercion spill, allocated in the function's entry
+    /// block.  Allocas are only reclaimed at function exit, so emitting one at
+    /// the current insert point costs a fresh slot per iteration when the call
+    /// sits in a loop body - unbounded stack growth in a hot loop.  Only the
+    /// alloca is hoisted; the store stays where the caller emits it.  Falls
+    /// back to an in-place alloca when the insert block has no parent function
+    /// (the entry block is then unreachable, and a per-iteration slot is still
+    /// correct, just not hoisted).
+    coercion_slot(mut &this, ty: LType, name: string) -> LValue {
+        const bb: LBasicBlock = this.builder.get_insert_block();
+        if (bb.is_valid()) {
+            const fn: LValue = bb.get_parent();
+            if (fn.is_valid()) {
+                const slot: LValue = this.flow.create_entry_alloca(fn, name, ty);
+                if (slot.is_valid()) { return slot; }
+            }
+        }
+        return this.builder.build_alloca(ty, name);
+    }
+
+    /// Coerce one call argument from the LLVM type it actually has to the
+    /// type the callee's signature declares for its slot.  Dispatch is keyed on
+    /// the (expected, actual) `LTypeKind` pair; `slot_index` distinguishes the
+    /// receiver slot, whose pointer/integer disagreements mean something
+    /// different from an ordinary argument's.
+    ///
+    /// Shared by the 1:1 marshalling loop and by `codegen_call_direct_dp_expand`'s
+    /// non-expanded slots.  The DirectPair path used to carry its own reduced copy
+    /// implementing 4 of these branches, so a call that needed an expanded 9-16
+    /// byte aggregate arg AND any of the missing coercions on another arg passed a
+    /// wrong-typed value silently.
+    coerce_call_arg(mut &this, expected_ty: void*, arg_val_in: LValue,
+                    arg_ty_ref: TypeRef, slot_index: u32,
+                    expected_count: u32) -> LValue {
+        mut arg_val: LValue = arg_val_in;
+        // Every spill slot below goes through `coercion_slot`, not
+        // `build_alloca`: a coerced call inside a loop body would otherwise
+        // allocate a fresh slot per iteration.
+        const actual_ty: void* = llvm::LLVMTypeOf(arg_val.raw);
+        // Compare by LLVM type kind first to dispatch to
+        // shape-aware coercion branches (ptr<->struct, ptr<->int,
+        // struct->scalar, etc.).  When kinds match we fall
+        // through to the equal-kinds branches further down
+        // and use direct void* identity (`expected_ty !=
+        // actual_ty`) to catch named-vs-literal struct
+        // mismatches and similar.
+        const ek: LTypeKind = LType::kind_of(expected_ty);
+        const ak: LTypeKind = LType::kind_of(actual_ty);
+
+        // A <= 8 byte aggregate parameter lowers to a single
+        // register slot (Direct-with-coercion).  When the
+        // source arrives as a *pointer* (the address of an lvalue,
+        // or a `T*` / `&T` pointing at the aggregate) facing a
+        // register-shaped slot, the register must hold the
+        // aggregate's bytes, so load them through the pointer.
+        // The generic `Integer <- Pointer` branch below would
+        // otherwise `ptrtoint` the address itself and pass the
+        // pointer where the callee expects the aggregate's
+        // contents (e.g. the 8-byte `LBuilder` reached via
+        // `this.builder: LBuilder*`, whose `.raw` handle would
+        // become the struct's address - a runtime crash the
+        // verifier can't catch).  The struct-*value* case is
+        // handled by the Integer/Float/Double/Vector <- Struct
+        // branch below.
+        mut agg_coerced: boolean = false;
+        const ek_reg_c: boolean = ek == LTypeKind::Integer
+            || ek == LTypeKind::Float
+            || ek == LTypeKind::Double
+            || ek == LTypeKind::Vector;
+        if (arg_val.is_valid() && ek_reg_c && ak == LTypeKind::Pointer) {
+            const asz_c: u64 = this.agg_register_size(
+                actual_ty, arg_ty_ref, ak);
+            if (asz_c > 0 && asz_c <= 8) {
+                const reg_lty: LType = LType { raw: expected_ty };
+                arg_val = this.builder.build_load(
+                    reg_lty, arg_val, "arg.coerced");
+                agg_coerced = true;
+            }
+        }
+
+        if (!agg_coerced && ek != ak) {
+            if (ek == LTypeKind::Pointer && ak == LTypeKind::Struct) {
+                // Expected ptr, actual struct: the struct value
+                // came from `codegen_rvalue` loading through
+                // some lvalue.  If we can recover that pre-load
+                // address (`val` is a Load whose only operand is
+                // the original pointer), use it directly - that
+                // preserves identity so callees that mutate the
+                // struct see the caller's memory.  Otherwise
+                // fall back to a fresh temp alloca + store +
+                // addr-of.  LLVMOpcode::Load = 27.
+                mut handled: boolean = false;
+                const opcode: i32 = llvm::LLVMGetInstructionOpcode(arg_val.raw);
+                if (opcode == 27) {
+                    const ptr_operand: void* = llvm::LLVMGetOperand(arg_val.raw, 0);
+                    if (ptr_operand != null) {
+                        arg_val = LValue { raw: ptr_operand };
+                        handled = true;
+                    }
+                }
+                if (!handled) {
+                    const st: LType = LType { raw: actual_ty };
+                    const tmp: LValue = this.coercion_slot(st, "arg.ref");
+                    this.builder.build_store(arg_val, tmp);
+                    arg_val = tmp;
+                }
+            } else if (ek == LTypeKind::Pointer
+                       && (ak == LTypeKind::Float || ak == LTypeKind::Double)) {
+                // Expected a pointer (a `&f32`/`&f64` reference
+                // parameter), but the argument arrived as a loaded
+                // SSE scalar.  This happens when a reference-typed
+                // binding - e.g. a float payload bound by
+                // `match (&opt) { Some(b) => ... }` - is passed bare
+                // to a `&Self` parameter; the conditional `Eq`/`Ord`
+                // impls on `Option<f64>` do exactly this via
+                // `a.equals(b)`.  `codegen_rvalue` loaded the referent
+                // to a `double`/`float`, so recover the address rather
+                // than passing the value: there is no float<->pointer
+                // auto-coercion, and passing the scalar trips the LLVM
+                // verifier ("Call parameter type does not match
+                // function signature").  Mirror the `ptr <- struct`
+                // branch above - reuse the Load's source pointer when
+                // possible (identity-preserving, matching the
+                // receiver-side autoref), else spill to a temp slot
+                // and take its address.  LLVMOpcode::Load = 27.
+                mut handled_f: boolean = false;
+                const opcode_f: i32 = llvm::LLVMGetInstructionOpcode(arg_val.raw);
+                if (opcode_f == 27) {
+                    const ptr_operand_f: void* = llvm::LLVMGetOperand(arg_val.raw, 0);
+                    if (ptr_operand_f != null) {
+                        arg_val = LValue { raw: ptr_operand_f };
+                        handled_f = true;
+                    }
+                }
+                if (!handled_f) {
+                    const fst: LType = LType { raw: actual_ty };
+                    const ftmp: LValue = this.coercion_slot(fst, "arg.faddr");
+                    this.builder.build_store(arg_val, ftmp);
+                    arg_val = ftmp;
+                }
+            } else if (ek == LTypeKind::Struct && ak == LTypeKind::Pointer) {
+                const st: LType = LType { raw: expected_ty };
+                arg_val = this.builder.build_load(st, arg_val, "arg.deref");
+            } else if ((ek == LTypeKind::Float || ek == LTypeKind::Double) && ak == LTypeKind::Pointer) {
+                const ft: LType = LType { raw: expected_ty };
+                arg_val = this.builder.build_load(ft, arg_val, "arg.deref");
+            } else if (ek == LTypeKind::Integer && ak == LTypeKind::Pointer && expected_count > 0 && slot_index == 0) {
+                const it: LType = LType { raw: expected_ty };
+                arg_val = this.builder.build_load(it, arg_val, "arg.deref");
+            } else if (ek == LTypeKind::Pointer && ak == LTypeKind::Integer) {
+                // Expected ptr, actual integer.  For the
+                // receiver slot (i==0) this is a primitive
+                // method on an rvalue; spill to a stack temp and
+                // pass the slot's address.
+                if (slot_index == 0) {
+                    const slot_lty: LType = LType { raw: actual_ty };
+                    const slot: LValue = this.coercion_slot(slot_lty, "recv.slot");
+                    this.builder.build_store(arg_val, slot);
+                    arg_val = slot;
+                } else if (llvm::LLVMGetInstructionOpcode(arg_val.raw) == 27) {
+                    // The integer is a Load of an lvalue, not a
+                    // genuine value-as-address.  This is the
+                    // integer twin of the float bug above: a
+                    // reference-typed binding (an integer payload
+                    // bound by `match (&x) { Some(b) => ... }`)
+                    // passed bare to a `&T` parameter; codegen_rvalue
+                    // loaded the referent to an integer.  Naively
+                    // `inttoptr`-ing that VALUE would pass e.g.
+                    // address 0x1 for the payload 1, so the callee's
+                    // `*other` would dereference garbage and segfault at
+                    // runtime (the verifier is happy because
+                    // inttoptr does yield a `ptr`).  Recover the
+                    // address instead, exactly like the `ptr <-
+                    // struct`/`ptr <- float` branches: reuse the
+                    // Load's source pointer (identity-preserving,
+                    // matching the receiver-side autoref).
+                    // LLVMOpcode::Load = 27.  Non-Load integers
+                    // (literal `0`/`null` constants, computed
+                    // address values) keep the legitimate inttoptr
+                    // below.
+                    mut handled_i: boolean = false;
+                    const ptr_operand_i: void* = llvm::LLVMGetOperand(arg_val.raw, 0);
+                    if (ptr_operand_i != null) {
+                        arg_val = LValue { raw: ptr_operand_i };
+                        handled_i = true;
+                    }
+                    if (!handled_i) {
+                        arg_val = LValue { raw: llvm::LLVMBuildIntToPtr(this.builder.raw, arg_val.raw, expected_ty, "arg.i2p") };
+                    }
+                } else {
+                    arg_val = LValue { raw: llvm::LLVMBuildIntToPtr(this.builder.raw, arg_val.raw, expected_ty, "arg.i2p") };
+                }
+            } else if (ek == LTypeKind::Integer && ak == LTypeKind::Pointer) {
+                arg_val = LValue { raw: llvm::LLVMBuildPtrToInt(this.builder.raw, arg_val.raw, expected_ty, "arg.p2i") };
+            } else if ((ek == LTypeKind::Integer
+                        || ek == LTypeKind::Float
+                        || ek == LTypeKind::Double
+                        || ek == LTypeKind::Vector)
+                       && ak == LTypeKind::Struct) {
+                // Small-aggregate param passed by value.  The
+                // callee's LLVM signature has a register-sized
+                // scalar slot (integer for INTEGER class,
+                // float/double for single-field SSE class,
+                // `<2 x float>` for two-F32 SSE class) where the
+                // Cryo source type is a <= 8-byte struct.  Spill
+                // the struct value to a slot typed as the
+                // scalar/vector and reload it; the slot's storage
+                // size matches the struct's byte width by
+                // construction.  This is the inverse of the
+                // receiver-side coercion on the callee side.
+                const slot_lty: LType = LType { raw: expected_ty };
+                const slot_p: LValue = this.coercion_slot(slot_lty, "arg.coerce");
+                this.builder.build_store(arg_val, slot_p);
+                arg_val = this.builder.build_load(slot_lty, slot_p, "arg.coerced");
+            } else if (ek == LTypeKind::Struct
+                       && (ak == LTypeKind::Integer
+                           || ak == LTypeKind::Float
+                           || ak == LTypeKind::Double
+                           || ak == LTypeKind::Vector)) {
+                // Inverse case - the arg is a register-shaped
+                // scalar/vector coming out of a <= 8-byte
+                // aggregate return (Direct-with-coercion), but
+                // the receiving param wants the source-level
+                // named struct.  Alloca with the scalar type so
+                // the store doesn't overflow, then reload at the
+                // named struct.
+                const slot_lty: LType = LType { raw: actual_ty };
+                const slot_p: LValue = this.coercion_slot(slot_lty, "arg.reshape");
+                this.builder.build_store(arg_val, slot_p);
+                const exp_lty: LType = LType { raw: expected_ty };
+                arg_val = this.builder.build_load(exp_lty, slot_p, "arg.reshaped");
+            }
+        } else if (ek == LTypeKind::Struct && ak == LTypeKind::Struct
+                   && expected_ty != actual_ty) {
+            // Both Struct but distinct LLVM types: the arg is
+            // the anonymous `{lo, hi}` literal struct from a
+            // DirectPair-classified callee return (or
+            // another layout-compatible-but-not-identical
+            // struct, e.g. anonymous `Option<i32>` layout vs.
+            // the source-level named type).  Spill-then-reload
+            // at the expected named struct.  Catches cases
+            // where the post-call coercion couldn't fire
+            // (e.g. node.resolved_type didn't resolve fully
+            // through generic instantiation) but the param-
+            // type disagreement is unambiguous.
+            const slot_lty: LType = LType { raw: actual_ty };
+            const slot_p: LValue = this.coercion_slot(slot_lty, "arg.reshape");
+            this.builder.build_store(arg_val, slot_p);
+            const exp_lty: LType = LType { raw: expected_ty };
+            arg_val = this.builder.build_load(exp_lty, slot_p, "arg.reshaped");
+        } else if (ek == LTypeKind::Integer && ak == LTypeKind::Integer) {
+            // Both integers: coerce widths if needed.  Picking
+            // sext vs zext from the *source* Cryo type's
+            // signedness is load-bearing: an i32 holding `-1`
+            // (0xFFFFFFFF) widened to i64 must become
+            // 0xFFFFFFFFFFFFFFFF (sext), not 0x00000000FFFFFFFF
+            // (zext).  Defaulting to zext silently corrupted any
+            // negative signed-narrow arg passed to a wider
+            // parameter.
+            const ew: u32 = llvm::LLVMGetIntTypeWidth(expected_ty);
+            const aw: u32 = llvm::LLVMGetIntTypeWidth(actual_ty);
+            if (aw < ew) {
+                const target: LType = LType { raw: expected_ty };
+                mut src_signed: boolean = false;
+                if (arg_ty_ref.is_valid()) {
+                    const at_t: Type* = this.lookup_type_by_id(arg_ty_ref.id);
+                    if (at_t != null && at_t.kind == TypeKind::Int) {
+                        const it: IntType* = at_t as IntType*;
+                        src_signed = it.int_kind.is_signed();
+                    }
+                }
+                if (src_signed) {
+                    arg_val = this.builder.build_sext(arg_val, target, "arg.widen");
+                } else {
+                    arg_val = this.builder.build_zext(arg_val, target, "arg.widen");
+                }
+            } else if (aw > ew) {
+                const target: LType = LType { raw: expected_ty };
+                arg_val = this.builder.build_trunc(arg_val, target, "arg.trunc");
+            }
+        }
+        return arg_val;
+    }
+
+    /// Emit the callee call, choosing `invoke` over `call` when CallEmitter
+    /// has armed the transient invoke state for this call (the frame has live
+    /// droppable locals under `--panic=unwind`).  On `invoke`, control returns
+    /// to `invoke_normal` on success and `invoke_lpad` (a cleanup landing pad)
+    /// on unwind; the builder is left at `invoke_normal` so post-call codegen
+    /// (sret load, byval attrs, return coercion) continues on the normal path,
+    /// NOT after the invoke terminator.  The flag is consumed on first use so a
+    /// single activation emits exactly one invoke (args are fully emitted
+    /// before this point, so no nested call re-enters the armed state).
+    build_call_maybe_invoke(mut &this, fn_ty: LType, fn_val: LValue,
+                            args: void*, num_args: u32, name: string) -> LValue {
+        if (this.invoke_active) {
+            this.invoke_active = false;
+            const then_bb: LBasicBlock = this.invoke_normal;
+            const catch_bb: LBasicBlock = this.invoke_lpad;
+            const inv: LValue = this.builder.build_invoke(
+                fn_ty, fn_val, args, num_args, then_bb, catch_bb, name);
+            this.builder.position_at_end(then_bb);
+            return inv;
+        }
+        return this.builder.build_call(fn_ty, fn_val, args, num_args, name);
+    }
+
+    /// Get-or-declare the exception personality routine `__cryo_personality_v0`
+    /// against the shared Itanium `_Unwind_*` Level-1 ABI:
+    /// `i32 (i32 version, i32 actions, i64 exn_class, ptr exn, ptr context)`.
+    /// Attached to every function that grows a cleanup landing pad; the
+    /// definition is linked in from the `panic/unwind` runtime tier under
+    /// `--panic=unwind`.
+    get_or_decl_personality(mut &this) -> LValue {
+        mut fn: LValue = this.llvm_module.get_named_function("__cryo_personality_v0");
+        if (fn.is_valid()) { return fn; }
+        const ptr_ty: LType = LType::pointer_to(LType::i8());
+        const param_buf: void* = intrinsics::malloc(40);
+        const param_slots: void** = param_buf as void**;
+        param_slots[0] = LType::i32().raw;
+        param_slots[1] = LType::i32().raw;
+        param_slots[2] = LType::i64().raw;
+        param_slots[3] = ptr_ty.raw;
+        param_slots[4] = ptr_ty.raw;
+        const fty: LType = LType::function_type(LType::i32(), param_buf, 5, false);
+        intrinsics::free(param_buf);
+        return this.llvm_module.add_function("__cryo_personality_v0", fty);
+    }
+
+    /// The `{ ptr, i32 }` landing-pad result type (exception object pointer +
+    /// selector).  LLVM uniques literal struct types by structure within a
+    /// context, so this returns the same type on every call in a module.
+    landingpad_type(mut &this) -> LType {
+        const elems_buf: void* = intrinsics::malloc(16);
+        const elems: void** = elems_buf as void**;
+        elems[0] = LType::pointer_to(LType::i8()).raw;
+        elems[1] = LType::i32().raw;
+        const t: LType = LType::literal_struct(elems_buf, 2, false);
+        intrinsics::free(elems_buf);
+        return t;
+    }
+
+    // ---- live anonymous arg-temp tracking (`--panic=unwind`) -------------
+    //
+    // A dedicated stack (kept in small methods so CallEmitter never manipulates
+    // it inline - an inline array-stack push/pop embedded in the large call
+    // emitter miscompiled the inc-4 named path). CallEmitter opens a frame per
+    // in-progress call, pushes a `<name>.drop()` statement per anonymous owning
+    // temp, and closes the frame once the call is fully built.
+
+    /// Open a frame for a call whose arguments are about to be evaluated.
+    open_arg_temp_frame(mut &this) -> void {
+        this.arg_temp_frames.push(this.arg_temp_drops.length);
+    }
+
+    /// Close the innermost frame: the call is fully built, so its argument
+    /// temporaries are now owned by the callee and drop out of the live set.
+    /// Read-then-truncate (mirrors DropInserter::close_pending_arg_frame).
+    close_arg_temp_frame(mut &this) -> void {
+        const top: i64 = this.arg_temp_frames.length;
+        if (top == 0) { return; }
+        const start: i64 = this.arg_temp_frames[top - 1];
+        this.arg_temp_frames.pop();
+        while (this.arg_temp_drops.length > start) {
+            this.arg_temp_drops.pop();
+        }
+    }
+
+    /// Record a ready-made `<name>.drop()` statement for a live anonymous owning
+    /// arg temp (built by CallEmitter, whose name is bound to the temp's slot in
+    /// the value table).
+    push_arg_temp_drop(mut &this, stmt: ASTNode*) -> void {
+        if (stmt != null) { this.arg_temp_drops.push(stmt); }
+    }
+
+    /// True when a panic origin must invoke into a cleanup pad to drop live
+    /// anonymous arg temps.  Suppressed while a pad is already replaying its
+    /// drops, so a drop-call emitted inside the pad does not re-invoke.
+    has_live_arg_temps(&this) -> boolean {
+        return this.arg_temp_drops.length > 0 && !this.suppress_arg_temp_invoke;
+    }
+
+    /// Schedule-driven cleanup landing pad for `--panic=unwind`, shared by the
+    /// ordinary-call path (CallEmitter forwards to here) and the synthesized
+    /// check origins.  Builds a cleanup-only `landingpad` at `lpad_bb`, drops the
+    /// live anonymous arg temps (whole stack, most-recent first - at the panic
+    /// point the enclosing calls have not run, so this pad is the only one that
+    /// frees them), replays the drop schedule (`sched`, innermost-first, each a
+    /// drop-call statement up-cast to `ASTNode*`) via `accept(visitor)`, then
+    /// `resume`s.  Attaches the personality to `cur_fn` (idempotent) and restores
+    /// the builder to where it was called from.  `invoke_active` is clear here,
+    /// so a drop that itself unwinds propagates without re-entering this pad; the
+    /// arg-temp invoke path is suppressed across both replays so a drop-call does
+    /// not re-drop the stack.
+    emit_cleanup_landingpad_sched(mut &this, visitor: ASTVisitor*, sched: ASTNode*[]*,
+                                  cur_fn: LValue, lpad_bb: LBasicBlock) -> void {
+        const saved_bb: LBasicBlock = this.builder.get_insert_block();
+        const pers: LValue = this.get_or_decl_personality();
+        if (pers.is_valid()) { cur_fn.set_personality_fn(pers); }
+        this.builder.position_at_end(lpad_bb);
+        const lpad_ty: LType = this.landingpad_type();
+        const lp: LValue = this.builder.build_landing_pad(lpad_ty, 0, "lpad");
+        lp.set_cleanup(true);
+        const saved_suppress: boolean = this.suppress_arg_temp_invoke;
+        this.suppress_arg_temp_invoke = true;
+        for (mut a: i64 = this.arg_temp_drops.length - 1; a >= 0; a--) {
+            const t: ASTNode* = this.arg_temp_drops[a];
+            if (t != null) { (t as StatementNode*).accept(visitor); }
+        }
+        for (mut i: i64 = 0; i < sched.length; i++) {
+            const d: ASTNode* = sched[i];
+            if (d != null) { (d as StatementNode*).accept(visitor); }
+        }
+        this.suppress_arg_temp_invoke = saved_suppress;
+        this.builder.build_resume(lp);
+        if (saved_bb.is_valid()) { this.builder.position_at_end(saved_bb); }
+    }
+
+    /// Emit a diverging raise through `__cryo_panic(msg, file, line)` for a
+    /// synthesized check (div-by-zero, non-exhaustive match, `new[]` overflow)
+    /// under `--panic=unwind`.  When the frame has live droppable locals
+    /// (`sched` non-empty) the raise is an `invoke` into a cleanup landing pad
+    /// that drops them before the unwind continues; otherwise a plain `call`.
+    /// Either way it diverges (`unreachable` on the normal edge).  Callers gate
+    /// this on `ctx.project_panic_unwind` and keep the `abort` trap on the
+    /// default path, so emitted IR is unchanged there.
+    emit_panic_diverge_cleanup(mut &this, visitor: ASTVisitor*, sched: ASTNode*[]*,
+                               msg: LValue, file: LValue, line: LValue) -> void {
+        const panic_fn: LValue = this.intrinsics.get_or_decl_cryo_panic();
+        if (!panic_fn.is_valid()) { return; }
+        const ptr_ty: LType = LType::pointer_to(LType::i8());
+        const param_buf: void* = intrinsics::malloc(24);
+        const param_slots: void** = param_buf as void**;
+        param_slots[0] = ptr_ty.raw;
+        param_slots[1] = ptr_ty.raw;
+        param_slots[2] = LType::i32().raw;
+        const fty: LType = LType::function_type(LType::void_type(), param_buf, 3, false);
+        intrinsics::free(param_buf);
+        const arg_buf: void* = intrinsics::malloc(24);
+        const arg_slots: void** = arg_buf as void**;
+        arg_slots[0] = msg.raw;
+        arg_slots[1] = file.raw;
+        arg_slots[2] = line.raw;
+
+        // Live anonymous arg temps also demand the invoke+pad path even when the
+        // frame has no named schedule (`sched` empty): a div/bounds/no-match/
+        // overflow check nested in a later argument must drop the temps built by
+        // earlier arguments before the unwind leaves the frame.
+        const has_cleanup: boolean = (sched != null && sched.length > 0)
+            || this.has_live_arg_temps();
+        if (has_cleanup) {
+            const cur_bb: LBasicBlock = this.builder.get_insert_block();
+            const cur_fn: LValue = cur_bb.get_parent();
+            const cont_bb: LBasicBlock = LBasicBlock::append(cur_fn, "check.cont");
+            const lpad_bb: LBasicBlock = LBasicBlock::append(cur_fn, "check.lpad");
+            this.invoke_active = true;
+            this.invoke_normal = cont_bb;
+            this.invoke_lpad   = lpad_bb;
+            this.build_call_maybe_invoke(fty, panic_fn, arg_buf, 3, "");
+            this.invoke_active = false;
+            intrinsics::free(arg_buf);
+            this.builder.build_unreachable();
+            this.emit_cleanup_landingpad_sched(visitor, sched, cur_fn, lpad_bb);
+        } else {
+            this.builder.build_call(fty, panic_fn, arg_buf, 3, "");
+            intrinsics::free(arg_buf);
+            this.builder.build_unreachable();
+        }
+    }
+
+    /// Build the `(message, file, line)` args for a synthesized check from a
+    /// compile-time `message` and the origin's `span`, then raise + clean up via
+    /// `emit_panic_diverge_cleanup`.  The shared body of every synthesized-check
+    /// raise (div-by-zero, non-exhaustive match, `new[]` overflow).
+    emit_check_raise(mut &this, visitor: ASTVisitor*, sched: ASTNode*[]*,
+                     span: SourceSpan, message: string) -> void {
+        const msg: LValue = this.builder.build_global_string_ptr(message, "check.msg");
+        mut filename: string = span.file;
+        if (filename == null || filename.length() == 0) { filename = "<unknown>"; }
+        const file: LValue = this.builder.build_global_string_ptr(filename, "check.file");
+        const line: LValue = LType::const_int(LType::i32(), span.start_line as u64, false);
+        this.emit_panic_diverge_cleanup(visitor, sched, msg, file, line);
+    }
+
     /// The pre-Phase-1 call lowering: coerce integer widths to match
     /// the callee's expected param types, then `build_call`.  Split out
     /// of `codegen_call` so the sret-marshalling wrapper can call
@@ -632,7 +1164,7 @@ type struct ExprOps {
         const n: u32 = args.length as u32;
 
         if (n == 0) {
-            out_value = this.builder.build_call(callee_type, callee, null, 0, name);
+            out_value = this.build_call_maybe_invoke(callee_type, callee, null, 0, name);
             return out_value;
         }
 
@@ -671,256 +1203,14 @@ type struct ExprOps {
             mut arg_val: LValue = args[i as i64].first;
             const arg_ty_ref: TypeRef = args[i as i64].second;
             if (arg_val.is_valid() && param_types_buf != null && i < expected_count) {
-                const expected_ty: void* = param_types[i];
-                const actual_ty: void* = llvm::LLVMTypeOf(arg_val.raw);
-                // Compare by LLVM type kind first to dispatch to
-                // shape-aware coercion branches (ptr<->struct, ptr<->int,
-                // struct->scalar, etc.).  When kinds match we fall
-                // through to the equal-kinds branches further down
-                // and use direct void* identity (`expected_ty !=
-                // actual_ty`) to catch named-vs-literal struct
-                // mismatches and similar.
-                const ek: LTypeKind = LType::kind_of(expected_ty);
-                const ak: LTypeKind = LType::kind_of(actual_ty);
-
-                // A <= 8 byte aggregate parameter lowers to a single
-                // register slot (Direct-with-coercion).  When the
-                // source arrives as a *pointer* (the address of an lvalue,
-                // or a `T*` / `&T` pointing at the aggregate) facing a
-                // register-shaped slot, the register must hold the
-                // aggregate's bytes, so load them through the pointer.
-                // The generic `Integer <- Pointer` branch below would
-                // otherwise `ptrtoint` the address itself and pass the
-                // pointer where the callee expects the aggregate's
-                // contents (e.g. the 8-byte `LBuilder` reached via
-                // `this.builder: LBuilder*`, whose `.raw` handle would
-                // become the struct's address - a runtime crash the
-                // verifier can't catch).  The struct-*value* case is
-                // handled by the Integer/Float/Double/Vector <- Struct
-                // branch below.
-                mut agg_coerced: boolean = false;
-                const ek_reg_c: boolean = ek == LTypeKind::Integer
-                    || ek == LTypeKind::Float
-                    || ek == LTypeKind::Double
-                    || ek == LTypeKind::Vector;
-                if (arg_val.is_valid() && ek_reg_c && ak == LTypeKind::Pointer) {
-                    const asz_c: u64 = this.agg_register_size(
-                        actual_ty, arg_ty_ref, ak);
-                    if (asz_c > 0 && asz_c <= 8) {
-                        const reg_lty: LType = LType { raw: expected_ty };
-                        arg_val = this.builder.build_load(
-                            reg_lty, arg_val, "arg.coerced");
-                        agg_coerced = true;
-                    }
-                }
-
-                if (!agg_coerced && ek != ak) {
-                    if (ek == LTypeKind::Pointer && ak == LTypeKind::Struct) {
-                        // Expected ptr, actual struct: the struct value
-                        // came from `codegen_rvalue` loading through
-                        // some lvalue.  If we can recover that pre-load
-                        // address (`val` is a Load whose only operand is
-                        // the original pointer), use it directly - that
-                        // preserves identity so callees that mutate the
-                        // struct see the caller's memory.  Otherwise
-                        // fall back to a fresh temp alloca + store +
-                        // addr-of.  LLVMOpcode::Load = 27.
-                        mut handled: boolean = false;
-                        const opcode: i32 = llvm::LLVMGetInstructionOpcode(arg_val.raw);
-                        if (opcode == 27) {
-                            const ptr_operand: void* = llvm::LLVMGetOperand(arg_val.raw, 0);
-                            if (ptr_operand != null) {
-                                arg_val = LValue { raw: ptr_operand };
-                                handled = true;
-                            }
-                        }
-                        if (!handled) {
-                            const st: LType = LType { raw: actual_ty };
-                            const tmp: LValue = this.builder.build_alloca(st, "arg.ref");
-                            this.builder.build_store(arg_val, tmp);
-                            arg_val = tmp;
-                        }
-                    } else if (ek == LTypeKind::Pointer
-                               && (ak == LTypeKind::Float || ak == LTypeKind::Double)) {
-                        // Expected a pointer (a `&f32`/`&f64` reference
-                        // parameter), but the argument arrived as a loaded
-                        // SSE scalar.  This happens when a reference-typed
-                        // binding - e.g. a float payload bound by
-                        // `match (&opt) { Some(b) => ... }` - is passed bare
-                        // to a `&Self` parameter; the conditional `Eq`/`Ord`
-                        // impls on `Option<f64>` do exactly this via
-                        // `a.equals(b)`.  `codegen_rvalue` loaded the referent
-                        // to a `double`/`float`, so recover the address rather
-                        // than passing the value: there is no float<->pointer
-                        // auto-coercion, and passing the scalar trips the LLVM
-                        // verifier ("Call parameter type does not match
-                        // function signature").  Mirror the `ptr <- struct`
-                        // branch above - reuse the Load's source pointer when
-                        // possible (identity-preserving, matching the
-                        // receiver-side autoref), else spill to a temp slot
-                        // and take its address.  LLVMOpcode::Load = 27.
-                        mut handled_f: boolean = false;
-                        const opcode_f: i32 = llvm::LLVMGetInstructionOpcode(arg_val.raw);
-                        if (opcode_f == 27) {
-                            const ptr_operand_f: void* = llvm::LLVMGetOperand(arg_val.raw, 0);
-                            if (ptr_operand_f != null) {
-                                arg_val = LValue { raw: ptr_operand_f };
-                                handled_f = true;
-                            }
-                        }
-                        if (!handled_f) {
-                            const fst: LType = LType { raw: actual_ty };
-                            const ftmp: LValue = this.builder.build_alloca(fst, "arg.faddr");
-                            this.builder.build_store(arg_val, ftmp);
-                            arg_val = ftmp;
-                        }
-                    } else if (ek == LTypeKind::Struct && ak == LTypeKind::Pointer) {
-                        const st: LType = LType { raw: expected_ty };
-                        arg_val = this.builder.build_load(st, arg_val, "arg.deref");
-                    } else if ((ek == LTypeKind::Float || ek == LTypeKind::Double) && ak == LTypeKind::Pointer) {
-                        const ft: LType = LType { raw: expected_ty };
-                        arg_val = this.builder.build_load(ft, arg_val, "arg.deref");
-                    } else if (ek == LTypeKind::Integer && ak == LTypeKind::Pointer && expected_count > 0 && i == 0) {
-                        const it: LType = LType { raw: expected_ty };
-                        arg_val = this.builder.build_load(it, arg_val, "arg.deref");
-                    } else if (ek == LTypeKind::Pointer && ak == LTypeKind::Integer) {
-                        // Expected ptr, actual integer.  For the
-                        // receiver slot (i==0) this is a primitive
-                        // method on an rvalue; spill to a stack temp and
-                        // pass the slot's address.
-                        if (i == 0) {
-                            const slot_lty: LType = LType { raw: actual_ty };
-                            const slot: LValue = this.builder.build_alloca(slot_lty, "recv.slot");
-                            this.builder.build_store(arg_val, slot);
-                            arg_val = slot;
-                        } else if (llvm::LLVMGetInstructionOpcode(arg_val.raw) == 27) {
-                            // The integer is a Load of an lvalue, not a
-                            // genuine value-as-address.  This is the
-                            // integer twin of the float bug above: a
-                            // reference-typed binding (an integer payload
-                            // bound by `match (&x) { Some(b) => ... }`)
-                            // passed bare to a `&T` parameter; codegen_rvalue
-                            // loaded the referent to an integer.  Naively
-                            // `inttoptr`-ing that VALUE would pass e.g.
-                            // address 0x1 for the payload 1, so the callee's
-                            // `*other` would dereference garbage and segfault at
-                            // runtime (the verifier is happy because
-                            // inttoptr does yield a `ptr`).  Recover the
-                            // address instead, exactly like the `ptr <-
-                            // struct`/`ptr <- float` branches: reuse the
-                            // Load's source pointer (identity-preserving,
-                            // matching the receiver-side autoref).
-                            // LLVMOpcode::Load = 27.  Non-Load integers
-                            // (literal `0`/`null` constants, computed
-                            // address values) keep the legitimate inttoptr
-                            // below.
-                            mut handled_i: boolean = false;
-                            const ptr_operand_i: void* = llvm::LLVMGetOperand(arg_val.raw, 0);
-                            if (ptr_operand_i != null) {
-                                arg_val = LValue { raw: ptr_operand_i };
-                                handled_i = true;
-                            }
-                            if (!handled_i) {
-                                arg_val = LValue { raw: llvm::LLVMBuildIntToPtr(this.builder.raw, arg_val.raw, expected_ty, "arg.i2p") };
-                            }
-                        } else {
-                            arg_val = LValue { raw: llvm::LLVMBuildIntToPtr(this.builder.raw, arg_val.raw, expected_ty, "arg.i2p") };
-                        }
-                    } else if (ek == LTypeKind::Integer && ak == LTypeKind::Pointer) {
-                        arg_val = LValue { raw: llvm::LLVMBuildPtrToInt(this.builder.raw, arg_val.raw, expected_ty, "arg.p2i") };
-                    } else if ((ek == LTypeKind::Integer
-                                || ek == LTypeKind::Float
-                                || ek == LTypeKind::Double
-                                || ek == LTypeKind::Vector)
-                               && ak == LTypeKind::Struct) {
-                        // Small-aggregate param passed by value.  The
-                        // callee's LLVM signature has a register-sized
-                        // scalar slot (integer for INTEGER class,
-                        // float/double for single-field SSE class,
-                        // `<2 x float>` for two-F32 SSE class) where the
-                        // Cryo source type is a <= 8-byte struct.  Spill
-                        // the struct value to a slot typed as the
-                        // scalar/vector and reload it; the slot's storage
-                        // size matches the struct's byte width by
-                        // construction.  This is the inverse of the
-                        // receiver-side coercion on the callee side.
-                        const slot_lty: LType = LType { raw: expected_ty };
-                        const slot_p: LValue = this.builder.build_alloca(slot_lty, "arg.coerce");
-                        this.builder.build_store(arg_val, slot_p);
-                        arg_val = this.builder.build_load(slot_lty, slot_p, "arg.coerced");
-                    } else if (ek == LTypeKind::Struct
-                               && (ak == LTypeKind::Integer
-                                   || ak == LTypeKind::Float
-                                   || ak == LTypeKind::Double
-                                   || ak == LTypeKind::Vector)) {
-                        // Inverse case - the arg is a register-shaped
-                        // scalar/vector coming out of a <= 8-byte
-                        // aggregate return (Direct-with-coercion), but
-                        // the receiving param wants the source-level
-                        // named struct.  Alloca with the scalar type so
-                        // the store doesn't overflow, then reload at the
-                        // named struct.
-                        const slot_lty: LType = LType { raw: actual_ty };
-                        const slot_p: LValue = this.builder.build_alloca(slot_lty, "arg.reshape");
-                        this.builder.build_store(arg_val, slot_p);
-                        const exp_lty: LType = LType { raw: expected_ty };
-                        arg_val = this.builder.build_load(exp_lty, slot_p, "arg.reshaped");
-                    }
-                } else if (ek == LTypeKind::Struct && ak == LTypeKind::Struct
-                           && expected_ty != actual_ty) {
-                    // Both Struct but distinct LLVM types: the arg is
-                    // the anonymous `{lo, hi}` literal struct from a
-                    // DirectPair-classified callee return (or
-                    // another layout-compatible-but-not-identical
-                    // struct, e.g. anonymous `Option<i32>` layout vs.
-                    // the source-level named type).  Spill-then-reload
-                    // at the expected named struct.  Catches cases
-                    // where the post-call coercion couldn't fire
-                    // (e.g. node.resolved_type didn't resolve fully
-                    // through generic instantiation) but the param-
-                    // type disagreement is unambiguous.
-                    const slot_lty: LType = LType { raw: actual_ty };
-                    const slot_p: LValue = this.builder.build_alloca(slot_lty, "arg.reshape");
-                    this.builder.build_store(arg_val, slot_p);
-                    const exp_lty: LType = LType { raw: expected_ty };
-                    arg_val = this.builder.build_load(exp_lty, slot_p, "arg.reshaped");
-                } else if (ek == LTypeKind::Integer && ak == LTypeKind::Integer) {
-                    // Both integers: coerce widths if needed.  Picking
-                    // sext vs zext from the *source* Cryo type's
-                    // signedness is load-bearing: an i32 holding `-1`
-                    // (0xFFFFFFFF) widened to i64 must become
-                    // 0xFFFFFFFFFFFFFFFF (sext), not 0x00000000FFFFFFFF
-                    // (zext).  Defaulting to zext silently corrupted any
-                    // negative signed-narrow arg passed to a wider
-                    // parameter.
-                    const ew: u32 = llvm::LLVMGetIntTypeWidth(expected_ty);
-                    const aw: u32 = llvm::LLVMGetIntTypeWidth(actual_ty);
-                    if (aw < ew) {
-                        const target: LType = LType { raw: expected_ty };
-                        mut src_signed: boolean = false;
-                        if (arg_ty_ref.is_valid()) {
-                            const at_t: Type* = this.lookup_type_by_id(arg_ty_ref.id);
-                            if (at_t != null && at_t.kind == TypeKind::Int) {
-                                const it: IntType* = at_t as IntType*;
-                                src_signed = it.int_kind.is_signed();
-                            }
-                        }
-                        if (src_signed) {
-                            arg_val = this.builder.build_sext(arg_val, target, "arg.widen");
-                        } else {
-                            arg_val = this.builder.build_zext(arg_val, target, "arg.widen");
-                        }
-                    } else if (aw > ew) {
-                        const target: LType = LType { raw: expected_ty };
-                        arg_val = this.builder.build_trunc(arg_val, target, "arg.trunc");
-                    }
-                }
+                arg_val = this.coerce_call_arg(param_types[i], arg_val,
+                                               arg_ty_ref, i, expected_count);
             }
             slots[i] = arg_val.raw;
         }
         if (param_types_buf != null) { intrinsics::free(param_types_buf); }
 
-        out_value = this.builder.build_call(callee_type, callee, buf, n, name);
+        out_value = this.build_call_maybe_invoke(callee_type, callee, buf, n, name);
         intrinsics::free(buf);
 
         // Phase 2 - propagate `byval(%T)` from the callee's parameter
@@ -1071,7 +1361,7 @@ type struct ExprOps {
                 mut src_ptr: LValue = agg_ptr;
                 if (agg_from_value) {
                     const struct_lty: LType = LType { raw: actual_ty };
-                    src_ptr = this.builder.build_alloca(struct_lty, "arg.dp.tmp");
+                    src_ptr = this.coercion_slot(struct_lty, "arg.dp.tmp");
                     this.builder.build_store(arg_val, src_ptr);
                 }
 
@@ -1114,61 +1404,12 @@ type struct ExprOps {
                 continue;
             }
 
-            // 1:1 mapping with the same coercion shapes as the main
-            // `codegen_call_direct` loop - kept inline so this path
-            // is fully self-contained.
-            if (arg_val.is_valid() && ek != ak) {
-                if (ek == LTypeKind::Pointer && ak == LTypeKind::Struct) {
-                    mut handled: boolean = false;
-                    const opcode: i32 = llvm::LLVMGetInstructionOpcode(arg_val.raw);
-                    if (opcode == 27) {
-                        const ptr_operand: void* = llvm::LLVMGetOperand(arg_val.raw, 0);
-                        if (ptr_operand != null) {
-                            arg_val = LValue { raw: ptr_operand };
-                            handled = true;
-                        }
-                    }
-                    if (!handled) {
-                        const st: LType = LType { raw: actual_ty };
-                        const tmp: LValue = this.builder.build_alloca(st, "arg.ref");
-                        this.builder.build_store(arg_val, tmp);
-                        arg_val = tmp;
-                    }
-                } else if (ek == LTypeKind::Struct && ak == LTypeKind::Pointer) {
-                    const st: LType = LType { raw: expected_ty };
-                    arg_val = this.builder.build_load(st, arg_val, "arg.deref");
-                } else if ((ek == LTypeKind::Integer
-                            || ek == LTypeKind::Float
-                            || ek == LTypeKind::Double
-                            || ek == LTypeKind::Vector)
-                           && ak == LTypeKind::Struct) {
-                    const slot_lty: LType = LType { raw: expected_ty };
-                    const slot_p: LValue = this.builder.build_alloca(slot_lty, "arg.coerce");
-                    this.builder.build_store(arg_val, slot_p);
-                    arg_val = this.builder.build_load(slot_lty, slot_p, "arg.coerced");
-                }
-            } else if (ek == LTypeKind::Integer && ak == LTypeKind::Integer) {
-                const ew: u32 = llvm::LLVMGetIntTypeWidth(expected_ty);
-                const aw: u32 = llvm::LLVMGetIntTypeWidth(actual_ty);
-                if (aw < ew) {
-                    const target: LType = LType { raw: expected_ty };
-                    mut src_signed: boolean = false;
-                    if (arg_ty_ref.is_valid()) {
-                        const at_t: Type* = this.lookup_type_by_id(arg_ty_ref.id);
-                        if (at_t != null && at_t.kind == TypeKind::Int) {
-                            const it: IntType* = at_t as IntType*;
-                            src_signed = it.int_kind.is_signed();
-                        }
-                    }
-                    if (src_signed) {
-                        arg_val = this.builder.build_sext(arg_val, target, "arg.widen");
-                    } else {
-                        arg_val = this.builder.build_zext(arg_val, target, "arg.widen");
-                    }
-                } else if (aw > ew) {
-                    const target: LType = LType { raw: expected_ty };
-                    arg_val = this.builder.build_trunc(arg_val, target, "arg.trunc");
-                }
+            // Non-expanded slots take the same coercion path as the 1:1
+            // marshalling loop; `source_idx` is the source ordinal, so the
+            // receiver-slot branches key off it rather than the LLVM slot.
+            if (arg_val.is_valid()) {
+                arg_val = this.coerce_call_arg(expected_ty, arg_val, arg_ty_ref,
+                                               source_idx as u32, expected_count);
             }
 
             slots[llvm_slot_idx] = arg_val.raw;
@@ -1176,7 +1417,7 @@ type struct ExprOps {
             source_idx += 1;
         }
 
-        const out: LValue = this.builder.build_call(
+        const out: LValue = this.build_call_maybe_invoke(
             callee_type, callee, buf, expected_count, name);
         intrinsics::free(buf);
 
@@ -1198,7 +1439,8 @@ type struct ExprOps {
 
     /// Generate IR for a binary expression.  Handles arithmetic,
     /// comparison, logical short-circuit, and assignment operators.
-    codegen_binary(mut &this, lhs_val: LValue, rhs_val: LValue, op_kind: TokenType, result_type: TypeRef, rhs_type: TypeRef) -> LValue {
+    codegen_binary(mut &this, lhs_val: LValue, rhs_val: LValue, op_kind: TokenType, result_type: TypeRef, rhs_type: TypeRef,
+                   visitor: ASTVisitor*, div_sched: ASTNode*[]*, div_span: SourceSpan) -> LValue {
         mut out_value: LValue = LValue::null();
         if (!lhs_val.is_valid() || !rhs_val.is_valid()) {
             out_value = LValue::null();
@@ -1269,7 +1511,7 @@ type struct ExprOps {
                 }
                 const fn_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(fn_val.raw) };
                 const this_ty: LType = LType::pointer_to(LType::i8());
-                const this_slot: LValue = this.builder.build_alloca(this_ty, "strcat.this");
+                const this_slot: LValue = this.coercion_slot(this_ty, "strcat.this");
                 this.builder.build_store(lhs_val, this_slot);
                 mut args: Pair<LValue, TypeRef>[] = [];
                 args.push(Pair<LValue, TypeRef>::new(this_slot, TypeRef::invalid()));
@@ -1511,7 +1753,7 @@ type struct ExprOps {
                 // integer sdiv/udiv on a zero divisor (and signed
                 // INT_MIN / -1) are LLVM UB and must trap explicitly.
                 if (!is_float) {
-                    this.emit_int_div_guard(lhs, rhs, is_signed);
+                    this.emit_int_div_guard(lhs, rhs, is_signed, visitor, div_sched, div_span);
                 }
                 out_value = if (is_float) {
                     this.builder.build_fdiv(lhs, rhs, "divtmp")
@@ -1523,7 +1765,7 @@ type struct ExprOps {
             }
             TokenType::Percent => {
                 if (!is_float) {
-                    this.emit_int_div_guard(lhs, rhs, is_signed);
+                    this.emit_int_div_guard(lhs, rhs, is_signed, visitor, div_sched, div_span);
                 }
                 out_value = if (is_float) {
                     this.builder.build_frem(lhs, rhs, "remtmp")
@@ -1716,7 +1958,8 @@ type struct ExprOps {
     /// constant divisors LLVM's optimizer folds the branch away in O2
     /// builds (default), so the guard has no steady-state runtime cost
     /// when the compiler can prove safety statically.
-    emit_int_div_guard(mut &this, lhs: LValue, rhs: LValue, is_signed: boolean) -> void {
+    emit_int_div_guard(mut &this, lhs: LValue, rhs: LValue, is_signed: boolean,
+                       visitor: ASTVisitor*, div_sched: ASTNode*[]*, div_span: SourceSpan) -> void {
         const rhs_ty_raw: void* = llvm::LLVMTypeOf(rhs.raw);
         if (rhs_ty_raw == null) { return; }
         const rhs_ty: LType = LType { raw: rhs_ty_raw };
@@ -1757,17 +2000,19 @@ type struct ExprOps {
 
         this.builder.build_cond_br(trap_cond, trap_bb, ok_bb);
 
-        // Trap arm: call @abort(); unreachable.  Same pattern as the
-        // match-no-default block in ir_generator: a bare `unreachable`
-        // lowers to no instruction on x86, which silently slides into
-        // adjacent code at runtime.  abort + unreachable guarantees a
-        // clean SIGABRT.
+        // Trap arm.  `--panic=unwind` (hosted): raise through `__cryo_panic`
+        // (call-or-invoke + cleanup) so the failure unwinds and drops the
+        // frame's live locals.  Default abort path: `call @abort();
+        // unreachable` - a bare `unreachable` lowers to no instruction on x86
+        // and would silently slide into adjacent code, so abort guarantees a
+        // clean SIGABRT.  Byte-identical on the default path.
         this.builder.position_at_end(trap_bb);
-        const abort_fn: LValue = this.intrinsics.get_or_decl_abort();
-        const abort_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(abort_fn.raw) };
-        mut a_args: Pair<LValue, TypeRef>[] = [];
-        this.codegen_call(abort_fn, abort_ty, a_args, "");
-        this.builder.build_unreachable();
+        if (this.ctx.project_panic_unwind && !this.intrinsics.no_runtime) {
+            this.emit_check_raise(visitor, div_sched, div_span, "attempt to divide by zero");
+        } else {
+            mut dz_ops: LValue[] = [];
+            this.intrinsics.emit_check_sink("__cryo_panic_div_zero", div_span, &dz_ops);
+        }
 
         // OK arm: caller continues with the div/rem here.
         this.builder.position_at_end(ok_bb);
@@ -1786,7 +2031,8 @@ type struct ExprOps {
     /// (`new int[-1]`) reads as a huge value and traps too. 1-byte elements
     /// can never overflow, so the guard is elided. Leaves the builder at the
     /// ok block; mirrors `emit_int_div_guard`'s trap shape.
-    emit_array_mul_guard(mut &this, count_i64: LValue, elem_size: u64) -> void {
+    emit_array_mul_guard(mut &this, count_i64: LValue, elem_size: u64,
+                         visitor: ASTVisitor*, ovf_sched: ASTNode*[]*, ovf_span: SourceSpan) -> void {
         if (elem_size <= (1 as u64)) { return; }
         const u64_max: u64 = (0 as u64) - (1 as u64);
         const max_count: u64 = u64_max / elem_size;
@@ -1802,14 +2048,24 @@ type struct ExprOps {
 
         this.builder.build_cond_br(overflow, trap_bb, ok_bb);
 
-        // Trap arm: call @abort(); unreachable - a clean SIGABRT instead of
-        // a silently-truncated allocation.
+        // Trap arm.  `--panic=unwind` (hosted): raise + cleanup so the failure
+        // unwinds and drops the frame's live locals.  Default abort path: `call
+        // @abort(); unreachable` - a clean SIGABRT instead of a silently
+        // truncated allocation.  Byte-identical on the default path.
         this.builder.position_at_end(trap_bb);
-        const abort_fn: LValue = this.intrinsics.get_or_decl_abort();
-        const abort_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(abort_fn.raw) };
-        mut a_args: Pair<LValue, TypeRef>[] = [];
-        this.codegen_call(abort_fn, abort_ty, a_args, "");
-        this.builder.build_unreachable();
+        if (this.ctx.project_panic_unwind && !this.intrinsics.no_runtime) {
+            this.emit_check_raise(visitor, ovf_sched, ovf_span, "arithmetic overflow");
+        } else {
+            // `op` 2 = multiply: this guard is the array-size product. The
+            // handler formats "arithmetic overflow (op 2): <lhs>, <rhs>", so it
+            // takes the raw operands rather than a pre-baked message.
+            mut ovf_ops: LValue[] = [
+                LType::const_int(LType::i32(), 2, false),
+                count_i64,
+                LType::const_int(LType::i64(), elem_size, false)
+            ];
+            this.intrinsics.emit_check_sink("__cryo_panic_overflow", ovf_span, &ovf_ops);
+        }
 
         this.builder.position_at_end(ok_bb);
     }
@@ -1933,6 +2189,144 @@ type struct ExprOps {
     }
 
 
+    // Heap allocation / deallocation funnel
+
+    /// The single heap-allocation site every `new` / `new[]` / array-literal /
+    /// box routes through, so "the allocator" is one lookup instead of a copy
+    /// of the fallback ladder per emitter (a precondition for making the
+    /// allocator a weak, overridable `__cryo_alloc` lang item).
+    ///
+    /// Resolution ladder, emitting the exact same call each caller did:
+    ///   - `is_ast_node` (the compiler allocating its own AST nodes): the
+    ///     process-global AST arena (`cryo_ast_arena_alloc`), bulk-reclaimed at
+    ///     each target boundary.
+    ///   - otherwise the canonical `GlobalAlloc` via `std::alloc::allocator::alloc`
+    ///     (`{size, align}`), so every heap object shares the same arena routing.
+    ///   - if the stdlib is not linked (`--no-std`), a direct libc `malloc`
+    ///     (`{size}` only — no alignment).
+    ///
+    /// `size_val` is a computed i64 value; `align` is a compile-time constant
+    /// (built into an i64 constant here). `label` names the result SSA value.
+    /// `what` names the construct for diagnostics. Returns a null `LValue`
+    /// (after emitting a diagnostic) when no allocator can be resolved.
+    emit_raw_alloc(mut &this, is_ast_node: boolean, size_val: LValue, align: u64,
+                   label: string, span: SourceSpan, what: string) -> LValue {
+        const align_val: LValue = LType::const_int(LType::i64(), align, false);
+
+        if (is_ast_node) {
+            const arena_fn: LValue = this.resolver.resolve_function(
+                this.intern_str("Compiler::Codegen::AstArena::cryo_ast_arena_alloc"));
+            if (!arena_fn.is_valid()) {
+                this.diag.emit_error_at_span(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL,
+                    format("codegen: %s: AST arena allocator not declared", what), span);
+                return LValue::null();
+            }
+            const arena_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(arena_fn.raw) };
+            mut arena_args: Pair<LValue, TypeRef>[] = [];
+            arena_args.push(Pair<LValue, TypeRef>::new(size_val, TypeRef::invalid()));
+            arena_args.push(Pair<LValue, TypeRef>::new(align_val, TypeRef::invalid()));
+            return this.codegen_call(arena_fn, arena_ty, arena_args, label);
+        }
+
+        const raw_fn: LValue = this.resolver.resolve_function(
+            this.intern_str("std::alloc::allocator::alloc"));
+        if (raw_fn.is_valid()) {
+            const raw_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(raw_fn.raw) };
+            mut raw_args: Pair<LValue, TypeRef>[] = [];
+            raw_args.push(Pair<LValue, TypeRef>::new(size_val, TypeRef::invalid()));
+            raw_args.push(Pair<LValue, TypeRef>::new(align_val, TypeRef::invalid()));
+            return this.codegen_call(raw_fn, raw_ty, raw_args, label);
+        }
+
+        // Freestanding: `-nostdlib` means there is no libc `malloc` to fall
+        // back to, and `no_std` means the stdlib allocator above never resolves
+        // either — so without this step every `new` in a freestanding program
+        // fails codegen with "'malloc' not declared".  Route to the allocator
+        // lang item, which the alloc tier supplies.
+        if (this.intrinsics != null && this.intrinsics.no_runtime) {
+            const rt_fn: LValue = this.intrinsics.get_or_decl_cryo_alloc();
+            if (rt_fn.is_valid()) {
+                const rt_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(rt_fn.raw) };
+                mut rt_args: Pair<LValue, TypeRef>[] = [];
+                rt_args.push(Pair<LValue, TypeRef>::new(size_val, TypeRef::invalid()));
+                rt_args.push(Pair<LValue, TypeRef>::new(align_val, TypeRef::invalid()));
+                return this.codegen_call(rt_fn, rt_ty, rt_args, label);
+            }
+        }
+
+        const malloc_fn: LValue = this.resolver.resolve_function(this.intern_str("malloc"));
+        if (!malloc_fn.is_valid()) {
+            this.diag.emit_error_at_span(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL,
+                format("codegen: %s: 'malloc' not declared", what), span);
+            return LValue::null();
+        }
+        const malloc_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(malloc_fn.raw) };
+        if (!malloc_ty.is_valid()) {
+            this.diag.emit_error_at_span(ErrorCode::E0602_INVALID_LLVM_TYPE,
+                format("codegen: %s: failed to retrieve malloc function type", what), span);
+            return LValue::null();
+        }
+        mut malloc_args: Pair<LValue, TypeRef>[] = [];
+        malloc_args.push(Pair<LValue, TypeRef>::new(size_val, TypeRef::invalid()));
+        return this.codegen_call(malloc_fn, malloc_ty, malloc_args, label);
+    }
+
+    /// The dealloc counterpart to `emit_raw_alloc`, for `delete`. Bitcasts the
+    /// pointer to `i8*`, then frees through `std::alloc::allocator::free`
+    /// (`{ptr, align}` — the shim takes the alignment so it pairs with the
+    /// aligned `alloc` on platforms where free is alignment-sensitive), or a
+    /// direct libc `free` (`{ptr}`) when the stdlib is not linked. A null or
+    /// invalid pointer is a silent no-op (nothing was allocated).
+    emit_raw_dealloc(mut &this, ptr: LValue, align: u64, span: SourceSpan) -> void {
+        // Freestanding: pair with the `__cryo_alloc` the allocation went
+        // through, for the same reason there is no libc `free` here either.
+        // The lang item's `size` parameter is passed 0: a `delete` site does not
+        // carry the allocation size, and the tier recovers the exact mapping
+        // from its own header rather than the argument.
+        if (this.intrinsics != null && this.intrinsics.no_runtime && ptr.is_valid()) {
+            const rt_fn: LValue = this.intrinsics.get_or_decl_cryo_dealloc();
+            if (rt_fn.is_valid()) {
+                const rt_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(rt_fn.raw) };
+                const rt_ptr: LValue = this.builder.build_pointer_cast(
+                    ptr, LType::pointer_to(LType::i8()), "delcast");
+                mut rt_args: Pair<LValue, TypeRef>[] = [];
+                rt_args.push(Pair<LValue, TypeRef>::new(rt_ptr, TypeRef::invalid()));
+                rt_args.push(Pair<LValue, TypeRef>::new(
+                    LType::const_int(LType::i64(), 0, false), TypeRef::invalid()));
+                rt_args.push(Pair<LValue, TypeRef>::new(
+                    LType::const_int(LType::i64(), align, false), TypeRef::invalid()));
+                this.codegen_call(rt_fn, rt_ty, rt_args, "");
+                return;
+            }
+        }
+
+        mut free_fn: LValue = this.resolver.resolve_function(
+            this.intern_str("std::alloc::allocator::free"));
+        const free_via_shim: boolean = free_fn.is_valid();
+        if (!free_via_shim) {
+            free_fn = this.resolver.resolve_function(this.intern_str("free"));
+        }
+        if (!free_fn.is_valid() || !ptr.is_valid()) { return; }
+
+        const void_ptr: LValue = this.builder.build_pointer_cast(
+            ptr, LType::pointer_to(LType::i8()), "delcast");
+        const free_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(free_fn.raw) };
+        if (!free_ty.is_valid()) {
+            this.diag.emit_error_at_span(ErrorCode::E0602_INVALID_LLVM_TYPE,
+                "codegen: 'delete' expression: failed to retrieve free function type",
+                span);
+            return;
+        }
+        mut free_args: Pair<LValue, TypeRef>[] = [];
+        free_args.push(Pair<LValue, TypeRef>::new(void_ptr, TypeRef::invalid()));
+        if (free_via_shim) {
+            const align_val: LValue = LType::const_int(LType::i64(), align, false);
+            free_args.push(Pair<LValue, TypeRef>::new(align_val, TypeRef::invalid()));
+        }
+        this.codegen_call(free_fn, free_ty, free_args, "");
+    }
+
+
     // Heap-box enum variant
 
     /// Heap-box an enum variant value for `new T::V(...)`.  Allocates
@@ -1949,40 +2343,11 @@ type struct ExprOps {
         }
 
         const size_val: LValue = LType::const_int(LType::i64(), size, false);
-        mut raw_ptr: LValue = LValue::null();
-        // Box the enum through the canonical `GlobalAlloc` (via
-        // `alloc`), exactly like `new T()` / `new T{...}` in
-        // new_delete_emitter, so a boxed `new T::V` shares the per-target
-        // arena routing.  Fall back to a direct `malloc` when the stdlib is
-        // not linked (e.g. `--no-std`).
-        const raw_sym: SymbolStr = this.intern_str("std::alloc::allocator::alloc");
-        const raw_fn: LValue = this.resolver.resolve_function(raw_sym);
-        if (raw_fn.is_valid()) {
-            const raw_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(raw_fn.raw) };
-            const align_val: LValue = LType::const_int(LType::i64(), 16, false);
-            mut raw_args: Pair<LValue, TypeRef>[] = [];
-            raw_args.push(Pair<LValue, TypeRef>::new(size_val, TypeRef::invalid()));
-            raw_args.push(Pair<LValue, TypeRef>::new(align_val, TypeRef::invalid()));
-            raw_ptr = this.codegen_call(raw_fn, raw_ty, raw_args, "newenum");
-        } else {
-            const malloc_fn: LValue = this.resolver.resolve_function(this.intern_str("malloc"));
-            if (!malloc_fn.is_valid()) {
-                this.diag.emit_error_at_span(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL,
-                    "codegen: new T::V: malloc not declared",
-                    span);
-                return LValue::null();
-            }
-            const malloc_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(malloc_fn.raw) };
-            if (!malloc_ty.is_valid()) {
-                this.diag.emit_error_at_span(ErrorCode::E0602_INVALID_LLVM_TYPE,
-                    "codegen: new T::V: failed to retrieve malloc function type",
-                    span);
-                return LValue::null();
-            }
-            mut malloc_args: Pair<LValue, TypeRef>[] = [];
-            malloc_args.push(Pair<LValue, TypeRef>::new(size_val, TypeRef::invalid()));
-            raw_ptr = this.codegen_call(malloc_fn, malloc_ty, malloc_args, "newenum");
-        }
+        // Box the enum through the shared allocation funnel, exactly like
+        // `new T()` in new_delete_emitter, so a boxed `new T::V` shares the
+        // per-target arena routing.
+        const raw_ptr: LValue = this.emit_raw_alloc(false, size_val, 16, "newenum", span, "new T::V");
+        if (!raw_ptr.is_valid()) { return LValue::null(); }
 
         const enum_llvm: LType = this.type_mapper.map_type(enum_ref);
         if (!enum_llvm.is_valid()) {

@@ -1,0 +1,59 @@
+// Where an `async function` is declared must not matter.
+//
+// The state machine can only be built from a typed body, so the lowering runs at
+// the end of each function's own sema visit.  But `await` resolves the callee's
+// return type through the declaration index, so a caller visited before its
+// callee used to see the callee's PRE-lowering signature and report that its
+// Output "does not implement `Future`" - a diagnostic that pointed at the await
+// and named a type the user never wrote.  The futures for a whole module are now
+// declared before any body is typed, so all three directions below resolve.
+![config(testing)]
+namespace CryoTests::Tests::Lang::AsyncDeclarationOrder;
+
+import std::test;
+import std::core::result;
+import std::future;
+
+// Declared FIRST, awaits a callee declared below it.
+async function awaits_below() -> i64 {
+    const v: i64 = await declared_after();
+    return v + 1;
+}
+
+async function declared_after() -> i64 {
+    const _z: i64 = await PendingThenReady<i64>::new(1, 1);
+    return 10;
+}
+
+// Awaits one declared above and one declared below, in the same body.
+async function awaits_both_directions() -> i64 {
+    const a: i64 = await declared_after();
+    const b: i64 = await declared_last();
+    return a + b;
+}
+
+async function declared_last() -> i64 {
+    const _z: i64 = await PendingThenReady<i64>::new(1, 1);
+    return 100;
+}
+
+// A plain function calling an async fn declared below it: the call site needs the
+// future type just as much as an `await` does.
+function sync_calls_forward() -> i64 {
+    return future::block_on(declared_last());
+}
+
+![test]
+function async_can_await_a_callee_declared_below() -> Result<(), TestError> {
+    return expect_eq(future::block_on(awaits_below()), 11 as i64);
+}
+
+![test]
+function async_can_await_in_both_directions() -> Result<(), TestError> {
+    return expect_eq(future::block_on(awaits_both_directions()), 110 as i64);
+}
+
+![test]
+function plain_function_can_call_async_declared_below() -> Result<(), TestError> {
+    return expect_eq(sync_calls_forward(), 100 as i64);
+}

@@ -1,0 +1,109 @@
+// `async function ... -> void`: the natural shape for a task that is run for its
+// effect rather than its value.
+//
+// A future has to hand a value to `Poll::Ready`, and `void` is the absence of
+// one, so a `-> void` async fn lowers with `Output = ()`.  Unit IS a value, so
+// the terminal `return` is well-formed - which also means a body that ends
+// without a `return` is legal here and must be given that unit completion
+// implicitly.  Getting it wrong is not subtle: the generated `poll` either fails
+// to type-check or falls off its end and spins the state-dispatch loop.
+![config(testing)]
+namespace CryoTests::Tests::Lang::AsyncVoidOutput;
+
+import std::test;
+import std::core::result;
+import std::future;
+
+mut vo_hits: i64 = 0;
+
+async function no_await_no_return() -> void {
+    vo_hits = vo_hits + 1;
+}
+
+async function no_await_bare_return() -> void {
+    vo_hits = vo_hits + 1;
+    return;
+}
+
+// Falls off its end AFTER a suspend: the terminal state has to complete rather
+// than re-dispatch.
+async function await_falls_off_end() -> void {
+    const _z: i64 = await PendingThenReady<i64>::new(1, 1);
+    vo_hits = vo_hits + 1;
+}
+
+async function await_bare_return() -> void {
+    const _z: i64 = await PendingThenReady<i64>::new(1, 1);
+    vo_hits = vo_hits + 1;
+    return;
+}
+
+// One path returns early, the other falls off the end, and there is a suspend on
+// each - so both the explicit and the implicit completion are exercised in one
+// state machine.
+async function early_return_or_fall_off(early: boolean) -> void {
+    const _z: i64 = await PendingThenReady<i64>::new(1, 1);
+    if (early) {
+        vo_hits = vo_hits + 1;
+        return;
+    }
+    const _w: i64 = await PendingThenReady<i64>::new(1, 1);
+    vo_hits = vo_hits + 1;
+}
+
+// A void async fn awaited by another: `await` on a unit-output future is a
+// statement, with no value to bind.
+async function awaits_a_void_async() -> void {
+    await await_falls_off_end();
+    vo_hits = vo_hits + 1;
+}
+
+![test]
+function void_async_without_await_runs() -> Result<(), TestError> {
+    vo_hits = 0;
+    future::block_on(no_await_no_return());
+    return expect_eq(vo_hits, 1 as i64);
+}
+
+![test]
+function void_async_bare_return_runs() -> Result<(), TestError> {
+    vo_hits = 0;
+    future::block_on(no_await_bare_return());
+    return expect_eq(vo_hits, 1 as i64);
+}
+
+![test]
+function void_async_falling_off_end_completes() -> Result<(), TestError> {
+    vo_hits = 0;
+    future::block_on(await_falls_off_end());
+    return expect_eq(vo_hits, 1 as i64);
+}
+
+![test]
+function void_async_bare_return_after_await_completes() -> Result<(), TestError> {
+    vo_hits = 0;
+    future::block_on(await_bare_return());
+    return expect_eq(vo_hits, 1 as i64);
+}
+
+![test]
+function void_async_early_return_path_completes() -> Result<(), TestError> {
+    vo_hits = 0;
+    future::block_on(early_return_or_fall_off(true));
+    return expect_eq(vo_hits, 1 as i64);
+}
+
+![test]
+function void_async_fall_off_path_completes() -> Result<(), TestError> {
+    vo_hits = 0;
+    future::block_on(early_return_or_fall_off(false));
+    return expect_eq(vo_hits, 1 as i64);
+}
+
+![test]
+function void_async_awaiting_void_async_completes() -> Result<(), TestError> {
+    vo_hits = 0;
+    future::block_on(awaits_a_void_async());
+    // The awaited future's effect plus the awaiting one's.
+    return expect_eq(vo_hits, 2 as i64);
+}

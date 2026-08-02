@@ -4,6 +4,8 @@
 namespace CryoTests::Tests::Stdlib::RcT;
 
 import std::core::result;
+import std::core::option;
+import std::collections::str;
 import std::alloc::rc;
 import std::test::error;
 import std::test::assert;
@@ -110,4 +112,135 @@ function rc_inline_drop_payload_compiles_and_drops() -> Result<(), TestError> {
     mut r: Rc<InlineDropRc> = Rc::new(InlineDropRc { counter_ptr: &count });
     r.drop();
     return expect_eq(count, 1);
+}
+
+// ============================================================================
+// Weak<T> - non-owning references
+//
+// These tests use a test-local `Payload` type rather than a builtin like
+// `i32`. Each generic instance (`Rc<Payload>`, `Weak<Payload>`) is then owned
+// by THIS object and its methods are emitted here, the same way
+// `Rc<InlineDropRc>` above already links. A `Weak<i32>` would instead be
+// designated to the stdlib's `alloc::allocator` object, which is not emitted
+// for a brand-new generic reached only through `Rc::downgrade` - so it would
+// fail to link in the test harness even though a normal `cryo build` of a
+// program using `Weak<i32>` emits and links it fine.
+// ============================================================================
+
+// A small owned payload with an inline (no-op) destructor, satisfying Rc's
+// `where T: Drop`. `v` lets the value tests read something concrete.
+type struct Payload {
+    v: i32;
+    drop(mut &this) -> void { }
+}
+
+![test]
+function downgrade_does_not_bump_strong() -> Result<(), TestError> {
+    mut r: Rc<Payload> = Rc::new(Payload { v: 11 });
+    mut w: Weak<Payload> = r.downgrade();
+    const strong: u64 = r.strong_count();
+    const weak: u64 = r.weak_count();
+    w.drop();
+    r.drop();
+    expect_eq(strong, 1u64)?;
+    return expect_eq(weak, 1u64);
+}
+
+![test]
+function upgrade_while_alive_returns_some() -> Result<(), TestError> {
+    mut r: Rc<Payload> = Rc::new(Payload { v: 11 });
+    mut w: Weak<Payload> = r.downgrade();
+    mut strong_during: u64 = 0;
+    mut val: i32 = 0;
+    match (w.upgrade()) {
+        Option::Some(up) => {
+            mut u: Rc<Payload> = up;
+            strong_during = u.strong_count();
+            val = (*u.as_ptr()).v;
+            u.drop();
+        }
+        Option::None => { }
+    }
+    const strong_after: u64 = r.strong_count();
+    w.drop();
+    r.drop();
+    expect_eq(strong_during, 2u64)?;   // upgrade bumped strong to 2
+    expect_eq(val, 11)?;
+    return expect_eq(strong_after, 1u64);   // and back to 1 once its Rc dropped
+}
+
+![test]
+function upgrade_after_last_strong_is_none() -> Result<(), TestError> {
+    mut r: Rc<Payload> = Rc::new(Payload { v: 5 });
+    mut w: Weak<Payload> = r.downgrade();
+    r.drop();                         // last strong: value dies, header kept
+    mut got_none: boolean = false;
+    match (w.upgrade()) {
+        Option::Some(up) => { mut u: Rc<Payload> = up; u.drop(); }
+        Option::None    => { got_none = true; }
+    }
+    w.drop();
+    return expect_true(got_none, Str::new("upgrade after last strong drop is None"));
+}
+
+// Two-phase teardown: the value's destructor runs exactly once (on the
+// strong->0 transition), NOT again when the surviving Weak frees the header.
+![test]
+function value_dropped_once_with_outstanding_weak() -> Result<(), TestError> {
+    mut count: i32 = 0;
+    mut r: Rc<InlineDropRc> = Rc::new(InlineDropRc { counter_ptr: &count });
+    mut w: Weak<InlineDropRc> = r.downgrade();
+    r.drop();
+    const after_strong: i32 = count;   // value dropped once here
+    w.drop();
+    const after_weak: i32 = count;     // header freed; no second drop
+    expect_eq(after_strong, 1)?;
+    return expect_eq(after_weak, 1);
+}
+
+// get_mut is exclusive: an outstanding Weak (which could upgrade) blocks it.
+![test]
+function get_mut_blocked_by_outstanding_weak() -> Result<(), TestError> {
+    mut r: Rc<Payload> = Rc::new(Payload { v: 3 });
+    mut w: Weak<Payload> = r.downgrade();
+    mut blocked: boolean = false;
+    match (r.get_mut()) {
+        Option::Some(_) => { }
+        Option::None    => { blocked = true; }
+    }
+    w.drop();                          // no more weaks: now unique
+    mut unlocked: boolean = false;
+    match (r.get_mut()) {
+        Option::Some(p) => { (*p).v = 8; unlocked = true; }
+        Option::None    => { }
+    }
+    const final_val: i32 = (*r.as_ptr()).v;
+    r.drop();
+    expect_true(blocked, Str::new("get_mut blocked while a Weak exists"))?;
+    expect_true(unlocked, Str::new("get_mut allowed once unique"))?;
+    return expect_eq(final_val, 8);
+}
+
+![test]
+function dangling_weak_upgrades_to_none() -> Result<(), TestError> {
+    mut w: Weak<Payload> = Weak<Payload>::new();
+    mut got_none: boolean = false;
+    match (w.upgrade()) {
+        Option::Some(up) => { mut u: Rc<Payload> = up; u.drop(); }
+        Option::None    => { got_none = true; }
+    }
+    w.drop();
+    return expect_true(got_none, Str::new("dangling Weak::new upgrades to None"));
+}
+
+![test]
+function weak_clone_bumps_weak_count() -> Result<(), TestError> {
+    mut r: Rc<Payload> = Rc::new(Payload { v: 1 });
+    mut w1: Weak<Payload> = r.downgrade();
+    mut w2: Weak<Payload> = w1.clone();
+    const wc: u64 = r.weak_count();
+    w2.drop();
+    w1.drop();
+    r.drop();
+    return expect_eq(wc, 2u64);
 }

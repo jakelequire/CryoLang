@@ -62,6 +62,32 @@ type struct LiteralResolver {
     /// Type an integer literal.  Adopts an integer `expected_type` (bounds-checked
     /// against its width); otherwise falls back to the default width.
     resolve_integer_literal(&this, lit: LiteralNode*) -> TypeRef {
+        // A type suffix names the literal's type outright, so it settles the
+        // question before either the expected-type adoption or the magnitude
+        // default: `7u64` is a u64 wherever it appears.  The width bound is
+        // then checked against what the author wrote rather than against the
+        // surrounding context, so `300u8` is caught even in an i32 position.
+        // Where the suffix disagrees with the context, the literal keeps its
+        // own type and ordinary assignment checking reports the mismatch -
+        // previously the suffix was validated by the lexer and then discarded,
+        // so a contradiction was silently resolved in the context's favour.
+        const suffixed: TypeRef = sema_numeric_suffix_type(this.arena, lit.suffix);
+        if (suffixed.is_valid()) {
+            const st: Type* = this.arena.lookup(suffixed.id);
+            if (st != null && st.kind == TypeKind::Int) {
+                const sit: IntType* = st as IntType*;
+                const smax: u64 = sema_int_unsigned_bound(sit.int_kind.bit_width());
+                if (smax != 0 && int_literal_exceeds(lit.value, smax)) {
+                    this.ctx.emit_error_at(
+                        ErrorCode::E0010_NUMBER_TOO_LARGE,
+                        format("integer literal `%s` is out of range for type `%s`",
+                            lit.value, sit.int_kind.to_string()),
+                        lit.span);
+                }
+            }
+            this.warn_if_suffix_redundant(lit, suffixed);
+            return suffixed;
+        }
         if (this.state.expected_type.is_valid()) {
             const exp: Type* = this.arena.lookup(this.state.expected_type.id);
             if (exp != null && exp.kind == TypeKind::Int) {
@@ -101,14 +127,39 @@ type struct LiteralResolver {
                 }
                 return this.state.expected_type;
             }
+            // `char` is a 32-bit unsigned Unicode scalar, so an integer literal
+            // in a `char` position adopts `char` the same way one in a `u8`
+            // position adopts `u8`.  This is what keeps `buf[n] = 0` (writing a
+            // NUL terminator into a `char[]`) cast-free.  Without it the literal
+            // falls back to the `i32` default and then has to cross the
+            // Char/Int width lattice in `check_compatibility`, which correctly
+            // refuses a signed 32-bit value narrowing into an unsigned 32-bit
+            // one - turning every NUL terminator into an error.
+            if (exp != null && exp.kind == TypeKind::Char) {
+                const char_max: u64 = sema_int_unsigned_bound(32);
+                if (char_max != 0 && int_literal_exceeds(lit.value, char_max)) {
+                    this.ctx.emit_error_at(
+                        ErrorCode::E0010_NUMBER_TOO_LARGE,
+                        format("integer literal `%s` is out of range for type `char`",
+                            lit.value),
+                        lit.span);
+                }
+                return this.state.expected_type;
+            }
         }
         // No integer expected-type hint: pick the narrowest default width that
         // holds the literal's magnitude (i32 -> i64 -> u64).
         return sema_default_int_type(this.arena, lit.value);
     }
 
-    /// Type a float literal: adopt a float `expected_type`, else default to f64.
+    /// Type a float literal: a type suffix settles it, else adopt a float
+    /// `expected_type`, else default to f64.
     resolve_float_literal(&this, lit: LiteralNode*) -> TypeRef {
+        const suffixed: TypeRef = sema_numeric_suffix_type(this.arena, lit.suffix);
+        if (suffixed.is_valid()) {
+            this.warn_if_suffix_redundant(lit, suffixed);
+            return suffixed;
+        }
         if (this.state.expected_type.is_valid()) {
             const exp: Type* = this.arena.lookup(this.state.expected_type.id);
             if (exp != null && exp.kind == TypeKind::Float) {
@@ -116,6 +167,55 @@ type struct LiteralResolver {
             }
         }
         return this.arena.get_f64();
+    }
+
+    /// Warn when a literal's type suffix names exactly the type the literal
+    /// would have had anyway, so deleting it is provably behaviour-preserving.
+    /// Redundancy is decided by re-running the no-suffix rule (adopt a numeric
+    /// expected type, else the width default) and comparing: a suffix is only
+    /// reported where the surrounding context already settles the same type.
+    /// Where it does NOT - a bare `mut x = 7u64`, or a generic parameter
+    /// reachable from no other argument - the suffix is load-bearing and stays
+    /// silent.
+    warn_if_suffix_redundant(&this, lit: LiteralNode*, suffixed: TypeRef) -> void {
+        // Judge only the FIRST resolution. An un-annotated `mut x = 7u64` is
+        // typed by resolving its initializer, after which the declaration
+        // re-resolves that same literal with the now-known type as the expected
+        // type - a context derived FROM this suffix. Comparing against it would
+        // call every such suffix redundant and delete the only thing typing the
+        // local. On a re-resolution the node already carries its type, which is
+        // exactly the signal that the surrounding context is no longer
+        // independent of it.
+        if (lit.has_resolved_type()) { return; }
+        const contextual: TypeRef = this.type_without_suffix(lit);
+        if (!contextual.is_valid()) { return; }
+        if (contextual.id != suffixed.id) { return; }
+        mut diag: Diagnostic = Diagnostic::warning(
+            ErrorCode::W0014_REDUNDANT_NUMERIC_SUFFIX,
+            format("redundant type suffix `%s` on numeric literal `%s`; the surrounding context already types it",
+                lit.suffix, lit.value));
+        diag = diag.at(lit.span);
+        this.ctx.emit_diagnostic(diag);
+    }
+
+    /// The type this literal would take with its suffix removed.
+    type_without_suffix(&this, lit: LiteralNode*) -> TypeRef {
+        if (lit.literal_kind == LiteralKind::Float) {
+            if (this.state.expected_type.is_valid()) {
+                const fexp: Type* = this.arena.lookup(this.state.expected_type.id);
+                if (fexp != null && fexp.kind == TypeKind::Float) {
+                    return this.state.expected_type;
+                }
+            }
+            return this.arena.get_f64();
+        }
+        if (this.state.expected_type.is_valid()) {
+            const exp: Type* = this.arena.lookup(this.state.expected_type.id);
+            if (exp != null && (exp.kind == TypeKind::Int || exp.kind == TypeKind::Char)) {
+                return this.state.expected_type;
+            }
+        }
+        return sema_default_int_type(this.arena, lit.value);
     }
 
     /// Whether the current `expected_type` hint is a concrete integer type (so a

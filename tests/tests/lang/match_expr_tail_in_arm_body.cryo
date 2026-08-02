@@ -1,0 +1,247 @@
+// A match-expression arm's braced body is a VALUE block: codegen takes the
+// arm's value from whatever its LAST statement left behind.  Inside that block
+// `match` parses in statement position, and the statement lowering merges no
+// value — so before the fix an arm whose tail was a `match` silently adopted
+// whichever value that inner match's LAST arm happened to emit, no matter which
+// arm actually ran.
+//
+// Two symptoms, one cause.  With constant arms it compiled and returned the
+// wrong number (`Some(Ok(9))` yielded 8, not 7).  With arms that read a bound
+// payload it failed LLVM verification instead — the outer phi named the inner
+// match's join block as its predecessor while taking a value defined inside one
+// of the inner ARMS, so the value did not dominate its use.  The fix re-forms
+// such a tail as the match EXPRESSION it is being used as, giving it its own
+// phi that the outer one can legitimately read.
+//
+// The controls carry the weight here.  `only_the_tail_match_is_promoted` pins
+// that an earlier `match` in the same block is still a statement run for
+// effect — promoting those too would silently change what a block does.
+// `unbraced_arm_body_*` covers the path that always worked and must keep
+// working, and the diverging cases pin that an arm which never yields a value
+// is still excluded from the phi rather than contributing an undefined one.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::MatchExprTailInArmBody;
+
+import std::core::result;
+import std::core::option;
+import std::test::error;
+import std::test::assert;
+
+
+// Constant arms: the silent wrong-value form.
+function classify_const(r: Option<Result<i64, i64>>) -> i64 {
+    const got: i64 = match (r) {
+        Option::Some(inner) => {
+            match (inner) {
+                Result::Ok(_)  => { 7 }
+                Result::Err(_) => { 8 }
+            }
+        }
+        Option::None => { -1 }
+    };
+    return got;
+}
+
+// Payload-reading arms: the form that failed LLVM verification.
+function classify_payload(r: Option<Result<i64, i64>>) -> i64 {
+    const got: i64 = match (r) {
+        Option::Some(inner) => {
+            match (inner) {
+                Result::Ok(v)  => { v }
+                Result::Err(e) => { -e }
+            }
+        }
+        Option::None => { -1 }
+    };
+    return got;
+}
+
+// A statement before the tail match: the tail is still the value.
+function with_leading_statement(x: i64) -> i64 {
+    const got: i64 = match (x) {
+        0 => {
+            mut z: i64 = 1;
+            match (z) {
+                1 => { 7 }
+                _ => { 8 }
+            }
+        }
+        _ => { -1 }
+    };
+    return got;
+}
+
+// An earlier match is a STATEMENT run for effect; only the tail is a value.
+function leading_match_is_still_a_statement(x: i64) -> i64 {
+    const got: i64 = match (x) {
+        0 => {
+            mut acc: i64 = 0;
+            match (x) {
+                0 => { acc = 5; }
+                _ => { acc = 6; }
+            }
+            match (acc) {
+                5 => { acc + 2 }
+                _ => { 99 }
+            }
+        }
+        _ => { -1 }
+    };
+    return got;
+}
+
+// Three levels: the promotion is not special-cased to one depth.
+function three_levels(r: Option<Result<i64, i64>>) -> i64 {
+    const got: i64 = match (r) {
+        Option::Some(inner) => {
+            match (inner) {
+                Result::Ok(v) => {
+                    match (v) {
+                        0 => { 40 }
+                        _ => { 41 }
+                    }
+                }
+                Result::Err(_) => { 8 }
+            }
+        }
+        Option::None => { -1 }
+    };
+    return got;
+}
+
+// Every arm of the tail match diverges: nothing flows out of the outer arm.
+function all_arms_return(x: i64) -> i64 {
+    const got: i64 = match (x) {
+        0 => {
+            match (x) {
+                0 => { return 100; }
+                _ => { return 200; }
+            }
+        }
+        _ => { -1 }
+    };
+    return got;
+}
+
+// One arm diverges, the other yields a value.
+function mixed_return_and_value(x: i64, y: i64) -> i64 {
+    const got: i64 = match (x) {
+        0 => {
+            match (y) {
+                0 => { return 100; }
+                _ => { 7 }
+            }
+        }
+        _ => { -1 }
+    };
+    return got;
+}
+
+// CONTROL: the unbraced arm body already parsed as an expression.
+function unbraced(r: Option<Result<i64, i64>>) -> i64 {
+    const got: i64 = match (r) {
+        Option::Some(inner) => match (inner) {
+            Result::Ok(v)  => { v }
+            Result::Err(e) => { -e }
+        }
+        Option::None => { -1 }
+    };
+    return got;
+}
+
+
+![test]
+function tail_match_with_constant_arms_yields_the_matching_arm() -> Result<(), TestError> {
+    match (expect_eq(classify_const(Option::Some(Result::Ok(9))), 7 as i64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(classify_const(Option::Some(Result::Err(4))), 8 as i64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(classify_const(Option::None), -1 as i64);
+}
+
+![test]
+function tail_match_reading_a_bound_payload_compiles_and_yields_it() -> Result<(), TestError> {
+    match (expect_eq(classify_payload(Option::Some(Result::Ok(9))), 9 as i64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(classify_payload(Option::Some(Result::Err(4))), -4 as i64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(classify_payload(Option::None), -1 as i64);
+}
+
+![test]
+function tail_match_after_a_leading_statement_is_the_arm_value() -> Result<(), TestError> {
+    match (expect_eq(with_leading_statement(0), 7 as i64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(with_leading_statement(5), -1 as i64);
+}
+
+// CONTROL: a non-tail match must keep lowering as a statement.
+![test]
+function only_the_tail_match_is_promoted() -> Result<(), TestError> {
+    match (expect_eq(leading_match_is_still_a_statement(0), 7 as i64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(leading_match_is_still_a_statement(5), -1 as i64);
+}
+
+![test]
+function tail_match_promotion_nests_three_deep() -> Result<(), TestError> {
+    match (expect_eq(three_levels(Option::Some(Result::Ok(0))), 40 as i64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(three_levels(Option::Some(Result::Ok(3))), 41 as i64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(three_levels(Option::Some(Result::Err(1))), 8 as i64);
+}
+
+// CONTROL: an arm that never yields a value contributes nothing to the phi.
+![test]
+function tail_match_whose_arms_all_diverge_still_works() -> Result<(), TestError> {
+    match (expect_eq(all_arms_return(0), 100 as i64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(all_arms_return(5), -1 as i64);
+}
+
+![test]
+function tail_match_mixing_a_return_and_a_value_still_works() -> Result<(), TestError> {
+    match (expect_eq(mixed_return_and_value(0, 0), 100 as i64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(mixed_return_and_value(0, 1), 7 as i64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(mixed_return_and_value(5, 0), -1 as i64);
+}
+
+// CONTROL: the path that always worked.
+![test]
+function unbraced_arm_body_match_still_yields_the_matching_arm() -> Result<(), TestError> {
+    match (expect_eq(unbraced(Option::Some(Result::Ok(9))), 9 as i64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(unbraced(Option::Some(Result::Err(4))), -4 as i64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(unbraced(Option::None), -1 as i64);
+}

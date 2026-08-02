@@ -1,0 +1,109 @@
+/// Built and run end-to-end by the projects meta-runner (Low-Level Plan
+/// Stage 2). On Linux every `std::sys` seam function and
+/// `syscall::sys_callN` in this binary IS the raw `syscall` instruction via
+/// inline asm, no libc trampoline (the interim `native_syscalls` migration
+/// switch was deleted once the backend was proven). The program is a
+/// differential suite: each native operation is cross-checked against plain
+/// libc (which remains fully available - only the `sys` seam is native), and
+/// the seam's `-errno` error contract is asserted on deliberate failures. It
+/// ends by calling `sys::exit(3)` - the native `exit_group` path - so the
+/// expected exit code 3 in test.json is itself proof the native exit works;
+/// any failure exits earlier through `libc::exit` with a distinct nonzero
+/// step code. The seam contract is also asserted from the unit suite by the
+/// `sys_seam` stdlib test.
+namespace NativeSyscallsGate::Main;
+
+import std::core::intrinsics;
+import std::sys;
+import sys::syscall;
+import ffi::libc;
+
+/// Report a failed step and exit with its number (via libc so the failure
+/// path does not depend on the machinery under test).
+function fail(step: i32) -> void {
+    intrinsics::printf("FAIL step %d\n", step);
+    libc::exit(step);
+}
+
+function main() -> int {
+    const path: u8* = "/tmp/cryo_native_syscalls_gate.txt" as u8*;
+    const payload: u8* = "hello from the syscall instruction\n" as u8*;
+    const payload_len: u64 = 35;
+
+    // -- Native open/write/close ------------------------------------------
+    const wfd: i64 = sys::open(path, libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC, 420);
+    if (wfd < 0) { fail(1); }
+    const wrote: i64 = sys::write(wfd as i32, payload, payload_len);
+    if (wrote != (payload_len as i64)) { fail(2); }
+    if (sys::close(wfd as i32) != 0) { fail(3); }
+
+    // -- Differential read-back through plain libc -------------------------
+    // The native writes above must be visible to a completely independent
+    // libc open/read of the same file, byte for byte.
+    const rfd: i32 = libc::open(path, libc::O_RDONLY, 0);
+    if (rfd < 0) { fail(4); }
+    mut buf: u8[64];
+    const got: i64 = libc::read(rfd, &buf[0], 64);
+    if (got != (payload_len as i64)) { fail(5); }
+    for (mut i: i64 = 0; i < got; i++) {
+        if (buf[i] != payload[i]) { fail(6); }
+    }
+    libc::close(rfd);
+    libc::unlink(path);
+
+    // -- Native read of libc-written data (the reverse direction) ----------
+    const wfd2: i32 = libc::open(path, libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC, 420);
+    if (wfd2 < 0) { fail(7); }
+    if (libc::write(wfd2, payload, payload_len) != (payload_len as i64)) { fail(8); }
+    libc::close(wfd2);
+    const rfd2: i64 = sys::open(path, libc::O_RDONLY, 0);
+    if (rfd2 < 0) { fail(9); }
+    mut buf2: u8[64];
+    const got2: i64 = sys::read(rfd2 as i32, &buf2[0], 64);
+    if (got2 != (payload_len as i64)) { fail(10); }
+    for (mut i: i64 = 0; i < got2; i++) {
+        if (buf2[i] != payload[i]) { fail(11); }
+    }
+    if (sys::close(rfd2 as i32) != 0) { fail(12); }
+    libc::unlink(path);
+
+    // -- The seam's -errno contract on deliberate failures -----------------
+    // Nonexistent path: raw kernel open returns -ENOENT directly.
+    const noent: i64 = sys::open("/nonexistent/cryo_gate_dir/x" as u8*, libc::O_RDONLY, 0);
+    if (noent != -(libc::ENOENT as i64)) { fail(13); }
+    // Bogus fd: -EBADF from close and read.
+    if (sys::close(987654) != -(libc::EBADF as i64)) { fail(14); }
+    mut scratch: u8[8];
+    if (sys::read(987654, &scratch[0], 8) != -(libc::EBADF as i64)) { fail(15); }
+
+    // -- Raw escape hatch: getpid differential, mmap/munmap round-trip -----
+    // getpid via the native `syscall` instruction must agree with libc's.
+    const native_pid: i64 = syscall::sys_call0(syscall::Syscall::getpid);
+    if (native_pid != (libc::getpid() as i64)) { fail(16); }
+    // Anonymous mapping via raw mmap; probe it end to end, then munmap.
+    const addr: i64 = syscall::sys_call6(syscall::Syscall::mmap,
+        0, 4096,
+        (libc::PROT_READ | libc::PROT_WRITE) as i64,
+        (libc::MAP_PRIVATE | libc::MAP_ANONYMOUS) as i64,
+        -1, 0);
+    // Raw contract: [-4095, -1] is -errno; anything else is the address.
+    if (addr < 0 && addr >= -4095) { fail(17); }
+    const page: u8* = addr as u8*;
+    page[0] = 199;
+    page[4095] = 42;
+    if (page[0] != 199 || page[4095] != 42) { fail(18); }
+    if (syscall::sys_call2(syscall::Syscall::munmap, addr, 4096) != 0) { fail(19); }
+
+    intrinsics::printf("all native syscall checks passed\n");
+
+    // -- Native process exit ------------------------------------------------
+    // `sys::exit` is the native exit_group syscall - a RAW exit that runs no
+    // libc atexit handlers and flushes nothing (first observed here: without
+    // the fflush, every printf above vanished when stdout was a pipe - which
+    // is itself proof the exit path is genuinely raw). Flush explicitly, as
+    // the seam's contract requires. Reaching the `return` below would mean
+    // exit_group returned (a failure), surfacing as exit code 1.
+    libc::fflush(null);
+    sys::exit(3);
+    return 1;
+}

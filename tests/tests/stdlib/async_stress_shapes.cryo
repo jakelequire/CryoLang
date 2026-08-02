@@ -1,0 +1,1291 @@
+///! Async state-machine stress shapes: the cross product of what is awaited,
+///! what is carried across the suspend, and the control flow around it.
+///!
+///! These are not tests OF async so much as tests of ordinary code that happens
+///! to suspend. Every earlier async test drives a single-shot exchange, which is
+///! why a whole class of carrier bugs survived: nothing awaited a method on an
+///! owning local inside a LOOP -- the shape of every protocol read loop, accept
+///! loop and retry loop.
+///!
+///! Two rules make these useful rather than decorative:
+///!
+///!  * every test asserts a NUMBER, never just "it compiled" or "it did not
+///!    crash". Both have been wrong here before;
+///!  * wherever ownership is involved the destructor is COUNTED, so a value that
+///!    is dropped twice, or leaked, fails loudly instead of corrupting the heap
+///!    somewhere unrelated. `ASS_DROPS` is reset by each test before it runs.
+///!
+///! Each shape is paired with a CONTROL one step simpler -- the same body
+///! without the loop, without the await, or on a non-generic owner -- so a red
+///! cell names the variable responsible instead of just the symptom.
+///!
+///! `PendingThenReady` reports `Pending` without waking, so everything here runs
+///! under `future::block_on` and needs no reactor and no executor.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::AsyncStressShapes;
+
+import std::core::result;
+import std::core::option;
+import std::core::slice;
+import std::collections::array;
+import std::collections::str;
+import std::collections::string;
+import std::future;
+import std::future::ready;
+import std::test::error;
+import std::test::assert;
+
+/// Destructor counter. Reset at the top of every test, read at the end.
+mut ASS_DROPS: i64 = 0;
+
+// ============================================================================
+// Fixtures
+// ============================================================================
+
+/// An owning aggregate with a destructor: the value whose carrier the state
+/// machine has to get exactly right. `buf` also records progress, so a test can
+/// tell "the awaits ran" apart from "the value survived".
+type struct Tok {
+    id:  u64;
+    buf: Array<u8>;
+
+    static make(id: u64) -> Tok {
+        return Tok { id: id, buf: Array<u8>::new() };
+    }
+
+    drop(mut &this) -> void {
+        ASS_DROPS = ASS_DROPS + 1;
+        this.buf.drop();
+    }
+
+    count(&this) -> i64 { return this.buf.length() as i64; }
+
+    /// Suspends once, then writes through `this`. Awaiting THIS on a carried
+    /// local is the shape that makes the receiver the carried value itself.
+    async bump(mut &this) -> u64 {
+        const z: u64 = await PendingThenReady<u64>::new(1, 1);
+        this.buf.push(z as u8);
+        return z;
+    }
+
+    /// Same, reported as a `Result`, for the `?` shapes.
+    async try_bump(mut &this) -> Result<u64, i64> {
+        const z: u64 = await PendingThenReady<u64>::new(1, 1);
+        this.buf.push(z as u8);
+        return Result::Ok(z);
+    }
+
+    /// No suspension point at all: the control that separates "the lowering
+    /// mishandles this" from "the language does".
+    sync_bump(mut &this) -> u64 {
+        this.buf.push(1);
+        return 1;
+    }
+}
+
+/// A plain aggregate with no destructor -- copied rather than carried. The
+/// control that isolates "has a destructor" as the variable.
+type struct Plain {
+    n: i64;
+
+    static make(n: i64) -> Plain { return Plain { n: n }; }
+}
+
+/// Two owning values reached through one carried aggregate, so the awaited
+/// receiver is a FIELD path rather than a bare name.
+type struct Pair {
+    a: Tok;
+    b: Tok;
+
+    static make() -> Pair {
+        return Pair { a: Tok::make(1), b: Tok::make(2) };
+    }
+
+    drop(mut &this) -> void {
+        this.a.drop();
+        this.b.drop();
+    }
+}
+
+/// A generic owner with an `async` method, so the whole lowering runs
+/// symbolically and is specialized afterwards.
+type struct Holder<T> {
+    value: T;
+    hits:  i64;
+
+    static of(value: T) -> Holder<T> {
+        return Holder<T> { value: value, hits: 0 };
+    }
+
+    async tick(mut &this) -> u64 {
+        const z: u64 = await PendingThenReady<u64>::new(1, 1);
+        this.hits = this.hits + 1;
+        return z;
+    }
+}
+
+/// A required `async` method plus a default body that awaits it IN A LOOP --
+/// the default-body path that `BufStream` relies on and that no existing test
+/// drove more than once per connection.
+type trait Ticker {
+    async tick_once(mut &this) -> u64;
+
+    async tick_many(mut &this, n: u64) -> u64 {
+        mut total: u64 = 0;
+        mut i: u64 = 0;
+        while (i < n) {
+            const v: u64 = await this.tick_once();
+            total = total + v;
+            i = i + 1;
+        }
+        return total;
+    }
+}
+
+implement trait Ticker for struct Tok {
+    async tick_once(mut &this) -> u64 {
+        const z: u64 = await PendingThenReady<u64>::new(1, 1);
+        this.buf.push(z as u8);
+        return z;
+    }
+}
+
+// ============================================================================
+// Free async functions used as awaited operands
+// ============================================================================
+
+async function ass_tick() -> u64 {
+    return await PendingThenReady<u64>::new(1, 1);
+}
+
+/// Depth 2: awaits an async fn that awaits an async fn.
+async function ass_tick2() -> u64 {
+    const a: u64 = await ass_tick();
+    return a + 1;
+}
+
+/// Depth 3.
+async function ass_tick3() -> u64 {
+    const a: u64 = await ass_tick2();
+    return a + 1;
+}
+
+/// Takes an owning aggregate by value, suspends, and gives it back -- the
+/// owned-handle idiom, where the state that hands the value over must NOT also
+/// hand it back to its carrier.
+async function ass_pass_through(t: Tok) -> Tok {
+    const z: u64 = await PendingThenReady<u64>::new(1, 1);
+    mut b: Tok = t;
+    b.buf.push(z as u8);
+    return b;
+}
+
+/// Zero suspension points, aggregate parameter given away. A body with no
+/// `await` runs to completion in one poll, but its parameter still has to MOVE
+/// out of the future rather than be copied out of it.
+async function ass_no_await_give(t: Tok) -> Tok {
+    mut b: Tok = t;
+    b.buf.push(1);
+    return b;
+}
+
+/// Zero suspension points, aggregate parameter only read.
+async function ass_no_await_read(t: Tok) -> i64 {
+    return t.count();
+}
+
+// ============================================================================
+// Shape: awaited method on an owning local -- control flow matrix
+// ============================================================================
+
+/// CONTROL for every loop below: the same three awaits, straight-line.
+async function ass_straight() -> i64 {
+    mut c: Tok = Tok::make(10);
+    const x: u64 = await c.bump();
+    const y: u64 = await c.bump();
+    const z: u64 = await c.bump();
+    return c.count();
+}
+
+![test]
+function async_receiver_straight_line() -> Result<(), TestError> {
+    ASS_DROPS = 0;
+    const n: i64 = future::block_on(ass_straight());
+    expect_eq(n, 3 as i64)?;
+    return expect_eq(ASS_DROPS, 1 as i64);
+}
+
+/// CONTROL: the identical loop with NO await, so a red cell above and a green
+/// one here isolates the lowering from the language.
+function ass_sync_loop() -> i64 {
+    mut c: Tok = Tok::make(11);
+    mut i: u64 = 0;
+    while (i < 3) {
+        const _z: u64 = c.sync_bump();
+        i = i + 1;
+    }
+    return c.count();
+}
+
+![test]
+function async_control_sync_loop_over_owning_local() -> Result<(), TestError> {
+    ASS_DROPS = 0;
+    const n: i64 = ass_sync_loop();
+    expect_eq(n, 3 as i64)?;
+    return expect_eq(ASS_DROPS, 1 as i64);
+}
+
+async function ass_while() -> i64 {
+    mut c: Tok = Tok::make(12);
+    mut i: u64 = 0;
+    while (i < 3) {
+        const z: u64 = await c.bump();
+        i = i + 1;
+    }
+    return c.count();
+}
+
+![test]
+function async_receiver_in_while_loop() -> Result<(), TestError> {
+    ASS_DROPS = 0;
+    const n: i64 = future::block_on(ass_while());
+    expect_eq(n, 3 as i64)?;
+    return expect_eq(ASS_DROPS, 1 as i64);
+}
+
+/// A single iteration: proves the failure is the FIRST hand-back, not loop
+/// re-entry or a second take.
+async function ass_while_one() -> i64 {
+    mut c: Tok = Tok::make(13);
+    mut i: u64 = 0;
+    while (i < 1) {
+        const z: u64 = await c.bump();
+        i = i + 1;
+    }
+    return c.count();
+}
+
+![test]
+function async_receiver_in_single_iteration_loop() -> Result<(), TestError> {
+    ASS_DROPS = 0;
+    const n: i64 = future::block_on(ass_while_one());
+    expect_eq(n, 1 as i64)?;
+    return expect_eq(ASS_DROPS, 1 as i64);
+}
+
+async function ass_loop_break() -> i64 {
+    mut c: Tok = Tok::make(14);
+    mut i: u64 = 0;
+    loop {
+        const z: u64 = await c.bump();
+        i = i + 1;
+        if (i == 3) { break; }
+    }
+    return c.count();
+}
+
+![test]
+function async_receiver_in_loop_with_break() -> Result<(), TestError> {
+    ASS_DROPS = 0;
+    const n: i64 = future::block_on(ass_loop_break());
+    expect_eq(n, 3 as i64)?;
+    return expect_eq(ASS_DROPS, 1 as i64);
+}
+
+async function ass_for() -> i64 {
+    mut c: Tok = Tok::make(15);
+    for (mut i: u64 = 0; i < 3; i++) {
+        const z: u64 = await c.bump();
+    }
+    return c.count();
+}
+
+![test]
+function async_receiver_in_for_loop() -> Result<(), TestError> {
+    ASS_DROPS = 0;
+    const n: i64 = future::block_on(ass_for());
+    expect_eq(n, 3 as i64)?;
+    return expect_eq(ASS_DROPS, 1 as i64);
+}
+
+/// `continue` skips the tail of the body -- including, if the lowering is
+/// wrong, the hand-back store that lives there.
+async function ass_continue() -> i64 {
+    mut c: Tok = Tok::make(16);
+    mut i: u64 = 0;
+    while (i < 4) {
+        const z: u64 = await c.bump();
+        i = i + 1;
+        if (i == 2) { continue; }
+    }
+    return c.count();
+}
+
+![test]
+function async_receiver_with_continue_in_loop() -> Result<(), TestError> {
+    ASS_DROPS = 0;
+    const n: i64 = future::block_on(ass_continue());
+    expect_eq(n, 4 as i64)?;
+    return expect_eq(ASS_DROPS, 1 as i64);
+}
+
+/// An early `return` out of the middle of a loop: that state still owns the
+/// value and must drop it exactly once rather than hand it back to a carrier
+/// nobody will read.
+async function ass_early_return() -> i64 {
+    mut c: Tok = Tok::make(17);
+    mut i: u64 = 0;
+    while (i < 10) {
+        const z: u64 = await c.bump();
+        i = i + 1;
+        if (i == 2) { return c.count(); }
+    }
+    return -1;
+}
+
+![test]
+function async_receiver_with_early_return_in_loop() -> Result<(), TestError> {
+    ASS_DROPS = 0;
+    const n: i64 = future::block_on(ass_early_return());
+    expect_eq(n, 2 as i64)?;
+    return expect_eq(ASS_DROPS, 1 as i64);
+}
+
+async function ass_nested_loops() -> i64 {
+    mut c: Tok = Tok::make(18);
+    mut i: u64 = 0;
+    while (i < 2) {
+        mut j: u64 = 0;
+        while (j < 3) {
+            const z: u64 = await c.bump();
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return c.count();
+}
+
+![test]
+function async_receiver_in_nested_loops() -> Result<(), TestError> {
+    ASS_DROPS = 0;
+    const n: i64 = future::block_on(ass_nested_loops());
+    expect_eq(n, 6 as i64)?;
+    return expect_eq(ASS_DROPS, 1 as i64);
+}
+
+/// Two suspends on different paths through one iteration: only the branch that
+/// runs may consume, and both must leave the carrier full.
+async function ass_if_else_in_loop() -> i64 {
+    mut c: Tok = Tok::make(19);
+    mut i: u64 = 0;
+    while (i < 4) {
+        if (i % 2 == 0) {
+            const z: u64 = await c.bump();
+        } else {
+            const w: u64 = await c.bump();
+        }
+        i = i + 1;
+    }
+    return c.count();
+}
+
+![test]
+function async_receiver_in_branch_inside_loop() -> Result<(), TestError> {
+    ASS_DROPS = 0;
+    const n: i64 = future::block_on(ass_if_else_in_loop());
+    expect_eq(n, 4 as i64)?;
+    return expect_eq(ASS_DROPS, 1 as i64);
+}
+
+/// The suspend sits inside a `match` ARM, inside the loop.
+async function ass_match_arm_in_loop() -> i64 {
+    mut c: Tok = Tok::make(20);
+    mut i: u64 = 0;
+    while (i < 3) {
+        match (i % 2) {
+            0 => { const z: u64 = await c.bump(); }
+            _ => { const w: u64 = await c.bump(); }
+        }
+        i = i + 1;
+    }
+    return c.count();
+}
+
+![test]
+function async_receiver_in_match_arm_inside_loop() -> Result<(), TestError> {
+    ASS_DROPS = 0;
+    const n: i64 = future::block_on(ass_match_arm_in_loop());
+    expect_eq(n, 3 as i64)?;
+    return expect_eq(ASS_DROPS, 1 as i64);
+}
+
+/// `?` inside the loop: `TryExpression` is the node kind that has been missing
+/// from these walkers most often.
+async function ass_try_in_loop() -> Result<i64, i64> {
+    mut c: Tok = Tok::make(21);
+    mut i: u64 = 0;
+    while (i < 3) {
+        const z: u64 = (await c.try_bump())?;
+        i = i + 1;
+    }
+    return Result::Ok(c.count());
+}
+
+![test]
+function async_receiver_with_try_operator_in_loop() -> Result<(), TestError> {
+    ASS_DROPS = 0;
+    const r: Result<i64, i64> = future::block_on(ass_try_in_loop());
+    const n: i64 = match (r) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { -1 as i64 }
+    };
+    expect_eq(n, 3 as i64)?;
+    return expect_eq(ASS_DROPS, 1 as i64);
+}
+
+// ============================================================================
+// Shape: what is carried
+// ============================================================================
+
+/// CONTROL: the carried value is NOT the awaited receiver, so a red cell here
+/// versus a green one above separates "carried" from "carried AND the
+/// receiver".
+async function ass_carried_not_receiver() -> i64 {
+    mut c: Tok = Tok::make(22);
+    mut i: u64 = 0;
+    while (i < 3) {
+        const z: u64 = await ass_tick();
+        c.buf.push(z as u8);
+        i = i + 1;
+    }
+    return c.count();
+}
+
+![test]
+function async_carried_value_is_not_the_receiver() -> Result<(), TestError> {
+    ASS_DROPS = 0;
+    const n: i64 = future::block_on(ass_carried_not_receiver());
+    expect_eq(n, 3 as i64)?;
+    return expect_eq(ASS_DROPS, 1 as i64);
+}
+
+/// CONTROL: a scalar across the suspend, which uses the field-promotion path
+/// rather than the `Option` carrier.
+async function ass_scalar_carried() -> i64 {
+    mut acc: i64 = 0;
+    mut i: u64 = 0;
+    while (i < 4) {
+        const z: u64 = await ass_tick();
+        acc = acc + (z as i64);
+        i = i + 1;
+    }
+    return acc;
+}
+
+![test]
+function async_scalar_carried_across_loop() -> Result<(), TestError> {
+    return expect_eq(future::block_on(ass_scalar_carried()), 4 as i64);
+}
+
+/// CONTROL: an aggregate with NO destructor, so it is copied rather than
+/// carried in an `Option`.
+async function ass_plain_carried() -> i64 {
+    mut p: Plain = Plain::make(0);
+    mut i: u64 = 0;
+    while (i < 3) {
+        const z: u64 = await ass_tick();
+        p = Plain::make(p.n + (z as i64));
+        i = i + 1;
+    }
+    return p.n;
+}
+
+![test]
+function async_non_droppable_aggregate_carried() -> Result<(), TestError> {
+    return expect_eq(future::block_on(ass_plain_carried()), 3 as i64);
+}
+
+/// An `Option`-wrapped owning value, taken apart and put back each iteration.
+async function ass_option_carried() -> i64 {
+    mut o: Option<Tok> = Option::Some(Tok::make(23));
+    mut i: u64 = 0;
+    while (i < 2) {
+        mut c: Tok = o.take().unwrap();
+        const z: u64 = await c.bump();
+        o = Option::Some(c);
+        i = i + 1;
+    }
+    mut fin: Tok = o.take().unwrap();
+    return fin.count();
+}
+
+![test]
+function async_option_wrapped_owning_value_across_loop() -> Result<(), TestError> {
+    ASS_DROPS = 0;
+    const n: i64 = future::block_on(ass_option_carried());
+    expect_eq(n, 2 as i64)?;
+    return expect_eq(ASS_DROPS, 1 as i64);
+}
+
+/// Two owning locals carried through the same loop: one carrier per name, and
+/// neither may pick up the other's value.
+async function ass_two_carried() -> i64 {
+    mut a: Tok = Tok::make(24);
+    mut b: Tok = Tok::make(25);
+    mut i: u64 = 0;
+    while (i < 2) {
+        const x: u64 = await a.bump();
+        const y: u64 = await b.bump();
+        i = i + 1;
+    }
+    return a.count() + b.count();
+}
+
+![test]
+function async_two_owning_locals_carried_together() -> Result<(), TestError> {
+    ASS_DROPS = 0;
+    const n: i64 = future::block_on(ass_two_carried());
+    expect_eq(n, 4 as i64)?;
+    return expect_eq(ASS_DROPS, 2 as i64);
+}
+
+/// The awaited receiver is a FIELD of the carried aggregate, not the aggregate
+/// itself, so the re-addressing on resume has to rebuild a whole place path.
+async function ass_field_receiver() -> i64 {
+    mut p: Pair = Pair::make();
+    mut i: u64 = 0;
+    while (i < 2) {
+        const x: u64 = await p.a.bump();
+        const y: u64 = await p.b.bump();
+        i = i + 1;
+    }
+    return p.a.count() + p.b.count();
+}
+
+![test]
+function async_receiver_is_a_field_of_a_carried_aggregate() -> Result<(), TestError> {
+    ASS_DROPS = 0;
+    const n: i64 = future::block_on(ass_field_receiver());
+    expect_eq(n, 4 as i64)?;
+    return expect_eq(ASS_DROPS, 2 as i64);
+}
+
+/// The owned-handle idiom in a loop: the value is handed to an operation and
+/// taken back out of its result. The state that gives it away must NOT also
+/// hand it back, or it is dropped twice.
+async function ass_give_and_retake() -> i64 {
+    mut c: Tok = Tok::make(26);
+    mut i: u64 = 0;
+    while (i < 3) {
+        c = await ass_pass_through(c);
+        i = i + 1;
+    }
+    return c.count();
+}
+
+![test]
+function async_value_given_away_and_retaken_in_loop() -> Result<(), TestError> {
+    ASS_DROPS = 0;
+    const n: i64 = future::block_on(ass_give_and_retake());
+    expect_eq(n, 3 as i64)?;
+    return expect_eq(ASS_DROPS, 1 as i64);
+}
+
+// ============================================================================
+// Shape: aggregate PARAMETERS (the `carry_params` path)
+// ============================================================================
+
+/// An owning parameter awaited on inside a loop.
+async function ass_param_loop(c: Tok) -> i64 {
+    mut i: u64 = 0;
+    while (i < 3) {
+        const z: u64 = await c.bump();
+        i = i + 1;
+    }
+    return c.count();
+}
+
+![test]
+function async_owning_parameter_as_receiver_in_loop() -> Result<(), TestError> {
+    ASS_DROPS = 0;
+    mut t: Tok = Tok::make(27);
+    const n: i64 = future::block_on(ass_param_loop(t));
+    expect_eq(n, 3 as i64)?;
+    return expect_eq(ASS_DROPS, 1 as i64);
+}
+
+/// CONTROL: the same parameter, straight-line.
+async function ass_param_straight(c: Tok) -> i64 {
+    const z: u64 = await c.bump();
+    return c.count();
+}
+
+![test]
+function async_owning_parameter_straight_line() -> Result<(), TestError> {
+    ASS_DROPS = 0;
+    mut t: Tok = Tok::make(28);
+    const n: i64 = future::block_on(ass_param_straight(t));
+    expect_eq(n, 1 as i64)?;
+    return expect_eq(ASS_DROPS, 1 as i64);
+}
+
+/// An `async fn` with ZERO suspension points that gives its owning parameter
+/// away. There is no state machine here, but the parameter still has to move
+/// out of the future rather than be copied out of it.
+![test]
+function async_no_await_gives_owning_parameter_away() -> Result<(), TestError> {
+    ASS_DROPS = 0;
+    mut t: Tok = Tok::make(29);
+    mut r: Tok = future::block_on(ass_no_await_give(t));
+    const n: i64 = r.count();
+    r.drop();
+    expect_eq(n, 1 as i64)?;
+    return expect_eq(ASS_DROPS, 1 as i64);
+}
+
+/// The same body with a suspension point added -- the control that proves the
+/// difference is the no-await path, not the giving-away.
+![test]
+function async_with_await_gives_owning_parameter_away() -> Result<(), TestError> {
+    ASS_DROPS = 0;
+    mut t: Tok = Tok::make(30);
+    mut r: Tok = future::block_on(ass_pass_through(t));
+    const n: i64 = r.count();
+    r.drop();
+    expect_eq(n, 1 as i64)?;
+    return expect_eq(ASS_DROPS, 1 as i64);
+}
+
+/// An `async fn` with zero suspension points that only READS its owning
+/// parameter: the value dies with the future and must be dropped once.
+![test]
+function async_no_await_reads_owning_parameter() -> Result<(), TestError> {
+    ASS_DROPS = 0;
+    mut t: Tok = Tok::make(31);
+    const n: i64 = future::block_on(ass_no_await_read(t));
+    expect_eq(n, 0 as i64)?;
+    return expect_eq(ASS_DROPS, 1 as i64);
+}
+
+// ============================================================================
+// Shape: what is awaited
+// ============================================================================
+
+/// A free `async fn`, three deep, inside a loop that also carries a value.
+async function ass_nested_depth() -> i64 {
+    mut c: Tok = Tok::make(32);
+    mut i: u64 = 0;
+    while (i < 2) {
+        const z: u64 = await ass_tick3();
+        c.buf.push(z as u8);
+        i = i + 1;
+    }
+    return c.count() * 100 + (c.buf.get(0).unwrap() as i64);
+}
+
+![test]
+function async_three_deep_nested_futures_in_loop() -> Result<(), TestError> {
+    ASS_DROPS = 0;
+    // 2 pushes; each `ass_tick3` yields 1 + 1 + 1 == 3.
+    const n: i64 = future::block_on(ass_nested_depth());
+    expect_eq(n, 203 as i64)?;
+    return expect_eq(ASS_DROPS, 1 as i64);
+}
+
+/// A method on a GENERIC owner, awaited in a loop.
+async function ass_generic_owner_loop() -> i64 {
+    mut h: Holder<i64> = Holder<i64>::of(7);
+    mut i: u64 = 0;
+    while (i < 3) {
+        const z: u64 = await h.tick();
+        i = i + 1;
+    }
+    return h.hits * 10 + h.value;
+}
+
+![test]
+function async_method_on_generic_owner_in_loop() -> Result<(), TestError> {
+    return expect_eq(future::block_on(ass_generic_owner_loop()), 37 as i64);
+}
+
+/// CONTROL: the same generic owner, straight-line.
+async function ass_generic_owner_straight() -> i64 {
+    mut h: Holder<i64> = Holder<i64>::of(7);
+    const z: u64 = await h.tick();
+    return h.hits * 10 + h.value;
+}
+
+![test]
+function async_method_on_generic_owner_straight_line() -> Result<(), TestError> {
+    return expect_eq(future::block_on(ass_generic_owner_straight()), 17 as i64);
+}
+
+/// A generic owner holding an OWNING payload, awaited in a loop. `h` is left to
+/// auto-drop: an explicit `.drop()` on `h.value` would run the destructor the
+/// owner's drop glue is still going to run, which double-drops in sync code too.
+async function ass_generic_owning_payload() -> i64 {
+    mut h: Holder<Tok> = Holder<Tok>::of(Tok::make(33));
+    mut i: u64 = 0;
+    while (i < 2) {
+        const z: u64 = await h.tick();
+        i = i + 1;
+    }
+    return h.hits;
+}
+
+![test]
+function async_generic_owner_with_owning_payload_in_loop() -> Result<(), TestError> {
+    ASS_DROPS = 0;
+    const n: i64 = future::block_on(ass_generic_owning_payload());
+    expect_eq(n, 2 as i64)?;
+    return expect_eq(ASS_DROPS, 1 as i64);
+}
+
+/// A trait's REQUIRED `async` method, awaited on a carried local in a loop.
+async function ass_trait_required_loop() -> i64 {
+    mut c: Tok = Tok::make(34);
+    mut i: u64 = 0;
+    while (i < 3) {
+        const z: u64 = await c.tick_once();
+        i = i + 1;
+    }
+    return c.count();
+}
+
+![test]
+function async_trait_required_method_in_loop() -> Result<(), TestError> {
+    ASS_DROPS = 0;
+    const n: i64 = future::block_on(ass_trait_required_loop());
+    expect_eq(n, 3 as i64)?;
+    return expect_eq(ASS_DROPS, 1 as i64);
+}
+
+/// A trait's DEFAULT body, which itself loops over the required method. This is
+/// the `BufStream` path: nothing before this drove a default body more than once.
+async function ass_trait_default_loop() -> i64 {
+    mut c: Tok = Tok::make(35);
+    const total: u64 = await c.tick_many(4);
+    return (total as i64) * 10 + c.count();
+}
+
+![test]
+function async_trait_default_body_loops_over_required() -> Result<(), TestError> {
+    ASS_DROPS = 0;
+    const n: i64 = future::block_on(ass_trait_default_loop());
+    expect_eq(n, 44 as i64)?;
+    return expect_eq(ASS_DROPS, 1 as i64);
+}
+
+/// The default body driven twice on the same receiver, from a loop in the
+/// caller: two nested loops, both suspending, over one owning value.
+async function ass_trait_default_twice() -> i64 {
+    mut c: Tok = Tok::make(36);
+    mut total: u64 = 0;
+    mut i: u64 = 0;
+    while (i < 2) {
+        const t: u64 = await c.tick_many(2);
+        total = total + t;
+        i = i + 1;
+    }
+    return (total as i64) * 10 + c.count();
+}
+
+![test]
+function async_trait_default_body_driven_twice_from_a_loop() -> Result<(), TestError> {
+    ASS_DROPS = 0;
+    const n: i64 = future::block_on(ass_trait_default_twice());
+    expect_eq(n, 44 as i64)?;
+    return expect_eq(ASS_DROPS, 1 as i64);
+}
+
+// ============================================================================
+// Zero-sized types in a future's Output
+// ============================================================================
+//
+// A type with no fields is legitimately zero-sized, but `size_bytes() == 0` was
+// also the sentinel for "this type's layout has not been computed yet". An enum
+// with a zero-sized payload variant therefore deferred its own layout forever
+// and kept size 0 — and any enum NESTING it, such as the `Poll<T>` every future
+// returns, then sized its payload from that 0.
+//
+// The result was silent: `Poll<Result<i64, Empty>>` lowered to a payload of
+// `[0 x i8]`, so the value came back as garbage or the discriminant read out of
+// bounds. It compiled cleanly, which is why this needs asserted VALUES rather
+// than a compile check. `Elapsed` in `future::combinator` carries a `deadline`
+// field for exactly this reason; that workaround should no longer be load-bearing.
+
+/// No fields: legitimately zero-sized.
+type struct AssEmpty { }
+
+/// CONTROL: the same shape one field wider, which never had the bug.
+type struct AssSized { pad: i64; }
+
+async function ass_zst_payload() -> Result<i64, AssEmpty> {
+    const z: u64 = await Ready<u64>::new(5);
+    return Result::Ok(z as i64);
+}
+
+async function ass_sized_payload() -> Result<i64, AssSized> {
+    const z: u64 = await Ready<u64>::new(5);
+    return Result::Ok(z as i64);
+}
+
+/// The Output IS the zero-sized type, rather than carrying one.
+async function ass_zst_output() -> AssEmpty {
+    const z: u64 = await Ready<u64>::new(5);
+    return AssEmpty { };
+}
+
+![test]
+function async_zero_sized_type_in_output_payload() -> Result<(), TestError> {
+    const r: Result<i64, AssEmpty> = future::block_on(ass_zst_payload());
+    const n: i64 = match (r) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { -1 as i64 }
+    };
+    return expect_eq(n, 5 as i64);
+}
+
+![test]
+function async_sized_type_in_output_payload() -> Result<(), TestError> {
+    const r: Result<i64, AssSized> = future::block_on(ass_sized_payload());
+    const n: i64 = match (r) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { -1 as i64 }
+    };
+    return expect_eq(n, 5 as i64);
+}
+
+![test]
+function async_zero_sized_type_as_the_whole_output() -> Result<(), TestError> {
+    const e: AssEmpty = future::block_on(ass_zst_output());
+    return expect_eq(1 as i64, 1 as i64);
+}
+
+/// CONTROL, sync: the same enum shapes off the async path entirely, so a red
+/// cell above versus a green one here separates the lowering from the layout.
+type enum AssEither {
+    Num(i64);
+    Nothing(AssEmpty);
+}
+
+![test]
+function sync_zero_sized_payload_enum_round_trips() -> Result<(), TestError> {
+    const e: AssEither = AssEither::Num(5);
+    const n: i64 = match (e) {
+        AssEither::Num(v)     => { v }
+        AssEither::Nothing(_) => { -1 as i64 }
+    };
+    expect_eq(n, 5 as i64)?;
+    const r: Result<i64, AssEmpty> = Result::Ok(5);
+    const m: i64 = match (r) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { -1 as i64 }
+    };
+    return expect_eq(m, 5 as i64);
+}
+
+// ============================================================================
+// `?` on an awaited call
+// ============================================================================
+//
+// `?` is not a syntax the state machine sees. Sema replaces it with a `match`
+// whose SUBJECT is the `?`'s operand — the very same expression node, held in
+// two slots at once. The async lowering then hoists the `await` out of that
+// subject into its own statement, which replaces the subject node and left the
+// operand slot naming the pre-hoist tree.
+//
+// Nothing walks the operand at RUNTIME, so the symptom was a name error rather
+// than a wrong answer: the resolver still reads the operand (call
+// specialization and dispatch annotation read it and never the desugar), and
+// there it found an `await` that had moved to an earlier state, reading locals
+// that no longer exist where it sits. `(await f(n))?` where `n` is any local
+// was rejected outright.
+//
+// These pin the shape by VALUE rather than by "it compiled", because the same
+// desync also mis-specializes a generic callee, which no compile check catches.
+
+async function ass_try_step(n: i64) -> Result<i64, i64> {
+    const v: i64 = await PendingThenReady<i64>::new(1, n);
+    if (v < 0) { return Result::Err(v); }
+    return Result::Ok(v * 2);
+}
+
+/// `?` on an awaited call whose argument list reads a `mut` local.
+async function ass_try_mut_local_arg() -> Result<i64, i64> {
+    mut n: i64 = 0;
+    n = 3;
+    const a: i64 = (await ass_try_step(n))?;
+    return Result::Ok(a);
+}
+
+/// The same with a `const` local, and with the local inside an expression
+/// rather than alone — the operand slot holds the whole argument tree.
+async function ass_try_const_local_arg() -> Result<i64, i64> {
+    const n: i64 = 3;
+    const a: i64 = (await ass_try_step(n + 0))?;
+    return Result::Ok(a);
+}
+
+/// Two of them, with a value read out of the first result feeding the second
+/// call's arguments — the frame-reader shape.
+async function ass_try_chained() -> Result<i64, i64> {
+    const a: i64 = (await ass_try_step(2))?;
+    mut b: i64 = 0;
+    const held: Option<i64> = Option::Some(a);
+    match (held) { Option::Some(v) => { b = v; } Option::None => { } }
+    const c: i64 = (await ass_try_step(b))?;
+    return Result::Ok(c);
+}
+
+/// CONTROL: the same call hand-hoisted, which never had the bug. If this is
+/// green and the three above are red, the fault is the `?` desugar's operand.
+async function ass_try_hand_hoisted() -> Result<i64, i64> {
+    mut n: i64 = 0;
+    n = 3;
+    const r: Result<i64, i64> = await ass_try_step(n);
+    const a: i64 = r?;
+    return Result::Ok(a);
+}
+
+function ass_try_value(r: Result<i64, i64>) -> i64 {
+    match (r) {
+        Result::Ok(v)  => { return v; }
+        Result::Err(e) => { return e - 1000; }
+    }
+}
+
+![test]
+function async_try_on_awaited_call_reading_a_mut_local() -> Result<(), TestError> {
+    return expect_eq(ass_try_value(future::block_on(ass_try_mut_local_arg())), 6 as i64);
+}
+
+![test]
+function async_try_on_awaited_call_reading_a_const_local() -> Result<(), TestError> {
+    return expect_eq(ass_try_value(future::block_on(ass_try_const_local_arg())), 6 as i64);
+}
+
+![test]
+function async_try_chained_across_two_suspends() -> Result<(), TestError> {
+    return expect_eq(ass_try_value(future::block_on(ass_try_chained())), 8 as i64);
+}
+
+![test]
+function async_try_hand_hoisted_control() -> Result<(), TestError> {
+    return expect_eq(ass_try_value(future::block_on(ass_try_hand_hoisted())), 6 as i64);
+}
+
+// ============================================================================
+// Carrying a value that has no destructor
+// ============================================================================
+//
+// A value crossing a suspend rides either a scalar field or an `Option<T>`
+// carrier, and the carrier is emptied on entry to a state and refilled on the
+// way out — unless that state GAVE THE VALUE AWAY, in which case it has nothing
+// left to hand back.
+//
+// "Gave away" was read off the syntax alone: any by-value use counted. For a
+// value with a destructor that is right, it IS a move. For one without —a
+// payload-free enum, a struct of scalars, a `Slice` view— a by-value use is a
+// COPY and the state still holds its own. Reporting it as given away suppressed
+// the hand-back, so the next state took an empty carrier and `unwrap` panicked
+// on a `None`.
+//
+// The shape that reaches it is ordinary: read a tag out of a header, check it,
+// then await the body. Every test below asserts the value SURVIVED the suspend,
+// not merely that the function returned.
+
+type enum AssTag : u8 {
+    Zero = 0x0;
+    One  = 0x1;
+    Two  = 0x2;
+}
+
+/// By VALUE, so the read is exactly the "give-away" the walk used to see.
+function ass_tag_num(t: AssTag) -> u64 {
+    match (t) {
+        AssTag::Zero => { return 0; }
+        AssTag::One  => { return 1; }
+        AssTag::Two  => { return 2; }
+    }
+}
+
+/// A struct with no destructor, read the same way.
+type struct AssPlain { v: u64; }
+function ass_plain_num(p: AssPlain) -> u64 { return p.v; }
+
+/// Declare, read by value, suspend, read again. The middle read is what made
+/// the declaring state skip publishing the carrier.
+async function ass_nodrop_enum_read_then_await() -> u64 {
+    const tag: AssTag = AssTag::Two;
+    if (ass_tag_num(tag) > 99) { return 0; }
+    const _a: u64 = await PendingThenReady<u64>::new(1, 1);
+    return ass_tag_num(tag);
+}
+
+async function ass_nodrop_struct_read_then_await() -> u64 {
+    const p: AssPlain = AssPlain { v: 2 };
+    if (ass_plain_num(p) > 99) { return 0; }
+    const _a: u64 = await PendingThenReady<u64>::new(1, 1);
+    return ass_plain_num(p);
+}
+
+/// The same with a branch that suspends between the two reads, on the path that
+/// SKIPS it — the branch is where this first showed up.
+async function ass_nodrop_enum_over_skipped_branch(take: boolean) -> u64 {
+    const tag: AssTag = AssTag::Two;
+    mut extra: u64 = 0;
+    if (take) {
+        extra = await PendingThenReady<u64>::new(1, 7);
+    }
+    if (ass_tag_num(tag) > 99) { return 0; }
+    const _a: u64 = await PendingThenReady<u64>::new(1, 1);
+    return ass_tag_num(tag) + extra;
+}
+
+/// CONTROL: no read before the suspend, which always worked. Green here with a
+/// red above names the middle read rather than the carrier itself.
+async function ass_nodrop_enum_no_early_read() -> u64 {
+    const tag: AssTag = AssTag::Two;
+    const _a: u64 = await PendingThenReady<u64>::new(1, 1);
+    return ass_tag_num(tag);
+}
+
+![test]
+function async_carries_a_payload_free_enum_read_before_the_suspend() -> Result<(), TestError> {
+    return expect_eq(future::block_on(ass_nodrop_enum_read_then_await()) as i64, 2 as i64);
+}
+
+![test]
+function async_carries_a_destructorless_struct_read_before_the_suspend() -> Result<(), TestError> {
+    return expect_eq(future::block_on(ass_nodrop_struct_read_then_await()) as i64, 2 as i64);
+}
+
+![test]
+function async_carries_an_enum_past_a_branch_that_was_not_taken() -> Result<(), TestError> {
+    return expect_eq(future::block_on(ass_nodrop_enum_over_skipped_branch(false)) as i64, 2 as i64);
+}
+
+![test]
+function async_carries_an_enum_past_a_branch_that_was_taken() -> Result<(), TestError> {
+    return expect_eq(future::block_on(ass_nodrop_enum_over_skipped_branch(true)) as i64, 9 as i64);
+}
+
+![test]
+function async_carries_an_enum_with_no_early_read_control() -> Result<(), TestError> {
+    return expect_eq(future::block_on(ass_nodrop_enum_no_early_read()) as i64, 2 as i64);
+}
+
+// ============================================================================
+// Shape: a non-owning view borrowed from a local, handed to an awaited call
+// ============================================================================
+//
+// The future built from `t.view()` is stashed in a field and first polled a
+// state LATER, but `t` was mentioned only inside that operand -- so the
+// lowering used to end its live range with the block that built the future and
+// run its destructor there, freeing the storage the view points into. The value
+// read back was whatever the allocator handed out next, which is why this
+// presents as a wrong NUMBER far from the borrow rather than as a crash.
+//
+// Every shape below is paired with a control that was already green, so a red
+// cell names the borrow rather than the surrounding control flow.
+
+/// An owning aggregate whose destructor is counted and whose heap buffer a view
+/// can point into. Separate from `Tok` so these tests cannot perturb the
+/// receiver-carrier matrix above.
+type struct AssBorrowed {
+    buf: Array<u8>;
+
+    static make(a: u8, b: u8) -> AssBorrowed {
+        mut v: Array<u8> = Array<u8>::new();
+        v.push(a);
+        v.push(b);
+        return AssBorrowed { buf: v };
+    }
+
+    drop(mut &this) -> void {
+        ASS_DROPS = ASS_DROPS + 1;
+        this.buf.drop();
+    }
+
+    /// A borrow: the returned `Slice` points into `buf`'s heap block and records
+    /// nothing about the value it came from.
+    view(&this) -> Slice<u8> { return this.buf.as_slice(); }
+}
+
+/// Suspends BEFORE reading the view, so the read lands after the caller's
+/// declaring state has fallen off its end.
+async function ass_eat(bytes: Slice<u8>) -> u64 {
+    const _t: u64 = await PendingThenReady<u64>::new(1, 0);
+    mut sum: u64 = 0;
+    mut i: u64 = 0;
+    while (i < bytes.length()) {
+        mut b: u8 = 0;
+        match (bytes.get(i)) { Option::Some(x) => { b = x; } Option::None => { } }
+        sum = sum * 256 + (b as u64);
+        i = i + 1;
+    }
+    return sum;
+}
+
+/// Takes the value BY VALUE, so the local is moved away rather than borrowed.
+/// Carrying it as well would leave the frame a second claim on it.
+async function ass_swallow(t: AssBorrowed) -> u64 {
+    const _z: u64 = await PendingThenReady<u64>::new(1, 0);
+    mut sum: u64 = 0;
+    mut i: u64 = 0;
+    while (i < t.buf.length() as u64) {
+        mut b: u8 = 0;
+        match (t.buf.get(i)) { Option::Some(x) => { b = x; } Option::None => { } }
+        sum = sum * 256 + (b as u64);
+        i = i + 1;
+    }
+    return sum;
+}
+
+/// The defect: borrowed into the awaited call and never mentioned again.
+async function ass_borrow_only() -> u64 {
+    const t: AssBorrowed = AssBorrowed::make(0x6d, 0x30);
+    const got: u64 = await ass_eat(t.view());
+    return got;
+}
+
+![test]
+function async_borrowed_view_outlives_the_suspend() -> Result<(), TestError> {
+    ASS_DROPS = 0;
+    const n: u64 = future::block_on(ass_borrow_only());
+    expect_eq(n as i64, 27952 as i64)?;
+    return expect_eq(ASS_DROPS, 1 as i64);
+}
+
+/// CONTROL: the same borrow, but the local is mentioned AFTER the await. That
+/// mention alone used to be what kept the value alive, which is exactly why the
+/// defect was invisible.
+async function ass_borrow_then_read() -> u64 {
+    const t: AssBorrowed = AssBorrowed::make(0x6d, 0x30);
+    const got: u64 = await ass_eat(t.view());
+    const n: u64 = t.buf.length() as u64;
+    return got + n * 0;
+}
+
+![test]
+function async_borrowed_view_mentioned_after_the_await_control() -> Result<(), TestError> {
+    ASS_DROPS = 0;
+    const n: u64 = future::block_on(ass_borrow_then_read());
+    expect_eq(n as i64, 27952 as i64)?;
+    return expect_eq(ASS_DROPS, 1 as i64);
+}
+
+/// CONTROL: moved by value, not borrowed. One destructor run, not two -- the
+/// carry must not fire for a value the state gave away.
+async function ass_moved_into_await() -> u64 {
+    const t: AssBorrowed = AssBorrowed::make(0x6d, 0x30);
+    const got: u64 = await ass_swallow(t);
+    return got;
+}
+
+![test]
+function async_value_moved_into_an_awaited_call_is_not_also_carried() -> Result<(), TestError> {
+    ASS_DROPS = 0;
+    const n: u64 = future::block_on(ass_moved_into_await());
+    expect_eq(n as i64, 27952 as i64)?;
+    return expect_eq(ASS_DROPS, 1 as i64);
+}
+
+/// Borrowed, then MOVED after the await: the carrier has to hand the value back
+/// so the move finds it, and it must still be dropped exactly once.
+async function ass_borrow_then_move() -> u64 {
+    const t: AssBorrowed = AssBorrowed::make(0x6d, 0x30);
+    const a: u64 = await ass_eat(t.view());
+    const b: u64 = await ass_swallow(t);
+    return a + b;
+}
+
+![test]
+function async_borrowed_view_then_moved() -> Result<(), TestError> {
+    ASS_DROPS = 0;
+    const n: u64 = future::block_on(ass_borrow_then_move());
+    expect_eq(n as i64, 55904 as i64)?;
+    return expect_eq(ASS_DROPS, 1 as i64);
+}
+
+/// The borrow inside a LOOP body, where the local is declared outside it.
+async function ass_borrow_in_loop() -> u64 {
+    const t: AssBorrowed = AssBorrowed::make(0x6d, 0x30);
+    mut acc: u64 = 0;
+    mut i: i64 = 0;
+    while (i < 3) {
+        acc = acc + await ass_eat(t.view());
+        i = i + 1;
+    }
+    return acc;
+}
+
+![test]
+function async_borrowed_view_in_a_loop() -> Result<(), TestError> {
+    ASS_DROPS = 0;
+    const n: u64 = future::block_on(ass_borrow_in_loop());
+    expect_eq(n as i64, 83856 as i64)?;
+    return expect_eq(ASS_DROPS, 1 as i64);
+}
+
+/// A `Slice<u8>` taken straight off an `Array<u8>` local -- no wrapper struct,
+/// so the borrow is of a stdlib container rather than of a user destructor.
+async function ass_borrow_array_local() -> u64 {
+    mut arr: Array<u8> = Array<u8>::new();
+    arr.push(0x6d);
+    arr.push(0x30);
+    const got: u64 = await ass_eat(arr.as_slice());
+    return got;
+}
+
+![test]
+function async_borrowed_slice_from_an_array_local() -> Result<(), TestError> {
+    return expect_eq(future::block_on(ass_borrow_array_local()) as i64, 27952 as i64);
+}
+
+/// A `Str` view of a `String` local. `String`'s destructor is not counted by
+/// `ASS_DROPS`, so this shape asserts the bytes only -- a freed buffer reads
+/// back as whatever the allocator reissued.
+async function ass_borrow_string_local() -> u64 {
+    mut msg: String = String::from_str(Str::new("m"));
+    msg.push_byte(0x30);
+    const got: u64 = await ass_eat(msg.as_str().as_bytes());
+    return got;
+}
+
+![test]
+function async_borrowed_str_from_a_string_local() -> Result<(), TestError> {
+    return expect_eq(future::block_on(ass_borrow_string_local()) as i64, 27952 as i64);
+}
+
+/// CONTROL: a view of a static literal borrows no local at all, so it must keep
+/// working whatever the carry rule does.
+async function ass_borrow_static_literal() -> u64 {
+    const got: u64 = await ass_eat(Str::new("m0").as_bytes());
+    return got;
+}
+
+![test]
+function async_view_of_a_static_literal_control() -> Result<(), TestError> {
+    return expect_eq(future::block_on(ass_borrow_static_literal()) as i64, 27952 as i64);
+}
+
+/// CONTROL: a SCALAR derived from the local and handed to the await. Nothing
+/// points back into the value, so it must not be carried -- a green cell here
+/// with a red one above separates "borrowed" from "merely mentioned".
+async function ass_scalar_derived_from_local() -> u64 {
+    const t: AssBorrowed = AssBorrowed::make(0x6d, 0x30);
+    const n: u64 = t.buf.length() as u64;
+    const _z: u64 = await PendingThenReady<u64>::new(1, 0);
+    return n;
+}
+
+![test]
+function async_scalar_derived_from_a_local_control() -> Result<(), TestError> {
+    ASS_DROPS = 0;
+    const n: u64 = future::block_on(ass_scalar_derived_from_local());
+    expect_eq(n as i64, 2 as i64)?;
+    return expect_eq(ASS_DROPS, 1 as i64);
+}

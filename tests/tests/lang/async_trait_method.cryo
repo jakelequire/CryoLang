@@ -1,0 +1,248 @@
+// An `async` method on a TRAIT desugars to an implicit associated type plus a
+// projection return: `async read(&this, n: i64) -> i64` becomes
+// `type ReadFut;` + `read(&this, n: i64) -> This::ReadFut`.  Each impl binds
+// that associated type to the future its own `async read` lowers to, so two
+// implementations return two different concrete future types while the trait
+// still declares one signature.
+//
+// The split that makes this work, and the thing that is easy to get wrong: the
+// desugaring rewrites only the trait method's RESOLVED return.  Its ANNOTATION
+// deliberately keeps the user's `-> i64`, because `synthesize_default_trait_methods`
+// clones a default-bodied trait method into each impl carrying its annotations,
+// and that clone has to lower as an ordinary `async` method whose future's
+// Output is `i64`.  Rewriting the annotation would make the clone return its own
+// future type, which is circular.
+//
+// A generic consumer needs only `where S: AsyncRead`: the future's own bound is
+// implied by the trait rather than respelled at each use site.
+![config(testing)]
+namespace CryoTests::Tests::Lang::AsyncTraitMethod;
+
+import std::test;
+import std::core::result;
+import std::future;
+import std::future::ready;
+
+/// The first failure of two checks, or Ok.
+function atm_both(a: Result<(), TestError>, b: Result<(), TestError>) -> Result<(), TestError> {
+    match (a) {
+        Result::Ok(_)  => {}
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return b;
+}
+
+type trait AtmRead {
+    async read(&this, n: i64) -> i64;
+
+    /// A DEFAULT body, written once over `read` and awaiting through `this`
+    /// twice, so the receiver is live across two suspends.
+    async read_twice(&this, n: i64) -> i64 {
+        const a: i64 = await this.read(n);
+        const b: i64 = await this.read(a);
+        return b;
+    }
+}
+
+type struct AtmTicker {
+    base: i64;
+}
+
+implement trait AtmRead for AtmTicker {
+    async read(&this, n: i64) -> i64 {
+        const bump: i64 = await PendingThenReady<i64>::new(1, this.base);
+        return bump + n;
+    }
+}
+
+type struct AtmDoubler {
+    base: i64;
+}
+
+implement trait AtmRead for AtmDoubler {
+    async read(&this, n: i64) -> i64 {
+        const bump: i64 = await PendingThenReady<i64>::new(1, this.base);
+        return (bump + n) * 2;
+    }
+
+    /// Overrides the default, so this impl's own future must win over the
+    /// clone the trait would otherwise supply.
+    async read_twice(&this, n: i64) -> i64 {
+        const a: i64 = await this.read(n);
+        return a + 1;
+    }
+}
+
+/// A method with no `await` at all still has to lower to a future, since the
+/// trait's return is the projection either way.
+type struct AtmPlain {
+    base: i64;
+}
+
+implement trait AtmRead for AtmPlain {
+    async read(&this, n: i64) -> i64 {
+        return this.base + n;
+    }
+}
+
+/// The generic consumer: only `S: AtmRead`, no projection bound spelled.
+async function atm_pump<S>(s: S) -> i64
+where S: AtmRead {
+    const r: i64 = await s.read(3);
+    return r;
+}
+
+/// Drives the default-bodied method through the same bound.
+async function atm_pump_twice<S>(s: S) -> i64
+where S: AtmRead {
+    const r: i64 = await s.read_twice(3);
+    return r;
+}
+
+![test]
+function async_trait_method_dispatches_to_the_impls_own_future() -> Result<(), TestError> {
+    const t: i64 = future::block_on(atm_pump<AtmTicker>(AtmTicker { base: 4 }));
+    return expect_eq(t, 7 as i64);
+}
+
+// Two implementors must bind DIFFERENT future types; a shared one would make
+// both answers equal.
+![test]
+function async_trait_method_binds_a_distinct_future_per_impl() -> Result<(), TestError> {
+    const t: i64 = future::block_on(atm_pump<AtmTicker>(AtmTicker { base: 4 }));
+    const d: i64 = future::block_on(atm_pump<AtmDoubler>(AtmDoubler { base: 4 }));
+    return atm_both(expect_eq(t, 7 as i64), expect_eq(d, 14 as i64));
+}
+
+// An `async` trait method whose body never awaits still lowers to a future.
+![test]
+function async_trait_method_without_await_still_lowers() -> Result<(), TestError> {
+    const p: i64 = future::block_on(atm_pump<AtmPlain>(AtmPlain { base: 5 }));
+    return expect_eq(p, 8 as i64);
+}
+
+// The default body is cloned into the impl that does not override it, and
+// lowers there like any other `async` method.
+![test]
+function async_trait_default_body_runs_for_the_non_overriding_impl()
+        -> Result<(), TestError> {
+    // read(3) = 4 + 3 = 7 ; read(7) = 4 + 7 = 11
+    const t: i64 = future::block_on(atm_pump_twice<AtmTicker>(AtmTicker { base: 4 }));
+    return expect_eq(t, 11 as i64);
+}
+
+// An impl that DOES override the default must use its own body, not the clone.
+![test]
+function async_trait_default_body_is_overridable() -> Result<(), TestError> {
+    // Doubler::read(3) = (4 + 3) * 2 = 14, then + 1
+    const d: i64 = future::block_on(atm_pump_twice<AtmDoubler>(AtmDoubler { base: 4 }));
+    return expect_eq(d, 15 as i64);
+}
+
+// Calling through the concrete type (no generic parameter in sight) has to reach
+// the same future as the projection-typed generic path.
+![test]
+function async_trait_method_callable_on_a_concrete_receiver() -> Result<(), TestError> {
+    const t: AtmTicker = AtmTicker { base: 2 };
+    const v: i64 = future::block_on(t.read(3));
+    return expect_eq(v, 5 as i64);
+}
+
+// The consumers above are all generic FUNCTIONS. A generic OWNER that
+// implements a trait is a different path: the owner's parameters are written on
+// the impl block's TARGET (`for struct AtmHolder<S>`), not on the block, so the
+// block itself carries none. A future lowered from such a method still has to be
+// generic in `S`, because the future's own impl block is what decides whether
+// sema walks its `poll` body symbolically -- and a body walked concretely while
+// `S::ReadFut::Output` is still abstract fails every check against that
+// projection instead of deferring until monomorphization resolves it.
+//
+// This is the shape every buffered connection and protocol layer has: own a
+// transport, be generic in it, and satisfy a trait so the next layer up can be
+// generic over you in turn.
+
+type trait AtmDrain {
+    async drain(mut &this, n: i64) -> i64;
+
+    /// A DEFAULT body on the same trait, awaiting the required method through
+    /// `this`. The impl below is on a GENERIC owner, and `drain` is delivered
+    /// by that impl block rather than by the owner's own method list -- so
+    /// resolving this `await` means finding a method the owner TEMPLATE does
+    /// not declare. Leaving it unresolved is survivable for a synchronous call
+    /// (monomorphization retypes it once `S` is bound) but not for an awaited
+    /// one: the state machine needs the sub-future's type to give it a field.
+    async drain_twice(mut &this, n: i64) -> i64 {
+        const a: i64 = await this.drain(n);
+        const b: i64 = await this.drain(a);
+        return b;
+    }
+}
+
+type struct AtmHolder<S> {
+    inner: S;
+    seen:  i64;
+}
+
+implement trait AtmDrain for struct AtmHolder<S> {
+    async drain(mut &this, n: i64) -> i64 where S: AtmRead {
+        const v: i64 = await this.inner.read(n);
+        this.seen = this.seen + v;
+        return v;
+    }
+}
+
+/// Builds the owner from a bare `S` and drains it twice, reporting the value
+/// AND the accumulated field -- a write made through `mut &this` on a generic
+/// owner is lost silently rather than faulting, so it has to be observed.
+async function atm_hold_and_drain<S>(s: S) -> i64
+where S: AtmRead {
+    mut h: AtmHolder<S> = AtmHolder<S> { inner: s, seen: 0 };
+    const a: i64 = await h.drain(3);
+    const b: i64 = await h.drain(a);
+    return b * 100 + h.seen;
+}
+
+/// Consumes the owner through the SECOND trait only, which is how a protocol
+/// layer sees the connection underneath it.
+async function atm_via_drain<D>(d: D) -> i64
+where D: AtmDrain {
+    mut owned: D = d;
+    const a: i64 = await owned.drain(3);
+    return a;
+}
+
+// read(3) = 4+3 = 7 (seen 7) ; read(7) = 4+7 = 11 (seen 18) -> 11*100 + 18
+![test]
+function async_trait_method_on_a_generic_owner_normalizes_the_projection()
+        -> Result<(), TestError> {
+    const v: i64 = future::block_on(atm_hold_and_drain<AtmTicker>(AtmTicker { base: 4 }));
+    return expect_eq(v, 1118 as i64);
+}
+
+// The generic owner's trait impl must satisfy a bound in its own right.
+![test]
+function async_trait_impl_on_a_generic_owner_satisfies_a_second_bound()
+        -> Result<(), TestError> {
+    const v: i64 = future::block_on(atm_via_drain<AtmHolder<AtmTicker>>(
+        AtmHolder<AtmTicker> { inner: AtmTicker { base: 4 }, seen: 0 }));
+    return expect_eq(v, 7 as i64);
+}
+
+/// Drives the trait's DEFAULT body on a generic owner. The value alone would
+/// not catch a lost write, so `seen` -- accumulated through `mut &this` across
+/// both suspends, one state machine nested inside another -- is reported too.
+async function atm_default_body_on_generic_owner<S>(s: S) -> i64
+where S: AtmRead {
+    mut h: AtmHolder<S> = AtmHolder<S> { inner: s, seen: 0 };
+    const v: i64 = await h.drain_twice(3);
+    return v * 100 + h.seen;
+}
+
+// drain(3) = 4+3 = 7 (seen 7) ; drain(7) = 4+7 = 11 (seen 18) -> 11*100 + 18
+![test]
+function async_trait_default_body_awaits_a_required_method_on_a_generic_owner()
+        -> Result<(), TestError> {
+    const v: i64 = future::block_on(
+        atm_default_body_on_generic_owner<AtmTicker>(AtmTicker { base: 4 }));
+    return expect_eq(v, 1118 as i64);
+}

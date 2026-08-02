@@ -1,0 +1,249 @@
+///! Compile-time integer constant values.
+///!
+///! Cryo `const` declarations are emitted as runtime globals, so their values
+///! are not otherwise available to the frontend.  A fixed array size
+///! (`u8[CHUNK]`) has to know the value at type-resolution time - a size that
+///! never resolves produces an array descriptor with no storage behind it -
+///! so module-level integer constants are folded once during name resolution
+///! and recorded here.
+///!
+///! This lives outside `DeclIndex` on purpose: the name resolver populates the
+///! table and `DeclIndex` already imports the resolver, so hanging it off the
+///! declaration index would close an import cycle.
+///!
+///! Naming: entries are keyed by qualified name (`std::io::traits::CHUNK`).
+///! A bare-name index resolves unqualified uses, and records ambiguity rather
+///! than a winner - two same-named constants with different values make the
+///! bare name unfoldable, which surfaces as a diagnostic asking for
+///! qualification instead of silently picking one.
+
+namespace Compiler::ConstTable;
+
+import Compiler::AST;
+import Compiler::AST::{ Node, Expression };
+import Compiler::Resolver::{ SymbolStr, InternTable };
+import std::core::option;
+import std::collections::hashmap;
+
+
+/// Largest magnitude representable in i64, as u64.  Folding bails above this
+/// rather than wrapping into a negative size.
+const CONST_I64_MAX_MAG: u64 = 9223372036854775807;
+
+/// Bare-name entry sentinel: the name is registered more than once with
+/// conflicting values, so it cannot be folded without qualification.
+const BARE_AMBIGUOUS: i64 = -9223372036854775807 - 1;
+
+
+type struct ConstantTable {
+    /// Qualified name id -> folded value.
+    by_qualified: HashMap<u32, i64>;
+    /// Bare leaf name id -> folded value, or `BARE_AMBIGUOUS`.
+    by_bare: HashMap<u32, i64>;
+
+    static new() -> ConstantTable {
+        return ConstantTable {
+            by_qualified: HashMap<u32, i64>::new(),
+            by_bare:      HashMap<u32, i64>::new(),
+        };
+    }
+
+    /// Record `qualified` (and its bare leaf) as having the folded value
+    /// `value`.  Re-registering the same qualified name with the same value is
+    /// a no-op, which keeps repeated passes over a module idempotent.
+    register(mut &this, qualified: SymbolStr, bare: SymbolStr, value: i64) -> void {
+        this.by_qualified.insert(qualified.id, value);
+
+        match (this.by_bare.get(&bare.id)) {
+            Option::Some(existing) => {
+                // A second constant of the same leaf name: keep the entry only
+                // while every registration agrees.
+                if (existing != value) {
+                    this.by_bare.insert(bare.id, BARE_AMBIGUOUS);
+                }
+            }
+            Option::None => {
+                this.by_bare.insert(bare.id, value);
+            }
+        }
+    }
+
+    /// Look up `name` as written at a use site inside `module_ns`.
+    ///
+    /// A qualified name is looked up directly.  A bare name prefers the
+    /// use site's own module, then falls back to the bare index - which
+    /// answers only when every constant of that name agrees.
+    lookup(&this, name: SymbolStr, module_ns: SymbolStr, intern: InternTable*,
+           out: i64*) -> boolean {
+        match (this.by_qualified.get(&name.id)) {
+            Option::Some(v) => { *out = v; return true; }
+            Option::None    => { }
+        }
+
+        if (intern != null && module_ns.is_valid()) {
+            const qualified: SymbolStr =
+                ConstantTable::intern_qualified(intern, module_ns, name);
+            if (qualified.is_valid()) {
+                match (this.by_qualified.get(&qualified.id)) {
+                    Option::Some(v) => { *out = v; return true; }
+                    Option::None    => { }
+                }
+            }
+        }
+
+        return match (this.by_bare.get(&name.id)) {
+            Option::Some(v) => {
+                if (v == BARE_AMBIGUOUS) { return false; } else { *out = v; return true; }
+            }
+            Option::None => { return false; }
+        };
+    }
+
+    /// Intern `<ns>::<leaf>`.
+    static intern_qualified(intern: InternTable*, ns: SymbolStr,
+                            leaf: SymbolStr) -> SymbolStr {
+        if (intern == null) { return SymbolStr::empty(); }
+        const joined: string = format("%s::%s", intern.resolve(ns), intern.resolve(leaf));
+        return intern.intern(joined);
+    }
+
+    /// Fold a compile-time integer expression to its `i64` value.
+    ///
+    /// `table` may be null, which restricts folding to literal arithmetic -
+    /// that is the shape sema uses for integer-literal width selection, where
+    /// no name binding has happened yet.  With a table, plain identifiers
+    /// resolve to previously-registered constants, so `CHUNK * 2` folds.
+    ///
+    /// Returns false for anything non-constant, and for any step that would
+    /// overflow i64 or divide by a constant zero.  Bailing is always safe:
+    /// callers either leave a width unchanged or report the size as
+    /// non-constant.
+    static fold_i64(expr: ExpressionNode*, table: ConstantTable*,
+                    module_ns: SymbolStr, intern: InternTable*,
+                    out: i64*) -> boolean {
+        if (expr == null) { return false; }
+        const node: ASTNode* = expr as ASTNode*;
+
+        if (node.kind == NodeKind::Literal) {
+            const lit: LiteralNode* = expr as LiteralNode*;
+            if (lit.literal_kind != LiteralKind::Integer) { return false; }
+            mut v: u64 = 0;
+            if (!ConstantTable::parse_int_literal(lit.value, &v)) { return false; }
+            if (v > CONST_I64_MAX_MAG) { return false; }
+            *out = v as i64;
+            return true;
+        }
+
+        if (node.kind == NodeKind::Identifier) {
+            if (table == null) { return false; }
+            const id: IdentifierNode* = expr as IdentifierNode*;
+            return table.lookup(id.name, module_ns, intern, out);
+        }
+
+        if (node.kind == NodeKind::UnaryExpression) {
+            const u: UnaryExprNode* = expr as UnaryExprNode*;
+            mut a: i64 = 0;
+            if (!ConstantTable::fold_i64(u.operand, table, module_ns, intern, &a)) {
+                return false;
+            }
+            if (u.op.lexeme == "-") { *out = 0 - a; return true; }
+            if (u.op.lexeme == "+") { *out = a;     return true; }
+            if (u.op.lexeme == "~") { *out = ~a;    return true; }
+            return false;
+        }
+
+        if (node.kind == NodeKind::BinaryExpression) {
+            const b: BinaryExprNode* = expr as BinaryExprNode*;
+            mut x: i64 = 0;
+            mut y: i64 = 0;
+            if (!ConstantTable::fold_i64(b.left,  table, module_ns, intern, &x)) { return false; }
+            if (!ConstantTable::fold_i64(b.right, table, module_ns, intern, &y)) { return false; }
+            return ConstantTable::apply_binary(b.op.lexeme, x, y, out);
+        }
+
+        return false;
+    }
+
+    /// Evaluate `x <op> y` with overflow and divide-by-zero guarded; false
+    /// means the result is not representable and the fold must bail.
+    static apply_binary(op: string, x: i64, y: i64, out: i64*) -> boolean {
+        const I64MAX: i64 = CONST_I64_MAX_MAG as i64;
+        const I64MIN: i64 = (0 - I64MAX) - 1;
+
+        if (op == "+") {
+            if (y > 0 && x > I64MAX - y) { return false; }
+            if (y < 0 && x < I64MIN - y) { return false; }
+            *out = x + y; return true;
+        }
+        if (op == "-") {
+            if (y < 0 && x > I64MAX + y) { return false; }
+            if (y > 0 && x < I64MIN + y) { return false; }
+            *out = x - y; return true;
+        }
+        if (op == "*") {
+            if (x == 0 || y == 0) { *out = 0; return true; }
+            // I64MIN has no positive counterpart; the re-division check below
+            // would itself trap on it.
+            if (x == I64MIN || y == I64MIN) { return false; }
+            const p: i64 = x * y;
+            if (p / y != x) { return false; }
+            *out = p; return true;
+        }
+        if (op == "/" || op == "%") {
+            if (y == 0) { return false; }
+            if (x == I64MIN && y == 0 - 1) { return false; }
+            if (op == "/") { *out = x / y; } else { *out = x % y; }
+            return true;
+        }
+        if (op == "<<") {
+            if (y < 0 || y >= 64) { return false; }
+            const s: i64 = x << y;
+            if ((s >> y) != x) { return false; }
+            *out = s; return true;
+        }
+        if (op == ">>") {
+            if (y < 0 || y >= 64) { return false; }
+            *out = x >> y; return true;
+        }
+        if (op == "&") { *out = x & y; return true; }
+        if (op == "|") { *out = x | y; return true; }
+        if (op == "^") { *out = x ^ y; return true; }
+        return false;
+    }
+
+    /// Decode an integer literal lexeme, honouring `0x`/`0o`/`0b` prefixes and
+    /// `_` separators.  False on overflow past u64 or on a stray character.
+    static parse_int_literal(text: string, out: u64*) -> boolean {
+        if (text == null) { return false; }
+        mut i: i64 = 0;
+        mut base: u64 = 10;
+        if (text[0] == '0' && text[1] != 0) {
+            const c: char = text[1];
+            if (c == 'x' || c == 'X') { base = 16; i = 2; }
+            else if (c == 'o' || c == 'O') { base = 8;  i = 2; }
+            else if (c == 'b' || c == 'B') { base = 2;  i = 2; }
+        }
+
+        mut acc: u64 = 0;
+        mut saw_digit: boolean = false;
+        while (text[i] != 0) {
+            const c: char = text[i];
+            i = i + 1;
+            if (c == '_') { continue; }
+            mut d: u64 = 0;
+            if (c >= '0' && c <= '9')      { d = (c - '0') as u64; }
+            else if (c >= 'a' && c <= 'f') { d = ((c - 'a') as u64) + 10; }
+            else if (c >= 'A' && c <= 'F') { d = ((c - 'A') as u64) + 10; }
+            else { return false; }         // type suffix or stray character
+            if (d >= base) { return false; }
+            // Overflow check before the multiply-add.
+            const limit: u64 = 18446744073709551615;
+            if (acc > (limit - d) / base) { return false; }
+            acc = acc * base + d;
+            saw_digit = true;
+        }
+        if (!saw_digit) { return false; }
+        *out = acc;
+        return true;
+    }
+}

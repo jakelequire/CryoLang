@@ -96,7 +96,7 @@ Type-position prefixes (a single leading letter, never preceded by `$`):
 |--------|----------------------------------------|
 | `P`    | Pointer - `P` + pointee                |
 | `R`    | Reference - `R` + referent             |
-| `A`    | Array / slice - `A` + element          |
+| `A`    | Array - `A` [`$L` len `$G`] + element  |
 | `N`    | Named type - `N$L` Path [args] `$G`    |
 | `F`    | Function type - `F$L` params `$G` ret  |
 
@@ -211,7 +211,8 @@ with `s` (`i16`). Additional rules:
 |----------------------|-----------------------------------------|----------------------------------|
 | Pointer `T*`         | `P` + `T`                               | `int*` -> `Pi`                    |
 | Reference `&T`       | `R` + `T`                               | `&Vec2` -> `RN$L4Vec2$G`          |
-| Array / slice        | `A` + element                           | `int[]` -> `Ai`                   |
+| Array, dynamic `T[]` | `A` + element                           | `int[]` -> `Ai`                   |
+| Array, fixed `T[N]`  | `A$L` N `$G` + element                  | `int[8]` -> `A$L8$Gi`             |
 | Named type           | `N$L` Path `$G`                         | `Math::Vec2` -> `N$L4Math.4Vec2$G`|
 | Generic instance     | `N$L` Path `$L` args `$G$G`             | `Pair<int>` -> `N$L4Pair$Li$G$G`  |
 | Optional `T?`        | `N$L8Optional$L` T `$G$G`               | `int?` -> `N$L8Optional$Li$G$G`   |

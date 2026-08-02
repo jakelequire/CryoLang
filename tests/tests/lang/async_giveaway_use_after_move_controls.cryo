@@ -1,0 +1,132 @@
+// Controls for the give-away hoist in the async lowering.
+//
+// A carried value handed away inside one state is now taken through a NAMED
+// local, and later mentions in the same straight-line run are rebound to it so
+// MoveCheck sees an ordinary move (see the negative test
+// `E0452_async_giveaway_then_borrow_same_state`).
+//
+// Rebinding that much is only correct if it stays off every shape where the
+// value is still legitimately there. These are those shapes: each one has a
+// give-away or a carried value in it and each one MUST compile and run. A
+// change that reported E0452 here would be over-rejecting, which is the easy
+// way to make the negative test pass and the wrong one.
+//
+// Destructor runs are counted, because a hoist that emptied the field on a path
+// the give-away never took would show up as a missing or doubled drop rather
+// than as a compile error.
+![config(testing)]
+namespace CryoTests::Tests::Lang::AsyncGiveawayUseAfterMoveControls;
+
+import std::test;
+import std::core::result;
+import future::executor;
+
+mut g_drops: i64 = 0;
+
+type struct Res {
+    id: i64;
+
+    static new(id: i64) -> Res { return Res { id: id }; }
+
+    drop(mut &this) -> void { g_drops = g_drops + 1; }
+}
+
+function consume(r: Res) -> i64 { return r.id; }
+function peek(r: &Res) -> i64 { return r.id; }
+
+async function ready(v: i64) -> i64 { return v; }
+
+// A give-away with NO later mention in that state. Nothing to rebind, and the
+// value must be dropped exactly once - by the callee that took it.
+async function giveaway_only() -> i64 {
+    mut c: Res = Res::new(5);
+    const a: i64 = consume(c);
+    const z: i64 = await ready(1);
+    return a + z;
+}
+
+// Borrow-only. The value is carried across the suspend and never handed away,
+// so every mention keeps reaching it in its field.
+async function borrow_only() -> i64 {
+    mut c: Res = Res::new(5);
+    const a: i64 = peek(&c);
+    const z: i64 = await ready(1);
+    const d: i64 = peek(&c);
+    return a + z + d;
+}
+
+// Given away, then REBUILT. The republish puts a fresh value back in the field,
+// so the mentions after it are reaching a live value again and must NOT be
+// rebound to the local that was moved away.
+async function giveaway_then_rebuild() -> i64 {
+    mut c: Res = Res::new(5);
+    const a: i64 = consume(c);
+    c = Res::new(9);
+    const b: i64 = peek(&c);
+    const z: i64 = await ready(1);
+    const d: i64 = peek(&c);
+    return a + b + z + d;
+}
+
+// The give-away happens on ONE path. After the join the value may or may not
+// still be there, so nothing may be rebound to a local declared inside the
+// branch - it is not even in scope here.
+async function giveaway_in_one_branch(flag: boolean) -> i64 {
+    mut c: Res = Res::new(5);
+    mut a: i64 = 0;
+    if (flag) { a = consume(c); }
+    const z: i64 = await ready(1);
+    return a + z;
+}
+
+![test]
+function giveaway_with_no_later_use_runs() -> Result<(), TestError> {
+    g_drops = 0;
+    mut ex: Executor = Executor::new();
+    const got: i64 = ex.block_on(giveaway_only());
+    ex.drop();
+    if (got != 6) { return expect_eq(got, 6 as i64); }
+    return expect_eq(g_drops, 1 as i64);
+}
+
+![test]
+function borrow_only_carried_value_runs() -> Result<(), TestError> {
+    g_drops = 0;
+    mut ex: Executor = Executor::new();
+    const got: i64 = ex.block_on(borrow_only());
+    ex.drop();
+    if (got != 11) { return expect_eq(got, 11 as i64); }
+    return expect_eq(g_drops, 1 as i64);
+}
+
+![test]
+function rebuild_after_giveaway_runs() -> Result<(), TestError> {
+    g_drops = 0;
+    mut ex: Executor = Executor::new();
+    const got: i64 = ex.block_on(giveaway_then_rebuild());
+    ex.drop();
+    // 5 (given away) + 9 + 1 + 9
+    if (got != 24) { return expect_eq(got, 24 as i64); }
+    // The value handed to `consume` and the rebuilt one: two distinct values.
+    return expect_eq(g_drops, 2 as i64);
+}
+
+![test]
+function giveaway_on_the_untaken_branch_runs() -> Result<(), TestError> {
+    g_drops = 0;
+    mut ex: Executor = Executor::new();
+    const got: i64 = ex.block_on(giveaway_in_one_branch(false));
+    ex.drop();
+    if (got != 1) { return expect_eq(got, 1 as i64); }
+    return expect_eq(g_drops, 1 as i64);
+}
+
+![test]
+function giveaway_on_the_taken_branch_runs() -> Result<(), TestError> {
+    g_drops = 0;
+    mut ex: Executor = Executor::new();
+    const got: i64 = ex.block_on(giveaway_in_one_branch(true));
+    ex.drop();
+    if (got != 6) { return expect_eq(got, 6 as i64); }
+    return expect_eq(g_drops, 1 as i64);
+}

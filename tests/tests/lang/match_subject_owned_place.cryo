@@ -1,0 +1,105 @@
+// The `match`-subject move-out rule must not fire on the ordinary shape.
+//
+// Matching a BARE local that owns a destructor is not a projection: the pattern
+// binds the whole payload out of the subject and the subject's own glue is
+// suppressed, so the value is dropped exactly once. Only a subject that
+// PROJECTS out of an owned place (`p.0`, `arr[i]`, `*ptr`) hands the same
+// handle to two owners - that is what negative/E0453_match_subject_field_move
+// pins.
+//
+// The drop COUNT is the assertion, not just the bound value: a rule that turned
+// the whole-payload binding into a second owner would still return 5 here and
+// only show up as a double free.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::MatchSubjectOwnedPlace;
+
+import std::core::result;
+import std::core::option;
+import std::core::mem;
+import std::test::error;
+import std::test::assert;
+
+mut msop_drops: i64 = 0;
+
+type struct Res {
+    id: i64;
+
+    static new(id: i64) -> Res { return Res { id: id }; }
+
+    drop(mut &this) -> void { msop_drops = msop_drops + 1; }
+}
+
+type struct Holder {
+    res: Res;
+}
+
+// Every count below is taken AFTER the owner's scope has closed. Reading it
+// while the owner is still live would report 1 whether or not the subject was
+// left owning a second claim, so the assertion has to outlive the scope it is
+// about.
+![test]
+function bare_local_subject_binds_payload_and_drops_once() -> Result<(), TestError> {
+    msop_drops = 0;
+    mut id: i64 = -1;
+    {
+        mut o: Option<Res> = Option::Some(Res::new(5));
+        id = match (o) {
+            Option::Some(r) => { r.id }
+            Option::None    => { -1 }
+        };
+    }
+    match (expect_eq(id, 5 as i64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(msop_drops, 1 as i64);
+}
+
+// A droppable field moved out of a straight-line, non-`Drop` STRUCT local is
+// the partial-move model's "allow + track" half: drop_insertion skips exactly
+// that field at the owner's scope exit, so the subject temporary is the only
+// owner left. The count is what proves it - the shape compiles either way, and
+// a missing drop-skip would show up only as a second free.
+//
+// This is why negative/E0453_match_subject_field_move uses a TUPLE: no
+// per-field drop-skip exists there, so the same projection stays a hard error.
+![test]
+function tracked_partial_move_subject_drops_once() -> Result<(), TestError> {
+    msop_drops = 0;
+    {
+        mut h: Holder = Holder { res: Res::new(7) };
+        mut got: i64 = 0;
+        match (h.res) {
+            _ => { got = 1; }
+        }
+        match (expect_eq(got, 1 as i64)) {
+            Result::Ok(_)  => { }
+            Result::Err(e) => { return Result::Err(e); }
+        }
+    }
+    return expect_eq(msop_drops, 1 as i64);
+}
+
+// `mem::swap` is the escape hatch the diagnostic names: the field is left a
+// valid value to be dropped in place, so the source keeps exactly one claim.
+![test]
+function swapped_out_field_is_a_legal_subject() -> Result<(), TestError> {
+    msop_drops = 0;
+    mut id: i64 = -1;
+    {
+        mut h: Holder = Holder { res: Res::new(8) };
+        mut taken: Res = Res::new(0);
+        mem::swap<Res>(&taken, &h.res);
+        id = match (taken) {
+            _ => { taken.id }
+        };
+    }
+    match (expect_eq(id, 8 as i64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    // Two live values - the swapped-out id-8 and the id-0 placeholder now in
+    // the field - so exactly two drops, one each.
+    return expect_eq(msop_drops, 2 as i64);
+}

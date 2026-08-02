@@ -1,0 +1,365 @@
+///! Format-spec parsing and rendering for f-string holes.
+///!
+///! An f-string hole may carry a spec after a colon: `f"{value:spec}"`.
+///! The grammar is a subset of Rust's:
+///!
+///!   spec := [[fill]align][#][0][width][.precision][type]
+///!   align := '<' | '>' | '^'          (left, right, centre)
+///!   type  := 'x' | 'X' | 'o' | 'b'    (lower/upper hex, octal, binary)
+///!
+///! `#` prefixes a radix with `0x`/`0o`/`0b`; a leading `0` zero-pads
+///! (sign/prefix stay leftmost). `width` is a minimum field width in
+///! Unicode scalars; `.precision` truncates a Display value to that many
+///! scalars, or sets the fractional digits of a float.
+///!
+///! The parser (`fmt_parse_spec`) turns the spec string into a `FmtSpec`;
+///! the render helpers here build the padded output. `fmt/interp.cryo`
+///! owns the per-type dispatch (`static match (T)`) that picks the right
+///! render helper - that is the only piece that must know `T`.
+
+namespace std::fmt::spec;
+
+import core::option;
+import core::result;
+import core::iter;
+import collections::str;
+import collections::string;
+import collections::pair;
+import fmt::display;
+
+/// No radix: format the value in its natural (decimal / Display) form.
+const RADIX_NONE:      u8 = 0;
+const RADIX_HEX_LOWER: u8 = 1;
+const RADIX_HEX_UPPER: u8 = 2;
+const RADIX_OCT:       u8 = 3;
+const RADIX_BIN:       u8 = 4;
+
+/// Default alignment: left for text and numbers alike (a `0` flag or an
+/// explicit `>`/`^` overrides it). Chosen for predictability over Rust's
+/// type-dependent default.
+const ALIGN_DEFAULT: u8 = 0;
+const ALIGN_LEFT:    u8 = 1;
+const ALIGN_RIGHT:   u8 = 2;
+const ALIGN_CENTER:  u8 = 3;
+
+/// Space scalar - the default fill.
+const FILL_SPACE: u32 = 0x20;
+/// Zero scalar - the fill a `0` flag selects.
+const FILL_ZERO:  u32 = 0x30;
+
+/// A parsed format spec. Field defaults describe an empty spec (plain
+/// Display, no padding).
+type struct FmtSpec {
+    fill:          u32;      // scalar fill char
+    align:         u8;       // ALIGN_*
+    alternate:     boolean;  // '#' - radix prefix
+    zero_pad:      boolean;  // '0' - sign-aware zero fill
+    width:         u64;      // minimum field width, in scalars
+    has_precision: boolean;
+    precision:     u64;
+    radix:         u8;       // RADIX_*
+
+    static empty() -> FmtSpec {
+        return FmtSpec {
+            fill: FILL_SPACE, align: ALIGN_DEFAULT, alternate: false,
+            zero_pad: false, width: 0, has_precision: false, precision: 0,
+            radix: RADIX_NONE,
+        };
+    }
+}
+
+/// True for the alignment sigils `<` `>` `^`.
+function is_align_byte(b: u8) -> boolean {
+    return b == 0x3C || b == 0x3E || b == 0x5E;
+}
+
+/// Map an alignment sigil byte to its `ALIGN_*` code.
+function align_of_byte(b: u8) -> u8 {
+    if (b == 0x3C) { return ALIGN_LEFT; }
+    if (b == 0x3E) { return ALIGN_RIGHT; }
+    return ALIGN_CENTER;   // '^'
+}
+
+/// Parse a spec string (the text after the `:` in a hole) into a
+/// `FmtSpec`. The compiler has already validated the grammar, so this
+/// walks it without re-checking; an unexpected byte is simply ignored.
+function fmt_parse_spec(spec: Str) -> FmtSpec {
+    mut s: FmtSpec = FmtSpec::empty();
+    const n: u64 = spec.length();
+    const bytes: u8* = spec.as_ptr();
+    mut i: u64 = 0;
+
+    // [fill]align  |  align
+    if (n >= 2 && is_align_byte(bytes[1])) {
+        s.fill = bytes[0] as u32;
+        s.align = align_of_byte(bytes[1]);
+        i = 2;
+    } else if (n >= 1 && is_align_byte(bytes[0])) {
+        s.align = align_of_byte(bytes[0]);
+        i = 1;
+    }
+
+    // '#'
+    if (i < n && bytes[i] == 0x23) {
+        s.alternate = true;
+        i = i + 1;
+    }
+
+    // leading '0' flag
+    if (i < n && bytes[i] == 0x30) {
+        s.zero_pad = true;
+        i = i + 1;
+    }
+
+    // width digits
+    while (i < n && bytes[i] >= 0x30 && bytes[i] <= 0x39) {
+        s.width = s.width * 10 + ((bytes[i] - 0x30) as u64);
+        i = i + 1;
+    }
+
+    // '.' precision
+    if (i < n && bytes[i] == 0x2E) {
+        i = i + 1;
+        s.has_precision = true;
+        s.precision = 0;
+        while (i < n && bytes[i] >= 0x30 && bytes[i] <= 0x39) {
+            s.precision = s.precision * 10 + ((bytes[i] - 0x30) as u64);
+            i = i + 1;
+        }
+    }
+
+    // type
+    if (i < n) {
+        const t: u8 = bytes[i];
+        if (t == 0x78)      { s.radix = RADIX_HEX_LOWER; }   // 'x'
+        else if (t == 0x58) { s.radix = RADIX_HEX_UPPER; }   // 'X'
+        else if (t == 0x6F) { s.radix = RADIX_OCT; }         // 'o'
+        else if (t == 0x62) { s.radix = RADIX_BIN; }         // 'b'
+    }
+
+    return s;
+}
+
+// ----------------------------------------------------------------------
+// Body builders: render the value's digits/text (no field padding yet)
+// and report how many leading bytes are sign/prefix (so a `0` flag can
+// zero-fill after them). Padding is applied by `fmt_pad`.
+// ----------------------------------------------------------------------
+
+/// Uppercase the ASCII hex letters `a`-`f` in `buf[0, len)` in place.
+function ascii_hex_upper(buf: u8*, len: u64) -> void {
+    mut i: u64 = 0;
+    while (i < len) {
+        if (buf[i] >= 0x61 && buf[i] <= 0x66) { buf[i] = buf[i] - 0x20; }
+        i = i + 1;
+    }
+}
+
+/// Radix prefix for `#`: `0x` / `0o` / `0b`. Empty for decimal or when
+/// `alternate` is off.
+function radix_prefix(spec: &FmtSpec) -> Str {
+    if (!spec.alternate) { return Str::new(""); }
+    if (spec.radix == RADIX_HEX_LOWER) { return Str::new("0x"); }
+    if (spec.radix == RADIX_HEX_UPPER) { return Str::new("0x"); }
+    if (spec.radix == RADIX_OCT)       { return Str::new("0o"); }
+    if (spec.radix == RADIX_BIN)       { return Str::new("0b"); }
+    return Str::new("");
+}
+
+/// Render the magnitude `val` in the spec's radix into a `String`.
+function radix_digits(val: u64, spec: &FmtSpec) -> String {
+    mut buffer: u8[64];
+    mut digits: u64 = 0;
+    if (spec.radix == RADIX_HEX_LOWER) {
+        digits = val.to_hex_buf(&buffer[0]);
+    } else if (spec.radix == RADIX_HEX_UPPER) {
+        digits = val.to_hex_buf(&buffer[0]);
+        ascii_hex_upper(&buffer[0], digits);
+    } else if (spec.radix == RADIX_OCT) {
+        digits = val.to_oct_buf(&buffer[0]);
+    } else if (spec.radix == RADIX_BIN) {
+        digits = val.to_bin_buf(&buffer[0]);
+    } else {
+        digits = val.to_decimal_buf(&buffer[0]);
+    }
+    mut out: String = String::new();
+    out.push(Str::from_raw(&buffer[0], digits));
+    return out;
+}
+
+/// Body for an unsigned integer: optional radix prefix + digits. `head`
+/// (out-param via the returned struct) is the prefix length.
+function fmt_uint_body(val: u64, spec: &FmtSpec) -> BodyText {
+    mut out: String = String::new();
+    mut head: u64 = 0;
+    const prefix: Str = radix_prefix(spec);
+    if (spec.radix != RADIX_NONE) {
+        out.push(prefix);
+        head = prefix.length();
+    }
+    mut digits: String = radix_digits(val, spec);
+    out.push(digits.as_str());
+    digits.drop();
+    return BodyText { text: out, head_len: head };
+}
+
+/// Body for a signed integer. Decimal keeps the sign; a radix formats the
+/// two's-complement bit pattern `masked` (already narrowed to the value's
+/// own width by the caller) with no sign, matching Rust.
+function fmt_sint_body(val: i64, masked: u64, spec: &FmtSpec) -> BodyText {
+    if (spec.radix != RADIX_NONE) {
+        return fmt_uint_body(masked, spec);
+    }
+    mut out: String = String::new();
+    mut head: u64 = 0;
+    mut magnitude: u64 = val as u64;
+    if (val < 0) {
+        out.push_byte(0x2D);   // '-'
+        head = 1;
+        // Negate in u64 space so i64::MIN (whose magnitude overflows i64)
+        // still yields the right digits.
+        magnitude = (0 - val) as u64;
+    }
+    mut buffer: u8[20];
+    const digits: u64 = magnitude.to_decimal_buf(&buffer[0]);
+    out.push(Str::from_raw(&buffer[0], digits));
+    return BodyText { text: out, head_len: head };
+}
+
+/// Body for a float. With a precision, uses fixed fractional digits;
+/// without, the default shortest round-trip form. The sign is part of
+/// the text, so `head_len` marks a leading `-` for zero-fill.
+function fmt_float_body(val: f64, spec: &FmtSpec) -> BodyText {
+    mut out: String = String::new();
+    if (spec.has_precision) {
+        mut buffer: u8[64];
+        const written: u64 = val.to_buf_with(&buffer[0], spec.precision);
+        out.push(Str::from_raw(&buffer[0], written));
+    } else {
+        match (format_to_string<f64>(&val)) {
+            Result::Ok(s)  => { mut tmp: String = s; out.push(tmp.as_str()); tmp.drop(); }
+            Result::Err(_) => { }
+        }
+    }
+    mut head: u64 = 0;
+    if (out.length() > 0 && out.as_str().byte_at(0).unwrap_or(0) == 0x2D) { head = 1; }
+    return BodyText { text: out, head_len: head };
+}
+
+/// Body for any Display value that is not an integer or float: render it,
+/// then truncate to `precision` scalars if one is set.
+function fmt_display_body<T>(value: &T, spec: &FmtSpec) -> BodyText
+where T: Display {
+    mut out: String = String::new();
+    match (format_to_string<T>(value)) {
+        Result::Ok(s)  => { mut tmp: String = s; out.push(tmp.as_str()); tmp.drop(); }
+        Result::Err(_) => { }
+    }
+    if (spec.has_precision) {
+        const truncated: Str = truncate_scalars(out.as_str(), spec.precision);
+        if (truncated.length() < out.length()) {
+            mut shorter: String = String::new();
+            shorter.push(truncated);
+            out.drop();
+            out = shorter;
+        }
+    }
+    return BodyText { text: out, head_len: 0 };
+}
+
+/// The rendered digits/text of a value plus the length of its leading
+/// sign/radix-prefix run (bytes that a `0` flag must keep leftmost).
+type struct BodyText {
+    text:     String;
+    head_len: u64;
+
+    drop(mut &this) -> void { this.text.drop(); }
+}
+
+/// Truncate `s` to at most `n` Unicode scalars, returning a borrowed
+/// prefix.
+function truncate_scalars(s: Str, n: u64) -> Str {
+    mut seen: u64 = 0;
+    mut ci: implement Iterator<Pair<u64, u32>> = s.char_indices();
+    loop {
+        match (ci.next()) {
+            Option::Some(p) => {
+                if (seen == n) {
+                    return s.sub_bytes(0, p.first);
+                }
+                seen = seen + 1;
+            }
+            Option::None => { return s; }
+        }
+    }
+}
+
+/// Count the Unicode scalars in `s`.
+function scalar_count(s: Str) -> u64 {
+    mut it: implement Iterator<u32> = s.chars();
+    mut n: u64 = 0;
+    loop {
+        match (it.next()) {
+            Option::Some(_) => { n = n + 1; }
+            Option::None => { break; }
+        }
+    }
+    return n;
+}
+
+/// Append the UTF-8 encoding of scalar `c` to `out` `count` times.
+function push_fill(out: mut &String, c: u32, count: u64) -> void {
+    mut buffer: u8[4];
+    const width: u64 = encode_utf8(c, &buffer[0]);
+    mut i: u64 = 0;
+    while (i < count) {
+        mut b: u64 = 0;
+        while (b < width) {
+            out.push_byte(buffer[b]);
+            b = b + 1;
+        }
+        i = i + 1;
+    }
+}
+
+/// Pad `body` to the spec's field width and append it to `out`. `head_len`
+/// is the leading sign/prefix run for sign-aware zero-fill.
+function fmt_pad(out: mut &String, body: Str, head_len: u64, spec: &FmtSpec) -> void {
+    const count: u64 = scalar_count(body);
+    if (count >= spec.width) {
+        out.push(body);
+        return;
+    }
+    const padn: u64 = spec.width - count;
+
+    // Resolve alignment and fill, honouring the `0` flag when no explicit
+    // alignment was given.
+    mut align: u8 = spec.align;
+    mut fill: u32 = spec.fill;
+    if (align == ALIGN_DEFAULT) {
+        if (spec.zero_pad) { align = ALIGN_RIGHT; fill = FILL_ZERO; }
+        else { align = ALIGN_LEFT; }
+    }
+
+    if (align == ALIGN_LEFT) {
+        out.push(body);
+        push_fill(out, fill, padn);
+        return;
+    }
+    if (align == ALIGN_CENTER) {
+        const left: u64 = padn / 2;
+        push_fill(out, fill, left);
+        out.push(body);
+        push_fill(out, fill, padn - left);
+        return;
+    }
+    // ALIGN_RIGHT. For a zero-fill, keep the sign/prefix leftmost.
+    if (spec.zero_pad && head_len > 0) {
+        out.push(body.sub_bytes(0, head_len));
+        push_fill(out, fill, padn);
+        out.push(body.sub_bytes(head_len, body.length()));
+        return;
+    }
+    push_fill(out, fill, padn);
+    out.push(body);
+}

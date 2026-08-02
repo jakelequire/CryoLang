@@ -1,0 +1,87 @@
+// A generic enum constructor used where nothing supplies an expected type -
+// `match (Option::Some(x)) {...}`, or an unannotated `const o = Option::Some(x)`
+// - infers its type arguments from its own argument types.
+//
+// The instantiation used to come only from an expected type flowing DOWN: an
+// annotated local, a parameter slot, a return position. With none of those the
+// constructor kept the GENERIC BASE, so the variant's payload stayed the raw
+// param `T`. That has no layout, so the construction was rejected at codegen
+// (E0600 "payload type ... is unresolved"), and a `T`-typed pattern binding
+// also hid a `Drop`-field move-out from move-check.
+//
+// The argument types determine the instantiation on their own, so they are read
+// directly when nothing else bound it. Both the annotated spellings (which
+// always worked) and the inferred ones are asserted here, because the fix must
+// not change what the annotated forms resolve to.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::EnumCtorArgInference;
+
+import std::core::result;
+import std::core::option;
+import std::collections::string;
+import std::test::error;
+import std::test::assert;
+
+// Inline constructor as a `match` subject: the subject expression is resolved
+// with no contextual type at all.
+![test]
+function inline_some_as_match_subject() -> Result<(), TestError> {
+    const local: i64 = 5;
+    const got: i64 = match (Option::Some(local)) {
+        Option::Some(x) => { x }
+        Option::None    => { 0 }
+    };
+    return expect_eq(got, 5 as i64);
+}
+
+// The same constructor initializing a local with no `: T` annotation.
+![test]
+function inline_some_as_unannotated_initializer() -> Result<(), TestError> {
+    const local: i64 = 7;
+    const o = Option::Some(local);
+    const got: i64 = match (o) {
+        Option::Some(x) => { x }
+        Option::None    => { 0 }
+    };
+    return expect_eq(got, 7 as i64);
+}
+
+// An annotated subject already worked; it must keep resolving the same way.
+![test]
+function annotated_some_still_binds_payload() -> Result<(), TestError> {
+    const local: i64 = 9;
+    const o: Option<i64> = Option::Some(local);
+    const got: i64 = match (o) {
+        Option::Some(x) => { x }
+        Option::None    => { 0 }
+    };
+    return expect_eq(got, 9 as i64);
+}
+
+// A two-parameter enum: both slots have to come from the arguments, and only
+// the constructed variant's payload can supply one of them. `Result<i64, E>`
+// leaves `E` unbound from `Ok(...)` alone, so this stays on the generic-base
+// path unless an expected type supplies it - which the annotation here does.
+![test]
+function annotated_result_ok_binds_payload() -> Result<(), TestError> {
+    const r: Result<i64, TestError> = Result::Ok(3);
+    const got: i64 = match (r) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { 0 }
+    };
+    return expect_eq(got, 3 as i64);
+}
+
+// A payload that owns a destructor is the case the narrow inference was first
+// written for: a `T`-typed binding lets move-check miss the field's `Drop`.
+// Inferring the concrete instantiation is what makes the binding's type - and
+// so its drop obligation - visible.
+![test]
+function inline_some_with_owning_payload() -> Result<(), TestError> {
+    const got: u64 = match (Option::Some(String::from_string("hello"))) {
+        Option::Some(s) => { s.length() }
+        Option::None    => { 0 }
+    };
+    return expect_eq(got, 5 as u64);
+}

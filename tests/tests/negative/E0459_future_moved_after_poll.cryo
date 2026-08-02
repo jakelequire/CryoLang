@@ -1,0 +1,31 @@
+// E0459: a future that has been polled must not move.
+//
+// Polling runs the state machine's own body, which may take the address of one
+// of its fields and keep it in another field across the suspend. Moving the
+// future afterwards leaves that pointer naming the storage it used to occupy -
+// live stack or a stale field, so the corruption is silent rather than a fault.
+//
+// Before the first poll there is nothing pointing inward yet, which is why the
+// construct-then-hand-over moves stay legal: `block_on(f)`, `spawn(f)` and
+// `Futures::join(a, b)` all take a future by value and are exactly how one is
+// meant to be handed over. The rule is "not after a poll", not "never" - see
+// lang/async_future_address_stable.cryo for the permitted side.
+![config(testing)]
+![config(negative, E0459)]
+namespace CryoTests::Negative::FutureMovedAfterPoll;
+
+import std::future;
+
+async function work() -> i64 {
+    const v: i64 = await Ready<i64>::new(7);
+    return v;
+}
+
+function main() -> int {
+    mut f = work();
+    mut cx: Context = Context::new(Waker::noop());
+    const _first = f.poll(&cx);
+    mut g = f;                      // `f` already ran: its address is fixed
+    const _second = g.poll(&cx);
+    return 0;
+}

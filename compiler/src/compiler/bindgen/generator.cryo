@@ -135,10 +135,28 @@ type struct BindingSerializer {
                     if (seen_fn[k].eq(fnm)) { dup_at = k; break; }
                 }
                 if (dup_at >= 0) {
-                    if (report != null && !seen_sym[dup_at].eq(sym)) {
-                        report.skip(format(
-                            "function `%s` (C++ overload or cross-namespace name collision; bound `%s`, dropped `%s`)",
-                            fnm, seen_sym[dup_at], sym));
+                    if (!seen_sym[dup_at].eq(sym)) {
+                        // A genuinely distinct function under a colliding leaf name
+                        // (a C++ overload, or a cross-namespace leaf clash): bind it
+                        // under a numeric-suffixed alias with its true linker symbol
+                        // pinned, rather than dropping it.  The alias is chosen to
+                        // not shadow a name already emitted; a third+ collider gets
+                        // the next free suffix.  Reported as reduced-fidelity so the
+                        // caller learns the name to call.
+                        mut n: i64 = 2;
+                        mut alias: string = format("%s_%lld", fnm, n);
+                        while (BindingSerializer::contains(&seen_fn, alias)) {
+                            n += 1;
+                            alias = format("%s_%lld", fnm, n);
+                        }
+                        seen_fn.push(alias);
+                        seen_sym.push(sym);
+                        s.render_function_named(fnode, alias, sym);
+                        if (report != null) {
+                            report.approx(format(
+                                "function `%s` renamed to `%s` (C++ overload or cross-namespace leaf collision; binds `%s`)",
+                                fnm, alias, sym));
+                        }
                     }
                     continue;
                 }
@@ -297,8 +315,8 @@ type struct BindingSerializer {
     /// `(1 << width) - 1` as a u64 mask (width is 1..64; clamps a full-width
     /// 64-bit field to avoid an undefined `1 << 64`).
     static bit_mask(width: i64) -> u64 {
-        if (width >= 64) { return 0xFFFFFFFFFFFFFFFFu64; }
-        return (1u64 << (width as u64)) - 1u64;
+        if (width >= 64) { return 0xFFFFFFFFFFFFFFFF; }
+        return (1 << (width as u64)) - 1;
     }
 
     /// The signed sibling of an unsigned backing type name (`u32` -> `i32`),
@@ -400,12 +418,22 @@ type struct BindingSerializer {
 
     render_function(mut &this, node: FunctionDeclNode*) -> void {
         // C++ free/namespace function: pin its mangled linker symbol.  C
-        // functions have no link override, so this line is absent for them.
-        if (node.has_link_name) {
-            this.out.push(format("    ![symbol(\"%s\")]\n", node.link_name));
+        // functions have no link override, so `sym` is empty for them.
+        const nm: string = this.ctx.intern_table.resolve(node.name);
+        const sym: string = if (node.has_link_name) { node.link_name } else { "" };
+        this.render_function_named(node, nm, sym);
+    }
+
+    /// Emit an extern `function` prototype for `node` under `disp_name`, pinning
+    /// `symbol` as its linker name when non-empty.  Shared by the 1:1 emit and the
+    /// collision disambiguator, which renders a distinct same-leaf overload under a
+    /// suffixed alias with its true (mangled or bare-C) symbol pinned.
+    render_function_named(mut &this, node: FunctionDeclNode*,
+                          disp_name: string, symbol: string) -> void {
+        if (symbol.length() > 0) {
+            this.out.push(format("    ![symbol(\"%s\")]\n", symbol));
         }
-        this.out.push(format("    function %s(",
-            this.ctx.intern_table.resolve(node.name)));
+        this.out.push(format("    function %s(", disp_name));
         for (mut i: i64 = 0; i < node.parameters.length; i++) {
             if (i > 0) { this.out.push(", "); }
             const p: VarDeclNode* = node.parameters[i];
@@ -577,16 +605,16 @@ type struct BindingSerializer {
         const n: u64 = s.length();
         mut out: String = String::new();
         for (mut i: u64 = 0; i < n; i++) {
-            const c: i8 = s[i];
+            const c: char = s[i];
             if (c == '"')       { out.push("\\\""); }
             else if (c == '\\') { out.push("\\\\"); }
-            else if (c == 10i8) { out.push("\\n"); }
-            else if (c == 13i8) { out.push("\\r"); }
-            else if (c == 9i8)  { out.push("\\t"); }
+            else if (c == '\n') { out.push("\\n"); }
+            else if (c == '\r') { out.push("\\r"); }
+            else if (c == '\t') { out.push("\\t"); }
             else {
                 mut one: i8[2];
-                one[0] = c;
-                one[1] = 0i8;
+                one[0] = c as i8;
+                one[1] = 0;
                 out.push(&one[0] as string);
             }
         }
@@ -648,7 +676,7 @@ type struct VendorGenerator {
             // may not report the TU's main file); `collect_from_tu` then appends
             // the transitive non-system includes.  Final de-dup happens below.
             if (out_inputs != null) { out_inputs.push(hp); }
-            Importer::collect_from_tu(hp as u8*, null, 0u32, &extra, hp,
+            Importer::collect_from_tu(hp as u8*, null, 0, &extra, hp,
                                       extern_node, &ctx, &report, out_inputs,
                                       language, cpp_std);
             parsed = parsed + 1;
@@ -698,7 +726,7 @@ type struct VendorGenerator {
     static provenance_key(source_path: string, headers: &string[],
                           include_dirs: &string[], defines: &string[],
                           triple: string, cache_file: string, lang: string) -> string {
-        mut h: DefaultHasher = DefaultHasher::new();
+        mut h: Fnv128Hasher = Fnv128Hasher::new();
         const depfile: string = if (cache_file.length() > 0) {
             format("%s.deps", cache_file)
         } else {
@@ -745,7 +773,7 @@ type struct VendorGenerator {
         h.fold(triple);
         h.fold(VendorGenerator::clang_version());
         h.fold(GENERATOR_VERSION as u64);
-        return h.finish().to_hex_padded_str(16);
+        return Manifest::hex128(h.finish128());
     }
 
     /// Fold the bytes of every file listed in an include-graph depfile (one path
@@ -753,7 +781,7 @@ type struct VendorGenerator {
     /// listed file that has since been deleted perturbs the key with a distinct
     /// marker (so it can't masquerade as unchanged -> forces a regeneration that
     /// rebuilds the graph).  Blank lines are skipped.
-    static fold_depfile(h: DefaultHasher*, depfile: string) -> void {
+    static fold_depfile(h: Fnv128Hasher*, depfile: string) -> void {
         mut content: string = "";
         match (file::read_to_string(Path::from(depfile))) {
             Result::Ok(s)  => { content = s.into_raw(); }

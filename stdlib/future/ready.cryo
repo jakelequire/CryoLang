@@ -1,0 +1,54 @@
+///! Hand-written sample futures: `Ready<T>` and `PendingThenReady<T>`.
+
+namespace std::future::ready;
+
+import core::option;
+import future::poll;
+import future::waker;
+import future::traits;
+
+/// A future that is already complete: the first `poll` returns `Ready(value)`.
+/// The value is held in an `Option` and moved out on completion, so polling a
+/// `Ready` a second time is a contract violation (it panics) rather than a
+/// double-move.
+type struct Ready<T> {
+    value: Option<T>;
+
+    static new(value: T) -> Ready<T> {
+        return Ready<T> { value: Option::Some(value) };
+    }
+}
+
+implement<T> trait Future<T> for struct Ready<T> {
+    poll(mut &this, cx: Context*) -> Poll<T> {
+        match (this.value.take()) {
+            Option::Some(v) => { return Poll::Ready(v); }
+            Option::None    => { panic("future::Ready polled after completion", FILE, LINE); }
+        }
+    }
+}
+
+/// A future that reports `Pending` for its first `pending_count` polls and then
+/// completes with `value`. Exercises the suspend/resume path end-to-end under a
+/// driver without any I/O or threads — the canonical Phase-1 validation future.
+type struct PendingThenReady<T> {
+    remaining: u32;
+    value:     Option<T>;
+
+    static new(pending_count: u32, value: T) -> PendingThenReady<T> {
+        return PendingThenReady<T> { remaining: pending_count, value: Option::Some(value) };
+    }
+}
+
+implement<T> trait Future<T> for struct PendingThenReady<T> {
+    poll(mut &this, cx: Context*) -> Poll<T> {
+        if (this.remaining > 0) {
+            this.remaining = this.remaining - 1;
+            return Poll::Pending;
+        }
+        match (this.value.take()) {
+            Option::Some(v) => { return Poll::Ready(v); }
+            Option::None    => { panic("future::PendingThenReady polled after completion", FILE, LINE); }
+        }
+    }
+}

@@ -86,68 +86,39 @@ type struct Response {
         );
     }
 
-    /// Write to any `Write` impl, typically a `TcpStream`.
-    write_to<W>(&this, writer: mut &W) -> Result<(), IoError>
-    where W: Write {
-        const crlf: Slice<u8> = Slice::from_raw("\r\n", 2);
-        const sp: Slice<u8> = Slice::from_raw(" ", 1);
-        const http11: Slice<u8> = Slice::from_raw("HTTP/1.1", 8);
-
-        // Status line: HTTP/1.1 <code> <reason>CRLF
-        writer.write(http11)?;
-        writer.write(sp)?;
-        // StatusCode wraps a full u16, whose largest decimal form is
-        // "65535" (5 digits). `to_decimal_buf` writes exactly as many
-        // digits as the value needs, so the buffer must hold 5.
-        mut code_buf: u8[5];
-        const code_val: u64 = this.status.as_u16() as u64;
-        const code_digits: u64 = code_val.to_decimal_buf(&code_buf[0]);
-        writer.write(Slice<u8>::from_raw(&code_buf[0], code_digits))?;
-        writer.write(sp)?;
-        writer.write(this.status.reason_phrase().as_bytes())?;
-        writer.write(crlf)?;
-
-        // Headers: emit every stored header as `name: value\r\n`.
-        this.headers.write_to(writer)?;
-
-        // Blank line separating headers from body.
-        writer.write(crlf)?;
-        if (!this.body.is_empty()) {
-            writer.write(this.body.as_slice())?;
-        }
-        return Result::Ok(());
-    }
-
-    /// Parse a response from a `Read`. Used by the HTTP client.
-    static parse<R>(reader: mut &R) -> Result<Response, IoError>
-    where R: Read {
-        mut status_line: String = String::new();
-        request::read_line(reader, &status_line, 8192)?;
-
-        // Status-Line: HTTP/x.y SP code SP reason
-        mut first_sp: u64 = status_line.length();
-        mut second_sp: u64 = status_line.length();
+    /// Parse a Status-Line (`HTTP/x.y SP code SP reason`, no CRLF) into
+    /// a response with empty headers and no body. A missing code or a
+    /// non-numeric one is `InvalidData`. The reason phrase is advisory
+    /// and discarded; the code is what callers dispatch on.
+    ///
+    /// Split out from the message read so the grammar has exactly one
+    /// implementation: `BufStream::read_response` obtains the line and this
+    /// turns it into a response.
+    static from_status_line(line: Str) -> Result<Response, IoError> {
+        mut first_sp: u64 = line.length();
+        mut second_sp: u64 = line.length();
         mut i: u64 = 0;
-        while (i < status_line.length()) {
-            match (status_line.as_str().byte_at(i)) {
+        while (i < line.length()) {
+            match (line.byte_at(i)) {
                 Option::Some(byte) => {
                     if (byte == 0x20) {
-                        if (first_sp == status_line.length()) { first_sp = i; }
-                        else if (second_sp == status_line.length()) { second_sp = i; break; }
+                        if (first_sp == line.length()) { first_sp = i; }
+                        else if (second_sp == line.length()) { second_sp = i; break; }
                     }
                 }
                 Option::None => { break; }
             }
             i++;
         }
-        if (first_sp == status_line.length()) {
+        if (first_sp == line.length()) {
             return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
         }
-        mut code_end: u64 = second_sp;
-        if (code_end == status_line.length()) { code_end = status_line.length(); }
+        // A status line with no reason phrase ("HTTP/1.1 204") is legal;
+        // the code then runs to the end of the line.
+        const code_end: u64 = second_sp;
 
-        const version_str: Str = status_line.as_str().sub_bytes(0, first_sp);
-        const code_str: Str = status_line.as_str().sub_bytes(first_sp + 1, code_end);
+        const version_str: Str = line.sub_bytes(0, first_sp);
+        const code_str: Str = line.sub_bytes(first_sp + 1, code_end);
 
         mut code: u16 = 0;
         match (u16::try_from(code_str)) {
@@ -157,64 +128,45 @@ type struct Response {
             }
         }
 
-        mut resp: Response = Response {
+        return Result::Ok(Response {
             status: StatusCode::from_u16(code),
             version: String::from_str(version_str),
             headers: Headers::new(),
             body: Array::new()
-        };
+        });
+    }
 
-        mut header_count: u64 = 0;
-        loop {
-            mut header_line: String = String::new();
-            request::read_line(reader, &header_line, 8192)?;
-            if (header_line.is_empty()) {
-                break;
-            }
-            if (!resp.headers.parse_line(header_line.as_str())) {
-                return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
-            }
-            header_count = header_count + 1;
-            if (header_count > MAX_HEADER_COUNT) {
-                return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
-            }
+    /// Append the whole message — status line, headers, blank line,
+    /// body — to `out`, normally the connection's `pending()` buffer.
+    ///
+    /// Synchronous for the same reason as `Request::encode_into`: a
+    /// whole response is assembled without a suspension point, so the
+    /// layer above suspends exactly once, in the following `flush`.
+    encode_into(&this, out: Array<u8>*) -> Result<(), IoError> {
+        const crlf: Slice<u8> = Slice::from_raw("\r\n", 2);
+        const sp: Slice<u8> = Slice::from_raw(" ", 1);
+        const http11: Slice<u8> = Slice::from_raw("HTTP/1.1", 8);
+
+        headers::push_all(out, http11)?;
+        headers::push_all(out, sp)?;
+        // StatusCode wraps a full u16, whose largest decimal form is
+        // "65535" (5 digits). `to_decimal_buf` writes exactly as many
+        // digits as the value needs, so the buffer must hold 5.
+        mut code_buf: u8[5];
+        const code_val: u64 = this.status.as_u16() as u64;
+        const code_digits: u64 = code_val.to_decimal_buf(&code_buf[0]);
+        headers::push_all(out, Slice<u8>::from_raw(&code_buf[0], code_digits))?;
+        headers::push_all(out, sp)?;
+        headers::push_all(out, this.status.reason_phrase().as_bytes())?;
+        headers::push_all(out, crlf)?;
+
+        this.headers.encode_into(out)?;
+
+        headers::push_all(out, crlf)?;
+        if (!this.body.is_empty()) {
+            headers::push_all(out, this.body.as_slice())?;
         }
-
-        // Body (Content-Length sized only).
-        match (resp.headers.get(Str::new("content-length"))) {
-            Option::Some(mut value) => {
-                match (u64::try_from(value.as_str())) {
-                    Result::Ok(len) => {
-                        if (len > MAX_BODY) {
-                            // Reject up front; never size a buffer to an
-                            // untrusted peer's declared length.
-                            return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
-                        }
-                        mut body: Array<u8> = Array::with_capacity(len);
-                        mut remaining: u64 = len;
-                        mut chunk: u8[4096];
-                        while (remaining > 0) {
-                            mut take: u64 = 4096;
-                            if (take > remaining) { take = remaining; }
-                            const n: u64 = reader.read(&chunk[0], take)?;
-                            if (n == 0) {
-                                return Result::Err(IoError::new(IoErrorKind::UnexpectedEof, 0));
-                            }
-                            mut j: u64 = 0;
-                            while (j < n) { body.push(chunk[j]); j = j + 1; }
-                            remaining = remaining - n;
-                        }
-                        resp.body = body;
-                    }
-                    Result::Err(_) => {
-                        return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
-                    }
-                }
-            }
-            Option::None => { }
-        }
-
-        return Result::Ok(resp);
+        return Result::Ok(());
     }
 
 }

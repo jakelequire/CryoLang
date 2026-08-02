@@ -1,0 +1,40 @@
+///! `![config(no_runtime)]` compile-time freestanding-build gate.  Two
+///! same-named `backend` functions are gated on opposite polarities of the
+///! `no_runtime` build flag.  ConfigGating strips exactly one before name
+///! resolution — so the mere fact that this file COMPILES proves the gate
+///! removed the other (two live `backend`s would be a duplicate-definition
+///! error).  Under `cryo test` the flag is OFF (its default; nothing sets
+///! cryoconfig `[compiler] no_runtime`), so the `not(no_runtime)` arm survives.
+///!
+///! The ON polarity (freestanding arm surviving) can't be exercised by a
+///! `run` test yet — a `no_runtime` binary has no crt0 and needs its own
+///! `![naked] _start` entry, which is deferred.  The build-flag plumbing and
+///! codegen suppression are probe-verified against emitted IR/objects.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::ConfigNoRuntimeGate;
+
+import std::core::result;
+import std::test::error;
+import std::test::assert;
+
+// Freestanding backend: stripped unless `no_runtime` is ON.  Returns a value
+// distinct from the hosted arm so the surviving arm is identifiable.
+![config(no_runtime)]
+function backend() -> i32 { return 1; }
+
+// Hosted backend: active whenever `no_runtime` is OFF (the default).
+![config(not(no_runtime))]
+function backend() -> i32 { return 0; }
+
+![test]
+function default_build_selects_hosted_arm() -> Result<(), TestError> {
+    // Off by default => the `not(no_runtime)` (hosted) arm is the survivor.
+    const got: i32 = backend();
+    const want: i32 = 0;
+    match (expect_eq(got, want)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return Result::Ok(());
+}

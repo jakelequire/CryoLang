@@ -17,8 +17,6 @@
 
 namespace Compiler::Sema::State;
 
-import std::env;
-import std::collections::str;
 import Compiler::Types::TypeRef;
 import Compiler::Diag::SourceSpan;
 import Compiler::AST;
@@ -44,6 +42,12 @@ type struct SemaState {
     // -- Per-function frame --
     return_type:     TypeRef;                 // current function return type
     return_type_ann: TypeAnnotation*;         // current return-type annotation (secondary spans)
+    // Inside the `poll` an `async fn` was lowered into, this is that function's
+    // declared Output — the `Poll<Output>` return peeled back to what the source
+    // said. `?` is judged against it, because the body being walked is the
+    // async function's, written against `Output`, not `Poll<Output>`.
+    // Invalid in any function that is not such a `poll`.
+    async_poll_output: TypeRef;
     this_type:       TypeRef;                 // current method receiver type (invalid for static)
     this_is_mut:     boolean;                 // method has `mut &this`
     // Type whose method body we're inside, regardless of static-ness.  Matches
@@ -53,9 +57,8 @@ type struct SemaState {
     current_owner_type: TypeRef;
     body_count:      i64;                     // counter for debug output
 
-    // -- Loop/switch nesting (break/continue validation) --
+    // -- Loop nesting (break/continue validation) --
     loop_depth:   i32;
-    switch_depth: i32;
 
     // -- Expected-type hint (set by DeclStmt for initializer resolution) --
     expected_type: TypeRef;
@@ -66,14 +69,18 @@ type struct SemaState {
     // function returns.  These ids let the return-escape check reject that
     // (E0455) instead of miscompiling into a use-after-free.
     payload_binding_ids: u32[];
-    // True only while resolving a `match` subject EXPRESSION.  Gates the
-    // enum-variant-constructor instantiation inference in call_resolver
-    // (`infer_variant_instantiation`) to inline match subjects
-    // (`match (Option::Some(<expr>)) {...}`), and only when the payload owns a
-    // destructor - so the subject (and its variant binding) become the concrete
-    // `Option<Holder>` instead of the generic base, closing a pattern-binding
-    // `Drop`-field move-out double-free (move-check then sees the field's Drop).
-    resolving_match_subject: boolean;
+    // The subset of the bindings above whose subject is reached through a
+    // by-reference parameter (`match (&this)`, `match (ptr_param)`).  Such a
+    // binding names the CALLER's storage rather than a copy in this frame, so
+    // `&binding` stays valid after the function returns and the escape check
+    // above must not reject it - that is what an in-place accessor
+    // (`payload_ptr(&this) -> T*`) is.  Kept as a separate set rather than by
+    // suppressing the entry above, because the payload-escape check has its own
+    // reason to know a name is a payload binding.
+    alias_binding_ids: u32[];
+    // True while inside a method whose receiver is `&this` / `mut &this`.  A
+    // by-value `this` receiver lives in THIS frame, so it is not caller-backed.
+    this_is_by_ref: boolean;
     // The current function's parameter (and `this`) names.  Autoref'd /
     // caller-backed, so `&param` re-borrows caller storage rather than escaping
     // a stack slot - the return-escape check flags only `&<body-local>`.
@@ -113,9 +120,6 @@ type struct SemaState {
     try_counter: u32;
 
     // -- Symbolic generic-body check --
-    // Cached gate, read once in `new()`.  ON by default; `CRYO_NO_SYMBOLIC_CHECK`
-    // is the kill-switch.  Zero-as-unread sentinel: 0=unread, 1=off, 2=on.
-    symbolic_check_gate: i32;
     // True only while a symbolic generic-body walk is in progress.
     in_symbolic_check: boolean;
     // Intern ids of the generic-param names in scope for the body under symbolic
@@ -155,21 +159,6 @@ type struct SemaState {
     last_expr_type: TypeRef;
 
     static new() -> SemaState {
-        // Read the symbolic-check gate once.  ON by default; the
-        // `CRYO_NO_SYMBOLIC_CHECK` env var is a kill-switch for fast triage.
-        mut gate: i32 = 2;
-        match (env::var(Str::new("CRYO_NO_SYMBOLIC_CHECK"))) {
-            Option::Some(v) => {
-                // Presence check only: move into a local (RAII-dropped at scope
-                // exit) and read its length. No leak; nothing outlives the arm.
-                mut s: String = v;
-                if (s.length() > 0) {
-                    gate = 1;   // off (kill-switch set)
-                }
-            }
-            Option::None => {}
-        }
-
         return SemaState {
             locals:         HashMap<u32, TypeRef>::new(),
             local_muts:     HashMap<u32, boolean>::new(),
@@ -178,17 +167,18 @@ type struct SemaState {
             undo_prev:      [],
             undo_muts:      [],
             undo_kw_spans:  [],
-            return_type:     TypeRef::invalid(),
-            return_type_ann: null,
+            return_type:       TypeRef::invalid(),
+            return_type_ann:   null,
+            async_poll_output: TypeRef::invalid(),
             this_type:       TypeRef::invalid(),
             this_is_mut:     false,
             current_owner_type: TypeRef::invalid(),
             body_count:      0,
             loop_depth:   0,
-            switch_depth: 0,
             expected_type: TypeRef::invalid(),
             payload_binding_ids: [],
-            resolving_match_subject:     false,
+            alias_binding_ids: [],
+            this_is_by_ref:  false,
             param_ids: [],
             in_lambda_depth:     0,
             lambda_outer_locals: HashMap<u32, TypeRef>::new(),
@@ -198,7 +188,6 @@ type struct SemaState {
             in_implicit_conversion: false,
             post_mono_verify: false,
             try_counter: 0,
-            symbolic_check_gate: gate,
             in_symbolic_check:           false,
             symbolic_generic_param_ids:  [],
             symbolic_owner_param_ids:    [],

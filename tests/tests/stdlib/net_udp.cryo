@@ -1,9 +1,15 @@
-///! UdpSocket - loopback datagram round-trip over 127.0.0.1.
+///! UdpSocket - loopback datagram round-trip over 127.0.0.1, driven by a real
+///! `Executor` (worker pool + reactor).
 ///!
 ///! Both sockets bind to port 0 and read their kernel-assigned port
 ///! back with `local_addr()`, so concurrent test runs never collide and
 ///! the test needs no hard-coded ports. A datagram is sent each way and
 ///! the payload plus the reported peer address are checked.
+///!
+///! Every send and receive is a future, so these also cover what the port to
+///! async bought: the receive parks on the reactor until the datagram lands
+///! rather than sleeping the calling thread inside `recvfrom`, and each
+///! operation owns its socket and buffer for the duration and hands both back.
 
 ![config(testing)]
 namespace CryoTests::Tests::Stdlib::NetUdp;
@@ -12,29 +18,114 @@ import std::core::result;
 import std::core::option;
 import std::core::slice;
 import std::collections::str;
+import std::collections::array;
+import std::future;
 import std::io::error;
-import std::net::ip;
-import std::net::socket_addr;
-import std::net::udp;
+import std::net::addr::ip;
+import std::net::addr::socket_addr;
+import std::net::socket::udp;
 import std::test::error;
 import std::test::assert;
 
-function slices_eq(a: Slice<u8>, b: Slice<u8>) -> boolean {
-    if (a.length() != b.length()) { return false; }
-    mut i: u64 = 0;
-    while (i < a.length()) {
-        match (a.get(i)) {
-            Option::Some(av) => {
-                match (b.get(i)) {
-                    Option::Some(bv) => { if (av != bv) { return false; } }
-                    Option::None     => { return false; }
-                }
-            }
-            Option::None => { return false; }
-        }
-        i++;
+// Every failure is a distinct negative number so a red test names its own step
+// instead of just reporting "not 0".
+
+/// "ping" as bytes. Built by hand because an `Array<u8>` is what the futures
+/// own, and a `Str`'s bytes are borrowed from the literal.
+function ping_bytes() -> Array<u8> {
+    mut a: Array<u8> = Array<u8>::new();
+    a.push(112); a.push(105); a.push(110); a.push(103);
+    return a;
+}
+
+/// "pong" as bytes.
+function pong_bytes() -> Array<u8> {
+    mut a: Array<u8> = Array<u8>::new();
+    a.push(112); a.push(111); a.push(110); a.push(103);
+    return a;
+}
+
+/// A 64-byte receive buffer. Sized with `resize`, not `with_capacity`: an array
+/// exposes only `[0, length)`, so a capacity-only buffer has nothing to receive
+/// into.
+function recv_buf() -> Array<u8> {
+    mut a: Array<u8> = Array<u8>::new();
+    a.resize(64, 0);
+    return a;
+}
+
+/// The first byte of `a`, or 0 if it is empty.
+function first_byte(a: &Array<u8>) -> u8 {
+    match (a.get(0)) {
+        Option::Some(v) => { return v; }
+        Option::None    => { return 0; }
     }
-    return true;
+}
+
+/// client -> server "ping", server -> the peer it saw "pong". Returns 0 on a
+/// clean round trip. Owns both sockets for the whole exchange, since each
+/// operation takes one and hands it back.
+async function ping_pong(server: UdpSocket, client: UdpSocket, server_addr: SocketAddr) -> i64 {
+    mut srv: UdpSocket = server;
+
+    mut sio: UdpIo = await UdpSendTo::start(client, ping_bytes(), server_addr);
+    mut cl: UdpSocket = sio.take_socket();
+    // A send hands the buffer back untouched, so the caller still has what it
+    // sent; nothing here needs it again.
+    mut sent: Array<u8> = sio.take_buf();
+    sent.drop();
+    match (sio.outcome()) {
+        Result::Ok(k)  => { if (k != 4) { cl.drop(); srv.drop(); return -1; } }
+        Result::Err(_) => { cl.drop(); srv.drop(); return -2; }
+    }
+
+    mut rio: UdpReceived = await UdpRecvFrom::start(srv, recv_buf());
+    mut srv2: UdpSocket  = rio.take_socket();
+    mut got:  Array<u8>  = rio.take_buf();
+    mut peer: SocketAddr = SocketAddr::localhost_v4(0);
+    mut recv_ok: boolean = false;
+    match (rio.outcome()) {
+        Result::Ok(pair) => { peer = pair.1; recv_ok = true; }
+        Result::Err(_)   => { }
+    }
+    // A receive hands back a buffer TRUNCATED to the datagram that arrived, so
+    // its length is the byte count - a 64-byte buffer holding "ping" comes back
+    // at 4.
+    const n: u64   = got.length();
+    const f: u8    = first_byte(&got);
+    got.drop();
+    if (!recv_ok)      { cl.drop(); srv2.drop(); return -3; }
+    if (n != 4)        { cl.drop(); srv2.drop(); return -4; }
+    if (f != 112)      { cl.drop(); srv2.drop(); return -5; }
+    if (!peer.ip.is_ipv4()) { cl.drop(); srv2.drop(); return -6; }
+
+    // Reply to the peer the datagram came from.
+    mut sio2: UdpIo = await UdpSendTo::start(srv2, pong_bytes(), peer);
+    mut srv3: UdpSocket = sio2.take_socket();
+    mut sent2: Array<u8> = sio2.take_buf();
+    sent2.drop();
+    match (sio2.outcome()) {
+        Result::Ok(k)  => { if (k != 4) { cl.drop(); srv3.drop(); return -7; } }
+        Result::Err(_) => { cl.drop(); srv3.drop(); return -8; }
+    }
+
+    mut rio2: UdpReceived = await UdpRecvFrom::start(cl, recv_buf());
+    mut cl2:  UdpSocket   = rio2.take_socket();
+    mut back: Array<u8>   = rio2.take_buf();
+    mut back_ok: boolean  = false;
+    match (rio2.outcome()) {
+        Result::Ok(_)  => { back_ok = true; }
+        Result::Err(_) => { }
+    }
+    const bn: u64 = back.length();
+    const bf: u8  = first_byte(&back);
+    back.drop();
+    cl2.drop();
+    srv3.drop();
+    if (!back_ok) { return -9; }
+    if (bn != 4)  { return -10; }
+    if (bf != 112) { return -11; }
+    return 0;
 }
 
 ![test]
@@ -47,55 +138,54 @@ function loopback_datagram_round_trip() -> Result<(), TestError> {
         Result::Ok(s)  => { s }
         Result::Err(_) => { server.drop(); return bail(Str::new("client bind failed")); }
     };
-
     const server_addr: SocketAddr = match (server.local_addr()) {
         Result::Ok(a)  => { a }
-        Result::Err(_) => { client.drop(); server.drop(); return bail(Str::new("server local_addr failed")); }
+        Result::Err(_) => { client.drop(); server.drop();
+                            return bail(Str::new("server local_addr failed")); }
     };
 
-    // client -> server
-    match (client.send_to(Str::new("ping").as_bytes(), server_addr)) {
-        Result::Ok(_)  => { }
-        Result::Err(_) => { client.drop(); server.drop(); return bail(Str::new("client send_to failed")); }
+    mut ex: Executor = Executor::new();
+    const r: i64 = ex.block_on(ping_pong(server, client, server_addr));
+    ex.drop();
+    return expect_eq(r, 0 as i64);
+}
+
+/// `connect` pins a default peer so the address-less `UdpSend` works.
+async function connected_exchange(server: UdpSocket, client: UdpSocket) -> i64 {
+    mut hello: Array<u8> = Array<u8>::new();
+    hello.push(104); hello.push(101); hello.push(108); hello.push(108); hello.push(111);
+
+    mut sio: UdpIo = await UdpSend::start(client, hello);
+    mut cl: UdpSocket = sio.take_socket();
+    mut sent: Array<u8> = sio.take_buf();
+    sent.drop();
+    mut srv: UdpSocket = server;
+    match (sio.outcome()) {
+        Result::Ok(k)  => { if (k != 5) { cl.drop(); srv.drop(); return -20; } }
+        Result::Err(_) => { cl.drop(); srv.drop(); return -21; }
     }
 
-    mut sbuf: u8[64];
-    mut client_addr: SocketAddr = SocketAddr::localhost_v4(0);
-    mut sgot: u64 = 0;
-    match (server.recv_from(&sbuf[0], 64)) {
-        Result::Ok(pair) => { sgot = pair[0]; client_addr = pair[1]; }
-        Result::Err(_)   => { client.drop(); server.drop(); return bail(Str::new("server recv_from failed")); }
+    mut rio: UdpReceived = await UdpRecvFrom::start(srv, recv_buf());
+    mut srv2: UdpSocket = rio.take_socket();
+    mut got:  Array<u8> = rio.take_buf();
+    mut ok: boolean = false;
+    match (rio.outcome()) {
+        Result::Ok(_)  => { ok = true; }
+        Result::Err(_) => { }
     }
-    const ping_ok: boolean = slices_eq(Slice::from_raw(&sbuf[0], sgot), Str::new("ping").as_bytes());
-
-    // server -> client, replying to the peer the datagram came from
-    match (server.send_to(Str::new("pong").as_bytes(), client_addr)) {
-        Result::Ok(_)  => { }
-        Result::Err(_) => { client.drop(); server.drop(); return bail(Str::new("server send_to failed")); }
-    }
-
-    mut cbuf: u8[64];
-    mut cgot: u64 = 0;
-    match (client.recv_from(&cbuf[0], 64)) {
-        Result::Ok(pair) => { cgot = pair[0]; }
-        Result::Err(_)   => { client.drop(); server.drop(); return bail(Str::new("client recv_from failed")); }
-    }
-    const pong_ok: boolean = slices_eq(Slice::from_raw(&cbuf[0], cgot), Str::new("pong").as_bytes());
-
-    // The peer the server saw must be the client's loopback address.
-    const peer_is_loopback: boolean = client_addr.ip.is_ipv4();
-
-    client.drop();
-    server.drop();
-
-    match (expect(ping_ok, Str::new("server should receive \"ping\""))) { Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); } }
-    match (expect(pong_ok, Str::new("client should receive \"pong\""))) { Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); } }
-    return expect(peer_is_loopback, Str::new("server should see an IPv4 peer address"));
+    const n: u64 = got.length();
+    const f: u8  = first_byte(&got);
+    got.drop();
+    cl.drop();
+    srv2.drop();
+    if (!ok)      { return -22; }
+    if (n != 5)   { return -23; }
+    if (f != 104) { return -24; }
+    return 0;
 }
 
 ![test]
 function connected_socket_send_recv() -> Result<(), TestError> {
-    // `connect` pins a default peer so the address-less send/recv work.
     mut server: UdpSocket = match (UdpSocket::bind(SocketAddr::localhost_v4(0))) {
         Result::Ok(s)  => { s }
         Result::Err(_) => { return bail(Str::new("server bind failed")); }
@@ -104,37 +194,45 @@ function connected_socket_send_recv() -> Result<(), TestError> {
         Result::Ok(a)  => { a }
         Result::Err(_) => { server.drop(); return bail(Str::new("server local_addr failed")); }
     };
-
     mut client: UdpSocket = match (UdpSocket::unbound()) {
         Result::Ok(s)  => { s }
         Result::Err(_) => { server.drop(); return bail(Str::new("client unbound failed")); }
     };
     match (client.connect(server_addr)) {
         Result::Ok(_)  => { }
-        Result::Err(_) => { client.drop(); server.drop(); return bail(Str::new("client connect failed")); }
-    }
-    match (client.send(Str::new("hello").as_bytes())) {
-        Result::Ok(_)  => { }
-        Result::Err(_) => { client.drop(); server.drop(); return bail(Str::new("client send failed")); }
+        Result::Err(_) => { client.drop(); server.drop();
+                            return bail(Str::new("client connect failed")); }
     }
 
-    mut buf: u8[64];
-    mut got: u64 = 0;
-    match (server.recv_from(&buf[0], 64)) {
-        Result::Ok(pair) => { got = pair[0]; }
-        Result::Err(_)   => { client.drop(); server.drop(); return bail(Str::new("server recv_from failed")); }
-    }
-    const ok: boolean = slices_eq(Slice::from_raw(&buf[0], got), Str::new("hello").as_bytes());
+    mut ex: Executor = Executor::new();
+    const r: i64 = ex.block_on(connected_exchange(server, client));
+    ex.drop();
+    return expect_eq(r, 0 as i64);
+}
 
-    client.drop();
-    server.drop();
-    return expect(ok, Str::new("connected send should deliver \"hello\""));
+/// A `UdpSendTo` aimed at an IPv6 destination must report `Unsupported` rather
+/// than pack a 28-byte `sockaddr_in6` into the v4-sized buffer behind it.
+async function v6_send_rejected(client: UdpSocket) -> i64 {
+    mut one: Array<u8> = Array<u8>::new();
+    one.push(120);
+    mut sio: UdpIo = await UdpSendTo::start(client, one, SocketAddr::any_v6(9));
+    mut cl: UdpSocket = sio.take_socket();
+    mut b: Array<u8> = sio.take_buf();
+    b.drop();
+    cl.drop();
+    match (sio.outcome()) {
+        Result::Ok(_)  => { return -30; }
+        Result::Err(e) => {
+            if (e.kind == IoErrorKind::Unsupported) { return 0; }
+            return -31;
+        }
+    }
 }
 
 // Guards against the UDP entry points taking a
 // 16-byte `sockaddr_buf` while `pack_sockaddr_in` writes 28 bytes for an
 // IPv6 address - a 12-byte stack overflow - despite a doc comment claiming
-// IPv6 was rejected. The socket is AF_INET, so `bind`/`connect`/`send_to`
+// IPv6 was rejected. The socket is AF_INET, so `bind`/`connect`/`UdpSendTo`
 // reject an `IpAddr::V6` destination up front with `Unsupported`
 // (and the buffers are 28 bytes as defense in depth). This must NOT crash
 // and must surface the documented error.
@@ -166,12 +264,9 @@ function ipv6_rejected_unsupported() -> Result<(), TestError> {
             }
         }
     }
-    const v6: SocketAddr = SocketAddr::any_v6(9);
-    const send_res: Result<u64, IoError> = client.send_to(Str::new("x").as_bytes(), v6);
-    const sent_rejected: boolean = match (send_res) {
-        Result::Ok(_)  => { false }
-        Result::Err(e) => { e.kind == IoErrorKind::Unsupported }
-    };
-    client.drop();
-    return expect(sent_rejected, Str::new("v6 send_to should fail Unsupported"));
+
+    mut ex: Executor = Executor::new();
+    const r: i64 = ex.block_on(v6_send_rejected(client));
+    ex.drop();
+    return expect_eq(r, 0 as i64);
 }

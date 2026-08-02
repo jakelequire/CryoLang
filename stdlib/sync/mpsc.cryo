@@ -47,7 +47,7 @@ import core::drop;
 import alloc::layout;
 import alloc::allocator;
 import ffi::libc;
-import ffi::syscall;
+import sys::syscall;
 
 
 // Per-OS channel lock/cond primitives.  The channel embeds its own mutex
@@ -91,7 +91,7 @@ private function chan_cond_destroy(b: u8*) -> void { }
 private function chan_cond_wait(c: u8*, m: u8*) -> void { pthread_cond_wait(c, m); }
 ![target(windows)]
 private function chan_cond_wait(c: u8*, m: u8*) -> void {
-    syscall::SleepConditionVariableSRW(c, m, 0xFFFFFFFFu32, 0u32);
+    syscall::SleepConditionVariableSRW(c, m, 0xFFFFFFFF, 0);
 }
 
 ![target(unix)]
@@ -144,8 +144,8 @@ function new_inner<T>() -> ChannelInner<T>* {
     }
     inner.head    = null;
     inner.tail    = null;
-    inner.senders = 0i64;
-    inner.refs    = 1i64;   // the Receiver
+    inner.senders = 0;
+    inner.refs    = 1;   // the Receiver
     inner.rx_open = true;
     return inner;
 }
@@ -223,8 +223,8 @@ type struct Sender<T> {
     clone(&this) -> Sender<T> {
         const inner: ChannelInner<T>* = this.inner;
         chan_mtx_lock(&inner.mutex[0]);
-        inner.senders = inner.senders + 1i64;
-        inner.refs    = inner.refs + 1i64;
+        inner.senders = inner.senders + 1;
+        inner.refs    = inner.refs + 1;
         chan_mtx_unlock(&inner.mutex[0]);
         return Sender<T> { inner: inner };
     }
@@ -243,12 +243,12 @@ type struct Sender<T> {
 /// inner if this was the last handle of any kind.
 function release_sender<T>(inner: ChannelInner<T>*) -> void {
     chan_mtx_lock(&inner.mutex[0]);
-    inner.senders = inner.senders - 1i64;
-    if (inner.senders == 0i64) {
+    inner.senders = inner.senders - 1;
+    if (inner.senders == 0) {
         chan_cond_broadcast(&inner.cond[0]);
     }
-    inner.refs = inner.refs - 1i64;
-    const last: boolean = inner.refs == 0i64;
+    inner.refs = inner.refs - 1;
+    const last: boolean = inner.refs == 0;
     chan_mtx_unlock(&inner.mutex[0]);
     if (last) { free_inner<T>(inner); }
 }
@@ -275,8 +275,8 @@ type struct Receiver<T> {
     sender(&this) -> Sender<T> {
         const inner: ChannelInner<T>* = this.inner;
         chan_mtx_lock(&inner.mutex[0]);
-        inner.senders = inner.senders + 1i64;
-        inner.refs    = inner.refs + 1i64;
+        inner.senders = inner.senders + 1;
+        inner.refs    = inner.refs + 1;
         chan_mtx_unlock(&inner.mutex[0]);
         return Sender<T> { inner: inner };
     }
@@ -287,7 +287,7 @@ type struct Receiver<T> {
     recv(&this) -> Result<T, RecvError> {
         const inner: ChannelInner<T>* = this.inner;
         chan_mtx_lock(&inner.mutex[0]);
-        while (inner.head == null && inner.senders > 0i64) {
+        while (inner.head == null && inner.senders > 0) {
             chan_cond_wait(&inner.cond[0], &inner.mutex[0]);
         }
         if (inner.head == null) {
@@ -299,10 +299,11 @@ type struct Receiver<T> {
         inner.head = (*node).next;
         if (inner.head == null) { inner.tail = null; }
         chan_mtx_unlock(&inner.mutex[0]);
-        // Move the value out of the node (raw pointer read), free the node
-        // without dropping the moved-from slot.
+        // Move the value out of the node, then free the node without running
+        // the slot's destructor, so the value is owned exactly once.
         const slot: T* = &(*node).value;
-        const value: T = *slot;
+        mut value: T;
+        unsafe { value = *slot; }
         mut alloc: GlobalAlloc = GlobalAlloc::new();
         alloc.deallocate(NonNull::new(node as u8*), Layout::of<ChanNode<T>>());
         return Result::Ok(value);
@@ -315,7 +316,7 @@ type struct Receiver<T> {
         const inner: ChannelInner<T>* = this.inner;
         chan_mtx_lock(&inner.mutex[0]);
         if (inner.head == null) {
-            const disconnected: boolean = inner.senders == 0i64;
+            const disconnected: boolean = inner.senders == 0;
             chan_mtx_unlock(&inner.mutex[0]);
             if (disconnected) { return Result::Err(TryRecvError::Disconnected); }
             return Result::Err(TryRecvError::Empty);
@@ -324,8 +325,11 @@ type struct Receiver<T> {
         inner.head = (*node).next;
         if (inner.head == null) { inner.tail = null; }
         chan_mtx_unlock(&inner.mutex[0]);
+        // Same balance as `recv`: the node is released without running the
+        // slot's destructor, so the value is owned exactly once.
         const slot: T* = &(*node).value;
-        const value: T = *slot;
+        mut value: T;
+        unsafe { value = *slot; }
         mut alloc: GlobalAlloc = GlobalAlloc::new();
         alloc.deallocate(NonNull::new(node as u8*), Layout::of<ChanNode<T>>());
         return Result::Ok(value);
@@ -352,8 +356,8 @@ where T: Drop {
         }
         inner.head = null;
         inner.tail = null;
-        inner.refs = inner.refs - 1i64;
-        const last: boolean = inner.refs == 0i64;
+        inner.refs = inner.refs - 1;
+        const last: boolean = inner.refs == 0;
         chan_mtx_unlock(&inner.mutex[0]);
         if (last) { free_inner<T>(inner); }
         this.inner = null;

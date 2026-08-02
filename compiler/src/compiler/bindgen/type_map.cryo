@@ -41,8 +41,8 @@ function scalar_name(k: i32) -> string {
     if (k == Clang::TK_Short)      { return "i16"; }
     if (k == Clang::TK_UInt)       { return "u32"; }
     if (k == Clang::TK_Int)        { return "i32"; }
-    if (k == Clang::TK_ULong)      { return "u64"; }
-    if (k == Clang::TK_Long)       { return "i64"; }
+    // TK_Long / TK_ULong are handled in `map()` via clang_Type_getSizeOf:
+    // their width is target-dependent (LP64 vs LLP64), not a fixed name.
     if (k == Clang::TK_ULongLong)  { return "u64"; }
     if (k == Clang::TK_LongLong)   { return "i64"; }
     if (k == Clang::TK_Float)      { return "f32"; }
@@ -94,7 +94,8 @@ type struct CTypeMapper {
 
     /// Heap-allocate a fixed-size ArrayAnnotation (`T[N]`).
     array(&this, element: TypeAnnotation*, size: i64) -> TypeAnnotation* {
-        const arr: ArrayAnnotation* = new ArrayAnnotation { element: element, size: size, span: SourceSpan::none() };
+        const arr: ArrayAnnotation* = new ArrayAnnotation { element: element, size: size,
+                                                            size_expr: null, span: SourceSpan::none() };
         const ann: TypeAnnotation* = intrinsics::malloc(sizeof(TypeAnnotation)) as TypeAnnotation*;
         *ann = TypeAnnotation::Array(arr);
         return ann;
@@ -207,7 +208,7 @@ type struct CTypeMapper {
                 const ret: TypeAnnotation* = this.map(Clang::clang_getResultType(pc));
                 return this.fnptr(params, ret);
             }
-            const is_const: boolean = Clang::clang_isConstQualifiedType(pointee) != 0u32;
+            const is_const: boolean = Clang::clang_isConstQualifiedType(pointee) != 0;
             // A pointer to a system-header record (e.g. `FILE` == `struct _iobuf`
             // on mingw) -> opaque `void*`.  That record is filtered out of the
             // bindings, so a named `_iobuf*` reference would dangle (E0203);
@@ -232,7 +233,7 @@ type struct CTypeMapper {
         // receiver).  `const T&` lowers as `T*` like any const pointer.
         if (k == Clang::TK_LValueReference || k == Clang::TK_RValueReference) {
             const referent: CXType = Clang::clang_getPointeeType(c);
-            const is_const_ref: boolean = Clang::clang_isConstQualifiedType(referent) != 0u32;
+            const is_const_ref: boolean = Clang::clang_isConstQualifiedType(referent) != 0;
             return this.ptr(this.map(referent), is_const_ref);
         }
 
@@ -282,6 +283,19 @@ type struct CTypeMapper {
             }
             // Enums with no emittable name still round-trip as their integer width.
             return this.prim("i32");
+        }
+
+        // C `long` / `unsigned long` width is TARGET-DEPENDENT: 8 bytes on
+        // LP64 (Linux/macOS), 4 on LLP64 (Windows).  Ask libclang for the
+        // canonical type's actual size in this TU's target instead of
+        // assuming LP64 - a hardcoded i64/u64 gives every bare-`long` C API
+        // wrong-width fields and params on Windows.
+        if (k == Clang::TK_Long || k == Clang::TK_ULong) {
+            const long_size: i64 = Clang::clang_Type_getSizeOf(c);
+            if (long_size == 4) {
+                return this.prim(if (k == Clang::TK_Long) { "i32" } else { "u32" });
+            }
+            return this.prim(if (k == Clang::TK_Long) { "i64" } else { "u64" });
         }
 
         const name: string = scalar_name(k);

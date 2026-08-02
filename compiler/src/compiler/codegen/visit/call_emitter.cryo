@@ -88,6 +88,22 @@ type struct CallEmitter {
     /// `&mut` borrow sees the caller's storage.  Otherwise (rvalue: a
     /// literal, a global like a string constant, a computed value) we spill
     /// it to a fresh stack slot and return that slot's address.
+    /// Stack slot for a value spilled so its address can be taken, allocated in
+    /// the function's entry block so a spill inside a loop body doesn't grow
+    /// the stack once per iteration.  Falls back to an in-place alloca when the
+    /// insert block has no parent function.
+    entry_spill_slot(&this, ty: LType, name: string) -> LValue {
+        const bb: LBasicBlock = this.cg.builder.get_insert_block();
+        if (bb.is_valid()) {
+            const fn: LValue = bb.get_parent();
+            if (fn.is_valid()) {
+                const slot: LValue = this.cg.flow.create_entry_alloca(fn, name, ty);
+                if (slot.is_valid()) { return slot; }
+            }
+        }
+        return this.cg.builder.build_alloca(ty, name);
+    }
+
     address_of_value(&this, v: LValue) -> LValue {
         // LLVMOpcode::Load == 27.  On non-instruction values (globals,
         // constants) GetInstructionOpcode won't return 27, so we fall
@@ -98,7 +114,11 @@ type struct CallEmitter {
             if (operand != null) { return LValue { raw: operand }; }
         }
         const ty: LType = LType { raw: llvm::LLVMTypeOf(v.raw) };
-        const slot: LValue = this.cg.builder.build_alloca(ty, "argref");
+        // Entry-block slot: allocas are only reclaimed at function exit, so
+        // spilling here for a call inside a loop body would allocate a fresh
+        // slot per iteration.  Only the alloca is hoisted - the store below
+        // stays at the current insert point.
+        const slot: LValue = this.entry_spill_slot(ty, "argref");
         this.cg.builder.build_store(v, slot);
         return slot;
     }
@@ -128,6 +148,17 @@ type struct CallEmitter {
 
         if (node.callee.kind == NodeKind::Identifier) {
             const id: IdentifierNode* = node.callee as IdentifierNode*;
+
+            // `try_catch(body, data)` - the catch_unwind primitive.  Needs an
+            // `invoke` + a catch-all landing pad + a phi (control flow the
+            // generic `try_emit` inline path cannot build), so it is special-
+            // lowered here rather than through `IntrinsicKind`.  Handles both
+            // the bare and `intrinsics::`-qualified call shapes (ScopeResolution
+            // branch below).
+            if (id.name.equals(intern.intern("try_catch"))) {
+                this.emit_catch_unwind(visitor, node);
+                return;
+            }
 
             // Intrinsics first: `i32_to_i64`, `ptr_diff`, `bswap32`, etc.
             // are emitted as inline LLVM IR, not as real function calls,
@@ -159,6 +190,23 @@ type struct CallEmitter {
                 mut intr_args: LValue[] = [];
                 for (mut ai: i64 = 0; ai < node.arguments.length; ai++) {
                     intr_args.push(this.dispatch.codegen_rvalue(visitor,node.arguments[ai]));
+                }
+                // `--panic=unwind` direct-panic drop-completeness: route the
+                // panic funnel through an invoke + cleanup landing pad so the
+                // frame's live droppable locals drop on unwind (the plain-call
+                // `emit_panic_call` path bypasses the invoke-swap and leaks
+                // them).  Gated on a hosted unwind build WITH live locals; every
+                // other case falls through to the byte-identical `try_emit`
+                // plain-call path below.
+                if (id.name.equals(intern.intern("panic"))
+                    && this.cg.ctx.project_panic_unwind
+                    && !this.cg.intrinsics.no_runtime
+                    && (node.unwind_cleanup.length > 0
+                        || this.cg.expr_ops.has_live_arg_temps())
+                    && intr_args.length >= 3) {
+                    this.emit_panic_unwind(visitor, node,
+                        intr_args[0], intr_args[1], intr_args[2]);
+                    return;
                 }
                 match (this.cg.intrinsics.try_emit(intr_name_str, intr_args)) {
                     Option::Some(v) => {
@@ -367,8 +415,15 @@ type struct CallEmitter {
             const sr: ScopeResolutionNode* = node.callee as ScopeResolutionNode*;
             const di: DeclarationIndex* = this.cg.get_decl_index();
 
+            // `intrinsics::try_catch(body, data)` - the catch_unwind primitive.
+            // See the Identifier-branch twin for why this is special-lowered.
+            if (sr.member_name.equals(intern.intern("try_catch"))) {
+                this.emit_catch_unwind(visitor, node);
+                return;
+            }
+
             // Inline-lower intrinsics referenced via a namespace prefix
-            // (e.g., `intrinsics::isfinite`, `intrinsics::ptr_diff`).  The
+            // (e.g., `intrinsics::fpclass`, `intrinsics::ptr_diff`).  The
             // leaf name uniquely identifies the intrinsic; the prefix is
             // ignored because intrinsics live in the global LLVM namespace,
             // not in the source-level module they were declared in.  Run
@@ -390,6 +445,20 @@ type struct CallEmitter {
                 mut sr_args: LValue[] = [];
                 for (mut sai: i64 = 0; sai < node.arguments.length; sai++) {
                     sr_args.push(this.dispatch.codegen_rvalue(visitor,node.arguments[sai]));
+                }
+                // `--panic=unwind` direct-panic drop-completeness (mirrors the
+                // Identifier branch): `intrinsics::panic(...)` / `core::panic`'s
+                // inner call arrive here as a ScopeResolution intrinsic.  Route
+                // through invoke + cleanup pad when the frame has live locals.
+                if (sr.member_name.equals(intern.intern("panic"))
+                    && this.cg.ctx.project_panic_unwind
+                    && !this.cg.intrinsics.no_runtime
+                    && (node.unwind_cleanup.length > 0
+                        || this.cg.expr_ops.has_live_arg_temps())
+                    && sr_args.length >= 3) {
+                    this.emit_panic_unwind(visitor, node,
+                        sr_args[0], sr_args[1], sr_args[2]);
+                    return;
                 }
                 match (this.cg.intrinsics.try_emit(sr_leaf_str, sr_args)) {
                     Option::Some(v) => {
@@ -981,6 +1050,13 @@ type struct CallEmitter {
         // param's LLVM width.  Receivers are pointer/reference-typed and
         // never hit the integer-widening path, but we record the receiver
         // type anyway to keep the array meaningful end-to-end.
+        // `--panic=unwind`: open a frame for this call's owning temporaries - the
+        // consumed receiver (recorded below) plus each positional owning temp
+        // (recorded in the arg loop). A panic origin nested in a LATER argument
+        // drops the whole live frame; it is closed once the call is built (the
+        // callee then owns them). Opened before the receiver so a consumed
+        // receiver temp joins this frame.
+        if (this.cg.ctx.project_panic_unwind) { this.cg.expr_ops.open_arg_temp_frame(); }
         mut args: Pair<LValue, TypeRef>[] = [];
         if (node.callee.kind == NodeKind::MemberAccess) {
             const ma: MemberAccessNode* = node.callee as MemberAccessNode*;
@@ -1003,9 +1079,25 @@ type struct CallEmitter {
                 // Spill it to a fresh slot so `this` points at real memory.
                 if (obj.is_valid() && !this.state.last_is_lvalue) {
                     const recv_ty: LType = LType { raw: llvm::LLVMTypeOf(obj.raw) };
-                    const recv_slot: LValue = this.cg.builder.build_alloca(recv_ty, "recvtmp");
+                    const recv_slot: LValue = this.entry_spill_slot(recv_ty, "recvtmp");
                     this.cg.builder.build_store(obj, recv_slot);
                     obj = recv_slot;
+                    // A CONSUMED anonymous receiver temp (`make().consume(g())`)
+                    // is moved into the call; if a later argument panics before
+                    // the call runs, this frame must drop it (the callee never
+                    // took it). Record it like a positional owning temp. Gated on
+                    // the same consume check DropInsertion uses, so a receiver it
+                    // treats as borrowed (still owned elsewhere) is not recorded.
+                    if (this.cg.ctx.project_panic_unwind
+                        && (ma.object.kind == NodeKind::CallExpression
+                            || ma.object.kind == NodeKind::StructLiteral)
+                        && this.call_consumes_receiver(node, ma)
+                        && OwnershipQuery::needs_drop(this.cg.get_arena(),
+                               this.cg.ctx.generic_registry, this.cg.get_intern(),
+                               ma.object.resolved_type)) {
+                        this.record_arg_temp_slot(recv_slot, ma.object.resolved_type,
+                                                  ma.object.span);
+                    }
                 }
             }
             args.push(Pair<LValue, TypeRef>::new(obj, ma.object.resolved_type));
@@ -1034,8 +1126,19 @@ type struct CallEmitter {
                     arg = this.cg.abi.forward_va_list(&this.cg.builder, arg);
                 }
             }
+            // A by-value owning temp (a call / struct-literal result with no AST
+            // binding) is invisible to DropInsertion's name-keyed pending-arg
+            // machinery; record it so a later argument's panic drops it. Autoref
+            // args are borrows (the callee never owns them), so they are skipped.
+            if (this.cg.ctx.project_panic_unwind && !node.arguments[i].autoref) {
+                this.maybe_record_arg_temp(node.arguments[i], arg);
+            }
             args.push(Pair<LValue, TypeRef>::new(arg, node.arguments[i].resolved_type));
         }
+        // Close this call's arg-temp frame: its temporaries are now owned by the
+        // callee, so the call's own cleanup schedule must not drop them. A panic
+        // origin walked while the frame was open already captured them.
+        if (this.cg.ctx.project_panic_unwind) { this.cg.expr_ops.close_arg_temp_frame(); }
 
         const fn_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(callee_val.raw) };
         if (!fn_ty.is_valid()) {
@@ -1110,7 +1213,39 @@ type struct CallEmitter {
                                   ret_kind_is_void;
         const call_name: string = if (is_void) { "" } else { "calltmp" };
         mut result: LValue = LValue::null();
-        result = this.cg.expr_ops.codegen_call(callee_val, fn_ty, args, call_name);
+        // Under `--panic=unwind`, a call whose frame has live droppable locals
+        // must be an `invoke`: on unwind, control lands in a cleanup landing pad
+        // that drops those locals (innermost-first) then `resume`s into the
+        // caller.  DropInsertion recorded the cumulative schedule on
+        // `node.unwind_cleanup`; it is empty on the default abort path, so the
+        // else-branch below emits the identical plain `call` there.
+        // Live anonymous arg temps in an enclosing in-progress call also force an
+        // invoke: if this call unwinds, its pad must drop them (the callee that
+        // would own them never runs on the unwind path).
+        const needs_invoke: boolean = this.cg.ctx.project_panic_unwind
+            && (node.unwind_cleanup.length > 0
+                || this.cg.expr_ops.has_live_arg_temps());
+        if (needs_invoke) {
+            const cur_fn: LValue = this.get_current_function();
+            if (cur_fn.is_valid()) {
+                const cont_bb: LBasicBlock = LBasicBlock::append(cur_fn, "invoke.cont");
+                const lpad_bb: LBasicBlock = LBasicBlock::append(cur_fn, "invoke.lpad");
+                this.cg.expr_ops.invoke_active = true;
+                this.cg.expr_ops.invoke_normal = cont_bb;
+                this.cg.expr_ops.invoke_lpad   = lpad_bb;
+                result = this.cg.expr_ops.codegen_call(callee_val, fn_ty, args, call_name);
+                // Clear defensively in case an upstream error path returned
+                // before any callee call armed and consumed the flag.
+                this.cg.expr_ops.invoke_active = false;
+                this.emit_cleanup_landingpad(visitor, node, cur_fn, lpad_bb);
+                // `build_call_maybe_invoke` left the builder at `cont_bb`; the
+                // return coercion and any `unreachable` below emit there.
+            } else {
+                result = this.cg.expr_ops.codegen_call(callee_val, fn_ty, args, call_name);
+            }
+        } else {
+            result = this.cg.expr_ops.codegen_call(callee_val, fn_ty, args, call_name);
+        }
 
         // Phase 3 - small-aggregate return coercion.  When the callee
         // was declared with a register-shaped return (Direct-with-
@@ -1188,6 +1323,279 @@ type struct CallEmitter {
         }
 
         this.state.last_value = result;
+        this.state.last_is_lvalue = false;
+    }
+
+    /// Register an already-materialized owning temp `slot` for drop on the unwind
+    /// path: bind it to a synthetic name in the value table and hand a ready-made
+    /// `<name>.drop()` statement to the arg-temp stack, which the cleanup landing
+    /// pad replays exactly like an ordinary local's drop (user drop, Copy no-op,
+    /// and recursive glue all fall out of the normal `.drop()` lowering).  Shared
+    /// by the positional-arg path (`maybe_record_arg_temp`) and the
+    /// consumed-receiver path (`make().consume(g())`).
+    record_arg_temp_slot(mut &this, slot: LValue, ty: TypeRef, span: SourceSpan) -> void {
+        if (!slot.is_valid() || !ty.is_valid()) { return; }
+        const intern: InternTable* = this.cg.get_intern();
+        const nm: SymbolStr = intern.intern(format("__argtemp_%d", this.glue_seq));
+        this.glue_seq = this.glue_seq + 1;
+        this.cg.values.set(nm, slot);
+        mut id_node: IdentifierNode* = new IdentifierNode(nm, span);
+        id_node.set_resolved_type(ty);
+        const drop_sym: SymbolStr = intern.intern("drop");
+        mut da: MemberAccessNode* = new MemberAccessNode(
+            id_node as ExpressionNode*, drop_sym, span, span);
+        mut call: CallExprNode* = new CallExprNode(da as ExpressionNode*, span);
+        mut stmt: ExprStmtNode* = new ExprStmtNode(call as ExpressionNode*, span);
+        this.cg.expr_ops.push_arg_temp_drop(stmt as ASTNode*);
+    }
+
+    /// Record a live owning argument temporary so a panic origin nested in a
+    /// LATER argument drops it on the unwind path.  `f(make(), boom())`: make()'s
+    /// result is an owning temp with no AST binding, so DropInsertion's name-keyed
+    /// pending-arg machinery (which handles NAMED owning args) cannot schedule its
+    /// drop.  Spill the value into a stable slot and register it for a pad drop;
+    /// the callee still receives the value and drops its own copy on the normal
+    /// path, so this slot is dropped ONLY on the unwind path.  Qualifying args:
+    ///   - a call / struct-literal result - a fresh owning rvalue temp; and
+    ///   - a member access that moves an owning field out of an owned aggregate
+    ///     (`f(p.first, g())`), a partial move.  Safe because the owner's drop
+    ///     glue already skips the moved-out field (the same poison that keeps the
+    ///     normal path from double-freeing it), so the pad drop is that field's
+    ///     only drop on the unwind path.
+    /// Never a bare identifier (the named machinery covers it; double-tracking
+    /// would double-drop).  Caller gates on `--panic=unwind` and skips autoref
+    /// (borrowed) args.
+    maybe_record_arg_temp(mut &this, arg_expr: ExpressionNode*, arg_val: LValue) -> void {
+        if (arg_expr == null || !arg_val.is_valid()) { return; }
+        if (arg_expr.kind != NodeKind::CallExpression
+            && arg_expr.kind != NodeKind::StructLiteral
+            && arg_expr.kind != NodeKind::MemberAccess) { return; }
+        const ty: TypeRef = arg_expr.resolved_type;
+        if (!ty.is_valid()) { return; }
+        const arena: TypeArena* = this.cg.get_arena();
+        if (arena == null) { return; }
+        if (!OwnershipQuery::needs_drop(arena, this.cg.ctx.generic_registry,
+                                        this.cg.get_intern(), ty)) { return; }
+        const lty: LType = this.cg.type_mapper.map_type(ty);
+        if (!lty.is_valid()) { return; }
+        const slot: LValue = this.entry_spill_slot(lty, "argtemp");
+        if (!slot.is_valid()) { return; }
+        this.cg.builder.build_store(arg_val, slot);
+        this.record_arg_temp_slot(slot, ty, arg_expr.span);
+    }
+
+    /// Does the method invoked by `node` consume its receiver by value (an
+    /// explicit by-value `this` or an `![sink]`)?  Mirrors DropInsertion's check
+    /// exactly (resolved method first, then a receiver-type + name fallback for
+    /// monomorphized generics) so the two passes agree on which receivers are
+    /// moved into the call - the invariant that keeps a consumed anonymous
+    /// receiver from being both dropped here and left for some other pass.
+    call_consumes_receiver(&this, node: CallExprNode*, ma: MemberAccessNode*) -> boolean {
+        const arena: TypeArena* = this.cg.get_arena();
+        if (arena == null) { return false; }
+        const intern: InternTable* = this.cg.get_intern();
+        if (node.resolved_method != null) {
+            const m: MethodNode* = node.resolved_method as MethodNode*;
+            if (OwnershipQuery::method_consumes_receiver(arena, intern, m)) { return true; }
+        }
+        if (ma.object == null) { return false; }
+        return OwnershipQuery::type_method_consumes(arena, this.cg.ctx.generic_registry,
+                                                    intern, ma.object.resolved_type, ma.member);
+    }
+
+    /// Emit the cleanup landing pad for an `invoke` under `--panic=unwind`.
+    /// Builds the `{ ptr, i32 }` `landingpad` at the head of `lpad_bb`
+    /// (cleanup-only: no catch clause, so the personality runs destructors and
+    /// keeps unwinding rather than catching here), replays the call's drop
+    /// schedule (`node.unwind_cleanup`, innermost-first) so live locals are
+    /// freed on the unwind path, then `resume`s into the caller's frame.
+    /// Attaches `__cryo_personality_v0` to the enclosing function (idempotent).
+    /// The builder is restored to the block it was called in (the invoke's
+    /// normal continuation) so normal-path codegen resumes there.
+    ///
+    /// The `landingpad` must be the first instruction in `lpad_bb`, so it is
+    /// emitted before the drops; the drops themselves may open init-flag
+    /// branches, leaving the builder at a later merge block, so `resume` is
+    /// emitted wherever the last drop left off (still dominated by the
+    /// landingpad, which is legal).
+    /// The schedule-driven core lives on `ExprOps` (reachable from the
+    /// synthesized-check origins too); this forwards the ordinary-call schedule
+    /// to it.
+    emit_cleanup_landingpad(mut &this, visitor: ASTVisitor*, node: CallExprNode*,
+                            cur_fn: LValue, lpad_bb: LBasicBlock) -> void {
+        this.cg.expr_ops.emit_cleanup_landingpad_sched(
+            visitor, &node.unwind_cleanup, cur_fn, lpad_bb);
+    }
+
+    /// Direct-panic origin under `--panic=unwind`: emit the raising
+    /// `__cryo_panic(msg,file,line)` funnel as an `invoke` into a cleanup
+    /// landing pad that drops the frame's live locals (innermost-first) before
+    /// the unwind continues, then `resume`s.  Without this the panic intrinsic
+    /// lowers to a plain `call` (`emit_panic_call`) that bypasses the ordinary
+    /// call's invoke-swap, so a droppable local live at the panic point leaks.
+    /// Reuses `node.unwind_cleanup` (DropInsertion populates it for EVERY call,
+    /// panic included).  Only taken when the frame has live droppable locals and
+    /// the hosted raising funnel applies; the plain-call fast-path (empty
+    /// schedule / abort mode / freestanding trap) stays byte-identical through
+    /// `emit_panic_call`.
+    emit_panic_unwind(mut &this, visitor: ASTVisitor*, node: CallExprNode*,
+                      msg: LValue, file: LValue, line: LValue) -> void {
+        const cur_fn: LValue = this.get_current_function();
+        if (!cur_fn.is_valid()) {
+            // No enclosing function to hang a landing pad on; diverge plainly.
+            this.cg.intrinsics.emit_panic_call(msg, file, line);
+            return;
+        }
+        const cont_bb: LBasicBlock = LBasicBlock::append(cur_fn, "panic.cont");
+        const lpad_bb: LBasicBlock = LBasicBlock::append(cur_fn, "panic.lpad");
+
+        const panic_fn: LValue = this.cg.intrinsics.get_or_decl_cryo_panic();
+        const fty: LType = LType { raw: llvm::LLVMGlobalGetValueType(panic_fn.raw) };
+        const arg_buf: void* = intrinsics::malloc(24);
+        const arg_slots: void** = arg_buf as void**;
+        arg_slots[0] = msg.raw;
+        arg_slots[1] = file.raw;
+        arg_slots[2] = line.raw;
+
+        // Arm the invoke swap so `build_call_maybe_invoke` emits
+        // `invoke @__cryo_panic(...) to cont unwind lpad` and leaves the builder
+        // at `cont`.
+        this.cg.expr_ops.invoke_active = true;
+        this.cg.expr_ops.invoke_normal = cont_bb;
+        this.cg.expr_ops.invoke_lpad   = lpad_bb;
+        this.cg.expr_ops.build_call_maybe_invoke(fty, panic_fn, arg_buf, 3, "");
+        this.cg.expr_ops.invoke_active = false;
+        intrinsics::free(arg_buf);
+
+        // The funnel is noreturn: its invoke normal-dest is unreachable.
+        this.cg.builder.build_unreachable();
+
+        // Cleanup pad: drop the frame's live locals, then resume the unwind.
+        this.emit_cleanup_landingpad(visitor, node, cur_fn, lpad_bb);
+
+        this.state.last_value = LValue::null();
+        this.state.last_is_lvalue = false;
+    }
+
+    /// Lower the `try_catch(body, data)` catch_unwind primitive.  `body` is an
+    /// opaque `(void*) -> void` trampoline (the stdlib `catch_unwind` wrapper
+    /// builds it, capturing the real body fn-ptr + the result slot in `data`),
+    /// so this lowering needs no knowledge of the caught value's type.
+    ///
+    /// Under `--panic=unwind`:
+    ///   invoke body(data) to cu.cont unwind cu.lpad
+    /// cu.cont:  br cu.done                        ; body returned normally
+    /// cu.lpad:  landingpad {ptr,i32} catch null   ; a panic unwound to here
+    ///           br cu.done
+    /// cu.done:  %caught = phi i1 [false,cu.cont],[true,cu.lpad]
+    /// yielding `%caught` (boolean).  The pad is catch-all + UNCONDITIONAL (it
+    /// never inspects the selector): every Cryo panic that unwinds this far is
+    /// caught.  Attaching a catch clause here is what makes this frame the
+    /// Itanium phase-1 handler, so the intermediate frames' cleanup landing
+    /// pads (Phase C) actually run their drops in phase 2.
+    ///
+    /// `catch_unwind` requires `--panic=unwind`: it is meaningless under the
+    /// abort strategy (a panic terminates the process rather than unwinding, so
+    /// there is nothing to catch) and its runtime payload accessors live only in
+    /// the unwind tier.  Off `--panic=unwind` this is a clear compile error
+    /// rather than a plain call that would fail to link with undefined
+    /// `__cryo_panic_taken_*` symbols.  The default path never reaches here (the
+    /// stdlib `catch_unwind` is generic and uninstantiated unless a program
+    /// calls it), so this leaves the default IR byte-identical.
+    emit_catch_unwind(mut &this, visitor: ASTVisitor*, node: CallExprNode*) -> void {
+        if (node.arguments.length != 2) {
+            this.cg.diag.emit_error_at_span(ErrorCode::E0636_UNDEFINED_FUNCTION_CALL,
+                "codegen: try_catch expects exactly two arguments (body, data)",
+                node.span);
+            this.state.last_value = LValue::null();
+            this.state.last_is_lvalue = false;
+            return;
+        }
+
+        if (!this.cg.ctx.project_panic_unwind) {
+            this.cg.diag.emit_error_at_span(ErrorCode::E0600_CODEGEN_FAILED,
+                "`catch_unwind` requires the unwinding panic strategy; rebuild with `--panic=unwind` (or set `panic = \"unwind\"` in cryoconfig). Under the default `--panic=abort` a panic terminates the process, so there is nothing to catch.",
+                node.span);
+            this.state.last_value = LValue::null();
+            this.state.last_is_lvalue = false;
+            return;
+        }
+
+        const body_ptr: LValue = this.dispatch.codegen_rvalue(visitor, node.arguments[0]);
+        const data_ptr: LValue = this.dispatch.codegen_rvalue(visitor, node.arguments[1]);
+        if (!body_ptr.is_valid() || !data_ptr.is_valid()) {
+            this.state.last_value = LValue::null();
+            this.state.last_is_lvalue = false;
+            return;
+        }
+
+        // Trampoline LLVM type: `void (ptr)`.
+        const ptr_ty: LType = LType::pointer_to(LType::i8());
+        const param_buf: void* = intrinsics::malloc(8);
+        const param_slots: void** = param_buf as void**;
+        param_slots[0] = ptr_ty.raw;
+        const body_fty: LType = LType::function_type(LType::void_type(), param_buf, 1, false);
+        intrinsics::free(param_buf);
+
+        const arg_buf: void* = intrinsics::malloc(8);
+        const arg_slots: void** = arg_buf as void**;
+        arg_slots[0] = data_ptr.raw;
+
+        const bool_ty: LType = LType::i1();
+
+        const cur_fn: LValue = this.get_current_function();
+        if (!cur_fn.is_valid()) {
+            intrinsics::free(arg_buf);
+            this.state.last_value = LValue::null();
+            this.state.last_is_lvalue = false;
+            return;
+        }
+
+        const cont_bb: LBasicBlock = LBasicBlock::append(cur_fn, "cu.cont");
+        const lpad_bb: LBasicBlock = LBasicBlock::append(cur_fn, "cu.lpad");
+        const done_bb: LBasicBlock = LBasicBlock::append(cur_fn, "cu.done");
+
+        // Any function with a landing pad needs the personality attached.
+        const pers: LValue = this.cg.expr_ops.get_or_decl_personality();
+        if (pers.is_valid()) { cur_fn.set_personality_fn(pers); }
+
+        // `invoke` is a terminator; the builder must be repositioned to a real
+        // block before any further emission (done below at cont_bb).
+        this.cg.builder.build_invoke(body_fty, body_ptr, arg_buf, 1, cont_bb, lpad_bb, "");
+        intrinsics::free(arg_buf);
+
+        const false_val: LValue = LType::const_int(bool_ty, 0, false);
+        const true_val: LValue = LType::const_int(bool_ty, 1, false);
+
+        // Normal edge: body returned; nothing was caught.
+        this.cg.builder.position_at_end(cont_bb);
+        this.cg.builder.build_br(done_bb);
+
+        // Unwind edge: catch-all landing pad.  The landingpad must be the first
+        // non-phi instruction in the block.  No `set_cleanup` - the catch
+        // clause alone makes this the phase-1 handler.
+        this.cg.builder.position_at_end(lpad_bb);
+        const lpad_ty: LType = this.cg.expr_ops.landingpad_type();
+        const lp: LValue = this.cg.builder.build_landing_pad(lpad_ty, 1, "cu.eh");
+        lp.add_clause(LType::const_pointer_null(ptr_ty));
+        this.cg.builder.build_br(done_bb);
+
+        // Merge: caught flag.
+        this.cg.builder.position_at_end(done_bb);
+        const phi: LValue = this.cg.builder.build_phi(bool_ty, "cu.caught");
+        const vals_buf: void* = intrinsics::malloc(16);
+        const vals: void** = vals_buf as void**;
+        vals[0] = false_val.raw;
+        vals[1] = true_val.raw;
+        const blks_buf: void* = intrinsics::malloc(16);
+        const blks: void** = blks_buf as void**;
+        blks[0] = cont_bb.raw;
+        blks[1] = lpad_bb.raw;
+        phi.add_incoming(vals_buf, blks_buf, 2);
+        intrinsics::free(vals_buf);
+        intrinsics::free(blks_buf);
+
+        this.state.last_value = phi;
         this.state.last_is_lvalue = false;
     }
 
@@ -1277,11 +1685,48 @@ type struct CallEmitter {
             }
             return true;
         }
-        // Optional / tuple glue is not yet emitted.  Returning true (no-op)
-        // keeps these compiling with today's behavior rather than erroring;
-        // user-written `T?` desugars to Option<T> (an Enum, handled above),
-        // so this only affects bare tuples of owned elements.
+        if (t.kind == TypeKind::Tuple) {
+            const tt: TupleType* = t as TupleType*;
+            this.emit_tuple_element_drops(visitor, receiver, tt);
+            return true;
+        }
+        // User-written `T?` desugars to Option<T> (an Enum, handled above), so
+        // no Optional type reaches here; anything else that does owns nothing.
         return true;
+    }
+
+    /// Drop each owning element of a tuple in place via synthesized
+    /// `receiver.N.drop()` calls.  Tuple positional access is a member access
+    /// whose member symbol is the decimal index (see `place_emitter`'s Tuple
+    /// branch), so the element access is built exactly like a struct field's
+    /// and re-enters the normal `.drop()` lowering - elements without a user
+    /// drop recurse back through glue.
+    emit_tuple_element_drops(mut &this, visitor: ASTVisitor*,
+                             receiver: ExpressionNode*, tt: TupleType*) -> void {
+        if (tt == null) { return; }
+        const arena: TypeArena* = this.cg.get_arena();
+        if (arena == null) { return; }
+        const registry: GenericRegistry* = this.cg.ctx.generic_registry;
+        const intern: InternTable* = this.cg.get_intern();
+        const drop_sym: SymbolStr = intern.intern("drop");
+        for (mut i: i64 = 0; i < tt.elements.length; i++) {
+            const elem_type: TypeRef = tt.elements[i];
+            if (!OwnershipQuery::needs_drop(arena, registry, intern, elem_type)) {
+                continue;
+            }
+            const idx_sym: SymbolStr = intern.intern(format("%ld", i));
+            mut elem_access: MemberAccessNode* = new MemberAccessNode(
+                receiver, idx_sym, receiver.span, receiver.span);
+            elem_access.set_resolved_type(elem_type);
+            mut drop_access: MemberAccessNode* = new MemberAccessNode(
+                elem_access as ExpressionNode*, drop_sym,
+                receiver.span, receiver.span);
+            mut call: CallExprNode* = new CallExprNode(
+                drop_access as ExpressionNode*, receiver.span);
+            mut stmt: ExprStmtNode* = new ExprStmtNode(
+                call as ExpressionNode*, receiver.span);
+            stmt.accept(visitor);
+        }
     }
 
     /// Drop each element of a fixed-size array in place via synthesized
@@ -1403,15 +1848,20 @@ type struct CallEmitter {
             sw.add_case(LType::const_int(LType::i32(), v.tag_value, false), drop_bb);
             this.cg.builder.position_at_end(drop_bb);
 
-            mut running: u64 = 0;
+            // Field offsets from the single layout authority
+            // (TypeArena::variant_payload_layout) - the SAME align-up
+            // offsets construction stored the fields at.  The packed
+            // running sum this replaced dropped e.g. `V(u32, String)`'s
+            // String from packed offset 4 while construction wrote it at
+            // aligned offset 8 - freeing a garbage pointer.
+            const offsets: u64[] = arena.variant_payload_layout(v, null, null);
             for (mut pos: i64 = 0; pos < v.payload_types.length; pos++) {
                 const pt: TypeRef = v.payload_types[pos];
-                const ft: Type* = this.cg.lookup_type_by_id(pt.id);
                 if (OwnershipQuery::needs_drop(arena, registry, intern, pt)) {
-                    // field_ptr = payload base + running (byte offset)
+                    // field_ptr = payload base + offsets[pos] (byte offset)
                     mut field_ptr_raw: LValue = payload_ptr;
-                    if (running != 0) {
-                        const byte_off: LValue = LType::const_int(LType::i64(), running, false);
+                    if (offsets[pos] != 0) {
+                        const byte_off: LValue = LType::const_int(LType::i64(), offsets[pos], false);
                         const obuf: void* = intrinsics::malloc(8);
                         const obuf_arr: void** = obuf as void**;
                         obuf_arr[0] = byte_off.raw;
@@ -1439,7 +1889,6 @@ type struct CallEmitter {
                         call as ExpressionNode*, receiver.span);
                     stmt.accept(visitor);
                 }
-                if (ft != null) { running = running + ft.size_bytes(); }
             }
 
             // Branch to the merge block from wherever payload drops left the

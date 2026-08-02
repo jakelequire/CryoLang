@@ -1,0 +1,966 @@
+///! std::future::executor: a multi-threaded, poll-driven task executor.
+///!
+///! An `Executor` owns a mutex+condvar-guarded FIFO of ready tasks and a pool of
+///! `pthread` workers that drive them by polling. A task is a heap-boxed,
+///! type-erased future plus a manual vtable (`poll_fn`/`drop_fn`/`dispose_fn`),
+///! so futures of different concrete types share one queue — the same
+///! non-capturing-fn-ptr + `void*` erasure the `Waker`, `catch_unwind`, and
+///! `thread::spawn` use. Each poll hands the future a `Waker` whose `wake()`
+///! reschedules the task; a future that returns `Pending` after arranging to be
+///! woken (today, by calling `cx.waker.wake()` itself — a real reactor arrives in
+///! Phase 4) is re-enqueued and polled again.
+///!
+///! `Executor::new()` sizes the worker pool to the hardware thread count (use
+///! `with_threads(n)` to pick a count). `spawn(fut)` returns a
+///! `JoinHandle<Output>` and the workers begin driving it immediately;
+///! `block_on(root)` spawns `root` and blocks the calling thread on a completion
+///! condvar until a worker finishes it, then returns its value. `join`/`block_on`
+///! never poll on the calling thread — the workers own all polling.
+///!
+///! ## Concurrent-poll safety
+///!
+///! With ≥2 workers a task can be woken (by itself mid-poll, or later by another
+///! thread) while a worker is already polling it. Polling one future from two
+///! workers at once is a data race, so each task carries an atomic run-state —
+///! `IDLE`/`SCHEDULED`/`RUNNING`/`NOTIFIED` — and a task is enqueued at most once
+///! and polled by at most one worker: `wake()` moves `IDLE→SCHEDULED` (and
+///! enqueues) or `RUNNING→NOTIFIED` (defers — the running worker reschedules); a
+///! worker moves `SCHEDULED→RUNNING` to poll, then `RUNNING→IDLE` on a quiet
+///! `Pending` or re-schedules on `NOTIFIED`. This is the standard
+///! tokio/`async-task` machine. (It is a per-task *state machine*, not a
+///! refcount: Phase-3 wakers never outlive a poll, so there is nothing to
+///! reference-count yet — waker refcounting arrives with the Phase-4 reactor.)
+///!
+///! ## Task isolation
+///!
+///! Under `--panic=unwind` the poll boundary runs inside `intrinsics::try_catch`
+///! (via the `run_poll` trampoline, mirroring `panic_unwind::run_catch_body`): a
+///! panicking task is caught, finishes with outcome `PANICKED`, and its `join`
+///! returns `Err(Panicked)` — its sibling tasks keep running. `try_catch` is a
+///! compile error under the default `--panic=abort`, so the catch path is gated
+///! `![config(panic_unwind)]`; under abort the boundary is a plain direct call
+///! and a task panic aborts the whole process (the accepted degradation).
+///!
+///! ## Lifetime
+///!
+///! Task/handle lifetime is a two-actor handshake on a `TaskShared` control
+///! block, exactly like `thread::spawn`: whichever of {the finishing task, the
+///! joining/detaching handle} acts last frees the block. A `JoinHandle` dropped
+///! without `join`/`detach` detaches (the task runs on, its result discarded);
+///! `abort()` requests cancellation, and the task is reclaimed — its `Output`
+///! never produced — the next time a worker reaches it. Dropping the `Executor`
+///! signals shutdown, joins the workers, then reclaims any still-queued tasks.
+
+namespace std::future::executor;
+
+import core::intrinsics;
+import core::ptr;
+import core::result;
+import core::drop;
+import core::panic_unwind;
+import alloc::layout;
+import alloc::allocator;
+import alloc::arc;
+import sync::atomic;
+import ffi::libc;
+import sys::syscall;
+import collections::array;
+import future::poll;
+import future::waker;
+import future::traits;
+import future::reactor;
+import future::blocking;
+
+
+// Task outcome (published by the executor when a task finishes), read by a
+// joining handle to build its result.
+const OUTCOME_PENDING:   u8 = 0u8;   // not finished
+const OUTCOME_READY:     u8 = 1u8;   // completed; `result` is stored
+const OUTCOME_CANCELLED: u8 = 2u8;   // aborted or unreschedulable; no result
+const OUTCOME_PANICKED:  u8 = 3u8;   // panicked while polling; `panic` is stored
+
+// Two-actor handshake over the shared block: whoever swaps in last (observing
+// the other side already gone) frees it. Mirrors `thread::spawn`'s state byte.
+const HS_LIVE:        u8 = 0u8;   // task running, handle live
+const HS_TASK_FIN:    u8 = 1u8;   // task finished (outcome published)
+const HS_HANDLE_GONE: u8 = 2u8;   // handle detached/dropped without joining
+
+// Per-task run-state (atomic): governs which worker may poll a task and whether
+// a wake must enqueue it. See the module doc "Concurrent-poll safety".
+const ST_IDLE:      u8 = 0u8;   // not queued, not running
+const ST_SCHEDULED: u8 = 1u8;   // linked in the ready queue
+const ST_RUNNING:   u8 = 2u8;   // a worker is polling it
+const ST_NOTIFIED:  u8 = 3u8;   // woken while RUNNING; reschedule after the poll
+
+
+// ---------------------------------------------------------------------------
+// Per-OS lock/cond primitives. The executor embeds its own mutex (u8[40]) + cond
+// (u8[48]) buffers; on Windows those hold an SRWLOCK + CONDITION_VARIABLE with
+// room to spare, and a zero buffer is the valid init state for both platforms.
+// ConfigGating only evaluates file-scope declarations (never method bodies), so
+// every OS call lives in one of these gated free functions and the methods
+// delegate. See sync::mpsc, which uses the identical idiom.
+// ---------------------------------------------------------------------------
+
+![target(unix)]
+private function exec_mtx_init(b: u8*) -> i32 { return pthread_mutex_init(b, null); }
+![target(windows)]
+private function exec_mtx_init(b: u8*) -> i32 { syscall::InitializeSRWLock(b); return 0; }
+
+![target(unix)]
+private function exec_mtx_lock(b: u8*) -> void { pthread_mutex_lock(b); }
+![target(windows)]
+private function exec_mtx_lock(b: u8*) -> void { syscall::AcquireSRWLockExclusive(b); }
+
+![target(unix)]
+private function exec_mtx_unlock(b: u8*) -> void { pthread_mutex_unlock(b); }
+![target(windows)]
+private function exec_mtx_unlock(b: u8*) -> void { syscall::ReleaseSRWLockExclusive(b); }
+
+![target(unix)]
+private function exec_mtx_destroy(b: u8*) -> void { pthread_mutex_destroy(b); }
+![target(windows)]
+private function exec_mtx_destroy(b: u8*) -> void { }
+
+![target(unix)]
+private function exec_cond_init(b: u8*) -> i32 { return pthread_cond_init(b, null); }
+![target(windows)]
+private function exec_cond_init(b: u8*) -> i32 { syscall::InitializeConditionVariable(b); return 0; }
+
+![target(unix)]
+private function exec_cond_destroy(b: u8*) -> void { pthread_cond_destroy(b); }
+![target(windows)]
+private function exec_cond_destroy(b: u8*) -> void { }
+
+![target(unix)]
+private function exec_cond_wait(c: u8*, m: u8*) -> void { pthread_cond_wait(c, m); }
+![target(windows)]
+private function exec_cond_wait(c: u8*, m: u8*) -> void {
+    syscall::SleepConditionVariableSRW(c, m, 0xFFFFFFFF, 0);
+}
+
+![target(unix)]
+private function exec_cond_signal(b: u8*) -> void { pthread_cond_signal(b); }
+![target(windows)]
+private function exec_cond_signal(b: u8*) -> void { syscall::WakeConditionVariable(b); }
+
+![target(unix)]
+private function exec_cond_broadcast(b: u8*) -> void { pthread_cond_broadcast(b); }
+![target(windows)]
+private function exec_cond_broadcast(b: u8*) -> void { syscall::WakeAllConditionVariable(b); }
+
+
+/// Non-generic control header, laid out at offset 0 of every `TaskShared<O>`, so
+/// the type-erased executor reads/writes a task's outcome, handshake, cancel
+/// flag, and (on the panic path) captured `PanicInfo` through a `TaskCtl*`
+/// without knowing `O`.
+type struct TaskCtl {
+    outcome: Atomic<u8>;   // OUTCOME_*
+    hs:      Atomic<u8>;   // HS_*
+    cancel:  Atomic<u8>;   // 1 == abort requested by the handle
+    panic:   PanicInfo;    // valid only when outcome == OUTCOME_PANICKED
+}
+
+/// The control block shared between a task and its `JoinHandle<O>`. Outlives the
+/// task so `join` can read the result after the task finishes. `result` is
+/// uninitialized until the task stores it on the READY path; the handshake
+/// guarantees it is read/dropped exactly once and never before the store.
+type struct TaskShared<O> {
+    ctl:    TaskCtl;
+    result: O;
+}
+
+/// Handle-side teardown (detach or drop): announce the handle is gone, and if
+/// the task already finished, reclaim the block here (dropping a stored result).
+/// Otherwise the task frees it when it finishes and observes HS_HANDLE_GONE.
+///
+/// A free generic function rather than a `TaskShared<O>` static method: a static
+/// method on a generic owner reached only through another generic's instantiation
+/// (here `JoinHandle<O>`) is not emitted by the monomorphizer (E0636 at codegen).
+/// The free generic function is the proven form (mirrors `thread::reap_detached`).
+function detach_shared<O>(sh: TaskShared<O>*) -> void {
+    const ctl: TaskCtl* = &sh.ctl;
+    const prev: u8 = ctl.hs.swap(HS_HANDLE_GONE, MemoryOrder::AcqRel);
+    if (prev == HS_TASK_FIN) {
+        const outcome: u8 = ctl.outcome.load(MemoryOrder::Acquire);
+        mut alloc: GlobalAlloc = GlobalAlloc::new();
+        if (outcome == OUTCOME_READY) {
+            const rp: O* = &sh.result;
+            rp.drop();
+        }
+        alloc.deallocate(NonNull::new(sh as u8*), Layout::of<TaskShared<O>>());
+    }
+    // else: task still running; it frees the block when it observes GONE.
+}
+
+/// A heap-boxed, type-erased task on an executor's queue. The concrete future
+/// lives in the `fut` box; `poll_fn`/`drop_fn`/`dispose_fn` are its
+/// monomorphized vtable. `shared` points at the `TaskShared<O>` (and, at offset
+/// 0, the `TaskCtl`). `next` links the ready queue; `exec` lets a `Waker` reach
+/// the queue/condvars; `run_state` is the concurrent-poll guard (module doc).
+type struct Task {
+    poll_fn:    (u8*, u8*, Context*) -> u8;   // (fut, shared, cx) -> 1 Ready / 0 Pending
+    drop_fn:    (u8*) -> void;                 // drop the boxed future, free its box
+    dispose_fn: (u8*, u8) -> void;             // (shared, drop_result) -> free the shared block
+    fut:        u8*;
+    shared:     u8*;
+    next:       Task*;
+    exec:       ExecInner*;
+    run_state:  Atomic<u8>;
+    self_arc:   ArcInner<Task, GlobalAlloc>*;   // the box's own Arc header (for incref/decref)
+
+    /// Build a ready-to-enqueue task around a boxed future + its shared control
+    /// block. `run_state` starts SCHEDULED (the caller enqueues immediately) and
+    /// `next` is unlinked; the vtable fn-ptrs are the future's monomorphized
+    /// thunks. `self_arc` is null here — `spawn_on` wires it after `Arc::new`
+    /// places this value in its header. Returned by value and moved into that
+    /// `Arc<Task>`.
+    static new(poll_fn:    (u8*, u8*, Context*) -> u8,
+               drop_fn:    (u8*) -> void,
+               dispose_fn: (u8*, u8) -> void,
+               fut:        u8*,
+               shared:     u8*,
+               exec:       ExecInner*) -> Task {
+        return Task {
+            poll_fn:    poll_fn,
+            drop_fn:    drop_fn,
+            dispose_fn: dispose_fn,
+            fut:        fut,
+            shared:     shared,
+            next:       null,
+            exec:       exec,
+            run_state:  Atomic<u8>::new(ST_SCHEDULED),
+            self_arc:   null,
+        };
+    }
+
+    /// Poll this task once. Returns true when the task re-enqueued itself — a
+    /// self-wake during the poll transferred the scheduling reference back to
+    /// the queue, so the caller must NOT release it — and false when it finished
+    /// or parked, in which case the caller releases the scheduling reference via
+    /// `task_decref`. The last release runs `Task::drop`, which finishes a
+    /// still-unfinished (parked, never re-woken) task as CANCELLED before the
+    /// box is freed. Honors a pending abort without polling. `&this` IS the heap
+    /// box address, so the owning `Waker` carries it.
+    drive(mut &this) -> boolean {
+        const ctl: TaskCtl* = this.shared as TaskCtl*;
+        if (ctl.cancel.load(MemoryOrder::Acquire) == 1) {
+            this.finish(OUTCOME_CANCELLED);
+            return false;
+        }
+        // The poll's `Waker` owns one reference — bumped here, released when
+        // `cx` drops at the end of this method — so any clone the future stores
+        // is a genuine extra reference that keeps the task alive while parked.
+        // The worker's scheduling reference outlives this method, so this bump
+        // is never the last: `cx`'s drop cannot free the box mid-poll.
+        task_incref(&this);
+        mut cx: Context = Context::new(Waker::new(task_wake, waker_arc_clone,
+                                                  waker_arc_drop, &this as u8*));
+        mut pinfo: PanicInfo = PanicInfo { msg: "", file: "", line: 0 };
+        const status: u8 = poll_boundary(this.poll_fn, this.fut, this.shared, &cx, &pinfo);
+        if (status == 2) {
+            ctl.panic = pinfo;
+            this.finish(OUTCOME_PANICKED);
+            return false;
+        }
+        if (status == 1) {
+            this.finish(OUTCOME_READY);
+            return false;
+        }
+        // Pending. A wake during the poll left the state NOTIFIED; reschedule,
+        // transferring the scheduling reference back to the queue. Otherwise the
+        // state is still RUNNING and the task parks: a stored waker will wake it,
+        // or none will and the final `task_decref` cancels it via `Task::drop`.
+        match (this.run_state.compare_exchange(ST_RUNNING, ST_IDLE,
+                                               MemoryOrder::AcqRel, MemoryOrder::Acquire)) {
+            Result::Ok(_) => {
+                return false;
+            }
+            Result::Err(_) => {
+                this.run_state.store(ST_SCHEDULED, MemoryOrder::Release);
+                this.exec.enqueue(&this);
+                return true;
+            }
+        }
+    }
+
+    /// Finish this task: drop its future, publish `outcome`, run the shared-block
+    /// handshake, and wake any joiner. Does NOT free the task box (the owning
+    /// `Arc<Task>` reclaims it when the last reference drops). Nulls `fut` after
+    /// dropping the future so `Task::drop` knows finishing already ran and does
+    /// not repeat it. On READY the future's `Output` was already moved into the
+    /// shared block; on CANCELLED/PANICKED there is no result. Called at most
+    /// once per task (from `drive`, or from `Task::drop` when `fut` is non-null).
+    finish(mut &this, outcome: u8) -> void {
+        const ctl:  TaskCtl*      = this.shared as TaskCtl*;
+        const exec: ExecInner*    = this.exec;
+        const df:   (u8*) -> void = this.drop_fn;
+        df(this.fut);
+        this.fut = null;
+        ctl.outcome.store(outcome, MemoryOrder::Release);
+        const prev: u8 = ctl.hs.swap(HS_TASK_FIN, MemoryOrder::AcqRel);
+        if (prev == HS_HANDLE_GONE) {
+            // No handle will read the block: dispose it here (drop the stored
+            // result only on READY). This swap was our last touch of the block.
+            const disp: (u8*, u8) -> void = this.dispose_fn;
+            mut drop_result: u8 = 0;
+            if (outcome == OUTCOME_READY) { drop_result = 1; }
+            disp(this.shared, drop_result);
+        } else {
+            // Handle live: a joiner may be blocked on the completion condvar. The
+            // hs.swap above (Release) published HS_TASK_FIN — our last touch of
+            // the block; the joiner observes it and then owns reading+freeing the
+            // block, so we must not touch `ctl` after the broadcast below.
+            exec_mtx_lock(&exec.d_mutex[0]);
+            exec_cond_broadcast(&exec.d_cond[0]);
+            exec_mtx_unlock(&exec.d_mutex[0]);
+        }
+    }
+
+}
+
+/// Reclaim a task whose last reference is dropping. If it never finished
+/// (`fut` still non-null — it parked and was never re-woken, or the executor is
+/// tearing down), finish it as CANCELLED first so its future is dropped and any
+/// joiner is released; a finished task (`fut` null) needs nothing more. The
+/// `Arc<Task>` frees the box itself after this runs. Invoked by the `Arc` teardown
+/// through `task_decref`, never directly.
+implement trait Drop for struct Task {
+    drop(mut &this) -> void {
+        if (this.fut != null) {
+            this.finish(OUTCOME_CANCELLED);
+        }
+    }
+}
+
+/// The shared executor state: a mutex+condvar-guarded FIFO of ready tasks plus a
+/// second mutex+condvar joiners block on. Heap-pinned so a `Task`'s `exec`
+/// back-pointer and the worker threads reference a stable address (the pthread
+/// buffers must not move after init while threads block on them).
+type struct ExecInner {
+    q_mutex:  u8[40];   // guards head/tail/shutdown (pthread_mutex_t, Linux x86_64)
+    q_cond:   u8[48];   // workers wait here for work (pthread_cond_t)
+    d_mutex:  u8[40];   // guards the completion signal
+    d_cond:   u8[48];   // joiners wait here for a task to finish
+    head:     Task*;    // dequeue end (null when empty)
+    tail:     Task*;    // enqueue end
+    shutdown: boolean;  // set at Executor drop; guarded by q_mutex
+    reactor:  Reactor*; // the I/O driver this pool's workers publish while polling
+    blocking: BlockingPool*;   // where workers offload calls the reactor cannot drive
+
+    /// Link `task` at the tail of the ready queue and wake one worker. The
+    /// caller has already set `task.run_state = ST_SCHEDULED`, so a concurrent
+    /// `wake()` sees SCHEDULED and does not double-link.
+    enqueue(mut &this, task: Task*) -> void {
+        exec_mtx_lock(&this.q_mutex[0]);
+        task.next = null;
+        if (this.tail == null) {
+            this.head = task;
+            this.tail = task;
+        } else {
+            this.tail.next = task;
+            this.tail = task;
+        }
+        exec_cond_signal(&this.q_cond[0]);
+        exec_mtx_unlock(&this.q_mutex[0]);
+    }
+
+    /// Block until a task is ready or shutdown is signaled. Returns the dequeued
+    /// task (already transitioned to ST_RUNNING under the lock so no second
+    /// worker can claim it), or null once shutdown is set (leaving any remaining
+    /// queued tasks for `Executor::drop` to reclaim).
+    take(mut &this) -> Task* {
+        exec_mtx_lock(&this.q_mutex[0]);
+        while (this.head == null && !this.shutdown) {
+            exec_cond_wait(&this.q_cond[0], &this.q_mutex[0]);
+        }
+        if (this.shutdown) {
+            exec_mtx_unlock(&this.q_mutex[0]);
+            return null;
+        }
+        const t: Task* = this.head;
+        this.head = t.next;
+        if (this.head == null) { this.tail = null; }
+        t.next = null;
+        // Claim the task for this worker before releasing the lock, so a wake
+        // between dequeue and poll takes the RUNNING→NOTIFIED path (deferred
+        // reschedule) rather than re-linking an already-dequeued task.
+        t.run_state.store(ST_RUNNING, MemoryOrder::Release);
+        exec_mtx_unlock(&this.q_mutex[0]);
+        return t;
+    }
+
+    /// Reclaim every still-queued task (called from `Executor::drop` after the
+    /// workers have joined, so no locking is needed). Releasing each task's
+    /// scheduling reference — the last reference for a never-driven task — runs
+    /// `Task::drop`, which finishes it CANCELLED (its future's drop + the
+    /// shared-block handshake) and frees the box; tasks never driven would
+    /// otherwise leak their boxed futures.
+    drain_cancelled(mut &this) -> void {
+        loop {
+            const t: Task* = this.head;
+            if (t == null) { break; }
+            this.head = t.next;
+            if (this.head == null) { this.tail = null; }
+            task_decref(t);
+        }
+    }
+}
+
+
+/// Acquire one strong reference to `task`'s box. The owning waker's `clone_fn`
+/// and the wake path (handing the ready queue its own reference) call this; it
+/// pairs one-for-one with `task_decref`.
+private function task_incref(task: Task*) -> void {
+    Arc<Task, GlobalAlloc>::increment_strong_count(task.self_arc);
+}
+
+/// Release one strong reference to `task`'s box. The last release runs
+/// `Task::drop` (finishing an unfinished task) and frees the box. Pairs with
+/// `task_incref`, the initial `Arc::new` scheduling reference, and each stored
+/// waker.
+private function task_decref(task: Task*) -> void {
+    Arc<Task, GlobalAlloc>::decrement_strong_count(task.self_arc);
+}
+
+/// `Waker` `clone_fn` for an owning task waker: acquire a reference and return
+/// the same `Task*` handle, so the clone keeps the task alive until it drops. A
+/// bare fn-ptr stored in the `Waker` vtable, so a free function.
+function waker_arc_clone(data: u8*) -> u8* {
+    task_incref(data as Task*);
+    return data;
+}
+
+/// `Waker` `drop_fn` for an owning task waker: release the reference the waker
+/// held. A bare fn-ptr stored in the `Waker` vtable, so a free function.
+function waker_arc_drop(data: u8*) -> void {
+    task_decref(data as Task*);
+}
+
+/// The waker callback: `data` is the `Task*`. Reschedule it via the atomic
+/// run-state so it is enqueued at most once and never polled by two workers —
+/// see the module doc. Must be a free function: it is stored in the `Waker`
+/// vtable as a raw `(u8*) -> void` and invoked as `wake_fn(data)`, and Cryo
+/// cannot take a static method's address as a fn-ptr value (it resolves to the
+/// type, not the method) — nor could an instance method's `this`-ABI match.
+function task_wake(data: u8*) -> void {
+    const task: Task* = data as Task*;
+    loop {
+        const s: u8 = task.run_state.load(MemoryOrder::Acquire);
+        if (s == ST_IDLE) {
+            match (task.run_state.compare_exchange(ST_IDLE, ST_SCHEDULED,
+                                                   MemoryOrder::AcqRel, MemoryOrder::Acquire)) {
+                // Waking a parked task hands the ready queue a fresh scheduling
+                // reference (the waker keeps its own); the worker that later
+                // drives it releases this one. Bump BEFORE enqueue so a worker
+                // cannot dequeue-drive-and-decref it to zero before the bump.
+                Result::Ok(_)  => { task_incref(task); task.exec.enqueue(task); return; }
+                Result::Err(_) => { }   // lost the race; re-read and retry
+            }
+        } else if (s == ST_RUNNING) {
+            match (task.run_state.compare_exchange(ST_RUNNING, ST_NOTIFIED,
+                                                   MemoryOrder::AcqRel, MemoryOrder::Acquire)) {
+                Result::Ok(_)  => { return; }   // the running worker will reschedule
+                Result::Err(_) => { }
+            }
+        } else {
+            // SCHEDULED or NOTIFIED: already pending a poll; nothing to do.
+            return;
+        }
+    }
+}
+
+
+/// Context handed to the `try_catch` trampoline through one `void*`: the erased
+/// poll call plus a slot for its status byte. All-`Copy` (fn-ptr + raw pointers),
+/// so it owns nothing and is never dropped.
+type struct PollCtx {
+    poll_fn: (u8*, u8*, Context*) -> u8;
+    fut:     u8*;
+    shared:  u8*;
+    cx:      Context*;
+    status:  u8;
+}
+
+/// The void-returning trampoline `intrinsics::try_catch` invokes inside its
+/// catch pad. Recovers the poll call from `data`, runs it, and stashes the
+/// status. If the poll panics, control unwinds out before the store — straight
+/// through this frame, which owns no droppable locals — to the catch pad. A bare
+/// fn-ptr, so it must be a free function. Mirrors `panic_unwind::run_catch_body`.
+function run_poll(data: u8*) -> void {
+    const pc: PollCtx* = data as PollCtx*;
+    const pf: (u8*, u8*, Context*) -> u8 = pc.poll_fn;
+    pc.status = pf(pc.fut, pc.shared, pc.cx);
+}
+
+/// Poll boundary under the unwinding strategy: catch a panicking poll, report it
+/// as status 2 and fill `out_panic`. Gated `![config(panic_unwind)]` because
+/// `intrinsics::try_catch` and the `__cryo_panic_taken_*` accessors are a
+/// compile error / undefined symbols under `--panic=abort`. Must be a file-scope
+/// free function — ConfigGating strips declarations, not method bodies.
+![config(panic_unwind)]
+function poll_boundary(poll_fn: (u8*, u8*, Context*) -> u8, fut: u8*, shared: u8*,
+                       cx: Context*, out_panic: PanicInfo*) -> u8 {
+    mut pc: PollCtx = PollCtx { poll_fn: poll_fn, fut: fut, shared: shared,
+                               cx: cx, status: 0 };
+    const tramp: (u8*) -> void = run_poll;
+    const caught: boolean = intrinsics::try_catch(tramp as void*, &pc as void*);
+    if (caught) {
+        *out_panic = panic_unwind::taken_panic_info();
+        return 2;
+    }
+    return pc.status;
+}
+
+/// Poll boundary under the abort strategy: a plain direct poll. A panicking poll
+/// aborts the whole process (the accepted degradation — no per-task isolation
+/// without unwinding). `out_panic` is unused here.
+![config(not(panic_unwind))]
+function poll_boundary(poll_fn: (u8*, u8*, Context*) -> u8, fut: u8*, shared: u8*,
+                       cx: Context*, out_panic: PanicInfo*) -> u8 {
+    return poll_fn(fut, shared, cx);
+}
+
+
+/// Monomorphized poll thunk for a concrete future `F`: recover it from its box,
+/// poll it, and on `Ready` store the value into the shared block's `result` slot
+/// through a raw `O*` (no drop-synth on the uninitialized slot — the
+/// `thread_body` idiom). Reports readiness as a byte (1 Ready, 0 Pending). A
+/// vtable fn-ptr, addressed via the generic-function-reference mechanism (proven
+/// by `thread::thread_trampoline`), so it must be a free function.
+function task_poll_thunk<F, O>(fut_raw: u8*, shared_raw: u8*, cx: Context*) -> u8
+where F: Future<O> {
+    const fut: F* = fut_raw as F*;
+    match (fut.poll(cx)) {
+        Poll::Ready(v) => {
+            const sh: TaskShared<O>* = shared_raw as TaskShared<O>*;
+            const rptr: O* = &sh.result;
+            *rptr = v;
+            return 1;
+        }
+        Poll::Pending => { return 0; }
+    }
+}
+
+/// Monomorphized drop thunk for `F`: drop the future, free its box.
+///
+/// The future is moved out of its box into a local, whose scope-exit drop runs
+/// whatever drop glue `F` has — an explicit `Drop` impl, per-field drops, or
+/// nothing at all. Calling `.drop()` on the box directly would instead require
+/// `F` to *declare* a `drop` method, which a hand-written future may but a
+/// compiler-generated one (an `async function`'s state machine) never does. A
+/// vtable fn-ptr, so a free function.
+function task_drop_thunk<F>(fut_raw: u8*) -> void {
+    const fut: F* = fut_raw as F*;
+    // Sound because the box is released below without running the pointee's
+    // destructor, so taking the future out leaves exactly one owner.
+    mut _owned: F;
+    unsafe { _owned = *fut; }
+    mut alloc: GlobalAlloc = GlobalAlloc::new();
+    alloc.deallocate(NonNull::new(fut_raw), Layout::of<F>());
+    // `_owned` drops here, after its storage has been released.
+}
+
+/// Monomorphized dispose thunk for a shared block of result type `O`: optionally
+/// drop the stored `result` (only valid on the READY path), then free the block.
+/// The one shared-block op the type-erased executor cannot do without `O`, so it
+/// is captured as a per-`O` vtable fn-ptr.
+function dispose_shared_thunk<O>(shared_raw: u8*, drop_result: u8) -> void {
+    const sh: TaskShared<O>* = shared_raw as TaskShared<O>*;
+    if (drop_result == 1) {
+        const rp: O* = &sh.result;
+        rp.drop();
+    }
+    mut alloc: GlobalAlloc = GlobalAlloc::new();
+    alloc.deallocate(NonNull::new(shared_raw), Layout::of<TaskShared<O>>());
+}
+
+
+/// A pool worker: pull ready tasks and drive them until shutdown. The pthread
+/// entry (a `(ExecInner*) -> void` fn-ptr handed to `thread::Scope::spawn`), so
+/// a free function.
+function worker_body(inner: ExecInner*) -> void {
+    // Publish this pool's reactor and blocking pool for the thread's lifetime:
+    // every future this worker polls reaches them through `Reactor::current()` /
+    // `BlockingPool::current()`, so an I/O future can park — and a future whose
+    // work has no readiness form can offload it — without either driver being
+    // threaded through `Context`, whose shape is fixed.
+    Reactor::set_current(inner.reactor);
+    BlockingPool::set_current(inner.blocking);
+    loop {
+        const task: Task* = inner.take();
+        if (task == null) { return; }
+        // `drive` returns true when it re-enqueued the task (the scheduling
+        // reference moved back to the queue), false when it finished or parked —
+        // then release the scheduling reference this worker held.
+        const rescheduled: boolean = task.drive();
+        if (!rescheduled) { task_decref(task); }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-OS worker-thread create/join + CPU count. The executor manages its own
+// pool (rather than depending on `thread::Scope`, whose public `JoinHandle`
+// leaf-name would collide with this module's) using the same pthread/Win32
+// primitives `thread` does. ConfigGating strips file-scope decls only, so these
+// stay free functions. `worker_tramp` adapts the C entry ABI (pthread returns
+// `void*`, Win32's start routine returns `DWORD`/`u32`) around `worker_body`.
+// ---------------------------------------------------------------------------
+
+![target(unix)]
+function worker_tramp(arg: u8*) -> u8* { worker_body(arg as ExecInner*); return null; }
+![target(windows)]
+function worker_tramp(arg: u8*) -> u32 { worker_body(arg as ExecInner*); return 0; }
+
+/// Create one worker thread running `worker_tramp(inner)`, writing its joinable
+/// id/handle into `tbuf` (8 bytes). Returns 0 on success, non-zero on failure.
+![target(unix)]
+private function exec_spawn_worker(inner: ExecInner*, tbuf: u8*) -> i32 {
+    const t: (u8*) -> u8* = worker_tramp;
+    return pthread_create(tbuf, null, t as void*, inner as u8*);
+}
+![target(windows)]
+private function exec_spawn_worker(inner: ExecInner*, tbuf: u8*) -> i32 {
+    const t: (u8*) -> u32 = worker_tramp;
+    const h: u8* = syscall::CreateThread(null, 0, t as void*, inner as u8*, 0, null);
+    if (h == null) { return 11; }
+    *(tbuf as u64*) = h as u64;
+    return 0;
+}
+
+/// Block until worker `tid` exits, releasing its OS resources.
+![target(unix)]
+private function exec_join_worker(tid: u64) -> void {
+    mut ret: u8* = null;
+    pthread_join(tid, &ret);
+}
+![target(windows)]
+private function exec_join_worker(tid: u64) -> void {
+    const h: u8* = tid as u8*;
+    syscall::WaitForSingleObject(h, 0xFFFFFFFF);   // INFINITE
+    syscall::CloseHandle(h);
+}
+
+/// Hardware-thread count (the natural pool size), clamped to >= 1. Best-effort:
+/// returns 1 if the OS query fails.
+![target(unix)]
+private function exec_cpu_count() -> u32 {
+    const n: i64 = libc::sysconf(84);   // _SC_NPROCESSORS_ONLN on Linux/glibc + BSD
+    if (n <= 0) { return 1; }
+    return n as u32;
+}
+![target(windows)]
+private function exec_cpu_count() -> u32 {
+    mut si: syscall::SYSTEM_INFO_PARTIAL = syscall::SYSTEM_INFO_PARTIAL {
+        wProcessorArchitecture: 0, wReserved: 0, dwPageSize: 0,
+        lpMinimumApplicationAddress: null, lpMaximumApplicationAddress: null,
+        dwActiveProcessorMask: 0, dwNumberOfProcessors: 0,
+        dwProcessorType: 0, dwAllocationGranularity: 0,
+        wProcessorLevel: 0, wProcessorRevision: 0
+    };
+    syscall::GetSystemInfo(&si as u8*);
+    if (si.dwNumberOfProcessors == 0) { return 1; }
+    return si.dwNumberOfProcessors;
+}
+
+
+/// Box `fut` + its shared control block, wrap them in a `Task` with the
+/// monomorphized vtable, and enqueue it. Generic-function references
+/// (`task_poll_thunk<F,O>` etc.) are taken here in a free generic function — the
+/// proven addressable-generic-fn shape (cf. `thread::os_create_thread`) — so this
+/// stays a free function rather than an `Executor` method body.
+function spawn_on<F, O>(inner: ExecInner*, fut: F) -> JoinHandle<O>
+where F: Future<O> {
+    mut alloc: GlobalAlloc = GlobalAlloc::new();
+
+    mut sh: TaskShared<O>* = null;
+    match (alloc.allocate(Layout::of<TaskShared<O>>())) {
+        Result::Ok(raw) => { sh = raw.cast<TaskShared<O>>().as_ptr(); }
+        Result::Err(_)  => { panic("Executor::spawn: shared allocation failed", FILE, LINE); }
+    }
+    sh.ctl.outcome = Atomic<u8>::new(OUTCOME_PENDING);
+    sh.ctl.hs      = Atomic<u8>::new(HS_LIVE);
+    sh.ctl.cancel  = Atomic<u8>::new(0);
+    sh.ctl.panic   = PanicInfo { msg: "", file: "", line: 0 };
+
+    mut fbox: F* = null;
+    match (alloc.allocate(Layout::of<F>())) {
+        Result::Ok(raw) => { fbox = raw.cast<F>().as_ptr(); }
+        Result::Err(_)  => {
+            alloc.deallocate(NonNull::new(sh as u8*), Layout::of<TaskShared<O>>());
+            panic("Executor::spawn: future allocation failed", FILE, LINE);
+        }
+    }
+    *fbox = fut;
+
+    // Box the task inside an `Arc<Task>`: the strong count is the box's
+    // lifetime. `Arc::new`'s initial count of 1 IS the scheduling reference,
+    // handed to the ready queue by `into_raw` (which suppresses the handle's own
+    // drop). `self_arc` back-points at the header so `task_incref`/`task_decref`
+    // reach the count from any `Task*`.
+    // Box the task inside an `Arc<Task>`: the strong count is the box's
+    // lifetime. `Arc::new`'s initial count of 1 IS the scheduling reference,
+    // handed to the ready queue by `into_raw` (which suppresses the handle's own
+    // drop). `self_arc` back-points at the header so `task_incref`/`task_decref`
+    // reach the count from any `Task*`.
+    mut arc_res: Result<Arc<Task, GlobalAlloc>, AllocError> =
+        Arc::try_new(Task::new(task_poll_thunk<F, O>, task_drop_thunk<F>,
+                               dispose_shared_thunk<O>, fbox as u8*, sh as u8*, inner));
+    match (arc_res) {
+        Result::Ok(arc) => {
+            const ap: ArcInner<Task, GlobalAlloc>* = arc.into_raw();
+            ap.value.self_arc = ap;
+            inner.enqueue(&ap.value);
+        }
+        Result::Err(_)  => {
+            // `try_new` dropped the Task value; its `Drop` finished it CANCELLED
+            // and dropped the boxed future, so only the shared block remains.
+            alloc.deallocate(NonNull::new(sh as u8*), Layout::of<TaskShared<O>>());
+            panic("Executor::spawn: task allocation failed", FILE, LINE);
+        }
+    }
+
+    return JoinHandle<O> { shared: sh, exec: inner };
+}
+
+
+/// Why a `join` did not yield a value.
+type enum JoinError {
+    Cancelled;              // the task was aborted, or could not make progress
+    Panicked(PanicInfo);    // the task panicked (only under --panic=unwind)
+}
+
+
+/// A handle to a spawned task, yielding its `Output` via `join()`. Dropping a
+/// handle without `join`/`detach` detaches (the task runs on, its result
+/// discarded). `abort()` requests cancellation.
+type struct JoinHandle<O> {
+    shared: TaskShared<O>*;
+    exec:   ExecInner*;
+
+    /// Block on the completion condvar until a worker finishes this task, then
+    /// return its `Output` (or `Err` if it was aborted / could not complete /
+    /// panicked). Consumes the handle and frees the block. Waiting on the
+    /// handshake state (not merely `outcome`) guarantees the finishing worker is
+    /// past its last touch of the block before we read+free it.
+    join(mut this) -> Result<O, JoinError> {
+        // Read the fields, then null `shared` to neutralize this handle's Drop
+        // (it no-ops on a null `shared`) — the "consume" a destructure would give,
+        // without a `: JoinHandle<O>` annotation (which misresolves to
+        // `thread::JoinHandle` under `import thread`).
+        const shared: TaskShared<O>* = this.shared;
+        const exec:   ExecInner*     = this.exec;
+        this.shared = null;
+        const ctl: TaskCtl* = &shared.ctl;
+        exec_mtx_lock(&exec.d_mutex[0]);
+        while (ctl.hs.load(MemoryOrder::Acquire) != HS_TASK_FIN) {
+            exec_cond_wait(&exec.d_cond[0], &exec.d_mutex[0]);
+        }
+        exec_mtx_unlock(&exec.d_mutex[0]);
+        const outcome: u8 = ctl.outcome.load(MemoryOrder::Acquire);
+        mut alloc: GlobalAlloc = GlobalAlloc::new();
+        if (outcome == OUTCOME_READY) {
+            const rptr: O* = &shared.result;
+            const out:  O  = *rptr;
+            alloc.deallocate(NonNull::new(shared as u8*), Layout::of<TaskShared<O>>());
+            return Result::Ok(out);
+        }
+        if (outcome == OUTCOME_PANICKED) {
+            const info: PanicInfo = ctl.panic;
+            alloc.deallocate(NonNull::new(shared as u8*), Layout::of<TaskShared<O>>());
+            return Result::Err(JoinError::Panicked(info));
+        }
+        alloc.deallocate(NonNull::new(shared as u8*), Layout::of<TaskShared<O>>());
+        return Result::Err(JoinError::Cancelled);
+    }
+
+    /// Give up the ability to join. The task runs to completion independently;
+    /// its result is dropped. Consumes the handle.
+    detach(mut this) -> void {
+        const shared: TaskShared<O>* = this.shared;
+        this.shared = null;   // consume: neutralize this handle's Drop
+        detach_shared<O>(shared);
+    }
+
+    /// Request that the task be cancelled. It is reclaimed — its `Output` never
+    /// produced — the next time a worker reaches it (a subsequent `join` then
+    /// returns `Err(Cancelled)`). Does not consume the handle.
+    abort(&this) -> void {
+        const ctl: TaskCtl* = &this.shared.ctl;
+        ctl.cancel.store(1, MemoryOrder::Release);
+    }
+
+    /// True once the task has finished (completed, cancelled, or panicked).
+    /// Never blocks and does not consume the handle.
+    is_finished(&this) -> boolean {
+        const ctl: TaskCtl* = &this.shared.ctl;
+        return ctl.outcome.load(MemoryOrder::Acquire) != OUTCOME_PENDING;
+    }
+}
+
+/// Dropping a handle without `join`/`detach` detaches the task, so it and its
+/// control block are still reclaimed. `join`/`detach` destructure `this`,
+/// suppressing this path.
+implement<O> trait Drop for struct JoinHandle<O> {
+    drop(mut &this) -> void {
+        if (this.shared == null) { return; }
+        detach_shared<O>(this.shared);
+        this.shared = null;
+    }
+}
+
+
+/// A multi-threaded, poll-driven task executor. Construct one, `spawn` futures
+/// onto it (keeping the `JoinHandle` to await a result, or dropping it to
+/// fire-and-forget), and `block_on` to drive a root future to its value. A pool
+/// of worker threads does all polling; the calling thread only ever blocks on a
+/// completion condvar.
+type struct Executor {
+    inner:       ExecInner*;
+    worker_tids: u64[];   // joinable ids of the pool's worker threads
+
+    /// Create an executor whose pool is sized to the hardware parallelism.
+    static new() -> Executor {
+        return Executor::with_threads(exec_cpu_count());
+    }
+
+    /// Create an executor with exactly `n` worker threads (clamped to >= 1 so the
+    /// pool always makes progress) and the default blocking-pool ceiling.
+    static with_threads(n: u32) -> Executor {
+        return Executor::with_threads_and_blocking(n, BLOCKING_DEFAULT_THREADS);
+    }
+
+    /// Create an executor with `n` worker threads and a blocking pool that will
+    /// grow to at most `blocking` threads.
+    ///
+    /// The two counts size unrelated things and should not be derived from each
+    /// other: workers are CPU-bound pollers, so their count tracks hardware
+    /// parallelism, while a blocking thread is asleep in a syscall and its count
+    /// tracks how many uninterruptible calls are outstanding at once. A program
+    /// that offloads more concurrent blocking work than `blocking` allows does
+    /// not slow down evenly — the excess queues behind the running jobs.
+    static with_threads_and_blocking(n: u32, blocking: u32) -> Executor {
+        mut count: u32 = n;
+        if (count == 0) { count = 1; }
+        mut alloc: GlobalAlloc = GlobalAlloc::new();
+        mut inner: ExecInner* = null;
+        match (alloc.allocate(Layout::of<ExecInner>())) {
+            Result::Ok(raw) => { inner = raw.cast<ExecInner>().as_ptr(); }
+            Result::Err(_)  => { panic("Executor::new: allocation failed", FILE, LINE); }
+        }
+        if (exec_mtx_init(&inner.q_mutex[0]) != 0) { panic("Executor: queue mutex init failed", FILE, LINE); }
+        if (exec_cond_init(&inner.q_cond[0]) != 0) { panic("Executor: queue cond init failed", FILE, LINE); }
+        if (exec_mtx_init(&inner.d_mutex[0]) != 0) { panic("Executor: done mutex init failed", FILE, LINE); }
+        if (exec_cond_init(&inner.d_cond[0]) != 0) { panic("Executor: done cond init failed", FILE, LINE); }
+        inner.head     = null;
+        inner.tail     = null;
+        inner.shutdown = false;
+        // Before any worker starts: each publishes these handles as it comes up.
+        // The blocking pool starts empty — it creates its first thread only if
+        // something actually offloads work — so this costs an allocation.
+        inner.reactor  = Reactor::start();
+        inner.blocking = BlockingPool::with_max(blocking);
+        mut tids: u64[] = [];
+        mut i: u32 = 0;
+        while (i < count) {
+            mut tbuf: u8[8] = [0; 8];
+            if (exec_spawn_worker(inner, &tbuf[0]) != 0) {
+                panic("Executor: worker thread creation failed", FILE, LINE);
+            }
+            tids.push(*(&tbuf[0] as u64*));
+            i = i + 1;
+        }
+        return Executor { inner: inner, worker_tids: tids };
+    }
+
+    /// Spawn `fut` and return a handle to its `Output`. Workers begin driving it
+    /// immediately.
+    spawn<F, O>(mut &this, fut: F) -> JoinHandle<O>
+    where F: Future<O> {
+        return spawn_on<F, O>(this.inner, fut);
+    }
+
+    /// Spawn `fut` as fire-and-forget: it runs to completion and its result is
+    /// discarded. Sugar for `spawn(fut).detach()`.
+    spawn_detached<F, O>(mut &this, fut: F) -> void
+    where F: Future<O> {
+        mut h: JoinHandle<O> = spawn_on<F, O>(this.inner, fut);
+        h.detach();
+    }
+
+    /// Spawn `root` and block the calling thread until a worker drives it to
+    /// completion, then return its value. Panics if `root` was cancelled or
+    /// could not complete; use `spawn(root).join()` for the `Result`.
+    block_on<F, O>(mut &this, root: F) -> O
+    where F: Future<O> {
+        mut h: JoinHandle<O> = spawn_on<F, O>(this.inner, root);
+        match (h.join()) {
+            Result::Ok(v)  => { return v; }
+            Result::Err(_) => { panic("Executor::block_on: root future did not complete", FILE, LINE); }
+        }
+    }
+}
+
+/// Signal shutdown, join the workers, stop the two drivers, then reclaim any
+/// tasks still queued (never driven) as CANCELLED so their futures' drops run
+/// and no block leaks. Shutdown MUST be signaled before the workers are joined,
+/// or the join would block forever waiting on threads that never leave `take()`.
+///
+/// The steps are ordered so nothing can be resurrected after it is reclaimed.
+/// Joining the workers first stops all polling.
+///
+/// The blocking pool stops next, and before the reactor. Its threads cannot be
+/// interrupted, so this waits out any call already in flight; cancelling what is
+/// merely queued releases those jobs' wakers, which can be the last reference to
+/// a task, whose future's drop may then cancel a reactor registration — so the
+/// reactor has to still be standing when that happens.
+///
+/// Stopping the reactor then joins its thread — after which no wake can be
+/// generated — and releases its registrations and timers, whose wakers are the
+/// last reference to any task parked on I/O or a deadline, so those tasks are
+/// finished and freed here (a task's drop deregisters, which the teardown
+/// tolerates re-entrantly). Only then is the queue drained: draining before the
+/// drivers stopped would leave a task woken in the interim sitting in the queue
+/// forever.
+///
+/// Both driver blocks are freed last, after the drain rather than as part of
+/// their stop. A task that readiness had already woken is still sitting in the
+/// queue at that point, and dropping it runs its future's `Drop`, which cancels
+/// against the reactor it registered with or lets go of a blocking job; those
+/// have to find live (if empty) structures rather than freed memory.
+implement trait Drop for struct Executor {
+    drop(mut &this) -> void {
+        if (this.inner == null) { return; }
+        const inner: ExecInner* = this.inner;
+        exec_mtx_lock(&inner.q_mutex[0]);
+        inner.shutdown = true;
+        exec_mtx_unlock(&inner.q_mutex[0]);
+        exec_cond_broadcast(&inner.q_cond[0]);
+        // Join every worker (each exits `take()` once it observes shutdown), then
+        // release the tid buffer. Must follow the shutdown+broadcast above, or the
+        // join would block forever on threads still parked in `take()`.
+        const n: i64 = this.worker_tids.length() as i64;
+        for (mut i: i64 = 0; i < n; i = i + 1) {
+            exec_join_worker(this.worker_tids[i]);
+        }
+        this.worker_tids.drop();
+        BlockingPool::stop(inner.blocking);
+        Reactor::stop(inner.reactor);
+        // No workers and no reactor thread remain: safe to reclaim without
+        // locking. The reactor block stays alive across this drain because a
+        // queued task's future may still cancel a registration or timer against
+        // it as it is dropped; `Reactor::free` releases it once that is past.
+        inner.drain_cancelled();
+        Reactor::free(inner.reactor);
+        inner.reactor = null;
+        BlockingPool::free(inner.blocking);
+        inner.blocking = null;
+        exec_cond_destroy(&inner.d_cond[0]);
+        exec_mtx_destroy(&inner.d_mutex[0]);
+        exec_cond_destroy(&inner.q_cond[0]);
+        exec_mtx_destroy(&inner.q_mutex[0]);
+        mut alloc: GlobalAlloc = GlobalAlloc::new();
+        alloc.deallocate(NonNull::new(inner as u8*), Layout::of<ExecInner>());
+        this.inner = null;
+    }
+}

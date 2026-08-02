@@ -1,0 +1,308 @@
+///! std::future::combinator: running futures against each other — `Join`,
+///! `TryJoin`, `Select`, and `Timeout`.
+///!
+///! Each of these is an ordinary future that OWNS the futures it composes and
+///! drives them from its own `poll`. Every child is polled with the same
+///! `Context`, so they all register the composing task's waker: whichever child
+///! becomes ready wakes the task, the task re-polls the combinator, and the
+///! combinator re-polls whichever children have not finished. One task drives
+///! the whole group — no child is spawned, and none needs an `Executor`.
+///!
+///! ## Cancellation is a drop
+///!
+///! A `Select` that completes still owns the child that lost, and a `Timeout`
+///! that elapses still owns the operation it was timing. Both are released when
+///! the combinator itself is dropped, which is what cancels them: dropping a
+///! parked future runs its `Drop`, and that is where a `Sleep` disarms its timer
+///! and an I/O future releases its reactor registration. Cancellation therefore
+///! needs no separate mechanism and cannot be forgotten — it is the same drop
+///! that reclaims the memory.
+///!
+///! ## Arity
+///!
+///! These compose two futures. Higher arities nest:
+///! `Futures::join(a, Futures::join(b, c))`. Cryo has no variadic generics, so a
+///! fixed-arity pair plus nesting is the whole story; the alternative would be a
+///! hand-written `Join3`, `Join4`, ... tower that says nothing new.
+///!
+///! ## Polling a finished combinator
+///!
+///! Every one of these panics if polled after it completed, matching
+///! `future::Ready`. A completed future has already moved its output out, so a
+///! second poll has nothing to return — and would re-poll children that already
+///! finished, which is itself a contract violation.
+///!
+///! ## Fallible children
+///!
+///! `join` waits for both children and hands back both `Result`s; `try_join`
+///! completes on the first error and abandons the sibling. Neither substitutes
+///! for the other — `join` is for a caller that needs every outcome, `try_join`
+///! for one that has nothing left to do once either side has failed.
+
+namespace std::future::combinator;
+
+import core::option;
+import core::result;
+import future::poll;
+import future::waker;
+import future::traits;
+import future::timer;
+import time::duration;
+
+
+/// Which side of a `Select` finished first.
+type enum Selected<L, R> {
+    First(L);
+    Second(R);
+}
+
+/// A `Timeout` expired before the operation it was timing finished.
+///
+/// Carries the deadline it missed, as monotonic nanoseconds on the scale
+/// `Instant::as_nanos` reports, so a caller reporting the failure has the
+/// deadline without threading it through separately.
+///
+/// It is deliberately not an empty struct. A zero-sized type used as a generic
+/// payload is fine in a plain value but is miscompiled when it reaches a
+/// `Future`'s associated `Output` — `Poll<Result<T, ZeroSized>>` hands back a
+/// garbage `T` — so the field is load-bearing, not decoration.
+type struct Elapsed {
+    deadline: i64;
+
+    static at(deadline: i64) -> Elapsed { return Elapsed { deadline: deadline }; }
+
+    /// The monotonic-nanosecond deadline that was missed.
+    deadline_nanos(&this) -> i64 { return this.deadline; }
+}
+
+
+/// Runs two futures concurrently and completes with both results once both have
+/// finished. Each child is polled only until it completes; its value is parked
+/// in an `Option` until the other one catches up.
+type struct Join<A, B, OA, OB> {
+    a:      A;
+    b:      B;
+    a_out:  Option<OA>;   // the value `a` produced, waiting for `b`
+    b_out:  Option<OB>;
+    a_done: boolean;      // stays true after `a_out` is taken, so `a` is never re-polled
+    b_done: boolean;
+}
+
+implement<A, B, OA, OB> trait Future<(OA, OB)> for struct Join<A, B, OA, OB>
+where A: Future<OA>, B: Future<OB> {
+    poll(mut &this, cx: Context*) -> Poll<(OA, OB)> {
+        if (this.a_done && this.b_done) {
+            panic("future::Join polled after completion", FILE, LINE);
+        }
+        if (!this.a_done) {
+            match (this.a.poll(cx)) {
+                Poll::Ready(v) => { this.a_out = Option::Some(v); this.a_done = true; }
+                Poll::Pending  => { }
+            }
+        }
+        if (!this.b_done) {
+            match (this.b.poll(cx)) {
+                Poll::Ready(v) => { this.b_out = Option::Some(v); this.b_done = true; }
+                Poll::Pending  => { }
+            }
+        }
+        if (this.a_done && this.b_done) {
+            mut x: OA = this.a_out.take().unwrap();
+            mut y: OB = this.b_out.take().unwrap();
+            return Poll::Ready((x, y));
+        }
+        return Poll::Pending;
+    }
+}
+
+
+/// Runs two fallible futures concurrently and completes with both values, or
+/// with the FIRST error either of them reports.
+///
+/// The error completes this future immediately: neither child is polled again,
+/// and the sibling is dropped with this future, which is what cancels it — the
+/// same plain-drop cancellation `Select` gives its loser, so an in-flight I/O
+/// registration or an armed timer is released rather than left running behind a
+/// result nobody will read.
+///
+/// A value that arrived before the error is dropped with this future too. There
+/// is nowhere to hand it back: the output is a single `Result`, and reporting
+/// the error is what joining fallibly asked for. A caller that needs every
+/// outcome wants `join`, which waits for both sides and yields both `Result`s.
+///
+/// `a` is polled first on every poll, the same documented bias `Select` carries:
+/// when both sides fail on one poll, the error reported is `a`'s.
+type struct TryJoin<A, B, T1, T2, E> {
+    a:      A;
+    b:      B;
+    a_out:  Option<T1>;   // the value `a` produced, waiting for `b`
+    b_out:  Option<T2>;
+    a_done: boolean;      // stays true after `a_out` is filled, so `a` is never re-polled
+    b_done: boolean;
+    /// Set by BOTH completion paths. `a_done && b_done` cannot stand in for it:
+    /// an error completes this future with the other side still unfinished, so
+    /// without a separate flag a later poll would drive a child again after this
+    /// future had already reported.
+    done:   boolean;
+}
+
+implement<A, B, T1, T2, E> trait Future<Result<(T1, T2), E>> for struct TryJoin<A, B, T1, T2, E>
+where A: Future<Result<T1, E>>, B: Future<Result<T2, E>> {
+    poll(mut &this, cx: Context*) -> Poll<Result<(T1, T2), E>> {
+        if (this.done) {
+            panic("future::TryJoin polled after completion", FILE, LINE);
+        }
+        if (!this.a_done) {
+            match (this.a.poll(cx)) {
+                Poll::Ready(r) => {
+                    match (r) {
+                        Result::Ok(v)  => { this.a_out = Option::Some(v); this.a_done = true; }
+                        Result::Err(e) => { this.done = true; return Poll::Ready(Result::Err(e)); }
+                    }
+                }
+                Poll::Pending  => { }
+            }
+        }
+        if (!this.b_done) {
+            match (this.b.poll(cx)) {
+                Poll::Ready(r) => {
+                    match (r) {
+                        Result::Ok(v)  => { this.b_out = Option::Some(v); this.b_done = true; }
+                        Result::Err(e) => { this.done = true; return Poll::Ready(Result::Err(e)); }
+                    }
+                }
+                Poll::Pending  => { }
+            }
+        }
+        if (this.a_done && this.b_done) {
+            mut x: T1 = this.a_out.take().unwrap();
+            mut y: T2 = this.b_out.take().unwrap();
+            this.done = true;
+            return Poll::Ready(Result::Ok((x, y)));
+        }
+        return Poll::Pending;
+    }
+}
+
+
+/// Runs two futures concurrently and completes as soon as EITHER finishes,
+/// reporting which one it was. The loser is dropped with this future, which
+/// cancels it.
+///
+/// `a` is polled first on every poll. That bias is deliberate and documented
+/// rather than randomized: a `select` returns on the first ready child, so a
+/// consistently-ready `a` cannot starve `b` within one `select` — it only makes
+/// the choice predictable when both are ready at once, which is what a caller
+/// pairing an operation against a timeout wants.
+type struct Select<A, B, OA, OB> {
+    a:    A;
+    b:    B;
+    done: boolean;
+}
+
+implement<A, B, OA, OB> trait Future<Selected<OA, OB>> for struct Select<A, B, OA, OB>
+where A: Future<OA>, B: Future<OB> {
+    poll(mut &this, cx: Context*) -> Poll<Selected<OA, OB>> {
+        if (this.done) {
+            panic("future::Select polled after completion", FILE, LINE);
+        }
+        match (this.a.poll(cx)) {
+            Poll::Ready(v) => { this.done = true; return Poll::Ready(Selected::First(v)); }
+            Poll::Pending  => { }
+        }
+        match (this.b.poll(cx)) {
+            Poll::Ready(v) => { this.done = true; return Poll::Ready(Selected::Second(v)); }
+            Poll::Pending  => { }
+        }
+        return Poll::Pending;
+    }
+}
+
+
+/// Runs a future with a deadline: `Ok(value)` if it finishes in time, otherwise
+/// `Err(Elapsed)`.
+///
+/// The operation is polled BEFORE the deadline, so a future that becomes ready
+/// on the very poll where the timer also fires reports its value rather than a
+/// timeout. It did complete; calling that a timeout would discard a result the
+/// caller can never get back — and for an I/O future it would discard one whose
+/// side effect has already happened.
+///
+/// On expiry the operation is dropped with this future, cancelling it.
+type struct Timeout<F, O> {
+    fut:   F;
+    sleep: Sleep;
+    done:  boolean;
+}
+
+implement<F, O> trait Future<Result<O, Elapsed>> for struct Timeout<F, O>
+where F: Future<O> {
+    poll(mut &this, cx: Context*) -> Poll<Result<O, Elapsed>> {
+        if (this.done) {
+            panic("future::Timeout polled after completion", FILE, LINE);
+        }
+        match (this.fut.poll(cx)) {
+            Poll::Ready(v) => { this.done = true; return Poll::Ready(Result::Ok(v)); }
+            Poll::Pending  => { }
+        }
+        match (this.sleep.poll(cx)) {
+            Poll::Ready(_) => {
+                this.done = true;
+                return Poll::Ready(Result::Err(Elapsed::at(this.sleep.deadline_nanos())));
+            }
+            Poll::Pending => { }
+        }
+        return Poll::Pending;
+    }
+}
+
+
+/// Constructors for the combinators above.
+///
+/// A namespace rather than a value: a combinator is generic over its children's
+/// types as well as their outputs, and a child produced by an `async function`
+/// has a compiler-generated type no caller can name. Building through statics
+/// whose bounds infer the whole set (`Futures::join(a, b)`) is what keeps them
+/// constructible at all.
+type struct Futures {
+    /// Run `a` and `b` concurrently; complete with both values.
+    static join<A, B, OA, OB>(a: A, b: B) -> Join<A, B, OA, OB>
+    where A: Future<OA>, B: Future<OB> {
+        return Join<A, B, OA, OB> {
+            a: a, b: b,
+            a_out: Option::None, b_out: Option::None,
+            a_done: false, b_done: false,
+        };
+    }
+
+
+    /// Run `a` and `b` concurrently; complete with both values, or with the
+    /// first error either reports, dropping the sibling.
+    static try_join<A, B, T1, T2, E>(a: A, b: B) -> TryJoin<A, B, T1, T2, E>
+    where A: Future<Result<T1, E>>, B: Future<Result<T2, E>> {
+        return TryJoin<A, B, T1, T2, E> {
+            a: a, b: b,
+            a_out: Option::None, b_out: Option::None,
+            a_done: false, b_done: false, done: false,
+        };
+    }
+
+    /// Run `a` and `b` concurrently; complete as soon as either does, dropping
+    /// the other.
+    static select<A, B, OA, OB>(a: A, b: B) -> Select<A, B, OA, OB>
+    where A: Future<OA>, B: Future<OB> {
+        return Select<A, B, OA, OB> { a: a, b: b, done: false };
+    }
+
+    /// Run `fut` with a deadline `dur` from now.
+    static timeout<F, O>(dur: Duration, fut: F) -> Timeout<F, O>
+    where F: Future<O> {
+        return Timeout<F, O> { fut: fut, sleep: Sleep::new(dur), done: false };
+    }
+
+    /// Run `fut` with an absolute deadline.
+    static timeout_at<F, O>(deadline: Instant, fut: F) -> Timeout<F, O>
+    where F: Future<O> {
+        return Timeout<F, O> { fut: fut, sleep: Sleep::until(deadline), done: false };
+    }
+}

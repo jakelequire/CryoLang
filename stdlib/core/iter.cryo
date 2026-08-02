@@ -23,6 +23,7 @@ namespace std::core::iter;
 
 import core::option;
 import core::clone;
+import core::cmp;
 import collections::pair;
 
 type trait Iterator {
@@ -77,6 +78,12 @@ type trait Iterator {
     /// Yield at most the first `n` elements, then stop.
     take(this, n: u64) -> TakeIter<This> {
         return TakeIter::new(this, n);
+    }
+
+    /// Discard the first `n` elements, then yield the rest. An iterator with
+    /// fewer than `n` elements is drained and yields nothing.
+    skip(this, n: u64) -> SkipIter<This> {
+        return SkipIter::new(this, n);
     }
 
     /// Transform each element with `f`, yielding the results. `f` must be a
@@ -150,6 +157,51 @@ type trait Iterator {
             }
         }
     }
+
+    /// The smallest element by `Ord`, or `None` for an empty iterator.
+    /// Consumes the iterator. On ties the FIRST minimal element wins (only a
+    /// strictly smaller element displaces the running best), matching Rust's
+    /// `Iterator::min`. Available only where the element type is `Ord` - the
+    /// `where This::Item: Ord` associated-type projection bound; adapters whose
+    /// element is never `Ord` (e.g. `enumerate`/`zip`, which yield `Pair`) do
+    /// not carry it.
+    min(mut &this) -> Option<This::Item> where This::Item: Ord {
+        match (this.next()) {
+            Option::None => { return Option::None; }
+            Option::Some(first) => {
+                mut best: This::Item = first;
+                loop {
+                    match (this.next()) {
+                        Option::Some(value) => {
+                            if (value.compare(&best).is_lt()) { best = value; }
+                        }
+                        Option::None => { return Option::Some(best); }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The largest element by `Ord`, or `None` for an empty iterator.
+    /// Consumes the iterator. On ties the LAST maximal element wins (an
+    /// equal-or-greater element displaces the running best), matching Rust's
+    /// `Iterator::max`.
+    max(mut &this) -> Option<This::Item> where This::Item: Ord {
+        match (this.next()) {
+            Option::None => { return Option::None; }
+            Option::Some(first) => {
+                mut best: This::Item = first;
+                loop {
+                    match (this.next()) {
+                        Option::Some(value) => {
+                            if (value.compare(&best).is_ge()) { best = value; }
+                        }
+                        Option::None => { return Option::Some(best); }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Adapter yielding at most `remaining` elements from `inner`.
@@ -169,6 +221,33 @@ where I: Iterator<A> {
             return Option::None;
         }
         this.remaining = this.remaining - 1;
+        return this.inner.next();
+    }
+}
+
+/// Adapter that drops the first `remaining` elements of `inner` on the first
+/// `next`, then passes the rest through. `remaining` counts DOWN as elements
+/// are skipped; once it hits 0 the adapter is transparent.
+type struct SkipIter<I> {
+    inner: I;
+    remaining: u64;
+
+    static new(inner: I, n: u64) -> SkipIter<I> {
+        return SkipIter<I> { inner: inner, remaining: n };
+    }
+}
+
+implement<I, A> trait Iterator<A> for struct SkipIter<I>
+where I: Iterator<A> {
+    next(mut &this) -> Option<A> {
+        while (this.remaining > 0) {
+            this.remaining = this.remaining - 1;
+            match (this.inner.next()) {
+                // Payload dropped by the `_` match, as in `count`.
+                Option::Some(_) => { }
+                Option::None    => { this.remaining = 0; return Option::None; }
+            }
+        }
         return this.inner.next();
     }
 }

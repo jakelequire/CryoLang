@@ -1,0 +1,168 @@
+// A carried value that is also GIVEN AWAY or REBUILT still lives in its carrier
+// field, so its address holds still across a suspend.
+//
+// These two shapes used to take the moving carrier: the value was copied out of
+// its `Option<T>` field into a fresh block-local at the top of every state and
+// handed back on the way out, because neither a by-value use nor a
+// reassignment could be spelled against a value living in a field. Anything the
+// value had published a pointer into then named a dead stack slot from the
+// second poll onwards - silently, because that slot is live stack and still
+// readable. The substitution now knows what POSITION each mention sits in, so a
+// give-away takes the value out of the field and a rebuild republishes it, and
+// both shapes stay resident.
+//
+// The discriminating observation is a THIRD PARTY writing through a pointer the
+// value published while the future is parked - see the sibling file
+// `async_carried_local_address_stable.cryo` for why an address COMPARISON
+// cannot see this class of bug. Each test is paired with a control that drives
+// the same future without writing, so a carrier that lost the value entirely
+// fails the pair rather than passing one half.
+//
+// Every test also asserts the destructor count. A changed drop count is a
+// regression, not progress.
+![config(testing)]
+namespace CryoTests::Tests::Lang::AsyncGiveawayCarrierAddressStable;
+
+import std::test;
+import std::core::result;
+import std::future;
+
+mut ga_slot: i64* = null;
+mut ga_drops: i64 = 0;
+
+type struct Handle {
+    canary: i64;
+
+    static new() -> Handle { return Handle { canary: 0 }; }
+
+    // Hands out a pointer into this value's own storage. Nothing at the call
+    // site mentions an address.
+    publish(mut &this) -> void { ga_slot = &this.canary; }
+
+    read(&this) -> i64 { return this.canary; }
+
+    drop(mut &this) -> void { ga_drops = ga_drops + 1; }
+}
+
+// Consumes the handle and hands it back: the owned-handle I/O idiom, and the
+// shape that made `carrier_can_live_in_place` refuse a carrier.
+function relay(h: Handle) -> Handle { return h; }
+
+// Consumes the handle outright, running its destructor.
+function sink(h: Handle) -> i64 { return h.read(); }
+
+type struct Ticks {
+    left: i64;
+
+    static new(n: i64) -> Ticks { return Ticks { left: n }; }
+}
+
+implement trait Future for struct Ticks {
+    type Output = i64;
+
+    poll(mut &this, cx: Context*) -> Poll<i64> {
+        if (this.left > 0) {
+            this.left = this.left - 1;
+            return Poll::Pending;
+        }
+        return Poll::Ready(0);
+    }
+}
+
+// Carried across the suspend, then handed over by value in the same state.
+async function carried_then_given_away() -> i64 {
+    mut h: Handle = Handle::new();
+    h.publish();
+    const _z: i64 = await Ticks::new(1);
+    const seen: i64 = h.read();
+    const _consumed: i64 = sink(h);
+    return seen;
+}
+
+// Given away and rebuilt from the result in one state, then read after a second
+// suspend. The republished field is the same storage, so the pointer taken
+// after the rebuild stays good.
+async function relayed_then_carried() -> i64 {
+    mut h: Handle = Handle::new();
+    const _a: i64 = await Ticks::new(1);
+    h = relay(h);
+    h.publish();
+    const _b: i64 = await Ticks::new(1);
+    return h.read();
+}
+
+// Drives the future to completion, writing `value` through whatever pointer the
+// carried local published each time the future parks.
+function drive_writing<F>(f: F, value: i64) -> i64
+where F: Future<i64> {
+    mut fut: F = f;
+    mut cx: Context = Context::new(Waker::noop());
+    loop {
+        match (fut.poll(&cx)) {
+            Poll::Ready(v) => { return v; }
+            Poll::Pending => {
+                if (ga_slot != null) { *ga_slot = value; }
+            }
+        }
+    }
+}
+
+// Drives to completion without touching the published pointer at all.
+function drive_quietly<F>(f: F) -> i64
+where F: Future<i64> {
+    mut fut: F = f;
+    mut cx: Context = Context::new(Waker::noop());
+    loop {
+        match (fut.poll(&cx)) {
+            Poll::Ready(v) => { return v; }
+            Poll::Pending => { }
+        }
+    }
+}
+
+// A carrier the state hands over by value is still reached in its field up to
+// that point. With the value moving, the write lands in the copy the suspend
+// abandoned and the read returns 0.
+![test]
+function giveaway_carrier_sees_third_party_write() -> Result<(), TestError> {
+    ga_slot = null;
+    ga_drops = 0;
+    const seen: i64 = drive_writing(carried_then_given_away(), 55);
+    if (seen != 55) { return expect_eq(seen, 55 as i64); }
+    // `sink` consumed it, so exactly one destructor ran and the carrier field
+    // was left empty rather than dropped a second time with the future.
+    return expect_eq(ga_drops, 1 as i64);
+}
+
+// Control: same future, same driver, nobody writes.
+![test]
+function giveaway_carrier_untouched_reads_its_own_value() -> Result<(), TestError> {
+    ga_slot = null;
+    ga_drops = 0;
+    const seen: i64 = drive_quietly(carried_then_given_away());
+    if (seen != 0) { return expect_eq(seen, 0 as i64); }
+    return expect_eq(ga_drops, 1 as i64);
+}
+
+// A carrier republished mid-flight keeps the field's storage, so a pointer
+// taken after the rebuild survives the next suspend.
+![test]
+function rebuilt_carrier_sees_third_party_write() -> Result<(), TestError> {
+    ga_slot = null;
+    ga_drops = 0;
+    const seen: i64 = drive_writing(relayed_then_carried(), 77);
+    if (seen != 77) { return expect_eq(seen, 77 as i64); }
+    // Handed to `relay` and back exactly once, so the single live value is
+    // dropped once when the future completes.
+    return expect_eq(ga_drops, 1 as i64);
+}
+
+// Control for the rebuild shape.
+![test]
+function rebuilt_carrier_untouched_reads_its_own_value() -> Result<(), TestError> {
+    ga_slot = null;
+    ga_drops = 0;
+    const seen: i64 = drive_quietly(relayed_then_carried());
+    if (seen != 0) { return expect_eq(seen, 0 as i64); }
+    return expect_eq(ga_drops, 1 as i64);
+}

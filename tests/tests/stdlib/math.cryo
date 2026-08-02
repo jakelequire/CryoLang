@@ -4,6 +4,7 @@
 namespace CryoTests::Tests::Stdlib::MathT;
 
 import std::core::result;
+import std::core::mem;
 import std::math;
 import std::test::error;
 import std::test::assert;
@@ -155,25 +156,25 @@ function clamp_f64_bounds() -> Result<(), TestError> {
 
 ![test]
 function clamp_i64_passthrough() -> Result<(), TestError> {
-    return expect_eq(math::clamp_i64(2, 0, 10), 2);
+    return expect_eq(math::clamp<i64>(2, 0, 10), 2);
 }
 
 ![test]
 function min_u64_picks_smaller() -> Result<(), TestError> {
-    return expect_eq(math::min_u64(7, 3), 3);
+    return expect_eq(math::min<u64>(7, 3), 3);
 }
 
 // --- integer absolute --------------------------------------------------
 
 ![test]
 function abs_i32_negative() -> Result<(), TestError> {
-    return expect_eq(math::abs_i32(0 - 42), 42);
+    return expect_eq(math::abs<i32>(0 - 42), 42);
 }
 
 ![test]
 function abs_i64_negative() -> Result<(), TestError> {
     const big: i64 = 1000000000000;
-    return expect_eq(math::abs_i64(0 - big), big);
+    return expect_eq(math::abs<i64>(0 - big), big);
 }
 
 // --- classification ----------------------------------------------------
@@ -192,6 +193,110 @@ function is_nan_of_nan() -> Result<(), TestError> {
 function is_infinite_of_infinity() -> Result<(), TestError> {
     return expect(math::is_infinite(math::infinity()),
         Str::new("infinity() should be infinite"));
+}
+
+// Classification is now pure Cryo over the IEEE-754 bit pattern (the
+// `fpclass` intrinsic, LLVM `llvm.is.fpclass`) - no libm.  These cover the
+// edge classes that the previous `isnan`/`finite` surface never exercised:
+// subnormals, -0.0, and the full `classify` category set.  Edge values are
+// built by transmuting exact bit patterns so the tests don't depend on how
+// any particular literal is rounded.
+
+![test]
+function is_normal_true_only_for_normals() -> Result<(), TestError> {
+    match (expect(math::is_normal(1.0), Str::new("1.0 is normal"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect(!math::is_normal(0.0), Str::new("0.0 is not normal"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect(!math::is_normal(math::nan()), Str::new("NaN is not normal"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect(!math::is_normal(math::infinity()), Str::new("Inf is not normal"));
+}
+
+![test]
+function is_sign_negative_reads_the_sign_bit() -> Result<(), TestError> {
+    // -0.0 has the sign bit set but is numerically zero; the raw-bit read
+    // must report it as negative (a value compare could not).
+    const neg_zero: f64 = mem::transmute<u64, f64>(0x8000000000000000);
+    match (expect(math::is_sign_negative(neg_zero), Str::new("-0.0 is sign-negative"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect(math::is_sign_negative(0.0 - 3.5), Str::new("-3.5 is sign-negative"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect(!math::is_sign_negative(0.0), Str::new("+0.0 is not sign-negative"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect(!math::is_sign_negative(3.5), Str::new("+3.5 is not sign-negative"));
+}
+
+![test]
+function classify_normal_and_zero() -> Result<(), TestError> {
+    const norm: boolean = match (math::classify(1.5)) {
+        FpCategory::Normal => { true }
+        _                  => { false }
+    };
+    match (expect(norm, Str::new("1.5 classifies as Normal"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    const pos_zero: boolean = match (math::classify(0.0)) {
+        FpCategory::Zero => { true }
+        _                => { false }
+    };
+    match (expect(pos_zero, Str::new("+0.0 classifies as Zero"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    const neg_zero_val: f64 = mem::transmute<u64, f64>(0x8000000000000000);
+    const neg_zero: boolean = match (math::classify(neg_zero_val)) {
+        FpCategory::Zero => { true }
+        _                => { false }
+    };
+    return expect(neg_zero, Str::new("-0.0 classifies as Zero"));
+}
+
+![test]
+function classify_subnormal_is_finite_not_normal() -> Result<(), TestError> {
+    // Smallest positive subnormal: bit pattern 0x0000000000000001.  A
+    // subnormal f32 would widen to a *normal* f64, so this must be tested
+    // natively at f64 width.
+    const sub: f64 = mem::transmute<u64, f64>(1);
+    const is_sub: boolean = match (math::classify(sub)) {
+        FpCategory::Subnormal => { true }
+        _                     => { false }
+    };
+    match (expect(is_sub, Str::new("smallest subnormal classifies as Subnormal"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect(math::is_finite(sub), Str::new("subnormal is finite"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect(!math::is_normal(sub), Str::new("subnormal is not normal"));
+}
+
+![test]
+function classify_nan_and_infinite() -> Result<(), TestError> {
+    const is_nan_cat: boolean = match (math::classify(math::nan())) {
+        FpCategory::Nan => { true }
+        _               => { false }
+    };
+    match (expect(is_nan_cat, Str::new("nan() classifies as Nan"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    const is_inf_cat: boolean = match (math::classify(math::infinity())) {
+        FpCategory::Infinite => { true }
+        _                    => { false }
+    };
+    match (expect(is_inf_cat, Str::new("+infinity() classifies as Infinite"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    const is_neg_inf_cat: boolean = match (math::classify(math::neg_infinity())) {
+        FpCategory::Infinite => { true }
+        _                    => { false }
+    };
+    return expect(is_neg_inf_cat, Str::new("-infinity() classifies as Infinite"));
 }
 
 // --- integer helpers ---------------------------------------------------
@@ -265,29 +370,29 @@ function float_min_consts() -> Result<(), TestError> {
 function min_max_clamp_f32() -> Result<(), TestError> {
     const lo: f32 = 1.5;
     const hi: f32 = 2.5;
-    match (expect(within(math::min_f32(lo, hi) as f64, 1.5, 0.0001), Str::new("min_f32"))) {
+    match (expect(within(math::min(lo, hi) as f64, 1.5, 0.0001), Str::new("min<f32>"))) {
         Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
     }
-    match (expect(within(math::max_f32(lo, hi) as f64, 2.5, 0.0001), Str::new("max_f32"))) {
+    match (expect(within(math::max(lo, hi) as f64, 2.5, 0.0001), Str::new("max<f32>"))) {
         Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
     }
     const five: f32 = 5.0;
     const zero: f32 = 0.0;
     const three: f32 = 3.0;
-    return expect(within(math::clamp_f32(five, zero, three) as f64, 3.0, 0.0001),
-        Str::new("clamp_f32 high"));
+    return expect(within(math::clamp(five, zero, three) as f64, 3.0, 0.0001),
+        Str::new("clamp<f32> high"));
 }
 
 ![test]
 function min_f32_nan_transparent() -> Result<(), TestError> {
     const nan32: f32 = math::nan() as f32;
     const two: f32 = 2.0;
-    match (expect(within(math::min_f32(nan32, two) as f64, 2.0, 0.0001),
-        Str::new("min_f32(nan,2)=2"))) {
+    match (expect(within(math::min(nan32, two) as f64, 2.0, 0.0001),
+        Str::new("min<f32>(nan,2)=2"))) {
         Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
     }
-    return expect(within(math::min_f32(two, nan32) as f64, 2.0, 0.0001),
-        Str::new("min_f32(2,nan)=2"));
+    return expect(within(math::min(two, nan32) as f64, 2.0, 0.0001),
+        Str::new("min<f32>(2,nan)=2"));
 }
 
 ![test]
@@ -328,4 +433,108 @@ function hypot_no_overflow() -> Result<(), TestError> {
     // hypot scales by the larger operand and returns the right answer.
     return expect(within(math::hypot(3.0e200, 4.0e200), 5.0e200, 1.0e196),
         Str::new("hypot(3e200,4e200) ≈ 5e200 without overflow"));
+}
+
+// --- cheap fp ops (compiler intrinsics) ---------------------------------
+//
+// fabs/floor/ceil/trunc/round/copysign/sqrt/mul_add lower to LLVM float
+// intrinsics (llvm.fabs.f64, ...) instead of calling libm.  These pin down
+// the edge semantics that must keep matching the C functions of the same
+// name: round's halfway-away-from-zero (NOT rint's round-to-even), the pure
+// sign-bit behavior of fabs/copysign on -0.0 and NaN, sqrt's NaN domain
+// result, and mul_add's single rounding (which an unfused mul+add cannot
+// reproduce).  Exact `==` compares are deliberate - every operation here is
+// exact.
+
+![test]
+function round_half_away_from_zero() -> Result<(), TestError> {
+    // C round() semantics: halfway cases go AWAY from zero on both sides.
+    // rint/nearbyint under the default mode would give -2 / 0 / -0 here.
+    match (expect(math::round(0.0 - 2.5) == (0.0 - 3.0), Str::new("round(-2.5) = -3"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect(math::round(0.5) == 1.0, Str::new("round(0.5) = 1"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect(math::round(0.0 - 0.5) == (0.0 - 1.0), Str::new("round(-0.5) = -1"));
+}
+
+![test]
+function floor_ceil_negative_operands() -> Result<(), TestError> {
+    match (expect(math::floor(0.0 - 2.1) == (0.0 - 3.0), Str::new("floor(-2.1) = -3"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect(math::ceil(0.0 - 2.1) == (0.0 - 2.0), Str::new("ceil(-2.1) = -2"));
+}
+
+![test]
+function rounding_preserves_nonfinite() -> Result<(), TestError> {
+    match (expect(math::floor(math::infinity()) == math::infinity(),
+        Str::new("floor(inf) = inf"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect(math::trunc(math::neg_infinity()) == math::neg_infinity(),
+        Str::new("trunc(-inf) = -inf"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect(math::is_nan(math::round(math::nan())), Str::new("round(NaN) is NaN"));
+}
+
+![test]
+function fabs_is_a_pure_sign_bit_op() -> Result<(), TestError> {
+    // fabs must clear the sign bit of -0.0 (a value compare cannot see it)
+    // and pass NaN through rather than faulting on it.
+    const neg_zero: f64 = mem::transmute<u64, f64>(0x8000000000000000);
+    match (expect(!math::is_sign_negative(math::fabs(neg_zero)),
+        Str::new("fabs(-0.0) clears the sign bit"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect(math::is_nan(math::fabs(math::nan())), Str::new("fabs(NaN) is NaN"));
+}
+
+![test]
+function copysign_edge_signs() -> Result<(), TestError> {
+    // -0.0 as the sign source: copysign transfers the sign BIT, not the
+    // numeric sign (which is zero here).
+    const neg_zero: f64 = mem::transmute<u64, f64>(0x8000000000000000);
+    match (expect(math::copysign(3.0, neg_zero) == (0.0 - 3.0),
+        Str::new("copysign(3, -0.0) = -3"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect(math::copysign(0.0 - 3.0, 1.0) == 3.0,
+        Str::new("copysign(-3, 1) = 3"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    // NaN keeps its payload but takes the requested sign bit.
+    return expect(math::is_sign_negative(math::copysign(math::nan(), 0.0 - 1.0)),
+        Str::new("copysign(NaN, -1) is sign-negative"));
+}
+
+![test]
+function sqrt_domain_edges_and_f32() -> Result<(), TestError> {
+    match (expect(math::is_nan(math::sqrt(0.0 - 1.0)), Str::new("sqrt(-1) is NaN"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect(math::sqrt(0.0) == 0.0, Str::new("sqrt(0) = 0"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect(math::sqrt(math::infinity()) == math::infinity(),
+        Str::new("sqrt(inf) = inf"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect(math::sqrt(9.0 as f32) == (3.0 as f32), Str::new("sqrt<f32>(9) = 3"));
+}
+
+![test]
+function mul_add_single_rounding() -> Result<(), TestError> {
+    // (1 + 2^-52)^2 = 1 + 2^-51 + 2^-104.  A separate multiply rounds the
+    // product to 1 + 2^-51, so mul-then-add of -(1 + 2^-51) yields exactly
+    // 0.  A true fused multiply-add keeps the full product and returns
+    // exactly 2^-104 - this test fails if mul_add is ever lowered to an
+    // unfused mul + add.
+    const a: f64 = mem::transmute<u64, f64>(0x3FF0000000000001);        // 1 + 2^-52
+    const b: f64 = mem::transmute<u64, f64>(0x3FF0000000000002);        // 1 + 2^-51
+    const expected: f64 = mem::transmute<u64, f64>(0x3970000000000000); // 2^-104
+    return expect(math::mul_add(a, a, 0.0 - b) == expected,
+        Str::new("mul_add fuses with a single rounding"));
 }

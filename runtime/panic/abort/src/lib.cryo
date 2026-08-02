@@ -1,0 +1,143 @@
+///! runtime/panic/abort — the abort panic strategy.
+///!
+///! Defines the panic funnel `__cryo_panic` (see `../../abi/lang_items.def`):
+///! write "panicked at <file>:<line>: <msg>" to stderr, then terminate (exit
+///! code 101). This tier is the abort strategy; a `panic/unwind` tier would
+///! define the same symbol to unwind instead, chosen at link time — callers
+///! never change.
+///!
+///! The four check handlers take raw operands plus a `SourceLoc`, format their
+///! own message into a stack buffer, and funnel through `__cryo_panic`. Nothing
+///! here assumes the abort strategy beyond the funnel it calls, so the unwind
+///! tier can redefine `__cryo_panic` unchanged.
+///!
+///! Write/format/exit primitives come from the shared `CryoRt::Sys` module.
+///!
+///! Nothing here is gated on `no_runtime`: this same source is compiled twice,
+///! once by `runtime/` for a freestanding link and once by `runtime/hosted/` for
+///! a libc-linked one. The only difference between the two archives is which
+///! `Sys::rt_exit` they bind — raw `exit_group`/`NtTerminateProcess`, or libc
+///! `exit` so the panicking program's buffered stdio is flushed on the way out.
+
+namespace CryoRt::Panic::Abort;
+
+import CryoRt::Sys;
+
+/// Source location passed to every check handler, matching `abi/layout.def`:
+/// `{ file: string @0, line: u32 @8, col: u32 @12 }`, 16 bytes. Codegen
+/// constructs it zero-alloc from static data; the handlers read `file`/`line`.
+type struct SourceLoc {
+    file: string;
+    line: u32;
+    col:  u32;
+}
+
+/// The single panic sink. Prints `panicked at <file>:<line>: <msg>` and
+/// terminates. `![no_mangle]` makes the source name the emitted symbol.
+![no_mangle]
+function __cryo_panic(msg: string, file: string, line: u32) -> never {
+    Sys::write_cstr("panicked at ");
+    Sys::write_cstr(file);
+    Sys::write_cstr(":");
+    Sys::write_u32(line);
+    Sys::write_cstr(": ");
+    Sys::write_cstr(msg);
+    Sys::write_cstr("\n");
+    Sys::rt_exit(101);
+}
+
+// --- Unwind-surface stubs ---------------------------------------------------
+// Both panic tiers export the SAME symbol surface and differ only in behaviour;
+// that is what lets one archive be swapped for the other at link time. These
+// five exist in the unwind tier because unwinding needs them, and here because
+// the symbols are still REFERENCED under abort: the stdlib archive is built once
+// with the default strategy, so an `--panic=abort` program can be handed stdlib
+// objects that name a personality and the caught-panic accessors. Without these
+// the link fails on undefined symbols that no abort-strategy program could ever
+// actually call.
+//
+// Deliberately storage-free: no `![thread_local]`, because this tier is also
+// linked `-nostdlib` into freestanding programs, where a TLS reference would
+// drag in a C-runtime symbol (`_tls_index` on Windows) that such a link cannot
+// resolve.
+
+/// Under abort a panic never returns and never unwinds, so no `catch_unwind` can
+/// observe one and these are unreachable. They report "no panic taken" rather
+/// than inventing a payload.
+![no_mangle]
+function __cryo_panic_taken_message() -> string { return null; }
+
+![no_mangle]
+function __cryo_panic_taken_file() -> string { return null; }
+
+![no_mangle]
+function __cryo_panic_taken_line() -> u32 { return 0; }
+
+/// The unwind tier's root-catch tail. Unreachable here — the compiler only
+/// synthesizes the root-catch `main` wrapper that calls it under `--panic=unwind`
+/// — but terminate with the panic exit code rather than returning into a caller
+/// that assumed divergence.
+![no_mangle]
+function __cryo_panic_finish() -> never {
+    Sys::rt_exit(101);
+}
+
+/// The language personality, in each OS's calling convention: Linux is called
+/// with the Itanium 5-argument signature, Windows through `.xdata` with the
+/// 4-argument SEH one. Nothing in an abort build raises, so the only way to
+/// arrive here is a genuine hardware exception, and the correct answer for a
+/// tier with no handlers is "keep searching".
+![no_mangle] ![config(linux)]
+function __cryo_personality_v0(version: i32, actions: i32, exception_class: u64,
+                               exception_object: i64, context: i64) -> i32 {
+    return 8;   // _URC_CONTINUE_UNWIND
+}
+
+![no_mangle] ![config(windows)]
+function __cryo_personality_v0(ms_exc: i64, this_frame: i64,
+                               ms_orig_context: i64, ms_disp: i64) -> i32 {
+    return 1;   // ExceptionContinueSearch
+}
+
+// --- Check handlers ---------------------------------------------------------
+
+/// Index out of bounds: "index <index> out of bounds for length <len>".
+![no_mangle]
+function __cryo_panic_bounds_check(loc: SourceLoc*, index: u64, len: u64) -> never {
+    mut buf: u8[128];
+    mut pos: u64 = 0;
+    Sys::append_cstr(&buf[0], &pos, "index ");
+    Sys::append_u64(&buf[0], &pos, index);
+    Sys::append_cstr(&buf[0], &pos, " out of bounds for length ");
+    Sys::append_u64(&buf[0], &pos, len);
+    buf[pos] = 0;
+    __cryo_panic(&buf[0] as string, loc.file, loc.line);
+}
+
+/// Arithmetic overflow. `op` is a raw operation code (mapping pinned later);
+/// the operands are printed so the failure is distinguishable now.
+![no_mangle]
+function __cryo_panic_overflow(loc: SourceLoc*, op: u32, lhs: u64, rhs: u64) -> never {
+    mut buf: u8[128];
+    mut pos: u64 = 0;
+    Sys::append_cstr(&buf[0], &pos, "arithmetic overflow (op ");
+    Sys::append_u64(&buf[0], &pos, op as u64);
+    Sys::append_cstr(&buf[0], &pos, "): ");
+    Sys::append_u64(&buf[0], &pos, lhs);
+    Sys::append_cstr(&buf[0], &pos, ", ");
+    Sys::append_u64(&buf[0], &pos, rhs);
+    buf[pos] = 0;
+    __cryo_panic(&buf[0] as string, loc.file, loc.line);
+}
+
+/// Division or remainder by zero (also the `INT_MIN / -1` case).
+![no_mangle]
+function __cryo_panic_div_zero(loc: SourceLoc*) -> never {
+    __cryo_panic("attempt to divide by zero", loc.file, loc.line);
+}
+
+/// Fell through a non-exhaustive match with no arm for the scrutinee.
+![no_mangle]
+function __cryo_panic_no_match(loc: SourceLoc*) -> never {
+    __cryo_panic("no matching pattern (non-exhaustive match)", loc.file, loc.line);
+}

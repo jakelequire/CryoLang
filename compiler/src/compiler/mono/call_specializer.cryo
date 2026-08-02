@@ -265,6 +265,15 @@ type struct MonoCallSpecializer {
             NodeKind::BlockStatement => {
                 this.walk_block(stmt as BlockStmtNode*, res_ctx, subst);
             }
+            NodeKind::UnsafeBlockStatement => {
+                // `unsafe` marks who is responsible for raw-pointer ownership;
+                // it says nothing about instantiation, so the body specializes
+                // exactly like any other block.  Missing this case left a
+                // generic call reachable ONLY from inside an `unsafe` block
+                // with no specialization enqueued, and codegen then failed to
+                // resolve the bare template name (E0636).
+                this.walk_block((stmt as UnsafeBlockStmtNode*).block, res_ctx, subst);
+            }
             NodeKind::IfStatement => {
                 const ifs: IfStmtNode* = stmt as IfStmtNode*;
                 this.walk_expr(ifs.condition, res_ctx, subst);
@@ -440,6 +449,21 @@ type struct MonoCallSpecializer {
     }
 
 
+    /// Concretize one stashed type-arg: apply the active specialization, then
+    /// reduce any associated-type projection the substitution left standing.
+    ///
+    /// Substitution rewrites a projection's BASE (`S::ReadFut` ->
+    /// `Ticker::ReadFut`) but never the projection itself, and a projection is
+    /// free of generic params once its base is concrete - so it survives the
+    /// `contains_generic_param` guards and gets MANGLED into the specialized
+    /// callee name, which names a specialization nothing ever emits (E0636).
+    /// Reducing it here yields the impl's bound member (`ReadyN`).
+    concretize_stashed_arg(mut &this, b_in: TypeRef, subst: TypeSubstitution*) -> TypeRef {
+        mut b: TypeRef = b_in;
+        if (subst != null) { b = subst.apply(b, this.arena); }
+        return this.trait_spec.reduce_projections(b);
+    }
+
     // -- Free-function call specialization (consumes call.resolved_type_args) --
 
     /// Pin a specialized callee on a generic free-function call so codegen can
@@ -470,7 +494,16 @@ type struct MonoCallSpecializer {
         // Look up the function template (same precedence ladder sema uses, so the
         // instantiated spec and the call's resolved callee agree).
         mut entry: TemplateEntry* = null;
-        if (callee_scope.is_valid()) {
+        // Sema's pin wins outright when present: it was decided with the
+        // caller's import scope in hand, which is not reconstructible here.
+        if (call.resolved_template.is_valid()) {
+            const pinned: TemplateEntry* =
+                this.generic_registry.get_template(call.resolved_template);
+            if (pinned != null && pinned.node_kind == NodeKind::FunctionDeclaration) {
+                entry = pinned;
+            }
+        }
+        if (entry == null && callee_scope.is_valid()) {
             const member_str: string = this.intern_table.resolve(callee_name);
             const qualified_scope: SymbolStr = if (this.decl_index != null) {
                 this.decl_index.resolve_qualified_scoped_or(
@@ -522,7 +555,7 @@ type struct MonoCallSpecializer {
                     }
                 }
             }
-        } else {
+        } else if (entry == null) {
             entry = this.find_function_template_for_call(callee_name, call.arguments.length);
         }
         if (entry == null) { return; }
@@ -541,8 +574,7 @@ type struct MonoCallSpecializer {
         mut bindings: TypeRef[] = [];
         mut all_bound: boolean = true;
         for (mut i: i64 = 0; i < call.resolved_type_args.length; i++) {
-            mut b: TypeRef = call.resolved_type_args[i];
-            if (subst != null) { b = subst.apply(b, this.arena); }
+            const b: TypeRef = this.concretize_stashed_arg(call.resolved_type_args[i], subst);
             if (!b.is_valid()) { all_bound = false; break; }
             bindings.push(b);
         }
@@ -734,16 +766,13 @@ type struct MonoCallSpecializer {
                     recv_type = inst.resolved_type;
                     t = this.arena.lookup(recv_type.id);
                 } else {
-                    // A substituter-minted nested receiver (`this.try_push(item)`
-                    // cloned into `String<Str>::push`) carries fresh arg TypeIDs and
-                    // so missed `instantiated_cache`/`resolved_type`, even though its
-                    // logical spec is already materialized.  Recover the spec by
-                    // structural equality so the lookup ladder + qualified-name keying
-                    // match the in-source path; else leave it for the fixpoint re-walk.
-                    const spec_ty: TypeRef = this.resolve_unresolved_inst_via_spec(recv_type);
-                    if (!spec_ty.is_valid()) { break; }
-                    recv_type = spec_ty;
-                    t = this.arena.lookup(recv_type.id);
+                    // Genuinely still an unresolved pre-mono wrapper: its spec has
+                    // not been materialized yet.  Leave it for the fixpoint re-walk,
+                    // which re-enters once the spec exists.  (There is nothing to
+                    // "recover" here - under single-id a materialized named spec
+                    // REUSES this wrapper's arena id, so any lookup keyed on that id
+                    // could only ever hand back the same id it was given.)
+                    break;
                 }
             } else {
                 break;
@@ -796,6 +825,29 @@ type struct MonoCallSpecializer {
             }
             if (orig_method == null) {
                 orig_method = this.find_spec_inline_method(recv_type, ma.member, &inherent_owner_ast);
+            }
+            // Generic method declared in a SEPARATE inherent `implement T { ... }`
+            // block on a non-generic USER type (`implement struct Driver {
+            // run<F,R>(..) }`). These live in the inherent-impl registry, not merged
+            // into the owner's AST methods, so the `find_inherent_method` owner walk
+            // above misses them. Sema resolves the call through this same registry
+            // (`find_inherent_impl_generic_method`); without the mono analogue the
+            // sema-stashed method args never drive a specialization and codegen
+            // reports E0636 "no method found". Route through the impl_node path
+            // (its inherent, non-trait impl gets the `$MG` pin + DI registration).
+            if (orig_method == null && this.generic_registry != null) {
+                const bare_i: SymbolStr = this.trait_spec.bare_name_of(recv_type);
+                if (bare_i.is_valid()) {
+                    orig_method = this.generic_registry.find_inherent_impl_generic_method(
+                        bare_i, ma.member, &impl_node);
+                }
+                if (orig_method == null) {
+                    const qbare_i: SymbolStr = this.arena.get_qualified_name(recv_type);
+                    if (qbare_i.is_valid() && !qbare_i.equals(bare_i)) {
+                        orig_method = this.generic_registry.find_inherent_impl_generic_method(
+                            qbare_i, ma.member, &impl_node);
+                    }
+                }
             }
             if (orig_method == null) {
                 // Synthesized/hand-written generic trait method on a non-generic
@@ -883,8 +935,7 @@ type struct MonoCallSpecializer {
         if (call.resolved_type_args.length == n_method_params && n_method_params > 0) {
             m_from_stash = true;
             for (mut i: i64 = 0; i < n_method_params; i++) {
-                mut sv: TypeRef = call.resolved_type_args[i];
-                if (subst != null) { sv = subst.apply(sv, this.arena); }
+                const sv: TypeRef = this.concretize_stashed_arg(call.resolved_type_args[i], subst);
                 if (!sv.is_valid()) { m_from_stash = false; break; }
                 bindings[i] = sv;
             }
@@ -988,15 +1039,12 @@ type struct MonoCallSpecializer {
             spec_method, pin_target);
         if (this.state.method_spec_seen(spec_sym)) {
             call.set_resolved_method(spec_method as ASTNode*);
-            // Inherent specs pin the precise symbol; trait-impl specs normally
-            // rely on the already-present DI entry (their mangle can diverge from
-            // the emitted symbol), exactly as the first materialization did below.
-            // EXCEPTION: a trait-impl method whose type param is return-only
-            // (`!method_generic_in_value_param`) MUST pin its `$MG` symbol - its
-            // unmangled DI key is identical across instantiations and would
-            // otherwise collapse every spec onto the first (see the stamping
-            // comment above and the matching pin below).
-            if ((inherent_pin || !method_generic_in_value_param) && spec_sym.is_valid()) {
+            // Pin the precise symbol, exactly as the first materialization does
+            // below.  This is unconditional because the unmangled `Type::method`
+            // key codegen falls back to is the SAME for every instantiation of one
+            // method on one owner, so any unpinned call resolves to whichever spec
+            // happened to be emitted first.
+            if (spec_sym.is_valid()) {
                 call.set_resolved_callee(spec_sym);
             }
             return;
@@ -1053,18 +1101,17 @@ type struct MonoCallSpecializer {
             }
         } else {
             this.register_spec_method_in_di(spec_method, recv_type, impl_node);
-            // Inherent (non-trait) generic method on a primitive/fixed receiver
-            // (`string::parse_int<u64>` vs `<i64>`): like the inherent-owner case
-            // above, pin the precise return-distinct mangle.  Without this,
-            // codegen falls back to the unmangled `Type::method` key and every
-            // instantiation collapses onto whichever spec was emitted first.
-            // Trait-impl / combinator specs stay unpinned (their DI mangle can
-            // diverge from the emitted definition symbol) - EXCEPT a trait-impl
-            // method with a return-only type param, which shares one unmangled DI
-            // key across all instantiations and so must pin its distinct `$MG`
-            // symbol (matching the stamped `spec_type_args` + the emitted def).
-            if ((!impl_node.is_trait_impl() || !method_generic_in_value_param)
-                    && spec_sym.is_valid()) {
+            // Pin the precise mangle for EVERY generic-method spec, trait-impl
+            // included.  Codegen's fallback key is the unmangled `Type::method`,
+            // which cannot tell two instantiations of one method on one owner
+            // apart, so an unpinned call silently resolves to whichever spec was
+            // emitted first - `CGen<i32>::put<u64>` running the `put<u32>` body
+            // and returning its answer.  `spec_sym` is safe to pin because it is
+            // built by the same `for_method_or_trait_impl` path the definition is
+            // emitted under (same `origin_trait`, same `spec_type_args`), and it
+            // is the very key this pass records in `mark_method_spec`.  Pinning
+            // adds no symbol: it only names the one already being emitted.
+            if (spec_sym.is_valid()) {
                 call.set_resolved_callee(spec_sym);
             }
         }
@@ -1228,8 +1275,7 @@ type struct MonoCallSpecializer {
             if (call.resolved_type_args.length != entry.param_type_ids.length) { return false; }
             mut binds: TypeRef[] = [];
             for (mut i: i64 = 0; i < call.resolved_type_args.length; i++) {
-                mut b: TypeRef = call.resolved_type_args[i];
-                if (subst != null) { b = subst.apply(b, this.arena); }
+                const b: TypeRef = this.concretize_stashed_arg(call.resolved_type_args[i], subst);
                 if (!b.is_valid() || this.arena.contains_generic_param(b)) { return false; }
                 binds.push(b);
             }
@@ -1284,8 +1330,7 @@ type struct MonoCallSpecializer {
         if (call.resolved_type_args.length != n_method) { return false; }
         mut method_binds: TypeRef[] = [];
         for (mut i: i64 = 0; i < n_method; i++) {
-            mut b: TypeRef = call.resolved_type_args[i];
-            if (subst != null) { b = subst.apply(b, this.arena); }
+            const b: TypeRef = this.concretize_stashed_arg(call.resolved_type_args[i], subst);
             if (!b.is_valid() || this.arena.contains_generic_param(b)) { return false; }
             method_binds.push(b);
         }
@@ -1366,7 +1411,7 @@ type struct MonoCallSpecializer {
             const e: SpecializationEntry* = &this.state.spec_entries[i];
             if (!e.instantiated_type.is_valid() || !e.specialized_type.is_valid()) { continue; }
             if (e.instantiated_type.id == owner_inst.id
-                    || this.arena.display_equal(e.instantiated_type.id, owner_inst.id)) {
+                    || e.instantiated_type.id == owner_inst.id) {
                 return e;
             }
         }
@@ -1447,6 +1492,9 @@ type struct MonoCallSpecializer {
                 body_mod = this.intern_table.resolve(owner_entry.module_name);
             }
             mut body_ctx: ResolutionContext = ResolutionContext::new(body_mod, "");
+            // The body's local annotations were written in the owner's module;
+            // the ambient scope chain is the caller's.
+            body_ctx.set_home_module(body_mod);
             this.ast_resolver.resolve_func_and_body(spec_method.func, &body_ctx, &full_subst, recv_type);
         }
 
@@ -1576,27 +1624,34 @@ type struct MonoCallSpecializer {
     /// receiver's concrete arg.  No-op when the owner isn't a generic instantiation.
     add_owner_param_bindings(&this, subst: TypeSubstitution*, owner_type: TypeRef) -> void {
         if (this.generic_registry == null) { return; }
-        mut inst: InstantiatedType* = null;
-        const ot: Type* = this.arena.lookup(owner_type.id);
-        if (ot != null && ot.kind == TypeKind::InstantiatedType) {
-            inst = ot as InstantiatedType*;
-        } else {
+        // The owner's `(generic_base, type_args)` read directly: a pre-mono wrapper
+        // answers from its own node, a post-mono concrete from its intrinsic
+        // identity.  Without these bindings the cloned body's owner-typed
+        // constructions (`Option<T>::Some(..)`, `NonNull<T> { .. }`) stay abstract
+        // and codegen ICEs (E0600/E0638).
+        mut owner_src: TypeRef = owner_type;
+        mut owner_base: TypeRef = this.arena.inst_generic_base(owner_type);
+        if (!owner_base.is_valid()) {
+            // Legacy fallback: an owner minted without generic identity (the
+            // substituter can mint an instantiation with fresh arg ids) - match the
+            // concrete against a materialized spec entry's instantiated type.
             for (mut i: i64 = 0; i < this.state.spec_entries.length; i++) {
                 const e: SpecializationEntry* = &this.state.spec_entries[i];
                 if (!e.specialized_type.is_valid() || !e.instantiated_type.is_valid()) { continue; }
-                if (e.specialized_type.id == owner_type.id
-                        || this.arena.display_equal(e.specialized_type.id, owner_type.id)) {
-                    const it: Type* = this.arena.lookup(e.instantiated_type.id);
-                    if (it != null && it.kind == TypeKind::InstantiatedType) {
-                        inst = it as InstantiatedType*;
+                if (e.specialized_type.id == owner_type.id) {
+                    const cand: TypeRef = this.arena.inst_generic_base(e.instantiated_type);
+                    if (cand.is_valid()) {
+                        owner_src = e.instantiated_type;
+                        owner_base = cand;
                         break;
                     }
                 }
             }
         }
-        if (inst == null) { return; }
+        if (!owner_base.is_valid()) { return; }
+        const owner_nargs: i64 = this.arena.inst_type_arg_count(owner_src);
         const tmpl: TemplateEntry* =
-            this.generic_registry.get_template_by_type_id(inst.generic_base.id);
+            this.generic_registry.get_template_by_type_id(owner_base.id);
         if (tmpl == null || tmpl.ast_node == null) { return; }
         const empty_params: GenericParamNode*[] = [];
         mut owner_params: &GenericParamNode*[] = &empty_params;
@@ -1609,27 +1664,21 @@ type struct MonoCallSpecializer {
         } else {
             return;
         }
-        const n: i64 = if (owner_params.length < inst.type_args.length) {
+        const n: i64 = if (owner_params.length < owner_nargs) {
             owner_params.length
         } else {
-            inst.type_args.length
+            owner_nargs
         };
         for (mut i: i64 = 0; i < n; i++) {
             const gp: GenericParamNode* = owner_params[i];
             if (gp == null) { continue; }
-            if (this.arena.contains_generic_param(inst.type_args[i])) { continue; }
+            const arg_i: TypeRef = this.arena.inst_type_arg_at(owner_src, i);
+            if (this.arena.contains_generic_param(arg_i)) { continue; }
             const pref: TypeRef = this.arena.create_generic_param(gp.name, i as u64);
-            subst.add(pref.id, inst.type_args[i]);
+            subst.add(pref.id, arg_i);
         }
     }
 
-    /// Recover the concrete specialized type for an InstantiatedType that the
-    /// substituter minted with fresh arg TypeIDs (so it missed
-    /// `instantiated_cache`/`resolved_type`) by matching it STRUCTURALLY against a
-    /// materialized spec entry's instantiated type.  TypeID identity is not logical
-    /// identity across the pre-/post-mono boundary (see
-    /// `TypeArena::propagate_instantiated_resolution`), so display-equality - not id
-    /// equality - is the correct key.  Invalid when no materialized spec matches.
     /// If `recv_type` is a bare generic-template struct/class (every type param has a
     /// default), build its DEFAULT instantiation and return the materialized spec's
     /// concrete type - so a generic-method call on the bare template pins/emits under
@@ -1661,21 +1710,12 @@ type struct MonoCallSpecializer {
             if (!da.is_valid() || this.arena.contains_generic_param(da)) { return recv_type; }
             default_args.push(da);
         }
+        // `create_instantiation` interns by (base.id, arg ids), so this IS the id
+        // the spec was materialized against - if one was.  Only the membership
+        // question remains; the type needs no recovery.
         const default_inst: TypeRef = this.arena.create_instantiation(recv_type, &default_args);
-        const spec_ty: TypeRef = this.resolve_unresolved_inst_via_spec(default_inst);
-        if (spec_ty.is_valid()) { return spec_ty; }
+        if (this.state.has_materialized_spec(default_inst)) { return default_inst; }
         return recv_type;
-    }
-
-    resolve_unresolved_inst_via_spec(&this, recv_type: TypeRef) -> TypeRef {
-        for (mut i: i64 = 0; i < this.state.spec_entries.length; i++) {
-            const e: SpecializationEntry* = &this.state.spec_entries[i];
-            if (!e.instantiated_type.is_valid() || !e.specialized_type.is_valid()) { continue; }
-            if (this.arena.display_equal(e.instantiated_type.id, recv_type.id)) {
-                return e.specialized_type;
-            }
-        }
-        return TypeRef::invalid();
     }
 
     /// Spec'd impl-block method lookup, with bound-directed dispatch (prefer the
@@ -1926,7 +1966,7 @@ type struct MonoCallSpecializer {
             this.add_owner_param_bindings(&subst_val, owner_type);
         }
         const subst_ptr: TypeSubstitution* =
-            allocator::alloc(sizeof(TypeSubstitution), 16u64) as TypeSubstitution*;
+            allocator::alloc(sizeof(TypeSubstitution), 16) as TypeSubstitution*;
         *subst_ptr = subst_val;
 
         mut cloner: ASTCloner = ASTCloner();
@@ -1957,6 +1997,12 @@ type struct MonoCallSpecializer {
         if (this.type_resolver != null) {
             mut module_name: string = "";
             mut res_ctx: ResolutionContext = ResolutionContext::new(module_name, "");
+            // The signature being re-resolved was WRITTEN in the owner's module,
+            // while the ambient scope chain is still the module that triggered
+            // this specialization.  A bare leaf in the return / parameter
+            // annotations must bind as the owner's module sees it, or a same-leaf
+            // type visible at the call site silently wins.
+            res_ctx.set_home_module(this.arena.module_ns_of(owner_type));
             if (owner_type.is_valid()) { res_ctx.set_this_type(owner_type); }
             if (owner_impl != null) {
                 for (mut di: i64 = 0; di < owner_impl.derived_param_names.length; di++) {
@@ -2216,7 +2262,6 @@ type struct MonoCallSpecializer {
             TypeAnnotation::Generic(ga)   => { this.trait_leaf_of_ann(ga.base) }
             TypeAnnotation::Reference(ra) => { this.trait_leaf_of_ann(ra.inner) }
             TypeAnnotation::Pointer(pa)   => { this.trait_leaf_of_ann(pa.inner) }
-            TypeAnnotation::Optional(oa)  => { this.trait_leaf_of_ann(oa.inner) }
             _                             => { SymbolStr::empty() }
         };
     }

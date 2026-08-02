@@ -58,7 +58,7 @@ import io::error;
 import io::stdio;
 import fmt::display;
 import ffi::libc;
-import ffi::syscall;
+import sys::syscall;
 import process::child;
 import process::command;
 import sync::atomic;
@@ -667,21 +667,21 @@ function contains_substring(haystack: Str, needle: Str) -> boolean {
 function num_cpus() -> u32 {
     // _SC_NPROCESSORS_ONLN == 84 on Linux/glibc and the BSDs.
     const n: i64 = libc::sysconf(84);
-    if (n <= 0i64) { return 1u32; }
+    if (n <= 0) { return 1; }
     return n as u32;
 }
 
 ![target(windows)]
 function num_cpus() -> u32 {
     mut si: syscall::SYSTEM_INFO_PARTIAL = syscall::SYSTEM_INFO_PARTIAL {
-        wProcessorArchitecture: 0u16, wReserved: 0u16, dwPageSize: 0u32,
+        wProcessorArchitecture: 0, wReserved: 0, dwPageSize: 0,
         lpMinimumApplicationAddress: null, lpMaximumApplicationAddress: null,
-        dwActiveProcessorMask: 0u64, dwNumberOfProcessors: 0u32,
-        dwProcessorType: 0u32, dwAllocationGranularity: 0u32,
-        wProcessorLevel: 0u16, wProcessorRevision: 0u16
+        dwActiveProcessorMask: 0, dwNumberOfProcessors: 0,
+        dwProcessorType: 0, dwAllocationGranularity: 0,
+        wProcessorLevel: 0, wProcessorRevision: 0
     };
     syscall::GetSystemInfo(&si as u8*);
-    if (si.dwNumberOfProcessors == 0u32) { return 1u32; }
+    if (si.dwNumberOfProcessors == 0) { return 1; }
     return si.dwNumberOfProcessors;
 }
 
@@ -712,10 +712,10 @@ function num_cpus() -> u32 {
 function drain_fd_into(fd: i32, out: mut &String) -> void {
     mut buf: u8[4096];
     loop {
-        const n: i64 = libc::read(fd, &buf[0], 4096u64);
-        if (n > 0i64) {
+        const n: i64 = libc::read(fd, &buf[0], 4096);
+        if (n > 0) {
             out.push(Str::from_raw(&buf[0], n as u64));
-        } else if (n == 0i64) {
+        } else if (n == 0) {
             return;                                  // EOF: all write ends closed
         } else {
             if (libc::errno() == 4) { continue; }    // EINTR
@@ -736,12 +736,12 @@ function run_one(d: TestDescriptor, idx: u64, timeout_secs: u32,
     // path stays async-signal-safe (dup2/close/execv + _exit only).
     mut exe_buf: u8[4096];
     mut exe_path: String = String::with_null(Str::new("/proc/self/exe"));
-    const exe_n: i64 = libc::readlink(exe_path.as_ptr(), &exe_buf[0], 4095u64);
+    const exe_n: i64 = libc::readlink(exe_path.as_ptr(), &exe_buf[0], 4095);
     exe_path.drop();
-    if (exe_n <= 0i64) {
+    if (exe_n <= 0) {
         return TestRun::bare(TestOutcome::RunnerError(libc::errno()));
     }
-    exe_buf[exe_n as u64] = 0u8; // readlink does not NUL-terminate.
+    exe_buf[exe_n as u64] = 0; // readlink does not NUL-terminate.
 
     // `--timeout=<n>`: propagated so the re-exec'd child arms its own
     // SIGALRM watchdog (the POSIX child times itself out; the parent just
@@ -749,13 +749,13 @@ function run_one(d: TestDescriptor, idx: u64, timeout_secs: u32,
     mut timeout_arg: String = String::new();
     timeout_arg.push(Str::new("--timeout="));
     append_u64(&timeout_arg, timeout_secs as u64);
-    timeout_arg.push_byte(0u8);
+    timeout_arg.push_byte(0);
 
     // `--test-runner-child=<idx>`: selects the single test to run.
     mut child_arg: String = String::new();
     child_arg.push(Str::new("--test-runner-child="));
     append_u64(&child_arg, idx);
-    child_arg.push_byte(0u8);
+    child_arg.push_byte(0);
 
     mut argv: command::ArgvBuf = command::ArgvBuf::new();
     match (argv.push(&exe_buf[0]))         { Result::Ok(_) => { } Result::Err(_) => { } }
@@ -839,7 +839,7 @@ function run_one(d: TestDescriptor, idx: u64, timeout_secs: u32,
 /// timeout with WaitForSingleObject - so this is a no-op there.
 ![target(unix)]
 function arm_watchdog(timeout_secs: u32) -> void {
-    if (timeout_secs > 0u32) {
+    if (timeout_secs > 0) {
         libc::alarm(timeout_secs);
     }
 }
@@ -880,16 +880,16 @@ function run_child_single(idx: u64, descriptors: TestDescriptor*, count: u64,
 /// Append a `u64` as decimal digits to a `String`.  Used to build the
 /// `--test-runner-child=<idx>` argument for the Windows re-exec.
 function append_u64(out: mut &String, x: u64) -> void {
-    if (x == 0u64) { out.push_byte(0x30u8); return; }
+    if (x == 0) { out.push_byte(0x30); return; }
     mut tmp: u8[24];
     mut ti: u64 = 0;
     mut v: u64 = x;
-    while (v > 0u64) {
-        tmp[ti] = ((v % 10u64) + 0x30u64) as u8;
+    while (v > 0) {
+        tmp[ti] = ((v % 10) + 0x30) as u8;
         ti = ti + 1;
-        v = v / 10u64;
+        v = v / 10;
     }
-    while (ti > 0u64) {
+    while (ti > 0) {
         ti = ti - 1;
         out.push_byte(tmp[ti]);
     }
@@ -900,16 +900,20 @@ function append_u64(out: mut &String, x: u64) -> void {
 /// open doesn't hit a sharing violation.
 ![target(windows)]
 function read_capture_file(path: &String, out: mut &String) -> void {
+    // Delete sharing here too: this handle is open across the sibling tests'
+    // spawns, so without it their `DeleteFileA` calls fail and leak. See the
+    // capture-file creation in `run_one` for the full story.
     const h: u8* = syscall::CreateFileA(path.as_ptr(), syscall::GENERIC_READ,
-        syscall::FILE_SHARE_READ | syscall::FILE_SHARE_WRITE, null,
-        syscall::OPEN_EXISTING, 0u32, null);
+        syscall::FILE_SHARE_READ | syscall::FILE_SHARE_WRITE
+            | syscall::FILE_SHARE_DELETE, null,
+        syscall::OPEN_EXISTING, 0, null);
     if ((h as i64) == -1) { return; }   // local -1, not the cross-module const
     mut buf: u8[4096];
     loop {
-        mut nread: u32 = 0u32;
-        const ok: i32 = syscall::ReadFile(h, &buf[0], 4096u32, &nread, null);
+        mut nread: u32 = 0;
+        const ok: i32 = syscall::ReadFile(h, &buf[0], 4096, &nread, null);
         if (ok == 0) { break; }          // read error
-        if (nread == 0u32) { break; }    // EOF
+        if (nread == 0) { break; }    // EOF
         out.push(Str::from_raw(&buf[0], nread as u64));
     }
     syscall::CloseHandle(h);
@@ -929,20 +933,20 @@ function run_one(d: TestDescriptor, idx: u64, timeout_secs: u32,
     libc::fflush(null);
 
     mut exe_buf: u8[1024];
-    const n: u32 = libc::GetModuleFileNameA(null, &exe_buf[0], 1024u32);
-    if (n == 0u32 || n >= 1024u32) { return TestRun::bare(TestOutcome::RunnerError(0)); }
-    exe_buf[n as u64] = 0u8;
+    const n: u32 = libc::GetModuleFileNameA(null, &exe_buf[0], 1024);
+    if (n == 0 || n >= 1024) { return TestRun::bare(TestOutcome::RunnerError(0)); }
+    exe_buf[n as u64] = 0;
 
     // Command line:  "<exe>" --test-runner-child=<idx>\0   (CreateProcessA may
     // modify the buffer, so it's an owned String).
     mut cmd: String = String::new();
-    cmd.push_byte(34u8);
+    cmd.push_byte(34);
     mut k: u64 = 0;
     while (k < n as u64) { cmd.push_byte(exe_buf[k]); k = k + 1; }
-    cmd.push_byte(34u8);
+    cmd.push_byte(34);
     cmd.push(Str::new(" --test-runner-child="));
     append_u64(&cmd, idx);
-    cmd.push_byte(0u8);
+    cmd.push_byte(0);
 
     // Capture: redirect the child's stdout+stderr to a per-test temp file.
     // A setup failure falls back to inherited stdio (have_cap stays false).
@@ -951,36 +955,67 @@ function run_one(d: TestDescriptor, idx: u64, timeout_secs: u32,
     mut have_cap:   boolean = false;
     if (capture) {
         mut dir_buf: u8[512];
-        const dl: u32 = syscall::GetTempPathA(512u32, &dir_buf[0]);
-        if (dl > 0u32 && dl < 512u32) {
-            mut name_buf: u8[512];
-            mut prefix: String = String::with_null(Str::new("cyt"));
-            // GetTempFileNameA creates a unique empty file and writes its full
-            // NUL-terminated path into name_buf.
-            const uniq: u32 = syscall::GetTempFileNameA(&dir_buf[0], prefix.as_ptr(),
-                                                        0u32, &name_buf[0]);
-            prefix.drop();
-            if (uniq != 0u32) {
-                mut sa: syscall::SECURITY_ATTRIBUTES = syscall::SECURITY_ATTRIBUTES {
-                    nLength: 24u32, lpSecurityDescriptor: null, bInheritHandle: 1
-                };
-                const h: u8* = syscall::CreateFileA(&name_buf[0], syscall::GENERIC_WRITE,
-                    syscall::FILE_SHARE_READ | syscall::FILE_SHARE_WRITE, &sa as u8*,
-                    syscall::CREATE_ALWAYS, 0u32, null);
-                if ((h as i64) != -1) {
-                    cap_handle = h;
-                    cap_path   = String::with_null(cstr_to_str(&name_buf[0]));
-                    have_cap   = true;
-                }
+        const dl: u32 = syscall::GetTempPathA(512, &dir_buf[0]);
+        if (dl > 0 && dl < 512) {
+            // Name the capture file DETERMINISTICALLY from (pid, test index)
+            // rather than asking `GetTempFileNameA` for a unique one.
+            //
+            // `GetTempFileNameA(uUnique = 0)` PROBES the filesystem: it derives a
+            // candidate from the clock and then increments and retries until it
+            // finds a name that does not exist. It can only ever mint 65535 of
+            // them (a 16-bit space). A run that is killed part-way leaks its
+            // capture files, so `%TEMP%` accumulates `cyt*` entries across runs -
+            // and once that space SATURATES, every call scans essentially all
+            // 65535 names before succeeding, on every test, from every worker.
+            //
+            // Observed here: 65535 stale files had built up over six days, and
+            // the same 25-test subset took 110s instead of 1.18s (~93x), with
+            // 12 workers slower than 1 because they all probed the same
+            // saturated directory. Deleting the leftovers restored it instantly.
+            //
+            // (pid, idx) is unique BY CONSTRUCTION: no probing, no 65535 ceiling,
+            // and leaked files are simply overwritten by `CREATE_ALWAYS` on a
+            // later run with the same pid rather than poisoning the namespace.
+            mut path: String = String::new();
+            path.push(cstr_to_str(&dir_buf[0]));        // GetTempPathA ends in `\`
+            path.push(Str::new("cyt"));
+            append_u64(&path, syscall::GetCurrentProcessId() as u64);
+            path.push_byte(95);                        // '_'
+            append_u64(&path, idx);
+            path.push(Str::new(".tmp"));
+            path.push_byte(0);
+
+            mut sa: syscall::SECURITY_ATTRIBUTES = syscall::SECURITY_ATTRIBUTES {
+                nLength: 24, lpSecurityDescriptor: null, bInheritHandle: 1
+            };
+            // FILE_SHARE_DELETE matters: `bInheritHandles = TRUE` hands EVERY
+            // in-flight capture handle to EVERY child, so while sibling tests
+            // are running this file has open handles in other processes. Without
+            // delete sharing, the `DeleteFileA` after the read fails with a
+            // sharing violation and the file is LEAKED - which is how `%TEMP%`
+            // accumulated 65535 `cyt*` files over six days and saturated
+            // `GetTempFileNameA`. Measured: 1481 tests leaked ~1481 files per
+            // run before this flag; zero after.
+            const share: u32 = syscall::FILE_SHARE_READ | syscall::FILE_SHARE_WRITE
+                             | syscall::FILE_SHARE_DELETE;
+            const h: u8* = syscall::CreateFileA(path.as_ptr(), syscall::GENERIC_WRITE,
+                share, &sa as u8*,
+                syscall::CREATE_ALWAYS, 0, null);
+            if ((h as i64) != -1) {
+                cap_handle = h;
+                cap_path   = path;
+                have_cap   = true;
+            } else {
+                path.drop();
             }
         }
     }
 
     mut si: syscall::STARTUPINFOA = syscall::STARTUPINFOA {
-        cb: 104u32, lpReserved: null, lpDesktop: null, lpTitle: null,
-        dwX: 0u32, dwY: 0u32, dwXSize: 0u32, dwYSize: 0u32,
-        dwXCountChars: 0u32, dwYCountChars: 0u32, dwFillAttribute: 0u32,
-        dwFlags: 0u32, wShowWindow: 0u16, cbReserved2: 0u16,
+        cb: 104, lpReserved: null, lpDesktop: null, lpTitle: null,
+        dwX: 0, dwY: 0, dwXSize: 0, dwYSize: 0,
+        dwXCountChars: 0, dwYCountChars: 0, dwFillAttribute: 0,
+        dwFlags: 0, wShowWindow: 0, cbReserved2: 0,
         lpReserved2: null, hStdInput: null, hStdOutput: null, hStdError: null
     };
     mut inherit: i32 = 0;
@@ -994,10 +1029,10 @@ function run_one(d: TestDescriptor, idx: u64, timeout_secs: u32,
         inherit = 1;
     }
     mut pi: syscall::PROCESS_INFORMATION = syscall::PROCESS_INFORMATION {
-        hProcess: null, hThread: null, dwProcessId: 0u32, dwThreadId: 0u32
+        hProcess: null, hThread: null, dwProcessId: 0, dwThreadId: 0
     };
     const ok: i32 = syscall::CreateProcessA(null, cmd.as_ptr(), null, null,
-                                            inherit, 0u32, null, null, &si, &pi);
+                                            inherit, 0, null, null, &si, &pi);
     cmd.drop();
     if (ok == 0) {
         if (have_cap) {
@@ -1009,11 +1044,11 @@ function run_one(d: TestDescriptor, idx: u64, timeout_secs: u32,
     }
     syscall::CloseHandle(pi.hThread);
 
-    const ms: u32 = if (timeout_secs > 0u32) { timeout_secs * 1000u32 } else { 0xFFFFFFFFu32 };
+    const ms: u32 = if (timeout_secs > 0) { timeout_secs * 1000 } else { 0xFFFFFFFF };
     const w: u32 = syscall::WaitForSingleObject(pi.hProcess, ms);
-    if (w == 0x102u32) {   // WAIT_TIMEOUT
-        syscall::TerminateProcess(pi.hProcess, 1u32);
-        syscall::WaitForSingleObject(pi.hProcess, 0xFFFFFFFFu32);
+    if (w == 0x102) {   // WAIT_TIMEOUT
+        syscall::TerminateProcess(pi.hProcess, 1);
+        syscall::WaitForSingleObject(pi.hProcess, 0xFFFFFFFF);
         syscall::CloseHandle(pi.hProcess);
         mut cap_to: String = String::new();
         if (have_cap) {
@@ -1024,7 +1059,7 @@ function run_one(d: TestDescriptor, idx: u64, timeout_secs: u32,
         cap_path.drop();
         return TestRun { outcome: TestOutcome::Timeout(timeout_secs), captured: cap_to };
     }
-    mut code: u32 = 0u32;
+    mut code: u32 = 0;
     syscall::GetExitCodeProcess(pi.hProcess, &code);
     syscall::CloseHandle(pi.hProcess);
 
@@ -1451,7 +1486,7 @@ type struct WorkerCtx {
 /// worker has finished.
 function test_worker(ctx: WorkerCtx) -> void {
     loop {
-        const k: u64 = (*ctx.counter).fetch_add(1u64, MemoryOrder::Relaxed);
+        const k: u64 = (*ctx.counter).fetch_add(1, MemoryOrder::Relaxed);
         if (k >= ctx.n_runnable) { break; }
         const idx: u64 = ctx.runnable[k];
 
@@ -1501,7 +1536,7 @@ function print_in_flight(descriptors: TestDescriptor*, count: u64,
                         libc::printf(", ... and %llu more", n_in_flight - shown);
                         break;
                     }
-                    if (shown > 0u64) { libc::printf(", "); }
+                    if (shown > 0) { libc::printf(", "); }
                     const d: TestDescriptor = descriptors[i];
                     libc::printf("%.*s", d.name.length() as i32, d.name.as_ptr());
                     shown = shown + 1;
@@ -1614,7 +1649,7 @@ type struct TestRunner {
         libc::printf("%.*s", v.length() as i32, v.as_ptr());
         // Guarantee the trailing rule starts on its own line even when the
         // test's last write had no newline.
-        if (v.length() == 0u64 || v.as_ptr()[v.length() - 1u64] != 0x0Au8) {
+        if (v.length() == 0 || v.as_ptr()[v.length() - 1] != 0x0A) {
             libc::printf("\n");
         }
         libc::printf("----\n");
@@ -1737,7 +1772,7 @@ type struct TestRunner {
             const outcome: TestOutcome = tr.outcome;
             const failed: boolean = is_failure(outcome);
             this.report_end(outcome, d.should_panic);
-            if (this.should_show(failed) && tr.captured.length() > 0u64) {
+            if (this.should_show(failed) && tr.captured.length() > 0) {
                 this.report_output(d.name, &tr.captured);
             }
             tr.drop();
@@ -1784,7 +1819,7 @@ type struct TestRunner {
         }
 
         const n_runnable: u64 = runnable.length();
-        if (n_runnable == 0u64) {
+        if (n_runnable == 0) {
             in_flight.drop();
             runnable.drop();
             return;
@@ -1792,7 +1827,7 @@ type struct TestRunner {
 
         // Shared work cursor on the stack; workers borrow it by pointer and we
         // join them all before this frame returns (scoped-thread idiom).
-        mut counter: Atomic<u64> = Atomic<u64>::new(0u64);
+        mut counter: Atomic<u64> = Atomic<u64>::new(0);
         const cptr: Atomic<u64>* = &counter;
 
         mut rx: mpsc::Receiver<WorkerResult> = mpsc::channel<WorkerResult>();
@@ -1836,14 +1871,14 @@ type struct TestRunner {
                             }
                             WorkerEventKind::Finished => {
                                 in_flight.set(ev.idx, false);
-                                if (n_in_flight > 0u64) {
+                                if (n_in_flight > 0) {
                                     n_in_flight = n_in_flight - 1;
                                 }
                                 const d: TestDescriptor = this.descriptors[ev.idx];
                                 const outcome: TestOutcome = ev.outcome;
                                 const failed: boolean = is_failure(outcome);
                                 this.report_live_finish(d.name, outcome, d.should_panic);
-                                if (this.should_show(failed) && ev.captured.length() > 0u64) {
+                                if (this.should_show(failed) && ev.captured.length() > 0) {
                                     this.report_output(d.name, &ev.captured);
                                 }
                                 if (failed) {
@@ -1856,7 +1891,7 @@ type struct TestRunner {
                         }
                         ev.drop();
                         // Progress: clear the idle timer and re-arm the report.
-                        idle_ms = 0u64;
+                        idle_ms = 0;
                         next_report_ms = STALL_REPORT_MS;
                     }
                     Result::Err(e) => {
@@ -1866,9 +1901,9 @@ type struct TestRunner {
                             TryRecvError::Disconnected => { break; }
                             TryRecvError::Empty => {
                                 idle_ms = idle_ms + STALL_POLL_MS;
-                                if (n_in_flight > 0u64 && idle_ms >= next_report_ms) {
+                                if (n_in_flight > 0 && idle_ms >= next_report_ms) {
                                     print_in_flight(this.descriptors, this.count,
-                                        &in_flight, n_in_flight, idle_ms / 1000u64);
+                                        &in_flight, n_in_flight, idle_ms / 1000);
                                     next_report_ms = next_report_ms + STALL_REPORT_MS;
                                 }
                                 thread::sleep_ms(STALL_POLL_MS);
@@ -1927,8 +1962,8 @@ type struct TestRunner {
         // Resolve the worker count: explicit `--jobs`/`CRYO_TEST_JOBS`, else
         // the online CPU count. Clamp to at least 1.
         mut jobs: u32 = this.opts.jobs;
-        if (jobs == 0u32) { jobs = num_cpus(); }
-        if (jobs == 0u32) { jobs = 1u32; }
+        if (jobs == 0) { jobs = num_cpus(); }
+        if (jobs == 0) { jobs = 1; }
 
         // Pre-pass: count how many descriptors match the filter so the
         // `running N tests` header is honest.
@@ -1949,7 +1984,7 @@ type struct TestRunner {
         }
 
         // A worker pool only pays off with more than one test to spread.
-        const parallel: boolean = jobs > 1u32 && to_run > 1u64;
+        const parallel: boolean = jobs > 1 && to_run > 1;
 
         this.print_header(jobs, to_run, parallel);
 

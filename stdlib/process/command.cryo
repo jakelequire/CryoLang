@@ -22,6 +22,7 @@ import core::option;
 import core::result;
 import core::slice;
 import core::drop;
+import core::mem;
 import io::error;
 import io::fd;
 import io::traits;
@@ -31,9 +32,13 @@ import collections::str;
 import collections::string;
 import alloc::allocator;
 import ffi::libc;
-import ffi::syscall;
+import sys::syscall;
 import alloc::layout;
 import process::child;
+import future::poll;
+import future::waker;
+import future::traits;
+import future::combinator;
 
 // ArgvBuf: owned grow-on-push buffer of `u8*` for execvp's argv.
 //
@@ -176,6 +181,114 @@ type struct Command {
         const handle: Child = this.spawn()?;
         mut c: Child = handle;
         return c.wait();
+    }
+
+    /// Spawn, capture both streams, and await the exit without blocking the
+    /// calling thread: the async spelling of `output`.
+    ///
+    /// The two pipes are drained CONCURRENTLY. Draining one to EOF before
+    /// starting the other deadlocks any child that fills the second pipe's
+    /// buffer in the meantime — the kernel blocks the child's write, so the
+    /// child never exits and the first pipe never reaches EOF. That is the same
+    /// hazard the synchronous `output` interleaves its drains to avoid.
+    ///
+    /// The exit is awaited only after both pipes report EOF, which they do once
+    /// the child has closed them. Ordering it that way keeps the blocking cost
+    /// to the drains: on Windows a captured child occupies two pool threads
+    /// while draining (one per pipe — its reactor cannot watch a pipe, see
+    /// `PipeDrain`) and one while joining, never all three at once. On Linux
+    /// the drains and the exit all sit on the reactor and occupy no pool thread
+    /// at all. A program running N children concurrently should still size the
+    /// pool for 2N on Windows.
+    ///
+    /// Cancelling mid-drain closes the captured pipes and leaves the child
+    /// running — precisely the state `Child::drop` already handles.
+    async collect(&this) -> Result<Output, IoError> {
+        mut configured: Command = clone_command(this);
+        configured.stdout_cfg = Stdio::Piped;
+        configured.stderr_cfg = Stdio::Piped;
+        const handle: Child = configured.spawn()?;
+        mut c: Child = handle;
+
+        // Hand each descriptor to its drain and neuter the handle it came from.
+        // The handle stays in its slot so the `Child`'s teardown still runs, but
+        // with `-1` it closes nothing — the drain owns the descriptor now, and
+        // closing it twice could land on a number an unrelated open has reused.
+        mut so_fd: i32 = -1;
+        if (c.stdout.is_some()) {
+            mut hp: ChildStdout* = c.stdout.unwrap_ptr();
+            so_fd = hp.fd;
+            hp.fd = -1;
+        }
+        mut se_fd: i32 = -1;
+        if (c.stderr.is_some()) {
+            mut hp2: ChildStderr* = c.stderr.unwrap_ptr();
+            se_fd = hp2.fd;
+            hp2.fd = -1;
+        }
+
+        mut drained: (Result<Array<u8>, IoError>, Result<Array<u8>, IoError>) =
+            await Futures::join(PipeDrain::start(so_fd), PipeDrain::start(se_fd));
+
+        // Swap each half out rather than reading `drained.0` / `drained.1`
+        // directly: a tuple that owns a destructor still drops both fields at
+        // scope exit, so moving one out would leave the tuple to free it a
+        // second time. The placeholders left behind own nothing.
+        mut r_out: Result<Array<u8>, IoError> = Result::Err(IoError::new(IoErrorKind::Other, 0));
+        mut r_err: Result<Array<u8>, IoError> = Result::Err(IoError::new(IoErrorKind::Other, 0));
+        mem::swap<Result<Array<u8>, IoError>>(&r_out, &drained.0);
+        mem::swap<Result<Array<u8>, IoError>>(&r_err, &drained.1);
+
+        mut out_buf: Array<u8> = Array::new();
+        mut err_buf: Array<u8> = Array::new();
+        mut failed:  Option<IoError> = Option::None;
+        match (r_out) {
+            Result::Ok(b)  => { out_buf = b; }
+            Result::Err(e) => { failed = Option::Some(e); }
+        }
+        match (r_err) {
+            Result::Ok(b)  => { err_buf = b; }
+            Result::Err(e) => { failed = Option::Some(e); }
+        }
+        // Both halves are consumed before reporting either failure, so the
+        // buffer belonging to the half that succeeded is released rather than
+        // leaked on the error path.
+        match (failed) {
+            Option::Some(e) => {
+                out_buf.drop();
+                err_buf.drop();
+                return Result::Err(e);
+            }
+            Option::None => { }
+        }
+
+        mut joined: Result<ExitStatus, IoError> = await c.join();
+        match (joined) {
+            Result::Ok(status) => {
+                return Result::Ok(Output {
+                    status: status,
+                    stdout: out_buf,
+                    stderr: err_buf
+                });
+            }
+            Result::Err(e) => {
+                out_buf.drop();
+                err_buf.drop();
+                return Result::Err(e);
+            }
+        }
+    }
+
+    /// Spawn and await the exit without capturing anything: the async spelling
+    /// of `status`. Stdio goes wherever the caller configured it.
+    ///
+    /// A child whose output is left `Piped` and never drained can still fill a
+    /// pipe buffer and stop making progress; use `collect` when anything is
+    /// captured.
+    async run(&this) -> Result<ExitStatus, IoError> {
+        const handle: Child = this.spawn()?;
+        mut c: Child = handle;
+        return await c.join();
     }
 
     /// Run `command` through the platform shell (`/bin/sh -c` on POSIX,
@@ -593,7 +706,7 @@ function spawn_impl(cmd: &Command) -> Result<Child, IoError> {
     // The argument strings + pointer array fall out of scope at function
     // exit; the synthesized drops release them.  The child has its own COW
     // copies, which are either replaced by exec or abandoned on _exit.
-    return Result::Ok(Child::new(pid, 0u64, stdin_handle, stdout_handle, stderr_handle));
+    return Result::Ok(Child::new(pid, 0, stdin_handle, stdout_handle, stderr_handle));
 }
 
 function close_pipe(pair: &PipePair) -> void {
@@ -869,39 +982,39 @@ type struct WinStdio {
 function win_append_quoted(out: mut &String, arg: &String) -> void {
     const p: u8* = arg.as_ptr();
     const n: u64 = arg.length();
-    mut need: boolean = (n == 0u64);
-    mut s: u64 = 0u64;
+    mut need: boolean = (n == 0);
+    mut s: u64 = 0;
     while (s < n) {
         const c: u8 = p[s];
-        if (c == 32u8 || c == 9u8 || c == 34u8) { need = true; }
-        s = s + 1u64;
+        if (c == 32 || c == 9 || c == 34) { need = true; }
+        s = s + 1;
     }
     if (!need) {
-        mut k: u64 = 0u64;
-        while (k < n) { out.push_byte(p[k]); k = k + 1u64; }
+        mut k: u64 = 0;
+        while (k < n) { out.push_byte(p[k]); k = k + 1; }
         return;
     }
-    out.push_byte(34u8);   // opening quote
-    mut j: u64 = 0u64;
+    out.push_byte(34);   // opening quote
+    mut j: u64 = 0;
     while (j < n) {
-        mut bs: u64 = 0u64;
-        while (j < n && p[j] == 92u8) { bs = bs + 1u64; j = j + 1u64; }
+        mut bs: u64 = 0;
+        while (j < n && p[j] == 92) { bs = bs + 1; j = j + 1; }
         if (j == n) {
-            mut d: u64 = 0u64;
-            while (d < bs * 2u64) { out.push_byte(92u8); d = d + 1u64; }
-        } else if (p[j] == 34u8) {
-            mut d: u64 = 0u64;
-            while (d < bs * 2u64 + 1u64) { out.push_byte(92u8); d = d + 1u64; }
-            out.push_byte(34u8);
-            j = j + 1u64;
+            mut d: u64 = 0;
+            while (d < bs * 2) { out.push_byte(92); d = d + 1; }
+        } else if (p[j] == 34) {
+            mut d: u64 = 0;
+            while (d < bs * 2 + 1) { out.push_byte(92); d = d + 1; }
+            out.push_byte(34);
+            j = j + 1;
         } else {
-            mut d: u64 = 0u64;
-            while (d < bs) { out.push_byte(92u8); d = d + 1u64; }
+            mut d: u64 = 0;
+            while (d < bs) { out.push_byte(92); d = d + 1; }
             out.push_byte(p[j]);
-            j = j + 1u64;
+            j = j + 1;
         }
     }
-    out.push_byte(34u8);   // closing quote
+    out.push_byte(34);   // closing quote
 }
 
 // Build the NUL-terminated command line "program arg1 arg2 ..." for
@@ -910,15 +1023,15 @@ function win_append_quoted(out: mut &String, arg: &String) -> void {
 function build_cmdline(cmd: &Command) -> String {
     mut cl: String = String::new();
     win_append_quoted(&cl, &cmd.program);
-    mut i: u64 = 0u64;
+    mut i: u64 = 0;
     while (i < cmd.args.length()) {
         match (cmd.args.get_ref(i)) {
-            Option::Some(a) => { cl.push_byte(32u8); win_append_quoted(&cl, a); }
+            Option::Some(a) => { cl.push_byte(32); win_append_quoted(&cl, a); }
             Option::None    => { break; }
         }
-        i = i + 1u64;
+        i = i + 1;
     }
-    cl.push_byte(0u8);   // NUL terminator (kept in the buffer)
+    cl.push_byte(0);   // NUL terminator (kept in the buffer)
     return cl;
 }
 
@@ -927,8 +1040,8 @@ function build_cmdline(cmd: &Command) -> String {
 function win_append_bytes(blk: &String, s: &String) -> void {
     const p: u8* = s.as_ptr();
     const n: u64 = s.length();
-    mut i: u64 = 0u64;
-    while (i < n) { blk.push_byte(p[i]); i = i + 1u64; }
+    mut i: u64 = 0;
+    while (i < n) { blk.push_byte(p[i]); i = i + 1; }
 }
 
 // True if the `KEY=VALUE\0` entry at `entry` has key exactly `key` (i.e. the
@@ -938,12 +1051,12 @@ function win_append_bytes(blk: &String, s: &String) -> void {
 function win_env_key_matches(entry: u8*, key: &String) -> boolean {
     const klen: u64 = key.length();
     const kp: u8* = key.as_ptr();
-    mut i: u64 = 0u64;
+    mut i: u64 = 0;
     while (i < klen) {
         if (entry[i] != kp[i]) { return false; }
-        i = i + 1u64;
+        i = i + 1;
     }
-    return entry[klen] == 61u8;  // '='
+    return entry[klen] == 61;  // '='
 }
 
 // Build the ANSI environment block for CreateProcessA: a sequence of
@@ -961,11 +1074,11 @@ function build_env_block(cmd: &Command) -> String {
     if (!cmd.clear_env_flag) {
         const base: u8* = syscall::GetEnvironmentStrings();
         if (base != null) {
-            mut i: u64 = 0u64;
-            while (base[i] != 0u8) {        // until the block's double-NUL
+            mut i: u64 = 0;
+            while (base[i] != 0) {        // until the block's double-NUL
                 const start: u64 = i;
                 mut overridden: boolean = false;
-                mut e: u64 = 0u64;
+                mut e: u64 = 0;
                 while (e < cmd.envs.length()) {
                     match (cmd.envs.get_ref(e)) {
                         Option::Some(en) => {
@@ -975,36 +1088,36 @@ function build_env_block(cmd: &Command) -> String {
                         }
                         Option::None => { }
                     }
-                    e = e + 1u64;
+                    e = e + 1;
                 }
                 // Copy (or skip) the whole `KEY=VALUE\0` entry.
-                while (base[i] != 0u8) {
+                while (base[i] != 0) {
                     if (!overridden) { blk.push_byte(base[i]); }
-                    i = i + 1u64;
+                    i = i + 1;
                 }
-                if (!overridden) { blk.push_byte(0u8); }
-                i = i + 1u64;              // step past the entry's NUL
+                if (!overridden) { blk.push_byte(0); }
+                i = i + 1;              // step past the entry's NUL
             }
             syscall::FreeEnvironmentStringsA(base);
         }
     }
 
     // Append the caller's overrides as KEY=VALUE\0.
-    mut e2: u64 = 0u64;
+    mut e2: u64 = 0;
     while (e2 < cmd.envs.length()) {
         match (cmd.envs.get_ref(e2)) {
             Option::Some(en) => {
                 win_append_bytes(&blk, &en.key);
-                blk.push_byte(61u8);           // '='
+                blk.push_byte(61);           // '='
                 win_append_bytes(&blk, &en.value);
-                blk.push_byte(0u8);
+                blk.push_byte(0);
             }
             Option::None => { }
         }
-        e2 = e2 + 1u64;
+        e2 = e2 + 1;
     }
 
-    blk.push_byte(0u8);  // block terminator (block ends in `\0\0`)
+    blk.push_byte(0);  // block terminator (block ends in `\0\0`)
     return blk;
 }
 
@@ -1018,19 +1131,19 @@ function win_setup_stdio(setting: Stdio, std_id: u32, is_input: boolean) -> WinS
             mut rd: u8* = null;
             mut wr: u8* = null;
             mut sa: syscall::SECURITY_ATTRIBUTES = syscall::SECURITY_ATTRIBUTES {
-                nLength: 24u32, lpSecurityDescriptor: null, bInheritHandle: 1
+                nLength: 24, lpSecurityDescriptor: null, bInheritHandle: 1
             };
-            if (syscall::CreatePipe(&rd, &wr, &sa as u8*, 0u32) == 0) {
+            if (syscall::CreatePipe(&rd, &wr, &sa as u8*, 0) == 0) {
                 return WinStdio { child_handle: null, parent_fd: -1, extra_close: null, close_fd: -1, ok: false };
             }
             if (is_input) {
                 // child reads `rd` (inheritable); parent writes `wr`.
-                syscall::SetHandleInformation(wr, syscall::HANDLE_FLAG_INHERIT, 0u32);
+                syscall::SetHandleInformation(wr, syscall::HANDLE_FLAG_INHERIT, 0);
                 const f: i32 = _open_osfhandle(wr as i64, 0);
                 return WinStdio { child_handle: rd, parent_fd: f, extra_close: rd, close_fd: -1, ok: true };
             }
             // child writes `wr` (inheritable); parent reads `rd`.
-            syscall::SetHandleInformation(rd, syscall::HANDLE_FLAG_INHERIT, 0u32);
+            syscall::SetHandleInformation(rd, syscall::HANDLE_FLAG_INHERIT, 0);
             const f: i32 = _open_osfhandle(rd as i64, 0);
             return WinStdio { child_handle: wr, parent_fd: f, extra_close: wr, close_fd: -1, ok: true };
         }
@@ -1040,14 +1153,14 @@ function win_setup_stdio(setting: Stdio, std_id: u32, is_input: boolean) -> WinS
             // instead would leak the child's output onto the parent's
             // console.
             mut sa: syscall::SECURITY_ATTRIBUTES = syscall::SECURITY_ATTRIBUTES {
-                nLength: 24u32, lpSecurityDescriptor: null, bInheritHandle: 1
+                nLength: 24, lpSecurityDescriptor: null, bInheritHandle: 1
             };
             mut nul_path: String = String::with_null(Str::new("NUL"));
             mut access: u32 = syscall::GENERIC_WRITE;
             if (is_input) { access = syscall::GENERIC_READ; }
             const h: u8* = syscall::CreateFileA(nul_path.as_ptr(), access,
                 syscall::FILE_SHARE_READ | syscall::FILE_SHARE_WRITE,
-                &sa as u8*, syscall::OPEN_EXISTING, 0u32, null);
+                &sa as u8*, syscall::OPEN_EXISTING, 0, null);
             // CreateFileA returns INVALID_HANDLE_VALUE (-1) on failure. Compare
             // against a local -1, not syscall::INVALID_HANDLE_VALUE (a
             // cross-module const i64 that mis-evaluates).
@@ -1069,7 +1182,7 @@ function win_setup_stdio(setting: Stdio, std_id: u32, is_input: boolean) -> WinS
             }
             mut dup: u8* = null;
             const cur: u8* = syscall::GetCurrentProcess();
-            if (syscall::DuplicateHandle(cur, src as u8*, cur, &dup, 0u32, 1,
+            if (syscall::DuplicateHandle(cur, src as u8*, cur, &dup, 0, 1,
                                          syscall::DUPLICATE_SAME_ACCESS) == 0) {
                 return WinStdio { child_handle: null, parent_fd: -1, extra_close: null, close_fd: -1, ok: false };
             }
@@ -1107,15 +1220,15 @@ function spawn_impl(cmd: &Command) -> Result<Child, IoError> {
     }
 
     mut si: syscall::STARTUPINFOA = syscall::STARTUPINFOA {
-        cb: 104u32, lpReserved: null, lpDesktop: null, lpTitle: null,
-        dwX: 0u32, dwY: 0u32, dwXSize: 0u32, dwYSize: 0u32,
-        dwXCountChars: 0u32, dwYCountChars: 0u32, dwFillAttribute: 0u32,
-        dwFlags: syscall::STARTF_USESTDHANDLES, wShowWindow: 0u16, cbReserved2: 0u16,
+        cb: 104, lpReserved: null, lpDesktop: null, lpTitle: null,
+        dwX: 0, dwY: 0, dwXSize: 0, dwYSize: 0,
+        dwXCountChars: 0, dwYCountChars: 0, dwFillAttribute: 0,
+        dwFlags: syscall::STARTF_USESTDHANDLES, wShowWindow: 0, cbReserved2: 0,
         lpReserved2: null,
         hStdInput: sin.child_handle, hStdOutput: sout.child_handle, hStdError: serr.child_handle
     };
     mut pi: syscall::PROCESS_INFORMATION = syscall::PROCESS_INFORMATION {
-        hProcess: null, hThread: null, dwProcessId: 0u32, dwThreadId: 0u32
+        hProcess: null, hThread: null, dwProcessId: 0, dwThreadId: 0
     };
 
     // Apply env overrides / env_clear via an explicit ANSI environment block.
@@ -1124,13 +1237,13 @@ function spawn_impl(cmd: &Command) -> Result<Child, IoError> {
     // (which copies it); it drops at function exit.
     mut env_block: String = String::new();
     mut env_ptr: u8* = null;
-    if (cmd.clear_env_flag || cmd.envs.length() > 0u64) {
+    if (cmd.clear_env_flag || cmd.envs.length() > 0) {
         env_block = build_env_block(cmd);
         env_ptr = env_block.as_ptr();
     }
 
     const ok: i32 = syscall::CreateProcessA(null, cmdline.as_ptr(), null, null,
-                                            1, 0u32, env_ptr, cwd_ptr, &si, &pi);
+                                            1, 0, env_ptr, cwd_ptr, &si, &pi);
 
     // Parent closes the child's pipe ends now that they have been inherited.
     if (sin.extra_close  != null) { syscall::CloseHandle(sin.extra_close); }
@@ -1170,9 +1283,9 @@ function win_drain(fd_no: i32, chunk: u8*, chunk_len: u64, buf: mut &Array<u8>) 
     loop {
         match (fd::read_fd(fd_no, chunk, chunk_len)) {
             Result::Ok(n) => {
-                if (n == 0u64) { return Result::Ok(()); }
-                mut i: u64 = 0u64;
-                while (i < n) { buf.push(chunk[i]); i = i + 1u64; }
+                if (n == 0) { return Result::Ok(()); }
+                mut i: u64 = 0;
+                while (i < n) { buf.push(chunk[i]); i = i + 1; }
             }
             Result::Err(e) => { return Result::Err(e); }
         }
@@ -1186,8 +1299,8 @@ function win_drain(fd_no: i32, chunk: u8*, chunk_len: u64, buf: mut &Array<u8>) 
 function win_peek_avail(fd_no: i32) -> i64 {
     const h: i64 = _get_osfhandle(fd_no);
     if (h == -1) { return -1; }
-    mut avail: u32 = 0u32;
-    const r: i32 = syscall::PeekNamedPipe(h as u8*, null, 0u32, null, &avail, null);
+    mut avail: u32 = 0;
+    const r: i32 = syscall::PeekNamedPipe(h as u8*, null, 0, null, &avail, null);
     if (r == 0) { return -1; }   // broken pipe => EOF
     return avail as i64;
 }
@@ -1217,10 +1330,10 @@ function win_drain_interleaved(so_fd0: i32, se_fd0: i32,
                 if ((av as u64) < want) { want = av as u64; }
                 match (fd::read_fd(so, chunk, want)) {
                     Result::Ok(n) => {
-                        if (n == 0u64) { so = -1; }
+                        if (n == 0) { so = -1; }
                         else {
-                            mut i: u64 = 0u64;
-                            while (i < n) { so_buf.push(chunk[i]); i = i + 1u64; }
+                            mut i: u64 = 0;
+                            while (i < n) { so_buf.push(chunk[i]); i = i + 1; }
                             progressed = true;
                         }
                     }
@@ -1238,10 +1351,10 @@ function win_drain_interleaved(so_fd0: i32, se_fd0: i32,
                 if ((av as u64) < want) { want = av as u64; }
                 match (fd::read_fd(se, chunk, want)) {
                     Result::Ok(n) => {
-                        if (n == 0u64) { se = -1; }
+                        if (n == 0) { se = -1; }
                         else {
-                            mut i: u64 = 0u64;
-                            while (i < n) { se_buf.push(chunk[i]); i = i + 1u64; }
+                            mut i: u64 = 0;
+                            while (i < n) { se_buf.push(chunk[i]); i = i + 1; }
                             progressed = true;
                         }
                     }
@@ -1251,7 +1364,7 @@ function win_drain_interleaved(so_fd0: i32, se_fd0: i32,
         }
 
         if (!progressed && (so >= 0 || se >= 0)) {
-            syscall::Sleep(1u32);
+            syscall::Sleep(1);
         }
     }
 }

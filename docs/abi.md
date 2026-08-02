@@ -1,12 +1,15 @@
 # ABI Lowering - As-Built
 
 This document describes how Cryo lowers function signatures and call sites
-to LLVM IR for the SysV x86-64 ABI, as actually implemented in the compiler.
+to LLVM IR, as actually implemented in the compiler.
 
-Target scope today: SysV x86-64 only. The seam is designed so that other
-targets (AArch64 AAPCS, Win64) plug in as separate `AbiClassifier`
-instances later; nothing in the rest of codegen knows what platform it
-is generating for.
+Target scope today: **SysV x86-64 and Win64 (Microsoft x64)**, both shipping.
+`AbiClassifier::kind_for_triple` picks between them from the target triple, and
+`classify_param` / `classify_return` dispatch to the matching rules; nothing in
+the rest of codegen knows what platform it is generating for. Sections 1-N below
+describe the SysV path, which is the more elaborate of the two; section "Win64"
+covers where Microsoft x64 differs. Further targets (e.g. AArch64 AAPCS) plug in
+as additional `AbiKind` branches behind the same seam.
 
 ## 1. Seam architecture
 
@@ -119,6 +122,28 @@ whose `size_bytes()` is 0 even though `map_type` lowers it to a correct
 type (with a slot-budget fallback when the source carries no struct size)
 keeps the call site's slot count in agreement with the callee.
 
+## 2a. Classification rules (Win64 / Microsoft x64)
+
+Win64 aggregate classification is markedly simpler than SysV, and lives in
+`classify_win64_param` / `classify_win64_return`. For an aggregate of size `sz`:
+
+| `sz` | Class | Lowering |
+|---|---|---|
+| 1, 2, 4, 8 | Direct | coerced to an integer of that exact size (`i8`/`i16`/`i32`/`i64`), passed in one GP register |
+| 3, 5, 6, 7, > 8 | Indirect | caller spills to its own stack and passes a pointer — `byval` for params, `sret` for returns (hidden pointer in RCX) |
+| 0 | Direct | falls through to the plain-Direct path, identical to SysV |
+
+Two consequences worth internalising, because they are where SysV intuition
+misleads:
+
+- **There is no SSE, HFA, or DirectPair branch.** Win64 passes *every* aggregate
+  in GP registers, float-bearing or not — an 8-byte `struct { double x; }` rides
+  through RAX, not XMM0.
+- **Size alone decides.** Field types never affect the classification, so the
+  eightbyte machinery in section 3 is SysV-only.
+
+Reference: [x64 calling convention — Parameter Passing](https://learn.microsoft.com/en-us/cpp/build/x64-calling-convention).
+
 ## 3. Eightbyte slot classification
 
 For each <= 8 byte half of an aggregate ("eightbyte bucket"),
@@ -223,27 +248,45 @@ sret slot; ret void`).
 
 ## 6. va_list
 
-Hard-coded as `[24 x i8]` in `compiler/src/compiler/codegen/ops/expr_ops.cryo`.
-That layout is SysV x86-64 specific (a stack save area pointer, a
-fp/gp save area pointer, and three integer counters). AArch64 and
-Win64 use different `va_list` shapes; when the multi-target story
-arrives, `va_list_type()` should become an `AbiClassifier` method
-keyed on the active target triple.
+`va_list` is per-ABI, behind two `AbiClassifier` seams.
 
-## 7. Multi-target plug-in
+`va_list_alloca_type()` gives the storage the variadic prologue allocates:
 
-Today every Cryo process has one `AbiClassifier`, hard-coded to SysV
-x86-64 rules. When a second target lands (most likely AArch64 first):
+| Target | Alloca type | What it holds |
+|---|---|---|
+| SysV x86-64 | `[24 x i8]` | `__va_list_tag[1]` — gp_offset, fp_offset, overflow_arg_area*, reg_save_area* |
+| Win64 | `i8*` | a single `char*` pointing at the next variadic argument |
 
-1. Add a `target: TargetTriple` field on `CodegenContext`.
-2. Promote `AbiClassifier`'s eightbyte / sret / byval rules to virtual
-   methods, with a per-target concrete subclass selecting the right
-   behavior.
-3. Move the va_list constant into a `AbiClassifier::va_list_type()`
-   call.
-4. Update `eightbyte_slot_type` for AArch64's HFA/HVA rules (homogeneous
-   floating-point aggregates pass in vector registers, larger ones
-   spill differently than x86-64).
+Both sizes are exactly what `@llvm.va_start.p0` expects to initialize, so the
+backend writes the right number of bytes per target — no over-allocation.
+
+`forward_va_list()` handles passing a `va_list` **by value** to a C consumer
+(`vsnprintf`, `vfprintf`, …). The two ABIs differ in a way that is easy to get
+wrong:
+
+- **SysV**: `va_list` is `__va_list_tag[1]`, which decays to `__va_list_tag*`.
+  Forwarding the alloca pointer directly is correct.
+- **Win64**: `va_list` is `char*`. The alloca *holds* that pointer, so it must be
+  **loaded** before forwarding. Passing the alloca address would hand the callee
+  a `char**` and crash on the first variadic read.
+
+`@llvm.va_start` / `va_end` always take the alloca address itself and so bypass
+this seam on both targets.
+
+## 7. Adding a further target
+
+`AbiKind` (`SysVAmd64`, `Win64`) is selected per-process by
+`AbiClassifier::kind_for_triple(triple)`, and every ABI-shaped decision already
+routes through a `match` on it. Adding a third target (most likely AArch64
+AAPCS) means extending those matches, not restructuring the seam:
+
+1. Add the `AbiKind` variant and its `kind_for_triple` branch.
+2. Add `classify_<target>_param` / `classify_<target>_return`, and dispatch to
+   them from `classify_param` / `classify_return`.
+3. Add the target's arms to `va_list_alloca_type()` and `forward_va_list()`.
+4. For AArch64 specifically, `eightbyte_slot_type` needs HFA/HVA rules —
+   homogeneous floating-point aggregates pass in vector registers, and larger
+   ones spill differently than on x86-64.
 5. Re-pin the compiler on the new target before changing default behavior.
 
 Nothing in `DeclarationEmitter`, `ExprOps`, `SymbolResolver`, or the

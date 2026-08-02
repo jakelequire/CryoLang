@@ -1,0 +1,33 @@
+// E0453 must fire for a call whose scope names a MODULE by a SUFFIX of its
+// namespace (`mem` for `std::core::mem`), which is how the standard library's
+// free functions are spelled at nearly every call site.
+//
+// The rejection is only reached for an argument sema classified as by-value:
+// an unclassified slot stands the rule down, because rejecting a slot whose
+// parameter was never resolved would break correct code. Sema could not resolve
+// a module-scoped callee at all, so the rule silently stood down on this entire
+// call shape - including on `mem::swap<T>(&s, this)`, the shape the async
+// lowering generates - and the double free it exists to catch went unreported.
+//
+// The same read through a same-file callee is negative/E0453_deref_move_out.cryo;
+// the permitted side is `unsafe`, in lang/deref_take_in_unsafe.cryo.
+![config(testing)]
+![config(negative, E0453)]
+namespace CryoTests::Negative::DerefMoveOutQualifiedCall;
+
+import std::core::mem;
+
+type struct Res {
+    id: i64;
+
+    static new(id: i64) -> Res { return Res { id: id }; }
+
+    drop(mut &this) -> void { }
+}
+
+function main() -> int {
+    mut a: Res = Res::new(7);
+    mut p: Res* = &a;
+    mem::drop<Res>(*p);             // `a` is still dropped at scope exit
+    return 0;
+}

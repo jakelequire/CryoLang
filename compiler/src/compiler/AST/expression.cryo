@@ -22,9 +22,18 @@ public:
     /// to false; only the call-argument resolution paths set it.
     autoref: boolean;
 
+    /// How this expression binds to the parameter it is passed to, when it
+    /// stands in a call or constructor argument slot.  `autoref` answers a
+    /// narrower, codegen-facing question ("take the address here"), so it is
+    /// only ever set for a `&T` parameter and says nothing about a `T*` one;
+    /// the ownership passes need the full answer and read this instead.
+    /// `Unclassified` outside an argument slot.
+    arg_binding: ArgBinding;
+
     ExpressionNode(kind: NodeKind, span: SourceSpan) : ASTNode(kind, span) {
         this.resolved_type = TypeRef::invalid();
         this.autoref       = false;
+        this.arg_binding   = ArgBinding::Unclassified;
     }
 
     set_resolved_type(t: TypeRef) -> void { this.resolved_type = t; }
@@ -43,10 +52,19 @@ public:
     value:        string;
     literal_kind: LiteralKind;
 
+    /// The numeric type suffix this literal was written with (`"u64"` for
+    /// `7u64`), or `""` for a bare literal.  A suffixed literal NAMES its own
+    /// type, so it is not width-polymorphic: it neither adopts an expected type
+    /// nor falls back to the magnitude default, and generic inference binds a
+    /// type parameter from it like any other typed argument.  Set by the parser
+    /// from the lexer's boundary; empty on every synthesized node.
+    suffix:       string;
+
     LiteralNode(value: string, literal_kind: LiteralKind, span: SourceSpan)
         : ExpressionNode(NodeKind::Literal, span) {
         this.value        = value;
         this.literal_kind = literal_kind;
+        this.suffix       = "";
     }
 
     override accept(visitor: ASTVisitor*) -> void {
@@ -74,12 +92,26 @@ public:
     /// Empty for non-generic identifiers.
     resolved_callee:     SymbolStr;
 
+    /// True when a following `<` was read as opening type arguments on a
+    /// GUESS - the name is not a known local, global, or generic declared in
+    /// this module, so the parser fell back to inspecting the tokens after the
+    /// matching `>`. The same text is also a valid chain of comparisons, so a
+    /// downstream "no such function" is as likely to mean the guess was wrong
+    /// as that the function is missing; diagnostics say so rather than sending
+    /// the reader after a function they never meant to call.
+    generic_angle_guessed: boolean;
+
     IdentifierNode(name: SymbolStr, span: SourceSpan)
         : ExpressionNode(NodeKind::Identifier, span) {
         this.name                = name;
         this.is_global_reference = false;
         this.generic_args        = [];
         this.resolved_callee     = SymbolStr::empty();
+        this.generic_angle_guessed = false;
+    }
+
+    set_generic_angle_guessed(v: boolean) -> void {
+        this.generic_angle_guessed = v;
     }
 
     set_global_reference(v: boolean) -> void {
@@ -119,12 +151,19 @@ public:
     /// call's result is stored back into the left place.
     desugared_call: ExpressionNode*;
 
+    /// `--panic=unwind` cleanup schedule for the synthesized divide-by-zero /
+    /// `INT_MIN / -1` guard (populated only for `/` and `%`), so the guard's
+    /// raise runs the frame's local destructors on unwind.  See
+    /// `CallExprNode.unwind_cleanup`.  Empty on the default abort path.
+    unwind_cleanup: ASTNode*[];
+
     BinaryExprNode(op: Token, left: ExpressionNode*, right: ExpressionNode*, span: SourceSpan)
         : ExpressionNode(NodeKind::BinaryExpression, span) {
         this.op    = op;
         this.left  = left;
         this.right = right;
         this.desugared_call = null;
+        this.unwind_cleanup = [];
     }
 
     override accept(visitor: ASTVisitor*) -> void {
@@ -217,10 +256,16 @@ public:
     subject: ExpressionNode*;
     arms:    MatchArmNode*[];
 
+    /// `--panic=unwind` cleanup schedule for the synthesized non-exhaustive
+    /// `no_match` guard, so a scrutinee matching no arm runs the frame's local
+    /// destructors on unwind.  See `CallExprNode.unwind_cleanup`.
+    unwind_cleanup: ASTNode*[];
+
     MatchExprNode(subject: ExpressionNode*, span: SourceSpan)
         : ExpressionNode(NodeKind::MatchExpression, span) {
         this.subject = subject;
         this.arms    = [];
+        this.unwind_cleanup = [];
     }
 
     add_arm(arm: MatchArmNode*) -> void {
@@ -296,6 +341,29 @@ public:
     /// non-generic free calls and for calls sema deferred.
     resolved_type_args: TypeRef[];
 
+    /// Qualified name of the generic free-function TEMPLATE sema bound this
+    /// call to.  Sema decides this with the caller's import scope in hand;
+    /// mono has only the consuming module's name and would otherwise re-pick
+    /// by bare leaf name, using an arity/namespace-prefix heuristic that ties
+    /// whenever two modules define a same-named generic at the same arity
+    /// (`alpha::pick` vs `beta::pick`, both called at arity 2 from sibling
+    /// modules).  On a tie mono bound every caller to one of them, so the
+    /// other module's specialization was never instantiated and its callers
+    /// silently ran the wrong body.  Empty when sema didn't resolve the call.
+    resolved_template: SymbolStr;
+
+    /// Unwind cleanup schedule for `--panic=unwind`.  The ordered drop
+    /// statements for every droppable local live in the enclosing scopes at
+    /// this call site (innermost-first, reverse declaration order, guarded by
+    /// the same move/init flags as the normal-path drops).  DropInsertion
+    /// populates it only when a panic may unwind; codegen replays it in the
+    /// call's cleanup landing pad so a panic propagating out of the callee
+    /// runs local destructors before continuing to unwind.  Typed `ASTNode*[]`
+    /// (each element is a `StatementNode*`) to avoid an Expression<->Statement
+    /// import cycle.  Empty on the default abort path, so emitted IR is
+    /// unchanged there.
+    unwind_cleanup: ASTNode*[];
+
     CallExprNode(callee: ExpressionNode*, span: SourceSpan)
         : ExpressionNode(NodeKind::CallExpression, span) {
         this.callee             = callee;
@@ -304,6 +372,8 @@ public:
         this.resolved_method    = null;
         this.resolved_callee    = SymbolStr::empty();
         this.resolved_type_args = [];
+        this.resolved_template  = SymbolStr::empty();
+        this.unwind_cleanup     = [];
     }
 
     add_argument(arg: ExpressionNode*) -> void {
@@ -333,6 +403,10 @@ public:
         this.resolved_type_args = args;
     }
 
+    set_resolved_template(qualified_name: SymbolStr) -> void {
+        this.resolved_template = qualified_name;
+    }
+
     override accept(visitor: ASTVisitor*) -> void {
         visitor.visit(this);
     }
@@ -353,6 +427,12 @@ public:
     array_size:   ExpressionNode*;
     struct_init:  StructLiteralNode*;
 
+    /// `--panic=unwind` cleanup schedule for the synthesized `new T[n]`
+    /// size-overflow guard (populated only for the array form), so the guard's
+    /// raise runs the frame's local destructors on unwind.  See
+    /// `CallExprNode.unwind_cleanup`.
+    unwind_cleanup: ASTNode*[];
+
     NewExprNode(type_name: SymbolStr, span: SourceSpan)
         : ExpressionNode(NodeKind::NewExpression, span) {
         this.type_name    = type_name;
@@ -361,6 +441,7 @@ public:
         this.arguments    = [];
         this.array_size   = null;
         this.struct_init  = null;
+        this.unwind_cleanup = [];
     }
 
     has_array_size() -> boolean { return this.array_size != null; }
@@ -640,11 +721,17 @@ public:
     /// enclosing rvalue/lvalue caller decide load-vs-address.
     desugared_call: ExpressionNode*;
 
+    /// `--panic=unwind` cleanup schedule for the synthesized array bounds check
+    /// (fat-array / fixed-array indexing), so an out-of-bounds index runs the
+    /// frame's local destructors on unwind.  See `CallExprNode.unwind_cleanup`.
+    unwind_cleanup: ASTNode*[];
+
     ArrayAccessNode(array: ExpressionNode*, index: ExpressionNode*, span: SourceSpan)
         : ExpressionNode(NodeKind::ArrayAccess, span) {
         this.array = array;
         this.index = index;
         this.desugared_call = null;
+        this.unwind_cleanup = [];
     }
 
     override accept(visitor: ASTVisitor*) -> void {
@@ -837,6 +924,25 @@ public:
     has_desugar() -> boolean { return this.desugared != null; }
 
     set_desugared(d: ExpressionNode*) -> void { this.desugared = d; }
+
+    /// Re-point `operand` at the desugared `match`'s subject.
+    ///
+    /// `build_try_desugar` seeds the `match` with `operand` ITSELF, so the two
+    /// slots name one expression.  A pass that rewrites the desugar in place
+    /// replaces that subject node, and `operand` is then the only reference
+    /// left to the pre-rewrite tree - which is still walked, because call
+    /// specialization, dispatch annotation and `resolve_try_expr` all read
+    /// `operand` and never `desugared`.  A stale one resolves an `await` that
+    /// no longer runs and names locals that no longer exist where it sits.
+    ///
+    /// Every in-place rewrite of the desugar must call this.  The async
+    /// lowering has two: hoisting an `await` out of the subject, and promoting
+    /// a carried local there to a frame field.
+    resync_operand() -> void {
+        if (this.desugared == null) { return; }
+        if ((this.desugared as ASTNode*).kind != NodeKind::MatchExpression) { return; }
+        this.operand = (this.desugared as MatchExprNode*).subject;
+    }
 
     override accept(visitor: ASTVisitor*) -> void {
         visitor.visit(this);

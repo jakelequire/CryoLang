@@ -7,7 +7,7 @@
 ///! (not a `struct timeval`), errors come from `WSAGetLastError()` (not
 ///! errno), close is `closesocket`, and it needs a one-time `WSAStartup`.
 ///!
-///! Every one of those differences is hidden here so `net::tcp` / `net::udp`
+///! Every one of those differences is hidden here so `net::socket::tcp` / `net::socket::udp`
 ///! / `net::dns` stay platform-agnostic.  Sockets are exposed as a plain
 ///! `i32` fd on both platforms: SOCKET values fit `i32` in practice (and
 ///! under wine), and these wrappers cast at the boundary.  ConfigGating only
@@ -20,7 +20,7 @@ import core::result;
 import io::error;
 import io::fd;
 import ffi::libc;
-import ffi::syscall;
+import sys::syscall;
 
 // ---- one-time Winsock init -------------------------------------------------
 // WSAStartup is reference-counted and idempotent, so calling it once per
@@ -31,7 +31,7 @@ function net_init() -> void { }
 ![target(windows)]
 function net_init() -> void {
     mut wsadata: u8[512];                       // >= sizeof(WSADATA)
-    syscall::WSAStartup(0x0202u16, &wsadata[0]); // request Winsock 2.2
+    syscall::WSAStartup(0x0202, &wsadata[0]); // request Winsock 2.2
 }
 
 // ---- socket creation -------------------------------------------------------
@@ -53,7 +53,7 @@ function os_socket_tcp() -> i32 {
 }
 
 // AF_INET6 TCP socket (family 10 on Linux, 23 on Windows). The caller
-// (net::tcp) selects this vs os_socket_tcp() per the address family, so
+// (net::socket::tcp) selects this vs os_socket_tcp() per the address family, so
 // sys stays free of net::ip / net::socket_addr imports.
 ![target(unix)]
 function os_socket_tcp6() -> i32 {
@@ -182,6 +182,108 @@ function os_set_broadcast(fd: i32, on: boolean) -> i32 {
     return syscall::setsockopt(fd as u64, 65535, 32, &v as u8*, 4);
 }
 
+// ---- non-blocking mode + in-flight connect status --------------------------
+// Async I/O needs sockets that report "would block" instead of sleeping the
+// calling thread: the reactor does the waiting. POSIX toggles a file-status
+// flag; Winsock has a dedicated ioctl and no way to read the mode back.
+
+![target(unix)]
+function os_set_nonblocking(fd: i32, on: boolean) -> i32 {
+    const cur: i32 = libc::fcntl(fd, libc::F_GETFL, 0 as i64);
+    if (cur < 0) { return -1; }
+    const next: i32 = if (on) { cur | libc::O_NONBLOCK } else { cur & ~libc::O_NONBLOCK };
+    return libc::fcntl(fd, libc::F_SETFL, next as i64);
+}
+![target(windows)]
+function os_set_nonblocking(fd: i32, on: boolean) -> i32 {
+    mut v: u32 = if (on) { 1 } else { 0 };
+    return syscall::ioctlsocket(fd as u64, syscall::FIONBIO, &v);
+}
+
+/// How an in-flight non-blocking connect is progressing. `Failed` carries the
+/// error the caller should surface; the socket is left open either way, so the
+/// caller owns closing it.
+type enum ConnectStatus {
+    Connected;
+    Pending;
+    Failed(IoError);
+}
+
+/// Ask an in-flight non-blocking connect how it went, without blocking.
+///
+/// POSIX answers by re-issuing the `connect`: it reports `EISCONN` once the
+/// handshake lands, `EINPROGRESS`/`EALREADY` while it is outstanding, and the
+/// real failure otherwise, so the packed sockaddr is replayed here.
+![target(unix)]
+function os_connect_status(fd: i32, addr: u8*, addrlen: u32) -> ConnectStatus {
+    if (os_connect(fd, addr, addrlen) >= 0) { return ConnectStatus::Connected; }
+    const e: IoError = last_io_error();
+    if (e.os_code == libc::EISCONN) { return ConnectStatus::Connected; }
+    if (e.os_code == libc::EINPROGRESS || e.os_code == libc::EALREADY) {
+        return ConnectStatus::Pending;
+    }
+    match (e.kind) {
+        IoErrorKind::Interrupted => { return ConnectStatus::Pending; }
+        _                        => { }
+    }
+    return ConnectStatus::Failed(e);
+}
+
+/// Winsock cannot be asked the same way: a repeat `connect` on a socket whose
+/// attempt already failed does not report that failure - it restarts the
+/// attempt and clears the latched `SO_ERROR`, so a poll loop built on re-issuing
+/// `connect` only ever sees WSAEWOULDBLOCK/WSAEALREADY and waits forever. The
+/// status is read off the socket instead, leaving the attempt untouched:
+/// `SO_ERROR` is the outcome once it is non-zero, and until then
+/// `SO_CONNECT_TIME` distinguishes an established connection from one still in
+/// flight (the socket never becomes writable when the peer refuses).
+![target(windows)]
+function os_connect_status(fd: i32, addr: u8*, addrlen: u32) -> ConnectStatus {
+    const se: i32 = os_sock_error(fd);
+    if (se > 0) { return ConnectStatus::Failed(io_error_from_wsa(se)); }
+    if (os_sock_connected(fd)) { return ConnectStatus::Connected; }
+    return ConnectStatus::Pending;
+}
+
+/// True once the handshake has completed. `SO_CONNECT_TIME` reads back
+/// `SO_CONNECT_TIME_NEVER` until then; an unreadable option is reported as
+/// not-yet-connected so the caller keeps waiting rather than inventing success.
+![target(windows)]
+function os_sock_connected(fd: i32) -> boolean {
+    mut secs: u32 = 0;
+    mut len: i32 = 4;
+    if (syscall::getsockopt(fd as u64, syscall::SOL_SOCKET, syscall::SO_CONNECT_TIME,
+                            &secs as u8*, &len) != 0) {
+        return false;
+    }
+    return secs != syscall::SO_CONNECT_TIME_NEVER;
+}
+
+/// The latched error on `fd` (`SO_ERROR`): non-zero is a failed operation, zero
+/// means nothing has failed *yet* - for a connect still in flight it is zero
+/// too, so zero alone does not mean connected. Returns -1 if the option itself
+/// could not be read.
+![target(unix)]
+function os_sock_error(fd: i32) -> i32 {
+    mut v: i32 = 0;
+    mut len: u32 = 4;
+    if (libc::getsockopt(fd, libc::SocketLevel::SOL_SOCKET, libc::SO_ERROR,
+                         &v as u8*, &len) != 0) {
+        return -1;
+    }
+    return v;
+}
+![target(windows)]
+function os_sock_error(fd: i32) -> i32 {
+    mut v: i32 = 0;
+    mut len: i32 = 4;
+    if (syscall::getsockopt(fd as u64, syscall::SOL_SOCKET, syscall::SO_ERROR,
+                            &v as u8*, &len) != 0) {
+        return -1;
+    }
+    return v;
+}
+
 // SO_RCVTIMEO/SO_SNDTIMEO: POSIX wants a 16-byte `struct timeval` (two host-
 // order i64s); Winsock wants a 4-byte DWORD of milliseconds.
 ![target(unix)]
@@ -194,7 +296,7 @@ function os_set_timeout(fd: i32, is_recv: boolean, secs: i64, usecs: i64) -> i32
 }
 ![target(windows)]
 function os_set_timeout(fd: i32, is_recv: boolean, secs: i64, usecs: i64) -> i32 {
-    const ms: u32 = (secs * 1000i64 + usecs / 1000i64) as u32;
+    const ms: u32 = (secs * 1000 + usecs / 1000) as u32;
     mut buf: u8[4];
     buf[0] = (ms)       as u8;
     buf[1] = (ms >> 8)  as u8;
@@ -226,8 +328,13 @@ function pack_i64_le(out: u8*, value: i64) -> void {
 ![target(unix)]
 function last_io_error() -> IoError { return IoError::from_errno(libc::errno()); }
 ![target(windows)]
-function last_io_error() -> IoError {
-    const e: i32 = syscall::WSAGetLastError();
+function last_io_error() -> IoError { return io_error_from_wsa(syscall::WSAGetLastError()); }
+
+/// Classify a Winsock error code. Split from `last_io_error` because a connect
+/// failure is read back from `SO_ERROR` rather than `WSAGetLastError()`, and
+/// both paths must produce the same `IoErrorKind` for the same code.
+![target(windows)]
+function io_error_from_wsa(e: i32) -> IoError {
     if (e == syscall::WSAEWOULDBLOCK)  { return IoError::new(IoErrorKind::WouldBlock, e); }
     if (e == syscall::WSAEINTR)        { return IoError::new(IoErrorKind::Interrupted, e); }
     if (e == syscall::WSAECONNREFUSED) { return IoError::new(IoErrorKind::ConnectionRefused, e); }
@@ -266,7 +373,7 @@ function ai_addr_offset() -> u64 { return 32; }
 
 // ---- stream read/write (recv/send with EINTR retry) ------------------------
 // Platform-agnostic: built on the gated os_recv/os_send + last_io_error.
-// `net::tcp`'s Read/Write impls delegate here (read()/write() on a CRT fd do
+// `net::socket::tcp`'s Read/Write impls delegate here (read()/write() on a CRT fd do
 // NOT work on a Windows SOCKET, so sockets must go through recv/send on both
 // platforms).
 function sock_read(fd: i32, buf: u8*, len: u64) -> Result<u64, IoError> {
@@ -309,4 +416,4 @@ function set_timeout(fd: i32, is_recv: boolean, secs: i64, usecs: i64) -> Result
 ![target(unix)]
 function dns_hint_flags() -> u32 { return libc::AI_ADDRCONFIG as u32; }
 ![target(windows)]
-function dns_hint_flags() -> u32 { return 0u32; }
+function dns_hint_flags() -> u32 { return 0; }

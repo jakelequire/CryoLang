@@ -452,13 +452,23 @@ type struct Resolver {
     /// can be used for TypeArena/DeclarationIndex lookup, or empty if not found.
     ///
     /// Handles both bare names ("Vec2") and already-qualified names
-    /// ("Math::Vec2::Vec2").  For qualified input, extracts the leaf segment
-    /// and resolves that, then validates the prefix matches the symbol's module.
+    /// ("Math::Vec2::Vec2").  For qualified input, extracts the leaf segment and
+    /// resolves that, then validates the written prefix against the module the
+    /// symbol was declared in — two modules may export the same leaf name, and
+    /// the leaf-keyed scope chain cannot tell them apart on its own.
     resolve_type_qualified_name(&this, name: SymbolStr) -> SymbolStr {
+        return this.resolve_type_qualified_name_from(this.current_scope, name);
+    }
+
+    /// `resolve_type_qualified_name`, but resolving the leaf from an EXPLICIT
+    /// scope rather than the ambient cursor.  See
+    /// `resolve_type_qualified_name_bare_from` for why the scope is a parameter.
+    resolve_type_qualified_name_from(&this, start: ScopeID,
+                                     name: SymbolStr) -> SymbolStr {
         const name_str: string = this.intern_table.resolve(name);
         LOG_DEBUG(LogComponent::Resolver,
             "[resolve_type_qn] looking for '%s' starting at scope %llu",
-            name_str, this.current_scope.id);
+            name_str, start.id);
 
         // If the name is already qualified (contains "::"), try it as-is first
         // (it may already be the canonical form), then fall back to extracting
@@ -470,27 +480,180 @@ type struct Resolver {
             // or arena lookup by the caller.
             // If the caller's lookup fails, it will try bare-name fallback.
 
-            // Extract the leaf (last segment) and resolve it
+            // Extract the leaf (last segment) and resolve it. The scope chain is
+            // keyed by leaf alone, so this can land on a same-named type from an
+            // entirely different module — `executor::JoinHandle` reaching
+            // `thread::JoinHandle` in a program that imports both. Accept the
+            // result only when its declaring module agrees with the qualifier
+            // that was actually written; otherwise fall through to the export
+            // scan below, which searches BY prefix. Without that check the winner
+            // is whichever module registered the leaf last, which is not a
+            // property the source mentions.
             const leaf_sym: SymbolStr = this.extract_leaf(name_str);
             if (leaf_sym.is_valid()) {
-                const resolved: SymbolStr = this.resolve_type_qualified_name_bare(leaf_sym);
-                if (resolved.is_valid()) {
+                const resolved: SymbolStr =
+                    this.resolve_type_qualified_name_bare_from(start, leaf_sym);
+                if (resolved.is_valid() && this.qualifier_agrees(resolved, name_str)) {
                     return resolved;
                 }
+            }
+            // A module-qualified type whose leaf isn't reachable through the
+            // current scope chain - e.g. `future::Ready` when only the parent
+            // `std::future` was imported, so `Ready` entered as a re-export of
+            // the `future::ready` submodule (`public module future::ready;`).
+            // The bare `Ready` already resolves elsewhere; make the qualified
+            // form consistent by resolving it against the cross-module export
+            // table: a public type whose leaf is `Ready` and whose declaring
+            // module matches the `future` prefix.
+            const via_exports: SymbolStr = this.resolve_qualified_type_via_exports(name_str);
+            if (via_exports.is_valid()) {
+                return via_exports;
             }
             // Return the input as-is; it may be the canonical form already
             return name;
         }
 
-        return this.resolve_type_qualified_name_bare(name);
+        return this.resolve_type_qualified_name_bare_from(start, name);
+    }
+
+    /// Resolve a module-qualified type name (`Module::Leaf`) to its canonical
+    /// `<declaring-module>::Leaf` by scanning the cross-module export table for a
+    /// public type whose leaf name is `Leaf` and whose declaring module is
+    /// consistent with the `Module` prefix. Used only as a fallback in
+    /// `resolve_type_qualified_name` when the leaf isn't reachable through the
+    /// current scope chain (the qualified analogue of an already-working bare
+    /// name that entered as a submodule re-export). Empty when none matches.
+    resolve_qualified_type_via_exports(&this, name_str: string) -> SymbolStr {
+        const nlen: i64 = name_str.length() as i64;
+        mut last_sep: i64 = -1;
+        for (mut i: i64 = 0; i + 1 < nlen; i++) {
+            if (name_str[i] == ':' && name_str[i + 1] == ':') { last_sep = i; }
+        }
+        if (last_sep <= 0 || last_sep + 2 >= nlen) { return SymbolStr::empty(); }
+        const prefix_str: string = name_str.substring(0, last_sep);
+        const leaf_str: string = name_str.substring(last_sep + 2, nlen - last_sep - 2);
+        const leaf_sym: SymbolStr = this.intern_table.intern(leaf_str);
+
+        for (mut i: i64 = 0; i < this.exports.length; i++) {
+            const sym: Symbol = this.get_symbol(this.exports[i].first);
+            if (sym.kind != SymbolKind::Type && sym.kind != SymbolKind::TypeAlias) { continue; }
+            if (!sym.visibility.is_public()) { continue; }
+            if (!sym.name.equals(leaf_sym)) { continue; }
+            const mod_sym: SymbolStr = SymbolStr::from_id(this.exports[i].second as u32);
+            const mod_str: string = this.intern_table.resolve(mod_sym);
+            if (this.module_ns_matches_prefix(mod_str, prefix_str)) {
+                return this.intern_table.intern(mod_str + "::" + leaf_str);
+            }
+        }
+        return SymbolStr::empty();
+    }
+
+    /// True when the module `resolved` was declared in is consistent with the
+    /// qualifier written in `written_str`. `resolved` is a canonical
+    /// `Module::Leaf`; `written_str` is the `Prefix::Leaf` the source spelled.
+    ///
+    /// An unqualified `written_str` agrees with anything — there is no qualifier
+    /// to contradict. A `resolved` with no module of its own agrees with nothing
+    /// qualified, since a written prefix cannot name the global namespace.
+    qualifier_agrees(&this, resolved: SymbolStr, written_str: string) -> boolean {
+        const written_prefix: string = this.prefix_of(written_str);
+        if ((written_prefix.length() as i64) == 0) { return true; }
+        const resolved_mod: string = this.prefix_of(this.intern_table.resolve(resolved));
+        if ((resolved_mod.length() as i64) == 0) { return false; }
+        return this.module_ns_matches_prefix(resolved_mod, written_prefix);
+    }
+
+    /// Everything before the final "::" in `s`, or empty when there is none.
+    /// E.g. "std::future::executor::JoinHandle" -> "std::future::executor".
+    prefix_of(&this, s: string) -> string {
+        const len: i64 = s.length() as i64;
+        mut last_sep: i64 = -1;
+        for (mut i: i64 = 0; i + 1 < len; i++) {
+            if (s[i] == ':' && s[i + 1] == ':') {
+                last_sep = i;
+            }
+        }
+        if (last_sep <= 0) { return ""; }
+        return s.substring(0, last_sep);
+    }
+
+    /// True when `prefix` occurs in the module namespace `mod_str` as a run of
+    /// whole `::`-delimited segments. This honors the qualifier (`future` matches
+    /// `std::future::ready` but `other` does not) while tolerating the root
+    /// segments a written prefix omits (`future` == `std::future` minus `std`).
+    module_ns_matches_prefix(&this, mod_str: string, prefix_str: string) -> boolean {
+        const ml: i64 = mod_str.length() as i64;
+        const pl: i64 = prefix_str.length() as i64;
+        if (pl == 0 || pl > ml) { return false; }
+        mut i: i64 = 0;
+        while (i + pl <= ml) {
+            if (mod_str.substring(i, pl).eq(prefix_str)) {
+                const boundary_before: boolean =
+                    i == 0 || (i >= 2 && mod_str[i - 1] == ':' && mod_str[i - 2] == ':');
+                const boundary_after: boolean =
+                    i + pl == ml || (i + pl + 1 < ml && mod_str[i + pl] == ':' && mod_str[i + pl + 1] == ':');
+                if (boundary_before && boundary_after) { return true; }
+            }
+            i += 1;
+        }
+        return false;
+    }
+
+    /// The defining module of the function a bare name resolves to here, or an
+    /// empty SymbolStr when the name isn't a function visible from this scope.
+    ///
+    /// This is the import-aware half of picking between same-named functions in
+    /// different modules: the scope chain already models what the current
+    /// module can see, so a candidate whose defining module this returns is the
+    /// one the source actually names. Without it, selection can only compare
+    /// candidate counts, and two same-named generics anywhere in the program
+    /// leave every caller of either one unresolvable.
+    resolve_function_source_module(&this, name: SymbolStr) -> SymbolStr {
+        mut scope_id: ScopeID = this.current_scope;
+        while (scope_id.is_valid()) {
+            const scope: Scope* = this.get_scope(scope_id);
+            const found: SymbolID = scope.find(name);
+            if (found.is_valid()) {
+                const sym: Symbol = this.get_symbol(found);
+                // `Import` is the kind a name brought in by `import` carries -
+                // an imported function is not re-declared as `Function` in the
+                // importer's scope. `resolve_type_qualified_name_bare` accepts
+                // it for the same reason.
+                if (sym.kind == SymbolKind::Function || sym.kind == SymbolKind::Import) {
+                    if (sym.source_module == "") { return SymbolStr::empty(); }
+                    return this.intern_table.intern(sym.source_module);
+                }
+            }
+            scope_id = scope.parent_id;
+        }
+        return SymbolStr::empty();
     }
 
     /// Core qualified-name resolution for a bare (unqualified) type name.
     /// Walks scope chain and import aliases to find the symbol, then constructs
     /// the canonical qualified form: "module::name".
     resolve_type_qualified_name_bare(&this, name: SymbolStr) -> SymbolStr {
-        // 1. Walk scope chain from current scope for Type/TypeAlias/Import symbols.
-        mut scope_id: ScopeID = this.current_scope;
+        return this.resolve_type_qualified_name_bare_from(this.current_scope, name);
+    }
+
+    /// `resolve_type_qualified_name_bare`, but walking from an EXPLICIT scope
+    /// instead of the resolver's ambient cursor.
+    ///
+    /// A bare leaf in a type annotation means what the annotation's OWN module
+    /// says: that module's declarations, then its imports, then the prelude. The
+    /// ambient cursor answers for whatever module a pass happens to be walking,
+    /// which is the caller's at any re-resolution site - so two modules exporting
+    /// the same leaf silently bind to the wrong one.
+    ///
+    /// Taking the start scope as a PARAMETER is what makes this safe where a
+    /// cursor swap is not: resolution recurses (a type's arguments, a function
+    /// annotation's parameters), and each nested resolution carries its own
+    /// start scope. Repointing the shared cursor instead leaks the switch into
+    /// every nested resolution underneath it.
+    resolve_type_qualified_name_bare_from(&this, start: ScopeID,
+                                          name: SymbolStr) -> SymbolStr {
+        // 1. Walk scope chain from `start` for Type/TypeAlias/Import symbols.
+        mut scope_id: ScopeID = start;
         while (scope_id.is_valid()) {
             const scope: Scope* = this.get_scope(scope_id);
             const found: SymbolID = scope.find(name);
@@ -510,15 +673,25 @@ type struct Resolver {
             scope_id = scope.parent_id;
         }
 
-        // 2. Check import aliases
-        const alias_id: SymbolID = this.lookup_import_alias(name);
-        if (alias_id.is_valid()) {
-            const alias_sym: Symbol = this.get_symbol(alias_id);
-            const resolved: string = this.intern_table.resolve(alias_sym.name);
-            if (alias_sym.source_module != "") {
-                return this.intern_table.intern(alias_sym.source_module + "::" + resolved);
+        // 2. Check import aliases.
+        //    `import_aliases` is resolver-global and reset per module, so it holds
+        //    the aliases of the module the cursor is on - not of `start`. Consult
+        //    it only when those are the same module; for a foreign start scope an
+        //    alias hit would be the CALLER's `import X as Y`, which is exactly the
+        //    kind of cross-module leak this overload exists to prevent. (Aliases
+        //    are not yet stored per-scope, so a foreign module's own aliases are
+        //    simply not visible here; the caller falls through to its next
+        //    lookup rather than binding something wrong.)
+        if (start.id == this.current_scope.id) {
+            const alias_id: SymbolID = this.lookup_import_alias(name);
+            if (alias_id.is_valid()) {
+                const alias_sym: Symbol = this.get_symbol(alias_id);
+                const resolved: string = this.intern_table.resolve(alias_sym.name);
+                if (alias_sym.source_module != "") {
+                    return this.intern_table.intern(alias_sym.source_module + "::" + resolved);
+                }
+                return alias_sym.name;
             }
-            return alias_sym.name;
         }
 
         // 3. Not found

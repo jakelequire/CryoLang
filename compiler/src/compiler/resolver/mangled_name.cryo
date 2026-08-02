@@ -717,8 +717,34 @@ type struct MangleContext {
             return "R" + this.encode_type_ref(r.referent, "Reference.referent");
         }
         if (ty.kind == TypeKind::Array) {
+            // A fixed array carries its length: `T[8]`, `T[16]` and `T[]` are
+            // three distinct types, and `specialized_identifier` keys every
+            // monomorphization off this encoding.  Dropping the length gave
+            // them one key, so whichever instantiation was registered first
+            // answered for all of them - `Option<u8[8]>` silently resolving
+            // to `Option<u8[]>`.
+            //
+            // The length is bracketed in `$L`/`$G` rather than written bare:
+            // no type code may begin with `$`, so the form is self-delimiting
+            // and round-trips, where a bare `A8h` could not be told from an
+            // element code beginning with a digit.  A dynamic `T[]` keeps the
+            // bare `A` + element form, leaving every heap-array symbol
+            // byte-unchanged.
+            //
+            // `size` is authoritative here.  The fixed-pending marker (-2, a
+            // `T[NAME]` whose size expression has not yet been folded) lives
+            // on `ArrayAnnotation`, and `TypeResolver::array_size_of` folds it
+            // at the one site that builds an arena array - so a pending size
+            // cannot reach the mangler and split one type across two keys.
             const a: ArrayType* = ty as ArrayType*;
-            return "A" + this.encode_type_ref(a.element, "Array.element");
+            const elem_a: string = this.encode_type_ref(a.element, "Array.element");
+            if (a.is_dynamic()) { return "A" + elem_a; }
+            const len_a: u64 = a.size as u64;
+            mut buf_a: string = "A$L";
+            buf_a += len_a.to_decimal_str();
+            buf_a += "$G";
+            buf_a += elem_a;
+            return buf_a;
         }
         if (ty.kind == TypeKind::Optional) {
             // Optional<T>: encode as a synthetic named generic so the form
@@ -749,6 +775,28 @@ type struct MangleContext {
          || ty.kind == TypeKind::Trait
          || ty.kind == TypeKind::TypeAlias
          || ty.kind == TypeKind::FunctionTemplate) {
+            // SINGLE-ID IDENTITY: a monomorphized generic now lives at its former
+            // wrapper's id AS a concrete Struct/Class/Enum carrying the mangled
+            // SPEC name, so it lands here - while any path still holding an
+            // InstantiatedType node lands on the `encode_instantiated` branch
+            // below.  One logical type, two symbols: the definition is emitted
+            // under the spec-named form while call sites reference the base+args
+            // form (or vice versa), and the link fails with undefined references.
+            //
+            // Normalize onto the base+args form, which is what the pinned
+            // pre-swap compiler emits for every generic instantiation.  Encoding
+            // toward the spec-named form instead would change every generic
+            // symbol in the program relative to the pin, breaking selfhost
+            // byte-identity and forcing a two-phase repin.
+            if (ty.kind == TypeKind::Struct
+             || ty.kind == TypeKind::Class
+             || ty.kind == TypeKind::Enum) {
+                const self_ref: TypeRef = TypeRef::new(ty.id, this.arena);
+                const inst_base: TypeRef = this.arena.inst_generic_base(self_ref);
+                if (inst_base.is_valid()) {
+                    return this.encode_instantiation_of(inst_base, ty.id);
+                }
+            }
             const inner_n: string = MangleContext::encode_named_type_path(this.table, ty);
             mut buf_n: string = "N$L";
             buf_n += inner_n;
@@ -866,7 +914,18 @@ type struct MangleContext {
     ///   Pair<int>       -> 4Pair$Li$G
     ///   Result<T, U>    -> 6Result$L<T>_<U>$G
     encode_instantiated(&this, inst: InstantiatedType*) -> string {
-        const base_t: Type* = this.arena.lookup(inst.generic_base.id);
+        return this.encode_instantiation_of(inst.generic_base, inst.id);
+    }
+
+    /// Encode an instantiation from its `(generic_base, type_args)` identity,
+    /// reading the args off `owner` (a pre-mono wrapper OR a post-mono concrete -
+    /// both carry the same identity).  Keeping ONE encoder for both is what
+    /// guarantees a type mangles to a single symbol regardless of which
+    /// representation the caller happens to hold; encoding them separately is
+    /// what produced the defined-vs-referenced symbol split.
+    encode_instantiation_of(&this, base: TypeRef, owner_id: u64) -> string {
+        const owner: TypeRef = TypeRef::new(owner_id, this.arena);
+        const base_t: Type* = this.arena.lookup(base.id);
         mut buf: string = "N$L";
         if (base_t == null) {
             buf += MangleContext::encode_ident("?");
@@ -874,9 +933,11 @@ type struct MangleContext {
             buf += MangleContext::encode_named_type_path(this.table, base_t);
         }
         buf += "$L";
-        for (mut i: i64 = 0; i < inst.type_args.length; i++) {
+        const n: i64 = this.arena.inst_type_arg_count(owner);
+        for (mut i: i64 = 0; i < n; i++) {
             if (i > 0) { buf += "_"; }
-            buf += this.encode_type_ref(inst.type_args[i], "InstantiatedType.arg");
+            buf += this.encode_type_ref(this.arena.inst_type_arg_at(owner, i),
+                                        "InstantiatedType.arg");
         }
         buf += "$G";
         buf += "$G";

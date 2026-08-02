@@ -62,7 +62,7 @@ type struct TraitChecker {
             // diagnostic. Without this, the `false` propagates into
             // filter_bounds_violating_methods/impls, which silently *drop* the
             // method/impl, and the failure resurfaces far away as a baffling
-            // "no method"/undefined-symbol error (M10). No SourceSpan is
+            // "no method"/undefined-symbol error. No SourceSpan is
             // available here; the trait name pins it down. error_count is left
             // untouched because this receiver is `&this`; emit() records the
             // error in the sink (the same `&this` diagnostics.emit pattern used
@@ -136,28 +136,17 @@ type struct TraitChecker {
             }
         }
 
-        // Normalize the subject to its InstantiatedType wrapper when we
-        // were handed the concrete spec'd Struct/Class/Enum directly. The
-        // monomorphizer substitutes a where-clause param straight to the
-        // concrete spec (e.g. checking `I: Iterator<A>` for `TakeIter<I>`,
-        // where `I` was bound to the concrete `Range<i32>` struct rather
-        // than its wrapper). A concrete spec struct's bare name is its
-        // MANGLED spec name (`5Range$Li$G`), so the trait-impl registry
-        // lookup below - keyed on the template's bare name (`Range`) - 
-        // would miss, and the impl would be wrongly dropped. The wrapper
-        // both bare-names back to the template AND carries the type args
-        // needed to verify the matched impl's own where-bounds
-        // (`Range<T> where T: Step`). Mirrors diagnose_method_bounds_failure.
-        mut subject: TypeRef = ty;
-        const subj_t0: Type* = this.arena.lookup(ty.id);
-        if (subj_t0 != null
-                && (subj_t0.kind == TypeKind::Struct
-                    || subj_t0.kind == TypeKind::Class
-                    || subj_t0.kind == TypeKind::Enum)) {
-            const wrapper: TypeRef = TypeArena::find_inst_wrapping(this.arena, ty);
-            if (wrapper.is_valid()) { subject = wrapper; }
-        }
-
+        // The subject is used directly, whether it is a pre-mono InstantiatedType
+        // wrapper or a post-mono concrete spec: both `bare_name_of` and the
+        // type-arg substitution below read the instantiation identity through the
+        // `inst_*` views, and a concrete carries that identity itself.
+        //
+        // (This used to swap in the origin carrier first, because a concrete spec
+        // struct's bare name is its MANGLED spec name (`5Range$Li$G`) and the
+        // trait-impl registry is keyed on the template's bare name (`Range`), so
+        // the impl was wrongly dropped.  `bare_name_of` now resolves a concrete to
+        // its template, so the swap is unnecessary.)
+        const subject: TypeRef = ty;
         const target_name: SymbolStr = this.bare_name_of(subject);
         if (!target_name.is_valid()) { return false; }
         // Collision-proof: resolve the impl by the subject's canonical
@@ -191,16 +180,14 @@ type struct TraitChecker {
         // the concrete type's args. For `implement<T> trait Eq for Option<T>`
         // and `ty = Option<X>`, the impl's `T` maps to the InstantiatedType's
         // `type_args[0]`.
-        const t: Type* = this.arena.lookup(subject.id);
-        if (t == null) { return false; }
-        if (t.kind != TypeKind::InstantiatedType) {
+        const subj_nargs: i64 = this.arena.inst_type_arg_count(subject);
+        if (subj_nargs == 0) {
             // No outer args to substitute through; bounds reference impl
             // params that have no concrete value, so the impl's where
             // clauses can't be checked. Conservatively report unsatisfied
             // so we don't accidentally enable a body that would crash.
             return false;
         }
-        const inst: InstantiatedType* = t as InstantiatedType*;
         // Map the impl's TARGET type args - the names the struct itself is
         // parameterized by (`I` in `for TakeIter<I>`) - to the concrete
         // instantiation's args.  This is NOT the same as the impl's full
@@ -211,7 +198,7 @@ type struct TraitChecker {
         // such impl (e.g. the nested `TakeIter<TakeIter<Range<i32>>>` while
         // chaining).  The where-bound check below only needs the target params
         // bound; it looks up bound subjects by name.
-        if (impl_block.target_args.length != inst.type_args.length) {
+        if (impl_block.target_args.length != subj_nargs) {
             return false;
         }
         mut nested: TypeSubstitution = TypeSubstitution::empty();
@@ -224,7 +211,7 @@ type struct TraitChecker {
                     // name, so the index here only has to make a GenericParam
                     // TypeRef; the name is what matters.
                     const gp_ref: TypeRef = this.arena.create_generic_param(n.name, gi as u64);
-                    nested.add(gp_ref.id, inst.type_args[gi]);
+                    nested.add(gp_ref.id, this.arena.inst_type_arg_at(subject, gi));
                 }
                 _ => {}
             }
@@ -248,15 +235,9 @@ type struct TraitChecker {
     type_satisfies_opaque_bound(&this, ty: TypeRef, trait_name: SymbolStr) -> boolean {
         if (this.type_implements_trait(ty, trait_name, 0)) { return true; }
         if (this.generic_registry == null) { return false; }
-        mut subject: TypeRef = ty;
-        const subj_t0: Type* = this.arena.lookup(ty.id);
-        if (subj_t0 != null
-                && (subj_t0.kind == TypeKind::Struct
-                    || subj_t0.kind == TypeKind::Class
-                    || subj_t0.kind == TypeKind::Enum)) {
-            const wrapper: TypeRef = TypeArena::find_inst_wrapping(this.arena, ty);
-            if (wrapper.is_valid()) { subject = wrapper; }
-        }
+        // No carrier swap needed: `bare_name_of` resolves a post-mono concrete to
+        // its template, and `resolve_trait_impl_for_type` keys off the same.
+        const subject: TypeRef = ty;
         const target_name: SymbolStr = this.bare_name_of(subject);
         if (!target_name.is_valid()) { return false; }
         return OwnershipQuery::resolve_trait_impl_for_type(this.arena,
@@ -275,26 +256,15 @@ type struct TraitChecker {
                                     method_name: SymbolStr) -> SymbolStr {
         if (this.generic_registry == null) { return SymbolStr::empty(); }
 
-        // Sema typically passes the spec'd concrete type (e.g. the
-        // Enum for `Result_int_OpaqueErr`) rather than the
-        // InstantiatedType wrapper.  `bare_name_of` on a Struct/Class/
-        // Enum returns its qualified leaf; for spec'd types that's
-        // the mangled spec name (`Result_int_OpaqueErr`), not the
-        // template's bare name (`Result`).  Trait impls are registered
-        // against the template's bare name, so without walking back
-        // to the wrapper here, the registry lookup misses every
-        // template impl and we'd silently fall through to the generic
-        // "method not found" diagnostic.  Same reasoning applies to
-        // the recursive `type_implements_trait` call below; it also
-        // requires the InstantiatedType wrapper to substitute the
-        // template's generic params with the receiver's type args.
-        mut probe_ref: TypeRef = receiver;
-        const recv_t: Type* = this.arena.lookup(receiver.id);
-        if (recv_t != null && recv_t.kind != TypeKind::InstantiatedType) {
-            const wrapper: TypeRef = TypeArena::find_inst_wrapping(this.arena, receiver);
-            if (wrapper.is_valid()) { probe_ref = wrapper; }
-        }
-
+        // Sema typically passes the spec'd concrete type (e.g. the Enum for
+        // `Result_int_OpaqueErr`) rather than an InstantiatedType wrapper.  Trait
+        // impls are registered against the TEMPLATE's bare name (`Result`), and
+        // `bare_name_of` resolves a concrete to its template through its intrinsic
+        // generic identity - so the receiver is probed directly.  (This used to
+        // swap in the origin carrier first; without that, the registry lookup
+        // missed every template impl and fell through to the generic
+        // "method not found" diagnostic.)
+        const probe_ref: TypeRef = receiver;
         const base_name: SymbolStr = this.bare_name_of(probe_ref);
         if (!base_name.is_valid()) { return SymbolStr::empty(); }
         const traits: SymbolStr[] = this.generic_registry.traits_implemented_by(base_name);
@@ -328,6 +298,14 @@ type struct TraitChecker {
         if (subst == null || subst.replacements.length == 0) { return true; }
         for (mut bi: i64 = 0; bi < bounds.length; bi++) {
             const bound: TraitBound* = &bounds[bi];
+            // An associated-type-projection subject (`where This::Item: Ord`)
+            // is not a substitutable param name; it is enforced structurally by
+            // the method body's use of the bound trait's methods (a non-`Ord`
+            // element makes the body's `.compare()` unresolvable at
+            // specialization). Treat it as satisfied here rather than failing
+            // the whole spec. (Crisp projection-level filtering is a future
+            // refinement - see plan risk #1.)
+            if (bound.has_projection_subject()) { continue; }
             const concrete: TypeRef = this.lookup_subst_for_param(bound.type_parameter, subst);
             if (!concrete.is_valid()) {
                 // No substitution for this param; the bound names a
@@ -362,6 +340,10 @@ type struct TraitChecker {
         if (subst == null || subst.replacements.length == 0) { return true; }
         for (mut bi: i64 = 0; bi < bounds.length; bi++) {
             const bound: TraitBound* = &bounds[bi];
+            // Projection subject (`where This::Item: Ord`): enforced by the
+            // method body, not filterable by param substitution here. Treat as
+            // satisfied rather than failing the spec (matching `bounds_satisfied`).
+            if (bound.has_projection_subject()) { continue; }
             const concrete: TypeRef = this.lookup_subst_for_param(bound.type_parameter, subst);
             if (!concrete.is_valid()) { return false; }
             for (mut ri: i64 = 0; ri < bound.trait_refs.length; ri++) {
@@ -433,9 +415,16 @@ type struct TraitChecker {
         // the bound is being checked for). Recurse on `generic_base`
         // instead of unwrapping through `resolved_type`, so a spec like
         // `String<GlobalAlloc>` keys against `String`.
-        if (k == TypeKind::InstantiatedType) {
-            const inst: InstantiatedType* = t as InstantiatedType*;
-            return this.bare_name_of(inst.generic_base);
+        //
+        // `inst_generic_base` covers a pre-mono wrapper AND a post-mono concrete
+        // (which carries its own base).  Handling the concrete HERE is what lets
+        // callers pass a receiver directly: they used to have to swap in the
+        // origin carrier first, because a concrete fell through to the branch
+        // below and keyed against its SPEC name (`String_GlobalAlloc`), which no
+        // registry holds.
+        const inst_base: TypeRef = this.arena.inst_generic_base(ty);
+        if (inst_base.is_valid()) {
+            return this.bare_name_of(inst_base);
         }
         const qname: SymbolStr = this.arena.get_qualified_name(ty);
         if (!qname.is_valid()) { return SymbolStr::empty(); }

@@ -59,19 +59,34 @@ type struct PatternResolver {
     /// Bind the names introduced by a match arm's top-level patterns against a
     /// value of `subject_type`.  An identifier pattern binds the whole subject; an
     /// enum pattern recurses into its payload.
-    bind_arm_patterns(mut &this, arm: MatchArmNode*, subject_type: TypeRef) -> void {
+    ///
+    /// `caller_backed` says the subject's storage outlives this frame (it was
+    /// reached through a by-reference parameter), which makes every binding taken
+    /// from it an alias of the caller's storage rather than of a frame copy.  The
+    /// return-escape check needs that distinction to tell an in-place accessor
+    /// from a dangling one.
+    bind_arm_patterns(mut &this, arm: MatchArmNode*, subject_type: TypeRef,
+                      caller_backed: boolean) -> void {
         for (mut i: i64 = 0; i < arm.patterns.length; i++) {
             const pat: PatternNode* = arm.patterns[i];
             if (pat == null) { continue; }
             if (pat.pattern_kind == PatternKind::Identifier && pat.binding_name.is_valid()) {
                 if (subject_type.is_valid()) {
                     this.scopes.register_local(pat.binding_name, subject_type);
+                    this.note_alias_binding(pat.binding_name, caller_backed);
                 }
                 continue;
             }
             if (pat.pattern_kind != PatternKind::Enum) { continue; }
-            this.bind_enum_pattern(pat as EnumPatternNode*, subject_type);
+            this.bind_enum_pattern(pat as EnumPatternNode*, subject_type, caller_backed);
         }
+    }
+
+    /// Record that `name` aliases caller storage, so `return &name` is not a
+    /// dangling return.
+    note_alias_binding(mut &this, name: SymbolStr, caller_backed: boolean) -> void {
+        if (!caller_backed || !name.is_valid()) { return; }
+        this.state.alias_binding_ids.push(name.id);
     }
 
     /// Resolve the positional payload types of `enum_pat`'s variant against a value
@@ -102,7 +117,10 @@ type struct PatternResolver {
 
         const et: EnumType* = enum_ty as EnumType*;
         const variant: EnumVariantInfo* = et.get_variant(enum_pat.variant_name);
-        if (variant == null) { return payload_types; }
+        if (variant == null) {
+            this.report_unknown_variant(et, enum_pat);
+            return payload_types;
+        }
         payload_types = sema_copy_type_refs(&variant.payload_types);
 
         // Substitute the template's generic params with the instantiation's args.
@@ -122,9 +140,55 @@ type struct PatternResolver {
         return payload_types;
     }
 
+    /// Report a pattern naming a variant the enum does not have.
+    ///
+    /// Without this the arm is silently accepted: `resolve_variant_payload_types`
+    /// finds no payload, and the binder falls back to binding the element
+    /// against the SUBJECT's type - a fallback that exists for genuinely
+    /// unresolved types during the symbolic walk. The arm then never matches,
+    /// so the case the author meant to handle goes to whatever else covers it.
+    /// Exhaustiveness catches that when nothing else does (E0405), but a typo
+    /// alongside complete coverage otherwise compiles to silent dead code, and
+    /// the binding's apparent type is the whole subject rather than a payload -
+    /// which surfaces later as a baffling error about the enum type itself.
+    ///
+    /// Only reported once the subject's enum type is known and the walk is
+    /// committed: during the symbolic pass a pattern may legitimately be
+    /// checked against a type that is not its own.
+    report_unknown_variant(mut &this, et: EnumType*, enum_pat: EnumPatternNode*) -> void {
+        if (et == null || enum_pat == null) { return; }
+        if (this.state.in_symbolic_check) { return; }
+        if (!enum_pat.variant_name.is_valid()) { return; }
+
+        const enum_name: string = this.intern.resolve(et.qualified_name);
+        const variant_name: string = this.intern.resolve(enum_pat.variant_name);
+
+        mut diag: Diagnostic = Diagnostic::error(
+            ErrorCode::E0406_UNKNOWN_ENUM_VARIANT,
+            format("enum `%s` has no variant named `%s`", enum_name, variant_name));
+        diag = diag.at_with_label(enum_pat.variant_span, "not a variant of this enum");
+
+        // Same shape as `SemaDiagnostics::attach_did_you_mean`, built inline
+        // because `PatternResolver` is not wired to that helper.
+        mut cands: string[] = [];
+        for (mut i: i64 = 0; i < et.variants.length; i++) {
+            cands.push(this.intern.resolve(et.variants[i].name));
+        }
+        const best: string = find_best_candidate(variant_name, cands);
+        if (best != "") {
+            diag = diag.help(format("a variant with a similar name exists: `%s`", best));
+            diag = diag.suggest(Suggestion::machine_applicable(
+                enum_pat.variant_span, best, format("did you mean `%s`?", best)));
+        }
+        diag = diag.with_note(
+            "a pattern naming a variant that does not exist never matches, so the arm is dead code");
+        this.ctx.emit_diagnostic(diag);
+    }
+
     /// Bind the names of an enum pattern matched against a value of `value_type`,
     /// recursing into nested sub-patterns; each element binds against its payload.
-    bind_enum_pattern(mut &this, enum_pat: EnumPatternNode*, value_type: TypeRef) -> void {
+    bind_enum_pattern(mut &this, enum_pat: EnumPatternNode*, value_type: TypeRef,
+                      caller_backed: boolean) -> void {
         const payload_types: TypeRef[] = this.resolve_variant_payload_types(value_type, enum_pat);
         for (mut j: i64 = 0; j < enum_pat.elements.length; j++) {
             mut elem_ty: TypeRef = this.arena.get_void();
@@ -139,23 +203,28 @@ type struct PatternResolver {
                 // Remember the binding so a `return &payload` is caught (E0455).
                 if (pb.name.is_valid()) { this.state.payload_binding_ids.push(pb.name.id); }
                 this.scopes.register_local(pb.name, elem_ty);
+                this.note_alias_binding(pb.name, caller_backed);
                 continue;
             }
             const sub: PatternNode* = enum_pat.sub_at(j);
-            if (sub != null) { this.bind_subpattern(sub, elem_ty); }
+            if (sub != null) { this.bind_subpattern(sub, elem_ty, caller_backed); }
         }
     }
 
     /// Bind names in an arbitrary nested pattern matched against `value_type`.
     /// Only identifier bindings and nested enum patterns introduce names.
-    bind_subpattern(mut &this, pat: PatternNode*, value_type: TypeRef) -> void {
+    bind_subpattern(mut &this, pat: PatternNode*, value_type: TypeRef,
+                    caller_backed: boolean) -> void {
         if (pat == null) { return; }
         if (pat.pattern_kind == PatternKind::Identifier && pat.binding_name.is_valid()) {
-            if (value_type.is_valid()) { this.scopes.register_local(pat.binding_name, value_type); }
+            if (value_type.is_valid()) {
+                this.scopes.register_local(pat.binding_name, value_type);
+                this.note_alias_binding(pat.binding_name, caller_backed);
+            }
             return;
         }
         if (pat.pattern_kind == PatternKind::Enum) {
-            this.bind_enum_pattern(pat as EnumPatternNode*, value_type);
+            this.bind_enum_pattern(pat as EnumPatternNode*, value_type, caller_backed);
         }
     }
 

@@ -1,0 +1,35 @@
+// E0600: a `match` with an awaiting arm guard cannot bind an OWNING payload out
+// of its subject.
+//
+// A suspending guard turns the `match` into a decision chain: each arm is tested
+// in its own state, and a guard that fails falls through to the next test, which
+// matches the SAME subject again. Binding a scalar payload copies it and leaves
+// the subject whole; binding an owning one moves it out, so the following test
+// would match a value whose contents have been taken away — and the subject is
+// handed back to the chain either way, which would leave the future holding a
+// moved-from value to drop.
+//
+// The rewrite is to bind inside the arm, where the subject is no longer re-tested:
+//   Option::Some(_) if await g() => { match (o) { Option::Some(s) => { … } … } }
+![config(testing)]
+![config(negative, E0600)]
+namespace CryoTests::Negative::E0600AsyncGuardMovesOwningPayload;
+
+import std::future;
+import std::collections::string;
+
+async function ready_true() -> boolean {
+    return await PendingThenReady<boolean>::new(1, true);
+}
+
+async function guarded(o: Option<String>) -> u64 {   //~ ERROR[E0600] async: a `match` with an awaiting arm guard cannot bind an owning payload out of its subject
+    match (o) {
+        Option::Some(s) if await ready_true() => {
+            const _n: u64 = await PendingThenReady<u64>::new(1, s.length());
+            return _n;
+        }
+        _ => { return 0; }
+    }
+}
+
+function main() -> int { return 0; }

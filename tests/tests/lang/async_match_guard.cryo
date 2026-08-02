@@ -1,0 +1,254 @@
+// State-machine lowering: an `await` inside a `match`-arm GUARD.
+//
+// Every other `await` position reduces to a temporary bound before the statement
+// that uses it. A guard cannot: it runs after its own pattern matched and before
+// the next arm is tried, so lifting it above the `match` would both run it for a
+// subject its pattern rejects and lose the "try the next arm" edge that a false
+// guard means.
+//
+// So a `match` with a suspending guard is lowered as a DECISION CHAIN — one test
+// state per arm, each falling through to the next — instead of the single
+// dispatch `match` every other case uses. The two shapes must be
+// indistinguishable from the source's point of view, and the cases here are
+// chosen for the properties that a plausible-but-wrong chain gets wrong:
+//
+//   * THE SUBJECT IS EVALUATED ONCE. The chain re-tests it per arm; re-evaluating
+//     it per test would run its side effects once per arm tried.
+//
+//   * A GUARD RUNS ONLY WHEN ITS OWN PATTERN MATCHED, and guards run in arm
+//     order, stopping at the first that holds.
+//
+//   * A FALSE GUARD FALLS TO THE NEXT ARM — including to a later arm with the
+//     SAME pattern, which is the whole reason guards exist.
+![config(testing)]
+namespace CryoTests::Tests::Lang::AsyncMatchGuard;
+
+import std::test;
+import std::core::option;
+import std::core::result;
+import std::future;
+
+// Each guard suspends at least once, so every case crosses a real state
+// boundary rather than completing inside one poll.
+async function mg_guard(yes: boolean) -> boolean {
+    return await PendingThenReady<boolean>::new(1, yes);
+}
+
+async function mg_big(v: i64) -> boolean {
+    return await PendingThenReady<boolean>::new(1, v > 10);
+}
+
+async function mg_bump(v: i64) -> i64 {
+    return await PendingThenReady<i64>::new(1, v + 1);
+}
+
+// ---- the guard decides which arm runs ----
+
+async function scalar_subject(v: i64) -> i64 {
+    match (v) {
+        1 => { return 100; }
+        n if await mg_big(n) => { return 200; }
+        _ => { return 300; }
+    }
+}
+
+![test]
+function a_guard_that_awaits_selects_its_arm() -> Result<(), TestError> {
+    return expect_eq(future::block_on(scalar_subject(50)), 200 as i64);
+}
+
+![test]
+function a_false_awaiting_guard_falls_to_the_next_arm() -> Result<(), TestError> {
+    return expect_eq(future::block_on(scalar_subject(3)), 300 as i64);
+}
+
+![test]
+function an_arm_before_a_guarded_one_still_wins() -> Result<(), TestError> {
+    return expect_eq(future::block_on(scalar_subject(1)), 100 as i64);
+}
+
+// ---- a guard reading its own pattern's binding ----
+
+async function enum_guard(o: Option<i64>) -> i64 {
+    match (o) {
+        Option::Some(n) if await mg_big(n) => { return n + 1000; }
+        Option::Some(n) => { return n; }
+        Option::None    => { return -1; }
+    }
+}
+
+![test]
+function a_guard_reads_the_binding_of_its_own_pattern() -> Result<(), TestError> {
+    return expect_eq(future::block_on(enum_guard(Option::Some(50))), 1050 as i64);
+}
+
+// The subject is matched AGAIN by the next test after the guard fails, which is
+// what the chain has to keep intact.
+![test]
+function a_false_guard_falls_to_a_later_arm_with_the_same_pattern() -> Result<(), TestError> {
+    return expect_eq(future::block_on(enum_guard(Option::Some(2))), 2 as i64);
+}
+
+![test]
+function an_unguarded_arm_after_a_guarded_one_still_matches() -> Result<(), TestError> {
+    return expect_eq(future::block_on(enum_guard(Option::None)), -1 as i64);
+}
+
+// ---- several guards, and a body that also suspends ----
+
+async function two_guards(v: i64) -> i64 {
+    match (v) {
+        a if await mg_big(a)     => { return 1; }
+        b if await mg_big(b * 4) => { const c: i64 = await mg_bump(b); return c; }
+        _                        => { return 3; }
+    }
+}
+
+![test]
+function the_first_holding_guard_wins() -> Result<(), TestError> {
+    return expect_eq(future::block_on(two_guards(50)), 1 as i64);
+}
+
+![test]
+function a_second_guard_runs_when_the_first_fails() -> Result<(), TestError> {
+    // 5 is not big, 20 is; the arm body then suspends again before returning.
+    return expect_eq(future::block_on(two_guards(5)), 6 as i64);
+}
+
+![test]
+function all_guards_failing_reaches_the_last_arm() -> Result<(), TestError> {
+    return expect_eq(future::block_on(two_guards(0)), 3 as i64);
+}
+
+// ---- a guard beside a guard that does NOT await ----
+
+async function mixed_guards(v: i64) -> i64 {
+    match (v) {
+        n if n == 7          => { return 70; }
+        m if await mg_big(m) => { return 80; }
+        _                    => { return 90; }
+    }
+}
+
+![test]
+function a_plain_guard_next_to_an_awaiting_one_still_decides() -> Result<(), TestError> {
+    return aw_guard_both(
+        expect_eq(future::block_on(mixed_guards(7)), 70 as i64),
+        aw_guard_both(expect_eq(future::block_on(mixed_guards(50)), 80 as i64),
+                      expect_eq(future::block_on(mixed_guards(1)),  90 as i64)));
+}
+
+function aw_guard_both(a: Result<(), TestError>, b: Result<(), TestError>) -> Result<(), TestError> {
+    match (a) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return b;
+}
+
+// ---- inside a loop, where the chain's edges share the loop's dispatch ----
+
+async function guard_in_loop(limit: i64) -> i64 {
+    mut acc: i64 = 0;
+    mut i: i64 = 0;
+    loop {
+        if (i >= limit) { break; }
+        match (i) {
+            k if await mg_big(k * 5) => { acc = acc + 10; }
+            _                        => { acc = acc + 1; }
+        }
+        i = i + 1;
+    }
+    return acc;
+}
+
+![test]
+function a_guard_that_awaits_inside_a_loop() -> Result<(), TestError> {
+    // i = 0,1,2 -> 0,5,10, none over 10 -> three misses.
+    return expect_eq(future::block_on(guard_in_loop(3)), 3 as i64);
+}
+
+![test]
+function a_guard_that_awaits_holds_on_some_iterations() -> Result<(), TestError> {
+    // i = 0..4 -> 0,5,10,15,20; the last two are big.
+    return expect_eq(future::block_on(guard_in_loop(5)), 23 as i64);
+}
+
+// ---- the same guard in a match EXPRESSION ----
+
+async function guard_in_match_expr(v: i64) -> i64 {
+    const r: i64 = match (v) {
+        n if await mg_big(n) => { 5 }
+        _                    => { 6 }
+    };
+    return r;
+}
+
+![test]
+function a_guard_that_awaits_in_a_match_expression() -> Result<(), TestError> {
+    return aw_guard_both(
+        expect_eq(future::block_on(guard_in_match_expr(50)), 5 as i64),
+        expect_eq(future::block_on(guard_in_match_expr(1)),  6 as i64));
+}
+
+// ---- evaluation ORDER, which is what a wrong chain silently breaks ----
+//
+// One test owns this counter, so its reads cannot race the parallel runner.
+mut mg_trace: i64 = 0;
+
+function mg_mark(d: i64) -> i64 {
+    mg_trace = mg_trace * 10 + d;
+    return d;
+}
+
+async function mg_marked_guard(d: i64, yes: boolean) -> boolean {
+    const _m: i64 = mg_mark(d);
+    return await PendingThenReady<boolean>::new(1, yes);
+}
+
+// The subject marks 9; each guard marks its own digit as it runs. Two guards
+// fail, so the trace records the subject ONCE followed by both guards in order.
+async function order_of_subject_and_guards() -> i64 {
+    match (mg_mark(9)) {
+        a if await mg_marked_guard(1, false) => { return a * 100; }
+        b if await mg_marked_guard(2, false) => { return b * 200; }
+        c => { return c; }
+    }
+}
+
+// A guard on an arm whose PATTERN does not match must never run: guard 1 sits on
+// `None` and the subject is `Some`, so only guard 2 leaves a mark.
+async function guard_skipped_when_pattern_fails() -> i64 {
+    const o: Option<i64> = Option::Some(3);
+    match (o) {
+        Option::None    if await mg_marked_guard(1, true) => { return -1; }
+        Option::Some(n) if await mg_marked_guard(2, true) => { return n; }
+        _ => { return -2; }
+    }
+}
+
+![test]
+function the_subject_is_evaluated_once_and_guards_run_in_order() -> Result<(), TestError> {
+    mg_trace = 0;
+    const r: i64 = future::block_on(order_of_subject_and_guards());
+    const trace: i64 = mg_trace;
+    match (expect_eq(r, 9 as i64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    // Subject once, then guard 1, then guard 2 - not 99 or 991, which is what
+    // re-evaluating the subject per test would produce.
+    match (expect_eq(trace, 912 as i64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+
+    mg_trace = 0;
+    const s: i64 = future::block_on(guard_skipped_when_pattern_fails());
+    const trace2: i64 = mg_trace;
+    match (expect_eq(s, 3 as i64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(trace2, 2 as i64);
+}

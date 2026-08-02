@@ -1,67 +1,106 @@
 ///! HTTP/2 server.
 ///!
-///! `serve` runs the server side of HTTP/2 over an already-accepted
-///! `Read + Write` stream, dispatching each request to a handler until
-///! the peer closes the connection - generic over the transport, so it
-///! serves h2c (`TcpStream`) and, layered under a `TlsAcceptor`, h2.
+///! `serve` runs the server side of HTTP/2 over an already-accepted, buffered
+///! async transport, dispatching each request to a handler until the peer closes
+///! the connection - generic over the transport, so it serves h2c (`TcpStream`)
+///! and, layered under a TLS session, h2. It takes ownership of the connection,
+///! as the whole async family does.
 ///!
-///! `Http2Server` is a blocking h2c (cleartext) listener: bind, then
-///! `serve_one` for a single connection or `run` to accept and serve
-///! connections forever, one at a time. Requests are dispatched through
-///! the same `(Request) -> Response` handler the HTTP/1.1 server uses.
+///! `Http2Server` is an h2c (cleartext) listener: bind, then `serve_one` for a
+///! single connection or `run` to accept and serve connections forever, one at a
+///! time. Both are `async` and need an `Executor` — its reactor is what the
+///! accept and the per-connection reads register with. Requests are dispatched
+///! through the same `(Request) -> Response` handler the HTTP/1.1 server uses.
+///!
+///! `TcpAccept` consumes the listener and hands it back with the connection it
+///! produced, so the loop swaps it out of `this` and back in each time round
+///! rather than borrowing it across the suspension.
 
 namespace std::net::http2::server;
 
 import core::option;
 import core::result;
+import core::mem;
 import io::error;
 import io::traits;
-import net::socket_addr;
-import net::tcp;
+import io::buf;
+import net::addr::socket_addr;
+import net::socket::tcp;
 import net::http::request;
 import net::http::response;
 import net::http2::connection;
+import future::poll;
+import future::waker;
+import future::traits;
 
-/// Serve HTTP/2 over `stream`, dispatching each request to `handler`
-/// until the peer closes or sends GOAWAY. The caller owns `stream`.
-function serve<S>(stream: S*, handler: (Request) -> Response) -> Result<(), IoError>
-where S: Read + Write {
-    mut conn: Http2Connection<S> = Http2Connection<S>::new_server(stream);
-    const r: Result<(), IoError> = conn.serve(handler);
-    conn.drop();
-    return r;
+/// Serve HTTP/2 over `conn`, dispatching each request to `handler` until the
+/// peer closes or sends GOAWAY. Takes ownership of the connection.
+async function serve<S>(conn: BufStream<S>, handler: (Request) -> Response) -> Result<(), IoError>
+where S: AsyncTransport {
+    mut c: Http2Connection<S> = Http2Connection<S>::new_server(conn);
+    return await c.serve(handler);
 }
 
-/// A blocking, single-threaded h2c (cleartext) server.
+/// A single-connection-at-a-time h2c (cleartext) server.
 type struct Http2Server {
     listener: TcpListener;
 
-    /// Bind + listen on `addr` for h2c connections.
+    /// Bind + listen on `addr` for h2c connections. The listener is put in
+    /// non-blocking mode here: `TcpAccept` parks on readiness, and a blocking
+    /// listener would stall an executor's whole worker thread inside `accept`.
     static bind(addr: SocketAddr) -> Result<Http2Server, IoError> {
-        const l: TcpListener = TcpListener::bind(addr)?;
+        mut l: TcpListener = TcpListener::bind(addr)?;
+        l.set_nonblocking(true)?;
         return Result::Ok(Http2Server { listener: l });
     }
 
+    /// The local address the listener is bound to. After `bind(.., 0)` this
+    /// reports the kernel-assigned ephemeral port.
+    local_addr(&this) -> Result<SocketAddr, IoError> {
+        return this.listener.local_addr();
+    }
+
     /// Accept one connection and serve it to completion, then return.
-    serve_one(mut &this, handler: (Request) -> Response) -> Result<(), IoError> {
-        mut stream: TcpStream = this.listener.accept()?;
-        const r: Result<(), IoError> = serve(&stream, handler);
-        stream.drop();
-        return r;
+    async serve_one(mut &this, handler: (Request) -> Response) -> Result<(), IoError> {
+        mut stream: TcpStream = (await this.accept_one())?;
+        mut conn: Http2Connection<TcpStream> =
+            Http2Connection<TcpStream>::new_server(BufStream<TcpStream>::of(stream));
+        return await conn.serve(handler);
     }
 
     /// Accept and serve connections forever, one at a time. A failure on
     /// a single connection is swallowed so one client can't stop the
     /// server; only an `accept` failure ends the loop.
-    run(mut &this, handler: (Request) -> Response) -> Result<(), IoError> {
+    async run(mut &this, handler: (Request) -> Response) -> Result<(), IoError> {
         loop {
-            mut stream: TcpStream = this.listener.accept()?;
-            match (serve(&stream, handler)) {
+            mut stream: TcpStream = (await this.accept_one())?;
+            mut conn: Http2Connection<TcpStream> =
+                Http2Connection<TcpStream>::new_server(BufStream<TcpStream>::of(stream));
+            match (await conn.serve(handler)) {
                 Result::Ok(_)  => { }
                 Result::Err(_) => { }
             }
-            stream.drop();
         }
+    }
+
+    /// Take the listener out of `this`, accept one connection on it, and put it
+    /// back. The swap is what lets the accept own the listener for the duration
+    /// without this server holding a second address for it across the
+    /// suspension.
+    async accept_one(mut &this) -> Result<TcpStream, IoError> {
+        mut lent: TcpListener = TcpListener::from_fd(-1);
+        mem::swap<TcpListener>(&lent, &this.listener);
+
+        mut acc: TcpAccepted = await TcpAccept::start(lent);
+
+        // Restore the real listener before looking at the result: every exit
+        // below must leave `this` holding its socket rather than the
+        // placeholder.
+        mut back: TcpListener = acc.take_listener();
+        mem::swap<TcpListener>(&back, &this.listener);
+        back.drop();                    // the closed placeholder, not a socket
+
+        return acc.take_result();
     }
 
     drop(mut &this) -> void {

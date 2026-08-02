@@ -132,6 +132,19 @@ type struct CompilerConfig {
     /// force a freestanding build on, never off); for single-file builds
     /// it is the only way to opt out of the auto-imported stdlib.
     no_std:              boolean;
+    /// `--no-runtime`: freestanding build - suppress the implicit `main`
+    /// widening / prologue and the `@panic` runtime, route check failures to
+    /// `llvm.trap`, and link with `-nostartfiles -nostdlib -static`.  OR'd
+    /// with the cryoconfig `no_runtime` key for project builds (can force on,
+    /// never off).  How `runtime/core` is built.  Implies nothing about the
+    /// stdlib - pair with `--no-std` for a fully freestanding build.
+    no_runtime:          boolean;
+    /// `--panic=<abort|unwind>`: which panic strategy to emit and link.  Unlike
+    /// `no_std`/`no_runtime` this is a CHOICE rather than a switch, so it is
+    /// not OR'd: an explicit flag overrides the cryoconfig in either direction,
+    /// and `Unspecified` (the default here) leaves the project's own answer
+    /// alone.  `ProjectConfig::resolve_panic_unwind` turns it into a boolean.
+    panic:               PanicStrategy;
     /// `--locked`: verify the `cryoconfig.lock` vendor section instead of
     /// updating it - the build FAILS if a resolved vendor binding's content
     /// hash drifts from the lock (or has no lock entry).  The reproducibility
@@ -163,6 +176,8 @@ type struct CompilerConfig {
             incremental:         true,
             release_static:      false,
             no_std:              false,
+            no_runtime:          false,
+            panic:               PanicStrategy::Unspecified,
             locked:              false,
             codegen_threads_override: -1,
         };
@@ -186,6 +201,8 @@ type struct CompilerConfig {
             incremental:         true,
             release_static:      false,
             no_std:              false,
+            no_runtime:          false,
+            panic:               PanicStrategy::Unspecified,
             locked:              false,
             codegen_threads_override: -1,
         };
@@ -312,6 +329,20 @@ type struct CompilerInstance {
         return view;
     }
 
+    /// Build a ProjectConfig view that compiles one `[[lib]]` workspace
+    /// member as a Library.  Unlike `make_lib_view` (which reads the singular
+    /// `[lib]`), the member is passed explicitly: name + source_dir select
+    /// what to compile and name the `lib<name>.a` archive.  Everything else
+    /// (no_std/no_runtime/optimize/link/stdlib) is inherited from `base`, so
+    /// members share the project-level `[compiler]` config.
+    static make_lib_member_view(base: ProjectConfig, lib: LibTarget) -> ProjectConfig {
+        mut view: ProjectConfig = base;
+        view.target_type  = TargetType::Library;
+        view.project_name = lib.name;
+        view.source_dir   = lib.source_dir;
+        return view;
+    }
+
     // Shared pipeline orchestration
 
     /// Run a pipeline on a context, handling AST dump, diagnostics, and
@@ -429,6 +460,8 @@ type struct CompilerInstance {
         config.entry_point  = source.basename();
         config.project_name = source.stem();
         config.no_std       = this.config.no_std;
+        config.no_runtime   = this.config.no_runtime;
+        config.panic        = this.config.panic;
         config.emit_llvm    = this.config.emit_llvm;
         // Artifacts land NEXT TO THE SOURCE FILE, not in the invoking
         // directory: output_dir is consumed as-is by the build-layout
@@ -516,6 +549,8 @@ type struct CompilerInstance {
         config.entry_point  = source.basename();
         config.project_name = source.stem();
         config.no_std       = this.config.no_std;
+        config.no_runtime   = this.config.no_runtime;
+        config.panic        = this.config.panic;
         if (this.config.target_triple_override.length() > 0) {
             config.target_triple = this.config.target_triple_override;
         }
@@ -726,6 +761,14 @@ type struct CompilerInstance {
         if (this.config.no_std) {
             config.no_std = true;
         }
+        // Same one-directional force for `--no-runtime`.
+        if (this.config.no_runtime) {
+            config.no_runtime = true;
+        }
+        // NOT one-directional: `--panic=` names a strategy, so an explicit flag
+        // has to be able to select abort as well as unwind.  `pick` keeps the
+        // project's answer when the CLI said nothing.
+        config.panic = PanicStrategy::pick(config.panic, this.config.panic);
 
         // Mirror cryoconfig `debug = true` into the global compiler debug
         // gate so the [Tag] trace printfs fire.  Only flips it ON; CLI
@@ -797,7 +840,48 @@ type struct CompilerInstance {
             if (r.output_path.length() > 0) { last_output = r.output_path; }
         }
 
+        // Workspace `[[lib]]` members: build each as an independent library
+        // archive from its own source_dir.  Each member flows through the same
+        // single-target library path as a lone `target_type = "library"`
+        // project, so `run_linking` archives `lib<name>.a` with no extra work.
+        // A fresh CompilationContext per member (in compile_project_with_config)
+        // isolates the module graph, so members with disjoint namespaces do not
+        // interfere; each member's name keys its own archive + incremental state.
+        for (mut i: int = 0; i < base.libs.length; i++) {
+            cdebug("[Compiler] Workspace: building lib '%s' from %s\n",
+                base.libs[i].name, base.libs[i].source_dir);
+            // Clone `base` per iteration; make_lib_member_view consumes its first arg.
+            const sel: LibTarget = base.libs[i];
+            const lib_view: ProjectConfig = CompilerInstance::make_lib_member_view(base.clone(), sel);
+            const r: CompilationResult = this.compile_project_with_config(lib_view);
+            if (!r.success) { return r; }
+            if (r.output_path.length() > 0) { last_output = r.output_path; }
+        }
+
         return CompilationResult::ok(last_output);
+    }
+
+    /// Union the import closure of the compiler-injected module `ns` into
+    /// `out`, for folding into every per-module cache key.
+    ///
+    /// Absent is not an error: the prelude is skipped under `no_std` and the
+    /// f-string runtime is only discovered when an f-string is actually used,
+    /// so a missing module simply contributes nothing.  A closure that comes
+    /// back SHORT is different, and raises `out_short` - the widened key would
+    /// then be missing inputs exactly like an unresolvable dependency name,
+    /// and the caller declines to serve those modules from cache.
+    mark_implicit_closure(&this, ctx: CompilationContext*, ns: string, n: u32,
+                          out: boolean[]*, out_short: boolean*) -> void {
+        if (ctx == null || out == null) { return; }
+        const idx: i64 = ctx.module_graph.find_module_index(ctx.intern_table.intern(ns));
+        if (idx < 0 || idx >= n as i64) { return; }
+        mut short_walk: boolean = false;
+        const clos: boolean[] =
+            ctx.module_graph.compute_import_closure(idx as u32, n, &short_walk);
+        for (mut i: u32 = 0; i < n; i++) {
+            if (clos[i as i64]) { (*out)[i as i64] = true; }
+        }
+        if (short_walk && out_short != null) { *out_short = true; }
     }
 
     /// Compile a single target view of a project.  Shared between the
@@ -806,8 +890,9 @@ type struct CompilerInstance {
     compile_project_with_config(&this, config: ProjectConfig) -> CompilationResult {
         const root_path: string = config.discovery_root_path();
 
-        cdebug("[Compiler] Project: %s (target: %s, root: %s, no_std: %d)\n",
-            config.project_name, config.target_type.label(), root_path, config.no_std as int);
+        cdebug("[Compiler] Project: %s (target: %s, root: %s, no_std: %d, no_runtime: %d)\n",
+            config.project_name, config.target_type.label(), root_path,
+            config.no_std as int, config.no_runtime as int);
 
         if (!metadata::exists(Path::from(root_path))) {
             // Route to stderr: stdout in LSP mode owns the JSON-RPC stream;
@@ -925,12 +1010,12 @@ type struct CompilerInstance {
         // the overhead on a normal build is a handful of `clock_gettime`s.
         const tm_on: boolean = CompilerInstance::timing_enabled();
         const tm_entry:        i64 = Instant::now().as_nanos();
-        mut tm_discovery_end:  i64 = 0i64;
-        mut tm_frontend_end:   i64 = 0i64;
-        mut tm_mono_end:       i64 = 0i64;
-        mut tm_sema_end:       i64 = 0i64;
-        mut tm_codegen_end:    i64 = 0i64;
-        mut tm_link_end:       i64 = 0i64;
+        mut tm_discovery_end:  i64 = 0;
+        mut tm_frontend_end:   i64 = 0;
+        mut tm_mono_end:       i64 = 0;
+        mut tm_sema_end:       i64 = 0;
+        mut tm_codegen_end:    i64 = 0;
+        mut tm_link_end:       i64 = 0;
 
         const root_path: string = config.discovery_root_path();
         ctx.debug_mode = this.config.debug;
@@ -971,6 +1056,8 @@ type struct CompilerInstance {
         ctx.emit_debug_info = ProjectConfig::profile_base_debug_info(config.profile)
             || this.config.emit_debug_info;
         ctx.project_no_std = config.no_std;
+        ctx.project_no_runtime = config.no_runtime;
+        ctx.project_panic_unwind = config.resolve_panic_unwind();
         ctx.target_triple = config.target_triple;
         // Distribution-only static link (see CompilerConfig.release_static).
         // Consumed at link time; has no effect on emitted IR.
@@ -1433,8 +1520,8 @@ type struct CompilerInstance {
             const manifest: BuildManifest::Manifest = Compiler::BuildManifest::Manifest::new(
                 ctx.project_config, ctx.opt_level, ctx.emit_debug_info,
                 manifest_stdlib_archive);
-            const build_fp: u64 = manifest.compute_fingerprint(&mod_entries);
-            build_fp_hex = build_fp.to_hex_padded_str(16);
+            const build_fp: u128 = manifest.compute_fingerprint(&mod_entries);
+            build_fp_hex = Compiler::BuildManifest::Manifest::hex128(build_fp);
 
             if (manifest.is_up_to_date(build_fp_hex, &manifest_artifacts)) {
                 // Nothing changed and the artifact still exists: skip
@@ -1602,7 +1689,7 @@ type struct CompilerInstance {
             pm_active = true;
 
             // Per-module source hashes (indexed by module index).
-            mut pm_src_h: u64[] = [];
+            mut pm_src_h: u128[] = [];
             for (mut m: u32 = 0; m < n; m++) {
                 const mi: ModuleInfo* = &ctx.module_graph.modules[m];
                 pm_src_h.push(Compiler::BuildManifest::Manifest::module_source_hash(
@@ -1611,7 +1698,7 @@ type struct CompilerInstance {
                     mi.file_path));
             }
 
-            const pm_tool_fp: u64 = Compiler::BuildManifest::Manifest::toolchain_fingerprint(
+            const pm_tool_fp: u128 = Compiler::BuildManifest::Manifest::toolchain_fingerprint(
                 ctx.project_config, ctx.opt_level, ctx.emit_debug_info);
 
             // Spec ownership.  A spec whose owner can't be attributed to a
@@ -1656,43 +1743,86 @@ type struct CompilerInstance {
             }
 
             // Global digest over every module's source hash, in topo order.
-            mut pm_global_h: DefaultHasher = DefaultHasher::new();
+            mut pm_global_h: Fnv128Hasher = Fnv128Hasher::new();
             pm_global_h.fold(pm_tool_fp);
             for (mut i: u32 = 0; i < n; i++) {
                 pm_global_h.fold(pm_src_h[order[i] as i64]);
             }
-            const pm_global: u64 = pm_global_h.finish();
+            const pm_global: u128 = pm_global_h.finish128();
 
             const pm_prior: BuildManifest::ModuleKeyTable =
                 Compiler::BuildManifest::ModuleKeyTable::read_module_keys(ctx.project_config.module_keys_path());
 
             // Per-module key (indexed by module index, parallel arrays).
-            for (mut m: u32 = 0; m < n; m++) { pm_cached.push(false); }
+            // `pm_closure_ok` clears for any module whose import closure came
+            // back short; such a module is never served from cache.
+            mut pm_closure_ok: boolean[] = [];
+            for (mut m: u32 = 0; m < n; m++) { pm_cached.push(false); pm_closure_ok.push(true); }
+
+            // Modules the compiler imports on a module's behalf - the prelude,
+            // and the f-string runtime when an f-string appears anywhere - are
+            // force-discovered AFTER the import graph is built and never get a
+            // dependency edge from the modules that go on to import them.  The
+            // closure walk therefore cannot reach them, and unlike an
+            // unresolvable dependency name nothing reports the gap: the walk
+            // completes, just short.  A layout change to a prelude-reachable
+            // type would leave every consumer's key unchanged while its `.o`
+            // still had the old field offsets baked in.
+            //
+            // Folded into every leaf key rather than repaired by adding the
+            // edges: `dependencies` also drives name resolution and link
+            // order, and which modules actually receive the injection is not
+            // settled until AutoImport runs, so widening the key is the change
+            // that cannot be wrong in the dangerous direction.  Owner modules
+            // already fold the global digest and so are covered.
+            mut pm_implicit: boolean[] = [];
+            for (mut i: u32 = 0; i < n; i++) { pm_implicit.push(false); }
+            mut pm_implicit_short: boolean = false;
+            if (ctx.mode.auto_imports_enabled() && !config.no_std) {
+                this.mark_implicit_closure(ctx, "std::prelude", n,
+                                           &pm_implicit, &pm_implicit_short);
+                if (ctx.module_graph.uses_fstring) {
+                    this.mark_implicit_closure(ctx, "std::fmt::interp", n,
+                                               &pm_implicit, &pm_implicit_short);
+                }
+            }
             for (mut m: u32 = 0; m < n; m++) {
                 const mi: ModuleInfo* = &ctx.module_graph.modules[m];
                 const ns: string = ctx.intern_table.resolve(mi.name);
-                mut k: DefaultHasher = DefaultHasher::new();
+                mut k: Fnv128Hasher = Fnv128Hasher::new();
                 k.fold(pm_tool_fp);
                 if (pm_owns_spec[m as i64]) {
                     k.fold("owner");
                     k.fold(pm_global);
                 } else {
                     k.fold("leaf");
+                    mut clos_incomplete: boolean = false;
                     const clos: boolean[] =
-                        ctx.module_graph.compute_import_closure(m, n);
+                        ctx.module_graph.compute_import_closure(m, n, &clos_incomplete);
                     for (mut i: u32 = 0; i < n; i++) {
-                        if (clos[order[i] as i64]) {
+                        // The implicit set is unioned in rather than folded
+                        // separately so a module reached BOTH ways still folds
+                        // exactly once and the key stays order-stable.
+                        if (clos[order[i] as i64] || pm_implicit[order[i] as i64]) {
                             k.fold(pm_src_h[order[i] as i64]);
                         }
                     }
+                    // An unresolvable dependency name left the closure short, so
+                    // this key doesn't cover everything the module was compiled
+                    // against.  Rebuild rather than risk a stale `.o`.
+                    if (clos_incomplete) { pm_closure_ok[m as i64] = false; }
+                    // Same reasoning for the implicit set: if the prelude's own
+                    // closure came back short, the widened key is short too.
+                    if (pm_implicit_short) { pm_closure_ok[m as i64] = false; }
                 }
                 pm_key_names.push(ns);
-                pm_key_hex.push(k.finish().to_hex_padded_str(16));
+                pm_key_hex.push(Compiler::BuildManifest::Manifest::hex128(k.finish128()));
             }
 
             // Cached if the prior key matches AND the .o is still on disk.
             if (pm_active) {
                 for (mut m: u32 = 0; m < n; m++) {
+                    if (!pm_closure_ok[m as i64]) { continue; }
                     const mi: ModuleInfo* = &ctx.module_graph.modules[m];
                     const prior_k: string = pm_prior.lookup(pm_key_names[m as i64]);
                     if (prior_k == "") { continue; }
@@ -1785,6 +1915,35 @@ type struct CompilerInstance {
 
         if (this.config.debug) {
             ctx.type_arena.debug_dump();
+        }
+
+        // Invariant guard (gated by CRYO_TYPE_AUDIT): canonical type identity.
+        // Off by default; zero cost when unset.
+        //
+        // Checks the property the whole interner exists to provide - for any two
+        // TypeRefs denoting the same semantic type, `a.id == b.id`.  Run HERE,
+        // after every stage that mints or mutates types in place
+        // (monomorphization's `swap_wrapper_to_concrete`, sema's resolution) and
+        // before codegen consumes those ids, so a fork is caught at its widest
+        // point rather than after it has already skewed a vtable or a mangle.
+        //
+        // A violation is an ICE rather than a warning: forked identity produces
+        // wrong output, not a diagnostic, so continuing past it just buries the
+        // symptom somewhere further downstream.
+        match (env::var(Str::new("CRYO_TYPE_AUDIT"))) {
+            Option::Some(_) => {
+                const forked: i64 = ctx.type_arena.verify_canonical_identity();
+                if (forked > 0) {
+                    ctx.diagnostics.emit(Diagnostic::error(
+                        ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                        format("canonical type identity violated: %d interned entr(ies) do not resolve to themselves by their own key (type identity has forked)",
+                            forked)));
+                    phase6_failed = true;
+                } else {
+                    fmt::eprintln("[type-audit] canonical type identity OK (0 violations)");
+                }
+            }
+            Option::None => { }
         }
 
         // Build cross-module function descriptors from front-end data.
@@ -1884,11 +2043,11 @@ type struct CompilerInstance {
             // (ProjectConfig), else -1 (auto = online CPU count).  Never affects
             // emitted bytes.
             mut cg_req: i32 = this.config.codegen_threads_override;
-            if (cg_req < 0 && config.codegen_threads >= 0i64) {
+            if (cg_req < 0 && config.codegen_threads >= 0) {
                 cg_req = config.codegen_threads as i32;
             }
             if (cg_req < 0 && ctx.project_config != null
-                && ctx.project_config.codegen_threads >= 0i64) {
+                && ctx.project_config.codegen_threads >= 0) {
                 cg_req = ctx.project_config.codegen_threads as i32;
             }
             const cg_threads: u32 = CompilerInstance::codegen_thread_count(n, cg_req);
@@ -1921,7 +2080,7 @@ type struct CompilerInstance {
             // mode (or a 1-thread build) caps at 1 -> flush every module
             // immediately, byte-identical to the serial path.
             mut cg_batch_cap: u32 = cg_threads;
-            if (cg_mode == "serial" || cg_threads <= 1u32) { cg_batch_cap = 1u32; }
+            if (cg_mode == "serial" || cg_threads <= 1) { cg_batch_cap = 1; }
 
             // The per-TARGET codegen context (published before sema/mono) is
             // superseded by per-MODULE contexts below; dispose it up front so
@@ -2108,7 +2267,8 @@ type struct CompilerInstance {
                     triple:          cg_tri,
                     opt_level:       ctx.opt_level,
                     should_register: tgt.should_register,
-                    ok:              false
+                    ok:              false,
+                    err_msg:         null as string
                 });
                 cg_pos.push(i);
                 // Detach the module from ctx (the job owns it now); do NOT
@@ -2120,11 +2280,27 @@ type struct CompilerInstance {
                     CompilerInstance::emit_jobs_threaded(&cg_jobs, cg_threads);
                     for (mut b: i64 = 0; b < cg_jobs.length as i64; b++) {
                         const p: u32 = cg_pos[b];
-                        if (cg_jobs[b].ok) {
+                        if (cg_jobs[b].ok &&
+                            !metadata::exists(Path::from(cg_jobs[b].emit_path))) {
+                            // Reported success and wrote nothing. In an
+                            // incremental build the previous build's object is
+                            // still on disk and would be archived in its place,
+                            // silently, so this has to fail the build.
+                            fmt::eprintln(f"error: codegen wrote no object for module {p}");
+                            cg_failed = true;
+                        } else if (cg_jobs[b].ok) {
                             cg_obj[p as i64] = cg_jobs[b].emit_path;
                         } else {
-                            fmt::eprintln(f"error: codegen failed for module {p}");
+                            const emsg: string = cg_jobs[b].err_msg;
+                            if (emsg != null as string) {
+                                fmt::eprintln(f"error: codegen failed for module {p}: {emsg}");
+                            } else {
+                                fmt::eprintln(f"error: codegen failed for module {p}");
+                            }
                             cg_failed = true;
+                        }
+                        if (cg_jobs[b].err_msg != null as string) {
+                            llvm::LLVMDisposeMessage(cg_jobs[b].err_msg as void*);
                         }
                     }
                     cg_jobs.clear();
@@ -2137,11 +2313,23 @@ type struct CompilerInstance {
                 CompilerInstance::emit_jobs_threaded(&cg_jobs, cg_threads);
                 for (mut b: i64 = 0; b < cg_jobs.length as i64; b++) {
                     const p: u32 = cg_pos[b];
-                    if (cg_jobs[b].ok) {
+                    if (cg_jobs[b].ok &&
+                        !metadata::exists(Path::from(cg_jobs[b].emit_path))) {
+                        fmt::eprintln(f"error: codegen wrote no object for module {p}");
+                        cg_failed = true;
+                    } else if (cg_jobs[b].ok) {
                         cg_obj[p as i64] = cg_jobs[b].emit_path;
                     } else {
-                        fmt::eprintln(f"error: codegen failed for module {p}");
+                        const emsg: string = cg_jobs[b].err_msg;
+                        if (emsg != null as string) {
+                            fmt::eprintln(f"error: codegen failed for module {p}: {emsg}");
+                        } else {
+                            fmt::eprintln(f"error: codegen failed for module {p}");
+                        }
                         cg_failed = true;
+                    }
+                    if (cg_jobs[b].err_msg != null as string) {
+                        llvm::LLVMDisposeMessage(cg_jobs[b].err_msg as void*);
                     }
                 }
                 cg_jobs.clear();
@@ -2372,10 +2560,10 @@ type struct CompilerInstance {
             CompilerInstance::timing_fmt("frontend (frontend)", tm_frontend_end - tm_discovery_end, total);
             CompilerInstance::timing_fmt("monomorphization (6a)", tm_mono_end - tm_frontend_end, total);
             CompilerInstance::timing_fmt("sema/lowering (6b)", tm_sema_end - tm_mono_end, total);
-            if (tm_codegen_end > 0i64) {
+            if (tm_codegen_end > 0) {
                 CompilerInstance::timing_fmt("codegen+objects (7)", tm_codegen_end - tm_sema_end, total);
             }
-            if (tm_link_end > 0i64) {
+            if (tm_link_end > 0) {
                 CompilerInstance::timing_fmt("link (8)", tm_link_end - tm_codegen_end, total);
             }
             fmt::printf("  %-28s\n", "----");
@@ -3027,13 +3215,13 @@ type struct CompilerInstance {
     /// Render a nanosecond span as milliseconds with one decimal place, plus
     /// its share of `total_ns`.  Pure formatting helper for the timing report.
     static timing_fmt(label: string, span_ns: i64, total_ns: i64) -> void {
-        const ms_x10: i64 = (span_ns + 50000i64) / 100000i64;
-        mut pct: i64 = 0i64;
-        if (total_ns > 0i64) {
-            pct = (span_ns * 100i64 + total_ns / 2i64) / total_ns;
+        const ms_x10: i64 = (span_ns + 50000) / 100000;
+        mut pct: i64 = 0;
+        if (total_ns > 0) {
+            pct = (span_ns * 100 + total_ns / 2) / total_ns;
         }
         fmt::printf("  %-28s %6lld.%lld ms  (%lld%%)\n",
-            label, ms_x10 / 10i64, ms_x10 % 10i64, pct);
+            label, ms_x10 / 10, ms_x10 % 10, pct);
     }
 
     /// Parallel-codegen worker count.  `CRYO_CODEGEN_THREADS` overrides; 0/1
@@ -3167,7 +3355,7 @@ type struct CompilerInstance {
     static emit_jobs_threaded(jobs: EmitJob[]*, nthreads: u32) -> void {
         const cnt: i64 = (*jobs).length as i64;
         if (cnt <= 0) { return; }
-        if (nthreads <= 1u32 || cnt <= 1) {
+        if (nthreads <= 1 || cnt <= 1) {
             CompilerInstance::emit_jobs_serial(jobs);
             return;
         }
@@ -3188,7 +3376,7 @@ type struct CompilerInstance {
         // 64 MiB per-worker stacks (SelectionDAG recursion depth).  No arena
         // pause: the workers are allocation-free (see the doc comment), so the
         // single-threaded arena is untouched while they run.
-        mut s: thread::Scope = thread::Scope::new_with_stack(64u64 * 1024u64 * 1024u64);
+        mut s: thread::Scope = thread::Scope::new_with_stack(64u64 * 1024u64 * 1024);
         for (mut w: u32 = 0; w < nw; w++) {
             s.spawn<EmitWorkerCtx*>(&wcs[w], emit_worker_entry);
         }

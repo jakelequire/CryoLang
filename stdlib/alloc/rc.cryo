@@ -1,19 +1,36 @@
-///! Rc<T, A>: single-threaded reference counting.
+///! Rc<T, A>: single-threaded reference counting, with weak references.
 ///!
 ///! `Rc<T, A>` shares ownership of a heap-allocated value among many
-///! holders.  The value lives until the last `Rc` pointing at it calls
-///! `drop`, at which point the storage is returned through the
-///! allocator instance carried inside the inner header.  `A` defaults
-///! to `GlobalAlloc` so the bare `Rc<T>` spelling keeps its meaning.
+///! holders.  The value lives until the last *strong* `Rc` pointing at it
+///! calls `drop`, at which point `T::drop()` runs; the storage itself is
+///! returned through the allocator instance carried inside the inner header
+///! once the last *weak* reference is also gone.  `A` defaults to
+///! `GlobalAlloc` so the bare `Rc<T>` spelling keeps its meaning.
 ///!
-///! **Not thread-safe.** The reference count is a plain `u64` with no
-///! synchronization.  Sending an `Rc` across threads, or cloning one
-///! from multiple threads at once, is a data race.  Use a mutex-wrapped
-///! value when shared mutable access across threads is required.
+///! **Not thread-safe.** The reference counts are plain `u64`s with no
+///! synchronization.  Sending an `Rc`/`Weak` across threads, or cloning one
+///! from multiple threads at once, is a data race.  Use `Arc` (and `Weak`
+///! from `alloc::arc`) when shared ownership crosses threads.
 ///!
-///! `Rc` does not support weak references.  Cycles through `Rc`
-///! pointers will leak; callers are responsible for breaking reference
-///! cycles manually.
+///! ## Weak references
+///!
+///! `Weak<T, A>` is a non-owning handle obtained from `Rc::downgrade`.  It
+///! does not keep the value alive: once every strong `Rc` is gone the value
+///! is dropped, and a `Weak::upgrade` from then on returns `None`.  Weak
+///! references are the tool for breaking `Rc` cycles - hold the back-edge of
+///! a cycle as a `Weak` and it will not leak.
+///!
+///! ## Teardown in two phases
+///!
+///! The header carries two counts.  `strong` tracks live `Rc` handles;
+///! `weak` tracks live `Weak` handles PLUS one shared count owned by the
+///! strong group as a whole (so `weak >= 1` for as long as any `Rc` lives).
+///! When `strong` hits 0 the value is dropped and the strong group's shared
+///! weak count is released; when `weak` then hits 0 - whether that happens
+///! on the same `drop` or later, when the last surviving `Weak` goes away -
+///! the header is freed.  This split is what lets a `Weak` safely outlive
+///! the value: the header (and the `strong` flag it reads on `upgrade`)
+///! stays mapped until no handle of either kind remains.
 
 namespace std::alloc::rc;
 
@@ -25,13 +42,30 @@ import core::drop;
 import alloc::layout;
 import alloc::allocator;
 
-/// Heap-resident header shared by every `Rc<T, A>` clone.  The allocator
-/// instance lives here, not in the `Rc` handle, so all clones agree on
-/// who frees the inner when the last refcount drops.
+/// Heap-resident header shared by every `Rc<T, A>` and `Weak<T, A>` for one
+/// value.  The allocator instance lives here, not in the handles, so all of
+/// them agree on who frees the inner when the last reference drops.
+///
+/// `strong` counts live `Rc` handles.  `weak` counts live `Weak` handles
+/// plus one shared unit held by the strong group; it therefore never drops
+/// below 1 while any `Rc` exists, which is exactly what keeps `strong`
+/// readable (for `upgrade`) after the value itself has been destroyed.
 type struct RcInner<T, A> {
-    count: u64;
-    value: T;
-    alloc: A;
+    strong: u64;
+    weak:   u64;
+    value:  T;
+    alloc:  A;
+}
+
+/// Free the header through its own stored allocator.  Called only once the
+/// value has already been dropped (on the `strong -> 0` transition) and both
+/// counts have reached zero.  The allocator is moved to a stack local before
+/// `deallocate` so the call does not reach into the memory it is reclaiming.
+private function free_rc_inner<T, A>(inner_ptr: RcInner<T, A>*) -> void
+where A: Allocator {
+    mut alloc: A = inner_ptr.alloc;
+    const header: Layout = Layout::of<RcInner<T, A>>();
+    alloc.deallocate(NonNull::new(inner_ptr as u8*), header);
 }
 
 type struct Rc<T, A = GlobalAlloc> {
@@ -75,51 +109,67 @@ type struct Rc<T, A = GlobalAlloc> {
         const raw: NonNull<u8> = alloc.allocate(header)?;
         const typed: NonNull<RcInner<T, GlobalAlloc>> = raw.cast<RcInner<T, GlobalAlloc>>();
         const inner_ptr: RcInner<T, GlobalAlloc>* = typed.as_ptr();
-        inner_ptr.count = 1;
-        inner_ptr.value = value;
-        inner_ptr.alloc = alloc;
+        inner_ptr.strong = 1;
+        inner_ptr.weak   = 1;
+        inner_ptr.value  = value;
+        inner_ptr.alloc  = alloc;
         return Result::Ok(Rc<T, GlobalAlloc> { inner: inner_ptr });
     }
 
     /// Fallible constructor with a caller-supplied allocator.  The
     /// allocator instance is stored in the inner header and is used to
-    /// free the inner when the last refcount drops.
+    /// free the inner when the last reference drops.
     static try_new_in(value: T, alloc: A) -> Result<Rc<T, A>, AllocError> {
         mut a: A = alloc;
         const header: Layout = Layout::of<RcInner<T, A>>();
         const raw: NonNull<u8> = a.allocate(header)?;
         const typed: NonNull<RcInner<T, A>> = raw.cast<RcInner<T, A>>();
         const inner_ptr: RcInner<T, A>* = typed.as_ptr();
-        inner_ptr.count = 1;
-        inner_ptr.value = value;
-        inner_ptr.alloc = a;
+        inner_ptr.strong = 1;
+        inner_ptr.weak   = 1;
+        inner_ptr.value  = value;
+        inner_ptr.alloc  = a;
         return Result::Ok(Rc<T, A> { inner: inner_ptr });
     }
 
     /// Produce another `Rc` pointing at the same value.  Increments the
-    /// reference count; the two handles are interchangeable.  Allocator
+    /// strong count; the two handles are interchangeable.  Allocator
     /// is shared through the inner pointer; no copy needed.
     clone(&this) -> Rc<T, A> {
         const inner_ptr: RcInner<T, A>* = this.inner;
-        inner_ptr.count = inner_ptr.count + 1;
+        inner_ptr.strong = inner_ptr.strong + 1;
         return Rc<T, A> { inner: this.inner };
+    }
+
+    /// A non-owning `Weak` handle to the same value.  Bumps the weak count
+    /// but not the strong count, so it will not keep the value alive.
+    downgrade(&this) -> Weak<T, A> {
+        const inner_ptr: RcInner<T, A>* = this.inner;
+        inner_ptr.weak = inner_ptr.weak + 1;
+        return Weak<T, A> { inner: this.inner };
     }
 
     /// Current strong-reference count.  Primarily useful for tests and
     /// assertions; acting on this value in a running program is rarely
     /// the right move.
     strong_count(&this) -> u64 {
-        return this.inner.count;
+        return this.inner.strong;
     }
 
-    /// Raw pointer to the shared value.  Valid for as long as *any*
+    /// Number of live `Weak` handles.  The strong group's shared unit is
+    /// excluded, so this is 0 when no `Weak` has been created.
+    weak_count(&this) -> u64 {
+        return this.inner.weak - 1;
+    }
+
+    /// Raw pointer to the shared value.  Valid for as long as *any* strong
     /// clone of this `Rc` is still alive; dereferencing after the last
     /// `drop` is undefined.
     as_ptr(&this) -> T* {
         return &this.inner.value;
     }
 
-    /// Shared borrow of the value. Sound for reads while any clone is
+    /// Shared borrow of the value. Sound for reads while any strong clone is
     /// alive. Prefer over `as_ptr` for the read path. Do NOT mutate
     /// through this when other clones exist - use `get_mut`, which is
     /// gated on uniqueness.
@@ -127,12 +177,13 @@ type struct Rc<T, A = GlobalAlloc> {
         return &this.inner.value;
     }
 
-    /// Mutable borrow of the value, but only when this is the sole owner
-    /// (`strong_count() == 1`); otherwise `None`. This is the sound way
-    /// to mutate an `Rc`-managed value: aliasing through other clones is
-    /// impossible because they would push the count above 1.
+    /// Mutable borrow of the value, but only when this is the sole owner:
+    /// exactly one strong reference AND no outstanding `Weak` (either could
+    /// otherwise alias the value - a `Weak` by upgrading to a second strong).
+    /// Otherwise `None`. This is the sound way to mutate an `Rc`-managed
+    /// value.
     get_mut(mut &this) -> Option<T*> {
-        if (this.inner.count == 1) {
+        if (this.inner.strong == 1 && this.inner.weak == 1) {
             return Option::Some(&this.inner.value);
         }
         return Option::None;
@@ -140,18 +191,55 @@ type struct Rc<T, A = GlobalAlloc> {
 
 }
 
-/// Decrement the refcount.  When the count reaches zero, `T::drop()` is
-/// called on the shared value and the underlying storage is freed.
+/// A non-owning reference to an `Rc`-managed value.  Obtain one with
+/// `Rc::downgrade`; recover a strong `Rc` (if the value still lives) with
+/// `upgrade`.  Holding a `Weak` keeps the header mapped but not the value,
+/// which is what makes it safe to store the back-edge of a cycle here.
+type struct Weak<T, A = GlobalAlloc> {
+    // Nullable, like `Rc::inner`: a dangling `Weak::new()` carries null and
+    // a dropped handle is nulled for idempotency.
+    inner: RcInner<T, A>*;
+
+    /// A `Weak` that never upgrades.  Allocates nothing; `upgrade` always
+    /// returns `None`.  Useful as a placeholder before a cycle is wired up.
+    static new() -> Weak<T, GlobalAlloc> {
+        return Weak<T, GlobalAlloc> { inner: null };
+    }
+
+    /// Try to obtain a strong `Rc`.  Returns `None` once the last strong
+    /// reference has gone (the value has been dropped), or for a dangling
+    /// `Weak::new()`.  On success the strong count is bumped, so the
+    /// returned `Rc` keeps the value alive.
+    upgrade(&this) -> Option<Rc<T, A>> {
+        if (this.inner == null) { return Option::None; }
+        const inner_ptr: RcInner<T, A>* = this.inner;
+        if (inner_ptr.strong == 0) { return Option::None; }
+        inner_ptr.strong = inner_ptr.strong + 1;
+        return Option::Some(Rc<T, A> { inner: inner_ptr });
+    }
+
+    /// Another `Weak` to the same value.  Bumps the weak count.
+    clone(&this) -> Weak<T, A> {
+        if (this.inner != null) {
+            const inner_ptr: RcInner<T, A>* = this.inner;
+            inner_ptr.weak = inner_ptr.weak + 1;
+        }
+        return Weak<T, A> { inner: this.inner };
+    }
+
+    /// Live strong count, or 0 for a dangling `Weak`.  Advisory.
+    strong_count(&this) -> u64 {
+        if (this.inner == null) { return 0; }
+        return this.inner.strong;
+    }
+}
+
+/// Decrement the strong count.  When it reaches zero, run `T::drop()` on the
+/// shared value and release the strong group's shared weak unit; if that
+/// takes the weak count to zero as well, free the header.
 ///
-/// The allocator instance lives in the inner header we're about to
-/// free, so it must be moved out to a stack local *before* the
-/// `deallocate` call; otherwise the deallocate would call into memory
-/// that's about to be reclaimed.  After the move, the inner allocator
-/// slot is logically empty and the stack copy is the sole live
-/// instance; it drops at the end of this function.
-///
-/// Ownership obligation: every `Rc` handle must have `drop` called
-/// exactly once before it goes out of scope.
+/// Ownership obligation: every `Rc` handle must have `drop` called exactly
+/// once before it goes out of scope.
 implement<T, A> trait Drop for struct Rc<T, A>
 where T: Drop, A: Allocator {
     drop(mut &this) -> void {
@@ -161,15 +249,35 @@ where T: Drop, A: Allocator {
         // freed header). Other live clones keep their own non-null inner.
         if (this.inner == null) { return; }
         const inner_ptr: RcInner<T, A>* = this.inner;
-        inner_ptr.count--;
-        if (inner_ptr.count == 0) {
-            // Last owner: drop the shared value before freeing the inner.
+        inner_ptr.strong = inner_ptr.strong - 1;
+        if (inner_ptr.strong == 0) {
+            // Last strong owner: drop the shared value, then release the
+            // strong group's shared weak unit. If no `Weak` outlives us,
+            // that unit was the last weak reference - free the header now.
             inner_ptr.value.drop();
-            // Move the allocator out of the inner so the deallocate call
-            // doesn't reach into memory we're freeing.
-            mut alloc: A = inner_ptr.alloc;
-            const header: Layout = Layout::of<RcInner<T, A>>();
-            alloc.deallocate(NonNull::new(this.inner as u8*), header);
+            inner_ptr.weak = inner_ptr.weak - 1;
+            if (inner_ptr.weak == 0) {
+                free_rc_inner<T, A>(inner_ptr);
+            }
+        }
+        this.inner = null;
+    }
+}
+
+/// Decrement the weak count.  Reaching zero can only happen after the strong
+/// group has already released its shared unit (i.e. the value is gone), so
+/// this is the point at which the last surviving `Weak` frees the header.
+implement<T, A> trait Drop for struct Weak<T, A>
+where T: Drop, A: Allocator {
+    drop(mut &this) -> void {
+        if (this.inner == null) { return; }
+        const inner_ptr: RcInner<T, A>* = this.inner;
+        inner_ptr.weak = inner_ptr.weak - 1;
+        if (inner_ptr.weak == 0) {
+            // Strong is already 0 here: while any `Rc` lived, its shared
+            // unit kept `weak >= 1`. The value was dropped on that
+            // `strong -> 0` transition; we only reclaim the header.
+            free_rc_inner<T, A>(inner_ptr);
         }
         this.inner = null;
     }

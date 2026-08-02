@@ -1,0 +1,155 @@
+// The sound side of the address-of-across-a-suspend rule.
+//
+// A pointer held across an `await` is only invalid when it names storage in the
+// poll frame, which every poll re-creates.  Storage the suspend does not move -
+// a pointee in the caller's frame, a dynamic array's heap block, a global - is
+// fine to point into, and each case below writes through such a pointer AFTER a
+// suspend and reads the result back.  These are the shapes the async I/O API is
+// written in, so a check that rejected them would be worse than no check: it
+// would push users onto whatever spelling happened to slip through.
+//
+// The rejected counterparts live in tests/negative/E0455_async_*.cryo.
+![config(testing)]
+namespace CryoTests::Tests::Lang::AsyncPointerAcrossAwait;
+
+import std::test;
+import std::core::result;
+import std::future;
+
+mut g_buf: u8[8] = [0; 8];
+
+type struct Counter { n: i64; }
+
+function bump(c: Counter*) -> void { c.n = c.n + 1; }
+
+// The remedy the diagnostic names: the caller owns the buffer, so the pointee
+// outlives every suspend regardless of what the state machine does with the
+// pointer (a pointer parameter is Copy, so it is shadowed, not carried).
+async function writes_caller_buffer(p: u8*) -> i64 {
+    const _z: i64 = await PendingThenReady<i64>::new(2, 1);
+    *p = 42;
+    return *p as i64;
+}
+
+// A dynamic array's elements live in a heap block; only the fat header sits in
+// the frame, and the header is what gets carried.
+async function writes_heap_block() -> i64 {
+    mut v: u8[] = [1, 2, 3];
+    const q: u8* = &v[0];
+    const _z: i64 = await PendingThenReady<i64>::new(1, 5);
+    *q = 9;
+    return v[0] as i64;
+}
+
+// Global storage is not the frame.
+async function writes_global() -> i64 {
+    const g: u8* = &g_buf[0];
+    const _z: i64 = await PendingThenReady<i64>::new(1, 3);
+    *g = 11;
+    return g_buf[0] as i64;
+}
+
+// Taking a local's address for the duration of one call is unaffected by a
+// suspend elsewhere in the body: the pointer never outlives the step that made
+// it.  Passing owning aggregates by pointer is ordinary Cryo, so this must not
+// become collateral damage.
+async function transient_local_address() -> i64 {
+    mut c: Counter = Counter { n: 1 };
+    bump(&c);
+    const _z: i64 = await PendingThenReady<i64>::new(1, 7);
+    return c.n;
+}
+
+![test]
+function pointer_parameter_survives_suspend() -> Result<(), TestError> {
+    mut owned: u8[8] = [0; 8];
+    return expect_eq(future::block_on(writes_caller_buffer(&owned[0])), 42 as i64);
+}
+
+![test]
+function caller_buffer_observes_the_write() -> Result<(), TestError> {
+    mut owned: u8[8] = [0; 8];
+    const _r: i64 = future::block_on(writes_caller_buffer(&owned[0]));
+    // The write must have landed in the caller's own storage, not a copy.
+    return expect_eq(owned[0] as i64, 42 as i64);
+}
+
+![test]
+function heap_block_pointer_survives_suspend() -> Result<(), TestError> {
+    return expect_eq(future::block_on(writes_heap_block()), 9 as i64);
+}
+
+![test]
+function global_pointer_survives_suspend() -> Result<(), TestError> {
+    return expect_eq(future::block_on(writes_global()), 11 as i64);
+}
+
+![test]
+function transient_local_address_is_allowed() -> Result<(), TestError> {
+    return expect_eq(future::block_on(transient_local_address()), 2 as i64);
+}
+
+// -- Pointers into the async fn's OWN frame, once carried values stopped moving --
+//
+// Both shapes below used to be hard errors (E0455), and rightly so: a carried
+// local was copied into a fresh block-local on every poll, so an address taken
+// before a suspend named storage a later state had stopped reading. Writes
+// through it landed on an abandoned copy and reported a plausible wrong value
+// rather than faulting.
+//
+// A carried aggregate now lives in its `Option<T>` carrier field for the whole
+// life of the future, so its address is the future's own and holds still. These
+// are the inverted forms of what were negative/E0455_async_pointer_to_carried_local
+// and negative/E0455_async_pointer_from_accessor; each asserts the value written
+// through the pointer, so a pointer that went stale would report the old one.
+
+type struct Inner { n: u64; }
+
+type struct Owner {
+    inner: Inner;
+
+    static make() -> Owner { return Owner { inner: Inner { n: 1 } }; }
+
+    /// Hands out a pointer into `this` - an address-of with no `&` at the call site.
+    conn(mut &this) -> Inner* { return &this.inner; }
+
+    async touch(mut &this) -> u64 {
+        const z: u64 = await PendingThenReady<u64>::new(1, 1);
+        return this.inner.n + z;
+    }
+}
+
+// Wrapped in a struct rather than a bare `u8[8]` local: instantiating BOTH
+// `Option<u8[8]>` and `Option<u8[]>` in one compilation unit collides on type
+// identity, and `writes_heap_block` above already carries a `u8[]`. That defect
+// is pre-existing, reproduces identically under the pinned compiler, and has
+// nothing to do with async - see the finding recorded in ASYNC_IMPL.md.
+type struct Buf { bytes: u8[8]; }
+
+async function ptr_into_carried_local() -> i64 {
+    mut b: Buf = Buf { bytes: [0; 8] };
+    const p: u8* = &b.bytes[0];
+    const _z: i64 = await PendingThenReady<i64>::new(2, 1);
+    *p = 42;
+    // Read back through the local, not the pointer: the two must name one
+    // storage location, which is the whole point.
+    return b.bytes[0] as i64;
+}
+
+async function ptr_from_accessor() -> u64 {
+    mut owner: Owner = Owner::make();
+    mut p: Inner* = owner.conn();
+    const a: u64 = await owner.touch();
+    return a + p.n;
+}
+
+![test]
+function pointer_into_carried_local_survives_suspend() -> Result<(), TestError> {
+    return expect_eq(future::block_on(ptr_into_carried_local()), 42 as i64);
+}
+
+![test]
+function pointer_from_accessor_survives_suspend() -> Result<(), TestError> {
+    // `touch` yields 1 and adds `inner.n` (1), so `a` is 2; `p.n` is still 1.
+    return expect_eq(future::block_on(ptr_from_accessor()) as i64, 3 as i64);
+}

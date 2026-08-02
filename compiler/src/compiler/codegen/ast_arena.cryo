@@ -44,7 +44,7 @@ mut g_ast_arena: Arena* = null;
 function get_ast_arena() -> Arena* {
     if (g_ast_arena == null) {
         const _box: Box<Arena> = Box<Arena>::new(
-            Arena::with_chunk_size(8u64 * 1024u64 * 1024u64));
+            Arena::with_chunk_size(8 * 1024 * 1024));
         g_ast_arena = _box.leak();
         // Publish this region as THE per-target global arena so that, once
         // the driver activates routing (instance.cryo), the compiler's whole
@@ -68,9 +68,9 @@ function get_ast_arena() -> Arena* {
 public function cryo_ast_arena_alloc(size: u64, align: u64) -> void* {
     mut a: Arena* = get_ast_arena();
     mut sz: u64 = size;
-    if (sz == 0u64) { sz = 1u64; }       // malloc(0) is UB on some platforms
+    if (sz == 0) { sz = 1; }       // malloc(0) is UB on some platforms
     mut al: u64 = align;
-    if (al == 0u64) { al = 16u64; }      // malloc-parity alignment floor
+    if (al == 0) { al = 16; }      // malloc-parity alignment floor
     // Call the inherent raw bump directly (not the `Allocator` trait) so this
     // hot path doesn't depend on cross-module trait-impl resolution and needs
     // no `allocator`/`layout`/`result` imports.  Returns null on OOM, matching
@@ -99,6 +99,24 @@ public function cryo_ast_arena_set_current(a: Arena*) -> void {
     g_ast_arena = a;
     // Point the container-heap router at the same region (see get_ast_arena).
     GlobalArena::publish(a);
+}
+
+/// Clear the current-arena slots, but only if `a` is the arena they hold.
+///
+/// A caller about to free its arena MUST retract first.  `GlobalArena` keeps a
+/// raw pointer to the published arena and `holds()` dereferences it on EVERY
+/// deallocation, so an arena that is freed while still published turns the next
+/// `free` anywhere in the process into a wild read.
+///
+/// The identity guard matters once more than one arena is alive (the LSP keeps
+/// one per open document): retracting an arena that is not the published one
+/// would clear a different document's routing and send its arena-resident
+/// buffers to libc `free`.
+public function cryo_ast_arena_retract(a: Arena*) -> void {
+    if (a == null || g_ast_arena != a) { return; }
+    g_ast_arena = null;
+    GlobalArena::publish(null);
+    GlobalArena::set_active(false);
 }
 
 /// Enable/disable routing the compiler's **container** heap (every `T[]`,

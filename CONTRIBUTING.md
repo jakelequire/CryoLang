@@ -11,7 +11,6 @@ expect ongoing development on top of a stable surface.
 | `stdlib/` | Standard library (written in Cryo). **Active.** |
 | `tools/CryoLSP/` | Language Server Protocol implementation. Built via `make lsp`. **Active.** |
 | `tools/CryoAnalyzer/` | VS Code extension front-end for `cryolsp`. Built and installed via `make install-lsp`. **Active.** |
-| `tools/CryoFormat/` | Exploratory formatter; not built by default. |
 | `legacy/bootstrap/` | Retired C++23 bootstrap, kept in the tree for historical reference only. **Do not modify.** It will not build against the current language. |
 
 ## Building
@@ -49,6 +48,48 @@ git commit -m "build: refresh pinned cryo binaries"
 Refresh **only** when `compiler/src/` has actually adopted something the
 existing pin can't handle. Do not refresh just because a new build exists -
 the pin is for compatibility, not freshness.
+
+### Where the runtime tiers land
+
+The **cross**-built Windows tiers go to `runtime/.bin/x86_64-pc-windows-gnu/`,
+the **host** tiers to `runtime/.bin` itself. `runtime_dir_pick`
+(`compiler/src/compiler/codegen/passes.cryo`) looks in `<dir>/<triple>` before
+falling back to `<dir>`, so each is found for its own target and a cross build
+no longer overwrites the host archives.
+
+The split is asymmetric on purpose. A cross build names its triple explicitly
+with `--target=`, which `resolve_effective_triple` hands back verbatim, so the
+directory name is guaranteed to be the one the lookup will use. A **native**
+build has no such guarantee - its triple comes from a probe of the installed
+toolchain (on Windows, whether an mingw `gcc` or an MSVC linker is on `PATH`) -
+so the build system cannot predict the name and the host tiers stay flat.
+
+Before this split, a Windows build - the second half of `make pin`, or the
+Windows half of `make selfhost-check` - overwrote the host tier archives with PE
+objects, and the host recipe that should re-establish them builds
+incrementally, sees its own objects unchanged, and skips the re-archive. The
+archives stayed PE and the next Linux build failed at link time with a wall of
+`undefined reference to RtlAllocateHeap` and `dangerous relocation:
+R_AMD64_IMAGEBASE`. If you ever see that, the flat directory is holding the
+wrong target's objects; deleting it forces the rebuild:
+
+```bash
+rm -rf runtime/.bin && make runtime-tiers
+```
+
+Note that `make selfhost-check`'s Windows chain still writes the flat directory
+(it is a native build, so it cannot name its own triple). On a Windows host,
+where the native triple is also `x86_64-pc-windows-gnu`, the per-triple
+directory left behind by `make pin` takes precedence over the flat one - so
+after editing anything under `runtime/`, remove it as well to be sure your
+change is what gets linked.
+
+`file` on the archive does not tell you which target it holds - it prints
+`current ar archive` either way. Check a member:
+
+```bash
+ar p runtime/.bin/libcryort-core-hosted.a Entry.o | file -
+```
 
 ## Filing issues
 
@@ -93,6 +134,5 @@ A few conventions worth knowing:
 - `process::Command` is POSIX-first (`fork` + `execve`); a partial Windows
   (`CreateProcessA`) path exists with known gaps (`Stdio::Null` / `Fd` fall back
   to inherit, env/cwd not fully applied).
-- `tools/CryoFormat` is exploratory and not built by default. The shipped
-  tooling is `tools/CryoLSP` (the LSP server, `make lsp`) and
+- The shipped tooling is `tools/CryoLSP` (the LSP server, `make lsp`) and
   `tools/CryoAnalyzer` (the VS Code extension, `make install-lsp`).

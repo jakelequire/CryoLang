@@ -1,0 +1,397 @@
+///! std::future::combinator - `Join`, `Select`, `Timeout`.
+///!
+///! Timing assertions follow the same rule as the timer tests: lower bounds are
+///! the real correctness property (a combinator must not report completion
+///! before its children are done), and the few upper bounds are set far enough
+///! above the concurrent time to distinguish it from the serial time without
+///! being sensitive to load.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::FutureCombinator;
+
+import std::core::result;
+import std::future;
+import std::test::error;
+import std::test::assert;
+import std::time;
+
+async function nap_v(ms: u64, v: i64) -> i64 {
+    await Sleep::new(Duration::from_millis(ms));
+    return v;
+}
+
+async function ok_after(ms: u64, v: i64) -> Result<i64, i64> {
+    await Sleep::new(Duration::from_millis(ms));
+    return Result::Ok(v);
+}
+
+async function err_after(ms: u64, e: i64) -> Result<i64, i64> {
+    await Sleep::new(Duration::from_millis(ms));
+    return Result::Err(e);
+}
+
+async function join_two(ms: u64) -> i64 {
+    const r: (i64, i64) = await Futures::join(nap_v(ms, 10), nap_v(ms, 32));
+    return r.0 + r.1;
+}
+
+// Which side won, encoded: 100+v for the first, 200+v for the second.
+async function select_two(a_ms: u64, b_ms: u64) -> i64 {
+    const s: Selected<i64, i64> = await Futures::select(nap_v(a_ms, 1), nap_v(b_ms, 2));
+    return match (s) {
+        Selected::First(v)  => { 100 + v }
+        Selected::Second(v) => { 200 + v }
+    };
+}
+
+async function timeout_of(limit_ms: u64, work_ms: u64) -> i64 {
+    const r: Result<i64, Elapsed> =
+        await Futures::timeout(Duration::from_millis(limit_ms), nap_v(work_ms, 9));
+    return match (r) {
+        Result::Ok(v)  => { v }
+        // A deadline is only meaningful if it was actually carried through.
+        Result::Err(e) => { e.deadline_nanos() > 0 ? -1 : -2 }
+    };
+}
+
+// Three futures joined by nesting, which is how arity above two is expressed.
+async function join_three(ms: u64) -> i64 {
+    const r: (i64, (i64, i64)) =
+        await Futures::join(nap_v(ms, 1), Futures::join(nap_v(ms, 2), nap_v(ms, 4)));
+    return r.0 + r.1.0 + r.1.1;
+}
+
+// `join` over two fallible futures: both results arrive, each matched
+// separately. This is what stands in for `try_join` (see the module doc).
+async function join_results() -> i64 {
+    const r: (Result<i64, i64>, Result<i64, i64>) =
+        await Futures::join(ok_after(40, 3), err_after(60, 66));
+    mut acc: i64 = 0;
+    match (r.0) { Result::Ok(v)  => { acc = acc + v * 10; } Result::Err(_) => { } }
+    match (r.1) { Result::Ok(_)  => { }                     Result::Err(e) => { acc = acc + e; } }
+    return acc;
+}
+
+async function try_join_two(ms: u64) -> i64 {
+    const r: Result<(i64, i64), i64> =
+        await Futures::try_join(ok_after(ms, 3), ok_after(ms, 4));
+    return match (r) {
+        Result::Ok(p)  => { p.0 * 10 + p.1 }
+        Result::Err(e) => { -e }
+    };
+}
+
+// The failing side finishes while the sibling is an hour from done, so the error
+// can only come back by abandoning it.
+async function try_join_short_circuits() -> i64 {
+    const r: Result<(i64, i64), i64> =
+        await Futures::try_join(ok_after(3600000, 3), err_after(50, 66));
+    return match (r) {
+        Result::Ok(p)  => { p.0 * 10 + p.1 }
+        Result::Err(e) => { -e }
+    };
+}
+
+// The success lands FIRST and is discarded when the other side then fails.
+async function try_join_error_after_success() -> i64 {
+    const r: Result<(i64, i64), i64> =
+        await Futures::try_join(ok_after(40, 3), err_after(150, 66));
+    return match (r) {
+        Result::Ok(p)  => { p.0 * 10 + p.1 }
+        Result::Err(e) => { -e }
+    };
+}
+
+// The loser is an hour-long sleep. `select` must return as soon as the fast side
+// finishes, and dropping the combinator must disarm the loser's timer.
+async function select_abandons_a_long_loser() -> i64 {
+    const s: Selected<i64, i64> =
+        await Futures::select(nap_v(3600000, 1), nap_v(50, 2));
+    return match (s) {
+        Selected::First(v)  => { 100 + v }
+        Selected::Second(v) => { 200 + v }
+    };
+}
+
+![test]
+function join_waits_for_both_and_yields_both() -> Result<(), TestError> {
+    mut ex: Executor = Executor::new();
+    const t0: Instant = Instant::now();
+    const r: i64 = ex.block_on(join_two(400));
+    const ms: u64 = t0.elapsed().as_millis();
+    ex.drop();
+    match (expect_eq(r, 42 as i64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_true(ms >= 390, "join completed before its children did");
+}
+
+![test]
+function join_runs_its_children_concurrently() -> Result<(), TestError> {
+    // Serially these two would take ~800ms.
+    mut ex: Executor = Executor::new();
+    const t0: Instant = Instant::now();
+    const r: i64 = ex.block_on(join_two(400));
+    const ms: u64 = t0.elapsed().as_millis();
+    ex.drop();
+    match (expect_eq(r, 42 as i64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_true(ms < 700, "join ran its children serially");
+}
+
+![test]
+function join_nests_for_three_futures() -> Result<(), TestError> {
+    mut ex: Executor = Executor::new();
+    const t0: Instant = Instant::now();
+    const r: i64 = ex.block_on(join_three(300));
+    const ms: u64 = t0.elapsed().as_millis();
+    ex.drop();
+    match (expect_eq(r, 7 as i64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_true(ms >= 290, "a nested join completed early")) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_true(ms < 800, "a nested join serialized its children");
+}
+
+![test]
+function join_carries_both_results_of_fallible_children() -> Result<(), TestError> {
+    mut ex: Executor = Executor::new();
+    const r: i64 = ex.block_on(join_results());
+    ex.drop();
+    return expect_eq(r, 96 as i64);   // 3*10 from the Ok half + 66 from the Err half
+}
+
+![test]
+function try_join_yields_both_values_when_both_succeed() -> Result<(), TestError> {
+    // Serially these two would take ~800ms.
+    mut ex: Executor = Executor::new();
+    const t0: Instant = Instant::now();
+    const r: i64 = ex.block_on(try_join_two(400));
+    const ms: u64 = t0.elapsed().as_millis();
+    ex.drop();
+    match (expect_eq(r, 34 as i64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_true(ms >= 390, "try_join completed before its children did")) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_true(ms < 700, "try_join ran its children serially");
+}
+
+![test]
+function try_join_reports_the_first_error_without_waiting_for_the_sibling()
+        -> Result<(), TestError> {
+    // The sibling sleeps for an hour. Returning at all proves `try_join` did not
+    // wait for it; tearing the executor down promptly afterwards proves the
+    // sibling's timer registration was released when the combinator dropped,
+    // rather than pinning the task until its deadline.
+    mut ex: Executor = Executor::new();
+    const t0: Instant = Instant::now();
+    const r: i64 = ex.block_on(try_join_short_circuits());
+    ex.drop();
+    const ms: u64 = t0.elapsed().as_millis();
+    match (expect_eq(r, -66 as i64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_true(ms < 2000, "try_join waited for the abandoned sibling");
+}
+
+![test]
+function try_join_reports_an_error_arriving_after_the_other_side_succeeded()
+        -> Result<(), TestError> {
+    mut ex: Executor = Executor::new();
+    const r: i64 = ex.block_on(try_join_error_after_success());
+    ex.drop();
+    return expect_eq(r, -66 as i64);
+}
+
+![test]
+function select_completes_with_the_faster_side() -> Result<(), TestError> {
+    mut ex: Executor = Executor::new();
+    const t0: Instant = Instant::now();
+    const r: i64 = ex.block_on(select_two(600, 50));
+    const ms: u64 = t0.elapsed().as_millis();
+    ex.drop();
+    match (expect_eq(r, 202 as i64)) {   // the SECOND side, value 2
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_true(ms < 500, "select waited for the slower side");
+}
+
+![test]
+function select_reports_the_first_side_when_it_wins() -> Result<(), TestError> {
+    mut ex: Executor = Executor::new();
+    const r: i64 = ex.block_on(select_two(50, 600));
+    ex.drop();
+    return expect_eq(r, 101 as i64);   // the FIRST side, value 1
+}
+
+![test]
+function select_abandons_the_losing_future() -> Result<(), TestError> {
+    // The loser sleeps for an hour. Returning at all proves `select` did not
+    // wait for it; tearing the executor down promptly afterwards proves the
+    // loser's timer registration was released when the combinator dropped,
+    // rather than pinning the task until its deadline.
+    mut ex: Executor = Executor::new();
+    const t0: Instant = Instant::now();
+    const r: i64 = ex.block_on(select_abandons_a_long_loser());
+    ex.drop();
+    const ms: u64 = t0.elapsed().as_millis();
+    match (expect_eq(r, 202 as i64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_true(ms < 10000, "select or teardown waited on the abandoned loser");
+}
+
+![test]
+function timeout_passes_a_fast_operation_through() -> Result<(), TestError> {
+    mut ex: Executor = Executor::new();
+    const r: i64 = ex.block_on(timeout_of(600, 50));
+    ex.drop();
+    return expect_eq(r, 9 as i64);
+}
+
+![test]
+function timeout_reports_elapsed_for_a_slow_operation() -> Result<(), TestError> {
+    // -1 is the Err arm having found a real deadline on the `Elapsed`; -2 would
+    // mean the deadline came back as zero, which is how a zero-sized error type
+    // used to fail here.
+    mut ex: Executor = Executor::new();
+    const t0: Instant = Instant::now();
+    const r: i64 = ex.block_on(timeout_of(100, 3600000));
+    const ms: u64 = t0.elapsed().as_millis();
+    ex.drop();
+    match (expect_eq(r, -1 as i64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_true(ms >= 90, "timeout fired before its deadline")) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_true(ms < 10000, "timeout did not abandon the slow operation");
+}
+
+
+// A combinator awaited inside a GENERIC impl, wrapping one of the owner's own
+// `async` methods.  Two things have to hold at once here that do not inside a
+// concrete impl: the static's type arguments still mention the owner's `S` when
+// its body is walked, so nothing about the call is concrete yet; and the child
+// future carries a pointer to the owner, which the enclosing frame has to
+// re-address before every poll by walking into the combinator's own field.
+//
+// This is the shape `HttpServer` caps a request read with, one layer down --
+// `await Futures::timeout(d, this.read_request())` inside `BufStream<S>`.
+
+type trait GenStep {
+    async step(mut &this, n: i64) -> i64;
+}
+
+type struct GenSrc {
+    hits: i64;
+    buf:  Array<u8>;
+}
+
+implement trait GenStep for GenSrc {
+    async step(mut &this, n: i64) -> i64 {
+        await Sleep::new(Duration::from_millis(20));
+        this.hits = this.hits + 1;
+        return this.hits + n + 10;
+    }
+}
+
+/// Generic in its transport and owning it: every protocol layer in `net` has
+/// this shape.
+type struct GenLayer<S> {
+    inner: S;
+    seen:  i64;
+
+    async pump(mut &this, n: i64) -> i64 where S: GenStep {
+        const v: i64 = await this.inner.step(n);
+        this.seen = this.seen + v;
+        return v;
+    }
+
+    async capped(mut &this, n: i64) -> i64 where S: GenStep {
+        const r: Result<i64, Elapsed> =
+            await Futures::timeout(Duration::from_millis(3000), this.pump(n));
+        this.seen = this.seen + 1000;
+        return match (r) {
+            Result::Ok(v)  => { v }
+            Result::Err(_) => { -1 }
+        };
+    }
+
+    /// Never completes within any test's lifetime; the cap is what ends it.
+    async slow(mut &this, n: i64) -> i64 {
+        await Sleep::new(Duration::from_millis(3600000));
+        this.seen = this.seen + n;
+        return n;
+    }
+
+    /// The cap actually firing: the child outlives the deadline, so the arm that
+    /// abandons it runs -- with the abandoned child still holding a pointer to
+    /// this receiver.
+    async capped_expires(mut &this, n: i64) -> i64 {
+        const r: Result<i64, Elapsed> =
+            await Futures::timeout(Duration::from_millis(20), this.slow(n));
+        this.seen = this.seen + 1000;
+        return match (r) {
+            Result::Ok(_)  => { 1 }
+            Result::Err(e) => { e.deadline_nanos() > 0 ? -1 : -2 }
+        };
+    }
+}
+
+async function gen_layer_capped() -> i64 {
+    mut c: GenLayer<GenSrc> = GenLayer<GenSrc> {
+        inner: GenSrc { hits: 0, buf: Array<u8>::new() }, seen: 0 };
+    const v: i64 = await c.capped(5);
+    return v + c.seen + c.inner.hits;
+}
+
+async function gen_layer_expires() -> i64 {
+    mut c: GenLayer<GenSrc> = GenLayer<GenSrc> {
+        inner: GenSrc { hits: 0, buf: Array<u8>::new() }, seen: 0 };
+    const v: i64 = await c.capped_expires(5);
+    return v + c.seen;
+}
+
+// `pump` returns 1 (hits) + 5 (n) + 10 == 16 and writes it to `seen` through
+// `mut &this`; `capped` then adds 1000 to `seen` through the same receiver.
+// 16 + 1016 + 1 -- so a receiver refresh that never reached into the combinator
+// would lose one of those writes and land short.
+![test]
+function timeout_wraps_an_owner_method_inside_a_generic_impl()
+        -> Result<(), TestError> {
+    mut ex: Executor = Executor::new();
+    const r: i64 = ex.block_on(gen_layer_capped());
+    ex.drop();
+    return expect_eq(r, 1033 as i64);
+}
+
+![test]
+function timeout_inside_a_generic_impl_still_expires() -> Result<(), TestError> {
+    mut ex: Executor = Executor::new();
+    const t0: Instant = Instant::now();
+    const r: i64 = ex.block_on(gen_layer_expires());
+    const ms: u64 = t0.elapsed().as_millis();
+    ex.drop();
+    match (expect_eq(r, 999 as i64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_true(ms < 10000, "timeout did not abandon the slow operation");
+}

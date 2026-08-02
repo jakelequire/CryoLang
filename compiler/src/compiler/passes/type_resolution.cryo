@@ -225,6 +225,12 @@ type struct TypeResolutionRunner {
             const adecl: AssocTypeDeclNode* = trait_decl.assoc_types[i];
             if (adecl == null) { continue; }
             if (impl_node.lookup_assoc_binding(adecl.name) != null) { continue; }
+            // The implicit `<Method>Fut` of an `async` trait method is bound by
+            // the impl's own `async` method, not written by the user — and that
+            // binding is added by the sema-time lowering, which has not run yet.
+            // Requiring it here would make every async trait impl an error.
+            if (TypeResolutionPasses::impl_binds_assoc_via_async(
+                    impl_node, trait_decl, adecl.name, this.ctx)) { continue; }
             const aname: string = intern.resolve(adecl.name);
             this.ctx.emit_error_at(
                 ErrorCode::E0309_ASSOC_TYPE_NOT_BOUND,
@@ -262,7 +268,6 @@ type struct TypeResolutionRunner {
             TypeAnnotation::Pointer(p)   => { return p.inner; }
             TypeAnnotation::Reference(r) => { return r.inner; }
             TypeAnnotation::Array(a)     => { return a.element; }
-            TypeAnnotation::Optional(o)  => { return o.inner; }
             TypeAnnotation::Generic(g)   => { return g.base; }
             _                            => { return ann; }
         }
@@ -442,6 +447,29 @@ type struct TypeResolutionRunner {
         this.resolver.resolve_method_signatures(methods, res_ctx, owner_type, owner_qname);
     }
 
+    /// Repair the signatures of a struct/union/class's *inline* methods during
+    /// the TypeResolution pass, once the owner type is available in the arena.
+    /// The DeclarationCollection FunctionSignature pass resolves these methods
+    /// before the owning type is registered, so its `decl_index`-based owner
+    /// lookup returns invalid and a by-value `this` receiver (which carries no
+    /// annotation) is left without a resolved_type.  The owner is sourced from
+    /// the arena here (populated by DeclarationCollection's type creation),
+    /// mirroring `register_decl_in_index`'s qualified-then-bare lookup, so the
+    /// receiver back-fill in `Resolver::resolve_method_signatures` runs.
+    /// Idempotent for already-resolved return/param types.
+    resolve_inline_method_signatures(&this, name: SymbolStr,
+                                     binding_namespace: SymbolStr,
+                                     methods: &MethodNode*[],
+                                     res_ctx: ResolutionContext*) -> void {
+        const qname: SymbolStr = this.ctx.qualify_binding_sym(name, binding_namespace);
+        mut owner: TypeRef = this.arena.lookup_by_name(qname);
+        if (owner.is_invalid()) {
+            owner = this.arena.lookup_by_name(name);
+        }
+        if (owner.is_invalid()) { return; }
+        this.resolver.resolve_method_signatures(methods, res_ctx, owner, qname);
+    }
+
     /// Resolves all function signatures (FunctionDeclNode*[]) on a trait.
     resolve_trait_method_signatures(&this, methods: &FunctionDeclNode*[],
                                     res_ctx: ResolutionContext*) -> void {
@@ -604,15 +632,6 @@ type struct TypeResolutionRunner {
             NodeKind::LoopStatement => {
                 const loop_stmt: LoopStmtNode* = stmt as LoopStmtNode*;
                 this.resolve_var_types_in_statement(loop_stmt.body as ASTNode*, res_ctx);
-            }
-            NodeKind::SwitchStatement => {
-                const switch_stmt: SwitchStmtNode* = stmt as SwitchStmtNode*;
-                for (mut i: i64 = 0; i < switch_stmt.cases.length; i++) {
-                    const cs: CaseStmtNode* = switch_stmt.cases[i];
-                    if (cs != null && cs.body != null) {
-                        this.resolve_var_types_in_statement(cs.body as ASTNode*, res_ctx);
-                    }
-                }
             }
             _ => {
                 // Other statement kinds (break, continue): no type annotations
@@ -1156,9 +1175,22 @@ type struct TypeResolutionPasses {
 
                     // Also register under bare name for backward-compatible lookups.
                     // Use the same mangled name as the qualified version.
+                    // A leaf owned by a declared `intrinsic function` keeps
+                    // its single-slot bindings: the DeclarationIndex refuses
+                    // non-intrinsic overwrites of intrinsic-owned slots (see
+                    // the intrinsic-durability guards in decl_index), while
+                    // this function's own per-signature overload entry still
+                    // registers so arity/signature dispatch can pick it.
                     if (!q_name.equals(func.name)) {
                         ctx.decl_index.register_function(func.name, func.resolved_return_type);
-                        ctx.decl_index.register_function_type(func.name, func_type_ref);
+                        // Owner-stamped (by q_name): a same-signature bare
+                        // leaf from another module keeps its own entry +
+                        // mangled slot instead of adopting/restamping the
+                        // first claimant's (`heap::free` vs the `free`
+                        // intrinsic), and the bare-call binder can filter
+                        // candidates by the use site's imports.
+                        ctx.decl_index.register_function_type_owned(
+                            func.name, func_type_ref, q_name);
                         ctx.decl_index.register_name_mapping(func.name, q_name);
                         const q_mangled: SymbolStr = ctx.decl_index.lookup_mangled_name(q_name);
                         if (q_mangled.is_valid()) {
@@ -1167,8 +1199,8 @@ type struct TypeResolutionPasses {
                             // mangled-name slot is overwritten across modules
                             // (last-wins) and would otherwise hand out the
                             // wrong symbol when this overload gets picked.
-                            ctx.decl_index.register_overload_mangled(
-                                func.name, func_type_ref, q_mangled);
+                            ctx.decl_index.register_overload_mangled_owned(
+                                func.name, func_type_ref, q_name, q_mangled);
                         }
                     }
                 }
@@ -1531,9 +1563,6 @@ type struct TypeResolutionPasses {
             TypeAnnotation::Pointer(p) => {
                 TypeResolutionPasses::rewrite_this_type_annotation(p.inner, target, target_args);
             }
-            TypeAnnotation::Optional(o) => {
-                TypeResolutionPasses::rewrite_this_type_annotation(o.inner, target, target_args);
-            }
             TypeAnnotation::Array(a) => {
                 TypeResolutionPasses::rewrite_this_type_annotation(a.element, target, target_args);
             }
@@ -1599,10 +1628,6 @@ type struct TypeResolutionPasses {
             TypeAnnotation::Pointer(p) => {
                 TypeResolutionPasses::rewrite_trait_params_annotation(
                     p.inner, param_names, arg_anns);
-            }
-            TypeAnnotation::Optional(o) => {
-                TypeResolutionPasses::rewrite_trait_params_annotation(
-                    o.inner, param_names, arg_anns);
             }
             TypeAnnotation::Array(a) => {
                 TypeResolutionPasses::rewrite_trait_params_annotation(
@@ -1680,9 +1705,6 @@ type struct TypeResolutionPasses {
             TypeAnnotation::Pointer(p) => {
                 TypeResolutionPasses::annotation_references_this(p.inner)
             }
-            TypeAnnotation::Optional(o) => {
-                TypeResolutionPasses::annotation_references_this(o.inner)
-            }
             TypeAnnotation::Array(a) => {
                 TypeResolutionPasses::annotation_references_this(a.element)
             }
@@ -1739,6 +1761,201 @@ type struct TypeResolutionPasses {
         };
     }
 
+    /// The implicit associated-type name an `async` trait method's future is
+    /// bound to: `read` -> `ReadFut`, `read_exact` -> `ReadExactFut`. Each
+    /// `_`-separated word is capitalised and the separators dropped, so the name
+    /// reads as an ordinary Cryo type and cannot collide with the method name.
+    /// Case-mapped through explicit alphabet tables rather than char arithmetic:
+    /// `CharType` is 4 bytes here while the stdlib treats a char as 1, so
+    /// `c - 32` is not a portable way to upper-case in this codebase.
+    static async_fut_assoc_name(ctx: CompilationContext*, method: SymbolStr) -> SymbolStr {
+        const lower: string = "abcdefghijklmnopqrstuvwxyz";
+        const upper: string = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        const src: string = ctx.get_intern_table().resolve(method);
+        const n: i64 = src.length() as i64;
+        mut out: string = "";
+        mut upper_next: boolean = true;
+        for (mut i: i64 = 0; i < n; i++) {
+            if (src[i] == '_') { upper_next = true; continue; }
+            mut piece: string = src.substring(i, 1);
+            if (upper_next) {
+                for (mut k: i64 = 0; k < 26; k++) {
+                    if (src[i] == lower[k]) { piece = upper.substring(k, 1); break; }
+                }
+            }
+            out = format("%s%s", out, piece);
+            upper_next = false;
+        }
+        return ctx.intern(format("%sFut", out));
+    }
+
+    /// Whether `assoc` is the implicit future type of an `async` trait method
+    /// that `impl_node` supplies — either with its own `async` method, or with a
+    /// default body inherited from the trait.
+    ///
+    /// Such a binding is added by the sema-time async lowering (which mints the
+    /// future struct), long after E0309 runs, so the check has to recognise it
+    /// as satisfied here rather than demanding the user write it.
+    static impl_binds_assoc_via_async(impl_node: ImplBlockNode*, trait_decl: TraitDeclNode*,
+                                      assoc: SymbolStr, ctx: CompilationContext*) -> boolean {
+        if (impl_node == null || trait_decl == null || ctx == null) { return false; }
+        for (mut ti: i64 = 0; ti < trait_decl.methods.length; ti++) {
+            const tfunc: FunctionDeclNode* = trait_decl.methods[ti];
+            if (tfunc == null || !tfunc.is_async) { continue; }
+            if (!TypeResolutionPasses::async_fut_assoc_name(ctx, tfunc.name).equals(assoc)) {
+                continue;
+            }
+            // The impl overrides it with its own `async` method...
+            for (mut mi: i64 = 0; mi < impl_node.methods.length; mi++) {
+                const m: MethodNode* = impl_node.methods[mi];
+                if (m == null || m.func == null) { continue; }
+                if (m.func.name.equals(tfunc.name) && m.func.is_async) { return true; }
+            }
+            // ...or inherits the trait's default body, which
+            // `synthesize_default_trait_methods` clones in as an `async` method.
+            if (tfunc.has_body()) { return true; }
+        }
+        return false;
+    }
+
+    /// Desugar every `async` method on a trait declaration.
+    ///
+    /// `async read(&this, n: i64) -> i64` becomes an implicit `type ReadFut;`
+    /// plus a projection return (`read(&this, n: i64) -> This::ReadFut`), which
+    /// each impl binds to the future its own `async read` lowers to.
+    ///
+    /// Only the RESOLVED return is rewritten — the ANNOTATION deliberately keeps
+    /// the user's `-> i64`. `synthesize_default_trait_methods` clones a
+    /// default-bodied trait method into each impl carrying its annotations, and
+    /// that clone must lower as an ordinary `async` method whose future's Output
+    /// is `i64`. Rewriting the annotation would make the clone return its own
+    /// future type, which is circular.
+    static desugar_async_trait_methods(node: TraitDeclNode*, ctx: CompilationContext*,
+                                       arena: TypeArena*) -> void {
+        if (node == null || ctx == null || arena == null) { return; }
+        const this_ty: TypeRef = arena.create_generic_param(
+            ctx.intern("This"), 0xFFFFFFFF as u64);
+        if (!this_ty.is_valid()) { return; }
+        for (mut i: i64 = 0; i < node.methods.length; i++) {
+            const func: FunctionDeclNode* = node.methods[i];
+            if (func == null || !func.is_async) { continue; }
+            const assoc: SymbolStr =
+                TypeResolutionPasses::async_fut_assoc_name(ctx, func.name);
+            if (!assoc.is_valid()) { continue; }
+            // A trait may legitimately declare the associated type itself; only
+            // synthesize the one that is missing, so an explicit `type ReadFut;`
+            // keeps its declaration-site bounds.
+            if (node.lookup_assoc_type(assoc) == null) {
+                mut adecl: AssocTypeDeclNode* =
+                    malloc(sizeof(AssocTypeDeclNode)) as AssocTypeDeclNode*;
+                *adecl = AssocTypeDeclNode {
+                    name:   assoc,
+                    bounds: [],
+                    span:   func.span,
+                };
+                node.add_assoc_type(adecl);
+            }
+            func.set_resolved_return_type(
+                arena.create_assoc_projection(this_ty, assoc, TypeRef::invalid()));
+        }
+    }
+
+    /// The projected member (`Item`) of a projection type-annotation, else empty.
+    static projection_member_of(ann: TypeAnnotation*) -> SymbolStr {
+        if (ann == null) { return SymbolStr::empty(); }
+        return match (*ann) {
+            TypeAnnotation::Projection(pj) => { pj.member }
+            _ => { SymbolStr::empty() }
+        };
+    }
+
+    /// Whether `ann` is an associated-type projection annotation (`I::Item`).
+    static is_projection_annotation(ann: TypeAnnotation*) -> boolean {
+        if (ann == null) { return false; }
+        return match (*ann) {
+            TypeAnnotation::Projection(_) => { true }
+            _ => { false }
+        };
+    }
+
+    /// Whether `name` is one of `impl_node`'s own head generic parameters.
+    static impl_declares_generic_param(impl_node: ImplBlockNode*, name: SymbolStr) -> boolean {
+        if (impl_node == null || !name.is_valid()) { return false; }
+        for (mut i: i64 = 0; i < impl_node.generic_params.length; i++) {
+            const gp: GenericParamNode* = impl_node.generic_params[i];
+            if (gp != null && gp.name.equals(name)) { return true; }
+        }
+        return false;
+    }
+
+    /// Whether the type named `type_name` is registered as implementing the
+    /// trait named `trait_name`. Conservative: true (assume satisfiable) when the
+    /// registry is unavailable, so a default method is only DROPPED on positive
+    /// evidence that a concrete Item type lacks the bound.
+    static name_implements_trait(ctx: CompilationContext*, type_name: SymbolStr,
+                                 trait_name: SymbolStr) -> boolean {
+        if (ctx == null || ctx.generic_registry == null) { return true; }
+        const traits: SymbolStr[] = ctx.generic_registry.traits_implemented_by(type_name);
+        for (mut i: i64 = 0; i < traits.length; i++) {
+            if (traits[i].equals(trait_name)) { return true; }
+        }
+        return false;
+    }
+
+    /// Whether a projection-bounded trait-default method (`min where This::Item:
+    /// Ord`) is applicable to THIS impl. Returns false ONLY when the impl's
+    /// concrete Item type definitively does not implement a bound trait - the
+    /// case that must be filtered so the default's body is never synthesized
+    /// (and then type-checked) for it (e.g. `EnumerateIter`/`ZipIter` whose Item
+    /// is `Pair`, which is never `Ord`). A SYMBOLIC Item - a bare impl generic
+    /// param (`A`), or an `I::Item` projection - is undecidable here and kept;
+    /// its applicability is settled at the trait-level symbolic pass or per
+    /// monomorphization. `args_ref` is the impl's trait-arg annotations.
+    static default_method_applies_to_impl(tfunc: FunctionDeclNode*,
+                                          impl_node: ImplBlockNode*,
+                                          trait_decl: TraitDeclNode*,
+                                          args_ref: &TypeAnnotation*[],
+                                          ctx: CompilationContext*) -> boolean {
+        if (tfunc == null || impl_node == null || trait_decl == null) { return true; }
+        for (mut bi: i64 = 0; bi < tfunc.trait_bounds.length; bi++) {
+            const b: TraitBound* = &tfunc.trait_bounds[bi];
+            if (!b.has_projection_subject()) { continue; }
+            const member: SymbolStr =
+                TypeResolutionPasses::projection_member_of(b.subject_type);
+            if (!member.is_valid()) { continue; }
+            // Position of `member` among the trait's associated types, then in
+            // the impl's positional trait-arg list (generic params first).
+            mut assoc_idx: i64 = -1;
+            for (mut a: i64 = 0; a < trait_decl.assoc_types.length; a++) {
+                if (trait_decl.assoc_types[a] != null
+                        && trait_decl.assoc_types[a].name.equals(member)) {
+                    assoc_idx = a; break;
+                }
+            }
+            if (assoc_idx < 0) { continue; }
+            const arg_idx: i64 = trait_decl.generic_params.length + assoc_idx;
+            if (arg_idx < 0 || arg_idx >= args_ref.length) { continue; }
+            const item_ann: TypeAnnotation* = args_ref[arg_idx];
+            if (item_ann == null) { continue; }
+            // Symbolic Item (projection or impl-declared generic param) -> keep.
+            if (TypeResolutionPasses::is_projection_annotation(item_ann)) { continue; }
+            const head: SymbolStr = TypeResolutionPasses::extract_trait_leaf(item_ann);
+            if (!head.is_valid()) { continue; }
+            if (TypeResolutionPasses::impl_declares_generic_param(impl_node, head)) { continue; }
+            // Concrete Item type: it must implement every bound trait, else the
+            // default cannot apply here.
+            for (mut ti: i64 = 0; ti < b.trait_refs.length; ti++) {
+                const tr: TraitRef* = &b.trait_refs[ti];
+                if (tr.path.length == 0) { continue; }
+                const need: SymbolStr = tr.path[tr.path.length - 1];
+                if (!TypeResolutionPasses::name_implements_trait(ctx, head, need)) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
     /// Positional index of `name` among `node`'s impl-head generic params,
     /// or -1 when it is not one of them.  Used to normalize a generic param
     /// to a position (`#0`) in the coherence key so that two otherwise
@@ -1787,7 +2004,7 @@ type struct TypeResolutionPasses {
             tref = ctx.decl_index.lookup_type(name);
         }
         if (tref.is_valid()) {
-            return format("#T%llu", ctx.type_arena.canon_type_id(tref));
+            return format("#T%llu", tref.id);
         }
         return ctx.intern_table.resolve(qual);
     }
@@ -1826,9 +2043,6 @@ type struct TypeResolutionPasses {
             }
             TypeAnnotation::Pointer(p) => {
                 "*" + TypeResolutionPasses::ann_canon_key(p.inner, node, ctx)
-            }
-            TypeAnnotation::Optional(o) => {
-                "?" + TypeResolutionPasses::ann_canon_key(o.inner, node, ctx)
             }
             TypeAnnotation::Array(a) => {
                 "[" + TypeResolutionPasses::ann_canon_key(a.element, node, ctx)
@@ -2025,6 +2239,19 @@ type struct TypeResolutionPasses {
             }
             if (already_present) { continue; }
 
+            // Skip cloning a projection-bounded default (`min`/`max` with
+            // `where This::Item: Ord`) into an impl whose CONCRETE Item type
+            // definitively lacks the bound trait - e.g. `EnumerateIter`/`ZipIter`
+            // yield `Pair`, which is never `Ord`. Without this the default body
+            // would be synthesized and then type-checked against a `Pair`
+            // receiver (`.compare()`), a spurious E0358. Symbolic Item types
+            // (a param `A`, or an `I::Item` projection) are kept and decided
+            // later.
+            if (!TypeResolutionPasses::default_method_applies_to_impl(
+                    tfunc, impl_node, trait_decl, args_ref, ctx)) {
+                continue;
+            }
+
             const cloned: FunctionDeclNode* = cloner.clone_func_decl(tfunc);
             if (cloned == null) { continue; }
             cloned.set_synth_default(true);
@@ -2177,6 +2404,13 @@ type struct TypeResolutionPasses {
                     mut trait_ctx: ResolutionContext = runner.make_generic_context(
                         node.generic_params, &runner.res_ctx);
                     runner.resolve_trait_method_signatures(node.methods, &trait_ctx);
+                    // Rewrite each `async` method's resolved return to its
+                    // implicit `This::<Method>Fut` projection AFTER the ordinary
+                    // resolution, so callers see the future type while the
+                    // annotation still spells the Output for impl-side lowering.
+                    // Must precede the `required_methods` population below,
+                    // which snapshots these signatures onto the TraitType.
+                    TypeResolutionPasses::desugar_async_trait_methods(node, ctx, arena);
                     sig_count += node.methods.length;
 
                     // Populate the TraitType's required_methods array so the
@@ -2199,13 +2433,26 @@ type struct TypeResolutionPasses {
                             const adecl: AssocTypeDeclNode* = node.assoc_types[ai];
                             if (adecl != null) { tr_type.add_assoc_type(adecl.name); }
                         }
+                        // `MethodInfo.param_types` is by contract the NON-SELF
+                        // parameters, which is what every reader matches against
+                        // an argument count. Keeping the receiver here made an
+                        // instance trait method look like it took one parameter
+                        // too many, so a call on a bounded or where-bounded
+                        // receiver found no signature and left its arguments
+                        // unclassified. Same receiver spellings the struct and
+                        // class method tables filter on.
+                        const tr_this_amp: SymbolStr = ctx.intern_table.intern("&this");
+                        const tr_this_val: SymbolStr = ctx.intern_table.intern("this");
                         for (mut mi: i64 = 0; mi < node.methods.length; mi++) {
                             const tfunc: FunctionDeclNode* = node.methods[mi];
                             if (tfunc == null) { continue; }
                             mut param_types: TypeRef[] = [];
                             for (mut p: i64 = 0; p < tfunc.parameters.length; p++) {
                                 const param: VarDeclNode* = tfunc.parameters[p];
-                                if (param != null && param.resolved_type.is_valid()) {
+                                if (param == null) { continue; }
+                                if (param.name.equals(tr_this_amp)) { continue; }
+                                if (param.name.equals(tr_this_val)) { continue; }
+                                if (param.resolved_type.is_valid()) {
                                     param_types.push(param.resolved_type);
                                 }
                             }
@@ -2459,12 +2706,16 @@ type struct TypeResolutionPasses {
                             // Sole bare owner: drop any libc extern twin overload
                             // so bare `malloc`/`strlen`/... bind to the intrinsic
                             // regardless of module topo order (see method doc).
-                            ctx.decl_index.register_intrinsic_function_type(node.name, i_func_type_ref);
+                            // Owned regular same-leaf functions keep their
+                            // entries; the intrinsic's ownership of the leaf's
+                            // single-slot bindings is durable from here on.
+                            ctx.decl_index.register_intrinsic_function_type(
+                                node.name, i_func_type_ref, q_name);
                             ctx.decl_index.register_name_mapping(node.name, q_name);
                             // Bare name also needs its own mangled entry.
                             ctx.decl_index.register_mangled_name(node.name, bare_mangled);
-                            ctx.decl_index.register_overload_mangled(
-                                node.name, i_func_type_ref, bare_mangled);
+                            ctx.decl_index.register_overload_mangled_owned(
+                                node.name, i_func_type_ref, q_name, bare_mangled);
                         }
                     }
                     sig_count++;
@@ -2478,7 +2729,7 @@ type struct TypeResolutionPasses {
                             // Register as a global so sema's lookup_global_var finds it
                             const ic_mod_sym: SymbolStr = ctx.intern(ctx.source_file);
                             ctx.decl_index.register_global_with_module(
-                                ic_node.name, ic_type, ic_mod_sym, ctx.namespace_str);
+                                ic_node.name, ic_type, ic_mod_sym, ctx.namespace_str, false);
                             // Also register the module-qualified name (see the
                             // VariableDeclaration arm + lookup_global_var) so a
                             // same-bare-name const elsewhere can't shadow it.
@@ -2594,6 +2845,18 @@ type struct TypeResolutionPasses {
                         node.generic_params, &runner.res_ctx);
                     runner.resolve_fields(node.fields, &struct_ctx);
                     field_count += node.fields.length;
+                    // Re-resolve the inline methods' signatures now that the
+                    // owner type exists in the arena.  The DeclarationCollection
+                    // FunctionSignature pass ran before this type was registered,
+                    // so its owner lookup was invalid and a by-value `this`
+                    // receiver (which carries no annotation) was left without a
+                    // resolved_type.  Impl-block methods are repaired by the
+                    // ImplementationBlock branch below; inline methods need the
+                    // same repair here, or a consuming method (`fn m(mut this)`)
+                    // reaches drop-insertion with an unresolved receiver and its
+                    // by-value `this` is never dropped - a leak on every call.
+                    runner.resolve_inline_method_signatures(
+                        node.name, node.binding_namespace, node.methods, &struct_ctx);
                 }
                 NodeKind::UnionDeclaration => {
                     const node: UnionDeclNode* = stmt as UnionDeclNode*;
@@ -2601,6 +2864,8 @@ type struct TypeResolutionPasses {
                         node.generic_params, &runner.res_ctx);
                     runner.resolve_fields(node.fields, &union_ctx);
                     field_count += node.fields.length;
+                    runner.resolve_inline_method_signatures(
+                        node.name, node.binding_namespace, node.methods, &union_ctx);
                 }
                 NodeKind::ClassDeclaration => {
                     const node: ClassDeclNode* = stmt as ClassDeclNode*;
@@ -2608,6 +2873,8 @@ type struct TypeResolutionPasses {
                         node.generic_params, &runner.res_ctx);
                     runner.resolve_fields(node.fields, &class_ctx);
                     field_count += node.fields.length;
+                    runner.resolve_inline_method_signatures(
+                        node.name, SymbolStr::empty(), node.methods, &class_ctx);
                 }
                 NodeKind::ImplementationBlock => {
                     const node: ImplBlockNode* = stmt as ImplBlockNode*;
@@ -2913,10 +3180,12 @@ type struct TypeResolutionPasses {
                             const bq_sym: SymbolStr =
                                 ctx.qualify_binding_sym(var_node.name, var_node.binding_namespace);
                             ctx.decl_index.register_global_with_module(
-                                bq_sym, var_node.resolved_type, gmod_sym, var_node.binding_namespace);
+                                bq_sym, var_node.resolved_type, gmod_sym,
+                                var_node.binding_namespace, var_node.is_thread_local);
                         } else {
                             ctx.decl_index.register_global_with_module(
-                                var_node.name, var_node.resolved_type, gmod_sym, ctx.namespace_str);
+                                var_node.name, var_node.resolved_type, gmod_sym,
+                                ctx.namespace_str, var_node.is_thread_local);
                             // Also register under the module-qualified name so a
                             // same-bare-name global in another module can't shadow
                             // this one in the (bare-keyed, last-write-wins) type
@@ -3050,7 +3319,9 @@ type struct TypeResolutionPasses {
                         }
                         const is_pub: boolean = field.visibility == Visibility::Public;
                         const is_prot: boolean = field.visibility == Visibility::Protected;
-                        field_infos.push(FieldInfo::new(field.name, field.resolved_type, is_pub, is_prot, true));
+                        mut fi: FieldInfo = FieldInfo::new(field.name, field.resolved_type, is_pub, is_prot, true);
+                        fi.set_default_value(field.default_value);
+                        field_infos.push(fi);
                     }
                     st.set_fields(field_infos);
 
@@ -3122,7 +3393,9 @@ type struct TypeResolutionPasses {
                         }
                         const is_pub: boolean = field.visibility == Visibility::Public;
                         const is_prot: boolean = field.visibility == Visibility::Protected;
-                        field_infos.push(FieldInfo::new(field.name, field.resolved_type, is_pub, is_prot, true));
+                        mut fi: FieldInfo = FieldInfo::new(field.name, field.resolved_type, is_pub, is_prot, true);
+                        fi.set_default_value(field.default_value);
+                        field_infos.push(fi);
                     }
                     st.set_fields(field_infos);
 
@@ -3187,7 +3460,9 @@ type struct TypeResolutionPasses {
                         }
                         const is_pub: boolean = field.visibility == Visibility::Public;
                         const is_prot: boolean = field.visibility == Visibility::Protected;
-                        field_infos.push(FieldInfo::new(field.name, field.resolved_type, is_pub, is_prot, true));
+                        mut fi: FieldInfo = FieldInfo::new(field.name, field.resolved_type, is_pub, is_prot, true);
+                        fi.set_default_value(field.default_value);
+                        field_infos.push(fi);
                     }
                     ct.set_fields(field_infos);
 

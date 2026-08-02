@@ -1,0 +1,186 @@
+///! Cursor: an in-memory byte buffer that is `Read`, `Write`, and `Seek`.
+///!
+///! A `Cursor` wraps an owned `Array<u8>` and a position, so code written
+///! against the `io` traits can run against memory instead of a file or
+///! socket - the standard way to unit-test a reader/writer, or to build a
+///! byte payload up before handing it to a real sink.
+///!
+///! Reads copy from the position forward and stop at the buffer end (a
+///! read past the end returns 0 = EOF). Writes overwrite the bytes under
+///! the cursor and extend the buffer past its end; a write that starts
+///! beyond the current end zero-fills the gap first, matching the sparse
+///! region a `File` seek-past-end leaves. Seeks may land past the end.
+
+namespace std::io::cursor;
+
+import core::intrinsics;
+import core::option;
+import core::result;
+import core::slice;
+import core::mem;
+import collections::array;
+import io::error;
+import io::traits;
+
+/// An in-memory `Read` + `Write` + `Seek` byte buffer. Owns its
+/// `Array<u8>`; `drop` releases it (or move it out with `into_inner`
+/// first).
+type struct Cursor {
+    buffer: Array<u8>;
+    pos:    u64;
+
+    /// Wrap an existing byte buffer with the cursor at position 0. Takes
+    /// ownership of `buffer`; reads start at its first byte.
+    static new(buffer: Array<u8>) -> Cursor {
+        return Cursor { buffer: buffer, pos: 0 };
+    }
+
+    /// A cursor over a fresh empty buffer - the usual starting point for
+    /// accumulating bytes with `write`.
+    static empty() -> Cursor {
+        return Cursor { buffer: Array<u8>::new(), pos: 0 };
+    }
+
+    /// Current cursor position: the absolute byte offset from the start
+    /// where the next read or write lands. Independent of the buffer
+    /// length; may exceed it after a seek-past-end.
+    position(&this) -> u64 {
+        return this.pos;
+    }
+
+    /// Set the cursor position directly. Positions past the buffer end
+    /// are allowed and behave as documented on the type.
+    set_position(mut &this, pos: u64) -> void {
+        this.pos = pos;
+    }
+
+    /// Number of bytes currently in the buffer, independent of the
+    /// cursor position.
+    len(&this) -> u64 {
+        return this.buffer.length();
+    }
+
+    /// Borrow the buffered bytes without moving the cursor. The slice is
+    /// invalidated by any subsequent write (which may reallocate).
+    as_bytes(&this) -> Slice<u8> {
+        return this.buffer.as_slice();
+    }
+
+    /// Move the buffer out, leaving the cursor holding a fresh empty
+    /// buffer. The typical "collect the written bytes" finisher; the
+    /// cursor stays valid and must still be dropped.
+    into_inner(mut &this) -> Array<u8> {
+        mut out: Array<u8> = Array<u8>::new();
+        mem::swap(&out, &this.buffer);
+        this.pos = 0;
+        return out;
+    }
+}
+
+/// Read from the position forward, copying at most `length` bytes into
+/// `buffer` and advancing the cursor. A read at or past the buffer end
+/// returns 0 (EOF); otherwise it returns as many bytes as remain, up to
+/// `length`. Never errors.
+implement trait Read for struct Cursor {
+    read(mut &this, buffer: u8*, length: u64) -> Result<u64, IoError> {
+        const total: u64 = this.buffer.length();
+        if (this.pos >= total) {
+            return Result::Ok(0);
+        }
+        mut n: u64 = total - this.pos;
+        if (n > length) { n = length; }
+        if (n > 0) {
+            intrinsics::memcpy(
+                buffer as void*,
+                (this.buffer.as_ptr() + this.pos) as void*,
+                n);
+            this.pos = this.pos + n;
+        }
+        return Result::Ok(n);
+    }
+}
+
+/// Write at the cursor, overwriting existing bytes and extending the
+/// buffer past its end. A write whose start is beyond the current end
+/// first zero-fills the `[len, pos)` gap. Always accepts the whole slice;
+/// `flush` is a no-op. Fails only on allocation failure during growth,
+/// surfaced as `WriteZero`.
+implement trait Write for struct Cursor {
+    write_some(mut &this, bytes: Slice<u8>) -> Result<u64, IoError> {
+        const n: u64 = bytes.length();
+        if (n == 0) {
+            return Result::Ok(0);
+        }
+        // Zero-fill any gap between the buffer end and the cursor so the
+        // write always lands inside initialised storage.
+        while (this.buffer.length() < this.pos) {
+            match (this.buffer.try_push(0)) {
+                Result::Ok(_)  => { }
+                Result::Err(_) => {
+                    return Result::Err(IoError::new(IoErrorKind::WriteZero, 0));
+                }
+            }
+        }
+        const src: u8* = bytes.as_ptr();
+        mut i: u64 = 0;
+        while (i < n) {
+            const at: u64 = this.pos + i;
+            if (at < this.buffer.length()) {
+                this.buffer.set(at, src[i]);
+            } else {
+                match (this.buffer.try_push(src[i])) {
+                    Result::Ok(_)  => { }
+                    Result::Err(_) => {
+                        // Partial progress: report what landed so the
+                        // generic `write` loop can retry the remainder.
+                        this.pos = this.pos + i;
+                        if (i > 0) { return Result::Ok(i); }
+                        return Result::Err(IoError::new(IoErrorKind::WriteZero, 0));
+                    }
+                }
+            }
+            i = i + 1;
+        }
+        this.pos = this.pos + n;
+        return Result::Ok(n);
+    }
+
+    flush(mut &this) -> Result<(), IoError> {
+        return Result::Ok(());
+    }
+}
+
+/// Reposition the cursor. `Start` sets an absolute offset; `Current` and
+/// `End` apply a signed delta to the position or the buffer length. A
+/// resulting negative offset fails with `InvalidInput`; landing past the
+/// end is allowed (the next write zero-fills up to it).
+implement trait Seek for struct Cursor {
+    seek(mut &this, from: SeekFrom) -> Result<u64, IoError> {
+        mut target: i64 = 0;
+        match (from) {
+            SeekFrom::Start(offset) => {
+                this.pos = offset;
+                return Result::Ok(offset);
+            }
+            SeekFrom::Current(offset) => {
+                target = (this.pos as i64) + offset;
+            }
+            SeekFrom::End(offset) => {
+                target = (this.buffer.length() as i64) + offset;
+            }
+        }
+        if (target < 0) {
+            return Result::Err(IoError::new(IoErrorKind::InvalidInput, 0));
+        }
+        this.pos = target as u64;
+        return Result::Ok(this.pos);
+    }
+}
+
+/// Releases the owned buffer. `into_inner` empties the cursor first when
+/// the caller wants to keep the bytes.
+implement trait Drop for struct Cursor {
+    drop(mut &this) -> void {
+        this.buffer.drop();
+    }
+}

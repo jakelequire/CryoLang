@@ -38,6 +38,7 @@ import Compiler::CompilationContext;
 import Compiler::AST;
 import Compiler::AST::Node;
 import Compiler::AST::Expression;
+import Compiler::AST::Statement;
 import Compiler::AST::Declaration;
 import Compiler::AST::NodeLocator;
 import Compiler::Diag::SourceSpan;
@@ -55,6 +56,7 @@ import Compiler::ModuleGraph;
 
 import Lsp::Server::Docs;
 import Lsp::Server::Session;
+import Lsp::Server::LineIndex;
 import Lsp::Protocol::Lsp;
 import Lsp::Protocol::Conv;
 import Lsp::Handlers::KeywordDocs;
@@ -936,6 +938,65 @@ public function handle_hover_ex(docs: &Docs, sessions: mut &SessionMap,
         }
     }
 
+    // Inline-asm symbol reference: the cursor sits inside an `asm { ... }`
+    // block (the locator returns the AsmBlockStmtNode because the body isn't
+    // span-preserved in the AST).  Pull the identifier under the cursor out
+    // of the live buffer and, if it names a Cryo function (`call
+    // __cryo_start`), render that function's signature.  Mnemonics and
+    // registers simply don't resolve to a function, so they get no hover.
+    if (content == "" && node.kind == NodeKind::AsmBlockStatement
+            && ctx.intern_table != null) {
+        const doc_opt: Option<Document*> = docs.get(uri);
+        mut docp: Document* = null;
+        match (doc_opt) {
+            Option::Some(d) => { docp = d; }
+            Option::None     => { }
+        }
+        if (docp != null) {
+            const line0: u32 = cursor_line - 1 as u32;
+            if (line0 as u64 < docp.line_index.line_count()) {
+                const ls: u64 = docp.line_index.line_start(line0);
+                const le: u64 = docp.line_index.line_end(line0);
+                mut lb: u64 = if (le > ls) { le - ls } else { 0 as u64 };
+                if (lb > 0 as u64 && line0 as u64 + 1 < docp.line_index.line_count()) {
+                    lb = lb - 1 as u64;             // strip trailing '\n'
+                }
+                const txt: string = docp.text.as_ptr() as string;
+                const base: string = txt + ls as i64;
+                const col: u32 = cursor_char - 1 as u32;    // 0-based byte col
+                if (col as u64 < lb
+                        && HoverEngine::asm_is_ident_byte(base[col as i64] as u8)) {
+                    mut s: u32 = col;
+                    while (s > 0 as u32
+                            && HoverEngine::asm_is_ident_byte(base[(s - 1 as u32) as i64] as u8)) {
+                        s = s - 1 as u32;
+                    }
+                    mut e: u32 = col;
+                    while (e as u64 < lb
+                            && HoverEngine::asm_is_ident_byte(base[e as i64] as u8)) {
+                        e = e + 1 as u32;
+                    }
+                    mut ident: String = String::new();
+                    mut bi: u32 = s;
+                    while (bi < e) {
+                        ident.push_byte(base[bi as i64] as u8);
+                        bi = bi + 1 as u32;
+                    }
+                    const target: SymbolStr =
+                        ctx.intern_table.intern(ident.as_ptr() as string);
+                    ident.drop();
+                    const fdecl: FunctionDeclNode* = eng.find_asm_symbol_decl(target);
+                    if (fdecl != null) {
+                        content    = eng.format_callable_decl(fdecl);
+                        doc_text   = fdecl.documentation;
+                        hover_span = SourceSpan::new(node.span.file,
+                            cursor_line, s + 1 as u32, cursor_line, e + 1 as u32);
+                    }
+                }
+            }
+        }
+    }
+
     // Fallback path for everything else (variables, identifiers,
     // expressions, type tokens).  Use the short type name so the
     // tooltip says `Str` not `std::collections::str::Str`.
@@ -1083,6 +1144,70 @@ type struct HoverEngine {
             graph:   ctx.module_graph,
             verbose: false,
         };
+    }
+
+
+    // Inline-asm symbol hover support
+
+    /// Byte class for an identifier inside an `asm` body (letters, digits,
+    /// `_`, and `.`/`$` for mangled symbols).  Mirrors the classifier in the
+    /// semantic-tokens re-scanner so hover and colouring agree on token edges.
+    static asm_is_ident_byte(b: u8) -> boolean {
+        return (b >= 65 as u8 && b <= 90 as u8)      // A-Z
+            || (b >= 97 as u8 && b <= 122 as u8)     // a-z
+            || (b >= 48 as u8 && b <= 57 as u8)      // 0-9
+            || b == 95 as u8                          // _
+            || b == 46 as u8                          // .
+            || b == 36 as u8;                         // $
+    }
+
+    /// Find a free / extern function named `target` anywhere in the module
+    /// graph.  Used to resolve a bare symbol reference written inside an
+    /// `asm` block (`call __cryo_start`) - those aren't AST nodes, so the
+    /// normal span->symbol resolver can't reach them; we match by name.
+    find_asm_symbol_decl(&this, target: SymbolStr) -> FunctionDeclNode* {
+        if (!target.is_valid() || this.graph == null) { return null; }
+        const count: u32 = this.graph.module_count();
+        for (mut m: u32 = 0 as u32; m < count; m++) {
+            const prog: ProgramNode* = this.graph.get_module_ast(m);
+            if (prog == null) { continue; }
+            const hit: FunctionDeclNode* =
+                HoverEngine::scan_stmts_for_fn(prog, target);
+            if (hit != null) { return hit; }
+        }
+        return null;
+    }
+
+    /// Scan a module's top-level statements for a function declaration whose
+    /// name equals `target` - covers free functions (bare or wrapped in a
+    /// DeclarationStatement) and `extern "C"` block functions.
+    static scan_stmts_for_fn(prog: ProgramNode*, target: SymbolStr) -> FunctionDeclNode* {
+        for (mut i: i64 = 0; i < prog.statements.length; i++) {
+            const s: ASTNode* = prog.statements[i] as ASTNode*;
+            if (s == null) { continue; }
+            mut f: FunctionDeclNode* = null;
+            if (s.kind == NodeKind::FunctionDeclaration) {
+                f = s as FunctionDeclNode*;
+            } else if (s.kind == NodeKind::DeclarationStatement) {
+                const ds: DeclStmtNode* = s as DeclStmtNode*;
+                if (ds.declaration != null
+                        && ds.declaration.kind == NodeKind::FunctionDeclaration) {
+                    f = ds.declaration as FunctionDeclNode*;
+                }
+            } else if (s.kind == NodeKind::ExternBlock) {
+                const eb: ExternBlockNode* = s as ExternBlockNode*;
+                for (mut k: i64 = 0; k < eb.functions.length; k++) {
+                    const ef: FunctionDeclNode* = eb.functions[k];
+                    if (ef != null && ef.name.is_valid() && ef.name.equals(target)) {
+                        return ef;
+                    }
+                }
+            }
+            if (f != null && f.name.is_valid() && f.name.equals(target)) {
+                return f;
+            }
+        }
+        return null;
     }
 
 
@@ -1596,9 +1721,6 @@ type struct HoverEngine {
                 // Cryo spells a mutable reference `mut &T`, not `&mut T`.
                 const prefix: string = if (r.is_mutable) { "mut &" } else { "&" };
                 prefix + inner
-            }
-            TypeAnnotation::Optional(o)  => {
-                this.format_annotation(o.inner) + "?"
             }
             TypeAnnotation::Array(a)     => {
                 this.format_annotation(a.element) + "[]"
@@ -3063,7 +3185,6 @@ type struct HoverEngine {
             }
             Option::None => { return 0 as u32; }
         }
-        return 0 as u32;
     }
 
     /// True when the cursor lands on a position where a token is being used
@@ -3117,7 +3238,7 @@ type struct HoverEngine {
         if (span.start_col  > 0) { sc = span.start_col  - 1; }
         if (span.end_line   > 0) { el = span.end_line   - 1; }
         if (span.end_col    > 0) { ec = span.end_col    - 1; }
-        return std::Range::new(Position::new(sl, sc), Position::new(el, ec));
+        return Lsp::Protocol::Lsp::Range::new(Position::new(sl, sc), Position::new(el, ec));
     }
 
     /// Render a literal-bearing expression to its source-level text.
@@ -3163,7 +3284,6 @@ type struct HoverEngine {
                 TypeAnnotation::Reference(r) => { r.inner }
                 TypeAnnotation::Pointer(p)   => { p.inner }
                 TypeAnnotation::Array(a)     => { a.element }
-                TypeAnnotation::Optional(o)  => { o.inner }
                 TypeAnnotation::Generic(g)   => { g.base }
                 _                            => { null }
             };
@@ -3218,7 +3338,7 @@ type struct HoverEngine {
         const seg_len: i64 = end - start;
         if (seg_len <= 0) { return ""; }
         const buf: i8* = malloc((seg_len + 1) as u64) as i8*;
-        for (mut i: i64 = 0; i < seg_len; i++) { buf[i] = s[start + i]; }
+        for (mut i: i64 = 0; i < seg_len; i++) { buf[i] = s[start + i] as i8; }
         buf[seg_len] = 0 as i8;
         return buf as string;
     }
@@ -3278,7 +3398,7 @@ type struct HoverEngine {
                     i = i + 2;
                     break;
                 }
-                buf[out] = raw[i];
+                buf[out] = raw[i] as i8;
                 out = out + 1;
                 i = i + 1;
             }
@@ -3359,7 +3479,7 @@ type struct HoverEngine {
                 buf[wi] = '.' as i8;  wi = wi + 1;
                 break;
             }
-            const c: i8 = s[i];
+            const c: char = s[i];
             if (c == '\n' as i8) {
                 buf[wi] = '\\' as i8; wi = wi + 1;
                 buf[wi] = 'n' as i8;  wi = wi + 1;
@@ -3381,7 +3501,7 @@ type struct HoverEngine {
                 buf[wi] = '\\' as i8; wi = wi + 1;
                 shown = shown + 2;
             } else {
-                buf[wi] = c; wi = wi + 1;
+                buf[wi] = c as i8; wi = wi + 1;
                 shown = shown + 1;
             }
             i = i + 1;

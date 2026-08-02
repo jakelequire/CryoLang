@@ -43,13 +43,21 @@ type enum PassID {
     TypeResolution;
     StructFieldTypeSync;
 
-    // Stage 5: Specialization
+    // Conceptual phase groupings.  NOTE: these are declaration groupings, not
+    // execution order.  Since the mono-after-sema flip the driver runs sema
+    // (FunctionBodyTypeCheck) BEFORE Monomorphization, and the SemanticAnalysis-
+    // phase passes run both before mono (initial type check) and after it
+    // (re-check + MoveCheck/DropInsertion), so no single linear phase order holds.
+    // Actual order is defined by the ordered `set_passes(...)` calls in
+    // `instance.cryo`; see the note on `metadata()` below.
+
+    // Specialization
     DirectiveProcessing;        // Will NOT be implemented pre-self-hosting, but reserving the slot for after self-hosting is complete. synax: `![directive]`
     Monomorphization;
     GenericExpressionResolution;
     GenericValidation;
 
-    // Stage 6: Semantic Analysis
+    // Semantic Analysis (runs partly before, partly after Specialization)
     FunctionBodyTypeCheck;
     MoveCheck;
     DropInsertion;
@@ -105,71 +113,19 @@ implement enum PassID {
         };
     }
 
-    /// Which pipeline stage this pass belongs to.
-    stage(&this) -> PassStage {
-        return match (this) {
-            PassID::Lexing                      => { PassStage::Frontend              }
-            PassID::Parsing                     => { PassStage::Frontend              }
-            PassID::ConfigGating                => { PassStage::Frontend              }
-            PassID::ASTValidation               => { PassStage::Frontend              }
-            PassID::CHeaderImport               => { PassStage::Frontend              }
-            PassID::AutoImport                  => { PassStage::ModuleResolution      }
-            PassID::ImportResolution            => { PassStage::ModuleResolution      }
-            PassID::NameResolution              => { PassStage::ModuleResolution      }
-            PassID::TypeDeclaration             => { PassStage::DeclarationCollection }
-            PassID::FunctionSignature           => { PassStage::DeclarationCollection }
-            PassID::TemplateRegistration        => { PassStage::DeclarationCollection }
-            PassID::DefaultExpansion            => { PassStage::DeclarationCollection }
-            PassID::TypeResolution              => { PassStage::TypeResolution        }
-            PassID::StructFieldTypeSync         => { PassStage::TypeResolution        }
-            PassID::DirectiveProcessing         => { PassStage::Specialization        }
-            PassID::Monomorphization            => { PassStage::Specialization        }
-            PassID::GenericExpressionResolution => { PassStage::Specialization        }
-            PassID::GenericValidation           => { PassStage::Specialization        }
-            PassID::FunctionBodyTypeCheck       => { PassStage::SemanticAnalysis      }
-            PassID::MoveCheck                   => { PassStage::SemanticAnalysis      }
-            PassID::DropInsertion               => { PassStage::SemanticAnalysis      }
-            PassID::DeadCodeAnalysis            => { PassStage::SemanticAnalysis      }
-            PassID::TypeLowering                => { PassStage::CodegenPreparation    }
-            PassID::IRGeneration                => { PassStage::IRGeneration          }
-            PassID::Optimization                => { PassStage::Output                }
-            PassID::ObjectEmission              => { PassStage::Output                }
-            PassID::Linking                     => { PassStage::Output                }
-        };
-    }
-
-    /// Execution order within the full pipeline (0-based).
-    order(&this) -> u32 {
-        return match (this) {
-            PassID::Lexing                      => { 0  }
-            PassID::Parsing                     => { 1  }
-            PassID::ConfigGating                => { 2  }
-            PassID::ASTValidation               => { 3  }
-            PassID::CHeaderImport               => { 4  }
-            PassID::AutoImport                  => { 5  }
-            PassID::ImportResolution            => { 6  }
-            PassID::NameResolution              => { 7  }
-            PassID::TypeDeclaration             => { 8  }
-            PassID::FunctionSignature           => { 9  }
-            PassID::TemplateRegistration        => { 10 }
-            PassID::DefaultExpansion            => { 11 }
-            PassID::TypeResolution              => { 12 }
-            PassID::StructFieldTypeSync         => { 13 }
-            PassID::DirectiveProcessing         => { 14 }
-            PassID::Monomorphization            => { 15 }
-            PassID::GenericExpressionResolution => { 16 }
-            PassID::GenericValidation           => { 17 }
-            PassID::FunctionBodyTypeCheck       => { 18 }
-            PassID::MoveCheck                   => { 19 }
-            PassID::DropInsertion               => { 20 }
-            PassID::DeadCodeAnalysis            => { 20 }
-            PassID::TypeLowering                => { 21 }
-            PassID::IRGeneration                => { 22 }
-            PassID::Optimization                => { 23 }
-            PassID::ObjectEmission              => { 24 }
-            PassID::Linking                     => { 25 }
-        };
-    }
+    // NOTE: there are deliberately NO standalone `stage()` / `order()` methods.
+    // The pipeline's execution order is defined by the driver's ordered
+    // `set_passes(...)` calls in `instance.cryo` (compile_project ->
+    // typecheck_bodies -> monomorphize -> the post-mono re-sema/validation
+    // batch).  Since the mono-after-sema flip, sema (FunctionBodyTypeCheck) runs
+    // BEFORE Monomorphization and the SemanticAnalysis-phase passes straddle
+    // Monomorphization, so a single linear stage/order number can no longer
+    // describe execution.  `metadata()` below is the SINGLE SOURCE OF TRUTH used
+    // by the pass registry (it validates `requirements`/`provisions` in the
+    // driver-supplied order) and carries a documentary `stage` for logging.
+    // Two earlier `stage()`/`order()` methods encoded the pre-flip order, had
+    // drifted out of sync with both the driver and metadata(), and had no
+    // callers; they were removed rather than kept as a second, lying authority.
 
     /// Whether failure in this pass should abort the pipeline.
     fatal_on_failure(&this) -> boolean {
@@ -708,7 +664,13 @@ type struct PassRequirement {
 type struct PassMetadata {
     id:               PassID;
     name:             string;
+    /// Conceptual phase, for logging only (`stage.label()`).  NOT execution
+    /// order - see the note on `PassID`.
     stage:            PassStage;
+    /// Documentary only: no code reads this field.  Real execution order is the
+    /// driver's `set_passes(...)` sequence in `instance.cryo`; the per-pass
+    /// numbers here are a legacy pre-mono-after-sema encoding kept for reference
+    /// and are not kept in lockstep with the driver.
     order:            u32;
     requirements:     PassRequirement[];
     provisions:       Provision[];

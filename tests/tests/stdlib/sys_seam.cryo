@@ -1,0 +1,112 @@
+///! std::sys - the low-level OS seam (Low-Level Plan Stage 0/2).
+///!
+///! Exercises the seam's per-target implementation from inside the unit
+///! suite: on Linux that is the raw `syscall` instruction (no libc), on
+///! Windows the libc pass-through arm.  The assertions mirror the ones
+///! `tests/projects/native_syscalls_gate` makes end-to-end - the seam must
+///! present the identical `-errno` contract and byte-identical file effects
+///! as plain libc, whichever arm is active.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::SysSeam;
+
+import std::core::result;
+import std::sys;
+import ffi::libc;
+import std::test::error;
+import std::test::assert;
+
+// Round-trip: open/write/close through the seam, read back through plain
+// libc, byte for byte.
+![test]
+function seam_write_libc_readback() -> Result<(), TestError> {
+    const path: u8* = "/tmp/cryo_sys_seam_test.txt" as u8*;
+    const payload: u8* = "seam round trip\n" as u8*;
+    const payload_len: u64 = 16;
+
+    const wfd: i64 = sys::open(path, libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC, 420);
+    match (expect(wfd >= 0, Str::new("seam open for write succeeds"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    const wrote: i64 = sys::write(wfd as i32, payload, payload_len);
+    match (expect_eq(wrote, payload_len as i64)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(sys::close(wfd as i32), 0)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+
+    // `O_BINARY` for the same reason as the reverse test below: the raw-libc
+    // reader must match the seam's binary mode or MSVCRT text-mode reads
+    // would filter the bytes being compared. Zero (a no-op) on POSIX.
+    const rfd: i32 = libc::open(path, libc::O_RDONLY | libc::O_BINARY, 0);
+    match (expect(rfd >= 0, Str::new("libc reopen succeeds"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    mut buf: u8[64];
+    const got: i64 = libc::read(rfd, &buf[0], 64);
+    libc::close(rfd);
+    libc::unlink(path);
+    match (expect_eq(got, payload_len as i64)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    mut same: boolean = true;
+    for (mut i: i64 = 0; i < got; i++) {
+        if (buf[i] != payload[i]) { same = false; }
+    }
+    return expect(same, Str::new("seam-written bytes read back identically"));
+}
+
+// Reverse direction: libc writes, the seam reads.
+![test]
+function libc_write_seam_readback() -> Result<(), TestError> {
+    const path: u8* = "/tmp/cryo_sys_seam_test2.txt" as u8*;
+    const payload: u8* = "reverse trip\n" as u8*;
+    const payload_len: u64 = 13;
+
+    // `O_BINARY` on the raw-libc side: the seam always opens binary (POSIX
+    // byte semantics), so the plain-libc writer this test compares against
+    // must too - otherwise MSVCRT text mode writes `\r\n` and the byte
+    // counts diverge. Zero (a no-op) on POSIX targets.
+    const wfd: i32 = libc::open(path,
+        libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC | libc::O_BINARY, 420);
+    match (expect(wfd >= 0, Str::new("libc open for write succeeds"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    libc::write(wfd, payload, payload_len);
+    libc::close(wfd);
+
+    const rfd: i64 = sys::open(path, libc::O_RDONLY, 0);
+    match (expect(rfd >= 0, Str::new("seam open for read succeeds"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    mut buf: u8[64];
+    const got: i64 = sys::read(rfd as i32, &buf[0], 64);
+    const closed: i64 = sys::close(rfd as i32);
+    libc::unlink(path);
+    match (expect_eq(got, payload_len as i64)) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    mut same: boolean = true;
+    for (mut i: i64 = 0; i < got; i++) {
+        if (buf[i] != payload[i]) { same = false; }
+    }
+    match (expect(same, Str::new("libc-written bytes read back identically"))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(closed, 0);
+}
+
+// The seam's error contract: failures are `-errno`, not libc's -1.
+![test]
+function seam_errors_are_negative_errno() -> Result<(), TestError> {
+    const noent: i64 = sys::open("/nonexistent/cryo_seam_dir/x" as u8*, libc::O_RDONLY, 0);
+    match (expect_eq(noent, -(libc::ENOENT as i64))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(sys::close(987654), -(libc::EBADF as i64))) {
+        Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); }
+    }
+    mut scratch: u8[8];
+    return expect_eq(sys::read(987654, &scratch[0], 8), -(libc::EBADF as i64));
+}

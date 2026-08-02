@@ -16,7 +16,7 @@ namespace Compiler::Codegen::Visit::PatternEmitter;
 import Compiler::Codegen;
 import Compiler::Codegen::{ LLVMTypes, Context, Util };
 import Compiler::Types;
-import Compiler::Types::{ TypeRef, Type, Compound, UserDefined, Generic };
+import Compiler::Types::{ TypeRef, Type, Compound, UserDefined, Generic, Arena };
 import Compiler::AST;
 import Compiler::AST::{ Node, Pattern };
 import Compiler::Lex;
@@ -131,11 +131,7 @@ type struct PatternEmitter {
         }
 
         // ADT enum: we need a ptr to do struct GEP for tag and payload.
-        // Only alloca when the subject is a raw struct value.  Alloca goes in
-        // the current block (not the entry block) so it stays before the
-        // match's own control flow; `create_entry_alloca` can't be used here
-        // because if visit_match_stmt runs mid-function the entry block already
-        // has a terminator.
+        // Only alloca when the subject is a raw struct value.
         if (is_ptr) {
             info.subject_ptr = subject;
         } else if (subject_addr.is_valid()) {
@@ -148,7 +144,21 @@ type struct PatternEmitter {
             // the drop to free the original's stale pointer (double free).
             info.subject_ptr = subject_addr;
         } else {
-            info.subject_ptr = this.cg.builder.build_alloca(info.enum_llvm, "match.subj");
+            // The scratch copy's slot is hoisted to the entry block, while the
+            // store below stays here, where the subject value is live. A `match`
+            // reached from inside a loop would otherwise allocate a fresh slot on
+            // every iteration and never reclaim it — the stack grows without
+            // bound until it overflows, which is a crash rather than a slowdown.
+            // Reusing one slot across iterations is safe because the store
+            // precedes every read of it within an iteration.
+            if (current_fn.is_valid()) {
+                info.subject_ptr = this.cg.flow.create_entry_alloca(
+                    current_fn, "match.subj", info.enum_llvm);
+            } else {
+                // No enclosing function to hoist into — extremely unusual; a
+                // local alloca still lowers correctly, it just cannot be hoisted.
+                info.subject_ptr = this.cg.builder.build_alloca(info.enum_llvm, "match.subj");
+            }
             if (info.subject_ptr.is_valid()) {
                 this.cg.builder.build_store(subject, info.subject_ptr);
             }
@@ -197,38 +207,13 @@ type struct PatternEmitter {
         }
     }
 
-    /// Compute the byte offset of each payload field of `variant`, applying
-    /// the SAME align-up rules as compute_enum_layout (type_map) and the
-    /// construction side (EnumVariantEmitter). A naive packed running sum
-    /// would bind e.g. a `u64` after a `u8` at byte +1, reading it with a
-    /// false `align 8` off an odd address (UB / strict-align fault).
+    /// Byte offset of each payload field of `variant`.  Delegates to the
+    /// single layout authority (TypeArena::variant_payload_layout) shared
+    /// with construction, drop glue, map_enum, and compute_enum_layout, so
+    /// pattern binds can never diverge from where the fields were stored.
     payload_field_offsets(mut &this, variant: EnumVariantInfo*) -> u64[] {
-        mut offsets: u64[] = [];
-        mut running: u64 = 0;
-        for (mut pi: i64 = 0; pi < variant.payload_types.length; pi++) {
-            mut ft: Type* = this.cg.lookup_type_by_id(variant.payload_types[pi].id);
-            // Follow an InstantiatedType wrapper (reports size/align 0) to its
-            // concrete spec'd struct, as type_map does.
-            if (ft != null && ft.kind == TypeKind::InstantiatedType) {
-                const inst: InstantiatedType* = ft as InstantiatedType*;
-                if (inst.has_resolved_type()) {
-                    const r: Type* = this.cg.lookup_type_by_id(inst.resolved_type.id);
-                    if (r != null) { ft = r; }
-                }
-            }
-            if (ft != null) {
-                const fa: u64 = ft.alignment();
-                if (fa > 0) {
-                    const rem: u64 = running % fa;
-                    if (rem != 0) { running += (fa - rem); }
-                }
-            }
-            offsets.push(running);
-            if (ft != null) {
-                running += ft.size_bytes();
-            }
-        }
-        return offsets;
+        const arena: TypeArena* = this.cg.get_arena();
+        return arena.variant_payload_layout(variant, null, null);
     }
 
     /// Pointer to payload field `pos` of an ADT enum at `subject_ptr`
@@ -415,7 +400,7 @@ type struct PatternEmitter {
                 if (is_string_subj) {
                     const pat_text: string = this.cg.resolve(pat.value);
                     const pat_val: LValue =
-                        this.cg.str_cache.get_or_create(pat_text, this.cg.builder);
+                        this.cg.str_cache.get_or_create(pat_text, &this.cg.llvm_module);
                     cmp = this.cg.expr_ops.codegen_string_compare(subject, pat_val,
                         TokenType::EqualEqual);
                 } else {

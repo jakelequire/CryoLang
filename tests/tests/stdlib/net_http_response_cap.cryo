@@ -1,65 +1,107 @@
-///! HTTP response body cap + namespace-qualified-call resolution.
+///! HTTP response body cap.
 ///!
-///! `Response::parse` must reject an oversized `Content-Length` up front
-///! rather than sizing a buffer to a hostile peer's declared length (remote
-///! DoS).  Mirrors the server-side cap in `request.cryo` (MAX_BODY = 16 MiB).
+///! `BufStream::read_response` must reject an oversized `Content-Length` up
+///! front rather than sizing a buffer to a hostile peer's declared length
+///! (remote DoS). Mirrors the request-side cap in `request.cryo`
+///! (MAX_BODY = 16 MiB).
 ///!
-///! This file ALSO regression-guards name resolution: it pulls the generic
+///! NOTE on coverage this file used to carry: it also regression-guarded
+///! bare-leaf name resolution, by pulling the generic
 ///! `Request/Response::parse<R: Read>` into the shared test binary alongside
-///! json.cryo's `parser::parse(src: Str)`.  If the monomorphizer matched
-///! `parse` by bare leaf name, it would bind json's call to the HTTP static
-///! method, failing its `where R: Read` bound (E0306).  If that regresses,
-///! json.cryo stops compiling.
+///! json.cryo's `parser::parse(src: Str)`. Those blocking parsers are gone with
+///! the rest of the blocking surface, so that particular pairing no longer
+///! exists to be confused. The same class is still exercised in this binary by
+///! `Method::parse(Str)` living alongside json's `parser::parse(Str)`; if the
+///! monomorphizer regressed to matching `parse` by bare leaf name, json.cryo
+///! would stop compiling.
 
 ![config(testing)]
 namespace CryoTests::Tests::Stdlib::HttpResponseCap;
 
 import std::core::option;
 import std::core::result;
+import std::core::slice;
 import std::collections::str;
 import std::collections::array;
+import std::future;
 import std::io::error;
 import std::io::traits;
+import std::io::buf;
+import std::net::http::method;
 import std::net::http::response;
+import std::net::http::conn;
 import std::test::error;
 import std::test::assert;
 
-// Serve bytes from a Str so the response parser has something to read.
-type struct ByteReader { data: Str; pos: u64; }
-implement trait Read for struct ByteReader {
-    read(mut &this, buffer: u8*, length: u64) -> Result<u64, IoError> {
-        mut n: u64 = 0;
-        while (n < length && this.pos < this.data.length()) {
-            match (this.data.byte_at(this.pos)) {
-                Option::Some(b) => { buffer[n] = b; }
-                Option::None    => { break; }
+/// Hands the whole scripted stream over in one operation.
+type struct CapTransport {
+    inbox: Array<u8>;
+    ipos:  u64;
+
+    static of(text: string) -> CapTransport {
+        mut d: Array<u8> = Array<u8>::new();
+        const b: Slice<u8> = Str::new(text).as_bytes();
+        mut i: u64 = 0;
+        while (i < b.length()) {
+            match (b.get(i)) {
+                Option::Some(byte) => { d.push(byte); }
+                Option::None       => { }
             }
-            this.pos = this.pos + 1;
-            n = n + 1;
+            i = i + 1;
         }
-        return Result::Ok(n);
+        return CapTransport { inbox: d, ipos: 0 };
     }
 }
 
-function parses(head: string) -> boolean {
-    mut r: ByteReader = ByteReader { data: Str::new(head), pos: 0 };
-    match (Response::parse(&r)) {
-        Result::Ok(_)  => { return true; }
-        Result::Err(_) => { return false; }
+implement trait Drop for struct CapTransport {
+    drop(mut &this) -> void { this.inbox.drop(); }
+}
+
+implement trait AsyncTransport for struct CapTransport {
+    async read_into(mut &this, buf: Array<u8>) -> Transfer {
+        mut out: Array<u8> = buf;
+        mut take: u64 = this.inbox.length() - this.ipos;
+        if (take > out.length()) { take = out.length(); }
+        mut i: u64 = 0;
+        while (i < take) {
+            match (this.inbox.get(this.ipos + i)) {
+                Option::Some(byte) => { out.set(i, byte); }
+                Option::None       => { }
+            }
+            i = i + 1;
+        }
+        this.ipos = this.ipos + take;
+        out.truncate(take);
+        return Transfer { buf: out, result: Result::Ok(take) };
+    }
+
+    async write_from(mut &this, buf: Array<u8>) -> Transfer {
+        mut src: Array<u8> = buf;
+        const n: u64 = src.length();
+        return Transfer { buf: src, result: Result::Ok(n) };
+    }
+}
+
+/// 1 when the response reads back, 0 when it is refused.
+async function cap_reads(head: string) -> i64 {
+    mut c: BufStream<CapTransport> = BufStream<CapTransport>::of(CapTransport::of(head));
+    match (await c.read_response()) {
+        Result::Ok(_)  => { return 1; }
+        Result::Err(_) => { return 0; }
     }
 }
 
 ![test]
 function oversized_content_length_rejected() -> Result<(), TestError> {
     // ~93 GB declared length - must be refused before allocating.
-    return expect(
-        !parses("HTTP/1.1 200 OK\r\nContent-Length: 99999999999\r\n\r\n"),
-        Str::new("oversized Content-Length must be rejected"));
+    const got: i64 = future::block_on(
+        cap_reads("HTTP/1.1 200 OK\r\nContent-Length: 99999999999\r\n\r\n"));
+    return expect_eq(got, 0 as i64);
 }
 
 ![test]
 function small_body_still_parses() -> Result<(), TestError> {
-    return expect(
-        parses("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"),
-        Str::new("a small, valid body must still parse"));
+    const got: i64 = future::block_on(
+        cap_reads("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"));
+    return expect_eq(got, 1 as i64);
 }

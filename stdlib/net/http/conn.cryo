@@ -1,0 +1,132 @@
+///! HTTP/1.1 message framing over a buffered async connection.
+///!
+///! `Request` and `Response` know their own grammar; this module knows
+///! the order in which bytes have to arrive to build one. The split is
+///! forced rather than stylistic:
+///!
+///!   - **Reads are methods on the connection.** A parser written as a
+///!     static taking `mut &BufStream<S>` cannot be called from an async
+///!     caller holding the connection as a local: handing the address of
+///!     a local to a future that outlives the current poll is refused
+///!     (E0455), and only the RECEIVER is re-supplied on every poll. So
+///!     the parse lives here, as methods on the connection.
+///!
+///!     Being a METHOD is what is forced; being a TRAIT is not. These are
+///!     an inherent impl on a type this module does not declare, which
+///!     Cryo allows across modules, generically, and for `async` methods
+///!     with a `where` bound. A trait with one implementor and no bound
+///!     that names it would buy nothing and would read like a second
+///!     connection type sitting next to `BufStream`, which is the one thing
+///!     this layer must not grow.
+///!   - **Writes are not here at all.** Encoding is synchronous — see
+///!     `Request::encode_into` — so a whole message is assembled into
+///!     `pending()` with no suspension point inside it, and the caller
+///!     suspends exactly once, in `AsyncWrite::flush`:
+///!
+///!         req.encode_into(c.pending())?;
+///!         (await c.flush())?;
+///!
+///! Neither parser holds a `buffered()` slice across an `await`; every
+///! byte is copied out by `read_line` / `read_exact` before the next
+///! suspension, which is what makes them safe against a fill that grows
+///! and moves the connection's buffer.
+
+namespace std::net::http::conn;
+
+import core::option;
+import core::result;
+import core::slice;
+import io::error;
+import io::traits;
+import io::buf;
+import collections::array;
+import collections::str;
+import collections::string;
+import net::http::headers;
+import net::http::request;
+import net::http::response;
+import future::poll;
+import future::waker;
+import future::traits;
+
+/// Reading a whole HTTP/1.1 message off a buffered connection.
+///
+/// Written once for `BufStream<S>` over any async transport, so a plaintext
+/// socket and a TLS session are served by the same framing code.
+implement struct BufStream<S> {
+    /// Read one complete request: request line, headers, and the body
+    /// sized by `Content-Length`. A peer that closes mid-message is
+    /// `UnexpectedEof`; one that sends a malformed line is `InvalidData`.
+    async read_request(mut &this) -> Result<Request, IoError>
+    where S: AsyncTransport {
+        mut line: String = (await this.read_line(request::MAX_HEADER_LINE))?;
+        mut req: Request = Request::from_request_line(line.as_str())?;
+
+        mut header_count: u64 = 0;
+        loop {
+            mut header_line: String = (await this.read_line(request::MAX_HEADER_LINE))?;
+            if (header_line.is_empty()) { break; }
+            if (!req.headers.parse_line(header_line.as_str())) {
+                return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
+            }
+            header_count = header_count + 1;
+            if (header_count > request::MAX_HEADER_COUNT) {
+                return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
+            }
+        }
+
+        // Body, sized by Content-Length. No Content-Length means no body
+        // for this parser; chunked encoding is out of scope.
+        const declared: Option<u64> = req.headers.content_length()?;
+        mut length: u64 = 0;
+        match (declared) {
+            Option::Some(n) => { length = n; }
+            Option::None    => { return Result::Ok(req); }
+        }
+        // Reject up front; never size a buffer to an untrusted peer's
+        // declared length.
+        if (length > request::MAX_BODY) {
+            return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
+        }
+        if (length > 0) {
+            mut body: Array<u8> = (await this.read_exact(length))?;
+            req.body = body;
+        }
+        return Result::Ok(req);
+    }
+
+    /// Read one complete response, framed the same way.
+    async read_response(mut &this) -> Result<Response, IoError>
+    where S: AsyncTransport {
+        mut line: String = (await this.read_line(request::MAX_HEADER_LINE))?;
+        mut resp: Response = Response::from_status_line(line.as_str())?;
+
+        mut header_count: u64 = 0;
+        loop {
+            mut header_line: String = (await this.read_line(request::MAX_HEADER_LINE))?;
+            if (header_line.is_empty()) { break; }
+            if (!resp.headers.parse_line(header_line.as_str())) {
+                return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
+            }
+            header_count = header_count + 1;
+            if (header_count > response::MAX_HEADER_COUNT) {
+                return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
+            }
+        }
+
+        const declared: Option<u64> = resp.headers.content_length()?;
+        mut length: u64 = 0;
+        match (declared) {
+            Option::Some(n) => { length = n; }
+            Option::None    => { return Result::Ok(resp); }
+        }
+        if (length > response::MAX_BODY) {
+            return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
+        }
+        if (length > 0) {
+            mut body: Array<u8> = (await this.read_exact(length))?;
+            resp.body = body;
+        }
+        return Result::Ok(resp);
+    }
+}

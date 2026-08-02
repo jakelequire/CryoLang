@@ -1,0 +1,72 @@
+///! std::future: stackless async foundations — `Future`, `Poll`, `Context`,
+///! `Waker`, and the drivers that poll them.
+///!
+///! A `Future<Output>` is a value that computes an `Output` incrementally: each
+///! `poll` either yields `Poll::Ready(v)` (done) or `Poll::Pending` (not yet —
+///! try again after the paired `Waker` fires). Futures are lazy: nothing runs
+///! until something drives `poll`.
+///!
+///! There are two drivers, and picking the wrong one is the easy mistake:
+///!   - `Executor::block_on` — the real one. Worker threads, a reactor, and
+///!     genuine parking, so a future waiting on I/O or a timer costs nothing
+///!     while it waits. Use this for anything that does I/O.
+///!   - the free `block_on` below — a spin loop with a no-op waker and NO
+///!     reactor. Only for compute-only futures that progress on every poll.
+///!
+///! Sub-modules:
+///!   - `poll`   : `Poll<T>` (`Ready` / `Pending`)
+///!   - `waker`  : `Waker` (wake callback + data) and `Context`
+///!   - `traits` : the `Future` trait (`type Output`; `poll`)
+///!   - `ready`  : sample futures `Ready<T>` and `PendingThenReady<T>`
+///!   - `reactor`: the I/O readiness driver (epoll / IOCP) a parked future waits on
+///!   - `blocking`: the thread pool that runs work the reactor cannot drive
+///!   - `executor`: the worker pool, `spawn` / `JoinHandle`, and `Executor::block_on`
+///!   - `timer`  : `Sleep`, the future that completes when a deadline arrives
+///!   - `combinator`: `Join` / `TryJoin` / `Select` / `Timeout` over two futures
+///!
+///! The module is named `future` rather than `async` because `async` is a
+///! reserved keyword.
+///!
+///! Self-reference: Cryo forbids holding a reference live across an `await`
+///! (`E0455`), so a future never contains a pointer into its own fields and is
+///! always safe to move — no `Pin` is needed.
+
+namespace std::future;
+
+import future::poll;
+import future::waker;
+import future::traits;
+import future::ready;
+import future::reactor;
+import future::blocking;
+import future::executor;
+import future::timer;
+import future::combinator;
+
+public module future::poll;
+public module future::waker;
+public module future::traits;
+public module future::ready;
+public module future::reactor;
+public module future::blocking;
+public module future::executor;
+public module future::timer;
+public module future::combinator;
+
+/// Drive a single future to completion on the calling thread and return its
+/// value. The simplest possible executor: poll in a loop with a no-op waker,
+/// re-polling immediately on `Pending`. It has no reactor, so a future that
+/// stays `Pending` forever spins forever — real parking arrives with the
+/// Phase-3 executor. Sufficient for compute-only futures that make progress on
+/// every poll.
+function block_on<F, R>(fut: F) -> R
+where F: Future<R> {
+    mut f:  F       = fut;
+    mut cx: Context = Context::new(Waker::noop());
+    loop {
+        match (f.poll(&cx)) {
+            Poll::Ready(v) => { return v; }
+            Poll::Pending  => { }
+        }
+    }
+}

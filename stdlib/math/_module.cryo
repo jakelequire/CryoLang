@@ -1,17 +1,29 @@
 ///! math: numeric operations on floats and integers.
 ///!
-///! Float functions are thin wrappers over libm and inherit its
-///! platform behavior (rounding mode, errno on domain errors,
-///! subnormal handling); we don't re-derive the IEEE 754 corner cases
-///! in Cryo. Naming follows C: `sqrt`, `ln`, `sin`, `atan2`. f64 is the
-///! default; an `_f32` suffix marks a single-precision variant, and
-///! integer variants carry an `_i64` / `_u64` / `_i32` suffix (the
-///! plain name is the f64 form).
+///! Transcendentals (`sin`, `exp`, `pow`, ...) are thin wrappers over
+///! libm and inherit its platform behavior (rounding mode, errno on
+///! domain errors, subnormal handling); we don't re-derive those IEEE
+///! 754 corner cases in Cryo. Classification and the cheap ops
+///! (`fabs`, `floor`, `round`, `copysign`, `sqrt`, `mul_add`, ...) are
+///! Cryo-owned compiler intrinsics lowered to LLVM float intrinsics -
+///! same results as the libm functions of the same name, but no libm
+///! dependency and no errno. Naming follows C: `sqrt`, `ln`, `sin`,
+///! `atan2`.
+///!
+///! Operations that are meaningful at more than one width are a single
+///! generic dispatched on `T` at compile time (`sqrt`, `fabs`, `min`, `max`,
+///! `clamp`, `abs`, `checked_abs`) rather than a family of type-suffixed
+///! names. f64 stays the default, so an unannotated float literal argument
+///! still picks the double-precision form; `sqrt<f32>(x)` or an f32-typed
+///! argument selects single precision. The remaining transcendentals are
+///! f64-only because libm is.
 
 namespace std::math;
 
 import ffi::libc;
 import core::option;
+import core::intrinsics;
+import core::mem;
 
 // --- constants ---------------------------------------------------------
 
@@ -50,8 +62,14 @@ function nan() -> f64 { const inf: f64 = infinity(); return inf - inf; }
 
 // --- roots & powers ----------------------------------------------------
 
-function sqrt(value: f64) -> f64 { return libc::sqrt(value); }
-function sqrt_f32(value: f32) -> f32 { return libc::sqrtf(value); }
+/// Square root, at the precision of `T` (f64 by default; `sqrt<f32>(x)` or an
+/// f32 argument selects the single-precision intrinsic).
+function sqrt<T>(value: T) -> T {
+    static match (T) {
+        f32 => { return intrinsics::sqrt32(value); }
+        _   => { return intrinsics::sqrt64(value); }
+    }
+}
 function cbrt(value: f64) -> f64 { return libc::cbrt(value); }
 function pow(base: f64, exponent: f64) -> f64 { return libc::pow(base, exponent); }
 
@@ -81,7 +99,7 @@ function powi(base: f64, exp: i64) -> f64 {
 
 /// Fused multiply-add: `a * b + c` computed with a single rounding (IEEE
 /// fma), more accurate than performing the multiply and add separately.
-function mul_add(a: f64, b: f64, c: f64) -> f64 { return libc::fma(a, b, c); }
+function mul_add(a: f64, b: f64, c: f64) -> f64 { return intrinsics::fma64(a, b, c); }
 
 // --- exponential & logarithm -------------------------------------------
 
@@ -122,22 +140,31 @@ function to_degrees(radians: f64) -> f64 { return radians * (180.0 / PI); }
 
 // --- rounding ----------------------------------------------------------
 
-function floor(value: f64) -> f64 { return libc::floor(value); }
-function ceil(value: f64) -> f64 { return libc::ceil(value); }
-function round(value: f64) -> f64 { return libc::round(value); }
-function trunc(value: f64) -> f64 { return libc::trunc(value); }
+function floor(value: f64) -> f64 { return intrinsics::floor64(value); }
+function ceil(value: f64) -> f64 { return intrinsics::ceil64(value); }
+
+/// Round to the nearest integer, halfway cases away from zero
+/// (`round(2.5) == 3.0`, `round(-2.5) == -3.0`) - C `round` semantics,
+/// not the current-rounding-mode `rint`/`nearbyint`.
+function round(value: f64) -> f64 { return intrinsics::round64(value); }
+function trunc(value: f64) -> f64 { return intrinsics::ftrunc64(value); }
 
 /// Fractional part, with the sign of `value` (`fract(-2.25) == -0.25`).
-function fract(value: f64) -> f64 { return value - libc::trunc(value); }
+function fract(value: f64) -> f64 { return value - intrinsics::ftrunc64(value); }
 
 // --- sign & absolute value ---------------------------------------------
 
-function fabs(value: f64) -> f64 { return libc::fabs(value); }
-function fabs_f32(value: f32) -> f32 { return libc::fabsf(value); }
+/// Floating-point absolute value, at the precision of `T`.
+function fabs<T>(value: T) -> T {
+    static match (T) {
+        f32 => { return intrinsics::fabs32(value); }
+        _   => { return intrinsics::fabs64(value); }
+    }
+}
 
 /// `magnitude` with the sign of `sign` (IEEE copysign).
 function copysign(magnitude: f64, sign: f64) -> f64 {
-    return libc::copysign(magnitude, sign);
+    return intrinsics::copysign64(magnitude, sign);
 }
 
 /// Floating-point remainder of `x / y` (IEEE fmod).
@@ -150,32 +177,26 @@ function signum(value: f64) -> f64 {
     return value;
 }
 
-// Integer absolute value: cheap enough to be intrinsic-free.
-//
-// WARNING: two's-complement has no positive counterpart for the most-negative
-// value, so `abs_i64(i64::MIN)` and `abs_i32(i32::MIN)` overflow and return the
-// SAME negative input (the standard C/Rust `abs` footgun). Feeding that result
-// to a size/index computation silently corrupts it. When the input may be the
-// minimum, use `checked_abs_i64` / `checked_abs_i32`, which return `None` on
-// overflow instead of a wrong (negative) value.
-function abs_i64(value: i64) -> i64 { if (value < 0) { return 0 - value; } return value; }
-function abs_i32(value: i32) -> i32 { if (value < 0) { return 0 - value; } return value; }
-
-// Non-overflowing absolute value: `None` for i64::MIN / i32::MIN (whose
-// magnitude is not representable), `Some(|value|)` otherwise. The overflow is
-// detected without naming the MIN constant: only MIN negates to a still-
-// negative value under two's complement.
-function checked_abs_i64(value: i64) -> Option<i64> {
-    if (value < 0) {
-        const neg: i64 = 0 - value;
-        if (neg < 0) { return Option::None; }
-        return Option::Some(neg);
-    }
-    return Option::Some(value);
+/// Integer absolute value: cheap enough to be intrinsic-free.
+///
+/// WARNING: two's-complement has no positive counterpart for the most-negative
+/// value, so `abs(i64::MIN)` and `abs(i32::MIN)` overflow and return the SAME
+/// negative input (the standard C/Rust `abs` footgun). Feeding that result to
+/// a size/index computation silently corrupts it. When the input may be the
+/// minimum, use `checked_abs`, which returns `None` on overflow instead of a
+/// wrong (negative) value.
+function abs<T>(value: T) -> T {
+    if (value < 0) { return 0 - value; }
+    return value;
 }
-function checked_abs_i32(value: i32) -> Option<i32> {
+
+/// Non-overflowing absolute value: `None` for the most-negative value of `T`
+/// (whose magnitude is not representable), `Some(|value|)` otherwise. The
+/// overflow is detected without naming the MIN constant: only MIN negates to
+/// a still-negative value under two's complement.
+function checked_abs<T>(value: T) -> Option<T> {
     if (value < 0) {
-        const neg: i32 = 0 - value;
+        const neg: T = 0 - value;
         if (neg < 0) { return Option::None; }
         return Option::Some(neg);
     }
@@ -184,57 +205,49 @@ function checked_abs_i32(value: i32) -> Option<i32> {
 
 // --- min / max / clamp -------------------------------------------------
 //
-// The plain names operate on f64; integer variants carry a type suffix.
-// Free-function overloading is avoided deliberately (it tickles the
-// generic-codegen path), so each width gets its own name.
+// One generic per operation, dispatched on `T` at compile time.
 //
-// Float `min`/`max` are NaN-transparent (IEEE minNum/maxNum via libm: a
-// NaN operand is ignored and the other returned; both-NaN yields NaN).
-// This differs from `cmp::min`/`cmp::max`, which order NaN under the
-// total bit-order. `clamp` keeps plain comparisons, so a NaN `value`
-// propagates (it is not silently pulled into range).
+// Float `min`/`max` are NaN-transparent (IEEE minNum/maxNum: a NaN operand
+// is ignored and the other returned; both-NaN yields NaN). This differs
+// from `cmp::min`/`cmp::max`, which order NaN under the total bit-order.
+// `clamp` keeps plain comparisons for every type, so a NaN `value`
+// propagates (it is not silently pulled into range) - which is why it needs
+// no per-type dispatch at all.
 
-function min(a: f64, b: f64) -> f64 { return libc::fmin(a, b); }
-function max(a: f64, b: f64) -> f64 { return libc::fmax(a, b); }
-function clamp(value: f64, lo: f64, hi: f64) -> f64 {
-    if (value < lo) { return lo; }
-    if (value > hi) { return hi; }
-    return value;
-}
-
-// f32 min/max/clamp. libm exposes no `fminf`/`fmaxf` binding here, so NaN
-// handling is by hand: `x != x` is true iff x is NaN (the `!=` operator is
-// IEEE, distinct from the bitwise `Eq` trait). min/max are NaN-transparent
-// like the f64 forms; clamp is NaN-propagating like f64 `clamp`.
-function min_f32(a: f32, b: f32) -> f32 {
-    if (a != a) { return b; }
-    if (b != b) { return a; }
-    if (a < b) { return a; }
-    return b;
-}
-function max_f32(a: f32, b: f32) -> f32 {
-    if (a != a) { return b; }
-    if (b != b) { return a; }
-    if (a > b) { return a; }
-    return b;
-}
-function clamp_f32(value: f32, lo: f32, hi: f32) -> f32 {
-    if (value < lo) { return lo; }
-    if (value > hi) { return hi; }
-    return value;
+/// Smaller of `a` and `b`. NaN-transparent for the float types.
+function min<T>(a: T, b: T) -> T {
+    static match (T) {
+        f64 => { return libc::fmin(a, b); }
+        // libm exposes no `fminf` binding here, so NaN handling is by hand:
+        // `x != x` is true if x is NaN (the `!=` operator is IEEE, distinct
+        // from the bitwise `Eq` trait).
+        f32 => {
+            if (a != a) { return b; }
+            if (b != b) { return a; }
+            if (a < b) { return a; }
+            return b;
+        }
+        _ => { if (a < b) { return a; } return b; }
+    }
 }
 
-function min_i64(a: i64, b: i64) -> i64 { if (a < b) { return a; } return b; }
-function max_i64(a: i64, b: i64) -> i64 { if (a > b) { return a; } return b; }
-function clamp_i64(value: i64, lo: i64, hi: i64) -> i64 {
-    if (value < lo) { return lo; }
-    if (value > hi) { return hi; }
-    return value;
+/// Larger of `a` and `b`. NaN-transparent for the float types.
+function max<T>(a: T, b: T) -> T {
+    static match (T) {
+        f64 => { return libc::fmax(a, b); }
+        f32 => {
+            if (a != a) { return b; }
+            if (b != b) { return a; }
+            if (a > b) { return a; }
+            return b;
+        }
+        _ => { if (a > b) { return a; } return b; }
+    }
 }
 
-function min_u64(a: u64, b: u64) -> u64 { if (a < b) { return a; } return b; }
-function max_u64(a: u64, b: u64) -> u64 { if (a > b) { return a; } return b; }
-function clamp_u64(value: u64, lo: u64, hi: u64) -> u64 {
+/// `value` confined to `[lo, hi]`. NaN-propagating for the float types: a NaN
+/// `value` compares false against both bounds and falls through unchanged.
+function clamp<T>(value: T, lo: T, hi: T) -> T {
     if (value < lo) { return lo; }
     if (value > hi) { return hi; }
     return value;
@@ -242,36 +255,48 @@ function clamp_u64(value: u64, lo: u64, hi: u64) -> u64 {
 
 // --- classification ----------------------------------------------------
 //
-// `isnan` / `isinf` in libc are macros; the underlying primitive
-// implementations are exposed under different names per platform:
-//   - glibc:    `__isnan`, `__isinf`, `__finite`
-//   - msvcrt:   `_isnan`, `_finite`  (no `_isinf` export - derive it)
-// Both surfaces live in `ffi::libc` behind their own `![target(...)]`
-// gates.
+// IEEE-754 class tests via the `fpclass` intrinsic (LLVM `llvm.is.fpclass`):
+// pure bit-class predicates with no libm dependency and no FP exceptions,
+// so they are platform-independent - no per-OS libc name gymnastics.  Each
+// `test` literal selects which classes count as true; the bit meanings are
+// documented on `intrinsics::fpclass`.
 
-![target(linux)]
-function is_nan(value: f64) -> boolean { return libc::__isnan(value) != 0; }
-
-![target(linux)]
-function is_infinite(value: f64) -> boolean { return libc::__isinf(value) != 0; }
-
-![target(linux)]
-function is_finite(value: f64) -> boolean {
-    return libc::__finite(value) != 0;
+/// IEEE-754 value categories, as returned by `classify`.
+type enum FpCategory {
+    Nan;
+    Infinite;
+    Zero;
+    Subnormal;
+    Normal;
 }
 
-![target(windows)]
-function is_nan(value: f64) -> boolean { return libc::_isnan(value) != 0; }
+/// True if `value` is NaN (quiet or signaling).
+function is_nan(value: f64) -> boolean { return intrinsics::fpclass(value, 0x003); }
 
-![target(windows)]
-function is_finite(value: f64) -> boolean { return libc::_finite(value) != 0; }
+/// True if `value` is positive or negative infinity.
+function is_infinite(value: f64) -> boolean { return intrinsics::fpclass(value, 0x204); }
 
-// msvcrt has no direct `_isinf`; `!finite && !nan` is the standard
-// derivation and matches what C99's `isinf` macro is defined to do
-// for any value that compares unequal to itself only when NaN.
-![target(windows)]
-function is_infinite(value: f64) -> boolean {
-    return !is_finite(value) && !is_nan(value);
+/// True if `value` is finite - neither NaN nor infinite.  Includes +/-0
+/// and subnormals.
+function is_finite(value: f64) -> boolean { return intrinsics::fpclass(value, 0x1F8); }
+
+/// True if `value` is a normal number: finite, nonzero, and not subnormal.
+function is_normal(value: f64) -> boolean { return intrinsics::fpclass(value, 0x108); }
+
+/// True if `value`'s IEEE-754 sign bit is set.  Unlike the class tests this
+/// reports the raw sign bit, so it is true for -0.0 and negative NaNs too.
+/// A single bit read - no libm.
+function is_sign_negative(value: f64) -> boolean {
+    return (mem::transmute<f64, u64>(value) >> 63) != 0;
+}
+
+/// Classify `value` into its IEEE-754 category.
+function classify(value: f64) -> FpCategory {
+    if (intrinsics::fpclass(value, 0x003)) { return FpCategory::Nan; }
+    if (intrinsics::fpclass(value, 0x204)) { return FpCategory::Infinite; }
+    if (intrinsics::fpclass(value, 0x060)) { return FpCategory::Zero; }
+    if (intrinsics::fpclass(value, 0x090)) { return FpCategory::Subnormal; }
+    return FpCategory::Normal;
 }
 
 // --- integer helpers ---------------------------------------------------

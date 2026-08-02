@@ -1,0 +1,109 @@
+// `unsafe` is where the programmer takes responsibility for ownership the
+// compiler cannot follow - which, in a language without lifetimes, means
+// ownership reached through a raw pointer.
+//
+// A by-value read of `*p` is rejected in safe code (E0453: the pointee is
+// duplicated into an independently-dropped place while whoever owns that
+// storage keeps its own claim, so the destructor runs twice - see
+// negative/E0453_deref_move_out.cryo). Inside an `unsafe` block the same read
+// is permitted, because the block is the programmer stating the storage is
+// theirs to empty. Every case here PROVES that by counting destructor runs: a
+// take leaves exactly one, a duplication would leave two.
+//
+// `unsafe` is NOT a move-checking off-switch. It stands down the raw-pointer
+// rule and nothing else; a use-after-move written inside one is still E0452.
+// That mattered: before this, the pass had no `UnsafeBlockStatement` case at
+// all, so it never descended and `unsafe` silently disabled move checking
+// wholesale - while drop insertion, which does walk the block, went on
+// suppressing drops for moves the checker never saw.
+![config(testing)]
+namespace CryoTests::Tests::Lang::DerefTakeInUnsafe;
+
+import std::test;
+import std::core::result;
+import std::core::mem;
+
+mut g_drops: i64 = 0;
+
+type struct Res {
+    id: i64;
+
+    static new(id: i64) -> Res { return Res { id: id }; }
+
+    drop(mut &this) -> void { g_drops = g_drops + 1; }
+}
+
+// A take balanced by an overwrite: the slot is refilled before anything can
+// drop it, so exactly one owner exists at every moment.
+function take_and_refill(slot: Res*, replacement: Res) -> Res {
+    mut previous: Res;
+    unsafe { previous = *slot; }
+    *slot = replacement;
+    return previous;
+}
+
+![test]
+function take_through_pointer_drops_once() -> Result<(), TestError> {
+    g_drops = 0;
+    if (true) {
+        mut held: Res = Res::new(1);
+        const taken: Res = take_and_refill(&held, Res::new(2));
+        // `taken` owns the original, `held` owns the replacement: two live
+        // values, so two drops at the end of this scope and not one more.
+        const seen: i64 = taken.id;
+        if (seen != 1) { return expect_eq(seen, 1 as i64); }
+    }
+    return expect_eq(g_drops, 2 as i64);
+}
+
+![test]
+function swap_permutes_without_duplicating() -> Result<(), TestError> {
+    g_drops = 0;
+    if (true) {
+        mut a: Res = Res::new(10);
+        mut b: Res = Res::new(20);
+        mem::swap<Res>(&a, &b);
+        if (a.id != 20) { return expect_eq(a.id, 20 as i64); }
+        if (b.id != 10) { return expect_eq(b.id, 10 as i64); }
+    }
+    // Two values in, two values out: a duplicating swap would report four.
+    return expect_eq(g_drops, 2 as i64);
+}
+
+// A pointer parameter is a BORROW: handing the same owning binding to one
+// twice is not a move, so neither call may mark it moved. Deciding that from
+// `autoref` classified every `T*` argument as a by-value transfer, because
+// `autoref` is a codegen directive that only ever fires for `&T`.
+function peek(p: Res*) -> i64 { return p.id; }
+
+![test]
+function pointer_parameter_is_a_borrow_not_a_move() -> Result<(), TestError> {
+    g_drops = 0;
+    if (true) {
+        mut a: Res = Res::new(5);
+        const first: i64 = peek(&a);
+        const second: i64 = peek(&a);
+        // Still live after both borrows, and still owned by this frame.
+        const third: i64 = a.id;
+        if (first + second + third != 15) {
+            return expect_eq(first + second + third, 15 as i64);
+        }
+    }
+    return expect_eq(g_drops, 1 as i64);
+}
+
+![test]
+function borrowing_in_a_loop_is_not_loop_carried() -> Result<(), TestError> {
+    g_drops = 0;
+    if (true) {
+        mut a: Res = Res::new(0);
+        mut total: i64 = 0;
+        for (mut i: i64 = 0; i < 3; i++) {
+            // A move here would be loop-carried and a hard error; a borrow is
+            // fine every iteration.
+            total = total + peek(&a);
+        }
+        if (total != 0) { return expect_eq(total, 0 as i64); }
+    }
+    return expect_eq(g_drops, 1 as i64);
+}

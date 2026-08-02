@@ -12,7 +12,7 @@ import random::source;
 import random::bits;
 import random::secure;
 import ffi::libc;
-import ffi::syscall;
+import sys::syscall;
 
 /// A fast non-cryptographic PRNG (xoshiro256**). The 256-bit state is
 /// the four words `s0..s3`.
@@ -43,8 +43,8 @@ type struct Rng {
     /// - instead of binding the Linux-only `getrandom` symbol directly.
     static from_os() -> Rng {
         mut buf: u8[32];
-        const got: i64 = secure::fill_secure_bytes(&buf[0], 32u64);
-        if (got == 32i64) {
+        const got: i64 = secure::fill_secure_bytes(&buf[0], 32);
+        if (got == 32) {
             return non_zero_state(load_u64_le(&buf[0]),  load_u64_le(&buf[8]),
                                   load_u64_le(&buf[16]), load_u64_le(&buf[24]));
         }
@@ -59,30 +59,30 @@ type struct Rng {
 /// links the other's symbols. Non-crypto only; for cryptography use `SecureRng`.
 ![target(unix)]
 private function fallback_seed() -> u64 {
-    mut ts: timespec = timespec { tv_sec: 0i64, tv_nsec: 0i64 };
+    mut ts: timespec = timespec { tv_sec: 0, tv_nsec: 0 };
     clock_gettime(ClockId::CLOCK_MONOTONIC, &ts);
-    return ((ts.tv_sec as u64) * 1000000000u64 + (ts.tv_nsec as u64))
-           ^ ((getpid() as u64) << 32u64);
+    return ((ts.tv_sec as u64) * 1000000000 + (ts.tv_nsec as u64))
+           ^ ((getpid() as u64) << 32);
 }
 
 ![target(windows)]
 private function fallback_seed() -> u64 {
-    mut counter: LARGE_INTEGER = LARGE_INTEGER { QuadPart: 0i64 };
+    mut counter: LARGE_INTEGER = LARGE_INTEGER { QuadPart: 0 };
     syscall::QueryPerformanceCounter(&counter);
     return (counter.QuadPart as u64)
-           ^ ((syscall::GetCurrentProcessId() as u64) << 32u64);
+           ^ ((syscall::GetCurrentProcessId() as u64) << 32);
 }
 
 implement trait RandomSource for struct Rng {
     next_64(mut &this) -> u64 {
-        const result: u64 = rotl(this.s1 * 5u64, 7u32) * 9u64;
-        const t: u64 = this.s1 << 17u64;
+        const result: u64 = rotl(this.s1 * 5, 7) * 9;
+        const t: u64 = this.s1 << 17;
         this.s2 = this.s2 ^ this.s0;
         this.s3 = this.s3 ^ this.s1;
         this.s1 = this.s1 ^ this.s2;
         this.s0 = this.s0 ^ this.s3;
         this.s2 = this.s2 ^ t;
-        this.s3 = rotl(this.s3, 45u32);
+        this.s3 = rotl(this.s3, 45);
         return result;
     }
 }
@@ -93,8 +93,8 @@ implement trait RandomSource for struct Rng {
 /// guard is cheap.
 private function non_zero_state(a: u64, b: u64, c: u64, d: u64) -> Rng {
     mut r: Rng = Rng { s0: a, s1: b, s2: c, s3: d };
-    if (r.s0 == 0u64 && r.s1 == 0u64 && r.s2 == 0u64 && r.s3 == 0u64) {
-        r.s0 = 1u64;
+    if (r.s0 == 0 && r.s1 == 0 && r.s2 == 0 && r.s3 == 0) {
+        r.s0 = 1;
     }
     return r;
 }
@@ -102,14 +102,14 @@ private function non_zero_state(a: u64, b: u64, c: u64, d: u64) -> Rng {
 /// SplitMix64: advances `*state` and returns a well-mixed 64-bit value.
 /// Used to expand a single seed into xoshiro's 256-bit state.
 private function splitmix64(state: u64*) -> u64 {
-    *state = *state + 0x9E3779B97F4A7C15u64;
+    *state = *state + 0x9E3779B97F4A7C15;
     mut z: u64 = *state;
-    z = (z ^ (z >> 30u64)) * 0xBF58476D1CE4E5B9u64;
-    z = (z ^ (z >> 27u64)) * 0x94D049BB133111EBu64;
-    return z ^ (z >> 31u64);
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EB;
+    return z ^ (z >> 31);
 }
 
 /// Rotate `x` left by `k` bits (`k` in `1..=63`).
 private function rotl(x: u64, k: u32) -> u64 {
-    return (x << (k as u64)) | (x >> ((64u32 - k) as u64));
+    return (x << (k as u64)) | (x >> ((64 - k) as u64));
 }
