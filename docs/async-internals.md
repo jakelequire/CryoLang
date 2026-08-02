@@ -67,13 +67,13 @@ without breaking existing code.
 
 ## 4. Runtime shape (`stdlib/future/`)
 
-| Piece | Notes |
-|---|---|
-| `Future` / `Poll` / `Context` / `Waker` | `Output` is an associated type - a future has exactly one result type, mirroring `Iterator::Item`. `Waker` is a manual vtable (`wake_fn` / `clone_fn` / `drop_fn` / `data`), sidestepping `dyn`. |
-| `Executor` | Worker pool, ready queue, per-task atomic run-state. Under `--panic=unwind`, a `catch_unwind` boundary at each poll keeps one panicking task from taking down a worker; under the default `--panic=abort` the boundary is a plain call and a task panic aborts the process. **Async never *requires* unwind.** |
-| `Reactor` | One readiness interface on both platforms: `epoll` on Linux, `\Device\Afd` + `IOCTL_AFD_POLL` + IOCP on Windows. Dedicated thread, one per `Executor`. |
-| `BlockingPool` | For work no readiness reactor can drive - `getaddrinfo` has no non-blocking form, and a regular file is always "ready" to `epoll`. Starts at zero threads, grows on demand to a configurable ceiling (default 512). Job blocks are refcounted, not handshaken: releasing a stored waker can reclaim the task, drop the future, and release the same block re-entrantly. |
-| `Sleep`, combinators | Deadline chain on the reactor. `join` / `try_join` / `select` / `timeout`, arity 2, nesting for higher arities. |
+| Piece                                   | Notes                                                                                                                                                                                                                                                                                                                                                                   |
+| --------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Future` / `Poll` / `Context` / `Waker` | `Output` is an associated type - a future has exactly one result type, mirroring `Iterator::Item`. `Waker` is a manual vtable (`wake_fn` / `clone_fn` / `drop_fn` / `data`), sidestepping `dyn`.                                                                                                                                                                        |
+| `Executor`                              | Worker pool, ready queue, per-task atomic run-state. Under `--panic=unwind`, a `catch_unwind` boundary at each poll keeps one panicking task from taking down a worker; under the default `--panic=abort` the boundary is a plain call and a task panic aborts the process. **Async never *requires* unwind.**                                                          |
+| `Reactor`                               | One readiness interface on both platforms: `epoll` on Linux, `\Device\Afd` + `IOCTL_AFD_POLL` + IOCP on Windows. Dedicated thread, one per `Executor`.                                                                                                                                                                                                                  |
+| `BlockingPool`                          | For work no readiness reactor can drive - `getaddrinfo` has no non-blocking form, and a regular file is always "ready" to `epoll`. Starts at zero threads, grows on demand to a configurable ceiling (default 512). Job blocks are refcounted, not handshaken: releasing a stored waker can reclaim the task, drop the future, and release the same block re-entrantly. |
+| `Sleep`, combinators                    | Deadline chain on the reactor. `join` / `try_join` / `select` / `timeout`, arity 2, nesting for higher arities.                                                                                                                                                                                                                                                         |
 
 **Cancellation is a plain drop.** Releasing a `Select` loser or a `Timeout` victim is what disarms a
 `Sleep` and releases an I/O registration. There is no cancellation protocol to implement in a future
@@ -93,14 +93,14 @@ beyond a correct `Drop`.
 
 ## 6. Diagnostics
 
-| Code | Rejects |
-|---|---|
+| Code    | Rejects                                                                                                                                                       |
+| ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `E0455` | A reference or frame address live across a suspension; an async method awaited on a receiver that names no storage; a method future stored and awaited later. |
-| `E0459` | Moving a future after it has been polled. |
-| `E0453` | Moving a carried value out from behind its in-place pointer (the give-away rules). |
-| `E0364` | `async` combined with `virtual`/`override`; async constructors, destructors, fields. |
-| `E0365` | A generic `async function main`, or a return type that is neither `i32` nor `void`. |
-| `E0600` | A future that would contain itself; unsupported async control flow. |
+| `E0459` | Moving a future after it has been polled.                                                                                                                     |
+| `E0453` | Moving a carried value out from behind its in-place pointer (the give-away rules).                                                                            |
+| `E0364` | `async` combined with `virtual`/`override`; async constructors, destructors, fields.                                                                          |
+| `E0365` | A generic `async function main`, or a return type that is neither `i32` nor `void`.                                                                           |
+| `E0600` | A future that would contain itself; unsupported async control flow.                                                                                           |
 
 ## 7. Known gaps
 
@@ -141,9 +141,3 @@ beyond a correct `Drop`.
   code defect.
 - Assert numbers and drop counts, not just success. Several carrier bugs passed a
   did-it-return-`Ok` test and failed a count-the-drops one.
-
-## 9. Where the history lives
-
-The full implementation record - every root cause, every rejected approach, session by session - is
-`ASYNC_IMPL.md`, which was retired once async landed. Recover it with
-`git show <sha>:ASYNC_IMPL.md`. This document is the distillate; the tracker is the evidence.
