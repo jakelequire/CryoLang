@@ -289,10 +289,15 @@ type struct JoinHandle<T> {
         // so it did not tear down). Move the result out, then free the
         // block without dropping the (now-moved-from) result storage.
         const rptr: T* = &(*shared).result;
-        const out: T = *rptr;
-        mut alloc: GlobalAlloc = GlobalAlloc::new();
-        alloc.deallocate(NonNull::new(shared as u8*), Layout::of<Shared<T>>());
-        return out;
+        // Destructive read: `deallocate` releases the block as raw bytes and
+        // runs no drop glue over `result`, so the value moved out here has
+        // exactly one owner.  The read and the free are a single sequence.
+        unsafe {
+            const out: T = *rptr;
+            mut alloc: GlobalAlloc = GlobalAlloc::new();
+            alloc.deallocate(NonNull::new(shared as u8*), Layout::of<Shared<T>>());
+            return out;
+        }
     }
 
     /// Detach: give up the ability to join. The thread runs to
