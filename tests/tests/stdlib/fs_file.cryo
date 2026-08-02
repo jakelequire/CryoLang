@@ -1,6 +1,6 @@
 ///! File - open/create, write->read round-trip, seek, error paths.
 ///!
-///! Each test owns a PID-unique file under /tmp and unlinks it before
+///! Each test owns a PID-unique file under the OS temp dir and unlinks it before
 ///! returning, so the suite leaves no residue and tolerates concurrent
 ///! runs on the same machine.
 
@@ -21,10 +21,25 @@ import std::ffi::libc;
 import std::test::error;
 import std::test::assert;
 
-// Fill `buf` with "/tmp/cryo_fs_<tag>_<pid>.dat" and return a Path over
+// Scratch directory for test files.  A hardcoded "/tmp" is not portable:
+// on Windows it resolves against the current drive, so a checkout on any
+// drive without a top-level \tmp (a CI workspace on D:, say) fails every
+// create.  Take the OS temp directory instead.
+![target(linux)]
+function temp_root() -> u8* { return "/tmp" as u8*; }
+
+![target(windows)]
+function temp_root() -> u8* {
+    const t: u8* = libc::getenv("TEMP" as u8*);
+    if (t != null) { return t; }
+    return "C:/Windows/Temp" as u8*;
+}
+
+// Fill `buf` with "<temp>/cryo_fs_<tag>_<pid>.dat" and return a Path over
 // it.  The Path borrows `buf`, so the caller must keep it alive.
 function temp_path(buf: i8*, tag: string) -> Path {
-    const n: i32 = intrinsics::snprintf(buf, 96, "/tmp/cryo_fs_%s_%d.dat", tag, libc::getpid());
+    const n: i32 = intrinsics::snprintf(buf, 256, "%s/cryo_fs_%s_%d.dat",
+                                        temp_root(), tag, libc::getpid());
     return Path::from(Str::from_raw(buf as u8*, n as u64));
 }
 
@@ -49,7 +64,7 @@ function slices_eq(a: Slice<u8>, b: Slice<u8>) -> boolean {
 
 ![test]
 function write_then_read_roundtrip() -> Result<(), TestError> {
-    mut namebuf: i8[96];
+    mut namebuf: i8[256];
     const p: Path = temp_path(&namebuf[0], "roundtrip");
     const payload: Str = Str::new("Hello, Cryo!\n");
 
@@ -90,7 +105,7 @@ function write_then_read_roundtrip() -> Result<(), TestError> {
 
 ![test]
 function seek_set_reads_from_offset() -> Result<(), TestError> {
-    mut namebuf: i8[96];
+    mut namebuf: i8[256];
     const p: Path = temp_path(&namebuf[0], "seek");
     const payload: Str = Str::new("Hello, Cryo!\n");   // 'C' is at offset 7
 
@@ -137,7 +152,7 @@ function seek_set_reads_from_offset() -> Result<(), TestError> {
 function seek_trait_positions_via_seekfrom() -> Result<(), TestError> {
     // Drive the same offsets through the `Seek` trait (`SeekFrom` +
     // `rewind`/`stream_position`) rather than the inherent `seek_*`.
-    mut namebuf: i8[96];
+    mut namebuf: i8[256];
     const p: Path = temp_path(&namebuf[0], "seektrait");
     const payload: Str = Str::new("Hello, Cryo!\n");   // 'C' at offset 7
 
@@ -193,8 +208,8 @@ function seek_trait_positions_via_seekfrom() -> Result<(), TestError> {
 
 ![test]
 function copy_duplicates_contents() -> Result<(), TestError> {
-    mut srcbuf: i8[96];
-    mut dstbuf: i8[96];
+    mut srcbuf: i8[256];
+    mut dstbuf: i8[256];
     const src: Path = temp_path(&srcbuf[0], "copy_src");
     const dst: Path = temp_path(&dstbuf[0], "copy_dst");
     const payload: Str = Str::new("copy me verbatim\n");   // 17 bytes
@@ -241,8 +256,8 @@ function copy_duplicates_contents() -> Result<(), TestError> {
 
 ![test]
 function copy_missing_source_errors() -> Result<(), TestError> {
-    mut srcbuf: i8[96];
-    mut dstbuf: i8[96];
+    mut srcbuf: i8[256];
+    mut dstbuf: i8[256];
     const src: Path = temp_path(&srcbuf[0], "copy_absent_src");
     const dst: Path = temp_path(&dstbuf[0], "copy_absent_dst");
     // Guarantee the source really is absent.
@@ -258,7 +273,7 @@ function copy_missing_source_errors() -> Result<(), TestError> {
 
 ![test]
 function open_nonexistent_errors() -> Result<(), TestError> {
-    mut namebuf: i8[96];
+    mut namebuf: i8[256];
     const p: Path = temp_path(&namebuf[0], "does_not_exist");
     // Make sure it really isn't there from a prior run.
     libc::unlink(&namebuf[0] as u8*);
@@ -273,7 +288,7 @@ function open_nonexistent_errors() -> Result<(), TestError> {
 
 ![test]
 function create_new_fails_when_exists() -> Result<(), TestError> {
-    mut namebuf: i8[96];
+    mut namebuf: i8[256];
     const p: Path = temp_path(&namebuf[0], "exclusive");
 
     // First create succeeds.
