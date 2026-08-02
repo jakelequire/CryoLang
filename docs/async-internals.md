@@ -104,12 +104,23 @@ beyond a correct `Drop`.
 
 ## 7. Known gaps
 
-- **Five forms the lowering does not walk:** an `unsafe` block, a tuple literal, `switch`, `static
-  match`, and `delete`. An `await` inside one is never counted as a suspension, so the body lowers
-  around it and the surviving node is rejected at codegen (`E0600`) rather than in sema. Loud, never
-  a miscompile. `rn_expr`/`rn_stmt` know all five; the other eight walkers know none - fixing it is a
-  sweep across all nine plus `lower_stmt_sm`, but `unsafe` needs a semantics call first (the block is
-  split across states, so the `unsafe` scope does not survive the explosion).
+- **One form the lowering does not walk: `switch`.** An `await` inside it is never counted as a
+  suspension, so the body lowers around it and the surviving node is rejected at codegen (`E0600`)
+  rather than in sema. Loud, never a miscompile. Left unwalked deliberately - `switch`/`case` is
+  frozen surface with no use anywhere in the compiler or stdlib, and is slated for removal.
+- **Two forms are counted and rejected in sema,** each with its own span and message, because
+  neither can survive the state explosion:
+  - An **`unsafe` block** is a scope, not a control-flow form. Split across resume points it would
+    end at the first suspend, and the operations it authorises after that would be checked as safe.
+  - A **`static match` arm** is selected by pruning the arms during monomorphization
+    (`mono/ast_resolver.cryo`), which runs *after* the body is lowered and the future's field set is
+    fixed. Lowering an arm would move its body out of the node into flat states, where pruning can
+    no longer drop the arms an instantiation did not pick - so every arm's code would reach codegen,
+    narrowed to a type that instantiation does not have. Supporting it means building the state
+    machine per instantiation rather than once on the template.
+- **A tuple literal and `delete` lower normally.** Both are ordinary value operands: the suspend
+  lifts out of them like any other, and anything to the left of it is lifted with it so effects keep
+  their source order.
 - **Give-away then reuse inside one state** is caught only in the straight-line case. The branchy and
   cross-state forms surface as a runtime `unwrap`-on-`None` panic, not a compile error, because once
   the value lives behind an `Option` reached by method calls, flow-sensitive move tracking of it is

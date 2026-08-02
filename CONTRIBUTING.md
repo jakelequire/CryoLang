@@ -49,21 +49,40 @@ Refresh **only** when `compiler/src/` has actually adopted something the
 existing pin can't handle. Do not refresh just because a new build exists -
 the pin is for compatibility, not freshness.
 
-### After a pin refresh or a Windows build: rebuild the runtime tiers
+### Where the runtime tiers land
 
-`runtime/.bin` is a **single flat directory shared by every target**. A Windows
-build - the second half of `make pin`, or the Windows half of
-`make selfhost-check` - overwrites the host tier archives with PE objects, and
-the host recipe that is supposed to re-establish them builds incrementally, sees
-its own objects unchanged, and skips the re-archive. The archives stay PE, and
-the next Linux build fails at link time with a wall of `undefined reference to
-RtlAllocateHeap` and `dangerous relocation: R_AMD64_IMAGEBASE`.
+The **cross**-built Windows tiers go to `runtime/.bin/x86_64-pc-windows-gnu/`,
+the **host** tiers to `runtime/.bin` itself. `runtime_dir_pick`
+(`compiler/src/compiler/codegen/passes.cryo`) looks in `<dir>/<triple>` before
+falling back to `<dir>`, so each is found for its own target and a cross build
+no longer overwrites the host archives.
 
-Deleting the directory is what forces the rebuild:
+The split is asymmetric on purpose. A cross build names its triple explicitly
+with `--target=`, which `resolve_effective_triple` hands back verbatim, so the
+directory name is guaranteed to be the one the lookup will use. A **native**
+build has no such guarantee - its triple comes from a probe of the installed
+toolchain (on Windows, whether an mingw `gcc` or an MSVC linker is on `PATH`) -
+so the build system cannot predict the name and the host tiers stay flat.
+
+Before this split, a Windows build - the second half of `make pin`, or the
+Windows half of `make selfhost-check` - overwrote the host tier archives with PE
+objects, and the host recipe that should re-establish them builds
+incrementally, sees its own objects unchanged, and skips the re-archive. The
+archives stayed PE and the next Linux build failed at link time with a wall of
+`undefined reference to RtlAllocateHeap` and `dangerous relocation:
+R_AMD64_IMAGEBASE`. If you ever see that, the flat directory is holding the
+wrong target's objects; deleting it forces the rebuild:
 
 ```bash
 rm -rf runtime/.bin && make runtime-tiers
 ```
+
+Note that `make selfhost-check`'s Windows chain still writes the flat directory
+(it is a native build, so it cannot name its own triple). On a Windows host,
+where the native triple is also `x86_64-pc-windows-gnu`, the per-triple
+directory left behind by `make pin` takes precedence over the flat one - so
+after editing anything under `runtime/`, remove it as well to be sure your
+change is what gets linked.
 
 `file` on the archive does not tell you which target it holds - it prints
 `current ar archive` either way. Check a member:

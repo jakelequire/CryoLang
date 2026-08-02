@@ -1,0 +1,30 @@
+// E0600: an `await` inside a `static match` arm is rejected.
+//
+// A `static match` picks its arm by pruning the arms during monomorphization,
+// which runs after the async lowering has already exploded the body into states
+// and built the future's field set. Lowering an arm would move its body out of
+// the node into flat states, where pruning can no longer drop the arms this
+// instantiation did not pick — so every arm's code would reach codegen, narrowed
+// to a type that instantiation does not have.
+//
+// The suspend does not depend on the arm, so the rewrite is to lift it out:
+//   const v: i64 = await f();
+//   static match (T) { … }
+![config(testing)]
+![config(negative, E0600)]
+namespace CryoTests::Negative::E0600AwaitInStaticMatchArm;
+
+import std::future;
+
+async function ready_one(v: i64) -> i64 {
+    return await PendingThenReady<i64>::new(1, v);
+}
+
+async function picks<T>(v: T) -> i64 {
+    static match (T) {                           //~ ERROR[E0600] async: an `await` inside a `static match` arm is not supported
+        i64 => { return await ready_one(41) + 1; }
+        _   => { return 0; }
+    }
+}
+
+function main() -> int { return 0; }

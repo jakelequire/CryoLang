@@ -1007,6 +1007,28 @@ type struct AsyncLower {
             }
             return n;
         }
+        if (k == NodeKind::TupleLiteral) {
+            const tl: TupleLiteralNode* = e as TupleLiteralNode*;
+            mut n: i64 = 0;
+            for (mut i: i64 = 0; i < tl.elements.length; i++) {
+                n += this.expr_await_count(tl.elements[i]);
+            }
+            return n;
+        }
+        // Every arm counts, not just the one an instantiation keeps: the arms
+        // are pruned during monomorphization, long after this runs, so the
+        // suspend has to be seen here whichever arm holds it.
+        if (k == NodeKind::StaticMatchExpression) {
+            const sme: StaticMatchExprNode* = e as StaticMatchExprNode*;
+            mut n: i64 = 0;
+            for (mut i: i64 = 0; i < sme.arms.length; i++) {
+                if (sme.arms[i] != null) { n += this.stmt_await_count(sme.arms[i].body); }
+            }
+            return n;
+        }
+        if (k == NodeKind::DeleteExpression) {
+            return this.expr_await_count((e as DeleteExprNode*).operand);
+        }
         // A lambda body is a separate function: an `await` in one belongs to
         // that function, not to this one, and counting it here would make this
         // body try to explode a suspend it does not contain.
@@ -1049,6 +1071,20 @@ type struct AsyncLower {
         }
         if (k == NodeKind::BlockStatement) {
             return this.block_await_count(stmt as BlockStmtNode*);
+        }
+        // Counted so the suspend is SEEN and the function still takes the async
+        // path; `lower_stmt_sm` then rejects it with its own span rather than
+        // letting an unwalked `await` reach codegen with no state to resume.
+        if (k == NodeKind::UnsafeBlockStatement) {
+            return this.block_await_count((stmt as UnsafeBlockStmtNode*).block);
+        }
+        if (k == NodeKind::StaticMatchStatement) {
+            const sms: StaticMatchStmtNode* = stmt as StaticMatchStmtNode*;
+            mut n: i64 = 0;
+            for (mut i: i64 = 0; i < sms.arms.length; i++) {
+                if (sms.arms[i] != null) { n += this.stmt_await_count(sms.arms[i].body); }
+            }
+            return n;
         }
         if (k == NodeKind::IfStatement) {
             const iff: IfStmtNode* = stmt as IfStmtNode*;
@@ -1408,6 +1444,26 @@ type struct AsyncLower {
                 if (this.name_read_in_expr(sl.field_inits[i].value, name)) { return true; }
             }
             return false;
+        }
+        // An element list reads its elements. Missing one here answers "not
+        // read" for a carried local mentioned only inside a literal, which is
+        // what `expr_first_use` turns into a give-away/hand-back decision.
+        if (k == NodeKind::ArrayLiteral) {
+            const al: ArrayLiteralNode* = e as ArrayLiteralNode*;
+            for (mut i: i64 = 0; i < al.elements.length; i++) {
+                if (this.name_read_in_expr(al.elements[i], name)) { return true; }
+            }
+            return false;
+        }
+        if (k == NodeKind::TupleLiteral) {
+            const tl: TupleLiteralNode* = e as TupleLiteralNode*;
+            for (mut i: i64 = 0; i < tl.elements.length; i++) {
+                if (this.name_read_in_expr(tl.elements[i], name)) { return true; }
+            }
+            return false;
+        }
+        if (k == NodeKind::DeleteExpression) {
+            return this.name_read_in_expr((e as DeleteExprNode*).operand, name);
         }
         if (k == NodeKind::AwaitExpression) {
             return this.name_read_in_expr((e as AwaitExprNode*).operand, name);
@@ -2173,6 +2229,28 @@ type struct AsyncLower {
         if (k == NodeKind::ForStatement)     { return this.lower_for_sm(sm, stmt as ForStmtNode*, cur); }
         if (k == NodeKind::LoopStatement)    { return this.lower_loop_sm(sm, stmt as LoopStmtNode*, cur); }
         if (k == NodeKind::MatchStatement)   { return this.lower_match_sm(sm, stmt as MatchStmtNode*, cur); }
+        // A `static match` arm is chosen by pruning the arms during
+        // monomorphization, which runs after this. Exploding an arm here would
+        // move its body out of the node into flat states, where pruning can no
+        // longer drop the arms this instantiation did not pick — so every arm's
+        // code would reach codegen, narrowed to a type it does not have.
+        if (k == NodeKind::StaticMatchStatement) {
+            this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
+                "async: an `await` inside a `static match` arm is not supported — the arms are selected after the body is lowered, so the suspend cannot be placed; bind it to a `const` ahead of the `static match`",
+                stmt.span);
+            sm.ok = false;
+            return cur;
+        }
+        // An `unsafe` block is a scope, not a control-flow form: exploding it
+        // would spread its statements over states the scope cannot reach, so
+        // the operations it authorises would be checked as safe.
+        if (k == NodeKind::UnsafeBlockStatement) {
+            this.ctx.emit_error_at(ErrorCode::E0600_CODEGEN_FAILED,
+                "async: an `await` inside an `unsafe` block is not supported — the block is split at each resume point, so the `unsafe` scope cannot span it; move the `await` ahead of the block",
+                stmt.span);
+            sm.ok = false;
+            return cur;
+        }
         // No `await` here means the statement was exploded for its `break`/
         // `continue` alone, and the only expression form that can hold one is a
         // `match` used as an expression. Its arms are part of an expression, so
@@ -5432,6 +5510,23 @@ type struct AsyncLower {
                 al.elements[i] = this.hoist_operand(
                     al.elements[i], this.args_await_after(&al.elements, i + 1), pre);
             }
+            return e;
+        }
+
+        if (k == NodeKind::TupleLiteral) {
+            mut tl: TupleLiteralNode* = e as TupleLiteralNode*;
+            for (mut i: i64 = 0; i < tl.elements.length; i++) {
+                tl.elements[i] = this.hoist_operand(
+                    tl.elements[i], this.args_await_after(&tl.elements, i + 1), pre);
+            }
+            return e;
+        }
+
+        // `delete` reads its operand for the pointer value it frees, so the
+        // await lifts out of it like any other value operand.
+        if (k == NodeKind::DeleteExpression) {
+            mut dl: DeleteExprNode* = e as DeleteExprNode*;
+            dl.operand = this.hoist_expr(dl.operand, pre);
             return e;
         }
 

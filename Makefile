@@ -543,30 +543,46 @@ endif
 # `runtime/hosted/` rebuilds the abort tier with `no_runtime = false` so its
 # `__cryo_panic` exits through libc (flushing stdio) instead of a raw syscall.
 # Both write into runtime/.bin, so one directory holds every tier.
+#
+# `--no-incremental` is load-bearing, not tidiness.  The incremental cache tracks
+# SOURCE freshness and not the target the objects were built for, so after the
+# flat directory has been left holding another target's archives this target
+# reports `cryort-core is up to date`, skips the re-archive, and exits 0 with the
+# wrong objects still in place - measured in both directions.  A native build
+# cannot use the per-triple directory that protects `runtime-tiers-win` (its
+# triple comes from a toolchain probe, so the name is unpredictable), so forcing
+# the re-emit is what makes the host archives always match the host.  The tier
+# sources are small; this costs seconds.
 ifeq ($(HOST_OS),windows)
 runtime-tiers:
 	@echo "==> Building runtime tiers via bin/cryo.exe"
-	@cd runtime && "$(subst /,\,$(PIN_EXE))" build
-	@cd runtime\hosted && "$(subst /,\,$(PIN_EXE))" build
+	@cd runtime && "$(subst /,\,$(PIN_EXE))" build --no-incremental
+	@cd runtime\hosted && "$(subst /,\,$(PIN_EXE))" build --no-incremental
 else
 runtime-tiers: $(PIN)
 	@echo "==> Building runtime tiers via bin/cryo"
-	@cd runtime && "$(PIN)" build
-	@cd runtime/hosted && "$(PIN)" build
+	@cd runtime && "$(PIN)" build --no-incremental
+	@cd runtime/hosted && "$(PIN)" build --no-incremental
 endif
 
-# The same tiers cross-built for the windows triple, for `cryo-exe`.  A project's
-# artifacts hoist to the root of its output_dir, so this OVERWRITES the host
-# archives in runtime/.bin rather than sitting beside them - which is safe only
-# because the two are never needed at once: `pin` finishes the whole host half
-# before `cryo-exe` runs, and the next host build re-establishes them through
-# `runtime-tiers`.  Skipped (not failed) without the cross toolchain, matching
-# how `pin-windows-impl` treats a Linux-only checkout.
+# The same tiers cross-built for the windows triple, for `cryo-exe`.  These land
+# in a per-triple subdirectory rather than beside the host archives: a project's
+# artifacts hoist to the root of its output_dir, so writing them flat OVERWROTE
+# the host tiers with PE objects and the next host link died on
+# `undefined reference to RtlAllocateHeap`.  `runtime_dir_pick`
+# (codegen/passes.cryo) already looks in `<dir>/<triple>` before falling back to
+# `<dir>`, so the cross tiers are found here and the host ones keep the flat
+# path.  The triple is safe to spell here because an explicit `--target=` is
+# returned verbatim by `resolve_effective_triple` - it is the same string the
+# lookup will use.  A NATIVE build must stay flat: its triple comes from a probe
+# of the host toolchain, so the build system cannot predict the directory name.
+# Skipped (not failed) without the cross toolchain, matching how
+# `pin-windows-impl` treats a Linux-only checkout.
 runtime-tiers-win: $(PIN)
 	@if command -v $(MINGW_GCC) >/dev/null 2>&1; then \
 		echo "==> Building runtime tiers for $(WIN_TRIPLE) via bin/cryo"; \
-		( cd runtime && "$(PIN)" build --target=$(WIN_TRIPLE) --no-incremental >/dev/null ); \
-		( cd runtime/hosted && "$(PIN)" build --target=$(WIN_TRIPLE) --no-incremental >/dev/null ); \
+		( cd runtime && "$(PIN)" build --target=$(WIN_TRIPLE) --no-incremental --build-dir=.bin/$(WIN_TRIPLE) >/dev/null ); \
+		( cd runtime/hosted && "$(PIN)" build --target=$(WIN_TRIPLE) --no-incremental --build-dir=../.bin/$(WIN_TRIPLE) >/dev/null ); \
 	else \
 		echo "==> [skip] windows runtime tiers: $(MINGW_GCC) absent."; \
 	fi
