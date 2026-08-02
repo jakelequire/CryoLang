@@ -177,6 +177,45 @@ function await_assigned_into_a_field() -> Result<(), TestError> {
     return expect_eq(future::block_on(member_assignment()), 42 as i64);
 }
 
+async function tuple_literal_element() -> i64 {
+    const p: (i64, i64) = (40, await aw_one(2));
+    return p.0 + p.1;
+}
+
+![test]
+function await_in_a_tuple_literal_element() -> Result<(), TestError> {
+    return expect_eq(future::block_on(tuple_literal_element()), 42 as i64);
+}
+
+async function tuple_literal_two_elements() -> i64 {
+    const p: (i64, i64) = (await aw_one(40), await aw_one(2));
+    return p.0 + p.1;
+}
+
+![test]
+function two_awaits_in_one_tuple_literal() -> Result<(), TestError> {
+    return expect_eq(future::block_on(tuple_literal_two_elements()), 42 as i64);
+}
+
+// `delete` reads its operand for the pointer value it frees, so a suspend there
+// lifts out like any other value operand.
+async function aw_alloc(n: i32) -> u8* {
+    const v: i64 = await aw_one(7);
+    mut b: u8* = new u8[n];
+    b[0] = v as u8;
+    return b;
+}
+
+async function delete_awaited_pointer() -> i64 {
+    delete await aw_alloc(8);
+    return 42;
+}
+
+![test]
+function await_in_a_delete_operand() -> Result<(), TestError> {
+    return expect_eq(future::block_on(delete_awaited_pointer()), 42 as i64);
+}
+
 // ---- order: an effect left of a lifted `await` stays left of it ----
 
 async function order_call_then_await() -> i64 {
@@ -200,6 +239,21 @@ function effects_around_an_await_keep_source_order() -> Result<(), TestError> {
     aw_reset();
     const v: i64 = future::block_on(order_three_arguments());
     return aw_both(expect_eq(v, 6 as i64), expect_eq(aw_trace, 123 as i64));
+}
+
+async function order_tuple_elements() -> i64 {
+    const p: (i64, i64) = (aw_mark(1), await aw_mark_async(2));
+    return p.0 + p.1;
+}
+
+// Lifting the element's `await` above the tuple must carry the element to its
+// left with it; leaving it behind would run `aw_mark(1)` after the suspend and
+// trace 21 while still adding up to 3.
+![test]
+function an_effect_left_of_an_await_in_a_tuple_stays_left() -> Result<(), TestError> {
+    aw_reset();
+    const v: i64 = future::block_on(order_tuple_elements());
+    return aw_both(expect_eq(v, 3 as i64), expect_eq(aw_trace, 12 as i64));
 }
 
 // ---- conditionality: `&&` / `||` ----
