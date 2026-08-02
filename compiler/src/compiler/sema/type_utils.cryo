@@ -66,6 +66,16 @@ type struct TypeUtils {
         return this.ctx.decl_index.lookup_global(name);
     }
 
+    /// The global `name` as declared by the module named by `scope_leaf`, for a
+    /// qualified `scope_leaf::name` reference. Invalid when no single module
+    /// matches, leaving the caller its existing fallback.
+    lookup_global_in_scope(&this, name: SymbolStr, scope_leaf: SymbolStr,
+                           out_ns: SymbolStr*) -> TypeRef {
+        mut module: SymbolStr = SymbolStr::empty();
+        return this.ctx.decl_index.find_global_in_scope(name, scope_leaf, this.intern,
+                                                        out_ns, &module);
+    }
+
     lookup_method_return(&this, type_sym: SymbolStr, method_sym: SymbolStr) -> TypeRef {
         return this.canonicalize_method_return(
             this.lookup_method_return_raw(type_sym, method_sym));
@@ -146,6 +156,17 @@ type struct TypeUtils {
             }
             const base: SymbolStr = this.ctx.decl_index.lookup_type_name(inst.generic_base);
             if (base.is_valid()) { return base; }
+        }
+        // A dynamic array shares the `Array_<T>` method/layout registry, but its
+        // TypeRef is not canonical (many TypeRefs describe the same `T[]`), so the
+        // TypeRef-keyed `direct` lookup above misses. Resolve its name by ELEMENT
+        // type, the canonical key - the same mapping codegen dispatches through.
+        // Without this a `T[]` receiver has no name, so method resolution can't
+        // find `pop`/`push`/etc. on it and (for a value use like
+        // `const x = arr.pop()`) silently falls through unresolved instead of
+        // resolving to the real return type (`pop -> Option<T>`) or erroring.
+        if (t != null && t.kind == TypeKind::Array && (t as ArrayType*).is_dynamic()) {
+            return this.ctx.decl_index.lookup_array_type_name((t as ArrayType*).element);
         }
         return SymbolStr::empty();
     }
@@ -287,6 +308,86 @@ type struct TypeUtils {
         return null;
     }
 
+    // -- Generic-identity views (carrier-free) ---------------------------------
+    //
+    // These answer "what generic instantiation is this?" for BOTH a pre-mono
+    // `InstantiatedType` wrapper and a post-mono concrete aggregate, WITHOUT
+    // routing through the origin carrier: a wrapper answers from its own node, a
+    // concrete from its intrinsic `generic_base` / `type_args`.  Pointer and
+    // Reference layers are peeled.
+    //
+    // A monomorphized type answers these from its own fields; there is no side
+    // node to consult and none to forget.
+
+    /// The template `ty` is an instantiation of, or invalid.
+    view_generic_base(&this, ty: TypeRef) -> TypeRef {
+        if (!ty.is_valid()) { return TypeRef::invalid(); }
+        const t: Type* = this.arena.lookup(ty.id);
+        if (t == null) { return TypeRef::invalid(); }
+        if (t.kind == TypeKind::Reference) {
+            return this.view_generic_base((t as ReferenceType*).referent);
+        }
+        if (t.kind == TypeKind::Pointer) {
+            return this.view_generic_base((t as PointerType*).pointee);
+        }
+        return this.arena.inst_generic_base(ty);
+    }
+
+    /// Number of type arguments `ty` carries as an instantiation (0 if none).
+    view_type_arg_count(&this, ty: TypeRef) -> i64 {
+        if (!ty.is_valid()) { return 0; }
+        const t: Type* = this.arena.lookup(ty.id);
+        if (t == null) { return 0; }
+        if (t.kind == TypeKind::Reference) {
+            return this.view_type_arg_count((t as ReferenceType*).referent);
+        }
+        if (t.kind == TypeKind::Pointer) {
+            return this.view_type_arg_count((t as PointerType*).pointee);
+        }
+        return this.arena.inst_type_arg_count(ty);
+    }
+
+    /// The `i`-th type argument of `ty` as an instantiation, or invalid.
+    view_type_arg_at(&this, ty: TypeRef, i: i64) -> TypeRef {
+        if (!ty.is_valid() || i < 0) { return TypeRef::invalid(); }
+        const t: Type* = this.arena.lookup(ty.id);
+        if (t == null) { return TypeRef::invalid(); }
+        if (t.kind == TypeKind::Reference) {
+            return this.view_type_arg_at((t as ReferenceType*).referent, i);
+        }
+        if (t.kind == TypeKind::Pointer) {
+            return this.view_type_arg_at((t as PointerType*).pointee, i);
+        }
+        return this.arena.inst_type_arg_at(ty, i);
+    }
+
+    /// The CONCRETE specialization denoted by `ty` when `ty` is an instantiation:
+    /// a post-mono concrete is already it (single-id identity), a pre-mono wrapper
+    /// yields its `resolved_type`.  Invalid when `ty` is a wrapper that has not
+    /// been monomorphized yet.
+    view_concrete_of(&this, ty: TypeRef) -> TypeRef {
+        if (!ty.is_valid()) { return TypeRef::invalid(); }
+        const t: Type* = this.arena.lookup(ty.id);
+        if (t == null) { return TypeRef::invalid(); }
+        if (t.kind == TypeKind::InstantiatedType) {
+            const inst: InstantiatedType* = t as InstantiatedType*;
+            if (inst.has_resolved_type()) { return inst.resolved_type; }
+            return TypeRef::invalid();
+        }
+        if (this.arena.inst_generic_base(ty).is_valid()) { return ty; }
+        return TypeRef::invalid();
+    }
+
+    /// Copy `ty`'s instantiation type arguments into a fresh owned array.
+    /// Element-wise by construction - never hand back a borrow of the type's own
+    /// buffer, which would be freed twice.
+    view_type_args_copy(&this, ty: TypeRef) -> TypeRef[] {
+        mut out: TypeRef[] = [];
+        const n: i64 = this.view_type_arg_count(ty);
+        for (mut i: i64 = 0; i < n; i++) { out.push(this.view_type_arg_at(ty, i)); }
+        return out;
+    }
+
     /// Peel Pointer / Reference / resolved-InstantiatedType wrappers (bounded
     /// depth) to the underlying base `Type*`, or null if an instantiation is
     /// still unresolved.
@@ -313,14 +414,14 @@ type struct TypeUtils {
         return t;
     }
 
-    /// The generic base of an InstantiatedType, or invalid.
+    /// The generic base of an instantiation, or invalid.
+    ///
+    /// Alias for `view_generic_base`: the whole contract of this function is
+    /// "give me what this is an instantiation OF", which a monomorphized type now
+    /// answers from its own intrinsic identity.  A bare `kind == InstantiatedType`
+    /// test here would return invalid for precisely the types callers ask about.
     generic_base_of(&this, ty: TypeRef) -> TypeRef {
-        if (!ty.is_valid()) { return TypeRef::invalid(); }
-        const t: Type* = this.arena.lookup(ty.id);
-        if (t == null || t.kind != TypeKind::InstantiatedType) {
-            return TypeRef::invalid();
-        }
-        return (t as InstantiatedType*).generic_base;
+        return this.view_generic_base(ty);
     }
 
     /// Pointee of a concrete pointer TypeRef, or invalid if not a pointer.
@@ -449,27 +550,16 @@ type struct TypeUtils {
         return true;
     }
 
-    /// Type identity tolerant of arena-id differences for the same named type:
-    /// under single-file `check`, a generic instantiation can carry a nominal
-    /// whose arena id differs from the one a binding resolves to.  Falls back to
-    /// comparing qualified names for struct/class/enum.
+    /// Type identity: plain arena-id equality.
+    ///
+    /// Plain id equality, with no name-based fallback for struct/class/enum:
+    /// nominals are keyed by qualified name in the arena and compound types are
+    /// interned structurally, so one semantic type has exactly one id.
     types_equivalent(&this, a: TypeRef, b: TypeRef) -> boolean {
-        if (a.id == b.id) { return true; }
-        const ta: Type* = this.arena.lookup(a.id);
-        const tb: Type* = this.arena.lookup(b.id);
-        if (ta == null || tb == null) { return false; }
-        if (ta.kind != tb.kind) { return false; }
-        if (ta.kind == TypeKind::Struct || ta.kind == TypeKind::Class ||
-            ta.kind == TypeKind::Enum) {
-            const qa: SymbolStr = this.arena.get_qualified_name(a);
-            const qb: SymbolStr = this.arena.get_qualified_name(b);
-            return qa.is_valid() && qb.is_valid() && qa.equals(qb);
-        }
-        return false;
+        return a.id == b.id;
     }
 
-    /// True when `t` is a pointer/reference whose pointee is the same type as `v`
-    /// (by id or, robustly, by qualified name).
+    /// True when `t` is a pointer/reference whose pointee is the same type as `v`.
     is_ptr_or_ref_to(&this, t: TypeRef, v: TypeRef) -> boolean {
         const ty: Type* = this.arena.lookup(t.id);
         if (ty == null) { return false; }

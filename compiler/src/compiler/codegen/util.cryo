@@ -10,8 +10,8 @@ namespace Compiler::Codegen::Util;
 import Compiler::AST;
 import Compiler::AST::{ Node, Declaration };
 import Compiler::Types;
-import Compiler::Types::{ TypeRef, Type, Arena };
-import Compiler::Resolver::{ SymbolStr, InternTable };
+import Compiler::Types::{ TypeRef, Type };
+import Compiler::Resolver::{ SymbolStr };
 
 
 // VTable slot identity
@@ -40,7 +40,7 @@ type struct CodegenUtil {
     /// constants via `LLVMConstIntOfString`, which takes digits + radix rather
     /// than a 64-bit value (so it doesn't truncate literals above `u64::MAX`).
     static int_literal_clean(s: string, out_radix: u8*) -> string {
-        *out_radix = 10u8;
+        *out_radix = 10;
         if (s == null) { return "0"; }
         const len: i64 = s.length() as i64;
         mut i: i64 = 0;
@@ -48,12 +48,12 @@ type struct CodegenUtil {
         // tolerate it defensively.
         if (len > 0 && (*(s + 0) as char == '-' || *(s + 0) as char == '+')) { i = 1; }
 
-        mut base: u8 = 10u8;
+        mut base: u8 = 10;
         if (i + 1 < len && (*(s + i) as char) == '0') {
             const p: char = *(s + i + 1) as char;
-            if (p == 'x' || p == 'X')      { base = 16u8; i += 2; }
-            else if (p == 'b' || p == 'B') { base = 2u8;  i += 2; }
-            else if (p == 'o' || p == 'O') { base = 8u8;  i += 2; }
+            if (p == 'x' || p == 'X')      { base = 16; i += 2; }
+            else if (p == 'b' || p == 'B') { base = 2;  i += 2; }
+            else if (p == 'o' || p == 'O') { base = 8;  i += 2; }
         }
 
         mut buf: string = intrinsics::malloc(len + 1) as string;
@@ -222,28 +222,20 @@ type struct CodegenUtil {
 
     // VTable slot identity
 
-    /// Structural equality on two param-type lists, going through the arena so
-    /// two TypeRefs that represent the same shape but happen to live under
-    /// different IDs (e.g., a `ASTVisitor*` registered while ASTVisitor was
-    /// still a forward declaration vs after the body resolved) compare equal.
-    /// Vtable slot matching needs this lenience because override methods
-    /// declared in a subclass may resolve their parameter types in a slightly
-    /// different resolution context than the virtual base they override.  IDs
-    /// that already match short-circuit; otherwise the arena canonicalizes the
-    /// types and they're compared by formatted display.
-    static param_types_equal_structural(arena: TypeArena*, intern: InternTable*,
-                                        a: &TypeRef[], b: &TypeRef[]) -> boolean {
+    /// Equality on two param-type lists: same arity, and element-wise equal
+    /// arena ids.
+    ///
+    /// A plain id compare is sufficient because type ids are canonical - the
+    /// arena's structural interner guarantees one id per semantic type, so two
+    /// `TypeRef`s denoting the same shape ARE the same id no matter which
+    /// resolution context minted them.  Vtable slot matching depends on that:
+    /// an override's parameter `Foo*` and the virtual base's `Foo*` must
+    /// compare equal even when one was registered while `Foo` was still a
+    /// forward declaration.
+    static param_types_equal(a: &TypeRef[], b: &TypeRef[]) -> boolean {
         if (a.length != b.length) { return false; }
         for (mut i: i64 = 0; i < a.length; i++) {
-            if (a[i].id == b[i].id) { continue; }
-            // Two distinct IDs are still "equal" here when they render to the
-            // same display (e.g. two PointerType IDs at the same nominal class):
-            // display names are the canonical source-level identity.  Compare
-            // structurally via `display_equal` rather than formatting both to
-            // Strings: format-and-compare would be the single biggest heap
-            // consumer in a self-host build (~470 MB of transient display
-            // Strings on this per-call vtable-slot path).
-            if (!arena.display_equal(a[i].id, b[i].id)) { return false; }
+            if (a[i].id != b[i].id) { return false; }
         }
         return true;
     }

@@ -1,0 +1,102 @@
+///! sockaddr_in packing/unpacking + socket-option helpers.
+///!
+///! Both `net::socket::tcp` and `net::socket::udp` translate between Cryo's
+///! `SocketAddr` and the platform `struct sockaddr_in`; this module is
+///! the shared, single home for that conversion plus the `timeval`
+///! packing behind `SO_RCVTIMEO` / `SO_SNDTIMEO`.
+///!
+///! `sockaddr_in` is packed by hand: 16 bytes, family + port + addr
+///! + 8 bytes padding, port/addr in network byte order. That avoids
+///! needing cryoc to model C struct layouts for every sockaddr
+///! variant. The inverse, `unpack_sockaddr_in`, reads those same
+///! offsets back out of a kernel-filled buffer (e.g. from `recvfrom`
+///! or `getsockname`).
+
+namespace std::net::addr::sockaddr;
+
+import core::option;
+import core::result;
+import io::error;
+import net::addr::ip;
+import net::addr::socket_addr;
+
+// `SO_RCVTIMEO`/`SO_SNDTIMEO` settings live in `net::sys::set_timeout`: the
+// option format - `struct timeval` vs a Windows DWORD - and the SO_* constant
+// values are platform-specific, so they belong with the other gated socket
+// primitives.
+
+/// AF_INET6 family value (host byte order): 10 on Linux glibc, 23 on
+/// Win32 Winsock. The `sockaddr_in6` layout is otherwise identical
+/// (28 bytes) on both, so only this value differs per OS.
+![target(unix)]
+function af_inet6() -> u16 { return 10; }
+![target(windows)]
+function af_inet6() -> u16 { return 23; }
+
+/// Pack a `SocketAddr` into a `sockaddr_in` (16 bytes, IPv4) or
+/// `sockaddr_in6` (28 bytes, IPv6) buffer. Returns the number of bytes
+/// written. The caller must supply a buffer of at least 28 bytes so the
+/// v6 path fits.
+function pack_sockaddr_in(out: u8*, addr: &SocketAddr) -> Result<u32, IoError> {
+    match (addr.ip) {
+        IpAddr::V4(v4) => {
+            // sin_family = AF_INET, host byte order
+            out[0] = 2;
+            out[1] = 0;
+            // sin_port, network byte order (big-endian)
+            out[2] = (addr.port >> 8) as u8;
+            out[3] = (addr.port & 0xFF) as u8;
+            // sin_addr, network byte order
+            out[4] = v4.a;
+            out[5] = v4.b;
+            out[6] = v4.c;
+            out[7] = v4.d;
+            // 8 bytes of sin_zero padding
+            mut i: u64 = 8;
+            while (i < 16) { out[i] = 0; i++; }
+            return Result::Ok(16);
+        }
+        IpAddr::V6(v6) => {
+            // sin6_family = AF_INET6, host byte order (low byte first on
+            // our little-endian targets).
+            const fam: u16 = af_inet6();
+            out[0] = (fam & 0xFF) as u8;
+            out[1] = (fam >> 8) as u8;
+            // sin6_port, network byte order
+            out[2] = (addr.port >> 8) as u8;
+            out[3] = (addr.port & 0xFF) as u8;
+            // sin6_flowinfo = 0 (offsets 4..8)
+            out[4] = 0; out[5] = 0; out[6] = 0; out[7] = 0;
+            // sin6_addr: 16 bytes, already network order in `segments`
+            mut j: u64 = 0;
+            while (j < 16) { out[8 + j] = v6.segments[j]; j++; }
+            // sin6_scope_id = 0 (offsets 24..28)
+            out[24] = 0; out[25] = 0; out[26] = 0; out[27] = 0;
+            return Result::Ok(28);
+        }
+    }
+}
+
+/// Read an IPv4 `sockaddr_in` back out of a kernel-filled buffer (the
+/// `recvfrom` source address, or `getsockname`'s local address). Reads
+/// `sin_port` (offset 2, big-endian) and `sin_addr` (offset 4, network
+/// order). The family at offset 0 is assumed `AF_INET`; the socket
+/// layer only ever creates v4 sockets, so a v6 reply can't appear here.
+function unpack_sockaddr_in(buf: u8*) -> SocketAddr {
+    const port: u16 = ((buf[2] as u16) << 8) | (buf[3] as u16);
+    const v4: IpV4Addr = IpV4Addr::new(buf[4], buf[5], buf[6], buf[7]);
+    return SocketAddr::new(IpAddr::V4(v4), port);
+}
+
+/// Unpack either a v4 `sockaddr_in` or a v6 `sockaddr_in6` from a
+/// kernel-filled buffer, dispatching on the family at offset 0. Used by
+/// `getsockname`-style readback where the socket may be either family.
+/// The buffer must be at least 28 bytes for the v6 case.
+function unpack_sockaddr(buf: u8*) -> SocketAddr {
+    const fam: u16 = (buf[0] as u16) | ((buf[1] as u16) << 8);
+    if (fam == af_inet6()) {
+        const port: u16 = ((buf[2] as u16) << 8) | (buf[3] as u16);
+        return SocketAddr::new(IpAddr::V6(IpV6Addr::from_buf(&buf[8])), port);
+    }
+    return unpack_sockaddr_in(buf);
+}

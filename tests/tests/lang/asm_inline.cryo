@@ -116,6 +116,51 @@ function immediate_operand() -> Result<(), TestError> {
     return expect_eq(r, 9);
 }
 
+// Pinned operand form `${x:"reg"}` / `${=x:"reg"}`: the operand is bound to
+// a SPECIFIC register through the constraint string (`{rcx}` / `={rax}` -
+// the AsmConstraintKind::Pinned arms in ir_generator.cryo), unlike
+// `pinned_register_and_clobber` above, which only names rax as literal
+// assembly text.  In the template a pinned operand substitutes as its
+// register name, so `mov rax, ${v:"rcx"}` assembles to `mov rax, rcx` - the
+// test proves the VALUE actually arrives in rcx and leaves from rax, which
+// is exactly what a syscall ABI needs (Low-Level Plan Stage 2 relies on
+// this form for the native syscall bodies).
+![test]
+function pinned_input_and_output_operands() -> Result<(), TestError> {
+    const v: i64 = 21;
+    mut out: i64 = 0;
+    ![arch(x86_64, intel)]
+    ![clobber(flags)]
+    asm {
+        mov rax, ${v:"rcx"}
+        add rax, ${v:"rcx"}
+        mov ${=out:"rax"}, rax
+    }
+    return expect_eq(out, 42);
+}
+
+// Several pinned inputs at once (the syscall-shape: distinct values each
+// pinned to a distinct register, combined into a pinned output).  If any
+// pin were mis-honored the sum would be wrong.
+![test]
+function pinned_multi_register_spread() -> Result<(), TestError> {
+    const a: i64 = 1000;
+    const b: i64 = 300;
+    const c: i64 = 30;
+    const d: i64 = 7;
+    mut out: i64 = 0;
+    ![arch(x86_64, intel)]
+    ![clobber(flags)]
+    asm {
+        mov rax, ${a:"rdi"}
+        add rax, ${b:"rsi"}
+        add rax, ${c:"rdx"}
+        add rax, ${d:"r10"}
+        mov ${=out:"rax"}, rax
+    }
+    return expect_eq(out, 1337);
+}
+
 // Arch gating: an `![arch(aarch64, ...)]` block must be dropped when
 // building x86_64, so `w` is left unchanged.  If gating regressed and the
 // block emitted as x86, `w` would become 10.

@@ -1,10 +1,12 @@
 ///! HTTP/2 client.
 ///!
-///! `connect` upgrades an established `Read + Write` stream to an HTTP/2
-///! client connection (preface + SETTINGS), generic over the transport
-///! so it serves h2c (`TcpStream`) and h2 (`TlsStream`) alike. The
-///! returned `Http2Connection` issues requests with `request`; reuse it
-///! for several sequential requests on the one connection.
+///! `connect` upgrades an established, buffered async transport to an HTTP/2
+///! client connection (preface + SETTINGS), generic over the transport so it
+///! serves h2c (`TcpStream`) and h2 (`TlsStream`) alike. It takes ownership of
+///! the connection: the returned `Http2Connection` owns the transport for the
+///! rest of its life, because a borrowed one could not survive a suspension.
+///! Issue requests with `request`; reuse the connection for several sequential
+///! requests.
 ///!
 ///! `Http2Client` is a convenience for one-shot h2c requests over plain
 ///! TCP: dial, handshake, one request/response, close.
@@ -15,25 +17,27 @@ import core::option;
 import core::result;
 import io::error;
 import io::traits;
+import io::buf;
 import collections::array;
 import collections::str;
-import net::socket_addr;
-import net::tcp;
+import net::addr::socket_addr;
+import net::socket::tcp;
 import net::http::method;
 import net::http::request;
 import net::http::response;
 import net::http2::connection;
+import future::poll;
+import future::waker;
+import future::traits;
 
-/// Upgrade `stream` to an HTTP/2 client connection by performing the
-/// preface + SETTINGS handshake. The caller owns `stream` and drops it
-/// after dropping the returned connection.
-function connect<S>(stream: S*) -> Result<Http2Connection<S>, IoError>
-where S: Read + Write {
-    mut conn: Http2Connection<S> = Http2Connection<S>::new_client(stream);
-    match (conn.handshake_client()) {
-        Result::Ok(_)  => { return Result::Ok(conn); }
-        Result::Err(e) => { conn.drop(); return Result::Err(e); }
-    }
+/// Upgrade `conn` to an HTTP/2 client connection by performing the preface +
+/// SETTINGS handshake. Takes ownership; the returned connection closes the
+/// transport when dropped. A failed handshake releases it.
+async function connect<S>(conn: BufStream<S>) -> Result<Http2Connection<S>, IoError>
+where S: AsyncTransport {
+    mut c: Http2Connection<S> = Http2Connection<S>::new_client(conn);
+    (await c.handshake_client())?;
+    return Result::Ok(c);
 }
 
 /// One-shot h2c (cleartext) requests over plain TCP.
@@ -44,35 +48,32 @@ type struct Http2Client {
 
     /// `GET` over h2c. `authority` is the `:authority` pseudo-header
     /// (host[:port]); `path` is the request target.
-    get(&this, addr: SocketAddr, authority: Str, path: Str) -> Result<Response, IoError> {
+    async get(&this, addr: SocketAddr, authority: Str, path: Str) -> Result<Response, IoError> {
         mut req: Request = Request::new(Method::Get, path);
-        return one_shot(addr, authority, req);
+        return await one_shot(addr, authority, req);
     }
 
     /// `POST` over h2c with a body and Content-Type.
-    post(&this, addr: SocketAddr, authority: Str, path: Str,
-         content_type: Str, body: Array<u8>) -> Result<Response, IoError> {
+    async post(&this, addr: SocketAddr, authority: Str, path: Str,
+               content_type: Str, body: Array<u8>) -> Result<Response, IoError> {
         mut req: Request = Request::new(Method::Post, path);
         req.headers.insert(Str::new("content-type"), content_type);
         req.set_body(body);
-        return one_shot(addr, authority, req);
+        return await one_shot(addr, authority, req);
     }
 }
 
 /// Dial `addr`, upgrade to h2c, run one request/response, close.
-function one_shot(addr: SocketAddr, authority: Str, req: Request) -> Result<Response, IoError> {
+///
+/// The connection is built synchronously from the accepted socket and then
+/// awaited on as this future's own local, so the socket never has to be reached
+/// through an address belonging to another frame. Dropping it at the end of the
+/// function is what closes the connection — every exit path releases it.
+async function one_shot(addr: SocketAddr, authority: Str, req: Request) -> Result<Response, IoError> {
     mut request_local: Request = req;
-    mut tcp: TcpStream = match (TcpStream::connect(addr)) {
-        Result::Ok(s)  => { s }
-        Result::Err(e) => { request_local.drop(); return Result::Err(e); }
-    };
-    mut conn: Http2Connection<TcpStream> = match (connect(&tcp)) {
-        Result::Ok(c)  => { c }
-        Result::Err(e) => { request_local.drop(); tcp.drop(); return Result::Err(e); }
-    };
-    const result: Result<Response, IoError> =
-        conn.request(request_local, Str::new("http"), authority);
-    conn.drop();
-    tcp.drop();
-    return result;
+    mut sock: TcpStream = (await TcpConnect::start(addr))?;
+    mut conn: Http2Connection<TcpStream> =
+        Http2Connection<TcpStream>::new_client(BufStream<TcpStream>::of(sock));
+    (await conn.handshake_client())?;
+    return await conn.request(request_local, Str::new("http"), authority);
 }

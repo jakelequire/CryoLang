@@ -26,12 +26,20 @@ public:
     /// Directives written as `![name(args)]` immediately preceding this
     /// declaration in source order.
     attached_directives: DirectiveNode*[];
+    /// Extent of the leading modifier keywords (`public` / `private` /
+    /// `protected` / `async` / `static`) the parser consumed before reaching
+    /// this declaration's own first token.  `span` starts at that first
+    /// token (`function`, `type`, the method name), so the modifiers fall
+    /// outside it; `outer_span()` folds them back in.  `none()` when the
+    /// declaration carries no modifier.
+    modifier_span:       SourceSpan;
 
     DeclarationNode(kind: NodeKind, span: SourceSpan) : ASTNode(kind, span) {
         this.documentation       = "";
         this.source_module       = "";
         this.name_span           = SourceSpan::none();
         this.attached_directives = [];
+        this.modifier_span       = SourceSpan::none();
     }
 
     has_documentation() -> boolean { return this.documentation != ""; }
@@ -44,6 +52,31 @@ public:
     set_name_span(span: SourceSpan) -> void { this.name_span = span; }
     add_directive(d: DirectiveNode*) -> void {
         if (d != null) { this.attached_directives.push(d); }
+    }
+
+    /// Record the span of one leading modifier keyword.  Called once per
+    /// keyword as the parser consumes it, so the recorded extent grows to
+    /// cover all of them however they nest (`public async function` records
+    /// `async` from the inner parse, then `public` from the outer one).
+    note_modifier_span(span: SourceSpan) -> void {
+        this.modifier_span = SourceSpan::covering(this.modifier_span, span);
+    }
+
+    /// The declaration's full written extent: `span` widened to cover the
+    /// leading modifier keywords and every attached `![...]` directive.
+    /// `span` alone starts at `function` / `type` - the right thing to
+    /// underline in a diagnostic, but not what a reader sees as "the
+    /// declaration".  Anything highlighting the declaration as a whole (the
+    /// LSP's inactive-region dimming) needs this instead.
+    outer_span(&this) -> SourceSpan {
+        mut out: SourceSpan = SourceSpan::covering(this.span, this.modifier_span);
+        for (mut i: i64 = 0; i < this.attached_directives.length; i++) {
+            const d: DirectiveNode* = this.attached_directives[i];
+            if (d != null) {
+                out = SourceSpan::covering(out, d.span);
+            }
+        }
+        return out;
     }
 
     find_directive(&this, name: string) -> DirectiveNode* {
@@ -117,6 +150,10 @@ public:
     /// Mirrors StructDeclNode/EnumDeclNode/TypeAliasDeclNode.binding_namespace.
     /// Empty for ordinary source-level declarations.
     binding_namespace: SymbolStr;
+    /// `![thread_local]`: emit this global as an LLVM thread-local so each
+    /// thread gets its own instance. Only meaningful on globals; codegen
+    /// (`codegen_global_var`) and cross-module extern refs read this flag.
+    is_thread_local: boolean;
 
     VarDeclNode(name: SymbolStr, span: SourceSpan)
         : DeclarationNode(NodeKind::VariableDeclaration, span) {
@@ -131,6 +168,7 @@ public:
         this.is_capture_alias = false;
         this.is_drop_flag     = false;
         this.binding_namespace = SymbolStr::empty();
+        this.is_thread_local  = false;
     }
 
     has_initializer() -> boolean     { return this.initializer != null; }
@@ -227,6 +265,11 @@ public:
     body:                   BlockStmtNode*;
     is_public:              boolean;
     is_static:              boolean;
+    /// `async function` was written. The body is lowered into a state-machine
+    /// struct implementing `std::future::traits::Future`, and this declaration
+    /// is rewritten to a constructor returning that struct. Set by the parser;
+    /// consumed by the async lowering in SemanticAnalysis.
+    is_async:               boolean;
     /// `![inline]` was applied: codegen attaches LLVM `alwaysinline`.
     is_inline:              boolean;
     /// `![noinline]` was applied: codegen attaches LLVM `noinline`.  Kept
@@ -240,6 +283,11 @@ public:
     /// declared return type against the call's expected type. Set by
     /// directive_processing; consumed by the monomorphizer's call inference.
     is_implicit:            boolean;
+    /// Set when the compiler synthesized this function's BODY after name
+    /// resolution ran — currently the `poll` of an `async` lowering. The
+    /// resolution map has no entry for the locals such a body declares, so the
+    /// unused-local lint has no evidence to judge them by and skips the body.
+    is_synthesized_body:    boolean;
     /// Set when this function was synthesized by cloning a trait default
     /// method into an impl block (see `synthesize_default_trait_methods`).
     /// The monomorphizer's call-site inference uses it to know a generic
@@ -274,6 +322,19 @@ public:
     /// surface directive that sets it was renamed `link` -> `symbol`.)
     link_name:              string;
     has_link_name:          boolean;
+    /// `![weak]` was applied: codegen gives the definition weak linkage
+    /// (`WeakAny`) plus a COMDAT, so a strong definition in another object
+    /// overrides it.  Used for user-overridable runtime symbols (the global
+    /// allocator, the panic handler).
+    is_weak:                boolean;
+    /// `![naked]` was applied: codegen emits no prologue/epilogue and sets
+    /// LLVM's `naked` function attribute.  The body must be a single
+    /// `asm { }` block (params are not accessible by name).  Enables a
+    /// freestanding `_start` / register-exact trampolines.
+    is_naked:               boolean;
+    /// `![section("name")]` object-file section placement for the emitted
+    /// symbol; empty string = the default section.
+    link_section:           string;
     return_type_annotation: TypeAnnotation*;
     resolved_return_type:   TypeRef;
     /// When this function is a method of an `implement trait T for U` block,
@@ -318,15 +379,20 @@ public:
         this.body                   = null;
         this.is_public              = false;
         this.is_static              = false;
+        this.is_async               = false;
         this.is_inline              = false;
         this.is_noinline            = false;
         this.is_variadic            = false;
         this.is_implicit            = false;
+        this.is_synthesized_body    = false;
         this.is_synth_default       = false;
         this.is_self_returning_default = false;
         this.is_lazy_self_growing   = false;
         this.link_name              = "";
         this.has_link_name          = false;
+        this.is_weak                = false;
+        this.is_naked               = false;
+        this.link_section           = "";
         this.return_type_annotation = null;
         this.resolved_return_type   = TypeRef::invalid();
         this.origin_trait           = SymbolStr::empty();
@@ -354,10 +420,12 @@ public:
     set_body(b: BlockStmtNode*) -> void                     { this.body = b; }
     set_public(v: boolean) -> void                          { this.is_public = v; }
     set_static(v: boolean) -> void                          { this.is_static = v; }
+    set_async(v: boolean) -> void                           { this.is_async = v; }
     set_inline(v: boolean) -> void                          { this.is_inline = v; }
     set_noinline(v: boolean) -> void                        { this.is_noinline = v; }
     set_variadic(v: boolean) -> void                        { this.is_variadic = v; }
     set_implicit(v: boolean) -> void                        { this.is_implicit = v; }
+    set_synthesized_body(v: boolean) -> void                { this.is_synthesized_body = v; }
     set_synth_default(v: boolean) -> void                   { this.is_synth_default = v; }
     set_self_returning_default(v: boolean) -> void          { this.is_self_returning_default = v; }
     set_lazy_self_growing(v: boolean) -> void               { this.is_lazy_self_growing = v; }

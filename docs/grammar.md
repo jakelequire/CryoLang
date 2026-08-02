@@ -14,14 +14,14 @@ Namespace          ::= "namespace" QualName ";"
 
 TopLevelItem       ::= Import | ModuleDecl | VarDecl | FunctionDecl
                      | ExternDecl | CHeaderImport | IntrinsicDecl
-                     | AggregateDecl | EnumDecl | TraitDecl
+                     | AggregateDecl | UnionDecl | EnumDecl | TraitDecl
                      | TypeAlias | ImplBlock | StaticAssert
 
 Statement          ::= VarDecl | FunctionDecl
                      | AggregateDecl | EnumDecl | TraitDecl
                      | TypeAlias | ImplBlock
                      | If | While | For | "loop" Block | DoWhile
-                     | Match | Switch
+                     | Match | StaticMatch
                      | "break" ";" | "continue" ";" | Return
                      | "unsafe" Block | AsmBlock | Block | Expr ";"
 
@@ -252,6 +252,7 @@ Primary            ::= Literal
                      | "typeof"  "(" Expr ")"
                      | IfExpr
                      | Match
+                     | StaticMatch
                      | Lambda
                      | "delete" Expr           (* parsed; see cryo.md section 21 *)
                      | "await"  Expr           (* parsed; no async semantics yet *)
@@ -298,9 +299,6 @@ ForInit            ::= VarDecl | Ident ":" Type ("=" Expr)? ";"
 Match              ::= "match" Cond "{" MatchArm* "}"
 MatchArm           ::= Pattern ("|" Pattern)* Guard? "=>" (Block | Expr ","?)
 Guard              ::= "if" Cond   (* checked after the pattern matches *)
-
-Switch             ::= "switch" Cond "{" CaseClause* "}"
-CaseClause         ::= ("case" Expr | "default") ":" Statement*
 
 StaticMatch        ::= "static" "match" "(" Type ")" "{" StaticMatchArm* "}"
                        (* compile-time type dispatch; usable in statement or
@@ -402,16 +400,16 @@ Ident              ::= /* [a-zA-Z_][a-zA-Z0-9_]*                */
 (*  `cryo.md` for the reserved-syntax table.                        *)
 (*                                                                  *)
 (*  alignof    as         asm        async     auto      await     *)
-(*  boolean    break      case      char      class     const     *)
-(*  continue   default    delete    do        double    else      *)
-(*  enum       export     extern    f32       f64       false     *)
-(*  float      for        from      function  i8        i16       *)
-(*  i32        i64        i128      if        implement import    *)
-(*  in         inline     int       intrinsic loop      match     *)
-(*  module     move       mut       namespace new       null      *)
-(*  optional   override   private   protected public    return    *)
-(*  sizeof     static     string    struct    switch    this      *)
-(*  This       trait      true      tuple     type      typeof    *)
-(*  u8         u16        u32       u64       u128      uint      *)
-(*  union      unsafe     unsigned  virtual   void      where     *)
-(*  while      with       yield                                   *)
+(*  boolean    break      char       class     const     continue  *)
+(*  default    delete     do         double    else      enum      *)
+(*  export     extern     f32        f64       false     float     *)
+(*  for        from       function   i8        i16       i32       *)
+(*  i64        i128       if         implement import    in        *)
+(*  inline     int        intrinsic  loop      match     module    *)
+(*  move       mut        namespace  new       null      optional  *)
+(*  override   private    protected  public    return    sizeof    *)
+(*  static     string     struct     this      This      trait     *)
+(*  true       tuple      type       typeof    u8        u16       *)
+(*  u32        u64        u128       uint      union     unsafe    *)
+(*  unsigned   virtual    void       where     while     with      *)
+(*  yield                                                          *)

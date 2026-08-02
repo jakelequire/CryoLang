@@ -1,0 +1,207 @@
+///! std::future::timer - `Sleep`, the deadline future.
+///!
+///! The assertions are deliberately one-sided wherever a machine under load
+///! could push a measurement around: a sleep completing LATE is a scheduling
+///! artifact, while a sleep completing EARLY is the actual defect, so the bounds
+///! that matter are lower bounds. The one upper bound (`parallel_sleeps_overlap`)
+///! is set at roughly a third of the serial time it is there to rule out.
+///!
+///! Elapsed readings are truncated to whole milliseconds and the reactor rounds
+///! its wait bound up, so a 100ms sleep can legitimately read 99; every lower
+///! bound leaves that much slack.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::FutureTimer;
+
+import std::core::result;
+import std::future;
+import std::sync::atomic;
+import std::test::error;
+import std::test::assert;
+import std::time;
+
+// Completion counter for the detached tasks. Atomic because a worker pool runs
+// them on different threads. Zero-initialized, which is also the reset value, so
+// the ignored non-zero global initializer never matters here.
+mut ft_done: Atomic<i64>;
+
+async function nap(ms: u64) -> i64 {
+    await Sleep::new(Duration::from_millis(ms));
+    return 1;
+}
+
+// The detached form: reports completion through the counter rather than a
+// `JoinHandle`, so the timer behaviour under test is observable without one.
+async function counted_nap(ms: u64) -> void {
+    await Sleep::new(Duration::from_millis(ms));
+    ft_done.fetch_add(1, MemoryOrder::AcqRel);
+}
+
+async function two_naps(ms: u64) -> i64 {
+    await Sleep::new(Duration::from_millis(ms));
+    await Sleep::new(Duration::from_millis(ms));
+    return 1;
+}
+
+async function zero_nap() -> i64 {
+    await Sleep::new(Duration::zero());
+    return 1;
+}
+
+// Parks on a deadline far beyond the test's lifetime, so it is guaranteed to
+// still be armed when the executor tears down.
+async function forever_nap() -> i64 {
+    await Sleep::new(Duration::from_secs(3600));
+    return 1;
+}
+
+![test]
+function a_zero_duration_sleep_is_ready_on_the_first_poll() -> Result<(), TestError> {
+    mut s: Sleep = Sleep::new(Duration::zero());
+    const elapsed: boolean = s.is_elapsed();
+    s.drop();
+    return expect_true(elapsed, "a zero-duration sleep should already be elapsed");
+}
+
+![test]
+function a_zero_duration_sleep_completes() -> Result<(), TestError> {
+    mut ex: Executor = Executor::new();
+    const r: i64 = ex.block_on(zero_nap());
+    ex.drop();
+    return expect_eq(r, 1 as i64);
+}
+
+![test]
+function a_sleep_does_not_complete_before_its_deadline() -> Result<(), TestError> {
+    mut ex: Executor = Executor::new();
+    const t0: Instant = Instant::now();
+    const r: i64 = ex.block_on(nap(150));
+    const ms: u64 = t0.elapsed().as_millis();
+    ex.drop();
+    match (expect_eq(r, 1 as i64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_true(ms >= 140, "a 150ms sleep returned before its deadline");
+}
+
+![test]
+function sequential_sleeps_each_wait() -> Result<(), TestError> {
+    // The second sleep is armed only after the first has fired, so this is what
+    // proves the reactor recomputes its wait bound rather than keeping the first.
+    mut ex: Executor = Executor::new();
+    const t0: Instant = Instant::now();
+    const r: i64 = ex.block_on(two_naps(100));
+    const ms: u64 = t0.elapsed().as_millis();
+    ex.drop();
+    match (expect_eq(r, 1 as i64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_true(ms >= 190, "two 100ms sleeps did not accumulate");
+}
+
+![test]
+function parallel_sleeps_overlap() -> Result<(), TestError> {
+    // Three tasks parked on their own deadlines at the same time. Run serially
+    // this would take ~1200ms; the bound rules that out with room to spare.
+    mut ex: Executor = Executor::new();
+    ft_done.store(0, MemoryOrder::Release);
+    const t0: Instant = Instant::now();
+    ex.spawn_detached(counted_nap(400));
+    ex.spawn_detached(counted_nap(400));
+    ex.spawn_detached(counted_nap(400));
+    // Wait for the three to finish before tearing down: executor teardown
+    // CANCELS a task still parked on its deadline rather than waiting it out, so
+    // dropping here would reclaim all three and count none. The bound keeps a
+    // regression a failure rather than a hang.
+    mut waited: u64 = 0;
+    while (ft_done.load(MemoryOrder::Acquire) < 3 && waited < 5000) {
+        sleep(Duration::from_millis(10));
+        waited = waited + 10;
+    }
+    const ms:  u64 = t0.elapsed().as_millis();
+    const got: i64 = ft_done.load(MemoryOrder::Acquire);
+    ex.drop();
+    match (expect_eq(got, 3 as i64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_true(ms >= 390, "parallel sleeps returned before their deadline")) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_true(ms < 1000, "parallel sleeps ran serially");
+}
+
+![test]
+function a_sleep_completes_without_a_reactor() -> Result<(), TestError> {
+    // `future::block_on` publishes no reactor, so this exercises the self-wake
+    // path: the sleep must still complete, and still not complete early.
+    const t0: Instant = Instant::now();
+    const r: i64 = future::block_on(nap(100));
+    const ms: u64 = t0.elapsed().as_millis();
+    match (expect_eq(r, 1 as i64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_true(ms >= 90, "a reactor-less sleep returned before its deadline");
+}
+
+![test]
+function an_armed_sleep_does_not_wedge_executor_teardown() -> Result<(), TestError> {
+    // A task parked on a one-hour deadline is abandoned and the executor torn
+    // down. Teardown must release that registration — and with it the waker's
+    // reference to the task — rather than wait for the deadline. Reaching the
+    // end of this test at all is the assertion.
+    mut ex: Executor = Executor::new();
+    ex.spawn_detached(forever_nap());
+    // Let the task reach its first poll, so the timer is genuinely armed in the
+    // reactor rather than still sitting unpolled in the ready queue.
+    sleep(Duration::from_millis(50));
+    const t0: Instant = Instant::now();
+    ex.drop();
+    const ms: u64 = t0.elapsed().as_millis();
+    return expect_true(ms < 10000, "executor teardown waited on an armed timer");
+}
+
+![test]
+function until_accepts_an_absolute_deadline() -> Result<(), TestError> {
+    const t0: Instant = Instant::now();
+    match (t0.checked_add(&Duration::from_millis(100))) {
+        Option::Some(at) => {
+            mut ex: Executor = Executor::new();
+            future::block_on(Sleep::until(at));
+            const ms: u64 = t0.elapsed().as_millis();
+            ex.drop();
+            return expect_true(ms >= 90, "an absolute deadline returned early");
+        }
+        Option::None => {
+            return expect_true(false, "the monotonic clock overflowed a 100ms offset");
+        }
+    }
+}
+
+![test]
+function a_deadline_already_past_completes_at_once() -> Result<(), TestError> {
+    // `until` in the past must complete rather than wait for a wrapped deadline.
+    const t0: Instant = Instant::now();
+    future::block_on(Sleep::until(t0));
+    return expect_true(true, "unreachable");
+}
+
+![test]
+function an_over_long_duration_saturates_rather_than_wrapping() -> Result<(), TestError> {
+    // `Duration::as_nanos` would wrap a u64 here; a wrapped deadline would land
+    // in the past and the sleep would complete immediately, which is the bug the
+    // saturating construction exists to prevent.
+    mut s: Sleep = Sleep::new(Duration::from_secs(18446744073709551615));
+    const elapsed: boolean = s.is_elapsed();
+    const d: i64 = s.deadline_nanos();
+    s.drop();
+    match (expect_false(elapsed, "an over-long sleep wrapped into the past")) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(d, 9223372036854775807 as i64);
+}

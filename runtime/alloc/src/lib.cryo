@@ -1,0 +1,145 @@
+///! runtime/alloc — the global allocator tier.
+///!
+///! Defines the weak, user-overridable allocator lang items (see
+///! `../../abi/lang_items.def`): `__cryo_alloc(size, align)` and
+///! `__cryo_dealloc(ptr, size, align)`. `![weak]` linkage lets a user object
+///! supply its own strong definition to replace this one wholesale.
+///!
+///! Freestanding: no libc, no stdlib (a `no_std` tier cannot import the
+///! stdlib allocator). Memory comes straight from the OS — one mapping per
+///! allocation: Linux `mmap`/`munmap` syscalls, Windows kernel32
+///! `VirtualAlloc`/`VirtualFree`. This is the correct, dual-OS baseline
+///! allocator; a segment/free-list allocator (the perf upgrade, e.g.
+///! relocating the stdlib mmap heap down here) can override it later without
+///! touching callers.
+///!
+///! Each allocation stores a 16-byte header immediately below the returned
+///! pointer — `[map_base @-16][map_total @-8]` — so `__cryo_dealloc` can
+///! unmap the exact region regardless of the requested alignment (the OS
+///! mapping is page-aligned, but the returned pointer is bumped up to satisfy
+///! `align`, so the base is not recoverable from the user pointer alone).
+
+namespace CryoRt::Alloc;
+
+const MMAP:          i64 = 0x9;
+const MUNMAP:        i64 = 0xb;
+const PROT_READ:     i64 = 0x1;
+const PROT_WRITE:    i64 = 0x2;
+const MAP_PRIVATE:   i64 = 0x2;
+const MAP_ANONYMOUS: i64 = 0x20;
+
+// --- Linux OS primitives (raw mmap/munmap) ----------------------------------
+
+/// Map `len` bytes of anonymous, writable memory. Returns the base address, or
+/// a negative value (`-errno`) on failure. `mmap` (syscall 9) takes its 4th
+/// argument in r10 (not rcx); rdi/r9 are zeroed as scratch and declared
+/// clobbered so the allocator does not corrupt caller state on return.
+![config(no_runtime)] ![config(linux)]
+function os_map(len: u64) -> i64 {
+    const nr:    i64 = MMAP;
+    const prot:  i64 = PROT_READ | PROT_WRITE;
+    const flags: i64 = MAP_PRIVATE | MAP_ANONYMOUS;
+    const fd:    i64 = -1;
+    mut ret: i64 = 0;
+
+    ![arch(x86_64, intel)]
+    ![clobber(rcx, r11, rdi, r9, memory)]
+    asm {
+        mov rax, ${nr:"rax"}
+        xor rdi, rdi
+        mov rsi, ${len:"rsi"}
+        mov rdx, ${prot:"rdx"}
+        mov r10, ${flags:"r10"}
+        mov r8,  ${fd:"r8"}
+        xor r9, r9
+        syscall
+        mov ${=ret:"rax"}, rax
+    }
+
+    return ret;
+}
+
+/// Unmap a mapping previously returned by `os_map`. `munmap` (syscall 11).
+![config(no_runtime)] ![config(linux)]
+function os_unmap(addr: i64, len: u64) -> void {
+    const nr: i64 = MUNMAP;
+    mut ret: i64 = 0;
+    
+    ![arch(x86_64, intel)]
+    ![clobber(rcx, r11, memory)]
+    asm {
+        mov rax, ${nr:"rax"}
+        mov rdi, ${addr:"rdi"}
+        mov rsi, ${len:"rsi"}
+        syscall
+        mov ${=ret:"rax"}, rax
+    }
+}
+
+// --- Windows OS primitives (VirtualAlloc/VirtualFree) -----------------------
+
+/// kernel32 virtual-memory API. `VirtualAlloc(NULL, size, MEM_COMMIT|
+/// MEM_RESERVE, PAGE_READWRITE)` returns the base or 0 on failure;
+/// `VirtualFree(base, 0, MEM_RELEASE)` releases the whole reservation.
+![config(windows)]
+extern "C" {
+    function VirtualAlloc(addr: i64, size: u64, alloc_type: u32, protect: u32) -> i64;
+    function VirtualFree(addr: i64, size: u64, free_type: u32) -> i32;
+}
+
+![config(no_runtime)] ![config(windows)]
+function os_map(len: u64) -> i64 {
+    const MEM_COMMIT_RESERVE: u32 = 0x3000;   // MEM_COMMIT | MEM_RESERVE
+    const PAGE_READWRITE:     u32 = 0x04;
+    const base: i64 = VirtualAlloc(0, len, MEM_COMMIT_RESERVE, PAGE_READWRITE);
+    // VirtualAlloc returns 0 on failure; map that to the negative sentinel the
+    // shared code checks, so both OSes share one failure test.
+    if (base == 0) { return -1; }
+    return base;
+}
+
+![config(no_runtime)] ![config(windows)]
+function os_unmap(addr: i64, len: u64) -> void {
+    const MEM_RELEASE: u32 = 0x8000;
+    // With MEM_RELEASE the size must be 0 and the whole reservation is freed.
+    VirtualFree(addr, 0, MEM_RELEASE);
+}
+
+// --- OS-agnostic allocator --------------------------------------------------
+
+/// Round `x` up to a multiple of `a` (a power of two, >= 1).
+function align_up(x: u64, a: u64) -> u64 {
+    return (x + a - 1) & ~(a - 1);
+}
+
+/// Allocate `size` bytes aligned to `align`. Weak + unmangled so a user object
+/// can override it. Returns null on OS failure. The mapping carries 16 bytes
+/// of header (base + total) below the returned pointer, plus `align` slack so
+/// the aligned user pointer always leaves room for that header above the base.
+![weak] ![no_mangle] ![config(no_runtime)]
+function __cryo_alloc(size: u64, align: u64) -> u8* {
+    mut a: u64 = align;
+    if (a < 1) { a = 1; }
+    const total: u64 = size + 16 + a;
+    const base: i64 = os_map(total);
+    if (base < 0) { return null; }
+    const user: u64 = align_up((base as u64) + 16, a);
+    // Header just below the user pointer: h[0] = base, h[1] = total.
+    const h: u64* = (user - 16) as u64*;
+    h[0] = base as u64;
+    h[1] = total;
+    return user as u8*;
+}
+
+/// Free a pointer returned by `__cryo_alloc`. `size`/`align` are ignored — the
+/// header is authoritative — but kept in the signature to match the lang-item
+/// ABI (and a future sized-free allocator). A null pointer is a no-op.
+![weak] ![no_mangle] ![config(no_runtime)]
+function __cryo_dealloc(ptr: u8*, size: u64, align: u64) -> void {
+    if (ptr == null) { return; }
+    const u: u64 = ptr as u64;
+    const h: u64* = (u - 16) as u64*;
+    const base:  u64 = h[0];
+    const total: u64 = h[1];
+    os_unmap(base as i64, total);
+}

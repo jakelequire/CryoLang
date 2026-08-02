@@ -55,6 +55,45 @@ implement enum TargetType {
 }
 
 
+/// What a panic does: run each frame's destructors on the way out, or terminate
+/// where it stands.  `Unspecified` is a real state, not a placeholder — it is
+/// what lets a CLI `--panic=` override be distinguished from a project that
+/// simply never mentioned the key, so the two can be merged without inventing a
+/// parallel "was it set" flag.
+type enum PanicStrategy {
+    Unspecified;
+    Abort;
+    Unwind;
+}
+
+implement enum PanicStrategy {
+    label(&this) -> string {
+        return match (this) {
+            PanicStrategy::Unspecified => { "unspecified" }
+            PanicStrategy::Abort       => { "abort"       }
+            PanicStrategy::Unwind      => { "unwind"      }
+        };
+    }
+
+    /// Parse a `[compiler] panic` / `--panic=` value.  Anything unrecognized is
+    /// `Abort`, the conservative reading: a typo must not silently hand a build
+    /// an unwinder it never asked for.
+    static from_string(s: string) -> PanicStrategy {
+        if (s.eq("unwind")) { return PanicStrategy::Unwind; }
+        return PanicStrategy::Abort;
+    }
+
+    /// True when `other` should replace this one in a merge: an explicit choice
+    /// wins over an unspecified one, in either direction.
+    static pick(base: PanicStrategy, override_: PanicStrategy) -> PanicStrategy {
+        return match (override_) {
+            PanicStrategy::Unspecified => { base }
+            _                          => { override_ }
+        };
+    }
+}
+
+
 // LibTarget / BinTarget: multi-target output declarations
 
 /// One library output produced from a project.  Empty `name` means the
@@ -226,6 +265,25 @@ type struct ProjectConfig {
     /// overridden by the CLI `--release` / `--dev` / `--profile=NAME` flags.
     profile:      string;
     no_std:       boolean;
+    /// `[compiler] no_runtime = true` - freestanding build: suppress the
+    /// implicit `main` widening / `set_args`/`set_env` prologue and the
+    /// `@panic` runtime, route check failures to `llvm.trap`, and link with
+    /// `-nostartfiles -nostdlib -static` (no crt0, no libc, no `libcryo.a`).
+    /// This is how `runtime/core` can be written in Cryo. Recommended to pair
+    /// with `no_std = true`.
+    no_runtime:   boolean;
+    /// `[compiler] panic = "abort" | "unwind"` / CLI `--panic=`.  A CHOICE, not
+    /// a switch, so it carries its own "nobody said" state: this same struct
+    /// holds both a parsed cryoconfig and the CLI overrides, and merging them
+    /// requires telling "the user asked for unwind" apart from "unwind is
+    /// merely the default".  A boolean cannot express that, which is why the
+    /// merge used to be a one-directional "force ON if set" that silently
+    /// ignored `--panic=abort` the moment unwind became the default.
+    ///
+    /// Read it through `resolve_panic_unwind`, never directly: that is where the
+    /// default and the freestanding coupling live, in one place.
+    panic:        PanicStrategy;
+    native_alloc: boolean;
     emit_llvm:    boolean;
     /// `[compiler] codegen_threads = N` - worker count for parallel object
     /// emission.  `-1` (unset) => the online CPU count; `1` forces serial
@@ -270,10 +328,10 @@ type struct ProjectConfig {
     ///   search -> `-L<dir>`   (extra dirs for resolving `system` libs that
     ///                          live off the default path, e.g. LLVM-20)
     ///   static -> the path is passed to the linker verbatim (a local
-    ///             archive such as "helpers/libabihelpers.a")
+    ///             archive such as "helpers/libabihelpers-unix.a")
     link_system:  string[];    // e.g. ["LLVM-20"]              -> `-lLLVM-20`
     link_search:  string[];    // e.g. ["/usr/lib/llvm-20/lib"] -> `-L...`
-    link_static:  string[];    // e.g. ["helpers/libabihelpers.a"] (path verbatim)
+    link_static:  string[];    // e.g. ["helpers/libabihelpers-unix.a"] (path verbatim)
     /// Per-OS `[link.unix]` / `[link.windows]` overlays.  Bare `[link]`
     /// above is common (applied to every target); these are appended on
     /// top only when the effective target triple's OS matches, so a
@@ -300,6 +358,14 @@ type struct ProjectConfig {
     /// executable per entry; the legacy `[project] target_type = "executable"`
     /// + `entry_point` are ignored in favour of these.
     bins: BinTarget[];
+    /// `[[lib]]` targets - the workspace form.  When non-empty, the project is
+    /// a workspace that builds one independent static-library archive per
+    /// entry (each from its own `source_dir` into `lib<name>.a`), instead of a
+    /// single output.  Distinct from the singular `[lib]` (`this.lib`), which
+    /// derives one archive from a project that also produces a `[[bin]]`/
+    /// executable.  Each member inherits the project-level `[compiler]` config
+    /// (`no_std`/`no_runtime`/optimize/...); the driver builds them in order.
+    libs: LibTarget[];
     /// `[dependencies]` entries.  Path deps point at a local directory;
     /// git deps point at a remote repository fetched into the global
     /// cache and pinned by `cryoconfig.lock`.  See `Dependency`.
@@ -347,6 +413,9 @@ type struct ProjectConfig {
             opt_level_explicit: false,
             profile:      "release",
             no_std:       false,
+            no_runtime:   false,
+            panic:        PanicStrategy::Unspecified,
+            native_alloc: false,
             emit_llvm:    false,
             codegen_threads: -1,
             bundle_lib_from_bin: "",
@@ -366,6 +435,7 @@ type struct ProjectConfig {
             source_paths: [],
             lib:          LibTarget::empty(),
             bins:         [],
+            libs:         [],
             dependencies: [],
             vendor_pins:  [],
             test_format:  "",
@@ -392,6 +462,7 @@ type struct ProjectConfig {
         mut link_static_windows_c: string[] = [];
         mut source_paths_c:  string[]      = [];
         mut bins_c:          BinTarget[]   = [];
+        mut libs_c:          LibTarget[]   = [];
         mut deps_c:          Dependency[]  = [];
         mut vendor_pins_c:   VendorPin[]   = [];
         for (mut i: i64 = 0; i < this.link_system.length; i++)   { link_system_c.push(this.link_system[i]); }
@@ -405,6 +476,7 @@ type struct ProjectConfig {
         for (mut i: i64 = 0; i < this.link_static_windows.length; i++) { link_static_windows_c.push(this.link_static_windows[i]); }
         for (mut i: i64 = 0; i < this.source_paths.length; i++)  { source_paths_c.push(this.source_paths[i]); }
         for (mut i: i64 = 0; i < this.bins.length; i++)          { bins_c.push(this.bins[i]); }
+        for (mut i: i64 = 0; i < this.libs.length; i++)          { libs_c.push(this.libs[i]); }
         for (mut i: i64 = 0; i < this.dependencies.length; i++)  { deps_c.push(this.dependencies[i]); }
         for (mut i: i64 = 0; i < this.vendor_pins.length; i++)   { vendor_pins_c.push(this.vendor_pins[i]); }
         return ProjectConfig {
@@ -418,6 +490,9 @@ type struct ProjectConfig {
             opt_level_explicit: this.opt_level_explicit,
             profile:       this.profile,
             no_std:        this.no_std,
+            no_runtime:    this.no_runtime,
+            panic:         this.panic,
+            native_alloc:  this.native_alloc,
             emit_llvm:     this.emit_llvm,
             codegen_threads: this.codegen_threads,
             bundle_lib_from_bin: this.bundle_lib_from_bin,
@@ -437,6 +512,7 @@ type struct ProjectConfig {
             source_paths:  source_paths_c,
             lib:           this.lib,
             bins:          bins_c,
+            libs:          libs_c,
             dependencies:  deps_c,
             vendor_pins:   vendor_pins_c,
             test_format:   this.test_format,
@@ -445,11 +521,38 @@ type struct ProjectConfig {
         };
     }
 
+    /// Resolve the panic strategy to the single boolean the rest of the
+    /// compiler consumes: does this build unwind?
+    ///
+    /// The default (unwind) and its one hard exception both live here, so no
+    /// caller has to re-derive either.  Freestanding always aborts: a
+    /// `no_runtime` link passes `-nostdlib`, so nothing resolves the `_Unwind_*`
+    /// calls LLVM lowers `resume` into, and asking for unwind there fails at
+    /// LINK time on symbols the user never wrote.  Unwind is the default
+    /// everywhere else because under abort a panic leaks every live value.
+    resolve_panic_unwind(&this) -> boolean {
+        if (this.no_runtime) { return false; }
+        return match (this.panic) {
+            PanicStrategy::Abort       => { false }
+            PanicStrategy::Unwind      => { true  }
+            PanicStrategy::Unspecified => { true  }
+        };
+    }
+
     /// True when the cryoconfig declares `[lib]` and/or one or more
     /// `[[bin]]` blocks.  Multi-target projects bypass the legacy
     /// single-target dispatch in `compile_project`.
     is_multi_target(&this) -> boolean {
-        return this.lib.is_present() || this.bins.length > 0;
+        return this.lib.is_present() || this.bins.length > 0
+            || this.libs.length > 0;
+    }
+
+    /// True when the cryoconfig declares one or more `[[lib]]` array members -
+    /// the workspace form, where the project builds several independent
+    /// library archives (each from its own `source_dir`) rather than a single
+    /// output.  Drives the per-member build loop in the driver.
+    is_workspace(&this) -> boolean {
+        return this.libs.length > 0;
     }
 
     /// Whether this project requires an entry point (main function).
@@ -511,6 +614,11 @@ type struct ProjectConfig {
         // current_bin_idx is -1 when not inside a [[bin]] block.
         mut current_section: string = "";
         mut current_bin_idx:  i64    = -1;
+        // Index into config.libs for the current `[[lib]]` block, or -1 when
+        // not inside one (mirrors current_bin_idx).  Distinguishes an array
+        // `[[lib]]` member from the singular `[lib]` section, which share the
+        // section name "lib" but write to different fields.
+        mut current_lib_idx:  i64    = -1;
         // Index into config.vendor_pins for the current `[vendor.<Name>]`
         // section, or -1 when not inside one.  Set when the section header is
         // seen (mirrors current_bin_idx for `[[bin]]`).
@@ -540,14 +648,22 @@ type struct ProjectConfig {
                     && trimmed[t_len - 1] == 93            // ']'
                     && trimmed[t_len - 2] == 93;           // ']]'
                 if (is_array) {
-                    // [[bin]] -> current_section = "bin", push fresh BinTarget.
+                    // [[bin]] -> section "bin", push a fresh BinTarget;
+                    // [[lib]] -> section "lib", push a fresh LibTarget (the
+                    // workspace form, distinct from the singular `[lib]`).
                     current_section = trimmed.substr(2, t_len - 4);
                     current_vendor_idx = -1;
                     if (current_section.eq("bin")) {
                         config.bins.push(BinTarget::empty());
                         current_bin_idx = config.bins.length as i64 - 1;
+                        current_lib_idx = -1;
+                    } else if (current_section.eq("lib")) {
+                        config.libs.push(LibTarget::empty());
+                        current_lib_idx = config.libs.length as i64 - 1;
+                        current_bin_idx = -1;
                     } else {
                         current_bin_idx = -1;
+                        current_lib_idx = -1;
                     }
                 } else {
                     const close: i64 = trimmed.find_char(93 as i8);  // 93 = ']'
@@ -555,6 +671,7 @@ type struct ProjectConfig {
                         current_section = trimmed.substr(1, close - 1);
                     }
                     current_bin_idx = -1;
+                    current_lib_idx = -1;
                     current_vendor_idx = -1;
                     // `[vendor.<Name>]` -> push a fresh pin and track its index,
                     // so the dotted-section keys below land on the right pin.
@@ -609,6 +726,12 @@ type struct ProjectConfig {
                         _ => { ProjectConfig::report_unknown_key("project", key); }
                     }
                 }
+                "low_level" => {
+                    match (key) {
+                        "native_alloc" => { config.native_alloc = ProjectConfig::parse_bool(val); }
+                        _ => { ProjectConfig::report_unknown_key("low_level", key); }
+                    }
+                }
                 "compiler" => {
                     match (key) {
                         "debug"     => { config.debug     = ProjectConfig::parse_bool(val); }
@@ -617,6 +740,8 @@ type struct ProjectConfig {
                             config.opt_level_explicit = true;
                         }
                         "no_std"    => { config.no_std    = ProjectConfig::parse_bool(val); }
+                        "no_runtime" => { config.no_runtime = ProjectConfig::parse_bool(val); }
+                        "panic"     => { config.panic = PanicStrategy::from_string(val); }
                         "emit_llvm" => { config.emit_llvm = ProjectConfig::parse_bool(val); }
                         "codegen_threads" => {
                             config.codegen_threads = ProjectConfig::parse_codegen_threads(val);
@@ -676,10 +801,20 @@ type struct ProjectConfig {
                     }
                 }
                 "lib" => {
-                    match (key) {
-                        "name"       => { config.lib.name = val; }
-                        "source_dir" => { config.lib.source_dir = val; }
-                        _ => { ProjectConfig::report_unknown_key("lib", key); }
+                    // current_lib_idx >= 0 => inside a `[[lib]]` array member;
+                    // otherwise the singular `[lib]` section.
+                    if (current_lib_idx >= 0) {
+                        match (key) {
+                            "name"       => { config.libs[current_lib_idx].name = val; }
+                            "source_dir" => { config.libs[current_lib_idx].source_dir = val; }
+                            _ => { ProjectConfig::report_unknown_key("lib", key); }
+                        }
+                    } else {
+                        match (key) {
+                            "name"       => { config.lib.name = val; }
+                            "source_dir" => { config.lib.source_dir = val; }
+                            _ => { ProjectConfig::report_unknown_key("lib", key); }
+                        }
                     }
                 }
                 "bin" => {
@@ -941,6 +1076,9 @@ type struct ProjectConfig {
         };
     }
 
+    /// Parse a `[compiler] panic = "..."` / CLI `--panic=...` value into the
+    /// unwind flag.  `"unwind"` selects DWARF unwinding; anything else (incl.
+    /// `"abort"`) keeps the default abort strategy.
     /// Parse a `[compiler] optimize` value into an LLVM optimization level
     /// 0..3. Accepts C-style `O0`/`O1`/`O2`/`O3` (case-insensitive), a bare
     /// `0`..`3`, and the legacy booleans (`true`/`yes` => O2, `false`/`no` =>
@@ -985,7 +1123,7 @@ type struct ProjectConfig {
         const len: i64 = raw.length() as i64;
         mut i: i64 = 0;
         while (i < len) {
-            const c: i8 = raw[i];
+            const c: char = raw[i];
             // Skip opening bracket, commas, whitespace.
             if (c == '[' || c == ',' || c == ' ' || c == '\t') {
                 i += 1;
@@ -995,7 +1133,7 @@ type struct ProjectConfig {
             if (c == ']') { break; }
             // A quoted string.
             if (c == '"' || c == '\'') {
-                const quote: i8 = c;
+                const quote: char = c;
                 i += 1;
                 const start: i64 = i;
                 while (i < len && raw[i] != quote) { i += 1; }
@@ -1097,7 +1235,7 @@ type struct ProjectConfig {
             // Value: quoted string or unquoted token until ',' or '}'.
             mut value: string = "";
             if (raw[i] == '"' || raw[i] == '\'') {
-                const quote: i8 = raw[i];
+                const quote: char = raw[i];
                 i += 1;
                 const v_start: i64 = i;
                 while (i < len && raw[i] != quote) { i += 1; }

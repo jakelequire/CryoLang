@@ -1,0 +1,109 @@
+// A call whose scope names a MODULE by a SUFFIX of its namespace (`hash` for
+// `std::core::hash`, `mem` for `std::core::mem`) is how nearly every free
+// function in the standard library is spelled at its call sites.
+//
+// Sema resolves each argument's ownership from the callee's declared parameter
+// types, but none of the lookups it had could answer this callee shape: two ask
+// for a type-scoped name and the third for an enum variant, so a module scope
+// fell through all three and every argument stayed unclassified. The move
+// passes read unclassified as a transfer - the safe default when the answer is
+// a move set - and so a value merely LENT to such a function was recorded as
+// moved and its scope-exit drop suppressed. A silent leak, and it applied to
+// every module-qualified call, generic or not.
+//
+// Each test counts destructor runs, because that is the only thing that
+// separates a borrow from a transfer here: both compile, and both run.
+![config(testing)]
+namespace CryoTests::Tests::Lang::QualifiedModuleCallArgBinding;
+
+import std::test;
+import std::core::result;
+import std::core::hash;
+import std::core::mem;
+
+mut g_drops: i64 = 0;
+
+type struct Res {
+    id: i64;
+
+    static new(id: i64) -> Res { return Res { id: id }; }
+
+    drop(mut &this) -> void { g_drops = g_drops + 1; }
+}
+
+implement trait Hash for Res {
+    hash<H>(&this, hasher: mut &H) -> void
+    where H: Hasher {
+        hasher.write_u8(this.id as u8);
+    }
+}
+
+// `digest<T>(value: &T)` takes a REFERENCE: the caller keeps the value and is
+// the one that drops it. Classified as a transfer, the drop was suppressed and
+// the value leaked.
+![test]
+function reference_param_leaves_the_value_owned() -> Result<(), TestError> {
+    g_drops = 0;
+    if (true) {
+        const r: Res = Res::new(7);
+        const d: u64 = hash::digest<Res>(r);
+        if (d == 0) { return expect_eq(1 as i64, 0 as i64); }
+    }
+    return expect_eq(g_drops, 1 as i64);
+}
+
+// Lending the same binding twice is not a move either time, so neither call
+// may mark it moved and the value is still dropped exactly once.
+![test]
+function reference_param_can_be_lent_twice() -> Result<(), TestError> {
+    g_drops = 0;
+    if (true) {
+        const r: Res = Res::new(9);
+        const a: u64 = hash::digest<Res>(r);
+        const b: u64 = hash::digest<Res>(r);
+        if (a != b) { return expect_eq(1 as i64, 0 as i64); }
+    }
+    return expect_eq(g_drops, 1 as i64);
+}
+
+// The type argument inferred rather than written: the same callee shape reaches
+// the same lookup, so the classification must not depend on the turbofish.
+![test]
+function inferred_type_argument_is_classified_too() -> Result<(), TestError> {
+    g_drops = 0;
+    if (true) {
+        const r: Res = Res::new(3);
+        const d: u64 = hash::digest(r);
+        if (d == 0) { return expect_eq(1 as i64, 0 as i64); }
+    }
+    return expect_eq(g_drops, 1 as i64);
+}
+
+// A pointer parameter on the same call shape. Two values in, two values out -
+// a swap that duplicated either would report four.
+![test]
+function pointer_params_permute_without_duplicating() -> Result<(), TestError> {
+    g_drops = 0;
+    if (true) {
+        mut a: Res = Res::new(10);
+        mut b: Res = Res::new(20);
+        mem::swap<Res>(&a, &b);
+        if (a.id != 20) { return expect_eq(a.id, 20 as i64); }
+        if (b.id != 10) { return expect_eq(b.id, 10 as i64); }
+    }
+    return expect_eq(g_drops, 2 as i64);
+}
+
+// The control: a by-value parameter on the SAME call shape really is a
+// transfer, so the callee drops it and this scope must not drop it again.
+![test]
+function by_value_param_on_the_same_shape_still_transfers() -> Result<(), TestError> {
+    g_drops = 0;
+    if (true) {
+        const r: Res = Res::new(4);
+        mem::drop<Res>(r);
+        // Dropped inside `mem::drop`, which owns its parameter.
+        if (g_drops != 1) { return expect_eq(g_drops, 1 as i64); }
+    }
+    return expect_eq(g_drops, 1 as i64);
+}

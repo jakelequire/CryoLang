@@ -1,10 +1,10 @@
 ///! HTTPS client: one-shot requests over TLS.
 ///!
-///! Ties together `net::dns` (resolve the hostname), `net::tcp` (dial),
+///! Ties together `net::dns` (resolve the hostname), `net::socket::tcp` (dial),
 ///! `net::tls` (wrap + verify), and `net::http` (serialize the request /
-///! parse the response). The HTTP layer never learns it's talking to
-///! TLS - `TlsStream` is just another `Read + Write`, so `send_over`
-///! drives it exactly like a plaintext socket.
+///! parse the response). The HTTP layer never learns it's talking to TLS -
+///! `TlsStream` is an `io::AsyncTransport` like any socket, so the same
+///! `BufStream<S>` frames it and the same HTTP/1.1 reader parses it.
 ///!
 ///! Linking: pulls in `net::tls`, so a binary using this module must add
 ///! `ssl` + `crypto` to its project `cryoconfig` `link_libs`.
@@ -16,16 +16,22 @@ import core::result;
 import collections::array;
 import collections::str;
 import io::error;
-import net::ip;
-import net::socket_addr;
-import net::tcp;
+import io::traits;
+import io::buf;
+import net::addr::ip;
+import net::addr::socket_addr;
+import net::socket::tcp;
 import net::dns;
 import net::tls::context;
 import net::tls::stream;
+import net::tls::future;
 import net::http::method;
 import net::http::request;
 import net::http::response;
-import net::http::client;
+import net::http::conn;
+import future::poll;
+import future::waker;
+import future::traits;
 
 type struct HttpsClient {
     connector: TlsConnector;
@@ -48,48 +54,67 @@ type struct HttpsClient {
     /// `GET https://host:port/path`. Resolves `host`, dials, performs the
     /// TLS handshake with SNI = `host`, then sends the request and reads
     /// one response.
-    get(&this, host: Str, port: u16, path: Str) -> Result<Response, IoError> {
+    async get(&this, host: Str, port: u16, path: Str) -> Result<Response, IoError> {
         mut req: Request = Request::new(Method::Get, path);
         req.headers.insert(Str::new("Host"), host);
-        return this.send(host, port, req);
+        return await this.send(host, port, req);
     }
 
     /// `POST https://host:port/path` with a body. Sets Host and the
     /// given Content-Type; the request's Content-Length is set by
     /// `set_body`.
-    post(&this,
-         host: Str,
-         port: u16,
-         path: Str,
-         content_type: Str,
-         body: Array<u8>) -> Result<Response, IoError> {
+    async post(&this,
+               host: Str,
+               port: u16,
+               path: Str,
+               content_type: Str,
+               body: Array<u8>) -> Result<Response, IoError> {
         mut req: Request = Request::new(Method::Post, path);
         req.headers.insert(Str::new("Host"), host);
         req.headers.insert(Str::new("Content-Type"), content_type);
         req.set_body(body);
-        return this.send(host, port, req);
+        return await this.send(host, port, req);
     }
 
-    /// Resolve, dial, wrap in TLS, and run one request/response. The
-    /// `TlsStream` is closed before returning regardless of outcome.
-    send(&this, host: Str, port: u16, req: Request) -> Result<Response, IoError> {
+    /// Resolve, dial, wrap in TLS, and run one request/response.
+    ///
+    /// `Connection: close` marks this as the one-shot exchange it is, so the
+    /// server can release its half as soon as the response is written rather
+    /// than holding the socket until its own idle timeout.
+    ///
+    /// The whole request is encoded into the connection's outgoing buffer and
+    /// flushed once, and the response comes back through the SAME buffer, which
+    /// is what lets the header block and a Content-Length body be read without
+    /// losing bytes that arrived in the same TLS record.
+    async send(&this, host: Str, port: u16, req: Request) -> Result<Response, IoError> {
+        mut request_local: Request = req;
         // The socket layer is IPv4-only, so pick the first A record even
-        // if the resolver preference-orders a AAAA ahead of it.
-        const addr: SocketAddr = match (first_ipv4(host, port)) {
+        // if the resolver preference-orders a AAAA ahead of it. Awaited rather
+        // than called: `getaddrinfo` blocks, so `Resolve` runs it on the
+        // executor's blocking pool instead of stalling this worker inside the
+        // slowest step of the request.
+        const addr: SocketAddr = match (await first_ipv4(host, port)) {
             Result::Ok(a)  => { a }
-            Result::Err(e) => { req.drop(); return Result::Err(e); }
+            Result::Err(e) => { request_local.drop(); return Result::Err(e); }
         };
-        mut tcp: TcpStream = match (TcpStream::connect(addr)) {
+        request_local.headers.insert(
+            Str::new("Connection"),
+            Str::new("close")
+        );
+
+        mut tcp: TcpStream = match (await TcpConnect::start(addr)) {
             Result::Ok(s)  => { s }
-            Result::Err(e) => { req.drop(); return Result::Err(e); }
+            Result::Err(e) => { request_local.drop(); return Result::Err(e); }
         };
-        mut tls: TlsStream = match (this.connector.connect(tcp, host)) {
+        mut tls: TlsStream = match (await this.connector.connect(tcp, host)) {
             Result::Ok(t)  => { t }   // consumed `tcp`
-            Result::Err(e) => { req.drop(); return Result::Err(e); }
+            Result::Err(e) => { request_local.drop(); return Result::Err(e); }
         };
-        const result: Result<Response, IoError> = client::send_over(&tls, req);
-        tls.drop();
-        return result;
+        mut c: BufStream<TlsStream> = BufStream<TlsStream>::of(tls);
+
+        request_local.encode_into(c.pending())?;
+        (await c.flush())?;
+        return await c.read_response();
     }
 
     /// Release the underlying TLS context.
@@ -98,25 +123,12 @@ type struct HttpsClient {
     }
 }
 
-/// Resolve `host` and return the first IPv4 address paired with `port`.
-/// IPv6 results are skipped until the socket layer can dial them; if
-/// none are IPv4, fails `Unsupported`.
-function first_ipv4(host: Str, port: u16) -> Result<SocketAddr, IoError> {
-    mut resolved: ResolvedAddrs = dns::resolve(host)?;
-    mut chosen: Option<SocketAddr> = Option::None;
-    mut i: u64 = 0;
-    while (i < resolved.length()) {
-        match (resolved.get(i)) {
-            Option::Some(ip) => {
-                if (ip.is_ipv4()) {
-                    chosen = Option::Some(SocketAddr::new(ip, port));
-                    i = resolved.length();   // stop at the first match
-                }
-            }
-            Option::None => { }
-        }
-        i++;
-    }
+/// Resolve `host` off the executor and return the first IPv4 address paired
+/// with `port`. IPv6 results are skipped until the socket layer can dial them;
+/// if none are IPv4, fails `Unsupported`.
+async function first_ipv4(host: Str, port: u16) -> Result<SocketAddr, IoError> {
+    mut resolved: ResolvedAddrs = (await Resolve::start(host))?;
+    const chosen: Option<SocketAddr> = resolved.first_ipv4(port);
     resolved.drop();
     match (chosen) {
         Option::Some(addr) => { return Result::Ok(addr); }

@@ -232,6 +232,23 @@ type struct DirectiveProcessingPasses {
             // (gating the block in ConfigGating) and the asm dialect; `clobber`
             // lists clobbered registers / `flags` / `memory`.
             | "arch" | "clobber"
+            // `![no_mangle]`: emit the function/method under its bare declared
+            // identifier instead of the mangled `C$...` symbol, so it can be
+            // linked from C or referenced as a fixed runtime lang-item symbol
+            // (e.g. `__cryo_panic`).  Orthogonal to language visibility - a
+            // `public` symbol is still mangled by default; this flips only the
+            // emitted object-file symbol name.  Zero args; function/method.
+            | "no_mangle"
+            // Runtime-linkage directives.  `![weak]`: emit with weak linkage so
+            // a strong definition elsewhere overrides it (user-overridable
+            // allocator / panic handler).  `![naked]`: emit no prologue/epilogue
+            // (body is a single `asm { }` block) - enables a freestanding
+            // `_start`.  `![section("name")]`: place the symbol in a named
+            // object-file section.  Effects applied in `apply_effects`.
+            | "weak" | "naked" | "section"
+            // `![thread_local]`: emit a global with thread-local storage (each
+            // thread gets its own instance).  Zero args; variable-target.
+            | "thread_local"
             // Bare-atom forms of the cfg/config gate.  These are sugar for
             // `![config(<atom>)]` and are evaluated by the ConfigGating pass.
             | "windows" | "linux" | "macos" | "unix"
@@ -395,9 +412,37 @@ type struct DirectiveProcessingPasses {
                     return;
                 }
 
+                // Low-level migration switch: `config(native_alloc)` gates a
+                // decl on the `[low_level] native_alloc` build flag (Low-Level
+                // Plan Stage 3: the native mmap-backed heap behind
+                // `GlobalAlloc`).  No placement restriction; evaluated by
+                // ConfigGating against `ctx.native_alloc`.  Migration
+                // switches are temporary: deleted once the native subsystem
+                // is proven (as `native_syscalls` was in Stage 2).
+                if (a.name.eq("native_alloc")) {
+                    return;
+                }
+
+                // `config(no_runtime)` gates a decl on the `[compiler]
+                // no_runtime` freestanding build flag.  No placement
+                // restriction; evaluated by ConfigGating against
+                // `ctx.project_no_runtime`.
+                if (a.name.eq("no_runtime")) {
+                    return;
+                }
+
+                // `config(panic_unwind)` gates a decl on the `[compiler] panic =
+                // "unwind"` strategy flag.  No placement restriction; evaluated
+                // by ConfigGating against `ctx.project_panic_unwind`.  Lets a
+                // module reference the unwinding tier (`try_catch`, the
+                // `__cryo_panic_taken_*` accessors) only when it is linked.
+                if (a.name.eq("panic_unwind")) {
+                    return;
+                }
+
                 const code: ErrorCode = ErrorCode::E0152_DIRECTIVE_BAD_ARG;
                 const msg: string = format(
-                    "directive `![config]`: unknown flavor `%s` (expected `testing`, `negative`, `windows`, `linux`, `macos`, `unix`, or `not(<atom>)`)",
+                    "directive `![config]`: unknown flavor `%s` (expected `testing`, `negative`, `native_alloc`, `no_runtime`, `panic_unwind`, `windows`, `linux`, `macos`, `unix`, or `not(<atom>)`)",
                     a.name);
                 mut diag: Diagnostic = Diagnostic::error(code, msg);
                 diag = diag.at(dir.span);
@@ -558,6 +603,71 @@ type struct DirectiveProcessingPasses {
                 }
             }
 
+            // `![no_mangle]`: zero args; function- or method-target.  Suppresses
+            // name mangling so the symbol ships under its bare declared name.
+            // Orthogonal to `public`/visibility; it only changes the emitted
+            // object-file symbol.  The effect (set link_name to the source name)
+            // is applied in `apply_effects`.
+            "no_mangle" => {
+                if (argc != 0) {
+                    DirectiveProcessingPasses::emit_arity_error(ctx, dir, name, 0, argc);
+                }
+                if (target != DirectiveTarget::Function && target != DirectiveTarget::Method) {
+                    DirectiveProcessingPasses::emit_placement_error(ctx, dir, name, "function or method", target);
+                }
+            }
+
+            // `![weak]`: zero args; function- or method-target.  Weak linkage
+            // on a definition; the effect is applied in `apply_effects`.
+            "weak" => {
+                if (argc != 0) {
+                    DirectiveProcessingPasses::emit_arity_error(ctx, dir, name, 0, argc);
+                }
+                if (target != DirectiveTarget::Function && target != DirectiveTarget::Method) {
+                    DirectiveProcessingPasses::emit_placement_error(ctx, dir, name, "function or method", target);
+                }
+            }
+
+            // `![thread_local]`: zero args; variable-target only.  Applied in
+            // `apply_effects` onto the VarDeclNode.
+            "thread_local" => {
+                if (argc != 0) {
+                    DirectiveProcessingPasses::emit_arity_error(ctx, dir, name, 0, argc);
+                }
+                if (target != DirectiveTarget::Variable) {
+                    DirectiveProcessingPasses::emit_placement_error(ctx, dir, name, "global variable", target);
+                }
+            }
+
+            // `![naked]`: zero args; function-target only.  A naked function's
+            // body must be a single `asm { }` block; that body-shape check runs
+            // in `apply_effects` where the FunctionDeclNode body is in hand.
+            "naked" => {
+                if (argc != 0) {
+                    DirectiveProcessingPasses::emit_arity_error(ctx, dir, name, 0, argc);
+                }
+                if (target != DirectiveTarget::Function) {
+                    DirectiveProcessingPasses::emit_placement_error(ctx, dir, name, "function", target);
+                }
+            }
+
+            // `![section("name")]`: one string-literal arg; function- or
+            // method-target.  Names the object-file section for the symbol.
+            "section" => {
+                if (argc != 1) {
+                    DirectiveProcessingPasses::emit_arity_error(ctx, dir, name, 1, argc);
+                    return;
+                }
+                const a: DirectiveArg = dir.args[0];
+                if (a.kind != DirectiveArgKind::StringLit) {
+                    DirectiveProcessingPasses::emit_arg_kind_error(ctx, dir, name, 0, "a string literal");
+                    return;
+                }
+                if (target != DirectiveTarget::Function && target != DirectiveTarget::Method) {
+                    DirectiveProcessingPasses::emit_placement_error(ctx, dir, name, "function or method", target);
+                }
+            }
+
             // `![target(<atom>)]` is an alias for `![config(<atom>)]` for
             // platform-gate purposes.  Accepts the same vocabulary: bare OS
             // atom or `not(<atom>)`.  The legacy `![cfg]` spelling has been
@@ -704,7 +814,8 @@ type struct DirectiveProcessingPasses {
                 mut cands: string[] = [
                     "inline", "noinline", "entry", "test", "ignore",
                     "should_panic", "config", "deprecated", "align",
-                    "repr", "link", "symbol", "target", "allow", "warn", "deny",
+                    "repr", "link", "symbol", "no_mangle", "weak", "naked", "section",
+                    "target", "allow", "warn", "deny",
                     "derive", "sink", "implicit", "functions_only",
                     "windows", "linux", "macos", "unix", "not"
                 ];
@@ -962,6 +1073,67 @@ type struct DirectiveProcessingPasses {
                 }
                 return;
             }
+            if (name.eq("no_mangle")) {
+                // Emit under the bare declared identifier (orthogonal to
+                // visibility).  Reuses the same link_name/has_link_name channel
+                // `![symbol(...)]` uses, which codegen's declare_function /
+                // declare_method already read - so `no_mangle` is exactly
+                // `symbol("<source name>")`.
+                fn.link_name     = ctx.resolve_str(fn.name);
+                fn.has_link_name = true;
+                return;
+            }
+            if (name.eq("weak")) {
+                fn.is_weak = true;
+                return;
+            }
+            if (name.eq("section")) {
+                if (dir.args.length == 1
+                        && dir.args[0].kind == DirectiveArgKind::StringLit) {
+                    fn.link_section = dir.args[0].str_value;
+                }
+                return;
+            }
+            if (name.eq("naked")) {
+                fn.is_naked = true;
+                // A naked function emits no prologue/epilogue, so its body must
+                // be pure inline asm - any other statement would read arguments
+                // or locals through a frame that was never set up.  Require the
+                // body to consist solely of `asm { }` block statements.
+                mut all_asm: boolean =
+                    fn.body != null && fn.body.statements.length > 0;
+                if (all_asm) {
+                    for (mut i: i64 = 0; i < fn.body.statements.length; i++) {
+                        if (fn.body.statements[i] == null
+                                || fn.body.statements[i].kind != NodeKind::AsmBlockStatement) {
+                            all_asm = false;
+                        }
+                    }
+                }
+                if (!all_asm) {
+                    const code: ErrorCode = ErrorCode::E0151_DIRECTIVE_MISPLACED;
+                    const msg: string =
+                        "directive `![naked]` requires the function body to be a single `asm { }` block";
+                    mut diag: Diagnostic = Diagnostic::error(code, msg);
+                    diag = diag.at(dir.span);
+                    ctx.emit_diagnostic(diag);
+                }
+                return;
+            }
+        }
+
+        // `![thread_local]` on a global variable: mark it for thread-local
+        // emission (read by codegen_global_var and cross-module extern refs).
+        if (decl.kind == NodeKind::VariableDeclaration) {
+            const vd: VarDeclNode* = decl as VarDeclNode*;
+            if (name.eq("thread_local")) {
+                vd.is_thread_local = true;
+                // TypeResolution already registered this global (before
+                // directives run) with the flag false; update the DI record so
+                // cross-module extern refs are marked thread-local too.
+                ctx.decl_index.mark_global_thread_local(vd.name);
+            }
+            return;
         }
 
         // Layout effects on user-defined types.  The validator above has
@@ -1058,6 +1230,27 @@ type struct DirectiveProcessingPasses {
                         && dir.args[0].kind == DirectiveArgKind::StringLit) {
                     m.func.link_name     = dir.args[0].str_value;
                     m.func.has_link_name = true;
+                }
+                return;
+            }
+            if (name.eq("no_mangle")) {
+                // See the free-function arm above: emit the method under its
+                // bare declared name instead of the mangled `C$...` symbol.
+                if (m.func != null) {
+                    m.func.link_name     = ctx.resolve_str(m.func.name);
+                    m.func.has_link_name = true;
+                }
+                return;
+            }
+            if (name.eq("weak")) {
+                if (m.func != null) { m.func.is_weak = true; }
+                return;
+            }
+            if (name.eq("section")) {
+                if (m.func != null
+                        && dir.args.length == 1
+                        && dir.args[0].kind == DirectiveArgKind::StringLit) {
+                    m.func.link_section = dir.args[0].str_value;
                 }
                 return;
             }

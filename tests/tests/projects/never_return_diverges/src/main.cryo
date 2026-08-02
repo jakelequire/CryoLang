@@ -1,0 +1,39 @@
+/// A `-> never` function whose body ends by falling off the end after a
+/// divergent call must still reach codegen, and must actually diverge.
+///
+/// The divergent primitives such a body ends in (`sys::exit`) are typed
+/// `void`, so from the type checker's view control DOES fall off the end of a
+/// non-void function. The epilogue only emitted an implicit terminator for
+/// `void`/`unit`, so the block stayed unterminated, the body validator
+/// discarded the whole function, and this failed to compile at all with
+/// E0633 - "left 1 of 1 basic block(s) unterminated; body discarded".
+///
+/// Compiling is necessary but not sufficient: terminating the block with a
+/// `ret void` rather than an `unreachable` would also compile, while letting
+/// control return out of a function whose whole contract is that it does not.
+/// Asserting the exit code is what separates the two - `boom` exits 9, so a
+/// build where `boom` returns cannot produce 9.
+namespace NeverReturnDiverges::Main;
+
+import std::core::intrinsics;
+import std::sys;
+
+/// Ends in a void-typed divergent call, with no `return` and no terminator of
+/// its own. This is the shape that failed to compile.
+function boom(code: i32) -> never {
+    intrinsics::printf("entered boom\n");
+    // `sys::exit` is `exit_group(2)` on Linux: it runs no libc atexit
+    // handlers and does NOT flush stdio, so buffered `printf` output (fully
+    // buffered when stdout is a pipe, as under the test runner) would be
+    // lost.  Its doc says "flush before calling"; `fflush(null)` flushes
+    // every open output stream.  Without this the runner sees an empty
+    // stdout even though `boom` ran - exit code 9 still proves divergence,
+    // but the `stdout_contains` assertion needs the bytes on the pipe.
+    intrinsics::fflush(null);
+    sys::exit(code);
+}
+
+function main() -> int {
+    intrinsics::printf("before boom\n");
+    boom(9);
+}

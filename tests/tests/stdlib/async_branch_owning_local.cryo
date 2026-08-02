@@ -1,0 +1,215 @@
+///! An owning value written into a local from inside a BRANCH of an `async`
+///! function used to be miscompiled: heap corruption from a double free.
+///!
+///! A state whose first touch of a carried local is a top-level write does not
+///! take the value out of the carrier — it produces its own — so the lowering
+///! turns that write into a declaration. It used to bind the SAME alpha-renamed
+///! name in every such state, and drop flags used to be keyed BY NAME, so
+///! several states shared one flag while owning separate storage. A flag raised
+///! where one state initialized its copy then enabled the scope-exit drop in a
+///! state that never did.
+///!
+///! The arithmetic of it is why an `if`/`else` is the shape that breaks: one
+///! declaring state is fine, two survive, and three — the entry state plus one
+///! per arm — release the same heap block twice. Each declaring state now binds
+///! a fresh name and hands the value back under it.
+///!
+///! States that TAKE a carried value cannot be separated that way — they share
+///! AST statement nodes, so renaming one rewrites a node another reads — and
+///! they hit the same collision from the other side. That half is fixed at the
+///! root instead: drop flags are keyed per DECLARATION rather than by name
+///! (`binding_dropflags` in `passes/drop_insertion.cryo`), so several states
+///! declaring one name each govern their own storage.
+///! `carried_owning_local_taken_by_several_states` is the test for that half.
+///!
+///! Each failing shape is paired with a CONTROL differing by ONE thing — the
+///! branch that multiplies the binding states. Both controls passed throughout,
+///! which is what identified the branch rather than the loop, the await, or the
+///! owning payload as the variable that mattered.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::AsyncBranchOwningLocal;
+
+import std::core::option;
+import std::core::result;
+import std::collections::str;
+import std::collections::string;
+import std::collections::array;
+import std::future;
+import std::time;
+import std::test::error;
+import std::test::assert;
+
+/// Churn the allocator so a double free shows up as corruption here rather
+/// than as a quiet inconsistency that surfaces somewhere unrelated.
+function abol_churn() -> u64 {
+    mut total: u64 = 0;
+    mut i: i64 = 0;
+    while (i < 200) {
+        mut a: Array<u8> = Array<u8>::with_capacity(128);
+        a.push(1);
+        total = total + a.length();
+        a.drop();
+        i = i + 1;
+    }
+    return total;
+}
+
+/// An owner with heap content, so a stale or doubly-dropped payload is a real
+/// memory fault rather than a wrong number.
+type struct Source {
+    s: String;
+
+    /// Hands back an OWNING payload across a suspend.
+    async give(mut &this) -> Result<String, i64> {
+        await Sleep::new(Duration::from_millis(2));
+        mut out: String = String::from_str(Str::new("owned"));
+        out.push_byte(0x42);
+        return Result::Ok(out);
+    }
+}
+
+implement trait Drop for struct Source {
+    drop(mut &this) -> void { this.s.drop(); }
+}
+
+/// The control: the owning local is written at statement level, never inside a
+/// branch. Six payload bytes plus 200 from the churn, per iteration.
+async function abol_no_branch(iters: i64) -> u64 {
+    mut r: Source = Source { s: String::from_str(Str::new("hello")) };
+    mut total: u64 = 0;
+    mut k: i64 = 0;
+    while (k < iters) {
+        mut got: Result<String, i64> = Result::Err(0);
+        got = await r.give();
+        match (got) {
+            Result::Ok(s)  => { mut owned: String = s; total = total + owned.length(); }
+            Result::Err(_) => { }
+        }
+        total = total + abol_churn();
+        k = k + 1;
+    }
+    return total;
+}
+
+/// The failing shape: identical, except the write happens inside an `if`/`else`
+/// whose arms both produce the value.
+async function abol_in_branch(flag: boolean, iters: i64) -> u64 {
+    mut r: Source = Source { s: String::from_str(Str::new("hello")) };
+    mut total: u64 = 0;
+    mut k: i64 = 0;
+    while (k < iters) {
+        mut got: Result<String, i64> = Result::Err(0);
+        if (flag) {
+            got = await r.give();
+        } else {
+            got = await r.give();
+        }
+        match (got) {
+            Result::Ok(s)  => { mut owned: String = s; total = total + owned.length(); }
+            Result::Err(_) => { }
+        }
+        total = total + abol_churn();
+        k = k + 1;
+    }
+    return total;
+}
+
+/// Hands back an OWNING payload across a suspend, with no receiver involved,
+/// so the taking-side pair below turns on the branch alone.
+async function abol_give() -> Result<String, i64> {
+    await Sleep::new(Duration::from_millis(2));
+    mut out: String = String::from_str(Str::new("owned"));
+    out.push_byte(0x42);
+    return Result::Ok(out);
+}
+
+/// The CONTROL for the taking side: the capped read, written into `got` from
+/// inside a `match` arm — so `got` is carried in rather than produced — but
+/// with no `if`/`else` around it, so exactly ONE state takes it.
+async function abol_take_one_state(iters: i64) -> u64 {
+    mut total: u64 = 0;
+    mut k: i64 = 0;
+    while (k < iters) {
+        mut got: Result<String, i64> = Result::Err(0);
+        const capped: Result<Result<String, i64>, Elapsed> =
+            await Futures::timeout(Duration::from_millis(500), abol_give());
+        match (capped) {
+            Result::Ok(inner) => { got = inner; }
+            Result::Err(_)    => { got = Result::Err(7); }
+        }
+        match (got) {
+            Result::Ok(s)  => { mut owned: String = s; total = total + owned.length(); }
+            Result::Err(_) => { }
+        }
+        total = total + abol_churn();
+        k = k + 1;
+    }
+    return total;
+}
+
+/// The failing shape for the taking side, and the exact shape enforcing
+/// `HttpServer::with_read_timeout` produces: the `if`/`else` puts the write to
+/// `got` inside a branch on BOTH paths, so several states carry it in and each
+/// declares it under the one carried name. Sharing a drop flag between those
+/// declarations released the same heap block twice.
+async function abol_take_in_branch(use_cap: boolean, iters: i64) -> u64 {
+    mut total: u64 = 0;
+    mut k: i64 = 0;
+    while (k < iters) {
+        mut got: Result<String, i64> = Result::Err(0);
+        if (use_cap) {
+            const capped: Result<Result<String, i64>, Elapsed> =
+                await Futures::timeout(Duration::from_millis(500), abol_give());
+            match (capped) {
+                Result::Ok(inner) => { got = inner; }
+                Result::Err(_)    => { got = Result::Err(7); }
+            }
+        } else {
+            got = await abol_give();
+        }
+        match (got) {
+            Result::Ok(s)  => { mut owned: String = s; total = total + owned.length(); }
+            Result::Err(_) => { }
+        }
+        total = total + abol_churn();
+        k = k + 1;
+    }
+    return total;
+}
+
+![test]
+function carried_owning_local_written_outside_any_branch() -> Result<(), TestError> {
+    mut ex: Executor = Executor::new();
+    const r: u64 = ex.block_on(abol_no_branch(2 as i64));
+    ex.drop();
+    return expect_eq(r, 412u64);
+}
+
+![test]
+function carried_owning_local_written_inside_a_branch() -> Result<(), TestError> {
+    mut ex: Executor = Executor::new();
+    const r: u64 = ex.block_on(abol_in_branch(false, 2 as i64));
+    ex.drop();
+    return expect_eq(r, 412u64);
+}
+
+![test]
+function carried_owning_local_taken_by_one_state() -> Result<(), TestError> {
+    mut ex: Executor = Executor::new();
+    const r: u64 = ex.block_on(abol_take_one_state(2 as i64));
+    ex.drop();
+    return expect_eq(r, 412u64);
+}
+
+/// Both arms are exercised, because the arms differ in how many states end up
+/// taking `got` and only running both proves neither path double-drops.
+![test]
+function carried_owning_local_taken_by_several_states() -> Result<(), TestError> {
+    mut ex: Executor = Executor::new();
+    const capped: u64 = ex.block_on(abol_take_in_branch(true, 2 as i64));
+    expect_eq(capped, 412u64)?;
+    const direct: u64 = ex.block_on(abol_take_in_branch(false, 2 as i64));
+    ex.drop();
+    return expect_eq(direct, 412u64);
+}

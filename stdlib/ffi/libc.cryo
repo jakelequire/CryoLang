@@ -3,7 +3,7 @@
 ///! Single home for every `extern "C"` declaration the stdlib needs,
 ///! plus broad coverage of the POSIX / glibc surface for downstream
 ///! consumers. Modules consume libc through `import ffi::libc;` and
-///! call `libc::read(...)`, `libc::sqrt(...)`, etc., keeping the rest
+///! call `libc::read(...)`, `libc::sin(...)`, etc., keeping the rest
 ///! of the tree free of inline `extern` blocks.
 ///!
 ///! Functions mirror libc / POSIX headers verbatim: same names, same
@@ -37,7 +37,7 @@
 ///! order, so callers can construct them directly. Platform-variant
 ///! structs (`sockaddr_in`, `struct stat`, `addrinfo`, `epoll_event`,
 ///! `struct termios`, `pthread_*`) are treated as opaque byte
-///! buffers; callers pack/unpack manually, as `net::tcp` does for
+///! buffers; callers pack/unpack manually, as `net::socket::tcp` does for
 ///! `sockaddr_in`. The accompanying `SIZEOF_*` constants give the
 ///! Linux x86_64 size so a `u8[SIZEOF_X]` buffer can be sized
 ///! correctly.
@@ -297,30 +297,89 @@ extern "C" {
 //
 // `O_*` and `F_*` are bit-flag and command sets; kept as constants.
 // `fcntl` is a variadic command dispatcher; arg type depends on cmd.
+//
+// The `O_*` bit VALUES are OS-specific: glibc and MSVCRT lay them out
+// differently (glibc's `O_CREAT`=0x40 is MSVCRT's `_O_TEMPORARY` -
+// delete-on-close! - so reusing glibc values on Windows silently opens
+// without creating).  Only the access-mode bits agree.  Each target gets
+// its own faithful mirror of its C library's header; a flag that does not
+// exist on a target is not defined for it, so misuse is a compile error
+// rather than a silently-wrong bitmask.
 
 const O_RDONLY:    i32 = 0;
 const O_WRONLY:    i32 = 1;
 const O_RDWR:      i32 = 2;
 const O_ACCMODE:   i32 = 3;
 
+// Linux/glibc `<fcntl.h>` values.
+![target(unix)]
 const O_CREAT:     i32 = 64;
+![target(unix)]
 const O_EXCL:      i32 = 128;
+![target(unix)]
 const O_NOCTTY:    i32 = 256;
+![target(unix)]
 const O_TRUNC:     i32 = 512;
+![target(unix)]
 const O_APPEND:    i32 = 1024;
+![target(unix)]
 const O_NONBLOCK:  i32 = 2048;
+![target(unix)]
 const O_NDELAY:    i32 = 2048;     // == O_NONBLOCK
+![target(unix)]
 const O_DSYNC:     i32 = 4096;
+![target(unix)]
 const O_ASYNC:     i32 = 8192;
+![target(unix)]
 const O_DIRECT:    i32 = 16384;
+![target(unix)]
 const O_LARGEFILE: i32 = 32768;
+![target(unix)]
 const O_DIRECTORY: i32 = 65536;
+![target(unix)]
 const O_NOFOLLOW:  i32 = 131072;
+![target(unix)]
 const O_NOATIME:   i32 = 262144;
+![target(unix)]
 const O_CLOEXEC:   i32 = 524288;
+![target(unix)]
 const O_SYNC:      i32 = 1052672;  // O_DSYNC | O_RSYNC
+![target(unix)]
 const O_PATH:      i32 = 2097152;
+![target(unix)]
 const O_TMPFILE:   i32 = 4259840;  // O_TMPFILE | O_DIRECTORY
+// POSIX has no text/binary distinction; a zero `O_BINARY` lets portable
+// callers write `flags | O_BINARY` unconditionally (the standard C idiom).
+![target(unix)]
+const O_BINARY:    i32 = 0;
+
+// MSVCRT `<fcntl.h>` (`_O_*`) values, spelled without the underscore so
+// portable call sites read identically.  `O_NOINHERIT` is the CRT's
+// close-on-exec analog (the fd's handle is not inherited by children);
+// `O_TEMPORARY` is delete-on-close.  Text-mode translation (CRLF) applies
+// unless `O_BINARY` is set - binary is what POSIX semantics expect.
+![target(windows)]
+const O_APPEND:      i32 = 8;       // _O_APPEND
+![target(windows)]
+const O_RANDOM:      i32 = 16;      // _O_RANDOM
+![target(windows)]
+const O_SEQUENTIAL:  i32 = 32;      // _O_SEQUENTIAL
+![target(windows)]
+const O_TEMPORARY:   i32 = 64;      // _O_TEMPORARY (delete-on-close)
+![target(windows)]
+const O_NOINHERIT:   i32 = 128;     // _O_NOINHERIT
+![target(windows)]
+const O_CREAT:       i32 = 256;     // _O_CREAT
+![target(windows)]
+const O_TRUNC:       i32 = 512;     // _O_TRUNC
+![target(windows)]
+const O_EXCL:        i32 = 1024;    // _O_EXCL
+![target(windows)]
+const O_SHORT_LIVED: i32 = 4096;    // _O_SHORT_LIVED
+![target(windows)]
+const O_TEXT:        i32 = 16384;   // _O_TEXT (CRLF translation)
+![target(windows)]
+const O_BINARY:      i32 = 32768;   // _O_BINARY (no translation)
 
 // fcntl() commands
 const F_DUPFD:         i32 = 0;
@@ -483,10 +542,55 @@ const _SC_LOGIN_NAME_MAX:   i32 = 71;
 
 // unistd.h: POSIX file / process operations
 
+// Byte I/O + lseek widths are OS-dispatched.  POSIX `read`/`write` take a
+// `size_t` count and return `ssize_t` (both 64-bit); MSVCRT's `_read`/
+// `_write` take `unsigned int` and return `int`, and its `lseek` alias is
+// the 32-bit `_lseek` (`long` return).  Declaring the CRT trio at POSIX
+// widths reads garbage past bit 31 of the return register: an error `-1`
+// zero-extends to 4294967295, which callers see as SUCCESS.  Windows gets
+// faithful `_read`/`_write`/`_lseeki64` externs plus POSIX-shaped shims
+// (same pattern as `isatty` below).
+![target(unix)]
 extern "C" {
-    // Byte I/O
     function read(fd: i32, buffer: u8*, count: u64) -> i64;
     function write(fd: i32, buffer: u8*, count: u64) -> i64;
+    function lseek(fd: i32, offset: i64, whence: Whence) -> i64;
+}
+
+![target(windows)]
+extern "C" {
+    function _read(fd: i32, buffer: u8*, count: u32) -> i32;
+    function _write(fd: i32, buffer: u8*, count: u32) -> i32;
+    function _lseeki64(fd: i32, offset: i64, origin: i32) -> i64;
+}
+
+/// POSIX-shaped `read` over CRT `_read`.  The count is clamped to the
+/// CRT's `INT_MAX` request ceiling - a short read is legal under the
+/// POSIX contract, so callers loop as they already must.
+![target(windows)]
+function read(fd: i32, buffer: u8*, count: u64) -> i64 {
+    mut n: u32 = 2147483647;
+    if (count < 2147483647) { n = count as u32; }
+    return _read(fd, buffer, n) as i64;
+}
+
+/// POSIX-shaped `write` over CRT `_write`; same clamp, short writes legal.
+![target(windows)]
+function write(fd: i32, buffer: u8*, count: u64) -> i64 {
+    mut n: u32 = 2147483647;
+    if (count < 2147483647) { n = count as u32; }
+    return _write(fd, buffer, n) as i64;
+}
+
+/// POSIX-shaped `lseek` over CRT `_lseeki64` (the 64-bit offset entry
+/// point; plain CRT `lseek` truncates offsets and returns to 32 bits).
+![target(windows)]
+function lseek(fd: i32, offset: i64, whence: Whence) -> i64 {
+    return _lseeki64(fd, offset, whence as i32);
+}
+
+extern "C" {
+    // Byte I/O (POSIX-only entry points; no MSVCRT equivalent)
     function pread(fd: i32, buffer: u8*, count: u64, offset: i64) -> i64;
     function pwrite(fd: i32, buffer: u8*, count: u64, offset: i64) -> i64;
     function readv(fd: i32, iov: iovec*, iovcnt: i32) -> i64;
@@ -496,7 +600,6 @@ extern "C" {
 
     // Descriptor management
     function close(fd: i32) -> i32;
-    function lseek(fd: i32, offset: i64, whence: Whence) -> i64;
     function dup(oldfd: i32) -> i32;
     function dup2(oldfd: i32, newfd: i32) -> i32;
     function dup3(oldfd: i32, newfd: i32, flags: i32) -> i32;
@@ -845,7 +948,7 @@ extern "C" {
 
 ![target(windows)]
 function aligned_alloc(alignment: u64, size: u64) -> u8* {
-    if (alignment > 16u64) {
+    if (alignment > 16) {
         return _aligned_malloc(size, alignment);
     }
     return malloc(size);
@@ -853,20 +956,19 @@ function aligned_alloc(alignment: u64, size: u64) -> u8* {
 
 ![target(windows)]
 function aligned_free(ptr: u8*, alignment: u64) -> void {
-    if (alignment > 16u64) {
+    if (alignment > 16) {
         _aligned_free(ptr);
         return;
     }
     free(ptr);
 }
 
-// TTY detection and symlink reading, OS-dispatched.
+// TTY detection and symlink reading.
 //
-// POSIX `isatty(fd)` is spelled `_isatty(fd)` on msvcrt. `readlink` has no
-// msvcrt equivalent; the only path Cryo passes through it is
-// "/proc/self/exe" (compiler / test-runner self-discovery), so the Windows
-// shim satisfies that single case via `GetModuleFileNameA` (kernel32) and
-// returns -1 for any other path.
+// POSIX `isatty(fd)` is spelled `_isatty(fd)` on msvcrt, so it is aliased
+// below. `readlink` has no msvcrt equivalent and is therefore declared only
+// where it exists; callers that want the running executable's path across
+// both families use `env::current_exe`, which dispatches per OS.
 ![target(unix)]
 extern "C" {
     function isatty(fd: i32) -> i32;
@@ -884,16 +986,6 @@ extern "C" {
 ![target(windows)]
 function isatty(fd: i32) -> i32 {
     return _isatty(fd);
-}
-
-![target(windows)]
-function readlink(path: u8*, buf: u8*, bufsize: u64) -> i64 {
-    if (strcmp(path, "/proc/self/exe") != 0) {
-        return -1i64;
-    }
-    const n: u32 = GetModuleFileNameA(null, buf, bufsize as u32);
-    if (n == 0u32) { return -1i64; }
-    return n as i64;
 }
 
 // Windows-only msvcrt env helper.  mingw doesn't ship POSIX
@@ -1316,7 +1408,7 @@ type struct in6_addr {
 // `struct sockaddr_in` (16 bytes on Linux) and `struct sockaddr_in6`
 // (28 bytes on Linux) have platform-variant `sa_family_t` width.
 // Callers should allocate a `u8[SIZEOF_SOCKADDR_*]` buffer and pack
-// fields by offset, as `net::tcp` already does.
+// fields by offset, as `net::socket::tcp` already does.
 
 const SIZEOF_SOCKADDR_IN:      u64 = 16;
 const SIZEOF_SOCKADDR_IN6:     u64 = 28;
@@ -1334,7 +1426,7 @@ const INADDR_NONE:      u32 = 4294967295;
 // POSIX BSD sockets.  On Windows these symbols live in `ws2_32` (Winsock)
 // with a different ABI - a SOCKET is an opaque `u64`, lengths are `int`,
 // and the call needs `WSAStartup` - so the Windows declarations live in
-// `ffi::syscall` instead.  Declaring this block unconditionally would make
+// `sys::syscall` instead.  Declaring this block unconditionally would make
 // every socket symbol resolve ambiguously on Windows (W0011); `net::sys`
 // already dispatches to `libc::*` on unix and `syscall::*` on windows
 // through `![target]`-gated wrappers, so gating this block to unix is both
@@ -1437,7 +1529,7 @@ const EAI_INPROGRESS:  i32 = -100;
 const EAI_CANCELED:    i32 = -101;
 
 // `getaddrinfo`/`freeaddrinfo`/`getnameinfo` also exist on Windows, but
-// there they come from `ws2_32` (declared in `ffi::syscall`); the rest of
+// there they come from `ws2_32` (declared in `sys::syscall`); the rest of
 // this block is POSIX/glibc-only.  Gated to unix to avoid a duplicate-symbol
 // (W0011) clash with the Winsock declarations - `net::sys` routes Windows
 // name resolution through `syscall::getaddrinfo`.
@@ -2104,13 +2196,14 @@ extern "C" {
     function regfree(preg: u8*)                          -> void;
 }
 
-// math.h: libm. `__isnan` / `__isinf` are the underlying glibc
-// primitives behind libc's NaN/Inf classification macros.
+// math.h: libm.  Transcendentals only.  FP classification (isnan/isinf/
+// finite) and the cheap ops (sqrt/fabs/floor/ceil/trunc/round/copysign/fma)
+// are NOT here - they are done in pure Cryo via the `fpclass` and
+// cheap-fp-math intrinsics (see std::math and core::intrinsics), so no
+// libm classifier or rounding helper is referenced.
 
 extern "C" {
     // Roots & powers
-    function sqrt(value: f64)               -> f64;
-    function sqrtf(value: f32)              -> f32;
     function cbrt(value: f64)               -> f64;
     function cbrtf(value: f32)              -> f32;
     function pow(base: f64, exponent: f64)  -> f64;
@@ -2165,24 +2258,16 @@ extern "C" {
     function acosh(value: f64) -> f64;
     function atanh(value: f64) -> f64;
 
-    // Rounding & sign
-    function floor(value: f64) -> f64;
-    function ceil(value: f64)  -> f64;
-    function round(value: f64) -> f64;
-    function trunc(value: f64) -> f64;
+    // Rounding & sign (the current-rounding-mode family; the fixed-mode
+    // floor/ceil/trunc/round + fabs/copysign/fma are compiler intrinsics)
     function rint(value: f64)  -> f64;
     function nearbyint(value: f64) -> f64;
     function lround(value: f64)  -> i64;
     function llround(value: f64) -> i64;
     function lrint(value: f64)   -> i64;
-    function fabs(value: f64)    -> f64;
-    function fabsf(value: f32)   -> f32;
-    function copysign(magnitude: f64, sign: f64)  -> f64;
-    function copysignf(magnitude: f32, sign: f32) -> f32;
     function fmod(x: f64, y: f64)      -> f64;
     function fmodf(x: f32, y: f32)     -> f32;
     function remainder(x: f64, y: f64) -> f64;
-    function fma(x: f64, y: f64, z: f64) -> f64;
     function fdim(x: f64, y: f64) -> f64;
     function fmin(x: f64, y: f64) -> f64;
     function fmax(x: f64, y: f64) -> f64;
@@ -2201,34 +2286,11 @@ extern "C" {
 
 }
 
-// FP classification: glibc exports the primitives behind the FP_*
-// macros as `__isnan` / `__isinf` / `__finite` / `__signbit` /
-// `__fpclassify`.  msvcrt exports a different (smaller) set with
-// leading-underscore names; `_isinf` and `_signbit` and `_fpclassify`
-// don't exist as msvcrt exports - derive `isinf` from `_finite` and
-// `_isnan` at the call site.
-
-![target(linux)]
-extern "C" {
-    function __isnan(value: f64)        -> i32;
-    function __isinf(value: f64)        -> i32;
-    function __finite(value: f64)       -> i32;
-    function __signbit(value: f64)      -> i32;
-    function __fpclassify(value: f64)   -> i32;
-}
-
-![target(windows)]
-extern "C" {
-    function _isnan(value: f64)         -> i32;
-    function _finite(value: f64)        -> i32;
-}
-
-// FP classification macros' integer returns (glibc).
-const FP_NAN:       i32 = 0;
-const FP_INFINITE:  i32 = 1;
-const FP_ZERO:      i32 = 2;
-const FP_SUBNORMAL: i32 = 3;
-const FP_NORMAL:    i32 = 4;
+// FP classification (isnan/isinf/finite/signbit/fpclassify) is deliberately
+// NOT declared here.  It is implemented in pure Cryo over the IEEE-754 bit
+// representation via the `fpclass` intrinsic (LLVM `llvm.is.fpclass`); see
+// `std::math` and `std::core::intrinsics`.  This keeps the classification
+// surface off libc entirely - no libm classifier symbol is linked.
 
 // dlfcn.h: runtime dynamic linking
 

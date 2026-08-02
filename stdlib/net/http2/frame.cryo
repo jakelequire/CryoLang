@@ -3,9 +3,31 @@
 ///! Every HTTP/2 frame is a 9-octet header - a 24-bit length, an 8-bit
 ///! type, an 8-bit flags field, and a 31-bit stream identifier (the top
 ///! reserved bit is cleared) - followed by `length` octets of payload.
-///! `write_frame` and `read_frame` are generic over the `Write` / `Read`
-///! transport, so they run unchanged over `TcpStream` (h2c) and
-///! `TlsStream` (h2).
+///!
+///! Both directions are inherent methods on `BufStream<S>`, beside HTTP/1.1's
+///! `read_request` and WebSocket's `read_frame`, and for the same reasons:
+///!
+///!   - **Reading is a method** because a parser written as a static taking
+///!     `mut &BufStream<S>` cannot be called from an async caller holding the
+///!     connection as a local — handing the address of a local to a future
+///!     that outlives the current poll is refused (E0455), and only the
+///!     RECEIVER is re-supplied on every poll.
+///!   - **Queuing is synchronous.** A whole frame — header then payload — is
+///!     built into `pending()` with no suspension point inside it, and the
+///!     caller suspends exactly once, in `flush`. That is what lets a HEADERS
+///!     block and its CONTINUATION fragments, or a DATA frame and the
+///!     WINDOW_UPDATE that follows it, go out in one transport operation.
+///!
+///! The names carry the `h2_` prefix because `BufStream<S>` hosts the framing
+///! for three protocols and each name has to be its own: `ws::frame` already
+///! owns `read_frame` / `queue_frame` on this type.
+///!
+///! Written once for `BufStream<S>` over any async transport, so h2c over
+///! `TcpStream` and h2 over `TlsStream` are served by the same code.
+///!
+///! No `buffered()` slice is held across an `await`: every header byte is
+///! copied into a scalar before the next suspension, which is what makes the
+///! parse safe against a fill that grows and moves the connection's buffer.
 
 namespace std::net::http2::frame;
 
@@ -14,7 +36,11 @@ import core::result;
 import core::slice;
 import io::error;
 import io::traits;
+import io::buf;
 import collections::array;
+import future::poll;
+import future::waker;
+import future::traits;
 
 /// Length of the fixed frame header.
 const FRAME_HEADER_LEN: u64 = 9;
@@ -41,8 +67,8 @@ const FLAG_PRIORITY:    u8 = 0x20;  // HEADERS
 /// Absolute ceiling on a payload length we will buffer for a single
 /// frame, independent of the negotiated SETTINGS_MAX_FRAME_SIZE. A
 /// frame claiming more is rejected rather than risking an unbounded
-/// allocation. Callers pass the negotiated limit to `read_frame`; this
-/// is only the hard backstop.
+/// allocation. Callers pass the negotiated limit to `read_h2_frame`;
+/// this is only the hard backstop.
 const MAX_FRAME_PAYLOAD: u64 = 1048576;   // 1 MiB
 
 /// One decoded frame. Owns its payload bytes; call `drop`.
@@ -61,61 +87,85 @@ type struct Frame {
     }
 }
 
-/// Write a frame: 9-byte header then payload. The reserved high bit of
-/// the stream identifier is always sent as 0.
-function write_frame<W>(writer: mut &W, ftype: u8, flags: u8,
-                        stream_id: u32, payload: Slice<u8>) -> Result<(), IoError>
-where W: Write {
-    const len: u64 = payload.length();
-    mut hdr: u8[9];
-    hdr[0] = (len >> 16) as u8;
-    hdr[1] = (len >> 8) as u8;
-    hdr[2] = (len) as u8;
-    hdr[3] = ftype;
-    hdr[4] = flags;
-    hdr[5] = ((stream_id >> 24) & 0x7f) as u8;   // clear reserved bit
-    hdr[6] = (stream_id >> 16) as u8;
-    hdr[7] = (stream_id >> 8) as u8;
-    hdr[8] = (stream_id) as u8;
-    writer.write(Slice<u8>::from_raw(&hdr[0], 9))?;
-    if (len > 0) {
-        writer.write(payload)?;
+/// HTTP/2 framing over a buffered async connection.
+implement struct BufStream<S> {
+    /// Queue one frame into the outgoing buffer: the 9-byte header, then the
+    /// payload. The reserved high bit of the stream identifier is always sent
+    /// as 0. The payload is not consumed. Nothing is sent until the caller
+    /// flushes.
+    queue_h2_frame(mut &this, ftype: u8, flags: u8, stream_id: u32,
+                   payload: Slice<u8>) -> Result<(), IoError> {
+        const len: u64 = payload.length();
+        mut out: Array<u8>* = this.pending();
+
+        out.push((len >> 16) as u8);
+        out.push((len >> 8) as u8);
+        out.push((len) as u8);
+        out.push(ftype);
+        out.push(flags);
+        out.push(((stream_id >> 24) & 0x7f) as u8);   // clear reserved bit
+        out.push((stream_id >> 16) as u8);
+        out.push((stream_id >> 8) as u8);
+        out.push((stream_id) as u8);
+
+        if (len > 0) {
+            match (out.try_append(payload)) {
+                Result::Ok(_)  => { }
+                Result::Err(_) => {
+                    return Result::Err(IoError::new(IoErrorKind::OutOfMemory, 0));
+                }
+            }
+        }
+        return Result::Ok(());
     }
-    return Result::Ok(());
+
+    /// Read one frame, rejecting a payload longer than `max_payload` (the
+    /// negotiated SETTINGS_MAX_FRAME_SIZE) or the hard backstop, whichever is
+    /// smaller.
+    ///
+    /// The nine header bytes are copied into scalars and consumed before the
+    /// payload's suspension, so no view into the connection's buffer is live
+    /// when a fill can move it.
+    async read_h2_frame(mut &this, max_payload: u64) -> Result<Frame, IoError>
+    where S: AsyncTransport {
+        (await this.ensure(FRAME_HEADER_LEN))?;
+        const hdr: Slice<u8> = this.buffered();
+        const h0: u8    = frame_byte_at(hdr, 0);
+        const h1: u8    = frame_byte_at(hdr, 1);
+        const h2: u8    = frame_byte_at(hdr, 2);
+        const ftype: u8 = frame_byte_at(hdr, 3);
+        const flags: u8 = frame_byte_at(hdr, 4);
+        const h5: u8    = frame_byte_at(hdr, 5);
+        const h6: u8    = frame_byte_at(hdr, 6);
+        const h7: u8    = frame_byte_at(hdr, 7);
+        const h8: u8    = frame_byte_at(hdr, 8);
+        this.consume(FRAME_HEADER_LEN);
+
+        const len: u64 = ((h0 as u64) << 16) | ((h1 as u64) << 8) | (h2 as u64);
+        const stream_id: u32 = (((h5 & 0x7f) as u32) << 24)
+                             | ((h6 as u32) << 16)
+                             | ((h7 as u32) << 8)
+                             | (h8 as u32);
+
+        mut cap: u64 = max_payload;
+        if (cap > MAX_FRAME_PAYLOAD) { cap = MAX_FRAME_PAYLOAD; }
+        if (len > cap) {
+            return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
+        }
+
+        mut payload: Array<u8> = (await this.read_exact(len))?;
+        return Result::Ok(Frame {
+            ftype: ftype, flags: flags, stream_id: stream_id, payload: payload
+        });
+    }
 }
 
-/// Read one frame off `reader`, rejecting a payload longer than
-/// `max_payload` (the negotiated SETTINGS_MAX_FRAME_SIZE) or the hard
-/// backstop, whichever is smaller.
-function read_frame<R>(reader: mut &R, max_payload: u64) -> Result<Frame, IoError>
-where R: Read {
-    mut hdr: u8[9];
-    reader.read_exact(&hdr[0], FRAME_HEADER_LEN)?;
-
-    const len: u64 = ((hdr[0] as u64) << 16) | ((hdr[1] as u64) << 8) | (hdr[2] as u64);
-    const ftype: u8 = hdr[3];
-    const flags: u8 = hdr[4];
-    const stream_id: u32 = (((hdr[5] & 0x7f) as u32) << 24)
-                         | ((hdr[6] as u32) << 16)
-                         | ((hdr[7] as u32) << 8)
-                         | (hdr[8] as u32);
-
-    mut cap: u64 = max_payload;
-    if (cap > MAX_FRAME_PAYLOAD) { cap = MAX_FRAME_PAYLOAD; }
-    if (len > cap) {
-        return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
+/// Slice byte access without `Option` ceremony; callers stay in range. Named
+/// apart from `connection`'s own accessor: that module imports this one, and a
+/// bare leaf name resolved across both would be ambiguous.
+function frame_byte_at(s: Slice<u8>, index: u64) -> u8 {
+    match (s.get(index)) {
+        Option::Some(b) => { return b; }
+        Option::None    => { return 0; }
     }
-
-    mut payload: Array<u8> = Array<u8>::with_capacity(len);
-    if (len > 0) {
-        mut z: u64 = 0;
-        while (z < len) { payload.push(0); z++; }
-        match (reader.read_exact(payload.as_ptr(), len)) {
-            Result::Ok(_)  => { }
-            Result::Err(e) => { payload.drop(); return Result::Err(e); }
-        }
-    }
-    return Result::Ok(Frame {
-        ftype: ftype, flags: flags, stream_id: stream_id, payload: payload
-    });
 }

@@ -9,6 +9,7 @@ namespace Compiler::Types::UserDefined;
 import Compiler::Types;
 import Compiler::Types::TypeRef;
 import Compiler::Resolver::{ SymbolStr, InternTable };
+import Compiler::AST::Expression;
 
 
 // FieldInfo: Metadata for a struct/class field
@@ -23,18 +24,28 @@ type struct FieldInfo {
     /// with `is_public`; both false => `private`.
     is_protected: boolean;
     is_mutable: boolean;
+    /// The field's `= expr` default, or null.  When a struct literal omits this
+    /// field, sema clones this expression, resolves it, and appends it as a
+    /// synthetic field-init (so codegen fills the field); a field with no default
+    /// that is omitted is `E0355`.  Carries an AST pointer for the same reason the
+    /// generic registry does - it is the authority the use site consults.
+    default_value: ExpressionNode*;
 
     static new(name: SymbolStr, field_type: TypeRef, is_public: boolean,
                is_protected: boolean, is_mutable: boolean) -> FieldInfo {
         return FieldInfo {
-            name:         name,
-            field_type:   field_type,
-            offset:       0,
-            is_public:    is_public,
-            is_protected: is_protected,
-            is_mutable:   is_mutable,
+            name:          name,
+            field_type:    field_type,
+            offset:        0,
+            is_public:     is_public,
+            is_protected:  is_protected,
+            is_mutable:    is_mutable,
+            default_value: null,
         };
     }
+
+    has_default(&this) -> boolean { return this.default_value != null; }
+    set_default_value(v: ExpressionNode*) -> void { this.default_value = v; }
 }
 
 
@@ -134,6 +145,13 @@ public:
     /// since the active member is unknown).  The struct machinery (field lookup,
     /// member resolution, generics) is otherwise shared.
     is_union:         boolean;
+    /// The generic instantiation this concrete IS, carried intrinsically:
+    /// `Box<i32>` holds `generic_base` = the `Box` template and `type_args` =
+    /// `[i32]`.  This is the rustc `TyKind::Adt(AdtDef, SubstsRef)` shape - the
+    /// substitutions live ON the type, so no side node has to be consulted.
+    /// Invalid / empty for a non-generic type.
+    generic_base:     TypeRef;
+    type_args:        TypeRef[];
 
     StructType(id: u64, qualified_name: SymbolStr, module_name: SymbolStr, intern_table: InternTable*)
         : Type(id, TypeKind::Struct) {
@@ -151,6 +169,18 @@ public:
         this.repr_transparent = false;
         this.min_alignment    = 0;
         this.is_union         = false;
+        this.generic_base     = TypeRef::invalid();
+        this.type_args        = [];
+    }
+
+    /// Record the instantiation this concrete was monomorphized from.  `args` is
+    /// copied ELEMENT-WISE: assigning a `TypeRef[]` by value aliases the source
+    /// buffer, and dropping either owner would free the other's live storage.
+    set_generic_origin(mut &this, base: TypeRef, args: &TypeRef[]) -> void {
+        this.generic_base = base;
+        mut copied: TypeRef[] = [];
+        for (mut i: i64 = 0; i < args.length; i++) { copied.push(args[i]); }
+        this.type_args = copied;
     }
 
     set_repr(mut &this, c: boolean, packed: boolean, transparent: boolean) -> void {
@@ -259,6 +289,10 @@ public:
     repr_packed:      boolean;
     repr_transparent: boolean;
     min_alignment:    u64;
+    /// See StructType.generic_base / type_args: the instantiation this concrete
+    /// IS, carried intrinsically rather than via a side node.
+    generic_base:     TypeRef;
+    type_args:        TypeRef[];
 
     ClassType(id: u64, qualified_name: SymbolStr, module_name: SymbolStr, intern_table: InternTable*)
         : Type(id, TypeKind::Class) {
@@ -278,6 +312,16 @@ public:
         this.repr_packed         = false;
         this.repr_transparent    = false;
         this.min_alignment       = 0;
+        this.generic_base        = TypeRef::invalid();
+        this.type_args           = [];
+    }
+
+    /// See StructType::set_generic_origin - `args` is copied element-wise.
+    set_generic_origin(mut &this, base: TypeRef, args: &TypeRef[]) -> void {
+        this.generic_base = base;
+        mut copied: TypeRef[] = [];
+        for (mut i: i64 = 0; i < args.length; i++) { copied.push(args[i]); }
+        this.type_args = copied;
     }
 
     set_repr(mut &this, c: boolean, packed: boolean, transparent: boolean) -> void {
@@ -387,6 +431,10 @@ public:
     /// through the declared C ABI width and large discriminants don't
     /// truncate; ADT enums keep an i32 tag (full ADT C-ABI is post-1.0).
     discriminant_type: TypeRef;
+    /// See StructType.generic_base / type_args: the instantiation this concrete
+    /// IS, carried intrinsically rather than via a side node.
+    generic_base:      TypeRef;
+    type_args:         TypeRef[];
 
     EnumType(id: u64, qualified_name: SymbolStr, module_name: SymbolStr, intern_table: InternTable*)
         : Type(id, TypeKind::Enum) {
@@ -401,6 +449,16 @@ public:
         this.repr_c         = false;
         this.min_alignment  = 0;
         this.discriminant_type = TypeRef::invalid();
+        this.generic_base      = TypeRef::invalid();
+        this.type_args         = [];
+    }
+
+    /// See StructType::set_generic_origin - `args` is copied element-wise.
+    set_generic_origin(mut &this, base: TypeRef, args: &TypeRef[]) -> void {
+        this.generic_base = base;
+        mut copied: TypeRef[] = [];
+        for (mut i: i64 = 0; i < args.length; i++) { copied.push(args[i]); }
+        this.type_args = copied;
     }
 
     set_repr_c(mut &this, c: boolean) -> void {

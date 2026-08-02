@@ -1,0 +1,284 @@
+// Init-flag regression: a droppable local declared WITHOUT an initializer and
+// assigned on only some control-flow paths must be dropped ONLY on the paths
+// that actually initialized it.  Without init flags the scope-exit `.drop()` is
+// emitted unconditionally and runs on the un-initialized path too - dropping
+// uninitialized stack garbage (a free of a junk pointer for a heap-owning
+// type).  The flag defaults false (= not initialized => do NOT drop) and each
+// assignment sets it true; the drop is wrapped `if (flag) { ... }`.  This is
+// the inverse-polarity mirror of the conditional-move drop flag.
+![config(testing)]
+namespace CryoTests::Tests::Lang::ConditionalInitDrop;
+
+import std::test;
+import std::core::result;
+
+// Probe with construct/drop accounting so each test asserts exact counts, not
+// merely absence of a crash.
+mut ci_alive: i32 = 0;
+mut ci_drops: i32 = 0;
+
+function ci_reset() -> void {
+    ci_alive = 0;
+    ci_drops = 0;
+}
+
+type struct CIProbe {
+    tag: i32;
+}
+
+implement struct CIProbe {
+    static new(tag: i32) -> CIProbe {
+        ci_alive = ci_alive + 1;
+        return CIProbe { tag: tag };
+    }
+
+    tag_of(&this) -> i32 {
+        return this.tag;
+    }
+}
+
+implement trait Drop for struct CIProbe {
+    drop(mut &this) -> void {
+        ci_alive = ci_alive - 1;
+        ci_drops = ci_drops + 1;
+    }
+}
+
+function ci_consume(p: CIProbe) -> void {
+    // by-value: callee owns and drops on return.
+}
+
+// --- then-only init in a braced branch -------------------------------
+
+// The uninitialized path must NOT drop: the local was never constructed.
+![test]
+function block_then_uninit_path_no_drop() -> Result<(), TestError> {
+    ci_reset();
+    {
+        mut x: CIProbe;
+        if (false) { x = CIProbe::new(1); }
+    }
+    return expect_eq(ci_drops, 0 as i32);
+}
+
+// The initialized path drops exactly once.
+![test]
+function block_then_init_path_drops_once() -> Result<(), TestError> {
+    ci_reset();
+    {
+        mut x: CIProbe;
+        if (true) { x = CIProbe::new(2); }
+    }
+    match (expect_eq(ci_drops, 1 as i32)) {
+        Result::Ok(_) => {}
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(ci_alive, 0 as i32);
+}
+
+// --- then-only init in a BRACELESS branch ----------------------------
+// The synthesized `<flag> = true;` must survive even for a non-block body
+// (which walk_stmt_in_place routes through a throwaway buffer).
+
+![test]
+function braceless_then_uninit_path_no_drop() -> Result<(), TestError> {
+    ci_reset();
+    {
+        mut x: CIProbe;
+        if (false) x = CIProbe::new(3);
+    }
+    return expect_eq(ci_drops, 0 as i32);
+}
+
+![test]
+function braceless_then_init_path_drops_once() -> Result<(), TestError> {
+    ci_reset();
+    {
+        mut x: CIProbe;
+        if (true) x = CIProbe::new(4);
+    }
+    return expect_eq(ci_drops, 1 as i32);
+}
+
+// --- else-only init --------------------------------------------------
+
+![test]
+function else_only_init_drops_on_else_path() -> Result<(), TestError> {
+    ci_reset();
+    {
+        mut x: CIProbe;
+        if (false) { } else { x = CIProbe::new(5); }
+    }
+    return expect_eq(ci_drops, 1 as i32);
+}
+
+![test]
+function else_only_skip_path_no_drop() -> Result<(), TestError> {
+    ci_reset();
+    {
+        mut x: CIProbe;
+        if (true) { } else { x = CIProbe::new(6); }
+    }
+    return expect_eq(ci_drops, 0 as i32);
+}
+
+// --- definite init on BOTH branches: drop unconditionally, once ------
+
+![test]
+function both_branches_init_drops_once() -> Result<(), TestError> {
+    ci_reset();
+    {
+        mut x: CIProbe;
+        if (true)  { x = CIProbe::new(7); }
+        else       { x = CIProbe::new(8); }
+    }
+    return expect_eq(ci_drops, 1 as i32);
+}
+
+// --- loop init: 0 iterations => never initialized => no drop ---------
+
+![test]
+function loop_zero_iterations_no_drop() -> Result<(), TestError> {
+    ci_reset();
+    {
+        mut x: CIProbe;
+        mut i: i32 = 0;
+        while (i < 0) { x = CIProbe::new(9); i = i + 1; }
+    }
+    return expect_eq(ci_drops, 0 as i32);
+}
+
+![test]
+function loop_one_iteration_drops_once() -> Result<(), TestError> {
+    ci_reset();
+    {
+        mut x: CIProbe;
+        mut i: i32 = 0;
+        while (i < 1) { x = CIProbe::new(10); i = i + 1; }
+    }
+    return expect_eq(ci_drops, 1 as i32);
+}
+
+// --- init flag composes with the move flag ---------------------------
+// Conditionally initialized AND moved out in the same branch: drop iff
+// initialized and not moved.
+
+![test]
+function cond_init_and_move_on_init_path() -> Result<(), TestError> {
+    ci_reset();
+    {
+        mut x: CIProbe;
+        if (true) { x = CIProbe::new(11); ci_consume(x); }
+    }
+    // ci_consume takes ownership and drops it; scope exit must NOT drop again.
+    match (expect_eq(ci_drops, 1 as i32)) {
+        Result::Ok(_) => {}
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(ci_alive, 0 as i32);
+}
+
+![test]
+function cond_init_and_move_on_skip_path() -> Result<(), TestError> {
+    ci_reset();
+    {
+        mut x: CIProbe;
+        if (false) { x = CIProbe::new(12); ci_consume(x); }
+    }
+    // Never initialized: no construct, no drop.
+    return expect_eq(ci_drops, 0 as i32);
+}
+
+// --- reading the local must not cost it its init flag ----------------
+// The flag is dropped for locals whose storage can be initialized without a
+// whole-binding assignment.  A field READ or a method call initializes
+// nothing, so it must not disqualify: a local disqualified here gets an
+// UNGUARDED scope-exit drop, which the `return` below then runs over
+// uninitialized stack memory (for a socket-like type, a close() of a garbage
+// descriptor).  Each helper takes the early `return` on the uninitialized
+// path while still mentioning the local later in the body.
+
+function ci_read_field(early: boolean) -> i32 {
+    mut x: CIProbe;
+    if (early) { return 0 as i32; }
+    x = CIProbe::new(13);
+    return x.tag;
+}
+
+function ci_call_method(early: boolean) -> i32 {
+    mut x: CIProbe;
+    if (early) { return 0 as i32; }
+    x = CIProbe::new(14);
+    return x.tag_of();
+}
+
+![test]
+function field_read_keeps_guard_on_uninit_path() -> Result<(), TestError> {
+    ci_reset();
+    ci_read_field(true);
+    return expect_eq(ci_drops, 0 as i32);
+}
+
+![test]
+function field_read_still_drops_on_init_path() -> Result<(), TestError> {
+    ci_reset();
+    ci_read_field(false);
+    match (expect_eq(ci_drops, 1 as i32)) {
+        Result::Ok(_) => {}
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(ci_alive, 0 as i32);
+}
+
+![test]
+function method_call_keeps_guard_on_uninit_path() -> Result<(), TestError> {
+    ci_reset();
+    ci_call_method(true);
+    return expect_eq(ci_drops, 0 as i32);
+}
+
+![test]
+function method_call_still_drops_once_on_init_path() -> Result<(), TestError> {
+    ci_reset();
+    ci_call_method(false);
+    match (expect_eq(ci_drops, 1 as i32)) {
+        Result::Ok(_) => {}
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(ci_alive, 0 as i32);
+}
+
+// --- initialization the flag genuinely cannot observe ----------------
+// A field WRITE and an address-of both initialize storage without a
+// whole-binding assignment, so the local must stay OUT of init tracking.
+// If it were tracked, its flag would never be set and the value would leak;
+// these two assert the drop still happens.
+
+function ci_init_through(p: CIProbe*) -> void {
+    (*p) = CIProbe::new(16);
+}
+
+![test]
+function piecemeal_field_write_still_drops() -> Result<(), TestError> {
+    ci_reset();
+    {
+        mut x: CIProbe;
+        x.tag = 15 as i32;
+        ci_alive = ci_alive + 1;
+    }
+    return expect_eq(ci_drops, 1 as i32);
+}
+
+![test]
+function init_through_escaped_address_still_drops() -> Result<(), TestError> {
+    ci_reset();
+    {
+        mut x: CIProbe;
+        ci_init_through(&x);
+    }
+    match (expect_eq(ci_drops, 1 as i32)) {
+        Result::Ok(_) => {}
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(ci_alive, 0 as i32);
+}

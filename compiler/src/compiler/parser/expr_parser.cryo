@@ -33,13 +33,6 @@ public mut g_for_in_counter: u32 = 0;
 
 type class ExprParser : ParserBase {
 public:
-    /// Parse a brace-delimited block containing statements and expressions.
-    /// ExprParser provides a limited version (const/mut, return, expressions).
-    /// Parser overrides this with full statement parsing (for, if, while, etc.).
-    override parse_inner_block() -> BlockStmtNode* {
-        return this.parse_lambda_block_body();
-    }
-
     ExprParser(tokens: Token[], source_file: string, ctx: CompilationContext*)
         : ParserBase(tokens, source_file, ctx) {
     }
@@ -360,33 +353,53 @@ public:
 
         while (this.check(TokenType::KwAs)) {
             this.advance();
-            // `as const T*` casts to a pointer-to-const; the const binds to the
-            // first pointer suffix (threaded via parse_type_suffixes_q).
-            mut pending_const: boolean = false;
-            if (this.check(TokenType::KwConst)) {
-                this.advance();
-                pending_const = true;
-            }
-            // Parse base type first, then selectively apply suffixes.
-            // This resolves the ambiguity: `x as u64 * 8` should be
-            // (x as u64) * 8, not x as (u64*) followed by orphaned 8.
-            // We consume * as pointer suffix only if it's NOT followed
-            // by a token that could start an expression (number, ident, etc.).
-            mut target: TypeAnnotation* = this.parse_base_type();
-            if (target == null) {
-                this.report_error(ErrorCode::E0104_EXPECTED_TYPE,
-                    "expected type after 'as'");
-                return expr;
-            }
-            // Apply pointer/array suffixes only when * is not an operator.
-            // Disambiguate: `x as u64 * 8` -> (x as u64) * 8, not x as (u64*)
-            // Heuristic: * is a pointer suffix if followed by a non-expression
-            // token (;  )  }  ]  ,  as  EOF).  Otherwise it's multiplication.
-            if (this.check(TokenType::Star) && this.is_star_pointer_suffix()) {
-                target = this.parse_type_suffixes_q(target, pending_const);
-            } else if (!this.check(TokenType::Star)) {
-                // Non-star suffixes ([], ?) are unambiguous
-                target = this.parse_type_suffixes_q(target, pending_const);
+            mut target: TypeAnnotation* = null;
+            // A parenthesized cast target - function `(T) -> R`, tuple
+            // `(T, U)`, unit `()`, or grouping `(T)` - cannot be reached
+            // through parse_base_type, which has no LParen branch.  The
+            // narrow entry below is deliberate for bare base types (it keeps
+            // `x as u64 * 8` parsing as `(x as u64) * 8`), but that ambiguity
+            // needs a base type sitting to the left of the `*`; a leading `(`
+            // can never be a binary operator, so delegate to the same paren
+            // parser the annotation grammar uses.  It consumes its own
+            // suffixes, so the `*` disambiguation must not run over it again.
+            if (this.check(TokenType::LParen)) {
+                target = this.parse_paren_type();
+                if (target == null) {
+                    this.report_error(ErrorCode::E0104_EXPECTED_TYPE,
+                        "expected type after 'as'");
+                    return expr;
+                }
+            } else {
+                // `as const T*` casts to a pointer-to-const; the const binds
+                // to the first pointer suffix (threaded via
+                // parse_type_suffixes_q).
+                mut pending_const: boolean = false;
+                if (this.check(TokenType::KwConst)) {
+                    this.advance();
+                    pending_const = true;
+                }
+                // Parse base type first, then selectively apply suffixes.
+                // This resolves the ambiguity: `x as u64 * 8` should be
+                // (x as u64) * 8, not x as (u64*) followed by orphaned 8.
+                // We consume * as pointer suffix only if it's NOT followed
+                // by a token that could start an expression (number, ident, etc.).
+                target = this.parse_base_type();
+                if (target == null) {
+                    this.report_error(ErrorCode::E0104_EXPECTED_TYPE,
+                        "expected type after 'as'");
+                    return expr;
+                }
+                // Apply pointer/array suffixes only when * is not an operator.
+                // Disambiguate: `x as u64 * 8` -> (x as u64) * 8, not x as (u64*)
+                // Heuristic: * is a pointer suffix if followed by a non-expression
+                // token (;  )  }  ]  ,  as  EOF).  Otherwise it's multiplication.
+                if (this.check(TokenType::Star) && this.is_star_pointer_suffix()) {
+                    target = this.parse_type_suffixes_q(target, pending_const);
+                } else if (!this.check(TokenType::Star)) {
+                    // Non-star suffixes ([], ?) are unambiguous
+                    target = this.parse_type_suffixes_q(target, pending_const);
+                }
             }
             const span: SourceSpan = ParserBase::merge_spans(expr.span, this.current_span());
             expr = new CastExprNode(expr, target, span);
@@ -492,6 +505,7 @@ public:
                 // E0154 ambiguity detector.
                 this.advance();
                 mut scope_name: SymbolStr = SymbolStr::empty();
+                mut carried_gen_args: TypeAnnotation*[] = [];
                 if (expr.kind == NodeKind::ScopeResolution) {
                     const psr: ScopeResolutionNode* = expr as ScopeResolutionNode*;
                     const scope_part: string  = this.ctx.intern_table.resolve(psr.scope_name);
@@ -502,11 +516,21 @@ public:
                     } else {
                         scope_name = psr.member_name;
                     }
+                    // Carry the intermediate node's generic args forward as the new
+                    // scope's generic args. In `future::Ready<i32>::new`, the `<i32>`
+                    // was parsed as `future::Ready`'s member generic_args; folding
+                    // `future::Ready` into the scope path must preserve them as the
+                    // new scope's scope_generic_args, or owner-arg inference
+                    // (compute_static_owner_bindings) sees no turbofish and a
+                    // polymorphic-literal arg trips a spurious E0307. Deep-clone since
+                    // `psr` owns its pointees and outlives this fold.
+                    for (mut gi: i64 = 0; gi < psr.generic_args.length; gi++) {
+                        carried_gen_args.push(TypeAnnotation::clone_ptr(psr.generic_args[gi]));
+                    }
                 } else {
                     scope_name = this.get_expr_name(expr);
                 }
-                const no_gen_args: TypeAnnotation*[] = [];
-                expr = this.parse_scope_member(scope_name, no_gen_args, expr.span);
+                expr = this.parse_scope_member(scope_name, carried_gen_args, expr.span);
             } else if (this.check(TokenType::LBrace)
                        && expr.kind == NodeKind::ScopeResolution
                        && !this.struct_lit_suppressed()
@@ -740,7 +764,9 @@ public:
                 }
             }
         }
-        return new LiteralNode(tok.lexeme, kind, this.span_from_token(tok));
+        mut lit: LiteralNode* = new LiteralNode(tok.lexeme, kind, this.span_from_token(tok));
+        lit.suffix = tok.numeric_suffix;
+        return lit;
     }
 
     /// Parse a string literal.
@@ -770,7 +796,10 @@ public:
     ///
     /// `{{` / `}}` are literal braces; standard escapes (`\n`, `\t`, ...) in
     /// the literal chunks are processed via the same routine as plain
-    /// strings.  Only `{}` and `{:?}` specs are recognised for now.
+    /// strings.  A hole may carry a format spec after a `:` -
+    /// `{expr:[[fill]align][#][0][width][.precision][type]}` - lowered to
+    /// `fmt_append_fmt` with the spec as a string; `{expr}` and `{expr:?}`
+    /// still lower to `fmt_append_display` / `fmt_append_debug`.
     parse_fstring() -> ExpressionNode* {
         const tok: Token = this.advance();
         this.used_fstring = true;
@@ -832,12 +861,31 @@ public:
                 const hole_len: i64 = j - (i + 1);
                 const hole_src: string = raw.substr(i + 1, hole_len);
 
-                // Split off a trailing `:?` Debug spec, if present.
+                // Split off a trailing format spec after the first
+                // top-level `:` separator (`{expr:spec}`). `?` alone is
+                // Debug; a grammar-valid suffix is a format spec; anything
+                // else (e.g. a ternary's ` : b`) is not a spec and the
+                // whole hole stays the expression.
                 const tl: i64 = this.fstr_rstrip_len(hole_src);
-                const is_debug: boolean = this.fstr_spec_is_debug(hole_src, tl);
                 mut expr_src: string = hole_src;
-                if (is_debug) {
-                    expr_src = hole_src.substr(0, tl - 2);
+                mut spec_src:  string = "";
+                // Helper kind: 0 = Display, 1 = Debug, 2 = full spec.
+                mut helper_kind: i64 = 0;
+                const sep: i64 = this.fstr_find_spec_colon(hole_src, tl);
+                if (sep >= 0) {
+                    const spec_len: i64 = tl - (sep + 1);
+                    const suffix: string = hole_src.substr(sep + 1, spec_len);
+                    if (spec_len == 1 && (*(suffix) as char) == '?') {
+                        helper_kind = 1;
+                        expr_src = hole_src.substr(0, sep);
+                    } else if (spec_len == 0) {
+                        // `{x:}` - empty spec renders as plain Display.
+                        expr_src = hole_src.substr(0, sep);
+                    } else if (this.fstr_spec_is_valid(suffix)) {
+                        helper_kind = 2;
+                        spec_src = suffix;
+                        expr_src = hole_src.substr(0, sep);
+                    }
                 }
 
                 // Real source position of the hole's first byte (raw[i+1]) so
@@ -871,9 +919,14 @@ public:
                 mut ref_node: UnaryExprNode* = new UnaryExprNode(amp, inner, this.fstr_span);
                 ref_node.is_synthetic = true;
 
-                const helper: string =
-                    if (is_debug) { "fmt_append_debug" } else { "fmt_append_display" };
-                acc = this.fstr_call2(helper, acc, ref_node as ExpressionNode*);
+                if (helper_kind == 2) {
+                    acc = this.fstr_call_fmt(acc, ref_node as ExpressionNode*, spec_src);
+                } else {
+                    const helper: string =
+                        if (helper_kind == 1) { "fmt_append_debug" }
+                        else { "fmt_append_display" };
+                    acc = this.fstr_call2(helper, acc, ref_node as ExpressionNode*);
+                }
                 continue;
             }
 
@@ -959,14 +1012,99 @@ public:
         return n;
     }
 
-    /// True if the hole text `s` (whose trimmed length is `tl`) ends with a
-    /// `:?` Debug spec.  Early-returns keep the `s + tl - 2` deref guarded by
-    /// the length check without relying on `&&` short-circuit evaluation.
-    fstr_spec_is_debug(s: string, tl: i64) -> boolean {
-        if (tl < 2) { return false; }
-        const c2: char = *(s + tl - 2) as char;
-        const c1: char = *(s + tl - 1) as char;
-        return c2 == ':' && c1 == '?';
+    /// Build the three-argument call `fmt_append_fmt(acc, ref, "spec")`
+    /// that lowers a `{expr:spec}` hole. `spec` is the raw spec text; it
+    /// is passed verbatim as a string literal (no escape processing) and
+    /// re-parsed at runtime by `std::fmt::spec::fmt_parse_spec`.
+    fstr_call_fmt(acc: ExpressionNode*, ref_node: ExpressionNode*,
+                  spec: string) -> ExpressionNode* {
+        const id: IdentifierNode* = new IdentifierNode(
+            this.ctx.intern("fmt_append_fmt"), this.fstr_span);
+        mut call: CallExprNode* = new CallExprNode(id as ExpressionNode*, this.fstr_span);
+        call.add_argument(acc);
+        call.add_argument(ref_node);
+        const lit: LiteralNode* = new LiteralNode(spec, LiteralKind::String, this.fstr_span);
+        call.add_argument(lit as ExpressionNode*);
+        return call as ExpressionNode*;
+    }
+
+    /// Index of the `:` that separates a hole's expression from its format
+    /// spec, or -1 if none.  It is the first `:` at bracket depth 0 that is
+    /// not inside a string/char literal and not part of a `::` path
+    /// separator.  A ternary's `:` is normally at depth 0 too, so a hole
+    /// mixing a bare ternary with a spec must parenthesise the ternary; an
+    /// idiomatic `a ? b : c` (spaces around `:`) is caught by the caller's
+    /// grammar check failing on the leading space, leaving the hole intact.
+    fstr_find_spec_colon(s: string, tl: i64) -> i64 {
+        mut depth: i64 = 0;
+        mut i: i64 = 0;
+        while (i < tl) {
+            const c: char = *(s + i) as char;
+            if (c == '"' || c == '\'') {
+                i = this.fstr_skip_quoted(s, tl, i, c);
+                continue;
+            }
+            if (c == '(' || c == '[' || c == '{') {
+                depth += 1;
+            } else if (c == ')' || c == ']' || c == '}') {
+                depth -= 1;
+            } else if (c == ':' && depth == 0) {
+                if (i + 1 < tl && (*(s + i + 1) as char) == ':') {
+                    i += 2;   // `::` path separator - skip both colons
+                    continue;
+                }
+                return i;
+            }
+            i += 1;
+        }
+        return -1;
+    }
+
+    /// True if `s` is a well-formed format spec:
+    /// `[[fill]align][#][0][width][.precision][type]`, where `align` is
+    /// `< > ^` and `type` is `x X o b`.  Rejecting an ill-formed suffix is
+    /// what lets a ternary's ` : b` fall back to being part of the
+    /// expression rather than a (broken) spec.
+    fstr_spec_is_valid(s: string) -> boolean {
+        const n: i64 = s.length() as i64;
+        if (n == 0) { return false; }
+        mut i: i64 = 0;
+        // [fill]align | align
+        if (n >= 2 && this.fstr_is_align(*(s + 1) as char)) {
+            i = 2;
+        } else if (this.fstr_is_align(*(s) as char)) {
+            i = 1;
+        }
+        // '#' alternate
+        if (i < n && (*(s + i) as char) == '#') { i += 1; }
+        // '0' flag
+        if (i < n && (*(s + i) as char) == '0') { i += 1; }
+        // width
+        while (i < n && this.fstr_is_digit(*(s + i) as char)) { i += 1; }
+        // .precision
+        if (i < n && (*(s + i) as char) == '.') {
+            i += 1;
+            mut pd: i64 = 0;
+            while (i < n && this.fstr_is_digit(*(s + i) as char)) { i += 1; pd += 1; }
+            if (pd == 0) { return false; }
+        }
+        // type
+        if (i < n) {
+            const t: char = *(s + i) as char;
+            if (t == 'x' || t == 'X' || t == 'o' || t == 'b') { i += 1; }
+            else { return false; }
+        }
+        return i == n;
+    }
+
+    /// True for an alignment sigil `< > ^`.
+    fstr_is_align(c: char) -> boolean {
+        return c == '<' || c == '>' || c == '^';
+    }
+
+    /// True for an ASCII digit.
+    fstr_is_digit(c: char) -> boolean {
+        return c >= '0' && c <= '9';
     }
 
     /// Advance past a string/char literal in a hole scan.  `j` indexes the
@@ -989,8 +1127,23 @@ public:
         const name: SymbolStr = this.intern_lexeme(tok);
         mut expr: ExpressionNode* = new IdentifierNode(name, this.span_from_token(tok));
 
-        // Check for generic args: Name<T, U>
-        if (this.check(TokenType::LAngle) && this.is_generic_call_ahead()) {
+        // Check for generic args: Name<T, U>.
+        //
+        // A name bound to a value - a parameter, a local, or a module-level
+        // global - is not a generic function or type, so its `<` is a
+        // comparison however much the following tokens resemble type
+        // arguments. This is what settles `f(a < b, c > (d))`, which the token
+        // scan alone reads as the generic call `a<b, c>(d)`. Names that bind
+        // no known value - including everything imported - still go to the
+        // scan.
+        if (this.check(TokenType::LAngle) && !this.binds_a_value(name) &&
+            this.is_generic_call_ahead()) {
+            // Record whether this was knowledge or a guess. Knowing the name is
+            // declared generic in this module settles it; otherwise only the
+            // token scan spoke, and the same text may have been comparisons.
+            if (!this.is_generic_decl_name(name)) {
+                (expr as IdentifierNode*).set_generic_angle_guessed(true);
+            }
             const gen_args: TypeAnnotation*[] = this.parse_generic_args();
 
             // After generic args, check what follows
@@ -1172,6 +1325,18 @@ public:
             return this.parse_lambda_expression(start);
         }
 
+        // Untyped-parameter lambda: `(x) -> ...` / `(x, y) -> ...`.  The
+        // first param has no `: Type`, so the check above misses it and it
+        // would otherwise parse as a parenthesized expression / tuple and
+        // then trip the generic "`->` is not an operator" error - confusing,
+        // because the user clearly meant a lambda.  Cryo has no `->`
+        // operator, so a `( ... ) ->` shape is unambiguously a lambda
+        // parameter list; route it to the lambda parser, which reports the
+        // missing annotations precisely and recovers.
+        if (this.check(TokenType::Identifier) && this.looks_like_lambda_params()) {
+            return this.parse_lambda_expression(start);
+        }
+
         // Parse as expression (possibly tuple)
         const first: ExpressionNode* = this.parse_expression();
         if (first == null) {
@@ -1200,6 +1365,32 @@ public:
         return first;
     }
 
+    /// Lookahead: does the paren group just opened (the `(` already
+    /// consumed, so `pos` sits at the first token inside) close with a
+    /// matching `)` immediately followed by `->`?  That shape is only ever
+    /// a lambda parameter list - Cryo has no `->` operator, so no valid
+    /// parenthesized expression or tuple can be followed by `->`.  Scans by
+    /// paren depth (nested function-pointer type params balance correctly)
+    /// with a hard bound so a pathological unbalanced stream can't spin.
+    looks_like_lambda_params(&this) -> boolean {
+        mut depth: int = 1;   // account for the already-consumed '('
+        mut off:   int = 0;
+        while (off < 4096) {
+            const k: TokenType = this.peek_at(off).kind;
+            if (k == TokenType::EOF) { return false; }
+            if (k == TokenType::LParen) {
+                depth += 1;
+            } else if (k == TokenType::RParen) {
+                depth -= 1;
+                if (depth == 0) {
+                    return this.peek_at(off + 1).kind == TokenType::Arrow;
+                }
+            }
+            off += 1;
+        }
+        return false;
+    }
+
     /// Parse a lambda starting from the parameter list (after '(' was consumed).
     /// Lambdas accept a stripped-down parameter form: `name` or `name: Type`,
     /// without `mut`, default values, or variadics. Kept inline (rather than
@@ -1208,6 +1399,7 @@ public:
     /// duplicating it on ParserBase or threading a Parser* through.
     parse_lambda_expression(start: Token) -> ExpressionNode* {
         mut params: VarDeclNode*[] = [];
+        mut reported_untyped: boolean = false;
         while (!this.check(TokenType::RParen) && !this.is_at_end()) {
             const name_tok: Token = this.consume(TokenType::Identifier, "parameter name");
             const pname: SymbolStr = this.intern_lexeme(name_tok);
@@ -1216,6 +1408,22 @@ public:
             if (this.match_tok(TokenType::Colon)) {
                 const ptype: TypeAnnotation* = this.parse_type_annotation();
                 param.set_type_annotation(ptype);
+            } else if (!reported_untyped) {
+                // Lambda parameters must be typed: there is no parameter-type
+                // inference, so an unannotated param would fail obscurely
+                // downstream.  Report it here, once per lambda (pointing at the
+                // first bare param), then keep parsing so the body still forms
+                // a lambda node and no cascade follows.  Emitted directly (not
+                // via report_error) to avoid tripping panic-mode recovery -
+                // mirrors the `->` member-access diagnostic above.
+                this.error_count += 1;
+                mut diag: Diagnostic = Diagnostic::error(
+                    ErrorCode::E0104_EXPECTED_TYPE,
+                    "lambda parameters need explicit type annotations");
+                diag = diag.at(this.span_from_token(name_tok));
+                diag = diag.with_note("annotate each parameter, e.g. `(x: T) -> ...`; Cryo does not infer lambda parameter types");
+                this.ctx.emit_diagnostic(diag);
+                reported_untyped = true;
             }
 
             params.push(param);
@@ -1263,11 +1471,9 @@ public:
         if (this.check(TokenType::LBrace)) {
             // Route through the virtual `parse_inner_block` hook so Parser's
             // full-statement override (if/while/for/loop/match/switch/break/
-            // continue, plus the const-mut-return-expr forms ExprParser can
-            // handle on its own) takes effect.  At runtime `this` is a
-            // Parser* whenever a top-down compile is in progress; the
-            // ExprParser-only fallback (`parse_lambda_block_body` below) is
-            // kept as the base for any standalone ExprParser instantiation.
+            // continue) takes effect.  Parser is the only concrete parser -
+            // ExprParser exists as its base, never standalone - so this always
+            // dispatches there.
             const block: BlockStmtNode* = this.parse_inner_block();
             lambda.set_body(block);
         } else {
@@ -1287,65 +1493,6 @@ public:
 
         lambda.span = this.span_from(start);
         return lambda;
-    }
-
-    /// Parse a lambda block body: { statement; statement; ... }
-    /// Simplified block parser for ExprParser (can't call Parser's parse_block_statement).
-    /// Handles return statements and expression statements.
-    parse_lambda_block_body() -> BlockStmtNode* {
-        const start: Token = this.advance(); // consume '{'
-        mut block: BlockStmtNode* = new BlockStmtNode(this.span_from_token(start));
-
-        while (!this.check(TokenType::RBrace) && !this.is_at_end()) {
-            // Return statement
-            if (this.check(TokenType::KwReturn)) {
-                const ret_start: Token = this.advance(); // consume 'return'
-                mut ret_expr: ExpressionNode* = null;
-                if (!this.check(TokenType::Semicolon) && !this.check(TokenType::RBrace)) {
-                    ret_expr = this.parse_expression();
-                }
-                this.consume(TokenType::Semicolon, "';'");
-                const ret: ReturnStmtNode* = new ReturnStmtNode(ret_expr, this.span_from(ret_start));
-                block.add_statement(ret);
-                continue;
-            }
-
-            // Variable declaration (const/mut)
-            if (this.check(TokenType::KwConst) || this.check(TokenType::KwMut)) {
-                const is_mut: boolean = this.check(TokenType::KwMut);
-                const decl_start: Token = this.advance(); // consume const/mut
-                const name_tok: Token = this.consume(TokenType::Identifier, "variable name");
-                const vname: SymbolStr = this.intern_lexeme(name_tok);
-                mut decl: VarDeclNode* = new VarDeclNode(vname, this.span_from_token(decl_start));
-                decl.set_mutable(is_mut);
-                decl.set_kw_span(this.span_from_token(decl_start));
-                if (this.match_tok(TokenType::Colon)) {
-                    decl.set_type_annotation(this.parse_type_annotation());
-                }
-                if (this.match_tok(TokenType::Equal)) {
-                    decl.set_initializer(this.parse_expression());
-                }
-                this.consume(TokenType::Semicolon, "';'");
-                const ds: DeclStmtNode* = new DeclStmtNode(decl, this.span_from(decl_start));
-                block.add_statement(ds);
-                continue;
-            }
-
-            // Expression statement
-            const expr: ExpressionNode* = this.parse_expression();
-            if (expr != null) {
-                this.consume(TokenType::Semicolon, "';'");
-                const es: ExprStmtNode* = new ExprStmtNode(expr, expr.span);
-                block.add_statement(es);
-            } else {
-                this.error_unexpected();
-                this.advance();
-            }
-        }
-
-        this.consume(TokenType::RBrace, "'}'");
-        block.span = this.span_from(start);
-        return block;
     }
 
     /// Parse an array literal: [ expr, expr, ... ]
@@ -1772,7 +1919,8 @@ public:
         // Block bodies are parsed via parse_inner_block(), which Parser
         // overrides to support full statements (for, if, while, etc.).
         if (this.check(TokenType::LBrace)) {
-            const block: BlockStmtNode* = this.parse_inner_block();
+            mut block: BlockStmtNode* = this.parse_inner_block();
+            this.promote_value_block_tail(block);
             arm.set_body(block);
         } else {
             const body_expr: ExpressionNode* = this.parse_expression();
@@ -1788,35 +1936,46 @@ public:
         return arm;
     }
 
-    /// Parse a variable declaration inside a match expression arm block.
-    /// Handles: const name: Type = expr;  /  mut name = expr;
-    /// Lightweight version that doesn't need full Parser::parse_declaration.
-    parse_match_arm_var_decl() -> VarDeclNode* {
-        const start: Token = this.current();
-        const is_mutable: boolean = this.check(TokenType::KwMut);
-        this.advance(); // consume const/mut
-
-        const name_tok: Token = this.consume(TokenType::Identifier, "variable name");
-        const name: SymbolStr = this.intern_lexeme(name_tok);
-        mut node: VarDeclNode* = new VarDeclNode(name, this.span_from_token(start));
-        node.set_mutable(is_mutable);
-        node.set_name_span(this.span_from_token(name_tok));
-        node.set_kw_span(this.span_from_token(start));
-
-        // Optional type annotation: `: Type`
-        if (this.match_tok(TokenType::Colon)) {
-            node.set_type_annotation(this.parse_type_annotation());
+    /// A match-expression arm's braced body is a VALUE block: codegen takes the
+    /// arm's value from whatever its LAST statement left behind (the same
+    /// contract `BlockStmtNode.synth_drops` is built around).  Inside that
+    /// block, `match` parses in statement position, and the statement lowering
+    /// merges no value — so an arm whose tail is a `match` would silently adopt
+    /// whichever value that match's last arm happened to emit, regardless of
+    /// which arm actually ran.  Re-form such a tail as the expression it is
+    /// being used as, so it lowers with its own phi.
+    ///
+    /// Only the TAIL is rewritten. An earlier `match` in the same block really
+    /// is a statement, evaluated for effect, and must keep lowering as one.
+    /// The unbraced arm form (`p => match (x) { .. }`) already parses as an
+    /// expression and never reaches here.
+    promote_value_block_tail(block: BlockStmtNode*) -> void {
+        if (block == null || block.statements.length == 0) { return; }
+        const last: i64 = block.statements.length - 1;
+        const s: StatementNode* = block.statements[last];
+        if (s == null || s.kind != NodeKind::MatchStatement) { return; }
+        const ms: MatchStmtNode* = s as MatchStmtNode*;
+        // Both nodes carry the same components, so this re-wraps rather than
+        // rebuilding: the arms move across by pointer and keep their bindings,
+        // guards and bodies (and their identity, which later passes rely on).
+        mut me: MatchExprNode* = new MatchExprNode(ms.subject, ms.span);
+        for (mut i: i64 = 0; i < ms.arms.length; i++) {
+            const a: MatchArmNode* = ms.arms[i];
+            // These arms were parsed in STATEMENT context, so their own bodies
+            // were never treated as value blocks.  Promoting this node makes
+            // them value blocks, so their tails need the same treatment — which
+            // is what carries the promotion to arbitrary depth.  Idempotent on
+            // an arm already parsed in expression context: its tail is an
+            // ExpressionStatement by then and no longer matches.
+            if (a != null && a.body != null && a.body.kind == NodeKind::BlockStatement) {
+                this.promote_value_block_tail(a.body as BlockStmtNode*);
+            }
+            me.add_arm(a);
         }
-
-        // Optional initializer: `= expr`
-        if (this.match_tok(TokenType::Equal)) {
-            node.set_initializer(this.parse_expression());
-        }
-
-        this.match_tok(TokenType::Semicolon);
-        node.span = this.span_from(start);
-        return node;
+        block.statements[last] =
+            new ExprStmtNode(me as ExpressionNode*, ms.span) as StatementNode*;
     }
+
 
     /// Parse a pattern (internal, used by match expressions and statements).
     parse_pattern_internal() -> PatternNode* {
@@ -2239,8 +2398,19 @@ public:
 
     /// Scan forward to determine if `<` begins generic type arguments.
     /// Returns true if we find a matching `>` followed by `(`, `{`, or `::`.
+    ///
+    /// The scan stays inside the grouping the `<` appeared in. A type argument
+    /// list is balanced with respect to `()` and `[]` - a tuple type `(i32,
+    /// i64)` or an array suffix `[]` nests, but nothing may close a group the
+    /// list did not open. So a closer arriving at depth zero means the `<` was
+    /// a comparison, and any `>` found beyond it belongs to something else
+    /// entirely. Without this the scan runs out of the enclosing argument list
+    /// and pairs the `<` with a `>` from a LATER argument: in
+    /// `f((a < b), (c > (d)))` it spans `a < b), (c >`, then generic-argument
+    /// parsing fails on the `)` it never expected to see.
     is_generic_call_ahead() -> boolean {
         mut angle_depth: int = 1;
+        mut group_depth: int = 0;
         mut offset: int = 1;
         const max_lookahead: int = 200;
 
@@ -2249,6 +2419,14 @@ public:
 
             // EOF: not a generic
             if (tok.kind == TokenType::EOF) { return false; }
+
+            if (tok.kind == TokenType::LParen || tok.kind == TokenType::LSquare) {
+                group_depth += 1;
+            } else if (tok.kind == TokenType::RParen ||
+                       tok.kind == TokenType::RSquare) {
+                if (group_depth == 0) { return false; }
+                group_depth -= 1;
+            }
 
             if (tok.kind == TokenType::LAngle) {
                 angle_depth += 1;
@@ -2318,6 +2496,40 @@ public:
         return false;
     }
 
+    /// Error recovery for a `<...>` that turned out not to hold type
+    /// arguments: advance past its closing `>` so the enclosing expression can
+    /// still be parsed. The opening `<` is already consumed, so nesting starts
+    /// at one. Stops at a closer that would leave the enclosing group, and at
+    /// the statement terminators, so a missing `>` cannot run away.
+    skip_past_generic_args() -> void {
+        mut angle_depth: int = 1;
+        mut group_depth: int = 0;
+        mut steps: int = 0;
+        while (angle_depth > 0 && !this.is_at_end() && steps < 200) {
+            const k: TokenType = this.current().kind;
+            if (k == TokenType::Semicolon || k == TokenType::LBrace) { return; }
+            if (k == TokenType::LParen || k == TokenType::LSquare) {
+                group_depth += 1;
+            } else if (k == TokenType::RParen || k == TokenType::RSquare) {
+                if (group_depth == 0) { return; }
+                group_depth -= 1;
+            } else if (k == TokenType::LAngle) {
+                angle_depth += 1;
+            } else if (k == TokenType::RAngle) {
+                angle_depth -= 1;
+            } else if (k == TokenType::GreaterGreater) {
+                angle_depth -= 2;
+            }
+            this.advance();
+            steps += 1;
+        }
+        // The cursor now sits at a known-good point - just past the `<...>` -
+        // which is what panic mode exists to find. Leaving it set would make
+        // the rest of the statement refuse to parse and report the fallout
+        // instead of the cause.
+        this.panic_mode = false;
+    }
+
     /// Parse generic type arguments: <T1, T2*, Array<int>, ...>
     /// Returns structured TypeAnnotation nodes, preserving pointer, array,
     /// optional, and nested generic structure.
@@ -2328,12 +2540,43 @@ public:
         while (!this.check(TokenType::RAngle) &&
                !this.check(TokenType::GreaterGreater) &&
                !this.is_at_end()) {
+            // A literal can never begin a type, so the `<` was a comparison
+            // that the lookahead misread - `f(x < 2, 3 > (4))` being the usual
+            // shape. Diagnosed here rather than in `parse_type_annotation`,
+            // which would first report a bare "expected type" from a position
+            // where the reader has no reason to expect one, leaving two errors
+            // for one mistake.
+            const lead: TokenType = this.current().kind;
+            if (lead == TokenType::NumericConstant ||
+                lead == TokenType::StringLiteral ||
+                lead == TokenType::FStringLiteral ||
+                lead == TokenType::CharConstant ||
+                lead == TokenType::KwTrue ||
+                lead == TokenType::KwFalse) {
+                this.report_error(ErrorCode::E0104_EXPECTED_TYPE,
+                    format("expected a type in generic arguments, found the value `%s`; if `<` was meant as a comparison, parenthesise the operands - `(x < y)`",
+                           this.current().lexeme));
+                // Resync past the matching `>` and return rather than break.
+                // Leaving the cursor on the offending token makes the enclosing
+                // expression fail too, burying the useful message under
+                // "expected ')'" / "expected ';'" cascades about the same
+                // mistake; stepping over the whole `<...>` lets the rest of the
+                // statement parse and keeps the diagnostics on the real error.
+                this.skip_past_generic_args();
+                return args;
+            }
             const ann: TypeAnnotation* = this.parse_type_annotation();
             if (ann != null) {
                 args.push(ann);
             } else {
+                // Reaching here means the `<` was committed to as opening type
+                // arguments and the contents turned out not to be a type. The
+                // same text is very often a comparison instead - `f(x < 2, 3 >
+                // (4))` - so lead with that rather than with a bare "expected
+                // type", which reads as though a type belonged here.
                 this.report_error(ErrorCode::E0104_EXPECTED_TYPE,
-                    format("expected type in generic arguments, found '%s'", this.current().lexeme));
+                    format("expected type in generic arguments, found '%s'; if `<` was meant as a comparison, parenthesise the operands - `(x < y)`",
+                           this.current().lexeme));
                 break;
             }
 
@@ -2454,6 +2697,46 @@ public:
             span:     this.span_from(start),
         };
         return new TypeAnnotation::ImplTrait(imp);
+    }
+
+    /// Parse a where-clause bound SUBJECT that is an associated-type projection:
+    /// `This::Item`, `S::ReadFut`, or a chain (`S::ReadFut::Output`).
+    ///
+    /// In subject position a `Base::Member` path is unambiguously a projection -
+    /// a where-bound constrains a type parameter or a projection off one, never a
+    /// module-qualified concrete type - so the disambiguation the general type
+    /// grammar cannot make is available here. `parse_base_type` would flatten an
+    /// identifier base into a qualified `Named` ("S::ReadFut"), a shape that every
+    /// projection consumer (`projection_ann_member`, `projection_member_of`,
+    /// `is_projection_annotation`) silently reads as "not a projection", leaving
+    /// the bound inert. Only `This::Item` survived that, because `This` is a
+    /// keyword and so takes `parse_base_type`'s Projection branch.
+    parse_projection_subject() -> TypeAnnotation* {
+        // `This::Item` already builds a Projection chain.
+        if (this.check(TokenType::KwThisType)) { return this.parse_base_type(); }
+
+        const head_tok: Token = this.consume(TokenType::Identifier, "type parameter");
+        mut base_ann: TypeAnnotation* = new TypeAnnotation::Named(
+            new NamedAnnotation {
+                name:         this.intern_lexeme(head_tok),
+                span:         this.span_from_token(head_tok),
+                pre_resolved: TypeRef::invalid(),
+            }
+        );
+        while (this.check(TokenType::ColonColon)) {
+            this.advance(); // consume '::'
+            const mem_tok: Token = this.consume(TokenType::Identifier,
+                "associated type name after '::'");
+            const pj: ProjectionAnnotation* = new ProjectionAnnotation {
+                base:         base_ann,
+                member:       this.intern_lexeme(mem_tok),
+                owning_trait: SymbolStr::empty(),
+                resolved:     TypeRef::invalid(),
+                span:         this.span_from(head_tok),
+            };
+            base_ann = new TypeAnnotation::Projection(pj);
+        }
+        return base_ann;
     }
 
     /// Parse a base type (primitive, `This`, or named).
@@ -2648,16 +2931,24 @@ public:
                     // Heap-backed dynamic array: T[]
                     this.advance();
                     const arr_ann: ArrayAnnotation* = new ArrayAnnotation {
-                        element: result,
-                        size:    ArrayAnnotation::heap_dynamic_size(),
-                        span:    this.current_span(),
+                        element:   result,
+                        size:      ArrayAnnotation::heap_dynamic_size(),
+                        size_expr: null,
+                        span:      this.current_span(),
                     };
                     result = new TypeAnnotation::Array(arr_ann);
                 } else {
-                    // Fixed-size array: T[N] or T[CONST_NAME]
-                    // Parse the size as a numeric constant or identifier (const ref)
+                    // Fixed-size array: T[N], T[CONST_NAME], T[CONST * 2]
+                    //
+                    // A plain numeric literal is decoded here; anything else is
+                    // kept as an expression for the type resolver to constant-
+                    // fold once names are bound.  The expression MUST be
+                    // retained: discarding it leaves the size permanently
+                    // unknown, and an array whose size never resolves is
+                    // emitted as a descriptor with no storage behind it.
                     const size_tok: Token = this.current();
                     mut size: i64 = 0;
+                    mut size_expr: ExpressionNode* = null;
                     if (size_tok.kind == TokenType::NumericConstant) {
                         // Decode the full numeric lexeme: this honours the
                         // `0x`/`0o`/`0b` base prefixes and `_` separators that
@@ -2673,25 +2964,21 @@ public:
                         }
                         size = ParserBase::parse_numeric_lexeme_i64(size_tok.lexeme);
                         this.advance();
-                    } else if (size_tok.kind == TokenType::Identifier) {
-                        // Named constant: T[BTREE_MAX_KEYS].  Mark it
-                        // fixed-pending (size resolved later) - distinct from
-                        // a heap-backed `T[]` so ownership analysis does not
-                        // free its (nonexistent) heap buffer.  Still
-                        // `is_dynamic()`, so layout and codegen are unchanged.
-                        size = ArrayAnnotation::fixed_pending_size();
-                        this.advance();
                     } else {
-                        // Computed-size expression: also a fixed array
-                        // awaiting resolution.
-                        size = ArrayAnnotation::fixed_pending_size();
-                        this.advance();
+                        // Named constant or computed size: T[BTREE_MAX_KEYS],
+                        // T[CHUNK * 2].  Marked fixed-pending until the type
+                        // resolver folds `size_expr` - distinct from a
+                        // heap-backed `T[]` so ownership analysis does not free
+                        // its (nonexistent) heap buffer.
+                        size      = ArrayAnnotation::fixed_pending_size();
+                        size_expr = this.parse_expression();
                     }
                     this.consume(TokenType::RSquare, "']'");
                     const arr_ann: ArrayAnnotation* = new ArrayAnnotation {
-                        element: result,
-                        size:    size,
-                        span:    this.current_span(),
+                        element:   result,
+                        size:      size,
+                        size_expr: size_expr,
+                        span:      this.current_span(),
                     };
                     result = new TypeAnnotation::Array(arr_ann);
                 }

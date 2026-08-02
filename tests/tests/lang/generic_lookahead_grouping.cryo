@@ -1,0 +1,122 @@
+///! The `<` generic-argument lookahead must not escape the grouping the `<`
+///! appeared in.
+///!
+///! Deciding whether `<` opens a type-argument list means scanning ahead for a
+///! balancing `>`. That scan tracked angle nesting only, so it walked straight
+///! out of the enclosing argument list and paired the `<` of one argument with
+///! the `>` of a LATER one: in `take2((a < b), (c > (d)))` it spanned
+///! `a < b), (c >`, and generic-argument parsing then failed on the `)` it had
+///! never expected - E0100 "expected '>', found ')'".
+///!
+///! A type-argument list is balanced with respect to `()` and `[]`: a tuple
+///! type nests, an array suffix nests, but nothing may close a group the list
+///! did not open. So a closer arriving at grouping depth zero proves the `<`
+///! was a comparison, and the scan stops.
+///!
+///! The bare `take2(a < b, c > (d))` spelling is settled separately, by what
+///! the name is bound to: a parameter, a local, or a module-level global binds
+///! a VALUE, and a value is not a generic function or type, so its `<` is a
+///! comparison however much the following tokens resemble type arguments.
+///! Names that bind no known value - anything imported, most obviously - still
+///! go to the token scan, so the generic calls below must keep working.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::GenericLookaheadGrouping;
+
+import std::core::result;
+import std::test::error;
+import std::test::assert;
+
+function ident<T>(v: T) -> T { return v; }
+function pair_first<A, B>(a: A, b: B) -> A { return a; }
+
+function take2(x: boolean, y: boolean) -> i32 {
+    if (x && y) { return 1; }
+    return 0;
+}
+
+// Parenthesised comparisons as call arguments: the shape that failed to parse.
+![test]
+function parenthesised_comparison_args_parse() -> Result<(), TestError> {
+    const a: i32 = 1;
+    const b: i32 = 2;
+    const c: i32 = 3;
+    const d: i32 = 4;
+    // 1 < 2 is true, 3 > 4 is false.
+    return expect(take2((a < b), (c > (d))) == 0, Str::new("(a<b) && (c>(d))"));
+}
+
+// Same shape, both operands true - guards against the arguments being
+// swallowed or reordered rather than merely parsing.
+![test]
+function parenthesised_comparison_args_both_true() -> Result<(), TestError> {
+    const a: i32 = 1;
+    const b: i32 = 2;
+    const c: i32 = 3;
+    const d: i32 = 4;
+    return expect(take2((a < b), (d > (c))) == 1, Str::new("(a<b) && (d>(c))"));
+}
+
+// Module-level globals bind values too, and the pre-scan finds them wherever
+// they sit in the file - these are declared BELOW the function that uses them.
+![test]
+function global_operands_read_as_comparisons() -> Result<(), TestError> {
+    return expect(take2(g_a < g_b, g_c > (g_d)) == 0, Str::new("globals"));
+}
+
+const g_a: i32 = 1;
+const g_b: i32 = 2;
+const g_c: i32 = 3;
+const g_d: i32 = 4;
+
+// Parameters bind values: the bare spelling must read as comparisons here.
+function via_params(a: i32, b: i32, c: i32, d: i32) -> i32 {
+    return take2(a < b, c > (d));
+}
+
+// The bare, unparenthesised headline case, with locals.
+![test]
+function bare_comparison_args_with_locals() -> Result<(), TestError> {
+    const a: i32 = 1;
+    const b: i32 = 2;
+    const c: i32 = 3;
+    const d: i32 = 4;
+    // 1 < 2 is true, 3 > 4 is false.
+    return expect(take2(a < b, c > (d)) == 0, Str::new("bare a<b, c>(d)"));
+}
+
+// Same shape, both operands true - a fix that simply dropped one argument
+// would still pass the case above.
+![test]
+function bare_comparison_args_both_true() -> Result<(), TestError> {
+    const a: i32 = 1;
+    const b: i32 = 2;
+    const c: i32 = 3;
+    const d: i32 = 4;
+    return expect(take2(a < b, d > (c)) == 1, Str::new("bare a<b, d>(c)"));
+}
+
+![test]
+function bare_comparison_args_with_params() -> Result<(), TestError> {
+    return expect(via_params(1, 2, 4, 3) == 1, Str::new("params a<b, c>(d)"));
+}
+
+// The grouping guard must not cost us real generic calls.
+![test]
+function generic_call_still_parses() -> Result<(), TestError> {
+    return expect(ident<i32>(7) == 7, Str::new("ident<i32>(7)"));
+}
+
+![test]
+function multi_arg_generic_call_still_parses() -> Result<(), TestError> {
+    return expect(pair_first<i32, i64>(8, 9) == 8,
+                  Str::new("pair_first<i32, i64>(8, 9)"));
+}
+
+// A generic call in argument position - the scan starts inside an open `(`,
+// so this is the case most at risk from a grouping-depth guard.
+![test]
+function nested_generic_call_still_parses() -> Result<(), TestError> {
+    return expect(ident<i32>(ident<i32>(10)) == 10,
+                  Str::new("ident<i32>(ident<i32>(10))"));
+}

@@ -362,8 +362,58 @@ type struct SymbolResolver {
         mut g_val: LValue = this.llvm_module.get_named_global(mangled);
         if (!g_val.is_valid()) {
             g_val = this.llvm_module.add_global(g_llvm_ty, mangled);
+            // A cross-module reference to a `![thread_local]` global must
+            // itself be thread-local, or it references the TLS symbol with a
+            // non-TLS relocation and fails to link.
+            if (di.is_global_thread_local(name)) {
+                g_val.set_thread_local(true);
+            }
         }
         this.globals.register(name, g_val);
+        return g_val;
+    }
+
+    /// Look up the global `name` as declared by the module named by
+    /// `scope_leaf`, for a qualified `scope_leaf::name` reference.
+    ///
+    /// `resolve_global` keys everything — the DI lookup, the namespace it
+    /// mangles with, and its cache — on the BARE leaf, which is last-write-wins
+    /// across every module declaring that leaf. Globals are NOT unique by leaf
+    /// at link time (that is exactly why they are mangled `C$<ns>.<name>`), so a
+    /// qualified reference resolved that way can bind to another module's
+    /// definition: a different address, a different value, a different type.
+    /// Returns null when no single module matches, or when the match is the
+    /// current module, leaving the caller its existing in-module path.
+    resolve_global_in_scope(mut &this, name: SymbolStr, scope_leaf: SymbolStr) -> LValue {
+        const intern: InternTable* = this.ctx.intern_table;
+        const di: DeclarationIndex* = this.ctx.decl_index;
+
+        mut def_ns: SymbolStr = SymbolStr::empty();
+        mut def_module: SymbolStr = SymbolStr::empty();
+        const g_type_ref: TypeRef = di.find_global_in_scope(name, scope_leaf, intern,
+                                                            &def_ns, &def_module);
+        if (g_type_ref.is_invalid()) { return LValue::null(); }
+        if (this.owned_by_current_module(def_module)) { return LValue::null(); }
+
+        // Cache under the namespace-qualified key: the bare key belongs to
+        // whichever module `resolve_global` happened to bind first.
+        const cache_key: SymbolStr = intern.intern(
+            format("%s::%s", intern.resolve(def_ns), intern.resolve(name)));
+        const cached: LValue = this.globals.get(cache_key);
+        if (cached.is_valid()) { return cached; }
+
+        const g_llvm_ty: LType = this.type_mapper.map_type(g_type_ref);
+        if (!g_llvm_ty.is_valid()) { return LValue::null(); }
+
+        const mangled: string = MangledName::for_global(intern, def_ns, name).resolve(intern);
+        mut g_val: LValue = this.llvm_module.get_named_global(mangled);
+        if (!g_val.is_valid()) {
+            g_val = this.llvm_module.add_global(g_llvm_ty, mangled);
+            if (di.is_global_thread_local(name)) {
+                g_val.set_thread_local(true);
+            }
+        }
+        this.globals.register(cache_key, g_val);
         return g_val;
     }
 

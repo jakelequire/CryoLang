@@ -9,7 +9,7 @@ Cryo is a statically-typed, compiled systems language. It targets native machine
 
 2. **One toolchain.** Build, run, test, fetch, init, and check are subcommands of a single `cryo` binary. The package manager, the test runner, and the dependency resolver ship with the compiler.
 
-3. **Pay for what you use.** Cryo provides single-inheritance classes with virtual dispatch *and* a trait system with monomorphic dispatch. Use a class when the program needs runtime polymorphism over a heterogeneous collection; use a trait when you want compile-time abstraction.
+3. **Ownership without lifetimes.** Cryo tracks ownership statically - `Copy` and `Drop` are inferred structurally, destructors are synthesised at every scope exit, and using a value after it has moved is a hard error - but there is no borrow checker, no lifetime annotations, and no garbage collector. Raw pointers stay unchecked and aliasing stays the programmer's responsibility. The model buys deterministic destruction and use-after-move rejection without asking you to prove your program correct to the compiler.
 
 The rest of this document is organised by feature area. Examples are runnable against the current compiler; anything aspirational is marked.
 
@@ -35,12 +35,13 @@ The rest of this document is organised by feature area. Examples are runnable ag
 - [16. Ownership, Copy, and Drop](#16-ownership-copy-and-drop)
 - [17. Directives and Attributes](#17-directives-and-attributes)
 - [18. Foreign Function Interface](#18-foreign-function-interface)
-- [19. The Standard Library](#19-the-standard-library)
-- [20. Testing](#20-testing)
-- [21. Reserved Syntax](#21-reserved-syntax)
-- [22. Grammar Summary](#22-grammar-summary)
-- [23. Project Configuration (cryoconfig)](#23-project-configuration-cryoconfig)
-- [24. Command-Line Interface](#24-command-line-interface)
+- [19. Asynchronous Programming](#19-asynchronous-programming)
+- [20. The Standard Library](#20-the-standard-library)
+- [21. Testing](#21-testing)
+- [22. Reserved Syntax](#22-reserved-syntax)
+- [23. Grammar Summary](#23-grammar-summary)
+- [24. Project Configuration (cryoconfig)](#24-project-configuration-cryoconfig)
+- [25. Command-Line Interface](#25-command-line-interface)
 
 ---
 
@@ -69,23 +70,27 @@ Keywords are reserved identifiers. They cannot be used as variable, function, or
 | Control flow | Declarations    |             | Modifiers   | Operator keywords | Special values | Reserved for future use |
 | ------------ | --------------- | ----------- | ----------- | ----------------- | -------------- | ----------------------- |
 | `if`         | `function`      | `from`      | `const`     | `new`             | `true`         | `yield`                 |
-| `else`       | `class`         | `as`        | `mut`       | `delete`          | `false`        | `async`                 |
-| `switch`     | `struct`        | `implement` | `static`    | `sizeof`          | `null`         | `await`                 |
-| `case`       | `enum`          | `intrinsic` | `public`    | `alignof`         | `this`         | `auto`                  |
-| `default`    | `trait`         | `where`     | `private`   | `typeof`          | `This`         | `unsigned`              |
-| `match`      | `type`          | `extern`    | `protected` | `in`              |                | `tuple`                 |
-| `while`      | `namespace`     |             | `virtual`   | `as`              |                | `optional`              |
-| `for`        | `module`        |             | `override`  |                   |                | `with`                  |
-| `loop`       | `import`        |             | `inline`    |                   |                |                         |
-| `do`         | `export`        |             | `unsafe`    |                   |                |                         |
-| `break`      | `static_assert` |             | `move`      |                   |                |                         |
-| `continue`   | `union`         |             |             |                   |                |                         |
-| `return`     |                 |             |             |                   |                |                         |
-| `asm`        |                 |             |             |                   |                |                         |
+| `else`       | `class`         | `as`        | `mut`       | `delete`          | `false`        | `auto`                  |
+| `match`      | `struct`        | `implement` | `static`    | `sizeof`          | `null`         | `unsigned`              |
+| `while`      | `enum`          | `intrinsic` | `public`    | `alignof`         | `this`         | `tuple`                 |
+| `for`        | `trait`         | `where`     | `private`   | `typeof`          | `This`         | `optional`              |
+| `loop`       | `type`          | `extern`    | `protected` | `in`              |                | `with`                  |
+| `do`         | `namespace`     |             | `virtual`   | `as`              |                |                         |
+| `break`      | `module`        |             | `override`  | `await`           |                |                         |
+| `continue`   | `import`        |             | `inline`    |                   |                |                         |
+| `return`     | `export`        |             | `unsafe`    |                   |                |                         |
+| `asm`        | `static_assert` |             | `move`      |                   |                |                         |
+|              | `union`         |             | `async`     |                   |                |                         |
+|              | `default`       |             |             |                   |                |                         |
+
+`default` appears in exactly one position: `~Type() = default;`, which asks the compiler to
+synthesize the destructor rather than take a written body.
 
 `move` marks a closure that captures its environment by move (see [section 16.3](#163-move-checking)).
 
-Reserved-for-future-use keywords are recognised by the lexer; the parser may accept them in places that have no semantic implementation. See [section 21](#21-reserved-syntax).
+`async` marks a function, method, or trait method whose body is compiled into a state machine and whose call returns a future; `await` suspends the enclosing `async` body until a future completes (see [section 19](#19-asynchronous-programming)).
+
+Reserved-for-future-use keywords are recognised by the lexer; the parser may accept them in places that have no semantic implementation. See [section 22](#22-reserved-syntax).
 
 ### 1.3 Comments
 
@@ -141,7 +146,7 @@ Strings are enclosed in double quotes; characters in single quotes. Both share t
 '\x41'                     // hex byte: equivalent to 'A'
 ```
 
-**Escape sequences:** `\n` `\t` `\r` `\0` `\\` `\'` `\"` `\xHH` (hex byte). Raw strings (`r"..."`) and the additional C escapes `\a \b \f \v` are reserved but not yet implemented - see [section 21](#21-reserved-syntax).
+**Escape sequences:** `\n` `\t` `\r` `\0` `\\` `\'` `\"` `\xHH` (hex byte). Raw strings (`r"..."`) and the additional C escapes `\a \b \f \v` are reserved but not yet implemented - see [section 22](#22-reserved-syntax).
 
 #### f-strings (string interpolation)
 
@@ -159,6 +164,29 @@ const s: String = f"x = {x}, opt = {opt:?}";   // "x = 42, opt = Some(7)"
   `Option`, `Result`, and `Array<T>`.
 - The embedded expression is a full expression: `f"{a + b}"`, `f"{p.x}"`,
   `f"{m.get(k)}"`.
+- A hole may carry a **format spec** after a colon, a subset of Rust's:
+
+  ```
+  {expr:[[fill]align][#][0][width][.precision][type]}
+  ```
+
+  - `align` is `<` (left), `>` (right), or `^` (centre); the default is
+    left. `fill` is any single character placed before the alignment
+    (`{n:*>6}` → `****42`).
+  - `width` is a minimum field width counted in Unicode scalars; shorter
+    values are padded with `fill` (space by default).
+  - A leading `0` zero-pads numbers, keeping the sign and any radix prefix
+    leftmost (`{−5:06}` → `-00005`, `{255:#06x}` → `0x00ff`).
+  - `.precision` truncates a Display value to that many scalars
+    (`{"hello":.3}` → `hel`) and sets the fractional digits of a float
+    (`{pi:.2}` → `3.14`).
+  - `type` selects an integer radix: `x`/`X` (hex), `o` (octal), `b`
+    (binary); `#` adds the `0x`/`0o`/`0b` prefix. A radix formats the
+    value's own-width two's-complement bits, so `{(-5i32):x}` → `fffffffb`.
+  - The spec separator is the first top-level `:`. A hole that mixes a
+    ternary with a spec must parenthesise the ternary
+    (`f"{(c ? a : b):>4}"`); a bare `a ? b : c` (spaces around `:`) is not
+    mistaken for a spec.
 - `{{` and `}}` produce literal `{` and `}`. Standard escape sequences in the
   literal text are processed as in a normal string.
 - The result is a heap-backed `String` the caller owns (and drops). The
@@ -208,7 +236,7 @@ Every value in Cryo has a known type at compile time. A binding's type is either
 
 In performance-sensitive or cross-platform code, prefer the explicit-width forms (`i32`, `u64`, `f64`) so the layout is unambiguous. The shorthand aliases exist for ergonomics.
 
-`string` is a NUL-terminated raw byte pointer matching the C ABI. Inside the standard library, length-typed UTF-8 is modelled by [`Str`](#str) (borrowed) and [`String`](#string) (owned). The translation between them happens at the FFI boundary in `ffi::cstr`.
+`string` is a NUL-terminated raw byte pointer matching the C ABI. Inside the standard library, length-typed UTF-8 is modelled by [`Str`](#20-the-standard-library) (borrowed) and [`String`](#20-the-standard-library) (owned). The translation between them happens at the FFI boundary in `ffi::cstr`.
 
 ### 2.2 Pointer Types
 
@@ -279,7 +307,8 @@ apply((n: int) -> int { return n * 2; }, 21);     // 42 (inline)
 
 A lambda that references a binding from the enclosing scope **captures** it,
 becoming a closure. Copy types (i32, u64, bool, char, references, and any
-`![derive(Copy)]` type) are captured by value-copy; non-Copy types are
+aggregate whose components are all Copy and which has no `Drop` impl - Copy
+is decided structurally, never declared) are captured by value-copy; non-Copy types are
 captured by move - the outer binding is consumed at the lambda's
 construction site (subsequent use is E0452) and the closure-struct's
 synthesized Drop releases the captured value at scope exit. The `move`
@@ -311,6 +340,43 @@ apply((x: i32) -> i32 { return x + bias; }, 32);  // 42 - capturing closure
 apply((x: i32) -> i32 { return x * 2; }, 21);     // 42 - non-capturing lambda
 apply(tentimes, 4);                               // 40 - named function pointer
 ```
+
+#### Where a capturing closure may be passed
+
+The specialisation above happens per call site, and in 1.0 it is wired for
+one call shape: a **non-generic free function**. Passing a *capturing* closure
+anywhere else is rejected at compile time with **E0458** rather than silently
+falling back to an indirect call:
+
+| Callee | Capturing closure | Non-capturing lambda / named fn |
+|---|---|---|
+| Non-generic free function - `apply(c, x)` | **yes** | yes |
+| Generic free function - `apply<T>(c, x)` | E0458 | yes |
+| Method - `obj.run(c)` | E0458 | yes |
+| Scope-resolution call - `Type::run(c)` | E0458 | yes |
+| `extern "C"` callback parameter | never (no environment slot) | yes |
+
+The distinction is *capture*, not syntax. A lambda that captures nothing is an
+ordinary function pointer and binds anywhere a function pointer does, including
+every row above; a lambda that captures becomes an anonymous struct value, and
+only the first row knows how to specialise a receiver for it. This is why
+`opt.map((n: int) -> int { return n * 10; })` is fine while the same call with
+a lambda that closes over a local is E0458 - the callee is a method.
+
+Two ways around it:
+
+```cryo
+// 1. Pull the call into a free function that takes the closure.
+function run_with(f: (i32) -> i32, v: i32) -> i32 { return f(v); }
+run_with((x: i32) -> i32 { return x + bias; }, 32);
+
+// 2. Close over nothing - pass the value as an argument instead.
+opt.map((n: int) -> int { return n * 10; });
+```
+
+These are deferred capabilities, not bugs: the grammar and the closure
+representation already accommodate them, only the receiver-specialisation
+paths for generic, method, and scope-resolution callees are unimplemented.
 
 A combinator that infers a *new* type parameter from the callback's return
 type - for example `Option::map<U>` - does so automatically: `U` is bound from
@@ -613,7 +679,7 @@ function sum(count: i32, args...) -> i64 {
 }
 ```
 
-`va.next<T>()` is the explicit form; `va.next()` infers `T` from the expected type at the call site (see [section 17.x](#directives) on `![implicit]`). `va.as_ptr()` returns the raw `va_list` pointer for forwarding to a C `v*printf` callee - equivalently, pass the original `args` identifier.
+`va.next<T>()` is the explicit form; `va.next()` infers `T` from the expected type at the call site (see [section 17](#17-directives-and-attributes) on `![implicit]`). `va.as_ptr()` returns the raw `va_list` pointer for forwarding to a C `v*printf` callee - equivalently, pass the original `args` identifier.
 
 Two limits are inherited from C varargs and no wrapper can remove them:
 
@@ -725,7 +791,7 @@ Only `mut` bindings can be assigned to.
 
 | Operator       | Description                                                                                                                                   |
 | -------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| `->`           | Return-type arrow; pointer member access (`p->field`).                                                                                        |
+| `->`           | Return-type arrow. Not a member-access operator: `.` auto-dereferences pointers, so write `p.field`, never `p->field`.                         |
 | `=>`           | Pattern-to-body separator inside `match`.                                                                                                     |
 | `::`           | Scope resolution: static methods, enum variants, module members.                                                                              |
 | `?` `:`        | Ternary conditional.                                                                                                                          |
@@ -741,7 +807,7 @@ Only `mut` bindings can be assigned to.
 | `typeof(expr)` | Compile-time type of `expr`, used in type position (decltype-style).                                                                          |
 | `new` `delete` | Heap allocation / deallocation.                                                                                                               |
 
-> **Reserved.** `?.` and `...` in call position are recognised by the lexer but not yet lowered. See [section 21](#21-reserved-syntax). (The range operators `..` / `..=` *are* fully lowered - see [section 5.7](#57-operator-precedence).)
+> **Reserved.** `?.` and `...` in call position are recognised by the lexer but not yet lowered. See [section 22](#22-reserved-syntax). (The range operators `..` / `..=` *are* fully lowered - see [section 5.7](#57-operator-precedence).)
 
 **Pipeline (`|>`, `<|`).** The pipeline operators thread a value into a call. `x |> f` is `f(x)`; with an argument list the piped value is **prepended** - `x |> f(a, b)` is `f(x, a, b)`. The backward form **appends** instead - `f(a, b) <| x` is `f(a, b, x)`. Pipes are left-associative, so `x |> f |> g` is `g(f(x))`. They are a compile-time rewrite to an ordinary call, with no runtime cost.
 
@@ -797,7 +863,7 @@ From **lowest** to **highest**:
 | 15    | `*` `/` `%`                                                   | Left          |
 | 16    | `as`                                                          | Left          |
 | 17    | `-` `!` `&` `*` `~` `++` `--` (unary prefix), `new`, `delete` | Right         |
-| 18    | `()` `[]` `.` `->` `?` (postfix try) `++` `--` (postfix)      | Left          |
+| 18    | `()` `[]` `.` `?` (postfix try) `++` `--` (postfix)           | Left          |
 
 `as` sits between multiplication and unary, so `x * y as i64` casts `y`, not the product. Use parentheses if you mean `(x * y) as i64`.
 
@@ -932,23 +998,7 @@ const name: string = match (n) {
 };
 ```
 
-### 6.9 Switch / Case
-
-A traditional `switch` is also available for **integer, `char`, `bool`, and fieldless enum** values - anything compared by value. There is no implicit fallthrough; each case is independent.
-
-```cryo
-switch (value) {
-    case 1: { println("one");   }
-    case 2: { println("two");   }
-    default: { println("other"); }
-}
-```
-
-A `switch` on anything else is a compile error that points you at the right tool: enums whose variants carry payloads, strings, and other structured types require a `match` (which destructures and checks exhaustiveness), and floating-point values require explicit comparisons.
-
-In idiomatic code, prefer `match`; it supports richer patterns and enforces exhaustiveness. `switch` is provided for familiarity and for low-level integer dispatch.
-
-### 6.10 Ternary
+### 6.9 Ternary
 
 ```cryo
 const abs: int = x >= 0 ? x : -x;
@@ -956,7 +1006,7 @@ const abs: int = x >= 0 ? x : -x;
 
 The ternary is right-associative: `a ? b : c ? d : e` parses as `a ? b : (c ? d : e)`.
 
-### 6.11 Return
+### 6.10 Return
 
 ```cryo
 function add(a: int, b: int) -> int {
@@ -966,7 +1016,7 @@ function add(a: int, b: int) -> int {
 
 `return` exits the current function. If the function has a non-`void` return type, a value is required.
 
-### 6.12 Unsafe Blocks
+### 6.11 Unsafe Blocks
 
 `unsafe { ... }` is recognised at parse time and lowers identically to a plain block. It serves as a **documentation marker**: a visible signal that the enclosed code performs raw pointer arithmetic, calls `extern` functions, or otherwise sits at the edge of the language's safety story. The compiler does not currently impose any extra restriction outside an `unsafe` block, and does not relax any check inside one - every operation Cryo permits today is permitted everywhere.
 
@@ -979,7 +1029,7 @@ unsafe {
 
 This is the committed 1.0 behavior: `unsafe` is a documentation marker and nothing more. It is **not** reserved to silently become enforcing - 1.0 code will not break under a future release on account of `unsafe`. Should later versions add safety checks around raw pointer dereference, raw-to-pointer `as`-casts, or `extern` calls, they would arrive compatibly (as an opt-in lint/warning first), not as a breaking change to code that already compiles.
 
-### 6.13 Inline Assembly
+### 6.12 Inline Assembly
 
 `asm { ... }` embeds target assembly directly, lowering to an LLVM inline-assembly call. The block body is **raw assembly** - written without string quoting - and Cryo values are bound into it through `${ ... }` operand holes. Bare `{` and `}` are literal assembly text, so target syntax that uses braces (AVX-512 mask registers such as `{k1}`, for instance) passes straight through.
 
@@ -1159,23 +1209,22 @@ Visibility may also be declared per-field with a leading `private` / `public`. W
 
 > Field visibility (a `private` *field* -> type-scoped, `E0353`) is a different axis from a top-level type being `private` (module-scoped, `E0503` - see [section 14.4](#144-visibility)). A `public` struct may have `private` fields, and a `private` struct's fields are public to the rest of its own module.
 
-Fields may declare **default values** with `= <expr>`.
-
-> **Status: reserved - see [section 21](#21-reserved-syntax).** The default-value
-> syntax parses, but defaults are **not yet applied** at construction: a
-> struct literal must still supply every field, and omitting a field that
-> has a default is an error (`E0355`). The syntax below is accepted by the
-> parser today purely so the eventual feature is forward-compatible.
+Fields may declare **default values** with `= <expr>`. When a struct literal
+omits a field that has a default, the default is used; a field with no default
+must still be supplied, and omitting one is `E0355`. A default is a standalone
+expression - it cannot reference the other fields - and is evaluated afresh at
+each construction that omits the field.
 
 ```cryo
 type struct Config {
-    debug:   boolean = false;   // default parsed, but NOT yet applied
+    debug:   boolean = false;
     verbose: boolean = false;
+    retries: i32     = 3;
 }
 
-// Today this is an error (E0355: missing fields `debug`, `verbose`);
-// when defaults are implemented it will construct Config { false, false }.
-const c: Config = Config {};
+const c: Config = Config {};              // -> { false, false, 3 }
+const d: Config = Config { retries: 5 };  // -> { false, false, 5 } (supplied value wins)
+// Omitting a field that has NO default is still `E0355`.
 ```
 
 ### 8.3 Methods
@@ -1975,6 +2024,70 @@ it generates two independent types and two specialised function bodies, one for 
 
 The pipeline driver lives in [`compiler/src/compiler/types/monomorphizer.cryo`](../compiler/src/compiler/types/monomorphizer.cryo) (Phase 6a in `instance.cryo`), invoked after type resolution and trait-bound validation but before function-body type checking. The follow-on [`compiler/src/compiler/passes/specialization.cryo`](../compiler/src/compiler/passes/specialization.cryo) walks already-typed bodies and rewrites generic call sites to point at the monomorphised callees.
 
+### 12.7 `static match` — Compile-Time Type Dispatch
+
+`static match` selects a body by inspecting a type parameter *at compile time*. It is the mechanism that lets one generic function accept several unrelated types without a trait bound and without runtime dispatch.
+
+```cryo
+static match (T) {
+    u8      => { this.write_u8(value); }
+    i8      => { this.write_u8(value as u8); }
+    boolean => { this.write_u8(if (value) { 1 as u8 } else { 0 as u8 }); }
+}
+```
+
+The subject is a **type**, not a value, and each arm is a type rather than a pattern. During monomorphisation the compiler knows what `T` is, keeps the one matching arm, and discards the rest — so there is no branch and no runtime cost in the emitted code.
+
+**Arms may group types with `|`, and `_` is the wildcard:**
+
+```cryo
+static match (T) {
+    u8 | u16 | u32 | u64 => { this.push_display(item) }
+    string               => { this.push_view_bytes(Str::from(item)) }
+    _                    => { core::panic("unsupported", FILE, LINE); }
+}
+```
+
+**Omitting `_` makes the arm list the accepted-type list.** A `T` that matches no arm is a compile error. This is deliberate and is how the standard library expresses "this generic accepts exactly these types" without inventing a trait:
+
+```cryo
+// `String::try_push` accepts strings, integers, floats and boolean.
+// Any other T is rejected at compile time - there is no `_` arm.
+try_push<T>(mut &this, item: T) -> Result<(), AllocError> {
+    return static match (T) {
+        String  => { this.push_view_bytes(item.as_str()) }
+        Str     => { this.push_view_bytes(item) }
+        string  => { this.push_view_bytes(Str::from(item)) }
+        u8 | u16 | u32 | u64 |
+        i8 | i16 | i32 | i64 |
+        f32 | f64 |
+        boolean => { this.push_display(item) }
+    };
+}
+```
+
+**Statement and expression position both work.** As an expression, every arm's body yields the value of its final expression, and all arms must agree on a type — as in the `try_push` example above, where each arm yields `Result<(), AllocError>`.
+
+**Discarded arms are not type-checked against the wrong type.** Because pruning happens before the body is checked, an arm may use operations that are valid only for its own type — `item.as_str()` in the `String` arm above is not an error when `T` is `u8`, since that arm no longer exists in the `u8` instantiation. This is the property that makes the construct useful: without it, every arm would have to compile for every `T`.
+
+**The subject may be any type parameter in scope** — the enclosing type's parameter, or one introduced by the method itself:
+
+```cryo
+type struct Atomic<T> {
+    // `T` here comes from the type.
+    load(&this) -> T { return static match (T) { /* ... */ }; }
+}
+
+implement struct String {
+    // `T` here is introduced by the method.
+    push<T>(mut &this, item: T) -> void { /* static match (T) ... */ }
+}
+```
+
+`static match` is also permitted in a trait's default method body, which is what lets `io::Write::write<T>` dispatch on the payload type without each implementor restating the arms.
+
+**When to reach for it.** Prefer a trait bound when the operation is genuinely the same across types and the set is open. Reach for `static match` when the set of accepted types is closed and each one needs *different* code — width-specific integer handling, or a conversion whose implementation differs per source type. The standard library uses it for `Hash::fold`, `String::push`/`try_push`, `Str::from`, `Atomic<T>`, and `io::Write::write`.
+
 ---
 
 ## 13. Implement Blocks
@@ -2161,11 +2274,14 @@ const arr: int* = new int[100];
 
 ### 15.3 Null
 
-`null` is the null pointer literal, valid in any pointer context.
+`null` is the null pointer literal, valid in any pointer context. The primitive `string` is pointer-shaped (a NUL-terminated `u8*`), so it counts as a pointer context: `null` assigns to, initializes, returns as, and compares with a `string` without a cast.
 
 ```cryo
 const p: int* = null;
 if (p == null) { println("null"); }
+
+const s: string = null;          // string is pointer-shaped
+if (s == null) { println("no name"); }
 ```
 
 Dereferencing a null pointer is undefined behaviour. For "may be absent" semantics on a value, use `Option<T>` rather than a nullable pointer; the compiler then forces you to handle the absent case at every use.
@@ -2243,6 +2359,64 @@ Cryo has **no borrow checker**. References and raw pointers are unchecked: alias
 
 ---
 
+### 16.4 The `Send` and `Sync` Traits
+
+`Send` means a value may be moved to another thread; `Sync` means it may be
+shared between threads by reference. Like `Copy`, they are **decided by the
+compiler, never declared** - `implement trait Send for T { ... }` is not how a
+type becomes `Send`, and writing one has no effect. The declarations in
+`stdlib/core/marker.cryo` are empty marker traits that exist so bounds can
+name them.
+
+The rule is structural, and identical for both traits today (they are separate
+predicates so a future `&T: Send if T: Sync` distinction can land without an
+API change):
+
+- Primitives, references, function pointers, and **raw pointers** are `Send`
+  and `Sync`.
+- Arrays, optionals, and tuples are `Send`/`Sync` if every component is.
+- Structs, classes, and enums are `Send`/`Sync` if every field - or every
+  variant payload - is, **and** the type is not on the deny-list below.
+- Generic parameters and unresolved positions are conservatively **not**
+  `Send`/`Sync`; say `where T: Send` when a generic needs it.
+
+A small deny-list overrides the structural answer for types that are
+genuinely thread-unsafe despite being built from `Send` parts. It is matched
+on the fully-qualified name, so a type of your own merely *named* `Rc` is not
+caught by it:
+
+| Type | Why |
+|---|---|
+| `std::alloc::rc::Rc` | non-atomic refcount; use `Arc` across threads |
+| `std::sync::mutex::MutexGuard` | POSIX mutexes must be released by the acquiring thread |
+| `std::sync::rwlock::RwLockReadGuard` | as above |
+| `std::sync::rwlock::RwLockWriteGuard` | as above |
+
+#### `Send` is advisory at the edges
+
+Bounds are genuinely enforced: `Send`/`Sync` are checked at every explicit
+`where T: Send` / `where T: Sync`, and the thread entry points carry them -
+`thread::spawn`, `try_spawn`, and `spawn_with_attr` require `C: Send, T: Send`,
+`Scope::spawn` requires `C: Send`. Moving an `Rc<T>` or a lock guard into
+another thread is a compile error.
+
+What the rule does **not** do is make `Send` a safety guarantee:
+
+- **Raw pointers are unconditionally `Send + Sync`.** This is deliberate -
+  Cryo has no borrow checker, and the containers built on raw pointers
+  (`Box`, `Arc`, `Array`, `String`, `mpsc::Sender`) are structurally `Send`
+  because of it. A struct that hides a `T*` and reasons about it correctly
+  does not have to fight the type system; a struct that hides a `T*` and
+  reasons about it *incorrectly* is `Send` all the same.
+- **The deny-list is a fixed list, not a derivation.** A new thread-unsafe
+  type is `Send` until someone adds it.
+- **Lock constructors do not yet carry `T: Send` bounds**, so a
+  `Mutex<Rc<_>>` is still constructible. That is the known remaining edge.
+
+Treat a `Send` bound as "the compiler checked the parts it can see", not as
+proof that a value is safe to move across a thread. Where a type wraps a raw
+pointer whose target is not thread-safe, the obligation is the author's.
+
 ## 17. Directives and Attributes
 
 Directives are compile-time annotations attached to declarations using `![...]` syntax. They modify how the compiler treats the declaration without changing its semantic meaning at the call site.
@@ -2273,24 +2447,28 @@ type struct AlignedData {
 | `![inline]`                                               | function                  | Inlining hint. *Parsed and validated; not yet emitted as an LLVM attribute (no effect at the default `-O0`).*                                                                                                                                                                                                                                                                                                               |
 | `![noinline]`                                             | function                  | Anti-inlining hint. *Parsed and validated; not yet emitted as an LLVM attribute.*                                                                                                                                                                                                                                                                                                                                           |
 | `![deprecated]` / `![deprecated("msg")]`                  | any decl                  | Marks a declaration as deprecated. *Parsed and validated; use-site warnings are not yet emitted.*                                                                                                                                                                                                                                                                                                                           |
-| `![symbol("name")]`                                       | extern fn / method        | Override the linker symbol used to resolve an extern function or body-less method: Cryo callers use the declared name while the symbol resolved at link time is `name`. Used by the C++ binding generator to pin a decl to its Itanium-mangled symbol.                                                                                                                                                                      |
+| `![symbol("name")]`                                       | extern fn / method / fn definition | Override the linker symbol: Cryo callers use the declared name while the symbol emitted / resolved at link time is `name`. On an extern decl or body-less method it renames the *imported* symbol; on a function *definition* it renames the *emitted* symbol. Used by the C++ binding generator to pin a decl to its Itanium-mangled symbol.                                                                          |
+| `![no_mangle]`                                            | function / method         | Emit the definition under its bare declared identifier instead of the mangled `C$…` symbol, so it can be linked from C (or serve as a runtime lang-item) without a wrapper. The preferred unmangling directive; `![symbol("name")]` is for the *rename* case.                                                                                                                                                                |
+| `![weak]`                                                 | function / method         | Emit the definition with weak linkage (and an any-selection COMDAT), so a strong definition elsewhere overrides it. For user-overridable runtime symbols (allocator, panic hook).                                                                                                                                                                                                                                            |
+| `![section("name")]`                                     | function / method         | Place the emitted symbol in object-file section `name`.                                                                                                                                                                                                                                                                                                                                                                     |
+| `![naked]`                                                | function                  | Emit no prologue/epilogue (sets LLVM's `naked` attribute); the body must be a single `asm { … }` block that provides its own `ret`/`jmp`/exit. For a freestanding `_start` and other raw entry points. A non-`asm` body is an error (`E0151`).                                                                                                                                                                                |
 | `![allow(name)]` / `![warn(name)]` / `![deny(name)]`      | any decl                  | Intended to adjust a named lint's level. *Parsed and validated; lint-level adjustment is not yet implemented.*                                                                                                                                                                                                                                                                                                              |
-| `![derive(Trait, ...)]`                                     | struct / class / enum     | Auto-derive one or more traits.                                                                                                                                                                                                                                                                                                                                                                                             |
+| `![derive(Trait, ...)]`                                     | struct / class / enum     | Intended to auto-derive one or more traits. *Parsed and validated; no trait is actually synthesized.* See [section 22](#22-reserved-syntax).                                                                                                                                                                                                                                                                                 |
 | `![sink]`                                                 | method                    | Marks a method as consuming its receiver, even when the receiver is syntactically `&this` or `mut &this`. Useful for methods that semantically take ownership but want the borrow-style call ergonomics.                                                                                                                                                                                                                    |
 | `![implicit]`                                             | generic function / method | Lets a call omit its generic type arguments: the compiler recovers them by unifying the declared return type against the call's *expected* type (the type of the `const x: T = ...` it initialises). Every type parameter must appear in the return type. A call with no expected type reports `E0307`; write the arguments explicitly (`f<T>(...)`) there. Used by `VaArgs::next` so `const n: i64 = va.next()` reads cleanly. |
 | `![config(<atom>)]` / `![target(<atom>)]` / `![<atom>]`   | any decl                  | Platform / build-flavor gate. `<atom>` is `windows`, `linux`, `macos`, `unix`, or `not(<atom>)`. The bare-atom form (`![windows]`) is sugar for `![config(windows)]`. The decl is stripped from the AST when the gate doesn't match.                                                                                                                                                                                        |
 | `![repr(C)]` / `![repr(packed)]` / `![repr(transparent)]` | struct / class / enum     | Memory layout control. See [section 17.3](#173-memory-layout).                                                                                                                                                                                                                                                                                                                                                                    |
 | `![align(N)]`                                             | struct / class / variable | Minimum alignment in bytes; N must be a power of two. See [section 17.3](#173-memory-layout).                                                                                                                                                                                                                                                                                                                                     |
-| `![arch(<arch>, <dialect>)]`                              | asm block                 | Required directly above an `asm { ... }` block (see [section 6.13](#613-inline-assembly)). Names the target architecture - which *gates* the block, like `![config]` - and the assembly dialect (`intel` or `att`).                                                                                                                                                                                                               |
+| `![arch(<arch>, <dialect>)]`                              | asm block                 | Required directly above an `asm { ... }` block (see [section 6.12](#612-inline-assembly)). Names the target architecture - which *gates* the block, like `![config]` - and the assembly dialect (`intel` or `att`).                                                                                                                                                                                                               |
 | `![clobber(...)]`                                         | asm block                 | Lists registers, `flags`, or `memory` that an `asm` block overwrites but does not bind as operands.                                                                                                                                                                                                                                                                                                                         |
 
 The test-mode directives (`![config(testing)]`, `![test]`, `![ignore]`, `![should_panic]`) are documented in the next subsection.
 
-Other names that appear with `![...]` syntax are accepted by the parser and recorded so user tooling can observe them, but the compiler emits a warning for any non-builtin name and applies no semantics. A list of reserved-but-unimplemented directive names is in [section 21](#21-reserved-syntax).
+Other names that appear with `![...]` syntax are accepted by the parser and recorded so user tooling can observe them, but the compiler emits a warning for any non-builtin name and applies no semantics. A list of reserved-but-unimplemented directive names is in [section 22](#22-reserved-syntax).
 
 ### 17.2 Test Directives
 
-The test framework introduces a small set of directives recognised by the compiler ([section 20](#20-testing) covers usage):
+The test framework introduces a small set of directives recognised by the compiler ([section 21](#21-testing) covers usage):
 
 | Directive            | Description                                                        |
 | -------------------- | ------------------------------------------------------------------ |
@@ -2489,9 +2667,14 @@ An aliased import block holds **only** `#include` directives, never Cryo declara
 
 ### 18.3 Calling Cryo from C
 
-Cryo emits each declaration under its [mangled symbol name](cryo-mangling-spec.md). To call a Cryo function from C, write a thin wrapper inside an `extern "C"` block on the Cryo side that forwards to the real function, and declare the wrapper in your C header using the wrapper's mangled symbol.
+Cryo emits each declaration under its [mangled symbol name](cryo-mangling-spec.md). To make a function callable from C, apply **`![no_mangle]`** to its definition: it then ships under its bare declared identifier, which your C header declares directly.
 
-A `![no_mangle]` / `![export]` directive that suppresses mangling for a single Cryo function is on the post-1.0 roadmap; until then, the wrapper-plus-mangled-symbol approach is the supported path.
+```cryo
+function cryo_add(a: i32, b: i32) -> i32 { return a + b; } ![no_mangle]
+// emits `cryo_add` (not the mangled `C$…` symbol); C sees `int cryo_add(int, int);`
+```
+
+Use **`![symbol("name")]`** instead when the exported name must differ from the Cryo identifier. The older approach - a thin wrapper inside an `extern "C"` block that forwards to the mangled function, declared in C under the wrapper's mangled symbol - still works and is the only option when you cannot annotate the definition itself (e.g. exporting a stdlib function you don't own).
 
 ### 18.4 Function-pointer callbacks
 
@@ -2539,11 +2722,337 @@ static_assert(sizeof(Color) == 4, "Color must be 4 bytes to match the C ABI");
 
 ---
 
-## 19. The Standard Library
+## 19. Asynchronous Programming
+
+Cryo supports `async` / `await` as a first-class language feature. An `async` function is compiled into a state machine: its body is split at every suspension point, the values that must survive a suspension become fields of a generated struct, and calling the function builds that struct instead of running the body. Nothing runs until the resulting future is polled.
+
+The model is **stackless**. A future is an ordinary struct with no hidden heap allocation, no separate stack, and no runtime machinery of its own - `async` is a compile-time transformation, and the executor that drives futures is an ordinary library (`std::future`), not part of the language.
+
+This section describes the surface. For how the lowering and the runtime are built - and why there is no `Pin` - see [`docs/async-internals.md`](./async-internals.md).
+
+### 19.1 Async Functions
+
+`async` before `function` makes the function asynchronous. The declared return type is the value the function eventually produces, **not** the future:
+
+```cryo
+import std::future;
+
+async function add_later(a: i64, b: i64) -> i64 {
+    const base: i64 = await ready_value(a);
+    return base + b;
+}
+```
+
+`add_later(1, 2)` returns a future whose output is `i64`. The body has not begun.
+
+An `async` function may return `void`, be generic, and be declared in any order relative to its callers:
+
+```cryo
+async function log_it(msg: Str) -> void { ... }
+
+async function first<T>(a: T, b: T) -> T { ... }
+```
+
+### 19.2 The `await` Operator
+
+`await` suspends the enclosing `async` body until its operand - which must implement `Future` - completes, and evaluates to that future's output.
+
+```cryo
+const n: i64 = await add_later(1, 2);
+```
+
+`await` is an ordinary prefix operator and may appear **anywhere an expression may appear**: in a condition, a loop body, an operand of a larger expression, a `match` subject, a `match` arm body, and a `match` arm guard.
+
+```cryo
+async function drain(mut q: Queue) -> i64 {
+    mut total: i64 = 0;
+    while (await q.has_more()) {
+        total = total + (await q.pop()) * 2;
+    }
+    match (await q.status()) {
+        Status::Clean          => { return total; }
+        Status::Dirty(n) if await q.can_retry() => { return total - n; }
+        _                      => { return 0; }
+    }
+}
+```
+
+`await` is only legal inside an `async` function or method. Using it elsewhere is an error.
+
+### 19.3 The `Future` Trait
+
+`await` is defined in terms of one trait, from `std::future`:
+
+```cryo
+type trait Future {
+    type Output;
+    poll(mut &this, cx: Context*) -> Poll<Output>;
+}
+```
+
+| Type | Meaning |
+| ---- | ------- |
+| `Poll<T>` | `Poll::Ready(T)` or `Poll::Pending`. Helpers: `is_pending()`, `is_ready()`, `into_ready()`. |
+| `Context` | The poll context. `cx.waker()` yields the `Waker` to register for a wake-up. |
+| `Waker` | A handle that reschedules the task. `Waker::noop()` is the no-op waker used by simple drivers. |
+
+`poll` returns `Poll::Pending` only after arranging for `cx.waker()` to be invoked when progress becomes possible; a future that returns `Pending` without registering a waker will never be polled again by a real executor.
+
+The bound is written `Future<T>`, which binds the associated `Output` positionally (see [section 11.5](#115-associated-types)):
+
+```cryo
+function drive<F, R>(fut: F) -> R where F: Future<R> { ... }
+```
+
+Hand-written futures are ordinary types implementing the trait, and are indistinguishable to `await` from compiler-generated ones:
+
+```cryo
+implement trait Future for struct Countdown {
+    type Output = i64;
+
+    poll(mut &this, cx: Context*) -> Poll<i64> {
+        if (this.n == 0) { return Poll::Ready(this.total); }
+        this.n = this.n - 1;
+        cx.waker().wake();
+        return Poll::Pending;
+    }
+}
+```
+
+### 19.4 How an Async Function Is Compiled
+
+Each `async` function generates one struct - the state machine - plus a `Future` implementation for it. The original function becomes a constructor returning that struct.
+
+- A `state` field records which suspension point to resume at. Each poll dispatches on it and re-enters there.
+- Every parameter, and every local that is live across a suspension, becomes a field. A local used only between two suspensions stays an ordinary stack local.
+- Every awaited sub-future is stored in a field and polled from the resuming state.
+- `Poll::Pending` from a sub-future records the state and returns `Pending`; the next poll resumes at that state.
+
+Two consequences are worth stating because they are guarantees, not implementation details:
+
+- **No hidden allocation.** The state machine is a value type. Its size is known at compile time, and a future is only heap-allocated if you put it somewhere that allocates (spawning it as a task, for example).
+- **Futures are freely movable.** Cryo futures are never self-referential, so no pinning discipline exists and none is needed - there is no `Pin` type. This is guaranteed by the restrictions in [section 19.7](#197-restrictions), which reject the constructs that would create a self-reference. Moving a future between polls, including polling it by hand, is well defined.
+
+### 19.5 Async Methods
+
+`async` applies to methods in `type struct`, `type class`, and `implement` blocks, with any receiver form:
+
+```cryo
+type struct Counter {
+    base: i64;
+
+    async bump(&this, n: i64) -> i64 {
+        const step: i64 = await tick();
+        return this.base + n + step;
+    }
+
+    async consume(this) -> i64 { ... }
+
+    static async make(n: i64) -> Counter { ... }
+}
+```
+
+A `&this` / `mut &this` receiver stays borrowed for the whole operation, including across suspensions: the enclosing frame re-establishes the receiver's address before every poll, so a method may read and write through `this` after an `await` exactly as it does before one. The receiver must be a place the caller can name again - see [section 19.7](#197-restrictions).
+
+### 19.6 Async Trait Methods
+
+A trait method may be `async`, with or without a default body:
+
+```cryo
+type trait AsyncRead {
+    async read(mut &this, buf: Array<u8>) -> AsyncIo;
+
+    /// A default body, written once over `read`.
+    async read_exact(mut &this, buf: Array<u8>) -> AsyncIo {
+        mut io: AsyncIo = await this.read(buf);
+        while (io.is_short()) {
+            io = await this.read(io.take_buf());
+        }
+        return io;
+    }
+}
+```
+
+Each implementation's `async` method lowers to its own state machine, so two implementors return two *different* concrete future types while the trait declares one signature. This is expressed with an implicit associated type: `async read(...) -> AsyncIo` declares an associated future type and returns it, and each `implement trait` block binds that associated type to its own generated future. Default bodies are instantiated per implementation and may be overridden.
+
+A generic consumer needs only the trait bound. The future's own bound is implied by the trait and is never respelled at the use site:
+
+```cryo
+async function slurp<S>(mut s: S, buf: Array<u8>) -> AsyncIo
+where S: AsyncRead {
+    return await s.read(buf);
+}
+```
+
+`async` may not be combined with `virtual` or `override` (`E0364`): those share a vtable slot, and each implementation's future is a distinct type.
+
+### 19.7 Restrictions
+
+The rules below exist to keep futures free of self-references, which is what makes them movable and removes the need for a pinning discipline.
+
+| Rule | Diagnostic |
+| ---- | ---------- |
+| A reference may not be held live across an `await`. Owned values are unrestricted. | `E0455` |
+| The address of a local or parameter of the current frame may not be handed to a future that outlives the current step. | `E0455` |
+| An `async` method must be awaited on a receiver that names storage - a local, parameter, field, or dereference. A temporary or call result must be bound to a local first. | `E0455` |
+| An `async` method's future must be awaited at the call, not stored and awaited later. | `E0455` |
+| An `async` function may not await itself, directly or transitively - the state machine would contain itself and have no finite size. Rewrite the recursion as a loop. | `E0600` |
+| `async` may not be combined with `virtual` or `override`, and there are no `async` constructors, destructors, or fields. | `E0364` |
+
+Each suspension runs on a fresh frame, which is why frame addresses do not survive one:
+
+```cryo
+async function bad(n: i64) -> i64 {
+    const p: i64* = &n;          // address into this frame
+    const step: i64 = await tick();
+    return *p + step;            // E0455: `p` is dangling here
+}
+
+async function good(n: i64) -> i64 {
+    const step: i64 = await tick();
+    return n + step;             // the owned value is carried for you
+}
+```
+
+The owned-value rewrite is always available, and it is the idiom the standard library's async I/O follows: an operation that needs a buffer *owns* the buffer for the duration and hands it back on completion, rather than borrowing one from the caller's frame.
+
+### 19.8 `async function main`
+
+`main` may be declared `async`:
+
+```cryo
+import std::future;
+
+async function main() -> i32 {
+    const body: Str = await fetch("example.com");
+    return body.length() as i32;
+}
+```
+
+The compiler renames the asynchronous body out of the entry-point slot and synthesises a synchronous `main` in its place that creates an `Executor` scoped to the entry point, drives the body to completion on it, and tears the runtime down at exit. Parameters are forwarded, so argument handling is identical to a synchronous `main`.
+
+`-> i32` and `-> void` are both accepted. A generic `main`, or any other return type, is an error (`E0365`).
+
+### 19.9 Driving Futures
+
+A future does nothing until something polls it. `std::future` provides two drivers.
+
+**`block_on`** runs a single future to completion on the calling thread, polling in a loop with a no-op waker. It has no reactor, so it suits compute-only futures that make progress on every poll:
+
+```cryo
+import std::future;
+
+const n: i64 = future::block_on(add_later(1, 2));
+```
+
+**`Executor`** is the real runtime: a worker pool with a ready queue, a reactor for I/O and timer readiness, a blocking pool for work no reactor can drive, and `catch_unwind` isolation at the poll boundary so one panicking task cannot take down a worker.
+
+The blocking pool exists because readiness is not universal. `getaddrinfo` has no non-blocking form on either platform, and a regular file is always "ready" as far as `epoll` is concerned, so neither can be parked on the reactor. Calling one directly inside a `poll` stalls a worker for its whole duration — on a single-threaded executor, the whole runtime. `std::future::blocking` runs such calls on threads nobody polls on and fires a `Waker` when they finish; `dns::Resolve` is the one that ships using it, so an `async` name lookup costs a worker nothing while it waits.
+
+The pool creates threads only on demand and only when none is idle, so its ceiling costs nothing until the work arrives; jobs beyond it queue. Because one pool serves every offloading caller in an executor, that ceiling has to cover their combined in-flight count — a caller that holds one job while waiting on a second deadlocks against a ceiling too low to run both. The default is deliberately generous; `Executor::with_threads_and_blocking` overrides it.
+
+```cryo
+mut ex: Executor = Executor::new();
+
+mut h1: JoinHandle<i64> = ex.spawn(work(1));
+mut h2: JoinHandle<i64> = ex.spawn(work(2));
+
+const a: i64 = h1.join();
+const b: i64 = h2.join();
+```
+
+| Operation | Meaning |
+| --------- | ------- |
+| `Executor::new()` | Create a runtime with a default worker pool and its reactor. |
+| `Executor::with_threads(n)` | Same, with exactly `n` worker threads (clamped to >= 1). |
+| `Executor::with_threads_and_blocking(n, m)` | Same, and cap the blocking pool at `m` threads instead of the default. |
+| `ex.spawn(fut)` | Schedule `fut` as an independent task; returns a `JoinHandle<T>`. |
+| `ex.block_on(fut)` | Drive one future to completion on this executor and return its output. |
+| `h.join()` | Wait for the task and take its output. |
+| `h.abort()` | Cancel the task. |
+| `h.detach()` | Let the task run without holding the handle. Dropping a handle detaches. |
+
+`Executor` implements `Drop`, so an executor held in a local tears its runtime down at the end of that scope; join the work you care about before then. Timer and I/O futures require an executor's reactor, so they cannot be driven by the plain `block_on`.
+
+### 19.10 Timers and Combinators
+
+`Sleep` completes after a delay, using the reactor's deadline chain rather than blocking a thread:
+
+```cryo
+import std::time;
+
+await Sleep::new(Duration::from_millis(50));
+await Sleep::until(deadline);
+```
+
+The `Futures` namespace composes futures. Each takes two futures and nests for higher arities:
+
+| Combinator | Behaviour |
+| ---------- | --------- |
+| `Futures::join(a, b)` | Completes when both complete; yields both outputs. |
+| `Futures::try_join(a, b)` | Completes on the first error, abandoning the sibling; otherwise both outputs. |
+| `Futures::select(a, b)` | Completes with whichever finishes first; the loser is dropped. |
+| `Futures::timeout(dur, fut)` | `fut`'s output, or `Elapsed` if the deadline passes first. |
+| `Futures::timeout_at(instant, fut)` | The same against an absolute deadline. |
+
+The duration comes first, so the deadline reads before the work it bounds:
+
+```cryo
+match (await Futures::timeout(Duration::from_secs(5), fetch(url))) {
+    Result::Ok(body) => { ... }
+    Result::Err(_)   => { ... }   // timed out
+}
+```
+
+### 19.11 Cancellation
+
+Cancellation is **a plain drop**. There is no cancellation token and no separate cancel operation: dropping a future before it completes cancels the operation it represents, and the future's `Drop` releases whatever it holds - deregistering a waker from the reactor, disarming a timer, closing a socket it owns. This is why `select` cancels its loser and `timeout` cancels its victim simply by releasing them, and why `Executor::drop` cancels tasks still parked.
+
+Because a future owns the resources of an in-flight operation, cancellation is complete by construction: there is no window in which a cancelled read is still writing into a buffer someone else now owns.
+
+### 19.12 Async I/O
+
+`std::net` is asynchronous. The reactor is `epoll` on Linux and IOCP with `\Device\Afd` on Windows, presented through one interface.
+
+Async I/O futures **own the handle and the buffer** for the duration of the operation and hand both back on completion. That is what makes them sound rather than merely careful: a future may move between polls, so a buffer identified by a pointer into the caller's frame would be written through a stale address.
+
+```cryo
+mut io: TcpIo = await TcpRead::start(stream, buf);
+mut stream: TcpStream  = io.take_stream();
+mut buf:    Array<u8>  = io.take_buf();
+match (io.outcome()) {
+    Result::Ok(n)  => { ... }      // n == 0 means the peer closed
+    Result::Err(e) => { ... }
+}
+```
+
+| Future | Completes with |
+| ------ | -------------- |
+| `TcpConnect` | A connected `TcpStream`. |
+| `TcpAccept` | `TcpAccepted` - the listener back, plus the accepted connection. |
+| `TcpRead` / `TcpWrite` | `TcpIo` - the socket and buffer back, plus the byte count or error. |
+| `TlsHandshake` | A negotiated `TlsIo`. |
+| `TlsRead` / `TlsWrite` | `TlsIo`, with the same hand-back contract. |
+
+The `AsyncRead` and `AsyncWrite` traits ([section 19.6](#196-async-trait-methods)) abstract over transports, so protocol code is written once and runs over plain TCP or TLS:
+
+```cryo
+async function greet<S>(mut conn: S) -> Result<(), IoError>
+where S: AsyncWrite {
+    await conn.write_all(Str::new("HELLO\r\n").as_bytes().to_array());
+    return Result::Ok(());
+}
+```
+
+`TlsConnector::connect` and `TlsAcceptor::accept` are `async` and drive a TLS handshake without blocking: each `WANT_READ` / `WANT_WRITE` becomes a reactor registration rather than a spin, and the direction to wait on is taken from the TLS error code. `start_connect` / `start_accept` stop one step short and return the `TlsHandshake` future itself, for a caller that needs to select over it or give it a deadline.
+
+---
+
+## 20. The Standard Library
 
 The standard library is written entirely in Cryo and ships with the compiler as a single static library plus its sources. It is organised into a small `core` (no allocation, no I/O), a heap-allocation layer (`alloc`), a collection layer (`collections`), and a set of domain-specific modules. The complete top-level manifest with one-line descriptions lives in [`stdlib/lib.cryo`](../stdlib/lib.cryo).
 
-### 19.1 The Prelude
+### 20.1 The Prelude
 
 The prelude is auto-imported into every Cryo source file. Currently:
 
@@ -2564,7 +3073,7 @@ The prelude is auto-imported into every Cryo source file. Currently:
 
 The prelude is deliberately small. Anything else is an explicit `import` - notably, the `print` / `println` / `eprint` / `eprintln` family lives in `std::fmt` and is **not** auto-imported. Examples in this document that use `println` assume `import std::fmt;` is in scope.
 
-### 19.2 Module Map
+### 20.2 Module Map
 
 | Module            | Highlights                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
@@ -2580,13 +3089,13 @@ The prelude is deliberately small. Anything else is an explicit `import` - notab
 | **`math`**        | Thin libm wrappers: `sqrt`, `cbrt`, `pow`, `exp` / `exp2`, `ln`, `log2` / `log10`, `sin` / `cos` / `tan` (plus the `a*` inverses and `*h` hyperbolics), `floor`, `ceil`, `round`, `trunc`, `fabs`, integer `abs_i32` / `abs_i64`, `min` / `max` / `clamp`, `f32` variants (`sqrt_f32`, `fabs_f32`, ...), and the constants `PI`, `TAU`, `E`.                                                                                                                                                                                                                                                             |
 | **`time`**        | `Duration` (normalized seconds + sub-second nanoseconds; `from_secs`/`from_millis`/`from_micros`/`from_nanos`, `as_secs`/`as_millis`/`as_micros`/`as_nanos`/`subsec_*`, `add`/`saturating_sub`/`is_zero`, `Eq` + `Ord`). `Instant` (monotonic `CLOCK_MONOTONIC`; `now`, `elapsed`, `duration_since`). `SystemTime` (wall `CLOCK_REALTIME`; `now`, `unix_epoch`, `duration_since_epoch`, `duration_since`). `sleep(Duration)` (EINTR-restarting). All clock differences saturate at zero.                                                                                                               |
 | **`random`**      | `Rng`, a fast non-cryptographic xoshiro256** generator seeded via `from_seed(u64)` (reproducible) or `from_os()`: `next_u64`/`next_u32`/`next_bool`/`next_f64`, unbiased `below(bound)` / `range_u64(lo, hi)` (rejection-sampled), `fill_bytes`. `secure_bytes(buf, len)` fills from the kernel CSPRNG (`getrandom`); use it for keys/tokens/nonces - `Rng` is not cryptographic.                                                                                                                                                                                                                      |
-| **`net`**         | `IpV4Addr`, `IpV6Addr`, `IpAddr`, `SocketAddr`, `TcpStream` (`Read + Write`), `TcpListener`. **HTTP/1.1 layer (`net::http`):** `Method`, `StatusCode`, `Headers`, `Request`, `Response`, `Router`, `HttpServer` with keep-alive + `Connection: close` opt-out + per-connection read timeouts, `Client::get`/`post` with `send(addr, req)`. **TLS** (`net::tls`, OpenSSL-backed `TlsStream`), **UDP** (`UdpSocket`), **HTTP/2** (`net::http2`, HPACK + single-stream framing), and **WebSocket** (`net::ws`, RFC 6455) all ship in 1.0. IPv6 addressing is parsed and represented but not yet dialable. |
+| **`net`**         | `IpV4Addr`, `IpV6Addr`, `IpAddr`, `SocketAddr`, `TcpStream` (`AsyncTransport`), `TcpListener`. **Every operation that can wait is a future** driven by an `Executor` — there is no blocking socket surface. **HTTP/1.1 layer (`net::http`):** `Method`, `StatusCode`, `Headers`, `Request`, `Response`, `Router`, `HttpServer` with keep-alive + `Connection: close` opt-out + per-connection read timeouts, `Client::get`/`post` with `send(addr, req)`. **TLS** (`net::tls`, OpenSSL-backed `TlsStream`), **UDP** (`UdpSocket`, datagram send/receive futures), **DNS** (`net::dns`; `Resolve` runs `getaddrinfo` on the executor's blocking pool rather than stalling a worker), **HTTP/2** (`net::http2`, HPACK + single-stream framing), and **WebSocket** (`net::ws`, RFC 6455) all ship in 1.0. IPv6 addressing is parsed and represented but not yet dialable. |
 | **`process`**     | POSIX subprocess spawning (`fork + execve`). `Command` builder (`arg`, `env`, `stdin`/`stdout`/`stderr`, `current_dir`), `Stdio` (`Inherit`, `Null`, `Piped`, `Fd`), `Child`, `ExitStatus`, `ChildStdin`/`ChildStdout`/`ChildStderr`, `Signal`. Windows is not yet supported.                                                                                                                                                                                                                                                                                                                          |
-| **`sync`**        | A generic `Atomic<T>` (`T` = `u8` / `u32` / `u64` / `i32` / `i64` / `boolean`, dispatched at compile time via `static match`; `load` / `store` / `swap` / `fetch_add` / `fetch_sub` / `fetch_and` / `fetch_or` / `fetch_xor` / `compare_exchange`), `MemoryOrder`, `fence`, `compiler_fence`, `Mutex<T, A>`, `RwLock<T, A>`, `CondVar`, `Once`, `Barrier`. RAII guards (`MutexGuard`, `RwLockReadGuard`, `RwLockWriteGuard`) are `!Send`. `Send` / `Sync` auto-derive with call-site enforcement.                                                                                                      |
+| **`sync`**        | A generic `Atomic<T>` (`T` = `u8` / `u32` / `u64` / `i32` / `i64` / `boolean`, dispatched at compile time via `static match`; `load` / `store` / `swap` / `fetch_add` / `fetch_sub` / `fetch_and` / `fetch_or` / `fetch_xor` / `compare_exchange`), `MemoryOrder`, `fence`, `compiler_fence`, `Mutex<T, A>`, `RwLock<T, A>`, `CondVar`, `Once`, `Barrier`. RAII guards (`MutexGuard`, `RwLockReadGuard`, `RwLockWriteGuard`) are `!Send`. `Send` / `Sync` are computed structurally with call-site enforcement - see [section 16.4](#164-the-send-and-sync-traits).                                    |
 | **`thread`**      | `ThreadLocal<T>` lazy per-thread storage via `pthread_key`. `thread::spawn` / `try_spawn` / `JoinHandle<T>` (returning the body's value on `join`), `spawn_with_attr`, scoped threads (`thread::Scope`), `thread::current` / `yield_now` / `sleep` / `sleep_ms`, plus `sync::mpsc` channels (`channel`, `Sender`, `Receiver`) all ship in 1.0, built on `pthread`. The `sync` primitives and `Arc<T>` ship alongside. `Builder` (`Builder::new().stack_size(bytes).name(str).spawn`/`try_spawn`) configures the stack size and OS thread name for a spawn.                                             |
-| **`test`**        | Built-in unit-test framework. Tests live in `<project>/tests/`, are marked `![test]`, and are discovered and run fork-per-test by `cryo test`. `expect`, `expect_eq`, `expect_ne`, `bail`, `bail_other`. See [section 20](#20-testing).                                                                                                                                                                                                                                                                                                                                                                      |
+| **`test`**        | Built-in unit-test framework. Tests live in `<project>/tests/`, are marked `![test]`, and are discovered and run fork-per-test by `cryo test`. `expect`, `expect_eq`, `expect_ne`, `bail`, `bail_other`. See [section 21](#21-testing).                                                                                                                                                                                                                                                                                                                                                                      |
 
-### 19.3 Naming Conventions in the Standard Library
+### 20.3 Naming Conventions in the Standard Library
 
 The standard library follows a small set of conventions that user code is encouraged to mirror.
 
@@ -2597,7 +3106,7 @@ The standard library follows a small set of conventions that user code is encour
 
 ---
 
-## 20. Testing
+## 21. Testing
 
 Cryo ships a built-in unit-test framework. Tests live in `<project>/tests/` files whose namespace declaration carries the `![config(testing)]` directive. Inside such a file, every function marked `![test]` is auto-discovered by the compiler and run fork-per-test by `cryo test`.
 
@@ -2677,7 +3186,7 @@ color  = "auto"     # one of: auto  | always | never
 
 ---
 
-## 21. Reserved Syntax
+## 22. Reserved Syntax
 
 The lexer and grammar reserve the following forms because the language plans to use them. The compiler does not yet lower them; using them today either errors at parse time or is silently ignored by later passes. Treat this list as a roadmap, not as features.
 
@@ -2685,31 +3194,27 @@ The lexer and grammar reserve the following forms because the language plans to 
 | --------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Raw strings `r"..."`                          | Reserved. Will treat backslashes literally (no escape processing). Today an `r` prefix lexes as a separate identifier followed by an ordinary string literal.                                     |
 | Escapes `\a` `\b` `\f` `\v`                   | Reserved. The lexer does not yet recognise them; they pass through as a literal backslash plus the following character. The implemented escapes are `\n` `\t` `\r` `\0` `\\` `\'` `\"` `\xHH`.    |
-| `async` / `await`                             | Lexer recognises them; parser will accept `await expr`, but the type system has no `Future` / `Promise` and codegen does not implement coroutines.                                                |
-| `yield`                                       | Parser accepts a `yield` expression; no generator semantics exist.                                                                                                                                |
+| `yield`                                       | Parser accepts a `yield` expression; no generator semantics exist. `async` / `await` are fully implemented - see [section 19](#19-asynchronous-programming).                                      |
 | Optional chaining `?.`                        | Token reserved; not consumed by the parser.                                                                                                                                                       |
 | Spread `...` in calls / literals              | The token exists for variadic parameter declarations only.                                                                                                                                        |
 | Pure-virtual class method (e.g. `= 0` syntax) | Not implemented. Use a `virtual` method without a body to declare an interface point.                                                                                                             |
-| Struct field defaults (`field: T = expr`)     | The `= expr` default syntax parses, but defaults are not applied at construction: every field must be supplied in a literal, and omitting one is `E0355`. See [section 8.2](#82-fields-and-visibility). |
 | Macros                                        | No macro system exists, and `macro` is **not** currently a reserved word (it lexes as an ordinary identifier). A future hygienic macro system may introduce one.                                  |
 | `![pure]`                                     | Reserved. Will assert the function has no observable side effects (enabling aggressive folding). Parsed as an unknown directive today (warning + no semantics).                                   |
 | `![const]`                                    | Reserved. Will mark a function as evaluable at compile time.                                                                                                                                      |
 | `![noreturn]`                                 | Reserved. Will declare a function that never returns normally.                                                                                                                                    |
-| `![export]` / `![no_mangle]`                  | Reserved. Will suppress Cryo name mangling so the function ships under its declared identifier and can be linked from C without a wrapper. See [section 18.3](#183-calling-cryo-from-c).                |
-| `![section("name")]`                          | Reserved. Will place the symbol in a specific object-file section.                                                                                                                                |
-| `![weak]`                                     | Reserved. Will declare weak linkage.                                                                                                                                                              |
 | `![constructor]` / `![destructor]`            | Reserved. Will register functions that run before `main` / after `main` returns.                                                                                                                  |
 | `![repr(<int_type>)]` on enums                | Reserved. Use `type enum Foo : u8 { ... }` syntax for now; future versions may accept `![repr(u8)]` as an equivalent spelling.                                                                      |
+| `![derive(Trait, ...)]`                       | Reserved. The directive's argument list is parsed and validated (an unknown trait name is rejected), but nothing consumes it: no implementation is synthesized for any listed trait. `Copy` in particular is decided structurally, not declared - see [section 16](#16-ownership-copy-and-drop). |
 
 When any of these moves out of "reserved" and into "implemented," it will be added to the relevant section of this document and removed from this table.
 
 ---
 
-## 22. Grammar Summary
+## 23. Grammar Summary
 
 The complete formal grammar is in [`docs/grammar.md`](grammar.md), written in EBNF following ISO/IEC 14977. What follows is a condensed overview of the major productions.
 
-### 22.1 Program Structure
+### 23.1 Program Structure
 
 ```
 program         = { directive } [ namespace_decl ] { top_level_item }
@@ -2721,7 +3226,7 @@ top_level_item  = import_decl | module_decl | var_declaration
                 | type_alias_declaration | implementation_block
 ```
 
-### 22.2 Statements
+### 23.2 Statements
 
 ```
 statement       = var_declaration | function_declaration | struct_declaration
@@ -2729,12 +3234,17 @@ statement       = var_declaration | function_declaration | struct_declaration
                 | type_alias_declaration | implementation_block
                 | if_statement | while_statement | for_statement
                 | loop_statement | do_while_statement
-                | match_statement | switch_statement
+                | match_statement | switch_statement | static_match
                 | break_statement | continue_statement | return_statement
                 | unsafe_block | block | expression_statement
+
+static_match    = "static" "match" "(" type ")" "{" static_match_arm* "}"
+static_match_arm = ( type { "|" type } | "_" ) "=>" ( block | expression )
 ```
 
-### 22.3 Expression Hierarchy
+`static_match` is also an expression form (see section 12.7).
+
+### 23.3 Expression Hierarchy
 
 Expressions are stratified by precedence; each level delegates to the next-higher-precedence level.
 
@@ -2763,13 +3273,13 @@ For the full grammar, including type and pattern productions, see [`grammar.md`]
 
 ---
 
-## 23. Project Configuration (cryoconfig)
+## 24. Project Configuration (cryoconfig)
 
 A project is a directory containing a `cryoconfig` file. `cryo build`, `cryo run`, and `cryo test` search upward from the working directory for it, then build the project it describes. Scaffold a starter file with `cryo init`.
 
 `cryoconfig` is an INI-like file: `[section]` headers, `key = value` lines, `#` comments. List values use TOML-style arrays (`["a", "b"]`). Unknown keys are ignored with a warning; keys removed in 1.0 are a hard error that names the replacement.
 
-### 23.1 `[project]`
+### 24.1 `[project]`
 
 Project identity and source layout.
 
@@ -2787,17 +3297,37 @@ stdlib_root   = ""                  # project-pinned stdlib root (see section 24
 
 `target_triple` (e.g. `"x86_64-pc-windows-gnu"`) cross-compiles: it is threaded into LLVM and selects the target ABI and toolchain. For `x86_64-pc-windows-gnu` the build drives a full mingw-w64 link to a `.exe`; for triples without a known toolchain (aarch64, riscv, windows-msvc, ...) the host link step is skipped and the object files are left for a manual link. The CLI `--target=TRIPLE` overrides it.
 
-### 23.2 `[compiler]`
+### 24.2 `[compiler]`
 
 Code-generation knobs.
 
 ```ini
 [compiler]
-debug     = false                   # verbose compiler logging
-optimize  = "O2"                    # O0 | O1 | O2 | O3 (default O2)
-emit_llvm = false                   # also write LLVM IR (.ll) beside the object
-no_std    = false                   # build without linking the standard library
+debug      = false                  # verbose compiler logging
+optimize   = "O2"                   # O0 | O1 | O2 | O3 (default O2)
+emit_llvm  = false                  # also write LLVM IR (.ll) beside the object
+no_std     = false                  # build without linking the standard library
+no_runtime = false                  # freestanding: no crt0 / libc / panic runtime
 ```
+
+**`no_std` vs `no_runtime`.** These are orthogonal knobs, each also settable
+per-build with `--no-std` / `--no-runtime` (the flag can force the option *on*,
+never off):
+
+| `no_std` | `no_runtime` | Result                                                                              |
+| -------- | ------------ | ----------------------------------------------------------------------------------- |
+| `false`  | `false`      | Default hosted build: prelude + stdlib linked, crt0 + libc, the `@panic` runtime.   |
+| `true`   | `false`      | No prelude/stdlib, but still hosted: crt0, libc, and the `@panic` runtime remain.   |
+| `false`  | `true`       | Freestanding link (no crt0/libc/`libcryo.a`) but the stdlib source is still in scope — rarely useful. |
+| `true`   | `true`       | Fully freestanding: no stdlib, no crt0/libc, `main` is not widened, and check failures diverge through `llvm.trap` instead of the libc-backed `@panic`. This is how a `runtime/core` tier is built. |
+
+`no_runtime = true` normally implies `no_std = true`: a freestanding link drops
+`libcryo.a`, so any stdlib symbol the program references would fail to resolve.
+A freestanding program supplies its own entry point (an `![naked] _start`);
+without one the linker warns that `_start` is missing.
+
+`![config(no_runtime)]` / `![config(not(no_runtime))]` gate a declaration on the
+freestanding build flag, exactly like the OS atoms (`![config(linux)]`, …).
 
 **Build profiles.** A build runs under a named *profile* that supplies a
 default optimization level and debug-info setting and names the per-profile
@@ -2851,7 +3381,7 @@ the compiler binary, or the linked stdlib) and the artifact still exists, the
 build is skipped (`<name> is up to date`). Pass `--no-incremental` to force a
 full rebuild and refresh the manifest.
 
-### 23.3 `[link]`
+### 24.3 `[link]`
 
 Native libraries to link, named by *intent* rather than by raw linker flag - so a project never has to juggle two similar lists.
 
@@ -2859,7 +3389,7 @@ Native libraries to link, named by *intent* rather than by raw linker flag - so 
 [link]
 system = ["ssl", "crypto"]          # system libraries        -> -l<name>
 search = ["/usr/lib/llvm-20/lib"]   # extra -L dirs to resolve `system` libs
-static = ["helpers/libabihelpers.a"] # local archives, passed to the linker by path
+static = ["vendor/libhelpers.a"]    # local archives, passed to the linker by path
 ```
 
 | Key      | Role                                                                                        | Linker form        |
@@ -2868,9 +3398,23 @@ static = ["helpers/libabihelpers.a"] # local archives, passed to the linker by p
 | `search` | Extra directories to search - only needed for `system` libs that live off the default path. | `-L<dir>`          |
 | `static` | A local archive in your project; linked by its path.                                        | the path, verbatim |
 
+Per-OS overlays `[link.unix]` and `[link.windows]` carry the same three keys. Bare `[link]` is common (applied to every target); the overlay whose OS matches the effective target triple is appended on top, so a project can name a library differently per platform - or link a platform-specific archive - without a cross-compile dragging in the other OS's libs:
+
+```ini
+[link]
+system = ["ssl", "crypto"]           # linked everywhere
+
+[link.unix]
+static = ["helpers/libhelpers-unix.a"]
+
+[link.windows]
+static = ["helpers/libhelpers-windows.a"]
+system = ["ws2_32"]                  # winsock, windows targets only
+```
+
 > Migrating from pre-1.0: `link_libs` -> `[link] system`, `link_paths` -> `[link] search` (or `[link] static` for a local archive). The old `[compiler] args = ["--emit-llvm"]` flag-smuggling is gone - set `emit_llvm = true`. `[compiler] include_paths` -> `[project] source_paths`. `[project] target` -> `[project] target_triple`.
 
-### 23.4 Multi-target: `[lib]` and `[[bin]]`
+### 24.4 Multi-target: `[lib]` and `[[bin]]`
 
 A project can build a library and one or more executables from one source tree. `[lib]` declares the library; each `[[bin]]` (array-of-tables) declares an executable. When present these take precedence over the single-target `[project] target_type` / `entry_point`.
 
@@ -2884,7 +3428,7 @@ name        = "mytool"
 entry_point = "src/main.cryo"
 ```
 
-### 23.5 `[dependencies]`
+### 24.5 `[dependencies]`
 
 Each entry is an inline table - a local path dependency or a git dependency. `cryo fetch` resolves them and writes `cryoconfig.lock`.
 
@@ -2896,7 +3440,7 @@ remote   = { git = "https://example.com/lib.git", tag = "v0.1.0", alias = "Remot
 
 A git dependency requires exactly one of `version`, `tag`, `branch`, or `rev`, and may set `subdir` (the path to the dependency's `cryoconfig` inside the repo). `alias` is the top-level namespace the consumer imports.
 
-### 23.6 `[test]`
+### 24.6 `[test]`
 
 Defaults for the test runner; forwarded to the spawned test binary unless overridden on the CLI.
 
@@ -2908,11 +3452,11 @@ color  = "auto"                     # auto | always | never
 
 ---
 
-## 24. Command-Line Interface
+## 25. Command-Line Interface
 
 `cryo` is a single binary: the compiler, package manager, test runner, and dependency resolver. Run `cryo` (or `cryo --help`) for a command overview, `cryo help <command>` for one command, and `cryo help <topic>` for the topics below.
 
-### 24.1 Commands
+### 25.1 Commands
 
 | Command                  | Purpose                                                                                    |
 | ------------------------ | ------------------------------------------------------------------------------------------ |
@@ -2930,7 +3474,7 @@ color  = "auto"                     # auto | always | never
 
 Running `cryo <file.cryo>` with no command compiles that file directly.
 
-### 24.2 Build flags
+### 25.2 Build flags
 
 Accepted by `build` / `run` / `test` / `check` as noted; run `cryo help flags` or `cryo help <flag>` for detail.
 
@@ -2954,7 +3498,7 @@ Accepted by `build` / `run` / `test` / `check` as noted; run `cryo help flags` o
 
 Test-only flags: `--ignored`, `--list`, `--exact`, `-q` / `--quiet`.
 
-### 24.3 Standard-library lookup
+### 25.3 Standard-library lookup
 
 The compiler resolves the stdlib root from the first source that matches:
 

@@ -1,0 +1,148 @@
+// `T[8]`, `T[16]` and `T[]` are three distinct types, but the symbol mangler
+// encoded every array as `A` + element and threw the length away.
+// `specialized_identifier` keys every monomorphization off that encoding, so
+// all three collapsed onto ONE key: whichever instantiation was registered
+// first answered for all of them, and a later spelling in the same compilation
+// unit silently resolved to the first one's type - `Option<u8[16]>` reading
+// back as `Option<u8[8]>`.
+//
+// Either spelling ALONE was fine, which is why this survived so long: it takes
+// two array lengths over the SAME element type in one unit to show at all.
+//
+// Each test asserts lengths and element values rather than merely compiling. A
+// collapsed specialization that happened to type-check would read the wrong
+// number of bytes, and only the numbers catch that.
+![config(testing)]
+namespace CryoTests::Tests::Lang::ArrayLengthTypeIdentity;
+
+import std::test;
+import std::core::result;
+
+// A user generic, to prove the fix is in the mangling and not in `Option`.
+// `data` is read in place rather than handed back by value: moving an owning
+// array out of a borrowed receiver is E0453, and that rule is not what these
+// tests are measuring.
+type struct Buf<T> {
+    data: T;
+
+    static of(data: T) -> Buf<T> { return Buf<T> { data: data }; }
+}
+
+// A fixed array and a heap-dynamic array of the same element type, in one
+// compilation unit. This is the shape that first surfaced the collision.
+![test]
+function fixed_and_dynamic_of_the_same_element_coexist() -> Result<(), TestError> {
+    mut a: Option<u8[8]> = Option::Some([7; 8]);
+    mut b: Option<u8[]>  = Option::Some([1, 2, 3]);
+
+    const va: u8[8] = a.take().unwrap();
+    const vb: u8[]  = b.take().unwrap();
+
+    if (va.length != 8) { return expect_eq(va.length, 8 as i64); }
+    if (vb.length != 3) { return expect_eq(vb.length, 3 as i64); }
+    if ((va[7] as i64) != 7) { return expect_eq(va[7] as i64, 7 as i64); }
+    return expect_eq(vb[2] as i64, 3 as i64);
+}
+
+// Two different FIXED lengths. These collided with each other too, and unlike
+// the fixed/dynamic pair both are the same size class, so a collapsed
+// specialization reads 8 bytes where 16 were written.
+![test]
+function two_fixed_lengths_stay_distinct() -> Result<(), TestError> {
+    mut a: Option<u8[8]>  = Option::Some([3; 8]);
+    mut b: Option<u8[16]> = Option::Some([5; 16]);
+
+    const va: u8[8]  = a.take().unwrap();
+    const vb: u8[16] = b.take().unwrap();
+
+    if (va.length != 8)  { return expect_eq(va.length, 8 as i64); }
+    if (vb.length != 16) { return expect_eq(vb.length, 16 as i64); }
+    if ((va[7] as i64) != 3)  { return expect_eq(va[7] as i64, 3 as i64); }
+    return expect_eq(vb[15] as i64, 5 as i64);
+}
+
+// All three spellings at once, so the registration order cannot be what makes
+// any single pair work.
+![test]
+function three_array_spellings_in_one_unit() -> Result<(), TestError> {
+    mut a: Option<u8[4]>  = Option::Some([1; 4]);
+    mut b: Option<u8[32]> = Option::Some([2; 32]);
+    mut c: Option<u8[]>   = Option::Some([9, 9, 9, 9, 9]);
+
+    const va: u8[4]  = a.take().unwrap();
+    const vb: u8[32] = b.take().unwrap();
+    const vc: u8[]   = c.take().unwrap();
+
+    if (va.length != 4)  { return expect_eq(va.length, 4 as i64); }
+    if (vb.length != 32) { return expect_eq(vb.length, 32 as i64); }
+    if (vc.length != 5)  { return expect_eq(vc.length, 5 as i64); }
+    return expect_eq(vb[31] as i64, 2 as i64);
+}
+
+// The same collision through a user-defined generic rather than `Option`: the
+// key is built by the shared mangler, so every generic owner was affected.
+![test]
+function user_generic_over_both_array_shapes() -> Result<(), TestError> {
+    // Typed locals: an array literal in a generic argument position infers its
+    // own element type rather than taking one from the owner's type argument.
+    const src_f: u8[8] = [6; 8];
+    const src_d: u8[]  = [4, 4, 4];
+
+    const fixed: Buf<u8[8]> = Buf<u8[8]>::of(src_f);
+    const dyn:   Buf<u8[]>  = Buf<u8[]>::of(src_d);
+
+    if (fixed.data.length != 8) { return expect_eq(fixed.data.length, 8 as i64); }
+    if (dyn.data.length != 3)   { return expect_eq(dyn.data.length, 3 as i64); }
+    if ((fixed.data[7] as i64) != 6) { return expect_eq(fixed.data[7] as i64, 6 as i64); }
+    return expect_eq(dyn.data[2] as i64, 4 as i64);
+}
+
+// A different ELEMENT type at the same length. The element was always part of
+// the key, so this worked before - it is here as the control that the new
+// length component did not disturb it.
+![test]
+function same_length_different_elements_stay_distinct() -> Result<(), TestError> {
+    mut a: Option<u8[8]>  = Option::Some([1; 8]);
+    mut b: Option<i32[8]> = Option::Some([70000; 8]);
+
+    const va: u8[8]  = a.take().unwrap();
+    const vb: i32[8] = b.take().unwrap();
+
+    if (va.length != 8) { return expect_eq(va.length, 8 as i64); }
+    if (vb.length != 8) { return expect_eq(vb.length, 8 as i64); }
+    // 70000 truncates to 112 in a u8; reading it back whole proves the i32
+    // specialization was not served by the u8 one.
+    return expect_eq(vb[7] as i64, 70000 as i64);
+}
+
+// The control against OVER-splitting: one length written twice is still ONE
+// type and one specialization. A key that accidentally varied per mention
+// would compile but emit a second, unrelated instantiation.
+![test]
+function same_fixed_length_twice_is_one_type() -> Result<(), TestError> {
+    mut a: Option<u8[8]> = Option::Some([1; 8]);
+    mut b: Option<u8[8]> = Option::Some([2; 8]);
+
+    mut va: u8[8] = a.take().unwrap();
+    const vb: u8[8] = b.take().unwrap();
+
+    // Assigning one into the other only type-checks if they are the same type.
+    va = vb;
+
+    if (va.length != 8) { return expect_eq(va.length, 8 as i64); }
+    return expect_eq(va[7] as i64, 2 as i64);
+}
+
+// A zero-length fixed array is a legitimate distinct type, and `0` must not be
+// confused with the dynamic marker by an encoding that writes the length out.
+![test]
+function zero_length_fixed_array_is_its_own_type() -> Result<(), TestError> {
+    mut a: Option<u8[0]> = Option::Some([]);
+    mut b: Option<u8[]>  = Option::Some([8, 8]);
+
+    const va: u8[0] = a.take().unwrap();
+    const vb: u8[]  = b.take().unwrap();
+
+    if (va.length != 0) { return expect_eq(va.length, 0 as i64); }
+    return expect_eq(vb.length, 2 as i64);
+}

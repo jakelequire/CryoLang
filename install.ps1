@@ -138,9 +138,27 @@ try {
         }
     }
 
-    if (Test-Path $Prefix) { Remove-Item -Recurse -Force $Prefix }
+    # Stage the new tree next to the destination, then swap: the previous
+    # install is moved ASIDE (not deleted) until the new one is in place, so
+    # a failed move can never destroy a working install (mirrors install.sh).
     New-Item -ItemType Directory -Path (Split-Path $Prefix) -Force | Out-Null
-    Move-Item -Path $top.FullName -Destination $Prefix
+    $incoming = "$Prefix.new"
+    $outgoing = "$Prefix.old"
+    if (Test-Path $incoming) { Remove-Item -Recurse -Force $incoming }
+    if (Test-Path $outgoing) { Remove-Item -Recurse -Force $outgoing }
+    Move-Item -Path $top.FullName -Destination $incoming
+    if (Test-Path $Prefix) { Move-Item -Path $Prefix -Destination $outgoing }
+    try {
+        Move-Item -Path $incoming -Destination $Prefix
+    } catch {
+        # Put the previous install back before failing.
+        if (Test-Path $outgoing) { Move-Item -Path $outgoing -Destination $Prefix }
+        Die "failed to move the new install into place: $_"
+    }
+    if (Test-Path $outgoing) {
+        try { Remove-Item -Recurse -Force $outgoing }
+        catch { Warn "could not remove the previous install at $outgoing (a cryo.exe may still be running) - delete it manually." }
+    }
     Ok "installed to $Prefix"
 } finally {
     Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue

@@ -272,7 +272,8 @@ type struct PlaceEmitter {
 
 
     /// Generate IR for an array indexing operation.
-    codegen_array_access(mut &this, array_val: LValue, array_type: TypeRef, array_is_lvalue: boolean, index_val: LValue, site_span: SourceSpan) -> void {
+    codegen_array_access(mut &this, array_val: LValue, array_type: TypeRef, array_is_lvalue: boolean, index_val: LValue, site_span: SourceSpan,
+                         visitor: ASTVisitor*, idx_sched: ASTNode*[]*) -> void {
         const t: Type* = this.cg.lookup_type_by_id(array_type.id);
         if (t == null) {
             this.state.last_value = LValue::null();
@@ -301,7 +302,7 @@ type struct PlaceEmitter {
                     LType::pointer_to(LType::i8()), array_val, "refderef");
             }
             this.codegen_array_access(header_ptr, rt.referent, true,
-                                      index_val, site_span);
+                                      index_val, site_span, visitor, idx_sched);
             return;
         }
 
@@ -329,7 +330,7 @@ type struct PlaceEmitter {
                         LType::pointer_to(LType::i8()), array_val, "ptrarrderef");
                 }
                 this.codegen_array_access(header_ptr, pt.pointee, true,
-                                          index_val, site_span);
+                                          index_val, site_span, visitor, idx_sched);
                 return;
             }
             const elem_ty: LType = this.cg.type_mapper.map_type(pt.pointee);
@@ -418,6 +419,10 @@ type struct PlaceEmitter {
         if (arr.is_fixed()) {
             // Fixed array: GEP into [N x T].
             const arr_ty: LType = this.cg.type_mapper.map_type(array_type);
+            // Bounds check against the fixed length `N` (a compile-time constant,
+            // so an in-range constant index folds away under O2).
+            const fx_len: LValue = LType::const_int(LType::i64(), arr.size as u64, false);
+            this.emit_bounds_check(index_val, fx_len, visitor, idx_sched, site_span);
             // Build indices: [0, index]
             const zero: LValue = LType::const_int(LType::i64(), 0, false);
             const buf: void* = intrinsics::malloc(16);
@@ -440,6 +445,10 @@ type struct PlaceEmitter {
                 struct_val = this.cg.builder.build_load(arr_ty, array_val, "arrload");
             }
             const data_ptr: LValue = this.cg.builder.build_extract_value(struct_val, 0, "data");
+            // Bounds check against the fat array's length field [1] before the
+            // element GEP (both data_ptr and len dominate the ok block).
+            const dyn_len: LValue = this.cg.builder.build_extract_value(struct_val, 1, "len");
+            this.emit_bounds_check(index_val, dyn_len, visitor, idx_sched, site_span);
             const buf: void* = intrinsics::malloc(8);
             const slots: void** = buf as void**;
             slots[0] = index_val.raw;
@@ -448,6 +457,45 @@ type struct PlaceEmitter {
             this.state.last_value = gep;
             this.state.last_is_lvalue = true;
         }
+    }
+
+    /// Emit an array bounds check: `index >= len` raises through `__cryo_panic`
+    /// under `--panic=unwind` (with a cleanup landing pad that drops the frame's
+    /// live locals) or aborts on the default path, else continues to the element
+    /// GEP.  The index is widened to i64 (unsigned), so a narrow or negative
+    /// index reads as a huge value and traps.  Leaves the builder at the ok
+    /// block.  A provably-in-range constant index folds the branch away under
+    /// O2, so the guard has no steady-state cost when safety is statically
+    /// provable (mirrors `emit_int_div_guard`).
+    emit_bounds_check(mut &this, index_val: LValue, len_val: LValue,
+                      visitor: ASTVisitor*, idx_sched: ASTNode*[]*, site_span: SourceSpan) -> void {
+        if (!index_val.is_valid() || !len_val.is_valid()) { return; }
+        mut idx64: LValue = index_val;
+        const idx_ty_raw: void* = llvm::LLVMTypeOf(index_val.raw);
+        if (idx_ty_raw != null && llvm::LLVMGetIntTypeWidth(idx_ty_raw) < 64) {
+            idx64 = this.cg.builder.build_zext(index_val, LType::i64(), "idx.ext");
+        }
+        const oob: LValue = this.cg.builder.build_icmp(
+            LIntPredicate::UGE, idx64, len_val, "bounds.oob");
+        const cur_bb: LBasicBlock = this.cg.builder.get_insert_block();
+        if (!cur_bb.is_valid()) { return; }
+        const fn: LValue = cur_bb.get_parent();
+        const trap_bb: LBasicBlock = LBasicBlock::append(fn, "bounds.trap");
+        const ok_bb: LBasicBlock = LBasicBlock::append(fn, "bounds.ok");
+        this.cg.builder.build_cond_br(oob, trap_bb, ok_bb);
+
+        this.cg.builder.position_at_end(trap_bb);
+        if (this.cg.ctx.project_panic_unwind && !this.cg.intrinsics.no_runtime) {
+            this.cg.expr_ops.emit_check_raise(visitor, idx_sched, site_span, "index out of bounds");
+        } else {
+            // The handler formats the operands, so it gets the index and the
+            // length rather than a pre-baked message: "index 5 out of bounds
+            // for length 3" needs both values, not just the site.
+            mut ops: LValue[] = [idx64, len_val];
+            this.cg.intrinsics.emit_check_sink("__cryo_panic_bounds_check",
+                                              site_span, &ops);
+        }
+        this.cg.builder.position_at_end(ok_bb);
     }
 
     // Tuple index (t.N as t[N])

@@ -48,6 +48,26 @@ implement enum Option<T> {
         }
     }
 
+    /// Borrow the contained value in place, aborting on `None`. Like `as_ref`
+    /// the pointer aliases the receiver's payload rather than copying it, so
+    /// the receiver keeps ownership of `T` and this is NOT `![sink]`; the
+    /// pointer is invalidated by anything that moves or overwrites the
+    /// receiver.
+    ///
+    /// Returns a bare `T*` where `as_ref` returns `Option<T*>`. Beyond being
+    /// less to unwrap, that keeps it usable where `as_ref` is not: `Option<T*>`
+    /// is a structural superterm of the owner, so `as_ref` is materialized
+    /// lazily at a call site and is absent from an `Option` whose payload type
+    /// is synthesized rather than written. A pointer return is not a superterm.
+    unwrap_ptr(&this) -> T* {
+        match (&this) {
+            Option::Some(value) => { return &value; }
+            Option::None => {
+                core::panic("called Option::unwrap_ptr() on a None value", FILE, LINE);
+            }
+        }
+    }
+
     /// Return the inner value, aborting on `None`. Prefer `unwrap_or` or
     /// a `match` in code that must not panic.
     ///
@@ -122,9 +142,15 @@ implement enum Option<T> {
 
     /// Replace with `None` and return the previous value.
     take(mut &this) -> Option<T> {
-        const previous: Option<T> = *this;
-        *this = Option::None;
-        return previous;
+        // A destructive read, not a copy: the `None` store leaves nothing here
+        // for the receiver to release, so the returned value is the sole owner
+        // of whatever the payload held. Without that store the read alone would
+        // hand out a second claim on it.
+        unsafe {
+            const previous: Option<T> = *this;
+            *this = Option::None;
+            return previous;
+        }
     }
 
     /// `Some(v)` -> `Ok(v)`; `None` -> `Err(err)`.

@@ -1,0 +1,214 @@
+///! net::url - absolute URL parsing.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::UrlT;
+
+import std::core::result;
+import std::core::option;
+import std::collections::str;
+import std::net::addr::url;
+import std::test::error;
+import std::test::assert;
+
+/// Assert `got` equals the literal `want`.
+function seq(got: Str, want: string) -> Result<(), TestError> {
+    const w: Str = Str::new(want);
+    return expect(got.equals(&w), Str::new(want));
+}
+
+/// Assert an `Option<Str>` field equals the literal `want`.
+function opt_eq(got: Option<Str>, want: string) -> Result<(), TestError> {
+    match (got) {
+        Option::Some(s) => { return seq(s, want); }
+        Option::None    => { return bail(Str::new("expected Some, got None")); }
+    }
+}
+
+![test]
+function parses_all_parts() -> Result<(), TestError> {
+    match (Url::parse(Str::new("https://example.com:8443/a/b?x=1&y=2#frag"))) {
+        Result::Ok(u) => {
+            seq(u.scheme, "https")?;
+            seq(u.host, "example.com")?;
+            expect_eq(u.port, 8443u16)?;
+            seq(u.path, "/a/b")?;
+            opt_eq(u.query, "x=1&y=2")?;
+            return opt_eq(u.fragment, "frag");
+        }
+        Result::Err(e) => { return bail(e.message()); }
+    }
+}
+
+![test]
+function default_port_http() -> Result<(), TestError> {
+    match (Url::parse(Str::new("http://example.com/"))) {
+        Result::Ok(u) => {
+            expect_eq(u.port, 80u16)?;
+            return seq(u.path, "/");
+        }
+        Result::Err(e) => { return bail(e.message()); }
+    }
+}
+
+![test]
+function default_ports_by_scheme() -> Result<(), TestError> {
+    match (Url::parse(Str::new("https://h/x"))) {
+        Result::Ok(u) => { expect_eq(u.port, 443u16)?; }
+        Result::Err(e) => { return bail(e.message()); }
+    }
+    match (Url::parse(Str::new("ws://h/"))) {
+        Result::Ok(u) => { expect_eq(u.port, 80u16)?; }
+        Result::Err(e) => { return bail(e.message()); }
+    }
+    match (Url::parse(Str::new("wss://h/"))) {
+        Result::Ok(u) => { expect_eq(u.port, 443u16)?; }
+        Result::Err(e) => { return bail(e.message()); }
+    }
+    match (Url::parse(Str::new("ftp://h/"))) {
+        Result::Ok(u) => { return expect_eq(u.port, 21u16); }
+        Result::Err(e) => { return bail(e.message()); }
+    }
+}
+
+// An absent path reads as "/".
+![test]
+function missing_path_defaults_to_slash() -> Result<(), TestError> {
+    match (Url::parse(Str::new("http://example.com"))) {
+        Result::Ok(u) => {
+            seq(u.host, "example.com")?;
+            expect_eq(u.port, 80u16)?;
+            return seq(u.path, "/");
+        }
+        Result::Err(e) => { return bail(e.message()); }
+    }
+}
+
+// `user[:pass]@` userinfo is skipped; the host is what follows the '@'.
+![test]
+function userinfo_is_skipped() -> Result<(), TestError> {
+    match (Url::parse(Str::new("https://user:pass@host.example:443/p"))) {
+        Result::Ok(u) => {
+            seq(u.host, "host.example")?;
+            expect_eq(u.port, 443u16)?;
+            return seq(u.path, "/p");
+        }
+        Result::Err(e) => { return bail(e.message()); }
+    }
+}
+
+// An IPv6 literal is unwrapped to its inner address, with an optional port.
+![test]
+function ipv6_literal_with_port() -> Result<(), TestError> {
+    match (Url::parse(Str::new("http://[::1]:8080/v6"))) {
+        Result::Ok(u) => {
+            seq(u.host, "::1")?;
+            expect_eq(u.port, 8080u16)?;
+            return seq(u.path, "/v6");
+        }
+        Result::Err(e) => { return bail(e.message()); }
+    }
+}
+
+![test]
+function ipv6_literal_default_port() -> Result<(), TestError> {
+    match (Url::parse(Str::new("https://[2001:db8::1]/only"))) {
+        Result::Ok(u) => {
+            seq(u.host, "2001:db8::1")?;
+            expect_eq(u.port, 443u16)?;
+            return seq(u.path, "/only");
+        }
+        Result::Err(e) => { return bail(e.message()); }
+    }
+}
+
+// Query with no fragment.
+![test]
+function query_without_fragment() -> Result<(), TestError> {
+    match (Url::parse(Str::new("http://h/p?just=query"))) {
+        Result::Ok(u) => {
+            opt_eq(u.query, "just=query")?;
+            return expect_true(u.fragment.is_none(), Str::new("no fragment"));
+        }
+        Result::Err(e) => { return bail(e.message()); }
+    }
+}
+
+// Fragment with no query; path defaults to "/".
+![test]
+function fragment_without_query() -> Result<(), TestError> {
+    match (Url::parse(Str::new("http://h/#onlyfrag"))) {
+        Result::Ok(u) => {
+            expect_true(u.query.is_none(), Str::new("no query"))?;
+            seq(u.path, "/")?;
+            return opt_eq(u.fragment, "onlyfrag");
+        }
+        Result::Err(e) => { return bail(e.message()); }
+    }
+}
+
+// ---- error cases ----
+
+![test]
+function relative_url_missing_scheme() -> Result<(), TestError> {
+    match (Url::parse(Str::new("relative/path"))) {
+        Result::Ok(_) => { return bail(Str::new("relative URL should error")); }
+        Result::Err(e) => {
+            match (e) {
+                UrlError::MissingScheme => { return Result::Ok(()); }
+                _ => { return bail(Str::new("expected MissingScheme")); }
+            }
+        }
+    }
+}
+
+![test]
+function empty_scheme_rejected() -> Result<(), TestError> {
+    match (Url::parse(Str::new("://noscheme"))) {
+        Result::Ok(_) => { return bail(Str::new("empty scheme should error")); }
+        Result::Err(e) => {
+            match (e) {
+                UrlError::EmptyScheme => { return Result::Ok(()); }
+                _ => { return bail(Str::new("expected EmptyScheme")); }
+            }
+        }
+    }
+}
+
+![test]
+function empty_host_rejected() -> Result<(), TestError> {
+    match (Url::parse(Str::new("http:///nopath"))) {
+        Result::Ok(_) => { return bail(Str::new("no host should error")); }
+        Result::Err(e) => {
+            match (e) {
+                UrlError::EmptyHost => { return Result::Ok(()); }
+                _ => { return bail(Str::new("expected EmptyHost")); }
+            }
+        }
+    }
+}
+
+![test]
+function invalid_port_rejected() -> Result<(), TestError> {
+    match (Url::parse(Str::new("http://h:notaport/"))) {
+        Result::Ok(_) => { return bail(Str::new("non-numeric port should error")); }
+        Result::Err(e) => {
+            match (e) {
+                UrlError::InvalidPort => { return Result::Ok(()); }
+                _ => { return bail(Str::new("expected InvalidPort")); }
+            }
+        }
+    }
+}
+
+![test]
+function port_out_of_range_rejected() -> Result<(), TestError> {
+    match (Url::parse(Str::new("http://h:70000/"))) {
+        Result::Ok(_) => { return bail(Str::new("port > 65535 should error")); }
+        Result::Err(e) => {
+            match (e) {
+                UrlError::InvalidPort => { return Result::Ok(()); }
+                _ => { return bail(Str::new("expected InvalidPort")); }
+            }
+        }
+    }
+}

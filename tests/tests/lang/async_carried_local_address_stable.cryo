@@ -1,0 +1,174 @@
+// A droppable local carried across an `await` lives in its carrier field for
+// the whole life of the future, so its ADDRESS holds still across a suspend.
+//
+// The moving carrier it replaces copied the value out of its `Option<T>` field
+// into a fresh block-local at the top of every state and handed it back on the
+// way out. Anything the value had published a pointer into then named a dead
+// stack slot from the second poll onwards - silently, because that slot is live
+// stack and still readable.
+//
+// An address COMPARISON cannot see this bug: a driver re-entering `poll` from
+// the same loop reuses the same stack region, so a block-local copy lands at
+// the same address every time and the moving carrier reports "stable" too. What
+// discriminates is a THIRD PARTY writing through a pointer the value published
+// while the future is parked. That is what each test here does.
+//
+// Most of the shapes below publish their pointer from inside a method rather
+// than taking an address syntactically, so the frame-address rejection never
+// sees them: they compiled before the fix and were wrong before the fix. The
+// last test does take an address in source, and pins the fact that doing so
+// against a CARRIED local is accepted - the rejection stops at the first
+// indirection a place passes through, and a carried value is reached through a
+// pointer into its field.
+//
+// Every test also asserts the destructor count. A changed drop count is a
+// regression, not progress.
+![config(testing)]
+namespace CryoTests::Tests::Lang::AsyncCarriedLocalAddressStable;
+
+import std::test;
+import std::core::result;
+import std::future;
+
+mut ca_slot: i64* = null;
+mut ca_drops: i64 = 0;
+
+type struct Cell {
+    canary: i64;
+
+    static new() -> Cell { return Cell { canary: 0 }; }
+
+    // Hands out a pointer into this value's own storage. Nothing at the call
+    // site mentions an address.
+    publish(mut &this) -> void { ca_slot = &this.canary; }
+
+    read(&this) -> i64 { return this.canary; }
+
+    drop(mut &this) -> void { ca_drops = ca_drops + 1; }
+}
+
+type struct Ticks {
+    left: i64;
+
+    static new(n: i64) -> Ticks { return Ticks { left: n }; }
+}
+
+implement trait Future for struct Ticks {
+    type Output = i64;
+
+    poll(mut &this, cx: Context*) -> Poll<i64> {
+        if (this.left > 0) {
+            this.left = this.left - 1;
+            return Poll::Pending;
+        }
+        return Poll::Ready(0);
+    }
+}
+
+async function carried_cell() -> i64 {
+    mut c: Cell = Cell::new();
+    c.publish();
+    const _z: i64 = await Ticks::new(1);
+    return c.read();
+}
+
+async function carried_cell_two_suspends() -> i64 {
+    mut c: Cell = Cell::new();
+    c.publish();
+    const _a: i64 = await Ticks::new(1);
+    const _b: i64 = await Ticks::new(1);
+    return c.read();
+}
+
+// The address taken SYNTACTICALLY, at the call site, of a local that is itself
+// carried. The frame-address rejection stops at the first indirection a place
+// passes through, and a carried value is reached as `*<name>$p` once it lives
+// in its field — so `&c.canary` becomes `&(*c$p).canary`, which is rooted in
+// the future's own storage rather than in the poll frame, and is allowed. A
+// local whose address escapes but which is NOT carried still dies with the
+// frame and is still rejected; see the two `E0455_async_*` negatives.
+async function carried_cell_addr_taken_in_source() -> i64 {
+    mut c: Cell = Cell::new();
+    const p: i64* = &c.canary;
+    const _z: i64 = await Ticks::new(1);
+    *p = 33;
+    return c.read();
+}
+
+// Drives the future to completion, writing `value` through whatever pointer the
+// carried local published each time the future parks.
+function drive_writing<F>(f: F, value: i64) -> i64
+where F: Future<i64> {
+    mut fut: F = f;
+    mut cx: Context = Context::new(Waker::noop());
+    loop {
+        match (fut.poll(&cx)) {
+            Poll::Ready(v) => { return v; }
+            Poll::Pending => {
+                if (ca_slot != null) { *ca_slot = value; }
+            }
+        }
+    }
+}
+
+// Drives to completion without touching the published pointer at all.
+function drive_quietly<F>(f: F) -> i64
+where F: Future<i64> {
+    mut fut: F = f;
+    mut cx: Context = Context::new(Waker::noop());
+    loop {
+        match (fut.poll(&cx)) {
+            Poll::Ready(v) => { return v; }
+            Poll::Pending => { }
+        }
+    }
+}
+
+// The discriminating case: written from outside while parked, read after the
+// resume. With the value moving between its field and the stack, the write
+// lands in the copy the suspend abandoned and the read returns 0.
+![test]
+function third_party_write_through_published_pointer_is_seen() -> Result<(), TestError> {
+    ca_slot = null;
+    ca_drops = 0;
+    const seen: i64 = drive_writing(carried_cell(), 55);
+    if (seen != 55) { return expect_eq(seen, 55 as i64); }
+    return expect_eq(ca_drops, 1 as i64);
+}
+
+// The control: same future, same driver, nobody writes. Proves the carrier
+// still delivers the value's OWN contents - a carrier that lost the value
+// entirely would also fail the test above.
+![test]
+function untouched_carried_local_reads_its_own_value() -> Result<(), TestError> {
+    ca_slot = null;
+    ca_drops = 0;
+    const seen: i64 = drive_quietly(carried_cell());
+    if (seen != 0) { return expect_eq(seen, 0 as i64); }
+    return expect_eq(ca_drops, 1 as i64);
+}
+
+// Two suspends, so the value survives more than one state transition and the
+// last write before completion is the one observed.
+![test]
+function published_pointer_survives_two_suspends() -> Result<(), TestError> {
+    ca_slot = null;
+    ca_drops = 0;
+    const seen: i64 = drive_writing(carried_cell_two_suspends(), 77);
+    if (seen != 77) { return expect_eq(seen, 77 as i64); }
+    return expect_eq(ca_drops, 1 as i64);
+}
+
+// The guarantee spelled in source: a pointer written with `&` in the async
+// function's own body, into a carried local, still names that local after the
+// suspend. Nothing writes from outside here — the async function writes through
+// its own pointer after resuming, which is the shape a caller-owned buffer
+// takes.
+![test]
+function source_taken_address_of_carried_local_survives() -> Result<(), TestError> {
+    ca_slot = null;
+    ca_drops = 0;
+    const seen: i64 = drive_quietly(carried_cell_addr_taken_in_source());
+    if (seen != 33) { return expect_eq(seen, 33 as i64); }
+    return expect_eq(ca_drops, 1 as i64);
+}

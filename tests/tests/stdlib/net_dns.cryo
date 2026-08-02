@@ -1,8 +1,14 @@
-///! dns::resolve - hostname resolution via getaddrinfo.
+///! dns::resolve - hostname resolution via getaddrinfo, blocking and async.
 ///!
 ///! Hermetic: only `localhost` and numeric literals are resolved, which
 ///! glibc answers from `/etc/hosts` / the numeric fast-path without
 ///! touching the network, so the test is deterministic in CI.
+///!
+///! The async half checks that `Resolve` is the *same* lookup — same answers,
+///! same failures — reached through the blocking pool. That it reaches the pool
+///! at all rather than stalling the worker is covered structurally in
+///! `future_blocking`, which is where a regression in the offload would show up;
+///! localhost answers too fast for a timing test here to mean anything.
 
 ![config(testing)]
 namespace CryoTests::Tests::Stdlib::NetDns;
@@ -12,8 +18,9 @@ import std::core::option;
 import std::collections::str;
 import std::collections::array;
 import std::io::error;
-import std::net::ip;
-import std::net::socket_addr;
+import std::future;
+import std::net::addr::ip;
+import std::net::addr::socket_addr;
 import std::net::dns;
 import std::test::error;
 import std::test::assert;
@@ -61,6 +68,72 @@ function lookup_attaches_port() -> Result<(), TestError> {
     }
     addrs.drop();
     return expect(port_ok, Str::new("lookup should attach port 8080"));
+}
+
+/// Await one async lookup and report how many addresses came back, or -1 if it
+/// failed. The result is moved out of the `match` rather than dropped inside an
+/// arm, which is the shape the rest of the tree uses for an owning payload.
+async function async_count(host: Str) -> i64 {
+    mut got: ResolvedAddrs = ResolvedAddrs { addrs: Array<IpAddr>::new() };
+    mut ok:  boolean = false;
+    match (await Resolve::start(host)) {
+        Result::Ok(r)  => { got = r; ok = true; }
+        Result::Err(_) => { }
+    }
+    if (!ok) { got.drop(); return -1; }
+    const n: i64 = got.length() as i64;
+    got.drop();
+    return n;
+}
+
+/// Two lookups in flight at once through one task, so the pool has to keep both
+/// jobs straight and wake the task for each.
+async function async_count_pair() -> i64 {
+    const p: (i64, i64) = await Futures::join(async_count(Str::new("localhost")),
+                                              async_count(Str::new("127.0.0.1")));
+    if (p.0 < 1) { return -2; }
+    if (p.1 < 1) { return -3; }
+    return 0;
+}
+
+![test]
+function async_resolve_localhost_matches_the_blocking_call() -> Result<(), TestError> {
+    mut resolved: ResolvedAddrs = match (dns::resolve(Str::new("localhost"))) {
+        Result::Ok(r)  => { r }
+        Result::Err(_) => { return bail(Str::new("resolve(localhost) failed")); }
+    };
+    const blocking_n: i64 = resolved.length() as i64;
+    resolved.drop();
+
+    mut ex: Executor = Executor::new();
+    const async_n: i64 = ex.block_on(async_count(Str::new("localhost")));
+    ex.drop();
+    return expect_eq(async_n, blocking_n);
+}
+
+![test]
+function async_resolve_unknown_name_fails() -> Result<(), TestError> {
+    mut ex: Executor = Executor::new();
+    const n: i64 = ex.block_on(async_count(Str::new("nonexistent.invalid")));
+    ex.drop();
+    return expect_eq(n, -1 as i64);
+}
+
+![test]
+function async_resolve_two_at_once() -> Result<(), TestError> {
+    mut ex: Executor = Executor::new();
+    const r: i64 = ex.block_on(async_count_pair());
+    ex.drop();
+    return expect_eq(r, 0 as i64);
+}
+
+/// Off an executor there is no pool to submit to, so `Resolve` does the lookup
+/// on the polling thread and completes on its first poll. The spinning driver
+/// has no reactor either, so this is the only way it could work at all.
+![test]
+function async_resolve_without_a_pool_runs_inline() -> Result<(), TestError> {
+    const n: i64 = future::block_on(async_count(Str::new("localhost")));
+    return expect(n >= 1, Str::new("localhost should resolve with no pool present"));
 }
 
 ![test]

@@ -2,9 +2,28 @@
 ///!
 ///! A frame is a 2-byte header, an extended length (0 / 2 / 8 bytes), an
 ///! optional 4-byte masking key, then the payload. Clients MUST mask;
-///! servers MUST NOT. `encode_frame` / `read_frame` are generic over the
-///! `Write` / `Read` transport, so they run over `TcpStream` (ws://) and
-///! `TlsStream` (wss://) alike.
+///! servers MUST NOT.
+///!
+///! Both directions are inherent methods on `BufStream<S>`, beside HTTP/1.1's
+///! `read_request` and for the same reasons:
+///!
+///!   - **Reading is a method** because a parser written as a static taking
+///!     `mut &BufStream<S>` cannot be called from an async caller holding the
+///!     connection as a local — handing the address of a local to a future
+///!     that outlives the current poll is refused (E0455), and only the
+///!     RECEIVER is re-supplied on every poll.
+///!   - **Queuing is synchronous.** A whole frame — header, extended length,
+///!     key, masked payload — is built into `pending()` with no suspension
+///!     point inside it, and the caller suspends exactly once, in `flush`.
+///!     That also removes the staging `Array` a transport-driven encoder
+///!     needed: the bytes are masked in place where they already sit.
+///!
+///! Written once for `BufStream<S>` over any async transport, so ws:// over
+///! `TcpStream` and wss:// over `TlsStream` are served by the same code.
+///!
+///! No `buffered()` slice is held across an `await`: every header byte is
+///! copied into a scalar before the next suspension, which is what makes the
+///! parse safe against a fill that grows and moves the connection's buffer.
 
 namespace std::net::ws::frame;
 
@@ -13,8 +32,12 @@ import core::result;
 import core::slice;
 import io::error;
 import io::traits;
+import io::buf;
 import collections::array;
 import random::secure;
+import future::poll;
+import future::waker;
+import future::traits;
 
 /// Largest payload we'll buffer for a single frame (64 MiB). A frame
 /// claiming more is rejected rather than risking an unbounded alloc.
@@ -45,129 +68,141 @@ type struct Frame {
     }
 }
 
-/// Write one frame. `mask` selects client framing (a random masking key
-/// is generated and applied) vs server framing (no mask). The payload is
-/// not consumed.
-function encode_frame<W>(writer: mut &W, fin: boolean, opcode: OpCode,
-                         payload: Slice<u8>, mask: boolean) -> Result<(), IoError>
-where W: Write {
-    const len: u64 = payload.length();
-    mut frame: Array<u8> = Array<u8>::with_capacity(len + 14);
+/// Framing over a buffered async connection.
+implement struct BufStream<S> {
+    /// Queue one frame into the outgoing buffer. `mask` selects client framing
+    /// (a fresh masking key from the OS CSPRNG is generated and applied) from
+    /// server framing (no mask), per RFC 6455 section 5.1. The payload is not
+    /// consumed. Nothing is sent until the caller flushes.
+    queue_frame(mut &this, fin: boolean, opcode: OpCode, payload: Slice<u8>,
+                mask: boolean) -> Result<(), IoError> {
+        const len: u64 = payload.length();
+        mut out: Array<u8>* = this.pending();
 
-    // Byte 0: FIN + opcode.
-    mut b0: u8 = op_to_u8(opcode);
-    if (fin) { b0 = b0 | 0x80; }
-    frame.push(b0);
+        // Byte 0: FIN + opcode.
+        mut b0: u8 = op_to_u8(opcode);
+        if (fin) { b0 = b0 | 0x80; }
+        out.push(b0);
 
-    // Byte 1: mask bit + length (7-bit, or 126/127 escape).
-    const mask_bit: u8 = if (mask) { 0x80 } else { 0 };
-    if (len < 126) {
-        frame.push(mask_bit | (len as u8));
-    } else {
-        if (len <= 0xFFFF) {
-            frame.push(mask_bit | 126);
-            frame.push((len >> 8) as u8);
-            frame.push((len)      as u8);
+        // Byte 1: mask bit + length (7-bit, or 126/127 escape).
+        const mask_bit: u8 = if (mask) { 0x80 } else { 0 };
+        if (len < 126) {
+            out.push(mask_bit | (len as u8));
         } else {
-            frame.push(mask_bit | 127);
-            mut s: i64 = 56;
-            while (s >= 0) { frame.push((len >> (s as u64)) as u8); s = s - 8; }
+            if (len <= 0xFFFF) {
+                out.push(mask_bit | 126);
+                out.push((len >> 8) as u8);
+                out.push((len)      as u8);
+            } else {
+                out.push(mask_bit | 127);
+                mut s: i64 = 56;
+                while (s >= 0) { out.push((len >> (s as u64)) as u8); s = s - 8; }
+            }
         }
-    }
 
-    // Masking key + masked payload, or raw payload.
-    if (mask) {
         mut key: u8[4];
-        gen_mask(&key[0]);
-        frame.push(key[0]); frame.push(key[1]); frame.push(key[2]); frame.push(key[3]);
-        mut i: u64 = 0;
-        while (i < len) {
-            frame.push(byte_at(payload, i) ^ key[i % 4]);
-            i++;
+        if (mask) {
+            gen_mask(&key[0]);
+            out.push(key[0]); out.push(key[1]); out.push(key[2]); out.push(key[3]);
         }
-    } else {
-        mut i: u64 = 0;
-        while (i < len) { frame.push(byte_at(payload, i)); i++; }
-    }
 
-    const result: Result<(), IoError> =
-        writer.write(Slice<u8>::from_raw(frame.as_ptr(), frame.length()));
-    frame.drop();
-    return result;
-}
-
-/// Read one frame off `reader`, enforcing the role-independent RFC 6455
-/// framing rules: a set reserved bit (RSV1-3, section 5.2, no extension
-/// negotiated), an over-long or fragmented control frame (section 5.4-5.5), a
-/// reserved opcode, and an oversized payload are all rejected with
-/// `InvalidData`. The mask-direction rule (section 5.1) is role-dependent, so the
-/// decoded `Frame` carries its `masked` bit and the connection layer
-/// enforces it. (Kept single-argument on purpose - see conn.cryo.)
-function read_frame<R>(reader: mut &R) -> Result<Frame, IoError>
-where R: Read {
-    mut header: u8[2];
-    reader.read_exact(&header[0], 2)?;
-
-    // RSV1-3 (bits 0x70 of byte 0) MUST be clear: we negotiate no
-    // extension that would define them. (section 5.2)
-    if ((header[0] & 0x70) != 0) {
-        return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
-    }
-
-    const fin: boolean = (header[0] & 0x80) != 0;
-    const masked: boolean = (header[1] & 0x80) != 0;
-    const opcode: OpCode = match (op_from_u8(header[0] & 0x0F)) {
-        Option::Some(op) => { op }
-        Option::None     => { return Result::Err(IoError::new(IoErrorKind::InvalidData, 0)); }
-    };
-
-    // Payload length: 7-bit, or 16-/64-bit extended.
-    mut len: u64 = (header[1] & 0x7F) as u64;
-    if (len == 126) {
-        mut ext: u8[2];
-        reader.read_exact(&ext[0], 2)?;
-        len = ((ext[0] as u64) << 8) | (ext[1] as u64);
-    } else {
-        if (len == 127) {
-            mut ext: u8[8];
-            reader.read_exact(&ext[0], 8)?;
-            len = 0;
-            mut i: u64 = 0;
-            while (i < 8) { len = (len << 8) | (ext[i] as u64); i++; }
-        }
-    }
-
-    // Control frames (Close/Ping/Pong) MUST carry the FIN bit and at most
-    // 125 payload bytes (section 5.4-5.5). Rejecting here - before the payload is
-    // buffered - stops a 64 MiB "ping" from being read and echoed back as
-    // a Pong (a DoS amplification).
-    if (is_control(opcode) && (!fin || len > 125)) {
-        return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
-    }
-
-    if (len > MAX_PAYLOAD) {
-        return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
-    }
-
-    mut key: u8[4];
-    if (masked) { reader.read_exact(&key[0], 4)?; }
-
-    mut payload: Array<u8> = Array<u8>::with_capacity(len);
-    mut z: u64 = 0;
-    while (z < len) { payload.push(0); z++; }
-    if (len > 0) {
-        match (reader.read_exact(payload.as_ptr(), len)) {
+        // Copy the payload in, then mask it where it landed. `as_ptr` is read
+        // AFTER the append: appending may move the buffer's block.
+        const start: u64 = out.length();
+        match (out.try_append(payload)) {
             Result::Ok(_)  => { }
-            Result::Err(e) => { payload.drop(); return Result::Err(e); }
+            Result::Err(_) => { return Result::Err(IoError::new(IoErrorKind::OutOfMemory, 0)); }
         }
-    }
-    if (masked) {
-        const p: u8* = payload.as_ptr();
-        mut i: u64 = 0;
-        while (i < len) { p[i] = p[i] ^ key[i % 4]; i++; }
+        if (mask) {
+            const p: u8* = out.as_ptr() + start;
+            mut i: u64 = 0;
+            while (i < len) { p[i] = p[i] ^ key[i % 4]; i++; }
+        }
+        return Result::Ok(());
     }
 
-    return Result::Ok(Frame { fin: fin, opcode: opcode, masked: masked, payload: payload });
+    /// Read one frame, enforcing the role-independent RFC 6455 framing rules:
+    /// a set reserved bit (RSV1-3, section 5.2, no extension negotiated), an
+    /// over-long or fragmented control frame (section 5.4-5.5), a reserved
+    /// opcode, and an oversized payload are all rejected with `InvalidData`.
+    /// The mask-direction rule (section 5.1) is role-dependent, so the decoded
+    /// `Frame` carries its `masked` bit and the connection layer enforces it.
+    async read_frame(mut &this) -> Result<Frame, IoError>
+    where S: AsyncTransport {
+        (await this.ensure(2))?;
+        const head: Slice<u8> = this.buffered();
+        const h0: u8 = byte_at(head, 0);
+        const h1: u8 = byte_at(head, 1);
+        this.consume(2);
+
+        // RSV1-3 (bits 0x70 of byte 0) MUST be clear: we negotiate no
+        // extension that would define them. (section 5.2)
+        if ((h0 & 0x70) != 0) {
+            return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
+        }
+
+        const fin: boolean = (h0 & 0x80) != 0;
+        const masked: boolean = (h1 & 0x80) != 0;
+        const opcode: OpCode = match (op_from_u8(h0 & 0x0F)) {
+            Option::Some(op) => { op }
+            Option::None     => { return Result::Err(IoError::new(IoErrorKind::InvalidData, 0)); }
+        };
+
+        // Payload length: 7-bit, or 16-/64-bit extended.
+        mut len: u64 = (h1 & 0x7F) as u64;
+        if (len == 126) {
+            (await this.ensure(2))?;
+            const ext: Slice<u8> = this.buffered();
+            len = ((byte_at(ext, 0) as u64) << 8) | (byte_at(ext, 1) as u64);
+            this.consume(2);
+        } else {
+            if (len == 127) {
+                (await this.ensure(8))?;
+                const ext: Slice<u8> = this.buffered();
+                len = 0;
+                mut i: u64 = 0;
+                while (i < 8) { len = (len << 8) | (byte_at(ext, i) as u64); i++; }
+                this.consume(8);
+            }
+        }
+
+        // Control frames (Close/Ping/Pong) MUST carry the FIN bit and at most
+        // 125 payload bytes (section 5.4-5.5). Rejecting here - before the
+        // payload is buffered - stops a 64 MiB "ping" from being read and
+        // echoed back as a Pong (a DoS amplification).
+        if (is_control(opcode) && (!fin || len > 125)) {
+            return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
+        }
+
+        if (len > MAX_PAYLOAD) {
+            return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
+        }
+
+        // The masking key is carried as ONE scalar rather than a 4-byte buffer:
+        // it has to survive the payload's suspension, and a scalar crosses it
+        // in a frame field with no allocation and no carrier bookkeeping.
+        mut mask_key: u32 = 0;
+        if (masked) {
+            (await this.ensure(4))?;
+            const kv: Slice<u8> = this.buffered();
+            mask_key = ((byte_at(kv, 0) as u32) << 24) | ((byte_at(kv, 1) as u32) << 16)
+                     | ((byte_at(kv, 2) as u32) << 8)  |  (byte_at(kv, 3) as u32);
+            this.consume(4);
+        }
+
+        mut payload: Array<u8> = (await this.read_exact(len))?;
+        if (masked) {
+            const p: u8* = payload.as_ptr();
+            mut i: u64 = 0;
+            while (i < len) {
+                const shift: u32 = (24 - 8 * ((i % 4) as u32));
+                p[i] = p[i] ^ ((mask_key >> shift) as u8);
+                i++;
+            }
+        }
+
+        return Result::Ok(Frame { fin: fin, opcode: opcode, masked: masked, payload: payload });
+    }
 }
 
 /// Numeric opcode for the wire.
@@ -212,7 +247,7 @@ function op_from_u8(value: u8) -> Option<OpCode> {
 /// portable `secure::fill_secure_bytes` (`getrandom` on UNIX,
 /// `RtlGenRandom` on Windows) so it links on every target.
 function gen_mask(out: u8*) -> void {
-    secure::fill_secure_bytes(out, 4u64);
+    secure::fill_secure_bytes(out, 4);
 }
 
 /// Slice byte access without `Option` ceremony; callers stay in range.

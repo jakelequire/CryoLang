@@ -15,6 +15,7 @@ import { createStatusBar, updateStatus, disposeStatusBar } from './statusBar';
 import { registerCommands } from './commands';
 import { registerDiagnosticView } from './diagnosticView';
 import { extendMarkdownIt, initHighlighter } from './markdownPreview';
+import { initInactiveRegions, registerInactiveRegions } from './inactiveRegions';
 
 let client: LanguageClient | undefined;
 let outputChannel: vscode.OutputChannel;
@@ -102,6 +103,11 @@ export async function activate(
     // Both grab the LanguageClient lazily so they survive server
     // restarts without a re-registration step.
     registerDiagnosticView(context, () => client, outputChannel);
+
+    // Inactive-region dimming: create the fade decoration + keep newly-visible
+    // editors painted. The per-client notification subscription is set up in
+    // `startClient` (it needs the running client).
+    initInactiveRegions(context);
 
     // Hover-verbosity toggle: flip the expand flag and re-show the hover the
     // user is pointing at.  `editor.action.showHover` renders at the caret, not
@@ -307,12 +313,64 @@ async function startClient(context: vscode.ExtensionContext): Promise<void> {
     try {
         await client.start();
         outputChannel.appendLine('CryoLSP started successfully');
+        // Subscribe to inactive-region notifications for this client instance.
+        context.subscriptions.push(registerInactiveRegions(client));
+        reportServerVersion(client, serverPath, context, outputChannel);
         updateStatus('ready');
     } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         outputChannel.appendLine(`Failed to start CryoLSP: ${message}`);
         updateStatus('error');
         client = undefined;
+    }
+}
+
+/**
+ * Compare the version the server reported in `initialize` against the
+ * extension's own, and say so out loud when they disagree.
+ *
+ * The server binary is found by probing seven locations, so the one that
+ * actually got launched is frequently not the one the user has in mind - a
+ * `cryolsp` left on $PATH by an old install outranks a freshly built tree.
+ * Mismatched halves mostly still speak LSP, so the symptom is not a failure
+ * to start but subtly wrong results, which is the worst way to find out.
+ *
+ * The resolved path is included because knowing the versions differ is only
+ * half an answer; the user needs to know WHICH binary to replace. This warns
+ * rather than refuses: running deliberately mixed versions is normal while
+ * developing the server itself.
+ */
+function reportServerVersion(
+    client: LanguageClient,
+    serverPath: string,
+    context: vscode.ExtensionContext,
+    outputChannel: vscode.OutputChannel
+): void {
+    const clientVersion: string = context.extension.packageJSON.version;
+    const serverInfo = client.initializeResult?.serverInfo;
+
+    // A server old enough to omit `serverInfo` predates the handshake
+    // entirely, which is itself the staleness this check exists to catch.
+    if (!serverInfo?.version) {
+        const hint =
+            `CryoLSP at ${serverPath} reported no version; it is older than ` +
+            `this extension (${clientVersion}) and may be stale.`;
+        outputChannel.appendLine(hint);
+        vscode.window.showWarningMessage(hint);
+        return;
+    }
+
+    outputChannel.appendLine(
+        `CryoLSP version ${serverInfo.version} (extension ${clientVersion})`
+    );
+
+    if (serverInfo.version !== clientVersion) {
+        const hint =
+            `CryoLSP version mismatch: server ${serverInfo.version} at ` +
+            `${serverPath}, extension ${clientVersion}. Rebuild the server ` +
+            `or set cryo.languageServer.path to the matching binary.`;
+        outputChannel.appendLine(hint);
+        vscode.window.showWarningMessage(hint);
     }
 }
 

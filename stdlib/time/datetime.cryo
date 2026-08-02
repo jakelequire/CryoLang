@@ -1,0 +1,180 @@
+///! std::time::datetime: `DateTime`, a UTC civil calendar.
+///!
+///! `DateTime` is a broken-out UTC calendar reading - year / month / day /
+///! hour / minute / second - derived from a Unix timestamp (whole seconds
+///! since 1970-01-01 00:00:00 UTC) or a `SystemTime`. It is a pure value:
+///! POD, copy-by-value, no `Drop`.
+///!
+///! The timestamp <-> civil-date conversion uses Howard Hinnant's public
+///! `civil_from_days` algorithm, which is exact and branch-light across the
+///! whole proleptic Gregorian calendar - leap years, century rules, and
+///! pre-epoch (negative) timestamps all fall out of the arithmetic with no
+///! per-month tables. The day index and the second-of-day are split with a
+///! FLOOR division so a negative timestamp lands on the correct civil day
+///! (truncating toward zero would put, e.g., -1 second on 1970-01-01 instead
+///! of 1969-12-31).
+///!
+///! `Display` renders ISO-8601 in UTC: `YYYY-MM-DDThh:mm:ssZ`. Only whole
+///! seconds are shown; sub-second precision, if any, stays in the source
+///! `SystemTime`.
+
+namespace std::time::datetime;
+
+import core::result;
+import core::primitives;
+import collections::str;
+import collections::string;
+import fmt::display;
+import fmt::write;
+import fmt::error;
+import time::clock;
+
+const SECS_PER_DAY: i64 = 86400;
+const SECS_PER_HOUR: i64 = 3600;
+const SECS_PER_MIN:  i64 = 60;
+
+// The civil algorithm counts days from 0000-03-01 (a "shifted" epoch that
+// puts the leap day at the end of the year). 719468 is the number of days
+// from that shifted epoch to 1970-01-01, so adding it converts a Unix day
+// index into the algorithm's internal frame.
+const DAYS_SHIFT:   i64 = 719468;
+const DAYS_PER_ERA: i64 = 146097;   // days in 400 years
+const YEARS_PER_ERA: i64 = 400;
+
+/// A UTC civil calendar reading. All fields are UTC and already normalized:
+/// `month` in 1..=12, `day` in 1..=31, `hour` in 0..=23, `minute`/`second`
+/// in 0..=59. `year` is the proleptic Gregorian year and may be negative for
+/// timestamps far before the Common Era. POD.
+type struct DateTime {
+    year:   i64;
+    month:  u32;
+    day:    u32;
+    hour:   u32;
+    minute: u32;
+    second: u32;
+
+    /// Break a whole-second Unix timestamp into its UTC calendar parts.
+    static from_unix_secs(secs: i64) -> DateTime {
+        // Floor-divide into (day index, second-of-day). Cryo integer
+        // division truncates toward zero, so for a negative timestamp the
+        // quotient is one too high and the remainder is negative - correct
+        // both by borrowing a day, landing `sod` in [0, 86399].
+        mut days: i64 = secs / SECS_PER_DAY;
+        mut sod:  i64 = secs % SECS_PER_DAY;
+        if (sod < 0) {
+            days = days - 1;
+            sod  = sod + SECS_PER_DAY;
+        }
+        const hour:   u32 = (sod / SECS_PER_HOUR) as u32;
+        const minute: u32 = ((sod % SECS_PER_HOUR) / SECS_PER_MIN) as u32;
+        const second: u32 = (sod % SECS_PER_MIN) as u32;
+        return civil_from_days(days, hour, minute, second);
+    }
+
+    /// The UTC calendar reading for a `SystemTime` (its whole-second Unix
+    /// timestamp; any sub-second remainder is dropped).
+    static from_system_time(t: &SystemTime) -> DateTime {
+        return DateTime::from_unix_secs(t.unix_secs());
+    }
+
+    /// The current UTC date and time from the wall clock.
+    static now() -> DateTime {
+        const t: SystemTime = SystemTime::now();
+        return DateTime::from_system_time(&t);
+    }
+
+    /// Render as ISO-8601 UTC (`YYYY-MM-DDThh:mm:ssZ`) - the same text as the
+    /// `Display` impl, available directly without an f-string.
+    to_string(&this) -> String {
+        match (format_to_string<DateTime>(this)) {
+            Result::Ok(s)  => { return s; }
+            Result::Err(_) => { return String::new(); }
+        }
+    }
+}
+
+/// (year, month, day) for a day index counted from the Unix epoch, packed
+/// into a `DateTime` alongside the already-computed time-of-day. This is
+/// Howard Hinnant's `civil_from_days`, verbatim in structure; every division
+/// here is exact integer arithmetic with the ranges annotated inline.
+private function civil_from_days(days: i64, hour: u32,
+                                 minute: u32, second: u32) -> DateTime {
+    const z: i64 = days + DAYS_SHIFT;
+
+    // era: which 400-year cycle `z` falls in. The offset keeps the floor
+    // correct for negative `z` (truncation would round toward zero here).
+    mut z_for_era: i64 = z;
+    if (z < 0) { z_for_era = z - (DAYS_PER_ERA - 1); }
+    const era: i64 = z_for_era / DAYS_PER_ERA;
+
+    const doe: i64 = z - era * DAYS_PER_ERA;                 // day-of-era [0, 146096]
+    const yoe: i64 = (doe - doe / 1460 + doe / 36524
+                          - doe / 146096) / 365;       // year-of-era [0, 399]
+    const y:   i64 = yoe + era * YEARS_PER_ERA;
+    const doy: i64 = doe - (365 * yoe + yoe / 4
+                                         - yoe / 100);    // day-of-year [0, 365]
+    const mp:  i64 = (5 * doy + 2) / 153;           // shifted month [0, 11]
+    const day: i64 = doy - (153 * mp + 2) / 5 + 1;   // [1, 31]
+
+    // Unshift the month (the algorithm's year starts in March) and, when the
+    // month rolls back to Jan/Feb, advance the year to match.
+    mut month: i64 = mp + 3;
+    if (mp >= 10) { month = mp - 9; }
+    mut year: i64 = y;
+    if (month <= 2) { year = y + 1; }
+
+    return DateTime {
+        year:   year,
+        month:  month as u32,
+        day:    day as u32,
+        hour:   hour,
+        minute: minute,
+        second: second
+    };
+}
+
+// Display: ISO-8601 UTC.
+
+/// Write `value` as a decimal integer zero-padded to at least `width` digits.
+private function write_pad<W>(f: mut &Formatter<W>, value: u64, width: u64)
+    -> Result<(), FmtError>
+where W: FmtWrite {
+    mut buffer: u8[20];
+    const digits: u64 = value.to_decimal_buf(&buffer[0]);
+    mut pad: u64 = digits;
+    while (pad < width) {
+        f.write_str(Str::new("0"))?;
+        pad = pad + 1;
+    }
+    return f.write_str(Str::from_raw(&buffer[0], digits));
+}
+
+/// Write the year zero-padded to 4 digits, with a leading `-` for years
+/// before the Common Era (ISO-8601 expanded form).
+private function write_year<W>(f: mut &Formatter<W>, year: i64)
+    -> Result<(), FmtError>
+where W: FmtWrite {
+    if (year < 0) {
+        f.write_str(Str::new("-"))?;
+        return write_pad(f, (0 - year) as u64, 4);
+    }
+    return write_pad(f, year as u64, 4);
+}
+
+implement trait Display for struct DateTime {
+    fmt<W>(&this, f: mut &Formatter<W>) -> Result<(), FmtError>
+    where W: FmtWrite {
+        write_year(f, this.year)?;
+        f.write_str(Str::new("-"))?;
+        write_pad(f, this.month as u64, 2)?;
+        f.write_str(Str::new("-"))?;
+        write_pad(f, this.day as u64, 2)?;
+        f.write_str(Str::new("T"))?;
+        write_pad(f, this.hour as u64, 2)?;
+        f.write_str(Str::new(":"))?;
+        write_pad(f, this.minute as u64, 2)?;
+        f.write_str(Str::new(":"))?;
+        write_pad(f, this.second as u64, 2)?;
+        return f.write_str(Str::new("Z"));
+    }
+}

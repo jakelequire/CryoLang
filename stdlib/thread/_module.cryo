@@ -57,7 +57,7 @@ import alloc::allocator;
 import collections::array;
 import collections::str;
 import ffi::libc;
-import ffi::syscall;
+import sys::syscall;
 import sync::atomic;
 
 public module thread::local;
@@ -85,7 +85,7 @@ private function os_join(tid: u64) -> void {
 ![target(windows)]
 private function os_join(tid: u64) -> void {
     const h: u8* = tid as u8*;
-    syscall::WaitForSingleObject(h, 0xFFFFFFFFu32);   // INFINITE
+    syscall::WaitForSingleObject(h, 0xFFFFFFFF);   // INFINITE
     syscall::CloseHandle(h);
 }
 
@@ -111,9 +111,9 @@ private function os_yield() -> void { syscall::SwitchToThread(); }
 
 ![target(unix)]
 private function os_sleep_nanos(nanos: u64) -> void {
-    mut req: timespec = timespec { tv_sec: (nanos / 1000000000u64) as i64,
-                                   tv_nsec: (nanos % 1000000000u64) as i64 };
-    mut rem: timespec = timespec { tv_sec: 0i64, tv_nsec: 0i64 };
+    mut req: timespec = timespec { tv_sec: (nanos / 1000000000) as i64,
+                                   tv_nsec: (nanos % 1000000000) as i64 };
+    mut rem: timespec = timespec { tv_sec: 0, tv_nsec: 0 };
     while (nanosleep(&req, &rem) != 0) {
         req = rem;   // EINTR: resume with the kernel's remaining time.
     }
@@ -122,8 +122,8 @@ private function os_sleep_nanos(nanos: u64) -> void {
 private function os_sleep_nanos(nanos: u64) -> void {
     // Sleep takes whole milliseconds; round up so a sub-ms request still
     // yields a non-zero sleep (>= 1ms) rather than busy-returning.
-    mut ms: u64 = (nanos + 999999u64) / 1000000u64;
-    if (ms == 0u64 && nanos > 0u64) { ms = 1u64; }
+    mut ms: u64 = (nanos + 999999) / 1000000;
+    if (ms == 0 && nanos > 0) { ms = 1; }
     syscall::Sleep(ms as u32);
 }
 
@@ -141,9 +141,9 @@ private function os_set_thread_name(tid: u64, name: u8*) -> void {
     // MultiByteToWideChar the input is NUL-terminated (and to NUL-terminate
     // the output).
     mut wbuf: u16[16];
-    mut i: u64 = 0u64;
-    while (i < 16u64) { wbuf[i] = 0u16; i = i + 1u64; }
-    const n: i32 = syscall::MultiByteToWideChar(syscall::CP_UTF8, 0u32,
+    mut i: u64 = 0;
+    while (i < 16) { wbuf[i] = 0; i = i + 1; }
+    const n: i32 = syscall::MultiByteToWideChar(syscall::CP_UTF8, 0,
                                                 name, -1, &wbuf[0], 16);
     if (n <= 0) { return; }
     syscall::SetThreadDescription(tid as u8*, &wbuf[0]);
@@ -218,7 +218,7 @@ function thread_body<C, T>(arg: u8*) -> void {
 ![target(unix)]
 function thread_trampoline<C, T>(arg: u8*) -> u8* { thread_body<C, T>(arg); return null; }
 ![target(windows)]
-function thread_trampoline<C, T>(arg: u8*) -> u32 { thread_body<C, T>(arg); return 0u32; }
+function thread_trampoline<C, T>(arg: u8*) -> u32 { thread_body<C, T>(arg); return 0; }
 
 /// Create an OS thread running `thread_trampoline<C,T>(arg)`, writing the
 /// joinable id/handle into `tbuf` (8 bytes).  `stack_bytes == 0` requests
@@ -226,12 +226,12 @@ function thread_trampoline<C, T>(arg: u8*) -> u32 { thread_body<C, T>(arg); retu
 ![target(linux)]
 private function os_create_thread<C, T>(tbuf: u8*, arg: u8*, stack_bytes: u64) -> i32 {
     const tramp_fn: (u8*) -> u8* = thread_trampoline<C, T>;
-    if (stack_bytes == 0u64) {
+    if (stack_bytes == 0) {
         return pthread_create(tbuf, null, tramp_fn as void*, arg);
     }
     mut attr: u8[56];
-    mut i: u64 = 0u64;
-    while (i < 56u64) { attr[i] = 0u8; i = i + 1u64; }
+    mut i: u64 = 0;
+    while (i < 56) { attr[i] = 0; i = i + 1; }
     if (pthread_attr_init(&attr[0]) != 0) { return 11; }   // EAGAIN
     if (pthread_attr_setstacksize(&attr[0], stack_bytes) != 0) {
         pthread_attr_destroy(&attr[0]);
@@ -247,7 +247,7 @@ private function os_create_thread<C, T>(tbuf: u8*, arg: u8*, stack_bytes: u64) -
     // dwStackSize = 0 means "default"; CreateThread takes the size directly,
     // so no attribute object is needed.
     const h: u8* = syscall::CreateThread(null, stack_bytes, tramp_fn as void*,
-                                         arg, 0u32, null);
+                                         arg, 0, null);
     if (h == null) { return 11; }   // surface as a resource-limit error
     *(tbuf as u64*) = h as u64;     // store the HANDLE as the joinable id
     return 0;
@@ -347,7 +347,7 @@ implement<T> trait Drop for struct JoinHandle<T> {
 /// "move a non-thread-safe value into a thread" hole.
 function spawn<C, T>(ctx: C, body: (C) -> T) -> JoinHandle<T>
 where C: Send, T: Send {
-    match (spawn_with_attr<C, T>(ctx, body, 0u64)) {
+    match (spawn_with_attr<C, T>(ctx, body, 0)) {
         Result::Ok(h)  => { return h; }
         Result::Err(_) => {
             core::panic("thread::spawn: failed to create thread", FILE, LINE);
@@ -382,7 +382,7 @@ where C: Send, T: Send {
     (*p).ctx    = ctx;
     (*p).shared = shared;
 
-    mut tbuf: u8[8] = [0u8; 8];
+    mut tbuf: u8[8] = [0; 8];
     const rc: i32 = os_create_thread<C, T>(&tbuf[0], p as u8*, stack_bytes);
     if (rc != 0) {
         // The thread never started, so we still own both boxes. The
@@ -432,7 +432,7 @@ implement enum SpawnError {
 ///   ```
 function try_spawn<C, T>(ctx: C, body: (C) -> T) -> Result<JoinHandle<T>, SpawnError>
 where C: Send, T: Send {
-    return spawn_with_attr<C, T>(ctx, body, 0u64);
+    return spawn_with_attr<C, T>(ctx, body, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -469,9 +469,9 @@ type struct Builder {
     /// A builder with default attributes: OS-default stack, no name.
     static new() -> Builder {
         mut nb: u8[16];
-        mut i: u64 = 0u64;
-        while (i < 16u64) { nb[i] = 0u8; i = i + 1u64; }
-        return Builder { stack_bytes: 0u64, name_buf: nb, name_len: 0u64 };
+        mut i: u64 = 0;
+        while (i < 16) { nb[i] = 0; i = i + 1; }
+        return Builder { stack_bytes: 0, name_buf: nb, name_len: 0 };
     }
 
     /// Set the new thread's stack size in bytes. The OS rounds up to a
@@ -489,12 +489,12 @@ type struct Builder {
         mut len: u64 = n.length();
         if (len > MAX_THREAD_NAME) { len = MAX_THREAD_NAME; }
         const src: u8* = n.as_ptr();
-        mut i: u64 = 0u64;
+        mut i: u64 = 0;
         while (i < len) {
             this.name_buf[i] = src[i];
-            i = i + 1u64;
+            i = i + 1;
         }
-        this.name_buf[len] = 0u8;   // NUL-terminate
+        this.name_buf[len] = 0;   // NUL-terminate
         this.name_len = len;
         return this;
     }
@@ -524,7 +524,7 @@ type struct Builder {
 
         match (result) {
             Result::Ok(h) => {
-                if (this.name_len > 0u64) {
+                if (this.name_len > 0) {
                     // Best-effort: a naming failure does not invalidate the
                     // live thread.
                     os_set_thread_name(h.tid, &this.name_buf[0]);
@@ -579,7 +579,7 @@ function sleep(nanos: u64) -> void {
 
 /// Sleep for at least `millis` milliseconds.
 function sleep_ms(millis: u64) -> void {
-    sleep(millis * 1000000u64);
+    sleep(millis * 1000000);
 }
 
 
@@ -609,19 +609,19 @@ function scope_body<C>(arg: u8*) -> void {
 ![target(unix)]
 function scope_trampoline<C>(arg: u8*) -> u8* { scope_body<C>(arg); return null; }
 ![target(windows)]
-function scope_trampoline<C>(arg: u8*) -> u32 { scope_body<C>(arg); return 0u32; }
+function scope_trampoline<C>(arg: u8*) -> u32 { scope_body<C>(arg); return 0; }
 
 /// Create an OS thread running `scope_trampoline<C>(arg)`, writing the
 /// joinable id/handle into `tbuf`. Returns 0 on success.
 ![target(unix)]
 private function os_create_scope_thread<C>(tbuf: u8*, arg: u8*, stack_bytes: u64) -> i32 {
     const t: (u8*) -> u8* = scope_trampoline<C>;
-    if (stack_bytes == 0u64) {
+    if (stack_bytes == 0) {
         return pthread_create(tbuf, null, t as void*, arg);
     }
     mut attr: u8[56];
-    mut i: u64 = 0u64;
-    while (i < 56u64) { attr[i] = 0u8; i = i + 1u64; }
+    mut i: u64 = 0;
+    while (i < 56) { attr[i] = 0; i = i + 1; }
     if (pthread_attr_init(&attr[0]) != 0) { return 11; }
     if (pthread_attr_setstacksize(&attr[0], stack_bytes) != 0) {
         pthread_attr_destroy(&attr[0]);
@@ -637,8 +637,8 @@ private function os_create_scope_thread<C>(tbuf: u8*, arg: u8*, stack_bytes: u64
     // STACK_SIZE_PARAM_IS_A_RESERVATION (0x10000): treat `stack_bytes` as the
     // reserve (committed lazily) rather than an eager commit, so a large worker
     // stack costs address space, not resident memory.
-    mut flags: u32 = 0u32;
-    if (stack_bytes != 0u64) { flags = 65536u32; }
+    mut flags: u32 = 0;
+    if (stack_bytes != 0) { flags = 65536; }
     const h: u8* = syscall::CreateThread(null, stack_bytes, t as void*, arg, flags, null);
     if (h == null) { return 11; }
     *(tbuf as u64*) = h as u64;
@@ -668,7 +668,7 @@ type struct Scope {
 
     /// Create an empty scope whose threads use the OS default stack size.
     static new() -> Scope {
-        return Scope { tids: [], stack_bytes: 0u64 };
+        return Scope { tids: [], stack_bytes: 0 };
     }
 
     /// Create a scope whose threads each get a `stack_bytes`-byte stack. Use
@@ -694,7 +694,7 @@ type struct Scope {
         }
         (*p).body = body;
         (*p).ctx  = ctx;
-        mut tbuf: u8[8] = [0u8; 8];
+        mut tbuf: u8[8] = [0; 8];
         const rc: i32 = os_create_scope_thread<C>(&tbuf[0], p as u8*, this.stack_bytes);
         if (rc != 0) { core::panic("Scope::spawn: thread creation failed", FILE, LINE); }
         this.tids.push(*(&tbuf[0] as u64*));
@@ -742,11 +742,11 @@ function available_parallelism() -> u32 {
 ![target(windows)]
 function available_parallelism() -> u32 {
     mut si: syscall::SYSTEM_INFO_PARTIAL = syscall::SYSTEM_INFO_PARTIAL {
-        wProcessorArchitecture: 0u16, wReserved: 0u16, dwPageSize: 0u32,
+        wProcessorArchitecture: 0, wReserved: 0, dwPageSize: 0,
         lpMinimumApplicationAddress: null, lpMaximumApplicationAddress: null,
-        dwActiveProcessorMask: 0u64, dwNumberOfProcessors: 0u32,
-        dwProcessorType: 0u32, dwAllocationGranularity: 0u32,
-        wProcessorLevel: 0u16, wProcessorRevision: 0u16
+        dwActiveProcessorMask: 0, dwNumberOfProcessors: 0,
+        dwProcessorType: 0, dwAllocationGranularity: 0,
+        wProcessorLevel: 0, wProcessorRevision: 0
     };
     syscall::GetSystemInfo(&si as u8*);
     if (si.dwNumberOfProcessors == 0) { return 1; }

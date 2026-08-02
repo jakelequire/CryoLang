@@ -1,11 +1,15 @@
-///! TcpListener / TcpStream - loopback round-trip over 127.0.0.1.
+///! TcpListener / TcpStream - loopback round-trip over 127.0.0.1 and [::1].
 ///!
-///! Single-threaded: on Linux, connect() to a listening socket completes
-///! immediately by queuing into the backlog, so the same thread can
-///! connect then accept.  Each test binds an EPHEMERAL port (`:0`) and
-///! reads the kernel-assigned port back via `TcpListener::local_addr()`,
-///! so concurrent runs never collide and nothing is left to a fixed-port
-///! guess (hermetic; closes the m13 PID-modulo-port flakiness).
+///! Every operation that can wait is a future, so both ends run as two futures
+///! joined inside ONE `Executor` — its reactor is what the accept and every read
+///! register with. Each test binds an EPHEMERAL port (`:0`) and reads the
+///! kernel-assigned port back via `TcpListener::local_addr()`, so concurrent runs
+///! never collide and nothing is left to a fixed-port guess.
+///!
+///! What these cover that `net_tcp_conn` does not is the DIAL path rather than the
+///! buffering: the `sockaddr_in6` packer and the AF_INET6 socket behind
+///! `localhost_v6`, and a connect to a port nobody is listening on being refused
+///! rather than hanging.
 
 ![config(testing)]
 namespace CryoTests::Tests::Stdlib::NetTcp;
@@ -15,36 +19,109 @@ import std::core::option;
 import std::core::slice;
 import std::core::drop;
 import std::collections::str;
+import std::collections::array;
+import std::future;
 import std::io::error;
 import std::io::traits;
-import std::net::ip;
-import std::net::socket_addr;
-import std::net::tcp;
+import std::io::buf;
+import std::net::addr::ip;
+import std::net::addr::socket_addr;
+import std::net::socket::tcp;
 import std::ffi::libc;
 import std::test::error;
 import std::test::assert;
 
-function slices_eq(a: Slice<u8>, b: Slice<u8>) -> boolean {
+// Every failure is a distinct negative number so a red test names its own step.
+
+function ntcp_bytes_eq(a: &Array<u8>, text: string) -> boolean {
+    const b: Slice<u8> = Str::new(text).as_bytes();
     if (a.length() != b.length()) { return false; }
     mut i: u64 = 0;
     while (i < a.length()) {
-        match (a.get(i)) {
-            Option::Some(av) => {
-                match (b.get(i)) {
-                    Option::Some(bv) => { if (av != bv) { return false; } }
-                    Option::None     => { return false; }
-                }
-            }
-            Option::None => { return false; }
-        }
-        i++;
+        mut x: u8 = 0;
+        mut y: u8 = 1;
+        match (a.get(i)) { Option::Some(v) => { x = v; } Option::None => { } }
+        match (b.get(i)) { Option::Some(v) => { y = v; } Option::None => { } }
+        if (x != y) { return false; }
+        i = i + 1;
     }
     return true;
 }
 
+/// Accept one connection, read `ping`, answer `pong`. Returns 4 on success.
+async function ntcp_serve(listener: TcpListener) -> i64 {
+    mut acc: TcpAccepted = await TcpAccept::start(listener);
+    mut lst: TcpListener = acc.take_listener();
+    lst.drop();
+
+    mut stream: TcpStream = TcpStream::from_fd(-1);
+    match (acc.take_result()) {
+        Result::Ok(s)  => { stream = s; }
+        Result::Err(_) => { return -1; }
+    }
+    mut c: BufStream<TcpStream> = BufStream<TcpStream>::of(stream);
+
+    mut got: Array<u8> = match (await c.read_exact(4)) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { return -2; }
+    };
+    if (!ntcp_bytes_eq(&got, "ping")) { return -3; }
+
+    match (c.queue<string>("pong")) { Result::Ok(_) => { } Result::Err(_) => { return -4; } }
+    match (await c.flush())         { Result::Ok(_) => { } Result::Err(_) => { return -5; } }
+    return 4;
+}
+
+/// Dial `addr`, send `ping`, read `pong`. Returns 4 on success.
+async function ntcp_client(addr: SocketAddr) -> i64 {
+    mut sock: TcpStream = match (await TcpConnect::start(addr)) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { return -10; }
+    };
+    mut c: BufStream<TcpStream> = BufStream<TcpStream>::of(sock);
+
+    match (c.queue<string>("ping")) { Result::Ok(_) => { } Result::Err(_) => { return -11; } }
+    match (await c.flush())         { Result::Ok(_) => { } Result::Err(_) => { return -12; } }
+
+    mut got: Array<u8> = match (await c.read_exact(4)) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { return -13; }
+    };
+    if (!ntcp_bytes_eq(&got, "pong")) { return -14; }
+    return 4;
+}
+
+async function ntcp_round(addr: SocketAddr, listener: TcpListener) -> i64 {
+    const pair: (i64, i64) = await Futures::join(ntcp_serve(listener), ntcp_client(addr));
+    if (pair.0 != 4) { return pair.0; }
+    if (pair.1 != 4) { return pair.1; }
+    return 0;
+}
+
+/// A connect to a port nobody is listening on must be REFUSED, not parked.
+async function ntcp_refused(addr: SocketAddr) -> i64 {
+    match (await TcpConnect::start(addr)) {
+        Result::Ok(s)  => {
+            mut unexpected: TcpStream = s;
+            unexpected.drop();
+            return -20;
+        }
+        Result::Err(_) => { return 1; }
+    }
+}
+
+/// Bind an ephemeral port and put the listener in non-blocking mode, which
+/// `TcpAccept` requires: a blocking listener would stall an executor's whole
+/// worker thread inside `accept`.
+function ntcp_bind(addr: SocketAddr) -> Result<TcpListener, IoError> {
+    mut l: TcpListener = TcpListener::bind(addr)?;
+    l.set_nonblocking(true)?;
+    return Result::Ok(l);
+}
+
 ![test]
 function loopback_round_trip() -> Result<(), TestError> {
-    mut listener: TcpListener = match (TcpListener::bind(SocketAddr::localhost_v4(0))) {
+    mut listener: TcpListener = match (ntcp_bind(SocketAddr::localhost_v4(0))) {
         Result::Ok(l)  => { l }
         Result::Err(_) => { return bail(Str::new("bind 127.0.0.1:0 failed")); }
     };
@@ -52,56 +129,19 @@ function loopback_round_trip() -> Result<(), TestError> {
         Result::Ok(a)  => { a.port }
         Result::Err(_) => { listener.drop(); return bail(Str::new("local_addr failed")); }
     };
-    mut client: TcpStream = match (TcpStream::connect(SocketAddr::localhost_v4(port))) {
-        Result::Ok(s)  => { s }
-        Result::Err(_) => { listener.drop(); return bail(Str::new("connect failed")); }
-    };
-    mut server: TcpStream = match (listener.accept()) {
-        Result::Ok(s)  => { s }
-        Result::Err(_) => { client.drop(); listener.drop(); return bail(Str::new("accept failed")); }
-    };
-
-    // client -> server
-    match (client.write(Str::new("ping").as_bytes())) {
-        Result::Ok(_)  => { }
-        Result::Err(_) => { server.drop(); client.drop(); listener.drop(); return bail(Str::new("client write failed")); }
-    }
-    mut sbuf: u8[16];
-    mut sgot: u64 = 0;
-    match (server.read_all(&sbuf[0], 4)) {
-        Result::Ok(n)  => { sgot = n; }
-        Result::Err(_) => { server.drop(); client.drop(); listener.drop(); return bail(Str::new("server read failed")); }
-    }
-    const ping_ok: boolean = slices_eq(Slice::from_raw(&sbuf[0], sgot), Str::new("ping").as_bytes());
-
-    // server -> client
-    match (server.write(Str::new("pong").as_bytes())) {
-        Result::Ok(_)  => { }
-        Result::Err(_) => { server.drop(); client.drop(); listener.drop(); return bail(Str::new("server write failed")); }
-    }
-    mut cbuf: u8[16];
-    mut cgot: u64 = 0;
-    match (client.read_all(&cbuf[0], 4)) {
-        Result::Ok(n)  => { cgot = n; }
-        Result::Err(_) => { server.drop(); client.drop(); listener.drop(); return bail(Str::new("client read failed")); }
-    }
-    const pong_ok: boolean = slices_eq(Slice::from_raw(&cbuf[0], cgot), Str::new("pong").as_bytes());
-
-    server.drop();
-    client.drop();
-    listener.drop();
-
-    match (expect(ping_ok, Str::new("server should receive \"ping\""))) { Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); } }
-    return expect(pong_ok, Str::new("client should receive \"pong\""));
+    mut ex: Executor = Executor::new();
+    const r: i64 = ex.block_on(ntcp_round(SocketAddr::localhost_v4(port), listener));
+    ex.drop();
+    return expect_eq(r, 0 as i64);
 }
 
-// IPv6 loopback round-trip over [::1] (m2). Exercises the full v6 dial
-// path end-to-end: the sockaddr_in6 packer, the AF_INET6 socket, and
-// connect/accept. Guarded: if the host has no IPv6 loopback, bind fails
-// and the test skips (returns Ok) rather than flaking.
+/// IPv6 loopback round-trip over [::1]. Exercises the full v6 dial path end to
+/// end: the sockaddr_in6 packer, the AF_INET6 socket, and connect/accept.
+/// Guarded: if the host has no IPv6 loopback, bind fails and the test skips
+/// (returns Ok) rather than flaking.
 ![test]
 function loopback_round_trip_v6() -> Result<(), TestError> {
-    mut listener: TcpListener = match (TcpListener::bind(SocketAddr::localhost_v6(0))) {
+    mut listener: TcpListener = match (ntcp_bind(SocketAddr::localhost_v6(0))) {
         Result::Ok(l)  => { l }
         Result::Err(_) => { return Result::Ok(()); }   // no v6 loopback -> skip
     };
@@ -109,38 +149,17 @@ function loopback_round_trip_v6() -> Result<(), TestError> {
         Result::Ok(a)  => { a.port }
         Result::Err(_) => { listener.drop(); return bail(Str::new("v6 local_addr failed")); }
     };
-    mut client: TcpStream = match (TcpStream::connect(SocketAddr::localhost_v6(port))) {
-        Result::Ok(s)  => { s }
-        Result::Err(_) => { listener.drop(); return bail(Str::new("v6 connect failed")); }
-    };
-    mut server: TcpStream = match (listener.accept()) {
-        Result::Ok(s)  => { s }
-        Result::Err(_) => { client.drop(); listener.drop(); return bail(Str::new("v6 accept failed")); }
-    };
-
-    match (client.write(Str::new("ping").as_bytes())) {
-        Result::Ok(_)  => { }
-        Result::Err(_) => { server.drop(); client.drop(); listener.drop(); return bail(Str::new("v6 client write failed")); }
-    }
-    mut sbuf: u8[16];
-    mut sgot: u64 = 0;
-    match (server.read_all(&sbuf[0], 4)) {
-        Result::Ok(n)  => { sgot = n; }
-        Result::Err(_) => { server.drop(); client.drop(); listener.drop(); return bail(Str::new("v6 server read failed")); }
-    }
-    const ok: boolean = slices_eq(Slice::from_raw(&sbuf[0], sgot), Str::new("ping").as_bytes());
-
-    server.drop();
-    client.drop();
-    listener.drop();
-    return expect(ok, Str::new("v6 server should receive \"ping\" over [::1]"));
+    mut ex: Executor = Executor::new();
+    const r: i64 = ex.block_on(ntcp_round(SocketAddr::localhost_v6(port), listener));
+    ex.drop();
+    return expect_eq(r, 0 as i64);
 }
 
 ![test]
 function connect_to_unbound_port_fails() -> Result<(), TestError> {
     // Bind an ephemeral port, learn it, then release it; connecting to the
     // now-unbound port should be refused. Hermetic (no fixed-port guess).
-    mut listener: TcpListener = match (TcpListener::bind(SocketAddr::localhost_v4(0))) {
+    mut listener: TcpListener = match (ntcp_bind(SocketAddr::localhost_v4(0))) {
         Result::Ok(l)  => { l }
         Result::Err(_) => { return bail(Str::new("bind 127.0.0.1:0 failed")); }
     };
@@ -149,11 +168,8 @@ function connect_to_unbound_port_fails() -> Result<(), TestError> {
         Result::Err(_) => { listener.drop(); return bail(Str::new("local_addr failed")); }
     };
     listener.drop();   // release the port so the connect is refused
-    const r: Result<TcpStream, IoError> = TcpStream::connect(SocketAddr::localhost_v4(port));
-    const is_err: boolean = r.is_err();
-    match (r) {
-        Result::Ok(s)  => { mut stream: TcpStream = s; stream.drop(); }   // unexpected
-        Result::Err(_) => { }
-    }
-    return expect(is_err, Str::new("connecting to an unbound port should fail"));
+    mut ex: Executor = Executor::new();
+    const r: i64 = ex.block_on(ntcp_refused(SocketAddr::localhost_v4(port)));
+    ex.drop();
+    return expect_eq(r, 1 as i64);
 }

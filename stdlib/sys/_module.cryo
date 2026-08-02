@@ -1,0 +1,176 @@
+///! sys: the low-level OS seam.
+///!
+///! `sys` is the one layer in the stdlib that talks to the operating system
+///! directly. Everything above it (String, collections, `io` buffering, the
+///! `net` upper layers, ...) is pure Cryo; below it sits each platform's
+///! native system interface, selected per target:
+///!
+///!   - Linux: the raw kernel syscall - the `syscall` instruction through
+///!     `syscall::sys_callN` via inline asm, no libc involvement. On Linux
+///!     the kernel syscall interface is the stable ABI; glibc is just a
+///!     wrapper over it (Low-Level Plan Stage 2).
+///!   - Everything else (windows, macos): a thin pass-through to
+///!     `ffi::libc`. On Windows the eventual native surface is
+///!     kernel32/ntdll (the DLLs ARE the stable ABI there); those arms
+///!     migrate in Stage 4+ as their consumers arrive.
+///!
+///! ## The error model this seam presents upward
+///!
+///! Every fallible `sys` function returns a signed integer. A **negative**
+///! result is `-errno`: the negated POSIX error number (e.g. `-EINTR` == -4,
+///! `-EBADF` == -9). A **non-negative** result is the success value (a byte
+///! count, a file descriptor, `0`, ...). This is normalized *at the seam*,
+///! independent of backend:
+///!   - a raw Linux syscall already returns `-errno` in the result register,
+///!     so it is returned as-is;
+///!   - the libc arms read `errno` after a `-1` return and return `-errno`.
+///! Callers that want a rich `Result`/`IoError` (and `EINTR` retry) build it on
+///! top of this raw layer — that policy lives above `sys`, not in it (see
+///! `io::fd`, which Stage 4 rebuilds on this seam).
+///!
+///! ## Surface
+///!
+///! Stage 0 establishes the seam with the file-descriptor + process core
+///! (`read`/`write`/`open`/`close`/`exit`). Memory mapping (`mmap`/`munmap`)
+///! joined in Stage 3 for the native allocator. Sync (`futex`) and time
+///! (`clock_mono`/`sleep`) primitives join the seam as their consumers
+///! migrate in later stages (5).
+///!
+///! Sub-modules:
+///!   - `syscall` : raw syscalls per platform. Linux x86_64: `Syscall::read`
+///!                 numbers + `sys_callN` raw entry points + typed wrappers
+///!                 (`sys_read`, `sys_clone3`, `sys_io_uring_setup`, ...).
+///!                 Windows x86_64: Win32 (kernel32, user32, advapi32) +
+///!                 NT API (ntdll). Each surface is gated with
+///!                 `![target(...)]` so only the host platform's externs
+///!                 are emitted.
+
+namespace std::sys;
+
+import ffi::libc;
+
+public module sys::syscall;
+
+/// Normalize a libc call's `-1`-on-error return into the seam's `-errno`
+/// model. `n` is the raw libc result; on failure (`n < 0`) it is replaced by
+/// the negated current `errno`. Kept private to the seam (non-Linux libc
+/// arms only; a raw kernel return needs no translation).
+![not(linux)]
+function normalize(n: i64) -> i64 {
+    if (n < 0) {
+        return -(libc::errno() as i64);
+    }
+    return n;
+}
+
+/// `read(2)`: read up to `count` bytes from `fd` into `buf`. Returns the byte
+/// count read (`0` == EOF), or `-errno` on failure. A single raw call — no
+/// `EINTR` retry; a caller that wants retry loops on `-EINTR` itself.
+![target(linux)]
+function read(fd: i32, buf: u8*, count: u64) -> i64 {
+    return syscall::sys_call3(syscall::Syscall::read,
+                              fd as i64, buf as i64, count as i64);
+}
+
+![not(linux)]
+function read(fd: i32, buf: u8*, count: u64) -> i64 {
+    return normalize(libc::read(fd, buf, count));
+}
+
+/// `write(2)`: write up to `count` bytes from `buf` to `fd`. Returns the byte
+/// count written (short writes are normal), or `-errno` on failure.
+![target(linux)]
+function write(fd: i32, buf: u8*, count: u64) -> i64 {
+    return syscall::sys_call3(syscall::Syscall::write,
+                              fd as i64, buf as i64, count as i64);
+}
+
+![not(linux)]
+function write(fd: i32, buf: u8*, count: u64) -> i64 {
+    return normalize(libc::write(fd, buf, count));
+}
+
+/// `open(2)`: open `path` (a NUL-terminated C string) with `flags` and, when
+/// creating, `mode`. Returns the new file descriptor (>= 0), or `-errno`.
+/// The `O_*` flag values pass through unchanged: on Linux, glibc's `O_*`
+/// constants are the kernel's own bit values.
+![target(linux)]
+function open(path: u8*, flags: i32, mode: u32) -> i64 {
+    return syscall::sys_call3(syscall::Syscall::open,
+                              path as i64, flags as i64, mode as i64);
+}
+
+/// `O_BINARY` is forced on the libc arms: the seam presents POSIX byte
+/// semantics, and the MSVCRT would otherwise default the fd to text mode
+/// (CRLF translation - byte counts and contents stop matching what was
+/// passed).  On POSIX targets `O_BINARY` is 0, so this is a no-op there.
+![not(linux)]
+function open(path: u8*, flags: i32, mode: u32) -> i64 {
+    return normalize(libc::open(path, flags | libc::O_BINARY, mode) as i64);
+}
+
+/// `close(2)`: release `fd`. Returns `0` on success, or `-errno`.
+![target(linux)]
+function close(fd: i32) -> i64 {
+    return syscall::sys_call1(syscall::Syscall::close, fd as i64);
+}
+
+![not(linux)]
+function close(fd: i32) -> i64 {
+    return normalize(libc::close(fd) as i64);
+}
+
+/// `mmap(2)`: map `length` bytes of memory. Returns the mapped address as a
+/// non-negative `i64`, or `-errno` on failure. Unlike the fd calls, mapping
+/// is a unix-only seam surface (Windows callers use `VirtualAlloc` through
+/// `sys::syscall` directly — per-DLL, not per-libc, so there is nothing to
+/// wean). x86-64 user addresses fit comfortably in the positive `i64`
+/// range, so the sign carries the success/failure distinction losslessly.
+![target(linux)]
+function mmap(addr: u8*, length: u64, prot: i32,
+              flags: i32, fd: i32, offset: i64) -> i64 {
+    return syscall::sys_call6(syscall::Syscall::mmap,
+                              addr as i64, length as i64, prot as i64,
+                              flags as i64, fd as i64, offset);
+}
+
+/// The macos arm translates `MAP_FAILED` (`(void*)-1` + `errno`) into the
+/// seam's `-errno`.
+![target(macos)]
+function mmap(addr: u8*, length: u64, prot: i32,
+              flags: i32, fd: i32, offset: i64) -> i64 {
+    const p: u8* = libc::mmap(addr, length, prot, flags, fd, offset);
+    if ((p as i64) == libc::MAP_FAILED_VALUE) {
+        return -(libc::errno() as i64);
+    }
+    return p as i64;
+}
+
+/// `munmap(2)`: unmap `[addr, addr+length)`. Returns `0` on success, or
+/// `-errno`.
+![target(linux)]
+function munmap(addr: u8*, length: u64) -> i64 {
+    return syscall::sys_call2(syscall::Syscall::munmap,
+                              addr as i64, length as i64);
+}
+
+![target(macos)]
+function munmap(addr: u8*, length: u64) -> i64 {
+    return normalize(libc::munmap(addr, length) as i64);
+}
+
+/// `_exit(2)`-style process termination with status `code`. Does not return.
+/// Unflushed buffered writers lose their contents; flush before calling.
+///
+/// Native termination is `exit_group(2)` - ends every thread in the process,
+/// which is what `exit` means at process level (`Syscall::exit` alone would
+/// end only the calling thread). It runs no libc atexit handlers.
+![target(linux)]
+function exit(code: i32) -> void {
+    syscall::sys_call1(syscall::Syscall::exit_group, code as i64);
+}
+
+![not(linux)]
+function exit(code: i32) -> void {
+    libc::exit(code);
+}

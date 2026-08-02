@@ -73,11 +73,9 @@ type struct Monomorphizer {
     call_specializer:   MonoCallSpecializer;     // sema-stash consumer: free/method per-call specialization
 
     // -- Specialization cache (orchestrator-private; spec_entries live on state) --
-    spec_keys:         string[];
-    spec_index:        HashMap<string, i64>;   // key -> index in state.spec_entries
-
-    // -- Cycle detection --
-    in_progress:       HashMap<string, boolean>;
+    // Keyed by the CANONICAL INSTANTIATION ID for (base, args) - see `make_key`.
+    // (`spec_keys: string[]` used to sit here too; it was write-only and is gone.)
+    spec_index:        HashMap<u64, i64>;      // key -> index in state.spec_entries
 
     // -- Incremental injection tracking (for batch compilation) --
     injection_cursor:  i64;
@@ -110,9 +108,7 @@ type struct Monomorphizer {
             type_populator:        MonoTypePopulator::null(),
             ast_resolver:          MonoAstResolver::null(),
             call_specializer:      MonoCallSpecializer::null(),
-            spec_keys:             [],
-            spec_index:            HashMap<string, i64>::new(),
-            in_progress:           HashMap<string, boolean>::new(),
+            spec_index:            HashMap<u64, i64>::new(),
             injection_cursor:      0,
             current_module:        SymbolStr::empty(),
         };
@@ -227,15 +223,15 @@ type struct Monomorphizer {
             this.state.enqueue_from_type_ref(unprocessed[i]);
         }
 
-        // Worklist-iteration ceiling.  The cycle detection below only
-        // catches a request re-entering the SAME key while in progress; a
-        // *type-growing* template - one whose field/arg type gains a level
-        // of nesting at each instantiation (`Wrap<T> { f: Wrap<Wrap<T>> }`)
-        // - mints a fresh, ever-larger key every level and so never trips
-        // it, looping until the process exhausts memory.  Bound the loop to
-        // a generous multiple of the program's type count (far above any
-        // legitimate instantiation set) and report E0900 on exceed instead
-        // of hanging / OOMing with no diagnostic.
+        // Worklist-iteration ceiling.  A genuine instantiation cycle is
+        // collapsed by the `is_cached` check below (a re-requested key resolves
+        // to its cached concrete type).  What that does NOT bound is a
+        // *type-growing* template - one whose field/arg type gains a level of
+        // nesting at each instantiation (`Wrap<T> { f: Wrap<Wrap<T>> }`) - which
+        // mints a fresh, ever-larger key every level and would loop until the
+        // process exhausts memory.  Bound the loop to a generous multiple of the
+        // program's type count (far above any legitimate instantiation set) and
+        // report E0900 on exceed instead of hanging / OOMing with no diagnostic.
         const max_iterations: i64 = 100000 + this.arena.type_count() * 100;
         mut iterations: i64 = 0;
 
@@ -252,7 +248,7 @@ type struct Monomorphizer {
             const request: MonomorphRequest = this.state.pending[this.state.pending_cursor].clone();
             this.state.pending_cursor += 1;
 
-            const key: string = this.make_key(request);
+            const key: u64 = this.make_key(request);
 
             // Already cached; mark monomorphized + propagate the cached concrete
             // type to this module's fresh InstantiatedType.
@@ -262,18 +258,7 @@ type struct Monomorphizer {
                 continue;
             }
 
-            // Cycle detection
-            if (this.is_in_progress(key)) {
-                this.diagnostics.emit(Diagnostic::error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                    format("monomorphization cycle detected for %s", key)));
-                this.state.error_count += 1;
-                continue;
-            }
-
-            // Mark as in-progress, specialize, then clear.
-            this.in_progress.insert(key, true);
             const success: boolean = this.specialize_request(request, key);
-            this.remove_in_progress(key);
 
             if (!success) {
                 this.state.error_count += 1;
@@ -311,16 +296,13 @@ type struct Monomorphizer {
             while (this.state.pending_cursor < this.state.pending.length) {
                 const req: MonomorphRequest = this.state.pending[this.state.pending_cursor].clone();
                 this.state.pending_cursor += 1;
-                const rkey: string = this.make_key(req);
+                const rkey: u64 = this.make_key(req);
                 if (this.is_cached(rkey)) {
                     this.propagate_cached_resolution(rkey, req);
                     this.generic_registry.mark_monomorphized(req.base_type, req.type_args);
                     continue;
                 }
-                if (this.is_in_progress(rkey)) { continue; }
-                this.in_progress.insert(rkey, true);
                 const rsuccess: boolean = this.specialize_request(req, rkey);
-                this.remove_in_progress(rkey);
                 if (!rsuccess) { this.state.error_count += 1; }
             }
         }
@@ -360,21 +342,13 @@ type struct Monomorphizer {
             }
             const request: MonomorphRequest = this.state.pending[this.state.pending_cursor].clone();
             this.state.pending_cursor += 1;
-            const key: string = this.make_key(request);
+            const key: u64 = this.make_key(request);
             if (this.is_cached(key)) {
                 this.propagate_cached_resolution(key, request);
                 this.generic_registry.mark_monomorphized(request.base_type, request.type_args);
                 continue;
             }
-            if (this.is_in_progress(key)) {
-                this.diagnostics.emit(Diagnostic::error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                    format("monomorphization cycle detected for %s", key)));
-                errors += 1;
-                continue;
-            }
-            this.in_progress.insert(key, true);
             const ok: boolean = this.specialize_request(request, key);
-            this.remove_in_progress(key);
             if (!ok) { errors += 1; }
         }
         if (errors > 0) {
@@ -386,8 +360,8 @@ type struct Monomorphizer {
 
     // Single request specialization
 
-    specialize_request(mut &this, request: &MonomorphRequest, key: string) -> boolean {
-        cdebug("[Monomorphizer::specialize_request] key='%s' base_type.id=%llu\n", key, request.base_type.id);
+    specialize_request(mut &this, request: &MonomorphRequest, key: u64) -> boolean {
+        cdebug("[Monomorphizer::specialize_request] key=%llu base_type.id=%llu\n", key, request.base_type.id);
         const _base_dbg: Type* = this.arena.lookup(request.base_type.id);
         if (_base_dbg != null) {
             cdebug("  base type: kind=%s display='%s'\n", _base_dbg.kind.to_string(), _base_dbg.display_name());
@@ -408,7 +382,7 @@ type struct Monomorphizer {
     // `request` is BORROWED, not taken by value: it carries an owning
     // `type_args: TypeRef[]`; a by-value parameter would bitwise-copy the struct
     // (aliasing the caller's buffer) and the copy's drop would double-free.
-    specialize_with_entry(mut &this, request: &MonomorphRequest, key: string,
+    specialize_with_entry(mut &this, request: &MonomorphRequest, key: u64,
                           entry: TemplateEntry*) -> boolean {
         // Validate arg count
         if (request.type_args.length != entry.param_count) {
@@ -471,27 +445,104 @@ type struct Monomorphizer {
         const kept_impl_asts: ASTNode*[] = this.trait_spec.filter_bounds_violating_impls(
             result.impl_asts, &subst);
 
-        const concrete_type: TypeRef = this.create_concrete_type(entry, qualified_spec_sym, &subst);
-
-        // Register the bare spec name as an alias so resolve_body_locals() can find
-        // the type (the substituter rewrites annotations to bare names).
-        if (concrete_type.is_valid() && !spec_name_sym.equals(qualified_spec_sym)) {
-            this.arena.add_name_alias(spec_name_sym, concrete_type);
+        // Determine the concrete aggregate kind for this template.  Function
+        // templates (`is_named == false`) produce no arena type.
+        mut target_kind: TypeKind = TypeKind::Struct;
+        mut is_named: boolean = true;
+        mut is_union_kind: boolean = false;
+        match (entry.node_kind) {
+            NodeKind::StructDeclaration   => { target_kind = TypeKind::Struct; }
+            NodeKind::UnionDeclaration    => { target_kind = TypeKind::Struct; is_union_kind = true; }
+            NodeKind::EnumDeclaration     => { target_kind = TypeKind::Enum; }
+            NodeKind::ClassDeclaration    => { target_kind = TypeKind::Class; }
+            NodeKind::FunctionDeclaration => { is_named = false; }
+            _                             => { target_kind = TypeKind::Struct; }
         }
 
-        // Set human-readable display name (e.g., "Pair<i32, string>") on the type.
-        if (concrete_type.is_valid()) {
+        // Human-readable display name ("Pair<i32, string>"), computed from the
+        // still-unresolved InstantiatedType wrapper (valid whether or not we take
+        // the swap path below).
+        mut display_name: string = "";
+        if (request.generic_type.is_valid()) {
             const inst_for_name: Type* = this.arena.lookup(request.generic_type.id);
-            if (inst_for_name != null) {
-                const display: string = this.arena.format_display(inst_for_name);
-                const concrete_t: Type* = this.arena.lookup(concrete_type.id);
-                if (concrete_t != null) {
-                    if (concrete_t.kind == TypeKind::Struct) {
-                        (concrete_t as StructType*).set_display_name(display);
-                    } else if (concrete_t.kind == TypeKind::Enum) {
-                        (concrete_t as EnumType*).set_display_name(display);
-                    } else if (concrete_t.kind == TypeKind::Class) {
-                        (concrete_t as ClassType*).set_display_name(display);
+            if (inst_for_name != null) { display_name = this.arena.format_display(inst_for_name); }
+        }
+
+        // SWAP-RELOCATE identity path: a named generic whose request carries a
+        // valid, still-unresolved InstantiatedType wrapper reuses THAT wrapper's
+        // arena id for the concrete, so `wrapper.id == concrete.id` (one id per
+        // semantic type).  Reserve the spec names against the wrapper NOW - a spec
+        // body can reference itself by its bare/qualified spec name, and that must
+        // resolve to the concrete's eventual id during resolve_specialized_ast.
+        // The slot is flipped from wrapper to concrete at populate time (below).
+        // For a named generic this is the ONLY construction route for a concrete;
+        // the missing-wrapper case is an internal error (see the else branch).
+        // Function templates are not `is_named` and never reach here - they get a
+        // FunctionType bridged via `resolved_type` at the end of this function,
+        // which stays a two-id representation (see the bridge below for why).
+        mut concrete_type: TypeRef = TypeRef::invalid();
+        mut swap_path: boolean = false;
+        if (is_named) {
+            const w_t: Type* = this.arena.lookup(request.generic_type.id);
+            if (request.generic_type.is_valid() && w_t != null
+                    && w_t.kind == TypeKind::InstantiatedType) {
+                concrete_type = request.generic_type;
+                swap_path = true;
+                this.arena.reserve_spec_names(concrete_type, qualified_spec_sym, spec_name_sym, target_kind);
+            } else {
+                // INVARIANT (one id per semantic type): a named generic reaches
+                // here only via the swap path above, so `wrapper.id == concrete.id`.
+                // This branch is the older two-id fallback and is believed
+                // unreachable - a probe over the compiler's own 232 modules, the
+                // stdlib, and the full test suite recorded ZERO fires.  It is kept
+                // (rather than deleted) so that a reachable case fails LOUDLY here
+                // instead of silently minting a second id for one semantic type:
+                // the wrapper's `resolved_type` is only set at the end of this
+                // function, so any nested-call walk in between would see the two ids
+                // disagree, leave its call unpinned, and let codegen's name+arity
+                // fallback bind an arbitrary sibling spec.
+                //
+                // If you are reading this because it fired: the fix is to give the
+                // request a valid unresolved InstantiatedType wrapper upstream, not
+                // to relax this check.
+                // Name the generic, don't just print its id: this ICE's stated fix
+                // is "give the request a valid unresolved InstantiatedType wrapper
+                // UPSTREAM", which is only actionable if you know WHICH generic to
+                // go and look at.  Rendered as `Template<Arg, Arg>` to match the
+                // sibling "specialization failed for %s<%s>" diagnostic above.
+                //
+                // Two things are deliberately NOT used here.  `qualified_spec_sym`
+                // is the MANGLED spec symbol (`6Option$LN$L3std...$G$G`) - precise
+                // but unreadable.  `arena.resolve_display_name(request.generic_type)`
+                // is useless BY CONSTRUCTION: this branch is reached exactly when
+                // that ref is not a valid InstantiatedType, so it renders "?".
+                // `entry.qualified_name` + the already-built `type_arg_displays`
+                // are always populated.  Bound to a const first, matching this
+                // file's other `intern_table.resolve` sites - formatter results
+                // live in a shared static buffer, so sibling display calls inside
+                // one `format()` can clobber each other.
+                const tmpl_name: string = this.intern_table.resolve(entry.qualified_name);
+                mut ice_args: string = "";
+                for (mut ii: i64 = 0; ii < type_arg_displays.length; ii++) {
+                    if (ii > 0) { ice_args = format("%s, %s", ice_args, type_arg_displays[ii]); }
+                    else        { ice_args = type_arg_displays[ii]; }
+                }
+                this.diagnostics.emit(Diagnostic::error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                    format("named generic `%s<%s>` (instantiation id %llu) reached monomorphization without an unresolved InstantiatedType wrapper, so its concrete type cannot reuse the wrapper's arena id (one id per semantic type)",
+                        tmpl_name, ice_args, key)));
+                this.state.error_count += 1;
+                concrete_type = this.create_concrete_type(entry, qualified_spec_sym, &subst);
+                // Register the bare spec name as an alias so resolve_body_locals()
+                // can find the type (the substituter rewrites to bare names).
+                if (concrete_type.is_valid() && !spec_name_sym.equals(qualified_spec_sym)) {
+                    this.arena.add_name_alias(spec_name_sym, concrete_type);
+                }
+                if (concrete_type.is_valid() && display_name.length() > 0) {
+                    const ct: Type* = this.arena.lookup(concrete_type.id);
+                    if (ct != null) {
+                        if (ct.kind == TypeKind::Struct)     { (ct as StructType*).set_display_name(display_name); }
+                        else if (ct.kind == TypeKind::Enum)  { (ct as EnumType*).set_display_name(display_name); }
+                        else if (ct.kind == TypeKind::Class) { (ct as ClassType*).set_display_name(display_name); }
                     }
                 }
             }
@@ -538,10 +589,11 @@ type struct Monomorphizer {
         // call on a receiver that resolves to the SAME spec being materialized - e.g.
         // `String<GlobalAlloc>`'s `FmtWrite::write_str` calls `this.try_push(source)`
         // on a `this: String` (bare, all-defaulted) receiver that
-        // `canonicalize_default_template_recv` must map to `String<GlobalAlloc>` via
-        // a `spec_entries` scan.  Registering after the walk would leave the scan
-        // empty, so the receiver would stay bare, the `try_push` lookup would fail,
-        // and the call would be left entirely unpinned.  `kept_impl_asts` is MOVED into the
+        // `canonicalize_default_template_recv` must map to `String<GlobalAlloc>` by
+        // asking whether that instantiation has a registered spec.  Registering after
+        // the walk would make that answer "no", so the receiver would stay bare, the
+        // `try_push` lookup would fail, and the call would be left entirely
+        // unpinned.  `kept_impl_asts` is MOVED into the
         // entry, so capture the impl-node pointers into a walk list first (they alias
         // the same nodes the entry now owns).
         mut walk_impls: ASTNode*[] = [];
@@ -561,9 +613,9 @@ type struct Monomorphizer {
             owner_source:      SymbolStr::empty(),
         };
         const idx: i64 = this.state.spec_entries.length;
-        this.spec_keys.push(key);
         this.state.spec_entries.push(spec_entry);
         this.spec_index.insert(key, idx);
+        this.state.mark_materialized_spec(request.generic_type);
 
         // Specialize the generic CALLS inside the freshly-resolved spec'd bodies
         // (e.g. `mem::offset<T>` inside `NonNull<i32>`'s methods, or a nested
@@ -581,27 +633,70 @@ type struct Monomorphizer {
             this.call_specializer.specialize_calls_in_spec_decl(walk_impls[ri], &subst);
         }
 
-        // Populate the concrete type and set resolved_type on the InstantiatedType.
+        // Populate the concrete type.  On the swap path, flip the wrapper slot to
+        // the concrete IN PLACE first (one id per semantic type); the wrapper node
+        // identity is copied onto the concrete so `inst_generic_base` recovers base +
+        // type_args.  On the fallback path, bridge the wrapper to the freshly
+        // allocated concrete via `resolved_type` (the pre-A2a mechanism).
         if (concrete_type.is_valid()) {
+            if (swap_path) {
+                this.arena.swap_wrapper_to_concrete(concrete_type, qualified_spec_sym,
+                    entry.module_name, target_kind, is_union_kind, display_name);
+            }
             this.type_populator.populate_concrete_type(concrete_type, result.specialized_ast, entry.node_kind, &subst, entry);
 
-            const inst_t: Type* = this.arena.lookup(request.generic_type.id);
-            if (inst_t != null) {
-                (inst_t as InstantiatedType*).set_resolved_type(concrete_type);
+            if (!swap_path) {
+                const inst_t: Type* = this.arena.lookup(request.generic_type.id);
+                if (inst_t != null && inst_t.kind == TypeKind::InstantiatedType) {
+                    (inst_t as InstantiatedType*).set_resolved_type(concrete_type);
+                    // Record the concrete's intrinsic generic-instantiation identity:
+                    // the instantiation it was built from (the `inst_*` views read this).
+                    this.arena.set_type_generic_origin(concrete_type, request.generic_type);
+                }
             }
-            this.arena.propagate_instantiated_resolution(
-                request.base_type, request.type_args, concrete_type);
         } else if (entry.node_kind == NodeKind::FunctionDeclaration) {
             // Function templates don't create named arena types, but still get a
             // concrete FunctionType so the InstantiatedType has a valid resolved_type.
+            // (No generic origin: a FunctionType is not an aggregate and carries
+            // no intrinsic instantiation identity.)
+            //
+            // Function specs are out of scope for single-id identity BY
+            // CONSTRUCTION.  The aggregate swap (`swap_wrapper_to_concrete`)
+            // installs the concrete at the wrapper's id so
+            // `wrapper.id == concrete.id`.  That is impossible here, and the
+            // reason is not a missing branch:
+            //
+            //   `get_function` interns a FunctionType on its SIGNATURE ALONE -
+            //   `(kind, is_variadic, [ret, params...])`.  Nothing about WHICH
+            //   function it came from is in the key.  So `identity<i32>` and
+            //   `negate<i32>` - two distinct templates, two distinct wrappers, two
+            //   distinct spec_entries - share ONE FunctionType id for `(i32)->i32`.
+            //   One id cannot be assigned to two wrappers, so id-unification is
+            //   arithmetically unavailable here.  Doing the swap for whichever spec
+            //   arrives first and not the other would be strictly worse than this
+            //   bridge.
+            //
+            // The two ids are also not two names for one thing: the WRAPPER is the
+            // INSTANTIATION identity (FunctionTemplate base + type args, uniquely
+            // keyed), the FunctionType is the SIGNATURE identity (structurally
+            // keyed, deliberately SHARED across functions).  The one-id-per-type
+            // invariant applies to TYPES - a function specialization is a code
+            // artifact, not a type; its type is its signature, and that already has
+            // canonical single-id identity through the interner.  `reserve_spec_names`
+            // reinforces this: it writes only the struct/class/enum caches, so a
+            // function spec has nothing to reserve.  Function specs are bound
+            // downstream by MANGLED NAME, not by arena id, and
+            // `SpecializationEntry.specialized_type` is deliberately invalid for
+            // them - every consumer guards on `is_valid()`.
             const func_type: TypeRef = this.type_populator.build_function_type_from_ast(result.specialized_ast);
             if (func_type.is_valid()) {
                 const inst_t: Type* = this.arena.lookup(request.generic_type.id);
                 if (inst_t != null) {
-                    (inst_t as InstantiatedType*).set_resolved_type(func_type);
+                    // `set_signature`, NOT `set_resolved_type`: this records the
+                    // spec's SIGNATURE, it does not claim the wrapper collapsed
+                    // into it.  Same storage, different assertion.
+                    (inst_t as InstantiatedType*).set_signature(func_type);
                 }
-                this.arena.propagate_instantiated_resolution(
-                    request.base_type, request.type_args, func_type);
             }
         }
 
@@ -622,13 +717,14 @@ type struct Monomorphizer {
             this.state.nested_visited = [];
             this.state.request_nested_instantiations(concrete_type);
         } else if (entry.node_kind == NodeKind::FunctionDeclaration) {
-            const inst_t: Type* = this.arena.lookup(request.generic_type.id);
-            if (inst_t != null) {
-                const inst: InstantiatedType* = inst_t as InstantiatedType*;
-                if (inst.resolved_type.is_valid()) {
-                    this.state.nested_visited = [];
-                    this.state.request_nested_instantiations(inst.resolved_type);
-                }
+            // Walk the SIGNATURE's param/return types for nested instantiations.
+            // The checked accessor is deliberate: this path is only meaningful
+            // for a FunctionType, and reading `resolved_type` raw would happily
+            // hand back a collapsed aggregate concrete if the kinds ever drifted.
+            const sig: TypeRef = this.arena.instantiation_signature(request.generic_type);
+            if (sig.is_valid()) {
+                this.state.nested_visited = [];
+                this.state.request_nested_instantiations(sig);
             }
         }
         return true;
@@ -692,7 +788,6 @@ type struct Monomorphizer {
     /// and injection cursor.  Called between modules in StdlibBatch mode.
     reset_for_next_module(mut &this) -> void {
         this.state.reset_worklist();
-        this.in_progress = HashMap<string, boolean>::new();
     }
 
     /// Number of specializations completed.
@@ -731,36 +826,36 @@ type struct Monomorphizer {
 
     // Cache helpers (orchestrator-private)
 
-    /// Build a cache key from a request.  Mirrors GenericRegistry's
-    /// `make_cache_key` format (`base<arg,arg>`) but canonicalizes each arg id
-    /// through `canon_type_id` so equivalent instantiations dedup to one spec.
+    /// Build a cache key from a request: the CANONICAL INSTANTIATION ID for
+    /// (base, args).
     ///
-    /// The canonicalization is load-bearing for nested-generic RESOLUTION, not
-    /// just dedup: a request that arrives with an unresolved `InstantiatedType`
-    /// wrapper arg `W` must hit the cache entry built for its resolved concrete
-    /// `C` (`canon_type_id(W) == C.id`) so `propagate_cached_resolution` links
-    /// `W`'s InstantiatedType to `C`.  Keying structurally (e.g. off the
-    /// mangled symbol, which encodes `W` and `C` differently) splits them and
-    /// leaves nested wrappers like `ChainIter<MapIter<Range>>` unresolved
-    /// (E0900).  Aligning the pinned symbol to this canonical key (not the
-    /// reverse) is the only sound fix, and it is a wholesale mangling change
-    /// requiring its own repin.
-    make_key(&this, request: &MonomorphRequest) -> string {
+    /// The arena's structural interner already decides whether two instantiations
+    /// are the same type, and answers with a single id - so ask it, rather than
+    /// keeping a parallel `base<a,b>` string key that has to agree.  The id form
+    /// also avoids a `format()` and an allocation on every probe of this cache,
+    /// which sits in the worklist loop.
+    ///
+    /// Uses `create_instantiation`, NOT the pure `find_instantiation` lookup, for
+    /// the same reason `GenericRegistry::mark_monomorphized` does: a lookup that
+    /// can MISS would mint a different key for a request whose instantiation has
+    /// not been interned yet, and two requests for one type would then not share
+    /// a cache entry.  Interning makes the call idempotent - after the first, it
+    /// is a hash probe that returns the existing id.
+    ///
+    /// Stable across the wrapper->concrete swap: the intern table stores an
+    /// immutable COPY of each key and never re-derives it from the (mutated)
+    /// node, so `(base, args)` still resolves to the same id after
+    /// `swap_wrapper_to_concrete` installs the concrete in that slot.
+    make_key(&this, request: &MonomorphRequest) -> u64 {
         return this.make_key_for(request.base_type, request.type_args);
     }
 
-    make_key_for(&this, base: TypeRef, type_args: &TypeRef[]) -> string {
-        mut key: string = format("%llu<", base.id);
-        for (mut i: i64 = 0; i < type_args.length; i++) {
-            if (i > 0) { key += ","; }
-            key += format("%llu", this.arena.canon_type_id(type_args[i]));
-        }
-        key += ">";
-        return key;
+    make_key_for(&this, base: TypeRef, type_args: &TypeRef[]) -> u64 {
+        return this.arena.create_instantiation(base, type_args).id;
     }
 
     /// Check if a key is already in the specialization cache.
-    is_cached(&this, key: string) -> boolean {
+    is_cached(&this, key: u64) -> boolean {
         return this.spec_index.get(&key).is_some();
     }
 
@@ -768,7 +863,7 @@ type struct Monomorphizer {
     /// concrete type.  Sema creates a fresh InstantiatedType per call site, so a
     /// later module revisiting an already-specialized pair stays unresolved unless
     /// we explicitly propagate.
-    propagate_cached_resolution(mut &this, key: string, request: &MonomorphRequest) -> void {
+    propagate_cached_resolution(mut &this, key: u64, request: &MonomorphRequest) -> void {
         const idx_opt: Option<i64> = this.spec_index.get(&key);
         if (!idx_opt.is_some()) { return; }
         const idx: i64 = idx_opt.unwrap();
@@ -777,27 +872,16 @@ type struct Monomorphizer {
         if (!entry.specialized_type.is_valid()) { return; }
         // Resolve the request's OWN instantiation directly, mirroring the
         // first-time specialize path (which sets `resolved_type` on
-        // `request.generic_type`).  `propagate_instantiated_resolution` below only
-        // matches instantiations whose (base, type_args) equal the request's, so
-        // it misses a LOWER-arity form - e.g. the 1-arg receiver `HashSet<String>`
-        // of a wrapper-type method, whose request carries the default-expanded
-        // 2-arg `type_args` but references the original 1-arg `generic_type`.
-        // Without this, that receiver stays unresolved after mono (E0900).
+        // `request.generic_type`).  This matters for a LOWER-arity form - e.g.
+        // the 1-arg receiver `HashSet<String>` of a wrapper-type method, whose
+        // request carries the default-expanded 2-arg `type_args` but references
+        // the original 1-arg `generic_type`.  Without this, that receiver stays
+        // unresolved after mono (E0900).
         const inst_t: Type* = this.arena.lookup(request.generic_type.id);
         if (inst_t != null && inst_t.kind == TypeKind::InstantiatedType) {
             (inst_t as InstantiatedType*).set_resolved_type(entry.specialized_type);
+            this.arena.set_type_generic_origin(entry.specialized_type, request.generic_type);
         }
-        this.arena.propagate_instantiated_resolution(
-            request.base_type, request.type_args, entry.specialized_type);
     }
 
-    /// Check if a key is currently being processed (cycle detection).
-    is_in_progress(&this, key: string) -> boolean {
-        return this.in_progress.get(&key).is_some();
-    }
-
-    /// Remove a key from the in-progress set.
-    remove_in_progress(mut &this, key: string) -> void {
-        this.in_progress.remove(&key);
-    }
 }

@@ -1,16 +1,24 @@
-///! WebSocket connection: handshake + message send/recv over any stream.
+///! WebSocket connection: handshake + message send/recv over a buffered
+///! async connection.
 ///!
-///! `WebSocket<S>` borrows any `Read + Write` transport (by pointer, the
-///! same way `io::BufReader`/`BufWriter` do), so the same code speaks
-///! ws:// over `TcpStream` and wss:// over `TlsStream`. The caller owns
-///! the transport and drops it; the `WebSocket` is a protocol view over
-///! it. Messages are reassembled from frames (continuations joined,
-///! control frames handled inline - Ping is auto-answered with Pong).
-///! The opening handshake is plain HTTP/1.1 read one byte at a time so no
-///! payload bytes are ever consumed past the blank line.
+///! `WebSocket<S>` OWNS its `BufStream<S>`. Ownership is forced rather than
+///! stylistic: the type carries per-connection protocol state (`is_client`
+///! selects the RFC 6455 section 5.1 mask direction, `closed` records that a
+///! Close frame went out), and an `async` method may only re-address its OWN
+///! receiver between polls — a borrowed transport would be a second address
+///! the state machine has no way to refresh. Stateless framing stays where it
+///! has no state to keep: an inherent impl on `BufStream<S>` in `ws::frame`.
 ///!
-///! A received `Message::Text` / `Binary` owns its payload - drop it (or
-///! match it out) when done.
+///! Owning the connection is also what removes the byte-at-a-time handshake
+///! read the borrowed version needed. The buffer outlives the handshake, so
+///! frame bytes that arrived in the same fill as the terminating blank line
+///! survive into the first `recv` instead of being consumed and lost, and the
+///! head can be read a line at a time.
+///!
+///! Messages are reassembled from frames (continuations joined, control frames
+///! handled inline — Ping is auto-answered with Pong). A received
+///! `Message::Text` / `Binary` owns its payload — drop it (or match it out)
+///! when done.
 
 namespace std::net::ws::conn;
 
@@ -19,14 +27,22 @@ import core::result;
 import core::slice;
 import io::error;
 import io::traits;
+import io::buf;
 import collections::array;
 import collections::string;
 import collections::str;
-import net::tcp;
+import net::socket::tcp;
 import net::ws::frame;
 import net::ws::handshake;
+import future::poll;
+import future::waker;
+import future::traits;
 
-const MAX_HEAD: u64 = 16384;
+/// Cap on one line of the opening handshake's head, and on how many such
+/// lines are read. A peer that never sends the terminating blank line cannot
+/// drive the buffer to exhaust memory.
+const MAX_HEAD_LINE: u64 = 8192;
+const MAX_HEAD_LINES: u64 = 100;
 
 /// Cap on a single reassembled message. Fragmentation lets a peer stream an
 /// unbounded number of continuation frames into one message; without a ceiling
@@ -46,233 +62,255 @@ type enum Message {
 }
 
 type struct WebSocket<S> {
-    inner:     S*;
+    conn:      BufStream<S>;
     is_client: boolean;
     closed:    boolean;
 
-    /// View an already-upgraded stream as a WebSocket. `is_client`
-    /// selects masked (client) vs unmasked (server) framing per RFC 6455.
-    /// Borrows `stream`; the caller keeps ownership and drops it.
-    static from_upgraded(stream: S*, is_client: boolean) -> WebSocket<S> {
-        return WebSocket<S> { inner: stream, is_client: is_client, closed: false };
+    /// Take ownership of an already-upgraded connection. `is_client` selects
+    /// masked (client) vs unmasked (server) framing per RFC 6455. Use
+    /// `client_handshake` / `server_handshake` to run the upgrade first.
+    static of(conn: BufStream<S>, is_client: boolean) -> WebSocket<S> {
+        return WebSocket<S> { conn: conn, is_client: is_client, closed: false };
+    }
+
+    /// The buffered connection, for callers that need the transport itself
+    /// (socket options, the negotiated ALPN protocol). Not for reading or
+    /// writing — that would desynchronize the framing.
+    connection(mut &this) -> BufStream<S>* {
+        return &this.conn;
+    }
+
+    /// Has a Close frame been sent or received on this connection?
+    is_closed(&this) -> boolean {
+        return this.closed;
+    }
+
+    /// Client handshake: send the GET upgrade, then verify the `101` and the
+    /// `Sec-WebSocket-Accept` echo. Bytes that arrived after the blank line
+    /// stay buffered for `recv`.
+    async client_handshake(mut &this, host: Str, path: Str) -> Result<(), IoError>
+    where S: AsyncTransport {
+        mut key: String = handshake::generate_key();
+        mut expected: String = handshake::compute_accept(key.as_str());
+
+        mut req: String = String::with_capacity(160);
+        req.push(Str::new("GET ")); req.push(path); req.push(Str::new(" HTTP/1.1\r\n"));
+        req.push(Str::new("Host: ")); req.push(host); req.push(Str::new("\r\n"));
+        req.push(Str::new("Upgrade: websocket\r\n"));
+        req.push(Str::new("Connection: Upgrade\r\n"));
+        req.push(Str::new("Sec-WebSocket-Key: ")); req.push(key.as_str()); req.push(Str::new("\r\n"));
+        req.push(Str::new("Sec-WebSocket-Version: 13\r\n\r\n"));
+        push_all(this.conn.pending(), req.as_str().as_bytes())?;
+        (await this.conn.flush())?;
+
+        mut status: String = (await this.conn.read_line(MAX_HEAD_LINE))?;
+        const code: u64 = status_code(status.as_str());
+
+        mut accept_ok: boolean = false;
+        mut lines: u64 = 0;
+        loop {
+            mut header: String = (await this.conn.read_line(MAX_HEAD_LINE))?;
+            if (header.is_empty()) { break; }
+            match (header_line_value(header.as_str(), Str::new("sec-websocket-accept"))) {
+                Option::Some(got) => {
+                    if (str_eq(got, expected.as_str())) { accept_ok = true; }
+                }
+                Option::None => { }
+            }
+            lines = lines + 1;
+            if (lines > MAX_HEAD_LINES) {
+                return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
+            }
+        }
+
+        if (code != 101)  { return Result::Err(IoError::new(IoErrorKind::InvalidData, 0)); }
+        if (!accept_ok)   { return Result::Err(IoError::new(IoErrorKind::InvalidData, 0)); }
+        return Result::Ok(());
+    }
+
+    /// Server handshake: read the client GET, reply `101` with the computed
+    /// accept value. Bytes that arrived after the blank line — a client that
+    /// pipelined its first frame into the same write — stay buffered.
+    async server_handshake(mut &this) -> Result<(), IoError>
+    where S: AsyncTransport {
+        // The request line is read for its framing only: the resource this
+        // handshake upgrades is the caller's concern, not the protocol's.
+        mut request_line: String = (await this.conn.read_line(MAX_HEAD_LINE))?;
+
+        mut key: String = String::new();
+        mut lines: u64 = 0;
+        loop {
+            mut header: String = (await this.conn.read_line(MAX_HEAD_LINE))?;
+            if (header.is_empty()) { break; }
+            match (header_line_value(header.as_str(), Str::new("sec-websocket-key"))) {
+                // First one wins; a duplicate key header is malformed, and
+                // appending it would build a nonce neither value produces.
+                Option::Some(got) => { if (key.is_empty()) { key.push(got); } }
+                Option::None      => { }
+            }
+            lines = lines + 1;
+            if (lines > MAX_HEAD_LINES) {
+                return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
+            }
+        }
+        if (key.is_empty()) {
+            return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
+        }
+
+        mut accept_val: String = handshake::compute_accept(key.as_str());
+        mut resp: String = String::with_capacity(130);
+        resp.push(Str::new("HTTP/1.1 101 Switching Protocols\r\n"));
+        resp.push(Str::new("Upgrade: websocket\r\n"));
+        resp.push(Str::new("Connection: Upgrade\r\n"));
+        resp.push(Str::new("Sec-WebSocket-Accept: ")); resp.push(accept_val.as_str());
+        resp.push(Str::new("\r\n\r\n"));
+        push_all(this.conn.pending(), resp.as_str().as_bytes())?;
+        return await this.conn.flush();
     }
 
     /// Send a text message in a single frame.
-    send_text(mut &this, text: Str) -> Result<(), IoError>
-    where S: Read + Write {
-        return frame::encode_frame(this.inner, true, OpCode::Text,
-                                   text.as_bytes(), this.is_client);
+    async send_text(mut &this, text: Str) -> Result<(), IoError>
+    where S: AsyncTransport {
+        this.conn.queue_frame(true, OpCode::Text, text.as_bytes(), this.is_client)?;
+        return await this.conn.flush();
     }
 
     /// Send a binary message in a single frame.
-    send_binary(mut &this, data: Slice<u8>) -> Result<(), IoError>
-    where S: Read + Write {
-        return frame::encode_frame(this.inner, true, OpCode::Binary,
-                                   data, this.is_client);
+    async send_binary(mut &this, data: Slice<u8>) -> Result<(), IoError>
+    where S: AsyncTransport {
+        this.conn.queue_frame(true, OpCode::Binary, data, this.is_client)?;
+        return await this.conn.flush();
     }
 
     /// Send a Ping with optional application data.
-    ping(mut &this, data: Slice<u8>) -> Result<(), IoError>
-    where S: Read + Write {
-        return frame::encode_frame(this.inner, true, OpCode::Ping,
-                                   data, this.is_client);
+    async ping(mut &this, data: Slice<u8>) -> Result<(), IoError>
+    where S: AsyncTransport {
+        this.conn.queue_frame(true, OpCode::Ping, data, this.is_client)?;
+        return await this.conn.flush();
     }
 
-    /// Receive the next application message, reassembling fragments and
-    /// transparently answering Pings with Pongs and skipping Pongs. A
-    /// Close frame surfaces as `Message::Close`.
-    recv(mut &this) -> Result<Message, IoError>
-    where S: Read + Write {
-        mut acc: Array<u8> = Array<u8>::new();
-        mut binary: boolean = false;
-        mut control_count: u64 = 0;
-        loop {
-            mut fr: Frame = match (frame::read_frame(this.inner)) {
-                Result::Ok(f)  => { f }
-                Result::Err(e) => { acc.drop(); return Result::Err(e); }
-            };
-            // RFC 6455 section 5.1 mask direction: a server (is_client == false)
-            // requires masked client frames; a client requires unmasked
-            // server frames. A violation (masked == is_client) is a
-            // protocol error - the proxy cache-poisoning vector.
-            if (fr.masked == this.is_client) {
-                fr.drop();
-                acc.drop();
-                return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
-            }
-            match (fr.opcode) {
-                OpCode::Ping => {
-                    // Best-effort Pong echoing the ping payload.
-                    match (frame::encode_frame(this.inner, true, OpCode::Pong,
-                            fr.payload.as_slice(),
-                            this.is_client)) {
-                        Result::Ok(_)  => { }
-                        Result::Err(_) => { }
-                    }
-                    fr.drop();
-                    control_count = control_count + 1;
-                    if (control_count > MAX_CONTROL_PER_RECV) {
-                        acc.drop();
-                        return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
-                    }
-                }
-                OpCode::Pong => {
-                    fr.drop();
-                    control_count = control_count + 1;
-                    if (control_count > MAX_CONTROL_PER_RECV) {
-                        acc.drop();
-                        return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
-                    }
-                }
-                OpCode::Close => {
-                    fr.drop();
-                    acc.drop();
-                    this.closed = true;
-                    return Result::Ok(Message::Close);
-                }
-                OpCode::Text => {
-                    binary = false;
-                    acc.append(fr.payload.as_slice());
-                    const fin: boolean = fr.fin;
-                    fr.drop();
-                    if (acc.length() > MAX_MESSAGE) {
-                        acc.drop();
-                        return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
-                    }
-                    if (fin) { return Result::Ok(build_message(acc, binary)); }
-                }
-                OpCode::Binary => {
-                    binary = true;
-                    acc.append(fr.payload.as_slice());
-                    const fin: boolean = fr.fin;
-                    fr.drop();
-                    if (acc.length() > MAX_MESSAGE) {
-                        acc.drop();
-                        return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
-                    }
-                    if (fin) { return Result::Ok(build_message(acc, binary)); }
-                }
-                OpCode::Continuation => {
-                    acc.append(fr.payload.as_slice());
-                    const fin: boolean = fr.fin;
-                    fr.drop();
-                    if (acc.length() > MAX_MESSAGE) {
-                        acc.drop();
-                        return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
-                    }
-                    if (fin) { return Result::Ok(build_message(acc, binary)); }
-                }
-            }
-        }
-    }
-
-    /// Send a Close frame with a status code and reason. The transport
-    /// itself is closed by the owner dropping it.
-    close(mut &this, code: u16, reason: Str) -> Result<(), IoError>
-    where S: Read + Write {
+    /// Send a Close frame with a status code and reason. The transport itself
+    /// is closed when the `WebSocket` is dropped.
+    async close(mut &this, code: u16, reason: Str) -> Result<(), IoError>
+    where S: AsyncTransport {
         mut payload: Array<u8> = Array<u8>::with_capacity(2 + reason.length());
         payload.push((code >> 8) as u8);
         payload.push((code)      as u8);
         payload.append(reason.as_bytes());
-        const result: Result<(), IoError> = frame::encode_frame(this.inner, true,
-            OpCode::Close, payload.as_slice(),
-            this.is_client);
+        const queued: Result<(), IoError> = this.conn.queue_frame(
+            true, OpCode::Close, payload.as_slice(), this.is_client);
         payload.drop();
         this.closed = true;
-        return result;
+        queued?;
+        return await this.conn.flush();
     }
-}
 
-/// Run the client handshake over `stream`, then view it as a client-mode
-/// `WebSocket`. `stream` must already be connected (TCP for ws://, TLS
-/// for wss://); the caller owns it.
-function connect(stream: TcpStream*, host: Str, path: Str) -> Result<WebSocket<TcpStream>, IoError> {
-    client_handshake(stream, host, path)?;
-    return Result::Ok(WebSocket<TcpStream>::from_upgraded(stream, true));
-}
+    /// Receive the next application message, reassembling fragments and
+    /// transparently answering Pings with Pongs and skipping Pongs. A Close
+    /// frame surfaces as `Message::Close`.
+    async recv(mut &this) -> Result<Message, IoError>
+    where S: AsyncTransport {
+        mut acc: Array<u8> = Array<u8>::new();
+        mut binary: boolean = false;
+        mut control_count: u64 = 0;
+        loop {
+            mut fr: Frame = (await this.conn.read_frame())?;
 
-/// Run the server handshake over an accepted `stream`, then view it as a
-/// server-mode `WebSocket`. The caller owns `stream`.
-function accept(stream: TcpStream*) -> Result<WebSocket<TcpStream>, IoError> {
-    server_handshake(stream)?;
-    return Result::Ok(WebSocket<TcpStream>::from_upgraded(stream, false));
-}
-
-/// Client handshake over any stream: send the GET upgrade, verify the
-/// `101` and the `Sec-WebSocket-Accept` echo.
-function client_handshake<S>(stream: S*, host: Str, path: Str) -> Result<(), IoError>
-where S: Read + Write {
-    mut key: String = handshake::generate_key();
-
-    mut req: String = String::with_capacity(160);
-    req.push(Str::new("GET ")); req.push(path); req.push(Str::new(" HTTP/1.1\r\n"));
-    req.push(Str::new("Host: ")); req.push(host); req.push(Str::new("\r\n"));
-    req.push(Str::new("Upgrade: websocket\r\n"));
-    req.push(Str::new("Connection: Upgrade\r\n"));
-    req.push(Str::new("Sec-WebSocket-Key: ")); req.push(key.as_str()); req.push(Str::new("\r\n"));
-    req.push(Str::new("Sec-WebSocket-Version: 13\r\n\r\n"));
-
-    match (stream.write(req.as_str().as_bytes())) {
-        Result::Ok(_)  => { }
-        Result::Err(e) => { req.drop(); key.drop(); return Result::Err(e); }
-    }
-    req.drop();
-
-    mut head: String = match (read_head(stream)) {
-        Result::Ok(h)  => { h }
-        Result::Err(e) => { key.drop(); return Result::Err(e); }
-    };
-
-    mut ok: boolean = (status_code(head.as_str()) == 101);
-    if (ok) {
-        mut expected: String = handshake::compute_accept(key.as_str());
-        match (header_value(head.as_str(), Str::new("sec-websocket-accept"))) {
-            Option::Some(got) => {
-                mut g: String = got;
-                if (!str_eq(g.as_str(), expected.as_str())) { ok = false; }
-                g.drop();
+            // RFC 6455 section 5.1 mask direction: a server (is_client ==
+            // false) requires masked client frames; a client requires unmasked
+            // server frames. A violation (masked == is_client) is a protocol
+            // error - the proxy cache-poisoning vector.
+            const bad: boolean = (fr.masked == this.is_client);
+            mut pong: boolean = false;
+            mut done: boolean = false;
+            mut closing: boolean = false;
+            if (!bad) {
+                match (fr.opcode) {
+                    OpCode::Ping => {
+                        // Best-effort Pong echoing the ping payload. It is
+                        // queued, not sent: the frame it echoes is released
+                        // below, before the one suspension this arm adds.
+                        match (this.conn.queue_frame(true, OpCode::Pong,
+                                                    fr.payload.as_slice(), this.is_client)) {
+                            Result::Ok(_)  => { pong = true; }
+                            Result::Err(_) => { }
+                        }
+                        control_count = control_count + 1;
+                    }
+                    OpCode::Pong => {
+                        control_count = control_count + 1;
+                    }
+                    OpCode::Close => {
+                        closing = true;
+                    }
+                    OpCode::Text => {
+                        binary = false;
+                        acc.append(fr.payload.as_slice());
+                        done = fr.fin;
+                    }
+                    OpCode::Binary => {
+                        binary = true;
+                        acc.append(fr.payload.as_slice());
+                        done = fr.fin;
+                    }
+                    OpCode::Continuation => {
+                        acc.append(fr.payload.as_slice());
+                        done = fr.fin;
+                    }
+                }
             }
-            Option::None => { ok = false; }
-        }
-        expected.drop();
-    }
-    head.drop();
-    key.drop();
+            // Nothing suspends between the frame's arrival and here, so the
+            // frame never crosses a suspension point and is released as soon
+            // as its bytes have been copied out.
+            fr.drop();
 
-    if (!ok) { return Result::Err(IoError::new(IoErrorKind::InvalidData, 0)); }
-    return Result::Ok(());
+            if (bad) {
+                return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
+            }
+            if (closing) {
+                this.closed = true;
+                return Result::Ok(Message::Close);
+            }
+            if (acc.length() > MAX_MESSAGE) {
+                return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
+            }
+            if (control_count > MAX_CONTROL_PER_RECV) {
+                return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
+            }
+            if (done) {
+                return Result::Ok(build_message(acc, binary));
+            }
+            if (pong) {
+                (await this.conn.flush())?;
+            }
+        }
+    }
 }
 
-/// Server handshake over any stream: read the client GET, reply `101`
-/// with the computed accept value.
-function server_handshake<S>(stream: S*) -> Result<(), IoError>
-where S: Read + Write {
-    mut head: String = read_head(stream)?;
+implement trait Drop for struct WebSocket<S> {
+    drop(mut &this) -> void {
+        this.conn.drop();
+    }
+}
 
-    mut accept_val: String = match (header_value(head.as_str(), Str::new("sec-websocket-key"))) {
-        Option::Some(k) => {
-            mut key: String = k;
-            const a: String = handshake::compute_accept(key.as_str());
-            key.drop();
-            a
-        }
-        Option::None => {
-            head.drop();
-            return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
-        }
-    };
-    head.drop();
+/// Connect a WebSocket over an already-connected TCP socket: wrap it, run the
+/// client handshake, and hand back the upgraded connection. The socket is
+/// consumed — the `WebSocket` owns it from here.
+async function connect(sock: TcpStream, host: Str, path: Str)
+        -> Result<WebSocket<TcpStream>, IoError> {
+    mut ws: WebSocket<TcpStream> =
+        WebSocket<TcpStream>::of(BufStream<TcpStream>::of(sock), true);
+    (await ws.client_handshake(host, path))?;
+    return Result::Ok(ws);
+}
 
-    mut resp: String = String::with_capacity(130);
-    resp.push(Str::new("HTTP/1.1 101 Switching Protocols\r\n"));
-    resp.push(Str::new("Upgrade: websocket\r\n"));
-    resp.push(Str::new("Connection: Upgrade\r\n"));
-    resp.push(Str::new("Sec-WebSocket-Accept: ")); resp.push(accept_val.as_str()); resp.push(Str::new("\r\n\r\n"));
-    accept_val.drop();
-
-    const result: Result<(), IoError> = stream.write(resp.as_str().as_bytes());
-    resp.drop();
-    return result;
+/// Accept a WebSocket over an accepted TCP socket: wrap it, run the server
+/// handshake, and hand back the upgraded connection.
+async function accept(sock: TcpStream) -> Result<WebSocket<TcpStream>, IoError> {
+    mut ws: WebSocket<TcpStream> =
+        WebSocket<TcpStream>::of(BufStream<TcpStream>::of(sock), false);
+    (await ws.server_handshake())?;
+    return Result::Ok(ws);
 }
 
 /// Reassemble accumulated payload bytes into a `Message`. Consumes `data`.
@@ -286,39 +324,12 @@ function build_message(data: Array<u8>, binary: boolean) -> Message {
     return Message::Text(text);
 }
 
-/// Read an HTTP head (request or status line + headers) up to and
-/// including the terminating CRLF CRLF, one byte at a time so no body /
-/// frame bytes are consumed.
-function read_head<R>(reader: R*) -> Result<String, IoError>
-where R: Read {
-    mut head: String = String::new();
-    mut state: i32 = 0;   // CRLFCRLF progress: 0 -> \r1 -> \n2 -> \r3 -> \n done
-    mut b: u8[1];
-    loop {
-        if (head.length() > MAX_HEAD) {
-            head.drop();
-            return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
-        }
-        const n: u64 = match (reader.read(&b[0], 1)) {
-            Result::Ok(x)  => { x }
-            Result::Err(e) => { head.drop(); return Result::Err(e); }
-        };
-        if (n == 0) {
-            head.drop();
-            return Result::Err(IoError::new(IoErrorKind::UnexpectedEof, 0));
-        }
-        const c: u8 = b[0];
-        head.push(c);
-        if (c == 0x0D) {                      // '\r'
-            if (state == 2) { state = 3; } else { state = 1; }
-        } else {
-            if (c == 0x0A) {                  // '\n'
-                if (state == 3) { return Result::Ok(head); }
-                if (state == 1) { state = 2; } else { state = 0; }
-            } else {
-                state = 0;
-            }
-        }
+/// Append every byte or report `OutOfMemory`; the outgoing buffer is the one
+/// place a handshake's bytes can fail to fit.
+function push_all(out: Array<u8>*, bytes: Slice<u8>) -> Result<(), IoError> {
+    match (out.try_append(bytes)) {
+        Result::Ok(_)  => { return Result::Ok(()); }
+        Result::Err(_) => { return Result::Err(IoError::new(IoErrorKind::OutOfMemory, 0)); }
     }
 }
 
@@ -338,33 +349,22 @@ function status_code(head: Str) -> u64 {
     return code;
 }
 
-/// Find a header value by case-insensitive name. Skips the first line.
-function header_value(head: Str, name_lower: Str) -> Option<String> {
-    const len: u64 = head.length();
+/// The value of ONE header line when its name matches `name_lower`
+/// case-insensitively, as a view into that line. `read_line` has already
+/// stripped the terminator, so the value runs to the end of the line.
+function header_line_value(line: Str, name_lower: Str) -> Option<Str> {
+    const len: u64 = line.length();
+    mut colon: u64 = len;
     mut i: u64 = 0;
-    while (i < len && head_at(head, i) != 0x0A) { i++; }   // past request/status line
-    i++;
-
     while (i < len) {
-        mut j: u64 = i;
-        mut colon: u64 = len;
-        while (j < len && head_at(head, j) != 0x0A) {
-            if (head_at(head, j) == 0x3A && colon == len) { colon = j; }
-            j++;
-        }
-        if (colon != len) {
-            const name: Str = head.sub_bytes(i, colon);
-            if (eq_ignore_case(name, name_lower)) {
-                mut vs: u64 = colon + 1;
-                mut ve: u64 = j;
-                if (ve > vs && head_at(head, ve - 1) == 0x0D) { ve = ve - 1; }  // strip '\r'
-                while (vs < ve && head_at(head, vs) == 0x20) { vs = vs + 1; }    // strip leading SP
-                return Option::Some(String::from_str(head.sub_bytes(vs, ve)));
-            }
-        }
-        i = j + 1;
+        if (head_at(line, i) == 0x3A) { colon = i; break; }   // ':'
+        i++;
     }
-    return Option::None;
+    if (colon == len) { return Option::None; }
+    if (!eq_ignore_case(line.sub_bytes(0, colon), name_lower)) { return Option::None; }
+    mut vs: u64 = colon + 1;
+    while (vs < len && head_at(line, vs) == 0x20) { vs++; }   // strip leading SP
+    return Option::Some(line.sub_bytes(vs, len));
 }
 
 /// Case-insensitive equality of `a` against an already-lowercase `b`.

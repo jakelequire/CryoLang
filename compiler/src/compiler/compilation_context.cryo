@@ -10,7 +10,7 @@
 namespace Compiler::CompilationContext;
 
 import Compiler::{
-    CompileMode, Diag, Artifacts, ModuleGraph, DeclIndex, ProjectConfig
+    CompileMode, Diag, Artifacts, ModuleGraph, DeclIndex, ConstTable, ProjectConfig
 };
 import Compiler::Diag::{
     Snapshot, Config, Renderer, Severity, Sink, Diagnostic
@@ -107,6 +107,11 @@ public:
     // -- Declaration index (heap-allocated) --
     decl_index: DeclarationIndex*;
 
+    // -- Folded module-level integer constants (heap-allocated) --
+    // Shared across modules: a fixed array size may name a constant declared
+    // in an imported module, and imports are name-resolved first.
+    const_table: ConstantTable*;
+
     // -- Injected specialization origin tracking --
     // Maps ASTNode pointer (as u64) -> template module SymbolStr.id.
     // Populated by GenericExpressionResolution when injecting specialized ASTs;
@@ -114,12 +119,41 @@ public:
     injected_ast_ptrs:    u64[];
     injected_ast_modules: u32[];
 
+    // -- Inactive-region tracking (LSP tooling) --
+    // Source spans of top-level declarations, methods, and inline `![dir] { }`
+    // blocks that ConfigGating stripped as inactive for the target OS.  Those
+    // decls are removed from the AST, so this is the only surviving record of
+    // where they were; the LSP reads it to publish dimmed ("compiled out")
+    // ranges to the editor.  Populated only by the ConfigGating pass.  Fresh
+    // per compilation (the LSP builds a new CompilationContext on every
+    // recompile), so it needs no explicit reset.
+    inactive_spans: SourceSpan[];
+
     // -- Type system (initialized lazily by TypeDeclaration pass) --
     type_arena: TypeArena*;
 
     // -- Project configuration (multi-module mode) --
     project_config:      ProjectConfig*;
     project_no_std:      boolean;
+    /// `[compiler] no_runtime` (cryoconfig): freestanding build.  Read by
+    /// codegen to suppress the `main`-widening / `set_args`/`set_env`
+    /// prologue and the `@panic` runtime, and by the linker pass to drop
+    /// crt0 / libc / `libcryo.a`.  Also queryable from `![config(no_runtime)]`
+    /// gates via ConfigGating.  Default false.
+    project_no_runtime:  boolean;
+    /// `[compiler] panic = "unwind"` / CLI `--panic=unwind`: select DWARF
+    /// unwinding.  Read by codegen to emit invoke/landingpad cleanup edges and
+    /// attach `__cryo_personality_v0`, and by the linker pass to link the
+    /// `panic/unwind` runtime tier + libunwind instead of `panic/abort`.
+    /// Default false = abort (emitted IR is byte-identical to before).
+    project_panic_unwind:  boolean;
+    /// `[low_level] native_alloc` (cryoconfig): route `GlobalAlloc` through
+    /// the native mmap-backed heap instead of libc malloc.  Read by
+    /// ConfigGating to evaluate `![config(native_alloc)]` gates.  Default
+    /// false => libc-backed (Low-Level Plan Stage 3).  A temporary
+    /// migration switch, deleted once the native heap is proven (the
+    /// `native_syscalls` switch already completed that lifecycle).
+    native_alloc:        boolean;
     active_module_index: i64;
     /// Resolved stdlib root: where `lib.cryo` lives.  Set by Instance
     /// after `resolve_stdlib_root` runs; the linker reads
@@ -192,6 +226,7 @@ public:
         const _box_module_graph: Box<ModuleGraph> = Box<ModuleGraph>::new(ModuleGraph::new());
         const _box_intern: Box<InternTable>       = Box<InternTable>::new(InternTable::new());
         const _box_decl: Box<DeclarationIndex>    = Box<DeclarationIndex>::new(DeclarationIndex::new());
+        const _box_consts: Box<ConstantTable>     = Box<ConstantTable>::new(ConstantTable::new());
 
         const diag_ptr: DiagnosticSink* = _box_diag.leak();
         const diag_config_ptr: DiagConfig* = _box_diag_config.leak();
@@ -216,12 +251,17 @@ public:
             module_graph:  _box_module_graph.leak(),
             intern_table:  _box_intern.leak(),
             decl_index:    _box_decl.leak(),
+            const_table:   _box_consts.leak(),
             injected_ast_ptrs:    [],
             injected_ast_modules: [],
+            inactive_spans:       [],
             type_arena:    null,
 
             project_config:      null,
             project_no_std:      false,
+            project_no_runtime:  false,
+            project_panic_unwind: false,
+            native_alloc:        false,
             active_module_index: -1,
             stdlib_root:         "",
             target_triple:       "",
@@ -246,7 +286,9 @@ public:
 
         // Wire the renderer and config into the sink
         diag_ptr.set_renderer(renderer);
-        diag_ptr.set_config(*diag_config_ptr);
+        // The config box was leaked above, so nothing else will ever drop it;
+        // the sink's copy is the only owner.
+        unsafe { diag_ptr.set_config(*diag_config_ptr); }
         return ctx;
     }
 
@@ -470,7 +512,8 @@ public:
                 this.generic_registry,
                 this.module_type_registry,
                 this.resolver,
-                this.decl_index
+                this.decl_index,
+                this.const_table
             ));
             this.type_resolver = _box_tr.leak();
             this.type_resolver.set_diagnostics(this.diagnostics);
@@ -503,6 +546,17 @@ public:
     /// Called by the DirectiveProcessing pass.
     init_directives(mut &this) -> void {
         // Will create DirectiveRegistry when defined.
+    }
+
+    /// Record a source span that ConfigGating stripped as inactive for the
+    /// target OS (a decl / method / inline block gated to another platform).
+    /// The LSP reads `inactive_spans` to dim compiled-out code.  Ignores
+    /// location-less spans so a synthesized node never produces a phantom
+    /// range.
+    note_inactive(mut &this, span: SourceSpan) -> void {
+        if (span.has_location()) {
+            this.inactive_spans.push(span);
+        }
     }
 
 
@@ -560,6 +614,10 @@ public:
         mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR, ice_msg);
         diag = diag.help("please report this bug");
         this.diagnostics.emit(diag);
+        // The sink defers rendering until flush() at end of compilation;
+        // exiting without flushing here would make every ICE a silent
+        // exit-1 with no message printed at all.
+        this.diagnostics.flush();
         env::process_exit(1);
     }
 
@@ -661,6 +719,9 @@ public:
         this.project_config = config;
         if (config != null) {
             this.project_no_std = config.no_std;
+            this.project_no_runtime = config.no_runtime;
+            this.project_panic_unwind = config.resolve_panic_unwind();
+            this.native_alloc = config.native_alloc;
         }
     }
 

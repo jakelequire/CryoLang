@@ -16,6 +16,16 @@ import Compiler::Parser::{ ParserBase, ExprParser };
 import Utils::Logger;
 
 
+/// The `static` / `async` run parsed ahead of a method head.
+type struct MethodModifiers {
+    is_static: boolean;
+    is_async:  boolean;
+    /// Extent of the consumed keywords. They are read before the method node
+    /// exists, so they fall outside its own `span`; the member keeps them for
+    /// `outer_span()` (see `DeclarationNode::note_modifier_span`).
+    span:      SourceSpan;
+}
+
 type class Parser : ExprParser {
 public:
     /// Module-scope `static_assert(...)` items collected during the top-level
@@ -151,19 +161,35 @@ public:
         };
     }
 
+    /// Record a leading modifier keyword (`public` / `private`) on a
+    /// declaration that has just been parsed.  The keyword is consumed
+    /// before the declaration's own parse begins, so it falls outside the
+    /// node's `span`; `DeclarationNode::outer_span` folds it back in for
+    /// consumers that need the full written extent.  Nodes that can't carry
+    /// one (a recovery `null`, a non-declaration) are ignored - the same
+    /// gate `is_attachable_decl` applies to directives.
+    static note_decl_modifier(node: ASTNode*, span: SourceSpan) -> void {
+        if (!Parser::is_attachable_decl(node)) { return; }
+        const decl: DeclarationNode* = node as DeclarationNode*;
+        decl.note_modifier_span(span);
+    }
+
 
     // Entry Point
 
     /// Parse the entire program, producing a ProgramNode.
     parse() -> ProgramNode* {
+        // Module-level names first: the parse is single-pass, but deciding
+        // whether an `ident <` opens type arguments needs to know about
+        // declarations further down the file.
+        this.scan_module_names();
+
         // Skip leading comments/doc comments
         this.collect_doc_comments();
         LOG_DEBUG(LogComponent::Parser, "[Parser] parse() starting parsing...");
 
         const start: Token = this.current();
         mut program: ProgramNode* = new ProgramNode(this.span_from_token(start));
-        cdebug("[PARSE-DBG] new ProgramNode: ptr=%p kind=%d (expect 58)\n",
-               program as void*, program.kind as i32);
 
         while (!this.is_at_end()) {
             if (this.panic_mode) {
@@ -311,15 +337,19 @@ public:
 
         // Public declarations
         if (tok.kind == TokenType::KwPublic) {
+            const vis_span: SourceSpan = this.span_from_token(tok);
             this.advance(); // consume 'public'
             const decl: ASTNode* = this.parse_declaration(true, doc);
+            Parser::note_decl_modifier(decl, vis_span);
             return decl;
         }
 
         // Private declarations
         if (tok.kind == TokenType::KwPrivate) {
+            const vis_span: SourceSpan = this.span_from_token(tok);
             this.advance();
             const decl: ASTNode* = this.parse_declaration(false, doc);
+            Parser::note_decl_modifier(decl, vis_span);
             return decl;
         }
 
@@ -397,6 +427,21 @@ public:
             return func;
         }
 
+        // `async function` - an async fn is parsed as an ordinary function
+        // carrying the `is_async` flag; the async lowering in SemanticAnalysis
+        // rewrites it into a state-machine struct + `Future` impl.
+        if (tok.kind == TokenType::KwAsync && this.peek_at(1).kind == TokenType::KwFunction) {
+            const async_span: SourceSpan = this.span_from_token(tok);
+            this.advance(); // consume 'async'
+            const func: FunctionDeclNode* = this.parse_function_declaration(is_public);
+            if (func != null) {
+                func.set_async(true);
+                func.note_modifier_span(async_span);
+                if (doc != "") { func.set_documentation(doc); }
+            }
+            return func;
+        }
+
         // Variable declaration: const or mut.  If the next-after token is `{`
         // it's a struct destructure binding (`const { f }: T = expr;`); these
         // are body-only (no global destructures), so the global path stays on
@@ -461,10 +506,12 @@ public:
 
         // Static keyword before function
         if (tok.kind == TokenType::KwStatic && this.peek_at(1).kind == TokenType::KwFunction) {
+            const static_span: SourceSpan = this.span_from_token(tok);
             this.advance(); // consume 'static'
             const func: FunctionDeclNode* = this.parse_function_declaration(is_public);
             if (func != null) {
                 func.set_static(true);
+                func.note_modifier_span(static_span);
                 if (doc != "") { func.set_documentation(doc); }
             }
             return func;
@@ -505,6 +552,12 @@ public:
             name_tok = this.consume(TokenType::Identifier, "variable name");
         }
         const name: SymbolStr = this.intern_lexeme(name_tok);
+        // Only inside a function body: at depth 0 this is a module-level
+        // global, which shares a namespace with functions and types and so
+        // says nothing about whether a later `ident <` opens type arguments.
+        if (this.scope_depth > 0) {
+            this.note_local_name(name);
+        }
         mut node: VarDeclNode* = new VarDeclNode(name, this.span_from_token(start));
         node.set_mutable(is_mutable);
         node.set_name_span(this.span_from_token(name_tok));
@@ -735,6 +788,9 @@ public:
         mut params: VarDeclNode*[] = [];
         this.pending_bare_variadic  = false;
         this.pending_named_variadic = false;
+        // Every function and method reaches its body through here, so this is
+        // where the previous one's bindings stop being in scope.
+        this.reset_local_names();
 
         while (true) {
             // Bare variadic: `...` with no preceding name. Common in extern
@@ -747,6 +803,7 @@ public:
 
             const param: VarDeclNode* = this.parse_parameter();
             if (param != null) {
+                this.note_local_name(param.name);
                 params.push(param);
             }
 
@@ -1009,6 +1066,11 @@ public:
             // inline opt-out doesn't shift the rest of the section.
             mut member_visibility: Visibility = current_visibility;
             mut had_inline_visibility: boolean = false;
+            // Where that inline keyword sat, for the member's `outer_span()`:
+            // it is consumed here, before the member node exists, so nothing
+            // else records it.  Stays `none()` for block-form visibility,
+            // whose label is not part of any one member.
+            mut member_modifier_span: SourceSpan = SourceSpan::none();
             if (this.peek_at(1).kind != TokenType::Colon) {
                 mut matched: boolean = true;
                 match (this.current().kind) {
@@ -1026,6 +1088,7 @@ public:
                 }
                 if (matched) {
                     had_inline_visibility = true;
+                    member_modifier_span = this.span_from_token(this.current());
                     this.advance(); // consume keyword
                 }
             }
@@ -1056,15 +1119,40 @@ public:
             }
             if (this.check(TokenType::RBrace) || this.is_at_end()) { break; }
 
+            // A leading `async` is consumed ahead of the member head, so every
+            // member kind below sees it: only a method can carry it, and the
+            // kinds that cannot are rejected where they are built rather than
+            // dropping the keyword silently. `static` is deliberately NOT
+            // hoisted here — `static Name()` has always meant a static method
+            // named after the type, not a constructor, and hoisting it would
+            // change that.
+            mut member_is_async: boolean = false;
+            if (this.check(TokenType::KwAsync) && this.at_method_modifier()) {
+                member_is_async = true;
+                member_modifier_span = SourceSpan::covering(member_modifier_span,
+                    this.span_from_token(this.current()));
+                this.advance();
+            }
+
             // Constructor: ClassName(params) { body }
             if (this.check(TokenType::Identifier) && this.current().lexeme == this.current_type_name &&
                 this.peek_at(1).kind == TokenType::LParen) {
                 const method: MethodNode* = this.parse_constructor(member_visibility);
                 if (method != null) {
+                    // A constructor runs to completion at a fixed point in an
+                    // object's lifetime: it has no caller that could hold and
+                    // poll a future, and the object does not exist until it
+                    // returns.
+                    if (member_is_async) {
+                        this.report_invalid_at(ErrorCode::E0364_INVALID_ASYNC_MEMBER,
+                            "a constructor cannot be `async`: it must produce a fully initialized object before any caller can observe it, so there is nothing to suspend into",
+                            member_modifier_span);
+                    }
                     if (doc != "") { method.set_documentation(doc); }
                     for (mut pi: i64 = 0; pi < pending_dirs.length; pi++) {
                         method.add_directive(pending_dirs[pi]);
                     }
+                    method.note_modifier_span(member_modifier_span);
                     if (struct_node != null) { struct_node.add_method(method); }
                     if (class_node != null) { class_node.add_method(method); }
                     if (union_node != null) { union_node.add_method(method); }
@@ -1076,10 +1164,18 @@ public:
             if (this.check(TokenType::Tilde)) {
                 const method: MethodNode* = this.parse_destructor(member_visibility);
                 if (method != null) {
+                    // A destructor is called by drop insertion at scope exit,
+                    // from contexts that have no executor and cannot wait.
+                    if (member_is_async) {
+                        this.report_invalid_at(ErrorCode::E0364_INVALID_ASYNC_MEMBER,
+                            "a destructor cannot be `async`: it is called by drop insertion at scope exit, where there is no executor to poll a future",
+                            member_modifier_span);
+                    }
                     if (doc != "") { method.set_documentation(doc); }
                     for (mut pi: i64 = 0; pi < pending_dirs.length; pi++) {
                         method.add_directive(pending_dirs[pi]);
                     }
+                    method.note_modifier_span(member_modifier_span);
                     if (struct_node != null) { struct_node.add_method(method); }
                     if (class_node != null) { class_node.add_method(method); }
                     if (union_node != null) { union_node.add_method(method); }
@@ -1089,12 +1185,14 @@ public:
 
             // Static method or static field
             if (this.check(TokenType::KwStatic)) {
-                const method: MethodNode* = this.parse_method_with_modifiers(member_visibility, true, false, false);
+                const method: MethodNode* = this.parse_method_with_modifiers(
+                    member_visibility, true, false, false, member_is_async);
                 if (method != null) {
                     if (doc != "") { method.set_documentation(doc); }
                     for (mut pi: i64 = 0; pi < pending_dirs.length; pi++) {
                         method.add_directive(pending_dirs[pi]);
                     }
+                    method.note_modifier_span(member_modifier_span);
                     if (struct_node != null) { struct_node.add_method(method); }
                     if (class_node != null) { class_node.add_method(method); }
                     if (union_node != null) { union_node.add_method(method); }
@@ -1104,12 +1202,14 @@ public:
 
             // Virtual method
             if (this.check(TokenType::KwVirtual)) {
-                const method: MethodNode* = this.parse_method_with_modifiers(member_visibility, false, true, false);
+                const method: MethodNode* = this.parse_method_with_modifiers(
+                    member_visibility, false, true, false, member_is_async);
                 if (method != null) {
                     if (doc != "") { method.set_documentation(doc); }
                     for (mut pi: i64 = 0; pi < pending_dirs.length; pi++) {
                         method.add_directive(pending_dirs[pi]);
                     }
+                    method.note_modifier_span(member_modifier_span);
                     if (struct_node != null) { struct_node.add_method(method); }
                     if (class_node != null) { class_node.add_method(method); }
                     if (union_node != null) { union_node.add_method(method); }
@@ -1119,12 +1219,14 @@ public:
 
             // Override method
             if (this.check(TokenType::KwOverride)) {
-                const method: MethodNode* = this.parse_method_with_modifiers(member_visibility, false, false, true);
+                const method: MethodNode* = this.parse_method_with_modifiers(
+                    member_visibility, false, false, true, member_is_async);
                 if (method != null) {
                     if (doc != "") { method.set_documentation(doc); }
                     for (mut pi: i64 = 0; pi < pending_dirs.length; pi++) {
                         method.add_directive(pending_dirs[pi]);
                     }
+                    method.note_modifier_span(member_modifier_span);
                     if (struct_node != null) { struct_node.add_method(method); }
                     if (class_node != null) { class_node.add_method(method); }
                     if (union_node != null) { union_node.add_method(method); }
@@ -1145,15 +1247,22 @@ public:
                 if (next.kind == TokenType::LParen || next.kind == TokenType::LAngle) {
                     const method: MethodNode* = this.parse_method(member_visibility);
                     if (method != null) {
+                        if (member_is_async && method.func != null) { method.func.set_async(true); }
                         if (doc != "") { method.set_documentation(doc); }
                         for (mut pi: i64 = 0; pi < pending_dirs.length; pi++) {
                             method.add_directive(pending_dirs[pi]);
                         }
+                        method.note_modifier_span(member_modifier_span);
                         if (struct_node != null) { struct_node.add_method(method); }
                         if (class_node != null) { class_node.add_method(method); }
                         if (union_node != null) { union_node.add_method(method); }
                     }
                 } else if (this.check(TokenType::Identifier)) {
+                    if (member_is_async) {
+                        this.report_invalid_at(ErrorCode::E0364_INVALID_ASYNC_MEMBER,
+                            "only a method can be `async`; a field holds a value, not a computation to suspend",
+                            member_modifier_span);
+                    }
                     const field: FieldDeclNode* = this.parse_field_declaration();
                     if (field != null) {
                         field.set_visibility(member_visibility);
@@ -1161,6 +1270,7 @@ public:
                         for (mut pi: i64 = 0; pi < pending_dirs.length; pi++) {
                             field.add_directive(pending_dirs[pi]);
                         }
+                        field.note_modifier_span(member_modifier_span);
                         if (struct_node != null) { struct_node.add_field(field); }
                         if (class_node != null) { class_node.add_field(field); }
                         if (union_node != null) { union_node.add_field(field); }
@@ -1262,16 +1372,54 @@ public:
         return method;
     }
 
-    /// Parse a method with optional modifiers (static, virtual, override).
+    /// True when the current token is a method MODIFIER keyword rather than a
+    /// method NAME.
+    ///
+    /// A keyword may legally name a method (`as<T>()`, `type()`), so `static` /
+    /// `async` read as modifiers only when what follows is neither a parameter
+    /// list nor a generic-parameter list. Without this test, declaring a method
+    /// called `async` or `static` would stop parsing.
+    at_method_modifier() -> boolean {
+        if (!this.check(TokenType::KwStatic) && !this.check(TokenType::KwAsync)) { return false; }
+        const next: TokenType = this.peek_at(1).kind;
+        return next != TokenType::LParen && next != TokenType::LAngle;
+    }
+
+    /// Consume the run of `static` / `async` keywords at the cursor. They may
+    /// appear in either order and both may be present, so `static async f()`
+    /// and `async static f()` are the same declaration. `prefix` seeds the
+    /// returned extent, so a visibility keyword already consumed by the caller
+    /// stays part of the member's `outer_span()`.
+    consume_method_modifiers(prefix: SourceSpan) -> MethodModifiers {
+        mut m: MethodModifiers = MethodModifiers {
+            is_static: false, is_async: false, span: prefix };
+        while (this.at_method_modifier()) {
+            if (this.check(TokenType::KwStatic)) { m.is_static = true; } else { m.is_async = true; }
+            m.span = SourceSpan::covering(m.span, this.span_from_token(this.current()));
+            this.advance();
+        }
+        return m;
+    }
+
+    /// Parse a method with optional modifiers (static, async, virtual, override).
+    ///
+    /// The keyword that selected this path is still at the cursor and is
+    /// consumed here; a `static` / `async` run may follow it. `virtual async` /
+    /// `override async` are accepted by the grammar and rejected by sema, which
+    /// can say why (each override would return a different future type, so they
+    /// cannot share a vtable slot) instead of leaving a parse error on `async`.
     parse_method_with_modifiers(visibility: Visibility, is_static: boolean,
-                                 is_virtual: boolean, is_override: boolean) -> MethodNode* {
+                                 is_virtual: boolean, is_override: boolean,
+                                 is_async: boolean) -> MethodNode* {
         this.advance(); // consume modifier keyword
+        const extra: MethodModifiers = this.consume_method_modifiers(SourceSpan::none());
 
         const method: MethodNode* = this.parse_method(visibility);
         if (method != null) {
-            if (is_static) { method.set_static(true); }
+            if (is_static || extra.is_static) { method.set_static(true); }
             if (is_virtual) { method.set_virtual(true); }
             if (is_override) { method.set_override(true); }
+            if ((is_async || extra.is_async) && method.func != null) { method.func.set_async(true); }
         }
         return method;
     }
@@ -1509,11 +1657,14 @@ public:
                 continue;
             }
 
-            mut is_static: boolean = false;
-            if (this.check(TokenType::KwStatic)) {
-                is_static = true;
-                this.advance();
-            }
+            // An `async` trait method IS allowed: it desugars to an implicit
+            // associated type plus a projection return (`type ReadFut;` and
+            // `read(&this, n) -> This::ReadFut`), which each impl binds to its
+            // own synthesized future. `is_async` is kept on the node and
+            // `TypeResolutionPasses::desugar_async_trait_methods` performs that
+            // rewrite once the trait's signatures resolve.
+            mut trait_mods: MethodModifiers = this.consume_method_modifiers(SourceSpan::none());
+            const is_static: boolean = trait_mods.is_static;
 
             // Method name can be an identifier OR a keyword used as a name
             // (e.g. `from`, `default`, `into`). The leading `function`
@@ -1524,6 +1675,7 @@ public:
                 const func: FunctionDeclNode* = this.parse_function_declaration(false);
                 if (func != null) {
                     if (is_static) { func.set_static(true); }
+                    if (trait_mods.is_async) { func.set_async(true); }
                     node.add_method(func);
                 }
             } else {
@@ -2018,27 +2170,34 @@ public:
 
                 mut vis: Visibility = Visibility::Public;
                 mut is_static: boolean = false;
+                // These keywords are consumed before the method node exists,
+                // so they fall outside its `span`; keep their extent for
+                // `outer_span()` (see `DeclarationNode::note_modifier_span`).
+                mut modifier_span: SourceSpan = SourceSpan::none();
 
                 if (this.check(TokenType::KwPublic)) {
                     vis = Visibility::Public;
+                    modifier_span = this.span_from_token(this.current());
                     this.advance();
                 } else if (this.check(TokenType::KwPrivate)) {
                     vis = Visibility::Private;
+                    modifier_span = this.span_from_token(this.current());
                     this.advance();
                 }
 
-                if (this.check(TokenType::KwStatic)) {
-                    is_static = true;
-                    this.advance();
-                }
+                const mods: MethodModifiers = this.consume_method_modifiers(modifier_span);
+                is_static = mods.is_static;
+                modifier_span = mods.span;
 
                 const method: MethodNode* = this.parse_method(vis);
                 if (method != null) {
                     if (is_static) { method.set_static(true); }
+                    if (mods.is_async && method.func != null) { method.func.set_async(true); }
                     if (doc != "") { method.set_documentation(doc); }
                     for (mut pi: i64 = 0; pi < pending_dirs.length; pi++) {
                         method.add_directive(pending_dirs[pi]);
                     }
+                    method.note_modifier_span(modifier_span);
                     node.add_method(method);
                 }
             } else {
@@ -2324,7 +2483,27 @@ public:
         this.advance(); // consume 'where'
 
         while (true) {
-            const type_param_tok: Token = this.consume(TokenType::Identifier, "type parameter");
+            const start_tok: Token = this.current();
+
+            // Subject: a bare type parameter (`T`) or an associated-type
+            // projection (`This::Item`, `I::Item`). A projection routes through
+            // `parse_projection_subject` (which builds the Projection node) and
+            // leaves `type_parameter` empty; a bare param keeps the historical
+            // path so the param-name-keyed machinery downstream is unchanged.
+            mut type_param: SymbolStr = SymbolStr::empty();
+            mut subject: TypeAnnotation* = null;
+            const is_projection: boolean =
+                this.check(TokenType::KwThisType)
+                || (this.check(TokenType::Identifier)
+                    && this.peek_at(1).kind == TokenType::ColonColon);
+            if (is_projection) {
+                subject = this.parse_projection_subject();
+            } else {
+                const type_param_tok: Token =
+                    this.consume(TokenType::Identifier, "type parameter");
+                type_param = this.intern_lexeme(type_param_tok);
+            }
+
             this.consume(TokenType::Colon, "':'");
 
             mut refs: TraitRef[] = [];
@@ -2334,9 +2513,10 @@ public:
             }
 
             const bound: TraitBound = TraitBound {
-                type_parameter: this.intern_lexeme(type_param_tok),
+                type_parameter: type_param,
+                subject_type:   subject,
                 trait_refs:     refs,
-                span:           this.span_from(type_param_tok),
+                span:           this.span_from(start_tok),
             };
             bounds.push(bound);
 
@@ -2612,10 +2792,6 @@ public:
 
         if (tok.kind == TokenType::KwMatch) {
             return this.parse_match_statement();
-        }
-
-        if (tok.kind == TokenType::KwSwitch) {
-            return this.parse_switch_statement();
         }
 
         if (tok.kind == TokenType::KwReturn) {
@@ -3041,69 +3217,6 @@ public:
 
         arm.span = this.span_from(start);
         return arm;
-    }
-
-    /// Parse a switch statement: switch (expr) { cases }
-    parse_switch_statement() -> SwitchStmtNode* {
-        const start: Token = this.advance(); // consume 'switch'
-        const expr: ExpressionNode* = this.parse_paren_condition();
-        this.consume(TokenType::LBrace, "'{'");
-
-        mut switch_stmt: SwitchStmtNode* = new SwitchStmtNode(expr, this.span_from_token(start));
-
-        while (!this.check(TokenType::RBrace) && !this.is_at_end()) {
-            const before_pos: int = this.pos;
-            const case_node: CaseStmtNode* = this.parse_case_statement();
-            if (case_node != null) {
-                switch_stmt.add_case(case_node);
-            }
-            // Progress guard: matches the rationale in parse_match_statement.
-            if (this.pos == before_pos) {
-                this.advance();
-            }
-        }
-
-        this.consume(TokenType::RBrace, "'}'");
-        switch_stmt.span = this.span_from(start);
-        return switch_stmt;
-    }
-
-    /// Parse a case statement: case expr: { body } or default: { body }
-    parse_case_statement() -> CaseStmtNode* {
-        const start: Token = this.current();
-        mut is_default: boolean = false;
-        mut value: ExpressionNode* = null;
-
-        if (this.check(TokenType::KwDefault)) {
-            is_default = true;
-            this.advance();
-        } else if (this.check(TokenType::KwCase)) {
-            this.advance();
-            value = this.parse_expression();
-        } else {
-            this.error_expected("'case' or 'default'");
-            return null;
-        }
-
-        this.consume(TokenType::Colon, "':'");
-
-        // Case body (block or statements until next case/default/rbrace)
-        mut body: BlockStmtNode* = null;
-        if (this.check(TokenType::LBrace)) {
-            body = this.parse_block_statement();
-        } else {
-            body = new BlockStmtNode(this.current_span());
-            while (!this.check(TokenType::KwCase) && !this.check(TokenType::KwDefault) &&
-                   !this.check(TokenType::RBrace) && !this.is_at_end()) {
-                const stmt: StatementNode* = this.parse_statement();
-                if (stmt != null) {
-                    body.add_statement(stmt);
-                }
-            }
-            body.span = this.span_from(start);
-        }
-
-        return new CaseStmtNode(value, body, is_default, this.span_from(start));
     }
 
     /// Parse a return statement: return [expr];

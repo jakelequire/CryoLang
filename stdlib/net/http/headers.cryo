@@ -19,6 +19,9 @@ import io::traits;
 import collections::str;
 import collections::string;
 import collections::hashmap;
+import collections::array;
+import core::convert;
+import core::primitives;
 
 type struct Headers {
     inner: HashMap<String, String>;
@@ -119,12 +122,37 @@ type struct Headers {
         return true;
     }
 
-    /// Serialize all stored headers as HTTP/1.1 field lines:
-    /// `name: value\r\n` for every entry. The caller is responsible
-    /// for writing the trailing blank-line CRLF that separates
-    /// headers from the message body.
-    write_to<W>(&this, writer: mut &W) -> Result<(), IoError>
-    where W: Write {
+    /// Content-Length as a number. `Ok(None)` means the header is
+    /// absent, which for this parser means "no body". A present but
+    /// non-numeric value is `InvalidData` rather than a silent `None`:
+    /// a peer that sends `Content-Length: abc` has framed the message
+    /// wrongly, and guessing at zero would leave its body bytes in the
+    /// buffer to be read as the next message.
+    ///
+    /// The caller applies its own ceiling; the two directions cap the
+    /// body independently.
+    content_length(&this) -> Result<Option<u64>, IoError> {
+        match (this.get(Str::new("content-length"))) {
+            Option::Some(mut value) => {
+                match (u64::try_from(value.as_str())) {
+                    Result::Ok(len) => { return Result::Ok(Option::Some(len)); }
+                    Result::Err(_)  => {
+                        return Result::Err(IoError::new(IoErrorKind::InvalidData, 0));
+                    }
+                }
+            }
+            Option::None => { return Result::Ok(Option::None); }
+        }
+    }
+
+    /// Append every stored header to `out` as HTTP/1.1 field lines,
+    /// `name: value\r\n` per entry. The caller appends the trailing
+    /// blank-line CRLF that separates headers from the message body.
+    ///
+    /// Synchronous, and that is the point: a message is built into the
+    /// connection's outgoing buffer with no suspension point anywhere
+    /// inside it, so the layer above suspends exactly once, in `flush`.
+    encode_into(&this, out: Array<u8>*) -> Result<(), IoError> {
         const colon_sp: Slice<u8> = Slice::from_raw(": ", 2);
         const crlf: Slice<u8> = Slice::from_raw("\r\n", 2);
         const count: u64 = this.inner.bucket_count();
@@ -133,10 +161,10 @@ type struct Headers {
             mut node: hashmap::Entry<String, String>* = this.inner.get_bucket(i);
             loop {
                 if (node == null) { break; }
-                writer.write(node.key.as_bytes())?;
-                writer.write(colon_sp)?;
-                writer.write(node.value.as_bytes())?;
-                writer.write(crlf)?;
+                push_all(out, node.key.as_bytes())?;
+                push_all(out, colon_sp)?;
+                push_all(out, node.value.as_bytes())?;
+                push_all(out, crlf)?;
                 node = node.next;
             }
             i++;
@@ -144,6 +172,21 @@ type struct Headers {
         return Result::Ok(());
     }
 
+}
+
+/// Append `bytes` to `out`, reporting a failed grow as `OutOfMemory`.
+///
+/// Every HTTP message encoder builds into a caller-supplied `Array<u8>`
+/// — normally the connection's `pending()` buffer — so this one-line
+/// translation from the allocator's error to `IoError` is shared by all
+/// of them rather than restated at each of the couple of dozen appends.
+function push_all(out: Array<u8>*, bytes: Slice<u8>) -> Result<(), IoError> {
+    match (out.try_append(bytes)) {
+        Result::Ok(_)  => { return Result::Ok(()); }
+        Result::Err(_) => {
+            return Result::Err(IoError::new(IoErrorKind::OutOfMemory, 0));
+        }
+    }
 }
 
 /// Copy `s` into a fresh String with CR (0x0D) and LF (0x0A) bytes removed.

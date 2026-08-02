@@ -1,17 +1,24 @@
-///! HTTPS layer - HTTP/1.1 request + response over a TLS loopback.
+///! `HttpsClient` - HTTP/1.1 over a TLS loopback, end to end.
 ///!
-///! Drives the full TLS-carries-HTTP path end to end: the client wraps a
-///! `TcpStream` in TLS, sends a GET, and reads the response back; the server
-///! wraps its accepted socket in TLS and parses the request with the ordinary
-///! `http::Request::parse` (a `TlsStream` is just a `Read + Write`), then
-///! writes a fixed 200 response. Mirrors `net_tls`'s thread layout: main is
-///! the server (binds + listens before spawning), the spawned thread is the
-///! client.
+///! Drives the full TLS-carries-HTTP path: the client resolves nothing (it is
+///! handed `127.0.0.1` directly), dials, handshakes, sends a GET and reads the
+///! response; the server wraps its accepted socket in TLS and frames the
+///! request with the ordinary HTTP/1.1 reader, because a `TlsStream` is an
+///! `AsyncTransport` like any socket and `BufStream<S>` buffers both the same
+///! way.
 ///!
-///! The client READS the response before closing: that is what makes the
-///! round-trip honest (the bytes actually cross the wire and back) and
-///! race-free (the server's `write_all` never lands on a socket the client
-///! already closed - the original cause of this test's flakiness).
+///! `HttpsClient` had NO coverage before the async port - the previous test
+///! open-coded the client half against the blocking TLS API and never
+///! constructed an `HttpsClient` at all. Here the client half IS the shipped
+///! type, so a break in `get` / `send` fails this rather than going unnoticed.
+///!
+///! Both halves run as tasks on ONE `Executor`. That is not a simplification:
+///! a TLS handshake is bidirectional, so on blocking sockets the client would
+///! block in `SSL_connect` before the server ever reached `SSL_accept`, which
+///! is why the blocking version of this test needed a thread.
+///!
+///! The response body is asserted BY VALUE, so a truncated or mis-framed read
+///! fails rather than passing as an empty success.
 ///!
 ///! Requires `ssl` + `crypto` in `tests/cryoconfig` link_libs and the
 ///! `fixtures/tls/` cert+key (cwd is the `tests/` project root).
@@ -21,149 +28,142 @@ namespace CryoTests::Tests::Stdlib::NetHttps;
 
 import std::core::result;
 import std::core::option;
-import std::core::slice;
 import std::collections::str;
+import std::collections::array;
+import std::collections::string;
 import std::io::error;
 import std::io::traits;
 import std::io::buf;
-import std::net::socket_addr;
-import std::net::tcp;
+import std::future;
+import std::net::addr::socket_addr;
+import std::net::socket::tcp;
 import std::net::tls::context;
 import std::net::tls::stream;
+import std::net::tls::future;
 import std::net::http::method;
+import std::net::http::status;
 import std::net::http::request;
-import std::thread;
-import std::ffi::libc;
+import std::net::http::response;
+import std::net::http::conn;
+import std::net::https;
 import std::test::error;
 import std::test::assert;
 
-/// The fixed 200 response, built fresh at each call.  This is deliberately a
-/// function and not a module-level `const ... : Str`: a const `Str` initialised
-/// from a string literal reads back empty at runtime, which silently made the
-/// server send a zero-byte body (so the round-trip was never actually verified
-/// and the client - which used not to read it - could not catch it).
-function response_text() -> Str {
-    return Str::new("HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\nhi over tls");
+/// The body the server answers with. Distinctive enough that a stale or empty
+/// buffer cannot be mistaken for it.
+function https_body() -> Str {
+    return Str::new("hi over tls");
 }
 
-function slices_eq(a: Slice<u8>, b: Slice<u8>) -> boolean {
-    if (a.length() != b.length()) { return false; }
+function https_bytes_eq(got: &Array<u8>, want: Str) -> boolean {
+    if (got.length() != want.length()) { return false; }
     mut i: u64 = 0;
-    while (i < a.length()) {
-        match (a.get(i)) {
-            Option::Some(av) => {
-                match (b.get(i)) {
-                    Option::Some(bv) => { if (av != bv) { return false; } }
-                    Option::None     => { return false; }
-                }
-            }
-            Option::None => { return false; }
-        }
-        i++;
+    while (i < got.length()) {
+        mut a: u8 = 0;
+        mut b: u8 = 1;
+        match (got.get(i))          { Option::Some(v) => { a = v; } Option::None => { } }
+        match (want.byte_at(i))     { Option::Some(v) => { b = v; } Option::None => { } }
+        if (a != b) { return false; }
+        i = i + 1;
     }
     return true;
 }
 
-/// Client thread: TLS handshake, send a GET, read the full response back, and
-/// report whether it matched. Returns 200 on a verified round-trip.
-function https_client(port: i32) -> i32 {
-    mut tcp: TcpStream = match (TcpStream::connect(SocketAddr::localhost_v4(port as u16))) {
-        Result::Ok(s)  => { s }
-        Result::Err(_) => { return 0; }
-    };
-    mut conn: TlsConnector = match (TlsConnector::new()) {
-        Result::Ok(c)  => { c }
-        Result::Err(_) => { tcp.drop(); return 0; }
-    };
-    conn = conn.danger_accept_invalid_certs();
-    mut tls: TlsStream = match (conn.connect(tcp, Str::new("127.0.0.1"))) {
-        Result::Ok(t)  => { t }
-        Result::Err(_) => { conn.drop(); return 0; }
-    };
-    conn.drop();
+/// Accept ONE connection, complete the server handshake, read a request with
+/// the ordinary HTTP/1.1 framing, and answer 200 with the fixed body.
+/// Returns 1 on success, or a negative step code.
+async function https_serve(listener: TcpListener, acceptor: TlsAcceptor) -> i64 {
+    mut acc: TcpAccepted = await TcpAccept::start(listener);
+    mut lst: TcpListener = acc.take_listener();
+    lst.drop();
 
-    mut ok: i32 = 0;
-    mut req: Request = Request::new(Method::Get, Str::new("/"));
-    req.headers.insert(Str::new("Host"), Str::new("127.0.0.1"));
-    match (req.write_to(&tls)) {
-        Result::Ok(_) => {
-            // Read the whole response back before closing.  Blocking here until
-            // the server has written keeps the connection open across the
-            // server's `write_all`, so it can't race our close.
-            const want: u64 = response_text().as_bytes().length();
-            mut buf: u8[64];
-            match (tls.read_all(&buf[0], want)) {
-                Result::Ok(n) => {
-                    if (slices_eq(Slice::from_raw(&buf[0], n),
-                                  response_text().as_bytes())) {
-                        ok = 200;
-                    }
-                }
-                Result::Err(_) => { }
-            }
-        }
-        Result::Err(_) => { }
+    mut sock: TcpStream = TcpStream::from_fd(-1);
+    match (acc.take_result()) {
+        Result::Ok(s)  => { sock = s; }
+        Result::Err(_) => { return -1; }
     }
-    req.drop();
-    tls.drop();
-    return ok;
+
+    // `ac` is the receiver of an awaited method, so it is carried across the
+    // suspend and released by the scope-exit drop; an explicit `.drop()` here
+    // would be a second release of the same context.
+    mut ac: TlsAcceptor = acceptor;
+    mut tls: TlsStream = match (await ac.accept(sock)) {
+        Result::Ok(t)  => { t }
+        Result::Err(_) => { return -2; }
+    };
+
+    mut c: BufStream<TlsStream> = BufStream<TlsStream>::of(tls);
+    mut req: Request = match (await c.read_request()) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { return -3; }
+    };
+    if (!req.path.as_str().equals(Str::new("/hello"))) { return -4; }
+
+    mut resp: Response = Response::text(StatusCode::ok(), https_body());
+    match (resp.encode_into(c.pending())) {
+        Result::Ok(_)  => { }
+        Result::Err(_) => { return -5; }
+    }
+    match (await c.flush()) {
+        Result::Ok(_)  => { }
+        Result::Err(_) => { return -6; }
+    }
+    return 1;
 }
 
-/// Parse the request with the real HTTP parser over the TLS stream, then
-/// write the fixed 200 response.
-function serve_one(tls: TlsStream*) -> boolean {
-    mut parsed: boolean = false;
-    {
-        mut br: BufReader<TlsStream> = BufReader::new(tls);
-        match (Request::parse(&br)) {
-            Result::Ok(req) => { mut r: Request = req; r.drop(); parsed = true; }
-            Result::Err(_)  => { return false; }
-        }
-    }
-    if (!parsed) { return false; }
-    match (tls.write(response_text().as_bytes())) {
-        Result::Ok(_)  => { return true; }
-        Result::Err(_) => { return false; }
-    }
+/// The client half, through the shipped `HttpsClient`. The fixture certificate
+/// is self-signed, so verification is off - that is the only thing this differs
+/// from a real call in.
+async function https_fetch(port: u16) -> i64 {
+    mut client: HttpsClient = match (HttpsClient::insecure()) {
+        Result::Ok(c)  => { c }
+        Result::Err(_) => { return -20; }
+    };
+    mut resp: Response = match (await client.get(Str::new("127.0.0.1"), port,
+                                                 Str::new("/hello"))) {
+        Result::Ok(r)  => { r }
+        Result::Err(_) => { return -21; }
+    };
+    if (resp.status.as_u16() != 200)            { return -22; }
+    if (!https_bytes_eq(&resp.body, https_body())) { return -23; }
+    return 1;
+}
+
+async function https_round_trip(port: u16, listener: TcpListener,
+                                acceptor: TlsAcceptor) -> i64 {
+    const pair: (i64, i64) = await Futures::join(https_serve(listener, acceptor),
+                                                 https_fetch(port));
+    if (pair.0 != 1) { return pair.0; }
+    if (pair.1 != 1) { return pair.1; }
+    return 0;
 }
 
 ![test]
 function https_loopback_round_trip() -> Result<(), TestError> {
-    const port: u16 = (28000 + (libc::getpid() % 20000)) as u16;
-
-    mut listener: TcpListener = match (TcpListener::bind(SocketAddr::localhost_v4(port))) {
-        Result::Ok(l)  => { l }
-        Result::Err(_) => { return bail(Str::new("bind 127.0.0.1 failed")); }
-    };
-
-    const handle: thread::JoinHandle<i32> =
-        thread::spawn<i32, i32>(port as i32, https_client);
-
-    mut tcp_server: TcpStream = match (listener.accept()) {
-        Result::Ok(s)  => { s }
-        Result::Err(_) => { handle.join(); listener.drop(); return bail(Str::new("accept failed")); }
-    };
-    mut acceptor: TlsAcceptor = match (TlsAcceptor::new(
-            Str::new("fixtures/tls/cert.pem"), Str::new("fixtures/tls/key.pem"))) {
+    mut acceptor: TlsAcceptor = match (TlsAcceptor::new(Str::new("fixtures/tls/cert.pem"),
+                                                        Str::new("fixtures/tls/key.pem"))) {
         Result::Ok(a)  => { a }
-        Result::Err(_) => { tcp_server.drop(); handle.join(); listener.drop(); return bail(Str::new("TlsAcceptor::new failed (cert/key fixture?)")); }
+        Result::Err(_) => { return bail(Str::new("TlsAcceptor::new failed (fixture cert/key)")); }
     };
-    mut tls_server: TlsStream = match (acceptor.accept(tcp_server)) {
-        Result::Ok(t)  => { t }
-        Result::Err(_) => { acceptor.drop(); handle.join(); listener.drop(); return bail(Str::new("server TLS handshake failed")); }
+    mut listener: TcpListener = match (TcpListener::bind(SocketAddr::localhost_v4(0))) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { acceptor.drop(); return bail(Str::new("bind 127.0.0.1:0 failed")); }
     };
-
-    const server_ok: boolean = serve_one(&tls_server);
-
-    tls_server.drop();
-    acceptor.drop();
-    listener.drop();
-
-    const client_status: i32 = handle.join();
-
-    match (expect(server_ok, Str::new("server should parse the HTTPS request and respond"))) {
-        Result::Ok(_)  => { }
-        Result::Err(e) => { return Result::Err(e); }
+    listener.set_nonblocking(true);
+    const port: u16 = match (listener.local_addr()) {
+        Result::Ok(a)  => { a.port }
+        Result::Err(_) => {
+            listener.drop(); acceptor.drop();
+            return bail(Str::new("local_addr failed"));
+        }
+    };
+    if (port == 0) {
+        listener.drop(); acceptor.drop();
+        return bail(Str::new("local_addr reported port 0"));
     }
-    return expect_eq(client_status, 200);
+
+    mut ex: Executor = Executor::new();
+    const r: i64 = ex.block_on(https_round_trip(port, listener, acceptor));
+    ex.drop();
+    return expect_eq(r, 0 as i64);
 }

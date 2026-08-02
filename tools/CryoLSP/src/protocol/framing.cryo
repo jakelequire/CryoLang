@@ -69,6 +69,13 @@ const MAX_HEADER_LINE: u64 = 8192;
 /// frame instead of honoring the advertised size.
 const MAX_MESSAGE_SIZE: u64 = 536870912;                // 512 MiB
 
+/// Body read granularity.  The body loop reads up to this many bytes per
+/// syscall (bounded by the bytes remaining in the frame), turning a large
+/// `didChange` from ~1 syscall/byte into ~1 syscall/64 KiB.  A plain stack
+/// buffer (no heap churn on the hot edit path); 64 KiB is well under the
+/// LSP worker stack.
+const BODY_CHUNK_SIZE: u64 = 65536;
+
 const HEADER_CONTENT_LENGTH:     string = "Content-Length:";
 const HEADER_CONTENT_LENGTH_LEN: u64    = 15;
 
@@ -148,23 +155,34 @@ type struct FrameCodec {
             return Result::Err(FrameError::MessageTooLarge);
         }
 
-        // Read exactly `content_length` raw bytes for the body.
+        // Read exactly `content_length` raw bytes for the body, in bulk.
+        //
+        // Content-Length is known here, so we read in chunks rather than one
+        // syscall per byte - a 100 KB didChange was ~100k `read(1)` calls.
+        // The chunk is bounded (never reads past `content_length`), so we
+        // stop exactly on the frame boundary and never buffer into the NEXT
+        // frame - the read-ahead hazard the module header warns about (which
+        // would hide bytes from the coalescing poll) does not arise.
         mut body: String = String::with_capacity(content_length);
         if (content_length == 0) {
             return Result::Ok(Option::Some(body));
         }
 
-        mut scratch:     u8  = 0;
+        mut chunk: u8[BODY_CHUNK_SIZE];
         mut read_so_far: u64 = 0;
         while (read_so_far < content_length) {
-            match (reader.read(&scratch, 1)) {
+            mut want: u64 = content_length - read_so_far;
+            if (want > BODY_CHUNK_SIZE) { want = BODY_CHUNK_SIZE; }
+            match (reader.read(&chunk[0], want)) {
                 Result::Ok(n) => {
                     if (n == 0) {
                         body.drop();
                         return Result::Err(FrameError::UnexpectedEof);
                     }
-                    body.push_byte(scratch);
-                    read_so_far = read_so_far + 1;
+                    // One memcpy per chunk (the `Str` view over `chunk`),
+                    // versus a push per byte before.
+                    body.push(Str::from_raw(&chunk[0], n));
+                    read_so_far = read_so_far + n;
                 }
                 Result::Err(e) => {
                     body.drop();

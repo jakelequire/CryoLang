@@ -29,7 +29,7 @@ import Compiler::Diag::{
 };
 import Compiler::DeclIndex;
 import Compiler::AST;
-import Compiler::AST::{ Node, Expression, Statement, Declaration, Pattern, Visitor, NodeLocator };
+import Compiler::AST::{ Node, Expression, Statement, Declaration, Pattern, Visitor, NodeLocator, Cloner };
 import Compiler::Passes::PassID;
 import Compiler::CompilationContext;
 import Compiler::Lex;
@@ -43,7 +43,7 @@ import Compiler::Resolver::{ SymbolStr, InternTable, QualifiedName, MangledName,
 import Compiler::Sema::{
     State, Helpers, ScopeManager, TypeUtils, LiteralResolver, Diagnostics,
     Dispatch, SymbolicChecker, MethodBinding, PatternResolver,
-    LambdaSynth, MemberResolver, CallResolver
+    LambdaSynth, AsyncLower, MemberResolver, CallResolver
 };
 import std::core::{ option, mem };
 import std::collections::hashmap;
@@ -146,6 +146,7 @@ public:
     binding:  MethodBinding;
     patterns: PatternResolver;
     lambda:   LambdaSynth;
+    async_lower: AsyncLower;
     member:   MemberResolver;
     calls:    CallResolver;
 
@@ -165,6 +166,7 @@ public:
         this.binding  = MethodBinding::null();
         this.patterns = PatternResolver::null();
         this.lambda   = LambdaSynth::null();
+        this.async_lower = AsyncLower::null();
         this.member   = MemberResolver::null();
         this.calls    = CallResolver::null();
     }
@@ -189,6 +191,7 @@ public:
                            &this.symbolic, &this.scopes);
         this.lambda.wire(this.arena, this.intern, this.ctx, &this.state, &this.symbolic,
                          &this.scopes, &this.dispatch);
+        this.async_lower.wire(this.arena, this.intern, this.ctx, &this.patterns);
         this.member.wire(this.arena, this.intern, this.ctx, &this.checker, &this.state, &this.types,
                          &this.symbolic, &this.binding, &this.diag, &this.dispatch);
         this.calls.wire(this.arena, this.intern, this.ctx, &this.checker, &this.state, &this.types,
@@ -202,20 +205,220 @@ public:
                                  this.intern, this.ctx.diagnostics);
     }
 
-    /// Whether the symbolic generic-body check is enabled.
-    sema_symbolic_check_enabled(&this) -> boolean {
-        return this.symbolic.sema_symbolic_check_enabled();
-    }
-
-
     // -- Top-level + statement recursion seams --
 
     override visit(mut &this, node: ProgramNode*) -> void {
+        this.declare_async_futures(node);
         for (mut i: i64 = 0; i < node.statements.length; i++) {
             const stmt: ASTNode* = node.statements[i];
             if (stmt == null) { continue; }
             this.dispatch_top_level(stmt);
         }
+    }
+
+    /// Give every `async function` in the module its future type before any body
+    /// is typed.
+    ///
+    /// The state machine can only be built from a typed body, so the lowering
+    /// runs at the end of each function's own visit. But an `await` resolves the
+    /// callee's return type through the declaration index, so a caller visited
+    /// before its callee would see the callee's pre-lowering signature and report
+    /// that its Output "does not implement `Future`". Declaring the whole module's
+    /// futures up front makes the order of declarations irrelevant, and lets an
+    /// `async function` await itself.
+    ///
+    /// Bounded to the statement list: the count of async fns per module is small,
+    /// and `declare` is idempotent per node.
+    declare_async_futures(mut &this, node: ProgramNode*) -> void {
+        // Only an impl block registers its methods under more than one owner
+        // name; every other owner shares this empty list.
+        const no_aliases: SymbolStr[] = [];
+        for (mut i: i64 = 0; i < node.statements.length; i++) {
+            const stmt: ASTNode* = node.statements[i];
+            if (stmt == null) { continue; }
+            match (stmt.kind) {
+                NodeKind::FunctionDeclaration => {
+                    const f: FunctionDeclNode* = stmt as FunctionDeclNode*;
+                    // A lowered one has already had `is_async` cleared.
+                    if (f.is_async && f.body != null) {
+                        // `async function main` is renamed out of the entry-point
+                        // slot first, so the future `declare` registers is keyed
+                        // to the renamed function and not to `main`.
+                        this.async_lower.desugar_async_main(f);
+                        this.async_lower.declare(f);
+                    }
+                }
+                NodeKind::StructDeclaration => {
+                    const s: StructDeclNode* = stmt as StructDeclNode*;
+                    this.declare_async_methods(s.methods, s.generic_params,
+                        this.ctx.qualify_binding_sym(s.name, s.binding_namespace), no_aliases, null);
+                }
+                NodeKind::UnionDeclaration => {
+                    const u: UnionDeclNode* = stmt as UnionDeclNode*;
+                    this.declare_async_methods(u.methods, u.generic_params,
+                        this.ctx.qualify_binding_sym(u.name, u.binding_namespace), no_aliases, null);
+                }
+                NodeKind::ClassDeclaration => {
+                    const c: ClassDeclNode* = stmt as ClassDeclNode*;
+                    this.declare_async_methods(c.methods, c.generic_params,
+                        this.ctx.qualify_symbol_sym(c.name), no_aliases, null);
+                }
+                NodeKind::ImplementationBlock => {
+                    const ib: ImplBlockNode* = stmt as ImplBlockNode*;
+                    // Type resolution stamped the canonical target on the node;
+                    // the two other spellings it also registered the methods
+                    // under have to be repointed alongside it, or a call that
+                    // resolved through one of them keeps the old signature.
+                    const canonical: SymbolStr = if (ib.qualified_target_name.is_valid()) {
+                        ib.qualified_target_name
+                    } else { this.ctx.qualify_symbol_sym(ib.target_type) };
+                    mut aliases: SymbolStr[] = [ib.target_type,
+                                                this.ctx.qualify_symbol_sym(ib.target_type)];
+                    mut owner_params: GenericParamNode*[] = this.impl_owner_params(ib);
+                    this.declare_async_methods(ib.methods, owner_params,
+                                               canonical, aliases, ib);
+                }
+                _ => { }
+            }
+        }
+    }
+
+    /// Declare the future of every `async` method in one owner's method list.
+    ///
+    /// `owner_params` are the OWNER's generic parameters, which the future must
+    /// carry as well as the method's own; `qname` / `aliases` are the keys the
+    /// declaration index registered the methods' signatures under.
+    /// `impl_node` is the enclosing impl block when the owner is one (null
+    /// otherwise); a trait impl uses it to bind the trait's implicit
+    /// `<Method>Fut` associated type to the future each method lowers to.
+    declare_async_methods(mut &this, methods: &MethodNode*[],
+                          owner_params: &GenericParamNode*[],
+                          qname: SymbolStr, aliases: &SymbolStr[],
+                          impl_node: ImplBlockNode*) -> void {
+        if (!qname.is_valid()) { this.reject_undeclarable_async(methods, qname); return; }
+        const owner_ty: TypeRef = this.ctx.decl_index.lookup_type(qname);
+        if (!owner_ty.is_valid()) { this.reject_undeclarable_async(methods, qname); return; }
+        for (mut i: i64 = 0; i < methods.length; i++) {
+            const m: MethodNode* = methods[i];
+            if (m == null || m.func == null || m.func.body == null) { continue; }
+            if (!m.func.is_async) { continue; }
+            // Each override lowers to its OWN future struct, so they return
+            // different types and cannot share a vtable slot. Clearing the flag
+            // keeps the method compiling as an ordinary one instead of raising a
+            // second, less informative error from the lowering.
+            if (m.is_virtual || m.is_override) {
+                this.ctx.emit_error_at(ErrorCode::E0364_INVALID_ASYNC_MEMBER,
+                    "a `virtual` or `override` method cannot be `async`: each implementation returns its own future type, so the overrides have no common return type to dispatch through",
+                    m.func.span);
+                m.func.set_async(false);
+                continue;
+            }
+            mut own: AsyncOwner = AsyncOwner {
+                method: m,
+                ty: this.async_owner_instance(owner_ty, owner_params),
+                qname: qname,
+                alias_qnames: this.clone_symbols(aliases),
+                params: this.clone_generic_params(owner_params),
+                impl_node: impl_node,
+            };
+            this.async_lower.declare_method(own);
+        }
+    }
+
+    /// Report every `async` method of an owner whose type could not be resolved,
+    /// and clear the flag.
+    ///
+    /// Skipping quietly is what must not happen: an `async` method left
+    /// undeclared reaches `lower` with no pending record, and that fallback
+    /// declares it as a FREE function — where the body's `this` would silently
+    /// resolve to the generated future instead of the receiver.
+    reject_undeclarable_async(mut &this, methods: &MethodNode*[], qname: SymbolStr) -> void {
+        const owner: string = if (qname.is_valid()) { this.intern.resolve(qname) } else { "?" };
+        for (mut i: i64 = 0; i < methods.length; i++) {
+            const m: MethodNode* = methods[i];
+            if (m == null || m.func == null || !m.func.is_async) { continue; }
+            this.ctx.emit_error_at(ErrorCode::E0203_UNDEFINED_TYPE,
+                format("cannot resolve the owner type `%s` of `async` method `%s`, so its future cannot be declared",
+                       owner, this.intern.resolve(m.func.name)),
+                m.func.span);
+            m.func.set_async(false);
+        }
+    }
+
+    clone_symbols(&this, syms: &SymbolStr[]) -> SymbolStr[] {
+        mut out: SymbolStr[] = [];
+        for (mut i: i64 = 0; i < syms.length; i++) { out.push(syms[i]); }
+        return out;
+    }
+
+    /// The owner type as a method body sees `this`: the type itself, or the
+    /// template instantiated over its own parameters for a generic owner
+    /// (`Box<T>`), which is what the symbolic walk binds `this` to.
+    async_owner_instance(mut &this, base: TypeRef, params: &GenericParamNode*[]) -> TypeRef {
+        if (!base.is_valid() || params.length == 0) { return base; }
+        const t: Type* = this.arena.lookup(base.id);
+        if (t == null || t.kind == TypeKind::InstantiatedType) { return base; }
+        mut refs: TypeRef[] = TypeResolutionPasses::create_generic_param_types(params, this.arena);
+        const inst: TypeRef = this.arena.create_instantiation(base, &refs);
+        refs.drop();
+        return inst;
+    }
+
+    /// The generic parameters the OWNER of an impl block's methods actually has.
+    ///
+    /// An impl block on a generic template writes them on the TARGET
+    /// (`implement trait Sink for struct Buf<S>`), not on the block itself, so
+    /// `generic_params` is empty there while the method bodies may still mention
+    /// `S`. A future lowered from such a method has to be generic in `S` too: the
+    /// future's own impl block is what decides whether sema walks its `poll` body
+    /// symbolically, and a body walked concretely while an abstract projection
+    /// (`S::ReadFut::Output`) is still in it fails every check against that
+    /// projection instead of deferring until monomorphization resolves it.
+    impl_owner_params(mut &this, ib: ImplBlockNode*) -> GenericParamNode*[] {
+        if (ib.generic_params.length > 0) {
+            return this.clone_generic_params(ib.generic_params);
+        }
+        const greg: GenericRegistry* = this.ctx.generic_registry;
+        if (greg == null) { return []; }
+        // The canonical target first, then the written name qualified against
+        // the CURRENT module. The target is written bare (`BufStream`), so
+        // qualifying it here only finds the template when the impl block sits in
+        // the module that declares it; an impl written anywhere else missed,
+        // handed back no parameters, and left the future non-generic in `S`
+        // while the body still mentioned it. A sync method recovers `S` by
+        // another route, so only `async` ones failed.
+        mut tmpl: TemplateEntry* = null;
+        if (ib.qualified_target_name.is_valid()) {
+            tmpl = greg.get_template(ib.qualified_target_name);
+        }
+        if (tmpl == null) {
+            mut qualified: SymbolStr = ib.target_type;
+            const target_str: string = this.intern.resolve(ib.target_type);
+            if (!target_str.contains("::")) {
+                qualified = this.ctx.qualify_symbol_sym(ib.target_type);
+            }
+            tmpl = greg.get_template(qualified);
+        }
+        if (tmpl == null || tmpl.ast_node == null) { return []; }
+        if (tmpl.node_kind == NodeKind::StructDeclaration) {
+            return this.clone_generic_params((tmpl.ast_node as StructDeclNode*).generic_params);
+        }
+        if (tmpl.node_kind == NodeKind::ClassDeclaration) {
+            return this.clone_generic_params((tmpl.ast_node as ClassDeclNode*).generic_params);
+        }
+        if (tmpl.node_kind == NodeKind::EnumDeclaration) {
+            return this.clone_generic_params((tmpl.ast_node as EnumDeclNode*).generic_params);
+        }
+        if (tmpl.node_kind == NodeKind::UnionDeclaration) {
+            return this.clone_generic_params((tmpl.ast_node as UnionDeclNode*).generic_params);
+        }
+        return [];
+    }
+
+    clone_generic_params(&this, params: &GenericParamNode*[]) -> GenericParamNode*[] {
+        mut out: GenericParamNode*[] = [];
+        for (mut i: i64 = 0; i < params.length; i++) { out.push(params[i]); }
+        return out;
     }
 
     /// Dispatch a top-level node, swapping to the template's module/namespace
@@ -261,7 +464,16 @@ public:
     override visit(mut &this, node: FunctionDeclNode*) -> void {
         if (node.body == null) { return; }
         if (node.is_generic()) {
+            // A generic body is typed by the symbolic walk, against abstract
+            // parameter refs. An `async function`'s state machine is then built
+            // from the resolved types that walk leaves on the body, and the
+            // future it produces is generic in the same parameters, so the
+            // monomorphizer specializes it from the same demand that specializes
+            // the function.
             this.symbolic_check_body(node, TypeRef::invalid(), TypeRef::invalid());
+            if (node.is_async) {
+                this.async_lower.lower(node);
+            }
             return;
         }
         this.member.check_annotation_visibility(node.return_type_annotation);
@@ -275,15 +487,18 @@ public:
         this.state.body_count += 1;
         this.check_function_returns(node);
         this.check_opaque_return_item(node);
+        // Lower an `async function` into a Future state machine AFTER its body is
+        // typed against the declared Output type. The generic case returned above.
+        if (node.is_async) {
+            this.async_lower.lower(node);
+        }
     }
 
     override visit(mut &this, node: StructDeclNode*) -> void {
         if (node.is_generic()) {
-            if (this.sema_symbolic_check_enabled()) {
-                const sym: SymbolStr = this.ctx.qualify_symbol_sym(node.name);
-                const ty: TypeRef = this.ctx.decl_index.lookup_type(sym);
-                this.symbolic_check_owner_methods(node.methods, ty, node.generic_params);
-            }
+            const sym: SymbolStr = this.ctx.qualify_symbol_sym(node.name);
+            const ty: TypeRef = this.ctx.decl_index.lookup_type(sym);
+            this.symbolic_check_owner_methods(node.methods, ty, node.generic_params);
             return;
         }
         const qualified_sym: SymbolStr = this.ctx.qualify_symbol_sym(node.name);
@@ -293,11 +508,9 @@ public:
 
     override visit(mut &this, node: UnionDeclNode*) -> void {
         if (node.is_generic()) {
-            if (this.sema_symbolic_check_enabled()) {
-                const sym: SymbolStr = this.ctx.qualify_symbol_sym(node.name);
-                const ty: TypeRef = this.ctx.decl_index.lookup_type(sym);
-                this.symbolic_check_owner_methods(node.methods, ty, node.generic_params);
-            }
+            const sym: SymbolStr = this.ctx.qualify_symbol_sym(node.name);
+            const ty: TypeRef = this.ctx.decl_index.lookup_type(sym);
+            this.symbolic_check_owner_methods(node.methods, ty, node.generic_params);
             return;
         }
         const qualified_sym: SymbolStr = this.ctx.qualify_symbol_sym(node.name);
@@ -307,11 +520,9 @@ public:
 
     override visit(mut &this, node: ClassDeclNode*) -> void {
         if (node.is_generic()) {
-            if (this.sema_symbolic_check_enabled()) {
-                const sym: SymbolStr = this.ctx.qualify_symbol_sym(node.name);
-                const ty: TypeRef = this.ctx.decl_index.lookup_type(sym);
-                this.symbolic_check_owner_methods(node.methods, ty, node.generic_params);
-            }
+            const sym: SymbolStr = this.ctx.qualify_symbol_sym(node.name);
+            const ty: TypeRef = this.ctx.decl_index.lookup_type(sym);
+            this.symbolic_check_owner_methods(node.methods, ty, node.generic_params);
             return;
         }
         const qualified_sym: SymbolStr = this.ctx.qualify_symbol_sym(node.name);
@@ -330,9 +541,8 @@ public:
             // in its body; that has to be walked SYMBOLICALLY (in_symbolic_check),
             // exactly like a struct/impl generic method (visit_methods), so the
             // arms are deferred to monomorphization instead of tripping E0645
-            // ("static match outside a generic context").  symbolic_check_body
-            // is a no-op when the symbolic check is disabled; mono then checks
-            // the concrete body.  Non-generic defaults keep the plain walk.
+            // ("static match outside a generic context").  Non-generic defaults
+            // keep the plain walk.
             if (func.is_generic()) {
                 this.symbolic_check_body(func, this_placeholder, this_placeholder);
                 continue;
@@ -345,13 +555,11 @@ public:
 
     override visit(mut &this, node: ImplBlockNode*) -> void {
         if (node.is_generic()) {
-            if (this.sema_symbolic_check_enabled()) {
-                const impl_target: TypeRef = this.types.lookup_type_by_sym(node.target_type);
-                const saved_impl: ImplBlockNode* = this.state.symbolic_impl_node;
-                this.state.symbolic_impl_node = node;
-                this.symbolic_check_owner_methods(node.methods, impl_target, node.generic_params);
-                this.state.symbolic_impl_node = saved_impl;
-            }
+            const impl_target: TypeRef = this.types.lookup_type_by_sym(node.target_type);
+            const saved_impl: ImplBlockNode* = this.state.symbolic_impl_node;
+            this.state.symbolic_impl_node = node;
+            this.symbolic_check_owner_methods(node.methods, impl_target, node.generic_params);
+            this.state.symbolic_impl_node = saved_impl;
             return;
         }
         const greg: GenericRegistry* = this.ctx.generic_registry;
@@ -361,7 +569,52 @@ public:
             if (!target_str.contains("::")) {
                 qualified_target = this.ctx.qualify_symbol_sym(node.target_type);
             }
-            if (greg.get_template(qualified_target) != null) { return; }
+            const tmpl: TemplateEntry* = greg.get_template(qualified_target);
+            if (tmpl != null) {
+                // BARE impl block on a GENERIC TEMPLATE target, e.g.
+                // `implement trait Sink for struct Buf` where `Buf` is declared
+                // `Buf<A = Tag>`.  `is_generic()` is false (the impl block itself
+                // has no `<...>`), so the generic path above was skipped - but the
+                // concrete path below cannot type-check it either, because the
+                // target is still a template.  This used to just `return`, which
+                // meant the method bodies were NEVER WALKED BY SEMA AT ALL.
+                //
+                // That silently broke method-generic calls inside such a body:
+                // `resolve_method_call`'s stash (`call.set_resolved_type_args`) is
+                // the ONLY producer of method-spec demand, mono consumes it and
+                // bails when it is absent (`call_specializer` "outside sema's
+                // visibility"), so `this.accum(Unit{...})` was left unspecialized
+                // and codegen failed with E0636.  It only APPEARED order-dependent:
+                // codegen has a name-based `Type::method` fallback, so the program
+                // compiled if some unrelated call had already materialized that
+                // method spec under the same name.  Verified by probe: this bail
+                // fires in BOTH the failing and the "working" variant.
+                //
+                // Walk the bodies symbolically instead, using the TEMPLATE's own
+                // generic params (the impl block has none of its own) so the
+                // receiver reads as a generic owner and the stash is produced
+                // independently of any other call site.
+                if (tmpl.ast_node != null) {
+                    const owner_ty: TypeRef = this.types.lookup_type_by_sym(node.target_type);
+                    const saved_impl: ImplBlockNode* = this.state.symbolic_impl_node;
+                    this.state.symbolic_impl_node = node;
+                    if (tmpl.node_kind == NodeKind::StructDeclaration) {
+                        this.symbolic_check_owner_methods(node.methods, owner_ty,
+                            (tmpl.ast_node as StructDeclNode*).generic_params);
+                    } else if (tmpl.node_kind == NodeKind::ClassDeclaration) {
+                        this.symbolic_check_owner_methods(node.methods, owner_ty,
+                            (tmpl.ast_node as ClassDeclNode*).generic_params);
+                    } else if (tmpl.node_kind == NodeKind::EnumDeclaration) {
+                        this.symbolic_check_owner_methods(node.methods, owner_ty,
+                            (tmpl.ast_node as EnumDeclNode*).generic_params);
+                    } else if (tmpl.node_kind == NodeKind::UnionDeclaration) {
+                        this.symbolic_check_owner_methods(node.methods, owner_ty,
+                            (tmpl.ast_node as UnionDeclNode*).generic_params);
+                    }
+                    this.state.symbolic_impl_node = saved_impl;
+                }
+                return;
+            }
         }
         const impl_this: TypeRef = this.types.lookup_type_by_sym(node.target_type);
         this.check_assoc_decl_bounds(node, impl_this);
@@ -375,13 +628,27 @@ public:
             if (method == null || method.func == null || method.func.body == null) { continue; }
             if (method.func.is_generic()) {
                 const sym_this: TypeRef = if (method.is_static) { TypeRef::invalid() } else { owner_type };
+                // Same shape as the free-function case: the walk types the body,
+                // and an `async` one's state machine is then built from what it
+                // left there.  `begin_body_check` lends the declared Output back
+                // for the walk and is a no-op for anything not a pending `async`
+                // method.
+                const displaced: TypeRef = this.async_lower.begin_body_check(method.func);
                 this.symbolic_check_body(method.func, sym_this, owner_type);
+                this.async_lower.end_body_check(method.func, displaced);
+                if (method.func.is_async) {
+                    this.async_lower.lower(method.func);
+                }
                 continue;
             }
             if (method.func.is_self_returning_default) { continue; }
             const method_this: TypeRef = if (method.is_static) { TypeRef::invalid() } else { owner_type };
             const saved_owner: TypeRef = this.state.current_owner_type;
             this.state.current_owner_type = owner_type;
+            // An `async` method's node already carries its FUTURE type, so
+            // callers typed before it resolve correctly; its own body is still
+            // checked against the declared Output.
+            const displaced: TypeRef = this.async_lower.begin_body_check(method.func);
             this.enter_function(method.func, method_this);
             if (method.is_constructor && method.has_base_ctor()) {
                 for (mut k: i64 = 0; k < method.base_ctor_args.length; k++) {
@@ -393,6 +660,10 @@ public:
             if (!method.is_constructor && !method.is_destructor) {
                 this.check_function_returns(method.func);
             }
+            this.async_lower.end_body_check(method.func, displaced);
+            // Lower AFTER the body is typed against the declared Output type,
+            // exactly as `visit(FunctionDeclNode*)` does for a free function.
+            if (method.func.is_async) { this.async_lower.lower(method.func); }
             this.state.current_owner_type = saved_owner;
         }
     }
@@ -437,8 +708,18 @@ public:
 
     // -- Symbolic generic-body walk drivers (drive visit(body); stay here) --
 
-    symbolic_check_body(mut &this, func: FunctionDeclNode*, this_type: TypeRef, owner_type: TypeRef) -> void {
-        if (!this.sema_symbolic_check_enabled()) { return; }
+    /// Type-check one generic body against abstract parameter refs.
+    ///
+    /// This is the ONLY pass that types a generic template body, and what it
+    /// leaves on that body is load-bearing twice over: it reports, ahead of any
+    /// instantiation, errors the body would produce, AND it is the resolution
+    /// monomorphization and codegen consume downstream — a where-bound call in a
+    /// template (`value.hash(&h)` in `digest<T>`) reaches codegen with no
+    /// resolved callee if the body was never walked, and lowering a generic
+    /// `async function` builds its state machine out of these very types. So the
+    /// walk is unconditional; it is not a diagnostic add-on to be switched off.
+    symbolic_check_body(mut &this, func: FunctionDeclNode*, this_type: TypeRef,
+                        owner_type: TypeRef) -> void {
         if (func == null || func.body == null) { return; }
         const sink: DiagnosticSink* = this.ctx.diagnostics;
         if (sink == null) { return; }
@@ -488,9 +769,11 @@ public:
         this.state.symbolic_total_would_emit += sink.errors_since(snap) as i64;
     }
 
+    /// Walk every method body of a GENERIC owner symbolically.  A method on a
+    /// generic owner reaches sema only here, so this is also where an `async` one
+    /// is lowered, off the types the walk leaves on its body.
     symbolic_check_owner_methods(mut &this, methods: &MethodNode*[], owner_type: TypeRef,
                                  owner_params: &GenericParamNode*[]) -> void {
-        if (!this.sema_symbolic_check_enabled()) { return; }
         const saved_owner_generic: boolean = this.state.symbolic_owner_is_generic;
         mut saved_owner_params: u32[] = [];
         mut saved_owner_nodes: GenericParamNode*[] = [];
@@ -510,7 +793,15 @@ public:
             if (method == null || method.func == null || method.func.body == null) { continue; }
             if (method.func.is_self_returning_default) { continue; }
             const sym_this: TypeRef = if (method.is_static) { TypeRef::invalid() } else { owner_type };
+            // A method on a GENERIC owner reaches sema only here, whether or not
+            // it has generic parameters of its own — so this is where an `async`
+            // one is lowered, off the types the walk just left on its body.
+            const displaced: TypeRef = this.async_lower.begin_body_check(method.func);
             this.symbolic_check_body(method.func, sym_this, owner_type);
+            this.async_lower.end_body_check(method.func, displaced);
+            if (method.func.is_async) {
+                this.async_lower.lower(method.func);
+            }
         }
         swap(&this.state.symbolic_owner_param_ids, &saved_owner_params);
         swap(&this.state.symbolic_owner_param_nodes, &saved_owner_nodes);
@@ -519,6 +810,27 @@ public:
 
 
     // -- Per-function frame setup --
+
+    /// Module the body currently being checked was written in.
+    ///
+    /// Type annotations inside a body mean what that body's OWN module says.
+    /// Inside a method that is the owner's module - and the owner is what makes
+    /// this differ from the module being compiled, because a specialized method
+    /// body is re-checked while the walk sits in the module that demanded the
+    /// specialization.  Outside a method there is no owner and the module being
+    /// compiled is the right answer.
+    body_home_module(&this) -> string {
+        const owner_ns: string = this.arena.module_ns_of(this.state.current_owner_type);
+        if ((owner_ns.length() as i64) > 0) { return owner_ns; }
+        return this.ctx.namespace_display();
+    }
+
+    /// A resolution context for annotations written in the body being checked.
+    body_res_ctx(&this) -> ResolutionContext {
+        mut rc: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
+        rc.set_home_module(this.body_home_module());
+        return rc;
+    }
 
     enter_function(mut &this, func: FunctionDeclNode*, fn_this_type: TypeRef) -> void {
         this.state.locals         = HashMap<u32, TypeRef>::new();
@@ -530,9 +842,12 @@ public:
         this.state.undo_kw_spans  = [];
         this.state.return_type     = func.resolved_return_type;
         this.state.return_type_ann = func.return_type_annotation;
+        this.state.async_poll_output = this.async_poll_output_of(func);
         this.state.this_type       = fn_this_type;
         this.state.this_is_mut = false;
         this.state.payload_binding_ids = [];
+        this.state.alias_binding_ids = [];
+        this.state.this_is_by_ref = false;
         this.state.param_ids = [];
         this.state.in_lambda_depth     = 0;
         this.state.lambda_outer_locals = HashMap<u32, TypeRef>::new();
@@ -551,6 +866,7 @@ public:
             const param_name: string = this.intern.resolve(param.name);
             if (param_name == "&this") {
                 this.state.this_is_mut = param.is_mutable;
+                this.state.this_is_by_ref = true;
             } else {
                 this.scopes.register_local_with_mut(param.name, ty, param.is_mutable);
                 this.scopes.record_local_kw_span(param.name, param.kw_span);
@@ -675,9 +991,9 @@ public:
     }
 
     override visit(mut &this, node: BreakStmtNode*) -> void {
-        if (this.state.loop_depth == 0 && this.state.switch_depth == 0) {
+        if (this.state.loop_depth == 0) {
             this.ctx.emit_error_at(ErrorCode::E0400_INVALID_BREAK,
-                "`break` outside of a loop or switch", node.span);
+                "`break` outside of a loop", node.span);
         }
     }
 
@@ -718,15 +1034,13 @@ public:
     }
 
     override visit(mut &this, node: MatchStmtNode*) -> void {
-        const saved_rms: boolean = this.state.resolving_match_subject;
-        this.state.resolving_match_subject = true;
         const subject_type: TypeRef = this.resolve_expr(node.subject);
-        this.state.resolving_match_subject = saved_rms;
+        const caller_backed: boolean = this.subject_is_caller_backed(node.subject);
         for (mut i: i64 = 0; i < node.arms.length; i++) {
             const arm: MatchArmNode* = node.arms[i];
             if (arm == null) { continue; }
             const save: i64 = this.scopes.save_scope();
-            this.patterns.bind_arm_patterns(arm, subject_type);
+            this.patterns.bind_arm_patterns(arm, subject_type, caller_backed);
             if (arm.guard != null) { this.resolve_expr(arm.guard); }
             if (arm.body != null) { this.dispatch_stmt(arm.body); }
             this.scopes.restore_scope(save);
@@ -769,19 +1083,6 @@ public:
         }
     }
 
-    override visit(mut &this, node: SwitchStmtNode*) -> void {
-        const subject_type: TypeRef = this.resolve_expr(node.expression);
-        this.state.switch_depth += 1;
-        for (mut i: i64 = 0; i < node.cases.length; i++) {
-            const cs: CaseStmtNode* = node.cases[i];
-            if (cs == null) { continue; }
-            if (cs.value != null) { this.resolve_expr(cs.value); }
-            if (cs.body != null)  { this.visit(cs.body); }
-        }
-        this.state.switch_depth -= 1;
-        this.check_switch_applicable(node, subject_type);
-    }
-
     override visit(mut &this, node: DeclStmtNode*) -> void {
         if (node.declaration == null) { return; }
         const decl: ASTNode* = node.declaration;
@@ -809,7 +1110,7 @@ public:
 
         if (!var_node.has_resolved_type() && var_node.type_annotation != null && this.ctx.type_resolver != null) {
             this.prime_typeof_annotation(var_node.type_annotation);
-            mut res_ctx: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
+            mut res_ctx: ResolutionContext = this.body_res_ctx();
             this.symbolic.symbolic_bind_params(&res_ctx);
             const vtype: TypeRef = this.ctx.type_resolver.resolve(var_node.type_annotation, &res_ctx);
             if (vtype.is_valid()) { var_node.resolved_type = vtype; }
@@ -947,7 +1248,7 @@ public:
 
     override visit(mut &this, node: DestructureDeclNode*) -> void {
         if (!node.has_resolved_type() && node.type_annotation != null && this.ctx.type_resolver != null) {
-            mut res_ctx: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
+            mut res_ctx: ResolutionContext = this.body_res_ctx();
             this.symbolic.symbolic_bind_params(&res_ctx);
             const ttype: TypeRef = this.ctx.type_resolver.resolve(node.type_annotation, &res_ctx);
             if (ttype.is_valid()) { node.resolved_type = ttype; }
@@ -1129,10 +1430,48 @@ public:
             }
             NodeKind::TryExpression     => { this.resolve_try_expr(expr as TryExprNode*) }
             NodeKind::LambdaExpression  => { this.lambda.resolve_lambda(this, expr as LambdaExprNode*) }
+            NodeKind::AwaitExpression   => { this.resolve_await(expr as AwaitExprNode*) }
             _ => { TypeRef::invalid() }
         };
         if (result.is_valid()) { expr.set_resolved_type(result); }
         return result;
+    }
+
+    /// Type an `await e`: `e` must be a `Future`, and the await evaluates to
+    /// that future's `Output` associated type. Projecting `F::Output` here (a)
+    /// types the body before `AsyncLower` runs so `const v = await e;` binds `v`
+    /// at the right type, and (b) leaves the projected type cached on the node
+    /// so the lowering can read the awaited future type (`operand`) and its
+    /// result type (this node) without re-projecting.
+    resolve_await(mut &this, node: AwaitExprNode*) -> TypeRef {
+        if (node == null || node.operand == null) { return TypeRef::invalid(); }
+        const fut_ty: TypeRef = this.resolve_expr(node.operand);
+        if (!fut_ty.is_valid()) { return TypeRef::invalid(); }
+        if (this.ctx.type_resolver == null) { return TypeRef::invalid(); }
+        const out_sym: SymbolStr = this.intern.intern("Output");
+        mut rc: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
+        const out_ty: TypeRef = this.ctx.type_resolver.resolve_concrete_member(fut_ty, out_sym, &rc);
+        if (out_ty.is_valid()) { return out_ty; }
+        // An operand typed by an associated-type projection (`s.read(n)` typed
+        // `S::ReadFut` inside a generic body) has no impl to read a binding from
+        // yet. Its Output is the nested projection `(S::ReadFut)::Output` —
+        // abstract, but precisely what monomorphization reduces once `S` is
+        // bound, and the lowering needs a valid type to build the frame field
+        // from. Restricted to the symbolic walk: a CONCRETE operand that fails
+        // the lookup genuinely does not implement `Future` and must still be
+        // diagnosed below.
+        if (this.state.in_symbolic_check && this.arena.contains_generic_param(fut_ty)) {
+            const sym_out: TypeRef = this.ctx.type_resolver.project_member(fut_ty, out_sym, &rc);
+            if (sym_out.is_valid()) { return sym_out; }
+        }
+        if (!out_ty.is_valid()) {
+            const disp: string = this.arena.resolve_display_name(fut_ty.id);
+            this.ctx.emit_error_at(ErrorCode::E0306_TRAIT_BOUND_NOT_SATISFIED,
+                format("`await` requires an expression whose type implements `Future`; `%s` does not", disp),
+                node.span);
+            return TypeRef::invalid();
+        }
+        return out_ty;
     }
 
 
@@ -1704,6 +2043,14 @@ public:
         if (!cast.has_resolved_target() && cast.target_annotation != null && this.ctx.type_resolver != null) {
             this.prime_typeof_annotation(cast.target_annotation);
             mut res_ctx: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
+            // Bind the enclosing generic's type parameters so a cast target like
+            // `x as T` resolves `T` to the abstract method/owner type parameter,
+            // not a same-named global type in another module.  Without this an
+            // innocent user `type struct T` shadows the parameter of any pulled
+            // generic (e.g. stdlib `RandomSource::next_range<T>`), turning
+            // `<scalar> as T` into an aggregate cast -> spurious E0208.  Mirrors
+            // the identical bind at the var-decl / other cast/annotation sites.
+            this.symbolic.symbolic_bind_params(&res_ctx);
             const target: TypeRef = this.ctx.type_resolver.resolve(cast.target_annotation, &res_ctx);
             if (target.is_valid()) { cast.set_resolved_target(target); }
         }
@@ -1747,10 +2094,38 @@ public:
         return (f_agg && t_scl) || (f_scl && t_agg);
     }
 
+    /// Arms of a value-producing branch have to agree on a type.  Neither arm is
+    /// the "expected" one, so compatibility is tested in both directions and only
+    /// a pair that is incompatible each way reports; a diverging arm carries
+    /// `Never`, which coerces to anything and therefore never fires here.
+    /// Without this check the resolver returns whichever arm happens to type
+    /// first, so arms of unrelated types (`char` vs `i8`) reach codegen and the
+    /// result is read at the wrong width.
+    check_branch_agreement(mut &this, first: TypeRef, first_span: SourceSpan,
+                           second: TypeRef, second_span: SourceSpan,
+                           context_msg: string) -> void {
+        if (!first.is_valid() || !second.is_valid()) { return; }
+        if (first.id == second.id) { return; }
+        // Inside a generic template an arm's type can still be a bare parameter
+        // or an unresolved projection; agreement is only decidable per
+        // instantiation, so defer exactly as the return-type check does.
+        if (this.symbolic.type_has_unresolved_projection(first)
+                || this.symbolic.type_has_unresolved_projection(second)
+                || this.symbolic.symbolic_defer_type(first)
+                || this.symbolic.symbolic_defer_type(second)) { return; }
+        if (this.checker.check_compatibility(first, second) != TypeCompatibility::Incompatible) { return; }
+        if (this.checker.check_compatibility(second, first) != TypeCompatibility::Incompatible) { return; }
+        this.diag.emit_type_mismatch(ErrorCode::E0238_BRANCH_TYPE_MISMATCH,
+            second_span, first, second, context_msg, first_span);
+    }
+
     resolve_if_expr(mut &this, if_expr: IfExprNode*) -> TypeRef {
         this.resolve_expr(if_expr.condition);
         const then_type: TypeRef = this.resolve_expr(if_expr.then_expr);
         const else_type: TypeRef = this.resolve_expr(if_expr.else_expr);
+        this.check_branch_agreement(then_type, if_expr.then_expr.span,
+            else_type, if_expr.else_expr.span,
+            "both branches of an `if` expression must produce the same type");
         if (then_type.is_valid()) { return then_type; }
         if (else_type.is_valid()) { return else_type; }
         return TypeRef::invalid();
@@ -1760,24 +2135,26 @@ public:
         this.resolve_expr(ternary.condition);
         const true_type: TypeRef = this.resolve_expr(ternary.true_expr);
         const false_type: TypeRef = this.resolve_expr(ternary.false_expr);
+        this.check_branch_agreement(true_type, ternary.true_expr.span,
+            false_type, ternary.false_expr.span,
+            "both arms of a conditional expression must produce the same type");
         if (true_type.is_valid()) { return true_type; }
         if (false_type.is_valid()) { return false_type; }
         return TypeRef::invalid();
     }
 
     resolve_match_expr(mut &this, match_expr: MatchExprNode*) -> TypeRef {
-        const saved_rms: boolean = this.state.resolving_match_subject;
-        this.state.resolving_match_subject = true;
         const subject_type: TypeRef = this.resolve_expr(match_expr.subject);
-        this.state.resolving_match_subject = saved_rms;
+        const caller_backed: boolean = this.subject_is_caller_backed(match_expr.subject);
         this.patterns.check_duplicate_default_arm(match_expr.arms);
         const outer_expected: TypeRef = this.state.expected_type;
         mut result_type: TypeRef = TypeRef::invalid();
+        mut result_span: SourceSpan = match_expr.span;
         for (mut i: i64 = 0; i < match_expr.arms.length; i++) {
             const arm: MatchArmNode* = match_expr.arms[i];
             if (arm == null || arm.body == null) { continue; }
             const save: i64 = this.scopes.save_scope();
-            this.patterns.bind_arm_patterns(arm, subject_type);
+            this.patterns.bind_arm_patterns(arm, subject_type, caller_backed);
             if (arm.guard != null) { this.resolve_expr(arm.guard); }
             const body_node: ASTNode* = arm.body as ASTNode*;
             if (body_node.kind == NodeKind::BlockStatement) {
@@ -1788,12 +2165,20 @@ public:
                     this.dispatch_stmt(block.statements[j]);
                     if (j == last_idx) { this.state.expected_type = outer_expected; }
                 }
-                if (!result_type.is_valid() && block.statements.length > 0) {
+                if (block.statements.length > 0) {
                     const last: StatementNode* = block.statements[block.statements.length - 1];
                     if ((last as ASTNode*).kind == NodeKind::ExpressionStatement) {
                         const es: ExprStmtNode* = last as ExprStmtNode*;
                         if (es.expression != null && es.expression.has_resolved_type()) {
-                            result_type = es.expression.resolved_type;
+                            const arm_type: TypeRef = es.expression.resolved_type;
+                            if (!result_type.is_valid()) {
+                                result_type = arm_type;
+                                result_span = es.expression.span;
+                            } else {
+                                this.check_branch_agreement(result_type, result_span,
+                                    arm_type, es.expression.span,
+                                    "every arm of a `match` expression must produce the same type");
+                            }
                         }
                     }
                 }
@@ -1921,6 +2306,44 @@ public:
         return save;
     }
 
+    /// `Poll::Ready(value)`, typed as `poll_out`. Mirrors the wrapper the async
+    /// lowering puts on every `return` it moves into a `poll` body.
+    make_poll_ready(&this, value: ExpressionNode*, poll_out: TypeRef,
+                    span: SourceSpan) -> ExpressionNode* {
+        mut scope: ScopeResolutionNode* = new ScopeResolutionNode(
+            this.intern.intern("Poll"), this.intern.intern("Ready"), span);
+        scope.set_resolved_type(poll_out);
+        mut call: CallExprNode* = new CallExprNode(scope as ExpressionNode*, span);
+        call.add_argument(value);
+        call.set_resolved_type(poll_out);
+        return call as ExpressionNode*;
+    }
+
+    /// `func`'s Output if it is the `poll` an `async fn` was lowered into,
+    /// otherwise invalid.
+    ///
+    /// The lowering moves the async function's own statements into this body, so
+    /// a construct whose legality depends on the enclosing return type — `?` —
+    /// must be judged against what the source function returned. Identified by
+    /// the three marks `declare` puts on the generated method (a synthesized
+    /// body, `Future`'s `poll`), never by shape alone: a hand-written
+    /// `-> Poll<Result<..>>` is a real function and keeps the ordinary rule.
+    async_poll_output_of(&this, func: FunctionDeclNode*) -> TypeRef {
+        if (func == null) { return TypeRef::invalid(); }
+        if (!func.is_synthesized_body) { return TypeRef::invalid(); }
+        if (!func.origin_trait.equals(this.intern.intern("Future"))) { return TypeRef::invalid(); }
+        if (!func.name.equals(this.intern.intern("poll"))) { return TypeRef::invalid(); }
+        // Read the Output off `Poll::Ready`'s payload rather than the return
+        // type's generic argument: once monomorphization has specialized it,
+        // `Poll<Output>` is a plain enum with no instantiation left to peel.
+        const e: Type* = this.types.unwrap_to_enum(func.resolved_return_type);
+        if (e == null || e.kind != TypeKind::Enum) { return TypeRef::invalid(); }
+        const et: EnumType* = e as EnumType*;
+        const ready: EnumVariantInfo* = et.get_variant(this.intern.intern("Ready"));
+        if (ready == null || ready.payload_types.length != 1) { return TypeRef::invalid(); }
+        return ready.payload_types[0];
+    }
+
     enum_try_shape(&this, ty: TypeRef) -> i32 {
         mut e: Type* = this.types.unwrap_to_enum(ty);
         if (e == null) {
@@ -1972,6 +2395,14 @@ public:
         } else {
             ret_value = new ScopeResolutionNode(enum_name, err_variant, span) as ExpressionNode*;
         }
+        // Inside the `poll` an `async fn` was lowered into, every `return`
+        // carries `Poll::Ready(...)`. The lowering wrapped the returns it could
+        // see, but this desugar is built after it ran — a `?` in a GENERIC body
+        // can only be shaped once its operand's `Result`/`Option` type is
+        // concrete, which is after specialization — so it wraps its own.
+        if (this.state.async_poll_output.is_valid()) {
+            ret_value = this.make_poll_ready(ret_value, this.state.return_type, span);
+        }
         mut err_arm: MatchArmNode* = new MatchArmNode(span);
         err_arm.add_pattern(err_pat as PatternNode*);
         const ret_stmt: ReturnStmtNode* = new ReturnStmtNode(ret_value, span);
@@ -1983,10 +2414,22 @@ public:
     }
 
     resolve_try_expr(mut &this, node: TryExprNode*) -> TypeRef {
+        // The operand is resolved on EVERY visit, including one that reuses an
+        // existing desugar: call-specialization and dispatch annotation both
+        // walk `operand` (never `desugared`), so a specialization whose operand
+        // went unresolved here reaches codegen with an unresolvable call.
         const saved_expected: TypeRef = this.state.expected_type;
         this.state.expected_type = TypeRef::invalid();
         const operand_type: TypeRef = this.resolve_expr(node.operand);
         this.state.expected_type = saved_expected;
+
+        // Already desugared: that desugar IS the expression from here on, and it
+        // is kept rather than rebuilt — the async lowering has since rewritten
+        // it in place (awaits hoisted out, `return`s wrapped in `Poll::Ready`,
+        // bindings alpha-renamed), and a fresh one would throw all of that away.
+        // Re-resolving it re-derives the types a specialization clone dropped.
+        if (node.desugared != null) { return this.resolve_expr(node.desugared); }
+
         if (!operand_type.is_valid()) { return TypeRef::invalid(); }
 
         const operand_shape: i32 = this.enum_try_shape(operand_type);
@@ -1998,9 +2441,22 @@ public:
                 format("the `?` operator requires a `Result` or `Option` value, but the operand has type '%s'", disp), node.span);
             return TypeRef::invalid();
         }
-        const fn_shape: i32 = this.enum_try_shape(this.state.return_type);
+        // Inside a lowered `poll`, the async function's Output is what `?`
+        // propagates out of; everywhere else it is the function's own return.
+        const fn_ret: TypeRef = if (this.state.async_poll_output.is_valid()) {
+            this.state.async_poll_output
+        } else { this.state.return_type };
+        const fn_shape: i32 = this.enum_try_shape(fn_ret);
         if (fn_shape != operand_shape) {
-            if (this.symbolic.symbolic_type_unresolved(this.state.return_type)
+            // A return type that still mentions an abstract parameter cannot
+            // settle this. An `async` trait default body is walked once with its
+            // return type ALREADY rewritten to the future it lowers to
+            // (`This::…Fut`), before the walk that sees the declared output, and
+            // judging a `?` against the future would reject every one of them.
+            // Deferring is what the shape check does with any not-yet-concrete
+            // type — the concrete walk is where a `?` can be shaped at all.
+            if (this.arena.contains_generic_param(fn_ret)) { return TypeRef::invalid(); }
+            if (this.symbolic.symbolic_type_unresolved(fn_ret)
                     || this.symbolic.symbolic_type_unresolved(operand_type)) {
                 return TypeRef::invalid();
             }
@@ -2021,18 +2477,89 @@ public:
         return this.resolve_expr(desugared as ExpressionNode*);
     }
 
+    /// Resolve a struct/union/class literal's TYPE through the SAME canonical path
+    /// a type ANNOTATION uses - `instantiate_for_module`, exactly as `resolve()`
+    /// does for `x as Foo<Args>`.  ONE resolution authority: a `Foo<Args> {}`
+    /// literal denotes the same canonical TypeID as the annotation `Foo<Args>`, so
+    /// `return NonNull<U> {}` matches its declared `-> NonNull<U>` by identity - no
+    /// name-lookup that races spec registration.  Fires ONLY when every arg
+    /// resolves CONCRETE: an abstract arg (`Pair<T, V>` in a template body, or an
+    /// unresolved method generic) would materialize a `Foo<?>` instantiation that
+    /// GenericValidation flags (E0900), so those return invalid and the caller
+    /// keeps the demand-free name-based path.
+    resolve_struct_literal_type(mut &this, lit: StructLiteralNode*) -> TypeRef {
+        if (this.ctx.type_resolver == null || this.ctx.generic_registry == null
+                || lit.generic_args.length == 0) {
+            return TypeRef::invalid();
+        }
+        const base_ref: TypeRef = this.types.lookup_type_by_sym(lit.struct_type);
+        if (!base_ref.is_valid()) { return TypeRef::invalid(); }
+        if (this.ctx.generic_registry.get_template_by_type_id(base_ref.id) == null) {
+            return TypeRef::invalid();
+        }
+        mut rc: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
+        // Inside a template body the args may name the enclosing generic
+        // parameters, which resolve only against their bindings; binding them also
+        // marks the context demand-free, so an abstract instantiation registers no
+        // monomorphization demand. Outside the symbolic walk this is a no-op.
+        this.symbolic.symbolic_bind_params(&rc);
+        mut arg_refs: TypeRef[] = [];
+        for (mut i: i64 = 0; i < lit.generic_args.length; i++) {
+            const a: TypeRef = this.ctx.type_resolver.resolve(lit.generic_args[i], &rc);
+            if (!a.is_valid()) { return TypeRef::invalid(); }
+            arg_refs.push(a);
+        }
+        // Demand-FREE: return the canonical arena slot for (base, args) - the SAME
+        // slot the annotation `Foo<Args>` minted and demanded.  The literal only
+        // REFERENCES the type; its monomorphization demand comes from the declared
+        // type it flows into.  Adding a fresh demand here (instantiate_for_module)
+        // perturbs the mono worklist and can strand a sibling method spec's owner
+        // binding (an Option::Some payload lost its instantiation).
+        // create_instantiation dedups by (base, arg ids), so this is the concrete
+        // post-swap slot on a cache hit.
+        //
+        // An arg that mentions a generic parameter yields the template-internal
+        // instantiation (`Foo<T>`), which is what the literal denotes inside a
+        // template body and what specialization rewrites.  Falling back to the bare
+        // base instead would erase the arguments: a consumer reading the literal's
+        // type directly would see `Foo`, and a type built from it (`Option<Foo>`)
+        // mentions no parameter at all, so specialization leaves it untouched.
+        return this.arena.create_instantiation(base_ref, &arg_refs);
+    }
+
     resolve_struct_literal(mut &this, lit: StructLiteralNode*) -> TypeRef {
         this.member.check_type_name_visibility(lit.struct_type, (lit as ASTNode*).span);
         mut struct_ref: TypeRef = TypeRef::invalid();
+        // Name-based lookup FIRST: for a literal whose spec is already registered
+        // (the common case) this is a pure lookup with no side effects.
         if (lit.generic_args.length > 0 && this.ctx.type_resolver != null) {
             const spec_sym: SymbolStr = this.calls.resolve_generic_scope_name(lit.struct_type, lit.generic_args);
             if (spec_sym.is_valid()) { struct_ref = this.types.lookup_type_by_sym(spec_sym); }
+        }
+        // Only when the name lookup found nothing (the spec isn't registered yet -
+        // e.g. a method-generic literal `NonNull<U>` in a spec body whose
+        // `NonNull<ChanNode<i32>>` races registration) fall to the canonical
+        // resolution path, so the literal denotes the same TypeID as its
+        // annotation.  Confining it to this case keeps its arg-resolution off the
+        // hot path where it would perturb sibling monomorphization.
+        if (!struct_ref.is_valid() && lit.generic_args.length > 0) {
+            struct_ref = this.resolve_struct_literal_type(lit);
         }
         if (!struct_ref.is_valid()) { struct_ref = this.types.lookup_type_by_sym(lit.struct_type); }
         mut struct_t: Type* = if (struct_ref.is_valid()) { this.arena.lookup(struct_ref.id) } else { null };
         if (struct_t != null && struct_t.kind == TypeKind::InstantiatedType) {
             const inst: InstantiatedType* = struct_t as InstantiatedType*;
             if (inst.has_resolved_type()) { struct_t = this.arena.lookup(inst.resolved_type.id); }
+        }
+
+        // The literal's TYPE is the canonical default instantiation for a bare
+        // all-default generic (`String { .. }` denotes `String<GlobalAlloc>`),
+        // matching how a bare `String` annotation resolves - so the literal shares
+        // ONE TypeID with its declared type.  `struct_ref`/`struct_t` stay raw
+        // below for the template's field lookup, visibility, and arity checks.
+        mut lit_type: TypeRef = struct_ref;
+        if (this.ctx.type_resolver != null) {
+            lit_type = this.ctx.type_resolver.canonicalize_default_generic_type(struct_ref);
         }
 
         const saved_expected: TypeRef = this.state.expected_type;
@@ -2088,7 +2615,7 @@ public:
                     if (lit.field_inits.length == 0) { "no field initialized" } else { "more than one field initialized" });
                 this.ctx.emit_diagnostic(udiag);
             }
-            return struct_ref;
+            return lit_type;
         }
 
         if (struct_t != null && (struct_t.kind == TypeKind::Struct || struct_t.kind == TypeKind::Class)) {
@@ -2105,7 +2632,16 @@ public:
                     for (mut fi: i64 = 0; fi < lit.field_inits.length; fi++) {
                         if (lit.field_inits[fi].field_name.id == decl_name.id) { covered = true; break; }
                     }
-                    if (!covered) { missing_names.push(decl_name); }
+                    if (covered) { continue; }
+                    // An omitted field carrying a `= default` is filled in: clone the
+                    // default, resolve + type-check it, and append it as a synthetic
+                    // field-init so codegen materializes it.  Only an omitted field
+                    // WITHOUT a default is a missing-field error (E0355).
+                    if (fields_ptr[k].has_default()) {
+                        this.fill_field_default(lit, &fields_ptr[k], decl_name);
+                    } else {
+                        missing_names.push(decl_name);
+                    }
                 }
                 if (missing_names.length > 0) {
                     mut names_str: string = "";
@@ -2125,7 +2661,41 @@ public:
                 }
             }
         }
-        return struct_ref;
+        return lit_type;
+    }
+
+    /// Materialize a struct field's `= default` at a construction site that omits
+    /// it: clone the default (each construction evaluates its own copy), resolve
+    /// and type-check it against the field type (E0200 on mismatch), then append
+    /// it to the literal as a synthetic field-init so codegen fills the field.
+    /// The default is a standalone expression - it never sees the other fields.
+    fill_field_default(mut &this, lit: StructLiteralNode*, field: FieldInfo*,
+                       name: SymbolStr) -> void {
+        if (field.default_value == null) { return; }
+        mut cloner: ASTCloner = ASTCloner();
+        const cloned: ExpressionNode* = cloner.clone_expr(field.default_value);
+        if (cloned == null) { return; }
+        const field_type: TypeRef = field.field_type;
+        const saved: TypeRef = this.state.expected_type;
+        if (field_type.is_valid()) { this.state.expected_type = field_type; }
+        else { this.state.expected_type = TypeRef::invalid(); }
+        const value_type: TypeRef = this.resolve_expr(cloned);
+        this.state.expected_type = saved;
+        if (field_type.is_valid() && value_type.is_valid()) {
+            const skip: boolean = this.types.contains_generic_param(value_type)
+                || this.types.contains_generic_param(field_type);
+            if (!skip && !this.checker.can_assign(value_type, field_type)) {
+                const nm: string = this.intern.resolve(name);
+                this.diag.emit_type_mismatch_with_value(
+                    ErrorCode::E0200_TYPE_MISMATCH, cloned.span, field_type, value_type,
+                    format("field `%s` default expects this type", nm), SourceSpan::none(), cloned);
+            }
+        }
+        lit.add_field_init(FieldInit {
+            field_name: name,
+            value:      cloned,
+            span:       lit.span,
+        });
     }
 
     resolve_scope_resolution(mut &this, scope: ScopeResolutionNode*) -> TypeRef {
@@ -2139,6 +2709,14 @@ public:
         const q_sym: SymbolStr = this.ctx.intern(scope_str + "::" + member_str);
         const q_global: TypeRef = this.types.lookup_global_var(q_sym);
         if (q_global.is_valid()) { return q_global; }
+        // The scope names a MODULE: ask for the global that module declares
+        // before falling back to the bare leaf. The bare map is keyed by leaf
+        // and last-write-wins across modules, so `syscall::FIONBIO` would
+        // otherwise answer with `libc::FIONBIO` — a different value and type.
+        mut scoped_ns: SymbolStr = SymbolStr::empty();
+        const s_global: TypeRef =
+            this.types.lookup_global_in_scope(scope.member_name, scope.scope_name, &scoped_ns);
+        if (s_global.is_valid()) { return s_global; }
         const b_global: TypeRef = this.types.lookup_global_var(scope.member_name);
         if (b_global.is_valid()) { return b_global; }
         return found;
@@ -2251,9 +2829,54 @@ public:
         return TypeRef::invalid();
     }
 
+    /// Resolve a tuple literal, propagating the expected type per POSITION.
+    ///
+    /// Each element is resolved under ITS OWN expected type, mirroring what
+    /// `resolve_array_literal` does per element and struct literals do per field.
+    /// The per-position hint is what makes `return (1, 2)` from a `-> (i64, i64)`
+    /// function type both elements as i64 rather than letting the second take the
+    /// i32 default.
+    ///
+    /// Setting the hint per position also matters for what it PREVENTS: the
+    /// enclosing hint must not survive into the elements.  `resolve_integer_literal`
+    /// only adopts a hint whose kind is `Int`, so a leaked `(i64, i64)` tuple hint
+    /// is ignored silently rather than diagnosed, and the element quietly falls
+    /// back to i32.
+    ///
+    /// Because elements adopt their expected type directly, a correctly typed
+    /// tuple needs no coercion downstream at all - which is what lets
+    /// `check_compatibility` refuse to coerce tuples element-wise (see the note
+    /// there; doing so miscompiles).  A genuinely mixed-width tuple - a
+    /// non-literal `i32` element in an `i64` slot - is a hard E0200 here; the
+    /// cast has to be written explicitly.
     resolve_tuple_literal(mut &this, tup: TupleLiteralNode*) -> TypeRef {
+        mut exp_tup: TupleType* = null;
+        if (this.state.expected_type.is_valid()) {
+            mut exp_t: Type* = this.arena.lookup(this.state.expected_type.id);
+            if (exp_t != null && exp_t.kind == TypeKind::InstantiatedType) {
+                const inst: InstantiatedType* = exp_t as InstantiatedType*;
+                if (inst.has_resolved_type()) { exp_t = this.arena.lookup(inst.resolved_type.id); }
+            }
+            if (exp_t != null && exp_t.kind == TypeKind::Tuple) {
+                const cand: TupleType* = exp_t as TupleType*;
+                // Arity must match, or the positions do not correspond and the
+                // per-element hints would be nonsense; fall through untyped and
+                // let the arity mismatch be diagnosed by the caller.
+                if (cand.elements.length == tup.elements.length) { exp_tup = cand; }
+            }
+        }
+        const saved_expected: TypeRef = this.state.expected_type;
         mut elem_types: TypeRef[] = [];
-        for (mut i: i64 = 0; i < tup.elements.length; i++) { elem_types.push(this.resolve_expr(tup.elements[i])); }
+        for (mut i: i64 = 0; i < tup.elements.length; i++) {
+            if (exp_tup != null) {
+                this.state.expected_type = exp_tup.elements[i];
+            } else {
+                // No usable tuple hint: clear rather than leak the enclosing one.
+                this.state.expected_type = TypeRef::invalid();
+            }
+            elem_types.push(this.resolve_expr(tup.elements[i]));
+            this.state.expected_type = saved_expected;
+        }
         return this.arena.get_tuple(elem_types);
     }
 
@@ -2274,7 +2897,6 @@ public:
             TypeAnnotation::Pointer(p)   => { this.prime_typeof_annotation(p.inner); }
             TypeAnnotation::Reference(r) => { this.prime_typeof_annotation(r.inner); }
             TypeAnnotation::Array(a)     => { this.prime_typeof_annotation(a.element); }
-            TypeAnnotation::Optional(o)  => { this.prime_typeof_annotation(o.inner); }
             TypeAnnotation::Generic(g)   => {
                 for (mut i: i64 = 0; i < g.args.length; i++) { this.prime_typeof_annotation(g.args[i]); }
             }
@@ -2380,17 +3002,6 @@ public:
                 if (!this.block_contains_break(ls.body)) { return true; }
                 return this.block_always_returns(ls.body);
             }
-            NodeKind::SwitchStatement => {
-                const sw: SwitchStmtNode* = stmt as SwitchStmtNode*;
-                mut has_default: boolean = false;
-                for (mut i: i64 = 0; i < sw.cases.length; i++) {
-                    const c: CaseStmtNode* = sw.cases[i];
-                    if (c == null) { return false; }
-                    if (c.is_default) { has_default = true; }
-                    if (!this.stmt_always_returns(c.body as StatementNode*)) { return false; }
-                }
-                return has_default;
-            }
             NodeKind::DoWhileStatement => { return this.stmt_always_returns((stmt as DoWhileStmtNode*).body); }
             NodeKind::ExpressionStatement => { return this.expr_is_divergent((stmt as ExprStmtNode*).expression); }
             _ => {}
@@ -2437,7 +3048,7 @@ public:
         return false;
     }
 
-    // A call diverges (does not return to the caller) iff its resolved
+    // A call diverges (does not return to the caller) if its resolved
     // return type is `never` - e.g. `core::panic` / `intrinsics::panic`,
     // both declared `-> never`. Divergence is carried structurally by the
     // type, so no special-casing on the callee's symbol name is needed.
@@ -2530,6 +3141,51 @@ public:
         return false;
     }
 
+    /// Whether a `match` subject's storage belongs to the CALLER rather than to
+    /// this frame, so a payload binding taken from it aliases storage that
+    /// outlives the function and `&binding` may legitimately be returned.
+    ///
+    /// True only for a subject reached through a by-reference receiver
+    /// (`match (&this)` in a `&this` / `mut &this` method) or a pointer/reference
+    /// parameter (`match (slot)` where `slot: Option<T>*`) - the same
+    /// caller-backed reasoning that already exempts `&param` from the check.
+    /// A BY-VALUE parameter does NOT qualify: it lives in this frame like any
+    /// local, so a pointer into its payload dangles once the frame is gone.
+    subject_is_caller_backed(&this, e: ExpressionNode*) -> boolean {
+        if (e == null) { return false; }
+        const k: NodeKind = e.kind;
+        if (k == NodeKind::Identifier) {
+            const id: IdentifierNode* = e as IdentifierNode*;
+            if (id.name.id == this.this_sym.id) { return this.state.this_is_by_ref; }
+            if (!this.scopes.is_param(id.name)) { return false; }
+            return this.type_is_indirect(id.resolved_type);
+        }
+        // `&subject` / `*subject` keep naming the same storage; a member or
+        // element of caller-backed storage is caller-backed too.
+        if (k == NodeKind::UnaryExpression) {
+            const u: UnaryExprNode* = e as UnaryExprNode*;
+            if (u.desugared_call != null) { return false; }
+            if (u.op.lexeme != "&" && u.op.lexeme != "*") { return false; }
+            return this.subject_is_caller_backed(u.operand);
+        }
+        if (k == NodeKind::MemberAccess) {
+            return this.subject_is_caller_backed((e as MemberAccessNode*).object);
+        }
+        if (k == NodeKind::ArrayAccess) {
+            return this.subject_is_caller_backed((e as ArrayAccessNode*).array);
+        }
+        return false;
+    }
+
+    /// Whether `ty` is a pointer or a reference — storage reached through it is
+    /// somebody else's.
+    type_is_indirect(&this, ty: TypeRef) -> boolean {
+        if (!ty.is_valid()) { return false; }
+        const t: Type* = this.arena.lookup(ty.id);
+        if (t == null) { return false; }
+        return t.kind == TypeKind::Pointer || t.kind == TypeKind::Reference;
+    }
+
     check_return_stack_address(mut &this, e: ExpressionNode*) -> void {
         if (e == null) { return; }
         if (e.kind == NodeKind::IfExpression) {
@@ -2560,6 +3216,10 @@ public:
             const u: UnaryExprNode* = e as UnaryExprNode*;
             if (u.op.lexeme == "&" && u.operand != null && u.operand.kind == NodeKind::Identifier) {
                 const id: IdentifierNode* = u.operand as IdentifierNode*;
+                // A payload binding over a caller-backed subject names the
+                // caller's storage, not a copy in this frame, so its address
+                // survives the return — that is exactly an in-place accessor.
+                if (this.scopes.is_aliasing_binding(id.name)) { return; }
                 if (this.scopes.is_local_or_param(id.name) && !this.scopes.is_param(id.name)) {
                     this.ctx.emit_error_at(ErrorCode::E0455_DANGLING_POINTER,
                         "cannot return the address of a local variable: it lives on this function's stack frame and is freed when the function returns. Return the value by move, or a heap allocation, instead.",
@@ -2567,84 +3227,6 @@ public:
                 }
             }
         }
-    }
-
-
-    // -- Switch applicability --
-
-    switch_type_class(&this, base: Type*) -> i32 {
-        if (base == null) { return -1; }
-        match (base.kind) {
-            TypeKind::Int    => { return 0; }
-            TypeKind::Char   => { return 0; }
-            TypeKind::Bool   => { return 0; }
-            TypeKind::Float  => { return 4; }
-            TypeKind::String => { return 3; }
-            TypeKind::Enum   => {
-                if ((base as EnumType*).is_simple_enum()) { return 1; }
-                return 2;
-            }
-            _ => { return 5; }
-        }
-    }
-
-    check_switch_applicable(mut &this, node: SwitchStmtNode*, subject_type: TypeRef) -> void {
-        if (!subject_type.is_valid()) { return; }
-        const base: Type* = this.types.unwrap_to_enum(subject_type);
-        const sc: i32 = this.switch_type_class(base);
-        if (sc == -1) { return; }
-        if (sc != 0 && sc != 1) {
-            this.emit_switch_subject_error(node, subject_type, sc);
-            return;
-        }
-        for (mut i: i64 = 0; i < node.cases.length; i++) {
-            const cs: CaseStmtNode* = node.cases[i];
-            if (cs == null || cs.is_default || cs.value == null) { continue; }
-            const ct: TypeRef = cs.value.resolved_type;
-            if (!ct.is_valid()) { continue; }
-            const cbase: Type* = this.types.unwrap_to_enum(ct);
-            const cc: i32 = this.switch_type_class(cbase);
-            mut ok: boolean = false;
-            if (sc == 0) { ok = (cc == 0); } else { ok = (cc == 1 && cbase == base); }
-            if (!ok) {
-                mut d: Diagnostic = Diagnostic::error(ErrorCode::E0200_TYPE_MISMATCH,
-                    format("`case` value of type `%s` is not comparable to the switch subject of type `%s`",
-                        this.types.type_display_name(ct), this.types.type_display_name(subject_type)));
-                d = d.at(cs.value.span);
-                d = d.with_note("every `case` value must have the same type as the value being switched on");
-                this.ctx.diagnostics.emit(d);
-            }
-        }
-    }
-
-    emit_switch_subject_error(mut &this, node: SwitchStmtNode*, subject_type: TypeRef, sc: i32) -> void {
-        const name: string = this.types.type_display_name(subject_type);
-        const span: SourceSpan = node.expression.span;
-        mut msg:   string = "";
-        mut note1: string = "";
-        mut note2: string = "";
-        if (sc == 2) {
-            msg   = format("`switch` cannot match on enum `%s`: it has variants that carry payloads", name);
-            note1 = "`switch` compares by value and cannot bind variant payloads";
-            note2 = "use a `match` expression instead - it destructures variant fields and checks exhaustiveness";
-        } else if (sc == 3) {
-            msg   = format("`switch` cannot match on `%s` values", name);
-            note1 = "`switch` compares by value, so it would test string addresses rather than contents";
-            note2 = "use a `match` expression with string patterns instead";
-        } else if (sc == 4) {
-            msg   = format("`switch` cannot match on floating-point type `%s`", name);
-            note1 = "floating-point equality is unreliable, so `switch` does not allow it";
-            note2 = "use `if` / `else if` comparisons instead";
-        } else {
-            msg   = format("`switch` cannot match on type `%s`", name);
-            note1 = "`switch` supports integer, char, bool, and fieldless enum values";
-            note2 = "use a `match` expression for structured types";
-        }
-        mut d: Diagnostic = Diagnostic::error(ErrorCode::E0209_INVALID_OPERATION, msg);
-        d = d.at(span);
-        d = d.with_note(note1);
-        d = d.with_note(note2);
-        this.ctx.diagnostics.emit(d);
     }
 
 
@@ -2711,7 +3293,7 @@ public:
         const expected: TypeRef = this.ctx.type_resolver.resolve(gen.args[0], &rc);
         const actual:   TypeRef = this.ctx.type_resolver.resolve_concrete_member(concrete, adecl.name, &rc);
         if (!expected.is_valid() || !actual.is_valid()) { return false; }
-        if (this.arena.canon_type_id(expected) == this.arena.canon_type_id(actual)) { return false; }
+        if (expected.id == actual.id) { return false; }
         if (this.checker.check_compatibility(expected, actual) != TypeCompatibility::Incompatible) { return false; }
         if (this.checker.check_compatibility(actual, expected) != TypeCompatibility::Incompatible) { return false; }
         *out_expected = expected;
@@ -2806,7 +3388,7 @@ type struct SemanticPasses {
         if (ctx.debug_mode) {
             cdebug("[Sema] Type-checked %lld function bodies\n", v.state.body_count);
         }
-        if (ctx.debug_mode && v.sema_symbolic_check_enabled()) {
+        if (ctx.debug_mode) {
             cdebug("[symbolic-check] walked %lld generic bodies, emitted %lld errors\n",
                 v.state.symbolic_bodies_walked, v.state.symbolic_total_would_emit);
         }

@@ -1,0 +1,36 @@
+// E0455: an `async` method cannot be awaited on a receiver that names no
+// storage.
+//
+// A `&this` method's future holds the ADDRESS of its receiver, and the enclosing
+// frame re-addresses that pointer from its own storage before every poll — which
+// it can only do when the receiver is a place it can name again. A temporary, or
+// the result of a call, belongs to the step that built the future and is gone by
+// the time the future resumes, so there is nothing to re-address.
+//
+// The rewrite is to give the receiver a home the frame owns:
+//   mut r: Holder = make_holder();  await r.bump(5);
+// which is legal and covered in `lang/async_receiver_refresh.cryo`.
+![config(testing)]
+![config(negative, E0455)]
+namespace CryoTests::Negative::E0455AsyncTemporaryReceiver;
+
+import std::future;
+
+type struct CtrHolder {
+    base: i64;
+
+    async bump(&this, n: i64) -> i64 {
+        const a: i64 = await PendingThenReady<i64>::new(1, 10);
+        return this.base + n + a;
+    }
+}
+
+function ctr_make() -> CtrHolder {
+    return CtrHolder { base: 100 };
+}
+
+async function ctr_drive() -> i64 {
+    return await ctr_make().bump(5);   //~ ERROR[E0455] calls an `async` method on a receiver that names no storage
+}
+
+function main() -> int { return 0; }

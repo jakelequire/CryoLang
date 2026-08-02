@@ -1,0 +1,245 @@
+///! net::addr::url: a parser for absolute URLs.
+///!
+///! `Url::parse` breaks `scheme://[user@]host[:port][/path][?query][#fragment]`
+///! into its parts. It is a BORROWING view, like `Str` and `Path`: every field
+///! is a slice into the `source` string, so parsing allocates nothing and the
+///! `Url` carries no destructor - the caller must keep `source` alive for as
+///! long as the `Url` is used.
+///!
+///! Scope for a first parser:
+///!   - Requires an absolute URL with a `scheme://` (relative URLs error).
+///!   - `host` is taken verbatim; an IPv6 literal `[::1]` is unwrapped to its
+///!     inner address (`::1`).  Any `user[:pass]@` userinfo is skipped, not
+///!     exposed.
+///!   - `port` is the explicit port when present, else the scheme's default
+///!     (`http`/`ws` -> 80, `https`/`wss` -> 443, `ftp` -> 21), else 0.
+///!   - `path` is always non-empty: an absent path reads as `/`.
+///!   - No percent-decoding, no normalisation - parts are returned as written.
+
+namespace std::net::addr::url;
+
+import core::option;
+import core::result;
+import core::convert;
+import collections::str;
+
+const COLON:    u8 = 0x3A;  // ':'
+const SLASH:    u8 = 0x2F;  // '/'
+const QUESTION: u8 = 0x3F;  // '?'
+const HASH:     u8 = 0x23;  // '#'
+const AT:       u8 = 0x40;  // '@'
+const LBRACKET: u8 = 0x5B;  // '['
+const RBRACKET: u8 = 0x5D;  // ']'
+
+/// Why a URL failed to parse.
+type enum UrlError {
+    /// No `scheme://` - the input is not an absolute URL.
+    MissingScheme;
+    /// A `://` with nothing before it.
+    EmptyScheme;
+    /// The authority had no host (`scheme:///path`, `scheme://:80`).
+    EmptyHost;
+    /// A `:port` that was empty, non-numeric, or out of `u16` range.
+    InvalidPort;
+}
+
+implement enum UrlError {
+    /// A short human-readable reason, for diagnostics.
+    message(&this) -> Str {
+        match (&this) {
+            UrlError::MissingScheme => { return Str::new("missing scheme://"); }
+            UrlError::EmptyScheme   => { return Str::new("empty scheme"); }
+            UrlError::EmptyHost     => { return Str::new("empty host"); }
+            UrlError::InvalidPort   => { return Str::new("invalid port"); }
+        }
+    }
+}
+
+/// Index of the first `byte` in `s`, or -1 if absent.
+private function index_of(s: Str, byte: u8) -> i64 {
+    const n: u64 = s.length();
+    mut i: u64 = 0;
+    while (i < n) {
+        match (s.byte_at(i)) {
+            Option::Some(b) => { if (b == byte) { return i as i64; } }
+            Option::None    => { return -1; }
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+/// Index of the last `byte` in `s`, or -1 if absent.
+private function last_index_of(s: Str, byte: u8) -> i64 {
+    mut i: u64 = s.length();
+    while (i > 0) {
+        const j: u64 = i - 1;
+        match (s.byte_at(j)) {
+            Option::Some(b) => { if (b == byte) { return j as i64; } }
+            Option::None    => { return -1; }
+        }
+        i = j;
+    }
+    return -1;
+}
+
+/// Length of `s`'s leading run that stops at the first `/`, `?`, or `#` -
+/// i.e. where the authority ends and the path/query/fragment begins.
+private function authority_end(s: Str) -> u64 {
+    const n: u64 = s.length();
+    mut i: u64 = 0;
+    while (i < n) {
+        match (s.byte_at(i)) {
+            Option::Some(b) => {
+                if (b == SLASH || b == QUESTION || b == HASH) { return i; }
+            }
+            Option::None => { return i; }
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
+/// ASCII case-insensitive equality against a lowercase literal `lit`.
+private function eq_ci(s: Str, lit: string) -> boolean {
+    const other: Str = Str::new(lit);
+    const n: u64 = s.length();
+    if (n != other.length()) { return false; }
+    mut i: u64 = 0;
+    while (i < n) {
+        mut a: u8 = 0;
+        mut b: u8 = 0;
+        match (s.byte_at(i))     { Option::Some(x) => { a = x; } Option::None => { return false; } }
+        match (other.byte_at(i)) { Option::Some(x) => { b = x; } Option::None => { return false; } }
+        // Lowercase A-Z in the source before comparing; `lit` is already lower.
+        if (a >= 0x41 && a <= 0x5A) { a = a + 0x20; }
+        if (a != b) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// The well-known default port for `scheme`, or 0 if none is known.
+private function default_port(scheme: Str) -> u16 {
+    if (eq_ci(scheme, "http"))  { return 80; }
+    if (eq_ci(scheme, "https")) { return 443; }
+    if (eq_ci(scheme, "ws"))    { return 80; }
+    if (eq_ci(scheme, "wss"))   { return 443; }
+    if (eq_ci(scheme, "ftp"))   { return 21; }
+    return 0;
+}
+
+type struct Url {
+    scheme:   Str;
+    host:     Str;
+    port:     u16;
+    path:     Str;            // never empty; "/" when the URL had no path
+    query:    Option<Str>;    // without the leading '?'
+    fragment: Option<Str>;    // without the leading '#'
+
+    /// Parse an absolute URL. See the module docs for the accepted shape.
+    static parse(source: Str) -> Result<Url, UrlError> {
+        const n: u64 = source.length();
+
+        // 1. Split off the scheme at "://".
+        const sep: i64 = index_of_seq(source);
+        if (sep < 0) { return Result::Err(UrlError::MissingScheme); }
+        const scheme: Str = source.sub_bytes(0, sep as u64);
+        if (scheme.is_empty()) { return Result::Err(UrlError::EmptyScheme); }
+        const after: Str = source.sub_bytes((sep as u64) + 3, n);
+
+        // 2. Authority is up to the first '/', '?' or '#'.
+        const ae: u64 = authority_end(after);
+        const authority: Str = after.sub_bytes(0, ae);
+        const rest: Str = after.sub_bytes(ae, after.length());
+
+        // 3. Drop any `user[:pass]@` userinfo; the host is what follows.
+        mut host_port: Str = authority;
+        const at: i64 = last_index_of(authority, AT);
+        if (at >= 0) {
+            host_port = authority.sub_bytes((at as u64) + 1, authority.length());
+        }
+
+        // 4. Split host and optional port.
+        mut host: Str = host_port;
+        mut port: u16 = default_port(scheme);
+        if (!host_port.is_empty() && Url::byte0(host_port) == LBRACKET) {
+            // IPv6 literal `[addr]` with an optional `:port` after `]`.
+            const close: i64 = index_of(host_port, RBRACKET);
+            if (close < 0) { return Result::Err(UrlError::EmptyHost); }
+            host = host_port.sub_bytes(1, close as u64);
+            const tail: Str = host_port.sub_bytes((close as u64) + 1, host_port.length());
+            if (!tail.is_empty()) {
+                if (Url::byte0(tail) != COLON) { return Result::Err(UrlError::InvalidPort); }
+                match (Url::parse_port(tail.sub_bytes(1, tail.length()))) {
+                    Result::Ok(p)  => { port = p; }
+                    Result::Err(e) => { return Result::Err(e); }
+                }
+            }
+        } else {
+            const colon: i64 = last_index_of(host_port, COLON);
+            if (colon >= 0) {
+                host = host_port.sub_bytes(0, colon as u64);
+                match (Url::parse_port(host_port.sub_bytes((colon as u64) + 1, host_port.length()))) {
+                    Result::Ok(p)  => { port = p; }
+                    Result::Err(e) => { return Result::Err(e); }
+                }
+            }
+        }
+        if (host.is_empty()) { return Result::Err(UrlError::EmptyHost); }
+
+        // 5. Split rest into path / ?query / #fragment. Fragment is everything
+        //    after the first '#'; query is between the first '?' and that '#'.
+        mut pre_frag: Str = rest;
+        mut fragment: Option<Str> = Option::None;
+        const hash: i64 = index_of(rest, HASH);
+        if (hash >= 0) {
+            fragment = Option::Some(rest.sub_bytes((hash as u64) + 1, rest.length()));
+            pre_frag = rest.sub_bytes(0, hash as u64);
+        }
+
+        mut path: Str = pre_frag;
+        mut query: Option<Str> = Option::None;
+        const q: i64 = index_of(pre_frag, QUESTION);
+        if (q >= 0) {
+            query = Option::Some(pre_frag.sub_bytes((q as u64) + 1, pre_frag.length()));
+            path = pre_frag.sub_bytes(0, q as u64);
+        }
+        if (path.is_empty()) { path = Str::new("/"); }
+
+        return Result::Ok(Url {
+            scheme:   scheme,
+            host:     host,
+            port:     port,
+            path:     path,
+            query:    query,
+            fragment: fragment
+        });
+    }
+
+    /// `s`'s first byte (callers guard `!s.is_empty()` first).
+    static byte0(s: Str) -> u8 {
+        match (s.byte_at(0)) {
+            Option::Some(b) => { return b; }
+            Option::None    => { return 0; }
+        }
+    }
+
+    /// Parse a non-empty decimal port into a `u16`.
+    static parse_port(digits: Str) -> Result<u16, UrlError> {
+        if (digits.is_empty()) { return Result::Err(UrlError::InvalidPort); }
+        match (u16::try_from(digits)) {
+            Result::Ok(p)  => { return Result::Ok(p); }
+            Result::Err(_) => { return Result::Err(UrlError::InvalidPort); }
+        }
+    }
+}
+
+/// Index of the "://" scheme separator in `source`, or -1 if absent.
+private function index_of_seq(source: Str) -> i64 {
+    const needle: Str = Str::new("://");
+    match (source.find(&needle)) {
+        Option::Some(idx) => { return idx as i64; }
+        Option::None      => { return -1; }
+    }
+}

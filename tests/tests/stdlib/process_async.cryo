@@ -1,0 +1,359 @@
+///! `Child::join` - awaiting a subprocess without stalling the executor.
+///!
+///! The routes differ by platform (`child::ChildWait` documents the split: a
+///! pidfd on the reactor where the kernel has one, a `BlockingPool` thread
+///! everywhere else), so these tests assert only what both must deliver: the
+///! same status `wait` reports, and genuine concurrency.
+///!
+///! `two_children_join_concurrently` is the one that earns the feature. Both
+///! children sleep, and the assertion is on WALL-CLOCK time against a
+///! single-worker executor: a `join` that blocked its worker would serialize
+///! them and blow the bound. It measures with `Instant::elapsed` rather than
+///! counting sleeps, because a sleep loop stretches unevenly under a loaded
+///! suite and would report the wrong thing.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::ProcessAsync;
+
+import std::core::result;
+import std::core::option;
+import std::core::drop;
+import std::core::slice;
+import std::collections::array;
+import std::collections::str;
+import std::collections::string;
+import std::io::error;
+import std::future;
+import std::future::combinator;
+import std::time::clock;
+import std::process::command;
+import std::process::child;
+import std::test::error;
+import std::test::assert;
+
+// ---------------------------------------------------------------------------
+// Platform abstraction, matching `process_command.cryo`: the Unix coreutils do
+// not exist on Windows. `![target(...)]` only strips file-scope declarations,
+// so these are free functions and the test bodies stay platform-neutral.
+// ---------------------------------------------------------------------------
+
+// A command that exits with `code`. `Command::arg` copies the bytes, so the
+// scratch `String` is released before the command is returned.
+![target(unix)]
+function cmd_exit(code: i32) -> Command {
+    mut c: Command = Command::new(Str::new("/bin/sh"));
+    c.arg(Str::new("-c"));
+    mut script: String = String::from(Str::new("exit "));
+    script.push(code);
+    c.arg(script.as_str());
+    script.drop();
+    return c;
+}
+![target(windows)]
+function cmd_exit(code: i32) -> Command {
+    mut c: Command = Command::new(Str::new("cmd"));
+    c.arg(Str::new("/c"));
+    c.arg(Str::new("exit"));
+    mut n: String = String::from(code);
+    c.arg(n.as_str());
+    n.drop();
+    return c;
+}
+
+// A command that occupies roughly `SLEEP_MS` and then exits 0. Long enough that
+// serialized execution is unambiguous against the bound below, short enough not
+// to slow the suite.
+![target(unix)]
+function cmd_sleep() -> Command {
+    mut c: Command = Command::new(Str::new("/bin/sh"));
+    c.arg(Str::new("-c"));
+    c.arg(Str::new("sleep 1"));
+    return c;
+}
+![target(windows)]
+function cmd_sleep() -> Command {
+    // `ping -n 3` waits ~1s between its 3 replies to the loopback address.
+    // `timeout` is not usable here: it fails outright when stdin is redirected.
+    mut c: Command = Command::new(Str::new("cmd"));
+    c.arg(Str::new("/c"));
+    c.arg(Str::new("ping -n 3 127.0.0.1 >nul"));
+    return c;
+}
+
+/// Spawn `cmd` and await its exit, reporting the exit code, or a negative
+/// marker for each way the attempt could fail instead.
+async function join_code(cmd: Command) -> i64 {
+    mut c: Command = cmd;
+    mut child: Child = match (c.spawn()) {
+        Result::Ok(ch)  => { ch }
+        Result::Err(_)  => { c.drop(); return -1; }
+    };
+    c.drop();
+    mut out: i64 = -2;
+    match (await child.join()) {
+        Result::Ok(st) => { out = st.exit_code().unwrap_or(-3) as i64; }
+        Result::Err(_) => { out = -4; }
+    }
+    child.drop();
+    return out;
+}
+
+/// Await two sleeping children through one task. Returns 0 when both exited
+/// cleanly, or a negative marker naming the one that did not.
+async function join_two_sleepers() -> i64 {
+    const p: (i64, i64) = await Futures::join(join_code(cmd_sleep()),
+                                              join_code(cmd_sleep()));
+    if (p.0 != 0) { return -10; }
+    if (p.1 != 0) { return -11; }
+    return 0;
+}
+
+![test]
+function join_reports_a_clean_exit() -> Result<(), TestError> {
+    mut ex: Executor = Executor::new();
+    const code: i64 = ex.block_on(join_code(cmd_exit(0)));
+    ex.drop();
+    return expect_eq(code, 0 as i64);
+}
+
+![test]
+function join_reports_a_failing_exit() -> Result<(), TestError> {
+    mut ex: Executor = Executor::new();
+    const code: i64 = ex.block_on(join_code(cmd_exit(3)));
+    ex.drop();
+    return expect_eq(code, 3 as i64);
+}
+
+/// The status `join` reports must be the status `wait` reports; the async
+/// spelling changes who blocks, not what is observed.
+![test]
+function join_agrees_with_the_blocking_wait() -> Result<(), TestError> {
+    mut cmd: Command = cmd_exit(5);
+    mut child: Child = match (cmd.spawn()) {
+        Result::Ok(ch) => { ch }
+        Result::Err(_) => { cmd.drop(); return bail(Str::new("spawn failed")); }
+    };
+    cmd.drop();
+    mut blocking: i64 = -1;
+    match (child.wait()) {
+        Result::Ok(st) => { blocking = st.exit_code().unwrap_or(-1) as i64; }
+        Result::Err(_) => { }
+    }
+    child.drop();
+
+    mut ex: Executor = Executor::new();
+    const asynchronous: i64 = ex.block_on(join_code(cmd_exit(5)));
+    ex.drop();
+
+    match (expect_eq(blocking, 5 as i64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(asynchronous, blocking);
+}
+
+/// The property the feature exists for. One executor worker, two sleeping
+/// children: awaiting them must overlap. A `join` that blocked its worker would
+/// run them back to back instead.
+///
+/// The bound is a RATIO against a single child measured the same way, not an
+/// absolute time. How long the sleep command actually takes varies by platform
+/// and host - `ping -n 3` is ~2.1s where `sleep 1` is ~1.0s - so an absolute
+/// threshold either passes trivially or fails a working implementation. The
+/// ratio is ~1.0 when the waits overlap and ~2.0 when they serialize, and 1.6
+/// sits between with room for load on either side. Measured against a swap of
+/// `join` for the blocking `wait`, which moves it from 1.01 to 1.99.
+///
+/// `one_ms` is floor-checked because the ratio is only meaningful if the
+/// baseline really slept: a sleep command that failed to spawn and returned
+/// instantly would otherwise make any pair time look concurrent.
+![test]
+function two_children_join_concurrently() -> Result<(), TestError> {
+    mut ex1: Executor = Executor::with_threads(1);
+    const t0: Instant = Instant::now();
+    const single: i64 = ex1.block_on(join_code(cmd_sleep()));
+    const one_ms: u64 = t0.elapsed().as_millis();
+    ex1.drop();
+
+    mut ex2: Executor = Executor::with_threads(1);
+    const t1: Instant = Instant::now();
+    const both: i64 = ex2.block_on(join_two_sleepers());
+    const two_ms: u64 = t1.elapsed().as_millis();
+    ex2.drop();
+
+    match (expect_eq(single, 0 as i64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect_eq(both, 0 as i64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    match (expect(one_ms >= 300,
+                  Str::new("the sleeping child should actually sleep; baseline too short to compare against"))) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect(two_ms * 10 < one_ms * 16,
+                  Str::new("two joined children should overlap, not serialize"));
+}
+
+/// Off an executor there is neither reactor nor pool, so a `ChildWait` polled
+/// there waits inline and completes on its first poll. The spinning
+/// `future::block_on` driver has nowhere to park a waker, so this is the only
+/// way it could work at all.
+![test]
+function join_without_an_executor_runs_inline() -> Result<(), TestError> {
+    const code: i64 = future::block_on(join_code(cmd_exit(0)));
+    return expect_eq(code, 0 as i64);
+}
+
+/// A `Child` dropped after a successful `join`, followed by an ordinary
+/// spawn+`wait`, must both report correctly.
+///
+/// This does NOT observe `waited` - that field is private and `Child::drop`
+/// tolerates either value (POSIX reaps non-blockingly, Windows closes the
+/// HANDLE unconditionally), so no black-box test can distinguish it. What this
+/// does catch is a `join` that left the process machinery unusable: a double
+/// reap, a closed-twice HANDLE, or a child still occupying the table.
+![test]
+function join_then_a_blocking_wait_both_report() -> Result<(), TestError> {
+    mut ex: Executor = Executor::new();
+    const first: i64 = ex.block_on(join_code(cmd_exit(0)));
+    ex.drop();
+
+    mut cmd: Command = cmd_exit(7);
+    mut child: Child = match (cmd.spawn()) {
+        Result::Ok(ch) => { ch }
+        Result::Err(_) => { cmd.drop(); return bail(Str::new("second spawn failed")); }
+    };
+    cmd.drop();
+    mut code: i64 = -1;
+    match (child.wait()) {
+        Result::Ok(st) => { code = st.exit_code().unwrap_or(-1) as i64; }
+        Result::Err(_) => { }
+    }
+    child.drop();
+
+    match (expect_eq(first, 0 as i64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(code, 7 as i64);
+}
+
+// ---------------------------------------------------------------------------
+// `Command::collect` / `Command::run` - the async spellings of `output` and
+// `status`.
+// ---------------------------------------------------------------------------
+
+// A command that writes `OUT` to stdout and `ERR` to stderr, then exits 0.
+// Both streams are written, because the point of `collect` is that neither
+// drain can starve the other.
+![target(unix)]
+function cmd_two_streams() -> Command {
+    mut c: Command = Command::new(Str::new("/bin/sh"));
+    c.arg(Str::new("-c"));
+    c.arg(Str::new("printf OUT; printf ERR 1>&2"));
+    return c;
+}
+![target(windows)]
+function cmd_two_streams() -> Command {
+    mut c: Command = Command::new(Str::new("cmd"));
+    c.arg(Str::new("/c"));
+    c.arg(Str::new("echo OUT& echo ERR 1>&2"));
+    return c;
+}
+
+// `cmd /c echo` appends CRLF and `printf` does not, so the captures are
+// compared by PREFIX - the bytes each shell is asked to produce - rather than
+// for equality against a platform-specific trailer.
+function starts_with_ascii(s: Slice<u8>, want: string) -> boolean {
+    const p: u8* = want as u8*;
+    const q: u8* = s.as_ptr();
+    mut i: u64 = 0;
+    while (p[i] != 0) {
+        if (i >= s.length()) { return false; }
+        if (q[i] != p[i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// Capture both streams through `collect`. Returns a bitmask so a failure
+/// names which half went wrong rather than just "not 7": 1 = stdout, 2 =
+/// stderr, 4 = exit status.
+async function collect_streams() -> i64 {
+    mut c: Command = cmd_two_streams();
+    mut r: Result<Output, IoError> = await c.collect();
+    c.drop();
+    mut out: i64 = -1;
+    match (r) {
+        Result::Ok(o) => {
+            out = 0;
+            if (starts_with_ascii(o.stdout(), "OUT"))      { out = out + 1; }
+            if (starts_with_ascii(o.stderr(), "ERR"))      { out = out + 2; }
+            if (o.status().exit_code().unwrap_or(-1) == 0) { out = out + 4; }
+        }
+        Result::Err(_) => { out = -2; }
+    }
+    return out;
+}
+
+/// Spawn and await through `run`, reporting the exit code.
+async function run_code(cmd: Command) -> i64 {
+    mut c: Command = cmd;
+    mut r: Result<ExitStatus, IoError> = await c.run();
+    c.drop();
+    mut out: i64 = -4;
+    match (r) {
+        Result::Ok(st) => { out = st.exit_code().unwrap_or(-3) as i64; }
+        Result::Err(_) => { out = -4; }
+    }
+    return out;
+}
+
+/// Both captures arrive intact and the status is the child's own. A drain that
+/// closed the wrong descriptor, or handed its buffer away twice, fails here.
+![test]
+function collect_captures_both_streams() -> Result<(), TestError> {
+    mut ex: Executor = Executor::new();
+    const mask: i64 = ex.block_on(collect_streams());
+    ex.drop();
+    return expect_eq(mask, 7 as i64);
+}
+
+/// `collect` reports the same status `output` does; the async spelling changes
+/// who blocks, not what is observed.
+![test]
+function collect_agrees_with_the_blocking_output() -> Result<(), TestError> {
+    mut cmd: Command = cmd_two_streams();
+    mut sync_r: Result<Output, IoError> = cmd.output();
+    cmd.drop();
+    mut sync_code: i64 = -1;
+    match (sync_r) {
+        Result::Ok(o)  => { sync_code = o.status().exit_code().unwrap_or(-1) as i64; }
+        Result::Err(_) => { sync_code = -2; }
+    }
+    mut ex: Executor = Executor::new();
+    const mask: i64 = ex.block_on(collect_streams());
+    ex.drop();
+    if (mask != 7) { return expect_eq(mask, 7 as i64); }
+    return expect_eq(sync_code, 0 as i64);
+}
+
+![test]
+function run_reports_a_clean_exit() -> Result<(), TestError> {
+    mut ex: Executor = Executor::new();
+    const code: i64 = ex.block_on(run_code(cmd_exit(0)));
+    ex.drop();
+    return expect_eq(code, 0 as i64);
+}
+
+![test]
+function run_reports_a_failing_exit() -> Result<(), TestError> {
+    mut ex: Executor = Executor::new();
+    const code: i64 = ex.block_on(run_code(cmd_exit(6)));
+    ex.drop();
+    return expect_eq(code, 6 as i64);
+}

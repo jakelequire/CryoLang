@@ -93,11 +93,25 @@ is written entirely in Cryo, and the public surface is frozen under semver.
   struct with a `__call__` method. Both forms call directly with zero
   overhead. Closures bound to a `(Args) -> Ret`-typed parameter are
   delivered via per-call-site receiver specialisation, so the body
-  dispatches through `__call__` without an indirect call. Generic
+  dispatches through `__call__` without an indirect call; that
+  specialisation is wired for non-generic free functions only, so a
+  *capturing* closure passed to a generic function, a method, or a
+  scope-resolution call is E0458 (non-capturing lambdas are function
+  pointers and bind anywhere). Generic
   type-parameter inference from function-typed arguments
   (`opt.map(lambda)` infers `U`).
 - **Modules:** `_module.cryo` aggregators, `public`/`private`/`protected`
   visibility, import cycle detection.
+- **`async` / `await`.** `async` functions, methods, and trait methods are
+  compiled into state machines, and `await` may appear anywhere an expression
+  may appear - in a condition, a loop body, an operand of a larger expression,
+  a `match` subject, an arm body, and an arm guard. `async function main` is
+  renamed out of the entry-point slot and driven on an `Executor` scoped to
+  the program. A future is an ordinary movable struct with no hidden
+  allocation and no pinning discipline, which the language buys by rejecting
+  a reference held live across a suspend (`E0455`); owned values are carried
+  across it for you. See
+  [`docs/cryo.md` section 19](./docs/cryo.md#19-asynchronous-programming).
 
 ### Build system
 
@@ -135,8 +149,9 @@ is written entirely in Cryo, and the public surface is frozen under semver.
 - **`collections`:** `Array<T>`, `String`, `HashMap<K,V>`, `HashSet<T>`,
   `Pair<A,B>`, `Slice<T>`, `Str`.
 - **`core`:** `Copy`/`Drop`/`Clone`/`Eq`/`Ord`/`Hash`/`Default`/`From`/`Into`/
-  `TryFrom`/`TryInto`/`Display`/`Debug`/`FmtWrite`/`Iterator`/`Error`
-  traits; `Option<T>` and `Result<T,E>`.
+  `TryFrom`/`TryInto`/`Display`/`Debug`/`FmtWrite`/`Iterator` traits;
+  `Option<T>`, `Result<T,E>`, and the catch-all `Error` struct (there is no
+  unifying `Error` *trait* — each module defines its own precise error type).
 - **`core::iter`:** `Iterator` with an associated `type Item` (one required
   `next() -> Option<This::Item>`); the legacy generic-param form `Iterator<T>`
   remains accepted as positional sugar for `Iterator<Item = T>` in impls,
@@ -145,10 +160,13 @@ is written entirely in Cryo, and the public surface is frozen under semver.
   combinator
   adapters `.take(n)` / `.map(f)` / `.filter(pred)` / `.chain(other)` /
   `.enumerate()` / `.zip(other)` (returning `TakeIter` / `MapIter` /
-  `FilterIter` / `ChainIter` / `EnumerateIter` / `ZipIter`); `f`/`pred` are
-  non-capturing functions (E0458). `.enumerate()` yields `Pair<u64, Item>`,
-  `.zip(other)` yields `Pair<Item, B>` and stops at the shorter side (Cryo has
-  no heterogeneous tuple literal, so `Pair` is the element type). Combinators
+  `FilterIter` / `ChainIter` / `EnumerateIter` / `ZipIter`); `f`/`pred` must
+  be non-capturing, since the adapters are methods and a capturing closure
+  may only be passed to a non-generic free function (E0458 - see
+  [`docs/cryo.md` section 2.5](./docs/cryo.md#25-function-types) for the
+  full boundary). `.enumerate()` yields `Pair<u64, Item>`,
+  `.zip(other)` yields `Pair<Item, B>` and stops at the shorter side (`Pair` is
+  the element type so the adapters stay monomorphization-friendly). Combinators
   chain freely (`r.take(n).map(f).filter(p)`, `r.chain(b).map(f)`,
   `a.zip(b).count()`, longer mixed chains) and feed `.count()` / `.fold(..)` /
   `for (x in ..)`. The adapters resolve on any concrete `Iterator` receiver,
@@ -166,16 +184,33 @@ is written entirely in Cryo, and the public surface is frozen under semver.
   `create_dir`/`create_dir_all`, `remove_dir`/`remove_dir_all`, `read_dir`,
   `canonicalize`) over `Path`/`PathBuf`; `metadata`/`symlink_metadata`/
   `exists`/`is_file`/`is_dir` backed by `stat`/`lstat`/`access`.
+- **`future`:** the async runtime - `Future`/`Poll`/`Context`/`Waker`; a
+  worker-pool `Executor` with `spawn`/`JoinHandle` and `block_on` (under
+  `--panic=unwind`, a `catch_unwind` boundary at every poll keeps one
+  panicking task from taking a worker down with it); a readiness reactor over
+  `epoll` on Linux and `\Device\Afd` + IOCP on Windows; `Sleep` timers; a
+  blocking thread pool for work no reactor can drive; and the
+  `join`/`try_join`/`select`/`timeout` combinators. Cancelling is a plain
+  drop - releasing a combinator disarms its timer and releases its I/O
+  registration.
 - **`net`:** `TcpStream`, `TcpListener`, `UdpSocket`, `IpAddr`/`IpV4Addr`/
   `IpV6Addr`, `SocketAddr`; `dns` name resolution; `tls` (OpenSSL) with
-  `https` on top; `ws` (RFC 6455) over any `Read + Write` transport. HTTP/1.1
+  `https` on top; `ws` (RFC 6455) over any async transport. HTTP/1.1
   server with keep-alive and read timeouts, HTTP client, router with route
   registration. HTTP/2 (`net::http2`): HPACK (RFC 7541), framing (RFC 7540),
-  h2c client + server over any stream, generic over the transport.
+  h2c client + server over any stream, generic over the transport. Every
+  operation that waits is `async` and parks on the reactor; there is no
+  blocking socket API. A future that needs a buffer owns it for the duration
+  and hands it back on completion, because a future moves between polls and a
+  borrowed caller-frame buffer would be written through a stale address.
 - **`json`:** parser and serializer for `JsonValue`/`JsonObject`/`JsonNumber`;
   round-trip clean.
 - **`process`:** `Command`/`Child`/`ExitStatus` via `fork + execve`;
-  `spawn`/`status`/`output`/`wait`/`try_wait`/`kill`/`send_signal`.
+  `spawn`/`status`/`output`/`wait`/`try_wait`/`kill`/`send_signal`, plus the
+  async spellings `Child::join`, `Command::collect`, and `Command::run`. A
+  captured pipe is drained by `PipeDrain`, and `collect` drains `stdout` and
+  `stderr` concurrently - draining one to EOF first deadlocks a child that
+  fills the other pipe's buffer meanwhile.
 - **`env`:** `args()`, `var`, `set_var`, `remove_var`, `process_exit`.
 - **`sync`:** a generic `Atomic<T>` (`T` = `u8`/`u32`/`u64`/`i32`/`i64`/`boolean`,
   dispatched at compile time via `static match`), `MemoryOrder`, `fence`,
@@ -268,10 +303,9 @@ nor `CRYO_STDLIB`.
 
 These are not bugs against 1.0 - the language deliberately ships
 without them and the grammar reserves the relevant syntax. See
-[`docs/cryo.md` section 21](./docs/cryo.md#21-reserved-syntax) for the
+[`docs/cryo.md` section 22](./docs/cryo.md#22-reserved-syntax) for the
 authoritative list.
 
-- Async / await / coroutines.
 - Macros / user-defined `![attr]` directives.
 - macOS / Darwin targets (no Mach-O backend or toolchain wiring yet). See
   **Target triples** above for the supported set.

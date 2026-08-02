@@ -344,6 +344,38 @@ type struct DeclarationEmitter {
         if (comdat != null) { llvm::LLVMSetComdat(fn_val.raw, comdat); }
     }
 
+    /// Apply the `![weak]` / `![naked]` / `![section("...")]` directive effects
+    /// to a just-declared function/method DEFINITION.  Shared by
+    /// declare_function and declare_method so all definition paths stay
+    /// consistent.  `fn_name` is the emitted LLVM symbol (used to key the weak
+    /// COMDAT).  Caller gates on the presence of a body: these only apply to
+    /// definitions, never bodyless externs.
+    apply_directive_effects(mut &this, fn_val: LValue, node: FunctionDeclNode*,
+                            fn_name: string) -> void {
+        if (node == null || !fn_val.is_valid()) { return; }
+        // `![weak]`: weak definition (WeakAny) so a strong definition in
+        // another object overrides it - the user-overridable runtime symbols
+        // (global allocator, panic handler).  Attach an any-selection COMDAT
+        // for the same COFF reason apply_spec_linkage does: without it,
+        // mingw-ld leaves a bare weak definition's weak-external alias
+        // unresolved on the Windows cross-link.
+        if (node.is_weak) {
+            fn_val.set_linkage(LLinkage::WeakAny);
+            const comdat: void* = llvm::LLVMGetOrInsertComdat(
+                this.llvm_module.raw, fn_name);
+            if (comdat != null) { llvm::LLVMSetComdat(fn_val.raw, comdat); }
+        }
+        // `![naked]`: the LLVM `naked` attribute; prologue/epilogue emission is
+        // separately skipped in the body pass (see codegen_function_prologue).
+        if (node.is_naked) {
+            this.abi.apply_naked_attribute(fn_val);
+        }
+        // `![section("name")]`: object-file section placement for the symbol.
+        if (node.link_section.length() > 0) {
+            llvm::LLVMSetSection(fn_val.raw, node.link_section);
+        }
+    }
+
     declare_function(mut &this, node: FunctionDeclNode*) -> void {
         // Skip generic templates.
         if (node.generic_params.length > 0) {
@@ -394,6 +426,16 @@ type struct DeclarationEmitter {
         const main_sym: SymbolStr = intern.intern("main");
         mut fn_name: string = intern.resolve(mangled_sym);
         const is_program_main: boolean = node.name.equals(main_sym);
+        // Under `--panic=unwind` the user's `main` runs under an internal symbol
+        // and a synthesized `main` wrapper (emitted just after this declaration)
+        // invokes it inside a catch-all landing pad: an otherwise-uncaught panic
+        // then finds a phase-1 handler at the root, so phase 2 runs every
+        // intermediate frame's cleanup pad (destructors execute) before the
+        // wrapper reports and exits 101.  Gated so the default abort path emits
+        // `main` exactly as before (byte-identical).  `no_runtime` has no C
+        // `main` to wrap.
+        const wrap_main_unwind: boolean = is_program_main
+            && this.ctx.project_panic_unwind && !this.ctx.project_no_runtime;
         if (is_program_main) {
             fn_name = "main";
             // `cryo test` synthesizes its own `main` that drives every
@@ -403,6 +445,17 @@ type struct DeclarationEmitter {
             if (this.ctx.mode.skip_user_main()) {
                 return;
             }
+            if (wrap_main_unwind) {
+                fn_name = "__cryo_user_main";
+            }
+        }
+        // `![no_mangle]` / `![symbol("...")]`: emit under the requested symbol
+        // instead of the mangled name.  `declare_method` (:966) and
+        // `declare_extern_block` (:1375) already honor this; `declare_function`
+        // historically did not, so the directive silently no-opped on free
+        // function definitions.  `main` keeps its C-runtime-mandated name above.
+        if (!is_program_main && node.has_link_name) {
+            fn_name = node.link_name;
         }
 
         // Build the LLVM function type via the ABI seam.  Phase 1 + 2:
@@ -420,24 +473,32 @@ type struct DeclarationEmitter {
         // builds `fn_type` open-coded (main can't have aggregate
         // parameters in source, so byval never applies there).
         mut plan_param_plans: ParamPlan[] = [];
-        if (is_program_main && param_count == 0) {
-            // The C ABI entry point is `int main(int argc, char** argv)`.
-            // _start always passes argc/argv, and the stdlib's
-            // `std::env::args()` reads them through `set_args` (called
+        // Under `no_runtime` there is no C runtime calling `main`, so we do
+        // NOT widen its signature to argc/argv/envp (nor emit the
+        // set_args/set_env prologue below): a freestanding entry is a
+        // separate `![naked] _start`, and `main` - if present - keeps its
+        // declared signature.
+        if (is_program_main && param_count == 0 && !this.ctx.project_no_runtime) {
+            // The C ABI entry point is
+            // `int main(int argc, char** argv, char** envp)`.  The C
+            // runtime always passes all three, and the stdlib reads argv
+            // through `set_args` and envp through `set_env` (both called
             // from the synthesized prologue in `codegen_function_prologue`
-            // below).  User source still writes `function main() -> int`;
-            // we silently widen the LLVM signature to take argc/argv.
+            // below), backing `std::env::args()` / `std::env::vars()`.
+            // User source still writes `function main() -> int`; we
+            // silently widen the LLVM signature to take argc/argv/envp.
             // This widening is not expressible in the ABI seam (it adds
             // synthetic parameters not in the source signature), so it
-            // stays open-coded here.
+            // stays open-coded here.  `envp` shares argv's `char**` type.
             const ret_ty: LType = this.map_return_type(node);
             if (!ret_ty.is_valid()) { return; }
             const argv_ty: LType = LType::pointer_to(LType::pointer_to(LType::i8()));
-            const buf: void* = intrinsics::malloc(2 * 8);
+            const buf: void* = intrinsics::malloc(3 * 8);
             const slots: void** = buf as void**;
             slots[0] = LType::i32().raw;
             slots[1] = argv_ty.raw;
-            fn_type = LType::function_type(ret_ty, buf, 2, false);
+            slots[2] = argv_ty.raw;
+            fn_type = LType::function_type(ret_ty, buf, 3, false);
             intrinsics::free(buf);
         } else {
             mut params: TypeRef[] = [];
@@ -466,6 +527,13 @@ type struct DeclarationEmitter {
         // Add the function to the LLVM module.
         const fn_val: LValue = this.llvm_module.add_function(fn_name, fn_type);
         this.apply_spec_linkage(fn_val, node, fn_name, is_program_main);
+
+        // `--panic=unwind`: `fn_val` is now `__cryo_user_main`; synthesize the
+        // `main` wrapper that catches an uncaught panic at the root (see
+        // `wrap_main_unwind`).
+        if (wrap_main_unwind) {
+            this.emit_main_unwind_wrapper(fn_val, fn_type);
+        }
 
         // Phase 1: attach `sret(%T)` to LLVM parameter slot 0 when the
         // classifier promoted the return to Indirect.  Call sites detect
@@ -519,10 +587,26 @@ type struct DeclarationEmitter {
             if (this.ctx.emit_debug_info) {
                 this.abi.apply_frame_pointer_attribute(fn_val);
             }
+            // `![weak]` / `![naked]` / `![section]` linkage-and-placement.
+            this.apply_directive_effects(fn_val, node, fn_name);
         }
 
         // Register under qualified name (module scope).
         this.functions.register(qualified, fn_val);
+        // `![no_mangle]` / `![symbol("...")]`: call sites resolve a free
+        // function through its Cryo mangled symbol
+        // (`resolve_function_by_mangled` on `node.resolved_callee`).  With a
+        // link-name override the LLVM definition is named `link_name`, not the
+        // mangled symbol, so also register this fn_val under the mangled key -
+        // mirroring `declare_method`, whose registration under the mangled key
+        // is what makes `![symbol]` "invisible to callers" (see
+        // symbol_resolver.cryo:249).  Without it the by-mangled lookup misses
+        // and synthesizes a phantom extern under the now-nonexistent mangled
+        // name, producing an undefined-reference link error.  Gated on
+        // has_link_name so normal functions are byte-unchanged.
+        if (node.has_link_name) {
+            this.functions.register(mangled_sym, fn_val);
+        }
     }
 
     /// Declare all methods in an impl block.
@@ -686,7 +770,6 @@ type struct DeclarationEmitter {
     /// the base's layout with its own additions.
     collect_vtable_slots(mut &this, cls: ClassType*) -> VTableSlot[] {
         const arena: TypeArena* = this.get_arena();
-        const intern: InternTable* = this.get_intern();
 
         // Build chain = [cls, ..., root].
         mut chain: ClassType*[] = [];
@@ -709,16 +792,14 @@ type struct DeclarationEmitter {
                 if (!m.is_virtual) { continue; }
                 mut already: boolean = false;
                 for (mut ki: i64 = 0; ki < slots.length; ki++) {
-                    // Structural (display-name) equality, NOT raw-ID: this must
-                    // match how `find_vtable_slot_impl` / `vtable_slot_index`
-                    // look slots up. With raw-ID matching here, two virtual
-                    // declarations of the same overload whose param TypeRefs
-                    // resolved to different IDs (e.g. `Foo*` registered before
-                    // vs after the type finished resolving) produced two slots,
-                    // while the structural lookup then matched both to one
-                    // method - a duplicate slot / index skew.
+                    // Must use the SAME param equality as `find_vtable_slot_impl`
+                    // / `vtable_slot_index`, or slot construction and slot
+                    // lookup disagree: two virtual declarations of the same
+                    // overload counted as distinct here produce two slots, while
+                    // a laxer lookup then matches both to one method - a
+                    // duplicate slot / index skew.
                     if (slots[ki].name.equals(m.name) &&
-                        CodegenUtil::param_types_equal_structural(arena, intern,
+                        CodegenUtil::param_types_equal(
                             slots[ki].param_types, m.param_types)) {
                         already = true;
                         break;
@@ -755,16 +836,17 @@ type struct DeclarationEmitter {
             for (mut mi: i64 = 0; mi < walk.methods.length; mi++) {
                 const m: &MethodInfo = &walk.methods[mi];
                 if (!m.name.equals(slot_name)) { continue; }
-                // Use structural (display-name) equality on params instead of
-                // raw-ID matching: an override method's params can resolve to
-                // different TypeRef IDs than the virtual base's params even
-                // though they're semantically the same type (e.g. `ASTVisitor*`
+                // Param equality must agree with `collect_vtable_slots`, which
+                // built these slots.  It relies on canonical type identity: an
+                // override's params and the virtual base's params denote the
+                // same types and therefore share arena ids, even when the two
+                // declarations resolved at different points (e.g. `ASTVisitor*`
                 // registered before vs. after the visitor module finished
-                // resolving).  Strict ID matching here misses every override
-                // and the whole vtable bails (every `new <DerivedClass>` then
-                // skips the vtable store; runtime virtual dispatch crashes
-                // reading a null vtable pointer).
-                if (!CodegenUtil::param_types_equal_structural(arena, intern, m.param_types, slot_params)) { continue; }
+                // resolving).  If that ever stopped holding, this would miss
+                // every override and the whole vtable would bail (every
+                // `new <DerivedClass>` then skips the vtable store; runtime
+                // virtual dispatch crashes reading a null vtable pointer).
+                if (!CodegenUtil::param_types_equal(m.param_types, slot_params)) { continue; }
                 if (!m.is_virtual && !m.is_override) { continue; }
                 // Skip pure virtual declarations (virtual without body).
                 // Their LLVM function is a bare `declare` that links as an
@@ -835,21 +917,20 @@ type struct DeclarationEmitter {
     /// via `CallExprNode.resolved_method`; this function just maps that
     /// declaration to its slot position.
     ///
-    /// Uses *structural* param-type equality (display-name match) rather than
-    /// strict arena-ID match: an override method's parameter `Foo*` may be
-    /// registered under a different arena ID than the base method's `Foo*` if
-    /// the two declarations were resolved before/after `Foo`'s body was sealed,
-    /// even though they denote the same nominal pointer type.  Without this,
-    /// `node.accept(this)` on a base-class pointer falls back to a static call
-    /// to the base accept (which targets vtable slot 0, the no-op base
-    /// `visit(BaseNode*)`; silently dropping every visitor traversal).
+    /// Param-type matching goes through `param_types_equal` (canonical arena-id
+    /// compare), the same relation `collect_vtable_slots` used to build the
+    /// slots.  It matters that an override's parameter `Foo*` and the base
+    /// method's `Foo*` share one id even when the two declarations resolved
+    /// before/after `Foo`'s body was sealed - that is exactly what canonical
+    /// type identity provides.  Were they to diverge, `node.accept(this)` on a
+    /// base-class pointer would fall back to a static call to the base accept
+    /// (which targets vtable slot 0, the no-op base `visit(BaseNode*)`;
+    /// silently dropping every visitor traversal).
     vtable_slot_index(mut &this, cls: ClassType*, method_name: SymbolStr, param_types: TypeRef[]) -> i32 {
         const slots: VTableSlot[] = this.collect_vtable_slots(cls);
-        const arena: TypeArena* = this.get_arena();
-        const intern: InternTable* = this.get_intern();
         for (mut i: i32 = 0; i < slots.length as i32; i++) {
             if (slots[i].name.equals(method_name) &&
-                CodegenUtil::param_types_equal_structural(arena, intern,
+                CodegenUtil::param_types_equal(
                     slots[i].param_types, param_types)) {
                 return i;
             }
@@ -1266,6 +1347,8 @@ type struct DeclarationEmitter {
             if (this.ctx.emit_debug_info) {
                 this.abi.apply_frame_pointer_attribute(fn_val);
             }
+            // `![weak]` / `![section]` on a method (naked is function-only).
+            this.apply_directive_effects(fn_val, func, fn_name);
         }
 
         // Register under the combined key built above.  Also register against the
@@ -1397,30 +1480,6 @@ type struct DeclarationEmitter {
         }
     }
 
-    /// Generate IR for all function bodies in the program.
-    /// `visit_fn` is a callback that generates the body using the visitor.
-    generate_bodies(mut &this, program: ProgramNode*, visit_fn: void*) -> void {
-        const stmts: &ASTNode*[] = &program.statements;
-        for (mut i: i64 = 0; i < stmts.length; i++) {
-            const stmt: ASTNode* = stmts[i];
-            if (stmt == null) { continue; }
-
-            const kind: NodeKind = stmt.kind;
-
-            if (kind == NodeKind::FunctionDeclaration) {
-                const func: FunctionDeclNode* = stmt as FunctionDeclNode*;
-                if (func.generic_params.length > 0) { continue; }
-                if (func.body == null) { continue; }
-                // Body generation happens through the visitor.
-            } else if (kind == NodeKind::VariableDeclaration) {
-                const var_decl: VarDeclNode* = stmt as VarDeclNode*;
-                if (var_decl.is_global) {
-                    this.codegen_global_var(var_decl);
-                }
-            }
-        }
-    }
-
     /// Generate a global variable declaration with optional initializer.
     codegen_global_var(mut &this, node: VarDeclNode*) -> void {
         // Mangle definitions under the current module's namespace
@@ -1469,10 +1528,10 @@ type struct DeclarationEmitter {
             const lit: LiteralNode* = init_expr as LiteralNode*;
             const tk: LTypeKind = LType::kind_of(ty.raw);
             if (lit.literal_kind == LiteralKind::Integer && tk == LTypeKind::Integer) {
-                if (llvm::LLVMGetIntTypeWidth(ty.raw) == 128u32) {
+                if (llvm::LLVMGetIntTypeWidth(ty.raw) == 128) {
                     // 128-bit global: build from the digit string so a value
                     // above u64::MAX isn't truncated by the u64 const_int path.
-                    mut radix: u8 = 10u8;
+                    mut radix: u8 = 10;
                     const digits: string = CodegenUtil::int_literal_clean(lit.value, &radix);
                     init = LType::const_int_of_string(ty, digits, radix);
                 } else {
@@ -1494,7 +1553,7 @@ type struct DeclarationEmitter {
                 // `const SOME_TEXT: string = "..."` emits as `null`, which
                 // surfaces as literal "(null)" in any printf/format output
                 // that consumes the constant.
-                init = this.str_cache.get_or_create(lit.value, this.builder);
+                init = this.str_cache.get_or_create(lit.value, this.llvm_module);
             }
         }
         // Fold a constant-expression initializer that isn't a bare literal -
@@ -1522,7 +1581,7 @@ type struct DeclarationEmitter {
                 // family, INVALID_HANDLE_VALUE, ...).  Only widths <= 64 fold here;
                 // the u64 two's-complement result truncates to the global's width
                 // in LLVMConstInt, which is exact for those types.
-                if (llvm::LLVMGetIntTypeWidth(ty.raw) <= 64u32) {
+                if (llvm::LLVMGetIntTypeWidth(ty.raw) <= 64) {
                     mut ifold: u64 = 0;
                     if (DeclarationEmitter::try_fold_const_int(init_expr, &ifold)) {
                         init = LType::const_int(ty, ifold, true);
@@ -1549,6 +1608,12 @@ type struct DeclarationEmitter {
 
         if (!node.is_mutable) {
             global.set_global_constant(true);
+        }
+
+        // `![thread_local]`: emit as an LLVM thread-local global so each thread
+        // gets its own instance (see set_thread_local).
+        if (node.is_thread_local) {
+            global.set_thread_local(true);
         }
 
         // A C-imported const is referenced only as `cit::NAME` (a
@@ -1650,6 +1715,30 @@ type struct DeclarationEmitter {
         llvm::LLVMSetCurrentDebugLocation2(this.builder.raw, loc);
     }
 
+    /// Minimal prologue for a `![naked]` function: resolve the declared LLVM
+    /// function (registered by declare_function under its qualified name) and
+    /// open its entry block.  Deliberately emits NO parameter allocas, NO
+    /// arg-setup prologue, and pushes NO value scope - a naked body is a single
+    /// `asm { }` block that runs on the caller's frame and cannot name its
+    /// parameters.  Returns null (with a diagnostic) when no declaration
+    /// exists.  The caller caps the entry block with `unreachable` after
+    /// emitting the asm (inline asm is not a terminator; the asm performs the
+    /// real control transfer).
+    codegen_naked_prologue(mut &this, node: FunctionDeclNode*) -> LValue {
+        const qualified: SymbolStr = this.fn_qualified_name(node);
+        const fn_val: LValue = this.functions.get(qualified);
+        if (!fn_val.is_valid()) {
+            const fname: string = this.resolve(node.name);
+            this.diag.emit_warning_at_span(ErrorCode::E0606_FUNCTION_GENERATION_ERROR,
+                format("codegen: naked function '%s' has no LLVM declaration in this module; body skipped.", fname),
+                node.span);
+            return LValue::null();
+        }
+        const entry_bb: LBasicBlock = LBasicBlock::append(fn_val, "entry");
+        this.builder.position_at_end(entry_bb);
+        return fn_val;
+    }
+
     codegen_function_prologue(mut &this, node: FunctionDeclNode*) -> LValue {
         const ctx_ptr: CompilationContext* = this.ctx;
         const intern: InternTable* = ctx_ptr.intern_table;
@@ -1686,6 +1775,12 @@ type struct DeclarationEmitter {
             mut ir_name: string = intern.resolve(overload_mangled);
             if (node.name.equals(main_sym)) {
                 ir_name = "main";
+                // Under `--panic=unwind` declare_function emitted the user body's
+                // function under the internal symbol (the `main` symbol is the
+                // synthesized catch wrapper); attach the body to that same symbol.
+                if (this.ctx.project_panic_unwind && !this.ctx.project_no_runtime) {
+                    ir_name = "__cryo_user_main";
+                }
             }
             fn_val = this.llvm_module.get_named_function(ir_name);
         }
@@ -1820,9 +1915,14 @@ type struct DeclarationEmitter {
         // no parameters, so we read the synthetic params via LLVMGetParam
         // and forward them through the regular function-resolution path.
         // `intern` is already bound at the top of this function.
+        // Suppressed under `no_runtime`: main's signature was NOT widened
+        // (no argc/argv/envp), so there are no synthetic params to publish,
+        // and `std::env` is not linked in a freestanding build.
         const main_sym: SymbolStr = intern.intern("main");
-        if (node.name.equals(main_sym) && CodegenUtil::fixed_param_count(node) == 0) {
+        if (node.name.equals(main_sym) && CodegenUtil::fixed_param_count(node) == 0
+            && !this.ctx.project_no_runtime) {
             this.emit_set_args_call(fn_val);
+            this.emit_set_env_call(fn_val);
         }
 
         return fn_val;
@@ -1855,24 +1955,145 @@ type struct DeclarationEmitter {
         result = this.expr_ops.codegen_call(set_args_fn, set_args_ty, args, "");
     }
 
+    /// Emit `std::env::set_env(envp)` at the entry of the program's main,
+    /// publishing the environment pointer the C runtime passed as main's
+    /// third argument so `std::env::vars()` can enumerate it.  Mirrors
+    /// `emit_set_args_call`: looked up by qualified name (no hardcoded
+    /// mangle) and a silent no-op when the stdlib (or `set_env`) is absent,
+    /// so `--no-std` and freestanding mains still compile.  The main-widening
+    /// branch above gave main a synthetic third `char**` param at index 2.
+    emit_set_env_call(mut &this, main_fn: LValue) -> void {
+        const intern: InternTable* = this.get_intern();
+        const set_env_sym: SymbolStr = intern.intern("std::env::set_env");
+        const set_env_fn: LValue = this.resolver.resolve_function(set_env_sym);
+        if (!set_env_fn.is_valid()) { return; }
+
+        const set_env_ty: LType = LType {
+            raw: llvm::LLVMGlobalGetValueType(set_env_fn.raw),
+        };
+        if (!set_env_ty.is_valid()) { return; }
+
+        const envp: LValue = LValue { raw: llvm::LLVMGetParam(main_fn.raw, 2) };
+
+        mut args: Pair<LValue, TypeRef>[] = [];
+        args.push(Pair<LValue, TypeRef>::new(envp, TypeRef::invalid()));
+        mut result: LValue = LValue::null();
+        result = this.expr_ops.codegen_call(set_env_fn, set_env_ty, args, "");
+    }
+
+    /// Get-or-declare the external root-catch reporter `__cryo_panic_finish()`
+    /// (`void() -> never`, defined by the `panic/unwind` runtime tier): report
+    /// the stashed panic payload and exit 101.  Called only from the `main`
+    /// wrapper's catch pad.
+    get_or_decl_panic_finish(mut &this) -> LValue {
+        mut fn: LValue = this.llvm_module.get_named_function("__cryo_panic_finish");
+        if (fn.is_valid()) { return fn; }
+        const fty: LType = LType::function_type(LType::void_type(), null, 0, false);
+        return this.llvm_module.add_function("__cryo_panic_finish", fty);
+    }
+
+    /// Synthesize the `--panic=unwind` root-catch wrapper.  `user_main` is the
+    /// user's `main` (declared under the internal symbol `__cryo_user_main` with
+    /// signature `fn_type`); this emits a strong C `main` of the same signature
+    /// that forwards its arguments to `__cryo_user_main` inside a catch-all
+    /// landing pad:
+    ///
+    ///   define i32 @main(...) personality @__cryo_personality_v0 {
+    ///   entry: %r = invoke @__cryo_user_main(...args) to %cont unwind %lpad
+    ///   cont:  ret %r                       ; normal exit
+    ///   lpad:  landingpad {ptr,i32} catch null
+    ///          call @__cryo_panic_finish()  ; report + exit 101; never returns
+    ///          unreachable
+    ///   }
+    ///
+    /// Reaching the pad means a panic unwound out of `main` uncaught; being the
+    /// phase-1 handler makes phase 2 run every intermediate frame's cleanup pad
+    /// first, so destructors execute before the process ends.  The catch is
+    /// catch-all + unconditional (the selector is never inspected).
+    emit_main_unwind_wrapper(mut &this, user_main: LValue, fn_type: LType) -> void {
+        const wrapper: LValue = this.llvm_module.add_function("main", fn_type);
+        if (!wrapper.is_valid()) { return; }
+
+        const pers: LValue = this.expr_ops.get_or_decl_personality();
+        if (pers.is_valid()) { wrapper.set_personality_fn(pers); }
+
+        const saved_bb: LBasicBlock = this.builder.get_insert_block();
+
+        const entry_bb: LBasicBlock = LBasicBlock::append(wrapper, "entry");
+        const cont_bb:  LBasicBlock = LBasicBlock::append(wrapper, "cont");
+        const lpad_bb:  LBasicBlock = LBasicBlock::append(wrapper, "lpad");
+
+        this.builder.position_at_end(entry_bb);
+
+        // Forward every parameter (argc/argv/envp, or the user signature) to
+        // __cryo_user_main.
+        const nparams: u32 = llvm::LLVMCountParamTypes(fn_type.raw);
+        mut arg_buf: void* = null;
+        if (nparams > 0) {
+            arg_buf = intrinsics::malloc(nparams as u64 * 8);
+            const arg_slots: void** = arg_buf as void**;
+            for (mut i: u32 = 0; i < nparams; i++) {
+                arg_slots[i] = wrapper.get_param(i).raw;
+            }
+        }
+        const r: LValue = this.builder.build_invoke(
+            fn_type, user_main, arg_buf, nparams, cont_bb, lpad_bb, "");
+        if (arg_buf != null) { intrinsics::free(arg_buf); }
+
+        // Normal exit: return the user main's result (or void).
+        this.builder.position_at_end(cont_bb);
+        const ret_ty: LType = LType { raw: llvm::LLVMGetReturnType(fn_type.raw) };
+        if (LType::kind_of(ret_ty.raw) == LTypeKind::Void) {
+            this.builder.build_ret_void();
+        } else {
+            this.builder.build_ret(r);
+        }
+
+        // Uncaught panic reached the root: catch-all, report + exit 101.
+        this.builder.position_at_end(lpad_bb);
+        const lpad_ty: LType = this.expr_ops.landingpad_type();
+        const lp: LValue = this.builder.build_landing_pad(lpad_ty, 1, "eh");
+        lp.add_clause(LType::const_pointer_null(LType::pointer_to(LType::i8())));
+        const finish_fn: LValue = this.get_or_decl_panic_finish();
+        const finish_ty: LType = LType::function_type(LType::void_type(), null, 0, false);
+        this.builder.build_call(finish_ty, finish_fn, null, 0, "");
+        this.builder.build_unreachable();
+
+        if (saved_bb.is_valid()) { this.builder.position_at_end(saved_bb); }
+    }
+
     /// Emit implicit void return ONLY for void/unit functions.
     /// Non-void functions must have explicit returns from the source code.
     /// If a non-void function's block has no terminator, body generation
     /// failed; the caller will strip it back to a declare.
+    ///
+    /// `never` is the exception: it declares that control does not leave the
+    /// function normally, so falling off the end is unreachable rather than a
+    /// missing `return`.  The compiler cannot verify the claim - the divergent
+    /// primitives a `never` body ends in (`sys::exit`, `abort`) are typed
+    /// `void` - so the annotation is taken at its word, exactly as the call
+    /// side already does when it emits `unreachable` after a `never`-returning
+    /// call.  Without this the block stays unterminated and the body validator
+    /// discards the whole function.
     codegen_function_epilogue(mut &this, node: FunctionDeclNode*) -> void {
         const current_bb: LBasicBlock = this.builder.get_insert_block();
         if (current_bb.is_valid() && !current_bb.has_terminator()) {
             const ret_ty: TypeRef = node.resolved_return_type;
             mut is_void: boolean = ret_ty.is_invalid();
+            mut is_never: boolean = false;
             if (!is_void) {
                 const t: Type* = this.lookup_type_by_id(ret_ty.id);
                 is_void = t != null && (t.kind == TypeKind::Void || t.kind == TypeKind::Unit);
+                is_never = t != null && t.kind == TypeKind::Never;
             }
             if (is_void) {
                 this.expr_ops.emit_va_end_if_variadic(CodegenUtil::variadic_param_name(node));
                 this.builder.build_ret_void();
+            } else if (is_never) {
+                this.expr_ops.emit_va_end_if_variadic(CodegenUtil::variadic_param_name(node));
+                this.builder.build_unreachable();
             }
-            // Non-void: intentionally leave unterminated. The caller
+            // Other non-void: intentionally leave unterminated. The caller
             // detects this and strips the function body.
         }
 
@@ -2305,7 +2526,7 @@ type struct DeclarationEmitter {
             mut a: u64 = 0;
             if (!DeclarationEmitter::try_fold_const_int(u.operand, &a)) { return false; }
             const op: string = u.op.lexeme;
-            if (op == "-") { *out = 0u64 - a; return true; }
+            if (op == "-") { *out = 0 - a; return true; }
             if (op == "+") { *out = a;        return true; }
             if (op == "~") { *out = ~a;       return true; }
             return false;
@@ -2340,7 +2561,7 @@ type struct DeclarationEmitter {
     /// fallback - correct-or-decline, never a silently wrong layout.
     static try_const_struct(sl: StructLiteralNode*, ty: LType) -> LValue {
         const n: u32 = llvm::LLVMCountStructElementTypes(ty.raw);
-        if (n == 0u32 || (sl.field_inits.length as u32) != n) { return LValue::null(); }
+        if (n == 0 || (sl.field_inits.length as u32) != n) { return LValue::null(); }
         const buf: void* = intrinsics::malloc((n as u64) * 8);
         const slots: void** = buf as void**;
         mut ok: boolean = true;

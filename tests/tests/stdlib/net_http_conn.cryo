@@ -1,0 +1,456 @@
+///! HTTP/1.1 message framing over `BufStream<S>`.
+///!
+///! The blocking parser these replace read ONE BYTE PER SYSCALL and could not
+///! be driven through a shared buffer without losing the bytes it had already
+///! pulled past the header block — its own doc comment recorded that as a known
+///! limitation. So the property to pin is not "a request parses"; it is that
+///! several messages read through ONE connection buffer, with no relationship
+///! between message boundaries and fill boundaries.
+///!
+///! Each test therefore asserts a NUMBER, and the hermetic pair asserts the
+///! FILL COUNT: two complete responses that arrive in a single fill must cost
+///! exactly one fill, and the same two split one byte per fill must parse
+///! identically. A parser that re-read the transport per message, or that lost
+///! the tail of a fill, fails one of those two and passes the other.
+///!
+///! The loopback tests drive a real `Executor` (worker pool + reactor) over an
+///! EPHEMERAL port (`:0`), so concurrent runs never collide. Every failure is a
+///! distinct negative number, so a red test names its own step.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::NetHttpConn;
+
+import std::core::option;
+import std::core::result;
+import std::core::drop;
+import std::core::slice;
+import std::collections::str;
+import std::collections::string;
+import std::collections::array;
+import std::future;
+import std::io::error;
+import std::io::traits;
+import std::io::buf;
+import std::net::addr::socket_addr;
+import std::net::socket::tcp;
+import std::net::http::method;
+import std::net::http::status;
+import std::net::http::headers;
+import std::net::http::request;
+import std::net::http::response;
+import std::net::http::conn;
+import std::net::http::client;
+import std::test::error;
+import std::test::assert;
+
+// ============================================================================
+// An in-memory transport, so the framing tests need no reactor and no socket.
+//
+// `chunk == 0` hands over everything available in one operation; a positive
+// `chunk` caps each one, which is how a message is forced to straddle fills.
+// `fills` counts read operations: a parser that re-reads the transport once per
+// message shows up as a count, not just as a wrong answer.
+// ============================================================================
+
+type struct MemTransport {
+    inbox:  Array<u8>;
+    ipos:   u64;
+    outbox: Array<u8>;
+    chunk:  u64;
+    fills:  i64;
+
+    static of(text: string, chunk: u64) -> MemTransport {
+        mut d: Array<u8> = Array<u8>::new();
+        const b: Slice<u8> = Str::new(text).as_bytes();
+        mut i: u64 = 0;
+        while (i < b.length()) {
+            match (b.get(i)) {
+                Option::Some(byte) => { d.push(byte); }
+                Option::None       => { }
+            }
+            i = i + 1;
+        }
+        return MemTransport { inbox: d, ipos: 0, outbox: Array<u8>::new(),
+                              chunk: chunk, fills: 0 };
+    }
+}
+
+implement trait Drop for struct MemTransport {
+    drop(mut &this) -> void {
+        this.inbox.drop();
+        this.outbox.drop();
+    }
+}
+
+implement trait AsyncTransport for struct MemTransport {
+    async read_into(mut &this, buf: Array<u8>) -> Transfer {
+        mut out: Array<u8> = buf;
+        this.fills = this.fills + 1;
+        mut take: u64 = this.inbox.length() - this.ipos;
+        if (this.chunk > 0 && take > this.chunk) { take = this.chunk; }
+        if (take > out.length())                 { take = out.length(); }
+        mut i: u64 = 0;
+        while (i < take) {
+            match (this.inbox.get(this.ipos + i)) {
+                Option::Some(byte) => { out.set(i, byte); }
+                Option::None       => { }
+            }
+            i = i + 1;
+        }
+        this.ipos = this.ipos + take;
+        out.truncate(take);
+        return Transfer { buf: out, result: Result::Ok(take) };
+    }
+
+    async write_from(mut &this, buf: Array<u8>) -> Transfer {
+        mut src: Array<u8> = buf;
+        mut take: u64 = src.length();
+        if (this.chunk > 0 && take > this.chunk) { take = this.chunk; }
+        mut i: u64 = 0;
+        while (i < take) {
+            match (src.get(i)) {
+                Option::Some(byte) => { this.outbox.push(byte); }
+                Option::None       => { }
+            }
+            i = i + 1;
+        }
+        return Transfer { buf: src, result: Result::Ok(take) };
+    }
+}
+
+function hc_bytes_eq(a: &Array<u8>, text: string) -> boolean {
+    const b: Slice<u8> = Str::new(text).as_bytes();
+    if (a.length() != b.length()) { return false; }
+    mut i: u64 = 0;
+    while (i < a.length()) {
+        mut x: u8 = 0;
+        mut y: u8 = 1;
+        match (a.get(i)) { Option::Some(v) => { x = v; } Option::None => { } }
+        match (b.get(i)) { Option::Some(v) => { y = v; } Option::None => { } }
+        if (x != y) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+const TWO_RESPONSES: string =
+    "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhelloHTTP/1.1 404 Not Found\r\nContent-Length: 3\r\n\r\nbye";
+
+// ============================================================================
+// Hermetic: two pipelined responses through one connection buffer.
+// ============================================================================
+
+/// Parse both responses off one connection and return the number of transport
+/// reads it took. Assertions on the parsed values are folded in as negative
+/// returns, so a wrong body can never be mistaken for a fill count.
+async function hc_two_responses(chunk: u64) -> i64 {
+    mut c: BufStream<MemTransport> =
+        BufStream<MemTransport>::of(MemTransport::of(TWO_RESPONSES, chunk));
+
+    mut first: Response = match (await c.read_response()) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { return -1; }
+    };
+    if (first.status.as_u16() != 200)       { return -2; }
+    if (!hc_bytes_eq(&first.body, "hello"))    { return -3; }
+
+    mut second: Response = match (await c.read_response()) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { return -4; }
+    };
+    if (second.status.as_u16() != 404)      { return -5; }
+    if (!hc_bytes_eq(&second.body, "bye"))     { return -6; }
+
+    return c.transport().fills;
+}
+
+/// Both responses arrive together, so the second must be parsed entirely out of
+/// bytes already buffered: exactly ONE transport read for the pair. A parser
+/// that discarded the tail of a fill at a message boundary would need a second.
+![test]
+function http_conn_reads_two_pipelined_responses_in_one_fill() -> Result<(), TestError> {
+    const fills: i64 = future::block_on(hc_two_responses(0));
+    return expect_eq(fills, 1 as i64);
+}
+
+/// The control: the same two responses, one byte per fill, so every message
+/// straddles many fills and no header or body lands whole. Same parse, and the
+/// fill count is now the byte count — which is what makes the `1` above mean
+/// something.
+![test]
+function http_conn_reads_the_same_pair_split_one_byte_per_fill() -> Result<(), TestError> {
+    const fills: i64 = future::block_on(hc_two_responses(1));
+    return expect_eq(fills, Str::new(TWO_RESPONSES).length() as i64);
+}
+
+/// A response announcing more body than the peer sends is `UnexpectedEof`, not
+/// a short read and not a hang.
+async function hc_truncated_response() -> i64 {
+    mut c: BufStream<MemTransport> = BufStream<MemTransport>::of(
+        MemTransport::of("HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nfour", 0));
+    match (await c.read_response()) {
+        Result::Ok(_)  => { return -1; }
+        Result::Err(e) => {
+            match (e.kind) {
+                IoErrorKind::UnexpectedEof => { return 1; }
+                _                          => { return -2; }
+            }
+        }
+    }
+}
+
+![test]
+function http_conn_reports_a_truncated_body_as_eof() -> Result<(), TestError> {
+    return expect_eq(future::block_on(hc_truncated_response()), 1 as i64);
+}
+
+/// A `Content-Length` that is not a number is a framing error: guessing zero
+/// would leave the body in the buffer to be read as the next message.
+async function hc_bad_content_length() -> i64 {
+    mut c: BufStream<MemTransport> = BufStream<MemTransport>::of(
+        MemTransport::of("HTTP/1.1 200 OK\r\nContent-Length: abc\r\n\r\n", 0));
+    match (await c.read_response()) {
+        Result::Ok(_)  => { return -1; }
+        Result::Err(e) => {
+            match (e.kind) {
+                IoErrorKind::InvalidData => { return 1; }
+                _                        => { return -2; }
+            }
+        }
+    }
+}
+
+![test]
+function http_conn_rejects_a_non_numeric_content_length() -> Result<(), TestError> {
+    return expect_eq(future::block_on(hc_bad_content_length()), 1 as i64);
+}
+
+/// A request encoded into `pending()` and read straight back off the same
+/// connection: the encoder and the parser have to agree byte for byte, and this
+/// is the cheapest place to find out that they do not.
+async function hc_encode_then_parse() -> i64 {
+    mut wire: BufStream<MemTransport> =
+        BufStream<MemTransport>::of(MemTransport::of("", 0));
+
+    mut req: Request = Request::new(Method::Post, Str::new("/submit"));
+    req.headers.insert(Str::new("Content-Type"), Str::new("text/plain"));
+    mut payload: Array<u8> = Array<u8>::new();
+    payload.append(Str::new("hello").as_bytes());
+    req.set_body(payload);
+    match (req.encode_into(wire.pending())) {
+        Result::Ok(_)  => { }
+        Result::Err(_) => { return -1; }
+    }
+
+    // Move the encoded bytes into a fresh connection's inbox and parse them.
+    mut encoded: Array<u8> = Array<u8>::new();
+    match (encoded.try_append(wire.pending().as_slice())) {
+        Result::Ok(_)  => { }
+        Result::Err(_) => { return -2; }
+    }
+    mut back: BufStream<MemTransport> =
+        BufStream<MemTransport>::of(MemTransport::of("", 0));
+    match (back.transport().inbox.try_append(encoded.as_slice())) {
+        Result::Ok(_)  => { }
+        Result::Err(_) => { return -3; }
+    }
+
+    mut parsed: Request = match (await back.read_request()) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { return -4; }
+    };
+    if (parsed.path.as_str() != Str::new("/submit"))    { return -5; }
+    if (!hc_bytes_eq(&parsed.body, "hello"))            { return -6; }
+    match (parsed.headers.get(Str::new("content-type"))) {
+        Option::Some(mut v) => {
+            if (v.as_str() != Str::new("text/plain"))   { return -7; }
+        }
+        Option::None => { return -8; }
+    }
+    return 1;
+}
+
+![test]
+function http_conn_encoded_request_parses_back_identically() -> Result<(), TestError> {
+    return expect_eq(future::block_on(hc_encode_then_parse()), 1 as i64);
+}
+
+// ============================================================================
+// Loopback, over a real reactor.
+// ============================================================================
+
+/// Serve `n` requests on ONE accepted connection, echoing each path back as the
+/// body. The connection is an owning local awaited on repeatedly from inside a
+/// loop — the shape a keep-alive server has and the shape nothing exercised
+/// before the port.
+async function hc_serve(listener: TcpListener, n: i64) -> i64 {
+    mut acc: TcpAccepted = await TcpAccept::start(listener);
+    mut lst: TcpListener = acc.take_listener();
+    lst.drop();
+
+    mut stream: TcpStream = TcpStream::from_fd(-1);
+    match (acc.take_result()) {
+        Result::Ok(s)  => { stream = s; }
+        Result::Err(_) => { return -20; }
+    }
+    mut c: BufStream<TcpStream> = BufStream<TcpStream>::of(stream);
+
+    mut served: i64 = 0;
+    while (served < n) {
+        mut req: Request = match (await c.read_request()) {
+            Result::Ok(v)  => { v }
+            Result::Err(_) => { return -21; }
+        };
+        // Echo the path, so every exchange carries a DIFFERENT body and a
+        // response served from a stale buffer is visible as a wrong one.
+        mut resp: Response = Response::text(StatusCode::ok(), req.path.as_str());
+        match (resp.encode_into(c.pending())) {
+            Result::Ok(_)  => { }
+            Result::Err(_) => { return -22; }
+        }
+        match (await c.flush()) {
+            Result::Ok(_)  => { }
+            Result::Err(_) => { return -23; }
+        }
+        served = served + 1;
+    }
+    return served;
+}
+
+/// The keep-alive client half: `n` requests down one connection, each path
+/// distinct, each response checked against the path that produced it.
+async function hc_request_n(port: u16, n: i64) -> i64 {
+    mut sock: TcpStream = match (await TcpConnect::start(SocketAddr::localhost_v4(port))) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { return -30; }
+    };
+    mut c: BufStream<TcpStream> = BufStream<TcpStream>::of(sock);
+
+    mut sent: i64 = 0;
+    while (sent < n) {
+        mut path: String = String::from_str(Str::new("/p"));
+        path.push_byte((0x30 + sent) as u8);
+
+        mut req: Request = Request::new(Method::Get, path.as_str());
+        req.headers.insert(Str::new("Host"), Str::new("127.0.0.1"));
+        match (req.encode_into(c.pending())) {
+            Result::Ok(_)  => { }
+            Result::Err(_) => { return -31; }
+        }
+        match (await c.flush()) {
+            Result::Ok(_)  => { }
+            Result::Err(_) => { return -32; }
+        }
+
+        mut resp: Response = match (await c.read_response()) {
+            Result::Ok(v)  => { v }
+            Result::Err(_) => { return -33; }
+        };
+        if (resp.status.as_u16() != 200) { return -34; }
+        // The body is the path the server read, so a mismatch here means the
+        // exchanges desynchronized rather than merely that a byte was wrong.
+        if (resp.body.length() != path.length()) { return -35; }
+        mut k: u64 = 0;
+        while (k < path.length()) {
+            mut lhs: u8 = 0;
+            mut rhs: u8 = 1;
+            match (resp.body.get(k))            { Option::Some(v) => { lhs = v; } Option::None => { } }
+            match (path.as_str().byte_at(k))    { Option::Some(v) => { rhs = v; } Option::None => { } }
+            if (lhs != rhs) { return -36; }
+            k = k + 1;
+        }
+        sent = sent + 1;
+    }
+    return sent;
+}
+
+async function hc_keep_alive(port: u16, listener: TcpListener, n: i64) -> i64 {
+    const pair: (i64, i64) = await Futures::join(hc_serve(listener, n),
+                                                 hc_request_n(port, n));
+    if (pair.0 != n) { return pair.0; }
+    if (pair.1 != n) { return pair.1; }
+    return 0;
+}
+
+![test]
+function http_conn_four_exchanges_on_one_connection() -> Result<(), TestError> {
+    mut listener: TcpListener = match (TcpListener::bind(SocketAddr::localhost_v4(0))) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { return bail(Str::new("bind 127.0.0.1:0 failed")); }
+    };
+    listener.set_nonblocking(true);
+    const port: u16 = match (listener.local_addr()) {
+        Result::Ok(a)  => { a.port }
+        Result::Err(_) => { listener.drop(); return bail(Str::new("local_addr failed")); }
+    };
+    mut ex: Executor = Executor::new();
+    const r: i64 = ex.block_on(hc_keep_alive(port, listener, 4 as i64));
+    ex.drop();
+    return expect_eq(r, 0 as i64);
+}
+
+/// The control for the loop: ONE exchange on the same code path. If this passes
+/// and the four-exchange test does not, the fault is in carrying the connection
+/// round a loop rather than in the framing.
+![test]
+function http_conn_one_exchange_on_one_connection() -> Result<(), TestError> {
+    mut listener: TcpListener = match (TcpListener::bind(SocketAddr::localhost_v4(0))) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { return bail(Str::new("bind 127.0.0.1:0 failed")); }
+    };
+    listener.set_nonblocking(true);
+    const port: u16 = match (listener.local_addr()) {
+        Result::Ok(a)  => { a.port }
+        Result::Err(_) => { listener.drop(); return bail(Str::new("local_addr failed")); }
+    };
+    mut ex: Executor = Executor::new();
+    const r: i64 = ex.block_on(hc_keep_alive(port, listener, 1 as i64));
+    ex.drop();
+    return expect_eq(r, 0 as i64);
+}
+
+// ============================================================================
+// The client, end to end.
+// ============================================================================
+
+/// Answer exactly one request with a fixed body, then let the connection close.
+async function hc_serve_one(listener: TcpListener) -> i64 {
+    return await hc_serve(listener, 1 as i64);
+}
+
+async function hc_get_via_client(port: u16) -> i64 {
+    mut cl: Client = Client::new();
+    mut resp: Response = match (await cl.get(SocketAddr::localhost_v4(port),
+                                             Str::new("/hi"))) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { return -40; }
+    };
+    if (resp.status.as_u16() != 200)     { return -41; }
+    if (!hc_bytes_eq(&resp.body, "/hi"))    { return -42; }
+    return 1;
+}
+
+async function hc_client_round_trip(port: u16, listener: TcpListener) -> i64 {
+    const pair: (i64, i64) = await Futures::join(hc_serve_one(listener),
+                                                 hc_get_via_client(port));
+    if (pair.0 != 1) { return pair.0; }
+    if (pair.1 != 1) { return pair.1; }
+    return 0;
+}
+
+![test]
+function http_client_get_round_trips_over_a_real_socket() -> Result<(), TestError> {
+    mut listener: TcpListener = match (TcpListener::bind(SocketAddr::localhost_v4(0))) {
+        Result::Ok(v)  => { v }
+        Result::Err(_) => { return bail(Str::new("bind 127.0.0.1:0 failed")); }
+    };
+    listener.set_nonblocking(true);
+    const port: u16 = match (listener.local_addr()) {
+        Result::Ok(a)  => { a.port }
+        Result::Err(_) => { listener.drop(); return bail(Str::new("local_addr failed")); }
+    };
+    mut ex: Executor = Executor::new();
+    const r: i64 = ex.block_on(hc_client_round_trip(port, listener));
+    ex.drop();
+    return expect_eq(r, 0 as i64);
+}

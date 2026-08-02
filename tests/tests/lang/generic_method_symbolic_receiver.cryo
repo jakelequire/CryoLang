@@ -1,0 +1,159 @@
+// A GENERIC method called on a receiver whose type mentions the ENCLOSING
+// generic parameter - `i.put<u32>(x)` where `i: Inner<S>` inside `f<S>`.
+//
+// `symbolic_type_unresolved` is true for any receiver type that merely CONTAINS
+// a generic param, so such a receiver was routed to the abstract-receiver stash,
+// whose method lookup is off the receiver's TRAIT BOUNDS. An instantiation like
+// `Inner<S>` names no method that way, so nothing was stashed - and sema's stash
+// is the ONLY producer of method-spec demand. The monomorphizer takes a generic
+// method's bindings solely from it, so no specialization was ever minted and
+// codegen reported E0636 "no method found". A receiver whose type args are
+// symbolic is not abstract for method lookup: its base template is known, and
+// its methods resolve through that template.
+//
+// The failure was invisible whenever anything else in the program happened to
+// instantiate the same method spec, because codegen falls back to a name-based
+// `Type::method` symbol - so a concrete-receiver sibling elsewhere in the file
+// masked it entirely. That is why the subjects here are reached ONLY through
+// symbolic receivers, and why the concrete control lives on its own type: a
+// shared one would re-create the mask and the test would pass either way.
+//
+// Every result is a NUMBER that depends on the method's own type argument
+// (`sizeof(T)`), because the adjacent hazard is not a missing spec but a
+// COLLAPSED one: two instantiations of a method whose signature does not
+// otherwise mention `T` can mangle to the same symbol, and every call then
+// reaches the first body emitted. `put<u32>` and `put<u64>` are called from
+// symbolic receivers for exactly that reason - a collapse reads as 14 twice.
+![config(testing)]
+namespace CryoTests::Tests::Lang::GenericMethodSymbolicReceiver;
+
+import std::core::result;
+import std::test::error;
+import std::test::assert;
+
+type trait GmsrSink {
+    room(&this) -> u64;
+    // A generic DEFAULT method: one of the two declaration sites that must reach
+    // specialization from a symbolic receiver.
+    put<T>(&this, v: T) -> u64 { return this.room() + sizeof(T) as u64; }
+}
+
+type struct GmsrInner<S> {
+    seed: S;
+    static new(s: S) -> GmsrInner<S> { return GmsrInner<S> { seed: s }; }
+    // A generic INHERENT method: the other declaration site.
+    own<T>(&this, v: T) -> u64 { return 100 + sizeof(T) as u64; }
+}
+
+implement<S> trait GmsrSink for GmsrInner<S> {
+    room(&this) -> u64 { return 10; }
+}
+
+// A separate owner for the concrete control, so it cannot mint a spec that
+// masks a missing one on the subjects above.
+type struct GmsrPlain {
+    v: i32;
+    static new(v: i32) -> GmsrPlain { return GmsrPlain { v: v }; }
+    own<T>(&this, v: T) -> u64 { return 100 + sizeof(T) as u64; }
+}
+implement trait GmsrSink for GmsrPlain {
+    room(&this) -> u64 { return 10; }
+}
+
+// -- SUBJECTS: the receiver's type mentions the enclosing `S` --
+
+// Receiver is a PARAMETER.
+function gmsr_param_default<S>(i: GmsrInner<S>*) -> u64 { return i.put<u32>(7); }
+function gmsr_param_inherent<S>(i: GmsrInner<S>*) -> u64 { return i.own<u32>(7); }
+// A SECOND method type-arg through the same call shape: distinct specialization.
+function gmsr_param_wide<S>(i: GmsrInner<S>*) -> u64 { return i.put<u64>(7); }
+// The method type-arg INFERRED from the argument rather than turbofished.
+function gmsr_param_inferred<S>(i: GmsrInner<S>*) -> u64 { return i.put(7u64); }
+// The method type-arg IS the enclosing generic parameter.
+function gmsr_param_enclosing<S>(i: GmsrInner<S>*, s: S) -> u64 { return i.put<S>(s); }
+
+// Receiver is a LOCAL whose type mentions the enclosing `S`.
+function gmsr_local_default<S>(s: S) -> u64 {
+    const i: GmsrInner<S> = GmsrInner<S>::new(s);
+    return i.put<u32>(7);
+}
+
+// -- CONTROLS: shapes that already worked and must keep working --
+
+// A NON-generic method on the same symbolic receiver.
+function gmsr_param_nongeneric<S>(i: GmsrInner<S>*) -> u64 { return i.room(); }
+
+![test]
+function symbolic_param_receiver_trait_default() -> Result<(), TestError> {
+    mut n: GmsrInner<i32> = GmsrInner<i32>::new(1);
+    return expect_eq(gmsr_param_default<i32>(&n) as i64, 14);
+}
+
+![test]
+function symbolic_param_receiver_inherent_method() -> Result<(), TestError> {
+    mut n: GmsrInner<i32> = GmsrInner<i32>::new(1);
+    return expect_eq(gmsr_param_inherent<i32>(&n) as i64, 104);
+}
+
+![test]
+function symbolic_receiver_specs_do_not_collapse() -> Result<(), TestError> {
+    mut n: GmsrInner<i32> = GmsrInner<i32>::new(1);
+    // Same owner, same call shape, two different method type args. A collapsed
+    // specialization returns the same number twice.
+    match (expect_eq(gmsr_param_default<i32>(&n) as i64, 14)) {
+        Result::Ok(_)  => {}
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(gmsr_param_wide<i32>(&n) as i64, 18);
+}
+
+// The method type argument INFERRED from a suffixed literal rather than
+// turbofished. This was red until the suffix became the literal's type: it is
+// the one shape where no context can supply `T`, so a discarded suffix left the
+// polymorphic-literal default (4 bytes) binding `T` and returned 14. See
+// `lang/numeric_literal_suffix.cryo` for the rule itself.
+![test]
+function symbolic_receiver_inferred_type_arg() -> Result<(), TestError> {
+    mut n: GmsrInner<i32> = GmsrInner<i32>::new(1);
+    return expect_eq(gmsr_param_inferred<i32>(&n) as i64, 18);
+}
+
+![test]
+function symbolic_receiver_method_arg_is_enclosing_param() -> Result<(), TestError> {
+    mut n: GmsrInner<i32> = GmsrInner<i32>::new(1);
+    return expect_eq(gmsr_param_enclosing<i32>(&n, 1) as i64, 14);
+}
+
+![test]
+function symbolic_local_receiver() -> Result<(), TestError> {
+    return expect_eq(gmsr_local_default<i32>(1) as i64, 14);
+}
+
+![test]
+function two_owner_instantiations_stay_distinct() -> Result<(), TestError> {
+    // The owner's own argument varies while the method's stays fixed; both
+    // specializations must exist and agree on the method result.
+    mut a: GmsrInner<i32> = GmsrInner<i32>::new(1);
+    mut b: GmsrInner<u64> = GmsrInner<u64>::new(1);
+    match (expect_eq(gmsr_param_default<i32>(&a) as i64, 14)) {
+        Result::Ok(_)  => {}
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(gmsr_param_default<u64>(&b) as i64, 14);
+}
+
+![test]
+function control_nongeneric_method_on_symbolic_receiver() -> Result<(), TestError> {
+    mut n: GmsrInner<i32> = GmsrInner<i32>::new(1);
+    return expect_eq(gmsr_param_nongeneric<i32>(&n) as i64, 10);
+}
+
+![test]
+function control_concrete_receiver_still_specializes() -> Result<(), TestError> {
+    const p: GmsrPlain = GmsrPlain::new(1);
+    match (expect_eq(p.put<u32>(7) as i64, 14)) {
+        Result::Ok(_)  => {}
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(p.own<u64>(7) as i64, 108);
+}

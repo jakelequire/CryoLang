@@ -14,6 +14,8 @@
 namespace Compiler::Sema::Helpers;
 
 import Compiler::AST;
+import Compiler::ConstTable;
+import Compiler::Resolver::SymbolStr;
 import Compiler::AST::Node;
 import Compiler::AST::Expression;
 import Compiler::Lex;
@@ -58,6 +60,57 @@ public function sema_default_int_type(arena: TypeArena*, value: string) -> TypeR
     if (!int_literal_exceeds(value, SEMA_I32_MAX_MAG)) { return arena.get_i32(); }
     if (!int_literal_exceeds(value, SEMA_I64_MAX_MAG)) { return arena.get_i64(); }
     return arena.get_u64();
+}
+
+/// The type named by a numeric literal's type suffix (`"u64"` -> `u64`), or an
+/// invalid ref when the literal carries none.  A suffix is a written-down type,
+/// so it settles the literal outright: neither the expected-type adoption above
+/// nor the magnitude default applies.  The suffix set is the lexer's
+/// (`Lexer::is_valid_numeric_suffix`); anything outside it never reaches here.
+public function sema_numeric_suffix_type(arena: TypeArena*, suffix: string) -> TypeRef {
+    if (suffix == "")     { return TypeRef::invalid(); }
+    if (suffix == "i8")   { return arena.get_i8();   }
+    if (suffix == "i16")  { return arena.get_i16();  }
+    if (suffix == "i32")  { return arena.get_i32();  }
+    if (suffix == "i64")  { return arena.get_i64();  }
+    if (suffix == "i128") { return arena.get_i128(); }
+    if (suffix == "u8")   { return arena.get_u8();   }
+    if (suffix == "u16")  { return arena.get_u16();  }
+    if (suffix == "u32")  { return arena.get_u32();  }
+    if (suffix == "u64")  { return arena.get_u64();  }
+    if (suffix == "u128") { return arena.get_u128(); }
+    if (suffix == "f32")  { return arena.get_f32();  }
+    if (suffix == "f64")  { return arena.get_f64();  }
+    return TypeRef::invalid();
+}
+
+/// True when `expr` is a numeric literal written with a type suffix (`7u64`),
+/// including one reached through a sign/bitwise-not prefix (`-7i8`).  Such a
+/// literal is NOT width-polymorphic, so the generic-inference paths must bind
+/// a type parameter from it rather than skipping it as an adoptable default.
+public function sema_expr_has_numeric_suffix(expr: ExpressionNode*) -> boolean {
+    if (expr == null) { return false; }
+    const node: ASTNode* = expr as ASTNode*;
+    if (node.kind == NodeKind::Literal) {
+        const lit: LiteralNode* = expr as LiteralNode*;
+        return lit.suffix != "";
+    }
+    if (node.kind == NodeKind::UnaryExpression) {
+        const u: UnaryExprNode* = expr as UnaryExprNode*;
+        if (u.op.lexeme == "-" || u.op.lexeme == "+" || u.op.lexeme == "~") {
+            return sema_expr_has_numeric_suffix(u.operand);
+        }
+        return false;
+    }
+    // An arithmetic constant is suffix-typed when EITHER operand names a type:
+    // `1u64 << 40` is a u64 shift, and treating the whole expression as
+    // polymorphic would re-type it back to the default width.
+    if (node.kind == NodeKind::BinaryExpression) {
+        const b: BinaryExprNode* = expr as BinaryExprNode*;
+        return sema_expr_has_numeric_suffix(b.left)
+            || sema_expr_has_numeric_suffix(b.right);
+    }
+    return false;
 }
 
 
@@ -131,6 +184,33 @@ public function is_wide_int_type(arena: TypeArena*, ty: TypeRef) -> boolean {
     if (t == null || t.kind != TypeKind::Int) { return false; }
     const it: IntType* = t as IntType*;
     return it.int_kind.bit_width() >= 64;
+}
+
+/// True when `ty` is a narrower-than-f64 float type.  Gates pushing a param
+/// slot's type onto a bare float literal: such a literal defaults to f64, and
+/// unlike the integer path there is no float width coercion at the call
+/// boundary, so an f64 value reaching an `f32` slot is passed to the callee as
+/// a `double` against a `float` signature.
+public function is_narrow_float_type(arena: TypeArena*, ty: TypeRef) -> boolean {
+    if (!ty.is_valid()) { return false; }
+    const t: Type* = arena.lookup(ty.id);
+    if (t == null || t.kind != TypeKind::Float) { return false; }
+    const ft: FloatType* = t as FloatType*;
+    return ft.bit_width() < 64;
+}
+
+/// True when `ty` is a CONCRETE numeric slot a literal can simply adopt.  Gates
+/// pushing a parameter's type onto a plain numeric-literal argument, which is
+/// what lets `f(1)` bind a `u64` parameter directly instead of defaulting to
+/// i32 and relying on the call boundary's width coercion.  An unresolved
+/// generic parameter has its own type kind, so it is excluded here and the
+/// argument's own type keeps selecting the specialization.
+public function is_adoptable_numeric_type(arena: TypeArena*, ty: TypeRef) -> boolean {
+    if (!ty.is_valid()) { return false; }
+    const t: Type* = arena.lookup(ty.id);
+    if (t == null) { return false; }
+    return t.kind == TypeKind::Int || t.kind == TypeKind::Float
+        || t.kind == TypeKind::Char;
 }
 
 /// True when `expr` is a negated numeric literal: a `-`-operator UnaryExpression
@@ -271,79 +351,15 @@ public function int_literal_exceeds(s: string, max_mag: u64) -> boolean {
 
 /// Fold a compile-time-constant integer expression to its i64 value, for width
 /// selection only (the actual computation is left to codegen at the chosen
-/// width).  Accepts the same shapes as `is_constant_numeric_expr`.  Returns
-/// false (caller leaves width unchanged) for anything non-constant or whenever a
-/// step would overflow i64 or hit a constant divide-by-zero - bailing is always
-/// safe since it just preserves the existing default width.
+/// width).  Returns false - leaving the caller's width unchanged - for anything
+/// non-constant, and for any step that would overflow i64 or divide by a
+/// constant zero.
+///
+/// Literal arithmetic only: width selection runs before array sizes are folded
+/// and has no constant table to resolve a named constant against, so an
+/// identifier reads as non-constant here.
 public function try_fold_const_i64(expr: ExpressionNode*, out: i64*) -> boolean {
-    if (expr == null) { return false; }
-    const node: ASTNode* = expr as ASTNode*;
-    if (node.kind == NodeKind::Literal) {
-        const lit: LiteralNode* = expr as LiteralNode*;
-        if (lit.literal_kind != LiteralKind::Integer) { return false; }
-        mut v: u64 = 0;
-        if (!parse_int_literal_u64(lit.value, &v)) { return false; }
-        if (v > SEMA_I64_MAX_MAG) { return false; }   // needs > i64; bail
-        *out = v as i64;
-        return true;
-    }
-    if (node.kind == NodeKind::UnaryExpression) {
-        const u: UnaryExprNode* = expr as UnaryExprNode*;
-        mut a: i64 = 0;
-        if (!try_fold_const_i64(u.operand, &a)) { return false; }
-        if (u.op.lexeme == "-") { *out = 0 - a; return true; }
-        if (u.op.lexeme == "+") { *out = a; return true; }
-        if (u.op.lexeme == "~") { *out = ~a; return true; }
-        return false;
-    }
-    if (node.kind == NodeKind::BinaryExpression) {
-        const b: BinaryExprNode* = expr as BinaryExprNode*;
-        mut x: i64 = 0;
-        mut y: i64 = 0;
-        if (!try_fold_const_i64(b.left, &x)) { return false; }
-        if (!try_fold_const_i64(b.right, &y)) { return false; }
-        const op: string = b.op.lexeme;
-        const I64MAX: i64 = SEMA_I64_MAX_MAG as i64;
-        const I64MIN: i64 = (0 - I64MAX) - 1;
-        if (op == "+") {
-            if (y > 0 && x > I64MAX - y) { return false; }
-            if (y < 0 && x < I64MIN - y) { return false; }
-            *out = x + y; return true;
-        }
-        if (op == "-") {
-            if (y < 0 && x > I64MAX + y) { return false; }
-            if (y > 0 && x < I64MIN + y) { return false; }
-            *out = x - y; return true;
-        }
-        if (op == "*") {
-            if (x == 0 || y == 0) { *out = 0; return true; }
-            // Bail on the trap edge and on overflow (checked by re-division).
-            if (x == I64MIN || y == I64MIN) { return false; }
-            const p: i64 = x * y;
-            if (p / y != x) { return false; }
-            *out = p; return true;
-        }
-        if (op == "/" || op == "%") {
-            if (y == 0) { return false; }
-            if (x == I64MIN && y == 0 - 1) { return false; }
-            *out = if (op == "/") { x / y } else { x % y };
-            return true;
-        }
-        if (op == "<<") {
-            if (y < 0 || y >= 63 || x < 0) { return false; }
-            if (x > (I64MAX >> y)) { return false; }
-            *out = x << y; return true;
-        }
-        if (op == ">>") {
-            if (y < 0 || y >= 64) { return false; }
-            *out = x >> y; return true;
-        }
-        if (op == "&") { *out = x & y; return true; }
-        if (op == "|") { *out = x | y; return true; }
-        if (op == "^") { *out = x ^ y; return true; }
-        return false;
-    }
-    return false;
+    return ConstantTable::fold_i64(expr, null, SymbolStr::empty(), null, out);
 }
 
 /// Parse a member-name as a non-negative tuple index.  Returns -1 for any

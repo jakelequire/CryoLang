@@ -43,6 +43,31 @@ type struct NegSuiteResult {
     failures: i32;
 }
 
+/// One `//~` expectation parsed from a negative-test source file: the compiler
+/// must emit a diagnostic at `line`, of `severity` ("error"/"warning"), carrying
+/// `code`, and - when `msg` is non-empty - a message CONTAINING `msg`.  A `//~`
+/// sits on the offending line; each leading `^` backs the target line up one
+/// (`//~^` = previous line), matching the rustc `//~ ERROR` convention.
+type struct NegExpect {
+    line:     i64;
+    severity: string;
+    code:     string;
+    msg:      string;
+}
+
+/// One diagnostic parsed back out of `cryo check`'s rendered output: `severity`
+/// and `code` from the `error[Exxxx]:` / `warning[Wxxxx]:` header, `message` the
+/// remainder of that header line, and `line` the source line from the following
+/// `--> file:line:col` arrow.  Only diagnostics anchored in the test file itself
+/// are collected (an arrow pointing elsewhere - e.g. into the stdlib - is not the
+/// test's concern), so `//~` exhaustiveness is scoped to the file under test.
+type struct NegDiag {
+    line:     i64;
+    severity: string;
+    code:     string;
+    message:  string;
+}
+
 /// Parsed `test.json` for a multi-module test project (see
 /// `run_projects_suite`). The FIXTURE (`outcome`: 0 = collect, 1 = build,
 /// 2 = run) and the ASSERTIONS (the `expect` fields - `exit_code`, `fails`,
@@ -71,10 +96,12 @@ type struct ProjSpec {
     /// Environment prerequisites (test.json `requires`): the project runs only
     /// where every token holds, and is otherwise SKIPPED with a reason (not a
     /// failure).  Recognized tokens: `"display"` (an X11/Wayland display is
-    /// present) and `"vendor:<Name>"` (that vendor library is registered with
-    /// host bindings).  Lets a real integration test (e.g. the raylib window
-    /// demo) stay live without turning a portable `make test` red.  Empty = no
-    /// prerequisites (the common case).
+    /// present), `"vendor:<Name>"` (that vendor library is registered with
+    /// host bindings), `"cxx"` (a C++ toolchain responds), and `"os:<name>"`
+    /// (the host OS is `linux`/`windows`/`macos` - for projects whose sources
+    /// hard-use one platform's surface).  Lets a real integration test (e.g.
+    /// the raylib window demo) stay live without turning a portable
+    /// `make test` red.  Empty = no prerequisites (the common case).
     requires:   string[];
 }
 
@@ -120,6 +147,25 @@ function exec_path(path: string) -> string {
 ![target(unix)]
 function exec_path(path: string) -> string {
     return path;
+}
+
+// The host OS this compiler was built for, as the name an `os:<name>`
+// project-test requirement matches against (see `proj_requirement_met`).
+// A method body can't be `![target(...)]`-gated, so this lives as a
+// per-target free function like `exec_path` above.
+![target(linux)]
+function host_os_name() -> string {
+    return "linux";
+}
+
+![target(windows)]
+function host_os_name() -> string {
+    return "windows";
+}
+
+![target(macos)]
+function host_os_name() -> string {
+    return "macos";
 }
 
 /// Per-process scratch path for capturing a negative test's compiler
@@ -270,6 +316,7 @@ implement enum CommandKind {
                 fmt::printf("  --stdlib=PATH      Standard library root for this run\n");
                 fmt::printf("  --target=TRIPLE    Cross-compile for the given LLVM target triple\n");
                 fmt::printf("  --no-std           Build without the standard library / prelude\n");
+                fmt::printf("  --no-runtime       Freestanding build: no crt0 / libc / panic runtime\n");
                 fmt::printf("  -o, --output PATH  Redirect output (single-file builds only)\n");
             }
             CommandKind::Run => {
@@ -702,7 +749,9 @@ type struct Executor {
         fmt::printf("  debug     = false                   verbose compiler logging\n");
         fmt::printf("  optimize  = \"O2\"                    O0 | O1 | O2 | O3\n");
         fmt::printf("  emit_llvm = false                   also write LLVM IR (.ll)\n");
-        fmt::printf("  no_std    = false                   build without the standard library\n\n");
+        fmt::printf("  no_std    = false                   build without the standard library\n");
+        fmt::printf("  no_runtime = false                  freestanding: no crt0 / libc / panic runtime\n");
+        fmt::printf("  panic     = \"unwind\"                unwind (run drops) | abort (terminate)\n\n");
         fmt::printf("[profile]\n");
         fmt::printf("  default = \"release\"                 release (O2) | debug (O0 + DWARF)\n");
         fmt::printf("                                      override per-build with --release/--dev\n\n");
@@ -925,7 +974,7 @@ type struct Executor {
         const buf: i8* = malloc(n + 1);
         mut j: u64 = 0;
         for (mut i: u64 = 0; i < n; i++) {
-            const ch: i8 = name[i];
+            const ch: char = name[i];
             const is_upper: boolean = ch >= 65 && ch <= 90;
             const is_lower: boolean = ch >= 97 && ch <= 122;
             const is_digit: boolean = ch >= 48 && ch <= 57;
@@ -934,7 +983,7 @@ type struct Executor {
                 // First byte: only letters allowed; lowercase gets upcased.
                 if (is_upper) {
                     const p: i8* = buf + (j as i64);
-                    *p = ch;
+                    *p = ch as i8;
                     j += 1;
                 } else if (is_lower) {
                     const p: i8* = buf + (j as i64);
@@ -945,7 +994,7 @@ type struct Executor {
             } else {
                 const p: i8* = buf + (j as i64);
                 if (is_upper || is_lower || is_digit || ch == 95) {
-                    *p = ch;
+                    *p = ch as i8;
                     j += 1;
                 } else if (ch == 45 || ch == 32) {
                     // '-' or ' ' becomes '_'.
@@ -957,7 +1006,10 @@ type struct Executor {
         }
 
         if (j == 0) {
-            free(buf as void*);
+            // Qualified for the same reason as module_graph.cryo: bare `free`
+            // is ambiguous with `std::alloc::heap::free` until the resolver
+            // bug is fixed.
+            intrinsics::free(buf as void*);
             return "Main";
         }
         const term: i8* = buf + (j as i64);
@@ -1089,6 +1141,17 @@ type struct Executor {
         // cryoconfig `no_std` key; see compile_project).
         if (args.has_flag("no-std")) {
             config.no_std = true;
+        }
+        // `--no-runtime`: freestanding build (OR'd with the cryoconfig
+        // `no_runtime` key; see compile_project).
+        if (args.has_flag("no-runtime")) {
+            config.no_runtime = true;
+        }
+        // `--panic=<abort|unwind>`: exception strategy (default unwind).
+        // `unwind` emits invoke/landingpad cleanup edges + `__cryo_personality_v0`
+        // and links the `panic/unwind` runtime tier; `abort` opts back out.
+        if (args.has_arg("panic")) {
+            config.panic = PanicStrategy::from_string(args.get_value("panic"));
         }
         Executor::apply_profile_flags(&config, &args);
 
@@ -1450,6 +1513,255 @@ type struct Executor {
         return format("%s", &buf[0] as string);
     }
 
+    /// Read a base-10 unsigned integer from `s` starting at byte `start`,
+    /// stopping at the first non-digit.  -1 if no digit is present.
+    static neg_parse_uint(s: string, start: u64) -> i64 {
+        const n: u64 = s.length();
+        mut v: i64 = 0;
+        mut k: u64 = start;
+        mut any: boolean = false;
+        while (k < n) {
+            const c: i8 = *((s as i8*) + k);
+            if (c < 48 || c > 57) { break; }         // not '0'..'9'
+            v = v * 10 + ((c - 48) as i64);
+            any = true;
+            k += 1;
+        }
+        if (!any) { return -1; }
+        return v;
+    }
+
+    /// True if the FIRST line of `view` (up to '\n') contains `needle`.  Used to
+    /// bind a `-->` arrow to the test file without scanning the rest of output.
+    static neg_line_contains(view: string, needle: string) -> boolean {
+        const n: u64 = view.length();
+        mut eol: u64 = 0;
+        while (eol < n && *((view as i8*) + eol) != 10) { eol += 1; }
+        const nlen: u64 = needle.length();
+        if (nlen == 0) { return true; }
+        if (nlen > eol) { return false; }
+        mut i: u64 = 0;
+        while (i + nlen <= eol) {
+            mut j: u64 = 0;
+            while (j < nlen
+                    && *((view as i8*) + i + j) == *((needle as i8*) + j)) { j += 1; }
+            if (j == nlen) { return true; }
+            i += 1;
+        }
+        return false;
+    }
+
+    /// Given a view starting at a `--> file:line:col` arrow, return the source
+    /// LINE (the integer after the second-to-last colon of the arrow line).
+    /// Parsing from the tail is Windows-safe: a drive-letter colon (`C:\...`)
+    /// sits earlier and never becomes one of the final two.  -1 if unparseable.
+    static neg_arrow_line(view: string) -> i64 {
+        const n: u64 = view.length();
+        mut k: u64 = 0;
+        mut last_colon: i64 = -1;
+        mut prev_colon: i64 = -1;
+        while (k < n) {
+            const c: i8 = *((view as i8*) + k);
+            if (c == 10) { break; }                  // end of arrow line
+            if (c == 58) {                           // ':'
+                prev_colon = last_colon;
+                last_colon = k as i64;
+            }
+            k += 1;
+        }
+        if (prev_colon < 0) { return -1; }
+        return Executor::neg_parse_uint(view, (prev_colon as u64) + 1);
+    }
+
+    /// Parse every `//~ [^...] <SEV>[<CODE>] <msg>` expectation out of a negative
+    /// test's source.  `SEV` is `ERROR` or `WARN`/`WARNING`; each `^` after `//~`
+    /// backs the target line up one (`//~^` = previous line).  `<msg>` (the rest
+    /// of the line, trimmed) is an optional message-substring assertion.
+    static parse_neg_expectations(content: string) -> NegExpect[] {
+        mut out: NegExpect[] = [];
+        const clen: u64 = content.length();
+        mut line_no: i64 = 1;
+        mut i: u64 = 0;
+        while (i < clen) {
+            const c: i8 = *((content as i8*) + i);
+            if (c == 10) { line_no += 1; i += 1; continue; }
+            // Match "//~" starting at i.
+            if (!(c == 47 && i + 2 < clen
+                    && *((content as i8*) + i + 1) == 47
+                    && *((content as i8*) + i + 2) == 126)) {
+                i += 1; continue;
+            }
+            mut p: u64 = i + 3;
+            mut up: i64 = 0;
+            while (p < clen && *((content as i8*) + p) == 94) { up += 1; p += 1; }  // '^'
+            while (p < clen && *((content as i8*) + p) == 32) { p += 1; }          // ' '
+            // Severity keyword.
+            mut sev_buf: i8[16];
+            mut sj: u64 = 0;
+            while (p < clen && sj < 15) {
+                const sc: i8 = *((content as i8*) + p);
+                const is_alpha: boolean =
+                    (sc >= 65 && sc <= 90) || (sc >= 97 && sc <= 122);
+                if (!is_alpha) { break; }
+                sev_buf[sj] = sc; sj += 1; p += 1;
+            }
+            sev_buf[sj] = 0;
+            const sev_raw: string = format("%s", &sev_buf[0] as string);
+            mut severity: string = "";
+            if (sev_raw == "ERROR") { severity = "error"; }
+            else if (sev_raw == "WARN" || sev_raw == "WARNING") { severity = "warning"; }
+            // Require "[CODE]".
+            if (severity.length() == 0 || p >= clen || *((content as i8*) + p) != 91) {
+                i = p; continue;
+            }
+            p += 1;
+            mut code_buf: i8[24];
+            mut cj: u64 = 0;
+            while (p < clen && cj < 23) {
+                const cc: i8 = *((content as i8*) + p);
+                if (cc == 93) { break; }             // ']'
+                code_buf[cj] = cc; cj += 1; p += 1;
+            }
+            code_buf[cj] = 0;
+            const code: string = format("%s", &code_buf[0] as string);
+            if (p < clen && *((content as i8*) + p) == 93) { p += 1; }
+            // Optional message substring: the rest of the line, trimmed.
+            while (p < clen && *((content as i8*) + p) == 32) { p += 1; }
+            mut mbuf: i8[192];
+            mut mj: u64 = 0;
+            while (p < clen && mj < 191) {
+                const mc: i8 = *((content as i8*) + p);
+                if (mc == 10) { break; }
+                mbuf[mj] = mc; mj += 1; p += 1;
+            }
+            while (mj > 0 && (mbuf[mj - 1] == 32 || mbuf[mj - 1] == 13)) { mj -= 1; }
+            mbuf[mj] = 0;
+            const msg: string = format("%s", &mbuf[0] as string);
+            out.push(NegExpect { line: line_no - up, severity: severity,
+                                 code: code, msg: msg });
+            i = p;   // resume at the line's '\n' (or EOF); line_no advances there
+        }
+        return out;
+    }
+
+    /// Enumerate the diagnostics `cryo check` rendered into `out` that are
+    /// anchored in the test file `fname` (its basename must appear in the `-->`
+    /// arrow line).  Scoping to the file keeps `//~` exhaustiveness from tripping
+    /// on stdlib-internal diagnostics.
+    static parse_diagnostics(out: string, fname: string) -> NegDiag[] {
+        mut diags: NegDiag[] = [];
+        const n: u64 = out.length();
+        mut off: u64 = 0;
+        while (off < n) {
+            const view: string = ((out as i8*) + off) as string;
+            const ei: i64 = view.find("error[");
+            const wi: i64 = view.find("warning[");
+            mut severity: string = "";
+            mut rel: i64 = -1;
+            if (ei >= 0 && (wi < 0 || ei <= wi)) { severity = "error"; rel = ei; }
+            else if (wi >= 0) { severity = "warning"; rel = wi; }
+            if (rel < 0) { break; }
+            const habs: u64 = off + (rel as u64);
+            const hview: string = ((out as i8*) + habs) as string;
+            // Bound of this diagnostic's block = start of the next header (or EOF).
+            const after1: string = ((out as i8*) + habs + 1) as string;
+            const ne: i64 = after1.find("error[");
+            const nw: i64 = after1.find("warning[");
+            mut nrel: i64 = -1;
+            if (ne >= 0 && (nw < 0 || ne <= nw)) { nrel = ne; }
+            else if (nw >= 0) { nrel = nw; }
+            const next_habs: u64 = if (nrel >= 0) { habs + 1 + (nrel as u64) } else { n };
+            // Code between '[' and ']' on the header line.
+            const lb: i64 = hview.find("[");
+            const rb: i64 = hview.find("]");
+            if (lb < 0 || rb < 0 || rb <= lb) { off = habs + 1; continue; }
+            mut code_buf: i8[24];
+            mut cj: u64 = 0;
+            mut q: u64 = (lb as u64) + 1;
+            while (q < (rb as u64) && cj < 23) {
+                code_buf[cj] = *((hview as i8*) + q); cj += 1; q += 1;
+            }
+            code_buf[cj] = 0;
+            const code: string = format("%s", &code_buf[0] as string);
+            // Message = header line after "]: ", up to end-of-line.
+            mut mstart: u64 = (rb as u64) + 1;
+            while (mstart < hview.length()
+                    && (*((hview as i8*) + mstart) == 58
+                        || *((hview as i8*) + mstart) == 32)) {
+                mstart += 1;                         // skip ':' and ' '
+            }
+            mut mbuf: i8[256];
+            mut mj: u64 = 0;
+            mut r: u64 = mstart;
+            while (r < hview.length() && mj < 255) {
+                const mc: i8 = *((hview as i8*) + r);
+                if (mc == 10 || mc == 13) { break; }
+                mbuf[mj] = mc; mj += 1; r += 1;
+            }
+            mbuf[mj] = 0;
+            const message: string = format("%s", &mbuf[0] as string);
+            // Source line from the first "-->" arrow inside this block, IF it
+            // names the test file.
+            const arel: i64 = hview.find("-->");
+            mut lineno: i64 = -1;
+            if (arel >= 0 && habs + (arel as u64) < next_habs) {
+                const aview: string = ((out as i8*) + habs + (arel as u64)) as string;
+                if (Executor::neg_line_contains(aview, fname)) {
+                    lineno = Executor::neg_arrow_line(aview);
+                }
+            }
+            if (lineno >= 0) {
+                diags.push(NegDiag { line: lineno, severity: severity,
+                                     code: code, message: message });
+            }
+            off = habs + 1;
+        }
+        return diags;
+    }
+
+    /// Verify a negative test's `//~` expectations against the diagnostics in
+    /// `out` for `fname`.  Two-way: every expectation must match a diagnostic
+    /// (severity + code + line, and the message-substring when given), and every
+    /// diagnostic anchored in the file must be annotated - so an unexpected
+    /// cascade fails the test.  "" on success, else a one-line reason.
+    static check_annotations(anns: &NegExpect[], out: string, fname: string) -> string {
+        const diags: NegDiag[] = Executor::parse_diagnostics(out, fname);
+        for (mut a: i64 = 0; a < anns.length; a++) {
+            const e: NegExpect* = &anns[a];
+            mut matched: boolean = false;
+            for (mut d: i64 = 0; d < diags.length; d++) {
+                const g: NegDiag* = &diags[d];
+                if (g.severity == e.severity && g.code == e.code && g.line == e.line
+                        && (e.msg.length() == 0 || g.message.contains(e.msg))) {
+                    matched = true; break;
+                }
+            }
+            if (!matched) {
+                if (e.msg.length() > 0) {
+                    return format("expected %s[%s] at line %lld containing \"%s\"",
+                        e.severity, e.code, e.line, e.msg);
+                }
+                return format("expected %s[%s] at line %lld",
+                    e.severity, e.code, e.line);
+            }
+        }
+        for (mut d: i64 = 0; d < diags.length; d++) {
+            const g: NegDiag* = &diags[d];
+            mut ann: boolean = false;
+            for (mut a: i64 = 0; a < anns.length; a++) {
+                const e: NegExpect* = &anns[a];
+                if (g.severity == e.severity && g.code == e.code && g.line == e.line) {
+                    ann = true; break;
+                }
+            }
+            if (!ann) {
+                return format("unannotated %s[%s] at line %lld (add a `//~` or fix the cascade)",
+                    g.severity, g.code, g.line);
+            }
+        }
+        return "";
+    }
+
     /// Resolve `col_choice` ("auto"/"always"/"never"/"") into an
     /// on/off decision for ANSI color emission. Auto checks `NO_COLOR`
     /// (presence forces off, per https://no-color.org/) and `isatty(1)`.
@@ -1605,8 +1917,27 @@ type struct Executor {
             fflush(null);
             exec::shell(runcmd);
             const out: string = Executor::read_file_or_empty(tmp);
-            const want: string = format("error[%s]", expected);
-            const passed: boolean = out.contains(want);
+            // Warning codes (`W....`) render as `warning[Wxxxx]`; everything else
+            // as `error[Exxxx]`.  A warning-only file still exits 0, but the suite
+            // asserts on the rendered marker, not the exit status.
+            mut marker: string = "error";
+            if (expected.length() > 0 && (*(expected as i8*)) == 87) {   // 'W'
+                marker = "warning";
+            }
+            const want: string = format("%s[%s]", marker, expected);
+            mut passed: boolean = out.contains(want);
+            // When the file carries `//~` annotations, ALSO assert each one's
+            // message text and source line, and that every diagnostic anchored in
+            // the file is annotated (so an unexpected cascade fails).  Files with
+            // no annotations keep the code-presence-only behavior.
+            mut detail: string = "";
+            if (passed) {
+                const anns: NegExpect[] = Executor::parse_neg_expectations(content);
+                if (anns.length > 0) {
+                    detail = Executor::check_annotations(&anns, out, name);
+                    if (detail.length() > 0) { passed = false; }
+                }
+            }
             if (passed) {
                 if (is_compact) {
                     fmt::printf(".");
@@ -1621,9 +1952,11 @@ type struct Executor {
                     fmt::printf("F");
                 } else if (is_pretty) {
                     Executor::neg_chip_fail(color_on);
-                    fmt::printf("  (expected %s)\n", expected);
+                    if (detail.length() > 0) { fmt::printf("  (%s)\n", detail); }
+                    else { fmt::printf("  (expected %s)\n", expected); }
                 } else {
-                    fmt::printf("FAILED (expected %s)\n", expected);
+                    if (detail.length() > 0) { fmt::printf("FAILED (%s)\n", detail); }
+                    else { fmt::printf("FAILED (expected %s)\n", expected); }
                 }
                 failures += 1;
             }
@@ -1673,12 +2006,29 @@ type struct Executor {
     ///   - `"display"`        an X11 (`DISPLAY`) or Wayland (`WAYLAND_DISPLAY`)
     ///                        display is available;
     ///   - `"vendor:<Name>"`  the vendor library `<Name>` is registered and has
-    ///                        generated host bindings.
-    /// An unrecognized token is treated as SATISFIED so a newer test.json run
-    /// under an older compiler degrades to running, not spuriously skipping.
+    ///                        generated host bindings;
+    ///   - `"os:<name>"`      the compiler's own target OS is `<name>`;
+    ///   - `"cxx"`            a C++ toolchain is available.
+    /// Unrecognized tokens never reach here: `proj_first_unknown_requirement`
+    /// rejects them as a hard test failure first.
     static proj_first_unmet_requirement(reqs: &string[]) -> string {
         for (mut i: i64 = 0; i < reqs.length; i++) {
             if (!Executor::proj_requirement_met(reqs[i])) { return reqs[i]; }
+        }
+        return "";
+    }
+
+    /// The first `requires` token this harness does not recognize, or ""
+    /// when every token is known.  An unknown token is a hard test failure,
+    /// not a skip and not "satisfied": a typo'd requirement must not
+    /// silently change semantics from "gated" to "always-run" (or park the
+    /// project as permanently skipped).
+    static proj_first_unknown_requirement(reqs: &string[]) -> string {
+        for (mut i: i64 = 0; i < reqs.length; i++) {
+            const r: string = reqs[i];
+            const known: boolean = r == "display" || r == "cxx"
+                || r.starts_with("vendor:") || r.starts_with("os:");
+            if (!known) { return r; }
         }
         return "";
     }
@@ -1705,6 +2055,14 @@ type struct Executor {
                 VendorRegistry::normalize_triple(""));
             return f.length() > 0 && metadata::exists(Path::from(f));
         }
+        if (req.starts_with("os:")) {
+            // The project's sources hard-use one platform's surface (e.g.
+            // native_syscalls_gate's Linux `syscall`-instruction asm), so it
+            // can only compile and run on that host.  Matched against the
+            // COMPILER's OWN target - the projects suite builds and runs on
+            // the host, so compiler target == project host.
+            return (req + 3) == host_os_name();
+        }
         if (req == "cxx") {
             // A C++ toolchain is available.  The C++ direct-mangled-binding test
             // links a `c++`-compiled helper by its Itanium-mangled symbols, so it
@@ -1717,7 +2075,8 @@ type struct Executor {
             // separate Windows C++ link gap.
             return exec::shell("c++ --version > /dev/null 2>&1") == 0;
         }
-        // Unknown requirement: don't gate on something this compiler can't check.
+        // Unreachable for project specs: unknown tokens were already rejected
+        // as a hard failure by proj_first_unknown_requirement.
         return true;
     }
 
@@ -1965,6 +2324,16 @@ type struct Executor {
                 entry = readdir(dp); continue;
             }
 
+            // A `requires` token the harness doesn't recognize is a hard
+            // FAILURE, not a skip: a typo'd requirement would otherwise
+            // silently change semantics from "gated" to "always-run".
+            const unknown_req: string = Executor::proj_first_unknown_requirement(&spec.requires);
+            if (unknown_req.length() > 0) {
+                Executor::proj_report(is_pretty, is_compact, color_on, false,
+                    format("unknown requires token \"%s\"", unknown_req));
+                failures += 1; ran += 1; entry = readdir(dp); continue;
+            }
+
             // Environment-gated skip: a project declaring `requires` runs only
             // where every prerequisite holds (a display, a registered vendor
             // lib, ...); elsewhere it is skipped WITH A REASON, never counted as
@@ -2098,11 +2467,22 @@ type struct Executor {
             }
         } else {
             // collect: run the project's own `cryo test`; exit 0 = all passed.
+            // With `fails: true` the polarity inverts: the run MUST exit
+            // non-zero.  That's the known-fail canary - the test framework is
+            // compiled by the compiler under test, so a miscompile of
+            // expect_* / Result propagation / runner exit codes that converts
+            // failures into passes flips the canary's exit to 0 and fails the
+            // canary project (and the suite) instead of shipping silently.
             const cmd: string = format("%s test --format=plain%s > %s 2>&1", self_exe, std_flag, tmp);
             fflush(null);
             const st: i32 = exec::shell(cmd);
-            passed = st == 0;
-            if (!passed) { detail = "project tests failed"; }
+            if (spec.fails) {
+                passed = st != 0;
+                if (!passed) { detail = "expected project tests to FAIL (exit non-zero)"; }
+            } else {
+                passed = st == 0;
+                if (!passed) { detail = "project tests failed"; }
+            }
         }
 
         chdir(saved_cwd);
@@ -2360,6 +2740,14 @@ type struct Executor {
         // `--no-std`: freestanding build, no prelude / stdlib modules.
         if (args.has_flag("no-std")) {
             config.no_std = true;
+        }
+        // `--no-runtime`: freestanding build, no crt0 / libc / runtime.
+        if (args.has_flag("no-runtime")) {
+            config.no_runtime = true;
+        }
+        // `--panic=<abort|unwind>`: exception strategy (default unwind).
+        if (args.has_arg("panic")) {
+            config.panic = PanicStrategy::from_string(args.get_value("panic"));
         }
 
         // `-o PATH` / `--output PATH`: single-file output redirect.
@@ -2801,9 +3189,9 @@ type struct Executor {
         const n: u64 = s.length();
         const buf: i8* = malloc(n + 1) as i8*;
         for (mut i: u64 = 0; i < n; i++) {
-            mut c: i8 = s[i];
-            if (c >= 65 && c <= 90) { c = (c + 32) as i8; }
-            buf[i] = c;
+            mut c: char = s[i];
+            if (c >= 65 && c <= 90) { c = (c + 32) as char; }
+            buf[i] = c as i8;
         }
         buf[n] = 0;
         return buf as string;

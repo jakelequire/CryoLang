@@ -56,6 +56,14 @@ intrinsic function panic(message: string, file: string, line: u32) -> never;
 // `emit_format_runtime`; this declaration is what sema/decl_index see.
 intrinsic function format(fmt: string, args...) -> string;
 
+// The catch_unwind primitive (see `core::panic_unwind`). Runs the opaque
+// void-returning trampoline `body(data)` inside a catch-all landing pad and
+// returns true if a panic unwound out of it (false = normal return). Codegen
+// special-lowers this by leaf name (`call_emitter.cryo::emit_catch_unwind`) to
+// an `invoke` + catch pad + phi, so it takes erased `void*` operands and needs
+// no generic-T knowledge. Requires `--panic=unwind`; a clear compile error off it.
+intrinsic function try_catch(body: void*, data: void*) -> boolean;
+
 // Atomic memory ordering: emits an LLVM `fence` instruction.  The order
 // argument is currently always lowered as SequentiallyConsistent by the
 // emitter but the parameter is preserved for API symmetry with the
@@ -64,6 +72,19 @@ intrinsic function format(fmt: string, args...) -> string;
 // AtomicOrdering enum: Relaxed=2, Acquire=4, Release=5, AcqRel=6,
 // SeqCst=7.
 intrinsic function atomic_fence(order: u32) -> void;
+
+// Machine-level runtime primitives.
+//   trap()             aborts via an illegal instruction (`llvm.trap` ->
+//                      `ud2`, SIGILL) with NO libc dependency - the divergent
+//                      sink for a `no_runtime` check failure.  `never`.
+//   debugtrap()        a breakpoint (`llvm.debugtrap`) that returns.
+//   frame_address(n)   base pointer of the n-th caller frame (n=0 = current).
+//   return_address(n)  return address of the n-th frame.  Both for the
+//                      runtime backtrace; `n` MUST be a compile-time constant.
+intrinsic function trap() -> never;
+intrinsic function debugtrap() -> void;
+intrinsic function frame_address(level: u32) -> void*;
+intrinsic function return_address(level: u32) -> void*;
 
 // Per-type atomic operations.  The `order` argument MUST be a
 // compile-time constant Ordering value (the emitter extracts it at
@@ -124,6 +145,43 @@ intrinsic function atomic_cmpxchg_u32(
 intrinsic function atomic_cmpxchg_u64(
     ptr: u64*, cmp: u64, new: u64, succ: u32, fail: u32, out_ok: boolean*
 ) -> u64;
+
+// IEEE-754 classification.  `fpclass(x, test)` lowers to LLVM's
+// `llvm.is.fpclass.f64(x, test)` and returns true when x's floating-point
+// class is one of those selected by the `test` bitmask.  It is exception-
+// free (raises no FP flags) and branchless - no libm, no syscalls - so the
+// whole `is_nan` / `is_infinite` / `is_finite` / `classify` family in
+// `std::math` (and `std::fmt::float`) is pure Cryo.
+//
+// `test` MUST be a compile-time constant (LLVM immarg); callers pass the
+// documented mask literals rather than a runtime value.  The bits mirror
+// LLVM's is.fpclass test enum:
+//   0x001 SNaN       0x002 QNaN        0x004 -Inf       0x008 -Normal
+//   0x010 -Subnormal 0x020 -Zero       0x040 +Zero      0x080 +Subnormal
+//   0x100 +Normal    0x200 +Inf
+intrinsic function fpclass(value: f64, test: i32) -> boolean;
+
+// Cheap IEEE-754 math, lowered to the matching LLVM float intrinsic
+// (`llvm.fabs.f64`, `llvm.floor.f64`, ...) rather than a libm extern: the
+// backend picks a hardware instruction where one exists and otherwise
+// expands the operation itself.  Names carry a width suffix (like `bswap64`)
+// so common leaf names (`round`, `sqrt`, ...) stay available to user code;
+// `ftrunc64` is float truncation toward zero (`llvm.trunc.f64`), named apart
+// from the integer narrowing casts.  Semantics match the C functions of the
+// same name: `round64` rounds halfway cases away from zero (C `round`, NOT
+// `rint`/`nearbyint`), `copysign64`/`fabs64` are pure sign-bit ops (so they
+// apply to NaNs and -0.0 too), `sqrt64(-x)` is NaN, and `fma64` performs a
+// fused multiply-add with a single rounding.  Errno is never set.
+intrinsic function fabs64(value: f64) -> f64;
+intrinsic function fabs32(value: f32) -> f32;
+intrinsic function floor64(value: f64) -> f64;
+intrinsic function ceil64(value: f64) -> f64;
+intrinsic function ftrunc64(value: f64) -> f64;
+intrinsic function round64(value: f64) -> f64;
+intrinsic function copysign64(magnitude: f64, sign: f64) -> f64;
+intrinsic function sqrt64(value: f64) -> f64;
+intrinsic function sqrt32(value: f32) -> f32;
+intrinsic function fma64(x: f64, y: f64, z: f64) -> f64;
 
 // Bridge intrinsics: libc declarations exposed bare to satisfy the
 // legacy-shaped self-hosted compiler.
@@ -250,7 +308,7 @@ intrinsic function realpath(path: string, resolved: i8*) -> i8*;
 
 ![target(windows)]
 function realpath(path: string, resolved: i8*) -> i8* {
-    return _fullpath(resolved, path, 4096u64);
+    return _fullpath(resolved, path, 4096);
 }
 intrinsic function chmod(path: string, mode: i32) -> i32;
 intrinsic function getcwd(buf: i8*, size: u64) -> i8*;

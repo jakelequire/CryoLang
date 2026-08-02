@@ -1,5 +1,10 @@
-///! HTTP server: blocking, one connection at a time, HTTP/1.1
+///! HTTP server: non-blocking, one connection at a time, HTTP/1.1
 ///! keep-alive within a connection.
+///!
+///! `.run()` is an `async` method and needs an `Executor` (its reactor is
+///! what the accept and the per-connection reads register with). Connections
+///! are still served one at a time: this layer is on the async transport, not
+///! yet concurrent across connections.
 ///!
 ///! Two public entry-points:
 ///!
@@ -19,15 +24,21 @@
 ///! before the first `accept`; use it to log the listening address or
 ///! signal a readiness probe.
 ///!
-///! `.with_read_timeout(secs)` caps the time the server will block
-///! waiting for request bytes on an accepted connection. Defaults to
-///! 30 seconds; pass 0 to disable.  Without a cap a single slow peer
-///! sending one byte at a time pins the accept loop indefinitely.
+///! `.with_read_timeout(secs)` caps how long one request may take to arrive,
+///! which is what keeps a peer dribbling a request out a byte at a time from
+///! pinning the connection — and, since connections are served one at a time,
+///! the accept loop behind it. `secs == 0` disables the cap.
 ///!
-///! `.run()` blocks indefinitely, returning only on a fatal listener-level
-///! error (e.g. EMFILE). Per-connection failures (parse errors, client
-///! hangups, write errors) are swallowed; instrument the handler or router
-///! callbacks for request-level telemetry.
+///! A read that hits the cap is abandoned, and abandoning an in-flight read
+///! closes the connection: the transport is left holding a closed placeholder
+///! while the read future owns the real socket. The cap is therefore a hard
+///! close, not a recoverable error, so nothing after it can reply on that
+///! socket.
+///!
+///! `.run()` never completes normally, returning only on a fatal
+///! listener-level error (e.g. EMFILE). Per-connection failures (parse
+///! errors, client hangups, write errors) are swallowed; instrument the
+///! handler or router callbacks for request-level telemetry.
 ///!
 ///! Each accepted connection is reused for follow-up requests until
 ///! the client sends `Connection: close`, the HTTP version is below
@@ -39,24 +50,31 @@ namespace std::net::http::server;
 import core::option;
 import core::result;
 import io::error;
+import io::traits;
 import io::buf;
+import collections::array;
 import collections::str;
 import collections::string;
-import net::socket_addr;
-import net::tcp;
+import net::addr::socket_addr;
+import net::socket::tcp;
 import net::http::request;
 import net::http::response;
 import net::http::status;
+import net::http::conn;
 import net::http::router;
+import future::poll;
+import future::waker;
+import future::traits;
+import future::combinator;
+import time::duration;
 
 /// Hard cap on requests served per accepted connection.  Without this
 /// a misbehaving client could hold a connection open indefinitely with
 /// trivial keep-alive traffic and exhaust server file descriptors.
 const MAX_REQUESTS_PER_CONNECTION: u64 = 100;
 
-/// Default `set_read_timeout` on every accepted connection.  Chosen to
-/// be long enough for slow consumer networks but short enough that a
-/// single slow-loris peer can't pin the accept loop.
+/// Default per-connection read cap.  Long enough for slow consumer networks
+/// but short enough that a single slow-loris peer can't pin the accept loop.
 const DEFAULT_READ_TIMEOUT_SECS: i64 = 30;
 
 /// A configured HTTP server ready to bind and run.
@@ -85,7 +103,7 @@ type struct HttpServer {
     /// Owned by the caller; the Router must outlive this server.
     router:   Router*;
     on_ready: Option<() -> void>;
-    /// Per-accepted-connection `SO_RCVTIMEO` (whole seconds).  Zero
+    /// Deadline applied to each request read (whole seconds).  Zero
     /// disables; defaults to `DEFAULT_READ_TIMEOUT_SECS`.
     read_timeout_secs: i64;
 
@@ -126,10 +144,10 @@ type struct HttpServer {
     }
 
     /// Override the per-connection read timeout.  `secs == 0` disables;
-    /// the default is `DEFAULT_READ_TIMEOUT_SECS`.  Applies to both the
-    /// initial request line and the inter-request idle window when
-    /// keep-alive is in effect; the latter is what bounds a
-    /// well-behaved client's idle-connection lifetime.
+    /// the default is `DEFAULT_READ_TIMEOUT_SECS`.
+    ///
+    /// Reaching the cap closes the connection outright rather than answering
+    /// with a 408 -- see the module doc for why a timed-out read cannot reply.
     with_read_timeout(mut &this, secs: i64) -> &HttpServer {
         this.read_timeout_secs = secs;
         return &this;
@@ -139,27 +157,39 @@ type struct HttpServer {
 
     /// Bind to `this.addr` and serve requests forever. Returns `Err`
     /// only on a fatal listener error (e.g. EMFILE, ENFILE).
-    run(mut &this) -> Result<(), IoError> {
-        match (TcpListener::bind(this.addr)) {
-            Result::Ok(listener) => {
-                mut l: TcpListener = listener;
-                match (this.on_ready) {
-                    Option::Some(cb) => { cb(); }
-                    Option::None     => { }
+    async run(mut &this) -> Result<(), IoError> {
+        const l: TcpListener = TcpListener::bind(this.addr)?;
+        return await this.run_on(l);
+    }
+
+    /// Serve on a listener the caller already bound, which is the form to
+    /// reach for when the port matters and `this.addr` cannot name it: bind
+    /// to port 0, read the assigned port off `local_addr`, then hand the
+    /// listener over. Binding here and reporting the port afterwards would
+    /// mean racing another process for the port in between.
+    ///
+    /// `TcpAccept` consumes the listener and hands it back with the
+    /// connection it produced, so the loop reclaims it each time round
+    /// rather than borrowing it across the suspension.
+    async run_on(mut &this, listener: TcpListener) -> Result<(), IoError> {
+        mut l: TcpListener = listener;
+        match (this.on_ready) {
+            Option::Some(cb) => { cb(); }
+            Option::None     => { }
+        }
+        loop {
+            mut accepted: TcpAccepted = await TcpAccept::start(l);
+            l = accepted.take_listener();
+            match (accepted.take_result()) {
+                Result::Ok(stream) => {
+                    // The connection is MOVED into the exchange rather than
+                    // lent to it: a future may not hold the address of a
+                    // local in the frame that spawned it, and moving it in
+                    // makes it that future's own storage.
+                    await this.serve_connection(BufStream<TcpStream>::of(stream));
                 }
-                loop {
-                    match (l.accept()) {
-                        Result::Ok(stream) => {
-                            mut s: TcpStream = stream;
-                            this.handle_connection(&s);
-                        }
-                        Result::Err(err) => {
-                            return Result::Err(err);
-                        }
-                    }
-                }
+                Result::Err(err) => { return Result::Err(err); }
             }
-            Result::Err(err) => { return Result::Err(err); }
         }
     }
 
@@ -183,33 +213,54 @@ type struct HttpServer {
         }
     }
 
-    /// Serve requests on `stream` until the client (or this server)
-    /// signals close, the read times out, or
-    /// `MAX_REQUESTS_PER_CONNECTION` is reached.  A parse failure on
-    /// the FIRST request writes a canned 400; failures on follow-up
-    /// requests are taken as "peer gave up" and close silently.  Write
-    /// failures (peer gone) end the connection.  The accept loop
-    /// always continues.
-    handle_connection(&this, stream: mut &TcpStream) -> void {
-        if (this.read_timeout_secs > 0) {
-            match (stream.set_read_timeout(this.read_timeout_secs, 0)) {
-                Result::Ok(_) => { }
-                Result::Err(_) => { }
-            }
-        }
-        // One buffered reader for the WHOLE connection. `read_line` (and
-        // the Content-Length body read) inside `Request::parse` pull
-        // through this, turning per-byte header scanning into a few
-        // buffer-sized syscalls. Critically, the buffer persists across
-        // keep-alive iterations: any bytes of the NEXT request that
-        // arrived in the same packet as the previous body are retained
-        // here, not lost. The wrapped `stream` is still used directly for
-        // writes; only reads go through `br`.
-        mut br: BufReader<TcpStream> = BufReader::new(stream);
+    /// Serve requests on `conn` until the client (or this server) signals
+    /// close, a read exceeds the cap, or `MAX_REQUESTS_PER_CONNECTION` is
+    /// reached.  A parse failure on the FIRST request writes a canned 400;
+    /// failures on follow-up requests are taken as "peer gave up" and close
+    /// silently.  Write failures (peer gone) end the connection.  The accept
+    /// loop always continues.
+    ///
+    /// Takes the connection BY VALUE. The framing reads are methods on it and
+    /// a future may only re-address its own RECEIVER between polls, so the
+    /// connection has to be storage this future owns rather than the accept
+    /// loop's local.
+    ///
+    /// One buffer serves the WHOLE connection, and it persists across
+    /// keep-alive iterations: bytes of the NEXT request that arrived in the
+    /// same fill as the previous body are still there to be parsed, not lost.
+    async serve_connection(mut &this, conn: BufStream<TcpStream>) -> void {
+        mut c: BufStream<TcpStream> = conn;
         mut served: u64 = 0;
         loop {
             served = served + 1;
-            match (Request::parse(&br)) {
+
+            // The read is capped so one peer dribbling a request out a byte at
+            // a time cannot pin this connection (and, since connections are
+            // served one at a time, the accept loop behind it) forever.
+            // `read_timeout_secs == 0` disables the cap.
+            //
+            // Hitting the cap ABANDONS the read, and abandoning an in-flight
+            // read closes the connection: the transport is left holding a
+            // closed placeholder while the read future owns the real socket.
+            // The cap is therefore a hard close, not a recoverable error --
+            // nothing after it can reply on this socket, so the timeout arm
+            // returns rather than trying to write a 408.
+            mut got: Result<Request, IoError> =
+                Result::Err(IoError::new(IoErrorKind::TimedOut, 0));
+            if (this.read_timeout_secs > 0) {
+                const capped: Result<Result<Request, IoError>, Elapsed> =
+                    await Futures::timeout(
+                        Duration::from_secs(this.read_timeout_secs as u64),
+                        c.read_request());
+                match (capped) {
+                    Result::Ok(inner) => { got = inner; }
+                    Result::Err(_)    => { return; }
+                }
+            } else {
+                got = await c.read_request();
+            }
+
+            match (got) {
                 Result::Ok(req) => {
                     mut request_local: Request = req;
                     const keep_alive: boolean = should_keep_alive(&request_local, served);
@@ -220,20 +271,33 @@ type struct HttpServer {
                             Str::new("close")
                         );
                     }
-                    match (response.write_to(stream)) {
-                        Result::Ok(_) => { }
+                    // Encoding is synchronous, so a whole response is
+                    // assembled with no suspension inside it and the
+                    // connection suspends exactly once, in `flush`.
+                    match (response.encode_into(c.pending())) {
+                        Result::Ok(_)  => { }
+                        Result::Err(_) => { return; }
+                    }
+                    match (await c.flush()) {
+                        Result::Ok(_)  => { }
                         Result::Err(_) => { return; }
                     }
                     if (!keep_alive) { return; }
                 }
                 Result::Err(_) => {
+                    // Only a malformed FIRST request is worth answering; a
+                    // failure later reads as the peer having given up.
                     if (served == 1) {
                         mut bad: Response = Response::text(
                             StatusCode::bad_request(),
                             Str::new("Bad Request")
                         );
-                        match (bad.write_to(stream)) {
-                            Result::Ok(_) => { }
+                        match (bad.encode_into(c.pending())) {
+                            Result::Ok(_)  => { }
+                            Result::Err(_) => { return; }
+                        }
+                        match (await c.flush()) {
+                            Result::Ok(_)  => { }
                             Result::Err(_) => { }
                         }
                     }

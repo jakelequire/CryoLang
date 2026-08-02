@@ -621,6 +621,16 @@ public:
         return this.dispatch.codegen_lvalue(this, subject_node);
     }
 
+    /// `--panic=unwind`: emit the non-exhaustive-match `no_match` raise through
+    /// `__cryo_panic` (call-or-invoke + cleanup landing pad), replacing the
+    /// `abort` trap so the failure unwinds and the frame's live locals drop.
+    /// `sched` is the match node's `unwind_cleanup` (empty => plain call).
+    /// Shared by the statement and expression match forms.
+    emit_no_match_raise(mut &this, span: SourceSpan, sched: ASTNode*[]*) -> void {
+        this.cg.expr_ops.emit_check_raise(this, sched, span,
+            "no matching pattern (non-exhaustive match)");
+    }
+
     override visit(mut &this, node: MatchStmtNode*) -> void {
         if (node.subject == null || node.arms.length == 0) { return; }
 
@@ -731,12 +741,16 @@ public:
         // LLVM elides the whole thing; either way the IR stays well-formed.
         if (!no_match_bb.has_terminator()) {
             this.cg.builder.position_at_end(no_match_bb);
-            const abort_fn: LValue = this.cg.intrinsics.get_or_decl_abort();
-            const abort_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(abort_fn.raw) };
-            mut a_args: Pair<LValue, TypeRef>[] = [];
-            mut a_res: LValue = LValue::null();
-            a_res = this.cg.expr_ops.codegen_call(abort_fn, abort_ty, a_args, "");
-            this.cg.builder.build_unreachable();
+            // `--panic=unwind` (hosted): raise through `__cryo_panic` so the
+            // failure unwinds and drops the frame's live locals; the default
+            // abort path stays byte-identical.
+            if (this.cg.ctx.project_panic_unwind && !this.cg.intrinsics.no_runtime) {
+                this.emit_no_match_raise(node.span, &node.unwind_cleanup);
+            } else {
+                mut no_ops: LValue[] = [];
+                this.cg.intrinsics.emit_check_sink("__cryo_panic_no_match",
+                                                   node.span, &no_ops);
+            }
         }
 
         this.cg.builder.position_at_end(merge_bb);
@@ -915,13 +929,13 @@ public:
             if (sty != null && sty.kind == TypeKind::Int) {
                 const sint: IntType* = sty as IntType*;
                 if (sint.int_kind.is_unsigned()) { sign_extend = false; }
-                if (sint.int_kind.bit_width() == 128u64) { is_128 = true; }
+                if (sint.int_kind.bit_width() == 128) { is_128 = true; }
             }
             if (is_128) {
                 // A 128-bit literal can hold more than 64 bits, so the u64
                 // `const_int` path would truncate. Build the constant from the
                 // literal's digit string instead.
-                mut radix: u8 = 10u8;
+                mut radix: u8 = 10;
                 const digits: string = CodegenUtil::int_literal_clean(node.value, &radix);
                 this.state.last_value = LType::const_int_of_string(ty, digits, radix);
             } else {
@@ -937,7 +951,7 @@ public:
             const val: f64 = float::parse_f64(fdigits).unwrap_or(0.0);
             this.state.last_value = LType::const_real(ty, val);
         } else if (kind == LiteralKind::String) {
-            this.state.last_value = this.cg.str_cache.get_or_create(node.value, this.cg.builder);
+            this.state.last_value = this.cg.str_cache.get_or_create(node.value, &this.cg.llvm_module);
         } else if (kind == LiteralKind::Char) {
             // Char is stored as i32.  The lexer hands us the raw lexeme between
             // the surrounding quotes; for `'\n'` that's the two-char string
@@ -1350,7 +1364,7 @@ public:
         const idx: LValue = this.dispatch.codegen_rvalue(this,node.index);
         this.places.codegen_array_access(arr, node.array.resolved_type,
                                          arr_is_lvalue, idx,
-                                         node.span);
+                                         node.span, this, &node.unwind_cleanup);
     }
 
     override visit(mut &this, node: CastExprNode*) -> void {
@@ -1557,12 +1571,23 @@ public:
             this.state.last_is_lvalue = true;
             return;
         }
+        // The scope names a MODULE: resolve the global that module declares
+        // before trying the bare leaf below. Two modules may each declare the
+        // same leaf with different values and types (`libc::FIONBIO` is a Linux
+        // ioctl number, `syscall::FIONBIO` the Winsock one), and the bare lookup
+        // cannot tell them apart.
+        const scoped_global: LValue =
+            this.cg.resolver.resolve_global_in_scope(node.member_name, node.scope_name);
+        if (scoped_global.is_valid()) {
+            this.state.last_value    = scoped_global;
+            this.state.last_is_lvalue = true;
+            return;
+        }
         // Bare-name global lookup. Top-level `const X: T = ...` declarations
         // register globals under their bare name (e.g. `O_RDWR`); when
         // referenced as `libc::O_RDWR` from another module the combined-
-        // name lookup misses, so also try the bare member name. Globals
-        // are unique LLVM symbols at link time, so the bare name resolves
-        // to the same definition regardless of which module references it.
+        // name lookup misses, so also try the bare member name. Reached only
+        // when no single module matched the scope above.
         const bare_global: LValue = this.cg.resolver.resolve_global(node.member_name);
         if (bare_global.is_valid()) {
             this.state.last_value    = bare_global;
@@ -1782,12 +1807,14 @@ public:
         // LLVM elides it.
         if (!default_bb.has_terminator()) {
             this.cg.builder.position_at_end(default_bb);
-            const abort_fn_e: LValue = this.cg.intrinsics.get_or_decl_abort();
-            const abort_ty_e: LType = LType { raw: llvm::LLVMGlobalGetValueType(abort_fn_e.raw) };
-            mut a_args_e: Pair<LValue, TypeRef>[] = [];
-            mut a_res_e: LValue = LValue::null();
-            a_res_e = this.cg.expr_ops.codegen_call(abort_fn_e, abort_ty_e, a_args_e, "");
-            this.cg.builder.build_unreachable();
+            // `--panic=unwind` (hosted): raise + cleanup instead of abort.
+            if (this.cg.ctx.project_panic_unwind && !this.cg.intrinsics.no_runtime) {
+                this.emit_no_match_raise(node.span, &node.unwind_cleanup);
+            } else {
+                mut no_ops_e: LValue[] = [];
+                this.cg.intrinsics.emit_check_sink("__cryo_panic_no_match",
+                                                   node.span, &no_ops_e);
+            }
         }
 
         this.cg.builder.position_at_end(merge_bb);
@@ -1813,31 +1840,72 @@ public:
         const merge_bb: LBasicBlock = LBasicBlock::append(current_fn, "ternary.merge");
         this.cg.builder.build_cond_br(cond, then_bb, else_bb);
 
-        this.cg.builder.position_at_end(then_bb);
-        const then_val: LValue = this.dispatch.codegen_rvalue(this,node.true_expr);
-        const then_end: LBasicBlock = this.cg.builder.get_insert_block();
-        this.cg.flow.branch_if_not_terminated(merge_bb);
-
-        this.cg.builder.position_at_end(else_bb);
-        const else_val: LValue = this.dispatch.codegen_rvalue(this,node.false_expr);
-        const else_end: LBasicBlock = this.cg.builder.get_insert_block();
-        this.cg.flow.branch_if_not_terminated(merge_bb);
-
-        this.cg.builder.position_at_end(merge_bb);
         const ty: LType = this.cg.type_mapper.map_type(node.resolved_type);
-        const phi: LValue = this.cg.builder.build_phi(ty, "ternary");
+
+        // Only arms that actually reach `merge_bb` may be phi predecessors, and
+        // each arm's value is coerced to the phi type BEFORE its branch - the
+        // same contract the match-expression path above follows, for the same
+        // two reasons.
+        //
+        // An arm can terminate: `Never` is compatible with every type, so
+        // `if (c) { panic("x") } else { 5 }` is legal and its `then` block ends
+        // in `unreachable`.  `branch_if_not_terminated` correctly emits no `br`
+        // for it, which means that block is NOT a predecessor of `merge_bb` -
+        // adding it to the phi anyway builds a phi whose incoming block doesn't
+        // branch here, and the LLVM verifier rejects the function.
+        //
+        // Coercing after the branch would instead leave `zext`/`sext`/`inttoptr`
+        // sitting past the terminator, so the block reads as having none.
         const vals: void* = intrinsics::malloc(16);
         const blks: void* = intrinsics::malloc(16);
         const vals_arr: void** = vals as void**;
         const blks_arr: void** = blks as void**;
-        vals_arr[0] = then_val.raw;
-        vals_arr[1] = else_val.raw;
-        blks_arr[0] = then_end.raw;
-        blks_arr[1] = else_end.raw;
-        phi.add_incoming(vals, blks, 2);
+        mut n: u32 = 0;
+
+        this.cg.builder.position_at_end(then_bb);
+        mut then_val: LValue = this.dispatch.codegen_rvalue(this,node.true_expr);
+        const then_end: LBasicBlock = this.cg.builder.get_insert_block();
+        const then_live: boolean = then_end.is_valid() && !then_end.has_terminator();
+        if (then_live && then_val.is_valid()) {
+            then_val = IRGeneratorVisitor::coerce_to_phi_type(
+                this.cg, then_val, ty, node.resolved_type);
+        }
+        this.cg.flow.branch_if_not_terminated(merge_bb);
+        if (then_live) {
+            vals_arr[n as i64] = if (then_val.is_valid()) { then_val.raw }
+                                 else { llvm::LLVMGetUndef(ty.raw) };
+            blks_arr[n as i64] = then_end.raw;
+            n += 1;
+        }
+
+        this.cg.builder.position_at_end(else_bb);
+        mut else_val: LValue = this.dispatch.codegen_rvalue(this,node.false_expr);
+        const else_end: LBasicBlock = this.cg.builder.get_insert_block();
+        const else_live: boolean = else_end.is_valid() && !else_end.has_terminator();
+        if (else_live && else_val.is_valid()) {
+            else_val = IRGeneratorVisitor::coerce_to_phi_type(
+                this.cg, else_val, ty, node.resolved_type);
+        }
+        this.cg.flow.branch_if_not_terminated(merge_bb);
+        if (else_live) {
+            vals_arr[n as i64] = if (else_val.is_valid()) { else_val.raw }
+                                 else { llvm::LLVMGetUndef(ty.raw) };
+            blks_arr[n as i64] = else_end.raw;
+            n += 1;
+        }
+
+        this.cg.builder.position_at_end(merge_bb);
+        if (n > 0 && ty.is_valid()) {
+            const phi: LValue = this.cg.builder.build_phi(ty, "ternary");
+            phi.add_incoming(vals, blks, n);
+            this.state.last_value = phi;
+        } else {
+            // Both arms diverged; `merge_bb` is unreachable and there is no
+            // value to produce.
+            this.state.last_value = LValue::null();
+        }
         intrinsics::free(vals);
         intrinsics::free(blks);
-        this.state.last_value = phi;
         this.state.last_is_lvalue = false;
     }
 
@@ -1879,8 +1947,19 @@ public:
     // `last_value` so downstream code fails loudly rather than wrongly.
 
     override visit(mut &this, node: AwaitExprNode*) -> void {
+        // The async lowering (`sema/async_lower.cryo`) rewrites every `await` in
+        // an `async function` into an explicit poll state machine, so a surviving
+        // `AwaitExprNode` here was never lowered. Two causes: an `await` outside
+        // an `async function` (a lambda body is its own function, so an `await`
+        // there is this case), or one enclosed in a form the lowering's walkers
+        // do not descend into - never counted as a suspension, so the body is
+        // lowered around it and the node arrives here intact. That set is
+        // whatever `expr_await_count` / `stmt_await_count` skip, today only
+        // `switch`; an `unsafe` block and a `static match` arm are counted and
+        // rejected in sema with their own spans. Fail loudly rather than emit a
+        // stale value.
         this.cg.diag.emit_error_at_span(ErrorCode::E0600_CODEGEN_FAILED,
-            "codegen: 'await' expressions are not implemented",
+            "codegen: this `await` was never lowered; it is either outside an `async function` (a lambda body is its own function) or inside a `switch`, which the async lowering does not walk - lift it out of that form, or bind it to a `const` before it",
             node.span);
         this.state.last_value     = LValue::null();
         this.state.last_is_lvalue = false;
@@ -1919,86 +1998,6 @@ public:
         this.cg.builder.position_at_end(blocks.merge_bb);
     }
 
-    /// Lower a `switch` to a linear chain of equality tests - there is no
-    /// implicit fallthrough, so each case is an independent block that jumps
-    /// to the merge when done.  The subject and each case value are compared
-    /// with `icmp eq` (works for integers and simple enums, both i32-class at
-    /// the LLVM level); `default` is the fallback when no case matches.
-    /// `break` inside a case exits to the merge; `continue` passes through to
-    /// the enclosing loop (a switch doesn't catch it - see sema).
-    override visit(mut &this, node: SwitchStmtNode*) -> void {
-        if (node.expression == null) { return; }
-        const current_fn: LValue = this.get_current_function();
-        if (!current_fn.is_valid()) { return; }
-
-        const subject: LValue = this.dispatch.codegen_rvalue(this,node.expression);
-        if (!subject.is_valid()) { return; }
-        const subj_ty: TypeRef = node.expression.resolved_type;
-
-        const ncases: i64 = node.cases.length;
-        mut case_bbs: LBasicBlock[] = [];
-        for (mut i: i64 = 0; i < ncases; i++) {
-            case_bbs.push(LBasicBlock::append(current_fn, format("switch.case%lld", i)));
-        }
-        const merge_bb: LBasicBlock = LBasicBlock::append(current_fn, "switch.end");
-
-        // `break` exits the switch; `continue` is forwarded to whatever loop
-        // encloses the switch (null when there is none - sema rejects a bare
-        // `continue` here, and codegen_continue no-ops on a null target).
-        const enclosing_continue: LBasicBlock = this.cg.loops.current_continue();
-        this.cg.loops.push(merge_bb, enclosing_continue);
-
-        // Locate the (at most one) default case.
-        mut default_idx: i64 = -1;
-        for (mut i: i64 = 0; i < ncases; i++) {
-            if (node.cases[i] != null && node.cases[i].is_default) {
-                default_idx = i;
-            }
-        }
-
-        // Equality-test chain: each non-default case branches to its body on a
-        // match, otherwise falls through to the next test.
-        for (mut i: i64 = 0; i < ncases; i++) {
-            const c: CaseStmtNode* = node.cases[i];
-            if (c == null || c.is_default) { continue; }
-            const next_bb: LBasicBlock =
-                LBasicBlock::append(current_fn, format("switch.test%lld", i));
-            const case_val: LValue = this.dispatch.codegen_rvalue(this,c.value);
-            const coerced: LValue = this.cg.expr_ops.coerce_icmp_operands(
-                subject, case_val, subj_ty);
-            const cmp: LValue = this.cg.builder.build_icmp(
-                LIntPredicate::EQ, subject, coerced, "switch.cmp");
-            this.cg.builder.build_cond_br(cmp, case_bbs[i], next_bb);
-            this.cg.builder.position_at_end(next_bb);
-        }
-        // No case matched: fall to `default` if present, else past the switch.
-        if (default_idx >= 0) {
-            this.cg.builder.build_br(case_bbs[default_idx]);
-        } else {
-            this.cg.builder.build_br(merge_bb);
-        }
-
-        // Emit each case body.  No fallthrough: a body that doesn't otherwise
-        // terminate branches to the merge.
-        for (mut i: i64 = 0; i < ncases; i++) {
-            const c: CaseStmtNode* = node.cases[i];
-            if (c == null) { continue; }
-            this.cg.builder.position_at_end(case_bbs[i]);
-            if (c.body != null) {
-                this.dispatch.generate_statement(this,c.body as StatementNode*);
-            }
-            this.cg.flow.branch_if_not_terminated(merge_bb);
-        }
-
-        this.cg.loops.pop();
-        this.cg.builder.position_at_end(merge_bb);
-    }
-
-    /// Case bodies are emitted directly by `visit(SwitchStmtNode*)`, so a
-    /// standalone CaseStmtNode is never reached during codegen; this is a
-    /// defensive no-op rather than an error.
-    override visit(mut &this, node: CaseStmtNode*) -> void {}
-
     /// Coerce `val` to match `expected` for use as a phi-node operand.  LLVM
     /// requires every phi incoming to have the phi's result type exactly, and
     /// match arms routinely produce differently-sized integers (e.g. an i32
@@ -2015,10 +2014,9 @@ public:
                                  expected: LType, result_ty: TypeRef) -> LValue {
         if (!val.is_valid() || !expected.is_valid()) { return val; }
 
-        // NB: do NOT compare `void*`-typed LLVMTypeRef values with `==`; that
-        // currently lowers to strcmp, which returns "equal" for structurally-
-        // different types and short-circuits the coercion path.  Dispatch on
-        // kind + width instead.
+        // Dispatch on kind + width rather than on type identity: a narrower
+        // arm value needs a real sext/zext/trunc, and identity only tells us
+        // the pair differs, not which direction to convert.
         const got_ty: void* = llvm::LLVMTypeOf(val.raw);
         const want_ty: void* = expected.raw;
         const gk: LTypeKind = LType::kind_of(got_ty);

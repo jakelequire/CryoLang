@@ -306,7 +306,7 @@ for any package: `[link]`, `[dependencies]`, target type), and `test.json` is
 
 | `test.json` field | Meaning |
 | --- | --- |
-| `"outcome"` | `"collect"` (default) / `"compile_fail"` / `"run"` |
+| `"outcome"` | `"collect"` (default) / `"build"` / `"compile_fail"` / `"run"` |
 | `"ignore"` | `true` skips the project (reported as ignored) |
 | `"expect"` | per-outcome assertions (below) |
 
@@ -314,11 +314,18 @@ for any package: `[link]`, `[dependencies]`, target type), and `test.json` is
 
 - **`collect`** - build the package and run *its own* `![test]` functions
   (its `tests/` dir, discovered exactly as for a top-level project). The project
-  passes iff all of them pass. This is the common case: a multi-module package
+  passes if all of them pass. This is the common case: a multi-module package
   whose tests exercise cross-module behavior.
 
   ```json
   { "outcome": "collect" }
+  ```
+
+- **`build`** - the package must compile (`cryo build` succeeds); nothing is
+  run. Useful when compiling and linking is itself the assertion.
+
+  ```json
+  { "outcome": "build" }
   ```
 
 - **`compile_fail`** - the package must **fail** to compile. `cryo build` is run

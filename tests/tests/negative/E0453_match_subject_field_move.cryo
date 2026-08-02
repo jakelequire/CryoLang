@@ -1,0 +1,41 @@
+// E0453: a `match` subject that projects a droppable field out of an owned
+// value moves it, exactly as the assignment spelling of the same projection
+// does.
+//
+// The subject is evaluated into a drop-glued temporary before any arm runs, so
+// the tuple and that temporary both own the payload and both free it.
+// `mut v: Array<u8> = p.0;` was already rejected; the `match` spelling reached
+// the arms unchecked, built cleanly, and died at runtime with
+// STATUS_HEAP_CORRUPTION - precisely the silent failure this rule converts into
+// a diagnostic.
+//
+// The copy into the temporary does NOT depend on an arm binding the payload:
+// `Some(_)` double-freed the same way `Some(v)` did, so the rule does not look
+// at the patterns.
+//
+// A TUPLE is the subject here on purpose. The partial-move model can allow (and
+// track) a field moved out of a straight-line, non-`Drop` STRUCT local, and
+// does so soundly for a match subject too - see
+// lang/match_subject_owned_place.cryo, which pins that case at exactly one
+// drop. A tuple is not a struct/class, so no per-field drop-skip is available
+// and the conservative error stands.
+![config(testing)]
+![config(negative, E0453)]
+namespace CryoTests::Negative::MatchSubjectFieldMove;
+
+type struct Res {
+    id: i64;
+
+    static new(id: i64) -> Res { return Res { id: id }; }
+
+    drop(mut &this) -> void { }
+}
+
+function main() -> int {
+    mut p: (Res, i64) = (Res::new(7), 0);
+    mut got: i64 = 0;
+    match (p.0) {                   // the tuple still drops field 0 at scope exit
+        _ => { got = 1; }
+    }
+    return got as int;
+}

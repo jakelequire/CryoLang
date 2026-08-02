@@ -1,0 +1,51 @@
+// E0452: inside ONE state of an async function, a carried value that has been
+// handed away may not be read again.
+//
+// A value that a later state reads is CARRIED: it is built into an `Option`
+// field of the future and reached through a pointer (`*c$p`) so its address
+// holds still across a suspend. A by-value use has to empty that field, since
+// the field owns the value outright.
+//
+// The take used to be spelled inline at the mention, which left the give-away
+// and any later mention as two unrelated expressions to MoveCheck - it runs
+// long after the async lowering - so this shape compiled clean and the later
+// read looked at emptied storage. The take is now hoisted into a named local
+// and every later mention in the same straight-line run is rebound to it, so
+// the move is an ordinary local move and this is an ordinary use-after-move.
+//
+// The name in the diagnostic is the hoisted local, derived from the binding the
+// programmer wrote (`c` -> `c$...$gv0`), the same way `c$p` already is.
+//
+// Compiles clean and must keep compiling: a give-away with no later use, a
+// borrow-only carried value, a give-away followed by a REBUILD, and a give-away
+// confined to one branch. Those are covered by
+// `lang/async_giveaway_use_after_move_controls`.
+![config(testing)]
+![config(negative, E0452)]
+namespace CryoTests::Negative::AsyncGiveawayThenBorrowSameState;
+
+type struct Res {
+    id: i64;
+
+    static new(id: i64) -> Res { return Res { id: id }; }
+
+    drop(mut &this) -> void { }
+}
+
+function consume(r: Res) -> i64 { return r.id; }
+function peek(r: &Res) -> i64 { return r.id; }
+
+async function ready(v: i64) -> i64 { return v; }
+
+async function drive() -> i64 {
+    mut c: Res = Res::new(5);
+    const a: i64 = consume(c);   // handed away: the carrier field is emptied
+    const b: i64 = peek(&c);     // same state, after the move   //~ ERROR[E0452] use of moved value
+    const z: i64 = await ready(1);
+    const d: i64 = peek(&c);     // a later state reads it, so `c` IS carried
+    return a + b + z + d;
+}
+
+function main() -> int {
+    return 0;
+}

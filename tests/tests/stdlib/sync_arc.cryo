@@ -170,3 +170,126 @@ function arc_clones_round_trip_through_loop() -> Result<(), TestError> {
     }
     return Result::Ok(());
 }
+
+// ============================================================================
+// Weak<T> - non-owning atomic references
+//
+// Like the Rc Weak tests, these use the test-local `Counted` type so each
+// Weak<Counted> instance is owned and emitted in this object.
+// ============================================================================
+
+![test]
+function arc_downgrade_does_not_bump_strong() -> Result<(), TestError> {
+    arc_payload_drops = 0;
+    mut a: Arc<Counted> = Arc::new(Counted { tag: 1 });
+    mut w: Weak<Counted> = a.downgrade();
+    const strong: u64 = a.strong_count();
+    const weak: u64 = a.weak_count();
+    w.drop();
+    a.drop();
+    expect_eq(strong as i32, 1)?;
+    expect_eq(weak as i32, 1)?;
+    return expect_eq(arc_payload_drops, 1);
+}
+
+![test]
+function arc_upgrade_while_alive_returns_some() -> Result<(), TestError> {
+    arc_payload_drops = 0;
+    mut a: Arc<Counted> = Arc::new(Counted { tag: 42 });
+    mut w: Weak<Counted> = a.downgrade();
+    mut strong_during: u64 = 0;
+    mut tag: i32 = 0;
+    match (w.upgrade()) {
+        Option::Some(up) => {
+            mut u: Arc<Counted> = up;
+            strong_during = u.strong_count();
+            tag = u.as_ptr().tag;
+            u.drop();
+        }
+        Option::None => { }
+    }
+    const strong_after: u64 = a.strong_count();
+    w.drop();
+    a.drop();
+    expect_eq(strong_during as i32, 2)?;
+    expect_eq(tag, 42)?;
+    expect_eq(strong_after as i32, 1)?;
+    return expect_eq(arc_payload_drops, 1);   // value dropped exactly once
+}
+
+![test]
+function arc_upgrade_after_last_strong_is_none() -> Result<(), TestError> {
+    arc_payload_drops = 0;
+    mut a: Arc<Counted> = Arc::new(Counted { tag: 5 });
+    mut w: Weak<Counted> = a.downgrade();
+    a.drop();                          // last strong: value dies, header kept
+    const drops_after_strong: i32 = arc_payload_drops;
+    mut got_none: boolean = false;
+    match (w.upgrade()) {
+        Option::Some(up) => { mut u: Arc<Counted> = up; u.drop(); }
+        Option::None    => { got_none = true; }
+    }
+    w.drop();                          // header freed; no second value drop
+    expect_eq(drops_after_strong, 1)?;
+    expect_eq(arc_payload_drops, 1)?;
+    return expect_true(got_none, Str::new("upgrade after last strong Arc is None"));
+}
+
+![test]
+function arc_weak_does_not_keep_value_alive() -> Result<(), TestError> {
+    arc_payload_drops = 0;
+    mut a: Arc<Counted> = Arc::new(Counted { tag: 9 });
+    mut w: Weak<Counted> = a.downgrade();
+    a.drop();
+    // The lone Weak must NOT have kept the value alive.
+    const dropped: i32 = arc_payload_drops;
+    w.drop();
+    return expect_eq(dropped, 1);
+}
+
+![test]
+function arc_get_mut_blocked_by_outstanding_weak() -> Result<(), TestError> {
+    arc_payload_drops = 0;
+    mut a: Arc<Counted> = Arc::new(Counted { tag: 3 });
+    mut w: Weak<Counted> = a.downgrade();
+    mut blocked: boolean = false;
+    match (a.get_mut()) {
+        Option::Some(_) => { }
+        Option::None    => { blocked = true; }
+    }
+    w.drop();
+    mut unlocked: boolean = false;
+    match (a.get_mut()) {
+        Option::Some(p) => { p.tag = 8; unlocked = true; }
+        Option::None    => { }
+    }
+    const final_tag: i32 = a.as_ptr().tag;
+    a.drop();
+    expect_true(blocked, Str::new("get_mut blocked while a Weak exists"))?;
+    expect_true(unlocked, Str::new("get_mut allowed once unique"))?;
+    return expect_eq(final_tag, 8);
+}
+
+![test]
+function arc_dangling_weak_upgrades_to_none() -> Result<(), TestError> {
+    mut w: Weak<Counted> = Weak<Counted>::new();
+    mut got_none: boolean = false;
+    match (w.upgrade()) {
+        Option::Some(up) => { mut u: Arc<Counted> = up; u.drop(); }
+        Option::None    => { got_none = true; }
+    }
+    w.drop();
+    return expect_true(got_none, Str::new("dangling Weak::new upgrades to None"));
+}
+
+![test]
+function arc_weak_clone_bumps_weak_count() -> Result<(), TestError> {
+    mut a: Arc<Counted> = Arc::new(Counted { tag: 1 });
+    mut w1: Weak<Counted> = a.downgrade();
+    mut w2: Weak<Counted> = w1.clone();
+    const wc: u64 = a.weak_count();
+    w2.drop();
+    w1.drop();
+    a.drop();
+    return expect_eq(wc as i32, 2);
+}

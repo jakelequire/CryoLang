@@ -109,6 +109,15 @@ type enum LLinkage : i32 {
     LinkerPrivateWeak   = 16;
 }
 
+/// Mirror of `LLVMUnnamedAddr` (`llvm-c/Core.h`).  Marks whether a global's
+/// address is significant; `Global` lets the linker merge identical
+/// constants - what `LLVMBuildGlobalStringPtr` sets on its string literals.
+type enum LUnnamedAddr : i32 {
+    None   = 0;
+    Local  = 1;
+    Global = 2;
+}
+
 /// Mirror of `LLVMVerifierFailureAction` (`llvm-c/Analysis.h`).
 type enum LVerifierAction : i32 {
     AbortProcess = 0;
@@ -776,6 +785,32 @@ type struct LBuilder {
         return LValue { raw: llvm::LLVMBuildCall2(this.raw, fn_ty.raw, fn_val.raw, args, num_args, name) };
     }
 
+    /// `invoke` variant of `build_call`: control transfers to `then_bb` on a
+    /// normal return and to `catch_bb` (a landing-pad block) if the callee
+    /// unwinds.  Used only under `--panic=unwind` at panic-capable call sites
+    /// that have live droppable locals to clean up.
+    build_invoke(&this, fn_ty: LType, fn_val: LValue, args: void*, num_args: u32,
+                 then_bb: LBasicBlock, catch_bb: LBasicBlock, name: string) -> LValue {
+        if (fn_ty.raw == null || fn_val.raw == null) { return LValue::null(); }
+        return LValue { raw: llvm::LLVMBuildInvoke2(this.raw, fn_ty.raw, fn_val.raw,
+            args, num_args, then_bb.raw, catch_bb.raw, name) };
+    }
+
+    /// Build a `landingpad` at the start of an unwind-destination block.  `ty`
+    /// is the `{ ptr, i32 }` exception/selector pair.  The legacy personality
+    /// operand is null (modern LLVM reads the personality off the function).
+    build_landing_pad(&this, ty: LType, num_clauses: u32, name: string) -> LValue {
+        if (ty.raw == null) { return LValue::null(); }
+        return LValue { raw: llvm::LLVMBuildLandingPad(this.raw, ty.raw, null, num_clauses, name) };
+    }
+
+    /// Re-raise the in-flight exception `exn` (the landing-pad result) to
+    /// continue unwinding into the caller's frame after running local drops.
+    build_resume(&this, exn: LValue) -> LValue {
+        if (exn.raw == null) { return LValue::null(); }
+        return LValue { raw: llvm::LLVMBuildResume(this.raw, exn.raw) };
+    }
+
     build_select(&this, cond: LValue, then_val: LValue, else_val: LValue, name: string) -> LValue {
         if (cond.raw == null || then_val.raw == null || else_val.raw == null) { return LValue::null(); }
         return LValue { raw: llvm::LLVMBuildSelect(this.raw, cond.raw, then_val.raw, else_val.raw, name) };
@@ -824,12 +859,50 @@ type struct LValue {
         llvm::LLVMSetLinkage(this.raw, linkage as i32);
     }
 
+    /// Add a clause to a `landingpad` value: `clause_val` is a type-info
+    /// global for a typed catch, or a null pointer constant for catch-all.
+    add_clause(&this, clause_val: LValue) -> void {
+        llvm::LLVMAddClause(this.raw, clause_val.raw);
+    }
+
+    /// Mark a `landingpad` as running cleanups (destructors) even when no
+    /// catch clause matches.  Set on every cleanup-only landing pad.
+    set_cleanup(&this, on: boolean) -> void {
+        llvm::LLVMSetCleanup(this.raw, on as i32);
+    }
+
+    /// Attach the exception-personality routine to this function.  Required
+    /// on any function that contains an `invoke`/`landingpad`.
+    set_personality_fn(&this, pers_fn: LValue) -> void {
+        llvm::LLVMSetPersonalityFn(this.raw, pers_fn.raw);
+    }
+
     set_initializer(&this, val: LValue) -> void {
         llvm::LLVMSetInitializer(this.raw, val.raw);
     }
 
     set_global_constant(&this, is_const: boolean) -> void {
         llvm::LLVMSetGlobalConstant(this.raw, is_const as i32);
+    }
+
+    /// Set a global's unnamed-address kind (see LUnnamedAddr).  `Global`
+    /// tells the linker the address is not significant, so identical
+    /// constants may be merged - the mode `LLVMBuildGlobalStringPtr` uses
+    /// for its string globals.
+    set_unnamed_address(&this, addr: LUnnamedAddr) -> void {
+        llvm::LLVMSetUnnamedAddress(this.raw, addr as i32);
+    }
+
+    /// Set the alignment, in bytes, of a global or memory instruction.
+    set_alignment(&this, bytes: u32) -> void {
+        llvm::LLVMSetAlignment(this.raw, bytes);
+    }
+
+    /// Mark a global as thread-local (each thread gets its own instance). LLVM
+    /// picks the default (general-dynamic) TLS model and inserts the TLS
+    /// lowering at every reference; the OS/loader provides the per-thread block.
+    set_thread_local(&this, tl: boolean) -> void {
+        llvm::LLVMSetThreadLocal(this.raw, tl as i32);
     }
 
     get_param(index: u32) -> LValue {
@@ -1022,6 +1095,17 @@ type struct LType {
 
     static const_array(element_ty: LType, values: void*, count: u32) -> LValue {
         return LValue { raw: llvm::LLVMConstArray(element_ty.raw, values, count) };
+    }
+
+    /// Build a NUL-terminated `[len+1 x i8]` array constant from `text`
+    /// (`c"...\00"`).  `len` is the strlen of the C string, matching what
+    /// `LLVMBuildGlobalStringPtr` measures.  Interns the constant in the
+    /// current per-module context (not the implicit global one) so it stays
+    /// private to that module during parallel emit - same rationale as
+    /// `const_struct`.
+    static const_string(text: string) -> LValue {
+        return LValue { raw: llvm::LLVMConstStringInContext(
+            LContext::current().raw, text, text.length() as u32, 0) };
     }
 
     /// Typed wrapper around `LLVMGetTypeKind` for raw `LLVMTypeRef` handles

@@ -13,6 +13,7 @@ import std::core::result;
 import std::core::option;
 import std::core::slice;
 import std::core::drop;
+import std::core::mem;
 import std::collections::array;
 import std::collections::str;
 import std::io::error;
@@ -174,7 +175,13 @@ function echo_stdout_via_pipe() -> Result<(), TestError> {
     match (cmd.spawn()) {
         Result::Ok(handle) => {
             mut c: Child = handle;
-            match (c.stdout) {
+            // Take the pipe handle OUT of the child before reading it. Matching
+            // `c.stdout` in place would leave `c` holding a second claim on the
+            // same descriptor, so the arm's handle and the child's teardown
+            // would both close it.
+            mut so: Option<ChildStdout> = Option::None;
+            mem::swap<Option<ChildStdout>>(&so, &c.stdout);
+            match (so) {
                 Option::Some(mut h) => {
                     loop {
                         match (h.read(&chunk[0], 64)) {
@@ -192,7 +199,6 @@ function echo_stdout_via_pipe() -> Result<(), TestError> {
                 }
                 Option::None => { }
             }
-            c.stdout = Option::None;
             match (c.wait()) {
                 Result::Ok(st) => { success = st.success(); }
                 Result::Err(_) => { c.drop(); cmd.drop(); acc.drop(); return bail(Str::new("wait failed")); }
@@ -419,14 +425,14 @@ function stdout_fd_redirects_to_file() -> Result<(), TestError> {
     // "fdhello" is 7 bytes; echo adds a newline (LF or CRLF). Confirm the
     // word itself reached the file rather than just any byte count.
     const want: Slice<u8> = Str::new("fdhello").as_bytes();
-    mut content_ok: boolean = (got >= 7u64);
+    mut content_ok: boolean = (got >= 7);
     mut i: u64 = 0;
-    while (content_ok && i < 7u64) {
+    while (content_ok && i < 7) {
         match (want.get(i)) {
             Option::Some(wv) => { if (readbuf[i] != wv) { content_ok = false; } }
             Option::None     => { content_ok = false; }
         }
-        i = i + 1u64;
+        i = i + 1;
     }
     return expect(content_ok, Str::new("redirected stdout must reach the file"));
 }
@@ -450,8 +456,8 @@ function output_large_stderr_no_deadlock_win() -> Result<(), TestError> {
         Result::Ok(out) => {
             mut o: Output = out;
             deadlocked = false;
-            got_stdout = o.stdout.length() >= 4u64;        // "done"
-            got_stderr = o.stderr.length() >= 100000u64;
+            got_stdout = o.stdout.length() >= 4;        // "done"
+            got_stderr = o.stderr.length() >= 100000;
             o.drop();
         }
         Result::Err(_) => {

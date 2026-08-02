@@ -1,0 +1,111 @@
+// `if` used as an EXPRESSION is the ternary's block-bodied twin, and the async
+// lowering's expression walkers knew almost nothing about it: of the nine that
+// descend into a `TernaryExpression`, exactly one also descended into an
+// `IfExpression`.  Each miss showed up as its own rejection of code that has a
+// working statement-level spelling:
+//
+//   - the receiver rewrite never reached the arms, so `this.f` inside one
+//     resolved against the generated Future struct (E0204);
+//   - a local read ONLY inside an if-expression was not seen as read, so it was
+//     never carried across a suspend and its alpha-renamed name went missing
+//     (E0201) -- the same for a value given away in an arm;
+//   - an `await` in an arm was never counted, so the arm was never lifted into
+//     the branch statement it already means (E0600 at codegen).
+//
+// One miss was SILENT rather than loud, and it is the reason this is a sweep
+// and not a patch: the address-of-across-suspend check did not descend either,
+// so `const p: u8* = if (c) { &buf[0] } else { null };` held across an `await`
+// compiled and ran, writing through a pointer into a frame the poll had left.
+// That case is `negative/E0455_async_address_in_if_expression.cryo`.
+//
+// These are the shapes those walkers have to agree on.  Each is written the way
+// it reads naturally rather than routed around the hole.
+![config(testing)]
+namespace CryoTests::Tests::Lang::AsyncIfExpression;
+
+import std::core::result;
+import std::collections::string;
+import std::collections::str;
+import std::future;
+import std::future::ready;
+import std::test::error;
+import std::test::assert;
+
+type struct Cap {
+    field: i64;
+
+    /// The receiver in the condition AND in an arm, with a write through it
+    /// afterwards so a rewrite that reached the arms but produced the wrong
+    /// place would not pass either.
+    async pick(mut &this) -> i64 {
+        const cap: i64 = if (this.field > 0) { this.field } else { 100 };
+        const a: i64 = await PendingThenReady<i64>::new(2, 5);
+        this.field = cap + 1;
+        return cap + a;
+    }
+}
+
+/// An `await` inside an arm: only one arm runs, so it cannot be lifted above
+/// the test -- the whole expression becomes `mut $tv; if (c) {…} else {…}`.
+async function await_in_arm(c: boolean) -> i64 {
+    const v: i64 = if (c) { await PendingThenReady<i64>::new(2, 5) } else { 100 };
+    return v + 1;
+}
+
+/// `base` is read nowhere but inside the if-expression, and that read is after
+/// a suspend -- so it is carried only if the walk sees it.
+async function carried_local(c: boolean) -> i64 {
+    const base: i64 = 40;
+    const a: i64 = await PendingThenReady<i64>::new(2, 5);
+    const v: i64 = if (c) { base } else { 100 };
+    return v + a;
+}
+
+function consume(s: String) -> u64 {
+    mut owned: String = s;
+    return owned.length();
+}
+
+/// The same for an OWNED value handed away inside an arm, which additionally
+/// has to be reported as a last use so the state does not hand it back.
+async function move_in_arm(c: boolean) -> u64 {
+    mut s: String = String::from_str(Str::new("owned"));
+    const a: i64 = await PendingThenReady<i64>::new(2, 5);
+    const n: u64 = if (c) { consume(s) } else { 100 };
+    return n + (a as u64);
+}
+
+![test]
+function this_resolves_inside_an_if_expression() -> Result<(), TestError> {
+    mut b: Cap = Cap { field: 7 };
+    match (expect_eq(block_on(b.pick()), 12 as i64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    // The write after the suspend went through the refreshed receiver.
+    return expect_eq(b.field, 8 as i64);
+}
+
+![test]
+function an_await_inside_an_if_expression_arm_suspends() -> Result<(), TestError> {
+    match (expect_eq(block_on(await_in_arm(true)), 6 as i64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    // The arm with no `await` still has to produce its value.
+    return expect_eq(block_on(await_in_arm(false)), 101 as i64);
+}
+
+![test]
+function a_local_read_only_in_an_if_expression_is_carried() -> Result<(), TestError> {
+    match (expect_eq(block_on(carried_local(true)), 45 as i64)) {
+        Result::Ok(_)  => { }
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(block_on(carried_local(false)), 105 as i64);
+}
+
+![test]
+function an_owned_value_given_away_in_an_arm_is_carried() -> Result<(), TestError> {
+    return expect_eq(block_on(move_in_arm(true)), 10 as u64);
+}
