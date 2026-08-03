@@ -1445,8 +1445,30 @@ type struct CompilerInstance {
         // Compute topological order
         cdebug("[Compiler] Calling compute_order()...\n");
         if (!ctx.module_graph.compute_order()) {
-            ctx.emit_error(ErrorCode::E0501_CIRCULAR_IMPORT,
-                "circular module dependency detected; cannot determine compilation order");
+            // Name the modules that could not be placed.  Without this the
+            // user saw only "Project compilation failed (1 errors, ...)" with
+            // no diagnostic at all: the cycle listing went to the debug
+            // channel, and the E0501 below was buffered but never flushed.
+            mut cyc: string = "";
+            const unplaced: &u32[] = &ctx.module_graph.topo_unplaced;
+            for (mut ui: i64 = 0; ui < unplaced.length; ui++) {
+                const uinfo: ModuleInfo* =
+                    &ctx.module_graph.modules[unplaced[ui]];
+                const uname: string = ctx.intern_table.resolve(uinfo.name);
+                if (cyc.length() > 0) { cyc = cyc + ", "; }
+                cyc = cyc + uname;
+            }
+            const cyc_msg: string = if (cyc.length() > 0) {
+                format("circular module dependency detected; cannot determine "
+                       "compilation order. Modules in the cycle: %s", cyc)
+            } else {
+                "circular module dependency detected; cannot determine compilation order"
+            };
+            ctx.emit_error(ErrorCode::E0501_CIRCULAR_IMPORT, cyc_msg);
+            // Diagnostics are buffered until flush(); an early return that
+            // skips it silently discards the error (same defect the E0505
+            // path above documents).
+            ctx.diagnostics.flush();
             return CompilationResult::failed(ctx.diagnostics.error_count, 0);
         }
 

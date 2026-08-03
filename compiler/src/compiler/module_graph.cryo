@@ -119,6 +119,13 @@ type struct ModuleInfo {
     }
 
     add_dependency(mut &this, dep: SymbolStr) -> void {
+        // A module cannot depend on itself.  `import A::{ X };` records the
+        // parent path `A` as the dependency, so a file whose OWN namespace is
+        // `A` would otherwise gain an unsatisfiable self-edge and be reported
+        // as a cycle ("blocked by itself").  Drop it: the edge carries no
+        // ordering information, and the brace items are recorded separately as
+        // visibility edges.
+        if (dep.id == this.name.id) { return; }
         this.dependencies.push(dep);
     }
 
@@ -174,6 +181,11 @@ type struct CrossModuleFnDescriptor {
 type struct ModuleGraph {
     modules:          ModuleInfo[];
     topo_order:       u32[];
+    /// Modules `compute_order()` could not place, set only when it returns
+    /// false.  Exists so the caller can name the cycle in a USER-FACING
+    /// diagnostic; before this the cycle was reported to the debug channel
+    /// only, so a plain build printed "1 errors" and nothing else.
+    topo_unplaced:    u32[];
     cross_module_fns: CrossModuleFnDescriptor[];
 
     // Per-module AST storage: raw pointer array to avoid array[i]=x codegen bug
@@ -209,6 +221,7 @@ type struct ModuleGraph {
         return ModuleGraph {
             modules:          [],
             topo_order:       [],
+            topo_unplaced:    [],
             cross_module_fns: [],
             module_ast_buf:   ast_buf,
             module_ast_cap:   initial_cap,
@@ -386,8 +399,10 @@ type struct ModuleGraph {
                 cdebug("[TopSort] Cycle detected! %u of %u modules placed.\n",
                     order.length, n);
                 cdebug("[TopSort] Unplaced modules and their unresolved deps:\n");
+                mut unplaced: u32[] = [];
                 for (mut ci: u32 = 0; ci < n; ci++) {
                     if (ModuleGraph::topo_contains(order, ci)) { continue; }
+                    unplaced.push(ci);
                     const cinfo: ModuleInfo* = &this.modules[ci];
                     cdebug("  [%u] %s\n", ci, cinfo.file_path);
                     // Read deps in place - a value copy of `cinfo` would alias
@@ -400,6 +415,7 @@ type struct ModuleGraph {
                         }
                     }
                 }
+                this.topo_unplaced = unplaced;
                 this.topo_order = order;
                 return false;
             }

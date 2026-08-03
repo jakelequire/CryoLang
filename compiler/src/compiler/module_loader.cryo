@@ -668,37 +668,44 @@ type struct ModuleLoader {
             }
         }
 
-        // Record brace-list import items as VISIBILITY edges only.  The parent
-        // path already produced the dependency edge above, and the item's own
-        // module is discovered through the parent's `public module` manifest
-        // below, so nothing here needs discovery - only the mapping from the
-        // written path to the target's declared namespace.
+        // Brace-list import items.  Each item that names a real module must be
+        // DISCOVERED (exactly like a plain import path) and recorded as a
+        // VISIBILITY edge - never a dependency edge, or `compute_order()` gains
+        // the false cycles this loader avoids for `public module`.
+        //
+        // Discovery cannot be skipped on the assumption that the parent's
+        // `public module` manifest already found the item: a project whose
+        // parent has no `_module.cryo` never declares it, and then
+        // `import A::{ B };` would silently compile without B while
+        // `import A::B;` compiled with it - two spellings, two meanings.
         for (mut ii: i64 = 0; ii < scan.import_item_count; ii++) {
             const item_path: string = scan.import_items[ii];
-            // Written path first: compiler and stdlib spell these fully
-            // qualified, so this is the common case.
-            const item_sym: SymbolStr = intern.intern(item_path);
-            const item_idx: i64 = graph.find_module_index(item_sym);
-            if (item_idx >= 0) {
-                info.add_imported_namespace(graph.modules[item_idx].name);
-                continue;
-            }
-            // Otherwise resolve it on disk the way an import path is resolved,
-            // and take the declared namespace of whatever file that names.
             mut item_resolved: string = this.resolve_import_path(item_path);
             if (item_resolved.length() == 0) {
                 item_resolved = this.search_location(
                     file_dir, ModuleLoader::replace_separator(item_path));
             }
             if (item_resolved.length() > 0) {
+                if (!this.discover_module(intern, graph, sink, item_resolved, debug)) {
+                    success = false;
+                }
                 const by_path: i64 = graph.find_module_by_path(item_resolved);
                 if (by_path >= 0) {
                     info.add_imported_namespace(graph.modules[by_path].name);
+                    continue;
                 }
             }
-            // A brace item naming a TYPE rather than a submodule resolves to
-            // nothing here.  That is correct and not an error: the type is
-            // reached through its parent module, which is already a dependency.
+            // Not a file on disk: it may already be in the graph under the
+            // written path (fully-qualified spellings, the common case in the
+            // compiler and stdlib).
+            const item_sym: SymbolStr = intern.intern(item_path);
+            const item_idx: i64 = graph.find_module_index(item_sym);
+            if (item_idx >= 0) {
+                info.add_imported_namespace(graph.modules[item_idx].name);
+            }
+            // Otherwise the item names a TYPE rather than a submodule, which
+            // resolves to nothing here.  Correct, and not an error: the type is
+            // reached through its parent module, already a dependency above.
         }
 
         // Discover submodules (public module declarations) WITHOUT adding
