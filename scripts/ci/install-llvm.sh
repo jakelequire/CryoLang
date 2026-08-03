@@ -25,10 +25,28 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CACHE_DIR="${CRYO_CI_CACHE_DIR:-$HOME/.cache/cryo-ci}"
 TARBALL="${CACHE_DIR}/llvm-${LLVM_MAJOR}-toolchain.tar.zst"
 
+# The C-import engine (Compiler::Bindgen) drives libclang, and libclang locates
+# its resource directory - the one holding stddef.h - relative to the shared
+# object it was loaded from, NOT from /usr/lib/llvm-N.  Loading the multiarch
+# /usr/lib/x86_64-linux-gnu/libclang-N.so.1 therefore resolves it to
+# /usr/lib/clang/N, a path outside the llvm-N tree.
+#
+# This matters because compiler/llvm_bindings.h includes <stddef.h> so `size_t`
+# maps to u64.  With the resource headers missing the include silently fails,
+# libclang falls back to implicit-int, and every size_t parameter becomes i32 -
+# surfacing much later as `error[E0214]: expected i32, found u64` on the length
+# arguments of LLVMGetInlineAsm and friends, with nothing pointing at the cache.
+clang_resource_ok() {
+    printf '#include <stddef.h>\nsize_t probe(void);\n' > /tmp/cryo-cimport-probe.c
+    "clang-${LLVM_MAJOR}" -fsyntax-only /tmp/cryo-cimport-probe.c >/dev/null 2>&1 \
+        && [ -e "/usr/lib/clang/${LLVM_MAJOR}/include/stddef.h" ]
+}
+
 toolchain_ok() {
     "clang-${LLVM_MAJOR}" --version >/dev/null 2>&1 \
         && "llvm-config-${LLVM_MAJOR}" --libs core >/dev/null 2>&1 \
-        && [ -e "/usr/lib/llvm-${LLVM_MAJOR}/lib/libclang-${LLVM_MAJOR}.so.1" ]
+        && [ -e "/usr/lib/llvm-${LLVM_MAJOR}/lib/libclang-${LLVM_MAJOR}.so.1" ] \
+        && clang_resource_ok
 }
 
 install_from_apt() {
@@ -52,11 +70,22 @@ write_cache_tarball() {
     # The /usr/lib/llvm-N tree includes the libclang-N.so.1 symlink, but that
     # symlink points into the multiarch dir - capture the real libclang shared
     # object there too (alongside libLLVM) or a cache restore leaves it dangling.
+    #
+    # /usr/lib/clang/<ver> lives OUTSIDE the llvm-N tree and must be captured
+    # separately: it is the resource directory a multiarch-loaded libclang
+    # resolves to, so omitting it restores a toolchain whose <stddef.h> cannot
+    # be found (see clang_resource_ok above).
+    local extra=()
+    local d
+    for d in /usr/lib/clang/"${LLVM_MAJOR}"*; do
+        if [ -d "$d" ]; then extra+=("$d"); fi
+    done
     sudo tar --zstd -cf "$TARBALL" \
         "/usr/lib/llvm-${LLVM_MAJOR}" \
         /usr/lib/x86_64-linux-gnu/libLLVM*"${LLVM_MAJOR}"* \
         /usr/lib/x86_64-linux-gnu/libclang*"${LLVM_MAJOR}"* \
-        /usr/bin/*-"${LLVM_MAJOR}"
+        /usr/bin/*-"${LLVM_MAJOR}" \
+        ${extra+"${extra[@]}"}
     sudo chmod 644 "$TARBALL"
 }
 
