@@ -19,7 +19,7 @@
 | D3 | All work lands on branch **`name-res-impl`**, cut from `main` after `ll-impl` merges | One long-lived branch; phase boundaries are commits, not merges. §5. |
 | D4 | Deletion of the global leaf index is what fixes §2.4 | Not the package. Credit assigned to Phase 5, not Phase 2. §3.1. |
 
-### Revision history
+### Revision historyc
 
 **Revision 3 (2026-07-27)** — D1–D4 applied. D2 is the substantive one: revision
 2 gave the package two jobs (cycle unit *and* implicit rib), and only the first

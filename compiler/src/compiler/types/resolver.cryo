@@ -20,6 +20,7 @@ import Compiler::AST::{ Node, Declaration, Statement, Expression };
 import Compiler::Resolver::{ SymbolStr, InternTable, Resolver };
 import Compiler::DeclIndex;
 import Compiler::ConstTable;
+import Compiler::ResolveCounter;
 import Utils::Logger;
 import std::collections::pair;
 
@@ -1325,9 +1326,11 @@ private:
         const name_str: string = this.intern_table.resolve(name);
         const name_len: i64 = name_str.length() as i64;
         LOG_DEBUG(LogComponent::TypeChecker, "resolve_named() name='%s'", name_str);
+        ResolveCounter::rc_rn_call();
         // 1. Check generic bindings first (O(1) SymbolStr comparison)
         mut binding: TypeRef = ctx.lookup_binding(name);
         if (binding.is_valid()) {
+            ResolveCounter::rc_rn_generic_binding();
             return binding;
         }
 
@@ -1354,7 +1357,7 @@ private:
                         name_str.substring(sep + 2, name_len - sep - 2);
                     const member_sym: SymbolStr = this.intern_table.intern(member_str);
                     const proj: TypeRef = this.project_member(prefix_ty, member_sym, ctx);
-                    if (proj.is_valid()) { return proj; }
+                    if (proj.is_valid()) { ResolveCounter::rc_rn_assoc_projection(); return proj; }
                 }
             }
         }
@@ -1365,6 +1368,7 @@ private:
         //    This fallback ensures they resolve correctly.
         const prim: TypeRef = this.resolve_primitive(name);
         if (prim.is_valid()) {
+            ResolveCounter::rc_rn_primitive();
             return prim;
         }
 
@@ -1392,11 +1396,13 @@ private:
             if (this.decl_index != null) {
                 const home_di: TypeRef = this.decl_index.lookup_type(home_qn);
                 if (home_di.is_valid()) {
+                    ResolveCounter::rc_rn_home_module();
                     return this.follow_alias(home_di);
                 }
             }
             const home_arena: TypeRef = this.arena.lookup_by_name(home_qn);
             if (home_arena.is_valid()) {
+                ResolveCounter::rc_rn_home_module();
                 return this.follow_alias(home_arena);
             }
         }
@@ -1424,6 +1430,7 @@ private:
                         Diagnostic::error(ErrorCode::E0203_UNDEFINED_TYPE, msg));
                 }
             }
+            ResolveCounter::rc_rn_ambiguous();
             return TypeRef::invalid();
         }
 
@@ -1450,6 +1457,7 @@ private:
                     && this.name_resolver.contains_separator(name_str)) {
                 const di_literal: TypeRef = this.decl_index.lookup_type(name);
                 if (di_literal.is_valid()) {
+                    ResolveCounter::rc_rn_di_literal();
                     return this.follow_alias(di_literal);
                 }
             }
@@ -1460,6 +1468,7 @@ private:
                 if (qualified.is_valid()) {
                     const di_found: TypeRef = this.decl_index.lookup_type(qualified);
                     if (di_found.is_valid()) {
+                        ResolveCounter::rc_rn_di_canonical();
                         return this.follow_alias(di_found);
                     }
                 }
@@ -1467,6 +1476,7 @@ private:
             // Try bare name
             const di_bare: TypeRef = this.decl_index.lookup_type(name);
             if (di_bare.is_valid()) {
+                ResolveCounter::rc_rn_di_bare();
                 return this.follow_alias(di_bare);
             }
         }
@@ -1480,6 +1490,7 @@ private:
         if (this.bootstrap_mode) {
             found = this.arena.lookup_by_name(name);
             if (found.is_valid()) {
+                ResolveCounter::rc_rn_arena_bootstrap();
                 const found_t: Type* = this.arena.lookup(found.id);
                 if (found_t != null && found_t.kind == TypeKind::TypeAlias) {
                     const alias_t: TypeAliasType* = found_t as TypeAliasType*;
@@ -1501,6 +1512,7 @@ private:
             if (qualified.is_valid()) {
                 found = this.arena.lookup_by_name(qualified);
                 if (found.is_valid()) {
+                    ResolveCounter::rc_rn_scope_arena_boot();
                     return found;
                 }
             }
@@ -1530,10 +1542,12 @@ private:
         //    misroute a stray `T` into a real type.
         found = this.arena.lookup_by_leaf(name);
         if (found.is_valid()) {
+            ResolveCounter::rc_rn_leaf_index();
             return found;
         }
 
         // Not found; return invalid (caller should create error)
+        ResolveCounter::rc_rn_failed();
         LOG_DEBUG(LogComponent::TypeChecker, "[TypeResolver] resolve_named() FAILED for '%s'", name_str);
         return TypeRef::invalid();
     }
