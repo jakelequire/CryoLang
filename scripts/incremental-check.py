@@ -100,10 +100,22 @@ def main():
         return 2
 
     tmp = tempfile.mkdtemp(prefix="incr-check-")
+
+    # Every cold-cache scenario wipes <project>/build, and the default
+    # compiler-under-test lives inside it, so driving builds from `cryo`
+    # directly would delete the binary mid-run. Drive them from a copy placed
+    # outside the tree that gets wiped. The copy is transparent to the cache:
+    # `Manifest::compiler_fingerprint` folds the compiler's own bytes, not its
+    # path, and copy2 preserves both the content and the executable bit. The
+    # exe-relative runtime-tier candidates miss from here, but `run_build` sets
+    # CRYO_STDLIB, so the stdlib-relative candidate still resolves the tiers.
+    driver = os.path.join(tmp, os.path.basename(cryo))
+    shutil.copy2(cryo, driver)
+
     failures = []
 
     def build_and_snapshot(label, *extra):
-        rc, out = run_build(cryo, project, *extra)
+        rc, out = run_build(driver, project, *extra)
         if rc != 0:
             print(f"  [{label}] BUILD FAILED (rc={rc})")
             print("\n".join("    " + l for l in out.splitlines()[-12:]))

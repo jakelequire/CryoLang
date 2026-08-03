@@ -131,7 +131,11 @@ jobs:
     # guards this. Nothing else in CI exercises the incremental path (the
     # build/selfhost jobs force clean builds), so without this a caching
     # regression ships unnoticed.
-    timeout-minutes: 30
+    # The matrix drives ~7 clean compiler builds plus the stage-2 bootstrap, so
+    # the ceiling is sized for that, not for a single build: the whole run
+    # measures ~16 min on a fast multi-core host, which leaves no headroom at 30
+    # on a 2-core runner.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
@@ -174,7 +178,7 @@ jobs:
       - name: Install the mingw-w64 cross toolchain + wine
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64 zip wine64
+          sudo apt-get install -y gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64 zip wine
 
       - name: Restore the windows LLVM bits cache
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
@@ -198,10 +202,15 @@ jobs:
           unzip -q dist/cryo-*-windows-x86_64.zip -d "$out"
           exe="$(find "$out" -name cryo.exe | head -1)"
           if [ -z "$exe" ]; then echo "cryo.exe not found in the windows zip"; exit 1; fi
+          # Current ubuntu images ship the 64-bit loader as `wine` and no longer
+          # provide a `wine64` command; older ones only have `wine64`. Take
+          # whichever exists so the job runs on either image.
+          wine="$(command -v wine64 || command -v wine || true)"
+          if [ -z "$wine" ]; then echo "no wine binary on PATH"; exit 1; fi
           # Run from the binary's own dir so it finds LLVM-C.dll beside it.
           cd "$(dirname "$exe")"
-          wine64 cryo.exe --version
-          wine64 cryo.exe --help
+          "$wine" cryo.exe --version
+          "$wine" cryo.exe --help
 
   windows-native:
     name: windows native (build + test on windows-latest)
