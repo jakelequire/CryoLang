@@ -128,7 +128,20 @@ const RC_VIS_WOULD_REJECT:        i64 = 32;
 const RC_VIS_REJECT_UNREACHABLE:  i64 = 33;
 const RC_VIS_REJECT_NOTPUBLIC:    i64 = 34;
 
-const RC_SITE_COUNT:              i64 = 35;
+// Per-caller attribution for the global leaf index.  `lookup_by_leaf` has SIX
+// callers and only one is `resolve_named`'s step 5, so the aggregate cannot
+// say who depends on it.  §2.10a justifies the index narrowly - as the only
+// route for `ASTVisitor*` in AST node files, which cannot account for 17,326
+// answers - so knowing WHICH sites consume it decides whether legalizing
+// intra-package import cycles retires it or not.
+const RC_LEAF_S_RESOLVE_NAMED:    i64 = 35;  // types/resolver.cryo step 5
+const RC_LEAF_S_RESOLVER_BOUND:   i64 = 36;  // types/resolver.cryo generic-param constraint
+const RC_LEAF_S_SYMBOLIC_CHECK:   i64 = 37;  // sema/symbolic_checker.cryo
+const RC_LEAF_S_TYPE_UTILS:       i64 = 38;  // sema/type_utils.cryo
+const RC_LEAF_S_TYPERES_BOUND:    i64 = 39;  // passes/type_resolution.cryo constraint
+const RC_LEAF_S_TYPERES_BASE:     i64 = 40;  // passes/type_resolution.cryo base class
+
+const RC_SITE_COUNT:              i64 = 41;
 
 /// Per-site tallies.  Zero-initialized in BSS; index with the `RC_*`
 /// constants above.  Sized well above `RC_SITE_COUNT` so adding a site
@@ -180,6 +193,35 @@ public function rc_vis_fastpath()          -> void { rc_bump(RC_VIS_FASTPATH); }
 public function rc_vis_would_reject()      -> void { rc_bump(RC_VIS_WOULD_REJECT); }
 public function rc_vis_reject_unreachable() -> void { rc_bump(RC_VIS_REJECT_UNREACHABLE); }
 public function rc_vis_reject_notpublic()  -> void { rc_bump(RC_VIS_REJECT_NOTPUBLIC); }
+
+// Leaf-index consumers, bumped on a HIT (an answer actually produced):
+public function rc_leaf_s_resolve_named()  -> void { rc_bump(RC_LEAF_S_RESOLVE_NAMED); }
+public function rc_leaf_s_resolver_bound() -> void { rc_bump(RC_LEAF_S_RESOLVER_BOUND); }
+public function rc_leaf_s_symbolic()       -> void { rc_bump(RC_LEAF_S_SYMBOLIC_CHECK); }
+public function rc_leaf_s_type_utils()     -> void { rc_bump(RC_LEAF_S_TYPE_UTILS); }
+public function rc_leaf_s_typeres_bound()  -> void { rc_bump(RC_LEAF_S_TYPERES_BOUND); }
+public function rc_leaf_s_typeres_base()   -> void { rc_bump(RC_LEAF_S_TYPERES_BASE); }
+
+/// Tri-state cache for `CRYO_LEAF_AUDIT`: 0 unknown, 1 on, 2 off.
+mut g_leaf_audit: i32 = 0;
+
+function rc_leaf_audit_enabled() -> boolean {
+    if (g_leaf_audit == 0) {
+        match (env::var(Str::new("CRYO_LEAF_AUDIT"))) {
+            Option::Some(_) => { g_leaf_audit = 1; }
+            Option::None    => { g_leaf_audit = 2; }
+        }
+    }
+    return g_leaf_audit == 1;
+}
+
+/// Log one name that the GLOBAL LEAF INDEX answered, with the module that
+/// asked.  Line-oriented so a run can be piped through `sort -u` to get the
+/// distinct set.  No-op unless `CRYO_LEAF_AUDIT` is set.
+public function rc_leaf_audit(use_site: string, name: string) -> void {
+    if (!rc_leaf_audit_enabled()) { return; }
+    fmt::eprintf("LEAF-HIT\t%s\t%s\n", use_site, name);
+}
 
 /// Tri-state cache for `CRYO_VIS_AUDIT`: 0 unknown, 1 on, 2 off.  Cached
 /// because the violation hook runs inside the hottest lookup in the compiler
@@ -282,6 +324,12 @@ public function rc_report() -> void {
     fmt::eprintf("\n-- global leaf index (types/arena.cryo:1023) ----------\n");
     rc_line("B1 ", "lookup_by_leaf calls",                 RC_LEAF_CALLS);
     rc_line("B1 ", "lookup_by_leaf hits",                  RC_LEAF_HITS);
+    rc_line("   ", "  by caller: resolve_named step 5",    RC_LEAF_S_RESOLVE_NAMED);
+    rc_line("   ", "  by caller: resolver generic bound",  RC_LEAF_S_RESOLVER_BOUND);
+    rc_line("   ", "  by caller: symbolic_checker",        RC_LEAF_S_SYMBOLIC_CHECK);
+    rc_line("   ", "  by caller: sema type_utils",         RC_LEAF_S_TYPE_UTILS);
+    rc_line("   ", "  by caller: type_resolution bound",   RC_LEAF_S_TYPERES_BOUND);
+    rc_line("   ", "  by caller: type_resolution base",    RC_LEAF_S_TYPERES_BASE);
 
     fmt::eprintf("\n-- DeclarationIndex bare_alts (decl_index.cryo:1405) --\n");
     rc_line("   ", "lookup_qualified_alternatives calls",  RC_BAREALTS_CALLS);

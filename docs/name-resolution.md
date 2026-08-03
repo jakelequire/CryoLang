@@ -421,14 +421,44 @@ gate can distinguish the two. And the import classifier is a textual regex, so
 "source imports it" does not prove the name legitimately comes from there.
 Neither caveat changes the conclusion's direction.
 
-### 8.1a A diagnostic can be counted but never rendered
+### 8.1a A diagnostic counted but never rendered — FIXED 2026-08-03
 
-Found incidentally while probing brace imports: a build of a two-module program
-using `import VisTest::{ Helper };` reported
+Found while probing brace imports: a two-module program using
+`import VisTest::{ Helper };` reported
 `Project compilation failed (1 errors, 0 warnings)` and printed **no
-diagnostic at all**. An error that cannot be read is worse than a crash. This
-is unrelated to name resolution proper but must be fixed before the corpus
-relies on diagnostic text.
+diagnostic at all**. An error that cannot be read is worse than a crash.
+
+Root cause was three separate defects stacked on one input:
+
+1. **A self-dependency made the module graph unplaceable.**
+   `import A::{ X };` records the parent path `A` as the dependency edge, so a
+   file whose own namespace is `A` gained a self-edge and could never be
+   placed. `add_dependency` now drops an edge to the module's own name: it
+   carries no ordering information, and the brace items are recorded
+   separately as visibility edges anyway.
+2. **The cycle was reported only to the debug channel.** `compute_order()`
+   printed the unplaced modules and their blockers via `cdebug`, so a plain
+   build showed nothing. It now records `topo_unplaced`, and the caller names
+   the modules in the cycle in the E0501 message (this closes §9 Q3's
+   "needs a printed cycle path", though a full cycle *path* rather than a
+   member list is still worth doing).
+3. **The E0501 diagnostic was buffered but never flushed.** Diagnostics render
+   on `flush()` (`diag/sink.cryo:111`); the `compute_order()` failure path
+   returned without calling it. Notably the adjacent E0505 path
+   (`instance.cryo:1442`) carries a comment saying exactly this — *"without
+   this the buffered E0505 would never reach the terminal"* — so the bug class
+   had been found and fixed at **one** site while this one was missed. Every
+   `CompilationResult::failed` path in `compile_project` was audited; the
+   others either print directly with `fmt::eprintln` (no buffered diagnostic)
+   or sit after the flush at `:2497`.
+
+A fourth defect surfaced from the fix and was also closed: brace-list items
+were not being **discovered**, on the assumption that the parent's
+`public module` manifest already had. False when the parent has no
+`_module.cryo` — `import A::{ B };` then compiled without `B` while
+`import A::B;` compiled with it. Two spellings, two meanings, which is the
+same failure shape as §2.6. Brace items are now discovered exactly like plain
+import paths.
 
 ### 8.2 Fallback inventory
 
@@ -446,6 +476,101 @@ Measured hit counts, compiler building itself, 2026-08-03:
 | M5 import suffix fallback | 456 | **456** | 100% — a missing capability, not a heuristic |
 | cascade 3a / 3c (DI literal / bare) | — | 1 / **0** | dead |
 | cascade 2b (E0203) | — | **0** | never fires |
+
+### 8.2a The leaf index, attributed (2026-08-03) — one root cause under everything
+
+Per-caller instrumentation of `lookup_by_leaf`'s six call sites, plus a
+`CRYO_LEAF_AUDIT` log of every name it answered:
+
+| Caller | Hits |
+|---|---:|
+| `resolve_named` step 5 | 17,084 |
+| `sema/type_utils` leaf fallback | 6,438 |
+| `type_resolution` base class | 17 |
+| `resolve_named` generic bound | **0** |
+| `symbolic_checker` generic bound | **0** |
+| `type_resolution` generic bound | **0** |
+
+**Three of six sites are dead** — every generic-bound lookup. Deletable with a
+corpus entry pinning it.
+
+The 17,084 collapse to **199 distinct (module, name) pairs / 165 names**:
+
+| Name | Events | |
+|---|---:|---|
+| `GlobalAlloc` | 13,687 | **80% of the total** |
+| `AllocError` | 898 | |
+| `Formatter` | 825 | |
+| `Option` | 461 | |
+| `FmtError` | 258 | |
+| … | | |
+| **`ASTVisitor`** | **69** | **0.4% — the case §2.10a cites to justify the whole fallback** |
+
+**14,588 of 17,084 (85%) were resolved with an EMPTY home module**, and
+**39 of 57 `ResolutionContext::new(...)` sites pass `""`** as the home module.
+
+**This is the single root cause under all three of today's measurements.** The
+resolver is routinely called with no use-site scope. With no scope it cannot
+answer from imports, so it falls the length of the cascade and lands on a
+program-wide index — which is the only thing that *can* answer a question asked
+without a scope. The same defect appears as:
+
+- **17,084 leaf-index answers** — resolution with no scope at all (§8.2a)
+- **327 visibility violations** — template bodies resolved in the *consumer's*
+  scope rather than the definer's (§8.1b)
+- **26,473 `home-module preference` answers** — a step that exists solely to
+  correct the ambient cursor (§8.2)
+
+**Consequence for D4 and Phase 2.** Legalizing intra-package import cycles
+addresses `ASTVisitor` and its peers: **0.4%** of leaf-index usage. It does not
+retire the fallback. What retires it is making the use-site scope mandatory and
+explicit (§5.2) and stamping `Res` on nodes so synthesized and instantiated
+bodies carry their resolution instead of being re-resolved scope-less (§6.3,
+§7.2 mechanism 4). Those two changes are the keystone; nearly everything else
+in §8.2 follows from them.
+
+### 8.2b First scope fix landed (2026-08-03) — 87% of the leaf index retired
+
+Two changes, both applying §5.2 ("resolve where it was written"):
+
+1. **Default generic annotations resolve in the template's module.** A default
+   (`struct String<A = GlobalAlloc>`) is syntax written in the template's
+   module, so `expand_default_type_args` now sets `home_module` from
+   `entry.module_name` on the context it already clones. Set in the shared
+   layer rather than at the nine call sites: the owning module is a property of
+   `entry`, so it is correct by construction and a new caller cannot forget it.
+2. **Home-module resolution became import-aware.** Step 2c previously consulted
+   only what the home module *declares* (`home_module::Name`). But a bare leaf
+   in an annotation means what that module can *see* — its imports and the
+   prelude. `GlobalAlloc` is declared in `std::alloc::allocator` and merely
+   imported by `std::collections::string`, so the declaration-only check missed
+   every time. It now falls through to `resolve_qualified_scoped_or` against
+   the home namespace, which is import-scoped and therefore cannot bind to an
+   unrelated same-leaf type in a module the home module never imported.
+
+Measured effect on a full compiler build:
+
+| | before | after |
+|---|---:|---:|
+| `resolve_named` step 5 (leaf index) | 17,084 | **2,280** |
+| `lookup_by_leaf` hits, all callers | 23,539 | **8,735** |
+| `lookup_by_leaf` calls | 62,222 | 47,424 |
+| step 2c (import-scoped home) | 26,473 | 48,764 |
+
+Change 1 alone moved nothing (the declaration-only check still missed);
+change 2 alone moved 2,503. Together they moved 14,804. **The two are only
+useful in combination**, which is worth remembering before either is
+"simplified" later.
+
+This is the empirical confirmation of §8.2a: the global leaf index was
+load-bearing because the resolver was being called without a scope, not
+because of circular imports.
+
+Note the visibility-gate reading rose (21,296 → 35,672) because more traffic
+now flows through `resolve_qualified_scoped`'s unguarded single-candidate fast
+path (§1). That is not a regression — those resolutions previously used a
+program-wide first-writer-wins index with no scope at all — but it does mean
+§1's fast path is now the dominant remaining source of scope-less binding.
 
 Two readings matter for sequencing:
 
