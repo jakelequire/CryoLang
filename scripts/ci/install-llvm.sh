@@ -36,10 +36,18 @@ TARBALL="${CACHE_DIR}/llvm-${LLVM_MAJOR}-toolchain.tar.zst"
 # libclang falls back to implicit-int, and every size_t parameter becomes i32 -
 # surfacing much later as `error[E0214]: expected i32, found u64` on the length
 # arguments of LLVMGetInlineAsm and friends, with nothing pointing at the cache.
+# Probe libclang, NOT the clang driver.  The driver finds its resource dir from
+# /usr/bin/clang-N and keeps working when libclang's own lookup is broken, so a
+# `clang -fsyntax-only` check passes on exactly the restores that then fail the
+# build.  c-index-test links the same libclang the C-import engine loads, so it
+# fails in the cases that matter.
 clang_resource_ok() {
     printf '#include <stddef.h>\nsize_t probe(void);\n' > /tmp/cryo-cimport-probe.c
-    "clang-${LLVM_MAJOR}" -fsyntax-only /tmp/cryo-cimport-probe.c >/dev/null 2>&1 \
-        && [ -e "/usr/lib/clang/${LLVM_MAJOR}/include/stddef.h" ]
+    if ! command -v "c-index-test-${LLVM_MAJOR}" >/dev/null 2>&1; then
+        return 1
+    fi
+    ! "c-index-test-${LLVM_MAJOR}" -test-load-source all /tmp/cryo-cimport-probe.c 2>&1 \
+        | grep -qi 'error\|fatal'
 }
 
 toolchain_ok() {
@@ -64,28 +72,32 @@ install_from_apt() {
 write_cache_tarball() {
     echo "[install-llvm] writing the toolchain tarball for the CI cache"
     mkdir -p "$CACHE_DIR"
-    # Everything the build needs: the self-contained /usr/lib/llvm-X tree,
-    # the runtime libLLVM.so in the multiarch dir, and the /usr/bin/<tool>-X
-    # entry points into the tree.
-    # The /usr/lib/llvm-N tree includes the libclang-N.so.1 symlink, but that
-    # symlink points into the multiarch dir - capture the real libclang shared
-    # object there too (alongside libLLVM) or a cache restore leaves it dangling.
-    #
-    # /usr/lib/clang/<ver> lives OUTSIDE the llvm-N tree and must be captured
-    # separately: it is the resource directory a multiarch-loaded libclang
-    # resolves to, so omitting it restores a toolchain whose <stddef.h> cannot
-    # be found (see clang_resource_ok above).
-    local extra=()
-    local d
-    for d in /usr/lib/clang/"${LLVM_MAJOR}"*; do
-        if [ -d "$d" ]; then extra+=("$d"); fi
+    # Ask dpkg which files the packages own rather than hand-maintaining a list
+    # of paths.  Guessing paths is what produced a tarball that restored a
+    # toolchain whose libclang could not resolve <stddef.h>: clang's resource
+    # headers are not all under /usr/lib/llvm-N, and exactly where they land
+    # varies with the packaging.  Capturing the package file lists makes a
+    # restore equal to the fresh install by construction.
+    local pkgs=(
+        "llvm-${LLVM_MAJOR}" "llvm-${LLVM_MAJOR}-dev" "llvm-${LLVM_MAJOR}-runtime"
+        "clang-${LLVM_MAJOR}" "libclang1-${LLVM_MAJOR}"
+        "libclang-common-${LLVM_MAJOR}-dev" "libclang-cpp${LLVM_MAJOR}"
+        "libpolly-${LLVM_MAJOR}-dev" "libllvm${LLVM_MAJOR}"
+    )
+    local present=()
+    local p
+    for p in "${pkgs[@]}"; do
+        if dpkg -s "$p" >/dev/null 2>&1; then present+=("$p"); fi
     done
-    sudo tar --zstd -cf "$TARBALL" \
-        "/usr/lib/llvm-${LLVM_MAJOR}" \
-        /usr/lib/x86_64-linux-gnu/libLLVM*"${LLVM_MAJOR}"* \
-        /usr/lib/x86_64-linux-gnu/libclang*"${LLVM_MAJOR}"* \
-        /usr/bin/*-"${LLVM_MAJOR}" \
-        ${extra+"${extra[@]}"}
+    # Regular files and symlinks only: `dpkg -L` also prints the directories
+    # holding them, and archiving a directory would sweep in unrelated siblings.
+    dpkg -L "${present[@]}" \
+        | while IFS= read -r f; do
+              if [ -f "$f" ] || [ -L "$f" ]; then printf '%s\n' "$f"; fi
+          done > /tmp/llvm-cache-files.txt
+    echo "[install-llvm] archiving $(wc -l < /tmp/llvm-cache-files.txt) files" \
+         "from ${#present[@]} package(s)"
+    sudo tar --zstd -cf "$TARBALL" -T /tmp/llvm-cache-files.txt
     sudo chmod 644 "$TARBALL"
 }
 
