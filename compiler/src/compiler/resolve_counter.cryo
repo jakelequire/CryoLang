@@ -1,0 +1,298 @@
+///! Name-Resolution Instrumentation Counter
+///!
+///! Phase 0 instrumentation for the name-resolution unification effort
+///! (`.todo/NAME_RESOLUTION_PLAN.md`).  Pure measurement: every entry point
+///! here only bumps a counter, so enabling or disabling it cannot change
+///! what the compiler resolves.
+///!
+///! The plan's §3.2 rule 2 splits resolution into two answers, and the
+///! counter mirrors that split into two BUCKETS:
+///!
+///!   B1 - path re-derivation.  A stage recomputing, from a string, an
+///!        answer the resolver already produced.  Every B1 site must read
+///!        ZERO before Phase 5 deletes the fallback that feeds it.
+///!   B2 - type-dependent lookup.  Resolution that genuinely needs a
+///!        receiver type (method/trait selection, associated-item
+///!        projection).  Expected to stay nonzero forever; enumerated and
+///!        justified rather than eliminated.
+///!
+///! Bucket labels here are the plan's current reading and are expected to
+///! be revised once `docs/name-resolution.md` settles them.  The counter
+///! records SITES; the bucket is only a report-time annotation.
+///!
+///! Counting is unconditional - a global array increment is cheaper than
+///! the branch that would guard it, and always-on counting removes any
+///! init-ordering question.  Only the REPORT is gated, on
+///! `CRYO_RESOLVE_COUNTER=1`.
+///!
+///! Two caveats on any reading this produces:
+///!   - Counters are per-PROCESS.  Multiprocess codegen (`>= 16` modules,
+///!     see `CODEGEN_MULTIPROC_MIN_MODULES` in `instance.cryo`) loses child
+///!     tallies, so a baseline run must pin `CRYO_CODEGEN_THREADS=1`.
+///!   - Increments are not atomic.  Any threaded phase makes counts
+///!     approximate, never exact.
+
+namespace Compiler::ResolveCounter;
+
+import std::fmt;
+import std::env;
+import std::collections::str;
+
+// ---- Site indices ------------------------------------------------------
+// `resolve_named`'s nine-step cascade (`types/resolver.cryo:1324`).  One
+// site per OUTCOME, so the tally shows which step actually answered rather
+// than which steps were attempted.  §2.3 of the plan.
+
+const RC_RN_CALLS:                i64 = 0;   // total entries into resolve_named
+const RC_RN_GENERIC_BINDING:      i64 = 1;   // step 1   generic binding
+const RC_RN_ASSOC_PROJECTION:     i64 = 2;   // step 1b  `I::Item` projection  [B2]
+const RC_RN_PRIMITIVE:            i64 = 3;   // step 2   primitive name
+const RC_RN_HOME_MODULE:          i64 = 4;   // step 2c  home-module preference
+const RC_RN_AMBIGUOUS:            i64 = 5;   // step 2b  ambiguity -> E0203
+const RC_RN_DI_LITERAL:           i64 = 6;   // step 3a  DI exact qualified literal
+const RC_RN_DI_CANONICAL:         i64 = 7;   // step 3b  DI canonicalized qualified
+const RC_RN_DI_BARE:              i64 = 8;   // step 3c  DI bare name
+const RC_RN_ARENA_BOOTSTRAP:      i64 = 9;   // step 4   arena, bootstrap-only
+const RC_RN_SCOPE_ARENA_BOOTSTRAP: i64 = 10; // step 4a  scope chain + arena, bootstrap-only
+const RC_RN_LEAF_INDEX:           i64 = 11;  // step 5   GLOBAL LEAF INDEX  <- headline
+const RC_RN_FAILED:               i64 = 12;  // fell off the end
+
+// The global leaf index itself (`types/arena.cryo:1023`).  Counted
+// separately from the cascade because it has SIX callers, only one of
+// which is `resolve_named` step 5.  §2.4.
+const RC_LEAF_CALLS:              i64 = 13;
+const RC_LEAF_HITS:               i64 = 14;
+
+// `DeclarationIndex` bare-name alternatives (`decl_index.cryo:1405`).
+// MULTI counts the genuinely-ambiguous answers (length > 1).  §2.1 system 3.
+const RC_BAREALTS_CALLS:          i64 = 15;
+const RC_BAREALTS_HITS:           i64 = 16;
+const RC_BAREALTS_MULTI:          i64 = 17;
+
+// The five hand-maintained copies of the namespace-suffix heuristic.  §2.5.
+// M1 `Resolver::module_ns_matches_prefix`          resolver/resolver.cryo:584
+const RC_M1_CALLS:                i64 = 18;
+const RC_M1_HITS:                 i64 = 19;
+// M2 `resolve_module_qualified_symbol`             sema/call_resolver.cryo:4418
+const RC_M2_CALLS:                i64 = 20;
+const RC_M2_HITS:                 i64 = 21;
+// M3 `collect_namespace_suffix_matches`            codegen/visit/call_emitter.cryo:1915
+const RC_M3_CALLS:                i64 = 22;
+const RC_M3_HITS:                 i64 = 23;
+// M4 `find_function_template_for_call` bare scan   mono/call_specializer.cryo:2378
+const RC_M4_CALLS:                i64 = 24;
+const RC_M4_HITS:                 i64 = 25;
+// M5 import suffix fallback (two copies)           resolver/name_resolution.cryo:944,1018
+const RC_M5_CALLS:                i64 = 26;
+const RC_M5_HITS:                 i64 = 27;
+
+// Caller attribution for the bare_alts read path.  The aggregate above
+// hides a distinction that matters for bucketing: its three callers are
+// NOT equally fuzzy.
+//   - `resolve_qualified_scoped` (decl_index.cryo:1340) is import- and
+//     prelude-aware and picks a local over a visible import.  That is
+//     close to what §3.2 rule 6 specifies, so much of it is expected to
+//     SURVIVE as the resolver's own mechanism rather than reach zero.
+//   - `canonical_qualified` (decl_index.cryo:1393) is program-wide and
+//     blind: unique-candidate-or-give-up, with no scope input at all.
+//     This is the genuinely fuzzy one.
+//   - the sema ambiguity diagnostic (call_resolver.cryo:3225) is a
+//     path-ambiguity report, which §5 Phase 5 moves to the resolver.
+const RC_BAREALTS_VIA_SCOPED:     i64 = 28;
+const RC_BAREALTS_VIA_CANONICAL:  i64 = 29;
+const RC_BAREALTS_VIA_AMBIG_DIAG: i64 = 30;
+
+const RC_SITE_COUNT:              i64 = 31;
+
+/// Per-site tallies.  Zero-initialized in BSS; index with the `RC_*`
+/// constants above.  Sized well above `RC_SITE_COUNT` so adding a site
+/// never requires resizing.
+mut g_rc_counts: u64[64];
+
+// ---- Recording ---------------------------------------------------------
+
+/// Bump one site.  Out-of-range indices are ignored rather than trapping:
+/// instrumentation must never be able to abort a build.
+///
+/// Private on purpose.  Call sites use the named wrappers below instead of
+/// passing an index, so an instrumented line names the thing it is
+/// measuring and no caller can drift onto the wrong slot.
+function rc_bump(site: i64) -> void {
+    if (site < 0 || site >= RC_SITE_COUNT) { return; }
+    g_rc_counts[site] = g_rc_counts[site] + 1;
+}
+
+// One wrapper per site.  `types/resolver.cryo` resolve_named cascade:
+public function rc_rn_call()               -> void { rc_bump(RC_RN_CALLS); }
+public function rc_rn_generic_binding()    -> void { rc_bump(RC_RN_GENERIC_BINDING); }
+public function rc_rn_assoc_projection()   -> void { rc_bump(RC_RN_ASSOC_PROJECTION); }
+public function rc_rn_primitive()          -> void { rc_bump(RC_RN_PRIMITIVE); }
+public function rc_rn_home_module()        -> void { rc_bump(RC_RN_HOME_MODULE); }
+public function rc_rn_ambiguous()          -> void { rc_bump(RC_RN_AMBIGUOUS); }
+public function rc_rn_di_literal()         -> void { rc_bump(RC_RN_DI_LITERAL); }
+public function rc_rn_di_canonical()       -> void { rc_bump(RC_RN_DI_CANONICAL); }
+public function rc_rn_di_bare()            -> void { rc_bump(RC_RN_DI_BARE); }
+public function rc_rn_arena_bootstrap()    -> void { rc_bump(RC_RN_ARENA_BOOTSTRAP); }
+public function rc_rn_scope_arena_boot()   -> void { rc_bump(RC_RN_SCOPE_ARENA_BOOTSTRAP); }
+public function rc_rn_leaf_index()         -> void { rc_bump(RC_RN_LEAF_INDEX); }
+public function rc_rn_failed()             -> void { rc_bump(RC_RN_FAILED); }
+
+// `types/arena.cryo` global leaf index:
+public function rc_leaf_call()             -> void { rc_bump(RC_LEAF_CALLS); }
+public function rc_leaf_hit()              -> void { rc_bump(RC_LEAF_HITS); }
+
+// `decl_index.cryo` bare-name alternatives:
+public function rc_barealts_call()         -> void { rc_bump(RC_BAREALTS_CALLS); }
+public function rc_barealts_hit()          -> void { rc_bump(RC_BAREALTS_HITS); }
+public function rc_barealts_multi()        -> void { rc_bump(RC_BAREALTS_MULTI); }
+public function rc_barealts_via_scoped()   -> void { rc_bump(RC_BAREALTS_VIA_SCOPED); }
+public function rc_barealts_via_canon()    -> void { rc_bump(RC_BAREALTS_VIA_CANONICAL); }
+public function rc_barealts_via_ambig()    -> void { rc_bump(RC_BAREALTS_VIA_AMBIG_DIAG); }
+
+// The five namespace-suffix matchers:
+public function rc_m1_call()               -> void { rc_bump(RC_M1_CALLS); }
+public function rc_m1_hit()                -> void { rc_bump(RC_M1_HITS); }
+public function rc_m2_call()               -> void { rc_bump(RC_M2_CALLS); }
+public function rc_m2_hit()                -> void { rc_bump(RC_M2_HITS); }
+public function rc_m3_call()               -> void { rc_bump(RC_M3_CALLS); }
+public function rc_m3_hit()                -> void { rc_bump(RC_M3_HITS); }
+public function rc_m4_call()               -> void { rc_bump(RC_M4_CALLS); }
+public function rc_m4_hit()                -> void { rc_bump(RC_M4_HITS); }
+public function rc_m5_call()               -> void { rc_bump(RC_M5_CALLS); }
+public function rc_m5_hit()                -> void { rc_bump(RC_M5_HITS); }
+
+/// Read one site back.  Used by the report and by tests.
+public function rc_get(site: i64) -> u64 {
+    if (site < 0 || site >= RC_SITE_COUNT) { return 0; }
+    return g_rc_counts[site];
+}
+
+/// Drop every tally back to zero.  Exists so a driver that compiles more
+/// than one unit in a process can attribute counts per unit.
+public function rc_reset() -> void {
+    for (mut i: i64 = 0; i < RC_SITE_COUNT; i++) {
+        g_rc_counts[i] = 0;
+    }
+}
+
+// ---- Reporting ---------------------------------------------------------
+
+/// Whether `CRYO_RESOLVE_COUNTER` is set in the environment.
+public function rc_enabled() -> boolean {
+    match (env::var(Str::new("CRYO_RESOLVE_COUNTER"))) {
+        Option::Some(_) => { return true;  }
+        Option::None    => { return false; }
+    }
+}
+
+/// One report row: `bucket`, an indented label, and the tally.
+function rc_line(bucket: string, label: string, site: i64) -> void {
+    fmt::eprintf("  %-3s %-46s %12llu\n", bucket, label, rc_get(site));
+}
+
+/// Print the tally to stderr.  No-op unless `CRYO_RESOLVE_COUNTER` is set.
+///
+/// B1 total is the number the unification effort drives to zero; it is
+/// printed last so it is the final thing on screen.
+public function rc_report() -> void {
+    if (!rc_enabled()) { return; }
+
+    fmt::eprintf("\n");
+    fmt::eprintf("=============== name-resolution counter ===============\n");
+    fmt::eprintf("  B1 = fuzzy fallback        -> must reach ZERO\n");
+    fmt::eprintf("  B2 = type-dependent lookup -> stays; enumerate+justify\n");
+    fmt::eprintf("  B3 = authoritative lookup  -> once per path, NOT zero\n");
+    fmt::eprintf("\n");
+    fmt::eprintf("  Sites NEST: cascade step 5 is a subset of leaf-index\n");
+    fmt::eprintf("  hits, and bare_alts hits are a subset of its callers'\n");
+    fmt::eprintf("  calls.  Totals are taken over a DISJOINT selection and\n");
+    fmt::eprintf("  count site events, not distinct resolutions.\n");
+    fmt::eprintf("\n");
+
+    fmt::eprintf("-- resolve_named cascade (types/resolver.cryo:1324) ----\n");
+    rc_line("   ", "calls (total)",                        RC_RN_CALLS);
+    rc_line("B3 ", "1   generic binding",                  RC_RN_GENERIC_BINDING);
+    rc_line("B2 ", "1b  assoc-type projection (I::Item)",  RC_RN_ASSOC_PROJECTION);
+    rc_line("B3 ", "2   primitive name",                   RC_RN_PRIMITIVE);
+    rc_line("B1 ", "2c  home-module preference",           RC_RN_HOME_MODULE);
+    rc_line("B1 ", "2b  ambiguity -> E0203",               RC_RN_AMBIGUOUS);
+    rc_line("B3 ", "3a  DI exact qualified literal",       RC_RN_DI_LITERAL);
+    rc_line("B3 ", "3b  DI canonicalized qualified",       RC_RN_DI_CANONICAL);
+    rc_line("B3 ", "3c  DI bare name",                     RC_RN_DI_BARE);
+    rc_line("B1 ", "4   arena (bootstrap-only)",           RC_RN_ARENA_BOOTSTRAP);
+    rc_line("B1 ", "4a  scope+arena (bootstrap-only)",     RC_RN_SCOPE_ARENA_BOOTSTRAP);
+    rc_line("B1*", "5   GLOBAL LEAF INDEX  (* in leaf hits)", RC_RN_LEAF_INDEX);
+    rc_line("   ", "    unresolved",                       RC_RN_FAILED);
+
+    fmt::eprintf("\n-- global leaf index (types/arena.cryo:1023) ----------\n");
+    rc_line("B1 ", "lookup_by_leaf calls",                 RC_LEAF_CALLS);
+    rc_line("B1 ", "lookup_by_leaf hits",                  RC_LEAF_HITS);
+
+    fmt::eprintf("\n-- DeclarationIndex bare_alts (decl_index.cryo:1405) --\n");
+    rc_line("   ", "lookup_qualified_alternatives calls",  RC_BAREALTS_CALLS);
+    rc_line("   ", "lookup_qualified_alternatives hits",   RC_BAREALTS_HITS);
+    rc_line("   ", "  of which ambiguous (>1 candidate)",  RC_BAREALTS_MULTI);
+    rc_line("B3 ", "  by caller: resolve_qualified_scoped", RC_BAREALTS_VIA_SCOPED);
+    rc_line("B1 ", "  by caller: canonical_qualified",     RC_BAREALTS_VIA_CANONICAL);
+    rc_line("B1 ", "  by caller: sema ambiguity diag",     RC_BAREALTS_VIA_AMBIG_DIAG);
+
+    fmt::eprintf("\n-- namespace-suffix heuristic, 5 copies ---------------\n");
+    rc_line("B1 ", "M1 module_ns_matches_prefix calls",    RC_M1_CALLS);
+    rc_line("B1 ", "M1 module_ns_matches_prefix hits",     RC_M1_HITS);
+    rc_line("B1 ", "M2 resolve_module_qualified_sym calls", RC_M2_CALLS);
+    rc_line("B1 ", "M2 resolve_module_qualified_sym hits",  RC_M2_HITS);
+    rc_line("B1 ", "M3 collect_namespace_suffix calls",    RC_M3_CALLS);
+    rc_line("B1 ", "M3 collect_namespace_suffix hits",     RC_M3_HITS);
+    rc_line("B1 ", "M4 mono bare-name template scan",      RC_M4_CALLS);
+    rc_line("B1 ", "M4 mono bare-name scan hits",          RC_M4_HITS);
+    rc_line("B1 ", "M5 import suffix fallback calls",      RC_M5_CALLS);
+    rc_line("B1 ", "M5 import suffix fallback hits",       RC_M5_HITS);
+
+    // Bucket totals, over DISJOINT selections.
+    //
+    // B1 counts ANSWERS PRODUCED (hits, cascade outcomes), never attempts:
+    // a fallback that is called but returns nothing is not load-bearing,
+    // and counting attempts would make "drive it to zero" unreachable for
+    // the wrong reason.  Cascade step 5 is deliberately NOT added - it is
+    // already inside `RC_LEAF_HITS`, and adding both double-counts it.
+    //
+    // The bootstrap arena steps are B1 because Phase 2 deletes
+    // `bootstrap_mode` outright; they need a home, not a smaller count.
+    mut b1: u64 = 0;
+    b1 = b1 + rc_get(RC_RN_HOME_MODULE);
+    b1 = b1 + rc_get(RC_RN_AMBIGUOUS);
+    b1 = b1 + rc_get(RC_RN_ARENA_BOOTSTRAP);
+    b1 = b1 + rc_get(RC_RN_SCOPE_ARENA_BOOTSTRAP);
+    b1 = b1 + rc_get(RC_LEAF_HITS);
+    b1 = b1 + rc_get(RC_BAREALTS_VIA_CANONICAL);
+    b1 = b1 + rc_get(RC_BAREALTS_VIA_AMBIG_DIAG);
+    b1 = b1 + rc_get(RC_M1_HITS);
+    b1 = b1 + rc_get(RC_M2_HITS);
+    b1 = b1 + rc_get(RC_M3_HITS);
+    b1 = b1 + rc_get(RC_M4_HITS);
+    b1 = b1 + rc_get(RC_M5_HITS);
+
+    // INCOMPLETE.  Only `resolve_named`'s assoc-type projection is
+    // instrumented so far; sema's method/trait dispatch - the actual bulk
+    // of type-dependent resolution, and the §2.6 `call_resolver.cryo:1862`
+    // case - is NOT counted yet.  Treat this as a floor, not a total.
+    const b2: u64 = rc_get(RC_RN_ASSOC_PROJECTION);
+
+    // B3 is authoritative resolution: correct mechanisms that answer from
+    // scope/imports rather than by guessing.  The unification target for
+    // these is ONCE PER PATH, not zero - today they are re-derived by every
+    // downstream stage, which is what §3.2 rule 2 is really about.
+    mut b3: u64 = 0;
+    b3 = b3 + rc_get(RC_RN_GENERIC_BINDING);
+    b3 = b3 + rc_get(RC_RN_PRIMITIVE);
+    b3 = b3 + rc_get(RC_RN_DI_LITERAL);
+    b3 = b3 + rc_get(RC_RN_DI_CANONICAL);
+    b3 = b3 + rc_get(RC_RN_DI_BARE);
+    b3 = b3 + rc_get(RC_BAREALTS_VIA_SCOPED);
+
+    fmt::eprintf("\n-------------------------------------------------------\n");
+    fmt::eprintf("  B1 fuzzy fallback   -> ZERO           %12llu\n", b1);
+    fmt::eprintf("  B2 type-dependent   -> stays (FLOOR)  %12llu\n", b2);
+    fmt::eprintf("  B3 authoritative    -> once per path  %12llu\n", b3);
+    fmt::eprintf("=======================================================\n");
+}
