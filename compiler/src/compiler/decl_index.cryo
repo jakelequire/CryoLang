@@ -1342,7 +1342,38 @@ type struct DeclarationIndex {
         ResolveCounter::rc_barealts_via_scoped();
         const cands: SymbolStr[] = this.lookup_qualified_alternatives(bare);
         if (cands.length == 0) { return ScopeResolution::NotFound; }
-        if (cands.length == 1) { return ScopeResolution::Unique(cands[0]); }
+        if (cands.length == 1) {
+            // AUDIT ONLY - behavior deliberately unchanged.
+            // (docs/name-resolution.md §8.1)
+            //
+            // This fast path is the root cause described in §1 of the spec: it
+            // answers WITHOUT consulting visibility or imports, both of which
+            // are checked only in the multi-candidate branch below.  So a name
+            // unique program-wide resolves from anywhere - which is why every
+            // declaration sits in every module's namespace, and therefore why
+            // resolution has to guess and the fallback cascade exists.
+            //
+            // Measure what a gate here would reject BEFORE turning one on.
+            ResolveCounter::rc_vis_fastpath();
+            const c0: SymbolStr = cands[0];
+            const c0_ns: SymbolStr = this.namespace_of(c0, intern);
+            mut c0_ok: boolean = (c0_ns.id == use_site_ns.id);
+            if (!c0_ok) {
+                const c0_prelude: boolean = this.is_prelude_ns(c0_ns);
+                const c0_reach: boolean =
+                    c0_prelude || this.ns_imports(use_site_ns, c0_ns);
+                const c0_pub: boolean = this.is_candidate_public(c0);
+                c0_ok = c0_reach && c0_pub;
+                if (!c0_ok) {
+                    if (!c0_reach) { ResolveCounter::rc_vis_reject_unreachable(); }
+                    else           { ResolveCounter::rc_vis_reject_notpublic();   }
+                    ResolveCounter::rc_vis_would_reject();
+                    ResolveCounter::rc_vis_violation(intern.resolve(use_site_ns),
+                                                     intern.resolve(c0));
+                }
+            }
+            return ScopeResolution::Unique(c0);
+        }
 
         mut local:   SymbolStr[] = [];
         mut visible: SymbolStr[] = [];

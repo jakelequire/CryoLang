@@ -102,7 +102,33 @@ const RC_BAREALTS_VIA_SCOPED:     i64 = 28;
 const RC_BAREALTS_VIA_CANONICAL:  i64 = 29;
 const RC_BAREALTS_VIA_AMBIG_DIAG: i64 = 30;
 
-const RC_SITE_COUNT:              i64 = 31;
+// Visibility-gate blast radius (docs/name-resolution.md §8.1).
+//
+// `resolve_qualified_scoped`'s single-candidate fast path
+// (decl_index.cryo:1345) returns Unique WITHOUT consulting
+// `is_candidate_public` or `ns_imports` - both are checked only in the
+// multi-candidate branch below it.  So a name that is unique program-wide
+// resolves from anywhere, regardless of visibility or imports.  That is the
+// root cause in §1: it is why every declaration is in every module's
+// namespace, and therefore why resolution has to guess.
+//
+// These two sites answer "what breaks if visibility becomes a gate?" without
+// changing behavior: count every trip through the fast path, and how many of
+// those WOULD be rejected once the gate applies.
+// A rejection splits into two very different migrations, so they are counted
+// apart:
+//   UNREACHABLE - the candidate's namespace is neither local, nor preluded,
+//                 nor imported here.  Fix = add an import at the use site.
+//   NOTPUBLIC   - the namespace IS reachable but the candidate is not marked
+//                 public.  Fix = mark the declaration public, OR the DI is
+//                 failing to record a visibility that the source does set.
+//                 The second case is a bug, not a migration.
+const RC_VIS_FASTPATH:            i64 = 31;
+const RC_VIS_WOULD_REJECT:        i64 = 32;
+const RC_VIS_REJECT_UNREACHABLE:  i64 = 33;
+const RC_VIS_REJECT_NOTPUBLIC:    i64 = 34;
+
+const RC_SITE_COUNT:              i64 = 35;
 
 /// Per-site tallies.  Zero-initialized in BSS; index with the `RC_*`
 /// constants above.  Sized well above `RC_SITE_COUNT` so adding a site
@@ -148,6 +174,35 @@ public function rc_barealts_multi()        -> void { rc_bump(RC_BAREALTS_MULTI);
 public function rc_barealts_via_scoped()   -> void { rc_bump(RC_BAREALTS_VIA_SCOPED); }
 public function rc_barealts_via_canon()    -> void { rc_bump(RC_BAREALTS_VIA_CANONICAL); }
 public function rc_barealts_via_ambig()    -> void { rc_bump(RC_BAREALTS_VIA_AMBIG_DIAG); }
+
+// Visibility-gate audit:
+public function rc_vis_fastpath()          -> void { rc_bump(RC_VIS_FASTPATH); }
+public function rc_vis_would_reject()      -> void { rc_bump(RC_VIS_WOULD_REJECT); }
+public function rc_vis_reject_unreachable() -> void { rc_bump(RC_VIS_REJECT_UNREACHABLE); }
+public function rc_vis_reject_notpublic()  -> void { rc_bump(RC_VIS_REJECT_NOTPUBLIC); }
+
+/// Tri-state cache for `CRYO_VIS_AUDIT`: 0 unknown, 1 on, 2 off.  Cached
+/// because the violation hook runs inside the hottest lookup in the compiler
+/// and an `env::var` per call would dominate the measurement.
+mut g_vis_audit: i32 = 0;
+
+function rc_vis_audit_enabled() -> boolean {
+    if (g_vis_audit == 0) {
+        match (env::var(Str::new("CRYO_VIS_AUDIT"))) {
+            Option::Some(_) => { g_vis_audit = 1; }
+            Option::None    => { g_vis_audit = 2; }
+        }
+    }
+    return g_vis_audit == 1;
+}
+
+/// Print one would-be-rejected resolution.  Line-oriented on purpose, so a
+/// run can be piped through `sort -u` to get the distinct migration set.
+/// No-op unless `CRYO_VIS_AUDIT` is set.
+public function rc_vis_violation(use_site: string, cand: string) -> void {
+    if (!rc_vis_audit_enabled()) { return; }
+    fmt::eprintf("VIS-VIOLATION\t%s\t%s\n", use_site, cand);
+}
 
 // The five namespace-suffix matchers:
 public function rc_m1_call()               -> void { rc_bump(RC_M1_CALLS); }
@@ -235,6 +290,12 @@ public function rc_report() -> void {
     rc_line("B3 ", "  by caller: resolve_qualified_scoped", RC_BAREALTS_VIA_SCOPED);
     rc_line("B1 ", "  by caller: canonical_qualified",     RC_BAREALTS_VIA_CANONICAL);
     rc_line("B1 ", "  by caller: sema ambiguity diag",     RC_BAREALTS_VIA_AMBIG_DIAG);
+
+    fmt::eprintf("\n-- visibility gate blast radius (spec §8.1) -----------\n");
+    rc_line("   ", "single-candidate fast path taken",      RC_VIS_FASTPATH);
+    rc_line("!! ", "  WOULD BE REJECTED once gated",        RC_VIS_WOULD_REJECT);
+    rc_line("   ", "    cause: namespace not reachable",    RC_VIS_REJECT_UNREACHABLE);
+    rc_line("   ", "    cause: candidate not public",       RC_VIS_REJECT_NOTPUBLIC);
 
     fmt::eprintf("\n-- namespace-suffix heuristic, 5 copies ---------------\n");
     rc_line("B1 ", "M1 module_ns_matches_prefix calls",    RC_M1_CALLS);

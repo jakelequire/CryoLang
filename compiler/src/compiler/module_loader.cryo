@@ -668,6 +668,39 @@ type struct ModuleLoader {
             }
         }
 
+        // Record brace-list import items as VISIBILITY edges only.  The parent
+        // path already produced the dependency edge above, and the item's own
+        // module is discovered through the parent's `public module` manifest
+        // below, so nothing here needs discovery - only the mapping from the
+        // written path to the target's declared namespace.
+        for (mut ii: i64 = 0; ii < scan.import_item_count; ii++) {
+            const item_path: string = scan.import_items[ii];
+            // Written path first: compiler and stdlib spell these fully
+            // qualified, so this is the common case.
+            const item_sym: SymbolStr = intern.intern(item_path);
+            const item_idx: i64 = graph.find_module_index(item_sym);
+            if (item_idx >= 0) {
+                info.add_imported_namespace(graph.modules[item_idx].name);
+                continue;
+            }
+            // Otherwise resolve it on disk the way an import path is resolved,
+            // and take the declared namespace of whatever file that names.
+            mut item_resolved: string = this.resolve_import_path(item_path);
+            if (item_resolved.length() == 0) {
+                item_resolved = this.search_location(
+                    file_dir, ModuleLoader::replace_separator(item_path));
+            }
+            if (item_resolved.length() > 0) {
+                const by_path: i64 = graph.find_module_by_path(item_resolved);
+                if (by_path >= 0) {
+                    info.add_imported_namespace(graph.modules[by_path].name);
+                }
+            }
+            // A brace item naming a TYPE rather than a submodule resolves to
+            // nothing here.  That is correct and not an error: the type is
+            // reached through its parent module, which is already a dependency.
+        }
+
         // Discover submodules (public module declarations) WITHOUT adding
         // dependency edges.  Aggregator _module.cryo files re-export their
         // children, but this isn't a real data dependency; the parent doesn't
@@ -773,6 +806,7 @@ type struct ModuleLoader {
         mut ns: string = "";
         mut imports: string[] = [];
         mut import_spans: SourceSpan[] = [];
+        mut import_items: string[] = [];
         mut submodules: string[] = [];
         const len: i64 = tokens.length;
         mut i: i64 = 0;
@@ -823,6 +857,49 @@ type struct ModuleLoader {
                     import_spans.push(SourceSpan::new("",
                         path_line as u32, path_col as u32,
                         end_line as u32, end_col as u32));
+
+                    // Brace list: `import A::B::{ X, Y };`.  The qualified-name
+                    // collector stops at `{`, so without this the items are
+                    // silently dropped and the module is later judged not to
+                    // import them.  Record each as `A::B::X`.
+                    if (i < len) {
+                        if (tokens[i].kind == TokenType::LBrace) {
+                            i += 1;   // consume '{'
+                            while (i < len) {
+                                if (tokens[i].kind == TokenType::RBrace) {
+                                    i += 1;   // consume '}'
+                                    break;
+                                }
+                                if (tokens[i].kind == TokenType::Comma) {
+                                    i += 1;
+                                    continue;
+                                }
+                                const item: string =
+                                    ModuleLoader::collect_qualified_name(tokens, &i, len);
+                                if (item.length() > 0) {
+                                    import_items.push(format("%s::%s", path, item));
+                                    // `X as Y`: the alias names the same module,
+                                    // so the visibility edge is already recorded.
+                                    // Skip `as` and the alias identifier, or the
+                                    // collector - which accepts keywords as path
+                                    // segments - would read `as` as a segment and
+                                    // emit a bogus `A::as`.  Per-item aliasing is
+                                    // not in the grammar yet; this keeps the
+                                    // scanner correct for when it lands.
+                                    if (i < len) {
+                                        if (tokens[i].kind == TokenType::KwAs) {
+                                            i += 1;
+                                            if (i < len) { i += 1; }
+                                        }
+                                    }
+                                } else {
+                                    // Not a name (stray token): advance so the
+                                    // loop cannot spin.
+                                    i += 1;
+                                }
+                            }
+                        }
+                    }
                 }
                 // Skip semicolon if present
                 if (i < len) {
@@ -878,16 +955,19 @@ type struct ModuleLoader {
             }
         }
 
-        const import_count_val:    i64 = imports.length;
-        const submodule_count_val: i64 = submodules.length;
+        const import_count_val:      i64 = imports.length;
+        const submodule_count_val:   i64 = submodules.length;
+        const import_item_count_val: i64 = import_items.length;
         return ModuleScanResult {
-            namespace_name:  ns,
-            import_paths:    imports,
-            import_spans:    import_spans,
-            import_count:    import_count_val,
-            submodule_paths: submodules,
-            submodule_count: submodule_count_val,
-            uses_fstring:    uses_fstring_val,
+            namespace_name:    ns,
+            import_paths:      imports,
+            import_spans:      import_spans,
+            import_count:      import_count_val,
+            import_items:      import_items,
+            import_item_count: import_item_count_val,
+            submodule_paths:   submodules,
+            submodule_count:   submodule_count_val,
+            uses_fstring:      uses_fstring_val,
         };
     }
 
@@ -1063,6 +1143,17 @@ type struct ModuleScanResult {
     import_paths:    string[];    // real `import` statements (create dependency edges)
     import_spans:    SourceSpan[]; // span of each import path, parallel to import_paths (file unset; caller fills)
     import_count:    i64;
+    /// Brace-list items expanded to full paths: `import A::B::{ X, Y };`
+    /// yields `A::B::X` and `A::B::Y`.
+    ///
+    /// These are VISIBILITY edges, never dependency edges.  A dependency edge
+    /// constrains build order, and adding one per brace item reintroduces
+    /// exactly the false cycles the submodule loop below avoids
+    /// (`AST -> Specializer -> Types -> AST`).  What a module can SEE and what
+    /// must be BUILT FIRST are different relations; conflating them is why
+    /// `ns_imports` reported 68% of its visibility answers wrong.
+    import_items:    string[];
+    import_item_count: i64;
     submodule_paths: string[];    // `public module` declarations (discover only, no dep edge)
     submodule_count: i64;
     uses_fstring:    boolean;     // file contains at least one f-string (`f"..."`)
