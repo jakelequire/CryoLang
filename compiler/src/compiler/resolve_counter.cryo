@@ -5,6 +5,13 @@
 ///! here only bumps a counter, so enabling or disabling it cannot change
 ///! what the compiler resolves.
 ///!
+///! **Not scaffolding.**  `docs/name-resolution.md` §7.2 mechanism 3 makes
+///! `B1 == 0` a permanent gate: the cascade grew for years because nobody
+///! could see it growing, and deleting the meter after fixing the leak is how
+///! the leak comes back.  Individual SITES are disposable - a site whose
+///! fallback has been deleted has nothing left to count - but the module is
+///! not.
+///!
 ///! The plan's §3.2 rule 2 splits resolution into two answers, and the
 ///! counter mirrors that split into two BUCKETS:
 ///!
@@ -38,271 +45,376 @@ import std::fmt;
 import std::env;
 import std::collections::str;
 
-// ---- Site indices ------------------------------------------------------
-// `resolve_named`'s nine-step cascade (`types/resolver.cryo:1324`).  One
-// site per OUTCOME, so the tally shows which step actually answered rather
-// than which steps were attempted.  §2.3 of the plan.
+// ---- Storage -----------------------------------------------------------
 
-const RC_RN_CALLS:                i64 = 0;   // total entries into resolve_named
-const RC_RN_GENERIC_BINDING:      i64 = 1;   // step 1   generic binding
-const RC_RN_ASSOC_PROJECTION:     i64 = 2;   // step 1b  `I::Item` projection  [B2]
-const RC_RN_PRIMITIVE:            i64 = 3;   // step 2   primitive name
-const RC_RN_HOME_MODULE:          i64 = 4;   // step 2c  home-module preference
-const RC_RN_AMBIGUOUS:            i64 = 5;   // step 2b  ambiguity -> E0203
-const RC_RN_DI_LITERAL:           i64 = 6;   // step 3a  DI exact qualified literal
-const RC_RN_DI_CANONICAL:         i64 = 7;   // step 3b  DI canonicalized qualified
-const RC_RN_DI_BARE:              i64 = 8;   // step 3c  DI bare name
-const RC_RN_ARENA_BOOTSTRAP:      i64 = 9;   // step 4   arena, bootstrap-only
-const RC_RN_SCOPE_ARENA_BOOTSTRAP: i64 = 10; // step 4a  scope chain + arena, bootstrap-only
-const RC_RN_LEAF_INDEX:           i64 = 11;  // step 5   GLOBAL LEAF INDEX  <- headline
-const RC_RN_FAILED:               i64 = 12;  // fell off the end
+/// Capacity of the tally array.  Sized well above the variant count so
+/// adding a `Site` never requires resizing, and so the bound is a property
+/// of the STORAGE rather than a hand-maintained "number of sites" constant
+/// that a new variant could silently outrun.
+const TALLY_CAP: i64 = 64;
 
-// The global leaf index itself (`types/arena.cryo:1023`).  Counted
-// separately from the cascade because it has SIX callers, only one of
-// which is `resolve_named` step 5.  §2.4.
-const RC_LEAF_CALLS:              i64 = 13;
-const RC_LEAF_HITS:               i64 = 14;
+/// Per-site tallies.  Zero-initialized in BSS; indexed by `Site`.
+mut g_tally: u64[64];
 
-// `DeclarationIndex` bare-name alternatives (`decl_index.cryo:1405`).
-// MULTI counts the genuinely-ambiguous answers (length > 1).  §2.1 system 3.
-const RC_BAREALTS_CALLS:          i64 = 15;
-const RC_BAREALTS_HITS:           i64 = 16;
-const RC_BAREALTS_MULTI:          i64 = 17;
+/// Suspend depth.  Non-zero means "a measurement is currently re-running
+/// production lookups; record nothing".
+mut g_suspend: i32 = 0;
 
-// The five hand-maintained copies of the namespace-suffix heuristic.  §2.5.
-// M1 `Resolver::module_ns_matches_prefix`          resolver/resolver.cryo:584
-const RC_M1_CALLS:                i64 = 18;
-const RC_M1_HITS:                 i64 = 19;
-// M2 `resolve_module_qualified_symbol`             sema/call_resolver.cryo:4418
-const RC_M2_CALLS:                i64 = 20;
-const RC_M2_HITS:                 i64 = 21;
-// M3 `collect_namespace_suffix_matches`            codegen/visit/call_emitter.cryo:1915
-const RC_M3_CALLS:                i64 = 22;
-const RC_M3_HITS:                 i64 = 23;
-// M4 `find_function_template_for_call` bare scan   mono/call_specializer.cryo:2378
-const RC_M4_CALLS:                i64 = 24;
-const RC_M4_HITS:                 i64 = 25;
-// M5 import suffix fallback (two copies)           resolver/name_resolution.cryo:944,1018
-const RC_M5_CALLS:                i64 = 26;
-const RC_M5_HITS:                 i64 = 27;
+/// Per-stream tri-state env cache: 0 unknown, 1 on, 2 off.  Indexed by
+/// `Audit`.  Cached because these hooks run inside the hottest lookup in the
+/// compiler and an `env::var` per call would dominate the measurement.
+mut g_audit_state: i32[8];
 
-// Caller attribution for the bare_alts read path.  The aggregate above
-// hides a distinction that matters for bucketing: its three callers are
-// NOT equally fuzzy.
-//   - `resolve_qualified_scoped` (decl_index.cryo:1340) is import- and
-//     prelude-aware and picks a local over a visible import.  That is
-//     close to what §3.2 rule 6 specifies, so much of it is expected to
-//     SURVIVE as the resolver's own mechanism rather than reach zero.
-//   - `canonical_qualified` (decl_index.cryo:1393) is program-wide and
-//     blind: unique-candidate-or-give-up, with no scope input at all.
-//     This is the genuinely fuzzy one.
-//   - the sema ambiguity diagnostic (call_resolver.cryo:3225) is a
-//     path-ambiguity report, which §5 Phase 5 moves to the resolver.
-const RC_BAREALTS_VIA_SCOPED:     i64 = 28;
-const RC_BAREALTS_VIA_CANONICAL:  i64 = 29;
-const RC_BAREALTS_VIA_AMBIG_DIAG: i64 = 30;
+const AUDIT_CAP: i64 = 8;
 
-// Visibility-gate blast radius (docs/name-resolution.md §8.1).
-//
-// `resolve_qualified_scoped`'s single-candidate fast path
-// (decl_index.cryo:1345) returns Unique WITHOUT consulting
-// `is_candidate_public` or `ns_imports` - both are checked only in the
-// multi-candidate branch below it.  So a name that is unique program-wide
-// resolves from anywhere, regardless of visibility or imports.  That is the
-// root cause in §1: it is why every declaration is in every module's
-// namespace, and therefore why resolution has to guess.
-//
-// These two sites answer "what breaks if visibility becomes a gate?" without
-// changing behavior: count every trip through the fast path, and how many of
-// those WOULD be rejected once the gate applies.
-// A rejection splits into two very different migrations, so they are counted
-// apart:
-//   UNREACHABLE - the candidate's namespace is neither local, nor preluded,
-//                 nor imported here.  Fix = add an import at the use site.
-//   NOTPUBLIC   - the namespace IS reachable but the candidate is not marked
-//                 public.  Fix = mark the declaration public, OR the DI is
-//                 failing to record a visibility that the source does set.
-//                 The second case is a bug, not a migration.
-const RC_VIS_FASTPATH:            i64 = 31;
-const RC_VIS_WOULD_REJECT:        i64 = 32;
-const RC_VIS_REJECT_UNREACHABLE:  i64 = 33;
-const RC_VIS_REJECT_NOTPUBLIC:    i64 = 34;
+// ---- Sites -------------------------------------------------------------
 
-// Per-caller attribution for the global leaf index.  `lookup_by_leaf` has SIX
-// callers and only one is `resolve_named`'s step 5, so the aggregate cannot
-// say who depends on it.  §2.10a justifies the index narrowly - as the only
-// route for `ASTVisitor*` in AST node files, which cannot account for 17,326
-// answers - so knowing WHICH sites consume it decides whether legalizing
-// intra-package import cycles retires it or not.
-const RC_LEAF_S_RESOLVE_NAMED:    i64 = 35;  // types/resolver.cryo step 5
-const RC_LEAF_S_RESOLVER_BOUND:   i64 = 36;  // types/resolver.cryo generic-param constraint
-const RC_LEAF_S_SYMBOLIC_CHECK:   i64 = 37;  // sema/symbolic_checker.cryo
-const RC_LEAF_S_TYPE_UTILS:       i64 = 38;  // sema/type_utils.cryo
-const RC_LEAF_S_TYPERES_BOUND:    i64 = 39;  // passes/type_resolution.cryo constraint
-const RC_LEAF_S_TYPERES_BASE:     i64 = 40;  // passes/type_resolution.cryo base class
-
-// Free-function bare-call binding (sema/call_resolver.cryo
-// `try_pin_overload_mangled_callee`).  A SECOND, independent instance of the
-// §2a root cause, in a different subsystem: a bare `foo()` call never touches
-// `resolve_qualified_scoped`, so the visibility work done there cannot see it.
-// This binder has its own scope model (`bare_candidate_scope`: same-module /
-// Imported / Prelude / Hidden), and two defects against spec §3.3 + §4:
-//
-//   D-A  The single-overload branch pins the one candidate UNCONDITIONALLY,
-//        without consulting the tier at all - so a function in a module the
-//        use site never imported still binds.  Exactly the shape of the
-//        `cands.length == 1` fast path in decl_index.
-//   D-B  `bare_candidate_scope` has no visibility dimension, so an imported
-//        module's `private` function classifies as `Imported` and binds.
-//        Verified end-to-end: a two-module probe calling a cross-module
-//        `private function` compiles and RUNS.
-//
-// Counted apart because they need different fixes: D-A is a missing check,
-// D-B is a missing input.  SINGLE_HIDDEN is the D-A blast radius;
-// PRIVATE_BOUND is D-B's (it counts binds in ANY branch, so it is not a
-// subset of SINGLE).
-const RC_FNBIND_SINGLE:           i64 = 41;
-const RC_FNBIND_SINGLE_HIDDEN:    i64 = 42;
-const RC_FNBIND_PRIVATE_BOUND:    i64 = 43;
-// A SECOND door into free-function binding: `resolve_direct_call`'s fallback
-// to the program-wide bare `func_returns` map, which has no owner column and
-// therefore no scope input whatsoever.  `try_pin_overload_mangled_callee`
-// pins the SYMBOL; this one supplies the TYPE, and a call can be answered
-// here without the other ever running - so SINGLE above is a floor, not a
-// total, until this is counted too.
-const RC_FNBIND_UNSCOPED_RET:     i64 = 44;
-
-const RC_SITE_COUNT:              i64 = 45;
-
-/// Per-site tallies.  Zero-initialized in BSS; index with the `RC_*`
-/// constants above.  Sized well above `RC_SITE_COUNT` so adding a site
-/// never requires resizing.
-mut g_rc_counts: u64[64];
-
-// ---- Recording ---------------------------------------------------------
-
-/// Bump one site.  Out-of-range indices are ignored rather than trapping:
-/// instrumentation must never be able to abort a build.
+/// One counted resolution OUTCOME.
 ///
-/// Private on purpose.  Call sites use the named wrappers below instead of
-/// passing an index, so an instrumented line names the thing it is
-/// measuring and no caller can drift onto the wrong slot.
-function rc_bump(site: i64) -> void {
-    if (site < 0 || site >= RC_SITE_COUNT) { return; }
-    g_rc_counts[site] = g_rc_counts[site] + 1;
+/// An enum rather than a block of `const i64` indices, for two reasons that
+/// both bit this module in practice:
+///
+///   - the old `RC_SITE_COUNT` bound was hand-maintained, and a new constant
+///     added past it made `bump` silently no-op.  A counter reading zero
+///     because it was never recorded is indistinguishable from a real zero,
+///     which is the same trap as `is_candidate_public` defaulting to `true`
+///     (§8.1 landmine).  The bound is now the array capacity.
+///   - `label()` and `bucket()` below are exhaustive `match`es, so a new
+///     variant cannot be added without giving it a report row.  That is
+///     §7.2 mechanism 1 applied to the counter itself.
+///
+/// Declaration order is the storage order and is otherwise arbitrary; nothing
+/// persists tallies across runs, so variants may be regrouped freely.
+type enum Site {
+    // `types/resolver.cryo` resolve_named cascade.  One site per OUTCOME, so
+    // the tally shows which step actually answered rather than which steps
+    // were attempted.  §2.3 of the plan.
+    RnCalls;
+    RnGenericBinding;
+    RnAssocProjection;
+    RnPrimitive;
+    RnHomeModule;
+    RnAmbiguous;
+    RnDiLiteral;
+    RnDiCanonical;
+    RnDiBare;
+    RnArenaBootstrap;
+    RnScopeArenaBootstrap;
+    RnLeafIndex;
+    RnFailed;
+
+    // `types/arena.cryo` global leaf index.
+    LeafCalls;
+    LeafHits;
+
+    // `decl_index.cryo` bare-name alternatives.
+    BareAltsCalls;
+    BareAltsHits;
+    BareAltsMulti;
+    BareAltsViaScoped;
+    BareAltsViaCanonical;
+    BareAltsViaAmbigDiag;
+
+    // Visibility-gate blast radius.
+    VisFastpath;
+    VisWouldReject;
+    VisRejectUnreachable;
+    VisRejectNotPublic;
+
+    // Leaf-index consumers, bumped on a HIT (an answer actually produced).
+    LeafViaResolveNamed;
+    LeafViaResolverBound;
+    LeafViaSymbolicCheck;
+    LeafViaTypeUtils;
+    LeafViaTypeResBound;
+    LeafViaTypeResBase;
+
+    // Free-function bare-call binder.  Counted apart because they need
+    // different fixes: D-A is a missing check, D-B is a missing input.
+    // SingleHidden is the D-A blast radius; PrivateBound is D-B's (it counts
+    // binds in ANY branch, so it is not a subset of Single).  UnscopedRet is
+    // a SECOND door - `resolve_direct_call`'s fallback to the program-wide
+    // bare `func_returns` map, which has no owner column and therefore no
+    // scope input whatsoever.  One pins the SYMBOL, the other supplies the
+    // TYPE, and a call can be answered by either alone.
+    FnBindSingle;
+    FnBindSingleHidden;
+    FnBindPrivateBound;
+    FnBindUnscopedRet;
+
+    // Ambient-cursor divergence (§2b, §5.2), measured where the true scope is
+    // KNOWN: the home-module preference step.  There a caller has said which
+    // module the annotation was written in, so the module-blind chain can be
+    // re-run and compared.  §6's caveat is that the cursor contaminates any
+    // measurement of itself; this is the one place that is not true.
+    //
+    // Read CursorSame/CursorDiff FIRST.  A comparison where home and cursor
+    // are the same module proves nothing - one scope was in play, so
+    // agreement is forced.  DiffPlural is the control on that control: scope
+    // can only change an answer when the leaf has more than one declaring
+    // module.  With DiffPlural at zero, a zero Diverge says nothing about
+    // scope; it says the corpus has no collisions.
+    HomeCursorSame;
+    HomeCursorDiff;
+    HomeDiffPlural;
+    HomeAgree;
+    HomeDiverge;
+    HomeBlindMiss;
+
+    // The five namespace-suffix matchers.
+    M1Calls;
+    M1Hits;
+    M2Calls;
+    M2Hits;
+    M3Calls;
+    M3Hits;
+    M4Calls;
+    M4Hits;
+    M5Calls;
+    M5Hits;
 }
 
-// One wrapper per site.  `types/resolver.cryo` resolve_named cascade:
-public function rc_rn_call()               -> void { rc_bump(RC_RN_CALLS); }
-public function rc_rn_generic_binding()    -> void { rc_bump(RC_RN_GENERIC_BINDING); }
-public function rc_rn_assoc_projection()   -> void { rc_bump(RC_RN_ASSOC_PROJECTION); }
-public function rc_rn_primitive()          -> void { rc_bump(RC_RN_PRIMITIVE); }
-public function rc_rn_home_module()        -> void { rc_bump(RC_RN_HOME_MODULE); }
-public function rc_rn_ambiguous()          -> void { rc_bump(RC_RN_AMBIGUOUS); }
-public function rc_rn_di_literal()         -> void { rc_bump(RC_RN_DI_LITERAL); }
-public function rc_rn_di_canonical()       -> void { rc_bump(RC_RN_DI_CANONICAL); }
-public function rc_rn_di_bare()            -> void { rc_bump(RC_RN_DI_BARE); }
-public function rc_rn_arena_bootstrap()    -> void { rc_bump(RC_RN_ARENA_BOOTSTRAP); }
-public function rc_rn_scope_arena_boot()   -> void { rc_bump(RC_RN_SCOPE_ARENA_BOOTSTRAP); }
-public function rc_rn_leaf_index()         -> void { rc_bump(RC_RN_LEAF_INDEX); }
-public function rc_rn_failed()             -> void { rc_bump(RC_RN_FAILED); }
-
-// `types/arena.cryo` global leaf index:
-public function rc_leaf_call()             -> void { rc_bump(RC_LEAF_CALLS); }
-public function rc_leaf_hit()              -> void { rc_bump(RC_LEAF_HITS); }
-
-// `decl_index.cryo` bare-name alternatives:
-public function rc_barealts_call()         -> void { rc_bump(RC_BAREALTS_CALLS); }
-public function rc_barealts_hit()          -> void { rc_bump(RC_BAREALTS_HITS); }
-public function rc_barealts_multi()        -> void { rc_bump(RC_BAREALTS_MULTI); }
-public function rc_barealts_via_scoped()   -> void { rc_bump(RC_BAREALTS_VIA_SCOPED); }
-public function rc_barealts_via_canon()    -> void { rc_bump(RC_BAREALTS_VIA_CANONICAL); }
-public function rc_barealts_via_ambig()    -> void { rc_bump(RC_BAREALTS_VIA_AMBIG_DIAG); }
-
-// Visibility-gate audit:
-public function rc_vis_fastpath()          -> void { rc_bump(RC_VIS_FASTPATH); }
-public function rc_vis_would_reject()      -> void { rc_bump(RC_VIS_WOULD_REJECT); }
-public function rc_vis_reject_unreachable() -> void { rc_bump(RC_VIS_REJECT_UNREACHABLE); }
-public function rc_vis_reject_notpublic()  -> void { rc_bump(RC_VIS_REJECT_NOTPUBLIC); }
-
-// Leaf-index consumers, bumped on a HIT (an answer actually produced):
-public function rc_leaf_s_resolve_named()  -> void { rc_bump(RC_LEAF_S_RESOLVE_NAMED); }
-public function rc_leaf_s_resolver_bound() -> void { rc_bump(RC_LEAF_S_RESOLVER_BOUND); }
-public function rc_leaf_s_symbolic()       -> void { rc_bump(RC_LEAF_S_SYMBOLIC_CHECK); }
-public function rc_leaf_s_type_utils()     -> void { rc_bump(RC_LEAF_S_TYPE_UTILS); }
-public function rc_leaf_s_typeres_bound()  -> void { rc_bump(RC_LEAF_S_TYPERES_BOUND); }
-public function rc_leaf_s_typeres_base()   -> void { rc_bump(RC_LEAF_S_TYPERES_BASE); }
-
-/// Tri-state cache for `CRYO_LEAF_AUDIT`: 0 unknown, 1 on, 2 off.
-mut g_leaf_audit: i32 = 0;
-
-function rc_leaf_audit_enabled() -> boolean {
-    if (g_leaf_audit == 0) {
-        match (env::var(Str::new("CRYO_LEAF_AUDIT"))) {
-            Option::Some(_) => { g_leaf_audit = 1; }
-            Option::None    => { g_leaf_audit = 2; }
-        }
+implement enum Site {
+    /// Record one occurrence.
+    ///
+    /// Out-of-range is ignored rather than trapping: instrumentation must
+    /// never be able to abort a build.
+    bump(&this) -> void {
+        if (g_suspend > 0) { return; }
+        const i: i64 = this as i64;
+        if (i < 0 || i >= TALLY_CAP) { return; }
+        g_tally[i] = g_tally[i] + 1;
     }
-    return g_leaf_audit == 1;
+
+    /// Read the tally back.  Used by the report and by tests.
+    count(&this) -> u64 {
+        const i: i64 = this as i64;
+        if (i < 0 || i >= TALLY_CAP) { return 0; }
+        return g_tally[i];
+    }
+
+    /// The report bucket this site belongs to.  `"B1"` must reach zero,
+    /// `"B2"` stays, `"B3"` is authoritative, `"  "` is context-only and
+    /// `"!!"` flags a violation row.
+    ///
+    /// Exhaustive on purpose: a new site cannot be added without classifying
+    /// it.
+    bucket(&this) -> string {
+        return match (this) {
+            Site::RnCalls               => { "   " }
+            Site::RnGenericBinding      => { "B3 " }
+            Site::RnAssocProjection     => { "B2 " }
+            Site::RnPrimitive           => { "B3 " }
+            Site::RnHomeModule          => { "B1 " }
+            Site::RnAmbiguous           => { "B1 " }
+            Site::RnDiLiteral           => { "B3 " }
+            Site::RnDiCanonical         => { "B3 " }
+            Site::RnDiBare              => { "B3 " }
+            Site::RnArenaBootstrap      => { "B1 " }
+            Site::RnScopeArenaBootstrap => { "B1 " }
+            Site::RnLeafIndex           => { "B1*" }
+            Site::RnFailed              => { "   " }
+            Site::LeafCalls             => { "B1 " }
+            Site::LeafHits              => { "B1 " }
+            Site::BareAltsCalls         => { "   " }
+            Site::BareAltsHits          => { "   " }
+            Site::BareAltsMulti         => { "   " }
+            Site::BareAltsViaScoped     => { "B3 " }
+            Site::BareAltsViaCanonical  => { "B1 " }
+            Site::BareAltsViaAmbigDiag  => { "B1 " }
+            Site::VisFastpath           => { "   " }
+            Site::VisWouldReject        => { "!! " }
+            Site::VisRejectUnreachable  => { "   " }
+            Site::VisRejectNotPublic    => { "   " }
+            Site::LeafViaResolveNamed   => { "   " }
+            Site::LeafViaResolverBound  => { "   " }
+            Site::LeafViaSymbolicCheck  => { "   " }
+            Site::LeafViaTypeUtils      => { "   " }
+            Site::LeafViaTypeResBound   => { "   " }
+            Site::LeafViaTypeResBase    => { "   " }
+            Site::FnBindSingle          => { "   " }
+            Site::FnBindSingleHidden    => { "!! " }
+            Site::FnBindPrivateBound    => { "!! " }
+            Site::FnBindUnscopedRet     => { "B1 " }
+            Site::HomeCursorSame        => { "   " }
+            Site::HomeCursorDiff        => { "   " }
+            Site::HomeDiffPlural        => { "   " }
+            Site::HomeAgree             => { "   " }
+            Site::HomeDiverge           => { "!! " }
+            Site::HomeBlindMiss         => { "   " }
+            Site::M1Calls               => { "B1 " }
+            Site::M1Hits                => { "B1 " }
+            Site::M2Calls               => { "B1 " }
+            Site::M2Hits                => { "B1 " }
+            Site::M3Calls               => { "B1 " }
+            Site::M3Hits                => { "B1 " }
+            Site::M4Calls               => { "B1 " }
+            Site::M4Hits                => { "B1 " }
+            Site::M5Calls               => { "B1 " }
+            Site::M5Hits                => { "B1 " }
+        };
+    }
+
+    /// The report row label.  Exhaustive: a new site cannot be added without
+    /// a line in the report, which is the failure this enum exists to make
+    /// impossible.
+    label(&this) -> string {
+        return match (this) {
+            Site::RnCalls               => { "calls (total)" }
+            Site::RnGenericBinding      => { "1   generic binding" }
+            Site::RnAssocProjection     => { "1b  assoc-type projection (I::Item)" }
+            Site::RnPrimitive           => { "2   primitive name" }
+            Site::RnHomeModule          => { "2c  home-module preference" }
+            Site::RnAmbiguous           => { "2b  ambiguity -> E0203" }
+            Site::RnDiLiteral           => { "3a  DI exact qualified literal" }
+            Site::RnDiCanonical         => { "3b  DI canonicalized qualified" }
+            Site::RnDiBare              => { "3c  DI bare name" }
+            Site::RnArenaBootstrap      => { "4   arena (bootstrap-only)" }
+            Site::RnScopeArenaBootstrap => { "4a  scope+arena (bootstrap-only)" }
+            Site::RnLeafIndex           => { "5   GLOBAL LEAF INDEX  (* in leaf hits)" }
+            Site::RnFailed              => { "    unresolved" }
+            Site::LeafCalls             => { "lookup_by_leaf calls" }
+            Site::LeafHits              => { "lookup_by_leaf hits" }
+            Site::BareAltsCalls         => { "lookup_qualified_alternatives calls" }
+            Site::BareAltsHits          => { "lookup_qualified_alternatives hits" }
+            Site::BareAltsMulti         => { "  of which ambiguous (>1 candidate)" }
+            Site::BareAltsViaScoped     => { "  by caller: resolve_qualified_scoped" }
+            Site::BareAltsViaCanonical  => { "  by caller: canonical_qualified" }
+            Site::BareAltsViaAmbigDiag  => { "  by caller: sema ambiguity diag" }
+            Site::VisFastpath           => { "single-candidate fast path taken" }
+            Site::VisWouldReject        => { "  WOULD BE REJECTED once gated" }
+            Site::VisRejectUnreachable  => { "    cause: namespace not reachable" }
+            Site::VisRejectNotPublic    => { "    cause: candidate not public" }
+            Site::LeafViaResolveNamed   => { "  by caller: resolve_named step 5" }
+            Site::LeafViaResolverBound  => { "  by caller: resolver generic bound" }
+            Site::LeafViaSymbolicCheck  => { "  by caller: symbolic_checker" }
+            Site::LeafViaTypeUtils      => { "  by caller: sema type_utils" }
+            Site::LeafViaTypeResBound   => { "  by caller: type_resolution bound" }
+            Site::LeafViaTypeResBase    => { "  by caller: type_resolution base" }
+            Site::FnBindSingle          => { "single-overload pins (no scope check)" }
+            Site::FnBindSingleHidden    => { "  of those, owner NOT in scope (D-A)" }
+            Site::FnBindPrivateBound    => { "bound to a PRIVATE candidate  (D-B)" }
+            Site::FnBindUnscopedRet     => { "bare return-type answers, NO scope input" }
+            Site::HomeCursorSame        => { "home == ambient cursor (proves nothing)" }
+            Site::HomeCursorDiff        => { "home != ambient cursor (the evidence)" }
+            Site::HomeDiffPlural        => { "  of those, leaf declared by >1 module" }
+            Site::HomeAgree             => { "  both chains agreed" }
+            Site::HomeDiverge           => { "  blind chain binds a DIFFERENT type" }
+            Site::HomeBlindMiss         => { "  blind chain answers nothing" }
+            Site::M1Calls               => { "M1 module_ns_matches_prefix calls" }
+            Site::M1Hits                => { "M1 module_ns_matches_prefix hits" }
+            Site::M2Calls               => { "M2 resolve_module_qualified_sym calls" }
+            Site::M2Hits                => { "M2 resolve_module_qualified_sym hits" }
+            Site::M3Calls               => { "M3 collect_namespace_suffix calls" }
+            Site::M3Hits                => { "M3 collect_namespace_suffix hits" }
+            Site::M4Calls               => { "M4 mono bare-name template scan" }
+            Site::M4Hits                => { "M4 mono bare-name scan hits" }
+            Site::M5Calls               => { "M5 import suffix fallback calls" }
+            Site::M5Hits                => { "M5 import suffix fallback hits" }
+        };
+    }
+
+    /// One report row: bucket, label, tally.
+    print_row(&this) -> void {
+        fmt::eprintf("  %-3s %-46s %12llu\n",
+                     this.bucket(), this.label(), this.count());
+    }
 }
+
+// ---- Suspension --------------------------------------------------------
+
+/// Stop recording until the matching `resume`.
+///
+/// An instrument that re-runs a production lookup to compare answers would
+/// otherwise be counted as if the compiler had really taken that path -
+/// `lookup_by_leaf` bumps the leaf sites, and `resolve_type_qualified_name`
+/// emits M1 path-audit events.  Both sit underneath the divergence probe, so
+/// without this the probe would inflate the exact numbers it exists to put in
+/// context.
+///
+/// Counted, not a flag, so nesting is safe.  `Audit::enabled` honors it too,
+/// so a suspended region emits no audit lines either.
+public function suspend() -> void { g_suspend = g_suspend + 1; }
+
+public function resume() -> void {
+    if (g_suspend > 0) { g_suspend = g_suspend - 1; }
+}
+
+// ---- Audit streams -----------------------------------------------------
+
+/// A line-oriented audit stream, each switched on by its own env var.
+///
+/// Line-oriented on purpose: a run can be piped through `sort -u` to get the
+/// distinct set, and the classification can be re-cut offline without a
+/// recompile.
+///
+/// `CRYO_RESOLVE_COUNTER` is deliberately NOT a variant here.  It gates a
+/// summary printed once at exit rather than per-event lines, and it must not
+/// be suppressed by `suspend` - folding it in would mean a probe region could
+/// silently swallow the report.
+type enum Audit {
+    Leaf;
+    Visibility;
+    Path;
+    Scope;
+}
+
+implement enum Audit {
+    /// The environment variable that switches this stream on.
+    var_name(&this) -> string {
+        return match (this) {
+            Audit::Leaf       => { "CRYO_LEAF_AUDIT" }
+            Audit::Visibility => { "CRYO_VIS_AUDIT" }
+            Audit::Path       => { "CRYO_PATH_AUDIT" }
+            Audit::Scope      => { "CRYO_SCOPE_PROBE" }
+        };
+    }
+
+    /// Whether this stream is on.  Exposed so a caller can skip building the
+    /// strings an audit line needs - interning a namespace is not free, and
+    /// these sites sit in the resolution hot path.
+    enabled(&this) -> boolean {
+        if (g_suspend > 0) { return false; }
+        const i: i64 = this as i64;
+        if (i < 0 || i >= AUDIT_CAP) { return false; }
+        if (g_audit_state[i] == 0) {
+            match (env::var(Str::new(this.var_name()))) {
+                Option::Some(_) => { g_audit_state[i] = 1; }
+                Option::None    => { g_audit_state[i] = 2; }
+            }
+        }
+        return g_audit_state[i] == 1;
+    }
+}
+
+// ---- Audit emitters ----------------------------------------------------
+//
+// Free functions rather than methods on `Audit`, deliberately.  A method would
+// be callable on any variant - `Audit::Leaf.scope_diverge(...)` would compile
+// and then gate a SCOPE-DIVERGE line on `CRYO_LEAF_AUDIT`.  That is a silent
+// mis-gating bug of exactly the kind this module exists to catch.  Each
+// emitter below names its own stream once, in one place.
 
 /// Log one name that the GLOBAL LEAF INDEX answered, with the module that
-/// asked.  Line-oriented so a run can be piped through `sort -u` to get the
-/// distinct set.  No-op unless `CRYO_LEAF_AUDIT` is set.
-public function rc_leaf_audit(use_site: string, name: string) -> void {
-    if (!rc_leaf_audit_enabled()) { return; }
+/// asked.
+public function leaf_hit(use_site: string, name: string) -> void {
+    if (!Audit::Leaf.enabled()) { return; }
     fmt::eprintf("LEAF-HIT\t%s\t%s\n", use_site, name);
 }
 
-/// Tri-state cache for `CRYO_VIS_AUDIT`: 0 unknown, 1 on, 2 off.  Cached
-/// because the violation hook runs inside the hottest lookup in the compiler
-/// and an `env::var` per call would dominate the measurement.
-mut g_vis_audit: i32 = 0;
-
-function rc_vis_audit_enabled() -> boolean {
-    if (g_vis_audit == 0) {
-        match (env::var(Str::new("CRYO_VIS_AUDIT"))) {
-            Option::Some(_) => { g_vis_audit = 1; }
-            Option::None    => { g_vis_audit = 2; }
-        }
-    }
-    return g_vis_audit == 1;
-}
-
-/// Print one would-be-rejected resolution.  Line-oriented on purpose, so a
-/// run can be piped through `sort -u` to get the distinct migration set.
-/// No-op unless `CRYO_VIS_AUDIT` is set.
-public function rc_vis_violation(use_site: string, cand: string) -> void {
-    if (!rc_vis_audit_enabled()) { return; }
+/// Print one would-be-rejected resolution, so a run yields the distinct
+/// migration set.
+public function vis_violation(use_site: string, cand: string) -> void {
+    if (!Audit::Visibility.enabled()) { return; }
     fmt::eprintf("VIS-VIOLATION\t%s\t%s\n", use_site, cand);
-}
-
-/// Whether `CRYO_VIS_AUDIT` is set.  Exposed so a caller can skip building
-/// the strings an audit line needs (interning a namespace is not free, and
-/// these sites sit in the resolution hot path).
-public function rc_vis_audit_on() -> boolean { return rc_vis_audit_enabled(); }
-
-public function rc_fnbind_single()        -> void { rc_bump(RC_FNBIND_SINGLE); }
-public function rc_fnbind_single_hidden() -> void { rc_bump(RC_FNBIND_SINGLE_HIDDEN); }
-public function rc_fnbind_private_bound() -> void { rc_bump(RC_FNBIND_PRIVATE_BOUND); }
-public function rc_fnbind_unscoped_ret() -> void { rc_bump(RC_FNBIND_UNSCOPED_RET); }
-
-/// Print one bare free-function call that bound to a candidate the use site
-/// should not be able to name.  `kind` is `HIDDEN` (D-A: not imported) or
-/// `PRIVATE` (D-B: imported but not public).
-/// No-op unless `CRYO_VIS_AUDIT` is set.
-public function rc_fnbind_violation(kind: string, use_site: string, cand: string) -> void {
-    if (!rc_vis_audit_enabled()) { return; }
-    fmt::eprintf("FNBIND-VIOLATION\t%s\t%s\t%s\n", kind, use_site, cand);
 }
 
 /// Print one recorded visibility verdict, so a run can prove the
 /// `decl_visibility` map is populated before any conclusion is drawn from a
 /// zero rejection count (`is_candidate_public` defaults to `true`, so an
 /// unwired recorder and a genuinely-all-public program look identical).
-/// No-op unless `CRYO_VIS_AUDIT` is set.
-public function rc_vis_record(qualified: string, is_public: boolean) -> void {
-    if (!rc_vis_audit_enabled()) { return; }
+public function vis_record(qualified: string, is_public: boolean) -> void {
+    if (!Audit::Visibility.enabled()) { return; }
     const flag: i32 = if (is_public) { 1 } else { 0 };
     fmt::eprintf("VIS-RECORD\t%d\t%s\n", flag, qualified);
 }
@@ -310,23 +422,18 @@ public function rc_vis_record(qualified: string, is_public: boolean) -> void {
 /// Print one fast-path encounter with a candidate recorded as PRIVATE, tagged
 /// with why it was (or was not) let through.  Distinguishes "the gate saw no
 /// private candidates" from "the gate never got to look".
-/// No-op unless `CRYO_VIS_AUDIT` is set.
-public function rc_vis_private(kind: string, use_site: string, cand: string) -> void {
-    if (!rc_vis_audit_enabled()) { return; }
+public function vis_private(kind: string, use_site: string, cand: string) -> void {
+    if (!Audit::Visibility.enabled()) { return; }
     fmt::eprintf("VIS-PRIVATE\t%s\t%s\t%s\n", kind, use_site, cand);
 }
 
-/// Tri-state cache for `CRYO_PATH_AUDIT`: 0 unknown, 1 on, 2 off.
-mut g_path_audit: i32 = 0;
-
-function rc_path_audit_enabled() -> boolean {
-    if (g_path_audit == 0) {
-        match (env::var(Str::new("CRYO_PATH_AUDIT"))) {
-            Option::Some(_) => { g_path_audit = 1; }
-            Option::None    => { g_path_audit = 2; }
-        }
-    }
-    return g_path_audit == 1;
+/// Print one bare free-function call that bound to a candidate the use site
+/// should not be able to name.  `kind` is `HIDDEN` (D-A: not imported) or
+/// `PRIVATE` (D-B: imported but not public).
+public function fnbind_violation(kind: string, use_site: string,
+                                 cand: string) -> void {
+    if (!Audit::Visibility.enabled()) { return; }
+    fmt::eprintf("FNBIND-VIOLATION\t%s\t%s\t%s\n", kind, use_site, cand);
 }
 
 /// Log one QUALIFIED PATH that a namespace-suffix matcher resolved, to size
@@ -342,9 +449,9 @@ function rc_path_audit_enabled() -> boolean {
 /// suffix, or a shallower prefix needing a re-export - is what classifies the
 /// churn, and it is computed offline from these two strings rather than here,
 /// so the classification can be re-cut without a recompile.
-public function rc_path_audit(kind: string, use_site: string,
-                              written: string, resolved: string) -> void {
-    if (!rc_path_audit_enabled()) { return; }
+public function path_hit(kind: string, use_site: string,
+                         written: string, resolved: string) -> void {
+    if (!Audit::Path.enabled()) { return; }
     fmt::eprintf("PATH-HIT\t%s\t%s\t%s\t%s\n", kind, use_site, written, resolved);
 }
 
@@ -352,65 +459,51 @@ public function rc_path_audit(kind: string, use_site: string,
 /// ask the compiler's OWN reachability question ("is this first segment in
 /// scope here?") instead of re-deriving it with a regex over import lines,
 /// which cannot see the prelude or brace-list items.
-public function rc_path_scope(ns: string, visible: string) -> void {
-    if (!rc_path_audit_enabled()) { return; }
+public function path_scope(ns: string, visible: string) -> void {
+    if (!Audit::Path.enabled()) { return; }
     fmt::eprintf("PATH-SCOPE\t%s\t%s\n", ns, visible);
 }
 
 /// Dump one prelude namespace - in scope everywhere, so a path rooted at one
 /// needs no import no matter where it is written.
-public function rc_path_prelude(ns: string) -> void {
-    if (!rc_path_audit_enabled()) { return; }
+public function path_prelude(ns: string) -> void {
+    if (!Audit::Path.enabled()) { return; }
     fmt::eprintf("PATH-PRELUDE\t%s\n", ns);
 }
 
-// The five namespace-suffix matchers:
-public function rc_m1_call()               -> void { rc_bump(RC_M1_CALLS); }
-public function rc_m1_hit()                -> void { rc_bump(RC_M1_HITS); }
-public function rc_m2_call()               -> void { rc_bump(RC_M2_CALLS); }
-public function rc_m2_hit()                -> void { rc_bump(RC_M2_HITS); }
-public function rc_m3_call()               -> void { rc_bump(RC_M3_CALLS); }
-public function rc_m3_hit()                -> void { rc_bump(RC_M3_HITS); }
-public function rc_m4_call()               -> void { rc_bump(RC_M4_CALLS); }
-public function rc_m4_hit()                -> void { rc_bump(RC_M4_HITS); }
-public function rc_m5_call()               -> void { rc_bump(RC_M5_CALLS); }
-public function rc_m5_hit()                -> void { rc_bump(RC_M5_HITS); }
-
-/// Read one site back.  Used by the report and by tests.
-public function rc_get(site: i64) -> u64 {
-    if (site < 0 || site >= RC_SITE_COUNT) { return 0; }
-    return g_rc_counts[site];
-}
-
-/// Drop every tally back to zero.  Exists so a driver that compiles more
-/// than one unit in a process can attribute counts per unit.
-public function rc_reset() -> void {
-    for (mut i: i64 = 0; i < RC_SITE_COUNT; i++) {
-        g_rc_counts[i] = 0;
-    }
+/// Print one annotation whose meaning DEPENDS on having a scope: the module
+/// it was written in binds `name` to `home_qn`, the ambient chain binds it to
+/// `blind_qn`, and they are not the same type.
+public function scope_diverge(home: string, name: string,
+                              home_qn: string, blind_qn: string) -> void {
+    if (!Audit::Scope.enabled()) { return; }
+    fmt::eprintf("SCOPE-DIVERGE\t%s\t%s\t%s\t%s\n", home, name, home_qn, blind_qn);
 }
 
 // ---- Reporting ---------------------------------------------------------
 
+/// Drop every tally back to zero.  Exists so a driver that compiles more
+/// than one unit in a process can attribute counts per unit.
+public function reset() -> void {
+    for (mut i: i64 = 0; i < TALLY_CAP; i++) {
+        g_tally[i] = 0;
+    }
+}
+
 /// Whether `CRYO_RESOLVE_COUNTER` is set in the environment.
-public function rc_enabled() -> boolean {
+public function enabled() -> boolean {
     match (env::var(Str::new("CRYO_RESOLVE_COUNTER"))) {
         Option::Some(_) => { return true;  }
         Option::None    => { return false; }
     }
 }
 
-/// One report row: `bucket`, an indented label, and the tally.
-function rc_line(bucket: string, label: string, site: i64) -> void {
-    fmt::eprintf("  %-3s %-46s %12llu\n", bucket, label, rc_get(site));
-}
-
 /// Print the tally to stderr.  No-op unless `CRYO_RESOLVE_COUNTER` is set.
 ///
 /// B1 total is the number the unification effort drives to zero; it is
 /// printed last so it is the final thing on screen.
-public function rc_report() -> void {
-    if (!rc_enabled()) { return; }
+public function report() -> void {
+    if (!enabled()) { return; }
 
     fmt::eprintf("\n");
     fmt::eprintf("=============== name-resolution counter ===============\n");
@@ -425,61 +518,70 @@ public function rc_report() -> void {
     fmt::eprintf("\n");
 
     fmt::eprintf("-- resolve_named cascade (types/resolver.cryo:1324) ----\n");
-    rc_line("   ", "calls (total)",                        RC_RN_CALLS);
-    rc_line("B3 ", "1   generic binding",                  RC_RN_GENERIC_BINDING);
-    rc_line("B2 ", "1b  assoc-type projection (I::Item)",  RC_RN_ASSOC_PROJECTION);
-    rc_line("B3 ", "2   primitive name",                   RC_RN_PRIMITIVE);
-    rc_line("B1 ", "2c  home-module preference",           RC_RN_HOME_MODULE);
-    rc_line("B1 ", "2b  ambiguity -> E0203",               RC_RN_AMBIGUOUS);
-    rc_line("B3 ", "3a  DI exact qualified literal",       RC_RN_DI_LITERAL);
-    rc_line("B3 ", "3b  DI canonicalized qualified",       RC_RN_DI_CANONICAL);
-    rc_line("B3 ", "3c  DI bare name",                     RC_RN_DI_BARE);
-    rc_line("B1 ", "4   arena (bootstrap-only)",           RC_RN_ARENA_BOOTSTRAP);
-    rc_line("B1 ", "4a  scope+arena (bootstrap-only)",     RC_RN_SCOPE_ARENA_BOOTSTRAP);
-    rc_line("B1*", "5   GLOBAL LEAF INDEX  (* in leaf hits)", RC_RN_LEAF_INDEX);
-    rc_line("   ", "    unresolved",                       RC_RN_FAILED);
+    Site::RnCalls.print_row();
+    Site::RnGenericBinding.print_row();
+    Site::RnAssocProjection.print_row();
+    Site::RnPrimitive.print_row();
+    Site::RnHomeModule.print_row();
+    Site::RnAmbiguous.print_row();
+    Site::RnDiLiteral.print_row();
+    Site::RnDiCanonical.print_row();
+    Site::RnDiBare.print_row();
+    Site::RnArenaBootstrap.print_row();
+    Site::RnScopeArenaBootstrap.print_row();
+    Site::RnLeafIndex.print_row();
+    Site::RnFailed.print_row();
 
     fmt::eprintf("\n-- global leaf index (types/arena.cryo:1023) ----------\n");
-    rc_line("B1 ", "lookup_by_leaf calls",                 RC_LEAF_CALLS);
-    rc_line("B1 ", "lookup_by_leaf hits",                  RC_LEAF_HITS);
-    rc_line("   ", "  by caller: resolve_named step 5",    RC_LEAF_S_RESOLVE_NAMED);
-    rc_line("   ", "  by caller: resolver generic bound",  RC_LEAF_S_RESOLVER_BOUND);
-    rc_line("   ", "  by caller: symbolic_checker",        RC_LEAF_S_SYMBOLIC_CHECK);
-    rc_line("   ", "  by caller: sema type_utils",         RC_LEAF_S_TYPE_UTILS);
-    rc_line("   ", "  by caller: type_resolution bound",   RC_LEAF_S_TYPERES_BOUND);
-    rc_line("   ", "  by caller: type_resolution base",    RC_LEAF_S_TYPERES_BASE);
+    Site::LeafCalls.print_row();
+    Site::LeafHits.print_row();
+    Site::LeafViaResolveNamed.print_row();
+    Site::LeafViaResolverBound.print_row();
+    Site::LeafViaSymbolicCheck.print_row();
+    Site::LeafViaTypeUtils.print_row();
+    Site::LeafViaTypeResBound.print_row();
+    Site::LeafViaTypeResBase.print_row();
 
     fmt::eprintf("\n-- DeclarationIndex bare_alts (decl_index.cryo:1405) --\n");
-    rc_line("   ", "lookup_qualified_alternatives calls",  RC_BAREALTS_CALLS);
-    rc_line("   ", "lookup_qualified_alternatives hits",   RC_BAREALTS_HITS);
-    rc_line("   ", "  of which ambiguous (>1 candidate)",  RC_BAREALTS_MULTI);
-    rc_line("B3 ", "  by caller: resolve_qualified_scoped", RC_BAREALTS_VIA_SCOPED);
-    rc_line("B1 ", "  by caller: canonical_qualified",     RC_BAREALTS_VIA_CANONICAL);
-    rc_line("B1 ", "  by caller: sema ambiguity diag",     RC_BAREALTS_VIA_AMBIG_DIAG);
+    Site::BareAltsCalls.print_row();
+    Site::BareAltsHits.print_row();
+    Site::BareAltsMulti.print_row();
+    Site::BareAltsViaScoped.print_row();
+    Site::BareAltsViaCanonical.print_row();
+    Site::BareAltsViaAmbigDiag.print_row();
 
     fmt::eprintf("\n-- visibility gate blast radius (spec §8.1) -----------\n");
-    rc_line("   ", "single-candidate fast path taken",      RC_VIS_FASTPATH);
-    rc_line("!! ", "  WOULD BE REJECTED once gated",        RC_VIS_WOULD_REJECT);
-    rc_line("   ", "    cause: namespace not reachable",    RC_VIS_REJECT_UNREACHABLE);
-    rc_line("   ", "    cause: candidate not public",       RC_VIS_REJECT_NOTPUBLIC);
+    Site::VisFastpath.print_row();
+    Site::VisWouldReject.print_row();
+    Site::VisRejectUnreachable.print_row();
+    Site::VisRejectNotPublic.print_row();
 
     fmt::eprintf("\n-- free-fn bare-call binder (spec §3.3, §4) ----------\n");
-    rc_line("   ", "single-overload pins (no scope check)", RC_FNBIND_SINGLE);
-    rc_line("!! ", "  of those, owner NOT in scope (D-A)",  RC_FNBIND_SINGLE_HIDDEN);
-    rc_line("!! ", "bound to a PRIVATE candidate  (D-B)",   RC_FNBIND_PRIVATE_BOUND);
-    rc_line("B1 ", "bare return-type answers, NO scope input", RC_FNBIND_UNSCOPED_RET);
+    Site::FnBindSingle.print_row();
+    Site::FnBindSingleHidden.print_row();
+    Site::FnBindPrivateBound.print_row();
+    Site::FnBindUnscopedRet.print_row();
+
+    fmt::eprintf("\n-- ambient-cursor divergence (spec §2b, §5.2) ---------\n");
+    fmt::eprintf("     (CRYO_SCOPE_PROBE only; all zero without it)\n");
+    Site::HomeCursorSame.print_row();
+    Site::HomeCursorDiff.print_row();
+    Site::HomeDiffPlural.print_row();
+    Site::HomeAgree.print_row();
+    Site::HomeDiverge.print_row();
+    Site::HomeBlindMiss.print_row();
 
     fmt::eprintf("\n-- namespace-suffix heuristic, 5 copies ---------------\n");
-    rc_line("B1 ", "M1 module_ns_matches_prefix calls",    RC_M1_CALLS);
-    rc_line("B1 ", "M1 module_ns_matches_prefix hits",     RC_M1_HITS);
-    rc_line("B1 ", "M2 resolve_module_qualified_sym calls", RC_M2_CALLS);
-    rc_line("B1 ", "M2 resolve_module_qualified_sym hits",  RC_M2_HITS);
-    rc_line("B1 ", "M3 collect_namespace_suffix calls",    RC_M3_CALLS);
-    rc_line("B1 ", "M3 collect_namespace_suffix hits",     RC_M3_HITS);
-    rc_line("B1 ", "M4 mono bare-name template scan",      RC_M4_CALLS);
-    rc_line("B1 ", "M4 mono bare-name scan hits",          RC_M4_HITS);
-    rc_line("B1 ", "M5 import suffix fallback calls",      RC_M5_CALLS);
-    rc_line("B1 ", "M5 import suffix fallback hits",       RC_M5_HITS);
+    Site::M1Calls.print_row();
+    Site::M1Hits.print_row();
+    Site::M2Calls.print_row();
+    Site::M2Hits.print_row();
+    Site::M3Calls.print_row();
+    Site::M3Hits.print_row();
+    Site::M4Calls.print_row();
+    Site::M4Hits.print_row();
+    Site::M5Calls.print_row();
+    Site::M5Hits.print_row();
 
     // Bucket totals, over DISJOINT selections.
     //
@@ -487,41 +589,41 @@ public function rc_report() -> void {
     // a fallback that is called but returns nothing is not load-bearing,
     // and counting attempts would make "drive it to zero" unreachable for
     // the wrong reason.  Cascade step 5 is deliberately NOT added - it is
-    // already inside `RC_LEAF_HITS`, and adding both double-counts it.
+    // already inside `Site::LeafHits`, and adding both double-counts it.
     //
     // The bootstrap arena steps are B1 because Phase 2 deletes
     // `bootstrap_mode` outright; they need a home, not a smaller count.
     mut b1: u64 = 0;
-    b1 = b1 + rc_get(RC_RN_HOME_MODULE);
-    b1 = b1 + rc_get(RC_RN_AMBIGUOUS);
-    b1 = b1 + rc_get(RC_RN_ARENA_BOOTSTRAP);
-    b1 = b1 + rc_get(RC_RN_SCOPE_ARENA_BOOTSTRAP);
-    b1 = b1 + rc_get(RC_LEAF_HITS);
-    b1 = b1 + rc_get(RC_BAREALTS_VIA_CANONICAL);
-    b1 = b1 + rc_get(RC_BAREALTS_VIA_AMBIG_DIAG);
-    b1 = b1 + rc_get(RC_M1_HITS);
-    b1 = b1 + rc_get(RC_M2_HITS);
-    b1 = b1 + rc_get(RC_M3_HITS);
-    b1 = b1 + rc_get(RC_M4_HITS);
-    b1 = b1 + rc_get(RC_M5_HITS);
+    b1 = b1 + Site::RnHomeModule.count();
+    b1 = b1 + Site::RnAmbiguous.count();
+    b1 = b1 + Site::RnArenaBootstrap.count();
+    b1 = b1 + Site::RnScopeArenaBootstrap.count();
+    b1 = b1 + Site::LeafHits.count();
+    b1 = b1 + Site::BareAltsViaCanonical.count();
+    b1 = b1 + Site::BareAltsViaAmbigDiag.count();
+    b1 = b1 + Site::M1Hits.count();
+    b1 = b1 + Site::M2Hits.count();
+    b1 = b1 + Site::M3Hits.count();
+    b1 = b1 + Site::M4Hits.count();
+    b1 = b1 + Site::M5Hits.count();
 
     // INCOMPLETE.  Only `resolve_named`'s assoc-type projection is
     // instrumented so far; sema's method/trait dispatch - the actual bulk
     // of type-dependent resolution, and the §2.6 `call_resolver.cryo:1862`
     // case - is NOT counted yet.  Treat this as a floor, not a total.
-    const b2: u64 = rc_get(RC_RN_ASSOC_PROJECTION);
+    const b2: u64 = Site::RnAssocProjection.count();
 
     // B3 is authoritative resolution: correct mechanisms that answer from
     // scope/imports rather than by guessing.  The unification target for
     // these is ONCE PER PATH, not zero - today they are re-derived by every
     // downstream stage, which is what §3.2 rule 2 is really about.
     mut b3: u64 = 0;
-    b3 = b3 + rc_get(RC_RN_GENERIC_BINDING);
-    b3 = b3 + rc_get(RC_RN_PRIMITIVE);
-    b3 = b3 + rc_get(RC_RN_DI_LITERAL);
-    b3 = b3 + rc_get(RC_RN_DI_CANONICAL);
-    b3 = b3 + rc_get(RC_RN_DI_BARE);
-    b3 = b3 + rc_get(RC_BAREALTS_VIA_SCOPED);
+    b3 = b3 + Site::RnGenericBinding.count();
+    b3 = b3 + Site::RnPrimitive.count();
+    b3 = b3 + Site::RnDiLiteral.count();
+    b3 = b3 + Site::RnDiCanonical.count();
+    b3 = b3 + Site::RnDiBare.count();
+    b3 = b3 + Site::BareAltsViaScoped.count();
 
     fmt::eprintf("\n-------------------------------------------------------\n");
     fmt::eprintf("  B1 fuzzy fallback   -> ZERO           %12llu\n", b1);

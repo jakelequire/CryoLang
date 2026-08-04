@@ -1088,7 +1088,7 @@ type struct TypeResolver {
         for (mut k: i64 = 0; k < gp.constraints.length; k++) {
             const trait_ref: TypeRef = this.arena.lookup_by_leaf(gp.constraints[k]);
             if (trait_ref.is_valid()) {
-                ResolveCounter::rc_leaf_s_resolver_bound();
+                ResolveCounter::Site::LeafViaResolverBound.bump();
                 bounds.push(trait_ref);
             }
         }
@@ -1314,6 +1314,103 @@ private:
         return ScopeID { id: sid };
     }
 
+    /// Measure the ambient scope cursor against a scope KNOWN to be right.
+    ///
+    /// Called only from the home-module preference step (2c), which runs only
+    /// when a caller has said which module the annotation was written in.
+    /// That makes this the one place where the correct answer and the ambient
+    /// one both exist, so the cursor can be measured instead of inferred -
+    /// see the §6 caveat, and `RC_HOME_*` in `resolve_counter.cryo`.
+    ///
+    /// Re-runs the module-blind steps below 2c (3b canonical, 3c bare, 5 leaf
+    /// index) - the chain every `ResolutionContext` that never sets a home
+    /// module falls into - and classifies the pair:
+    ///
+    ///   DIVERGE    the blind chain binds a DIFFERENT type.  A silent
+    ///              miscompile at any site that resolves this annotation
+    ///              without a scope.
+    ///   BLIND_MISS the blind chain answers nothing; the scope rescued it.
+    ///   AGREE      the cursor happened to be standing in the right place.
+    ///
+    /// Instrumentation only.  Returns nothing, and deliberately does NOT
+    /// replay 2b's ambiguity arm, which emits E0203 - a probe must not be able
+    /// to add a diagnostic to a build.  Recording is suspended across the
+    /// re-run so the replayed lookups cannot inflate the leaf-index or M1
+    /// tallies they normally bump.
+    ///
+    /// Off unless `CRYO_SCOPE_PROBE` is set.
+    probe_ambient_divergence(&this, name: SymbolStr, name_str: string,
+                             ctx: ResolutionContext*, home_answer: TypeRef,
+                             home_via: SymbolStr) -> void {
+        if (!ResolveCounter::Audit::Scope.enabled()) { return; }
+
+        mut blind: TypeRef = TypeRef::invalid();
+        mut blind_qn: SymbolStr = SymbolStr::empty();
+
+        ResolveCounter::suspend();
+
+        // The control.  When the cursor is already standing in the home module
+        // there is only one scope in play, so agreement is guaranteed and says
+        // nothing about what a scope-less site would do.  Only the DIFF rows
+        // are evidence.
+        mut cursor_same: boolean = true;
+        if (this.name_resolver != null) {
+            const home_sym: SymbolStr = this.intern_table.intern(ctx.home_module);
+            cursor_same = home_sym.id == this.name_resolver.current_module_sym().id;
+        }
+        // And the control on that: scope can only change an answer when the
+        // leaf has more than one declaring module.  A singleton leaf forces
+        // agreement no matter where the cursor stands.
+        mut leaf_plural: boolean = false;
+        if (this.decl_index != null) {
+            const alts: SymbolStr[] =
+                this.decl_index.lookup_qualified_alternatives(name);
+            leaf_plural = alts.length > 1;
+        }
+        // 3b, as the blind chain runs it: canonicalized against the AMBIENT
+        // cursor, with no home scope to prefer.
+        if (this.decl_index != null && this.name_resolver != null) {
+            const q: SymbolStr = this.name_resolver.resolve_type_qualified_name(name);
+            if (q.is_valid()) {
+                const t: TypeRef = this.decl_index.lookup_type(q);
+                if (t.is_valid()) { blind = t; blind_qn = q; }
+            }
+        }
+        // 3c bare name.
+        if (!blind.is_valid() && this.decl_index != null) {
+            const t: TypeRef = this.decl_index.lookup_type(name);
+            if (t.is_valid()) { blind = t; blind_qn = name; }
+        }
+        // 5, the global leaf index.
+        if (!blind.is_valid()) {
+            const t: TypeRef = this.arena.lookup_by_leaf(name);
+            if (t.is_valid()) { blind = t; blind_qn = name; }
+        }
+        ResolveCounter::resume();
+
+        if (cursor_same) {
+            ResolveCounter::Site::HomeCursorSame.bump();
+        } else {
+            ResolveCounter::Site::HomeCursorDiff.bump();
+            if (leaf_plural) { ResolveCounter::Site::HomeDiffPlural.bump(); }
+        }
+
+        if (!blind.is_valid()) {
+            ResolveCounter::Site::HomeBlindMiss.bump();
+            return;
+        }
+        const blind_answer: TypeRef = this.follow_alias(blind);
+        if (blind_answer.id == home_answer.id) {
+            ResolveCounter::Site::HomeAgree.bump();
+            return;
+        }
+        ResolveCounter::Site::HomeDiverge.bump();
+        ResolveCounter::scope_diverge(
+            ctx.home_module, name_str,
+            this.intern_table.resolve(home_via),
+            this.intern_table.resolve(blind_qn));
+    }
+
     /// Canonical `<module>::<leaf>` for `name`, resolved as the annotation's OWN
     /// module sees it whenever the context says which module that is.
     ///
@@ -1344,11 +1441,11 @@ private:
         const name_str: string = this.intern_table.resolve(name);
         const name_len: i64 = name_str.length() as i64;
         LOG_DEBUG(LogComponent::TypeChecker, "resolve_named() name='%s'", name_str);
-        ResolveCounter::rc_rn_call();
+        ResolveCounter::Site::RnCalls.bump();
         // 1. Check generic bindings first (O(1) SymbolStr comparison)
         mut binding: TypeRef = ctx.lookup_binding(name);
         if (binding.is_valid()) {
-            ResolveCounter::rc_rn_generic_binding();
+            ResolveCounter::Site::RnGenericBinding.bump();
             return binding;
         }
 
@@ -1375,7 +1472,7 @@ private:
                         name_str.substring(sep + 2, name_len - sep - 2);
                     const member_sym: SymbolStr = this.intern_table.intern(member_str);
                     const proj: TypeRef = this.project_member(prefix_ty, member_sym, ctx);
-                    if (proj.is_valid()) { ResolveCounter::rc_rn_assoc_projection(); return proj; }
+                    if (proj.is_valid()) { ResolveCounter::Site::RnAssocProjection.bump(); return proj; }
                 }
             }
         }
@@ -1386,7 +1483,7 @@ private:
         //    This fallback ensures they resolve correctly.
         const prim: TypeRef = this.resolve_primitive(name);
         if (prim.is_valid()) {
-            ResolveCounter::rc_rn_primitive();
+            ResolveCounter::Site::RnPrimitive.bump();
             return prim;
         }
 
@@ -1409,19 +1506,21 @@ private:
         if ((this.home_module_len(ctx) > 0)
                 && this.name_resolver != null
                 && !this.name_resolver.contains_separator(name_str)) {
+            // One exit, not three.  Each hit records WHICH qualified name won
+            // so the divergence probe below can name both sides of a mismatch;
+            // the lookup order and short-circuiting are unchanged.
+            mut home_hit: TypeRef = TypeRef::invalid();
+            mut home_via: SymbolStr = SymbolStr::empty();
+
             const home_qn: SymbolStr =
                 this.intern_table.intern(ctx.home_module + "::" + name_str);
             if (this.decl_index != null) {
                 const home_di: TypeRef = this.decl_index.lookup_type(home_qn);
-                if (home_di.is_valid()) {
-                    ResolveCounter::rc_rn_home_module();
-                    return this.follow_alias(home_di);
-                }
+                if (home_di.is_valid()) { home_hit = home_di; home_via = home_qn; }
             }
-            const home_arena: TypeRef = this.arena.lookup_by_name(home_qn);
-            if (home_arena.is_valid()) {
-                ResolveCounter::rc_rn_home_module();
-                return this.follow_alias(home_arena);
+            if (!home_hit.is_valid()) {
+                const home_arena: TypeRef = this.arena.lookup_by_name(home_qn);
+                if (home_arena.is_valid()) { home_hit = home_arena; home_via = home_qn; }
             }
             // The home module does not DECLARE the leaf, but "resolve where it
             // was written" means resolving against what that module can SEE -
@@ -1433,18 +1532,23 @@ private:
             // the global leaf index.  Import-scoped, so it cannot bind to some
             // unrelated same-leaf type in a module the home module never
             // imported.
-            if (this.decl_index != null) {
+            if (!home_hit.is_valid() && this.decl_index != null) {
                 const home_ns: SymbolStr = this.intern_table.intern(ctx.home_module);
                 const home_scoped: SymbolStr =
                     this.decl_index.resolve_qualified_scoped_or(
                         name, home_ns, this.intern_table);
                 if (home_scoped.is_valid() && home_scoped.id != name.id) {
                     const home_st: TypeRef = this.decl_index.lookup_type(home_scoped);
-                    if (home_st.is_valid()) {
-                        ResolveCounter::rc_rn_home_module();
-                        return this.follow_alias(home_st);
-                    }
+                    if (home_st.is_valid()) { home_hit = home_st; home_via = home_scoped; }
                 }
+            }
+
+            if (home_hit.is_valid()) {
+                const home_answer: TypeRef = this.follow_alias(home_hit);
+                this.probe_ambient_divergence(name, name_str, ctx,
+                                              home_answer, home_via);
+                ResolveCounter::Site::RnHomeModule.bump();
+                return home_answer;
             }
         }
 
@@ -1471,7 +1575,7 @@ private:
                         Diagnostic::error(ErrorCode::E0203_UNDEFINED_TYPE, msg));
                 }
             }
-            ResolveCounter::rc_rn_ambiguous();
+            ResolveCounter::Site::RnAmbiguous.bump();
             return TypeRef::invalid();
         }
 
@@ -1498,7 +1602,7 @@ private:
                     && this.name_resolver.contains_separator(name_str)) {
                 const di_literal: TypeRef = this.decl_index.lookup_type(name);
                 if (di_literal.is_valid()) {
-                    ResolveCounter::rc_rn_di_literal();
+                    ResolveCounter::Site::RnDiLiteral.bump();
                     return this.follow_alias(di_literal);
                 }
             }
@@ -1509,7 +1613,7 @@ private:
                 if (qualified.is_valid()) {
                     const di_found: TypeRef = this.decl_index.lookup_type(qualified);
                     if (di_found.is_valid()) {
-                        ResolveCounter::rc_rn_di_canonical();
+                        ResolveCounter::Site::RnDiCanonical.bump();
                         return this.follow_alias(di_found);
                     }
                 }
@@ -1517,7 +1621,7 @@ private:
             // Try bare name
             const di_bare: TypeRef = this.decl_index.lookup_type(name);
             if (di_bare.is_valid()) {
-                ResolveCounter::rc_rn_di_bare();
+                ResolveCounter::Site::RnDiBare.bump();
                 return this.follow_alias(di_bare);
             }
         }
@@ -1531,7 +1635,7 @@ private:
         if (this.bootstrap_mode) {
             found = this.arena.lookup_by_name(name);
             if (found.is_valid()) {
-                ResolveCounter::rc_rn_arena_bootstrap();
+                ResolveCounter::Site::RnArenaBootstrap.bump();
                 const found_t: Type* = this.arena.lookup(found.id);
                 if (found_t != null && found_t.kind == TypeKind::TypeAlias) {
                     const alias_t: TypeAliasType* = found_t as TypeAliasType*;
@@ -1553,7 +1657,7 @@ private:
             if (qualified.is_valid()) {
                 found = this.arena.lookup_by_name(qualified);
                 if (found.is_valid()) {
-                    ResolveCounter::rc_rn_scope_arena_boot();
+                    ResolveCounter::Site::RnScopeArenaBootstrap.bump();
                     return found;
                 }
             }
@@ -1583,18 +1687,18 @@ private:
         //    misroute a stray `T` into a real type.
         found = this.arena.lookup_by_leaf(name);
         if (found.is_valid()) {
-            ResolveCounter::rc_rn_leaf_index();
-            ResolveCounter::rc_leaf_s_resolve_named();
+            ResolveCounter::Site::RnLeafIndex.bump();
+            ResolveCounter::Site::LeafViaResolveNamed.bump();
             // Which names actually need the global index, and who asks.  §2.10a
             // justifies this fallback narrowly (circular `ASTVisitor*` refs in
             // AST node files); the audit decides whether legalizing
             // intra-package import cycles would really retire it.
-            ResolveCounter::rc_leaf_audit(ctx.home_module, name_str);
+            ResolveCounter::leaf_hit(ctx.home_module, name_str);
             return found;
         }
 
         // Not found; return invalid (caller should create error)
-        ResolveCounter::rc_rn_failed();
+        ResolveCounter::Site::RnFailed.bump();
         LOG_DEBUG(LogComponent::TypeChecker, "[TypeResolver] resolve_named() FAILED for '%s'", name_str);
         return TypeRef::invalid();
     }
