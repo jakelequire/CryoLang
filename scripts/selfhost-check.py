@@ -77,6 +77,11 @@ STAGE3 = ROOT / "compiler" / "build" / "self" / "s3" / "cryo"      # stage-2 -> 
 STAGE4 = ROOT / "compiler" / "build" / "self" / "s4" / "cryo"      # stage-3 -> stage-4
 S3_LL  = ROOT / "compiler" / "build" / "self" / "s3" / "cryo.ll"
 S4_LL  = ROOT / "compiler" / "build" / "self" / "s4" / "cryo.ll"
+# Stage roots, for the per-module IR tree comparison (`_compare_ir_trees`).
+# The `*_LL` files above are the linked artifact only; these are what the
+# windows half compares, and what the linux half must compare too.
+S3_DIR = ROOT / "compiler" / "build" / "self" / "s3"
+S4_DIR = ROOT / "compiler" / "build" / "self" / "s4"
 LOG_DIR = ROOT / "build-logs" / "selfhost-check"
 
 # Top-level dirs we wipe before the chain runs. Recursive - covers the
@@ -810,10 +815,29 @@ def main():
 
     if s3 == s4:
         md5 = hashlib.md5(s3).hexdigest()
-        print(f"  {C.GREEN}{C.BOLD}✓ FIXED POINT OK{C.RESET}  stage-3 and stage-4 produce byte-identical IR")
-        print(f"  {C.DIM}IR md5:{C.RESET}  {md5}")
-        print(f"  {C.DIM}IR size:{C.RESET} {len(s3):,} bytes")
-        result_ok = True
+        # `cryo.ll` is the llvm-link artifact - one file, ~1MB against ~104MB of
+        # per-module IR.  Matching it is necessary but nowhere near sufficient:
+        # a name that binds differently in any of the other modules does not
+        # show up here.  The windows half has always walked the whole tree; the
+        # linux half did not, so for a long time the two halves of this gate
+        # were not checking comparable things.  Walk it here too, and make a
+        # tree mismatch fail the gate even when the linked artifact matches.
+        tree_ok, tree_detail = _compare_ir_trees(S3_DIR, S4_DIR)
+        if tree_ok is None:
+            print(f"  {C.RED}✗ cannot compare linux IR tree:{C.RESET} {tree_detail}")
+            result_ok = False
+        elif tree_ok:
+            nmods, total_bytes = tree_detail
+            print(f"  {C.GREEN}{C.BOLD}✓ FIXED POINT OK{C.RESET}  stage-3 and stage-4 produce byte-identical IR")
+            print(f"  {C.DIM}IR md5:{C.RESET}  {md5}  {C.DIM}(cryo.ll, {len(s3):,} bytes){C.RESET}")
+            print(f"  {C.DIM}modules:{C.RESET} {nmods}")
+            print(f"  {C.DIM}IR size:{C.RESET} {total_bytes:,} bytes")
+            result_ok = True
+        else:
+            print(f"  {C.RED}{C.BOLD}✗ FIXED POINT BROKEN{C.RESET}  "
+                  f"linked cryo.ll matches but per-module IR differs; "
+                  f"first differing module: {tree_detail}")
+            result_ok = False
     else:
         print(f"  {C.RED}{C.BOLD}✗ FIXED POINT BROKEN{C.RESET}  stage-3 and stage-4 IR differ")
         diff = subprocess.run(
