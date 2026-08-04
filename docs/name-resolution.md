@@ -462,6 +462,121 @@ were not being **discovered**, on the assumption that the parent's
 same failure shape as §2.6. Brace items are now discovered exactly like plain
 import paths.
 
+### 8.1c Function visibility, wired — and the second binder it exposed (2026-08-04)
+
+§8.1b's caveat said the measured "0 rejected for non-public" meant *visibility
+is largely never recorded*, and listed wiring it as step 3. Wiring it produced
+a more interesting result than the count it was meant to fix.
+
+**What was wired.** `set_type_visibility` recorded only types (5 sites, all in
+`register_decl_in_index`). It is now `set_decl_visibility` — the old name
+described a map that also has to answer for functions — and the
+`FunctionDeclaration` arm records `func.is_public` alongside its
+`register_name_mapping`. Intrinsics record `true` explicitly, as traits already
+did.
+
+**Read the zero with a positive control.** `is_candidate_public` defaults to
+`true`, so an unwired recorder and a genuinely-all-public program are
+indistinguishable from the counter alone. `CRYO_VIS_AUDIT=1` now emits
+`VIS-RECORD <0|1> <qualified>` per recorded verdict, and `VIS-PRIVATE <kind>` for
+every private candidate the fast path meets. Both are the control the earlier
+zero lacked. A probe project with a cross-module `private function` is the
+end-to-end control; it must appear in the audit, and it does.
+
+**Two corrections to the model, both found by that control:**
+
+1. **Top-level declarations are PUBLIC BY DEFAULT** (`parser.cryo:405`,
+   deliberate and commented); you opt out with `private`. §3.1 says the default
+   is module-private. The spec and the parser disagree, and the first probe —
+   written to the spec — silently tested nothing. **§9 Q7** records the
+   decision this needs. Nothing in §8.1's numbers depends on it.
+
+2. **A bare free-function call never reaches `resolve_qualified_scoped`.** It is
+   bound by `try_pin_overload_mangled_callee` (`sema/call_resolver.cryo`), a
+   separate subsystem with its own scope model (`bare_candidate_scope`:
+   same-module / Imported / Prelude / Hidden). So the §8.1 gate — the entire
+   subject of §8.1 and §8.1b — **cannot see function calls at all**, and
+   `RC_VIS_REJECT_NOTPUBLIC` will stay 0 no matter how well visibility is
+   recorded. The probe's private function compiles, links, and *runs*
+   cross-module.
+
+**The free-function binder has its own copy of the §1 root cause**, plus one
+defect the type path does not have:
+
+- **D-A** — the single-overload branch pins its one candidate *without
+  consulting the tier at all*, the exact shape of `cands.length == 1` in
+  `decl_index`. A function whose module the use site never imported binds.
+- **D-B** — `bare_candidate_scope` has no visibility dimension, so an imported
+  module's `private` function classifies as `Imported` and binds.
+
+Measured (compiler building itself, `CRYO_RESOLVE_COUNTER=1`):
+
+| | events | distinct pairs |
+|---|---:|---:|
+| single-overload pins (no scope check) | 2,905 | — |
+| **D-A: owner not in scope** | **536** | **25** |
+| **D-B: bound to a private candidate** | **0** | 0 |
+| bare return-type answers, no scope input | 40 | — |
+
+D-B is now an *honest* zero: the positive control fires (1 event) on a probe
+that exercises it. The compiler and stdlib simply never call a cross-module
+`private` function by bare name.
+
+D-A's 536 events collapse to **6 distinct callees**, in two classes:
+
+| callee | events | pairs | class |
+|---|---:|---:|---|
+| `std::fmt::display::fmt_err` | 324 | 1 | compiler-synthesized |
+| `std::fmt::interp::fmt_append_lit` | 114 | 9 | compiler-synthesized |
+| `std::fmt::interp::fmt_new` | 65 | 9 | compiler-synthesized |
+| `Utils::Logger::cdebug` | 31 | 4 | **missing import** |
+| `Utils::Logger::set_compiler_debug` | 1 | 1 | **missing import** |
+| `Compiler::Diag::EditDistance::find_best_candidate` | 1 | 1 | **missing import** |
+
+The first class is not user churn: `stdlib/core/result.cryo` contains no
+textual `fmt_err` call, and the f-string helpers are injected by lowering into
+modules that never imported them. It is the same mechanism as §8.1b's class 2 —
+a call synthesized into a foreign scope — and it is fixed by §5.2/§6.3, not by
+adding imports.
+
+The second class is 6 import lines. **It was corroborated independently**: of
+the 26 files calling `cdebug`, 21 import `Utils::Logger`, 4 do not — exactly the
+4 flagged — and the 5th non-importer is `logger.cryo` itself, which the audit
+correctly excludes as same-module. No false positives, no false negatives.
+
+**The 6 imports are applied, and the delta confirms the model.** Re-measured
+after adding them:
+
+| | before | after |
+|---|---:|---:|
+| D-A events | 536 | **503** |
+| D-A distinct pairs | 25 | **19** |
+| genuine-missing-import pairs | 6 | **0** |
+
+−33 events is exactly the count those 6 pairs carried, and every remaining pair
+is compiler-synthesized. **The entire user-code migration for D-A was 6 import
+lines.** What is left is one lowering defect, not corpus churn.
+
+**Two doors, and the count is a floor.** Free-function binding is not one
+function: `try_pin_overload_mangled_callee` pins the *symbol*, while
+`resolve_direct_call` supplies the *return type* by falling back to the
+program-wide bare `func_returns` map — which has no owner column, hence no
+scope input of any kind. Both are now instrumented (the second answers 40
+times, contributing no violations). They are still not provably the whole
+surface: 8 modules call `find_best_candidate` bare and none import
+`Compiler::Diag::EditDistance`, yet only one is flagged, so at least one more
+path types such a call. Treat 503 the way §8.3 treats B2 — a floor with a
+named instrument, not a total.
+
+**Consequence for sequencing.** §8.1b's revised order is still right about the
+cursor coming first, but its step 4 ("turn the gate on") is under-specified:
+there are **two** gates, in two subsystems, and turning on the `decl_index` one
+does nothing for function calls. D-A is the cheaper of the two — its migration
+is 6 import lines plus a lowering fix already on the roadmap — and unlike the
+type path it does **not** depend on the ambient cursor, because
+`bare_candidate_scope` already resolves against `current_module_ns()` at the
+call site and the measured attribution is clean.
+
 ### 8.2 Fallback inventory
 
 Measured hit counts, compiler building itself, 2026-08-03:
@@ -791,6 +906,28 @@ dispatch — the actual bulk of type-dependent resolution — is not counted.
 - **Q4** — Does `std::Range` survive? It works today only via the mechanism in
   §1. Either `stdlib/lib.cryo` re-exports it explicitly or it becomes an error
   with a suggestion — decided per name, deliberately.
+- **Q7 — is a top-level declaration public or private by default?** §3.1 says
+  module-private. The parser says **public**, deliberately and with a comment
+  (`parser.cryo:405`): "modules export their surface, and individual items can
+  opt out with the `private` keyword… matching the long-standing stdlib
+  convention where every free function is written without a `public` prefix."
+  Both are defensible; they cannot both be normative, and the disagreement is
+  invisible until visibility becomes a gate — a probe written to §3.1 tests
+  nothing on today's parser (§8.1c).
+
+  Cost of each answer, so the decision is not made by inertia:
+  - **Spec wins (default private):** every free function in stdlib and the
+    compiler intended as API needs an explicit `public`. Large, purely
+    mechanical, and it makes the export set (§3.2) something an author states
+    rather than something they inherit.
+  - **Parser wins (default public):** amend §3.1 and §3.2, and `private` becomes
+    the only visibility that carries information. No code churn. The export set
+    is then "everything not marked `private`", which is a weaker guarantee — a
+    new helper is exported by default, and forgetting `private` is silent.
+
+  This is a language decision, not a resolution one; it does not block §8.1c's
+  D-A work, whose entire migration is import statements.
+
 ### Decided 2026-08-03
 
 - **Q5 — a package root IS implicitly addressable.** `std::fs::path::Path`
