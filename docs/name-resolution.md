@@ -82,15 +82,30 @@ beyond where its answer is recorded.
 
 ### 3.1 Declarations
 
-Every declaration has a visibility: `public` or (default) module-private.
-`public` on an item means *other modules may name it*. It is not advisory.
+Every declaration has a visibility. A top-level declaration is **public by
+default**; `private` opts it out. `public` is accepted and is a no-op at top
+level, written where an author wants the export to be explicit.
+
+Visibility is not advisory in either direction: `private` on an item means
+*no other module may name it*, and that is enforced as a gate (§3.3).
+
+> **Decided 2026-08-04 (Q7).** Earlier revisions of this section specified the
+> opposite default. The parser has always defaulted to public
+> (`parser.cryo:405`), so the disagreement was invisible until visibility
+> became a gate — see §9. `private` is now the only visibility keyword that
+> carries information.
 
 ### 3.2 The export set
 
-A module's **export set** is exactly its `public` declarations. Nothing else
-about a module is nameable from outside it. There is no path — index, alias,
-fallback, or otherwise — by which a module-private declaration becomes
-reachable from another module.
+A module's **export set** is exactly its declarations not marked `private`.
+Nothing else about a module is nameable from outside it. There is no path —
+index, alias, fallback, or otherwise — by which a module-private declaration
+becomes reachable from another module.
+
+The known cost of this default: a new helper is exported the moment it is
+written, and forgetting `private` is silent. §3.3's gate is what makes
+`private` mean something when it *is* written; it does not and cannot recover
+an export set the author never stated.
 
 ### 3.3 Enforcement is a gate
 
@@ -292,6 +307,14 @@ feature it is implementing, so the mechanisms below are what carry it.
    nobody could see it growing — steps were added empirically and pruned only
    when someone noticed "0 hits across all builds." A gate converts "do not add
    fallbacks" from a principle into a build failure.
+
+   > **NOT YET WIRED (checked 2026-08-04).** `CRYO_RESOLVE_COUNTER` appears
+   > nowhere in `Makefile`, `scripts/`, or `.github/` — the gate is currently a
+   > statement in this document, which §7's own opening sentence says is not
+   > enough. Until a build step runs the counter and fails on a nonzero B1,
+   > every B1 figure in §8 is a snapshot taken by hand, and the cascade can
+   > regrow between snapshots exactly as it did before. Wiring it is cheap and
+   > blocks on no other phase.
 
 4. **An unstamped node is an ICE, never a fallback.** A path-bearing node that
    reaches a stage after `NameResolution` without a `Res` is an internal
@@ -1076,6 +1099,68 @@ recorded, so that measurement is available when the decision is taken.
 prelude was loaded. Derivation makes the set empty there. Verified on a probe
 project: 12 namespaces on a normal build, **0** under `--no-std`.
 
+### 8.2g This corpus CANNOT exercise the keystone (2026-08-04)
+
+The §5.2 keystone — explicit scope replacing the ambient cursor — was measured
+directly, and the result changes its sequencing: **the tree cannot tell a
+correct implementation from a broken one.**
+
+The instrument (`CRYO_SCOPE_PROBE`) runs at step 2c, the one place where the
+true scope is known because a caller set `home_module` explicitly. There the
+module-blind chain below 2c (3b canonical, 3c bare, 5 leaf index) is re-run and
+compared against the scoped answer. Full compiler build, serial codegen:
+
+| | events |
+|---|---:|
+| step 2c hits compared | 48,777 |
+| home **==** ambient cursor (proves nothing) | 35,407 |
+| **home ≠ ambient cursor** (the evidence) | **13,370** |
+| of those, leaf declared by >1 module | **1** |
+| both chains agreed | 48,777 |
+| blind chain binds a DIFFERENT type | **0** |
+| blind chain answers nothing | **0** |
+
+**Read the last three rows together or not at all.** Zero divergence is not
+evidence that scope-less resolution is safe. It is a fact about the corpus: in
+13,369 of 13,370 wrong-cursor resolutions there was exactly **one** candidate
+in the entire program, so no scope — right, wrong, or absent — could have
+changed the answer.
+
+Corroborated statically and independently: across `stdlib` and `compiler/src`
+there are **666** distinct type leaves and only **8** declared by more than one
+module (`Cursor` ×3; `Weak`, `Scope`, `JoinHandle`, `Frame`, `Executor`,
+`DiagSink`, `Command` ×2). Several live in `thread`/`process`/async modules a
+compiler build never loads, which is why the measured plural count is 1 rather
+than 8.
+
+Three consequences, in order of how much they cost if ignored:
+
+1. **The self-host fixed point is not a correctness gate for this change.**
+   Making the 49 scope-less `ResolutionContext` constructions explicit will
+   produce a bit-identical compiler. `make test` and both self-host halves will
+   pass whether the new scopes are right or wrong. Every gate this repo
+   currently has would stay green through a completely incorrect
+   implementation.
+2. **The conformance corpus is a PREREQUISITE for the keystone, not a
+   follow-up.** §7 already noted the tree contains zero prefix/interior paths;
+   this generalizes that to leaf collisions — the tree has essentially no
+   same-leaf ambiguity of any kind. The corpus must supply the collisions the
+   corpus-under-test lacks, and it must exist *before* step 2, or step 2 ships
+   unverified.
+3. **The keystone's justification is architectural, not bug-fixing.** No
+   miscompile is being fixed here on today's sources; what is being fixed is
+   that a wrong answer is *representable*. That is still worth doing — §7's
+   whole premise is that this subsystem regressed for years because nothing
+   could see it — but it should be argued on that basis rather than on a defect
+   count, and it means the change carries no user-visible payoff to point at.
+
+> **Instrument note.** The probe re-runs production lookups, which normally bump
+> the leaf-index and M1 tallies. `rc_suspend`/`rc_resume` in
+> `resolve_counter.cryo` suppress recording across the replay. Verified exact:
+> with the probe ON and OFF, `lookup_by_leaf calls` (49,528), `M1 calls`
+> (49,760) and step 2c (48,777) are identical. Any future instrument that
+> replays a lookup must do the same or it will inflate what it measures.
+
 ### 8.3 B2 is unmeasured
 
 Only the assoc-type projection (62) is instrumented. Sema's method and trait
@@ -1097,27 +1182,27 @@ dispatch — the actual bulk of type-dependent resolution — is not counted.
 - **Q4** — Does `std::Range` survive? It works today only via the mechanism in
   §1. Either `stdlib/lib.cryo` re-exports it explicitly or it becomes an error
   with a suggestion — decided per name, deliberately.
-- **Q7 — is a top-level declaration public or private by default?** §3.1 says
-  module-private. The parser says **public**, deliberately and with a comment
-  (`parser.cryo:405`): "modules export their surface, and individual items can
-  opt out with the `private` keyword… matching the long-standing stdlib
-  convention where every free function is written without a `public` prefix."
-  Both are defensible; they cannot both be normative, and the disagreement is
-  invisible until visibility becomes a gate — a probe written to §3.1 tests
-  nothing on today's parser (§8.1c).
+### Decided 2026-08-04
 
-  Cost of each answer, so the decision is not made by inertia:
-  - **Spec wins (default private):** every free function in stdlib and the
-    compiler intended as API needs an explicit `public`. Large, purely
-    mechanical, and it makes the export set (§3.2) something an author states
-    rather than something they inherit.
-  - **Parser wins (default public):** amend §3.1 and §3.2, and `private` becomes
-    the only visibility that carries information. No code churn. The export set
-    is then "everything not marked `private`", which is a weaker guarantee — a
-    new helper is exported by default, and forgetting `private` is silent.
+- **Q7 — a top-level declaration is PUBLIC by default.** The parser wins;
+  §3.1 and §3.2 are amended. `private` is the only visibility keyword that
+  carries information, and `public` at top level is an explicit no-op.
 
-  This is a language decision, not a resolution one; it does not block §8.1c's
-  D-A work, whose entire migration is import statements.
+  Consequences, recorded so they are not rediscovered as bugs:
+  - **Zero code churn.** The alternative (default private) would have required
+    an explicit `public` on every stdlib and compiler free function intended
+    as API.
+  - **The export set is inherited, not stated.** A new helper is exported the
+    moment it is written; forgetting `private` is silent. This is the accepted
+    cost — §3.3's gate enforces `private` where it appears, and no gate can
+    recover an intent the author never wrote.
+  - **Probes must say `private` explicitly.** A test written to the old §3.1
+    exercises nothing (§8.1c, and the D-B zero in §8.1's table depends on this
+    control firing).
+  - `RC_VIS_REJECT_NOTPUBLIC` staying at 0 is therefore *expected* for the
+    current tree, and is not evidence about the gate either way. The reason it
+    cannot fire is §8.1c — function calls never reach that gate — not the
+    default.
 
 ### Decided 2026-08-03
 
