@@ -12,6 +12,7 @@ import Compiler::Diag::{
 };
 import Compiler::Resolver::{ SymbolStr, InternTable };
 import Compiler::ModuleGraph;
+import Compiler::ResolveCounter;
 import Compiler::Lex;
 import Compiler::Lex::Lexer;
 import Compiler::ProjectConfig;
@@ -46,6 +47,18 @@ type struct ModuleLoader {
 
     // Already-loaded file paths (dedup)
     loaded_paths: string[];
+
+    // Normalized file path -> declared namespace, recorded as soon as a
+    // module's namespace is scanned - BEFORE recursing into its imports.
+    //
+    // A module is only added to the graph at the END of `discover_module`, so
+    // inside an import cycle the target is mid-load and `find_module_by_path`
+    // cannot see it yet.  The dependency edge then silently degraded to the
+    // raw import path (`collections::str` instead of `std::collections::str`),
+    // and `ns_imports` answered "not imported" ever after for a module that
+    // plainly imports it.  This map is what makes the edge resolvable while
+    // the target is still on the loading stack.
+    scanned_ns: HashMap<string, string>;
 
     // Pre-scanned namespace -> file_path map.
     // Built by scan_all_project_files() before discovery begins.
@@ -99,6 +112,7 @@ type struct ModuleLoader {
             extra_roots:   extra_roots,
             loading: [],
             loaded_paths:  [],
+            scanned_ns:    HashMap<string, string>::new(),
             ns_map:        HashMap<string, string>::new(),
             lsp_override_path:    "",
             lsp_override_content: "",
@@ -573,6 +587,12 @@ type struct ModuleLoader {
         mut info: ModuleInfo = ModuleInfo::with_namespace(
             mod_name, file_path, mod_name);
 
+        // Publish this module's namespace BEFORE recursing into its imports.
+        // Inside a cycle the recursion comes back around and asks for this
+        // module's namespace while it is still mid-load; without this the
+        // dependency edge degrades to the raw import path.  See `scanned_ns`.
+        this.scanned_ns.insert(norm_path, mod_name_str);
+
         // Directory of the current file, used to resolve bare sub-module
         // names (e.g., `public module Commands;` in src/CLI/_module.cryo
         // should find src/CLI/Commands.cryo).
@@ -661,10 +681,35 @@ type struct ModuleLoader {
             if (dep_idx >= 0) {
                 info.add_dependency(graph.modules[dep_idx].name);
             } else {
-                // Fallback: use raw import path (should not happen if
-                // discover_module succeeded)
-                const dep_name: SymbolStr = intern.intern(import_path);
-                info.add_dependency(dep_name);
+                // Not in the graph yet.  Inside an import cycle that is
+                // NORMAL, not an anomaly: the target is on the loading stack
+                // and is only added to the graph when its own discovery
+                // finishes.  Its namespace is already known, so take it from
+                // `scanned_ns` rather than degrading the edge to the written
+                // import path - which is what made `ns_imports` answer "not
+                // imported" for 59% of the visibility-gate blast radius.
+                const scanned: string =
+                    match (this.scanned_ns.get(&resolved.to_ascii_lower())) {
+                        Option::Some(ns) => { ns }
+                        Option::None     => { "" }
+                    };
+                if (scanned.length() > 0) {
+                    // A VISIBILITY edge, deliberately not a dependency edge.
+                    // Reaching here means the target is mid-load, i.e. this
+                    // import closes a cycle - so it cannot be an ordering
+                    // constraint, and recording it as one makes `compute_order`
+                    // fail with E0501 across the whole program (measured).
+                    // The same rule the loader already applies to `public
+                    // module` and to brace-list items: what a module can SEE
+                    // is not what must be COMPILED FIRST.
+                    info.add_imported_namespace(intern.intern(scanned));
+                } else {
+                    // Genuinely unknown: keep the written path so the edge is
+                    // not lost outright.
+                    ResolveCounter::rc_path_audit("EDGE-FALLBACK",
+                        intern.resolve(info.name), import_path, resolved);
+                    info.add_dependency(intern.intern(import_path));
+                }
             }
         }
 
@@ -693,6 +738,16 @@ type struct ModuleLoader {
                 if (by_path >= 0) {
                     info.add_imported_namespace(graph.modules[by_path].name);
                     continue;
+                }
+                // Mid-load inside a cycle - same case as the dependency edge
+                // above; the namespace is known even though the graph entry
+                // is not written yet.
+                match (this.scanned_ns.get(&item_resolved.to_ascii_lower())) {
+                    Option::Some(ns) => {
+                        info.add_imported_namespace(intern.intern(ns));
+                        continue;
+                    }
+                    Option::None => { }
                 }
             }
             // Not a file on disk: it may already be in the graph under the
@@ -726,7 +781,21 @@ type struct ModuleLoader {
                 if (!this.discover_module(intern, graph, sink, sub_resolved, debug)) {
                     success = false;
                 }
-                // NO add_dependency here; submodules are not real deps
+                // NO add_dependency here; submodules are not real deps.
+                // Record the target's own namespace though - discovery already
+                // knows it, and dropping it here is what forced the prelude's
+                // set to be hand-transcribed into a constant in `decl_index`.
+                const sub_idx: i64 = graph.find_module_by_path(sub_resolved);
+                if (sub_idx >= 0) {
+                    info.add_submodule(graph.modules[sub_idx].name);
+                } else {
+                    // Mid-load (cycle): the graph entry is not written yet, but
+                    // the namespace is known.  Same case as the import edge.
+                    match (this.scanned_ns.get(&sub_resolved.to_ascii_lower())) {
+                        Option::Some(ns) => { info.add_submodule(intern.intern(ns)); }
+                        Option::None     => { }
+                    }
+                }
             }
         }
 

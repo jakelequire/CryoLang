@@ -351,7 +351,7 @@ including brace lists; re-runnable):
 | Class | Pairs | What it actually is |
 |---|---:|---|
 | Source **does** import it; `ns_imports` disagrees | **772 (68%)** | **Bug.** Brace-list imports (`import A::B::{ X, Y };`) do not register dependency edges for `A::B::X`. Dominated by `Compiler::AST::Expression`, `Compiler::Codegen::LLVMTypes`, `Compiler::AST::Declaration` — all brace-imported. |
-| Implicit runtime dependency | **~318 (28%)** | **Omission.** `std::alloc::allocator` (157), `std::alloc::layout` (58), `std::core::ptr` (50), `std::collections::{hashmap,str,string}` (53). The compiler injects references to these for any heap type, f-string, or allocation. `seed_prelude_namespaces` (`decl_index.cryo:1245`) is a **hardcoded list of 12 namespaces** that omits every one of them. |
+| Implicit runtime dependency | **~318 (28%)** | **Omission.** `std::alloc::allocator` (157), `std::alloc::layout` (58), `std::core::ptr` (50), `std::collections::{hashmap,str,string}` (53). The compiler injects references to these for any heap type, f-string, or allocation. The prelude set (12 namespaces) omits every one of them — it was a hardcoded list here, and is derived from `stdlib/prelude.cryo` as of §8.2e; the omission is the same either way, because the prelude source does not name them. |
 | Genuinely missing import | **~20 (2%)** | Add the import. |
 
 **Reading: enforcing visibility is feasible**, but the second class is not what
@@ -376,10 +376,12 @@ Re-measured:
 | of those, GENUINE | 359 | 359 |
 
 **Class 2 is NOT a prelude gap — it is lost use-site attribution.** The
-hardcoded `seed_prelude_namespaces` list turns out to mirror `stdlib/prelude.cryo`
+`seed_prelude_namespaces` list turns out to mirror `stdlib/prelude.cryo`
 exactly, so nothing is missing from it, and the prelude's own doc comment is
-explicit that adding names has a cost. Two measurements identify the real
-mechanism:
+explicit that adding names has a cost. (That list is no longer hardcoded — it is
+derived from the prelude source as of §8.2e, which is what makes "mirrors it
+exactly" true by construction rather than by inspection.) Two measurements
+identify the real mechanism:
 
 - A module whose entire content is `public function open_fn() -> i32 { return 1; }`
   — no types, no strings, no heap — still logs **64 violation events** against
@@ -583,6 +585,190 @@ Two readings matter for sequencing:
   express what the source needs today. It is a missing *capability*
   (per-item aliasing, re-export), and the capability must ship before the
   fallback is removed — otherwise it gets re-added under pressure.
+  **Superseded by §8.2c**, which resolved those 456 and found they are not a
+  missing capability: every one is an import path with `std::` dropped.
+
+### 8.2c Rule-6 path churn, measured (2026-08-03) — the migration is ~1 edit
+
+§5.1 ("first segment resolves in scope, the remainder is rooted") is what
+deletes the five substring matchers, and its cost was the last unmeasured
+number in Phase 0: every partially-qualified path whose prefix is not genuinely
+in scope becomes an error needing an import.
+
+**Method.** M1, M2 and M5 emit one `PATH-HIT` line per *accepted path* under
+`CRYO_PATH_AUDIT=1`, plus the compiler's own module→visible-namespace table
+(`PATH-SCOPE`) and prelude set (`PATH-PRELUDE`). Emitting at the decision, not
+inside the matcher, is essential: M1's 49,607 raw hits are probes inside a
+per-candidate loop, so that number cannot answer "how many written paths need
+an import" — only one event per accepted path can. Reachability is then the
+compiler's own (`ns_imports` + prelude + own namespace), not a regex over
+`import` lines, which cannot see brace-list items or the prelude.
+
+The rule-6 walk is forced, which makes the classification exact rather than
+heuristic. For written `w0::…::wn::leaf` binding to canonical `r0::…::rm::leaf`,
+`w0` must bind to a module M and `w1..wn` walk down from it; since the answer is
+`r`, that succeeds only when `w` is a `::`-suffix of `r`, and M is then exactly
+`r[:m-n]`. So there is one question per event: **is that ancestor in scope at
+the use site?**
+
+72,242 use-site path events (1,553 distinct) and 456 import-path events:
+
+| class | events | distinct | disposition |
+|---|---:|---:|---|
+| ancestor already in scope | 69,757 | 1,403 | legal as written |
+| fully-rooted path, root not an import edge | 2,190 | 79 | zero churn (see below) |
+| ambient-cursor artifacts | 267 | 67 | not real (see below) |
+| **abbreviation, ancestor not in scope** | **28** | **4** | **the whole use-site migration** |
+| **UNWALKABLE — needs rewrite or re-export** | **0** | **0** | **none exists** |
+| abbreviated import paths | 456 | 58 | mechanical, one rule |
+
+Four results, in descending order of consequence:
+
+1. **Nothing in the tree needs a re-export. `public import` is not a
+   prerequisite.** Zero paths have a PREFIX or INTERIOR shape — no source
+   anywhere writes `Lib::Widget` for a `Lib::Helper::Widget`. That hazard is
+   real in the *language* (§8.2a documents how the fallbacks cover for it) but
+   the corpus never exercises it. This **contradicts the sequencing claim that
+   D1 must land before the fallbacks are deleted**: on this corpus the
+   fallbacks can be deleted first, and D1 stands on its own merits.
+2. **The use-site migration is one module.** `std::sys` writes
+   `syscall::sys_callN` while importing only `std::ffi::libc`; the four
+   distinct paths are one missing `import std::sys::syscall;`. Because
+   `std::sys::syscall` is a *submodule* of `std::sys`, even this reduces to a
+   single design decision: **does a parent module implicitly bind its
+   submodules?** If yes, use-site churn is **zero**.
+3. **The 456 M5 hits are one mechanical rule, not a missing capability.** Every
+   one is an import path with `std::` dropped (`import core::option;` for
+   `std::core::option`) — 58 distinct modules, no other pattern. Under the Q5
+   decision below these are the migration: `std` being addressable makes
+   `std::core::option` legal, but `core::option` still is not, because `core`
+   is not itself a root and nothing binds it. So all 456 get `std::` prefixed.
+   This supersedes §8.2b's reading of M5 as evidence for a capability gap.
+4. **The 79 fully-rooted paths are zero churn.** They are spellings like
+   `std::fs::path::Path` and `Utils::Logger::Logger` whose required ancestor is
+   just the package root. No design makes a fully-rooted path illegal; Rust
+   keeps crate roots in the extern prelude for exactly this reason.
+
+Two defects surfaced from the audit rather than from the churn question:
+
+- **Dependency edges are recorded under the string the source wrote.** `import
+  alloc::allocator;` lands in the module graph as `alloc::allocator`, so
+  `ns_imports("std::core::primitives", "std::alloc::allocator")` answers *not
+  imported* for a module that plainly imports it, while the sibling `import
+  core::intrinsics;` in the same file is recorded resolved. Six edge targets are
+  affected. This is the same class as the brace-list bug in §8.1b — the visible
+  set under-reports — and it inflates both this measurement and the
+  visibility-gate blast radius. Repairing it in the classifier is what removed
+  `std::core::primitives`' `allocator::alloc` from the churn list.
+- **M5's second copy is dead.** `name_resolution.cryo`'s submodule suffix
+  fallback (the `M5-SUBMOD` site) records **0** hits across a full build; all
+  456 come from the first copy. It joins M3 and M4 in §8.2's deletable set.
+
+**Caveat on attribution.** The use-site of an M1 event is
+`Resolver.current_module`, the ambient cursor §5.2 exists to remove — so it
+names the module being *processed*, not the one that wrote the path. 267 events
+(67 distinct) prove it directly: they report a stdlib use site for a
+`Compiler::`/`CLI::` path, and stdlib cannot depend on the compiler. They are
+excluded above. This does not weaken results 1, 3 or 4, which do not depend on
+the use site at all; it means result 2 is an *upper* bound on use-site churn.
+
+### 8.2d Cycle imports lost their namespace (2026-08-03) — 59% of the gate
+
+Found while auditing §8.2c, not while looking for it. **The visibility-gate
+blast radius fell 35,672 → 14,444 (-59.5%) with no change to what the compiler
+resolves.**
+
+`discover_module` adds a module to the graph at the *end* of its own
+discovery, but returns early when the target is already on the loading stack —
+which is the normal case inside an import cycle, and the early return says so
+("the topological sort handles actual ordering"). The caller, however, needs
+the target's namespace *immediately*, to record the dependency edge:
+
+```
+discover_module(resolved)                  // returns true; graph entry not written yet
+const dep_idx = graph.find_module_by_path(resolved)   // -> -1
+… fallback: add_dependency(intern(import_path))       // the WRITTEN path
+```
+
+So an import that closes a cycle recorded its edge under the string the source
+wrote. `std::collections::string` imports `alloc::allocator`, and the edge went
+in as `alloc::allocator` — while `core::intrinsics` **in the same file**, not in
+a cycle, went in resolved as `std::core::intrinsics`. `ns_imports` then answered
+*not imported* forever after for a module that plainly imports it. Six edge
+targets, and 21,168 of the 35,672 gate rejections.
+
+**Fix.** Publish each module's namespace into a `path -> namespace` map as soon
+as it is scanned — before recursing into its imports, so the recursion can see
+it — and consult that map when the graph lookup misses.
+
+**The edge must be a VISIBILITY edge, not a dependency edge.** Recording it as
+a dependency first, which is the obvious reading of the code being fixed, put
+every module in the program into one E0501 cycle. That is not a bug in the fix;
+it is the fix telling the truth. Reaching this branch *means* the import closes
+a cycle, so it cannot also be an ordering constraint. The raw-path edges were
+tolerable only because they were **inert** — they matched no module name, so
+`compute_order()` never saw them while `ns_imports` never matched them either.
+Resolving them makes them real, and they must land on the side that carries
+visibility. This is §8.1b's rule (`visibility edges ≠ dependency edges`)
+arriving a second time, by a different road.
+
+Two readings worth keeping:
+
+- **A silently-degraded edge is worse than a missing one.** It looked like a
+  recorded dependency and answered every visibility question wrongly, for
+  years, with no diagnostic. The `should not happen` comment on the fallback
+  was load-bearing documentation that was simply false.
+- **The remaining 14,444 are all `namespace not reachable`; `candidate not
+  public` is still exactly 0.** Visibility is recorded for types
+  (`set_type_visibility`, 5 sites) but nothing records it for *functions*, so
+  `is_candidate_public` cannot reject one. The gate's blast radius is entirely
+  a reachability question today, and §8.1's "is the migration mechanical?"
+  cannot be answered for functions until function visibility is recorded at
+  all.
+
+### 8.2e The prelude is derived, not transcribed (2026-08-03)
+
+`seed_prelude_namespaces` was a hardcoded list of 12 namespaces whose own doc
+comment said **"KEEP IN SYNC if the prelude's `public module` set changes"** —
+a constant that had to be hand-maintained against a source file. §8.1b already
+noted it mirrors `stdlib/prelude.cryo` exactly; that is precisely what makes it
+a transcription rather than a design.
+
+The comment justified it: prelude entries "arrive as `public module`
+SUBMODULES of the prelude, which the loader does NOT record as dependency
+edges, so they can't be derived from the graph." The first half is true and
+must stay true — a `public module` dependency edge recreates the false cycles
+`compute_order()` avoids (§8.1b, and again in §8.2d). The conclusion no longer
+follows. The loader **does** discover those submodules; it simply discarded the
+result:
+
+```
+if (sub_resolved.length() > 0) {
+    if (!this.discover_module(...)) { success = false; }
+    // NO add_dependency here; submodules are not real deps
+}
+```
+
+The namespace is in hand at that line and was dropped on the floor.
+
+**Change.** `ModuleInfo.submodules` records each `public module` target's
+resolved namespace, and `instance.cryo` derives the prelude set by reading
+`std::prelude`'s entry off the graph. `stdlib/prelude.cryo` becomes the single
+source of truth. Derived set verified **set-equal** to the 12 it replaces, so
+behavior is preserved by construction.
+
+**`submodules` is deliberately neither a dependency edge nor a visibility
+edge.** Recording it grants nothing and changes no resolution input. Making
+`public module` also feed `ns_imports` — i.e. treating it as a real re-export —
+is the `public import` / D1 question, and §8.2c showed the fallbacks are
+currently covering for that gap. It should be decided and measured on its own
+terms, not acquired as a side effect of deleting a constant. The data is now
+recorded, so that measurement is available when the decision is taken.
+
+**Latent bug fixed for free.** The old seeding ran *unconditionally*, so a
+`--no-std` build registered 12 standard-library namespaces as "prelude" when no
+prelude was loaded. Derivation makes the set empty there. Verified on a probe
+project: 12 namespaces on a normal build, **0** under `--no-std`.
 
 ### 8.3 B2 is unmeasured
 
@@ -605,3 +791,29 @@ dispatch — the actual bulk of type-dependent resolution — is not counted.
 - **Q4** — Does `std::Range` survive? It works today only via the mechanism in
   §1. Either `stdlib/lib.cryo` re-exports it explicitly or it becomes an error
   with a suggestion — decided per name, deliberately.
+### Decided 2026-08-03
+
+- **Q5 — a package root IS implicitly addressable.** `std::fs::path::Path`
+  resolves with no `import std;`, the way Rust keeps crate names in the extern
+  prelude. A fully-qualified path always works. This makes §8.2c's 79
+  fully-rooted spellings legal with no edit.
+
+  It does **not** rescue an abbreviated path: `core::option` is still an error,
+  because `core` is not itself a root and nothing binds it. Roots are
+  addressable; interior segments are not.
+
+- **Q6 — a parent module does NOT implicitly bind its submodules.** `std::sys`
+  must write `import std::sys::syscall;` to say `syscall::sys_call3`. A
+  submodule is an ordinary module and reaching it takes an import like any
+  other, so §4's rib chain gains no tier and "nothing is reachable that is not
+  on the chain" stays literally true. Cost: one `import` in
+  `stdlib/sys/_module.cryo`.
+
+- **An import binds its leaf name.** `import std::core::mem;` binds `mem`, so
+  `mem::swap(a, b)` is rule-6-legal. This is what keeps §8.2c's 22,536
+  in-scope abbreviations legal, and it is why the migration is import
+  statements rather than call sites.
+
+**Net rule-6 migration, fully determined:** 456 import statements re-rooted
+with `std::`, plus one import added to `stdlib/sys/_module.cryo`. Zero path
+rewrites, zero re-exports.
