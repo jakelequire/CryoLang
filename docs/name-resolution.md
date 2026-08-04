@@ -302,6 +302,44 @@ feature it is implementing, so the mechanisms below are what carry it.
    are all bound by this. The same lesson was already learned once in the async
    work, where a synthesized call had to set its own `arg_binding`.
 
+### 7.2a The self-host gate was checking 1% of the IR on Linux — FIXED 2026-08-04
+
+The self-host is the gate this work leans on hardest: "a name binding
+differently shows up as a broken fixed point even when tests pass." That claim
+was only true on one of the two halves.
+
+`selfhost-check.py` verified the **windows** fixed point with
+`_compare_ir_trees`, which walks every per-module `.ll` under the stage root —
+243 modules, 103.6 MB. The **linux** half compared exactly one file,
+`self/s3/cryo.ll` against `self/s4/cryo.ll`: the `llvm-link` artifact, **953,674
+bytes against 104.4 MB of per-module IR**. A name that bound differently in any
+of the other modules did not have to show up there, and the run still printed
+`✓ FIXED POINT OK`.
+
+Nothing was wrong with the *stages*; the two halves simply verified
+non-comparable things, and the Linux number was small enough that the
+discrepancy was visible in the report all along (`IR size: 953,674` next to
+windows' `103,578,577`) without being read.
+
+**Fix.** The linux verification now runs `_compare_ir_trees(S3_DIR, S4_DIR)` as
+well, and a per-module mismatch fails the gate even when the linked artifact
+matches. The linked `cryo.ll` check is kept — it is a cheap whole-program
+check — but it is no longer the *only* one. Linux stages already write
+per-module IR without `--emit-llvm`, so no stage command changed; if that ever
+regresses, `_compare_ir_trees` returns "no per-module IR found" and the gate
+**fails loudly** rather than passing on one file.
+
+Verified against the already-built stage trees before the change was trusted:
+match → `(True, (243, 104400627))`, mismatch → `(False, 'CLI.ll')`, missing →
+`(None, 'no per-module IR found …')`; all three are handled.
+
+> **The general lesson, and it applies to every gate in §7.2.** A gate that
+> cannot fail is indistinguishable from a gate that passes. Two gates that are
+> supposed to check the same property must be checked *against each other*, not
+> just against their own output. This one was asymmetric for as long as the
+> windows half has existed, and the whole point of §7 is that discipline does
+> not survive deadline — so the gates have to be audited like code.
+
 ### 7.3 Buckets
 
 The counter classifies every instrumented lookup into three buckets. The
@@ -562,20 +600,101 @@ function: `try_pin_overload_mangled_callee` pins the *symbol*, while
 `resolve_direct_call` supplies the *return type* by falling back to the
 program-wide bare `func_returns` map — which has no owner column, hence no
 scope input of any kind. Both are now instrumented (the second answers 40
-times, contributing no violations). They are still not provably the whole
+times, contributing no violations). ~~They are still not provably the whole
 surface: 8 modules call `find_best_candidate` bare and none import
 `Compiler::Diag::EditDistance`, yet only one is flagged, so at least one more
-path types such a call. Treat 503 the way §8.3 treats B2 — a floor with a
-named instrument, not a total.
+path types such a call.~~ **That inference is withdrawn — see §8.1d.** Treat 503
+the way §8.3 treats B2 — a floor with a named instrument, not a total — but the
+one piece of positive evidence for a third door turned out to be a measurement
+artifact, not a finding.
 
 **Consequence for sequencing.** §8.1b's revised order is still right about the
 cursor coming first, but its step 4 ("turn the gate on") is under-specified:
 there are **two** gates, in two subsystems, and turning on the `decl_index` one
-does nothing for function calls. D-A is the cheaper of the two — its migration
+does nothing for function calls. ~~D-A is the cheaper of the two — its migration
 is 6 import lines plus a lowering fix already on the roadmap — and unlike the
 type path it does **not** depend on the ambient cursor, because
 `bare_candidate_scope` already resolves against `current_module_ns()` at the
-call site and the measured attribution is clean.
+call site and the measured attribution is clean.~~ **Both halves of that last
+sentence are wrong; §8.1d replaces them.** D-A's attribution is *not* clean —
+64% of its remaining events are ambient-cursor false positives — and its real
+residue is not import lines at all.
+
+### 8.1d D-A, fully attributed (2026-08-04) — 64% is the cursor, the rest is one lowering defect
+
+§8.1c left D-A at "503 events, 19 pairs, all compiler-synthesized" and drew two
+conclusions from it. Both were wrong, and the residue is smaller and differently
+shaped than they implied. Each result below is *entailed* by the source plus the
+audit's own early-exit, not inferred from a count.
+
+**1. The third-door evidence does not exist.** §8.1c reasoned that "8 modules
+call `find_best_candidate` bare and none import `Compiler::Diag::EditDistance`,
+yet only one is flagged" ⇒ some further path must type such a call. Re-checked
+against the tree: there are **6 files with 7 bare calls**, and **all 6 import
+`EditDistance`** — five through *multi-line* brace lists
+(`import Compiler::Diag::{\n  …, EditDistance\n};`) and one through the plain
+import added in `49f5e6eb`. The original check was a single-line regex, which
+cannot see a brace list that wraps. The audit had **no false negatives**: the one
+file it flagged was the one file genuinely missing the import.
+
+> **Method landmine, and the second time this exact one has bitten.** §8.1's
+> class 1 (772 pairs, 68%) was also a brace-list blind spot in a textual import
+> classifier. Any regex over `import` lines must flatten whitespace first.
+> Prefer the compiler's own `ns_imports` (as §8.2c does) over a regex.
+
+**2. `fmt_err` — 324 of the 503 events (64%) — is not a violation.** It is
+`private function fmt_err` in `stdlib/fmt/display.cryo` (`namespace
+std::fmt::display`), and the only references to that name anywhere in the tree
+are its definition and its 8 call sites **in that same file**, inside
+`implement<T, E> trait Display for enum Result<T, E>`. A same-module call is
+legal under §4 whatever its visibility — and `audit_fnbind_candidate` agrees: it
+returns early on `c_ns.id == use_ns.id`. So the event can only have fired with a
+`use_ns` that is not the writing module, and the audit indeed blames
+`std::core::result` — the module that owns `Result`, i.e. the one the cursor is
+parked on while that generic impl body is specialized.
+
+**This is the ambient cursor (§2b/§5.2), inside the binder §8.1c said the cursor
+did not affect.** `audit_fnbind_candidate` and `bare_candidate_scope` both take
+their use site from `this.ctx.current_module_ns()`, which is
+`CompilationContext.namespace_str` — the module *currently being processed*. The
+free-function lane has the same defect as the type lane, and its measured
+attribution is no cleaner.
+
+**3. The real D-A residue is 179 events from one mechanism.** The remaining
+`fmt_append_lit` (114) and `fmt_new` (65) are genuine out-of-scope binds, and
+their cause is exact rather than statistical:
+
+- the parser desugars every `f"…"` into bare `fmt_new` / `fmt_append_lit` /
+  `fmt_append_*` calls (`parser/expr_parser.cryo:813`, `:963`, via `fstr_call0`
+  / `fstr_call2`, each of which builds a plain `IdentifierNode`);
+- `AutoImport` injects `import std::fmt::interp` for any module that used one —
+  **except** when the module's namespace starts with `std::`
+  (`passes/pass_registry.cryo:1002`), or under `--no-std`;
+- **exactly 9 stdlib files contain an f-string, and none imports
+  `std::fmt::interp`.** That is a one-to-one match with the 9 distinct pairs
+  measured for each helper.
+
+**The stdlib skip cannot simply be deleted.** `std::core::primitives` is one of
+the 9, and `std::fmt::interp` transitively depends on core; the skip's comment
+("prevents circular imports when compiling the prelude or any module the prelude
+re-exports") is load-bearing. So the fix is not an import, and it is not an
+allowlist — it is **§7.2 mechanism 4**: the synthesizer knows exactly which
+function it is referring to, so it must construct the node already resolved,
+rather than emitting a bare name for a later stage to re-bind by string. Today
+that means the parser emitting the rooted path it means; after §6.3 it means
+stamping `Res` directly.
+
+**Revised reading of D-A:**
+
+| class | events | disposition |
+|---|---:|---|
+| `fmt_err` — same-module, cursor artifact | 324 | not a violation; retired by §5.2 |
+| f-string helpers synthesized into stdlib | 179 | real; retired by §7.2 mechanism 4 |
+| genuinely missing imports | 0 | fixed in `49f5e6eb` |
+
+So D-A's migration is **zero import lines** beyond the six already applied, and
+turning the call-lane gate on requires the *same* keystone as the type lane —
+not, as §8.1c claimed, a cheaper independent path.
 
 ### 8.2 Fallback inventory
 
@@ -759,6 +878,8 @@ Four results, in descending order of consequence:
    `std::core::option` legal, but `core::option` still is not, because `core`
    is not itself a root and nothing binds it. So all 456 get `std::` prefixed.
    This supersedes §8.2b's reading of M5 as evidence for a capability gap.
+   **456 is the compiler-build-visible subset; the whole-tree count is 1,011 —
+   see the correction under §9's "Net rule-6 migration".**
 4. **The 79 fully-rooted paths are zero churn.** They are spellings like
    `std::fs::path::Path` and `Utils::Logger::Logger` whose required ancestor is
    just the package root. No design makes a fully-rooted path illegal; Rust
@@ -840,6 +961,76 @@ Two readings worth keeping:
   a reachability question today, and §8.1's "is the migration mechanical?"
   cannot be answered for functions until function visibility is recorded at
   all.
+
+### 8.2f Rule-6 migration LANDED (2026-08-04) — M5 retired, and what it exposed
+
+The migration §9 determined is applied: **1,011 plain `import <path>;` statements
+re-rooted with `std::`** across 126 files (1,007 stdlib, 4 `compiler/src`, 0
+runtime), plus 6 in `tests/` and the one `import std::sys::syscall;` that Q6
+requires in `stdlib/sys/_module.cryo`. `legacy/` (159) is dead and
+`.claude/worktrees/` (625) is not built; neither is compiled.
+
+**Result — M5 is dead, by its own counter:**
+
+| | before | after |
+|---|---:|---:|
+| M5 import suffix fallback **calls** | 456 | **0** |
+| M5 import suffix fallback **hits** | 456 | **0** |
+| B1 total | 153,804 | 153,408 |
+
+Zero *calls*, not merely zero hits: no import path in the tree now needs a
+suffix search. Every other counter is unchanged within run-to-run drift
+(fast path 310,656; would-be-rejected 14,444; D-A 503), which is what a
+behaviour-neutral migration should look like. `make test` green (unit, 168
+compile-fail, 15 projects).
+
+**Finding 1 — the abbreviations were masking a real import cycle, and the
+stale pin turned that into a bootstrap trap.** With the migration applied, the
+*pinned* compiler (then 3 commits behind, at `259bb212`) failed to build stdlib:
+`[TopSort] Cycle detected! 42 of 154 modules placed`, rooted at
+`core/option.cryo` ↔ `core/result.cryo`, and — landmine 5 again — it printed
+`Project compilation failed (1 errors)` with **no diagnostic**. The same tree
+built clean with the HEAD-built compiler.
+
+The mechanism is §8.2d's, a third time. `option` and `result` genuinely import
+each other. Before `fd1f1750`, a cycle-closing import degraded its edge to the
+*written* path; `core::result` matched no module name, so `compute_order()`
+silently skipped it (`find_module_index(...) >= 0` guard) and the cycle was
+invisible. Spelling it `std::core::result` makes that degraded edge **match**,
+so the cycle becomes a hard E0501. The old behaviour was not correct — it was
+an accident of the abbreviation.
+
+> **Two lessons.** (a) A silently-degraded edge is worse than a missing one —
+> stated in §8.2d, and it has now cost time three times; the remaining
+> `EDGE-FALLBACK` branch is the last place it can still happen, and it is
+> instrumented. (b) **Repin before measuring anything.** A pin that predates the
+> fix under test makes a correct change look like a regression, and the failure
+> it produces points at the wrong subsystem entirely. §7's ordering (repin
+> first) is load-bearing, not hygiene.
+
+**Finding 2 — deleting M5 needs a diagnostic first; it is not pure dead-code
+removal.** M5 is dead, but the naive deletion produces *bad errors*, because two
+different subsystems consume an import path:
+
+- the **loader** resolves `core::option` on the filesystem to `./core/option.cryo`
+  and records the dependency edge under the file's real namespace. It does not
+  need M5 and does not care about the spelling.
+- **`process_import`** (`resolver/name_resolution.cryo`) needs the written path
+  to name a *graph module*, so it can pull that module's export set. That is the
+  only consumer M5 serves.
+
+Delete M5 and a stale abbreviation no longer errors at the import. It silently
+binds **nothing** — `find_module_index` misses, `get_exports` returns empty — and
+the user gets a scatter of downstream "undefined type" errors pointing at use
+sites, with nothing pointing at the import that caused them. That is strictly
+worse than today.
+
+So M5's removal is paired work: `process_import` must emit an E0500-family
+diagnostic *at the import* when the written path names no module, with the
+`suggest_module`-style "did you mean `std::core::option`?" note. The corpus
+entry that pins the deletion (§7.2 mechanism 2) is a negative test asserting
+exactly that diagnostic — and it cannot be written until the diagnostic exists.
+`tests/tests/negative/E0500_module_not_found.cryo` is the shape to follow.
 
 ### 8.2e The prelude is derived, not transcribed (2026-08-03)
 
@@ -951,6 +1142,26 @@ dispatch — the actual bulk of type-dependent resolution — is not counted.
   in-scope abbreviations legal, and it is why the migration is import
   statements rather than call sites.
 
-**Net rule-6 migration, fully determined:** 456 import statements re-rooted
-with `std::`, plus one import added to `stdlib/sys/_module.cryo`. Zero path
-rewrites, zero re-exports.
+**Net rule-6 migration, fully determined:** ~~456~~ **1,011** import statements
+re-rooted with `std::`, plus one import added to `stdlib/sys/_module.cryo`. Zero
+path rewrites, zero re-exports.
+
+> **Corrected 2026-08-04.** The 456 figure is a `CRYO_PATH_AUDIT` event count
+> from the compiler building *itself*, and a compiler build loads only the part
+> of the stdlib the compiler uses — no `net`, `json`, `tls`, `http2`, `random`,
+> `process`, `thread`. The whole-tree count, taken statically over every
+> `import <path>;` in `stdlib`, `compiler/src` and `runtime`, is **1,011
+> statements in 126 files across 97 distinct target modules** (1,007 in stdlib,
+> 4 in `compiler/src`, 0 in `runtime`). Nothing about the *shape* of the
+> migration changes — it is still one mechanical rule — only its size.
+>
+> **The rewrite is provably behaviour-identical.** M5 accepts a written path
+> when some module's name has it as a `::`-delimited suffix, taking the first
+> such module in graph order. Checked over all 97 paths: each has **exactly
+> one** suffix candidate in the whole tree, and it is always `std::<path>`. So
+> the static rewrite reproduces M5's answer by construction, and cannot be
+> ambiguous. Verified alongside: **0** brace-list imports need re-rooting, and
+> **0** of the rewrites produce a self-import.
+>
+> A measured event count and a corpus size answer different questions. Use the
+> audit to learn *which rule* applies; count the corpus statically to size it.
