@@ -246,6 +246,54 @@ public function rc_vis_violation(use_site: string, cand: string) -> void {
     fmt::eprintf("VIS-VIOLATION\t%s\t%s\n", use_site, cand);
 }
 
+/// Tri-state cache for `CRYO_PATH_AUDIT`: 0 unknown, 1 on, 2 off.
+mut g_path_audit: i32 = 0;
+
+function rc_path_audit_enabled() -> boolean {
+    if (g_path_audit == 0) {
+        match (env::var(Str::new("CRYO_PATH_AUDIT"))) {
+            Option::Some(_) => { g_path_audit = 1; }
+            Option::None    => { g_path_audit = 2; }
+        }
+    }
+    return g_path_audit == 1;
+}
+
+/// Log one QUALIFIED PATH that a namespace-suffix matcher resolved, to size
+/// the migration §5.1 ("first segment resolves in scope, remainder rooted")
+/// implies.  `docs/name-resolution.md` §9 / plan R4.
+///
+/// Emitted at the DECISION, not inside the matcher.  M1's raw hit count is
+/// probes-inside-a-loop (once per export candidate), so it cannot answer "how
+/// many written paths need an import" - only one event per accepted path can.
+///
+/// `written` is the path as the source spelled it; `resolved` is the canonical
+/// name it bound to.  The relationship between the two - exact, abbreviated
+/// suffix, or a shallower prefix needing a re-export - is what classifies the
+/// churn, and it is computed offline from these two strings rather than here,
+/// so the classification can be re-cut without a recompile.
+public function rc_path_audit(kind: string, use_site: string,
+                              written: string, resolved: string) -> void {
+    if (!rc_path_audit_enabled()) { return; }
+    fmt::eprintf("PATH-HIT\t%s\t%s\t%s\t%s\n", kind, use_site, written, resolved);
+}
+
+/// Dump one `module -> visible namespace` edge, so the offline classifier can
+/// ask the compiler's OWN reachability question ("is this first segment in
+/// scope here?") instead of re-deriving it with a regex over import lines,
+/// which cannot see the prelude or brace-list items.
+public function rc_path_scope(ns: string, visible: string) -> void {
+    if (!rc_path_audit_enabled()) { return; }
+    fmt::eprintf("PATH-SCOPE\t%s\t%s\n", ns, visible);
+}
+
+/// Dump one prelude namespace - in scope everywhere, so a path rooted at one
+/// needs no import no matter where it is written.
+public function rc_path_prelude(ns: string) -> void {
+    if (!rc_path_audit_enabled()) { return; }
+    fmt::eprintf("PATH-PRELUDE\t%s\n", ns);
+}
+
 // The five namespace-suffix matchers:
 public function rc_m1_call()               -> void { rc_bump(RC_M1_CALLS); }
 public function rc_m1_hit()                -> void { rc_bump(RC_M1_HITS); }

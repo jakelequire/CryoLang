@@ -1378,7 +1378,28 @@ type struct CompilerInstance {
         // (module_graph.cryo already imports DeclIndex).  Done once here, after
         // discovery, where every module's namespace + dependency edges are known
         // and before any pass calls the resolver.
-        ctx.decl_index.seed_prelude_namespaces(ctx.intern_table);
+        // Prelude re-export set, DERIVED from `stdlib/prelude.cryo`'s
+        // `public module` declarations rather than transcribed into a constant.
+        // The loader records each declaration's resolved namespace on the
+        // declaring module (`ModuleInfo.submodules`), so the prelude's own
+        // entry in the graph already carries exactly the set the source spells.
+        //
+        // Two things this fixes beyond the sync hazard: the list can no longer
+        // drift from the file it mirrors, and under `--no-std` it now comes out
+        // EMPTY - the old constant registered 12 std namespaces as "prelude"
+        // even when no prelude was loaded.
+        const prelude_ns_sym: SymbolStr = ctx.intern_table.intern("std::prelude");
+        mut prelude_set: SymbolStr[] = [];
+        for (mut pmi: u32 = 0; pmi < ctx.module_graph.modules.length; pmi++) {
+            const pm: ModuleInfo* = &ctx.module_graph.modules[pmi];
+            if (pm.namespace_name.id != prelude_ns_sym.id) { continue; }
+            for (mut psi: i64 = 0; psi < pm.submodules.length; psi++) {
+                prelude_set.push(pm.submodules[psi]);
+                ResolveCounter::rc_path_prelude(
+                    ctx.intern_table.resolve(pm.submodules[psi]));
+            }
+        }
+        ctx.decl_index.register_prelude_namespaces(prelude_set);
         for (mut imi: u32 = 0; imi < ctx.module_graph.modules.length; imi++) {
             const imi_info: ModuleInfo* = &ctx.module_graph.modules[imi];
             // What a module can SEE is its dependency edges PLUS the brace-list
@@ -1396,6 +1417,16 @@ type struct CompilerInstance {
             }
             ctx.decl_index.register_module_imports(
                 imi_info.namespace_name, &imi_visible);
+            // Same set, dumped for the §5.1 path-churn audit.  Emitted here
+            // rather than reconstructed offline so the classifier asks the
+            // compiler's own reachability question - a regex over `import`
+            // lines cannot see brace-list items or the prelude.
+            const imi_ns_str: string =
+                ctx.intern_table.resolve(imi_info.namespace_name);
+            for (mut si: i64 = 0; si < imi_visible.length; si++) {
+                ResolveCounter::rc_path_scope(
+                    imi_ns_str, ctx.intern_table.resolve(imi_visible[si]));
+            }
         }
 
         // Experimental gate: consuming a C++ vendor library (binding_source
