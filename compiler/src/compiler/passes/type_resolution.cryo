@@ -1058,7 +1058,7 @@ type struct TypeResolutionPasses {
                 // qualified-only (`cit::Vec2`).
                 if (!qualified_sym.equals(node.name) && node.binding_namespace.is_empty()) {
                     ctx.decl_index.register_name_mapping(node.name, qualified_sym);
-                    ctx.decl_index.set_type_visibility(qualified_sym, node.is_public);
+                    ctx.decl_index.set_decl_visibility(qualified_sym, node.is_public);
                 }
                 ctx.decl_index.register_methods_with_module(qualified_sym, node.methods, module_sym, ctx.intern_table, arena);
             }
@@ -1074,7 +1074,7 @@ type struct TypeResolutionPasses {
                 }
                 if (!qualified_sym.equals(node.name) && node.binding_namespace.is_empty()) {
                     ctx.decl_index.register_name_mapping(node.name, qualified_sym);
-                    ctx.decl_index.set_type_visibility(qualified_sym, node.is_public);
+                    ctx.decl_index.set_decl_visibility(qualified_sym, node.is_public);
                 }
                 ctx.decl_index.register_methods_with_module(qualified_sym, node.methods, module_sym, ctx.intern_table, arena);
             }
@@ -1090,7 +1090,7 @@ type struct TypeResolutionPasses {
                 }
                 if (!qualified_sym.equals(node.name)) {
                     ctx.decl_index.register_name_mapping(node.name, qualified_sym);
-                    ctx.decl_index.set_type_visibility(qualified_sym, node.is_public);
+                    ctx.decl_index.set_decl_visibility(qualified_sym, node.is_public);
                 }
                 ctx.decl_index.register_methods_with_module(qualified_sym, node.methods, module_sym, ctx.intern_table, arena);
             }
@@ -1106,7 +1106,7 @@ type struct TypeResolutionPasses {
                 }
                 if (!qualified_sym.equals(node.name) && node.binding_namespace.is_empty()) {
                     ctx.decl_index.register_name_mapping(node.name, qualified_sym);
-                    ctx.decl_index.set_type_visibility(qualified_sym, node.is_public);
+                    ctx.decl_index.set_decl_visibility(qualified_sym, node.is_public);
                 }
             }
             NodeKind::TraitDeclaration => {
@@ -1119,7 +1119,7 @@ type struct TypeResolutionPasses {
                 if (!qualified_sym.equals(node.name)) {
                     ctx.decl_index.register_name_mapping(node.name, qualified_sym);
                     // Traits are always public (mirrors ModuleTypeRegistry).
-                    ctx.decl_index.set_type_visibility(qualified_sym, true);
+                    ctx.decl_index.set_decl_visibility(qualified_sym, true);
                 }
                 // Register each trait method's return type on both the
                 // qualified and bare trait name so bound-aware dispatch
@@ -1194,6 +1194,20 @@ type struct TypeResolutionPasses {
                         ctx.decl_index.register_function_type_owned(
                             func.name, func_type_ref, q_name);
                         ctx.decl_index.register_name_mapping(func.name, q_name);
+                        // Same-leaf resolution needs a visibility verdict for
+                        // every candidate it can be handed, and until now only
+                        // TYPES recorded one - so `is_candidate_public` fell to
+                        // its permissive default for every function and could
+                        // never reject one (measured: 0 rejections for
+                        // non-public, docs/name-resolution.md §8.1 caveat).
+                        // A module still sees its own private functions; the
+                        // namespace comparison in resolve_qualified_scoped runs
+                        // before this verdict is consulted.
+                        ctx.decl_index.set_decl_visibility(q_name, func.is_public);
+                        if (ResolveCounter::rc_vis_audit_on()) {
+                            ResolveCounter::rc_vis_record(
+                                ctx.intern_table.resolve(q_name), func.is_public);
+                        }
                         const q_mangled: SymbolStr = ctx.decl_index.lookup_mangled_name(q_name);
                         if (q_mangled.is_valid()) {
                             ctx.decl_index.register_mangled_name(func.name, q_mangled);
@@ -2714,6 +2728,11 @@ type struct TypeResolutionPasses {
                             ctx.decl_index.register_intrinsic_function_type(
                                 node.name, i_func_type_ref, q_name);
                             ctx.decl_index.register_name_mapping(node.name, q_name);
+                            // Intrinsics are always public (IntrinsicDeclNode
+                            // carries no visibility); record it explicitly so
+                            // the verdict is stated rather than inherited from
+                            // `is_candidate_public`'s permissive default.
+                            ctx.decl_index.set_decl_visibility(q_name, true);
                             // Bare name also needs its own mangled entry.
                             ctx.decl_index.register_mangled_name(node.name, bare_mangled);
                             ctx.decl_index.register_overload_mangled_owned(

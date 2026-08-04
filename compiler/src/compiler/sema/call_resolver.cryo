@@ -2208,6 +2208,15 @@ type struct CallResolver {
         }
         if (overloads.length == 0) { return TypeRef::invalid(); }
         if (overloads.length == 1) {
+            // AUDIT ONLY - behavior deliberately unchanged.
+            // This is the free-function twin of decl_index's single-candidate
+            // fast path (spec §8.1): the sole overload is pinned without
+            // consulting `bare_candidate_scope` at all, so a function the use
+            // site never imported binds anyway.  Measure before gating.
+            ResolveCounter::rc_fnbind_single();
+            if (scoped_bare && owners.length > 0 && owners[0] != 0) {
+                this.audit_fnbind_candidate(owners[0]);
+            }
             mut unique_mangled: SymbolStr = di.lookup_overload_mangled(lookup_key, overloads[0]);
             if (!unique_mangled.is_valid()) { unique_mangled = di.lookup_mangled_name(lookup_key); }
             if (unique_mangled.is_valid()) { call.set_resolved_callee(unique_mangled); }
@@ -2269,6 +2278,7 @@ type struct CallResolver {
             if (tier_len != 1) { return TypeRef::invalid(); }
             const oi: i64 = tier_first;
             const owner: u32 = if (owners.length > oi) { owners[oi] } else { 0 };
+            if (owner != 0) { this.audit_fnbind_candidate(owner); }
             mut mangled: SymbolStr = SymbolStr::empty();
             if (owner != 0) {
                 mangled = di.lookup_overload_mangled_owned(lookup_key, overloads[oi], owner);
@@ -2288,6 +2298,7 @@ type struct CallResolver {
             const oi: i64 = matches[0];
             mut mangled: SymbolStr = SymbolStr::empty();
             if (scoped_bare && owners.length > oi && owners[oi] != 0) {
+                this.audit_fnbind_candidate(owners[oi]);
                 mangled = di.lookup_overload_mangled_owned(
                     lookup_key, overloads[oi], owners[oi]);
             }
@@ -2340,6 +2351,7 @@ type struct CallResolver {
             // bare ownership), so taking the first is exact.
             const oi: i64 = if (imported_owned.length == 1) { imported_owned[0] }
                             else { prelude_owned[0] };
+            this.audit_fnbind_candidate(owners[oi]);
             mut mangled: SymbolStr = di.lookup_overload_mangled_owned(
                 lookup_key, overloads[oi], owners[oi]);
             if (!mangled.is_valid()) {
@@ -2358,10 +2370,40 @@ type struct CallResolver {
         return TypeRef::invalid();
     }
 
+    /// AUDIT ONLY (spec §3.3, §4).  Classify a candidate the bare-call binder
+    /// is about to pin, against the two rules this binder does not enforce:
+    /// its owning module must be in scope, and it must be public.  Counts
+    /// only; the caller pins regardless.
+    audit_fnbind_candidate(&this, owner: u32) -> void {
+        const owner_sym: SymbolStr = SymbolStr::from_id(owner);
+        const di: DeclarationIndex* = this.ctx.decl_index;
+        const c_ns: SymbolStr = di.namespace_of(owner_sym, this.intern);
+        if (!c_ns.is_valid()) { return; }
+        const use_ns: SymbolStr = this.ctx.current_module_ns();
+        // A module always sees its own items, public or not (spec §4).
+        if (c_ns.id == use_ns.id) { return; }
+        mut kind: string = "";
+        if (!di.ns_imports(use_ns, c_ns) && !di.is_prelude_ns(c_ns)) {
+            ResolveCounter::rc_fnbind_single_hidden();
+            kind = "HIDDEN";
+        } else if (!di.is_candidate_public(owner_sym)) {
+            ResolveCounter::rc_fnbind_private_bound();
+            kind = "PRIVATE";
+        }
+        // Resolve the names only when someone is reading them.
+        if (kind != "" && ResolveCounter::rc_vis_audit_on()) {
+            ResolveCounter::rc_fnbind_violation(kind,
+                this.intern.resolve(use_ns), this.intern.resolve(owner_sym));
+        }
+    }
+
     /// Scope class of a bare-call overload candidate owned by `owner` (a
     /// qualified function-name id) relative to the module being checked.
     /// Mirrors the type-side `resolve_qualified_scoped` visibility rules,
     /// with explicit imports ranked NEARER than the implicit prelude.
+    ///
+    /// NOTE: no visibility dimension - an imported module's `private` function
+    /// classifies as `Imported` and binds (defect D-B, spec §8.1c).
     bare_candidate_scope(&this, owner: u32) -> BareCandidateScope {
         const di: DeclarationIndex* = this.ctx.decl_index;
         const owner_sym: SymbolStr = SymbolStr::from_id(owner);
@@ -2426,7 +2468,22 @@ type struct CallResolver {
         // function in another unit (fixes the #9 last-write-wins collision).
         const qual_name: SymbolStr = this.ctx.qualify_symbol_sym(ident.name);
         mut func_ret: TypeRef = this.types.lookup_func_return(qual_name);
-        if (!func_ret.is_valid()) { func_ret = this.types.lookup_func_return(ident.name); }
+        if (!func_ret.is_valid()) {
+            func_ret = this.types.lookup_func_return(ident.name);
+            // AUDIT ONLY (spec §3.3, §4).  The bare `func_returns` map is
+            // program-wide and carries no owner, so this answer is produced
+            // with ZERO scope input - a second, more permissive door than
+            // `try_pin_overload_mangled_callee`, and the one that types the
+            // other seven bare `find_best_candidate` calls that door misses.
+            // Attribute it through `bare_alts` when the leaf is unambiguous;
+            // a plural leaf has no owner to name here, which is the defect.
+            if (func_ret.is_valid()) {
+                ResolveCounter::rc_fnbind_unscoped_ret();
+                const alts: SymbolStr[] =
+                    this.ctx.decl_index.lookup_qualified_alternatives(ident.name);
+                if (alts.length == 1) { this.audit_fnbind_candidate(alts[0].id); }
+            }
+        }
         if (func_ret.is_valid()) {
             if (this.state.expected_type.is_valid()) {
                 const ret_t: Type* = this.arena.lookup(func_ret.id);

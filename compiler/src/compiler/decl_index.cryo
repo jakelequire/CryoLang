@@ -236,15 +236,19 @@ type struct DeclarationIndex {
     // conflict (ambiguous), not a silent shadow.  Populated once.
     prelude_ns:          u32[];
 
-    // Qualified type-name SymbolStr.id -> is_public.  Lets import-scoped
-    // same-leaf resolution (resolve_qualified_scoped) exclude a PRIVATE
-    // cross-module candidate from the visible set so it can't manufacture a
-    // false ambiguity on the E0154 static-call-scope path.  Populated by
-    // `register_decl_in_index` (type_resolution.cryo) alongside
-    // `register_name_mapping`, so every name that can appear as a same-leaf
-    // candidate carries a verdict.  A name absent from this map (single-file /
-    // C-import types, which never enter the alternatives set) is treated as
-    // public (permissive).
+    // Qualified declaration-name SymbolStr.id -> is_public, for TYPES and FREE
+    // FUNCTIONS alike.  Lets import-scoped same-leaf resolution
+    // (resolve_qualified_scoped) exclude a PRIVATE cross-module candidate from
+    // the visible set so it can't manufacture a false ambiguity on the E0154
+    // static-call-scope path.  Populated by `register_decl_in_index`
+    // (type_resolution.cryo) alongside `register_name_mapping`, so every name
+    // that can appear as a same-leaf candidate carries a verdict.  A name
+    // absent from this map (single-file / C-import types, which never enter the
+    // alternatives set) is treated as public (permissive).
+    //
+    // A same-module candidate never reaches this check: both branches of
+    // `resolve_qualified_scoped` compare namespaces first, so a module always
+    // sees its own private items (spec docs/name-resolution.md §4).
     //
     // NOTE on the mechanism hierarchy: this is a SECONDARY guard, not the
     // primary privacy gate.  A bare TYPE NAME is resolved by the NameResolver
@@ -256,7 +260,14 @@ type struct DeclarationIndex {
     // for the import-scoped static-call/template lookups that consult
     // resolve_qualified_scoped directly, and it makes `is_candidate_public`
     // honest rather than a permanently-empty stub.
-    type_visibility:     HashMap<u32, boolean>;
+    //
+    // AND IT DOES NOT GATE FUNCTION CALLS.  A bare `foo()` never reaches
+    // `resolve_qualified_scoped` at all - it is bound by sema's
+    // `try_pin_overload_mangled_callee` / `resolve_direct_call`, which have
+    // their own scope model and do not consult this map.  Recording function
+    // visibility here is what makes that measurable, not what enforces it;
+    // see docs/name-resolution.md §8.1c.
+    decl_visibility:     HashMap<u32, boolean>;
 
 
     static new() -> DeclarationIndex {
@@ -292,7 +303,7 @@ type struct DeclarationIndex {
             extern_bare_owner:  HashMap<u32, u32>::new(),
             module_imports:     HashMap<u32, u32[]>::new(),
             prelude_ns:         [],
-            type_visibility:    HashMap<u32, boolean>::new(),
+            decl_visibility:    HashMap<u32, boolean>::new(),
         };
     }
 
@@ -1257,10 +1268,11 @@ type struct DeclarationIndex {
         }
     }
 
-    /// Record a type's visibility (keyed by its qualified name) so same-leaf
-    /// resolution can exclude a private cross-module candidate.
-    set_type_visibility(mut &this, qualified: SymbolStr, is_public: boolean) -> void {
-        this.type_visibility.insert(qualified.id, is_public);
+    /// Record a declaration's visibility (keyed by its qualified name) so
+    /// same-leaf resolution can exclude a private cross-module candidate.
+    /// Covers types AND free functions; both share one identity space here.
+    set_decl_visibility(mut &this, qualified: SymbolStr, is_public: boolean) -> void {
+        this.decl_visibility.insert(qualified.id, is_public);
     }
 
     /// The defining namespace of a qualified name (everything before the leaf),
@@ -1297,9 +1309,9 @@ type struct DeclarationIndex {
     }
 
     /// Visibility verdict for a candidate; permissive default (see
-    /// `type_visibility`).
+    /// `decl_visibility`).
     is_candidate_public(&this, qualified: SymbolStr) -> boolean {
-        return match (this.type_visibility.get(&qualified.id)) {
+        return match (this.decl_visibility.get(&qualified.id)) {
             Option::Some(v) => { v }
             Option::None    => { true }
         };
@@ -1343,6 +1355,22 @@ type struct DeclarationIndex {
             const c0: SymbolStr = cands[0];
             const c0_ns: SymbolStr = this.namespace_of(c0, intern);
             mut c0_ok: boolean = (c0_ns.id == use_site_ns.id);
+            // AUDIT ONLY.  Where does a candidate we KNOW is private end up?
+            // `rc_vis_reject_notpublic` reads 0, which is ambiguous between
+            // "no private candidate ever reaches the gate" and "the gate is
+            // short-circuited before it looks".  Classify every private
+            // candidate so the two are distinguishable.
+            if (ResolveCounter::rc_vis_audit_on() && !this.is_candidate_public(c0)) {
+                const priv_reach: boolean = this.is_prelude_ns(c0_ns)
+                    || this.ns_imports(use_site_ns, c0_ns);
+                const priv_kind: string = if (c0_ok) {
+                    "SAME-NS"
+                } else {
+                    if (priv_reach) { "REACHABLE" } else { "UNREACHABLE" }
+                };
+                ResolveCounter::rc_vis_private(priv_kind,
+                    intern.resolve(use_site_ns), intern.resolve(c0));
+            }
             if (!c0_ok) {
                 const c0_prelude: boolean = this.is_prelude_ns(c0_ns);
                 const c0_reach: boolean =

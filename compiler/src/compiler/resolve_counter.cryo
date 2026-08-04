@@ -141,7 +141,38 @@ const RC_LEAF_S_TYPE_UTILS:       i64 = 38;  // sema/type_utils.cryo
 const RC_LEAF_S_TYPERES_BOUND:    i64 = 39;  // passes/type_resolution.cryo constraint
 const RC_LEAF_S_TYPERES_BASE:     i64 = 40;  // passes/type_resolution.cryo base class
 
-const RC_SITE_COUNT:              i64 = 41;
+// Free-function bare-call binding (sema/call_resolver.cryo
+// `try_pin_overload_mangled_callee`).  A SECOND, independent instance of the
+// §2a root cause, in a different subsystem: a bare `foo()` call never touches
+// `resolve_qualified_scoped`, so the visibility work done there cannot see it.
+// This binder has its own scope model (`bare_candidate_scope`: same-module /
+// Imported / Prelude / Hidden), and two defects against spec §3.3 + §4:
+//
+//   D-A  The single-overload branch pins the one candidate UNCONDITIONALLY,
+//        without consulting the tier at all - so a function in a module the
+//        use site never imported still binds.  Exactly the shape of the
+//        `cands.length == 1` fast path in decl_index.
+//   D-B  `bare_candidate_scope` has no visibility dimension, so an imported
+//        module's `private` function classifies as `Imported` and binds.
+//        Verified end-to-end: a two-module probe calling a cross-module
+//        `private function` compiles and RUNS.
+//
+// Counted apart because they need different fixes: D-A is a missing check,
+// D-B is a missing input.  SINGLE_HIDDEN is the D-A blast radius;
+// PRIVATE_BOUND is D-B's (it counts binds in ANY branch, so it is not a
+// subset of SINGLE).
+const RC_FNBIND_SINGLE:           i64 = 41;
+const RC_FNBIND_SINGLE_HIDDEN:    i64 = 42;
+const RC_FNBIND_PRIVATE_BOUND:    i64 = 43;
+// A SECOND door into free-function binding: `resolve_direct_call`'s fallback
+// to the program-wide bare `func_returns` map, which has no owner column and
+// therefore no scope input whatsoever.  `try_pin_overload_mangled_callee`
+// pins the SYMBOL; this one supplies the TYPE, and a call can be answered
+// here without the other ever running - so SINGLE above is a floor, not a
+// total, until this is counted too.
+const RC_FNBIND_UNSCOPED_RET:     i64 = 44;
+
+const RC_SITE_COUNT:              i64 = 45;
 
 /// Per-site tallies.  Zero-initialized in BSS; index with the `RC_*`
 /// constants above.  Sized well above `RC_SITE_COUNT` so adding a site
@@ -244,6 +275,45 @@ function rc_vis_audit_enabled() -> boolean {
 public function rc_vis_violation(use_site: string, cand: string) -> void {
     if (!rc_vis_audit_enabled()) { return; }
     fmt::eprintf("VIS-VIOLATION\t%s\t%s\n", use_site, cand);
+}
+
+/// Whether `CRYO_VIS_AUDIT` is set.  Exposed so a caller can skip building
+/// the strings an audit line needs (interning a namespace is not free, and
+/// these sites sit in the resolution hot path).
+public function rc_vis_audit_on() -> boolean { return rc_vis_audit_enabled(); }
+
+public function rc_fnbind_single()        -> void { rc_bump(RC_FNBIND_SINGLE); }
+public function rc_fnbind_single_hidden() -> void { rc_bump(RC_FNBIND_SINGLE_HIDDEN); }
+public function rc_fnbind_private_bound() -> void { rc_bump(RC_FNBIND_PRIVATE_BOUND); }
+public function rc_fnbind_unscoped_ret() -> void { rc_bump(RC_FNBIND_UNSCOPED_RET); }
+
+/// Print one bare free-function call that bound to a candidate the use site
+/// should not be able to name.  `kind` is `HIDDEN` (D-A: not imported) or
+/// `PRIVATE` (D-B: imported but not public).
+/// No-op unless `CRYO_VIS_AUDIT` is set.
+public function rc_fnbind_violation(kind: string, use_site: string, cand: string) -> void {
+    if (!rc_vis_audit_enabled()) { return; }
+    fmt::eprintf("FNBIND-VIOLATION\t%s\t%s\t%s\n", kind, use_site, cand);
+}
+
+/// Print one recorded visibility verdict, so a run can prove the
+/// `decl_visibility` map is populated before any conclusion is drawn from a
+/// zero rejection count (`is_candidate_public` defaults to `true`, so an
+/// unwired recorder and a genuinely-all-public program look identical).
+/// No-op unless `CRYO_VIS_AUDIT` is set.
+public function rc_vis_record(qualified: string, is_public: boolean) -> void {
+    if (!rc_vis_audit_enabled()) { return; }
+    const flag: i32 = if (is_public) { 1 } else { 0 };
+    fmt::eprintf("VIS-RECORD\t%d\t%s\n", flag, qualified);
+}
+
+/// Print one fast-path encounter with a candidate recorded as PRIVATE, tagged
+/// with why it was (or was not) let through.  Distinguishes "the gate saw no
+/// private candidates" from "the gate never got to look".
+/// No-op unless `CRYO_VIS_AUDIT` is set.
+public function rc_vis_private(kind: string, use_site: string, cand: string) -> void {
+    if (!rc_vis_audit_enabled()) { return; }
+    fmt::eprintf("VIS-PRIVATE\t%s\t%s\t%s\n", kind, use_site, cand);
 }
 
 /// Tri-state cache for `CRYO_PATH_AUDIT`: 0 unknown, 1 on, 2 off.
@@ -392,6 +462,12 @@ public function rc_report() -> void {
     rc_line("!! ", "  WOULD BE REJECTED once gated",        RC_VIS_WOULD_REJECT);
     rc_line("   ", "    cause: namespace not reachable",    RC_VIS_REJECT_UNREACHABLE);
     rc_line("   ", "    cause: candidate not public",       RC_VIS_REJECT_NOTPUBLIC);
+
+    fmt::eprintf("\n-- free-fn bare-call binder (spec §3.3, §4) ----------\n");
+    rc_line("   ", "single-overload pins (no scope check)", RC_FNBIND_SINGLE);
+    rc_line("!! ", "  of those, owner NOT in scope (D-A)",  RC_FNBIND_SINGLE_HIDDEN);
+    rc_line("!! ", "bound to a PRIVATE candidate  (D-B)",   RC_FNBIND_PRIVATE_BOUND);
+    rc_line("B1 ", "bare return-type answers, NO scope input", RC_FNBIND_UNSCOPED_RET);
 
     fmt::eprintf("\n-- namespace-suffix heuristic, 5 copies ---------------\n");
     rc_line("B1 ", "M1 module_ns_matches_prefix calls",    RC_M1_CALLS);
