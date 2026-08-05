@@ -28,6 +28,7 @@ import Compiler::Diag::{
     Diagnostic, Suggestion, SourceSpan, EditDistance, Snapshot
 };
 import Compiler::DeclIndex;
+import Compiler::ResolveCounter;
 import Compiler::AST;
 import Compiler::AST::{ Node, Expression, Statement, Declaration, Pattern, Visitor, NodeLocator, Cloner };
 import Compiler::Passes::PassID;
@@ -811,37 +812,55 @@ public:
 
     // -- Per-function frame setup --
 
-    /// Module the body currently being checked was written in.
-    ///
-    /// Type annotations inside a body mean what that body's OWN module says.
-    /// Inside a method that is the owner's module - and the owner is what makes
-    /// this differ from the module being compiled, because a specialized method
-    /// body is re-checked while the walk sits in the module that demanded the
-    /// specialization.  Outside a method there is no owner and the module being
-    /// compiled is the right answer.
-    body_home_module(&this) -> string {
-        const owner_ns: string = this.arena.module_ns_of(this.state.current_owner_type);
-        if ((owner_ns.length() as i64) > 0) { return owner_ns; }
-        return this.ctx.namespace_display();
-    }
-
     /// A resolution context for annotations written in the body being checked.
     ///
-    /// The two branches have DIFFERENT provenance and are recorded as such.
-    /// The owner type's module is read from the arena, where it was recorded
-    /// when the type was declared, so it names where the body was written.
-    /// The fallback is `namespace_display()` - the ambient scope cursor - which
-    /// is right only while a pass walks declarations in order.  Collapsing them
-    /// into one `set_home_module` call would report a cursor guess as an
+    /// Type annotations inside a body mean what that body's OWN module says, so
+    /// `span` must be the span of the syntax being resolved - not of whatever
+    /// the walk is standing on.  Both branches now answer from where the code
+    /// was WRITTEN and are recorded as `Syntax`: inside a method, the owner
+    /// type's module, read from the arena where it was recorded at declaration;
+    /// outside one, the module claiming the span's file.  These differ from the
+    /// module being compiled whenever a body is re-checked from elsewhere - a
+    /// specialized method body is checked while the walk sits in the module
+    /// that demanded the specialization.
+    ///
+    /// Only a span that no module claims still reaches the ambient cursor, and
+    /// that case is recorded as `Cursor` so a guess is never reported as an
     /// authoritative answer; see `HomeOrigin`.
-    body_res_ctx(&this) -> ResolutionContext {
+    body_res_ctx(&this, span: SourceSpan) -> ResolutionContext {
         mut rc: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
         const owner_ns: string = this.arena.module_ns_of(this.state.current_owner_type);
         if ((owner_ns.length() as i64) > 0) {
+            ResolveCounter::Site::BodyNsOwner.bump();
             rc.set_home_module(owner_ns, HomeOrigin::Syntax);
-        } else {
-            rc.set_home_module(this.ctx.namespace_display(), HomeOrigin::Cursor);
+            return rc;
         }
+        // Outside a method there is no owner, and this used to read the ambient
+        // cursor.  The body's own FILE answers the question directly, and does
+        // so without any state that can go stale: the previous attempt at this
+        // cached the module at `enter_function`, which has no matching exit
+        // hook, so `body_res_ctx` read whichever function was entered last and
+        // typed `mem::transmute`'s `mut result: To` as `void`.  Deriving it
+        // from the span at the point of use is the same shape as
+        // `CallResolver::call_use_site_ns`, and has no lifetime at all.
+        const cursor_ns: string = this.ctx.namespace_display();
+        const syntax_ns: string = this.ctx.module_ns_of_file(span.file);
+        if ((syntax_ns.length() as i64) > 0) {
+            ResolveCounter::Site::BodyNsSyntax.bump();
+            if (syntax_ns != cursor_ns) { ResolveCounter::Site::BodyNsDiff.bump(); }
+            // Emitted on EVERY row, not only the diverging ones, so that Diff's
+            // zero stays re-derivable offline by a comparison this compiler did
+            // not perform.  A zero computed only by the `!=` above would be its
+            // own control; `awk -F'\t' '$3!=$4'` over the stream is not.
+            ResolveCounter::body_ns_diff(span.file, syntax_ns, cursor_ns);
+            rc.set_home_module(syntax_ns, HomeOrigin::Syntax);
+            return rc;
+        }
+        // No module claims the file (synthesized node, single-file mode).
+        // Counted, so "provenance was available" is never confused with
+        // "provenance agreed with the cursor".
+        ResolveCounter::Site::BodyNsCursor.bump();
+        rc.set_home_module(cursor_ns, HomeOrigin::Cursor);
         return rc;
     }
 
@@ -1125,7 +1144,7 @@ public:
 
         if (!var_node.has_resolved_type() && var_node.type_annotation != null && this.ctx.type_resolver != null) {
             this.prime_typeof_annotation(var_node.type_annotation);
-            mut res_ctx: ResolutionContext = this.body_res_ctx();
+            mut res_ctx: ResolutionContext = this.body_res_ctx(var_node.span);
             this.symbolic.symbolic_bind_params(&res_ctx);
             const vtype: TypeRef = this.ctx.type_resolver.resolve(var_node.type_annotation, &res_ctx);
             if (vtype.is_valid()) { var_node.resolved_type = vtype; }
@@ -1263,7 +1282,7 @@ public:
 
     override visit(mut &this, node: DestructureDeclNode*) -> void {
         if (!node.has_resolved_type() && node.type_annotation != null && this.ctx.type_resolver != null) {
-            mut res_ctx: ResolutionContext = this.body_res_ctx();
+            mut res_ctx: ResolutionContext = this.body_res_ctx(node.span);
             this.symbolic.symbolic_bind_params(&res_ctx);
             const ttype: TypeRef = this.ctx.type_resolver.resolve(node.type_annotation, &res_ctx);
             if (ttype.is_valid()) { node.resolved_type = ttype; }
