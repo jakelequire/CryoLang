@@ -1297,14 +1297,19 @@ scope-less site gets it wrong.
 Independently: that project already covers same-leaf collisions in **both**
 lanes (value via `pick`, type via `Widget`/`WidgetOther`), so §7's "the corpus
 must supply a leaf declared by two modules" is *partly already satisfied* —
-what it lacks is the M1 case below and the cross-module `private` call.
+what it lacked was the M1 case below (since fixed) and the cross-module
+`private` call (still open — §8.1e).
 
 #### The M1 interior-prefix violation — FIXED 2026-08-04
 
+> **The next three paragraphs describe the behavior BEFORE the fix**, kept
+> because the reduction and its control are what identified the cause. The fix
+> and its verification follow them.
+
 §5.1 says the first segment resolves in scope and the remainder is **rooted** —
 "no substring matching, no suffix matching". `module_ns_matches_prefix`
-(`resolver/resolver.cryo:600`) instead accepts the written prefix anywhere it
-occurs in the module path as a whole-segment run. Reduced to a 2-module
+(`resolver/resolver.cryo:620`) instead accepted the written prefix anywhere it
+occurred in the module path as a whole-segment run. Reduced to a 2-module
 program:
 
 ```
@@ -1376,6 +1381,82 @@ reporting a false green.
 
 Both defects were reproduced from scratch before being pinned — the
 cross-module `private` call compiles *and runs*, printing 99.
+
+### 8.2i The worklist is not 49 decisions — it is one question per context (2026-08-05)
+
+The keystone has been described as "the 49 scope-less `ResolutionContext`
+constructions are the worklist". Reading all 57 shows that framing is
+misleading in a way that would have produced a wrong change passing every gate.
+
+**A context's home module is decided by where its SYNTAX was written**, not by
+which function constructs it. Two contexts built six lines apart in the same
+function can belong to different modules. Sorted by that question:
+
+| what the context resolves | home | sites |
+|---|---|---|
+| `call.generic_args`, `scope.generic_args`, `scope.scope_generic_args` — turbofish | the **caller** | `call_resolver` 1262, 1394, 1457, 1623, 3663, 3851, 3910, 4180 |
+| `expand_default_type_args` — the template's declared defaults | the **callee** | `call_resolver` 4243 |
+| owner ctx for the callee's own annotations | the **owner type's module** | `method_binding` 1177, 1192 |
+| a method found on a trait decl | the **trait's module** | `method_binding` 1045 |
+
+Eight of the twelve sites previously grouped as "callee signature
+re-resolution" are **caller-scoped**: they resolve turbofish the caller wrote.
+`call_resolver.cryo:1457` already says so in a comment
+("Resolve the turbofish in the CALLER's scope"). Setting those to the callee's
+module is a miscompile, and §8.2g's measurement says the self-host, `make test`,
+`b1-check` and the scope probe would all have stayed green through it.
+
+`method_binding.cryo:1192` was already migrated (line 1249,
+`owner_module_of(recv_type)`) with a comment stating the rule exactly. It is the
+reference implementation for this shape, not a special case.
+
+**Landed 2026-08-05:** `method_binding.cryo:1177` and `call_resolver.cryo:4243`,
+the two sites where the home module was recoverable from data already in hand
+(`owner_module_of(recv_type)`; `TemplateEntry.module_name`). Behaviour-neutral
+as predicted: corpus 21/21, `make test` 2001/170/17, B1 unchanged at 19,292, and
+a counter diff against the previously pinned compiler on `examples/09-json-config`
+was **byte-identical across every row**.
+
+**Blocked: `method_binding.cryo:1045`.** It resolves a method located through
+`generic_registry.get_trait_decl(leaf)` — a lookup keyed by LEAF NAME — and
+`TraitDeclNode` (`AST/declaration.cryo:877`) carries no module or namespace
+field, only `name: SymbolStr` and the inherited span. There is no correct home
+module to set, so the site cannot be migrated without guessing. This is the same
+class of defect as the keystone itself, one level down: the trait registry has
+no module identity. Prerequisite work, not a one-liner.
+
+### 8.2j A bare name resolves with NOTHING in scope — reduced (2026-08-05)
+
+§5.1 says the first segment resolves in scope. It does not have to.
+
+Deleting the *only* `import` from a module that names a type in two signatures
+produced **no error**: the signatures still resolved, and still to the right
+type. Diffing `CRYO_LEAF_AUDIT` between the two variants of the same project
+named the mechanism with no inference required — exactly six new hits, all for
+the orphaned leaf:
+
+```
+3  LEAF-HIT  GenericNameCollision::WidgetStatic  Widget   <- home module SET, fell through to step 5
+3  LEAF-HIT  (empty use-site)                    Widget   <- NO scope: the keystone's own sites
+```
+
+Nothing else in the counter moved except step 5 (753 → 759) and 2c (5102 →
+5099). This is §8.2a's root cause reduced from an aggregate over a full
+compiler build to a project small enough to read in one sitting, and it is why
+the leaf index cannot simply be deleted: 2,538 answers in the compiler's own
+build depend on it, and every one of them is a name that was never in scope.
+
+Pinned as the second tripwire in `resolution_tripwire`
+(`orphan.cryo`, `depot.cryo`, two `WRONG_*` tests plus a qualified-path
+control), under the same flip protocol as the visibility tripwire.
+
+> **Corpus note.** `find_static_method_template` — the largest single cluster in
+> this shape — had **no coverage at all**: there was not one static generic
+> method anywhere in `tests/tests/projects`. Added as `widget_static.cryo` /
+> `widget_static_test.cryo` in `generic_name_collision`, reusing the existing
+> `WidgetDeep`/`WidgetOther` collision. Control-verified: retyping one
+> assertion to the colliding `Widget` fails the build with E0200 + E0358, so a
+> wrong bind is a hard error rather than a silent pass.
 
 ### 8.3 B2 is unmeasured
 

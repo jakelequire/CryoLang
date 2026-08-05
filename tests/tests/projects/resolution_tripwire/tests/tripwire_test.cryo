@@ -60,3 +60,64 @@ function CONTROL_a_public_function_is_callable_from_another_module()
     expect_eq(ResolutionTripwire::Vault::door(), 1)?;
     return Result::Ok(());
 }
+
+// ---- KNOWN DEFECT: a bare name resolves with NOTHING in scope (§5.1) ----
+//
+// §5.1: "The first segment resolves in scope. There is no substring
+// matching, no suffix matching, and no dependence on what other modules
+// happen to exist in the program."
+//
+// `ResolutionTripwire::Orphan` has no `import` statement at all, and names
+// `Crate` in two signatures. `Crate` is declared only by
+// `ResolutionTripwire::Depot`. Nothing binds it in Orphan's scope, so under
+// §5.1 both signatures must be an E0203 "unknown type" -- and instead they
+// resolve, because cascade step 5 (the GLOBAL LEAF INDEX, types/arena.cryo)
+// answers from the whole program without consulting scope at all.
+//
+// MEASURED 2026-08-05, by deleting the equivalent import from
+// tests/projects/generic_name_collision and diffing CRYO_LEAF_AUDIT:
+// removing one import moved exactly 6 resolutions onto the leaf index --
+// 3 logged with a home module set, 3 logged with an EMPTY use-site, the
+// scope-less sites the §5.2 keystone exists to fix. Nothing else in the
+// counter moved.
+//
+// This is §8.2a's root cause reduced to a project small enough to reason
+// about: previously it was only observable as an aggregate over a full
+// compiler build. It is the reason the leaf index cannot simply be deleted
+// -- 2,538 answers in the compiler's own build depend on it, and every one
+// of them is a name that was never in scope.
+//
+// AFTER THE FIX both tests below must be E0203 at the Orphan signatures.
+// Convert this project to `compile_fail` with `expect.diagnostic` E0203 in
+// the same change, exactly as the visibility tripwire above directs.
+
+![test]
+function WRONG_a_static_template_resolves_a_type_not_in_its_scope()
+        -> Result<(), TestError> {
+    mut c: ResolutionTripwire::Depot::Crate<i64> =
+        ResolutionTripwire::Orphan::Packer::pack(21);
+    expect_eq(c.unwrap(), 21 as i64)?;
+    return Result::Ok(());
+}
+
+![test]
+function WRONG_a_free_generic_resolves_a_type_not_in_its_scope()
+        -> Result<(), TestError> {
+    mut c: ResolutionTripwire::Depot::Crate<i64> =
+        ResolutionTripwire::Orphan::box_up(23);
+    expect_eq(c.unwrap(), 23 as i64)?;
+    return Result::Ok(());
+}
+
+/// CONTROL. `Depot` is imported nowhere by `Orphan`, but a module that DOES
+/// spell the path in full must keep working -- otherwise a fix that made the
+/// tripwires above fail did so by breaking qualified paths rather than by
+/// enforcing scope.
+![test]
+function CONTROL_a_qualified_path_still_reaches_the_same_type()
+        -> Result<(), TestError> {
+    mut c: ResolutionTripwire::Depot::Crate<i64> =
+        ResolutionTripwire::Depot::Crate<i64> { v: 25 };
+    expect_eq(c.unwrap(), 25 as i64)?;
+    return Result::Ok(());
+}

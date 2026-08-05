@@ -1,0 +1,70 @@
+/// Assertions for the static-template and free-function arms of the `Widget`
+/// collision (see `widget_static.cryo`).
+///
+/// Importing `WidgetOther` is load-bearing, exactly as in `widget_test.cryo`:
+/// it is what puts a SECOND `Widget` in this module's scope. Without it every
+/// check below passes for the uninteresting reason that only one candidate was
+/// ever visible -- the failure mode §8.2g measured across the whole compiler,
+/// where 13,369 of 13,370 wrong-cursor resolutions had a single candidate and
+/// so could not diverge.
+///
+/// Each check binds the result to the callee's `WidgetDeep::Widget` spelled in
+/// full and then reads `.v` / `unwrap()`. `WidgetOther::Widget` has neither --
+/// its field is `other_v` -- so a bind to the wrong module is a compile error
+/// at the field access, not a silently wrong type.
+![config(testing)]
+namespace GenericNameCollision::WidgetStaticTest;
+
+import std::core::result;
+import std::test::error;
+import std::test::assert;
+
+import GenericNameCollision::WidgetStatic;
+import GenericNameCollision::WidgetOther;
+
+// Static generic method, inferred type argument. Bound by
+// `find_static_method_template` -- 5 of shape B's 12 sites, and the cluster
+// the corpus had no coverage for at all.
+![test]
+function static_template_keeps_the_callees_own_widget() -> Result<(), TestError> {
+    mut w: GenericNameCollision::WidgetDeep::Widget<i64> = StaticMaker::build(7);
+    expect_eq(w.unwrap(), 7 as i64)?;
+    return Result::Ok(());
+}
+
+// The turbofish path re-resolves the return annotation separately from the
+// inferred one, so it is its own regression.
+![test]
+function static_template_turbofish_keeps_its_own_widget() -> Result<(), TestError> {
+    mut w: GenericNameCollision::WidgetDeep::Widget<i64> = StaticMaker::build_tf<i64>(9);
+    expect_eq(w.unwrap(), 9 as i64)?;
+    return Result::Ok(());
+}
+
+// Free generic function whose signature names the colliding type. Bound by
+// `check_generic_free_call` -- shape B's remaining 4 sites.
+![test]
+function free_generic_keeps_the_callees_own_widget() -> Result<(), TestError> {
+    mut w: GenericNameCollision::WidgetDeep::Widget<i64> = wrap(11);
+    expect_eq(w.unwrap(), 11 as i64)?;
+    return Result::Ok(());
+}
+
+// Same call reached with an explicit type argument.
+![test]
+function free_generic_turbofish_keeps_its_own_widget() -> Result<(), TestError> {
+    mut w: GenericNameCollision::WidgetDeep::Widget<i64> = wrap<i64>(13);
+    expect_eq(w.unwrap(), 13 as i64)?;
+    return Result::Ok(());
+}
+
+// The control. The colliding `Widget` must remain reachable from this module
+// by its own qualified name, so no fix can work by preferring the callee's
+// module program-wide.
+![test]
+function the_colliding_widget_is_still_usable_here() -> Result<(), TestError> {
+    mut o: GenericNameCollision::WidgetOther::Widget<i64> =
+        GenericNameCollision::WidgetOther::Widget<i64> { other_v: 5 };
+    expect_eq(o.other_v, 5 as i64)?;
+    return Result::Ok(());
+}
