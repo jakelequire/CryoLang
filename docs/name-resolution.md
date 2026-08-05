@@ -1628,11 +1628,11 @@ Eight caller-scoped turbofish sites in `call_resolver.cryo` now take their home
 module from the call node's own span rather than from `current_module_name()`,
 which reads the cursor. That is the −35 above.
 
-#### The last 23 resist a cache — ATTEMPTED AND REVERTED
+#### The last 23 resisted a cache — LANDED 2026-08-05 without one
 
-The remaining cursor-derived answers are **free-function bodies**:
+The remaining cursor-derived answers were **free-function bodies**:
 `body_res_ctx` reads the owner type's module, which is invalid when there is no
-owner, and falls back to `namespace_display()`.
+owner, and fell back to `namespace_display()`.
 
 Caching the module at `enter_function` from `func.span.file` **breaks the
 build** — `stdlib/core/mem.cryo`'s `transmute<From, To>` types
@@ -1646,15 +1646,65 @@ later, at annotation-resolution time, and reads whichever function was entered
 last. `namespace_display()` is *live*, and therefore self-correcting — which is
 why the worse mechanism works and the better one does not.
 
-A correct fix needs a real current-function node on `SemaState` with paired
-enter/exit, or resolution at `body_res_ctx` time from the function node rather
-than a cache. Until then the fallback stays, honestly labelled `Cursor`.
+**The fix keeps the liveness and drops the cache.** `body_res_ctx` now takes the
+`span` of the syntax it is resolving and derives the home module from
+`module_ns_of_file(span.file)` at the point of use. That is the same shape as
+`call_use_site_ns` (§8.1f), and it has no lifetime at all: there is no state to
+go stale, because nothing is stored. The two callers — `DeclStmtNode` and
+`DestructureDeclNode` — each already had the declaration node in hand. A span
+that no module claims still reaches the cursor and is still counted and labelled
+`Cursor`; on every corpus measured so far that count is **zero**.
 
-> Two intermediate hypotheses were tested and **disproved** before this one:
-> that 2c was mis-resolving a generic parameter (binding the enclosing params
-> changed nothing), and that `module_ns_of_file` was returning `""` for stdlib
-> paths (it returns `std::core::mem` correctly). Both would have been plausible
-> as written-up causes. Neither survived measurement.
+| on `examples/09-json-config` | before | after |
+|---|---:|---:|
+| `2c` home-module (ambient cursor) | 23 | **0** |
+| `2c*` home-module (syntax provenance) | 3,870 | **3,893** |
+| **B1 total** | 15,460 | **15,437** |
+
+Behaviour-neutral: that target built with the old and new compilers into
+separate trees is **63 files byte-identical**, linked binary included. The −23 is
+the whole of the cursor's remaining presence at this site, not a sample of it.
+
+> **The zero was controlled, twice.** `BodyNsDiff` — span-derived module ≠
+> cursor — reads **0** over 241 free-function contexts in the compiler's own
+> build and 70 in `09-json-config`, with `BodyNsCursor` (no provenance at all)
+> also 0. A zero that a change is justified by has to be attacked, so
+> `body_ns_diff` emits **every** row rather than only the diverging ones, and
+> `awk -F'\t' '$3!=$4'` over the stream re-derives the count with a comparison
+> this compiler did not perform. It agrees. The rows carry 13 distinct real
+> namespaces, so the comparison demonstrably distinguishes values rather than
+> being uniformly false. `std::core::mem` is **127 of the 241** — the flip is
+> exercised hardest at exactly the site the cached version broke.
+
+This is the shape to reuse for §8, task #3: the failed mechanism and the working
+one differ only in *when* the question is asked, not in what is asked or what
+data answers it. A cursor read is not always a missing input; sometimes it is a
+correct input consulted at the wrong time.
+
+> **The zero is structural at this site, and that was tested rather than
+> assumed.** "No divergence on the corpora measured" and "this site cannot
+> diverge" are different claims, and §8.2g is the standing warning against
+> reading the first as the second. So the adversarial case was *built*:
+> `wrap_via_local` in `generic_name_collision`, a free generic function whose
+> body-local annotation is a bare `Widget`, called from a module with a second
+> `Widget` in scope. The `BODY-NS` stream shows the site is reached, and syntax
+> and cursor still agree. `body_res_ctx` runs during the declaring module's own
+> in-order walk, where the cursor is correct by construction; the specialization
+> re-check that parks the cursor elsewhere does not come back through this path.
+> That is *why* the cache failed and the live read did not, and it is the
+> boundary of what this change buys: provenance, not a behaviour fix.
+>
+> Kept as a corpus entry anyway — `body_res_ctx`'s home module previously had no
+> coverage discriminating one module from another. Control-verified in the same
+> way as the rest of that file: retyping the binding to the colliding
+> `WidgetOther::Widget` fails with E0200 + E0358, so a wrong bind is a hard
+> error rather than a silent pass.
+
+> Two intermediate hypotheses were tested and **disproved** before the lifetime
+> one: that 2c was mis-resolving a generic parameter (binding the enclosing
+> params changed nothing), and that `module_ns_of_file` was returning `""` for
+> stdlib paths (it returns `std::core::mem` correctly). Both would have been
+> plausible as written-up causes. Neither survived measurement.
 
 ### 8.3 B2 is unmeasured
 

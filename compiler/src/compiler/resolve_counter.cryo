@@ -168,6 +168,19 @@ type enum Site {
     FnBindVisPlural;
     FnBindVisRetLane;
 
+    // Where a BODY's type-annotation context got its home module (§8, task #7).
+    // `body_res_ctx` answers "which module wrote this annotation".  Inside a
+    // method the owner type's module answers it; outside one there was no
+    // answer at all and it read the ambient cursor.  Syntax/Cursor say which
+    // input was available; Diff counts the annotations where the span-derived
+    // module and the cursor DISAGREE - i.e. exactly the set the cursor was
+    // getting wrong.  Read Diff, not Cursor: a large Cursor with a zero Diff
+    // means the cursor was right every time, which is the null result.
+    BodyNsOwner;
+    BodyNsSyntax;
+    BodyNsCursor;
+    BodyNsDiff;
+
     // Ambient-cursor divergence (§2b, §5.2), measured where the true scope is
     // KNOWN: the home-module preference step.  There a caller has said which
     // module the annotation was written in, so the module-blind chain can be
@@ -271,6 +284,10 @@ implement enum Site {
             Site::FnBindVisSingle       => { "   " }
             Site::FnBindVisPlural       => { "   " }
             Site::FnBindVisRetLane      => { "   " }
+            Site::BodyNsOwner           => { "   " }
+            Site::BodyNsSyntax          => { "   " }
+            Site::BodyNsCursor          => { "   " }
+            Site::BodyNsDiff            => { "   " }
             Site::HomeCursorSame        => { "   " }
             Site::HomeCursorDiff        => { "   " }
             Site::HomeDiffPlural        => { "   " }
@@ -339,6 +356,10 @@ implement enum Site {
             Site::FnBindVisSingle       => { "  door 2: single-overload fast path" }
             Site::FnBindVisPlural       => { "  door 3: multi-candidate selection" }
             Site::FnBindVisRetLane      => { "  door 4: bare return-type lane" }
+            Site::BodyNsOwner           => { "body annots: owner type's module" }
+            Site::BodyNsSyntax          => { "body annots: the body's OWN file" }
+            Site::BodyNsCursor          => { "  no provenance: fell back to the cursor" }
+            Site::BodyNsDiff            => { "  syntax != cursor (the mis-judged set)" }
             Site::HomeCursorSame        => { "home == ambient cursor (proves nothing)" }
             Site::HomeCursorDiff        => { "home != ambient cursor (the evidence)" }
             Site::HomeDiffPlural        => { "  of those, leaf declared by >1 module" }
@@ -542,6 +563,20 @@ public function scope_diverge(home: string, name: string,
     fmt::eprintf("SCOPE-DIVERGE\t%s\t%s\t%s\t%s\n", home, name, home_qn, blind_qn);
 }
 
+/// Print one body-annotation context where the module that WROTE the body and
+/// the ambient cursor name different modules (§8, task #7).
+///
+/// `file` is carried because the two namespaces alone do not identify the
+/// body: the whole point of the divergence is that one module's function is
+/// being checked while the walk stands in another, and only the file says
+/// which function.  Emitted at the event, so it survives a failing build -
+/// see `vis_gate_reject` for why that matters.
+public function body_ns_diff(file: string, syntax_ns: string,
+                             cursor_ns: string) -> void {
+    if (!Audit::Scope.enabled()) { return; }
+    fmt::eprintf("BODY-NS\t%s\t%s\t%s\n", file, syntax_ns, cursor_ns);
+}
+
 // ---- Reporting ---------------------------------------------------------
 
 /// Drop every tally back to zero.  Exists so a driver that compiles more
@@ -632,6 +667,12 @@ public function report() -> void {
     Site::FnBindVisSingle.print_row();
     Site::FnBindVisPlural.print_row();
     Site::FnBindVisRetLane.print_row();
+
+    fmt::eprintf("\n-- body annotation provenance (spec §8, task #7) ------\n");
+    Site::BodyNsOwner.print_row();
+    Site::BodyNsSyntax.print_row();
+    Site::BodyNsCursor.print_row();
+    Site::BodyNsDiff.print_row();
 
     fmt::eprintf("\n-- ambient-cursor divergence (spec §2b, §5.2) ---------\n");
     fmt::eprintf("     (CRYO_SCOPE_PROBE only; all zero without it)\n");
