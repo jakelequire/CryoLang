@@ -1458,6 +1458,108 @@ control), under the same flip protocol as the visibility tripwire.
 > assertion to the colliding `Widget` fails the build with E0200 + E0358, so a
 > wrong bind is a hard error rather than a silent pass.
 
+### 8.2k §5.2's premise about 2c is 0.6% true — MEASURED (2026-08-05)
+
+§5.2 says the home-module preference step "exists solely to correct an ambient
+cursor pointing at the wrong module. With an explicit scope it has nothing to
+correct and is deleted, not fixed." **That premise is now measured, and it is
+wrong.**
+
+The step could not previously be measured because the counter could not tell
+*where a context's home module came from*. `ResolutionContext.home_module` is a
+bare string; a module recovered from a declaration's own record and one copied
+off the ambient scope cursor are indistinguishable once stored, so both landed
+in one tally that was flagged B1 on the assumption that the second case
+dominated.
+
+`HomeOrigin { Unset, Cursor, Syntax }` makes the provenance explicit, and
+`set_home_module` now **requires** it as an argument — the origin is not
+recoverable from the string, and a site that cannot say which it is has not
+established the annotation's module at all. Measured on
+`examples/09-json-config`:
+
+| | answers |
+|---|---:|
+| 2c total | 3,893 |
+| **from syntax provenance** (a declaration's recorded module, or a node span) | **3,870** |
+| from the ambient cursor | **23** |
+
+⇒ **2c is 99.4% authoritative scoped resolution.** It is already doing what
+§5.1 asks — resolving a leaf in the module that wrote it. Deleting it would
+delete the correct mechanism and leave the module-blind chain below it as the
+only answer. What should be deleted instead is **3b's ambient-cursor
+canonicalization and step 5**, the global leaf index.
+
+The classification was inverting the migration's own signal. 3b is flagged B3
+("answers from scope/imports rather than by guessing") while consulting the
+ambient cursor; 2c was flagged B1 while consulting the syntax's own module. So
+teaching a site real provenance moved answers 3b → 2c and made **B1 go up** —
+the ratchet reporting progress as regression. With the split, 2c's
+provenance-derived arm counts as B3 and the signal points the right way.
+
+Effect on B1, and the two parts must not be conflated:
+
+```
+B1  19,292 -> 15,460   (-3,832)
+       -35  a REAL reduction: answers that fell through to the global leaf
+            index now resolve in scope (the 8 turbofish sites, below)
+    -3,797  a MEASUREMENT CORRECTION: answers that were always authoritative,
+            previously miscounted as fuzzy
+```
+
+Only the 35 is fewer fallbacks. Reporting the 3,832 as "fallbacks removed"
+would be false.
+
+> **Design note.** The two-setter alternative — `set_home_module` plus
+> `set_home_module_from_syntax` — was rejected. A caller that forgets which one
+> to use silently gets the wrong bucket, and the wrong direction is the
+> dangerous one: labelling a cursor guess as authoritative launders it into
+> B3 and hides exactly what this instrument exists to expose. A required
+> argument cannot be forgotten.
+
+#### Where provenance comes from
+
+`CompilationContext::module_ns_of_file(file)` maps a span's file to its module.
+This is exact, not a heuristic: a `.cryo` file declares exactly one namespace
+(the parser records the first non-directive `ModuleDeclaration` as the file's
+`namespace_name` and stops), so file → module is a total function. Verified
+across `compiler/src` + `stdlib`: every file declares exactly one namespace, and
+no namespace is declared by two files. `ModuleInfo` already paired `file_path`
+with `namespace_name` and `ModuleGraph::find_module_by_path` already existed —
+this assembles data the compiler already had rather than adding a new index.
+
+Eight caller-scoped turbofish sites in `call_resolver.cryo` now take their home
+module from the call node's own span rather than from `current_module_name()`,
+which reads the cursor. That is the −35 above.
+
+#### The last 23 resist a cache — ATTEMPTED AND REVERTED
+
+The remaining cursor-derived answers are **free-function bodies**:
+`body_res_ctx` reads the owner type's module, which is invalid when there is no
+owner, and falls back to `namespace_display()`.
+
+Caching the module at `enter_function` from `func.span.file` **breaks the
+build** — `stdlib/core/mem.cryo`'s `transmute<From, To>` types
+`mut result: To` as `void` (E0200).
+
+The cause is lifetime, not value, and the instrument is what established that:
+`body_ns` and the cursor were **identical in all 26 sampled calls, zero
+divergence**. `enter_function` has no matching exit hook and `SemaState` has no
+current-function node, so a value cached there goes stale; `body_res_ctx` runs
+later, at annotation-resolution time, and reads whichever function was entered
+last. `namespace_display()` is *live*, and therefore self-correcting — which is
+why the worse mechanism works and the better one does not.
+
+A correct fix needs a real current-function node on `SemaState` with paired
+enter/exit, or resolution at `body_res_ctx` time from the function node rather
+than a cache. Until then the fallback stays, honestly labelled `Cursor`.
+
+> Two intermediate hypotheses were tested and **disproved** before this one:
+> that 2c was mis-resolving a generic parameter (binding the enclosing params
+> changed nothing), and that `module_ns_of_file` was returning `""` for stdlib
+> paths (it returns `std::core::mem` correctly). Both would have been plausible
+> as written-up causes. Neither survived measurement.
+
 ### 8.3 B2 is unmeasured
 
 Only the assoc-type projection (62) is instrumented. Sema's method and trait

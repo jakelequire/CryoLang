@@ -131,6 +131,23 @@ type struct CallResolver {
         return this.ctx.source_file;
     }
 
+    /// Module that WROTE the syntax at `span`.
+    ///
+    /// A turbofish (`make<Widget>(..)`) is syntax the CALLER wrote, so its bare
+    /// leaves mean what they mean in the caller's module -- which is not
+    /// necessarily the module the compiler is standing in when the annotation is
+    /// re-resolved.  `current_module_name()` above answers the latter (it reads
+    /// the ambient scope cursor) and is therefore the wrong source for this;
+    /// see spec §5.2 and §8.1e, where an exemption built on the cursor rejected
+    /// calls that never left their own file.
+    ///
+    /// Falls back to "" when the span names no module in the graph, which leaves
+    /// the context scope-less exactly as before rather than guessing.
+    syntax_module_of(&this, span: SourceSpan) -> string {
+        if (this.ctx == null) { return ""; }
+        return this.ctx.module_ns_of_file(span.file);
+    }
+
 
     // -- Callee / payload-type lookups (for expected-type propagation) --
 
@@ -1261,6 +1278,7 @@ type struct CallResolver {
         if (call.generic_args.length > 0) {
             mut rc: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
             this.symbolic.symbolic_bind_params(&rc);
+            rc.set_home_module(this.syntax_module_of(call.span), HomeOrigin::Syntax);
             mut n: i64 = call.generic_args.length;
             if (n > bindings.length) { n = bindings.length; }
             for (mut i: i64 = 0; i < n; i++) {
@@ -1393,6 +1411,7 @@ type struct CallResolver {
         for (mut i: i64 = 0; i < entry.param_type_ids.length; i++) { bindings.push(TypeRef::invalid()); }
         mut rc: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
         this.symbolic.symbolic_bind_params(&rc);
+        rc.set_home_module(this.syntax_module_of(call.span), HomeOrigin::Syntax);
         mut n: i64 = call.generic_args.length;
         if (n > bindings.length) { n = bindings.length; }
         for (mut i: i64 = 0; i < n; i++) {
@@ -1456,6 +1475,7 @@ type struct CallResolver {
         // `MethodBinding::solve_method_bindings`.
         mut tf_ctx: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
         this.symbolic.symbolic_bind_params(&tf_ctx);
+        tf_ctx.set_home_module(this.syntax_module_of(member.span), HomeOrigin::Syntax);
         mut bindings: TypeRef[] = [];
         for (mut i: i64 = 0; i < n_method_params; i++) {
             const tr: TypeRef = this.ctx.type_resolver.resolve(member.generic_args[i], &tf_ctx);
@@ -1622,6 +1642,7 @@ type struct CallResolver {
             if (targs.length != entry.param_type_ids.length) { return; }
             mut rc: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
             this.symbolic.symbolic_bind_params(&rc);
+            rc.set_home_module(this.syntax_module_of(call.span), HomeOrigin::Syntax);
             for (mut i: i64 = 0; i < targs.length; i++) {
                 const tr: TypeRef = this.ctx.type_resolver.resolve(targs[i], &rc);
                 if (!tr.is_valid()) { return; }
@@ -3662,6 +3683,7 @@ type struct CallResolver {
             if (targs.length != entry.param_type_ids.length) { return TypeRef::invalid(); }
             mut rc: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
             this.symbolic.symbolic_bind_params(&rc);
+            rc.set_home_module(this.syntax_module_of(call.span), HomeOrigin::Syntax);
             for (mut i: i64 = 0; i < targs.length; i++) {
                 const tr: TypeRef = this.ctx.type_resolver.resolve(targs[i], &rc);
                 if (!tr.is_valid()) { return TypeRef::invalid(); }
@@ -3850,6 +3872,7 @@ type struct CallResolver {
             if (targs.length != n) { return empty; }
             mut rc: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
             this.symbolic.symbolic_bind_params(&rc);
+            rc.set_home_module(this.syntax_module_of(call.span), HomeOrigin::Syntax);
             mut binds: TypeRef[] = [];
             for (mut i: i64 = 0; i < targs.length; i++) {
                 const tr: TypeRef = this.ctx.type_resolver.resolve(targs[i], &rc);
@@ -3909,6 +3932,7 @@ type struct CallResolver {
         if (want == 0) { return []; }
         mut rc: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
         this.symbolic.symbolic_bind_params(&rc);
+        rc.set_home_module(this.syntax_module_of(scope.span), HomeOrigin::Syntax);
         mut sb: TypeRef[] = [];
         for (mut i: i64 = 0; i < scope.scope_generic_args.length; i++) {
             const tr: TypeRef = this.ctx.type_resolver.resolve(scope.scope_generic_args[i], &rc);
@@ -4179,6 +4203,7 @@ type struct CallResolver {
         if (scope.scope_generic_args.length > 0 && this.ctx.type_resolver != null) {
             mut rc: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
             this.symbolic.symbolic_bind_params(&rc);
+            rc.set_home_module(this.syntax_module_of(scope.span), HomeOrigin::Syntax);
             mut sb: TypeRef[] = [];
             mut ok: boolean = true;
             for (mut i: i64 = 0; i < scope.scope_generic_args.length; i++) {
@@ -4246,7 +4271,7 @@ type struct CallResolver {
                 // declaration, so a bare leaf in it means whatever that leaf means in
                 // the TEMPLATE's module -- not in the caller's, which is where the
                 // ambient cursor is parked here (§5.2, keystone shape B).
-                rc_d.set_home_module(this.intern.resolve(tmpl.module_name));
+                rc_d.set_home_module(this.intern.resolve(tmpl.module_name), HomeOrigin::Syntax);
                 mut filled: TypeRef[] = this.ctx.type_resolver.expand_default_type_args(tmpl, prefix, &rc_d);
                 if (filled.length == want) {
                     mut all_ok: boolean = true;

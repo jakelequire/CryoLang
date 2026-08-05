@@ -28,6 +28,28 @@ import std::collections::pair;
 // ResolutionContext: context for type resolution
 
 /// Ambient state needed while resolving type annotations.
+/// Where a `ResolutionContext`'s `home_module` came from.
+///
+/// The distinction is load-bearing, not bookkeeping.  A home module derived
+/// from the SYNTAX's own span answers spec §5.1's question ("what does this
+/// leaf mean in the module it was written in") and is authoritative.  One
+/// derived from the ambient scope cursor answers "what does it mean in
+/// whichever module the compiler is standing in", which coincides only while a
+/// pass walks declarations in order and is wrong at every re-resolution site.
+///
+/// Both land in cascade step 2c, so without this the counter cannot tell a
+/// resolution that is right by construction from one that is right by
+/// coincidence, and migrating a site from the cursor to real provenance shows
+/// up as B1 going UP.  See `docs/name-resolution.md` §5.2.
+type enum HomeOrigin {
+    /// No home module; resolution falls through to the module-blind chain.
+    Unset;
+    /// Derived from the ambient scope cursor.  TRANSITIONAL - counts as B1.
+    Cursor;
+    /// Derived from the span of the syntax being resolved.  Counts as B3.
+    Syntax;
+}
+
 type struct ResolutionContext {
     current_module:   string;
     source_file:      string;
@@ -59,6 +81,9 @@ type struct ResolutionContext {
     /// site that does not know its home module keeps today's behavior.
     home_module:      string;
 
+    /// Provenance of `home_module`.  See `HomeOrigin`.
+    home_origin:      HomeOrigin;
+
     /// Demand-free (symbolic) resolution mode. When set, `resolve_generic`
     /// builds an arena-only `InstantiatedType` (via `arena.create_instantiation`)
     /// instead of routing through `generic_registry.instantiate_for_module`. The
@@ -77,14 +102,25 @@ type struct ResolutionContext {
             generic_bindings: [],
             this_type:        TypeRef::invalid(),
             home_module:      "",
+            home_origin:      HomeOrigin::Unset,
             symbolic_no_demand: false,
         };
     }
 
     /// Declare which module the annotations resolved through this context were
-    /// written in.  See `home_module`.
-    set_home_module(mut &this, module_ns: string) -> void {
+    /// written in, and WHERE THAT CLAIM CAME FROM.  See `home_module` and
+    /// `HomeOrigin`.
+    ///
+    /// The origin is a required argument on purpose: it is not recoverable from
+    /// the string, and a site that cannot say which one it is has not actually
+    /// established the annotation's module.  Passing `Cursor` is honest and
+    /// costs nothing but a B1 tally; passing `Syntax` when the value came from
+    /// the ambient cursor silently launders a guess into an authoritative
+    /// answer, which is the one failure this split exists to prevent.
+    set_home_module(mut &this, module_ns: string, origin: HomeOrigin) -> void {
         this.home_module = module_ns;
+        this.home_origin = if (module_ns.length() == 0) { HomeOrigin::Unset }
+                           else { origin };
     }
 
     /// Add a generic binding (e.g., T -> i32).
@@ -120,6 +156,7 @@ type struct ResolutionContext {
             ResolutionContext::new(this.current_module, this.source_file);
         out.this_type = this.this_type;
         out.home_module = this.home_module;
+        out.home_origin = this.home_origin;
         out.symbolic_no_demand = this.symbolic_no_demand;
         for (mut i: i64 = 0; i < this.generic_bindings.length; i++) {
             out.add_binding(this.generic_bindings[i].first,
@@ -1133,7 +1170,7 @@ type struct TypeResolver {
             // leaf index - `GlobalAlloc` alone was 13,687 of 17,084 leaf-index
             // answers.  See docs/name-resolution.md §8.2a.
             if (entry.module_name.is_valid()) {
-                def_ctx.set_home_module(this.intern_table.resolve(entry.module_name));
+                def_ctx.set_home_module(this.intern_table.resolve(entry.module_name), HomeOrigin::Syntax);
             }
             for (mut j: i64 = 0; j < filled.length; j++) {
                 def_ctx.add_binding(entry.param_names[j], filled[j]);
@@ -1547,7 +1584,18 @@ private:
                 const home_answer: TypeRef = this.follow_alias(home_hit);
                 this.probe_ambient_divergence(name, name_str, ctx,
                                               home_answer, home_via);
-                ResolveCounter::Site::RnHomeModule.bump();
+                // Same mechanism, two very different claims.  When the home
+                // module came from the syntax's own span this IS spec §5.1
+                // resolution - the leaf resolved in the module that wrote it -
+                // and counts as authoritative.  When it came from the ambient
+                // cursor it is still the pre-keystone tie-breaker and stays in
+                // B1, so migrating a site to real provenance shows up as B1
+                // going DOWN rather than up.  See `HomeOrigin`.
+                if (ctx.home_origin == HomeOrigin::Syntax) {
+                    ResolveCounter::Site::RnHomeModuleSyntax.bump();
+                } else {
+                    ResolveCounter::Site::RnHomeModule.bump();
+                }
                 return home_answer;
             }
         }
