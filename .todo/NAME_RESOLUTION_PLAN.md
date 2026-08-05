@@ -661,14 +661,32 @@ scan, and the name-keyed `codegen` sites.
 - resolution of nodes synthesized *after* the resolver runs (`async_lower.cryo`)
 - the §2.4 acceptance test: two packages each defining `Diagnostic`, both used
 
-Write tests against **desired** behavior and mark currently-failing ones as
-expected-fail. The corpus then doubles as the executable spec, and later phases
-are measured by expected-fail entries flipping to pass.
+Write tests against **desired** behavior. ~~Mark currently-failing ones as
+expected-fail.~~ **SUPERSEDED — there is no `xfail` mechanism and one will not
+be added.** It was built once and removed, and its re-addition was refused:
+*"I would rather have a test fail over a patchy green using xfail as a mask."*
 
-**Exit:** corpus committed and wired into `make test`; expected-fail mechanism
-working in both directions; every entry either passes or is a recorded
-expected-fail with a phase number attached; counter builds and reports a
-baseline for both buckets.
+Use the **tripwire pattern** instead: a real, passing test of the behavior the
+compiler has *today*, under a `WRONG_` name, with a loud header stating what
+the spec requires and a FLIP PROTOCOL for the change that fixes it — move the
+case to a `compile_fail` project with the right `expect.diagnostic`, in the
+same change, rather than weakening the assertion. `resolution_tripwire` is the
+worked example, and the protocol was exercised end-to-end on 2026-08-05 when
+its visibility half became `tests/tests/projects/visibility_gate`.
+
+Two things that pattern must carry, both learned the hard way:
+
+- **A control, and sometimes a control on the control.** A probe written to the
+  spec rather than to the parser tests nothing: top-level declarations are
+  PUBLIC by default (Q7), so a visibility probe that omits `private` is vacuous.
+- **A way to show WHICH mechanism it exercised.** `visibility_gate` needs one
+  private callee per binding door, because a single firing door otherwise
+  satisfies the whole assertion — and its door-3 module turned out not to be
+  compiled at all, which nothing but a per-rejection audit line could see.
+
+**Exit:** corpus committed and wired into `make test`; every entry either
+passes, or is a tripwire whose header names the spec section it violates and
+the flip it will get; counter builds and reports a baseline for both buckets.
 
 ---
 

@@ -1,39 +1,46 @@
-# resolution_tripwire - ONE KNOWN-WRONG BEHAVIOR, PINNED SO IT CANNOT MOVE
+# resolution_tripwire - KNOWN-WRONG BEHAVIOR, PINNED SO IT CANNOT MOVE
 #                       SILENTLY.  Read tests/tripwire_test.cryo first.
 #
-# A `private` function is callable from another module. Spec §3.3 says
-# "enforcement is a gate"; today visibility is only a tie-breaker, so a
-# declaration is reachable from anywhere as long as it is unambiguous.
+# WHAT IS STILL OPEN HERE (spec §5.1): a bare name resolves with NOTHING in
+# scope. `ResolutionTripwire::Orphan` has no `import` at all and names a type
+# only `Depot` declares; it resolves anyway, via the global leaf index. Both
+# `WRONG_` tests pin that. When it is fixed they must become E0203 -- follow
+# the flip protocol below.
 #
-# THE FLIP PROTOCOL. When the visibility gate lands this test STARTS FAILING.
-# That is the design. Convert this project to `compile_fail` with
-# `expect.diagnostic` E0353 in the SAME change that makes it an error -- do
-# not adjust the assertion to get back to green.
+# THE FLIP PROTOCOL. When a fix lands, the matching test STARTS FAILING. That
+# is the design. Move the case to a `compile_fail` project with the right
+# `expect.diagnostic` in the SAME change that makes it an error -- do not
+# adjust the assertion to get back to green.
 #
-# WHY THIS IS STILL HERE (measured 2026-08-04, and it cost a full attempt).
-# The fix looks separable from the §5.2 keystone and is NOT. There are three
-# doors -- a written qualified path, the bare binder's single-overload fast
-# path, and the multi-candidate path via `bare_candidate_scope` -- and all
-# three were shut, with the compiler and stdlib still self-building clean.
-# It still had to be reverted: every gate needs a "does the use site live in
-# the declaring module?" exemption, and that question is answered by
-# `current_module_ns()`, which is the AMBIENT CURSOR.
+# THE PROTOCOL HAS BEEN EXERCISED ONCE, ON THIS FILE (2026-08-05). The
+# visibility half -- "a `private` function is callable from another module" --
+# left for tests/tests/projects/visibility_gate, which asserts E0353 through
+# each of the gate's three binding doors. Only the public CONTROL stayed, in
+# tests/vault.cryo, because it has to keep running rather than merely
+# compiling.
 #
-# The cursor is wrong often enough to break the build. `std::fmt::display`'s
-# `private fmt_err` is called ONLY from its own file (display.cryo:610-656,
-# no cross-module caller exists), yet the gate rejected 8 of those calls
-# claiming the use site was `std::core::result` -- the f-string lowering
-# synthesizes those calls and they are checked with the cursor parked
-# somewhere else entirely.
+# THE HISTORY IS WORTH KEEPING, because the same trap is still live for the
+# §5.1 half. The visibility gate was built and REVERTED on 2026-08-04: all
+# three doors were shut and the compiler and stdlib self-built clean, yet the
+# test tree failed with 8 errors on `std::fmt::display::fmt_err` -- a private
+# function whose every caller is in its own file. Every gate needs a "does the
+# use site live in the declaring module?" exemption, and that one asked
+# `current_module_ns()`, the AMBIENT CURSOR, which points at whatever module
+# is being processed. The f-string lowering synthesizes those `fmt_err` calls
+# and they were checked with the cursor parked in `std::core::result`.
 #
-# So visibility enforcement is blocked on the keystone supplying a real
-# scope, exactly as spec §8.1d states. The counter's `FnBindPrivateBound == 0`
-# reads like evidence the gate is safe to switch on; it is not, because the
-# failure mode is FALSE POSITIVES from a wrong cursor, which that counter
-# does not measure.
+# It was unblocked by giving the exemption real provenance
+# (`module_ns_sym_of_file(span.file)` -- the module that WROTE the syntax).
+# Measured on examples/09-json-config: 204 of 204 "owner not in scope" events
+# were that same false positive, and all 204 vanished.
 #
-# Its sibling defect - a path silently dropping TRAILING module segments -
-# WAS fixed on 2026-08-04 and is now pinned as a real compile-fail case at
+# THE COUNTER LESSON GENERALIZES AND IS NOT RETIRED. `FnBindPrivateBound == 0`
+# read like evidence the gate was safe to switch on. It was not: it counts
+# what a gate would CATCH, and the failure mode was what it would BREAK. Any
+# fix to the §5.1 half above will have the same shape.
+#
+# A sibling defect - a path silently dropping TRAILING module segments - was
+# fixed on 2026-08-04 and is pinned at
 # tests/tests/negative/E0203_path_drops_trailing_segment.cryo.
 
 [project]

@@ -1,0 +1,47 @@
+/// Three `private` functions and one `public` control.
+///
+/// `private` is written out on every one of them and is load-bearing: spec Q7
+/// (decided 2026-08-04) makes a top-level declaration PUBLIC by default, so a
+/// visibility probe that leaves the keyword off tests nothing at all.  A
+/// probe that silently tests nothing is the failure mode this whole project
+/// exists to prevent (§4's "a zero needs a control").
+namespace VisibilityGate::Vault;
+
+/// Pulls `Annex` into the compilation. Module discovery is IMPORT-DRIVEN: a
+/// file sitting in `src/` that nothing imports is never compiled, so its
+/// declarations never reach the index. Measured 2026-08-05 -- without this
+/// line `Annex::stash` was absent from `CRYO_VIS_AUDIT`'s `VIS-RECORD`
+/// stream, the leaf `stash` was not plural after all, and `Main`'s door-3
+/// call was quietly caught by door 2 instead. The project still "passed".
+///
+/// It is imported HERE and not by `Main` on purpose: door 3 needs a candidate
+/// that is out of the USE SITE's scope, and `Main` importing it would make
+/// both candidates equally visible and turn the call into E0154 instead.
+import VisibilityGate::Annex;
+
+/// DOOR 1 -- reached by a WRITTEN QUALIFIED PATH (`Vault::latch()`).  This
+/// door resolves straight to a symbol in `resolve_module_qualified_function`
+/// and never meets the bare binder's scope classifier; before 2026-08-05 it
+/// was not even audited.
+private function latch() -> i32 { return 7; }
+
+/// DOOR 2 -- reached by a BARE call with a leaf that is unique program-wide,
+/// so the binder takes its single-overload fast path and pins without
+/// consulting scope at all.  This is the free-function twin of `decl_index`'s
+/// single-candidate fast path -- the same root cause in the other lane.
+private function secret() -> i32 { return 99; }
+
+/// DOOR 3 -- reached by a BARE call with a leaf that is PLURAL.
+/// `VisibilityGate::Annex` declares a `stash` with the same signature, which
+/// forces the binder past the fast path into multi-candidate selection.
+/// The call to `Annex::stash` is what makes the import above load-bearing
+/// rather than dead (and keeps the unused-import lint quiet). It is a
+/// qualified call to a PUBLIC function, so it passes the gate untouched.
+private function stash(v: i32) -> i32 { return VisibilityGate::Annex::stash(v) - 99; }
+
+/// CONTROL: a genuinely public sibling, called both bare and qualified from
+/// `Main`.  `test.json` asserts this name NEVER appears in the output.  If it
+/// does, the gate started rejecting public cross-module calls -- the false
+/// positive that reverted the first attempt (§8.1e) -- and the project would
+/// otherwise still "pass" on the strength of the three errors it expects.
+public function door() -> i32 { return 1; }
