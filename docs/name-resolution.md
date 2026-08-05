@@ -270,24 +270,28 @@ what actually forces compliance, and is normative.
 
 ### 7.1 What the language can force — measured
 
-Measured 2026-08-03 by compiling probe programs:
+Measured 2026-08-03 by compiling probe programs; the function row re-measured
+2026-08-05.
 
 | Mechanism | Enforced? | Evidence |
 |---|---|---|
 | Exhaustive `match` over an enum | **YES** | `E0405`; `tests/negative/E0405_non_exhaustive_match.cryo` |
 | Private struct/class **field** | **YES** | `E0353`; `tests/negative/E0353_private_field_access.cryo` |
-| Non-public **function**, cross-module | **NO** | probe compiled clean |
+| Non-public **function**, cross-module | **YES**, since 2026-08-05 | `E0353`; `tests/projects/visibility_gate` — all four binding doors, §8.1f |
 | Non-public **type**, cross-module | **NO** | probe compiled clean |
 
-**Cryo cannot currently enforce an API boundary.** Marking a function private
-does not stop another module from calling it. Therefore:
+**Cryo enforces an API boundary for functions, and still does not for types.**
+The function half landed with §8.1f; the type half is `resolve_qualified_scoped`'s
+single-candidate fast path (§8.1), which still answers `Unique` without
+consulting `is_candidate_public`. Therefore, and until that closes:
 
-> **Any design that relies on "make the fallback API private" does not work.
-> The fallback entry points must be DELETED, not hidden.**
+> **Any design that relies on "make the fallback API private" works only when
+> the fallback is a FUNCTION. A private TYPE is still reachable from anywhere it
+> is unambiguous, so type-level fallback entry points must be DELETED, not
+> hidden.**
 
-This is not a limitation to work around — §3.3 makes item visibility a real
-gate, which fixes it. But the resolver's own enforcement cannot depend on the
-feature it is implementing, so the mechanisms below are what carry it.
+The resolver's own enforcement still cannot depend on the feature it is
+implementing, so the mechanisms below are what carry the remaining work.
 
 ### 7.2 The four mechanisms
 
@@ -427,6 +431,11 @@ Counter caveats, both load-bearing when reading any number it prints:
 ### 8.1 Visibility is not enforced (§3.3)
 
 The defect in §1. Turning the gate on will reject code that compiles today.
+
+> **Scope note, 2026-08-05.** This section and its numbers are about the TYPE
+> lane — `decl_index`'s `resolve_qualified_scoped`. The FUNCTION lane is
+> enforced as of §8.1f and is no longer a gap. The two lanes were always
+> separate subsystems (§8.1c); only one of them has closed.
 
 **Blast radius, measured 2026-08-03** (compiler building itself, via
 `CRYO_VIS_AUDIT=1`, which logs every resolution that succeeded *only* because
@@ -752,6 +761,11 @@ not, as §8.1c claimed, a cheaper independent path.
 
 ### 8.1e The visibility gate was BUILT and REVERTED (2026-08-04) — it is blocked on the keystone, and the counter cannot see why
 
+> **SUPERSEDED on its conclusion by §8.1f.** The diagnosis below is correct and
+> still worth reading — the ambient cursor *was* the cause. Its closing claim is
+> not: the gate needed provenance for one question, not the whole keystone, and
+> it landed on 2026-08-05. Do not read "blocked" here as current.
+
 §8.1d attributed D-A to the ambient cursor. D-B — "bound to a PRIVATE
 candidate" — looked separable: it measures **0** on a compiler build, and
 rejecting a `private` declaration needs only visibility data the index already
@@ -810,6 +824,88 @@ and no part of it can be pulled forward.
 
 The sibling defect attempted in the same session — a path silently dropping
 TRAILING module segments — **was** fixable independently and landed; see §8.2h.
+
+### 8.1f The visibility gate LANDED (2026-08-05) — provenance was the whole missing input
+
+§8.1e concluded "the visibility gate is **not** available before the keystone,
+in either lane". That was right about the cause and wrong about the size of the
+prerequisite: the gate needed *one* question answered correctly — **which module
+wrote this call** — not the whole keystone. §8.2k had already built the machinery
+(`module_ns_of_file`); it had simply never been pointed at the exemption.
+
+**The hypothesis, and the number that settled it.** The exemption asked
+`current_module_ns()`. Point it at the call's own span instead and every §8.1e
+false positive should vanish, while genuine violations survive. Measured on
+`examples/09-json-config`, a fixed external target (§10):
+
+| | before | after |
+|---|---:|---:|
+| D-A "owner NOT in scope" | 204 | **0** |
+| use site from the syntax's own module | — | 254 (all of them) |
+| **no provenance: fell back to the cursor** | — | **0** |
+| syntax ≠ cursor | — | **204** |
+
+All 204 D-A events on this target were `std::fmt::display::fmt_err` blamed on
+`std::core::result` — the §8.1e false positive, and *nothing else*. The 204 that
+changed verdict are exactly the 204 where syntax and cursor disagree. Provenance
+was available for **every** decision, so the gate never has to fall back to a
+guess. The change was verified behaviour-neutral by building that target with the
+old and new compilers into separate trees: 63 files, byte-identical, including
+the linked binary.
+
+**What was built.**
+
+- `CompilationContext::module_ns_sym_of_file` — §8.2k's file→module map as an
+  interned id, for callers that *compare* namespaces rather than print them. It
+  returns the INVALID symbol when no module claims the file, which is
+  deliberately distinguishable from "the module whose namespace is empty": a
+  classifier that conflated them would read *unknown* use site as *different*
+  use site and reject everything.
+- `CallResolver::call_use_site_ns(span)` — the use site for a call, from the
+  syntax, with a counted fallback to the cursor.
+- `enforce_callee_visibility` — the gate, shared by every door.
+
+**Four doors, not three.** §8.1e named three; the return-type lane
+(`resolve_direct_call`'s fallback to the owner-less bare `func_returns` map,
+already instrumented as `FnBindUnscopedRet`) is a fourth and is now gated too.
+Each rejection records **which door caught it**, because shutting three of four
+is indistinguishable from shutting all four unless each is named — that
+indistinguishability is precisely why the first attempt looked like it worked.
+
+**Enforcement is by DIAGNOSTIC, not by candidate selection.** A private
+candidate still binds exactly as it did; the compile fails with E0353. Removing
+it from overload selection would silently rebind the call to a *different*
+function, and §4.1 says a wrong bind is a miscompile that every gate in this repo
+stays green through. An error is the honest outcome; a silent rebind is not.
+
+**D-A is still NOT enforced, and that is deliberate.** The "owner not in scope"
+dimension stays audit-only: §8.1d's 179 f-string-helper events are real
+out-of-scope binds that the stdlib depends on, because `AutoImport` cannot inject
+`std::fmt::interp` into a module the prelude re-exports. That is retired by §7.2
+mechanism 4, not by this gate. **Visibility and scope were separable after all —
+just not in the direction §8.1c guessed.**
+
+**The corpus, and what writing it caught.**
+`tests/tests/projects/visibility_gate` is a `compile_fail` project with one
+private callee *per door* (`latch` qualified, `secret` bare-unique, `stash`
+bare-plural) so that one firing door cannot satisfy the whole assertion, plus a
+public control asserted ABSENT from the output via `expect.output_excludes`.
+
+Writing it produced a result worth keeping. The door-3 case depends on a second
+module declaring the same leaf — and **that module was never compiled**. Module
+discovery is import-driven, so a file sitting in `src/` that nothing imports
+contributes no declarations, the leaf was never plural, and the call was quietly
+caught by door 2. The project passed. Only the per-rejection `VIS-GATE` audit
+line showed it, and only because that line is emitted **at the rejection** rather
+than tallied for the end-of-run report — which never prints on a failing build
+(§11 landmine 8), i.e. never prints for a `compile_fail` entry. A corpus entry
+that cannot report which mechanism it exercised is the same class of instrument
+as §8.2g's vacuous zero.
+
+`resolution_tripwire` was flipped exactly as its own protocol directs: the
+private-call case moved out as an error, the still-open §5.1 half stayed, and the
+public control stayed there too — it has to keep *running*, and a `compile_fail`
+project can only assert that a diagnostic is absent.
 
 ### 8.2 Fallback inventory
 

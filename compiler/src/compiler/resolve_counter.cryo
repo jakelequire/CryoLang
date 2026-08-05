@@ -143,6 +143,31 @@ type enum Site {
     FnBindPrivateBound;
     FnBindUnscopedRet;
 
+    // Where the bare-call binder's USE SITE came from.  Every scope and
+    // visibility verdict above is relative to a use site, so these say whether
+    // those verdicts were computed against the module that wrote the call or
+    // against the ambient cursor.  UseDiff is the one to read: it counts the
+    // calls where the two disagree, i.e. exactly the population the cursor was
+    // mis-judging.  Reading SingleHidden without it repeats §8.1e - a violation
+    // count says what a gate would CATCH, never what it would BREAK.
+    FnBindUseSyntax;
+    FnBindUseCursor;
+    FnBindUseDiff;
+
+    // ENFORCED (spec §3.3, §8.1e): calls rejected as cross-module `private`.
+    // Unlike the rows above this one is not a blast radius - it is the gate
+    // firing.  A NON-zero value is only correct if every event is a real
+    // violation; read it with the corpus, never on its own.
+    FnBindVisReject;
+    // ...broken down by WHICH of the doors in §8.1e caught it.  Qualified is
+    // the written path, Single the bare binder's one-candidate fast path,
+    // Plural its multi-candidate selection, RetLane the separate door that
+    // supplies a return TYPE from the owner-less bare map.
+    FnBindVisQualified;
+    FnBindVisSingle;
+    FnBindVisPlural;
+    FnBindVisRetLane;
+
     // Ambient-cursor divergence (§2b, §5.2), measured where the true scope is
     // KNOWN: the home-module preference step.  There a caller has said which
     // module the annotation was written in, so the module-blind chain can be
@@ -238,6 +263,14 @@ implement enum Site {
             Site::FnBindSingleHidden    => { "!! " }
             Site::FnBindPrivateBound    => { "!! " }
             Site::FnBindUnscopedRet     => { "B1 " }
+            Site::FnBindUseSyntax       => { "   " }
+            Site::FnBindUseCursor       => { "   " }
+            Site::FnBindUseDiff         => { "   " }
+            Site::FnBindVisReject       => { "!! " }
+            Site::FnBindVisQualified    => { "   " }
+            Site::FnBindVisSingle       => { "   " }
+            Site::FnBindVisPlural       => { "   " }
+            Site::FnBindVisRetLane      => { "   " }
             Site::HomeCursorSame        => { "   " }
             Site::HomeCursorDiff        => { "   " }
             Site::HomeDiffPlural        => { "   " }
@@ -298,6 +331,14 @@ implement enum Site {
             Site::FnBindSingleHidden    => { "  of those, owner NOT in scope (D-A)" }
             Site::FnBindPrivateBound    => { "bound to a PRIVATE candidate  (D-B)" }
             Site::FnBindUnscopedRet     => { "bare return-type answers, NO scope input" }
+            Site::FnBindUseSyntax       => { "use site from the SYNTAX's own module" }
+            Site::FnBindUseCursor       => { "  no provenance: fell back to the cursor" }
+            Site::FnBindUseDiff         => { "  syntax != cursor (the mis-judged set)" }
+            Site::FnBindVisReject       => { "REJECTED: private, cross-module (E0353)" }
+            Site::FnBindVisQualified    => { "  door 1: written qualified path" }
+            Site::FnBindVisSingle       => { "  door 2: single-overload fast path" }
+            Site::FnBindVisPlural       => { "  door 3: multi-candidate selection" }
+            Site::FnBindVisRetLane      => { "  door 4: bare return-type lane" }
             Site::HomeCursorSame        => { "home == ambient cursor (proves nothing)" }
             Site::HomeCursorDiff        => { "home != ambient cursor (the evidence)" }
             Site::HomeDiffPlural        => { "  of those, leaf declared by >1 module" }
@@ -439,6 +480,24 @@ public function fnbind_violation(kind: string, use_site: string,
     fmt::eprintf("FNBIND-VIOLATION\t%s\t%s\t%s\n", kind, use_site, cand);
 }
 
+/// Log one call REJECTED by the visibility gate, naming the door it was
+/// caught by.
+///
+/// Emitted at the rejection rather than tallied for the end-of-run report,
+/// because a rejected call means the build FAILS, and the report only prints
+/// on the success path after link.  Without this, the one measurement that
+/// matters for a compile_fail corpus entry - "did the door this case was
+/// written for actually fire?" - is unavailable precisely when the case
+/// works.  `visibility_gate`'s `stash` is the motivating example: if its
+/// second declarer stopped being compiled, the call would silently fall back
+/// to the single-overload door and the project would still pass while testing
+/// nothing it claims to.
+public function vis_gate_reject(door: string, use_site: string,
+                                cand: string) -> void {
+    if (!Audit::Visibility.enabled()) { return; }
+    fmt::eprintf("VIS-GATE\t%s\t%s\t%s\n", door, use_site, cand);
+}
+
 /// Log one QUALIFIED PATH that a namespace-suffix matcher resolved, to size
 /// the migration §5.1 ("first segment resolves in scope, remainder rooted")
 /// implies.  `docs/name-resolution.md` §9 / plan R4.
@@ -565,6 +624,14 @@ public function report() -> void {
     Site::FnBindSingleHidden.print_row();
     Site::FnBindPrivateBound.print_row();
     Site::FnBindUnscopedRet.print_row();
+    Site::FnBindUseSyntax.print_row();
+    Site::FnBindUseCursor.print_row();
+    Site::FnBindUseDiff.print_row();
+    Site::FnBindVisReject.print_row();
+    Site::FnBindVisQualified.print_row();
+    Site::FnBindVisSingle.print_row();
+    Site::FnBindVisPlural.print_row();
+    Site::FnBindVisRetLane.print_row();
 
     fmt::eprintf("\n-- ambient-cursor divergence (spec §2b, §5.2) ---------\n");
     fmt::eprintf("     (CRYO_SCOPE_PROBE only; all zero without it)\n");

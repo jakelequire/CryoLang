@@ -148,6 +148,37 @@ type struct CallResolver {
         return this.ctx.module_ns_of_file(span.file);
     }
 
+    /// The use site a bare CALL must be judged against: the module whose source
+    /// text contains the call, not the module the compiler happens to be
+    /// standing in while it types the call.
+    ///
+    /// Every scope and visibility rule in §3.3/§4 is relative to a use site, and
+    /// both classifiers below took theirs from `current_module_ns()` - the
+    /// ambient cursor.  Generic bodies are typed with the cursor parked on the
+    /// module that owns the *receiver* type, so calls that never leave their own
+    /// file are judged as cross-module: 204 of the 204 D-A "owner not in scope"
+    /// events on `examples/09-json-config` were `std::fmt::display::fmt_err`
+    /// called from `stdlib/fmt/display.cryo` itself, blamed on
+    /// `std::core::result`.  Reading that as real is what made the visibility
+    /// gate reject correct code and get reverted (spec §8.1e).
+    ///
+    /// Falls back to the cursor - not to "no scope" - when the span names no
+    /// module in the graph (nodes synthesized without a file, single-file mode).
+    /// The fallback is counted, so "provenance was available" is never confused
+    /// with "provenance agreed with the cursor".
+    call_use_site_ns(&this, span: SourceSpan) -> SymbolStr {
+        if (this.ctx == null) { return SymbolStr::empty(); }
+        const cursor: SymbolStr = this.ctx.current_module_ns();
+        const syn: SymbolStr = this.ctx.module_ns_sym_of_file(span.file);
+        if (!syn.is_valid()) {
+            ResolveCounter::Site::FnBindUseCursor.bump();
+            return cursor;
+        }
+        ResolveCounter::Site::FnBindUseSyntax.bump();
+        if (syn.id != cursor.id) { ResolveCounter::Site::FnBindUseDiff.bump(); }
+        return syn;
+    }
+
 
     // -- Callee / payload-type lookups (for expected-type propagation) --
 
@@ -2228,6 +2259,11 @@ type struct CallResolver {
             scoped_bare = true;
         }
         if (overloads.length == 0) { return TypeRef::invalid(); }
+        // The use site every scope decision below is relative to.  Computed once
+        // (it costs a module-graph path lookup) and only on the bare path - a
+        // qualified key names one declaration family and is never scope-checked.
+        const use_ns: SymbolStr = if (scoped_bare) { this.call_use_site_ns(call.span) }
+                                  else { SymbolStr::empty() };
         if (overloads.length == 1) {
             // AUDIT ONLY - behavior deliberately unchanged.
             // This is the free-function twin of decl_index's single-candidate
@@ -2236,7 +2272,8 @@ type struct CallResolver {
             // site never imported binds anyway.  Measure before gating.
             ResolveCounter::Site::FnBindSingle.bump();
             if (scoped_bare && owners.length > 0 && owners[0] != 0) {
-                this.audit_fnbind_candidate(owners[0]);
+                this.check_fnbind_candidate(owners[0], use_ns, call.span,
+                    ResolveCounter::Site::FnBindVisSingle);
             }
             mut unique_mangled: SymbolStr = di.lookup_overload_mangled(lookup_key, overloads[0]);
             if (!unique_mangled.is_valid()) { unique_mangled = di.lookup_mangled_name(lookup_key); }
@@ -2279,7 +2316,7 @@ type struct CallResolver {
             for (mut oi: i64 = 0; oi < overloads.length; oi++) {
                 const owner: u32 = if (owners.length > oi) { owners[oi] } else { 0 };
                 if (owner == 0) { t_legacy.push(oi); continue; }
-                match (this.bare_candidate_scope(owner)) {
+                match (this.bare_candidate_scope(owner, use_ns)) {
                     BareCandidateScope::Imported => { t_imported.push(oi); }
                     BareCandidateScope::Prelude  => { t_prelude.push(oi); }
                     BareCandidateScope::Global   => { t_legacy.push(oi); }
@@ -2299,7 +2336,10 @@ type struct CallResolver {
             if (tier_len != 1) { return TypeRef::invalid(); }
             const oi: i64 = tier_first;
             const owner: u32 = if (owners.length > oi) { owners[oi] } else { 0 };
-            if (owner != 0) { this.audit_fnbind_candidate(owner); }
+            if (owner != 0) {
+                this.check_fnbind_candidate(owner, use_ns, call.span,
+                    ResolveCounter::Site::FnBindVisPlural);
+            }
             mut mangled: SymbolStr = SymbolStr::empty();
             if (owner != 0) {
                 mangled = di.lookup_overload_mangled_owned(lookup_key, overloads[oi], owner);
@@ -2319,7 +2359,8 @@ type struct CallResolver {
             const oi: i64 = matches[0];
             mut mangled: SymbolStr = SymbolStr::empty();
             if (scoped_bare && owners.length > oi && owners[oi] != 0) {
-                this.audit_fnbind_candidate(owners[oi]);
+                this.check_fnbind_candidate(owners[oi], use_ns, call.span,
+                    ResolveCounter::Site::FnBindVisPlural);
                 mangled = di.lookup_overload_mangled_owned(
                     lookup_key, overloads[oi], owners[oi]);
             }
@@ -2350,7 +2391,7 @@ type struct CallResolver {
             const oi: i64 = matches[mi];
             const owner: u32 = if (owners.length > oi) { owners[oi] } else { 0 };
             if (owner == 0) { legacy.push(oi); continue; }
-            match (this.bare_candidate_scope(owner)) {
+            match (this.bare_candidate_scope(owner, use_ns)) {
                 BareCandidateScope::Imported => { imported_owned.push(oi); }
                 BareCandidateScope::Prelude  => { prelude_owned.push(oi); }
                 BareCandidateScope::Global   => { legacy.push(oi); }
@@ -2372,7 +2413,8 @@ type struct CallResolver {
             // bare ownership), so taking the first is exact.
             const oi: i64 = if (imported_owned.length == 1) { imported_owned[0] }
                             else { prelude_owned[0] };
-            this.audit_fnbind_candidate(owners[oi]);
+            this.check_fnbind_candidate(owners[oi], use_ns, call.span,
+                    ResolveCounter::Site::FnBindVisPlural);
             mut mangled: SymbolStr = di.lookup_overload_mangled_owned(
                 lookup_key, overloads[oi], owners[oi]);
             if (!mangled.is_valid()) {
@@ -2391,16 +2433,28 @@ type struct CallResolver {
         return TypeRef::invalid();
     }
 
-    /// AUDIT ONLY (spec §3.3, §4).  Classify a candidate the bare-call binder
-    /// is about to pin, against the two rules this binder does not enforce:
-    /// its owning module must be in scope, and it must be public.  Counts
-    /// only; the caller pins regardless.
-    audit_fnbind_candidate(&this, owner: u32) -> void {
+    /// Judge a candidate the bare-call binder is about to pin, against the two
+    /// rules of §3.3/§4: its owning module must be in scope, and it must be
+    /// public.  The two halves are NOT treated alike, and the asymmetry is the
+    /// point:
+    ///
+    ///   - **in scope (D-A) is AUDIT ONLY.**  It counts and does not reject.
+    ///     The f-string lowering synthesizes `fmt_new` / `fmt_append_lit` calls
+    ///     into stdlib modules that cannot import `std::fmt::interp` -- the
+    ///     skip that prevents a prelude import cycle is load-bearing (§8.1d) --
+    ///     so enforcing scope here would reject the stdlib.  It is retired by
+    ///     §7.2 mechanism 4, not by a gate.
+    ///   - **public (D-B) is ENFORCED**, via `enforce_callee_visibility`.
+    ///
+    /// Every caller is a point where the binder is about to pin, which is why
+    /// the gate lives here rather than at each of them: doors 2, 3 and 4 all
+    /// funnel through this one function.  `door` records which.
+    check_fnbind_candidate(mut &this, owner: u32, use_ns: SymbolStr,
+                           span: SourceSpan, door: ResolveCounter::Site) -> void {
         const owner_sym: SymbolStr = SymbolStr::from_id(owner);
         const di: DeclarationIndex* = this.ctx.decl_index;
         const c_ns: SymbolStr = di.namespace_of(owner_sym, this.intern);
         if (!c_ns.is_valid()) { return; }
-        const use_ns: SymbolStr = this.ctx.current_module_ns();
         // A module always sees its own items, public or not (spec §4).
         if (c_ns.id == use_ns.id) { return; }
         mut kind: string = "";
@@ -2416,6 +2470,60 @@ type struct CallResolver {
             ResolveCounter::fnbind_violation(kind,
                 this.intern.resolve(use_ns), this.intern.resolve(owner_sym));
         }
+        this.enforce_callee_visibility(owner_sym, use_ns, span, door);
+    }
+
+    /// Spec §3.3 - visibility is a GATE, not a tie-breaker.  Emits E0353 when
+    /// `callee` belongs to another module and is not public.
+    ///
+    /// Each early `return` is a deliberate refusal to judge, because the
+    /// failure mode that reverted this gate (§8.1e) is the FALSE POSITIVE, not
+    /// the miss:
+    ///
+    ///   - a symbolic/trial walk is in progress: those bind speculatively;
+    ///   - the callee has no owning namespace - an `extern "C"` twin or an
+    ///     intrinsic, which is not a module member to enforce against;
+    ///   - the use site is UNKNOWN.  `call_use_site_ns` returns an invalid
+    ///     symbol when nothing names the span's module, and an invalid symbol
+    ///     compares unequal to every real one - judging here would reject
+    ///     every call rather than none;
+    ///   - the use site IS the declaring module (spec §4).  This is the clause
+    ///     that misfired: it used to ask `current_module_ns()`, the ambient
+    ///     cursor, and rejected 204 `std::fmt::display::fmt_err` calls that
+    ///     never leave `display.cryo`.  It now asks where the syntax was
+    ///     written, which is the question §4 is actually about.
+    ///
+    /// This REPORTS; it does not change which symbol binds.  Removing a private
+    /// candidate from overload selection would silently rebind the call to a
+    /// different function, and a wrong bind is a miscompile that every gate in
+    /// this repo stays green through (§4.1).  A hard error is the honest one.
+    enforce_callee_visibility(mut &this, callee: SymbolStr, use_ns: SymbolStr,
+                              span: SourceSpan, door: ResolveCounter::Site) -> void {
+        if (this.state.in_symbolic_check) { return; }
+        if (!callee.is_valid() || !use_ns.is_valid()) { return; }
+        const di: DeclarationIndex* = this.ctx.decl_index;
+        const c_ns: SymbolStr = di.namespace_of(callee, this.intern);
+        if (!c_ns.is_valid()) { return; }
+        if (c_ns.id == use_ns.id) { return; }
+        if (di.is_candidate_public(callee)) { return; }
+        ResolveCounter::Site::FnBindVisReject.bump();
+        // WHICH door caught it.  §8.1e's lesson is that shutting two of the
+        // three doors is indistinguishable from shutting all three - the call
+        // still fails to bind through the open one only when nothing else
+        // reaches it.  Without this breakdown a corpus entry cannot show that
+        // the door it was written for is the door that fired.
+        door.bump();
+        const callee_str: string = this.intern.resolve(callee);
+        ResolveCounter::vis_gate_reject(door.label(),
+            this.intern.resolve(use_ns), callee_str);
+        mut d: Diagnostic = Diagnostic::error(
+            ErrorCode::E0353_PRIVATE_ACCESS,
+            format("`%s` is private and cannot be called from `%s`",
+                callee_str, this.intern.resolve(use_ns)));
+        d = d.at_with_label(span,
+            format("`%s` is private to its declaring module", callee_str));
+        d = d.with_note("declare it `public` to allow calls from other modules");
+        this.ctx.emit_diagnostic(d);
     }
 
     /// Scope class of a bare-call overload candidate owned by `owner` (a
@@ -2425,12 +2533,15 @@ type struct CallResolver {
     ///
     /// NOTE: no visibility dimension - an imported module's `private` function
     /// classifies as `Imported` and binds (defect D-B, spec §8.1c).
-    bare_candidate_scope(&this, owner: u32) -> BareCandidateScope {
+    ///
+    /// `use_ns` comes from `bare_use_site_ns` (the syntax's own module), NOT
+    /// from the ambient cursor: this classifier decides which candidates may
+    /// capture a bare name, so a wrong use site silently rebinds the call.
+    bare_candidate_scope(&this, owner: u32, use_ns: SymbolStr) -> BareCandidateScope {
         const di: DeclarationIndex* = this.ctx.decl_index;
         const owner_sym: SymbolStr = SymbolStr::from_id(owner);
         const c_ns: SymbolStr = di.namespace_of(owner_sym, this.intern);
         if (!c_ns.is_valid()) { return BareCandidateScope::Global; }
-        const use_ns: SymbolStr = this.ctx.current_module_ns();
         if (c_ns.id == use_ns.id) { return BareCandidateScope::Imported; }
         if (di.ns_imports(use_ns, c_ns)) { return BareCandidateScope::Imported; }
         if (di.is_prelude_ns(c_ns)) { return BareCandidateScope::Prelude; }
@@ -2502,7 +2613,11 @@ type struct CallResolver {
                 ResolveCounter::Site::FnBindUnscopedRet.bump();
                 const alts: SymbolStr[] =
                     this.ctx.decl_index.lookup_qualified_alternatives(ident.name);
-                if (alts.length == 1) { this.audit_fnbind_candidate(alts[0].id); }
+                if (alts.length == 1) {
+                    this.check_fnbind_candidate(alts[0].id, this.call_use_site_ns(ident.span),
+                                                ident.span,
+                                                ResolveCounter::Site::FnBindVisRetLane);
+                }
             }
         }
         if (func_ret.is_valid()) {
@@ -4598,6 +4713,18 @@ type struct CallResolver {
         if (!q_sym.is_valid()) { return TypeRef::invalid(); }
         const ret: TypeRef = this.types.lookup_func_return(q_sym);
         if (!ret.is_valid()) { return TypeRef::invalid(); }
+        // DOOR 1 (spec §8.1e).  A WRITTEN qualified path resolves straight to a
+        // symbol here and never meets the bare binder's scope classifier, so it
+        // was not previously audited at all.  Shutting the other two doors
+        // without this one leaves the hole fully open - which is why the first
+        // attempt looked like it worked.
+        const q_span: SourceSpan = if (call != null) {
+            call.span
+        } else {
+            if (scope != null) { scope.span } else { SourceSpan::none() }
+        };
+        this.enforce_callee_visibility(q_sym, this.call_use_site_ns(q_span), q_span,
+            ResolveCounter::Site::FnBindVisQualified);
 
         mut is_fn_template: boolean = false;
         mut tmpl: TemplateEntry* = null;

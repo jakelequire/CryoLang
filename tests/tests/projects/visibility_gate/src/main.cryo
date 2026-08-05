@@ -1,0 +1,50 @@
+/// ==================== THE VISIBILITY GATE, PINNED ======================
+///
+/// Spec §3.3: "enforcement is a gate".  A `private` declaration must not be
+/// callable from another module.  This project asserts that, and asserts it
+/// through EACH of the three doors independently.
+///
+/// WHY THREE, AND WHY SEPARATELY.  The first attempt at this gate
+/// (2026-08-04, docs/name-resolution.md §8.1e) shut two doors and looked like
+/// it worked: the compiler and stdlib self-built clean and a private call
+/// still compiled through the third.  Shutting any two is indistinguishable
+/// from shutting all three unless each is named and observed, so each door
+/// here has its OWN private callee and `test.json` requires all three names
+/// in the output.  One shared callee would let a single firing door satisfy
+/// the whole assertion.
+///
+/// WHAT WOULD HAVE BROKEN THIS BEFORE 2026-08-05.  The gate needs a "does the
+/// use site live in the declaring module?" exemption, and that used to ask
+/// `current_module_ns()` -- the ambient scope cursor.  The cursor is parked on
+/// whichever module is being processed, not on the module that wrote the
+/// call, so the exemption misfired and rejected 204 `fmt_err` calls that never
+/// leave `stdlib/fmt/display.cryo`.  The exemption now asks
+/// `module_ns_sym_of_file(span.file)` -- where the syntax was written.
+///
+/// IF THIS PROJECT STARTS PASSING ITS BUILD: a door reopened.  Do not relax
+/// `test.json`.
+///
+/// =======================================================================
+namespace VisibilityGate::Main;
+
+import VisibilityGate::Vault;
+
+function main() -> int {
+    // DOOR 1 -- written qualified path.
+    mut n: i32 = VisibilityGate::Vault::latch();
+
+    // DOOR 2 -- bare call, leaf unique program-wide (single-overload path).
+    n = n + secret();
+
+    // DOOR 3 -- bare call, leaf declared by Vault AND Annex (multi-candidate
+    // path).  Only Vault is imported, so Vault's private `stash` is selected.
+    n = n + stash(1);
+
+    // CONTROLS.  Both must compile silently.  `test.json` excludes the name
+    // `Vault::door` from the output: a gate that rejects these is broken in
+    // the direction that actually costs -- false positives on correct code.
+    n = n + door();
+    n = n + VisibilityGate::Vault::door();
+
+    return n as int;
+}

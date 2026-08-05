@@ -1,23 +1,34 @@
 /// ============================ TRIPWIRE ==================================
 ///
-/// THE FIRST TEST BELOW PINS BEHAVIOR docs/name-resolution.md SAYS IS WRONG.
-/// It passes today because the compiler is wrong today.
+/// THE TWO `WRONG_` TESTS BELOW PIN BEHAVIOR docs/name-resolution.md SAYS IS
+/// WRONG. They pass today because the compiler is wrong today.
 ///
-/// IF YOU ARE HERE BECAUSE IT STARTED FAILING: that is the intended outcome,
-/// and it means someone landed the visibility gate. Do NOT delete the
-/// assertion to get back to green. Convert this project to `compile_fail`
-/// with `expect.diagnostic` E0353, in the same change that made it an error.
+/// IF YOU ARE HERE BECAUSE ONE STARTED FAILING: that is the intended outcome,
+/// and it means someone landed the fix. Do NOT delete the assertion to get
+/// back to green. Move the case to a `compile_fail` project with the right
+/// `expect.diagnostic`, in the same change that made it an error -- which is
+/// exactly what happened to this file's visibility half on 2026-08-05; see
+/// below.
 ///
 /// Same trust-loop reasoning as tests/tests/projects/known_fail_canary: a
 /// defect that nothing in CI observes is how this subsystem regressed for
 /// years (§7's opening premise).
 ///
-/// DO NOT "just switch the gate on" without reading the cryoconfig. That was
-/// tried on 2026-08-04: all three binding doors were shut and the compiler
-/// and stdlib still self-built clean, but it had to be reverted because the
-/// same-module exemption reads the AMBIENT CURSOR, which is wrong often
-/// enough to reject calls that never leave their own file. It is blocked on
-/// the §5.2 keystone, not on someone noticing.
+/// ---- WHAT LEFT, AND WHEN ----------------------------------------------
+///
+/// The cross-module `private` call that used to head this file is GONE: the
+/// visibility gate landed on 2026-08-05 and it is now an E0353 error, pinned
+/// through all three of its binding doors at
+/// tests/tests/projects/visibility_gate. The flip was performed exactly as
+/// the instruction above directs -- the case moved, it was not weakened.
+///
+/// What unblocked it was provenance. The gate had been built and reverted on
+/// 2026-08-04 because its "does the use site live in the declaring module?"
+/// exemption asked `current_module_ns()`, the AMBIENT CURSOR, which points at
+/// whatever module is being processed rather than at the module that wrote
+/// the call. The exemption now asks `module_ns_sym_of_file(span.file)`.
+///
+/// The §5.1 half below is untouched and still open.
 ///
 /// ========================================================================
 ![config(testing)]
@@ -29,31 +40,11 @@ import std::test::assert;
 
 import ResolutionTripwire::Vault;
 
-// ---- KNOWN DEFECT: cross-module `private` call (§3.3, §8.1c) -----------
-//
-// §3.3: "enforcement is a gate". Today `resolve_qualified_scoped`'s
-// single-candidate fast path returns Unique without consulting
-// `is_candidate_public`, so a `private` declaration is reachable from
-// anywhere as long as it is unambiguous.
-//
-// §8.1c adds the part that makes this hard: a FUNCTION call is bound by
-// sema/call_resolver.cryo, a separate subsystem that never reaches the
-// visibility gate at all -- and it has three independent doors.
-//
-// AFTER THE FIX this must be an E0353 visibility error.
-
-![test]
-function WRONG_a_private_function_is_callable_from_another_module()
-        -> Result<(), TestError> {
-    // `secret` is declared `private` in ResolutionTripwire::Vault.
-    // Qualified path: one of the three doors.
-    expect_eq(ResolutionTripwire::Vault::secret(), 99)?;
-    return Result::Ok(());
-}
-
-/// CONTROL, and CORRECT behavior -- must stay green through the fix. If this
-/// ever fails alongside the tripwire above, the visibility work broke public
-/// access rather than closing the private hole.
+/// CONTROL for the gate that landed, and it stays HERE rather than moving to
+/// the compile_fail project with the defect: this one has to keep RUNNING.
+/// `visibility_gate` can only assert that a name is absent from a build's
+/// diagnostics, which would still hold if public cross-module calls had been
+/// broken some other way. This executes one and checks the value.
 ![test]
 function CONTROL_a_public_function_is_callable_from_another_module()
         -> Result<(), TestError> {
