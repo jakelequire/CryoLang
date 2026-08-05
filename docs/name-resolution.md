@@ -308,13 +308,44 @@ feature it is implementing, so the mechanisms below are what carry it.
    when someone noticed "0 hits across all builds." A gate converts "do not add
    fallbacks" from a principle into a build failure.
 
-   > **NOT YET WIRED (checked 2026-08-04).** `CRYO_RESOLVE_COUNTER` appears
-   > nowhere in `Makefile`, `scripts/`, or `.github/` — the gate is currently a
-   > statement in this document, which §7's own opening sentence says is not
-   > enough. Until a build step runs the counter and fails on a nonzero B1,
-   > every B1 figure in §8 is a snapshot taken by hand, and the cascade can
-   > regrow between snapshots exactly as it did before. Wiring it is cheap and
-   > blocks on no other phase.
+   > **WIRED 2026-08-04.** `scripts/b1-gate.py`, `make b1-check`, golden at
+   > `tests/b1-baseline.txt`, and a CI step next to `roster-check`. It runs a
+   > fixed external target (`examples/09-json-config`) with
+   > `--no-incremental CRYO_CODEGEN_THREADS=1` and asserts the B1 total plus
+   > every per-site `B1`-flagged row.
+   >
+   > **It is a RATCHET, not a literal `B1 == 0`.** B1 is not zero today, so
+   > that assertion would be red from the moment it was wired, and §7.2a's
+   > lesson has an inverse: a gate that can *only* fail gets switched off. The
+   > golden pins the current value and **any drift fails** — an increase is the
+   > regression this exists to catch, and a decrease is progress that must be
+   > re-pinned so the lower value becomes the new bound. A tolerated decrease
+   > would leave the old higher number as the ceiling and let a later
+   > regression back up to it pass unnoticed. When Phase 2–4 drive it to 0 the
+   > golden reads 0 and this becomes the permanent gate, with no change to the
+   > script.
+   >
+   > Three things that were not obvious and are encoded in the script:
+   >
+   > - **The `B1` flag is a family label, not the summation set.** `M1..M5
+   >   calls` and `lookup_by_leaf calls` are flagged `B1` but are *not* summed
+   >   (B1 counts answers, never attempts), and cascade step 5 is flagged `B1*`
+   >   and excluded as nested inside `lookup_by_leaf hits`. Asserting
+   >   `rows == total` is therefore wrong and makes the gate unrunnable; the
+   >   invariant that does hold, and is checked, is `total <= row_sum`.
+   > - **`cryo check` emits no counter report at all.** `ResolveCounter::report()`
+   >   sits on the success path of a full build, after link
+   >   (`instance.cryo:2647`), so every measurement needs a successful link —
+   >   which is why the gate depends on `runtime-tiers` and why landmine 6
+   >   presents as a B1 failure. The script recognizes `__ImageBase` and says so.
+   > - **The golden needed a `.gitignore` exemption.** `*.txt` is ignored
+   >   repo-wide; without `!tests/b1-baseline.txt` the golden is never
+   >   committed and CI fails on a fresh clone with "no golden".
+   >
+   > Verified before being trusted: two consecutive runs agree exactly
+   > (B1 = 19,292 over 20 rows), and the gate was made to fail on a simulated
+   > increase, a simulated decrease, and a vanished site, each with a per-site
+   > diff naming what moved.
 
 4. **An unstamped node is an ICE, never a fallback.** A path-bearing node that
    reaches a stage after `NameResolution` without a `Res` is an internal
@@ -718,6 +749,67 @@ stamping `Res` directly.
 So D-A's migration is **zero import lines** beyond the six already applied, and
 turning the call-lane gate on requires the *same* keystone as the type lane —
 not, as §8.1c claimed, a cheaper independent path.
+
+### 8.1e The visibility gate was BUILT and REVERTED (2026-08-04) — it is blocked on the keystone, and the counter cannot see why
+
+§8.1d attributed D-A to the ambient cursor. D-B — "bound to a PRIVATE
+candidate" — looked separable: it measures **0** on a compiler build, and
+rejecting a `private` declaration needs only visibility data the index already
+holds, not a scope. That argument is wrong, and the way it fails is worth
+recording because the counter actively points the other way.
+
+**What was built.** Every door to a cross-module `private` function call was
+shut, and there turned out to be **three**, not the one §8.1c describes:
+
+1. a **written qualified path** (`Vault::secret()`) resolves straight to a
+   symbol in `resolve_module_qualified_function` and never goes near the scope
+   classifier — it was not even audited;
+2. the bare binder's **single-overload fast path** (`call_resolver.cryo:2210`,
+   "AUDIT ONLY — behavior deliberately unchanged") pins the sole candidate
+   without consulting `bare_candidate_scope` at all. This is the free-function
+   twin of `decl_index`'s single-candidate fast path — the *same* root cause as
+   §8.1, in the other lane;
+3. the **multi-candidate bare path**, via `bare_candidate_scope`, which had no
+   visibility dimension.
+
+Shutting any two leaves the third open, which is why the first attempt appeared
+to work: the qualified door was closed, the compiler self-built, and a bare call
+to the same private function still compiled and ran.
+
+**Why it was reverted.** With all three shut the compiler *and stdlib* still
+self-built clean — and the test tree failed with 8 errors, all one symbol:
+
+```
+error[E0353]: `std::fmt::display::fmt_err` is private and cannot be called from this module
+```
+
+`fmt_err` is declared `private` in `stdlib/fmt/display.cryo` and **every caller
+is in that same file** (`:610`–`:656`); no cross-module caller exists. The gate
+rejected calls that never leave their own module, reporting the use site as
+`std::core::result`.
+
+The cause is not the visibility data. Every gate needs a "does the use site live
+in the declaring module?" exemption, and that question is answered by
+`current_module_ns()` — **the ambient cursor** (§2b). The f-string lowering
+synthesizes those `fmt_err` calls and they are checked with the cursor parked in
+another module, so the exemption misfires. Visibility enforcement needs the same
+explicit scope the type lane does. §8.1d already said this; this is the
+measurement behind it.
+
+**The part that should change how the counter is read.** `FnBindPrivateBound == 0`
+reads like evidence the gate is safe to switch on. It is not, and it cannot be:
+it counts *bindings that would be rejected*, and the failure mode here is
+**false positives** — correct same-module calls rejected because the cursor lied.
+A counter over the wrong population is not a weak signal, it is an inverted one.
+The same caution applies to D-A's 503: that number bounds what enforcement would
+*catch*, never what it would *break*.
+
+Sequencing consequence: the visibility gate is **not** available before the
+keystone, in either lane. §7's step 6 ("turn on BOTH gates") stays after step 4,
+and no part of it can be pulled forward.
+
+The sibling defect attempted in the same session — a path silently dropping
+TRAILING module segments — **was** fixable independently and landed; see §8.2h.
 
 ### 8.2 Fallback inventory
 
@@ -1160,6 +1252,130 @@ Three consequences, in order of how much they cost if ignored:
 > with the probe ON and OFF, `lookup_by_leaf calls` (49,528), `M1 calls`
 > (49,760) and step 2c (48,777) are identical. Any future instrument that
 > replays a lookup must do the same or it will inflate what it measures.
+
+### 8.2h The probe cannot see the keystone's worklist (2026-08-04)
+
+§8.2g established that the corpus has no collisions for the probe to find. A
+purpose-built collision shows the constraint is tighter than that, and it
+changes what a corpus entry has to prove.
+
+**The probe runs only inside step 2c**, which is reached only when
+`ctx.home_module` is non-empty — the 8 of 57 sites that already set a scope.
+The 49 scope-less `ResolutionContext::new("")` constructions never reach it.
+So the probe measures divergence across exactly the *complement* of the
+keystone's worklist. It is not merely starved of collisions; it is structurally
+blind to the sites being fixed.
+
+Measured on a purpose-built 4-module program (`Widget` declared by two modules,
+both in scope at the use site, the bare return annotation re-resolved from a
+third):
+
+| | events |
+|---|---:|
+| home == ambient cursor | 2,477 |
+| home ≠ ambient cursor | 150 |
+| **of those, leaf declared by >1 module** | **0** |
+| `lookup_qualified_alternatives` ambiguous (>1 candidate), same run | **2** |
+
+The last two rows are the finding. The collision is real and the resolver saw
+it twice — but not at step 2c, so `HomeDiffPlural` stayed 0. **A corpus entry
+that exercises the keystone will therefore register nothing on this probe**,
+and "drive `HomeDiffPlural` above zero" is the wrong acceptance criterion for
+one. It measures where a *scoped* site would have diverged, not where a
+scope-less site gets it wrong.
+
+**What a corpus entry must use instead**, in preference order:
+
+1. **Runtime-observable divergence.** The existing
+   `tests/tests/projects/generic_name_collision` is the template and already
+   does this correctly: `Alpha::pick` returns the smaller argument and
+   `Beta::pick` the larger, so a wrong bind is a wrong *value*, not merely a
+   failed compile. This is checkable today, after the keystone, and without
+   any instrument.
+2. **A pinned diagnostic** for cases that must become errors.
+
+Independently: that project already covers same-leaf collisions in **both**
+lanes (value via `pick`, type via `Widget`/`WidgetOther`), so §7's "the corpus
+must supply a leaf declared by two modules" is *partly already satisfied* —
+what it lacks is the M1 case below and the cross-module `private` call.
+
+#### The M1 interior-prefix violation — FIXED 2026-08-04
+
+§5.1 says the first segment resolves in scope and the remainder is **rooted** —
+"no substring matching, no suffix matching". `module_ns_matches_prefix`
+(`resolver/resolver.cryo:600`) instead accepts the written prefix anywhere it
+occurs in the module path as a whole-segment run. Reduced to a 2-module
+program:
+
+```
+namespace ProbeM1::Lib::Helper;      // the ONLY Widget
+type struct Widget { v: i64; ... }
+
+// in ProbeM1::Main:
+const w: ProbeM1::Lib::Widget = ProbeM1::Lib::Widget { v: 7 };   // COMPILES, RUNS
+```
+
+`ProbeM1::Lib` declares no `Widget`; the path resolves to
+`ProbeM1::Lib::Helper::Widget` and the program prints 7. **Control**, required
+before reading anything into that: `ProbeM1::Bogus::Widget` correctly fails
+with `E0203`, so this is M1's prefix matching specifically and not paths being
+ignored wholesale.
+
+This is the concrete instance of §8.2g consequence 3 — a wrong answer that is
+*representable* rather than a miscompile on today's sources — and unlike the
+scope cases it needs no instrument and no collision to demonstrate.
+
+**Fixed 2026-08-04.** `module_ns_matches_prefix` is now anchored to the END of
+the module namespace: the written qualifier must be a whole-segment **suffix**
+of the declaring module's path, which is a test rather than a search. The
+distinction that makes this safe to do ahead of the keystone:
+
+| direction | example | verdict |
+|---|---|---|
+| omit **leading** segments | `future` for `std::future` | **kept** — a scope question, and the tolerance this function exists to provide |
+| omit **trailing** segments | `Lib` for `Lib::Helper` | **rejected** — a false claim about where a declaration lives |
+
+Only the second was ever wrong, and separating them is what let this land
+without the keystone: "which module does this qualifier name?" is answerable
+from the qualifier and the candidate alone, with no use-site scope involved.
+Contrast §8.1e, where the visibility gate could *not* be separated for exactly
+that reason.
+
+Verified: the defect case is now `E0203`; canonical paths, root-omitted paths
+(`Lib::Helper::Widget`), and bare leaves via import all still resolve; the
+compiler self-builds and both self-host halves stay byte-identical. Pinned at
+`tests/tests/negative/E0203_path_drops_trailing_segment.cryo`, which compiled
+clean before the fix and errors after — a before/after the negative suite can
+hold by itself.
+
+#### The corpus slice that landed (2026-08-04)
+
+Two projects, both value-checked, both control-verified:
+
+**`tests/tests/projects/resolution_scope`** — 5 tests pinning what the keystone
+must **not** change. Three modules (`Red`/`Green`/`Blue`) declare the same
+`tint` and `Paint` leaves with different values; three consumers each import
+exactly one. Three-way rather than two-way deliberately: a fix that prefers one
+module program-wide passes a two-way collision one time in two. Covers the
+value lane (bare call), the type lane (bare return annotation re-resolved from
+a module that binds a different `Paint`), qualified paths with two candidates
+in scope, and the decided "an import binds its leaf name" rule.
+
+**`tests/tests/projects/resolution_tripwire`** — the two defects above, pinned
+as they behave **today**, with the flip protocol in the file header: when the
+keystone or the visibility gate lands, these tests fail, and the fix is to
+convert the project to `compile_fail` in the same change — not to adjust the
+assertions. Same trust-loop reasoning as `known_fail_canary`. Its control
+(`E0203_unknown_module_prefix.cryo` in the negative suite) pins the *correct*
+rejection and must stay green throughout.
+
+Verified rather than assumed: an assertion was deliberately broken and the
+suite went red, and the parent project runner was confirmed to propagate a
+child project's failure (`[FAIL] (project tests failed)`, exit 1) rather than
+reporting a false green.
+
+Both defects were reproduced from scratch before being pinned — the
+cross-module `private` call compiles *and runs*, printing 99.
 
 ### 8.3 B2 is unmeasured
 

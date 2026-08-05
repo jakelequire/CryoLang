@@ -149,7 +149,7 @@ EXT_ID        := cryolang.cryo-analyzer
 EXT_VSIX      := $(EXT_DIR)/cryo-analyzer.vsix
 
 .DEFAULT_GOAL := help
-.PHONY: help stdlib cryo cryo-exe selfhost-check test test-list roster-check examples examples-golden valgrind-check verify-freestanding runtime-tiers runtime-tiers-win pin \
+.PHONY: help stdlib cryo cryo-exe selfhost-check test test-list roster-check b1-check examples examples-golden valgrind-check verify-freestanding runtime-tiers runtime-tiers-win pin \
         pin-linux-impl pin-windows-impl _pin-windows-do \
         install uninstall clean lsp install-lsp release release-linux release-windows
 
@@ -167,6 +167,9 @@ help:
 	@echo "                         Linux 6-stage chain via WSL."
 	@echo "  make test              Run the repo-level test suite (tests/) via cryo test"
 	@echo "  make test-list         List the discovered test cases without running them"
+	@echo "  make b1-check          Pin the B1 fuzzy-fallback bucket against its golden"
+	@echo "                         (name-resolution cascade regrowth gate;"
+	@echo "                         re-pin deliberately with ARGS=--update)"
 	@echo "  make examples          Compile every examples/*/ project (CI smoke gate)"
 	@echo "  make runtime-tiers     Build the runtime tier archives (freestanding +"
 	@echo "                         hosted); every link needs the panic tier"
@@ -462,6 +465,9 @@ test-list: $(STAGE2_EXE) $(LIBCRYO_A) $(TEST_HELPERS_A)
 
 roster-check: $(STAGE2_EXE) $(LIBCRYO_A) $(TEST_HELPERS_A)
 	@python scripts/roster-check.py "$(STAGE2_EXE_WIN)" $(ARGS)
+
+b1-check: $(STAGE2_EXE) $(LIBCRYO_A) runtime-tiers
+	@python scripts/b1-gate.py "$(STAGE2_EXE_WIN)" $(ARGS)
 else
 test: $(STAGE2) $(LIBCRYO_A) $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A) runtime-tiers
 	@cd tests && "$(STAGE2)" test $(ARGS)
@@ -474,6 +480,23 @@ test-list: $(STAGE2) $(LIBCRYO_A) $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A)
 # ("0 of 0 failed" is a pass).  Re-pin deliberately with ARGS=--update.
 roster-check: $(STAGE2) $(LIBCRYO_A) $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A)
 	@python3 scripts/roster-check.py "$(STAGE2)" $(ARGS)
+
+# Golden-file gate on the B1 "fuzzy fallback" bucket (docs/name-resolution.md
+# §7.2 mechanism 3).  The nine-step resolution cascade grew for years because
+# nobody could see it growing; this makes a regrown fallback a build failure
+# rather than something noticed at the next hand-taken snapshot.
+#
+# A RATCHET, not a literal `B1 == 0`: zero is the end state of Phase 2-4, so
+# asserting it today would be red on every run and get switched off.  The
+# golden pins the current value and ANY drift fails -- an increase is the
+# regression, a decrease is progress that must be re-pinned so the new lower
+# value becomes the bound.  Re-pin deliberately with ARGS=--update.
+#
+# Depends on runtime-tiers: the counter report is emitted only on the SUCCESS
+# path of a full build (after link), so a stale runtime/.bin fails this gate
+# for reasons unrelated to B1.
+b1-check: $(STAGE2) $(LIBCRYO_A) runtime-tiers
+	@python3 scripts/b1-gate.py "$(STAGE2)" $(ARGS)
 endif
 
 # ---- examples smoke build ---------------------------------------------

@@ -1,0 +1,62 @@
+/// ============================ TRIPWIRE ==================================
+///
+/// THE FIRST TEST BELOW PINS BEHAVIOR docs/name-resolution.md SAYS IS WRONG.
+/// It passes today because the compiler is wrong today.
+///
+/// IF YOU ARE HERE BECAUSE IT STARTED FAILING: that is the intended outcome,
+/// and it means someone landed the visibility gate. Do NOT delete the
+/// assertion to get back to green. Convert this project to `compile_fail`
+/// with `expect.diagnostic` E0353, in the same change that made it an error.
+///
+/// Same trust-loop reasoning as tests/tests/projects/known_fail_canary: a
+/// defect that nothing in CI observes is how this subsystem regressed for
+/// years (§7's opening premise).
+///
+/// DO NOT "just switch the gate on" without reading the cryoconfig. That was
+/// tried on 2026-08-04: all three binding doors were shut and the compiler
+/// and stdlib still self-built clean, but it had to be reverted because the
+/// same-module exemption reads the AMBIENT CURSOR, which is wrong often
+/// enough to reject calls that never leave their own file. It is blocked on
+/// the §5.2 keystone, not on someone noticing.
+///
+/// ========================================================================
+![config(testing)]
+namespace ResolutionTripwire::TripwireTest;
+
+import std::core::result;
+import std::test::error;
+import std::test::assert;
+
+import ResolutionTripwire::Vault;
+
+// ---- KNOWN DEFECT: cross-module `private` call (§3.3, §8.1c) -----------
+//
+// §3.3: "enforcement is a gate". Today `resolve_qualified_scoped`'s
+// single-candidate fast path returns Unique without consulting
+// `is_candidate_public`, so a `private` declaration is reachable from
+// anywhere as long as it is unambiguous.
+//
+// §8.1c adds the part that makes this hard: a FUNCTION call is bound by
+// sema/call_resolver.cryo, a separate subsystem that never reaches the
+// visibility gate at all -- and it has three independent doors.
+//
+// AFTER THE FIX this must be an E0353 visibility error.
+
+![test]
+function WRONG_a_private_function_is_callable_from_another_module()
+        -> Result<(), TestError> {
+    // `secret` is declared `private` in ResolutionTripwire::Vault.
+    // Qualified path: one of the three doors.
+    expect_eq(ResolutionTripwire::Vault::secret(), 99)?;
+    return Result::Ok(());
+}
+
+/// CONTROL, and CORRECT behavior -- must stay green through the fix. If this
+/// ever fails alongside the tripwire above, the visibility work broke public
+/// access rather than closing the private hole.
+![test]
+function CONTROL_a_public_function_is_callable_from_another_module()
+        -> Result<(), TestError> {
+    expect_eq(ResolutionTripwire::Vault::door(), 1)?;
+    return Result::Ok(());
+}
