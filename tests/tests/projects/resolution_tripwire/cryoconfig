@@ -1,0 +1,48 @@
+# resolution_tripwire - ONE KNOWN-WRONG BEHAVIOR, PINNED SO IT CANNOT MOVE
+#                       SILENTLY.  Read tests/tripwire_test.cryo first.
+#
+# A `private` function is callable from another module. Spec §3.3 says
+# "enforcement is a gate"; today visibility is only a tie-breaker, so a
+# declaration is reachable from anywhere as long as it is unambiguous.
+#
+# THE FLIP PROTOCOL. When the visibility gate lands this test STARTS FAILING.
+# That is the design. Convert this project to `compile_fail` with
+# `expect.diagnostic` E0353 in the SAME change that makes it an error -- do
+# not adjust the assertion to get back to green.
+#
+# WHY THIS IS STILL HERE (measured 2026-08-04, and it cost a full attempt).
+# The fix looks separable from the §5.2 keystone and is NOT. There are three
+# doors -- a written qualified path, the bare binder's single-overload fast
+# path, and the multi-candidate path via `bare_candidate_scope` -- and all
+# three were shut, with the compiler and stdlib still self-building clean.
+# It still had to be reverted: every gate needs a "does the use site live in
+# the declaring module?" exemption, and that question is answered by
+# `current_module_ns()`, which is the AMBIENT CURSOR.
+#
+# The cursor is wrong often enough to break the build. `std::fmt::display`'s
+# `private fmt_err` is called ONLY from its own file (display.cryo:610-656,
+# no cross-module caller exists), yet the gate rejected 8 of those calls
+# claiming the use site was `std::core::result` -- the f-string lowering
+# synthesizes those calls and they are checked with the cursor parked
+# somewhere else entirely.
+#
+# So visibility enforcement is blocked on the keystone supplying a real
+# scope, exactly as spec §8.1d states. The counter's `FnBindPrivateBound == 0`
+# reads like evidence the gate is safe to switch on; it is not, because the
+# failure mode is FALSE POSITIVES from a wrong cursor, which that counter
+# does not measure.
+#
+# Its sibling defect - a path silently dropping TRAILING module segments -
+# WAS fixed on 2026-08-04 and is now pinned as a real compile-fail case at
+# tests/tests/negative/E0203_path_drops_trailing_segment.cryo.
+
+[project]
+project_name = "resolution_tripwire"
+output_dir   = "build"
+target_type  = "executable"
+source_dir   = "src"
+entry_point  = "src/main.cryo"
+
+[compiler]
+
+[dependencies]

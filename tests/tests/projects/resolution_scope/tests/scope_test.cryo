@@ -1,0 +1,88 @@
+/// The keystone corpus assertions. Every one is a VALUE check: a name that
+/// binds to the wrong module returns a different number, which is observable
+/// with no instrument and unchanged by the keystone's implementation details.
+/// See the cryoconfig for why value checks are the only workable signal here.
+![config(testing)]
+namespace ResolutionScope::ScopeTest;
+
+import std::core::result;
+import std::test::error;
+import std::test::assert;
+
+import ResolutionScope::UsesRed;
+import ResolutionScope::UsesGreen;
+import ResolutionScope::UsesBlue;
+import ResolutionScope::TwoInScope;
+import ResolutionScope::Deep::Nested;
+
+// Importing one of the colliding modules HERE is load-bearing: it puts a
+// second `tint`/`Paint` in the assertion module's own scope, so a callee's
+// bare name re-resolved from this module has something wrong to bind to.
+// Without it every check below passes for the uninteresting reason that only
+// one candidate was ever visible.
+import ResolutionScope::Blue;
+
+// ---- value lane: a bare call binds to the CALLEE's import ---------------
+
+/// All three must hold AT ONCE. A fix that prefers one module program-wide
+/// satisfies any single one of these and fails the set.
+![test]
+function bare_call_binds_to_each_callers_own_import() -> Result<(), TestError> {
+    expect_eq(ResolutionScope::UsesRed::bare_call(), 1)?;
+    expect_eq(ResolutionScope::UsesGreen::bare_call(), 2)?;
+    expect_eq(ResolutionScope::UsesBlue::bare_call(), 3)?;
+    return Result::Ok(());
+}
+
+// ---- type lane: a bare ANNOTATION keeps its own module's meaning --------
+
+/// The callee's bare `Paint` return annotation is re-resolved while checking
+/// THIS module, whose scope binds `Blue::Paint`. Each must still mean what its
+/// own module says.
+![test]
+function bare_annotation_keeps_the_callees_own_type() -> Result<(), TestError> {
+    const r: ResolutionScope::Red::Paint = ResolutionScope::UsesRed::bare_annotation();
+    const g: ResolutionScope::Green::Paint = ResolutionScope::UsesGreen::bare_annotation();
+    const b: ResolutionScope::Blue::Paint = ResolutionScope::UsesBlue::bare_annotation();
+    expect_eq(r.shade(), 1)?;
+    expect_eq(g.shade(), 2)?;
+    expect_eq(b.shade(), 3)?;
+    return Result::Ok(());
+}
+
+// ---- qualified paths are unaffected by how crowded the scope is ---------
+
+/// Two colliding modules imported at once; qualified paths must still resolve
+/// to exactly what they name.
+![test]
+function qualified_paths_resolve_with_two_candidates_in_scope()
+        -> Result<(), TestError> {
+    expect_eq(ResolutionScope::TwoInScope::red_qualified(), 1)?;
+    expect_eq(ResolutionScope::TwoInScope::green_qualified(), 2)?;
+    expect_eq(ResolutionScope::TwoInScope::red_type_qualified(), 1)?;
+    expect_eq(ResolutionScope::TwoInScope::green_type_qualified(), 2)?;
+    return Result::Ok(());
+}
+
+// ---- the colliding modules stay reachable by their own names ------------
+
+/// The fix cannot work by walling each module off into its own world: a
+/// directly-imported collider must remain usable by its bare leaf here.
+![test]
+function a_directly_imported_collider_is_still_usable()
+        -> Result<(), TestError> {
+    expect_eq(ResolutionScope::Blue::tint(), 3)?;
+    const p: ResolutionScope::Blue::Paint = ResolutionScope::Blue::Paint::mix();
+    expect_eq(p.shade(), 3)?;
+    return Result::Ok(());
+}
+
+// ---- an import binds its LEAF name (spec §9, decided) -------------------
+
+/// `import ResolutionScope::Deep::Nested;` binds `Nested`, so the leaf alone
+/// qualifies the call.
+![test]
+function an_import_binds_its_leaf_name() -> Result<(), TestError> {
+    expect_eq(Nested::value(), 42)?;
+    return Result::Ok(());
+}

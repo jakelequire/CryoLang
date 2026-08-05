@@ -593,30 +593,46 @@ type struct Resolver {
         return s.substring(0, last_sep);
     }
 
-    /// True when `prefix` occurs in the module namespace `mod_str` as a run of
-    /// whole `::`-delimited segments. This honors the qualifier (`future` matches
-    /// `std::future::ready` but `other` does not) while tolerating the root
-    /// segments a written prefix omits (`future` == `std::future` minus `std`).
+    /// True when `prefix_str` is the module namespace `mod_str` with zero or
+    /// more of its LEADING segments omitted — i.e. a whole-segment SUFFIX.
+    ///
+    /// `future` matches `std::future` (the root `std` is omitted, which is the
+    /// tolerance this function exists to provide) and `other` does not.
+    ///
+    /// It must be a suffix, NOT any interior run. Anchoring to the end is what
+    /// makes the qualifier name the module that actually DECLARES the item:
+    ///
+    ///     mod = "App::Lib::Helper", written "Lib::Helper"  -> true  (root omitted)
+    ///     mod = "App::Lib::Helper", written "App::Lib"     -> FALSE (see below)
+    ///
+    /// The second case is the defect this anchoring fixes. `App::Lib::Widget`
+    /// used to resolve to `App::Lib::Helper::Widget` because `App::Lib` occurs
+    /// inside the module path as a whole-segment run — so a path could name a
+    /// module that declares nothing of the sort and still resolve, by silently
+    /// dropping TRAILING segments. Spec §5.1: "the first segment resolves in
+    /// scope; the remainder is rooted ... no substring matching, no suffix
+    /// matching. A path that does not resolve is an error with a suggestion,
+    /// not an invitation to search."
+    ///
+    /// Omitting leading segments is a scope question (does `future` name
+    /// `std::future` from here?) and stays. Omitting trailing ones is a claim
+    /// about where a declaration lives, and is now false when it is wrong.
     module_ns_matches_prefix(&this, mod_str: string, prefix_str: string) -> boolean {
         ResolveCounter::Site::M1Calls.bump();
         const ml: i64 = mod_str.length() as i64;
         const pl: i64 = prefix_str.length() as i64;
         if (pl == 0 || pl > ml) { return false; }
-        mut i: i64 = 0;
-        while (i + pl <= ml) {
-            if (mod_str.substring(i, pl).eq(prefix_str)) {
-                const boundary_before: boolean =
-                    i == 0 || (i >= 2 && mod_str[i - 1] == ':' && mod_str[i - 2] == ':');
-                const boundary_after: boolean =
-                    i + pl == ml || (i + pl + 1 < ml && mod_str[i + pl] == ':' && mod_str[i + pl + 1] == ':');
-                if (boundary_before && boundary_after) {
-                    ResolveCounter::Site::M1Hits.bump();
-                    return true;
-                }
-            }
-            i += 1;
-        }
-        return false;
+        // Only one alignment can be a suffix, so this is a single check rather
+        // than the scan it used to be.
+        const i: i64 = ml - pl;
+        if (!mod_str.substring(i, pl).eq(prefix_str)) { return false; }
+        // ...and it must start ON a segment boundary, so `ture` does not match
+        // `std::future`.
+        const boundary_before: boolean =
+            i == 0 || (i >= 2 && mod_str[i - 1] == ':' && mod_str[i - 2] == ':');
+        if (!boundary_before) { return false; }
+        ResolveCounter::Site::M1Hits.bump();
+        return true;
     }
 
     /// The defining module of the function a bare name resolves to here, or an
