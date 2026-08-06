@@ -94,15 +94,26 @@ type struct ResolutionContext {
     /// the registry with type-param-bearing instantiations.
     symbolic_no_demand: boolean;
 
-    static new(current_module: string, source_file: string) -> ResolutionContext {
+    /// `home_module` and `home_origin` are REQUIRED, for the same reason
+    /// `set_home_module` requires its origin: a context that does not state its
+    /// scope is not a context that happens to lack one, it is a site that never
+    /// asked the question.  When the scope defaulted silently, every step below
+    /// cascade 2c was reached ONLY by such a context — the module-blind chain
+    /// serves scope-less callers exclusively, so the default WAS the fallback
+    /// chain's entire supply.  A site with genuinely nothing to say writes
+    /// `HomeOrigin::Unset` and is then greppable; a forgotten one no longer
+    /// compiles.
+    static new(current_module: string, source_file: string,
+               home_module: string, home_origin: HomeOrigin) -> ResolutionContext {
         return ResolutionContext {
             current_module:   current_module,
             source_file:      source_file,
             import_modules:   [],
             generic_bindings: [],
             this_type:        TypeRef::invalid(),
-            home_module:      "",
-            home_origin:      HomeOrigin::Unset,
+            home_module:      home_module,
+            home_origin:      if (home_module.length() == 0) { HomeOrigin::Unset }
+                              else { home_origin },
             symbolic_no_demand: false,
         };
     }
@@ -153,7 +164,7 @@ type struct ResolutionContext {
     /// `[]` - it is never populated anywhere, matching the prior behavior.
     clone(&this) -> ResolutionContext {
         mut out: ResolutionContext =
-            ResolutionContext::new(this.current_module, this.source_file);
+            ResolutionContext::new(this.current_module, this.source_file, "", HomeOrigin::Unset);
         out.this_type = this.this_type;
         out.home_module = this.home_module;
         out.home_origin = this.home_origin;
@@ -539,7 +550,7 @@ type struct TypeResolver {
             // Resolve the binding with the impl's target params bound to the
             // base's concrete args (`T -> i32` for `Range<i32>`); empty for a
             // non-generic base like `IntSeq`.
-            mut bctx: ResolutionContext = ResolutionContext::new("", "");
+            mut bctx: ResolutionContext = ResolutionContext::new("", "", "", HomeOrigin::Unset);
             if (impl_node.target_args.length == base_args.length) {
                 for (mut ti: i64 = 0; ti < impl_node.target_args.length; ti++) {
                     const ta: TypeAnnotation* = impl_node.target_args[ti];
@@ -723,7 +734,7 @@ type struct TypeResolver {
                         // Nothing left to solve in this arg: don't pay for a lookup.
                         if (!this.where_arg_has_unbound_param(arg_ann, param_names, ictx)) { continue; }
                     }
-                    mut rc: ResolutionContext = ResolutionContext::new(source_file, "");
+                    mut rc: ResolutionContext = ResolutionContext::new(source_file, "", "", HomeOrigin::Unset);
                     const member: SymbolStr = tdecl.assoc_types[assoc_idx].name;
                     if (subject_abstract) {
                         // `project_member` keeps an abstract base symbolic, giving
@@ -1298,7 +1309,7 @@ type struct TypeResolver {
         // The home module for the defaults is supplied by
         // `expand_default_type_args` from `entry.module_name`, so this context
         // deliberately stays bare.
-        mut ctx: ResolutionContext = ResolutionContext::new("", "");
+        mut ctx: ResolutionContext = ResolutionContext::new("", "", "", HomeOrigin::Unset);
         mut empty: TypeRef[] = [];
         const filled: TypeRef[] = this.expand_default_type_args(entry, empty, &ctx);
         if (filled.length != entry.param_count) { return ty; }
