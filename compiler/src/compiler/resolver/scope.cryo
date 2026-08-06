@@ -11,6 +11,7 @@ import Compiler::Resolver::{ SymbolID, SymbolStr };
 import Compiler::Diag;
 import Compiler::Diag::SourceSpan;
 import Utils::Logger;
+import Compiler::ResolveCounter;
 import std::core::option;
 import std::collections::{ hashmap, pair };
 
@@ -74,6 +75,56 @@ implement enum ScopeKind {
     }
 }
 
+/// One name bound directly in a scope, with the TIER it occupies.
+///
+/// `docs/name-resolution.md` §4 orders a scope's bindings:
+///
+///     locals / generic params
+///       -> current-module items          (public AND private)
+///       -> imported modules' export sets
+///       -> prelude
+///
+/// and rule 1 makes that precedence TOTAL: an inner tier shadows an outer one
+/// silently. A flat `name -> SymbolID` map cannot express it -- a declaration
+/// and an import compete for one slot and the first writer wins -- so the tier
+/// has to travel WITH the entry.
+///
+/// It is a field rather than a parallel `boolean[]` deliberately. A parallel
+/// array holds its invariant only as long as every push site remembers to
+/// update both, and a later third insert path that forgets desyncs it
+/// silently: every index-based read after the missing push returns a
+/// NEIGHBOUR's tier, which is a wrong bind with no diagnostic -- the exact
+/// failure class this type exists to remove. §8.2l's rule, on a new surface:
+/// put the fact where the entity is, so a future caller cannot forget it.
+///
+/// `Scope` holds SymbolIDs, not Symbols, and has no route back to the symbol
+/// arena, so it cannot recover `SymbolKind::Import` on its own; the tier is
+/// stated at insert time by which entry point was used.
+///
+/// The PRELUDE tier is not modelled here: it lives in the DeclarationIndex
+/// (`prelude_ns`, `is_prelude_ns`), so `is_import == false` means "not an
+/// import into this scope", not "tier 2 exclusively".
+///
+/// Note which system already had this precedence.
+/// `DeclarationIndex::resolve_qualified_scoped` documents and implements it
+/// ("a local definition beats imports") and is what the VALUE lane goes
+/// through -- which is why a bare call in a module that both declares and
+/// imports a leaf has always bound correctly, while the same shape in an
+/// annotation bound to the import. Spec §4.4's "two answers for one question"
+/// was this: two lookup systems, only one of which implemented §4.
+type struct ScopeEntry {
+    name:      SymbolStr;
+    sym:       SymbolID;
+    /// false = declared by this scope's own module (tier 2, or a local/param
+    ///         in a Function/Block scope); true = brought in by an `import`
+    ///         (tier 3).
+    is_import: boolean;
+
+    static new(name: SymbolStr, sym: SymbolID, is_import: boolean) -> ScopeEntry {
+        return ScopeEntry { name: name, sym: sym, is_import: is_import };
+    }
+}
+
 type struct Scope {
     id:              ScopeID;
     kind:            ScopeKind;
@@ -82,7 +133,8 @@ type struct Scope {
     owner_name:      string;
     span:            SourceSpan;
 
-    symbols:         Pair<SymbolStr, SymbolID>[];
+    // One entry per name bound directly in this scope, in insertion order.
+    symbols:         ScopeEntry[];
 
     // Fast lookup index: SymbolStr.id -> index in symbols[]
     symbol_index:    HashMap<u32, i64>;
@@ -131,19 +183,48 @@ type struct Scope {
         if (opt.is_some()) {
             const idx: i64 = opt.unwrap();
             LOG_DEBUG(LogComponent::General, "[Scope] find() found at idx=%lld in scope '%s'", idx, this.owner_name);
-            return this.symbols[idx].second;
+            return this.symbols[idx].sym;
         }
         LOG_DEBUG(LogComponent::General, "[Scope] find() NOT found in scope '%s'", this.owner_name);
         return SymbolID::invalid();
     }
 
-    /// Insert a symbol into this scope.  If the name already exists and
-    /// allows_overload is true, adds to the overload set instead.
-    /// Returns false if the name is a duplicate and overloading is not allowed.
+    /// Insert a DECLARATION into this scope (tier 2, or a local/param).
+    ///
+    /// If the name already exists and allows_overload is true, adds to the
+    /// overload set instead.  Returns false if the name is a duplicate
+    /// declaration and overloading is not allowed.
+    ///
+    /// A declaration arriving over an IMPORT takes the slot: §4 rule 1 makes
+    /// the precedence total, and it is a property of the two tiers, not of
+    /// which line of the file came first.  Before this, `insert` returned
+    /// false here and the module silently lost the ability to name its own
+    /// declaration -- the whole defect, in one branch.
     insert(mut &this, name: SymbolStr, sym_id: SymbolID, allows_overload: boolean) -> boolean {
 
         // Check for existing symbol with the same name
-        if (this.symbol_index.contains_key(&name.id)) {
+        const existing: Option<i64> = this.symbol_index.get(&name.id);
+        if (existing.is_some()) {
+            const idx: i64 = existing.unwrap();
+            if (this.symbols[idx].is_import) {
+                // Tier 2 over tier 3.  The displaced import is dropped rather
+                // than demoted into the overload set: §4 rule 1 says the
+                // inner tier SHADOWS the outer one, so the import is reachable
+                // only by a qualified path from here on.  Dropping it is also
+                // what makes the two source orders agree -- declaration-first
+                // already produced exactly this set, because `insert_import`
+                // never added itself as an overload.
+                ResolveCounter::Site::ScopeDeclOverImport.bump();
+                this.symbols[idx].sym = sym_id;
+                this.symbols[idx].is_import = false;
+                // Any ambiguity recorded for this name was import-vs-import.
+                // A declaration shadows every import of the name, so the
+                // ambiguity is no longer reachable and must not be reported:
+                // §4 rule 2 confines ambiguity to WITHIN a tier.
+                this.clear_ambiguity(name);
+                return true;
+            }
+            // An existing DECLARATION: unchanged behavior.
             if (allows_overload) {
                 this.add_overload(name, sym_id);
                 return true;
@@ -151,21 +232,31 @@ type struct Scope {
             return false;
         }
 
-        const idx: i64 = this.symbols.length;
-        this.symbols.push(Pair<SymbolStr, SymbolID>::new(name, sym_id));
-        this.symbol_index.insert(name.id, idx);
+        this.push_entry(name, sym_id, false);
         return true;
     }
 
-    /// Insert an import symbol.  If the name already exists from a DIFFERENT
-    /// module, mark it as ambiguous (the user must qualify with the module name).
-    /// If it exists from the SAME module (re-import), silently skip.
-    /// Local declarations (Type, Function) are not overwritten.
+    /// Insert an IMPORT symbol (tier 3).
+    ///
+    /// If this scope's own module already DECLARES the name, the import is
+    /// shadowed and skipped silently -- §4 rule 1, and explicitly not a
+    /// diagnostic.  If the name already exists as an import from a DIFFERENT
+    /// module, mark it ambiguous (the user must qualify); from the SAME module
+    /// (re-import), skip silently.
     /// module_a_id and module_b_id are SymbolStr IDs (interned, heap-safe).
     insert_import(mut &this, name: SymbolStr, sym_id: SymbolID,
                   new_module_id: u32, existing_module_id: u32) -> boolean {
         const existing: Option<i64> = this.symbol_index.get(&name.id);
         if (existing.is_some()) {
+            const idx: i64 = existing.unwrap();
+            // A declaration owns the slot; the import is shadowed.  Recording
+            // ambiguity here is what made a module's own type "ambiguous"
+            // against an import of the same leaf (E0203), which §4 rule 2
+            // forbids: the two are in different tiers, so they never compete.
+            if (!this.symbols[idx].is_import) {
+                ResolveCounter::Site::ScopeImportShadowed.bump();
+                return true;
+            }
             // Same module re-import; skip silently
             if (new_module_id == existing_module_id) {
                 return true;
@@ -179,10 +270,41 @@ type struct Scope {
             return true;
         }
         // No existing entry; insert normally
-        const idx: i64 = this.symbols.length;
-        this.symbols.push(Pair<SymbolStr, SymbolID>::new(name, sym_id));
-        this.symbol_index.insert(name.id, idx);
+        this.push_entry(name, sym_id, true);
         return true;
+    }
+
+    /// Append a fresh binding and index it.  The ONLY place a `ScopeEntry` is
+    /// created, so the tier and the index can never disagree with the array.
+    push_entry(mut &this, name: SymbolStr, sym_id: SymbolID,
+               is_import: boolean) -> void {
+        const idx: i64 = this.symbols.length;
+        this.symbols.push(ScopeEntry::new(name, sym_id, is_import));
+        this.symbol_index.insert(name.id, idx);
+    }
+
+    /// Drop every ambiguity record for `name`.
+    ///
+    /// Called when a declaration takes the name's slot: the recorded conflict
+    /// was between two imports, and both are now shadowed.
+    clear_ambiguity(mut &this, name: SymbolStr) -> void {
+        for (mut i: i64 = 0; i < this.ambig_name_ids.length; i++) {
+            if (this.ambig_name_ids[i] == name.id) {
+                ResolveCounter::Site::ScopeAmbigRetracted.bump();
+            }
+        }
+        mut keep_names: u32[] = [];
+        mut keep_a:     u32[] = [];
+        mut keep_b:     u32[] = [];
+        for (mut i: i64 = 0; i < this.ambig_name_ids.length; i++) {
+            if (this.ambig_name_ids[i] == name.id) { continue; }
+            keep_names.push(this.ambig_name_ids[i]);
+            keep_a.push(this.ambig_module_a[i]);
+            keep_b.push(this.ambig_module_b[i]);
+        }
+        this.ambig_name_ids = keep_names;
+        this.ambig_module_a = keep_a;
+        this.ambig_module_b = keep_b;
     }
 
     /// Check if a name is ambiguous (imported from multiple modules).
@@ -218,7 +340,7 @@ type struct Scope {
         // Primary symbol
         const opt: Option<i64> = this.symbol_index.get(&name.id);
         if (opt.is_some()) {
-            result.push(this.symbols[opt.unwrap()].second);
+            result.push(this.symbols[opt.unwrap()].sym);
         }
 
         // Overloaded symbols

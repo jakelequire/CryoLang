@@ -1,0 +1,66 @@
+/// `owns_before.cryo` with the `import` moved BELOW the declarations, and
+/// nothing else changed.
+///
+/// This file exists because the two orders measurably disagreed: with the
+/// import first, a module could not name its own type at all (E0214 naming
+/// the IMPORTED type as expected); with it last, the same program compiled.
+/// The mechanism is `Scope`'s flat name->SymbolID map, where a declaration and
+/// an import compete for one slot on a first-writer-wins basis
+/// (`Scope::insert` returns false when the name is taken; `insert_import`
+/// keeps the first entry and raises ambiguity only for import-vs-import, so a
+/// local-vs-import conflict is not detected at all).
+///
+/// Source order is not part of what a name means. Both files assert the same
+/// values, and the pair is the assertion -- either one alone passes for the
+/// uninteresting reason that its order happened to be the lucky one.
+![config(testing)]
+namespace ResolutionScope::OwnsAfter;
+
+function tint() -> i32 { return 8; }
+
+type struct Paint {
+    v: i32;
+
+    static mix() -> ResolutionScope::OwnsAfter::Paint {
+        return ResolutionScope::OwnsAfter::Paint { v: 8 };
+    }
+    shade(&this) -> i32 { return this.v; }
+}
+
+import ResolutionScope::Red;
+
+/// VALUE LANE.
+function own_bare_call() -> i32 { return tint(); }
+
+/// TYPE LANE, return position.
+function own_bare_return() -> Paint { return ResolutionScope::OwnsAfter::Paint::mix(); }
+
+/// TYPE LANE, parameter position.
+function own_bare_param(p: Paint) -> i32 { return p.shade(); }
+
+/// TYPE LANE, body-local declaration.
+function own_bare_local() -> i32 {
+    mut a: Paint = ResolutionScope::OwnsAfter::Paint::mix();
+    return a.shade();
+}
+
+/// TYPE LANE, struct field.
+type struct Holder {
+    p: Paint;
+
+    static wrap() -> ResolutionScope::OwnsAfter::Holder {
+        return ResolutionScope::OwnsAfter::Holder {
+            p: ResolutionScope::OwnsAfter::Paint::mix()
+        };
+    }
+    unwrap(&this) -> i32 { return this.p.shade(); }
+}
+
+function own_bare_field() -> i32 {
+    const h: ResolutionScope::OwnsAfter::Holder =
+        ResolutionScope::OwnsAfter::Holder::wrap();
+    return h.unwrap();
+}
+
+/// The import must still work.
+function the_import_still_resolves() -> i32 { return ResolutionScope::Red::tint(); }

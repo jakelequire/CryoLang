@@ -1334,6 +1334,34 @@ private:
         return current;
     }
 
+    /// Emit one `RN` audit line naming the cascade step that answered, the home
+    /// module the context carried, and the type it bound to.
+    ///
+    /// Off unless `CRYO_RN_AUDIT` is set.  The end-of-run tally counts answers
+    /// per step; only a per-event line can say WHICH name a step answered, and
+    /// a wrong bind is a statement about one name.
+    rn_trace(&this, step: string, name_str: string, ctx: ResolutionContext*,
+             result: TypeRef) -> void {
+        if (!ResolveCounter::Audit::Named.enabled()) { return; }
+        mut answer: string = "<invalid>";
+        if (result.is_valid()) {
+            const t: Type* = this.arena.lookup(result.id);
+            if (t != null) { answer = t.display_name(); }
+        }
+        mut home: string = "<none>";
+        if (ctx != null && ctx.home_module.length() > 0) { home = ctx.home_module; }
+        // The ambient cursor is what every step below 2c canonicalizes against,
+        // so a line that reports only the home module cannot distinguish "the
+        // scope was wrong" from "the scope was right and the LOOKUP was wrong".
+        mut cursor: string = "<none>";
+        if (this.name_resolver != null) {
+            const cur: string =
+                this.intern_table.resolve(this.name_resolver.current_module_sym());
+            if (cur.length() > 0) { cursor = cur; }
+        }
+        ResolveCounter::rn_answer(step, home, cursor, name_str, answer);
+    }
+
     /// Length of `ctx.home_module`, or 0 when the context is absent.
     home_module_len(&this, ctx: ResolutionContext*) -> i64 {
         if (ctx == null) { return 0; }
@@ -1483,6 +1511,7 @@ private:
         mut binding: TypeRef = ctx.lookup_binding(name);
         if (binding.is_valid()) {
             ResolveCounter::Site::RnGenericBinding.bump();
+            this.rn_trace("1-generic", name_str, ctx, binding);
             return binding;
         }
 
@@ -1509,7 +1538,11 @@ private:
                         name_str.substring(sep + 2, name_len - sep - 2);
                     const member_sym: SymbolStr = this.intern_table.intern(member_str);
                     const proj: TypeRef = this.project_member(prefix_ty, member_sym, ctx);
-                    if (proj.is_valid()) { ResolveCounter::Site::RnAssocProjection.bump(); return proj; }
+                    if (proj.is_valid()) {
+                        ResolveCounter::Site::RnAssocProjection.bump();
+                        this.rn_trace("1b-assoc", name_str, ctx, proj);
+                        return proj;
+                    }
                 }
             }
         }
@@ -1521,6 +1554,7 @@ private:
         const prim: TypeRef = this.resolve_primitive(name);
         if (prim.is_valid()) {
             ResolveCounter::Site::RnPrimitive.bump();
+            this.rn_trace("2-primitive", name_str, ctx, prim);
             return prim;
         }
 
@@ -1613,8 +1647,10 @@ private:
                 // going DOWN rather than up.  See `HomeOrigin`.
                 if (ctx.home_origin == HomeOrigin::Syntax) {
                     ResolveCounter::Site::RnHomeModuleSyntax.bump();
+                    this.rn_trace("2c-home-syntax", name_str, ctx, home_answer);
                 } else {
                     ResolveCounter::Site::RnHomeModule.bump();
+                    this.rn_trace("2c-home-cursor", name_str, ctx, home_answer);
                 }
                 return home_answer;
             }
@@ -1644,6 +1680,7 @@ private:
                 }
             }
             ResolveCounter::Site::RnAmbiguous.bump();
+            this.rn_trace("2b-ambiguous", name_str, ctx, TypeRef::invalid());
             return TypeRef::invalid();
         }
 
@@ -1671,7 +1708,9 @@ private:
                 const di_literal: TypeRef = this.decl_index.lookup_type(name);
                 if (di_literal.is_valid()) {
                     ResolveCounter::Site::RnDiLiteral.bump();
-                    return this.follow_alias(di_literal);
+                    const a_lit: TypeRef = this.follow_alias(di_literal);
+                    this.rn_trace("3a-di-literal", name_str, ctx, a_lit);
+                    return a_lit;
                 }
             }
             // Try qualified name first, canonicalized against the annotation's
@@ -1682,7 +1721,9 @@ private:
                     const di_found: TypeRef = this.decl_index.lookup_type(qualified);
                     if (di_found.is_valid()) {
                         ResolveCounter::Site::RnDiCanonical.bump();
-                        return this.follow_alias(di_found);
+                        const a_can: TypeRef = this.follow_alias(di_found);
+                        this.rn_trace("3b-di-canonical", name_str, ctx, a_can);
+                        return a_can;
                     }
                 }
             }
@@ -1690,7 +1731,9 @@ private:
             const di_bare: TypeRef = this.decl_index.lookup_type(name);
             if (di_bare.is_valid()) {
                 ResolveCounter::Site::RnDiBare.bump();
-                return this.follow_alias(di_bare);
+                const a_bare: TypeRef = this.follow_alias(di_bare);
+                this.rn_trace("3c-di-bare", name_str, ctx, a_bare);
+                return a_bare;
             }
         }
 
@@ -1704,6 +1747,7 @@ private:
             found = this.arena.lookup_by_name(name);
             if (found.is_valid()) {
                 ResolveCounter::Site::RnArenaBootstrap.bump();
+                this.rn_trace("4-arena-bootstrap", name_str, ctx, found);
                 const found_t: Type* = this.arena.lookup(found.id);
                 if (found_t != null && found_t.kind == TypeKind::TypeAlias) {
                     const alias_t: TypeAliasType* = found_t as TypeAliasType*;
@@ -1726,6 +1770,7 @@ private:
                 found = this.arena.lookup_by_name(qualified);
                 if (found.is_valid()) {
                     ResolveCounter::Site::RnScopeArenaBootstrap.bump();
+                    this.rn_trace("4a-scope-arena", name_str, ctx, found);
                     return found;
                 }
             }
@@ -1762,11 +1807,13 @@ private:
             // AST node files); the audit decides whether legalizing
             // intra-package import cycles would really retire it.
             ResolveCounter::leaf_hit(ctx.home_module, name_str);
+            this.rn_trace("5-leaf-index", name_str, ctx, found);
             return found;
         }
 
         // Not found; return invalid (caller should create error)
         ResolveCounter::Site::RnFailed.bump();
+        this.rn_trace("X-failed", name_str, ctx, TypeRef::invalid());
         LOG_DEBUG(LogComponent::TypeChecker, "[TypeResolver] resolve_named() FAILED for '%s'", name_str);
         return TypeRef::invalid();
     }

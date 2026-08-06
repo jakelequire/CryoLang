@@ -1,0 +1,67 @@
+/// A module that declares a leaf and imports TWO modules declaring it.
+///
+/// `owns_before`/`owns_after` pit one declaration against one import. This
+/// pits one declaration against a pair of imports that are ambiguous WITH EACH
+/// OTHER, which is the case where §4's two rules interact:
+///
+///   rule 1  an inner tier shadows an outer one, silently
+///   rule 2  ambiguity is reportable only WITHIN a tier
+///
+/// Red and Green both export `tint`/`Paint`, so tier 3 alone is genuinely
+/// ambiguous here (that is what `two_in_scope.cryo` declines to pin). A tier-2
+/// declaration settles it: both imports are shadowed, so the ambiguity is no
+/// longer reachable and must not be reported. Binding `Paint` to Red's or
+/// Green's, OR reporting E0203, are all failures.
+///
+/// The imports are written FIRST on purpose. That is the order in which the
+/// ambiguity is recorded before the declaration arrives, so it is the only
+/// order that exercises retracting it (`Scope::clear_ambiguity`). With the
+/// declaration first the ambiguity is never recorded at all, and this file
+/// would pass while testing nothing.
+![config(testing)]
+namespace ResolutionScope::OwnsTwo;
+
+import ResolutionScope::Red;
+import ResolutionScope::Green;
+
+function tint() -> i32 { return 9; }
+
+type struct Paint {
+    v: i32;
+
+    static mix() -> ResolutionScope::OwnsTwo::Paint {
+        return ResolutionScope::OwnsTwo::Paint { v: 9 };
+    }
+    shade(&this) -> i32 { return this.v; }
+}
+
+function own_bare_call() -> i32 { return tint(); }
+
+function own_bare_return() -> Paint { return ResolutionScope::OwnsTwo::Paint::mix(); }
+
+function own_bare_local() -> i32 {
+    mut a: Paint = ResolutionScope::OwnsTwo::Paint::mix();
+    return a.shade();
+}
+
+/// Both shadowed imports stay reachable by their qualified paths, and they
+/// stay distinguishable from each other -- shadowing must not collapse tier 3
+/// into a single winner on its way out.
+function red_still_resolves() -> i32 { return ResolutionScope::Red::tint(); }
+function green_still_resolves() -> i32 { return ResolutionScope::Green::tint(); }
+
+/// ...and the same for the TYPE lane, with TWO shadowed candidates rather
+/// than one. See `owns_before.cryo`'s `the_imported_TYPE_still_resolves` for
+/// why the type control is the load-bearing one: shadowing reroutes a
+/// qualified shadowed type onto the M1 export scan, and here the scan has two
+/// same-leaf candidates to tell apart rather than one, so a scan that answers
+/// "first public `Paint` whose module matches the prefix" is under real
+/// pressure instead of trivially correct.
+function red_TYPE_still_resolves() -> i32 {
+    const p: ResolutionScope::Red::Paint = ResolutionScope::Red::Paint::mix();
+    return p.shade();
+}
+function green_TYPE_still_resolves() -> i32 {
+    const p: ResolutionScope::Green::Paint = ResolutionScope::Green::Paint::mix();
+    return p.shade();
+}

@@ -149,7 +149,7 @@ EXT_ID        := cryolang.cryo-analyzer
 EXT_VSIX      := $(EXT_DIR)/cryo-analyzer.vsix
 
 .DEFAULT_GOAL := help
-.PHONY: help stdlib cryo cryo-exe selfhost-check test test-list roster-check b1-check examples examples-golden valgrind-check verify-freestanding runtime-tiers runtime-tiers-win pin \
+.PHONY: help stdlib cryo cryo-exe selfhost-check test test-list roster-check b1-check api-index api-index-check examples examples-golden valgrind-check verify-freestanding runtime-tiers runtime-tiers-win pin \
         pin-linux-impl pin-windows-impl _pin-windows-do \
         install uninstall clean lsp install-lsp release release-linux release-windows
 
@@ -168,6 +168,8 @@ help:
 	@echo "  make test              Run the repo-level test suite (tests/) via cryo test"
 	@echo "  make test-list         List the discovered test cases without running them"
 	@echo "  make b1-check          Pin the B1 fuzzy-fallback bucket against its golden"
+	@echo "  make api-index         Regenerate docs/stdlib-api.txt (the stdlib API index)"
+	@echo "  make api-index-check   Fail if docs/stdlib-api.txt is stale"
 	@echo "                         (name-resolution cascade regrowth gate;"
 	@echo "                         re-pin deliberately with ARGS=--update)"
 	@echo "  make examples          Compile every examples/*/ project (CI smoke gate)"
@@ -498,6 +500,25 @@ roster-check: $(STAGE2) $(LIBCRYO_A) $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A)
 b1-check: $(STAGE2) $(LIBCRYO_A) runtime-tiers
 	@python3 scripts/b1-gate.py "$(STAGE2)" $(ARGS)
 endif
+
+# ---- stdlib API index --------------------------------------------------
+# Regenerate docs/stdlib-api.txt, the one-file answer to "does this already
+# exist?".  Two sources, cross-checked: `nm` over stdlib/.bin/libcryo.a decoded
+# by the compiler's OWN demangler (authoritative -- a symbol in the archive
+# linked), plus a declaration scan of stdlib/**/*.cryo (complete -- it sees
+# generic templates the stdlib never instantiates, which have no symbol).
+#
+# Depends on $(LIBCRYO_A) so the archive half is present; without it the script
+# degrades to the source scan and SAYS SO in the file header rather than
+# silently emitting a thinner index.
+#
+# `api-index-check` is the CI half: a hand-edited or stale index is worse than
+# no index, because it gets trusted.
+api-index: $(LIBCRYO_A)
+	@$(PYTHON) scripts/api-index.py
+
+api-index-check: $(LIBCRYO_A)
+	@$(PYTHON) scripts/api-index.py --check
 
 # ---- examples smoke build ---------------------------------------------
 # Compile every examples/*/ project with the freshly-built stage-2 compiler
