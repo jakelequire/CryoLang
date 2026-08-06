@@ -24,6 +24,8 @@ import Compiler::Types::{ Generic, UserDefined, Compound, Type, Arena, TypeRef, 
 import Compiler::Diag;
 import Compiler::Diag::{ Sink, Diagnostic, SourceSpan };
 import Compiler::Resolver::{ InternTable, SymbolStr };
+import Compiler::ModuleGraph;
+import Compiler::ResolveCounter;
 import Compiler::Mono::{ State, TraitSpecializer };
 
 
@@ -34,6 +36,10 @@ type struct MonoAstResolver {
     type_resolver: TypeResolver*;
     state:         MonoState*;
     trait_spec:    MonoTraitSpecializer*;
+    // File -> namespace map, for deriving a context's HOME module from the span
+    // of the syntax being resolved rather than from the template entry.  See
+    // `MonoCallSpecializer.module_graph`.
+    module_graph:  ModuleGraph*;
 
     static null() -> MonoAstResolver {
         return MonoAstResolver {
@@ -43,6 +49,7 @@ type struct MonoAstResolver {
             type_resolver: null,
             state:         null,
             trait_spec:    null,
+            module_graph:  null,
         };
     }
 
@@ -55,6 +62,16 @@ type struct MonoAstResolver {
         this.type_resolver = type_resolver;
         this.state         = state;
         this.trait_spec    = trait_spec;
+    }
+
+    set_module_graph(mut &this, graph: ModuleGraph*) -> void {
+        this.module_graph = graph;
+    }
+
+    /// The module that WROTE `file`, or "" when the graph cannot say.  See
+    /// `ModuleGraph::home_ns_of_file`.
+    home_ns_of(&this, file: string) -> string {
+        return ModuleGraph::home_ns_of_file(this.module_graph, this.intern_table, file);
     }
 
 
@@ -74,6 +91,19 @@ type struct MonoAstResolver {
         // The template's own module owns every annotation in this AST; the
         // ambient scope chain still points at whichever module demanded the
         // specialization.
+        //
+        // Deliberately the ENTRY's module and not the node's span, which is the
+        // opposite of every other site in this migration.  This context does not
+        // resolve one kind of name: alongside the annotations the user wrote, it
+        // re-resolves the MANGLED SPEC NAMES the substituter just wrote into the
+        // clone (`6Result$Lm_N$L3std.2io.5error.7IoError$G$G`), and those are
+        // registered under the module the template lives in, not under the
+        // module the syntax lives in.  Pointing this at the span costs 119
+        // extra step-4 arena lookups on `examples/09-json-config` - every one an
+        // `implement Display for Option<T>` written in `std::fmt::display` while
+        // the spec names it resolves belong to `std::core::option`.  It is
+        // `method_binding:865`'s shape: TWO homes through ONE context, and it
+        // has to be split before either half can move (spec §8.2m).
         res_ctx.set_home_module(module_name, HomeOrigin::Syntax);
 
         match (node_kind) {
@@ -149,6 +179,9 @@ type struct MonoAstResolver {
             module_name = this.intern_table.resolve(entry.module_name);
         }
         mut res_ctx: ResolutionContext = ResolutionContext::new(module_name, "");
+        // No home module, for the reason `resolve_specialized_ast` records: this
+        // walks the same substituted clone, so the names it resolves are the
+        // same mix of written annotations and synthesized spec names.
 
         match (node_kind) {
             NodeKind::StructDeclaration => {
