@@ -271,19 +271,44 @@ what actually forces compliance, and is normative.
 ### 7.1 What the language can force — measured
 
 Measured 2026-08-03 by compiling probe programs; the function row re-measured
-2026-08-05.
+2026-08-05; the **call/reference split** and the **type row** re-measured
+2026-08-06 (§8.2n), which corrected both.
 
 | Mechanism | Enforced? | Evidence |
 |---|---|---|
 | Exhaustive `match` over an enum | **YES** | `E0405`; `tests/negative/E0405_non_exhaustive_match.cryo` |
 | Private struct/class **field** | **YES** | `E0353`; `tests/negative/E0353_private_field_access.cryo` |
-| Non-public **function**, cross-module | **YES**, since 2026-08-05 | `E0353`; `tests/projects/visibility_gate` — all four binding doors, §8.1f |
-| Non-public **type**, cross-module | **NO** | probe compiled clean |
+| Non-public **function**, cross-module, **called** | **YES**, since 2026-08-05 | `E0353`; `tests/projects/visibility_gate` — all four *binding* doors, §8.1f |
+| Non-public **function**, taken as a **value** | **NO** | compiles, links, runs; §8.2n door 5 |
+| Non-public **static method**, cross-module | **NO** | compiles, links, runs; §8.2n door 6 |
+| Non-public **instance method**, cross-module | **YES** | `E0353`; §8.2n positive control |
+| Non-public **type**, cross-module, leaf **unique** | **YES** | `E0503` fires; §8.2n variant A |
+| Non-public **type**, cross-module, leaf **shared** | **NO** — *maskable* | §8.2n variant B |
 
-**Cryo enforces an API boundary for functions, and still does not for types.**
-The function half landed with §8.1f; the type half is `resolve_qualified_scoped`'s
-single-candidate fast path (§8.1), which still answers `Unique` without
-consulting `is_candidate_public`. Therefore, and until that closes:
+Two corrections to what this table said before 2026-08-06, both measured:
+
+**The type row was not "no enforcement" — it was "enforcement that is not a
+gate."** `E0503` does fire for a cross-module private type. But
+`ModuleTypeRegistry::private_owner_module` is keyed on the **leaf**, scans every
+registered module, and returns "allowed" the moment *any* same-leaf type
+anywhere in the program is public — so one unrelated `public type struct Hidden`
+in a module the use site never imports silently unmasks a private `Hidden` in a
+module it does. Its use site also asks the **ambient cursor**
+(`current_module_name()`) for the use-site module rather than the module that
+wrote the syntax. The masking is written as intent in the function's own doc
+comment; §3.3 says visibility is a gate, so the comment describes a defect.
+
+**The function row overstated its scope.** "All four binding doors" are four
+ways a *call* binds, and the gate is enforced at the call. A private function
+that is never called — taken as a value into a function pointer — and a private
+*static* method both reach across a module boundary and execute.
+`enforce_callee_visibility` is reached only from call paths, and
+`enforce_method_visibility` only from member-access paths, so neither lane sees
+these two shapes.
+
+The rider below is therefore **unchanged in force but sharper in reason**: a
+private type is reachable not merely when it is unambiguous, but whenever any
+unrelated module happens to export its leaf. Therefore, and until that closes:
 
 > **Any design that relies on "make the fallback API private" works only when
 > the fallback is a FUNCTION. A private TYPE is still reachable from anywhere it
@@ -2078,6 +2103,132 @@ different routes.
   Read them as a population size, never as a gate. If a future change makes them
   nonzero on the self-host, that is new information about the *sources*, not
   about the resolver.
+
+### 8.2n Visibility: two more doors, and E0503 is maskable — MEASURED 2026-08-06
+
+§8.1f closed the function **call** lane and §7.1 recorded it as "cross-module
+private functions are enforced". Three claims inherited from the previous
+handoff were carried as *unverified leads*. All three are now measured against
+this tree, two of them with a running program rather than an absent diagnostic.
+
+**Method.** Two scratch projects, each with its own positive control, because an
+absent diagnostic is not evidence that a gate was consulted — it is equally
+consistent with the probe never reaching it (§4's "a zero needs a control").
+Every declaration spells `private` explicitly, since Q7 makes a top-level
+declaration public by default.
+
+**Doors 5 and 6 are open, and they execute.** One project, four call shapes,
+observed by exit code rather than by diagnostic:
+
+| shape | result |
+|---|---|
+| private free fn, **called** (door 2 control) | `E0353` — gate fired |
+| private **instance** method, member access (control) | `E0353` — gate fired |
+| private free fn, taken as a **value** (`const f: () -> i32 = door5;`) | **no diagnostic; runs** |
+| private **static** method (`Vault::PubType::door6()`) | **no diagnostic; runs** |
+
+With the two controls removed the program compiles, links, and exits `119` —
+`5 + 6 + 105 + 3`, i.e. both private callees returned their own values across a
+module boundary. The controls firing in the same batch is what makes the two
+zeros interesting.
+
+The cause is structural, not a missed case: `enforce_callee_visibility` is
+reached only from call paths, so a reference that never becomes a call is never
+offered to it; `enforce_method_visibility` is reached only from member-access
+paths, so the static lane never reaches it. Neither is a branch that got the
+answer wrong — both are lanes that were never asked.
+
+**E0503 fires, and one unrelated module switches it off.** A/B on a single
+import line, with the use site's own scope held identical between the two:
+
+- **A** — `Main` names a cross-module `private type struct Hidden`, spelled
+  fully qualified, and nothing else in the program declares that leaf:
+  `error[E0503]: type 'Hidden' is private to module 'TypeProbe::Vault'`.
+- **B** — add one `public type struct Hidden` in a third module that `Main`
+  never imports and never references, pulled into the build by an import in
+  `Vault`: **the error disappears**, the program links and exits `7` — the
+  private type's own value.
+
+`check_type_name_visibility` strips a written path to its **leaf** before asking
+the registry, so the qualifier in `TypeProbe::Vault::Hidden` is discarded and the
+question becomes "is any `Hidden` anywhere public?". `private_owner_module`
+answers it with a program-wide scan that short-circuits to "allowed" on the first
+public same-leaf entry. It also takes its use-site module from
+`current_module_name()` — the ambient cursor — which is the same input §8.1e
+found misfiring in the function lane, still live here.
+
+**What this changes about §6's plan.** The type lane's defect is *not* only
+`resolve_qualified_scoped`'s single-candidate fast path, which is what §7.1
+asserted; there is a second, independent leaf-keyed decision in
+`ModuleTypeRegistry`. Re-deriving E0503 from the resolved qualified symbol
+retires both at once, and is the same shape as the fix that closed the function
+lane: ask the resolved symbol, not the leaf, and ask where the syntax was
+written, not where the cursor is parked.
+
+**Not yet pinned by a corpus entry.** These four shapes are reproductions, not
+gates; nothing in the tree fails today if a door reopens. `visibility_gate`
+covers the four *call* doors only. Doors 5 and 6 and the E0503 A/B belong in it
+as siblings before either is fixed, on §8.1e's precedent that shutting some
+doors is indistinguishable from shutting all of them unless each is named.
+
+### 8.2o The fallback chain's supply is scope-less contexts — MEASURED, and the scope is now required 2026-08-06
+
+§6 step 1 says to promote 2c to `resolve_path`: scope a **required parameter**,
+the lookup **total**, `Res::Err` on a miss rather than a fall-through into
+3/4/4a/5, so the steps below die of starvation. Measured on
+`examples/09-json-config` before changing anything, over all 11,475
+`resolve_named` calls (the `CRYO_RN_AUDIT` stream is exactly that population):
+
+| step | answers | `home=<none>` | home set |
+|---|---:|---:|---:|
+| 2c home-module (syntax provenance) | 4,394 | 0 | **4,394** |
+| 3b DI canonicalized | 203 | **203** | 0 |
+| 4a scope+arena | 2,304 | **2,304** | 0 |
+| 5 global leaf index | 328 | **328** | 0 |
+| X failed | 15 | 7 | 8 |
+
+**The partition is exact: every answer below 2c comes from a context carrying no
+home module, and no answer below 2c comes from one that does.** The cursor is
+set on all 2,835 — it is the *scope* that is absent, not the position.
+
+Two consequences, and the second reorders §6:
+
+**2c does not miss when it runs.** With a scope present the only fall-throughs
+are 8 `X-failed` lines, all the generic param `T` in `std::alloc::box` /
+`std::alloc::rc` — an unbound-binding defect, unrelated to scope. So the
+module-blind chain is not a safety net for names 2c gets wrong; it serves
+scope-less callers **exclusively**. The names it serves are the stdlib's core
+vocabulary (`Result` 281, `Formatter` 224, `Option` 171, `Str` 170, `String`
+118, `GlobalAlloc` 93) — precisely the imported-type case 2c's import-scoped arm
+already handles correctly whenever a home module is present.
+
+**Totality is therefore blocked on scope coverage, not the other way round.**
+Making `resolve_path` total today would convert 2,835 currently-correct
+resolutions into errors — not because the answer was wrong, but because nobody
+asked the question. §6's step 3 ("the remaining `ResolutionContext` sites") is a
+**prerequisite** of step 1's totality, not a follow-on.
+
+#### What landed: the scope can no longer be omitted
+
+`ResolutionContext::new` now takes `home_module` and `home_origin` as required
+arguments. It previously defaulted them to `"" / Unset`, and that silent default
+was the fallback chain's entire supply. The reasoning is `set_home_module`'s
+own, applied one level out: a site that cannot state its scope has not
+established one, and a required argument cannot be forgotten. A site with
+nothing to say now writes `HomeOrigin::Unset` and is greppable; a site that
+forgot no longer compiles.
+
+57 construction sites were updated mechanically to state today's value, so this
+is a **pure refactor**. Controls, all held: B1 `15094 -> 15094`, B3
+`66331 -> 66331`, every cascade row unchanged to the answer
+(2c\* 4,394 · 3b 203 · 4a 2,304 · 5 328), `resolution_scope` 10/10,
+`make test` PASS (unit; compile-fail 170; projects 18).
+
+> **Does this make a wrong bind impossible, or only unmeasured?** Neither — it
+> makes an *unasked* one impossible to write by accident, which is strictly
+> less. No binding changed. The remaining work is to give those sites a scope
+> that is right, and §3.1's question ("what should this name bind to") is not
+> answered by threading a module string into them.
 
 ### 8.3 B2 is unmeasured
 
