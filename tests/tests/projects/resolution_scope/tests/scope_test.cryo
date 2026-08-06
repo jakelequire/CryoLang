@@ -14,6 +14,9 @@ import ResolutionScope::UsesGreen;
 import ResolutionScope::UsesBlue;
 import ResolutionScope::TwoInScope;
 import ResolutionScope::Deep::Nested;
+import ResolutionScope::OwnsBefore;
+import ResolutionScope::OwnsAfter;
+import ResolutionScope::OwnsTwo;
 
 // Importing one of the colliding modules HERE is load-bearing: it puts a
 // second `tint`/`Paint` in the assertion module's own scope, so a callee's
@@ -74,6 +77,100 @@ function a_directly_imported_collider_is_still_usable()
     expect_eq(ResolutionScope::Blue::tint(), 3)?;
     const p: ResolutionScope::Blue::Paint = ResolutionScope::Blue::Paint::mix();
     expect_eq(p.shade(), 3)?;
+    return Result::Ok(());
+}
+
+// ---- §4 rule 1: a module's OWN declarations beat its imports ------------
+
+/// The tier-2/tier-3 boundary. `OwnsBefore` and `OwnsAfter` each declare
+/// `tint`/`Paint` AND import `Red`, which declares both leaves too. Per §4 a
+/// bare name there means the module's own, and the two files differ only in
+/// where the `import` line sits, so the pair also asserts that source order is
+/// not part of what a name means.
+///
+/// Every position is checked: a wrong bind was measured to be silent in the
+/// body-local one (it compiled, linked and returned the imported module's
+/// number) and a hard E0214 in the others, so a set that checked only one
+/// position would report the defect as either a crash or a wrong value
+/// depending on which it picked.
+![test]
+function a_module_sees_its_own_declarations_before_its_imports()
+        -> Result<(), TestError> {
+    // value lane
+    expect_eq(ResolutionScope::OwnsBefore::own_bare_call(), 7)?;
+    expect_eq(ResolutionScope::OwnsAfter::own_bare_call(), 8)?;
+
+    // type lane, every annotation position
+    expect_eq(ResolutionScope::OwnsBefore::own_bare_return().shade(), 7)?;
+    expect_eq(ResolutionScope::OwnsAfter::own_bare_return().shade(), 8)?;
+    expect_eq(ResolutionScope::OwnsBefore::own_bare_local(), 7)?;
+    expect_eq(ResolutionScope::OwnsAfter::own_bare_local(), 8)?;
+    expect_eq(ResolutionScope::OwnsBefore::own_bare_field(), 7)?;
+    expect_eq(ResolutionScope::OwnsAfter::own_bare_field(), 8)?;
+
+    expect_eq(ResolutionScope::OwnsBefore::own_bare_param(
+        ResolutionScope::OwnsBefore::Paint::mix()), 7)?;
+    expect_eq(ResolutionScope::OwnsAfter::own_bare_param(
+        ResolutionScope::OwnsAfter::Paint::mix()), 8)?;
+
+    // the fifth annotation position: a bare return on a STATIC method
+    expect_eq(ResolutionScope::OwnsBefore::own_bare_static_return(), 7)?;
+
+    return Result::Ok(());
+}
+
+/// The control on the direction of the fix. A bare name in EXPRESSION position
+/// bound correctly even while every annotation position bound to the import --
+/// spec §2.6's asymmetry, measured on the same file. Pinned so that closing
+/// the annotation half cannot be mistaken for licence to change this half.
+![test]
+function the_expression_lane_was_already_correct() -> Result<(), TestError> {
+    expect_eq(ResolutionScope::OwnsBefore::own_expr_position(), 7)?;
+    return Result::Ok(());
+}
+
+/// §4 rules 1 and 2 together: a tier-2 declaration settles an ambiguity that
+/// tier 3 genuinely has. `OwnsTwo` declares `tint`/`Paint` and imports BOTH
+/// Red and Green, which collide with each other. Binding to either import, or
+/// reporting the import-vs-import ambiguity, are both failures -- the
+/// declaration shadows the pair, so the conflict is unreachable.
+![test]
+function a_declaration_settles_an_ambiguity_between_two_imports()
+        -> Result<(), TestError> {
+    expect_eq(ResolutionScope::OwnsTwo::own_bare_call(), 9)?;
+    expect_eq(ResolutionScope::OwnsTwo::own_bare_return().shade(), 9)?;
+    expect_eq(ResolutionScope::OwnsTwo::own_bare_local(), 9)?;
+    // ...and both shadowed imports stay reachable, and stay distinct.
+    expect_eq(ResolutionScope::OwnsTwo::red_still_resolves(), 1)?;
+    expect_eq(ResolutionScope::OwnsTwo::green_still_resolves(), 2)?;
+    return Result::Ok(());
+}
+
+/// The control on the test above. Shadowing an import is not walling it off:
+/// the imported module must stay reachable by its qualified path from inside
+/// the module that shadows its leaf. Without this, "a module's own
+/// declarations win" would be satisfiable by dropping the import entirely.
+![test]
+function shadowing_an_import_does_not_hide_it() -> Result<(), TestError> {
+    expect_eq(ResolutionScope::OwnsBefore::the_import_still_resolves(), 1)?;
+    expect_eq(ResolutionScope::OwnsAfter::the_import_still_resolves(), 1)?;
+    return Result::Ok(());
+}
+
+/// The TYPE half of the control above, and the one this fix most needs.
+///
+/// A shadowed import's qualified TYPE path is answered by a different
+/// mechanism after the fix than before it (the M1 export scan rather than the
+/// leaf-plus-`qualifier_agrees` route), and that mechanism is on §6's deletion
+/// list. Without this, deleting it would silently break qualified access to
+/// every shadowed type. `OwnsTwo` exercises it with two same-leaf candidates
+/// in scope, so the scan has to tell them apart.
+![test]
+function a_shadowed_imports_TYPE_is_still_reachable_qualified()
+        -> Result<(), TestError> {
+    expect_eq(ResolutionScope::OwnsBefore::the_imported_TYPE_still_resolves(), 1)?;
+    expect_eq(ResolutionScope::OwnsTwo::red_TYPE_still_resolves(), 1)?;
+    expect_eq(ResolutionScope::OwnsTwo::green_TYPE_still_resolves(), 2)?;
     return Result::Ok(());
 }
 

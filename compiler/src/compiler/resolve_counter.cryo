@@ -211,6 +211,9 @@ type enum Site {
     M4Hits;
     M5Calls;
     M5Hits;
+    ScopeDeclOverImport;
+    ScopeImportShadowed;
+    ScopeAmbigRetracted;
 }
 
 implement enum Site {
@@ -304,6 +307,9 @@ implement enum Site {
             Site::M4Hits                => { "B1 " }
             Site::M5Calls               => { "B1 " }
             Site::M5Hits                => { "B1 " }
+            Site::ScopeDeclOverImport   => { "B3 " }
+            Site::ScopeImportShadowed   => { "B3 " }
+            Site::ScopeAmbigRetracted   => { "B3 " }
         };
     }
 
@@ -376,6 +382,9 @@ implement enum Site {
             Site::M4Hits                => { "M4 mono bare-name scan hits" }
             Site::M5Calls               => { "M5 import suffix fallback calls" }
             Site::M5Hits                => { "M5 import suffix fallback hits" }
+            Site::ScopeDeclOverImport   => { "declaration took a slot an import held" }
+            Site::ScopeImportShadowed   => { "import shadowed by a declaration" }
+            Site::ScopeAmbigRetracted   => { "import-vs-import ambiguity retracted" }
         };
     }
 
@@ -422,6 +431,7 @@ type enum Audit {
     Visibility;
     Path;
     Scope;
+    Named;
 }
 
 implement enum Audit {
@@ -432,6 +442,7 @@ implement enum Audit {
             Audit::Visibility => { "CRYO_VIS_AUDIT" }
             Audit::Path       => { "CRYO_PATH_AUDIT" }
             Audit::Scope      => { "CRYO_SCOPE_PROBE" }
+            Audit::Named      => { "CRYO_RN_AUDIT" }
         };
     }
 
@@ -517,6 +528,34 @@ public function vis_gate_reject(door: string, use_site: string,
                                 cand: string) -> void {
     if (!Audit::Visibility.enabled()) { return; }
     fmt::eprintf("VIS-GATE\t%s\t%s\t%s\n", door, use_site, cand);
+}
+
+/// Log the answer `resolve_named` gave for ONE annotation, naming the cascade
+/// step that produced it.
+///
+/// The end-of-run tally says how many answers each step gave; it cannot say
+/// which NAME a step answered, and that is the question a wrong bind poses.
+/// `docs/name-resolution.md` §8.2m: a module that declares a leaf it also
+/// imports binds the IMPORT in every annotation position, and every existing
+/// instrument reads green through it, because they all measure whether the
+/// home module was DERIVED correctly rather than what it then RESOLVED to.
+///
+/// `step` is the cascade label from the report; `home` is the module the
+/// annotation was written in as the context knows it (`<none>` when the site
+/// never established one); `cursor` is the ambient scope cursor, which is what
+/// every step below 2c canonicalizes against; `answer` is the qualified name
+/// that won.
+///
+/// `home` and `cursor` are separate columns because they answer different
+/// questions and the difference is the whole finding: on the body-local
+/// reproduction the cursor is CORRECT (it names the writing module) and the
+/// answer is still the imported type. An instrument reporting only provenance
+/// reads green there. Compare with
+/// `awk -F'\t' '$2=="3b-di-canonical" && $6 !~ "^"$4"::"'`.
+public function rn_answer(step: string, home: string, cursor: string,
+                          name: string, answer: string) -> void {
+    if (!Audit::Named.enabled()) { return; }
+    fmt::eprintf("RN\t%s\t%s\t%s\t%s\t%s\n", step, home, cursor, name, answer);
 }
 
 /// Log one QUALIFIED PATH that a namespace-suffix matcher resolved, to size
@@ -694,6 +733,11 @@ public function report() -> void {
     Site::FnBindVisSingle.print_row();
     Site::FnBindVisPlural.print_row();
     Site::FnBindVisRetLane.print_row();
+
+    fmt::eprintf("\n-- scope tiers (spec §4 rules 1-2) --------------------\n");
+    Site::ScopeDeclOverImport.print_row();
+    Site::ScopeImportShadowed.print_row();
+    Site::ScopeAmbigRetracted.print_row();
 
     fmt::eprintf("\n-- body annotation provenance (spec §8, task #7) ------\n");
     Site::BodyNsOwner.print_row();

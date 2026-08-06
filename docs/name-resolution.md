@@ -1841,6 +1841,244 @@ hold, since it carries only `current_ns`. §8.2i's warning stands for all of
 them: getting caller and callee backwards is a miscompile that every gate in
 this repo stays green through.
 
+### 8.2m The rib chain did not exist — FIXED 2026-08-06
+
+§4 defines a tiered precedence and calls it total. **`Scope` had no tiers.**
+`resolver/scope.cryo` was one flat `name -> SymbolID` map in which a module's
+own declarations and its imports competed for the same slot, first-writer-wins:
+
+- `Scope::insert` returned `false` when the name was taken — a declaration
+  arriving *after* an import silently failed to register.
+- `Scope::insert_import` kept the **first** entry and raised ambiguity only for
+  import-vs-import. A declaration-vs-import conflict was not detected at all.
+
+This was pre-existing rather than a regression — `scope.cryo` was untouched on
+this branch and `main` had the same code — and it is the defect the whole
+refactor exists to remove.
+
+#### Three failure modes, one flat map
+
+Measured on three-file probes, no generics, no mono. `Vault` declares a leaf
+and imports `Decoy`, which declares it too.
+
+| probe | result before the fix |
+|---|---|
+| standalone project, `import` **before** the declaration | `error[E0214]: expected Decoy::Widget, found Vault::Widget` — the module cannot name its own type, in **every** annotation position (free-fn return, free-fn param, local decl, struct field, static-method return). Every *expression* position was correct — §2.6's asymmetry, alive, on the same line. Both claims re-measured independently rather than inherited: the static-method return fails `E0200` on its own `-> Widget`, and an expression-position probe with every annotation qualified returns the right value before and after. |
+| the same project, `import` **after** the declaration | compiled clean, right answer |
+| corpus module, `import` **after** the declaration | `error[E0203]: ambiguous type 'Paint': imported from both 'ResolutionScope::OwnsAfter' and 'ResolutionScope::Red'` — the module's **own declaration** reported as an import, and declared ambiguous against a real one. §4 rule 2 confines ambiguity to *within* a tier, so these two never compete. |
+
+Read rows 2 and 3 together: **the same source order produced a clean build in
+one program and E0203 in another.** What a name meant depended not only on
+where the `import` line sat but on the shape of the rest of the program, which
+is what "first-writer-wins over a flat map" amounts to from the outside. No
+attempt is made here to explain the difference between those two pre-fix
+outcomes; the mechanism that produced both is gone.
+
+And the silent one, which is the reason this matters:
+
+```cryo
+namespace BR::Vault;
+import BR::Decoy;                                  // Decoy::Widget::make stores v*100
+public type struct Widget { v: i64; ... }
+public function local_decl() -> i64 {
+    mut a: Widget = BR::Decoy::Widget::make(3);    // compiling AT ALL => bound to the IMPORT
+    return a.v;
+}
+```
+
+**Compiles, links, runs, returns 300.** Controlled: retyping the initializer to
+`BR::Vault::Widget::make(3)` fails `E0200 expected BR::Decoy::Widget, found
+BR::Vault::Widget`, so the bind is proven rather than inferred. After the fix
+the same probe fails with expected/found **flipped**, which is the same control
+read in the other direction.
+
+#### Why every existing instrument read green
+
+`HomeOrigin`, `BodyNsDiff`, `mono_home`, `CRYO_SCOPE_PROBE` and the B1 ratchet
+all answer *"was the home module derived correctly?"*. None answers *"did the
+right home module produce the right answer?"*. A new per-event stream
+(`CRYO_RN_AUDIT`, `ResolveCounter::rn_answer`) reports the cascade step, the
+context's home module, **the ambient cursor**, the name, and the type that won.
+On the 300 probe it emits exactly one line:
+
+```
+RN  3b-di-canonical  home=<none>  cursor=BR::Vault  Widget  BR::Decoy::Widget
+```
+
+**The cursor was correct** — it named the module that wrote the syntax — **and
+the bind was still wrong.** The site sets no home module, so 2c is skipped
+entirely and 3b canonicalizes through `resolve_type_qualified_name_bare_from`,
+which walks the flat scope where the import owns the slot.
+
+That is the finding, and it is what makes this different from the preceding
+migration steps: **correct provenance is necessary and not sufficient.** Handing
+the remaining 23 scope-less `ResolutionContext` sites their home module would
+not have fixed any of the four cases above. §8.2l's dismissal of
+`type_resolution:60` ("the cursor is correct **by construction** here") is
+accurate about the cursor and says nothing about the bind.
+
+> **The instrument bar from §8.2g, one level up.** Every zero cited in §8.2i–l
+> was measured over the population of *provenance* decisions, which is the
+> complement of the population where this defect lives. Any new instrument here
+> must be able to fail on the four cases above; `rn_answer` is the first one in
+> the tree that can, and it prints the cursor and the answer as separate columns
+> precisely so a green provenance column cannot stand in for a correct bind.
+
+#### The fix
+
+`Scope`'s entries became a `ScopeEntry { name, sym, is_import }` and the two
+entry points now state the tier instead of racing for the slot:
+
+- `insert` (a declaration) arriving over an import **takes** the slot and
+  retracts any ambiguity recorded for that name — the recorded conflict was
+  import-vs-import, and a declaration shadows all of them (§4 rules 1 and 2).
+- `insert_import` arriving over a declaration is **skipped silently** — §4 rule
+  1 is explicit that a shadowed outer tier is not a diagnostic.
+
+The displaced import is dropped rather than demoted into the overload set,
+because that is what makes the two source orders agree: declaration-first
+already produced exactly that candidate set, since `insert_import` never added
+itself as an overload.
+
+> **The tier is a field, not a parallel array, and that was a deliberate second
+> pass.** The first cut carried `sym_is_import: boolean[]` alongside `symbols`.
+> The invariant held — two push sites, both updated — but it held *by
+> discipline*: a third insert path added later desyncs the arrays silently, and
+> every index-based read after the missing push then returns a NEIGHBOUR's
+> tier, which is a wrong bind with no diagnostic. That is the same class of
+> defect this section exists to remove, reintroduced one level down. §8.2l's
+> rule — set the fact inside the thing that knows it, so a caller cannot forget
+> — applies to data layout as much as to `expand_default_type_args`. One
+> `push_entry` helper is now the only place a binding is created.
+
+> **One of the two lookup systems already had this.**
+> `DeclarationIndex::resolve_qualified_scoped` documents and implements the same
+> precedence — *"a local definition beats imports"* — and it is what the VALUE
+> lane goes through. That is why a bare **call** in a module that both declares
+> and imports a leaf has always bound correctly while the same shape in an
+> **annotation** bound to the import, in both source orders. §4.4's "two answers
+> for one question" was this, concretely: two lookup systems, one of which
+> implemented §4.
+
+#### Measured effect — and what it is NOT
+
+Three counters were added at the tier decisions themselves
+(`ScopeDeclOverImport`, `ScopeImportShadowed`, `ScopeAmbigRetracted`), because
+a fix whose population is unmeasured is a fix whose blast radius is unknown.
+
+| target | declaration displaced an import | import shadowed | ambiguity retracted |
+|---|---:|---:|---:|
+| `examples/09-json-config` | **0** | **0** | **0** |
+| the compiler's own build (162 local + 81 std modules) | **0** | **0** | **0** |
+
+**No module in `compiler/src` or `stdlib` declares a leaf it also imports.** So
+on today's sources this change is inert, and that is the honest headline: the
+payoff is for *user* code and for what is representable, not for a bug in the
+shipped tree.
+
+Consequently **B1 is unmoved by this change**, and the −101 the ratchet reports
+is not mine. Verified rather than assumed: with the compiler changes stashed
+and stage-2 rebuilt at `3b65cd36`, `b1-check` reports the identical
+`15195 -> 15094 (-101)` with the identical five per-site rows. That drift
+belongs to `3b65cd36`, which changed resolution and did not re-pin the golden.
+The golden is re-pinned to 15,094 here to keep the ratchet usable — a
+permanently-red ratchet gets switched off — and the attribution is recorded so
+the two changes are not conflated. §8.2k's rule applies to conflating two
+behaviour changes just as much as to conflating a correction with a change.
+
+#### Corrections to earlier sections
+
+- **§8.2g consequence 1 is confirmed, and is now demonstrated rather than
+  predicted.** The Linux self-host fixed point passes with the defect present
+  *and* with it fixed.
+- **§8.2g consequence 2 is confirmed, and is the reason this was findable at
+  all.** The corpus was the prerequisite: the entry below was written first,
+  failed, and is what the fix is verified against.
+- **§8.2g consequence 3 needs splitting, and only half of it survives.** It
+  reads: *"No miscompile is being fixed here on today's sources … the change
+  carries no user-visible payoff to point at."*
+  - *"on today's sources"* — **confirmed, and now measured directly** rather
+    than inferred from candidate counts: the three tier counters above are zero
+    across the whole self-host.
+  - *"no user-visible payoff to point at"* — **falsified.** Ordinary user code
+    that declares a leaf it also imports mis-binds silently, with no generics
+    and no mono. The two statements were run together because the tree's own
+    sources were standing in for "what a program can look like", and §8.2g's
+    own argument is why they must not: the corpus cannot contain the shapes it
+    is being used to rule out.
+
+#### Corpus
+
+`tests/projects/resolution_scope` gained the tier-2/tier-3 boundary, which
+nothing in the tree previously reached — every collision in `resolution_scope`,
+`generic_name_collision` and `resolution_tripwire` is import-vs-import or
+consumer-vs-its-import, and both live entirely in tier 3.
+
+| file | what it pins |
+|---|---|
+| `owns_before.cryo` | declares `tint`/`Paint`, imports colliding `Red`; import written **first** |
+| `owns_after.cryo` | the same file with the import written **last** — the pair asserts that source order is not part of what a name means |
+| `owns_two.cryo` | declares the leaves and imports **two** modules that collide with each other, so tier 3 alone is genuinely ambiguous; exercises retracting the recorded ambiguity, which only the imports-first order reaches |
+
+Every position is value-checked, and each file carries the control that the
+shadowed import stays reachable by its qualified path — without it, "a module's
+own declarations win" would be satisfiable by dropping the import entirely.
+
+#### A coupling this creates, and the control that guards it
+
+Shadowing changes **how a qualified shadowed TYPE is found**, and the
+replacement mechanism is one §6 schedules for deletion.
+
+`resolve_type_qualified_name_from` answers a written path by extracting the
+leaf, resolving it in scope, and accepting the result only when
+`qualifier_agrees`. Before the fix, bare `Paint` inside a module that shadows
+`Red::Paint` resolved to *Red's*, the qualifier agreed, and the path was
+answered there. After it, the leaf resolves to the module's own, the qualifier
+**disagrees**, and the answer falls through to
+`resolve_qualified_type_via_exports` — the M1 export scan.
+
+Measured with `CRYO_PATH_AUDIT` on the corpus, not reasoned:
+
+```
+PATH-HIT  M1-AGREE   OwnsBefore  OwnsBefore::Paint  OwnsBefore::Paint   <- own decl
+PATH-HIT  M1-EXPORT  OwnsBefore  Red::Paint         Red::Paint          <- shadowed import
+PATH-HIT  M1-EXPORT  OwnsTwo     Red::Paint         Red::Paint
+PATH-HIT  M1-EXPORT  OwnsTwo     Green::Paint       Green::Paint
+```
+
+⇒ **Deleting the export scan without a replacement now silently breaks
+qualified access to every shadowed type.** At that point the cheapest-looking
+move is to put the deleted mechanism back, which is exactly the ratchet this
+subsystem has slipped down before. So the control is written *now*, while the
+reason is fresh, rather than discovered as a regression later:
+`a_shadowed_imports_TYPE_is_still_reachable_qualified`, exercised in `OwnsTwo`
+with two same-leaf candidates so the scan must tell them apart rather than be
+trivially right. The function-lane control (`the_import_still_resolves`) does
+**not** cover this — the whole defect was type-lane, and the two lanes take
+different routes.
+
+#### Still open after this
+
+- **The value lane's overload set.** §4 rule 1 implies that a module declaring
+  `foo(i32)` while importing `foo(string)` makes bare `foo("x")` an error, not a
+  call to the import. This change makes the two source orders **agree** on the
+  candidate set; it does not settle what overload resolution should then do with
+  it. Deliberately separate — §8.2k's rule about not conflating a measurement
+  correction with a behaviour change applies to conflating two behaviour changes
+  too.
+- **The prelude tier is still not in `Scope`.** It lives in the
+  `DeclarationIndex` (`prelude_ns`), so `sym_is_import == false` means "not an
+  import into this scope", not "tier 2 exclusively".
+- **3b, 4, 4a and step 5 still exist.** This makes 3b's *answer* correct; it
+  does not retire the fallbacks below it. §6's promotion of 2c to `resolve_path`
+  is what starves them, and it is now unblocked in a way it was not before: the
+  scope it would consult finally means what §4 says.
+- **The tier counters are zero on every corpus in the tree**, so they cannot
+  catch a regression in this fix by themselves — only `resolution_scope` can.
+  Read them as a population size, never as a gate. If a future change makes them
+  nonzero on the self-host, that is new information about the *sources*, not
+  about the resolver.
+
 ### 8.3 B2 is unmeasured
 
 Only the assoc-type projection (62) is instrumented. Sema's method and trait

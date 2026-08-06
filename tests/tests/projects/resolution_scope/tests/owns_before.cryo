@@ -1,0 +1,133 @@
+/// A module that DECLARES a leaf and also IMPORTS a module declaring the same
+/// leaf -- the tier-2/tier-3 boundary of spec §4, which nothing else in this
+/// corpus reaches.
+///
+/// Every other collision here is import-vs-import (`two_in_scope`) or
+/// consumer-vs-its-import (`uses_red`). Both live entirely in tier 3, so they
+/// exercise rule 2 (ambiguity WITHIN a tier) and never rule 1 (an inner tier
+/// shadows an outer one). Rule 1 is the one §4 is actually about:
+///
+///     locals / generic params
+///       -> current-module items          <- THIS module declares `tint`/`Paint`
+///       -> imported modules' export sets <- ...and imports Red's
+///       -> prelude
+///
+/// So `tint` and `Paint` written bare in this file mean THIS module's, and
+/// `ResolutionScope::Red` being in scope is irrelevant to that. A module must
+/// be able to name its own declarations.
+///
+/// The import is written BEFORE the declarations. `owns_after.cryo` is the
+/// same file with the import moved below them, and the two must agree: source
+/// order is not part of what a name means. They are separate modules rather
+/// than one file compiled twice because module discovery is import-driven --
+/// a file nothing imports is never compiled at all.
+///
+/// Values are distinct from Red's (1) so a wrong bind returns a wrong NUMBER
+/// rather than a compile error, per this project's design rule.
+![config(testing)]
+namespace ResolutionScope::OwnsBefore;
+
+import ResolutionScope::Red;
+
+function tint() -> i32 { return 7; }
+
+type struct Paint {
+    v: i32;
+
+    // Fully qualified on purpose: the type's own signature must not depend on
+    // the thing under test, or a wrong bind here would mask the wrong bind
+    // in the annotation positions below.
+    static mix() -> ResolutionScope::OwnsBefore::Paint {
+        return ResolutionScope::OwnsBefore::Paint { v: 7 };
+    }
+    shade(&this) -> i32 { return this.v; }
+}
+
+/// VALUE LANE. Bare `tint()` with Red's `tint` also in scope.
+function own_bare_call() -> i32 { return tint(); }
+
+/// TYPE LANE, return position.
+function own_bare_return() -> Paint { return ResolutionScope::OwnsBefore::Paint::mix(); }
+
+/// TYPE LANE, parameter position. Called with this module's own `Paint`, so a
+/// bind to `Red::Paint` is a hard error rather than a wrong number.
+function own_bare_param(p: Paint) -> i32 { return p.shade(); }
+
+/// TYPE LANE, body-local declaration -- the position that compiles, links and
+/// returns the wrong number with no diagnostic at all.
+function own_bare_local() -> i32 {
+    mut a: Paint = ResolutionScope::OwnsBefore::Paint::mix();
+    return a.shade();
+}
+
+/// TYPE LANE, struct field.
+type struct Holder {
+    p: Paint;
+
+    static wrap() -> ResolutionScope::OwnsBefore::Holder {
+        return ResolutionScope::OwnsBefore::Holder {
+            p: ResolutionScope::OwnsBefore::Paint::mix()
+        };
+    }
+    unwrap(&this) -> i32 { return this.p.shade(); }
+}
+
+function own_bare_field() -> i32 {
+    const h: ResolutionScope::OwnsBefore::Holder =
+        ResolutionScope::OwnsBefore::Holder::wrap();
+    return h.unwrap();
+}
+
+/// TYPE LANE, bare return annotation on a STATIC METHOD -- the fifth
+/// annotation position, and the only one the types above cannot cover: their
+/// own `mix()` is qualified on purpose, so that a wrong bind in the type's own
+/// signature cannot mask the wrong bind under test elsewhere. This type exists
+/// to put that position under test in isolation, and nothing else uses it.
+type struct Tin {
+    v: i32;
+
+    static fill() -> Paint {                       // <- bare, on a static method
+        return ResolutionScope::OwnsBefore::Paint::mix();
+    }
+}
+
+function own_bare_static_return() -> i32 {
+    return ResolutionScope::OwnsBefore::Tin::fill().shade();
+}
+
+/// EXPRESSION position, as the control on all of the above.
+///
+/// `Paint::mix()` here is a path EXPRESSION, not an annotation. Measured
+/// before the fix: with every annotation in the file qualified so nothing can
+/// leak into it, this position bound correctly while all five annotation
+/// positions bound to the import. That asymmetry is spec §2.6, and the fix
+/// must not "repair" it by changing this side -- a regression here is as much
+/// a failure as one above.
+function own_expr_position() -> i32 { return Paint::mix().shade(); }
+
+/// The import must still WORK: shadowing is not walling-off. `Red` is in this
+/// module's scope and its qualified path must resolve to Red's, not to ours.
+function the_import_still_resolves() -> i32 { return ResolutionScope::Red::tint(); }
+
+/// The same control for the TYPE lane, and it is NOT redundant with the
+/// function one above -- it is the control this fix most needs.
+///
+/// Shadowing changes HOW a qualified shadowed type is found.
+/// `resolve_type_qualified_name_from` resolves the written path by extracting
+/// the leaf, resolving it in scope, and accepting the result only when
+/// `qualifier_agrees`. Before the fix, bare `Paint` here resolved to
+/// `Red::Paint`, the qualifier agreed, and the path was answered by that
+/// route. After it, bare `Paint` resolves to THIS module's, the qualifier
+/// disagrees, and the answer comes from `resolve_qualified_type_via_exports`
+/// -- the M1 export scan -- instead.
+///
+/// So the fix moves qualified shadowed types onto a mechanism that
+/// `docs/name-resolution.md` §6 schedules for DELETION. Deleting it without
+/// this control in place makes `Red::Paint` stop resolving from here, and the
+/// pressure at that point is to put the deleted mechanism back. The control
+/// is written now, while the reason is fresh, so that a future deletion has
+/// to supply a replacement rather than a revert.
+function the_imported_TYPE_still_resolves() -> i32 {
+    const p: ResolutionScope::Red::Paint = ResolutionScope::Red::Paint::mix();
+    return p.shade();
+}
