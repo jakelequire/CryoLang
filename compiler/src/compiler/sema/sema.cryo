@@ -2077,6 +2077,10 @@ public:
         if (!cast.has_resolved_target() && cast.target_annotation != null && this.ctx.type_resolver != null) {
             this.prime_typeof_annotation(cast.target_annotation);
             mut res_ctx: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
+            // `x as T` is written inside a body, so the target annotation means
+            // what that body's module says (spec §8.2l, same shape as
+            // `body_res_ctx`).
+            res_ctx.set_home_module(this.ctx.module_ns_of_file(cast.span.file), HomeOrigin::Syntax);
             // Bind the enclosing generic's type parameters so a cast target like
             // `x as T` resolves `T` to the abstract method/owner type parameter,
             // not a same-named global type in another module.  Without this an
@@ -2308,6 +2312,9 @@ public:
         if (this.ctx.type_resolver == null || this.arena == null) { return save; }
 
         mut rc: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
+        // The scrutinee annotation is written at the `static match`, inside a
+        // body (spec §8.2l).
+        rc.set_home_module(this.ctx.module_ns_of_file(arm.span.file), HomeOrigin::Syntax);
         this.symbolic.symbolic_bind_params(&rc);
         const scrut_ref: TypeRef = this.ctx.type_resolver.resolve(scrutinee, &rc);
         if (!scrut_ref.is_valid()) { return save; }
@@ -2532,6 +2539,9 @@ public:
             return TypeRef::invalid();
         }
         mut rc: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
+        // The literal's generic args are written at the literal, inside a body
+        // (spec §8.2l).
+        rc.set_home_module(this.ctx.module_ns_of_file(lit.span.file), HomeOrigin::Syntax);
         // Inside a template body the args may name the enclosing generic
         // parameters, which resolve only against their bindings; binding them also
         // marks the context demand-free, so an abstract instantiation registers no
@@ -2567,7 +2577,7 @@ public:
         // Name-based lookup FIRST: for a literal whose spec is already registered
         // (the common case) this is a pure lookup with no side effects.
         if (lit.generic_args.length > 0 && this.ctx.type_resolver != null) {
-            const spec_sym: SymbolStr = this.calls.resolve_generic_scope_name(lit.struct_type, lit.generic_args);
+            const spec_sym: SymbolStr = this.calls.resolve_generic_scope_name(lit.struct_type, lit.generic_args, lit.span);
             if (spec_sym.is_valid()) { struct_ref = this.types.lookup_type_by_sym(spec_sym); }
         }
         // Only when the name lookup found nothing (the spec isn't registered yet -

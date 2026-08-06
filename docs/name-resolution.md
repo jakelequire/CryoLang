@@ -1706,6 +1706,141 @@ correct input consulted at the wrong time.
 > stdlib paths (it returns `std::core::mem` correctly). Both would have been
 > plausible as written-up causes. Neither survived measurement.
 
+### 8.2l The worklist, classified in full (2026-08-05)
+
+§8.2i established that the question is **per context, not per function**, and
+classified twelve sites. This is the same pass run over all of them. Every
+`ResolutionContext::new` in the compiler was read — 57 total, 42 of which set no
+home module — and sorted by *where the syntax it resolves was written*.
+
+**Five of the 42 are not worklist items at all**, and finding that out first
+changes the size of the job:
+
+| site | why it needs nothing |
+|---|---|
+| `types/resolver` 156 | `clone()` — copies `home_module` **and** `home_origin` verbatim |
+| `types/resolver` 1301, `mono/state` 302 · 366, `monomorphizer` 290 | bare by design: each only feeds `expand_default_type_args`, which clones the context and sets the home from `entry.module_name` itself |
+
+That leaves **37**. The second row is the important one, and it is the pattern
+the rest of this migration should copy: `expand_default_type_args` is correct at
+*nine* call sites without any of them knowing it, because the home module is a
+property of the `entry` it already receives. Setting provenance **inside the
+resolver function that knows the owning entity** is correct by construction;
+setting it at each call site is a rule every future caller can forget. Prefer
+the former wherever the callee holds the entity.
+
+| what the context resolves | home module | sites | n |
+|---|---|---|---:|
+| turbofish / scope generic args | the **caller** | `call_resolver` 577 · 4783 · 4833 · 4871, `method_binding` 798 · 1428, `call_specializer` 1368 | 7 |
+| annotations written inside a body (cast target, static-match scrutinee, struct-literal args, lambda params/return, `sizeof` operand) | the **enclosing body's** module | `sema` 2079 · 2310 · 2534, `lambda_synth` 72, `lambda_emitter` 108 · 123, `ir_generator` 171 | 7 |
+| a specialized body being re-walked, and template defaults | the **template's** module | `call_specializer` 111 · 177 · 1134 · 1149 · 1211 · 1481 · 1532 · 1706, `ast_resolver` 151, `type_resolution` 3629 | 10 |
+| an impl block's trait annotation / target args / assoc bindings | the **impl block's** module | `method_binding` 1628 · 1897, `types/resolver` 542, `trait_specializer` 120 | 4 |
+| a where-clause bound's trait args | the module that **wrote the bound** | `method_binding` 475, `types/resolver` 726, `sema` 3326 | 3 |
+| a method reached through a trait decl | the **trait's** module | `method_binding` 1045, `sema` 687 | 2 |
+| the callee's own annotations, off a receiver | the **owner type's** module | `method_binding` 1197 | 1 |
+| a whole module's declarations, walked in order | the module being walked — the cursor is correct **by construction** here | `type_resolution` 60 | 1 |
+| `Output` on an awaited future — a synthesized leaf, not user syntax | n/a | `sema` 1486 | 1 |
+| **two homes through ONE context** | see below | `method_binding` 865 | 1 |
+
+#### `method_binding.cryo:865` is a defect, not a site
+
+One `imp_ctx` resolves the caller's turbofish (`member.generic_args[i]`) and
+then the callee's return annotation (`im.func.return_type_annotation`) — two
+different modules through one context. There is no single home module that is
+correct for it, so it cannot be migrated; it has to be **split into two
+contexts** first. It is the only site of its shape, and it is invisible to a
+per-function audit: the function looks like one context doing one job.
+
+#### What this predicts
+
+The `caller` and `body` rows are the shapes already proven — §8.2i's eight
+turbofish sites and §8.2k's `body_res_ctx` respectively — and both measured
+behaviour-neutral, because the cursor is parked correctly during an in-order
+walk. **The `template` row is the one to expect divergence from**: those
+contexts are built while mono re-walks a specialized clone, which is exactly the
+condition under which the cursor names the module that *demanded* the
+specialization rather than the one that wrote the code. That is where a
+measurement should be pointed first, and it is 10 of the 37.
+
+`type_resolution:3629` belongs to that row and is the clearest single case: it
+computes its module as `ctx.has_namespace() ? ctx.namespace_display() : ...` —
+the cursor, spelled out — while re-resolving a template's generic parameters.
+
+#### Migrated: `call_specializer:1481`
+
+One site from the `template` row landed with this classification, chosen because
+its correctness argument needs no new evidence: `finish_generic_static_method_spec`
+builds **two** contexts over the **same body** — `prune_ctx` for the
+static-match patterns and `body_ctx` for the local annotations — and only
+`body_ctx` had a home module. The value is `owner_entry.module_name`, already
+derived fourteen lines below and already documented there as the module the body
+was written in. The derivation is now hoisted once and shared, so the two cannot
+drift.
+
+**It is behaviour-neutral, and the honest caveat is that no available corpus
+reaches it.** `09-json-config` produced a byte-identical output tree and a
+byte-identical counter report; `generic_name_collision`, which *does* declare
+generic static methods, produced a byte-identical counter report too (97 lines,
+checked non-empty — an "identical" between two empty files is the §8.2g failure
+in miniature). A counter that does not move here means the path is not
+exercised, **not** that the change is proven safe on it. The evidence that it is
+safe is the self-host: stdlib and compiler both specialize generic static
+methods, and stage-3/stage-4 IR is byte-identical across 244 modules on Linux
+and 243 on Windows. Per §4.1 that proves no regression and says nothing about
+scope correctness.
+
+#### Migrated: the `caller` and `body` rows — 13 more sites
+
+Both rows use a mechanism already proven and measured (§8.2i's turbofish sites;
+§8.2k's `body_res_ctx`), so they landed together rather than one at a time.
+
+| row | migrated | site |
+|---|---|---|
+| caller | 6 of 7 | `call_resolver` 577 · 4783 · 4833 · 4871, `method_binding` 798 · 1428 |
+| body | 7 of 7 | `sema` 2079 · 2310 · 2534, `lambda_synth` 72, `lambda_emitter` 108 · 123, `ir_generator` 171 |
+
+Two of these needed a **required** span parameter rather than an inferred one —
+`resolve_generic_scope_name` (7 call sites) and `resolve_sizeof_operand_type`
+(2). Required, not defaulted, for the same reason `set_home_module` takes a
+required origin: a caller that can omit it silently reinstates the scope-less
+context, and every one of those 9 call sites already had the node in hand.
+
+**This is the first change in the migration to move the number.** On
+`examples/09-json-config`, output byte-identical:
+
+| | before | after | Δ |
+|---|---:|---:|---:|
+| **B1 total** | 15,437 | **15,195** | **−242** |
+| step 5, GLOBAL LEAF INDEX | 656 | **414** | **−242** |
+| `lookup_by_leaf` hits | 2,096 | 1,854 | −242 |
+| 2c* home-module (syntax provenance) | 3,893 | 4,283 | +390 |
+| B3 authoritative | 65,628 | 66,207 | +579 |
+
+The −242 is the whole point: those are answers that used to fall through to the
+global leaf index — §8.2a's root cause, a name resolved with nothing in scope —
+and now resolve in the module that wrote them. It retires **37% of that row** on
+this target. Unlike §8.2k's provenance-only result, this one is a real reduction
+in fallback reliance.
+
+> **One row moved the wrong way, and it is not a regression.** "WOULD BE
+> REJECTED once gated" rose 4,192 → 4,360 (+168). Giving a context a home module
+> is what lets `resolve_qualified_scoped` judge it against a real scope at all,
+> so closing the keystone *grows* the type lane's measured blast radius rather
+> than shrinking it. §8.1e's lesson applies unchanged: a violation count says
+> what a gate would CATCH, never what it would BREAK, so this number is not
+> evidence for or against switching the type gate on. It does mean §6's "re-measure
+> before acting" now has a moving target — the type-lane audit should happen
+> *after* the keystone closes, not alongside it.
+
+**23 of the 37 remain**, and none of them are the same shape as these. What is
+left needs a home value that does not yet exist in hand: a trait's module
+(`TraitDeclNode` has no module field), an impl block's module, the module that
+wrote a where-clause bound, or — for `call_specializer` 1368, the one `caller`
+site not migrated — a `CompilationContext` that `MonoCallSpecializer` does not
+hold, since it carries only `current_ns`. §8.2i's warning stands for all of
+them: getting caller and callee backwards is a miscompile that every gate in
+this repo stays green through.
+
 ### 8.3 B2 is unmeasured
 
 Only the assoc-type projection (62) is instrumented. Sema's method and trait

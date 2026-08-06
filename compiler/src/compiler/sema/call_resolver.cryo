@@ -421,7 +421,7 @@ type struct CallResolver {
         mut type_ref: TypeRef = this.types.lookup_type_by_sym(scope.scope_name);
         if (scope.scope_generic_args.length > 0) {
             const spec_sym: SymbolStr = this.resolve_generic_scope_name(
-                scope.scope_name, scope.scope_generic_args);
+                scope.scope_name, scope.scope_generic_args, scope.span);
             if (spec_sym.is_valid()) {
                 const spec_ref: TypeRef = this.types.lookup_type_by_sym(spec_sym);
                 if (spec_ref.is_valid()) { type_ref = spec_ref; }
@@ -575,6 +575,9 @@ type struct CallResolver {
             tmpl = this.lookup_scope_template(sr.scope_name);
             if (tmpl == null) { return out; }
             mut res_ctx: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
+            // `Wrap<u8>::make` - the turbofish is syntax the CALLER wrote, so its
+            // bare leaves mean what the caller's module says (spec §8.2l).
+            res_ctx.set_home_module(this.syntax_module_of(sr.span), HomeOrigin::Syntax);
             this.symbolic.symbolic_bind_params(&res_ctx);
             for (mut i: i64 = 0; i < sr.scope_generic_args.length; i++) {
                 owner_args.push(this.ctx.type_resolver.resolve(sr.scope_generic_args[i], &res_ctx));
@@ -810,7 +813,7 @@ type struct CallResolver {
             }
             if (inferred_generic_ret.is_valid()) { return inferred_generic_ret; }
             if (call.generic_args.length > 0) {
-                const spec_sym: SymbolStr = this.resolve_generic_scope_name(ident.name, call.generic_args);
+                const spec_sym: SymbolStr = this.resolve_generic_scope_name(ident.name, call.generic_args, call.span);
                 if (spec_sym.is_valid()) {
                     call.set_resolved_callee(spec_sym);
                     const spec_ret: TypeRef = this.types.lookup_func_return(spec_sym);
@@ -3450,7 +3453,7 @@ type struct CallResolver {
         // scoping doesn't apply (unique leaf, module scope, or a generic param).
         mut lookup_sym: SymbolStr = this.ctx.resolve_scoped_or(scope.scope_name);
         if (scope.scope_generic_args.length > 0) {
-            const spec_sym: SymbolStr = this.resolve_generic_scope_name(scope.scope_name, scope.scope_generic_args);
+            const spec_sym: SymbolStr = this.resolve_generic_scope_name(scope.scope_name, scope.scope_generic_args, scope.span);
             if (spec_sym.is_valid()) { lookup_sym = spec_sym; }
         }
         const method_ret: TypeRef = this.try_resolve_static_method(scope, lookup_sym, call);
@@ -4738,9 +4741,9 @@ type struct CallResolver {
             if (!spec_sym.is_valid()) {
                 const base: SymbolStr = tmpl.spec_base_name(this.intern);
                 if (scope != null && scope.generic_args.length > 0) {
-                    spec_sym = this.resolve_generic_scope_name(base, scope.generic_args);
+                    spec_sym = this.resolve_generic_scope_name(base, scope.generic_args, scope.span);
                 } else if (call.generic_args.length > 0) {
-                    spec_sym = this.resolve_generic_scope_name(base, call.generic_args);
+                    spec_sym = this.resolve_generic_scope_name(base, call.generic_args, call.span);
                 }
             }
             if (spec_sym.is_valid()) {
@@ -4781,6 +4784,9 @@ type struct CallResolver {
         if (this.ctx.type_resolver == null) { return TypeRef::invalid(); }
         if (generic_args.length != tmpl.param_type_ids.length) { return TypeRef::invalid(); }
         mut rc: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
+        // Explicit turbofish on the call: the CALLER's syntax, not the
+        // template's (spec §8.2l).
+        rc.set_home_module(this.syntax_module_of(call.span), HomeOrigin::Syntax);
         this.symbolic.symbolic_bind_params(&rc);
         mut arg_refs: TypeRef[] = [];
         for (mut i: i64 = 0; i < generic_args.length; i++) {
@@ -4828,9 +4834,16 @@ type struct CallResolver {
         return entry;
     }
 
-    resolve_generic_scope_name(&this, base_name: SymbolStr, generic_args: &TypeAnnotation*[]) -> SymbolStr {
+    /// `use_span` is the span of the syntax that WROTE `generic_args` - always a
+    /// call/scope/identifier/literal node at the use site. The args are the
+    /// caller's turbofish, so they resolve in the caller's module (spec §8.2l);
+    /// it is a required parameter because every caller has such a node in hand
+    /// and a defaulted one would silently reintroduce the scope-less context.
+    resolve_generic_scope_name(&this, base_name: SymbolStr, generic_args: &TypeAnnotation*[],
+                               use_span: SourceSpan) -> SymbolStr {
         if (this.ctx.type_resolver == null) { return SymbolStr::empty(); }
         mut res_ctx: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
+        res_ctx.set_home_module(this.syntax_module_of(use_span), HomeOrigin::Syntax);
         this.symbolic.symbolic_bind_params(&res_ctx);
         mut arg_refs: TypeRef[] = [];
         for (mut i: i64 = 0; i < generic_args.length; i++) {
@@ -4869,6 +4882,10 @@ type struct CallResolver {
                 mut resolved_args: TypeRef[] = [];
                 mut all_valid: boolean = true;
                 mut res_ctx: ResolutionContext = ResolutionContext::new(this.ctx.source_file, "");
+                // Scope turbofish written at the use site (spec §8.2l). The
+                // `expand_default_type_args` below re-homes itself on the
+                // TEMPLATE's module, so the two do not conflict.
+                res_ctx.set_home_module(this.syntax_module_of(scope.span), HomeOrigin::Syntax);
                 this.symbolic.symbolic_bind_params(&res_ctx);
                 for (mut i: i64 = 0; i < scope.scope_generic_args.length; i++) {
                     const arg_ref: TypeRef = this.ctx.type_resolver.resolve(scope.scope_generic_args[i], &res_ctx);
@@ -4946,7 +4963,7 @@ type struct CallResolver {
         // scoping doesn't apply (unique leaf, module scope, or a generic param).
         mut lookup_sym: SymbolStr = this.ctx.resolve_scoped_or(scope.scope_name);
         if (scope.scope_generic_args.length > 0) {
-            const spec_sym: SymbolStr = this.resolve_generic_scope_name(scope.scope_name, scope.scope_generic_args);
+            const spec_sym: SymbolStr = this.resolve_generic_scope_name(scope.scope_name, scope.scope_generic_args, scope.span);
             if (spec_sym.is_valid()) { lookup_sym = spec_sym; }
         }
         if (this.scope_is_generic_template(lookup_sym, scope.member_name)) { return; }
