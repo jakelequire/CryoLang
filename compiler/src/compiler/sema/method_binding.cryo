@@ -1130,6 +1130,14 @@ type struct MethodBinding {
             }
         }
         if (found != null) {
+            // `found` is a method of the BOUND TRAIT, so the annotations resolved
+            // through this context were written in the trait's declaration file --
+            // not in the module holding the `where` clause that named the bound,
+            // and not in the module being checked.  The receiver is a generic param
+            // and has no module of its own, so there is nothing here to key off
+            // except the declaration.
+            rc.set_home_module(this.ctx.module_ns_of_file(found.span.file),
+                               HomeOrigin::Syntax);
             rc.set_this_type(recv_type);
             *out_func = found;
         }
@@ -1180,10 +1188,13 @@ type struct MethodBinding {
         mut owner_ctx: ResolutionContext = ResolutionContext::new(FILE, LINE, this.ctx.source_file, "", "", HomeOrigin::Unset);
         this.symbolic.symbolic_bind_params(&owner_ctx);
         owner_ctx.set_this_type(recv_type);
-        // `orig_func` is the OWNER's method, so the annotations `solve_method_bindings`
-        // resolves through this context were written in the owner's module, not in the
-        // module being checked.  Same reasoning -- and the same call -- as
-        // `find_generic_method_for_call` below (§5.2, keystone shape B).
+        // `orig_func` is the OWNER's method, so the annotations
+        // `solve_method_bindings` resolves through this context are that method's,
+        // not the checked module's.  The receiver here is the un-instantiated
+        // owner template and does carry a module, so keying off it answers -- but
+        // what it answers is the owner's module, which parts company with the
+        // declaring file whenever the method is a trait default (declared in the
+        // trait's file) or sits in an `implement` block outside the owner's module.
         owner_ctx.set_home_module(this.owner_module_of(recv_type), HomeOrigin::Syntax);
         mut bindings: TypeRef[] = this.solve_method_bindings(orig_func, &owner_ctx, member, call);
         if (bindings.length != n_method_params) { return; }
@@ -1249,12 +1260,6 @@ type struct MethodBinding {
                 break;
             }
         }
-
-        // Annotations resolved through this context (and the clones every caller
-        // makes of it) belong to the RECEIVER's module, not the module being
-        // checked.  Without this the callee's bare return leaf is re-resolved
-        // against the caller's imports.
-        owner_ctx.set_home_module(this.owner_module_of(recv_type), HomeOrigin::Syntax);
 
         mut found: MethodNode* = null;
         const empty_params: GenericParamNode*[] = [];
@@ -1351,6 +1356,22 @@ type struct MethodBinding {
         }
         if (orig_func == null) { return owner_ctx; }
         if (orig_func.generic_params.length == 0) { return owner_ctx; }
+
+        // The annotations resolved through this context (and through the clones
+        // every caller makes of it) are `orig_func`'s own, so their scope is the
+        // file that DECLARES the method -- not the receiver's module and not the
+        // module being checked.  The three differ: a trait default's body lives in
+        // the trait's file while the receiver is the implementing type, and an
+        // `implement` block may sit in a third module again.  Keying off the
+        // receiver type also has no answer at all for a symbolic receiver, and an
+        // empty module normalizes to `Unset`, which drops every name resolved here
+        // into the module-blind chain while the source reads as though a scope was
+        // established.  This is set after `orig_func` is known because the
+        // declaration is the thing that carries the answer; the early returns above
+        // hand back an unscoped context, and every caller discards it when
+        // `*out_func` is null.
+        owner_ctx.set_home_module(this.ctx.module_ns_of_file(orig_func.span.file),
+                                  HomeOrigin::Syntax);
 
         if (recv_base.is_valid()) {
             const n_owner: i64 = if (owner_params.length < recv_nargs) {

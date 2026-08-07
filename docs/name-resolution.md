@@ -2466,6 +2466,154 @@ flip them; deleting step 5 is what flips them**, and that flip — the project
 converting to `compile_fail` with E0203 in the same change — is the outcome that
 turns this from a counter delta into a defect that stops existing.
 
+### 8.2r The declaration carries the scope — three sites, MEASURED 2026-08-06
+
+§8.2q left `find_generic_method_for_call` as the largest remaining supplier: 102
+of step 5's 143, and the one site in the tree that passes an empty module while
+claiming `HomeOrigin::Syntax`, 1,086 times. The mechanism §8.2p measured was
+`owner_module_of` → `arena.module_ns_of`, which has no answer for a symbolic
+receiver.
+
+**The fix is a deletion of a proxy, not a guard on it.** The context exists to
+re-resolve `orig_func`'s own parameter and return annotations, so their scope is
+the file that *declares the method*. Keying off the receiver's type asks a
+different question and merely agrees with the right one whenever a type's methods
+live beside it:
+
+```cryo
+owner_ctx.set_home_module(this.ctx.module_ns_of_file(orig_func.span.file),
+                          HomeOrigin::Syntax);
+```
+
+The three answers genuinely differ — a trait default's body lives in the trait's
+file while the receiver is the implementing type, and an `implement` block may
+sit in a third module again. `module_ns_of_file` is the same total
+file → module function §8.2q scopes `TypeResolution` with, so this is one
+question with one answering path rather than a receiver lookup with an
+empty-string branch. The assignment moved below the method search because the
+declaration is the thing that carries the answer; the early returns above hand
+back an unscoped context, and all three callers discard it when `*out_func` is
+null.
+
+**Predicted before the edit, and checked after.** Every row hit exactly:
+
+| row | predicted | measured |
+|---|---|---|
+| `RN-HOME-EMPTY` at this site | → 0 | **1,086 → 0** |
+| 5 leaf index | → 41 | **143 → 41** |
+| step-5 leaf names | `Str` only | **`Formatter`×102 gone, `Str`×41** |
+| 3b DI canonical | unchanged | **108** |
+| calls (total) | unchanged | **11,495** |
+| 2c\* syntax provenance | +102 | **6,998 → 7,100** |
+| B1 | −102 | **12,605 → 12,503** |
+
+The site is now absent from the below-2c attribution entirely; below-2c fell
+**266 → 164**. `RN-HOME-EMPTY` is left with only the six span-less synthesized
+declarations §8.2q explained. `b1-check` reported the same −102 against its own
+golden and was re-pinned to 12,503, with `lookup_by_leaf hits` 1,583 → 1,481 —
+the family label falling by the row it actually contains, as §8.2q's correction
+predicts.
+
+#### What this is NOT: a route change, and the corpus says so
+
+**No binding changed.** Three corpus entries were built to make the old and new
+scopes disagree observably, and none could:
+
+- **a generic trait default returning a bare leaf** — the declaration fails to
+  typecheck against its own return annotation *before* this site is reached,
+  because the default's **body** binds bare names in the implementing module.
+  Reproduces with this fix reverted.
+- **the same with the body qualified** — the instantiated-for-implementor check
+  binds the bare *return annotation* in the implementing module too. Reproduces
+  with the fix reverted.
+- **a cross-module inherent `implement struct` block** — both compilers emit the
+  identical mangled symbol, carrying the *declaring* module's type, and both then
+  fail an unrelated E0900 (`Incorrect number of arguments passed to called
+  function` for a generic method returning an aggregate).
+
+So on every shape reachable today the leaf index was already finding the same
+type by global index, which is why the self-host stays byte-identical and why
+`resolution_scope` stays 10/10. The measurable effect is the counter, and the
+counter is the pin: `tests/b1-baseline.txt` asserts the per-site rows, so
+restoring the receiver-type proxy fails `b1-check` on the row it moved.
+
+> **Does this make a wrong bind impossible, or only unmeasured?** It removes the
+> largest remaining *unasked* question — 1,086 contexts that read as scoped and
+> were not. It does not by itself change an answer, and the entry that would
+> prove one cannot be written until the trait-default lanes above are fixed.
+
+The two `WRONG_` tripwires are still green, still correctly: deleting step 5
+remains what flips them.
+
+#### The same mechanism at two more sites
+
+`find_generic_method_on_receiver_bounds` (the abstract-receiver path) built its
+context and **never scoped it at all**. Its `found` comes from `td.methods` — a
+method of the *bound trait* — so the annotations were written in the trait's
+declaration file, and the receiver is a generic param with no module to key off
+even in principle. Same one-line answer, from `found.span.file`.
+
+`TypeResolver::resolve_concrete_member` resolves an **assoc-type binding
+annotation**, which is the `implement` block's own text. Neither the trait nor
+the target type can stand in for it: an `implement` block may live in a third
+module again, which is exactly the disagreement `resolve_counter.cryo` names as
+the thing that decides between "derive the home from an entity in hand" and
+"plumb a file → namespace map". The entity cannot answer here, so the file does.
+
+`TypeResolver` had no `CompilationContext` — that is the import cycle
+`compilation_context.cryo` creates — so it takes a `ModuleGraph*` and calls
+`ModuleGraph::home_ns_of_file`, the same escape mono already uses for the same
+reason. It is a **required** constructor argument, matching the file's own stated
+rule that registries are mandatory so no caller can silently bypass one; there is
+a single construction site, in `compilation_context.cryo`.
+
+| row | after §8.2q | receiver-bounds | assoc-binding |
+|---|---:|---:|---:|
+| 3b DI canonical | 108 | **64** | **11** |
+| 5 leaf index | 41 | 41 | **8** |
+| 2c\* syntax provenance | 7,100 | **7,144** | **7,230** |
+| B1 | 12,503 | 12,503 | **12,470** |
+| below 2c | 164 | **120** | **34** |
+| calls (total) | 11,495 | 11,495 | 11,495 |
+
+**B1 did not move for the receiver-bounds fix, and that was predicted**: 3b is a
+B3 row, so draining it changes which authoritative step answers without touching
+the fuzzy total. `by caller: canonical_qualified` held at 2,527, which was the
+stated condition under which B1 *would* have moved.
+
+#### What is left below 2c
+
+| answers | site | kind |
+|---:|---|---|
+| 8 + 8 | `mono/trait_specializer.cryo:120` | 5 / 3b — the last `Str` |
+| 3 | `mono/ast_resolver.cryo:181` | 3b |
+| 8 | `sema/method_binding.cryo:798` | X-failed, home **set** |
+| 6 | `sema/sema.cryo:3336` | X-failed |
+| 1 | `passes/type_resolution.cryo:60` | X-failed, home **set** |
+
+Only 19 of the 34 are a missing scope. The other 15 are `X-failed` with a scope
+present — an unbound-binding defect, not this one, and they will not be fixed by
+scoping anything. **Step 5's entire remaining population is `Str`×8 from one
+site**, so the leaf index's blast radius is now a single leaf name.
+
+#### Three defects this exposed, none of them this fix's
+
+Each reproduces with the change reverted, so each is pre-existing:
+
+1. **A generic trait default's body binds bare names in the implementing
+   module**, not the trait's file — so a default whose body and return
+   annotation share a bare leaf fails E0200 against itself.
+2. **A generic trait default's bare return annotation binds in the implementing
+   module** when instantiated per implementor, disagreeing with the same
+   annotation at its declaration site.
+3. **A generic method in a cross-module inherent impl miscompiles** — E0900,
+   wrong argument count at the call, when it returns an aggregate.
+
+Also: `docs/grammar.md` §188 gives `TargetType ::= QualName GenericArgs?`, but
+the parser accepts only a bare identifier as an inherent impl target —
+`implement struct Gadget`, never `implement Widget::Gadget`. Where the code and
+the grammar disagree, the code is the defect.
+
 ### 8.3 B2 is unmeasured
 
 Only the assoc-type projection (62) is instrumented. Sema's method and trait
