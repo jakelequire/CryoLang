@@ -50,6 +50,17 @@ type enum HomeOrigin {
     Syntax;
 }
 
+implement enum HomeOrigin {
+    /// Display name, for audit streams.
+    display_name(&this) -> string {
+        return match (this) {
+            HomeOrigin::Unset  => { "Unset" }
+            HomeOrigin::Cursor => { "Cursor" }
+            HomeOrigin::Syntax => { "Syntax" }
+        };
+    }
+}
+
 type struct ResolutionContext {
     current_module:   string;
     source_file:      string;
@@ -84,6 +95,25 @@ type struct ResolutionContext {
     /// Provenance of `home_module`.  See `HomeOrigin`.
     home_origin:      HomeOrigin;
 
+    /// Which construction site built this context.  Every caller passes
+    /// `FILE, LINE`, which the compiler expands at the call site.
+    ///
+    /// Required for the same reason `home_origin` is: the end-of-run tally says
+    /// how many answers a fallback step gave, and the per-answer `RN` line says
+    /// which name it answered, but neither can say which caller failed to
+    /// establish a scope.  Attribution needs the site, and a site is only
+    /// knowable where the context is built.
+    ///
+    /// A hand-written site name would be a second copy of a fact the compiler
+    /// already holds, kept in step by discipline: rename the enclosing function
+    /// or move the call and the label goes on asserting the old location.
+    ///
+    /// `clone` carries the ORIGINAL site forward rather than naming itself,
+    /// because a cloned context inherits the scope - and therefore the defect -
+    /// of the context it was copied from.
+    origin_file:      string;
+    origin_line:      i32;
+
     /// Demand-free (symbolic) resolution mode. When set, `resolve_generic`
     /// builds an arena-only `InstantiatedType` (via `arena.create_instantiation`)
     /// instead of routing through `generic_registry.instantiate_for_module`. The
@@ -103,7 +133,8 @@ type struct ResolutionContext {
     /// chain's entire supply.  A site with genuinely nothing to say writes
     /// `HomeOrigin::Unset` and is then greppable; a forgotten one no longer
     /// compiles.
-    static new(current_module: string, source_file: string,
+    static new(origin_file: string, origin_line: i32,
+               current_module: string, source_file: string,
                home_module: string, home_origin: HomeOrigin) -> ResolutionContext {
         return ResolutionContext {
             current_module:   current_module,
@@ -115,6 +146,8 @@ type struct ResolutionContext {
             home_origin:      if (home_module.length() == 0) { HomeOrigin::Unset }
                               else { home_origin },
             symbolic_no_demand: false,
+            origin_file:      origin_file,
+            origin_line:      origin_line,
         };
     }
 
@@ -128,7 +161,19 @@ type struct ResolutionContext {
     /// costs nothing but a B1 tally; passing `Syntax` when the value came from
     /// the ambient cursor silently launders a guess into an authoritative
     /// answer, which is the one failure this split exists to prevent.
+    ///
+    /// A call that supplies an EMPTY module while claiming a real origin is
+    /// reported, because it is indistinguishable from a site that never asked.
+    /// The caller looked the module up, got nothing back, and the normalization
+    /// below turns that into `Unset` - so the context drops into the
+    /// module-blind chain while the source reads as though a scope was
+    /// established.  A static scan of who calls this cannot see it; only the
+    /// event can.
     set_home_module(mut &this, module_ns: string, origin: HomeOrigin) -> void {
+        if (module_ns.length() == 0 && origin != HomeOrigin::Unset) {
+            ResolveCounter::home_empty(this.origin_file, this.origin_line,
+                                       origin.display_name());
+        }
         this.home_module = module_ns;
         this.home_origin = if (module_ns.length() == 0) { HomeOrigin::Unset }
                            else { origin };
@@ -162,12 +207,17 @@ type struct ResolutionContext {
     /// element type `Pair<SymbolStr, TypeRef>` is POD (interned ids), so the
     /// per-element copies are trivial.  `import_modules` is reconstructed as
     /// `[]` - it is never populated anywhere, matching the prior behavior.
+    ///
+    /// The scope is passed to `new` rather than assigned afterwards: a copy that
+    /// states `Unset` and then overwrites it reads as a site that never
+    /// established a scope, which is exactly the distinction the required
+    /// argument exists to make legible.
     clone(&this) -> ResolutionContext {
         mut out: ResolutionContext =
-            ResolutionContext::new(this.current_module, this.source_file, "", HomeOrigin::Unset);
+            ResolutionContext::new(this.origin_file, this.origin_line,
+                                   this.current_module, this.source_file,
+                                   this.home_module, this.home_origin);
         out.this_type = this.this_type;
-        out.home_module = this.home_module;
-        out.home_origin = this.home_origin;
         out.symbolic_no_demand = this.symbolic_no_demand;
         for (mut i: i64 = 0; i < this.generic_bindings.length; i++) {
             out.add_binding(this.generic_bindings[i].first,
@@ -550,7 +600,7 @@ type struct TypeResolver {
             // Resolve the binding with the impl's target params bound to the
             // base's concrete args (`T -> i32` for `Range<i32>`); empty for a
             // non-generic base like `IntSeq`.
-            mut bctx: ResolutionContext = ResolutionContext::new("", "", "", HomeOrigin::Unset);
+            mut bctx: ResolutionContext = ResolutionContext::new(FILE, LINE, "", "", "", HomeOrigin::Unset);
             if (impl_node.target_args.length == base_args.length) {
                 for (mut ti: i64 = 0; ti < impl_node.target_args.length; ti++) {
                     const ta: TypeAnnotation* = impl_node.target_args[ti];
@@ -734,7 +784,7 @@ type struct TypeResolver {
                         // Nothing left to solve in this arg: don't pay for a lookup.
                         if (!this.where_arg_has_unbound_param(arg_ann, param_names, ictx)) { continue; }
                     }
-                    mut rc: ResolutionContext = ResolutionContext::new(source_file, "", "", HomeOrigin::Unset);
+                    mut rc: ResolutionContext = ResolutionContext::new(FILE, LINE, source_file, "", "", HomeOrigin::Unset);
                     const member: SymbolStr = tdecl.assoc_types[assoc_idx].name;
                     if (subject_abstract) {
                         // `project_member` keeps an abstract base symbolic, giving
@@ -1309,7 +1359,7 @@ type struct TypeResolver {
         // The home module for the defaults is supplied by
         // `expand_default_type_args` from `entry.module_name`, so this context
         // deliberately stays bare.
-        mut ctx: ResolutionContext = ResolutionContext::new("", "", "", HomeOrigin::Unset);
+        mut ctx: ResolutionContext = ResolutionContext::new(FILE, LINE, "", "", "", HomeOrigin::Unset);
         mut empty: TypeRef[] = [];
         const filled: TypeRef[] = this.expand_default_type_args(entry, empty, &ctx);
         if (filled.length != entry.param_count) { return ty; }
@@ -1370,7 +1420,16 @@ private:
                 this.intern_table.resolve(this.name_resolver.current_module_sym());
             if (cur.length() > 0) { cursor = cur; }
         }
-        ResolveCounter::rn_answer(step, home, cursor, name_str, answer);
+        // Which caller built this context.  `home` says a scope is missing; only
+        // the site says whose to fix.
+        mut site_file: string = "<none>";
+        mut site_line: i32 = 0;
+        if (ctx != null && ctx.origin_file.length() > 0) {
+            site_file = ctx.origin_file;
+            site_line = ctx.origin_line;
+        }
+        ResolveCounter::rn_answer(step, home, cursor, site_file, site_line,
+                                  name_str, answer);
     }
 
     /// Length of `ctx.home_module`, or 0 when the context is absent.

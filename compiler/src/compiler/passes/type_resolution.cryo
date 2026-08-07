@@ -57,8 +57,32 @@ type struct TypeResolutionRunner {
         runner.name_resolver   = ctx.get_resolver();
         runner.ctx             = ctx;
         runner.module_registry = ctx.module_type_registry;
-        runner.res_ctx         = ResolutionContext::new(module_name, ctx.source_file, "", HomeOrigin::Unset);
+        runner.res_ctx         = ResolutionContext::new(FILE, LINE, module_name, ctx.source_file, "", HomeOrigin::Unset);
         return runner;
+    }
+
+    /// Scope the shared context to the declaration about to be walked.
+    ///
+    /// A bare leaf in an annotation means what it means in the module that
+    /// WROTE the annotation, so the scope has to come from the node's own span.
+    /// `module_name` above cannot stand in for it: it is `namespace_display()`,
+    /// which answers "which module is the compiler standing in", and passing
+    /// that here would record a cursor reading as though it came from the
+    /// syntax - the one substitution `HomeOrigin` exists to keep visible.
+    ///
+    /// Called per declaration rather than once per pass because the span is the
+    /// authority.  A per-pass scope is only equivalent while a compilation unit
+    /// is exactly one file, which is true today and is an assumption this form
+    /// does not need.
+    /// A synthesized declaration carries no span, and then there is no syntax to
+    /// ask.  It must still be RESET to `Unset` rather than skipped: the context
+    /// is shared across the walk, so skipping would leave the previous
+    /// declaration's scope in place, and a scope that outlives the node it came
+    /// from binds the next declaration's names in the wrong module with no
+    /// diagnostic.  `set_home_module` normalizes the empty answer and reports it.
+    scope_to_decl(mut &this, span: SourceSpan) -> void {
+        this.res_ctx.set_home_module(this.ctx.module_ns_of_file(span.file),
+                                     HomeOrigin::Syntax);
     }
 
 
@@ -2341,6 +2365,7 @@ type struct TypeResolutionPasses {
         for (mut i: i64 = 0; i < root.statements.length; i++) {
             const stmt: ASTNode* = root.statements[i];
             if (stmt == null) { continue; }
+            runner.scope_to_decl(stmt.span);
             cdebug("[FuncSig] stmt[%lld] kind=%d\n", i, stmt.kind as i32);
 
             match (stmt.kind) {
@@ -2813,6 +2838,7 @@ type struct TypeResolutionPasses {
         for (mut i: i64 = 0; i < root.statements.length; i++) {
             const stmt: ASTNode* = root.statements[i];
             if (stmt == null) { continue; }
+            runner.scope_to_decl(stmt.span);
 
             if (stmt.kind == NodeKind::TypeAliasDeclaration) {
                 const node: TypeAliasDeclNode* = stmt as TypeAliasDeclNode*;
@@ -2858,6 +2884,7 @@ type struct TypeResolutionPasses {
         for (mut i: i64 = 0; i < root.statements.length; i++) {
             const stmt: ASTNode* = root.statements[i];
             if (stmt == null) { continue; }
+            runner.scope_to_decl(stmt.span);
 
             match (stmt.kind) {
                 NodeKind::StructDeclaration => {
@@ -2934,6 +2961,7 @@ type struct TypeResolutionPasses {
         for (mut i: i64 = 0; i < root.statements.length; i++) {
             const stmt: ASTNode* = root.statements[i];
             if (stmt == null) { continue; }
+            runner.scope_to_decl(stmt.span);
 
             match (stmt.kind) {
                 NodeKind::FunctionDeclaration => {
@@ -3053,6 +3081,7 @@ type struct TypeResolutionPasses {
         for (mut i: i64 = 0; i < root.statements.length; i++) {
             const stmt: ASTNode* = root.statements[i];
             if (stmt == null) { continue; }
+            runner.scope_to_decl(stmt.span);
 
             match (stmt.kind) {
                 NodeKind::FunctionDeclaration => {
@@ -3114,6 +3143,7 @@ type struct TypeResolutionPasses {
         for (mut i: i64 = 0; i < root.statements.length; i++) {
             const stmt: ASTNode* = root.statements[i];
             if (stmt == null) { continue; }
+            runner.scope_to_decl(stmt.span);
 
             // Register in DeclarationIndex (shared logic with Specialization).
             // Source decls are owned by the current module (empty owner_mod).
@@ -3626,7 +3656,7 @@ type struct TypeResolutionPasses {
                     // substitution to a known-good source.
                     const module_name: string = ctx.has_namespace()
                         ? ctx.namespace_display() : ctx.source_file;
-                    mut res_ctx: ResolutionContext = ResolutionContext::new(module_name, ctx.source_file, "", HomeOrigin::Unset);
+                    mut res_ctx: ResolutionContext = ResolutionContext::new(FILE, LINE, module_name, ctx.source_file, "", HomeOrigin::Unset);
                     // The variant payload annotations mean what the module that
                     // WROTE this enum says (spec §8.2m).  That is the cursor for
                     // a declaration this module actually owns - this walk is in
