@@ -26,6 +26,12 @@ disagreement is printed rather than hidden -- a free function in the source
 with no symbol in the archive is expected (uninstantiated generic) but the
 COUNT is reported so a sudden jump is visible.
 
+The cross-check goes to STDOUT and never into the file. `nm` sees a different
+symbol set per platform, so a count written into the index would make a
+committed, byte-compared artifact depend on the host that generated it, and
+`--check` could only ever pass on one OS. Only source 2 reaches the file, which
+is what makes it reproducible everywhere.
+
 The source scan tracks brace depth rather than matching indentation, and
 strips comments and string literals first, so a brace inside a string or a
 doc comment cannot desynchronize it.
@@ -43,7 +49,13 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STDLIB = os.path.join(ROOT, "stdlib")
 ARCHIVE = os.path.join(ROOT, "stdlib", ".bin", "libcryo.a")
-CRYO = os.path.join(ROOT, "bin", "cryo")
+# Both pins live side by side, so the name has to be chosen rather than assumed:
+# handing the ELF to CreateProcess raises WinError 193 ("not a valid Win32
+# application"), which surfaces as a traceback rather than as the "cryo
+# unavailable" degradation the archive step is written to tolerate.
+CRYO = os.path.join(
+    ROOT, "bin", "cryo.exe" if sys.platform.startswith("win") else "cryo"
+)
 OUT = os.path.join(ROOT, "docs", "stdlib-api.txt")
 
 # ---------------------------------------------------------------- source scan
@@ -217,7 +229,11 @@ def scan_stdlib():
             ns, entries = scan_file(path)
             if ns is None:
                 continue
-            rel = os.path.relpath(path, ROOT)
+            # The index is a committed artifact compared byte-for-byte, so the
+            # host's path separator must not reach it: `os.sep` would emit
+            # `stdlib\alloc\arc.cryo` on Windows against a golden written with
+            # forward slashes, and every namespace header would read as stale.
+            rel = os.path.relpath(path, ROOT).replace(os.sep, "/")
             by_ns.setdefault(ns, {"file": rel, "entries": []})["entries"].extend(entries)
     return by_ns
 
@@ -267,14 +283,26 @@ def archive_symbols():
 ORDER = {"type": 0, "impl": 1, "const": 2, "fn": 3, "method": 4}
 
 
-def render(by_ns, linked, note):
-    total = sum(len(v["entries"]) for v in by_ns.values())
+def cross_check(by_ns, linked):
+    """(linked, unlinked) counts for the archive cross-check.
+
+    Reported to stdout rather than written into the index: `nm` sees a different
+    symbol set per platform -- the Windows archive yields more Cryo text symbols
+    yet matches fewer source names than the Linux one -- so embedding these
+    counts would make a committed, byte-compared artifact depend on the host that
+    generated it.  The index body is derived from the stdlib sources alone and is
+    identical everywhere, which is what lets `--check` run on any host.
+    """
     src_fns = {
         e[1].split("(", 1)[0]
         for v in by_ns.values() for e in v["entries"]
         if e[0] == "fn" and not e[2]
     }
-    unlinked = sorted(src_fns - linked) if linked else []
+    return len(linked), len(src_fns - linked) if linked else 0
+
+
+def render(by_ns):
+    total = sum(len(v["entries"]) for v in by_ns.values())
 
     out = []
     out.append("# Cryo standard library -- API index")
@@ -291,16 +319,6 @@ def render(by_ns, linked, note):
     out.append("#   [private]         not reachable from another module")
     out.append("#")
     out.append(f"# {len(by_ns)} namespaces, {total} declarations.")
-    if note:
-        out.append(f"# NOTE: {note}")
-    else:
-        out.append(
-            f"# Cross-check: {len(linked)} free functions linked into "
-            f"stdlib/.bin/libcryo.a; {len(unlinked)} declared in source without a"
-        )
-        out.append(
-            "# symbol (expected -- generic templates the stdlib never instantiates)."
-        )
     out.append("")
 
     for ns in sorted(by_ns):
@@ -326,6 +344,16 @@ def render(by_ns, linked, note):
     return "\n".join(out) + "\n"
 
 
+def report_cross_check(n_linked, n_unlinked, note):
+    """The archive cross-check, on stdout so it never enters the artifact."""
+    if note:
+        print(f"api-index: {note}")
+        return
+    print(f"api-index: cross-check -- {n_linked} free functions linked into "
+          f"stdlib/.bin/libcryo.a; {n_unlinked} declared in source without a "
+          f"symbol (expected -- generic templates the stdlib never instantiates)")
+
+
 def main():
     check = "--check" in sys.argv
     by_ns = scan_stdlib()
@@ -333,7 +361,8 @@ def main():
         print("api-index: no namespaces found under stdlib/", file=sys.stderr)
         return 1
     linked, note = archive_symbols()
-    text = render(by_ns, linked, note)
+    text = render(by_ns)
+    n_linked, n_unlinked = cross_check(by_ns, linked)
 
     if check:
         if not os.path.exists(OUT):
@@ -346,16 +375,21 @@ def main():
                       f"run `make api-index` and commit the result", file=sys.stderr)
                 return 1
         print(f"api-index: {os.path.relpath(OUT, ROOT)} is up to date")
+        report_cross_check(n_linked, n_unlinked, note)
         return 0
 
     os.makedirs(os.path.dirname(OUT), exist_ok=True)
-    with open(OUT, "w", encoding="utf-8") as fh:
+    # `newline="\n"` suppresses the translation that would write CRLF on
+    # Windows, matching `roster-check.py`.  The reader above keeps universal
+    # newlines on purpose, so a golden checked out through `core.autocrlf` still
+    # compares equal; only what this script PRODUCES has to be pinned, or the
+    # artifact differs by host.
+    with open(OUT, "w", encoding="utf-8", newline="\n") as fh:
         fh.write(text)
     total = sum(len(v["entries"]) for v in by_ns.values())
     print(f"api-index: wrote {os.path.relpath(OUT, ROOT)} "
           f"({len(by_ns)} namespaces, {total} declarations)")
-    if note:
-        print(f"api-index: {note}")
+    report_cross_check(n_linked, n_unlinked, note)
     return 0
 
 

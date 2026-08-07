@@ -20,6 +20,7 @@ import Compiler::AST::{ Node, Declaration, Statement, Expression };
 import Compiler::Resolver::{ SymbolStr, InternTable, Resolver };
 import Compiler::DeclIndex;
 import Compiler::ConstTable;
+import Compiler::ModuleGraph;
 import Compiler::ResolveCounter;
 import Utils::Logger;
 import std::collections::pair;
@@ -235,6 +236,12 @@ type struct TypeResolver {
     module_registry:  ModuleTypeRegistry*;
     name_resolver:    Resolver*;
     decl_index:       DeclarationIndex*;
+    /// File -> declaring namespace, for annotations this resolver re-resolves on
+    /// behalf of syntax it did not itself walk to.  An assoc-type binding comes
+    /// from an `implement` block that may live in neither the trait's nor the
+    /// target type's module, so the owning entity cannot supply the scope and
+    /// only the annotation's own file can.
+    module_graph:     ModuleGraph*;
     /// Folded module-level integer constants, for `T[NAME]` array sizes.
     const_table:      ConstantTable*;
     diagnostics:      DiagnosticSink*;
@@ -250,7 +257,8 @@ type struct TypeResolver {
                module_registry: ModuleTypeRegistry*,
                name_resolver: Resolver*,
                decl_index: DeclarationIndex*,
-               const_table: ConstantTable*) -> TypeResolver {
+               const_table: ConstantTable*,
+               module_graph: ModuleGraph*) -> TypeResolver {
         return TypeResolver {
             arena:            arena,
             intern_table:     intern_table,
@@ -259,6 +267,7 @@ type struct TypeResolver {
             name_resolver:    name_resolver,
             decl_index:       decl_index,
             const_table:      const_table,
+            module_graph:     module_graph,
             diagnostics:      null,
             bootstrap_mode:   true,
         };
@@ -600,7 +609,16 @@ type struct TypeResolver {
             // Resolve the binding with the impl's target params bound to the
             // base's concrete args (`T -> i32` for `Range<i32>`); empty for a
             // non-generic base like `IntSeq`.
-            mut bctx: ResolutionContext = ResolutionContext::new(FILE, LINE, "", "", "", HomeOrigin::Unset);
+            // `ann` is the impl block's own text, so its scope is the file that
+            // block is written in.  Neither the trait nor the target type can
+            // stand in for it: an `implement` block may live in a third module
+            // again, and this context's other input is a type-param binding,
+            // which carries no module at all.
+            mut bctx: ResolutionContext = ResolutionContext::new(
+                FILE, LINE, "", "",
+                ModuleGraph::home_ns_of_file(this.module_graph, this.intern_table,
+                                             impl_node.span.file),
+                HomeOrigin::Syntax);
             if (impl_node.target_args.length == base_args.length) {
                 for (mut ti: i64 = 0; ti < impl_node.target_args.length; ti++) {
                     const ta: TypeAnnotation* = impl_node.target_args[ti];

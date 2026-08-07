@@ -357,7 +357,11 @@ def main():
     b1, b2, b3, rows = measure(args.cryo)
 
     if args.update:
-        with open(GOLDEN, "w", encoding="utf-8") as f:
+        # `newline="\n"` suppresses the translation that would write CRLF on
+        # Windows, matching `roster-check.py`.  The golden is committed and
+        # diffed, so a re-pin from a Windows host would otherwise rewrite all 34
+        # lines and bury the one or two rows that actually moved.
+        with open(GOLDEN, "w", encoding="utf-8", newline="\n") as f:
             f.write(render(b1, b2, b3, rows))
         print("b1-gate: golden updated -- B1 = %d" % b1)
         return 0
