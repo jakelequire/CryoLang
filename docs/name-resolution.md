@@ -2230,6 +2230,242 @@ is a **pure refactor**. Controls, all held: B1 `15094 -> 15094`, B3
 > that is right, and §3.1's question ("what should this name bind to") is not
 > answered by threading a module string into them.
 
+#### The worklist, and where 4a's supply comes from
+
+Of the 57 construction sites, **33 establish a scope and 24 do not**. One of the
+24 is a false positive: `ResolutionContext::clone` states `Unset` and then copies
+`home_module`/`home_origin` from the source on the next two lines, so it
+preserves scope. It should pass them to `new` directly rather than assign
+after — the state-then-overwrite shape is what made it read as unscoped.
+
+**Structural attribution for 4a — inferred, NOT measured.** 4a is gated on
+`bootstrap_mode`, which is true for the whole of TypeResolution, and that pass
+runs off a single `TypeResolutionRunner.res_ctx` built at
+`passes/type_resolution.cryo:60` with an empty home module. Every per-declaration
+context in the pass is a `clone` of it, and `clone` faithfully propagates the
+empty scope. That accounts for a bootstrap-only step answering 2,304 times with
+`home=<none>` in every single one. This is a structural argument from the code,
+not an instrumented one: no counter yet ties a below-2c answer to the site that
+built its context. Confirm before crediting a fix with the drop.
+
+**The fix is not the obvious one.** `TypeResolutionRunner::new` already computes
+a module name via `ctx.namespace_display()`, and passing that as the home module
+is the tempting one-line change. It is wrong: `namespace_display()`'s own
+contract is "which module is the compiler standing in right now" — the ambient
+cursor — so it would launder a cursor guess into `HomeOrigin::Syntax`, the exact
+failure `set_home_module`'s required-origin argument exists to prevent, and the
+one §8.1e already paid for once. `ctx.source_file` is no better: it is the walk,
+not the syntax. The established idiom is
+`ctx.module_ns_of_file(node.span.file)` with `HomeOrigin::Syntax`, applied per
+declaration where the node is in hand, so the answer travels with the syntax.
+Whether a single per-runner scope is equivalent depends on a compilation unit
+being exactly one file; that is true today (file → module is total and 1:1) but
+it is an assumption the per-node form does not need.
+
+### 8.2p The fallback chain has SEVEN suppliers, and one is 91% — MEASURED 2026-08-06
+
+§8.2o attributed 4a's 2,304 answers to `TypeResolutionRunner.res_ctx` by reading
+the code, and labelled the claim **inferred, not measured**, because no
+instrument tied a below-2c answer to the site that built its context. It is now
+measured, and the inference was right.
+
+**The instrument.** `ResolutionContext` carries `origin_file` / `origin_line`,
+required `new` arguments that every one of the 56 sites supplies as **`FILE,
+LINE`** — the pseudo-constants the compiler expands at the call site, which
+exist so callers do not pass locations by hand. `clone` passes the original
+pair forward rather than naming itself, because a copy inherits the scope, and
+therefore the defect, of what it was copied from. The `RN` line gained the pair
+as one `file:line` column between `cursor` and `name`.
+
+A hand-written site label was the first cut and is the wrong shape: it is a
+second copy of a fact the compiler already holds, kept in step only by
+discipline, so renaming the enclosing function or moving the call leaves the
+label asserting a location that is no longer true. That is the same defect as
+the parallel `sym_is_import` array §8.2m rejected, one level up. A computed
+location cannot drift and needs no ratchet to keep honest.
+
+Measured on `examples/09-json-config`, all 2,850 answers below cascade 2c:
+
+| step | answers | construction site |
+|---|---:|---|
+| 4a scope+arena | **2,304** | `passes/type_resolution.cryo:60` |
+| 5 leaf index | 185 | `passes/type_resolution.cryo:60` |
+| 3b DI canonical | 95 | `passes/type_resolution.cryo:60` |
+| X failed | 1 | `passes/type_resolution.cryo:60` |
+| 5 leaf index | 102 | `sema/method_binding.cryo:1200` (`find_generic_method_for_call`) |
+| 3b DI canonical | 53 | `types/resolver.cryo:599` (`resolve_concrete_member`) |
+| 5 leaf index | 33 | `types/resolver.cryo:599` |
+| 3b DI canonical | 44 | `sema/method_binding.cryo:1048` |
+| 5 / 3b | 8 / 8 | `mono/trait_specializer.cryo:120` |
+| X failed | 6 | `sema/sema.cryo:3336` |
+| 3b DI canonical | 3 | `mono/ast_resolver.cryo:181` |
+| X failed | 8 | `sema/method_binding.cryo:798` (home **set**) |
+
+The same partition was measured twice, once with hand-written labels and once
+with `FILE`/`LINE`, and the two agree row for row.
+
+The attribution is **exhaustive** — no answer reports `site=<none>`, so the
+column is measuring the whole population rather than a sample of it.
+
+Three things follow that the structural argument could not give:
+
+- **4a is one site, entirely.** 2,304 of 2,304. §8.2o's inference is confirmed.
+- **That site supplies 2,585 of 2,850 (91%), not 2,304.** The same context also
+  feeds 185 of step 5 and 95 of 3b. Scoping it is therefore a larger change than
+  the row named 4a suggests, and the prediction to check is per-row: **4a → 0,
+  step 5 → 143, 3b → 108.** The B1 *total* will move by more than 2,489, because
+  `lookup_by_leaf` and `canonical_qualified` are separate rows fed by the same
+  lookups; predicting the total to a number is not possible, and a total that
+  moves without those rows moving is a finding, not a confirmation.
+- **Seven sites supply the whole chain**, not the 22–24 the static worklist
+  names. The other unscoped sites either never resolve a name here, or answer
+  above 2c.
+
+#### A third category the static scan cannot see
+
+`find_generic_method_for_call` *does* call `set_home_module`, so any grep-shaped
+worklist marks it done — and it still answers 102 times with `home=<none>`.
+Instrumented at the call rather than inferred: it passes an **empty module while
+claiming `HomeOrigin::Syntax`, 1,086 times**, and it is the only site in the
+tree that does.
+
+```
+RN-HOME-EMPTY   src/compiler/sema/method_binding.cryo:1200   Syntax
+```
+
+The mechanism is `owner_module_of` → `arena.module_ns_of`, which has no answer
+for a symbolic receiver; `set_home_module` then normalizes the empty string to
+`Unset`. Every one of the 102 is the leaf `Formatter` binding to
+`std::fmt::display::Formatter` through the global leaf index, in a context whose
+other resolution is a generic param.
+
+Returning nothing for a receiver that genuinely has no module is honest. Turning
+that into a silent fall into the module-blind chain is not, and it is the same
+shape as the default `ResolutionContext::new` used to carry: the source reads as
+though a scope was established. When the chain below 2c is deleted these become
+`Res::Err`, so this site needs an answer before the deletion, not after.
+
+⇒ The worklist has three categories, not two: **never scoped**, **scoped**, and
+**scoped on the success path and unscoped on the one that matters**. Only the
+event can tell the third from the second.
+
+#### The control on the zeros
+
+Of the 56 sites, **31 resolve a name at all on this corpus and 25 never run**.
+Thirteen of the 22 statically-unscoped sites are among the 25. So "seven
+suppliers" is a statement about this program, and the remaining thirteen are
+untested rather than clean — §8.2g's rule, applied to the worklist itself. Two
+more (`method_binding.cryo:475`, `types/resolver.cryo:1358`) run unscoped and
+answer entirely above 2c, so being unscoped does not by itself put a site in
+the chain.
+
+#### Controls
+
+Pure instrumentation, and every counter held to the answer: calls 11,475 · 2c\*
+4,394 · 3b 203 · 4a 2,304 · 5 328 · B1 15,094 · B3 66,331 · `resolution_scope`
+10/10 · `make test` PASS (unit; compile-fail 170; projects 18) · `b1-check` OK ·
+`roster-check` OK (2,001).
+
+`clone` also stopped stating `Unset` and overwriting it, and now passes the
+scope to `new` directly. §8.2o recorded it as the false positive in the static
+scan; the shape, not the behaviour, was the defect.
+
+### 8.2q TypeResolution is scoped, and 4a is dead — MEASURED 2026-08-06
+
+The pass now scopes its shared context **per declaration**, from the node's own
+span, at the six top-level walks that thread `runner.res_ctx`:
+
+```cryo
+runner.scope_to_decl(stmt.span);        // module_ns_of_file(span.file), Syntax
+```
+
+`namespace_display()` was rejected: it answers "which module is the compiler
+standing in", so passing it would have recorded a cursor reading as
+`HomeOrigin::Syntax` — the substitution that reverted the visibility gate once
+already (§8.1e). The seventh walk (`run_struct_field_sync`) already built its
+contexts per node and was left alone.
+
+**Predicted before the edit, and checked after.** §8.2p's attribution was the
+input, so this is the measurement that tests the attribution as much as the fix:
+
+| row | predicted | measured |
+|---|---|---|
+| 4a scope+arena | → ~0 | **2,304 → 0** |
+| 3b DI canonical | → ~108 | **203 → 108** |
+| 5 leaf index | falls by *at most* 185 | **328 → 143** (−185, the maximum) |
+| 2c\* syntax provenance | rises by roughly the same | **4,394 → 6,978** (+2,584) |
+| calls (total) | unchanged | **11,475** |
+| B1 | falls ≥2,000 | **15,094 → 12,605** (−2,489) |
+| both `WRONG_` tripwires | still pass | **still pass** |
+
+−2,489 is exactly 2,304 + 185. **The 2,585 answers §8.2p attributed to
+`type_resolution.cryo:60` are the 2,584 that moved, plus one that still fails —
+and it now fails with a scope set**, which makes it an unresolvable name rather
+than an unasked question.
+
+Below-2c fell **2,850 → 266**. That site is gone from the fallback chain.
+
+#### Two numbers that did not behave as predicted
+
+- **B1 moved by exactly the row sum, not more.** §8.2p predicted the total would
+  fall by *more* than 2,489 because `lookup_by_leaf` and `canonical_qualified`
+  are fed by the same lookups. `lookup_by_leaf` did fall by 185 — but it carries
+  the B1 *flag* without being in the summation set, which the trap list already
+  says (`total <= row_sum` is the invariant, the label is a family). The
+  prediction was wrong for a reason that was written down before it was made.
+- **`WOULD BE REJECTED once gated` rose 4,366 → 4,423 (+57)**, alongside
+  `lookup_qualified_alternatives` +1,190 and `resolve_qualified_scoped` +1,190.
+  Unpredicted, and the mechanism is the change itself: 2c now runs a scoped
+  qualified lookup for 2,584 more names, so the population that counter is
+  evaluated over grew. It is a preview of the future visibility gate, not a
+  regression — the gate is off — but note that a **rate** was not measured, only
+  a total, so this says nothing yet about whether scoping makes rejection more
+  or less likely per lookup.
+
+#### Six declarations the pass cannot scope, and why the fix is not a skip
+
+`RN-HOME-EMPTY` — the instrument from §8.2p — fired **6 times at
+`type_resolution.cryo:60` after this change and 0 times before it**, so the
+change introduced them. Measured rather than reasoned: all six report
+`file='' line=0`. They are synthesized top-level declarations carrying no span,
+so there is no syntax to derive a scope from, and `set_home_module` normalizing
+the empty answer to `Unset` is the correct outcome.
+
+The tempting tidy-up — skip `set_home_module` when the span has no location — is
+**wrong, and dangerously so**. The context is shared across the walk and
+re-scoped per declaration, so skipping leaves the *previous* declaration's home
+module in place. A scope that outlives the node it came from binds the next
+declaration's bare names in the wrong module, with no diagnostic: the same
+failure this whole section exists to remove, reintroduced by an apparent
+cleanup. The reset is load-bearing and is now stated at the function.
+
+That an instrument built for one defect immediately caught a second one, in the
+change that consumed its output, is the argument for reporting at the event
+rather than tallying at exit.
+
+#### What is left, and what deleting the leaf index would cost
+
+266 answers below 2c, from six sites. Step 5's entire remaining population on
+this target is **two leaf names**:
+
+| leaf | answers | site |
+|---|---:|---|
+| `Formatter` | 102 | `method_binding.cryo` `find_generic_method_for_call` |
+| `Str` | 41 | `types/resolver.cryo` `resolve_concrete_member` (33), `trait_specializer.cryo` (8) |
+
+So the leaf index's blast radius here is not 328 names but two, and **102 of the
+143 are the empty-scope defect §8.2p already isolated** — the site that calls
+`set_home_module` with an empty module 1,086 times while claiming `Syntax`.
+Fixing that one site is what takes step 5 to 41 on this target; it is a
+prerequisite of the deletion, not separate work.
+
+The two `WRONG_` tripwires in `tests/projects/resolution_tripwire` are still
+green, and correctly so: `Orphan` imports nothing, so a scope makes 2c *miss*
+rather than answer, and step 5 catches it exactly as before. **Scoping cannot
+flip them; deleting step 5 is what flips them**, and that flip — the project
+converting to `compile_fail` with E0203 in the same change — is the outcome that
+turns this from a counter delta into a defect that stops existing.
+
 ### 8.3 B2 is unmeasured
 
 Only the assoc-type projection (62) is instrumented. Sema's method and trait
