@@ -3216,6 +3216,186 @@ this target now reaches the fallback chain without a scope.**
 > twice, before the raw row was read. The instrument says what it means; the
 > query has to ask what the instrument says.
 
+### 8.2y A bare name with nothing in scope binds by DIRECTORY ORDER — MEASURED 2026-08-08
+
+`tests/tests/projects/resolution_leaf_index` fails on Linux at `843c8d04`
+itself, and the failure is **pre-existing** — the compiler built from that commit
+with no local change produces it, so it is not attributable to any edit in this
+session. `make test` reads `projects: 18 passed, 1 failed`; every other gate is
+as §8.2v left it.
+
+The corpus asserts `Alpha::Widget`; the compiler binds `Omega::Widget`, and
+`ResolutionLeafIndex::Alpha::Widget<i64>` vs `Omega::Widget<i32>` is an E0200
+against the annotation. The `<i32>` is a **consequence, not a second defect**:
+unification against `Alpha::Widget` fails on the module, so the expected type
+never flows into `T` and the bare literal types it. Annotating
+`Omega::Widget<i64>` and asserting `tag() == 2` passes all four tests unchanged,
+which isolates it to one difference.
+
+`CRYO_RN_AUDIT` puts that difference at one step:
+
+| module | step | answer |
+|---|---|---|
+| `Alpha` (declares it) | `2c-home-syntax` | `Alpha::Widget` |
+| `Omega` (declares it) | `2c-home-syntax` | `Omega::Widget` |
+| `Importer` (imports `Omega`) | `2c-home-syntax` | `Omega::Widget` |
+| **`Orphan` (imports nothing)** | **`5-leaf-index`** | **`Omega::Widget`** |
+
+Every module with scope is answered correctly at 2c. Only the scope-less one
+reaches the global leaf index, which is §8.2s's starvation working as described.
+
+**The corpus's own stated mechanism is false.** Its header says "The leaf index
+picks by NAME ORDER: `Alpha` wins over `Omega` here", and
+`Alpha` does sort first while losing. `register_leaf_name`
+(`types/arena.cryo`) is **first registration wins**, so the winner is decided by
+registration order and by nothing else. Three candidate determinants were ruled
+out by control, each by moving the input and re-measuring:
+
+| input moved | result |
+|---|---|
+| renamed `alpha.cryo` → `aaa_alpha.cryo` (module names untouched) | winner unmoved |
+| module-name sort order | `Alpha` sorts first and **loses** |
+| deleted `importer.cryo`, the only `import` edge to `Omega` | winner unmoved |
+
+A temporary instrument on `register_leaf_name`, emitted on the existing
+`CRYO_LEAF_AUDIT` stream (no new `Site` variant, so no discriminant shift), gave
+the order directly, and it is deterministic across runs:
+
+```
+LEAF-REG  Widget  ResolutionLeafIndex::Omega::Widget    WON
+LEAF-REG  Packer  ResolutionLeafIndex::Importer::Packer WON
+LEAF-REG  Packer  ResolutionLeafIndex::Orphan::Packer   lost
+LEAF-REG  Widget  ResolutionLeafIndex::Alpha::Widget    lost
+```
+
+That order is **depth-first module discovery seeded by filesystem enumeration
+order.** Raw `readdir` order of the copied directory is `leaf_index_test,
+importer, omega, orphan, alpha`; registration is `Omega, Importer, Orphan,
+Alpha`. The one transposition is `importer.cryo`'s `import
+ResolutionLeafIndex::Omega`, resolved before the module that wrote it.
+
+**The prediction that confirms it.** The repo's own directory enumerates in a
+different order (`orphan, leaf_index_test, omega, alpha, importer`), which puts
+`Orphan` ahead of `Importer`, so `Packer` must have a *different* winner there.
+Stated before running, and measured:
+
+| directory | `readdir` order | `Widget` | `Packer` |
+|---|---|---|---|
+| repo | `orphan, test, omega, alpha, importer` | `Omega` | **`Orphan`** |
+| copy | `test, importer, omega, orphan, alpha` | `Omega` | **`Importer`** |
+
+**Byte-identical source, two directories, two different global bindings.**
+Copying a directory can change what a program compiles to, and nothing in the
+source of either program says which answer it gets.
+
+This is §1's root cause with its sharpest edge yet, and it supersedes the
+weaker readings in §8.2s and in the corpus header. It also explains the
+Windows/Linux divergence with no appeal to a compiler difference: NTFS
+enumerates alphabetically, so `alpha.cryo` registers first, `Alpha` wins, and the
+corpus passes — which is why the expectation was pinned that way and why it was
+never observed to be host-specific.
+
+**Do not relax the assertion.** The corpus is pinning a real defect and is doing
+its job; what is wrong is its stated *mechanism*, not its expectation. Two things
+are owed: the header's "name order" claim corrected to registration order, and an
+expectation that does not depend on the host — which, for a program whose answer
+is decided by `readdir`, can only come from the gate that makes the bare name an
+error in the first place. That is the same gate §3.3 needs, so this corpus entry
+is now a second reason it is the critical path rather than one.
+
+### 8.2z The specialized-AST home split, measured on both sides — MEASURED 2026-08-08
+
+§8.2v listed splitting `resolve_specialized_ast`'s home as owed and unsized.
+Homing it on the writing file's module — `home_ns_of(ast_node.span.file)`, the
+pattern two sibling sites in the same file already use — costs and pays exactly
+this:
+
+| | before | after |
+|---|---:|---:|
+| would-be rejections, total | 509 | **265** |
+| …at `ast_resolver.cryo:90` | 245 | **1** |
+| `Formatter` / `FmtError` as candidates | 122 / 124 | **0 / 2** |
+| cascade `2c-home-syntax` | 7,229 | 7,106 |
+| cascade **`4 arena (bootstrap-only)`** | **0** | **123** |
+| B1 total | 12,453 | **12,576 (+123)** |
+| (name → resolved type) over 11,475 | — | **identical** |
+
+The written annotations are fixed: `implement Display for Option<T>` is written
+in `std::fmt::display`, so its `Formatter` and `FmtError` are that file's
+imports, while the template entry names `std::core::option`, which imports
+neither. 244 of 245 rejections at the site were that one mistake.
+
+**The cost is real and was predicted by the code's own comment.** All 123 new
+step-4 events are mangled spec names (`6Result$Lm_N$L3std.2io.5error.7IoError$G$G`,
+`7HashMap$L…`), homed on `std::fmt::display` (122) and `std::fmt::write` (1).
+They are registered under the *entry's* module by `reserve_spec_names`, so a
+span-derived home makes 2c miss them and the arena answers instead. **No answer
+changed** — the multiset is identical — so this is a route change, not a
+rebinding.
+
+**Why `pre_resolved` does not already cover them.** `TypeResolver::resolve`
+returns `n.pre_resolved` before it consults the context, and the substituter sets
+it on the generic-param branch. Eight lines below that, the **base-type** rewrite
+(`substituter.cryo`) writes `named.name = this.spec_name` and sets no
+`pre_resolved` — so the spec name has to be re-derived by name through the
+cascade, and that only worked because the home happened to be the module it was
+registered under.
+
+**Why it cannot simply be attached there.** `ASTSpecializer::specialize` (clone +
+substitute) runs at `monomorphizer.cryo:429`, *before* `reserve_spec_names` at
+`:506`, so at substitution time the spec name is registered nowhere and there is
+no TypeRef to attach. The wrapper TypeRef does exist — it is
+`request.generic_type` on the swap path — but it is not threaded into
+`ASTSpecializer`, and function templates are not `is_named` and have no wrapper
+at all.
+
+**What step 4 actually is.** `arena.lookup_by_name(name)`, an **exact-name**
+lookup gated on `bootstrap_mode`, whose comment says it "should never be
+reached" after bootstrap. So the +123 was not a fuzzy match, but it did make 123
+resolutions depend on `bootstrap_mode` still being on during monomorphization,
+which is a property nothing asserts.
+
+#### The trade dissolves: the name carries its own answer
+
+The +123 was a symptom of the base-name rewrite, not a cost of the span home.
+`ASTSpecializer::specialize` now takes the arena id the specialization will
+occupy and hands it to the substituter, which attaches it as `pre_resolved` on
+every annotation it rewrites to the spec name — exactly what the generic-param
+branch eight lines above it already did. `request.generic_type` is that id on the
+swap-relocate path, and it is the same id `reserve_spec_names` publishes, so type
+identity cannot fork. The two sites that pass an empty base/spec name
+(`call_specializer`, `trait_specializer`) pass `TypeRef::invalid()`; their
+base-name branch cannot fire, so they are behaviour-neutral by construction.
+
+| | HEAD | span home alone | span home + `pre_resolved` |
+|---|---:|---:|---:|
+| would-be rejections | 509 | 265 | **265** |
+| cascade `4 arena (bootstrap-only)` | 0 | 123 | **0** |
+| B1 total | 12,453 | 12,576 | **12,453** |
+| `resolve_named` calls | 11,475 | 11,475 | **9,419** |
+| cascade `2c` | 7,229 | 7,106 | 5,173 |
+
+**A prediction that was wrong in magnitude, which is itself the finding.** −123
+`resolve_named` calls were predicted; the measurement is **−2,056**. Only 123 of
+them were reaching step 4. The other 1,933 were resolving *correctly* at 2c — by
+round-tripping a mangled spec name through the scope chain and finding it because
+the home happened to be the module it was registered under. They were never
+wrong, only needlessly derived, and load-bearing on a coincidence: any change to
+that home would have moved them to step 4 too. The 123 were the visible edge of a
+population sixteen times larger.
+
+**Controls.** No `(name → answer)` pair exists after that did not exist before —
+the pairs are a strict subset — and no name's answer *set* differs, so nothing
+rebound; the rows that vanish are annotations that no longer ask. `B1` returns to
+its golden 12,453 with no re-pin. `make test` is unchanged from HEAD (`unit: ok;
+compile-fail: 170 passed; projects: 18 passed, 1 failed`, the one failure being
+§8.2y's pre-existing readdir defect). All 14 examples build. Both self-host fixed
+points hold byte-identically.
+
+⇒ **`resolve_specialized_ast` no longer resolves two kinds of name through one
+context**, which is what §8.2v recorded as owed, and the site's `Syntax` label is
+now honest rather than laundered. What remains at it is **1** event, not 245.
+
 ### 8.3 B2 is unmeasured
 
 Only the assoc-type projection (62) is instrumented. Sema's method and trait
@@ -3237,6 +3417,36 @@ dispatch — the actual bulk of type-dependent resolution — is not counted.
 - **Q4** — Does `std::Range` survive? It works today only via the mechanism in
   §1. Either `stdlib/lib.cryo` re-exports it explicitly or it becomes an error
   with a suggestion — decided per name, deliberately.
+### Decided 2026-08-08
+
+- **Q8 — the fast-path gate gets its OWN error code, with a help line.** A name
+  that exists but is not reachable is a different condition from one that does
+  not exist, and it gets its own code rather than reusing `E0203`. The number and
+  wording are the owner's; what is settled is that it is new, and that it carries
+  a help naming the module that declares the candidate and the `import` that
+  would make it reachable.
+
+  Two measurements narrow what the code has to say, both taken on
+  `examples/09-json-config`: of the would-be rejections, **all** are *"namespace
+  not reachable"* and **zero** are *"candidate not public"*. The gate's first
+  job is scope, not privacy — privacy already has `E0353` and its own corpus.
+
+  Recorded because it was believed otherwise: `E0203` does **not** read
+  "ambiguous type" anywhere in the tree. It is `E0203_UNDEFINED_TYPE`, rendered
+  "cannot find type `X` in this scope" with the label "not found in this scope",
+  and both tripwire corpora already name it. The case for a new code is the
+  *distinction* it draws, not a mismatch in `E0203`'s wording.
+
+- **Q9 — the B1 golden is host-aware.** `lookup_by_leaf calls` reads 5,041 on
+  Windows and **4,989** on Linux for the same commit, because the Windows build
+  compiles Windows-only stdlib modules; the same asymmetry moves `2c` by 20 and
+  `declaration took a slot an import held` from 9 to 2. B1's *total* is unmoved
+  at 12,453 on both. A single cross-host golden on a host-dependent row makes
+  `make b1-check` red on whichever host did not pin it, and a permanently red
+  ratchet is precisely what §7 says gets switched off — so the gate is taught the
+  dimension rather than left to flip-flop. Re-pinning to one host's number was
+  rejected for that reason.
+
 ### Decided 2026-08-04
 
 - **Q7 — a top-level declaration is PUBLIC by default.** The parser wins;

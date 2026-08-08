@@ -2,9 +2,9 @@
 ///
 /// Post-clone re-resolution of a specialized AST: after `ASTSpecializer` clones a
 /// template and `ASTTypeSubstituter` rewrites its annotations to concrete names,
-/// every `resolved_type` field is invalid.  This collaborator fills them - 
+/// every `resolved_type` field is invalid.  This collaborator fills them -
 /// resolving fields, method signatures, and body locals against a resolution
-/// context built from the template's module - and performs compile-time
+/// context homed on the module that WROTE the syntax - and performs compile-time
 /// `static match` arm pruning (selecting the single live arm for the concrete
 /// substitution).
 ///
@@ -76,8 +76,10 @@ type struct MonoAstResolver {
 
 
     /// Walk the specialized AST and resolve all type annotations into concrete
-    /// TypeRefs.  Uses the template entry's module name to build a resolution
-    /// context so cross-module and user-defined types resolve through the scope chain.
+    /// TypeRefs.  The context's HOME is the module that wrote the syntax, so a
+    /// bare leaf in the clone means what it meant where it was written; its
+    /// `current_module` stays the template entry's, which is where the spec walk
+    /// registers.
     resolve_specialized_ast(mut &this, ast_node: ASTNode*, node_kind: NodeKind,
                             entry: TemplateEntry*, subst: TypeSubstitution*,
                             this_type: TypeRef) -> void {
@@ -88,23 +90,32 @@ type struct MonoAstResolver {
             module_name = this.intern_table.resolve(entry.module_name);
         }
         mut res_ctx: ResolutionContext = ResolutionContext::new(FILE, LINE, module_name, "", "", HomeOrigin::Unset);
-        // The template's own module owns every annotation in this AST; the
-        // ambient scope chain still points at whichever module demanded the
-        // specialization.
+        // A bare leaf in this clone means what it meant in the file that WROTE
+        // it, which is not the module the template entry names: `implement
+        // Display for Option<T>` is written in `std::fmt::display`, so its
+        // `Formatter` and `FmtError` are that file's imports, while the entry
+        // names the module owning the specialized TYPE (`std::core::option`),
+        // which imports neither.
         //
-        // Deliberately the ENTRY's module and not the node's span, which is the
-        // opposite of every other site in this migration.  This context does not
-        // resolve one kind of name: alongside the annotations the user wrote, it
-        // re-resolves the MANGLED SPEC NAMES the substituter just wrote into the
-        // clone (`6Result$Lm_N$L3std.2io.5error.7IoError$G$G`), and those are
-        // registered under the module the template lives in, not under the
-        // module the syntax lives in.  Pointing this at the span costs 119
-        // extra step-4 arena lookups on `examples/09-json-config` - every one an
-        // `implement Display for Option<T>` written in `std::fmt::display` while
-        // the spec names it resolves belong to `std::core::option`.  It is
-        // `method_binding:865`'s shape: TWO homes through ONE context, and it
-        // has to be split before either half can move (spec §8.2m).
-        res_ctx.set_home_module(module_name, HomeOrigin::Syntax);
+        // The MANGLED SPEC NAMES the substituter writes into the clone
+        // (`6Result$Lm_N$L3std.2io.5error.7IoError$G$G`) are registered under
+        // the entry's module and do not need this home at all: the substituter
+        // attaches a `pre_resolved` TypeRef to each, and `TypeResolver::resolve`
+        // returns that before it consults the context.  One context therefore
+        // carries one home, and `current_module` stays the entry's because the
+        // spec walk registers into the template's module.
+        //
+        // When the graph cannot name the writing file the entry's module
+        // answers, reported as `Cursor` because it is not the syntax's: a home
+        // claiming `Syntax` while holding another module's namespace makes a
+        // guess indistinguishable from provenance.
+        mut home: string = this.home_ns_of(ast_node.span.file);
+        mut home_origin: HomeOrigin = HomeOrigin::Syntax;
+        if (home.length() == 0) {
+            home = module_name;
+            home_origin = HomeOrigin::Cursor;
+        }
+        res_ctx.set_home_module(home, home_origin);
 
         match (node_kind) {
             NodeKind::StructDeclaration => {
