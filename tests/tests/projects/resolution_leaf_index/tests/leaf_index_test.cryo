@@ -1,13 +1,22 @@
 /// ============================ TRIPWIRE ==================================
 ///
 /// THE TWO `WRONG_` TESTS BELOW PIN BEHAVIOR docs/name-resolution.md SAYS IS
-/// WRONG. They pass today because the compiler is wrong today.
+/// WRONG. They pass only where the compiler is wrong in the particular
+/// direction they were pinned against -- see WHAT THE ANSWER DEPENDS ON.
 ///
-/// IF YOU ARE HERE BECAUSE ONE STARTED FAILING: that is the intended outcome,
-/// and it means someone landed the fix. Do NOT delete the assertion or relax
-/// the annotation to get back to green. Move the case to a `compile_fail`
-/// project with the right `expect.diagnostic`, in the same change that made it
-/// an error -- exactly as resolution_tripwire's visibility half was moved to
+/// IF YOU ARE HERE BECAUSE ONE STARTED FAILING: check WHICH way before
+/// assuming a fix landed. An E0203 at the `Orphan` signatures is the intended
+/// outcome and means someone landed it. An E0200 saying `expected
+/// ...Alpha::Widget<i64>, found ...Omega::Widget<i32>` is NOT: it means the
+/// leaf index picked the other declarer, which happens on any host whose
+/// directory enumeration order differs from the one this was pinned on. That
+/// is the defect itself, not a regression, and it is measured in
+/// docs/name-resolution.md §8.2y.
+///
+/// Either way: do NOT delete the assertion or relax the annotation to get back
+/// to green. For the real fix, move the case to a `compile_fail` project with
+/// the right `expect.diagnostic`, in the same change that made it an error --
+/// exactly as resolution_tripwire's visibility half was moved to
 /// tests/tests/projects/visibility_gate.
 ///
 /// ---- WHY THIS EXISTS ALONGSIDE resolution_tripwire ---------------------
@@ -26,12 +35,23 @@
 ///
 /// ---- WHAT THE ANSWER DEPENDS ON ---------------------------------------
 ///
-/// Not scope. The leaf index picks by NAME ORDER: `Alpha` wins over `Omega`
-/// here, and nothing readable from `Orphan` explains why. Renaming the loser
-/// to sort on the other side of the winner moves the binding with it, which
-/// turns a project that passes into one that does not compile. A bare name's
-/// meaning therefore depends on the names of modules the use site has never
-/// heard of.
+/// Not scope, and not the names either. `register_leaf_name` is FIRST
+/// REGISTRATION WINS, and registration order is depth-first module discovery
+/// seeded by the order the filesystem enumerates the directory. Measured, with
+/// controls, in docs/name-resolution.md §8.2y: renaming the declaring file,
+/// module-name sort order, and the import graph all leave the winner unmoved,
+/// while enumerating the SAME sources in a different directory order moves it.
+///
+/// So a bare name's meaning depends on something no reader of the source can
+/// see, and copying a directory can change what this program compiles to. This
+/// file's expectation names `Alpha` because that is what wins where directory
+/// enumeration is alphabetical; where it is not, `Omega` wins and the two
+/// `WRONG_` tests fail with an E0200 rather than passing.
+///
+/// An earlier revision of this comment said the pick was NAME ORDER, and cited
+/// `Alpha` beating `Omega` as evidence. `Alpha` does sort first, and it loses
+/// wherever enumeration is not alphabetical; the agreement was a coincidence of
+/// the host it was written on.
 ///
 /// ========================================================================
 ![config(testing)]
@@ -97,9 +117,11 @@ function CONTROL_the_leaf_is_declared_by_two_distinct_types()
 }
 
 /// CONTROL, and the one that says what the defect actually is. The SAME plural
-/// leaf, named from a module that imports one declarer, binds THAT declarer --
-/// and it is `Omega`, the loser of the leaf index's name-order pick, so this
-/// cannot be the arbitrary answer landing correctly by luck.
+/// leaf, named from a module that imports one declarer, binds THAT declarer.
+/// Where the leaf index picks `Alpha`, `Omega` here cannot be the arbitrary
+/// answer landing correctly by luck; where it picks `Omega`, the two coincide
+/// and this stops discriminating -- see the note in `importer.cryo` and
+/// docs/name-resolution.md §8.2y.
 ///
 /// It is also the guard on the fix: a change that made `Orphan` an error by
 /// making a bare plural leaf unresolvable everywhere would break this too, and

@@ -29,11 +29,19 @@ public:
     spec_name:         SymbolStr;         // "Array_i32"
     param_names:       SymbolStr[];       // ["T"]
     type_arg_displays: SymbolStr[];       // ["i32"]
+    /// The arena id the specialization will occupy, or invalid when the caller
+    /// has none.  Attached as `pre_resolved` to every annotation rewritten to
+    /// `spec_name`, so a synthesized mangled name never has to be re-derived
+    /// through the scope chain - which cannot answer it, because "which module
+    /// is this name written in" is not a question a name the substituter just
+    /// minted has.  Invalid means the annotation keeps today's by-name route.
+    spec_typeref:      TypeRef;
 
     ASTTypeSubstituter(subst: TypeSubstitution*, arena: TypeArena*,
                        intern_table: InternTable*,
                        base_name: SymbolStr, spec_name: SymbolStr,
-                       param_names: SymbolStr[], type_arg_displays: SymbolStr[])
+                       param_names: SymbolStr[], type_arg_displays: SymbolStr[],
+                       spec_typeref: TypeRef)
         : BaseASTVisitor() {
         this.subst             = subst;
         this.arena             = arena;
@@ -42,6 +50,7 @@ public:
         this.spec_name         = spec_name;
         this.param_names       = param_names;
         this.type_arg_displays = type_arg_displays;
+        this.spec_typeref      = spec_typeref;
     }
 
 
@@ -263,8 +272,19 @@ public:
         // Rewrite the base type name to the specialized name.
         // e.g. `&this` on `Pair<T>` has annotation Reference(Named("Pair"))
         // which must become Reference(Named("Pair_string")) after substitution.
+        //
+        // Carries the answer with the name, exactly as the generic-param branch
+        // above does.  `spec_name` is minted here and registered under the
+        // TEMPLATE's module, so resolving it by name later only works while the
+        // resolution context happens to be homed on that module - which makes
+        // the home of every WRITTEN annotation in the clone unmovable.  The id
+        // is the same one `reserve_spec_names` will publish, so this cannot fork
+        // type identity.
         if (named.name.equals(this.base_name)) {
             named.name = this.spec_name;
+            if (this.spec_typeref.is_valid()) {
+                named.pre_resolved = this.spec_typeref;
+            }
             return ann;
         }
 

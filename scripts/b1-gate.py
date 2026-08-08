@@ -63,6 +63,32 @@ B2/B3 are recorded for context but NOT asserted.  B2 is documented as a floor
 not a fixed number; asserting either would make the gate noisy, and a noisy
 gate gets turned off.
 
+THE GOLDEN IS PER-HOST, WITH NO INHERITANCE
+-------------------------------------------
+One row genuinely differs by host: `lookup_by_leaf calls` is 5,041 on Windows
+and 4,989 on Linux for the same commit, because a Windows build compiles
+Windows-only stdlib modules that a Linux build never loads.  The same asymmetry
+moves `2c` by 20 and `declaration took a slot an import held` from 9 to 2.  B1's
+TOTAL is identical on both.
+
+A single cross-host golden therefore reads as DRIFT on whichever host did not
+pin it -- which is what it did: the gate was red on Linux at a commit whose
+handoff certified it green on Windows, and the offered fix was to re-pin
+DOWNWARD, i.e. to hand the redness to the other host and flip-flop with whoever
+ran it last.  A permanently red ratchet is what §7 says gets switched off, so
+the gate is taught the dimension instead.
+
+Each host gets its OWN `[host:<key>]` section and nothing is inherited between
+them.  Inheritance was rejected deliberately: with a base plus overrides, a
+re-pin on one host silently changes the other host's bound for every row it did
+not override, which is the same invisible-movement failure this gate exists to
+prevent.  The cost is that a genuine improvement must be re-pinned once per
+host; that is the intended cost, because each host is a separate measurement and
+`--update` can only honestly rewrite the one it just ran.
+
+A host with no section is a hard failure, not a pass: an unpinned host is
+unmeasured, and this gate must never report OK for a number nobody committed.
+
 MEASUREMENT CONSTRAINTS -- all three are load-bearing
 -----------------------------------------------------
   * `--no-incremental`, or the build prints "up to date" and the counter
@@ -306,45 +332,104 @@ def parse_report(err):
     return b1, b2, b3, rows
 
 
-def render(b1, b2, b3, rows):
-    lines = [
-        "# B1 fuzzy-fallback baseline -- docs/name-resolution.md §7.2 mechanism 3.",
-        "#",
-        "# ASSERTED: the B1 total and every per-site row below.",
-        "# CONTEXT ONLY (not asserted): the B2/B3 comments.",
-        "#",
-        "# Target: examples/09-json-config, --no-incremental, CRYO_CODEGEN_THREADS=1.",
-        "# Re-pin DELIBERATELY with `make b1-check ARGS=--update` and commit the",
-        "# golden alongside the change that moved it. A decrease is progress and",
-        "# still requires a re-pin -- see the module docstring for why.",
-        "#",
-        "# context: B2=%s B3=%s" % (b2, b3),
-        "",
-        "B1_TOTAL %d" % b1,
-        "",
-    ]
+def host_key():
+    """The golden section this host asserts against.
+
+    Deliberately coarse -- the dimension that moves the numbers is "which
+    stdlib modules does a build of this OS compile", not the libc or the CPU.
+    """
+    if os.name == "nt" or sys.platform.startswith("win"):
+        return "windows"
+    if sys.platform.startswith("linux"):
+        return "linux"
+    return sys.platform
+
+
+HEADER = [
+    "# B1 fuzzy-fallback baseline -- docs/name-resolution.md §7.2 mechanism 3.",
+    "#",
+    "# ASSERTED: the B1 total and every per-site row, PER HOST.",
+    "# CONTEXT ONLY (not asserted): the B2/B3 comments.",
+    "#",
+    "# Target: examples/09-json-config, --no-incremental, CRYO_CODEGEN_THREADS=1.",
+    "# Re-pin DELIBERATELY with `make b1-check ARGS=--update` and commit the",
+    "# golden alongside the change that moved it. A decrease is progress and",
+    "# still requires a re-pin -- see the module docstring for why.",
+    "#",
+    "# Each [host:<key>] section is a SEPARATE measurement and inherits nothing",
+    "# from any other. `--update` rewrites only the section for the host it ran",
+    "# on and leaves the rest byte-for-byte, because it cannot honestly speak",
+    "# for a host it did not measure. One row really is host-dependent:",
+    "# `lookup_by_leaf calls`, because a Windows build compiles Windows-only",
+    "# stdlib modules. The B1 TOTAL is the same on both.",
+]
+
+
+def render_section(host, b1, b2, b3, rows):
+    lines = ["[host:%s]" % host,
+             "# context: B2=%s B3=%s" % (b2, b3),
+             "B1_TOTAL %d" % b1,
+             ""]
     for label, count in rows:
         lines.append("%-46s %d" % (label, count))
+    return lines
+
+
+def render(host, b1, b2, b3, rows, keep=None):
+    """Render the golden: this host's section, plus every other host verbatim.
+
+    `keep` is the ordered {host: [raw lines]} of the sections that were already
+    committed, so a re-pin here cannot perturb a host it did not run on.
+    """
+    lines = list(HEADER)
+    emitted = set()
+    for other, raw in (keep or {}).items():
+        if other == host:
+            continue
+        lines.append("")
+        lines.extend(raw)
+        emitted.add(other)
+    lines.append("")
+    lines.extend(render_section(host, b1, b2, b3, rows))
     return "\n".join(lines) + "\n"
 
 
 def parse_golden(text):
-    total = None
-    rows = []
+    """-> ({host: (total, rows)}, {host: [raw lines]}).
+
+    The raw blocks are kept so `--update` can round-trip the hosts it did not
+    measure without reformatting them.
+    """
+    parsed = {}
+    raw = {}
+    host = None
     for line in text.splitlines():
         line = line.rstrip()
-        if not line or line.lstrip().startswith("#"):
+        stripped = line.strip()
+        if stripped.startswith("[host:") and stripped.endswith("]"):
+            host = stripped[len("[host:"):-1].strip()
+            parsed[host] = [None, []]
+            raw[host] = [line]
             continue
-        if line.startswith("B1_TOTAL"):
-            total = int(line.split()[1])
+        if host is None:
+            continue
+        raw[host].append(line)
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith("B1_TOTAL"):
+            parsed[host][0] = int(stripped.split()[1])
             continue
         # `<label padded to 46> <count>`.  Same reasoning as split_row: the
         # count is the last whitespace-separated token, and the label keeps
         # its internal double spaces.
-        parts = line.rsplit(None, 1)
+        parts = stripped.rsplit(None, 1)
         if len(parts) == 2 and parts[1].isdigit():
-            rows.append((parts[0].strip(), int(parts[1])))
-    return total, rows
+            parsed[host][1].append((parts[0].strip(), int(parts[1])))
+    # Trailing blank lines inside a block would be re-emitted on every update.
+    for h in raw:
+        while raw[h] and not raw[h][-1].strip():
+            raw[h].pop()
+    return ({h: (t, r) for h, (t, r) in parsed.items()}, raw)
 
 
 def main():
@@ -372,6 +457,12 @@ def main():
                 sys.stderr.write("           %-40s %d -> %d\n" % (la, ca, cb))
         return 1
 
+    host = host_key()
+    existing, raw = ({}, {})
+    if os.path.exists(GOLDEN):
+        with open(GOLDEN, "r", encoding="utf-8") as f:
+            existing, raw = parse_golden(f.read())
+
     b1, b2, b3, rows = measure(args.cryo)
 
     if args.update:
@@ -380,29 +471,44 @@ def main():
         # diffed, so a re-pin from a Windows host would otherwise rewrite all 34
         # lines and bury the one or two rows that actually moved.
         with open(GOLDEN, "w", encoding="utf-8", newline="\n") as f:
-            f.write(render(b1, b2, b3, rows))
-        print("b1-gate: golden updated -- B1 = %d" % b1)
+            f.write(render(host, b1, b2, b3, rows, keep=raw))
+        others = sorted(h for h in raw if h != host)
+        print("b1-gate: golden updated for host %r -- B1 = %d%s"
+              % (host, b1,
+                 ("; left untouched: " + ", ".join(others)) if others else ""))
         return 0
 
-    if not os.path.exists(GOLDEN):
+    if not existing:
         sys.stderr.write(
             "b1-gate: no golden at %s\n"
             "         Create it deliberately with `make b1-check ARGS=--update`.\n"
             % GOLDEN)
         return 1
 
-    with open(GOLDEN, "r", encoding="utf-8") as f:
-        want_total, want_rows = parse_golden(f.read())
+    if host not in existing:
+        sys.stderr.write(
+            "b1-gate: the golden has no [host:%s] section.\n"
+            "         Pinned hosts: %s\n"
+            "         This host is UNMEASURED, and a gate must not report OK for a\n"
+            "         number nobody committed. Measure and pin it deliberately:\n"
+            "             make b1-check ARGS=--update\n"
+            "         Sections inherit nothing, so this cannot disturb the others.\n"
+            % (host, ", ".join(sorted(existing)) or "(none)"))
+        return 1
+
+    want_total, want_rows = existing[host]
 
     if want_total is None:
-        sys.stderr.write("b1-gate: golden has no B1_TOTAL line; it is corrupt.\n")
+        sys.stderr.write("b1-gate: golden section [host:%s] has no B1_TOTAL line;"
+                         " it is corrupt.\n" % host)
         return 1
 
     if want_total == b1 and want_rows == rows:
-        print("b1-gate: OK -- B1 = %d, %d sites, matches golden" % (b1, len(rows)))
+        print("b1-gate: OK -- B1 = %d, %d sites, matches golden [host:%s]"
+              % (b1, len(rows), host))
         return 0
 
-    sys.stderr.write("b1-gate: B1 DRIFT\n\n")
+    sys.stderr.write("b1-gate: B1 DRIFT  (host %s)\n\n" % host)
     sys.stderr.write("  total   golden %d   measured %d   (%+d)\n\n"
                      % (want_total, b1, b1 - want_total))
     want_map = dict(want_rows)
@@ -428,7 +534,9 @@ def main():
             "\n  B1 went DOWN: that is progress, and the new lower value must be\n"
             "  pinned so it becomes the bound. Re-pin with:\n"
             "      make b1-check ARGS=--update\n"
-            "  and commit tests/b1-baseline.txt with the change that moved it.\n")
+            "  and commit tests/b1-baseline.txt with the change that moved it.\n"
+            "  Name the mechanism first: a row can also fall because it stopped\n"
+            "  being recorded, and only this host's section is re-pinned.\n")
     return 1
 
 
