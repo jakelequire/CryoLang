@@ -2964,6 +2964,258 @@ a scope problem in `call_resolver`, the second is the split
 `ast_resolver.cryo:90` already documents as owed, and the third is a defect this
 measurement found.
 
+### 8.2v The scope lane is scoped, and the fast path swallows the difference — MEASURED 2026-08-07
+
+§8.2u's largest class was the caller's ambient cursor: five sites in
+`sema/call_resolver.cryo` supplying 3,549 of 4,215 would-be rejections. All five
+resolve the first segment of a written path, so the answer is the one §8.2q/§8.2r
+use — the module that wrote the syntax.
+
+`CompilationContext` gained `resolve_scoped_at` / `resolve_scoped_or_at` /
+`scope_is_ambiguous_at`, taking the node's own `span.file`. They fall back to the
+cursor, not to "no scope", when the file names no module: an invalid namespace
+compares unequal to every real one, so judging against it would read missing
+provenance as "written somewhere else" and reject everything — the false-positive
+direction that reverted the gate once. The fallback is counted *and* reported as
+the `Cursor` origin.
+
+Six sites moved, not five. `resolve_scope_call` asks `scope_is_ambiguous` one
+line before it binds with `resolve_scoped_or`; leaving the first on the cursor
+while the second took the syntax would make the E0154 diagnostic and the binding
+two answers to one question from two different modules. `resolve_scope_owner_template`
+takes a bare `SymbolStr`, which carries no provenance, so the span threads in from
+its four callers.
+
+**The migration is exact, and the untouched half proves it:**
+
+| population | before | after |
+|---|---:|---:|
+| would-be rejections claiming `Cursor` | 3,709 | **160** |
+| would-be rejections claiming `Syntax` | 506 | **506** |
+| total | 4,215 | **666** |
+
+The `Cursor` drop is 3,549 — the five sites, to the event. The `Syntax` half is
+bit-identical, which is the control: a change that only re-homed cursor callers
+must leave every non-cursor caller alone, and it did.
+
+**Provenance was never missing.** `ScopeUseCursor` = **0** over 40,828 scope
+resolutions, so the cursor fallback is dead code on this target and the drop
+cannot be an artifact of names quietly falling back. `ScopeUseDiff` = **9,563**:
+on 23% of scope resolutions the writing module and the ambient cursor name
+different modules.
+
+**And not one of those 9,563 changed its answer.** The entire counter report is
+identical apart from the three new rows and the rejection count; all 11,495
+(name → resolved type) pairs are unchanged; `b1-check` reads 12,453 against its
+golden with no re-pin; `resolution_scope` 10/10, `resolution_leaf_index` 4/4 and
+`resolution_tripwire` 4/4 are unmoved.
+
+> Read "the counter report is identical" with §8.2w's correction: three `Scope*`
+> tier rows were past the end of the tally array in *both* runs, so their 0 = 0
+> comparison was vacuous rather than confirming. The claim above holds for every
+> row that was actually being measured, which was not all of them.
+
+⇒ **§8.2u's expectation that a correct use site would select a different candidate
+is falsified on this corpus, and the reason is §1's root cause.**
+`resolve_qualified_scoped` consults `use_site_ns` in two places: the
+single-candidate fast path, which computes the verdict and returns `Unique`
+regardless, and the multi-candidate branch, which actually selects. Every one of
+the 9,563 mis-judged names is a leaf that is unique program-wide, so every one
+took the fast path. **A use site cannot change an answer while the fast path
+answers before consulting it.** The scope work is not a prerequisite that might
+also fix bindings; it is the input the gate needs, and the gate is now the only
+thing between a correct use site and a correct binding for all 9,563.
+
+**The 666 survivors attribute exhaustively, into three defects and no source
+migration:**
+
+- **~325 — a default type argument resolved at the use site** (§8.2u's third
+  class, now sized directly): 283 `GlobalAlloc`, 35 `AllocError`, 7 `Layout`.
+  The largest supplier is `resolve_generic_scope_name`, with
+  `type_resolution.cryo:60` behind it. **The mechanism is NOT
+  `expand_default_type_args`** — that reading is corrected, with a measurement,
+  in §8.2w.
+- **247 — `Formatter`/`FmtError` from `mono/ast_resolver.cryo:90`**, the
+  laundered-provenance split that site's comment already concedes is owed.
+  §8.2u measured 214 here; the direct count is 245 at the site.
+- **122 — a third cursor family, in mono, that §8.2u's three classes did not
+  separate.** `mono/call_specializer.cryo:544` and `:1302`, 61 each, both
+  honestly declaring `Cursor`. Every one of the 122 names `std::core::intrinsics`
+  as the use site — a module with **no `import` statement at all**, which writes
+  `NonNull` zero times. It is the same defect as the six just fixed, but harder:
+  the site's own comment states the caller's import scope "is not reconstructible
+  here", so mono cannot supply a use site the way sema can.
+
+Four cursor sites remain in `call_resolver` (`scope_is_generic_template` ×2,
+`scope_names_a_type`, `lookup_scope_template`). All take a bare `SymbolStr` with
+no node in hand, and all answer **zero** would-be rejections on this target, so
+threading spans through them is unverifiable here and was left alone rather than
+done blind.
+
+### 8.2w The default annotation is spliced, not expanded — and the tally was blind — MEASURED 2026-08-07
+
+**The mechanism §8.2u and §8.2v both named was wrong.** `expand_default_type_args`
+does not resolve a default against the caller: it clones the context and re-homes
+it on `entry.module_name` before resolving. A counter on the skipped branch
+(`DefaultArgNoOwner`) reads **0** — every entry reaching it carries a valid
+module. The zero has a control: the taken branch is what produces the 77
+`GlobalAlloc` rows homed on `std::collections::array`, so the site is reached.
+
+The real path is a **splice**. `passes/default_expansion.cryo` deep-clones the
+template's own default annotation and writes it into the *caller's*
+`scope_generic_args`; the clone keeps the template's span, which is correct,
+because `GlobalAlloc` means what it means in `string.cryo`.
+`resolve_generic_scope_name` then homed ONE context on the SCOPE node's span and
+resolved every element of that list against it — treating a spliced declaration
+as caller-written syntax.
+
+Measured over `examples/09-json-config`: **152 of 762** scope turbofish arguments
+have an annotation whose file is not the scope's file, and **every one of the 152
+is `stdlib/collections/string.cryo:30`** — `type struct String<A = GlobalAlloc>`.
+Nothing is synthesized: 0 of 762 arguments lack a source span. The declaration
+carries the scope (§8.2r), and here the annotation's own span was already
+recording it.
+
+**Fix:** each argument resolves in the module that wrote *it*; the scope's module
+answers only when an argument carries no file. Result:
+
+| | before | after |
+|---|---:|---:|
+| would-be rejections | 666 | **547** |
+| `GlobalAlloc` rows homed on the caller at that site | 139 | **20** |
+| relocated to `std::collections::string` | — | **0** |
+| (name → resolved type) over 11,495 | — | **identical** |
+
+Zero relocation is the load-bearing check: `std::collections::string` imports
+`std::alloc::allocator` and is a use site in no violation, so the rejection is
+removed rather than moved. The same defect class remains at
+`type_resolution.cryo:60` and two sibling contexts, which is why 20 survive; a
+central fix in `TypeResolver::resolve` would catch all of them at once and is a
+design change, not an implementation detail.
+
+#### The tally array was smaller than the enum
+
+Adding one `Site` variant made `M4 mono bare-name template scan` fall from 267 to
+0, and `b1-gate` offered to re-pin it as progress. It was not progress. `bump()`
+discards any index at or past `TALLY_CAP`, which stood at **64 against 71
+variants** — and against **67** before this session. Seven rows were reporting a
+0 they had never measured, and three of them are the `Scope*` rib-chain tier
+counters §8.2m landed, blind **from the day they were added**. Measured once the
+array was resized: `declaration took a slot an import held` = **9**, not 0.
+
+The module's own docstring asserted this could not happen — "sized well above the
+variant count … the bound is a property of the STORAGE rather than a
+hand-maintained constant a new variant could silently outrun." The capacity was a
+hand-maintained literal, and the assertion aged into a false one. A comment is a
+hypothesis.
+
+`TALLY_CAP` is now 256, and `g_tally_dropped` counts discarded bumps and prints a
+loud banner above the report. That detects **exactly** the false zeros — a site
+past the end that would have fired increments it, while one that never fires has
+a genuine 0 either way — and nothing about it is hand-maintained, which is the
+property the capacity comment claimed and did not have.
+
+`b1-gate.py` now refuses to certify a report carrying that banner, before it
+parses anything, and says explicitly not to re-pin. The blindness was detectable
+from outside the compiler the whole time; nothing was watching for it.
+Verified by breaking the property, not by observing green: the healthy report
+still parses to B1 = 12,453 over 20 rows, and the same report with the banner
+prepended exits 1.
+
+⇒ Two rules earned here. **A gate offering to re-pin a golden downward is not
+evidence the number improved**; B1's total never moved, and the row that did move
+had simply stopped being recorded. And **an instrument's own zero needs the same
+control as the compiler's** — the three tier counters passed four sessions of
+review as a measured 0.
+
+### 8.2x One of the fifteen unresolved names was a punctuation mark — MEASURED 2026-08-07
+
+§8.2s counted 15 `X-failed` resolutions on `examples/09-json-config` and read
+them as one defect class ("no module scope can answer a generic param"). Fourteen
+are that. The fifteenth was not: its name was the single character **`(`**.
+
+`implement trait Drop for ()` is parsed correctly — the target interns as `"()"`,
+and `pass_registry` registers `"()"` → `arena.get_unit()` precisely so unit impls
+"resolve through the same canonical-target path as the other primitives". But the
+parser then set `current_type_name` from the target TOKEN's lexeme, and the unit
+type is two tokens with only the `(` retained. `current_type_name` is what types
+an `&this` receiver, so the receiver of `()`'s `drop` was annotated with the name
+`(` — which names nothing and resolved to an invalid type, once, silently, on
+every build of the standard library.
+
+The name that would have worked was never tried: **0** resolutions of `()` appear
+in the audit before the fix. Carrying the target's spelling instead of the token's
+lexeme:
+
+| | before | after |
+|---|---:|---:|
+| `X-failed` | 15 | **14** |
+| resolutions of `()` | 0 | 1, answered at `3c-di-bare` |
+| `lookup_by_leaf calls` | 5,042 | **5,041** |
+| B3 (authoritative answers) | 69,986 | **69,987** |
+
+The last two corroborate each other and are the whole re-pin: exactly one
+resolution stopped failing through the cascade — including the leaf-index probe
+it used to reach — and became an authoritative answer one step earlier. B1's
+total did not move. The golden was re-pinned for that reason and no other.
+
+Structurally nothing else changed: masking digit runs in the (name → answer)
+multiset leaves **one** differing row, the intended one. The dozen rows that
+differ with digits intact are arena IDs shifted by one, because a type is now
+resolved that previously was not.
+
+⇒ **A population summarised by its majority hides its minority.** Fourteen of the
+fifteen were the generic-param defect, so the fifteenth inherited that label
+across three sections and was never read. It cost one `awk` to separate them.
+
+#### And the remaining fourteen are not one defect either
+
+Read individually rather than as a count, they split two ways, and **neither half
+is the "unbound-binding defect" §8.2s called the thing that stops the cascade
+being provably "2c or an error"**:
+
+- **8 at `sema/method_binding.cryo:798`** — `resolve_method_return_with_explicit_args`
+  builds a **deliberately empty** context on the symbolic walk, and its own
+  comment says so: "detect in a FRESH context (no bindings)". It then defers the
+  whole call when an explicit arg is invalid or still abstract. A `T` that fails
+  to resolve here is the **signal the probe exists to produce**, not a failure.
+  Binding `T` would break the detector.
+- **6 at `sema/sema.cryo:3336`** — `opaque_assoc_item_mismatch`, a diagnostic
+  helper deciding whether `implement Trait<Item = X>` mismatches its initializer.
+  Its context was `HomeOrigin::Unset`: a genuine scope-less site of the §8.2p
+  family. But the six failures are all the abstract param `T`, and **no home
+  module can answer a generic param** — a home matters only if the argument is a
+  bare type name, which on this corpus it never is.
+
+So the honest count of unresolved names attributable to missing scope is **zero**
+on this target: one was punctuation, eight are a working detector, and six need
+bindings rather than a namespace.
+
+**The scope-less site was closed anyway**, because "it changes no answer here" is
+not "it is correct": a bare same-leaf type name in that position reaches the
+module-blind chain and can bind a type the module never imported. Homed on the
+bound annotation's own module, the six rows move from `home=<none>` to
+`std::fmt::display` and `std::collections::hashset`, still fail (they are abstract
+params), and change no binding.
+
+That leaves the scope-less population on this target at:
+
+| | pre-session | now |
+|---|---:|---:|
+| resolutions with no home at all | 26 | **20** |
+| …of those, answered by `1-generic` | 20 | **20** |
+| …of those, reaching the module-blind chain | 6 | **0** |
+
+The surviving 20 are all `method_binding.cryo:475` answered by a generic
+**binding**, which consults no module scope by construction. **No resolution on
+this target now reaches the fallback chain without a scope.**
+
+> Counting that population needs `$3=="<none>"`, not `$3==""`. `rn_answer` prints
+> an absent home as the literal string `<none>`, so the empty-field test matches
+> nothing and reports a clean zero over the wrong population — which it did here,
+> twice, before the raw row was read. The instrument says what it means; the
+> query has to ask what the instrument says.
+
 ### 8.3 B2 is unmeasured
 
 Only the assoc-type projection (62) is instrumented. Sema's method and trait

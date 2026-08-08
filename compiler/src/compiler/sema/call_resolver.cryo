@@ -35,6 +35,7 @@ import Compiler::Types::{
 import Compiler::Resolver::{ SymbolStr, InternTable, QualifiedName, MangledName };
 import Compiler::AST;
 import Compiler::AST::{ Node, Visitor, Expression, Statement, Declaration };
+import Compiler::AST::NodeLocator;
 import Compiler::Diag;
 import Compiler::Diag::{ Diagnostic, Suggestion, SourceSpan };
 import Compiler::CompilationContext;
@@ -217,7 +218,8 @@ type struct CallResolver {
             const bare_sym: SymbolStr = this.intern.intern(bare_combined);
             const bare_ft: TypeRef = this.ctx.decl_index.lookup_func_type(bare_sym);
             if (bare_ft.is_valid()) { return bare_ft; }
-            const resolved_scope: SymbolStr = this.ctx.resolve_scoped_or(sr.scope_name, FILE, LINE);
+            const resolved_scope: SymbolStr =
+                this.ctx.resolve_scoped_or_at(sr.scope_name, sr.span.file, FILE, LINE);
             if (resolved_scope.is_valid()) {
                 const q_combined: string = format("%s::%s",
                     this.intern.resolve(resolved_scope), this.intern.resolve(sr.member_name));
@@ -3443,7 +3445,8 @@ type struct CallResolver {
         // stop resolution: it proceeds with the bare form so a single, clean
         // E0154 is emitted rather than a cascade of downstream misresolutions.
         if (scope.scope_generic_args.length == 0 && !this.state.in_symbolic_check
-                && this.ctx.scope_is_ambiguous(scope.scope_name, FILE, LINE)) {
+                && this.ctx.scope_is_ambiguous_at(scope.scope_name, scope.span.file,
+                                                  FILE, LINE)) {
             this.report_scope_ambiguity(scope);
         }
         // Resolve the scope to the import-visible qualified type FIRST, so a
@@ -3451,7 +3454,8 @@ type struct CallResolver {
         // imported `Coll::A::Beacon`) can't win the bare `lookup_method_return`
         // via last-write-wins.  Falls through to the bare form downstream when
         // scoping doesn't apply (unique leaf, module scope, or a generic param).
-        mut lookup_sym: SymbolStr = this.ctx.resolve_scoped_or(scope.scope_name, FILE, LINE);
+        mut lookup_sym: SymbolStr =
+            this.ctx.resolve_scoped_or_at(scope.scope_name, scope.span.file, FILE, LINE);
         if (scope.scope_generic_args.length > 0) {
             const spec_sym: SymbolStr = this.resolve_generic_scope_name(scope.scope_name, scope.scope_generic_args, scope.span);
             if (spec_sym.is_valid()) { lookup_sym = spec_sym; }
@@ -3535,23 +3539,30 @@ type struct CallResolver {
 
     /// Resolve a static-call scope name to its generic OWNER template.  Tries
     /// the scope name as-is (already-qualified or a spec), then its import-scoped
-    /// qualified form (`resolve_scoped_or`), which recovers a same-leaf stdlib
+    /// qualified form (`resolve_scoped_or_at`), which recovers a same-leaf stdlib
     /// generic (`Pair` -> `std::collections::pair::Pair`) that a bare
     /// `get_template` would miss.  Returns null when no generic type-owner
     /// template matches; callers then member-check by walking the returned
     /// template's methods, so a match that lacks the static member resolves to
     /// nothing.
-    resolve_scope_owner_template(&this, scope_sym: SymbolStr) -> TemplateEntry* {
+    ///
+    /// `span_file` is the file of the node the scope was WRITTEN in, which the
+    /// scope name alone cannot supply: a `SymbolStr` carries no provenance, so
+    /// without it the import-scoped step falls back to the ambient cursor and
+    /// judges the name against whichever module the walk is standing in.
+    resolve_scope_owner_template(&this, scope_sym: SymbolStr,
+                                 span_file: string) -> TemplateEntry* {
         if (this.ctx.generic_registry == null) { return null; }
         mut tmpl: TemplateEntry* = this.ctx.generic_registry.get_template(scope_sym);
         if (tmpl == null && this.ctx.decl_index != null) {
-            const q: SymbolStr = this.ctx.resolve_scoped_or(scope_sym, FILE, LINE);
+            const q: SymbolStr =
+                this.ctx.resolve_scoped_or_at(scope_sym, span_file, FILE, LINE);
             if (q.is_valid() && !q.equals(scope_sym)) {
                 tmpl = this.ctx.generic_registry.get_template(q);
             }
         }
         // Module-qualified scope path (`future::Ready`): the import-scoped
-        // `resolve_scoped_or` only canonicalizes a BARE leaf, so a `module::Type`
+        // `resolve_scoped_or_at` only canonicalizes a BARE leaf, so a `module::Type`
         // scope misses its template. Resolve it the way a type annotation does -
         // leaf-canonicalized through the name resolver - which maps `future::Ready`
         // to its registered generic template `std::future::ready::Ready`. Without
@@ -3738,7 +3749,8 @@ type struct CallResolver {
         const member_str: string = this.intern.resolve(scope.member_name);
         mut entry: TemplateEntry* = null;
         if (this.ctx.decl_index != null) {
-            const q: SymbolStr = this.ctx.resolve_scoped_or(scope.scope_name, FILE, LINE);
+            const q: SymbolStr =
+                this.ctx.resolve_scoped_or_at(scope.scope_name, scope.span.file, FILE, LINE);
             if (q.is_valid()) {
                 const qstr: string = this.intern.resolve(q) + "::" + member_str;
                 entry = this.ctx.generic_registry.get_template(this.intern.intern(qstr));
@@ -3894,7 +3906,8 @@ type struct CallResolver {
         if (this.ctx.generic_registry == null || this.ctx.type_resolver == null) {
             return TypeRef::invalid();
         }
-        mut tmpl: TemplateEntry* = this.resolve_scope_owner_template(scope.scope_name);
+        mut tmpl: TemplateEntry* =
+            this.resolve_scope_owner_template(scope.scope_name, scope.span.file);
         if (tmpl == null || tmpl.ast_node == null) { return TypeRef::invalid(); }
         if (tmpl.param_type_ids.length == 0) { return TypeRef::invalid(); }
 
@@ -4078,7 +4091,8 @@ type struct CallResolver {
         if (call == null || scope == null) { return; }
         if (call.resolved_type_args.length > 0) { return; }
         if (this.ctx.generic_registry == null) { return; }
-        mut tmpl: TemplateEntry* = this.resolve_scope_owner_template(scope.scope_name);
+        mut tmpl: TemplateEntry* =
+            this.resolve_scope_owner_template(scope.scope_name, scope.span.file);
         if (tmpl == null || tmpl.ast_node == null) { return; }
         if (tmpl.param_type_ids.length == 0) { return; }
         const empty_methods: MethodNode*[] = [];
@@ -4106,7 +4120,8 @@ type struct CallResolver {
     resolve_static_method_return_via_template(mut &this, scope: ScopeResolutionNode*,
                                               call: CallExprNode*) -> TypeRef {
         if (this.ctx.generic_registry == null) { return TypeRef::invalid(); }
-        mut tmpl: TemplateEntry* = this.resolve_scope_owner_template(scope.scope_name);
+        mut tmpl: TemplateEntry* =
+            this.resolve_scope_owner_template(scope.scope_name, scope.span.file);
         if (tmpl == null || tmpl.ast_node == null) { return TypeRef::invalid(); }
         if (tmpl.param_type_ids.length == 0) { return TypeRef::invalid(); }
         const empty_methods: MethodNode*[] = [];
@@ -4834,23 +4849,42 @@ type struct CallResolver {
         return entry;
     }
 
-    /// `use_span` is the span of the syntax that WROTE `generic_args` - always a
-    /// call/scope/identifier/literal node at the use site. The args are the
-    /// caller's turbofish, so they resolve in the caller's module (spec §8.2l);
-    /// it is a required parameter because every caller has such a node in hand
-    /// and a defaulted one would silently reintroduce the scope-less context.
+    /// `use_span` is the span of the syntax that named the SCOPE - always a
+    /// call/scope/identifier/literal node at the use site. It is a required
+    /// parameter because every caller has such a node in hand and a defaulted
+    /// one would silently reintroduce the scope-less context.
+    ///
+    /// It is the fallback home, not the home. `generic_args` is not uniformly
+    /// caller-written: `default_expansion` splices a CLONE of the template's own
+    /// default annotation into this list, and the clone keeps the template's
+    /// span. Resolving that clone against the scope's module binds
+    /// `String<A = GlobalAlloc>`'s default in whichever module happened to name
+    /// `String`, so one declaration's default means different things per caller -
+    /// and it names a module those callers neither write nor import. Each
+    /// argument therefore resolves in the module that WROTE IT, which its own
+    /// span already records; the scope's module answers only when an argument
+    /// carries no file of its own.
     resolve_generic_scope_name(&this, base_name: SymbolStr, generic_args: &TypeAnnotation*[],
                                use_span: SourceSpan) -> SymbolStr {
         if (this.ctx.type_resolver == null) { return SymbolStr::empty(); }
+        const scope_ns: string = this.syntax_module_of(use_span);
         mut res_ctx: ResolutionContext = ResolutionContext::new(FILE, LINE, this.ctx.source_file, "", "", HomeOrigin::Unset);
-        res_ctx.set_home_module(this.syntax_module_of(use_span), HomeOrigin::Syntax);
+        res_ctx.set_home_module(scope_ns, HomeOrigin::Syntax);
         this.symbolic.symbolic_bind_params(&res_ctx);
         mut arg_refs: TypeRef[] = [];
         for (mut i: i64 = 0; i < generic_args.length; i++) {
+            const arg_ns: string =
+                this.syntax_module_of(NodeLocator::annotation_span(generic_args[i]));
+            if (arg_ns.length() > 0) {
+                res_ctx.set_home_module(arg_ns, HomeOrigin::Syntax);
+            } else {
+                res_ctx.set_home_module(scope_ns, HomeOrigin::Syntax);
+            }
             const arg_ref: TypeRef = this.ctx.type_resolver.resolve(generic_args[i], &res_ctx);
             if (!arg_ref.is_valid()) { return SymbolStr::empty(); }
             arg_refs.push(arg_ref);
         }
+        res_ctx.set_home_module(scope_ns, HomeOrigin::Syntax);
         const entry: TemplateEntry* = this.lookup_scope_template(base_name);
         if (entry != null && arg_refs.length < entry.param_count) {
             arg_refs = this.ctx.type_resolver.expand_default_type_args(entry, arg_refs, &res_ctx);
@@ -4877,7 +4911,8 @@ type struct CallResolver {
         // `Result<Thing, GlobalAlloc>` instead of `Result<Arc<Thing, GlobalAlloc>, E>`
         // (it fired only because the arg counts coincidentally matched).
         if (scope != null && scope.scope_generic_args.length > 0) {
-            mut tmpl: TemplateEntry* = this.resolve_scope_owner_template(scope_name);
+            mut tmpl: TemplateEntry* =
+                this.resolve_scope_owner_template(scope_name, scope.span.file);
             if (tmpl != null && tmpl.param_type_ids.length >= scope.scope_generic_args.length) {
                 mut resolved_args: TypeRef[] = [];
                 mut all_valid: boolean = true;
@@ -4961,7 +4996,8 @@ type struct CallResolver {
         // imported `Coll::A::Beacon`) can't win the bare `lookup_method_return`
         // via last-write-wins.  Falls through to the bare form downstream when
         // scoping doesn't apply (unique leaf, module scope, or a generic param).
-        mut lookup_sym: SymbolStr = this.ctx.resolve_scoped_or(scope.scope_name, FILE, LINE);
+        mut lookup_sym: SymbolStr =
+            this.ctx.resolve_scoped_or_at(scope.scope_name, scope.span.file, FILE, LINE);
         if (scope.scope_generic_args.length > 0) {
             const spec_sym: SymbolStr = this.resolve_generic_scope_name(scope.scope_name, scope.scope_generic_args, scope.span);
             if (spec_sym.is_valid()) { lookup_sym = spec_sym; }

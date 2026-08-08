@@ -213,6 +213,24 @@ def parse_report(err):
 
     Split out from `measure` so it is testable without running a build.
     """
+    # Checked before anything is parsed, because an overflow makes every row
+    # below it unreadable rather than merely suspect: a site whose bumps were
+    # discarded still prints a plausible 0, so its drop reads as progress and
+    # invites exactly the re-pin that would bake the blindness into the golden.
+    # This gate exists to notice a fallback regrowing; certifying a number the
+    # compiler stopped recording is the one way it can fail silently.
+    if "TALLY OVERFLOW" in err:
+        # The report itself is not dumped: unlike the parse failures below it is
+        # perfectly well-formed, just untrustworthy, and the compiler has already
+        # printed the banner that says so.
+        sys.stderr.write(
+            "b1-gate: the counter's tally array overflowed.\n"
+            "         Sites past its capacity reported 0 WITHOUT being measured,\n"
+            "         so neither the total nor the breakdown can be trusted.\n"
+            "         Raise TALLY_CAP in resolve_counter.cryo. Do NOT re-pin:\n"
+            "         a row that fell to 0 here did not improve, it went blind.\n")
+        sys.exit(1)
+
     b1 = b2 = b3 = None
     rows = []
     for line in err.splitlines():

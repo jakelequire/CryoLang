@@ -47,14 +47,27 @@ import std::collections::str;
 
 // ---- Storage -----------------------------------------------------------
 
-/// Capacity of the tally array.  Sized well above the variant count so
-/// adding a `Site` never requires resizing, and so the bound is a property
-/// of the STORAGE rather than a hand-maintained "number of sites" constant
-/// that a new variant could silently outrun.
-const TALLY_CAP: i64 = 64;
+/// Capacity of the tally array.
+///
+/// A `Site` whose index reaches this reports 0 while never being measured, and
+/// a zero that was never recorded is indistinguishable from a real one - the
+/// same trap `is_candidate_public` defaulting to `true` sets.  Capacity being
+/// "obviously large enough" is not a safeguard: it stood at 64 against 67
+/// variants, so the three `Scope*` tier rows read 0 from the day they were
+/// added, and the B1 gate would have accepted the resulting `M4 267 -> 0` as
+/// progress.  `g_tally_dropped` below is the safeguard, because it counts the
+/// event rather than restating the intent.
+const TALLY_CAP: i64 = 256;
 
 /// Per-site tallies.  Zero-initialized in BSS; indexed by `Site`.
-mut g_tally: u64[64];
+mut g_tally: u64[256];
+
+/// Bumps discarded because the site's index was outside `g_tally`.
+///
+/// Detects exactly the false zeros: a site past the end that WOULD have fired
+/// increments this, while one that never fires has a genuine 0 either way.
+/// Nothing here is hand-maintained, so it cannot rot the way the capacity did.
+mut g_tally_dropped: u64 = 0;
 
 /// Suspend depth.  Non-zero means "a measurement is currently re-running
 /// production lookups; record nothing".
@@ -121,6 +134,20 @@ type enum Site {
     VisWouldReject;
     VisRejectUnreachable;
     VisRejectNotPublic;
+
+    // Where the SCOPE-call lane's use site came from (`Pair` in `Pair::new`).
+    // The rows above say what a gate would reject; these say whose namespace it
+    // would have been judged against, which is the half that decides whether a
+    // rejection is a defect in the source or an artifact of the caller.  Diff is
+    // the one to read: it counts the scope names whose writing module and
+    // ambient cursor disagree, i.e. exactly the set the cursor was mis-judging.
+    ScopeUseSyntax;
+    ScopeUseCursor;
+    ScopeUseDiff;
+
+    // A default type argument expanded with no owning module on its template,
+    // so it resolved against the caller instead of the file it was written in.
+    DefaultArgNoOwner;
 
     // Leaf-index consumers, bumped on a HIT (an answer actually produced).
     LeafViaResolveNamed;
@@ -224,7 +251,10 @@ implement enum Site {
     bump(&this) -> void {
         if (g_suspend > 0) { return; }
         const i: i64 = this as i64;
-        if (i < 0 || i >= TALLY_CAP) { return; }
+        if (i < 0 || i >= TALLY_CAP) {
+            g_tally_dropped = g_tally_dropped + 1;
+            return;
+        }
         g_tally[i] = g_tally[i] + 1;
     }
 
@@ -265,6 +295,10 @@ implement enum Site {
             Site::BareAltsViaScoped     => { "B3 " }
             Site::BareAltsViaCanonical  => { "B1 " }
             Site::BareAltsViaAmbigDiag  => { "B1 " }
+            Site::ScopeUseSyntax        => { "   " }
+            Site::ScopeUseCursor        => { "   " }
+            Site::ScopeUseDiff          => { "   " }
+            Site::DefaultArgNoOwner     => { "!! " }
             Site::VisFastpath           => { "   " }
             Site::VisWouldReject        => { "!! " }
             Site::VisRejectUnreachable  => { "   " }
@@ -340,6 +374,10 @@ implement enum Site {
             Site::BareAltsViaScoped     => { "  by caller: resolve_qualified_scoped" }
             Site::BareAltsViaCanonical  => { "  by caller: canonical_qualified" }
             Site::BareAltsViaAmbigDiag  => { "  by caller: sema ambiguity diag" }
+            Site::ScopeUseSyntax        => { "scope use site from the SYNTAX's own module" }
+            Site::ScopeUseCursor        => { "  no provenance: fell back to the cursor" }
+            Site::ScopeUseDiff          => { "  syntax != cursor (the mis-judged set)" }
+            Site::DefaultArgNoOwner     => { "default arg expanded with NO owning module" }
             Site::VisFastpath           => { "single-candidate fast path taken" }
             Site::VisWouldReject        => { "  WOULD BE REJECTED once gated" }
             Site::VisRejectUnreachable  => { "    cause: namespace not reachable" }
@@ -588,6 +626,19 @@ public function home_empty(site_file: string, site_line: i32,
     fmt::eprintf("RN-HOME-EMPTY\t%s:%d\t%s\n", site_file, site_line, origin);
 }
 
+/// Log a default type argument expanded WITHOUT its template's own module.
+///
+/// `expand_default_type_args` re-homes on `entry.module_name` because a default
+/// annotation is syntax written in the TEMPLATE's file.  When the entry carries
+/// no module the re-home is skipped and the default resolves against whichever
+/// module asked for the expansion, so one declaration's default binds
+/// differently per caller.  A count cannot say WHICH template lost its owner,
+/// and the template is the only actionable part.
+public function default_arg_no_owner(template: string, fallback_home: string) -> void {
+    if (!Audit::Named.enabled()) { return; }
+    fmt::eprintf("DEF-ARG-NO-OWNER\t%s\t%s\n", template, fallback_home);
+}
+
 /// Log one QUALIFIED PATH that a namespace-suffix matcher resolved, to size
 /// the migration §5.1 ("first segment resolves in scope, remainder rooted")
 /// implies.  `docs/name-resolution.md` §9 / plan R4.
@@ -681,6 +732,7 @@ public function reset() -> void {
     for (mut i: i64 = 0; i < TALLY_CAP; i++) {
         g_tally[i] = 0;
     }
+    g_tally_dropped = 0;
 }
 
 /// Whether `CRYO_RESOLVE_COUNTER` is set in the environment.
@@ -709,6 +761,19 @@ public function report() -> void {
     fmt::eprintf("  calls.  Totals are taken over a DISJOINT selection and\n");
     fmt::eprintf("  count site events, not distinct resolutions.\n");
     fmt::eprintf("\n");
+
+    // Printed FIRST, and loudly: every row below is unreadable while this is
+    // non-zero, because the rows that lost their bumps still print a plausible
+    // 0.  A gate comparing those zeros to a golden would read the blindness as
+    // progress rather than as an unmeasured counter.
+    if (g_tally_dropped > 0) {
+        fmt::eprintf("!! TALLY OVERFLOW: %llu bumps discarded -- a Site index is\n",
+                     g_tally_dropped);
+        fmt::eprintf("!! outside g_tally (capacity %d).  Rows below may read 0\n",
+                     TALLY_CAP);
+        fmt::eprintf("!! WITHOUT having been measured.  Raise TALLY_CAP.\n");
+        fmt::eprintf("\n");
+    }
 
     fmt::eprintf("-- resolve_named cascade (types/resolver.cryo:1324) ----\n");
     Site::RnCalls.print_row();
@@ -745,6 +810,10 @@ public function report() -> void {
     Site::BareAltsViaAmbigDiag.print_row();
 
     fmt::eprintf("\n-- visibility gate blast radius (spec §8.1) -----------\n");
+    Site::ScopeUseSyntax.print_row();
+    Site::ScopeUseCursor.print_row();
+    Site::ScopeUseDiff.print_row();
+    Site::DefaultArgNoOwner.print_row();
     Site::VisFastpath.print_row();
     Site::VisWouldReject.print_row();
     Site::VisRejectUnreachable.print_row();

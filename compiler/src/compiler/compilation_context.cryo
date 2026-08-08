@@ -16,6 +16,7 @@ import Compiler::Diag::{
     Snapshot, Config, Renderer, Severity, Sink, Diagnostic
 };
 import Compiler::Passes::PassID;
+import Compiler::ResolveCounter;
 import Compiler::Types;
 import Compiler::Types::{ TypeRef, Arena, Registry, Resolver, GenericRegistry };
 import Compiler::Mono::Monomorphizer;
@@ -458,6 +459,57 @@ public:
     scope_is_ambiguous(&this, bare: SymbolStr,
                        origin_file: string, origin_line: i32) -> boolean {
         return this.resolve_scoped(bare, origin_file, origin_line).is_ambiguous();
+    }
+
+    /// `resolve_scoped`, judged against the module that WROTE the name rather
+    /// than the module the compiler is standing in.
+    ///
+    /// A bare leaf means what it means in the module whose source text contains
+    /// it, and that is not the ambient cursor: a generic body is re-typed with
+    /// the cursor parked on the module owning the RECEIVER, so a name there is
+    /// judged against a module that never wrote it, and the verdict describes
+    /// the walk rather than the source (spec §5.2).
+    ///
+    /// `span_file` is the node's own `span.file`, so the answer travels with the
+    /// syntax.  When it names no module in the graph (synthesized nodes,
+    /// single-file mode) this falls back to the cursor rather than to "no
+    /// scope": an invalid namespace compares unequal to every real one, so
+    /// judging against it would read missing provenance as "written somewhere
+    /// else" and reject everything - the false-positive direction that reverted
+    /// the visibility gate once.  The fallback is counted AND reported as the
+    /// `Cursor` origin, so a run can never confuse "provenance was available"
+    /// with "provenance agreed with the cursor".
+    resolve_scoped_at(&this, bare: SymbolStr, span_file: string,
+                      origin_file: string, origin_line: i32) -> ScopeResolution {
+        const syn: SymbolStr = this.module_ns_sym_of_file(span_file);
+        if (!syn.is_valid()) {
+            ResolveCounter::Site::ScopeUseCursor.bump();
+            return this.resolve_scoped(bare, origin_file, origin_line);
+        }
+        ResolveCounter::Site::ScopeUseSyntax.bump();
+        if (syn.id != this.current_module_ns().id) {
+            ResolveCounter::Site::ScopeUseDiff.bump();
+        }
+        return this.decl_index.resolve_qualified_scoped(
+            bare, syn, this.intern_table, origin_file, origin_line, "Syntax");
+    }
+
+    /// `resolve_scoped_at(..).resolved_or(bare)` - the syntax-scoped twin of
+    /// `resolve_scoped_or`.
+    resolve_scoped_or_at(&this, bare: SymbolStr, span_file: string,
+                         origin_file: string, origin_line: i32) -> SymbolStr {
+        return this.resolve_scoped_at(bare, span_file, origin_file, origin_line)
+                   .resolved_or(bare);
+    }
+
+    /// `scope_is_ambiguous` judged against the writing module.  A caller that
+    /// binds with `resolve_scoped_or_at` must ask this rather than
+    /// `scope_is_ambiguous`, or the diagnostic and the binding are answers to
+    /// one question from two different modules.
+    scope_is_ambiguous_at(&this, bare: SymbolStr, span_file: string,
+                          origin_file: string, origin_line: i32) -> boolean {
+        return this.resolve_scoped_at(bare, span_file, origin_file, origin_line)
+                   .is_ambiguous();
     }
 
     /// Temporarily override the active namespace (e.g., for scope switching in sema).
