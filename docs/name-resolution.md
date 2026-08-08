@@ -2899,11 +2899,70 @@ Cross-checking the `VIS-VIOLATION` stream against `CRYO_RN_AUDIT` splits them:
   events and **zero** `RN` lines — no context with that home ever resolves `Str`
   through `resolve_named`. Those arrive through the cursor-based callers.
 
-Which of the three cursor callers dominates is **not** measured: the stream
-carries no construction-site column, and `resolve_scoped`'s own 26 callers would
-collapse into one wrapper location unless it forwards `FILE`/`LINE` the way
-`ResolutionContext` does. That is the instrument to build before the gate, and
-the shape is §8.2p's.
+Which of the three cursor callers dominates was not measurable from that stream:
+it carried no construction-site column. §8.2u builds it.
+
+### 8.2u The gate's rejections are 88% the caller's cursor — MEASURED 2026-08-07
+
+`resolve_qualified_scoped` now takes `origin_file`, `origin_line` and `origin`
+alongside `use_site_ns`, on the reasoning that made `home_origin` required: a
+namespace is only as good as the caller's claim about it, and the claim is not
+recoverable from the value. Every caller passes `FILE`/`LINE`; the three
+cursor-based ones pass `Cursor` by construction rather than by inspection, and
+2c passes `ctx.home_origin.display_name()`. `CompilationContext::resolve_scoped`
+takes the site from **its** caller rather than naming itself — the
+`ResolutionContext::clone` rule, without which its 23 call sites collapse into
+one wrapper location and the wrapper reads as the whole population.
+
+Pure instrumentation: the B1/B3 counter block is identical to the run before it,
+and the (name → resolved type) multiset over all 11,495 resolutions is unchanged.
+
+**Attribution is exhaustive** — 4,215 of 4,215, no event reports an unknown site.
+Crossed with §8.2t's question (does the use site's own source contain the leaf at
+all?):
+
+| claimed provenance | use site writes the leaf | events | share |
+|---|---|---:|---:|
+| `Cursor` | never | 3,702 | 87.8% |
+| `Syntax` | never | 472 | 11.2% |
+| `Syntax` | unmapped (`Main`, and it does not write it either) | 32 | 0.8% |
+| `Cursor` | yes | 7 | 0.2% |
+| `Syntax` | yes | 2 | 0.0% |
+
+The nine that "write the leaf" are §8.2t's own doc-comment false positives
+(`allocator → String`/`RawBuffer`, `io::traits → File`), read by hand and
+confirmed. **After the three imports, no would-be rejection is a name its use
+site actually wrote.**
+
+Three classes remain, and none of them is a source migration:
+
+- **3,702 — the caller handed over the ambient cursor.** Five sites in
+  `sema/call_resolver.cryo` supply 3,549 of them (`:3741` and `:3548` at 1,014
+  each; `:220`, `:3454`, `:4964` at 507 each). A gate would reject a name because
+  of where the compiler was standing.
+- **214 — laundered provenance at `mono/ast_resolver.cryo:90`**, all
+  `option`/`result` → `Formatter`/`FmtError`. The site scopes by the template
+  *entry's* module and labels it `Syntax`; `implement Display for Option<T>` is
+  written in `std::fmt::display` while the entry's module is `std::core::option`.
+  Its own comment concedes the two-homes-one-context problem. §8.2t inferred 107
+  of these by cross-referencing `RN`; the direct instrument says 214, and the
+  direct number supersedes the inference.
+- **~290 — a default type argument resolved at the use site.** Every remaining
+  `Syntax` row is `… → std::alloc::allocator::GlobalAlloc`, spread across
+  `json::value`, `json::parser`, `json::serializer`, `fs::metadata` and `Main`.
+  `std::json::value` uses `String`/`Array` 68 times, **never writes
+  `GlobalAlloc`**, and does not import `std::alloc::allocator`. The default in
+  `type struct String<A = GlobalAlloc>` is written in `std::collections::string`,
+  so by §8.2r's rule its scope is that file — but it is expanded and then
+  resolved against whoever wrote `String`. This is the declaration-carries-the-
+  scope defect again, in a shape none of the earlier sections reached, and it is
+  the one that cannot be fixed by adding imports: it would demand
+  `import std::alloc::allocator` in every module that names a `String`.
+
+⇒ Turning the gate on is gated on all three, in that order of size. The first is
+a scope problem in `call_resolver`, the second is the split
+`ast_resolver.cryo:90` already documents as owed, and the third is a defect this
+measurement found.
 
 ### 8.3 B2 is unmeasured
 
