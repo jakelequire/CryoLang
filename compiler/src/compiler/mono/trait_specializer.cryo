@@ -6,8 +6,9 @@
 /// the standalone `TraitChecker` (shared with sema).
 ///
 /// Plain `type struct` collaborator: env back-pointers + a `TraitChecker*`, set by
-/// `wire()`.  Holds no worklist/cache state (it never enqueues), so it takes no
-/// `MonoState`.
+/// `wire()`, plus a `ModuleGraph*` set separately by `set_module_graph` (the
+/// graph is not available at wire time).  Holds no worklist/cache state (it
+/// never enqueues), so it takes no `MonoState`.
 
 namespace Compiler::Mono::TraitSpecializer;
 
@@ -20,6 +21,7 @@ import Compiler::Types::{
 import Compiler::Types::TraitChecker;
 import Compiler::Diag::Sink;
 import Compiler::Resolver::{ InternTable, SymbolStr };
+import Compiler::ModuleGraph;
 import std::alloc::allocator;
 
 
@@ -30,6 +32,10 @@ type struct MonoTraitSpecializer {
     diagnostics:      DiagnosticSink*;
     type_resolver:    TypeResolver*;
     trait_checker:    TraitChecker*;
+    // File -> namespace map, for scoping a context by the file the syntax it
+    // resolves was written in rather than by the module that demanded the
+    // specialization.  See `MonoAstResolver.module_graph`.
+    module_graph:     ModuleGraph*;
 
     static null() -> MonoTraitSpecializer {
         return MonoTraitSpecializer {
@@ -39,6 +45,7 @@ type struct MonoTraitSpecializer {
             diagnostics:      null,
             type_resolver:    null,
             trait_checker:    null,
+            module_graph:     null,
         };
     }
 
@@ -51,6 +58,17 @@ type struct MonoTraitSpecializer {
         this.diagnostics      = diagnostics;
         this.type_resolver    = type_resolver;
         this.trait_checker    = trait_checker;
+    }
+
+    set_module_graph(mut &this, graph: ModuleGraph*) -> void {
+        this.module_graph = graph;
+    }
+
+    /// The module that WROTE `file`, or "" when the graph cannot say.  See
+    /// `ModuleGraph::home_ns_of_file` for why "" must not become a fallback to
+    /// the cursor.
+    home_ns_of(&this, file: string) -> string {
+        return ModuleGraph::home_ns_of_file(this.module_graph, this.intern_table, file);
     }
 
 
@@ -117,7 +135,14 @@ type struct MonoTraitSpecializer {
         const trait_ann: TypeAnnotation* = impl_node.trait_annotation;
         if (trait_ann == null) { return out; }
 
-        mut ctx: ResolutionContext = ResolutionContext::new(FILE, LINE, "", "", "", HomeOrigin::Unset);
+        // The trait args below are the `implement` block's own text, so their
+        // scope is the file that block is written in.  The subject type cannot
+        // stand in for it - an `implement` block may live in a third module - and
+        // the ambient cursor names whichever module demanded this query, not the
+        // one that wrote the annotation.
+        mut ctx: ResolutionContext = ResolutionContext::new(
+            FILE, LINE, "", "",
+            this.home_ns_of(impl_node.span.file), HomeOrigin::Syntax);
         // Arg count via the view: the subject may be a pre-mono wrapper OR a
         // post-mono concrete carrying its own args.  A bare `kind ==
         // InstantiatedType` test here would skip the bindings for every concrete
