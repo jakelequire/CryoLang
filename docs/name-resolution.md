@@ -3396,6 +3396,92 @@ points hold byte-identically.
 context**, which is what §8.2v recorded as owed, and the site's `Syntax` label is
 now honest rather than laundered. What remains at it is **1** event, not 245.
 
+### 8.2aa An annotation TREE is not written in one place — MEASURED 2026-08-08
+
+§8.2w recorded that a default type argument is *spliced*, not expanded: the
+template's own default annotation is cloned into a use site's argument list and
+keeps its own span. What that implies for resolution had not been drawn.
+`TypeResolver::resolve` descends through `Pointer`/`Reference`/`Array`/`Generic`
+children carrying ONE context, so a tree assembled from two files is judged
+entirely at the enclosing declaration's module. `String<A = GlobalAlloc>`'s
+default is then whatever `GlobalAlloc` means in the module that named `String` —
+a different answer per caller, and a module that neither writes nor imports it.
+
+**Size of the population.** A probe in the `Named` arm reporting the annotation's
+own span file against the home its context carried: **6,575** named-annotation
+resolutions, of which **573 (8.7%)** were homed at a module other than the one
+their span names. The gate's rejections were the visible edge of it — **137** of
+the 143 `Syntax`-origin would-be rejections, every one of them `GlobalAlloc`,
+across four context sites (`TypeResolutionRunner::make` 57,
+`compute_static_owner_bindings` 30, `try_resolve_generic_return` 29,
+`resolve_generic_scope_name` 20, one more at `type_resolution.cryo:3659`).
+
+The remaining 436 were binding correctly by coincidence: their carried home and
+the annotation's real module disagreed about the *module* while agreeing about
+the *answer*.
+
+**The fix** is one helper, `resolve_named_at_span`, at the only two places that
+turn an annotation into a name lookup (`resolve`'s `Named` arm and
+`resolve_generic`'s `Named` base — there are no others, in this file or any
+other). It takes the home from the annotation's own span and RESTORES the
+caller's afterwards, because the context is shared with the rest of the tree and
+a home that outlives the node it came from is the same defect one level down. An
+empty answer keeps the caller's home rather than clearing it: missing provenance
+read as a namespace compares unequal to every real module, the false-positive
+direction that reverted the gate once (§8.1e). File → module is exact and total —
+a `.cryo` file declares exactly one namespace — so the question always has an
+answer where the span has a file.
+
+**The prediction was wrong, and that is the finding.** Predicted 265 → 128;
+measured **323**. The 137 did go to zero, but `TypeResolutionRunner::make` went
+**57 → 196**. Re-homing had not created those; it had stopped hiding them.
+
+`rewrite_this_type_annotation` mints the concrete annotation that replaces `This`
+in a trait default cloned into an impl. It took the **name** from the impl's
+target (`HashMapIter`) and the **span** from the trait's `This` token
+(`std::core::iter`), and left `pre_resolved` invalid, so the name had to be
+re-derived by scope. Name and provenance named different modules. While the home
+came from the enclosing walk it landed on the implementing type's module — right
+by accident — and homing on the span exposed every one at once: 16 pairs of the
+shape `<trait module> → <implementor>::<Iter type>`.
+
+**The control that settles it:** `stdlib/core/iter.cryo` contains **zero**
+occurrences of `HashMapIter`, and `stdlib/io/traits.cryo` zero of `Stdin`, while
+13 and 8 annotations respectively carried those files as their span. A file
+cannot be the provenance of a name it never writes. The span, not the re-home,
+was the lie.
+
+Giving the rewritten annotation the impl's span (`target_type_span`, else the
+block) is the root fix: the name written IS the impl's target, so the syntax it
+stands for was written in the impl's file. Neither the trait's file nor the
+target type's can stand in — an `implement` block may live in a third module
+again, which is the same reason `resolver.cryo` already homes assoc-type
+bindings on `impl_node.span.file`.
+
+| | before | span-home only | both |
+|---|---:|---:|---:|
+| would-be rejections | 265 | 323 | **122** |
+| — `Syntax` origin | 143 | 201 | **0** |
+| — `Cursor` origin (mono) | 122 | 122 | 122 |
+| annotations homed off their own span | 573 | — | **0** |
+
+**Controls.** No `(name → answer)` pair exists after that did not exist before
+and none was lost — the sets are identical, so nothing rebound; this changes
+which module a name is JUDGED at, never which declaration it binds to. `B1`
+holds at its golden 12,453 with no re-pin, and the RN row count is unchanged at
+9,419, so no resolution moved down the cascade. `roster-check` OK (2001 tests),
+`api-index-check` up to date, all 14 examples build, `make test` unchanged from
+HEAD (`unit: ok; compile-fail: 170 passed; projects: 18 passed, 1 failed`, the
+one failure being §8.2y's pre-existing readdir defect) — the 170 is the load-
+bearing one, since a moved span could have moved a diagnostic golden and did not.
+`find_module_by_path` is a linear case-insensitive scan and is now on the
+per-annotation path; no build-time regression was measurable, but that is the
+first place to look if one appears.
+
+⇒ **Every `Syntax`-origin rejection is gone.** What the gate would now reject is
+122 events at two mono sites, all of them the ambient cursor of §8.2l — one
+family, not two, and the last one standing between here and turning the gate on.
+
 ### 8.3 B2 is unmeasured
 
 Only the assoc-type projection (62) is instrumented. Sema's method and trait

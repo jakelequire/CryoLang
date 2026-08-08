@@ -356,7 +356,8 @@ type struct TypeResolver {
                 // The base of an explicit `String<...>` is resolved directly in
                 // resolve_generic and deliberately bypasses this, so it is NOT
                 // canonicalized here (which would nest as `String<GlobalAlloc><...>`).
-                this.canonicalize_default_generic_type(this.resolve_named(n.name, ctx))
+                this.canonicalize_default_generic_type(
+                    this.resolve_named_at_span(n.name, n.span, ctx))
             }
             TypeAnnotation::Pointer(p) => {
                 mut inner: TypeRef = this.resolve(p.inner, ctx);
@@ -1392,6 +1393,43 @@ type struct TypeResolver {
         return this.arena.create_instantiation(ty, &filled);
     }
 
+    /// Resolve a named annotation against the module the annotation itself was
+    /// written in, restoring the caller's home afterwards.
+    ///
+    /// An annotation TREE is not written in one place.  A default type argument
+    /// is spliced from the template's file into a use site's argument list and
+    /// keeps its own span, so `String<A = GlobalAlloc>`'s default is syntax in
+    /// `std::collections::string` however the module that named `String` spells
+    /// its imports.  `resolve` descends into children carrying ONE context, so
+    /// without a per-node home the spliced leaf is judged at the enclosing
+    /// declaration - one declaration's default then means a different thing per
+    /// caller, and it names a module those callers neither write nor import.
+    ///
+    /// The home is RESTORED rather than left in place: the context is shared
+    /// with the rest of the tree, and a home that outlives the node it came from
+    /// is the same defect one level down.
+    ///
+    /// An empty answer means the span names no module in the graph (a
+    /// synthesized node, single-file mode) and keeps the caller's home rather
+    /// than clearing it.  Reading missing provenance as a namespace would make
+    /// it compare unequal to every real module - the false-positive direction
+    /// that reverted the visibility gate once.
+    resolve_named_at_span(&this, name: SymbolStr, span: SourceSpan,
+                          ctx: ResolutionContext*) -> TypeRef {
+        if (ctx == null) { return this.resolve_named(name, ctx); }
+        const ann_ns: string = ModuleGraph::home_ns_of_file(
+            this.module_graph, this.intern_table, span.file);
+        if (ann_ns.length() == 0 || ann_ns == ctx.home_module) {
+            return this.resolve_named(name, ctx);
+        }
+        const saved_home:   string     = ctx.home_module;
+        const saved_origin: HomeOrigin = ctx.home_origin;
+        ctx.set_home_module(ann_ns, HomeOrigin::Syntax);
+        const out: TypeRef = this.resolve_named(name, ctx);
+        ctx.set_home_module(saved_home, saved_origin);
+        return out;
+    }
+
 
 private:
     // Dispatch helpers
@@ -1956,7 +1994,7 @@ private:
         // A bare Named base goes straight through resolve_named, bypassing the
         // canonicalization the `resolve()` Named arm applies to bare uses.
         mut base: TypeRef = match (*g.base) {
-            TypeAnnotation::Named(bn) => { this.resolve_named(bn.name, ctx) }
+            TypeAnnotation::Named(bn) => { this.resolve_named_at_span(bn.name, bn.span, ctx) }
             _                         => { this.resolve(g.base, ctx) }
         };
 
