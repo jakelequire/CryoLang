@@ -1,0 +1,116 @@
+/// ============================ TRIPWIRE ==================================
+///
+/// THE TWO `WRONG_` TESTS BELOW PIN BEHAVIOR docs/name-resolution.md SAYS IS
+/// WRONG. They pass today because the compiler is wrong today.
+///
+/// IF YOU ARE HERE BECAUSE ONE STARTED FAILING: that is the intended outcome,
+/// and it means someone landed the fix. Do NOT delete the assertion or relax
+/// the annotation to get back to green. Move the case to a `compile_fail`
+/// project with the right `expect.diagnostic`, in the same change that made it
+/// an error -- exactly as resolution_tripwire's visibility half was moved to
+/// tests/tests/projects/visibility_gate.
+///
+/// ---- WHY THIS EXISTS ALONGSIDE resolution_tripwire ---------------------
+///
+/// That project's leaf is declared ONCE, and cascade 2c answers it from
+/// `resolve_qualified_scoped`'s single-candidate fast path, which never looks
+/// at the use site's imports. This project's leaf is declared TWICE, which
+/// skips that fast path: the multi-candidate branch finds no local candidate
+/// and no imported one, 2c correctly MISSES, and the GLOBAL LEAF INDEX
+/// (cascade step 5) answers instead.
+///
+/// That difference is why this file had to be written. On every other corpus
+/// in the tree step 5 answers ZERO times -- 2c takes every unique leaf before
+/// it is reached -- so a change that deleted the leaf index would look inert.
+/// It is starved, not dead, and only a plural leaf shows it.
+///
+/// ---- WHAT THE ANSWER DEPENDS ON ---------------------------------------
+///
+/// Not scope. The leaf index picks by NAME ORDER: `Alpha` wins over `Omega`
+/// here, and nothing readable from `Orphan` explains why. Renaming the loser
+/// to sort on the other side of the winner moves the binding with it, which
+/// turns a project that passes into one that does not compile. A bare name's
+/// meaning therefore depends on the names of modules the use site has never
+/// heard of.
+///
+/// ========================================================================
+![config(testing)]
+namespace ResolutionLeafIndex::LeafIndexTest;
+
+import std::core::result;
+import std::test::error;
+import std::test::assert;
+
+// ---- KNOWN DEFECT: a plural leaf resolves with NOTHING in scope (§5.1) ----
+//
+// §5.1: "The first segment resolves in scope. There is no substring matching,
+// no suffix matching, and no dependence on what other modules happen to exist
+// in the program."
+//
+// `ResolutionLeafIndex::Orphan` has no `import` statement at all and names
+// `Widget` in two signatures. Two modules declare that leaf and Orphan imports
+// neither, so nothing binds it in Orphan's scope and both signatures must be an
+// unknown-type error.
+//
+// The ANNOTATION is half the assertion: naming `Alpha::Widget` here means a
+// changed bind is an E0200 at build time rather than a silent pass. `tag()` is
+// the other half -- it makes the winner observable at runtime, so the test
+// cannot be satisfied by any `Widget` that happens to round-trip a value.
+
+![test]
+function WRONG_a_static_template_resolves_a_plural_leaf_not_in_its_scope()
+        -> Result<(), TestError> {
+    mut w: ResolutionLeafIndex::Alpha::Widget<i64> =
+        ResolutionLeafIndex::Orphan::Packer::pack(11);
+    expect_eq(w.unwrap(), 11 as i64)?;
+    expect_eq(w.tag(), 1)?;
+    return Result::Ok(());
+}
+
+![test]
+function WRONG_a_free_generic_resolves_a_plural_leaf_not_in_its_scope()
+        -> Result<(), TestError> {
+    mut w: ResolutionLeafIndex::Alpha::Widget<i64> =
+        ResolutionLeafIndex::Orphan::box_up(13);
+    expect_eq(w.unwrap(), 13 as i64)?;
+    expect_eq(w.tag(), 1)?;
+    return Result::Ok(());
+}
+
+/// CONTROL. The leaf really is declared twice, by two distinct types.
+/// Without this, both `WRONG_` tests above would be satisfied by a program in
+/// which `Omega::Widget` did not exist or had collapsed into `Alpha`'s -- and
+/// then they would be pinning the unique-leaf case resolution_tripwire already
+/// covers, through a mechanism they no longer reach.
+![test]
+function CONTROL_the_leaf_is_declared_by_two_distinct_types()
+        -> Result<(), TestError> {
+    mut a: ResolutionLeafIndex::Alpha::Widget<i64> =
+        ResolutionLeafIndex::Alpha::Widget<i64> { v: 17 };
+    mut o: ResolutionLeafIndex::Omega::Widget<i64> =
+        ResolutionLeafIndex::Omega::Widget<i64> { v: 19 };
+    expect_eq(a.tag(), 1)?;
+    expect_eq(o.tag(), 2)?;
+    expect_eq(a.unwrap(), 17 as i64)?;
+    expect_eq(o.unwrap(), 19 as i64)?;
+    return Result::Ok(());
+}
+
+/// CONTROL, and the one that says what the defect actually is. The SAME plural
+/// leaf, named from a module that imports one declarer, binds THAT declarer --
+/// and it is `Omega`, the loser of the leaf index's name-order pick, so this
+/// cannot be the arbitrary answer landing correctly by luck.
+///
+/// It is also the guard on the fix: a change that made `Orphan` an error by
+/// making a bare plural leaf unresolvable everywhere would break this too, and
+/// that is not the specified behavior -- §4's rib chain says an imported
+/// module's export set is in scope.
+![test]
+function CONTROL_an_importing_module_binds_the_module_it_imported()
+        -> Result<(), TestError> {
+    mut w: ResolutionLeafIndex::Omega::Widget<i64> =
+        ResolutionLeafIndex::Importer::Packer::pack(23);
+    expect_eq(w.unwrap(), 23 as i64)?;
+    expect_eq(w.tag(), 2)?;
+    return Result::Ok(());
+}

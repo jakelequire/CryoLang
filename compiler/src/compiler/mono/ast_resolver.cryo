@@ -179,9 +179,14 @@ type struct MonoAstResolver {
             module_name = this.intern_table.resolve(entry.module_name);
         }
         mut res_ctx: ResolutionContext = ResolutionContext::new(FILE, LINE, module_name, "", "", HomeOrigin::Unset);
-        // No home module, for the reason `resolve_specialized_ast` records: this
-        // walks the same substituted clone, so the names it resolves are the
-        // same mix of written annotations and synthesized spec names.
+        // Scoped per body below, not here.  Both kinds of name a `static match`
+        // resolves - the arm patterns the author wrote and the scrutinee the
+        // substituter rewrote to the concrete binding - were written wherever
+        // the BODY was, and a cloned trait default's body lives in the trait's
+        // file while `entry` names the implementing type's module.  The same
+        // walk reached through `prune_static_match_in_block` from the call
+        // specializer is scoped that way already; this entry is the one that
+        // was not, so the two disagreed about the same question.
 
         match (node_kind) {
             NodeKind::StructDeclaration => {
@@ -202,6 +207,8 @@ type struct MonoAstResolver {
             NodeKind::FunctionDeclaration => {
                 const decl: FunctionDeclNode* = ast_node as FunctionDeclNode*;
                 if (decl == null || decl.body == null) { return; }
+                res_ctx.set_home_module(this.home_ns_of((decl as ASTNode*).span.file),
+                                        HomeOrigin::Syntax);
                 this.prune_static_match_in_block(decl.body, &res_ctx);
             }
             NodeKind::ImplementationBlock => {
@@ -227,6 +234,14 @@ type struct MonoAstResolver {
             // would fail (E0900).  Skip them; the per-call path handles them.
             if (method.func.is_generic()) { continue; }
             if (method.func.body != null) {
+                // Re-scoped for EVERY method, never skipped: the context is
+                // shared across the walk, so leaving a previous method's home
+                // in place would bind the next body's bare names in the wrong
+                // module with no diagnostic.  An empty answer resetting it to
+                // `Unset` is the honest outcome, not a case to skip.
+                res_ctx.set_home_module(
+                    this.home_ns_of((method.func as ASTNode*).span.file),
+                    HomeOrigin::Syntax);
                 this.prune_static_match_in_block(method.func.body, res_ctx);
             }
         }

@@ -2614,6 +2614,297 @@ the parser accepts only a bare identifier as an inherent impl target —
 `implement struct Gadget`, never `implement Widget::Gadget`. Where the code and
 the grammar disagree, the code is the defect.
 
+### 8.2s The chain below 2c is starved, and 2c answers out of scope — MEASURED 2026-08-07
+
+Two sites carried the whole remaining below-2c population. Both are the §8.2r
+mechanism — the declaration carries the scope — applied where the declaration is
+an `implement` block and a method body.
+
+**`mono/trait_specializer.cryo` `concrete_trait_args_for`** resolves
+`impl_node.trait_annotation`'s args, which are the `implement` block's own text,
+so the scope is `impl_node.span.file`. It is the same shape as
+`resolve_concrete_member` and takes the same answer. `MonoTraitSpecializer` had
+no `ModuleGraph*`; it gained one from `Monomorphizer::set_module_graph`, which
+already cascaded to the two collaborators that build contexts.
+
+**`mono/ast_resolver.cryo` `prune_static_match_arms`** was unscoped *on purpose*,
+and the stated reason does not survive its own sibling. The site records that it
+resolves "a mix of written annotations and synthesized spec names", and that a
+synthesized name has no home to be right about. But the **same walk**
+(`prune_static_match_in_block`) is entered from `call_specializer.cryo:1191` with
+a context scoped by the body's span, and there a synthesized spec name resolves
+at 2c under that scope:
+
+```
+RN  2c-home-syntax  home=std::collections::string  cursor=std::io::stdio
+    6String$LN$L3std.5alloc.9allocator.11GlobalAlloc$G$G  ->  std::collections::string::String<...>
+```
+
+Two entry points into one walk, disagreeing about one question. The spec name is
+registered under the module the body was written in, which is the module the span
+names, so both kinds of name take the same scope. The walk now re-scopes from
+each body's own span — for **every** method, never skipped, because the context
+is shared and a home that outlives its node binds the next body's bare names in
+the wrong module (§8.2q's reset rule).
+
+Measured on `examples/09-json-config`, predicted per row before the edit:
+
+| row | before | trait args | static-match arms |
+|---|---:|---:|---:|
+| 3b DI canonical | 11 | 3 | **0** |
+| 5 leaf index | 8 | **0** | 0 |
+| 2c\* syntax provenance | 7,230 | 7,246 | **7,249** |
+| below 2c | 34 | 18 | **15** |
+| calls (total) | 11,495 | 11,495 | **11,495** |
+| B1 | 12,470 | 12,462 | **12,462** |
+
+**Every cascade row below 2c is zero on this target** — 3a, 3b, 3c, 4, 4a and 5
+all answer nothing. B1 fell by exactly the 8 leaf-index answers and no more,
+because 3b is a B3 row; `by caller: canonical_qualified` held at 2,527, the
+stated condition under which B1 would have moved further.
+
+**On this target.** A second target says the chain is not empty, and says
+something better: measured on `resolution_tripwire`'s *test* build, 19 answers
+remain below 2c after this change, and they fall into two kinds that the
+09-json-config population happened to hide.
+
+| answers | site | shape |
+|---:|---|---|
+| 12 | `passes/type_resolution.cryo:60` (3b, home **set**) | `syscall::STARTUPINFOA`, `mpsc::Receiver`, `thread::Scope` |
+| 3 | `passes/type_resolution.cryo:60` (3a, home **set**) | `ResolutionTripwire::Depot::Crate`, fully literal |
+| 4 | `sema/method_binding.cryo:475` (3b, home **none**) | bare `Result` |
+
+The first fifteen are **not a scope gap at all**: 2c runs only for a bare leaf
+(`!contains_separator`), so an abbreviated rule-6 path skips it by construction
+and 3a/3b are the lane that answers it. Those rows cannot go to zero by scoping
+anything — they need §5.1's "first segment in scope, remainder rooted", which is
+`resolve_path`. **3b is the qualified-path answerer, and deleting it is gated on
+`resolve_path` existing, not on the bare-leaf supply drying up.**
+
+The last four are a genuine unscoped supplier, and they correct §8.2p: that
+section lists `method_binding.cryo:475` among the sites that "run unscoped and
+answer entirely above 2c". That was true of `09-json-config` and is false here.
+"Seven suppliers" was always a statement about one program; this is what it costs
+to read it as a statement about the compiler.
+
+**No answer changed.** The multiset of (name → resolved type) over all 11,495
+resolutions is byte-identical before and after, across 353 distinct pairs. This
+is a route change, and the counter is what pins it.
+
+The 15 that remain are all `X-failed`, and the earlier classification of them was
+wrong in a way worth correcting: **9 carry a scope and 6 do not**
+(`sema/sema.cryo:3336`, home `<none>`). The conclusion is unchanged but for a
+different reason — five of the six names are the generic param `T` and the sixth
+is `(`, and no module scope can answer a generic param. They are an
+unbound-binding defect, not a scope one.
+
+#### The starvation does not reach the tripwire, and that was assumed
+
+§8.2q and §8.2r both state that scoping cannot flip the two `WRONG_` tests in
+`tests/projects/resolution_tripwire` and that **deleting step 5 is what flips
+them**. Measured against the tripwire project itself, that is false:
+
+```
+RN  2c-home-syntax  home=ResolutionTripwire::Orphan  Crate  ->  ResolutionTripwire::Depot::Crate
+```
+
+`Orphan` has no `import` statement at all. The bare `Crate` is answered by **2c**,
+under a home module that is correct and that cannot see the name — four of its
+five resolutions, at `type_resolution.cryo:60` and `ast_resolver.cryo:90`. Step 5
+answers **0** on that project too, and the tests still pass. The pre-session
+compiler produces the identical rows, so this is pre-existing and not the
+starvation's doing; what is new is that nothing below 2c is left to blame.
+
+The mechanism is 2c's import-scoped arm calling
+`DeclarationIndex::resolve_qualified_scoped`, whose single-candidate fast path
+(`decl_index.cryo:1342`) computes the reachability verdict, counts what a gate
+would reject, and then returns `Unique` regardless. That is the fast path §1
+names as the root cause, reached through the step that was supposed to be the
+scope-respecting one. The arm's own comment claims it "cannot bind to some
+unrelated same-leaf type in a module the home module never imported" — true only
+while the leaf has two candidates. For a leaf that is unique program-wide the
+imports are never consulted, and that is exactly the tripwire's shape.
+
+⇒ **Deleting 3b/4/4a/5 cannot flip the tripwire.** They answer nothing, so the
+flip is gated on the fast path, which is §3.3's enforcement for the type lane and
+needs the same decision the function lane got in §8.1f.
+
+**But "they answer nothing" is a property of the corpus, not of the code**, and
+one A/B says so. Copy `resolution_tripwire` out of the tree, add a second module
+declaring the leaf `Crate`, and import that module from the *test* file only —
+`Orphan` still imports nothing, which is the property under test:
+
+| variant | who answers `Crate` in `Orphan` | result |
+|---|---|---|
+| unique leaf (the corpus today) | **2c**, `home=Orphan` | binds `Depot::Crate`, tests pass |
+| leaf declared twice | **5 GLOBAL LEAF INDEX**, `home=Orphan` | binds `Decoy::Crate` — the wrong one — and the tests fail `E0200` |
+
+Two candidates skip the fast path, the multi-candidate branch finds no local and
+no imported candidate, `resolve_qualified_scoped` returns `NotFound`, and 2c
+misses exactly as it should. The leaf index then answers out of scope and picks
+by declaration order. So the deletion is not cosmetic: **step 5 is live, it is
+merely starved by 2c grabbing every unique leaf first**, and a plural leaf with
+nothing in scope is a wrong bind today that surfaces as a type error at the use
+site rather than as a resolution diagnostic.
+
+#### The corpus entry that pins it — `tests/projects/resolution_leaf_index`
+
+That A/B is now a project, and it had to be a **separate** one: adding the second
+declaration inside `resolution_tripwire` makes its two existing `WRONG_` tests
+fail, because the leaf they depend on stops being unique.
+
+`Alpha` and `Omega` both declare `Widget<T>`, distinguished by a `tag()` method
+so the winner is observable at runtime and not only in a type annotation.
+`Orphan` imports neither and names bare `Widget` in a static template and a free
+function — sema's two binding doors. Measured, `Orphan`'s four resolutions are
+**step 5**, answering `Alpha::Widget`; `Importer`, which imports `Omega`, is
+answered by **2c**.
+
+`Importer` is the control that says what the defect is, and it is built so it
+cannot pass by luck: `Omega` **loses** the name-order pick, so binding it is only
+explicable by the import. It also guards the fix in the other direction — a
+change that made `Orphan` an error by making every bare plural leaf unresolvable
+would break `Importer` too, and §4's rib chain says an imported module's export
+set is in scope.
+
+**The pin was verified by breaking the property, not by observing green.**
+Renaming `Omega` to a name that sorts before `Alpha` — changing nothing about
+`Orphan`, which still imports nothing — moves the binding with the rename and
+both `WRONG_` tests fail to build. So the tests are pinned to *which* module the
+leaf index picks, and a change in the pick cannot pass silently.
+
+#### A body's bare struct literal does not take the scoped path
+
+Building that control surfaced a defect, and it reproduces on the pre-session
+compiler, so it is pre-existing. In `Importer`:
+
+```cryo
+static pack<T>(v: T) -> Widget<T> {     // annotation  -> Omega::Widget  (2c, imported)
+    return Widget<T> { v: v };          // literal     -> Alpha::Widget  (leaf index)
+}
+```
+
+`error[E0200]: expected Omega::Widget<i64>, found Alpha::Widget<i64>` — **the
+function fails to typecheck against its own return annotation**, because the
+annotation resolves through the scoped path and the body's struct literal does
+not. This is the §8.2r trait-default family in its simplest possible shape: no
+traits, no generics beyond one param, no monomorphization — one module, one
+function, two answers for one written leaf. The literal is written qualified in
+the corpus so the control isolates the annotation, with the reason stated at the
+site.
+
+Sized on two targets, so the rate is available and not only the total:
+
+| target | single-candidate fast paths | would be rejected once gated | of which not public |
+|---|---:|---:|---:|
+| `examples/09-json-config` | 40,673 | 4,278 (10.5%) | 0 |
+| `resolution_tripwire` | 50,881 | 5,098 (10.0%) | 0 |
+
+Every rejection is **unreachable** (the use site never imported the namespace),
+none is a private candidate. Read the number as "what a gate would reject given
+today's `use_site_ns` inputs", which are a mix of syntax provenance and ambient
+cursor — §8.1e is the record of what happens when a cursor-derived use site
+reaches a gate.
+
+#### A zero that needed a control, and got one
+
+`5 GLOBAL LEAF INDEX = 0` does **not** mean the global leaf index is unused.
+`lookup_by_leaf` is still called 5,051 times with 1,440 hits on the same run —
+it fell by exactly the 8 answers cascade step 5 lost. The other callers are the
+qualified-path lane (`canonical_qualified`, 2,527), which answers a different
+question and which §8.2m's coupling note already flagged as load-bearing for
+reaching a shadowed type by its qualified path. The trap-list rule that B1's flag
+is a family label rather than a summation set applies to the deletion plan too:
+retiring cascade step 5 does not retire the leaf index.
+
+### 8.2t The gate's migration set is three imports — MEASURED 2026-08-07
+
+§8.2s sized what a gate at `decl_index.cryo:1342` would reject (4,278 on
+`examples/09-json-config`) and said the number could not be read until each
+rejection was attributed. The instrument for that **already existed**:
+`CRYO_VIS_AUDIT` has emitted `VIS-VIOLATION <use-site> <candidate>` per event all
+along. What was missing was not compiler code but a question asked of its output.
+
+**The classifier.** For each event, does the use site's own source contain the
+candidate's leaf as a token at all? If it does not, that module cannot have
+written the name, so the `use_site_ns` handed to the gate is the ambient cursor
+(or a synthesized call), not the syntax's home. Token-*present* does not prove
+the use site wrote that particular occurrence, so this is a **lower bound** on
+the cursor share.
+
+| bucket | events | share |
+|---|---:|---:|
+| use site never writes the leaf — cursor artifact | 4,174 | 97.6% |
+| use site does write the leaf — candidate violation | 72 | 1.7% |
+| use site outside `stdlib`, unmapped (`Main`) | 32 | 0.7% |
+
+72 is six distinct pairs, so they were read rather than counted. **Three are
+real** — a module using a leaf whose namespace it does not import, with
+`std::core::drop` confirmed absent from `stdlib/prelude.cryo`'s re-export list:
+
+| module | leaf | uses |
+|---|---|---|
+| `std::collections::hashmap` | `NonNull` | 5 annotations and constructor calls |
+| `std::io::stdio` | `Drop` | 3 `implement trait Drop for …` |
+| `std::future::waker` | `Drop` | 1 `implement trait Drop for …` |
+
+The other three (`allocator → String`, `allocator → RawBuffer`,
+`io::traits → File`) are the classifier's own false positives: every mention is
+in a doc comment. The unmapped 32 are `Main → GlobalAlloc`, and the example's
+source never writes `GlobalAlloc` either, so they join the cursor bucket.
+
+**The migration is three `import` statements.** Added, and predicted per row
+before the edit: `VIS-VIOLATION` **4,278 → 4,215** (−63, exactly the genuine
+events), every cascade row unchanged (2c\* 7,249 · below-2c 15 · calls 11,495),
+and the (name → resolved type) multiset over all 11,495 resolutions **identical**
+to the pre-session compiler. The imports make the source say what it already
+meant; no binding moved.
+
+One row moved that was **not** predicted, and it is recorded rather than
+absorbed: `lookup_by_leaf` fell by **9** on both targets (B1 12,462 → 12,453,
+re-pinned), the three names now resolving through the import-scoped arm instead.
+Nine is also the number of source *uses* the imports cover (`NonNull` ×5,
+`Drop` ×3+1), but that attribution is **unconfirmed**: the only instrument that
+could tie a leaf lookup to a name — `CRYO_LEAF_AUDIT`'s `LEAF-HIT` — reports
+cascade step 5's *answers*, which are zero on this target, so it emits nothing
+here. `lookup_by_leaf` and step 5 are different populations, which is the
+family-label trap arriving a third time in one session.
+
+⇒ **Zero genuine §5.1 violations remain on this target**, and the 4,215 that
+remain are, to the limit of this measurement, entirely use sites that never wrote
+the name. The gate is therefore **not** blocked on migrating source. It is
+blocked on `resolve_qualified_scoped` being handed a use site with real
+provenance — which is precisely §8.1e's conclusion for the function lane,
+now measured for the type lane rather than inherited from it.
+
+#### Which caller supplies them — partially measured
+
+`resolve_qualified_scoped` has four callers. Three pass the ambient cursor by
+their own contracts: `CompilationContext::resolve_scoped` (26 call sites,
+`current_module_ns()` — "the module currently being processed") and
+`call_specializer.cryo:542` / `:1299` (`current_ns`). Only 2c passes
+`ctx.home_module`, whose origin is known.
+
+Cross-checking the `VIS-VIOLATION` stream against `CRYO_RN_AUDIT` splits them:
+
+- **107 are 2c**, and they match exactly — `option → Formatter` (56) and
+  `result → Formatter` (51) appear in both streams with those counts, all from
+  `mono/ast_resolver.cryo:90`. That site scopes by the **template entry's
+  module** and labels it `HomeOrigin::Syntax`; for an `implement Display for
+  Option<T>` written in `std::fmt::display`, the entry's module is
+  `std::core::option` while the annotation's home is `std::fmt::display`. Its own
+  comment already concedes this is TWO homes through ONE context and must be
+  split; this is the first measurement of what the compromise costs.
+- **The largest pair is not 2c at all.** `option → Str` is 1,568 `VIS-VIOLATION`
+  events and **zero** `RN` lines — no context with that home ever resolves `Str`
+  through `resolve_named`. Those arrive through the cursor-based callers.
+
+Which of the three cursor callers dominates is **not** measured: the stream
+carries no construction-site column, and `resolve_scoped`'s own 26 callers would
+collapse into one wrapper location unless it forwards `FILE`/`LINE` the way
+`ResolutionContext` does. That is the instrument to build before the gate, and
+the shape is §8.2p's.
+
 ### 8.3 B2 is unmeasured
 
 Only the assoc-type projection (62) is instrumented. Sema's method and trait
