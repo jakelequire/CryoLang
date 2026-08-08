@@ -1334,8 +1334,19 @@ type struct DeclarationIndex {
     ///        - exactly one  -> Unique
     ///        - two or more  -> Ambiguous  (caller demands qualification)
     ///        - none visible -> NotFound   (a later "undefined" error owns it)
+    /// `use_site_ns` is only as good as the caller's claim about it, so the
+    /// caller states WHERE it came from: `origin_file`/`origin_line` (every
+    /// caller passes `FILE, LINE`, which the compiler expands at the call site)
+    /// and `origin`, the provenance of the namespace itself.  A caller handing
+    /// over the ambient cursor names a module that did not write the syntax, and
+    /// a rejection recorded against it is a false positive of the caller rather
+    /// than a defect in the source - the distinction that reverted the function
+    /// lane's gate once.  Required, not defaulted, for the reason
+    /// `set_home_module`'s origin is: it is not recoverable from the value.
     resolve_qualified_scoped(&this, bare: SymbolStr, use_site_ns: SymbolStr,
-                             intern: InternTable*) -> ScopeResolution {
+                             intern: InternTable*,
+                             origin_file: string, origin_line: i32,
+                             origin: string) -> ScopeResolution {
         ResolveCounter::Site::BareAltsViaScoped.bump();
         const cands: SymbolStr[] = this.lookup_qualified_alternatives(bare);
         if (cands.length == 0) { return ScopeResolution::NotFound; }
@@ -1382,7 +1393,9 @@ type struct DeclarationIndex {
                     else           { ResolveCounter::Site::VisRejectNotPublic.bump();   }
                     ResolveCounter::Site::VisWouldReject.bump();
                     ResolveCounter::vis_violation(intern.resolve(use_site_ns),
-                                                     intern.resolve(c0));
+                                                     intern.resolve(c0),
+                                                     origin_file, origin_line,
+                                                     origin);
                 }
             }
             return ScopeResolution::Unique(c0);
@@ -1422,8 +1435,12 @@ type struct DeclarationIndex {
     /// names); authoritative sites call `resolve_qualified_scoped` directly so
     /// they can diagnose `Ambiguous`.
     resolve_qualified_scoped_or(&this, bare: SymbolStr, use_site_ns: SymbolStr,
-                                intern: InternTable*) -> SymbolStr {
-        return this.resolve_qualified_scoped(bare, use_site_ns, intern).resolved_or(bare);
+                                intern: InternTable*,
+                                origin_file: string, origin_line: i32,
+                                origin: string) -> SymbolStr {
+        return this.resolve_qualified_scoped(bare, use_site_ns, intern,
+                                             origin_file, origin_line, origin)
+                   .resolved_or(bare);
     }
 
     /// Context-FREE canonicalization: fold a bare leaf to its qualified form
