@@ -119,6 +119,40 @@ type struct MonoCallSpecializer {
         return ModuleGraph::home_ns_of_file(this.module_graph, this.intern_table, file);
     }
 
+    /// Qualify a written scope name by judging it in the module that WROTE it,
+    /// which is the module its span names - not `current_ns`, which in mono
+    /// names whoever demanded the specialization and is the writing module only
+    /// by coincidence.
+    ///
+    /// The graph failing to name a module falls back to the cursor rather than
+    /// to no scope, and says so: an unnamed module compares unequal to every
+    /// real one, so handing it over as a use site reads missing provenance as
+    /// "written somewhere else" and rejects everything.  That is the
+    /// false-positive direction that reverted the visibility gate once.
+    ///
+    /// The empty-answer policy lives here, once, for the reason
+    /// `ModuleGraph::home_ns_of_file` is a free function: a rule spelled out at
+    /// each call site is a rule the next call site forgets.  `origin_file` and
+    /// `origin_line` still come from the CALLER - a wrapper that named itself
+    /// would collapse every call site onto one location and then read as the
+    /// whole population in an audit.
+    resolve_scope_at_span(&this, bare: SymbolStr, span_file: string,
+                          origin_file: string, origin_line: i32) -> SymbolStr {
+        const site_ns: SymbolStr = if (this.module_graph == null) {
+            SymbolStr::empty()
+        } else {
+            this.module_graph.ns_sym_of_file(span_file)
+        };
+        if (site_ns.is_valid()) {
+            return this.decl_index.resolve_qualified_scoped_or(
+                bare, site_ns, this.intern_table,
+                origin_file, origin_line, "Syntax");
+        }
+        return this.decl_index.resolve_qualified_scoped_or(
+            bare, this.current_ns, this.intern_table,
+            origin_file, origin_line, "Cursor");
+    }
+
 
     // -- Module walk (replaces discover_inferred_calls_in_module) --
 
@@ -538,10 +572,13 @@ type struct MonoCallSpecializer {
         }
         if (entry == null && callee_scope.is_valid()) {
             const member_str: string = this.intern_table.resolve(callee_name);
+            // `callee_scope` is the scope the CALL wrote, so it means what the
+            // module holding that syntax says it means.  `callee_node` IS the
+            // ScopeResolution here - the branch above is the only one that sets
+            // `callee_scope`, and an Identifier callee leaves it empty.
             const qualified_scope: SymbolStr = if (this.decl_index != null) {
-                this.decl_index.resolve_qualified_scoped_or(
-                    callee_scope, this.current_ns, this.intern_table,
-                    FILE, LINE, "Cursor")
+                this.resolve_scope_at_span(callee_scope, callee_node.span.file,
+                                           FILE, LINE)
             } else {
                 callee_scope
             };
@@ -1297,9 +1334,9 @@ type struct MonoCallSpecializer {
         if (registry == null) { return false; }
         mut entry: TemplateEntry* = registry.get_template(scope.scope_name);
         if (entry == null && this.decl_index != null) {
-            const q: SymbolStr = this.decl_index.resolve_qualified_scoped_or(
-                scope.scope_name, this.current_ns, this.intern_table,
-                FILE, LINE, "Cursor");
+            // The owner scope was written at `scope`, so it is judged there.
+            const q: SymbolStr = this.resolve_scope_at_span(
+                scope.scope_name, (scope as ASTNode*).span.file, FILE, LINE);
             if (q.is_valid() && !q.equals(scope.scope_name)) {
                 entry = registry.get_template(q);
             }

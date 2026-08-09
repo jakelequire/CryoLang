@@ -3482,6 +3482,90 @@ first place to look if one appears.
 122 events at two mono sites, all of them the ambient cursor of §8.2l — one
 family, not two, and the last one standing between here and turning the gate on.
 
+### 8.2ab The mono cursor family is gone — the gate's input is CLEAN — MEASURED 2026-08-08
+
+The last 122 would-be rejections were `call_specializer.cryo:544`
+(`specialize_free_call`) and `:1302` (`specialize_static_method_on_generic_owner`),
+61 each, both handing `current_ns` to `resolve_qualified_scoped_or` and honestly
+declaring `Cursor`. §8.2v called this family "harder" than the six sema sites it
+fixed, on the site's own comment that the caller's import scope "is not
+reconstructible here". **That comment is a hypothesis, and it is false.**
+
+Both sites hold a `ScopeResolutionNode*` — the written `Owner::member` — so the
+module that wrote the scope is its span's module. `MonoCallSpecializer` already
+carries `module_graph` for exactly this, and already uses `home_ns_of` at five
+sites in the same file, one of them (`compute_owner_default_binds`) on the same
+node type. Nothing needed threading; the span was in hand at both sites and the
+door was already open.
+
+The fix is one helper, `resolve_scope_at_span`. An invalid answer keeps the
+cursor and keeps reporting `Cursor`, for §8.2v's reason: an invalid id compares
+unequal to every module, so passing it as a use site reads missing provenance as
+"written somewhere else" and rejects everything — the false-positive direction
+that reverted the gate once (§8.1e). That policy lives in the helper rather than
+at each site, on `ModuleGraph::home_ns_of_file`'s stated reasoning: a rule
+spelled out per call site is a rule the next call site forgets. `origin_file` /
+`origin_line` are still the CALLER's — a wrapper that named itself would collapse
+both sites onto one location, and the wrapper would then read as the whole
+population in any audit (§8.2u's `resolve_scoped` rule).
+
+| | before | after |
+|---|---:|---:|
+| would-be rejections | 122 | **0** |
+| — `cause: namespace not reachable` | 122 | **0** |
+| — `cause: candidate not public` | 0 | 0 |
+
+**Controls.** The `(name → answer)` multiset is identical — 174 distinct pairs,
+same counts, nothing gained and nothing lost in either direction — so nothing
+rebound. RN rows unchanged at 9,419; `b1-check` reads 12,453 against its golden
+with no re-pin; the whole 493-line counter report differs in **exactly the two
+rows above**, and the audit stream shrank from 10,040 lines to 9,918 — **exactly
+122**, all of them `VIS-VIOLATION`. `make test` OVERALL PASS (unit 2001,
+compile-fail 170, projects 19), `roster-check` OK (2001 tests),
+`api-index-check` up to date, all 14 examples build.
+
+**The zero is not the site going quiet.** `B3 by caller:
+resolve_qualified_scoped` is unchanged at 58,458, and it is one of the 491 rows
+the report diff leaves untouched: the same resolutions still happen and still
+take the same lane. What changed is which module they are judged at.
+
+⇒ **No would-be rejection remains on this corpus, from any origin.** The gate's
+input is clean, and what stands between here and turning it on is the gate
+itself — Q8's new error code and its help line.
+
+#### `resolution_leaf_index`'s axis is the FILESYSTEM, not the host
+
+§3 of the working notes carried this as "fails on Linux, passes on Windows".
+That framing sends a reader looking for OS-conditional code, and there is none.
+§8.2y's mechanism is `register_leaf_name` being first-registration-wins over
+**depth-first module discovery seeded by filesystem enumeration order**, and the
+enumeration order is a property of the filesystem, not the OS:
+
+| filesystem | `ls -U` on `stdlib/` | corpus |
+|---|---|---|
+| v9fs (`/mnt/c` from WSL) | `alloc collections core cryoconfig encoding env …` — alphabetical | **PASS** |
+| ext4 (native) | `alloc fs net process math io future cryoconfig …` — hash order | **FAIL** |
+
+Same compiler, same sources, same host, copied between the two. On ext4 it fails
+as `WRONG_a_free_generic_resolves_a_plural_leaf_not_in_its_scope`, binding
+`Omega::Widget<i32>` where `Alpha::Widget<i64>` was written — §8.2y's defect,
+exactly. NTFS enumerates alphabetically too, which is why Windows "passes" and
+why that pass is the same non-event as the v9fs one rather than a second data
+point.
+
+**Consequence for anyone measuring here: a repo checked out on `/mnt/c` and
+built from WSL SILENTLY MASKS this defect.** A green `resolution_leaf_index` in
+that environment is the §8.2g failure again — it says the ordering happened to
+be favourable, not that the name binds correctly. Every number in §8.2ab above
+was therefore taken on **both** filesystems and agrees on both; the ext4 run is
+the one that proves the 122 → 0 is not itself an artifact of alphabetical
+discovery order.
+
+The host-independent expectation this corpus needs is still owed, and still
+blocked on the gate (§3). It is now known to need a *filesystem*-independent
+expectation, which is a strictly stronger requirement than the per-host golden
+Q9 settled for `b1-check`.
+
 ### 8.3 B2 is unmeasured
 
 Only the assoc-type projection (62) is instrumented. Sema's method and trait
