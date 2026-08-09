@@ -3529,9 +3529,13 @@ resolve_qualified_scoped` is unchanged at 58,458, and it is one of the 491 rows
 the report diff leaves untouched: the same resolutions still happen and still
 take the same lane. What changed is which module they are judged at.
 
-⇒ **No would-be rejection remains on this corpus, from any origin.** The gate's
-input is clean, and what stands between here and turning it on is the gate
-itself — Q8's new error code and its help line.
+⇒ **No would-be rejection remains on this corpus, from any origin.**
+
+> **Do not read that as "the gate's input is clean."** It was written that way
+> here first and §8.2ac corrects it with a measurement: `09-json-config` is one
+> example project, and the gate would run over the whole tree. Swept properly the
+> count is **4,272 events**, including **1,237 on the compiler's own build**. The
+> zero above is true and is about this corpus only.
 
 #### `resolution_leaf_index`'s axis is the FILESYSTEM, not the host
 
@@ -3565,6 +3569,171 @@ The host-independent expectation this corpus needs is still owed, and still
 blocked on the gate (§3). It is now known to need a *filesystem*-independent
 expectation, which is a strictly stronger requirement than the per-host golden
 Q9 settled for `b1-check`.
+
+### 8.2ac The gate's migration set is 106 imports, and every one is real — MEASURED 2026-08-08
+
+Every would-be-rejection figure in §8.2t through §8.2ab was taken on
+`examples/09-json-config`. The gate would run over the whole tree. Swept across
+all 14 examples, all 20 test projects and the compiler's own build, on both
+target surfaces:
+
+| population | events |
+|---|---:|
+| `examples/09-json-config` | **0** |
+| `examples/11-http-server` | 343 |
+| `proj:async_main` | 210 |
+| **the compiler building itself** | **1,237** |
+| most other projects | 2 each |
+| **pooled, both surfaces** | **4,272** |
+
+`09-json-config` is the *only* target in the sweep that reads zero. A count of 0
+measured there says nothing about the population the gate would actually judge —
+this is §4.6's rule, and the zero had been read the other way.
+
+**What the 1,237 are.** 1,211 of them declare `Syntax`, i.e. they are correctly
+homed at the module that wrote the name and that module still cannot reach it.
+Reduced to the import each one implies — the candidate's declaring module — they
+are **77 distinct (use site → declaring module) pairs** over 53 use sites for the
+compiler alone, and **106 pairs over 59 use sites** pooled.
+
+**The control said 106 of 106 are genuinely missing. THE CONTROL WAS WRONG.**
+It asked only whether the use site's file already contains `import M;` or a
+brace form naming the leaf. It never asked whether `M` is reachable through a
+`public module` RE-EXPORT from a parent the file already imports — and that is
+a real reachability path, documented at `resolver/resolver.cryo`'s
+`resolve_qualified_type_via_exports`: *"`future::Ready` when only the parent
+`std::future` was imported, so `Ready` entered as a re-export of the
+`future::ready` submodule."*
+
+Demonstrated false positives, not inferred: `tests/projects/async_main` already
+imported `std::future` and `std::time`, and `examples/11-http-server` already
+imported `std::future` and `std::net::http`, while
+`stdlib/future/_module.cryo` and `stdlib/net/http/_module.cryo` re-export
+`executor` / `poll` / `waker` / `timer` / `combinator` and `request` /
+`response` / `router` / `server` / `status` respectively. Every import added to
+those files was redundant.
+
+**Re-derived with a re-export-following control, and attributed per project**
+(the `Main` namespace is declared by several, and first-match-wins reads the
+wrong file — which is what made `11-http-server`'s pairs look genuine):
+
+| | pairs | host-surface events |
+|---|---:|---:|
+| already reachable — **false positives** | **25** | **784 (37%)** |
+| genuinely missing | **80** | 1,352 |
+| total | 105 | 2,136 |
+
+Where the gate looked worst it was almost entirely wrong, and where it looked
+quiet it was almost entirely right:
+
+| target | events | redundant | genuine |
+|---|---:|---:|---:|
+| `ex:11-http-server` | 343 | **341** | 2 |
+| `proj:async_main` | 210 | **207** | 3 |
+| `proj:async_main_void` | 91 | **89** | 2 |
+| **COMPILER-SELF** | 1,237 | 17 | **1,220** |
+
+So the compiler's own source does carry ~1,220 genuine events over ~80 pairs,
+while the example and test projects were noise from the predicate. A rejection
+count is not evidence of missing imports until the predicate that produced it
+understands every way a name can legally be reached.
+
+This is Q6 read too narrowly. Q6 settles that a parent does not *implicitly*
+bind its submodules; `public module` is the explicit opt-in that makes the
+parent import sufficient, and the stdlib already uses it throughout. No
+`public import` feature is needed for this.
+
+⇒ **The gate inherits the same defect.** `DeclarationIndex::ns_imports` knows
+only direct import edges, so it judges a re-exported name unreachable. That is
+a false-positive class independent of the provenance one in §8.2ae, and either
+one is fatal to turning the gate on.
+
+The pairs below were read by hand and ARE genuine — a missing import with no
+re-export path:
+
+- `Compiler::BuildManifest` writes `Str::from_raw` / `Str::new` five times and
+  imports `std::collections::string` — never `std::collections::str`.
+- `Compiler::Parser::ExprParser` names `TypeRef` eight times and imports nothing
+  that declares it.
+
+They compile today only through §1's root cause. **So the last class is a source
+migration after all** — the thing §8.2t and §8.2u each concluded was empty, on a
+corpus where it is empty. It is the same shape as §8.2c's rule-6 migration and
+subject to the same rule that Cryo permits import cycles, which several of these
+pairs need (`Compiler::AST::Expression → Compiler::AST::Statement`).
+
+**Both surfaces, and the control on it.** `--target=x86_64-pc-windows-gnu` from
+Linux reproduces a native-Windows front end exactly — RN rows 9,439 / 12,371 /
+75,047 against native Windows 9,439 / 12,371 / 75,047, each differing from the
+Linux-host 9,419 / 12,319 / 74,982. The Windows surface adds **0** pairs over the
+Linux one on the population both cover. Comparing the two runs' *home-module
+sets* does **not** show this and reads as "the surface was never reached" — the
+sets are identical because the gating is intra-file; the RN row count is the
+sensitive measure. A cross-target build exits non-zero at link with no mingw
+toolchain, long after the front end has emitted every event, so the audit stream
+is usable while the end-of-run counter report is not.
+
+⇒ Turning the gate on is gated on the 106 imports, not on more provenance work.
+The remaining `Cursor` rows are 26 of 1,237 on the compiler build and are a
+separate, much smaller question.
+
+### 8.2ad The migration LANDED — 4,272 rejections become 10, and all 10 are the tripwire — MEASURED 2026-08-08
+
+> **Read with §8.2ac's correction: 25 of these 105 imports are REDUNDANT**, and
+> they account for **784 of the 2,136 host-surface events** this section credits
+> itself with clearing. The control that derived them did not follow `public
+> module` re-exports. The measurements below are accurate about what the
+> rejection counter did; they are not evidence that every import was needed —
+> a third of the drop is a false positive being silenced rather than a defect
+> being fixed. The correct order is: fix the predicate, re-measure, then migrate
+> the ~80 that remain.
+
+105 imports across 59 files: §8.2ac's 106 pairs less
+`ResolutionTripwire::Orphan → ResolutionTripwire::Depot`, which is **excluded on
+purpose**. `tests/orphan.cryo` states it has no import deliberately and that the
+bare name resolves anyway; adding one would delete the only witness to the
+defect. Attribution is per sweep target rather than per namespace, because
+`Main` is not unique across projects and a namespace-keyed map edits whichever
+project it happens to find first.
+
+| population | before | after |
+|---|---:|---:|
+| pooled, both surfaces | 4,272 | **10** |
+| the compiler building itself | 1,237 | **0** |
+| `examples/11-http-server` | 343 | **0** |
+| `proj:async_main` | 210 | **0** |
+| every other target | 0–80 | **0** |
+| `proj:resolution_tripwire` | 12 | **10** |
+
+**All 10 survivors are one pair**, `ResolutionTripwire::Orphan →
+ResolutionTripwire::Depot::Crate`, across three sites. That is the gate rejecting
+exactly the thing a tripwire exists to prove is wrong, and nothing else.
+
+**Nothing rebound, and the control is specific.** An import brings in a module's
+whole export set, so the risk is shadowing some *other* leaf in the importing
+module — which shows up as a changed `(name → answer)` pair, never as a changed
+count. Restricted to answers that name a declaration (containing `::`): **697
+before, 697 after, 0 gained, 0 lost**, on the compiler's own build. 33 of 35
+targets are 0/0 outright. The compiler build's 46 delta rows are all on the
+generic-parameter names `T` and `V`, whose answers are arena type ids
+(`218*`, `251[]`) that renumber when the instantiation set shifts. No qualified
+name changed. Builds are clean — no new ambiguity diagnostic anywhere.
+
+**B1 did not move, and the prediction that it would was wrong.** Predicted a
+drop, on the reasoning that a name reachable by import stops needing the
+fallback. Measured **12,453, unchanged, golden intact, no re-pin**. The reason is
+§8.2v's mechanism and it is worth stating because it separates two things this
+document has been counting together: on the compiler build the fallback lanes
+read `2c` 0, `2b` 0, step-5 GLOBAL LEAF INDEX **0**, while *single-candidate fast
+path taken* reads **334,498**. These names never took a B1-counted fallback —
+they took the fast path, which returns `Unique` before consulting the use site.
+
+⇒ **B1 and the gate measure disjoint things.** B1 counts *which lane answered*;
+the gate counts *whether the answer was reachable from the use site*. A name can
+be judged at a module that cannot see it and still be answered authoritatively,
+which is the whole of §1's root cause. Do not expect gate work to move B1, or
+B1 work to move the gate. (Where the leaf index *was* carrying these names it did
+move: `11-http-server`'s `lookup_by_leaf calls` fell 6,536 → 6,478.)
 
 ### 8.3 B2 is unmeasured
 

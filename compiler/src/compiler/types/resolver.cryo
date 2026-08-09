@@ -24,6 +24,10 @@ import Compiler::ModuleGraph;
 import Compiler::ResolveCounter;
 import Utils::Logger;
 import std::collections::pair;
+import Compiler::Resolver::Scope;
+import Compiler::Types::Compound;
+import Compiler::Types::Type;
+import Compiler::Types::UserDefined;
 
 
 // ResolutionContext: context for type resolution
@@ -1739,11 +1743,22 @@ private:
             // imported.
             if (!home_hit.is_valid() && this.decl_index != null) {
                 const home_ns: SymbolStr = this.intern_table.intern(ctx.home_module);
-                const home_scoped: SymbolStr =
-                    this.decl_index.resolve_qualified_scoped_or(
+                const home_res: ScopeResolution =
+                    this.decl_index.resolve_qualified_scoped(
                         name, home_ns, this.intern_table,
                         ctx.origin_file, ctx.origin_line,
                         ctx.home_origin.display_name());
+                // THE GATE (spec §3.3).  Exactly one declaration carries this
+                // name and the module that wrote it cannot reach it, so the
+                // resolution fails here - but the DIAGNOSTIC belongs to
+                // `emit_undefined_type`, which holds the annotation's span.
+                // Reporting here as well would name the failure twice.
+                if (home_res.not_reachable().is_valid()) {
+                    this.rn_trace("gate-unreachable", name_str, ctx,
+                                  TypeRef::invalid());
+                    return TypeRef::invalid();
+                }
+                const home_scoped: SymbolStr = home_res.resolved_or(name);
                 if (home_scoped.is_valid() && home_scoped.id != name.id) {
                     mut home_st: TypeRef = this.decl_index.lookup_type(home_scoped);
                     // The scope question is already ANSWERED at this point: the

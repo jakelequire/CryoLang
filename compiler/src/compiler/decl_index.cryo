@@ -35,6 +35,15 @@ type enum ScopeResolution {
     Unique(SymbolStr);
     SameModule(SymbolStr);
     Ambiguous;
+    /// Exactly one candidate exists, and the use site cannot reach it - the
+    /// module that wrote the name neither declares it, imports its module, nor
+    /// gets it from the prelude.  Carries the candidate so the diagnostic can
+    /// name the module that declares it and the import that would fix it.
+    ///
+    /// Distinct from `NotFound`, which means no candidate exists at all: the
+    /// two need different diagnostics because only one of them has a fix to
+    /// suggest.
+    NotReachable(SymbolStr);
 }
 
 implement enum ScopeResolution {
@@ -47,6 +56,12 @@ implement enum ScopeResolution {
         match (&this) {
             ScopeResolution::Unique(q)     => { return q; }
             ScopeResolution::SameModule(q) => { return q; }
+            // An unreachable candidate still hands back the name it found.
+            // The gate's job is to DIAGNOSE, not to reroute: returning `bare`
+            // here would change which declaration downstream passes bind while
+            // the error is still being reported, so a rejected name would take
+            // a different path through the compiler than an accepted one.
+            ScopeResolution::NotReachable(q) => { return q; }
             _                              => { return bare; }
         }
     }
@@ -55,6 +70,16 @@ implement enum ScopeResolution {
         match (&this) {
             ScopeResolution::Ambiguous => { return true; }
             _                          => { return false; }
+        }
+    }
+
+    /// The unreachable candidate, or an invalid symbol for every other
+    /// outcome.  Authoritative sites use this to emit E0240; non-authoritative
+    /// ones never ask and keep the binding they already had.
+    not_reachable(&this) -> SymbolStr {
+        match (&this) {
+            ScopeResolution::NotReachable(q) => { return q; }
+            _                                => { return SymbolStr::empty(); }
         }
     }
 
@@ -1396,6 +1421,12 @@ type struct DeclarationIndex {
                                                      intern.resolve(c0),
                                                      origin_file, origin_line,
                                                      origin);
+                    // The gate. Until this returned, the fast path answered
+                    // `Unique` no matter what the use site could see, which is
+                    // §1's root cause: a name unique program-wide resolved from
+                    // anywhere. The candidate travels with the verdict so the
+                    // diagnostic can name its module.
+                    return ScopeResolution::NotReachable(c0);
                 }
             }
             return ScopeResolution::Unique(c0);
