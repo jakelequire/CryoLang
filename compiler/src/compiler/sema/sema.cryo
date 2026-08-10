@@ -1532,7 +1532,10 @@ public:
         if (name_str.eq("FILE")) { return this.arena.get_string(); }
         if (name_str.eq("LINE")) { return this.arena.get_i32(); }
         const func_ty: TypeRef = this.ctx.decl_index.lookup_func_type(ident.name);
-        if (func_ty.is_valid()) { return func_ty; }
+        if (func_ty.is_valid()) {
+            this.calls.enforce_value_ref_visibility(ident.name, ident.span);
+            return func_ty;
+        }
         mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0201_UNDEFINED_VARIABLE,
             format("cannot find value `%s` in this scope", name_str));
         diag = diag.at_with_label(ident.span, "not found in this scope");
@@ -2765,6 +2768,24 @@ public:
         if (s_global.is_valid()) { return s_global; }
         const b_global: TypeRef = this.types.lookup_global_var(scope.member_name);
         if (b_global.is_valid()) { return b_global; }
+        // A qualified path in value position may name a FUNCTION.  Sema owned no
+        // lookup for this shape, so codegen resolved it alone and unobserved:
+        // a path naming a function that does not exist compiled, linked, and
+        // called a null pointer at run time, and a `private` one was offered to
+        // no gate.  Asking here is what gives both an owner.
+        const fn_val: TypeRef = this.calls.lookup_scope_value_function(scope);
+        if (fn_val.is_valid()) { return fn_val; }
+        // Nothing declares this path.  `found` is invalid here by construction:
+        // the only way past the type lookup at the top is for it to have missed.  Everything codegen can emit for a
+        // ScopeResolution - type, global, enum variant, function - has now been
+        // asked, so the miss is real rather than a lane sema does not model.
+        if (this.state.in_symbolic_check) { return found; }
+        if (this.symbolic.symbolic_name_is_generic_param(scope.scope_name)) { return found; }
+        const path_str: string = format("%s::%s", scope_str, member_str);
+        mut miss: Diagnostic = Diagnostic::error(ErrorCode::E0201_UNDEFINED_VARIABLE,
+            format("cannot find value `%s` in this scope", path_str));
+        miss = miss.at_with_label(scope.span, "not found in this scope");
+        this.ctx.emit_diagnostic(miss);
         return found;
     }
 
