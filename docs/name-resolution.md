@@ -3648,9 +3648,13 @@ count is not evidence of missing imports until the predicate that produced it
 understands every way a name can legally be reached.
 
 This is Q6 read too narrowly. Q6 settles that a parent does not *implicitly*
-bind its submodules; `public module` is the explicit opt-in that makes the
-parent import sufficient, and the stdlib already uses it throughout. No
-`public import` feature is needed for this.
+bind its submodules.
+
+> **FALSIFIED — see §8.2ae and Q10.** The paragraph continued: "`public module`
+> is the explicit opt-in that makes the parent import sufficient … no
+> `public import` feature is needed for this." `public module` grants nothing,
+> measured four ways, and Q10 fixed that as the language rule. A re-export
+> feature is therefore exactly what is needed, and Q11 spells it `export`.
 
 ⇒ **The gate inherits the same defect.** `DeclarationIndex::ns_imports` knows
 only direct import edges, so it judges a re-exported name unreachable. That is
@@ -3829,6 +3833,93 @@ by iterating the diagnostic's own `add \`import M;\`` note:
 size is the §4.6 error again, with the abort as the mechanism rather than a
 badly chosen corpus.
 
+### 8.2af The gate never judged a METHOD signature — MEASURED 2026-08-10
+
+The gate closed the annotation door for free functions only. `resolve_func_signature`
+in the pass wrapper ran core resolution and then reported; **every method
+population went through the core resolver directly and was never reported at
+all** — impl-block methods and inline struct/union/class methods via
+`Resolver::resolve_method_signatures`, trait methods via
+`resolve_trait_method_signatures`. The pass-level wrappers were pure
+pass-throughs.
+
+A failed parameter annotation is not poisoned, it is simply *left unset*
+(`types/resolver.cryo`'s `resolve_func_signature` assigns `param.resolved_type`
+only when the lookup succeeds), and every consumer downstream reads an unset
+param as `void`. So the missing diagnostic did not merely lose an error — the
+parameter silently acquired a **different type than the one written**, which is
+§6.1's "`Res::Err` is a value, not a failure" violated in the one place nothing
+was checking.
+
+Three outcomes, all reproduced on a 15-line project (a type behind a
+`public module` edge, used as a parameter):
+
+| the impl's param is… | what the author gets |
+|---|---|
+| unused, method never called | **compiles clean, exit 0** — the impl's signature disagrees with the trait's, and the method is DCE'd before anything compares them |
+| unused, method called | 16 × `codegen failed for module N`, plus `E0636` and `E0619`, naming neither cause nor fix |
+| used | `E0358: no method named 'get' found on type 'void'` |
+
+The same type as a **free function** parameter gave the correct `E0240` with
+`add 'import probe::inner';`. The pointer was not the variable and neither was
+genericity: bare and `Ctx*` behave identically, and an all-local generic trait
+impl is clean.
+
+**Fix: one helper, called once per population at the point resolution is
+FINAL.** `emit_signature_diagnostics` is extracted from the free-function
+wrapper so there is a single implementation of "did this signature fail",
+and is invoked from `run_type_resolution` for impl blocks and for inline
+struct/union/class methods, and from `run_function_signature` for traits.
+Where a population is resolved twice — an early pass runs before the owner type
+is in the arena, a later one repairs what it missed — only the later call
+reports, or the first pass's misses would be errors.
+
+**The receiver must be skipped, and that is the whole false-positive class.**
+`&this`/`this` carry a synthesized annotation naming the impl's *target type*
+with the impl header's span, and `resolve_method_signatures` back-fills their
+type from the owner — leaving it unset whenever the owner lookup returns
+invalid. Reporting them produced `E0203` on `BufStream` pointing at
+`implement trait AsyncRead for struct BufStream<S>`, a line whose author can do
+nothing about it. `async_lower.cryo`'s `is_receiver_param` already records the
+invariant: a by-value receiver "is left without a resolved type by type
+resolution."
+
+Recorded because it was believed first and was wrong: the false positives were
+attributed to **async return types** being rewritten after this pass, and a
+guard was added for them. Removing that guard entirely leaves all 14 examples
+building — the async return branch was never the supplier. The instrument that
+settled it emitted one line per rejection naming the function and parameter, and
+every line read `param='&this'`. Three variable-at-a-time probes had missed it;
+one line at the event did not.
+
+Controls: all 14 examples build; each of the four populations (free function,
+inline method, trait method, trait-impl method) reports **exactly one** `E0240`
+for one failing site, so nothing double-reports across the two resolution
+passes.
+
+**Pinned** in `tests/tests/projects/namespace_gate_methods`, separate from
+`namespace_gate` because the two are reported by different passes: a free
+function's signature is judged in the FunctionSignature pass, whose abort stops
+the build before the TypeResolution pass that judges methods ever runs, so one
+project cannot hold both arms — the method arms would never be reached and the
+project would pass while testing nothing. The compiler built with this fix
+reverted **compiles that project exit 0**, which is what makes it a gate rather
+than a decoration.
+
+**What the hole was hiding, measured:** re-running the migration loop after the
+fix found **6 more files needing 12 more imports** — `std::future::waker` and
+`std::future::poll`, i.e. `Context*` and `Poll<T>` as trait-impl method
+parameters — that the gate could not see before. Migration total across both
+runs: **48 test files, 69 imports**, all pure additions.
+
+Also surfaced, and NOT this fix's doing: `tests/tests/negative/E0459_future_moved_after_poll.cryo`
+was failing to reach its own diagnostic because `mut cx: Context` needs
+`import std::future::waker;` under the *local-variable* gate. Control: the
+identical `E0240` reproduces with this section's change stashed. A compile-fail
+test is invisible to the migration loop — its diagnostics are the expected
+output, not part of the build's error stream — so this class has to be swept
+separately.
+
 ### 8.3 B2, enumerated — MEASURED 2026-08-09
 
 B2 was previously the assoc-type projection alone, and §7.3's "enumerated and
@@ -3956,33 +4047,145 @@ existing programs compile to.
   home; a special case here regenerates heuristics.
 - **Q3** — What is the diagnostic for a cross-package cycle, and its error
   code?
-- **Q10** — Does `public module X;` grant visibility, and if not, what does the
-  re-export? Today it grants nothing (§8.2ae): it suppresses a build-order edge,
-  triggers discovery, and feeds the prelude derivation. Three coherent answers,
-  and the choice is not forced by anything already decided — Q6 settles only the
-  *implicit* parent→submodule case.
-
-  1. **Nothing (status quo).** §4's rib chain stays literally true and the gate
-     is correct as written. Cost: the migration, which is §8.2ad's 105 plus at
-     least 45 test files.
-  2. **The module NAME.** `import std::test;` binds `error`, so `error::TestError`
-     resolves while bare `TestError` does not. This is what the keyword says and
-     what `pub mod` means in Rust, and it is consistent with §5.1's "first
-     segment resolves in scope, the remainder is rooted".
-  3. **The child's SYMBOLS.** Bare `TestError` resolves. This is `pub use`, not
-     `pub mod`, and it is the only answer that shrinks the migration.
-
-  Note which sites are at stake: the gate judges **bare leaves** by construction
-  (`resolve_qualified_scoped` takes a bare name), and every rejection measured is
-  a bare use. So answers 1 and 2 imply the **same** migration — only 3 changes
-  its size. The decision is therefore not blocking, and answer 3's cost is that
-  an importer of an aggregator acquires the union of its children's export sets,
-  which is §1's root cause re-created inside aggregator modules: `std::future`
-  re-exports 9 submodules, `std::net::http` 9, `std::test` 6.
-
 - **Q4** — Does `std::Range` survive? It works today only via the mechanism in
   §1. Either `stdlib/lib.cryo` re-exports it explicitly or it becomes an error
   with a suggestion — decided per name, deliberately.
+### Decided 2026-08-10
+
+- **Q11 — symbol re-export is spelled `export`, and it is a declaration in the
+  module that re-exports.** NOT YET IMPLEMENTED; this fixes the syntax so the
+  remaining name-resolution work can assume it.
+
+  ```ebnf
+  Export      ::= "export" ExportForm ";"
+  ExportForm  ::= ModulePath "::" "{" Ident ("," Ident)* "}"
+                | ModulePath "as" Ident
+                | ModulePath
+  ```
+
+  ```cryo
+  namespace std::future;
+
+  public module future::waker;                  // structure, per Q10
+  export future::waker::{Context, Waker};       // re-export, this decision
+  export future::poll::{Poll};
+  ```
+
+  …after which `import std::future;` alone puts `Context`, `Waker` and `Poll`
+  in scope.
+
+  **The rule, entire: an `export` grants an importer of THIS module exactly
+  what the same path would grant if it were imported here.** So
+  `export M::{A};` gives importers bare `A`; `export M;` gives them the name
+  `M`, hence `M::A`; `export M as N;` gives them `N`. There is no second
+  mechanism and no new path syntax — `ExportForm` is `ImportForm` minus one
+  case.
+
+  **`*` is deliberately not in `ExportForm`.** A glob re-export is the one
+  form under which an importer's in-scope set changes when a *child* module
+  gains a declaration, with the new name written down at neither end — §1's
+  ambient namespace re-created one level down, inside precisely the modules
+  that aggregate most (`std::future` has 9 submodules, `std::net::http` 9,
+  `std::test` 6). `M::*` remains legal as a LOCAL import, where the blast
+  radius is one file. Cost of the restriction, measured: the glob import form
+  has **zero** users across stdlib, compiler, tests and examples.
+
+  Why `export` rather than `public import`: **it is already a reserved keyword
+  and already lexed** (`TokenType::KwExport`, `lex/_module.cryo:75` and `:863`)
+  with no production consuming it. The feature therefore costs no keyword, no
+  lexer change, and breaks no existing source; it is a parser and resolver
+  change. `public import` was the other candidate and is the name the older
+  parts of this document use for the *concept* — read those as this feature.
+
+  **It chains, and every hop is explicit.** An `export` may name anything in
+  scope in the exporting module, including a name that module itself obtained
+  via an `export` — so `std` can write `export future::{Context};` because
+  `std::future` exports it. What it cannot do is propagate on its own: a level
+  that writes no `export` re-exports nothing, so no name arrives anywhere by
+  accident. This is what keeps a module's internal layout its own — moving
+  `Context` from `future::waker` to `future::poll` is invisible to `std`,
+  which names only `future`. The rejected alternative was to require every
+  re-export to name the DECLARING module, which reads as more explicit and is
+  in fact the opposite: it publishes every submodule's layout to every
+  ancestor and breaks all of them on any move.
+
+  Two consequences that follow and are not optional:
+
+  - **An `export` cannot widen visibility.** Re-exporting an item never grants
+    more than the item's own visibility allows; a `private` declaration stays
+    unreachable through any number of hops. Q7 makes public the default, so
+    this bites only where `private` is spelled.
+  - **Resolution through re-exports needs a visited set.** Mutual re-export
+    between two modules is *legal* under the edge rule below, so the walk
+    terminates on a seen-module check, not on the graph being acyclic.
+
+  **`E0240` suggests the shortest import that would actually work, and keeps
+  naming the declarer separately.** The two halves of Q8's help answer
+  different questions and both survive: `` `X` is declared in `A::B` ``
+  is provenance, `add import A;` is the fix. The suggestion is computed
+  against what the file ALREADY imports — if the aggregate is imported and
+  does not re-export the name, suggesting it again fixes nothing, and the note
+  must fall back to the declaring module.
+
+  **The tie-break must be deterministic.** Where two aggregates would equally
+  make a name reachable, the choice is by a stable total order on the path,
+  never by discovery order. §8.2y is the standing example of what happens
+  otherwise: a bare name already binds by directory enumeration, which is why
+  `resolution_leaf_index` passes on one filesystem and fails on another. A
+  suggestion that varies by enumeration order would be a second instance of
+  that defect, in the diagnostic instead of the binding.
+
+  **The edge is a VISIBILITY edge and never a build-order edge.** An `export`
+  changes what names are reachable and contributes nothing to compilation
+  order. `module_graph.cryo` already warns that adding a dependency edge per
+  re-exported item "recreates the false cycles the module loader avoids for
+  `public module` declarations", and that is the same `E0501` trap `public
+  module` hit. Under this rule two modules may re-export from each other
+  without either becoming unsatisfiable. The requirement it places on the
+  implementation: `DeclarationIndex` must answer a re-exported name without
+  the exporting module having been compiled first — which is how the index
+  already works, since it is populated at declaration collection.
+
+  The rejected middle option — a dependency edge *only where it would not
+  close a cycle* — is one question with two answering paths, the defect class
+  this document exists to remove.
+
+  `docs/grammar.md` deliberately does NOT yet carry the `Export` production:
+  it governs the language as it parses today, and a normative production the
+  compiler rejects would make the compiler retroactively the defect. It lands
+  there in the change that implements it.
+
+- **Q10 — `public module X;` grants NO visibility. It is module structure, and
+  nothing more.** It suppresses a build-order edge, triggers discovery, and
+  feeds the prelude derivation; it binds neither the child's name nor the
+  child's symbols at any importer. A name is reachable only through the rib
+  chain §4 describes, so §4 stays literally true and the gate is correct as
+  written: `import std::test;` does not reach `std::test::error`, and
+  `Result<(), TestError>` there is `E0240` until the importer says
+  `import std::test::error;`.
+
+  Symbol re-export is a separate feature, deliberately not folded into this
+  keyword. The reason it cannot be folded in: an importer of an aggregator
+  would acquire the union of its children's export sets — `std::future`
+  re-exports 9 submodules, `std::net::http` 9, `std::test` 6 — which is the
+  ambient-namespace root cause of §1 re-created one level down, inside exactly
+  the modules that aggregate the most. A keyword that means "structure" cannot
+  also mean "bring these names along" without reintroducing the condition the
+  rib chain exists to remove.
+
+  The two rejected answers and why the choice was nearly free: the gate judges
+  **bare leaves** by construction (`resolve_qualified_scoped` takes a bare
+  name) and every rejection measured is a bare use, so "grants nothing" and
+  "grants the module NAME" imply the *same* migration. Only "grants the
+  child's SYMBOLS" would have shrunk it, and that is `pub use` wearing
+  `pub mod`'s spelling.
+
+  Migration cost, measured rather than estimated: **197 of 222** `TestError`
+  files under `tests/` already carried `import std::test::error;` before this
+  decision, and the 25 that did not were all under `tests/tests/lang/`. Those
+  197 imports are valid under all three answers, so no answer here invalidated
+  work already done — the decision only ever governed the tail.
+
 ### Decided 2026-08-08
 
 - **Q8 — the fast-path gate gets its OWN error code, with a help line.** A name
