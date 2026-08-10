@@ -19,6 +19,7 @@ import Compiler::Diag::{
     Diagnostic, Suggestion, SourceSpan, EditDistance, Snapshot
 };
 import Compiler::DeclIndex;
+import Compiler::ModuleGraph;
 import Compiler::ResolveCounter;
 import Compiler::AST;
 import Compiler::AST::{ Node, Declaration, Statement, Expression, Pattern, Cloner };
@@ -429,6 +430,80 @@ type struct TypeResolutionRunner {
         return out;
     }
 
+    /// The shortest `import` that would actually make `qualified` reachable,
+    /// or `""` when none would.
+    ///
+    /// Importing the declaring module always works for a public declaration,
+    /// so that is the floor; any module whose re-export closure reaches the
+    /// declarer works too, and is worth suggesting when it is shorter to
+    /// write.  A private declaration is reachable through nothing, and the
+    /// empty string says so rather than naming an import that would not help.
+    ///
+    /// Ties break on the path itself - shorter first, then byte order - never
+    /// on the order modules were discovered.  A suggestion that varied with
+    /// directory enumeration would be the same defect as a BINDING that varies
+    /// with it, moved somewhere harder to see.
+    suggest_reaching_import(&this, qualified: SymbolStr, decl_ns: SymbolStr) -> string {
+        const intern: InternTable* = this.ctx.get_intern_table();
+        if (!this.ctx.decl_index.is_candidate_public(qualified)) { return ""; }
+
+        mut best: string = intern.resolve(decl_ns);
+        const graph: ModuleGraph* = this.ctx.module_graph;
+        for (mut mi: u32 = 0; mi < graph.modules.length; mi++) {
+            const cand: ModuleInfo* = &graph.modules[mi];
+            if (cand.reexports.length == 0) { continue; }
+            if (cand.name.id == decl_ns.id) { continue; }
+
+            // Transitive re-export closure of this candidate.  `seen` is both
+            // the worklist and the visited set, so mutual re-export terminates.
+            mut seen: SymbolStr[] = [];
+            for (mut ri: i64 = 0; ri < cand.reexports.length; ri++) {
+                seen.push(cand.reexports[ri]);
+            }
+            mut wi: i64 = 0;
+            mut reaches: boolean = false;
+            while (wi < seen.length) {
+                const via: SymbolStr = seen[wi];
+                wi = wi + 1;
+                if (via.id == decl_ns.id) { reaches = true; break; }
+                for (mut gj: u32 = 0; gj < graph.modules.length; gj++) {
+                    const src: ModuleInfo* = &graph.modules[gj];
+                    if (src.name.id != via.id) { continue; }
+                    for (mut sj: i64 = 0; sj < src.reexports.length; sj++) {
+                        const nxt: SymbolStr = src.reexports[sj];
+                        mut dup: boolean = false;
+                        for (mut qj: i64 = 0; qj < seen.length; qj++) {
+                            if (seen[qj].id == nxt.id) { dup = true; }
+                        }
+                        if (!dup) { seen.push(nxt); }
+                    }
+                }
+            }
+            if (!reaches) { continue; }
+
+            const cand_str: string = intern.resolve(cand.name);
+            const cand_len: i64 = cand_str.length() as i64;
+            const best_len: i64 = best.length() as i64;
+            if (cand_len < best_len) { best = cand_str; continue; }
+            if (cand_len == best_len
+                && TypeResolutionRunner::path_precedes(cand_str, best)) {
+                best = cand_str;
+            }
+        }
+        return best;
+    }
+
+    /// Byte order over two equal-length paths, so the tie-break between two
+    /// aggregates that would both work is a property of their names rather
+    /// than of the order the graph enumerated them.
+    static path_precedes(a: string, b: string) -> boolean {
+        const n: i64 = a.length() as i64;
+        for (mut i: i64 = 0; i < n; i++) {
+            if (a[i] != b[i]) { return a[i] < b[i]; }
+        }
+        return false;
+    }
+
     /// Build the rich E0203 diagnostic for an unresolved type referenced
     /// in `ann` from the declaration named `decl_name` (e.g. a function,
     /// parameter, or field name used only in the headline).  If the
@@ -467,18 +542,35 @@ type struct TypeResolutionRunner {
                     gated.name, gated_ns, intern, FILE, LINE, "Syntax");
             const unreachable: SymbolStr = gated_res.not_reachable();
             if (unreachable.is_valid()) {
-                const owner: string = intern.resolve(
-                    this.ctx.decl_index.namespace_of(unreachable, intern));
+                const owner_ns: SymbolStr =
+                    this.ctx.decl_index.namespace_of(unreachable, intern);
+                const owner: string = intern.resolve(owner_ns);
                 mut gdiag: Diagnostic = Diagnostic::error(
                     ErrorCode::E0240_NAMESPACE_NOT_REACHABLE,
                     format("`%s` is not reachable from this module",
                            gated_name));
                 gdiag = gdiag.at_with_label(gated.span,
                                             "not reachable in this scope");
+                // Provenance and fix answer different questions, so both are
+                // kept: the first names who declares it, the second what to
+                // write.  They are not always the same module - an aggregate
+                // that re-exports the declarer is a shorter, equally correct
+                // import, and naming the declarer there sends the author one
+                // level deeper than they need to go.
                 gdiag = gdiag.with_note(
                     format("`%s` is declared in `%s`", gated_name, owner));
-                gdiag = gdiag.with_note(
-                    format("add `import %s;` to bring it into scope", owner));
+                const fix: string = this.suggest_reaching_import(unreachable, owner_ns);
+                if (fix.length() > 0) {
+                    gdiag = gdiag.with_note(
+                        format("add `import %s;` to bring it into scope", fix));
+                } else {
+                    // Suggesting an import here would be false: a private
+                    // declaration is outside its module's export set, so no
+                    // import reaches it and no re-export can widen it.
+                    gdiag = gdiag.with_note(format(
+                        "`%s` is `private`, so no import makes it reachable",
+                        gated_name));
+                }
                 this.ctx.emit_diagnostic(gdiag);
                 return;
             }

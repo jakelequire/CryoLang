@@ -12,7 +12,7 @@
 Program            ::= Directive* Namespace? TopLevelItem*
 Namespace          ::= "namespace" QualName ";"
 
-TopLevelItem       ::= Import | ModuleDecl | VarDecl | FunctionDecl
+TopLevelItem       ::= Import | Export | ModuleDecl | VarDecl | FunctionDecl
                      | ExternDecl | CHeaderImport | IntrinsicDecl
                      | AggregateDecl | UnionDecl | EnumDecl | TraitDecl
                      | TypeAlias | ImplBlock | StaticAssert
@@ -47,6 +47,17 @@ ImportForm         ::= ModulePath "::" "*"
                      | ModulePath "::" "{" Ident ("," Ident)* "}"
                      | ModulePath "as" Ident
                      | ModulePath
+
+(*  Symbol re-export.  `ExportForm` is `ImportForm` minus the wildcard:
+    a glob re-export is the one form under which an importer's in-scope
+    set changes because a CHILD module gained a declaration, with the
+    new name written down at neither end.  `ModulePath "::" "*"` stays
+    legal as an Import, where its effect is confined to one file.       *)
+Export             ::= "export" ExportForm ";"
+ExportForm         ::= ModulePath "::" "{" Ident ("," Ident)* "}"
+                     | ModulePath "as" Ident
+                     | ModulePath
+
 ModulePath         ::= Ident ("::" Ident)*
 QualName           ::= Ident ("::" Ident)*
 
