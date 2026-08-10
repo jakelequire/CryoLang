@@ -1,0 +1,52 @@
+/// ============ DOOR 5: A FUNCTION NAMED WITHOUT BEING CALLED ============
+///
+/// Spec §3.3: visibility is a gate.  `visibility_gate` pins the four ways a
+/// CALL binds; this project pins the two ways a function is named in VALUE
+/// position, which reach none of them.
+///
+/// WHY THIS IS A SEPARATE PROJECT.  It has to build CLEAN on the compiler that
+/// predates the fix, or it pins nothing.  Measured before the gate landed: this
+/// program compiled, linked, and exited **17** = 5 + 6 + 3 + 3 -- both `private`
+/// callees returned their own values across a module boundary.  An absent
+/// diagnostic alone would have been equally consistent with a probe that never
+/// reached the gate, which is why the exit code is the evidence and why the two
+/// public controls are in the same batch.
+///
+/// WHAT WAS ACTUALLY WRONG.  Not a branch that answered wrong -- a lane that was
+/// never asked.  `enforce_callee_visibility` is reached only from call paths, so
+/// a reference that never becomes a call was never offered to it.  The qualified
+/// form was worse: sema resolved no function for it at all and codegen resolved
+/// the path alone, so `Vault::nosuchfn` in value position -- naming a function
+/// that DOES NOT EXIST -- compiled, linked, and segfaulted on a null function
+/// pointer.
+///
+/// IF THIS PROJECT STARTS PASSING ITS BUILD: a door reopened.  Do not relax
+/// `test.json`.
+///
+/// =======================================================================
+namespace VisibilityValueGate::Main;
+
+import VisibilityValueGate::Vault;
+
+function main() -> int {
+    // DOOR 5a -- written qualified path in value position.
+    const qualified: () -> i32 = VisibilityValueGate::Vault::tapped;
+
+    // DOOR 5b -- bare name in value position, leaf unique program-wide.  Its
+    // own callee, not a second use of `tapped`: one shared callee would let a
+    // single firing door satisfy the whole assertion.
+    const bare: () -> i32 = latched;
+
+    // CONTROLS.  Both must compile silently, and `test.json` asserts the
+    // rejection PHRASING for `offered` never appears.  A gate that rejects
+    // these is broken in the direction that actually costs -- the false
+    // positive on correct code that reverted the first attempt at this gate.
+    //
+    // Excluded by phrasing rather than by bare name on purpose: a caret display
+    // echoes the lines AROUND the error too, so an exclusion on the identifier
+    // alone would match this source line as context of a neighbouring error.
+    const control_q: () -> i32 = VisibilityValueGate::Vault::offered;
+    const control_b: () -> i32 = offered;
+
+    return (qualified() + bare() + control_q() + control_b()) as int;
+}

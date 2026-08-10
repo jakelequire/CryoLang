@@ -272,48 +272,51 @@ what actually forces compliance, and is normative.
 
 Measured 2026-08-03 by compiling probe programs; the function row re-measured
 2026-08-05; the **call/reference split** and the **type row** re-measured
-2026-08-06 (§8.2n), which corrected both.
+2026-08-06 (§8.2n), which corrected both; the last three `NO` rows closed and
+re-measured 2026-08-10 (§8.2ag). Every row is measured by a RUNNING program
+where one can exist — an absent diagnostic is equally consistent with a gate
+that passed and a probe that never reached it.
 
 | Mechanism | Enforced? | Evidence |
 |---|---|---|
 | Exhaustive `match` over an enum | **YES** | `E0405`; `tests/negative/E0405_non_exhaustive_match.cryo` |
 | Private struct/class **field** | **YES** | `E0353`; `tests/negative/E0353_private_field_access.cryo` |
 | Non-public **function**, cross-module, **called** | **YES**, since 2026-08-05 | `E0353`; `tests/projects/visibility_gate` — all four *binding* doors, §8.1f |
-| Non-public **function**, taken as a **value** | **NO** | compiles, links, runs; §8.2n door 5 |
-| Non-public **static method**, cross-module | **NO** | compiles, links, runs; §8.2n door 6 |
+| Non-public **function**, taken as a **value** | **YES**, since 2026-08-10 | `E0353`; `tests/projects/visibility_value_gate`, both spellings, §8.2ag |
+| Non-public **static method**, cross-module | **YES**, since 2026-08-10 | `E0353`; `tests/projects/visibility_static_gate`, both spellings, §8.2ag |
 | Non-public **instance method**, cross-module | **YES** | `E0353`; §8.2n positive control |
 | Non-public **type**, cross-module, leaf **unique** | **YES** | `E0503` fires; §8.2n variant A |
-| Non-public **type**, cross-module, leaf **shared** | **NO** — *maskable* | §8.2n variant B |
+| Non-public **type**, cross-module, leaf **shared** | **YES**, since 2026-08-10 | `E0503`; `tests/projects/visibility_type_mask`, §8.2ag |
 
-Two corrections to what this table said before 2026-08-06, both measured:
+Every row is a gate, and each is pinned by a corpus entry that the compiler
+predating its fix builds at **exit 0** — the property that makes an entry a gate
+rather than a decoration. Two rules carry all of them, and a verdict that breaks
+either one is a defect regardless of what it catches:
 
-**The type row was not "no enforcement" — it was "enforcement that is not a
-gate."** `E0503` does fire for a cross-module private type. But
-`ModuleTypeRegistry::private_owner_module` is keyed on the **leaf**, scans every
-registered module, and returns "allowed" the moment *any* same-leaf type
-anywhere in the program is public — so one unrelated `public type struct Hidden`
-in a module the use site never imports silently unmasks a private `Hidden` in a
-module it does. Its use site also asks the **ambient cursor**
-(`current_module_name()`) for the use-site module rather than the module that
-wrote the syntax. The masking is written as intent in the function's own doc
-comment; §3.3 says visibility is a gate, so the comment describes a defect.
+**The use site comes from the syntax, never from the ambient cursor.** Every
+verdict asks `module_ns_sym_of_file(span.file)` — the module that WROTE the
+name. The cursor is parked on whichever module is being processed, so a verdict
+computed against it describes the walk rather than the source. When a span names
+no module the gate REFUSES to judge, because an invalid namespace compares
+unequal to every real one: judging against it turns "I don't know where this was
+written" into "written somewhere else" and rejects everything.
 
-**The function row overstated its scope.** "All four binding doors" are four
-ways a *call* binds, and the gate is enforced at the call. A private function
-that is never called — taken as a value into a function pointer — and a private
-*static* method both reach across a module boundary and execute.
-`enforce_callee_visibility` is reached only from call paths, and
-`enforce_method_visibility` only from member-access paths, so neither lane sees
-these two shapes.
+**The question is asked about a RESOLVED QUALIFIED SYMBOL, never about a bare
+leaf.** A leaf-keyed question is "is any `Hidden` anywhere public?", and any
+unrelated module can answer it yes — so enforcement keyed on a leaf is
+switchable off by a declaration the name does not even resolve to.
 
-The rider below is therefore **unchanged in force but sharper in reason**: a
-private type is reachable not merely when it is unambiguous, but whenever any
-unrelated module happens to export its leaf. Therefore, and until that closes:
+The rider below **survives, narrowed, and is still normative.** `E0503` judges a
+type where the source NAMES one — an annotation or a struct literal. A value
+whose type is never written reaches no gate at all: measured 2026-08-10, a
+`private` type returned by a public function and bound by inference crosses a
+module boundary and answers a method call. Pinned as a `WRONG_` arm in
+`tests/projects/resolution_tripwire`, which fails when someone closes it.
 
 > **Any design that relies on "make the fallback API private" works only when
-> the fallback is a FUNCTION. A private TYPE is still reachable from anywhere it
-> is unambiguous, so type-level fallback entry points must be DELETED, not
-> hidden.**
+> the fallback is a FUNCTION. A private TYPE is still reachable wherever the use
+> site can avoid naming it, so type-level fallback entry points must be DELETED,
+> not hidden.**
 
 The resolver's own enforcement still cannot depend on the feature it is
 implementing, so the mechanisms below are what carry the remaining work.
@@ -3919,6 +3922,80 @@ identical `E0240` reproduces with this section's change stashed. A compile-fail
 test is invisible to the migration loop — its diagnostics are the expected
 output, not part of the build's error stream — so this class has to be swept
 separately.
+
+### 8.2ag The last three visibility doors CLOSED — MEASURED 2026-08-10
+
+§8.2n left three `NO` rows in §7.1 and said none of them was pinned: "these four
+shapes are reproductions, not gates; nothing in the tree fails today if a door
+reopens." All three are now gated, and each was pinned by a corpus entry
+**before** the fix, so the pre-fix compiler builds each one at exit 0.
+
+**The reproductions, re-measured on this tree before any edit.** Exit code, not
+absent diagnostic, because a zero needs a control:
+
+| probe | pre-fix | what executed |
+|---|---|---|
+| `visibility_value_gate` | **exit 17** = 5+6+3+3 | two `private` free functions taken as values, cross-module, plus two public controls |
+| `visibility_static_gate` | **exit 17** = 5+6+3+3 | two `private` statics called cross-module, both spellings, plus two public controls |
+| `visibility_type_mask` | **exit 8** = 7+1+0 | a `private` type named cross-module while an unrelated module's public same-leaf type masked the error |
+
+The type probe's A/B is the control that the gate was reached at all: renaming
+*only* the masking `Decoy::Hidden`, with the use site's scope held identical,
+turns the same program into two `E0503`s.
+
+**Doors 5 and 6 were lanes, not branches.** `enforce_callee_visibility` is
+reached only from call paths and `enforce_method_visibility` only from
+member-access paths, so a function that is referenced without being called and a
+static method reach neither. Each now asks for itself:
+
+- `enforce_value_ref_visibility` gates a bare name in value position, resolving
+  the leaf against the module that WROTE it before judging, because
+  `namespace_of` on an unqualified leaf has no owner to compare;
+- `lookup_scope_value_function` gates a qualified path in value position, and
+  resolves it through `resolve_module_qualified_symbol` — the *same* symbol the
+  call form of that path resolves through, so `Ns::Mod::f` and `Ns::Mod::f()`
+  cannot disagree about which function they name;
+- `enforce_static_method_visibility` is called from `pin_scope_callee_combined`,
+  which is where all four static-bind paths funnel, and *before* its early
+  returns: a call whose callee is already pinned is still a call. An owner that
+  names a module rather than a type resolves to no type and falls out without a
+  verdict, so module-qualified free functions keep their own door.
+
+`enforce_method_visibility` gained a `door` parameter for the same reason the
+function lane has one: shutting one lane is indistinguishable from shutting both
+unless each is named at the rejection.
+
+**Sema did not own the qualified value lane at all, and that is why door 5 was
+unasked.** `resolve_scope_resolution` tried types, then globals, then returned
+invalid with no diagnostic; codegen's `ScopeResolutionNode` visit resolved the
+function by itself. So `Ns::Vault::nosuchfn` in value position — naming a
+function that **does not exist** — compiled, linked, and **segfaulted** on a null
+function pointer, and the dead-code lint reported the referenced function as
+never used. Sema now asks for the function and, having asked every lane codegen
+can emit (type, global, enum variant, function), reports the miss as `E0201` in
+the wording `resolve_identifier` already uses for a bare unknown value.
+
+**Hole 3 was two leaf-keyed decisions, and both are gone.**
+`check_type_name_visibility` stripped the written path to its leaf before asking,
+and `ModuleTypeRegistry::private_owner_module` answered with a program-wide scan
+that short-circuited to "allowed" on the first public same-leaf entry — so the
+question degraded to "is any `Hidden` anywhere public?". It now asks
+`is_candidate_public` about the **resolved qualified symbol**, with the use site
+from `module_ns_sym_of_file(span.file)` rather than the ambient cursor. That is
+the same shape that closed the function lane in §8.1f, and it retires the leaf
+key and the cursor together. `private_owner_module` had exactly one caller and is
+**deleted**, not deprecated (§7.2 mechanism 2) — its doc comment asserted the
+masking as intent ("a name that is private in A but public in B is legal"), which
+§3.3 makes a defect, and a comment left in place is how the behaviour comes back.
+
+**Controls.** Every project carries a public sibling asserted ABSENT from the
+output, because the failure mode that reverted this gate once (§8.1e) is the
+false positive. Beyond those: all 14 examples build; the projects suite goes
+26 → 29 passing with the same single failure (`resolution_leaf_index`, §2's
+pinned filesystem-order defect); compile-fail stays 170/0; `b1-check` reads
+**12,453 across 18 sites, unchanged** — predicted before the edit, and the
+prediction is what makes it evidence: routing the value lane through M2 added no
+new fallback answers on the b1 target.
 
 ### 8.3 B2, enumerated — MEASURED 2026-08-09
 

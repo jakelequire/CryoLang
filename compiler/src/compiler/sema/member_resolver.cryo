@@ -13,7 +13,7 @@
 
 namespace Compiler::Sema::MemberResolver;
 
-import Compiler::Types::{ TypeRef, Type, Arena, Compound, UserDefined, Generic, Checker, Registry, Ownership };
+import Compiler::Types::{ TypeRef, Type, Arena, Compound, UserDefined, Generic, Checker, Ownership };
 import Compiler::Resolver::{ SymbolStr, InternTable };
 import Compiler::AST;
 import Compiler::AST::{ Node, Visitor, Expression, Declaration };
@@ -21,6 +21,7 @@ import Compiler::Lex;
 import Compiler::Diag;
 import Compiler::Diag::{ Diagnostic, SourceSpan };
 import Compiler::CompilationContext;
+import Compiler::ResolveCounter;
 import Compiler::Sema::{ State, TypeUtils, SymbolicChecker, MethodBinding, Diagnostics, Dispatch, Helpers };
 import std::fmt;
 import Compiler::Types::GenericRegistry;
@@ -161,7 +162,8 @@ type struct MemberResolver {
                 } else {
                     member.span
                 };
-                this.enforce_method_visibility(obj_type, member.member, acc_span);
+                this.enforce_method_visibility(obj_type, member.member, acc_span,
+                    ResolveCounter::Site::MethodVisMember);
                 return method_ret;
             }
 
@@ -303,7 +305,8 @@ type struct MemberResolver {
             const method_ret: TypeRef =
                 this.binding.lookup_method_with_inheritance(walk_ty, type_sym, member.member);
             if (method_ret.is_valid()) {
-                this.enforce_method_visibility(obj_type, member.member, acc_span);
+                this.enforce_method_visibility(obj_type, member.member, acc_span,
+                    ResolveCounter::Site::MethodVisMember);
                 return method_ret;
             }
         }
@@ -700,8 +703,16 @@ type struct MemberResolver {
     }
 
     /// Method-call counterpart to `enforce_field_visibility` (E0353).
+    ///
+    /// `door` records WHICH lane offered the method, because a gate that cannot
+    /// say which lane it caught cannot show that the lane a corpus entry was
+    /// written for is the lane that fired.  The static lane reached this
+    /// function through no path at all until it was given a door: every caller
+    /// was a member access, so `Type::method()` crossed module boundaries and
+    /// executed.
     enforce_method_visibility(mut &this, recv_type: TypeRef,
-                              method_name: SymbolStr, span: SourceSpan) -> void {
+                              method_name: SymbolStr, span: SourceSpan,
+                              door: ResolveCounter::Site) -> void {
         const base: Type* = this.types.unwrap_to_base_type(recv_type);
         if (base == null) { return; }
 
@@ -751,8 +762,12 @@ type struct MemberResolver {
             }
         }
 
+        ResolveCounter::Site::MethodVisReject.bump();
+        door.bump();
         const vis_word: string = if (method.is_protected) { "protected" } else { "private" };
         const method_str: string = this.intern.resolve(method_name);
+        ResolveCounter::vis_gate_reject(door.label(),
+            this.current_module_name(), format("%s::%s", declaring_name, method_str));
         mut d: Diagnostic = Diagnostic::error(
             ErrorCode::E0353_PRIVATE_ACCESS,
             format("method `%s` of `%s` is %s", method_str, declaring_name, vis_word));
@@ -766,31 +781,42 @@ type struct MemberResolver {
         return this.ctx.source_file;
     }
 
-    /// Bare leaf of a possibly-qualified type name (`a::b::Secret` -> `Secret`).
-    visibility_leaf_name(&this, name: SymbolStr) -> SymbolStr {
-        const s: string = this.intern.resolve(name);
-        const n: i64 = s.length() as i64;
-        mut last: i64 = 0;
-        for (mut i: i64 = 0; i + 1 < n; i++) {
-            if (s[i] == ':' && s[i + 1] == ':') { last = i + 2; }
-        }
-        if (last == 0) { return name; }
-        // The tail is the NUL-terminated suffix of `s` from `last`; point at
-        // it and intern once, avoiding an O(n^2) `format("%s%c", ...)` char rebuild.
-        const tail: string = s + last;
-        return this.intern.intern(tail);
-    }
-
     /// Reject a user-written reference to a cross-module `private` type (E0503).
-    /// No-op unless the registry reports a cross-module private match.
+    ///
+    /// Asks the RESOLVED QUALIFIED SYMBOL, and asks it from the module that
+    /// WROTE the name.  Both halves are load-bearing, and each replaces a
+    /// decision that was keyed on the bare leaf:
+    ///
+    ///   - a leaf-keyed question is "is any `Hidden` anywhere public?", which
+    ///     one unrelated module declaring a public `Hidden` answers yes - so a
+    ///     module the use site never imports could switch this error off for a
+    ///     private type in a module it does.  A per-symbol verdict cannot be
+    ///     masked by a declaration the name does not resolve to.
+    ///   - the use site used to come from the ambient cursor, which is parked on
+    ///     whichever module is being processed rather than on the one that wrote
+    ///     the syntax.  A verdict computed against it describes the walk.
+    ///
+    /// Refuses to judge when the span names no module: an invalid namespace
+    /// compares unequal to every real one, so judging against it would read
+    /// "I don't know where this was written" as "written somewhere else" and
+    /// reject everything - the false-positive direction, which is the one that
+    /// costs.
     check_type_name_visibility(mut &this, name: SymbolStr, span: SourceSpan) -> void {
-        if (this.ctx.type_resolver == null) { return; }
-        const reg: ModuleTypeRegistry* = this.ctx.type_resolver.module_registry;
-        if (reg == null) { return; }
-        const leaf: SymbolStr = this.visibility_leaf_name(name);
-        const owner: string = reg.private_owner_module(leaf, this.current_module_name());
-        if (owner.eq("")) { return; }
-        const leaf_str: string = this.intern.resolve(leaf);
+        if (this.state.in_symbolic_check) { return; }
+        if (this.ctx == null || this.ctx.decl_index == null) { return; }
+        const use_ns: SymbolStr = this.ctx.module_ns_sym_of_file(span.file);
+        if (!use_ns.is_valid()) { return; }
+        const q: SymbolStr = this.ctx.resolve_scoped_or_at(name, span.file, FILE, LINE);
+        const owner_ns: SymbolStr = this.ctx.decl_index.namespace_of(q, this.intern);
+        if (!owner_ns.is_valid()) { return; }
+        // A module always sees its own types, public or not.
+        if (owner_ns.id == use_ns.id) { return; }
+        if (this.ctx.decl_index.is_candidate_public(q)) { return; }
+        const owner: string = this.intern.resolve(owner_ns);
+        const leaf_str: string =
+            this.intern.resolve(OwnershipQuery::leaf_segment(this.intern, q));
+        ResolveCounter::vis_gate_reject("type name", this.intern.resolve(use_ns),
+            this.intern.resolve(q));
         mut d: Diagnostic = Diagnostic::error(
             ErrorCode::E0503_PRIVATE_SYMBOL_ACCESS,
             format("type `%s` is private to module `%s`", leaf_str, owner));

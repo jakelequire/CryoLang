@@ -2532,6 +2532,58 @@ type struct CallResolver {
         this.ctx.emit_diagnostic(d);
     }
 
+    /// Gate a function named in VALUE position (`const f: () -> i32 = door5;`).
+    ///
+    /// `enforce_callee_visibility` is reached only from call paths, so a
+    /// reference that never becomes a call is never offered to it - not a
+    /// branch that answered wrong, a lane that was never asked.  This is where
+    /// it asks.
+    ///
+    /// The leaf is resolved to its qualified form against the module that WROTE
+    /// the reference before being judged, for the same reason the call lane
+    /// resolves it: a bare name means what it means where it was written, and
+    /// `namespace_of` on an unqualified leaf has no owner to compare.
+    enforce_value_ref_visibility(mut &this, name: SymbolStr, span: SourceSpan) -> void {
+        const q: SymbolStr = this.ctx.resolve_scoped_or_at(name, span.file, FILE, LINE);
+        this.enforce_callee_visibility(q, this.call_use_site_ns(span), span,
+            ResolveCounter::Site::FnBindVisValueBare);
+    }
+
+    /// The function a qualified path in VALUE position names, or an invalid
+    /// TypeRef when it names none.
+    ///
+    /// Resolved through `resolve_module_qualified_symbol` - the same symbol the
+    /// CALL form of this path resolves through - so `Ns::Mod::f` and
+    /// `Ns::Mod::f()` cannot disagree about which function they mean.  The
+    /// value form is gated here because it reaches no other gate.
+    lookup_scope_value_function(mut &this, scope: ScopeResolutionNode*) -> TypeRef {
+        const q_sym: SymbolStr = this.resolve_module_qualified_symbol(
+            scope.scope_name, scope.member_name, null);
+        if (!q_sym.is_valid()) { return TypeRef::invalid(); }
+        const ft: TypeRef = this.ctx.decl_index.lookup_func_type(q_sym);
+        if (!ft.is_valid()) { return TypeRef::invalid(); }
+        this.enforce_callee_visibility(q_sym, this.call_use_site_ns(scope.span),
+            scope.span, ResolveCounter::Site::FnBindVisValueQual);
+        return ft;
+    }
+
+    /// Gate the static method a `Type::method(...)` call is about to pin.
+    ///
+    /// Placed at the pin rather than at each resolution branch because all four
+    /// static-bind paths funnel here, and shutting three of four is
+    /// indistinguishable from shutting all four unless one function sees them
+    /// all.  A `scope_sym` that names a MODULE rather than a type resolves to no
+    /// type, finds no method, and falls out without a verdict - module-qualified
+    /// free functions keep their own door.
+    enforce_static_method_visibility(mut &this, scope_sym: SymbolStr,
+                                     member_sym: SymbolStr, span: SourceSpan) -> void {
+        if (this.state.in_symbolic_check) { return; }
+        const owner: TypeRef = this.types.lookup_type_by_sym(scope_sym);
+        if (!owner.is_valid()) { return; }
+        this.member.enforce_method_visibility(owner, member_sym, span,
+            ResolveCounter::Site::MethodVisStatic);
+    }
+
     /// Scope class of a bare-call overload candidate owned by `owner` (a
     /// qualified function-name id) relative to the module being checked.
     /// Mirrors the type-side `resolve_qualified_scoped` visibility rules,
@@ -3175,7 +3227,8 @@ type struct CallResolver {
         if (ret.is_valid() && !proj_blocked) {
             ResolveCounter::Site::McInheritance.bump();
             const acc_span: SourceSpan = if (member.member_span.has_location()) { member.member_span } else { member.span };
-            this.member.enforce_method_visibility(lookup_ref, member.member, acc_span);
+            this.member.enforce_method_visibility(lookup_ref, member.member, acc_span,
+                ResolveCounter::Site::MethodVisMember);
             const refined: TypeRef = if (member.generic_args.length > 0) {
                 this.binding.resolve_method_return_with_explicit_args(obj_type, member, ret)
             } else {
@@ -3596,6 +3649,13 @@ type struct CallResolver {
 
     pin_scope_callee_combined(mut &this, call: CallExprNode*, scope_sym: SymbolStr, member_sym: SymbolStr) -> void {
         if (call == null) { return; }
+        // Judge BEFORE the early returns below: a call whose callee is already
+        // pinned, or whose owner is a generic template, is still a call to a
+        // method the use site may not name.  `scope_sym` is the owner that won
+        // resolution, so the verdict is about the method that actually binds.
+        if (member_sym.is_valid() && scope_sym.is_valid()) {
+            this.enforce_static_method_visibility(scope_sym, member_sym, call.span);
+        }
         if (call.resolved_callee.is_valid()) { return; }
         if (!scope_sym.is_valid() || !member_sym.is_valid()) { return; }
         if (this.scope_is_generic_template(scope_sym, member_sym)) { return; }
