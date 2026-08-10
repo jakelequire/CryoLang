@@ -521,7 +521,23 @@ type struct TypeResolutionRunner {
         // Core resolution (return type + param types)
         this.resolver.resolve_func_signature(func, res_ctx);
 
-        // Emit diagnostics for unresolved types
+        this.emit_signature_diagnostics(func);
+    }
+
+    /// Reports a signature whose return or parameter annotation did not
+    /// resolve.  A failed annotation leaves `resolved_type` unset rather than
+    /// poisoned, and every consumer downstream reads an unset param as `void`,
+    /// so a signature that is never reported here is not merely undiagnosed -
+    /// it silently acquires a different type than the one written.
+    ///
+    /// Call this once per function, at the point its signature resolution is
+    /// FINAL.  Impl-block and inline methods are resolved twice (an early pass
+    /// runs before the owner type exists in the arena, and a later one repairs
+    /// what that missed), so reporting from the resolution helper itself would
+    /// report the first pass's misses as errors.
+    emit_signature_diagnostics(&this, func: FunctionDeclNode*) -> void {
+        if (func == null) { return; }
+
         if (func.return_type_annotation != null && !func.has_resolved_return_type()) {
             this.emit_undefined_type(func.return_type_annotation,
                 "return type",
@@ -529,18 +545,44 @@ type struct TypeResolutionRunner {
                 func.span);
         }
 
-        // Emit diagnostics for unresolved parameter types.
         // Sema reads param types directly from the AST node (param.resolved_type)
         // via enter_function() -> register_local().
         for (mut i: i64 = 0; i < func.parameters.length; i++) {
             const param: VarDeclNode* = func.parameters[i];
             if (param == null) { continue; }
             if (param.type_annotation != null && !param.resolved_type.is_valid()) {
+                // The receiver is not a written annotation and has no import
+                // that would fix it: `resolve_method_signatures` back-fills it
+                // from the owner type, and leaves it unset when the owner is
+                // not yet in the arena.  Its annotation carries the impl's
+                // target-type name and span, so reporting it names the impl
+                // header rather than anything the author can act on.
+                const pname: string = this.ctx.resolve_str(param.name);
+                if (pname == "this" || pname == "&this") { continue; }
                 this.emit_undefined_type(param.type_annotation,
                     "type",
                     this.ctx.resolve_str(param.name),
                     param.span);
             }
+        }
+    }
+
+    /// `emit_signature_diagnostics` over a struct/union/class/impl method list.
+    emit_method_signature_diagnostics(&this, methods: &MethodNode*[]) -> void {
+        for (mut i: i64 = 0; i < methods.length; i++) {
+            const method: MethodNode* = methods[i];
+            if (method == null || method.func == null) { continue; }
+            this.emit_signature_diagnostics(method.func);
+        }
+    }
+
+    /// `emit_signature_diagnostics` over a trait's method list.
+    emit_trait_method_signature_diagnostics(&this,
+                                            methods: &FunctionDeclNode*[]) -> void {
+        for (mut i: i64 = 0; i < methods.length; i++) {
+            const func: FunctionDeclNode* = methods[i];
+            if (func == null) { continue; }
+            this.emit_signature_diagnostics(func);
         }
     }
 
@@ -2566,6 +2608,12 @@ type struct TypeResolutionPasses {
                     mut trait_ctx: ResolutionContext = runner.make_generic_context(
                         node.generic_params, &runner.res_ctx);
                     runner.resolve_trait_method_signatures(node.methods, &trait_ctx);
+                    // Final for traits: `run_type_resolution` re-resolves impl
+                    // and inline method signatures, but not a trait's own.
+                    // Before the async desugar below, so an `async` method is
+                    // judged on the Output its annotation spells rather than on
+                    // the future projection that replaces it.
+                    runner.emit_trait_method_signature_diagnostics(node.methods);
                     // Rewrite each `async` method's resolved return to its
                     // implicit `This::<Method>Fut` projection AFTER the ordinary
                     // resolution, so callers see the future type while the
@@ -3026,6 +3074,7 @@ type struct TypeResolutionPasses {
                     // by-value `this` is never dropped - a leak on every call.
                     runner.resolve_inline_method_signatures(
                         node.name, node.binding_namespace, node.methods, &struct_ctx);
+                    runner.emit_method_signature_diagnostics(node.methods);
                 }
                 NodeKind::UnionDeclaration => {
                     const node: UnionDeclNode* = stmt as UnionDeclNode*;
@@ -3035,6 +3084,7 @@ type struct TypeResolutionPasses {
                     field_count += node.fields.length;
                     runner.resolve_inline_method_signatures(
                         node.name, node.binding_namespace, node.methods, &union_ctx);
+                    runner.emit_method_signature_diagnostics(node.methods);
                 }
                 NodeKind::ClassDeclaration => {
                     const node: ClassDeclNode* = stmt as ClassDeclNode*;
@@ -3044,6 +3094,7 @@ type struct TypeResolutionPasses {
                     field_count += node.fields.length;
                     runner.resolve_inline_method_signatures(
                         node.name, SymbolStr::empty(), node.methods, &class_ctx);
+                    runner.emit_method_signature_diagnostics(node.methods);
                 }
                 NodeKind::ImplementationBlock => {
                     const node: ImplBlockNode* = stmt as ImplBlockNode*;
@@ -3064,6 +3115,7 @@ type struct TypeResolutionPasses {
                     }
                     runner.resolve_method_signatures(node.methods, &impl_ctx, impl_owner2,
                         ctx.qualify_symbol_sym(node.target_type));
+                    runner.emit_method_signature_diagnostics(node.methods);
                 }
                 _ => {
                     // Enum variant associated types (now TypeAnnotation*) are resolved
