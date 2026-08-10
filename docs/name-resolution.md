@@ -4035,6 +4035,83 @@ this one question with one answering path is a semantic choice about which
 return type is correct for a generic-owner receiver, and it changes what
 existing programs compile to.
 
+### 8.4 `export` LANDED, and the one door it does not open — MEASURED 2026-08-10
+
+Q11 is implemented. `TokenType::KwExport` was already lexed with no production
+consuming it, so this is a parser and resolver change and no existing source
+changed meaning.
+
+**Where the answer lives.** An `export` is recorded by the module loader as a
+namespace on `ModuleInfo.reexports` — a VISIBILITY edge, never a dependency
+edge — and `instance.cryo` closes over it when it builds each module's visible
+set for `register_module_imports`. `DeclarationIndex::ns_imports` then answers
+re-exported names with no new lookup path, which is why the gate, the E0240
+note and the ambiguity rules all inherited the feature without being told about
+it. The closure uses `imi_visible` as both worklist and visited set, so mutual
+re-export terminates; it cannot terminate on acyclicity, because the edge rule
+deliberately permits the cycle.
+
+`NameResolver::process_import` is not branched on `is_export`. An export grants
+the exporting module what it grants importers, so binding it locally is half
+the rule rather than a side effect, and one production means the two forms
+cannot drift.
+
+**The parser rejects `export M::*`.** Excluded from the grammar rather than
+diagnosed downstream, so no later stage has to decide what it means.
+
+**E0241** reports an export that names a `private` or nonexistent item, at the
+export site. It runs once after the LAST module's type resolution, not inside
+the per-module pass: `is_candidate_public` answers "public" for anything not
+yet recorded, so asked mid-stage the same export would be accepted or rejected
+depending on where its target landed in topological order — §8.2y's defect
+relocated into a diagnostic.
+
+**E0240's fix note now names the shortest import that would actually work**,
+tie-broken by length then byte order on the path. Two behaviours this
+corrected: it no longer suggests an import for a `private` declaration, where
+no import helps and the old note sent the author to edit a file that could not
+fix it; and where an aggregate re-exports the declarer, it names the aggregate
+instead of sending them one level deeper. The provenance note still names the
+declarer — Q8's two halves answer different questions.
+
+#### The hole: a bare generic static call does not see a re-export
+
+`Box<i32>::new(...)` fails with `E0233` on a type reachable only through an
+`export`, while `Box<i32>` as an ANNOTATION on the same line resolves. Reduced
+to a three-module project: declaring module, re-exporting facade, use site.
+
+Four measurements bound it, and the first three are the controls that make the
+fourth mean something:
+
+| spelling | result |
+|---|---|
+| `const b: Box<i32> = Box<i32> { v: 7 };` (annotation + literal) | resolves |
+| `Plain::new(7)` — static method, NON-generic owner | resolves |
+| `StatM::Store::Box<i32>::new(7)` — fully qualified | resolves |
+| `Box<i32>::new(7)` — bare, generic owner | **E0233** |
+
+`CRYO_VIS_AUDIT=1` emits **no** `VIS-VIOLATION` for the failing name, so the
+scoped resolver is not rejecting it: the name resolves and the SPECIALIZATION
+is never found. The supplier is `call_resolver.cryo`'s `lookup_scope_template`,
+a four-step chain whose second step asks `resolve_scoped_or` — the ambient
+cursor, with no span — and whose remaining steps try `qualify_symbol_sym` and a
+cross-module scan. None of them is the use site's reachable set.
+
+Recorded because it was tried and was wrong: passing the already-scope-resolved
+name into `resolve_generic_scope_name` instead of the bare leaf does **not**
+fix it. That was one hypothesis, refuted by rebuilding; the audit above is what
+located the real supplier. The fix is not a fifth step in that chain — it is
+§6's `Res` stamped on the node, which is what lets this door ask the same
+question as every other.
+
+**Cost, measured rather than estimated.** Of the 91 deep imports that
+`std::future`, `std::net::http` and `std::test`'s new `export` lines make
+redundant, **90 could be dropped and exactly 1 could not**:
+`tests/tests/lang/async_generic_function.cryo` needs `import
+std::future::ready;` back for `Ready<T>::new`. That import carries a comment
+naming the mechanism, and it is the marker for this section — when the keystone
+lands, that import is the thing to delete to prove it.
+
 ---
 
 ## 9. Open questions
@@ -4049,12 +4126,19 @@ existing programs compile to.
   code?
 - **Q4** — Does `std::Range` survive? It works today only via the mechanism in
   §1. Either `stdlib/lib.cryo` re-exports it explicitly or it becomes an error
-  with a suggestion — decided per name, deliberately.
+  with a suggestion — decided per name, deliberately. `export` now exists to
+  spell the first option (§8.4).
+- **Q12** — A bare generic static call (`Box<i32>::new`) does not see a
+  re-export, while the same type resolves as an annotation (§8.4). This is not
+  a question about what the language should mean — that is settled — but about
+  whether the keystone (§6) is allowed to subsume `lookup_scope_template`'s
+  four-step chain wholesale, since collapsing it changes which template a bare
+  same-leaf name binds to and therefore what existing programs compile to.
 ### Decided 2026-08-10
 
 - **Q11 — symbol re-export is spelled `export`, and it is a declaration in the
-  module that re-exports.** NOT YET IMPLEMENTED; this fixes the syntax so the
-  remaining name-resolution work can assume it.
+  module that re-exports.** IMPLEMENTED — see §8.4, including the one door it
+  does not open.
 
   ```ebnf
   Export      ::= "export" ExportForm ";"
@@ -4150,10 +4234,10 @@ existing programs compile to.
   close a cycle* — is one question with two answering paths, the defect class
   this document exists to remove.
 
-  `docs/grammar.md` deliberately does NOT yet carry the `Export` production:
-  it governs the language as it parses today, and a normative production the
-  compiler rejects would make the compiler retroactively the defect. It lands
-  there in the change that implements it.
+  `docs/grammar.md` carries the `Export` production as of the change that
+  implemented it, and `docs/cryo.md` §14.5 documents the feature. A normative
+  production the compiler rejects would make the compiler retroactively the
+  defect, so the two land together or not at all.
 
 - **Q10 — `public module X;` grants NO visibility. It is module structure, and
   nothing more.** It suppresses a build-order edge, triggers discovery, and

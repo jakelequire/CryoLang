@@ -23,7 +23,7 @@ import Compiler::Codegen::{
 import Compiler::Resolver::{
     InternTable, SymbolStr, MangledName
 };
-import Compiler::AST::{ Node, Dumper };
+import Compiler::AST::{ Node, Declaration, Dumper };
 import Compiler::Deps::DepResolver;
 import Compiler::Deps::Lockfile;
 import Compiler::Vendor::AutoVendor;
@@ -1400,6 +1400,16 @@ type struct CompilerInstance {
             }
         }
         ctx.decl_index.register_prelude_namespaces(prelude_set);
+        // Modules carrying at least one `export`.  Collected once so the
+        // closure below scans only re-exporters instead of the whole graph per
+        // visible namespace; on a program that writes no `export` this list is
+        // empty and the closure costs nothing.
+        mut reexporters: u32[] = [];
+        for (mut rxi: u32 = 0; rxi < ctx.module_graph.modules.length; rxi++) {
+            if (ctx.module_graph.modules[rxi].reexports.length > 0) {
+                reexporters.push(rxi);
+            }
+        }
         for (mut imi: u32 = 0; imi < ctx.module_graph.modules.length; imi++) {
             const imi_info: ModuleInfo* = &ctx.module_graph.modules[imi];
             // What a module can SEE is its dependency edges PLUS the brace-list
@@ -1414,6 +1424,36 @@ type struct CompilerInstance {
             }
             for (mut vi: i64 = 0; vi < imi_info.imported_namespaces.length; vi++) {
                 imi_visible.push(imi_info.imported_namespaces[vi]);
+            }
+            // Re-export closure: importing a module grants what that module
+            // re-exports, and what THAT one re-exports, without limit.
+            //
+            // `imi_visible` is both the worklist and the visited set - a
+            // namespace already present is never appended again - which is what
+            // terminates the walk.  It cannot terminate on the graph being
+            // acyclic, because mutual re-export is legal by design.
+            //
+            // Every file sharing a namespace is consulted, not the first match:
+            // a namespace can span files, and "whichever the graph enumerated
+            // first" is the directory-order defect this spec exists to remove.
+            mut wi: i64 = 0;
+            while (wi < imi_visible.length) {
+                const via: SymbolStr = imi_visible[wi];
+                wi = wi + 1;
+                for (mut ri: i64 = 0; ri < reexporters.length; ri++) {
+                    const src: ModuleInfo* =
+                        &ctx.module_graph.modules[reexporters[ri]];
+                    if (src.name.id != via.id) { continue; }
+                    for (mut si: i64 = 0; si < src.reexports.length; si++) {
+                        const re_ns: SymbolStr = src.reexports[si];
+                        if (re_ns.id == imi_info.namespace_name.id) { continue; }
+                        mut re_seen: boolean = false;
+                        for (mut qi: i64 = 0; qi < imi_visible.length; qi++) {
+                            if (imi_visible[qi].id == re_ns.id) { re_seen = true; }
+                        }
+                        if (!re_seen) { imi_visible.push(re_ns); }
+                    }
+                }
             }
             ctx.decl_index.register_module_imports(
                 imi_info.namespace_name, &imi_visible);
@@ -2881,7 +2921,95 @@ type struct CompilerInstance {
             }
             pipeline.reset();
         }
-        return true;
+        return CompilerInstance::check_export_grants(ctx);
+    }
+
+    /// Report every `export` that names something it cannot grant (E0241).
+    ///
+    /// Run here, once, after the LAST module's type resolution rather than
+    /// inside the per-module pass: a declaration's visibility is recorded as
+    /// its own module resolves, and `is_candidate_public` answers "public" for
+    /// anything not yet recorded.  Asked mid-stage, the same export would be
+    /// accepted or rejected depending on where its target landed in topological
+    /// order - the discovery-order defect this spec exists to remove, relocated
+    /// into a diagnostic.
+    ///
+    /// Only the brace form can fail this way.  A bare `export A::B;` names a
+    /// module, and a path that names no module is already E0500 at discovery.
+    static check_export_grants(ctx: CompilationContext*) -> boolean {
+        const intern: InternTable* = ctx.intern_table;
+        mut ok: boolean = true;
+        for (mut mi: u32 = 0; mi < ctx.module_graph.modules.length; mi++) {
+            const root: ProgramNode* = ctx.module_graph.get_module_ast(mi);
+            if (root == null) { continue; }
+            for (mut si: i64 = 0; si < root.statements.length; si++) {
+                const stmt: ASTNode* = root.statements[si];
+                if (stmt == null) { continue; }
+                if (stmt.kind != NodeKind::ImportDeclaration) { continue; }
+                const exp: ImportDeclNode* = stmt as ImportDeclNode*;
+                if (!exp.is_export) { continue; }
+                for (mut ii: i64 = 0; ii < exp.specific_imports.length; ii++) {
+                    const item: SymbolStr = exp.specific_imports[ii];
+                    const item_str: string = intern.resolve(item);
+                    const qual_str: string =
+                        format("%s::%s", exp.module_path, item_str);
+                    const qual: SymbolStr = intern.intern(qual_str);
+
+                    // An item naming a SUBMODULE grants that module, exactly as
+                    // the same item in an `import` brace list does.
+                    if (ctx.module_graph.find_module_index(qual) >= 0) { continue; }
+
+                    // Ask the index the same question the gate asks, so an
+                    // export and a use site can never disagree about whether a
+                    // name exists.
+                    const alts: SymbolStr[] =
+                        ctx.decl_index.lookup_qualified_alternatives(item);
+                    mut found: boolean = false;
+                    for (mut ai: i64 = 0; ai < alts.length; ai++) {
+                        if (alts[ai].id == qual.id) { found = true; }
+                    }
+
+                    if (found) {
+                        if (ctx.decl_index.is_candidate_public(qual)) { continue; }
+                        mut pdiag: Diagnostic = Diagnostic::error(
+                            ErrorCode::E0241_EXPORT_NOT_GRANTABLE,
+                            format("`%s` is private in `%s` and cannot be re-exported",
+                                   item_str, exp.module_path));
+                        if (exp.span.has_location()) {
+                            pdiag = pdiag.at_with_label(exp.span,
+                                "an export cannot widen visibility");
+                        }
+                        pdiag = pdiag.with_note(format(
+                            "`%s` is declared `private`, so no importer may name it through any number of re-exports",
+                            item_str));
+                        ctx.emit_diagnostic(pdiag);
+                        ok = false;
+                        continue;
+                    }
+
+                    // Silent unless the leaf resolves NOWHERE.  A leaf that
+                    // exists elsewhere but not under this path is equally an
+                    // error, but claiming so requires the index to be complete
+                    // for every declaration kind, and a wrong E0241 would
+                    // reject a legal program.  The narrower claim needs only
+                    // that the index knows the name at all.
+                    if (alts.length > 0) { continue; }
+                    mut ndiag: Diagnostic = Diagnostic::error(
+                        ErrorCode::E0241_EXPORT_NOT_GRANTABLE,
+                        format("`%s` is not declared in `%s`",
+                               item_str, exp.module_path));
+                    if (exp.span.has_location()) {
+                        ndiag = ndiag.at_with_label(exp.span,
+                            "no such item to re-export");
+                    }
+                    ndiag = ndiag.with_note(
+                        "an export names an item the path declares, or a submodule of it");
+                    ctx.emit_diagnostic(ndiag);
+                    ok = false;
+                }
+            }
+        }
+        return ok;
     }
 
     /// DirectiveProcessing for ALL modules, before any Monomorphization.  Mono

@@ -2187,7 +2187,7 @@ public module collections::hashmap;
 public module collections::hashset;
 ```
 
-When code imports `std::collections`, only the modules declared `public` in the aggregator are visible.
+`public module` is **structure only**: it declares that a submodule exists, drives discovery, and suppresses a build-order edge. It does not bring the child's name or the child's symbols into any importer's scope. Importing `std::collections` therefore does not let you name `Array` — reaching a submodule takes an `import` of that submodule, or an `export` in the aggregator (see [section 14.5](#145-re-exports)).
 
 ### 14.3 Imports
 
@@ -2226,6 +2226,37 @@ import app::engine;
 for (x in scan(...)) { ... }                     // fine - never names Cursor
 mut c: Cursor = ...;                             // E0503: `Cursor` is private to `app::engine`
 ```
+
+### 14.5 Re-exports
+
+An `export` declaration lets a module pass names it did not declare on to its own importers. This is how an aggregator presents a flat surface over a directory of files.
+
+```cryo
+namespace std::future;
+
+public module future::waker;                  // structure (section 14.2)
+export future::waker::{ Context, Waker };     // re-export: importers get these
+export future::poll;                          // re-export the whole submodule
+```
+
+After this, `import std::future;` alone puts `Context`, `Waker`, and everything `future::poll` exports in scope.
+
+**The rule, entire: an `export` grants an importer of this module exactly what the same path would grant if it were imported here** — and it grants this module the same thing, so a module that re-exports a name may also use it without writing the path a second time. The forms mirror `import`:
+
+```cryo
+export Math::Vector;                  // importers get the module, hence Vector::Vec2
+export Math::Vector::{ Vec2, Vec3 };  // importers get Vec2 and Vec3
+export Math::Vector as V;             // importers get the name V
+```
+
+There is deliberately **no `export M::*;`**. A glob re-export is the one form under which an importer's in-scope set changes because some *child* module gained a declaration, with the new name written down at neither end. `import M::*;` remains legal, where its effect is confined to the one file that wrote it.
+
+Two rules follow and are not optional:
+
+- **An export never widens visibility.** A `private` declaration stays unreachable through any number of hops. Naming one in a brace list is `E0241`, reported where the export is written, because that is the only place an author can fix it.
+- **Re-exports chain, and every hop is explicit.** An `export` may name something the exporting module itself obtained through an `export`, so a chain can be as long as you like — but a module that writes no `export` re-exports nothing. No name arrives anywhere by accident, and moving a declaration between a module's children stays invisible to that module's ancestors.
+
+Because an `export` changes what is *reachable* and never what is *compiled first*, two modules may re-export from each other without either becoming unsatisfiable.
 
 ---
 

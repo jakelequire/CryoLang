@@ -763,6 +763,122 @@ type struct ModuleLoader {
             // reached through its parent module, already a dependency above.
         }
 
+        // `export` targets.  Discovered exactly like an import - the module
+        // has to exist, and nothing else discovers it - but recorded as a
+        // VISIBILITY edge only.  A dependency edge here would make mutual
+        // re-export, which the rule permits, an unsatisfiable cycle.
+        //
+        // Two edges per target, and they answer different questions: the
+        // re-export makes the names reachable from this module's IMPORTERS,
+        // while the imported-namespace edge makes them reachable from HERE, so
+        // a module that re-exports a name can also use it without spelling the
+        // same path a second time.
+        //
+        // The brace and alias forms need no separate treatment: an item is
+        // either a name inside the path (reached through the path's own edge)
+        // or a submodule, and the loop below over `export_items` catches the
+        // latter the way the import-item loop does.
+        for (mut ei: i64 = 0; ei < scan.export_count; ei++) {
+            const exp_path: string = scan.export_paths[ei];
+            mut exp_resolved: string = this.resolve_import_path(exp_path);
+            if (exp_resolved.length() == 0) {
+                exp_resolved = this.search_location(
+                    file_dir, ModuleLoader::replace_separator(exp_path));
+            }
+            if (debug) {
+                cdebug("[ModuleLoader]   export '%s' -> '%s'\n", exp_path, exp_resolved);
+            }
+            if (exp_resolved.length() > 0) {
+                if (!this.discover_module(intern, graph, sink, exp_resolved, debug)) {
+                    success = false;
+                }
+                const exp_idx: i64 = graph.find_module_by_path(exp_resolved);
+                if (exp_idx >= 0) {
+                    info.add_reexport(graph.modules[exp_idx].name);
+                    info.add_imported_namespace(graph.modules[exp_idx].name);
+                    continue;
+                }
+                // Mid-load inside a cycle: the graph entry is not written yet,
+                // but the namespace is already known.
+                match (this.scanned_ns.get(&exp_resolved.to_ascii_lower())) {
+                    Option::Some(ns) => {
+                        const ns_sym: SymbolStr = intern.intern(ns);
+                        info.add_reexport(ns_sym);
+                        info.add_imported_namespace(ns_sym);
+                        continue;
+                    }
+                    Option::None => { }
+                }
+            }
+            // Not a file on disk: it may already be in the graph under the
+            // written path (a fully-qualified spelling).
+            const exp_sym: SymbolStr = intern.intern(exp_path);
+            const exp_gidx: i64 = graph.find_module_index(exp_sym);
+            if (exp_gidx >= 0) {
+                info.add_reexport(graph.modules[exp_gidx].name);
+                info.add_imported_namespace(graph.modules[exp_gidx].name);
+                continue;
+            }
+            // An `export` naming no module at all is E0500, the same as an
+            // import: the path is the only thing that could have named one.
+            mut exp_span: SourceSpan = SourceSpan::none();
+            if (ei < scan.export_spans.length) {
+                const raw: SourceSpan = scan.export_spans[ei];
+                exp_span = SourceSpan::new(file_path,
+                    raw.start_line, raw.start_col, raw.end_line, raw.end_col);
+            }
+            mut exp_diag: Diagnostic = Diagnostic::error(
+                ErrorCode::E0500_MODULE_NOT_FOUND,
+                format("cannot find module `%s`", exp_path));
+            if (exp_span.has_location()) {
+                exp_diag = exp_diag.at_with_label(exp_span,
+                    format("no module named `%s` is in scope", exp_path));
+            }
+            exp_diag = exp_diag.with_note(
+                "an `export` names a module path, the same as an `import`");
+            sink.emit(exp_diag);
+            success = false;
+        }
+
+        // Brace-list `export` items that name a SUBMODULE rather than a name
+        // inside the path, mirroring the import-item loop above.
+        for (mut eii: i64 = 0; eii < scan.export_item_count; eii++) {
+            const eitem_path: string = scan.export_items[eii];
+            mut eitem_resolved: string = this.resolve_import_path(eitem_path);
+            if (eitem_resolved.length() == 0) {
+                eitem_resolved = this.search_location(
+                    file_dir, ModuleLoader::replace_separator(eitem_path));
+            }
+            if (eitem_resolved.length() > 0) {
+                if (!this.discover_module(intern, graph, sink, eitem_resolved, debug)) {
+                    success = false;
+                }
+                const eby_path: i64 = graph.find_module_by_path(eitem_resolved);
+                if (eby_path >= 0) {
+                    info.add_reexport(graph.modules[eby_path].name);
+                    info.add_imported_namespace(graph.modules[eby_path].name);
+                    continue;
+                }
+                match (this.scanned_ns.get(&eitem_resolved.to_ascii_lower())) {
+                    Option::Some(ns) => {
+                        const ens: SymbolStr = intern.intern(ns);
+                        info.add_reexport(ens);
+                        info.add_imported_namespace(ens);
+                        continue;
+                    }
+                    Option::None => { }
+                }
+            }
+            const eitem_sym: SymbolStr = intern.intern(eitem_path);
+            const eitem_idx: i64 = graph.find_module_index(eitem_sym);
+            if (eitem_idx >= 0) {
+                info.add_reexport(graph.modules[eitem_idx].name);
+                info.add_imported_namespace(graph.modules[eitem_idx].name);
+            }
+            // Otherwise the item names a declaration inside the path, which is
+            // reached through the path's own edge, recorded above.
+        }
+
         // Discover submodules (public module declarations) WITHOUT adding
         // dependency edges.  Aggregator _module.cryo files re-export their
         // children, but this isn't a real data dependency; the parent doesn't
@@ -883,6 +999,9 @@ type struct ModuleLoader {
         mut imports: string[] = [];
         mut import_spans: SourceSpan[] = [];
         mut import_items: string[] = [];
+        mut exports: string[] = [];
+        mut export_spans: SourceSpan[] = [];
+        mut export_items: string[] = [];
         mut submodules: string[] = [];
         const len: i64 = tokens.length;
         mut i: i64 = 0;
@@ -904,14 +1023,21 @@ type struct ModuleLoader {
                 continue;
             }
 
-            // import Foo::Bar;
-            if (tok.kind == TokenType::KwImport) {
-                // The path's first segment sits just past the `import`
-                // keyword; record its position so an unresolved import can
-                // point a caret at the path rather than emitting a
-                // context-free message.
+            // import Foo::Bar;   /   export Foo::Bar;
+            //
+            // One arm for both: an export form IS an import form (minus the
+            // wildcard, which the parser rejects), and it names a module the
+            // same way, so it must be DISCOVERED the same way.  They part
+            // company only in which list they land in, because an import is a
+            // build-order edge and an export is purely a visibility one.
+            if (tok.kind == TokenType::KwImport || tok.kind == TokenType::KwExport) {
+                const is_exp: boolean = tok.kind == TokenType::KwExport;
+                // The path's first segment sits just past the keyword; record
+                // its position so an unresolved path can point a caret at it
+                // rather than emitting a context-free message.  "import " and
+                // "export " are the same length.
                 mut path_line: int = tok.line;
-                mut path_col:  int = tok.column + 7;  // length of "import "
+                mut path_col:  int = tok.column + 7;
                 i += 1;
                 if (i < len) {
                     path_line = tokens[i].line;
@@ -919,7 +1045,6 @@ type struct ModuleLoader {
                 }
                 const path: string = ModuleLoader::collect_qualified_name(tokens, &i, len);
                 if (path.length() > 0) {
-                    imports.push(path);
                     // Underline through the last consumed name token. The
                     // file is left empty here (scan_tokens has no path); the
                     // caller rebuilds the span with the real source path.
@@ -930,9 +1055,16 @@ type struct ModuleLoader {
                         end_line = last.line;
                         end_col  = last.column + last.source_length;
                     }
-                    import_spans.push(SourceSpan::new("",
+                    const path_span: SourceSpan = SourceSpan::new("",
                         path_line as u32, path_col as u32,
-                        end_line as u32, end_col as u32));
+                        end_line as u32, end_col as u32);
+                    if (is_exp) {
+                        exports.push(path);
+                        export_spans.push(path_span);
+                    } else {
+                        imports.push(path);
+                        import_spans.push(path_span);
+                    }
 
                     // Brace list: `import A::B::{ X, Y };`.  The qualified-name
                     // collector stops at `{`, so without this the items are
@@ -953,7 +1085,12 @@ type struct ModuleLoader {
                                 const item: string =
                                     ModuleLoader::collect_qualified_name(tokens, &i, len);
                                 if (item.length() > 0) {
-                                    import_items.push(format("%s::%s", path, item));
+                                    const item_path: string = format("%s::%s", path, item);
+                                    if (is_exp) {
+                                        export_items.push(item_path);
+                                    } else {
+                                        import_items.push(item_path);
+                                    }
                                     // `X as Y`: the alias names the same module,
                                     // so the visibility edge is already recorded.
                                     // Skip `as` and the alias identifier, or the
@@ -974,6 +1111,19 @@ type struct ModuleLoader {
                                     i += 1;
                                 }
                             }
+                        }
+                    }
+
+                    // Whole-path alias: `export A::B as C;`.  The alias renames
+                    // what the path already named, so the edge is unchanged and
+                    // only the tokens need consuming - but they MUST be
+                    // consumed: `as` is a declaration keyword, so leaving it
+                    // current makes the scan below stop at this line and treat
+                    // every later import in the file as absent.
+                    if (i < len) {
+                        if (tokens[i].kind == TokenType::KwAs) {
+                            i += 1;
+                            if (i < len) { i += 1; }
                         }
                     }
                 }
@@ -1034,6 +1184,8 @@ type struct ModuleLoader {
         const import_count_val:      i64 = imports.length;
         const submodule_count_val:   i64 = submodules.length;
         const import_item_count_val: i64 = import_items.length;
+        const export_count_val:      i64 = exports.length;
+        const export_item_count_val: i64 = export_items.length;
         return ModuleScanResult {
             namespace_name:    ns,
             import_paths:      imports,
@@ -1041,6 +1193,11 @@ type struct ModuleLoader {
             import_count:      import_count_val,
             import_items:      import_items,
             import_item_count: import_item_count_val,
+            export_paths:      exports,
+            export_spans:      export_spans,
+            export_count:      export_count_val,
+            export_items:      export_items,
+            export_item_count: export_item_count_val,
             submodule_paths:   submodules,
             submodule_count:   submodule_count_val,
             uses_fstring:      uses_fstring_val,
@@ -1230,6 +1387,15 @@ type struct ModuleScanResult {
     /// `ns_imports` reported 68% of its visibility answers wrong.
     import_items:    string[];
     import_item_count: i64;
+    /// `export` statements: the ModulePath each one names, and (for the brace
+    /// form) each item expanded to a full path, exactly as the import lists
+    /// above.  Held apart from them because the two produce different edges -
+    /// an import constrains build order, an export never does.
+    export_paths:    string[];
+    export_spans:    SourceSpan[];
+    export_count:    i64;
+    export_items:    string[];
+    export_item_count: i64;
     submodule_paths: string[];    // `public module` declarations (discover only, no dep edge)
     submodule_count: i64;
     uses_fstring:    boolean;     // file contains at least one f-string (`f"..."`)
