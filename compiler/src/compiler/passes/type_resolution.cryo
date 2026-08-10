@@ -318,6 +318,61 @@ type struct TypeResolutionRunner {
         }
     }
 
+    /// The name written anywhere in `ann` that the reachability gate rejects,
+    /// or null when none is.  Searches the WHOLE annotation tree, generic
+    /// ARGUMENTS included: `Result<(), TestError>` fails because `TestError` is
+    /// unreachable, and a search that stopped at the head would name `Result`,
+    /// which resolves fine - so the gate's verdict would be discarded and the
+    /// failure reported against the wrong type.  Each name is judged at the
+    /// module its OWN span names, never the ambient cursor.
+    find_unreachable_named(&this, ann: TypeAnnotation*, intern: InternTable*,
+                           depth: i32) -> NamedAnnotation* {
+        if (ann == null || depth >= 8) { return null; }
+        if (this.ctx.decl_index == null) { return null; }
+        match (ann) {
+            TypeAnnotation::Named(n) => {
+                if (n.pre_resolved.is_valid()) { return null; }
+                const site_ns: SymbolStr =
+                    this.ctx.module_ns_sym_of_file(n.span.file);
+                if (!site_ns.is_valid()) { return null; }
+                const res: ScopeResolution =
+                    this.ctx.decl_index.resolve_qualified_scoped(
+                        n.name, site_ns, intern, FILE, LINE, "Syntax");
+                if (res.not_reachable().is_valid()) { return n; }
+                return null;
+            }
+            TypeAnnotation::Generic(g) => {
+                const head: NamedAnnotation* =
+                    this.find_unreachable_named(g.base, intern, depth + 1);
+                if (head != null) { return head; }
+                for (mut i: i64 = 0; i < g.args.length; i++) {
+                    const hit: NamedAnnotation* =
+                        this.find_unreachable_named(g.args[i], intern, depth + 1);
+                    if (hit != null) { return hit; }
+                }
+                return null;
+            }
+            _ => { }
+        }
+        const next: TypeAnnotation* = this.peel_annotation(ann);
+        if (next == ann) { return null; }
+        return this.find_unreachable_named(next, intern, depth + 1);
+    }
+
+    /// Whether a failed annotation is certainly a source error, so a
+    /// diagnostic is owed rather than the invalid type being dropped.
+    /// A bare `Named` is certain - the name does not exist.  So is any tree
+    /// holding a gate-rejected name, wherever it sits.  The forms this must
+    /// NOT fire on are the deferred ones - `typeof(...)`, `implement Trait`, a
+    /// generic param bound later - and none of them can be gate-rejected,
+    /// because the gate only answers about a name that already has exactly one
+    /// declaration.
+    annotation_failure_is_certain(&this, ann: TypeAnnotation*) -> boolean {
+        if (this.top_level_named(ann) != null) { return true; }
+        return this.find_unreachable_named(
+            ann, this.ctx.get_intern_table(), 0) != null;
+    }
+
     extract_unresolved_named(&this, ann: TypeAnnotation*) -> NamedAnnotation* {
         mut cur: TypeAnnotation* = ann;
         mut depth: i32 = 0;
@@ -383,16 +438,7 @@ type struct TypeResolutionRunner {
     emit_undefined_type(&this, ann: TypeAnnotation*,
                         kind_label: string, decl_name: string,
                         fallback_span: SourceSpan) -> void {
-        const named: NamedAnnotation* = this.extract_unresolved_named(ann);
-        if (named == null) {
-            this.ctx.emit_error_at(ErrorCode::E0203_UNDEFINED_TYPE,
-                format("cannot resolve %s for `%s`", kind_label, decl_name),
-                fallback_span);
-            return;
-        }
-
         const intern: InternTable* = this.ctx.get_intern_table();
-        const ty_name: string = intern.resolve(named.name);
 
         // THE GATE (spec §3.3).  A name that EXISTS but that the writing module
         // cannot reach is a different condition from one that exists nowhere,
@@ -405,33 +451,47 @@ type struct TypeResolutionRunner {
         // failure must produce ONE diagnostic, and this is the site holding the
         // span.  Emitting at the lookup would report the name twice - once
         // without a caret, then again as a spurious "did you mean".
-        if (this.ctx.decl_index != null) {
-            const site_ns: SymbolStr =
-                this.ctx.module_ns_sym_of_file(named.span.file);
-            if (site_ns.is_valid()) {
-                const res: ScopeResolution =
-                    this.ctx.decl_index.resolve_qualified_scoped(
-                        named.name, site_ns, intern, FILE, LINE, "Syntax");
-                const unreachable: SymbolStr = res.not_reachable();
-                if (unreachable.is_valid()) {
-                    const owner: string = intern.resolve(
-                        this.ctx.decl_index.namespace_of(unreachable, intern));
-                    mut gdiag: Diagnostic = Diagnostic::error(
-                        ErrorCode::E0240_NAMESPACE_NOT_REACHABLE,
-                        format("`%s` is not reachable from this module",
-                               ty_name));
-                    gdiag = gdiag.at_with_label(named.span,
-                                                "not reachable in this scope");
-                    gdiag = gdiag.with_note(
-                        format("`%s` is declared in `%s`", ty_name, owner));
-                    gdiag = gdiag.with_note(
-                        format("add `import %s;` to bring it into scope",
-                               owner));
-                    this.ctx.emit_diagnostic(gdiag);
-                    return;
-                }
+        //
+        // Asked over the whole annotation tree, and BEFORE the head is required
+        // to be unresolved: the rejected name can be a generic argument under a
+        // head that resolves perfectly well, and then neither the head's own
+        // lookup nor `extract_unresolved_named` can see it.
+        const gated: NamedAnnotation* =
+            this.find_unreachable_named(ann, intern, 0);
+        if (gated != null) {
+            const gated_name: string = intern.resolve(gated.name);
+            const gated_ns: SymbolStr =
+                this.ctx.module_ns_sym_of_file(gated.span.file);
+            const gated_res: ScopeResolution =
+                this.ctx.decl_index.resolve_qualified_scoped(
+                    gated.name, gated_ns, intern, FILE, LINE, "Syntax");
+            const unreachable: SymbolStr = gated_res.not_reachable();
+            if (unreachable.is_valid()) {
+                const owner: string = intern.resolve(
+                    this.ctx.decl_index.namespace_of(unreachable, intern));
+                mut gdiag: Diagnostic = Diagnostic::error(
+                    ErrorCode::E0240_NAMESPACE_NOT_REACHABLE,
+                    format("`%s` is not reachable from this module",
+                           gated_name));
+                gdiag = gdiag.at_with_label(gated.span,
+                                            "not reachable in this scope");
+                gdiag = gdiag.with_note(
+                    format("`%s` is declared in `%s`", gated_name, owner));
+                gdiag = gdiag.with_note(
+                    format("add `import %s;` to bring it into scope", owner));
+                this.ctx.emit_diagnostic(gdiag);
+                return;
             }
         }
+
+        const named: NamedAnnotation* = this.extract_unresolved_named(ann);
+        if (named == null) {
+            this.ctx.emit_error_at(ErrorCode::E0203_UNDEFINED_TYPE,
+                format("cannot resolve %s for `%s`", kind_label, decl_name),
+                fallback_span);
+            return;
+        }
+        const ty_name: string = intern.resolve(named.name);
 
         mut diag: Diagnostic = Diagnostic::error(
             ErrorCode::E0203_UNDEFINED_TYPE,
@@ -574,14 +634,14 @@ type struct TypeResolutionRunner {
                             const vtype: TypeRef = this.resolver.resolve(var_node.type_annotation, res_ctx);
                             if (vtype.is_valid()) {
                                 var_node.resolved_type = vtype;
-                            } else if (this.top_level_named(var_node.type_annotation) != null) {
+                            } else if (this.annotation_failure_is_certain(var_node.type_annotation)) {
                                 // An explicit annotation naming an UNKNOWN type (e.g. `bool`
                                 // - the boolean type is `boolean`).  Emit a clean E0203 with
                                 // a did-you-mean rather than letting the invalid type reach
                                 // codegen (an LLVM verify crash) or be silently dropped.
                                 // This body is non-generic (gated at the caller), so the name
                                 // can't be a deferred generic param; `typeof(...)` and other
-                                // non-Named forms (inferred later) fail the extract guard.
+                                // non-Named forms (inferred later) fail the certainty guard.
                                 const vn: string = this.ctx.get_intern_table().resolve(var_node.name);
                                 this.emit_undefined_type(var_node.type_annotation, "type", vn, var_node.span);
                             }
@@ -620,7 +680,7 @@ type struct TypeResolutionRunner {
                     const vtype: TypeRef = this.resolver.resolve(var_node.type_annotation, res_ctx);
                     if (vtype.is_valid()) {
                         var_node.resolved_type = vtype;
-                    } else if (this.top_level_named(var_node.type_annotation) != null) {
+                    } else if (this.annotation_failure_is_certain(var_node.type_annotation)) {
                         // See the DeclStmt path above: a for-loop init like
                         // `for (mut i: bool = ...)` naming an unknown type gets a
                         // clean E0203 instead of a downstream codegen crash.

@@ -3572,6 +3572,15 @@ Q9 settled for `b1-check`.
 
 ### 8.2ac The gate's migration set is 106 imports, and every one is real — MEASURED 2026-08-08
 
+> **Corrected 2026-08-08 — the re-export correction below is itself wrong.**
+> `public module` grants NO visibility, so the "25 already reachable / 784
+> events (37%)" split does not exist and the original "106 of 106 genuinely
+> missing" reading was right for the wrong reason. §8.2ae measures this four
+> ways. In particular `resolve_qualified_type_via_exports`, cited here as
+> evidence, never consults `public module` — it is a segment-boundary SUFFIX
+> match (`module_ns_matches_prefix`), the rule §5.1 forbids. Read §8.2ae before
+> acting on anything in this section.
+
 Every would-be-rejection figure in §8.2t through §8.2ab was taken on
 `examples/09-json-config`. The gate would run over the whole tree. Swept across
 all 14 examples, all 20 test projects and the compiler's own build, on both
@@ -3679,7 +3688,15 @@ separate, much smaller question.
 
 ### 8.2ad The migration LANDED — 4,272 rejections become 10, and all 10 are the tripwire — MEASURED 2026-08-08
 
-> **Read with §8.2ac's correction: 25 of these 105 imports are REDUNDANT**, and
+> **Corrected 2026-08-08 — the correction below is withdrawn.** §8.2ae measures
+> that `public module` grants no visibility, so none of the 105 imports is
+> redundant on that ground and the "4,272 → 10" drop is not a false positive
+> being silenced. What the drop *does* overstate is enforcement: §8.2ae shows
+> the gate was rejecting names that still compiled, so the counter fell without
+> the program being rejected. The migration is also larger than this section's
+> 105, because `tests/` was never in the swept population.
+
+> ~~**Read with §8.2ac's correction: 25 of these 105 imports are REDUNDANT**~~, and
 > they account for **784 of the 2,136 host-surface events** this section credits
 > itself with clearing. The control that derived them did not follow `public
 > module` re-exports. The measurements below are accurate about what the
@@ -3735,11 +3752,197 @@ which is the whole of §1's root cause. Do not expect gate work to move B1, or
 B1 work to move the gate. (Where the leaf index *was* carrying these names it did
 move: `11-http-server`'s `lookup_by_leaf calls` fell 6,536 → 6,478.)
 
-### 8.3 B2 is unmeasured
+### 8.2ae `public module` grants NO visibility, and the gate was leaking — MEASURED 2026-08-08
 
-Only the assoc-type projection (62) is instrumented. Sema's method and trait
-dispatch — the actual bulk of type-dependent resolution — is not counted.
-§7.3's B2 target is "enumerated and justified"; that is not currently possible.
+§8.2ac corrected itself with a re-export reachability path and sized a 37%
+false-positive class on it. **That path does not exist.** Four independent
+measurements, each with its control:
+
+| | with `public module` | without it |
+|---|---|---|
+| gate lane (two projects differing ONLY in the declaration) | E0240 | E0240 |
+| multi-candidate lane (same, plus a colliding leaf) | compiles, binds via step 5 | compiles, binds via step 5 |
+| real stdlib (`std::net::http` DOES re-export `request`/`response`) | 12 × E0240 | — |
+| consumers of `ModuleInfo.submodules` in the tree | prelude derivation only | — |
+
+`ModuleInfo.submodules` — the `public module` record — is read at exactly one
+site, `instance.cryo`'s prelude derivation. `register_module_imports` is handed
+`dependencies + imported_namespaces` and nothing else. `module_graph.cryo` says
+this is deliberate and names "should `public module` also grant visibility" as an
+open question, which is where it still belongs (§9).
+
+**The cited evidence was misread.** `resolve_qualified_type_via_exports` never
+consults `public module`; it calls `module_ns_matches_prefix`, a
+segment-boundary **suffix match** over the global export table — the rule §5.1
+forbids by name. It matches identically whether or not the re-export is written.
+
+⇒ The original "106 of 106 genuinely missing" reading stands, though the control
+that produced it was weak for the reason §8.2ac gave. **A legal alternative path
+must be shown to be one the compiler TAKES, not one the source could support.**
+
+#### The gate was not a gate
+
+`resolver.cryo` returned `TypeRef::invalid()` on `NotReachable` and left the
+diagnostic to `emit_undefined_type`, which runs only when the annotation is still
+unresolved. Two suppliers dropped it on the floor:
+
+- **The rejected name can be a generic ARGUMENT.** `extract_unresolved_named`
+  peels pointer/array wrappers but never descends into arguments, so
+  `Result<(), TestError>` re-asked the gate about `Result` — which is reachable —
+  discarded the verdict, and fell through to E0203 on the wrong type with a
+  spurious "did you mean". This is the whole of the `roster-check` failure.
+- **The local-variable guard recognised only a bare `Named`.** A failed
+  `Generic` annotation matched nothing, so no diagnostic was emitted at all and
+  the invalid type was dropped silently.
+
+Measured before the fix: `tests/projects/async_main` with its `std::future::*`
+imports removed builds **exit 0, zero diagnostics**, while the audit records
+**4 `gate-unreachable` events on `Elapsed`**. A name the gate rejected still
+compiled.
+
+⇒ **§8.2ad's "4,272 → 10" counts events, not enforcement.** The counter can fall
+while the program is still accepted, so it cannot be read as "the gate is on".
+It also makes "compiles clean without the import" worthless as a redundancy test,
+which is how the 37% class was inferred in the first place.
+
+Both suppliers are closed by asking one question in one place: which name written
+anywhere in the annotation tree does the gate reject. Predicted and confirmed —
+`roster-check`'s 7 × E0203 on `Result` became 7 × E0240 on `TestError` with the
+caret on `TestError`; stripped `async_main` became E0240 on `Elapsed`. Controls:
+all 14 examples build, `b1-check` reads 12,453 against its golden unmoved (B1 and
+the gate measure disjoint things), and the committed projects stay green.
+
+#### The migration is larger than 105, and the abort hides it
+
+`tests/` — 2001 tests — was never in the swept population. It is where the
+remaining work is, and it is **not** visible in one run: the compiler aborts
+after the first batch of errors, so each fix surfaces the next batch. Sizing it
+by iterating the diagnostic's own `add \`import M;\`` note:
+
+| round | errors visible |
+|---|---:|
+| 1 | 7 (one file) |
+| 2 | 44 |
+| … | 12, 5, 4 … |
+
+**45 test files edited and still converging.** Reading the first run's 7 as the
+size is the §4.6 error again, with the abort as the mechanism rather than a
+badly chosen corpus.
+
+### 8.3 B2, enumerated — MEASURED 2026-08-09
+
+B2 was previously the assoc-type projection alone, and §7.3's "enumerated and
+justified" target was not assessable. `resolve_method_call` — the central
+dispatcher — is now instrumented one site per OUTCOME, the same shape as the
+`resolve_named` cascade, because a total cannot separate a receiver-typed lookup
+from a retry after one missed.
+
+**It is a fourteen-outcome cascade**, structurally the same object as the
+nine-step one, and it was carrying a reported B2 of 50.
+
+| outcome | 09-json-config | compiler self |
+|---|---:|---:|
+| m1 generic-owner receiver, own template | 196 | 196 |
+| m1b generic-owner receiver, via template | 378 | 378 |
+| m2 abstract receiver, via bounds | 1,011 | 1,703 |
+| *m3\* `no type sym` branch ENTERED* | *150* | *1,361* |
+| m3 no type sym: BoundedParam bound | **0** | **0** |
+| m3b no type sym: projection bound | **0** | **0** |
+| m4 no type sym: generic method return | **0** | **0** |
+| m4b no type sym: via template | **0** | **0** |
+| m5 by name + inheritance (concrete) | 2,784 | **52,310** |
+| m6 BoundedParam bound, after m5 missed | **0** | **0** |
+| m7 through trait impls | **0** | **0** |
+| m8 field holding a function | 3 | 4 |
+| m9 no-op drop on a Copy type | 1 | 255 |
+| m10 deref coercion | **0** | **0** |
+| unresolved | 608 | 1,839 |
+| **calls (total)** | **4,981** | **56,685** |
+
+**The rows account for exactly 100% of the calls** on both populations
+(54,846 + 1,839 = 56,685), so no outcome is unattributed. `b1-check` reads
+12,453 against its golden, unmoved — counters only.
+
+Three results, each with its control:
+
+**m5 is 92% of B2 and is justified.** A concrete receiver, looked up by name.
+This is §6.2's case exactly: it cannot move into the resolver because it needs
+the receiver's type. B2 stays nonzero because of this row, as §7.3 predicted.
+
+**The `no type sym` branch is entered 1,361 times and answers ZERO.** All four
+of its rescue outcomes are 0 on both populations while the branch itself is
+entered — which is why the entry is counted separately; the outcome rows alone
+cannot distinguish "never reached" from "reached and never answers". Those
+1,361 entries are 74% of all 1,839 failures. **Four of the fourteen outcomes are
+pure delay before a failure and are deletable**, which is the first concrete
+answer §7.3's "justify or delete" has had.
+
+**m1/m1b is a fallback chain inside B2.** m1b runs only when m1 returned
+invalid — `if (a) { … } else { try_another_way() }` for the same question — and
+the second attempt answers **378** against the first's **196**, so the fallback
+wins 2:1. Both numbers are identical across the two populations, which places
+the whole population in the stdlib rather than in either project.
+
+**m6, m7 and m10 read 0 on both populations but are NOT dead.** A probe that
+forces deref coercion (`Box<Widget>` receiver, method on `Widget`) makes m10
+read 1, so the counter is placed correctly and the zero means *unexercised*.
+Deleting them needs corpus coverage first, not a rejection count — the §8.2ac
+rule, applied to the other direction.
+
+⇒ **Still a FLOOR, for one named reason.** Overload selection
+(`resolve_method_overload`) and member access outside a call are not counted, so
+a method reached by those routes is missing from every number above.
+
+### 8.3a Two dead lanes DELETED — MEASURED 2026-08-09
+
+The population that justified each deletion is 35 projects (all examples, all
+test projects) pooled, plus the compiler building itself. Both deletions were
+predicted to move nothing and moved nothing.
+
+**The method cascade is 14 outcomes → 10.** The `no type sym` branch's four
+rescues are gone. Every receiver shape they could answer for is answered by the
+generic-owner and abstract-receiver arms above them, so arriving here means
+those arms declined, and re-asking the same sources with strictly less
+information cannot change that. Control: `unresolved` **1,839 → 1,839**, branch
+entries **1,361 → 1,361**, every surviving outcome identical, and the pooled
+35-project table byte-identical across all nine rows. An untyped receiver is now
+a failure, not a search.
+
+**M3 `collect_namespace_suffix_matches` is gone** — a namespace-SUFFIX walk in
+codegen, which §5.1 forbids and §7.2 mechanism 2 requires be deleted rather than
+hidden. It bumped `M3Hits` once per match pushed and read **0 hits over 13,567
+calls**, so it returned an empty array every time and both of its consumer
+branches — including an `E0154` ambiguity report — were unreachable. It sat
+directly above a comment reading "Fallback 1". Control: the compiler still
+self-hosts, all 14 examples build, and the pooled table is unchanged.
+
+`b1-check` re-pinned for host **linux only**: total **12,453 → 12,453 (+0)**,
+18 sites where there were 20. The bound is not relaxed — M3's hits were already
+zero, so its removal cannot lower the total. **The `[host:windows]` section
+still carries the two M3 rows and will fail until it is re-pinned there.**
+
+#### m1/m1b is a real fallback chain, and its call-site comment is false
+
+Not deleted, because it needs a decision rather than a measurement. The comment
+justifying the second lookup says a trait-impl-delivered method "is not in the
+template's own method list, so the owner-template lookup above cannot see it"
+and that the second reads the declaration index instead. **Both read the same
+source**: `generic_registry.get_template_by_type_id(...)` then `tmpl.ast_node`'s
+`methods` array, with the same struct/union/class dispatch.
+
+They differ in three ways, and neither is a superset:
+
+- m1b returns `TypeRef::invalid()` for a method with generic params; m1 answers.
+- m1b, on finding nothing, consults the DI and then trait impls; m1 does not.
+- m1b substitutes the receiver into the return
+  (`subst_method_return_from_receiver` + `subst_this_in_type`); **m1 returns the
+  raw `resolved_return_type`.**
+
+So the first path answers 5,747 times with a less-substituted type purely by
+running first, and the second answers 11,786 — the fallback wins 2:1. Making
+this one question with one answering path is a semantic choice about which
+return type is correct for a generic-owner receiver, and it changes what
+existing programs compile to.
 
 ---
 
@@ -3753,6 +3956,30 @@ dispatch — the actual bulk of type-dependent resolution — is not counted.
   home; a special case here regenerates heuristics.
 - **Q3** — What is the diagnostic for a cross-package cycle, and its error
   code?
+- **Q10** — Does `public module X;` grant visibility, and if not, what does the
+  re-export? Today it grants nothing (§8.2ae): it suppresses a build-order edge,
+  triggers discovery, and feeds the prelude derivation. Three coherent answers,
+  and the choice is not forced by anything already decided — Q6 settles only the
+  *implicit* parent→submodule case.
+
+  1. **Nothing (status quo).** §4's rib chain stays literally true and the gate
+     is correct as written. Cost: the migration, which is §8.2ad's 105 plus at
+     least 45 test files.
+  2. **The module NAME.** `import std::test;` binds `error`, so `error::TestError`
+     resolves while bare `TestError` does not. This is what the keyword says and
+     what `pub mod` means in Rust, and it is consistent with §5.1's "first
+     segment resolves in scope, the remainder is rooted".
+  3. **The child's SYMBOLS.** Bare `TestError` resolves. This is `pub use`, not
+     `pub mod`, and it is the only answer that shrinks the migration.
+
+  Note which sites are at stake: the gate judges **bare leaves** by construction
+  (`resolve_qualified_scoped` takes a bare name), and every rejection measured is
+  a bare use. So answers 1 and 2 imply the **same** migration — only 3 changes
+  its size. The decision is therefore not blocking, and answer 3's cost is that
+  an importer of an aggregator acquires the union of its children's export sets,
+  which is §1's root cause re-created inside aggregator modules: `std::future`
+  re-exports 9 submodules, `std::net::http` 9, `std::test` 6.
+
 - **Q4** — Does `std::Range` survive? It works today only via the mechanism in
   §1. Either `stdlib/lib.cryo` re-exports it explicitly or it becomes an error
   with a suggestion — decided per name, deliberately.
