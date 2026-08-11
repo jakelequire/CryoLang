@@ -376,10 +376,22 @@ public:
         // Declare generic params
         this.declare_generics(node.generic_params);
 
-        // Declare methods (as signatures only)
+        // Every signature is declared before any body is walked, so a default
+        // body may call a sibling method declared after it.
         for (mut i: int = 0; i < node.methods.length; i++) {
             const method: FunctionDeclNode* = node.methods[i];
             this.resolver.declare_method(method.name, method.span, true);
+        }
+
+        // A default body is source written in THIS file, and is the only place
+        // the module that wrote it is still known: it is later instantiated
+        // against each implementing type, where the surrounding module is the
+        // implementor's, not the trait's.  Skipping it here leaves every path
+        // it spells to be re-derived from wherever the compiler is standing at
+        // instantiation time.  A method with no default has no body, and
+        // `visit(FunctionDeclNode*)` already walks one only when it exists.
+        for (mut i: int = 0; i < node.methods.length; i++) {
+            node.methods[i].accept(this);
         }
 
         this.resolver.exit_scope();
@@ -573,6 +585,8 @@ public:
         if (written.length() == 0) { return; }
 
         mut found:   SymbolStr = SymbolStr::empty();
+        mut other:   SymbolStr = SymbolStr::empty();
+        mut any:     SymbolStr = SymbolStr::empty();
         mut visible: i64 = 0;
         mut matched: i64 = 0;
         const count: i64 = this.ctx.module_graph.module_count() as i64;
@@ -583,20 +597,33 @@ public:
             const cand_str: string = this.resolver.intern_table.resolve(cand_ns);
             if (!Resolver::ns_written_as(cand_str, written)) { continue; }
             matched = matched + 1;
+            if (matched == 1) { any = cand_ns; }
             // The same reachability relation same-leaf resolution uses: the
             // module's own namespace, anything it imports (the registered set
             // is already closed over re-exports), or the prelude.
+            //
+            // `cand_str.eq(written)` is the fully-qualified spelling: a package
+            // root is addressable without an import, so a path that names a
+            // module's WHOLE namespace needs nothing brought into scope.  Only
+            // the whole one - an abbreviation like `core::option` is a proper
+            // suffix, its first segment is an interior segment binding nothing,
+            // and it stays unreachable here.
             const reachable: boolean = cand_ns.id == use_ns.id
+                || cand_str.eq(written)
                 || this.ctx.decl_index.is_prelude_ns(cand_ns)
                 || this.ctx.decl_index.ns_imports(use_ns, cand_ns);
             if (!reachable) { continue; }
             visible = visible + 1;
             if (visible == 1) { found = cand_ns; }
+            if (visible == 2) { other = cand_ns; }
         }
 
         if (visible == 1) {
             node.set_scope_res(Res::Def(found));
             ResolveCounter::Site::ScopeResStamped.bump();
+            ResolveCounter::scope_res_stamped(
+                this.resolver.intern_table.resolve(use_ns), written,
+                this.resolver.intern_table.resolve(found));
             return;
         }
         if (visible > 1) {
@@ -604,6 +631,10 @@ public:
             // spelling does not name one of them.  Left unstamped and counted
             // rather than picked, because picking is the defect.
             ResolveCounter::Site::ScopeResAmbiguous.bump();
+            ResolveCounter::scope_res_refused(
+                "AMBIGUOUS", this.resolver.intern_table.resolve(use_ns), written,
+                this.resolver.intern_table.resolve(found) + " | "
+                    + this.resolver.intern_table.resolve(other));
             return;
         }
         if (matched > 0) {
@@ -611,6 +642,9 @@ public:
             // Counted, not rejected: whether this is always an error is the
             // question the count is here to answer.
             ResolveCounter::Site::ScopeResUnreachable.bump();
+            ResolveCounter::scope_res_refused(
+                "UNREACHABLE", this.resolver.intern_table.resolve(use_ns), written,
+                this.resolver.intern_table.resolve(any));
             return;
         }
         ResolveCounter::Site::ScopeResNoModule.bump();

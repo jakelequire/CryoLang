@@ -264,7 +264,8 @@ span index rebuilt from node slots is legitimate for the LSP and dead-code
 passes.
 
 Path-bearing node kinds requiring a slot (inventory taken 2026-08-03; the
-`ScopeResolutionNode` row landed 2026-08-11, §8.5):
+`ScopeResolutionNode` row landed 2026-08-11, and §8.2ah is the fallback it
+retired):
 
 | Node | Anchor | Slot |
 |---|---|---|
@@ -962,7 +963,7 @@ Measured hit counts, compiler building itself, 2026-08-03:
 | home-module preference (2c) | — | **26,473** | largest answering step; §5.2 deletes it |
 | bootstrap arena (4, 4a) | — | 12,603 | deleted with `bootstrap_mode` |
 | M1 `module_ns_matches_prefix` | 49,718 | 49,586 | 99.7% hit — load-bearing |
-| M2 `resolve_module_qualified_symbol` | 28,748 | 22,516 | |
+| M2 `resolve_module_qualified_symbol` | 28,748 | 22,516 | scan **deleted** — §8.2ah |
 | M3 `collect_namespace_suffix_matches` | 5,669 | **0** | dead |
 | M4 mono bare-name scan | 3,500 | **1** | effectively dead |
 | M5 import suffix fallback | 456 | **456** | 100% — a missing capability, not a heuristic |
@@ -4013,6 +4014,108 @@ pinned filesystem-order defect); compile-fail stays 170/0; `b1-check` reads
 **12,453 across 18 sites, unchanged** — predicted before the edit, and the
 prediction is what makes it evidence: routing the value lane through M2 added no
 new fallback answers on the b1 target.
+
+### 8.2ah M2 is DELETED, and a trait default was never name-resolved — MEASURED 2026-08-11
+
+§8.2's inventory row `M2 resolve_module_qualified_symbol` no longer exists. The
+graph scan under it — match every namespace carrying the written suffix, break
+ties by arity, then by longest shared prefix with the ambient cursor, then by
+enumeration order — is **deleted, not deprecated**, and `ns_shared_prefix_len`,
+its only tie-break helper, went with it. `resolve_module_qualified_symbol` now
+reads the `Res` that NameResolution stamped and returns the empty symbol when
+there is none. There is deliberately no second strategy: the empty answer
+becomes an unresolved-path diagnostic, which is the honest result for a question
+this stage no longer has the inputs to answer.
+
+**What held the lane open was not synthesized nodes.** The residual was
+predicted to be nodes built after NameResolution runs. It was not. Classifying
+each remaining scan answer at the answer itself — `NO-NODE` (no syntax passed),
+`NO-PROVENANCE` (a span naming no module), `UNSTAMPED` (provenance fine, never
+stamped) — put all 88 in the third bucket, with a real file behind every one:
+
+| writer | written | scan answered | enclosing construct |
+|---|---|---|---|
+| `std::core::hash` | `mem::transmute` | `std::core::mem::transmute` | `Hasher::fold` default |
+| `std::random::source` | `core::panic` | `std::core::panic` | `RandomSource::next_below` default |
+| `std::random::secure` | `mem::offset` | `std::core::mem::offset` | `RandomSource::fill` default |
+| `std::alloc::allocator` | `intrinsics::memcpy` | `std::core::intrinsics::memcpy` | `Allocator::reallocate` default |
+
+`visit(TraitDeclNode*)` declared method signatures and stopped. Struct, union,
+class and impl visitors all walk their method bodies; the trait visitor had no
+equivalent, so **no node inside any trait default body was ever name-resolved**.
+The control that made this readable rather than inferred: `mem` is stampable —
+56 stamps from six other modules on the same run, `std::random::secure` among
+them — while `std::core::hash` and `std::random::source` produced **zero stamps
+of any kind**.
+
+The row in the middle of that table is the whole mechanism in one line: the
+ambient cursor said `std::random::secure` while the syntax lived in
+`source.cryo`. A default body is written in the trait's file and instantiated
+against each implementing type, so the cursor names a module that did not write
+the path, and every existing instrument reads green through it.
+
+**Pinned before the fix.** `resolution_trait_default` is a running program: two
+traits in two files, both defaults spelling `Text::tag()`, importing opposite
+parents, implemented by one `Widget` that imports neither. Exit `5+6 = 11`.
+
+| | exit |
+|---|---|
+| pre-fix (`bin/cryo`) | **10** = 5+5 — both defaults bound to `Alpha` |
+| post-fix | **11** |
+
+10 is both bound to Alpha, 12 is both bound to Beta, and 12 is what any resolver
+answering from one global scan order must produce: it has a single answer to
+give and the two files need different ones. That is what makes the exit code
+independent of the enumeration order this host does not control, unlike §2's
+`resolution_leaf_index`.
+
+**Q5 was in the spec and not in the code.** Deleting the scan broke
+`generic_name_collision`, which writes `GenericNameCollision::Alpha::pick<i32>`
+without importing `Alpha`. Q5 ("a package root IS implicitly addressable; a
+fully-qualified path always works") makes that legal, and `stamp_module_scope`'s
+reachability relation was missing the clause — own namespace, prelude and
+imports only. Added as `cand_str.eq(written)`: the WHOLE namespace, so an
+abbreviation like `core::option` stays a proper suffix rooted at an interior
+segment and remains unreachable, exactly as Q5 says.
+
+**Numbers**, `examples/09-json-config`, `--no-incremental`, threads=1:
+
+| row | before | after |
+|---|---:|---:|
+| M2 calls | 2,258 | 2,258 |
+| M2 answered from the stamp | 1,976 | **2,064** |
+| M2 scan hits | 88 | **row deleted** |
+| B1 total | 10,477 | **10,389** |
+| M1 calls / hits | 6,431 / 6,431 | 6,431 / 6,431 |
+
+The −88 is the trait-body fix; the deletion that followed contributes 0, because
+its hits were already 0 when it was removed. Both were predicted before the
+edit.
+
+**Two population holes this measurement had to close first.**
+
+The three refusal counters (`module NOT visible from writer`, `two visible
+modules match`, `stamped module lacks the member`) print only in the end-of-run
+tally, which prints only after a successful link — so the compile_fail corpus,
+the population most likely to name a module its writer cannot see, contributed
+nothing and its blank row read as a zero. Emitting at the refusal instead
+(`SCOPE-RES-REFUSED`, with `SCOPE-RES-STAMPED` as the control, the same pairing
+`vis_record` gives `vis_violation`) put 44 of 46 projects on the record: all
+three counters **0**, against 8,799 stamps. The two that report nothing are
+`reexport_glob_rejected`, which aborts at parse, and `vendor_raylib`, which has
+no external dependency present — both never reach the lane, and neither is a
+silent blind spot.
+
+The second hole is not fixed and is worth naming: **`cryo build` and `cryo test`
+compile different source sets.** A sweep over every `cryoconfig` project reported
+0 residual everywhere while two failures were waiting in files that only
+`cryo test` compiles — a project's own `tests/` subdirectory, and the unit-test
+tree. A corpus sweep that builds is not a corpus sweep that tests.
+
+**Migration.** One source edit: `tests/tests/lang/impl_trait_iter.cryo` wrote
+`mem::offset` while importing no `mem`, and had been binding to a module it
+never imported. It now says `import std::core::mem;` like every other test that
+uses it.
 
 ### 8.3 B2, enumerated — MEASURED 2026-08-09
 

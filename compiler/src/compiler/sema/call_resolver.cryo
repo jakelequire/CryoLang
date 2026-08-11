@@ -660,7 +660,7 @@ type struct CallResolver {
             const callee_node: ASTNode* = call.callee as ASTNode*;
             if (callee_node.kind == NodeKind::ScopeResolution) {
                 param_types = this.lookup_module_qualified_param_types(
-                    call.callee as ScopeResolutionNode*, call);
+                    call.callee as ScopeResolutionNode*);
             }
         }
         // For an EXPLICIT generic free call (`passthru<i32>(...)`), the param
@@ -2558,7 +2558,7 @@ type struct CallResolver {
     /// value form is gated here because it reaches no other gate.
     lookup_scope_value_function(mut &this, scope: ScopeResolutionNode*) -> TypeRef {
         const q_sym: SymbolStr = this.resolve_module_qualified_symbol(
-            scope.scope_name, scope.member_name, null, scope);
+            scope.scope_name, scope.member_name, scope);
         if (!q_sym.is_valid()) { return TypeRef::invalid(); }
         const ft: TypeRef = this.ctx.decl_index.lookup_func_type(q_sym);
         if (!ft.is_valid()) { return TypeRef::invalid(); }
@@ -4702,94 +4702,54 @@ type struct CallResolver {
     }
 
     /// The fully-qualified `namespace::member` symbol a module-qualified call
-    /// (`intrinsics::frexp`, `mem::swap`) names, or the empty symbol when no
-    /// module matches.  The scope written at the call site may be a SUFFIX of
-    /// the defining namespace (`mem` for `std::core::mem`), so the module graph
-    /// is walked rather than the name being interned directly; same-leaf
-    /// collisions are broken by arity, then by longest shared namespace prefix
-    /// with the current module.
+    /// (`intrinsics::frexp`, `mem::swap`) names, or the empty symbol when the
+    /// scope segment does not name a module the writer can see.
+    ///
+    /// The written scope may be any whole-segment SUFFIX of the defining
+    /// namespace (`mem` for `std::core::mem`), and several modules can share
+    /// one suffix, so the spelling alone does not identify the module - the
+    /// imports of the file that wrote it do.  NameResolution answers that while
+    /// those imports are still in hand and records it on the node; this reads
+    /// the answer and does not re-derive it.
+    ///
+    /// There is deliberately NO second strategy when the node carries no
+    /// answer.  The graph scan that used to stand here matched every namespace
+    /// carrying the suffix and broke ties by arity, then by longest shared
+    /// prefix with the ambient cursor, then by enumeration order - none of
+    /// which the source mentions, so it could and did bind a call to a module
+    /// the file never imported.  Returning nothing lets the caller diagnose an
+    /// unresolved path, which is the honest answer to a question this stage no
+    /// longer has the inputs to answer.
     ///
     /// Shared by return-type resolution and by parameter-type lookup so the two
     /// cannot pick different modules: classifying an argument against one
     /// module's signature while the call resolves to another's would hand the
     /// move passes an ownership answer for a function that is not being called.
     resolve_module_qualified_symbol(mut &this, scope_name: SymbolStr, member_name: SymbolStr,
-                                    call: CallExprNode*,
                                     scope: ScopeResolutionNode*) -> SymbolStr {
         ResolveCounter::Site::M2Calls.bump();
-        const scope_str: string = this.intern.resolve(scope_name);
+        if (scope == null) { return SymbolStr::empty(); }
+        const stamped_ns: SymbolStr = scope.scope_res.def_name();
+        if (!stamped_ns.is_valid()) { return SymbolStr::empty(); }
+
         const member_str: string = this.intern.resolve(member_name);
-        const scope_len: i64 = scope_str.length() as i64;
-        if (scope_len == 0) { return SymbolStr::empty(); }
-
-        // NameResolution already answered which module this spelling names,
-        // against the imports of the file that wrote it.  Re-deriving it here
-        // would ask a strictly worse question: by this point the only inputs
-        // left are the graph's enumeration order and whatever module the
-        // compiler is standing in, neither of which the source mentions.
-        if (scope != null) {
-            const stamped_ns: SymbolStr = scope.scope_res.def_name();
-            if (stamped_ns.is_valid()) {
-                const q: SymbolStr = this.ctx.intern(
-                    this.intern.resolve(stamped_ns) + "::" + member_str);
-                if (this.types.lookup_func_return(q).is_valid()) {
-                    ResolveCounter::Site::M2ViaStamp.bump();
-                    return q;
-                }
-                // The module is settled but does not declare the member under
-                // its own name - a re-export would put it elsewhere.  Counted
-                // so the size of that case is known before the scan below is
-                // removed; until then the answer is unchanged.
-                ResolveCounter::Site::M2StampMemberMiss.bump();
-            }
+        const q: SymbolStr = this.ctx.intern(
+            this.intern.resolve(stamped_ns) + "::" + member_str);
+        if (!this.types.lookup_func_return(q).is_valid()) {
+            // The module is settled but does not declare the member under its
+            // own name, which a re-export would explain.  Counted and emitted
+            // rather than searched for elsewhere: looking is what reopens the
+            // lane this function exists to keep closed.
+            ResolveCounter::Site::M2StampMemberMiss.bump();
+            ResolveCounter::scope_res_member_miss(
+                this.intern.resolve(stamped_ns), member_str);
+            return SymbolStr::empty();
         }
-        const mg: ModuleGraph* = this.ctx.module_graph;
-        const modules: &ModuleInfo[] = &mg.modules;
-        const call_arity: i64 = if (call != null) { call.arguments.length } else { -1 };
-        const cur_ns: string = this.current_module_name();
-
-        mut first_i: i64 = -1;
-        mut arity_i: i64 = -1;
-        mut arity_count: i64 = 0;
-        mut prefix_i: i64 = -1;
-        mut prefix_best: i64 = -1;
-        mut prefix_ties: i64 = 0;
-
-        for (mut i: i64 = 0; i < modules.length; i++) {
-            const ns_str: string = this.intern.resolve(modules[i].namespace_name);
-            const ns_len: i64 = ns_str.length() as i64;
-            mut is_match: boolean = false;
-            if (ns_len == scope_len) {
-                is_match = ns_str.eq(scope_str);
-            } else if (ns_len > scope_len + 1) {
-                const suffix_start: i64 = ns_len - scope_len;
-                if (ns_str[suffix_start - 1] == ':' && ns_str[suffix_start - 2] == ':') {
-                    is_match = (ns_str + suffix_start) == scope_str;
-                }
-            }
-            if (!is_match) { continue; }
-            const q_sym: SymbolStr = this.ctx.intern(ns_str + "::" + member_str);
-            if (!this.types.lookup_func_return(q_sym).is_valid()) { continue; }
-            if (first_i < 0) { first_i = i; }
-            if (call_arity >= 0 && this.types.scope_fn_arity(q_sym) == call_arity) {
-                arity_i = i;
-                arity_count = arity_count + 1;
-            }
-            const shared: i64 = ns_shared_prefix_len(cur_ns, ns_str);
-            if (shared > prefix_best) { prefix_best = shared; prefix_i = i; prefix_ties = 1; }
-            else if (shared == prefix_best) { prefix_ties = prefix_ties + 1; }
-        }
-
-        mut chosen_i: i64 = first_i;
-        if (arity_count == 1) { chosen_i = arity_i; }
-        else if (prefix_ties == 1 && prefix_i >= 0) { chosen_i = prefix_i; }
-        if (chosen_i < 0) { return SymbolStr::empty(); }
-
-        ResolveCounter::Site::M2Hits.bump();
-        const chosen_ns: string = this.intern.resolve(modules[chosen_i].namespace_name);
-        ResolveCounter::path_hit("M2", cur_ns, scope_str + "::" + member_str,
-                                      chosen_ns + "::" + member_str);
-        return this.ctx.intern(chosen_ns + "::" + member_str);
+        ResolveCounter::Site::M2ViaStamp.bump();
+        ResolveCounter::path_hit("M2", this.current_module_name(),
+                                 this.intern.resolve(scope_name) + "::" + member_str,
+                                 this.intern.resolve(q));
+        return q;
     }
 
     /// The declared parameter types of a module-qualified free function, for
@@ -4809,11 +4769,10 @@ type struct CallResolver {
     /// generic params (`T*`); the caller substitutes any turbofish args, and
     /// either way the ownership answer is the same, since substitution cannot
     /// turn a pointer parameter into a by-value one.
-    lookup_module_qualified_param_types(mut &this, scope: ScopeResolutionNode*,
-                                        call: CallExprNode*) -> TypeRef[] {
+    lookup_module_qualified_param_types(mut &this, scope: ScopeResolutionNode*) -> TypeRef[] {
         if (this.ctx.decl_index == null || this.ctx.module_graph == null) { return []; }
         const q_sym: SymbolStr = this.resolve_module_qualified_symbol(
-            scope.scope_name, scope.member_name, call, scope);
+            scope.scope_name, scope.member_name, scope);
         if (!q_sym.is_valid()) { return []; }
         const ft: TypeRef = this.ctx.decl_index.lookup_func_type(q_sym);
         if (!ft.is_valid()) { return []; }
@@ -4822,11 +4781,14 @@ type struct CallResolver {
         return sema_copy_type_refs(&(ft_raw as FunctionType*).param_types);
     }
 
-    /// Resolve a module-qualified function (`intrinsics::frexp`) via the module
-    /// graph, disambiguating same-leaf collisions by arity then namespace prefix.
+    /// The return type of a module-qualified function (`intrinsics::frexp`),
+    /// from the module NameResolution recorded on the scope segment.
+    ///
+    /// `call` is for the visibility gate and the template specialization below
+    /// it, not for choosing the module - that question is already answered.
     resolve_module_qualified_function(mut &this, scope_name: SymbolStr, member_name: SymbolStr,
                                       call: CallExprNode*, scope: ScopeResolutionNode*) -> TypeRef {
-        const q_sym: SymbolStr = this.resolve_module_qualified_symbol(scope_name, member_name, call, scope);
+        const q_sym: SymbolStr = this.resolve_module_qualified_symbol(scope_name, member_name, scope);
         if (!q_sym.is_valid()) { return TypeRef::invalid(); }
         const ret: TypeRef = this.types.lookup_func_return(q_sym);
         if (!ret.is_valid()) { return TypeRef::invalid(); }
