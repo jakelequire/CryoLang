@@ -259,9 +259,25 @@ type enum Site {
     HomeDiverge;
     HomeBlindMiss;
 
-    // The five namespace-suffix matchers.
-    M1Calls;
-    M1Hits;
+    // The five namespace-suffix matchers.  M1 is split by CALLER, because its
+    // two callers ask opposite questions of the same predicate: one SEARCHES
+    // the export table for a module the spelling could mean, the other CHECKS
+    // an answer already chosen against the spelling the source wrote.  Pooled
+    // under one row, a validator that never rejects is indistinguishable from
+    // a search that always answers.
+    M1AgreeCalls;
+    M1AgreeHits;
+    M1ExportCalls;
+    M1ExportHits;
+    // Whether either site produced INFORMATION: an answer that differs from
+    // the string it was handed.  The export scan's fall-through returns the
+    // input unchanged, so a hit that reproduces the input is an answer no
+    // caller could tell from the scan not existing.
+    M1ExportNovel;
+    // The check's two negative outcomes, which its `hits` row cannot show:
+    // a rejection, and a leaf that never resolved so the check was not asked.
+    M1QualReject;
+    M1LeafMiss;
     M2Calls;
     M4Calls;
     M4Hits;
@@ -390,8 +406,13 @@ implement enum Site {
             Site::HomeAgree             => { "   " }
             Site::HomeDiverge           => { "!! " }
             Site::HomeBlindMiss         => { "   " }
-            Site::M1Calls               => { "B1 " }
-            Site::M1Hits                => { "B1 " }
+            Site::M1AgreeCalls          => { "B1 " }
+            Site::M1AgreeHits           => { "B1 " }
+            Site::M1ExportCalls         => { "B1 " }
+            Site::M1ExportHits          => { "B1 " }
+            Site::M1ExportNovel         => { "   " }
+            Site::M1QualReject          => { "   " }
+            Site::M1LeafMiss            => { "   " }
             Site::M2Calls               => { "B1 " }
             Site::M4Calls               => { "B1 " }
             Site::M4Hits                => { "B1 " }
@@ -489,8 +510,13 @@ implement enum Site {
             Site::HomeAgree             => { "  both chains agreed" }
             Site::HomeDiverge           => { "  blind chain binds a DIFFERENT type" }
             Site::HomeBlindMiss         => { "  blind chain answers nothing" }
-            Site::M1Calls               => { "M1 module_ns_matches_prefix calls" }
-            Site::M1Hits                => { "M1 module_ns_matches_prefix hits" }
+            Site::M1AgreeCalls          => { "M1 CHECK qualifier_agrees calls" }
+            Site::M1AgreeHits           => { "M1 CHECK qualifier_agrees agreed" }
+            Site::M1ExportCalls         => { "M1 SEARCH export-table scan calls" }
+            Site::M1ExportHits          => { "M1 SEARCH export-table scan hits" }
+            Site::M1ExportNovel         => { "  of those, answer != input" }
+            Site::M1QualReject          => { "  CHECK rejected the leaf answer" }
+            Site::M1LeafMiss            => { "  leaf unresolved, CHECK not asked" }
             Site::M2Calls               => { "M2 resolve_module_qualified_sym calls" }
             Site::M4Calls               => { "M4 mono bare-name template scan" }
             Site::M4Hits                => { "M4 mono bare-name scan hits" }
@@ -998,8 +1024,13 @@ public function report() -> void {
     Site::HomeBlindMiss.print_row();
 
     fmt::eprintf("\n-- namespace-suffix heuristic, 5 copies ---------------\n");
-    Site::M1Calls.print_row();
-    Site::M1Hits.print_row();
+    Site::M1AgreeCalls.print_row();
+    Site::M1AgreeHits.print_row();
+    Site::M1QualReject.print_row();
+    Site::M1LeafMiss.print_row();
+    Site::M1ExportCalls.print_row();
+    Site::M1ExportHits.print_row();
+    Site::M1ExportNovel.print_row();
     Site::M2Calls.print_row();
     Site::M4Calls.print_row();
     Site::M4Hits.print_row();
@@ -1022,6 +1053,14 @@ public function report() -> void {
     // the wrong reason.  Cascade step 5 is deliberately NOT added - it is
     // already inside `Site::LeafHits`, and adding both double-counts it.
     //
+    // `M1AgreeHits` is excluded for the same reason and is the clearest case
+    // of it: `qualifier_agrees` is a CHECK.  Its `true` lets an answer another
+    // lookup already produced stand, so summing it counts that answer twice
+    // and credits the fallback bucket with work no fallback did.  The row
+    // stays flagged and asserted - a validator that starts agreeing with
+    // something it used to refuse is a resolution change, and the golden must
+    // still catch it - it just is not a summand.
+    //
     // The bootstrap arena steps are B1 because Phase 2 deletes
     // `bootstrap_mode` outright; they need a home, not a smaller count.
     mut b1: u64 = 0;
@@ -1032,7 +1071,7 @@ public function report() -> void {
     b1 = b1 + Site::LeafHits.count();
     b1 = b1 + Site::BareAltsViaCanonical.count();
     b1 = b1 + Site::BareAltsViaAmbigDiag.count();
-    b1 = b1 + Site::M1Hits.count();
+    b1 = b1 + Site::M1ExportHits.count();
     b1 = b1 + Site::M4Hits.count();
     b1 = b1 + Site::M5Hits.count();
 
