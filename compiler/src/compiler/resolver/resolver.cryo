@@ -500,16 +500,25 @@ type struct Resolver {
             // is whichever module registered the leaf last, which is not a
             // property the source mentions.
             const leaf_sym: SymbolStr = this.extract_leaf(name_str);
+            mut leaf_answered: boolean = false;
             if (leaf_sym.is_valid()) {
                 const resolved: SymbolStr =
                     this.resolve_type_qualified_name_bare_from(start, leaf_sym);
-                if (resolved.is_valid() && this.qualifier_agrees(resolved, name_str)) {
-                    ResolveCounter::path_hit(
-                        "M1-AGREE", this.intern_table.resolve(this.current_module),
-                        name_str, this.intern_table.resolve(resolved));
-                    return resolved;
+                if (resolved.is_valid()) {
+                    leaf_answered = true;
+                    if (this.qualifier_agrees(resolved, name_str)) {
+                        ResolveCounter::path_hit(
+                            "M1-AGREE", this.intern_table.resolve(this.current_module),
+                            name_str, this.intern_table.resolve(resolved));
+                        return resolved;
+                    }
                 }
             }
+            // Separates the two ways the check produces no answer: it said no,
+            // or it was never asked because nothing resolved. `qualifier_agrees`
+            // hits alone cannot tell those apart, and they call for opposite
+            // fixes.
+            if (!leaf_answered) { ResolveCounter::Site::M1LeafMiss.bump(); }
             // A module-qualified type whose leaf isn't reachable through the
             // current scope chain - e.g. `future::Ready` when only the parent
             // `std::future` was imported, so `Ready` entered as a re-export of
@@ -554,11 +563,20 @@ type struct Resolver {
             if (!sym.name.equals(leaf_sym)) { continue; }
             const mod_sym: SymbolStr = SymbolStr::from_id(this.exports[i].second as u32);
             const mod_str: string = this.intern_table.resolve(mod_sym);
-            if (this.module_ns_matches_prefix(mod_str, prefix_str)) {
+            ResolveCounter::Site::M1ExportCalls.bump();
+            if (Resolver::ns_written_as(mod_str, prefix_str)) {
+                ResolveCounter::Site::M1ExportHits.bump();
+                const answer: string = mod_str + "::" + leaf_str;
+                // An answer equal to the input is one the caller would have got
+                // from this function not existing: the fall-through below hands
+                // `name` back unchanged.
+                if (!answer.eq(name_str)) {
+                    ResolveCounter::Site::M1ExportNovel.bump();
+                }
                 ResolveCounter::path_hit(
                     "M1-EXPORT", this.intern_table.resolve(this.current_module),
-                    name_str, mod_str + "::" + leaf_str);
-                return this.intern_table.intern(mod_str + "::" + leaf_str);
+                    name_str, answer);
+                return this.intern_table.intern(answer);
             }
         }
         return SymbolStr::empty();
@@ -575,8 +593,27 @@ type struct Resolver {
         const written_prefix: string = this.prefix_of(written_str);
         if ((written_prefix.length() as i64) == 0) { return true; }
         const resolved_mod: string = this.prefix_of(this.intern_table.resolve(resolved));
-        if ((resolved_mod.length() as i64) == 0) { return false; }
-        return this.module_ns_matches_prefix(resolved_mod, written_prefix);
+        // Emitted at the refusal, not tallied: the end-of-run report prints
+        // only after a successful link, and the corpus that spells a qualifier
+        // the declaring module contradicts is the compile_fail corpus, which
+        // never gets there. `M1-AGREE` is the control for this line's zero.
+        if ((resolved_mod.length() as i64) == 0) {
+            ResolveCounter::Site::M1QualReject.bump();
+            ResolveCounter::path_hit(
+                "M1-REJECT", this.intern_table.resolve(this.current_module),
+                written_str, "<no module>");
+            return false;
+        }
+        ResolveCounter::Site::M1AgreeCalls.bump();
+        if (!Resolver::ns_written_as(resolved_mod, written_prefix)) {
+            ResolveCounter::Site::M1QualReject.bump();
+            ResolveCounter::path_hit(
+                "M1-REJECT", this.intern_table.resolve(this.current_module),
+                written_str, resolved_mod);
+            return false;
+        }
+        ResolveCounter::Site::M1AgreeHits.bump();
+        return true;
     }
 
     /// Everything before the final "::" in `s`, or empty when there is none.
@@ -593,11 +630,12 @@ type struct Resolver {
         return s.substring(0, last_sep);
     }
 
-    /// True when `prefix_str` is the module namespace `mod_str` with zero or
-    /// more of its LEADING segments omitted — i.e. a whole-segment SUFFIX.
+    /// Whether `written` is how a source file may spell the module whose
+    /// namespace is `mod_str`: the same namespace with zero or more of its
+    /// LEADING segments omitted.
     ///
     /// `future` matches `std::future` (the root `std` is omitted, which is the
-    /// tolerance this function exists to provide) and `other` does not.
+    /// tolerance this predicate exists to provide) and `other` does not.
     ///
     /// It must be a suffix, NOT any interior run. Anchoring to the end is what
     /// makes the qualifier name the module that actually DECLARES the item:
@@ -616,25 +654,15 @@ type struct Resolver {
     ///
     /// Omitting leading segments is a scope question (does `future` name
     /// `std::future` from here?) and stays. Omitting trailing ones is a claim
-    /// about where a declaration lives, and is now false when it is wrong.
-    module_ns_matches_prefix(&this, mod_str: string, prefix_str: string) -> boolean {
-        ResolveCounter::Site::M1Calls.bump();
-        if (!Resolver::ns_written_as(mod_str, prefix_str)) { return false; }
-        ResolveCounter::Site::M1Hits.bump();
-        return true;
-    }
-
-    /// Whether `written` is how a source file may spell the module whose
-    /// namespace is `mod_str`: the same namespace with zero or more of its
-    /// LEADING segments omitted.
+    /// about where a declaration lives, and is false when it is wrong.
     ///
     /// The predicate alone decides nothing.  Used as a guess - "find me a
     /// module this could mean" - it is a fuzzy fallback and its caller is
     /// counted as one.  Used as a FILTER over the modules a file can actually
     /// see, followed by a uniqueness requirement, it is ordinary path
     /// resolution.  Same test, so the two can never drift about what a spelling
-    /// may name; separate entry points, so the accounting does not claim a
-    /// scoped answer is a guess.
+    /// may name; each caller counts itself, so the accounting does not claim a
+    /// scoped answer is a guess — or a validator's `true` is an answer.
     static ns_written_as(mod_str: string, written: string) -> boolean {
         const ml: i64 = mod_str.length() as i64;
         const pl: i64 = written.length() as i64;

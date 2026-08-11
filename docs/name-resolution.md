@@ -962,7 +962,7 @@ Measured hit counts, compiler building itself, 2026-08-03:
 | Global leaf index (cascade step 5) | 62,478 | **17,326** | 18% of all `resolve_named` answers |
 | home-module preference (2c) | — | **26,473** | largest answering step; §5.2 deletes it |
 | bootstrap arena (4, 4a) | — | 12,603 | deleted with `bootstrap_mode` |
-| M1 `module_ns_matches_prefix` | 49,718 | 49,586 | 99.7% hit — load-bearing |
+| M1 `ns_written_as` (check + export scan) | 49,718 | 49,586 | 99.7% hit, ~0 of it information — §8.2ai |
 | M2 `resolve_module_qualified_symbol` | 28,748 | 22,516 | scan **deleted** — §8.2ah |
 | M3 `collect_namespace_suffix_matches` | 5,669 | **0** | dead |
 | M4 mono bare-name scan | 3,500 | **1** | effectively dead |
@@ -4147,6 +4147,144 @@ control's *diagnostic* rather than its source token: the renderer echoes the
 source around an error, so a token on the failing line appears in the output
 whatever the compiler decided about it, and cannot be asserted absent. The
 first version of both projects failed for exactly that reason.
+
+### 8.2ai M1 attributed per caller: a validator that never rejects and a search that never informs — MEASURED 2026-08-11
+
+M1 was 62% of B1 and had never been attributed. One row read **6,431 calls /
+6,431 hits — a predicate that had never once rejected**, which is the shape of
+something counted in the wrong bucket. It was one counted wrapper over two
+callers asking opposite questions of the same predicate, so the row could not
+distinguish a search that always answers from a validator that never refuses.
+The wrapper is gone; each caller now counts itself, and `ns_written_as` — the
+predicate both share, so the two can never drift about what a spelling may
+name — is the only thing left.
+
+| site | question | 09-json-config |
+|---|---|---:|
+| `qualifier_agrees` | **CHECK**: does the answer already chosen agree with the qualifier the source wrote? | 4,804 |
+| export-table scan | **SEARCH**: which module could this spelling mean? | 1,627 |
+
+B1's total did not move (10,389, +0): no answer changed hands, only its
+attribution. Both sums were predicted before the edit, along with the constraint
+that binds them — the scan is entered only when the check refuses or is not
+asked, so `reject + leaf-miss` must be at least the scan's answer count. It is:
+0 + 2,563 ≥ 1,627.
+
+**Neither site produces information.** Two counters decide this, and both are
+new: whether the scan's answer differs from the string it was handed, and
+whether the check ever says no.
+
+```
+M1 CHECK qualifier_agrees calls    4804
+M1 CHECK qualifier_agrees agreed   4804
+  CHECK rejected the leaf answer      0
+  leaf unresolved, CHECK not asked 2563
+M1 SEARCH export-table scan calls  1627
+M1 SEARCH export-table scan hits   1627
+  of those, answer != input           0
+```
+
+A scan hit equal to its input is one no caller could tell from the scan not
+existing, because the fall-through returns the input unchanged. Pooled over
+every population reachable from a Linux host — 43 example and test projects,
+the unit-test tree with all 170 compile_fail negatives, and the compiler's own
+163 modules — the scan answered **91,587 times and was novel once**, and the
+check **refused once**. Both are the same name in the same module:
+
+```
+M1-REJECT  CryoTests::Tests::Stdlib::FutureExecutor
+           future::executor::JoinHandle   vs decl  std::thread
+M1-EXPORT  CryoTests::Tests::Stdlib::FutureExecutor
+           future::executor::JoinHandle -> std::future::executor::JoinHandle
+```
+
+That is the construction the scan was written for, and the pair is the mechanism
+in two lines: `future_executor.cryo` imports `std::thread` and `std::future`
+deliberately, both export a `JoinHandle` leaf, so the leaf-keyed scope chain
+lands on `std::thread::JoinHandle`, the check refuses it against the written
+`future::executor`, and the scan recovers the right one by prefix.
+
+**And the corpus still cannot tell whether the scan exists.** Stubbed to return
+nothing, `make test` reports unit ok, compile-fail 170 passed, projects 33
+passed / 1 failed, and `make examples` builds all 14 — identical to the run
+with it in, including `spawn_returns_the_executors_own_join_handle`, the one
+test whose one answer it supplies. So the refused path reaches a correct binding
+by some *other* route, which makes the scan the redundant middle strategy of
+three answering one question, not the answer to it.
+
+**Which route is not yet known, and the obvious suspect is ruled out.** Building
+the unit tree both ways, threads=1, `--no-incremental`:
+
+| row | scan present | scan stubbed |
+|---|---:|---:|
+| `lookup_by_leaf` hits | 14,905 | 14,905 |
+| — by caller: sema `type_utils` | 14,905 | 14,905 |
+| CHECK rejected | 1 | 4 |
+| SEARCH hits / of those novel | 12,157 / 1 | 0 / 0 |
+| B1 total | 84,738 | 72,581 |
+
+The global leaf index absorbs **none** of it — the natural fear, since a leaf
+answer is the one that binds by directory enumeration order and would make the
+suite's verdict a property of the filesystem rather than the program. B1 falls
+by exactly the scan's hits and nothing else moves, so the work is not handed to
+another counted fallback. It is handed to an **uncounted** one: the fall-through
+returns the abbreviated string `future::executor::JoinHandle` and some later
+lookup accepts it, which means a suffix-abbreviated key resolves somewhere that
+no counter watches. Deleting the scan before that path is named would move a
+question out of sight rather than answer it. The rejection count rising 1 → 4 is
+the same effect from the other side: with nothing short-circuiting it, the
+annotation is re-refused on every later pass.
+
+**A zero measured over the wrong population, again.** The first sweep put the
+scan at 73,420 answers and 0 novel and read as proof it was dead. It was driven
+per project directory, which never compiles the unit-test tree — where the only
+instance lives. The suite-wide sweep that found it went through the test runner,
+which swallows each project's stderr, so the event stream it captured was 3% of
+the events. Neither sweep alone spans the corpus; the union does. A count of
+zero says nothing until the population it was taken over is stated.
+
+**What this makes M1.** 6,430 of 6,431 answers on the gate target confirm a name
+that already named itself: 4,798 of the check's agreements are literally
+`written == resolved`, and 1,627 of the scan's hits reproduce their input. The
+six non-identity agreements (`libc::Whence` → `std::ffi::libc::Whence`) are
+leading-segment abbreviations, and the expansion is the *leaf* resolver's work —
+M1 only checked it. So M1 is not a resolution strategy that happens to be
+right; it is bookkeeping around one, plus a recovery path for a single shape.
+
+**That shape is a `NamedAnnotation`.** `mut h: future::executor::JoinHandle<i64>`
+is an annotation carrying a qualified path, resolved with no provenance beyond
+the leaf and the ambient cursor — the same inputs M2 was answering from before
+its question moved earlier. Its module produced exactly one module-scope stamp
+on the whole run (`thread` → `std::thread`); the annotation's own path produced
+none, so it does not travel the `Res` lane at all. Stamping the node is the M2
+treatment applied to the one case M1 exists to catch, and it is the measured
+reason to take the `NamedAnnotation` row of §6.3 next.
+
+**The check no longer counts toward B1.** `qualifier_agrees` produces no answer:
+its `true` lets stand a binding `resolve_type_qualified_name_bare_from` already
+made, so summing it credits the fallback bucket with another lookup's work and
+counts that binding twice. B1 on the gate target is **5,585**, and the per-site
+rows did not move — the drift report shows `-4,804` with no row added, removed
+or changed, which is what distinguishes a summation fix from a behaviour change.
+The row stays flagged and asserted: a validator that starts agreeing with
+something it used to refuse is a resolution change and the golden must still
+catch it. This is the same rule that already excludes cascade step 5 and every
+`calls` row — B1 counts answers produced, and a check produces none.
+
+**Where the refused path actually binds, narrowed but not closed.** The
+annotation lane is `TypeResolver::canonical_type_name`, which asks
+`resolve_type_qualified_name_from` a second time — from the annotation's HOME
+scope rather than the ambient cursor — and then falls back to the ambient one,
+so the two-strategy shape repeats one level up. The home attempt refuses for the
+same reason the cursor attempt does, and the fall-through hands back the
+abbreviated `future::executor::JoinHandle` as though it were canonical, because
+a non-empty `SymbolStr` reads as valid. `TypeResolver::resolve_named_type`'s own
+chain then answers from a step no counter watches: not `lookup_by_leaf` (Δ 0
+across the stub), not the module-scope stamp (none exists), not `type_utils`'s
+cross-module branch (the abbreviated name never reaches it). Instrumenting that
+chain per outcome, the way `resolve_method_call` was, is what has to happen
+before the export scan can be deleted rather than merely stubbed — otherwise the
+deletion moves the question somewhere with no counter on it.
 
 ### 8.3 B2, enumerated — MEASURED 2026-08-09
 
