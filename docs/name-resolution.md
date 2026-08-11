@@ -4117,6 +4117,37 @@ tree. A corpus sweep that builds is not a corpus sweep that tests.
 never imported. It now says `import std::core::mem;` like every other test that
 uses it.
 
+**Both refusals now report, and NO new error code was needed.** With the scan
+gone each refusal already failed the build, but on the generic unresolved-path
+message. They now name their own cause:
+
+| refusal | code | pinned by |
+|---|---|---|
+| a module carries the spelling, the writer cannot reach it | **E0240** | `resolution_unreachable_module` |
+| two reachable modules carry it | **E0154** | `resolution_ambiguous_module` |
+
+E0240 is `NAMESPACE_NOT_REACHABLE` — "a name that EXISTS but is not reachable
+from the module that wrote it" — which is this case exactly, so minting a code
+would have produced a near-duplicate of one already carrying the meaning. The
+E0240 arm suggests the import that fixes it, naming the whole namespace, since
+what makes the path unreachable is that its first segment binds to nothing.
+
+Both are gated on the segment binding to **nothing in scope**, using the lookup
+`visit(ScopeResolutionNode*)` has already performed. Without that guard a
+segment naming a TYPE would be judged against the module graph, and a type
+sharing its name with any unreachable module anywhere in the program would be
+rejected on the strength of a coincidence. The counters read 0 across the
+corpus, so the two new projects are the only things that make either arm fire —
+a gate nothing exercises is indistinguishable from one that passes.
+
+Each project carries a control (`Only::ping`, a uniquely-suffixed module that
+IS imported) asserted absent from the output. The control lives in its own
+function several lines from the rejection, and the assertion excludes the
+control's *diagnostic* rather than its source token: the renderer echoes the
+source around an error, so a token on the failing line appears in the output
+whatever the compiler decided about it, and cannot be asserted absent. The
+first version of both projects failed for exactly that reason.
+
 ### 8.3 B2, enumerated — MEASURED 2026-08-09
 
 B2 was previously the assoc-type projection alone, and §7.3's "enumerated and

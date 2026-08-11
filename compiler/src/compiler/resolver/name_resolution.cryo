@@ -16,6 +16,7 @@ import Compiler::Resolver::Res;
 import Compiler::ConstTable;
 import Compiler::Diag;
 import Compiler::Diag::{ Snapshot, SourceSpan };
+import Compiler::Diag::Diagnostic;
 import Compiler::AST;
 import Compiler::AST::{ Node, Expression, Statement, Declaration, Pattern, Visitor };
 import Compiler::Passes::PassID;
@@ -550,7 +551,11 @@ public:
         if (scope_sym.is_valid()) {
             this.resolver.record_resolution(node.span, scope_sym);
         }
-        this.stamp_module_scope(node);
+        // A segment that already binds in scope names a TYPE (or a value), and
+        // what its members are is sema's question, not this one.  Passing that
+        // through is what keeps the two refusals below from judging a type that
+        // merely shares its name with some module elsewhere in the program.
+        this.stamp_module_scope(node, scope_sym.is_valid());
         // Member resolution within the type's scope is deferred to
         // TypeResolution (needs type info to find the TypeBody scope).
     }
@@ -568,7 +573,14 @@ public:
     /// Silent when the segment names no visible module.  That is not this
     /// question failing: a segment naming a TYPE needs a receiver type, which
     /// does not exist yet, and belongs to sema.
-    stamp_module_scope(&this, node: ScopeResolutionNode*) -> void {
+    ///
+    /// Reports only when the segment binds to NOTHING in scope and a module
+    /// nevertheless carries the spelling - then the source has written a module
+    /// path, and the two ways it can fail are worth naming where they happen.
+    /// `binds_in_scope` is the caller's already-answered lookup, not a second
+    /// one: asking again here would be the same question with a second answer.
+    stamp_module_scope(&this, node: ScopeResolutionNode*,
+                       binds_in_scope: boolean) -> void {
         if (this.ctx == null || this.ctx.module_graph == null) { return; }
         if (this.ctx.decl_index == null) { return; }
 
@@ -631,20 +643,45 @@ public:
             // spelling does not name one of them.  Left unstamped and counted
             // rather than picked, because picking is the defect.
             ResolveCounter::Site::ScopeResAmbiguous.bump();
+            const a: string = this.resolver.intern_table.resolve(found);
+            const b: string = this.resolver.intern_table.resolve(other);
             ResolveCounter::scope_res_refused(
                 "AMBIGUOUS", this.resolver.intern_table.resolve(use_ns), written,
-                this.resolver.intern_table.resolve(found) + " | "
-                    + this.resolver.intern_table.resolve(other));
+                a + " | " + b);
+            if (!binds_in_scope) {
+                mut d: Diagnostic = Diagnostic::error(
+                    ErrorCode::E0154_AMBIGUOUS_CALL,
+                    format("`%s` names more than one module in scope", written));
+                d = d.at_with_label(node.scope_span, "ambiguous module path");
+                d = d.with_note(format("it could be `%s` or `%s`", a, b));
+                d = d.with_note(
+                    "write the path out in full to say which one is meant");
+                this.ctx.emit_diagnostic(d);
+            }
             return;
         }
         if (matched > 0) {
-            // A module carries this spelling but the writer cannot see it.
-            // Counted, not rejected: whether this is always an error is the
-            // question the count is here to answer.
+            // A module carries this spelling and the writer cannot reach it.
+            // The name exists, so this is E0240's story and not "no such name"
+            // (E0203) nor "reachable but private" (E0353).
             ResolveCounter::Site::ScopeResUnreachable.bump();
+            const owner: string = this.resolver.intern_table.resolve(any);
             ResolveCounter::scope_res_refused(
                 "UNREACHABLE", this.resolver.intern_table.resolve(use_ns), written,
-                this.resolver.intern_table.resolve(any));
+                owner);
+            if (!binds_in_scope) {
+                mut d: Diagnostic = Diagnostic::error(
+                    ErrorCode::E0240_NAMESPACE_NOT_REACHABLE,
+                    format("`%s` is not reachable from this module", written));
+                d = d.at_with_label(node.scope_span, "not reachable in this scope");
+                // The import names the WHOLE namespace: what makes the path
+                // unreachable is that its first segment binds to nothing here,
+                // and only the full path fixes that.
+                d = d.with_note(format("`%s` is the module it would name", owner));
+                d = d.with_note(
+                    format("add `import %s;` to bring it into scope", owner));
+                this.ctx.emit_diagnostic(d);
+            }
             return;
         }
         ResolveCounter::Site::ScopeResNoModule.bump();
