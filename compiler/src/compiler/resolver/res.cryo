@@ -1,0 +1,82 @@
+/// Res
+///
+/// What a written path refers to, recorded ON the node that wrote it.
+///
+/// A span-keyed side table cannot be exact: two spans that pack to the same
+/// key silently overwrite each other, and a synthesized node has no span to
+/// key on at all.  A slot on the node has neither failure mode, and it cannot
+/// desynchronize from the syntax it answers for.
+///
+/// Two rules make the answer safe to copy and safe to trust:
+///
+/// **A `Res` names a definition, never an instantiation.**  `T` stamps
+/// `GenericParam("T")`, not whatever `T` is bound to at some call site.
+/// Substitution happens strictly below this, in the type layer.  That is what
+/// lets `ASTCloner` copy a `Res` verbatim, and it is the difference between
+/// this and `NamedAnnotation.pre_resolved`, which holds a `TypeRef` - an
+/// instantiation - and therefore has to be dropped on every clone.
+///
+/// **`Err` is an answer, not a failure.**  It is produced once, with its
+/// diagnostic already emitted, and poisons downstream without triggering a
+/// second lookup.  There is deliberately no state meaning "did not resolve,
+/// try something else": that state is what grows a resolution cascade, because
+/// each recovery path added to it becomes a correctness path the next time
+/// something reaches it.
+///
+/// `Unstamped` is NOT that state.  It means no resolver has claimed this node
+/// - a path whose first segment names a type rather than a module is answered
+/// by the type layer, which needs a receiver type and so cannot run here.
+/// Reaching a stage that requires a stamp while still `Unstamped` is an
+/// internal error, never a licence to guess.
+
+namespace Compiler::Resolver::Res;
+
+import Compiler::Resolver::SymbolStr;
+import Compiler::Resolver::SymbolID;
+
+type enum Res {
+    /// No resolver has answered for this node yet.
+    Unstamped;
+    /// A declaration or module, by its canonical qualified name.
+    Def(SymbolStr);
+    /// A local binding (parameter or local variable).
+    Local(SymbolID);
+    /// A type parameter, BY NAME - never the type it is bound to.
+    GenericParam(SymbolStr);
+    /// A primitive, by its spelling.
+    PrimTy(SymbolStr);
+    /// Resolution failed and the diagnostic has already been emitted.
+    Err;
+}
+
+implement enum Res {
+    /// Whether a resolver has answered for this node, for any answer
+    /// including a failed one.
+    is_stamped(&this) -> boolean {
+        return match (&this) {
+            Res::Unstamped => { false }
+            _              => { true }
+        };
+    }
+
+    /// The qualified name of a resolved definition, or an empty SymbolStr for
+    /// every other answer.  Callers that only accept a definition use this;
+    /// callers that must tell `Err` apart from `Unstamped` match instead.
+    def_name(&this) -> SymbolStr {
+        return match (&this) {
+            Res::Def(q) => { q }
+            _           => { SymbolStr::empty() }
+        };
+    }
+
+    to_string(&this) -> string {
+        return match (&this) {
+            Res::Unstamped       => { "Unstamped" }
+            Res::Def(_)          => { "Def" }
+            Res::Local(_)        => { "Local" }
+            Res::GenericParam(_) => { "GenericParam" }
+            Res::PrimTy(_)       => { "PrimTy" }
+            Res::Err             => { "Err" }
+        };
+    }
+}

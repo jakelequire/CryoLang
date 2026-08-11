@@ -619,20 +619,33 @@ type struct Resolver {
     /// about where a declaration lives, and is now false when it is wrong.
     module_ns_matches_prefix(&this, mod_str: string, prefix_str: string) -> boolean {
         ResolveCounter::Site::M1Calls.bump();
-        const ml: i64 = mod_str.length() as i64;
-        const pl: i64 = prefix_str.length() as i64;
-        if (pl == 0 || pl > ml) { return false; }
-        // Only one alignment can be a suffix, so this is a single check rather
-        // than the scan it used to be.
-        const i: i64 = ml - pl;
-        if (!mod_str.substring(i, pl).eq(prefix_str)) { return false; }
-        // ...and it must start ON a segment boundary, so `ture` does not match
-        // `std::future`.
-        const boundary_before: boolean =
-            i == 0 || (i >= 2 && mod_str[i - 1] == ':' && mod_str[i - 2] == ':');
-        if (!boundary_before) { return false; }
+        if (!Resolver::ns_written_as(mod_str, prefix_str)) { return false; }
         ResolveCounter::Site::M1Hits.bump();
         return true;
+    }
+
+    /// Whether `written` is how a source file may spell the module whose
+    /// namespace is `mod_str`: the same namespace with zero or more of its
+    /// LEADING segments omitted.
+    ///
+    /// The predicate alone decides nothing.  Used as a guess - "find me a
+    /// module this could mean" - it is a fuzzy fallback and its caller is
+    /// counted as one.  Used as a FILTER over the modules a file can actually
+    /// see, followed by a uniqueness requirement, it is ordinary path
+    /// resolution.  Same test, so the two can never drift about what a spelling
+    /// may name; separate entry points, so the accounting does not claim a
+    /// scoped answer is a guess.
+    static ns_written_as(mod_str: string, written: string) -> boolean {
+        const ml: i64 = mod_str.length() as i64;
+        const pl: i64 = written.length() as i64;
+        if (pl == 0 || pl > ml) { return false; }
+        // Only one alignment can be a suffix, so this is a single check rather
+        // than a scan.
+        const i: i64 = ml - pl;
+        if (!mod_str.substring(i, pl).eq(written)) { return false; }
+        // ...and it must start ON a segment boundary, so `ture` does not match
+        // `std::future`.
+        return i == 0 || (i >= 2 && mod_str[i - 1] == ':' && mod_str[i - 2] == ':');
     }
 
     /// The defining module of the function a bare name resolves to here, or an

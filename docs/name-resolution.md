@@ -200,12 +200,28 @@ here; it is not a stylistic choice.
 Produced by the resolver, before types exist.
 
 ```
-Res = Def(SymbolID)        // a resolved declaration
-    | Local(...)           // a local binding
-    | GenericParam(...)    // a type parameter, BY NAME
-    | PrimTy(...)          // a primitive
+Res = Unstamped            // no resolver has answered for this node
+    | Def(SymbolStr)       // a declaration or module, by canonical qualified name
+    | Local(SymbolID)      // a local binding
+    | GenericParam(SymbolStr)  // a type parameter, BY NAME
+    | PrimTy(SymbolStr)    // a primitive
     | Err                  // resolution failed; diagnostic ALREADY emitted
 ```
+
+**`Def` carries a qualified name, not a `SymbolID`.** An earlier revision of
+this section wrote `Def(SymbolID)`. A `SymbolID` indexes the Resolver's own
+arena, and two things make it the wrong handle for this answer: modules are not
+declared there at all, so a module scope has no `SymbolID` to name, and every
+downstream consumer — `DeclarationIndex`, the type arena, the mangler — keys on
+the interned qualified name, so a `SymbolID` stamp would have to be translated
+back at each use, re-deriving the thing the stamp exists to stop re-deriving.
+Decided 2026-08-11 with the first stamped lane (§8.5).
+
+**`Unstamped` is not "unresolved".** It means no resolver has claimed the node —
+which for a path-bearing node is a routing fact, not a failure: a first segment
+naming a *type* needs a receiver type and belongs to `TypeDependentRes` below.
+Reaching a stage that requires the stamp while still `Unstamped` is an ICE
+(§7.2 mechanism 4), never a licence to search.
 
 Two invariants:
 
@@ -247,18 +263,19 @@ better choice here — cheaper, and impossible to desynchronize — but a derive
 span index rebuilt from node slots is legitimate for the LSP and dead-code
 passes.
 
-Path-bearing node kinds requiring a slot (inventory taken 2026-08-03):
+Path-bearing node kinds requiring a slot (inventory taken 2026-08-03; the
+`ScopeResolutionNode` row landed 2026-08-11, §8.5):
 
-| Node | Anchor |
-|---|---|
-| `IdentifierNode` | `AST/expression.cryo:104` |
-| `ScopeResolutionNode` | `AST/expression.cryo:789` |
-| `NamedAnnotation` | `AST/_module.cryo:456` |
-| `NewExprNode` | `AST/expression.cryo:436` |
-| `SizeofExprNode` / `AlignofExprNode` | `AST/expression.cryo:483`, `:506` |
-| `CallExprNode` (callee) | `AST/expression.cryo:398` |
-| `ImportDeclNode` (per segment) | `AST/declaration.cryo:575` |
-| enum variant reference | `AST/expression.cryo:424` |
+| Node | Anchor | Slot |
+|---|---|---|
+| `IdentifierNode` | `AST/expression.cryo:104` | — |
+| `ScopeResolutionNode` | `AST/expression.cryo:789` | **`scope_res`** (SCOPE segment) |
+| `NamedAnnotation` | `AST/_module.cryo:456` | — |
+| `NewExprNode` | `AST/expression.cryo:436` | — |
+| `SizeofExprNode` / `AlignofExprNode` | `AST/expression.cryo:483`, `:506` | — |
+| `CallExprNode` (callee) | `AST/expression.cryo:398` | — |
+| `ImportDeclNode` (per segment) | `AST/declaration.cryo:575` | — |
+| enum variant reference | `AST/expression.cryo:424` | — |
 
 ---
 
