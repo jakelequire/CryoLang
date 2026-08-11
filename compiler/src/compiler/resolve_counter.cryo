@@ -263,7 +263,6 @@ type enum Site {
     M1Calls;
     M1Hits;
     M2Calls;
-    M2Hits;
     M4Calls;
     M4Hits;
     M5Calls;
@@ -394,7 +393,6 @@ implement enum Site {
             Site::M1Calls               => { "B1 " }
             Site::M1Hits                => { "B1 " }
             Site::M2Calls               => { "B1 " }
-            Site::M2Hits                => { "B1 " }
             Site::M4Calls               => { "B1 " }
             Site::M4Hits                => { "B1 " }
             Site::M5Calls               => { "B1 " }
@@ -494,7 +492,6 @@ implement enum Site {
             Site::M1Calls               => { "M1 module_ns_matches_prefix calls" }
             Site::M1Hits                => { "M1 module_ns_matches_prefix hits" }
             Site::M2Calls               => { "M2 resolve_module_qualified_sym calls" }
-            Site::M2Hits                => { "M2 resolve_module_qualified_sym hits" }
             Site::M4Calls               => { "M4 mono bare-name template scan" }
             Site::M4Hits                => { "M4 mono bare-name scan hits" }
             Site::M5Calls               => { "M5 import suffix fallback calls" }
@@ -743,6 +740,51 @@ public function path_hit(kind: string, use_site: string,
     fmt::eprintf("PATH-HIT\t%s\t%s\t%s\t%s\n", kind, use_site, written, resolved);
 }
 
+/// Log one module-scope segment that was NOT stamped although some module
+/// spells it, naming which of the two refusals fired.
+///
+/// Emitted at the refusal rather than tallied, for the same reason as
+/// `vis_gate_reject`: the end-of-run report prints only after a successful
+/// link, and the corpus most likely to name a module its writer cannot see is
+/// the compile_fail corpus, which never gets there.  A zero pooled from
+/// linking projects alone is a zero measured over the population that by
+/// construction has no such case.
+///
+/// `reason` is `UNREACHABLE` (a module carries the spelling, the writer cannot
+/// reach it) or `AMBIGUOUS` (two reachable modules carry it, so the spelling
+/// names neither).  `cand` is one matching namespace: the count says how big
+/// the case is, only the namespace says what it is.
+public function scope_res_refused(reason: string, use_site: string,
+                                  written: string, cand: string) -> void {
+    if (!Audit::Path.enabled()) { return; }
+    fmt::eprintf("SCOPE-RES-REFUSED\t%s\t%s\t%s\t%s\n",
+                 reason, use_site, written, cand);
+}
+
+/// Log one module-scope segment that WAS stamped.
+///
+/// The control for `scope_res_refused`'s zero, and the same role `vis_record`
+/// plays for `vis_violation`: on a build that does not link there is no
+/// end-of-run tally, so "no refusals" and "this lane was never reached" emit
+/// exactly the same nothing.  Pair the two counts and the zero becomes
+/// readable.
+public function scope_res_stamped(use_site: string, written: string,
+                                  cand: string) -> void {
+    if (!Audit::Path.enabled()) { return; }
+    fmt::eprintf("SCOPE-RES-STAMPED\t%s\t%s\t%s\n", use_site, written, cand);
+}
+
+/// Log one settled module scope that does not declare the member under its own
+/// name - the call resolves to nothing and the caller diagnoses an unknown path.
+///
+/// Emitted at the event for the same reason as `scope_res_refused`.  The
+/// qualified name is what classifies it - a re-export puts the declaration in
+/// another namespace, and only the pair says which.
+public function scope_res_member_miss(stamped_ns: string, member: string) -> void {
+    if (!Audit::Path.enabled()) { return; }
+    fmt::eprintf("SCOPE-RES-MEMBER-MISS\t%s\t%s\n", stamped_ns, member);
+}
+
 /// Dump one `module -> visible namespace` edge, so the offline classifier can
 /// ask the compiler's OWN reachability question ("is this first segment in
 /// scope here?") instead of re-deriving it with a regex over import lines,
@@ -959,7 +1001,6 @@ public function report() -> void {
     Site::M1Calls.print_row();
     Site::M1Hits.print_row();
     Site::M2Calls.print_row();
-    Site::M2Hits.print_row();
     Site::M4Calls.print_row();
     Site::M4Hits.print_row();
     Site::M5Calls.print_row();
@@ -992,7 +1033,6 @@ public function report() -> void {
     b1 = b1 + Site::BareAltsViaCanonical.count();
     b1 = b1 + Site::BareAltsViaAmbigDiag.count();
     b1 = b1 + Site::M1Hits.count();
-    b1 = b1 + Site::M2Hits.count();
     b1 = b1 + Site::M4Hits.count();
     b1 = b1 + Site::M5Hits.count();
 
