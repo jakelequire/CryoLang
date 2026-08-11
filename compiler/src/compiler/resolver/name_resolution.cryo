@@ -12,6 +12,7 @@ namespace Compiler::Resolver::NameResolution;
 
 import Compiler::Resolver;
 import Compiler::Resolver::{ SymbolID, SymbolStr, Symbol, Scope, Resolver, QualifiedName, InternTable };
+import Compiler::Resolver::Res;
 import Compiler::ConstTable;
 import Compiler::Diag;
 import Compiler::Diag::{ Snapshot, SourceSpan };
@@ -537,8 +538,82 @@ public:
         if (scope_sym.is_valid()) {
             this.resolver.record_resolution(node.span, scope_sym);
         }
+        this.stamp_module_scope(node);
         // Member resolution within the type's scope is deferred to
         // TypeResolution (needs type info to find the TypeBody scope).
+    }
+
+    /// Record which MODULE the scope segment of `Ns::member` names, as the file
+    /// that wrote it can see.
+    ///
+    /// The source may spell any whole-segment suffix of a module's namespace,
+    /// and several modules can share one suffix, so the spelling alone does not
+    /// identify the module - the writer's imports do.  Answering that once,
+    /// here, is what stops the question being re-asked later from wherever the
+    /// compiler happens to be standing, where the only inputs left are the
+    /// graph's order and the ambient cursor.
+    ///
+    /// Silent when the segment names no visible module.  That is not this
+    /// question failing: a segment naming a TYPE needs a receiver type, which
+    /// does not exist yet, and belongs to sema.
+    stamp_module_scope(&this, node: ScopeResolutionNode*) -> void {
+        if (this.ctx == null || this.ctx.module_graph == null) { return; }
+        if (this.ctx.decl_index == null) { return; }
+
+        // The use site comes from the syntax.  A span naming no module means
+        // this node was synthesized, and a synthesizer that knows what it is
+        // referring to sets the `Res` itself; guessing a use site here would
+        // compare an unknown writer unequal to every real module and reject
+        // what it cannot place.
+        const use_ns: SymbolStr =
+            this.ctx.module_ns_sym_of_file(node.scope_span.file);
+        if (!use_ns.is_valid()) { return; }
+
+        const written: string = this.resolver.intern_table.resolve(node.scope_name);
+        if (written.length() == 0) { return; }
+
+        mut found:   SymbolStr = SymbolStr::empty();
+        mut visible: i64 = 0;
+        mut matched: i64 = 0;
+        const count: i64 = this.ctx.module_graph.module_count() as i64;
+        for (mut i: i64 = 0; i < count; i++) {
+            const cand: ModuleInfo* = this.ctx.module_graph.get_module(i);
+            const cand_ns: SymbolStr = cand.namespace_name;
+            if (!cand_ns.is_valid()) { continue; }
+            const cand_str: string = this.resolver.intern_table.resolve(cand_ns);
+            if (!Resolver::ns_written_as(cand_str, written)) { continue; }
+            matched = matched + 1;
+            // The same reachability relation same-leaf resolution uses: the
+            // module's own namespace, anything it imports (the registered set
+            // is already closed over re-exports), or the prelude.
+            const reachable: boolean = cand_ns.id == use_ns.id
+                || this.ctx.decl_index.is_prelude_ns(cand_ns)
+                || this.ctx.decl_index.ns_imports(use_ns, cand_ns);
+            if (!reachable) { continue; }
+            visible = visible + 1;
+            if (visible == 1) { found = cand_ns; }
+        }
+
+        if (visible == 1) {
+            node.set_scope_res(Res::Def(found));
+            ResolveCounter::Site::ScopeResStamped.bump();
+            return;
+        }
+        if (visible > 1) {
+            // Two modules the writer can see, both spelled this way: the
+            // spelling does not name one of them.  Left unstamped and counted
+            // rather than picked, because picking is the defect.
+            ResolveCounter::Site::ScopeResAmbiguous.bump();
+            return;
+        }
+        if (matched > 0) {
+            // A module carries this spelling but the writer cannot see it.
+            // Counted, not rejected: whether this is always an error is the
+            // question the count is here to answer.
+            ResolveCounter::Site::ScopeResUnreachable.bump();
+            return;
+        }
+        ResolveCounter::Site::ScopeResNoModule.bump();
     }
 
     override visit(node: CallExprNode*) -> void {

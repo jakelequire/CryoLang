@@ -2558,7 +2558,7 @@ type struct CallResolver {
     /// value form is gated here because it reaches no other gate.
     lookup_scope_value_function(mut &this, scope: ScopeResolutionNode*) -> TypeRef {
         const q_sym: SymbolStr = this.resolve_module_qualified_symbol(
-            scope.scope_name, scope.member_name, null);
+            scope.scope_name, scope.member_name, null, scope);
         if (!q_sym.is_valid()) { return TypeRef::invalid(); }
         const ft: TypeRef = this.ctx.decl_index.lookup_func_type(q_sym);
         if (!ft.is_valid()) { return TypeRef::invalid(); }
@@ -4714,12 +4714,35 @@ type struct CallResolver {
     /// module's signature while the call resolves to another's would hand the
     /// move passes an ownership answer for a function that is not being called.
     resolve_module_qualified_symbol(mut &this, scope_name: SymbolStr, member_name: SymbolStr,
-                                    call: CallExprNode*) -> SymbolStr {
+                                    call: CallExprNode*,
+                                    scope: ScopeResolutionNode*) -> SymbolStr {
         ResolveCounter::Site::M2Calls.bump();
         const scope_str: string = this.intern.resolve(scope_name);
         const member_str: string = this.intern.resolve(member_name);
         const scope_len: i64 = scope_str.length() as i64;
         if (scope_len == 0) { return SymbolStr::empty(); }
+
+        // NameResolution already answered which module this spelling names,
+        // against the imports of the file that wrote it.  Re-deriving it here
+        // would ask a strictly worse question: by this point the only inputs
+        // left are the graph's enumeration order and whatever module the
+        // compiler is standing in, neither of which the source mentions.
+        if (scope != null) {
+            const stamped_ns: SymbolStr = scope.scope_res.def_name();
+            if (stamped_ns.is_valid()) {
+                const q: SymbolStr = this.ctx.intern(
+                    this.intern.resolve(stamped_ns) + "::" + member_str);
+                if (this.types.lookup_func_return(q).is_valid()) {
+                    ResolveCounter::Site::M2ViaStamp.bump();
+                    return q;
+                }
+                // The module is settled but does not declare the member under
+                // its own name - a re-export would put it elsewhere.  Counted
+                // so the size of that case is known before the scan below is
+                // removed; until then the answer is unchanged.
+                ResolveCounter::Site::M2StampMemberMiss.bump();
+            }
+        }
         const mg: ModuleGraph* = this.ctx.module_graph;
         const modules: &ModuleInfo[] = &mg.modules;
         const call_arity: i64 = if (call != null) { call.arguments.length } else { -1 };
@@ -4790,7 +4813,7 @@ type struct CallResolver {
                                         call: CallExprNode*) -> TypeRef[] {
         if (this.ctx.decl_index == null || this.ctx.module_graph == null) { return []; }
         const q_sym: SymbolStr = this.resolve_module_qualified_symbol(
-            scope.scope_name, scope.member_name, call);
+            scope.scope_name, scope.member_name, call, scope);
         if (!q_sym.is_valid()) { return []; }
         const ft: TypeRef = this.ctx.decl_index.lookup_func_type(q_sym);
         if (!ft.is_valid()) { return []; }
@@ -4803,7 +4826,7 @@ type struct CallResolver {
     /// graph, disambiguating same-leaf collisions by arity then namespace prefix.
     resolve_module_qualified_function(mut &this, scope_name: SymbolStr, member_name: SymbolStr,
                                       call: CallExprNode*, scope: ScopeResolutionNode*) -> TypeRef {
-        const q_sym: SymbolStr = this.resolve_module_qualified_symbol(scope_name, member_name, call);
+        const q_sym: SymbolStr = this.resolve_module_qualified_symbol(scope_name, member_name, call, scope);
         if (!q_sym.is_valid()) { return TypeRef::invalid(); }
         const ret: TypeRef = this.types.lookup_func_return(q_sym);
         if (!ret.is_valid()) { return TypeRef::invalid(); }
