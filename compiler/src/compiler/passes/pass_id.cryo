@@ -31,6 +31,18 @@ type enum PassID {
     // Stage 2: Module Resolution
     AutoImport;
     ImportResolution;
+    /// Declares and exports a module's own top-level names, and nothing else.
+    ///
+    /// Separate from NameResolution because an import is answered from the
+    /// declaring module's EXPORTS, which exist only once that module has been
+    /// declared.  Run per-module in sequence, a module in an import cycle
+    /// processes its import against a partner that has exported nothing yet and
+    /// declares no symbol at all for it - so the name is missing from the
+    /// importing scope for the rest of the compilation.  Running this across
+    /// every module first makes "exports exist before any import is processed"
+    /// true by construction rather than a property of the topological order,
+    /// which no order can supply inside a cycle.
+    NameDeclaration;
     NameResolution;
 
     // Stage 3: Declaration Collection
@@ -90,6 +102,7 @@ implement enum PassID {
             PassID::CHeaderImport               => { "CHeaderImport"               }
             PassID::AutoImport                  => { "AutoImport"                  }
             PassID::ImportResolution            => { "ImportResolution"            }
+            PassID::NameDeclaration             => { "NameDeclaration"             }
             PassID::NameResolution              => { "NameResolution"              }
             PassID::TypeDeclaration             => { "TypeDeclaration"             }
             PassID::FunctionSignature           => { "FunctionSignature"           }
@@ -134,6 +147,7 @@ implement enum PassID {
             PassID::Parsing               => { true  }
             PassID::ASTValidation         => { true  }
             PassID::CHeaderImport         => { false }
+            PassID::NameDeclaration       => { true  }
             PassID::NameResolution        => { true  }
             PassID::TypeResolution        => { false }
             PassID::GenericValidation     => { true  }
@@ -223,13 +237,25 @@ implement enum PassID {
                     provisions:       [Provision::ModulesLoaded, Provision::ModuleOrder],
                 }
             }
+            PassID::NameDeclaration => {
+                PassMetadata {
+                    id:               PassID::NameDeclaration,
+                    name:             "NameDeclaration",
+                    stage:            PassStage::ModuleResolution,
+                    order:            6,
+                    requirements:     [PassRequirement::required(Provision::ASTValidated),
+                                       PassRequirement::optional(Provision::ModulesLoaded)],
+                    provisions:       [Provision::NamesDeclared],
+                }
+            }
             PassID::NameResolution => {
                 PassMetadata {
                     id:               PassID::NameResolution,
                     name:             "NameResolution",
                     stage:            PassStage::ModuleResolution,
-                    order:            6,
+                    order:            7,
                     requirements:     [PassRequirement::required(Provision::ASTValidated),
+                                       PassRequirement::required(Provision::NamesDeclared),
                                        PassRequirement::optional(Provision::ModulesLoaded)],
                     provisions:       [Provision::NamesResolved],
                 }
@@ -472,6 +498,8 @@ type enum Provision {
     ImportsDiscovered;
     ModulesLoaded;
     ModuleOrder;
+    /// Every module's own top-level names are declared and exported.
+    NamesDeclared;
     NamesResolved;
     TypeDeclarations;
     FunctionSignatures;
@@ -505,6 +533,7 @@ implement enum Provision {
             Provision::ImportsDiscovered          => { 4  }
             Provision::ModulesLoaded              => { 5  }
             Provision::ModuleOrder                => { 6  }
+            Provision::NamesDeclared              => { 28 }
             Provision::NamesResolved              => { 7  }
             Provision::TypeDeclarations           => { 8  }
             Provision::FunctionSignatures         => { 9  }
@@ -537,6 +566,7 @@ implement enum Provision {
             Provision::ImportsDiscovered          => { "ImportsDiscovered"          }
             Provision::ModulesLoaded              => { "ModulesLoaded"              }
             Provision::ModuleOrder                => { "ModuleOrder"                }
+            Provision::NamesDeclared              => { "NamesDeclared"              }
             Provision::NamesResolved              => { "NamesResolved"              }
             Provision::TypeDeclarations           => { "TypeDeclarations"           }
             Provision::FunctionSignatures         => { "FunctionSignatures"         }

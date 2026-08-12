@@ -2745,14 +2745,27 @@ type struct CompilerInstance {
         return true;
     }
 
-    /// Module resolution: AutoImport, ImportResolution, NameResolution over
-    /// every module.  Saves each module's resolver scope into `scope_buf` for
-    /// later stages to restore.
+    /// Module resolution, in two sweeps over every module: AutoImport +
+    /// ImportResolution + NameDeclaration, then NameResolution.  Saves each
+    /// module's resolver scope into `scope_buf` for later stages to restore.
+    ///
+    /// The sweeps are separate because an import is answered from the declaring
+    /// module's EXPORTS, which exist only once that module has been declared.
+    /// Declaring and walking a module together makes that a property of the
+    /// topological order, and inside an import cycle no order can put every
+    /// declarer first: the module walked first processes its import against a
+    /// partner that has exported nothing, declares no symbol for it, and the
+    /// name stays absent from its scope for the whole compilation.  Declaring
+    /// every module first makes the invariant true by construction - the same
+    /// reason `register_templates` runs across all modules before any
+    /// DefaultExpansion consults the registry.
     run_module_resolution(&this, ctx: CompilationContext*, pipeline: PassRegistry*,
                           ast_buf: void*, scope_buf: void*) -> boolean {
         const order: &u32[] = &ctx.module_graph.topo_order;
         const n: u32 = order.length as u32;
-        pipeline.set_passes([PassID::AutoImport, PassID::ImportResolution, PassID::NameResolution]);
+
+        pipeline.set_passes([PassID::AutoImport, PassID::ImportResolution,
+                             PassID::NameDeclaration]);
         {
             mut initial3: ProvisionSet = ProvisionSet::empty();
             initial3.mark(Provision::ASTValidated);
@@ -2768,7 +2781,42 @@ type struct CompilerInstance {
             if (!pipeline.run_all(ctx)) {
                 return false;
             }
-            // Save the resolver's scope to local buffer
+            // Save the scope NameDeclaration filled, so the walk below resumes
+            // in the scope holding this module's own names rather than a fresh
+            // one.
+            if (ctx.resolver != null && ctx.active_module_index >= 0) {
+                const scope_val: u64 = ctx.resolver.get_current_scope_id();
+                const sc_idx: u32 = ctx.active_module_index as u32;
+                if (sc_idx < n) {
+                    const sc_slot: u64* = (scope_buf as u64*) + sc_idx;
+                    *sc_slot = scope_val;
+                }
+            }
+            pipeline.reset();
+        }
+
+        pipeline.set_passes([PassID::NameResolution]);
+        {
+            mut initial3b: ProvisionSet = ProvisionSet::empty();
+            initial3b.mark(Provision::ASTValidated);
+            initial3b.mark(Provision::NamesDeclared);
+            pipeline.validate_with_initial(initial3b);
+        }
+
+        for (mut i: u32 = 0; i < n; i++) {
+            CompilerInstance::load_module_with_scope(ctx, ctx.intern_table, ast_buf,
+                                                     scope_buf, order[i], n);
+            ctx.provisions.clear();
+            ctx.provisions.mark(Provision::Tokens);
+            ctx.provisions.mark(Provision::AST);
+            ctx.provisions.mark(Provision::ASTValidated);
+            ctx.provisions.mark(Provision::ImportsDiscovered);
+            ctx.provisions.mark(Provision::ModulesLoaded);
+            ctx.provisions.mark(Provision::ModuleOrder);
+            ctx.provisions.mark(Provision::NamesDeclared);
+            if (!pipeline.run_all(ctx)) {
+                return false;
+            }
             if (ctx.resolver != null && ctx.active_module_index >= 0) {
                 const scope_val: u64 = ctx.resolver.get_current_scope_id();
                 const sc_idx: u32 = ctx.active_module_index as u32;

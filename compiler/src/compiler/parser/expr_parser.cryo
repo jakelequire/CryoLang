@@ -135,7 +135,7 @@ public:
                     "expression nesting too deep (null-coalesce recursion limit exceeded)");
                 return left;
             }
-            this.advance();
+            const op_tok: Token = this.advance();
             this.expr_depth += 1;
             const right: ExpressionNode* = this.parse_pipe();
             this.expr_depth -= 1;
@@ -145,7 +145,8 @@ public:
                 return left;
             }
             const span: SourceSpan = ParserBase::merge_spans(left.span, right.span);
-            left = this.desugar_null_coalesce(left, right, span);
+            left = this.desugar_null_coalesce(left, right, span,
+                                              this.span_from_token(op_tok));
         }
         return left;
     }
@@ -185,8 +186,19 @@ public:
     /// `a ?? b` => `match (a) { Option::Some(v) => { v } Option::None => { b } }`.
     /// `a` becomes the match scrutinee so it is evaluated exactly once, and
     /// `b` lands in the `None` arm so it is only evaluated when `a` is `None`.
+    ///
+    /// Every node synthesized here carries `op_span` (the `??` token) rather
+    /// than the expression's own extent.  The resolution map keys a reference
+    /// by its span's START position alone, so a synthesized name stamped with
+    /// `span` - which begins where `left` begins - collides with `left`'s own
+    /// key and overwrites it: a bare identifier operand then resolves to the
+    /// arm binding instead of itself, which reads as never-referenced (a W0001
+    /// false positive, and the wrong target for LSP hover and go-to-definition).
+    /// No user expression can begin at the operator's column, so stamping the
+    /// synthesized nodes there cannot collide with one.  `match_expr` keeps the
+    /// full extent because it is not a name and nothing records against it.
     desugar_null_coalesce(left: ExpressionNode*, right: ExpressionNode*,
-                          span: SourceSpan) -> ExpressionNode* {
+                          span: SourceSpan, op_span: SourceSpan) -> ExpressionNode* {
         g_coalesce_counter += 1;
         const bind_str:  string    = format("__cryo_coalesce_%u", g_coalesce_counter);
         const bind_name: SymbolStr = this.ctx.intern(bind_str);
@@ -194,25 +206,25 @@ public:
         mut match_expr: MatchExprNode* = new MatchExprNode(left, span);
 
         // Some(v) => { v }
-        mut some_pat: EnumPatternNode* = new EnumPatternNode(span);
+        mut some_pat: EnumPatternNode* = new EnumPatternNode(op_span);
         some_pat.set_enum_name(this.ctx.intern("Option"));
         some_pat.set_variant_name(this.ctx.intern("Some"));
-        const pb: PatternBinding* = new PatternBinding { name: bind_name, span: span };
+        const pb: PatternBinding* = new PatternBinding { name: bind_name, span: op_span };
         some_pat.add_element(PatternElement::Binding(pb));
-        mut some_arm: MatchArmNode* = new MatchArmNode(span);
+        mut some_arm: MatchArmNode* = new MatchArmNode(op_span);
         some_arm.add_pattern(some_pat as PatternNode*);
-        const some_ident: IdentifierNode* = new IdentifierNode(bind_name, span);
-        const some_stmt:  ExprStmtNode*   = new ExprStmtNode(some_ident as ExpressionNode*, span);
-        mut some_block: BlockStmtNode* = new BlockStmtNode(span);
+        const some_ident: IdentifierNode* = new IdentifierNode(bind_name, op_span);
+        const some_stmt:  ExprStmtNode*   = new ExprStmtNode(some_ident as ExpressionNode*, op_span);
+        mut some_block: BlockStmtNode* = new BlockStmtNode(op_span);
         some_block.add_statement(some_stmt as StatementNode*);
         some_arm.set_body(some_block as StatementNode*);
         match_expr.add_arm(some_arm);
 
         // None => { b }
-        mut none_pat: EnumPatternNode* = new EnumPatternNode(span);
+        mut none_pat: EnumPatternNode* = new EnumPatternNode(op_span);
         none_pat.set_enum_name(this.ctx.intern("Option"));
         none_pat.set_variant_name(this.ctx.intern("None"));
-        mut none_arm: MatchArmNode* = new MatchArmNode(span);
+        mut none_arm: MatchArmNode* = new MatchArmNode(op_span);
         none_arm.add_pattern(none_pat as PatternNode*);
         const none_stmt: ExprStmtNode* = new ExprStmtNode(right, right.span);
         mut none_block: BlockStmtNode* = new BlockStmtNode(right.span);

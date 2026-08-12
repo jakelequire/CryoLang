@@ -1783,6 +1783,11 @@ public:
         if (bin.desugared_call != null) { return bin.desugared_call.resolved_type; }
         const left_is_lit:  boolean = is_numeric_literal_expr(bin.left);
         const right_is_lit: boolean = is_numeric_literal_expr(bin.right);
+        // A negated or folded constant (`-1.0`, `16.0 / 9.0`) is as
+        // width-polymorphic as the bare literal above, but it is a Unary/Binary
+        // node so the two flags miss it and neither operand hints the other.
+        const left_is_const_num:  boolean = is_constant_numeric_expr(bin.left);
+        const right_is_const_num: boolean = is_constant_numeric_expr(bin.right);
         mut lhs: TypeRef = TypeRef::invalid();
         mut rhs: TypeRef = TypeRef::invalid();
 
@@ -1881,6 +1886,34 @@ public:
         } else if (left_is_lit && !right_is_lit) {
             rhs = this.resolve_expr(bin.right);
             if (rhs.is_valid()) {
+                const saved_exp: TypeRef = this.state.expected_type;
+                this.state.expected_type = rhs;
+                lhs = this.resolve_expr(bin.left);
+                this.state.expected_type = saved_exp;
+            } else {
+                lhs = this.resolve_expr(bin.left);
+            }
+        // A constant numeric expression paired with a narrow float takes that
+        // float, for the reason the call path pushes a narrow float slot onto
+        // one: the constant otherwise settles on the f64 default and the pair
+        // reaches codegen as `fadd double, float`, which fails module
+        // verification with no source location.  Gated on the peer being a
+        // narrow FLOAT so every integer pairing keeps resolving exactly as it
+        // does above - pushing a narrow int peer onto `1 << 20` would truncate
+        // a constant that currently computes at the i32 default.
+        } else if (right_is_const_num && !left_is_const_num) {
+            lhs = this.resolve_expr(bin.left);
+            if (is_narrow_float_type(this.arena, lhs)) {
+                const saved_exp: TypeRef = this.state.expected_type;
+                this.state.expected_type = lhs;
+                rhs = this.resolve_expr(bin.right);
+                this.state.expected_type = saved_exp;
+            } else {
+                rhs = this.resolve_expr(bin.right);
+            }
+        } else if (left_is_const_num && !right_is_const_num) {
+            rhs = this.resolve_expr(bin.right);
+            if (is_narrow_float_type(this.arena, rhs)) {
                 const saved_exp: TypeRef = this.state.expected_type;
                 this.state.expected_type = rhs;
                 lhs = this.resolve_expr(bin.left);

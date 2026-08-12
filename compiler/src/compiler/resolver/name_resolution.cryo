@@ -148,7 +148,11 @@ public:
                 }
             }
             NodeKind::ImportDeclaration => {
-                this.process_import(node as ImportDeclNode*);
+                // Deliberately NOT processed here.  An import is answered from
+                // the declaring module's exports, so processing it while this
+                // module is still declaring its own names binds it against
+                // whatever happens to have been declared so far.  It is done on
+                // the walk instead, by which point every module has declared.
             }
             NodeKind::IntrinsicDeclaration => {
                 const intr_node: IntrinsicDeclNode* = node as IntrinsicDeclNode*;
@@ -227,15 +231,10 @@ public:
 
     // -- ProgramNode --
     override visit(node: ProgramNode*) -> void {
-        // Set module name
-        if (node.namespace_name != "") {
-            this.resolver.set_module(this.resolver.intern_table.intern(node.namespace_name));
-        }
-
-        // Pass 1: forward declarations
-        this.forward_declare(node);
-
-        // Pass 2: full resolution walk
+        // The module's own names are already declared and exported, and the
+        // scope holding them is the one the caller restored.  Naming the module
+        // again here would CREATE a second scope of the same name and walk into
+        // it, leaving every symbol declared above unreachable from the walk.
         for (mut i: int = 0; i < node.statements.length; i++) {
             node.statements[i].accept(this);
         }
@@ -494,7 +493,15 @@ public:
     }
 
     override visit(node: ImportDeclNode*) -> void {
-        // Already processed in forward_declare; skip in pass 2.
+        // Every module has declared and exported its own names by now, so the
+        // exports this import reads from exist whichever order the modules are
+        // walked in - including inside an import cycle, where no order can put
+        // the declarer first.
+        //
+        // Running after this module's own declarations rather than before them
+        // does not change which of the two wins: the scope tiers them, so a
+        // declaration owns the slot and shadows the import either way.
+        this.process_import(node);
     }
 
     override visit(node: ExternBlockNode*) -> void {
@@ -1375,7 +1382,55 @@ public:
 }
 
 
-// Entry point: static method for cross-module resolution
+// Entry points: static methods for cross-module resolution
+
+/// Declares and exports one module's own top-level names, and walks nothing.
+///
+/// Split out of NameResolution so a driver can run it over EVERY module before
+/// any module's imports are processed.  An import is answered from the
+/// declaring module's exports, and those exist only once that module has been
+/// declared; inside an import cycle no module order can put every declarer
+/// first, so the earlier module's import declares no symbol at all and the name
+/// is absent from its scope for the rest of the compilation.
+type struct NameDeclarationPass {
+    static run(ctx: CompilationContext*) -> PassResult {
+        LOG_DEBUG(LogComponent::General, "[NameDeclaration] run() entry");
+        const snap: DiagnosticSnapshot = ctx.diagnostics.snapshot();
+
+        ctx.init_resolver();
+        if (ctx.resolver == null) {
+            ctx.emit_error(ErrorCode::E0805_INTERNAL_ERROR, "Failed to initialize Resolver");
+            return PassResult::failure(1);
+        }
+
+        const root: ProgramNode* = ctx.artifacts.ast.root;
+        if (root == null) {
+            LOG_DEBUG(LogComponent::General, "[NameDeclaration] No AST root available, skipping");
+            return PassResult::ok();
+        }
+
+        // Creating the module's scope belongs with the declarations that go
+        // into it.  In multi-module mode `switch_to_module` tries to set the
+        // name but the Resolver may not exist yet, so the module graph is the
+        // source of truth; the AST's own namespace wins where it carries one.
+        if (ctx.active_module_index >= 0
+            && ctx.active_module_index < ctx.module_graph.modules.length as i64) {
+            const mod_info: ModuleInfo* = &ctx.module_graph.modules[ctx.active_module_index];
+            const mod_name: SymbolStr = mod_info.namespace_name;
+            if (mod_name.is_valid()) {
+                ctx.resolver.set_module(mod_name);
+            }
+        }
+        if (root.namespace_name != "") {
+            ctx.resolver.set_module(ctx.intern(root.namespace_name));
+        }
+
+        const visitor: NameResolver = NameResolver(ctx.resolver, ctx);
+        visitor.forward_declare(root);
+
+        return PassResult::from_snapshot(ctx.diagnostics, snap);
+    }
+}
 
 /// Wrapper struct so the entry point is a static method.  Cross-module
 /// resolution of free functions through imported namespaces is
@@ -1402,18 +1457,19 @@ type struct NameResolutionPass {
             return PassResult::ok();
         }
 
-        // Set module name on the resolver.  In multi-module mode,
-        // switch_to_module tries to set it but the Resolver may not exist yet.
-        // Use the module graph as the source of truth for the current module name.
+        // Name the module WITHOUT creating its scope: NameDeclaration created
+        // that one and filled it, and the caller restored it.  `set_module`
+        // here would start the walk in a fresh empty scope.
+        const walk_scope: u64 = ctx.resolver.get_current_scope_id();
         if (ctx.active_module_index >= 0
             && ctx.active_module_index < ctx.module_graph.modules.length as i64) {
             const mod_info: ModuleInfo* = &ctx.module_graph.modules[ctx.active_module_index];
             const mod_name: SymbolStr = mod_info.namespace_name;
             if (mod_name.is_valid()) {
-                ctx.resolver.set_module(mod_name);
+                ctx.resolver.set_module_with_scope(mod_name, walk_scope);
             }
         } else if (root.namespace_name != "") {
-            ctx.resolver.set_module(ctx.intern(root.namespace_name));
+            ctx.resolver.set_module_with_scope(ctx.intern(root.namespace_name), walk_scope);
         }
 
         // Create and run the visitor
@@ -1427,4 +1483,5 @@ type struct NameResolutionPass {
 
         return PassResult::from_snapshot(ctx.diagnostics, snap);
     }
+
 }
