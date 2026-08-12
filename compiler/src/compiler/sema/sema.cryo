@@ -1775,6 +1775,37 @@ public:
         return true;
     }
 
+    /// Warn when two DIFFERENT concrete numeric types meet in one operation.
+    ///
+    /// Only the widening direction can occur here - the common-type rule picks
+    /// the wider operand, so the narrower one converts up to it - and narrowing
+    /// is already rejected where it can appear, at the assignment and argument
+    /// boundaries.  Widening is accepted for now, so this is a warning and not
+    /// an error, but the language reference states that every conversion is
+    /// written with `as`, so the message says the acceptance is temporary
+    /// rather than letting the code quietly contradict the reference.
+    ///
+    /// Suppressible by code through `DiagConfig` like any other warning, which
+    /// matters while the tree still carries mixed-width integer arithmetic.
+    warn_implicit_numeric_conversion(mut &this, bin: BinaryExprNode*,
+                                     lhs: TypeRef, rhs: TypeRef) -> void {
+        if (!lhs.is_valid() || !rhs.is_valid()) { return; }
+        if (lhs.id == rhs.id) { return; }
+        const lt: Type* = this.arena.lookup(lhs.id);
+        const rt2: Type* = this.arena.lookup(rhs.id);
+        if (lt == null || rt2 == null) { return; }
+        const l_num: boolean = lt.kind == TypeKind::Int || lt.kind == TypeKind::Float;
+        const r_num: boolean = rt2.kind == TypeKind::Int || rt2.kind == TypeKind::Float;
+        if (!l_num || !r_num) { return; }
+        mut diag: Diagnostic = Diagnostic::warning(
+            ErrorCode::W0005_IMPLICIT_CONVERSION,
+            format("implicit conversion between `%s` and `%s`; the narrower operand widens to the wider one. Write it with `as` - this is accepted for now and will become an error once the tree is clean",
+                this.types.type_display_name(lhs),
+                this.types.type_display_name(rhs)));
+        diag = diag.at(bin.span);
+        this.ctx.emit_diagnostic(diag);
+    }
+
     resolve_binary(mut &this, bin: BinaryExprNode*) -> TypeRef {
         // Idempotent: if a previous resolution already rewrote this operator
         // into a trait-method call, return its type without re-running
@@ -1933,6 +1964,7 @@ public:
             const result: TypeCheckResult = this.checker.check_binary_op(bin.op.lexeme, lhs, rhs);
             const map: OperatorTraitMap = OperatorTraitMap::for_binary(bin.op.lexeme);
             if (result.success) {
+                this.warn_implicit_numeric_conversion(bin, lhs, rhs);
                 // Phase 2: a bounded-param operand (`T: Add`) still overloads,
                 // even though `check_binary_op` passed the generic param through.
                 // Concrete primitives fall straight through (no user impl).

@@ -1636,7 +1636,12 @@ type struct ExprOps {
             }
         }
 
-        const is_float: boolean = t_kind == TypeKind::Float;
+        // Provisional: `result_type` is the LEFT operand's type (the caller
+        // passes `node.left.resolved_type`), so it cannot settle this on its
+        // own - `i32 + f32` arrives claiming to be integer arithmetic, and a
+        // comparison arrives as `bool`.  The operand normalization below decides
+        // it from the values actually being combined.
+        mut is_float: boolean = t_kind == TypeKind::Float;
         mut is_signed: boolean = false;
         if (t_kind == TypeKind::Int) {
             const int_t: IntType* = t as IntType*;
@@ -1672,11 +1677,56 @@ type struct ExprOps {
         // extend the narrower one to match the wider.
         mut lhs: LValue = lhs_val;
         mut rhs: LValue = rhs_val;
-        if (!is_float) {
-            const lhs_ty: void* = llvm::LLVMTypeOf(lhs.raw);
-            const rhs_ty: void* = llvm::LLVMTypeOf(rhs.raw);
-            const lhs_kind: LTypeKind = LType::kind_of(lhs_ty);
-            const rhs_kind: LTypeKind = LType::kind_of(rhs_ty);
+        const lhs_ty: void* = llvm::LLVMTypeOf(lhs.raw);
+        const rhs_ty: void* = llvm::LLVMTypeOf(rhs.raw);
+        const lhs_kind: LTypeKind = LType::kind_of(lhs_ty);
+        const rhs_kind: LTypeKind = LType::kind_of(rhs_ty);
+        const lhs_fp: boolean = lhs_kind == LTypeKind::Float
+                             || lhs_kind == LTypeKind::Double;
+        const rhs_fp: boolean = rhs_kind == LTypeKind::Float
+                             || rhs_kind == LTypeKind::Double;
+        // A float on EITHER side makes this float arithmetic, and the other
+        // operand converts up to it: the wider float when both are floats, the
+        // float itself when the other side is an integer.  Without this the
+        // pair reaches LLVM as `fadd float, double` or `add i32, float` and the
+        // module fails verification naming no user construct - the operand
+        // widths are the ONLY thing that fixes it, because `is_float` above is
+        // read off one operand.  Restricted to an integer partner so pointer
+        // and aggregate operands keep their own paths.
+        if (lhs_ty != null && rhs_ty != null && (lhs_fp || rhs_fp)
+                && (lhs_fp || lhs_kind == LTypeKind::Integer)
+                && (rhs_fp || rhs_kind == LTypeKind::Integer)) {
+            mut target_raw: void* = lhs_ty;
+            if (!lhs_fp) {
+                target_raw = rhs_ty;
+            } else if (rhs_fp && rhs_kind == LTypeKind::Double
+                    && lhs_kind != LTypeKind::Double) {
+                target_raw = rhs_ty;
+            }
+            const target: LType = LType { raw: target_raw };
+            // Each integer converts by its OWN signedness, for the reason the
+            // width path sign-extends by its own: reading an unsigned operand
+            // as signed changes the value, not just the representation.
+            if (!lhs_fp) {
+                if (is_signed) {
+                    lhs = this.builder.build_si_to_fp(lhs, target, "widen.sitofp");
+                } else {
+                    lhs = this.builder.build_ui_to_fp(lhs, target, "widen.uitofp");
+                }
+            } else if (lhs_ty != target_raw) {
+                lhs = this.builder.build_fp_ext(lhs, target, "widen.fpext");
+            }
+            if (!rhs_fp) {
+                if (rhs_is_signed) {
+                    rhs = this.builder.build_si_to_fp(rhs, target, "widen.sitofp");
+                } else {
+                    rhs = this.builder.build_ui_to_fp(rhs, target, "widen.uitofp");
+                }
+            } else if (rhs_ty != target_raw) {
+                rhs = this.builder.build_fp_ext(rhs, target, "widen.fpext");
+            }
+            is_float = true;
+        } else if (!is_float) {
             if (lhs_ty != null && rhs_ty != null &&
                 lhs_kind == LTypeKind::Integer && rhs_kind == LTypeKind::Integer) {
                 const lhs_w: u32 = llvm::LLVMGetIntTypeWidth(lhs_ty);
