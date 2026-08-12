@@ -123,6 +123,64 @@ function c_import_anonymous_typed_field_layout() -> Result<(), TestError> {
     return Result::Ok(());
 }
 
+// A macro defined in an INCLUDED header, not the imported one.  A library's
+// entry header is typically an umbrella of `#include`s, so a filter keyed on the
+// main file binds none of its constants - and says nothing about having dropped
+// them.
+![test]
+function c_import_included_header_macro() -> Result<(), TestError> {
+    expect_eq(cit::CIT_INNER, 7 as i32)?;
+    return Result::Ok(());
+}
+
+// A macro whose body is another macro's invocation (`CIT_U32(0x20)`) folds to
+// its value.  CIT_FLAG_BOTH additionally proves the fold sees through a macro
+// operand inside an operator chain.
+![test]
+function c_import_macro_invocation_folds() -> Result<(), TestError> {
+    expect_eq(cit::CIT_FLAG_VIDEO, 32 as u32)?;
+    expect_eq(cit::CIT_FLAG_BOTH, 96 as u32)?;
+    return Result::Ok(());
+}
+
+// The width a `..._C()` macro pins survives even when the value would fit a
+// narrower type: `CIT_U64(0x10000000)` is 268435456 in a 64-bit type, and an API
+// that ORs it into a 64-bit flags field needs it to stay 64-bit.  Comparing
+// against a `u64` is what pins it - `expect_eq<T>` takes both sides as one type,
+// so a constant bound as `u32` fails to compile here rather than silently
+// narrowing.
+![test]
+function c_import_macro_width_is_pinned() -> Result<(), TestError> {
+    expect_eq(cit::CIT_FLAG_WIDE, 268435456 as u64)?;
+    return Result::Ok(());
+}
+
+// A `static const` global binds by VALUE - it has no symbol to import, but it
+// does have a constant, and it is how a C API expresses one too wide for an
+// enum.  0x100000000 needs 33 bits, so this also pins that the declared C width
+// (`unsigned long long`) is what carries over.
+![test]
+function c_import_static_const_binds_by_value() -> Result<(), TestError> {
+    expect_eq(cit::CIT_WIDE_BIT, 4294967296 as u64)?;
+    return Result::Ok(());
+}
+
+// A tag the header never defines (`typedef union _NeverU NeverU;`) binds as a
+// zero-field opaque record, so its typedef resolves and a pointer to it is a
+// usable handle.  The binding of the tag is what this test pins: were it dropped
+// again, the typedef and every use of it would name an unemitted type and the
+// whole module would fail to compile - this test cannot then run at all.  Both
+// spellings are covered because a union and a struct reach the tag emitter by
+// different paths.
+![test]
+function c_import_incomplete_tag_is_opaque() -> Result<(), TestError> {
+    const u: cit::NeverU* = null;
+    const s: cit::NeverS* = null;
+    expect_true(u == null, Str::new("opaque union handle is a usable pointer"))?;
+    expect_true(s == null, Str::new("opaque struct handle is a usable pointer"))?;
+    return Result::Ok(());
+}
+
 // A top-level named C `union` -> a native Cryo `type union`: a literal sets
 // exactly one member, members are accessed directly (`v.i`, no accessor method),
 // and they overlay at offset 0 so sizeof is the largest member (4).

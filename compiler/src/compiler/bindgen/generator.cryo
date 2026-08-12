@@ -76,7 +76,27 @@ import std::collections::str;
 /// (which lowers to a pointer) instead of being skipped - so `*_vappendf`-style
 /// functions BIND and are callable by forwarding a Cryo variadic function's
 /// `args`.  The earlier skip+report is gone.
-const GENERATOR_VERSION: i64 = 15;
+/// 15 -> 16: a tag declared but never defined in the translation unit (an
+/// `typedef union _XEvent XEvent;` whose union is completed only on another
+/// platform) now binds as a zero-field opaque record instead of being dropped.
+/// Dropping it emitted a typedef, parameter and return type naming a record that
+/// was never declared, so the generated module did not compile.
+/// 16 -> 17: object-like macro constants are recovered two ways they were lost.
+/// (a) The macro filter now accepts any header the library included, not the
+/// entry file alone - an umbrella entry header (`#include <SDL3/SDL.h>`) defines
+/// almost nothing itself, so every constant one level down was invisible AND
+/// unreported.  (b) A body no token walk can fold - a macro invocation such as
+/// `SDL_UINT32_C(0x20)`, the portable way to pin a constant's width - is folded
+/// by clang and bound to its value.
+/// 17 -> 18: `extern` C globals bind.  A header's file-scope variables produced
+/// nothing at all before - not even a report line - which rules out every
+/// loader-shaped C API (volk and its kind expose each entry point as a global
+/// function pointer, not a prototype).
+/// 18 -> 19: a `static const` global binds as a VALUE const.  It is not a
+/// symbol - each translation unit gets its own copy - but it is how a C API
+/// states a constant too wide for an enum, which is what Vulkan's 64-bit flag
+/// bits are; 309 of them were reported unbound in a vulkan_core.h run.
+const GENERATOR_VERSION: i64 = 19;
 
 /// Renders bindgen-emitted AST decls to `.cryo` source under `namespace ns`.
 type struct BindingSerializer {
@@ -105,12 +125,21 @@ type struct BindingSerializer {
         // Type declarations, in emission order, deduped by name (a type can be
         // visited once per header across a multi-header library).
         mut seen: string[] = [];
+        mut ext_globals: VarDeclNode*[] = [];
         for (mut i: i64 = 0; i < root.statements.length; i++) {
             const node: ASTNode* = root.statements[i];
             if (node == null) { continue; }
             const nm: string = BindingSerializer::decl_name(s.ctx, node);
             if (nm.length() == 0 || BindingSerializer::contains(&seen, nm)) { continue; }
             seen.push(nm);
+            // An imported global is a MEMBER of the `extern "C"` block rendered
+            // below, not a standalone declaration.  Gathering it here rather
+            // than in a second sweep lets it inherit this loop's dedup.
+            if (node.kind == NodeKind::VariableDeclaration
+                    && (node as VarDeclNode*).is_extern_import) {
+                ext_globals.push(node as VarDeclNode*);
+                continue;
+            }
             s.render_decl(node);
         }
 
@@ -122,10 +151,13 @@ type struct BindingSerializer {
         // same-name function whose linker symbol DIFFERS (a genuine distinct
         // function being lost, not a benign re-declaration of the same symbol),
         // record it in the honesty report instead of dropping it silently.
-        if (extern_node.functions.length > 0) {
+        if (extern_node.functions.length > 0 || ext_globals.length > 0) {
             mut seen_fn:  string[] = [];
             mut seen_sym: string[] = [];   // parallel: kept symbol per seen name
             s.out.push("extern \"C\" {\n");
+            for (mut gi: i64 = 0; gi < ext_globals.length; gi++) {
+                s.render_extern_global(ext_globals[gi]);
+            }
             for (mut i: i64 = 0; i < extern_node.functions.length; i++) {
                 const fnode: FunctionDeclNode* = extern_node.functions[i];
                 const fnm: string = s.ctx.intern_table.resolve(fnode.name);
@@ -360,6 +392,24 @@ type struct BindingSerializer {
         this.out.push(format("type %s = %s;\n\n",
             BindingSerializer::ident(this.ctx.intern_table.resolve(node.alias_name)),
             this.render_type(node.target_annotation)));
+    }
+
+    /// Render an imported global as a member of the `extern "C"` block:
+    /// `    mut vkCreateInstance: (void*) -> i32;`.  A C name that collides with
+    /// a Cryo keyword is escaped by `ident()`, which would otherwise silently
+    /// change the symbol bound - so whenever escaping changed the spelling, the
+    /// original C name is pinned with `![symbol("...")]`.  `link_name` (set on
+    /// the C++ path, where every symbol is mangled) takes precedence.
+    render_extern_global(mut &this, node: VarDeclNode*) -> void {
+        const raw: string = this.ctx.intern_table.resolve(node.name);
+        const name: string = BindingSerializer::ident(raw);
+        const sym: string = if (node.link_name.length() > 0) { node.link_name } else { raw };
+        if (!sym.eq(name)) {
+            this.out.push(format("    ![symbol(\"%s\")]\n", BindingSerializer::escape(sym)));
+        }
+        const kw: string = if (node.is_mutable) { "mut" } else { "const" };
+        this.out.push(format("    %s %s: %s;\n",
+            kw, name, this.render_type(node.type_annotation)));
     }
 
     render_const(mut &this, node: VarDeclNode*) -> void {
@@ -756,6 +806,19 @@ type struct VendorGenerator {
         // touching any header) MUST invalidate the cache.  Distinct markers
         // keep the two lists from aliasing each other, and the per-element
         // order is the manifest order (stable across regenerations).
+        //
+        // The entry-header LIST is one of those knobs, and folding the include
+        // graph does not cover it: a header added to the manifest whose bytes
+        // the graph never reached leaves the digest untouched, so the addition
+        // reads as a cache hit and its declarations silently never appear.  It
+        // decides which file is the MAIN file too, which is what governs macro
+        // import.  The length is folded so that removing a header - or moving a
+        // name boundary, `["a","b"]` against `["ab"]` - also misses.
+        h.fold("<headers>");
+        h.fold(headers.length as u64);
+        for (mut i: i64 = 0; i < headers.length; i++) {
+            h.fold(headers[i]);
+        }
         h.fold("<include_dirs>");
         for (mut i: i64 = 0; i < include_dirs.length; i++) {
             h.fold(include_dirs[i]);

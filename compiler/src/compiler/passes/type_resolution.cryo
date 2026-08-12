@@ -494,6 +494,26 @@ type struct TypeResolutionRunner {
         return best;
     }
 
+    /// Record, under `key`, the linker symbol an IMPORTED global binds - its
+    /// `![symbol("...")]` override when it has one, else its declared name.  A
+    /// no-op for a global Cryo defines, which is mangled under its namespace.
+    ///
+    /// Called once per key the global is registered under, because a reference
+    /// arrives spelled however the author wrote it: `probe_counter` bare inside
+    /// the declaring module, `GvProbe::probe_counter` from outside.  Recording
+    /// only one spelling leaves the other silently mangling a symbol no object
+    /// defines.
+    static record_extern_symbol(ctx: CompilationContext*, node: VarDeclNode*,
+                                key: SymbolStr) -> void {
+        if (!node.is_extern_import) { return; }
+        const sym: SymbolStr = if (node.link_name.length() > 0) {
+            ctx.intern(node.link_name)
+        } else {
+            node.name
+        };
+        ctx.decl_index.record_global_extern_symbol(key, sym);
+    }
+
     /// Byte order over two equal-length paths, so the tie-break between two
     /// aggregates that would both work is a property of their names rather
     /// than of the order the graph enumerated them.
@@ -511,9 +531,17 @@ type struct TypeResolutionRunner {
     /// annotation has a Named leaf we point the caret at it and attach a
     /// did-you-mean suggestion; otherwise fall back to the bare error
     /// stamped at the declaration's span.
+    ///
+    /// `defines` is the name this declaration BINDS, and only when `ann` is the
+    /// definition of that name - a type alias's target.  It is barred from the
+    /// suggestions, because rewriting the annotation to it makes the declaration
+    /// its own meaning.  An annotation that merely USES a type (a parameter,
+    /// field, or variable) passes "": there the surrounding declaration's name
+    /// is an ordinary candidate, and a field named like a type is a real
+    /// coincidence rather than a self-reference.
     emit_undefined_type(&this, ann: TypeAnnotation*,
                         kind_label: string, decl_name: string,
-                        fallback_span: SourceSpan) -> void {
+                        fallback_span: SourceSpan, defines: string) -> void {
         const intern: InternTable* = this.ctx.get_intern_table();
 
         // THE GATE (spec §3.3).  A name that EXISTS but that the writing module
@@ -590,7 +618,18 @@ type struct TypeResolutionRunner {
             ErrorCode::E0203_UNDEFINED_TYPE,
             format("cannot find type `%s` in this scope", ty_name));
         diag = diag.at_with_label(named.span, "not found in this scope");
-        const cands: string[] = this.collect_bare_type_names();
+        // The name this declaration is DEFINING cannot be the fix for a name
+        // inside its own definition: accepting it yields `type Foo = Foo;`, a
+        // declaration whose meaning is itself.  The suggestion is
+        // machine-applicable, so a tool would make that edit unprompted.  It is
+        // dropped from the candidate set rather than from the chosen result, so
+        // a genuine second-best name is still offered when one exists.
+        mut cands: string[] = [];
+        const all_cands: string[] = this.collect_bare_type_names();
+        for (mut ci: i64 = 0; ci < all_cands.length; ci++) {
+            if (defines.length() > 0 && all_cands[ci].eq(defines)) { continue; }
+            cands.push(all_cands[ci]);
+        }
         const best: string = find_best_candidate(ty_name, cands);
         if (best != "") {
             diag = diag.help(
@@ -635,7 +674,7 @@ type struct TypeResolutionRunner {
             this.emit_undefined_type(func.return_type_annotation,
                 "return type",
                 this.ctx.resolve_str(func.name),
-                func.span);
+                func.span, "");
         }
 
         // Sema reads param types directly from the AST node (param.resolved_type)
@@ -655,7 +694,7 @@ type struct TypeResolutionRunner {
                 this.emit_undefined_type(param.type_annotation,
                     "type",
                     this.ctx.resolve_str(param.name),
-                    param.span);
+                    param.span, "");
             }
         }
     }
@@ -693,7 +732,7 @@ type struct TypeResolutionRunner {
                 this.emit_undefined_type(field.type_annotation,
                     "type",
                     this.ctx.resolve_str(field.name),
-                    field.span);
+                    field.span, "");
             }
         }
     }
@@ -778,7 +817,7 @@ type struct TypeResolutionRunner {
                                 // can't be a deferred generic param; `typeof(...)` and other
                                 // non-Named forms (inferred later) fail the certainty guard.
                                 const vn: string = this.ctx.get_intern_table().resolve(var_node.name);
-                                this.emit_undefined_type(var_node.type_annotation, "type", vn, var_node.span);
+                                this.emit_undefined_type(var_node.type_annotation, "type", vn, var_node.span, "");
                             }
                         }
                         // Recurse into the initializer expression so var
@@ -820,7 +859,7 @@ type struct TypeResolutionRunner {
                         // `for (mut i: bool = ...)` naming an unknown type gets a
                         // clean E0203 instead of a downstream codegen crash.
                         const vn: string = this.ctx.get_intern_table().resolve(var_node.name);
-                        this.emit_undefined_type(var_node.type_annotation, "type", vn, var_node.span);
+                        this.emit_undefined_type(var_node.type_annotation, "type", vn, var_node.span, "");
                     }
                 }
             }
@@ -3129,10 +3168,14 @@ type struct TypeResolutionPasses {
                         }
                         alias_count++;
                     } else {
+                        // The alias's own name is barred from the suggestions:
+                        // this annotation IS the alias's definition, so
+                        // accepting it would write `type Foo = Foo;`.
                         runner.emit_undefined_type(node.target_annotation,
                             "target type",
                             ctx.resolve_str(node.alias_name),
-                            node.span);
+                            node.span,
+                            ctx.resolve_str(node.alias_name));
                     }
                 }
             }
@@ -3500,10 +3543,12 @@ type struct TypeResolutionPasses {
                             ctx.decl_index.register_global_with_module(
                                 bq_sym, var_node.resolved_type, gmod_sym,
                                 var_node.binding_namespace, var_node.is_thread_local);
+                            TypeResolutionRunner::record_extern_symbol(ctx, var_node, bq_sym);
                         } else {
                             ctx.decl_index.register_global_with_module(
                                 var_node.name, var_node.resolved_type, gmod_sym,
                                 ctx.namespace_str, var_node.is_thread_local);
+                            TypeResolutionRunner::record_extern_symbol(ctx, var_node, var_node.name);
                             // Also register under the module-qualified name so a
                             // same-bare-name global in another module can't shadow
                             // this one in the (bare-keyed, last-write-wins) type
@@ -3511,6 +3556,11 @@ type struct TypeResolutionPasses {
                             const gq_sym: SymbolStr = ctx.qualify_symbol_sym(var_node.name);
                             if (!gq_sym.equals(var_node.name)) {
                                 ctx.decl_index.register_global(gq_sym, var_node.resolved_type);
+                                // A reference from another module arrives under
+                                // THIS key, so an imported global's symbol has
+                                // to be reachable from it too.
+                                TypeResolutionRunner::record_extern_symbol(
+                                    ctx, var_node, gq_sym);
                             }
                         }
                     }

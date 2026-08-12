@@ -1496,8 +1496,18 @@ type struct DeclarationEmitter {
         } else {
             this.ctx.namespace_str
         };
-        const mangled: string = MangledName::for_global(
-            this.get_intern(), def_ns, node.name).resolve(this.get_intern());
+        // An IMPORTED global names storage another object owns, so it takes the
+        // bare linker symbol rather than the namespace mangling - the mangling
+        // exists to keep two modules' same-named globals apart, and there is
+        // only ever one `errno`.  `![symbol("...")]` overrides it for a C name
+        // that is not a Cryo identifier.
+        const mangled: string = if (node.is_extern_import) {
+            if (node.link_name.length() > 0) { node.link_name }
+            else { this.get_intern().resolve(node.name) }
+        } else {
+            MangledName::for_global(
+                this.get_intern(), def_ns, node.name).resolve(this.get_intern())
+        };
 
         const ty: LType = this.type_mapper.map_type(node.resolved_type);
         if (!ty.is_valid()) {
@@ -1505,6 +1515,19 @@ type struct DeclarationEmitter {
         }
 
         const global: LValue = this.llvm_module.add_global(ty, mangled);
+
+        // An imported global is a DECLARATION: leaving it with no initializer is
+        // what makes it external in LLVM.  Giving it one - even the
+        // zeroinitializer every other global falls back to - would define the
+        // symbol here and collide with the library at link time.  It is also
+        // never marked LLVM-constant, including when written `const`: `const`
+        // governs what Cryo may write, while the owning library stays free to
+        // change the value, and promising otherwise would license folding a
+        // stale read.
+        if (node.is_extern_import) {
+            this.globals.register(this.global_cache_key(node), global);
+            return;
+        }
 
         // Initializer: if the source declaration has a literal initializer
         // (e.g., `const BUCKET_OCCUPIED: u8 = 1`), emit it as the constant
@@ -1624,12 +1647,19 @@ type struct DeclarationEmitter {
         // (owned-by-current-module) short-circuit, so register under the
         // qualified key - the bare key would never be hit and would risk a
         // last-write-wins collision between two imports' same-named consts.
-        const cache_key: SymbolStr = if (!node.binding_namespace.is_empty()) {
-            this.ctx.qualify_binding_sym(node.name, node.binding_namespace)
-        } else {
-            node.name
-        };
-        this.globals.register(cache_key, global);
+        this.globals.register(this.global_cache_key(node), global);
+    }
+
+    /// The key a global is cached under for later reference resolution.  A
+    /// C-imported global is reachable only as `alias::NAME` (a ScopeResolution),
+    /// which `resolve_global` probes under the qualified key; the bare key would
+    /// never be hit, and two imports declaring the same name would race to
+    /// last-write-wins under it.
+    global_cache_key(&this, node: VarDeclNode*) -> SymbolStr {
+        if (!node.binding_namespace.is_empty()) {
+            return this.ctx.qualify_binding_sym(node.name, node.binding_namespace);
+        }
+        return node.name;
     }
 
     /// Generate the body of a function.  Called from the IRGeneratorVisitor.

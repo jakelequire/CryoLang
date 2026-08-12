@@ -2656,6 +2656,39 @@ extern function exit(code: int) -> void;
 
 It is the programmer's responsibility to ensure the Cryo signature matches the C signature; the compiler cannot verify this across the language boundary.
 
+An `extern` block also declares **imported globals** — variables whose storage
+belongs to the library being linked:
+
+```cryo
+extern "C" {
+    function gv_bump() -> void;
+    mut  gv_counter: i32;      // read and written through the C library's storage
+    const gv_name:   u8*;
+}
+```
+
+The type is required and an initializer is rejected. There is nothing to infer a
+type from, and an initializer would *define* the symbol here, colliding with the
+library that already defines it.
+
+`mut` and `const` describe what **Cryo** may do with the binding, not what the
+library may. A `const` imported global is not assumed to hold still: the owning
+library may change the value at any time, so the compiler never treats a read of
+one as foldable.
+
+Use **`![symbol("name")]`** when the C symbol is not a valid Cryo identifier —
+for instance when it collides with a keyword:
+
+```cryo
+extern "C" {
+    ![symbol("type")]
+    mut type_: i32;
+}
+```
+
+An imported global is reached like any other: bare inside its own module, and
+qualified (`Binding::gv_counter`) from outside.
+
 ### 18.2 C Header Import
 
 For larger C libraries, transcribing every signature by hand is error-prone. Cryo can import a C header directly. The compiler drives **libclang** (Clang's stable C API), which parses the header and generates Cryo declarations for the functions **and the structs, unions, enums, and typedefs** it finds.
@@ -2679,11 +2712,19 @@ function main() -> int {
 
 Each `#include` takes either an angle-bracketed name (`<stdio.h>`, resolved on the C preprocessor's system include search path) or a quoted path (`"./my_header.h"`, resolved relative to the importing file) - exactly as in C. The identifier after `extern module` (`c` here) introduces a namespace into which the imported declarations are placed; access both functions and types with `::` (`c::printf`, `c::Point`) to prevent collisions between C and Cryo names. Only declarations from the named header(s) are imported - types pulled in transitively from system headers (`size_t`, `int32_t`, ...) are resolved to their Cryo primitive directly rather than re-emitted.
 
-Type mapping: a C `struct`/`union` becomes a `![repr(c)]` `type struct` (a union is a layout-faithful opaque storage blob - no field access); a named `enum` becomes a `type enum` with its explicit discriminant values; an **anonymous** `enum` (which has no nameable type - its constants are plain integers in C) contributes one alias-namespaced `const` per constant (`enum { LO = 1, HI = 2 }` -> `c::LO`, `c::HI`); a `typedef` becomes a `type alias`; function-pointer parameters/fields map to Cryo `(Args) -> Ret`. Imported types and constants are namespaced under the alias only (`c::Point`, `c::LO`), never the global namespace.
+Type mapping: a C `struct` becomes a `![repr(c)]` `type struct` and a named C `union` a native `type union` (one field per member, accessed directly); a tag that the header declares but never defines - the opaque-handle idiom, and any tag completed only on another platform - becomes a zero-field opaque record, usable through a pointer exactly as in C; a named `enum` becomes a `type enum` with its explicit discriminant values; an **anonymous** `enum` (which has no nameable type - its constants are plain integers in C) contributes one alias-namespaced `const` per constant (`enum { LO = 1, HI = 2 }` -> `c::LO`, `c::HI`); a `typedef` becomes a `type alias`; function-pointer parameters/fields map to Cryo `(Args) -> Ret`. Imported types and constants are namespaced under the alias only (`c::Point`, `c::LO`), never the global namespace.
 
 Some C constructs have no first-class Cryo equivalent, so they are translated to **layout-faithful opaque storage** - a struct of that type round-trips by value over the FFI boundary (correct size and alignment, verifiable with `static_assert`; see [section 18.5](#185-compile-time-layout-assertions-static_assert)) but offers no member access to that part: a **bitfield run** (adjacent `unsigned x : 3` fields share a storage unit) collapses to one blob field; a C11 **anonymous struct/union member** (`union { ... };` with no field name) becomes an aligned blob field named `_anon0`, `_anon1`, ...; and a field whose type is an inline **anonymous struct/union** likewise maps to a blob rather than a pointer. Each such approximation is reported (see below).
 
-Object-like `#define` constants whose body is a single literal are imported too, each as an alias-namespaced `const` with an inferred type: a **numeric** literal (`#define MAX_LEN 256` -> `c::MAX_LEN: i32`; hex, octal, negative, and floating-point are supported, with integer width inferred from the value and `u`/`l` suffixes); a **string** literal (`#define NAME "cryo"` -> `c::NAME: string`, with C escape sequences decoded); and a **character** literal (`#define TAB '\t'` -> `c::TAB: char` carrying the code point). Macros that can't be bound - **function-like** macros (`#define SQUARE(x) ...`), valueless guards (`#define HEADER_H`), and compound expressions (`#define AREA (W * H)`) - are skipped rather than silently dropped. Only macros defined in the named header itself are considered (the compiler's predefined macros are excluded).
+Object-like `#define` constants are imported too, each as an alias-namespaced `const` with an inferred type: a **numeric** literal (`#define MAX_LEN 256` -> `c::MAX_LEN: i32`; hex, octal, negative, and floating-point are supported, with integer width inferred from the value and `u`/`l` suffixes); a **string** literal (`#define NAME "cryo"` -> `c::NAME: string`, with C escape sequences decoded); and a **character** literal (`#define TAB '\t'` -> `c::TAB: char` carrying the code point).
+
+A body that is not a bare literal is **constant-folded by clang** and bound to the value it computes. That covers the shape most current C APIs use for flags, where a macro's body is another macro's invocation pinning the constant's width (`#define SDL_INIT_VIDEO SDL_UINT32_C(0x20)`), as well as ordinary constant arithmetic (`#define AREA (W * H)`). The **width** the C expression has is the width bound: `SDL_UINT64_C(0x10000000)` binds as `u64` even though its value would fit `u32`, because an API that ORs it into a 64-bit field needs it to.
+
+Macros that still can't be bound - **function-like** macros (`#define SQUARE(x) ...`), valueless guards (`#define HEADER_H`), and bodies that are not constant expressions (`#define NOW time(0)`) - are reported rather than silently dropped.
+
+Macros are taken from **any header the import pulled in**, not only the file named in the `#include` line: a library's entry header is typically an umbrella of `#include`s that defines nothing itself. The compiler's own predefined macros (`__STDC__` and friends) live in no header and are excluded.
+
+A header's `extern` **globals** bind as [imported globals](#181-extern-blocks) under the alias (`extern int errno_value;` -> `c::errno_value`), including the loader idiom of exposing each entry point as a global function pointer. A `static` global is skipped and reported: it has no symbol outside the translation unit that defines it.
 
 Every construct that is skipped or approximated is recorded and printed as a per-header **translation report** under `--debug` (`[skip]` for an unbound construct, `[approx]` for a layout-only binding), so nothing is lost silently.
 

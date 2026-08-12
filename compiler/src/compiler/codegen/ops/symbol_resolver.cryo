@@ -353,8 +353,17 @@ type struct SymbolResolver {
         // out of DI so the extern decl in this module refers to the same
         // LLVM symbol the defining module emits.  Empty namespace -> bare
         // `C$<name>` (root-namespace globals).
+        // An IMPORTED global has exactly one symbol in the whole program - the
+        // one the C library exports - so a reader must not mangle it under the
+        // declaring module's namespace the way it does for a global Cryo
+        // defines.  Mangling it asks the linker for a name nobody emits.
         const def_ns: SymbolStr = di.get_global_namespace(name);
-        const mangled: string = MangledName::for_global(intern, def_ns, name).resolve(intern);
+        const ext_sym: SymbolStr = di.global_extern_symbol(name);
+        const mangled: string = if (ext_sym.is_valid()) {
+            intern.resolve(ext_sym)
+        } else {
+            MangledName::for_global(intern, def_ns, name).resolve(intern)
+        };
 
         // Reuse an existing LLVM global if something (e.g. a prior pass)
         // already created one with the same mangled name; identical-name
@@ -405,7 +414,12 @@ type struct SymbolResolver {
         const g_llvm_ty: LType = this.type_mapper.map_type(g_type_ref);
         if (!g_llvm_ty.is_valid()) { return LValue::null(); }
 
-        const mangled: string = MangledName::for_global(intern, def_ns, name).resolve(intern);
+        const ext_sym: SymbolStr = di.global_extern_symbol(name);
+        const mangled: string = if (ext_sym.is_valid()) {
+            intern.resolve(ext_sym)
+        } else {
+            MangledName::for_global(intern, def_ns, name).resolve(intern)
+        };
         mut g_val: LValue = this.llvm_module.get_named_global(mangled);
         if (!g_val.is_valid()) {
             g_val = this.llvm_module.add_global(g_llvm_ty, mangled);
