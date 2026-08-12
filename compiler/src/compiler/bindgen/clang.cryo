@@ -68,6 +68,21 @@ type struct CXCursor {
         return pk == CURSOR_STRUCT_DECL || pk == CURSOR_UNION_DECL;
     }
 
+    /// True when this tag declaration is COMPLETED somewhere in this translation
+    /// unit - i.e. a definition exists, whether at this cursor or a later one.
+    /// False for a tag that is only ever forward-declared (`typedef union _XEvent
+    /// XEvent;` where the union is defined only on another platform, or the
+    /// `typedef struct sqlite3 sqlite3;` opaque-handle idiom).  Such a tag has no
+    /// members and no size, so it cannot be emitted as a layout-faithful record;
+    /// it binds as an opaque one instead.  Distinguishing "incomplete here" from
+    /// "incomplete everywhere" matters because libclang visits a forward
+    /// declaration BEFORE the definition that completes it - a size-only test
+    /// cannot tell the two apart, and would bind the forward declaration as
+    /// opaque and then skip the real definition as already-seen.
+    has_definition_in_tu(this) -> boolean {
+        return clang_Cursor_isNull(clang_getCursorDefinition(this)) == 0;
+    }
+
     /// True when this cursor was declared in a system header (`<stddef.h>` & co.).
     /// THE filter: libclang exposes every transitively-included header's
     /// top-level decls, so type emission must drop the system-header ones (their
@@ -76,16 +91,6 @@ type struct CXCursor {
     is_in_system_header(this) -> boolean {
         const loc: CXSourceLocation = clang_getCursorLocation(this);
         return clang_Location_isInSystemHeader(loc) != 0;
-    }
-
-    /// True when this cursor is in the translation unit's MAIN file (the imported
-    /// header itself).  Used to keep object-like `#define` import to the user's
-    /// own header - the compiler/target PREDEFINED macros (`__STDC__`,
-    /// `__GCC_HAVE_DWARF2_CFI_ASM`, ...) live in a `<built-in>` pseudo-file, are NOT
-    /// flagged as system headers, and would otherwise leak into the alias.
-    is_from_main_file(this) -> boolean {
-        const loc: CXSourceLocation = clang_getCursorLocation(this);
-        return clang_Location_isFromMainFile(loc) != 0;
     }
 
     /// Intern this cursor's spelling (e.g. a function/field name) into `ctx`.
@@ -237,6 +242,7 @@ const CURSOR_ENUM_DECL: i32          = 5;
 const CURSOR_FIELD_DECL: i32         = 6;
 const CURSOR_ENUM_CONSTANT_DECL: i32 = 7;
 const CURSOR_FUNCTION_DECL: i32      = 8;
+const CURSOR_VAR_DECL: i32           = 9;
 const CURSOR_TYPEDEF_DECL: i32       = 20;
 // C++ cursor kinds (Strategy A: direct mangled-symbol binding).
 const CURSOR_CXX_METHOD: i32         = 21;
@@ -254,6 +260,18 @@ const CX_CXX_INVALID_ACCESS: i32 = 0;
 const CX_CXX_PUBLIC: i32         = 1;
 const CX_CXX_PROTECTED: i32      = 2;
 const CX_CXX_PRIVATE: i32        = 3;
+
+// ---- CXLinkageKind constants ----
+/// The only linkage that yields a symbol another object can bind to.
+const LINKAGE_EXTERNAL: i32 = 4;
+
+// ---- CXEvalResultKind constants ----
+// The shape a folded initializer took.  Anything not listed (`CXEval_Other`,
+// `CXEval_UnExposed`, the Objective-C string kinds) has no Cryo constant form,
+// so the macro that produced it stays unbound and reported.
+const EVAL_INT: i32     = 1;
+const EVAL_FLOAT: i32   = 2;
+const EVAL_STRLIT: i32  = 4;
 
 // ---- CXTokenKind constants ----
 const TOKEN_PUNCTUATION: i32 = 0;
@@ -323,6 +341,16 @@ extern "C" {
     /// (`enum (unnamed at foo.h:1:1)`), so an empty-spelling test does NOT
     /// detect anonymity.
     function clang_Cursor_isAnonymous(c: CXCursor) -> u32;
+    /// The cursor DEFINING the entity `c` declares, or the null cursor when the
+    /// translation unit contains no definition for it.  Drives the
+    /// incomplete-tag test: a tag that is never completed anywhere in the TU has
+    /// no layout to reproduce, so it binds as an opaque record rather than being
+    /// dropped (which would leave every reference to it naming a type that was
+    /// never emitted).
+    function clang_getCursorDefinition(c: CXCursor) -> CXCursor;
+    /// True for the null cursor returned by `clang_getCursorDefinition` when no
+    /// definition exists.
+    function clang_Cursor_isNull(c: CXCursor) -> i32;
 
     // Function-decl introspection.
     function clang_getCursorResultType(c: CXCursor) -> CXType;
@@ -343,6 +371,10 @@ extern "C" {
     function clang_CXXMethod_isConst(c: CXCursor) -> u32;
     function clang_Cursor_isFunctionInlined(c: CXCursor) -> u32;
     function clang_getCXXAccessSpecifier(c: CXCursor) -> i32;
+    /// The linkage of the entity a cursor declares.  Gates global binding: only
+    /// an EXTERNAL-linkage variable has a symbol outside its own translation
+    /// unit, so binding a `static` one would name something no linker can find.
+    function clang_getCursorLinkage(c: CXCursor) -> i32;
 
     // Type introspection (drives the CXType -> Cryo annotation mapper).
     function clang_getCanonicalType(t: CXType) -> CXType;
@@ -392,7 +424,32 @@ extern "C" {
     // Source-location queries (system-header filter).
     function clang_getCursorLocation(c: CXCursor) -> CXSourceLocation;
     function clang_Location_isInSystemHeader(loc: CXSourceLocation) -> i32;
-    function clang_Location_isFromMainFile(loc: CXSourceLocation) -> i32;
+    /// Decompose a location into (CXFile, line, column, offset).  The CXFile is
+    /// the identity the macro filter compares against the TU's inclusion set:
+    /// CXFile is a `const FileEntry*`, unique per file within a TU, so pointer
+    /// identity answers "was this written in one of the library's own headers?"
+    /// exactly - no path spelling or case normalization to get wrong.  A
+    /// location with no file (a compiler predefine) yields a null CXFile.
+    function clang_getFileLocation(loc: CXSourceLocation, file: void**,
+        line: u32*, column: u32*, offset: u32*) -> void;
+
+    // Constant folding (`clang_Cursor_Evaluate`).  Asks clang what an
+    // initializer MEANS rather than re-deriving it from tokens - the only way to
+    // read a macro whose body is another macro's invocation
+    // (`SDL_UINT32_C(0x20)`), which no token walk can fold.  The opaque
+    // CXEvalResult must be disposed.
+    function clang_Cursor_Evaluate(c: CXCursor) -> void*;
+    function clang_EvalResult_getKind(e: void*) -> i32;
+    function clang_EvalResult_getAsLongLong(e: void*) -> i64;
+    function clang_EvalResult_getAsUnsigned(e: void*) -> u64;
+    /// True when the folded integer does not fit a signed long long, i.e. the
+    /// value must be read with `getAsUnsigned` to survive.
+    function clang_EvalResult_isUnsignedInt(e: void*) -> u32;
+    function clang_EvalResult_getAsDouble(e: void*) -> f64;
+    /// The folded string's bytes, already unescaped by clang.  Owned by the
+    /// eval result - copy before disposing.
+    function clang_EvalResult_getAsStr(e: void*) -> u8*;
+    function clang_EvalResult_dispose(e: void*) -> void;
 
     // Preprocessor / macro introspection (object-like #define import).
     function clang_Cursor_isMacroFunctionLike(c: CXCursor) -> u32;

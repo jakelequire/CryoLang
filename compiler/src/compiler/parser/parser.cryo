@@ -242,6 +242,7 @@ public:
                     }
                 }
                 program.add_statement(node);
+                Parser::hoist_extern_globals(program, node);
             } else if (pending.length > 0) {
                 for (mut i: i64 = 0; i < pending.length; i++) {
                     program.add_statement(pending[i] as ASTNode*);
@@ -2317,6 +2318,14 @@ public:
                     }
                     node.add_function(func);
                 }
+            } else if (this.check(TokenType::KwMut) || this.check(TokenType::KwConst)) {
+                const gvar: VarDeclNode* = this.parse_extern_global();
+                if (gvar != null) {
+                    for (mut pi: i64 = 0; pi < pending_dirs.length; pi++) {
+                        gvar.add_directive(pending_dirs[pi]);
+                    }
+                    node.add_global(gvar);
+                }
             } else {
                 this.error_unexpected();
                 this.advance();
@@ -2425,6 +2434,45 @@ public:
     parse_extern_function() -> FunctionDeclNode* {
         const func: FunctionDeclNode* = this.parse_function_declaration(false);
         return func;
+    }
+
+    /// Parse an imported global inside an `extern "C"` block:
+    ///   `mut errno_value: i32;`  /  `const build_id: u8*;`
+    ///
+    /// The declaration names storage that belongs to another object, which
+    /// rules out both halves of an ordinary global: an initializer would DEFINE
+    /// the symbol here and collide with the library at link time, and the type
+    /// cannot be inferred because there is nothing to infer it from.  `mut` and
+    /// `const` still say what CRYO may do with it - `const` is not a promise
+    /// about the library, which remains free to change the value.
+    parse_extern_global() -> VarDeclNode* {
+        mut node: VarDeclNode* = this.parse_variable_declaration();
+        if (node == null) { return null; }
+        node.is_global = true;
+        node.is_extern_import = true;
+        if (node.initializer != null) {
+            this.report_error(ErrorCode::E0111_INVALID_SYNTAX,
+                "an imported global cannot have an initializer: its storage is defined by the library being linked, not here");
+        }
+        if (node.type_annotation == null) {
+            this.report_error(ErrorCode::E0104_EXPECTED_TYPE,
+                "an imported global needs a type annotation: there is no initializer to infer one from");
+        }
+        return node;
+    }
+
+    /// Move an `extern "C"` block's imported globals into the top-level
+    /// statement stream.  They ARE top-level globals - only their storage lives
+    /// elsewhere - so hoisting lets the declaration index, name resolution, type
+    /// resolution and codegen reach them through the paths that already handle
+    /// globals, instead of each learning to look inside an extern block.
+    static hoist_extern_globals(program: ProgramNode*, node: ASTNode*) -> void {
+        if (program == null || node == null) { return; }
+        if (node.kind != NodeKind::ExternBlock) { return; }
+        const blk: ExternBlockNode* = node as ExternBlockNode*;
+        for (mut i: i64 = 0; i < blk.globals.length; i++) {
+            program.add_statement(blk.globals[i] as ASTNode*);
+        }
     }
 
     /// Parse an intrinsic declaration:

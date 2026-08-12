@@ -138,6 +138,20 @@ type struct DeclarationIndex {
                                       // marked thread-local too (else it would
                                       // reference a TLS symbol with a non-TLS
                                       // relocation and fail to link).
+    // A global whose storage another object owns (an `extern` C global) binds
+    // ONE linker symbol program-wide - the one the C library exports.  A reader
+    // in another module otherwise mangles the reference `C$<ns>.<name>` to match
+    // the definition, which is right until the definition is not ours to name:
+    // mangling `errno` asks the linker for a symbol nobody emits.
+    //
+    // Kept as its own map rather than a column on `module_global_*` because it
+    // answers a question asked under a DIFFERENT key: a qualified reference
+    // (`GvProbe::probe_counter`) resolves against the qualified name, while
+    // those arrays are keyed by the bare leaf.  Every key a global is registered
+    // under records here, so the answer does not depend on which spelling the
+    // caller had in hand.
+    extern_global_keys: u32[];
+    extern_global_syms: u32[];
 
     // Qualified function name -> mangled LLVM symbol name.
     // Computed once at registration time so codegen never mangles.
@@ -310,6 +324,8 @@ type struct DeclarationIndex {
             module_types:        [],
             module_global_keys:       [],
             module_global_threadlocal: [],
+            extern_global_keys: [],
+            extern_global_syms: [],
             module_global_modules:    [],
             module_global_namespaces: [],
             module_global_types:      [],
@@ -860,6 +876,35 @@ type struct DeclarationIndex {
             }
         }
         return false;
+    }
+
+    /// The linker symbol of a global whose storage another object owns, or an
+    /// empty SymbolStr when the global is Cryo's own (and so is mangled under
+    /// its defining namespace).  A cross-module reference asks this before
+    /// mangling: an imported global has one symbol in the whole program, and it
+    /// is the one the C library exports.
+    global_extern_symbol(&this, name: SymbolStr) -> SymbolStr {
+        for (mut i: i64 = 0; i < this.extern_global_keys.length; i++) {
+            if (this.extern_global_keys[i] == name.id) {
+                return SymbolStr::from_id(this.extern_global_syms[i]);
+            }
+        }
+        return SymbolStr::empty();
+    }
+
+    /// Record that the global reachable as `name` binds linker symbol `sym`.
+    /// Called once per key the global is registered under (bare, module-
+    /// qualified, alias-qualified), so a reference resolves the same whichever
+    /// spelling it used.
+    record_global_extern_symbol(mut &this, name: SymbolStr, sym: SymbolStr) -> void {
+        for (mut i: i64 = 0; i < this.extern_global_keys.length; i++) {
+            if (this.extern_global_keys[i] == name.id) {
+                this.extern_global_syms[i] = sym.id;
+                return;
+            }
+        }
+        this.extern_global_keys.push(name.id);
+        this.extern_global_syms.push(sym.id);
     }
 
     /// Mark an already-registered global as thread-local. Called when the

@@ -1133,6 +1133,36 @@ type struct DirectiveProcessingPasses {
                 // cross-module extern refs are marked thread-local too.
                 ctx.decl_index.mark_global_thread_local(vd.name);
             }
+            // `![symbol("sym")]` on an IMPORTED global pins the linker symbol,
+            // the way it does on an extern function.  It is what lets a C global
+            // whose name is a Cryo keyword be bound at all: the declaration is
+            // spelled with an escaped identifier while the symbol stays the C
+            // one.  On a global Cryo DEFINES, the emitted symbol is the module's
+            // mangling and there is nothing to override.
+            if (name.eq("symbol") && dir.args.length == 1
+                    && dir.args[0].kind == DirectiveArgKind::StringLit) {
+                if (vd.is_extern_import) {
+                    vd.link_name = dir.args[0].str_value;
+                    // TypeResolution registered this global before directives
+                    // ran, recording its DECLARED name as the symbol; correct
+                    // every key it recorded so cross-module readers - which
+                    // arrive under the qualified spelling - bind the override.
+                    const ovr: SymbolStr = ctx.intern(vd.link_name);
+                    ctx.decl_index.record_global_extern_symbol(vd.name, ovr);
+                    ctx.decl_index.record_global_extern_symbol(
+                        ctx.qualify_symbol_sym(vd.name), ovr);
+                    if (!vd.binding_namespace.is_empty()) {
+                        ctx.decl_index.record_global_extern_symbol(
+                            ctx.qualify_binding_sym(vd.name, vd.binding_namespace), ovr);
+                    }
+                } else {
+                    mut sdiag: Diagnostic = Diagnostic::error(
+                        ErrorCode::E0151_DIRECTIVE_MISPLACED,
+                        "directive `![symbol]` applies to an imported global (one declared in an `extern` block); a global Cryo defines is emitted under its own module's symbol");
+                    sdiag = sdiag.at(dir.span);
+                    ctx.emit_diagnostic(sdiag);
+                }
+            }
             return;
         }
 

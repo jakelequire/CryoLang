@@ -51,6 +51,12 @@ import std::fs::metadata;
 import std::fs::path;
 import std::env;
 
+/// Name stem of a constant-folding probe variable.  The macro's index in
+/// `probe_names` is appended, which is what maps a folded value back to the
+/// macro that produced it - a stem no C header would collide with, so a probe
+/// is never confused with a real declaration.
+const PROBE_PREFIX: string = "__cryo_macro_probe_";
+
 /// A structured account of what a single translation unit's import could NOT
 /// translate faithfully - the honesty channel.  Two buckets:
 /// `skipped` (a construct that produced NO binding - a function-like macro, a
@@ -242,6 +248,22 @@ type struct Importer {
     /// cache provenance.  Stays empty on the inline `#include` path (which never
     /// calls `clang_getInclusions`).
     inputs:         string[];
+    /// The same set as `inputs`, held as libclang CXFile handles.  This is what
+    /// the macro filter tests: a CXFile is unique per file within a TU, so
+    /// pointer identity answers "did one of the library's own headers write
+    /// this?" without comparing path spellings.  Collected on EVERY path (not
+    /// just the vendor one), because the filter needs it whenever a macro is
+    /// considered.
+    input_files:    void*[];
+    /// Macros neither token pass could bind, held back from the report until the
+    /// constant-folding probe has had its turn (reporting them at classification
+    /// time would announce a loss the probe is about to recover).
+    /// `probe_reasons[i]` is the line to report if the probe also fails, and
+    /// `probe_lost[i]` selects its bucket: true = API we could bind but didn't,
+    /// false = inherently-unbindable noise.
+    probe_names:    SymbolStr[];
+    probe_reasons:  string[];
+    probe_lost:     boolean[];
 
     /// Build a per-TU importer.  Alias and `functions_only` are derived from the
     /// extern block; the type mapper is wired with the same (ctx, alias).
@@ -281,6 +303,10 @@ type struct Importer {
             is_vendor:      false,
             is_cpp:         false,
             inputs:         [],
+            input_files:    [],
+            probe_names:    [],
+            probe_reasons:  [],
+            probe_lost:     [],
         };
     }
 
@@ -346,6 +372,8 @@ type struct Importer {
             imp.emit_record(cursor, true);
         } else if (k == Clang::CURSOR_ENUM_DECL) {
             imp.emit_enum(cursor);
+        } else if (k == Clang::CURSOR_VAR_DECL) {
+            imp.emit_global(cursor);
         } else if (k == Clang::CURSOR_MACRO_DEFINITION) {
             // W1: defer - a macro can alias an enum constant, struct, or another
             // macro that this walk hasn't reached yet (cursor order is not
@@ -488,6 +516,33 @@ type struct Importer {
 
         this.extern_node.add_function(func);
         this.count = this.count + 1;
+    }
+
+    /// True when `cursor` was written in one of the files this TU actually
+    /// included - the entry header and its non-system `#include`s, the set the
+    /// `.deps` sidecar records.  THE macro filter.
+    ///
+    /// A `#define` is bindable API when the library wrote it and not when the
+    /// compiler did, and the inclusion set is exactly that distinction: compiler
+    /// and target predefines (`__STDC__`, `__GCC_HAVE_*`) live in a `<built-in>`
+    /// pseudo-file which is never included by anyone, and system headers are
+    /// dropped from the set as it is built.  Asking instead whether the macro
+    /// came from the MAIN file answers a much narrower question, and gets the
+    /// common case backwards: a library's entry header is typically an umbrella
+    /// of `#include`s that defines nothing itself, so every constant the library
+    /// ships lives one level down and is silently invisible.
+    is_from_bound_header(&this, cursor: CXCursor) -> boolean {
+        const loc: CXSourceLocation = Clang::clang_getCursorLocation(cursor);
+        mut file: void* = null;
+        mut line: u32 = 0;
+        mut col: u32 = 0;
+        mut off: u32 = 0;
+        Clang::clang_getFileLocation(loc, &file, &line, &col, &off);
+        if (file == null) { return false; }
+        for (mut i: i64 = 0; i < this.input_files.length; i++) {
+            if (this.input_files[i] == file) { return true; }
+        }
+        return false;
     }
 
     /// This cursor's spelling resolved to a `string` (for report messages).
@@ -686,6 +741,18 @@ type struct Importer {
             return;
         }
 
+        // A tag this translation unit never completes has no members and no
+        // size, so there is no layout to reproduce - only a name that other
+        // declarations refer to.  Bind it as a zero-field opaque record: C
+        // permits nothing but pointers to an incomplete type, and a named record
+        // keeps those pointers spelled as themselves.  Emitting nothing instead
+        // is what leaves a typedef, parameter or return type naming a type that
+        // was never emitted.
+        if (!cursor.has_definition_in_tu()) {
+            this.emit_opaque_tag(name_sym, is_union);
+            return;
+        }
+
         if (is_union) {
             // Native `type union`: one field per member, all sharing storage at
             // offset 0 (the first-class union feature, not the pre-union `_storage`
@@ -730,6 +797,29 @@ type struct Importer {
             Clang::clang_visitChildren(cursor, Importer::visit_collect_member, this as void*);
             this.populate_record_fields(node, cursor);
         }
+    }
+
+    /// Emit an incomplete tag - one declared but never defined in this
+    /// translation unit - as a zero-field `![repr(C)]` record.  A union binds the
+    /// same way as a struct: with no definition there are no members and no size,
+    /// so no union-ness survives to be represented; what remains is an opaque
+    /// name reachable only through a pointer, which is also all C allows.
+    /// Registered in the struct tables so a repeated declaration of the same tag
+    /// dedups, and reported so the reduced fidelity is visible.
+    emit_opaque_tag(mut &this, name_sym: SymbolStr, is_union: boolean) -> void {
+        if (this.name_seen(name_sym)) { return; }
+        mut node: StructDeclNode* = new StructDeclNode(name_sym, SourceSpan::none());
+        node.binding_namespace = this.alias;
+        node.repr_c = true;
+        this.seen_names.push(name_sym);
+        this.type_names.push(name_sym);
+        this.struct_names.push(name_sym);
+        this.struct_nodes.push(node);
+        this.emit_top_level(node as ASTNode*);
+        const kindword: string = if (is_union) { "union" } else { "struct" };
+        this.report.approx(format(
+            "incomplete tag `%s %s` (declared, never defined in this translation unit) -> zero-field opaque record: usable only through a pointer",
+            kindword, this.ctx.intern_table.resolve(name_sym)));
     }
 
     /// Build a struct's fields from its collected member cursors, faithfully
@@ -1112,6 +1202,64 @@ type struct Importer {
         this.ec_enum_tags.push(SymbolStr::empty());
     }
 
+    /// Emit a file-scope C variable as an imported Cryo global.
+    ///
+    /// Only EXTERNAL linkage is bindable: a `static` variable has no symbol
+    /// outside the translation unit that defined it, so a binding to one would
+    /// name something no linker can resolve.  C `const` qualification carries
+    /// over as Cryo `const`, which says what Cryo may write - the library that
+    /// owns the storage is unaffected either way.
+    ///
+    /// This is what a loader-shaped C API needs: volk and its kind expose every
+    /// entry point as a global function pointer
+    /// (`extern PFN_vkCreateInstance vkCreateInstance;`), which is a global, not
+    /// a prototype.
+    emit_global(mut &this, cursor: CXCursor) -> void {
+        const name_sym: SymbolStr = cursor.intern_spelling(this.ctx);
+        const name_str: string = this.ctx.intern_table.resolve(name_sym);
+        if (name_str.eq("")) { return; }
+        if (this.name_seen(name_sym)) { return; }
+        const ctype: CXType = Clang::clang_getCursorType(cursor);
+
+        // A `static const` in a header is not a symbol - every translation unit
+        // gets its own copy - so it cannot be bound as an imported global.  It
+        // IS a compile-time value though, and it is how a C API states a
+        // constant too wide for an enum: Vulkan spells its 64-bit flag bits
+        // `static const VkFlagBits64 VK_PIPELINE_STAGE_2_* = 0x...ULL`, which is
+        // the same "flag constant" a smaller API would have written as a
+        // `#define`.  Bind the VALUE, and report only when clang cannot fold it.
+        if (Clang::clang_getCursorLinkage(cursor) != Clang::LINKAGE_EXTERNAL) {
+            if (Clang::clang_isConstQualifiedType(ctype) != 0
+                    && this.emit_evaluated_const(name_sym, cursor)) {
+                return;
+            }
+            this.report.skip(format(
+                "global `%s` (internal linkage: no symbol outside the translation unit that defines it, and no constant value to bind instead)",
+                name_str));
+            return;
+        }
+
+        mut vnode: VarDeclNode* = new VarDeclNode(name_sym, SourceSpan::none());
+        vnode.is_global        = true;
+        vnode.is_extern_import = true;
+        vnode.is_mutable       = Clang::clang_isConstQualifiedType(ctype) == 0;
+        vnode.binding_namespace = this.alias;
+        vnode.type_annotation  = this.types.map(ctype);
+
+        // A C++ variable's symbol is mangled; pin it the way bound functions do.
+        if (this.is_cpp) {
+            const mangled: SymbolStr = cursor.intern_mangling(this.ctx);
+            if (!mangled.is_valid()) {
+                this.report.skip(format("global `%s` (no mangled symbol)", name_str));
+                return;
+            }
+            vnode.link_name = this.ctx.intern_table.resolve(mangled);
+        }
+
+        this.seen_names.push(name_sym);
+        this.emit_top_level(vnode as ASTNode*);
+    }
+
     /// Emit a `type alias` for a C typedef.  Skips the redundant
     /// `typedef struct Foo Foo;` shape (the struct already supplies `alias::Foo`,
     /// and emitting an alias of the same qualified name would collide / E0207).
@@ -1147,10 +1295,10 @@ type struct Importer {
     /// lowering.
     emit_macro(mut &this, cursor: CXCursor) -> void {
         if (Clang::clang_Cursor_isMacroBuiltin(cursor) != 0) { return; }
-        // Compiler/target PREDEFINED macros (`__STDC__`, `__GCC_HAVE_*`, ...) live
-        // in a `<built-in>` pseudo-file and are NOT flagged as system headers, so
-        // the system-header filter misses them; restrict import to the header.
-        if (!cursor.is_from_main_file()) { return; }
+        // Bind only what the library's own headers wrote (see
+        // `is_from_bound_header`): compiler predefines are not this library's
+        // API, and a macro one `#include` below the entry header is.
+        if (!this.is_from_bound_header(cursor)) { return; }
         const name_sym: SymbolStr = cursor.intern_spelling(this.ctx);
         const name_str: string = this.ctx.intern_table.resolve(name_sym);
         if (name_str.eq("")) { return; }
@@ -1277,7 +1425,7 @@ type struct Importer {
     /// *could* bind but don't yet via `skip` (the headline "not bound" bucket).
     emit_macro_complex(mut &this, cursor: CXCursor) -> void {
         if (Clang::clang_Cursor_isMacroBuiltin(cursor) != 0) { return; }
-        if (!cursor.is_from_main_file()) { return; }
+        if (!this.is_from_bound_header(cursor)) { return; }
         const name_sym: SymbolStr = cursor.intern_spelling(this.ctx);
         const name_str: string = this.ctx.intern_table.resolve(name_sym);
         if (name_str.eq("")) { return; }
@@ -1323,8 +1471,11 @@ type struct Importer {
                 }
             }
             // A keyword/punctuation token, or an identifier that resolves to
-            // nothing bound, is a marker (`RLAPI`, `extern`), not lost API.
-            this.report.ignore(format("marker macro '%s' -> '%s'", name_str, s1));
+            // nothing bound, is a marker (`RLAPI`, `extern`), not lost API -
+            // unless it names something only the C compiler can evaluate (a
+            // constant in a system header), which the probe decides.
+            this.defer_probe(name_sym,
+                format("marker macro '%s' -> '%s'", name_str, s1), false);
             return;
         }
 
@@ -1335,7 +1486,192 @@ type struct Importer {
         }
 
         Clang::clang_disposeTokens(this.tu, toks, ntok);
-        this.report.skip(format("compound macro '%s' (non-trivial replacement)", name_str));
+        this.defer_probe(name_sym,
+            format("compound macro '%s' (non-trivial replacement)", name_str), true);
+    }
+
+    /// Queue an object-like macro that neither token pass could bind for the
+    /// constant-folding probe, carrying the report line to use if the probe
+    /// fails too.  Held rather than reported because the probe frequently
+    /// recovers exactly these, and a report line claiming a loss that did not
+    /// happen is worse than no line at all.
+    defer_probe(mut &this, name_sym: SymbolStr, reason: string, lost: boolean) -> void {
+        this.probe_names.push(name_sym);
+        this.probe_reasons.push(reason);
+        this.probe_lost.push(lost);
+    }
+
+    /// CONSTANT-FOLDING PASS: bind the object-like macros the token passes
+    /// could not, by asking a C compiler what they mean instead of
+    /// re-implementing C.
+    ///
+    /// A macro whose body is another macro's INVOCATION - `SDL_UINT32_C(0x20)`,
+    /// the portable way to pin a constant's width, and the shape most current C
+    /// APIs use for flags - is neither a literal nor an operator chain over
+    /// literals, so no token walk can fold it without becoming a preprocessor.
+    /// One synthesized translation unit carries a probe per candidate:
+    ///
+    ///     #include "<the entry header this TU parsed>"
+    ///     #ifdef SDL_INIT_VIDEO
+    ///     __auto_type __cryo_macro_probe_7 = (SDL_INIT_VIDEO);
+    ///     #endif
+    ///
+    /// and `clang_Cursor_Evaluate` reads each initializer's folded value back.
+    /// One TU for the whole library rather than one per macro: the include parse
+    /// dominates the cost and is shared.  `__auto_type` because the probe must
+    /// accept whatever type the expression has; `#ifdef` because a macro can be
+    /// `#undef`d after the definition cursor that named it; the parenthesis
+    /// because a body may be a comma expression.
+    ///
+    /// A body that is not an expression, or not a constant one, yields no
+    /// evaluable initializer and its macro keeps the classification the token
+    /// passes gave it - reported, never guessed.  Such a probe is a local parse
+    /// error that clang recovers from at the `;`, so one unfoldable macro costs
+    /// only itself.
+    probe_macro_constants(mut &this, index: void*, source_filename: u8*,
+                          unsaved: CXUnsavedFile*, num_unsaved: u32,
+                          args: &u8*[]) -> void {
+        if (this.probe_names.length == 0) { return; }
+
+        // Reproduce this TU's own entry exactly: a real header is included by
+        // path, and a virtual entry (the `#include <stdio.h>` form) already IS
+        // the include line, so it is reused verbatim.
+        mut src: String = String::new();
+        if (unsaved != null && num_unsaved > 0) {
+            src.push(Str::new((*unsaved).contents as string));
+            src.push_byte(10 as u8);
+        } else {
+            src.push(Str::new(format("#include \"%s\"\n",
+                Importer::to_forward_slashes(source_filename as string))));
+        }
+        // The probe must accept whatever type the expression has, which each
+        // language spells differently: `auto` is C++'s, `__auto_type` the C one.
+        const auto_kw: string = if (this.is_cpp) { "auto" } else { "__auto_type" };
+        for (mut i: i64 = 0; i < this.probe_names.length; i++) {
+            const nm: string = this.ctx.intern_table.resolve(this.probe_names[i]);
+            src.push(Str::new(format(
+                "#ifdef %s\n%s %s%lld = (%s);\n#endif\n",
+                nm, auto_kw, PROBE_PREFIX, i, nm)));
+        }
+
+        const content: string = src.into_raw();
+        const probe_file: string = "__cryo_macro_probe.c";
+        mut uf: CXUnsavedFile = CXUnsavedFile {
+            filename: probe_file as u8*,
+            contents: content as u8*,
+            length:   content.length()
+        };
+        // No detailed preprocessing record: this TU is read for VALUES, and the
+        // macro cursors were already collected from the real one.
+        const ptu: void* = Clang::clang_parseTranslationUnit(
+            index, probe_file as u8*, &args[0], args.length as i32, &uf, 1, 0);
+        if (ptu != null) {
+            const proot: CXCursor = Clang::clang_getTranslationUnitCursor(ptu);
+            Clang::clang_visitChildren(proot, Importer::visit_probe, this as void*);
+            Clang::clang_disposeTranslationUnit(ptu);
+        }
+
+        // Whatever the probe did not bind keeps the token passes' verdict.
+        for (mut i: i64 = 0; i < this.probe_names.length; i++) {
+            if (this.name_seen(this.probe_names[i])) { continue; }
+            if (this.probe_lost[i]) { this.report.skip(this.probe_reasons[i]); }
+            else                    { this.report.ignore(this.probe_reasons[i]); }
+        }
+    }
+
+    /// Probe-TU visitor: one folded constant per `__cryo_macro_probe_<N>`
+    /// variable.  The trailing index maps the probe back to the macro that
+    /// produced it, so no name matching is needed.
+    static visit_probe(cursor: CXCursor, parent: CXCursor, client: void*) -> i32 {
+        if (Clang::clang_getCursorKind(cursor) != Clang::CURSOR_VAR_DECL) {
+            return Clang::VISIT_CONTINUE;
+        }
+        const imp: Importer* = client as Importer*;
+        const spell: string = imp.spelling_of(cursor);
+        if (!spell.starts_with(PROBE_PREFIX)) { return Clang::VISIT_CONTINUE; }
+        const idx: i64 = spell.substr(PROBE_PREFIX.length() as i64,
+                                      (spell.length() - PROBE_PREFIX.length()) as i64)
+                              .parse_c_uint() as i64;
+        if (idx < 0 || idx >= imp.probe_names.length) { return Clang::VISIT_CONTINUE; }
+        imp.bind_probed_macro(imp.probe_names[idx], cursor);
+        return Clang::VISIT_CONTINUE;
+    }
+
+    /// Bind one probe's folded value as an alias-namespaced `const`.  The Cryo
+    /// type comes from the value the way the literal path picks one - the
+    /// narrowest that holds it, unsigned staying unsigned - so a macro recovered
+    /// here and one written as a bare literal bind identically.  A result that
+    /// is not an integer, float, or string has no Cryo constant form and is left
+    /// for the caller to report.
+    bind_probed_macro(mut &this, name_sym: SymbolStr, cursor: CXCursor) -> void {
+        if (this.name_seen(name_sym)) { return; }
+        this.emit_evaluated_const(name_sym, cursor);
+    }
+
+    /// Bind the folded value of `cursor`'s initializer as an alias-namespaced
+    /// `const`, returning whether anything bound.  Shared by the macro probe and
+    /// by `static const` globals, because both ask clang the same question -
+    /// what value does this initializer have - and both want the same answer
+    /// shape.  A result that is not an integer, float, or string has no Cryo
+    /// constant form; the caller reports those.
+    emit_evaluated_const(mut &this, name_sym: SymbolStr, cursor: CXCursor) -> boolean {
+        const ev: void* = Clang::clang_Cursor_Evaluate(cursor);
+        if (ev == null) { return false; }
+        mut bound: boolean = true;
+        const kind: i32 = Clang::clang_EvalResult_getKind(ev);
+
+        if (kind == Clang::EVAL_INT) {
+            // Width comes from the expression's own C type, never from the
+            // magnitude: `SDL_UINT64_C(0x10000000)` is a 64-bit constant whose
+            // VALUE happens to fit 32 bits, and an API that ORs it into a 64-bit
+            // flags field needs it to stay 64-bit.  Pinning that width is the
+            // whole reason a portable header spells the constant this way, so
+            // re-deriving it from the value would discard the one thing the
+            // macro was written to say.  Anything narrower than `int` has been
+            // promoted to `int` by the expression that reads it.
+            const wide: boolean = Clang::clang_Type_getSizeOf(
+                Clang::clang_getCursorType(cursor)) > 4;
+            mut type_name: string = "i32";
+            mut value_u64: u64 = 0;
+            if (Clang::clang_EvalResult_isUnsignedInt(ev) != 0) {
+                value_u64 = Clang::clang_EvalResult_getAsUnsigned(ev);
+                type_name = if (wide) { "u64" } else { "u32" };
+            } else {
+                const sv: i64 = Clang::clang_EvalResult_getAsLongLong(ev);
+                value_u64 = sv as u64;
+                type_name = if (wide) { "i64" } else { "i32" };
+            }
+            const itext: string = format("%llu", value_u64);
+            mut ilit: LiteralNode* =
+                new LiteralNode(itext, LiteralKind::Integer, SourceSpan::none());
+            this.emit_alias_const(name_sym, this.types.prim(type_name), ilit as ExpressionNode*);
+            this.record_macro_const(name_sym, type_name, itext, false);
+        } else if (kind == Clang::EVAL_FLOAT) {
+            mut ftext: string = format("%.17g", Clang::clang_EvalResult_getAsDouble(ev));
+            if (!Importer::has_float_marker(ftext)) { ftext = ftext + ".0"; }
+            mut flit: LiteralNode* =
+                new LiteralNode(ftext, LiteralKind::Float, SourceSpan::none());
+            this.emit_alias_const(name_sym, this.types.prim("f64"), flit as ExpressionNode*);
+            this.record_macro_const(name_sym, "f64", ftext, true);
+        } else if (kind == Clang::EVAL_STRLIT) {
+            const raw: u8* = Clang::clang_EvalResult_getAsStr(ev);
+            if (raw != null) {
+                // clang hands back the DECODED bytes and owns them; the intern
+                // table copies, and the serializer re-escapes on the way out.
+                const text: string = this.ctx.intern_table.resolve(
+                    this.ctx.intern_table.intern(raw as string));
+                mut slit: LiteralNode* =
+                    new LiteralNode(text, LiteralKind::String, SourceSpan::none());
+                this.emit_alias_const(name_sym, this.types.prim("string"),
+                                      slit as ExpressionNode*);
+            } else {
+                bound = false;
+            }
+        } else {
+            bound = false;
+        }
+        Clang::clang_EvalResult_dispose(ev);
+        return bound;
     }
 
     /// True if a top-level C function `name` was bound in this import (so a
@@ -1878,6 +2214,7 @@ type struct Importer {
         if (cstr != null && (cstr as string).length() > 0) {
             mut owned: String = String::from_string(cstr as string);
             imp.inputs.push(owned.into_raw());
+            imp.input_files.push(included_file);
         }
         Clang::clang_disposeString(fname);
     }
@@ -1956,6 +2293,11 @@ type struct Importer {
         // `#include` path passes null.  Function-alias wrappers ride this flag.
         imp.is_vendor = out_report != null;
         imp.is_cpp = is_cpp;
+        // Enumerate the inclusion set FIRST: it is what the macro filter asks
+        // ("did one of this library's own headers write this?"), so it has to be
+        // known before any macro is judged.  It doubles as the include-graph
+        // provenance record threaded out below.
+        Clang::clang_getInclusions(tu, Importer::visit_inclusion, (&imp) as void*);
         const cursor: CXCursor = Clang::clang_getTranslationUnitCursor(tu);
         Clang::clang_visitChildren(cursor, Importer::visit_decl, (&imp) as void*);
         // W1 two-pass macro emission (deferred from the decl walk): bind the
@@ -1968,15 +2310,17 @@ type struct Importer {
         for (mut mi: i64 = 0; mi < imp.macro_cursors.length; mi++) {
             imp.emit_macro_complex(imp.macro_cursors[mi]);
         }
+        // Last: fold the macros no token walk could read, and report whatever
+        // even a C compiler could not evaluate.  Runs after both token passes so
+        // it only ever ADDS bindings - a macro that already bound keeps the
+        // form it bound with.
+        imp.probe_macro_constants(index, source_filename, unsaved, num_unsaved, &args);
         if (out_report != null) { imp.report.merge_into(out_report); }
         else                    { imp.report.summary(label); }
 
-        // Vendor path only: enumerate the TU's inclusion set (entry header +
-        // transitive `#include`s) for the include-graph provenance sidecar.  The
-        // TU is still live here; the visitor appends non-system paths to
-        // `imp.inputs`, which we thread out to the caller's accumulator.
+        // Thread the inclusion set (entry header + transitive `#include`s) out
+        // to the vendor generator's include-graph provenance sidecar.
         if (out_inputs != null) {
-            Clang::clang_getInclusions(tu, Importer::visit_inclusion, (&imp) as void*);
             for (mut ii: i64 = 0; ii < imp.inputs.length; ii++) {
                 out_inputs.push(imp.inputs[ii]);
             }
@@ -1989,6 +2333,19 @@ type struct Importer {
 
 
     // Path Resolution.
+
+    /// Path with `\` rewritten to `/`.  A Windows path embedded in a generated
+    /// `#include "..."` would otherwise put a backslash where C reads an escape;
+    /// clang accepts forward slashes on every host.
+    static to_forward_slashes(p: string) -> string {
+        const len: u64 = p.length();
+        mut s: String = String::with_capacity(len + 1);
+        for (mut i: u64 = 0; i < len; i++) {
+            if (p[i] == '\\') { s.push_byte('/' as u8); }
+            else              { s.push_byte(p[i] as u8); }
+        }
+        return s.into_raw();
+    }
 
     /// Extract directory component from a file path.
     static get_directory(path: string) -> string {

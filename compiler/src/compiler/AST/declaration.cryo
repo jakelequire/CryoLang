@@ -155,6 +155,19 @@ public:
     /// thread gets its own instance. Only meaningful on globals; codegen
     /// (`codegen_global_var`) and cross-module extern refs read this flag.
     is_thread_local: boolean;
+    /// True for a global DECLARED here but DEFINED in another object - the
+    /// storage belongs to a C library (`extern int errno;`).  Three things
+    /// follow, and none of them can be inferred from a missing initializer
+    /// (an ordinary global may omit one and get zero): the symbol is the bare
+    /// C name rather than the namespace mangling, no initializer may be
+    /// emitted (that would define the symbol here and collide at link time),
+    /// and it is never marked LLVM-constant even when declared `const`, since
+    /// `const` binds what CRYO may write while the owning library remains free
+    /// to change the value under us.
+    is_extern_import: boolean;
+    /// `![symbol("name")]` on an imported global: the linker symbol to bind,
+    /// when it differs from the Cryo identifier.  Empty means "use the name".
+    link_name:        string;
 
     VarDeclNode(name: SymbolStr, span: SourceSpan)
         : DeclarationNode(NodeKind::VariableDeclaration, span) {
@@ -170,6 +183,8 @@ public:
         this.is_drop_flag     = false;
         this.binding_namespace = SymbolStr::empty();
         this.is_thread_local  = false;
+        this.is_extern_import = false;
+        this.link_name        = "";
     }
 
     has_initializer() -> boolean     { return this.initializer != null; }
@@ -1216,6 +1231,13 @@ public:
     /// "foo.h"`, resolved relative to the importing file's directory).
     include_is_system: boolean[];
     functions:       FunctionDeclNode*[];
+    /// Imported globals declared in this block (`mut errno: i32;`).  Held here
+    /// so the block owns what it declared, but HOISTED into the top-level
+    /// statement stream by the parser: they are globals whose storage lives in
+    /// another object, and every later pass already knows how to handle a
+    /// top-level global.  Teaching each of those passes to also look inside an
+    /// extern block would be the same rule written several times.
+    globals:         VarDeclNode*[];
 
     ExternBlockNode(linkage_type: string, span: SourceSpan)
         : DeclarationNode(NodeKind::ExternBlock, span) {
@@ -1224,6 +1246,12 @@ public:
         this.include_paths   = [];
         this.include_is_system = [];
         this.functions       = [];
+        this.globals         = [];
+    }
+
+    /// Record an imported global declared inside this block.
+    add_global(mut &this, node: VarDeclNode*) -> void {
+        this.globals.push(node);
     }
 
     /// Whether this is a CImport block (extern module name := "C" { #include ... })
