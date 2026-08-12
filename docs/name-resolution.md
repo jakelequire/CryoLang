@@ -271,7 +271,7 @@ retired):
 |---|---|---|
 | `IdentifierNode` | `AST/expression.cryo:104` | — |
 | `ScopeResolutionNode` | `AST/expression.cryo:789` | **`scope_res`** (SCOPE segment) |
-| `NamedAnnotation` | `AST/_module.cryo:456` | — |
+| `NamedAnnotation` | `AST/_module.cryo:456` | **`res`** (written name; §8.2ak) |
 | `NewExprNode` | `AST/expression.cryo:436` | — |
 | `SizeofExprNode` / `AlignofExprNode` | `AST/expression.cryo:483`, `:506` | — |
 | `CallExprNode` (callee) | `AST/expression.cryo:398` | — |
@@ -962,7 +962,7 @@ Measured hit counts, compiler building itself, 2026-08-03:
 | Global leaf index (cascade step 5) | 62,478 | **17,326** | 18% of all `resolve_named` answers |
 | home-module preference (2c) | — | **26,473** | largest answering step; §5.2 deletes it |
 | bootstrap arena (4, 4a) | — | 12,603 | deleted with `bootstrap_mode` |
-| M1 `ns_written_as` (check + export scan) | 49,718 | 49,586 | 99.7% hit, ~0 of it information — §8.2ai |
+| M1 `ns_written_as` (check + export scan) | 49,718 | 49,586 | export scan **deleted**; the check remains and is not a summand — §8.2ai, §8.2aj |
 | M2 `resolve_module_qualified_symbol` | 28,748 | 22,516 | scan **deleted** — §8.2ah |
 | M3 `collect_namespace_suffix_matches` | 5,669 | **0** | dead |
 | M4 mono bare-name scan | 3,500 | **1** | effectively dead |
@@ -4271,20 +4271,269 @@ something it used to refuse is a resolution change and the golden must still
 catch it. This is the same rule that already excludes cascade step 5 and every
 `calls` row — B1 counts answers produced, and a check produces none.
 
-**Where the refused path actually binds, narrowed but not closed.** The
-annotation lane is `TypeResolver::canonical_type_name`, which asks
+**Nothing answers in its place. The annotation simply goes unresolved.**
+Diffing the whole `resolve_named` cascade across the stub — it is already
+instrumented one site per outcome — shows the work is not redistributed:
+
+| `resolve_named` outcome | scan present | scan stubbed |
+|---|---:|---:|
+| 3b DI canonicalized qualified | 24 | 23 |
+| 5 global leaf index | 0 | 0 |
+| **unresolved** | **107** | **109** |
+
+With the scan, the abbreviated spelling is canonicalized and found at 3b. Without
+it, `resolve_named` returns nothing two more times — **and the build still
+succeeds and the test still passes**, because `mut h: future::executor::JoinHandle<i64>`
+is redundant with inference from its own initializer. An annotation that resolves
+to nothing is silently tolerated; the declared type is supplied by the callee's
+return type instead.
+
+That is the honest shape of the lane. The export scan is not a resolution
+strategy competing with another one — it is cover for an annotation lane that
+cannot resolve its own qualified path, and the corpus cannot see it working
+because the only annotation that needs it is one inference would have typed
+anyway. Two consequences, and the second is the more serious:
+
+* **Deleting the scan is a real behaviour change**, just an invisible one: two
+  annotations go from resolved to unresolved. Stamping `NamedAnnotation` first
+  makes the scan unreachable rather than merely redundant, and then its deletion
+  removes a branch that can no longer be taken.
+* **A `NamedAnnotation` naming a type that resolves to nothing produces no
+  diagnostic.** `resolve_named`'s 107 unresolved answers are not all benign, and
+  nothing distinguishes "inference will cover this" from "this annotation names
+  a type that does not exist". That is its own defect, independent of M1.
+
+The lane is `TypeResolver::canonical_type_name`, which asks
 `resolve_type_qualified_name_from` a second time — from the annotation's HOME
-scope rather than the ambient cursor — and then falls back to the ambient one,
-so the two-strategy shape repeats one level up. The home attempt refuses for the
-same reason the cursor attempt does, and the fall-through hands back the
-abbreviated `future::executor::JoinHandle` as though it were canonical, because
-a non-empty `SymbolStr` reads as valid. `TypeResolver::resolve_named_type`'s own
-chain then answers from a step no counter watches: not `lookup_by_leaf` (Δ 0
-across the stub), not the module-scope stamp (none exists), not `type_utils`'s
-cross-module branch (the abbreviated name never reaches it). Instrumenting that
-chain per outcome, the way `resolve_method_call` was, is what has to happen
-before the export scan can be deleted rather than merely stubbed — otherwise the
-deletion moves the question somewhere with no counter on it.
+scope rather than the ambient cursor — then falls back to the ambient one, so
+the two-strategy shape repeats one level up. Its fall-through hands back the
+abbreviated string as though canonical, because a non-empty `SymbolStr` reads as
+valid; a resolver that cannot say "I did not resolve this" is why its caller
+needs a chain at all.
+
+### 8.2aj The 107 unresolved are ALL generic parameters, and the scan's 1,627 answers are the identity — MEASURED 2026-08-11
+
+Two claims from §8.2ai were taken at face value and both are now measured. One
+survives in a stronger form; the other is wrong.
+
+**Controls first.** Compiler rebuilt from the tree at §8.2ai, after
+`make stdlib runtime-tiers`. `examples/09-json-config`, `--no-incremental`,
+`CRYO_CODEGEN_THREADS=1`: B1 = **5585**, matching `tests/b1-baseline.txt`
+`[host:linux]` row for row. `selfhost-check` passes both halves on that tree.
+
+#### The export scan answers nothing, and that is measurable without stubbing it
+
+| row | gate target |
+|---|---:|
+| `M1 SEARCH export-table scan calls` | 1627 |
+| `M1 SEARCH export-table scan hits` | 1627 |
+| `  of those, answer != input` | **0** |
+
+The scan returns `mod_str + "::" + leaf_str`, and the fall-through immediately
+below it returns `name` unchanged. When those are equal the scan has produced
+**the identity function**. So all 1,627 of its B1 answers on the gate target
+are answers the caller would have received from the function not existing.
+
+This does not require the stub experiment to establish, and it is a stronger
+statement than "redundant": the B1 bucket is crediting a fallback with 1,627
+answers, none of which changed a name.
+
+#### All 107 unresolved answers are generic parameters — none is a missing type
+
+`CRYO_RN_AUDIT=1` over the unit tree, step `X-failed`, 56,163 RN lines total.
+107 unresolved, reproducing §8.2ai exactly. Six distinct spellings:
+
+| name | count |  | site | count |
+|---|---:|---|---|---:|
+| `T` | 53 | | `sema/method_binding.cryo:798` | 73 |
+| `S` | 22 | | `passes/type_resolution.cryo:62` | 27 |
+| `C` | 16 | | `sema/sema.cryo:3365` | 6 |
+| `F` | 9 | | `mono/call_specializer.cryo:2164` | 1 |
+| `O` | 6 | | | |
+| `I` | 1 | | | |
+
+**Every one is a single-letter generic parameter. Not one is a written path
+naming a type that does not exist.** The gate target's own 14 are the same
+shape — 14 of 14 `T`, home equal to cursor in every case, so not the keystone
+and not a missing scope.
+
+Two of the three sema sites fail *by construction*, and say so:
+
+* `sema.cryo:3365` — "An ABSTRACT param … needs a binding, and no home module
+  can supply one, so those keep failing here by construction."
+* `method_binding.cryo:798` — "an explicit arg referencing the enclosing body's
+  abstract params can't select a concrete instantiation — detect in a FRESH
+  context (no bindings) and defer the whole call."
+
+Sema resolves in a binding-free context *so that* an abstract parameter fails,
+and uses the failure as the answer. `type_resolution.cryo:62` is different: it
+is the runner's shared `res_ctx`, built `HomeOrigin::Unset` with an empty home.
+
+**So §8.2ai's second bullet is withdrawn.** There is no population of
+undiagnosed "this annotation names a type that does not exist" behind the 107.
+A diagnostic hung on `resolve_named` answering nothing would fire on both
+deliberate probes and break the symbolic-walk deferral. If an unresolvable
+annotation should be diagnosed, the diagnostic belongs on the **annotation**,
+which is a node the user wrote — not on this function, which the probes reach
+without one.
+
+There is a constructive reading. Under §6.1 a generic parameter is not a
+failure at all: it is `Res::GenericParam`, an answer. Stamping would convert
+107 of 107 of today's "unresolved" into answers.
+
+#### Stamping does NOT make the scan unreachable
+
+§8.2ai's first bullet gives the deletion order as: stamp `NamedAnnotation`,
+which makes the scan unreachable, then delete a branch that can no longer be
+taken. The premise does not hold. `resolve_qualified_type_via_exports` is
+reached only through `Resolver::resolve_type_qualified_name`, which has four
+live callers, of which the annotation lane is one:
+
+| caller | qualified name possible? |
+|---|---|
+| `types/resolver.cryo:1632` `canonical_type_name` | yes — the annotation lane |
+| `sema/type_utils.cryo:146` `resolve_cross_module_name` | yes |
+| `passes/type_resolution.cryo:3853` base class | yes |
+| `sema/async_lower.cryo:2443` `sr.scope_name` | yes |
+
+Stamping starves the first. The other three keep reaching the scan, so the
+branch remains takeable and the deletion cannot be justified as removing dead
+code.
+
+It is still justifiable — on the measurement above, by "it answers nothing"
+rather than "nothing reaches it". Those are different claims about different
+populations, and only the first is measured. The one answer the scan has ever
+produced corpus-wide that was not the identity is the `JoinHandle` annotation
+of §8.2ai; deleting the scan sends that annotation, and one other, to
+unresolved, where inference already covers both.
+
+#### Ordering constraints on the `NamedAnnotation` stamp, read off the source
+
+* §6.1 fixes the owner: `Res` is "produced by the resolver, before types
+  exist", so the slot cannot be a memo of `canonical_type_name`'s answer
+  written during type resolution. A memo would also not starve the scan — the
+  first resolution of each node still runs the cascade.
+* The `NameResolver` does not traverse type annotations at all; a
+  `TypeAnnotation` is not an `accept`-visited node. The stamp needs an explicit
+  recursive walk plus a call from every annotation-bearing visitor, including
+  `SizeofExprNode` and `AlignofExprNode`, whose visitors are empty bodies.
+* `NameResolutionPass::run` runs per module, and `export_symbol` is called only
+  from that module's forward-declare sweep. Intra-module forward references are
+  therefore safe, and cross-module ones follow the import DAG rather than
+  directory order — but an import **cycle** has no valid order, so some
+  annotations stay `Unstamped` for a structural reason. Under §6.1 that is a
+  routing fact and must not become a licence to search.
+
+#### Instrument landmine
+
+`CRYO_RN_AUDIT=1` perturbs the suite exactly as `CRYO_PATH_AUDIT=1` does.
+`namespace_gate_methods` asserts its output must not contain `Carrier`, and the
+audit stream echoes the module `CryoTests::Tests::Lang::AsyncGiveawayCarrierAddressStable`
+31 times. Under `CRYO_RN_AUDIT` the project baseline is **32 passed / 2 failed**
+— `resolution_leaf_index` by design, plus this echo — not 33 / 1.
+
+#### The scan is DELETED, on the measurement that holds
+
+`resolve_qualified_type_via_exports` and its three counter sites are gone, and
+`M1ExportHits` leaves the B1 summation. The justification on the record is *it
+answers nothing* — 1,627 identity answers, one non-identity answer
+corpus-wide — and explicitly NOT *nothing reaches it*, which the four-caller
+table above disproves.
+
+Predicted before the edit: B1 5585 → **3958**, the two SEARCH rows leave, and
+no other row moves. Measured after: B1 = **3958**, 17 sites, and a full diff of
+the counter report against the pre-deletion run shows only the three deleted
+rows and the total. Every other row — `lookup_by_leaf` 4989/1431, canonical
+2527, M1 CHECK 4804/4804, M2 2258, M4 267/0, and `resolve_named` unresolved at
+14 — is byte-identical. That is the accounting signature, with no behaviour
+drift on this population.
+
+Gates after: `make test` unit ok / compile-fail 170 passed / projects 33 passed,
+1 failed (`resolution_leaf_index`, §2's by-design red); `make examples` all 14;
+`roster-check` OK; `api-index-check` OK; `b1-check` OK at 3958.
+
+The `[host:windows]` golden now has a **sixth** reason to be stale and still
+owes a re-pin from a Windows host.
+
+Two annotations that the scan used to canonicalize now go unresolved, where
+inference already supplies the type. No diagnostic was added: per the 107
+measurement above, a diagnostic hung on `resolve_named` answering nothing would
+fire on two deliberate sema probes. Hanging it on the annotation node instead
+is `NamedAnnotation`'s row of §6.3, still unfilled.
+
+### 8.2ak The annotation stamp lands write-only: 87% covered, and the hard case is 4 names — MEASURED 2026-08-11
+
+`NamedAnnotation` now carries `res: Res`, filled by `NameResolver::stamp_annotation`
+walking the annotation tree from every visitor that holds one. **Nothing reads
+it.** That is deliberate: a stamp with no consumer cannot change what a program
+compiles to, so the coverage number below is measured before anything depends
+on it being high.
+
+#### What the resolver can actually ask
+
+`register_type` runs in the **TypeDeclaration** pass, which is the pass *after*
+`NameResolution`. So at stamp time the `DeclarationIndex` knows module imports
+and the prelude — which is why `stamp_module_scope` can use `ns_imports` — but
+knows **no types at all**. The only type knowledge available is the Resolver's
+own export table, populated per module by the forward-declare sweep of
+`visit(ProgramNode*)`.
+
+That is the same table `resolve_qualified_type_via_exports` was scanning before
+§8.2aj deleted it. The difference is not the data, it is the question: the scan
+searched it by prefix from wherever the compiler was standing and threw the
+answer away; the stamp asks once from the writer's own module scope and records
+the answer on the node.
+
+#### Coverage, `examples/09-json-config`
+
+| outcome | count |
+|---|---:|
+| annotations offered to the stamp | 2679 |
+| stamped `Def` (bare, via home scope) | **1686** |
+| stamped `GenericParam` | **656** |
+| UNSTAMPED qualified spelling | 4 |
+| UNSTAMPED span names no module | 0 |
+| UNSTAMPED module has no scope | 0 |
+| UNSTAMPED bare name not in scope | 333 |
+
+**2,342 of 2,679 — 87% — are answered.** B1 is unchanged at 3958 and every
+gate is unchanged, as it must be with no consumer.
+
+#### The case the design was worried about is four names
+
+§8.2aj flagged that a qualified spelling needs a lookup that can say "no", and
+the one that exists returns its input unchanged on failure, so a canonical
+answer and a refusal are the same value. Those are left unstamped and counted —
+and there are **4** of them. The shape that looked like the obstacle is a
+rounding error; it did not deserve the design weight it was being given.
+
+#### The 333, classified — 227 primitives and 106 ordering casualties
+
+Emitted at the event as `ANN-UNSTAMPED` on `CRYO_PATH_AUDIT`, because a count
+cannot say which name:
+
+* **227 are primitive spellings** — `string` 40, `char` 19, `u64` 18, and so on
+  down. 58 come from `std::core::primitives` alone and the rest from trait
+  impls on primitives (`std::core::cmp`, `std::fmt::display`, `core::hash`,
+  `core::drop`, `core::ops`, `core::clone`). Primitives are lexed as keywords
+  and normally parse to `PrimitiveAnnotation`, so their arriving here as
+  `Named` is itself worth a look. Under §6.1 they are `Res::PrimTy` — an
+  answer. Adding it needs the lexer's keyword table as the single authority
+  rather than a second list of primitive names.
+* **106 are real types, and only twelve distinct names**: `Option`, `Array`,
+  `Str`, `String`, `Iterator`, `GlobalAlloc`, `AllocError`, `Arena`,
+  `CharIndices`, `Chars`, `ConversionError`, `SplitIter`. Every one is a core
+  stdlib type with heavy mutual dependency, and they go unstamped in modules
+  that import their declarer — `String` unresolved in `std::fmt::display`,
+  `std::io::traits`, `std::io::stdio`; `Str` in `std::collections::string`
+  itself.
+
+That second bucket is the structural limit predicted from the pass order, now
+with a number on it: the export table is filled in module processing order, so
+a module whose declarer has not been walked yet cannot be answered. It is the
+import-cycle population, it is 4% of annotations, and it is the question that
+has to be answered before any consumer may treat `Unstamped` as an ICE rather
+than as "the type layer still owns this one".
 
 ### 8.3 B2, enumerated — MEASURED 2026-08-09
 

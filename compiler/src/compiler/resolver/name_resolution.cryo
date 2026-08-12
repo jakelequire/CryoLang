@@ -273,7 +273,11 @@ public:
             }
             const param_sym: SymbolID = this.resolver.declare_parameter(param.name, param.span);
             this.resolver.record_resolution(param.span, param_sym);
+            // After `declare_generics`, so a parameter spelled `T` is answered
+            // as the generic param it names rather than searched for as a type.
+            this.stamp_annotation(param.type_annotation);
         }
+        this.stamp_annotation(node.return_type_annotation);
 
         // Visit body
         if (node.has_body()) {
@@ -428,6 +432,7 @@ public:
     }
 
     override visit(node: VarDeclNode*) -> void {
+        this.stamp_annotation(node.type_annotation);
         // Local variable declarations (globals handled in forward_declare)
         if (!node.is_global) {
             // Reject a same-scope redeclaration of a value binding (E0205).
@@ -485,6 +490,7 @@ public:
     override visit(node: TypeAliasDeclNode*) -> void {
         // Already forward-declared; nothing more to resolve here.
         // Target type resolution is deferred to the TypeResolution pass.
+        this.stamp_annotation(node.target_annotation);
     }
 
     override visit(node: ImportDeclNode*) -> void {
@@ -513,6 +519,7 @@ public:
     }
 
     override visit(node: FieldDeclNode*) -> void {
+        this.stamp_annotation(node.type_annotation);
         // Fields already declared by parent struct/class visitor.
         // Visit default value expression if present.
         if (node.has_default_value()) {
@@ -687,6 +694,119 @@ public:
         ResolveCounter::Site::ScopeResNoModule.bump();
     }
 
+    /// Stamp every `Named` node in a type-annotation tree.
+    ///
+    /// A `TypeAnnotation` is not an AST node and is never `accept`-visited, so
+    /// the walk is explicit and every visitor holding one calls it.
+    ///
+    /// It descends per NODE rather than judging the tree at its root, because
+    /// an annotation tree is not written in one place: a spliced default type
+    /// argument keeps the span of the file it came FROM, so judging it at the
+    /// enclosing declaration would make one declaration's default mean a
+    /// different thing per caller.
+    stamp_annotation(&this, ann: TypeAnnotation*) -> void {
+        if (ann == null) { return; }
+        match (*ann) {
+            TypeAnnotation::Named(n)       => { this.stamp_named_annotation(n); }
+            TypeAnnotation::Pointer(p)     => { this.stamp_annotation(p.inner); }
+            TypeAnnotation::Reference(r)   => { this.stamp_annotation(r.inner); }
+            TypeAnnotation::Array(a)       => { this.stamp_annotation(a.element); }
+            TypeAnnotation::Projection(pj) => { this.stamp_annotation(pj.base); }
+            TypeAnnotation::Function(f)    => {
+                for (mut i: i64 = 0; i < f.parameters.length; i++) {
+                    this.stamp_annotation(f.parameters[i]);
+                }
+                this.stamp_annotation(f.return_type);
+            }
+            TypeAnnotation::Tuple(t)       => {
+                for (mut i: i64 = 0; i < t.elements.length; i++) {
+                    this.stamp_annotation(t.elements[i]);
+                }
+            }
+            TypeAnnotation::Generic(g)     => {
+                this.stamp_annotation(g.base);
+                for (mut i: i64 = 0; i < g.args.length; i++) {
+                    this.stamp_annotation(g.args[i]);
+                }
+            }
+            TypeAnnotation::ImplTrait(imp) => {
+                for (mut i: i64 = 0; i < imp.bounds.length; i++) {
+                    this.stamp_annotation(imp.bounds[i]);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Record what one annotation's written name refers to, as the file that
+    /// WROTE it can see - never as the module the walk happens to be standing
+    /// in.
+    ///
+    /// Silent rather than guessing in every case it cannot answer. A name left
+    /// `Unstamped` is not a failed lookup: the type layer still resolves it as
+    /// it always did, and this is the only reason adding the stamp cannot
+    /// change what a program compiles to.
+    stamp_named_annotation(&this, n: NamedAnnotation*) -> void {
+        if (n.res.is_stamped()) { return; }
+        ResolveCounter::Site::AnnResSeen.bump();
+        const written: string = this.resolver.intern_table.resolve(n.name);
+        if (written.length() == 0) { return; }
+
+        // A generic parameter names ITSELF, never whatever a call site binds it
+        // to. Answering it here is what keeps the stamp a statement about
+        // syntax; substitution happens strictly below this, in the type layer.
+        const in_scope: SymbolID =
+            this.resolver.lookup(n.name, this.resolver.current_scope);
+        if (in_scope.is_valid()) {
+            const sym: Symbol = this.resolver.get_symbol(in_scope);
+            if (sym.kind == SymbolKind::GenericParam) {
+                n.res = Res::GenericParam(n.name);
+                ResolveCounter::Site::AnnResGenericParam.bump();
+                return;
+            }
+        }
+
+        // A qualified spelling needs a lookup that can say "no". The one that
+        // exists hands the input back unchanged when it fails, so a canonical
+        // answer and a refusal are the same value; counted here and left
+        // unstamped rather than recorded on a reading the function cannot
+        // support.
+        if (this.resolver.contains_separator(written)) {
+            ResolveCounter::Site::AnnResQualified.bump();
+            return;
+        }
+
+        // The use site comes from the syntax. A span naming no module means a
+        // synthesized node, and a synthesizer that knows its referent sets the
+        // `Res` itself; judging against an invalid namespace would compare
+        // unequal to every real module and refuse everything.
+        const use_ns: SymbolStr = this.ctx.module_ns_sym_of_file(n.span.file);
+        if (!use_ns.is_valid()) {
+            ResolveCounter::Site::AnnResNoHome.bump();
+            return;
+        }
+        const home_sid: u64 =
+            this.resolver.find_module_scope(this.resolver.intern_table.resolve(use_ns));
+        if (home_sid == 0) {
+            ResolveCounter::Site::AnnResNoHomeScope.bump();
+            return;
+        }
+        const qn: SymbolStr = this.resolver.resolve_type_qualified_name_bare_from(
+            ScopeID { id: home_sid }, n.name);
+        if (!qn.is_valid()) {
+            ResolveCounter::Site::AnnResUnresolved.bump();
+            // Emitted at the event: the tally says how many names the writer's
+            // own scope cannot answer, and only a per-name line says which, so
+            // the bucket can be classified instead of guessed at.
+            ResolveCounter::path_hit(
+                "ANN-UNSTAMPED", this.resolver.intern_table.resolve(use_ns),
+                written, "<none>");
+            return;
+        }
+        n.res = Res::Def(qn);
+        ResolveCounter::Site::AnnResDef.bump();
+    }
+
     override visit(node: CallExprNode*) -> void {
         // Visit the callee expression (resolves the function name)
         node.callee.accept(this);
@@ -763,6 +883,10 @@ public:
             this.resolver.record_resolution(node.span, type_sym);
         }
 
+        for (mut i: i64 = 0; i < node.generic_args.length; i++) {
+            this.stamp_annotation(node.generic_args[i]);
+        }
+
         for (mut i: int = 0; i < node.arguments.length; i++) {
             node.arguments[i].accept(this);
         }
@@ -783,6 +907,7 @@ public:
 
     override visit(node: CastExprNode*) -> void {
         node.expression.accept(this);
+        this.stamp_annotation(node.target_annotation);
     }
 
     override visit(node: StructLiteralNode*) -> void {
@@ -829,7 +954,9 @@ public:
         for (mut i: int = 0; i < node.parameters.length; i++) {
             const param: VarDeclNode* = node.parameters[i];
             this.resolver.declare_parameter(param.name, param.span);
+            this.stamp_annotation(param.type_annotation);
         }
+        this.stamp_annotation(node.return_type_ann);
 
         // Visit body
         if (node.body != null) {
@@ -841,8 +968,12 @@ public:
 
     // Leaf expressions: no name resolution needed
     override visit(node: LiteralNode*) -> void {}
-    override visit(node: SizeofExprNode*) -> void {}
-    override visit(node: AlignofExprNode*) -> void {}
+    override visit(node: SizeofExprNode*) -> void {
+        this.stamp_annotation(node.type_ann);
+    }
+    override visit(node: AlignofExprNode*) -> void {
+        this.stamp_annotation(node.type_ann);
+    }
 
 
     // -- Statements --

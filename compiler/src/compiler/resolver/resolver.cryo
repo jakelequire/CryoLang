@@ -495,10 +495,10 @@ type struct Resolver {
             // entirely different module — `executor::JoinHandle` reaching
             // `thread::JoinHandle` in a program that imports both. Accept the
             // result only when its declaring module agrees with the qualifier
-            // that was actually written; otherwise fall through to the export
-            // scan below, which searches BY prefix. Without that check the winner
-            // is whichever module registered the leaf last, which is not a
-            // property the source mentions.
+            // the source wrote. A contradicted answer is refused and the name
+            // goes back unchanged rather than being bound: binding it would make
+            // the winner whichever module registered the leaf last, which is not
+            // a property the source mentions.
             const leaf_sym: SymbolStr = this.extract_leaf(name_str);
             mut leaf_answered: boolean = false;
             if (leaf_sym.is_valid()) {
@@ -519,67 +519,11 @@ type struct Resolver {
             // hits alone cannot tell those apart, and they call for opposite
             // fixes.
             if (!leaf_answered) { ResolveCounter::Site::M1LeafMiss.bump(); }
-            // A module-qualified type whose leaf isn't reachable through the
-            // current scope chain - e.g. `future::Ready` when only the parent
-            // `std::future` was imported, so `Ready` entered as a re-export of
-            // the `future::ready` submodule (`public module future::ready;`).
-            // The bare `Ready` already resolves elsewhere; make the qualified
-            // form consistent by resolving it against the cross-module export
-            // table: a public type whose leaf is `Ready` and whose declaring
-            // module matches the `future` prefix.
-            const via_exports: SymbolStr = this.resolve_qualified_type_via_exports(name_str);
-            if (via_exports.is_valid()) {
-                return via_exports;
-            }
             // Return the input as-is; it may be the canonical form already
             return name;
         }
 
         return this.resolve_type_qualified_name_bare_from(start, name);
-    }
-
-    /// Resolve a module-qualified type name (`Module::Leaf`) to its canonical
-    /// `<declaring-module>::Leaf` by scanning the cross-module export table for a
-    /// public type whose leaf name is `Leaf` and whose declaring module is
-    /// consistent with the `Module` prefix. Used only as a fallback in
-    /// `resolve_type_qualified_name` when the leaf isn't reachable through the
-    /// current scope chain (the qualified analogue of an already-working bare
-    /// name that entered as a submodule re-export). Empty when none matches.
-    resolve_qualified_type_via_exports(&this, name_str: string) -> SymbolStr {
-        const nlen: i64 = name_str.length() as i64;
-        mut last_sep: i64 = -1;
-        for (mut i: i64 = 0; i + 1 < nlen; i++) {
-            if (name_str[i] == ':' && name_str[i + 1] == ':') { last_sep = i; }
-        }
-        if (last_sep <= 0 || last_sep + 2 >= nlen) { return SymbolStr::empty(); }
-        const prefix_str: string = name_str.substring(0, last_sep);
-        const leaf_str: string = name_str.substring(last_sep + 2, nlen - last_sep - 2);
-        const leaf_sym: SymbolStr = this.intern_table.intern(leaf_str);
-
-        for (mut i: i64 = 0; i < this.exports.length; i++) {
-            const sym: Symbol = this.get_symbol(this.exports[i].first);
-            if (sym.kind != SymbolKind::Type && sym.kind != SymbolKind::TypeAlias) { continue; }
-            if (!sym.visibility.is_public()) { continue; }
-            if (!sym.name.equals(leaf_sym)) { continue; }
-            const mod_sym: SymbolStr = SymbolStr::from_id(this.exports[i].second as u32);
-            const mod_str: string = this.intern_table.resolve(mod_sym);
-            ResolveCounter::Site::M1ExportCalls.bump();
-            if (Resolver::ns_written_as(mod_str, prefix_str)) {
-                ResolveCounter::Site::M1ExportHits.bump();
-                const answer: string = mod_str + "::" + leaf_str;
-                // An answer equal to the input is one the caller would have got
-                // from this function not existing: the fall-through below hands
-                // `name` back unchanged.
-                if (!answer.eq(name_str)) {
-                    ResolveCounter::Site::M1ExportNovel.bump();
-                }
-                ResolveCounter::path_hit(
-                    "M1-EXPORT", this.intern_table.resolve(this.current_module),
-                    name_str, answer);
-                return this.intern_table.intern(answer);
-            }
-        }
-        return SymbolStr::empty();
     }
 
     /// True when the module `resolved` was declared in is consistent with the
