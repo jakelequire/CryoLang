@@ -627,9 +627,41 @@ type struct CallResolver {
 
     // -- The central dispatcher --
 
+    /// Warn on a hand-written `x.drop()`.
+    ///
+    /// Releasing a value is the compiler's job: it drops every owning local at
+    /// scope exit, and it drops an aggregate's fields after the type's own
+    /// `drop` body runs. A hand-written call therefore releases something that
+    /// is going to be released again, and stays correct only for as long as
+    /// every leaf drop nulls what it frees.
+    ///
+    /// `mem::drop(x)` is the sanctioned way to release EARLY: it takes the
+    /// value, so the move checker stops the caller using it afterwards and the
+    /// scope-exit drop is suppressed - neither of which a bare `x.drop()` does.
+    ///
+    /// A warning rather than an error while the tree still carries the
+    /// hand-written releases that predate field glue; the message says so, so
+    /// nobody reads the current tolerance as the rule.
+    ///
+    /// Emitted from sema, which is the last stage that sees only what the
+    /// AUTHOR wrote: DropInsertion's scope-exit drops and codegen's field glue
+    /// are both synthesized later, so neither can trip this.
+    warn_explicit_drop_call(mut &this, call: CallExprNode*) -> void {
+        if (call.arguments.length != 0) { return; }
+        if (call.callee == null || call.callee.kind != NodeKind::MemberAccess) { return; }
+        const ma: MemberAccessNode* = call.callee as MemberAccessNode*;
+        if (!ma.member.equals(this.intern.intern("drop"))) { return; }
+        mut diag: Diagnostic = Diagnostic::warning(
+            ErrorCode::W0015_EXPLICIT_DROP_CALL,
+            "explicit destructor call; the value is released at scope exit, and an aggregate's fields are released after its own `drop` runs. To release EARLY, write `mem::drop(x)`, which also stops the value being used afterwards. This is a warning while the tree is being cleaned up and will become an error");
+        diag = diag.at(call.span);
+        this.ctx.emit_diagnostic(diag);
+    }
+
     resolve_call(mut &this, visitor: ASTVisitor*, call: CallExprNode*) -> TypeRef {
         // Closure-call rewrite: `f(args)` where `f` is a closure-struct value.
         this.lambda.maybe_rewrite_closure_call(call);
+        this.warn_explicit_drop_call(call);
 
         // Compute the callee's param types for expected-type propagation.
         mut param_types: TypeRef[] = [];

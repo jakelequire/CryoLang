@@ -2361,9 +2361,45 @@ implement trait Drop for Buffer {
 }
 ```
 
-Implementing `Drop` declares "I own resources that must be released." The compiler **automatically synthesises drop calls at scope exit** for non-`Copy` `const`/`mut` bindings - the analyzer + synthesizer run unconditionally between `MoveCheck` and `TypeLowering`. Drops fire in reverse declaration order at every scope-exit point (block end, early `return`, `break`, `continue`). Manual `binding.drop()` remains valid and idiomatic: the analyzer treats the call as a move, the synthesizer skips bindings already consumed, and a **second** `binding.drop()` (or any other use of the binding after `.drop()`) is rejected as use-after-move (`E0452`).
+Implementing `Drop` declares "I own resources that must be released." The compiler **automatically synthesises drop calls at scope exit** for non-`Copy` `const`/`mut` bindings - the analyzer + synthesizer run unconditionally between `MoveCheck` and `TypeLowering`. Drops fire in reverse declaration order at every scope-exit point (block end, early `return`, `break`, `continue`).
 
-Auto-drop covers `const x: T = ...` and `mut x: T = ...` declarations. It does **not** yet cover pattern bindings (`match` arms) or members reached by field/index access - explicit `.drop()` is still required in those positions.
+Auto-drop covers `const x: T = ...` and `mut x: T = ...` declarations. It does **not** yet cover pattern bindings (`match` arms) or members reached by field/index access.
+
+**A user `drop` runs in addition to field drop-glue, not instead of it.** After a type's own `drop` body returns, its droppable fields are released for it, exactly as they would be for the same type with no `Drop` impl at all. A destructor therefore releases only what the *type itself* owns beyond its fields - a raw handle, an OS resource - and never has to release a field by hand:
+
+```cryo
+type struct Owner { inner: Buffer; }        // Buffer implements Drop
+
+implement trait Drop for Owner {
+    drop(mut &this) -> void {
+        shutdown();                         // `inner` is released after this returns
+    }
+}
+```
+
+**Releasing a field by hand releases it twice**, which is why the next rule is a requirement rather than advice.
+
+> **A `drop` implementation must be idempotent.** Releasing an
+> already-released value must be a no-op, not a second release. Null the handle
+> you free and guard on it:
+>
+> ```cryo
+> drop(mut &this) -> void {
+>     if (this.data != null) { free(this.data); }
+>     this.data = null;                       // REQUIRED, not defensive style
+> }
+> ```
+>
+> The compiler does not check this. A `drop` that calls `free(this.data)` and
+> leaves the pointer dangling is a double-free the moment the value is released
+> along two paths, and both the field-glue rule above and the drop of a
+> partially-consumed aggregate depend on the no-op behaviour.
+
+**Do not call `drop` by hand.** An explicit `x.drop()` warns (`W0015`) and will
+become an error: the value is released at scope exit anyway, so the call is at
+best redundant and at worst a second release. To release **early**, use
+`mem::drop(x)`, which takes the value - so the move checker rejects any later
+use and the scope-exit drop is suppressed. A bare `x.drop()` does neither.
 
 ### 16.3 Move Checking
 
