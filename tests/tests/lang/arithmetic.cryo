@@ -188,3 +188,66 @@ function compound_field_and_index_targets() -> Result<(), TestError> {
     match (expect_eq(buf[2], 16)) { Result::Ok(_) => {} Result::Err(e) => { return Result::Err(e); } }
     return Result::Ok(());
 }
+
+// -- Mixed-type numeric operands -------------------------------------------
+//
+// Two operands of DIFFERENT numeric types: the narrower converts up to the
+// wider. These all reached LLVM unconverted and failed module verification
+// outright - `fadd float, double`, `add i32, float` - naming no user construct,
+// so the whole class read as a compiler crash rather than a type error.
+// Widening warns (W0005) that it will one day require an explicit `as`;
+// narrowing is already an error and is not exercised here.
+
+![test]
+function mixed_float_widths_add() -> Result<(), TestError> {
+    mut a: f32 = 1.5;
+    mut b: f64 = 2.25;
+    const sum: f64 = a + b;
+    return expect_close_f64(sum, 3.75, 0.0000001);
+}
+
+// The result type is `bool` for a comparison, so it cannot say whether this is
+// float arithmetic; only the operands can.
+![test]
+function mixed_float_widths_compare() -> Result<(), TestError> {
+    mut a: f32 = 1.5;
+    mut b: f64 = 2.25;
+    return expect(a <= b, Str::new("f32 <= f64"));
+}
+
+// Int-FIRST ordering is the case that exposed the cause: codegen read the
+// operation's type off the LEFT operand, so this selected the integer `add`
+// with a float operand.
+![test]
+function int_then_float_uses_float_opcode() -> Result<(), TestError> {
+    mut n: i32 = 3;
+    mut f: f32 = 0.5;
+    const r: f32 = n + f;
+    return expect_close_f64(r as f64, 3.5, 0.0001);
+}
+
+![test]
+function float_then_int_widens() -> Result<(), TestError> {
+    mut f: f32 = 0.5;
+    mut n: i32 = 3;
+    const r: f32 = f + n;
+    return expect_close_f64(r as f64, 3.5, 0.0001);
+}
+
+// An unsigned operand converts by its OWN signedness. Reading this u8 as signed
+// would make 200 into -56 - a changed value, not a changed representation.
+![test]
+function unsigned_operand_converts_unsigned() -> Result<(), TestError> {
+    mut u: u8 = 200;
+    mut f: f32 = 0.5;
+    const r: f32 = u + f;
+    return expect_close_f64(r as f64, 200.5, 0.0001);
+}
+
+// An integer literal against a float operand converts the same way.
+![test]
+function integer_literal_against_float_operand() -> Result<(), TestError> {
+    mut f: f32 = 1.5;
+    const r: f32 = f + 2;
+    return expect_close_f64(r as f64, 3.5, 0.0001);
+}

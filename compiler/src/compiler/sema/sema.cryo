@@ -1924,17 +1924,19 @@ public:
             } else {
                 lhs = this.resolve_expr(bin.left);
             }
-        // A constant numeric expression paired with a narrow float takes that
-        // float, for the reason the call path pushes a narrow float slot onto
-        // one: the constant otherwise settles on the f64 default and the pair
-        // reaches codegen as `fadd double, float`, which fails module
-        // verification with no source location.  Gated on the peer being a
-        // narrow FLOAT so every integer pairing keeps resolving exactly as it
-        // does above - pushing a narrow int peer onto `1 << 20` would truncate
-        // a constant that currently computes at the i32 default.
+        // A constant numeric expression adopts its peer's type on exactly the
+        // slots the call path pushes a parameter type onto, and for the same
+        // two reasons.  A narrow FLOAT: the constant otherwise settles on the
+        // f64 default and the pair reaches codegen as `fadd double, float`,
+        // which fails module verification with no source location.  A WIDE int:
+        // `value < -128` against an `i64` otherwise computes the constant at
+        // the i32 default and then widens it, which is a conversion the source
+        // never asked for.  Narrow int peers are excluded on purpose - pushing
+        // one onto `1 << 20` would truncate a constant that currently computes
+        // at the i32 default and is then widened correctly.
         } else if (right_is_const_num && !left_is_const_num) {
             lhs = this.resolve_expr(bin.left);
-            if (is_narrow_float_type(this.arena, lhs)) {
+            if (is_narrow_float_type(this.arena, lhs) || is_wide_int_type(this.arena, lhs)) {
                 const saved_exp: TypeRef = this.state.expected_type;
                 this.state.expected_type = lhs;
                 rhs = this.resolve_expr(bin.right);
@@ -1944,7 +1946,7 @@ public:
             }
         } else if (left_is_const_num && !right_is_const_num) {
             rhs = this.resolve_expr(bin.right);
-            if (is_narrow_float_type(this.arena, rhs)) {
+            if (is_narrow_float_type(this.arena, rhs) || is_wide_int_type(this.arena, rhs)) {
                 const saved_exp: TypeRef = this.state.expected_type;
                 this.state.expected_type = rhs;
                 lhs = this.resolve_expr(bin.left);

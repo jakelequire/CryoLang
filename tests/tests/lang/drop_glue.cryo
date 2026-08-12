@@ -247,3 +247,53 @@ function match_rvalue_subject_consumed_no_double_free() -> Result<(), TestError>
     // payload exactly once.
     return expect_eq(count(), 1);
 }
+
+// ---- a user `drop` runs IN ADDITION to field glue ------------------------
+//
+// Writing a destructor used to switch field glue OFF for that type, so the
+// aggregate's fields were released only if the body named them. That made
+// adding a `drop` the one edit that could turn a correct type into a leaking
+// one, and it leaked silently - the same struct without a `drop` had its
+// fields released for it.
+
+// A hand-written `drop` that deliberately releases nothing.
+type struct HandDropped { p: Probe; }
+implement trait Drop for struct HandDropped {
+    drop(mut &this) -> void { }
+}
+
+![test]
+function user_drop_does_not_suppress_field_glue() -> Result<(), TestError> {
+    reset();
+    { mut a: HandDropped = HandDropped { p: Probe { tag: 1 } }; }
+    return expect_eq(count(), 1);
+}
+
+// The transitional case, and the invariant the design now leans on: a body
+// that releases its own field is followed by glue releasing it a second time.
+// That is sound only because a leaf drop nulls what it frees, so the second
+// release is a no-op. Asserted as an EFFECT count rather than a call count, so
+// it stays true once the redundant hand-written releases are stripped.
+mut g_idem_releases: i32 = 0;
+
+type struct IdemProbe { released: boolean; }
+implement trait Drop for struct IdemProbe {
+    drop(mut &this) -> void {
+        if (!this.released) {
+            g_idem_releases = g_idem_releases + 1;
+            this.released = true;
+        }
+    }
+}
+
+type struct ManualOwner { q: IdemProbe; }
+implement trait Drop for struct ManualOwner {
+    drop(mut &this) -> void { this.q.drop(); }
+}
+
+![test]
+function manual_field_release_then_glue_releases_once() -> Result<(), TestError> {
+    g_idem_releases = 0;
+    { mut a: ManualOwner = ManualOwner { q: IdemProbe { released: false } }; }
+    return expect_eq(g_idem_releases, 1);
+}
