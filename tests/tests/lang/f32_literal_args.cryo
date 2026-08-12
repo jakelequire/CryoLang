@@ -13,6 +13,19 @@
 ///! `f32` parameter. The generic cases are covered too because they were how
 ///! it first surfaced (via `math/`'s type-suffixed `min_f32`/`clamp_f32`,
 ///! which exist to work around exactly this).
+///!
+///! The same rule covers a constant float EXPRESSION - a negated literal
+///! (`-1.5`) or arithmetic over literals (`3.0 / 2.0`). Those parse as
+///! Unary/Binary nodes rather than `Literal`, so the allowlist missed them and
+///! they kept the f64 default: as an argument that was a clean `E0214`, but
+///! against an f32 PEER (`d <= -1.0 + eps`) nothing rejected it and codegen
+///! emitted `fadd double, float`, failing module verification with no source
+///! location at all.
+///!
+///! Both rules are gated on a narrower-than-f64 FLOAT target. Integer typing
+///! must not move: pushing a narrow int peer onto a folded constant would
+///! truncate a value that currently computes at the i32 default, so
+///! `integer_peer_typing_unchanged` pins that.
 
 ![config(testing)]
 namespace CryoTests::Tests::Lang::F32LiteralArgs;
@@ -66,4 +79,49 @@ function f64_params_still_take_full_precision() -> Result<(), TestError> {
     const v: f64 = ident<f64>(0.1);
     const d: f64 = v - 0.1;
     return expect(d == 0.0, Str::new("f64 literal unchanged"));
+}
+
+![test]
+function negated_float_literal_arg() -> Result<(), TestError> {
+    return expect(near(take_f32(-1.5), -1.5), Str::new("take_f32(-1.5)"));
+}
+
+![test]
+function literal_arithmetic_arg() -> Result<(), TestError> {
+    return expect(near(take_f32(3.0 / 2.0), 1.5), Str::new("take_f32(3.0 / 2.0)"));
+}
+
+![test]
+function negated_and_folded_args_together() -> Result<(), TestError> {
+    return expect(near(add_f32(-1.5, 9.0 / 4.0), 0.75),
+                  Str::new("add_f32(-1.5, 9.0 / 4.0)"));
+}
+
+![test]
+function negated_float_literal_arg_to_generic_at_f32() -> Result<(), TestError> {
+    return expect(near(ident<f32>(-1.5), -1.5), Str::new("ident<f32>(-1.5)"));
+}
+
+![test]
+function constant_float_expr_adopts_f32_peer() -> Result<(), TestError> {
+    // Neither operand is a bare literal, so before the peer rule recognised a
+    // constant expression this compiled to `fcmp ole float, double`.
+    const eps: f32 = 0.25;
+    const d:   f32 = -0.9;
+    return expect(d <= -1.0 + eps, Str::new("d <= -1.0 + eps"));
+}
+
+![test]
+function constant_float_expr_peer_arithmetic() -> Result<(), TestError> {
+    const half: f32 = 0.5;
+    return expect(near(half * (3.0 / 2.0), 0.75), Str::new("half * (3.0 / 2.0)"));
+}
+
+![test]
+function integer_peer_typing_unchanged() -> Result<(), TestError> {
+    // Exercises the same peer branch with a NON-float peer: `1 << 20` must keep
+    // computing at the i32 default rather than adopting the u8 on its left.
+    mut x: u8 = 3;
+    const sum: i32 = x + (1 << 20);
+    return expect_eq(sum, 1048579);
 }

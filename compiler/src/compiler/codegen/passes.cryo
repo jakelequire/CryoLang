@@ -1480,16 +1480,20 @@ type struct CodegenPasses {
         }
 
         const rc: i32 = Command::shell(cmd);
+        if (rc != 0) {
+            // Keep the response file on the failure path: the command in the
+            // diagnostic names it with `@`, so deleting it makes that command
+            // unreplayable - the linker just reports the missing file instead
+            // of the original error.
+            ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                format("linker invocation failed (%s exited with %d): %s\n  object list retained at: %s",
+                    link_cfg.driver, rc, cmd, link_rsp_path));
+            return PassResult::failure(1);
+        }
         // The response file has served its purpose; remove it so it doesn't
         // linger in the per-profile dir (best-effort - a failed unlink is
         // harmless).
         dir::remove_file(Path::from(link_rsp_path));
-        if (rc != 0) {
-            ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                format("linker invocation failed (%s exited with %d): %s",
-                    link_cfg.driver, rc, cmd));
-            return PassResult::failure(1);
-        }
 
         cdebug("[Codegen] Linked executable: %s\n", exe_path);
 
@@ -1626,15 +1630,17 @@ type struct CodegenPasses {
         }
 
         const rc: i32 = Command::shell(cmd);
+        if (rc != 0) {
+            // Retained on failure so the reported command can be re-run; see
+            // the project link path for the reasoning.
+            ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                format("linker invocation failed (%s exited with %d): %s\n  object list retained at: %s",
+                    link_cfg.driver, rc, cmd, link_rsp_path));
+            return PassResult::failure(1);
+        }
         // Discard the response file once the link has consumed it
         // (best-effort - a failed unlink is harmless).
         dir::remove_file(Path::from(link_rsp_path));
-        if (rc != 0) {
-            ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                format("linker invocation failed (%s exited with %d): %s",
-                    link_cfg.driver, rc, cmd));
-            return PassResult::failure(1);
-        }
 
         cdebug("[Codegen] Linked executable: %s\n", exe_path);
         ctx.artifacts.linked = LinkedOutput { object_file_path: exe_path };
@@ -1716,13 +1722,16 @@ type struct CodegenPasses {
         }
 
         const rc: i32 = Command::shell(cmd);
-        // Drop the response file now the archiver has read it (best-effort).
-        dir::remove_file(Path::from(rsp_path));
         if (rc != 0) {
+            // Retained on failure so the reported command can be re-run; see
+            // the project link path for the reasoning.
             ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                format("ar invocation failed (exited with %d): %s", rc, cmd));
+                format("ar invocation failed (exited with %d): %s\n  object list retained at: %s",
+                    rc, cmd, rsp_path));
             return PassResult::failure(1);
         }
+        // Drop the response file now the archiver has read it (best-effort).
+        dir::remove_file(Path::from(rsp_path));
 
         cdebug("[Codegen] Bundled archive: %s (%lld objects)\n",
             archive_path, objs.length);
