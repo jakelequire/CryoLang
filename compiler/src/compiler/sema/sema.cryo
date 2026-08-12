@@ -2816,9 +2816,47 @@ public:
         });
     }
 
+    /// Whether `A::B` reaches B THROUGH the type `A`, as opposed to through a
+    /// module that merely shares its name.
+    ///
+    /// One qualifier can name both: a module `Buffer` declaring a struct
+    /// `Buffer` is the shape that exposed this.  Answering "it is the type"
+    /// without asking whether `B` is a member of it types the whole path as the
+    /// TYPE, so a module-level `const` reached this way arrives as a struct -
+    /// and nothing complains until the value is USED, where it surfaces as
+    /// `Buffer does not implement BitOr`, naming neither the constant nor the
+    /// module nor anything the author can act on.
+    ///
+    /// A struct or class carries no associated constants, only `methods`, so a
+    /// member that names no method of it cannot be reached through the type and
+    /// the qualifier must be the module.
+    ///
+    /// Every other kind answers yes unchanged.  An ENUM especially: a variant's
+    /// type IS the enum, and `validate_enum_scope_member` owns the "no such
+    /// variant" diagnostic, which has to stay reachable.
+    scope_member_binds_type(mut &this, ty: TypeRef, scope: ScopeResolutionNode*) -> boolean {
+        const t: Type* = this.arena.lookup(ty.id);
+        if (t == null) { return true; }
+        if (t.kind == TypeKind::Struct) {
+            const st: StructType* = t as StructType*;
+            for (mut i: i64 = 0; i < st.methods.length; i++) {
+                if (st.methods[i].name.equals(scope.member_name)) { return true; }
+            }
+            return false;
+        }
+        if (t.kind == TypeKind::Class) {
+            const ct: ClassType* = t as ClassType*;
+            for (mut i: i64 = 0; i < ct.methods.length; i++) {
+                if (ct.methods[i].name.equals(scope.member_name)) { return true; }
+            }
+            return false;
+        }
+        return true;
+    }
+
     resolve_scope_resolution(mut &this, scope: ScopeResolutionNode*) -> TypeRef {
         const found: TypeRef = this.types.lookup_type_by_sym(scope.scope_name);
-        if (found.is_valid()) {
+        if (found.is_valid() && this.scope_member_binds_type(found, scope)) {
             this.validate_enum_scope_member(found, scope);
             return this.calls.promote_to_expected_instantiation(found);
         }
