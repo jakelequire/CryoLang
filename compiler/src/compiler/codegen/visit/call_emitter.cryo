@@ -1277,6 +1277,35 @@ type struct CallEmitter {
             }
         }
 
+        // A user-written `drop` runs IN ADDITION to field glue, not instead of
+        // it: the body releases what it names, and the type's own droppable
+        // fields are released here, right after the call returns.  Otherwise
+        // writing a `drop` silently switches field glue off, and every field
+        // the body forgets leaks with no diagnostic - the same type without a
+        // `drop` at all has its fields released for it, so adding a destructor
+        // would be the one edit that makes a program leak.
+        //
+        // Emitted at the CALL SITE rather than appended to the body so it
+        // covers every release path uniformly: an explicit `.drop()` and the
+        // synthesizer's scope-exit drop lower through here alike, and a body
+        // that returns early still releases its fields.
+        //
+        // A field the body already released is released again here.  That is
+        // sound only because leaf drops are in-place and null what they free,
+        // making the second release a no-op - an invariant this now depends on
+        // rather than merely benefits from.
+        if (node.callee.kind == NodeKind::MemberAccess && node.arguments.length == 0) {
+            const gma: MemberAccessNode* = node.callee as MemberAccessNode*;
+            const gdrop_sym: SymbolStr = intern.intern("drop");
+            if (gma.member.equals(gdrop_sym) && gma.object != null
+                    && OwnershipQuery::needs_drop(this.cg.get_arena(),
+                           this.cg.ctx.generic_registry,
+                           this.cg.get_intern(),
+                           gma.object.resolved_type)) {
+                this.emit_drop_glue(visitor, gma.object, gma.object.resolved_type);
+            }
+        }
+
         // Emit `unreachable` after a call to a divergent function - one
         // whose resolved return type is `never` (e.g. `core::panic` /
         // `intrinsics::panic`). Without this, a divergent call in a
