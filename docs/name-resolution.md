@@ -4535,6 +4535,97 @@ import-cycle population, it is 4% of annotations, and it is the question that
 has to be answered before any consumer may treat `Unstamped` as an ICE rather
 than as "the type layer still owns this one".
 
+### 8.2al The 227 primitive spellings are synthesized receivers, not written names — MEASURED 2026-08-11
+
+§8.2ak said their arriving as `Named` was "worth a look" and proposed stamping
+them `Res::PrimTy` off the lexer's keyword table. The look was taken first, and
+it **supersedes that proposal**: they are not written type names at all, so the
+stamp would have recorded a true fact about a node the parser should not have
+produced.
+
+Measured on this host (`[host:windows]`, `examples/09-json-config`), where the
+unstamped bucket is the same 333 as Linux while the offered total is 2,699
+rather than 2,679 — a Windows build compiles Windows-only stdlib modules, and
+all 20 extra annotations stamp `Def`.
+
+#### Classifying by the span, not by the name
+
+`ANN-UNSTAMPED` names the module and the name; neither says which *construct*
+wrote it. The annotation's own span does, so the audit line carries it. Every
+one of the 333 was then read off its source line:
+
+| construct at the annotation's span | count | of which primitive/unit |
+|---|---:|---:|
+| synthesized `&this` receiver | 219 | 211 |
+| synthesized `mut &this` receiver | 19 | 14 |
+| written type name | 95 | 3 |
+
+**225 of the 228 primitive/unit spellings are synthesized receivers.**
+
+#### Why a keyword never reached the keyword test
+
+`parse_parameter` types a `&this` receiver from `Parser::current_type_name` — a
+`string` holding the impl target's **text**, set by `parse_implement_block`.
+`is_primitive_type_token` tests a *token kind*, and by the time the receiver is
+synthesized the target is text, so the branch that produces
+`PrimitiveAnnotation` for every written primitive cannot be reached from there.
+`implement string { … }` therefore gives each of its methods a receiver
+annotation naming `string` that no module scope can answer.
+
+The control is `()`: it is one hit, and a written `()` parses as an empty
+`Tuple`, so `Named("()")` can only come from the one line in
+`parse_implement_block` that spells the unit target's text. It is the fingerprint
+of the synthesis and it is the only one of the 228 that survives the fix, because
+`()` is not a keyword.
+
+#### The second primitive-name list had already drifted, by exactly one name
+
+The other 3 are written `-> never`. `never` was in `TypeResolver::resolve_primitive`'s
+string table and **not** in the lexer's keyword table, so it lexed as an
+identifier, parsed to `Named`, and resolved only by falling through
+`resolve_named` into the same table the keyword would have named directly. The
+two lists differed by `{never}` and nothing else. §8.2ak's instruction to use the
+keyword table as the single authority is the right rule; there was already a
+duplicate to remove rather than one to avoid creating.
+
+#### What changed
+
+`TokenType::is_primitive_type` now holds the one list, `is_primitive_type_token`
+delegates to it, `never` joins the keyword table (it becomes reserved), and the
+receiver synthesis asks `TokenType::from_keyword` instead of assuming a name.
+
+Predicted before the edit: the primitive spellings leave both the offered and
+the unstamped bucket, `Def`/`GenericParam`/qualified hold still, `resolve_named`
+step 2 empties, and **B1 does not move** — none of these sites is a B1 summand.
+
+| row | before | after |
+|---|---:|---:|
+| annotations offered to the stamp | 2,699 | 2,472 |
+| stamped `Def` | 1,706 | 1,706 |
+| stamped `GenericParam` | 656 | 656 |
+| UNSTAMPED qualified spelling | 4 | 4 |
+| UNSTAMPED bare name not in scope | 333 | **106** |
+| `resolve_named` 2 primitive name (B3) | 230 | **0** |
+| B1 total | 3,958 | 3,958 |
+
+Coverage 2,362 of 2,472 — **95.5%**, from 87%. Seven rows moved and ninety were
+identical; the B3 total falls 236 = the 230 step-2 answers plus 6 scope
+judgements that only walked the tree because `never` was a named annotation.
+Five `-> never` positions exist in the compiled corpus and six judgements
+stopped; the multiplicity is unattributed.
+
+That the type is unchanged is structural, not a test result: `resolve()`'s
+`Primitive` arm and `resolve_named` step 2 call the **same** `resolve_primitive`
+with the same name, and steps 1 and 1b cannot shadow it because a generic
+parameter cannot be spelled with a keyword.
+
+#### What is left is exactly the ordering question
+
+The remaining 106 are the twelve stdlib types of §8.2ak plus `()`. Nothing about
+the primitive population touched them, which is the point: they are a different
+defect, and the pass-order question in §8.2ak is still the one that gates any
+consumer treating `Unstamped` as an error.
+
 ### 8.3 B2, enumerated — MEASURED 2026-08-09
 
 B2 was previously the assoc-type projection alone, and §7.3's "enumerated and

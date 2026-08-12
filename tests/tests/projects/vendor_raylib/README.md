@@ -33,8 +33,9 @@ cryo vendor /path/to/raylib
 cryo run
 ```
 
-`cryo vendor list` shows the registered library and its per-triple cached
-bindings; `cryo vendor remove RayLib` unregisters it.
+`cryo vendor list` shows the registered library and the triples it has cached
+bindings for; `cryo vendor remove RayLib` unregisters it, and `cryo vendor
+clean` unregisters every library whose source directory is gone.
 
 ## Why no bindings are checked in
 

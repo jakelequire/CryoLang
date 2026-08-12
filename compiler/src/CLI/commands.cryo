@@ -37,6 +37,16 @@ const NEG_ANSI_GREEN: string = "\x1B[32m";
 const NEG_ANSI_RED:   string = "\x1B[31m";
 const NEG_ANSI_RESET: string = "\x1B[0m";
 
+// `cryo vendor list` framing (ASCII only). Each library is a bordered block
+// whose top rule carries the library's name, so consecutive blocks share one
+// rule and the whole listing reads as a table. Widths are fixed rather than
+// terminal-derived, and a value too wide for its column wraps at a path
+// separator instead of being cut: a truncated path is not something the
+// reader can act on.
+const VENDOR_BOX_WIDTH:   i64 = 76;   // '+' to '+' inclusive
+const VENDOR_LABEL_WIDTH: i64 = 12;
+const VENDOR_VALUE_WIDTH: i64 = 58;   // BOX_WIDTH - 2 bars - 4 padding - LABEL
+
 /// Tally returned by the compile-fail suite so `cmd_test`'s unified
 /// OVERALL footer can quote it alongside the unit-suite outcome.
 type struct NegSuiteResult {
@@ -270,7 +280,7 @@ implement enum CommandKind {
             CommandKind::Demangle => { "cryo demangle <mangled-symbol>"  }
             CommandKind::Fetch    => { "cryo fetch"                        }
             CommandKind::Update   => { "cryo update"                       }
-            CommandKind::Vendor   => { "cryo vendor <path>|list|remove <name>|rebuild [name]" }
+            CommandKind::Vendor   => { "cryo vendor <path>|list|remove <name>|clean|rebuild [name]" }
             _ => { "" }
         };
     }
@@ -397,6 +407,8 @@ implement enum CommandKind {
                 fmt::printf("                            include_dirs, defines, link, bindings_file).\n");
                 fmt::printf("  cryo vendor list          List registered vendor libraries.\n");
                 fmt::printf("  cryo vendor remove <name> Unregister a library (by name or key).\n");
+                fmt::printf("  cryo vendor clean         Unregister every library whose source path is\n");
+                fmt::printf("                            gone.  Cached bindings are left on disk.\n");
                 fmt::printf("  cryo vendor rebuild [name] Regenerate bindings from a library's recorded\n");
                 fmt::printf("                            source (all libraries when no name is given).\n\n");
                 fmt::printf("The registry is global (per machine), stored under the cryo cache at\n");
@@ -2854,7 +2866,7 @@ type struct Executor {
         return 0;
     }
 
-    /// `cryo vendor <path>|list|remove <name>|rebuild [name]`: manage the
+    /// `cryo vendor <path>|list|remove <name>|clean|rebuild [name]`: manage the
     /// per-machine registry of vendored C libraries.
     static cmd_vendor(args: ParsedArgs) -> int {
         if (args.has_flag("debug")) { Logger::enable_debug(); }
@@ -2862,10 +2874,11 @@ type struct Executor {
         const sub: string = args.input_file();
         if (sub == "") {
             fmt::eprintf("Error: cryo vendor needs a subcommand or path.\n");
-            fmt::eprintf("Usage: cryo vendor <path>|list|remove <name>|rebuild [name]\n");
+            fmt::eprintf("Usage: cryo vendor <path>|list|remove <name>|clean|rebuild [name]\n");
             return 1;
         }
         if (sub == "list")   { return Executor::vendor_list(); }
+        if (sub == "clean")  { return Executor::vendor_clean(); }
         if (sub == "remove") { return Executor::vendor_remove(args.positional_at(1)); }
         if (sub == "rebuild") {
             return Executor::vendor_rebuild(args.positional_at(1), args);
@@ -3100,6 +3113,115 @@ type struct Executor {
         return 0;
     }
 
+    /// `n` copies of `ch`, for box rules and column padding.
+    static vendor_fill(ch: u8, n: i64) -> string {
+        mut out: String = String::new();
+        for (mut i: i64 = 0; i < n; i++) { out.push_byte(ch); }
+        return out.into_raw();
+    }
+
+    /// A `+- label ------+` rule opening one library's block.  Passing "" gives
+    /// the plain rule that closes the last block.
+    static vendor_box_rule(label: string) -> void {
+        if (label == "") {
+            const plain: string = Executor::vendor_fill('-' as u8, VENDOR_BOX_WIDTH - 2);
+            fmt::printf("+%s+\n", plain);
+            return;
+        }
+        // "+- " + label + " " + dashes + "+" spans the box width; a label wider
+        // than the box keeps a stub of rule rather than a negative count.
+        mut dashes: i64 = VENDOR_BOX_WIDTH - 5 - (label.length() as i64);
+        if (dashes < 3) { dashes = 3; }
+        const fill: string = Executor::vendor_fill('-' as u8, dashes);
+        fmt::printf("+- %s %s+\n", label, fill);
+    }
+
+    /// A bordered but empty row, closing one library's block off from the rule
+    /// that opens the next.
+    static vendor_box_gap() -> void {
+        const blank: string = Executor::vendor_fill(' ' as u8, VENDOR_BOX_WIDTH - 2);
+        fmt::printf("|%s|\n", blank);
+    }
+
+    /// One `|  label  value  |` row.  A value wider than its column continues
+    /// on further rows under an empty label, broken after the last path
+    /// separator that fits so each row still holds whole path segments; a
+    /// single segment longer than the column breaks at the column edge.
+    static vendor_box_field(label: string, value: string) -> void {
+        const text: Str = Str::new(value);
+        const n: u64 = text.length();
+        mut start: u64 = 0;
+        mut first: boolean = true;
+        // The `first` guard prints one row for an empty value, so a field is
+        // never silently absent from the block.
+        while (first || start < n) {
+            mut end: u64 = start + (VENDOR_VALUE_WIDTH as u64);
+            if (end >= n) {
+                end = n;
+            } else {
+                const cut: i64 = Path::last_separator(text.sub_bytes(start, end), 0);
+                if (cut > 0) { end = start + (cut as u64) + 1; }
+            }
+            const chunk: Str = text.sub_bytes(start, end);
+            mut shown: String = String::from_str(chunk);
+            mut head: string = "";
+            if (first) { head = label; }
+            const lpad: string = Executor::vendor_fill(' ' as u8,
+                VENDOR_LABEL_WIDTH - (head.length() as i64));
+            const vpad: string = Executor::vendor_fill(' ' as u8,
+                VENDOR_VALUE_WIDTH - (chunk.length() as i64));
+            fmt::printf("|  %s%s%s%s  |\n", head, lpad, shown.as_cstr() as string, vpad);
+            start = end;
+            first = false;
+        }
+    }
+
+    /// How an entry's bindings were produced, for its `bindings` row.
+    static vendor_binding_kind(entry: &VendorEntry) -> string {
+        if (entry.binding_source == "manual") { return "pre-written"; }
+        if (entry.binding_source == "headers"
+                || entry.binding_source == "cxx-headers") {
+            if (entry.is_cxx()) { return "generated from C++ headers"; }
+            return "generated from C headers";
+        }
+        return entry.binding_source;
+    }
+
+    /// The target triples an entry has cached bindings for.  The files sit at
+    /// `<cache>/<key>/<triple>/<Name>.cryo`, so the listing prints the cache
+    /// root once and names only the triples here.
+    static vendor_cached_targets(entry: &VendorEntry) -> string {
+        if (entry.cache.length == 0) { return "none cached"; }
+        mut out: String = String::new();
+        for (mut c: i64 = 0; c < entry.cache.length; c++) {
+            if (c > 0) { out.push(", "); }
+            out.push(entry.cache[c].triple);
+        }
+        return out.into_raw();
+    }
+
+    /// Registry indices ordered by library key.  Insertion order is whatever
+    /// sequence the machine happened to register in; sorting is what makes two
+    /// runs of `list` comparable to each other.  The stored order is untouched.
+    static vendor_key_order(reg: &VendorRegistry) -> i64[] {
+        mut order: i64[] = [];
+        for (mut i: i64 = 0; i < reg.entries.length; i++) { order.push(i); }
+        for (mut a: i64 = 0; a + 1 < order.length; a++) {
+            mut low: i64 = a;
+            for (mut b: i64 = a + 1; b < order.length; b++) {
+                const cand: Str = Str::new(reg.entries[order[b]].key);
+                const best: Str = Str::new(reg.entries[order[low]].key);
+                if (cand < best) { low = b; }
+            }
+            if (low != a) {
+                const held: i64 = order[a];
+                order[a] = order[low];
+                order[low] = held;
+            }
+        }
+        return order;
+    }
+
     /// `cryo vendor list`: print the registered libraries.
     static vendor_list() -> int {
         const reg: VendorRegistry = VendorRegistry::load_global();
@@ -3108,16 +3230,91 @@ type struct Executor {
             fmt::printf("Register one with: cryo vendor <path-to-c-project>\n");
             return 0;
         }
-        fmt::printf("Registered vendor libraries (%lld):\n", reg.entries.length as i64);
-        for (mut i: i64 = 0; i < reg.entries.length; i++) {
-            fmt::printf("  %s  ->  import vendor::%s\n",
-                reg.entries[i].key, reg.entries[i].name);
-            fmt::printf("      source: %s\n", reg.entries[i].source_path);
-            for (mut c: i64 = 0; c < reg.entries[i].cache.length; c++) {
-                fmt::printf("      [%s] %s\n",
-                    reg.entries[i].cache[c].triple, reg.entries[i].cache[c].file);
+        const order: i64[] = Executor::vendor_key_order(&reg);
+        fmt::printf("Registered vendor libraries (%lld)\n", reg.entries.length as i64);
+        fmt::printf("Bindings cache: %s\n\n",
+            exec_path(VendorRegistry::vendor_root()));
+        mut missing: i64 = 0;
+        for (mut oi: i64 = 0; oi < order.length; oi++) {
+            const i: i64 = order[oi];
+            const gone: boolean =
+                !metadata::exists(Path::from(reg.entries[i].source_path));
+            mut title: string = reg.entries[i].key;
+            if (gone) {
+                missing++;
+                title = format("%s  (source missing)", reg.entries[i].key);
+            }
+            Executor::vendor_box_rule(title);
+            Executor::vendor_box_field("import as",
+                format("vendor::%s", reg.entries[i].name));
+            Executor::vendor_box_field("bindings",
+                Executor::vendor_binding_kind(&reg.entries[i]));
+            Executor::vendor_box_field("targets",
+                Executor::vendor_cached_targets(&reg.entries[i]));
+            Executor::vendor_box_field("source",
+                exec_path(reg.entries[i].source_path));
+            Executor::vendor_box_gap();
+        }
+        Executor::vendor_box_rule("");
+        if (missing > 0) {
+            fmt::printf("\n%lld of %lld libraries no longer have their source; unregister them\n",
+                missing, reg.entries.length as i64);
+            fmt::printf("with `cryo vendor clean`.\n");
+        }
+        return 0;
+    }
+
+    /// `cryo vendor clean`: unregister every library whose recorded source path
+    /// is gone.  Registry-only, like `vendor remove`: the generated bindings
+    /// under the cache stay on disk, and re-registering the library reuses
+    /// them.
+    static vendor_clean() -> int {
+        mut lock: VendorLock = VendorLock::acquire();
+        mut reg: VendorRegistry = VendorRegistry::load_global();
+        if (reg.entries.length == 0) {
+            lock.release();
+            fmt::printf("No vendor libraries registered.\n");
+            return 0;
+        }
+        // One downward walk decides and deletes: each removal shifts the tail
+        // down, so descending indices leave the entries not yet examined where
+        // they were.  Deleting by index (not by key) is what keeps a library
+        // whose namespace collides with a doomed entry's key from being the one
+        // that goes.  The recorded key and path outlive their entry - a
+        // `string` field is a borrowed pointer its owner's drop does not free.
+        const total: i64 = reg.entries.length;
+        mut doomed: string[] = [];
+        mut paths:  string[] = [];
+        for (mut i: i64 = total - 1; i >= 0; i--) {
+            if (!metadata::exists(Path::from(reg.entries[i].source_path))) {
+                doomed.push(reg.entries[i].key);
+                paths.push(reg.entries[i].source_path);
+                reg.remove_at(i);
             }
         }
+        if (doomed.length == 0) {
+            lock.release();
+            fmt::printf("Nothing to clean: all %lld registered libraries still have\n",
+                total);
+            fmt::printf("their source.\n");
+            return 0;
+        }
+        if (!reg.save_global()) {
+            lock.release();
+            fmt::eprintf("Error: failed to write the vendor registry.\n");
+            return 1;
+        }
+        lock.release();
+        fmt::printf("Unregistered %lld vendor librar%s with a missing source:\n",
+            doomed.length as i64, if (doomed.length == 1) { "y" } else { "ies" });
+        // Collection ran downwards; report upwards so the order matches the
+        // registry.
+        for (mut d: i64 = doomed.length - 1; d >= 0; d--) {
+            fmt::printf("  %s\n", doomed[d]);
+            fmt::printf("      was %s\n", exec_path(paths[d]));
+        }
+        fmt::printf("%lld librar%s left registered.\n", reg.entries.length as i64,
+            if (reg.entries.length == 1) { "y" } else { "ies" });
         return 0;
     }
 
