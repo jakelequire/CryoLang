@@ -184,9 +184,8 @@ type struct PatternEmitter {
     ///
     /// Registers each binding as a pointer to its payload slot.  `codegen_identifier`
     /// treats named values as lvalues, so `codegen_rvalue` loads through the ptr.
-    /// This avoids creating entry-block allocas after the entry block has been
-    /// terminated (`create_entry_alloca` uses position_at_end and would emit
-    /// allocas after the terminator).
+    /// Pointing at the payload inside the subject needs no storage of its own,
+    /// so an arm binding costs no stack slot however many times it is reached.
     bind_arm_enum_payloads(mut &this, arm: MatchArmNode*, minfo: MatchSubjectInfo) -> void {
         if (minfo.enum_type == null || !minfo.subject_ptr.is_valid()) { return; }
         if (!minfo.enum_llvm.is_valid()) { return; }
@@ -325,7 +324,12 @@ type struct PatternEmitter {
             if (!is_ptr) {
                 const vty: LType = this.cg.type_mapper.map_type(minfo.subject_ty);
                 if (!vty.is_valid()) { continue; }
-                slot = this.cg.builder.build_alloca(vty, "match.bind");
+                // Hoisted like `match.subj` above: a `match` in a loop body
+                // would otherwise spill the subject into a fresh slot every
+                // iteration and reclaim none of them.  One slot serves every
+                // iteration because the store below precedes every read of the
+                // binding within the arm that reads it.
+                slot = this.cg.flow.temp_slot(vty, "match.bind");
                 if (!slot.is_valid()) { continue; }
                 this.cg.builder.build_store(minfo.subject_ptr, slot);
             }

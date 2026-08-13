@@ -324,7 +324,15 @@ type struct BinaryUnaryEmitter {
             if (!this.state.last_is_lvalue) {
                 const ty: LType = this.cg.type_mapper.map_type(node.operand.resolved_type);
                 if (ty.is_valid()) {
-                    addr = this.cg.builder.build_alloca(ty, "addrof.tmp");
+                    // The slot is hoisted to the entry block while the store
+                    // stays here, where the value is live.  `f(&g())` in a loop
+                    // body would otherwise allocate a fresh temporary every
+                    // iteration and release none of them, growing the frame
+                    // until it hits the guard page.  One slot serves every
+                    // iteration because the materialized rvalue dies with the
+                    // statement that created it, so the store below always
+                    // precedes the reads that consume it.
+                    addr = this.cg.flow.temp_slot(ty, "addrof.tmp");
                     this.cg.builder.build_store(v, addr);
                 }
             }

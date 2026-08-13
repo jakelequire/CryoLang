@@ -2266,7 +2266,7 @@ type struct CompilerInstance {
                 if (!ctx.artifacts.ir.is_valid()) {
                     // IR generation failed for this module.  The fresh context
                     // has no module to emit; reclaim it now.
-                    fmt::eprintln(f"error: codegen failed for module {i}");
+                    fmt::eprintln(f"error: codegen failed for module {CompilerInstance::codegen_module_name(ctx, i)}");
                     cg_failed = true;
                     Compiler::Codegen::LLVMTypes::dispose_codegen_context();
                     pipeline.reset();
@@ -2347,7 +2347,7 @@ type struct CompilerInstance {
                         mp_obj.push(tgt.emit_path);
                         mp_pos.push(i);
                     } else {
-                        fmt::eprintln(f"error: codegen failed for module {i}");
+                        fmt::eprintln(f"error: codegen failed for module {CompilerInstance::codegen_module_name(ctx, i)}");
                         cg_failed = true;
                     }
                     continue;
@@ -2396,16 +2396,16 @@ type struct CompilerInstance {
                             // incremental build the previous build's object is
                             // still on disk and would be archived in its place,
                             // silently, so this has to fail the build.
-                            fmt::eprintln(f"error: codegen wrote no object for module {p}");
+                            fmt::eprintln(f"error: codegen wrote no object for module {CompilerInstance::codegen_module_name(ctx, p)}");
                             cg_failed = true;
                         } else if (cg_jobs[b].ok) {
                             cg_obj[p as i64] = cg_jobs[b].emit_path;
                         } else {
                             const emsg: string = cg_jobs[b].err_msg;
                             if (emsg != null as string) {
-                                fmt::eprintln(f"error: codegen failed for module {p}: {emsg}");
+                                fmt::eprintln(f"error: codegen failed for module {CompilerInstance::codegen_module_name(ctx, p)}: {emsg}");
                             } else {
-                                fmt::eprintln(f"error: codegen failed for module {p}");
+                                fmt::eprintln(f"error: codegen failed for module {CompilerInstance::codegen_module_name(ctx, p)}");
                             }
                             cg_failed = true;
                         }
@@ -2425,16 +2425,16 @@ type struct CompilerInstance {
                     const p: u32 = cg_pos[b];
                     if (cg_jobs[b].ok &&
                         !metadata::exists(Path::from(cg_jobs[b].emit_path))) {
-                        fmt::eprintln(f"error: codegen wrote no object for module {p}");
+                        fmt::eprintln(f"error: codegen wrote no object for module {CompilerInstance::codegen_module_name(ctx, p)}");
                         cg_failed = true;
                     } else if (cg_jobs[b].ok) {
                         cg_obj[p as i64] = cg_jobs[b].emit_path;
                     } else {
                         const emsg: string = cg_jobs[b].err_msg;
                         if (emsg != null as string) {
-                            fmt::eprintln(f"error: codegen failed for module {p}: {emsg}");
+                            fmt::eprintln(f"error: codegen failed for module {CompilerInstance::codegen_module_name(ctx, p)}: {emsg}");
                         } else {
-                            fmt::eprintln(f"error: codegen failed for module {p}");
+                            fmt::eprintln(f"error: codegen failed for module {CompilerInstance::codegen_module_name(ctx, p)}");
                         }
                         cg_failed = true;
                     }
@@ -2465,7 +2465,7 @@ type struct CompilerInstance {
                     if (metadata::exists(Path::from(mp_obj[k]))) {
                         cg_obj[mp_pos[k] as i64] = mp_obj[k];
                     } else {
-                        fmt::eprintln(f"error: codegen failed for module {mp_pos[k]}");
+                        fmt::eprintln(f"error: codegen failed for module {CompilerInstance::codegen_module_name(ctx, mp_pos[k])}");
                         cg_failed = true;
                     }
                 }
@@ -3603,6 +3603,25 @@ type struct CompilerInstance {
     ///     after every worker has joined (`dispose_emit_jobs`).
     ///   * Workers get 64 MiB stacks: LLVM's SelectionDAG recurses deep and
     ///     overflows the ~1 MiB default thread stack.
+    /// The name of the module sitting at `pos` in the topological codegen
+    /// order, for a failure message.
+    ///
+    /// A bare index names nothing the reader can open, and it indexes the
+    /// ORDER rather than the module graph, so it does not agree with any
+    /// numbering the build prints elsewhere - which sends the reader looking
+    /// through whichever module happens to carry that id, usually somebody
+    /// else's. Returns a placeholder rather than failing: this runs only on a
+    /// path that is already reporting an error.
+    static codegen_module_name(ctx: CompilationContext*, pos: u32) -> string {
+        if (ctx == null) { return "<unknown>"; }
+        const order: &u32[] = &ctx.module_graph.topo_order;
+        if (pos as i64 >= order.length) { return "<unknown>"; }
+        const mi: u32 = order[pos as i64];
+        if (mi as i64 >= ctx.module_graph.modules.length) { return "<unknown>"; }
+        const info: ModuleInfo* = &ctx.module_graph.modules[mi as i64];
+        return ctx.intern_table.resolve(info.name);
+    }
+
     /// `nthreads <= 1` (or a single job) runs the batch inline via
     /// `emit_jobs_serial`, keeping a serial build byte-identical.
     static emit_jobs_threaded(jobs: EmitJob[]*, nthreads: u32) -> void {

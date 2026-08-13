@@ -383,6 +383,12 @@ void LLVMSetOrdering(LLVMValueRef MemoryAccessInst, int Ordering);
  * Required for atomic loads and stores. */
 void LLVMSetAlignment(LLVMValueRef V, unsigned Bytes);
 
+/* Read the alignment (in bytes) a load/store/alloca/global carries.  An
+ * alloca is born holding the ABI alignment of its LLVM type, so this reports
+ * what LLVM guarantees unaided - the floor a caller raising alignment for an
+ * `![align(N)]` type must not drop below. */
+unsigned LLVMGetAlignment(LLVMValueRef V);
+
 
 /* ===================================================================
  * Builder - Arithmetic

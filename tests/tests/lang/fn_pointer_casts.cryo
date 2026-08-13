@@ -1,0 +1,53 @@
+///! A function used as a value IS the address of its code, so a cast of one to
+///! an integer is a `ptrtoint` - the same lowering a data pointer gets. Casting
+///! it as if it were an aggregate emits a `bitcast ptr to i64`, which LLVM
+///! rejects outright ("Invalid bitcast"), so the whole module fails to codegen.
+///!
+///! The `void*` route is the control: it went through the same fallback and
+///! survived only because `bitcast ptr to ptr` happens to be well-formed, which
+///! is why the gap stayed invisible until an integer was asked for.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::FnPointerCasts;
+
+import std::core::result;
+import std::test::error;
+import std::test::assert;
+
+function bump(n: u64) -> u64 { return n + 1; }
+function ignore(n: u64) -> void { }
+
+![test]
+function fn_value_casts_to_u64() -> Result<(), TestError> {
+    const f: (u64) -> u64 = bump;
+    const bits: u64 = f as u64;
+    return expect(bits != 0, "a function value must carry a non-zero address");
+}
+
+// The `void*` hop and the direct cast must name the same address; if the
+// direct one were a bitcast of something else, they would diverge.
+![test]
+function fn_value_integer_matches_pointer_route() -> Result<(), TestError> {
+    const f: (u64) -> u64 = bump;
+    const direct:  u64 = f as u64;
+    const via_ptr: u64 = (f as void*) as u64;
+    return expect_eq(direct as i64, via_ptr as i64);
+}
+
+![test]
+function fn_value_casts_to_u32() -> Result<(), TestError> {
+    const f: (u64) -> void = ignore;
+    const wide:   u64 = f as u64;
+    const narrow: u32 = f as u32;
+    return expect_eq(narrow as i64, (wide % 4294967296) as i64);
+}
+
+// The function must still be callable through the value the cast came from -
+// a cast that reads the wrong operand could yield a plausible integer while
+// the value itself is unusable.
+![test]
+function fn_value_still_calls() -> Result<(), TestError> {
+    const f: (u64) -> u64 = bump;
+    const _bits: u64 = f as u64;
+    return expect_eq(f(41) as i64, 42);
+}

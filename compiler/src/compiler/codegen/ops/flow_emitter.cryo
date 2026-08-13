@@ -229,6 +229,30 @@ type struct IRFlowEmitter {
         return alloca;
     }
 
+    /// Entry-block slot for a compiler-synthesized temporary, resolving the
+    /// enclosing function from the builder's current position.  An alloca is
+    /// only reclaimed when its function returns, never at the end of the block
+    /// that emitted it, so a slot built at the insert point costs a fresh one
+    /// per iteration when the expression sits in a loop body: the frame grows
+    /// without bound and a loop that runs long enough overflows the stack.
+    /// Hoisting to the entry block gives every iteration the same slot, which
+    /// is safe wherever the store precedes every read of it within an
+    /// iteration - true of a materialized rvalue, whose lifetime ends with the
+    /// statement that created it.  Falls back to an in-place alloca when the
+    /// insert block has no parent function, there being no entry block to
+    /// hoist into; the slot is then per-iteration but still correct.
+    temp_slot(mut &this, ty: LType, name: string) -> LValue {
+        const bb: LBasicBlock = this.builder.get_insert_block();
+        if (bb.is_valid()) {
+            const fn: LValue = bb.get_parent();
+            if (fn.is_valid()) {
+                const slot: LValue = this.create_entry_alloca(fn, name, ty);
+                if (slot.is_valid()) { return slot; }
+            }
+        }
+        return this.builder.build_alloca(ty, name);
+    }
+
     /// Store a zeroinitializer into `alloca` in the function ENTRY block, so
     /// the slot reads a defined value on every path - including paths that
     /// never reach the declaring statement.  Used for synthesized

@@ -1,0 +1,66 @@
+///! A member referenced as a VALUE through a scope segment that names both a
+///! module and a type.
+///!
+///! A file that declares one main type routinely gives it the same leaf as its
+///! own namespace - `Compiler::Bindgen::Importer` declaring `type Importer` -
+///! so `Importer::member` names both owners at once. The segment alone does not
+///! say where the member lives; only the member does. The two below live on
+///! different owners, and resolving the segment to just one leaves the other's
+///! reference as an unwritten slot, with nothing diagnosed.
+///!
+///! `hook` mirrors the compiler's own libclang trampolines: a `static` taken as
+///! a value from INSIDE its type's body, to be handed out as a C callback.
+///! Breaking that does not fail this suite - it fails the SELF-HOST build one
+///! stage later, where the callback reaches LLVM as
+///! `clang_visitChildren(..., <null operand!>, ...)`.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::StaticMethodValue;
+
+import std::core::result;
+import std::test::error;
+import std::test::assert;
+
+mut g_seen: i64 = 0;
+
+// The type's leaf is the namespace's leaf.
+type struct StaticMethodValue {
+    tag: i64;
+
+    static record(n: i64) -> void { g_seen = g_seen + n; }
+
+    /// Its own static handed to a callback parameter, named through the
+    /// colliding segment - the shape of the libclang trampolines.
+    static fire(n: i64) -> void { apply(StaticMethodValue::record, n); }
+}
+
+// A module-level free function reached through that same segment.
+function tally() -> i64 { return g_seen; }
+
+// Takes the callback by parameter, so the expected type comes from the
+// signature rather than from an annotation on a local.
+function apply(f: (i64) -> void, n: i64) -> void { f(n); }
+
+![test]
+function type_static_as_value_calls_through() -> Result<(), TestError> {
+    g_seen = 0;
+    StaticMethodValue::fire(4);
+    StaticMethodValue::fire(3);
+    return expect_eq(g_seen, 7);
+}
+
+![test]
+function module_free_function_as_value_calls_through() -> Result<(), TestError> {
+    g_seen = 0;
+    StaticMethodValue::record(5);
+    const g: () -> i64 = StaticMethodValue::tally;
+    return expect_eq(g(), 5);
+}
+
+// The same reference from OUTSIDE the type body, still as an argument.
+![test]
+function type_static_as_argument_from_outside() -> Result<(), TestError> {
+    g_seen = 0;
+    apply(StaticMethodValue::record, 6);
+    return expect_eq(g_seen, 6);
+}

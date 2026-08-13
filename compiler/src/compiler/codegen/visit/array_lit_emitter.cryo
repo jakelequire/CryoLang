@@ -6,10 +6,10 @@
 ///   3. fill-form    `[value; N]`               -> alloca + fill loop (fixed or dynamic)
 ///
 /// The fill-loop emitters (`emit_fill_loop_indexed` / `emit_fill_loop_raw`)
-/// alloca the loop counter in the *current* block, not via
-/// `IRFlowEmitter::create_entry_alloca`, because at the call-site the entry
-/// block may already have a terminator (a preceding `br cond_bb`) and
-/// inserting another alloca past a terminator breaks the block.
+/// hoist their loop counter to the entry block, so a fill-form literal in a
+/// loop body reuses one counter slot instead of stranding a fresh one per
+/// iteration.  The entry block may already carry a terminator by then;
+/// `create_entry_alloca` inserts before it rather than after.
 ///
 /// Holds `cg`, `state`, and `dispatch` back-pointers; recursion into the
 /// element expressions goes through `dispatch.codegen_rvalue(visitor, ...)`.
@@ -361,14 +361,12 @@ type struct ArrayLitEmitter {
         const body_bb: LBasicBlock = LBasicBlock::append(current_fn, "fill.body");
         const end_bb: LBasicBlock = LBasicBlock::append(current_fn, "fill.end");
 
-        // Alloca the counter in the CURRENT block, not via create_entry_alloca.
-        // The entry block may already hold allocas for preceding locals and
-        // is about to get its `br cond_bb` terminator; inserting another
-        // alloca via `position_at_end(entry)` after we've emitted a
-        // terminator there lands the instruction after the terminator and
-        // breaks the block.  Inline alloca keeps the block well-formed and
-        // LLVM still optimizes it correctly.
-        const i_slot: LValue = this.cg.builder.build_alloca(LType::i64(), "fill.i");
+        // The counter is hoisted to the entry block: a fill-form literal in a
+        // loop body would otherwise leave one counter slot behind per
+        // iteration.  Sharing one slot across iterations is safe because the
+        // store of 0 below re-initializes it before the loop reads it.
+        const i_slot: LValue = this.cg.flow.create_entry_alloca(
+            current_fn, "fill.i", LType::i64());
         this.cg.builder.build_store(
             LType::const_int(LType::i64(), 0, false), i_slot);
         this.cg.builder.build_br(cond_bb);
@@ -404,9 +402,10 @@ type struct ArrayLitEmitter {
         const body_bb: LBasicBlock = LBasicBlock::append(current_fn, "fill.body");
         const end_bb: LBasicBlock = LBasicBlock::append(current_fn, "fill.end");
 
-        // See `emit_fill_loop_indexed` above for why this alloca goes in
-        // the current block, not via `create_entry_alloca`.
-        const i_slot: LValue = this.cg.builder.build_alloca(LType::i64(), "fill.i");
+        // Hoisted, and safe to share across iterations; see
+        // `emit_fill_loop_indexed` above.
+        const i_slot: LValue = this.cg.flow.create_entry_alloca(
+            current_fn, "fill.i", LType::i64());
         this.cg.builder.build_store(
             LType::const_int(LType::i64(), 0, false), i_slot);
         this.cg.builder.build_br(cond_bb);
