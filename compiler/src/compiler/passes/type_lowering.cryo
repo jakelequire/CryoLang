@@ -585,58 +585,68 @@ type struct TypeLoweringPasses {
     static compute_class_layout(cl: ClassType*, arena: TypeArena*) -> boolean {
         if (cl.computed_align > 0) { return false; }
 
-        mut offset: u64 = 0;
-        mut max_align: u64 = 8;  // Classes always at least pointer-aligned
-        // `![align(N)]` raises the minimum alignment further; the 8-byte
-        // floor is preserved because of the vtable-pointer convention.
+        // One flat object: a single vtable pointer at offset 0 iff any class in
+        // the inheritance chain declares virtual methods, then every class's
+        // fields root-to-derived in one sequence, each at the lowest offset
+        // satisfying its natural alignment.  This is the object codegen emits
+        // (`TypeMapper::map_class`), so it is the only layout `sizeof` may
+        // report: charging a vtable pointer per level, or restarting the
+        // derived fields after the base's *padded* size, describes an object
+        // that does not exist and overruns anything sized from it.
+        //
+        // chain[0] is this class; chain[N-1] is the root.  The depth cap
+        // mirrors the mapper's, so a pathological chain truncates identically
+        // on both sides rather than disagreeing.
+        mut chain: ClassType*[] = [];
+        mut any_virtual: boolean = false;
+        mut walk: ClassType* = cl;
+        mut depth: i32 = 0;
+        while (walk != null && depth < 16) {
+            chain.push(walk);
+            if (walk.has_virtual_methods) { any_virtual = true; }
+            if (!walk.has_base || !walk.base_class.is_valid()) { break; }
+            const base_t: Type* = arena.lookup(walk.base_class.id);
+            if (base_t == null || base_t.kind != TypeKind::Class) { break; }
+            walk = base_t as ClassType*;
+            depth += 1;
+        }
+
+        mut offset:    u64 = 0;
+        mut max_align: u64 = 1;
+        if (any_virtual) {
+            offset    = 8;
+            max_align = 8;
+        }
+        // `![align(N)]` raises the minimum alignment.
         if (cl.min_alignment > max_align) { max_align = cl.min_alignment; }
 
-        // If this class has virtual methods, reserve 8 bytes for vtable pointer
-        if (cl.has_virtual_methods) {
-            offset = 8;
-        }
+        for (mut ci: i64 = chain.length - 1; ci >= 0; ci--) {
+            const link: ClassType* = chain[ci];
+            for (mut i: i64 = 0; i < link.fields.length; i++) {
+                const field_ty: Type* = arena.lookup(link.fields[i].field_type.id);
+                if (field_ty == null) { continue; }
 
-        // If there's a base class, include its size first
-        if (cl.has_base && cl.base_class.is_valid()) {
-            const base_ty: Type* = arena.lookup(cl.base_class.id);
-            if (base_ty != null) {
-                const base_size:  u64 = base_ty.size_bytes();
-                const base_align: u64 = base_ty.alignment();
-                if (base_size == 0 && TypeLoweringPasses::needs_layout(base_ty)) { return false; }
-                // Base class fields start after vtable pointer (if any)
-                // For simplicity, we add base size directly (base already has its own vptr accounted for)
-                if (base_align > max_align) { max_align = base_align; }
-                offset = math::align_up(offset, base_align) + base_size;
+                const f_size:  u64 = field_ty.size_bytes();
+                const f_align: u64 = field_ty.alignment();
+
+                // Defer until every member type is laid out.  Empty markers
+                // (size 0, align 1) are settled; don't defer on those.
+                if (f_size == 0 && TypeLoweringPasses::needs_layout(field_ty)
+                        && !TypeLoweringPasses::layout_settled(field_ty)) {
+                    return false;
+                }
+
+                if (f_align > 0) {
+                    offset = math::align_up(offset, f_align);
+                    if (f_align > max_align) { max_align = f_align; }
+                }
+
+                // Only this class's own field offsets are ours to record; an
+                // ancestor records its own, and does so from the same start,
+                // which is what makes an upcast pointer a no-op.
+                if (ci == 0) { cl.set_field_offset(i, offset); }
+                offset += f_size;
             }
-        }
-
-        // Lay out own fields
-        for (mut i: i64 = 0; i < cl.fields.length; i++) {
-            const field_ty: Type* = arena.lookup(cl.fields[i].field_type.id);
-            if (field_ty == null) { continue; }
-
-            const f_size:  u64 = field_ty.size_bytes();
-            const f_align: u64 = field_ty.alignment();
-
-            if (f_size == 0 && TypeLoweringPasses::needs_layout(field_ty)) { return false; }
-
-            if (f_align > 0) {
-                offset = math::align_up(offset, f_align);
-                if (f_align > max_align) { max_align = f_align; }
-            }
-
-            cl.set_field_offset(i, offset);
-            offset += f_size;
-        }
-
-        if (cl.fields.length == 0 && !cl.has_base) {
-            // Empty class with no base: just vtable or minimum size
-            if (cl.has_virtual_methods) {
-                cl.set_layout(8, 8);
-            } else {
-                cl.set_layout(0, 1);
-            }
-            return true;
         }
 
         const total: u64 = math::align_up(offset, max_align);

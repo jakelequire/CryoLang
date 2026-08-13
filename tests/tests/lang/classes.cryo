@@ -249,3 +249,57 @@ function class_literal_inits_vtable_for_value_construction() -> Result<(), TestE
     }
     return Result::Ok(());
 }
+
+// Class layout is ONE flat object: a single vtable pointer at offset 0 when
+// any class in the chain is virtual, then every class's fields root-to-derived,
+// each at the lowest offset satisfying its alignment.  `sizeof` is computed by
+// the front end and the object is laid out by the backend, and nothing else in
+// the pipeline compares the two -- so charging a vtable pointer per inheritance
+// level, or restarting the derived fields after the base's PADDED size, gave
+// `sizeof` a number 8 bytes per level larger than the object it describes.
+// Measured on the emitted object: the distance between two adjacent array
+// elements is the size the type claims to have.
+type class LayoutRoot {
+public:
+    a: i64;
+
+    LayoutRoot() { this.a = 0; }
+
+    virtual tag(&this) -> i32 { return 1; }
+}
+
+type class LayoutMid : LayoutRoot {
+public:
+    b: i32;
+
+    LayoutMid() { this.b = 0; }
+
+    override tag(&this) -> i32 { return 2; }
+}
+
+type class LayoutLeaf : LayoutMid {
+public:
+    c: i32;
+
+    LayoutLeaf() { this.c = 0; }
+
+    override tag(&this) -> i32 { return 3; }
+}
+
+![test]
+function class_object_is_as_wide_as_sizeof_says() -> Result<(), TestError> {
+    mut leaves: LayoutLeaf[2];
+    leaves[0].c = 1;
+    const stride: u64 = (&leaves[1] as u64) - (&leaves[0] as u64);
+    return expect_eq(stride as i64, sizeof(LayoutLeaf) as i64);
+}
+
+![test]
+function class_carries_one_vtable_pointer_for_the_whole_chain() -> Result<(), TestError> {
+    // vptr(8) + a(8) + b(4) + c(4): the derived fields pack into the tail
+    // the base's own padding would otherwise waste, and the second and third
+    // levels add no further vtable pointer.
+    expect_eq(sizeof(LayoutRoot) as i64, 16)?;
+    expect_eq(sizeof(LayoutMid) as i64, 24)?;
+    return expect_eq(sizeof(LayoutLeaf) as i64, 24);
+}

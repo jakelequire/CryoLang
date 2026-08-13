@@ -18,6 +18,8 @@ import std::core::slice;
 
 import Compiler::Codegen;
 import Compiler::Codegen::{ LLVMTypes, TypeMap, Context };
+import Compiler::Types;
+import Compiler::Types::{ TypeRef, Type, Arena, UserDefined };
 import Compiler::Codegen::Ops::IntrinsicsCodegen;
 import Compiler::Codegen::Visit::IRGenerator;
 import Compiler::CompilationContext;
@@ -513,6 +515,125 @@ type struct CodegenPasses {
         // aid and is not produced on a native Windows build.
     }
 
+    /// Compare, for every nominal type this module actually mapped, the size
+    /// the front end computed against the size LLVM lays out for the mapped
+    /// body.  The two are independent computations of the same number and
+    /// nothing else in the pipeline compares them, so a front-end layout bug
+    /// is otherwise invisible until a `sizeof`-driven write overruns.
+    ///
+    /// Switched on by `CRYO_LAYOUT_AUDIT`; one line per disagreement plus a
+    /// per-module examined/disagree count, so a run reports the population and
+    /// not just the exceptions.
+    static audit_layout(ctx: CompilationContext*, cg: CodegenContext*, module_name: string) -> void {
+        mut audit_all: boolean = false;
+        match (env::var(Str::new("CRYO_LAYOUT_AUDIT"))) {
+            Option::Some(v) => { if (v.starts_with(&Str::new("all"))) { audit_all = true; } }
+            Option::None    => { return; }
+        }
+        const arena: TypeArena* = ctx.type_arena;
+        if (arena == null) { return; }
+
+        mut nominal:   i64 = 0;
+        mut unmapped:  i64 = 0;
+        mut opaque:    i64 = 0;
+        mut fe_zero:   i64 = 0;
+        mut llvm_zero: i64 = 0;
+        mut examined:  i64 = 0;
+        mut disagree:  i64 = 0;
+        mut align_dis: i64 = 0;
+        mut padded_n:  i64 = 0;
+        for (mut i: i64 = 0; i < arena.types.length; i++) {
+            const t: Type* = arena.types[i];
+            if (t == null) { continue; }
+            if (t.kind != TypeKind::Struct && t.kind != TypeKind::Class) { continue; }
+            nominal += 1;
+
+            // Only types this module put through the type mapper: mapping one
+            // here to measure it would mint LLVM structs the module never
+            // referenced and perturb what is being measured.
+            const mapped: LType = cg.type_mapper.lookup_cache(t.id);
+            if (!mapped.is_valid()) { unmapped += 1; continue; }
+            if (mapped.is_opaque_struct()) { opaque += 1; continue; }
+
+            const fe_size: u64 = t.size_bytes();
+            if (fe_size == 0) { fe_zero += 1; continue; }
+            const llvm_size: u64 = cg.llvm_module.abi_size_of(mapped);
+            if (llvm_size == 0) { llvm_zero += 1; continue; }
+            const llvm_align: u64 = cg.llvm_module.abi_align_of(mapped);
+
+            // A second, independent number for structs: the size of a LITERAL
+            // struct built from this type's own field list.  The named struct
+            // in the cache is reused by mangled name across type ids, so a
+            // name that two distinct field lists mangle to keeps the FIRST
+            // body -- which this comparison, and only this comparison, sees.
+            mut lit_size: u64 = 0;
+            if (t.kind == TypeKind::Struct) {
+                const st0: StructType* = t as StructType*;
+                const nf: u32 = st0.fields.length as u32;
+                if (!st0.is_union && nf > 0) {
+                    const fbuf: void* = intrinsics::malloc(nf as u64 * 8);
+                    const fslots: void** = fbuf as void**;
+                    // Read the cache; do NOT map.  Mapping here would add
+                    // entries the module never asked for, and the next
+                    // module would then find them cached -- an instrument
+                    // that moves its own population.
+                    mut ok: boolean = true;
+                    for (mut fi: u32 = 0; fi < nf; fi++) {
+                        const ft: LType = cg.type_mapper.lookup_cache(st0.fields[fi].field_type.id);
+                        if (!ft.is_valid()) { ok = false; }
+                        else { fslots[fi] = ft.raw; }
+                    }
+                    if (ok) {
+                        const lit: LType = LType::literal_struct(fbuf, nf, st0.repr_packed);
+                        lit_size = cg.llvm_module.abi_size_of(lit);
+                    }
+                    intrinsics::free(fbuf);
+                }
+            }
+
+            examined += 1;
+            // A body LARGER than its own field list carries the tail padding
+            // that reproduces a declared `![align(N)]`; a body SMALLER than
+            // its field list is an identified struct reused under a mangled
+            // name a different field list already claimed.
+            const padded: boolean = lit_size != 0 && lit_size < llvm_size;
+            if (padded) { padded_n += 1; }
+            const size_ok: boolean = fe_size == llvm_size;
+            const body_ok: boolean = lit_size == 0 || lit_size == llvm_size || padded;
+            const agrees:  boolean = size_ok && body_ok;
+            if (!agrees) { disagree += 1; }
+            if (t.alignment() != llvm_align) { align_dis += 1; }
+            if (agrees && !padded && t.alignment() == llvm_align && !audit_all) { continue; }
+
+            mut name:      string = "<anon>";
+            mut min_align: u64    = 0;
+            mut nargs:     i64    = 0;
+            mut kind:      string = "C";
+            if (t.kind == TypeKind::Struct) {
+                const st: StructType* = t as StructType*;
+                name      = ctx.intern_table.resolve(st.qualified_name);
+                min_align = st.min_alignment;
+                nargs     = st.type_args.length;
+                kind      = "S";
+            } else {
+                const cl: ClassType* = t as ClassType*;
+                name      = ctx.intern_table.resolve(cl.qualified_name);
+                min_align = cl.min_alignment;
+            }
+            mut tag: string = "LAYOUT-DIS";
+            if (agrees) {
+                tag = "LAYOUT-OK";
+                if (padded) { tag = "LAYOUT-PADDED"; }
+                if (t.alignment() != llvm_align) { tag = "LAYOUT-ALIGN-DIS"; }
+            }
+            fmt::eprintf("%s module=%s kind=%s type=%s id=%llu fe_size=%llu fe_align=%llu llvm_size=%llu llvm_align=%llu lit_size=%llu min_align=%llu targs=%lld\n",
+                   tag, module_name, kind, name, t.id, fe_size, t.alignment(), llvm_size, llvm_align, lit_size, min_align, nargs);
+        }
+        fmt::eprintf("LAYOUT-AUDIT module=%s nominal=%lld examined=%lld disagree=%lld align_dis=%lld padded=%lld skip_unmapped=%lld skip_opaque=%lld skip_fe0=%lld skip_llvm0=%lld\n",
+               module_name, nominal, examined, disagree, align_dis, padded_n, unmapped, opaque, fe_zero, llvm_zero);
+        fflush(null);
+    }
+
     /// IRGeneration pass.  Creates an LLVM module, walks the AST, and
     /// produces LLVM IR.  Stores result in ctx.artifacts.ir.
     static run_ir_generation(ctx: CompilationContext*) -> PassResult {
@@ -651,6 +772,8 @@ type struct CodegenPasses {
         // strip set only contains symbols whose body was attempted in
         // this module.
         CodegenPasses::cascade_strip_dependents(cg);
+
+        CodegenPasses::audit_layout(ctx, cg, module_name);
 
         // Finalize debug info: wires every DISubprogram into the compile
         // unit and resolves temporary metadata. Must run before
