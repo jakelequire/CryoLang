@@ -306,9 +306,9 @@ type enum Site {
     /// candidate, and its qualified form differs from the name handed in.
     ///
     /// The call row cannot stand in for this one: it is bumped on entry, so it
-    /// counts attempts, while B1 counts answers produced.  A call that hands
-    /// its input back changed nothing and is what the caller would have used
-    /// anyway.
+    /// counts attempts, while a bucket total counts answers produced.  A call
+    /// that hands its input back changed nothing and is what the caller would
+    /// have used anyway.
     BareAltsCanonFolded;
 }
 
@@ -337,6 +337,17 @@ implement enum Site {
     /// The report bucket this site belongs to.  `"B1"` must reach zero,
     /// `"B2"` stays, `"B3"` is authoritative, `"  "` is context-only and
     /// `"!!"` flags a violation row.
+    ///
+    /// A trailing `*` qualifies the row's membership, and means something
+    /// different in each family because the families are asserted differently:
+    /// on a B1 row it marks a site that is NOT a summand (it nests inside
+    /// another B1 row, so summing both double-counts); on a B3 row it marks a
+    /// site the gate pins ANYWAY, against the rule that B3 is context-only.
+    /// A B3 row is normally unasserted because B3's target is "once per path"
+    /// rather than a fixed number, and pinning one would make the gate noisy;
+    /// the exception exists for a site that left B1 while still being able to
+    /// regrow into a binding path, where dropping the row would replace a
+    /// reachable target with a blind spot.
     ///
     /// Exhaustive on purpose: a new site cannot be added without classifying
     /// it.
@@ -374,7 +385,7 @@ implement enum Site {
             Site::BareAltsHits          => { "   " }
             Site::BareAltsMulti         => { "   " }
             Site::BareAltsViaScoped     => { "B3 " }
-            Site::BareAltsViaCanonical  => { "B1 " }
+            Site::BareAltsViaCanonical  => { "B3*" }
             Site::BareAltsViaAmbigDiag  => { "B1 " }
             Site::ScopeUseSyntax        => { "   " }
             Site::ScopeUseCursor        => { "   " }
@@ -442,7 +453,7 @@ implement enum Site {
             Site::ScopeResAmbiguous     => { "!! " }
             Site::M2ViaStamp            => { "B3 " }
             Site::M2StampMemberMiss     => { "!! " }
-            Site::BareAltsCanonFolded   => { "B1 " }
+            Site::BareAltsCanonFolded   => { "B3*" }
         };
     }
 
@@ -1097,13 +1108,6 @@ public function report() -> void {
     b1 = b1 + Site::RnArenaBootstrap.count();
     b1 = b1 + Site::RnScopeArenaBootstrap.count();
     b1 = b1 + Site::LeafHits.count();
-    // `canonical_qualified` is summed by what it FOLDED, not by how often it
-    // was called: the call row is bumped on entry, and a call that hands its
-    // input back produced nothing the caller would not have had anyway.  The
-    // call row stays flagged and asserted for the same reason `M1AgreeHits`
-    // does - a caller that starts asking more often is a change worth catching
-    // - it just is not a summand.
-    b1 = b1 + Site::BareAltsCanonFolded.count();
     b1 = b1 + Site::BareAltsViaAmbigDiag.count();
     b1 = b1 + Site::M4Hits.count();
     b1 = b1 + Site::M5Hits.count();
@@ -1135,6 +1139,21 @@ public function report() -> void {
     b3 = b3 + Site::RnDiCanonical.count();
     b3 = b3 + Site::RnDiBare.count();
     b3 = b3 + Site::BareAltsViaScoped.count();
+    // `canonical_qualified` is authoritative rather than fuzzy: it never
+    // answers "which declaration does this name bind to", only "what is this
+    // type's module-independent identity", and it folds ONLY when exactly one
+    // qualified candidate is registered - a colliding leaf is handed back
+    // bare.  Its consumers are coherence keys, which must key the same type
+    // identically from every module, so a use-site-dependent answer would be
+    // the defect here and not the fix.
+    //
+    // Summed by what it FOLDED, not by how often it was called: the call row
+    // is bumped on entry, and a call that hands its input back produced
+    // nothing the caller would not have had anyway.  Both rows are pinned by
+    // the gate regardless - a caller that starts asking more often, or a new
+    // one that uses this to BIND rather than to key, is the change worth
+    // catching, and it would be invisible in an unasserted bucket.
+    b3 = b3 + Site::BareAltsCanonFolded.count();
 
     fmt::eprintf("\n-------------------------------------------------------\n");
     fmt::eprintf("  B1 fuzzy fallback   -> ZERO           %12llu\n", b1);

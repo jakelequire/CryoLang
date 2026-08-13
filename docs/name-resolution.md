@@ -362,7 +362,7 @@ implementing, so the mechanisms below are what carry the remaining work.
    > `tests/b1-baseline.txt`, and a CI step next to `roster-check`. It runs a
    > fixed external target (`examples/09-json-config`) with
    > `--no-incremental CRYO_CODEGEN_THREADS=1` and asserts the B1 total plus
-   > every per-site `B1`-flagged row.
+   > every per-site row flagged `B1` or `B3*`.
    >
    > **It is a RATCHET, not a literal `B1 == 0`.** B1 is not zero today, so
    > that assertion would be red from the moment it was wired, and §7.2a's
@@ -383,6 +383,15 @@ implementing, so the mechanisms below are what carry the remaining work.
    >   and excluded as nested inside `lookup_by_leaf hits`. Asserting
    >   `rows == total` is therefore wrong and makes the gate unrunnable; the
    >   invariant that does hold, and is checked, is `total <= row_sum`.
+   > - **The asserted set is wider than the B1 family.** A `B3*` row is pinned
+   >   too, and that marker is deliberately narrow: it belongs to a site that
+   >   answers a module-independent *identity* question rather than binding a
+   >   name, so it has no reduction target and cannot sit in B1 — but it is
+   >   still a leaf lookup a future caller could misuse for binding. Leaving it
+   >   unasserted would buy a reachable B1 target with a lane nobody can watch,
+   >   which is the failure this gate exists to prevent. A B3 row without that
+   >   regrowth story stays unasserted, because B3's target is "once per path"
+   >   and pinning it would make the gate noisy.
    > - **`cryo check` emits no counter report at all.** `ResolveCounter::report()`
    >   sits on the success path of a full build, after link
    >   (`instance.cryo:2647`), so every measurement needs a successful link —
@@ -462,6 +471,25 @@ prelude-aware — close to what §4 specifies. Classifying it as "must reach zer
 inflated B1 from 144,639 to 492,867 and set an unreachable target.
 **"Must reach zero" is correct for fuzzy fallbacks and wrong for the
 resolver's own lookup**, whose correct target is once-per-path.
+
+`canonical_qualified` is B3 for the same reason, arrived at from the opposite
+direction. It reads like a fuzzy fallback — a bare leaf handed to an index —
+but it never answers *which declaration this name binds to*; it answers *what
+this type's module-independent identity is*, and it folds only when exactly one
+qualified candidate is registered, handing a colliding leaf back unchanged. Its
+consumers are coherence keys — trait-origin comparison, impl-block dedup,
+where-clause keying — which must key the same type identically from every
+module, so a use-site-dependent answer would be the defect there and not the
+fix. That makes it permanent by construction: no consumer work retires it, and
+leaving it in B1 would make `B1 == 0` unreachable and the gate's stated end
+state false. It is summed by what it **folded**, not by how often it was
+called, since a call that hands its input back produced nothing the caller
+would not have had anyway.
+
+Its rows keep the ratchet under the `B3*` marker above. The classification says
+the site is legitimate *as its current callers use it*; a future caller that
+reached for it to bind a name would be a genuine regression, and the flag alone
+would not catch it.
 
 Counter caveats, both load-bearing when reading any number it prints:
 

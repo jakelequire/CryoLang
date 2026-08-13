@@ -23,20 +23,28 @@
 /// each recovery path added to it becomes a correctness path the next time
 /// something reaches it.
 ///
-/// `Unstamped` is NOT that state.  It means no resolver has claimed this node
-/// - a path whose first segment names a type rather than a module is answered
-/// by the type layer, which needs a receiver type and so cannot run here.
-/// Reaching a stage that requires a stamp while still `Unstamped` is an
-/// internal error, never a licence to guess.
+/// **`Res` has no variant meaning "missing".**  Every variant is an answer, so
+/// a consumer holding one has nothing to branch on and no place to put a
+/// second strategy.  Absence lives in `ResSlot` below, one type up, where only
+/// the resolver can observe it - which is what makes "re-resolve it later"
+/// unwriteable rather than merely discouraged.
+///
+/// `TypeRelative` is a POSITIVE claim of ownership, not a shrug: the language
+/// says a path whose first segment names a type is finished by the type layer,
+/// which needs a receiver type and so cannot run here.  It must never be used
+/// to record that a lookup was attempted and failed - that is `Err` when the
+/// name layer is the authority, and a defect in the lookup when it is not.
+/// Laundering a tool's limitation into an ownership claim rebuilds the
+/// cascade under a better name.
 
 namespace Compiler::Resolver::Res;
+
+import std::fmt;
 
 import Compiler::Resolver::SymbolStr;
 import Compiler::Resolver::SymbolID;
 
 type enum Res {
-    /// No resolver has answered for this node yet.
-    Unstamped;
     /// A declaration or module, by its canonical qualified name.
     Def(SymbolStr);
     /// A local binding (parameter or local variable).
@@ -45,23 +53,18 @@ type enum Res {
     GenericParam(SymbolStr);
     /// A primitive, by its spelling.
     PrimTy(SymbolStr);
+    /// The type layer owns the rest of this path: its first segment names a
+    /// type rather than a module, so finishing it needs a receiver type.
+    TypeRelative;
     /// Resolution failed and the diagnostic has already been emitted.
     Err;
 }
 
 implement enum Res {
-    /// Whether a resolver has answered for this node, for any answer
-    /// including a failed one.
-    is_stamped(&this) -> boolean {
-        return match (&this) {
-            Res::Unstamped => { false }
-            _              => { true }
-        };
-    }
-
     /// The qualified name of a resolved definition, or an empty SymbolStr for
     /// every other answer.  Callers that only accept a definition use this;
-    /// callers that must tell `Err` apart from `Unstamped` match instead.
+    /// callers that must tell one non-definition answer from another match
+    /// instead.
     def_name(&this) -> SymbolStr {
         return match (&this) {
             Res::Def(q) => { q }
@@ -71,12 +74,84 @@ implement enum Res {
 
     to_string(&this) -> string {
         return match (&this) {
-            Res::Unstamped       => { "Unstamped" }
             Res::Def(_)          => { "Def" }
             Res::Local(_)        => { "Local" }
             Res::GenericParam(_) => { "GenericParam" }
             Res::PrimTy(_)       => { "PrimTy" }
+            Res::TypeRelative    => { "TypeRelative" }
             Res::Err             => { "Err" }
         };
     }
+}
+
+/// The slot a node carries: either no resolver has answered yet, or one has.
+///
+/// This type exists so that `Pending` is not a `Res`.  A consumer reaches an
+/// answer only through `require`, which is total over `Res` - so the code that
+/// would re-derive a name has no state to test for and no branch to live in.
+/// The resolver writes through `answer`, which is first-write-wins, and that
+/// is a correctness rule rather than an optimization: a `Res` records what the
+/// file that WROTE the path can see, so a second walk standing in a different
+/// module must not be able to overwrite the first answer with its own view.
+type enum ResSlot {
+    /// No resolver has answered for this node yet.
+    Pending;
+    /// A resolver has answered, including with a failure.
+    Answered(Res);
+}
+
+implement enum ResSlot {
+    /// Record an answer.  The first one wins; later ones are dropped.
+    answer(mut &this, r: Res) -> void {
+        match (&this) {
+            ResSlot::Answered(_) => { return; }
+            _                    => { }
+        }
+        *this = ResSlot::Answered(r);
+    }
+
+    /// The answer this node carries.
+    ///
+    /// `Pending` here means no resolver claimed a node that a later stage
+    /// depends on, which is an internal error and never a licence to guess.
+    /// It is recorded rather than fatal: a compilation that has already
+    /// emitted a diagnostic may legitimately have skipped work, so the bug is
+    /// reported only if the build otherwise succeeds (see
+    /// `pending_bug_count`).  The value handed back is `Err`, which stops the
+    /// caller for the same reason a real failure would - there is deliberately
+    /// no third outcome for a caller to route around.
+    require(&this, site: string) -> Res {
+        return match (&this) {
+            ResSlot::Answered(r) => { r }
+            _                    => {
+                Res::record_pending_bug(site);
+                Res::Err
+            }
+        };
+    }
+}
+
+/// How many `require` calls found a `Pending` slot, and where the first one
+/// was.  Held here rather than on the diagnostic engine because a `Res` slot
+/// is reachable from parts of the tree that cannot see a
+/// `CompilationContext`; the flush that turns this into a diagnostic runs
+/// where one is in hand.
+mut g_pending_bugs: u64 = 0;
+mut g_pending_first_site: string = "";
+
+/// Note that a stage required an answer no resolver had written.
+public function record_pending_bug(site: string) -> void {
+    if (g_pending_bugs == 0) { g_pending_first_site = site; }
+    g_pending_bugs = g_pending_bugs + 1;
+}
+
+/// How many times a required answer was missing.  Zero is the only value a
+/// successful build may end on.
+public function pending_bug_count() -> u64 {
+    return g_pending_bugs;
+}
+
+/// Where the first missing answer was required, for the report.
+public function pending_bug_first_site() -> string {
+    return g_pending_first_site;
 }
