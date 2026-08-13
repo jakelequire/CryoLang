@@ -2962,7 +2962,30 @@ public:
                     ErrorCode::E0200_TYPE_MISMATCH, arr.elements[i].span, target, t,
                     "array elements must all have the same type", SourceSpan::none(), arr.elements[i]);
             }
-            if (!elem_type.is_valid() && t.is_valid()) { elem_type = t; }
+            if (!elem_type.is_valid() && t.is_valid()) {
+                elem_type = t;
+                // The element was resolved UNDER `elem_expected` and checked
+                // against it just above.  When the two differ only in which
+                // pointee the compiler believes in - both one machine word,
+                // no instruction between them - the literal IS an array of
+                // the expected element type.  `null` is typed `void*` and is
+                // valid in any pointer context, so `[null; 8]` written into a
+                // `T*[8]` must be a `T*[8]`; typing it `void*[8]` makes the
+                // enclosing assignment fail on a difference that does not
+                // exist at runtime.
+                //
+                // Restricted to pointer-shaped on purpose: an element that
+                // needs a VALUE change to reach the expected type (an integer
+                // widening) must not adopt it, because the element emitter
+                // stores what the element evaluated to - adopting there would
+                // store a narrow value into a wide slot.
+                if (elem_expected.is_valid() && !t.equals(elem_expected)
+                        && this.checker.can_assign(t, elem_expected)
+                        && this.checker.is_pointer_shaped(t)
+                        && this.checker.is_pointer_shaped(elem_expected)) {
+                    elem_type = elem_expected;
+                }
+            }
         }
         if (arr.repeat_count_expr != null) { this.resolve_expr(arr.repeat_count_expr); }
         if (!elem_type.is_valid() && this.state.expected_type.is_valid()

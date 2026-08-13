@@ -96,13 +96,74 @@ type struct TypeMapper {
     // an unmappable field fails the compile instead of shipping a corrupt
     // layout.
     diag:   DiagnosticSink*;
+    // The module whose data layout answers "how big is this body?" when a
+    // type's declared size has to be reproduced (see `tail_padding_for`).
+    // Borrowed, set by `wire()` once the owning CodegenContext is at its
+    // stable address; the `LLVMTargetDataRef` itself is re-fetched per query
+    // rather than cached, since it belongs to the module.  Null until wired
+    // (and in any TypeMapper built outside a CodegenContext), which only
+    // costs the padding: the layout audit reports the resulting disagreement.
+    llvm_module: LModule*;
 
     static new(arena: TypeArena*, intern: InternTable*, diag: DiagnosticSink*) -> TypeMapper {
         return TypeMapper {
             arena:  arena,
             intern: intern,
             diag:   diag,
+            llvm_module: null,
         };
+    }
+
+    wire(mut &this, llvm_module: LModule*) -> void {
+        this.llvm_module = llvm_module;
+    }
+
+    /// Bytes of tail padding this body needs so the emitted object is the size
+    /// the front end reports.  `![align(N)]` - declared, or inherited from a
+    /// field - rounds a type's size up to a multiple of N, but an LLVM struct
+    /// has no alignment of its own: its size and alignment come only from its
+    /// members.  Without the padding the object is smaller than `sizeof` says,
+    /// and everything sized from the front end (`mem::zero`, an array's
+    /// stride, a by-value copy) runs past its end.
+    ///
+    /// Returns 0 when the two already agree, when the body cannot be measured
+    /// (no module wired, no data layout yet, or a member still opaque), and
+    /// when the front end's size is the SMALLER of the two - that is a
+    /// front-end layout defect, and padding would hide it instead of fixing
+    /// it.
+    tail_padding_for(&this, fe_size: u64, slots: void*, n: u32, packed: boolean) -> u64 {
+        if (this.llvm_module == null || fe_size == 0 || n == 0) { return 0; }
+        const raw: void** = slots as void**;
+        for (mut i: u32 = 0; i < n; i++) {
+            const ft: LType = LType { raw: raw[i] };
+            if (!ft.is_valid()) { return 0; }
+            // An opaque member has no size yet; asking would assert inside
+            // LLVM rather than return a number.
+            if (ft.kind() == LTypeKind::Struct && ft.is_opaque_struct()) { return 0; }
+        }
+        const lit: LType = LType::literal_struct(slots, n, packed);
+        const lit_size: u64 = this.llvm_module.abi_size_of(lit);
+        if (lit_size == 0 || fe_size <= lit_size) { return 0; }
+        return fe_size - lit_size;
+    }
+
+    /// Install `slots[0..n]` as `llvm_ty`'s body, appending `[pad x i8]` when
+    /// the declared size needs it.  One `set_struct_body` call either way: a
+    /// second one on an already-filled identified struct is not allowed.
+    set_body_with_padding(&this, llvm_ty: LType, slots: void*, n: u32,
+                          packed: boolean, pad: u64) -> void {
+        if (pad == 0) {
+            llvm_ty.set_struct_body(slots, n, packed);
+            return;
+        }
+        const total: u32 = n + 1;
+        const buf: void* = intrinsics::malloc(total as u64 * 8);
+        const dst: void** = buf as void**;
+        const src: void** = slots as void**;
+        for (mut i: u32 = 0; i < n; i++) { dst[i] = src[i]; }
+        dst[n] = LType::array_of(LType::i8(), pad as u32).raw;
+        llvm_ty.set_struct_body(buf, total, packed);
+        intrinsics::free(buf);
     }
 
     /// Report that a user-defined type could not be lowered soundly because
@@ -435,7 +496,8 @@ type struct TypeMapper {
                 this.report_unmappable_fields(mangled, bad_fields, first_bad);
                 return LType::null();
             }
-            llvm_ty.set_struct_body(buf, n, packed);
+            const pad: u64 = this.tail_padding_for(t.computed_size, buf, n, packed);
+            this.set_body_with_padding(llvm_ty, buf, n, packed, pad);
             intrinsics::free(buf);
         } else {
             llvm_ty.set_struct_body(null, 0, packed);
@@ -541,7 +603,8 @@ type struct TypeMapper {
             return LType::null();
         }
 
-        llvm_ty.set_struct_body(buf, total, false);
+        const pad: u64 = this.tail_padding_for(t.computed_size, buf, total, false);
+        this.set_body_with_padding(llvm_ty, buf, total, false, pad);
         intrinsics::free(buf);
 
         return llvm_ty;

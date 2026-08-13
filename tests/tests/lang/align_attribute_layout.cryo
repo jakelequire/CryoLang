@@ -1,20 +1,18 @@
-///! `![align(N)]` and where it does - and does not - reach.
+///! `![align(N)]`: the boundary AND the width.
 ///!
-///! FIXED: the BOUNDARY. An alloca and a global take the ABI alignment of the
-///! MAPPED LLVM type, which carries no record of the attribute, so the object
-///! landed on the fields' boundary instead of N. Both now raise to the declared
-///! alignment, never lower it.
+///! An LLVM struct has no alignment of its own - its size and alignment come
+///! from its members alone - so an over-aligned type needs both halves supplied
+///! separately. The BOUNDARY: an alloca and a global take the ABI alignment of
+///! the mapped type, so both are raised to the declared alignment and never
+///! lowered. The WIDTH: the mapped body carries tail padding to the declared
+///! size, because otherwise `sizeof` reports a number larger than the object
+///! and an array stride or a `mem::zero` sized from it runs past the end.
 ///!
-///! NOT FIXED, and deliberately untested here: the WIDTH. The mapped struct is
-///! built from the field types alone, so LLVM stops short of N and the type
-///! measures 64 to `sizeof` but 16 to the object holding it. Reproducing that
-///! width as tail padding was tried and REVERTED: padding on a size
-///! disagreement alone also fires where the front end merely computed a size
-///! wrong, and writing that into the type changes how the ABI classifies it -
-///! it broke `Pair<SymbolStr, TypeRef>` into a one-register argument with an
-///! unset half, which only the self-host build caught. Until the front end and
-///! LLVM are reconciled, `sizeof` on an over-aligned type overruns the object,
-///! so do not size a `mem::zero` or an array stride from it.
+///! Deliberately untested here, because it does not hold: a field of an
+///! over-aligned type does not start on its own boundary inside a containing
+///! struct. Inter-field padding is not emitted, so `offsetof` a 64-aligned
+///! member can be 8. Reproducing it renumbers LLVM element indices, which
+///! every GEP site reads.
 
 ![config(testing)]
 namespace CryoTests::Tests::Lang::AlignAttributeLayout;
@@ -58,4 +56,26 @@ function a_local_lands_on_the_declared_boundary() -> Result<(), TestError> {
     mut line: CacheLine;
     line.a = 1;
     return expect_eq(((&line as u64) % 64) as i64, 0);
+}
+
+// The WIDTH, measured on the emitted object rather than reported by the front
+// end: the distance between two adjacent elements is the size the type claims.
+// This is the quantity a `mem::zero`, a `memcpy`, or an index computation
+// uses, and it is what an unpadded body gets wrong.
+![test]
+function the_object_is_as_wide_as_sizeof_says() -> Result<(), TestError> {
+    mut lines: CacheLine[2];
+    lines[0].a = 1;
+    const stride: u64 = (&lines[1] as u64) - (&lines[0] as u64);
+    return expect_eq(stride as i64, sizeof(CacheLine) as i64);
+}
+
+// Same check one level out: the container inherited the alignment through a
+// member, so its own size was rounded up too and its stride must match.
+![test]
+function an_inherited_alignment_widens_the_container_too() -> Result<(), TestError> {
+    mut holders: Holder[2];
+    holders[0].n = 1;
+    const stride: u64 = (&holders[1] as u64) - (&holders[0] as u64);
+    return expect_eq(stride as i64, sizeof(Holder) as i64);
 }
