@@ -36,6 +36,11 @@
 /// name layer is the authority, and a defect in the lookup when it is not.
 /// Laundering a tool's limitation into an ownership claim rebuilds the
 /// cascade under a better name.
+///
+/// It carries the base it stopped on and a count of trailing segments, which
+/// is what makes that claim checkable rather than merely asserted: a base can
+/// only be a type, so a path the name layer failed to walk has nothing to put
+/// there and cannot be recorded as type-owned by accident.
 
 namespace Compiler::Resolver::Res;
 
@@ -43,6 +48,74 @@ import std::fmt;
 
 import Compiler::Resolver::SymbolStr;
 import Compiler::Resolver::SymbolID;
+
+/// The part of a type-relative path the name layer DID finish.
+///
+/// Exactly the three answers that can name a type, so a base that could not
+/// own members - a local, a failure, or another type-relative path - is
+/// unrepresentable rather than merely unexpected.  That is what stops
+/// `TypeRelative` from degenerating into "something went wrong here": there is
+/// no value to put in it unless a type was actually named.
+///
+/// It is a separate enum because `Res` cannot contain itself by value - an ADT
+/// enum is laid out as a tag plus a payload area sized to its largest variant,
+/// which for a self-referential variant has no finite size.
+type enum ResBase {
+    /// A declared type, by its canonical qualified name.
+    Def(SymbolStr);
+    /// A type parameter, BY NAME - its members are reached through its bound.
+    GenericParam(SymbolStr);
+    /// A primitive, by its spelling.  Primitives own members without being
+    /// declared anywhere, so there is no qualified name to give.
+    PrimTy(SymbolStr);
+}
+
+implement enum ResBase {
+    /// Whether a spelling names a primitive.
+    ///
+    /// A primitive owns members without being declared anywhere, so it binds in
+    /// no scope and appears in no module's export set.  Every lookup therefore
+    /// reports it as absent, and only the spelling distinguishes "a primitive,
+    /// which needs no declaration" from "a name nothing in the program owns".
+    static is_primitive_spelling(name: string) -> boolean {
+        return name.eq("void")
+            || name.eq("boolean")
+            || name.eq("char")
+            || name.eq("string")
+            || name.eq("i8")
+            || name.eq("i16")
+            || name.eq("i32")
+            || name.eq("i64")
+            || name.eq("i128")
+            || name.eq("u8")
+            || name.eq("u16")
+            || name.eq("u32")
+            || name.eq("u64")
+            || name.eq("u128")
+            || name.eq("isize")
+            || name.eq("usize")
+            || name.eq("f32")
+            || name.eq("f64")
+            || name.eq("never");
+    }
+
+    /// The name this base was recorded under, whichever kind it is.
+    name(&this) -> SymbolStr {
+        return match (&this) {
+            ResBase::Def(q)          => { q }
+            ResBase::GenericParam(n) => { n }
+            ResBase::PrimTy(n)       => { n }
+        };
+    }
+
+    to_string(&this) -> string {
+        return match (&this) {
+            ResBase::Def(_)          => { "Def" }
+            ResBase::GenericParam(_) => { "GenericParam" }
+            ResBase::PrimTy(_)       => { "PrimTy" }
+        };
+    }
+}
 
 type enum Res {
     /// A declaration or module, by its canonical qualified name.
@@ -53,9 +126,15 @@ type enum Res {
     GenericParam(SymbolStr);
     /// A primitive, by its spelling.
     PrimTy(SymbolStr);
-    /// The type layer owns the rest of this path: its first segment names a
-    /// type rather than a module, so finishing it needs a receiver type.
-    TypeRelative;
+    /// The type layer owns the REST of this path.  The payload states how far
+    /// the name layer got: the type its walk ended on, and how many trailing
+    /// segments are left for the type layer to finish.
+    ///
+    /// Carrying the base is what lets sema resume at a known position instead
+    /// of re-searching from a bare name, which is the whole reason a private
+    /// resolver grew in sema in the first place.  A marker with no payload
+    /// says only "not mine", and "not mine" is not an answer anyone can use.
+    TypeRelative(ResBase, u32);
     /// Resolution failed and the diagnostic has already been emitted.
     Err;
 }
@@ -78,7 +157,9 @@ implement enum Res {
             Res::Local(_)        => { "Local" }
             Res::GenericParam(_) => { "GenericParam" }
             Res::PrimTy(_)       => { "PrimTy" }
-            Res::TypeRelative    => { "TypeRelative" }
+            Res::TypeRelative(b, n) => {
+                format("TypeRelative(%s, %d)", b.to_string(), n)
+            }
             Res::Err             => { "Err" }
         };
     }

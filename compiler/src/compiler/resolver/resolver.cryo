@@ -47,6 +47,22 @@ type struct Resolver {
     // Current context
     current_module:     SymbolStr;
 
+    /// The namespaces a file can name WITHOUT importing them.
+    ///
+    /// §4's tier chain ends at the prelude, and until this existed the chain
+    /// stopped one tier short: the scope walk knew about a module's own
+    /// declarations and its imports, and nothing at all about the names that
+    /// are reachable by default.  A file writing `Option::Some` while importing
+    /// no option module therefore bound nothing, and the answer came instead
+    /// from a leaf-index search that is not scoped to the writer at all - which
+    /// is the mechanical origin of the fallback this subsystem is retiring.
+    ///
+    /// Held as namespaces rather than as copied symbols so the tier stays one
+    /// list instead of a per-module duplication of every prelude export, and so
+    /// it shadows correctly: it is consulted only after every real scope has
+    /// been asked, which is what makes an inner declaration win.
+    prelude_modules:    SymbolStr[];
+
     // Index: interned owner_name id -> ids of Module-kind scopes with that
     // name.  find_module_scope would otherwise linear-scan every scope with a
     // per-scope strcmp (~3% frontend self-time combined).  The resolver may
@@ -76,6 +92,7 @@ type struct Resolver {
             exports:              [],
             import_aliases:       [],
             current_module:       SymbolStr::empty(),
+            prelude_modules:      [],
             module_scope_index:   HashMap<u32, u64[]>::new(),
         };
     }
@@ -335,7 +352,38 @@ type struct Resolver {
             }
             scope_id = scope.parent_id;
         }
-        return SymbolID::invalid();
+        return this.lookup_prelude(name);
+    }
+
+    /// The outermost tier of the rib chain: names reachable without an import.
+    ///
+    /// Consulted only after every enclosing scope has been asked, which is what
+    /// makes it a TIER and not a second strategy - an inner declaration or an
+    /// explicit import shadows it, exactly as a nearer rib shadows a farther
+    /// one.  It answers the same question the walk above does and returns the
+    /// same kind of answer, so no caller acquires a branch on which tier
+    /// replied.
+    ///
+    /// A name two prelude modules both export is left UNANSWERED rather than
+    /// taken from whichever module the graph happens to list first: picking
+    /// would make the meaning of a program depend on module order, which is the
+    /// property this subsystem exists to remove.
+    lookup_prelude(&this, name: SymbolStr) -> SymbolID {
+        mut found: SymbolID = SymbolID::invalid();
+        for (mut i: i64 = 0; i < this.prelude_modules.length; i++) {
+            const hit: SymbolID = this.lookup_in_module(this.prelude_modules[i], name);
+            if (!hit.is_valid()) { continue; }
+            if (found.is_valid()) { return SymbolID::invalid(); }
+            found = hit;
+        }
+        return found;
+    }
+
+    /// Record the namespaces reachable without an import.  Derived from the
+    /// prelude module's own `public module` list, so it is empty when no
+    /// prelude was loaded rather than defaulting to a transcribed set.
+    set_prelude_modules(mut &this, mods: SymbolStr[]) -> void {
+        this.prelude_modules = mods;
     }
 
     /// Look up a name in the current scope only.
@@ -717,6 +765,24 @@ type struct Resolver {
     }
 
 
+    /// The canonical qualified name of a symbol.
+    ///
+    /// A symbol stores its leaf and its declaring module separately, so the
+    /// canonical form is built rather than read off.  Every answer that names a
+    /// definition is built here, because a second construction site is how two
+    /// lanes come to disagree about what the same declaration is called - and
+    /// the qualified name is the key `DeclarationIndex`, the type arena and the
+    /// mangler all use, so disagreeing about it is not a cosmetic difference.
+    ///
+    /// A re-exported symbol keeps the module that DECLARED it, which is what
+    /// makes the name canonical rather than a statement about the route taken
+    /// to reach it.
+    qualified_name_of(&this, sym: &Symbol) -> SymbolStr {
+        if (sym.source_module == "") { return sym.name; }
+        return this.intern_table.intern(
+            sym.source_module + "::" + this.intern_table.resolve(sym.name));
+    }
+
     /// THE path-resolution entry point (§5.2).
     ///
     /// `ns` is a parameter rather than a separate function per kind, and that is
@@ -750,22 +816,28 @@ type struct Resolver {
             if (found.is_valid()) {
                 const sym: Symbol = this.get_symbol(found);
                 if (ns.accepts(sym.kind)) {
+                    // How many segments the head does NOT account for.  The
+                    // head is resolved here and nothing after it is, so this is
+                    // a statement about this walk rather than an estimate.
+                    const trailing: u32 = (segments.length - 1) as u32;
                     // A parameter names ITSELF.  Substitution happens strictly
                     // below this, in the type layer, which is what lets a `Res`
                     // be copied verbatim by `ASTCloner`.
                     if (sym.kind == SymbolKind::GenericParam) {
-                        if (segments.length > 1) { return Res::TypeRelative; }
+                        if (segments.length > 1) {
+                            return Res::TypeRelative(
+                                ResBase::GenericParam(sym.name), trailing);
+                        }
                         return Res::GenericParam(sym.name);
                     }
+                    const qualified: SymbolStr = this.qualified_name_of(&sym);
                     // The remainder is rooted in what the head named; a type
                     // owner needs a receiver type, so it is not finishable here.
-                    if (segments.length > 1) { return Res::TypeRelative; }
-                    const resolved: string = this.intern_table.resolve(sym.name);
-                    if (sym.source_module != "") {
-                        return Res::Def(this.intern_table.intern(
-                            sym.source_module + "::" + resolved));
+                    if (segments.length > 1) {
+                        return Res::TypeRelative(ResBase::Def(qualified),
+                                                 trailing);
                     }
-                    return Res::Def(sym.name);
+                    return Res::Def(qualified);
                 }
             }
             scope_id = sc.parent_id;
