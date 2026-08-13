@@ -32,12 +32,22 @@ this script.
 
 WHAT IS ASSERTED
 ----------------
-The B1 total AND every per-site row the report flags `B1`.  The breakdown is
-asserted, not merely reported, because a change that moves 500 answers from one
-fallback to another without moving the total is still a resolution behavior
-change, and the cascade's history is precisely that of steps being added and
-shifted without anyone seeing it.  The failure output is a per-site diff naming
-which step moved, so re-pinning is a decision rather than a guess.
+The B1 total AND every per-site row the report flags `B1` or `B3*`.  The
+breakdown is asserted, not merely reported, because a change that moves 500
+answers from one fallback to another without moving the total is still a
+resolution behavior change, and the cascade's history is precisely that of steps
+being added and shifted without anyone seeing it.  The failure output is a
+per-site diff naming which step moved, so re-pinning is a decision rather than a
+guess.
+
+`B3*` is the one exception to "B3 is context only", and it is not a general
+licence to pin B3 rows.  It marks a site that left B1 because it answers a
+module-INDEPENDENT identity question rather than binding a name to a
+declaration -- so it has no reduction target and belongs in B3 -- while still
+being the kind of leaf lookup a future caller could misuse for binding.  Such a
+row keeps its ratchet because the alternative is to trade a reachable B1 target
+for a lane nobody can see growing, which is the failure this gate exists to
+prevent.  A B3 row with no such regrowth story stays unasserted.
 
 THE ROWS DO NOT SUM TO THE TOTAL, AND MUST NOT BE ASSERTED TO
 -------------------------------------------------------------
@@ -58,10 +68,11 @@ What DOES hold is `total <= row_sum`: every summand is flagged B1.  That is
 checked, and it is the real completeness test -- if the total ever exceeds the
 rows, a summand is not being parsed and the per-site assertion has gone blind.
 
-B2/B3 are recorded for context but NOT asserted.  B2 is documented as a floor
-(§8.3, sema's dispatch is uninstrumented) and B3's target is "once per path",
-not a fixed number; asserting either would make the gate noisy, and a noisy
-gate gets turned off.
+The B2 and B3 TOTALS are recorded for context but NOT asserted.  B2 is
+documented as a floor (§8.3, sema's dispatch is uninstrumented) and B3's target
+is "once per path", not a fixed number; asserting either would make the gate
+noisy, and a noisy gate gets turned off.  Individual B3 rows are likewise
+unasserted, apart from the `B3*` exception above.
 
 THE GOLDEN IS PER-HOST, WITH NO INHERITANCE
 -------------------------------------------
@@ -279,8 +290,12 @@ def parse_report(err):
         row = split_row(line)
         # `B1` and `B1*` (the nested step-5 row) are both fuzzy-fallback
         # family sites worth pinning; see the module docstring for why this
-        # set is not the same as the set of summands.
-        if row and row[0].startswith("B1"):
+        # set is not the same as the set of summands.  `B3*` is the narrow
+        # exception to "B3 is context only": a site that left B1 because it
+        # keys identity rather than binding names, but could regrow into a
+        # binding path if a future caller misused it, and would do so
+        # invisibly in an unasserted bucket.
+        if row and (row[0].startswith("B1") or row[0].startswith("B3*")):
             rows.append((row[1], row[2]))
 
     if b1 is None:
@@ -348,8 +363,8 @@ def host_key():
 HEADER = [
     "# B1 fuzzy-fallback baseline -- docs/name-resolution.md §7.2 mechanism 3.",
     "#",
-    "# ASSERTED: the B1 total and every per-site row, PER HOST.",
-    "# CONTEXT ONLY (not asserted): the B2/B3 comments.",
+    "# ASSERTED: the B1 total and every per-site B1 / B3* row, PER HOST.",
+    "# CONTEXT ONLY (not asserted): the B2/B3 totals in the comments.",
     "#",
     "# Target: examples/09-json-config, --no-incremental, CRYO_CODEGEN_THREADS=1.",
     "# Re-pin DELIBERATELY with `make b1-check ARGS=--update` and commit the",
