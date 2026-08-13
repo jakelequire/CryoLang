@@ -357,7 +357,7 @@ module boundary and answers a method call. Pinned as a `WRONG_` arm in
 The resolver's own enforcement still cannot depend on the feature it is
 implementing, so the mechanisms below are what carry the remaining work.
 
-### 7.2 The four mechanisms
+### 7.2 The five mechanisms
 
 1. **`Res` is an enum, and `match` is exhaustive.** Adding or changing a
    variant forces every consumer to handle it (E0405). This is the primary
@@ -433,6 +433,47 @@ implementing, so the mechanisms below are what carry the remaining work.
    are all bound by this. The same lesson was already learned once in the async
    work, where a synthesized call had to set its own `arg_binding`.
 
+5. **A lane is a PARAMETER, and a second lane cannot compile.** §5.2 requires
+   one `resolve_path(segments, ns, scope)`; the enforcement is what keeps it
+   one. Three locks, in increasing order of strength:
+
+   - **The namespace is required at the call.** There is no overload that omits
+     it and no default. A caller must state which namespace it is asking about,
+     which is what makes "resolve `Foo`" a well-formed question instead of a
+     guess about which index to consult.
+   - **The per-kind lookups are non-public.** `lookup_type`,
+     `lookup_func_return`, `lookup_func_type`, `lookup_global` and
+     `lookup_method_return` become thin non-public wrappers over the primitive.
+     §7.1 measures a non-public FUNCTION as enforced cross-module (`E0353`), so
+     a direct call from `sema`, `mono` or `codegen` **fails to compile** rather
+     than being caught in review. This is the one place privatization is a
+     legitimate design, and only because these are functions — the §7.1 rider
+     still holds for types, which must be deleted rather than hidden.
+   - **A surface ratchet pins what remains.** Privatization cannot stop someone
+     adding a *new* public wrapper, and deletion cannot stop someone
+     reintroducing a helper. `make lane-check` pins two numbers against a
+     golden, in the shape mechanism 3 already proved: the count of direct
+     per-kind lookup call sites outside the resolver, and the count of
+     `get_resolver()` re-entries outside the driver. Both ratchet **downward
+     only** — an increase is a build failure, and a decrease must be re-pinned
+     deliberately.
+
+   The reason this needs all three is the observed failure mode. Lanes did not
+   drift because anyone decided to have two resolvers; they drifted because
+   each new caller needed an answer the existing lane could not give, and
+   adding a sibling lookup was always locally cheaper than fixing the shared
+   one. A convention loses that trade every time, under deadline, which is what
+   §7's opening sentence records. A compile error does not.
+
+   **Corollary — name resolution is a PASS, not a service.** A stage that can
+   call back into the resolver will, and a resolver called from `sema` no
+   longer has the writer's imports in hand, so it answers from the ambient
+   cursor or from a string. That is the mechanical origin of B1: every fuzzy
+   answer is a re-entry that lacked the inputs to do better. `Res` exists so
+   later stages **read** instead of asking, and driving `get_resolver()` out of
+   `sema`/`mono`/`codegen` is what makes the property structural rather than
+   incidental.
+
 ### 7.2a The self-host gate was checking 1% of the IR on Linux — FIXED 2026-08-04
 
 The self-host is the gate this work leans on hardest: "a name binding
@@ -482,6 +523,20 @@ two-bucket model in the roadmap (§3.2 rule 2) was measured wrong on
 | **B1** | fuzzy fallback — guesses from a string | **zero** |
 | **B2** | type-dependent — genuinely needs a receiver type | stays; enumerated and justified |
 | **B3** | authoritative — answers from scope/imports | **once per path**, not zero |
+
+**These are not one quality ladder, and reading them as one is the common
+mistake.** B1 and B3 answer the SAME question — *what does this written name
+refer to?* — one by guessing from a string and one from the writer's imports,
+so that pair is a quality axis and B1's target is zero. **B2 is a different
+question**: *given a receiver of type `T`, which method does `.foo()` dispatch
+to?* No amount of name-layer correctness answers it, because it needs the type.
+So B2 is not a worse B3 and does not converge on B3; it has a permanent floor.
+The same split exists in Rust, where method calls are resolved in
+`rustc_hir_typeck::method` and never in `rustc_resolve` — the counter only
+makes the boundary visible. What B2 *should* do is shrink as the name layer
+resolves more of a path's prefix before handing off (§5.3), and it is recorded
+as a FLOOR because sema's dispatch is uninstrumented, so its number is
+under-counted rather than exact.
 
 B3 exists because `resolve_qualified_scoped` accounts for 487,838 of
 `lookup_qualified_alternatives`' 496,945 calls, and it is import- and
@@ -4863,6 +4918,58 @@ redundant, **90 could be dropped and exactly 1 could not**:
 std::future::ready;` back for `Ready<T>::new`. That import carries a comment
 naming the mechanism, and it is the marker for this section — when the keystone
 lands, that import is the thing to delete to prove it.
+
+### 8.5 §5.2 was never implemented: lanes are duplicated code, not a parameter — MEASURED 2026-08-13
+
+§5.2 has specified `resolve_path(segments, ns, scope)` with **`ns` as a
+parameter, not a separate code path** since this document was written. The code
+has never done it, and the gap was never recorded here, so successive plans
+treated spec-mandated work as an optional future refactor.
+
+**There is no namespace concept in the compiler.** No `Namespace` enum exists.
+`SymbolKind` (`Variable`, `Function`, `Type`, `Namespace`, `GenericParam`, …)
+is a **tag on a result**, not a dimension of a query — it describes what was
+found, and cannot be passed to ask *for* something. What exists instead is one
+lookup per kind, each with its own path to an answer:
+
+| entry point | call sites |
+|---|---:|
+| `lookup_type` | 91 |
+| `lookup_method_return` | 17 |
+| `lookup_func_type` | 14 |
+| `lookup_func_return` | 12 |
+| `lookup_global` | 3 |
+| **total** | **137** |
+
+`get_resolver()` — the re-entry that §7.2's corollary forbids — has **9** call
+sites across 7 files, in `sema`, `passes`, and the driver.
+
+**This is the mechanism behind the cascade, and it reframes the remaining
+work.** Because each lane re-derives the scope, import and visibility rules
+separately, they drift: the annotation lane answers `0` leaf-index hits while
+sema's type lane answers **753**, and all 753 come from a single four-step
+cascade in `sema/type_utils.cryo::lookup_type_by_sym` — a private resolver
+inside sema. That function takes a bare `SymbolStr`, so it holds no node and
+can read no `Res`; **guessing is forced by its signature**, and no amount of
+stamping fixes a caller that never had a node to stamp. The cascade is not one
+bad function to delete, it is the same rules independently re-invented per
+lane, and it will regrow in whichever lane is cheapest next.
+
+The §7.2 mechanism-5 locks exist because of this history specifically. Note
+what each does and does not cover: the required `ns` parameter makes the
+question well-formed, privatization makes a direct call from `sema` fail to
+compile, and only the ratchet catches a *newly added* wrapper. Any one of them
+alone leaves the cheap shortcut available.
+
+**§5.3 is unimplemented in the same way, and the two are coupled.** The spec
+requires `resolve_path` to record the base `Res` **plus a count of unresolved
+trailing segments**. The implementation's `Res::TypeRelative` carries no
+payload, so the type layer is handed a bare name and must search for the base
+that the name layer had already resolved — which is precisely what keeps
+`lookup_type_by_sym` alive. Carrying the payload is what lets sema resume at a
+stated position and lets that function be deleted rather than fed. Recorded
+here because a payload-free marker was briefly adopted on 2026-08-13 before
+this section existed; the spec is normative and the code is the defect.
 
 ---
 

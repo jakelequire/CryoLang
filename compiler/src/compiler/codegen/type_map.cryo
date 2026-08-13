@@ -118,6 +118,187 @@ type struct TypeMapper {
         this.llvm_module = llvm_module;
     }
 
+    // ---- Field index -> LLVM element index -------------------------------
+    //
+    // The ONE place that answers "which element of the emitted body holds
+    // field N".  A body is not a one-to-one image of its field list: a class
+    // prepends a vtable slot and its ancestors' fields, and an over-aligned
+    // member forces an explicit padding element in front of it, because LLVM
+    // sizes and aligns a struct from its elements alone and would otherwise
+    // place that member at its natural offset.  Every GEP into a field, every
+    // constant aggregate, and the body builder itself read their answer here,
+    // so the body and the indices used to address it cannot disagree.
+
+    /// The alignment LLVM gives this type's emitted body, which is the maximum
+    /// over its members and ignores `![align(N)]` at every level: an LLVM
+    /// struct has no alignment of its own, and the filler elements that carry
+    /// a declared alignment are `i8` arrays.  This is the number that decides
+    /// where LLVM would place a member on its own, and so whether a member
+    /// needs an explicit filler in front of it to reach the offset the front
+    /// end assigned.
+    natural_align(&this, ty: TypeRef, depth: i32) -> u64 {
+        if (depth > 8) { return 1; }
+        const t: Type* = this.arena.lookup(ty.id);
+        if (t == null) { return 1; }
+        if (t.kind == TypeKind::Struct) {
+            const st: StructType* = t as StructType*;
+            if (st.repr_packed) { return 1; }
+            mut a: u64 = 1;
+            for (mut i: i64 = 0; i < st.fields.length; i++) {
+                const fa: u64 = this.natural_align(st.fields[i].field_type, depth + 1);
+                if (fa > a) { a = fa; }
+            }
+            return a;
+        }
+        if (t.kind == TypeKind::Class) {
+            const cl: ClassType* = t as ClassType*;
+            mut a: u64 = 1;
+            if (cl.has_virtual_methods || cl.has_base) { a = 8; }
+            for (mut i: i64 = 0; i < cl.fields.length; i++) {
+                const fa: u64 = this.natural_align(cl.fields[i].field_type, depth + 1);
+                if (fa > a) { a = fa; }
+            }
+            return a;
+        }
+        if (t.kind == TypeKind::Array) {
+            const arr: ArrayType* = t as ArrayType*;
+            if (arr.is_fixed()) { return this.natural_align(arr.element, depth + 1); }
+            return 8;
+        }
+        if (t.kind == TypeKind::InstantiatedType) {
+            const inst: InstantiatedType* = t as InstantiatedType*;
+            if (inst.has_resolved_type()) { return this.natural_align(inst.resolved_type, depth + 1); }
+            return 1;
+        }
+        if (t.kind == TypeKind::TypeAlias) {
+            const al: TypeAliasType* = t as TypeAliasType*;
+            if (al.has_target()) { return this.natural_align(al.target, depth + 1); }
+            return 1;
+        }
+        const a: u64 = t.alignment();
+        if (a == 0) { return 1; }
+        return a;
+    }
+
+    /// Element index of `field_idx` within `st`'s body, and - through
+    /// `gap_out`, when non-null - the filler bytes that must precede it.
+    ///
+    /// A filler is needed ONLY where the front end put a field further along
+    /// than LLVM would place it unaided: LLVM already inserts the ordinary
+    /// alignment padding between, say, a `u32` and an 8-aligned member, and
+    /// counting that as a filler would index past the end of the body.  The
+    /// gap therefore measures the front end's offset against LLVM's own
+    /// placement (`natural_align`), not against the previous field's end - so
+    /// it is non-zero only for a member whose declared alignment exceeds what
+    /// its own members give it.  Unions overlap at offset 0 and packed structs
+    /// are dense; neither can have one.
+    struct_field_slot(&this, st: StructType*, field_idx: i64, gap_out: u64*) -> i64 {
+        if (gap_out != null) { *gap_out = 0; }
+        if (st == null || field_idx < 0 || field_idx >= st.fields.length) { return -1; }
+        if (st.is_union || st.repr_packed) { return field_idx; }
+
+        mut elem: i64 = 0;
+        mut end:  u64 = 0;          // where LLVM would put the next element
+        for (mut i: i64 = 0; i <= field_idx; i++) {
+            const want: u64 = st.fields[i].offset;
+            const fa:   u64 = this.natural_align(st.fields[i].field_type, 0);
+            mut here: u64 = end;
+            if (fa > 1) { here = ((end + fa - 1) / fa) * fa; }
+            mut gap: u64 = 0;
+            if (want > here) { gap = want - here; }
+            if (gap > 0) { elem += 1; }
+            if (i == field_idx) {
+                if (gap_out != null) { *gap_out = gap; }
+                return elem;
+            }
+            elem += 1;
+            const ft: Type* = this.arena.lookup(st.fields[i].field_type.id);
+            if (ft == null) { return field_idx; }
+            end = want + ft.size_bytes();
+        }
+        return elem;
+    }
+
+    /// Element index of `owner`'s field `local_idx` inside `leaf`'s flattened
+    /// body: one vtable slot when any class in the chain declares virtual
+    /// methods, then every ancestor's fields root-to-derived.  `owner` must be
+    /// `leaf` or one of its ancestors; -1 otherwise.
+    class_field_element_index(&this, leaf: ClassType*, owner: ClassType*, local_idx: i64) -> i64 {
+        if (leaf == null || owner == null || local_idx < 0) { return -1; }
+        mut chain: ClassType*[] = [];
+        mut any_virtual: boolean = false;
+        mut walk: ClassType* = leaf;
+        mut depth: i32 = 0;
+        while (walk != null && depth < 16) {
+            chain.push(walk);
+            if (walk.has_virtual_methods) { any_virtual = true; }
+            if (!walk.has_base || !walk.base_class.is_valid()) { break; }
+            const base_t: Type* = this.arena.lookup(walk.base_class.id);
+            if (base_t == null || base_t.kind != TypeKind::Class) { break; }
+            walk = base_t as ClassType*;
+            depth += 1;
+        }
+        mut slot: i64 = if (any_virtual) { 1 } else { 0 };
+        for (mut ci: i64 = chain.length - 1; ci >= 0; ci--) {
+            const link: ClassType* = chain[ci];
+            if (link.id == owner.id) {
+                if (local_idx >= link.fields.length) { return -1; }
+                return slot + local_idx;
+            }
+            slot += link.fields.length;
+        }
+        return -1;
+    }
+
+    /// Element index of field `field_idx` of `t`, where `field_idx` indexes
+    /// the type's OWN field list.  A tuple and a dynamic-array header answer
+    /// the identity: their element order IS their field order.
+    field_element_index(&this, t: Type*, field_idx: i64) -> i64 {
+        if (t == null || field_idx < 0) { return -1; }
+        if (t.kind == TypeKind::Class) {
+            const cls: ClassType* = t as ClassType*;
+            return this.class_field_element_index(cls, cls, field_idx);
+        }
+        if (t.kind == TypeKind::Struct) {
+            return this.struct_field_slot(t as StructType*, field_idx, null);
+        }
+        return field_idx;
+    }
+
+    /// Element index of the member named `member`, searching a class's base
+    /// chain root-first so a base field wins a name a derived class reuses -
+    /// the order the flattened body itself is built in.  -1 when `t` has no
+    /// such member.
+    member_element_index(&this, t: Type*, member: SymbolStr) -> i64 {
+        if (t == null) { return -1; }
+        if (t.kind == TypeKind::Struct) {
+            const st: StructType* = t as StructType*;
+            return this.field_element_index(t, st.field_index(member));
+        }
+        if (t.kind == TypeKind::Class) {
+            const cls: ClassType* = t as ClassType*;
+            mut chain: ClassType*[] = [];
+            mut walk: ClassType* = cls;
+            mut depth: i32 = 0;
+            while (walk != null && depth < 16) {
+                chain.push(walk);
+                if (!walk.has_base || !walk.base_class.is_valid()) { break; }
+                const base_t: Type* = this.arena.lookup(walk.base_class.id);
+                if (base_t == null || base_t.kind != TypeKind::Class) { break; }
+                walk = base_t as ClassType*;
+                depth += 1;
+            }
+            for (mut ci: i64 = chain.length - 1; ci >= 0; ci--) {
+                const link: ClassType* = chain[ci];
+                const local_idx: i64 = link.field_index(member);
+                if (local_idx >= 0) {
+                    return this.class_field_element_index(cls, link, local_idx);
+                }
+            }
+        }
+        return -1;
+    }
+
     /// Bytes of tail padding this body needs so the emitted object is the size
     /// the front end reports.  `![align(N)]` - declared, or inherited from a
     /// field - rounds a type's size up to a multiple of N, but an LLVM struct
@@ -469,10 +650,17 @@ type struct TypeMapper {
             return llvm_ty;
         }
 
-        // Build field type array.
+        // Build the element list: each field, preceded by a `[K x i8]` filler
+        // wherever the front end's offsets leave a gap.  A gap appears only
+        // where a member's declared alignment exceeds what its own members
+        // give it, because LLVM aligns a struct from its elements alone and
+        // would otherwise place that member at its natural offset - and then
+        // `offsetof` would disagree with the layout the front end already
+        // computed, `sizeof`, and every other compiler.  Capacity is 2n+1:
+        // at most one filler per field, plus the tail.
         const n: u32 = t.fields.length as u32;
         if (n > 0) {
-            const buf: void* = intrinsics::malloc(n as u64 * 8);
+            const buf: void* = intrinsics::malloc((n as u64 * 2 + 1) * 8);
             const slots: void** = buf as void**;
             // A field whose type can't be lowered to LLVM means an
             // un-substituted generic or unresolved type reached codegen -- a
@@ -482,22 +670,30 @@ type struct TypeMapper {
             // body without calling set_struct_body, leaving the type opaque.
             mut bad_fields: u32 = 0;
             mut first_bad:  u32 = 0;
+            mut count:      u32 = 0;
             for (mut i: u32 = 0; i < n; i++) {
+                mut gap: u64 = 0;
+                this.struct_field_slot(t, i as i64, &gap);
+                if (gap > 0) {
+                    slots[count as i64] = LType::array_of(LType::i8(), gap as u32).raw;
+                    count += 1;
+                }
                 const ft: LType = this.map_type(t.fields[i].field_type);
                 if (ft.is_valid()) {
-                    slots[i] = ft.raw;
+                    slots[count as i64] = ft.raw;
                 } else {
                     if (bad_fields == 0) { first_bad = i; }
                     bad_fields += 1;
                 }
+                count += 1;
             }
             if (bad_fields > 0) {
                 intrinsics::free(buf);
                 this.report_unmappable_fields(mangled, bad_fields, first_bad);
                 return LType::null();
             }
-            const pad: u64 = this.tail_padding_for(t.computed_size, buf, n, packed);
-            this.set_body_with_padding(llvm_ty, buf, n, packed, pad);
+            const pad: u64 = this.tail_padding_for(t.computed_size, buf, count, packed);
+            this.set_body_with_padding(llvm_ty, buf, count, packed, pad);
             intrinsics::free(buf);
         } else {
             llvm_ty.set_struct_body(null, 0, packed);

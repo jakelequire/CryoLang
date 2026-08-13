@@ -1638,7 +1638,8 @@ type struct DeclarationEmitter {
         if (!init.is_valid() && init_expr != null
             && init_expr.kind == NodeKind::StructLiteral
             && LType::kind_of(ty.raw) == LTypeKind::Struct) {
-            init = DeclarationEmitter::try_const_struct(init_expr as StructLiteralNode*, ty);
+            init = DeclarationEmitter::try_const_struct(
+                this.type_mapper, gty, init_expr as StructLiteralNode*, ty);
         }
         if (!init.is_valid()) {
             init = LType::const_null(ty);
@@ -2605,14 +2606,39 @@ type struct DeclarationEmitter {
     /// any non-constant field, or a field-count mismatch (an unexpected shape),
     /// returns an invalid value so the caller declines to the zeroinitializer
     /// fallback - correct-or-decline, never a silently wrong layout.
-    static try_const_struct(sl: StructLiteralNode*, ty: LType) -> LValue {
+    /// `layout` is the Cryo type whose field list `sl` initializes, so a field
+    /// can be placed at the element that actually holds it: a body may carry
+    /// alignment padding elements the field list has no member for.  Padding
+    /// elements are zero-filled.  A body with a DIFFERENT element count than
+    /// fields-plus-padding is an unexpected shape and declines, as before -
+    /// but the count alone can no longer decide, because padding makes a
+    /// correct body wider than its field list.
+    static try_const_struct(mapper: TypeMapper*, layout: Type*,
+                            sl: StructLiteralNode*, ty: LType) -> LValue {
         const n: u32 = llvm::LLVMCountStructElementTypes(ty.raw);
-        if (n == 0 || (sl.field_inits.length as u32) != n) { return LValue::null(); }
+        if (n == 0 || mapper == null || layout == null) { return LValue::null(); }
+        // Every field initialized, in declaration order - the shape the
+        // importer emits.  A partial literal still declines: filling only some
+        // fields here would silently define the rest as zero.
+        mut field_count: i64 = -1;
+        if (layout.kind == TypeKind::Struct) { field_count = (layout as StructType*).fields.length; }
+        else if (layout.kind == TypeKind::Class) { field_count = (layout as ClassType*).fields.length; }
+        if (field_count < 0 || sl.field_inits.length != field_count) { return LValue::null(); }
         const buf: void* = intrinsics::malloc((n as u64) * 8);
         const slots: void** = buf as void**;
+        // Zero every element first, so any padding element is a well-formed
+        // constant even though no field initializer names it.
         mut ok: boolean = true;
-        for (mut i: u32 = 0u32; i < n; i++) {
-            const fty_raw: void* = llvm::LLVMStructGetTypeAtIndex(ty.raw, i);
+        for (mut z: u32 = 0u32; z < n; z++) {
+            const zty: void* = llvm::LLVMStructGetTypeAtIndex(ty.raw, z);
+            const zval: LValue = LType::const_null(LType { raw: zty });
+            if (!zval.is_valid()) { ok = false; break; }
+            slots[z as i64] = zval.raw;
+        }
+        for (mut i: u32 = 0u32; ok && i < sl.field_inits.length as u32; i++) {
+            const elem: i64 = mapper.field_element_index(layout, i as i64);
+            if (elem < 0 || elem as u32 >= n) { ok = false; break; }
+            const fty_raw: void* = llvm::LLVMStructGetTypeAtIndex(ty.raw, elem as u32);
             const fty: LType = LType { raw: fty_raw };
             const fk: LTypeKind = LType::kind_of(fty_raw);
             const fexpr: ExpressionNode* = sl.field_inits[i as i64].value;
@@ -2629,7 +2655,7 @@ type struct DeclarationEmitter {
                 }
             }
             if (!slot.is_valid()) { ok = false; break; }
-            slots[i as i64] = slot.raw;
+            slots[elem] = slot.raw;
         }
         if (!ok) { intrinsics::free(buf); return LValue::null(); }
         const v: LValue = LType::const_named_struct(ty, buf, n);
