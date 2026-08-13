@@ -1,0 +1,69 @@
+///! `Module::function` used as a VALUE must resolve to the function's address.
+///!
+///! The scope segment's canonical namespace is not recoverable from what the
+///! source wrote - any whole-segment suffix may be spelled, and several modules
+///! can share one - so the resolver records it on the node. The value path
+///! instead re-derived it through a lookup that returns its input unchanged
+///! when it fails, making a canonical answer and a refusal the same value; the
+///! qualified probe then compared equal to the bare spelling and was skipped.
+///!
+///! The failure is silent: nothing is diagnosed and the slot is simply never
+///! stored to, so the variable reads whatever the stack happened to hold. It is
+///! a CALL that works and a REFERENCE that does not.
+///!
+///! These call THROUGH the value rather than inspecting its address, so they
+///! need no cast - the same-module reference below is the control, and it
+///! resolved by a different step that always worked.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::ModuleQualifiedFnValue;
+
+import std::core::result;
+import std::test::error;
+import std::test::assert;
+import CryoTests::Tests::Lang::ModuleQualifiedFnValueDefn;
+
+mut g_local_calls: i64 = 0;
+function local_record(tag: i64) -> void { g_local_calls = g_local_calls + tag; }
+
+![test]
+function cross_module_fn_value_calls_through() -> Result<(), TestError> {
+    ModuleQualifiedFnValueDefn::reset();
+    const f: (i64) -> void = ModuleQualifiedFnValueDefn::record;
+    f(7);
+    f(5);
+    return expect_eq(ModuleQualifiedFnValueDefn::calls(), 12);
+}
+
+// The short spelling and the fully-qualified one must name one function.
+![test]
+function short_and_full_spelling_agree() -> Result<(), TestError> {
+    ModuleQualifiedFnValueDefn::reset();
+    const short_f: (i64) -> void = ModuleQualifiedFnValueDefn::record;
+    const full_f:  (i64) -> void = CryoTests::Tests::Lang::ModuleQualifiedFnValueDefn::record;
+    short_f(3);
+    full_f(4);
+    return expect_eq(ModuleQualifiedFnValueDefn::calls(), 7);
+}
+
+// A cross-module reference stored in a STRUCT field, which is how every
+// callback in a table-driven extension point arrives.
+type struct Hook { run: (i64) -> void; }
+
+![test]
+function cross_module_fn_value_survives_a_struct_field() -> Result<(), TestError> {
+    ModuleQualifiedFnValueDefn::reset();
+    const h: Hook = Hook { run: ModuleQualifiedFnValueDefn::record };
+    h.run(9);
+    return expect_eq(ModuleQualifiedFnValueDefn::calls(), 9);
+}
+
+// Control: a same-module reference always resolved. If a regression broke both,
+// this stops the pair from going quiet together.
+![test]
+function same_module_fn_value_still_resolves() -> Result<(), TestError> {
+    g_local_calls = 0;
+    const f: (i64) -> void = local_record;
+    f(6);
+    return expect_eq(g_local_calls, 6);
+}

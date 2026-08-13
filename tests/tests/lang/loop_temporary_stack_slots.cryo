@@ -1,0 +1,144 @@
+///! Compiler-synthesized temporaries reuse one stack slot across loop
+///! iterations instead of stranding a fresh one per iteration.
+///!
+///! An `alloca` is reclaimed when its function returns, never at the end of the
+///! block that emitted it. A temporary whose slot is built at the point of use
+///! therefore costs the enclosing frame one slot per iteration when the
+///! expression sits in a loop body, and a loop that runs long enough walks the
+///! frame into the guard page. The crash surfaces wherever the stack happens to
+///! be deepest, which is usually a callee far from the code that caused it.
+///!
+///! The slots below are emitted in the entry block, so every iteration reuses
+///! one. Each construct here creates a temporary that is NOT written by the
+///! programmer: the address of a call result, a `match` subject spilled for a
+///! bare-identifier arm, `delete`'s receiver spill, and a fill-literal's loop
+///! counter.
+///!
+///! Measuring this needs a third party, because the frame's own locals sit at
+///! fixed offsets whether or not the frame is growing. `sp()` reports the
+///! address of a local in a CALLEE, which is placed below whatever the caller's
+///! frame currently occupies - so it moves exactly when the caller's frame
+///! grows. Comparing a local's own address across iterations would report
+///! "stable" either way.
+///!
+///! The final test is the control: hoisting must not go so far as to merge two
+///! temporaries that are live at the same instant. Without it, a lowering that
+///! gave every `&`-temporary in a function ONE shared slot would pass all four
+///! drift assertions while quietly corrupting every multi-argument call.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::LoopTemporaryStackSlots;
+
+import std::core::result;
+import std::test::error;
+import std::test::assert;
+
+const ITERS: u64 = 4096;
+
+/// Address of a callee's local: a stand-in for the current stack pointer.
+/// Never inlined away in practice because the address escapes as a value.
+function sp() -> u64 {
+    mut probe: u64 = 0;
+    return &probe as u64;
+}
+
+/// Stack growth between the first iteration and loop exit, in bytes, measured
+/// from below so it is independent of which way the stack grows.
+function drift(first: u64, last: u64) -> u64 {
+    if (first > last) { return first - last; }
+    return last - first;
+}
+
+type struct V3 { x: f32; y: f32; z: f32; }
+
+function unit_y() -> V3 { return V3 { x: 0.0, y: 1.0, z: 0.0 }; }
+function take_y(v: &V3) -> f32 { return v.y; }
+
+// `f(&g())` - the address of a call result materializes the value into a slot.
+![test]
+function addrof_call_result_reuses_slot() -> Result<(), TestError> {
+    mut first: u64 = 0;
+    mut acc: f32 = 0.0;
+    mut i: u64 = 0;
+    while (i < ITERS) {
+        acc = acc + take_y(&unit_y());
+        if (i == 0) { first = sp(); }
+        i = i + 1;
+    }
+    expect_eq(acc as i64, ITERS as i64)?;
+    return expect_eq(drift(first, sp()) as i64, 0);
+}
+
+// A bare-identifier arm binds the whole subject; a scalar subject is an SSA
+// value, so it is spilled to a slot the binding can point at.
+![test]
+function match_binding_reuses_slot() -> Result<(), TestError> {
+    mut first: u64 = 0;
+    mut acc: u64 = 0;
+    mut i: u64 = 0;
+    while (i < ITERS) {
+        const doubled: u64 = match (i) {
+            v => { v * 2 }
+        };
+        acc = acc + doubled;
+        if (i == 0) { first = sp(); }
+        i = i + 1;
+    }
+    expect_eq(acc as i64, (ITERS * (ITERS - 1)) as i64)?;
+    return expect_eq(drift(first, sp()) as i64, 0);
+}
+
+mut g_drops: i64 = 0;
+
+type struct Owned { id: i64; }
+implement trait Drop for struct Owned {
+    drop(mut &this) -> void { g_drops = g_drops + 1; }
+}
+
+// `delete` spills its evaluated pointer so the synthesized `.drop()` and the
+// `free` drive off one evaluation rather than re-running the operand.
+![test]
+function delete_receiver_reuses_slot() -> Result<(), TestError> {
+    g_drops = 0;
+    mut first: u64 = 0;
+    mut i: u64 = 0;
+    while (i < ITERS) {
+        mut owned: Owned* = new Owned { id: i as i64 };
+        delete owned;
+        if (i == 0) { first = sp(); }
+        i = i + 1;
+    }
+    expect_eq(g_drops, ITERS as i64)?;
+    return expect_eq(drift(first, sp()) as i64, 0);
+}
+
+// A fill-form literal `[value; N]` lowers to a counted store loop whose
+// induction variable needs storage.
+![test]
+function fill_literal_reuses_slot() -> Result<(), TestError> {
+    mut first: u64 = 0;
+    mut acc: i64 = 0;
+    mut i: u64 = 0;
+    while (i < ITERS) {
+        const row: i64[4] = [3; 4];
+        acc = acc + row[0] + row[3];
+        if (i == 0) { first = sp(); }
+        i = i + 1;
+    }
+    expect_eq(acc, (ITERS * 6) as i64)?;
+    return expect_eq(drift(first, sp()) as i64, 0);
+}
+
+function with_x(n: f32) -> V3 { return V3 { x: n, y: 0.0, z: 0.0 }; }
+function first_scaled(a: &V3, b: &V3) -> f32 { return a.x * 100.0 + b.x; }
+
+// Control for the four above: two temporaries whose addresses are live at the
+// same instant must still occupy distinct slots. Sharing one would make the
+// second store clobber the first and both parameters would read the same V3,
+// yielding 202 rather than 102. Both operands are call results so this travels
+// the same materialize-an-rvalue path the drift tests exercise.
+![test]
+function simultaneous_temporaries_stay_distinct() -> Result<(), TestError> {
+    const got: f32 = first_scaled(&with_x(1.0), &with_x(2.0));
+    return expect_eq(got as i64, 102);
+}

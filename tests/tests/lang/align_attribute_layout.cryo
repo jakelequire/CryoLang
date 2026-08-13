@@ -1,0 +1,61 @@
+///! `![align(N)]` and where it does - and does not - reach.
+///!
+///! FIXED: the BOUNDARY. An alloca and a global take the ABI alignment of the
+///! MAPPED LLVM type, which carries no record of the attribute, so the object
+///! landed on the fields' boundary instead of N. Both now raise to the declared
+///! alignment, never lower it.
+///!
+///! NOT FIXED, and deliberately untested here: the WIDTH. The mapped struct is
+///! built from the field types alone, so LLVM stops short of N and the type
+///! measures 64 to `sizeof` but 16 to the object holding it. Reproducing that
+///! width as tail padding was tried and REVERTED: padding on a size
+///! disagreement alone also fires where the front end merely computed a size
+///! wrong, and writing that into the type changes how the ABI classifies it -
+///! it broke `Pair<SymbolStr, TypeRef>` into a one-register argument with an
+///! unset half, which only the self-host build caught. Until the front end and
+///! LLVM are reconciled, `sizeof` on an over-aligned type overruns the object,
+///! so do not size a `mem::zero` or an array stride from it.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::AlignAttributeLayout;
+
+import std::core::result;
+
+import std::test::error;
+import std::test::assert;
+
+![align(64)]
+type struct CacheLine { a: u64; b: u64; }
+
+// No attribute of its own: it inherits 64-byte alignment through the member.
+type struct Holder { slots: CacheLine[8]; n: u32; }
+
+![test]
+function attribute_sets_size_and_alignment() -> Result<(), TestError> {
+    expect_eq(sizeof(CacheLine) as i64, 64)?;
+    return expect_eq(alignof(CacheLine) as i64, 64);
+}
+
+![test]
+function alignment_is_inherited_by_a_containing_struct() -> Result<(), TestError> {
+    expect_eq(alignof(Holder) as i64, 64)?;
+    // 8 slots of 64, plus `n` rounded up to the inherited 64.
+    return expect_eq(sizeof(Holder) as i64, 576);
+}
+
+// A global is an object placement too, and gets its boundary from the same
+// attribute; it is emitted by a different path from a local's stack slot.
+mut g_line: CacheLine;
+
+![test]
+function a_global_lands_on_the_declared_boundary() -> Result<(), TestError> {
+    g_line.a = 1;
+    return expect_eq(((&g_line as u64) % 64) as i64, 0);
+}
+
+![test]
+function a_local_lands_on_the_declared_boundary() -> Result<(), TestError> {
+    mut line: CacheLine;
+    line.a = 1;
+    return expect_eq(((&line as u64) % 64) as i64, 0);
+}

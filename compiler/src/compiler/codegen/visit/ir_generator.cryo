@@ -28,6 +28,7 @@ import Compiler::AST;
 import Compiler::AST::{ Node, Visitor, Expression, Statement, Declaration, Pattern };
 import Compiler::Lex;
 import Compiler::Resolver::{ SymbolStr, InternTable, QualifiedName, MangledName };
+import Compiler::Resolver::Res;
 import Utils::Logger;
 import std::collections::pair;
 import std::fmt::float;
@@ -1548,12 +1549,47 @@ public:
             return;
         }
 
-        // 2. Qualified scope lookup
+        // 2. Qualified scope lookup.
+        //
+        // One written segment can name a MODULE and a TYPE at once - a file's
+        // namespace leaf and a type declared in it routinely share a spelling
+        // (`Compiler::Bindgen::Importer` and `type Importer`) - and the member
+        // may belong to either: a module's free function, or a type's static.
+        // The segment alone therefore does not say where to look, and only the
+        // member's own existence settles it, so both owners are probed and
+        // whichever declares the member answers.  The module goes first, which
+        // is the language's rule for a qualifier position.
+        //
+        // The module's canonical namespace comes from the stamp the resolver
+        // wrote on the node.  It cannot be re-derived here: the lookup that
+        // serves the type case hands its input back unchanged when it fails, so
+        // `Helper` answering `Helper` is indistinguishable from a refusal, and
+        // the probe - now equal to the bare spelling already tried above - is
+        // skipped. A function used as a VALUE then leaves its slot unwritten
+        // rather than diagnosed.
+        const stamped_ns: SymbolStr =
+            node.scope_res.require("codegen: scope-resolution value").def_name();
+        if (stamped_ns.is_valid()) {
+            const combined_mod: string = format("%s::%s",
+                intern.resolve(stamped_ns), member_str);
+            const sym_mod: SymbolStr = intern.intern(combined_mod);
+            if (!sym_mod.equals(sym_bare)) {
+                fn_val = this.cg.functions.get(sym_mod);
+                if (!fn_val.is_valid()) {
+                    fn_val = this.cg.resolver.resolve_function(sym_mod);
+                }
+                if (fn_val.is_valid()) {
+                    this.state.last_value    = fn_val;
+                    this.state.last_is_lvalue = false;
+                    return;
+                }
+            }
+        }
+
         // Static methods are registered under their fully-qualified owner name
         // (e.g. `MyNS::Handler::greet_static`).  Resolve the scope name through
-        // the DI type map; the same approach the call-site path uses, and
-        // judged against the module that WROTE the path rather than the one
-        // being emitted.
+        // the DI type map, judged against the module that WROTE the path rather
+        // than the one being emitted.
         const resolved_scope: SymbolStr =
             this.cg.ctx.resolve_scoped_or_at(node.scope_name, node.span.file, FILE, LINE);
         const scope_str_qual: string    = intern.resolve(resolved_scope);

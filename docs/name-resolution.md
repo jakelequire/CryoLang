@@ -200,12 +200,15 @@ here; it is not a stylistic choice.
 Produced by the resolver, before types exist.
 
 ```
-Res = Unstamped            // no resolver has answered for this node
-    | Def(SymbolStr)       // a declaration or module, by canonical qualified name
+Res = Def(SymbolStr)       // a declaration or module, by canonical qualified name
     | Local(SymbolID)      // a local binding
     | GenericParam(SymbolStr)  // a type parameter, BY NAME
     | PrimTy(SymbolStr)    // a primitive
+    | TypeRelative         // the type layer owns the rest of this path
     | Err                  // resolution failed; diagnostic ALREADY emitted
+
+ResSlot = Pending          // no resolver has answered for this node
+        | Answered(Res)    // one has, including with a failure
 ```
 
 **`Def` carries a qualified name, not a `SymbolID`.** An earlier revision of
@@ -217,11 +220,26 @@ the interned qualified name, so a `SymbolID` stamp would have to be translated
 back at each use, re-deriving the thing the stamp exists to stop re-deriving.
 Decided 2026-08-11 with the first stamped lane (§8.5).
 
-**`Unstamped` is not "unresolved".** It means no resolver has claimed the node —
-which for a path-bearing node is a routing fact, not a failure: a first segment
-naming a *type* needs a receiver type and belongs to `TypeDependentRes` below.
-Reaching a stage that requires the stamp while still `Unstamped` is an ICE
-(§7.2 mechanism 4), never a licence to search.
+**`Res` has no variant meaning "missing", and that is the point.** Every
+variant is an answer, so a consumer holding one has nothing to branch on and
+nowhere to put a second strategy. Absence lives one type up, in `ResSlot`,
+where only the resolver can observe it — which makes "re-resolve it later"
+unwriteable rather than merely discouraged. A consumer reaches an answer only
+through `ResSlot::require`, which is total over `Res`: on `Pending` it records
+a bug and hands back `Err`.
+
+Reaching a stage that requires the stamp while still `Pending` is an internal
+error (§7.2 mechanism 4), never a licence to search. It is recorded rather than
+fatal — a compilation that already emitted a diagnostic may legitimately have
+skipped work, so the bug is reported only if the build otherwise succeeds.
+
+**`TypeRelative` is a positive claim of ownership, not a shrug.** The language
+says a path whose first segment names a *type* is finished by the type layer
+(`TypeDependentRes` below), which needs a receiver type and so cannot run here.
+It must never record that a lookup was attempted and failed — that is `Err`
+when the name layer is the authority, and a defect in the lookup when it is
+not. Laundering a tool's limitation into an ownership claim rebuilds the
+cascade under a better name.
 
 Two invariants:
 
@@ -4449,7 +4467,7 @@ unresolved, where inference already covers both.
   from that module's forward-declare sweep. Intra-module forward references are
   therefore safe, and cross-module ones follow the import DAG rather than
   directory order — but an import **cycle** has no valid order, so some
-  annotations stay `Unstamped` for a structural reason. Under §6.1 that is a
+  annotations stay `Pending` for a structural reason. Under §6.1 that is a
   routing fact and must not become a licence to search.
 
 #### Instrument landmine
@@ -4560,7 +4578,7 @@ That second bucket is the structural limit predicted from the pass order, now
 with a number on it: the export table is filled in module processing order, so
 a module whose declarer has not been walked yet cannot be answered. It is the
 import-cycle population, it is 4% of annotations, and it is the question that
-has to be answered before any consumer may treat `Unstamped` as an ICE rather
+has to be answered before any consumer may treat `Pending` as an ICE rather
 than as "the type layer still owns this one".
 
 ### 8.2al The 227 primitive spellings are synthesized receivers, not written names — MEASURED 2026-08-11
@@ -4652,7 +4670,7 @@ parameter cannot be spelled with a keyword.
 The remaining 106 are the twelve stdlib types of §8.2ak plus `()`. Nothing about
 the primitive population touched them, which is the point: they are a different
 defect, and the pass-order question in §8.2ak is still the one that gates any
-consumer treating `Unstamped` as an error.
+consumer treating `Pending` as an error.
 
 ### 8.3 B2, enumerated — MEASURED 2026-08-09
 
