@@ -1,0 +1,87 @@
+/// Namespace
+///
+/// Which index a path question is being asked about.
+///
+/// §5.2 requires `ns` to be a PARAMETER of one `resolve_path`, not a separate
+/// code path per kind.  Before this existed the compiler had no namespace
+/// concept at all: `SymbolKind` is a tag on a RESULT - it says what was found
+/// and cannot be passed to ask FOR something - so each kind grew its own lookup
+/// with its own scope, import and visibility rules, and they drifted.  The
+/// drift is measurable: the annotation lane answers zero leaf-index hits while
+/// sema's type lane answers hundreds, for the same question.
+///
+/// A namespace is a filter over `SymbolKind`, which is exactly what the
+/// per-kind lookups already hardcoded.  Making it an argument is what turns
+/// "resolve `Foo`" from a guess about which index to consult into a question
+/// with one answer.
+///
+/// `Import` is accepted by EVERY namespace, and deliberately so: an import
+/// binds whatever the exporting module bound, so the kind it stands for is not
+/// known until it is followed.  Filtering it out here would make an imported
+/// name unresolvable in the namespace it actually belongs to.
+
+namespace Compiler::Resolver::Namespace;
+
+import Compiler::Resolver::Symbol;
+
+/// The namespace a path is being resolved in.
+///
+/// Method and associated-item selection is deliberately absent.  That needs a
+/// receiver type and so cannot be answered here at all (§6.2); it is sema's,
+/// permanently, and giving it a variant would invite exactly the re-entry the
+/// pass/service split exists to stop.
+type enum Namespace {
+    /// Types, type aliases, generic parameters.
+    Type;
+    /// Values: variables, constants, parameters, enum variants.
+    Value;
+    /// Callables reached by name.
+    Function;
+}
+
+implement enum Namespace {
+    /// Whether a symbol of this kind can answer a path asked in this namespace.
+    accepts(&this, k: SymbolKind) -> boolean {
+        // An import stands in for whatever the exporting module bound, so it
+        // is a candidate in every namespace until it is followed.
+        match (k) {
+            SymbolKind::Import => { return true; }
+            _                  => { }
+        }
+        return match (this) {
+            Namespace::Type => {
+                match (k) {
+                    SymbolKind::Type         => { true }
+                    SymbolKind::TypeAlias    => { true }
+                    SymbolKind::GenericParam => { true }
+                    _                        => { false }
+                }
+            }
+            Namespace::Value => {
+                match (k) {
+                    SymbolKind::Variable    => { true }
+                    SymbolKind::Parameter   => { true }
+                    SymbolKind::Constant    => { true }
+                    SymbolKind::EnumVariant => { true }
+                    _                       => { false }
+                }
+            }
+            Namespace::Function => {
+                match (k) {
+                    SymbolKind::Function  => { true }
+                    SymbolKind::Method    => { true }
+                    SymbolKind::Intrinsic => { true }
+                    _                     => { false }
+                }
+            }
+        };
+    }
+
+    to_string(&this) -> string {
+        return match (this) {
+            Namespace::Type     => { "Type" }
+            Namespace::Value    => { "Value" }
+            Namespace::Function => { "Function" }
+        };
+    }
+}

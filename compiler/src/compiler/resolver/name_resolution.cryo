@@ -30,11 +30,16 @@ type class NameResolver : BaseASTVisitor {
 public:
     resolver: Resolver*;
     ctx:      CompilationContext*;
+    /// The method whose base-constructor initializer list is still unresolved,
+    /// set while descending into its function so the list can be resolved in
+    /// the parameter scope that only the function visitor opens.
+    pending_base_ctor: MethodNode*;
 
     NameResolver(resolver: Resolver*, ctx: CompilationContext*)
         : BaseASTVisitor() {
         this.resolver = resolver;
         this.ctx      = ctx;
+        this.pending_base_ctor = null;
     }
 
     /// Extract names and spans from GenericParamNode*[] and delegate to
@@ -278,6 +283,26 @@ public:
         }
         this.stamp_annotation(node.return_type_annotation);
 
+        // The base-constructor initializer list, if this function is the
+        // constructor one was written on.  Resolved here, after the parameters
+        // are declared and before the body, because that is the scope the
+        // language evaluates it in.  Every other consumer - sema, codegen,
+        // drop insertion, the substituter, the cloner - already walks these
+        // arguments; name resolution was the only pass that did not, so a path
+        // written in one reached codegen with nothing recorded.
+        if (this.pending_base_ctor != null
+                && this.pending_base_ctor.func == node) {
+            const owner: MethodNode* = this.pending_base_ctor;
+            // Cleared for the descent: an argument containing a lambda or a
+            // nested constructor call must not re-enter this branch and resolve
+            // the same list a second time.
+            this.pending_base_ctor = null;
+            for (mut i: i64 = 0; i < owner.base_ctor_args.length; i++) {
+                owner.base_ctor_args[i].accept(this);
+            }
+            this.pending_base_ctor = owner;
+        }
+
         // Visit body
         if (node.has_body()) {
             this.visit_block_contents(node.body);
@@ -288,7 +313,15 @@ public:
 
     override visit(node: MethodNode*) -> void {
         if (node.func != null) {
+            // A base-constructor initializer list is written outside the body
+            // but evaluated inside it: `: Base(kind, span)` reads the
+            // constructor's own parameters, so it has to be resolved with those
+            // in scope.  Handed to the function visitor rather than walked here
+            // because that is the one place the parameter scope is open, and
+            // opening a second one would put the same names in two scopes.
+            this.pending_base_ctor = node;
             node.func.accept(this);
+            this.pending_base_ctor = null;
         }
     }
 
@@ -595,8 +628,14 @@ public:
     /// one: asking again here would be the same question with a second answer.
     stamp_module_scope(&this, node: ScopeResolutionNode*,
                        binds_in_scope: boolean) -> void {
-        if (this.ctx == null || this.ctx.module_graph == null) { return; }
-        if (this.ctx.decl_index == null) { return; }
+        if (this.ctx == null || this.ctx.module_graph == null) {
+            ResolveCounter::Site::ScopeResUnanswerable.bump();
+            return;
+        }
+        if (this.ctx.decl_index == null) {
+            ResolveCounter::Site::ScopeResUnanswerable.bump();
+            return;
+        }
 
         // The use site comes from the syntax.  A span naming no module means
         // this node was synthesized, and a synthesizer that knows what it is
@@ -605,10 +644,16 @@ public:
         // what it cannot place.
         const use_ns: SymbolStr =
             this.ctx.module_ns_sym_of_file(node.scope_span.file);
-        if (!use_ns.is_valid()) { return; }
+        if (!use_ns.is_valid()) {
+            ResolveCounter::Site::ScopeResUnanswerable.bump();
+            return;
+        }
 
         const written: string = this.resolver.intern_table.resolve(node.scope_name);
-        if (written.length() == 0) { return; }
+        if (written.length() == 0) {
+            ResolveCounter::Site::ScopeResUnanswerable.bump();
+            return;
+        }
 
         mut found:   SymbolStr = SymbolStr::empty();
         mut other:   SymbolStr = SymbolStr::empty();
@@ -654,8 +699,8 @@ public:
         }
         if (visible > 1) {
             // Two modules the writer can see, both spelled this way: the
-            // spelling does not name one of them.  Left unstamped and counted
-            // rather than picked, because picking is the defect.
+            // spelling does not name one of them.  Never picked, because
+            // picking is the defect.
             ResolveCounter::Site::ScopeResAmbiguous.bump();
             const a: string = this.resolver.intern_table.resolve(found);
             const b: string = this.resolver.intern_table.resolve(other);
@@ -671,6 +716,12 @@ public:
                 d = d.with_note(
                     "write the path out in full to say which one is meant");
                 this.ctx.emit_diagnostic(d);
+                node.set_scope_res(Res::Err);
+            } else {
+                // The segment binds in scope, so it names a TYPE and the module
+                // spellings never applied to it.  No diagnostic was emitted, so
+                // `Err` would be a refusal nobody reported.
+                node.set_scope_res(Res::TypeRelative);
             }
             return;
         }
@@ -695,10 +746,40 @@ public:
                 d = d.with_note(
                     format("add `import %s;` to bring it into scope", owner));
                 this.ctx.emit_diagnostic(d);
+                node.set_scope_res(Res::Err);
+            } else {
+                // Binds in scope: a type wearing a module's spelling.  The
+                // module was never what this path named, so its unreachability
+                // is not this node's answer.
+                node.set_scope_res(Res::TypeRelative);
             }
             return;
         }
         ResolveCounter::Site::ScopeResNoModule.bump();
+        // No module in the program carries this spelling, so whatever the
+        // segment names is not a module and the rest of the path needs a
+        // receiver type.  That is the type layer's to finish, which is what
+        // `TypeRelative` asserts - and the assertion has to be earned per node
+        // rather than taken as the leftover case, or a lookup this pass simply
+        // could not perform gets recorded as somebody else's property.
+        //
+        // A segment that binds in the writer's scope names a type outright.
+        // One that binds to nothing still reaches here for two reasons that are
+        // equally type-owned - it spells a primitive, which owns members
+        // without being declared anywhere, or it is itself a path whose own
+        // last segment names the type - so the bucket is counted separately and
+        // every member of it is emitted by name.  A segment belonging to none
+        // of those would be a segment nothing in the program owns, and reading
+        // the stream is what tells the two apart; a bare tally cannot.
+        if (binds_in_scope) {
+            ResolveCounter::Site::ScopeResTypeScope.bump();
+        } else {
+            ResolveCounter::Site::ScopeResNoBind.bump();
+            ResolveCounter::path_hit(
+                "SCOPE-RES-NOBIND", this.resolver.intern_table.resolve(use_ns),
+                written, node.scope_span.to_string());
+        }
+        node.set_scope_res(Res::TypeRelative);
     }
 
     /// Stamp every `Named` node in a type-annotation tree.
@@ -781,8 +862,39 @@ public:
         // answer and a refusal are the same value; counted here and left
         // unstamped rather than recorded on a reading the function cannot
         // support.
+        // A path's meaning turns on its first segment: that one resolves in
+        // scope, and every later segment resolves inside whatever it named.  So
+        // the question here is not "does this whole string name something" but
+        // "who owns the rest of it".  A first segment naming a type - including
+        // a generic parameter, whose associated items are reached through its
+        // bound - hands the remainder to the type layer, which is what
+        // `TypeRelative` states.  `I::Item` is that case and cannot be anything
+        // else: no module is named `I`, so a refusal here would report a
+        // failure the name layer has no standing to report.
         if (this.resolver.contains_separator(written)) {
             ResolveCounter::Site::AnnResQualified.bump();
+            const head: string = QualifiedName::head_of(written);
+            const head_sym: SymbolID = this.resolver.lookup(
+                this.resolver.intern_table.intern(head),
+                this.resolver.current_scope);
+            if (head_sym.is_valid()) {
+                const hs: Symbol = this.resolver.get_symbol(head_sym);
+                if (hs.kind == SymbolKind::GenericParam
+                        || hs.kind == SymbolKind::Type) {
+                    n.res.answer(Res::TypeRelative);
+                    ResolveCounter::Site::AnnResTypeRelative.bump();
+                    return;
+                }
+            }
+            // The first segment names neither a type nor a generic parameter,
+            // so this is a module path and belongs to the module lane - which
+            // has no entry point here that can refuse.  Left unstamped and
+            // named, because recording an answer this pass cannot produce is
+            // how a tool limitation becomes a claim.
+            ResolveCounter::path_hit(
+                "ANN-QUALIFIED", this.resolver.intern_table.resolve(
+                    this.ctx.module_ns_sym_of_file(n.span.file)),
+                written, n.span.to_string());
             return;
         }
 

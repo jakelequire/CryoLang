@@ -168,6 +168,7 @@ help:
 	@echo "  make test              Run the repo-level test suite (tests/) via cryo test"
 	@echo "  make test-list         List the discovered test cases without running them"
 	@echo "  make b1-check          Pin the B1 fuzzy-fallback bucket against its golden"
+	@echo "  make lane-check        Pin the resolution-lane surface against its golden"
 	@echo "  make api-index         Regenerate docs/stdlib-api.txt (the stdlib API index)"
 	@echo "  make api-index-check   Fail if docs/stdlib-api.txt is stale"
 	@echo "                         (name-resolution cascade regrowth gate;"
@@ -500,6 +501,18 @@ roster-check: $(STAGE2) $(LIBCRYO_A) $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A)
 b1-check: $(STAGE2) $(LIBCRYO_A) runtime-tiers
 	@python3 scripts/b1-gate.py "$(STAGE2)" $(ARGS)
 endif
+
+# ---- resolution-lane surface ratchet -----------------------------------
+# Pins the count of direct per-kind lookup call sites and of get_resolver()
+# re-entries (docs/name-resolution.md §7.2 mechanism 5).  Privatization cannot
+# stop a NEW public wrapper and deletion cannot stop a reintroduced helper;
+# only a ratchet catches growth.
+#
+# Unlike b1-check this needs no compiler, no stdlib and no link: it counts call
+# sites in the source, so it runs on a fresh clone in under a second and has no
+# per-host golden.
+lane-check:
+	@$(PYTHON) scripts/lane-gate.py $(ARGS)
 
 # ---- stdlib API index --------------------------------------------------
 # Regenerate docs/stdlib-api.txt, the one-file answer to "does this already

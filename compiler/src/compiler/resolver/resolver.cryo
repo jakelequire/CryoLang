@@ -9,6 +9,8 @@ namespace Compiler::Resolver::Resolver;
 
 import Compiler::Resolver;
 import Compiler::Resolver::{ SymbolID, SymbolStr, InternTable, Symbol, Scope, ResolutionMap };
+import Compiler::Resolver::Res;
+import Compiler::Resolver::Namespace;
 import Compiler::Diag;
 import Compiler::Diag::SourceSpan;
 import Compiler::ResolveCounter;
@@ -673,25 +675,20 @@ type struct Resolver {
     /// every nested resolution underneath it.
     resolve_type_qualified_name_bare_from(&this, start: ScopeID,
                                           name: SymbolStr) -> SymbolStr {
-        // 1. Walk scope chain from `start` for Type/TypeAlias/Import symbols.
-        mut scope_id: ScopeID = start;
-        while (scope_id.is_valid()) {
-            const scope: Scope* = this.get_scope(scope_id);
-            const found: SymbolID = scope.find(name);
-            if (found.is_valid()) {
-                const sym: Symbol = this.get_symbol(found);
-                if (sym.kind == SymbolKind::Type ||
-                    sym.kind == SymbolKind::TypeAlias ||
-                    sym.kind == SymbolKind::Import) {
-                    // Construct qualified name from symbol's module
-                    const resolved: string = this.intern_table.resolve(sym.name);
-                    if (sym.source_module != "") {
-                        return this.intern_table.intern(sym.source_module + "::" + resolved);
-                    }
-                    return sym.name;
-                }
-            }
-            scope_id = scope.parent_id;
+        // 1. The scope walk, asked in the TYPE namespace.
+        //
+        // A generic parameter is a type-namespace answer that has no qualified
+        // form - it names itself, never what a call site binds it to - so the
+        // primitive reports it and this projection, whose result type is a
+        // qualified name, has nothing to hand back for it.  Callers that need
+        // to tell "no answer" from "answered, and it is a parameter" read the
+        // `Res` instead of this string.
+        mut segs: SymbolStr[] = [];
+        segs.push(name);
+        const r: Res = this.resolve_path(&segs, Namespace::Type, start);
+        match (r) {
+            Res::Def(q) => { return q; }
+            _           => { }
         }
 
         // 2. Check import aliases.
@@ -717,6 +714,69 @@ type struct Resolver {
 
         // 3. Not found
         return SymbolStr::empty();
+    }
+
+
+    /// THE path-resolution entry point (§5.2).
+    ///
+    /// `ns` is a parameter rather than a separate function per kind, and that is
+    /// the whole point: every per-kind lookup in this compiler re-derived the
+    /// scope and import rules for itself, so they drifted, and the cascade grew
+    /// in whichever lane was cheapest to extend next.  A namespace is a filter
+    /// over `SymbolKind` - which those lookups already hardcoded - so making it
+    /// an argument costs nothing and makes "resolve `Foo`" a question with one
+    /// answer instead of a guess about which index to consult.
+    ///
+    /// `scope` is explicit, with no ambient-cursor default.  The largest
+    /// answering step this cascade ever had existed solely to correct a cursor
+    /// pointing at the wrong module; given the writer's scope there is nothing
+    /// for such a step to correct.
+    ///
+    /// §5.1's rule decides the shape: only the FIRST segment resolves in scope,
+    /// and everything after it is resolved within whatever that named.  So a
+    /// multi-segment path whose head names a type is finished by the type layer,
+    /// which is what `TypeRelative` claims.
+    resolve_path(&this, segments: &SymbolStr[], ns: Namespace,
+                 scope: ScopeID) -> Res {
+        if (segments.length == 0) { return Res::Err; }
+
+        // The head, in scope.  Walking outward is the rib chain: an inner tier
+        // shadows the outer one, and the first acceptable binding wins.
+        const head: SymbolStr = segments[0];
+        mut scope_id: ScopeID = scope;
+        while (scope_id.is_valid()) {
+            const sc: Scope* = this.get_scope(scope_id);
+            const found: SymbolID = sc.find(head);
+            if (found.is_valid()) {
+                const sym: Symbol = this.get_symbol(found);
+                if (ns.accepts(sym.kind)) {
+                    // A parameter names ITSELF.  Substitution happens strictly
+                    // below this, in the type layer, which is what lets a `Res`
+                    // be copied verbatim by `ASTCloner`.
+                    if (sym.kind == SymbolKind::GenericParam) {
+                        if (segments.length > 1) { return Res::TypeRelative; }
+                        return Res::GenericParam(sym.name);
+                    }
+                    // The remainder is rooted in what the head named; a type
+                    // owner needs a receiver type, so it is not finishable here.
+                    if (segments.length > 1) { return Res::TypeRelative; }
+                    const resolved: string = this.intern_table.resolve(sym.name);
+                    if (sym.source_module != "") {
+                        return Res::Def(this.intern_table.intern(
+                            sym.source_module + "::" + resolved));
+                    }
+                    return Res::Def(sym.name);
+                }
+            }
+            scope_id = sc.parent_id;
+        }
+
+        // Nothing in scope bound the head.  Reported as `Err` WITHOUT a
+        // diagnostic only because every caller today projects this back into
+        // its own not-found path and diagnoses there; the moment a caller reads
+        // the `Res` directly, the diagnostic belongs here, since this is the
+        // only place that knows which namespace was asked and from where.
+        return Res::Err;
     }
 
 

@@ -4971,6 +4971,196 @@ stated position and lets that function be deleted rather than fed. Recorded
 here because a payload-free marker was briefly adopted on 2026-08-13 before
 this section existed; the spec is normative and the code is the defect.
 
+### 8.6 The scope lane answers at every exit, and the flush found the gap the plan had not — MEASURED 2026-08-13
+
+`stamp_module_scope` now answers on every classified exit, `pending_bug_count()`
+is wired to `E0900` on an otherwise-successful build, and the surface ratchet
+(§7.2 mechanism 5's third lock) is wired as `make lane-check`. B1 is unmoved at
+**753** throughout, which is the point: none of this changes what resolves, it
+changes what is *recorded* and what is *enforceable*.
+
+#### `binds_in_scope` is not the discriminator, and the 1,199 is not one bucket
+
+The exit that had been described as a single "not a module scope" population of
+1,199 splits **1,166 / 33**, and the 33 are the interesting half:
+
+| the segment | count | why it is still type-owned |
+|---|---:|---|
+| binds in the writer's scope | 1,166 | names a type outright |
+| a primitive spelling (`i64::`, `u64::`, `u128::`, `i16/i32/u32`) | 23 | owns members without being declared in any scope |
+| a path (`libc::Whence::`, `syscall::Syscall::`) | 10 | its own last segment names the type |
+
+All 1,199 are genuinely `TypeRelative`, so the mapping proposed for them was
+right — but it was right for a reason no one had measured, and `binds_in_scope`
+alone would have justified only 1,166 of them. The three-way split is kept as
+counters, and every member of the non-binding bucket is emitted by name, so a
+*fourth* case — a segment nothing in the program owns — shows up as a line
+rather than joining a bucket that already has an owner's name on it. That is the
+difference between earning the ownership claim and defaulting to it.
+
+#### The four "qualified spellings" were never module paths
+
+§8.2ak's remaining hard case was described as 4 qualified annotation spellings
+needing a lookup that can refuse. Read off the audit stream, **all four are
+`I::Item`** in `stdlib/core/iter.cryo` — an associated type on a generic
+parameter bound by `Iterator`. There is no module `I`, so `Err` would have been
+a refusal the name layer has no standing to issue and `Def` was never available.
+They are §5.3's case exactly, and they now stamp `TypeRelative`.
+
+The general rule is §5.1's and needs no per-name knowledge: a path's first
+segment is the only one resolved in scope, so *who owns the rest* is decided by
+what that segment names. A first segment naming a type or a generic parameter
+hands the remainder to the type layer. The module-path branch is left unstamped
+and emitted by name, because the entry point that could refuse for it does not
+exist yet — recording an answer that cannot be produced is how a tool limitation
+becomes a claim.
+
+#### The unit receiver was a parser defect, not a missing primitive
+
+The single unstamped bare name was `()`, from `implement trait Drop for ()`.
+`ASTTypeSubstituter::rewrite_to_unit` already states the governing rule — the
+unit type "is not a Named type and cannot survive as `Named("()")` through the
+resolver" — and the receiver synthesis violated it because it types `&this` from
+the impl target's TEXT rather than its syntax. §8.2al repaired the keyword half
+of that same defect; `()` survived only because it is not a keyword. The
+synthesis now builds the empty-tuple annotation a written `()` produces, so the
+node stops existing rather than being taught a spelling: offered annotations
+2,452 → 2,451, unstamped 1 → 0.
+
+#### Mechanism 4's corollary was unimplemented, and the flush is what said so
+
+With the exits closed, `E0900` fired on the first build — one node reaching
+codegen with nothing recorded. **No synthesizer anywhere set `scope_res`**: the
+corollary that "a pass that synthesizes a path-bearing node must construct it
+with its `Res` already set" was written and never carried out, and the tally had
+no way to show it because an unstamped synthesized node is indistinguishable
+from an unvisited one until something *requires* the answer. Seven sites in
+`sema`, `async_lower` and `call_resolver` synthesize `Type::member` paths
+(`Option::None`, `Poll::Ready`, `Poll::Pending`, `Executor::new`,
+`Slice::from_raw`, the `?` desugar's `Err` arm, the converter callee); every one
+now records `TypeRelative`, which it knows by construction.
+
+Only one of the seven was reaching a `require`, so a fix aimed at the failing
+node would have left six live and the gate green. The delayed bug is worth more
+than the one diagnostic it produced.
+
+#### The ratchet's inputs are 134 and 8, not 137 and 9
+
+`make lane-check` pins direct per-kind lookup call sites and `get_resolver()`
+re-entries, per file, both ratcheting downward with `--update` to re-pin. The
+raw greps read 137 and 9; the pinned numbers are **134** and **8**, because a
+grep-shaped gate has two ways to pin a number that is not a call site:
+
+- **a commented-out call** — `instance.cryo` carries a commented
+  `ctx.get_resolver()`, so pinning 9 would score deleting a real call while
+  leaving the comment as progress, and uncommenting it as clean;
+- **the owner's own calls** — `decl_index.cryo` defines the five lookups and
+  calls them twice internally, which is not the surface other stages reach for.
+
+Unlike `b1-gate.py` this measures the SOURCE, not a build, so it has no
+per-host sections (the same tree answers identically everywhere), needs no
+compiler or link, and runs on a fresh clone in under a second. It was made to
+fail on a simulated increase, a simulated decrease, and a vanished row before
+being trusted, and the golden needs the same `.gitignore` negation the B1 golden
+does.
+
+### 8.7 `resolve_path` exists, and the namespace was hiding in a kind filter — MEASURED 2026-08-13
+
+`Namespace` (`resolver/namespace.cryo`) and
+`Resolver::resolve_path(segments, ns, scope) -> Res` now exist, and
+`resolve_type_qualified_name_bare_from` is their first caller. B1 is 753 and
+**every counter row is byte-identical** to the measurement before the change,
+which is the whole assertion: this moves no answers, it gives the question a
+shape.
+
+**The namespace was already in the code, hardcoded as a symbol-kind filter.**
+`resolve_type_qualified_name_bare_from`'s scope walk accepted
+`Type | TypeAlias | Import` and nothing else. That test *is* a namespace; §8.5's
+"there is no namespace concept in the compiler" is true of the vocabulary and
+false of the behaviour — every lane had one, written inline, which is precisely
+why they could drift apart without anything looking wrong at a call site.
+Turning the filter into an argument therefore costs nothing at the call sites
+that already agreed with it, and the lanes that disagreed become visible as
+disagreement rather than as separate functions.
+
+Two consequences worth recording:
+
+- **`Import` is accepted in every namespace.** An import stands in for whatever
+  the exporting module bound, so its kind is unknown until it is followed;
+  filtering it per namespace would make an imported name unresolvable in the
+  namespace it really belongs to.
+- **A generic parameter is a type-namespace answer with no qualified form.** It
+  names itself (§6.1), so `resolve_path` reports `GenericParam` while the
+  projection back to a qualified-name string has nothing to hand back. The
+  string-returning caller treats that exactly as it treated "not found", which
+  is what keeps the refactor behaviour-free; a caller that needs to tell the two
+  apart reads the `Res`.
+
+**`lookup_method_return` is deliberately NOT routed through the primitive.**
+§7.2 mechanism 5 lists it among the five, but §6.2 says method and
+associated-item selection cannot move into the resolver, and §6.2 is the section
+that is right about it: `lookup_method_return(type_sym, method_sym)` is handed an
+already-resolved type plus a member, which is `TypeDependentRes`, not a path.
+It is still privatized with the others — privatization is about stopping direct
+calls from `sema`/`mono`/`codegen`, and that applies whatever answers underneath
+— but its answer stays sema's. Decided 2026-08-13 with the owner; recorded here
+because mechanism 5's flat list of five reads as though all five are the same
+kind of question, and they are not.
+
+The remaining four are not yet routed either, and the reason is structural
+rather than a matter of effort: they return a `TypeRef` read out of a
+`DeclarationIndex` map by string key, and they take **no scope**. §5.2's `scope`
+is not optional, so giving them the primitive means giving every call site a
+scope to pass — which is the call-site migration, not a wrapper. The primitive
+landing first is what makes that migration mechanical instead of exploratory.
+
+### 8.8 Name resolution never walked a base-constructor initializer list — FIXED 2026-08-13
+
+With mechanism 4 wired, the first self-host attempt failed at stage 6 of 8 —
+the stage-2 compiler could not build the compiler — on
+`E0900: 92 path-bearing node(s) reached a stage requiring name resolution with
+no Res recorded`.
+
+All 92 were the same construct: a `ScopeResolutionNode` inside a **base-class
+initializer list**, `VoidType(id: u64) : Type(id, TypeKind::Void)`.
+`MethodNode.base_ctor_args` is walked by sema, codegen, drop insertion, the
+substituter, the cloner and the dumper. `resolver/name_resolution.cryo` was the
+only pass that did not walk it, so every path written in an initializer list
+reached codegen unresolved and was answered from its spelling.
+
+The list is written outside the body and evaluated inside it — the arguments
+read the constructor's own parameters — so it is resolved in the function
+visitor, after the parameters are declared and before the body, which is the one
+place that scope is open. Walking it from the method visitor instead would have
+had to open a second scope holding the same parameter names.
+
+#### Two things this says about the instruments, both worth more than the fix
+
+**The B1 corpus cannot see this defect at all.** Every counter row over
+`examples/09-json-config` is byte-identical before and after the fix — 293 /
+1,199 / 1,166 / 33, B1 = 753 — because that corpus and the stdlib it compiles
+use structs and free functions, while class inheritance with initializer lists
+is concentrated in the compiler's own AST and type hierarchies. A prediction
+that the stamp rows would rise was made before measuring and was wrong, for
+exactly the reason §8.2g already recorded about the keystone: the population is
+the compiler, and the corpus is not it.
+
+**Only the delayed bug could have found it.** An unstamped node is
+indistinguishable from an unvisited one until something *requires* the answer,
+so no tally over any corpus would have shown 92 missing answers — it would have
+shown 92 nodes that were simply never counted. `require` is what converts a
+silent absence into a number, and self-host is what supplied a population big
+enough to contain one. This is the concrete case for §7.2 mechanism 4 being an
+error rather than a warning: as a warning it would have printed 92 lines into a
+log that already prints 331 warnings, and the fixed point would still have been
+green.
+
+It also re-states landmine 4 in a sharper form. `make cryo` compiles new sources
+with the PIN, so a check newly added to the compiler never runs over the
+compiler's own modules; `make test` runs the new compiler over the test tree,
+which does not contain this construct in quantity. Both were green while the
+self-host was broken.
+
 ---
 
 ## 9. Open questions
