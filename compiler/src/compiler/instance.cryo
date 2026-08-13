@@ -23,6 +23,7 @@ import Compiler::Codegen::{
 import Compiler::Resolver::{
     InternTable, SymbolStr, MangledName
 };
+import Compiler::Resolver::Res;
 import Compiler::AST::{ Node, Declaration, Dumper };
 import Compiler::Deps::DepResolver;
 import Compiler::Deps::Lockfile;
@@ -2582,6 +2583,30 @@ type struct CompilerInstance {
         // necessarily wired up (the LSP, for one, gets `NULL`).  The
         // language server reads `ctx.diagnostics.diagnostics` directly
         // and emits them as JSON over stdout.
+
+        // A stage required a node's `Res` and no resolver had written one.
+        // That is an internal error rather than a licence to search: the
+        // consumer was handed `Err` and stopped, so whatever was built below it
+        // rests on a refusal nobody diagnosed.
+        //
+        // Raised only when nothing else failed.  A build that already emitted
+        // an error may legitimately have skipped the pass that would have
+        // written the answer, and a second, misleading error would bury the
+        // real one.  It has to precede the flush below, or the diagnostic lands
+        // in a buffer nothing prints.
+        //
+        // Tallies are per-process, so a `require` reached inside a forked
+        // codegen child is not represented here.
+        // Spelled in full because the namespace `Compiler::Resolver::Res` and
+        // the enum `Res` it declares share a spelling, and a bare `Res::`
+        // qualifier binds the type.
+        const pending: u64 = Compiler::Resolver::Res::pending_bug_count();
+        if (!ctx.diagnostics.has_errors() && pending > 0) {
+            ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
+                format("%llu path-bearing node(s) reached a stage requiring name resolution with no `Res` recorded; first required at %s",
+                    pending, Compiler::Resolver::Res::pending_bug_first_site()));
+        }
+
         const skip_flush: boolean = match (ctx.mode) {
             CompileMode::Lsp => { true }
             _                => { false }
