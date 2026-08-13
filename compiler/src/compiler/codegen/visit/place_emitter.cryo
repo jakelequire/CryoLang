@@ -146,37 +146,11 @@ type struct PlaceEmitter {
             const st: StructType* = t as StructType*;
             field_idx = st.field_index(member);
         } else if (tk == TypeKind::Class) {
-            // Classes are flattened at struct-layout time (see `map_class`):
-            //   [ vtable ptr, if any ancestor has virtual methods ]
-            //   [ root class's fields, then each derived class's fields in order ]
-            //   [ this class's own fields ]
-            // Walk the base chain root-first and sum field counts to get the
-            // absolute slot index.
-            const cls: ClassType* = t as ClassType*;
-            mut chain: ClassType*[] = [];
-            mut any_virtual: boolean = false;
-            mut walk: ClassType* = cls;
-            mut depth: i32 = 0;
-            while (walk != null && depth < 16) {
-                chain.push(walk);
-                if (walk.has_virtual_methods) { any_virtual = true; }
-                if (!walk.has_base || !walk.base_class.is_valid()) { break; }
-                const base_t: Type* = this.cg.lookup_type_by_id(walk.base_class.id);
-                if (base_t == null || base_t.kind != TypeKind::Class) { break; }
-                walk = base_t as ClassType*;
-                depth += 1;
-            }
-
-            mut cumulative: i64 = if (any_virtual) { 1 } else { 0 };
-            for (mut ci: i64 = chain.length - 1; ci >= 0; ci--) {
-                const link: ClassType* = chain[ci];
-                const local_idx: i64 = link.field_index(member);
-                if (local_idx >= 0) {
-                    field_idx = cumulative + local_idx;
-                    break;
-                }
-                cumulative += link.fields.length;
-            }
+            // A class body is flattened - vtable slot, then ancestors' fields,
+            // then its own - so a member's slot is not its index in any one
+            // field list.  `member_element_index` owns that arithmetic and is
+            // the same routine the body was built from.
+            field_idx = this.cg.type_mapper.member_element_index(t, member);
         } else if (tk == TypeKind::Array) {
             const arr_t: ArrayType* = t as ArrayType*;
             const length_sym: SymbolStr = this.cg.intern_str("length");
@@ -257,14 +231,30 @@ type struct PlaceEmitter {
         // an rvalue.  Under opaque pointers an actual pointer has kind
         // Pointer, so checking for Struct here is unambiguous.
         const obj_llvm_ty: void* = llvm::LLVMTypeOf(obj_ptr.raw);
+        // From here on the index addresses the BODY, not the field list: a
+        // struct's fields can be separated by alignment padding elements.  A
+        // class member already arrived as a body slot (see above); a tuple
+        // slot and the dynamic-array header are their own element order.
+        mut elem_idx: i64 = field_idx;
+        if (tk == TypeKind::Struct) {
+            elem_idx = this.cg.type_mapper.field_element_index(t, field_idx);
+            if (elem_idx < 0) {
+                this.cg.diag.emit_error_at_span(ErrorCode::E0622_MEMBER_ACCESS_ERROR,
+                    "codegen: member access: field has no slot in the emitted layout",
+                    site_span);
+                this.state.last_value = LValue::null();
+                this.state.last_is_lvalue = false;
+                return;
+            }
+        }
         if (obj_llvm_ty != null && LType::kind_of(obj_llvm_ty) == LTypeKind::Struct) {
             this.state.last_value = this.cg.builder.build_extract_value(
-                obj_ptr, field_idx as u32, "fieldval");
+                obj_ptr, elem_idx as u32, "fieldval");
             this.state.last_is_lvalue = false;
             return;
         }
         const gep: LValue = this.cg.builder.build_struct_gep(struct_ty, obj_ptr,
-                                                          field_idx as u32, "fieldptr");
+                                                          elem_idx as u32, "fieldptr");
         this.state.last_value = gep;
         this.state.last_is_lvalue = true;
     }

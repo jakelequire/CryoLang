@@ -8,11 +8,11 @@
 ///! size, because otherwise `sizeof` reports a number larger than the object
 ///! and an array stride or a `mem::zero` sized from it runs past the end.
 ///!
-///! Deliberately untested here, because it does not hold: a field of an
-///! over-aligned type does not start on its own boundary inside a containing
-///! struct. Inter-field padding is not emitted, so `offsetof` a 64-aligned
-///! member can be 8. Reproducing it renumbers LLVM element indices, which
-///! every GEP site reads.
+///! Both halves are supplied through one routine: `TypeMapper` decides which
+///! element of a body holds field N, and the body builder, every field GEP and
+///! every constant aggregate read their answer from it - so a filler inserted
+///! for alignment cannot shift a field out from under the index used to
+///! address it.
 
 ![config(testing)]
 namespace CryoTests::Tests::Lang::AlignAttributeLayout;
@@ -78,4 +78,58 @@ function an_inherited_alignment_widens_the_container_too() -> Result<(), TestErr
     holders[0].n = 1;
     const stride: u64 = (&holders[1] as u64) - (&holders[0] as u64);
     return expect_eq(stride as i64, sizeof(Holder) as i64);
+}
+
+// An over-aligned type keeps its alignment wherever it appears, including as a
+// member placed after another field: the body carries an explicit padding
+// element so the member starts on its declared boundary, which is what the
+// front end already computed the offset to be and what every other compiler
+// produces for the same declaration. Without the padding the member sits at
+// its natural offset and `![align(N)]` silently means "assume, but do not
+// arrange" for exactly this placement.
+type struct TrailingLine { tag: u8; line: CacheLine; }
+
+![test]
+function an_over_aligned_member_starts_on_its_boundary() -> Result<(), TestError> {
+    mut t: TrailingLine;
+    t.tag = 1;
+    const off: u64 = (&t.line as u64) - (&t as u64);
+    expect_eq(off as i64, 64)?;
+    return expect_eq((((&t.line as u64) % 64) == 0) as i64, 1);
+}
+
+// The padding shifts every later field to a new element of the body. A GEP
+// that still counted fields instead of elements would land on the padding and
+// write through it, so this is the check that the index and the layout agree.
+![test]
+function writing_across_the_padding_hits_the_right_fields() -> Result<(), TestError> {
+    mut t: TrailingLine;
+    t.tag = 0x5A;
+    t.line.a = 0xDEADBEEF;
+    t.line.b = 0xC0FFEE;
+    expect_eq(t.tag as i64, 0x5A)?;
+    expect_eq(t.line.a as i64, 0xDEADBEEF)?;
+    return expect_eq(t.line.b as i64, 0xC0FFEE);
+}
+
+// Same layout reached through a literal rather than field-by-field stores:
+// the literal emitter resolves each field to a body slot through the same
+// mapping the body was built from.
+![test]
+function a_literal_initialises_every_field_across_the_padding() -> Result<(), TestError> {
+    const t: TrailingLine = TrailingLine { tag: 9, line: CacheLine { a: 11, b: 22 } };
+    expect_eq(t.tag as i64, 9)?;
+    expect_eq(t.line.a as i64, 11)?;
+    return expect_eq(t.line.b as i64, 22);
+}
+
+// sizeof must still describe the whole object: the member's boundary is paid
+// for out of inter-field padding, and the tail is rounded to the alignment.
+![test]
+function the_container_is_sized_and_strided_to_match() -> Result<(), TestError> {
+    mut pair: TrailingLine[2];
+    pair[0].tag = 1;
+    const stride: u64 = (&pair[1] as u64) - (&pair[0] as u64);
+    expect_eq(sizeof(TrailingLine) as i64, 128)?;
+    return expect_eq(stride as i64, sizeof(TrailingLine) as i64);
 }

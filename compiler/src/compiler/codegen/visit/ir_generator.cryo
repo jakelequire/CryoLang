@@ -877,14 +877,19 @@ public:
                 }
             }
             if (field_idx < 0) { continue; }
+            // `fields_arr` is the type's own field list; the body it is read
+            // out of carries a class's vtable slot and inherited fields ahead
+            // of it, and alignment padding between fields.
+            const slot: i64 = this.cg.type_mapper.field_element_index(ty, field_idx);
+            if (slot < 0) { continue; }
 
             mut field_val: LValue = LValue::null();
             if (src_is_struct_value) {
                 field_val = this.cg.builder.build_extract_value(
-                    src_val, field_idx as u32, "destruct.field");
+                    src_val, slot as u32, "destruct.field");
             } else {
                 const field_ptr: LValue = this.cg.builder.build_struct_gep(
-                    struct_lty, src_val, field_idx as u32, "destruct.fieldptr");
+                    struct_lty, src_val, slot as u32, "destruct.fieldptr");
                 const field_lty: LType = this.cg.type_mapper.map_type(b.resolved_type);
                 if (!field_lty.is_valid()) { continue; }
                 field_val = this.cg.builder.build_load(field_lty, field_ptr, "destruct.fieldval");
@@ -1134,7 +1139,7 @@ public:
             const st: StructType* = t as StructType*;
             for (mut sfi: i64 = 0; sfi < st.fields.length; sfi++) {
                 fields.push(st.fields[sfi]);
-                field_slot.push(sfi);
+                field_slot.push(this.cg.type_mapper.field_element_index(t, sfi));
             }
         } else if (t != null && t.kind == TypeKind::Class) {
             const cls: ClassType* = t as ClassType*;
@@ -1152,14 +1157,14 @@ public:
                 walk = base_t as ClassType*;
                 depth += 1;
             }
-            // Walk root -> derived so slot indices match `map_class:458-468`.
-            mut slot_idx: i64 = if (any_virtual) { 1 } else { 0 };
+            // Root -> derived, the order the flattened body is built in; each
+            // slot comes from the routine that built it rather than from a
+            // second count kept in step here.
             for (mut ci: i64 = chain.length - 1; ci >= 0; ci--) {
                 const link: ClassType* = chain[ci];
                 for (mut li: i64 = 0; li < link.fields.length; li++) {
                     fields.push(link.fields[li]);
-                    field_slot.push(slot_idx);
-                    slot_idx += 1;
+                    field_slot.push(this.cg.type_mapper.class_field_element_index(cls, link, li));
                 }
             }
         }

@@ -542,6 +542,7 @@ type struct CodegenPasses {
         mut disagree:  i64 = 0;
         mut align_dis: i64 = 0;
         mut padded_n:  i64 = 0;
+        mut offset_dis: i64 = 0;
         for (mut i: i64 = 0; i < arena.types.length; i++) {
             const t: Type* = arena.types[i];
             if (t == null) { continue; }
@@ -592,19 +593,6 @@ type struct CodegenPasses {
             }
 
             examined += 1;
-            // A body LARGER than its own field list carries the tail padding
-            // that reproduces a declared `![align(N)]`; a body SMALLER than
-            // its field list is an identified struct reused under a mangled
-            // name a different field list already claimed.
-            const padded: boolean = lit_size != 0 && lit_size < llvm_size;
-            if (padded) { padded_n += 1; }
-            const size_ok: boolean = fe_size == llvm_size;
-            const body_ok: boolean = lit_size == 0 || lit_size == llvm_size || padded;
-            const agrees:  boolean = size_ok && body_ok;
-            if (!agrees) { disagree += 1; }
-            if (t.alignment() != llvm_align) { align_dis += 1; }
-            if (agrees && !padded && t.alignment() == llvm_align && !audit_all) { continue; }
-
             mut name:      string = "<anon>";
             mut min_align: u64    = 0;
             mut nargs:     i64    = 0;
@@ -620,6 +608,60 @@ type struct CodegenPasses {
                 name      = ctx.intern_table.resolve(cl.qualified_name);
                 min_align = cl.min_alignment;
             }
+
+            // WHERE each field lives, not just how big the type is.  Size and
+            // alignment can both agree while the offsets do not: an
+            // over-aligned member is placed by the front end on its declared
+            // boundary, and if the body does not carry a filler in front of it
+            // the tail padding hides the difference in the total.  The element
+            // index comes from `field_element_index` - the same routine the
+            // body was built from and every field GEP addresses through - so
+            // this compares the mapping against LLVM's own layout rather than
+            // re-deriving it.  A class is checked on its OWN fields: an
+            // ancestor's recorded offset is relative to that ancestor's
+            // layout, and every class is audited in its own right anyway.
+            mut off_bad: i64 = 0;
+            {
+                const empty_fields: FieldInfo[] = [];
+                mut fields_ref: &FieldInfo[] = &empty_fields;
+                mut skip: boolean = false;
+                if (t.kind == TypeKind::Struct) {
+                    const st1: StructType* = t as StructType*;
+                    if (st1.is_union) { skip = true; }
+                    fields_ref = &st1.fields;
+                } else {
+                    fields_ref = &(t as ClassType*).fields;
+                }
+                const n_elems: i64 = llvm::LLVMCountStructElementTypes(mapped.raw) as i64;
+                if (!skip) {
+                    for (mut fi: i64 = 0; fi < (*fields_ref).length; fi++) {
+                        const slot: i64 = cg.type_mapper.field_element_index(t, fi);
+                        if (slot < 0 || slot >= n_elems) { continue; }
+                        const want: u64 = (*fields_ref)[fi].offset;
+                        const got:  u64 = cg.llvm_module.offset_of_element(mapped, slot as u32);
+                        if (want != got) {
+                            off_bad += 1;
+                            fmt::eprintf("LAYOUT-OFF module=%s type=%s field=%lld slot=%lld fe_offset=%llu llvm_offset=%llu\n",
+                                   module_name, name, fi, slot, want, got);
+                        }
+                    }
+                }
+            }
+            if (off_bad > 0) { offset_dis += 1; }
+
+            // A body LARGER than its own field list carries the tail padding
+            // that reproduces a declared `![align(N)]`; a body SMALLER than
+            // its field list is an identified struct reused under a mangled
+            // name a different field list already claimed.
+            const padded: boolean = lit_size != 0 && lit_size < llvm_size;
+            if (padded) { padded_n += 1; }
+            const size_ok: boolean = fe_size == llvm_size;
+            const body_ok: boolean = lit_size == 0 || lit_size == llvm_size || padded;
+            const agrees:  boolean = size_ok && body_ok;
+            if (!agrees) { disagree += 1; }
+            if (t.alignment() != llvm_align) { align_dis += 1; }
+            if (agrees && !padded && t.alignment() == llvm_align && !audit_all) { continue; }
+
             mut tag: string = "LAYOUT-DIS";
             if (agrees) {
                 tag = "LAYOUT-OK";
@@ -629,8 +671,8 @@ type struct CodegenPasses {
             fmt::eprintf("%s module=%s kind=%s type=%s id=%llu fe_size=%llu fe_align=%llu llvm_size=%llu llvm_align=%llu lit_size=%llu min_align=%llu targs=%lld\n",
                    tag, module_name, kind, name, t.id, fe_size, t.alignment(), llvm_size, llvm_align, lit_size, min_align, nargs);
         }
-        fmt::eprintf("LAYOUT-AUDIT module=%s nominal=%lld examined=%lld disagree=%lld align_dis=%lld padded=%lld skip_unmapped=%lld skip_opaque=%lld skip_fe0=%lld skip_llvm0=%lld\n",
-               module_name, nominal, examined, disagree, align_dis, padded_n, unmapped, opaque, fe_zero, llvm_zero);
+        fmt::eprintf("LAYOUT-AUDIT module=%s nominal=%lld examined=%lld disagree=%lld align_dis=%lld offset_dis=%lld padded=%lld skip_unmapped=%lld skip_opaque=%lld skip_fe0=%lld skip_llvm0=%lld\n",
+               module_name, nominal, examined, disagree, align_dis, offset_dis, padded_n, unmapped, opaque, fe_zero, llvm_zero);
         fflush(null);
     }
 

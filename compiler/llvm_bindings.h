@@ -574,6 +574,7 @@ void                 LLVMDisposeTargetData(LLVMTargetDataRef TD);
 LLVMTargetDataRef    LLVMGetModuleDataLayout(LLVMModuleRef M);
 unsigned long long   LLVMABISizeOfType(LLVMTargetDataRef TD, LLVMTypeRef Ty);
 unsigned             LLVMABIAlignmentOfType(LLVMTargetDataRef TD, LLVMTypeRef Ty);
+unsigned long long   LLVMOffsetOfElement(LLVMTargetDataRef TD, LLVMTypeRef StructTy, unsigned Element);
 
 /* Emit object/assembly to file */
 LLVMBool LLVMTargetMachineEmitToFile(LLVMTargetMachineRef T, LLVMModuleRef M,
