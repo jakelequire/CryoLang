@@ -26,6 +26,25 @@ import Compiler::ResolveCounter;
 import Utils::Logger;
 
 
+/// What one file can see under a module spelling.
+///
+/// `visible` and `matched` are kept apart because they answer different
+/// questions: nothing carries this spelling at all, versus something does and
+/// the writer cannot reach it.  Collapsing them would report the second as the
+/// first, which is the difference between "no such name" and "add an import".
+type struct ModuleSpellingMatch {
+    /// The single visible module, when `visible == 1`.
+    found:   SymbolStr;
+    /// A second visible module, for naming the ambiguity.
+    other:   SymbolStr;
+    /// Any module carrying the spelling, reachable or not.
+    any:     SymbolStr;
+    /// How many carry it AND are reachable from the writing file.
+    visible: i64;
+    /// How many carry it at all.
+    matched: i64;
+}
+
 type class NameResolver : BaseASTVisitor {
 public:
     resolver: Resolver*;
@@ -599,12 +618,94 @@ public:
             this.resolver.record_resolution(node.span, scope_sym);
         }
         // A segment that already binds in scope names a TYPE (or a value), and
-        // what its members are is sema's question, not this one.  Passing that
-        // through is what keeps the two refusals below from judging a type that
-        // merely shares its name with some module elsewhere in the program.
-        this.stamp_module_scope(node, scope_sym.is_valid());
+        // what its members are is sema's question, not this one.  Passing the
+        // SYMBOL through is what keeps the two refusals below from judging a
+        // type that merely shares its name with some module elsewhere in the
+        // program, and it is also the base a type-relative answer records - so
+        // the stamp is built from the lookup already performed rather than from
+        // a second one asking the same question.
+        this.stamp_module_scope(node, scope_sym);
         // Member resolution within the type's scope is deferred to
         // TypeResolution (needs type info to find the TypeBody scope).
+    }
+
+    /// Which modules a spelling names, as one file can see them.
+    ///
+    /// Asked of a whole scope segment to decide what that segment names, and of
+    /// a segment's PREFIX to walk a module-rooted path; one implementation
+    /// because both are the same question about the same relation, and two
+    /// copies of a reachability rule are two rules as soon as either is edited.
+    modules_written_as(&this, spelling: string,
+                       use_ns: SymbolStr) -> ModuleSpellingMatch {
+        mut r: ModuleSpellingMatch = ModuleSpellingMatch {
+            found:   SymbolStr::empty(),
+            other:   SymbolStr::empty(),
+            any:     SymbolStr::empty(),
+            visible: 0,
+            matched: 0,
+        };
+        const count: i64 = this.ctx.module_graph.module_count() as i64;
+        for (mut i: i64 = 0; i < count; i++) {
+            const cand: ModuleInfo* = this.ctx.module_graph.get_module(i);
+            const cand_ns: SymbolStr = cand.namespace_name;
+            if (!cand_ns.is_valid()) { continue; }
+            const cand_str: string = this.resolver.intern_table.resolve(cand_ns);
+            if (!Resolver::ns_written_as(cand_str, spelling)) { continue; }
+            r.matched = r.matched + 1;
+            if (r.matched == 1) { r.any = cand_ns; }
+            // The same reachability relation same-leaf resolution uses: the
+            // module's own namespace, anything it imports (the registered set
+            // is already closed over re-exports), or the prelude.
+            //
+            // `cand_str.eq(spelling)` is the fully-qualified spelling: a package
+            // root is addressable without an import, so a path that names a
+            // module's WHOLE namespace needs nothing brought into scope.  Only
+            // the whole one - an abbreviation like `core::option` is a proper
+            // suffix, its first segment is an interior segment binding nothing,
+            // and it stays unreachable here.
+            const reachable: boolean = cand_ns.id == use_ns.id
+                || cand_str.eq(spelling)
+                || this.ctx.decl_index.is_prelude_ns(cand_ns)
+                || this.ctx.decl_index.ns_imports(use_ns, cand_ns);
+            if (!reachable) { continue; }
+            r.visible = r.visible + 1;
+            if (r.visible == 1) { r.found = cand_ns; }
+            if (r.visible == 2) { r.other = cand_ns; }
+        }
+        return r;
+    }
+
+    /// The type named by a scope segment that is itself a module-rooted path,
+    /// or an invalid id when the segment is not one.
+    ///
+    /// `libc::Whence` sits in the scope position of `libc::Whence::SEEK_END`:
+    /// its head names a module, and its last segment names a type in that
+    /// module's export set.  Resolving it in that order is the language's rule
+    /// for paths, and the result is a declaration this pass can name - so
+    /// recording the segment as type-owned WITHOUT walking it would hand the
+    /// type layer a base the name layer was supposed to supply.
+    ///
+    /// This is not a second attempt at the scope lookup.  A segment either
+    /// binds in the writer's scope or spells a module path, never both, and
+    /// which of the two it is has already been decided when this runs.
+    walk_module_rooted_type(&this, written: string,
+                            use_ns: SymbolStr) -> SymbolID {
+        const prefix: string = QualifiedName::parent_of(written);
+        if (prefix.length() == 0) { return SymbolID::invalid(); }
+        const leaf: string = QualifiedName::leaf_of(written);
+        if (leaf.length() == 0) { return SymbolID::invalid(); }
+
+        // A spelling two reachable modules share names neither of them, so the
+        // walk stops rather than picking one.
+        const head: ModuleSpellingMatch = this.modules_written_as(prefix, use_ns);
+        if (head.visible != 1) { return SymbolID::invalid(); }
+
+        // The segment after the head resolves inside what the head named - the
+        // module's EXPORT set, which is precisely what a module offers another
+        // file.  A private declaration is not a candidate here, so a path can
+        // never reach one by being spelled out in full.
+        return this.resolver.lookup_in_module(
+            head.found, this.resolver.intern_table.intern(leaf));
     }
 
     /// Record which MODULE the scope segment of `Ns::member` names, as the file
@@ -624,10 +725,14 @@ public:
     /// Reports only when the segment binds to NOTHING in scope and a module
     /// nevertheless carries the spelling - then the source has written a module
     /// path, and the two ways it can fail are worth naming where they happen.
-    /// `binds_in_scope` is the caller's already-answered lookup, not a second
-    /// one: asking again here would be the same question with a second answer.
+    /// `scope_sym` is the caller's already-answered lookup, not a second one:
+    /// asking again here would be the same question with a second answer.  It
+    /// is passed as the symbol rather than as a yes/no because a type-relative
+    /// answer has to name the type it stopped on, and that name is exactly what
+    /// the caller's lookup produced.
     stamp_module_scope(&this, node: ScopeResolutionNode*,
-                       binds_in_scope: boolean) -> void {
+                       scope_sym: SymbolID) -> void {
+        const binds_in_scope: boolean = scope_sym.is_valid();
         if (this.ctx == null || this.ctx.module_graph == null) {
             ResolveCounter::Site::ScopeResUnanswerable.bump();
             return;
@@ -655,39 +760,50 @@ public:
             return;
         }
 
-        mut found:   SymbolStr = SymbolStr::empty();
-        mut other:   SymbolStr = SymbolStr::empty();
-        mut any:     SymbolStr = SymbolStr::empty();
-        mut visible: i64 = 0;
-        mut matched: i64 = 0;
-        const count: i64 = this.ctx.module_graph.module_count() as i64;
-        for (mut i: i64 = 0; i < count; i++) {
-            const cand: ModuleInfo* = this.ctx.module_graph.get_module(i);
-            const cand_ns: SymbolStr = cand.namespace_name;
-            if (!cand_ns.is_valid()) { continue; }
-            const cand_str: string = this.resolver.intern_table.resolve(cand_ns);
-            if (!Resolver::ns_written_as(cand_str, written)) { continue; }
-            matched = matched + 1;
-            if (matched == 1) { any = cand_ns; }
-            // The same reachability relation same-leaf resolution uses: the
-            // module's own namespace, anything it imports (the registered set
-            // is already closed over re-exports), or the prelude.
-            //
-            // `cand_str.eq(written)` is the fully-qualified spelling: a package
-            // root is addressable without an import, so a path that names a
-            // module's WHOLE namespace needs nothing brought into scope.  Only
-            // the whole one - an abbreviation like `core::option` is a proper
-            // suffix, its first segment is an interior segment binding nothing,
-            // and it stays unreachable here.
-            const reachable: boolean = cand_ns.id == use_ns.id
-                || cand_str.eq(written)
-                || this.ctx.decl_index.is_prelude_ns(cand_ns)
-                || this.ctx.decl_index.ns_imports(use_ns, cand_ns);
-            if (!reachable) { continue; }
-            visible = visible + 1;
-            if (visible == 1) { found = cand_ns; }
-            if (visible == 2) { other = cand_ns; }
+        // What a type-relative answer on this node would name, decided once.
+        //
+        // Three disjoint ways a scope segment names a type, selected by a
+        // property of the segment rather than tried in turn: it binds in the
+        // writer's scope, it spells a primitive (which is declared nowhere and
+        // so binds nowhere), or it is a module-rooted path whose own last
+        // segment names the type.  A segment in none of them is a segment
+        // nothing in the program owns, and it is counted rather than guessed
+        // at, because a base invented here is a claim the type layer cannot
+        // check.
+        //
+        // A `ScopeResolutionNode` is exactly `scope :: member`, so whatever the
+        // scope segment names, the one member is what is left for the type
+        // layer to finish.
+        const trailing: u32 = 1;
+        mut base: ResBase = ResBase::PrimTy(node.scope_name);
+        mut have_base: boolean = false;
+        if (binds_in_scope) {
+            const s: Symbol = this.resolver.get_symbol(scope_sym);
+            if (s.kind == SymbolKind::GenericParam) {
+                base = ResBase::GenericParam(s.name);
+            } else {
+                base = ResBase::Def(this.resolver.qualified_name_of(&s));
+            }
+            have_base = true;
+        } else if (ResBase::is_primitive_spelling(written)) {
+            base = ResBase::PrimTy(node.scope_name);
+            have_base = true;
+        } else {
+            const rooted: SymbolID = this.walk_module_rooted_type(written, use_ns);
+            if (rooted.is_valid()) {
+                const rs: Symbol = this.resolver.get_symbol(rooted);
+                base = ResBase::Def(this.resolver.qualified_name_of(&rs));
+                have_base = true;
+                ResolveCounter::Site::ScopeResWalked.bump();
+            }
         }
+
+        const m: ModuleSpellingMatch = this.modules_written_as(written, use_ns);
+        const found:   SymbolStr = m.found;
+        const other:   SymbolStr = m.other;
+        const any:     SymbolStr = m.any;
+        const visible: i64 = m.visible;
+        const matched: i64 = m.matched;
 
         if (visible == 1) {
             node.set_scope_res(Res::Def(found));
@@ -721,7 +837,7 @@ public:
                 // The segment binds in scope, so it names a TYPE and the module
                 // spellings never applied to it.  No diagnostic was emitted, so
                 // `Err` would be a refusal nobody reported.
-                node.set_scope_res(Res::TypeRelative);
+                node.set_scope_res(Res::TypeRelative(base, trailing));
             }
             return;
         }
@@ -751,7 +867,7 @@ public:
                 // Binds in scope: a type wearing a module's spelling.  The
                 // module was never what this path named, so its unreachability
                 // is not this node's answer.
-                node.set_scope_res(Res::TypeRelative);
+                node.set_scope_res(Res::TypeRelative(base, trailing));
             }
             return;
         }
@@ -779,7 +895,20 @@ public:
                 "SCOPE-RES-NOBIND", this.resolver.intern_table.resolve(use_ns),
                 written, node.scope_span.to_string());
         }
-        node.set_scope_res(Res::TypeRelative);
+        if (!have_base) {
+            // Nothing in the program owns this segment, so there is no type to
+            // name as the base.  Left unanswered and emitted by name: a stamp
+            // invented here would assert an ownership the type layer cannot
+            // check, and an unanswered slot is reported against whatever later
+            // stage actually needs it - with a location - instead of being
+            // absorbed here as a shrug.
+            ResolveCounter::Site::ScopeResNoBase.bump();
+            ResolveCounter::path_hit(
+                "SCOPE-RES-NOBASE", this.resolver.intern_table.resolve(use_ns),
+                written, node.scope_span.to_string());
+            return;
+        }
+        node.set_scope_res(Res::TypeRelative(base, trailing));
     }
 
     /// Stamp every `Named` node in a type-annotation tree.
@@ -881,7 +1010,16 @@ public:
                 const hs: Symbol = this.resolver.get_symbol(head_sym);
                 if (hs.kind == SymbolKind::GenericParam
                         || hs.kind == SymbolKind::Type) {
-                    n.res.answer(Res::TypeRelative);
+                    // The head is resolved and nothing after it is, so the
+                    // count is what this walk did not account for rather than
+                    // an estimate of what remains hard.
+                    const trailing: u32 =
+                        QualifiedName::segment_count(written) - 1;
+                    mut hb: ResBase = ResBase::GenericParam(hs.name);
+                    if (hs.kind == SymbolKind::Type) {
+                        hb = ResBase::Def(this.resolver.qualified_name_of(&hs));
+                    }
+                    n.res.answer(Res::TypeRelative(hb, trailing));
                     ResolveCounter::Site::AnnResTypeRelative.bump();
                     return;
                 }
@@ -1410,6 +1548,37 @@ public:
                         id, export_sym.name, this.resolver.current_scope,
                         node.span, resolved_module);
                     this.resolver.declare_import(import_sym);
+                }
+            }
+            // A re-exported namespace is part of what this module offers, so
+            // importing the module brings its names too.  The module-level
+            // relation already knew this - `ns_imports` is closed over
+            // re-exports - while the SYMBOL lane did not, so a name that was
+            // legitimately visible bound nothing in scope and was found, if at
+            // all, by a leaf search that ignores the writing file entirely.
+            //
+            // Each name keeps the module that DECLARED it, not the one that
+            // passed it along: the qualified name is an identity, and routing
+            // it through the re-exporter would give the same declaration two.
+            const rx_idx: i64 = this.ctx.module_graph.find_module_index(module_sym);
+            if (rx_idx >= 0) {
+                const rx_mod: ModuleInfo* = this.ctx.module_graph.get_module(rx_idx);
+                for (mut rx: i64 = 0; rx < rx_mod.reexports.length; rx++) {
+                    const rx_ns: SymbolStr = rx_mod.reexports[rx];
+                    const rx_str: string = this.resolver.intern_table.resolve(rx_ns);
+                    const rx_exports: SymbolID[] = this.resolver.get_exports(rx_ns);
+                    for (mut re: i64 = 0; re < rx_exports.length; re++) {
+                        const rx_sym: Symbol = this.resolver.get_symbol(rx_exports[re]);
+                        if (!rx_sym.visibility.is_public()) { continue; }
+                        const rx_src: string =
+                            if (rx_sym.source_module != "") { rx_sym.source_module }
+                            else { rx_str };
+                        const rid: SymbolID = this.resolver.alloc_symbol_id();
+                        const rimp: Symbol = Symbol::import_sym(
+                            rid, rx_sym.name, this.resolver.current_scope,
+                            node.span, rx_src);
+                        this.resolver.declare_import(rimp);
+                    }
                 }
             }
         } else {
