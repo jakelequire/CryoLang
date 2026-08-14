@@ -142,6 +142,7 @@ public:
             }
             NodeKind::EnumDeclaration => {
                 const enum_node: EnumDeclNode* = node as EnumDeclNode*;
+                this.record_enum_decl(enum_node);
                 if (enum_node.binding_namespace.is_empty()) {
                     const sym_id: SymbolID = this.resolver.declare_type(
                         enum_node.name, enum_node.span, true);
@@ -1456,33 +1457,47 @@ public:
         }
     }
 
-    /// Process an import declaration: bring imported names into current scope.
-    /// Fold a module-level `const NAME: <int> = expr;` and record its value.
+    /// Record a module-level `const NAME = expr;` so its value can be folded.
     ///
     /// Fixed array sizes (`u8[NAME]`) are resolved long before codegen turns a
-    /// const into a runtime global, so the value has to be captured here or the
-    /// array's size is never known.  Statements are walked in source order, so
-    /// a constant defined in terms of an earlier one folds too.
+    /// const into a runtime global, so the initializer has to be captured here
+    /// or the array's size is never known.
     ///
-    /// A non-integer or non-constant initializer is simply not recorded; only
-    /// a use that needs the value (an array size) reports anything.
+    /// The value is NOT computed here.  An initializer may name a constant or
+    /// an enum that another module declares, and this pass runs over every
+    /// module before any of them is walked; folding at the declaration could
+    /// only ever see what preceded it.  A non-integer initializer is recorded
+    /// too and simply never folds - only a use that needs the value reports
+    /// anything.
     record_const_value(&this, node: VarDeclNode*) -> void {
         if (this.ctx == null || this.ctx.const_table == null) { return; }
         const intern: InternTable* = this.ctx.intern_table;
         if (intern == null) { return; }
-
-        mut value: i64 = 0;
-        if (!ConstantTable::fold_i64(node.initializer, this.ctx.const_table,
-                                      this.ctx.namespace_str, intern, &value)) {
-            return;
-        }
+        if (node.initializer == null) { return; }
 
         const qualified: SymbolStr = if (this.ctx.has_namespace()) {
             ConstantTable::intern_qualified(intern, this.ctx.namespace_str, node.name)
         } else {
             node.name
         };
-        this.ctx.const_table.register(qualified, node.name, value);
+        this.ctx.const_table.register(qualified, node.name,
+                                      this.ctx.namespace_str, node.initializer);
+    }
+
+    /// Record a module-level enum so `Enum::Variant` folds to its discriminant
+    /// wherever a compile-time integer is wanted.  Keyed the same two ways a
+    /// constant is, because a use site spells an enum the same ways.
+    record_enum_decl(&this, node: EnumDeclNode*) -> void {
+        if (this.ctx == null || this.ctx.const_table == null) { return; }
+        const intern: InternTable* = this.ctx.intern_table;
+        if (intern == null) { return; }
+
+        const qualified: SymbolStr = if (this.ctx.has_namespace()) {
+            ConstantTable::intern_qualified(intern, this.ctx.namespace_str, node.name)
+        } else {
+            node.name
+        };
+        this.ctx.const_table.register_enum(qualified, node.name, node);
     }
 
     /// Binds what an `import` - or an `export` - names into the current scope.

@@ -4,24 +4,39 @@
 ///! are not otherwise available to the frontend.  A fixed array size
 ///! (`u8[CHUNK]`) has to know the value at type-resolution time - a size that
 ///! never resolves produces an array descriptor with no storage behind it -
-///! so module-level integer constants are folded once during name resolution
-///! and recorded here.
+///! so module-level integer constants are recorded here during name
+///! declaration and folded on demand.
+///!
+///! Folding is DEFERRED rather than done at the declaration: an initializer
+///! may name a constant or an enum that a later module declares, and the
+///! declaration pass runs over every module before anything is walked.  A
+///! constant folded eagerly at its own declaration could only ever see what
+///! preceded it in source order.
 ///!
 ///! This lives outside `DeclIndex` on purpose: the name resolver populates the
 ///! table and `DeclIndex` already imports the resolver, so hanging it off the
 ///! declaration index would close an import cycle.
 ///!
 ///! Naming: entries are keyed by qualified name (`std::io::traits::CHUNK`).
-///! A bare-name index resolves unqualified uses, and records ambiguity rather
-///! than a winner - two same-named constants with different values make the
-///! bare name unfoldable, which surfaces as a diagnostic asking for
-///! qualification instead of silently picking one.
+///! A bare-name index resolves unqualified uses, and answers only when every
+///! constant of that name folds to the same value - two same-named constants
+///! with different values make the bare name unfoldable, which surfaces as a
+///! diagnostic asking for qualification instead of silently picking one.
+///!
+///! `ConstEval` is the ONE folder for every position that wants a compile-time
+///! integer: an array size, a `[value; N]` repeat count, and a `static_assert`
+///! condition.  They differ only in which capabilities exist at their point in
+///! the pipeline - an array size is fixed before any layout is computed, so
+///! `sizeof` is not a constant there - and a capability is passed as a
+///! pointer that may be null rather than as a separate folder.
 
 namespace Compiler::ConstTable;
 
 import Compiler::AST;
-import Compiler::AST::{ Node, Expression };
+import Compiler::AST::{ Node, Expression, Declaration };
 import Compiler::Resolver::{ SymbolStr, InternTable };
+import Compiler::Types::{ TypeRef, Arena };
+import Compiler::Types::Type;
 import std::core::option;
 import std::collections::hashmap;
 
@@ -30,53 +45,138 @@ import std::collections::hashmap;
 /// rather than wrapping into a negative size.
 const CONST_I64_MAX_MAG: u64 = 9223372036854775807;
 
-/// Bare-name entry sentinel: the name is registered more than once with
-/// conflicting values, so it cannot be folded without qualification.
-const BARE_AMBIGUOUS: i64 = -9223372036854775807 - 1;
+/// Fold states for one entry.  Only a SUCCESS is memoized: a fold can fail
+/// for want of a capability that a later position supplies, so caching the
+/// failure would make the answer depend on which position asked first.
+/// `Folding` is the cycle guard - a constant whose initializer names itself,
+/// directly or through another constant, is not a compile-time integer.
+const CONST_PENDING: i32 = 0;
+const CONST_FOLDING: i32 = 1;
+const CONST_FOLDED:  i32 = 2;
+
+
+/// One module-level `const`, with the initializer it is folded from.
+///
+/// `init` is borrowed from the AST, which outlives the table.
+type struct ConstEntry {
+    module_ns: SymbolStr;
+    init:      ExpressionNode*;
+    value:     i64;
+    state:     i32;
+    /// Next entry sharing this leaf name, or -1.  A bare use folds every
+    /// candidate on the chain and answers only when they agree.
+    next_same_bare: i64;
+}
+
+
+/// One module-level `type enum`, chained by leaf name like a constant.
+///
+/// `node` is borrowed from the AST.
+type struct EnumEntry {
+    node:           EnumDeclNode*;
+    next_same_bare: i64;
+}
 
 
 type struct ConstantTable {
-    /// Qualified name id -> folded value.
+    entries: ConstEntry[];
+    /// Qualified name id -> index into `entries`.
     by_qualified: HashMap<u32, i64>;
-    /// Bare leaf name id -> folded value, or `BARE_AMBIGUOUS`.
+    /// Bare leaf name id -> index of the first entry with that leaf.
     by_bare: HashMap<u32, i64>;
+
+    /// Module-level `type enum` declarations, so `Enum::Variant` folds to its
+    /// discriminant.  Same two-index, leaf-chained shape as the constants: an
+    /// enum is named at a use site by exactly the same kinds of spelling, and
+    /// a leaf that means two different enums has to be refused rather than
+    /// guessed - the wrong guess is a wrongly sized array, not a diagnostic.
+    enums: EnumEntry[];
+    enums_by_qualified: HashMap<u32, i64>;
+    enums_by_bare: HashMap<u32, i64>;
 
     static new() -> ConstantTable {
         return ConstantTable {
-            by_qualified: HashMap<u32, i64>::new(),
-            by_bare:      HashMap<u32, i64>::new(),
+            entries:            [],
+            by_qualified:       HashMap<u32, i64>::new(),
+            by_bare:            HashMap<u32, i64>::new(),
+            enums:              [],
+            enums_by_qualified: HashMap<u32, i64>::new(),
+            enums_by_bare:      HashMap<u32, i64>::new(),
         };
     }
 
-    /// Record `qualified` (and its bare leaf) as having the folded value
-    /// `value`.  Re-registering the same qualified name with the same value is
-    /// a no-op, which keeps repeated passes over a module idempotent.
-    register(mut &this, qualified: SymbolStr, bare: SymbolStr, value: i64) -> void {
-        this.by_qualified.insert(qualified.id, value);
-
-        match (this.by_bare.get(&bare.id)) {
+    /// Record `qualified` (and its bare leaf) as a constant initialized from
+    /// `init`, written in module `module_ns`.
+    ///
+    /// Re-registering the same qualified name replaces its initializer rather
+    /// than adding a second entry, which keeps repeated passes over a module
+    /// idempotent and keeps a module from making its own name ambiguous
+    /// against itself.
+    register(mut &this, qualified: SymbolStr, bare: SymbolStr,
+             module_ns: SymbolStr, init: ExpressionNode*) -> void {
+        match (this.by_qualified.get(&qualified.id)) {
             Option::Some(existing) => {
-                // A second constant of the same leaf name: keep the entry only
-                // while every registration agrees.
-                if (existing != value) {
-                    this.by_bare.insert(bare.id, BARE_AMBIGUOUS);
-                }
+                this.entries[existing].module_ns = module_ns;
+                this.entries[existing].init      = init;
+                this.entries[existing].value     = 0;
+                this.entries[existing].state     = CONST_PENDING;
+                return;
             }
-            Option::None => {
-                this.by_bare.insert(bare.id, value);
-            }
+            Option::None => { }
         }
+
+        // Push at the head of the leaf chain: the order candidates are folded
+        // in cannot matter, since a bare name answers only when they agree.
+        mut head: i64 = -1;
+        match (this.by_bare.get(&bare.id)) {
+            Option::Some(h) => { head = h; }
+            Option::None    => { }
+        }
+
+        const idx: i64 = this.entries.length;
+        this.entries.push(ConstEntry {
+            module_ns:      module_ns,
+            init:           init,
+            value:          0,
+            state:          CONST_PENDING,
+            next_same_bare: head,
+        });
+        this.by_qualified.insert(qualified.id, idx);
+        this.by_bare.insert(bare.id, idx);
     }
 
-    /// Look up `name` as written at a use site inside `module_ns`.
-    ///
-    /// A qualified name is looked up directly.  A bare name prefers the
-    /// use site's own module, then falls back to the bare index - which
-    /// answers only when every constant of that name agrees.
-    lookup(&this, name: SymbolStr, module_ns: SymbolStr, intern: InternTable*,
-           out: i64*) -> boolean {
-        match (this.by_qualified.get(&name.id)) {
-            Option::Some(v) => { *out = v; return true; }
+    /// Record a module-level enum declaration under its qualified name and at
+    /// the head of its leaf chain.  Re-registering the same qualified name
+    /// replaces the node rather than adding a second candidate.
+    register_enum(mut &this, qualified: SymbolStr, bare: SymbolStr,
+                  node: EnumDeclNode*) -> void {
+        if (node == null) { return; }
+        match (this.enums_by_qualified.get(&qualified.id)) {
+            Option::Some(existing) => { this.enums[existing].node = node; return; }
+            Option::None => { }
+        }
+
+        mut head: i64 = -1;
+        match (this.enums_by_bare.get(&bare.id)) {
+            Option::Some(h) => { head = h; }
+            Option::None    => { }
+        }
+
+        const idx: i64 = this.enums.length;
+        this.enums.push(EnumEntry { node: node, next_same_bare: head });
+        this.enums_by_qualified.insert(qualified.id, idx);
+        this.enums_by_bare.insert(bare.id, idx);
+    }
+
+    /// The index a written `name` denotes in a qualified/bare index pair, or
+    /// -1.  One home for the spelling rule both indexes obey: a name is looked
+    /// up as written, then under the use site's own module, then as a bare
+    /// leaf.
+    static index_of(by_qualified: HashMap<u32, i64>*, by_bare: HashMap<u32, i64>*,
+                    name: SymbolStr, module_ns: SymbolStr,
+                    intern: InternTable*) -> i64 {
+        match (by_qualified.get(&name.id)) {
+            Option::Some(i) => { return i; }
             Option::None    => { }
         }
 
@@ -84,18 +184,16 @@ type struct ConstantTable {
             const qualified: SymbolStr =
                 ConstantTable::intern_qualified(intern, module_ns, name);
             if (qualified.is_valid()) {
-                match (this.by_qualified.get(&qualified.id)) {
-                    Option::Some(v) => { *out = v; return true; }
+                match (by_qualified.get(&qualified.id)) {
+                    Option::Some(i) => { return i; }
                     Option::None    => { }
                 }
             }
         }
 
-        return match (this.by_bare.get(&name.id)) {
-            Option::Some(v) => {
-                if (v == BARE_AMBIGUOUS) { return false; } else { *out = v; return true; }
-            }
-            Option::None => { return false; }
+        return match (by_bare.get(&name.id)) {
+            Option::Some(i) => { i }
+            Option::None    => { -1 }
         };
     }
 
@@ -107,48 +205,166 @@ type struct ConstantTable {
         return intern.intern(joined);
     }
 
+    /// Decode an integer literal lexeme, honouring `0x`/`0o`/`0b` prefixes and
+    /// `_` separators.  False on overflow past u64 or on a stray character.
+    static parse_int_literal(text: string, out: u64*) -> boolean {
+        if (text == null) { return false; }
+        mut i: i64 = 0;
+        mut base: u64 = 10;
+        if (text[0] == '0' && text[1] != 0) {
+            const c: char = text[1];
+            if (c == 'x' || c == 'X') { base = 16; i = 2; }
+            else if (c == 'o' || c == 'O') { base = 8;  i = 2; }
+            else if (c == 'b' || c == 'B') { base = 2;  i = 2; }
+        }
+
+        mut acc: u64 = 0;
+        mut saw_digit: boolean = false;
+        while (text[i] != 0) {
+            const c: char = text[i];
+            i = i + 1;
+            if (c == '_') { continue; }
+            mut d: u64 = 0;
+            if (c >= '0' && c <= '9')      { d = (c - '0') as u64; }
+            else if (c >= 'a' && c <= 'f') { d = ((c - 'a') as u64) + 10; }
+            else if (c >= 'A' && c <= 'F') { d = ((c - 'A') as u64) + 10; }
+            else { return false; }         // type suffix or stray character
+            if (d >= base) { return false; }
+            // Overflow check before the multiply-add.
+            const limit: u64 = 18446744073709551615;
+            if (acc > (limit - d) / base) { return false; }
+            acc = acc * base + d;
+            saw_digit = true;
+        }
+        if (!saw_digit) { return false; }
+        *out = acc;
+        return true;
+    }
+}
+
+
+/// Everything a compile-time integer fold is allowed to consult.
+///
+/// A null capability is a NARROWER ENVIRONMENT, not a different rule.  Sema
+/// selects an integer literal's width before any name is bound, so it folds
+/// with no table and an identifier is simply not a constant there; an array
+/// size is fixed before TypeLowering computes a single layout, so `sizeof` is
+/// not a constant there either.  The positions that share this folder must
+/// share its answers wherever they share its capabilities - that is the
+/// property that keeps `T[N]` and `[v; N]` agreeing about `N`.
+type struct ConstEval {
+    table:  ConstantTable*;
+    intern: InternTable*;
+    /// Layouts, for `sizeof`/`alignof`.  Null until TypeLowering has run.
+    arena:  TypeArena*;
+    /// The module the expression being folded was WRITTEN in, which is what a
+    /// bare name is resolved against.
+    module_ns: SymbolStr;
+
+    static new(table: ConstantTable*, intern: InternTable*, arena: TypeArena*,
+               module_ns: SymbolStr) -> ConstEval {
+        return ConstEval {
+            table: table, intern: intern, arena: arena, module_ns: module_ns,
+        };
+    }
+
+    /// A folder with no name binding and no layouts: literal arithmetic only.
+    static literals_only() -> ConstEval {
+        return ConstEval {
+            table: null, intern: null, arena: null,
+            module_ns: SymbolStr::empty(),
+        };
+    }
+
+    /// The same capabilities, reading names as another module wrote them.
+    in_module(&this, module_ns: SymbolStr) -> ConstEval {
+        return ConstEval {
+            table: this.table, intern: this.intern, arena: this.arena,
+            module_ns: module_ns,
+        };
+    }
+
     /// Fold a compile-time integer expression to its `i64` value.
     ///
-    /// `table` may be null, which restricts folding to literal arithmetic -
-    /// that is the shape sema uses for integer-literal width selection, where
-    /// no name binding has happened yet.  With a table, plain identifiers
-    /// resolve to previously-registered constants, so `CHUNK * 2` folds.
+    /// Returns false for anything non-constant, for any step that would
+    /// overflow i64 or divide by a constant zero, and for a name this
+    /// environment cannot bind.  Bailing is always safe: callers either leave
+    /// a width unchanged or report the position as non-constant.
     ///
-    /// Returns false for anything non-constant, and for any step that would
-    /// overflow i64 or divide by a constant zero.  Bailing is always safe:
-    /// callers either leave a width unchanged or report the size as
-    /// non-constant.
-    static fold_i64(expr: ExpressionNode*, table: ConstantTable*,
-                    module_ns: SymbolStr, intern: InternTable*,
-                    out: i64*) -> boolean {
+    /// Booleans fold as 0/1 so a comparison composes with arithmetic; a caller
+    /// that wants a count rejects a negative result itself.
+    fold(&this, expr: ExpressionNode*, out: i64*) -> boolean {
         if (expr == null) { return false; }
         const node: ASTNode* = expr as ASTNode*;
 
         if (node.kind == NodeKind::Literal) {
             const lit: LiteralNode* = expr as LiteralNode*;
+            if (lit.literal_kind == LiteralKind::Boolean) {
+                *out = if (lit.value == "true") { 1 } else { 0 };
+                return true;
+            }
             if (lit.literal_kind != LiteralKind::Integer) { return false; }
+            // `value` is the whole lexeme, suffix included; the lexer already
+            // found the boundary, so strip rather than re-derive it - a digit
+            // scan cannot tell `0x1f64` (no suffix) from `0x1u8`.
+            mut text: string = lit.value;
+            const slen: i64 = lit.suffix.length() as i64;
+            if (slen > 0) {
+                const vlen: i64 = lit.value.length() as i64;
+                if (vlen <= slen) { return false; }
+                text = lit.value.substr(0, (vlen - slen) as u64);
+            }
             mut v: u64 = 0;
-            if (!ConstantTable::parse_int_literal(lit.value, &v)) { return false; }
+            if (!ConstantTable::parse_int_literal(text, &v)) { return false; }
             if (v > CONST_I64_MAX_MAG) { return false; }
             *out = v as i64;
             return true;
         }
 
         if (node.kind == NodeKind::Identifier) {
-            if (table == null) { return false; }
             const id: IdentifierNode* = expr as IdentifierNode*;
-            return table.lookup(id.name, module_ns, intern, out);
+            return this.fold_named(id.name, out);
+        }
+
+        if (node.kind == NodeKind::ScopeResolution) {
+            const sr: ScopeResolutionNode* = expr as ScopeResolutionNode*;
+            return this.fold_scoped(sr, out);
+        }
+
+        if (node.kind == NodeKind::CastExpression) {
+            const c: CastExprNode* = expr as CastExprNode*;
+            mut v: i64 = 0;
+            if (!this.fold(c.expression, &v)) { return false; }
+            return ConstEval::wrap_to_primitive(
+                this.primitive_name_of(c.target_annotation), v, out);
+        }
+
+        if (node.kind == NodeKind::SizeofExpression) {
+            const s: SizeofExprNode* = expr as SizeofExprNode*;
+            if (this.arena == null || !s.resolved_type.is_valid()) { return false; }
+            const t: Type* = this.arena.lookup(s.resolved_type.id);
+            if (t == null) { return false; }
+            *out = t.size_bytes() as i64;
+            return true;
+        }
+
+        if (node.kind == NodeKind::AlignofExpression) {
+            const a: AlignofExprNode* = expr as AlignofExprNode*;
+            if (this.arena == null || !a.resolved_type.is_valid()) { return false; }
+            const t: Type* = this.arena.lookup(a.resolved_type.id);
+            if (t == null) { return false; }
+            *out = t.alignment() as i64;
+            return true;
         }
 
         if (node.kind == NodeKind::UnaryExpression) {
             const u: UnaryExprNode* = expr as UnaryExprNode*;
             mut a: i64 = 0;
-            if (!ConstantTable::fold_i64(u.operand, table, module_ns, intern, &a)) {
-                return false;
-            }
+            if (!this.fold(u.operand, &a)) { return false; }
             if (u.op.lexeme == "-") { *out = 0 - a; return true; }
             if (u.op.lexeme == "+") { *out = a;     return true; }
             if (u.op.lexeme == "~") { *out = ~a;    return true; }
+            if (u.op.lexeme == "!") { *out = if (a == 0) { 1 } else { 0 }; return true; }
             return false;
         }
 
@@ -156,12 +372,188 @@ type struct ConstantTable {
             const b: BinaryExprNode* = expr as BinaryExprNode*;
             mut x: i64 = 0;
             mut y: i64 = 0;
-            if (!ConstantTable::fold_i64(b.left,  table, module_ns, intern, &x)) { return false; }
-            if (!ConstantTable::fold_i64(b.right, table, module_ns, intern, &y)) { return false; }
-            return ConstantTable::apply_binary(b.op.lexeme, x, y, out);
+            if (!this.fold(b.left,  &x)) { return false; }
+            if (!this.fold(b.right, &y)) { return false; }
+            return ConstEval::apply_binary(b.op.lexeme, x, y, out);
         }
 
         return false;
+    }
+
+    /// Fold a bare name: a constant of that leaf, wherever it was declared.
+    fold_named(&this, name: SymbolStr, out: i64*) -> boolean {
+        if (this.table == null) { return false; }
+        const idx: i64 = ConstantTable::index_of(
+            &this.table.by_qualified, &this.table.by_bare,
+            name, this.module_ns, this.intern);
+        if (idx < 0) { return false; }
+        return this.fold_chain(idx, out);
+    }
+
+    /// Fold `scope::member`.
+    ///
+    /// A constant is looked up first, under the whole written path: its key is
+    /// the fully qualified name, so a hit is exact.  Only then is `scope` read
+    /// as an enum, which is a leaf-indexed answer and so the weaker one.
+    fold_scoped(&this, sr: ScopeResolutionNode*, out: i64*) -> boolean {
+        if (this.table == null || this.intern == null) { return false; }
+
+        const path: SymbolStr = ConstantTable::intern_qualified(
+            this.intern, sr.scope_name, sr.member_name);
+        if (path.is_valid()) {
+            const idx: i64 = ConstantTable::index_of(
+                &this.table.by_qualified, &this.table.by_bare,
+                path, this.module_ns, this.intern);
+            if (idx >= 0) { return this.fold_chain(idx, out); }
+        }
+
+        const ei: i64 = ConstantTable::index_of(
+            &this.table.enums_by_qualified, &this.table.enums_by_bare,
+            sr.scope_name, this.module_ns, this.intern);
+        if (ei < 0) { return false; }
+
+        // Every enum reachable under the written scope must give the member
+        // the same discriminant.  An exact qualified hit is a chain of one, so
+        // this only bites a BARE leaf that names two different enums - where
+        // picking the first registration would silently size an array from the
+        // wrong declaration.
+        mut answered: boolean = false;
+        mut answer: i64 = 0;
+        mut i: i64 = ei;
+        while (i >= 0) {
+            mut v: i64 = 0;
+            if (ConstEval::variant_tag_of(this.table.enums[i].node,
+                                          sr.member_name, &v)) {
+                if (answered && v != answer) { return false; }
+                answered = true;
+                answer   = v;
+            }
+            i = this.table.enums[i].next_same_bare;
+        }
+        if (!answered) { return false; }
+        *out = answer;
+        return true;
+    }
+
+    /// The discriminant `decl` gives `member`, or false when it has no such
+    /// variant.  A variant carrying a payload is a constructor, not a value,
+    /// so it is not a compile-time integer.
+    static variant_tag_of(decl: EnumDeclNode*, member: SymbolStr,
+                          out: i64*) -> boolean {
+        if (decl == null) { return false; }
+        const tags: i64[] = decl.variant_tags();
+        for (mut i: i64 = 0; i < decl.variants.length; i++) {
+            const v: EnumVariantNode* = decl.variants[i];
+            if (v == null) { continue; }
+            if (v.name.id != member.id) { continue; }
+            if (v.associated_types.length > 0) { return false; }
+            *out = tags[i];
+            return true;
+        }
+        return false;
+    }
+
+    /// Fold every constant sharing one leaf name and answer only if they
+    /// agree.  A candidate whose initializer is not a compile-time integer is
+    /// skipped rather than poisoning the name: it could never have answered.
+    fold_chain(&this, head: i64, out: i64*) -> boolean {
+        mut answered: boolean = false;
+        mut answer: i64 = 0;
+        mut i: i64 = head;
+        while (i >= 0) {
+            mut v: i64 = 0;
+            if (this.fold_entry(i, &v)) {
+                if (answered && v != answer) { return false; }
+                answered = true;
+                answer   = v;
+            }
+            i = this.table.entries[i].next_same_bare;
+        }
+        if (!answered) { return false; }
+        *out = answer;
+        return true;
+    }
+
+    /// Fold one entry's initializer, in the module that WROTE it, and memoize
+    /// the value.
+    ///
+    /// Only success is memoized - a fold that failed for want of a capability
+    /// must be able to succeed at a position that has one.  `Folding` is the
+    /// cycle guard: a constant reached from its own initializer is not a
+    /// compile-time integer, and without the guard the recursion has no floor.
+    fold_entry(&this, idx: i64, out: i64*) -> boolean {
+        if (this.table == null) { return false; }
+        if (idx < 0 || idx >= this.table.entries.length) { return false; }
+
+        const state: i32 = this.table.entries[idx].state;
+        if (state == CONST_FOLDED)  { *out = this.table.entries[idx].value; return true; }
+        if (state == CONST_FOLDING) { return false; }
+
+        const init: ExpressionNode* = this.table.entries[idx].init;
+        if (init == null) { return false; }
+
+        this.table.entries[idx].state = CONST_FOLDING;
+        mut v: i64 = 0;
+        const inner: ConstEval = this.in_module(this.table.entries[idx].module_ns);
+        const ok: boolean = inner.fold(init, &v);
+        if (!ok) {
+            this.table.entries[idx].state = CONST_PENDING;
+            return false;
+        }
+        this.table.entries[idx].value = v;
+        this.table.entries[idx].state = CONST_FOLDED;
+        *out = v;
+        return true;
+    }
+
+    /// The primitive name a cast targets, or "" when the target is anything
+    /// else.  Only a primitive target has a width known without resolving a
+    /// name, and a cast to a user type is not an integer anyway.
+    primitive_name_of(&this, ann: TypeAnnotation*) -> string {
+        if (ann == null || this.intern == null) { return ""; }
+        return match (*ann) {
+            TypeAnnotation::Primitive(p) => { this.intern.resolve(p.name) }
+            _ => { "" }
+        };
+    }
+
+    /// Wrap `v` to the width and signedness of the primitive `prim`, the way
+    /// the emitted cast will, so `Slot::B as u8` folds to what the program
+    /// observes rather than to the unwrapped operand.
+    ///
+    /// False for anything an `i64` cannot carry: a float, a 128-bit width, and
+    /// a negative value cast to a 64-bit unsigned type.  `char` is excluded
+    /// because its width is not settled.
+    static wrap_to_primitive(prim: string, v: i64, out: i64*) -> boolean {
+        if (prim == "boolean") { *out = if (v != 0) { 1 } else { 0 }; return true; }
+
+        mut bits: i64 = 0;
+        mut is_signed: boolean = true;
+        if (prim == "i8")   { bits = 8;  is_signed = true; }
+        else if (prim == "i16")   { bits = 16; is_signed = true; }
+        else if (prim == "i32" || prim == "int") { bits = 32; is_signed = true; }
+        else if (prim == "i64" || prim == "isize") { bits = 64; is_signed = true; }
+        else if (prim == "u8")    { bits = 8;  is_signed = false; }
+        else if (prim == "u16")   { bits = 16; is_signed = false; }
+        else if (prim == "u32" || prim == "uint") { bits = 32; is_signed = false; }
+        else if (prim == "u64" || prim == "usize") { bits = 64; is_signed = false; }
+        if (bits == 0) { return false; }
+
+        if (bits == 64) {
+            if (!is_signed && v < 0) { return false; }
+            *out = v;
+            return true;
+        }
+
+        const mask: i64 = (1 << bits) - 1;
+        const low: i64 = v & mask;
+        if (is_signed) {
+            const sign_bit: i64 = 1 << (bits - 1);
+            if ((low & sign_bit) != 0) { *out = low - (mask + 1); } else { *out = low; }
+        } else {
+            *out = low;
+        }
+        return true;
     }
 
     /// Evaluate `x <op> y` with overflow and divide-by-zero guarded; false
@@ -208,42 +600,15 @@ type struct ConstantTable {
         if (op == "&") { *out = x & y; return true; }
         if (op == "|") { *out = x | y; return true; }
         if (op == "^") { *out = x ^ y; return true; }
+
+        if (op == "==") { *out = if (x == y) { 1 } else { 0 }; return true; }
+        if (op == "!=") { *out = if (x != y) { 1 } else { 0 }; return true; }
+        if (op == "<")  { *out = if (x <  y) { 1 } else { 0 }; return true; }
+        if (op == "<=") { *out = if (x <= y) { 1 } else { 0 }; return true; }
+        if (op == ">")  { *out = if (x >  y) { 1 } else { 0 }; return true; }
+        if (op == ">=") { *out = if (x >= y) { 1 } else { 0 }; return true; }
+        if (op == "&&") { *out = if (x != 0 && y != 0) { 1 } else { 0 }; return true; }
+        if (op == "||") { *out = if (x != 0 || y != 0) { 1 } else { 0 }; return true; }
         return false;
-    }
-
-    /// Decode an integer literal lexeme, honouring `0x`/`0o`/`0b` prefixes and
-    /// `_` separators.  False on overflow past u64 or on a stray character.
-    static parse_int_literal(text: string, out: u64*) -> boolean {
-        if (text == null) { return false; }
-        mut i: i64 = 0;
-        mut base: u64 = 10;
-        if (text[0] == '0' && text[1] != 0) {
-            const c: char = text[1];
-            if (c == 'x' || c == 'X') { base = 16; i = 2; }
-            else if (c == 'o' || c == 'O') { base = 8;  i = 2; }
-            else if (c == 'b' || c == 'B') { base = 2;  i = 2; }
-        }
-
-        mut acc: u64 = 0;
-        mut saw_digit: boolean = false;
-        while (text[i] != 0) {
-            const c: char = text[i];
-            i = i + 1;
-            if (c == '_') { continue; }
-            mut d: u64 = 0;
-            if (c >= '0' && c <= '9')      { d = (c - '0') as u64; }
-            else if (c >= 'a' && c <= 'f') { d = ((c - 'a') as u64) + 10; }
-            else if (c >= 'A' && c <= 'F') { d = ((c - 'A') as u64) + 10; }
-            else { return false; }         // type suffix or stray character
-            if (d >= base) { return false; }
-            // Overflow check before the multiply-add.
-            const limit: u64 = 18446744073709551615;
-            if (acc > (limit - d) / base) { return false; }
-            acc = acc * base + d;
-            saw_digit = true;
-        }
-        if (!saw_digit) { return false; }
-        *out = acc;
-        return true;
     }
 }

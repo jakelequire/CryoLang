@@ -275,6 +275,16 @@ mut   v:      Array<int>;  // growable, heap-backed; from collections::array
 
 For everything except FFI and stack-allocated scratch buffers, prefer `Array<T>` from the standard library. The shorthand `T[]` desugars to `Array<T>` in expression position when the prelude is loaded.
 
+The `N` in `T[N]` is a **compile-time integer**: an integer literal, a named `const` (declared in this module or another, written bare or qualified), an enum variant, a cast between integer types, or arithmetic, comparison, logical, and bitwise operators over those. The repeat expression `[value; N]` accepts exactly the same set and yields `T[N]`, so a field and the initializer that fills it can share one name for their length; a count that is *not* a compile-time integer is legal there and yields a dynamic `T[]` sized at run time. A size that is neither is E0239.
+
+```cryo
+const CAPACITY: i64 = 512;
+type struct Grid { cells: boolean[CAPACITY]; }
+const cells: boolean[CAPACITY] = [false; CAPACITY];
+```
+
+`sizeof`/`alignof` are **not** available in this position: an array's size is fixed before any layout is computed. `static_assert` runs after layouts exist and does accept them ([section 18.5](#185-compile-time-layout-assertions-static_assert)).
+
 ### 2.5 Function Types
 
 Functions are first-class values. A function type names its parameter types and its return type.
@@ -2845,7 +2855,13 @@ static_assert(alignof(Color) == 1);
 static_assert(sizeof(Color) == 4, "Color must be 4 bytes to match the C ABI");
 ```
 
-`static_assert` is a module-scope declaration: `static_assert(cond)` or `static_assert(cond, "message")`. The condition is folded after layouts are computed and may use integer/boolean literals, `sizeof(T)`, `alignof(T)`, and the arithmetic, comparison, logical, and bitwise operators. A condition that is false - or that is not a compile-time constant - is a compile error. (It is a general feature, not FFI-only, but layout verification is its primary use.)
+`static_assert` is a module-scope declaration: `static_assert(cond)` or `static_assert(cond, "message")`. The condition is folded after layouts are computed and may use anything that is a compile-time integer in an array size ([section 2.4](#24-array-types)) - integer/boolean literals, named constants, enum variants, integer casts, and the arithmetic, comparison, logical, and bitwise operators - plus `sizeof(T)` and `alignof(T)`, which only this position can see. A condition that is false - or that is not a compile-time constant - is a compile error. (It is a general feature, not FFI-only, but layout verification is its primary use.)
+
+```cryo
+const CAPACITY: i64 = 512;
+static_assert(CAPACITY == 512, "the wire format fixes the capacity");
+static_assert(sizeof(Grid) == CAPACITY);
+```
 
 ---
 

@@ -28,6 +28,7 @@ import Compiler::Diag::{
     Diagnostic, Suggestion, SourceSpan, EditDistance, Snapshot
 };
 import Compiler::DeclIndex;
+import Compiler::ConstTable;
 import Compiler::ResolveCounter;
 import Compiler::AST;
 import Compiler::AST::{ Node, Expression, Statement, Declaration, Pattern, Visitor, NodeLocator, Cloner };
@@ -3050,6 +3051,26 @@ public:
         return !(exp_t as ArrayType*).is_fixed();
     }
 
+    /// The element count of a `[value; N]` repeat expression, or -1 when `N`
+    /// is not a compile-time integer and the literal is therefore a dynamic
+    /// array sized at run time.
+    ///
+    /// Folded through the same environment an array size in a type is folded
+    /// through, so `T[N]` and `[v; N]` cannot disagree about `N` - a field and
+    /// its initializer sharing one name for their length is the whole point of
+    /// naming it.  No arena: a repeat count is fixed before TypeLowering, the
+    /// same position an array annotation's size is fixed at.
+    const_repeat_count(&this, arr: ArrayLiteralNode*) -> i64 {
+        if (this.ctx == null) { return -1; }
+        const ev: ConstEval = ConstEval::new(
+            this.ctx.const_table, this.ctx.intern_table, null,
+            this.ctx.module_ns_sym_of_file(arr.span.file));
+        mut n: i64 = 0;
+        if (!ev.fold(arr.repeat_count_expr, &n)) { return -1; }
+        if (n < 0) { return -1; }
+        return n;
+    }
+
     resolve_array_literal(mut &this, arr: ArrayLiteralNode*) -> TypeRef {
         mut elem_expected: TypeRef = TypeRef::invalid();
         if (this.state.expected_type.is_valid()) {
@@ -3115,7 +3136,7 @@ public:
             } else if (arr.repeat_count_expr != null) {
                 size = -1;
                 if (!this.expected_is_dynamic_array()) {
-                    const fill_count: i64 = sema_const_int_index(arr.repeat_count_expr);
+                    const fill_count: i64 = this.const_repeat_count(arr);
                     if (fill_count >= 0) { size = fill_count; }
                 }
             }
