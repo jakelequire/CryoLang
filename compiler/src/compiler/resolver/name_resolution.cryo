@@ -291,9 +291,25 @@ public:
         for (mut i: int = 0; i < node.statements.length; i++) {
             node.statements[i].accept(this);
         }
+
+        // A `static_assert` condition lives in a side list, not the statement
+        // stream, so the loop above never reaches it.  Its condition is an
+        // ordinary expression that may name a constant or an enum variant, and
+        // the fold that reads it runs in TypeLowering - long after the only
+        // pass that can say which module a written qualifier denotes.  Without
+        // this walk the qualifier reaches that fold with no `Res` to read.
+        //
+        // The list is this module's own: the driver swaps `ast.root` per module
+        // before the walk, so a condition is resolved in the scope of the file
+        // that wrote it.
+        for (mut i: i64 = 0; i < node.static_asserts.length; i++) {
+            const sa: StaticAssertItem* = node.static_asserts[i];
+            if (sa == null || sa.cond == null) { continue; }
+            (sa.cond as ExpressionNode*).accept(this);
+        }
     }
 
-    
+
     // -- Declarations --
     override visit(node: FunctionDeclNode*) -> void {
         LOG_DEBUG(LogComponent::General, "[NameResolver] visit(FunctionDecl) name='%s' generics=%d",
@@ -387,6 +403,16 @@ public:
             this.resolver.declare_field(field.name, field.span);
         }
 
+        // Then walk them.  Declaring a field is not resolving what its type
+        // annotation NAMES, and the field visitor - which stamps that
+        // annotation - was reachable from nothing: every field's annotation
+        // reached the type layer with no `Res` on it.  Declaration stays a
+        // separate first pass so a field's default value can name a sibling
+        // declared after it.
+        for (mut i: int = 0; i < node.fields.length; i++) {
+            node.fields[i].accept(this);
+        }
+
         // Visit methods
         for (mut i: int = 0; i < node.methods.length; i++) {
             node.methods[i].accept(this);
@@ -409,6 +435,16 @@ public:
             this.resolver.declare_field(field.name, field.span);
         }
 
+        // Then walk them.  Declaring a field is not resolving what its type
+        // annotation NAMES, and the field visitor - which stamps that
+        // annotation - was reachable from nothing: every field's annotation
+        // reached the type layer with no `Res` on it.  Declaration stays a
+        // separate first pass so a field's default value can name a sibling
+        // declared after it.
+        for (mut i: int = 0; i < node.fields.length; i++) {
+            node.fields[i].accept(this);
+        }
+
         // Visit methods
         for (mut i: int = 0; i < node.methods.length; i++) {
             node.methods[i].accept(this);
@@ -428,6 +464,16 @@ public:
         for (mut i: int = 0; i < node.fields.length; i++) {
             const field: FieldDeclNode* = node.fields[i];
             this.resolver.declare_field(field.name, field.span);
+        }
+
+        // Then walk them.  Declaring a field is not resolving what its type
+        // annotation NAMES, and the field visitor - which stamps that
+        // annotation - was reachable from nothing: every field's annotation
+        // reached the type layer with no `Res` on it.  Declaration stays a
+        // separate first pass so a field's default value can name a sibling
+        // declared after it.
+        for (mut i: int = 0; i < node.fields.length; i++) {
+            node.fields[i].accept(this);
         }
 
         // Visit methods
@@ -956,7 +1002,15 @@ public:
             TypeAnnotation::Named(n)       => { this.stamp_named_annotation(n); }
             TypeAnnotation::Pointer(p)     => { this.stamp_annotation(p.inner); }
             TypeAnnotation::Reference(r)   => { this.stamp_annotation(r.inner); }
-            TypeAnnotation::Array(a)       => { this.stamp_annotation(a.element); }
+            TypeAnnotation::Array(a)       => {
+                this.stamp_annotation(a.element);
+                // `T[N]`'s size is the one EXPRESSION hanging off an
+                // annotation.  It may name a constant or an enum variant, and
+                // the fold that reads it runs in TypeResolution, so a written
+                // qualifier has to be stamped here or there is nothing for
+                // that fold to read but the spelling.
+                if (a.size_expr != null) { a.size_expr.accept(this); }
+            }
             TypeAnnotation::Projection(pj) => { this.stamp_annotation(pj.base); }
             TypeAnnotation::Function(f)    => {
                 for (mut i: i64 = 0; i < f.parameters.length; i++) {
@@ -1497,7 +1551,7 @@ public:
         } else {
             node.name
         };
-        this.ctx.const_table.register_enum(qualified, node.name, node);
+        this.ctx.const_table.register_enum(qualified, node);
     }
 
     /// Binds what an `import` - or an `export` - names into the current scope.

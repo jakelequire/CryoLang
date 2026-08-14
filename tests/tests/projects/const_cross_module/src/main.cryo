@@ -10,11 +10,32 @@ type struct BareField      { f: u8[CAPACITY]; }
 type struct DerivedField   { f: u8[ConstCrossModule::Limits::HEADROOM]; }
 type struct EnumField      { f: u8[ConstCrossModule::Limits::TIER_LEN]; }
 
+/// The SUFFIX spelling: `Limits` is the last segment of
+/// `ConstCrossModule::Limits`, and naming a module that way is the normal case,
+/// not the exotic one. It is a distinct test from the fully-written path above
+/// because the constant table is keyed by the CANONICAL namespace - a folder
+/// that matched the written qualifier against that key would accept the long
+/// form and reject this one, which is what it did.
+type struct SuffixField     { f: u8[Limits::CAPACITY]; }
+type struct SuffixEnumField { f: u8[Limits::TIER_LEN]; }
+
+/// A constant whose own initializer is reached through a suffix path, then used
+/// as a length: the fold has to chase the name to its definition, not just
+/// answer the first one.
+const VIA_SUFFIX: i64 = Limits::CAPACITY;
+type struct ChainedField { f: u8[VIA_SUFFIX]; }
+
 static_assert(ConstCrossModule::Limits::CAPACITY == 12,
               "a qualified constant folds in a static_assert");
 static_assert(CAPACITY == 12, "the same constant, named bare");
+static_assert(Limits::CAPACITY == 12, "the same constant, named by suffix");
+static_assert(Limits::Tier::High as i64 == 2,
+              "an enum variant reached through a suffix-spelled module");
 static_assert(Tier::Mid as i64 == 1, "an enum variant from another module");
 static_assert(sizeof(QualifiedField) == 12, "a qualified constant sizes a type");
+static_assert(sizeof(SuffixField) == 12, "a suffix-spelled constant sizes a type");
+static_assert(sizeof(SuffixEnumField) == 2, "and so does its enum-cast constant");
+static_assert(sizeof(ChainedField) == 12, "through a constant that names one");
 static_assert(sizeof(DerivedField) == 3, "arithmetic done in the other module");
 static_assert(sizeof(EnumField) == 2, "an enum-cast constant crosses the boundary");
 
@@ -24,6 +45,9 @@ function main() -> int {
     const buf: u8[CAPACITY] = [1; ConstCrossModule::Limits::CAPACITY];
     const small: u8[ConstCrossModule::Limits::TIER_LEN] =
         [2; ConstCrossModule::Limits::TIER_LEN];
+    // The repeat position, reached by suffix. Annotated fixed, so a count that
+    // did not fold types the literal `u8[]` and this is E0200.
+    const suffix_buf: u8[Limits::CAPACITY] = [3; Limits::CAPACITY];
 
     // The same constants read as VALUES rather than as lengths.
     //
@@ -37,7 +61,11 @@ function main() -> int {
                       + (ConstCrossModule::Limits::HEADROOM - 3)
                       + (ConstCrossModule::Limits::TIER_LEN - 2)
                       + (ConstCrossModule::Limits::SLOT_BYTES as i64 - 16)
-                      + (ConstCrossModule::Limits::TWO_SLOTS as i64 - 32);
+                      + (ConstCrossModule::Limits::TWO_SLOTS as i64 - 32)
+                      + (Limits::CAPACITY - 12)
+                      + (VIA_SUFFIX - 12)
+                      + (suffix_buf.length - 12)
+                      + (suffix_buf[11] as i64 - 3);
 
     // The reals, compared exactly: every value here is a sum of negative
     // powers of two, so each is representable and an epsilon would only hide a
