@@ -12,6 +12,7 @@ import Compiler::AST::Node;
 import Compiler::Types::TypeRef;
 import Compiler::Resolver::SymbolStr;
 import Compiler::Resolver::Res;
+import Compiler::ResolveCounter;
 import Compiler::AST::Declaration;
 import Compiler::AST::Pattern;
 import Compiler::AST::Statement;
@@ -836,22 +837,52 @@ public:
         this.scope_res.answer(r);
     }
 
+    /// Record BOTH answers a synthesized `Type::member` reference has: the type
+    /// it names, and the name-layer `Res` derived from that type.
+    ///
+    /// A pass that builds a path-bearing node owes it a `Res`, because the
+    /// synthesizer is the only place the referent is known without a lookup.
+    /// Carrying only the type pushes every later consumer back to matching the
+    /// bare spelling against an index, which is the re-derivation the slot
+    /// exists to end - and a consumer that has to guess for synthesized nodes
+    /// keeps the guess alive for written ones too.
+    ///
+    /// `def_name` is the DEFINITION's canonical name, which the caller derives
+    /// from `ty` (`CompilationContext::definition_name_of`); it is not read off
+    /// the spelling the node was built with, since a synthesizer holds a bare
+    /// one. The trailing count is 1: the base is what `ty` names and the member
+    /// segment is the type layer's to finish.
+    ///
+    /// An empty `def_name` leaves the slot unanswered rather than inventing a
+    /// base. A synthesized reference to a type that names no declaration is a
+    /// defect in the synthesizer, and an unanswered slot is what reports it -
+    /// against the stage that needed the answer, with a site - instead of being
+    /// absorbed here.
+    set_synthesized_ref(ty: TypeRef, def_name: SymbolStr) -> void {
+        this.set_resolved_type(ty);
+        this.set_synthesized_res(def_name);
+    }
+
+    /// The `Res` half alone, for a synthesizer that knows WHAT it is referring
+    /// to before it knows the type - a lowering that names a stdlib type and
+    /// lets the following resolution walk supply the instantiation.
+    set_synthesized_res(def_name: SymbolStr) -> void {
+        if (def_name.is_valid()) {
+            this.set_scope_res(Res::TypeRelative(ResBase::Def(def_name), 1));
+            ResolveCounter::Site::SynthScopeResStamped.bump();
+            return;
+        }
+        ResolveCounter::Site::SynthScopeResNoName.bump();
+    }
+
     /// What this node's scope segment refers to, for a stage that needs it.
     ///
-    /// An unstamped slot is an internal error only when the node has no answer
-    /// at all.  A node this compiler SYNTHESIZED carries its type directly -
-    /// the synthesizer built the reference and knew what it was building - and
-    /// that is an answer, just not a name-layer one.  Demanding a `Res` from it
-    /// too would either report a hole that is not there, or push the
-    /// synthesizer into inventing a qualified name it does not have, which is
-    /// the string-keyed re-derivation the slot exists to end.
-    ///
-    /// So the missing-answer report is about nodes with NEITHER, which is
-    /// exactly the population a later stage can do nothing with.
+    /// `Pending` here means no resolver and no synthesizer claimed a node a
+    /// later stage depends on. It is an internal error in both cases and never
+    /// a licence to search: a node built by a pass owes its own `Res`
+    /// (`set_synthesized_ref`), so "this one was synthesized" is a defect
+    /// report and not an exemption.
     require_scope_res(&this, site: string) -> Res {
-        if (this.scope_res.is_pending() && this.has_resolved_type()) {
-            return Res::Err;
-        }
         return this.scope_res.require(site);
     }
 
