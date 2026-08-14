@@ -1,0 +1,83 @@
+///! A named constant is a length everywhere a length is wanted: in a type
+///! (`u8[N]`), in the repeat expression that initializes it (`[0; N]`), and in
+///! a `static_assert` about it.  All three fold through one evaluator, so a
+///! constant that sizes a field also sizes that field's initializer - which is
+///! the point of naming the length once.
+///!
+///! Lengths are asserted with `sizeof`, not by reading the constant at run
+///! time: a fixed array carries its length in its TYPE, so a wrong fold shows
+///! up as a differently sized struct.  (A module-level `const` whose
+///! initializer is an expression rather than a literal reads 0 at run time -
+///! a separate defect in how a global initializer is emitted, unrelated to
+///! what the length folds to.)
+///!
+///! Constants are folded on demand, not at their declaration, so a length may
+///! name a constant declared later in the file.  That is the same mechanism
+///! that lets a length name a constant in another module, where no source
+///! order exists at all - see tests/projects/const_cross_module.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::ConstArraySize;
+
+import std::core::result;
+import std::test::error;
+import std::test::assert;
+
+type enum CasSlot {
+    First;
+    Second;
+    Third;
+}
+
+const CAS_LEN:       i64 = 16;
+const CAS_DOUBLE:    i64 = CAS_LEN * 2;
+const CAS_FROM_ENUM: i64 = CasSlot::Third as i64;
+
+type struct CasFixed  { f: u8[CAS_LEN]; }
+type struct CasDouble { f: u8[CAS_DOUBLE]; }
+type struct CasEnum   { f: u8[CAS_FROM_ENUM]; }
+
+/// Sized by a constant the file has not reached yet.
+type struct CasLate   { f: u8[CAS_LATE]; }
+const CAS_LATE: i64 = 4;
+
+static_assert(CAS_LEN == 16, "a named constant folds in a static_assert");
+static_assert(CAS_DOUBLE == 32, "arithmetic over a named constant folds");
+static_assert(CAS_FROM_ENUM == 2, "a constant initialized from an enum cast folds");
+static_assert(CasSlot::Second as i64 == 1, "an enum variant folds directly");
+static_assert(sizeof(CasFixed) == CAS_LEN, "the type carries the named length");
+static_assert(sizeof(CasDouble) == 32, "arithmetic sizes the type");
+static_assert(sizeof(CasEnum) == 2, "an enum-cast constant sizes the type");
+static_assert(sizeof(CasLate) == 4, "a length may name a later constant");
+
+![test]
+function repeat_expression_uses_the_same_constant() -> Result<(), TestError> {
+    // The load-bearing assertion: the annotation and the initializer agree
+    // about `CAS_LEN`.  A repeat count that did not fold would type the
+    // literal `u8[]` and fail this binding with E0200.
+    const buf: u8[CAS_LEN] = [7; CAS_LEN];
+    expect_eq(buf.length as i64, 16)?;
+    expect_eq(buf[0] as i64, 7)?;
+    expect_eq(buf[15] as i64, 7)?;
+    return Result::Ok(());
+}
+
+![test]
+function repeat_expression_folds_an_enum_cast_constant() -> Result<(), TestError> {
+    const buf: u8[CAS_FROM_ENUM] = [3; CAS_FROM_ENUM];
+    expect_eq(buf.length as i64, 2)?;
+    expect_eq(buf[1] as i64, 3)?;
+    return Result::Ok(());
+}
+
+![test]
+function a_runtime_count_still_builds_a_dynamic_array() -> Result<(), TestError> {
+    // The control for the two above: a count that is NOT a compile-time
+    // constant must still produce a run-time-sized array, not a diagnostic.
+    mut n: i64 = 3;
+    n = n + 2;
+    const buf: u8[] = [1; n];
+    expect_eq(buf.length as i64, 5)?;
+    expect_eq(buf[4] as i64, 1)?;
+    return Result::Ok(());
+}
