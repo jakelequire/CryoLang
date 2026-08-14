@@ -1622,7 +1622,7 @@ type struct DeclarationEmitter {
                 // in LLVMConstInt, which is exact for those types.
                 if (llvm::LLVMGetIntTypeWidth(ty.raw) <= 64) {
                     mut ifold: u64 = 0;
-                    if (DeclarationEmitter::try_fold_const_int(init_expr, &ifold)) {
+                    if (this.try_fold_const_int(init_expr, &ifold)) {
                         init = LType::const_int(ty, ifold, true);
                     }
                 }
@@ -1638,7 +1638,7 @@ type struct DeclarationEmitter {
         if (!init.is_valid() && init_expr != null
             && init_expr.kind == NodeKind::StructLiteral
             && LType::kind_of(ty.raw) == LTypeKind::Struct) {
-            init = DeclarationEmitter::try_const_struct(
+            init = this.try_const_struct(
                 this.type_mapper, gty, init_expr as StructLiteralNode*, ty);
         }
         if (!init.is_valid()) {
@@ -2553,9 +2553,43 @@ type struct DeclarationEmitter {
     /// well-defined wrapping (codegen emits plain LLVMBuildAdd/Sub/Mul) and
     /// bit-identical to the signed result, which is what makes
     /// `const EOF: i32 = -1;` carry 0xFFFFFFFF instead of silently becoming 0.
-    static try_fold_const_int(expr: ExpressionNode*, out: u64*) -> boolean {
+    try_fold_const_int(&this, expr: ExpressionNode*, out: u64*) -> boolean {
         if (expr == null) { return false; }
         const node: ASTNode* = expr as ASTNode*;
+        if (node.kind == NodeKind::CastExpression) {
+            // `Enum::Variant as u64`, `SOME_CONST as i32`.  Fold the OPERAND:
+            // the cast's own width is applied by `const_int` when it builds the
+            // constant against the global's type, so a cast chain folds once and
+            // narrows once.  Without this the initializer does not fold at all
+            // and the global lands on the zero fallback below.
+            const ce: CastExprNode* = expr as CastExprNode*;
+            return this.try_fold_const_int(ce.expression, out);
+        }
+        if (node.kind == NodeKind::ScopeResolution) {
+            // `Enum::Variant`: a payload-free variant IS its discriminant.
+            // Naming the enum rather than copying its number is the spelling
+            // that survives a header change, and it is the one that silently
+            // produced 0 at module scope.
+            const sr: ScopeResolutionNode* = expr as ScopeResolutionNode*;
+            mut real_ref: TypeRef = sr.resolved_type;
+            mut real_t: Type* = this.lookup_type_by_id(real_ref.id);
+            mut depth: i32 = 0;
+            while (real_t != null && real_t.kind == TypeKind::InstantiatedType && depth < 5) {
+                const inst: InstantiatedType* = real_t as InstantiatedType*;
+                if (!inst.has_resolved_type()) { break; }
+                real_ref = inst.resolved_type;
+                real_t = this.lookup_type_by_id(real_ref.id);
+                depth += 1;
+            }
+            if (real_t == null || real_t.kind != TypeKind::Enum) { return false; }
+            const et: EnumType* = real_t as EnumType*;
+            const variant: EnumVariantInfo* = et.get_variant(sr.member_name);
+            // A variant carrying a payload is a CONSTRUCTOR, not a constant -
+            // its tag alone is not the value the initializer names.
+            if (variant == null || variant.has_payload()) { return false; }
+            *out = variant.tag_value;
+            return true;
+        }
         if (node.kind == NodeKind::Literal) {
             const lit: LiteralNode* = expr as LiteralNode*;
             if (lit.literal_kind == LiteralKind::Integer) {
@@ -2571,7 +2605,7 @@ type struct DeclarationEmitter {
         if (node.kind == NodeKind::UnaryExpression) {
             const u: UnaryExprNode* = expr as UnaryExprNode*;
             mut a: u64 = 0;
-            if (!DeclarationEmitter::try_fold_const_int(u.operand, &a)) { return false; }
+            if (!this.try_fold_const_int(u.operand, &a)) { return false; }
             const op: string = u.op.lexeme;
             if (op == "-") { *out = 0 - a; return true; }
             if (op == "+") { *out = a;        return true; }
@@ -2582,8 +2616,8 @@ type struct DeclarationEmitter {
             const b: BinaryExprNode* = expr as BinaryExprNode*;
             mut x: u64 = 0;
             mut y: u64 = 0;
-            if (!DeclarationEmitter::try_fold_const_int(b.left, &x)) { return false; }
-            if (!DeclarationEmitter::try_fold_const_int(b.right, &y)) { return false; }
+            if (!this.try_fold_const_int(b.left, &x)) { return false; }
+            if (!this.try_fold_const_int(b.right, &y)) { return false; }
             const op: string = b.op.lexeme;
             if (op == "+")  { *out = x + y;  return true; }
             if (op == "-")  { *out = x - y;  return true; }
@@ -2613,8 +2647,8 @@ type struct DeclarationEmitter {
     /// fields-plus-padding is an unexpected shape and declines, as before -
     /// but the count alone can no longer decide, because padding makes a
     /// correct body wider than its field list.
-    static try_const_struct(mapper: TypeMapper*, layout: Type*,
-                            sl: StructLiteralNode*, ty: LType) -> LValue {
+    try_const_struct(&this, mapper: TypeMapper*, layout: Type*,
+                     sl: StructLiteralNode*, ty: LType) -> LValue {
         const n: u32 = llvm::LLVMCountStructElementTypes(ty.raw);
         if (n == 0 || mapper == null || layout == null) { return LValue::null(); }
         // Every field initialized, in declaration order - the shape the
@@ -2645,7 +2679,7 @@ type struct DeclarationEmitter {
             mut slot: LValue = LValue::null();
             if (fk == LTypeKind::Integer) {
                 mut iv: u64 = 0;
-                if (DeclarationEmitter::try_fold_const_int(fexpr, &iv)) {
+                if (this.try_fold_const_int(fexpr, &iv)) {
                     slot = LType::const_int(fty, iv, true);
                 }
             } else if (fk == LTypeKind::Float || fk == LTypeKind::Double) {

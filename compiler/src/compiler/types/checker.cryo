@@ -301,6 +301,25 @@ type struct TypeChecker {
             return TypeCompatibility::ExplicitCast;
         }
 
+        // A closure value binds to a `(Args) -> Ret` slot.  A capturing lambda
+        // lowers to an anonymous struct carrying a `__call__` method whose
+        // interned signature IS the lambda's own, and the callee is specialised
+        // per closure type so the call stays direct - there is no function
+        // pointer anywhere in the lowering, which is why plain id equality
+        // cannot see the relation.  Structural: any struct with a `__call__` of
+        // the target signature qualifies, so this is not tied to the synthesised
+        // closure's name.  A `__call__` of a DIFFERENT signature stays a
+        // mismatch; where a closure may be passed at all is E0458's question,
+        // not this one.
+        if (to_type.kind == TypeKind::Function && from_type.kind == TypeKind::Struct) {
+            const from_st: StructType* = from_type as StructType*;
+            const call_m: MethodInfo* = from_st.get_method(
+                this.arena.intern_table.intern("__call__"));
+            if (call_m != null && call_m.function_type.equals(effective_to)) {
+                return TypeCompatibility::Compatible;
+            }
+        }
+
         // i8* -> string: C string to Cryo string (string is i8* at LLVM level)
         if (from_type.kind == TypeKind::Pointer && to_type.kind == TypeKind::String) {
             const from_ptr: PointerType* = from_type as PointerType*;
