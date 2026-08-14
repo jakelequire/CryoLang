@@ -1,0 +1,40 @@
+// E0214: when a type has SEVERAL same-named methods, a call matching none of
+// them is still an error.  The single-candidate case has always been checked;
+// the overload set was not, because the checker compares against one signature
+// and stops when it cannot pick one.  A call that reaches codegen unchecked is
+// bound there by name and arity alone, so the argument is read at whichever
+// candidate's parameter type came first - `a * k` returned `0 4 3` from a
+// `Vec3` whose scalar product is `2 4 6`, with no error and no warning.
+//
+// Two `Mul` impls is ordinary vector-library design (scalar and component-wise),
+// and neither takes `f64`.  The argument here is a VARIABLE on purpose: an
+// untyped `2.0` literal reaches the same error today, but by way of defaulting
+// to `f64` first, and what must not regress is the check itself rather than any
+// particular literal-typing policy.
+![config(testing)]
+![config(negative, E0214)]
+namespace CryoTests::Negative::OverloadSetNoMatch;
+
+import std::core::ops::{ Mul };
+
+type struct Vec3 { x: f32; y: f32; z: f32; }
+
+implement trait Mul<f32, Vec3> for struct Vec3 {
+    mul(&this, rhs: &f32) -> Vec3 {
+        return Vec3 { x: this.x * *rhs, y: this.y * *rhs, z: this.z * *rhs };
+    }
+}
+
+implement trait Mul<Vec3, Vec3> for struct Vec3 {
+    mul(&this, rhs: &Vec3) -> Vec3 {
+        return Vec3 { x: this.x * rhs.x, y: this.y * rhs.y, z: this.z * rhs.z };
+    }
+}
+
+function main() -> int {
+    const a: Vec3 = Vec3 { x: 1.0, y: 2.0, z: 3.0 };
+    const k: f64  = 2.0;
+    const s: Vec3 = a * k;   //~ ERROR[E0214] no overload of `mul` accepts these arguments
+    if (s.x > 0.0) { return 1; }
+    return 0;
+}

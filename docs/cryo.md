@@ -2317,6 +2317,23 @@ const s: string = null;          // string is pointer-shaped
 if (s == null) { println("no name"); }
 ```
 
+A function-pointer type `(A) -> R` is a pointer context too, so an optional
+callback slot takes a bare `null` wherever the type is stated - a binding's
+annotation, a `return`, a struct-literal field ([section 18.4](#184-function-pointer-callbacks)):
+
+```cryo
+type struct Vtable {
+    drop_fn: (void*) -> void;
+    data:    void*;
+}
+const vt: Vtable = Vtable { drop_fn: null, data: null };
+```
+
+This is the `null` literal taking the type its context states, not a conversion
+between `void*` and a function pointer. That conversion stays explicit in both
+directions, so an arbitrary `void*` still cannot become callable without an
+`as`.
+
 Dereferencing a null pointer is undefined behaviour. For "may be absent" semantics on a value, use `Option<T>` rather than a nullable pointer; the compiler then forces you to handle the absent case at every use.
 
 ### 15.4 NonNull
