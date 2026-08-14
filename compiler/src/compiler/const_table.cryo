@@ -39,6 +39,7 @@ import Compiler::Types::{ TypeRef, Arena };
 import Compiler::Types::Type;
 import std::core::option;
 import std::collections::hashmap;
+import std::fmt::float;
 
 
 /// Largest magnitude representable in i64, as u64.  Folding bails above this
@@ -63,6 +64,16 @@ type struct ConstEntry {
     init:      ExpressionNode*;
     value:     i64;
     state:     i32;
+    /// The same initializer folded as a REAL, memoized separately.
+    ///
+    /// Separate slots rather than one numeric slot because the two folds accept
+    /// different expressions and must not answer for each other: `1 / 2` is 0
+    /// as an integer and 0.5 as a real, so a value cached by one question would
+    /// be a wrong answer to the other. The INDEX is shared - a constant is
+    /// named the same ways whatever its type - and only the interpretation
+    /// differs.
+    real_value: f64;
+    real_state: i32;
     /// Next entry sharing this leaf name, or -1.  A bare use folds every
     /// candidate on the chain and answers only when they agree.
     next_same_bare: i64;
@@ -116,10 +127,12 @@ type struct ConstantTable {
              module_ns: SymbolStr, init: ExpressionNode*) -> void {
         match (this.by_qualified.get(&qualified.id)) {
             Option::Some(existing) => {
-                this.entries[existing].module_ns = module_ns;
-                this.entries[existing].init      = init;
-                this.entries[existing].value     = 0;
-                this.entries[existing].state     = CONST_PENDING;
+                this.entries[existing].module_ns  = module_ns;
+                this.entries[existing].init       = init;
+                this.entries[existing].value      = 0;
+                this.entries[existing].state      = CONST_PENDING;
+                this.entries[existing].real_value = 0.0;
+                this.entries[existing].real_state = CONST_PENDING;
                 return;
             }
             Option::None => { }
@@ -139,6 +152,8 @@ type struct ConstantTable {
             init:           init,
             value:          0,
             state:          CONST_PENDING,
+            real_value:     0.0,
+            real_state:     CONST_PENDING,
             next_same_bare: head,
         });
         this.by_qualified.insert(qualified.id, idx);
@@ -341,8 +356,11 @@ type struct ConstEval {
 
         if (node.kind == NodeKind::SizeofExpression) {
             const s: SizeofExprNode* = expr as SizeofExprNode*;
-            if (this.arena == null || !s.resolved_type.is_valid()) { return false; }
-            const t: Type* = this.arena.lookup(s.resolved_type.id);
+            // `operand_type`, never `resolved_type`: the latter is the type of
+            // the `sizeof` EXPRESSION (`u64`), so reading it here measures the
+            // count instead of the thing being counted.
+            if (this.arena == null || !s.operand_type.is_valid()) { return false; }
+            const t: Type* = this.arena.lookup(s.operand_type.id);
             if (t == null) { return false; }
             *out = t.size_bytes() as i64;
             return true;
@@ -350,8 +368,8 @@ type struct ConstEval {
 
         if (node.kind == NodeKind::AlignofExpression) {
             const a: AlignofExprNode* = expr as AlignofExprNode*;
-            if (this.arena == null || !a.resolved_type.is_valid()) { return false; }
-            const t: Type* = this.arena.lookup(a.resolved_type.id);
+            if (this.arena == null || !a.operand_type.is_valid()) { return false; }
+            const t: Type* = this.arena.lookup(a.operand_type.id);
             if (t == null) { return false; }
             *out = t.alignment() as i64;
             return true;
@@ -377,6 +395,93 @@ type struct ConstEval {
             return ConstEval::apply_binary(b.op.lexeme, x, y, out);
         }
 
+        return false;
+    }
+
+    /// Fold a compile-time REAL expression to its `f64` value.
+    ///
+    /// The same environment and the same index as `fold`, interpreting the
+    /// expression as a real instead of an integer.  It exists because a real
+    /// initializer reaches exactly the same dead end an integer one did: an
+    /// unfolded module-level initializer is not diagnosed, it is emitted as
+    /// zero, so a folder that cannot read a name publishes 0.0 for
+    /// `const D: f64 = A * B;`.
+    ///
+    /// An INTEGER-valued subexpression folds here too, promoted - that is what
+    /// makes `2.0 * 3` and `RADIUS * COUNT` mean what they read as. The integer
+    /// folder is asked for those rather than duplicated, so a shape either
+    /// folder accepts has one implementation and cannot drift.
+    ///
+    /// Division needs no signedness detour as it does in the integer folder:
+    /// `/` is exact-in-kind for reals, and it is the operator a derived real
+    /// constant is most often written with.
+    fold_real(&this, expr: ExpressionNode*, out: f64*) -> boolean {
+        if (expr == null) { return false; }
+        const node: ASTNode* = expr as ASTNode*;
+
+        if (node.kind == NodeKind::Literal) {
+            const lit: LiteralNode* = expr as LiteralNode*;
+            if (lit.literal_kind == LiteralKind::Float) {
+                // The lexeme carries any type suffix; the lexer already found
+                // the boundary, so strip it rather than re-deriving it.
+                mut text: string = lit.value;
+                const slen: i64 = lit.suffix.length() as i64;
+                if (slen > 0) {
+                    const vlen: i64 = lit.value.length() as i64;
+                    if (vlen <= slen) { return false; }
+                    text = lit.value.substr(0, (vlen - slen) as u64);
+                }
+                match (float::parse_f64(text)) {
+                    Option::Some(v) => { *out = v; return true; }
+                    Option::None    => { return false; }
+                }
+            }
+            // A non-float literal is an integer-valued constant; fall through.
+        }
+
+        if (node.kind == NodeKind::Identifier) {
+            const id: IdentifierNode* = expr as IdentifierNode*;
+            if (this.fold_named_real(id.name, out)) { return true; }
+            // Not a real constant - it may still be an integer one.
+        }
+
+        if (node.kind == NodeKind::CastExpression) {
+            const c: CastExprNode* = expr as CastExprNode*;
+            // The cast's own width is applied by the emitter against the
+            // global's type, so the operand folds once and converts once.
+            return this.fold_real(c.expression, out);
+        }
+
+        if (node.kind == NodeKind::UnaryExpression) {
+            const u: UnaryExprNode* = expr as UnaryExprNode*;
+            mut a: f64 = 0.0;
+            if (!this.fold_real(u.operand, &a)) { return false; }
+            if (u.op.lexeme == "-") { *out = 0.0 - a; return true; }
+            if (u.op.lexeme == "+") { *out = a;       return true; }
+            return false;
+        }
+
+        if (node.kind == NodeKind::BinaryExpression) {
+            const b: BinaryExprNode* = expr as BinaryExprNode*;
+            mut x: f64 = 0.0;
+            mut y: f64 = 0.0;
+            if (!this.fold_real(b.left,  &x)) { return false; }
+            if (!this.fold_real(b.right, &y)) { return false; }
+            const op: string = b.op.lexeme;
+            if (op == "+") { *out = x + y; return true; }
+            if (op == "-") { *out = x - y; return true; }
+            if (op == "*") { *out = x * y; return true; }
+            // Division by zero is NOT refused: IEEE gives it an answer, and it
+            // is the same answer the emitted code would compute, so declining
+            // would replace an infinity with the zero the fallback publishes.
+            if (op == "/") { *out = x / y; return true; }
+            return false;
+        }
+
+        // Anything else this environment can evaluate is integer-valued
+        // (a named integer constant, an enum variant, `sizeof`), promoted.
+        mut iv: i64 = 0;
+        if (this.fold(expr, &iv)) { *out = iv as f64; return true; }
         return false;
     }
 
@@ -502,6 +607,62 @@ type struct ConstEval {
         }
         this.table.entries[idx].value = v;
         this.table.entries[idx].state = CONST_FOLDED;
+        *out = v;
+        return true;
+    }
+
+    /// `fold_named`, as a real.
+    fold_named_real(&this, name: SymbolStr, out: f64*) -> boolean {
+        if (this.table == null) { return false; }
+        const idx: i64 = ConstantTable::index_of(
+            &this.table.by_qualified, &this.table.by_bare,
+            name, this.module_ns, this.intern);
+        if (idx < 0) { return false; }
+        return this.fold_chain_real(idx, out);
+    }
+
+    /// `fold_chain`, as a real: every candidate sharing the leaf must agree.
+    fold_chain_real(&this, head: i64, out: f64*) -> boolean {
+        mut answered: boolean = false;
+        mut answer: f64 = 0.0;
+        mut i: i64 = head;
+        while (i >= 0) {
+            mut v: f64 = 0.0;
+            if (this.fold_entry_real(i, &v)) {
+                if (answered && v != answer) { return false; }
+                answered = true;
+                answer   = v;
+            }
+            i = this.table.entries[i].next_same_bare;
+        }
+        if (!answered) { return false; }
+        *out = answer;
+        return true;
+    }
+
+    /// `fold_entry`, as a real, memoized in the entry's own real slots and
+    /// guarded against cycles the same way.
+    fold_entry_real(&this, idx: i64, out: f64*) -> boolean {
+        if (this.table == null) { return false; }
+        if (idx < 0 || idx >= this.table.entries.length) { return false; }
+
+        const state: i32 = this.table.entries[idx].real_state;
+        if (state == CONST_FOLDED)  { *out = this.table.entries[idx].real_value; return true; }
+        if (state == CONST_FOLDING) { return false; }
+
+        const init: ExpressionNode* = this.table.entries[idx].init;
+        if (init == null) { return false; }
+
+        this.table.entries[idx].real_state = CONST_FOLDING;
+        mut v: f64 = 0.0;
+        const inner: ConstEval = this.in_module(this.table.entries[idx].module_ns);
+        const ok: boolean = inner.fold_real(init, &v);
+        if (!ok) {
+            this.table.entries[idx].real_state = CONST_PENDING;
+            return false;
+        }
+        this.table.entries[idx].real_value = v;
+        this.table.entries[idx].real_state = CONST_FOLDED;
         *out = v;
         return true;
     }
