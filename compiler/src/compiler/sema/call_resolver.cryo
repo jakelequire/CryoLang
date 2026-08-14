@@ -2120,27 +2120,85 @@ type struct CallResolver {
         return this.ctx.decl_index.canonical_qualified(name);
     }
 
+    /// `(&f32, i64)` - one parameter list, rendered.  `from` is where the
+    /// candidate's slice starts in the flat array, `n` how long it is.
+    render_param_list(&this, params: &TypeRef[], from: i64, n: i64) -> string {
+        mut s: string = "(";
+        for (mut i: i64 = 0; i < n; i++) {
+            if (i > 0) { s = s + ", "; }
+            s = s + this.types.type_display_name(params[from + i]);
+        }
+        return s + ")";
+    }
+
+    /// No member of an overload set accepts this call's arguments.
+    ///
+    /// Reported here rather than deferred to `check_args_against_params`, which
+    /// needs ONE signature to compare against: the defining feature of this case
+    /// is that there are several and none of them fits, so the argument types
+    /// and the candidate list are what make it actionable.
+    ///
+    /// Silent unless every argument has a concrete type - an abstract one has
+    /// nothing to judge, and the same guard is why `check_args_against_params`
+    /// skips those positions.
+    emit_no_matching_overload(mut &this, call: CallExprNode*, member: MemberAccessNode*,
+                              recv: TypeRef, cand_params: &TypeRef[], argc: i64) -> void {
+        if (this.state.in_symbolic_check) { return; }
+        mut argstr: string = "";
+        for (mut i: i64 = 0; i < call.arguments.length; i++) {
+            const arg: ExpressionNode* = call.arguments[i];
+            if (arg == null) { return; }
+            if (!this.types.arg_type_is_concrete(arg.resolved_type)) { return; }
+            if (i > 0) { argstr = argstr + ", "; }
+            argstr = argstr + this.types.type_display_name(arg.resolved_type);
+        }
+        const name_str: string = this.intern.resolve(member.member);
+        mut diag: Diagnostic = Diagnostic::error(
+            ErrorCode::E0214_ARGUMENT_MISMATCH,
+            format("no overload of `%s` accepts these arguments", name_str));
+        diag = diag.at_with_label(call.span,
+            format("no `%s` on `%s` takes `(%s)`", name_str,
+                   this.types.type_display_name(recv), argstr));
+        if (argc > 0) {
+            const count: i64 = cand_params.length / argc;
+            mut note: string = "candidates are ";
+            for (mut c: i64 = 0; c < count; c++) {
+                if (c > 0) {
+                    if (c + 1 == count) { note = note + " and "; }
+                    else                { note = note + ", "; }
+                }
+                note = note + "`" + name_str
+                     + this.render_param_list(cand_params, c * argc, argc) + "`";
+            }
+            if (count > 0) { diag = diag.with_note(note); }
+        }
+        this.ctx.emit_diagnostic(diag);
+    }
+
     /// Per-argument type checking for an instance method call.  Gathers same-named
-    /// candidates from inherent methods + trait impls; checks only when a single
-    /// distinct signature emerges, else flags two-trait ambiguity / arity.
+    /// candidates from inherent methods + trait impls; checks against the single
+    /// signature when one emerges, and against the binder's verdict when several
+    /// do; flags two-trait ambiguity / arity.
     check_method_call_arg_types(mut &this, visitor: ASTVisitor*, call: CallExprNode*,
                                 member: MemberAccessNode*) -> void {
         const obj_type: TypeRef = member.object.resolved_type;
         if (!obj_type.is_valid()) { return; }
+        mut base_ref: TypeRef = obj_type;
         mut base_t: Type* = this.arena.lookup(obj_type.id);
         mut unwrap_depth: i32 = 0;
         while (base_t != null && unwrap_depth < 5) {
             if (base_t.kind == TypeKind::Pointer) {
-                base_t = this.arena.lookup((base_t as PointerType*).pointee.id);
+                base_ref = (base_t as PointerType*).pointee;
             } else if (base_t.kind == TypeKind::Reference) {
-                base_t = this.arena.lookup((base_t as ReferenceType*).referent.id);
+                base_ref = (base_t as ReferenceType*).referent;
             } else if (base_t.kind == TypeKind::InstantiatedType) {
                 const inst: InstantiatedType* = base_t as InstantiatedType*;
                 if (!inst.has_resolved_type()) { return; }
-                base_t = this.arena.lookup(inst.resolved_type.id);
+                base_ref = inst.resolved_type;
             } else {
                 break;
             }
+            base_t = this.arena.lookup(base_ref.id);
             unwrap_depth += 1;
         }
         if (base_t == null) { return; }
@@ -2155,6 +2213,14 @@ type struct CallResolver {
         mut chosen:    TypeRef[] = [];
         mut name_seen:  i64 = 0;
         mut uniq_arity: i64 = -1;
+        // Every arity-matching candidate's parameter types, flat: each candidate
+        // contributes exactly `argc` entries, so the diagnostic chunks them back
+        // apart.  Collected in the walk that finds them rather than by a second
+        // walk at the diagnostic, so the set reported is by construction the set
+        // that was considered - and held as TypeRefs rather than rendered text,
+        // because this runs at every method call and only the error path needs
+        // the strings.
+        mut cand_params: TypeRef[] = [];
 
         const empty_minfo: MethodInfo[] = [];
         mut methods_ref: &MethodInfo[] = &empty_minfo;
@@ -2176,6 +2242,9 @@ type struct CallResolver {
                 name_seen  += 1;
                 uniq_arity  = this.diag.note_arity(uniq_arity, m.param_types.length);
                 if (m.param_types.length != argc) { continue; }
+                for (mut ci: i64 = 0; ci < m.param_types.length; ci++) {
+                    cand_params.push(m.param_types[ci]);
+                }
                 if (!found) {
                     found = true;
                     chosen = [];
@@ -2238,6 +2307,9 @@ type struct CallResolver {
                         name_seen  += 1;
                         uniq_arity  = this.diag.note_arity(uniq_arity, tparams.length);
                         if (tparams.length != argc) { tparams.drop(); continue; }
+                        for (mut ci: i64 = 0; ci < tparams.length; ci++) {
+                            cand_params.push(tparams[ci]);
+                        }
                         if (!found) {
                             found = true;
                             chosen = tparams;
@@ -2274,7 +2346,20 @@ type struct CallResolver {
             this.ctx.emit_diagnostic(diag);
             return;
         }
-        if (ambiguous) { return; }
+        // Several arity-matching signatures is an overload SET, not a reason to
+        // stop checking.  There is no single `chosen` to compare against, but
+        // `resolve_method_overload` ran first and has already decided which
+        // member this call names; when it bound nothing, no candidate accepts
+        // these arguments.  Returning silently hands such a call to codegen,
+        // whose name+arity fallback picks a same-named sibling and reads the
+        // argument at THAT signature's parameter type - a reinterpretation with
+        // no diagnostic, where a single candidate would have produced E0214.
+        if (ambiguous) {
+            if (call.resolved_method == null) {
+                this.emit_no_matching_overload(call, member, base_ref, cand_params, argc);
+            }
+            return;
+        }
         if (found) {
             this.check_args_against_params(visitor, call, chosen.as_slice());
             return;
