@@ -1176,6 +1176,13 @@ public:
                         const slice_sym: SymbolStr = this.intern.intern("Slice");
                         const from_raw_sym: SymbolStr = this.intern.intern("from_raw");
                         mut sr: ScopeResolutionNode* = new ScopeResolutionNode(slice_sym, from_raw_sym, sp);
+                        // The reference is to the stdlib `Slice`, and its
+                        // canonical name comes from the import scope this
+                        // declaration was written in - not from the bare
+                        // spelling the lowering was built with, which names
+                        // nothing on its own.
+                        sr.set_synthesized_res(
+                            this.ctx.resolve_scoped_or(slice_sym, FILE, LINE));
                         mut elt_named: NamedAnnotation* = new NamedAnnotation {
                             name: SymbolStr::empty(), span: sp, pre_resolved: at.element,
                             res: ResSlot::Pending,
@@ -2427,7 +2434,7 @@ public:
                     span: SourceSpan) -> ExpressionNode* {
         mut scope: ScopeResolutionNode* = new ScopeResolutionNode(
             this.intern.intern("Poll"), this.intern.intern("Ready"), span);
-        scope.set_resolved_type(poll_out);
+        scope.set_synthesized_ref(poll_out, this.ctx.definition_name_of(poll_out));
         mut call: CallExprNode* = new CallExprNode(scope as ExpressionNode*, span);
         call.add_argument(value);
         call.set_resolved_type(poll_out);
@@ -2472,7 +2479,13 @@ public:
         return 0;
     }
 
-    build_try_desugar(mut &this, node: TryExprNode*, is_result: boolean) -> MatchExprNode* {
+    /// `ret_ty` is the ENCLOSING FUNCTION's return type, not the operand's: the
+    /// `Err`/`None` this builds is the value returned on the error arm, so that
+    /// is the enum its scope segment names. The two agree on shape (the caller
+    /// rejects a mismatch) but not necessarily on instantiation, and only the
+    /// returned one is what the synthesized reference refers to.
+    build_try_desugar(mut &this, node: TryExprNode*, is_result: boolean,
+                      ret_ty: TypeRef) -> MatchExprNode* {
         const span: SourceSpan = node.span;
         this.state.try_counter += 1;
         const enum_name: SymbolStr = this.intern.intern(if (is_result) { "Result" } else { "Option" });
@@ -2504,12 +2517,14 @@ public:
             const err_pb: PatternBinding* = new PatternBinding { name: err_bind, span: span };
             err_pat.add_element(PatternElement::Binding(err_pb));
             mut err_scope: ScopeResolutionNode* = new ScopeResolutionNode(enum_name, err_variant, span);
+            err_scope.set_synthesized_ref(ret_ty, this.ctx.definition_name_of(ret_ty));
             mut err_call: CallExprNode* = new CallExprNode(err_scope as ExpressionNode*, span);
             err_call.add_argument(new IdentifierNode(err_bind, span) as ExpressionNode*);
             ret_value = err_call as ExpressionNode*;
         } else {
             mut bare_err: ScopeResolutionNode* =
                 new ScopeResolutionNode(enum_name, err_variant, span);
+            bare_err.set_synthesized_ref(ret_ty, this.ctx.definition_name_of(ret_ty));
             ret_value = bare_err as ExpressionNode*;
         }
         // Inside the `poll` an `async fn` was lowered into, every `return`
@@ -2589,7 +2604,7 @@ public:
             this.ctx.emit_diagnostic(diag);
             return TypeRef::invalid();
         }
-        mut desugared: MatchExprNode* = this.build_try_desugar(node, operand_shape == 1);
+        mut desugared: MatchExprNode* = this.build_try_desugar(node, operand_shape == 1, fn_ret);
         node.set_desugared(desugared as ExpressionNode*);
         return this.resolve_expr(desugared as ExpressionNode*);
     }
