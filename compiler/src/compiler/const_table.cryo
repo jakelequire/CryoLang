@@ -17,11 +17,22 @@
 ///! table and `DeclIndex` already imports the resolver, so hanging it off the
 ///! declaration index would close an import cycle.
 ///!
-///! Naming: entries are keyed by qualified name (`std::io::traits::CHUNK`).
-///! A bare-name index resolves unqualified uses, and answers only when every
-///! constant of that name folds to the same value - two same-named constants
-///! with different values make the bare name unfoldable, which surfaces as a
-///! diagnostic asking for qualification instead of silently picking one.
+///! Naming: entries are keyed by CANONICAL qualified name
+///! (`std::io::traits::CHUNK`), which is what `Res::Def` carries, so a
+///! qualified use is a single exact lookup and never a search.  A written
+///! qualifier is NOT a key: a use site may spell a module by any whole-segment
+///! suffix of its namespace, so the spelling does not identify a module and
+///! matching against it is the suffix search `docs/name-resolution.md` §5.1
+///! forbids.  The resolver already decided what the qualifier names, with the
+///! writer's imports in hand; this reads that answer.
+///!
+///! A bare name is the exception, and a known one.  An `IdentifierNode` carries
+///! no `Res` slot, so there is no stamp to read and `by_bare` answers from a
+///! program-wide leaf map - the global-visibility mechanism §1 names as the
+///! root cause. It is counted (`ConstLeafHits`, a B1 row) so the residue is
+///! watched rather than invisible, and it retires when a bare identifier is
+///! stamped. Two same-named constants answer only when they fold to the same
+///! value, which keeps that step from silently picking one.
 ///!
 ///! `ConstEval` is the ONE folder for every position that wants a compile-time
 ///! integer: an array size, a `[value; N]` repeat count, and a `static_assert`
@@ -35,6 +46,8 @@ namespace Compiler::ConstTable;
 import Compiler::AST;
 import Compiler::AST::{ Node, Expression, Declaration };
 import Compiler::Resolver::{ SymbolStr, InternTable };
+import Compiler::Resolver::Res;
+import Compiler::ResolveCounter;
 import Compiler::Types::{ TypeRef, Arena };
 import Compiler::Types::Type;
 import std::core::option;
@@ -80,15 +93,6 @@ type struct ConstEntry {
 }
 
 
-/// One module-level `type enum`, chained by leaf name like a constant.
-///
-/// `node` is borrowed from the AST.
-type struct EnumEntry {
-    node:           EnumDeclNode*;
-    next_same_bare: i64;
-}
-
-
 type struct ConstantTable {
     entries: ConstEntry[];
     /// Qualified name id -> index into `entries`.
@@ -97,13 +101,11 @@ type struct ConstantTable {
     by_bare: HashMap<u32, i64>;
 
     /// Module-level `type enum` declarations, so `Enum::Variant` folds to its
-    /// discriminant.  Same two-index, leaf-chained shape as the constants: an
-    /// enum is named at a use site by exactly the same kinds of spelling, and
-    /// a leaf that means two different enums has to be refused rather than
-    /// guessed - the wrong guess is a wrongly sized array, not a diagnostic.
-    enums: EnumEntry[];
+    /// discriminant.  Keyed ONLY by canonical qualified name: the resolver
+    /// says which type a written scope names, so there is nothing here for a
+    /// spelling to be matched against.
+    enums: EnumDeclNode*[];
     enums_by_qualified: HashMap<u32, i64>;
-    enums_by_bare: HashMap<u32, i64>;
 
     static new() -> ConstantTable {
         return ConstantTable {
@@ -112,7 +114,6 @@ type struct ConstantTable {
             by_bare:            HashMap<u32, i64>::new(),
             enums:              [],
             enums_by_qualified: HashMap<u32, i64>::new(),
-            enums_by_bare:      HashMap<u32, i64>::new(),
         };
     }
 
@@ -160,55 +161,59 @@ type struct ConstantTable {
         this.by_bare.insert(bare.id, idx);
     }
 
-    /// Record a module-level enum declaration under its qualified name and at
-    /// the head of its leaf chain.  Re-registering the same qualified name
-    /// replaces the node rather than adding a second candidate.
-    register_enum(mut &this, qualified: SymbolStr, bare: SymbolStr,
-                  node: EnumDeclNode*) -> void {
+    /// Record a module-level enum declaration under its canonical qualified
+    /// name - the key `Res::TypeRelative`'s base carries.  Re-registering the
+    /// same name replaces the node.
+    register_enum(mut &this, qualified: SymbolStr, node: EnumDeclNode*) -> void {
         if (node == null) { return; }
         match (this.enums_by_qualified.get(&qualified.id)) {
-            Option::Some(existing) => { this.enums[existing].node = node; return; }
+            Option::Some(existing) => { this.enums[existing] = node; return; }
             Option::None => { }
         }
-
-        mut head: i64 = -1;
-        match (this.enums_by_bare.get(&bare.id)) {
-            Option::Some(h) => { head = h; }
-            Option::None    => { }
-        }
-
         const idx: i64 = this.enums.length;
-        this.enums.push(EnumEntry { node: node, next_same_bare: head });
+        this.enums.push(node);
         this.enums_by_qualified.insert(qualified.id, idx);
-        this.enums_by_bare.insert(bare.id, idx);
     }
 
-    /// The index a written `name` denotes in a qualified/bare index pair, or
-    /// -1.  One home for the spelling rule both indexes obey: a name is looked
-    /// up as written, then under the use site's own module, then as a bare
-    /// leaf.
-    static index_of(by_qualified: HashMap<u32, i64>*, by_bare: HashMap<u32, i64>*,
-                    name: SymbolStr, module_ns: SymbolStr,
-                    intern: InternTable*) -> i64 {
-        match (by_qualified.get(&name.id)) {
-            Option::Some(i) => { return i; }
-            Option::None    => { }
-        }
-
+    /// The entry a BARE name denotes, or -1.
+    ///
+    /// Two steps, and only the first is scoped: the use site's own module, then
+    /// a program-wide leaf map.  That second step is a global leaf index - it
+    /// answers from any module in the program with no import in hand, which is
+    /// the mechanism `docs/name-resolution.md` §1 names as the root cause.
+    ///
+    /// It cannot be replaced the way the qualified path was.  A qualified path
+    /// hangs off a `ScopeResolutionNode`, which carries a `Res`; a bare name is
+    /// an `IdentifierNode`, which carries no slot to read.  It is counted
+    /// (`ConstLeafHits`) so the residue is a number the B1 gate watches rather
+    /// than an invisible one, and it retires when a bare identifier is stamped.
+    bare_index_of(&this, name: SymbolStr, module_ns: SymbolStr,
+                  intern: InternTable*) -> i64 {
         if (intern != null && module_ns.is_valid()) {
             const qualified: SymbolStr =
                 ConstantTable::intern_qualified(intern, module_ns, name);
             if (qualified.is_valid()) {
-                match (by_qualified.get(&qualified.id)) {
+                match (this.by_qualified.get(&qualified.id)) {
                     Option::Some(i) => { return i; }
                     Option::None    => { }
                 }
             }
         }
 
-        return match (by_bare.get(&name.id)) {
-            Option::Some(i) => { i }
-            Option::None    => { -1 }
+        // A module with no namespace registers its constants under the bare
+        // name itself, so this is that module's own scope, not a search.
+        match (this.by_qualified.get(&name.id)) {
+            Option::Some(i) => { return i; }
+            Option::None    => { }
+        }
+
+        ResolveCounter::Site::ConstLeafCalls.bump();
+        return match (this.by_bare.get(&name.id)) {
+            Option::Some(i) => {
+                ResolveCounter::Site::ConstLeafHits.bump();
+                i
+            }
+            Option::None => { -1 }
         };
     }
 
@@ -488,56 +493,56 @@ type struct ConstEval {
     /// Fold a bare name: a constant of that leaf, wherever it was declared.
     fold_named(&this, name: SymbolStr, out: i64*) -> boolean {
         if (this.table == null) { return false; }
-        const idx: i64 = ConstantTable::index_of(
-            &this.table.by_qualified, &this.table.by_bare,
-            name, this.module_ns, this.intern);
+        const idx: i64 = this.table.bare_index_of(name, this.module_ns, this.intern);
         if (idx < 0) { return false; }
         return this.fold_chain(idx, out);
     }
 
-    /// Fold `scope::member`.
+    /// Fold `scope::member`, from what the RESOLVER said the scope names.
     ///
-    /// A constant is looked up first, under the whole written path: its key is
-    /// the fully qualified name, so a hit is exact.  Only then is `scope` read
-    /// as an enum, which is a leaf-indexed answer and so the weaker one.
+    /// The written qualifier is not consulted.  A use site may spell a module
+    /// by any whole-segment suffix of its namespace, so the spelling does not
+    /// identify a module and matching against it is the suffix search
+    /// `docs/name-resolution.md` §5.1 forbids.  `scope_res` already carries the
+    /// canonical answer, decided once by the pass that had the writer's imports
+    /// in hand, and this reads it.
+    ///
+    /// Two answers are meaningful here and they are different questions:
+    /// `Def` means the scope named a MODULE, so the member is a constant of
+    /// that module; `TypeRelative` means it named a TYPE, so the member is an
+    /// enum variant of it.  Anything else is not a compile-time integer.
     fold_scoped(&this, sr: ScopeResolutionNode*, out: i64*) -> boolean {
         if (this.table == null || this.intern == null) { return false; }
 
-        const path: SymbolStr = ConstantTable::intern_qualified(
-            this.intern, sr.scope_name, sr.member_name);
-        if (path.is_valid()) {
-            const idx: i64 = ConstantTable::index_of(
-                &this.table.by_qualified, &this.table.by_bare,
-                path, this.module_ns, this.intern);
-            if (idx >= 0) { return this.fold_chain(idx, out); }
-        }
-
-        const ei: i64 = ConstantTable::index_of(
-            &this.table.enums_by_qualified, &this.table.enums_by_bare,
-            sr.scope_name, this.module_ns, this.intern);
-        if (ei < 0) { return false; }
-
-        // Every enum reachable under the written scope must give the member
-        // the same discriminant.  An exact qualified hit is a chain of one, so
-        // this only bites a BARE leaf that names two different enums - where
-        // picking the first registration would silently size an array from the
-        // wrong declaration.
-        mut answered: boolean = false;
-        mut answer: i64 = 0;
-        mut i: i64 = ei;
-        while (i >= 0) {
-            mut v: i64 = 0;
-            if (ConstEval::variant_tag_of(this.table.enums[i].node,
-                                          sr.member_name, &v)) {
-                if (answered && v != answer) { return false; }
-                answered = true;
-                answer   = v;
+        return match (sr.scope_res.require("ConstEval::fold_scoped")) {
+            Res::Def(ns) => {
+                const key: SymbolStr = ConstantTable::intern_qualified(
+                    this.intern, ns, sr.member_name);
+                if (!key.is_valid()) { return false; }
+                return match (this.table.by_qualified.get(&key.id)) {
+                    Option::Some(i) => { this.fold_entry(i, out) }
+                    Option::None    => { false }
+                };
             }
-            i = this.table.enums[i].next_same_bare;
-        }
-        if (!answered) { return false; }
-        *out = answer;
-        return true;
+            Res::TypeRelative(base, trailing) => {
+                // `Enum::Variant` is one trailing segment past the type.  A
+                // longer tail is an associated item, which is sema's.
+                if (trailing != 1) { return false; }
+                return match (base) {
+                    ResBase::Def(q) => {
+                        return match (this.table.enums_by_qualified.get(&q.id)) {
+                            Option::Some(ei) => {
+                                ConstEval::variant_tag_of(
+                                    this.table.enums[ei], sr.member_name, out)
+                            }
+                            Option::None => { false }
+                        };
+                    }
+                    _ => { false }
+                };
+            }
+            _ => { false }
+        };
     }
 
     /// The discriminant `decl` gives `member`, or false when it has no such
@@ -614,9 +619,7 @@ type struct ConstEval {
     /// `fold_named`, as a real.
     fold_named_real(&this, name: SymbolStr, out: f64*) -> boolean {
         if (this.table == null) { return false; }
-        const idx: i64 = ConstantTable::index_of(
-            &this.table.by_qualified, &this.table.by_bare,
-            name, this.module_ns, this.intern);
+        const idx: i64 = this.table.bare_index_of(name, this.module_ns, this.intern);
         if (idx < 0) { return false; }
         return this.fold_chain_real(idx, out);
     }
