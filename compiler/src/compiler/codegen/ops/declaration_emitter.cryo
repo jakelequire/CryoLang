@@ -20,6 +20,7 @@ import Compiler::Codegen::{ LLVMTypes, TypeMap, Abi, Util };
 import Compiler::Codegen::State::{ ValueTable, FunctionRegistry, GlobalRegistry, StringCache, DiagSink };
 import Compiler::Codegen::Ops::{ IRFlowEmitter, SymbolResolver, IntrinsicEmitter, ExprOps };
 import Compiler::CompilationContext;
+import Compiler::ConstTable;
 import Compiler::DeclIndex;
 import Compiler::Diag;
 import Compiler::Diag::{ Diagnostic, SourceSpan };
@@ -1606,7 +1607,7 @@ type struct DeclarationEmitter {
             const tkf: LTypeKind = LType::kind_of(ty.raw);
             if (tkf == LTypeKind::Float || tkf == LTypeKind::Double) {
                 mut folded: f64 = 0.0;
-                if (DeclarationEmitter::try_fold_const_real(init_expr, &folded)) {
+                if (this.try_fold_const_real(init_expr, &folded)) {
                     init = LType::const_real(ty, folded);
                 }
             } else if (tkf == LTypeKind::Integer) {
@@ -2496,63 +2497,49 @@ type struct DeclarationEmitter {
     }
 
 
-    /// Fold a float-typed const initializer expression to an `f64` constant:
-    /// float/integer literals, unary `-`/`+`, and binary `+ - * /`. Returns
-    /// false for anything outside that set (identifiers, calls, etc.), which the
-    /// caller leaves on the zeroinitializer fallback. Mirrors sema's
-    /// `try_fold_const_i64` but in `f64` (IEEE saturates, so no overflow guards).
-    /// This is what makes `const F64_MIN: f64 = -1.79e308;` carry its real value
-    /// instead of silently becoming 0.0.
-    static try_fold_const_real(expr: ExpressionNode*, out: f64*) -> boolean {
+    /// Fold a float-typed const initializer to an `f64` constant.
+    ///
+    /// The whole expression is `ConstEval`'s to answer, including the names in
+    /// it: a folder here that knew only literals and arithmetic could not read
+    /// `const D: f64 = A * (1.0 - B);`, and an initializer this position cannot
+    /// fold is not diagnosed - it is emitted as 0.0.  Reading names is the
+    /// constant table's job, and doing it here as well would be a second
+    /// implementation of one question, free to drift from the first.
+    try_fold_const_real(&this, expr: ExpressionNode*, out: f64*) -> boolean {
         if (expr == null) { return false; }
-        const node: ASTNode* = expr as ASTNode*;
-        if (node.kind == NodeKind::Literal) {
-            const lit: LiteralNode* = expr as LiteralNode*;
-            if (lit.literal_kind == LiteralKind::Float) {
-                *out = float::parse_f64(lit.value).unwrap_or(0.0);
-                return true;
-            }
-            if (lit.literal_kind == LiteralKind::Integer) {
-                const iv: u64 = lit.value.parse_int<u64>();
-                *out = iv as f64;
-                return true;
-            }
-            return false;
-        }
-        if (node.kind == NodeKind::UnaryExpression) {
-            const u: UnaryExprNode* = expr as UnaryExprNode*;
-            mut a: f64 = 0.0;
-            if (!DeclarationEmitter::try_fold_const_real(u.operand, &a)) { return false; }
-            if (u.op.lexeme == "-") { *out = 0.0 - a; return true; }
-            if (u.op.lexeme == "+") { *out = a; return true; }
-            return false;
-        }
-        if (node.kind == NodeKind::BinaryExpression) {
-            const b: BinaryExprNode* = expr as BinaryExprNode*;
-            mut x: f64 = 0.0;
-            mut y: f64 = 0.0;
-            if (!DeclarationEmitter::try_fold_const_real(b.left, &x)) { return false; }
-            if (!DeclarationEmitter::try_fold_const_real(b.right, &y)) { return false; }
-            const op: string = b.op.lexeme;
-            if (op == "+") { *out = x + y; return true; }
-            if (op == "-") { *out = x - y; return true; }
-            if (op == "*") { *out = x * y; return true; }
-            if (op == "/") { *out = x / y; return true; }
-            return false;
-        }
-        return false;
+        return this.const_eval_at(expr.span.file).fold_real(expr, out);
+    }
+
+    /// The compile-time integer folder, reading names as the module that WROTE
+    /// this initializer sees them.
+    ///
+    /// Provenance comes from the node's own span rather than the emission
+    /// cursor: a bare constant name means what it means in the file it was
+    /// written in, and codegen does not necessarily stand in that module.
+    const_eval_at(&this, span_file: string) -> ConstEval {
+        return ConstEval::new(this.ctx.const_table, this.ctx.intern_table,
+                              this.ctx.type_arena,
+                              this.ctx.module_ns_sym_of_file(span_file));
     }
 
     /// Constant-fold an INTEGER const initializer to its 64-bit two's-complement
     /// bit pattern.  Handles integer/bool literals, unary `-`/`+`/`~`, and the
     /// binary operators that are bit-exact in two's complement regardless of
-    /// signedness (`+ - * << & | ^`).  Sign-dependent operators (`>> / %`) and
-    /// anything else (identifiers, calls) return false, leaving the caller on
-    /// the zeroinitializer fallback - so the folder is correct-or-decline, never
-    /// silently wrong.  Computing in u64 keeps every accepted operation
+    /// signedness (`+ - * << & | ^`).
+    ///
+    /// Arithmetic is computed here, at the global's own width, because that is
+    /// the question this position owns: u64 keeps every accepted operation
     /// well-defined wrapping (codegen emits plain LLVMBuildAdd/Sub/Mul) and
     /// bit-identical to the signed result, which is what makes
     /// `const EOF: i32 = -1;` carry 0xFFFFFFFF instead of silently becoming 0.
+    ///
+    /// What a NAME denotes, and what a type's `sizeof`/`alignof` is, are not
+    /// this position's questions - they belong to `ConstEval` over the constant
+    /// table and the arena - so they are asked there rather than re-derived
+    /// here.  Declining them locally is not the safe default it reads as: an
+    /// unfolded initializer does not become an error, it becomes the
+    /// zeroinitializer, so a leaf that cannot answer publishes 0 as the
+    /// constant's value.
     try_fold_const_int(&this, expr: ExpressionNode*, out: u64*) -> boolean {
         if (expr == null) { return false; }
         const node: ASTNode* = expr as ASTNode*;
@@ -2581,7 +2568,18 @@ type struct DeclarationEmitter {
                 real_t = this.lookup_type_by_id(real_ref.id);
                 depth += 1;
             }
-            if (real_t == null || real_t.kind != TypeKind::Enum) { return false; }
+            if (real_t == null || real_t.kind != TypeKind::Enum) {
+                // The scope does not name an enum, so the path names a
+                // module-qualified CONSTANT (`limits::MAX_PATH`) - a different
+                // referent, answered by the constant table rather than by a
+                // variant tag.
+                mut qv: i64 = 0;
+                if (this.const_eval_at(expr.span.file).fold(expr, &qv)) {
+                    *out = qv as u64;
+                    return true;
+                }
+                return false;
+            }
             const et: EnumType* = real_t as EnumType*;
             const variant: EnumVariantInfo* = et.get_variant(sr.member_name);
             // A variant carrying a payload is a CONSTRUCTOR, not a constant -
@@ -2602,6 +2600,18 @@ type struct DeclarationEmitter {
             }
             return false;
         }
+        // What a NAME denotes, and what a type's `sizeof`/`alignof` is, are not
+        // this position's questions - they belong to `ConstEval` over the
+        // constant table and the arena - so they are asked there rather than
+        // re-derived here.
+        if (node.kind == NodeKind::Identifier
+            || node.kind == NodeKind::SizeofExpression
+            || node.kind == NodeKind::AlignofExpression) {
+            mut nv: i64 = 0;
+            if (!this.const_eval_at(expr.span.file).fold(expr, &nv)) { return false; }
+            *out = nv as u64;
+            return true;
+        }
         if (node.kind == NodeKind::UnaryExpression) {
             const u: UnaryExprNode* = expr as UnaryExprNode*;
             mut a: u64 = 0;
@@ -2614,11 +2624,22 @@ type struct DeclarationEmitter {
         }
         if (node.kind == NodeKind::BinaryExpression) {
             const b: BinaryExprNode* = expr as BinaryExprNode*;
+            const op: string = b.op.lexeme;
+            // `/ % >>` read their operands as NUMBERS, so their result depends
+            // on a signedness a u64 bit pattern has already discarded.  They
+            // are computed by the folder that works in signed i64 rather than
+            // approximated here; each operator therefore has exactly one
+            // evaluator, and none is left to the zeroinitializer.
+            if (op == "/" || op == "%" || op == ">>") {
+                mut sv: i64 = 0;
+                if (!this.const_eval_at(expr.span.file).fold(expr, &sv)) { return false; }
+                *out = sv as u64;
+                return true;
+            }
             mut x: u64 = 0;
             mut y: u64 = 0;
             if (!this.try_fold_const_int(b.left, &x)) { return false; }
             if (!this.try_fold_const_int(b.right, &y)) { return false; }
-            const op: string = b.op.lexeme;
             if (op == "+")  { *out = x + y;  return true; }
             if (op == "-")  { *out = x - y;  return true; }
             if (op == "*")  { *out = x * y;  return true; }
@@ -2684,7 +2705,7 @@ type struct DeclarationEmitter {
                 }
             } else if (fk == LTypeKind::Float || fk == LTypeKind::Double) {
                 mut fv: f64 = 0.0;
-                if (DeclarationEmitter::try_fold_const_real(fexpr, &fv)) {
+                if (this.try_fold_const_real(fexpr, &fv)) {
                     slot = LType::const_real(fty, fv);
                 }
             }

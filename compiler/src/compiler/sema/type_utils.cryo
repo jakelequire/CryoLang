@@ -95,21 +95,46 @@ type struct TypeUtils {
 
     // widen: bare -> qualified -> cross-module cascade.
     lookup_method_return_raw(&this, type_sym: SymbolStr, method_sym: SymbolStr) -> TypeRef {
+        const owner: SymbolStr = this.resolve_method_owner(type_sym, method_sym);
+        if (!owner.is_valid()) { return TypeRef::invalid(); }
+        return this.ctx.decl_index.lookup_method_return(owner, method_sym);
+    }
+
+    /// The name `method_sym` is REGISTERED under for an owner segment spelled
+    /// `type_sym`, or an invalid symbol when no owner carries the method.
+    ///
+    /// The spelling a call site writes is not a registry key: a scope segment
+    /// may be a bare leaf, the writer's own module-qualified form, or a
+    /// module-relative path (`Deque::Gadget`), while the registries hold one
+    /// canonical name per declaration.  Widening is therefore part of asking
+    /// the question, and the answer is WHICH name carried the method - not just
+    /// that some name did.
+    ///
+    /// Every consumer keys off this one answer.  A caller that recovers the
+    /// return type here and then rebuilds a symbol from the written spelling is
+    /// naming a declaration that does not exist, and the failure surfaces a
+    /// whole stage later as an unresolvable callee.
+    resolve_method_owner(&this, type_sym: SymbolStr, method_sym: SymbolStr) -> SymbolStr {
         // As-is (already-qualified names from monomorphized types).
-        const bare_ret: TypeRef = this.ctx.decl_index.lookup_method_return(type_sym, method_sym);
-        if (bare_ret.is_valid()) { return bare_ret; }
+        if (this.ctx.decl_index.lookup_method_return(type_sym, method_sym).is_valid()) {
+            return type_sym;
+        }
         // Module-qualified (local/same-module types registered under qualified names).
         const qualified: SymbolStr = this.ctx.qualify_symbol_sym(type_sym);
         if (!qualified.equals(type_sym)) {
-            const q_ret: TypeRef = this.ctx.decl_index.lookup_method_return(qualified, method_sym);
-            if (q_ret.is_valid()) { return q_ret; }
+            if (this.ctx.decl_index.lookup_method_return(qualified, method_sym).is_valid()) {
+                return qualified;
+            }
         }
         // Cross-module: resolve the type's original module via the scope chain.
+        // This is the only probe that answers a written path whose own leading
+        // segments name a module, since the import-scoped index is keyed by leaf.
         const cross_sym: SymbolStr = this.resolve_cross_module_name(type_sym);
-        if (cross_sym.is_valid()) {
-            return this.ctx.decl_index.lookup_method_return(cross_sym, method_sym);
+        if (cross_sym.is_valid()
+                && this.ctx.decl_index.lookup_method_return(cross_sym, method_sym).is_valid()) {
+            return cross_sym;
         }
-        return TypeRef::invalid();
+        return SymbolStr::empty();
     }
 
     // widen: qualified -> direct -> cross-module -> arena-leaf cascade.

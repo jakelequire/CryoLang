@@ -3912,7 +3912,17 @@ type struct CallResolver {
         // expected-type-unify source can recover an owner param the args don't
         // determine.  Idempotent (no-op once `resolved_type_args` is set).
         this.stash_static_owner_bindings_for(scope, call);
-        const method_ret: TypeRef = this.types.lookup_method_return(lookup_sym, scope.member_name);
+        // The owner the method is REGISTERED under, which is not always the one
+        // the call site spelled: a module-relative path (`Deque::Gadget`) names a
+        // type the leaf-keyed import index above cannot fold, so `lookup_sym` is
+        // still the written text.  Pinning must use the name that answered - a
+        // symbol rebuilt from the spelling names no declaration, and codegen then
+        // binds it by bare leaf and arity or fails to bind it at all.
+        const owner_sym: SymbolStr = this.types.resolve_method_owner(lookup_sym, scope.member_name);
+        mut method_ret: TypeRef = TypeRef::invalid();
+        if (owner_sym.is_valid()) {
+            method_ret = this.types.lookup_method_return(owner_sym, scope.member_name);
+        }
         if (method_ret.is_valid()) {
             mut resolved: TypeRef = this.try_resolve_generic_return(method_ret, scope.scope_name, scope.member_name, scope);
             if (this.types.contains_generic_param(resolved)) {
@@ -3920,7 +3930,7 @@ type struct CallResolver {
                 if (inferred.is_valid() && !this.types.contains_generic_param(inferred)) { resolved = inferred; }
             }
             scope.set_resolved_type(resolved);
-            this.pin_scope_callee_combined(call, lookup_sym, scope.member_name);
+            this.pin_scope_callee_combined(call, owner_sym, scope.member_name);
             return resolved;
         }
         if (scope.scope_generic_args.length > 0) {
