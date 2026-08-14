@@ -196,7 +196,10 @@ LLVMTypeRef LLVMVectorType(LLVMTypeRef ElementType, unsigned ElementCount);
  * =================================================================== */
 
 LLVMTypeRef    LLVMTypeOf(LLVMValueRef Val);
-const char    *LLVMGetValueName2(LLVMValueRef Val, unsigned long *Length);
+/* `size_t *`, not `unsigned long *`: LLVM writes a size_t through this pointer,
+ * and `unsigned long` is 32-bit on Windows (LLP64), so the binding would claim
+ * a 4-byte slot for an 8-byte store.  The caller already passes a `u64`. */
+const char    *LLVMGetValueName2(LLVMValueRef Val, size_t *Length);
 void           LLVMSetValueName2(LLVMValueRef Val, const char *Name, unsigned long NameLen);
 void           LLVMDumpValue(LLVMValueRef Val);
 char          *LLVMPrintValueToString(LLVMValueRef Val);

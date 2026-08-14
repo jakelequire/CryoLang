@@ -458,6 +458,32 @@ type struct Importer {
         this.ctx.artifacts.ast.root.statements.push(node);
     }
 
+    /// Wrap an INTEGER-literal initializer in an explicit cast to the const's
+    /// own declared type.
+    ///
+    /// A negative C constant is carried here as its unsigned two's-complement
+    /// decimal (`-3` becomes `18446744073709551613`), which is a 64-bit pattern
+    /// no matter how narrow the declared type is.  As a bare literal that is out
+    /// of range for the declaration and rejected; the cast is what says "take
+    /// the low bits", and it is the same shape the file-writing binding
+    /// generator emits, so the two bindgen paths agree.  Codegen is unaffected:
+    /// the global-initializer path unwraps a cast over a literal and builds the
+    /// constant against the global's own LLVM type, which truncates exactly as
+    /// before.
+    ///
+    /// Only integers: a string/char/float initializer is already in range for
+    /// what it was mapped to, and a cast there would say nothing.
+    widen_integer_init(mut &this, type_annotation: TypeAnnotation*,
+                       init: ExpressionNode*) -> ExpressionNode* {
+        if (init == null || type_annotation == null) { return init; }
+        if ((init as ASTNode*).kind != NodeKind::Literal) { return init; }
+        if ((init as LiteralNode*).literal_kind != LiteralKind::Integer) { return init; }
+        // The declaration owns `type_annotation`; the cast needs its own copy.
+        const target: TypeAnnotation* = TypeAnnotation::clone_ptr(type_annotation);
+        if (target == null) { return init; }
+        return new CastExprNode(init, target, SourceSpan::none()) as ExpressionNode*;
+    }
+
     /// Push an alias-namespaced immutable global `const name = <init>` - the
     /// shape both anonymous-enum constants and object-like `#define` macros
     /// lower to.  `binding_namespace` keeps it reachable only as `alias::name`.
@@ -468,7 +494,7 @@ type struct Importer {
         vnode.is_mutable = false;
         vnode.binding_namespace = this.alias;
         vnode.type_annotation = type_annotation;
-        vnode.set_initializer(init);
+        vnode.set_initializer(this.widen_integer_init(type_annotation, init));
         this.seen_names.push(name_sym);
         this.emit_top_level(vnode as ASTNode*);
     }
