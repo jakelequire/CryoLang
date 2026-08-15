@@ -369,7 +369,8 @@ private:
             return this.emit_error_close_literal(
                 ErrorCode::E0002_UNTERMINATED_STRING,
                 "Unterminated string literal",
-                "\"");
+                "\"",
+                this.current_location.line, this.current_location.column);
         }
 
         this.advance(); // consume closing quote
@@ -402,6 +403,14 @@ private:
     /// `{`/`}`, sub-parses each hole as an expression, and processes the
     /// per-chunk escapes there.  We still skip `\X` digraphs while scanning
     /// so an escaped quote `\"` doesn't terminate the literal early.
+    ///
+    /// The scan tracks brace depth because a hole's body is Cryo source, not
+    /// literal text: inside `{...}` a `"` opens a nested string literal that
+    /// belongs to the expression, so only a quote at depth 0 closes the
+    /// f-string.  Without that, `f"{if (b) { "y" } else { "n" }}"` would end
+    /// at the quote before `y`.  `{{`/`}}` are literal braces and so change
+    /// no depth, but only at depth 0 - inside a hole they are two nested
+    /// blocks.
     lex_fstring(&this) -> Token {
         const start_line: int = this.current_location.line;
         // The `f` and the `"` were both consumed by the dispatcher, so the
@@ -410,23 +419,45 @@ private:
 
         const start: string = this.current;
 
-        while (!this.at_end() && this.peek() != '"') {
-            if (this.peek() == '\\' && !this.at_end()) {
+        mut depth: i64 = 0;
+        while (!this.at_end()) {
+            const c: char = this.peek();
+
+            if (c == '\\') {
                 this.advance(); // consume backslash
                 if (!this.at_end()) {
                     this.advance(); // consume escaped character
                 }
-            } else {
-                if (this.peek() == '\n') {
-                    // Consume without advance(): advance() would call
-                    // increment_char() after newline() already reset the
-                    // column, leaving column 2 for the first byte of the
-                    // next line. Mirrors skip_whitespace().
-                    this.current++;
-                    this.current_location.newline();
-                } else {
+                continue;
+            }
+
+            if (depth == 0) {
+                if (c == '"') { break; } // closes the f-string
+                if ((c == '{' || c == '}') && this.peek_ahead(1) == c) {
+                    // `{{` / `}}`: a literal brace, not a hole boundary.
                     this.advance();
+                    this.advance();
+                    continue;
                 }
+                if (c == '{') { depth = 1; }
+            } else {
+                if (c == '"' || c == '\'') {
+                    this.skip_fstring_nested_literal(c);
+                    continue;
+                }
+                if (c == '{') { depth += 1; }
+                else if (c == '}') { depth -= 1; }
+            }
+
+            if (c == '\n') {
+                // Consume without advance(): advance() would call
+                // increment_char() after newline() already reset the
+                // column, leaving column 2 for the first byte of the
+                // next line. Mirrors skip_whitespace().
+                this.current++;
+                this.current_location.newline();
+            } else {
+                this.advance();
             }
         }
 
@@ -435,7 +466,8 @@ private:
             return this.emit_error_close_literal(
                 ErrorCode::E0002_UNTERMINATED_STRING,
                 "Unterminated f-string literal",
-                "\"");
+                "\"",
+                start_line, start_col);
         }
 
         this.advance(); // consume closing quote
@@ -451,6 +483,32 @@ private:
         return Token::new_with_extent(
             TokenType::FStringLiteral, raw_text,
             start_line, start_col, source_length);
+    }
+
+    /// Advance past a string or char literal nested in an f-string hole,
+    /// leaving `current` just past its closing `q`.  The bytes stay in the
+    /// raw template verbatim - the parser re-scans them the same way when it
+    /// looks for the hole's `}` - so this only has to keep the outer scan
+    /// from reading the literal's own quotes and braces as f-string syntax.
+    /// Runs to end-of-buffer if unterminated, leaving the caller to report
+    /// the unterminated f-string.
+    skip_fstring_nested_literal(&this, q: char) {
+        this.advance(); // opening quote
+        while (!this.at_end()) {
+            const c: char = this.peek();
+            if (c == '\\') {
+                this.advance();
+                if (!this.at_end()) { this.advance(); }
+                continue;
+            }
+            if (c == '\n') {
+                this.current++;
+                this.current_location.newline();
+                continue;
+            }
+            this.advance();
+            if (c == q) { return; }
+        }
     }
 
     lex_character(&this) -> Token {
@@ -554,7 +612,8 @@ private:
             return this.emit_error_close_literal(
                 ErrorCode::E0003_UNTERMINATED_CHAR,
                 "Unterminated character literal",
-                "'");
+                "'",
+                this.current_location.line, this.current_location.column);
         }
         this.advance(); // consume closing '\''
 
@@ -891,21 +950,26 @@ private:
     /// Like `emit_error`, but attaches a machine-applicable suggestion
     /// that inserts `insertion` at the literal's start-of-body position.
     /// Used by the unterminated-string / unterminated-char paths so the
-    /// user's editor can close the literal in one click.  `body_line` /
-    /// `body_col` point at the byte AFTER the opening quote (where the
-    /// missing closer logically belongs); the suggestion uses a
-    /// zero-width span at the current end-of-stream position so the
+    /// user's editor can close the literal in one click.  The suggestion
+    /// uses a zero-width span at the current end-of-stream position so the
     /// insertion lands at the cursor, exactly where the user dropped
     /// the closing quote.
+    ///
+    /// `at_line` / `at_col` carry the primary span.  A caller whose scan can
+    /// run far past the mistake - an f-string, whose holes swallow the rest
+    /// of the file when one is left open - passes the literal's own opening
+    /// position, so the caret stays on the literal instead of landing on
+    /// end-of-file.
     emit_error_close_literal(&this, code: ErrorCode, message: string,
-                              insertion: string) -> Token {
+                              insertion: string,
+                              at_line: int, at_col: int) -> Token {
         if (this.sink != null) {
             const span: SourceSpan = SourceSpan::new(
                 this.path,
-                this.current_location.line as u32,
-                this.current_location.column as u32,
-                this.current_location.line as u32,
-                this.current_location.column as u32 + 1
+                at_line as u32,
+                at_col as u32,
+                at_line as u32,
+                at_col as u32 + 1
             );
             mut diag: Diagnostic = Diagnostic::error(code, message);
             diag = diag.at(span);

@@ -48,12 +48,14 @@ import Compiler::CompilationContext;
 import Compiler::Types;
 import Compiler::Types::{ Arena, TypeRef, Type, GenericRegistry, Ownership };
 import Compiler::Resolver::{ SymbolStr, InternTable };
+import Compiler::ConstTable;
 import Utils::Logger;
 import std::core::option;
 import std::collections::hashmap;
 import Compiler::Lex;
 import Compiler::Types::Generic;
 import Compiler::Types::UserDefined;
+import Compiler::Types::Compound;
 
 
 type struct DropInserter {
@@ -108,17 +110,61 @@ type struct DropInserter {
     binding_initflags: u32[];
 
     /// Name ids disqualified from init-flag tracking in the current function:
-    /// locals whose storage may be initialized by something other than a
-    /// whole-binding `<name> = ...` assignment - element assignment
-    /// (`name[i] = ...`), field assignment (`name.f = ...`), or address-of
-    /// (`&name`, whose callee may write through the pointer).  For those the
-    /// per-assignment init flag cannot observe the write, so tracking would
-    /// suppress a needed drop (a leak); instead they keep the pre-existing
-    /// unconditional scope-exit drop.  Recomputed per function by a flow-
-    /// insensitive pre-scan (`collect_init_disqualifiers`); name-keyed, so a
-    /// name used this way anywhere disqualifies every local of that name
-    /// (conservative, fail-safe toward the prior behavior).
+    /// locals whose storage may be initialized through a taken address
+    /// (`&name`, `&name.f`, whose callee may write through the pointer).  No
+    /// flag this pass can synthesize observes that write, so such a local
+    /// keeps an unconditional scope-exit drop: the callee is assumed to have
+    /// filled it.  Recomputed per function by a flow-insensitive pre-scan
+    /// (`collect_init_disqualifiers`); name-keyed, so a name used this way
+    /// anywhere disqualifies every local of that name (conservative, fail-safe
+    /// toward the prior behavior).
+    ///
+    /// A local initialized MEMBER-wise (`name.f = v`, `name[0] = v`) is not
+    /// disqualified - it is tracked per member instead; see `mem_*`.
     init_disq: u32[];
+
+    /// Members at which a piecewise-initialized local becomes live, and the
+    /// boolean recording it.  A local declared without an initializer and
+    /// filled member by member has no single moment at which the whole value
+    /// becomes live, so one whole-binding flag cannot govern its drop: an
+    /// unconditional drop runs the destructor over the members that were
+    /// never written - a release of stack garbage, not a leak - and
+    /// suppressing it leaks the members that were.  Each member instead
+    /// carries its own flag, set at the write and read by that member's own
+    /// scope-exit drop.
+    ///
+    /// Parallel arrays keyed by binding slot (an index into `binding_*`), so
+    /// two declarations of one name own separate members, and truncated in
+    /// lock-step with `binding_*` on scope pop.  `mem_pstart`/`mem_plen` slice
+    /// the flat `mem_proj_*` side table, so a member at any depth costs one
+    /// entry here - `p.a.b` and `xs[0]` are the same shape to everything
+    /// downstream.
+    mem_slot:   i64[];
+    mem_pstart: i64[];
+    mem_plen:   i64[];
+    mem_type:   TypeRef[];
+    mem_flag:   u32[];
+    mem_proj_kind: u8[];
+    mem_proj_key:  u32[];
+
+    /// Pre-scan output feeding `mem_*`: the member places at which each local
+    /// name is initialized, collected before any binding is registered (so it
+    /// is keyed by name, like `init_disq`, and materialized onto a slot at
+    /// `register_binding`).  Reduced to minimal prefixes, so recording both
+    /// `p.a` and `p.a.b` keeps only `p.a` - the shallower write initializes
+    /// the whole of that member and owns its drop.
+    pw_name:   u32[];
+    pw_pstart: i64[];
+    pw_plen:   i64[];
+    pw_proj_kind: u8[];
+    pw_proj_key:  u32[];
+
+    /// Names given a WHOLE-binding assignment (`name = ...`) somewhere in the
+    /// function.  Such a local becomes live all at once, so it keeps the
+    /// single whole-binding init flag and its members are not tracked: a
+    /// member write against an already-live parent releases that member in
+    /// place (see `assign_drop_for_target`) rather than needing its own flag.
+    pw_whole:  u32[];
 
     /// Stack of "loop boundary depths".  When walk_while/walk_for/
     /// walk_loop is processing a loop body, the current scope_stack
@@ -202,6 +248,38 @@ type struct DropInserter {
     fired:        i64;
     inserted:     i64;
 
+    /// Per binding slot: 1 when the declaration itself made the whole value
+    /// live - an initializer, or a by-value parameter the caller moved in.
+    /// Distinguishes the two reasons `binding_initflags` holds 0: definitely
+    /// live (no flag needed) versus liveness this pass cannot observe (the
+    /// address escaped).  Only the first may have its old value released on
+    /// assignment; conflating them would free storage a callee never filled.
+    binding_definit: u8[];
+
+    /// The assignment whose displaced value must be released, decided by
+    /// `record_assign_drop` and consumed by the enclosing expression
+    /// statement.  Held as a single slot keyed by node: the decision has to be
+    /// made mid-walk (see `record_assign_drop`) but can only be emitted where
+    /// a statement buffer exists, and an assignment nested inside a larger
+    /// expression never matches the node the statement is checking, so it is
+    /// skipped rather than mis-attributed.
+    pend_assign_node:  ExpressionNode*;
+    /// Flag id gating the release, or 0 when the destination is definitely
+    /// live and the release is unconditional.
+    pend_assign_guard: u32;
+    pend_assign_ty:    TypeRef;
+    /// The destination place, kept as base binding + projection chain so the
+    /// copy is rebuilt from types this pass derived rather than from the
+    /// source node's annotations.
+    pend_assign_base:    u32;
+    pend_assign_base_ty: TypeRef;
+    pend_assign_kind:    u8[];
+    pend_assign_key:     u32[];
+
+    /// Monotonic counter for naming the hidden locals that hold a displaced
+    /// value between the store and its release (see `emit_assign_drop`).
+    assign_seq:   i64;
+
     /// Monotonic counter for naming hidden locals synthesized to hold and
     /// drop discarded owning temporaries (see emit_discarded_temp_drop).
     discard_seq:  i64;
@@ -237,6 +315,28 @@ type struct DropInserter {
             binding_spans:   [],
             binding_initflags: [],
             init_disq:       [],
+            mem_slot:        [],
+            mem_pstart:      [],
+            mem_plen:        [],
+            mem_type:        [],
+            mem_flag:        [],
+            mem_proj_kind:   [],
+            mem_proj_key:    [],
+            pw_name:         [],
+            pw_pstart:       [],
+            pw_plen:         [],
+            pw_proj_kind:    [],
+            pw_proj_key:     [],
+            pw_whole:        [],
+            binding_definit: [],
+            pend_assign_node:  null,
+            pend_assign_guard: 0,
+            pend_assign_ty:    TypeRef::invalid(),
+            pend_assign_base:    0,
+            pend_assign_base_ty: TypeRef::invalid(),
+            pend_assign_kind:    [],
+            pend_assign_key:     [],
+            assign_seq:      0,
             loop_boundary:   [],
             moved_keys:      [],
             moved_lines:     [],
@@ -282,8 +382,26 @@ type struct DropInserter {
             this.binding_spans.pop();
             this.binding_initflags.pop();
             this.binding_dropflags.pop();
+            this.binding_definit.pop();
             this.types_keys.pop();
             this.types_refs.pop();
+        }
+        // Members are keyed by binding slot, so every entry pointing at a slot
+        // this scope just released must go with it.  Entries are appended in
+        // slot order (a slot's members are materialized when it is registered),
+        // so the ones to drop are a contiguous suffix, same as the bindings.
+        while (this.mem_slot.length > 0 &&
+               this.mem_slot[this.mem_slot.length - 1] >= start) {
+            const plen: i64 = this.mem_plen[this.mem_plen.length - 1];
+            this.mem_slot.pop();
+            this.mem_pstart.pop();
+            this.mem_plen.pop();
+            this.mem_type.pop();
+            this.mem_flag.pop();
+            for (mut k: i64 = 0; k < plen; k++) {
+                this.mem_proj_kind.pop();
+                this.mem_proj_key.pop();
+            }
         }
     }
 
@@ -318,7 +436,10 @@ type struct DropInserter {
         }
     }
 
-    register_binding(mut &this, name: SymbolStr, ty: TypeRef, span: SourceSpan) -> void {
+    /// `definit` records whether the declaration itself made the whole value
+    /// live (an initializer was present).  See `binding_definit`.
+    register_binding(mut &this, name: SymbolStr, ty: TypeRef, span: SourceSpan,
+                     definit: boolean) -> void {
         if (!name.is_valid()) { return; }
         // A freshly declared binding starts live. The moved-set is keyed by
         // intern name id and `pop_scope` does NOT clear it, so a sibling
@@ -347,6 +468,7 @@ type struct DropInserter {
         // No drop flag by default; a branch-join that finds this binding moved
         // on some paths only upgrades the slot via register_drop_flag.
         this.binding_dropflags.push(0 as u32);
+        this.binding_definit.push(if (definit) { 1 as u8 } else { 0 as u8 });
     }
 
     /// Same as register_binding but stores a type-only entry (no
@@ -545,6 +667,9 @@ type struct DropInserter {
         this.binding_types   = [];
         this.binding_spans   = [];
         this.binding_initflags = [];
+        this.binding_definit = [];
+        this.pend_assign_node = null;
+        this.assign_seq      = 0;
         this.loop_boundary   = [];
         this.moved_keys  = [];
         this.moved_lines = [];
@@ -554,11 +679,26 @@ type struct DropInserter {
         this.pm_field         = [];
         this.branch_depth     = 0;
         this.init_disq        = [];
-        // Flow-insensitive pre-scan: decide which uninitialized droppable
-        // locals CAN'T be soundly tracked with a per-assignment init flag
-        // (initialized element/field-wise or through a taken address) before
-        // any drop is emitted, so attach_init_flag can skip them.
+        this.mem_slot         = [];
+        this.mem_pstart       = [];
+        this.mem_plen         = [];
+        this.mem_type         = [];
+        this.mem_flag         = [];
+        this.mem_proj_kind    = [];
+        this.mem_proj_key     = [];
+        this.pw_name          = [];
+        this.pw_pstart        = [];
+        this.pw_plen          = [];
+        this.pw_proj_kind     = [];
+        this.pw_proj_key      = [];
+        this.pw_whole         = [];
+        // Flow-insensitive pre-scan, before any drop is emitted: decide each
+        // uninitialized droppable local's initialization GRANULARITY - the
+        // whole binding, a set of members, or nothing this pass can observe
+        // (a taken address).  attach_init_flag and attach_member_flags read
+        // the answer.
         this.collect_init_disqualifiers(func.body as StatementNode*);
+        this.reduce_init_places();
 
         this.push_scope();
         // A by-value owning parameter is moved in at the call (the argument is
@@ -589,6 +729,8 @@ type struct DropInserter {
                 // arrays in lock-step; register_binding is bypassed here).
                 this.binding_initflags.push(0 as u32);
                 this.binding_dropflags.push(0 as u32);
+                // The caller's move-in made it live before the body runs.
+                this.binding_definit.push(1 as u8);
             }
         }
         // A base-class constructor initializer (`MyCtor(...) : Base(arg, ...)`)
@@ -773,6 +915,7 @@ type struct DropInserter {
             }
             NodeKind::ExpressionStatement => {
                 const e: ExprStmtNode* = stmt as ExprStmtNode*;
+                this.pend_assign_node = null;
                 if (e.expression != null) { this.walk_expr_read(e.expression); }
                 // A discarded owning temporary (e.g. `make_owned();` or
                 // `Res { id: 1 };`) is never bound, so without this it is
@@ -785,9 +928,17 @@ type struct DropInserter {
                         && this.discarded_owning_temp(e.expression)) {
                     this.emit_discarded_temp_drop(e.expression, out, stmt.span);
                 } else {
-                    out.push(stmt);
+                    // Assigning over a live destination releases what was
+                    // there; the rewrite has to bracket the statement, so it
+                    // owns the `out.push(stmt)`.
+                    if (this.pend_assign_node != null &&
+                        this.pend_assign_node == e.expression) {
+                        this.emit_assign_drop(stmt, out);
+                    } else {
+                        out.push(stmt);
+                    }
                     // `<x> = ...` where x is a conditionally-initialized
-                    // droppable local: record that this path initialized it, so
+                    // droppable place: record that this path initialized it, so
                     // the scope-exit `if (<flag>) drop()` observes the write.
                     const iflag: SymbolStr =
                         this.init_flag_for_assignment_target(e.expression);
@@ -795,11 +946,13 @@ type struct DropInserter {
                         out.push(this.make_drop_flag_set(iflag, stmt.span));
                     }
                 }
+                this.pend_assign_node = null;
                 false
             }
             NodeKind::DeclarationStatement => {
                 const ds: DeclStmtNode* = stmt as DeclStmtNode*;
                 mut init_flag: SymbolStr = SymbolStr::empty();
+                mut flag_decls: StatementNode*[] = [];
                 if (ds.declaration != null) {
                     if (ds.declaration.kind == NodeKind::VariableDeclaration) {
                         const vd: VarDeclNode* = ds.declaration as VarDeclNode*;
@@ -810,10 +963,18 @@ type struct DropInserter {
                         // scope-exit drop fires only where it was assigned;
                         // otherwise the unconditional drop would free
                         // uninitialized stack garbage on the untouched path.
+                        //
+                        // A local filled member by member has no such moment:
+                        // ask for member flags first, and only fall back to the
+                        // whole-binding flag when the local becomes live all at
+                        // once.
                         if (vd.initializer == null && !vd.is_global &&
                             !vd.is_capture_alias &&
                             this.type_needs_drop(vd.resolved_type)) {
-                            init_flag = this.attach_init_flag(vd.name, vd.span);
+                            if (!this.attach_member_flags(vd.name, vd.resolved_type,
+                                                          vd.span, &flag_decls)) {
+                                init_flag = this.attach_init_flag(vd.name, vd.span);
+                            }
                         }
                     } else if (ds.declaration.kind == NodeKind::DestructureDeclaration) {
                         this.walk_destructure_decl(ds.declaration as DestructureDeclNode*);
@@ -822,6 +983,9 @@ type struct DropInserter {
                 out.push(stmt);
                 if (init_flag.is_valid()) {
                     out.push(this.make_drop_flag_decl(init_flag, ds.span));
+                }
+                for (mut fi: i64 = 0; fi < flag_decls.length; fi++) {
+                    out.push(flag_decls[fi]);
                 }
                 false
             }
@@ -919,7 +1083,8 @@ type struct DropInserter {
         // `__call__` invocation would drop the captured value on return.
         if (vd.is_capture_alias) { return; }
         if (!vd.is_global) {
-            this.register_binding(vd.name, vd.resolved_type, vd.span);
+            this.register_binding(vd.name, vd.resolved_type, vd.span,
+                                  vd.initializer != null);
         }
     }
 
@@ -935,7 +1100,9 @@ type struct DropInserter {
         }
         for (mut i: i64 = 0; i < dd.bindings.length; i++) {
             const b: DestructureBinding = dd.bindings[i];
-            this.register_binding(b.local_name, b.resolved_type, b.span);
+            // Every destructured field is bound from the RHS, so each is live
+            // from its declaration.
+            this.register_binding(b.local_name, b.resolved_type, b.span, true);
         }
     }
 
@@ -2125,6 +2292,29 @@ type struct DropInserter {
         const span: SourceSpan = this.binding_spans[idx];
         if (!this.type_needs_drop(ty)) { return; }
         const sym: SymbolStr = SymbolStr::from_id(key);
+        // Member-governed binding: it never becomes live all at once, so there
+        // is no whole value to drop - only the members that were written.  A
+        // monolithic drop here would expand through glue over every member,
+        // running the destructor on the ones that are still stack garbage.
+        if (this.slot_has_members(idx)) {
+            // The whole value left the frame; the new owner drops what it got.
+            if (this.is_moved_id(key)) { return; }
+            mut mcore: StatementNode*[] = [];
+            this.append_member_drops(&mcore, idx);
+            if (mcore.length == 0) { return; }
+            const mflag: SymbolStr = SymbolStr::from_id(this.binding_dropflags[idx]);
+            if (mflag.is_valid()) {
+                // Conditionally moved out as a whole on some path: the members
+                // survive only where the move did not happen.
+                out.push(this.wrap_in_move_guard(mflag, &mcore, span));
+                this.inserted += 1;
+            } else {
+                for (mut mi: i64 = 0; mi < mcore.length; mi++) {
+                    out.push(mcore[mi]);
+                }
+            }
+            return;
+        }
         // Build the core cleanup (whatever the move/partial-move state calls
         // for) into a local buffer, then wrap the whole thing in the
         // init-flag guard if the binding was only conditionally initialized.
@@ -2174,6 +2364,141 @@ type struct DropInserter {
                 this.inserted += 1;
             }
         }
+    }
+
+    // ---- releasing the value an assignment displaces ----------------------
+
+    /// Decide whether the plain `=` in `b` displaces a value this frame still
+    /// owns, and stash the answer for the enclosing expression statement.
+    ///
+    /// Called from `read_binary` between the RHS walk and the LHS revive,
+    /// which is the only point at which the moved-set answers the question
+    /// being asked.  Before the RHS walk it cannot see `t = takes_it(t)`,
+    /// where the callee now owns what is in the destination; after the revive
+    /// the move has been erased so a value consumed by an earlier statement
+    /// (`consume(t); t = make();`) looks live.  Both must NOT be released
+    /// here, and in between is where both are visible.
+    ///
+    /// Every "cannot tell" answer declines.  Declining leaks the displaced
+    /// value, which is what this pass did for every assignment before; a wrong
+    /// release is a double free.
+    record_assign_drop(mut &this, b: BinaryExprNode*) -> void {
+        this.pend_assign_node = null;
+        if (b == null || b.left == null) { return; }
+        // The destination must be storage this frame owns.  The chain is read
+        // syntactically and then typed from the BINDING down (`place_type_of`),
+        // never from the place node's own `resolved_type`: async lowering
+        // rebuilds the bodies this pass sees and leaves those annotations
+        // invalid, which silently answered "nothing to release" for every
+        // assignment inside a lowered `poll`.  A hop through a pointer or
+        // reference, or a run-time index, fails to type here - a raw slot store
+        // fills reserved capacity that holds nothing yet, and releasing its
+        // previous occupant frees whatever the allocator last left there.
+        mut kind: u8[]  = [];
+        mut key:  u32[] = [];
+        const root: SymbolStr = this.collect_place_chain(b.left, &kind, &key);
+        if (!root.is_valid()) { return; }
+        const slot: i64 = this.innermost_binding_slot(root);
+        if (slot < 0) { return; }
+        const place_ty: TypeRef = this.place_type_of(
+            this.binding_types[slot], &kind, &key, 0, kind.length);
+        if (!this.type_needs_drop(place_ty)) { return; }
+        if (this.is_moved(root)) { return; }
+        // Conditionally moved out on some path: whether the destination still
+        // holds a value is decided at run time by a flag whose polarity this
+        // site does not track.
+        if (this.binding_dropflags[slot] != (0 as u32)) { return; }
+
+        const root_live:  boolean = this.binding_definit[slot] == (1 as u8);
+        const root_flag:  u32     = this.binding_initflags[slot];
+        mut guard: u32 = 0;
+
+        if (kind.length == 0) {
+            // Whole-binding destination.
+            if (this.slot_has_members(slot)) { return; }
+            if (root_live) {
+                guard = 0;
+            } else if (root_flag != (0 as u32)) {
+                guard = root_flag;
+            } else {
+                return;                 // address escaped; liveness unknown
+            }
+        } else {
+            // A member already moved out of its owner belongs to whoever took
+            // it, exactly as `append_partial_drops` reasons at scope exit.
+            if (kind.length == 1 && kind[0] == (0 as u8) &&
+                this.pm_has(root.id, key[0])) { return; }
+            const midx: i64 = this.member_slot_for_place(b.left);
+            if (midx >= 0) {
+                guard = this.mem_flag[midx];
+            } else if (this.slot_has_members(slot)) {
+                // A place above or below a tracked member: the flags describe a
+                // different granularity than this write.
+                return;
+            } else if (root_live) {
+                guard = 0;              // parent live as a whole, so is this
+            } else if (root_flag != (0 as u32)) {
+                guard = root_flag;
+            } else {
+                return;
+            }
+        }
+        this.pend_assign_node  = b as ExpressionNode*;
+        this.pend_assign_guard = guard;
+        this.pend_assign_ty    = place_ty;
+        this.pend_assign_base    = this.binding_names[slot];
+        this.pend_assign_base_ty = this.binding_types[slot];
+        this.pend_assign_kind    = kind;
+        this.pend_assign_key     = key;
+    }
+
+    /// Rewrite `<place> = <rhs>;` so the value `<place>` held is released:
+    ///
+    ///     const __assign_oldN: T = <place>;
+    ///     <place> = <rhs>;
+    ///     if (<flag>) { __assign_oldN.drop(); }
+    ///
+    /// The copy has to be taken BEFORE the store (which overwrites the only
+    /// reference to the old value) and released AFTER it, because the RHS may
+    /// read the destination: `s = s.concat(x)` builds the new value out of the
+    /// old one, so releasing first would hand `concat` freed memory.  Copying
+    /// a not-yet-live destination is harmless - the bytes are only ever read
+    /// again under the guard that says they were live.
+    ///
+    /// The temporary is deliberately NOT registered as a binding: its release
+    /// is emitted right here, and a scope-exit drop would be a second one.
+    emit_assign_drop(mut &this, stmt: StatementNode*,
+                     out: StatementNode*[]*) -> void {
+        const span: SourceSpan = stmt.span;
+        const ty: TypeRef = this.pend_assign_ty;
+        const place: ExpressionNode* = this.build_place_expr(
+            SymbolStr::from_id(this.pend_assign_base), this.pend_assign_base_ty,
+            &this.pend_assign_kind, &this.pend_assign_key,
+            0, this.pend_assign_kind.length, span);
+        if (place == null) { out.push(stmt); return; }
+        const name: SymbolStr = this.intern.intern(
+            format("__assign_old%lld", this.assign_seq));
+        this.assign_seq = this.assign_seq + 1;
+
+        const vd: VarDeclNode* = new VarDeclNode(name, span);
+        vd.set_resolved_type(ty);
+        vd.set_initializer(place);
+        const ds: DeclStmtNode* = new DeclStmtNode(vd as DeclarationNode*, span);
+        out.push(ds as StatementNode*);
+
+        out.push(stmt);
+
+        const drop_stmt: StatementNode* = this.make_drop_call(name, ty, span);
+        if (drop_stmt == null) { return; }
+        if (this.pend_assign_guard == (0 as u32)) {
+            out.push(drop_stmt);
+        } else {
+            mut core: StatementNode*[] = [];
+            core.push(drop_stmt);
+            out.push(this.wrap_in_init_guard(
+                SymbolStr::from_id(this.pend_assign_guard), core, span));
+        }
+        this.inserted += 1;
     }
 
     /// An expression-statement whose result is a freshly-produced owning
@@ -2246,7 +2571,7 @@ type struct DropInserter {
         // Register the synthesized binding so scope-exit drop synthesis sees
         // it.  walk_var_decl is the usual entry point but it also walks the
         // initializer - which we just walked - so register directly.
-        this.register_binding(name, ty, span);
+        this.register_binding(name, ty, span, true);
         mut ident: IdentifierNode* = new IdentifierNode(name, span);
         ident.set_resolved_type(ty);
         m.subject = ident as ExpressionNode*;
@@ -2444,10 +2769,212 @@ type struct DropInserter {
         // Element/field/address-initialized locals can't be tracked by a
         // whole-binding-assignment flag; leave their drop unconditional.
         if (this.is_init_disqualified(name)) { return SymbolStr::empty(); }
+        // Written member-wise, but `attach_member_flags` declined it (a type
+        // with its own destructor, an unprojectable member).  A whole-binding
+        // flag would never be set - no whole-binding write exists - so the
+        // value would silently never be released.  Keep the unconditional
+        // drop, which is what such a local got before members were tracked.
+        if (this.has_init_places(name)) { return SymbolStr::empty(); }
         const flag: SymbolStr = this.fresh_init_flag_name(name);
         this.binding_initflags[n - 1] = flag.id;
         this.register_param_type(flag, this.arena.get_bool());
         return flag;
+    }
+
+    /// Materialize member flags for the binding just registered as the tail
+    /// entry of `binding_*`, and append their `mut <flag>: boolean = false;`
+    /// declarations to `out`.  Returns true when the binding is now governed
+    /// member-wise, so the caller skips the whole-binding init flag.
+    ///
+    /// Declines - leaving the local on its previous, whole-value treatment -
+    /// when the local is also written as a whole (one flag already answers for
+    /// it), when its address escapes (nothing this pass synthesizes observes
+    /// the callee's write), when the TYPE has its own destructor, or when no
+    /// recorded member actually needs dropping.
+    ///
+    /// The user-destructor case is the one worth spelling out: a `drop` body
+    /// takes the whole value, so member flags describe the wrong granularity
+    /// for it - a type whose every field is plain would attach no flags at all
+    /// and never run the destructor its author wrote.  This is the same rule
+    /// `partial_move_allowed` applies to moving a field out of such a type.
+    attach_member_flags(mut &this, name: SymbolStr, ty: TypeRef,
+                        span: SourceSpan, out: StatementNode*[]*) -> boolean {
+        const slot: i64 = this.binding_names.length - 1;
+        if (slot < 0 || this.binding_names[slot] != name.id) { return false; }
+        if (this.is_whole_assigned(name))   { return false; }
+        if (this.is_init_disqualified(name)) { return false; }
+        if (this.has_user_drop(ty))          { return false; }
+
+        mut attached: boolean = false;
+        for (mut i: i64 = 0; i < this.pw_name.length; i++) {
+            if (this.pw_name[i] != name.id) { continue; }
+            const pstart: i64 = this.pw_pstart[i];
+            const plen:   i64 = this.pw_plen[i];
+            // Walk the chain to the member's type.  A step the arena cannot
+            // resolve means this table cannot name the member after all; the
+            // local keeps its whole-binding treatment.
+            mut mty: TypeRef = ty;
+            mut ok: boolean = true;
+            for (mut k: i64 = 0; k < plen; k++) {
+                mty = this.project_type(mty, this.pw_proj_kind[pstart + k],
+                                             this.pw_proj_key[pstart + k]);
+                if (!mty.is_valid()) { ok = false; }
+                if (!ok) { break; }
+            }
+            if (!ok) { return false; }
+            // A member that owns nothing needs no flag and no drop; skip it
+            // without giving up on the local's other members.
+            if (!this.type_needs_drop(mty)) { continue; }
+            const flag: SymbolStr = this.fresh_member_flag_name(name, pstart, plen);
+            out.push(this.make_drop_flag_decl(flag, span));
+            this.register_param_type(flag, this.arena.get_bool());
+            this.mem_slot.push(slot);
+            this.mem_pstart.push(this.mem_proj_kind.length);
+            this.mem_plen.push(plen);
+            this.mem_type.push(mty);
+            this.mem_flag.push(flag.id);
+            for (mut k: i64 = 0; k < plen; k++) {
+                this.mem_proj_kind.push(this.pw_proj_kind[pstart + k]);
+                this.mem_proj_key.push(this.pw_proj_key[pstart + k]);
+            }
+            attached = true;
+        }
+        return attached;
+    }
+
+    /// Name a member's flag after the path it governs (`p__a__initflag3`), so
+    /// an IR dump names the member rather than only the local.
+    fresh_member_flag_name(mut &this, binding: SymbolStr,
+                           pstart: i64, plen: i64) -> SymbolStr {
+        mut named: string = this.intern.resolve(binding);
+        for (mut k: i64 = 0; k < plen; k++) {
+            if (this.pw_proj_kind[pstart + k] == (0 as u8)) {
+                named = format("%s__%s", named, this.intern.resolve(
+                    SymbolStr::from_id(this.pw_proj_key[pstart + k])));
+            } else {
+                named = format("%s__%u", named, this.pw_proj_key[pstart + k]);
+            }
+        }
+        named = format("%s__initflag%lld", named, this.initflag_seq);
+        this.initflag_seq = this.initflag_seq + 1;
+        return this.intern.intern(named);
+    }
+
+    /// Index of the member entry describing `expr`, or -1.  Matches the
+    /// innermost live binding of the place's root, then an exact chain.
+    member_slot_for_place(&this, expr: ExpressionNode*) -> i64 {
+        if (expr == null) { return -1; }
+        if (this.mem_slot.length == 0) { return -1; }
+        mut kind: u8[]  = [];
+        mut key:  u32[] = [];
+        const root: SymbolStr = this.collect_place_chain(expr, &kind, &key);
+        if (!root.is_valid() || kind.length == 0) { return -1; }
+        const slot: i64 = this.innermost_binding_slot(root);
+        if (slot < 0) { return -1; }
+        for (mut i: i64 = 0; i < this.mem_slot.length; i++) {
+            if (this.mem_slot[i] != slot) { continue; }
+            if (this.mem_plen[i] != kind.length) { continue; }
+            const st: i64 = this.mem_pstart[i];
+            mut same: boolean = true;
+            for (mut k: i64 = 0; k < kind.length; k++) {
+                if (this.mem_proj_kind[st + k] != kind[k] ||
+                    this.mem_proj_key[st + k]  != key[k]) { same = false; }
+            }
+            if (same) { return i; }
+        }
+        return -1;
+    }
+
+    /// True when `slot` has any member entries, i.e. its drop is governed
+    /// member-wise rather than by one whole-binding flag.
+    slot_has_members(&this, slot: i64) -> boolean {
+        for (mut i: i64 = 0; i < this.mem_slot.length; i++) {
+            if (this.mem_slot[i] == slot) { return true; }
+        }
+        return false;
+    }
+
+    /// Build a place expression as fresh nodes: `<base>` followed by the chain
+    /// slice.  Every node gets its type from `project_type` rather than from
+    /// whatever the source node carried, because codegen runs after this pass
+    /// and will not re-resolve one - and because async lowering leaves many
+    /// `resolved_type` annotations invalid.  Null when the chain does not
+    /// project (the caller then emits nothing).
+    ///
+    /// Always fresh nodes, never the original place: one AST node reached from
+    /// two statements is emitted twice by codegen, which for an indexed place
+    /// would evaluate the index twice.
+    build_place_expr(mut &this, base: SymbolStr, base_ty: TypeRef,
+                     kind: &u8[], key: &u32[], start: i64, len: i64,
+                     span: SourceSpan) -> ExpressionNode* {
+        const ident: IdentifierNode* = new IdentifierNode(base, span);
+        ident.set_resolved_type(base_ty);
+        mut cur: ExpressionNode* = ident as ExpressionNode*;
+        mut cur_ty: TypeRef = base_ty;
+        for (mut k: i64 = 0; k < len; k++) {
+            const pkind: u8  = kind[start + k];
+            const pkey:  u32 = key[start + k];
+            const next_ty: TypeRef = this.project_type(cur_ty, pkind, pkey);
+            if (!next_ty.is_valid()) { return null as ExpressionNode*; }
+            if (pkind == (0 as u8)) {
+                const ma: MemberAccessNode* = new MemberAccessNode(
+                    cur, SymbolStr::from_id(pkey), span, span);
+                ma.set_resolved_type(next_ty);
+                cur = ma as ExpressionNode*;
+            } else {
+                const idx_lit: LiteralNode* = new LiteralNode(
+                    format("%u", pkey), LiteralKind::Integer, span);
+                idx_lit.set_resolved_type(this.arena.get_i64());
+                const aa: ArrayAccessNode* = new ArrayAccessNode(
+                    cur, idx_lit as ExpressionNode*, span);
+                aa.set_resolved_type(next_ty);
+                cur = aa as ExpressionNode*;
+            }
+            cur_ty = next_ty;
+        }
+        return cur;
+    }
+
+    /// Build `<base><chain>.drop();` for member entry `idx`.
+    make_member_drop_call(mut &this, base: SymbolStr, base_ty: TypeRef,
+                          idx: i64, span: SourceSpan) -> StatementNode* {
+        const place: ExpressionNode* = this.build_place_expr(
+            base, base_ty, &this.mem_proj_kind, &this.mem_proj_key,
+            this.mem_pstart[idx], this.mem_plen[idx], span);
+        if (place == null) { return null as StatementNode*; }
+        const drop_access: MemberAccessNode* = new MemberAccessNode(
+            place, this.drop_sym, span, span);
+        const call: CallExprNode* = new CallExprNode(
+            drop_access as ExpressionNode*, span);
+        const stmt: ExprStmtNode* = new ExprStmtNode(call as ExpressionNode*, span);
+        return stmt as StatementNode*;
+    }
+
+    /// Emit `if (<flag>) { <member>.drop(); }` for every member of `slot`,
+    /// most recently declared first.  Members moved out of the owner are
+    /// skipped for the same reason `append_partial_drops` skips them: the
+    /// source no longer owns that storage.
+    append_member_drops(mut &this, out: StatementNode*[]*, slot: i64) -> void {
+        const base:    SymbolStr  = SymbolStr::from_id(this.binding_names[slot]);
+        const base_ty: TypeRef    = this.binding_types[slot];
+        const span:    SourceSpan = this.binding_spans[slot];
+        for (mut i: i64 = this.mem_slot.length - 1; i >= 0; i--) {
+            if (this.mem_slot[i] != slot) { continue; }
+            if (this.mem_plen[i] == 1 &&
+                this.mem_proj_kind[this.mem_pstart[i]] == (0 as u8) &&
+                this.pm_has(this.binding_names[slot],
+                            this.mem_proj_key[this.mem_pstart[i]])) {
+                continue;
+            }
+            const drop_stmt: StatementNode* =
+                this.make_member_drop_call(base, base_ty, i, span);
+            if (drop_stmt == null) { continue; }
+            mut core: StatementNode*[] = [];
+            core.push(drop_stmt);
+            out.push(this.wrap_in_init_guard(
+                SymbolStr::from_id(this.mem_flag[i]), core, span));
+            this.inserted += 1;
+        }
     }
 
     is_init_disqualified(&this, name: SymbolStr) -> boolean {
@@ -2656,9 +3183,22 @@ type struct DropInserter {
             NodeKind::Identifier => {
                 if (escaping) {
                     this.disqualify_init((expr as IdentifierNode*).name);
+                } else {
+                    // The whole-binding write the init flag exists to observe.
+                    // Recording it keeps members untracked for this local: a
+                    // value that becomes live all at once is governed by one
+                    // flag, and a later member write displaces a member of an
+                    // already-live parent rather than initializing it.
+                    this.note_whole_assignment((expr as IdentifierNode*).name);
                 }
             }
             NodeKind::MemberAccess => {
+                // A member write is an initialization at MEMBER granularity
+                // when the place is carved out of the local's own storage.
+                // When it isn't - a hop through a pointer, a dynamic index -
+                // no flag can name the slot, so fall through and let the local
+                // keep its unconditional whole-binding drop.
+                if (!escaping && this.record_init_place(expr)) { return; }
                 const ma: MemberAccessNode* = expr as MemberAccessNode*;
                 if (ma.object != null) {
                     if (ma.object.kind == NodeKind::Identifier) {
@@ -2669,6 +3209,7 @@ type struct DropInserter {
                 }
             }
             NodeKind::ArrayAccess => {
+                if (!escaping && this.record_init_place(expr)) { return; }
                 const aa: ArrayAccessNode* = expr as ArrayAccessNode*;
                 if (aa.array != null) {
                     if (aa.array.kind == NodeKind::Identifier) {
@@ -2688,6 +3229,247 @@ type struct DropInserter {
         }
     }
 
+    // ---- member-granularity initialization -------------------------------
+    //
+    // A local declared without an initializer and filled member by member
+    // (`p.a = v`, `xs[0] = v`) is live in parts.  Neither answer a single
+    // whole-binding flag can give is right: dropping unconditionally releases
+    // the members that were never written, and skipping leaks the ones that
+    // were.  These routines give each initialization-granularity member its
+    // own flag so the scope-exit drop asks the question once per member.
+
+    /// True when `ty` is a fixed-size array, whose elements are part of the
+    /// local's own storage.  A dynamic array owns a heap buffer, so indexing
+    /// one reaches storage the local merely points at - not a member of it.
+    is_fixed_array(&this, ty: TypeRef) -> boolean {
+        if (!ty.is_valid() || this.arena == null) { return false; }
+        mut cur: TypeRef = ty;
+        mut t: Type* = this.arena.lookup(cur.id);
+        mut guard: i32 = 0;
+        while (t != null && t.kind == TypeKind::InstantiatedType && guard < 16) {
+            const inst: InstantiatedType* = t as InstantiatedType*;
+            if (!inst.has_resolved_type()) { return false; }
+            cur = inst.resolved_type;
+            t = this.arena.lookup(cur.id);
+            guard = guard + 1;
+        }
+        if (t == null || t.kind != TypeKind::Array) { return false; }
+        const at: ArrayType* = t as ArrayType*;
+        return at.is_fixed();
+    }
+
+    /// The constant value of an index expression, or -1 when it is not a plain
+    /// integer literal.  A member flag names one slot, so an index decided at
+    /// run time has no member for it to govern.
+    const_index_of(&this, expr: ExpressionNode*) -> i64 {
+        if (expr == null || expr.kind != NodeKind::Literal) { return -1; }
+        const lit: LiteralNode* = expr as LiteralNode*;
+        if (lit.literal_kind != LiteralKind::Integer) { return -1; }
+        mut text: string = lit.value;
+        const slen: i64 = lit.suffix.length() as i64;
+        if (slen > 0) {
+            const vlen: i64 = lit.value.length() as i64;
+            if (vlen <= slen) { return -1; }
+            text = lit.value.substr(0, (vlen - slen) as u64);
+        }
+        mut v: u64 = 0;
+        if (!ConstantTable::parse_int_literal(text, &v)) { return -1; }
+        // The key is stored as a u32 alongside field name ids; an index that
+        // does not fit is not a member this table can name.
+        if (v > 0xFFFFFFFF) { return -1; }
+        return v as i64;
+    }
+
+    /// Decompose a place into the local it is rooted at plus its projection
+    /// chain, appended root-first to `out_kind`/`out_key`.  Returns an invalid
+    /// SymbolStr when the shape is not a projection chain over a name.
+    ///
+    /// Purely SYNTACTIC: whether the chain stays inside the local's own
+    /// storage is decided by `place_type_of`, walking types down from the
+    /// binding rather than reading each node's `resolved_type`.  Async
+    /// lowering rebuilds the bodies this pass sees and leaves many of those
+    /// annotations invalid, so a type test here silently answers "no" for
+    /// every assignment in a lowered `poll`.
+    ///
+    /// A failure never leaves a partial chain behind: every push happens after
+    /// the recursive call has already succeeded.
+    collect_place_chain(&this, expr: ExpressionNode*,
+                        out_kind: u8[]*, out_key: u32[]*) -> SymbolStr {
+        if (expr == null) { return SymbolStr::empty(); }
+        if (expr.kind == NodeKind::Identifier) {
+            return (expr as IdentifierNode*).name;
+        }
+        if (expr.kind == NodeKind::MemberAccess) {
+            const ma: MemberAccessNode* = expr as MemberAccessNode*;
+            if (ma.object == null) { return SymbolStr::empty(); }
+            const root: SymbolStr =
+                this.collect_place_chain(ma.object, out_kind, out_key);
+            if (!root.is_valid()) { return SymbolStr::empty(); }
+            out_kind.push(0 as u8);
+            out_key.push(ma.member.id);
+            return root;
+        }
+        if (expr.kind == NodeKind::ArrayAccess) {
+            const aa: ArrayAccessNode* = expr as ArrayAccessNode*;
+            if (aa.array == null || aa.index == null) { return SymbolStr::empty(); }
+            const idx: i64 = this.const_index_of(aa.index);
+            if (idx < 0) { return SymbolStr::empty(); }
+            const root: SymbolStr =
+                this.collect_place_chain(aa.array, out_kind, out_key);
+            if (!root.is_valid()) { return SymbolStr::empty(); }
+            out_kind.push(1 as u8);
+            out_key.push(idx as u32);
+            return root;
+        }
+        return SymbolStr::empty();
+    }
+
+    /// The type of the place `base_ty` + the chain slice, or an invalid
+    /// TypeRef when the chain leaves the local's own storage.  This is the
+    /// single authority on "is this place part of the local": `project_type`
+    /// refuses to step through a pointer or reference, so `(*q).f` and
+    /// `p.buf[i]` fail here even though they parse as clean chains.
+    place_type_of(&this, base_ty: TypeRef, kind: &u8[], key: &u32[],
+                  start: i64, len: i64) -> TypeRef {
+        mut cur: TypeRef = base_ty;
+        for (mut k: i64 = 0; k < len; k++) {
+            cur = this.project_type(cur, kind[start + k], key[start + k]);
+            if (!cur.is_valid()) { return TypeRef::invalid(); }
+        }
+        return cur;
+    }
+
+    /// Project `ty` through one chain step, or an invalid TypeRef when the
+    /// step does not reach a member of the local's own storage: a pointer or
+    /// reference at this level (whatever it addresses belongs to whoever it
+    /// came from), a dynamic array (its elements live in a heap buffer), a
+    /// field the type does not have, or a type the arena cannot resolve.
+    project_type(&this, ty: TypeRef, kind: u8, key: u32) -> TypeRef {
+        if (!ty.is_valid() || this.arena == null) { return TypeRef::invalid(); }
+        if (this.is_ptr_or_ref(ty)) { return TypeRef::invalid(); }
+        if (kind == (1 as u8)) {
+            if (!this.is_fixed_array(ty)) { return TypeRef::invalid(); }
+            mut cur: TypeRef = ty;
+            mut t: Type* = this.arena.lookup(cur.id);
+            mut guard: i32 = 0;
+            while (t != null && t.kind == TypeKind::InstantiatedType && guard < 16) {
+                const inst: InstantiatedType* = t as InstantiatedType*;
+                if (!inst.has_resolved_type()) { return TypeRef::invalid(); }
+                cur = inst.resolved_type;
+                t = this.arena.lookup(cur.id);
+                guard = guard + 1;
+            }
+            if (t == null || t.kind != TypeKind::Array) { return TypeRef::invalid(); }
+            const at: ArrayType* = t as ArrayType*;
+            return at.element;
+        }
+        const agg: Type* = this.aggregate_type_of(ty);
+        if (agg == null) { return TypeRef::invalid(); }
+        mut fields: &FieldInfo[] = if (agg.kind == TypeKind::Struct) {
+            &(agg as StructType*).fields
+        } else {
+            &(agg as ClassType*).fields
+        };
+        for (mut i: i64 = 0; i < fields.length; i++) {
+            if (fields[i].name.id == key) { return fields[i].field_type; }
+        }
+        return TypeRef::invalid();
+    }
+
+    /// Note that `name` is written as a whole somewhere in this function.
+    note_whole_assignment(mut &this, name: SymbolStr) -> void {
+        if (!name.is_valid()) { return; }
+        for (mut i: i64 = 0; i < this.pw_whole.length; i++) {
+            if (this.pw_whole[i] == name.id) { return; }
+        }
+        this.pw_whole.push(name.id);
+    }
+
+    /// True when the pre-scan recorded any member-granularity initialization
+    /// for `name`.
+    has_init_places(&this, name: SymbolStr) -> boolean {
+        if (!name.is_valid()) { return false; }
+        for (mut i: i64 = 0; i < this.pw_name.length; i++) {
+            if (this.pw_name[i] == name.id) { return true; }
+        }
+        return false;
+    }
+
+    is_whole_assigned(&this, name: SymbolStr) -> boolean {
+        if (!name.is_valid()) { return false; }
+        for (mut i: i64 = 0; i < this.pw_whole.length; i++) {
+            if (this.pw_whole[i] == name.id) { return true; }
+        }
+        return false;
+    }
+
+    /// Record `expr` as a member-granularity initialization site.  Returns
+    /// false when the place is not one this table can name, so the caller can
+    /// fall back to disqualifying the local entirely.
+    record_init_place(mut &this, expr: ExpressionNode*) -> boolean {
+        const mark: i64 = this.pw_proj_kind.length;
+        const root: SymbolStr = this.collect_place_chain(
+            expr, &this.pw_proj_kind, &this.pw_proj_key);
+        if (!root.is_valid() || this.pw_proj_kind.length == mark) {
+            while (this.pw_proj_kind.length > mark) {
+                this.pw_proj_kind.pop();
+                this.pw_proj_key.pop();
+            }
+            return false;
+        }
+        this.pw_name.push(root.id);
+        this.pw_pstart.push(mark);
+        this.pw_plen.push(this.pw_proj_kind.length - mark);
+        return true;
+    }
+
+    /// True when recorded place `a` is a prefix of recorded place `b` (both
+    /// rooted at the same name).  `p.a` is a prefix of `p.a.b`.
+    pw_place_is_prefix(&this, a: i64, b: i64) -> boolean {
+        if (this.pw_name[a] != this.pw_name[b]) { return false; }
+        const alen: i64 = this.pw_plen[a];
+        if (alen > this.pw_plen[b]) { return false; }
+        const astart: i64 = this.pw_pstart[a];
+        const bstart: i64 = this.pw_pstart[b];
+        for (mut k: i64 = 0; k < alen; k++) {
+            if (this.pw_proj_kind[astart + k] != this.pw_proj_kind[bstart + k] ||
+                this.pw_proj_key[astart + k]  != this.pw_proj_key[bstart + k]) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// Reduce the recorded places to minimal prefixes, dropping duplicates.
+    /// Recording both `p.a` and `p.a.b` keeps only `p.a`: the shallower write
+    /// makes the whole of that member live, so it is the member that owns the
+    /// drop and a second flag under it would release the same storage twice.
+    reduce_init_places(mut &this) -> void {
+        mut keep_name:   u32[] = [];
+        mut keep_pstart: i64[] = [];
+        mut keep_plen:   i64[] = [];
+        for (mut i: i64 = 0; i < this.pw_name.length; i++) {
+            mut covered: boolean = false;
+            for (mut j: i64 = 0; j < this.pw_name.length; j++) {
+                if (i == j) { continue; }
+                // A strictly shorter prefix covers this place.  Equal-length
+                // duplicates are settled by index so exactly one survives.
+                if (this.pw_place_is_prefix(j, i)) {
+                    if (this.pw_plen[j] < this.pw_plen[i] || j < i) {
+                        covered = true;
+                    }
+                }
+            }
+            if (covered) { continue; }
+            keep_name.push(this.pw_name[i]);
+            keep_pstart.push(this.pw_pstart[i]);
+            keep_plen.push(this.pw_plen[i]);
+        }
+        this.pw_name   = keep_name;
+        this.pw_pstart = keep_pstart;
+        this.pw_plen   = keep_plen;
+    }
+
     /// The init flag for the innermost live binding named `name`, or an invalid
     /// SymbolStr if that binding has none (unconditionally initialized, Copy,
     /// or no such binding).  Reverse scan so an inner shadow wins.
@@ -2703,19 +3485,24 @@ type struct DropInserter {
         return SymbolStr::empty();
     }
 
-    /// If `expr` is a plain assignment `<ident> = ...` whose target is a
-    /// conditionally-initialized droppable local, return that local's init
-    /// flag; otherwise an invalid SymbolStr.  Compound assigns (`+=`, ...) read
-    /// the target first, so they can't be the initializing write.
+    /// If `expr` is a plain assignment whose target is a conditionally-
+    /// initialized droppable place, return the flag that records the write:
+    /// the local's own init flag for `<ident> = ...`, or the member's flag for
+    /// a tracked `<ident>.f = ...` / `<ident>[k] = ...`.  Otherwise an invalid
+    /// SymbolStr.  Compound assigns (`+=`, ...) read the target first, so they
+    /// can't be the initializing write.
     init_flag_for_assignment_target(&this, expr: ExpressionNode*) -> SymbolStr {
         if (expr == null) { return SymbolStr::empty(); }
         if (expr.kind != NodeKind::BinaryExpression) { return SymbolStr::empty(); }
         const b: BinaryExprNode* = expr as BinaryExprNode*;
         if (b.op.kind != TokenType::Equal) { return SymbolStr::empty(); }
-        if (b.left == null || b.left.kind != NodeKind::Identifier) {
-            return SymbolStr::empty();
+        if (b.left == null) { return SymbolStr::empty(); }
+        if (b.left.kind == NodeKind::Identifier) {
+            return this.get_init_flag_for_name((b.left as IdentifierNode*).name);
         }
-        return this.get_init_flag_for_name((b.left as IdentifierNode*).name);
+        const midx: i64 = this.member_slot_for_place(b.left);
+        if (midx < 0) { return SymbolStr::empty(); }
+        return SymbolStr::from_id(this.mem_flag[midx]);
     }
 
     /// Wrap the cleanup statements `core` in `if (<flag>) { core... }` so they
@@ -2731,6 +3518,49 @@ type struct DropInserter {
         }
         const if_stmt: IfStmtNode* = new IfStmtNode(
             flag_ident as ExpressionNode*, body as StatementNode*,
+            null as StatementNode*, span);
+        return if_stmt as StatementNode*;
+    }
+
+    /// Cheap syntactic over-approximation of "this assignment might displace a
+    /// value that has to be released": a plain `=` whose destination is a
+    /// projection chain over a live droppable local.  Used only to decide
+    /// whether a braceless control-flow body needs block-wrapping, where a
+    /// false positive costs an empty block and a false negative loses the
+    /// release, so it deliberately answers before the moved-set is consulted.
+    assignment_may_displace(&this, expr: ExpressionNode*) -> boolean {
+        if (expr == null || expr.kind != NodeKind::BinaryExpression) { return false; }
+        const b: BinaryExprNode* = expr as BinaryExprNode*;
+        if (b.op.kind != TokenType::Equal || b.left == null) { return false; }
+        mut kind: u8[]  = [];
+        mut key:  u32[] = [];
+        const root: SymbolStr = this.collect_place_chain(b.left, &kind, &key);
+        if (!root.is_valid()) { return false; }
+        const slot: i64 = this.innermost_binding_slot(root);
+        if (slot < 0) { return false; }
+        return this.type_needs_drop(this.place_type_of(
+            this.binding_types[slot], &kind, &key, 0, kind.length));
+    }
+
+    /// Wrap `core` in `if (!<flag>) { core... }` so it runs only where the
+    /// binding was not moved out.  Negative-polarity twin of
+    /// `wrap_in_init_guard`; `make_conditional_drop_call` is the single-drop
+    /// special case of this shape.
+    wrap_in_move_guard(mut &this, flag: SymbolStr, core: &StatementNode*[],
+                       span: SourceSpan) -> StatementNode* {
+        const flag_ident: IdentifierNode* = new IdentifierNode(flag, span);
+        flag_ident.set_resolved_type(this.arena.get_bool());
+        const not_tok: Token = Token::new(TokenType::Exclaim, "!",
+            span.start_line as int, span.start_col as int);
+        const cond: UnaryExprNode* = new UnaryExprNode(
+            not_tok, flag_ident as ExpressionNode*, span);
+        cond.set_resolved_type(this.arena.get_bool());
+        const body: BlockStmtNode* = new BlockStmtNode(span);
+        for (mut i: i64 = 0; i < core.length; i++) {
+            body.statements.push(core[i]);
+        }
+        const if_stmt: IfStmtNode* = new IfStmtNode(
+            cond as ExpressionNode*, body as StatementNode*,
             null as StatementNode*, span);
         return if_stmt as StatementNode*;
     }
@@ -2756,7 +3586,15 @@ type struct DropInserter {
         match (stmt.kind) {
             NodeKind::ExpressionStatement => {
                 const e: ExprStmtNode* = stmt as ExprStmtNode*;
-                return this.init_flag_for_assignment_target(e.expression).is_valid();
+                if (this.init_flag_for_assignment_target(e.expression).is_valid()) {
+                    return true;
+                }
+                // A release synthesized for an unconditionally-live
+                // destination carries no flag, so the check above misses it -
+                // and a braceless body is walked into a throwaway buffer,
+                // which would discard the release along with the copy it
+                // depends on.  Wrapping is inert, so answer on the syntax.
+                return this.assignment_may_displace(e.expression);
             }
             NodeKind::BlockStatement => {
                 const b: BlockStmtNode* = stmt as BlockStmtNode*;
@@ -3053,6 +3891,9 @@ type struct DropInserter {
             // restrict the move semantics to plain `=`.
             if (b.op.kind == TokenType::Equal) {
                 this.walk_expr_move(b.right);
+                // Decide here, before the revive below erases the move state
+                // this needs; see record_assign_drop.
+                this.record_assign_drop(b);
                 // Plain `=` to a bare identifier reinitializes that
                 // binding: it now owns the rhs result and must be dropped
                 // at scope exit.  Clear any stale moved state for the lhs

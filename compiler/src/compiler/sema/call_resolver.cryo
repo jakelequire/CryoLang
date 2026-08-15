@@ -30,7 +30,7 @@ namespace Compiler::Sema::CallResolver;
 
 import Compiler::Types::{
     TypeRef, Type, Arena, Compound, UserDefined, Generic, Substitution,
-    Inference, TraitChecker, GenericRegistry, Resolver, Checker, Ownership
+    Inference, TraitChecker, GenericRegistry, Resolver, Checker, Ownership, TypeKind
 };
 import Compiler::Resolver::{ SymbolStr, InternTable, QualifiedName, MangledName };
 import Compiler::AST;
@@ -787,6 +787,20 @@ type struct CallResolver {
                     // numeric slot: an unresolved generic parameter is a different
                     // type kind, so the argument's own type still selects the
                     // specialization.
+                    push_expected = true;
+                } else if (this.sema_arg_is_null_literal(arg)
+                        && this.types.is_function_type(slot)) {
+                    // `null` is typed `void*` and reaches a data-pointer slot
+                    // through the universal pointer rule.  A function-pointer
+                    // slot is not reachable that way - the conversion between
+                    // `void*` and `(A) -> R` is explicit in both directions - so
+                    // the literal has to adopt the parameter's type, exactly as
+                    // it does at an annotated binding.  Without the hint the
+                    // `else` below CLEARS it and an optional callback passed as
+                    // a bare `null` is a mismatch.  Narrow on purpose: only the
+                    // null literal, only against a concrete function slot, so no
+                    // other argument changes which type it takes - in particular
+                    // a `null` bound to a `T*` parameter still must not pin `T`.
                     push_expected = true;
                 } else if (arg_node.kind == NodeKind::UnaryExpression) {
                     // Address-of-a-literal arg (`&<literal>`) bound to a `&T`
@@ -1947,9 +1961,9 @@ type struct CallResolver {
                 SymbolStr::from_id(type_name_id), SymbolStr::from_id(method_name_id), sp);
             // The converter yields `to_ty`, so that is what this reference
             // names.  The scope segment holds the owner's BARE name - the
-            // converter registry stores it that way - so it is not a qualified
-            // name any later stage could resolve, and the type is.
-            sr.set_resolved_type(to_ty);
+            // converter registry stores it that way - so the `Res` is derived
+            // from the type rather than read off the spelling.
+            sr.set_synthesized_ref(to_ty, this.ctx.definition_name_of(to_ty));
             // Generic-identity view: a post-mono concrete target still needs its
             // type_args stamped onto the synthesized scope, or the converter call
             // resolves against the bare generic scope name.
@@ -2120,27 +2134,85 @@ type struct CallResolver {
         return this.ctx.decl_index.canonical_qualified(name);
     }
 
+    /// `(&f32, i64)` - one parameter list, rendered.  `from` is where the
+    /// candidate's slice starts in the flat array, `n` how long it is.
+    render_param_list(&this, params: &TypeRef[], from: i64, n: i64) -> string {
+        mut s: string = "(";
+        for (mut i: i64 = 0; i < n; i++) {
+            if (i > 0) { s = s + ", "; }
+            s = s + this.types.type_display_name(params[from + i]);
+        }
+        return s + ")";
+    }
+
+    /// No member of an overload set accepts this call's arguments.
+    ///
+    /// Reported here rather than deferred to `check_args_against_params`, which
+    /// needs ONE signature to compare against: the defining feature of this case
+    /// is that there are several and none of them fits, so the argument types
+    /// and the candidate list are what make it actionable.
+    ///
+    /// Silent unless every argument has a concrete type - an abstract one has
+    /// nothing to judge, and the same guard is why `check_args_against_params`
+    /// skips those positions.
+    emit_no_matching_overload(mut &this, call: CallExprNode*, member: MemberAccessNode*,
+                              recv: TypeRef, cand_params: &TypeRef[], argc: i64) -> void {
+        if (this.state.in_symbolic_check) { return; }
+        mut argstr: string = "";
+        for (mut i: i64 = 0; i < call.arguments.length; i++) {
+            const arg: ExpressionNode* = call.arguments[i];
+            if (arg == null) { return; }
+            if (!this.types.arg_type_is_concrete(arg.resolved_type)) { return; }
+            if (i > 0) { argstr = argstr + ", "; }
+            argstr = argstr + this.types.type_display_name(arg.resolved_type);
+        }
+        const name_str: string = this.intern.resolve(member.member);
+        mut diag: Diagnostic = Diagnostic::error(
+            ErrorCode::E0214_ARGUMENT_MISMATCH,
+            format("no overload of `%s` accepts these arguments", name_str));
+        diag = diag.at_with_label(call.span,
+            format("no `%s` on `%s` takes `(%s)`", name_str,
+                   this.types.type_display_name(recv), argstr));
+        if (argc > 0) {
+            const count: i64 = cand_params.length / argc;
+            mut note: string = "candidates are ";
+            for (mut c: i64 = 0; c < count; c++) {
+                if (c > 0) {
+                    if (c + 1 == count) { note = note + " and "; }
+                    else                { note = note + ", "; }
+                }
+                note = note + "`" + name_str
+                     + this.render_param_list(cand_params, c * argc, argc) + "`";
+            }
+            if (count > 0) { diag = diag.with_note(note); }
+        }
+        this.ctx.emit_diagnostic(diag);
+    }
+
     /// Per-argument type checking for an instance method call.  Gathers same-named
-    /// candidates from inherent methods + trait impls; checks only when a single
-    /// distinct signature emerges, else flags two-trait ambiguity / arity.
+    /// candidates from inherent methods + trait impls; checks against the single
+    /// signature when one emerges, and against the binder's verdict when several
+    /// do; flags two-trait ambiguity / arity.
     check_method_call_arg_types(mut &this, visitor: ASTVisitor*, call: CallExprNode*,
                                 member: MemberAccessNode*) -> void {
         const obj_type: TypeRef = member.object.resolved_type;
         if (!obj_type.is_valid()) { return; }
+        mut base_ref: TypeRef = obj_type;
         mut base_t: Type* = this.arena.lookup(obj_type.id);
         mut unwrap_depth: i32 = 0;
         while (base_t != null && unwrap_depth < 5) {
             if (base_t.kind == TypeKind::Pointer) {
-                base_t = this.arena.lookup((base_t as PointerType*).pointee.id);
+                base_ref = (base_t as PointerType*).pointee;
             } else if (base_t.kind == TypeKind::Reference) {
-                base_t = this.arena.lookup((base_t as ReferenceType*).referent.id);
+                base_ref = (base_t as ReferenceType*).referent;
             } else if (base_t.kind == TypeKind::InstantiatedType) {
                 const inst: InstantiatedType* = base_t as InstantiatedType*;
                 if (!inst.has_resolved_type()) { return; }
-                base_t = this.arena.lookup(inst.resolved_type.id);
+                base_ref = inst.resolved_type;
             } else {
                 break;
             }
+            base_t = this.arena.lookup(base_ref.id);
             unwrap_depth += 1;
         }
         if (base_t == null) { return; }
@@ -2155,6 +2227,14 @@ type struct CallResolver {
         mut chosen:    TypeRef[] = [];
         mut name_seen:  i64 = 0;
         mut uniq_arity: i64 = -1;
+        // Every arity-matching candidate's parameter types, flat: each candidate
+        // contributes exactly `argc` entries, so the diagnostic chunks them back
+        // apart.  Collected in the walk that finds them rather than by a second
+        // walk at the diagnostic, so the set reported is by construction the set
+        // that was considered - and held as TypeRefs rather than rendered text,
+        // because this runs at every method call and only the error path needs
+        // the strings.
+        mut cand_params: TypeRef[] = [];
 
         const empty_minfo: MethodInfo[] = [];
         mut methods_ref: &MethodInfo[] = &empty_minfo;
@@ -2176,6 +2256,9 @@ type struct CallResolver {
                 name_seen  += 1;
                 uniq_arity  = this.diag.note_arity(uniq_arity, m.param_types.length);
                 if (m.param_types.length != argc) { continue; }
+                for (mut ci: i64 = 0; ci < m.param_types.length; ci++) {
+                    cand_params.push(m.param_types[ci]);
+                }
                 if (!found) {
                     found = true;
                     chosen = [];
@@ -2238,6 +2321,9 @@ type struct CallResolver {
                         name_seen  += 1;
                         uniq_arity  = this.diag.note_arity(uniq_arity, tparams.length);
                         if (tparams.length != argc) { tparams.drop(); continue; }
+                        for (mut ci: i64 = 0; ci < tparams.length; ci++) {
+                            cand_params.push(tparams[ci]);
+                        }
                         if (!found) {
                             found = true;
                             chosen = tparams;
@@ -2274,7 +2360,20 @@ type struct CallResolver {
             this.ctx.emit_diagnostic(diag);
             return;
         }
-        if (ambiguous) { return; }
+        // Several arity-matching signatures is an overload SET, not a reason to
+        // stop checking.  There is no single `chosen` to compare against, but
+        // `resolve_method_overload` ran first and has already decided which
+        // member this call names; when it bound nothing, no candidate accepts
+        // these arguments.  Returning silently hands such a call to codegen,
+        // whose name+arity fallback picks a same-named sibling and reads the
+        // argument at THAT signature's parameter type - a reinterpretation with
+        // no diagnostic, where a single candidate would have produced E0214.
+        if (ambiguous) {
+            if (call.resolved_method == null) {
+                this.emit_no_matching_overload(call, member, base_ref, cand_params, argc);
+            }
+            return;
+        }
         if (found) {
             this.check_args_against_params(visitor, call, chosen.as_slice());
             return;
@@ -3571,11 +3670,12 @@ type struct CallResolver {
                                                   FILE, LINE)) {
             this.report_scope_ambiguity(scope);
         }
-        // Resolve the scope to the import-visible qualified type FIRST, so a
-        // same-leaf type in another module (`Coll::B::Beacon` when this module
-        // imported `Coll::A::Beacon`) can't win the bare `lookup_method_return`
-        // via last-write-wins.  Falls through to the bare form downstream when
-        // scoping doesn't apply (unique leaf, module scope, or a generic param).
+        // The owner key the static-method lookups below are keyed by, which is
+        // an INSTANTIATION and not a definition: a specialized scope segment
+        // arrives already mangled (`6Result$Lu_N$L...`), and the registries hold
+        // its methods under that form.  The node's `Res` deliberately cannot
+        // answer this - it names the definition (`Result`) for every
+        // instantiation of it - so the identity comes from the type layer.
         mut lookup_sym: SymbolStr =
             this.ctx.resolve_scoped_or_at(scope.scope_name, scope.span.file, FILE, LINE);
         if (scope.scope_generic_args.length > 0) {
@@ -3812,7 +3912,17 @@ type struct CallResolver {
         // expected-type-unify source can recover an owner param the args don't
         // determine.  Idempotent (no-op once `resolved_type_args` is set).
         this.stash_static_owner_bindings_for(scope, call);
-        const method_ret: TypeRef = this.types.lookup_method_return(lookup_sym, scope.member_name);
+        // The owner the method is REGISTERED under, which is not always the one
+        // the call site spelled: a module-relative path (`Deque::Gadget`) names a
+        // type the leaf-keyed import index above cannot fold, so `lookup_sym` is
+        // still the written text.  Pinning must use the name that answered - a
+        // symbol rebuilt from the spelling names no declaration, and codegen then
+        // binds it by bare leaf and arity or fails to bind it at all.
+        const owner_sym: SymbolStr = this.types.resolve_method_owner(lookup_sym, scope.member_name);
+        mut method_ret: TypeRef = TypeRef::invalid();
+        if (owner_sym.is_valid()) {
+            method_ret = this.types.lookup_method_return(owner_sym, scope.member_name);
+        }
         if (method_ret.is_valid()) {
             mut resolved: TypeRef = this.try_resolve_generic_return(method_ret, scope.scope_name, scope.member_name, scope);
             if (this.types.contains_generic_param(resolved)) {
@@ -3820,7 +3930,7 @@ type struct CallResolver {
                 if (inferred.is_valid() && !this.types.contains_generic_param(inferred)) { resolved = inferred; }
             }
             scope.set_resolved_type(resolved);
-            this.pin_scope_callee_combined(call, lookup_sym, scope.member_name);
+            this.pin_scope_callee_combined(call, owner_sym, scope.member_name);
             return resolved;
         }
         if (scope.scope_generic_args.length > 0) {
@@ -3854,16 +3964,28 @@ type struct CallResolver {
         return TypeRef::invalid();
     }
 
-    /// True when `scope_name` resolves to a declared TYPE (as written or through
-    /// the caller's import scope), distinguishing a static-method scope (`Bo`)
-    /// from a module scope (`future`).  Used to keep the static-method-template
-    /// path off module-qualified free-function calls.
-    scope_names_a_type(&this, scope_name: SymbolStr) -> boolean {
-        if (this.types.lookup_type_by_sym(scope_name).is_valid()) { return true; }
-        const q: SymbolStr = this.ctx.resolve_scoped_or(scope_name, FILE, LINE);
-        if (q.is_valid() && !q.equals(scope_name)
-                && this.types.lookup_type_by_sym(q).is_valid()) { return true; }
-        return false;
+    /// True when the scope segment names a declared TYPE, distinguishing a
+    /// static-method scope (`Bo`) from a module scope (`future`).  Used to keep
+    /// the static-method-template path off module-qualified free-function calls.
+    ///
+    /// Read off the node's `Res`, which is the answer the name layer already
+    /// produced from the scope the path was WRITTEN in: a remainder the type
+    /// layer owns is exactly what `TypeRelative` records, and a module is `Def`.
+    /// Asking an index by spelling cannot separate the two when one leaf names
+    /// both a module and a type, and it answers for whichever was registered
+    /// first rather than for what this file can see.
+    scope_names_a_type(&this, scope: ScopeResolutionNode*) -> boolean {
+        // Named at the event: the delayed tally says HOW MANY nodes arrived
+        // unclaimed, only a per-node line says WHICH.
+        if (scope.scope_res.is_pending()) {
+            ResolveCounter::path_hit(
+                "RES-PENDING", this.intern.resolve(scope.scope_name),
+                this.intern.resolve(scope.member_name), scope.span.to_string());
+        }
+        return match (scope.require_scope_res("scope_names_a_type")) {
+            Res::TypeRelative(_, _) => { true }
+            _                       => { false }
+        };
     }
 
     /// Find the function template a `Owner::method` scope-resolution call names,
@@ -3923,7 +4045,7 @@ type struct CallResolver {
         // disambiguation - by `resolve_module_qualified_function`; intercepting it
         // here would bypass that disambiguation and mis-resolve an overloaded
         // module function.  The owner of a static method is always a nominal type.
-        if (!this.scope_names_a_type(scope.scope_name)) { return TypeRef::invalid(); }
+        if (!this.scope_names_a_type(scope)) { return TypeRef::invalid(); }
         const entry: TemplateEntry* = this.find_static_method_template(scope);
         if (entry == null || entry.node_kind != NodeKind::FunctionDeclaration) {
             return TypeRef::invalid();
@@ -5115,11 +5237,12 @@ type struct CallResolver {
     check_scope_call_arg_types(mut &this, visitor: ASTVisitor*, scope: ScopeResolutionNode*,
                                call: CallExprNode*) -> void {
         if (this.ctx.decl_index == null) { return; }
-        // Resolve the scope to the import-visible qualified type FIRST, so a
-        // same-leaf type in another module (`Coll::B::Beacon` when this module
-        // imported `Coll::A::Beacon`) can't win the bare `lookup_method_return`
-        // via last-write-wins.  Falls through to the bare form downstream when
-        // scoping doesn't apply (unique leaf, module scope, or a generic param).
+        // The owner key the static-method lookups below are keyed by, which is
+        // an INSTANTIATION and not a definition: a specialized scope segment
+        // arrives already mangled (`6Result$Lu_N$L...`), and the registries hold
+        // its methods under that form.  The node's `Res` deliberately cannot
+        // answer this - it names the definition (`Result`) for every
+        // instantiation of it - so the identity comes from the type layer.
         mut lookup_sym: SymbolStr =
             this.ctx.resolve_scoped_or_at(scope.scope_name, scope.span.file, FILE, LINE);
         if (scope.scope_generic_args.length > 0) {

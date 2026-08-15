@@ -85,3 +85,61 @@ function typed_null_callback() -> Result<(), TestError> {
     match (expect_eq(maybe_apply(null, 5), -1)) { Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); } }
     return expect_eq(maybe_apply(add1, 41), 42);
 }
+
+// --- `null` in every position that states a function-pointer type ---
+//
+// `null` is typed `void*`, and the universal `void* <-> T*` rule carries it
+// into any DATA pointer.  That rule stops at function types on purpose - the
+// conversion between `void*` and `(A) -> R` is explicit in both directions, so
+// an arbitrary `void*` cannot silently become callable - which leaves the
+// literal itself to adopt the function type its context states.  The vtable
+// struct below is the shape that exposes a gap here: one literal, one `null`,
+// accepted for the data pointer and rejected for the function pointer beside
+// it.
+
+type struct Vtable {
+    drop_fn: (void*) -> void;
+    poll_fn: (void*) -> u64;
+    data:    void*;
+}
+
+function poll_one(p: void*) -> u64 { return 1; }
+
+![test]
+function null_binds_to_annotated_fn_pointer() -> Result<(), TestError> {
+    const f: (void*) -> void = null;
+    return expect(f == null, "an annotated function pointer initialized with `null` must be null");
+}
+
+![test]
+function null_fills_fn_pointer_field_beside_a_data_pointer() -> Result<(), TestError> {
+    const vt: Vtable = Vtable { drop_fn: null, poll_fn: null, data: null };
+    match (expect(vt.drop_fn == null, "drop_fn must be null")) { Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); } }
+    match (expect(vt.poll_fn == null, "poll_fn must be null")) { Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); } }
+    return expect(vt.data == null, "data must be null");
+}
+
+// A null field must not disturb the live one beside it: a store that landed on
+// the wrong slot would leave this call unreachable or reading the null.
+![test]
+function live_fn_pointer_survives_a_null_sibling() -> Result<(), TestError> {
+    const vt: Vtable = Vtable { drop_fn: null, poll_fn: poll_one, data: null };
+    match (expect(vt.drop_fn == null, "drop_fn must be null")) { Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); } }
+    const g: (void*) -> u64 = vt.poll_fn;
+    return expect_eq(g(null) as i64, 1);
+}
+
+function no_dropper() -> (void*) -> void { return null; }
+
+![test]
+function null_returns_as_fn_pointer() -> Result<(), TestError> {
+    return expect(no_dropper() == null, "a `null` returned as a function pointer must be null");
+}
+
+// The explicit cast is still the route any OTHER `void*` takes to a function
+// type; adopting the annotation for the literal must not retire it.
+![test]
+function explicit_cast_to_fn_pointer_still_works() -> Result<(), TestError> {
+    const f: (void*) -> void = null as (void*) -> void;
+    return expect(f == null, "`null as (void*) -> void` must still be null");
+}

@@ -5211,6 +5211,70 @@ self-host was broken.
 
 ---
 
+### 8.9 A second lane grew in the constant folder, invisible to both ratchets — FIXED 2026-08-14
+
+The compile-time constant folder (`const_table.cryo::ConstEval`, the one folder
+behind `T[N]`, `[v; N]`, `static_assert` and a global initializer) resolved a
+qualified name **by spelling**: it interned the written qualifier, probed its
+own `by_qualified` map, then the use site's module, then a program-wide leaf
+map. That is a three-step cascade, a global leaf index, and no visibility check
+— §1's root cause and §6.1's "no state meaning didn't resolve, try something
+else", rebuilt from scratch inside a new module.
+
+It failed in the obvious way. The table is keyed by the declaring module's FULL
+namespace, and a use site may write any whole-segment suffix, so
+`Mesh::GROUND_VERTEX_COUNT` for `namespace Aether::Gpu::Mesh` missed every step.
+Measured on the game-engine tree: the fully-written path folded, the suffix did
+not, and the boundary was irrelevant — a same-package module failed identically.
+The proposed repair was to hoist `modules_written_as` and scan every module for
+a suffix match, which is exactly the search §5.1 forbids and the mechanism §8.2
+already recorded as `M3 collect_namespace_suffix_matches`, 5,669 calls / **0**
+answers, deleted.
+
+**Neither ratchet could see any of it.** `b1-gate` counts instrumented sites and
+the new module had none; `lane-gate` counts calls to `decl_index`'s five
+per-kind lookups and the new module called none, having built its own indexes
+instead. B1 stayed at 214 and LOOKUP at 134 across the whole addition. Both
+gates catch a lane that *grows*; a lane that is *born elsewhere* is outside
+their population. That is the same blind spot §8.8 found from the other side —
+there, an unvisited node; here, an uninstrumented index.
+
+**Three positions had never been name-resolved**, which is why reading the stamp
+was not a one-line change:
+
+| position | why the walk was missing |
+|---|---|
+| `ArrayAnnotation.size_expr` | the annotation walker `stamp_annotation` descends into `Array`'s ELEMENT and not its size — the one expression hanging off an annotation |
+| `ProgramNode.static_asserts` | a side list, not the statement stream; TypeResolution already carried a bespoke walk for the same reason |
+| struct / union / class FIELDS | all three visitors `declare_field` in a loop and never `accept` the field, so `visit(FieldDeclNode*)` — which stamps the annotation and walks the default value — was reachable from nothing |
+
+The third was found only by following the first: a field's `boolean[N]` cannot
+have its size stamped by a walker that never reaches the field.
+
+**The fix** is those three walks plus `fold_scoped` reading `scope_res`:
+`Res::Def(ns)` means the scope named a module, so the member is that module's
+constant; `Res::TypeRelative(ResBase::Def(q), 1)` means it named a type, so the
+member is an enum variant of it. The enum leaf index and the whole spelling
+cascade are deleted, not fixed.
+
+**Measured after.** Suffix-qualified constants, cross-module enum-cast
+constants, and enum variants through a suffix path all fold, in all four
+positions; the fully-written path still folds. A constant in a module that is
+compiled but NOT imported is now refused with **E0240 naming the module** rather
+than a vague "not a compile-time constant" — Rule 0 reaching a `static_assert`
+condition, which it could not previously see. `make test` unit / 176 / 35 green,
+lane unchanged, examples 14/14, self-host `FIXED POINT OK` on both halves, and
+**zero** mechanism-4 pending bugs, so the three walks cover the population.
+
+**B1 214 → 220.** All +6 is one new pair of rows, `const-table bare leaf
+calls/hits`. Nothing regressed: a fallback that was already answering became
+*counted*. A bare name is an `IdentifierNode`, which carries no `Res` slot, so
+there is no stamp to read and the leaf map is the only answer available. That
+row is the residue and the reduction target; it retires when a bare identifier
+is stamped, and until then the gate watches it.
+
+---
+
 ## 9. Open questions
 
 - **Q1** — Does enforcing §3.3 require per-item `public` on declarations that

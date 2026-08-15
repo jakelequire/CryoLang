@@ -1,0 +1,225 @@
+///! Assigning over a live value runs the displaced value's `drop`.
+///!
+///! Each probe records which ids were released in a bitmask, so a missing drop
+///! names the value that was dropped on the floor rather than only showing a
+///! count that is one short.  The two controls are load-bearing: the second one
+///! proves the mask can report more than one release, so "fewer drops than
+///! values" is a real result and not a stuck counter.
+///!
+///! The boundary cases at the bottom are equally load-bearing in the other
+///! direction.  A destination the compiler cannot prove holds a live value -
+///! anything behind a raw pointer or a reference - must NOT be dropped, or the
+///! first write into freshly-reserved capacity frees stack or heap garbage.
+///! `Array::try_push` writes `this.ptr[this.length] = value` into exactly such
+///! a slot, so widening the rule to cover it breaks every growing collection.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::AssignDropsOldValue;
+
+import std::core::result;
+import std::core::mem;
+import std::test::error;
+import std::test::assert;
+
+mut g_mask:  i32 = 0;
+mut g_count: i32 = 0;
+
+function reset() -> void { g_mask = 0; g_count = 0; }
+
+type struct Tracked { id: i32; }
+
+implement trait Drop for struct Tracked {
+    drop(mut &this) -> void {
+        g_mask  = g_mask | (1 << this.id);
+        g_count = g_count + 1;
+    }
+}
+
+type struct Holder { item: Tracked; }
+
+implement struct Holder {
+    // Field write through `mut &this`: the receiver is a reference, so the
+    // callee cannot know the pointee holds a live value.  See
+    // `field_write_through_reference_does_not_drop` below.
+    set_item(mut &this, v: Tracked) -> void { this.item = v; }
+}
+
+function consume(t: Tracked) -> void { }
+
+// ---- controls ------------------------------------------------------------
+
+![test]
+function control_one_value_one_drop() -> Result<(), TestError> {
+    reset();
+    { mut t: Tracked = Tracked { id: 0 }; }
+    return expect_eq(g_mask, 0x01);
+}
+
+![test]
+function control_two_values_two_drops() -> Result<(), TestError> {
+    reset();
+    {
+        mut a: Tracked = Tracked { id: 0 };
+        mut b: Tracked = Tracked { id: 1 };
+    }
+    return expect_eq(g_mask, 0x03);
+}
+
+// ---- the three destinations ----------------------------------------------
+
+![test]
+function assign_over_live_local_drops_old() -> Result<(), TestError> {
+    reset();
+    {
+        mut t: Tracked = Tracked { id: 0 };
+        t = Tracked { id: 1 };
+    }
+    return expect_eq(g_mask, 0x03);
+}
+
+![test]
+function assign_over_live_field_drops_old() -> Result<(), TestError> {
+    reset();
+    {
+        mut h: Holder = Holder { item: Tracked { id: 0 } };
+        h.item = Tracked { id: 1 };
+    }
+    return expect_eq(g_mask, 0x03);
+}
+
+![test]
+function assign_over_live_array_slot_drops_old() -> Result<(), TestError> {
+    reset();
+    {
+        mut xs: Tracked[2];
+        xs[0] = Tracked { id: 0 };
+        xs[1] = Tracked { id: 2 };
+        xs[0] = Tracked { id: 1 };
+    }
+    return expect_eq(g_mask, 0x07);
+}
+
+// ---- the leak this was filed for -----------------------------------------
+// Reassigning in a loop must release every displaced value, not just the last
+// one.  Three assignments over a live local plus the scope-exit drop = 4.
+
+![test]
+function reassignment_in_loop_drops_every_displaced_value()
+        -> Result<(), TestError> {
+    reset();
+    {
+        mut held: Tracked = Tracked { id: 0 };
+        for (mut i: i64 = 0; i < 3; i++) {
+            held = Tracked { id: 1 };
+        }
+    }
+    match (expect_eq(g_count, 4)) {
+        Result::Ok(_)  => {}
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(g_mask, 0x03);
+}
+
+// ---- an uninitialized destination must NOT drop --------------------------
+// The first assignment lands on stack garbage; only the second onward has a
+// live value to displace.
+
+![test]
+function first_assignment_to_uninitialized_local_does_not_drop()
+        -> Result<(), TestError> {
+    reset();
+    {
+        mut t: Tracked;
+        t = Tracked { id: 1 };
+    }
+    return expect_eq(g_mask, 0x02);
+}
+
+![test]
+function second_assignment_to_late_init_local_drops_old()
+        -> Result<(), TestError> {
+    reset();
+    {
+        mut t: Tracked;
+        t = Tracked { id: 0 };
+        t = Tracked { id: 1 };
+    }
+    return expect_eq(g_mask, 0x03);
+}
+
+// ---- a moved-from destination must NOT drop ------------------------------
+// The value left the binding; releasing it here would be the second release.
+
+![test]
+function assign_over_moved_from_local_does_not_double_drop()
+        -> Result<(), TestError> {
+    reset();
+    {
+        mut t: Tracked = Tracked { id: 0 };
+        consume(t);                       // callee owns and drops id 0
+        t = Tracked { id: 1 };            // nothing live to displace
+    }
+    return expect_eq(g_mask, 0x03);
+}
+
+![test]
+function self_referential_assignment_does_not_double_drop()
+        -> Result<(), TestError> {
+    reset();
+    {
+        mut t: Tracked = Tracked { id: 0 };
+        t = replace_with(t);              // moves t in; result moves back out
+    }
+    return expect_eq(g_mask, 0x03);
+}
+
+function replace_with(t: Tracked) -> Tracked {
+    return Tracked { id: 1 };             // `t` released here, by the callee
+}
+
+// ---- boundary: destinations that must NOT drop ---------------------------
+
+// A raw slot store is how a collection fills reserved-but-uninitialized
+// capacity.  The buffer is zeroed first, so a wrongly-emitted drop of the old
+// occupant releases id 0 and shows up as bit 0.
+![test]
+function raw_pointer_slot_store_does_not_drop() -> Result<(), TestError> {
+    reset();
+    const n: u64 = 2;
+    mut buf: Tracked* = intrinsics::malloc(n * 8) as Tracked*;
+    mem::zero(buf, n);
+    buf[0] = Tracked { id: 1 };
+    buf[1] = Tracked { id: 2 };
+    intrinsics::free(buf as void*);
+    // Nothing the compiler owns was released: heap slots are not auto-dropped,
+    // and neither store displaced a value it could prove live.
+    return expect_eq(g_mask, 0x00);
+}
+
+![test]
+function deref_store_does_not_drop() -> Result<(), TestError> {
+    reset();
+    mut slot: Tracked* = intrinsics::malloc(8) as Tracked*;
+    mem::zero(slot, 1);
+    (*slot) = Tracked { id: 1 };
+    intrinsics::free(slot as void*);
+    return expect_eq(g_mask, 0x00);
+}
+
+// The documented limitation, encoded so that widening the rule to cover
+// references trips here first.  `h.item = v` written in the caller DOES drop
+// (see assign_over_live_field_drops_old); routed through `mut &this` it does
+// not, because a reference parameter may point at storage the caller has not
+// initialized - the out-parameter idiom in conditional_init_drop.cryo relies
+// on exactly that.
+![test]
+function field_write_through_reference_does_not_drop()
+        -> Result<(), TestError> {
+    reset();
+    {
+        mut h: Holder = Holder { item: Tracked { id: 0 } };
+        h.set_item(Tracked { id: 1 });
+    }
+    // id 0 is leaked; only the scope-exit drop of `h` runs.
+    return expect_eq(g_mask, 0x02);
+}

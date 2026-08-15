@@ -17,7 +17,9 @@
 
 namespace Compiler::Sema::TypeUtils;
 
-import Compiler::Types::{ TypeRef, Type, Arena, Compound, UserDefined, Generic, Checker };
+import Compiler::Types::{
+    TypeRef, Type, Arena, Compound, UserDefined, Generic, Checker, TypeKind
+};
 import Compiler::Resolver::{ SymbolStr, InternTable, Resolver };
 import Compiler::CompilationContext;
 import Compiler::ResolveCounter;
@@ -93,21 +95,46 @@ type struct TypeUtils {
 
     // widen: bare -> qualified -> cross-module cascade.
     lookup_method_return_raw(&this, type_sym: SymbolStr, method_sym: SymbolStr) -> TypeRef {
+        const owner: SymbolStr = this.resolve_method_owner(type_sym, method_sym);
+        if (!owner.is_valid()) { return TypeRef::invalid(); }
+        return this.ctx.decl_index.lookup_method_return(owner, method_sym);
+    }
+
+    /// The name `method_sym` is REGISTERED under for an owner segment spelled
+    /// `type_sym`, or an invalid symbol when no owner carries the method.
+    ///
+    /// The spelling a call site writes is not a registry key: a scope segment
+    /// may be a bare leaf, the writer's own module-qualified form, or a
+    /// module-relative path (`Deque::Gadget`), while the registries hold one
+    /// canonical name per declaration.  Widening is therefore part of asking
+    /// the question, and the answer is WHICH name carried the method - not just
+    /// that some name did.
+    ///
+    /// Every consumer keys off this one answer.  A caller that recovers the
+    /// return type here and then rebuilds a symbol from the written spelling is
+    /// naming a declaration that does not exist, and the failure surfaces a
+    /// whole stage later as an unresolvable callee.
+    resolve_method_owner(&this, type_sym: SymbolStr, method_sym: SymbolStr) -> SymbolStr {
         // As-is (already-qualified names from monomorphized types).
-        const bare_ret: TypeRef = this.ctx.decl_index.lookup_method_return(type_sym, method_sym);
-        if (bare_ret.is_valid()) { return bare_ret; }
+        if (this.ctx.decl_index.lookup_method_return(type_sym, method_sym).is_valid()) {
+            return type_sym;
+        }
         // Module-qualified (local/same-module types registered under qualified names).
         const qualified: SymbolStr = this.ctx.qualify_symbol_sym(type_sym);
         if (!qualified.equals(type_sym)) {
-            const q_ret: TypeRef = this.ctx.decl_index.lookup_method_return(qualified, method_sym);
-            if (q_ret.is_valid()) { return q_ret; }
+            if (this.ctx.decl_index.lookup_method_return(qualified, method_sym).is_valid()) {
+                return qualified;
+            }
         }
         // Cross-module: resolve the type's original module via the scope chain.
+        // This is the only probe that answers a written path whose own leading
+        // segments name a module, since the import-scoped index is keyed by leaf.
         const cross_sym: SymbolStr = this.resolve_cross_module_name(type_sym);
-        if (cross_sym.is_valid()) {
-            return this.ctx.decl_index.lookup_method_return(cross_sym, method_sym);
+        if (cross_sym.is_valid()
+                && this.ctx.decl_index.lookup_method_return(cross_sym, method_sym).is_valid()) {
+            return cross_sym;
         }
-        return TypeRef::invalid();
+        return SymbolStr::empty();
     }
 
     // widen: qualified -> direct -> cross-module -> arena-leaf cascade.
@@ -466,6 +493,13 @@ type struct TypeUtils {
         return ty != null && ty.kind == TypeKind::Reference;
     }
 
+    /// True when `t` resolves to a function type (`(A) -> R`) - a callable slot.
+    is_function_type(&this, t: TypeRef) -> boolean {
+        if (!t.is_valid()) { return false; }
+        const ty: Type* = this.arena.lookup(t.id);
+        return ty != null && ty.kind == TypeKind::Function;
+    }
+
     /// True when `t` resolves to a reference OR pointer - the value is already an
     /// address and must not be auto-ref'd again.
     is_ref_or_ptr_type(&this, t: TypeRef) -> boolean {
@@ -488,7 +522,19 @@ type struct TypeUtils {
     /// True when `arg` and `param` describe the same underlying type up to one
     /// level of pointer/reference spelling - `&T`<->`&mut T`, `&T`<->`T*`, and
     /// value<->`&T`/`T*` (call-site auto-ref).  At least one side must be an
-    /// indirection; the underlying types must be non-`Incompatible`.
+    /// indirection, and the underlying types must be ASSIGNABLE to each other.
+    ///
+    /// Assignable, not merely "not Incompatible": this predicate is the second
+    /// opinion asked after `can_assign` has already said no, so accepting a pair
+    /// that needs an explicit cast means one peel plus any castable relation is
+    /// enough to waive the diagnosis - `i64` against `i32*` peels to `i64` vs
+    /// `i32`, which are cast-compatible.
+    ///
+    /// The auto-ref clause below is why a value whose type ALREADY equals the
+    /// pointee still binds a pointer parameter: `f(42)` against `i32*` matches
+    /// on `equals` and the call site materializes a temporary.  That is this
+    /// predicate's purpose at a CALL; a plain `=` must not ask it, and asks
+    /// `indirection_spelling_compatible` instead.
     indirection_compatible(&this, arg_ty: TypeRef, param_ty: TypeRef) -> boolean {
         const a_peeled: TypeRef = this.peel_indirection(arg_ty);
         const p_peeled: TypeRef = this.peel_indirection(param_ty);
@@ -501,41 +547,92 @@ type struct TypeUtils {
         // only models for `Derived*`->`Base*`.
         if (this.checker.is_subclass_of(a_in, p_in)) { return true; }
         const c: TypeCompatibility = this.checker.check_compatibility(a_in, p_in);
-        return c != TypeCompatibility::Incompatible;
+        return c.is_assignable();
     }
 
-    /// Whether `t` is concrete enough for argument type-checking to judge.  False
-    /// for generic/bounded params, function (template) types, and unresolved
-    /// instantiations; recurses through pointer/reference/array/optional/tuple.
-    /// `()` and `void` are treated as never-a-mismatch (skip).
+    /// True when two types differ only in how the SAME indirection is spelled -
+    /// `&T` vs `&mut T` vs `T*`.  BOTH sides must be indirections.
+    ///
+    /// This is `indirection_compatible` minus its call-site auto-ref clause, and
+    /// it is what a plain `=` must ask.  Auto-ref is something a CALL does: the
+    /// callee gets the address of a temporary the call site materializes.  An
+    /// assignment materializes nothing, so admitting the value<->pointer half
+    /// there waived the diagnosis for `p = 42` on a `i32*` - and since the
+    /// literal defaults to `i32`, it matched the pointee exactly and never even
+    /// reached a compatibility question.  What codegen then emitted was a 32-bit
+    /// store into the 64-bit pointer slot, leaving the high half of the previous
+    /// pointer in place.
+    indirection_spelling_compatible(&this, from_ty: TypeRef, to_ty: TypeRef) -> boolean {
+        const f_peeled: TypeRef = this.peel_indirection(from_ty);
+        const t_peeled: TypeRef = this.peel_indirection(to_ty);
+        if (!f_peeled.is_valid() || !t_peeled.is_valid()) { return false; }
+        if (f_peeled.equals(t_peeled)) { return true; }
+        if (this.checker.is_subclass_of(f_peeled, t_peeled)) { return true; }
+        return this.checker.check_compatibility(f_peeled, t_peeled).is_assignable();
+    }
+
+    /// Whether `t` is concrete enough for argument / assignment type-checking to
+    /// judge.  A `()` or `void` VALUE is never a mismatch, so it is skipped here;
+    /// everything else defers to `arg_type_part_is_concrete`.
+    ///
+    /// The void skip belongs at the TOP LEVEL only.  Applied to a component it
+    /// says `void*` cannot be judged, which silently disabled the check for every
+    /// `void*` argument and assignment in the tree - and `void*` is the type the
+    /// FFI and type-erasure seams are made of, so that is the last place the
+    /// check should be absent.
     arg_type_is_concrete(&this, t: TypeRef) -> boolean {
+        if (!t.is_valid()) { return false; }
+        const ty: Type* = this.arena.lookup(t.id);
+        if (ty == null) { return false; }
+        if (ty.kind == TypeKind::Unit) { return false; }
+        if (ty.kind == TypeKind::Void) { return false; }
+        return this.arg_type_part_is_concrete(t);
+    }
+
+    /// Whether every part of `t` names a settled type - one a mismatch can be
+    /// judged against.  False for generic/bounded params, function TEMPLATES,
+    /// and unresolved instantiations; recurses through
+    /// pointer/reference/array/optional/tuple and through a function signature.
+    ///
+    /// A `Function` is settled once its parameters and return type are: it is an
+    /// address with a known signature, structurally interned, so two spellings of
+    /// one signature share an id and a mismatch is real.  Treating the whole kind
+    /// as unjudgeable - which this inherited from the generic-INFERENCE predicate,
+    /// where the question is instead "can this pin a type variable?" - left a
+    /// callback field or parameter accepting any value at all, and the failure is
+    /// a call through the slot into whatever was stored there.
+    arg_type_part_is_concrete(&this, t: TypeRef) -> boolean {
         if (!t.is_valid()) { return false; }
         const ty: Type* = this.arena.lookup(t.id);
         if (ty == null) { return false; }
         if (ty.kind == TypeKind::GenericParam)     { return false; }
         if (ty.kind == TypeKind::BoundedParam)     { return false; }
         if (ty.kind == TypeKind::FunctionTemplate) { return false; }
-        if (ty.kind == TypeKind::Function)         { return false; }
-        if (ty.kind == TypeKind::Unit)             { return false; }
-        if (ty.kind == TypeKind::Void)             { return false; }
         if (ty.kind == TypeKind::Pointer) {
-            return this.arg_type_is_concrete((ty as PointerType*).pointee);
+            return this.arg_type_part_is_concrete((ty as PointerType*).pointee);
         }
         if (ty.kind == TypeKind::Reference) {
-            return this.arg_type_is_concrete((ty as ReferenceType*).referent);
+            return this.arg_type_part_is_concrete((ty as ReferenceType*).referent);
         }
         if (ty.kind == TypeKind::Array) {
-            return this.arg_type_is_concrete((ty as ArrayType*).element);
+            return this.arg_type_part_is_concrete((ty as ArrayType*).element);
         }
         if (ty.kind == TypeKind::Optional) {
-            return this.arg_type_is_concrete((ty as OptionalType*).wrapped);
+            return this.arg_type_part_is_concrete((ty as OptionalType*).wrapped);
         }
         if (ty.kind == TypeKind::Tuple) {
             const tt: TupleType* = ty as TupleType*;
             for (mut i: i64 = 0; i < tt.elements.length; i++) {
-                if (!this.arg_type_is_concrete(tt.elements[i])) { return false; }
+                if (!this.arg_type_part_is_concrete(tt.elements[i])) { return false; }
             }
             return true;
+        }
+        if (ty.kind == TypeKind::Function) {
+            const ft: FunctionType* = ty as FunctionType*;
+            for (mut i: i64 = 0; i < ft.param_types.length; i++) {
+                if (!this.arg_type_part_is_concrete(ft.param_types[i])) { return false; }
+            }
+            return this.arg_type_part_is_concrete(ft.return_type);
         }
         if (ty.kind == TypeKind::InstantiatedType) {
             const inst: InstantiatedType* = ty as InstantiatedType*;

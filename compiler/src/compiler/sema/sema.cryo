@@ -28,6 +28,7 @@ import Compiler::Diag::{
     Diagnostic, Suggestion, SourceSpan, EditDistance, Snapshot
 };
 import Compiler::DeclIndex;
+import Compiler::ConstTable;
 import Compiler::ResolveCounter;
 import Compiler::AST;
 import Compiler::AST::{ Node, Expression, Statement, Declaration, Pattern, Visitor, NodeLocator, Cloner };
@@ -1129,6 +1130,32 @@ public:
         }
         if (decl.kind != NodeKind::VariableDeclaration) { return; }
         const var_node: VarDeclNode* = decl as VarDeclNode*;
+        this.check_var_decl(var_node);
+        this.register_var_decl_local(var_node);
+    }
+
+    /// A declaration written at MODULE scope.  It reaches sema as a bare
+    /// `VarDeclNode` in the program's statement list, not wrapped in the
+    /// `DeclStmtNode` a body uses, so without this override `accept` found
+    /// nothing and a global's initializer was never resolved: no type for
+    /// codegen's constant folder to work from (the global then landed on the
+    /// zero fallback), and no diagnostic for anything wrong inside it - naming
+    /// an enum variant that does not exist compiled clean.
+    ///
+    /// Guarded on `is_global` so this cannot become a second answering path for
+    /// a local; the statement form and the for-loop form own those.
+    override visit(mut &this, node: VarDeclNode*) -> void {
+        if (node == null || !node.is_global) { return; }
+        this.check_var_decl(node);
+    }
+
+    /// Resolve and type-check one variable declaration: its annotation, its
+    /// initializer (resolved under that annotation as the expected type), the
+    /// type inferred from the initializer when there is no annotation, and the
+    /// E0200 agreement between the two.  Shared by the statement form and the
+    /// module-level form - they reach sema through different visitors and must
+    /// not answer this differently.
+    check_var_decl(mut &this, var_node: VarDeclNode*) -> void {
         this.member.check_annotation_visibility(var_node.type_annotation);
 
         // A type-less binding with no initializer has nothing to infer from.
@@ -1176,6 +1203,13 @@ public:
                         const slice_sym: SymbolStr = this.intern.intern("Slice");
                         const from_raw_sym: SymbolStr = this.intern.intern("from_raw");
                         mut sr: ScopeResolutionNode* = new ScopeResolutionNode(slice_sym, from_raw_sym, sp);
+                        // The reference is to the stdlib `Slice`, and its
+                        // canonical name comes from the import scope this
+                        // declaration was written in - not from the bare
+                        // spelling the lowering was built with, which names
+                        // nothing on its own.
+                        sr.set_synthesized_res(
+                            this.ctx.resolve_scoped_or(slice_sym, FILE, LINE));
                         mut elt_named: NamedAnnotation* = new NamedAnnotation {
                             name: SymbolStr::empty(), span: sp, pre_resolved: at.element,
                             res: ResSlot::Pending,
@@ -1269,6 +1303,13 @@ public:
             }
         }
 
+    }
+
+    /// Bind the declaration's name in the current scope.  Only the statement
+    /// form does this: a module-level declaration is already registered as a
+    /// global by an earlier pass, and binding it here would shadow that global
+    /// with a local for the rest of the module.
+    register_var_decl_local(mut &this, var_node: VarDeclNode*) -> void {
         if (var_node.resolved_type.is_valid()) {
             this.scopes.register_local_with_mut(var_node.name, var_node.resolved_type, var_node.is_mutable);
         } else if (var_node.has_initializer()) {
@@ -1835,7 +1876,8 @@ public:
             this.check_assignment_lvalue(bin.left);
             if (bin.op.lexeme == "=" && lhs.is_valid() && rhs.is_valid()
                 && this.types.arg_type_is_concrete(lhs) && this.types.arg_type_is_concrete(rhs)
-                && !this.checker.can_assign(rhs, lhs) && !this.types.indirection_compatible(rhs, lhs)) {
+                && !this.checker.can_assign(rhs, lhs)
+                && !this.types.indirection_spelling_compatible(rhs, lhs)) {
                 const value_span: SourceSpan = if (bin.right != null) { bin.right.span } else { bin.span };
                 this.diag.emit_type_mismatch_with_value(
                     ErrorCode::E0200_TYPE_MISMATCH, value_span, lhs, rhs,
@@ -2147,7 +2189,23 @@ public:
     }
 
     resolve_cast(mut &this, cast: CastExprNode*) -> TypeRef {
+        // The operand of an explicit cast is not bounded by the SURROUNDING
+        // annotation.  `as` names its own target, and performing a conversion
+        // the operand would not survive implicitly is the whole reason to write
+        // one - so leaving the enclosing expected type in scope let the bound
+        // the cast exists to satisfy reject the cast's own operand:
+        // `const x: i32 = 18446744073709551613 as i32` was "out of range for
+        // i32", which is how a two's-complement bit pattern is spelled and what
+        // the C importer emits for a negative constant.  Cleared rather than
+        // replaced by the target: the literal takes its natural width and the
+        // cast truncates, which is the same answer for an in-range operand and
+        // the only one that admits a full-width pattern.  A bare literal keeps
+        // its bound (no cast, no clear), and a suffixed one is settled before
+        // the expected type is consulted at all.
+        const saved_expected: TypeRef = this.state.expected_type;
+        this.state.expected_type = TypeRef::invalid();
         const from_ty: TypeRef = this.resolve_expr(cast.expression);
+        this.state.expected_type = saved_expected;
         if (!cast.has_resolved_target() && cast.target_annotation != null && this.ctx.type_resolver != null) {
             this.prime_typeof_annotation(cast.target_annotation);
             mut res_ctx: ResolutionContext = ResolutionContext::new(FILE, LINE, this.ctx.source_file, "", "", HomeOrigin::Unset);
@@ -2168,6 +2226,7 @@ public:
         }
         const to_ty: TypeRef = cast.resolved_target;
         if (from_ty.is_valid() && to_ty.is_valid()
+            && !this.cast_operand_is_byref_receiver(cast.expression)
             && this.types.arg_type_is_concrete(from_ty) && this.types.arg_type_is_concrete(to_ty)
             && this.is_aggregate_scalar_cast(from_ty, to_ty)) {
             this.ctx.emit_error_at(ErrorCode::E0208_INVALID_CAST,
@@ -2175,6 +2234,22 @@ public:
                 cast.span);
         }
         return cast.resolved_target;
+    }
+
+    /// True when the cast operand is `this` inside a BY-REFERENCE method.
+    ///
+    /// Such a receiver is an address - it is passed as a pointer - but it is
+    /// typed as the owner so that member access inside the body reads as the
+    /// value it stands for.  So `this as void*` is pointer-to-pointer, not the
+    /// aggregate-to-scalar conversion E0208 exists to reject, and it is how the
+    /// C client-data idiom is spelled (`clang_visitChildren(cur, visitor, this
+    /// as void*)`).  A BY-VALUE receiver is a real aggregate and still reports:
+    /// there the cast has no representation, exactly as for any other value.
+    cast_operand_is_byref_receiver(&this, expr: ExpressionNode*) -> boolean {
+        if (expr == null || !this.state.this_is_by_ref) { return false; }
+        const n: ASTNode* = expr as ASTNode*;
+        if (n.kind != NodeKind::Identifier) { return false; }
+        return (expr as IdentifierNode*).name.equals(this.this_sym);
     }
 
     /// True when a cast crosses between a memory aggregate and a scalar/pointer
@@ -2427,7 +2502,7 @@ public:
                     span: SourceSpan) -> ExpressionNode* {
         mut scope: ScopeResolutionNode* = new ScopeResolutionNode(
             this.intern.intern("Poll"), this.intern.intern("Ready"), span);
-        scope.set_resolved_type(poll_out);
+        scope.set_synthesized_ref(poll_out, this.ctx.definition_name_of(poll_out));
         mut call: CallExprNode* = new CallExprNode(scope as ExpressionNode*, span);
         call.add_argument(value);
         call.set_resolved_type(poll_out);
@@ -2472,7 +2547,13 @@ public:
         return 0;
     }
 
-    build_try_desugar(mut &this, node: TryExprNode*, is_result: boolean) -> MatchExprNode* {
+    /// `ret_ty` is the ENCLOSING FUNCTION's return type, not the operand's: the
+    /// `Err`/`None` this builds is the value returned on the error arm, so that
+    /// is the enum its scope segment names. The two agree on shape (the caller
+    /// rejects a mismatch) but not necessarily on instantiation, and only the
+    /// returned one is what the synthesized reference refers to.
+    build_try_desugar(mut &this, node: TryExprNode*, is_result: boolean,
+                      ret_ty: TypeRef) -> MatchExprNode* {
         const span: SourceSpan = node.span;
         this.state.try_counter += 1;
         const enum_name: SymbolStr = this.intern.intern(if (is_result) { "Result" } else { "Option" });
@@ -2504,12 +2585,14 @@ public:
             const err_pb: PatternBinding* = new PatternBinding { name: err_bind, span: span };
             err_pat.add_element(PatternElement::Binding(err_pb));
             mut err_scope: ScopeResolutionNode* = new ScopeResolutionNode(enum_name, err_variant, span);
+            err_scope.set_synthesized_ref(ret_ty, this.ctx.definition_name_of(ret_ty));
             mut err_call: CallExprNode* = new CallExprNode(err_scope as ExpressionNode*, span);
             err_call.add_argument(new IdentifierNode(err_bind, span) as ExpressionNode*);
             ret_value = err_call as ExpressionNode*;
         } else {
             mut bare_err: ScopeResolutionNode* =
                 new ScopeResolutionNode(enum_name, err_variant, span);
+            bare_err.set_synthesized_ref(ret_ty, this.ctx.definition_name_of(ret_ty));
             ret_value = bare_err as ExpressionNode*;
         }
         // Inside the `poll` an `async fn` was lowered into, every `return`
@@ -2589,7 +2672,7 @@ public:
             this.ctx.emit_diagnostic(diag);
             return TypeRef::invalid();
         }
-        mut desugared: MatchExprNode* = this.build_try_desugar(node, operand_shape == 1);
+        mut desugared: MatchExprNode* = this.build_try_desugar(node, operand_shape == 1, fn_ret);
         node.set_desugared(desugared as ExpressionNode*);
         return this.resolve_expr(desugared as ExpressionNode*);
     }
@@ -2856,8 +2939,35 @@ public:
         return true;
     }
 
+    /// The function type of a STATIC method named `ty::member`, or invalid when
+    /// `ty` names no struct/class, the member is not one of its methods, or the
+    /// method takes a receiver - an instance method is not a value on its own.
+    /// The stored `function_type` already excludes the receiver and is interned
+    /// through the same `get_function` an annotation goes through, so it is the
+    /// SAME id a `(A) -> R` annotation resolves to.
+    scope_static_method_type(mut &this, ty: TypeRef, scope: ScopeResolutionNode*) -> TypeRef {
+        if (!ty.is_valid()) { return TypeRef::invalid(); }
+        const t: Type* = this.arena.lookup(ty.id);
+        if (t == null) { return TypeRef::invalid(); }
+        mut m: MethodInfo* = null;
+        if (t.kind == TypeKind::Struct)     { m = (t as StructType*).get_method(scope.member_name); }
+        else if (t.kind == TypeKind::Class) { m = (t as ClassType*).get_method(scope.member_name); }
+        else { return TypeRef::invalid(); }
+        if (m == null || !m.is_static) { return TypeRef::invalid(); }
+        return m.function_type;
+    }
+
     resolve_scope_resolution(mut &this, scope: ScopeResolutionNode*) -> TypeRef {
         const found: TypeRef = this.types.lookup_type_by_sym(scope.scope_name);
+        // `Type::static_method` as a VALUE is the method, not the type.  The
+        // type-binding branch below answers "does this path name something the
+        // type owns" - what an enum variant needs - and a static method satisfies
+        // it too, so the expression took its OWNER's type.  A callback handed out
+        // that way arrived as a struct value with no signature to check against,
+        // and the address codegen emitted for it was never the one sema had
+        // described.
+        const static_ft: TypeRef = this.scope_static_method_type(found, scope);
+        if (static_ft.is_valid()) { return static_ft; }
         if (found.is_valid() && this.scope_member_binds_type(found, scope)) {
             this.validate_enum_scope_member(found, scope);
             return this.calls.promote_to_expected_instantiation(found);
@@ -2941,6 +3051,26 @@ public:
         return !(exp_t as ArrayType*).is_fixed();
     }
 
+    /// The element count of a `[value; N]` repeat expression, or -1 when `N`
+    /// is not a compile-time integer and the literal is therefore a dynamic
+    /// array sized at run time.
+    ///
+    /// Folded through the same environment an array size in a type is folded
+    /// through, so `T[N]` and `[v; N]` cannot disagree about `N` - a field and
+    /// its initializer sharing one name for their length is the whole point of
+    /// naming it.  No arena: a repeat count is fixed before TypeLowering, the
+    /// same position an array annotation's size is fixed at.
+    const_repeat_count(&this, arr: ArrayLiteralNode*) -> i64 {
+        if (this.ctx == null) { return -1; }
+        const ev: ConstEval = ConstEval::new(
+            this.ctx.const_table, this.ctx.intern_table, null,
+            this.ctx.module_ns_sym_of_file(arr.span.file));
+        mut n: i64 = 0;
+        if (!ev.fold(arr.repeat_count_expr, &n)) { return -1; }
+        if (n < 0) { return -1; }
+        return n;
+    }
+
     resolve_array_literal(mut &this, arr: ArrayLiteralNode*) -> TypeRef {
         mut elem_expected: TypeRef = TypeRef::invalid();
         if (this.state.expected_type.is_valid()) {
@@ -3006,7 +3136,7 @@ public:
             } else if (arr.repeat_count_expr != null) {
                 size = -1;
                 if (!this.expected_is_dynamic_array()) {
-                    const fill_count: i64 = sema_const_int_index(arr.repeat_count_expr);
+                    const fill_count: i64 = this.const_repeat_count(arr);
                     if (fill_count >= 0) { size = fill_count; }
                 }
             }
