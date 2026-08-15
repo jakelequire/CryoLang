@@ -65,7 +65,22 @@ The compiler does not enforce naming, but the standard library and ecosystem use
 
 ### 1.2 Keywords
 
-Keywords are reserved identifiers. They cannot be used as variable, function, or type names.
+Keywords are reserved identifiers. They cannot be used as variable, function, or type names — but they **can name a member**: a field or a method, declared and used.
+
+```cryo
+![repr(C)]
+type struct VkDescriptorPoolSize {
+    type:  u32;          // the C header's own field name
+    count: u32;
+}
+
+mut p: VkDescriptorPoolSize = VkDescriptorPoolSize { type: 1, count: 4 };
+p.type = 2;
+```
+
+A member position is never a declaration or an operator, so the keyword is unambiguous there: what follows the name says which member it is — `(` or `<` a method, `:` a field — and after `.` or `::` a token can only be a member name. This exists because a bound C struct's field names are not Cryo's to choose; a binding generator cannot rename `type` without breaking the ABI it exists to preserve.
+
+The exceptions are the keywords a member position reads *first*: `public`, `private` and `protected` open a visibility label, and `static`, `virtual`, `override` and `async` are member modifiers. A field with one of those seven names cannot be declared, and a C struct carrying one still needs a `![repr(C)]` shadow struct.
 
 | Control flow | Declarations    |             | Modifiers   | Operator keywords | Special values | Reserved for future use |
 | ------------ | --------------- | ----------- | ----------- | ----------------- | -------------- | ----------------------- |
