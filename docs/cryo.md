@@ -2388,9 +2388,40 @@ implement trait Drop for Buffer {
 }
 ```
 
-Implementing `Drop` declares "I own resources that must be released." The compiler **automatically synthesises drop calls at scope exit** for non-`Copy` `const`/`mut` bindings - the analyzer + synthesizer run unconditionally between `MoveCheck` and `TypeLowering`. Drops fire in reverse declaration order at every scope-exit point (block end, early `return`, `break`, `continue`).
+Implementing `Drop` declares "I own resources that must be released." The compiler **automatically synthesises drop calls** for non-`Copy` `const`/`mut` bindings - the analyzer + synthesizer run unconditionally between `MoveCheck` and `TypeLowering`. A value is released at two points:
 
-Auto-drop covers `const x: T = ...` and `mut x: T = ...` declarations. It does **not** yet cover pattern bindings (`match` arms) or members reached by field/index access.
+- **Scope exit**, in reverse declaration order, at every exit from the declaring scope (block end, early `return`, `break`, `continue`).
+- **Assignment over a live value**: `x = new_value` releases whatever `x` held. Without this every reassignment of an owning type leaks the previous value, without bound in a loop.
+
+Auto-drop covers `const x: T = ...` and `mut x: T = ...` declarations, and members of such a local reached by field or constant-index access (`x.f`, `x[0]`). It does **not** yet cover pattern bindings (`match` arms).
+
+#### What assignment releases
+
+Assignment releases the destination **only where the compiler can establish that it holds a live value**. That means a place carved out of a local's own storage: the local itself, or a chain of field projections and constant indices over it. The destinations below do *not* release what they overwrite, because nothing visible in the frame distinguishes a live value from reserved, never-written memory:
+
+| destination | why not |
+| --- | --- |
+| `*p = v` | `p` may address storage that has been reserved but never written |
+| `p[i] = v` where `p` is a pointer | the same - this is exactly how a collection fills fresh capacity |
+| `r.f = v` where `r` is a reference or pointer, **including `this.f = v`** | the callee cannot see whether the caller initialized the pointee |
+| `xs[i] = v` with a run-time `i` | no single member for the compiler to track |
+| a module-level global | globals are never auto-dropped |
+
+A consequence worth knowing: a local of an `async function` that survives an `await` is lowered into a field of the generated future, so reassigning it becomes a store through `this` and does not release the displaced value. A by-value `async` parameter is materialized as a real local per state and does release it.
+
+At those destinations, release the old value yourself. `Array::set` is the canonical example: it drops the previous occupant before reusing the slot, precisely because `this.ptr[index] = value` does not.
+
+#### Members are tracked separately
+
+A local filled member by member has no single moment at which the whole value becomes live, so each member is tracked on its own:
+
+```cryo
+mut p: Pair;          // nothing live yet
+p.a = make();         // p.a live; p.b still uninitialized
+                      // scope exit releases p.a, and only p.a
+```
+
+Releasing `p` as a whole here would run `Drop` over `p.b`'s uninitialized stack memory - a `free` of whatever the stack happened to hold, not a leak.
 
 **A user `drop` runs in addition to field drop-glue, not instead of it.** After a type's own `drop` body returns, its droppable fields are released for it, exactly as they would be for the same type with no `Drop` impl at all. A destructor therefore releases only what the *type itself* owns beyond its fields - a raw handle, an OS resource - and never has to release a field by hand:
 
@@ -2438,7 +2469,7 @@ Non-`Copy` bindings are tracked by a flow-sensitive analysis ([`passes/move_chec
 - passing a non-`Copy` value to a function or method parameter that is **not** a reference type (`fn f(t: T)` moves; `fn f(t: &T)` borrows), and
 - calling `binding.drop()` or any method whose receiver consumes (`mut this` or `![sink]`).
 
-References (`&T` / `mut &T`) and raw pointers borrow; passing `&x` keeps `x` usable. Reassigning a binding re-initialises it, so `consume(x); x = make();` is legal and `x` is live again after the assignment.
+References (`&T` / `mut &T`) and raw pointers borrow; passing `&x` keeps `x` usable. Reassigning a binding re-initialises it, so `consume(x); x = make();` is legal and `x` is live again after the assignment. A moved-from binding holds nothing, so that second assignment releases nothing - the callee owns what it took (see [section 16.2](#162-the-drop-trait) for what assignment does release).
 
 ```cryo
 const a: Buffer = make_buffer(1024);
