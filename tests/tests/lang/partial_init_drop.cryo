@@ -1,0 +1,154 @@
+///! A local initialized piecewise is dropped only over the members that were
+///! actually written.
+///!
+///! Writing one field or one element of a local declared without an
+///! initializer leaves the rest as stack garbage.  If the scope-exit drop is
+///! emitted unconditionally over the whole local, glue expands it across every
+///! member and runs the destructor on that garbage - for a heap-owning member
+///! that is a `free()` of whatever the stack happened to hold, which is memory
+///! corruption rather than a leak.
+///!
+///! Every case is paired with a fully-written control of the same type, same
+///! length, same scope shape.  Without the pair, "no crash" would be equally
+///! consistent with the drop never running at all, and a leak would read as a
+///! pass.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::PartialInitDrop;
+
+import std::core::result;
+import std::test::error;
+import std::test::assert;
+
+mut g_drops: i32 = 0;
+mut g_mask:  i32 = 0;
+
+function reset() -> void { g_drops = 0; g_mask = 0; }
+
+type struct Probe { id: i32; }
+
+implement trait Drop for struct Probe {
+    drop(mut &this) -> void {
+        g_drops = g_drops + 1;
+        g_mask  = g_mask | (1 << this.id);
+    }
+}
+
+type struct Pair  { a: Probe; b: Probe; }
+
+// ---- fixed-size array elements -------------------------------------------
+
+// Only element 0 is written.  Element 1 was never constructed, so exactly one
+// drop must run - and its id must be 0, not stack garbage.
+![test]
+function partial_array_drops_only_written_elements()
+        -> Result<(), TestError> {
+    reset();
+    {
+        mut xs: Probe[2];
+        xs[0] = Probe { id: 0 };
+    }
+    match (expect_eq(g_drops, 1)) {
+        Result::Ok(_)  => {}
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(g_mask, 0x01);
+}
+
+// Control: both written, both dropped.  This is what proves the array's
+// scope-exit drop runs at all, so the case above failing at 0 would be caught.
+![test]
+function full_array_drops_every_element() -> Result<(), TestError> {
+    reset();
+    {
+        mut xs: Probe[2];
+        xs[0] = Probe { id: 0 };
+        xs[1] = Probe { id: 1 };
+    }
+    match (expect_eq(g_drops, 2)) {
+        Result::Ok(_)  => {}
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(g_mask, 0x03);
+}
+
+// ---- struct fields --------------------------------------------------------
+
+![test]
+function partial_struct_drops_only_written_fields()
+        -> Result<(), TestError> {
+    reset();
+    {
+        mut p: Pair;
+        p.a = Probe { id: 0 };
+    }
+    match (expect_eq(g_drops, 1)) {
+        Result::Ok(_)  => {}
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(g_mask, 0x01);
+}
+
+![test]
+function full_struct_drops_every_field() -> Result<(), TestError> {
+    reset();
+    {
+        mut p: Pair;
+        p.a = Probe { id: 0 };
+        p.b = Probe { id: 1 };
+    }
+    match (expect_eq(g_drops, 2)) {
+        Result::Ok(_)  => {}
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(g_mask, 0x03);
+}
+
+// ---- a member written on only some paths ---------------------------------
+
+function partial_on_branch(take: boolean) -> void {
+    mut p: Pair;
+    p.a = Probe { id: 0 };
+    if (take) { p.b = Probe { id: 1 }; }
+}
+
+![test]
+function branch_written_field_drops_only_when_written()
+        -> Result<(), TestError> {
+    reset();
+    partial_on_branch(false);
+    match (expect_eq(g_drops, 1)) {
+        Result::Ok(_)  => {}
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(g_mask, 0x01);
+}
+
+![test]
+function branch_written_field_drops_when_taken() -> Result<(), TestError> {
+    reset();
+    partial_on_branch(true);
+    match (expect_eq(g_drops, 2)) {
+        Result::Ok(_)  => {}
+        Result::Err(e) => { return Result::Err(e); }
+    }
+    return expect_eq(g_mask, 0x03);
+}
+
+// ---- nothing written at all ----------------------------------------------
+// Already correct today via the whole-binding init flag; kept as the anchor
+// that the new per-member tracking must not regress.
+
+![test]
+function untouched_local_drops_nothing() -> Result<(), TestError> {
+    reset();
+    { mut p: Pair; }
+    return expect_eq(g_drops, 0);
+}
+
+![test]
+function untouched_array_drops_nothing() -> Result<(), TestError> {
+    reset();
+    { mut xs: Probe[2]; }
+    return expect_eq(g_drops, 0);
+}

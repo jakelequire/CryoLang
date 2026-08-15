@@ -88,7 +88,9 @@ async function suspend_between(c: boolean) -> u32 {
     return v.id + a + b + m;
 }
 
-// A droppable by-value parameter takes the same route as a local.
+// A droppable by-value parameter takes the same CARRY route as a local, but a
+// different assignment route: it is materialized as a real local per state, so
+// the rebuild below releases the argument the caller handed in.
 async function param_rebuilt_in_if(mut v: Tag, c: boolean) -> u32 {
     const a = await PendingThenReady<u32>::new(1, 10);
     if (c) { v = Tag { id: 6 }; }
@@ -96,93 +98,102 @@ async function param_rebuilt_in_if(mut v: Tag, c: boolean) -> u32 {
     return v.id + a + b;
 }
 
-// Reassigning a local does not drop the overwritten value (only the final value
-// dies at scope exit), so every case below ends at exactly one drop.
-function ac_check(got: u32, want: u32) -> Result<(), TestError> {
+// Each case states its own destructor count rather than sharing one, because
+// the two shapes here answer differently and the difference is the point.
+//
+// A by-value PARAMETER is materialized as a real local in each state, so
+// assigning over it releases the argument the caller handed in: two Tags built,
+// two destructors.  A carried LOCAL is not - state-machine lowering rewrites it
+// into a store to the future's carrier field, and a store through `this` is one
+// of the destinations assignment deliberately does not release (see
+// `docs/cryo.md` section 16.2: the callee cannot see whether the pointee holds
+// a live value).  So a rebuilt local still ends at one destructor, and the
+// value it displaced is leaked.
+function ac_check(got: u32, want: u32, want_drops: i32) -> Result<(), TestError> {
     match (expect_eq(got, want)) {
         Result::Ok(_) => {}
         Result::Err(e) => { return Result::Err(e); }
     }
-    return expect_eq(ac_drops, 1 as i32);
+    return expect_eq(ac_drops, want_drops);
 }
 
 ![test]
 function branch_rebuild_taken_uses_new_value() -> Result<(), TestError> {
     ac_drops = 0;
-    return ac_check(future::block_on(rebuilt_in_if(true)), 32 as u32);
+    return ac_check(future::block_on(rebuilt_in_if(true)), 32 as u32, 1);
 }
 
 // The path that skips the branch must still see the value state 0 built.
 ![test]
 function branch_rebuild_skipped_keeps_previous_value() -> Result<(), TestError> {
     ac_drops = 0;
-    return ac_check(future::block_on(rebuilt_in_if(false)), 31 as u32);
+    return ac_check(future::block_on(rebuilt_in_if(false)), 31 as u32, 1);
 }
 
 ![test]
 function if_else_rebuild_then_branch() -> Result<(), TestError> {
     ac_drops = 0;
-    return ac_check(future::block_on(rebuilt_in_if_else(true)), 35 as u32);
+    return ac_check(future::block_on(rebuilt_in_if_else(true)), 35 as u32, 1);
 }
 
 ![test]
 function if_else_rebuild_else_branch() -> Result<(), TestError> {
     ac_drops = 0;
-    return ac_check(future::block_on(rebuilt_in_if_else(false)), 37 as u32);
+    return ac_check(future::block_on(rebuilt_in_if_else(false)), 37 as u32, 1);
 }
 
 ![test]
 function loop_rebuild_zero_iterations_keeps_previous() -> Result<(), TestError> {
     ac_drops = 0;
-    return ac_check(future::block_on(rebuilt_in_loop(0)), 31 as u32);
+    return ac_check(future::block_on(rebuilt_in_loop(0)), 31 as u32, 1);
 }
 
 ![test]
 function loop_rebuild_runs_uses_new_value() -> Result<(), TestError> {
     ac_drops = 0;
-    return ac_check(future::block_on(rebuilt_in_loop(2)), 70 as u32);
+    return ac_check(future::block_on(rebuilt_in_loop(2)), 70 as u32, 1);
 }
 
 ![test]
 function match_arm_rebuild_uses_new_value() -> Result<(), TestError> {
     ac_drops = 0;
-    return ac_check(future::block_on(rebuilt_in_match(1)), 39 as u32);
+    return ac_check(future::block_on(rebuilt_in_match(1)), 39 as u32, 1);
 }
 
 ![test]
 function match_arm_without_rebuild_keeps_previous() -> Result<(), TestError> {
     ac_drops = 0;
-    return ac_check(future::block_on(rebuilt_in_match(0)), 31 as u32);
+    return ac_check(future::block_on(rebuilt_in_match(0)), 31 as u32, 1);
 }
 
 ![test]
 function top_level_rebuild_binds_fresh_value() -> Result<(), TestError> {
     ac_drops = 0;
-    return ac_check(future::block_on(rebuilt_at_top_level()), 33 as u32);
+    return ac_check(future::block_on(rebuilt_at_top_level()), 33 as u32, 1);
 }
 
 ![test]
 function suspend_between_carry_and_rebuild_taken() -> Result<(), TestError> {
     ac_drops = 0;
-    return ac_check(future::block_on(suspend_between(true)), 134 as u32);
+    return ac_check(future::block_on(suspend_between(true)), 134 as u32, 1);
 }
 
 ![test]
 function suspend_between_carry_and_rebuild_skipped() -> Result<(), TestError> {
     ac_drops = 0;
-    return ac_check(future::block_on(suspend_between(false)), 131 as u32);
+    return ac_check(future::block_on(suspend_between(false)), 131 as u32, 1);
 }
 
 ![test]
 function param_branch_rebuild_taken() -> Result<(), TestError> {
     ac_drops = 0;
-    return ac_check(future::block_on(param_rebuilt_in_if(Tag { id: 1 }, true)), 36 as u32);
+    return ac_check(future::block_on(param_rebuilt_in_if(Tag { id: 1 }, true)), 36 as u32, 2);
 }
 
 ![test]
 function param_branch_rebuild_skipped_keeps_argument() -> Result<(), TestError> {
     ac_drops = 0;
-    return ac_check(future::block_on(param_rebuilt_in_if(Tag { id: 1 }, false)), 31 as u32);
+    return ac_check(future::block_on(param_rebuilt_in_if(Tag { id: 1 }, false)), 31 as u32, 1);
 }
 
 // A `match` used as an EXPRESSION holds statement bodies, so every walker that
@@ -291,13 +302,13 @@ function match_expr_guard_false_falls_to_wildcard() -> Result<(), TestError> {
 ![test]
 function match_expr_arm_rebuild_taken_uses_new_value() -> Result<(), TestError> {
     ac_drops = 0;
-    return ac_check(future::block_on(me_arm_rebuilds(1)), 40 as u32);
+    return ac_check(future::block_on(me_arm_rebuilds(1)), 40 as u32, 1);
 }
 
 ![test]
 function match_expr_arm_rebuild_skipped_keeps_previous() -> Result<(), TestError> {
     ac_drops = 0;
-    return ac_check(future::block_on(me_arm_rebuilds(0)), 31 as u32);
+    return ac_check(future::block_on(me_arm_rebuilds(0)), 31 as u32, 1);
 }
 
 ![test]
