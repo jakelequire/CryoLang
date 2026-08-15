@@ -163,7 +163,15 @@ const s: String = f"x = {x}, opt = {opt:?}";   // "x = 42, opt = Some(7)"
   through `Debug`. Any type implementing the relevant trait works, including
   `Option`, `Result`, and `Array<T>`.
 - The embedded expression is a full expression: `f"{a + b}"`, `f"{p.x}"`,
-  `f"{m.get(k)}"`.
+  `f"{m.get(k)}"`. Because a hole holds source rather than literal text,
+  quoting nests inside it - a string or char literal written in a hole is its
+  own literal, and its quotes and braces are not f-string syntax:
+
+  ```cryo
+  f"panel {if (shown) { "shown" } else { "hidden" }}"
+  ```
+
+  Only a `"` outside every `{...}` closes the f-string.
 - A hole may carry a **format spec** after a colon, a subset of Rust's:
 
   ```
