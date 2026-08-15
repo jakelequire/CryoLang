@@ -13,6 +13,7 @@ namespace Compiler::Resolver::NameResolution;
 import Compiler::Resolver;
 import Compiler::Resolver::{ SymbolID, SymbolStr, Symbol, Scope, Resolver, QualifiedName, InternTable };
 import Compiler::Resolver::Res;
+import Compiler::Resolver::Namespace;
 import Compiler::ConstTable;
 import Compiler::Diag;
 import Compiler::Diag::{ Snapshot, SourceSpan };
@@ -390,6 +391,38 @@ public:
 
     override visit(node: ClassDeclNode*) -> void {
         LOG_DEBUG(LogComponent::General, "[NameResolver] visit(ClassDecl) name='%s'", this.resolver.intern_table.resolve(node.name));
+
+        // The base, in the scope ENCLOSING the class.  It has to be asked
+        // before `enter_scope`: the class body declares the class's own name
+        // and its generic parameters, either of which would shadow the base.
+        //
+        // The parser accepts a single identifier here, so this is always a
+        // one-segment question in the type namespace - and one this layer can
+        // finish, which is why anything other than a definition is reported
+        // here rather than passed on.  A base that names nothing leaves the
+        // class with no base at all, so letting it through silently drops
+        // every member the class was written to inherit.
+        if (node.has_base_class()) {
+            mut segs: SymbolStr[] = [];
+            segs.push(node.base_class);
+            const r: Res = this.resolver.resolve_path(
+                &segs, Namespace::Type, this.resolver.current_scope);
+            match (r) {
+                Res::Def(_) => { node.set_base_res(r); }
+                _           => {
+                    const written: string =
+                        this.resolver.intern_table.resolve(node.base_class);
+                    mut d: Diagnostic = Diagnostic::error(
+                        ErrorCode::E0203_UNDEFINED_TYPE,
+                        format("cannot find type `%s` in this scope", written));
+                    d = d.at_with_label(node.base_span, "not found in this scope");
+                    d = d.with_note("a base class is resolved in the scope the class is written in, before the class body");
+                    this.ctx.emit_diagnostic(d);
+                    node.set_base_res(Res::Err);
+                }
+            }
+        }
+
         this.resolver.enter_scope(ScopeKind::TypeBody, this.resolver.intern_table.resolve(node.name), node.span);
 
         // Declare generic params

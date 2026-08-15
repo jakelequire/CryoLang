@@ -17,6 +17,7 @@ import Compiler::AST;
 import Compiler::AST::{ Node, Expression, Statement, Pattern };
 import Compiler::Types::TypeRef;
 import Compiler::Resolver::SymbolStr;
+import Compiler::Resolver::Res;
 import Compiler::AST::Visitor;
 
 type class DeclarationNode : ASTNode {
@@ -843,6 +844,17 @@ public:
     fields:         FieldDeclNode*[];
     methods:        MethodNode*[];
     base_class:     SymbolStr;
+    /// What `base_class` refers to, stamped by NameResolution from the scope
+    /// ENCLOSING the class - the class body would shadow the base's own name.
+    ///
+    /// The spelling alone cannot answer: the parser accepts one identifier, so
+    /// a base is always a bare leaf, and the declaration it names may live in a
+    /// module whose own last segment repeats it (`Compiler::Types::Type::Type`).
+    /// Only the scope the class was WRITTEN in distinguishes those.
+    base_res:       ResSlot;
+    /// The base spelling's own span, so a diagnostic about it underlines the
+    /// base rather than the whole declaration.
+    base_span:      SourceSpan;
     /// Layout attributes - see StructDeclNode for the full description.
     repr_c:           boolean;
     repr_packed:      boolean;
@@ -858,6 +870,8 @@ public:
         this.fields           = [];
         this.methods          = [];
         this.base_class       = SymbolStr::empty();
+        this.base_res         = ResSlot::Pending;
+        this.base_span        = SourceSpan::none();
         this.repr_c           = false;
         this.repr_packed      = false;
         this.repr_transparent = false;
@@ -882,8 +896,23 @@ public:
         this.methods.push(method);
     }
 
-    set_base_class(name: SymbolStr) -> void {
+    /// The span is taken with the name so a base cannot be recorded without
+    /// the location a diagnostic about it needs.
+    set_base_class(name: SymbolStr, span: SourceSpan) -> void {
         this.base_class = name;
+        this.base_span  = span;
+    }
+
+    /// Record what the base-class spelling refers to.  First answer wins, for
+    /// the reason every `Res` slot does: it states what the file that WROTE
+    /// the name can see, and a later walk stands in a different module.
+    set_base_res(r: Res) -> void {
+        this.base_res.answer(r);
+    }
+
+    /// What this class's base refers to, for a stage that needs it.
+    require_base_res(&this, site: string) -> Res {
+        return this.base_res.require(site);
     }
 
     override accept(visitor: ASTVisitor*) -> void {
