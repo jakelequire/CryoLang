@@ -95,9 +95,9 @@ type struct TypeUtils {
 
     // widen: bare -> qualified -> cross-module cascade.
     lookup_method_return_raw(&this, type_sym: SymbolStr, method_sym: SymbolStr) -> TypeRef {
-        const owner: SymbolStr = this.resolve_method_owner(type_sym, method_sym);
-        if (!owner.is_valid()) { return TypeRef::invalid(); }
-        return this.ctx.decl_index.lookup_method_return(owner, method_sym);
+        mut ret: TypeRef = TypeRef::invalid();
+        this.resolve_method_owner(type_sym, method_sym, &ret);
+        return ret;
     }
 
     /// The name `method_sym` is REGISTERED under for an owner segment spelled
@@ -114,15 +114,25 @@ type struct TypeUtils {
     /// return type here and then rebuilds a symbol from the written spelling is
     /// naming a declaration that does not exist, and the failure surfaces a
     /// whole stage later as an unresolvable callee.
-    resolve_method_owner(&this, type_sym: SymbolStr, method_sym: SymbolStr) -> SymbolStr {
+    ///
+    /// A winning probe has already fetched the return type it validated, so
+    /// `out_ret` (when non-null) hands that value back: asking the registry
+    /// again under the owner just returned would re-derive what this call
+    /// already proved.  It is left untouched when no owner carries the method.
+    resolve_method_owner(&this, type_sym: SymbolStr, method_sym: SymbolStr,
+                         out_ret: TypeRef*) -> SymbolStr {
         // As-is (already-qualified names from monomorphized types).
-        if (this.ctx.decl_index.lookup_method_return(type_sym, method_sym).is_valid()) {
+        const as_is: TypeRef = this.ctx.decl_index.lookup_method_return(type_sym, method_sym);
+        if (as_is.is_valid()) {
+            if (out_ret != null) { *out_ret = as_is; }
             return type_sym;
         }
         // Module-qualified (local/same-module types registered under qualified names).
         const qualified: SymbolStr = this.ctx.qualify_symbol_sym(type_sym);
         if (!qualified.equals(type_sym)) {
-            if (this.ctx.decl_index.lookup_method_return(qualified, method_sym).is_valid()) {
+            const q_ret: TypeRef = this.ctx.decl_index.lookup_method_return(qualified, method_sym);
+            if (q_ret.is_valid()) {
+                if (out_ret != null) { *out_ret = q_ret; }
                 return qualified;
             }
         }
@@ -130,9 +140,12 @@ type struct TypeUtils {
         // This is the only probe that answers a written path whose own leading
         // segments name a module, since the import-scoped index is keyed by leaf.
         const cross_sym: SymbolStr = this.resolve_cross_module_name(type_sym);
-        if (cross_sym.is_valid()
-                && this.ctx.decl_index.lookup_method_return(cross_sym, method_sym).is_valid()) {
-            return cross_sym;
+        if (cross_sym.is_valid()) {
+            const c_ret: TypeRef = this.ctx.decl_index.lookup_method_return(cross_sym, method_sym);
+            if (c_ret.is_valid()) {
+                if (out_ret != null) { *out_ret = c_ret; }
+                return cross_sym;
+            }
         }
         return SymbolStr::empty();
     }

@@ -296,6 +296,17 @@ retired):
 | `ImportDeclNode` (per segment) | `AST/declaration.cryo:575` | — |
 | enum variant reference | `AST/expression.cryo:424` | — |
 | `ClassDeclNode` (base class) | `AST/declaration.cryo:854` | **`base_res`** (§8.2am) |
+| `ImplBlockNode` (trait head) | `AST/declaration.cryo:1152` | **`qualified_trait_name`** |
+
+`ImplBlockNode.qualified_trait_name` carries a canonical name rather than a
+`Res`, because the question asked of it is identity — *are these two impls the
+same trait?* — not location. It exists because the trait-impl registry keys on
+bare leaves so that a lookup is module-independent, which makes that key a
+**search** key: folding it back to a qualified name searches the program and
+therefore answers only while the leaf is unique. A single unrelated
+declaration sharing the leaf made one trait read as two and turned every method
+on it into a false ambiguity. A search key cannot be used as an identity; the
+identity has to be carried from where it was resolved.
 
 ---
 
