@@ -31,6 +31,7 @@ import Compiler::Diag;
 import Compiler::Diag::{ Diagnostic, SourceSpan };
 import Compiler::Passes::TypeResolution;
 import Compiler::CompilationContext;
+import Compiler::ResolveCounter;
 import Compiler::Sema::{ PatternResolver };
 import std::core::{ option, mem };
 import std::fmt;
@@ -2409,20 +2410,15 @@ type struct AsyncLower {
     ///
     /// Sema pins the winning template on the call node (`resolved_template`)
     /// because only sema has the caller's import scope, and reading that pin is
-    /// the answer whenever it exists. It does not always exist: a generic static
-    /// called with a type argument that is still abstract — a combinator awaited
-    /// inside `implement struct BufStream<S>`, whose child future's type mentions
-    /// `S` — makes `try_resolve_static_method_template` bail before it pins
-    /// anything, so the pin stays empty for exactly the generic contexts this
-    /// pass has to serve.
+    /// the answer whenever it exists.
     ///
-    /// The fallback re-runs that lookup from the callee's own `Scope::member`
-    /// spelling, probing in the same order sema does (import-scoped, bare, then
-    /// the resolver's cross-module qualification) so a same-leaf collision lands
-    /// on the same declaration sema would have chosen. It only decides WHICH
-    /// declaration is read; the shape the caller demands of that declaration is
-    /// unchanged, so a wrong guess still cannot become a silent wrong-address
-    /// store.
+    /// When it does not, the owner comes from the stamp the name layer wrote on
+    /// the callee's own `Scope::member` node — the module or type that spelling
+    /// bound to in the file that wrote it. A template is keyed by its owner's
+    /// canonical qualified name, so only an answer that names a declaration can
+    /// produce a key: a generic parameter or a primitive owns no template, and
+    /// leaving those unanswered is what keeps the caller reporting instead of
+    /// addressing a field it cannot vouch for.
     callee_template(&this, c: CallExprNode*) -> TemplateEntry* {
         if (this.ctx.generic_registry == null) { return null; }
         if (c.resolved_template.is_valid()) {
@@ -2435,22 +2431,22 @@ type struct AsyncLower {
         if (!sr.scope_name.is_valid() || !sr.member_name.is_valid()) { return null; }
         const member: string = this.intern.resolve(sr.member_name);
 
-        const scoped: SymbolStr = this.ctx.resolve_scoped_or(sr.scope_name, FILE, LINE);
-        if (scoped.is_valid()) {
-            mut te: TemplateEntry* = this.ctx.generic_registry.get_template(
-                this.intern.intern(this.intern.resolve(scoped) + "::" + member));
-            if (te != null) { return te; }
+        // Named at the event.  The delayed-bug tally says HOW MANY nodes
+        // arrived unclaimed; only a per-node line says WHICH.
+        if (sr.scope_res.is_pending() && !sr.has_resolved_type()) {
+            ResolveCounter::path_hit(
+                "RES-PENDING", this.intern.resolve(sr.scope_name),
+                member, sr.span.to_string());
         }
-        mut bare: TemplateEntry* = this.ctx.generic_registry.get_template(
-            this.intern.intern(this.intern.resolve(sr.scope_name) + "::" + member));
-        if (bare != null) { return bare; }
-
-        const resolver: Resolver* = this.ctx.get_resolver();
-        if (resolver == null) { return null; }
-        const cross: SymbolStr = resolver.resolve_type_qualified_name(sr.scope_name);
-        if (!cross.is_valid() || cross.equals(sr.scope_name)) { return null; }
+        const owner: SymbolStr =
+            match (sr.require_scope_res("async_lower: combinator callee owner")) {
+                Res::Def(q)                           => { q }
+                Res::TypeRelative(ResBase::Def(q), _) => { q }
+                _                                     => { SymbolStr::empty() }
+            };
+        if (!owner.is_valid()) { return null; }
         return this.ctx.generic_registry.get_template(
-            this.intern.intern(this.intern.resolve(cross) + "::" + member));
+            this.intern.intern(this.intern.resolve(owner) + "::" + member));
     }
 
     /// The field of the struct returned by `c`'s callee that receives that

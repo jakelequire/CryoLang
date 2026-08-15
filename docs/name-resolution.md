@@ -295,6 +295,7 @@ retired):
 | `CallExprNode` (callee) | `AST/expression.cryo:398` | — |
 | `ImportDeclNode` (per segment) | `AST/declaration.cryo:575` | — |
 | enum variant reference | `AST/expression.cryo:424` | — |
+| `ClassDeclNode` (base class) | `AST/declaration.cryo:854` | **`base_res`** (§8.2am) |
 
 ---
 
@@ -4726,6 +4727,53 @@ The remaining 106 are the twelve stdlib types of §8.2ak plus `()`. Nothing abou
 the primitive population touched them, which is the point: they are a different
 defect, and the pass-order question in §8.2ak is still the one that gates any
 consumer treating `Pending` as an error.
+
+### 8.2am A base class is a bare leaf the name layer never saw — MEASURED 2026-08-15
+
+`passes/type_resolution.cryo` resolved a class's base through three steps:
+current-module qualification, a `get_resolver()` re-entry, then the global leaf
+index (`LeafViaTypeResBase`). The step-3 comment justified itself by naming the
+case only the leaf index could answer — a base whose own module repeats its name,
+`class Type` in `namespace Compiler::Types::Type` registered as
+`Compiler::Types::Type::Type`.
+
+Tagged per step over the compiler's own source, the test tree, and all 14
+examples:
+
+| population | events | step 1 | step 2 (re-entry) | step 3 (leaf index) |
+|---|---:|---:|---:|---:|
+| `compiler/` | 103 | 71 | **32** | **0** |
+| test tree | 8 | 8 | 0 | **0** |
+| `examples/` (14 projects) | **0** | — | — | — |
+
+⇒ **Step 3 never ran.** The 32 that reached step 2 are exactly the
+double-qualified bases the step-3 comment claims only the leaf index finds —
+`Type`, `ASTNode`, `BaseASTVisitor`, `ParserBase`, `ExprParser`. The comment
+named the right construct and the wrong step.
+
+The corpus cannot see this at all: `examples/` is structs and free functions, so
+the population is the compiler itself.
+
+**The slot.** The parser accepts a single `Identifier` for a base
+(`parser/parser.cryo:1048`), so this is always a one-segment question in the type
+namespace — and `NameResolution` never asked it. `visit(ClassDeclNode*)` entered
+the type-body scope, declared generics and fields, walked methods, exited.
+
+`ClassDeclNode.base_res` is now stamped from the scope ENCLOSING the class — it
+has to be asked before `enter_scope`, or the class's own name and generic
+parameters shadow the base. Run in shadow against the live cascade before the
+switch, the stamp agreed on **111 of 111** (103 + 8) once the canonical name is
+looked up in the arena rather than the declaration index: 7 of the compiler's
+bases (`ASTNode`'s subclasses) name a type the `DeclarationIndex` does not hold,
+which is why the deleted step 2 needed `arena.lookup_by_name` behind its own
+`lookup_type`.
+
+**A base that names nothing was silently dropped.** `class Widget : Nonexistent`
+compiled clean, exit 0, and the class lost everything it was written to inherit.
+The name layer can finish this question, so it now reports it: `E0203` at the
+base's own span, and the slot records `Err`
+(`tests/negative/E0203_undefined_base_class.cryo`, verified to compile cleanly
+under the pre-fix pin).
 
 ### 8.3 B2, enumerated — MEASURED 2026-08-09
 

@@ -3884,38 +3884,19 @@ type struct TypeResolutionPasses {
                                mnode.is_override as i32, ct.has_virtual_methods as i32);
                     }
 
-                    // Resolve base class.  Cascades through:
-                    //   1. Current-module qualified form (`ThisModule::Type`)
-                    //      works when the base is declared in the same module.
-                    //   2. Name-resolver scope walk: handles imports that
-                    //      aliased the base into the current namespace.
-                    //   3. Arena leaf-index lookup: handles the common case
-                    //      where the base's defining namespace shadows its
-                    //      own name (e.g., `class Type` inside `namespace
-                    //      Compiler::Types::Type` gets registered as
-                    //      `Compiler::Types::Type::Type`; current-module
-                    //      qualification and scope walks don't find that
-                    //      double-qualified form, but the leaf index does).
+                    // The base names one declaration, and which one is settled
+                    // by the scope the class was WRITTEN in - so it is read
+                    // from the stamp NameResolution left, not re-derived here.
+                    // A bare leaf cannot be requalified from this pass's
+                    // position: the base's own module may repeat its name
+                    // (`Compiler::Types::Type::Type`), and no amount of
+                    // qualifying from the wrong module produces that.
                     if (node.has_base_class()) {
-                        const base_sym: SymbolStr = ctx.qualify_symbol_sym(node.base_class);
-                        mut base_ref: TypeRef = ctx.decl_index.lookup_type(base_sym);
-                        if (!base_ref.is_valid()) {
-                            const resolver: Resolver* = ctx.get_resolver();
-                            if (resolver != null) {
-                                const resolved_name: SymbolStr = resolver.resolve_type_qualified_name(node.base_class);
-                                if (!resolved_name.is_empty()) {
-                                    base_ref = ctx.decl_index.lookup_type(resolved_name);
-                                    if (!base_ref.is_valid()) {
-                                        base_ref = arena.lookup_by_name(resolved_name);
-                                    }
-                                }
-                            }
-                        }
-                        if (!base_ref.is_valid()) {
-                            base_ref = arena.lookup_by_leaf(node.base_class);
-                            if (base_ref.is_valid()) {
-                                ResolveCounter::Site::LeafViaTypeResBase.bump();
-                            }
+                        const base_q: SymbolStr =
+                            node.require_base_res("type_resolution: class base").def_name();
+                        mut base_ref: TypeRef = TypeRef::invalid();
+                        if (base_q.is_valid()) {
+                            base_ref = arena.lookup_by_name(base_q);
                         }
                         if (base_ref.is_valid()) {
                             ct.set_base_class(base_ref);
