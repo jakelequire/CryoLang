@@ -2121,17 +2121,15 @@ type struct CallResolver {
         return (t as FunctionType*).is_variadic;
     }
 
+    /// The canonical qualified trait a method came from, as stamped when the
+    /// impl block was resolved.  Returned verbatim: the stamp is already the
+    /// identity, and re-folding it through a program-wide leaf search would
+    /// reintroduce a dependence on no other declaration sharing the leaf.
     method_origin_trait(&this, m: &MethodInfo) -> SymbolStr {
         if (m.ast_node == null) { return SymbolStr::empty(); }
         const mn: MethodNode* = m.ast_node as MethodNode*;
         if (mn.func == null) { return SymbolStr::empty(); }
-        return this.canon_trait_name(mn.func.origin_trait);
-    }
-
-    canon_trait_name(&this, name: SymbolStr) -> SymbolStr {
-        if (!name.is_valid()) { return name; }
-        if (this.ctx.decl_index == null) { return name; }
-        return this.ctx.decl_index.canonical_qualified(name);
+        return mn.func.origin_trait;
     }
 
     /// `(&f32, i64)` - one parameter list, rendered.  `from` is where the
@@ -2327,12 +2325,13 @@ type struct CallResolver {
                         if (!found) {
                             found = true;
                             chosen = tparams;
-                            found_trait = this.canon_trait_name(traits[ti]);
+                            found_trait = block.qualified_trait_name;
                         } else {
                             const same: boolean = this.types.same_param_sig(chosen.as_slice(), tparams.as_slice());
                             tparams.drop();
-                            const cand_trait: SymbolStr = this.canon_trait_name(traits[ti]);
-                            if (found_trait.is_valid() && !cand_trait.equals(found_trait)) {
+                            const cand_trait: SymbolStr = block.qualified_trait_name;
+                            if (found_trait.is_valid() && cand_trait.is_valid()
+                                    && !cand_trait.equals(found_trait)) {
                                 trait_ambiguous = true;
                                 other_trait = cand_trait;
                                 break;
@@ -3918,7 +3917,7 @@ type struct CallResolver {
         // still the written text.  Pinning must use the name that answered - a
         // symbol rebuilt from the spelling names no declaration, and codegen then
         // binds it by bare leaf and arity or fails to bind it at all.
-        const owner_sym: SymbolStr = this.types.resolve_method_owner(lookup_sym, scope.member_name);
+        const owner_sym: SymbolStr = this.types.resolve_method_owner(lookup_sym, scope.member_name, null);
         mut method_ret: TypeRef = TypeRef::invalid();
         if (owner_sym.is_valid()) {
             method_ret = this.types.lookup_method_return(owner_sym, scope.member_name);
