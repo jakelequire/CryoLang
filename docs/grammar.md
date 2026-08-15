@@ -149,8 +149,18 @@ Member             ::= Visibility? "static"?
                                                    labels a run of subsequent members. *)
 VisibilityBlock    ::= Visibility ":" (Field | Method | Constructor | Destructor)*
 
-Field              ::= Ident ":" Type ("=" Expr)? ";"
-Method             ::= ("virtual" | "override")? Ident Generics?
+(* A member may be named by a keyword.  A member name is never read as a
+   declaration or an operator - what follows it says which member kind it
+   is (`(` or `<` a method, `:` a field), and after `.` or `::` the token
+   can only be a member name.  This is what lets a bound C struct keep a
+   field called `type`, which the binding generator cannot rename without
+   breaking the ABI.  The exceptions are the keywords a member position
+   reads FIRST: `public`/`private`/`protected` (a visibility label) and
+   `static`/`virtual`/`override`/`async` (a member modifier).             *)
+MemberName         ::= Ident | Keyword
+
+Field              ::= MemberName ":" Type ("=" Expr)? ";"
+Method             ::= ("virtual" | "override")? MemberName Generics?
                        "(" ParamList? ")" ("->" Type)?
                        ("where" WhereClause)?
                        (Block | ";")
@@ -249,8 +259,8 @@ UnaryOp            ::= "-" | "!" | "&" | "*" | "~" | "++" | "--"
 PostfixExpr        ::= Primary PostfixOp*
 PostfixOp          ::= "(" ArgList? ")"
                      | "[" Expr "]"
-                     | "." Ident GenericArgs?    (* `.` auto-derefs pointers; there is no `->` operator *)
-                     | "::" Ident GenericArgs?
+                     | "." MemberName GenericArgs?    (* `.` auto-derefs pointers; there is no `->` operator *)
+                     | "::" MemberName GenericArgs?
                      | "?"                              (* error propagation / try *)
                      | "++" | "--"
 
@@ -286,7 +296,10 @@ Lambda             ::= "move"? "(" (LambdaParam ("," LambdaParam)*)? ")" "->" Ty
 LambdaParam        ::= Ident (":" Type)?
 
 StructLit          ::= Ident GenericArgs?
-                       "{" Ident ":" Expr ("," Ident ":" Expr)* ","? "}"
+                       "{" MemberName ":" Expr ("," MemberName ":" Expr)* ","? "}"
+                       (* The shorthand `{ field }` form takes an Ident only:
+                          it means `{ field: field }`, and a keyword binds no
+                          local for it to name.                              *)
 ArrayLit           ::= "[" (Expr ("," Expr)*)? "]"
                      | "[" Expr ";" Expr "]"
 NewExpr            ::= "new" Type ("(" ArgList? ")")?
