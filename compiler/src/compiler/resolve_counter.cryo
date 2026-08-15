@@ -140,6 +140,14 @@ type enum Site {
     LeafCalls;
     LeafHits;
 
+    // `const_table.cryo` bare-name index for a compile-time constant.  A bare
+    // `Identifier` carries no `Res` slot, so the fold cannot read a stamp for
+    // it the way a qualified path now does; this answers from a program-wide
+    // leaf map instead, with no import in hand.  Counted so the reduction
+    // target is visible rather than invisible.
+    ConstLeafCalls;
+    ConstLeafHits;
+
     // `decl_index.cryo` bare-name alternatives.
     BareAltsCalls;
     BareAltsHits;
@@ -348,6 +356,19 @@ type enum Site {
     /// from the module-path remainder because the two have opposite owners, and
     /// a single "qualified" total says nothing about which lane owes an answer.
     AnnResTypeRelative;
+
+    /// A `Type::member` reference built by a pass rather than written, stamped
+    /// by its synthesizer from the type it was built to name.  The synthesizer
+    /// is the only place the referent is known without a lookup, so this is the
+    /// population that would otherwise reach a consumer with nothing to read.
+    SynthScopeResStamped;
+
+    /// Of those, the ones whose type names no declaration, so no base could be
+    /// derived and the slot stays unanswered.  MUST be zero: a synthesized
+    /// reference to a type the program does not declare is a defect in the
+    /// synthesizer, and leaving it unstamped is what makes it reportable
+    /// instead of silently re-derived downstream.
+    SynthScopeResNoName;
 }
 
 implement enum Site {
@@ -419,6 +440,8 @@ implement enum Site {
             Site::RnFailed              => { "   " }
             Site::LeafCalls             => { "B1 " }
             Site::LeafHits              => { "B1 " }
+            Site::ConstLeafCalls        => { "B1 " }
+            Site::ConstLeafHits         => { "B1 " }
             Site::BareAltsCalls         => { "   " }
             Site::BareAltsHits          => { "   " }
             Site::BareAltsMulti         => { "   " }
@@ -492,6 +515,8 @@ implement enum Site {
             Site::ScopeResNoBase        => { "!! " }
             Site::ScopeResUnanswerable  => { "!! " }
             Site::AnnResTypeRelative    => { "   " }
+            Site::SynthScopeResStamped  => { "B3 " }
+            Site::SynthScopeResNoName   => { "!! " }
             Site::ScopeResUnreachable   => { "!! " }
             Site::ScopeResAmbiguous     => { "!! " }
             Site::M2ViaStamp            => { "B3 " }
@@ -533,6 +558,8 @@ implement enum Site {
             Site::RnFailed              => { "    unresolved" }
             Site::LeafCalls             => { "lookup_by_leaf calls" }
             Site::LeafHits              => { "lookup_by_leaf hits" }
+            Site::ConstLeafCalls        => { "const-table bare leaf calls" }
+            Site::ConstLeafHits         => { "const-table bare leaf hits" }
             Site::BareAltsCalls         => { "lookup_qualified_alternatives calls" }
             Site::BareAltsHits          => { "lookup_qualified_alternatives hits" }
             Site::BareAltsMulti         => { "  of which ambiguous (>1 candidate)" }
@@ -611,6 +638,8 @@ implement enum Site {
             Site::ScopeResAmbiguous     => { "  two visible modules match" }
             Site::M2ViaStamp            => { "M2 answered from the stamp" }
             Site::M2StampMemberMiss     => { "  stamped module lacks the member" }
+            Site::SynthScopeResStamped  => { "synthesized scope Res stamped" }
+            Site::SynthScopeResNoName   => { "  type named no declaration" }
         };
     }
 
@@ -1045,6 +1074,12 @@ public function report() -> void {
     Site::LeafViaTypeUtils.print_row();
     Site::LeafViaTypeResBound.print_row();
 
+    fmt::eprintf("
+-- const-table bare leaf (const_table.cryo) -----------
+");
+    Site::ConstLeafCalls.print_row();
+    Site::ConstLeafHits.print_row();
+
     fmt::eprintf("\n-- DeclarationIndex bare_alts (decl_index.cryo:1405) --\n");
     Site::BareAltsCalls.print_row();
     Site::BareAltsHits.print_row();
@@ -1126,6 +1161,8 @@ public function report() -> void {
     Site::ScopeResAmbiguous.print_row();
     Site::M2ViaStamp.print_row();
     Site::M2StampMemberMiss.print_row();
+    Site::SynthScopeResStamped.print_row();
+    Site::SynthScopeResNoName.print_row();
 
     fmt::eprintf("\n-- annotation Res, stamped on the node -----------------\n");
     Site::AnnResSeen.print_row();
@@ -1161,6 +1198,7 @@ public function report() -> void {
     b1 = b1 + Site::RnArenaBootstrap.count();
     b1 = b1 + Site::RnScopeArenaBootstrap.count();
     b1 = b1 + Site::LeafHits.count();
+    b1 = b1 + Site::ConstLeafHits.count();
     b1 = b1 + Site::BareAltsViaAmbigDiag.count();
     b1 = b1 + Site::M4Hits.count();
     b1 = b1 + Site::M5Hits.count();

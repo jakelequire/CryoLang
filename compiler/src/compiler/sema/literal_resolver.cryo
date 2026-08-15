@@ -50,15 +50,36 @@ type struct LiteralResolver {
             LiteralKind::String  => { this.arena.get_string() }
             LiteralKind::Char    => { this.arena.get_char() }
             LiteralKind::Boolean => { this.arena.get_bool() }
-            LiteralKind::Null    => {
-                // Type `null` as `void*` (Pointer to Void) rather than bare Void:
-                // the `void* <-> T*` rule in TypeChecker handles assignment to any
-                // concrete pointer type without a dedicated `void -> Pointer`
-                // widening, preserving null semantics without letting arbitrary
-                // void-typed expressions widen.
-                this.arena.get_pointer_to(this.arena.get_void())
-            }
+            LiteralKind::Null    => { this.resolve_null_literal() }
         };
+    }
+
+    /// Type the `null` literal.
+    ///
+    /// The default is `void*` (Pointer to Void) rather than bare Void: the
+    /// `void* <-> T*` rule in TypeChecker then admits it in any concrete
+    /// pointer position without a dedicated `void -> Pointer` widening, so an
+    /// arbitrary void-typed expression still cannot widen.
+    ///
+    /// A function type is the one pointer-shaped type that rule does not
+    /// reach, and it must not be added to it: `void*` and `(A) -> R` are the
+    /// same `i8*` after `map_type`, but the conversion between them is
+    /// explicit in BOTH directions, and relaxing that would let any `void*`
+    /// become a callable.  So `null` adopts the expected function type
+    /// instead - it is the literal that is polymorphic, exactly as an integer
+    /// literal adopts an expected width, not the conversion that is widened.
+    /// Without this, a null function pointer needs a cast in precisely the
+    /// positions that check assignability (annotated binding, `return`,
+    /// struct-literal field) while a data pointer beside it in the same
+    /// literal needs none.
+    resolve_null_literal(&this) -> TypeRef {
+        if (this.state.expected_type.is_valid()) {
+            const exp: Type* = this.arena.lookup(this.state.expected_type.id);
+            if (exp != null && exp.kind == TypeKind::Function) {
+                return this.state.expected_type;
+            }
+        }
+        return this.arena.get_pointer_to(this.arena.get_void());
     }
 
     /// Type an integer literal.  Adopts an integer `expected_type` (bounds-checked

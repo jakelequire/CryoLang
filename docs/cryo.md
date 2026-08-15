@@ -178,7 +178,15 @@ const s: String = f"x = {x}, opt = {opt:?}";   // "x = 42, opt = Some(7)"
   through `Debug`. Any type implementing the relevant trait works, including
   `Option`, `Result`, and `Array<T>`.
 - The embedded expression is a full expression: `f"{a + b}"`, `f"{p.x}"`,
-  `f"{m.get(k)}"`.
+  `f"{m.get(k)}"`. Because a hole holds source rather than literal text,
+  quoting nests inside it - a string or char literal written in a hole is its
+  own literal, and its quotes and braces are not f-string syntax:
+
+  ```cryo
+  f"panel {if (shown) { "shown" } else { "hidden" }}"
+  ```
+
+  Only a `"` outside every `{...}` closes the f-string.
 - A hole may carry a **format spec** after a colon, a subset of Rust's:
 
   ```
@@ -289,6 +297,16 @@ mut   v:      Array<int>;  // growable, heap-backed; from collections::array
 ```
 
 For everything except FFI and stack-allocated scratch buffers, prefer `Array<T>` from the standard library. The shorthand `T[]` desugars to `Array<T>` in expression position when the prelude is loaded.
+
+The `N` in `T[N]` is a **compile-time integer**: an integer literal, a named `const` (declared in this module or another, written bare or qualified), an enum variant, a cast between integer types, or arithmetic, comparison, logical, and bitwise operators over those. The repeat expression `[value; N]` accepts exactly the same set and yields `T[N]`, so a field and the initializer that fills it can share one name for their length; a count that is *not* a compile-time integer is legal there and yields a dynamic `T[]` sized at run time. A size that is neither is E0239.
+
+```cryo
+const CAPACITY: i64 = 512;
+type struct Grid { cells: boolean[CAPACITY]; }
+const cells: boolean[CAPACITY] = [false; CAPACITY];
+```
+
+`sizeof`/`alignof` are **not** available in this position: an array's size is fixed before any layout is computed. `static_assert` runs after layouts exist and does accept them ([section 18.5](#185-compile-time-layout-assertions-static_assert)).
 
 ### 2.5 Function Types
 
@@ -2332,6 +2350,23 @@ const s: string = null;          // string is pointer-shaped
 if (s == null) { println("no name"); }
 ```
 
+A function-pointer type `(A) -> R` is a pointer context too, so an optional
+callback slot takes a bare `null` wherever the type is stated - a binding's
+annotation, a `return`, a struct-literal field ([section 18.4](#184-function-pointer-callbacks)):
+
+```cryo
+type struct Vtable {
+    drop_fn: (void*) -> void;
+    data:    void*;
+}
+const vt: Vtable = Vtable { drop_fn: null, data: null };
+```
+
+This is the `null` literal taking the type its context states, not a conversion
+between `void*` and a function pointer. That conversion stays explicit in both
+directions, so an arbitrary `void*` still cannot become callable without an
+`as`.
+
 Dereferencing a null pointer is undefined behaviour. For "may be absent" semantics on a value, use `Option<T>` rather than a nullable pointer; the compiler then forces you to handle the absent case at every use.
 
 ### 15.4 NonNull
@@ -2376,9 +2411,40 @@ implement trait Drop for Buffer {
 }
 ```
 
-Implementing `Drop` declares "I own resources that must be released." The compiler **automatically synthesises drop calls at scope exit** for non-`Copy` `const`/`mut` bindings - the analyzer + synthesizer run unconditionally between `MoveCheck` and `TypeLowering`. Drops fire in reverse declaration order at every scope-exit point (block end, early `return`, `break`, `continue`).
+Implementing `Drop` declares "I own resources that must be released." The compiler **automatically synthesises drop calls** for non-`Copy` `const`/`mut` bindings - the analyzer + synthesizer run unconditionally between `MoveCheck` and `TypeLowering`. A value is released at two points:
 
-Auto-drop covers `const x: T = ...` and `mut x: T = ...` declarations. It does **not** yet cover pattern bindings (`match` arms) or members reached by field/index access.
+- **Scope exit**, in reverse declaration order, at every exit from the declaring scope (block end, early `return`, `break`, `continue`).
+- **Assignment over a live value**: `x = new_value` releases whatever `x` held. Without this every reassignment of an owning type leaks the previous value, without bound in a loop.
+
+Auto-drop covers `const x: T = ...` and `mut x: T = ...` declarations, and members of such a local reached by field or constant-index access (`x.f`, `x[0]`). It does **not** yet cover pattern bindings (`match` arms).
+
+#### What assignment releases
+
+Assignment releases the destination **only where the compiler can establish that it holds a live value**. That means a place carved out of a local's own storage: the local itself, or a chain of field projections and constant indices over it. The destinations below do *not* release what they overwrite, because nothing visible in the frame distinguishes a live value from reserved, never-written memory:
+
+| destination | why not |
+| --- | --- |
+| `*p = v` | `p` may address storage that has been reserved but never written |
+| `p[i] = v` where `p` is a pointer | the same - this is exactly how a collection fills fresh capacity |
+| `r.f = v` where `r` is a reference or pointer, **including `this.f = v`** | the callee cannot see whether the caller initialized the pointee |
+| `xs[i] = v` with a run-time `i` | no single member for the compiler to track |
+| a module-level global | globals are never auto-dropped |
+
+A consequence worth knowing: a local of an `async function` that survives an `await` is lowered into a field of the generated future, so reassigning it becomes a store through `this` and does not release the displaced value. A by-value `async` parameter is materialized as a real local per state and does release it.
+
+At those destinations, release the old value yourself. `Array::set` is the canonical example: it drops the previous occupant before reusing the slot, precisely because `this.ptr[index] = value` does not.
+
+#### Members are tracked separately
+
+A local filled member by member has no single moment at which the whole value becomes live, so each member is tracked on its own:
+
+```cryo
+mut p: Pair;          // nothing live yet
+p.a = make();         // p.a live; p.b still uninitialized
+                      // scope exit releases p.a, and only p.a
+```
+
+Releasing `p` as a whole here would run `Drop` over `p.b`'s uninitialized stack memory - a `free` of whatever the stack happened to hold, not a leak.
 
 **A user `drop` runs in addition to field drop-glue, not instead of it.** After a type's own `drop` body returns, its droppable fields are released for it, exactly as they would be for the same type with no `Drop` impl at all. A destructor therefore releases only what the *type itself* owns beyond its fields - a raw handle, an OS resource - and never has to release a field by hand:
 
@@ -2426,7 +2492,7 @@ Non-`Copy` bindings are tracked by a flow-sensitive analysis ([`passes/move_chec
 - passing a non-`Copy` value to a function or method parameter that is **not** a reference type (`fn f(t: T)` moves; `fn f(t: &T)` borrows), and
 - calling `binding.drop()` or any method whose receiver consumes (`mut this` or `![sink]`).
 
-References (`&T` / `mut &T`) and raw pointers borrow; passing `&x` keeps `x` usable. Reassigning a binding re-initialises it, so `consume(x); x = make();` is legal and `x` is live again after the assignment.
+References (`&T` / `mut &T`) and raw pointers borrow; passing `&x` keeps `x` usable. Reassigning a binding re-initialises it, so `consume(x); x = make();` is legal and `x` is live again after the assignment. A moved-from binding holds nothing, so that second assignment releases nothing - the callee owns what it took (see [section 16.2](#162-the-drop-trait) for what assignment does release).
 
 ```cryo
 const a: Buffer = make_buffer(1024);
@@ -2843,7 +2909,13 @@ static_assert(alignof(Color) == 1);
 static_assert(sizeof(Color) == 4, "Color must be 4 bytes to match the C ABI");
 ```
 
-`static_assert` is a module-scope declaration: `static_assert(cond)` or `static_assert(cond, "message")`. The condition is folded after layouts are computed and may use integer/boolean literals, `sizeof(T)`, `alignof(T)`, and the arithmetic, comparison, logical, and bitwise operators. A condition that is false - or that is not a compile-time constant - is a compile error. (It is a general feature, not FFI-only, but layout verification is its primary use.)
+`static_assert` is a module-scope declaration: `static_assert(cond)` or `static_assert(cond, "message")`. The condition is folded after layouts are computed and may use anything that is a compile-time integer in an array size ([section 2.4](#24-array-types)) - integer/boolean literals, named constants, enum variants, integer casts, and the arithmetic, comparison, logical, and bitwise operators - plus `sizeof(T)` and `alignof(T)`, which only this position can see. A condition that is false - or that is not a compile-time constant - is a compile error. (It is a general feature, not FFI-only, but layout verification is its primary use.)
+
+```cryo
+const CAPACITY: i64 = 512;
+static_assert(CAPACITY == 512, "the wire format fixes the capacity");
+static_assert(sizeof(Grid) == CAPACITY);
+```
 
 ---
 

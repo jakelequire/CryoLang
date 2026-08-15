@@ -89,6 +89,21 @@ public:
         }
     }
 
+    /// Declare a C-imported type under `alias::name`.
+    ///
+    /// One home for the four declaration kinds an extern block emits, because
+    /// the rule is about where a C-imported declaration LIVES and not about
+    /// which kind it is; four copies of it would drift the moment one kind
+    /// gained a case.
+    declare_c_imported(&this, alias: SymbolStr, name: SymbolStr,
+                       span: SourceSpan) -> void {
+        if (alias.is_empty() || !name.is_valid()) { return; }
+        const q: string = this.resolver.intern_table.resolve(alias) + "::"
+                        + this.resolver.intern_table.resolve(name);
+        this.resolver.declare_c_imported_type(
+            this.resolver.intern_table.intern(q), span);
+    }
+
     forward_declare_node(node: ASTNode*) -> void {
         match (node.kind) {
             NodeKind::FunctionDeclaration => {
@@ -109,6 +124,9 @@ public:
                     const sym_id: SymbolID = this.resolver.declare_type(
                         struct_node.name, struct_node.span, true);
                     this.resolver.export_symbol(sym_id);
+                } else {
+                    this.declare_c_imported(struct_node.binding_namespace,
+                                            struct_node.name, struct_node.span);
                 }
             }
             NodeKind::UnionDeclaration => {
@@ -118,14 +136,21 @@ public:
                     const sym_id: SymbolID = this.resolver.declare_type(
                         union_node.name, union_node.span, true);
                     this.resolver.export_symbol(sym_id);
+                } else {
+                    this.declare_c_imported(union_node.binding_namespace,
+                                            union_node.name, union_node.span);
                 }
             }
             NodeKind::EnumDeclaration => {
                 const enum_node: EnumDeclNode* = node as EnumDeclNode*;
+                this.record_enum_decl(enum_node);
                 if (enum_node.binding_namespace.is_empty()) {
                     const sym_id: SymbolID = this.resolver.declare_type(
                         enum_node.name, enum_node.span, true);
                     this.resolver.export_symbol(sym_id);
+                } else {
+                    this.declare_c_imported(enum_node.binding_namespace,
+                                            enum_node.name, enum_node.span);
                 }
             }
             NodeKind::ClassDeclaration => {
@@ -146,6 +171,10 @@ public:
                     const sym_id: SymbolID = this.resolver.declare_type(
                         alias_node.alias_name, alias_node.span, true);
                     this.resolver.export_symbol(sym_id);
+                } else {
+                    this.declare_c_imported(alias_node.binding_namespace,
+                                            alias_node.alias_name,
+                                            alias_node.span);
                 }
             }
             NodeKind::VariableDeclaration => {
@@ -263,9 +292,25 @@ public:
         for (mut i: int = 0; i < node.statements.length; i++) {
             node.statements[i].accept(this);
         }
+
+        // A `static_assert` condition lives in a side list, not the statement
+        // stream, so the loop above never reaches it.  Its condition is an
+        // ordinary expression that may name a constant or an enum variant, and
+        // the fold that reads it runs in TypeLowering - long after the only
+        // pass that can say which module a written qualifier denotes.  Without
+        // this walk the qualifier reaches that fold with no `Res` to read.
+        //
+        // The list is this module's own: the driver swaps `ast.root` per module
+        // before the walk, so a condition is resolved in the scope of the file
+        // that wrote it.
+        for (mut i: i64 = 0; i < node.static_asserts.length; i++) {
+            const sa: StaticAssertItem* = node.static_asserts[i];
+            if (sa == null || sa.cond == null) { continue; }
+            (sa.cond as ExpressionNode*).accept(this);
+        }
     }
 
-    
+
     // -- Declarations --
     override visit(node: FunctionDeclNode*) -> void {
         LOG_DEBUG(LogComponent::General, "[NameResolver] visit(FunctionDecl) name='%s' generics=%d",
@@ -359,6 +404,16 @@ public:
             this.resolver.declare_field(field.name, field.span);
         }
 
+        // Then walk them.  Declaring a field is not resolving what its type
+        // annotation NAMES, and the field visitor - which stamps that
+        // annotation - was reachable from nothing: every field's annotation
+        // reached the type layer with no `Res` on it.  Declaration stays a
+        // separate first pass so a field's default value can name a sibling
+        // declared after it.
+        for (mut i: int = 0; i < node.fields.length; i++) {
+            node.fields[i].accept(this);
+        }
+
         // Visit methods
         for (mut i: int = 0; i < node.methods.length; i++) {
             node.methods[i].accept(this);
@@ -379,6 +434,16 @@ public:
         for (mut i: int = 0; i < node.fields.length; i++) {
             const field: FieldDeclNode* = node.fields[i];
             this.resolver.declare_field(field.name, field.span);
+        }
+
+        // Then walk them.  Declaring a field is not resolving what its type
+        // annotation NAMES, and the field visitor - which stamps that
+        // annotation - was reachable from nothing: every field's annotation
+        // reached the type layer with no `Res` on it.  Declaration stays a
+        // separate first pass so a field's default value can name a sibling
+        // declared after it.
+        for (mut i: int = 0; i < node.fields.length; i++) {
+            node.fields[i].accept(this);
         }
 
         // Visit methods
@@ -432,6 +497,16 @@ public:
         for (mut i: int = 0; i < node.fields.length; i++) {
             const field: FieldDeclNode* = node.fields[i];
             this.resolver.declare_field(field.name, field.span);
+        }
+
+        // Then walk them.  Declaring a field is not resolving what its type
+        // annotation NAMES, and the field visitor - which stamps that
+        // annotation - was reachable from nothing: every field's annotation
+        // reached the type layer with no `Res` on it.  Declaration stays a
+        // separate first pass so a field's default value can name a sibling
+        // declared after it.
+        for (mut i: int = 0; i < node.fields.length; i++) {
+            node.fields[i].accept(this);
         }
 
         // Visit methods
@@ -960,7 +1035,15 @@ public:
             TypeAnnotation::Named(n)       => { this.stamp_named_annotation(n); }
             TypeAnnotation::Pointer(p)     => { this.stamp_annotation(p.inner); }
             TypeAnnotation::Reference(r)   => { this.stamp_annotation(r.inner); }
-            TypeAnnotation::Array(a)       => { this.stamp_annotation(a.element); }
+            TypeAnnotation::Array(a)       => {
+                this.stamp_annotation(a.element);
+                // `T[N]`'s size is the one EXPRESSION hanging off an
+                // annotation.  It may name a constant or an enum variant, and
+                // the fold that reads it runs in TypeResolution, so a written
+                // qualifier has to be stamped here or there is nothing for
+                // that fold to read but the spelling.
+                if (a.size_expr != null) { a.size_expr.accept(this); }
+            }
             TypeAnnotation::Projection(pj) => { this.stamp_annotation(pj.base); }
             TypeAnnotation::Function(f)    => {
                 for (mut i: i64 = 0; i < f.parameters.length; i++) {
@@ -1461,33 +1544,47 @@ public:
         }
     }
 
-    /// Process an import declaration: bring imported names into current scope.
-    /// Fold a module-level `const NAME: <int> = expr;` and record its value.
+    /// Record a module-level `const NAME = expr;` so its value can be folded.
     ///
     /// Fixed array sizes (`u8[NAME]`) are resolved long before codegen turns a
-    /// const into a runtime global, so the value has to be captured here or the
-    /// array's size is never known.  Statements are walked in source order, so
-    /// a constant defined in terms of an earlier one folds too.
+    /// const into a runtime global, so the initializer has to be captured here
+    /// or the array's size is never known.
     ///
-    /// A non-integer or non-constant initializer is simply not recorded; only
-    /// a use that needs the value (an array size) reports anything.
+    /// The value is NOT computed here.  An initializer may name a constant or
+    /// an enum that another module declares, and this pass runs over every
+    /// module before any of them is walked; folding at the declaration could
+    /// only ever see what preceded it.  A non-integer initializer is recorded
+    /// too and simply never folds - only a use that needs the value reports
+    /// anything.
     record_const_value(&this, node: VarDeclNode*) -> void {
         if (this.ctx == null || this.ctx.const_table == null) { return; }
         const intern: InternTable* = this.ctx.intern_table;
         if (intern == null) { return; }
-
-        mut value: i64 = 0;
-        if (!ConstantTable::fold_i64(node.initializer, this.ctx.const_table,
-                                      this.ctx.namespace_str, intern, &value)) {
-            return;
-        }
+        if (node.initializer == null) { return; }
 
         const qualified: SymbolStr = if (this.ctx.has_namespace()) {
             ConstantTable::intern_qualified(intern, this.ctx.namespace_str, node.name)
         } else {
             node.name
         };
-        this.ctx.const_table.register(qualified, node.name, value);
+        this.ctx.const_table.register(qualified, node.name,
+                                      this.ctx.namespace_str, node.initializer);
+    }
+
+    /// Record a module-level enum so `Enum::Variant` folds to its discriminant
+    /// wherever a compile-time integer is wanted.  Keyed the same two ways a
+    /// constant is, because a use site spells an enum the same ways.
+    record_enum_decl(&this, node: EnumDeclNode*) -> void {
+        if (this.ctx == null || this.ctx.const_table == null) { return; }
+        const intern: InternTable* = this.ctx.intern_table;
+        if (intern == null) { return; }
+
+        const qualified: SymbolStr = if (this.ctx.has_namespace()) {
+            ConstantTable::intern_qualified(intern, this.ctx.namespace_str, node.name)
+        } else {
+            node.name
+        };
+        this.ctx.const_table.register_enum(qualified, node);
     }
 
     /// Binds what an `import` - or an `export` - names into the current scope.
