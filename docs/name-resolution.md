@@ -338,6 +338,11 @@ alone and `type_implements_trait` additionally compares against bare `Copy` /
 lookup miss and moves Copy/Drop classification, so re-keying them is its own
 project rather than a call-site change — see §8.2 for the inventory.
 
+Those key spaces are not the whole block, and reading them as it costs a
+session: an impl head carried no identity to hand them in the first place,
+because its trait annotation was never name-resolved (§8.2an). The consumers
+are the second obstacle, not the first.
+
 `lookup_method_return` is the exception, and what distinguishes it is its key
 space rather than its call site: a trait's methods are registered under **both**
 the bare and the home-module-qualified trait name, so the qualified half is an
@@ -4836,6 +4841,162 @@ The name layer can finish this question, so it now reports it: `E0203` at the
 base's own span, and the slot records `Err`
 (`tests/negative/E0203_undefined_base_class.cryo`, verified to compile cleanly
 under the pre-fix pin).
+
+### 8.2an An impl head's trait annotation was never name-resolved — MEASURED 2026-08-15
+
+§6 records that the consumers asking *does this type implement the trait named
+X?* still take the bare leaf, and attributes the block to their key spaces:
+`get_trait_decl` is keyed by bare leaf alone, `type_implements_trait` compares
+markers by `equals`. Both are true. Neither is what blocked the migration.
+
+The annotation sites had nothing to migrate **to**. `TraitRef.resolved_name`
+exists because a where-clause bound carries its answer; the same question asked
+of an impl head reads `path`-free syntax through
+`TypeResolutionPasses::extract_trait_leaf`, which returns `NamedAnnotation.name`
+and ignores `NamedAnnotation.res` beside it. That looked like the §6 defect —
+a consumer re-deriving identity from a spelling — and it is not.
+`resolver/name_resolution.cryo` contains the string `trait_annotation`
+**zero** times. `visit(ImplBlockNode*)` entered the impl scope, declared
+generics, resolved the TARGET through the older span-keyed `record_resolution`,
+walked methods, exited. It never called `stamp_annotation` at all.
+
+Measured over the compiler's own source, answering from the leaf and recording
+what the identity would have said:
+
+| | AGREE | LEAF-ONLY | DIFFER |
+|---|---:|---:|---:|
+| before | 40 | **3822** | 0 |
+| after one `stamp_annotation` call | **3842** | 20 | **0** |
+
+Every one of the 3822 was `Pending` — no resolver claimed the node — rather than
+an answer that was not a definition. The two have different fixes and
+`trait_identity` returns them alike, so they were separated at the probe.
+
+**The control on the 3822.** The 40 that did agree were all `Iterator` →
+`std::core::iter::Iterator`, so the accessor works wherever a stamp exists;
+without that the 3822 reads equally well as a broken probe. The residual 20 are
+`implement Trait` BINDING annotations (`ImplTraitAnnotation.bounds`: 12
+`Future`, 8 `Iterator`) — the same gap at a different position, not this one.
+
+`stamp_annotation` goes after `declare_generics`, for the reason a parameter
+annotation is stamped there: a head spelled like an impl generic is that
+parameter, not a type to search for.
+
+**What this does NOT do.** No lookup was flipped, so B1 stands at 196 and the
+ratchet remains an unperturbed control for the flip. `TypeAnnotation::trait_identity`
+is the accessor the stamp exists to serve and currently has no caller.
+
+#### The flip is blocked on a second slot, and no gate can see it
+
+`method_binding.cryo`'s `bound_leaves` is fed from two sources. Over the
+compiler: **267 entries, 267 lookups** — balanced, so the population is whole —
+of which **267 are where-clause `TraitRef`s** carrying valid identities (`Copy` →
+`std::core::marker::Copy`), and **zero** are inline `<T: Bound>` constraints.
+
+That zero is measured over a corpus that cannot produce the event:
+`compiler/src` and `stdlib` contain **no** inline generic constraints, though
+`parser/parser.cryo:2584` accepts them. A four-line project using
+`implement<T: Greet> Holder<T>` fires the constraint source immediately.
+`GenericParam.constraints` is a bare `SymbolStr[]` with no slot to carry an
+identity, so re-keying the registry makes that lookup miss **silently**, and the
+victim can only ever be user code — the same shape as the `register_trait_decl`
+clobber, whose victim is also structurally absent in-tree.
+
+⇒ The registry re-key needs `GenericParam.constraints` stamped the way
+`TraitRef` is, and that is an AST change, not a call-site change. It was built
+and verified, then backed out with the rest of the attempt below.
+
+#### The registry re-key was ATTEMPTED and BACKED OUT — what is known
+
+The re-key does not fit behind the two blockers above. It was tried, it did not
+converge, and the tree was returned to the state this section describes. The
+attempt is preserved as a patch rather than left half-applied, because a
+partially re-keyed registry misses silently in both directions.
+
+**The defect is real and reproduces.** Two modules declare a trait `Render`;
+`main` imports only `Alpha` and writes `implement<T: Render> Holder<T>`. The
+program compiles clean, exit 0, no diagnostic — and runs **Omega's** default
+body. Controls: the pinned pre-change compiler gives the same wrong answer (so
+it is pre-existing, not introduced), and inverting ONLY the two `import` lines
+flips it, which pins the mechanism to `register_trait_decl`'s bare-keyed,
+last-write-wins registration. **Which method body executes depends on import
+order in an unrelated file.**
+
+This is the victim §2a could not produce. That entry justified the re-key on a
+user-declared `Copy` colliding with the stdlib marker; this is stronger — no
+marker, no stdlib collision, two ordinary same-leaf traits.
+
+**What the attempt established:**
+
+- The trait tables are **two key spaces, not one**. The trait-DECL registry
+  answers "which declaration is this trait?" and wants an identity. The
+  trait-IMPL tables are `(trait-leaf, target)` DISPATCH indices where the
+  target disambiguates — `register_trait_impl_typed` normalizes to the leaf
+  deliberately, and `ownership.cryo`'s Drop path pairs with it. Re-keying the
+  impl tables was attempted first and is **wrong**; it breaks every operator
+  lookup, since `OperatorTraitMap.trait_leaf` names 14 operator traits by
+  string literal and resolves them through those tables.
+- So the well-known set is **five** (`Copy`/`Send`/`Sync`/`Drop`/`Future`),
+  not the ~23 an impl-table re-key would have forced. Operator traits stay
+  leaf-keyed by design.
+- `traits_implemented_by` returns dispatch leaves, which `get_trait_decl` then
+  refuses. The bridge is the impl head's stamped annotation, looked up in the
+  SAME table via `lookup_trait_impl(leaf, target)` so the pair cannot disagree
+  about what is registered.
+
+**Three hypotheses ruled out for the residual failure** (a re-keyed build
+compiles the compiler but miscompiles user programs, `E0358 no method named
+'get' on Slice<u8>`, alongside 14 lookups still keyed by a bare name —
+`FmtWrite` x8, `Drop` x4, `Display` x2):
+
+1. *Unconverted `register_trait_impl` sites.* Converted; failure unchanged.
+2. *`find_generic_trait_default` newly gated on an impl block that may not
+   resolve.* Repaired by pairing it with `lookup_trait_impl`; failure unchanged.
+3. *Bound stamps resolving to bare names* — `stamp_trait_ref` assigns
+   `resolve_scoped_or_at`, documented to return its input when no bare→qualified
+   mapping exists. **Measured false:** 200 stamps ran (the control on the zero)
+   and every one is qualified — `FmtWrite` → `std::fmt::write::FmtWrite`,
+   `Display` → `std::fmt::display::Display`, `Drop` → `std::core::drop::Drop`.
+
+⇒ The 14 bare keys therefore come from `TraitRef::identity()` falling back on a
+TraitRef that `stamp_trait_bounds` never reached — an owner outside the four it
+walks. **`AssocTypeDeclNode.bounds` is the untested candidate** and is where the
+next attempt should instrument first: tag `get_trait_decl` with its call site so
+the 14 name themselves, rather than inferring the owner.
+
+#### The second slot was solved, and that solution is NOT in the tree either
+
+`GenericParamNode.constraints` was converted from `SymbolStr[]` to `TraitRef[]`
+so an inline `<T: Bound>` and a `where T: Bound` share one representation and
+one stamping chokepoint. It verified — the control stamps `Greet` →
+`Main::Greet` with its exit code unchanged, and the full suite stayed green —
+but it was backed out with the rest of the attempt, since its only consumer is
+the re-key. The parser accepts only a bare identifier in constraint position, so
+the path is always one segment and a constraint cannot be written qualified.
+
+#### Well-known trait identities — measured, also NOT in the tree
+
+A `GenericRegistry` slot recording the qualified name of the declaration that
+claims each of `Copy`/`Send`/`Sync`/`Drop`/`Future`, filled at the registration
+site where the name is already import-resolved, so a marker check asks about a
+DECLARATION rather than about a spelling. Built and measured, then backed out
+with the attempt: the marker comparisons only become identity comparisons once
+their callers pass identities, which is the re-key.
+
+Measured while it was in: **2459 marker queries, none against an empty slot**
+(1220 `Copy`, 1239 `Drop`). An empty slot is a module-graph fact and not a
+"no" — answering "no" off one reclassifies every type at once — so absence must
+stay distinguishable from negation.
+
+`Send` and `Sync` were queried **zero** times by this corpus, so their zero says
+nothing. The prediction that `Drop` would be the exposed marker, on the grounds
+that `std::core::drop` is absent from the prelude's re-export list (§8.2t), was
+wrong: prelude re-export is not what puts a module in the graph.
+
+Scope note for whoever picks this up: the well-known set is **five**. It is only
+five because the trait-IMPL tables stay leaf-keyed. Re-key those and it becomes
+~23, because `OperatorTraitMap` names all 14 operator traits by string literal
+and resolves them through exactly those tables.
 
 ### 8.3 B2, enumerated — MEASURED 2026-08-09
 
