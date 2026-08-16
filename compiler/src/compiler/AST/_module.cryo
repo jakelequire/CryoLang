@@ -596,18 +596,50 @@ type struct GenericParam {
 /// `where T: TryFrom<&JsonValue>`); empty for non-generic trait references.
 type struct TraitRef {
     path:      SymbolStr[];
+    /// Canonical identity of the trait `path` names, resolved once against the
+    /// module that WROTE the bound and carried from there.
+    ///
+    /// `path` is a spelling, and identity questions cannot be answered from a
+    /// spelling: one trait may be written bare here and qualified there, and
+    /// two unrelated traits in different modules may share a leaf. Recovering
+    /// the qualified form from `path[length - 1]` is a search over the whole
+    /// program, so it answers only while that leaf is unique - a second,
+    /// unrelated declaration of the same leaf anywhere makes two distinct
+    /// traits fold to one name, and impl heads that differ only in their
+    /// bounds then render identically.
+    ///
+    /// Empty until TypeResolution stamps it; consumers asking WHICH trait a
+    /// bound names read this field.
+    resolved_name: SymbolStr;
     type_args: TypeAnnotation*[];
     span:      SourceSpan;
 
     /// Deep copy into independently-owned arrays (SymbolStr and the
     /// TypeAnnotation* handles are Copy), so a clone can be stored in a
     /// second owner without aliasing this one's buffers.
+    ///
+    /// `resolved_name` IS copied: specializing an impl rewrites which types a
+    /// bound is applied to, never which trait the bound names, so the
+    /// template's identity is the clone's. Copying it also keeps the answer
+    /// pinned to the module that wrote the bound once the clone is re-visited
+    /// under a different module cursor.
     clone(&this) -> TraitRef {
         mut path_c: SymbolStr[] = [];
         mut args_c: TypeAnnotation*[] = [];
         for (mut i: i64 = 0; i < this.path.length; i++)      { path_c.push(this.path[i]); }
         for (mut i: i64 = 0; i < this.type_args.length; i++) { args_c.push(this.type_args[i]); }
-        return TraitRef { path: path_c, type_args: args_c, span: this.span };
+        return TraitRef { path: path_c, resolved_name: this.resolved_name,
+                          type_args: args_c, span: this.span };
+    }
+
+    /// The trait's identity when it is known, falling back to the written
+    /// leaf. One accessor so a consumer never re-derives identity from `path`,
+    /// and so the unstamped case has a single defined answer rather than one
+    /// per call site.
+    identity(&this) -> SymbolStr {
+        if (this.resolved_name.is_valid()) { return this.resolved_name; }
+        if (this.path.length == 0) { return SymbolStr::empty(); }
+        return this.path[this.path.length - 1];
     }
 }
 
