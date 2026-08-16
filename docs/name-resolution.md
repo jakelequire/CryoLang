@@ -297,6 +297,7 @@ retired):
 | enum variant reference | `AST/expression.cryo:424` | — |
 | `ClassDeclNode` (base class) | `AST/declaration.cryo:854` | **`base_res`** (§8.2am) |
 | `ImplBlockNode` (trait head) | `AST/declaration.cryo:1152` | **`qualified_trait_name`** |
+| `TraitRef` (where/bound trait) | `AST/_module.cryo:597` | **`resolved_name`** |
 
 `ImplBlockNode.qualified_trait_name` carries a canonical name rather than a
 `Res`, because the question asked of it is identity — *are these two impls the
@@ -307,6 +308,36 @@ therefore answers only while the leaf is unique. A single unrelated
 declaration sharing the leaf made one trait read as two and turned every method
 on it into a false ambiguity. A search key cannot be used as an identity; the
 identity has to be carried from where it was resolved.
+
+`TraitRef.resolved_name` is the same rule reached from the other side. A trait
+reference in a bound stores its spelling as path segments, and every consumer
+asking *which trait is this?* re-derived the answer from `path[length - 1]` —
+discarding the qualifier the author wrote, then searching the program to
+recover it. The search declines on a plural leaf, so where
+`qualified_trait_name` made one trait read as two, this made two traits read as
+one: the impl-head coherence key rendered two impls that differed only in which
+module their bound came from as the same string, and rejected the second with a
+spurious `E0308`. Writing the bound fully qualified did not help, because the
+qualifier never reached the key.
+
+The slot is stamped at `register_decl_in_index` — the same chokepoint as
+`qualified_trait_name` — and resolved with `resolve_scoped_or_at` against the
+bound's own `span.file`, so the answer is judged by the module that *wrote* the
+bound rather than the module the compiler is standing in (§5.2), and survives a
+clone being re-visited under a different cursor. `TraitRef::identity()` is the
+single accessor; it defines the unstamped answer once rather than once per call
+site.
+
+Two limits are deliberate. A *relatively* qualified spelling (`alpha::Render`
+for `leaf_key::alpha::Render`) has no bare→qualified mapping and so keys by what
+was written — the false-negative direction, and the same residual the impl head
+carries. And the consumers that ask *does this type implement the trait named
+X?* still take the bare leaf, because the registries beneath them
+(`get_trait_decl`, `lookup_method_return`, `type_implements_trait`) are
+bare-keyed by design, and `type_implements_trait` additionally compares against
+bare `Copy` / `Send` / `Sync` / `Drop` by `equals`. Handing those a qualified
+name makes the lookup miss and moves Copy/Drop classification, so re-keying them
+is its own project rather than a call-site change — see §8.2 for the inventory.
 
 ---
 

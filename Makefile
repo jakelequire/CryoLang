@@ -149,7 +149,7 @@ EXT_ID        := cryolang.cryo-analyzer
 EXT_VSIX      := $(EXT_DIR)/cryo-analyzer.vsix
 
 .DEFAULT_GOAL := help
-.PHONY: help stdlib cryo cryo-exe selfhost-check test test-list roster-check b1-check api-index api-index-check examples examples-golden valgrind-check verify-freestanding runtime-tiers runtime-tiers-win pin \
+.PHONY: help stdlib cryo cryo-exe selfhost-check test test-list roster-check b1-check lane-check vendor-check api-index api-index-check examples examples-golden valgrind-check verify-freestanding runtime-tiers runtime-tiers-win pin \
         pin-linux-impl pin-windows-impl _pin-windows-do \
         install uninstall clean lsp install-lsp release release-linux release-windows
 
@@ -169,6 +169,7 @@ help:
 	@echo "  make test-list         List the discovered test cases without running them"
 	@echo "  make b1-check          Pin the B1 fuzzy-fallback bucket against its golden"
 	@echo "  make lane-check        Pin the resolution-lane surface against its golden"
+	@echo "  make vendor-check      Check every constant shape survives cryo vendor"
 	@echo "  make api-index         Regenerate docs/stdlib-api.txt (the stdlib API index)"
 	@echo "  make api-index-check   Fail if docs/stdlib-api.txt is stale"
 	@echo "                         (name-resolution cascade regrowth gate;"
@@ -471,6 +472,9 @@ roster-check: $(STAGE2_EXE) $(LIBCRYO_A) $(TEST_HELPERS_A)
 
 b1-check: $(STAGE2_EXE) $(LIBCRYO_A) runtime-tiers
 	@python scripts/b1-gate.py "$(STAGE2_EXE_WIN)" $(ARGS)
+
+vendor-check: $(STAGE2_EXE) $(LIBCRYO_A) runtime-tiers
+	@python scripts/vendor-consts-gate.py "$(STAGE2_EXE_WIN)" $(ARGS)
 else
 test: $(STAGE2) $(LIBCRYO_A) $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A) runtime-tiers
 	@cd tests && "$(STAGE2)" test $(ARGS)
@@ -500,6 +504,20 @@ roster-check: $(STAGE2) $(LIBCRYO_A) $(TEST_HELPERS_A) $(TEST_CPP_HELPERS_A)
 # for reasons unrelated to B1.
 b1-check: $(STAGE2) $(LIBCRYO_A) runtime-tiers
 	@python3 scripts/b1-gate.py "$(STAGE2)" $(ARGS)
+
+# End-to-end gate on the constants `cryo vendor` carries out of a C header.
+# The importer binds a constant and the serializer writes it, and when those
+# two disagree on an AST shape the constant vanishes with the generator still
+# reporting success -- the use site fails with `cannot find value` one build
+# later, pointing at nothing.  Consuming every constant is what turns that into
+# a build failure here instead.
+#
+# Needs the compiler and a working link (it builds and RUNS a consumer), but no
+# external library and no display, so unlike the raylib acceptance project this
+# runs everywhere.  Hermetic: the fixture registers under a throwaway
+# $CRYO_HOME and leaves nothing on the machine.
+vendor-check: $(STAGE2) $(LIBCRYO_A) runtime-tiers
+	@python3 scripts/vendor-consts-gate.py "$(STAGE2)" $(ARGS)
 endif
 
 # ---- resolution-lane surface ratchet -----------------------------------
