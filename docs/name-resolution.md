@@ -332,12 +332,32 @@ Two limits are deliberate. A *relatively* qualified spelling (`alpha::Render`
 for `leaf_key::alpha::Render`) has no bare→qualified mapping and so keys by what
 was written — the false-negative direction, and the same residual the impl head
 carries. And the consumers that ask *does this type implement the trait named
-X?* still take the bare leaf, because the registries beneath them
-(`get_trait_decl`, `lookup_method_return`, `type_implements_trait`) are
-bare-keyed by design, and `type_implements_trait` additionally compares against
-bare `Copy` / `Send` / `Sync` / `Drop` by `equals`. Handing those a qualified
-name makes the lookup miss and moves Copy/Drop classification, so re-keying them
-is its own project rather than a call-site change — see §8.2 for the inventory.
+X?* still take the bare leaf, because `get_trait_decl` is keyed by bare leaf
+alone and `type_implements_trait` additionally compares against bare `Copy` /
+`Send` / `Sync` / `Drop` by `equals`. Handing those a qualified name makes the
+lookup miss and moves Copy/Drop classification, so re-keying them is its own
+project rather than a call-site change — see §8.2 for the inventory.
+
+`lookup_method_return` is the exception, and what distinguishes it is its key
+space rather than its call site: a trait's methods are registered under **both**
+the bare and the home-module-qualified trait name, so the qualified half is an
+unambiguous key that already exists. The bound scans in `method_binding.cryo`
+therefore ask it with `TraitRef::identity()`, as does the `lookup_type_by_sym`
+scan beside them, which tries a qualified name ahead of its own cascade. The two
+key spaces are used side by side within one scan — identity for the registry
+lookup, the bare leaf for `subst_bound_assoc_args`, which reaches
+`get_trait_decl`. That is not a fallback chain: they are two questions of two
+registries, each with one answering path.
+
+Safe because measured, not because reasoned. A/B-ing both key spaces over 56
+corpora (the compiler, every example, the whole project suite) recorded 7300
+agreeing return lookups and 10160 agreeing type lookups, with **no case where
+the leaf answered and the identity did not**, and none where the two answered
+differently. The stamped identity is the registry's canonical key: `Iterator`
+resolves to `std::core::iter::Iterator`, a user trait to `Main::Shape`. The
+trade is visible in the ratchet — 24 answers move off the arena leaf index,
+which is valid only while a leaf is unique program-wide, onto resolution whose
+written qualifier is checked against the declaring module.
 
 ---
 
