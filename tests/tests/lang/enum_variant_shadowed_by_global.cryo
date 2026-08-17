@@ -1,0 +1,64 @@
+///! An enum variant whose name collides with a module-level constant somewhere
+///! else in the program resolves to the VARIANT.
+///!
+///! `std::math` exports `const E: f64`, and an enum with an `E` variant is
+///! ordinary (`Key::E` on a keyboard map). Codegen answered `Key::E` from the
+///! global table before it considered the enum, and the last of those probes
+///! matches on the member's BARE leaf, which any module in the program can
+///! satisfy - so the path bound `math::E`. A global resolves as an lvalue, so
+///! the enum's own backing width was then applied to that global's storage and
+///! the discriminant read as a truncation of a f64 bit pattern: `E` came back
+///! 22377 (`0x5769`) at u16 and 2333366121 (`0x8B145769`) at u32, compiling
+///! clean.
+///!
+///! The neighbouring variants are asserted too, and they are the control: they
+///! collide with nothing, so a failure confined to `E` is the collision and not
+///! the enum's declaration, its width, or its discriminant assignment.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::EnumVariantShadowedByGlobal;
+
+import std::core::result;
+import std::math;
+import std::test::error;
+import std::test::assert;
+
+/// Widths differ so a wrong value is truncated differently in each, which is
+/// what identified the culprit: the readings were the low 16 and low 32 bits
+/// of the same f64 bit pattern.
+type enum Key : u16 { A = 4; D = 7; E = 8; F = 9; }
+type enum Wide : u32 { E = 8; }
+
+/// `PI` and `TAU` are `std::math` exports as well, so the collision is not
+/// specific to the one name.
+type enum Named : u16 { PI = 1; TAU = 2; }
+
+![test]
+function colliding_variant_is_the_variant() -> Result<(), TestError> {
+    expect_eq(Key::E as u64, 8)?;
+    expect_eq(Wide::E as u64, 8)?;
+    return Result::Ok(());
+}
+
+![test]
+function neighbouring_variants_are_unaffected() -> Result<(), TestError> {
+    expect_eq(Key::A as u64, 4)?;
+    expect_eq(Key::D as u64, 7)?;
+    expect_eq(Key::F as u64, 9)?;
+    return Result::Ok(());
+}
+
+![test]
+function other_colliding_names() -> Result<(), TestError> {
+    expect_eq(Named::PI as u64, 1)?;
+    expect_eq(Named::TAU as u64, 2)?;
+    return Result::Ok(());
+}
+
+/// The constant the variant was being confused with still reads correctly, so
+/// the fix moved the enum ahead of the global lookup rather than disabling it.
+![test]
+function the_module_constant_still_resolves() -> Result<(), TestError> {
+    expect_close_f64(math::E, 2.718281828459045, 0.000000001)?;
+    return Result::Ok(());
+}

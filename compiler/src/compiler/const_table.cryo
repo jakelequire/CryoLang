@@ -87,6 +87,15 @@ type struct ConstEntry {
     /// differs.
     real_value: f64;
     real_state: i32;
+    /// Whether the declaration named an INTEGER primitive.
+    ///
+    /// The reading of an initializer is the DECLARED TYPE's to choose, not the
+    /// expression's: `1 / 2` is 0 in `const H: i64` and 0.5 in `const H: f64`,
+    /// so a real fold that re-interprets the initializer of an integer constant
+    /// answers with a value that constant never had.  False for a real, for a
+    /// non-primitive, and for an absent annotation - all of which leave the
+    /// choice to the expression, which is what an unannotated constant wants.
+    int_typed: boolean;
     /// Next entry sharing this leaf name, or -1.  A bare use folds every
     /// candidate on the chain and answers only when they agree.
     next_same_bare: i64;
@@ -125,7 +134,8 @@ type struct ConstantTable {
     /// idempotent and keeps a module from making its own name ambiguous
     /// against itself.
     register(mut &this, qualified: SymbolStr, bare: SymbolStr,
-             module_ns: SymbolStr, init: ExpressionNode*) -> void {
+             module_ns: SymbolStr, init: ExpressionNode*,
+             int_typed: boolean) -> void {
         match (this.by_qualified.get(&qualified.id)) {
             Option::Some(existing) => {
                 this.entries[existing].module_ns  = module_ns;
@@ -134,6 +144,7 @@ type struct ConstantTable {
                 this.entries[existing].state      = CONST_PENDING;
                 this.entries[existing].real_value = 0.0;
                 this.entries[existing].real_state = CONST_PENDING;
+                this.entries[existing].int_typed  = int_typed;
                 return;
             }
             Option::None => { }
@@ -155,6 +166,7 @@ type struct ConstantTable {
             state:          CONST_PENDING,
             real_value:     0.0,
             real_state:     CONST_PENDING,
+            int_typed:      int_typed,
             next_same_bare: head,
         });
         this.by_qualified.insert(qualified.id, idx);
@@ -214,6 +226,28 @@ type struct ConstantTable {
                 i
             }
             Option::None => { -1 }
+        };
+    }
+
+    /// Whether `ann` names an integer primitive, which is what decides how the
+    /// declaration's initializer is READ.
+    ///
+    /// `char` counts: whatever its width settles at, it is not a real, and the
+    /// question here is only which of the two folds may interpret the
+    /// initializer.  Anything that is not a primitive - a type name, an alias,
+    /// an absent annotation - answers false and leaves the choice to the
+    /// expression's own shape.
+    static declares_integer(ann: TypeAnnotation*, intern: InternTable*) -> boolean {
+        if (ann == null || intern == null) { return false; }
+        return match (*ann) {
+            TypeAnnotation::Primitive(p) => {
+                const n: string = intern.resolve(p.name);
+                return n == "i8"  || n == "i16" || n == "i32"  || n == "i64"
+                    || n == "i128"|| n == "u8"  || n == "u16"  || n == "u32"
+                    || n == "u64" || n == "u128"|| n == "int"  || n == "isize"
+                    || n == "usize" || n == "char" || n == "boolean";
+            }
+            _ => { false }
         };
     }
 
@@ -450,6 +484,15 @@ type struct ConstEval {
             // Not a real constant - it may still be an integer one.
         }
 
+        if (node.kind == NodeKind::ScopeResolution) {
+            // Terminal, unlike the bare-name case above: the qualifier's own
+            // answer says which kind of thing the member is, so one dispatch
+            // settles both the real and the integer reading and there is no
+            // second question left for the promotion below to ask.
+            const sr: ScopeResolutionNode* = expr as ScopeResolutionNode*;
+            return this.fold_scoped_real(sr, out);
+        }
+
         if (node.kind == NodeKind::CastExpression) {
             const c: CastExprNode* = expr as CastExprNode*;
             // The cast's own width is applied by the emitter against the
@@ -513,11 +556,23 @@ type struct ConstEval {
     /// enum variant of it.  Anything else is not a compile-time integer.
     fold_scoped(&this, sr: ScopeResolutionNode*, out: i64*) -> boolean {
         if (this.table == null || this.intern == null) { return false; }
+        return this.fold_scoped_res(
+            sr.scope_res.require("ConstEval::fold_scoped"), sr.member_name, out);
+    }
 
-        return match (sr.scope_res.require("ConstEval::fold_scoped")) {
+    /// `fold_scoped`, from an answer already read off the node.
+    ///
+    /// Split from the read so that a real fold can dispatch on the SAME answer
+    /// without requiring the slot a second time: `require` records a pending
+    /// bug for an unstamped node, so asking twice would count one unstamped
+    /// path as two.
+    fold_scoped_res(&this, r: Res, member: SymbolStr, out: i64*) -> boolean {
+        if (this.table == null || this.intern == null) { return false; }
+
+        return match (r) {
             Res::Def(ns) => {
                 const key: SymbolStr = ConstantTable::intern_qualified(
-                    this.intern, ns, sr.member_name);
+                    this.intern, ns, member);
                 if (!key.is_valid()) { return false; }
                 return match (this.table.by_qualified.get(&key.id)) {
                     Option::Some(i) => { this.fold_entry(i, out) }
@@ -533,7 +588,7 @@ type struct ConstEval {
                         return match (this.table.enums_by_qualified.get(&q.id)) {
                             Option::Some(ei) => {
                                 ConstEval::variant_tag_of(
-                                    this.table.enums[ei], sr.member_name, out)
+                                    this.table.enums[ei], member, out)
                             }
                             Option::None => { false }
                         };
@@ -624,6 +679,40 @@ type struct ConstEval {
         return this.fold_chain_real(idx, out);
     }
 
+    /// `fold_scoped`, as a real.
+    ///
+    /// A module's constant is folded as a real in its own right, because that
+    /// is the only reading under which a float initializer is a value at all:
+    /// asking the integer folder for `Scalar::PI` and promoting its answer
+    /// fails at the float literal inside, and a global initializer that fails
+    /// to fold is not diagnosed - it is emitted as zero.
+    ///
+    /// Everything else a scope can name is integer-valued - an enum variant's
+    /// discriminant - so it is decoded once by the integer arm and promoted,
+    /// rather than given a second decoder here that could disagree with it.
+    fold_scoped_real(&this, sr: ScopeResolutionNode*, out: f64*) -> boolean {
+        if (this.table == null || this.intern == null) { return false; }
+
+        const r: Res = sr.scope_res.require("ConstEval::fold_scoped_real");
+        return match (r) {
+            Res::Def(ns) => {
+                const key: SymbolStr = ConstantTable::intern_qualified(
+                    this.intern, ns, sr.member_name);
+                if (!key.is_valid()) { return false; }
+                return match (this.table.by_qualified.get(&key.id)) {
+                    Option::Some(i) => { this.fold_entry_real(i, out) }
+                    Option::None    => { false }
+                };
+            }
+            _ => {
+                mut iv: i64 = 0;
+                if (!this.fold_scoped_res(r, sr.member_name, &iv)) { return false; }
+                *out = iv as f64;
+                return true;
+            }
+        };
+    }
+
     /// `fold_chain`, as a real: every candidate sharing the leaf must agree.
     fold_chain_real(&this, head: i64, out: f64*) -> boolean {
         mut answered: boolean = false;
@@ -659,7 +748,20 @@ type struct ConstEval {
         this.table.entries[idx].real_state = CONST_FOLDING;
         mut v: f64 = 0.0;
         const inner: ConstEval = this.in_module(this.table.entries[idx].module_ns);
-        const ok: boolean = inner.fold_real(init, &v);
+        // An integer-typed constant is folded as an INTEGER and promoted, never
+        // re-read as a real.  Its value is what its own declaration produced -
+        // `const H: i64 = 1 / 2;` is 0 - and a real reading of the same
+        // initializer answers 0.5, a number that constant never held at any
+        // position.  The declared type is the only thing that can settle this;
+        // the initializer looks identical either way.
+        mut ok: boolean = false;
+        if (this.table.entries[idx].int_typed) {
+            mut iv: i64 = 0;
+            ok = inner.fold(init, &iv);
+            if (ok) { v = iv as f64; }
+        } else {
+            ok = inner.fold_real(init, &v);
+        }
         if (!ok) {
             this.table.entries[idx].real_state = CONST_PENDING;
             return false;

@@ -1623,7 +1623,24 @@ public:
             }
         }
 
-        // 3. Global variable lookups
+        // 3. Enum variant reference (`Option::None`, `Key::E`).
+        //
+        // Ahead of the global lookups below, and that order is the whole point:
+        // a member of a TYPE is not a global, so the tables that answer for
+        // module-level storage must not be asked first.  The last of those
+        // probes matches on the member's BARE leaf, which any module in the
+        // program can satisfy - `Key::E` was answered by `std::math`'s `E`, and
+        // because a global resolves as an lvalue the enum's own width was then
+        // applied to that global's storage, reading a truncation of a f64 bit
+        // pattern as the discriminant with nothing diagnosed.
+        //
+        // Sema's `resolved_type` is what decides, not the written qualifier: it
+        // names the enum this path denotes, and a member it has no variant for
+        // is not an enum reference at all, so this declines to the lookups
+        // below rather than shadowing them.
+        if (this.try_emit_enum_variant(node)) { return; }
+
+        // 4. Global variable lookups
         const global: LValue = this.cg.resolver.resolve_global(sym_bare);
         if (global.is_valid()) {
             this.state.last_value    = global;
@@ -1654,9 +1671,17 @@ public:
             return;
         }
 
-        // 4. Enum variant reference (e.g., Option::None)
-        // Use resolved_type from sema to find the concrete enum type.
-        // Follow InstantiatedType chain (may be multiple levels).
+        this.state.last_value    = LValue::null();
+        this.state.last_is_lvalue = false;
+    }
+
+    /// Emit `Enum::Variant` as its discriminant, or false when this path does
+    /// not name a variant.
+    ///
+    /// The enum comes from sema's `resolved_type`, through any chain of
+    /// instantiations, so a generic enum is answered by the type it was
+    /// instantiated to rather than by its declaration.
+    try_emit_enum_variant(mut &this, node: ScopeResolutionNode*) -> boolean {
         mut real_ref: TypeRef = node.resolved_type;
         mut real_t: Type* = this.cg.lookup_type_by_id(real_ref.id);
         mut sr_depth: i32 = 0;
@@ -1668,19 +1693,16 @@ public:
             } else { break; }
             sr_depth += 1;
         }
-        if (real_t != null && real_t.kind == TypeKind::Enum) {
-            const et: EnumType* = real_t as EnumType*;
-            const variant: EnumVariantInfo* = et.get_variant(node.member_name);
-            if (variant != null) {
-                mut no_args: LValue[] = [];
-                this.state.last_value = this.enum_variant.build(et, variant, real_ref, no_args);
-                this.state.last_is_lvalue = false;
-                return;
-            }
-        }
+        if (real_t == null || real_t.kind != TypeKind::Enum) { return false; }
 
-        this.state.last_value    = LValue::null();
+        const et: EnumType* = real_t as EnumType*;
+        const variant: EnumVariantInfo* = et.get_variant(node.member_name);
+        if (variant == null) { return false; }
+
+        mut no_args: LValue[] = [];
+        this.state.last_value = this.enum_variant.build(et, variant, real_ref, no_args);
         this.state.last_is_lvalue = false;
+        return true;
     }
 
     /// Match expression: produces a value via phi node.

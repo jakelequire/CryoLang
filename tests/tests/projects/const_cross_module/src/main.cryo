@@ -3,7 +3,7 @@
 namespace ConstCrossModule::Main;
 
 import ConstCrossModule::Limits;
-import ConstCrossModule::Limits::{ CAPACITY, Tier };
+import ConstCrossModule::Limits::{ CAPACITY, Tier, INT_HALF };
 
 type struct QualifiedField { f: u8[ConstCrossModule::Limits::CAPACITY]; }
 type struct BareField      { f: u8[CAPACITY]; }
@@ -24,6 +24,34 @@ type struct SuffixEnumField { f: u8[Limits::TIER_LEN]; }
 /// answer the first one.
 const VIA_SUFFIX: i64 = Limits::CAPACITY;
 type struct ChainedField { f: u8[VIA_SUFFIX]; }
+
+/// A MODULE-LEVEL constant initialized from another module's REAL constant.
+///
+/// Distinct from the reals read inside `main` below, and the distinction is the
+/// whole point: a use site in a body loads the other module's global at
+/// runtime, so it is right whether or not anything folded. This position has to
+/// be folded to be emitted at all, and an initializer that does not fold is not
+/// diagnosed - it becomes the zeroinitializer. A qualified path had no real
+/// reading, so every constant here was 0.0 while the same names in a body,
+/// and the same shape with an INTEGER, were correct.
+const FROM_OTHER_F:  f64 = ConstCrossModule::Limits::UNIT;
+const FROM_SUFFIX_F: f64 = Limits::UNIT;
+const DERIVED_F:     f64 = Limits::UNIT * 0.5;
+const MIXED_F:       f64 = Limits::UNIT - Limits::GAP;
+/// An enum variant in a real position: integer-valued, so it must reach the
+/// real fold through the integer one rather than through a second decoder.
+const ENUM_AS_F:     f64 = Limits::Tier::High as f64;
+
+/// Reading a constant whose DECLARED type disagrees with the reading this
+/// position wants. The value is the one its own declaration produced, so an
+/// integer constant is promoted rather than re-folded: `INT_HALF` is 0, and a
+/// real re-reading of `1 / 2` would answer 0.5 - a number it never held.
+/// Both spellings, because the bare and qualified paths reach the entry by
+/// different keys and disagreed about this.
+const INT_HALF_QUALIFIED: f64 = Limits::INT_HALF;
+const INT_HALF_BARE:      f64 = INT_HALF;
+/// The mirror, which is why the integer reading cannot simply be preferred.
+const REAL_DIV_QUALIFIED: f64 = Limits::REAL_DIV;
 
 static_assert(ConstCrossModule::Limits::CAPACITY == 12,
               "a qualified constant folds in a static_assert");
@@ -73,6 +101,18 @@ function main() -> int {
     mut reals: i64 = 0;
     if (ConstCrossModule::Limits::SCALED_F != 1.125) { reals = reals + 1; }
     if (ConstCrossModule::Limits::HALVED_F != 0.75)  { reals = reals + 1; }
+
+    // The module-level reals declared above, each zero when it failed to fold.
+    if (FROM_OTHER_F  != 1.5)  { reals = reals + 1; }
+    if (FROM_SUFFIX_F != 1.5)  { reals = reals + 1; }
+    if (DERIVED_F     != 0.75) { reals = reals + 1; }
+    if (MIXED_F       != 1.25) { reals = reals + 1; }
+    if (ENUM_AS_F     != 2.0)  { reals = reals + 1; }
+
+    // The declared type decides the reading, both spellings and both directions.
+    if (INT_HALF_QUALIFIED != 0.0) { reals = reals + 1; }
+    if (INT_HALF_BARE      != 0.0) { reals = reals + 1; }
+    if (REAL_DIV_QUALIFIED != 3.5) { reals = reals + 1; }
 
     return (buf.length + small.length
             + sizeof(BareField) as i64

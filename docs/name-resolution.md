@@ -5496,6 +5496,59 @@ there is no stamp to read and the leaf map is the only answer available. That
 row is the residue and the reduction target; it retires when a bare identifier
 is stamped, and until then the gate watches it.
 
+### 8.10 The stamp was right and the consumer never read it — FIXED 2026-08-17
+
+Reported as another instance of §8.2a's leaf index, i.e. a name-layer defect.
+It is not, and the distinction is the useful part: **the resolver's answer was
+correct and the consumer decided without it.**
+
+`Key::E`, for an enum declaring `E = 8`, evaluated to **22377**. That is
+`0x5769`, the low 16 bits of `std::math::E`'s f64 bit pattern; the same enum
+backed by `u32` read `0x8B145769`. Nothing was diagnosed, and no file in the
+program had to import `std::math` — one unrelated module importing it anywhere
+was sufficient.
+
+`codegen/visit/ir_generator.cryo::visit(ScopeResolutionNode*)` answers a path in
+this order: three function lookups, then `resolve_global(scope::member)`,
+`resolve_global_in_scope(member, scope)`, `resolve_global(member)`, and only
+then the enum variant. The sixth step matches on the member's **bare leaf**, so
+any module's `E` satisfies it. A global resolves as an *lvalue*, so the enum's
+own backing width was then applied to that global's storage — the value is a
+type-punned read, not a conversion, which is why the bit pattern survives
+intact.
+
+**Measured, and it refutes the report's diagnosis.** A `CRYO_PATH_AUDIT` probe
+at the node shows `Key::E` stamped **`TypeRelative(Def, 1)`** — §5.3's positive
+claim that the qualifier names a type, decided correctly by the name layer. The
+node carried the right answer the whole time. This is therefore not a resolution
+cascade to be migrated but a consumer reading tables in the wrong order, and it
+is the failure mode §6.3 exists to prevent: an answer stored on the node is only
+worth what its readers do with it.
+
+**The fix** hoists the enum-variant resolution above the three global lookups.
+It decides from sema's `resolved_type`, so a member the enum has no variant for
+declines to the lookups below instead of shadowing them, and the function
+lookups stay ahead of it so a static method used as a value is untouched.
+
+**A neighbour this exposed, in the constant folder rather than the name layer.**
+Giving a qualified path a real reading made it behave like a bare one, which
+revealed that both chose the integer-vs-real reading from the EXPRESSION rather
+than from the referenced constant's declared type. `const H: i64 = 1 / 2;` is 0,
+and a real re-reading of the same initializer answers 0.5 — a value that
+constant never held — while `const R: f64 = 7 / 2;` is 3.5 and an integer
+reading answers 3. Neither is recoverable from the initializer, so preferring
+either fold is wrong in one direction; the declared type is recorded on the
+entry instead (`ConstEntry.int_typed`).
+
+**What is still open.** The bare-leaf global step survives, and it would still
+answer for a non-enum type member colliding with some module's bare constant
+(`SomeStruct::CONST`). Post-fix it answered **0 times** over the 14 examples and
+both reduced repros — 5,534 stamp events, 94% of them `TypeRelative` — but the
+*pre*-fix count over that corpus was never taken, so this is not evidence that
+the step is dead. Gating it on the stamp (a `TypeRelative` qualifier cannot
+denote a global) is the root fix and is a behaviour change beyond the defect,
+so it is recorded here rather than taken.
+
 ---
 
 ## 9. Open questions
