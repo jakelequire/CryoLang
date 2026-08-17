@@ -1642,6 +1642,16 @@ type struct DeclarationEmitter {
             init = this.try_const_struct(
                 this.type_mapper, gty, init_expr as StructLiteralNode*, ty);
         }
+        // Array-literal const initializer, e.g. `const GAINS: f32[2] = [0.9,
+        // 1.0]`.  Without this an array-typed global has no branch at all and
+        // lands on the zeroinitializer below, so EVERY element reads 0 - a
+        // literal one included, which is what makes the failure look like a
+        // fold that went wrong rather than one that never ran.
+        if (!init.is_valid() && init_expr != null
+            && init_expr.kind == NodeKind::ArrayLiteral
+            && LType::kind_of(ty.raw) == LTypeKind::Array) {
+            init = this.try_const_array(init_expr as ArrayLiteralNode*, ty);
+        }
         if (!init.is_valid()) {
             init = LType::const_null(ty);
         }
@@ -2695,20 +2705,8 @@ type struct DeclarationEmitter {
             if (elem < 0 || elem as u32 >= n) { ok = false; break; }
             const fty_raw: void* = llvm::LLVMStructGetTypeAtIndex(ty.raw, elem as u32);
             const fty: LType = LType { raw: fty_raw };
-            const fk: LTypeKind = LType::kind_of(fty_raw);
             const fexpr: ExpressionNode* = sl.field_inits[i as i64].value;
-            mut slot: LValue = LValue::null();
-            if (fk == LTypeKind::Integer) {
-                mut iv: u64 = 0;
-                if (this.try_fold_const_int(fexpr, &iv)) {
-                    slot = LType::const_int(fty, iv, true);
-                }
-            } else if (fk == LTypeKind::Float || fk == LTypeKind::Double) {
-                mut fv: f64 = 0.0;
-                if (this.try_fold_const_real(fexpr, &fv)) {
-                    slot = LType::const_real(fty, fv);
-                }
-            }
+            const slot: LValue = this.const_element(fty, fexpr);
             if (!slot.is_valid()) { ok = false; break; }
             slots[elem] = slot.raw;
         }
@@ -2716,5 +2714,80 @@ type struct DeclarationEmitter {
         const v: LValue = LType::const_named_struct(ty, buf, n);
         intrinsics::free(buf);
         return v;
+    }
+
+    /// One constant element of an aggregate initializer, built at the
+    /// element's OWN llvm type.
+    ///
+    /// Shared by the struct and array builders because they ask the same
+    /// question at different positions; two copies of it would be free to
+    /// disagree about which expressions are constant, and the disagreement
+    /// would surface as a zeroed aggregate rather than as an error.
+    ///
+    /// A nested aggregate recurses, so `f32[2][2]` and an array inside a struct
+    /// are built rather than declined.  A struct element declines: building one
+    /// needs its layout to map field order onto element order, which is reached
+    /// from the declaration and not from the llvm type in hand here.
+    const_element(&this, ety: LType, expr: ExpressionNode*) -> LValue {
+        if (expr == null) { return LValue::null(); }
+        const k: LTypeKind = LType::kind_of(ety.raw);
+        if (k == LTypeKind::Integer) {
+            mut iv: u64 = 0;
+            if (this.try_fold_const_int(expr, &iv)) {
+                return LType::const_int(ety, iv, true);
+            }
+            return LValue::null();
+        }
+        if (k == LTypeKind::Float || k == LTypeKind::Double) {
+            mut fv: f64 = 0.0;
+            if (this.try_fold_const_real(expr, &fv)) {
+                return LType::const_real(ety, fv);
+            }
+            return LValue::null();
+        }
+        if (k == LTypeKind::Array && expr.kind == NodeKind::ArrayLiteral) {
+            return this.try_const_array(expr as ArrayLiteralNode*, ety);
+        }
+        return LValue::null();
+    }
+
+    /// Build a constant array from an array-literal initializer, or decline.
+    ///
+    /// The LLVM type is the authority on the LENGTH, never the literal: the
+    /// annotation's size was folded when the type was built, so a repeat form
+    /// (`[v; N]`) fills exactly that many slots without re-folding `N` here -
+    /// one question, answered where it was already answered.  A list whose
+    /// length disagrees with the type is not a constant this position can
+    /// build, and a partial one would define the remainder as zero, which is
+    /// the failure this whole branch exists to remove.
+    try_const_array(&this, al: ArrayLiteralNode*, ty: LType) -> LValue {
+        if (al == null) { return LValue::null(); }
+        const n: u32 = llvm::LLVMGetArrayLength(ty.raw);
+        if (n == 0) { return LValue::null(); }
+        const ety: LType = LType { raw: llvm::LLVMGetElementType(ty.raw) };
+
+        // `[v; N]` carries one element and a count; `[a, b]` carries its
+        // elements and no count.
+        const is_repeat: boolean =
+            al.repeat_count_expr != null || al.repeat_count > 0;
+        if (is_repeat) {
+            if (al.elements.length != 1) { return LValue::null(); }
+        } else if (al.elements.length != n as i64) {
+            return LValue::null();
+        }
+
+        const buf: void* = intrinsics::malloc((n as u64) * 8);
+        const slots: void** = buf as void**;
+        mut ok: boolean = true;
+        for (mut i: u32 = 0; i < n; i++) {
+            const idx: i64 = if (is_repeat) { 0 } else { i as i64 };
+            const v: LValue = this.const_element(ety, al.elements[idx]);
+            if (!v.is_valid()) { ok = false; break; }
+            slots[i as i64] = v.raw;
+        }
+        if (!ok) { intrinsics::free(buf); return LValue::null(); }
+        const out: LValue = LType::const_array(ety, buf, n);
+        intrinsics::free(buf);
+        return out;
     }
 }
