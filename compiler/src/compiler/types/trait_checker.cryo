@@ -54,6 +54,15 @@ type struct TraitChecker {
     /// past a handful of levels) and a depleted depth conservatively
     /// returns false so an unsatisfiable bound never accidentally enables
     /// body specialization.
+    /// `trait_name` is the trait's IDENTITY (`TraitRef::identity()`, a
+    /// stamped annotation, or `GenericRegistry::wellknown`), never a written
+    /// leaf: the marker comparisons below are identity comparisons, and a leaf
+    /// would match a user trait that merely shares the spelling.
+    ///
+    /// The trait-IMPL tables are a different key space - `(trait-leaf, target)`
+    /// dispatch indices where the target disambiguates - so this truncates to
+    /// the leaf for those, via `dispatch_leaf`. Two questions, two registries,
+    /// one answering path each.
     type_implements_trait(&this, ty: TypeRef, trait_name: SymbolStr, depth: i32) -> boolean {
         if (depth >= 16) {
             // Depth budget exhausted on a deep or cyclic impl/where-clause
@@ -79,7 +88,7 @@ type struct TraitChecker {
         // registry. The marker trait declared in core/marker.cryo
         // intentionally has no impl blocks; the compiler is the single
         // source of truth for "is this type bitwise-duplicable".
-        const copy_name: SymbolStr = this.intern_table.intern("Copy");
+        const copy_name: SymbolStr = this.generic_registry.wellknown(this.intern_table.intern("Copy"));
         if (copy_name.is_valid() && trait_name.equals(copy_name)) {
             return OwnershipQuery::is_copy(this.arena, this.generic_registry,
                                             this.intern_table, ty);
@@ -89,12 +98,12 @@ type struct TraitChecker {
         // as `Copy`: the compiler decides via a type walk, not via
         // `implement trait Send for T { ... }` lookups.  See
         // OwnershipQuery::is_send / is_sync for the rules.
-        const send_name: SymbolStr = this.intern_table.intern("Send");
+        const send_name: SymbolStr = this.generic_registry.wellknown(this.intern_table.intern("Send"));
         if (send_name.is_valid() && trait_name.equals(send_name)) {
             return OwnershipQuery::is_send(this.arena, this.generic_registry,
                                             this.intern_table, ty);
         }
-        const sync_name: SymbolStr = this.intern_table.intern("Sync");
+        const sync_name: SymbolStr = this.generic_registry.wellknown(this.intern_table.intern("Sync"));
         if (sync_name.is_valid() && trait_name.equals(sync_name)) {
             return OwnershipQuery::is_sync(this.arena, this.generic_registry,
                                             this.intern_table, ty);
@@ -106,7 +115,7 @@ type struct TraitChecker {
         // stdlib/core/drop.cryo, while pointers to user types still require
         // the pointee to `implement trait Drop`. Avoids needing a parser
         // extension to support pointer impl targets like `for u8*`.
-        const drop_name: SymbolStr = this.intern_table.intern("Drop");
+        const drop_name: SymbolStr = this.generic_registry.wellknown(this.intern_table.intern("Drop"));
         if (drop_name.is_valid() && trait_name.equals(drop_name)) {
             // Pointers/references are non-owning aliases.  Delegate
             // `T*: Drop` to `T: Drop` so primitive pointers auto-pass while
@@ -155,7 +164,8 @@ type struct TraitChecker {
         // subject isn't a precisely-registered named aggregate).
         const impl_block: ImplBlockNode* =
             OwnershipQuery::resolve_trait_impl_for_type(this.arena,
-                this.generic_registry, this.intern_table, trait_name, subject);
+                this.generic_registry, this.intern_table,
+                this.dispatch_leaf(trait_name), subject);
         if (impl_block == null) {
             // No `implement trait Drop` for this type - but a non-Copy
             // type whose destructor is written as an inherent `drop`
@@ -219,6 +229,13 @@ type struct TraitChecker {
         return this.bounds_satisfied_at_depth(impl_block.where_bounds, &nested, depth + 1);
     }
 
+    /// The leaf the trait-IMPL dispatch tables are keyed by. NOT an identity:
+    /// it answers only in combination with the target type, which is what
+    /// those tables pair it with.
+    dispatch_leaf(&this, trait_name: SymbolStr) -> SymbolStr {
+        return OwnershipQuery::leaf_segment(this.intern_table, trait_name);
+    }
+
     /// Lenient "does `ty` implement `trait_name`" check for verifying an
     /// `implement Trait` binding annotation against its initializer.
     ///
@@ -241,7 +258,8 @@ type struct TraitChecker {
         const target_name: SymbolStr = this.bare_name_of(subject);
         if (!target_name.is_valid()) { return false; }
         return OwnershipQuery::resolve_trait_impl_for_type(this.arena,
-            this.generic_registry, this.intern_table, trait_name, subject) != null;
+            this.generic_registry, this.intern_table,
+            this.dispatch_leaf(trait_name), subject) != null;
     }
 
     /// When sema's call-site method lookup misses on a spec'd type, we want
@@ -284,8 +302,11 @@ type struct TraitChecker {
                 }
             }
             if (!has_method) { continue; }
-            // Method exists; check whether bounds hold for this receiver.
-            if (!this.type_implements_trait(probe_ref, trait_name, 0)) {
+            // `trait_name` came from the impl-dispatch table, so it is a leaf.
+            // The impl head carries the identity the bound check needs.
+            const trait_id: SymbolStr =
+                TypeAnnotation::trait_identity(impl_block.trait_annotation);
+            if (!this.type_implements_trait(probe_ref, trait_id, 0)) {
                 return trait_name;
             }
         }
@@ -322,8 +343,7 @@ type struct TraitChecker {
             for (mut ri: i64 = 0; ri < bound.trait_refs.length; ri++) {
                 const tref: TraitRef* = &bound.trait_refs[ri];
                 if (tref.path.length == 0) { continue; }
-                const trait_name: SymbolStr = tref.path[tref.path.length - 1];
-                if (!this.type_implements_trait(concrete, trait_name, 0)) {
+                if (!this.type_implements_trait(concrete, tref.identity(), 0)) {
                     return false;
                 }
             }
@@ -349,8 +369,7 @@ type struct TraitChecker {
             for (mut ri: i64 = 0; ri < bound.trait_refs.length; ri++) {
                 const tref: TraitRef* = &bound.trait_refs[ri];
                 if (tref.path.length == 0) { continue; }
-                const trait_name: SymbolStr = tref.path[tref.path.length - 1];
-                if (!this.type_implements_trait(concrete, trait_name, depth)) {
+                if (!this.type_implements_trait(concrete, tref.identity(), depth)) {
                     return false;
                 }
             }

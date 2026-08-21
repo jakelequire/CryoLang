@@ -277,6 +277,11 @@ type struct GenericRegistry {
     // (generic or not); non-generic traits aren't in `entries`.
     trait_decl_index:   HashMap<u32, i64>;
     trait_decl_nodes:   TraitDeclNode*[];
+    // The identity each node was registered under, positionally aligned with
+    // `trait_decl_nodes`. A node's own `name` is its written leaf, so a scan
+    // that finds a node by walking cannot hand its caller a key this table
+    // accepts without it.
+    trait_decl_keys:    SymbolStr[];
 
     // -- Inherent-owner registry --
     // Maps a qualified type name (SymbolStr.id) to the StructDeclNode* /
@@ -306,6 +311,22 @@ type struct GenericRegistry {
     // scan runs a single time even though `process_all` is invoked per module.
     disambig_finalized: boolean;
 
+    // -- Well-known trait identities --
+    // The language names a fixed set of traits itself: the `Copy`/`Send`/`Sync`
+    // markers, `Drop`, `Future`, and the operator traits behind `+`, `==`,
+    // `[]`, `*` and friends.  A check for one of them asks about a specific
+    // DECLARATION, not about a spelling, so this maps the leaf the compiler
+    // spells to the qualified identity of the declaration that claimed it.
+    //
+    // Only a declaration whose qualified name is on the canonical list can
+    // claim an entry, so a user trait sharing a leaf never lands here and
+    // therefore cannot answer a question the language asks of its own trait.
+    //
+    // An absent entry means that declaration is not in this program's module
+    // graph.  It is NOT "no type satisfies this": answering "no" off an absent
+    // entry reclassifies every type at once, so callers distinguish the two.
+    wellknown_index: HashMap<u32, u32>;
+
 
     static new(arena: TypeArena*) -> GenericRegistry {
         return GenericRegistry {
@@ -329,11 +350,13 @@ type struct GenericRegistry {
             coherence_index:   HashMap<u64, i64>::new(),
             trait_decl_index:  HashMap<u32, i64>::new(),
             trait_decl_nodes:  [],
+            trait_decl_keys:   [],
             inherent_owner_index: HashMap<u32, i64>::new(),
             inherent_owner_nodes: [],
             inherent_impl_keys:   [],
             inherent_impl_nodes:  [],
             disambig_finalized:   false,
+            wellknown_index: HashMap<u32, u32>::new(),
         };
     }
 
@@ -691,9 +714,14 @@ type struct GenericRegistry {
         return result;
     }
 
-    /// Register a trait declaration's AST so default-method synthesis can
-    /// find it cross-module when an impl block names the trait. Idempotent:
-    /// later calls with the same bare name overwrite earlier ones.
+    /// Register a trait declaration's AST under its canonical identity, so
+    /// default-method synthesis can find it cross-module when an impl block
+    /// names the trait.
+    ///
+    /// `name` is the qualified identity, NOT the written leaf. Keyed by leaf
+    /// this table was last-write-wins over a search key, so two same-leaf
+    /// traits in different modules collapsed to one entry and which body a
+    /// program got depended on import order in an unrelated file.
     register_trait_decl(mut &this, name: SymbolStr, node: TraitDeclNode*) -> void {
         if (node == null || !name.is_valid()) { return; }
         const existing: Option<i64> = this.trait_decl_index.get(&name.id);
@@ -703,12 +731,16 @@ type struct GenericRegistry {
         }
         const idx: i64 = this.trait_decl_nodes.length;
         this.trait_decl_nodes.push(node);
+        this.trait_decl_keys.push(name);
         this.trait_decl_index.insert(name.id, idx);
     }
 
-    /// Look up a trait declaration's AST by bare name. Returns null when the
-    /// trait wasn't registered, most commonly because it's in a module
-    /// that hasn't been processed yet.
+    /// Look up a trait declaration's AST by its canonical identity. Returns
+    /// null when no such trait was registered.
+    ///
+    /// `name` must be the qualified identity a resolver stamped, never a
+    /// written leaf: the table is keyed that way precisely so two same-leaf
+    /// traits in different modules stay distinct. Passing a leaf misses.
     ///
     /// `site` names the consumer and exists for the audit stream alone: a leaf
     /// and an identity share one type, so a consumer asking with the wrong one
@@ -730,8 +762,78 @@ type struct GenericRegistry {
         return null;
     }
 
+    /// Report a lookup key that carries no module qualifier.
+    ///
+    /// A leaf and an identity are both `SymbolStr`, so a consumer that was
+    /// never converted type-checks and then silently misses. This makes that
+    /// consumer loud instead: after the re-key every key should be qualified,
+    /// so any hit here names a caller still passing a spelling.
+    static audit_registry_key(kind: string, name: SymbolStr,
+                              table: InternTable*) -> void {
+        if (table == null) { return; }
+        if (!ResolveCounter::Audit::Path.enabled()) { return; }
+        const s: string = table.resolve(name);
+        mut qualified: boolean = false;
+        const n: i64 = s.length() as i64;
+        for (mut i: i64 = 0; i + 1 < n; i++) {
+            if (s[i] == ':' && s[i + 1] == ':') { qualified = true; }
+        }
+        if (qualified) { return; }
+        ResolveCounter::path_hit(kind, "unqualified-key", s, "");
+    }
+
+    /// Record `qname` when it names a declaration the language itself relies
+    /// on. Called once per trait declaration, at the registration site, where
+    /// the name has already been import-resolved.
+    ///
+    /// The canonical spellings appear in `is_wellknown_trait_path` and nowhere
+    /// else. Every consumer asks by the leaf IT spells and gets back the
+    /// identity recorded here, so no consumer needs to know the path - which
+    /// is what stops a user trait from answering by being spelled the same.
+    claim_wellknown_trait(mut &this, qname: SymbolStr, table: InternTable*) -> void {
+        if (!qname.is_valid() || table == null) { return; }
+        const s: string = table.resolve(qname);
+        if (!GenericRegistry::is_wellknown_trait_path(s)) { return; }
+        const n: i64 = s.length() as i64;
+        mut leaf_start: i64 = 0;
+        for (mut i: i64 = 0; i + 1 < n; i++) {
+            if (s[i] == ':' && s[i + 1] == ':') { leaf_start = i + 2; }
+        }
+        const leaf: SymbolStr = table.intern(s.substr(leaf_start, n - leaf_start));
+        if (!leaf.is_valid()) { return; }
+        this.wellknown_index.insert(leaf.id, qname.id);
+    }
+
+    /// The identity of the well-known trait the compiler spells `leaf`, or an
+    /// empty SymbolStr when no such declaration is in this program's module
+    /// graph. Absence is not a "no" - see the field comment.
+    wellknown(&this, leaf: SymbolStr) -> SymbolStr {
+        if (!leaf.is_valid()) { return SymbolStr::empty(); }
+        const o: Option<u32> = this.wellknown_index.get(&leaf.id);
+        if (o.is_none()) { return SymbolStr::empty(); }
+        return SymbolStr::from_id(o.unwrap());
+    }
+
+    /// The qualified names of the declarations the language reasons about by
+    /// identity rather than by dispatch: the structural markers and `Future`.
+    ///
+    /// The operator traits are deliberately ABSENT. They are looked up in the
+    /// trait-IMPL tables, which are `(trait-leaf, target)` dispatch indices
+    /// where the target does the disambiguating - so they ask by leaf, and
+    /// giving them an identity would make every operator lookup miss.
+    ///
+    /// This is the one place the compiler knows how a stdlib trait is spelled.
+    static is_wellknown_trait_path(s: string) -> boolean {
+        if (s == "std::core::marker::Copy")     { return true; }
+        if (s == "std::core::marker::Send")     { return true; }
+        if (s == "std::core::marker::Sync")     { return true; }
+        if (s == "std::core::drop::Drop")       { return true; }
+        if (s == "std::future::traits::Future") { return true; }
+        return false;
+    }
+
     /// Walk all registered trait decls looking for one that defines a
-    /// method named `method_name`. Returns the trait's bare name, or
+    /// method named `method_name`. Returns the trait's IDENTITY, or
     /// `SymbolStr::empty()` when no trait declares the method. Used by
     /// sema to render an actionable hint on "no method found" errors:
     /// `note: method 'X' is defined on trait 'Y'`. Linear scan, fine
@@ -744,7 +846,9 @@ type struct GenericRegistry {
             for (mut mi: i64 = 0; mi < td.methods.length; mi++) {
                 const m: FunctionDeclNode* = td.methods[mi];
                 if (m != null && m.name.equals(method_name)) {
-                    return td.name;
+                    // The registration key, not `td.name`: the node's own name
+                    // is the written leaf, which this table no longer accepts.
+                    return this.trait_decl_keys[i];
                 }
             }
         }

@@ -482,7 +482,8 @@ type struct MethodBinding {
         if (this.ctx.generic_registry == null) { return ret; }
         if (this.ctx.type_resolver == null)    { return ret; }
         const tdecl: TraitDeclNode* = this.ctx.generic_registry.get_trait_decl(
-            trait_leaf, "subst_bound_assoc_args", this.intern);
+            tr.identity(), "subst_bound_assoc_args",
+            this.intern);
         if (tdecl == null || tdecl.assoc_types.length == 0) { return ret; }
         mut rc: ResolutionContext = ResolutionContext::new(FILE, LINE, this.ctx.source_file, "", "", HomeOrigin::Unset);
         this.symbolic.symbolic_bind_params(&rc);
@@ -644,8 +645,16 @@ type struct MethodBinding {
         if (!base_name.is_valid()) { return false; }
         const traits: SymbolStr[] = this.ctx.generic_registry.traits_implemented_by(base_name);
         for (mut ti: i64 = 0; ti < traits.length; ti++) {
+            // `traits[ti]` is a dispatch leaf, which the decl registry does not
+            // accept. The impl head carries the identity that does - read, not
+            // searched for. Looked up in the SAME table `traits_implemented_by`
+            // scanned, so the pair cannot disagree about what is registered.
+            const dimpl: ImplBlockNode* =
+                this.ctx.generic_registry.lookup_trait_impl(traits[ti], base_name);
+            if (dimpl == null) { continue; }
             const tdecl: TraitDeclNode* = this.ctx.generic_registry.get_trait_decl(
-                traits[ti], "projection_default_unavailable", this.intern);
+                TypeAnnotation::trait_identity(dimpl.trait_annotation),
+                "projection_default_unavailable", this.intern);
             if (tdecl == null) { continue; }
             // The trait's default-bodied method of this name, if projection-bounded.
             mut mfunc: FunctionDeclNode* = null;
@@ -654,10 +663,7 @@ type struct MethodBinding {
                 if (f != null && f.name.equals(method_name) && f.has_body()) { mfunc = f; break; }
             }
             if (mfunc == null) { continue; }
-            const impl_node: ImplBlockNode* = OwnershipQuery::resolve_trait_impl_for_type(
-                this.arena, this.ctx.generic_registry, this.intern, traits[ti], recv_type);
-            if (impl_node == null) { continue; }
-            if (this.projection_bound_fails(mfunc, impl_node, tdecl)) { return true; }
+            if (this.projection_bound_fails(mfunc, dimpl, tdecl)) { return true; }
         }
         return false;
     }
@@ -1012,8 +1018,14 @@ type struct MethodBinding {
         if (!bare.is_valid()) { return null; }
         const traits: SymbolStr[] = this.ctx.generic_registry.traits_implemented_by(bare);
         for (mut i: i64 = 0; i < traits.length; i++) {
+            // Same table `traits_implemented_by` scanned, so the leaf that
+            // came out of it is guaranteed to key back into it.
+            const gimpl: ImplBlockNode* =
+                this.ctx.generic_registry.lookup_trait_impl(traits[i], bare);
+            if (gimpl == null) { continue; }
             const td: TraitDeclNode* = this.ctx.generic_registry.get_trait_decl(
-                traits[i], "find_generic_trait_default", this.intern);
+                TypeAnnotation::trait_identity(gimpl.trait_annotation),
+                "find_generic_trait_default", this.intern);
             if (td == null) { continue; }
             for (mut k: i64 = 0; k < td.methods.length; k++) {
                 const f: FunctionDeclNode* = td.methods[k];
@@ -1100,7 +1112,7 @@ type struct MethodBinding {
                 for (mut ti: i64 = 0; ti < bound.trait_refs.length; ti++) {
                     const tr: TraitRef* = &bound.trait_refs[ti];
                     if (tr.path.length == 0) { continue; }
-                    bound_leaves.push(tr.path[tr.path.length - 1]);
+                    bound_leaves.push(tr.identity());
                 }
             }
         }
@@ -1111,7 +1123,7 @@ type struct MethodBinding {
                 for (mut ti: i64 = 0; ti < wb.trait_refs.length; ti++) {
                     const tr: TraitRef* = &wb.trait_refs[ti];
                     if (tr.path.length == 0) { continue; }
-                    bound_leaves.push(tr.path[tr.path.length - 1]);
+                    bound_leaves.push(tr.identity());
                 }
             }
         }
@@ -1119,14 +1131,14 @@ type struct MethodBinding {
             const onode: GenericParamNode* = this.state.symbolic_owner_param_nodes[oi];
             if (onode == null || !onode.name.equals(pname)) { continue; }
             for (mut ci: i64 = 0; ci < onode.constraints.length; ci++) {
-                bound_leaves.push(onode.constraints[ci]);
+                bound_leaves.push(onode.constraints[ci].identity());
             }
         }
         for (mut mi: i64 = 0; mi < this.state.symbolic_method_param_nodes.length; mi++) {
             const mnode: GenericParamNode* = this.state.symbolic_method_param_nodes[mi];
             if (mnode == null || !mnode.name.equals(pname)) { continue; }
             for (mut ci: i64 = 0; ci < mnode.constraints.length; ci++) {
-                bound_leaves.push(mnode.constraints[ci]);
+                bound_leaves.push(mnode.constraints[ci].identity());
             }
         }
 
