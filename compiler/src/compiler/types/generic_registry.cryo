@@ -26,6 +26,7 @@ import Compiler::Resolver::SymbolStr;
 import std::core::option;
 import std::collections::{ pair, hashmap };
 import Compiler::Resolver::InternTable;
+import Compiler::ResolveCounter;
 
 
 // TemplateEntry: Metadata for a single generic declaration
@@ -708,9 +709,21 @@ type struct GenericRegistry {
     /// Look up a trait declaration's AST by bare name. Returns null when the
     /// trait wasn't registered, most commonly because it's in a module
     /// that hasn't been processed yet.
-    get_trait_decl(&this, name: SymbolStr) -> TraitDeclNode* {
+    ///
+    /// `site` names the consumer and exists for the audit stream alone: a leaf
+    /// and an identity share one type, so a consumer asking with the wrong one
+    /// misses silently and no static scan can distinguish them.  It is a
+    /// parameter rather than a derived value because that makes the compiler
+    /// enumerate every consumer whenever this signature moves.
+    get_trait_decl(&this, name: SymbolStr, site: string,
+                   table: InternTable*) -> TraitDeclNode* {
         if (!name.is_valid()) { return null; }
         const opt: Option<i64> = this.trait_decl_index.get(&name.id);
+        if (table != null && ResolveCounter::Audit::Trait.enabled()) {
+            mut outcome: string = "MISS";
+            if (opt.is_some()) { outcome = "HIT"; }
+            ResolveCounter::trait_decl_lookup(site, table.resolve(name), outcome);
+        }
         if (opt.is_some()) {
             return this.trait_decl_nodes[opt.unwrap()];
         }
