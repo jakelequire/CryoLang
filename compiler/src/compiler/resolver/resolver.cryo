@@ -557,46 +557,60 @@ type struct Resolver {
         // (it may already be the canonical form), then fall back to extracting
         // the leaf and resolving that.
         if (this.contains_separator(name_str)) {
-            // Try the full qualified name directly; caller may already have
-            // the canonical form (e.g., from a previous resolution).
-            // No scope walk needed for this; just return it for DeclarationIndex
-            // or arena lookup by the caller.
-            // If the caller's lookup fails, it will try bare-name fallback.
-
-            // Extract the leaf (last segment) and resolve it. The scope chain is
-            // keyed by leaf alone, so this can land on a same-named type from an
-            // entirely different module — `executor::JoinHandle` reaching
-            // `thread::JoinHandle` in a program that imports both. Accept the
-            // result only when its declaring module agrees with the qualifier
-            // the source wrote. A contradicted answer is refused and the name
-            // goes back unchanged rather than being bound: binding it would make
-            // the winner whichever module registered the leaf last, which is not
-            // a property the source mentions.
-            const leaf_sym: SymbolStr = this.extract_leaf(name_str);
-            mut leaf_answered: boolean = false;
-            if (leaf_sym.is_valid()) {
-                const resolved: SymbolStr =
-                    this.resolve_type_qualified_name_bare_from(start, leaf_sym);
-                if (resolved.is_valid()) {
-                    leaf_answered = true;
-                    if (this.qualifier_agrees(resolved, name_str)) {
-                        ResolveCounter::path_hit(
-                            "M1-AGREE", this.intern_table.resolve(this.current_module),
-                            name_str, this.intern_table.resolve(resolved));
-                        return resolved;
-                    }
-                }
-            }
-            // Separates the two ways the check produces no answer: it said no,
-            // or it was never asked because nothing resolved. `qualifier_agrees`
-            // hits alone cannot tell those apart, and they call for opposite
-            // fixes.
-            if (!leaf_answered) { ResolveCounter::Site::M1LeafMiss.bump(); }
-            // Return the input as-is; it may be the canonical form already
+            const answered: SymbolStr =
+                this.resolve_type_qualified_name_strict_from(start, name_str);
+            if (answered.is_valid()) { return answered; }
+            // Return the input as-is; it may be the canonical form already.
+            // A caller that has to RECORD the answer cannot read this value -
+            // the refusal and the canonical form are the same string - and asks
+            // the strict overload instead.
             return name;
         }
 
         return this.resolve_type_qualified_name_bare_from(start, name);
+    }
+
+    /// What a QUALIFIED type path names, or empty when nothing answers it.
+    ///
+    /// The same walk `resolve_type_qualified_name_from` performs, differing
+    /// only in how it reports a refusal.  That one hands the written name back,
+    /// because its callers pass the result straight into an arena lookup that
+    /// may already hold the canonical form; a caller that must record the
+    /// answer on a node cannot tell that convention's refusal from its success.
+    /// Both go through this one walk so the two views cannot come to disagree
+    /// about what a path names.
+    ///
+    /// The scope chain is keyed by leaf alone, so resolving the leaf can land
+    /// on a same-named type from an entirely different module -
+    /// `executor::JoinHandle` reaching `thread::JoinHandle` in a program that
+    /// imports both.  The result is accepted only when its declaring module
+    /// agrees with the qualifier the source wrote; binding a contradicted
+    /// answer would make the winner whichever module registered the leaf last,
+    /// which is not a property the source mentions.
+    resolve_type_qualified_name_strict_from(&this, start: ScopeID,
+                                            name_str: string) -> SymbolStr {
+        const leaf_sym: SymbolStr = this.extract_leaf(name_str);
+        if (!leaf_sym.is_valid()) {
+            ResolveCounter::Site::M1LeafMiss.bump();
+            return SymbolStr::empty();
+        }
+        const resolved: SymbolStr =
+            this.resolve_type_qualified_name_bare_from(start, leaf_sym);
+        // Separates the two ways this produces no answer: the qualifier check
+        // said no, or it was never asked because nothing resolved.  Those call
+        // for opposite fixes and the agreement counter alone cannot tell them
+        // apart.
+        if (!resolved.is_valid()) {
+            ResolveCounter::Site::M1LeafMiss.bump();
+            return SymbolStr::empty();
+        }
+        if (!this.qualifier_agrees(resolved, name_str)) {
+            return SymbolStr::empty();
+        }
+        ResolveCounter::path_hit(
+            "M1-AGREE", this.intern_table.resolve(this.current_module),
+            name_str, this.intern_table.resolve(resolved));
+        return resolved;
     }
 
     /// True when the module `resolved` was declared in is consistent with the

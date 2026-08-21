@@ -5549,6 +5549,167 @@ the step is dead. Gating it on the stamp (a `TypeRelative` qualifier cannot
 denote a global) is the root fix and is a behaviour change beyond the defect,
 so it is recorded here rather than taken.
 
+### 8.11 A qualified annotation went unstamped because the lookup could not say no — FIXED 2026-08-21
+
+Handed off as one site: a five-segment trait path in an impl head
+(`tests/tests/lang/leaf_dispatch_mod_b.cryo:23`), blocked on a module lane that
+does not exist, with `ANN-QUALIFIED` reported as firing **exactly once**.
+
+**That measurement was taken over the wrong population.** With
+`CRYO_PATH_AUDIT=1` over the test corpus the stream carries **33 events across
+14 distinct written names and 6 distinct head modules**, and the bulk are
+ordinary two-segment annotations — `thread::JoinHandle` (6), `syscall::` types
+(10), `mpsc::Sender`, `hashmap::Entry`. The impl head was **1 of 33**. The
+earlier count was read with only `CRYO_TRAIT_AUDIT` set, so it measured a
+stream that was switched off.
+
+**The cause is not a missing lane.** `resolve_type_qualified_name_from` returns
+its input **unchanged** when it fails, so a canonical answer and a refusal are
+the same string. Its callers pass the result straight into an arena lookup, for
+which that convention is fine; a caller that must *record* the answer on a node
+cannot distinguish the two and so cannot stamp anything. `stamp_named_annotation`
+declined every module-qualified path for exactly this reason, and its comment
+saying so was correct.
+
+**The fix** splits the walk rather than adding a second one.
+`resolve_type_qualified_name_strict_from` returns an invalid `SymbolStr` on
+refusal; `resolve_type_qualified_name_from` becomes a thin wrapper that echoes
+the input, preserving the contract the arena callers depend on. One walk, two
+views — the two cannot come to disagree about what a path names. The annotation
+lane calls the strict form from the annotation's **own** module scope, since a
+qualified spelling means what the writing file's imports say it means.
+
+| measurement | before | after |
+|---|---:|---:|
+| `E0900` at `TypeAnnotation::trait_identity` | 46 | **0** |
+| `ANN-QUALIFIED`, test corpus | 33 | **5** |
+| `M1-AGREE` | 45,266 | 51,148 |
+| `M1-REJECT` | 4 | 9 |
+| B1 total | 162 | **162 (+0)** |
+| `qualifier_agrees` calls / agreed | 5,548 | 5,572 (**both hosts, identical +24**) |
+
+`make test` 2106/178/38 (unchanged from baseline), `selfhost-check`
+`FIXED POINT OK` ×2, b1/lane/roster/api-index green, 14 examples, four golden
+outputs.
+
+**The `E0900` zero is not evidence that everything stamps.** Five annotations
+remain unstamped; they are simply never *required* at `trait_identity`. The
+required population was a subset of what the fix covered, which is why one count
+went to zero while the other did not.
+
+**What is still open, and it is the substantive part.** The five survivors are
+refusals, not misses — `M1-REJECT` rose by exactly five. `leaf_dispatch.cryo`
+writes `...LeafDispatchB::Cell` while the leaf `Cell` resolves in the writing
+scope to `LeafDispatchA::Cell`; `future_executor.cryo` writes
+`thread::JoinHandle` while the leaf resolves to
+`std::future::executor::JoinHandle`, which is verbatim the collision
+`resolve_type_qualified_name_from`'s own doc comment cites. The walk resolves
+the **leaf in the writer's scope and only validates the written qualifier**, so
+it can never honour a qualifier that *selects* a different module's same-leaf
+type — which is precisely what `leaf_dispatch.cryo`'s header requires ("a
+fully-qualified reference must NOT resolve through the bare leaf name").
+Refusing beats binding the wrong `Cell`, and those tests pass because the type
+layer answers them by another lane; the annotations are merely not recorded.
+
+**A divergence between §5.1 and the implementation, exposed while fixing this.**
+`import std::thread;` binds **no symbol named `thread`** — a wildcard import
+declares the module's exports directly as `Import`-kind symbols, and only
+`import X as Y` binds an alias. `SymbolKind::Namespace` exists solely for
+C-import extern blocks, which is what `syscall` is. So `thread::JoinHandle`
+cannot be resolved by §5.1's segment walk at all: its first segment resolves in
+scope nowhere. §5.1 describes a rooted walk the compiler does not perform for
+these paths, and a "module lane" built to §5.1's shape would answer none of
+them. Closing the five requires the qualifier to select the module
+(`ns_written_as` to find it, then `lookup_in_module`), which changes how the
+51k-call M1 path answers wherever leaf-in-scope and the written qualifier
+disagree, and raises an ambiguity case — two modules matching one written prefix
+— that "module wins in qualifier position" does not settle. Recorded here rather
+than taken.
+
+**One inconsistency left in place deliberately.** The head lookup that produces
+`TypeRelative` still resolves against the ambient cursor, while the new lane
+below it uses the annotation's home scope. Repointing the head lookup is the
+§5.2 answer, but it changes which type a bare head binds to in existing
+programs, so it is not folded into this fix.
+
+### 8.12 The rooted walk already existed, one lane over — FIXED 2026-08-21
+
+§8.11 left five qualified annotations refused rather than bound: the walk that
+ships resolves the LEAF in the writer's scope and only *validates* the written
+qualifier, so it cannot honour a qualifier that SELECTS a different module's
+same-leaf type. Closing them was scoped as new work — find the module by
+spelling, then resolve inside it — with two questions recorded as unsettled:
+what to do when the writer cannot reach the module, and when two modules share
+the spelling.
+
+**Both were already built, and so was the walk.** `walk_module_rooted_type`
+resolves `prefix::leaf` by finding the module the prefix spells and looking the
+leaf up in its EXPORT set; `modules_written_as` returns how many modules carry
+the spelling (`matched`) and how many of those the writer can reach
+(`visible`), refusing an ambiguous spelling and reporting an unreachable one as
+E0240 with the import that would fix it. The `ScopeResolutionNode` lane has used
+this since §8.2m. The annotation lane simply never called it.
+
+**The fix routes the annotation lane through it**, and decides ownership by
+what the head names rather than by which lane answers first: when any module
+carries the written prefix the module lane owns the path and either answers or
+refuses. It is deliberately not handed on to the leaf reading afterwards — that
+reading resolves in the writer's scope and would answer straight past a module
+that is unreachable or ambiguous, recording a name the source may not legally
+spell as though it were fine.
+
+| measurement | before | after |
+|---|---:|---:|
+| `ANN-QUALIFIED`, test corpus | 5 | **0** |
+| qualified annotations answered by the rooted lane | 0 | **33 of 33** |
+
+Emitted with the definition each landed on, because the point of rooting a path
+is *which* of two same-leaf types it names and a tally cannot show that the
+qualifier selected rather than the leaf:
+
+```
+CryoTests::...::LeafDispatchB::Cell -> CryoTests::...::LeafDispatchB::Cell
+CryoTests::...::LeafDispatchA::Cell -> CryoTests::...::LeafDispatchA::Cell
+thread::JoinHandle                  -> std::thread::JoinHandle
+```
+
+The third is written in a file whose own module declares `executor::JoinHandle`;
+it was refused before. `make test` 2106/178/38 unchanged, `selfhost-check`
+`FIXED POINT OK` ×2, b1/lane/roster/api-index green, 14 examples, four goldens,
+LSP builds.
+
+**A measurement taken and discarded, recorded because it was wrong in a way
+that would recur.** Before finding the existing lane, a rooted reading was built
+in the resolver and run as a divergence probe against the shipping one over
+three populations: 161,893 agreements, 15,892 cases the rooted reading answered
+and the shipping one did not, and **zero** where it lost an answer or bound a
+different definition. That looked like licence to replace the shipping walk
+outright. It was not: the probe resolved a module by spelling **without asking
+whether the writer could reach it**, so its "would answer" rows counted paths a
+correct walk refuses with E0240. The probe was deleted rather than kept.
+
+Its controls survive as the useful part. Agreement is forced whenever only one
+module declares the leaf, so of those 161,893 agreements only **3,323** were
+plural-leaf rows and therefore evidence at all — and the 14 examples contributed
+**zero** of them, every agreement there being a forced singleton match. A
+corpus can produce six figures of agreement and no evidence.
+
+**B1 did not move, and the prediction that it would was wrong.** The rooted lane
+fires **0** times over `examples/09-json-config`, so `qualifier_agrees` stays at
+5,572 and the golden is untouched. That also settles that the leaf reading is
+still live and is not dead code to be deleted. What the instrumentation cannot
+say is whether the qualified branch is reached there at all or is reached and
+answered silently by the leaf reading; both emit nothing.
+
+**Still open.** The recorded decision is that a module wins in qualifier
+position. Both lanes do the opposite: a head that binds in the writer's scope as
+a type is answered as `TypeRelative` before module spellings are consulted, and
+the scope lane states outright that the module spellings "never applied to it".
+The disagreement is currently unreachable — declaring a namespace and a type
+with the same name is E0200 today — so no program observes it, and the
+precedence has been left as the code has it rather than changed to match the
+decision.
+
 ---
 
 ## 9. Open questions
