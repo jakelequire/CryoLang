@@ -1111,11 +1111,6 @@ public:
             }
         }
 
-        // A qualified spelling needs a lookup that can say "no". The one that
-        // exists hands the input back unchanged when it fails, so a canonical
-        // answer and a refusal are the same value; counted here and left
-        // unstamped rather than recorded on a reading the function cannot
-        // support.
         // A path's meaning turns on its first segment: that one resolves in
         // scope, and every later segment resolves inside whatever it named.  So
         // the question here is not "does this whole string name something" but
@@ -1149,11 +1144,71 @@ public:
                     return;
                 }
             }
-            // The first segment names neither a type nor a generic parameter,
-            // so this is a module path and belongs to the module lane - which
-            // has no entry point here that can refuse.  Left unstamped and
-            // named, because recording an answer this pass cannot produce is
-            // how a tool limitation becomes a claim.
+            // The head names neither a type nor a generic parameter, so the
+            // whole path names ONE definition - no receiver type is left for a
+            // later stage to supply, which is what separates this from the
+            // `TypeRelative` answer above.
+            //
+            // Which lane owns the path turns on what the head names, not on
+            // which lane would answer first: a namespace some module
+            // registered, or a scope the writing module owns.  Asked from the
+            // annotation's OWN module rather than the cursor's, because a
+            // qualified spelling means what the writing file's imports say it
+            // means and the cursor is on whatever module the pass is walking.
+            const q_ns: SymbolStr = this.ctx.module_ns_sym_of_file(n.span.file);
+            if (q_ns.is_valid()) {
+                const q_prefix: string = QualifiedName::parent_of(written);
+                const q_mods: ModuleSpellingMatch =
+                    this.modules_written_as(q_prefix, q_ns);
+                if (q_mods.matched > 0) {
+                    // A module carries the written prefix, so the module lane
+                    // owns this path: it answers, or the path is refused.  It
+                    // is deliberately NOT handed on to the leaf reading below,
+                    // which resolves the leaf in the writer's scope and would
+                    // answer straight past a module that is ambiguous or that
+                    // the writer cannot reach - recording a name the source may
+                    // not legally spell as though it were fine.
+                    const q_rooted: SymbolID =
+                        this.walk_module_rooted_type(written, q_ns);
+                    if (q_rooted.is_valid()) {
+                        const q_sym: Symbol = this.resolver.get_symbol(q_rooted);
+                        const q_def: SymbolStr =
+                            this.resolver.qualified_name_of(&q_sym);
+                        n.res.answer(Res::Def(q_def));
+                        ResolveCounter::Site::AnnResDef.bump();
+                        // Emitted with the DEFINITION it landed on, not just a
+                        // tally: the whole point of rooting the path is which of
+                        // two same-leaf types it names, and a count cannot show
+                        // that the qualifier selected rather than the leaf.
+                        ResolveCounter::path_hit(
+                            "ANN-ROOTED", this.resolver.intern_table.resolve(q_ns),
+                            written, this.resolver.intern_table.resolve(q_def));
+                        return;
+                    }
+                } else {
+                    // No module in the program spells the prefix, so the head
+                    // is not a module path at all.  A C-import namespace alias
+                    // reaches here: it is a scope the writing module owns
+                    // rather than a namespace any module registered, so the
+                    // leaf reading in the writer's own module is what owns it.
+                    const q_sid: u64 = this.resolver.find_module_scope(
+                        this.resolver.intern_table.resolve(q_ns));
+                    if (q_sid != 0) {
+                        const mqn: SymbolStr =
+                            this.resolver.resolve_type_qualified_name_strict_from(
+                                ScopeID { id: q_sid }, written);
+                        if (mqn.is_valid()) {
+                            n.res.answer(Res::Def(mqn));
+                            ResolveCounter::Site::AnnResDef.bump();
+                            return;
+                        }
+                    }
+                }
+            }
+            // Nothing in the writing module's scope answers the leaf, or the
+            // module it was declared in contradicts the written qualifier.
+            // Left unstamped and named, because recording an answer this pass
+            // cannot produce is how a tool limitation becomes a claim.
             ResolveCounter::path_hit(
                 "ANN-QUALIFIED", this.resolver.intern_table.resolve(
                     this.ctx.module_ns_sym_of_file(n.span.file)),
