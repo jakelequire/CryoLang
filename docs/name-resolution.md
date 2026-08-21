@@ -582,15 +582,16 @@ match → `(True, (243, 104400627))`, mismatch → `(False, 'CLI.ll')`, missing 
 
 ### 7.3 Buckets
 
-The counter classifies every instrumented lookup into three buckets. The
+The counter classifies every instrumented lookup into four buckets. The
 two-bucket model in the roadmap (§3.2 rule 2) was measured wrong on
-2026-08-03 and is superseded:
+2026-08-03 and is superseded; B4 was split out of B1 on 2026-08-21 (§8.13):
 
 | Bucket | Meaning | Target |
 |---|---|---|
 | **B1** | fuzzy fallback — guesses from a string | **zero** |
 | **B2** | type-dependent — genuinely needs a receiver type | stays; enumerated and justified |
 | **B3** | authoritative — answers from scope/imports | **once per path**, not zero |
+| **B4** | what the global leaf index answers — predominantly instantiation identity, which a `Res` cannot name | stays; floor, enumerated and justified |
 
 **These are not one quality ladder, and reading them as one is the common
 mistake.** B1 and B3 answer the SAME question — *what does this written name
@@ -605,6 +606,37 @@ makes the boundary visible. What B2 *should* do is shrink as the name layer
 resolves more of a path's prefix before handing off (§5.3), and it is recorded
 as a FLOOR because sema's dispatch is uninstrumented, so its number is
 under-counted rather than exact.
+
+**B4 is a floor for the same reason B2 is, arrived at from the type side
+rather than the receiver side.** A `Res` names a *declaration*: the thing a path
+was written to reach. `Array<JsonValue, GlobalAlloc>` is not a declaration — it
+is one instantiation of `Array`, minted by monomorphization long after the name
+layer has finished, and the name the arena is asked for is its MANGLED identity
+(`5Array$LN$L3std.4json.5value.9JsonValue$G_N$L…$G$G`), which no source file
+contains and no import can bring into scope. Asking name resolution to answer it
+is a category error, not an unfinished migration, so counting it against a
+target of zero makes that target permanently false and hides whatever real fuzzy
+fallback might regrow underneath it.
+
+What B4 *should* do, like B2, is shrink as instantiation identity gets a key of
+its own rather than a leaf, and it is recorded as a FLOOR because the arena's
+leaf index is the only structure that currently answers it.
+
+**The bucket is named for its mechanism, not purely for its contents, and
+deliberately so.** §8.13 has the measurement that separated it from B1: on three
+populations every leaf-index hit was an instantiation. A fourth - the test
+corpus - additionally shows 76 hits on `Poll`, a written source name reached
+through a reference async lowering SYNTHESIZES into modules that do not import
+it. That one is a genuine defect with a home (§8.10's family: the node carries a
+`set_synthesized_ref` its reader ignores), not a permanent floor, and it leaves
+B4 when that reader is fixed. Classifying by mechanism keeps the row honest in
+the meantime; classifying it as "instantiation identity" alone would have
+asserted something only three of four populations support.
+
+**An arena lookup by the BARE name is not the key B4 is waiting for.** A
+specialization is cached under its bare mangled spec name (`5Widget$Li$G`),
+which carries no module, so two modules instantiating one generic collide on it
+exactly as they do on a leaf - see §8.14.
 
 B3 exists because `resolve_qualified_scoped` accounts for 487,838 of
 `lookup_qualified_alternatives`' 496,945 calls, and it is import- and
@@ -5709,6 +5741,165 @@ The disagreement is currently unreachable — declaring a namespace and a type
 with the same name is E0200 today — so no program observes it, and the
 precedence has been left as the code has it rather than changed to match the
 decision.
+
+### 8.13 B1's residue is not name resolution's to answer — MEASURED 2026-08-21
+
+B1's target is zero (§7.3) and it stood at 162 with no attribution: the gate
+reports a total and a per-site call/hit pair, and nothing said WHICH names still
+needed a fuzzy fallback. The assumption on record was that where-clause trait
+bounds dominated — four of the six `lookup_by_leaf` call sites resolve
+`gp.constraints[k].written_leaf()`.
+
+**Attribution was already in the counter and simply never read.** Every call
+site carries its own site counter, and the report prints them:
+
+```
+B1  lookup_by_leaf hits                       156
+      by caller: sema type_utils              156
+      by caller: type_resolution bound          0
+      by caller: resolver generic bound         0
+      by caller: symbolic_checker               0
+      by caller: resolve_named step 5           0
+```
+
+All of it is ONE site, `sema/type_utils.cryo:173`, the last step of
+`lookup_type_by_sym`. The four where-bound sites answer zero. No signature
+change was needed to learn this.
+
+**What the names are settles which bucket they belong in.** A per-name line at
+that site, over four populations:
+
+| population | leaf-index hits | instantiations | written source names |
+|---|---:|---:|---:|
+| `examples/09-json-config` (the B1 corpus) | 156 | 156 | 0 |
+| 14 examples | 1,145 | 1,145 | 0 |
+| the compiler's own source | 937 | 937 | 0 |
+| test corpus, **as first measured** | 0 | 0 | 0 |
+| test corpus, **re-measured on a clean build** | **76** | 0 | **76** |
+
+On the first three, every hit is a mangled instantiation —
+`6String$LN$L3std.5alloc.9allocator.11GlobalAlloc$G$G` (`String<GlobalAlloc>`),
+`5Slice$Lh$G` (`Slice<u8>`) — and none is a name any source file contains. That
+is the B4 case in §7.3, and it confirms a warning already on record: a `Res`
+cannot key an instantiation, so nobody should stamp their way to B1 = 0.
+
+**The test corpus's zero was not a real zero, and the control did not catch
+it.** That run reused a CACHED stdlib build - only the test executable had been
+deleted, not the build directory - so no stdlib module was recompiled and none
+of its lookups were measured. `stdlib/net/tls` is compiled by no other corpus.
+The control that was run (the same binary reporting 156 on the B1 corpus) proved
+the audit LINE was live; it said nothing about whether this population had been
+compiled, which is the thing that was actually in doubt. **A control has to
+exercise the axis in question.**
+
+Re-measured against a wiped build directory the same corpus reports **76 hits,
+all one name: `Poll`** - `type enum Poll<T>` in `stdlib/future/poll.cryo`. So
+the leaf index is NOT answering instantiations alone, and §7.3's B4 is defined
+more narrowly than what the bucket actually holds.
+
+**What those 76 are.** The asking modules - `std::net::tls::context` and two
+async test modules - do not import `std::future::poll`, and the diagnostic spans
+point at the `async` keyword: the references are SYNTHESIZED by async lowering,
+not written by anyone. `AsyncLower::poll_pending` already calls
+`set_synthesized_ref(poll_ty, definition_name_of(poll_ty))`, so the node carries
+its identity and a consumer resolves it by name regardless - the §8.10 family,
+where the stamp was right and the reader ignored it. `option_none` builds the
+same shape and survives only because `Option` is in the prelude and `Poll` is
+not. The leaf index is therefore load-bearing for exactly one synthesized name,
+and the fix for it belongs in that consumer rather than in `type_utils`.
+
+**The 6 that WERE name resolution's, fixed.** The remainder of B1 was
+`const-table bare leaf`, and it was a single constant: `READ_TO_END_CHUNK`,
+asked from `std::io::stdio` (4) and `std::fs::file` (2). Both import
+`std::io::traits`, where it is declared, so no import was missing. It is used as
+an array size in a trait DEFAULT body — `mut scratch: u8[READ_TO_END_CHUNK]` —
+and a default's body is written in the trait's file while its owner is the
+implementing type. `TypeResolver::array_size_of` built its `ConstEval` from
+`ctx.current_module`, the ambient cursor, which during that instantiation names
+the IMPLEMENTING module; the qualified lookup then missed and fell through to
+the program-wide bare index, which answers from any module with no import in
+hand.
+
+Three of the four `ConstEval` construction sites already took provenance from
+the node's own span, each with a comment saying why. This was the fourth.
+`TypeResolver` already held `module_graph` for exactly this mapping and never
+used it. Fixed by asking `ns_sym_of_file(a.span.file)` and falling back to the
+cursor only when the file is unknown — an unknown file must not become "written
+somewhere else", the false-positive direction that reverted the visibility gate
+(§8.1e).
+
+`ctx.home_module` was tried first, on the theory that the field documenting this
+exact defect class would be populated here. It is not: the count stayed at 6,
+which is what ruled the cheap fix out.
+
+**Measured: const-table calls AND hits 6 → 0** — both, so the site is no longer
+reached rather than reached and no longer recorded — **B1 162 → 156 on both
+hosts**, array sizes still fold to 4,096 (`[4096 x i8]` allocas in `stdio.ll`,
+`file.ll`, `cursor.ll`; no zero-length array anywhere in the stdlib IR),
+`make test` 2106/178/38 unchanged.
+
+**The gate now says so.** `LeafCalls`/`LeafHits` are tagged `B4`, the cascade
+step-5 row `B4*`, and `LeafHits` is no longer a summand of B1; the counter
+prints a fourth bucket line and `b1-gate.py` parses, renders and asserts
+`B4_TOTAL` beside `B1_TOTAL`. Both hosts re-pinned:
+
+```
+b1-gate: OK -- B1 = 0, B4 = 156, 20 sites, matches golden
+```
+
+**B1 is zero.** Not "small enough to live with" - the fuzzy-fallback bucket
+whose stated target is zero measures zero, on both hosts, with every per-site
+row still asserted underneath it. B4 is pinned as a floor so growth in either is
+caught separately, and the two are deliberately not summed.
+
+**What this costs, stated because the gate itself warns about it.** `b1-gate.py`
+requires its target to exercise "enough cross-module resolution for B1 to be
+nonzero - a target with no B1 events would give a gate that cannot observe
+regrowth". B1 = 0 trips that condition. It is not newly broken: every remaining
+B1 summand already read zero before this change, so the corpus stopped
+demonstrating B1 liveness some time ago and the total was only nonzero because
+it carried B4's rows. What proves the leaf machinery still records is B4 = 156;
+no equivalent control exists for the other B1 summands, and a corpus that
+exercises one of them would be worth more to this gate than a lower number.
+
+### 8.14 The bare mangled spec name is not an identity — ATTEMPTED AND REVERTED 2026-08-21
+
+An attempt to retire B4 by replacing the leaf search at
+`sema/type_utils.cryo:173` with an exact arena lookup. The premise: the three
+steps above it all ask the `DeclarationIndex`, instantiations live in the
+`TypeArena`, and `TypeArena::reserve_spec_names` registers a specialization
+under its bare mangled spec name as well as its qualified one - so the key
+looked as though it were already there and the leaf index were doing keyed work
+by search.
+
+Measured first, over three populations: **2,238 hits, all EXACT-SAME, zero
+misses, zero differing ids.** On that evidence the leaf step was deleted rather
+than kept as a fallback, on the reasoning that a leaf index maps a bare name to
+whichever qualified name registered FIRST and so must never be a second chance.
+
+**`resolution_leaf_index` failed**, which is the test that exists for this:
+
+```
+expected `ResolutionLeafIndex::Alpha::Widget<i64>`,
+found    `ResolutionLeafIndex::Omega::Widget<i64>`
+```
+
+**The bare mangled spec name carries no module.** `5Widget$Li$G` is the whole
+key, so two modules instantiating one generic write the same cache slot and the
+last one wins. `lookup_by_name(bare_spec)` is the same first-registration-wins
+guess as the leaf index with a better name on it, and swapping one for the other
+buys nothing.
+
+**Why 2,238 agreements were not evidence.** Agreement is forced wherever a
+generic is declared once, which is true of every generic in the stdlib, the
+examples and the compiler itself. The corpus that declares one generic in two
+modules is the test corpus - and it was the population the probe did not cover.
+The same control that the rooted walk (§8.12) applied correctly - *count only
+the rows where the two mechanisms COULD disagree* - was not applied here.
+
+Reverted in full. B4 stays. The key an instantiation actually needs is the
+QUALIFIED spec name; what is missing is not a lookup but the qualification,
+which the caller has already lost by the time it reaches this site.
 
 ---
 

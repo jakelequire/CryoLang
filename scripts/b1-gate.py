@@ -146,6 +146,7 @@ BUILD_SUBDIR = os.path.join("build", "b1-gate")
 _B1_TOTAL_RE = re.compile(r"^\s*B1 fuzzy fallback\s*->\s*ZERO\s+(\d+)\s*$")
 _B2_TOTAL_RE = re.compile(r"^\s*B2 type-dependent\s*->\s*stays \(FLOOR\)\s+(\d+)\s*$")
 _B3_TOTAL_RE = re.compile(r"^\s*B3 authoritative\s*->\s*once per path\s+(\d+)\s*$")
+_B4_TOTAL_RE = re.compile(r"^\s*B4 instantiation id\s*->\s*stays \(FLOOR\)\s+(\d+)\s*$")
 
 
 def split_row(line):
@@ -191,7 +192,7 @@ def resolve_cryo(cryo):
 
 
 def measure(cryo):
-    """Build TARGET with the counter on; return (b1, b2, b3, rows).
+    """Build TARGET with the counter on; return (b1, b2, b3, b4, rows).
 
     `rows` is the ordered list of (label, count) for the sites that make up
     B1.  Returns via sys.exit(1) on any measurement failure -- a gate that
@@ -246,7 +247,7 @@ def measure(cryo):
 
 
 def parse_report(err):
-    """Pure parse of the counter report on stderr -> (b1, b2, b3, rows).
+    """Pure parse of the counter report on stderr -> (b1, b2, b3, b4, rows).
 
     Split out from `measure` so it is testable without running a build.
     """
@@ -268,7 +269,7 @@ def parse_report(err):
             "         a row that fell to 0 here did not improve, it went blind.\n")
         sys.exit(1)
 
-    b1 = b2 = b3 = None
+    b1 = b2 = b3 = b4 = None
     rows = []
     for line in err.splitlines():
         # The three bucket-total lines MUST be matched before split_row.
@@ -287,6 +288,10 @@ def parse_report(err):
         if m:
             b3 = int(m.group(1))
             continue
+        m = _B4_TOTAL_RE.match(line)
+        if m:
+            b4 = int(m.group(1))
+            continue
         row = split_row(line)
         # `B1` and `B1*` (the nested step-5 row) are both fuzzy-fallback
         # family sites worth pinning; see the module docstring for why this
@@ -295,13 +300,14 @@ def parse_report(err):
         # keys identity rather than binding names, but could regrow into a
         # binding path if a future caller misused it, and would do so
         # invisibly in an unasserted bucket.
-        if row and (row[0].startswith("B1") or row[0].startswith("B3*")):
+        if row and (row[0].startswith("B1") or row[0].startswith("B3*")
+                    or row[0].startswith("B4")):
             rows.append((row[1], row[2]))
 
-    if b1 is None:
+    if b1 is None or b4 is None:
         sys.stderr.write(err)
         sys.stderr.write(
-            "b1-gate: no B1 total in the counter report.\n"
+            "b1-gate: no B1/B4 total in the counter report.\n"
             "         The build may not have run the counter at all -- check that\n"
             "         CRYO_RESOLVE_COUNTER is still honored and that the build was\n"
             "         not skipped as up-to-date.\n")
@@ -336,15 +342,15 @@ def parse_report(err):
     # i.e. the total never exceeds their sum.  If it does, a B1 contributor is
     # not being parsed and the per-site assertion has silently gone blind.
     row_sum = sum(c for _, c in rows)
-    if b1 > row_sum:
+    if b1 + b4 > row_sum:
         sys.stderr.write(
-            "b1-gate: B1 total is %d but the flagged B1 rows sum to only %d.\n"
+            "b1-gate: B1+B4 total is %d but the flagged rows sum to only %d.\n"
             "         A summand is not being parsed, so the per-site assertion\n"
             "         covers less than it claims to. Fix the parser before\n"
-            "         trusting this gate.\n" % (b1, row_sum))
+            "         trusting this gate.\n" % (b1 + b4, row_sum))
         sys.exit(1)
 
-    return b1, b2, b3, rows
+    return b1, b2, b3, b4, rows
 
 
 def host_key():
@@ -363,7 +369,8 @@ def host_key():
 HEADER = [
     "# B1 fuzzy-fallback baseline -- docs/name-resolution.md §7.2 mechanism 3.",
     "#",
-    "# ASSERTED: the B1 total and every per-site B1 / B3* row, PER HOST.",
+    "# ASSERTED: the B1 and B4 totals, and every per-site B1 / B3* / B4 row,",
+    "# PER HOST.",
     "# CONTEXT ONLY (not asserted): the B2/B3 totals in the comments.",
     "#",
     "# Target: examples/09-json-config, --no-incremental, CRYO_CODEGEN_THREADS=1.",
@@ -376,21 +383,27 @@ HEADER = [
     "# on and leaves the rest byte-for-byte, because it cannot honestly speak",
     "# for a host it did not measure. One row really is host-dependent:",
     "# `lookup_by_leaf calls`, because a Windows build compiles Windows-only",
-    "# stdlib modules. The B1 TOTAL is the same on both.",
+    "# stdlib modules. The B1 and B4 TOTALS are the same on both.",
+    "#",
+    "# B1 is fuzzy fallback and its target is ZERO. B4 is instantiation",
+    "# identity -- a mangled name minted after the name layer has finished,",
+    "# which a `Res` cannot name -- so it is a FLOOR, pinned to catch growth,",
+    "# not a debt to pay down. Do not sum them.",
 ]
 
 
-def render_section(host, b1, b2, b3, rows):
+def render_section(host, b1, b2, b3, b4, rows):
     lines = ["[host:%s]" % host,
              "# context: B2=%s B3=%s" % (b2, b3),
              "B1_TOTAL %d" % b1,
+             "B4_TOTAL %d" % b4,
              ""]
     for label, count in rows:
         lines.append("%-46s %d" % (label, count))
     return lines
 
 
-def render(host, b1, b2, b3, rows, keep=None):
+def render(host, b1, b2, b3, b4, rows, keep=None):
     """Render the golden: this host's section, plus every other host verbatim.
 
     `keep` is the ordered {host: [raw lines]} of the sections that were already
@@ -405,12 +418,12 @@ def render(host, b1, b2, b3, rows, keep=None):
         lines.extend(raw)
         emitted.add(other)
     lines.append("")
-    lines.extend(render_section(host, b1, b2, b3, rows))
+    lines.extend(render_section(host, b1, b2, b3, b4, rows))
     return "\n".join(lines) + "\n"
 
 
 def parse_golden(text):
-    """-> ({host: (total, rows)}, {host: [raw lines]}).
+    """-> ({host: (b1_total, b4_total, rows)}, {host: [raw lines]}).
 
     The raw blocks are kept so `--update` can round-trip the hosts it did not
     measure without reformatting them.
@@ -423,7 +436,7 @@ def parse_golden(text):
         stripped = line.strip()
         if stripped.startswith("[host:") and stripped.endswith("]"):
             host = stripped[len("[host:"):-1].strip()
-            parsed[host] = [None, []]
+            parsed[host] = [None, None, []]
             raw[host] = [line]
             continue
         if host is None:
@@ -434,17 +447,20 @@ def parse_golden(text):
         if stripped.startswith("B1_TOTAL"):
             parsed[host][0] = int(stripped.split()[1])
             continue
+        if stripped.startswith("B4_TOTAL"):
+            parsed[host][1] = int(stripped.split()[1])
+            continue
         # `<label padded to 46> <count>`.  Same reasoning as split_row: the
         # count is the last whitespace-separated token, and the label keeps
         # its internal double spaces.
         parts = stripped.rsplit(None, 1)
         if len(parts) == 2 and parts[1].isdigit():
-            parsed[host][1].append((parts[0].strip(), int(parts[1])))
+            parsed[host][2].append((parts[0].strip(), int(parts[1])))
     # Trailing blank lines inside a block would be re-emitted on every update.
     for h in raw:
         while raw[h] and not raw[h][-1].strip():
             raw[h].pop()
-    return ({h: (t, r) for h, (t, r) in parsed.items()}, raw)
+    return ({h: (t1, t4, r) for h, (t1, t4, r) in parsed.items()}, raw)
 
 
 def main():
@@ -459,7 +475,7 @@ def main():
         b = measure(args.cryo)
         if a == b:
             print("b1-gate: determinism OK -- two runs agree (B1=%d, %d rows)"
-                  % (a[0], len(a[3])))
+                  % (a[0], len(a[4])))
             return 0
         sys.stderr.write(
             "b1-gate: NOT DETERMINISTIC -- two runs of the same target disagree.\n"
@@ -467,7 +483,7 @@ def main():
             "         Do not wire this as a gate until the source of the drift is\n"
             "         understood; a flaky gate is worse than no gate.\n"
             % (a[0], b[0]))
-        for (la, ca), (lb, cb) in zip(a[3], b[3]):
+        for (la, ca), (lb, cb) in zip(a[4], b[4]):
             if (la, ca) != (lb, cb):
                 sys.stderr.write("           %-40s %d -> %d\n" % (la, ca, cb))
         return 1
@@ -478,7 +494,7 @@ def main():
         with open(GOLDEN, "r", encoding="utf-8") as f:
             existing, raw = parse_golden(f.read())
 
-    b1, b2, b3, rows = measure(args.cryo)
+    b1, b2, b3, b4, rows = measure(args.cryo)
 
     if args.update:
         # `newline="\n"` suppresses the translation that would write CRLF on
@@ -486,10 +502,10 @@ def main():
         # diffed, so a re-pin from a Windows host would otherwise rewrite all 34
         # lines and bury the one or two rows that actually moved.
         with open(GOLDEN, "w", encoding="utf-8", newline="\n") as f:
-            f.write(render(host, b1, b2, b3, rows, keep=raw))
+            f.write(render(host, b1, b2, b3, b4, rows, keep=raw))
         others = sorted(h for h in raw if h != host)
-        print("b1-gate: golden updated for host %r -- B1 = %d%s"
-              % (host, b1,
+        print("b1-gate: golden updated for host %r -- B1 = %d, B4 = %d%s"
+              % (host, b1, b4,
                  ("; left untouched: " + ", ".join(others)) if others else ""))
         return 0
 
@@ -511,21 +527,24 @@ def main():
             % (host, ", ".join(sorted(existing)) or "(none)"))
         return 1
 
-    want_total, want_rows = existing[host]
+    want_b1, want_b4, want_rows = existing[host]
 
-    if want_total is None:
-        sys.stderr.write("b1-gate: golden section [host:%s] has no B1_TOTAL line;"
-                         " it is corrupt.\n" % host)
+    if want_b1 is None or want_b4 is None:
+        sys.stderr.write("b1-gate: golden section [host:%s] is missing a B1_TOTAL"
+                         " or B4_TOTAL line; it is corrupt, or predates the\n"
+                         "         B4 split. Re-pin it deliberately.\n" % host)
         return 1
 
-    if want_total == b1 and want_rows == rows:
-        print("b1-gate: OK -- B1 = %d, %d sites, matches golden [host:%s]"
-              % (b1, len(rows), host))
+    if want_b1 == b1 and want_b4 == b4 and want_rows == rows:
+        print("b1-gate: OK -- B1 = %d, B4 = %d, %d sites, matches golden"
+              " [host:%s]" % (b1, b4, len(rows), host))
         return 0
 
-    sys.stderr.write("b1-gate: B1 DRIFT  (host %s)\n\n" % host)
-    sys.stderr.write("  total   golden %d   measured %d   (%+d)\n\n"
-                     % (want_total, b1, b1 - want_total))
+    sys.stderr.write("b1-gate: DRIFT  (host %s)\n\n" % host)
+    sys.stderr.write("  B1 (-> zero)   golden %d   measured %d   (%+d)\n"
+                     % (want_b1, b1, b1 - want_b1))
+    sys.stderr.write("  B4 (floor)     golden %d   measured %d   (%+d)\n\n"
+                     % (want_b4, b4, b4 - want_b4))
     want_map = dict(want_rows)
     got_map = dict(rows)
     for label in sorted(set(want_map) | set(got_map)):
@@ -540,13 +559,13 @@ def main():
         else:
             sys.stderr.write("  %-10s %-40s %d -> %d (%+d)\n"
                              % ("CHANGED", label, w, g, g - w))
-    if b1 > want_total:
+    if b1 > want_b1 or b4 > want_b4:
         sys.stderr.write(
-            "\n  B1 went UP: a fuzzy fallback regrew. This is the regression\n"
+            "\n  A bucket went UP: a fallback regrew. This is the regression\n"
             "  §7.2 mechanism 3 exists to catch. Fix the cause, do not re-pin.\n")
     else:
         sys.stderr.write(
-            "\n  B1 went DOWN: that is progress, and the new lower value must be\n"
+            "\n  A bucket went DOWN: that is progress, and the new value must be\n"
             "  pinned so it becomes the bound. Re-pin with:\n"
             "      make b1-check ARGS=--update\n"
             "  and commit tests/b1-baseline.txt with the change that moved it.\n"
