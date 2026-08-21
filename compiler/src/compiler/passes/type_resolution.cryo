@@ -143,7 +143,8 @@ type struct TypeResolutionRunner {
         if (gen == null || gen.args.length == 0) { return; }
         const trait_leaf: SymbolStr = TypeResolutionPasses::extract_trait_leaf(trait_ann);
         if (!trait_leaf.is_valid()) { return; }
-        const trait_decl: TraitDeclNode* = this.ctx.generic_registry.get_trait_decl(trait_leaf);
+        const trait_decl: TraitDeclNode* = this.ctx.generic_registry.get_trait_decl(
+            trait_leaf, "bind_trait_args_for_impl", this.ctx.get_intern_table());
         if (trait_decl == null) { return; }
 
         const ngp: i64   = trait_decl.generic_params.length;
@@ -209,7 +210,8 @@ type struct TypeResolutionRunner {
         if (trait_ann == null) { return; }
         const trait_leaf: SymbolStr = TypeResolutionPasses::extract_trait_leaf(trait_ann);
         if (!trait_leaf.is_valid()) { return; }
-        const trait_decl: TraitDeclNode* = this.ctx.generic_registry.get_trait_decl(trait_leaf);
+        const trait_decl: TraitDeclNode* = this.ctx.generic_registry.get_trait_decl(
+            trait_leaf, "validate_impl_assoc_bindings", this.ctx.get_intern_table());
         if (trait_decl == null) { return; }
         // Only traits with associated types are subject to these checks.
         if (trait_decl.assoc_types.length == 0) { return; }
@@ -1360,6 +1362,8 @@ type struct TypeResolutionPasses {
                     ctx.decl_index.set_decl_visibility(qualified_sym, node.is_public);
                 }
                 ctx.decl_index.register_methods_with_module(qualified_sym, node.methods, module_sym, ctx.intern_table, arena);
+                TypeResolutionPasses::stamp_member_method_bounds(
+                    &node.methods, ctx);
             }
             NodeKind::UnionDeclaration => {
                 const node: UnionDeclNode* = stmt as UnionDeclNode*;
@@ -1376,6 +1380,8 @@ type struct TypeResolutionPasses {
                     ctx.decl_index.set_decl_visibility(qualified_sym, node.is_public);
                 }
                 ctx.decl_index.register_methods_with_module(qualified_sym, node.methods, module_sym, ctx.intern_table, arena);
+                TypeResolutionPasses::stamp_member_method_bounds(
+                    &node.methods, ctx);
             }
             NodeKind::ClassDeclaration => {
                 const node: ClassDeclNode* = stmt as ClassDeclNode*;
@@ -1392,6 +1398,8 @@ type struct TypeResolutionPasses {
                     ctx.decl_index.set_decl_visibility(qualified_sym, node.is_public);
                 }
                 ctx.decl_index.register_methods_with_module(qualified_sym, node.methods, module_sym, ctx.intern_table, arena);
+                TypeResolutionPasses::stamp_member_method_bounds(
+                    &node.methods, ctx);
             }
             NodeKind::EnumDeclaration => {
                 const node: EnumDeclNode* = stmt as EnumDeclNode*;
@@ -1549,12 +1557,8 @@ type struct TypeResolutionPasses {
                 // an inherent impl's where clause names traits too, and the
                 // bound checker asks which trait it named.
                 TypeResolutionPasses::stamp_trait_bounds(&node.where_bounds, ctx);
-                for (mut wmi: i64 = 0; wmi < node.methods.length; wmi++) {
-                    const wm: MethodNode* = node.methods[wmi];
-                    if (wm == null || wm.func == null) { continue; }
-                    TypeResolutionPasses::stamp_trait_bounds(
-                        &wm.func.trait_bounds, ctx);
-                }
+                TypeResolutionPasses::stamp_member_method_bounds(
+                    &node.methods, ctx);
                 // Stamp each trait-impl method with its trait's leaf name so
                 // every mangling site can disambiguate it from a same-named
                 // method of another trait implemented for the same type.
@@ -2149,6 +2153,24 @@ type struct TypeResolutionPasses {
         }
     }
 
+    /// Stamp the where-clause bounds of every method declared in a member
+    /// list.
+    ///
+    /// A `where` clause means the same thing wherever the method is written,
+    /// so every owner of a member list has to reach this. An owner that does
+    /// not leaves its methods' `TraitRef.resolved_name` empty, and
+    /// `TraitRef::identity()` then falls back to the written leaf - which
+    /// type-checks, and answers only while that leaf is unique program-wide.
+    static stamp_member_method_bounds(methods: MethodNode*[]*,
+                                      ctx: CompilationContext*) -> void {
+        if (methods == null) { return; }
+        for (mut i: i64 = 0; i < (*methods).length; i++) {
+            const m: MethodNode* = (*methods)[i];
+            if (m == null || m.func == null) { continue; }
+            TypeResolutionPasses::stamp_trait_bounds(&m.func.trait_bounds, ctx);
+        }
+    }
+
     /// Walk a trait_annotation to its leaf identifier: the bare trait name.
     /// Mirrors `Specialization::extract_root_name` but is duplicated here
     /// to keep type_resolution.cryo self-contained.
@@ -2576,7 +2598,8 @@ type struct TypeResolutionPasses {
         if (!trait_name.is_valid()) { return 0; }
 
         const trait_decl: TraitDeclNode* = ctx.generic_registry.get_trait_decl(
-            trait_name);
+            trait_name, "synthesize_default_trait_methods",
+            ctx.get_intern_table());
         if (trait_decl == null) { return 0; }
 
         // Quick scan: is there at least one default-bodied trait method
@@ -2831,7 +2854,9 @@ type struct TypeResolutionPasses {
                         // beside a zero total means this site never ran.
                         if (ResolveCounter::Audit::Path.enabled()) {
                             const prior: TraitDeclNode* =
-                                ctx.generic_registry.get_trait_decl(node.name);
+                                ctx.generic_registry.get_trait_decl(
+                                    node.name, "path-audit-dup-probe",
+                                    ctx.get_intern_table());
                             const leaf: string = ctx.resolve_str(node.name);
                             if (prior == null) {
                                 ResolveCounter::path_hit(
