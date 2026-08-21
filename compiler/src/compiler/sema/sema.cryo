@@ -679,7 +679,7 @@ public:
         if (node == null || !node.is_trait_impl()) { return; }
         if (this.ctx.generic_registry == null || this.ctx.type_resolver == null) { return; }
         if (!impl_this.is_valid()) { return; }
-        const trait_leaf: SymbolStr = this.trait_leaf_name(node.trait_annotation);
+        const trait_leaf: SymbolStr = TypeAnnotation::trait_identity(node.trait_annotation);
         if (!trait_leaf.is_valid()) { return; }
         const tdecl: TraitDeclNode* = this.ctx.generic_registry.get_trait_decl(
             trait_leaf, "check_assoc_decl_bounds", this.intern);
@@ -700,7 +700,7 @@ public:
                 const tref: TraitRef* = &adecl.bounds[b];
                 if (tref.path.length == 0) { continue; }
                 const bound_trait: SymbolStr = tref.path[tref.path.length - 1];
-                if (this.trait_checker().type_implements_trait(item_ty, bound_trait, 0)) { continue; }
+                if (this.trait_checker().type_implements_trait(item_ty, tref.identity(), 0)) { continue; }
                 const bound_str: string = this.intern.resolve(bound_trait);
                 this.ctx.emit_error_at(
                     ErrorCode::E0306_TRAIT_BOUND_NOT_SATISFIED,
@@ -3584,7 +3584,18 @@ public:
         for (mut i: i64 = 0; i < imp.bounds.length; i++) {
             const trait_name: SymbolStr = this.trait_leaf_name(imp.bounds[i]);
             if (!trait_name.is_valid()) { continue; }
-            if (this.trait_checker().type_satisfies_opaque_bound(concrete, trait_name)) {
+            const bound_id: SymbolStr = TypeAnnotation::trait_identity(imp.bounds[i]);
+            if (ResolveCounter::Audit::Trait.enabled()) {
+                mut idtext: string = "<EMPTY>";
+                if (bound_id.is_valid()) { idtext = this.intern.resolve(bound_id); }
+                const bsp: SourceSpan = annotation_span(imp.bounds[i]);
+                ResolveCounter::trait_decl_lookup("verify_impl_trait_bounds",
+                    idtext, format("%s @ %s:%u",
+                        this.intern.resolve(var_node.name),
+                        bsp.file, bsp.start_line));
+            }
+            if (this.trait_checker().type_satisfies_opaque_bound(
+                    concrete, bound_id)) {
                 this.check_opaque_assoc_item(imp.bounds[i], concrete, var_node);
                 continue;
             }
@@ -3612,7 +3623,7 @@ public:
             _ => { return false; }
         }
         if (gen == null || gen.args.length != 1) { return false; }
-        const trait_leaf: SymbolStr = this.trait_leaf_name(bound_ann);
+        const trait_leaf: SymbolStr = TypeAnnotation::trait_identity(bound_ann);
         if (!trait_leaf.is_valid()) { return false; }
         const tdecl: TraitDeclNode* = this.ctx.generic_registry.get_trait_decl(
             trait_leaf, "opaque_assoc_item_mismatch", this.intern);

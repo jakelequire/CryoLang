@@ -829,9 +829,14 @@ type struct Resolver {
                  scope: ScopeID) -> Res {
         if (segments.length == 0) { return Res::Err; }
 
+        // How many segments the head does NOT account for.  The head is
+        // resolved here and nothing after it is, so this is a statement about
+        // this walk rather than an estimate.
+        const head: SymbolStr = segments[0];
+        const trailing: u32 = (segments.length - 1) as u32;
+
         // The head, in scope.  Walking outward is the rib chain: an inner tier
         // shadows the outer one, and the first acceptable binding wins.
-        const head: SymbolStr = segments[0];
         mut scope_id: ScopeID = scope;
         while (scope_id.is_valid()) {
             const sc: Scope* = this.get_scope(scope_id);
@@ -839,39 +844,64 @@ type struct Resolver {
             if (found.is_valid()) {
                 const sym: Symbol = this.get_symbol(found);
                 if (ns.accepts(sym.kind)) {
-                    // How many segments the head does NOT account for.  The
-                    // head is resolved here and nothing after it is, so this is
-                    // a statement about this walk rather than an estimate.
-                    const trailing: u32 = (segments.length - 1) as u32;
-                    // A parameter names ITSELF.  Substitution happens strictly
-                    // below this, in the type layer, which is what lets a `Res`
-                    // be copied verbatim by `ASTCloner`.
-                    if (sym.kind == SymbolKind::GenericParam) {
-                        if (segments.length > 1) {
-                            return Res::TypeRelative(
-                                ResBase::GenericParam(sym.name), trailing);
-                        }
-                        return Res::GenericParam(sym.name);
-                    }
-                    const qualified: SymbolStr = this.qualified_name_of(&sym);
-                    // The remainder is rooted in what the head named; a type
-                    // owner needs a receiver type, so it is not finishable here.
-                    if (segments.length > 1) {
-                        return Res::TypeRelative(ResBase::Def(qualified),
-                                                 trailing);
-                    }
-                    return Res::Def(qualified);
+                    return this.res_for_head(&sym, trailing);
                 }
             }
             scope_id = sc.parent_id;
         }
 
-        // Nothing in scope bound the head.  Reported as `Err` WITHOUT a
-        // diagnostic only because every caller today projects this back into
-        // its own not-found path and diagnoses there; the moment a caller reads
-        // the `Res` directly, the diagnostic belongs here, since this is the
-        // only place that knows which namespace was asked and from where.
+        // The outermost rib: names reachable without an import.  Reached here,
+        // after every enclosing scope has been asked, because that is what
+        // makes the prelude a TIER - an inner declaration or an explicit import
+        // shadows it - and because a caller that consults the prelude for
+        // itself when this returns `Err` would be a second way to answer one
+        // question, free to disagree with this one about what a bare name
+        // means.  `lookup` reaches the same tier at the same point in its walk.
+        //
+        // Filtered by `ns` like every other rib.  Without the filter a question
+        // asked in one namespace is answerable by whatever kind a prelude
+        // module happens to export under the name.
+        const pre: SymbolID = this.lookup_prelude(head);
+        if (pre.is_valid()) {
+            const psym: Symbol = this.get_symbol(pre);
+            if (ns.accepts(psym.kind)) {
+                return this.res_for_head(&psym, trailing);
+            }
+        }
+
+        // No rib bound the head, the prelude included.  Reported as `Err`
+        // WITHOUT a diagnostic only because every caller today projects this
+        // back into its own not-found path and diagnoses there; the moment a
+        // caller reads the `Res` directly, the diagnostic belongs here, since
+        // this is the only place that knows which namespace was asked and from
+        // where.
         return Res::Err;
+    }
+
+    /// The answer a resolved head produces, given how many segments follow it.
+    ///
+    /// Every tier of `resolve_path` builds its result here.  A tier that
+    /// constructs its own is free to disagree with the others about what a
+    /// generic parameter or a trailing segment means, and nothing downstream
+    /// can tell which tier replied.
+    res_for_head(&this, sym: &Symbol, trailing: u32) -> Res {
+        // A parameter names ITSELF.  Substitution happens strictly below this,
+        // in the type layer, which is what lets a `Res` be copied verbatim by
+        // `ASTCloner`.
+        if (sym.kind == SymbolKind::GenericParam) {
+            if (trailing > 0) {
+                return Res::TypeRelative(
+                    ResBase::GenericParam(sym.name), trailing);
+            }
+            return Res::GenericParam(sym.name);
+        }
+        const qualified: SymbolStr = this.qualified_name_of(sym);
+        // The remainder is rooted in what the head named; a type owner needs a
+        // receiver type, so it is not finishable here.
+        if (trailing > 0) {
+            return Res::TypeRelative(ResBase::Def(qualified), trailing);
+        }
+        return Res::Def(qualified);
     }
 
 

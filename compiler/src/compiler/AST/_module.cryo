@@ -23,6 +23,7 @@ import Compiler::Types::TypeRef;
 import Compiler::Resolver::SymbolStr;
 import Compiler::Resolver::Res;
 import Compiler::AST::Expression;
+import Compiler::ResolveCounter;
 
 /// Discriminator for all AST node types.
 type enum NodeKind {
@@ -665,7 +666,33 @@ type struct TraitRef {
     identity(&this) -> SymbolStr {
         if (this.resolved_name.is_valid()) { return this.resolved_name; }
         if (this.path.length == 0) { return SymbolStr::empty(); }
+        if (ResolveCounter::Audit::Trait.enabled()) {
+            ResolveCounter::trait_ref_unstamped(this.span.file,
+                                                this.span.start_line);
+        }
         return this.path[this.path.length - 1];
+    }
+
+    /// The last segment of the SPELLING, which is a search key and not an
+    /// identity: it answers only while that leaf is unique program-wide.
+    ///
+    /// Its one legitimate consumer is the arena's leaf index, which is keyed
+    /// that way. Anything asking WHICH trait this names must call `identity()`
+    /// instead - the two differ exactly when it matters.
+    written_leaf(&this) -> SymbolStr {
+        if (this.path.length == 0) { return SymbolStr::empty(); }
+        return this.path[this.path.length - 1];
+    }
+
+    /// A constraint written as a single bare identifier, which is all the
+    /// parser accepts in `<T: Bound>` position. Shares the where-clause
+    /// representation so a bound has ONE shape in the AST regardless of which
+    /// syntax wrote it, and so the identity stamp reaches both.
+    static from_leaf(leaf: SymbolStr, span: SourceSpan) -> TraitRef {
+        mut path: SymbolStr[] = [];
+        path.push(leaf);
+        return TraitRef { path: path, resolved_name: SymbolStr::empty(),
+                          type_args: [], span: span };
     }
 }
 

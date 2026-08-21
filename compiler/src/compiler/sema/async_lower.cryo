@@ -546,6 +546,23 @@ type struct AsyncLower {
         return new TypeAnnotation::Named(n);
     }
 
+    /// `named_ann`, carrying the definition it refers to.
+    ///
+    /// Nothing name-resolves a synthesized annotation: the stamping walk visits
+    /// what the parser produced, and a minted node was never written. So a
+    /// consumer that asks what this refers to finds no answer unless the
+    /// synthesizer records one, and the synthesizer is the only place the
+    /// referent is known.
+    named_ann_def(&this, name: SymbolStr, def: SymbolStr,
+                  span: SourceSpan) -> TypeAnnotation* {
+        mut n: NamedAnnotation* = new NamedAnnotation {
+            name: name, span: span, pre_resolved: TypeRef::invalid(),
+            res: ResSlot::Pending,
+        };
+        if (def.is_valid()) { n.res.answer(Res::Def(def)); }
+        return new TypeAnnotation::Named(n);
+    }
+
     /// `<T, U, …>` — the function's own generic parameters spelled by name, the
     /// form the monomorphizer's substituter rewrites. A fresh array of fresh
     /// nodes per call: substitution edits annotations IN PLACE, so two uses may
@@ -588,7 +605,7 @@ type struct AsyncLower {
         if (owner.impl_node == null || !owner.impl_node.is_trait_impl()) { return; }
         if (this.ctx.generic_registry == null) { return; }
         const leaf: SymbolStr =
-            TypeResolutionPasses::extract_trait_leaf(owner.impl_node.trait_annotation);
+            TypeAnnotation::trait_identity(owner.impl_node.trait_annotation);
         if (!leaf.is_valid()) { return; }
         const tdecl: TraitDeclNode* = this.ctx.generic_registry.get_trait_decl(
             leaf, "bind_async_trait_assoc", this.intern);
@@ -6664,10 +6681,17 @@ type struct AsyncLower {
             st.add_method(minfo);
         }
 
+        // The declaration the language means by `Future`, so the synthesized
+        // impl lands under the same key a written `implement trait Future` does,
+        // and its head refers to the same declaration a written one would.
+        const future_leaf: SymbolStr = this.intern.intern("Future");
+
         // `implement trait Future<Output> for struct <Q>`
         mut impl_node: ImplBlockNode* = new ImplBlockNode(q_name, span);
         mut gen: GenericAnnotation* = new GenericAnnotation {
-            base: this.named_ann(this.intern.intern("Future"), span),
+            base: this.named_ann_def(
+                future_leaf,
+                this.ctx.generic_registry.wellknown(future_leaf), span),
             args: [this.output_type_ann(&d, span)],
             span: span,
         };
@@ -6696,7 +6720,6 @@ type struct AsyncLower {
         this.ctx.decl_index.register_methods_with_module(
             q_name, method_arr, module_sym, this.intern, this.arena);
 
-        const future_leaf: SymbolStr = this.intern.intern("Future");
         // Dispatch key: `.poll()` resolution keys on the struct's qualified name.
         this.ctx.generic_registry.register_trait_impl(future_leaf, q_name, impl_node);
         // Bound-check key: `F: Future<R>` resolves via qualified-name id + leaf.

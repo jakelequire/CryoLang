@@ -141,10 +141,10 @@ type struct TypeResolutionRunner {
         // returns the owning node, not a droppable copy of its args).
         const gen: GenericAnnotation* = TypeResolutionPasses::peel_to_generic(trait_ann);
         if (gen == null || gen.args.length == 0) { return; }
-        const trait_leaf: SymbolStr = TypeResolutionPasses::extract_trait_leaf(trait_ann);
-        if (!trait_leaf.is_valid()) { return; }
+        const trait_id: SymbolStr = TypeAnnotation::trait_identity(trait_ann);
+        if (!trait_id.is_valid()) { return; }
         const trait_decl: TraitDeclNode* = this.ctx.generic_registry.get_trait_decl(
-            trait_leaf, "bind_trait_args_for_impl", this.ctx.get_intern_table());
+            trait_id, "bind_trait_args_for_impl", this.ctx.get_intern_table());
         if (trait_decl == null) { return; }
 
         const ngp: i64   = trait_decl.generic_params.length;
@@ -208,16 +208,20 @@ type struct TypeResolutionRunner {
         if (this.ctx.generic_registry == null) { return; }
         const trait_ann: TypeAnnotation* = impl_node.trait_annotation;
         if (trait_ann == null) { return; }
-        const trait_leaf: SymbolStr = TypeResolutionPasses::extract_trait_leaf(trait_ann);
-        if (!trait_leaf.is_valid()) { return; }
+        const trait_id: SymbolStr = TypeAnnotation::trait_identity(trait_ann);
+        if (!trait_id.is_valid()) { return; }
         const trait_decl: TraitDeclNode* = this.ctx.generic_registry.get_trait_decl(
-            trait_leaf, "validate_impl_assoc_bindings", this.ctx.get_intern_table());
+            trait_id, "validate_impl_assoc_bindings",
+            this.ctx.get_intern_table());
         if (trait_decl == null) { return; }
         // Only traits with associated types are subject to these checks.
         if (trait_decl.assoc_types.length == 0) { return; }
 
         const intern: InternTable* = this.ctx.get_intern_table();
-        const trait_name: string = intern.resolve(trait_leaf);
+        // The diagnostic names the trait the way the author spelled it; the
+        // identity above is for the lookup, not for the message.
+        const trait_name: string = intern.resolve(
+            TypeResolutionPasses::extract_trait_leaf(trait_ann));
         const span: SourceSpan = if (impl_node.target_type_span.has_location()) {
             impl_node.target_type_span
         } else {
@@ -1291,7 +1295,7 @@ type struct TypeResolutionPasses {
             const gp: GenericParamNode* = generic_params[i];
             mut bounds: TypeRef[] = [];
             for (mut k: i64 = 0; k < gp.constraints.length; k++) {
-                const trait_ref: TypeRef = arena.lookup_by_leaf(gp.constraints[k]);
+                const trait_ref: TypeRef = arena.lookup_by_leaf(gp.constraints[k].written_leaf());
                 if (trait_ref.is_valid()) {
                     ResolveCounter::Site::LeafViaTypeResBound.bump();
                     bounds.push(trait_ref);
@@ -1332,6 +1336,10 @@ type struct TypeResolutionPasses {
                                   is_source_decl: boolean,
                                   owner_mod: SymbolStr) -> void {
         if (stmt == null) { return; }
+        // Inline `<T: Bound>` constraints, stamped alongside the where-bounds
+        // below: both name a trait, and which one they name must not depend on
+        // which syntax was used to write it.
+        TypeResolutionPasses::stamp_decl_generic_constraints(stmt, ctx);
         const arena: TypeArena* = ctx.type_arena;
         // DeclarationIndex module ownership.  Normally the current module, but
         // injected specializations pass their template's defining module via
@@ -2130,6 +2138,78 @@ type struct TypeResolutionPasses {
         }
         tr.resolved_name = ctx.resolve_scoped_or_at(
             written, tr.span.file, FILE, LINE);
+        ResolveCounter::path_hit("BOUND-STAMP-ALL", "stamp_trait_ref",
+            ctx.intern_table.resolve(tr.path[tr.path.length - 1]),
+            ctx.intern_table.resolve(tr.resolved_name));
+    }
+
+    /// Stamp the identity of every inline `<T: Bound>` constraint on a
+    /// declaration's own generic parameters.
+    ///
+    /// An inline constraint and a `where` bound are the same question asked
+    /// with two syntaxes, so they are answered at the same chokepoint. A
+    /// consumer that reached one and not the other would resolve a trait
+    /// differently depending on how its author happened to spell the bound.
+    static stamp_generic_constraints(params: GenericParamNode*[]*,
+                                     ctx: CompilationContext*) -> void {
+        if (params == null) { return; }
+        for (mut i: i64 = 0; i < (*params).length; i++) {
+            const gp: GenericParamNode* = (*params)[i];
+            if (gp == null) { continue; }
+            for (mut k: i64 = 0; k < gp.constraints.length; k++) {
+                TypeResolutionPasses::stamp_trait_ref(&gp.constraints[k], ctx);
+            }
+        }
+    }
+
+    /// Route a declaration to `stamp_generic_constraints` for whichever kind
+    /// it is. The kind dispatch lives here alone so a new generic-bearing
+    /// declaration has one place to be added rather than seven.
+    static stamp_decl_generic_constraints(stmt: ASTNode*,
+                                          ctx: CompilationContext*) -> void {
+        if (stmt == null) { return; }
+        match (stmt.kind) {
+            NodeKind::StructDeclaration => {
+                const n: StructDeclNode* = stmt as StructDeclNode*;
+                TypeResolutionPasses::stamp_generic_constraints(&n.generic_params, ctx);
+            }
+            NodeKind::UnionDeclaration => {
+                const n: UnionDeclNode* = stmt as UnionDeclNode*;
+                TypeResolutionPasses::stamp_generic_constraints(&n.generic_params, ctx);
+            }
+            NodeKind::ClassDeclaration => {
+                const n: ClassDeclNode* = stmt as ClassDeclNode*;
+                TypeResolutionPasses::stamp_generic_constraints(&n.generic_params, ctx);
+            }
+            NodeKind::EnumDeclaration => {
+                const n: EnumDeclNode* = stmt as EnumDeclNode*;
+                TypeResolutionPasses::stamp_generic_constraints(&n.generic_params, ctx);
+            }
+            NodeKind::TraitDeclaration => {
+                const n: TraitDeclNode* = stmt as TraitDeclNode*;
+                TypeResolutionPasses::stamp_generic_constraints(&n.generic_params, ctx);
+                for (mut i: i64 = 0; i < n.methods.length; i++) {
+                    const f: FunctionDeclNode* = n.methods[i];
+                    if (f == null) { continue; }
+                    TypeResolutionPasses::stamp_generic_constraints(&f.generic_params, ctx);
+                }
+            }
+            NodeKind::FunctionDeclaration => {
+                const n: FunctionDeclNode* = stmt as FunctionDeclNode*;
+                TypeResolutionPasses::stamp_generic_constraints(&n.generic_params, ctx);
+            }
+            NodeKind::ImplementationBlock => {
+                const n: ImplBlockNode* = stmt as ImplBlockNode*;
+                TypeResolutionPasses::stamp_generic_constraints(&n.generic_params, ctx);
+                for (mut i: i64 = 0; i < n.methods.length; i++) {
+                    const m: MethodNode* = n.methods[i];
+                    if (m == null || m.func == null) { continue; }
+                    TypeResolutionPasses::stamp_generic_constraints(
+                        &m.func.generic_params, ctx);
+                }
+            }
+            _ => { }
+        }
     }
 
     /// Stamp every trait reference reachable from a where/bound list.
@@ -2593,7 +2673,7 @@ type struct TypeResolutionPasses {
         if (!impl_node.is_trait_impl()) { return 0; }
         if (ctx.generic_registry == null) { return 0; }
 
-        const trait_name: SymbolStr = TypeResolutionPasses::extract_trait_leaf(
+        const trait_name: SymbolStr = TypeAnnotation::trait_identity(
             impl_node.trait_annotation);
         if (!trait_name.is_valid()) { return 0; }
 
@@ -2855,7 +2935,8 @@ type struct TypeResolutionPasses {
                         if (ResolveCounter::Audit::Path.enabled()) {
                             const prior: TraitDeclNode* =
                                 ctx.generic_registry.get_trait_decl(
-                                    node.name, "path-audit-dup-probe",
+                                    ctx.qualify_symbol_sym(node.name),
+                                    "path-audit-dup-probe",
                                     ctx.get_intern_table());
                             const leaf: string = ctx.resolve_str(node.name);
                             if (prior == null) {
@@ -2871,7 +2952,14 @@ type struct TypeResolutionPasses {
                                     prior.span.file, node.span.file);
                             }
                         }
-                        ctx.generic_registry.register_trait_decl(node.name, node);
+                        // The import-resolved name is the declaration's
+                        // identity, and also what decides whether this IS the
+                        // language's `Copy`/`Drop`/... - the leaf cannot say
+                        // either, since a user trait may share it.
+                        const trait_id: SymbolStr = ctx.qualify_symbol_sym(node.name);
+                        ctx.generic_registry.register_trait_decl(trait_id, node);
+                        ctx.generic_registry.claim_wellknown_trait(
+                            trait_id, ctx.intern_table);
                     }
 
                     mut trait_ctx: ResolutionContext = runner.make_generic_context(
