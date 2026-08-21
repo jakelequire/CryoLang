@@ -309,9 +309,25 @@ type struct TypeResolver {
         if (a.size != ArrayAnnotation::fixed_pending_size()) { return a.size; }
         if (a.size_expr == null) { return a.size; }
 
-        const module_ns: SymbolStr = if (this.intern_table != null) {
-            this.intern_table.intern(ctx.current_module)
-        } else { SymbolStr::empty() };
+        // A bare constant in a size expression means what it means in the FILE
+        // the annotation was written in.  The ambient cursor is on whichever
+        // module is being walked, which for a trait default's body is the
+        // implementing type's module and not the trait's; the leaf then misses
+        // its own module's table and falls through to the program-wide bare
+        // index, which answers from any module with no import in hand.
+        //
+        // An unknown file leaves the mapping invalid rather than guessing, and
+        // only then does the cursor answer - turning "written nowhere I know"
+        // into "written somewhere else" is the false-positive direction.
+        mut module_ns: SymbolStr = SymbolStr::empty();
+        if (this.module_graph != null) {
+            module_ns = this.module_graph.ns_sym_of_file(a.span.file);
+        }
+        if (!module_ns.is_valid()) {
+            if (this.intern_table != null) {
+                module_ns = this.intern_table.intern(ctx.current_module);
+            }
+        }
 
         // No arena: a size is fixed here, and TypeLowering computes every
         // layout later, so `sizeof`/`alignof` are not yet constants.
