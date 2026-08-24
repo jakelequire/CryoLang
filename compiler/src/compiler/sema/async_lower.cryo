@@ -43,6 +43,13 @@ import std::core::{ option, mem };
 import std::fmt;
 import Compiler::Types::Generic;
 
+/// The canonical name of the type the lowering wraps every completion in.
+/// Synthesized `Poll::…` nodes are SPELLED with it, not just typed by it: a
+/// bare `Poll` in a node no one wrote is resolved by later stages against the
+/// module it was lowered INTO, where the spelling may name something else
+/// entirely or nothing at all.
+const POLL_TYPE: string = "std::future::poll::Poll";
+
 /// The state-machine builder's accumulator for lowering one `async function`
 /// body with >= 1 `await`. `lower` seeds the configuration; the recursive
 /// builder (`build_poll_body_sm` and friends) fills `blocks` — one straight-line
@@ -504,12 +511,21 @@ type struct AsyncLower {
         return p.resolved_type.is_valid();
     }
 
-    /// Resolve a stdlib future type by its import-visible leaf (`Poll`,
-    /// `Context`) to its arena TypeRef. Invalid if the module didn't import it.
-    lookup_future_type(&this, leaf: string) -> TypeRef {
-        const leaf_sym: SymbolStr = this.intern.intern(leaf);
-        const qual: SymbolStr = this.ctx.resolve_scoped_or(leaf_sym, FILE, LINE);
-        return this.ctx.decl_index.lookup_type(qual);
+    /// A stdlib type the async lowering is DEFINED against, by canonical name.
+    ///
+    /// Named canonically rather than resolved through the lowered module's
+    /// import scope.  The lowering emits the references to these types itself,
+    /// so what they denote is fixed by the language and cannot depend on what
+    /// the module being lowered happens to have in scope.  Resolving the bare
+    /// leaf instead finds a user type spelled `Poll` and builds the whole state
+    /// machine against it; what the author then sees is a cascade of errors
+    /// about their own type - no variant `Pending`, no method `is_pending` -
+    /// naming nothing they wrote wrong and never naming `async`.
+    ///
+    /// Invalid when the declaration is absent from the program, which is the
+    /// case the callers' "add `import std::future;`" diagnostics report.
+    lookup_future_type(&this, qualified: string) -> TypeRef {
+        return this.ctx.decl_index.lookup_type(this.intern.intern(qualified));
     }
 
     mint_bare(mut &this, base: string) -> SymbolStr {
@@ -707,9 +723,13 @@ type struct AsyncLower {
     }
 
     /// An annotation for `Poll<X>` over an already-built `X`.
+    ///
+    /// The base is spelled canonically for the reason `lookup_future_type`
+    /// gives: this annotation is emitted by the lowering, so the module being
+    /// lowered does not get to say what `Poll` means in it.
     poll_type_ann(mut &this, arg: TypeAnnotation*, span: SourceSpan) -> TypeAnnotation* {
         mut gen: GenericAnnotation* = new GenericAnnotation {
-            base: this.named_ann(this.ctx.resolve_scoped_or(this.intern.intern("Poll"), FILE, LINE), span),
+            base: this.named_ann(this.intern.intern(POLL_TYPE), span),
             args: [arg],
             span: span,
         };
@@ -763,7 +783,7 @@ type struct AsyncLower {
     /// Wrap an already-typed value expression in `Poll::Ready(<expr>)` typed as
     /// `Poll<Output>`.
     make_poll_ready(&this, value: ExpressionNode*, poll_out: TypeRef, span: SourceSpan) -> ExpressionNode* {
-        return this.variant_call1("Poll", "Ready", value, poll_out, span);
+        return this.variant_call1(POLL_TYPE, "Ready", value, poll_out, span);
     }
 
     /// Rewrite every `return E;` reachable in `stmt` to `return Poll::Ready(E);`,
@@ -1342,7 +1362,7 @@ type struct AsyncLower {
     /// `Poll::Pending` typed `poll_ty`.
     poll_pending(&this, poll_ty: TypeRef, span: SourceSpan) -> ExpressionNode* {
         mut scope: ScopeResolutionNode* = new ScopeResolutionNode(
-            this.intern.intern("Poll"), this.intern.intern("Pending"), span);
+            this.intern.intern(POLL_TYPE), this.intern.intern("Pending"), span);
         scope.set_synthesized_ref(poll_ty, this.ctx.definition_name_of(poll_ty));
         return scope as ExpressionNode*;
     }
@@ -6315,8 +6335,8 @@ type struct AsyncLower {
         // Without `std::future` the module has no future types at all, and
         // `declare` reports that with the message naming the missing import; bow
         // out silently rather than reporting one cause twice.
-        if (!this.lookup_future_type("Poll").is_valid()) { return false; }
-        const exec_ty: TypeRef = this.lookup_future_type("Executor");
+        if (!this.lookup_future_type(POLL_TYPE).is_valid()) { return false; }
+        const exec_ty: TypeRef = this.lookup_future_type("std::future::executor::Executor");
         if (!exec_ty.is_valid()) {
             this.ctx.emit_error_at(ErrorCode::E0233_UNDEFINED_SYMBOL,
                 "`async function main` is driven by an `Executor`; add `import std::future;`",
@@ -6479,9 +6499,11 @@ type struct AsyncLower {
         const span: SourceSpan = node.span;
         const module_sym: SymbolStr = this.intern.intern(this.ctx.source_file);
 
-        // Future core types require the module to import them.
-        const poll_base: TypeRef = this.lookup_future_type("Poll");
-        const ctx_ref:   TypeRef = this.lookup_future_type("Context");
+        // Absent from the PROGRAM, not merely from this module's imports: the
+        // names below are canonical, so the only way they miss is that nothing
+        // imports the module declaring them and it was never compiled.
+        const poll_base: TypeRef = this.lookup_future_type(POLL_TYPE);
+        const ctx_ref:   TypeRef = this.lookup_future_type("std::future::waker::Context");
         if (!poll_base.is_valid() || !ctx_ref.is_valid()) {
             this.ctx.emit_error_at(ErrorCode::E0233_UNDEFINED_SYMBOL,
                 "an `async function` requires the future types in scope; add `import std::future;`",
@@ -6952,7 +6974,7 @@ type struct AsyncLower {
         // parameter has to move out of its field on the single poll, and only a
         // slot that can be left empty records that the future no longer owns it.
         mut body_block: BlockStmtNode* = null;
-        sm.opt_base = this.lookup_future_type("Option");
+        sm.opt_base = this.lookup_future_type("std::core::option::Option");
         if (!sm.opt_base.is_valid()
             && (total_await > 0 || this.params_need_carrier(&this.pending[pi], node))) {
             this.ctx.emit_error_at(ErrorCode::E0233_UNDEFINED_SYMBOL,
