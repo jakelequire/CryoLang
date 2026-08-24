@@ -5852,6 +5852,11 @@ whose stated target is zero measures zero, on both hosts, with every per-site
 row still asserted underneath it. B4 is pinned as a floor so growth in either is
 caught separately, and the two are deliberately not summed.
 
+Both halves of that reading turned out to be incomplete: there were TWO
+consumers, not one (§8.15), and the reason a synthesized `Poll` could reach an
+index keyed by bare leaf at all was that the lowering asked the USER's module
+what `Poll` meant (§8.16).
+
 **What this costs, stated because the gate itself warns about it.** `b1-gate.py`
 requires its target to exercise "enough cross-module resolution for B1 to be
 nonzero - a target with no B1 events would give a gate that cannot observe
@@ -5900,6 +5905,150 @@ the rows where the two mechanisms COULD disagree* - was not applied here.
 Reverted in full. B4 stays. The key an instantiation actually needs is the
 QUALIFIED spec name; what is missing is not a lookup but the qualification,
 which the caller has already lost by the time it reaches this site.
+
+### 8.15 The leaf index's last written name was a stamp two consumers never read — FIXED 2026-08-21
+
+§8.13 left one non-instantiation name in B4: `Poll`, reaching the arena leaf
+index from modules that never imported `std::future::poll`. The references are
+synthesized by async lowering, which stamps them
+(`set_synthesized_ref(poll_ty, definition_name_of(poll_ty))`), so the answer was
+already on the node and a consumer re-derived it from the spelling anyway - the
+§8.10 family.
+
+**Two consumers, not one.** The handoff named `Sema::resolve_scope_resolution`,
+which opens on `lookup_type_by_sym(scope.scope_name)`. It accounted for 7 of 13
+hits on a two-`await` repro; fixing it alone left 6. Probing every caller of
+`lookup_type_by_sym` by tag found the rest in
+`CallResolver::lookup_scope_variant_payload_types` - the payload-type hint for
+`Poll::Ready(v)` - which asks the same question the same way. `Poll::Pending` is
+a value and `Poll::Ready(v)` is a call, so the two shapes leave through
+different doors and both had to be told to read the stamp.
+
+**The fix** is `TypeUtils::scope_qualifier_type`, next to the cascade it
+precedes. `TypeRelative` is the name layer's positive claim that the
+qualifier names a type and it carries WHICH - a canonical name that already
+accounts for the writing module's imports - so the type is looked up by that
+name. Every other answer returns invalid: a qualifier naming a MODULE is not a
+type claim, and a primitive or type-parameter base names no declaration. A stamp
+that claims a type the index does not carry emits `SCOPE-TY-STAMP-MISS` rather
+than searching under a second key; it measures **0** on every population run.
+
+**`lane-check` caught the lookup this added, which is what it is for.** The
+first version asked `decl_index.lookup_type` directly and took
+`type_utils.cryo` from 10 to 11, an increase the gate refuses. The question the
+stamp reader asks - *what type is registered under exactly this canonical name*
+- is the same one the cascade's already-qualified step asks, so both now go
+through one `lookup_type_exact`, and the surface is unchanged at 132 rather than
+re-pinned. Two callers of one primitive is the shape that keeps them from
+drifting into different answers.
+
+**Measured**, on a repro with two `await`s and `std::net::tls` imported:
+
+| | leaf hits | of which `Poll` | written names |
+|---|---:|---:|---:|
+| before | 125 | 13 | 13 |
+| `resolve_scope_resolution` only | 118 | 6 | 6 |
+| both consumers | **112** | **0** | **0** |
+
+No written source name reaches the leaf index on that corpus any more; all 112
+remaining hits are mangled instantiations, which is B4 by mechanism (§8.14).
+
+**B1 and B4 are unchanged at 0 and 156.** `examples/09-json-config` contains no
+written name that reached the leaf index, which §8.13 had already measured, so
+the gate's own target could not move - and it did not. What DID move is
+`M1 CHECK qualifier_agrees`, **calls and agreed both 5572 -> 5566**. Equal
+movement means no answer changed, only that six questions stopped being asked:
+the stamp answers before `lookup_type_by_sym`'s cross-module tier runs, and that
+tier is where `qualifier_agrees` lives. Diffing the `M1-AGREE` stream names all
+six as one path - `libc::Whence` written in `std::fs::file`, resolving to
+`std::ffi::libc::Whence`, which is exactly what the stamp carries. Nothing
+appears in the fixed stream that was not in the baseline.
+
+**A control that had to be built twice.** The first attempt to show the emitted
+code was unchanged hashed an empty file list and reported "identical"; the
+digest turned out to be `md5sum` of empty stdin. The second attempt compared
+executables, and the determinism control - the same compiler run twice - showed
+the PE differs run to run. Neither comparison was evidence. Byte-identity here
+belongs to `selfhost-check`, which knows how to ask for it.
+
+### 8.16 The async lowering let the user's module decide what `Poll` meant — FIXED 2026-08-21
+
+Found while testing whether §8.15's leaf-index answer was load-bearing or
+merely redundant. It was neither: the same root that fed the leaf index also
+produced a wrong answer, and both compilers - before and after §8.15 - failed
+this program.
+
+```cryo
+namespace App::Shadow;
+public type struct Poll { marker: i64; }        // an ordinary user type
+```
+
+with an `async function` anywhere in a module that can see it:
+
+```
+error[E0900]: unresolved generic instantiation after monomorphization:
+              'App::Shadow::Poll<?>'
+error[E0358]: no method named `is_pending` found on type `App::Shadow::Poll<i64>`
+error[E0201]: cannot find value `Poll::Pending` in this scope
+```
+
+Five errors, none of which names `async`, all of them about a struct the author
+declared correctly and never asked to be a future.
+
+**The cause.** `AsyncLower::lookup_future_type` resolved `Poll`, `Context`,
+`Executor` and `Option` **through the import scope of the module being
+lowered**:
+
+```cryo
+const qual: SymbolStr = this.ctx.resolve_scoped_or(leaf_sym, FILE, LINE);
+return this.ctx.decl_index.lookup_type(qual);
+```
+
+These are types the lowering itself emits references to. What they denote is
+fixed by the language, so asking the user's module what the leaf means is asking
+the wrong scope entirely - and the two ways that goes wrong are the two symptoms
+already on file: the scope does not carry the name, so the answer falls through
+to whatever index answers bare leaves (§8.15's `Poll` in B4), or the scope
+carries a DIFFERENT `Poll`, and the state machine is built against it.
+
+The synthesizers had the same defect one level down: `poll_pending`,
+`make_poll_ready` and `poll_type_ann` SPELL their nodes with the bare leaf
+`Poll`, and a synthesized node's `span.file` names the module it was lowered
+INTO. Every consumer that resolves a scope segment by spelling - including
+`resolve_scoped_or_at`, which is careful to judge by the WRITING module - is
+therefore handed a module that never wrote it.
+
+**The fix** names all four types canonically (`std::future::poll::Poll`,
+`std::future::waker::Context`, `std::future::executor::Executor`,
+`std::core::option::Option`), following the tree's existing practice for
+well-known stdlib symbols (`std::collections::array::Array`,
+`std::test::runner::run_all`), and spells the synthesized nodes with the
+canonical name rather than the leaf. `POLL_TYPE` names it once.
+
+The `add `import std::future;`` diagnostics stay correct and stay reachable:
+module discovery is import-driven, so a program that imports the module nowhere
+does not compile it, and the declaration is then absent from the index - which
+is now the only thing those lookups can fail on.
+
+**No import requirement was relaxed.** A prelude-only async project compiled
+before this change and compiles after it; `future` is not in the prelude, so
+those diagnostics were already unreachable for any program whose stdlib was
+built. The change removes the hijack, not a check.
+
+**Measured.** The shadow program above now compiles and runs correctly. B1 and
+B4 are unchanged at 0 and 156.
+
+**An over-reach this caught, recorded because the comment that warned about it
+was right.** A first attempt also made `try_resolve_type_or_variant` read the
+stamp. `M1 CHECK qualifier_agrees` rose by 283 on `examples/09-json-config` - a
+corpus with no `async` in it at all - which is what said the change was doing
+something other than what it was for. The comment at that site already states
+why: a scope segment there can arrive already mangled
+(`6Result$Lu_N$L...`), the registries are keyed by that instantiation, and a
+`Res` names the definition for every instantiation of it. Guarding on written
+generic args does not cover the mangled-spelling case. Reverted; the row
+returned to -6. Fixing the SPELLING at the synthesizer solves the same symptom
+without asking that site to distrust its key.
 
 ---
 

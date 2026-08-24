@@ -21,11 +21,13 @@ import Compiler::Types::{
     TypeRef, Type, Arena, Compound, UserDefined, Generic, Checker, TypeKind
 };
 import Compiler::Resolver::{ SymbolStr, InternTable, Resolver };
+import Compiler::Resolver::Res;
 import Compiler::CompilationContext;
 import Compiler::ResolveCounter;
 import Compiler::DeclIndex;
 import Compiler::AST;
 import Compiler::AST::Node;
+import Compiler::AST::Expression;
 import std::core::slice;
 
 type struct TypeUtils {
@@ -150,6 +152,66 @@ type struct TypeUtils {
         return SymbolStr::empty();
     }
 
+    /// The type registered under EXACTLY this name, with no widening.
+    ///
+    /// A name that is already canonical has nothing left to resolve, so the
+    /// cascade's qualify/cross-module steps would be re-asking a question that
+    /// is already answered.  Shared by the stamp reader below and by the
+    /// cascade's already-qualified step, so the two cannot drift into
+    /// answering it differently.
+    lookup_type_exact(&this, name: SymbolStr) -> TypeRef {
+        return this.ctx.decl_index.lookup_type(name);
+    }
+
+    /// The type this path's QUALIFIER names, read off the answer the name layer
+    /// wrote on the node rather than re-derived from the spelling.
+    ///
+    /// `TypeRelative` is a positive claim that the qualifier names a type, and
+    /// it carries WHICH: a canonical name that already accounts for the imports
+    /// of the module that WROTE the path.  Matching the written spelling
+    /// against the index answers the same question from strictly less
+    /// information - the tier that ends that cascade is keyed by bare leaf and
+    /// so answers from any module in the program, with no import in hand.  That
+    /// is how a reference synthesized into a module which never imported the
+    /// type still resolved, and it would answer just as readily with a
+    /// same-leaf type from a module the writer cannot see.
+    ///
+    /// Invalid for every other answer.  A qualifier naming a MODULE is not a
+    /// type claim, and a base that is a primitive or a type parameter names no
+    /// declaration to look up; manufacturing a type for any of them here would
+    /// assert an ownership the stamp does not make.
+    scope_qualifier_type(&this, scope: ScopeResolutionNode*) -> TypeRef {
+        // Named at the event: the delayed tally says HOW MANY nodes arrived
+        // unclaimed, only a per-node line says WHICH.
+        if (scope.scope_res.is_pending() && !scope.has_resolved_type()) {
+            ResolveCounter::path_hit(
+                "RES-PENDING", this.intern.resolve(scope.scope_name),
+                this.intern.resolve(scope.member_name), scope.span.to_string());
+        }
+        mut base: ResBase = ResBase::PrimTy(scope.scope_name);
+        match (scope.require_scope_res("sema: scope-resolution qualifier")) {
+            Res::TypeRelative(b, _) => { base = b; }
+            _                       => { return TypeRef::invalid(); }
+        }
+        mut q: SymbolStr = SymbolStr::empty();
+        match (base) {
+            ResBase::Def(d) => { q = d; }
+            _               => { return TypeRef::invalid(); }
+        }
+        const ty: TypeRef = this.lookup_type_exact(q);
+        if (!ty.is_valid()) {
+            // The stamp names a declaration the index does not carry under that
+            // name.  Emitted rather than searched for under another key: a
+            // second lookup for a question already answered is how this
+            // cascade grew, and the pair (stamped name, written spelling) is
+            // what says whether the defect is in the stamp or in registration.
+            ResolveCounter::path_hit(
+                "SCOPE-TY-STAMP-MISS", this.intern.resolve(scope.scope_name),
+                this.intern.resolve(q), scope.span.to_string());
+        }
+        return ty;
+    }
+
     // widen: qualified -> direct -> cross-module -> arena-leaf cascade.
     lookup_type_by_sym(&this, name: SymbolStr) -> TypeRef {
         // Current module's qualified name FIRST so module-local types are
@@ -160,7 +222,7 @@ type struct TypeUtils {
             if (q_ty.is_valid()) { return q_ty; }
         }
         // Already-qualified names (specialized impl target_type) + cross-module aliases.
-        const direct: TypeRef = this.ctx.decl_index.lookup_type(name);
+        const direct: TypeRef = this.lookup_type_exact(name);
         if (direct.is_valid()) { return direct; }
         // Cross-module via scope chain.
         const cross_sym: SymbolStr = this.resolve_cross_module_name(name);
