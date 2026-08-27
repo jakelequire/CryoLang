@@ -6052,6 +6052,187 @@ without asking that site to distrust its key.
 
 ---
 
+### 8.17 A module-level `mut` global was stamped as a LOCAL — FIXED 2026-08-27
+
+Found while scoping §5.2's remaining work (the per-kind lookups), by asking what
+`sema/type_utils.cryo::lookup_global_var` would read if it read a stamp instead
+of guessing.
+
+**The defect.** `bare_name_res` mapped `SymbolKind::Variable` straight to
+`Res::Local`:
+
+```cryo
+if (s.kind == SymbolKind::Variable || s.kind == SymbolKind::Parameter) {
+    return ResSlot::Answered(Res::Local(sym_id));
+}
+```
+
+`Variable` is the kind for **both** a function-local binding and a module-level
+`mut` global. Name resolution's own module-level walk makes that split itself —
+an immutable global declares as `Constant`, a mutable one as `Variable` — so the
+two arrive at `bare_name_res` indistinguishable by kind. `Res::Local` carries a
+`SymbolID`, while a global is reached by canonical name in every index a later
+stage consults, so the stamp handed those stages a key nothing is stored under.
+`Res::Local`'s own definition says what it is for: *a local binding (parameter
+or local variable)*.
+
+The asymmetry is why this survived: an immutable global fell through to
+`Res::Def(qualified_name_of(s))` and was right all along. Only the mutable half
+was wrong, and it is the smaller half — **31** module-level `mut` globals across
+stdlib and the compiler against **1,256** consts.
+
+**The fix is the declaring scope, because nothing else separates them.**
+`SymbolKind` cannot, and the spelling cannot. `ScopeKind::is_module_level()`
+(`Global` or `Module`) is the discriminator; a `Variable` bound anywhere else is
+a local and still stamps `Res::Local`.
+
+**Measured, both directions.** A byte-identical result alone would be equally
+consistent with the new branch never executing, so it was instrumented before
+being believed:
+
+| control | result |
+|---|---|
+| new branch fires (probe, `examples/01-hello` alone) | **26** stamps over **9** distinct globals |
+| the scope those globals bind in | **26 / 26** `ScopeKind::Module` |
+| the name each now carries | canonical — `g_seed_state` → `std::collections::hashmap::g_seed_state` |
+| codegen, all 14 examples, every object | **800 / 800 byte-identical** |
+
+The zero in the last row is therefore measured over a population the first row
+proves is not empty. It is zero for a stated reason: the slot's only consumer
+today is `CallResolver::lookup_scope_template`, which answers `null` for
+`Res::Local` (no matching arm) and `null` for `Res::Def(q)` (no template is
+registered under a global's qualified name). A global named like a generic type
+would make these differ, which is what the object comparison was checking; all
+31 are `g_*`/`*_global`, none type-shaped.
+
+Gates at the change: `make test` OVERALL PASS (unit 2106, compile-fail 178,
+projects 38), `b1-check` B1 = 0 / B4 = 156, `lane-check` LOOKUP 132 / REENTRY 6,
+`roster-check` 2106, `vendor-check` 9, `api-index-check` clean.
+
+#### What this was scoping, and what it found instead
+
+The per-kind lookup surface is **132** call sites, and the shape of the
+migration is not what a count of them suggests:
+
+- **Only 1 of the 132 reads a `Res` today.** The stamps that landed over the
+  preceding sessions are almost entirely unconsumed by the type and codegen
+  layers, which is mechanism 4's half that is not yet cashed in.
+- **The map reads are downstream of the real lane.**
+  `CompilationContext::qualify_symbol_sym` — `this.namespace_str` plus string
+  concatenation, the ambient cursor §5.2 says must not exist — has **92** call
+  sites, and **33** of the 132 lookups take their argument from it inside the
+  same function. Routing `lookup_type` through the primitive without deleting
+  the cursor would move the guess one frame up, not remove it.
+- **The registration side already writes both keys.** A global is registered
+  bare *and* under `qualify_symbol_sym`'s spelling, which is what the
+  qualified-then-bare fallback in `lookup_global_var` mirrors. Reading a stamp
+  makes the bare key unnecessary rather than merely unpreferred.
+
+`lookup_global_var`'s fallback is not deleted by this change. Its three callers
+split: one holds an `IdentifierNode` and can read `ident.res` now that the stamp
+is correct, and the other two sit inside `resolve_scope_resolution`'s six-step
+cascade, which has to be restructured rather than re-pointed. That cascade is
+the actual unit of work behind "the global lane", and it is its own change.
+
+### 8.18 A module-level global was never EXPORTED, so the name layer could not answer for one — FIXED 2026-08-27
+
+§8.17 fixed what a global's stamp *says*. This is why so many globals had no
+stamp at all, and it is the reason the global lane had a fallback at all.
+
+**`forward_declare_node` exports every declaration kind except one.**
+
+| kind | export |
+|---|---|
+| Function | `if (is_public) export_symbol(sym_id)` |
+| Struct, Union, Enum, Class, Trait, TypeAlias | `export_symbol(sym_id)` |
+| **VariableDeclaration** | **nothing** |
+
+`lookup_in_module` reads the export set, so a module-level `const` or `mut`
+global was **unreachable across modules by the name layer at all**. That is the
+mechanical origin of the bare-leaf global map: with the name layer unable to
+answer, a later stage had to key globals by leaf, and a leaf key is
+last-write-wins across modules. The fallback was not a shortcut someone took —
+it was the only thing that could answer.
+
+A second gap sat behind it: `Symbol::variable` hardcoded
+`SymbolVisibility::Private` while `Symbol::constant` sets `Public`. The language
+is public-by-default, so a module-level `mut` global was private for no stated
+reason, and `lookup_in_module` filters on `is_public()`. `is_public` is now a
+parameter of `declare_variable` — true at the one module-level call, false at
+the four local ones — so a local is unaffected.
+
+#### What landed
+
+`resolve_identifier` reads `IdentifierNode.res` through
+`TypeUtils::spelling_global`, where "no answer" and "answered, but not a
+definition" are ONE outcome, because a bare name may be a local, a builtin or a
+function and none of those is a failure. `TypeUtils::lookup_global_var` — the
+ambient-cursor qualify followed by a bare-name retry — is **deleted**.
+
+Measured with a tripwire computing both answers and returning the old one:
+
+| corpus | rows | outcome |
+|---|---:|---|
+| 14 examples | 4,509 | 100% SAME |
+| compiler, 245 modules | 1,645 | 100% SAME |
+
+0 REBIND, 0 REGRESS, 0 GAIN over **6,154** rows. SAME requires the stamp to have
+answered, so the run is its own positive control rather than a count of silence.
+
+**The tripwire's first run found defects rather than confirming the change.**
+32 rows regressed, every one with an empty stamp — a cross-module bare reference
+that compiled only through the leaf fallback:
+
+- `INTEREST_READ` / `INTEREST_WRITE` (`std::future::reactor`) and
+  `BLOCKING_DEFAULT_THREADS` (`std::future::blocking`), read from **23 sites**
+  across `net::socket::tcp`, `net::socket::udp`, `net::tls::future` and
+  `process::child`. Fixed by the export gap above.
+- `g_logger`, `g_stderr`, `g_compiler_debug`, declared by `Utils`
+  (`utils/_module.cryo`) and read from `Utils::Logger` (`utils/logger.cryo`),
+  which did not import `Utils`. A child namespace is a separate module and does
+  not inherit its parent's scope, so nothing bound those names. Fixed by adding
+  the import the file always needed.
+
+#### What did NOT land, and the zero that was measured over the wrong population
+
+`resolve_scope_resolution`'s three global tiers — the spelling-derived
+`scope::member` key, a search for a module whose namespace *ends in* that leaf,
+and the bare leaf — were replaced by one exact lookup on the namespace the stamp
+carries, and **reverted**.
+
+The measurement said it was safe: 632 rows over the examples and 422 over the
+compiler, **100% SAME**, with the spelling-derived tier answering **zero** times
+and the bare-leaf tier never reached. The test suite then failed to build:
+
+```
+error[E0201]: cannot find value `probe::BINDGEN_PROBE_PLAIN_CONST` in this scope
+ --> tests/lang/c_import_libclang.cryo:52:15
+```
+
+**Neither corpus contains a C import.** The spelling tier is exactly what
+answers for a C-imported constant, and the population that exercises it is in
+`tests/`, which the tripwire never ran over. A zero measured over 1,054 rows was
+still a zero over the wrong population — the failure mode §7 keeps recording,
+reproduced here in full.
+
+The underlying defect is a **key-space split**, and it is why one key cannot yet
+serve: for `extern module probe := "C" { ... }`, the C-header import engine
+registers the constant under the BARE alias (`probe::NAME`, via
+`qualify_binding_sym`), while the name layer's canonical name for that same
+alias symbol is fully qualified (`CryoTests::…::probe`). One entity, two key
+spaces. Unifying them is the prerequisite for this lookup, and it is its own
+change — it moves what the C-import engine registers, which codegen mangling
+also reads.
+
+Kept from the attempt: `TypeUtils::lookup_global_exact`, the single exact
+lookup both the cascade and `spelling_global` now share.
+
+Gates: `make test` OVERALL PASS (unit 2106, compile-fail 178, projects 38),
+`b1-check` B1 = 0 / B4 = 156 unchanged, `roster-check` 2106, `vendor-check` 9,
+`api-index-check` clean, and **every object of all 14 examples byte-identical**
+to the pre-change compiler (800/800). `lane-check` LOOKUP **132 → 131**, the
+deleted `lookup_global_var` call sites, re-pinned deliberately.
+
 ## 9. Open questions
 
 - **Q1** — Does enforcing §3.3 require per-item `public` on declarations that
