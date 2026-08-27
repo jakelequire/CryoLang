@@ -55,30 +55,38 @@ type struct TypeUtils {
         return this.ctx.decl_index.lookup_func_return(name);
     }
 
-    lookup_global_var(&this, name: SymbolStr) -> TypeRef {
-        // Prefer the current module's qualified global so a same-bare-name
-        // global in another module can't shadow it: the decl-index global map
-        // is keyed by bare name and is last-write-wins, so two modules each
-        // declaring e.g. a private `const FILETIME_TO_UNIX_TICKS` would
-        // otherwise collide (codegen already mangles globals per-namespace,
-        // so the type side must qualify to match). Falls back to the bare
-        // name for globals referenced from outside their declaring module.
-        const qualified: SymbolStr = this.ctx.qualify_symbol_sym(name);
-        if (!qualified.equals(name)) {
-            const q: TypeRef = this.ctx.decl_index.lookup_global(qualified);
-            if (q.is_valid()) { return q; }
-        }
-        return this.ctx.decl_index.lookup_global(name);
+    /// The global a WRITTEN name refers to, or invalid when it refers to
+    /// something else or to nothing.
+    ///
+    /// Absence and "answered, but not a definition" are deliberately one
+    /// outcome: a bare name may be a local, a builtin or a function, so
+    /// neither is a failure and neither licenses a second lookup under
+    /// another key.  The stamp is the writer's own answer, and it is a
+    /// canonical name, which the spelling - a leaf - can never be.
+    spelling_global(&this, slot: ResSlot) -> TypeRef {
+        return match (slot) {
+            ResSlot::Answered(r) => { this.lookup_global_exact(r.def_name()) }
+            _                    => { TypeRef::invalid() }
+        };
     }
 
     /// The global `name` as declared by the module named by `scope_leaf`, for a
     /// qualified `scope_leaf::name` reference. Invalid when no single module
-    /// matches, leaving the caller its existing fallback.
+    /// matches.
     lookup_global_in_scope(&this, name: SymbolStr, scope_leaf: SymbolStr,
                            out_ns: SymbolStr*) -> TypeRef {
         mut module: SymbolStr = SymbolStr::empty();
         return this.ctx.decl_index.find_global_in_scope(name, scope_leaf, this.intern,
                                                         out_ns, &module);
+    }
+
+    /// The global registered under the canonical name `q`.
+    ///
+    /// One key and one lookup: `q` is the name layer's own answer for the
+    /// path, so there is nothing a spelling-derived or leaf-keyed second
+    /// attempt could add except a chance to disagree with it.
+    lookup_global_exact(&this, q: SymbolStr) -> TypeRef {
+        return this.ctx.decl_index.lookup_global(q);
     }
 
     lookup_method_return(&this, type_sym: SymbolStr, method_sym: SymbolStr) -> TypeRef {

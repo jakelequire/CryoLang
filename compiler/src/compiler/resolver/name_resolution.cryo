@@ -190,12 +190,18 @@ public:
                     // `match` arm as a value pattern rather than a binding.
                     const sym_id: SymbolID = if (var_node.is_mutable) {
                         this.resolver.declare_variable(
-                            var_node.name, var_node.span, true)
+                            var_node.name, var_node.span, true, true)
                     } else {
                         this.resolver.declare_constant(
                             var_node.name, var_node.span)
                     };
                     this.resolver.record_resolution(var_node.span, sym_id);
+                    // The export set is what `lookup_in_module` reads, so a
+                    // module-level declaration left out of it cannot be
+                    // resolved across modules by the name layer at all - which
+                    // is what forces a later stage to key the global map by
+                    // bare leaf and take whichever module registered last.
+                    this.resolver.export_symbol(sym_id);
                     if (!var_node.is_mutable) {
                         this.record_const_value(var_node);
                     }
@@ -616,7 +622,8 @@ public:
                         this.resolver.intern_table.resolve(node.name)),
                     node.span);
             }
-            const sym_id: SymbolID = this.resolver.declare_variable(node.name, node.span, node.is_mutable);
+            const sym_id: SymbolID = this.resolver.declare_variable(node.name, node.span, node.is_mutable,
+                                                          false);
             // Record the declaration span so downstream passes (TypeResolution,
             // Sema) can map VarDeclNode.span -> SymbolID for type write-back.
             this.resolver.record_resolution(node.span, sym_id);
@@ -650,7 +657,7 @@ public:
                 }
             }
             const sym_id: SymbolID = this.resolver.declare_variable(
-                b.local_name, b.name_span, b.is_mutable);
+                b.local_name, b.name_span, b.is_mutable, false);
             this.resolver.record_resolution(b.name_span, sym_id);
         }
     }
@@ -733,7 +740,22 @@ public:
         if (s.kind == SymbolKind::GenericParam) {
             return ResSlot::Answered(Res::GenericParam(s.name));
         }
-        if (s.kind == SymbolKind::Variable || s.kind == SymbolKind::Parameter) {
+        if (s.kind == SymbolKind::Parameter) {
+            return ResSlot::Answered(Res::Local(sym_id));
+        }
+        if (s.kind == SymbolKind::Variable) {
+            // A module-level `mut` global and a function local share this
+            // kind, and only the scope each was declared in separates them.
+            // A global is a definition later stages reach by canonical name,
+            // so answering `Local` would hand them a symbol id no index is
+            // keyed by.
+            if (s.scope_id.is_valid()) {
+                const sc: Scope* = this.resolver.get_scope(s.scope_id);
+                if (sc.kind.is_module_level()) {
+                    return ResSlot::Answered(
+                        Res::Def(this.resolver.qualified_name_of(&s)));
+                }
+            }
             return ResSlot::Answered(Res::Local(sym_id));
         }
         if (s.kind == SymbolKind::Method || s.kind == SymbolKind::Field
@@ -1611,7 +1633,8 @@ public:
                 node.set_value(node.binding_name);
                 node.set_binding_name(SymbolStr::empty());
             } else {
-                this.resolver.declare_variable(node.binding_name, node.span, false);
+                this.resolver.declare_variable(node.binding_name, node.span, false,
+                                               false);
             }
         }
     }
@@ -1628,7 +1651,7 @@ public:
         for (mut i: i64 = 0; i < node.elements.length; i++) {
             const pb: PatternBinding* = node.binding_at(i);
             if (pb == null) { continue; }
-            this.resolver.declare_variable(pb.name, pb.span, false);
+            this.resolver.declare_variable(pb.name, pb.span, false, false);
         }
     }
 
