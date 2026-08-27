@@ -51,11 +51,24 @@ stage_common() {
     # $1 = staging dir.  Copies the stdlib (source + archive), LICENSE, VERSION.
     local stage="$1"
     mkdir -p "${stage}/stdlib"
-    # stdlib source + the prebuilt host archive (libcryo.a) the linker pulls
-    # in for user programs; exclude transient per-build .o trees but keep
-    # .bin/libcryo.a.
-    ( cd "${ROOT}/stdlib" && tar --exclude='.bin/obj' --exclude='.bin/win-*' \
-        --exclude='.bin/self' -cf - . ) | ( cd "${stage}/stdlib" && tar -xf - )
+    # stdlib SOURCE only; the archive is placed explicitly below.
+    ( cd "${ROOT}/stdlib" && tar --exclude='.bin' -cf - . ) | ( cd "${stage}/stdlib" && tar -xf - )
+    # The build tree keeps one archive per target under `.bin/<triple>/`, but a
+    # release holds exactly ONE target, so it is staged at the flat path -- the
+    # layout the compiler falls back to and the one an installed tree has by
+    # construction.  Staging flat rather than shipping the per-triple tree is
+    # what keeps the release working when the installing host's toolchain probe
+    # names its triple differently from the build host's.
+    local _triple _archive
+    _triple="$("${ROOT}/bin/cryo" version --triple 2>/dev/null || true)"
+    _archive="${ROOT}/stdlib/.bin/libcryo.a"
+    if [ -n "$_triple" ] && [ -f "${ROOT}/stdlib/.bin/${_triple}/libcryo.a" ]; then
+        _archive="${ROOT}/stdlib/.bin/${_triple}/libcryo.a"
+    fi
+    if [ -f "$_archive" ]; then
+        mkdir -p "${stage}/stdlib/.bin"
+        cp "$_archive" "${stage}/stdlib/.bin/libcryo.a"
+    fi
     [ -f "${ROOT}/LICENSE" ] && cp "${ROOT}/LICENSE" "${stage}/LICENSE" || true
     stage_third_party_licenses "$stage"
     echo "$VER" > "${stage}/VERSION"

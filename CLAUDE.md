@@ -197,10 +197,11 @@ honest zeros here were measured over the wrong population entirely.
   named from `cryo version --triple`, asked of the compiler because a native
   triple comes from a toolchain probe; an empty answer is a hard error, since
   building flat is the failure this prevents.
-- `stdlib/.bin/libcryo.a` is still ONE archive for every target. A cross build
-  does not consume it (std is recompiled per-target into object files), but a
-  WSL-native `make stdlib` overwrites the Windows one; the next native link
-  then fails at *link* with `__ImageBase undefined`. Fix: `make stdlib`.
+- The stdlib archive builds to `stdlib/.bin/<triple>/libcryo.a` for the same
+  reason, so a WSL-native `make stdlib` no longer overwrites the Windows one.
+  A flat `stdlib/.bin/libcryo.a` is the pre-split layout and is removed by the
+  `stdlib` target; the flat path stays meaningful for an INSTALLED tree, which
+  holds one target by construction, and a release stages it there.
 - A scratch project outside the repo cannot find the stdlib — set
   `CRYO_STDLIB`. `compiler/build/cryo` cannot find it from another directory;
   `bin/cryo` can.

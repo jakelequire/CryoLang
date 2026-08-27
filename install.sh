@@ -299,7 +299,14 @@ dev_run() {
     REPO_ROOT="$(dirname "$SCRIPT_PATH")"
     SRC_BIN="${REPO_ROOT}/bin/cryo"
     SRC_STDLIB="${REPO_ROOT}/stdlib"
+    # The archive lives under `.bin/<triple>/` in a build tree and at the flat
+    # path in an installed one; this is only an existence probe deciding whether
+    # to run `make stdlib`, and the compiler resolves the real path itself.
     SRC_STDLIB_ARCHIVE="${SRC_STDLIB}/.bin/libcryo.a"
+    _src_triple="$("${SRC_BIN}" version --triple 2>/dev/null || true)"
+    if [ -n "${_src_triple}" ] && [ -f "${SRC_STDLIB}/.bin/${_src_triple}/libcryo.a" ]; then
+        SRC_STDLIB_ARCHIVE="${SRC_STDLIB}/.bin/${_src_triple}/libcryo.a"
+    fi
     SRC_LSP=""
     if [ -x "${REPO_ROOT}/bin/cryolsp" ]; then
         SRC_LSP="${REPO_ROOT}/bin/cryolsp"
