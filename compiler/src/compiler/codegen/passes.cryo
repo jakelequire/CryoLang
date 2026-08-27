@@ -332,6 +332,27 @@ type struct CodegenPasses {
         return "";
     }
 
+    /// The stdlib archive to link for `triple`.
+    ///
+    /// Prefers `<root>/.bin/<triple>/libcryo.a`.  One archive per target is
+    /// what stops a native build and a build for another target from
+    /// overwriting each other's `libcryo.a` in place -- they are both ar
+    /// archives with the same name, so the loser is not detected until the
+    /// link reports another architecture's objects.
+    ///
+    /// Unlike `runtime_dir_pick` this falls back to the flat path rather than
+    /// to "" when nothing is present: the result is handed to the linker
+    /// either way, so naming the canonical location is what makes a missing
+    /// archive report itself as the file it should have been.
+    static stdlib_archive_path(stdlib_root: string, triple: string) -> string {
+        const per_target: string = format("%s/.bin/%s/libcryo.a",
+                                          stdlib_root, triple);
+        if (metadata::exists(Path::from(per_target))) {
+            return per_target;
+        }
+        return format("%s/.bin/libcryo.a", stdlib_root);
+    }
+
     /// Locate the directory holding the runtime tier archives for `triple`, or
     /// "" when none can be found (the caller then links no tiers, exactly as
     /// before this locator existed).
@@ -1602,8 +1623,8 @@ type struct CodegenPasses {
         // target != host).
         if (link_cfg.use_stdlib_archive && !cfg.no_std && !cfg.no_runtime
                 && ctx.stdlib_root.length() > 0) {
-            const stdlib_archive: string = format("%s/.bin/libcryo.a",
-                ctx.stdlib_root);
+            const stdlib_archive: string = CodegenPasses::stdlib_archive_path(
+                ctx.stdlib_root, effective_triple);
             cmd = format("%s %s", cmd, CodegenPasses::link_quote(stdlib_archive));
         }
         // A freestanding link has no libc to satisfy the panic/alloc/backtrace
@@ -1778,8 +1799,8 @@ type struct CodegenPasses {
         // and let the linker error if the program needs stdlib symbols.
         if (link_cfg.use_stdlib_archive && !ctx.project_no_runtime
                 && ctx.stdlib_root.length() > 0) {
-            const stdlib_archive: string = format("%s/.bin/libcryo.a",
-                ctx.stdlib_root);
+            const stdlib_archive: string = CodegenPasses::stdlib_archive_path(
+                ctx.stdlib_root, raw_triple);
             cmd = format("%s %s", cmd, CodegenPasses::link_quote(stdlib_archive));
         }
         if (ctx.project_no_runtime) {
