@@ -710,20 +710,58 @@ public:
 
     // -- Expressions --
 
+    /// The `Res` a scope lookup's answer records for a BARE name.
+    ///
+    /// One mapping, because `SymbolKind` is what decides which variant is true
+    /// and a second copy of that decision is a second opinion about the same
+    /// symbol.
+    ///
+    /// `qualified_name_of` builds `module::leaf`, which is the canonical name
+    /// of a declaration living directly in a module and is NOT the canonical
+    /// name of a MEMBER - a method, a field and an enum variant are all named
+    /// through their owner, so `module::leaf` for one of them is a name nothing
+    /// is registered under.  Those are left unanswered rather than stamped with
+    /// a name no later stage can check; an unanswered slot is reported against
+    /// whatever stage actually needed it.
+    ///
+    /// Returned as a `ResSlot` because "this lookup names nothing a `Res` can
+    /// state" is exactly `Pending`, and the resolver is the one place allowed
+    /// to observe it.
+    bare_name_res(&this, sym_id: SymbolID) -> ResSlot {
+        if (!sym_id.is_valid()) { return ResSlot::Pending; }
+        const s: Symbol = this.resolver.get_symbol(sym_id);
+        if (s.kind == SymbolKind::GenericParam) {
+            return ResSlot::Answered(Res::GenericParam(s.name));
+        }
+        if (s.kind == SymbolKind::Variable || s.kind == SymbolKind::Parameter) {
+            return ResSlot::Answered(Res::Local(sym_id));
+        }
+        if (s.kind == SymbolKind::Method || s.kind == SymbolKind::Field
+                || s.kind == SymbolKind::EnumVariant) {
+            return ResSlot::Pending;
+        }
+        return ResSlot::Answered(Res::Def(this.resolver.qualified_name_of(&s)));
+    }
+
     override visit(node: IdentifierNode*) -> void {
-        const sym_id: SymbolID = this.resolver.lookup(
+        mut sym_id: SymbolID = this.resolver.lookup(
             node.name, this.resolver.current_scope);
-        if (sym_id.is_valid()) {
-            this.resolver.record_resolution(node.span, sym_id);
-        } else {
+        if (!sym_id.is_valid()) {
             LOG_DEBUG(LogComponent::General, "[NameResolver] Identifier '%s' not found in scope", this.resolver.intern_table.resolve(node.name));
             // Check import aliases
-            const alias_id: SymbolID = this.resolver.lookup_import_alias(node.name);
-            if (alias_id.is_valid()) {
-                this.resolver.record_resolution(node.span, alias_id);
-            }
+            sym_id = this.resolver.lookup_import_alias(node.name);
             // No error here; could be a built-in type or forward reference
             // that will be resolved by TypeResolution
+        }
+        if (sym_id.is_valid()) {
+            this.resolver.record_resolution(node.span, sym_id);
+        }
+        // Stamped from the lookup already performed, never a second one: the
+        // scope this walk stands in is the scope the name was written in, and
+        // that is the only place the answer is knowable.
+        match (this.bare_name_res(sym_id)) {
+            ResSlot::Answered(r) => { node.set_res(r); }
+            _                    => { }
         }
     }
 
@@ -1080,34 +1118,37 @@ public:
         }
     }
 
-    /// Record what one annotation's written name refers to, as the file that
-    /// WROTE it can see - never as the module the walk happens to be standing
-    /// in.
+    /// What a written TYPE SPELLING refers to, as the file that WROTE it can
+    /// see - never as the module the walk happens to be standing in.
     ///
-    /// Silent rather than guessing in every case it cannot answer. A name left
-    /// `Pending` is not a failed lookup: the type layer still resolves it as
-    /// it always did, and this is the only reason adding the stamp cannot
-    /// change what a program compiles to.
+    /// One answering path for every written type name, whatever node carries
+    /// it: an annotation and a generic struct literal's `struct_type` ask the
+    /// same question of the same syntax, and a second walk for the second node
+    /// would be a second opinion about the same spelling - answering, in
+    /// particular, straight past a module the writer cannot reach.
     ///
-    /// Re-entrant by construction rather than by an early-out: `answer` keeps
-    /// the first walk's result, so a second walk standing in a different module
-    /// cannot replace what the writing file could see.
-    stamp_named_annotation(&this, n: NamedAnnotation*) -> void {
+    /// `Pending` rather than a guess in every case it cannot answer. That is
+    /// not a failed lookup: the type layer still resolves the name as it always
+    /// did, and it is the only reason adding a stamp cannot change what a
+    /// program compiles to.
+    ///
+    /// The tallies here count written type spellings, annotations and literals
+    /// alike, despite their `AnnRes` names.
+    type_spelling_res(&this, name: SymbolStr, span: SourceSpan) -> ResSlot {
         ResolveCounter::Site::AnnResSeen.bump();
-        const written: string = this.resolver.intern_table.resolve(n.name);
-        if (written.length() == 0) { return; }
+        const written: string = this.resolver.intern_table.resolve(name);
+        if (written.length() == 0) { return ResSlot::Pending; }
 
         // A generic parameter names ITSELF, never whatever a call site binds it
         // to. Answering it here is what keeps the stamp a statement about
         // syntax; substitution happens strictly below this, in the type layer.
         const in_scope: SymbolID =
-            this.resolver.lookup(n.name, this.resolver.current_scope);
+            this.resolver.lookup(name, this.resolver.current_scope);
         if (in_scope.is_valid()) {
             const sym: Symbol = this.resolver.get_symbol(in_scope);
             if (sym.kind == SymbolKind::GenericParam) {
-                n.res.answer(Res::GenericParam(n.name));
                 ResolveCounter::Site::AnnResGenericParam.bump();
-                return;
+                return ResSlot::Answered(Res::GenericParam(name));
             }
         }
 
@@ -1139,9 +1180,8 @@ public:
                     if (hs.kind == SymbolKind::Type) {
                         hb = ResBase::Def(this.resolver.qualified_name_of(&hs));
                     }
-                    n.res.answer(Res::TypeRelative(hb, trailing));
                     ResolveCounter::Site::AnnResTypeRelative.bump();
-                    return;
+                    return ResSlot::Answered(Res::TypeRelative(hb, trailing));
                 }
             }
             // The head names neither a type nor a generic parameter, so the
@@ -1155,7 +1195,7 @@ public:
             // annotation's OWN module rather than the cursor's, because a
             // qualified spelling means what the writing file's imports say it
             // means and the cursor is on whatever module the pass is walking.
-            const q_ns: SymbolStr = this.ctx.module_ns_sym_of_file(n.span.file);
+            const q_ns: SymbolStr = this.ctx.module_ns_sym_of_file(span.file);
             if (q_ns.is_valid()) {
                 const q_prefix: string = QualifiedName::parent_of(written);
                 const q_mods: ModuleSpellingMatch =
@@ -1174,7 +1214,6 @@ public:
                         const q_sym: Symbol = this.resolver.get_symbol(q_rooted);
                         const q_def: SymbolStr =
                             this.resolver.qualified_name_of(&q_sym);
-                        n.res.answer(Res::Def(q_def));
                         ResolveCounter::Site::AnnResDef.bump();
                         // Emitted with the DEFINITION it landed on, not just a
                         // tally: the whole point of rooting the path is which of
@@ -1183,7 +1222,7 @@ public:
                         ResolveCounter::path_hit(
                             "ANN-ROOTED", this.resolver.intern_table.resolve(q_ns),
                             written, this.resolver.intern_table.resolve(q_def));
-                        return;
+                        return ResSlot::Answered(Res::Def(q_def));
                     }
                 } else {
                     // No module in the program spells the prefix, so the head
@@ -1198,9 +1237,8 @@ public:
                             this.resolver.resolve_type_qualified_name_strict_from(
                                 ScopeID { id: q_sid }, written);
                         if (mqn.is_valid()) {
-                            n.res.answer(Res::Def(mqn));
                             ResolveCounter::Site::AnnResDef.bump();
-                            return;
+                            return ResSlot::Answered(Res::Def(mqn));
                         }
                     }
                 }
@@ -1211,28 +1249,28 @@ public:
             // cannot produce is how a tool limitation becomes a claim.
             ResolveCounter::path_hit(
                 "ANN-QUALIFIED", this.resolver.intern_table.resolve(
-                    this.ctx.module_ns_sym_of_file(n.span.file)),
-                written, n.span.to_string());
-            return;
+                    this.ctx.module_ns_sym_of_file(span.file)),
+                written, span.to_string());
+            return ResSlot::Pending;
         }
 
         // The use site comes from the syntax. A span naming no module means a
         // synthesized node, and a synthesizer that knows its referent sets the
         // `Res` itself; judging against an invalid namespace would compare
         // unequal to every real module and refuse everything.
-        const use_ns: SymbolStr = this.ctx.module_ns_sym_of_file(n.span.file);
+        const use_ns: SymbolStr = this.ctx.module_ns_sym_of_file(span.file);
         if (!use_ns.is_valid()) {
             ResolveCounter::Site::AnnResNoHome.bump();
-            return;
+            return ResSlot::Pending;
         }
         const home_sid: u64 =
             this.resolver.find_module_scope(this.resolver.intern_table.resolve(use_ns));
         if (home_sid == 0) {
             ResolveCounter::Site::AnnResNoHomeScope.bump();
-            return;
+            return ResSlot::Pending;
         }
         const qn: SymbolStr = this.resolver.resolve_type_qualified_name_bare_from(
-            ScopeID { id: home_sid }, n.name);
+            ScopeID { id: home_sid }, name);
         if (!qn.is_valid()) {
             ResolveCounter::Site::AnnResUnresolved.bump();
             // Emitted at the event: the tally says how many names the writer's
@@ -1240,11 +1278,24 @@ public:
             // the bucket can be classified instead of guessed at.
             ResolveCounter::path_hit(
                 "ANN-UNSTAMPED", this.resolver.intern_table.resolve(use_ns),
-                written, n.span.to_string());
-            return;
+                written, span.to_string());
+            return ResSlot::Pending;
         }
-        n.res.answer(Res::Def(qn));
         ResolveCounter::Site::AnnResDef.bump();
+        return ResSlot::Answered(Res::Def(qn));
+    }
+
+    /// Record what one annotation's written name refers to.
+    ///
+    /// The annotation is one of two nodes carrying a written TYPE SPELLING;
+    /// a generic struct literal's `struct_type` is the other, and both are
+    /// answered by `type_spelling_res` so the two cannot come to disagree
+    /// about what a spelling names.
+    stamp_named_annotation(&this, n: NamedAnnotation*) -> void {
+        match (this.type_spelling_res(n.name, n.span)) {
+            ResSlot::Answered(r) => { n.res.answer(r); }
+            _                    => { }
+        }
     }
 
     override visit(node: CallExprNode*) -> void {
@@ -1356,6 +1407,14 @@ public:
             node.struct_type, this.resolver.current_scope);
         if (type_sym.is_valid()) {
             this.resolver.record_resolution(node.span, type_sym);
+        }
+        // The literal names a TYPE, and its spelling may be qualified, so it
+        // is the annotation's question rather than the single-segment scope
+        // lookup a bare value name gets - `type_sym` above answers whether the
+        // leaf binds here, which is not the same thing.
+        match (this.type_spelling_res(node.struct_type, node.span)) {
+            ResSlot::Answered(r) => { node.set_res(r); }
+            _                    => { }
         }
 
         // Visit field initializer expressions

@@ -107,6 +107,16 @@ public:
     /// the reader after a function they never meant to call.
     generic_angle_guessed: boolean;
 
+    /// What this name refers to, stamped by NameResolution from the scope the
+    /// writer stands in.
+    ///
+    /// A bare identifier is a whole path rather than the head of one, so there
+    /// is no trailing segment for the type layer and `TypeRelative` never
+    /// appears here.  The spelling is a leaf while every index a later stage
+    /// consults is keyed canonically, so this slot is the only place the two
+    /// meet without a search.
+    res:                 ResSlot;
+
     IdentifierNode(name: SymbolStr, span: SourceSpan)
         : ExpressionNode(NodeKind::Identifier, span) {
         this.name                = name;
@@ -114,6 +124,14 @@ public:
         this.generic_args        = [];
         this.resolved_callee     = SymbolStr::empty();
         this.generic_angle_guessed = false;
+        this.res                 = ResSlot::Pending;
+    }
+
+    /// Record what this name refers to.  The first answer wins, for the reason
+    /// `ScopeResolutionNode::set_scope_res` gives: a `Res` states what the file
+    /// that WROTE the name can see.
+    set_res(r: Res) -> void {
+        this.res.answer(r);
     }
 
     set_generic_angle_guessed(v: boolean) -> void {
@@ -580,11 +598,39 @@ public:
     generic_args: TypeAnnotation*[];
     field_inits:  FieldInit[];
 
+    /// What `struct_type` names, stamped by NameResolution from the scope the
+    /// literal was written in.  A literal names one type outright, so there is
+    /// no trailing segment and `TypeRelative` never appears here.
+    res:          ResSlot;
+
     StructLiteralNode(struct_type: SymbolStr, span: SourceSpan)
         : ExpressionNode(NodeKind::StructLiteral, span) {
         this.struct_type  = struct_type;
         this.generic_args = [];
         this.field_inits  = [];
+        this.res          = ResSlot::Pending;
+    }
+
+    /// Record what the literal's type name refers to.  First answer wins.
+    set_res(r: Res) -> void {
+        this.res.answer(r);
+    }
+
+    /// Record what a SYNTHESIZED literal's type name refers to.
+    ///
+    /// A pass that builds a path-bearing node owes it a `Res`, for the reason
+    /// `ScopeResolutionNode::set_synthesized_ref` gives: name resolution has
+    /// already run by the time the node exists, so the synthesizer is the only
+    /// place the referent is known without a lookup, and a consumer left to
+    /// guess for synthesized nodes keeps the guess alive for written ones too.
+    ///
+    /// `def_name` is the canonical name the pass registered the type under, not
+    /// the spelling it happened to write.  An empty one leaves the slot
+    /// unanswered rather than inventing a base, so the stage that needed the
+    /// answer reports it instead of this absorbing it.
+    set_synthesized_res(def_name: SymbolStr) -> void {
+        if (!def_name.is_valid()) { return; }
+        this.set_res(Res::Def(def_name));
     }
 
     set_generic_args(args: TypeAnnotation*[]) -> void {
@@ -826,9 +872,11 @@ public:
     /// is not recoverable from `scope_name`: the source may write any
     /// whole-segment suffix of it, and several modules can share one suffix.
     ///
-    /// Stays `Pending` when the segment names a TYPE.  That is a different
-    /// question, not a failed one - it needs the receiver's type and so is
-    /// answered by sema, which owns type-relative paths.
+    /// A segment naming a TYPE is stamped too, as `TypeRelative`: the name
+    /// layer records the type it stopped on and leaves the member segment to
+    /// sema.  The slot is unanswered only when nothing in the program owns the
+    /// segment, where a stamp would assert an ownership no later stage could
+    /// check.
     scope_res:          ResSlot;
 
     ScopeResolutionNode(scope_name: SymbolStr, member_name: SymbolStr, span: SourceSpan)
