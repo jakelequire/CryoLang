@@ -48,7 +48,6 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STDLIB = os.path.join(ROOT, "stdlib")
-ARCHIVE = os.path.join(ROOT, "stdlib", ".bin", "libcryo.a")
 # Both pins live side by side, so the name has to be chosen rather than assumed:
 # handing the ELF to CreateProcess raises WinError 193 ("not a valid Win32
 # application"), which surfaces as a traceback rather than as the "cryo
@@ -56,6 +55,32 @@ ARCHIVE = os.path.join(ROOT, "stdlib", ".bin", "libcryo.a")
 CRYO = os.path.join(
     ROOT, "bin", "cryo.exe" if sys.platform.startswith("win") else "cryo"
 )
+
+
+def _archive_path() -> str:
+    """The stdlib archive built for THIS host.
+
+    One archive per target lives under `.bin/<triple>/`, so two hosts sharing a
+    checkout no longer overwrite each other's `libcryo.a`; the flat path is what
+    a single-target tree and an installed toolchain look like. The triple is
+    asked of the compiler for the same reason the build system asks it: a native
+    triple comes from a toolchain probe and cannot be derived here.
+    """
+    flat = os.path.join(ROOT, "stdlib", ".bin", "libcryo.a")
+    if not os.path.exists(CRYO):
+        return flat
+    try:
+        triple = subprocess.run([CRYO, "version", "--triple"],
+                                capture_output=True, text=True).stdout.strip()
+    except OSError:
+        return flat
+    if not triple:
+        return flat
+    per_target = os.path.join(ROOT, "stdlib", ".bin", triple, "libcryo.a")
+    return per_target if os.path.exists(per_target) else flat
+
+
+ARCHIVE = _archive_path()
 OUT = os.path.join(ROOT, "docs", "stdlib-api.txt")
 
 # ---------------------------------------------------------------- source scan
@@ -350,7 +375,7 @@ def report_cross_check(n_linked, n_unlinked, note):
         print(f"api-index: {note}")
         return
     print(f"api-index: cross-check -- {n_linked} free functions linked into "
-          f"stdlib/.bin/libcryo.a; {n_unlinked} declared in source without a "
+          f"{os.path.relpath(ARCHIVE, ROOT)}; {n_unlinked} declared in source without a "
           f"symbol (expected -- generic templates the stdlib never instantiates)")
 
 

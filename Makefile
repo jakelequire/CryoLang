@@ -16,7 +16,7 @@
 ROOT       := $(CURDIR)
 PIN        := $(ROOT)/bin/cryo
 STAGE2     := $(ROOT)/compiler/build/cryo
-LIBCRYO_A  := $(ROOT)/stdlib/.bin/libcryo.a
+LIBCRYO_A   = $(ROOT)/stdlib/.bin/$(HOST_TRIPLE)/libcryo.a
 
 # Every .cryo the self-hosted compiler is built from.  The stage-2 file rules
 # below depend on these so an existing `compiler/build/cryo[.exe]` is treated
@@ -214,16 +214,26 @@ $(PIN):
 # use `bin/cryo.exe` with backslash separators and the cmd `rmdir` builtin.
 # The pin auto-detects the stdlib from its own location (it sits beside
 # `stdlib/`), so no CRYO_STDLIB is needed - same as the Linux recipe.
+# The archive is built per target into `stdlib/.bin/<triple>/libcryo.a`, and
+# only THAT directory is wiped first.  A flat `stdlib/.bin/libcryo.a` is the
+# pre-split layout: nothing writes it here any more, and leaving one in a dev
+# tree would let a link silently fall back to another target's archive, so it
+# is removed rather than left to be found.  The flat path stays meaningful for
+# an INSTALLED tree, which holds one target by construction.
 ifeq ($(HOST_OS),windows)
 stdlib:
-	@echo "==> Building stdlib via bin/cryo.exe"
-	@if exist "stdlib\.bin" rmdir /s /q "stdlib\.bin"
-	@cd stdlib && "$(subst /,\,$(PIN_EXE))" build
+	$(if $(strip $(HOST_TRIPLE)),,$(error stdlib: `cryo version --triple` returned nothing; the pinned compiler is too old))
+	@echo "==> Building stdlib for $(HOST_TRIPLE) via bin/cryo.exe"
+	@if exist "stdlib\.bin\$(HOST_TRIPLE)" rmdir /s /q "stdlib\.bin\$(HOST_TRIPLE)"
+	@if exist "stdlib\.bin\libcryo.a" del /q "stdlib\.bin\libcryo.a"
+	@cd stdlib && "$(subst /,\,$(PIN_EXE))" build --build-dir=.bin/$(HOST_TRIPLE)
 else
 stdlib: $(PIN)
-	@echo "==> Building stdlib via bin/cryo"
-	@rm -rf stdlib/.bin
-	@cd stdlib && "$(PIN)" build
+	$(if $(strip $(HOST_TRIPLE)),,$(error stdlib: `cryo version --triple` returned nothing; the pinned compiler is too old))
+	@echo "==> Building stdlib for $(HOST_TRIPLE) via bin/cryo"
+	@rm -rf stdlib/.bin/$(HOST_TRIPLE)
+	@rm -f stdlib/.bin/libcryo.a
+	@cd stdlib && "$(PIN)" build --build-dir=.bin/$(HOST_TRIPLE)
 endif
 
 # ---- self-hosted compiler via the pin ---------------------------------

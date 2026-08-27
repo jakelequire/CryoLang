@@ -29,7 +29,7 @@ top-level clutter:
 
 The `.bin/self/sN` archives are written by their corresponding compiler
 stage but never read back - every compiler stage links against the
-canonical `<stdlib>/.bin/libcryo.a` produced in round 1. Rebuilding
+canonical `<stdlib>/.bin/<triple>/libcryo.a` produced in round 1. Rebuilding
 stdlib at each round is a smoke test that the stage's codegen handles
 the stdlib source, not a link dependency.
 
@@ -168,11 +168,17 @@ def make_stages():
         ),
         # ------------------------------------------------------------------
         # Round 1: pinned boot -> stage-2  (default build dirs)
+        #
+        # The stdlib archive goes to `.bin/<triple>`, which is where the link
+        # resolves it from.  Writing it flat here would leave every compiler
+        # stage linking whatever `make stdlib` last left in the per-target
+        # directory instead of the archive this round just produced.
         # ------------------------------------------------------------------
         Stage(
-            src="stdlib", via="pinned", to=".bin",
+            src="stdlib", via="pinned", to=f".bin/{host_triple}",
             cwd=ROOT / "stdlib",
-            cmd=[str(BOOT), "build", "--no-incremental"],
+            cmd=[str(BOOT), "build", "--no-incremental",
+                 f"--build-dir=.bin/{host_triple}"],
         ),
         Stage(
             src="compiler", via="pinned", to="build",
@@ -532,7 +538,12 @@ def make_windows_stages(runner: list, env: dict) -> list:
     return [
         Stage("runtime",  "pinned",  f".bin/{wt}",          rt,            list(runner) + tiers + [f"--build-dir=.bin/{wt}"], env),
         Stage("runtime",  "pinned",  f".bin/{wt} (hosted)", rt / "hosted", list(runner) + tiers + [f"--build-dir=../.bin/{wt}"], env),
-        Stage("stdlib",   "pinned",  ".bin/self/win-s1",  sl, build(boot, ".bin/self/win-s1"), env),
+        # Round 1 writes the CANONICAL per-target archive, as the Linux chain
+        # does, because the compiler stages below link it.  Sending it to
+        # `.bin/self/win-s1` instead left this chain silently reusing whatever
+        # a previous `make cryo` had put at the canonical path -- so it passed
+        # only in a tree that already held a matching archive.
+        Stage("stdlib",   "pinned",  f".bin/{wt}",          sl, build(boot, f".bin/{wt}"), env),
         Stage("compiler", "pinned",  "build/self/win-s2", cm, build(boot, "build/self/win-s2"), env),
         Stage("stdlib",   "stage-2", ".bin/self/win-s2",  sl, build(s2,   ".bin/self/win-s2"), env),
         Stage("compiler", "stage-2", "build/self/win-s3", cm, build(s2,   "build/self/win-s3", emit=True), env),
