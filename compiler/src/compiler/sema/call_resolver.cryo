@@ -433,7 +433,7 @@ type struct CallResolver {
         }
         if (scope.scope_generic_args.length > 0) {
             const spec_sym: SymbolStr = this.resolve_generic_scope_name(
-                scope.scope_name, scope.scope_generic_args, scope.span);
+                scope.scope_name, scope.scope_generic_args, scope.span, scope);
             if (spec_sym.is_valid()) {
                 const spec_ref: TypeRef = this.types.lookup_type_by_sym(spec_sym);
                 if (spec_ref.is_valid()) { type_ref = spec_ref; }
@@ -584,7 +584,7 @@ type struct CallResolver {
             const sr: ScopeResolutionNode* = call.callee as ScopeResolutionNode*;
             if (sr.scope_generic_args.length == 0) { return out; }
             if (this.ctx.type_resolver == null) { return out; }
-            tmpl = this.lookup_scope_template(sr.scope_name);
+            tmpl = this.lookup_scope_template(sr.scope_name, sr);
             if (tmpl == null) { return out; }
             mut res_ctx: ResolutionContext = ResolutionContext::new(FILE, LINE, this.ctx.source_file, "", "", HomeOrigin::Unset);
             // `Wrap<u8>::make` - the turbofish is syntax the CALLER wrote, so its
@@ -885,7 +885,7 @@ type struct CallResolver {
             }
             if (inferred_generic_ret.is_valid()) { return inferred_generic_ret; }
             if (call.generic_args.length > 0) {
-                const spec_sym: SymbolStr = this.resolve_generic_scope_name(ident.name, call.generic_args, call.span);
+                const spec_sym: SymbolStr = this.resolve_generic_scope_name(ident.name, call.generic_args, call.span, null);
                 if (spec_sym.is_valid()) {
                     call.set_resolved_callee(spec_sym);
                     const spec_ret: TypeRef = this.types.lookup_func_return(spec_sym);
@@ -3686,7 +3686,7 @@ type struct CallResolver {
         mut lookup_sym: SymbolStr =
             this.ctx.resolve_scoped_or_at(scope.scope_name, scope.span.file, FILE, LINE);
         if (scope.scope_generic_args.length > 0) {
-            const spec_sym: SymbolStr = this.resolve_generic_scope_name(scope.scope_name, scope.scope_generic_args, scope.span);
+            const spec_sym: SymbolStr = this.resolve_generic_scope_name(scope.scope_name, scope.scope_generic_args, scope.span, scope);
             if (spec_sym.is_valid()) { lookup_sym = spec_sym; }
         }
         const method_ret: TypeRef = this.try_resolve_static_method(scope, lookup_sym, call);
@@ -5009,9 +5009,9 @@ type struct CallResolver {
             if (!spec_sym.is_valid()) {
                 const base: SymbolStr = tmpl.spec_base_name(this.intern);
                 if (scope != null && scope.generic_args.length > 0) {
-                    spec_sym = this.resolve_generic_scope_name(base, scope.generic_args, scope.span);
+                    spec_sym = this.resolve_generic_scope_name(base, scope.generic_args, scope.span, null);
                 } else if (call.generic_args.length > 0) {
-                    spec_sym = this.resolve_generic_scope_name(base, call.generic_args, call.span);
+                    spec_sym = this.resolve_generic_scope_name(base, call.generic_args, call.span, null);
                 }
             }
             if (spec_sym.is_valid()) {
@@ -5074,11 +5074,46 @@ type struct CallResolver {
     }
 
     /// The generic template a scope-call's scope names (`Atomic` in
-    /// `Atomic<u64>::new(..)`), or null.  The scope arrives as written, so all
-    /// four keys it can be registered under are tried: verbatim, through the
-    /// module graph, qualified into the current namespace, and as a
-    /// cross-module leaf.
-    lookup_scope_template(&this, base_name: SymbolStr) -> TemplateEntry* {
+    /// `Atomic<u64>::new(..)`).
+    ///
+    /// `scope` is the node that WROTE the name, or null where the caller holds
+    /// none. With a node the answer is the `Res` the resolver stamped on it:
+    /// `Res` names a DEFINITION and the registry is keyed by that same
+    /// canonical name, so the two meet without a search. That is also why a
+    /// mangled spelling answers here and cannot below - the stamp names what
+    /// the instantiation is OF, which no spelling of it carries.
+    ///
+    /// The branch is on which node kind asked, not on whether a lookup failed:
+    /// a caller with a stamp never reaches the derivation, and one without has
+    /// nothing to read.
+    lookup_scope_template(&this, base_name: SymbolStr,
+                          scope: ScopeResolutionNode*) -> TemplateEntry* {
+        if (this.ctx.generic_registry == null) { return null; }
+        if (scope != null && !scope.scope_res.is_pending()) {
+            const r: Res = scope.require_scope_res("lookup_scope_template");
+            mut def: SymbolStr = SymbolStr::empty();
+            match (r) {
+                Res::TypeRelative(b, _) => { def = b.name(); }
+                Res::Def(q)             => { def = q; }
+                _ => {}
+            }
+            if (def.is_valid()) {
+                return this.ctx.generic_registry.get_template(def);
+            }
+        }
+        return this.lookup_scope_template_derived(base_name);
+    }
+
+    /// The template a bare scope spelling names, derived by trying the keys it
+    /// could be registered under.
+    ///
+    /// None of these tiers is the use site's reachable set, so which one
+    /// answers depends on the ambient cursor rather than on what the writing
+    /// module can see. It stands in ONLY where the caller holds no node
+    /// carrying a `Res` - an identifier callee, a struct literal - and is what
+    /// those callers cost until they carry a slot of their own. Reached before
+    /// the stamp, never after it: nothing here retries a stamped answer.
+    lookup_scope_template_derived(&this, base_name: SymbolStr) -> TemplateEntry* {
         if (this.ctx.generic_registry == null) { return null; }
         mut entry: TemplateEntry* = this.ctx.generic_registry.get_template(base_name);
         if (entry == null) {
@@ -5117,8 +5152,12 @@ type struct CallResolver {
     /// argument therefore resolves in the module that WROTE IT, which its own
     /// span already records; the scope's module answers only when an argument
     /// carries no file of its own.
+    /// `scope` is the node that wrote `base_name`, or null when the caller
+    /// holds none or holds one that named something else (a function
+    /// template's own spec base is not what the surrounding scope segment
+    /// named, so its stamp answers a different question).
     resolve_generic_scope_name(&this, base_name: SymbolStr, generic_args: &TypeAnnotation*[],
-                               use_span: SourceSpan) -> SymbolStr {
+                               use_span: SourceSpan, scope: ScopeResolutionNode*) -> SymbolStr {
         if (this.ctx.type_resolver == null) { return SymbolStr::empty(); }
         const scope_ns: string = this.syntax_module_of(use_span);
         mut res_ctx: ResolutionContext = ResolutionContext::new(FILE, LINE, this.ctx.source_file, "", "", HomeOrigin::Unset);
@@ -5138,7 +5177,7 @@ type struct CallResolver {
             arg_refs.push(arg_ref);
         }
         res_ctx.set_home_module(scope_ns, HomeOrigin::Syntax);
-        const entry: TemplateEntry* = this.lookup_scope_template(base_name);
+        const entry: TemplateEntry* = this.lookup_scope_template(base_name, scope);
         if (entry != null && arg_refs.length < entry.param_count) {
             arg_refs = this.ctx.type_resolver.expand_default_type_args(entry, arg_refs, &res_ctx);
         }
@@ -5253,7 +5292,7 @@ type struct CallResolver {
         mut lookup_sym: SymbolStr =
             this.ctx.resolve_scoped_or_at(scope.scope_name, scope.span.file, FILE, LINE);
         if (scope.scope_generic_args.length > 0) {
-            const spec_sym: SymbolStr = this.resolve_generic_scope_name(scope.scope_name, scope.scope_generic_args, scope.span);
+            const spec_sym: SymbolStr = this.resolve_generic_scope_name(scope.scope_name, scope.scope_generic_args, scope.span, scope);
             if (spec_sym.is_valid()) { lookup_sym = spec_sym; }
         }
         if (this.scope_is_generic_template(lookup_sym, scope.member_name)) { return; }
