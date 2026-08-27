@@ -73,6 +73,21 @@ endif
 WIN_TRIPLE   := x86_64-pc-windows-gnu
 STAGE2_EXE   := $(ROOT)/compiler/build/cryo.exe
 PIN_EXE      := $(ROOT)/bin/cryo.exe
+
+# The triple a NATIVE build resolves to, asked of the pinned compiler.
+#
+# It cannot be derived from the host OS: the value comes from a toolchain probe
+# (mingw `gcc` on PATH -> `...-windows-gnu`, an MSVC linker -> `...-windows-msvc`;
+# on Linux whatever the linked libLLVM reports).  `cryo version --triple` prints
+# exactly what `resolve_effective_triple` hands the tier lookup, so the directory
+# named from it is the one the linker will search.  Guessing is SILENT when
+# wrong: `runtime_dir_pick` falls back to the flat directory and the two
+# toolchains resume overwriting each other's archives there.
+ifeq ($(HOST_OS),windows)
+HOST_TRIPLE  := $(shell "$(subst /,\,$(PIN_EXE))" version --triple)
+else
+HOST_TRIPLE  := $(shell "$(PIN)" version --triple)
+endif
 MINGW_GCC    := x86_64-w64-mingw32-gcc
 MINGW_STRIP  := x86_64-w64-mingw32-strip
 WIN_LLVM_LIB := $(ROOT)/.toolchains/llvm-win/lib/libLLVM-C.dll.a
@@ -617,27 +632,42 @@ endif
 # Two workspaces over the same sources: `runtime/` builds them freestanding,
 # `runtime/hosted/` rebuilds the abort tier with `no_runtime = false` so its
 # `__cryo_panic` exits through libc (flushing stdio) instead of a raw syscall.
-# Both write into runtime/.bin, so one directory holds every tier.
+# Both write into `runtime/.bin/$(HOST_TRIPLE)`, one directory per target.
 #
-# `--no-incremental` is load-bearing, not tidiness.  The incremental cache tracks
-# SOURCE freshness and not the target the objects were built for, so after the
-# flat directory has been left holding another target's archives this target
-# reports `cryort-core is up to date`, skips the re-archive, and exits 0 with the
-# wrong objects still in place - measured in both directions.  A native build
-# cannot use the per-triple directory that protects `runtime-tiers-win` (its
-# triple comes from a toolchain probe, so the name is unpredictable), so forcing
-# the re-emit is what makes the host archives always match the host.  The tier
-# sources are small; this costs seconds.
+# The per-target directory is what keeps two toolchains apart.  A project's
+# artifacts hoist to the root of its `output_dir`, so while every target wrote
+# `runtime/.bin` flat, building for a second target OVERWROTE the first's
+# archives in place and the next link died on another architecture's objects
+# (`__ImageBase undefined` one way, `undefined reference to RtlAllocateHeap`
+# the other).  `runtime_dir_pick` prefers `<dir>/<triple>`, so naming the
+# directory for the triple the linker will search removes the collision rather
+# than scheduling a cleanup around it.
+#
+# `HOST_TRIPLE` is asked of the compiler because a native triple comes from a
+# toolchain probe; a wrong guess is silent, since the lookup falls back to the
+# flat directory.  Empty means the pinned compiler predates `version --triple`,
+# which is a hard error here: building flat is the bug this target exists to
+# prevent, so it must not be the fallback.
+#
+# `--no-incremental` stays.  The incremental cache tracks SOURCE freshness and
+# not the target the objects were built for, so a directory left holding
+# another target's archives reports `cryort-core is up to date`, skips the
+# re-archive, and exits 0 with the wrong objects still in place - measured in
+# both directions.  The per-target split makes that unreachable through this
+# target, but the skip is a live defect in its own right and the tier sources
+# are small enough that forcing the re-emit costs seconds.
 ifeq ($(HOST_OS),windows)
 runtime-tiers:
-	@echo "==> Building runtime tiers via bin/cryo.exe"
-	@cd runtime && "$(subst /,\,$(PIN_EXE))" build --no-incremental
-	@cd runtime\hosted && "$(subst /,\,$(PIN_EXE))" build --no-incremental
+	$(if $(strip $(HOST_TRIPLE)),,$(error runtime-tiers: `cryo version --triple` returned nothing; the pinned compiler is too old))
+	@echo "==> Building runtime tiers for $(HOST_TRIPLE) via bin/cryo.exe"
+	@cd runtime && "$(subst /,\,$(PIN_EXE))" build --no-incremental --build-dir=.bin/$(HOST_TRIPLE)
+	@cd runtime\hosted && "$(subst /,\,$(PIN_EXE))" build --no-incremental --build-dir=../.bin/$(HOST_TRIPLE)
 else
 runtime-tiers: $(PIN)
-	@echo "==> Building runtime tiers via bin/cryo"
-	@cd runtime && "$(PIN)" build --no-incremental
-	@cd runtime/hosted && "$(PIN)" build --no-incremental
+	$(if $(strip $(HOST_TRIPLE)),,$(error runtime-tiers: `cryo version --triple` returned nothing; the pinned compiler is too old))
+	@echo "==> Building runtime tiers for $(HOST_TRIPLE) via bin/cryo"
+	@cd runtime && "$(PIN)" build --no-incremental --build-dir=.bin/$(HOST_TRIPLE)
+	@cd runtime/hosted && "$(PIN)" build --no-incremental --build-dir=../.bin/$(HOST_TRIPLE)
 endif
 
 # The same tiers cross-built for the windows triple, for `cryo-exe`.  These land

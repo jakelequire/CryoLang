@@ -191,9 +191,16 @@ honest zeros here were measured over the wrong population entirely.
 
 ## Environment landmines
 
-- `selfhost-check` wipes `stdlib/.bin` and `runtime/.bin` and leaves Windows
-  objects in the flat shared `runtime/.bin`; the next Linux build then fails at
-  *link* with `__ImageBase undefined`. Fix: `make stdlib runtime-tiers`.
+- The runtime tiers build into `runtime/.bin/<triple>/`, one directory per
+  target, so a Windows and a Linux build no longer overwrite each other's
+  archives there and nothing needs cleaning between them. The directory is
+  named from `cryo version --triple`, asked of the compiler because a native
+  triple comes from a toolchain probe; an empty answer is a hard error, since
+  building flat is the failure this prevents.
+- `stdlib/.bin/libcryo.a` is still ONE archive for every target. A cross build
+  does not consume it (std is recompiled per-target into object files), but a
+  WSL-native `make stdlib` overwrites the Windows one; the next native link
+  then fails at *link* with `__ImageBase undefined`. Fix: `make stdlib`.
 - A scratch project outside the repo cannot find the stdlib — set
   `CRYO_STDLIB`. `compiler/build/cryo` cannot find it from another directory;
   `bin/cryo` can.
