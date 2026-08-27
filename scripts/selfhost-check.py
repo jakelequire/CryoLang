@@ -73,6 +73,25 @@ from pathlib import Path
 ROOT   = Path(__file__).resolve().parent.parent
 BOOT   = ROOT / "bin" / "cryo"                                       # pinned boot
 STAGE2 = ROOT / "compiler" / "build"                 / "cryo"      # boot -> stage-2
+
+
+def target_triple(exe, runner=None, env=None) -> str:
+    """The triple a native build with `exe` resolves to.
+
+    Asked of the compiler instead of derived from the host: the value comes
+    from a toolchain probe (mingw `gcc` on PATH vs an MSVC linker on Windows,
+    whatever libLLVM reports on Linux), so it is not computable here.  A wrong
+    directory name is SILENT -- the tier lookup prefers `<dir>/<triple>` and
+    falls back to the flat directory, which is where the two chains used to
+    overwrite each other's archives.
+    """
+    cmd = (list(runner) if runner else []) + [str(exe), "version", "--triple"]
+    out = subprocess.run(cmd, capture_output=True, text=True,
+                         env=env).stdout.strip()
+    if not out:
+        sys.exit("selfhost-check: `version --triple` returned nothing from "
+                 f"{exe}; the pinned compiler predates it.")
+    return out
 STAGE3 = ROOT / "compiler" / "build" / "self" / "s3" / "cryo"      # stage-2 -> stage-3
 STAGE4 = ROOT / "compiler" / "build" / "self" / "s4" / "cryo"      # stage-3 -> stage-4
 S3_LL  = ROOT / "compiler" / "build" / "self" / "s3" / "cryo.ll"
@@ -125,24 +144,27 @@ class Stage:
 
 
 def make_stages():
+    host_triple = target_triple(BOOT)
     return [
         # ------------------------------------------------------------------
         # Round 0: runtime tiers.  Every stage from stage-2 on emits a call to
         # the external `__cryo_panic`, so LINKING those compilers needs a panic
         # tier archive; without this round the chain dies at stage-2 on an
         # undefined symbol.  Built by the pin (the only compiler that exists
-        # yet) and into the flat `.bin`, which is why each chain rebuilds them
-        # for its own target rather than sharing one directory.
+        # yet) into `.bin/<triple>`, so this chain's archives and the windows
+        # chain's coexist instead of whichever ran last owning a flat directory.
         # ------------------------------------------------------------------
         Stage(
-            src="runtime", via="pinned", to=".bin",
+            src="runtime", via="pinned", to=f".bin/{host_triple}",
             cwd=ROOT / "runtime",
-            cmd=[str(BOOT), "build", "--no-incremental"],
+            cmd=[str(BOOT), "build", "--no-incremental",
+                 f"--build-dir=.bin/{host_triple}"],
         ),
         Stage(
-            src="runtime", via="pinned", to=".bin (hosted)",
+            src="runtime", via="pinned", to=f".bin/{host_triple} (hosted)",
             cwd=ROOT / "runtime" / "hosted",
-            cmd=[str(BOOT), "build", "--no-incremental"],
+            cmd=[str(BOOT), "build", "--no-incremental",
+                 f"--build-dir=../.bin/{host_triple}"],
         ),
         # ------------------------------------------------------------------
         # Round 1: pinned boot -> stage-2  (default build dirs)
@@ -501,13 +523,15 @@ def make_windows_stages(runner: list, env: dict) -> list:
     sl, cm = ROOT / "stdlib", ROOT / "compiler"
     rt = ROOT / "runtime"
     # Runtime tiers first, for the same reason as the Linux chain: stage-2
-    # onwards link against `__cryo_panic`.  Rebuilt here with the WINDOWS boot
-    # compiler because both chains share the flat `runtime/.bin`, so whichever
-    # ran last owns it - each chain must re-establish its own target's archives.
+    # onwards link against `__cryo_panic`.  Built with the WINDOWS boot
+    # compiler into `.bin/<its triple>`, so this chain's archives and the Linux
+    # chain's occupy different directories and neither has to re-establish its
+    # own after the other has run.
+    wt = target_triple(boot, runner, env)
     tiers = [str(x) for x in (boot, "build", "--no-incremental")]
     return [
-        Stage("runtime",  "pinned",  ".bin",              rt,      list(runner) + tiers, env),
-        Stage("runtime",  "pinned",  ".bin (hosted)",     rt / "hosted", list(runner) + tiers, env),
+        Stage("runtime",  "pinned",  f".bin/{wt}",          rt,            list(runner) + tiers + [f"--build-dir=.bin/{wt}"], env),
+        Stage("runtime",  "pinned",  f".bin/{wt} (hosted)", rt / "hosted", list(runner) + tiers + [f"--build-dir=../.bin/{wt}"], env),
         Stage("stdlib",   "pinned",  ".bin/self/win-s1",  sl, build(boot, ".bin/self/win-s1"), env),
         Stage("compiler", "pinned",  "build/self/win-s2", cm, build(boot, "build/self/win-s2"), env),
         Stage("stdlib",   "stage-2", ".bin/self/win-s2",  sl, build(s2,   ".bin/self/win-s2"), env),
