@@ -2693,11 +2693,32 @@ public:
                 || lit.generic_args.length == 0) {
             return TypeRef::invalid();
         }
-        const base_ref: TypeRef = this.types.lookup_type_by_sym(lit.struct_type, "sema/resolve_struct_literal_type/lit.struct_type");
-        if (!base_ref.is_valid()) { return TypeRef::invalid(); }
-        if (this.ctx.generic_registry.get_template_by_type_id(base_ref.id) == null) {
-            return TypeRef::invalid();
+        // The BASE comes from the answer the name layer wrote on this node, not
+        // from matching its spelling against the index.  The stamp is a
+        // canonical name that already accounts for the imports of the module
+        // that WROTE the literal; the spelling is the same question asked with
+        // strictly less information, and the tier that ends its cascade is keyed
+        // by bare leaf and so answers from any module in the program.
+        //
+        // A `Res` names a DEFINITION, so it is exactly the base a template is
+        // registered under - and unlike the spelling it cannot be confused with
+        // a specialization, because there is no way to write one in it.
+        mut base_ref: TypeRef = TypeRef::invalid();
+        match (lit.res) {
+            ResSlot::Answered(r) => {
+                match (r) {
+                    Res::Def(q) => { base_ref = this.types.lookup_type_exact(q); }
+                    _           => { }
+                }
+            }
+            _ => { }
         }
+        if (!base_ref.is_valid()) { return TypeRef::invalid(); }
+        // Arguments mean nothing against a base that is not a template, and the
+        // entry is also what supplies any trailing defaults below.
+        const tmpl: TemplateEntry* =
+            this.ctx.generic_registry.get_template_by_type_id(base_ref.id);
+        if (tmpl == null) { return TypeRef::invalid(); }
         mut rc: ResolutionContext = ResolutionContext::new(FILE, LINE, this.ctx.source_file, "", "", HomeOrigin::Unset);
         // The literal's generic args are written at the literal, inside a body
         // (spec §8.2l).
@@ -2712,6 +2733,15 @@ public:
             const a: TypeRef = this.ctx.type_resolver.resolve(lit.generic_args[i], &rc);
             if (!a.is_valid()) { return TypeRef::invalid(); }
             arg_refs.push(a);
+        }
+        // A defaulted argument is written nowhere at the literal, so the pair is
+        // short by exactly the trailing defaults.  Completed through the same
+        // primitive the name path uses, which resolves each default in the
+        // TEMPLATE's module - the only place that syntax was written.  Without
+        // it `RawBuffer<u8>` keys `(base, [u8])` while the canonical slot is
+        // `(base, [u8, GlobalAlloc])`, and the two never meet.
+        if (arg_refs.length < tmpl.param_count) {
+            arg_refs = this.ctx.type_resolver.expand_default_type_args(tmpl, arg_refs, &rc);
         }
         // Demand-FREE: return the canonical arena slot for (base, args) - the SAME
         // slot the annotation `Foo<Args>` minted and demanded.  The literal only
@@ -2734,22 +2764,30 @@ public:
     resolve_struct_literal(mut &this, lit: StructLiteralNode*) -> TypeRef {
         this.member.check_type_name_visibility(lit.struct_type, (lit as ASTNode*).span);
         mut struct_ref: TypeRef = TypeRef::invalid();
-        // Name-based lookup FIRST: for a literal whose spec is already registered
-        // (the common case) this is a pure lookup with no side effects.
-        if (lit.generic_args.length > 0 && this.ctx.type_resolver != null) {
+        // Monomorphization records a specialized literal's instantiation as the
+        // arena id itself, which IS `(definition, arguments)` already resolved.
+        // Reading it is the whole answer.  Deriving one from the spelling
+        // instead would ask the same question from strictly less information:
+        // the spelling deliberately keeps what the source wrote, so it names a
+        // definition and can never name a specialization.
+        if (lit.resolved_type.is_valid()) { struct_ref = lit.resolved_type; }
+        // The pair answers next: a base named by the stamp plus this node's own
+        // substituted arguments, keyed through the arena's canonical
+        // instantiation slot.  It runs BEFORE any name is minted because it is
+        // the same fact without the round trip through a string - and a mangled
+        // spec name minted from an already-mangled spelling names nothing at
+        // all, which is what made this lookup miss three times in four.
+        if (!struct_ref.is_valid() && lit.generic_args.length > 0) {
+            struct_ref = this.resolve_struct_literal_type(lit);
+        }
+        // Only where the pair could not answer - the literal is unstamped, or its
+        // spec is not registered yet (a method-generic `NonNull<U>` in a spec
+        // body whose `NonNull<ChanNode<i32>>` races registration).
+        if (!struct_ref.is_valid() && lit.generic_args.length > 0 && this.ctx.type_resolver != null) {
             const spec_sym: SymbolStr = this.calls.resolve_generic_scope_name(
                 lit.struct_type, lit.generic_args, lit.span,
                 this.calls.spelling_template(lit.res));
             if (spec_sym.is_valid()) { struct_ref = this.types.lookup_type_by_sym(spec_sym, "sema/resolve_struct_literal/spec_sym"); }
-        }
-        // Only when the name lookup found nothing (the spec isn't registered yet -
-        // e.g. a method-generic literal `NonNull<U>` in a spec body whose
-        // `NonNull<ChanNode<i32>>` races registration) fall to the canonical
-        // resolution path, so the literal denotes the same TypeID as its
-        // annotation.  Confining it to this case keeps its arg-resolution off the
-        // hot path where it would perturb sibling monomorphization.
-        if (!struct_ref.is_valid() && lit.generic_args.length > 0) {
-            struct_ref = this.resolve_struct_literal_type(lit);
         }
         if (!struct_ref.is_valid()) { struct_ref = this.types.lookup_type_by_sym(lit.struct_type, "sema/resolve_struct_literal/lit.struct_type"); }
         mut struct_t: Type* = if (struct_ref.is_valid()) { this.arena.lookup(struct_ref.id) } else { null };

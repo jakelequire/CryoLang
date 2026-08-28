@@ -13,6 +13,7 @@
 namespace Compiler::AST::Substituter;
 
 import Compiler::Diag;
+import Compiler::ResolveCounter;
 import Compiler::AST;
 import Compiler::AST::{ Node, Expression, Statement, Declaration, Pattern, Visitor };
 import Compiler::Types;
@@ -594,18 +595,37 @@ public:
     }
 
     override visit(node: StructLiteralNode*) -> void {
-        // Only collapse to the spec name when this literal is a true
-        // self-reference: same base, and either no generic args or args
-        // that exactly echo the outer type's params in order. An inner
-        // generic-method literal like `NonNull<U> { ... }` inside a
-        // `cast<U>` on `NonNull<T>` shares the base name but is a
-        // different instantiation; renaming `NonNull` to `NonNull_u8`
-        // would falsely freeze the literal at the outer spec's args.
+        // A self-reference denotes the enclosing specialization, and it is
+        // recorded as the arena id that specialization already has - not by
+        // rewriting the spelling to the mangled spec name.  `struct_type`
+        // therefore keeps what the SOURCE wrote in every phase, so it cannot
+        // come to mean something different from the `res` beside it, which
+        // names the DEFINITION and is copied verbatim by every clone.  The id
+        // is the same carrier `pre_resolved` already is for annotations.
+        //
+        // The collapse rule is unchanged: same base, and either no generic
+        // args or args that echo the outer type's params in order.  An inner
+        // generic-method literal like `NonNull<U> { ... }` inside a `cast<U>`
+        // on `NonNull<T>` shares the base name but is a different
+        // instantiation, and freezing it at the outer spec's args binds every
+        // later `cast<V>` to the wrong sibling.
         const is_self: boolean = node.struct_type.equals(this.base_name)
             && (node.generic_args.length == 0
                 || this.args_are_outer_param_refs(node.generic_args));
         if (is_self) {
-            node.struct_type = this.spec_name;
+            if (this.spec_typeref.is_valid()) {
+                node.set_resolved_type(this.spec_typeref);
+            } else {
+                // The id is the only carrier once the spelling is stable, so a
+                // self-reference arriving without one has nothing left to
+                // denote.  Named at the event: a tally says how many, and only
+                // a line says which template was specialized with no reserved
+                // id.
+                ResolveCounter::path_hit(
+                    "SELF-LIT-NO-SPECREF",
+                    this.intern_table.resolve(this.base_name),
+                    this.intern_table.resolve(this.spec_name), "");
+            }
         }
         if (node.generic_args.length > 0) {
             node.generic_args = this.substitute_generic_type_args(node.generic_args);
