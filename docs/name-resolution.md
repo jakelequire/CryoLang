@@ -591,7 +591,7 @@ two-bucket model in the roadmap (§3.2 rule 2) was measured wrong on
 | **B1** | fuzzy fallback — guesses from a string | **zero** |
 | **B2** | type-dependent — genuinely needs a receiver type | stays; enumerated and justified |
 | **B3** | authoritative — answers from scope/imports | **once per path**, not zero |
-| **B4** | what the global leaf index answers — predominantly instantiation identity, which a `Res` cannot name | stays; floor, enumerated and justified |
+| **B4** | what the global leaf index answers — instantiation identity | **0**; the `(res, generic_args)` pair names the slot without a mangled key (§8.20) |
 
 **These are not one quality ladder, and reading them as one is the common
 mistake.** B1 and B3 answer the SAME question — *what does this written name
@@ -619,8 +619,25 @@ target of zero makes that target permanently false and hides whatever real fuzzy
 fallback might regrow underneath it.
 
 What B4 *should* do, like B2, is shrink as instantiation identity gets a key of
-its own rather than a leaf, and it is recorded as a FLOOR because the arena's
-leaf index is the only structure that currently answers it.
+its own rather than a leaf, and it was recorded as a FLOOR because the arena's
+leaf index was the only structure that answered it.
+
+**B4 is now 0, and the floor reasoning above is superseded.** The premise —
+that instantiation identity has no key a `Res` can supply — is true and does
+not entail the conclusion. A `Res` alone cannot name `Array<JsonValue,
+GlobalAlloc>`, but nothing required it to: the DEFINITION is on the node and
+the ARGUMENTS are beside it, and the pair `(res, generic_args)` names the same
+arena slot without minting a mangled string to look up. Struct literals and
+generic scope qualifiers resolve from the pair (§8.20); a specialized clone
+carries its instantiation as the arena id itself, which IS the pair already
+resolved. The mangled name is an OUTPUT of monomorphization, never a lookup
+key. `B4_TOTAL` is pinned 0 on both hosts, and the arena leaf index is still
+reachable and answers nothing — the control that says the calls stopped
+happening rather than stopped being recorded.
+
+The paragraphs below record how the bucket was measured and separated from B1.
+They remain accurate about the mechanism and about why a bare mangled name is
+not a key; they no longer describe a live population.
 
 **The bucket is named for its mechanism, not purely for its contents, and
 deliberately so.** §8.13 has the measurement that separated it from B1: on three
@@ -5733,14 +5750,35 @@ still live and is not dead code to be deleted. What the instrumentation cannot
 say is whether the qualified branch is reached there at all or is reached and
 answered silently by the leaf reading; both emit nothing.
 
-**Still open.** The recorded decision is that a module wins in qualifier
-position. Both lanes do the opposite: a head that binds in the writer's scope as
-a type is answered as `TypeRelative` before module spellings are consulted, and
-the scope lane states outright that the module spellings "never applied to it".
-The disagreement is currently unreachable — declaring a namespace and a type
-with the same name is E0200 today — so no program observes it, and the
-precedence has been left as the code has it rather than changed to match the
-decision.
+**Settled: a qualifier names whichever entity OWNS the next segment.**
+
+The earlier reading that the disagreement is unreachable was wrong. It is
+reached constantly: the module and the type do not share a full name, so no
+E0200 arises. `namespace A::B::N;` declaring `type N` gives a module `A::B::N`
+and a type `A::B::N::N`, and in QUALIFIER position both are spelled `N`. The
+file-per-type convention generates this systematically — 53 distinct qualifier
+names in the compiler's own source, answering 2,524 times.
+
+Neither precedence is correct, because the two cases want opposite answers and
+each breaks the other:
+
+| rule | breaks |
+|---|---|
+| module wins | 53 names — `TypeRef::invalid()` looks for `invalid` in the module |
+| type wins | `ModuleGraph::home_ns_of_file` — a namespaced static the MODULE owns |
+
+What separates them is not precedence but ownership: a path names the entity
+that owns its next segment. A scope segment binding in the writer's scope as a
+type is stamped `TypeRelative` — unless a module spelled the same way exports
+the member, which the module's export set answers directly. One question, asked
+once, with a defined tiebreak; no fallback chain, and no name is special-cased.
+
+A segment binding to something that is not a type — a module-qualified free
+function such as `metadata::metadata(..)`, whose leaf binds as a `Function` —
+is not a type claim and is left to the module lane. An imported name binds as
+`Import` and records only the target's qualified name, so the target is reached
+through its owning module's export set and ITS kind decides; the type index
+cannot serve this, being unpopulated until a later pass.
 
 ### 8.13 B1's residue is not name resolution's to answer — MEASURED 2026-08-21
 
@@ -6311,17 +6349,14 @@ new stream.
 
 **Two things this exposed that are NOT fixed here.**
 
-- **The bare-leaf fallback under a scope qualifier is the de-facto module/type
-  precedence rule.** `resolve_scope_resolution` and
-  `lookup_scope_variant_payload_types` read the stamp first and fall back to a
-  spelling lookup when it declines. That fallback answers 2,512 times, and all
-  2,512 have one shape: `TypeRef -> Compiler::Types::TypeRef::TypeRef`. A file
-  that opens `namespace Compiler::Types::TypeRef;` and declares `type struct
-  TypeRef` makes the qualifier name both a module and a type; the stamp resolves
-  it to the module, and the fallback finds the type. The file-per-type
-  convention generates this systematically. Deleting that fallback without
-  building "module wins in qualifier position" — decided, never built — breaks
-  53 names in the compiler's own source. It is a blocked target, not a cleanup.
+- **The bare-leaf fallback under a scope qualifier WAS the de-facto module/type
+  precedence rule, and is now empty.** `resolve_scope_resolution` and
+  `lookup_scope_variant_payload_types` read the stamp first and fell back to a
+  spelling lookup when it declined; that fallback answered 2,524 times, every
+  one a module/type collision such as `TypeRef -> Compiler::Types::TypeRef`.
+  Once the stamp answers by OWNERSHIP rather than by precedence (§8.12), the
+  two sites fall to 24 together. The fallback stays for the names the stamp
+  still makes no claim for, not as a second attempt at a question it answered.
 
 - **A zero over `examples/` is still not a zero.** The
   `resolve_scope_resolution` fallback answers **0 of 632** there and **332 of

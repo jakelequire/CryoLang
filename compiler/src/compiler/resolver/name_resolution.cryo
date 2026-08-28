@@ -983,6 +983,57 @@ public:
         }
 
         const m: ModuleSpellingMatch = this.modules_written_as(written, use_ns);
+
+        // A segment that binds in the writer's scope as a TYPE names that type,
+        // unless a module spelled the same way owns the very next segment.
+        //
+        // The file-per-type convention makes a module and the type declared
+        // inside it share a leaf - `namespace A::B::N;` holding `type N` - so in
+        // QUALIFIER position both are always spelled `N` and a precedence alone
+        // cannot choose: `N::invalid()` wants the type, `N::helper()` wants the
+        // module's namespaced static.  What separates them is which one OWNS the
+        // member, so that is what is asked, once, of the module's export set.
+        if (binds_in_scope && have_base) {
+            const bound: Symbol = this.resolver.get_symbol(scope_sym);
+            mut names_type: boolean =
+                   bound.kind == SymbolKind::Type
+                || bound.kind == SymbolKind::TypeAlias
+                || bound.kind == SymbolKind::GenericParam;
+            // An import binds the leaf without recording WHAT it names, so the
+            // kind alone cannot tell a type from a module or a function.  The
+            // name it binds is the target's qualified name, so the target is
+            // reached the same way any qualified path is - through the owning
+            // module's export set - and ITS kind is the answer.  The type index
+            // cannot serve this: it is not populated until a later pass.
+            if (!names_type && bound.kind == SymbolKind::Import) {
+                const qn: string = this.resolver.intern_table.resolve(
+                    this.resolver.qualified_name_of(&bound));
+                const parent: string = QualifiedName::parent_of(qn);
+                const leaf: string = QualifiedName::leaf_of(qn);
+                if (parent.length() > 0 && leaf.length() > 0) {
+                    const tgt: SymbolID = this.resolver.lookup_in_module(
+                        this.resolver.intern_table.intern(parent),
+                        this.resolver.intern_table.intern(leaf));
+                    if (tgt.is_valid()) {
+                        const ts: Symbol = this.resolver.get_symbol(tgt);
+                        names_type = ts.kind == SymbolKind::Type
+                                  || ts.kind == SymbolKind::TypeAlias;
+                    }
+                }
+            }
+            if (names_type) {
+                mut module_owns_member: boolean = false;
+                if (m.visible == 1) {
+                    module_owns_member = this.resolver.lookup_in_module(
+                        m.found, node.member_name).is_valid();
+                }
+                if (!module_owns_member) {
+                    ResolveCounter::Site::ScopeResTypeScope.bump();
+                    node.set_scope_res(Res::TypeRelative(base, trailing));
+                    return;
+                }
+            }
+        }
         const found:   SymbolStr = m.found;
         const other:   SymbolStr = m.other;
         const any:     SymbolStr = m.any;
