@@ -6233,6 +6233,132 @@ Gates: `make test` OVERALL PASS (unit 2106, compile-fail 178, projects 38),
 to the pre-change compiler (800/800). `lane-check` LOOKUP **132 → 131**, the
 deleted `lookup_global_var` call sites, re-pinned deliberately.
 
+### 8.19 The ambient cursor could not displace an exact answer, and now cannot — MEASURED AND FIXED 2026-08-27
+
+Found while sizing §5.2's remaining work: `sema/type_utils.cryo::lookup_type_by_sym`
+answers one question — "what type does this name mean?" — in four ways, and only
+the last of them was tallied. B1 = 0 says the *enumerated* fallback sites answer
+nothing; it never spoke for these three.
+
+**The instrument.** `lookup_type_by_sym` takes a `site: string` (threaded through
+all 19 call sites, as `get_trait_decl` does) and emits one `TYPE-CASCADE` row per
+call on **every** exit, gated on `CRYO_PATH_AUDIT`:
+
+```
+TYPE-CASCADE <site> <step> <asked> <answered-as> <control>
+```
+
+Every call leaves through exactly one exit, so **row count == call count**. That
+identity is the control: without it, a step reading zero cannot be told from a
+stream nothing reached — the reading error §7 keeps recording.
+
+**The cross-check.** On `examples/09-json-config` the leaf step reports 156,
+which is exactly the pinned `B4_TOTAL` / `lookup_by_leaf hits` row. Two
+independent instruments, one number.
+
+**What it measured**, over 176,161 calls on four corpora (09-json-config, all 14
+examples, `tests/tests/projects/ffi_c_import`, and the compiler's own source):
+
+| step | share |
+|---|---:|
+| exact — already canonical, no widening | 50.5% |
+| ambient cursor | 8.2% |
+| cross-module scope walk | 4.9% |
+| arena leaf index | 1.3% |
+| answered nothing | 35.1% |
+
+Half of all calls were never fallback. A third answer nothing at all — several
+callers use the cascade as a probe, where a miss is the answer. Fallback proper
+is 13.1%.
+
+**The finding.** Of 14,411 answers from the ambient-cursor step, the exact lookup
+would have answered **SAME 0 times and DIFF 0 times** — it had nothing, every
+time. The two steps never both had an answer.
+
+The comment that justified running the cursor first read: *"Current module's
+qualified name FIRST so module-local types are preferred over bare-name aliases
+from other modules."* That preference was never exercised. It described a
+conflict the cascade does not have.
+
+**The fix.** The exact lookup now runs first. The cursor is reached only when
+nothing is registered under the written spelling, so it can widen and cannot
+rebind — and that is now true by construction rather than by measurement. The
+`cursor_control` probe was deleted with it: once the order enforces the property,
+a helper that still measured it would be recording a fixed answer as evidence.
+
+This is what makes the remaining call-site migration safe to reason about. A
+site that replaces the cursor with a stamp read cannot be changing a binding,
+because the cursor was never reached for a name the index already carried.
+
+**Prediction stated before the change, and met.** If SAME = DIFF = 0 is a
+property rather than a corpus accident, the two populations are disjoint and
+swapping the order repartitions nothing — every per-step count must be unchanged,
+only relabelled. Measured on 09-json-config: 4,419 / 627 / 267 / 156 / 2,553,
+identical in every row.
+
+**Codegen control.** `.o` hashes, not `.exe` — a PE link timestamp makes an
+executable hash useless as a codegen control on Windows. Same-binary-twice first
+(61 objects, identical, so the hash is deterministic), then pre- vs post-change:
+800 objects compared, 800 identical. 61 of those were 09-json-config, whose
+baseline the measurement itself had overwritten, so **739 are genuine
+pre-vs-post evidence** and the remaining 61 rest on the step-count identity above.
+
+**Gates:** `make test` OVERALL PASS, `b1-check` B1 = 0 / B4 = 156 unchanged,
+`lane-check` LOOKUP 131 / REENTRY 6 unchanged, `roster-check` 2106,
+`selfhost-check` FIXED POINT OK x2. No golden moved, and none needed to:
+`b1-gate.py` does not set `CRYO_PATH_AUDIT`, so the pinned rows cannot see the
+new stream.
+
+**Two things this exposed that are NOT fixed here.**
+
+- **The bare-leaf fallback under a scope qualifier is the de-facto module/type
+  precedence rule.** `resolve_scope_resolution` and
+  `lookup_scope_variant_payload_types` read the stamp first and fall back to a
+  spelling lookup when it declines. That fallback answers 2,512 times, and all
+  2,512 have one shape: `TypeRef -> Compiler::Types::TypeRef::TypeRef`. A file
+  that opens `namespace Compiler::Types::TypeRef;` and declares `type struct
+  TypeRef` makes the qualifier name both a module and a type; the stamp resolves
+  it to the module, and the fallback finds the type. The file-per-type
+  convention generates this systematically. Deleting that fallback without
+  building "module wins in qualifier position" — decided, never built — breaks
+  53 names in the compiler's own source. It is a blocked target, not a cleanup.
+
+- **A zero over `examples/` is still not a zero.** The
+  `resolve_scope_resolution` fallback answers **0 of 632** there and **332 of
+  752** on the compiler's own source. Measuring only `examples/` would have
+  justified deleting a live lane. §7 records this for `extern module`; it is not
+  specific to C imports.
+
+- **A node stamp cannot serve a post-monomorphization lookup, and most of the
+  widening that looked migratable is that.** A tripwire over the two
+  struct-literal type lookups computed the `StructLiteralNode.res` stamp beside
+  the spelling cascade and returned the cascade's answer, over 10,025 calls:
+  **7,201 agreed, 2,824 disagreed, and every one of the 2,824 had the same
+  shape.** The node's `struct_type` had been rewritten to a mangled spec name
+  (`5Array$Lh_N$L3std…`), while `res` still named the generic base the source
+  wrote (`std::collections::array::Array`).
+
+  Neither answer is wrong. §6.1's invariant is that a `Res` names a definition
+  and never an instantiation — which is exactly what makes it safe for
+  `ASTCloner` to copy verbatim — so after mono the stamp and the spelling name
+  different things on purpose, and these sites need the instantiation. The
+  tripwire was reverted; only the finding is kept.
+
+  Measured across all 19 call sites, of 24,267 widening answers **26.7% ask
+  under a mangled instantiation name**, and the split is not uniform:
+
+  | tier | widening answers | mangled |
+  |---|---:|---:|
+  | ambient cursor | 13,784 | 31.5% |
+  | cross-module scope walk | 8,345 | **0%** |
+  | arena leaf index | 2,138 | **100%** |
+
+  The leaf index serves instantiations and nothing else, which is the same
+  statement as `B4` being a floor rather than a debt. Four call sites — the ones
+  taking a derived `spec_sym` / `lookup_sym` rather than a written name — are
+  90–100% mangled and are not name-resolution questions at all. Counting
+  fallback without this split overstates what a stamp could ever retire.
+
 ## 9. Open questions
 
 - **Q1** — Does enforcing §3.3 require per-item `public` on declarations that
