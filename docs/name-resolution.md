@@ -6359,6 +6359,109 @@ new stream.
   90–100% mangled and are not name-resolution questions at all. Counting
   fallback without this split overstates what a stamp could ever retire.
 
+### 8.20 The mangled instantiation name was a KEY, and is now only an output — MEASURED AND FIXED 2026-08-27
+
+Monomorphization minted a mangled spec name for an instantiation, wrote it back
+into the AST's spelling slot, and later stages re-resolved it BY NAME. The node
+already carried the instantiation as a pair -- `res`, which names the definition,
+and `generic_args`, substituted to concrete types -- and the arena already keyed
+its canonical slot on exactly that pair. The string was a third encoding of one
+fact and the only one that needed a lookup to decode.
+
+It also contradicted §6.1, which says substitution happens strictly BELOW `Res`,
+in the type layer: minting a name and re-resolving it lifts substitution back up
+into the name layer.
+
+**The spelling and the stamp came to mean different things.** A cloner copies
+`res` verbatim, which is legal precisely because a `Res` names a definition and
+never an instantiation. The substituter then overwrote the spelling beside it
+with the spec name. The stamp did not go stale; the field next to it changed
+meaning, and every consumer that read the spelling got an instantiation where
+the stamp offered a definition.
+
+**Feeding a mangled spelling back to the mangler produced a name for nothing.**
+`resolve_generic_scope_name` mangles `base_name` with the resolved arguments. In
+a specialized body `base_name` had ALREADY been rewritten to the spec, so the
+result was doubly mangled and no declaration carried it. That lookup missed
+three times in four -- 3,658 of 4,886 calls -- and the misses fell through to
+tiers keyed by bare leaf.
+
+**The fix.** A self-reference carries the arena id the specialization already
+has, on `resolved_type`, which is the carrier `NamedAnnotation.pre_resolved`
+already was for annotations; the spelling keeps what the source wrote in every
+phase. `resolve_generic_scope_type` answers the type question from `(base,
+args)` for a struct literal and for a scope qualifier alike -- one primitive,
+because two that resolved arguments differently would key one source text to two
+slots. Trailing defaults are completed through `expand_default_type_args`, the
+same primitive the name path used, so `RawBuffer<u8>` keys `(base, [u8,
+GlobalAlloc])` rather than a slot the canonical one never meets.
+
+`lookup_sym` is unchanged at the two static-method sites. The method registries
+really do hold a specialization's methods under its mangled form, so that key is
+not the compiler working around itself. Only the TYPE question moved.
+
+| site | calls before | calls after |
+|---|---:|---:|
+| `sema/resolve_struct_literal/spec_sym` | 4,886 | 0 over these corpora, but KEPT |
+| `sema/resolve_struct_literal_type/lit.struct_type` | 3,658 | 0 |
+| `call_resolver/try_resolve_static_method/lookup_sym` | 1,945 | 0 |
+| `call_resolver/lookup_scope_variant_payload_types/spec_sym` | 789 | 0 |
+| `call_resolver/check_static_scope_method_args/lookup_sym` | 8,397 | 571 |
+
+Reliance on the ambient cursor fell from 13,784 widening answers to 5,622.
+
+#### The name mint reads zero and is still load-bearing
+
+`resolve_struct_literal/spec_sym` answers nothing over every corpus above, and
+deleting it on that evidence was wrong. A literal naming a type the writing
+module cannot see is deliberately left UNSTAMPED (§6.2), so no definition is
+available to pair the arguments with, and the mangled name is the only remaining
+route to the instantiation. Removing it makes `Widget<T> { v: v }` resolve to
+the bare base and fail its own `-> Widget<T>` with E0200.
+
+**The zero was measured over the wrong population, by `cryo build`.** Module
+discovery is import-driven, so the orphan module in
+`tests/projects/resolution_leaf_index` that exists to exercise exactly this is
+compiled only by `cryo test` and was never in the measurement. The project test
+caught it. This is the §8.13 failure mode a second time: a control has to
+exercise the axis in question, and for a name-resolution zero that means the
+tool that compiles the file, not just the corpus that contains it.
+#### B4 is not a floor, and §7.3 / §8.13 record that it is
+
+B4 was pinned as a floor on the premise that a mangled name minted after the
+name layer has finished is one a `Res` cannot name. The premise is true and the
+conclusion does not follow: the name is not needed. The definition is on the
+node and the arguments are beside it, and that pair is the arena's own key.
+
+`B4_TOTAL` is **0** on both hosts. The arena leaf index is still ASKED 2,206
+times and answers none of them, so the tier is reachable and inert rather than
+unreached -- which is the control that separates "stopped happening" from
+"stopped being recorded". The `lookup_by_leaf calls` row falling by exactly 192
+at the struct-literal site, against 15 leaf hits plus 177 misses counted by a
+separately written instrument, is the same control at the level of one site.
+
+**§7.3 and §8.13 now describe a bucket that is empty.** Neither is edited here:
+what they record about how the residue was MEASURED remains true, and the
+decision to restate B4's definition is not one a measurement makes on its own.
+
+#### What the leaf index still answers, over every population measured
+
+One call. `Widget`, in `tests/tests/projects/reexport_chain`, through
+`sema/resolve_struct_literal/lit.struct_type` -- the spelling fallback that
+remains for a literal whose stamp makes no type claim. It is a PLAIN written
+source name reached through a re-export chain, so it belongs to B1's class and
+not to B4's: the scope walk did not follow the re-export and the program-wide
+bare index did.
+
+Populations measured, all with build directories wiped: `examples/09-json-config`,
+all 14 `examples/`, `tests/tests/projects/ffi_c_import`, the compiler's own
+source, all 38 `tests/tests/projects/`, and the `tests/` unit-test project (53
+stdlib modules recompiled, `Poll` present and resolving at the cursor tier, which
+is §8.16's fix holding).
+
+**`stdlib/net/tls` is compiled by none of them.** §8.13's residue was found in
+exactly that module, so this zero does not speak for it.
+
 ## 9. Open questions
 
 - **Q1** — Does enforcing §3.3 require per-item `public` on declarations that
