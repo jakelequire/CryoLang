@@ -2714,51 +2714,20 @@ public:
             _ => { }
         }
         if (!base_ref.is_valid()) { return TypeRef::invalid(); }
-        // Arguments mean nothing against a base that is not a template, and the
-        // entry is also what supplies any trailing defaults below.
-        const tmpl: TemplateEntry* =
-            this.ctx.generic_registry.get_template_by_type_id(base_ref.id);
-        if (tmpl == null) { return TypeRef::invalid(); }
-        mut rc: ResolutionContext = ResolutionContext::new(FILE, LINE, this.ctx.source_file, "", "", HomeOrigin::Unset);
-        // The literal's generic args are written at the literal, inside a body
-        // (spec §8.2l).
-        rc.set_home_module(this.ctx.module_ns_of_file(lit.span.file), HomeOrigin::Syntax);
-        // Inside a template body the args may name the enclosing generic
-        // parameters, which resolve only against their bindings; binding them also
-        // marks the context demand-free, so an abstract instantiation registers no
-        // monomorphization demand. Outside the symbolic walk this is a no-op.
-        this.symbolic.symbolic_bind_params(&rc);
-        mut arg_refs: TypeRef[] = [];
-        for (mut i: i64 = 0; i < lit.generic_args.length; i++) {
-            const a: TypeRef = this.ctx.type_resolver.resolve(lit.generic_args[i], &rc);
-            if (!a.is_valid()) { return TypeRef::invalid(); }
-            arg_refs.push(a);
-        }
-        // A defaulted argument is written nowhere at the literal, so the pair is
-        // short by exactly the trailing defaults.  Completed through the same
-        // primitive the name path uses, which resolves each default in the
-        // TEMPLATE's module - the only place that syntax was written.  Without
-        // it `RawBuffer<u8>` keys `(base, [u8])` while the canonical slot is
-        // `(base, [u8, GlobalAlloc])`, and the two never meet.
-        if (arg_refs.length < tmpl.param_count) {
-            arg_refs = this.ctx.type_resolver.expand_default_type_args(tmpl, arg_refs, &rc);
-        }
-        // Demand-FREE: return the canonical arena slot for (base, args) - the SAME
-        // slot the annotation `Foo<Args>` minted and demanded.  The literal only
-        // REFERENCES the type; its monomorphization demand comes from the declared
-        // type it flows into.  Adding a fresh demand here (instantiate_for_module)
-        // perturbs the mono worklist and can strand a sibling method spec's owner
-        // binding (an Option::Some payload lost its instantiation).
-        // create_instantiation dedups by (base, arg ids), so this is the concrete
-        // post-swap slot on a cache hit.
+        // Demand-FREE, and answered by the SAME primitive the call resolver uses
+        // for a scope qualifier: one node carries a base and written arguments,
+        // and so does the other.  Two copies would drift on how arguments are
+        // homed and resolve one source text to two different slots.
         //
-        // An arg that mentions a generic parameter yields the template-internal
-        // instantiation (`Foo<T>`), which is what the literal denotes inside a
-        // template body and what specialization rewrites.  Falling back to the bare
-        // base instead would erase the arguments: a consumer reading the literal's
-        // type directly would see `Foo`, and a type built from it (`Option<Foo>`)
-        // mentions no parameter at all, so specialization leaves it untouched.
-        return this.arena.create_instantiation(base_ref, &arg_refs);
+        // The literal only REFERENCES the type; its monomorphization demand comes
+        // from the declared type it flows into.  An argument that mentions a
+        // generic parameter yields the template-internal instantiation, which is
+        // what the literal denotes inside a template body and what specialization
+        // rewrites - falling back to the bare base would erase the arguments, and
+        // a type built from it mentions no parameter at all, so specialization
+        // would leave it untouched.
+        return this.calls.resolve_generic_scope_type(base_ref, lit.generic_args,
+                                                     lit.span);
     }
 
     resolve_struct_literal(mut &this, lit: StructLiteralNode*) -> TypeRef {

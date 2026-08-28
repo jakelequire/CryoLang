@@ -431,16 +431,13 @@ type struct CallResolver {
         if (!type_ref.is_valid()) {
             type_ref = this.types.lookup_type_by_sym(scope.scope_name, "call_resolver/lookup_scope_variant_payload_types/scope.scope_name");
         }
-        if (scope.scope_generic_args.length > 0) {
-            const spec_sym: SymbolStr = this.resolve_generic_scope_name(
-                scope.scope_name, scope.scope_generic_args, scope.span,
-                this.lookup_scope_template(
-                    scope.require_scope_res("enum-variant payload owner")));
-            if (spec_sym.is_valid()) {
-                const spec_ref: TypeRef = this.types.lookup_type_by_sym(spec_sym, "call_resolver/lookup_scope_variant_payload_types/spec_sym");
-                if (spec_ref.is_valid()) { type_ref = spec_ref; }
-            }
-        }
+        // The variant's owner is the instantiation the node's own pair names.
+        // Invalid where the qualifier's stamp makes no type claim, which leaves
+        // whatever the lookups above found rather than retrying them.
+        const spec_ref: TypeRef = this.resolve_generic_scope_type(
+            this.types.scope_qualifier_type(scope), scope.scope_generic_args,
+            scope.span);
+        if (spec_ref.is_valid()) { type_ref = spec_ref; }
         if (!type_ref.is_valid()) { return []; }
         mut enum_t: Type* = this.arena.lookup(type_ref.id);
         if (enum_t == null) { return []; }
@@ -3949,7 +3946,13 @@ type struct CallResolver {
             return resolved;
         }
         if (scope.scope_generic_args.length > 0) {
-            const spec_ref: TypeRef = this.types.lookup_type_by_sym(lookup_sym, "call_resolver/try_resolve_static_method/lookup_sym");
+            // `lookup_sym` stays the registries' dispatch key - they really do
+            // hold a specialization's methods under its mangled form.  Only the
+            // TYPE question is answered from the pair, which names the same slot
+            // without a lookup that can answer from any module in the program.
+            const spec_ref: TypeRef = this.resolve_generic_scope_type(
+                this.types.scope_qualifier_type(scope), scope.scope_generic_args,
+                scope.span);
             if (spec_ref.is_valid()) {
                 const spec_qn: SymbolStr = this.ctx.decl_index.lookup_type_name(spec_ref);
                 if (spec_qn.is_valid() && !spec_qn.equals(lookup_sym)) {
@@ -5188,6 +5191,69 @@ type struct CallResolver {
         return MangledName::specialized_identifier(this.intern, this.arena, base_qname, arg_refs);
     }
 
+    /// The TYPE a generic scope denotes, from the pair rather than from a name:
+    /// a base the caller read off its node's stamp, plus the arguments written
+    /// at the use site.
+    ///
+    /// The sibling of `resolve_generic_scope_name` above, and deliberately the
+    /// same shape - same per-argument homing, same default expansion - because
+    /// the two answer ONE question and a second answering path that computed
+    /// arguments differently would resolve to a different slot for the same
+    /// source text.  This one stops before the string: `(base, args)` IS an
+    /// instantiation's identity, and the arena keys its canonical slot on
+    /// exactly that, so a name minted here would only have to be decoded again
+    /// by a lookup that has strictly less to go on.
+    ///
+    /// Invalid when the base names no template, which is the caller's signal
+    /// that its node asks about something other than an instantiation - never a
+    /// licence to retry this question by spelling.
+    resolve_generic_scope_type(mut &this, base: TypeRef,
+                               generic_args: &TypeAnnotation*[],
+                               use_span: SourceSpan) -> TypeRef {
+        if (!base.is_valid()) { return TypeRef::invalid(); }
+        if (this.ctx.type_resolver == null || this.ctx.generic_registry == null) {
+            return TypeRef::invalid();
+        }
+        if (generic_args.length == 0) { return base; }
+        const tmpl: TemplateEntry* =
+            this.ctx.generic_registry.get_template_by_type_id(base.id);
+        if (tmpl == null) { return TypeRef::invalid(); }
+        const scope_ns: string = this.syntax_module_of(use_span);
+        mut res_ctx: ResolutionContext = ResolutionContext::new(FILE, LINE, this.ctx.source_file, "", "", HomeOrigin::Unset);
+        res_ctx.set_home_module(scope_ns, HomeOrigin::Syntax);
+        // Inside a template body an argument may name the enclosing generic
+        // parameters, which resolve only against their bindings; binding them
+        // also marks the context demand-free, so an abstract instantiation
+        // registers no monomorphization demand.
+        this.symbolic.symbolic_bind_params(&res_ctx);
+        mut arg_refs: TypeRef[] = [];
+        for (mut i: i64 = 0; i < generic_args.length; i++) {
+            // Each argument resolves in the module that WROTE it, which its own
+            // span already records; the scope's module answers only for an
+            // argument that carries no file of its own.  A default spliced from
+            // the template keeps the TEMPLATE's span, so homing every argument on
+            // the scope would bind one declaration's default per caller.
+            const arg_ns: string =
+                this.syntax_module_of(NodeLocator::annotation_span(generic_args[i]));
+            if (arg_ns.length() > 0) { res_ctx.set_home_module(arg_ns, HomeOrigin::Syntax); }
+            else                     { res_ctx.set_home_module(scope_ns, HomeOrigin::Syntax); }
+            const a: TypeRef = this.ctx.type_resolver.resolve(generic_args[i], &res_ctx);
+            if (!a.is_valid()) { return TypeRef::invalid(); }
+            arg_refs.push(a);
+        }
+        res_ctx.set_home_module(scope_ns, HomeOrigin::Syntax);
+        // A trailing default is written nowhere at the use site, so the pair is
+        // short by exactly those positions and would key a slot the canonical
+        // one never meets.
+        if (arg_refs.length < tmpl.param_count) {
+            arg_refs = this.ctx.type_resolver.expand_default_type_args(tmpl, arg_refs, &res_ctx);
+        }
+        // Demand-FREE, like every other reference to an instantiation: the slot
+        // is demanded by the declared type this flows into, and adding a fresh
+        // demand here perturbs the mono worklist.
+        return this.arena.create_instantiation(base, &arg_refs);
+    }
+
     /// Resolve a generic scope-call return (`Result::ok`) to the concrete
     /// specialization, from explicit scope args or the expected type.
     try_resolve_generic_return(mut &this, ret: TypeRef, scope_name: SymbolStr,
@@ -5382,7 +5448,16 @@ type struct CallResolver {
     /// single static signature of the call's arity is found.
     check_static_scope_method_args(mut &this, visitor: ASTVisitor*, lookup_sym: SymbolStr,
                                    scope: ScopeResolutionNode*, call: CallExprNode*) -> void {
-        mut type_ref: TypeRef = this.types.lookup_type_by_sym(lookup_sym, "call_resolver/check_static_scope_method_args/lookup_sym");
+        // The pair first, for the same reason as the sibling site above.  The
+        // spelling lookups below still serve every stamp that makes no type
+        // claim, so they answer a different question rather than retrying this
+        // one.
+        mut type_ref: TypeRef = this.resolve_generic_scope_type(
+            this.types.scope_qualifier_type(scope), scope.scope_generic_args,
+            scope.span);
+        if (!type_ref.is_valid()) {
+            type_ref = this.types.lookup_type_by_sym(lookup_sym, "call_resolver/check_static_scope_method_args/lookup_sym");
+        }
         if (!type_ref.is_valid() && !lookup_sym.equals(scope.scope_name)) {
             type_ref = this.types.lookup_type_by_sym(scope.scope_name, "call_resolver/check_static_scope_method_args/scope.scope_name");
         }
