@@ -558,9 +558,24 @@ public:
         }
     }
 
+    /// The type an impl head is for.
+    ///
+    /// The head's own stamp answers for a head as WRITTEN.  It deliberately
+    /// does not answer for a specialized clone - the cloner leaves that slot
+    /// unanswered - because a `Res` names a definition and a specialization is
+    /// not one; there the monomorphizer's rewritten spelling is the carrier,
+    /// and the lookup below reads it.  A primitive target names no declaration
+    /// to stamp either.  So the two paths answer DIFFERENT questions rather
+    /// than retrying one.
+    impl_target_type(mut &this, node: ImplBlockNode*) -> TypeRef {
+        const stamped: TypeRef = this.types.spelling_type(node.res);
+        if (stamped.is_valid()) { return stamped; }
+        return this.types.lookup_type_by_sym(node.target_type, "sema/visit:ImplBlockNode/node.target_type");
+    }
+
     override visit(mut &this, node: ImplBlockNode*) -> void {
         if (node.is_generic()) {
-            const impl_target: TypeRef = this.types.lookup_type_by_sym(node.target_type, "sema/visit:ImplBlockNode/node.target_type");
+            const impl_target: TypeRef = this.impl_target_type(node);
             const saved_impl: ImplBlockNode* = this.state.symbolic_impl_node;
             this.state.symbolic_impl_node = node;
             this.symbolic_check_owner_methods(node.methods, impl_target, node.generic_params);
@@ -600,7 +615,7 @@ public:
                 // receiver reads as a generic owner and the stash is produced
                 // independently of any other call site.
                 if (tmpl.ast_node != null) {
-                    const owner_ty: TypeRef = this.types.lookup_type_by_sym(node.target_type, "sema/visit:ImplBlockNode/node.target_type");
+                    const owner_ty: TypeRef = this.impl_target_type(node);
                     const saved_impl: ImplBlockNode* = this.state.symbolic_impl_node;
                     this.state.symbolic_impl_node = node;
                     if (tmpl.node_kind == NodeKind::StructDeclaration) {
@@ -621,7 +636,7 @@ public:
                 return;
             }
         }
-        const impl_this: TypeRef = this.types.lookup_type_by_sym(node.target_type, "sema/visit:ImplBlockNode/node.target_type");
+        const impl_this: TypeRef = this.impl_target_type(node);
         this.check_assoc_decl_bounds(node, impl_this);
         this.visit_methods(node.methods, impl_this);
     }
@@ -2981,7 +2996,7 @@ public:
         // The spelling lookup below still serves every path the stamp makes no
         // type claim for - a module qualifier above all - so it is reached by a
         // DIFFERENT question, not as a second attempt at this one.
-        mut found: TypeRef = this.types.scope_qualifier_type(scope);
+        mut found: TypeRef = this.types.scope_qualifier_type(scope, "sema/resolve_scope_resolution");
         if (!found.is_valid()) {
             found = this.types.lookup_type_by_sym(scope.scope_name, "sema/resolve_scope_resolution/scope.scope_name");
         }
@@ -3063,7 +3078,17 @@ public:
         for (mut i: i64 = 0; i < new_expr.arguments.length; i++) { this.resolve_expr(new_expr.arguments[i]); }
         if (new_expr.has_struct_init()) { this.resolve_struct_literal(new_expr.struct_init); }
         if (new_expr.has_array_size()) { this.resolve_expr(new_expr.array_size); }
-        mut base: TypeRef = this.types.lookup_type_by_sym(new_expr.type_name, "sema/resolve_new_expr/new_expr.type_name");
+        // The name layer's own answer for the written type name, which is a
+        // canonical name and so names one declaration.  A self-reference inside
+        // the specialized body never reaches here: the substituter records the
+        // instantiation's arena id on the node, and `resolve_expr` returns that
+        // before this runs.  The spelling lookup below still serves a name the
+        // stamp makes no claim for, so it answers a different question rather
+        // than retrying this one.
+        mut base: TypeRef = this.types.spelling_type(new_expr.res);
+        if (!base.is_valid()) {
+            base = this.types.lookup_type_by_sym(new_expr.type_name, "sema/resolve_new_expr/new_expr.type_name");
+        }
         if (!base.is_valid() && this.ctx.type_resolver != null) {
             base = this.ctx.type_resolver.resolve_primitive(new_expr.type_name);
         }
