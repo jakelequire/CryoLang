@@ -427,7 +427,7 @@ type struct CallResolver {
         // spelling lookup below still serves every stamp that makes no type
         // claim, so it answers a different question rather than retrying this
         // one.
-        mut type_ref: TypeRef = this.types.scope_qualifier_type(scope);
+        mut type_ref: TypeRef = this.types.scope_qualifier_type(scope, "call_resolver/lookup_scope_variant_payload_types");
         if (!type_ref.is_valid()) {
             type_ref = this.types.lookup_type_by_sym(scope.scope_name, "call_resolver/lookup_scope_variant_payload_types/scope.scope_name");
         }
@@ -435,7 +435,7 @@ type struct CallResolver {
         // Invalid where the qualifier's stamp makes no type claim, which leaves
         // whatever the lookups above found rather than retrying them.
         const spec_ref: TypeRef = this.resolve_generic_scope_type(
-            this.types.scope_qualifier_type(scope), scope.scope_generic_args,
+            this.types.scope_qualifier_type(scope, "call_resolver/lookup_scope_variant_payload_types_pair"), scope.scope_generic_args,
             scope.span);
         if (spec_ref.is_valid()) { type_ref = spec_ref; }
         if (!type_ref.is_valid()) { return []; }
@@ -2739,6 +2739,12 @@ type struct CallResolver {
     enforce_static_method_visibility(mut &this, scope_sym: SymbolStr,
                                      member_sym: SymbolStr, span: SourceSpan) -> void {
         if (this.state.in_symbolic_check) { return; }
+        // The owner is reached by the WRITTEN spelling rather than by the
+        // qualifier's stamp, and the stamp cannot stand in for it: the stamp
+        // names the generic TEMPLATE, whose method table is empty, while the
+        // instantiation this lookup reaches is what carries the method.  Read
+        // from the stamp instead, the check finds no method and returns without
+        // a verdict, so the door it guards would simply stop being shut.
         const owner: TypeRef = this.types.lookup_type_by_sym(scope_sym, "call_resolver/enforce_static_method_visibility/scope_sym");
         if (!owner.is_valid()) { return; }
         this.member.enforce_method_visibility(owner, member_sym, span,
@@ -2854,6 +2860,13 @@ type struct CallResolver {
             }
             return func_ret;
         }
+        // The name layer's own answer for this identifier, which is a canonical
+        // name and so names one declaration.  The spelling lookup below still
+        // serves every answer that names no declaration - a local, a primitive,
+        // a type parameter - so it is reached by a different question rather
+        // than as a second attempt at this one.
+        const stamped_ty: TypeRef = this.types.spelling_type(ident.res);
+        if (stamped_ty.is_valid()) { return stamped_ty; }
         const type_ref: TypeRef = this.types.lookup_type_by_sym(ident.name, "call_resolver/resolve_direct_call/ident.name");
         if (type_ref.is_valid()) { return type_ref; }
 
@@ -3951,7 +3964,7 @@ type struct CallResolver {
             // TYPE question is answered from the pair, which names the same slot
             // without a lookup that can answer from any module in the program.
             const spec_ref: TypeRef = this.resolve_generic_scope_type(
-                this.types.scope_qualifier_type(scope), scope.scope_generic_args,
+                this.types.scope_qualifier_type(scope, "call_resolver/resolve_scope_call_pair"), scope.scope_generic_args,
                 scope.span);
             if (spec_ref.is_valid()) {
                 const spec_qn: SymbolStr = this.ctx.decl_index.lookup_type_name(spec_ref);
@@ -5460,7 +5473,7 @@ type struct CallResolver {
         // claim, so they answer a different question rather than retrying this
         // one.
         mut type_ref: TypeRef = this.resolve_generic_scope_type(
-            this.types.scope_qualifier_type(scope), scope.scope_generic_args,
+            this.types.scope_qualifier_type(scope, "call_resolver/resolve_generic_scope_name_pair"), scope.scope_generic_args,
             scope.span);
         if (!type_ref.is_valid()) {
             type_ref = this.types.lookup_type_by_sym(lookup_sym, "call_resolver/check_static_scope_method_args/lookup_sym");

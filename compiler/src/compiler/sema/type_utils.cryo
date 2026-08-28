@@ -70,6 +70,20 @@ type struct TypeUtils {
         };
     }
 
+    /// The type a WRITTEN name refers to, or invalid when it refers to
+    /// something else or to nothing.
+    ///
+    /// The bare-identifier counterpart of `spelling_global`, and absent for the
+    /// same reasons: a name that answers `Local`, `PrimTy` or `GenericParam`
+    /// names no declaration to look up, and that is an answer rather than a
+    /// failure, so it licenses no second lookup under another key.
+    spelling_type(&this, slot: ResSlot) -> TypeRef {
+        return match (slot) {
+            ResSlot::Answered(r) => { this.lookup_type_exact(r.def_name()) }
+            _                    => { TypeRef::invalid() }
+        };
+    }
+
     /// The global `name` as declared by the module named by `scope_leaf`, for a
     /// qualified `scope_leaf::name` reference. Invalid when no single module
     /// matches.
@@ -188,7 +202,7 @@ type struct TypeUtils {
     /// type claim, and a base that is a primitive or a type parameter names no
     /// declaration to look up; manufacturing a type for any of them here would
     /// assert an ownership the stamp does not make.
-    scope_qualifier_type(&this, scope: ScopeResolutionNode*) -> TypeRef {
+    scope_qualifier_type(&this, scope: ScopeResolutionNode*, site: string) -> TypeRef {
         // Named at the event: the delayed tally says HOW MANY nodes arrived
         // unclaimed, only a per-node line says WHICH.
         if (scope.scope_res.is_pending() && !scope.has_resolved_type()) {
@@ -197,14 +211,25 @@ type struct TypeUtils {
                 this.intern.resolve(scope.member_name), scope.span.to_string());
         }
         mut base: ResBase = ResBase::PrimTy(scope.scope_name);
-        match (scope.require_scope_res("sema: scope-resolution qualifier")) {
+        const seen: Res = scope.require_scope_res("sema: scope-resolution qualifier");
+        match (seen) {
             Res::TypeRelative(b, _) => { base = b; }
-            _                       => { return TypeRef::invalid(); }
+            _                       => {
+                ResolveCounter::path_hit(
+                    "SCOPE-QUAL-NOTREL", site + " " + seen.to_string(),
+                    this.intern.resolve(scope.scope_name), scope.span.to_string());
+                return TypeRef::invalid();
+            }
         }
         mut q: SymbolStr = SymbolStr::empty();
         match (base) {
             ResBase::Def(d) => { q = d; }
-            _               => { return TypeRef::invalid(); }
+            _               => {
+                ResolveCounter::path_hit(
+                    "SCOPE-QUAL-NOTDEF", site + " " + base.to_string(),
+                    this.intern.resolve(scope.scope_name), scope.span.to_string());
+                return TypeRef::invalid();
+            }
         }
         const ty: TypeRef = this.lookup_type_exact(q);
         if (!ty.is_valid()) {
@@ -214,7 +239,7 @@ type struct TypeUtils {
             // cascade grew, and the pair (stamped name, written spelling) is
             // what says whether the defect is in the stamp or in registration.
             ResolveCounter::path_hit(
-                "SCOPE-TY-STAMP-MISS", this.intern.resolve(scope.scope_name),
+                "SCOPE-TY-STAMP-MISS", site + " " + this.intern.resolve(scope.scope_name),
                 this.intern.resolve(q), scope.span.to_string());
         }
         return ty;
