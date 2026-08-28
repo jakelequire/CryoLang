@@ -2736,16 +2736,23 @@ type struct CallResolver {
     /// all.  A `scope_sym` that names a MODULE rather than a type resolves to no
     /// type, finds no method, and falls out without a verdict - module-qualified
     /// free functions keep their own door.
-    enforce_static_method_visibility(mut &this, scope_sym: SymbolStr,
+    enforce_static_method_visibility(mut &this, scope: ScopeResolutionNode*, scope_sym: SymbolStr,
                                      member_sym: SymbolStr, span: SourceSpan) -> void {
         if (this.state.in_symbolic_check) { return; }
-        // The owner is reached by the WRITTEN spelling rather than by the
-        // qualifier's stamp, and the stamp cannot stand in for it: the stamp
-        // names the generic TEMPLATE, whose method table is empty, while the
-        // instantiation this lookup reaches is what carries the method.  Read
-        // from the stamp instead, the check finds no method and returns without
-        // a verdict, so the door it guards would simply stop being shut.
-        const owner: TypeRef = this.types.lookup_type_by_sym(scope_sym, "call_resolver/enforce_static_method_visibility/scope_sym");
+        // The qualifier's stamp answers for the path as WRITTEN.  Three of this
+        // function's callers pass a name they have already resolved - a
+        // canonical owner, a specialization, a DI key - and for those the stamp
+        // names the generic template rather than the type that call is about,
+        // so it is consulted only where the symbol IS the written qualifier.
+        // The lookup below then serves every other caller, and every stamp that
+        // makes no type claim, rather than retrying a question already answered.
+        mut owner: TypeRef = TypeRef::invalid();
+        if (scope != null && scope_sym.id == scope.scope_name.id) {
+            owner = this.types.scope_qualifier_type(scope, "call_resolver/enforce_static_method_visibility");
+        }
+        if (!owner.is_valid()) {
+            owner = this.types.lookup_type_by_sym(scope_sym, "call_resolver/enforce_static_method_visibility/scope_sym");
+        }
         if (!owner.is_valid()) { return; }
         this.member.enforce_method_visibility(owner, member_sym, span,
             ResolveCounter::Site::MethodVisStatic);
@@ -3825,14 +3832,14 @@ type struct CallResolver {
         return tmpl;
     }
 
-    pin_scope_callee_combined(mut &this, call: CallExprNode*, scope_sym: SymbolStr, member_sym: SymbolStr) -> void {
+    pin_scope_callee_combined(mut &this, call: CallExprNode*, scope: ScopeResolutionNode*, scope_sym: SymbolStr, member_sym: SymbolStr) -> void {
         if (call == null) { return; }
         // Judge BEFORE the early returns below: a call whose callee is already
         // pinned, or whose owner is a generic template, is still a call to a
         // method the use site may not name.  `scope_sym` is the owner that won
         // resolution, so the verdict is about the method that actually binds.
         if (member_sym.is_valid() && scope_sym.is_valid()) {
-            this.enforce_static_method_visibility(scope_sym, member_sym, call.span);
+            this.enforce_static_method_visibility(scope, scope_sym, member_sym, call.span);
         }
         if (call.resolved_callee.is_valid()) { return; }
         if (!scope_sym.is_valid() || !member_sym.is_valid()) { return; }
@@ -3955,7 +3962,7 @@ type struct CallResolver {
                 if (inferred.is_valid() && !this.types.contains_generic_param(inferred)) { resolved = inferred; }
             }
             scope.set_resolved_type(resolved);
-            this.pin_scope_callee_combined(call, owner_sym, scope.member_name);
+            this.pin_scope_callee_combined(call, scope, owner_sym, scope.member_name);
             return resolved;
         }
         if (scope.scope_generic_args.length > 0) {
@@ -3972,7 +3979,7 @@ type struct CallResolver {
                     const qn_ret: TypeRef = this.ctx.decl_index.lookup_method_return(spec_qn, scope.member_name);
                     if (qn_ret.is_valid()) {
                         scope.set_resolved_type(qn_ret);
-                        this.pin_scope_callee_combined(call, spec_qn, scope.member_name);
+                        this.pin_scope_callee_combined(call, scope, spec_qn, scope.member_name);
                         return qn_ret;
                     }
                 }
@@ -3983,7 +3990,7 @@ type struct CallResolver {
             if (base_ret.is_valid()) {
                 const resolved: TypeRef = this.try_resolve_generic_return(base_ret, scope.scope_name, scope.member_name, scope);
                 scope.set_resolved_type(resolved);
-                this.pin_scope_callee_combined(call, scope.scope_name, scope.member_name);
+                this.pin_scope_callee_combined(call, scope, scope.scope_name, scope.member_name);
                 return resolved;
             }
         }
@@ -4788,7 +4795,7 @@ type struct CallResolver {
             if (di_method_ret.is_valid()) {
                 const resolved: TypeRef = this.try_resolve_generic_return(di_method_ret, scope.scope_name, scope.member_name, scope);
                 scope.set_resolved_type(resolved);
-                this.pin_scope_callee_combined(call, di_name, scope.member_name);
+                this.pin_scope_callee_combined(call, scope, di_name, scope.member_name);
                 return resolved;
             }
         }
