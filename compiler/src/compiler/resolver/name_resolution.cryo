@@ -87,6 +87,128 @@ public:
             const stmt: ASTNode* = program.statements[i];
             this.forward_declare_node(stmt);
         }
+        this.check_module_type_collision(program);
+    }
+
+    /// Refuse a member name owned by BOTH the module and the type declared
+    /// inside it.
+    ///
+    /// The file-per-type convention makes `namespace A::B::N` and the `type N`
+    /// written in it share a leaf, so in qualifier position `N::member` names
+    /// two candidates.  Where exactly one of them declares `member` the path
+    /// still has a single answer and the qualifier rule takes it - that is
+    /// eliminating a candidate that cannot answer, not choosing between two
+    /// that can.  Where BOTH declare it the spelling names neither, and
+    /// picking is the defect - the rule the module-vs-module branch already
+    /// states.
+    ///
+    /// Asked at DECLARATION and not at the use site: a use-site gate lets the
+    /// two halves declare one name for as long as nobody writes the path,
+    /// which legitimizes exactly the declaration that merging the two scopes
+    /// would afterwards have to forbid.
+    ///
+    /// A type's methods can also arrive from an `implement` block in another
+    /// file, and those are not in this program, so a name contested from there
+    /// is not seen here.
+    check_module_type_collision(&this, program: ProgramNode*) -> void {
+        const ns: SymbolStr = this.resolver.current_module_sym();
+        if (!ns.is_valid()) { return; }
+        const ns_str: string = this.resolver.intern_table.resolve(ns);
+        const leaf: string = QualifiedName::leaf_of(ns_str);
+        if (leaf.length() == 0) { return; }
+        const leaf_sym: SymbolStr = this.resolver.intern_table.intern(leaf);
+
+        mut declares_type: boolean = false;
+        mut methods: MethodNode*[] = [];
+        mut mod_names: SymbolStr[] = [];
+        mut mod_spans: SourceSpan[] = [];
+
+        for (mut i: int = 0; i < program.statements.length; i++) {
+            const stmt: ASTNode* = program.statements[i];
+            match (stmt.kind) {
+                NodeKind::StructDeclaration => {
+                    const sn: StructDeclNode* = stmt as StructDeclNode*;
+                    if (sn.name.equals(leaf_sym)) {
+                        declares_type = true;
+                        for (mut j: int = 0; j < sn.methods.length; j++) {
+                            methods.push(sn.methods[j]);
+                        }
+                    }
+                }
+                NodeKind::UnionDeclaration => {
+                    const un: UnionDeclNode* = stmt as UnionDeclNode*;
+                    if (un.name.equals(leaf_sym)) {
+                        declares_type = true;
+                        for (mut j: int = 0; j < un.methods.length; j++) {
+                            methods.push(un.methods[j]);
+                        }
+                    }
+                }
+                NodeKind::ClassDeclaration => {
+                    const cn: ClassDeclNode* = stmt as ClassDeclNode*;
+                    if (cn.name.equals(leaf_sym)) {
+                        declares_type = true;
+                        for (mut j: int = 0; j < cn.methods.length; j++) {
+                            methods.push(cn.methods[j]);
+                        }
+                    }
+                }
+                NodeKind::EnumDeclaration => {
+                    const en: EnumDeclNode* = stmt as EnumDeclNode*;
+                    if (en.name.equals(leaf_sym)) { declares_type = true; }
+                }
+                NodeKind::ImplementationBlock => {
+                    const ib: ImplBlockNode* = stmt as ImplBlockNode*;
+                    if (ib.target_type.equals(leaf_sym)) {
+                        for (mut j: int = 0; j < ib.methods.length; j++) {
+                            methods.push(ib.methods[j]);
+                        }
+                    }
+                }
+                NodeKind::FunctionDeclaration => {
+                    const fd: FunctionDeclNode* = stmt as FunctionDeclNode*;
+                    mod_names.push(fd.name);
+                    mod_spans.push(fd.span);
+                }
+                NodeKind::VariableDeclaration => {
+                    const vd: VarDeclNode* = stmt as VarDeclNode*;
+                    if (vd.is_global && vd.binding_namespace.is_empty()) {
+                        mod_names.push(vd.name);
+                        mod_spans.push(vd.span);
+                    }
+                }
+                _ => { }
+            }
+        }
+
+        if (!declares_type) { return; }
+
+        // The census is the control for the refusal's zero: where no name is
+        // contested the diagnostic and a check nothing reached emit the same
+        // nothing, and only a row per collision examined tells them apart.
+        ResolveCounter::path_hit(
+            "MODTYPE-COLLIDE", ns_str, leaf,
+            format("mod=%d type=%d", mod_names.length, methods.length));
+
+        for (mut i: int = 0; i < mod_names.length; i++) {
+            for (mut j: int = 0; j < methods.length; j++) {
+                if (methods[j].func == null) { continue; }
+                if (!methods[j].func.name.equals(mod_names[i])) { continue; }
+                const member: string =
+                    this.resolver.intern_table.resolve(mod_names[i]);
+                mut d: Diagnostic = Diagnostic::error(
+                    ErrorCode::E0154_AMBIGUOUS_CALL,
+                    format("`%s` names both a module member and a type member",
+                           member));
+                d = d.at_with_label(mod_spans[i], "ambiguous qualified path");
+                d = d.with_note(format(
+                    "the module `%s` and the type `%s::%s` both declare `%s`",
+                    ns_str, ns_str, leaf, member));
+                d = d.with_note(
+                    "write the path out in full to say which one is meant");
+                this.ctx.emit_diagnostic(d);
+            }
+        }
     }
 
     /// Declare a C-imported type under `alias::name`.
