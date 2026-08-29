@@ -546,7 +546,7 @@ type struct TypeResolutionRunner {
     /// is an ordinary candidate, and a field named like a type is a real
     /// coincidence rather than a self-reference.
     emit_undefined_type(&this, ann: TypeAnnotation*,
-                        kind_label: string, decl_name: string,
+                        kind_label: string, noun: string, decl_name: string,
                         fallback_span: SourceSpan, defines: string) -> void {
         const intern: InternTable* = this.ctx.get_intern_table();
 
@@ -622,7 +622,7 @@ type struct TypeResolutionRunner {
 
         mut diag: Diagnostic = Diagnostic::error(
             ErrorCode::E0203_UNDEFINED_TYPE,
-            format("cannot find type `%s` in this scope", ty_name));
+            format("cannot find %s `%s` in this scope", noun, ty_name));
         diag = diag.at_with_label(named.span, "not found in this scope");
         // The name this declaration is DEFINING cannot be the fix for a name
         // inside its own definition: accepting it yields `type Foo = Foo;`, a
@@ -639,7 +639,7 @@ type struct TypeResolutionRunner {
         const best: string = find_best_candidate(ty_name, cands);
         if (best != "") {
             diag = diag.help(
-                format("a type with a similar name exists: `%s`", best));
+                format("a %s with a similar name exists: `%s`", noun, best));
             diag = diag.suggest(Suggestion::machine_applicable(named.span, best,
                 format("did you mean `%s`?", best)));
         }
@@ -678,7 +678,7 @@ type struct TypeResolutionRunner {
 
         if (func.return_type_annotation != null && !func.has_resolved_return_type()) {
             this.emit_undefined_type(func.return_type_annotation,
-                "return type",
+                "return type", "type",
                 this.ctx.resolve_str(func.name),
                 func.span, "");
         }
@@ -698,7 +698,7 @@ type struct TypeResolutionRunner {
                 const pname: string = this.ctx.resolve_str(param.name);
                 if (pname == "this" || pname == "&this") { continue; }
                 this.emit_undefined_type(param.type_annotation,
-                    "type",
+                    "type", "type",
                     this.ctx.resolve_str(param.name),
                     param.span, "");
             }
@@ -736,7 +736,7 @@ type struct TypeResolutionRunner {
             if (field == null) { continue; }
             if (field.type_annotation != null && !field.resolved_type.is_valid()) {
                 this.emit_undefined_type(field.type_annotation,
-                    "type",
+                    "type", "type",
                     this.ctx.resolve_str(field.name),
                     field.span, "");
             }
@@ -823,7 +823,7 @@ type struct TypeResolutionRunner {
                                 // can't be a deferred generic param; `typeof(...)` and other
                                 // non-Named forms (inferred later) fail the certainty guard.
                                 const vn: string = this.ctx.get_intern_table().resolve(var_node.name);
-                                this.emit_undefined_type(var_node.type_annotation, "type", vn, var_node.span, "");
+                                this.emit_undefined_type(var_node.type_annotation, "type", "type", vn, var_node.span, "");
                             }
                         }
                         // Recurse into the initializer expression so var
@@ -865,7 +865,7 @@ type struct TypeResolutionRunner {
                         // `for (mut i: bool = ...)` naming an unknown type gets a
                         // clean E0203 instead of a downstream codegen crash.
                         const vn: string = this.ctx.get_intern_table().resolve(var_node.name);
-                        this.emit_undefined_type(var_node.type_annotation, "type", vn, var_node.span, "");
+                        this.emit_undefined_type(var_node.type_annotation, "type", "type", vn, var_node.span, "");
                     }
                 }
             }
@@ -2651,6 +2651,28 @@ type struct TypeResolutionPasses {
     /// into a droppable local, and since `TypeAnnotation*[]` is deep-owning
     /// over its elements, two callers each dropping that alias double-freed
     /// the node's args buffer (and its element nodes).
+    /// The annotation node a trait head's NAME lives on, peeled through the
+    /// wrappers a written trait reference may carry.
+    ///
+    /// Mirrors `TypeAnnotation::trait_identity`'s walk, so this returns the
+    /// node whose `res` that identity reads.  Checking any other node would
+    /// be asking whether a different name resolves.
+    static trait_head_base(ann: TypeAnnotation*) -> TypeAnnotation* {
+        if (ann == null) { return null; }
+        return match (*ann) {
+            TypeAnnotation::Generic(g)   => {
+                TypeResolutionPasses::trait_head_base(g.base)
+            }
+            TypeAnnotation::Reference(r) => {
+                TypeResolutionPasses::trait_head_base(r.inner)
+            }
+            TypeAnnotation::Pointer(p)   => {
+                TypeResolutionPasses::trait_head_base(p.inner)
+            }
+            _ => { ann }
+        };
+    }
+
     static peel_to_generic(ann: TypeAnnotation*) -> GenericAnnotation* {
         if (ann == null) { return null; }
         return match (*ann) {
@@ -3396,7 +3418,7 @@ type struct TypeResolutionPasses {
                         // this annotation IS the alias's definition, so
                         // accepting it would write `type Foo = Foo;`.
                         runner.emit_undefined_type(node.target_annotation,
-                            "target type",
+                            "target type", "type",
                             ctx.resolve_str(node.alias_name),
                             node.span,
                             ctx.resolve_str(node.alias_name));
@@ -3469,6 +3491,28 @@ type struct TypeResolutionPasses {
                     // re-introduce the same `Item` lookup miss this
                     // resolution is meant to repair.)
                     runner.bind_trait_args_for_impl(node, &impl_ctx);
+                    // An impl head names one trait outright, and nothing else
+                    // reports a head whose trait resolves to nothing: every
+                    // consumer reads `trait_identity` and returns quietly when
+                    // it answers empty.  A misspelled trait therefore reached a
+                    // later stage as a missing `Res` - an internal error naming
+                    // no source location - instead of as a name its author can
+                    // fix.  The head's own name is asked here, where the type
+                    // index is populated and the same unresolved-name
+                    // diagnostic every other annotation gets is already built.
+                    if (node.is_trait_impl()) {
+                        const trait_base: TypeAnnotation* =
+                            TypeResolutionPasses::trait_head_base(
+                                node.trait_annotation);
+                        if (trait_base != null
+                                && !resolver.resolve(trait_base,
+                                                     &impl_ctx).is_valid()) {
+                            runner.emit_undefined_type(trait_base,
+                                "trait", "trait",
+                                ctx.resolve_str(node.target_type),
+                                node.span, "");
+                        }
+                    }
                     mut impl_owner2: TypeRef = ctx.decl_index.lookup_type(
                         ctx.qualify_symbol_sym(node.target_type));
                     if (impl_owner2.is_invalid()) {
