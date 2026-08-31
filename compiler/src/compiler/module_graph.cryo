@@ -345,6 +345,47 @@ type struct ModuleGraph {
         };
     }
 
+    /// Every namespace reachable from `ns` by `export` edges, transitively,
+    /// excluding `ns` itself.  Empty when `ns` names no module in the graph.
+    ///
+    /// An `export` grants an importer what the same path would grant if it
+    /// were imported there, and that is not limited to one hop: a facade that
+    /// names a facade must keep granting, or a module's internal layout leaks
+    /// into the spelling every importer has to use.  `reexports` holds one
+    /// hop, so a consumer that reads the field directly sees only the first.
+    ///
+    /// The result is both worklist and visited set - a namespace already
+    /// present is never appended again - which is what terminates the walk.
+    /// It cannot terminate on the graph being acyclic, because mutual
+    /// re-export is legal by design.
+    reexport_closure(&this, ns: SymbolStr) -> SymbolStr[] {
+        mut out: SymbolStr[] = [];
+        const start: i64 = this.find_module_index(ns);
+        if (start < 0) { return out; }
+        const root: ModuleInfo* = this.get_module(start);
+        for (mut i: i64 = 0; i < root.reexports.length; i++) {
+            out.push(root.reexports[i]);
+        }
+        mut wi: i64 = 0;
+        while (wi < out.length) {
+            const via: SymbolStr = out[wi];
+            wi = wi + 1;
+            const vidx: i64 = this.find_module_index(via);
+            if (vidx < 0) { continue; }
+            const vinfo: ModuleInfo* = this.get_module(vidx);
+            for (mut ri: i64 = 0; ri < vinfo.reexports.length; ri++) {
+                const nxt: SymbolStr = vinfo.reexports[ri];
+                if (nxt.id == ns.id) { continue; }
+                mut seen: boolean = false;
+                for (mut qi: i64 = 0; qi < out.length; qi++) {
+                    if (out[qi].id == nxt.id) { seen = true; }
+                }
+                if (!seen) { out.push(nxt); }
+            }
+        }
+        return out;
+    }
+
     /// Map an owner key (a namespace name, or a source-file path for modules
     /// without a namespace) to that module's source-file path, interned.
     /// Used by spec routing to set a relocated specialization's
