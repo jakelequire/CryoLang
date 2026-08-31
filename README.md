@@ -12,9 +12,10 @@
 
 ```cryo
 namespace Hello;
+import std::fmt;
 
 function main() -> int {
-    printf("Hello, world!\n");
+    fmt::println("Hello, world!");
     return 0;
 }
 ```
@@ -29,17 +30,31 @@ The compiler is **self-hosted**: every line of Cryo you compile is compiled by C
 
 ## Table of Contents
 
-- [Highlights](#highlights)
+- [Table of Contents](#table-of-contents)
 - [Installing](#installing)
+  - [Quick install (recommended)](#quick-install-recommended)
+  - [From source / for compiler development](#from-source--for-compiler-development)
+  - [Requirements](#requirements)
 - [Hello, World](#hello-world)
 - [Language Tour](#language-tour)
+  - [Variables](#variables)
+  - [Control flow](#control-flow)
+  - [Structs](#structs)
+  - [Classes: single inheritance, virtual dispatch](#classes-single-inheritance-virtual-dispatch)
+  - [Enums and pattern matching](#enums-and-pattern-matching)
+  - [Traits and generics](#traits-and-generics)
+  - [Modules](#modules)
+  - [FFI](#ffi)
+  - [Tests](#tests)
 - [The `cryo` CLI](#the-cryo-cli)
 - [Project Layout (`cryoconfig`)](#project-layout-cryoconfig)
+  - [Git dependencies](#git-dependencies)
 - [Standard Library](#standard-library)
 - [Building from Source](#building-from-source)
+  - [Release artifacts](#release-artifacts)
 - [Architecture](#architecture)
 - [Repository Layout](#repository-layout)
-- [Status & Roadmap](#status--roadmap)
+- [Status \& Roadmap](#status--roadmap)
 - [License](#license)
 
 ---
@@ -87,13 +102,13 @@ cd CryoLang
 
 The **quick-install** binary is statically linked - it only needs a C compiler on `PATH` to link the programs you compile. The table below applies to the **from-source / dev** flow (the pinned `bin/cryo` is dynamically linked):
 
-| Dependency | Version | Why |
-| --- | --- | --- |
-| `clang` | 20 | Linker driver invoked at compile time. |
-| `LLVM` | 20 (runtime + dev) | The pinned `bin/cryo` dynamically links `libLLVM.so.20.1`. The `-dev` package is additionally required to rebuild the compiler from source. |
-| `make` | 4.0+ | Top-level build orchestration. |
-| `python3` | 3.8+ | Drives `make selfhost-check`. |
-| `glibc` | 2.34+ | Floor of the committed pinned `bin/cryo` (Ubuntu 22.04+, Debian 12+, Fedora 35+). The quick-install binary is fully static and has no glibc requirement. |
+| Dependency | Version            | Why                                                                                                                                                      |
+| ---------- | ------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `clang`    | 20                 | Linker driver invoked at compile time.                                                                                                                   |
+| `LLVM`     | 20 (runtime + dev) | The pinned `bin/cryo` dynamically links `libLLVM.so.20.1`. The `-dev` package is additionally required to rebuild the compiler from source.              |
+| `make`     | 4.0+               | Top-level build orchestration.                                                                                                                           |
+| `python3`  | 3.8+               | Drives `make selfhost-check`.                                                                                                                            |
+| `glibc`    | 2.34+              | Floor of the committed pinned `bin/cryo` (Ubuntu 22.04+, Debian 12+, Fedora 35+). The quick-install binary is fully static and has no glibc requirement. |
 
 The pinned `bin/cryo` is an x86-64 Linux ELF dynamically linked against `libLLVM.so.20.1` (plus `libstdc++`, `libffi`, `libedit`, `libxml2`, `libicu`, `libz`, `libzstd`, `liblzma`, and glibc). On Debian/Ubuntu, `apt-get install llvm-20 clang-20` covers the runtime; rebuilding from source additionally needs `llvm-20-dev` (and `libpolly-20-dev` for a `--release-static` build). The dev install also runs `make stdlib` to produce `stdlib/.bin/libcryo.a` (which is gitignored), so a clean checkout needs the build toolchain even when using the pinned binary.
 
@@ -123,9 +138,10 @@ hello/
 
 ```cryo
 namespace Hello;
+import std::fmt;
 
 function main() -> int {
-    printf("Hello, world!\n");
+    fmt::println("Hello, world!");
     return 0;
 }
 ```
@@ -160,11 +176,11 @@ Type annotations are optional when there's an initializer to infer from (`const 
 ### Control flow
 
 ```cryo
-if (x > 0) { printf("positive\n"); }
-else if (x < 0) { printf("negative\n"); }
-else { printf("zero\n"); }
+if      (x > 0) { fmt::println("positive"); }
+else if (x < 0) { fmt::println("negative"); }
+else            { fmt::println("zero"); }
 
-for (mut i: int = 0; i < 10; i++) { printf("%d\n", i); }
+for (mut i: int = 0; i < 10; i++) { fmt::printf("%d\n", i); }
 
 loop {
     if (done) { break; }
@@ -339,21 +355,21 @@ Run with `cryo test`. See [`docs/cryo.md` section 20](./docs/cryo.md#20-testing)
 
 ## The `cryo` CLI
 
-| Command | Description |
-| --- | --- |
-| `cryo init [dir]` | Scaffold a new project (`cryoconfig` + `src/main.cryo`). |
-| `cryo build` | Build the project in the current directory. |
-| `cryo build --opt-level=N` | Override the optimization level (`0`-`3`) for this build. |
-| `cryo build -g` | Emit DWARF debug info (source file/line) for gdb/lldb backtraces. |
-| `cryo run` | Build and execute. |
-| `cryo test [filter]` | Discover, build, and run every `![test]` function. |
-| `cryo test --list` | Print discovered tests without running. |
-| `cryo test --ignored` | Also run `![ignore]`-marked tests. |
-| `cryo check <file>` | Type-check without code generation. |
-| `cryo fetch` | Resolve `[dependencies]`; write `cryoconfig.lock`. |
-| `cryo update` | Re-resolve dependencies, ignoring the lock. |
-| `cryo demangle <symbol>` | Decode a mangled Cryo symbol. |
-| `cryo version` | Print version info. |
+| Command                    | Description                                                       |
+| -------------------------- | ----------------------------------------------------------------- |
+| `cryo init [dir]`          | Scaffold a new project (`cryoconfig` + `src/main.cryo`).          |
+| `cryo build`               | Build the project in the current directory.                       |
+| `cryo build --opt-level=N` | Override the optimization level (`0`-`3`) for this build.         |
+| `cryo build -g`            | Emit DWARF debug info (source file/line) for gdb/lldb backtraces. |
+| `cryo run`                 | Build and execute.                                                |
+| `cryo test [filter]`       | Discover, build, and run every `![test]` function.                |
+| `cryo test --list`         | Print discovered tests without running.                           |
+| `cryo test --ignored`      | Also run `![ignore]`-marked tests.                                |
+| `cryo check <file>`        | Type-check without code generation.                               |
+| `cryo fetch`               | Resolve `[dependencies]`; write `cryoconfig.lock`.                |
+| `cryo update`              | Re-resolve dependencies, ignoring the lock.                       |
+| `cryo demangle <symbol>`   | Decode a mangled Cryo symbol.                                     |
+| `cryo version`             | Print version info.                                               |
 
 Run `cryo help` for the canonical list.
 
@@ -400,26 +416,26 @@ entry_point = "src/tool/main.cryo"
 
 `stdlib/` is written entirely in Cryo. The full module map with one-line descriptions lives at the top of [`stdlib/lib.cryo`](./stdlib/lib.cryo). At a glance:
 
-| Module | What you'll find |
-| --- | --- |
-| `core` | Language foundations: `Option`, `Result`, `Slice`, `NonNull`, `Range`, `Ordering`. Traits: `Copy`, `Drop`, `Clone`, `Default`, `Eq`, `Ord`, `Hash`, `Iterator<Item>`, `From`/`Into`/`TryFrom`, `Step`. Memory utilities. FNV-1a hasher. |
-| `alloc` | `Layout`, `Allocator` trait, `GlobalAlloc`, `Box<T>`, `Arena` (bump), `Pool` (slab), `Rc<T>`, `Arc<T>`. |
-| `collections` | `Array<T, A>`, `Str` (borrowed UTF-8), `String<A>` (owned UTF-8), `HashMap<K, V, A>`, `HashSet<T, A>`. Allocator-generic with `GlobalAlloc` default. |
-| `io` | `Read` and `Write` traits with rich defaults; `Stdin` / `Stdout` / `Stderr`; `BufWriter` / `LineWriter` / `BufReader`; POSIX `IoError` mapping. |
-| `fmt` | `Display`, `Debug`, `Formatter<W>`, `FmtWrite`. Heap-free integer and float writers. `print` / `println` / `eprint` / `eprintln`. |
-| `json` | RFC 8259 parser + serializer. `JsonValue`, `JsonNumber`, ordered `JsonObject`. |
-| `encoding` | Byte<->text codecs: `base64` (RFC 4648) `encode`/`decode`, and `sha1` (RFC 3174) 20-byte digest. |
-| `fs` | `Path` / `PathBuf`. `OpenOptions` builder, `File` (`Read + Write`). Path manipulation. |
-| `ffi` | The C ABI boundary. `libc` houses every `extern "C"` the stdlib needs. `cstr` for `CStr` / `CString`. |
-| `env` | `args()`, `var()`, `set_var()`, `process_exit()`. |
-| `math` | Thin libm wrappers: trig, log/exp, roots, rounding. `PI`, `TAU`, `E`. |
-| `time` | `Duration` (normalized seconds + nanoseconds), `Instant` (monotonic clock; `now`/`elapsed`), system-clock access for Unix timestamps, and `sleep(Duration)`. |
-| `random` | `SecureRng` over the kernel CSPRNG (`getrandom` / `RtlGenRandom`): `fill`, `next_u64`, unbiased range sampling, and shuffling. |
-| `net` | TCP/UDP sockets, DNS, IPv4/IPv6 addressing, and TLS. HTTP/1.1 (`Method`, `StatusCode`, `Headers`, `Request`, `Response`, `Router`, a connection-per-request server `HttpServer::with_router(addr, &router).run()`, `Client::get`/`post`), HTTP/2 (h2c + HPACK), and WebSocket. |
-| `process` | POSIX subprocess spawning (`fork + execve`). `Command` builder, `Stdio`, `Child`, `ExitStatus`, `Signal`. |
-| `sync` | A generic `Atomic<T>` (`T` = `u8` / `u32` / `u64` / `i32` / `i64` / `boolean`), `MemoryOrder`, `fence`, `Mutex<T>`, `RwLock<T>`, `CondVar`, `Once`, `Barrier`. |
-| `thread` | `ThreadLocal<T>` via POSIX TLS, `thread::spawn` / `try_spawn` / `JoinHandle<T>` (returns the body's value on `join`), `spawn_with_attr`, scoped threads (`thread::Scope`), `current` / `yield_now` / `sleep` / `sleep_ms`. Channels live in `sync::mpsc` (`channel`, `Sender`, `Receiver`). |
-| `test` | The built-in unit-test framework. |
+| Module        | What you'll find                                                                                                                                                                                                                                                                            |
+| ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `core`        | Language foundations: `Option`, `Result`, `Slice`, `NonNull`, `Range`, `Ordering`. Traits: `Copy`, `Drop`, `Clone`, `Default`, `Eq`, `Ord`, `Hash`, `Iterator<Item>`, `From`/`Into`/`TryFrom`, `Step`. Memory utilities. FNV-1a hasher.                                                     |
+| `alloc`       | `Layout`, `Allocator` trait, `GlobalAlloc`, `Box<T>`, `Arena` (bump), `Pool` (slab), `Rc<T>`, `Arc<T>`.                                                                                                                                                                                     |
+| `collections` | `Array<T, A>`, `Str` (borrowed UTF-8), `String<A>` (owned UTF-8), `HashMap<K, V, A>`, `HashSet<T, A>`. Allocator-generic with `GlobalAlloc` default.                                                                                                                                        |
+| `io`          | `Read` and `Write` traits with rich defaults; `Stdin` / `Stdout` / `Stderr`; `BufWriter` / `LineWriter` / `BufReader`; POSIX `IoError` mapping.                                                                                                                                             |
+| `fmt`         | `Display`, `Debug`, `Formatter<W>`, `FmtWrite`. Heap-free integer and float writers. `print` / `println` / `eprint` / `eprintln`.                                                                                                                                                           |
+| `json`        | RFC 8259 parser + serializer. `JsonValue`, `JsonNumber`, ordered `JsonObject`.                                                                                                                                                                                                              |
+| `encoding`    | Byte<->text codecs: `base64` (RFC 4648) `encode`/`decode`, and `sha1` (RFC 3174) 20-byte digest.                                                                                                                                                                                            |
+| `fs`          | `Path` / `PathBuf`. `OpenOptions` builder, `File` (`Read + Write`). Path manipulation.                                                                                                                                                                                                      |
+| `ffi`         | The C ABI boundary. `libc` houses every `extern "C"` the stdlib needs. `cstr` for `CStr` / `CString`.                                                                                                                                                                                       |
+| `env`         | `args()`, `var()`, `set_var()`, `process_exit()`.                                                                                                                                                                                                                                           |
+| `math`        | Thin libm wrappers: trig, log/exp, roots, rounding. `PI`, `TAU`, `E`.                                                                                                                                                                                                                       |
+| `time`        | `Duration` (normalized seconds + nanoseconds), `Instant` (monotonic clock; `now`/`elapsed`), system-clock access for Unix timestamps, and `sleep(Duration)`.                                                                                                                                |
+| `random`      | `SecureRng` over the kernel CSPRNG (`getrandom` / `RtlGenRandom`): `fill`, `next_u64`, unbiased range sampling, and shuffling.                                                                                                                                                              |
+| `net`         | TCP/UDP sockets, DNS, IPv4/IPv6 addressing, and TLS. HTTP/1.1 (`Method`, `StatusCode`, `Headers`, `Request`, `Response`, `Router`, a connection-per-request server `HttpServer::with_router(addr, &router).run()`, `Client::get`/`post`), HTTP/2 (h2c + HPACK), and WebSocket.              |
+| `process`     | POSIX subprocess spawning (`fork + execve`). `Command` builder, `Stdio`, `Child`, `ExitStatus`, `Signal`.                                                                                                                                                                                   |
+| `sync`        | A generic `Atomic<T>` (`T` = `u8` / `u32` / `u64` / `i32` / `i64` / `boolean`), `MemoryOrder`, `fence`, `Mutex<T>`, `RwLock<T>`, `CondVar`, `Once`, `Barrier`.                                                                                                                              |
+| `thread`      | `ThreadLocal<T>` via POSIX TLS, `thread::spawn` / `try_spawn` / `JoinHandle<T>` (returns the body's value on `join`), `spawn_with_attr`, scoped threads (`thread::Scope`), `current` / `yield_now` / `sleep` / `sleep_ms`. Channels live in `sync::mpsc` (`channel`, `Sender`, `Receiver`). |
+| `test`        | The built-in unit-test framework.                                                                                                                                                                                                                                                           |
 
 The **prelude** (auto-imported into every file) currently re-exports `core::panic`, `core::option`, `core::result`, `core::primitives`, `core::intrinsics`, `core::varargs`, `core::slice`, `core::ops`, `core::iter`, `collections::array`, `alloc::box`, and `alloc::rc`.
 
@@ -468,16 +484,16 @@ Source -> Lex -> Parse -> Module Resolution -> Declaration Collection -> Type Re
        -> IR Generation (LLVM 20) -> Linking (clang) -> Native binary
 ```
 
-| Stage | Source |
-| --- | --- |
-| Lexing | `compiler/src/compiler/lex/` |
-| Parsing | `compiler/src/compiler/parser/` |
-| AST | `compiler/src/compiler/AST/` |
-| Type system, monomorphisation | `compiler/src/compiler/types/` |
-| Passes (sema, move, drop, specialisation, type lowering, header import, ...) | `compiler/src/compiler/passes/` |
-| LLVM IR generation | `compiler/src/compiler/codegen/` |
-| Diagnostics | `compiler/src/compiler/diag/` |
-| CLI | `compiler/src/CLI/` |
+| Stage                                                                        | Source                           |
+| ---------------------------------------------------------------------------- | -------------------------------- |
+| Lexing                                                                       | `compiler/src/compiler/lex/`     |
+| Parsing                                                                      | `compiler/src/compiler/parser/`  |
+| AST                                                                          | `compiler/src/compiler/AST/`     |
+| Type system, monomorphisation                                                | `compiler/src/compiler/types/`   |
+| Passes (sema, move, drop, specialisation, type lowering, header import, ...) | `compiler/src/compiler/passes/`  |
+| LLVM IR generation                                                           | `compiler/src/compiler/codegen/` |
+| Diagnostics                                                                  | `compiler/src/compiler/diag/`    |
+| CLI                                                                          | `compiler/src/CLI/`              |
 
 The compiler runtime, meaning every intrinsic from `stdlib/core/intrinsics.cryo` plus `format()`, is emitted as LLVM IR by `compiler/src/compiler/codegen/intrinsics_codegen.cryo`. There is no separate runtime library.
 
