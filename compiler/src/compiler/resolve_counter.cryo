@@ -370,6 +370,21 @@ type enum Site {
     /// instead of silently re-derived downstream.
     SynthScopeResNoName;
 
+    /// Where the QUALIFIER minted by `qualify_symbol_sym` came from.  A bare
+    /// leaf is qualified with the module the compiler is STANDING IN, which is
+    /// the right answer only while a pass walks a module's own declarations in
+    /// order; it is the wrong one for any syntax re-visited from elsewhere.
+    /// `Diff` is the population that matters: the names whose writing module
+    /// and ambient cursor disagree, i.e. the set the cursor mis-qualifies.
+    ///
+    /// `Calls` is bumped at every probed site, so `Syntax + Cursor` failing to
+    /// sum to it means a site is reaching the unprobed entry point - which
+    /// looks identical to "the cursor always agreed" if only `Diff` is read.
+    QualSymCalls;
+    QualSymSyntax;
+    QualSymCursor;
+    QualSymDiff;
+
 }
 
 implement enum Site {
@@ -452,6 +467,10 @@ implement enum Site {
             Site::ScopeUseSyntax        => { "   " }
             Site::ScopeUseCursor        => { "   " }
             Site::ScopeUseDiff          => { "   " }
+            Site::QualSymCalls          => { "   " }
+            Site::QualSymSyntax         => { "   " }
+            Site::QualSymCursor         => { "   " }
+            Site::QualSymDiff           => { "!! " }
             Site::DefaultArgNoOwner     => { "!! " }
             Site::VisFastpath           => { "   " }
             Site::VisWouldReject        => { "!! " }
@@ -571,6 +590,10 @@ implement enum Site {
             Site::ScopeUseSyntax        => { "scope use site from the SYNTAX's own module" }
             Site::ScopeUseCursor        => { "  no provenance: fell back to the cursor" }
             Site::ScopeUseDiff          => { "  syntax != cursor (the mis-judged set)" }
+            Site::QualSymCalls          => { "qualify_symbol_sym probed calls" }
+            Site::QualSymSyntax         => { "  span names a module (provenance available)" }
+            Site::QualSymCursor         => { "  no provenance: fell back to the cursor" }
+            Site::QualSymDiff           => { "  syntax != cursor (the MIS-QUALIFIED set)" }
             Site::DefaultArgNoOwner     => { "default arg expanded with NO owning module" }
             Site::VisFastpath           => { "single-candidate fast path taken" }
             Site::VisWouldReject        => { "  WOULD BE REJECTED once gated" }
@@ -1014,6 +1037,25 @@ public function body_ns_diff(file: string, syntax_ns: string,
     fmt::eprintf("BODY-NS\t%s\t%s\t%s\n", file, syntax_ns, cursor_ns);
 }
 
+/// One qualifier mint: which call site asked, the file the syntax was written
+/// in, what that file's module would qualify with, what the ambient cursor
+/// qualified with, and the bare leaf.
+///
+/// Emitted on EVERY probed call, not only the diverging ones, so that a zero
+/// in `QualSymDiff` stays re-derivable offline by a comparison this compiler
+/// did not perform.  A zero computed only by the `!=` inside the probe would
+/// be its own control; an awk pass over the stream is not.
+///
+/// `site` is passed by the CALLER rather than derived here, for the reason
+/// `resolve_scoped` documents: one location inside the wrapper would collapse
+/// every caller into itself and report the wrapper as the whole population.
+public function qual_sym_diff(site: string, file: string, syntax_ns: string,
+                              cursor_ns: string, bare: string) -> void {
+    if (!Audit::Scope.enabled()) { return; }
+    fmt::eprintf("QUAL-SYM\t%s\t%s\t%s\t%s\t%s\n",
+                 site, file, syntax_ns, cursor_ns, bare);
+}
+
 /// Print one MONO-side resolution context, naming (a) the file whose syntax it
 /// is about to resolve, (b) the module of the ENTITY the context could derive a
 /// home from, and (c) the ambient cursor.
@@ -1149,6 +1191,10 @@ public function report() -> void {
     Site::ScopeUseSyntax.print_row();
     Site::ScopeUseCursor.print_row();
     Site::ScopeUseDiff.print_row();
+    Site::QualSymCalls.print_row();
+    Site::QualSymSyntax.print_row();
+    Site::QualSymCursor.print_row();
+    Site::QualSymDiff.print_row();
     Site::DefaultArgNoOwner.print_row();
     Site::VisFastpath.print_row();
     Site::VisWouldReject.print_row();

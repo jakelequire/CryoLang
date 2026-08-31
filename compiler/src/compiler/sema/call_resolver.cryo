@@ -208,7 +208,21 @@ type struct CallResolver {
             // expected-type propagation into the arguments - a generic-enum
             // literal arg (`classify(Option::Some(-3))`) then never
             // instantiates and codegen drops its payload store entirely.
-            const q_sym: SymbolStr = this.ctx.qualify_symbol_sym(ident.name);
+            // Qualified with the module that WROTE the call, not the one the
+            // compiler is standing in.  A trait default's body and a
+            // specialized clone are both re-typed with the cursor parked on
+            // another module, so the cursor's qualifier names a function that
+            // module does not declare; the lookup then misses and drops
+            // through to the bare map this comment warns about.  The span's
+            // module is where an unqualified call's leaf is actually written,
+            // which is the only module whose local signature it can mean.
+            //
+            // The bare fallback below stays load-bearing: a call to an
+            // IMPORTED free function is qualified by neither module - its
+            // qualified name is the DECLARING one - and only the bare lookup
+            // can reach it.
+            const q_sym: SymbolStr =
+                this.ctx.qualify_symbol_sym_home(ident.name, ident.span.file);
             const qual: TypeRef = this.ctx.decl_index.lookup_func_type(q_sym);
             if (qual.is_valid()) { return qual; }
             return this.ctx.decl_index.lookup_func_type(ident.name);
@@ -1810,7 +1824,13 @@ type struct CallResolver {
 
     check_call_arity(mut &this, visitor: ASTVisitor*, call: CallExprNode*, ident: IdentifierNode*) -> void {
         if (call.generic_args.length > 0) { return; }
-        const qualified: SymbolStr = this.ctx.qualify_symbol_sym(ident.name);
+        // The writing module, not the ambient cursor: an arity check must see
+        // the overload set of the module that wrote the call.  The cursor's
+        // qualifier names nothing whenever the body is being re-typed from
+        // another module, and the bare fallback below then reports arity
+        // against a same-leaf function from a different unit.
+        const qualified: SymbolStr =
+            this.ctx.qualify_symbol_sym_home(ident.name, ident.span.file);
         mut overloads: TypeRef[] = this.ctx.decl_index.lookup_func_type_overloads(qualified);
         if (overloads.length == 0) {
             overloads = this.ctx.decl_index.lookup_func_type_overloads(ident.name);
@@ -2410,7 +2430,12 @@ type struct CallResolver {
             arg_types.push(arg.resolved_type);
         }
         const di: DeclarationIndex* = this.ctx.decl_index;
-        const qualified: SymbolStr = this.ctx.qualify_symbol_sym(ident.name);
+        // The writing module, not the ambient cursor.  This name also becomes
+        // `lookup_key` below, so answering from the cursor does not merely
+        // miss - it drops the call onto the import-scoped bare path
+        // (`scoped_bare`) for a leaf whose own module declares it.
+        const qualified: SymbolStr =
+            this.ctx.qualify_symbol_sym_home(ident.name, ident.span.file);
         mut overloads: TypeRef[] = di.lookup_func_type_overloads(qualified);
         mut lookup_key: SymbolStr = qualified;
         // Bare fallback: candidates may span modules (per-owner entries), so
@@ -2830,7 +2855,7 @@ type struct CallResolver {
         }
         // R4: prefer the current-module qualified definition over a same-leaf
         // function in another unit (fixes the #9 last-write-wins collision).
-        const qual_name: SymbolStr = this.ctx.qualify_symbol_sym(ident.name);
+        const qual_name: SymbolStr = this.ctx.qualify_symbol_sym_at(ident.name, "look/cr-ident-d", ident.span.file);
         mut func_ret: TypeRef = this.types.lookup_func_return(qual_name);
         if (!func_ret.is_valid()) {
             func_ret = this.types.lookup_func_return(ident.name);
