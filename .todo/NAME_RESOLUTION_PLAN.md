@@ -1,5 +1,13 @@
 # Name Resolution: Unification Plan
 
+> **SUPERSEDED as a tracker. The live ledger is `docs/name-resolution.md` §8.**
+> Phase 2 (packages as a cycle unit) was re-scoped after measurement — intra-
+> package cycles are 0.4% of leaf-index usage — and the keystone became
+> mandatory explicit scope (§5.2) plus `Res` on nodes (§6.3). The vocabulary
+> here also predates the tree: re-export is spelled `export`, not `public
+> import`, and per-item import aliasing was dropped on measurement. Read this
+> for its current-state survey, not for what remains to be done.
+
 > Status: **proposal / roadmap**. Nothing here is committed work. This document
 > describes the path from Cryo's current six-system, fallback-cascade name
 > resolution to a two-table resolution model with a single authoritative

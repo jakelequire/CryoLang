@@ -5239,6 +5239,40 @@ std::future::ready;` back for `Ready<T>::new`. That import carries a comment
 naming the mechanism, and it is the marker for this section — when the keystone
 lands, that import is the thing to delete to prove it.
 
+#### Both import forms disagreed with the rule, and with each other — MEASURED 2026-08-30
+
+`export` grants an importer what the same path would grant if it were imported
+there. `process_import` implemented that twice, and neither copy was the rule.
+
+**Only a STATIC CALL can observe either defect.** A type annotation resolves
+through module-level reachability, and `instance.cryo` closes `ns_imports` over
+re-exports without limit, so an annotation passes at any depth under either
+form. Every re-export project asserted through an annotation —
+`reexport_basic`'s cryoconfig says so in as many words, calling the annotation
+"the load-bearing assertion" — which is why both defects survived six projects.
+
+| depth | `import M;` | `import M::{ N };` |
+|---|---|---|
+| 1 hop | resolves | **E0900** |
+| 2 hops | **E0900** | **E0900** |
+
+- The `Specific` branch read no re-export edge at all. `lookup_in_module` scans
+  a module's own export table; the sub-module path it fell to builds `M::N`,
+  which is not a module, so the name bound nothing.
+- The `Wildcard` branch read `ModuleInfo.reexports`, which holds ONE hop, so a
+  facade naming a facade granted nothing.
+
+`ModuleGraph::reexport_closure` now answers the question once, transitively,
+and both branches read it: the offered set is a module's own exports UNION what
+it re-exports. The result is its own worklist and visited set, so mutual
+re-export terminates — it cannot terminate on acyclicity, which the edge rule
+deliberately permits. A re-exported name keeps the module that DECLARED it, so
+one declaration never acquires two qualified names.
+
+Coverage followed the defect rather than the fix: the brace-list form and a
+depth-2 static call were the two unexercised positions, and a project that
+asserts only through an annotation cannot fail on either.
+
 ### 8.5 §5.2 was never implemented: lanes are duplicated code, not a parameter — MEASURED 2026-08-13
 
 §5.2 has specified `resolve_path(segments, ns, scope)` with **`ns` as a
@@ -6511,13 +6545,15 @@ exactly that module, so this zero does not speak for it.
   §1. Either `stdlib/lib.cryo` re-exports it explicitly or it becomes an error
   with a suggestion — decided per name, deliberately. `export` now exists to
   spell the first option (§8.4).
-- **Q12** — A bare generic static call (`Box<i32>::new`) does not see a
-  re-export, while the same type resolves as an annotation (§8.4). This is not
-  a question about what the language should mean — that is settled — but about
-  whether the keystone (§6) is allowed to subsume `lookup_scope_template`'s
-  four-step chain wholesale, since collapsing it changes which template a bare
-  same-leaf name binds to and therefore what existing programs compile to.
 ### Decided 2026-08-10
+
+- **Q12 — the keystone subsumes the scope-template chain.** ANSWERED BY THE
+  CODE: `lookup_scope_template` takes a `Res`, and the derived-name variant the
+  question was about no longer exists. The question assumed collapsing the
+  chain would rebind bare same-leaf names; measured over the corpus it gained
+  418 answers, regressed none, and rebound none, because a stamped node names
+  its template directly instead of searching for a leaf that a re-export never
+  carried.
 
 - **Q11 — symbol re-export is spelled `export`, and it is a declaration in the
   module that re-exports.** IMPLEMENTED — see §8.4, including the one door it

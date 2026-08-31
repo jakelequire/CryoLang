@@ -1933,6 +1933,24 @@ public:
         this.ctx.const_table.register_enum(qualified, node);
     }
 
+    /// The module in `m`'s `export` closure that publicly exports `name`, or
+    /// an invalid SymbolStr when none does.
+    ///
+    /// This is the second half of one question - what does `m` OFFER under
+    /// this name - whose first half is `m`'s own export table.  It is not a
+    /// second strategy for the same lookup: the offered set is defined as the
+    /// union, because an `export` grants an importer what the same path would
+    /// grant if it were imported there.
+    reexport_offering(&this, m: SymbolStr, name: SymbolStr) -> SymbolStr {
+        const via: SymbolStr[] = this.ctx.module_graph.reexport_closure(m);
+        for (mut i: i64 = 0; i < via.length; i++) {
+            if (this.resolver.lookup_in_module(via[i], name).is_valid()) {
+                return via[i];
+            }
+        }
+        return SymbolStr::empty();
+    }
+
     /// Binds what an `import` - or an `export` - names into the current scope.
     ///
     /// An export is deliberately NOT branched on here.  It grants an importer
@@ -2027,55 +2045,84 @@ public:
                 }
             }
             // A re-exported namespace is part of what this module offers, so
-            // importing the module brings its names too.  The module-level
-            // relation already knew this - `ns_imports` is closed over
-            // re-exports - while the SYMBOL lane did not, so a name that was
-            // legitimately visible bound nothing in scope and was found, if at
-            // all, by a leaf search that ignores the writing file entirely.
+            // importing the module brings its names too.  The walk is
+            // transitive because `export` is: a name reachable through a facade
+            // of a facade is offered by both, and stopping one hop in leaves it
+            // bound nowhere in scope, findable only by a leaf search that
+            // ignores the writing file entirely.
             //
             // Each name keeps the module that DECLARED it, not the one that
             // passed it along: the qualified name is an identity, and routing
             // it through the re-exporter would give the same declaration two.
-            const rx_idx: i64 = this.ctx.module_graph.find_module_index(module_sym);
-            if (rx_idx >= 0) {
-                const rx_mod: ModuleInfo* = this.ctx.module_graph.get_module(rx_idx);
-                for (mut rx: i64 = 0; rx < rx_mod.reexports.length; rx++) {
-                    const rx_ns: SymbolStr = rx_mod.reexports[rx];
-                    const rx_str: string = this.resolver.intern_table.resolve(rx_ns);
-                    const rx_exports: SymbolID[] = this.resolver.get_exports(rx_ns);
-                    for (mut re: i64 = 0; re < rx_exports.length; re++) {
-                        const rx_sym: Symbol = this.resolver.get_symbol(rx_exports[re]);
-                        if (!rx_sym.visibility.is_public()) { continue; }
-                        const rx_src: string =
-                            if (rx_sym.source_module != "") { rx_sym.source_module }
-                            else { rx_str };
-                        const rid: SymbolID = this.resolver.alloc_symbol_id();
-                        const rimp: Symbol = Symbol::import_sym(
-                            rid, rx_sym.name, this.resolver.current_scope,
-                            node.span, rx_src);
-                        this.resolver.declare_import(rimp);
-                    }
+            const rx_all: SymbolStr[] =
+                this.ctx.module_graph.reexport_closure(module_sym);
+            for (mut rx: i64 = 0; rx < rx_all.length; rx++) {
+                const rx_ns: SymbolStr = rx_all[rx];
+                const rx_str: string = this.resolver.intern_table.resolve(rx_ns);
+                const rx_exports: SymbolID[] = this.resolver.get_exports(rx_ns);
+                for (mut re: i64 = 0; re < rx_exports.length; re++) {
+                    const rx_sym: Symbol = this.resolver.get_symbol(rx_exports[re]);
+                    if (!rx_sym.visibility.is_public()) { continue; }
+                    const rx_src: string =
+                        if (rx_sym.source_module != "") { rx_sym.source_module }
+                        else { rx_str };
+                    const rid: SymbolID = this.resolver.alloc_symbol_id();
+                    const rimp: Symbol = Symbol::import_sym(
+                        rid, rx_sym.name, this.resolver.current_scope,
+                        node.span, rx_src);
+                    this.resolver.declare_import(rimp);
                 }
             }
         } else {
             // ImportStyle::Specific: each entry is either
-            //   (a) a direct exported symbol from `module_path`, e.g.
+            //   (a) a symbol `module_path` OFFERS - declared by it, or
+            //       reached through its `export` closure, e.g.
             //       `import std::fmt::{ println }`, OR
             //   (b) a sub-module of `module_path`, e.g.
             //       `import Compiler::{ CompileMode, Codegen }`.
-            // Try (a) first; if no direct symbol is found, build
-            // `<resolved_module>::<name>`, locate that sub-module in the graph,
-            // and wildcard-import its exports - exactly what
-            // `import Compiler::CompileMode;` does in Wildcard mode.
+            // (a) is ONE question - what does this module offer under this
+            // name - and the offered set is its own exports UNION what it
+            // re-exports, which is the set the Wildcard branch binds.  Reading
+            // only the own-exports half is what made `import M::{ N };` and
+            // `import M;` answer differently for the same `N`.
+            // (b) is a DIFFERENT question, asked only when the module offers
+            // no such symbol: build `<resolved_module>::<name>`, locate that
+            // sub-module in the graph, and wildcard-import its exports -
+            // exactly what `import Compiler::CompileMode;` does in Wildcard
+            // mode.
             for (mut i: int = 0; i < node.specific_imports.length; i++) {
                 const name: SymbolStr = node.specific_imports[i];
+                mut offered: boolean = false;
+                mut offered_src: string = "";
                 const found: SymbolID = this.resolver.lookup_in_module(module_sym, name);
                 if (found.is_valid()) {
-                    // (a) direct symbol in parent module
+                    offered_src = resolved_module;
+                    offered = true;
+                } else {
+                    // Reached through `module_path`'s `export` closure.  The
+                    // name keeps the module that DECLARED it, not the one that
+                    // passed it along, exactly as the Wildcard branch does: the
+                    // qualified name is an identity, and routing it through the
+                    // re-exporter would give the same declaration two.
+                    const via: SymbolStr = this.reexport_offering(module_sym, name);
+                    if (via.is_valid()) {
+                        const vid: SymbolID =
+                            this.resolver.lookup_in_module(via, name);
+                        const vsym: Symbol = this.resolver.get_symbol(vid);
+                        const vstr: string =
+                            this.resolver.intern_table.resolve(via);
+                        const vsrc: string =
+                            if (vsym.source_module != "") { vsym.source_module }
+                            else { vstr };
+                        offered_src = vsrc;
+                        offered = true;
+                    }
+                }
+                if (offered) {
                     const id: SymbolID = this.resolver.alloc_symbol_id();
                     const import_sym: Symbol = Symbol::import_sym(
                         id, name, this.resolver.current_scope,
-                        node.span, resolved_module);
+                        node.span, offered_src);
                     this.resolver.declare_import(import_sym);
                 } else {
                     // (b) sub-module: "<resolved_module>::<name>"
