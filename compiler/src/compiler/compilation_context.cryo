@@ -576,6 +576,72 @@ public:
         return this.intern_table.intern(ns + "::" + bare);
     }
 
+    /// The qualifier the span's OWN module would mint - the module that WROTE
+    /// the name, not the one the compiler is standing in.
+    ///
+    /// A bare leaf means what it means in the module whose source text
+    /// contains it.  The ambient cursor answers that correctly only while a
+    /// pass walks a module's own declarations in order; a trait default's body
+    /// and a specialized clone are both re-typed with the cursor parked on
+    /// another module, and a name qualified there names nothing.
+    ///
+    /// Falls back to the cursor when the file names no module in the graph
+    /// (a synthesized node, single-file mode) rather than to "no namespace":
+    /// an invalid namespace compares unequal to every real one, so treating
+    /// missing provenance as a distinct module would read "I cannot tell where
+    /// this was written" as "this was written somewhere else".
+    qualify_symbol_sym_home(mut &this, sym: SymbolStr,
+                            span_file: string) -> SymbolStr {
+        const home: SymbolStr = this.module_ns_sym_of_file(span_file);
+        if (!home.is_valid()) { return this.qualify_symbol_sym(sym); }
+        const ns: string   = this.intern_table.resolve(home);
+        const bare: string = this.intern_table.resolve(sym);
+        return this.intern_table.intern(ns + "::" + bare);
+    }
+
+    /// `qualify_symbol_sym`, judged against the module that WROTE the syntax
+    /// rather than the module the compiler is standing in.
+    ///
+    /// PROBE FORM: this returns the CURSOR's answer, unchanged, and only
+    /// records what the span's home module would have minted.  The flip is a
+    /// separate, measured step and cannot be done wholesale: a qualifier
+    /// minted here is matched later by a lookup that mints it the same way, so
+    /// both sides read the cursor and therefore AGREE WITH EACH OTHER even
+    /// where both are wrong.  Changing one side alone unpairs them, which is
+    /// why a divergence row is evidence about a site and not yet a defect.
+    ///
+    /// `span_file` is the node's own `span.file`, so the answer travels with
+    /// the syntax rather than with the walk.  A file that names no module in
+    /// the graph (a synthesized node, single-file mode) is recorded as
+    /// `Cursor`, never folded into agreement: "provenance was unavailable" and
+    /// "provenance agreed" are different findings, and merging them is what
+    /// would let a guess be reported as an authoritative answer.
+    ///
+    /// The home lookup is behind the audit flag because `ns_sym_of_file` is a
+    /// linear scan over the module graph and this sits in a hot path.  So
+    /// `QualSymCalls` IS the control for the other three: read as zero with
+    /// the probe off, `QualSymDiff` says nothing at all.
+    qualify_symbol_sym_at(mut &this, sym: SymbolStr, site: string,
+                          span_file: string) -> SymbolStr {
+        const cursor: SymbolStr = this.qualify_symbol_sym(sym);
+        if (!ResolveCounter::Audit::Scope.enabled()) { return cursor; }
+        ResolveCounter::Site::QualSymCalls.bump();
+        const cursor_ns: string = this.namespace_display();
+        const home: SymbolStr = this.module_ns_sym_of_file(span_file);
+        if (!home.is_valid()) {
+            ResolveCounter::Site::QualSymCursor.bump();
+            ResolveCounter::qual_sym_diff(site, span_file, "", cursor_ns,
+                                          this.intern_table.resolve(sym));
+            return cursor;
+        }
+        ResolveCounter::Site::QualSymSyntax.bump();
+        const home_ns: string = this.intern_table.resolve(home);
+        if (home_ns != cursor_ns) { ResolveCounter::Site::QualSymDiff.bump(); }
+        ResolveCounter::qual_sym_diff(site, span_file, home_ns, cursor_ns,
+                                      this.intern_table.resolve(sym));
+        return cursor;
+    }
+
     /// Qualify `sym` under an extern-module binding namespace when
     /// `binding_namespace` is set, otherwise under the file's ambient
     /// namespace (`qualify_symbol_sym`).  Used for the struct/enum/typedef

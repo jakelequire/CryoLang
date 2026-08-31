@@ -116,7 +116,7 @@ type struct DeclarationEmitter {
 
     qualify(&this, sym: SymbolStr) -> SymbolStr {
         const c: CompilationContext* = this.ctx;
-        return c.qualify_symbol_sym(sym);
+        return c.qualify_symbol_sym_at(sym, "wrap/de-qualify", "");
     }
 
     /// Qualified name for a function declaration, honoring a canonical
@@ -139,7 +139,7 @@ type struct DeclarationEmitter {
             return i.intern(node.source_module + "::" + i.resolve(node.name));
         }
         const c: CompilationContext* = this.ctx;
-        return c.qualify_symbol_sym(node.name);
+        return c.qualify_symbol_sym_at(node.name, "reg/de-fn-qname", node.span.file);
     }
 
     resolve(&this, sym: SymbolStr) -> string {
@@ -643,7 +643,7 @@ type struct DeclarationEmitter {
                 if (!resolved.equals(node.target_type)) {
                     qualified_target = resolved;
                 } else {
-                    qualified_target = ctx_ptr.qualify_symbol_sym(node.target_type);
+                    qualified_target = ctx_ptr.qualify_symbol_sym_at(node.target_type, "look/de-impl-target", node.span.file);
                 }
             }
         }
@@ -688,7 +688,7 @@ type struct DeclarationEmitter {
     canonical_type_ref(mut &this, name: SymbolStr) -> TypeRef {
         const ctx_ptr: CompilationContext* = this.ctx;
         const di: DeclarationIndex* = ctx_ptr.decl_index;
-        mut tref: TypeRef = di.lookup_type(ctx_ptr.qualify_symbol_sym(name));
+        mut tref: TypeRef = di.lookup_type(ctx_ptr.qualify_symbol_sym_at(name, "wrap/de-canon-typeref", ""));
         if (!tref.is_valid()) { tref = di.lookup_type(name); }
         if (!tref.is_valid()) { tref = this.get_arena().lookup_by_name(name); }
         return tref;
@@ -700,7 +700,7 @@ type struct DeclarationEmitter {
             const q: SymbolStr = this.get_arena().get_qualified_name(tref);
             if (q.is_valid()) { return q; }
         }
-        return this.ctx.qualify_symbol_sym(name);
+        return this.ctx.qualify_symbol_sym_at(name, "wrap/de-canon-qname", "");
     }
 
     /// Declare methods defined inline within a struct declaration.
@@ -1412,7 +1412,7 @@ type struct DeclarationEmitter {
 
         // Also register under qualified name (for cross-module resolution).
         const ctx_ptr: CompilationContext* = this.ctx;
-        const qualified: SymbolStr = ctx_ptr.qualify_symbol_sym(node.name);
+        const qualified: SymbolStr = ctx_ptr.qualify_symbol_sym_at(node.name, "reg/de-intrinsic", node.span.file);
         if (!qualified.equals(node.name)) {
             this.functions.register(qualified, fn_val);
         }
@@ -1734,7 +1734,7 @@ type struct DeclarationEmitter {
             // "Compiler::Codegen::State::FunctionRegistry::get") so same-named
             // methods are distinguishable in a backtrace, rather than the bare
             // leaf name.
-            const disp_sym: SymbolStr = ctx_ptr.qualify_symbol_sym(node.name);
+            const disp_sym: SymbolStr = ctx_ptr.qualify_symbol_sym_at(node.name, "reg/de-fn-disp", node.span.file);
             const name: string = this.resolve(disp_sym);
             const name_len: u64 = name.length();
 
@@ -2299,11 +2299,12 @@ type struct DeclarationEmitter {
         // named-value that's a pointer to the struct; for by-value `this` we
         // alloca+store the struct so member-access GEPs work the same way.
         if (!node.is_static) {
-            const qualified_target: SymbolStr = this.ctx.qualify_symbol_sym(target_type);
-            mut target_ref: TypeRef = this.ctx.decl_index.lookup_type(qualified_target);
-            if (target_ref.is_invalid()) {
-                target_ref = this.ctx.decl_index.lookup_type(target_type);
-            }
+            // A method node's `target_type` is already the canonical owner
+            // name, fully qualified by the pass that stamped it.  Prepending a
+            // namespace to it can only name a type no module declares, so a
+            // qualified lane in front of this lookup cannot answer and only the
+            // name as stamped ever binds.
+            mut target_ref: TypeRef = this.ctx.decl_index.lookup_type(target_type);
             if (target_ref.is_invalid()) {
                 // Unit-target impls (`implement trait Drop for ()`):
                 // unit type lives in the arena, not the DeclarationIndex.
