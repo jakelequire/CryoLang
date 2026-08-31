@@ -6531,6 +6531,183 @@ is §8.16's fix holding).
 **`stdlib/net/tls` is compiled by none of them.** §8.13's residue was found in
 exactly that module, so this zero does not speak for it.
 
+### 8.21 The stage that told the arena never told the index — MEASURED AND FIXED 2026-08-31
+
+`TypeDeclaration` exists to make every type NAME known before any signature
+resolves; its own driver says so (`collect_type_declarations`). It registered
+those names in the arena and, for struct/union/enum/class/trait, never in the
+`DeclarationIndex`. The guarantee held for one store.
+
+A QUALIFIED annotation in a function signature is what that gap reaches.
+`resolve_named` step 2c resolves a bare leaf against the writing module and
+completes the lookup in the arena itself, so a bare name never needed the index;
+2c is guarded on the name having no `::` and is skipped for a qualified one.
+Step 3a wants the written spelling, and the index is keyed canonically, so it
+misses. Step 3b canonicalizes correctly and then misses because the index does
+not yet hold the name. What answered was step 4a: the same canonical string, in
+the arena.
+
+**The whole population is signature annotations.** Every one was identified from
+source, and the control is that the same type written in a BODY nearby does not
+appear:
+
+| site | annotation | x |
+|---|---|---:|
+| `CLI/commands.cryo:920,928,934` | `input: mut &stdio::Stdin` | 3 |
+| `sema/call_resolver.cryo:2645,2693` | `door: ResolveCounter::Site` | 2 |
+| `sema/member_resolver.cryo:719` | `door: ResolveCounter::Site` | 1 |
+| `examples/14-threads/main.cryo:37` | `tx: mpsc::Sender<i32>` | 1 |
+
+`commands.cryo:862` and `:2615` write `stdio::Stdin` as a LOCAL and do not
+appear; `main.cryo:38,66,67` likewise. 3 of 5 and 1 of 4, which is what makes
+"signature" the axis rather than "this type".
+
+**The fix registers the name where the arena learns it**, using plain
+`register_type`. `register_type_with_module` also appends to `module_types`,
+which is not idempotent and is read by sema's suggestion machinery, so per-module
+ownership stays `TypeResolution`'s. The TypeAlias branch of the same match
+already did exactly this.
+
+Step 3b then answers with the identical canonical string, one step earlier:
+
+| corpus | 4a before | 4a after | 3b gain |
+|---|---:|---:|---:|
+| examples + ffi + compiler | 7 | 0 | +6 |
+| `tests/` | 2 | 0 | +2 |
+| `examples/14-threads` alone | 1 | 0 | +1 |
+| cross-target `x86_64-pc-linux-gnu` | 7 | 0 | — |
+
+`M1 qualifier_agrees` fell by exactly the same amount on every corpus, because
+`canonical_type_name` had been running TWICE for these names -- 3b missing, then
+4a recomputing the identical string.
+
+**An effect that was not predicted.** About eleven fewer type resolutions FAIL
+per corpus (`unresolved` -10 on `examples/11-http-server`, -11 on `tests/`, with
+`2c*` and `resolve_qualified_scoped` down by the same), from a caller that
+consults the index first and falls back to the resolver on a miss. Behaviour is
+unchanged by every gate, byte-identity included; it is recorded here because a
+number moved that nobody predicted.
+
+**`bootstrap_mode` then had nothing left to do.** Steps 4 and 4a answered 0 on
+all four corpora, so the flag, both steps, `end_bootstrap`, its call site, both
+counter variants and both B1 summands were deleted. The tripwire is no longer a
+counter: a name that needed 4a now fails to resolve, and E0203 stops the build.
+
+### 8.22 The bare-leaf template scan answers nothing, on every corpus — MEASURED, TIE-BREAKS DELETED 2026-08-31
+
+`find_function_template_for_call` scanned every registered template for a
+matching leaf and chose among candidates by unique call arity, then by longest
+module prefix shared with the calling module, then by scan order. The first two
+guess; the third is not a property the source states.
+
+Once the identifier's stamp was allowed to answer first (§8.10's shape), the
+scan stopped answering at all:
+
+| corpus | scan calls | found none | found one | found PLURAL |
+|---|---:|---:|---:|---:|
+| examples + ffi + compiler | 7,028 | 7,028 | 0 | 0 |
+| `tests/` | 3,199 | 3,199 | 0 | 0 |
+
+The three exits could not state this between them: each reports WHICH
+discriminator won, so "no exit fired" and "the scan matched nothing" read alike
+in their totals. `M4Scan{None,One,Plural}` splits the population itself, and
+survives the deletion of the code it justifies -- which the three exit counters
+could not.
+
+`PLURAL` is the only population a tie-break can act on and it is 0, so the three
+were deleted. A leaf borne by more than one template now returns null rather
+than picking one: refusing is a diagnostic, guessing is a silent misbind. The
+scan itself is KEPT -- it answers nothing today, and a scan that is merely inert
+is not the same finding as one that is unreachable.
+
+### 8.23 The same ladder, one function over, with no instrumentation at all — MEASURED AND FIXED 2026-08-31
+
+`find_scoped_function_template` carried a second copy of §8.22's ladder --
+arity, then longest shared prefix, then scan order -- and bumped no counter
+anywhere in its body, so nothing said whether it had ever decided anything. Its
+caller is the sibling `else` of the branch §8.22 hardened: the `ScopeResolution`
+callee arm.
+
+It matched by SUFFIX: any template whose qualified name ends `::scope::name`.
+That is a weaker question than the one asked, because the source may write any
+whole-segment suffix of a module's name and several modules can share one.
+
+**The scope segment was already stamped.** `ScopeResolutionNode.scope_res` has
+carried a `ResSlot` since the slot was introduced -- written by NameResolution at
+seven sites and by the async lowering's synthesizers -- and `Res::Def(ns)` on it
+is the module's OWN namespace, which `scope_name` cannot supply. The field is
+not named `res`, which is why it reads as absent.
+
+Probed before it was allowed to answer, the stamp and the scan agree in BOTH
+directions:
+
+| corpus | calls | scan: none | scan: one | scan: PLURAL | stamp reaches scan's entry | stamp DIFFERS |
+|---|---:|---:|---:|---:|---:|---:|
+| examples + ffi + compiler | 14,443 | 8,993 | 5,450 | 0 | 5,450 | 0 |
+| `tests/` | 4,608 | 3,121 | 1,487 | 0 | 1,487 | 0 |
+
+`stamp reaches the scan's entry` equals `scan: one` exactly, on both corpora --
+the pointer-identical `TemplateEntry`, not a matching name. And `scan: none`
+decomposes exactly into the stamp naming no template plus the segment carrying a
+non-`Def` answer (7,956 + 1,037 = 8,993; 2,867 + 254 = 3,121). Neither side sees
+anything the other misses.
+
+After the stamp answers first, the residual scan answers nothing: `scan: one`
+falls to 0 on both corpora and `answered from the scope stamp` takes exactly the
+population it held (5,450 and 1,487). The tie-breaks were deleted on the same
+terms as §8.22's.
+
+### 8.24 A probe was counted as a migration — MEASURED AND FLIPPED 2026-08-31
+
+`qualify_symbol_sym_at` records what the span's home module WOULD mint and
+returns the ambient cursor's answer unchanged. Its own docstring says so. Sites
+converted to it are instrumented, not migrated, and counting them as migrated
+overstates the work done.
+
+Over 586,106 probed mints across examples + ffi + compiler, the LSP, and
+`tests/`: 73 site labels exist in source, **61 are ever reached**, 50 of those
+never diverge and never lack a home module, 11 diverge or have no span to derive
+one from, and **12 are never exercised by any corpus measured**. A site that is
+never reached cannot be certified, and was not flipped.
+
+The 50 were moved to `qualify_symbol_sym_home`. Because home and cursor agreed on
+every one of those calls, the flip is a no-op by measurement -- and the control
+for that claim is not the counter but `selfhost-check`, which reports
+byte-identical IR on both hosts across a full self-compilation.
+
+The 11 that are NOT clean are left, and are the remaining population:
+
+| site | calls | diverge | no home |
+|---|---:|---:|---:|
+| `wrap/tu-method-owner` | 284,343 | 0 | 284,343 |
+| `wrap/tu-cascade-cursor` | 90,981 | 0 | 90,981 |
+| `look/sema-impl-target-b` | 22,473 | 8,008 | 0 |
+| `reg/extern-fn` | 15,700 | 0 | 522 |
+| `look/sema-impl-target-a` | 10,141 | 7,993 | 0 |
+| `look/sema-struct-qual` | 7,721 | 51 | 0 |
+| `reg/spec-register` | 6,279 | 6,266 | 0 |
+| `wrap/de-canon-typeref` | 3,695 | 0 | 3,695 |
+| `wrap/cgctx-qualify` | 3,455 | 0 | 3,455 |
+| `look/sema-struct-sym` | 1,716 | 30 | 0 |
+| `reg/al-future-qname` | 481 | 21 | 0 |
+
+"No home" is not agreement: it is the file naming no module in the graph, and
+folding it into agreement would report a guess as an authoritative answer.
+
+#### `spelling_type` collapses three answers into one
+
+`spelling_type` returns a `TypeRef`, so a slot that was never answered, an answer
+that names no definition, and an answer naming a definition the index does not
+hold all reach six consumers as the same `invalid`. Each branches on
+`!is_valid()` and falls through to a spelling lookup, and each carries a
+near-verbatim paragraph justifying it.
+
+Measured over 27,011 calls (native and `tests/`): `def NOT REGISTERED` is **0**,
+so no registration defect is being routed around. `answer names no def` is also
+**0** -- the case all six paragraphs cite as the reason for the fallback does not
+occur. Every invalid return is a slot that was never answered. The six fallbacks
+serve UNSTAMPED nodes, which is a different defect from the one they describe.
+
 ## 9. Open questions
 
 - **Q1** — Does enforcing §3.3 require per-item `public` on declarations that
