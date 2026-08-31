@@ -112,8 +112,6 @@ type enum Site {
     RnDiLiteral;
     RnDiCanonical;
     RnDiBare;
-    RnArenaBootstrap;
-    RnScopeArenaBootstrap;
     RnLeafIndex;
     RnFailed;
 
@@ -413,18 +411,15 @@ type enum Site {
     CgImplTargetScopedMap;
     CgImplTargetCursor;
 
-    /// Which discriminator answered M4's bare-leaf template scan, and whether
-    /// the identifier that asked already carried a stamp naming the callee.
+    /// Whether M4's bare-leaf template scan answered, and whether the
+    /// identifier that asked already carried a stamp naming the callee.
     ///
-    /// `M4Hits` counts all four exits alike, so the total cannot separate a
-    /// scan that found ONE candidate - where the leaf was never ambiguous -
-    /// from one that picked among several by module-prefix similarity or by
-    /// first-match.  Only the last two guess.  The `Res` rows say whether the
-    /// answer was available without any scan at all.
+    /// The scan answers only for a leaf borne by exactly one template, so
+    /// `M4Hits` and `M4Single` count the same events; both are kept because
+    /// `Hits` is what the fallback total sums and `Single` is what says why
+    /// it answered.  The `Res` rows say whether the answer was available
+    /// without any scan at all.
     M4Single;
-    M4Arity;
-    M4Prefix;
-    M4First;
     M4ResDef;
     M4ResOther;
     M4ResPending;
@@ -446,6 +441,51 @@ type enum Site {
     /// canonically, so this is the two meeting directly; the leaf scan below
     /// it can only ever approximate the same answer from a spelling.
     M4ViaRes;
+
+    /// How many candidates the leaf scan actually found, which is the question
+    /// the four exits below it answer between them.  The exits cannot state
+    /// this on their own: each says which discriminator won, so "no exit
+    /// fired" and "the scan found nothing" read identically in their totals.
+    /// `Plural` is the population the arity / module-prefix / first-match
+    /// tie-breaks exist to separate, and it is the row that has to stay zero
+    /// for them to be unreachable rather than merely unlucky.
+    /// What a WRITTEN name's stamp produced when sema asked it for a type.
+    ///
+    /// `spelling_type` returns a `TypeRef`, so three unlike situations reach
+    /// its callers as the same invalid answer: the slot was never answered,
+    /// the answer names no definition (a local, a primitive, a generic param -
+    /// which licenses no second lookup), and the answer names a definition the
+    /// index does not hold.  Only the last is a defect, and it is the one a
+    /// caller's `!is_valid()` fallback silently repairs by looking the spelling
+    /// up under another key.
+    ///
+    /// `DefMissing` is the row that decides whether those fallbacks serve a
+    /// real population or only the legitimate declines.
+    /// The SCOPED sibling of the M4 leaf scan: `find_scoped_function_template`,
+    /// which matches a template whose qualified name ends with the written
+    /// `scope::name`.  It carried the same arity / longest-module-prefix /
+    /// first-match ladder as the bare scan and, unlike it, no instrumentation
+    /// at all - so nothing said whether the ladder ever decided anything.
+    ///
+    /// `ViaRes` is the stamp answering directly.  The scan rows beneath it are
+    /// the tripwire: the stamp was measured to reach the same entry on every
+    /// call the scan could answer, so a non-zero `ScanOne` means it has stopped
+    /// covering a population it used to, and `ScanPlural` means a suffix has
+    /// become ambiguous.
+    SfCalls;
+    SfViaRes;
+    SfScanNone;
+    SfScanOne;
+    SfScanPlural;
+
+    SpellTyPending;
+    SpellTyNoDef;
+    SpellTyHit;
+    SpellTyDefMissing;
+
+    M4ScanNone;
+    M4ScanOne;
+    M4ScanPlural;
 
 }
 
@@ -512,8 +552,6 @@ implement enum Site {
             Site::RnDiLiteral           => { "B3 " }
             Site::RnDiCanonical         => { "B3 " }
             Site::RnDiBare              => { "B3 " }
-            Site::RnArenaBootstrap      => { "B1 " }
-            Site::RnScopeArenaBootstrap => { "B1 " }
             Site::RnLeafIndex           => { "B4*" }
             Site::RnFailed              => { "   " }
             Site::LeafCalls             => { "B4 " }
@@ -615,9 +653,6 @@ implement enum Site {
             Site::CgImplTargetScopedMap => { "   " }
             Site::CgImplTargetCursor    => { "!! " }
             Site::M4Single              => { "   " }
-            Site::M4Arity               => { "   " }
-            Site::M4Prefix              => { "!! " }
-            Site::M4First               => { "!! " }
             Site::M4ResDef              => { "   " }
             Site::M4ResOther            => { "   " }
             Site::M4ResPending          => { "   " }
@@ -628,6 +663,18 @@ implement enum Site {
             Site::M4PreDiffers          => { "!! " }
             Site::M4PreNoStamp          => { "   " }
             Site::M4ViaRes              => { "   " }
+            Site::SfCalls               => { "   " }
+            Site::SfScanNone            => { "   " }
+            Site::SfScanOne             => { "!! " }
+            Site::SfScanPlural          => { "!! " }
+            Site::SfViaRes              => { "   " }
+            Site::SpellTyPending        => { "   " }
+            Site::SpellTyNoDef          => { "   " }
+            Site::SpellTyHit            => { "   " }
+            Site::SpellTyDefMissing     => { "!! " }
+            Site::M4ScanNone            => { "   " }
+            Site::M4ScanOne             => { "   " }
+            Site::M4ScanPlural          => { "!! " }
         };
     }
 
@@ -658,8 +705,6 @@ implement enum Site {
             Site::RnDiLiteral           => { "3a  DI exact qualified literal" }
             Site::RnDiCanonical         => { "3b  DI canonicalized qualified" }
             Site::RnDiBare              => { "3c  DI bare name" }
-            Site::RnArenaBootstrap      => { "4   arena (bootstrap-only)" }
-            Site::RnScopeArenaBootstrap => { "4a  scope+arena (bootstrap-only)" }
             Site::RnLeafIndex           => { "5   GLOBAL LEAF INDEX  (* in leaf hits)" }
             Site::RnFailed              => { "    unresolved" }
             Site::LeafCalls             => { "lookup_by_leaf calls" }
@@ -761,9 +806,18 @@ implement enum Site {
             Site::CgImplTargetScopedMap => { "    3 bare->qualified mapping" }
             Site::CgImplTargetCursor    => { "    4 CURSOR-qualified (a guess)" }
             Site::M4Single              => { "  M4 by: one candidate for the leaf" }
-            Site::M4Arity               => { "  M4 by: unique call-arity match" }
-            Site::M4Prefix              => { "  M4 by: module-prefix (a guess)" }
-            Site::M4First               => { "  M4 by: first match (no discriminator)" }
+            Site::SfCalls               => { "scoped template scan calls" }
+            Site::SfScanNone            => { "  scoped scan found: no candidate" }
+            Site::SfScanOne             => { "  scoped scan found: exactly one" }
+            Site::SfScanPlural          => { "  scoped scan found: PLURAL (tie-break pop)" }
+            Site::SfViaRes              => { "  scoped: answered from the scope stamp" }
+            Site::SpellTyPending        => { "spelling_type: slot not answered" }
+            Site::SpellTyNoDef          => { "spelling_type: answer names no def" }
+            Site::SpellTyHit            => { "spelling_type: def found" }
+            Site::SpellTyDefMissing     => { "spelling_type: def NOT REGISTERED" }
+            Site::M4ScanNone            => { "  M4 scan found: no candidate" }
+            Site::M4ScanOne             => { "  M4 scan found: exactly one" }
+            Site::M4ScanPlural          => { "  M4 scan found: PLURAL (tie-break pop)" }
             Site::M4ResDef              => { "  M4 asker carried Res::Def" }
             Site::M4ResOther            => { "  M4 asker carried another Res" }
             Site::M4ResPending          => { "  M4 asker carried NO stamp" }
@@ -1256,8 +1310,6 @@ public function report() -> void {
     Site::RnDiLiteral.print_row();
     Site::RnDiCanonical.print_row();
     Site::RnDiBare.print_row();
-    Site::RnArenaBootstrap.print_row();
-    Site::RnScopeArenaBootstrap.print_row();
     Site::McCalls.print_row();
     Site::McOwnerSymbolic.print_row();
     Site::McOwnerTemplate.print_row();
@@ -1390,9 +1442,18 @@ public function report() -> void {
     Site::CgImplTargetScopedMap.print_row();
     Site::CgImplTargetCursor.print_row();
     Site::M4Single.print_row();
-    Site::M4Arity.print_row();
-    Site::M4Prefix.print_row();
-    Site::M4First.print_row();
+    Site::SfCalls.print_row();
+    Site::SfScanNone.print_row();
+    Site::SfScanOne.print_row();
+    Site::SfScanPlural.print_row();
+    Site::SfViaRes.print_row();
+    Site::SpellTyPending.print_row();
+    Site::SpellTyNoDef.print_row();
+    Site::SpellTyHit.print_row();
+    Site::SpellTyDefMissing.print_row();
+    Site::M4ScanNone.print_row();
+    Site::M4ScanOne.print_row();
+    Site::M4ScanPlural.print_row();
     Site::M4ResDef.print_row();
     Site::M4ResOther.print_row();
     Site::M4ResPending.print_row();
@@ -1429,14 +1490,9 @@ public function report() -> void {
     // stays flagged and asserted - a validator that starts agreeing with
     // something it used to refuse is a resolution change, and the golden must
     // still catch it - it just is not a summand.
-    //
-    // The bootstrap arena steps are B1 because Phase 2 deletes
-    // `bootstrap_mode` outright; they need a home, not a smaller count.
     mut b1: u64 = 0;
     b1 = b1 + Site::RnHomeModule.count();
     b1 = b1 + Site::RnAmbiguous.count();
-    b1 = b1 + Site::RnArenaBootstrap.count();
-    b1 = b1 + Site::RnScopeArenaBootstrap.count();
     b1 = b1 + Site::ConstLeafHits.count();
     b1 = b1 + Site::BareAltsViaAmbigDiag.count();
     b1 = b1 + Site::M4Hits.count();

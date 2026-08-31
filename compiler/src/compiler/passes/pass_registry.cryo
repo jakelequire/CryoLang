@@ -790,11 +790,11 @@ type struct PassRegistry {
                 }
                 NodeKind::ClassDeclaration => {
                     const n: ClassDeclNode* = stmt as ClassDeclNode*;
-                    tsym = ctx.qualify_symbol_sym_at(n.name, "look/pr-class", n.span.file); tspan = n.span; is_type = true;
+                    tsym = ctx.qualify_symbol_sym_home(n.name, n.span.file); tspan = n.span; is_type = true;
                 }
                 NodeKind::TraitDeclaration => {
                     const n: TraitDeclNode* = stmt as TraitDeclNode*;
-                    tsym = ctx.qualify_symbol_sym_at(n.name, "look/pr-trait", n.span.file); tspan = n.span; is_type = true;
+                    tsym = ctx.qualify_symbol_sym_home(n.name, n.span.file); tspan = n.span; is_type = true;
                 }
                 NodeKind::TypeAliasDeclaration => {
                     const n: TypeAliasDeclNode* = stmt as TypeAliasDeclNode*;
@@ -832,7 +832,16 @@ type struct PassRegistry {
                     cdebug("[TypeDecl]   -> Struct '%s'\n", _dbg);
                     const qualified_sym: SymbolStr = ctx.qualify_binding_sym(node.name, node.binding_namespace);
                     const struct_module_sym: SymbolStr = if (!node.binding_namespace.is_empty()) { node.binding_namespace } else { module_sym };
-                    arena.create_struct(qualified_sym, struct_module_sym);
+                    // The index learns the name here, with the arena: this
+                    // stage's guarantee is that every type name is known
+                    // before any signature resolves, and that has to hold for
+                    // both stores or a qualified annotation in a signature
+                    // finds the arena and misses the index.  The NAME only -
+                    // the per-module type list is not idempotent and stays
+                    // TypeResolution's to own.
+                    const struct_ref: TypeRef =
+                        arena.create_struct(qualified_sym, struct_module_sym);
+                    ctx.decl_index.register_type(qualified_sym, struct_ref);
                     // A C-imported type (binding_namespace set) is reachable
                     // ONLY via its alias (`cit::Vec2`); registering its bare
                     // name globally would pollute the namespace and shadow
@@ -849,7 +858,9 @@ type struct PassRegistry {
                     cdebug("[TypeDecl]   -> Union '%s'\n", _dbgu);
                     const qualified_sym: SymbolStr = ctx.qualify_binding_sym(node.name, node.binding_namespace);
                     const union_module_sym: SymbolStr = if (!node.binding_namespace.is_empty()) { node.binding_namespace } else { module_sym };
-                    arena.create_union(qualified_sym, union_module_sym);
+                    const union_ref: TypeRef =
+                        arena.create_union(qualified_sym, union_module_sym);
+                    ctx.decl_index.register_type(qualified_sym, union_ref);
                     if (!qualified_sym.equals(node.name) && node.binding_namespace.is_empty()) {
                         ctx.decl_index.register_name_mapping(node.name, qualified_sym);
                     }
@@ -862,7 +873,9 @@ type struct PassRegistry {
                     cdebug("[TypeDecl]   -> Enum '%s'\n", _dbg2);
                     const qualified_sym: SymbolStr = ctx.qualify_binding_sym(node.name, node.binding_namespace);
                     const enum_module_sym: SymbolStr = if (!node.binding_namespace.is_empty()) { node.binding_namespace } else { module_sym };
-                    arena.create_enum(qualified_sym, enum_module_sym);
+                    const enum_ref: TypeRef =
+                        arena.create_enum(qualified_sym, enum_module_sym);
+                    ctx.decl_index.register_type(qualified_sym, enum_ref);
                     if (!qualified_sym.equals(node.name) && node.binding_namespace.is_empty()) {
                         ctx.decl_index.register_name_mapping(node.name, qualified_sym);
                     }
@@ -870,8 +883,10 @@ type struct PassRegistry {
                 }
                 NodeKind::ClassDeclaration => {
                     const node: ClassDeclNode* = stmt as ClassDeclNode*;
-                    const qualified_sym: SymbolStr = ctx.qualify_symbol_sym_at(node.name, "look/pr-class2", node.span.file);
-                    arena.create_class(qualified_sym, module_sym);
+                    const qualified_sym: SymbolStr = ctx.qualify_symbol_sym_home(node.name, node.span.file);
+                    const class_ref: TypeRef =
+                        arena.create_class(qualified_sym, module_sym);
+                    ctx.decl_index.register_type(qualified_sym, class_ref);
                     if (!qualified_sym.equals(node.name)) {
                         ctx.decl_index.register_name_mapping(node.name, qualified_sym);
                     }
@@ -879,8 +894,10 @@ type struct PassRegistry {
                 }
                 NodeKind::TraitDeclaration => {
                     const node: TraitDeclNode* = stmt as TraitDeclNode*;
-                    const qualified_sym: SymbolStr = ctx.qualify_symbol_sym_at(node.name, "look/pr-trait2", node.span.file);
-                    arena.create_trait(qualified_sym, module_sym);
+                    const qualified_sym: SymbolStr = ctx.qualify_symbol_sym_home(node.name, node.span.file);
+                    const trait_ref: TypeRef =
+                        arena.create_trait(qualified_sym, module_sym);
+                    ctx.decl_index.register_type(qualified_sym, trait_ref);
                     if (!qualified_sym.equals(node.name)) {
                         ctx.decl_index.register_name_mapping(node.name, qualified_sym);
                     }

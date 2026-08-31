@@ -79,9 +79,34 @@ type struct TypeUtils {
     /// failure, so it licenses no second lookup under another key.
     spelling_type(&this, slot: ResSlot) -> TypeRef {
         return match (slot) {
-            ResSlot::Answered(r) => { this.lookup_type_exact(r.def_name()) }
-            _                    => { TypeRef::invalid() }
+            ResSlot::Answered(r) => { this.spelling_type_answered(r) }
+            _                    => {
+                ResolveCounter::Site::SpellTyPending.bump();
+                TypeRef::invalid()
+            }
         };
+    }
+
+    /// The three outcomes `spelling_type` collapses into one invalid answer.
+    ///
+    /// Split because a caller reading `!is_valid()` cannot tell an answer that
+    /// declines to name a type - which is complete, and licenses no second
+    /// lookup - from one naming a definition the index does not hold, which is
+    /// a registration defect a spelling lookup would paper over.  The returned
+    /// value is unchanged; only the counters are new.
+    spelling_type_answered(&this, r: Res) -> TypeRef {
+        const q: SymbolStr = r.def_name();
+        if (!q.is_valid()) {
+            ResolveCounter::Site::SpellTyNoDef.bump();
+            return TypeRef::invalid();
+        }
+        const found: TypeRef = this.lookup_type_exact(q);
+        if (found.is_valid()) {
+            ResolveCounter::Site::SpellTyHit.bump();
+        } else {
+            ResolveCounter::Site::SpellTyDefMissing.bump();
+        }
+        return found;
     }
 
     /// The global `name` as declared by the module named by `scope_leaf`, for a

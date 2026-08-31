@@ -252,7 +252,6 @@ type struct TypeResolver {
     /// Folded module-level integer constants, for `T[NAME]` array sizes.
     const_table:      ConstantTable*;
     diagnostics:      DiagnosticSink*;
-    bootstrap_mode:   boolean;     // true during Phase 5 (TypeResolution) when DI is being populated
 
     /// Construct with all required dependencies.
     ///
@@ -276,7 +275,6 @@ type struct TypeResolver {
             const_table:      const_table,
             module_graph:     module_graph,
             diagnostics:      null,
-            bootstrap_mode:   true,
         };
     }
 
@@ -284,14 +282,6 @@ type struct TypeResolver {
     set_diagnostics(mut &this, sink: DiagnosticSink*) -> void {
         this.diagnostics = sink;
     }
-
-    /// End bootstrap mode.  After this, resolve_named() uses only the
-    /// DeclarationIndex (step 3) and leaf-index (step 5).  Arena fallback
-    /// (steps 4, 5a) is disabled; all types should be in the DI.
-    end_bootstrap(mut &this) -> void {
-        this.bootstrap_mode = false;
-    }
-
 
     // Main resolve entry point
 
@@ -1668,9 +1658,8 @@ private:
     /// Fallback chain:
     ///   1. Generic bindings (T -> i32 from enclosing generic context)
     ///   2. Primitive name check (handles Named("i32") from generic substitution)
-    ///   3. Arena direct lookup by bare name (fast path for same-module types)
-    ///   4. Resolver scope chain + cross-module lookup -> qualified arena lookup
-    ///   5. Module type registry alias resolution (last resort)
+    ///   3. DeclarationIndex, by written literal then canonicalized name
+    ///   4. Global leaf index
     resolve_named(&this, name: SymbolStr, ctx: ResolutionContext*) -> TypeRef {
         const name_str: string = this.intern_table.resolve(name);
         const name_len: i64 = name_str.length() as i64;
@@ -1919,44 +1908,7 @@ private:
             }
         }
 
-        // 4. Arena lookup: bootstrap-only fallback.
-        //    During Phase 5 (TypeResolution), the DI is being populated, so
-        //    types created earlier in the pass exist only in the arena.
-        //    After bootstrap completes, all types are in the DI and this
-        //    step should never be reached.
         mut found: TypeRef = TypeRef::invalid();
-        if (this.bootstrap_mode) {
-            found = this.arena.lookup_by_name(name);
-            if (found.is_valid()) {
-                ResolveCounter::Site::RnArenaBootstrap.bump();
-                this.rn_trace("4-arena-bootstrap", name_str, ctx, found);
-                const found_t: Type* = this.arena.lookup(found.id);
-                if (found_t != null && found_t.kind == TypeKind::TypeAlias) {
-                    const alias_t: TypeAliasType* = found_t as TypeAliasType*;
-                    if (alias_t.has_target()) {
-                        return alias_t.target;
-                    }
-                    return found;
-                } else {
-                    return found;
-                }
-            }
-        }
-
-        // 4a. Scope chain + arena lookup: bootstrap-only fallback.
-        //     Uses the Resolver's scope chain to get a qualified name, then
-        //     looks it up in the arena.  Same bootstrap concern as step 4.
-        if (this.bootstrap_mode && this.name_resolver != null) {
-            const qualified: SymbolStr = this.canonical_type_name(name, ctx);
-            if (qualified.is_valid()) {
-                found = this.arena.lookup_by_name(qualified);
-                if (found.is_valid()) {
-                    ResolveCounter::Site::RnScopeArenaBootstrap.bump();
-                    this.rn_trace("4a-scope-arena", name_str, ctx, found);
-                    return found;
-                }
-            }
-        }
 
         // (Steps 5b and 6 removed; both confirmed dead code:
         //  5b: ModuleTypeRegistry alias: 0 hits across all builds.
