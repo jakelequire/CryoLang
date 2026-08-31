@@ -25,6 +25,7 @@ import Compiler::Diag;
 import Compiler::Diag::{ Sink, Diagnostic, SourceSpan };
 import Compiler::DeclIndex;
 import Compiler::Resolver::{ InternTable, SymbolStr, QualifiedName, MangledName };
+import Compiler::Resolver::{ Res, ResSlot };
 import Compiler::Mono::{ State, TraitSpecializer, AstResolver };
 import Compiler::ModuleGraph;
 import Compiler::ResolveCounter;
@@ -631,7 +632,12 @@ type struct MonoCallSpecializer {
                 }
             }
         } else if (entry == null) {
-            entry = this.find_function_template_for_call(callee_name, call.arguments.length);
+            mut callee_slot: ResSlot* = null;
+            if (callee_node.kind == NodeKind::Identifier) {
+                const cid: IdentifierNode* = call.callee as IdentifierNode*;
+                callee_slot = &cid.res;
+            }
+            entry = this.find_function_template_for_call(callee_name, call.arguments.length, callee_slot);
         }
         if (entry == null) { return; }
         const tmpl_func: FunctionDeclNode* = entry.ast_node as FunctionDeclNode*;
@@ -703,7 +709,7 @@ type struct MonoCallSpecializer {
 
         // A first-class function-reference value (`f<i32>` not invoked) has no
         // call arity; -1 leaves the lookup to disambiguate by module prefix.
-        const entry: TemplateEntry* = this.find_function_template_for_call(ident.name, -1);
+        const entry: TemplateEntry* = this.find_function_template_for_call(ident.name, -1, &ident.res);
         if (entry == null) { return; }
         if (entry.node_kind != NodeKind::FunctionDeclaration) { return; }
 
@@ -2513,10 +2519,36 @@ type struct MonoCallSpecializer {
     /// Look up a free-function template for an unqualified call.  `call_arity`
     /// is the call's argument count, or -1 when the arity is unknown (a
     /// first-class function-reference value, which is never invoked here).
+    /// `asker` is the slot of the identifier that named the callee, or null
+    /// when the caller holds no node to read.  It is consulted FIRST and
+    /// settles the answer whenever it carries a definition: the slot records
+    /// which declaration the writing scope bound the name to, and once two
+    /// modules declare the same leaf no lookup from the spelling can recover
+    /// that.
     find_function_template_for_call(mut &this, name: SymbolStr,
-                                    call_arity: i64) -> TemplateEntry* {
+                                    call_arity: i64,
+                                    asker: ResSlot*) -> TemplateEntry* {
         const registry: GenericRegistry* = this.generic_registry;
         if (registry == null) { return null; }
+        // The identifier that named this callee already records WHICH
+        // declaration it binds to, under the canonical name this registry is
+        // keyed by.  Deriving it again from the bare leaf asks a different
+        // question - "which template shares this spelling" - and a spelling
+        // cannot separate two modules that declare the same leaf, so the scan
+        // below can only approximate an answer the node already holds exactly.
+        if (asker != null && !asker.is_pending()) {
+            match (asker.require("find_function_template_for_call")) {
+                Res::Def(q) => {
+                    const via_res: TemplateEntry* = registry.get_template(q);
+                    if (via_res != null
+                            && via_res.node_kind == NodeKind::FunctionDeclaration) {
+                        ResolveCounter::Site::M4ViaRes.bump();
+                        return via_res;
+                    }
+                }
+                _ => { }
+            }
+        }
         // Try current module's qualified form first.
         const name_str: string = this.intern_table.resolve(name);
         const cur_mod_str: string = this.intern_table.resolve(this.current_module);
@@ -2524,10 +2556,16 @@ type struct MonoCallSpecializer {
             const q1_str: string = cur_mod_str + "::" + name_str;
             const q1: SymbolStr = this.intern_table.intern(q1_str);
             const e1: TemplateEntry* = registry.get_template(q1);
-            if (e1 != null && e1.node_kind == NodeKind::FunctionDeclaration) { return e1; }
+            if (e1 != null && e1.node_kind == NodeKind::FunctionDeclaration) {
+                this.record_m4_pre(asker, e1);
+                return e1;
+            }
         }
         const e2: TemplateEntry* = registry.get_template(name);
-        if (e2 != null && e2.node_kind == NodeKind::FunctionDeclaration) { return e2; }
+        if (e2 != null && e2.node_kind == NodeKind::FunctionDeclaration) {
+            this.record_m4_pre(asker, e2);
+            return e2;
+        }
         // Linear scan by bare name: the call site's current_module is the consuming
         // module, not where the function was defined.  Multiple modules can define a
         // same-leaf generic free function (e.g. `net::ws::frame::read_frame` vs
@@ -2569,19 +2607,73 @@ type struct MonoCallSpecializer {
             }
         }
         if (match_count <= 1) {
-            if (first != null) { ResolveCounter::Site::M4Hits.bump(); }
+            if (first != null) {
+                ResolveCounter::Site::M4Hits.bump();
+                ResolveCounter::Site::M4Single.bump();
+                this.record_m4_asker(asker, first);
+            }
             return first;
         }
         if (arity_count == 1) {
-            if (arity_match != null) { ResolveCounter::Site::M4Hits.bump(); }
+            if (arity_match != null) {
+                ResolveCounter::Site::M4Hits.bump();
+                ResolveCounter::Site::M4Arity.bump();
+                this.record_m4_asker(asker, arity_match);
+            }
             return arity_match;
         }
         if (prefix_ties == 1 && prefix_match != null) {
             ResolveCounter::Site::M4Hits.bump();
+            ResolveCounter::Site::M4Prefix.bump();
+            this.record_m4_asker(asker, prefix_match);
             return prefix_match;
         }
-        if (first != null) { ResolveCounter::Site::M4Hits.bump(); }
+        if (first != null) {
+            ResolveCounter::Site::M4Hits.bump();
+            ResolveCounter::Site::M4First.bump();
+            this.record_m4_asker(asker, first);
+        }
         return first;
+    }
+
+    /// Whether the name M4 just scanned for was already answered on the node
+    /// that asked.  `is_pending` is used for diagnosis here and nowhere else:
+    /// the scan's behaviour is unchanged either way.
+    /// Whether the stamp reaches the same template at the two exits that sit
+    /// above the scan.  A non-zero `DIFFERS` would mean the stamp and the
+    /// spelling disagree about which template a call names, which is the one
+    /// way consulting the stamp first could rebind a call.
+    record_m4_pre(mut &this, asker: ResSlot*, chosen: TemplateEntry*) -> void {
+        if (asker == null || asker.is_pending()) {
+            ResolveCounter::Site::M4PreNoStamp.bump(); return;
+        }
+        mut def_name: SymbolStr = SymbolStr::empty();
+        match (asker.require("m4-pre-probe")) {
+            Res::Def(q) => { def_name = q; }
+            _           => { ResolveCounter::Site::M4PreNoStamp.bump(); return; }
+        }
+        const registry: GenericRegistry* = this.generic_registry;
+        if (registry == null) { return; }
+        const via_res: TemplateEntry* = registry.get_template(def_name);
+        if (via_res == null) { ResolveCounter::Site::M4PreNoStamp.bump(); return; }
+        if (via_res == chosen) { ResolveCounter::Site::M4PreAgree.bump(); }
+        else { ResolveCounter::Site::M4PreDiffers.bump(); }
+    }
+
+    record_m4_asker(mut &this, asker: ResSlot*, chosen: TemplateEntry*) -> void {
+        if (asker == null) { ResolveCounter::Site::M4ResPending.bump(); return; }
+        if (asker.is_pending()) { ResolveCounter::Site::M4ResPending.bump(); return; }
+        mut def_name: SymbolStr = SymbolStr::empty();
+        match (asker.require("m4-probe")) {
+            Res::Def(q) => { ResolveCounter::Site::M4ResDef.bump(); def_name = q; }
+            _           => { ResolveCounter::Site::M4ResOther.bump(); return; }
+        }
+        const registry: GenericRegistry* = this.generic_registry;
+        if (registry == null) { return; }
+        const via_res: TemplateEntry* = registry.get_template(def_name);
+        if (via_res == null) { ResolveCounter::Site::M4ResNoTemplate.bump(); return; }
+        if (via_res == chosen) { ResolveCounter::Site::M4ResAgree.bump(); }
+        else { ResolveCounter::Site::M4ResDiffers.bump(); }
     }
 
 

@@ -385,6 +385,68 @@ type enum Site {
     QualSymCursor;
     QualSymDiff;
 
+    /// Impl heads reached by the async-declare walk, and the share of them the
+    /// walk actually consumes.
+    ///
+    /// The walk qualifies every impl head it passes, but the consumer bails
+    /// unless the owner declares an `async` method, so the qualifier minted for
+    /// the rest is discarded.  `Seen` is the control; `Async` is the only
+    /// population a wrong answer here can reach, and `AsyncUnstamped` is the
+    /// one where a missing canonical stamp is actually observable.  Split
+    /// because a divergence measured over `Seen` says nothing about whether
+    /// anything downstream read it.
+    ImplHeadSeen;
+    ImplHeadUnstamped;
+    ImplHeadAsync;
+    ImplHeadAsyncUnstamped;
+
+    /// The impl-target cascade as CODEGEN runs it, where the answer names the
+    /// key a method body is emitted under.  The stamp is meant to be the whole
+    /// answer here; the four steps below are the copy of the derivation that
+    /// still stands behind it.  Only `Cursor` guesses - it qualifies a bare
+    /// leaf with whatever module the compiler is standing in - so it is the
+    /// one that has to be zero before the copy can go.
+    CgImplTargetSeen;
+    CgImplTargetUnstamped;
+    CgImplTargetSpelling;
+    CgImplTargetDiBare;
+    CgImplTargetScopedMap;
+    CgImplTargetCursor;
+
+    /// Which discriminator answered M4's bare-leaf template scan, and whether
+    /// the identifier that asked already carried a stamp naming the callee.
+    ///
+    /// `M4Hits` counts all four exits alike, so the total cannot separate a
+    /// scan that found ONE candidate - where the leaf was never ambiguous -
+    /// from one that picked among several by module-prefix similarity or by
+    /// first-match.  Only the last two guess.  The `Res` rows say whether the
+    /// answer was available without any scan at all.
+    M4Single;
+    M4Arity;
+    M4Prefix;
+    M4First;
+    M4ResDef;
+    M4ResOther;
+    M4ResPending;
+    /// Of the stamped askers, whether the stamp REACHES the template the scan
+    /// chose.  "The node carried a Def" is a name shape; only this says the
+    /// stamp could have answered instead of the scan.
+    M4ResAgree;
+    M4ResDiffers;
+    M4ResNoTemplate;
+    /// The same agreement question at the two exits that run BEFORE the scan.
+    /// Inserting the stamp ahead of them would rebind this population, so it
+    /// has to be measured before the stamp is allowed to answer first.
+    M4PreAgree;
+    M4PreDiffers;
+    M4PreNoStamp;
+
+    /// Answered from the stamp the calling identifier carries, without a scan.
+    /// The registry is keyed canonically and the stamp names a declaration
+    /// canonically, so this is the two meeting directly; the leaf scan below
+    /// it can only ever approximate the same answer from a spelling.
+    M4ViaRes;
+
 }
 
 implement enum Site {
@@ -542,6 +604,30 @@ implement enum Site {
             Site::M2ViaStamp            => { "B3 " }
             Site::M2StampMemberMiss     => { "!! " }
             Site::BareAltsCanonFolded   => { "B3*" }
+            Site::ImplHeadSeen          => { "   " }
+            Site::ImplHeadUnstamped     => { "   " }
+            Site::ImplHeadAsync         => { "   " }
+            Site::ImplHeadAsyncUnstamped => { "!! " }
+            Site::CgImplTargetSeen      => { "   " }
+            Site::CgImplTargetUnstamped => { "   " }
+            Site::CgImplTargetSpelling  => { "   " }
+            Site::CgImplTargetDiBare    => { "   " }
+            Site::CgImplTargetScopedMap => { "   " }
+            Site::CgImplTargetCursor    => { "!! " }
+            Site::M4Single              => { "   " }
+            Site::M4Arity               => { "   " }
+            Site::M4Prefix              => { "!! " }
+            Site::M4First               => { "!! " }
+            Site::M4ResDef              => { "   " }
+            Site::M4ResOther            => { "   " }
+            Site::M4ResPending          => { "   " }
+            Site::M4ResAgree            => { "   " }
+            Site::M4ResDiffers          => { "!! " }
+            Site::M4ResNoTemplate       => { "!! " }
+            Site::M4PreAgree            => { "   " }
+            Site::M4PreDiffers          => { "!! " }
+            Site::M4PreNoStamp          => { "   " }
+            Site::M4ViaRes              => { "   " }
         };
     }
 
@@ -664,6 +750,30 @@ implement enum Site {
             Site::M2StampMemberMiss     => { "  stamped module lacks the member" }
             Site::SynthScopeResStamped  => { "synthesized scope Res stamped" }
             Site::SynthScopeResNoName   => { "  type named no declaration" }
+            Site::ImplHeadSeen          => { "impl heads seen by the async walk" }
+            Site::ImplHeadUnstamped     => { "  NO canonical target stamp" }
+            Site::ImplHeadAsync         => { "  owns an `async` method (consumed)" }
+            Site::ImplHeadAsyncUnstamped => { "    of those, unstamped" }
+            Site::CgImplTargetSeen      => { "codegen impl targets asked for" }
+            Site::CgImplTargetUnstamped => { "  NO stamp: re-derived here" }
+            Site::CgImplTargetSpelling  => { "    1 spelling already qualified" }
+            Site::CgImplTargetDiBare    => { "    2 DI knows the bare name" }
+            Site::CgImplTargetScopedMap => { "    3 bare->qualified mapping" }
+            Site::CgImplTargetCursor    => { "    4 CURSOR-qualified (a guess)" }
+            Site::M4Single              => { "  M4 by: one candidate for the leaf" }
+            Site::M4Arity               => { "  M4 by: unique call-arity match" }
+            Site::M4Prefix              => { "  M4 by: module-prefix (a guess)" }
+            Site::M4First               => { "  M4 by: first match (no discriminator)" }
+            Site::M4ResDef              => { "  M4 asker carried Res::Def" }
+            Site::M4ResOther            => { "  M4 asker carried another Res" }
+            Site::M4ResPending          => { "  M4 asker carried NO stamp" }
+            Site::M4ResAgree            => { "    stamp REACHES the same template" }
+            Site::M4ResDiffers          => { "    stamp reaches a DIFFERENT one" }
+            Site::M4ResNoTemplate       => { "    stamp names no template" }
+            Site::M4PreAgree            => { "pre-scan exit: stamp agrees" }
+            Site::M4PreDiffers          => { "pre-scan exit: stamp DIFFERS" }
+            Site::M4PreNoStamp          => { "pre-scan exit: no stamp" }
+            Site::M4ViaRes              => { "answered from the callee's stamp" }
         };
     }
 
@@ -1265,6 +1375,34 @@ public function report() -> void {
     Site::M2StampMemberMiss.print_row();
     Site::SynthScopeResStamped.print_row();
     Site::SynthScopeResNoName.print_row();
+
+    fmt::eprintf("
+-- impl-head target stamp, at the async declare walk ---
+");
+    Site::ImplHeadSeen.print_row();
+    Site::ImplHeadUnstamped.print_row();
+    Site::ImplHeadAsync.print_row();
+    Site::ImplHeadAsyncUnstamped.print_row();
+    Site::CgImplTargetSeen.print_row();
+    Site::CgImplTargetUnstamped.print_row();
+    Site::CgImplTargetSpelling.print_row();
+    Site::CgImplTargetDiBare.print_row();
+    Site::CgImplTargetScopedMap.print_row();
+    Site::CgImplTargetCursor.print_row();
+    Site::M4Single.print_row();
+    Site::M4Arity.print_row();
+    Site::M4Prefix.print_row();
+    Site::M4First.print_row();
+    Site::M4ResDef.print_row();
+    Site::M4ResOther.print_row();
+    Site::M4ResPending.print_row();
+    Site::M4ResAgree.print_row();
+    Site::M4ResDiffers.print_row();
+    Site::M4ResNoTemplate.print_row();
+    Site::M4PreAgree.print_row();
+    Site::M4PreDiffers.print_row();
+    Site::M4PreNoStamp.print_row();
+    Site::M4ViaRes.print_row();
 
     fmt::eprintf("\n-- annotation Res, stamped on the node -----------------\n");
     Site::AnnResSeen.print_row();
