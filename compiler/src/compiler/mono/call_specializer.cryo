@@ -552,6 +552,10 @@ type struct MonoCallSpecializer {
         // Extract the bare callee name and any qualifying scope.
         mut callee_name:  SymbolStr = SymbolStr::empty();
         mut callee_scope: SymbolStr = SymbolStr::empty();
+        // The scope segment's own answer, carried out of the branch that knows
+        // the node's type.  The suffix scan below can only match a spelling;
+        // this names the module.
+        mut callee_scope_slot: ResSlot* = null;
         if (callee_node.kind == NodeKind::Identifier) {
             const ident: IdentifierNode* = call.callee as IdentifierNode*;
             callee_name = ident.name;
@@ -559,6 +563,7 @@ type struct MonoCallSpecializer {
             const sr: ScopeResolutionNode* = call.callee as ScopeResolutionNode*;
             callee_name  = sr.member_name;
             callee_scope = sr.scope_name;
+            callee_scope_slot = &sr.scope_res;
         } else {
             return;
         }
@@ -618,7 +623,8 @@ type struct MonoCallSpecializer {
                     // Scope-qualified call to a non-type (module-alias) scope:
                     // only accept a free-function template that lives in that module.
                     entry = this.find_scoped_function_template(
-                        callee_name, callee_scope, call.arguments.length);
+                        callee_name, callee_scope, call.arguments.length,
+                        callee_scope_slot);
                 } else {
                     // Scope resolves to a TYPE: this may be a non-generic static
                     // method on a GENERIC owner (`Slice<T>::from_raw`,
@@ -637,7 +643,7 @@ type struct MonoCallSpecializer {
                 const cid: IdentifierNode* = call.callee as IdentifierNode*;
                 callee_slot = &cid.res;
             }
-            entry = this.find_function_template_for_call(callee_name, call.arguments.length, callee_slot);
+            entry = this.find_function_template_for_call(callee_name, callee_slot);
         }
         if (entry == null) { return; }
         const tmpl_func: FunctionDeclNode* = entry.ast_node as FunctionDeclNode*;
@@ -709,7 +715,7 @@ type struct MonoCallSpecializer {
 
         // A first-class function-reference value (`f<i32>` not invoked) has no
         // call arity; -1 leaves the lookup to disambiguate by module prefix.
-        const entry: TemplateEntry* = this.find_function_template_for_call(ident.name, -1, &ident.res);
+        const entry: TemplateEntry* = this.find_function_template_for_call(ident.name, &ident.res);
         if (entry == null) { return; }
         if (entry.node_kind != NodeKind::FunctionDeclaration) { return; }
 
@@ -2459,28 +2465,40 @@ type struct MonoCallSpecializer {
         return fd.parameters.length == call_arity;
     }
 
-    /// Find a scoped free-function template by qualified-name suffix against the
-    /// scope as written, disambiguating same-leaf modules by call arity then by
-    /// the namespace prefix shared with the calling module (matches sema's
-    /// `resolve_module_qualified_function`).
+    /// The template a scope-qualified call names.
+    ///
+    /// The scope segment's stamp answers whenever it names a module: it carries
+    /// that module's OWN namespace, which the written qualifier cannot supply,
+    /// because the source may write any whole-segment suffix of it and several
+    /// modules can share one suffix.  The suffix scan beneath serves a segment
+    /// that carries no such answer, and can establish only that exactly ONE
+    /// template bears the suffix - deciding between several is not something a
+    /// spelling can do.
     find_scoped_function_template(mut &this, name: SymbolStr,
-                                  scope: SymbolStr, call_arity: i64) -> TemplateEntry* {
+                                  scope: SymbolStr, call_arity: i64,
+                                  scope_slot: ResSlot*) -> TemplateEntry* {
+        ResolveCounter::Site::SfCalls.bump();
         const registry: GenericRegistry* = this.generic_registry;
         if (registry == null || !scope.is_valid()) { return null; }
+        // The scope segment already records WHICH module it names, under the
+        // canonical name this registry is keyed by.  Matching the spelling by
+        // suffix instead asks a weaker question - "whose qualified name ends
+        // this way" - which several modules can answer, and the written
+        // qualifier is any whole-segment suffix of the real one.
+        const via_res: TemplateEntry* = this.scoped_template_from_stamp(scope_slot, name);
+        if (via_res != null) {
+            ResolveCounter::Site::SfViaRes.bump();
+            return via_res;
+        }
         const scope_str: string = this.intern_table.resolve(scope);
         const name_str: string  = this.intern_table.resolve(name);
         const tail: string      = format("%s::%s", scope_str, name_str);
         const sep_tail: string  = format("::%s", tail);
         const tail_len: i64     = tail.length() as i64;
-        const cur_ns: string    = this.intern_table.resolve(this.current_module);
         const total: i64 = registry.template_count();
 
         mut first: TemplateEntry* = null;
-        mut arity_match: TemplateEntry* = null;
-        mut arity_count: i64 = 0;
-        mut prefix_match: TemplateEntry* = null;
-        mut prefix_best: i64 = -1;
-        mut prefix_ties: i64 = 0;
+        mut match_count: i64 = 0;
 
         for (mut i: i64 = 0; i < total; i++) {
             const cand: TemplateEntry* = &registry.entries[i];
@@ -2495,30 +2513,51 @@ type struct MonoCallSpecializer {
             if (!is_match) { continue; }
 
             if (first == null) { first = cand; }
-            if (call_arity >= 0 && cand.ast_node != null) {
-                const fd: FunctionDeclNode* = cand.ast_node as FunctionDeclNode*;
-                if (fd.parameters.length == call_arity) {
-                    arity_match = cand;
-                    arity_count = arity_count + 1;
-                }
-            }
-            const shared: i64 = cur_ns.common_prefix_len(qn);
-            if (shared > prefix_best) {
-                prefix_best = shared; prefix_match = cand; prefix_ties = 1;
-            } else if (shared == prefix_best) {
-                prefix_ties = prefix_ties + 1;
-            }
+            match_count = match_count + 1;
         }
 
-        mut chosen: TemplateEntry* = first;
-        if (arity_count == 1) { chosen = arity_match; }
-        else if (prefix_ties == 1 && prefix_match != null) { chosen = prefix_match; }
-        return chosen;
+        if (match_count == 0) {
+            ResolveCounter::Site::SfScanNone.bump();
+        } else if (match_count == 1) {
+            ResolveCounter::Site::SfScanOne.bump();
+        } else {
+            ResolveCounter::Site::SfScanPlural.bump();
+        }
+        // A suffix borne by more than one template is not a question the
+        // spelling can answer.  Call arity and longest shared module prefix
+        // each pick whichever candidate the registry happened to hold first,
+        // which is not a property the source states.
+        if (match_count > 1) { return null; }
+        return first;
     }
 
-    /// Look up a free-function template for an unqualified call.  `call_arity`
-    /// is the call's argument count, or -1 when the arity is unknown (a
-    /// first-class function-reference value, which is never invoked here).
+    /// The template the SCOPE SEGMENT's stamp names, or null when it names
+    /// none.
+    ///
+    /// One key and one lookup: the stamp carries the module's own namespace,
+    /// which `scope_name` cannot supply - the source may write any
+    /// whole-segment suffix of it, and several modules can share one suffix.
+    scoped_template_from_stamp(mut &this, slot: ResSlot*,
+                               name: SymbolStr) -> TemplateEntry* {
+        if (slot == null || slot.is_pending()) { return null; }
+        mut ns: SymbolStr = SymbolStr::empty();
+        match (slot.require("scoped_template_from_stamp")) {
+            Res::Def(q) => { ns = q; }
+            _           => { return null; }
+        }
+        const registry: GenericRegistry* = this.generic_registry;
+        if (registry == null) { return null; }
+        const q_str: string = this.intern_table.resolve(ns) + "::"
+                            + this.intern_table.resolve(name);
+        const entry: TemplateEntry* =
+            registry.get_template(this.intern_table.intern(q_str));
+        if (entry != null && entry.node_kind == NodeKind::FunctionDeclaration) {
+            return entry;
+        }
+        return null;
+    }
+
+    /// Look up a free-function template for an unqualified call.
     /// `asker` is the slot of the identifier that named the callee, or null
     /// when the caller holds no node to read.  It is consulted FIRST and
     /// settles the answer whenever it carries a definition: the slot records
@@ -2526,7 +2565,6 @@ type struct MonoCallSpecializer {
     /// modules declare the same leaf no lookup from the spelling can recover
     /// that.
     find_function_template_for_call(mut &this, name: SymbolStr,
-                                    call_arity: i64,
                                     asker: ResSlot*) -> TemplateEntry* {
         const registry: GenericRegistry* = this.generic_registry;
         if (registry == null) { return null; }
@@ -2566,24 +2604,17 @@ type struct MonoCallSpecializer {
             this.record_m4_pre(asker, e2);
             return e2;
         }
-        // Linear scan by bare name: the call site's current_module is the consuming
-        // module, not where the function was defined.  Multiple modules can define a
-        // same-leaf generic free function (e.g. `net::ws::frame::read_frame` vs
-        // `net::http2::frame::read_frame`); a blind first-match ignores arity and
-        // module and can bind the call to the wrong body.  Disambiguate the same
-        // way the scoped path does (`find_scoped_function_template`, matching sema's
-        // `resolve_module_qualified_function`): prefer a unique call-arity match,
-        // then the candidate whose namespace shares the longest prefix with the
-        // calling module.  A SINGLE same-leaf candidate is returned unchanged.
+        // Linear scan by bare name, reached only by a call whose identifier
+        // carries no usable stamp.  The call site's current_module is the
+        // CONSUMING module, not where the function was defined, so two modules
+        // declaring a same-leaf generic free function (`net::ws::frame::read_frame`
+        // vs `net::http2::frame::read_frame`) are indistinguishable here.  All
+        // this scan can establish is whether exactly ONE template bears the
+        // leaf; deciding between several is not something a spelling can do.
         ResolveCounter::Site::M4Calls.bump();
         const total: i64 = registry.template_count();
         mut first: TemplateEntry* = null;
         mut match_count: i64 = 0;
-        mut arity_match: TemplateEntry* = null;
-        mut arity_count: i64 = 0;
-        mut prefix_match: TemplateEntry* = null;
-        mut prefix_best: i64 = -1;
-        mut prefix_ties: i64 = 0;
         for (mut i: i64 = 0; i < total; i++) {
             const cand: TemplateEntry* = &registry.entries[i];
             if (cand == null) { continue; }
@@ -2591,46 +2622,28 @@ type struct MonoCallSpecializer {
             if (!cand.name.equals(name)) { continue; }
             if (first == null) { first = cand; }
             match_count = match_count + 1;
-            if (call_arity >= 0 && cand.ast_node != null) {
-                const fd: FunctionDeclNode* = cand.ast_node as FunctionDeclNode*;
-                if (fd.parameters.length == call_arity) {
-                    arity_match = cand;
-                    arity_count = arity_count + 1;
-                }
-            }
-            const qn: string = this.intern_table.resolve(cand.qualified_name);
-            const shared: i64 = cur_mod_str.common_prefix_len(qn);
-            if (shared > prefix_best) {
-                prefix_best = shared; prefix_match = cand; prefix_ties = 1;
-            } else if (shared == prefix_best) {
-                prefix_ties = prefix_ties + 1;
-            }
         }
-        if (match_count <= 1) {
-            if (first != null) {
-                ResolveCounter::Site::M4Hits.bump();
-                ResolveCounter::Site::M4Single.bump();
-                this.record_m4_asker(asker, first);
-            }
-            return first;
+        // What the scan found.  The exit below records only that it answered,
+        // so on its own it cannot separate a scan that matched nothing from
+        // one whose candidates were refused as ambiguous.  `Plural` is the
+        // population that would regain an answer if a discriminator were ever
+        // reintroduced here.
+        if (match_count == 0) {
+            ResolveCounter::Site::M4ScanNone.bump();
+        } else if (match_count == 1) {
+            ResolveCounter::Site::M4ScanOne.bump();
+        } else {
+            ResolveCounter::Site::M4ScanPlural.bump();
         }
-        if (arity_count == 1) {
-            if (arity_match != null) {
-                ResolveCounter::Site::M4Hits.bump();
-                ResolveCounter::Site::M4Arity.bump();
-                this.record_m4_asker(asker, arity_match);
-            }
-            return arity_match;
-        }
-        if (prefix_ties == 1 && prefix_match != null) {
-            ResolveCounter::Site::M4Hits.bump();
-            ResolveCounter::Site::M4Prefix.bump();
-            this.record_m4_asker(asker, prefix_match);
-            return prefix_match;
-        }
+        // A leaf naming more than one template is not a question a spelling
+        // can answer.  Call arity, longest shared module prefix and scan order
+        // each select whichever candidate the registry happened to hold first,
+        // which is not a property the source states; the stamp consulted above
+        // names the declaration exactly, and is the only path that can.
+        if (match_count > 1) { return null; }
         if (first != null) {
             ResolveCounter::Site::M4Hits.bump();
-            ResolveCounter::Site::M4First.bump();
+            ResolveCounter::Site::M4Single.bump();
             this.record_m4_asker(asker, first);
         }
         return first;

@@ -140,7 +140,24 @@ GOLDEN = os.path.join(ROOT, "tests", "b1-baseline.txt")
 # (see MEASUREMENT CONSTRAINTS).  It must exercise enough cross-module
 # resolution for B1 to be nonzero -- a target with no B1 events would give a
 # gate that cannot observe regrowth, which is the §7.2a failure mode.
-TARGET = os.path.join(ROOT, "examples", "09-json-config")
+# Each entry is (section-suffix, path).  The empty suffix keys the section
+# `[host:<host>]`, so the original target keeps the section it has always had
+# and every other target is purely additive.
+#
+# `ffi_c_import` is here because the extern-module population is measured
+# NOWHERE otherwise: neither the examples nor the compiler contains a single C
+# import, so a counter about imported-C declarations reads a confident zero
+# over a corpus that could not have produced anything else.
+TARGETS = [
+    ("",    os.path.join(ROOT, "examples", "09-json-config")),
+    ("ffi", os.path.join(ROOT, "tests", "tests", "projects", "ffi_c_import")),
+    ("gen", os.path.join(ROOT, "examples", "14-threads")),
+]
+
+
+def section_key(host, suffix):
+    """The golden section a (host, target) pair is pinned under."""
+    return host if not suffix else "%s-%s" % (host, suffix)
 BUILD_SUBDIR = os.path.join("build", "b1-gate")
 
 _B1_TOTAL_RE = re.compile(r"^\s*B1 fuzzy fallback\s*->\s*ZERO\s+(\d+)\s*$")
@@ -191,22 +208,22 @@ def resolve_cryo(cryo):
     return os.path.abspath(cryo)
 
 
-def measure(cryo):
-    """Build TARGET with the counter on; return (b1, b2, b3, b4, rows).
+def measure(cryo, target):
+    """Build `target` with the counter on; return (b1, b2, b3, b4, rows).
 
     `rows` is the ordered list of (label, count) for the sites that make up
     B1.  Returns via sys.exit(1) on any measurement failure -- a gate that
     cannot measure must fail loudly rather than pass on a missing number.
     """
     cryo = resolve_cryo(cryo)
-    if not os.path.isdir(TARGET):
-        sys.stderr.write("b1-gate: measured target is missing: %s\n" % TARGET)
+    if not os.path.isdir(target):
+        sys.stderr.write("b1-gate: measured target is missing: %s\n" % target)
         sys.exit(1)
 
     # A stale build dir would let the compiler skip work even under
     # --no-incremental (artifacts present == nothing to do for some steps),
     # so the measurement always starts from nothing.
-    build_dir = os.path.join(TARGET, BUILD_SUBDIR)
+    build_dir = os.path.join(target, BUILD_SUBDIR)
     shutil.rmtree(build_dir, ignore_errors=True)
 
     env = dict(os.environ)
@@ -217,7 +234,7 @@ def measure(cryo):
     r = subprocess.run(
         [cryo, "build", "--no-incremental",
          "--build-dir=%s" % BUILD_SUBDIR],
-        cwd=TARGET,
+        cwd=target,
         env=env,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -366,6 +383,8 @@ def host_key():
     return sys.platform
 
 
+NL = chr(10)
+
 HEADER = [
     "# B1 fuzzy-fallback baseline -- docs/name-resolution.md §7.2 mechanism 3.",
     "#",
@@ -373,12 +392,19 @@ HEADER = [
     "# PER HOST.",
     "# CONTEXT ONLY (not asserted): the B2/B3 totals in the comments.",
     "#",
-    "# Target: examples/09-json-config, --no-incremental, CRYO_CODEGEN_THREADS=1.",
+    "# Targets, each --no-incremental with CRYO_CODEGEN_THREADS=1:",
+    "#   [host:<host>]      examples/09-json-config",
+    "#   [host:<host>-ffi]  tests/tests/projects/ffi_c_import  (the only pinned",
+    "#                      corpus containing C imports at all)",
+    "#   [host:<host>-gen]  examples/14-threads  (the only pinned corpus that",
+    "#                      reaches the generic-callee stamp path at all)",
     "# Re-pin DELIBERATELY with `make b1-check ARGS=--update` and commit the",
     "# golden alongside the change that moved it. A decrease is progress and",
     "# still requires a re-pin -- see the module docstring for why.",
     "#",
     "# Each [host:<key>] section is a SEPARATE measurement and inherits nothing",
+    "# from any other -- across TARGETS as well as hosts, so a target that",
+    "# regrows a fallback cannot be masked by one that did not.",
     "# from any other. `--update` rewrites only the section for the host it ran",
     "# on and leaves the rest byte-for-byte, because it cannot honestly speak",
     "# for a host it did not measure. One row really is host-dependent:",
@@ -402,6 +428,25 @@ def render_section(host, b1, b2, b3, b4, rows):
         lines.append("%-46s %d" % (label, count))
     return lines
 
+
+def render_multi(mine, keep=None):
+    """Render the golden: every section measured now, plus the rest verbatim.
+
+    `mine` is the ordered [(key, b1, b2, b3, b4, rows)] measured on this host.
+    `keep` is the committed {key: raw lines}; a key not measured now is emitted
+    unchanged, so a re-pin cannot speak for a host or a target it did not run.
+    """
+    lines = list(HEADER)
+    mine_keys = set(k for k, _, _, _, _, _ in mine)
+    for other, raw in (keep or {}).items():
+        if other in mine_keys:
+            continue
+        lines.append("")
+        lines.extend(raw)
+    for key, b1, b2, b3, b4, rows in mine:
+        lines.append("")
+        lines.extend(render_section(key, b1, b2, b3, b4, rows))
+    return NL.join(lines).rstrip(NL) + NL
 
 def render(host, b1, b2, b3, b4, rows, keep=None):
     """Render the golden: this host's section, plus every other host verbatim.
@@ -471,8 +516,8 @@ def main():
     args = ap.parse_args()
 
     if args.verify_determinism:
-        a = measure(args.cryo)
-        b = measure(args.cryo)
+        a = measure(args.cryo, TARGETS[0][1])
+        b = measure(args.cryo, TARGETS[0][1])
         if a == b:
             print("b1-gate: determinism OK -- two runs agree (B1=%d, %d rows)"
                   % (a[0], len(a[4])))
@@ -494,18 +539,24 @@ def main():
         with open(GOLDEN, "r", encoding="utf-8") as f:
             existing, raw = parse_golden(f.read())
 
-    b1, b2, b3, b4, rows = measure(args.cryo)
+    measured = []
+    for suffix, path in TARGETS:
+        m_b1, m_b2, m_b3, m_b4, m_rows = measure(args.cryo, path)
+        measured.append((section_key(host, suffix), m_b1, m_b2, m_b3, m_b4, m_rows))
 
     if args.update:
         # `newline="\n"` suppresses the translation that would write CRLF on
         # Windows, matching `roster-check.py`.  The golden is committed and
         # diffed, so a re-pin from a Windows host would otherwise rewrite all 34
         # lines and bury the one or two rows that actually moved.
-        with open(GOLDEN, "w", encoding="utf-8", newline="\n") as f:
-            f.write(render(host, b1, b2, b3, b4, rows, keep=raw))
-        others = sorted(h for h in raw if h != host)
-        print("b1-gate: golden updated for host %r -- B1 = %d, B4 = %d%s"
-              % (host, b1, b4,
+        with open(GOLDEN, "w", encoding="utf-8", newline=NL) as f:
+            f.write(render_multi(measured, keep=raw))
+        mine = set(k for k, _, _, _, _, _ in measured)
+        others = sorted(h for h in raw if h not in mine)
+        print("b1-gate: golden updated for %s -- %s%s"
+              % (", ".join(sorted(mine)),
+                 "; ".join("%s: B1=%d B4=%d" % (k, b_1, b_4)
+                           for k, b_1, _, _, b_4, _ in measured),
                  ("; left untouched: " + ", ".join(others)) if others else ""))
         return 0
 
@@ -516,6 +567,9 @@ def main():
             % GOLDEN)
         return 1
 
+    missing = [k for k, _, _, _, _, _ in measured if k not in existing]
+    if missing:
+        host = missing[0]
     if host not in existing:
         sys.stderr.write(
             "b1-gate: the golden has no [host:%s] section.\n"
@@ -527,7 +581,17 @@ def main():
             % (host, ", ".join(sorted(existing)) or "(none)"))
         return 1
 
-    want_b1, want_b4, want_rows = existing[host]
+    # Every measured section must match; the first mismatch reports, so a
+    # second target cannot be certified by the first one agreeing.
+    key, b1, b2, b3, b4, rows = measured[0]
+    for cand in measured:
+        c_key, c_b1, _, _, c_b4, c_rows = cand
+        w_b1, w_b4, w_rows = existing[c_key]
+        if (w_b1, w_b4, w_rows) != (c_b1, c_b4, c_rows):
+            key, b1, b2, b3, b4, rows = cand
+            break
+    host = key
+    want_b1, want_b4, want_rows = existing[key]
 
     if want_b1 is None or want_b4 is None:
         sys.stderr.write("b1-gate: golden section [host:%s] is missing a B1_TOTAL"
@@ -536,8 +600,10 @@ def main():
         return 1
 
     if want_b1 == b1 and want_b4 == b4 and want_rows == rows:
-        print("b1-gate: OK -- B1 = %d, B4 = %d, %d sites, matches golden"
-              " [host:%s]" % (b1, b4, len(rows), host))
+        print("b1-gate: OK -- %s"
+              % "; ".join("[%s] B1=%d B4=%d %d sites"
+                          % (k, k_b1, k_b4, len(k_rows))
+                          for k, k_b1, _, _, k_b4, k_rows in measured))
         return 0
 
     sys.stderr.write("b1-gate: DRIFT  (host %s)\n\n" % host)
