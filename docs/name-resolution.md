@@ -6964,3 +6964,195 @@ path rewrites, zero re-exports.
 >
 > A measured event count and a corpus size answer different questions. Use the
 > audit to learn *which rule* applies; count the corpus statically to size it.
+
+### 8.25 The `spelling_type` fallbacks measured, and the zero that was not one — MEASURED, DELETION REVERTED 2026-08-31
+
+Five consumers call `spelling_type`, not six: `call_resolver.cryo:2774` is
+`enforce_static_method_visibility`, a different function with a
+`scope_qualifier_type` -> `lookup_type_by_sym` cascade.
+
+Per-site counters split the invalid answers, over four corpora that between
+them are the whole of what this tree compiles. **native** = 14 `examples/` +
+`ffi_c_import` + `compiler/`, one `cryo build --no-incremental` each. **tree** =
+the `tests/` harness compile itself. **projects** = the 41
+`tests/tests/projects/` run INDIVIDUALLY. **neg** = the 178 compile-fail cases,
+one `cryo check` each.
+
+| consumer | native | tree | projects | neg | TOTAL calls / fires |
+|---|---|---|---|---|---|
+| impl head `sema.cryo:589` | 16,202 / 12,078 | 4,004 / 3,186 | 24,948 / 17,880 | 31,886 / 22,352 | 77,040 / 55,496 |
+| struct literal `sema.cryo:2805` | 2,979 / 0 | 1,204 / 0 | 3,479 / **4** | 4,042 / 0 | 11,704 / **4** |
+| enum pattern `pattern_resolver.cryo:120` | 1,120 / 0 | 70 / 0 | 1,820 / 0 | 2,788 / 0 | 5,798 / **0** |
+| new expr `sema.cryo:3114` | 1,368 / 0 | 32 / **6** | 2 / 0 | 3 / 0 | 1,405 / **6** |
+| call ident `call_resolver.cryo:2900` | 26 / 0 | 6 / 0 | 0 / 0 | 1 / **1 empty** | 33 / **1** |
+
+`answer names no def` = 0 and `def NOT REGISTERED` = 0 on every corpus, with
+`def found` as the control, and per-site fires summing to the global `Pending`
+exactly on each. So every one of the five justification paragraphs cites a case
+that never occurs: an invalid answer here is always a slot that was never
+answered, never an answer declining to name a type.
+
+Three of the four non-impl-head fallbacks have a live population, and each one
+is confined to a single corpus: the struct literal's 4 to two projects, the new
+expr's 6 to the `tests/` tree, the call ident's 1 to one compile-fail case
+(where the fallback found nothing and fell through to E0202 regardless). Only
+the enum-pattern fallback answers nothing anywhere, against 5,798 calls.
+
+The shape is the finding: this family serves rare populations, each reachable
+from exactly one corner of the corpus. A rate of 4 in 11,704 - or 6 in 1,405 -
+is invisible to any sweep that misses the one place it lives.
+
+#### The impl head is the population, and it is legitimately unstamped
+
+Each head is consulted exactly twice by `impl_target_type`, which closes the
+arithmetic with no remainder: native 2,062 stamped + 3,048 stamp-declined +
+2,991 never-reached = 8,101 nodes, x2 = 16,202. Projects: 8,474 visited, 3,534
+stamped, 4,940 declined.
+
+The 3,048 declines are **100% primitive impl targets** - `implement trait Clone
+for i8` and its siblings - identified off `ANN-UNSTAMPED`, where all 3,048 sit
+at column 1 and come from only 195 distinct source lines, the stdlib's own
+primitive impls re-resolved once per project. The impl head is 3,048 of all
+3,049 `AnnResUnresolved` compiler-wide; the single other row is `CompileMode`,
+a name owned by both a namespace and a type. The 2,991 never-reached nodes are
+monomorphizer clones, which `cloner.cryo` deliberately does not give a `res` so
+that the rewritten spelling stays the only carrier of which specialization the
+head is for.
+
+Both halves are correct as they stand. There is no stamping fix behind this
+population.
+
+#### A zero that came from an instrument that could not see
+
+`cryo test` echoes a child project's captured output ONLY when that project
+fails. Capturing its stderr therefore records the PARENT invocation and nothing
+else - one counter block where running the 41 projects individually yields 26,
+and a `Pending` total of 3,192 where the real figure is 17,884.
+
+On that false zero the struct-literal, enum-pattern and call-ident fallbacks
+were deleted. The struct-literal one has a live population of **4**, in exactly
+two projects - `ffi_c_import` and `resolution_leaf_index`, both reachable only
+through `cryo test`. Removing it did not produce a diagnostic; it produced a
+**silent miscompile**, a C-imported aggregate taking a wrong layout so that
+`c_import_struct_construct_and_read` read 1308 for 7 and `c_import_union_native`
+read -1233322032 for 1234. All three deletions are reverted and `make test` is
+OVERALL PASS.
+
+The lesson is sharper than "measure over the right corpus". The corpus was
+right and the tool was right; the tool declines to report when it is happy. A
+zero is worth nothing until the number of counter blocks behind it is known -
+if it is 1, what was measured is the wrapper.
+
+#### A second hole: no failing compile has ever been counted
+
+`ResolveCounter::report()` was reached only from the end of the driver's success
+path, so every compilation that errors returned before it. The 178 compile-fail
+cases fail by construction, so **not one counter number on this branch has ever
+included them** - and they are the corpus richest in names that do not resolve,
+which is the condition that leaves a `res` slot unanswered.
+
+The report is now idempotent and `cryo check` calls it whatever the outcome, so
+the compile-fail corpus yields 178 blocks where it previously yielded 0. It
+remains inert without `CRYO_RESOLVE_COUNTER`, and `make test` still reports all
+178 passing.
+
+What it changed: the call-ident fallback's only fire in the whole tree is in
+this corpus, and would otherwise have been recorded as a clean zero.
+
+#### Corrected alongside
+
+`AST/declaration.cryo`'s `res` field doc said a clone "may copy it verbatim",
+which `cloner.cryo` contradicts explicitly and for a stated reason. The comment
+now records what the cloner does and why.
+
+### 8.26 A written primitive is an ANSWER - 6.1 implemented, superseding 8.2al 2026-08-31
+
+6.1 lists `PrimTy(SymbolStr)` and states that `Res` has no variant meaning
+"missing": every variant is an answer. Nothing in the tree ever constructed one.
+A written `implement trait Clone for i8` was therefore left `Pending`, because
+the bare lane resolves against the writing module's DECLARATIONS and a primitive
+is not one - the code disagreeing with the spec, not an open question.
+
+8.2ak drew this conclusion already ("Under 6.1 they are `Res::PrimTy` - an
+answer"). **8.2al superseded it on an empirical premise, never a design one**:
+that the primitives were not written type names at all but synthesized `&this`
+receivers - 225 of its 228 - so a stamp "would have recorded a true fact about a
+node the parser should not have produced".
+
+That premise no longer describes the population. Measured over all 16 build
+corpora, `ANN-UNSTAMPED` carries 3,049 rows from 195 distinct source lines, and
+**every primitive row is at column 1** - the `implement` keyword. Zero rows sit
+at any other column but the one `CompileMode` row at column 13. The
+receiver population 8.2al measured is gone; what remains is the written-type-name
+bucket its own table put at 95. An expired measurement does not override 6.1, so
+this entry supersedes 8.2al and reinstates 8.2ak's conclusion.
+
+#### Implementation
+
+`type_spelling_res` answers `Res::PrimTy(name)` for a written primitive, ahead of
+the lanes that search for a declaration. 8.2ak's constraint is honoured: the
+authority is the lexer's keyword table, via the same
+`TokenType::from_keyword(...).is_primitive_type()` idiom `parser.cryo` already
+uses, so there is no second list of primitive names to disagree with the first.
+The unit spelling `()` is NOT a keyword and is deliberately left `Pending`
+rather than special-cased in; it is 16 of the rows.
+
+#### Measured, and neutral
+
+| | before | after |
+|---|---:|---:|
+| `AnnResPrimTy` (native) | 0 | 3,032 |
+| `AnnResUnresolved` (native) | 3,049 | **17** |
+| `SpellTyPending` (native) | 12,078 | 6,014 |
+| `SpellTyNoDef` (native) | 0 | 6,064 |
+
+3,032 = 3,048 primitives less the 16 `()`; 17 = those 16 plus `CompileMode`;
+6,014 = the 5,982 clone consultations plus the 32 for `()`. `SpellTyDefMissing`
+stays 0, because `def_name()` is empty for every non-`Def` answer and so never
+reaches a lookup.
+
+**Consumer behaviour is unchanged, and that is the point.** Fires at all five
+`spelling_type` consumers are identical before and after - impl head 12,078
+native and 17,880 over the projects, struct literal 4, new expr 6 - because a
+`PrimTy` stamp still yields an invalid `TypeRef` and the same path still runs.
+Only the RECORDED REASON moves, from "no resolver answered" to "answered, names
+no declaration". `AnnResUnresolved` falling 3,049 -> 17 is what that buys: the
+row now names the one real defect instead of burying it under the stdlib's
+primitive impls.
+
+The 106 real types 8.2ak identified as the import-cycle population are untouched
+by this, and remain the question that has to be answered before any consumer may
+treat `Pending` as an ICE rather than as "the type layer still owns this one".
+
+### 8.27 One `spelling_type` consumer converted; two left, with reasons 2026-08-31
+
+The disposition is per site and follows the measurement, not a preference:
+`Pending > 0` means fix the stamp and leave the path alone; `Pending == 0` means
+delete the path and assert, which converts a correctness risk into a diagnostic
+one.
+
+**Enum pattern - CONVERTED.** 0 fires and 0 `NoDef` across all four corpora
+(native, the `tests/` tree, the 41 projects, the 178 compile-fail cases), against
+5,798 calls. A pattern names its enum outright, never a local, a generic
+parameter or a primitive, and `cloner.cryo` copies `res` so a clone carries it -
+a mechanism, not luck. The site now takes `require` and matches `Res::Def`, with
+no second key. `make test` OVERALL PASS and **zero E0900**.
+
+**New expr - NOT converted, and the reason inverted on measurement.** The
+proposal was to delete the spelling lookup and keep `resolve_primitive`, on the
+ground that a spelling lookup cannot resolve a primitive at all. Instrumenting
+the two steps separately says the opposite: over the `tests/` tree the spelling
+lookup answers **6** and `resolve_primitive` answers **0**. The population is
+`new int[100]` - `tests/tests/lang/new_array.cryo` covers it by name - and
+`lookup_type_by_sym` reaches the primitive through its arena leaf-index step.
+Deleting that step breaks a covered test. `resolve_primitive`'s own zero is
+SHADOWED, not measured: it is only reached when the step above declines, and the
+step above never does.
+
+**Call ident - NOT converted.** 33 calls in the whole tree, one fire, which found
+nothing and fell through to E0202 either way. That is too thin a population to
+certify in either direction - the same rule this ledger applies to a site no
+corpus reaches - and the only outcome on offer is trading E0202 for E0900.
+
+**Struct literal - NOT converted**, settled in 8.25: 4 live fires, C-imported
+aggregates, and deleting the path miscompiles them silently.

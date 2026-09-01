@@ -24,6 +24,7 @@ import Compiler::Passes::PassID;
 import Compiler::CompilationContext;
 import Compiler::ModuleGraph;
 import Compiler::ResolveCounter;
+import Compiler::Lex::{ TokenType };
 import Utils::Logger;
 
 
@@ -705,9 +706,13 @@ public:
         // The type an impl head is FOR, stamped after `declare_generics` for
         // the same reason the trait side is: a name spelled like an impl
         // generic is that param, not a type to search for.
+        ResolveCounter::Site::ImplResVisit.bump();
         match (this.type_spelling_res(node.target_type, node.span)) {
-            ResSlot::Answered(r) => { node.set_res(r); }
-            _                    => { }
+            ResSlot::Answered(r) => {
+                ResolveCounter::Site::ImplResStamped.bump();
+                node.set_res(r);
+            }
+            _                    => { ResolveCounter::Site::ImplResDeclined.bump(); }
         }
 
         // The trait an impl head names. After `declare_generics`, for the same
@@ -1340,6 +1345,22 @@ public:
         ResolveCounter::Site::AnnResSeen.bump();
         const written: string = this.resolver.intern_table.resolve(name);
         if (written.length() == 0) { return ResSlot::Pending; }
+
+        // A primitive names a builtin rather than a declaration, so the bare
+        // lane below - which resolves against the writing module's declared
+        // names - can never answer one, and `implement trait Clone for i8`
+        // would be left Pending for a name that is not in doubt.  `Res` has no
+        // variant meaning "missing", so this is an ANSWER: the spelling names
+        // `i8` outright and nothing later can refine it.
+        //
+        // The lexer's keyword table is the authority.  A second list of
+        // primitive names here is a place for the two to disagree, and the
+        // disagreement would be silent.  The unit spelling `()` is NOT a
+        // keyword and stays Pending rather than being special-cased in.
+        if (TokenType::from_keyword(written).is_primitive_type()) {
+            ResolveCounter::Site::AnnResPrimTy.bump();
+            return ResSlot::Answered(Res::PrimTy(name));
+        }
 
         // A generic parameter names ITSELF, never whatever a call site binds it
         // to. Answering it here is what keeps the stamp a statement about
