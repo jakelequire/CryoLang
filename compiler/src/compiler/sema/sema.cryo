@@ -577,25 +577,43 @@ public:
 
     /// The type an impl head is for.
     ///
-    /// The head's own stamp answers for a head as WRITTEN.  It deliberately
-    /// does not answer for a specialized clone - the cloner leaves that slot
-    /// unanswered - because a `Res` names a definition and a specialization is
-    /// not one; there the monomorphizer's rewritten spelling is the carrier,
-    /// and the lookup below reads it.  A written primitive target IS stamped,
-    /// as `PrimTy`, which names no declaration to look up - so it reaches the
-    /// lookup below as well, by a different route and for a different reason.
-    /// So the two paths answer DIFFERENT questions rather than retrying one.
+    /// One answering path per kind of answer the slot can carry, each an exact
+    /// lookup under the key that kind supplies - never a retry of one key
+    /// under another.  A `Def` is canonical, so the index holds it or the
+    /// declaration never registered.  A written primitive is stamped `PrimTy`
+    /// and names no declaration, because a primitive owns members without
+    /// being declared anywhere; its spelling IS its registration key.  An
+    /// unanswered slot belongs to the cloner, which leaves a specialization
+    /// alone because a `Res` names a definition and a specialization is not
+    /// one - there the monomorphizer's rewritten `target_type` is the carrier.
+    ///
+    /// Nothing else can name a type here: a type parameter, a local and an
+    /// already-failed resolution each name something that is not a
+    /// declaration, so there is no key to look one up under.
     impl_target_type(mut &this, node: ImplBlockNode*) -> TypeRef {
         ResolveCounter::Site::SpellTyImplCalls.bump();
-        const stamped: TypeRef = this.types.spelling_type(node.res, ResolveCounter::Site::SpellTyImplNoDef);
-        if (stamped.is_valid()) { return stamped; }
-        const fallback: TypeRef = this.types.lookup_type_by_sym(node.target_type, "sema/visit:ImplBlockNode/node.target_type");
-        if (fallback.is_valid()) {
-            ResolveCounter::Site::SpellTyImplFbHit.bump();
-        } else {
-            ResolveCounter::Site::SpellTyImplFbMiss.bump();
-        }
-        return fallback;
+        return match (node.res) {
+            ResSlot::Answered(r) => {
+                match (r) {
+                    Res::Def(q) => {
+                        ResolveCounter::Site::SpellTyImplResDef.bump();
+                        this.types.def_type(q, "sema/visit:ImplBlockNode/node.res")
+                    }
+                    Res::PrimTy(n) => {
+                        ResolveCounter::Site::SpellTyImplResPrim.bump();
+                        this.types.lookup_type_exact(n)
+                    }
+                    _ => {
+                        ResolveCounter::Site::SpellTyImplResOther.bump();
+                        TypeRef::invalid()
+                    }
+                }
+            }
+            _ => {
+                ResolveCounter::Site::SpellTyImplResPend.bump();
+                this.types.lookup_type_exact(node.target_type)
+            }
+        };
     }
 
     override visit(mut &this, node: ImplBlockNode*) -> void {

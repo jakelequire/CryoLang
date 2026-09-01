@@ -7156,3 +7156,144 @@ corpus reaches - and the only outcome on offer is trading E0202 for E0900.
 
 **Struct literal - NOT converted**, settled in 8.25: 4 live fires, C-imported
 aggregates, and deleting the path miscompiles them silently.
+
+### 8.28 The impl head answers per `Res`; the `spelling_type` round-trip is gone 2026-09-01
+
+8.27 named the signature as the higher-leverage change, and it is this one.
+`spelling_type` returned a bare `TypeRef`, so a caller could not tell an answer
+that DECLINES to name a type - which is complete - from one naming a definition
+the index does not hold, which is a registration defect. The impl head's
+response to either was to look the written spelling up, and that is the fallback
+shape this document exists to remove.
+
+The head now matches its own slot, one key per branch and no key retried under
+another:
+
+| slot | key | why that key |
+|---|---|---|
+| `Def(q)` | `q` | the name layer's own answer, already canonical |
+| `PrimTy(n)` | `n` | a primitive owns members without being declared anywhere, so its spelling IS its registration key |
+| `Pending` | `target_type` | the cloner leaves a specialization's slot alone - a `Res` names a definition and a specialization is not one - so the monomorphizer's rewritten spelling is the carrier |
+
+The variant split was measured BEFORE the match was written, because a match
+written blind would send an unmeasured variant somewhere the fallback did not.
+Over four corpora - native, the `tests/` tree, the 41 projects, the 178
+compile-fail cases - it is `Def` 21,870, `PrimTy` 31,601, `Pending` 24,670, and
+everything else **0**. `PrimTy + Pending` is 55,496, which is the fire count
+8.27 arrived at through a different instrument.
+
+**The fallback was narrowed, not merely rerouted.** It called
+`lookup_type_by_sym`, a five-step widen. The cascade audit says all 12,078
+native fires answered at step `1-EXACT`: none at the module cursor, the
+cross-module chain, the arena leaf index, or miss. The site now asks
+`lookup_type_exact`. `b1-check`'s per-site rows did not move, `lookup_by_leaf
+calls` among them, which is the control for that deletion - narrowing a cascade
+whose later steps were load-bearing would have moved exactly those rows.
+
+`SpellTyPending` 6,014 -> 0 and `SpellTyNoDef` 6,064 -> 0 on native. The whole
+residue of the family is now the 4 struct-literal fires and the 1 call-ident
+fire that 8.25 and 8.27 settled as not convertible.
+
+#### A canonical name the index cannot serve is now reported
+
+`def_type` is the single step that turns a `Res::Def` into a type, shared by the
+impl head and by `spelling_type_answered`, so every consumer of a canonical name
+asks the same question in the same place. A name the index does not hold records
+an internal defect on the same deferred terms as the `Pending` tally - raised
+only if the build otherwise succeeds - and under its own message, because the
+two say different things: a pass that never ran, against a declaration that
+never registered. It fires 0 times on all four corpora, which is what the
+measured `SpellTyDefMissing` zero predicted.
+
+#### The "projects" column in 8.25-8.27 was 26 projects, not 41
+
+8.24 hoisted `report()` above the success branch of the `check` driver, for the
+stated reason that a corpus of deliberately failing files is where names that do
+not resolve live. The BUILD driver was left on its success path, so a project
+that fails to compile still contributed nothing - and all 13 `compile_fail`
+projects were absent from every "projects" figure those three entries record.
+The corpus richest in unresolved names was missing from the column named after
+it, and the shortfall was visible as a block count of 26 against 41 files.
+
+`cryo build`, `cryo run` and `cryo test` now report on the same terms as `cryo
+check`. The sweep yields 41 blocks from 41 projects, which is why the projects
+figures here exceed the ones in 8.27 for populations that did not change.
+
+### 8.29 The codegen impl-target cascade cannot read the stamp - MEASURED, NOT MIGRATED 2026-09-01
+
+Two sites re-derive an impl block's target NAME rather than its type:
+`codegen/ops/declaration_emitter.cryo` and `codegen/visit/decl_visit_emitter.cryo`.
+They are verbatim mirrors, and one says so in a comment. Each is a five-way
+choice: the `qualified_target_name` stamp; else the spelling when it already
+contains `::`; else the bare name if the declaration index holds it; else a
+scoped mapping; else a cursor qualification the report itself marks a guess.
+
+The proposal was to make them read `res`, as 8.28 made the sema-side impl head
+do. **That is not available, and the reason is structural rather than
+incidental.**
+
+Split over the population that actually REACHES the cascade - the nodes with no
+`qualified_target_name` - `res` is `Pending` for **all** of them:
+
+| corpus | asked | re-derived | `Def` | `PrimTy` | `Pending` | other |
+|---|---:|---:|---:|---:|---:|---:|
+| native | 19,978 | 11,896 | 0 | 0 | 11,896 | 0 |
+| tree | 5,514 | 4,540 | 0 | 0 | 4,540 | 0 |
+| projects | 30,644 | 16,718 | 0 | 0 | 16,718 | 0 |
+| cross-target | 14,580 | 7,644 | 0 | 0 | 7,644 | 0 |
+
+`re-derived` equals the `Pending` column exactly on every corpus. `cloner.cryo`
+says why: `res` and `qualified_target_name` are BOTH withheld from a clone, for
+the same stated reason - specialization rebinds WHICH type the head is for, so a
+stamp naming the template beside a `target_type` the monomorphizer rewrote to
+the instantiation would bind the head back to the template. The rewritten
+spelling is deliberately the only carrier. A `Res` cannot name an instantiation,
+which is the same principle the B4 floor rests on.
+
+So the two carriers are not redundant and the cascade is not reading the wrong
+one. **A site whose population is entirely `Pending` by construction cannot be
+migrated to the stamp, and a session that "fixes" it is removing a carrier the
+clone has nothing to replace with.**
+
+The whole-population split adds the complementary fact: where `res` IS `Def(q)`,
+`q` names the SAME symbol the site computes - 21,540 agreements, **0**
+disagreements, across all four corpora. The two stamps agree wherever both
+exist; they simply do not both exist.
+
+The unstamped split is kept as a tripwire; the whole-population one was removed
+with the question it answered. `re-derived, yet res: Def` going nonzero would
+mean the stamp had become available where the cascade runs, and this migration
+worth revisiting - which is the only reason to keep a counter for a settled
+question.
+
+#### Three of the five ways answered nothing, and are gone
+
+Over 40,798 re-derivations on four corpora - native, the `tests/` tree, the 41
+projects, and a cross-target build that compiles the other OS's platform-gated
+modules - **every one takes the spelling step**. The declaration-index step, the
+scoped mapping and the cursor guess answered nothing anywhere, in both copies.
+
+The cross-target arm is the control that matters: it is the only one that
+compiles modules a native build never sees, so it is the population a
+native-only zero would have missed. It did not overturn the zero. It is also
+only observable because the build driver now reports on failure (8.28) - that
+link fails by design, and before 8.28 the whole arm would have been silent.
+
+Both copies now read: the stamp when there is one, the written spelling
+otherwise. `make test` OVERALL PASS, `selfhost-check` byte-identical on both
+arms, and `b1-check` unmoved - the last being the control for the deletion,
+since a branch that was load-bearing would have shifted a pinned row. The
+`lane-check` ratchet fell 129 -> 127 (`declaration_emitter.cryo` 10 -> 9,
+`decl_visit_emitter.cryo` 6 -> 5) and was re-pinned deliberately with this
+change.
+
+The two sites remain verbatim mirrors of each other, now four lines each rather
+than twenty. De-duplicating them is still available and still unclaimed.
+
+#### A comment corrected
+
+`AST/declaration.cryo`'s `res` field doc said a primitive impl target "is left
+unanswered here as well". It has not been since 8.26 stamped written primitives
+`PrimTy`; the codegen probe counts 6,064 of them reaching the emitter on the
+native corpus alone. The doc now records that a written primitive IS answered,
+names no declaration, and carries its registration key in its spelling.

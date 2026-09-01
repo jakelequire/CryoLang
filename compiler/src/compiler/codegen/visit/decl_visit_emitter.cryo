@@ -28,6 +28,7 @@ import Compiler::Types::{ TypeRef, Type, Arena, Compound, Generic, GenericRegist
 import Compiler::AST;
 import Compiler::AST::{ Node, Visitor, Expression, Statement, Declaration };
 import Compiler::Resolver::{ SymbolStr, InternTable };
+import Compiler::Resolver::Res;
 import Utils::Logger;
 import std::collections::pair;
 
@@ -221,23 +222,22 @@ type struct DeclVisitEmitter {
             qualified_impl_target = node.qualified_target_name;
         } else {
             ResolveCounter::Site::CgImplTargetUnstamped.bump();
-            const impl_target_str: string = this.cg.resolve(node.target_type);
-            if (impl_target_str.contains("::")) {
-                ResolveCounter::Site::CgImplTargetSpelling.bump();
-                qualified_impl_target = node.target_type;
-            } else if (di_ptr.lookup_type(node.target_type).is_valid()) {
-                ResolveCounter::Site::CgImplTargetDiBare.bump();
-                qualified_impl_target = node.target_type;
-            } else {
-                const resolved: SymbolStr = this.cg.ctx.resolve_scoped_or(node.target_type, FILE, LINE);
-                if (!resolved.equals(node.target_type)) {
-                    ResolveCounter::Site::CgImplTargetScopedMap.bump();
-                    qualified_impl_target = resolved;
-                } else {
-                    ResolveCounter::Site::CgImplTargetCursor.bump();
-                    qualified_impl_target = this.cg.qualify(node.target_type);
+            match (node.res) {
+                ResSlot::Answered(r2) => {
+                    match (r2) {
+                        Res::Def(_)    => { ResolveCounter::Site::CgImplTargetUnResDef.bump(); }
+                        Res::PrimTy(_) => { ResolveCounter::Site::CgImplTargetUnResPrim.bump(); }
+                        _              => { ResolveCounter::Site::CgImplTargetUnResOther.bump(); }
+                    }
                 }
+                _ => { ResolveCounter::Site::CgImplTargetUnResPend.bump(); }
             }
+            // No stamp means a monomorphized clone: the cloner withholds both
+            // `qualified_target_name` and `res` from one, because a
+            // specialization rebinds WHICH type the head is for and neither
+            // stamp can name an instantiation.  The rewritten spelling is the
+            // carrier by construction, and it is already qualified.
+            qualified_impl_target = node.target_type;
         }
         // Mirror declare_impl_block: skip when the target type is a generic
         // template; only spec'd clones should be codegen'd.
