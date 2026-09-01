@@ -16,6 +16,7 @@ import Compiler::Types::{
     TypeRef, Type, Arena, Compound, UserDefined, Generic, Substitution, GenericRegistry, TypeKind
 };
 import Compiler::Resolver::{ SymbolStr, InternTable };
+import Compiler::Resolver::Res;
 import Compiler::AST;
 import Compiler::AST::{ Node, Expression, Statement, Pattern };
 import Compiler::Diag;
@@ -23,6 +24,7 @@ import Compiler::Diag::{ Diagnostic, Suggestion, SourceSpan };
 import Compiler::Diag::EditDistance;
 import Compiler::Lex;
 import Compiler::CompilationContext;
+import Compiler::ResolveCounter;
 import Compiler::Sema::{ State, TypeUtils, SymbolicChecker, ScopeManager, Helpers };
 import std::fmt;
 
@@ -114,12 +116,24 @@ type struct PatternResolver {
                 // The instantiation's ARGUMENTS are not wanted here - they come
                 // from the subject's peeled instantiation below - so the
                 // definition is the whole of what this branch needs, and the
-                // template carries the variant list it reads.  The spelling
-                // lookup still serves a name the stamp makes no claim for, so
-                // it answers a different question rather than retrying this one.
-                mut enum_type_ref: TypeRef = this.types.spelling_type(enum_pat.res);
-                if (!enum_type_ref.is_valid()) {
-                    enum_type_ref = this.types.lookup_type_by_sym(enum_pat.enum_name, "pattern_resolver/resolve_variant_payload_types/enum_pat.enum_name");
+                // template carries the variant list it reads.
+                //
+                // A pattern names its enum outright - never a local, a generic
+                // parameter or a primitive - so the slot is answered, and names
+                // a definition, on every corpus this tree compiles.  `require`
+                // asserts that instead of testing it: an unanswered slot is an
+                // internal error reported against this site, where a second
+                // lookup keyed on the spelling would bind the pattern to
+                // whatever else shares the leaf, and a wrong enum reads as a
+                // wrong variant list rather than as a failure.
+                mut enum_type_ref: TypeRef = TypeRef::invalid();
+                match (enum_pat.res.require(
+                        "pattern_resolver/resolve_variant_payload_types")) {
+                    Res::Def(q) => { enum_type_ref = this.types.lookup_type_exact(q); }
+                    // `require` has already recorded the internal error, and an
+                    // answer that names no definition cannot name this enum.
+                    // There is deliberately no second key to try.
+                    _           => { }
                 }
                 if (enum_type_ref.is_valid()) { enum_ty = this.types.unwrap_to_enum(enum_type_ref); }
             }

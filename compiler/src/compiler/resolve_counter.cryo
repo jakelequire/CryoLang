@@ -62,6 +62,14 @@ const TALLY_CAP: i64 = 256;
 /// Per-site tallies.  Zero-initialized in BSS; indexed by `Site`.
 mut g_tally: u64[256];
 
+/// Whether the report has already been printed for this process.
+///
+/// The report is reached from both the driver's success path and the CLI's
+/// outcome-independent call, and a run that succeeds passes through both.  One
+/// process prints one block, or a consumer summing blocks across a sweep
+/// double-counts every successful compile.
+mut g_reported: boolean = false;
+
 /// Bumps discarded because the site's index was outside `g_tally`.
 ///
 /// Detects exactly the false zeros: a site past the end that WOULD have fired
@@ -483,6 +491,57 @@ type enum Site {
     SpellTyHit;
     SpellTyDefMissing;
 
+    /// Which of the new-expr site's two fallback steps answers.  They ask
+    /// different questions - a spelling lookup cannot resolve a primitive at
+    /// all - so the split says whether the first step serves anyone.
+    SpellTyNewStep2;
+    SpellTyNewStep3;
+
+    /// A written primitive spelling, answered rather than left Pending.
+    AnnResPrimTy;
+
+    /// `SpellTyNoDef` split per consumer.  Stamping a primitive moves a
+    /// population from "never answered" to "answered, names no
+    /// declaration", and a site converting to `require` has to know
+    /// which of the two it is now facing.
+    SpellTyImplNoDef;
+    SpellTyLitNoDef;
+    SpellTyNewNoDef;
+    SpellTyIdNoDef;
+
+    /// Impl heads as NAME RESOLUTION sees them, against the consumer-side
+    /// count of unanswered `res` slots.  A slot is unanswered either
+    /// because the stamp declined or because the walk never reached the
+    /// node, and the consumer cannot tell those apart; a clone carries its
+    /// original's slot verbatim and is minted after this walk has run, so
+    /// `Visit` far below the consumer's call count is the expected shape
+    /// and `Declined` near it would mean the stamp site is the decliner.
+    ImplResVisit;
+    ImplResStamped;
+    ImplResDeclined;
+
+    /// Which of the five `spelling_type` consumers an invalid answer came
+    /// from, and whether the spelling fallback beneath that consumer then
+    /// finds anything.  The shared rows above give the totals but not the
+    /// site, so nothing there separates a consumer whose stamp is merely
+    /// advisory from one whose node a pass owed a `Res` and never wrote.
+    ///
+    /// `FbHit + FbMiss` summed over the five sites must equal `Pending`; a
+    /// shortfall means an invalid answer arrived as `NoDef` or `DefMissing`
+    /// rather than as an unanswered slot, and the attribution is unsound.
+    SpellTyImplCalls;
+    SpellTyImplFbHit;
+    SpellTyImplFbMiss;
+    SpellTyLitCalls;
+    SpellTyLitFbHit;
+    SpellTyLitFbMiss;
+    SpellTyNewCalls;
+    SpellTyNewFbHit;
+    SpellTyNewFbMiss;
+    SpellTyIdCalls;
+    SpellTyIdFbHit;
+    SpellTyIdFbMiss;
+
     M4ScanNone;
     M4ScanOne;
     M4ScanPlural;
@@ -672,6 +731,28 @@ implement enum Site {
             Site::SpellTyNoDef          => { "   " }
             Site::SpellTyHit            => { "   " }
             Site::SpellTyDefMissing     => { "!! " }
+            Site::SpellTyNewStep2       => { "   " }
+            Site::SpellTyNewStep3       => { "   " }
+            Site::AnnResPrimTy          => { "   " }
+            Site::SpellTyImplNoDef      => { "   " }
+            Site::SpellTyLitNoDef       => { "   " }
+            Site::SpellTyNewNoDef       => { "   " }
+            Site::SpellTyIdNoDef        => { "   " }
+            Site::ImplResVisit          => { "   " }
+            Site::ImplResStamped        => { "   " }
+            Site::ImplResDeclined       => { "   " }
+            Site::SpellTyImplCalls      => { "   " }
+            Site::SpellTyImplFbHit      => { "   " }
+            Site::SpellTyImplFbMiss     => { "   " }
+            Site::SpellTyLitCalls       => { "   " }
+            Site::SpellTyLitFbHit       => { "   " }
+            Site::SpellTyLitFbMiss      => { "   " }
+            Site::SpellTyNewCalls       => { "   " }
+            Site::SpellTyNewFbHit       => { "   " }
+            Site::SpellTyNewFbMiss      => { "   " }
+            Site::SpellTyIdCalls        => { "   " }
+            Site::SpellTyIdFbHit        => { "   " }
+            Site::SpellTyIdFbMiss       => { "   " }
             Site::M4ScanNone            => { "   " }
             Site::M4ScanOne             => { "   " }
             Site::M4ScanPlural          => { "!! " }
@@ -815,6 +896,28 @@ implement enum Site {
             Site::SpellTyNoDef          => { "spelling_type: answer names no def" }
             Site::SpellTyHit            => { "spelling_type: def found" }
             Site::SpellTyDefMissing     => { "spelling_type: def NOT REGISTERED" }
+            Site::SpellTyNewStep2       => { "new expr: answered by spelling lookup" }
+            Site::SpellTyNewStep3       => { "new expr: answered by resolve_primitive" }
+            Site::AnnResPrimTy          => { "  stamped PrimTy (written primitive)" }
+            Site::SpellTyImplNoDef      => { "spelling_type impl head: answered, names no def" }
+            Site::SpellTyLitNoDef       => { "spelling_type struct literal: answered, names no def" }
+            Site::SpellTyNewNoDef       => { "spelling_type new expr: answered, names no def" }
+            Site::SpellTyIdNoDef        => { "spelling_type call ident: answered, names no def" }
+            Site::ImplResVisit          => { "impl head: reached by name resolution" }
+            Site::ImplResStamped        => { "  of those, res stamped" }
+            Site::ImplResDeclined       => { "  of those, stamp declined" }
+            Site::SpellTyImplCalls      => { "spelling_type impl head: calls" }
+            Site::SpellTyImplFbHit      => { "spelling_type impl head: fallback found" }
+            Site::SpellTyImplFbMiss     => { "spelling_type impl head: fallback empty" }
+            Site::SpellTyLitCalls       => { "spelling_type struct literal: calls" }
+            Site::SpellTyLitFbHit       => { "spelling_type struct literal: fallback found" }
+            Site::SpellTyLitFbMiss      => { "spelling_type struct literal: fallback empty" }
+            Site::SpellTyNewCalls       => { "spelling_type new expr: calls" }
+            Site::SpellTyNewFbHit       => { "spelling_type new expr: fallback found" }
+            Site::SpellTyNewFbMiss      => { "spelling_type new expr: fallback empty" }
+            Site::SpellTyIdCalls        => { "spelling_type call ident: calls" }
+            Site::SpellTyIdFbHit        => { "spelling_type call ident: fallback found" }
+            Site::SpellTyIdFbMiss       => { "spelling_type call ident: fallback empty" }
             Site::M4ScanNone            => { "  M4 scan found: no candidate" }
             Site::M4ScanOne             => { "  M4 scan found: exactly one" }
             Site::M4ScanPlural          => { "  M4 scan found: PLURAL (tie-break pop)" }
@@ -1272,6 +1375,8 @@ public function enabled() -> boolean {
 /// printed last so it is the final thing on screen.
 public function report() -> void {
     if (!enabled()) { return; }
+    if (g_reported) { return; }
+    g_reported = true;
 
     fmt::eprintf("\n");
     fmt::eprintf("=============== name-resolution counter ===============\n");
@@ -1451,6 +1556,28 @@ public function report() -> void {
     Site::SpellTyNoDef.print_row();
     Site::SpellTyHit.print_row();
     Site::SpellTyDefMissing.print_row();
+    Site::SpellTyNewStep2.print_row();
+    Site::SpellTyNewStep3.print_row();
+    Site::AnnResPrimTy.print_row();
+    Site::SpellTyImplNoDef.print_row();
+    Site::SpellTyLitNoDef.print_row();
+    Site::SpellTyNewNoDef.print_row();
+    Site::SpellTyIdNoDef.print_row();
+    Site::ImplResVisit.print_row();
+    Site::ImplResStamped.print_row();
+    Site::ImplResDeclined.print_row();
+    Site::SpellTyImplCalls.print_row();
+    Site::SpellTyImplFbHit.print_row();
+    Site::SpellTyImplFbMiss.print_row();
+    Site::SpellTyLitCalls.print_row();
+    Site::SpellTyLitFbHit.print_row();
+    Site::SpellTyLitFbMiss.print_row();
+    Site::SpellTyNewCalls.print_row();
+    Site::SpellTyNewFbHit.print_row();
+    Site::SpellTyNewFbMiss.print_row();
+    Site::SpellTyIdCalls.print_row();
+    Site::SpellTyIdFbHit.print_row();
+    Site::SpellTyIdFbMiss.print_row();
     Site::M4ScanNone.print_row();
     Site::M4ScanOne.print_row();
     Site::M4ScanPlural.print_row();

@@ -581,13 +581,21 @@ public:
     /// does not answer for a specialized clone - the cloner leaves that slot
     /// unanswered - because a `Res` names a definition and a specialization is
     /// not one; there the monomorphizer's rewritten spelling is the carrier,
-    /// and the lookup below reads it.  A primitive target names no declaration
-    /// to stamp either.  So the two paths answer DIFFERENT questions rather
-    /// than retrying one.
+    /// and the lookup below reads it.  A written primitive target IS stamped,
+    /// as `PrimTy`, which names no declaration to look up - so it reaches the
+    /// lookup below as well, by a different route and for a different reason.
+    /// So the two paths answer DIFFERENT questions rather than retrying one.
     impl_target_type(mut &this, node: ImplBlockNode*) -> TypeRef {
-        const stamped: TypeRef = this.types.spelling_type(node.res);
+        ResolveCounter::Site::SpellTyImplCalls.bump();
+        const stamped: TypeRef = this.types.spelling_type(node.res, ResolveCounter::Site::SpellTyImplNoDef);
         if (stamped.is_valid()) { return stamped; }
-        return this.types.lookup_type_by_sym(node.target_type, "sema/visit:ImplBlockNode/node.target_type");
+        const fallback: TypeRef = this.types.lookup_type_by_sym(node.target_type, "sema/visit:ImplBlockNode/node.target_type");
+        if (fallback.is_valid()) {
+            ResolveCounter::Site::SpellTyImplFbHit.bump();
+        } else {
+            ResolveCounter::Site::SpellTyImplFbMiss.bump();
+        }
+        return fallback;
     }
 
     override visit(mut &this, node: ImplBlockNode*) -> void {
@@ -2740,6 +2748,11 @@ public:
             ResSlot::Answered(r) => {
                 match (r) {
                     Res::Def(q) => { base_ref = this.types.lookup_type_exact(q); }
+                    // A literal's type is a struct, so a primitive stamp here
+                    // is not a template to look up.  Named rather than folded
+                    // into the wildcard: the primitive answer is new, and a
+                    // reader must be able to see it was considered.
+                    Res::PrimTy(_) => { }
                     _           => { }
                 }
             }
@@ -2802,12 +2815,23 @@ public:
         // A literal with no arguments has no pair to resolve, so neither branch
         // above applies and the stamp is the whole answer: it names one
         // definition, canonically, accounting for the writing module's imports.
-        if (!struct_ref.is_valid()) { struct_ref = this.types.spelling_type(lit.res); }
+        if (!struct_ref.is_valid()) {
+            ResolveCounter::Site::SpellTyLitCalls.bump();
+            struct_ref = this.types.spelling_type(lit.res, ResolveCounter::Site::SpellTyLitNoDef);
+        }
         // Last, for a literal the stamp makes no claim for - a type the writing
         // module cannot see is deliberately left unstamped - where the spelling
-        // is the only remaining way to reach the type.
+        // is the only remaining way to reach the type.  A C-imported aggregate
+        // reaches ONLY here: its declaration is minted by the importer rather
+        // than written, so no stamp names it, and without this the literal
+        // takes a wrong layout and its fields read as garbage.
         if (!struct_ref.is_valid()) {
             struct_ref = this.types.lookup_type_by_sym(lit.struct_type, "sema/resolve_struct_literal/lit.struct_type");
+            if (struct_ref.is_valid()) {
+                ResolveCounter::Site::SpellTyLitFbHit.bump();
+            } else {
+                ResolveCounter::Site::SpellTyLitFbMiss.bump();
+            }
         }
         mut struct_t: Type* = if (struct_ref.is_valid()) { this.arena.lookup(struct_ref.id) } else { null };
         if (struct_t != null && struct_t.kind == TypeKind::InstantiatedType) {
@@ -3104,19 +3128,35 @@ public:
         for (mut i: i64 = 0; i < new_expr.arguments.length; i++) { this.resolve_expr(new_expr.arguments[i]); }
         if (new_expr.has_struct_init()) { this.resolve_struct_literal(new_expr.struct_init); }
         if (new_expr.has_array_size()) { this.resolve_expr(new_expr.array_size); }
-        // The name layer's own answer for the written type name, which is a
-        // canonical name and so names one declaration.  A self-reference inside
-        // the specialized body never reaches here: the substituter records the
-        // instantiation's arena id on the node, and `resolve_expr` returns that
-        // before this runs.  The spelling lookup below still serves a name the
-        // stamp makes no claim for, so it answers a different question rather
-        // than retrying this one.
-        mut base: TypeRef = this.types.spelling_type(new_expr.res);
+        // The name layer's own answer for the written type name.  A
+        // self-reference inside the specialized body never reaches here: the
+        // substituter records the instantiation's arena id on the node, and
+        // `resolve_expr` returns that before this runs.
+        //
+        // `new int[100]` is what reaches the lookup below: the element name is
+        // a keyword, so the stamp answers `PrimTy` - an answer, but not one
+        // naming a declaration - and the primitive is reached through the
+        // arena instead.  A different question, not a second attempt at this
+        // one.  `resolve_primitive` beneath it answers nothing on any corpus,
+        // but it is only ever reached when the lookup above declines, so that
+        // zero is shadowed rather than measured.
+        ResolveCounter::Site::SpellTyNewCalls.bump();
+        mut base: TypeRef = this.types.spelling_type(new_expr.res, ResolveCounter::Site::SpellTyNewNoDef);
+        const new_unstamped: boolean = !base.is_valid();
         if (!base.is_valid()) {
             base = this.types.lookup_type_by_sym(new_expr.type_name, "sema/resolve_new_expr/new_expr.type_name");
+            if (base.is_valid()) { ResolveCounter::Site::SpellTyNewStep2.bump(); }
         }
         if (!base.is_valid() && this.ctx.type_resolver != null) {
             base = this.ctx.type_resolver.resolve_primitive(new_expr.type_name);
+            if (base.is_valid()) { ResolveCounter::Site::SpellTyNewStep3.bump(); }
+        }
+        if (new_unstamped) {
+            if (base.is_valid()) {
+                ResolveCounter::Site::SpellTyNewFbHit.bump();
+            } else {
+                ResolveCounter::Site::SpellTyNewFbMiss.bump();
+            }
         }
         if (base.is_valid()) { return this.arena.get_pointer_to(base); }
         return TypeRef::invalid();
