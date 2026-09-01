@@ -414,10 +414,17 @@ type enum Site {
     /// one that has to be zero before the copy can go.
     CgImplTargetSeen;
     CgImplTargetUnstamped;
-    CgImplTargetSpelling;
-    CgImplTargetDiBare;
-    CgImplTargetScopedMap;
-    CgImplTargetCursor;
+
+    /// What `res` says on the nodes with no `qualified_target_name` - the
+    /// ones that fall back to the written spelling.  It decides whether the
+    /// stamp could serve the site at all: a `Def` here is a node the stamp
+    /// could have answered for, while `Pending` here is a specialization,
+    /// which a `Res` cannot name by construction.  Measured entirely
+    /// `Pending`, which is why the spelling is still the carrier.
+    CgImplTargetUnResDef;
+    CgImplTargetUnResPrim;
+    CgImplTargetUnResPend;
+    CgImplTargetUnResOther;
 
     /// Whether M4's bare-leaf template scan answered, and whether the
     /// identifier that asked already carried a stamp naming the callee.
@@ -503,8 +510,9 @@ type enum Site {
     /// `SpellTyNoDef` split per consumer.  Stamping a primitive moves a
     /// population from "never answered" to "answered, names no
     /// declaration", and a site converting to `require` has to know
-    /// which of the two it is now facing.
-    SpellTyImplNoDef;
+    /// which of the two it is now facing.  The impl head is absent: it
+    /// matches its own answer, so it has no undifferentiated invalid to
+    /// attribute.
     SpellTyLitNoDef;
     SpellTyNewNoDef;
     SpellTyIdNoDef;
@@ -526,12 +534,22 @@ type enum Site {
     /// site, so nothing there separates a consumer whose stamp is merely
     /// advisory from one whose node a pass owed a `Res` and never wrote.
     ///
-    /// `FbHit + FbMiss` summed over the five sites must equal `Pending`; a
-    /// shortfall means an invalid answer arrived as `NoDef` or `DefMissing`
-    /// rather than as an unanswered slot, and the attribution is unsound.
+    /// `FbHit + FbMiss` summed over the sites that still have a fallback
+    /// must equal `Pending` less the impl head's share; a shortfall means an
+    /// invalid answer arrived as `NoDef` or `DefMissing` rather than as an
+    /// unanswered slot, and the attribution is unsound.
     SpellTyImplCalls;
-    SpellTyImplFbHit;
-    SpellTyImplFbMiss;
+
+    /// Which branch the impl head took, over the SAME population
+    /// `SpellTyImplCalls` counts.  `Other` is the branch that answers
+    /// nothing, and it must stay zero: a variant arriving there names
+    /// something that is not a declaration, so the impl block would be
+    /// typed invalid with no key left to try.
+    SpellTyImplResDef;
+    SpellTyImplResPrim;
+    SpellTyImplResPend;
+    SpellTyImplResOther;
+
     SpellTyLitCalls;
     SpellTyLitFbHit;
     SpellTyLitFbMiss;
@@ -707,10 +725,10 @@ implement enum Site {
             Site::ImplHeadAsyncUnstamped => { "!! " }
             Site::CgImplTargetSeen      => { "   " }
             Site::CgImplTargetUnstamped => { "   " }
-            Site::CgImplTargetSpelling  => { "   " }
-            Site::CgImplTargetDiBare    => { "   " }
-            Site::CgImplTargetScopedMap => { "   " }
-            Site::CgImplTargetCursor    => { "!! " }
+            Site::CgImplTargetUnResDef  => { "!! " }
+            Site::CgImplTargetUnResPrim => { "   " }
+            Site::CgImplTargetUnResPend => { "   " }
+            Site::CgImplTargetUnResOther => { "!! " }
             Site::M4Single              => { "   " }
             Site::M4ResDef              => { "   " }
             Site::M4ResOther            => { "   " }
@@ -734,7 +752,6 @@ implement enum Site {
             Site::SpellTyNewStep2       => { "   " }
             Site::SpellTyNewStep3       => { "   " }
             Site::AnnResPrimTy          => { "   " }
-            Site::SpellTyImplNoDef      => { "   " }
             Site::SpellTyLitNoDef       => { "   " }
             Site::SpellTyNewNoDef       => { "   " }
             Site::SpellTyIdNoDef        => { "   " }
@@ -742,8 +759,10 @@ implement enum Site {
             Site::ImplResStamped        => { "   " }
             Site::ImplResDeclined       => { "   " }
             Site::SpellTyImplCalls      => { "   " }
-            Site::SpellTyImplFbHit      => { "   " }
-            Site::SpellTyImplFbMiss     => { "   " }
+            Site::SpellTyImplResDef     => { "   " }
+            Site::SpellTyImplResPrim    => { "   " }
+            Site::SpellTyImplResPend    => { "   " }
+            Site::SpellTyImplResOther   => { "   " }
             Site::SpellTyLitCalls       => { "   " }
             Site::SpellTyLitFbHit       => { "   " }
             Site::SpellTyLitFbMiss      => { "   " }
@@ -882,10 +901,10 @@ implement enum Site {
             Site::ImplHeadAsyncUnstamped => { "    of those, unstamped" }
             Site::CgImplTargetSeen      => { "codegen impl targets asked for" }
             Site::CgImplTargetUnstamped => { "  NO stamp: re-derived here" }
-            Site::CgImplTargetSpelling  => { "    1 spelling already qualified" }
-            Site::CgImplTargetDiBare    => { "    2 DI knows the bare name" }
-            Site::CgImplTargetScopedMap => { "    3 bare->qualified mapping" }
-            Site::CgImplTargetCursor    => { "    4 CURSOR-qualified (a guess)" }
+            Site::CgImplTargetUnResDef  => { "  re-derived, yet res: Def" }
+            Site::CgImplTargetUnResPrim => { "  re-derived, res: PrimTy" }
+            Site::CgImplTargetUnResPend => { "  re-derived, res: Pending" }
+            Site::CgImplTargetUnResOther => { "  re-derived, res: OTHER" }
             Site::M4Single              => { "  M4 by: one candidate for the leaf" }
             Site::SfCalls               => { "scoped template scan calls" }
             Site::SfScanNone            => { "  scoped scan found: no candidate" }
@@ -899,7 +918,6 @@ implement enum Site {
             Site::SpellTyNewStep2       => { "new expr: answered by spelling lookup" }
             Site::SpellTyNewStep3       => { "new expr: answered by resolve_primitive" }
             Site::AnnResPrimTy          => { "  stamped PrimTy (written primitive)" }
-            Site::SpellTyImplNoDef      => { "spelling_type impl head: answered, names no def" }
             Site::SpellTyLitNoDef       => { "spelling_type struct literal: answered, names no def" }
             Site::SpellTyNewNoDef       => { "spelling_type new expr: answered, names no def" }
             Site::SpellTyIdNoDef        => { "spelling_type call ident: answered, names no def" }
@@ -907,8 +925,10 @@ implement enum Site {
             Site::ImplResStamped        => { "  of those, res stamped" }
             Site::ImplResDeclined       => { "  of those, stamp declined" }
             Site::SpellTyImplCalls      => { "spelling_type impl head: calls" }
-            Site::SpellTyImplFbHit      => { "spelling_type impl head: fallback found" }
-            Site::SpellTyImplFbMiss     => { "spelling_type impl head: fallback empty" }
+            Site::SpellTyImplResDef     => { "  impl head slot: Def" }
+            Site::SpellTyImplResPrim    => { "  impl head slot: PrimTy" }
+            Site::SpellTyImplResPend    => { "  impl head slot: Pending" }
+            Site::SpellTyImplResOther   => { "  impl head slot: OTHER" }
             Site::SpellTyLitCalls       => { "spelling_type struct literal: calls" }
             Site::SpellTyLitFbHit       => { "spelling_type struct literal: fallback found" }
             Site::SpellTyLitFbMiss      => { "spelling_type struct literal: fallback empty" }
@@ -1542,10 +1562,10 @@ public function report() -> void {
     Site::ImplHeadAsyncUnstamped.print_row();
     Site::CgImplTargetSeen.print_row();
     Site::CgImplTargetUnstamped.print_row();
-    Site::CgImplTargetSpelling.print_row();
-    Site::CgImplTargetDiBare.print_row();
-    Site::CgImplTargetScopedMap.print_row();
-    Site::CgImplTargetCursor.print_row();
+    Site::CgImplTargetUnResDef.print_row();
+    Site::CgImplTargetUnResPrim.print_row();
+    Site::CgImplTargetUnResPend.print_row();
+    Site::CgImplTargetUnResOther.print_row();
     Site::M4Single.print_row();
     Site::SfCalls.print_row();
     Site::SfScanNone.print_row();
@@ -1559,7 +1579,6 @@ public function report() -> void {
     Site::SpellTyNewStep2.print_row();
     Site::SpellTyNewStep3.print_row();
     Site::AnnResPrimTy.print_row();
-    Site::SpellTyImplNoDef.print_row();
     Site::SpellTyLitNoDef.print_row();
     Site::SpellTyNewNoDef.print_row();
     Site::SpellTyIdNoDef.print_row();
@@ -1567,8 +1586,10 @@ public function report() -> void {
     Site::ImplResStamped.print_row();
     Site::ImplResDeclined.print_row();
     Site::SpellTyImplCalls.print_row();
-    Site::SpellTyImplFbHit.print_row();
-    Site::SpellTyImplFbMiss.print_row();
+    Site::SpellTyImplResDef.print_row();
+    Site::SpellTyImplResPrim.print_row();
+    Site::SpellTyImplResPend.print_row();
+    Site::SpellTyImplResOther.print_row();
     Site::SpellTyLitCalls.print_row();
     Site::SpellTyLitFbHit.print_row();
     Site::SpellTyLitFbMiss.print_row();
