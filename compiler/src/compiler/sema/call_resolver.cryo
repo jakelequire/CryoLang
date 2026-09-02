@@ -2858,16 +2858,20 @@ type struct CallResolver {
         const qual_name: SymbolStr = this.ctx.qualify_symbol_sym_home(ident.name, ident.span.file);
         mut func_ret: TypeRef = this.types.lookup_func_return(qual_name);
         if (!func_ret.is_valid()) {
-            func_ret = this.types.lookup_func_return(ident.name);
-            // AUDIT ONLY (spec §3.3, §4).  The bare `func_returns` map is
-            // program-wide and carries no owner, so this answer is produced
-            // with ZERO scope input - a second, more permissive door than
-            // `try_pin_overload_mangled_callee`, and the one that types the
-            // other seven bare `find_best_candidate` calls that door misses.
-            // Attribute it through `bare_alts` when the leaf is unambiguous;
-            // a plural leaf has no owner to name here, which is the defect.
+            // The name layer's own answer for this callee.  It is a canonical
+            // name, so it names ONE declaration; the bare leaf this used to
+            // ask carries no owner, so a plural leaf answered from whichever
+            // module happened to register it last.
+            mut stamped_q: SymbolStr = SymbolStr::empty();
+            match (ident.res) {
+                ResSlot::Answered(r) => { stamped_q = r.def_name(); }
+                _                    => {}
+            }
+            if (stamped_q.is_valid()) {
+                func_ret = this.types.lookup_func_return(stamped_q);
+            }
             if (func_ret.is_valid()) {
-                ResolveCounter::Site::FnBindUnscopedRet.bump();
+                ResolveCounter::Site::FnBindStampedRet.bump();
                 const alts: SymbolStr[] =
                     this.ctx.decl_index.lookup_qualified_alternatives(ident.name);
                 if (alts.length == 1) {

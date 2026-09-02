@@ -30,7 +30,6 @@ import Compiler::Types::{ TypeRef, Type, Arena, Compound, UserDefined, Generic, 
 import Compiler::AST;
 import Compiler::AST::{ Node, Declaration };
 import Compiler::Resolver::{ SymbolStr, InternTable, MangledName, QualifiedName };
-import Compiler::Resolver::Res;
 import std::collections::pair;
 import std::fmt::float;
 import Compiler::AST::Expression;
@@ -621,39 +620,8 @@ type struct DeclarationEmitter {
             return;
         }
 
-        // Use TypeResolution's canonical-qualified target when available; it
-        // resolves cross-module impl targets (e.g. `implement trait FmtWrite
-        // for struct Stdout` in fmt::write where Stdout lives in io::stdio)
-        // by walking the bare->qualified table, so the impl's methods land
-        // under the same key the type's defining module uses.  Without the
-        // canonical resolution, we'd qualify with the CURRENT module and
-        // produce `fmt::write::Stdout::write_str`, which `declare_method`
-        // can't look up; bodies would be silently dropped and the linker
-        // would surface them as undefined references.
         const ctx_ptr: CompilationContext* = this.ctx;
-        mut qualified_target: SymbolStr = SymbolStr::empty();
-        ResolveCounter::Site::CgImplTargetSeen.bump();
-        if (node.qualified_target_name.is_valid()) {
-            qualified_target = node.qualified_target_name;
-        } else {
-            ResolveCounter::Site::CgImplTargetUnstamped.bump();
-            match (node.res) {
-                ResSlot::Answered(r2) => {
-                    match (r2) {
-                        Res::Def(_)    => { ResolveCounter::Site::CgImplTargetUnResDef.bump(); }
-                        Res::PrimTy(_) => { ResolveCounter::Site::CgImplTargetUnResPrim.bump(); }
-                        _              => { ResolveCounter::Site::CgImplTargetUnResOther.bump(); }
-                    }
-                }
-                _ => { ResolveCounter::Site::CgImplTargetUnResPend.bump(); }
-            }
-            // No stamp means a monomorphized clone: the cloner withholds both
-            // `qualified_target_name` and `res` from one, because a
-            // specialization rebinds WHICH type the head is for and neither
-            // stamp can name an instantiation.  The rewritten spelling is the
-            // carrier by construction, and it is already qualified.
-            qualified_target = node.target_type;
-        }
+        const qualified_target: SymbolStr = node.codegen_target_name();
         // Skip impls whose target is a generic template; only the
         // monomorphized spec'd clones should produce LLVM symbols.  Mirrors
         // the `generic_params.length > 0` skip above for `implement<T> Foo<T>`;
