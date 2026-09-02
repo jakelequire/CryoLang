@@ -7297,3 +7297,226 @@ unanswered here as well". It has not been since 8.26 stamped written primitives
 `PrimTy`; the codegen probe counts 6,064 of them reaching the emitter on the
 native corpus alone. The doc now records that a written primitive IS answered,
 names no declaration, and carries its registration key in its spelling.
+
+### 8.30 The impl-target derivation is one accessor on the node 2026-09-01
+
+8.29 left the two codegen sites reading stamp-then-spelling, four lines each and
+still verbatim mirrors. They are now one call to `ImplBlockNode::codegen_target_name`.
+
+The derivation is a function of the block's own three fields - the stamp, the
+slot, the written spelling - and of nothing the emitter knows, so the node is
+where it belongs. Both consumers ask the same question and there is now one
+place that answers it; a second answering path cannot drift back in without
+being visible as one.
+
+`declare_impl_block` registers a method under the returned name and
+`generate_impl_block` emits its body against the same name. That those two must
+agree is the reason the duplication was dangerous rather than merely untidy:
+they were two copies of the rule that decides one key, and nothing checked they
+stayed equal.
+
+MEASURED, not assumed. The whole `CgImplTarget` family and the impl-head slot
+split were collected over 14 examples plus the compiler's own sources - 15
+counter blocks from 15 files, counted both runs - with the pre-change compiler
+and again with the post-change one:
+
+| row | before | after |
+|---|---:|---:|
+| codegen impl targets asked for | 19,012 | 19,012 |
+| NO stamp: re-derived here | 11,416 | 11,416 |
+| re-derived, yet res: `Def` | 0 | 0 |
+| re-derived, res: `PrimTy` | 0 | 0 |
+| re-derived, res: `Pending` | 11,416 | 11,416 |
+| re-derived, res: OTHER | 0 | 0 |
+| impl head slot: `Def` | 3,888 | 3,888 |
+| impl head slot: `PrimTy` | 5,686 | 5,686 |
+| impl head slot: `Pending` | 5,772 | 5,772 |
+
+Byte-identical. The counters are bumped inside the accessor now rather than at
+each call site, and there are still exactly two callers, so a total that moved
+would have meant the hoist changed which nodes reach the derivation. It
+decomposes with no remainder on both runs - `re-derived` equals `res: Pending`
+exactly, and the four impl-head slots sum to the 15,346 calls - which is the
+same shape 8.29's four-corpus table has, reproduced here through a rebuild.
+
+`make test` OVERALL PASS (unit ok, 178 compile-fail, 38 projects), `b1-check`
+B1=0 B4=0 18 sites on all three Windows sections, both unmoved.
+
+#### The ratchet does not move, and 8.29 was wrong to expect it to
+
+8.29 closed by noting the de-duplication was still available. A handoff written
+beside it added that doing it would move `lane-check` and need a re-pin. **It
+does not.** `lane-gate.py` counts calls to the five per-kind lookups, and 8.29
+had already removed the only one in this block when it deleted the
+declaration-index step; the four lines left contain none. Measured before and
+after: LOOKUP 127 (20 files), REENTRY 6 (5 files), unchanged, no re-pin.
+
+The general point is the one 7.2 makes about the ratchet: it pins a named
+surface, not "code that looks like resolution". Predicting it will move because
+a call site changes file is predicting from the shape of the change rather than
+from what the gate measures.
+
+#### A dead local the previous change orphaned
+
+`decl_visit_emitter.cryo` still declared `di_ptr` for the declaration-index step
+8.29 deleted. The compiler had been reporting it as an unused variable; the
+warning total falls 352 -> 351 with its removal.
+
+### 8.31 `()` is a primitive spelling, and one predicate answers for all of them 2026-09-01
+
+The unit type was the last written spelling an impl head could not stamp. It is
+now `PrimTy`, on the same terms as every other primitive: it owns members
+without being declared, so no scope binds it and no export set carries it, and
+its spelling is its registration key - the declaration index already registered
+`()` beside the scalars.
+
+**There were TWO predicates answering "is this spelling a primitive", and they
+already disagreed.** `ResBase::is_primitive_spelling` served the scope lane;
+the lexer's keyword table (`TokenType::from_keyword(..).is_primitive_type()`)
+served the annotation lane. Their difference was not `()` alone:
+
+| in | not in | spellings |
+|---|---|---|
+| the list | the keyword table | `void` |
+| the keyword table | the list | `int`, `uint`, `float`, `double`, `va_list` |
+
+The annotation lane carried a comment naming the keyword table the authority and
+arguing a second list is "a place for the two to disagree, and the disagreement
+would be silent". The reasoning was right and the conclusion inverted: the second
+list already existed, one file over, and had already disagreed on six names.
+**The keyword table cannot be the survivor, because `()` is punctuation and no
+keyword spells it** - a table that cannot express a primitive cannot be the
+authority on which spellings are primitive. The list wins, and both lanes ask it.
+
+MEASURED before the switch, not after. A probe logged every spelling where the
+two predicates disagree, over two corpora: the compiler's own sources (33,666
+spellings offered to the stamp) and a project compiling 56 stdlib modules.
+**Zero disagreements on either.** The cause is upstream: the parser turns a
+keyword primitive into a `PrimitiveAnnotation` and `()` into an empty
+`TupleAnnotation`, so a keyword spelling never arrives here as a written name.
+What does arrive is an impl head's target TEXT, which is how `()` reaches the
+predicate at all.
+
+#### The list is NOT the set of every type keyword, and `float` is why
+
+Completing the list from the keyword table would have been the obvious tidy-up
+and it is wrong. `float`, `int`, `uint` and `double` are alias keywords, and a
+module may be named for one - **`float` IS one**, `std::fmt::float`, with 7 live
+call sites of the form `float::parse_f64(..)`. The scope lane consults this
+predicate for a qualifier, so answering `PrimTy` for `float` would name the
+primitive in every file that does not import the module. The predicate holds the
+spellings no module can also own; the alias keywords stay out, and the doc
+comment says so at the definition.
+
+#### Measured, on one project compiling the stdlib
+
+309 impl heads reached name resolution. Before: 307 stamped, **2 declined** -
+`Drop for ()` in `stdlib/core/drop.cryo` and a probe's own `Tag for ()`. The
+control was to swap the probe's target from `()` to a struct: declines fell 2 to
+1 and stamps rose 307 to 308, which is what identifies the declines as the unit
+heads rather than something else that happens to number two.
+
+After: **309 stamped, 0 declined.** Five counter rows moved out of 180, and every
+delta accounts for those same two heads - `stamped PrimTy` 189 -> 191, impl-head
+slot `PrimTy` 378 -> 382 against `Pending` 244 -> 240 (the four consultations the
+two heads draw), and `UNSTAMPED bare name not in scope` 2 -> 0. The slot split
+sums to 858 on both sides. **Nothing else moved**, which is the control for the
+predicate switch: `stamped PrimTy` rose by the two units rather than falling, so
+no keyword-only spelling lost an answer it had been getting.
+
+`make test` OVERALL PASS, `b1-check` B1=0 B4=0 18 sites on all three sections,
+`lane-check` 127/6 - none of them moved.
+
+### 8.32 A direct call's return type comes from the stamp, not an ownerless leaf 2026-09-01
+
+`resolve_direct_call` asked `lookup_func_return` twice: once on the name
+qualified with the file's home namespace, and on failure again on the BARE
+leaf. The second is the shape 7.2's corollary names as the mechanical origin of
+B1 - `if (a) { .. } else { try_another_way() }` for the same question - and the
+site's own comment already called it "a second, more permissive door" whose
+plural-leaf case "is the defect". The bare `func_returns` map is program-wide
+and carries no owner, so a leaf two modules spell answers from whichever
+registered last.
+
+It now reads `ident.res`. MEASURED over the population that actually takes the
+door, before the change: **40 fires, 40 carrying `Res::Def`, 40 reaching the
+pointer-identical `TypeRef`** the bare lookup produced. No `Pending`, no
+`stamp-EMPTY`, no `stamp-DIFFERENT`. The counter says 40 and the probe emitted
+40 rows, which is the control that says no row was dropped.
+
+#### The whole population says the home guess is redundant too
+
+A second probe covered every call, not only the widening ones.
+`resolve_direct_call` is reached **68 times** on the compiler's own sources:
+
+| `res` | home lookup | stamp | rows |
+|---|---|---|---:|
+| `Def` | empty | answers | 40 |
+| `Def` | empty | empty | 26 |
+| `Def` | hit | SAME | 2 |
+
+Every call carries `Def`; nothing is `Pending`. The home-qualified lookup
+answers **2 of 68**, and the stamp reaches the identical type in both. So the
+stamp strictly dominates: it answers everything the home guess answers and 40
+more, and collapsing the two into one read is available.
+
+**It was not taken here, and the reason is a gate rather than a doubt.** The
+bare branch carries the visibility check `enforce_callee_visibility` reaches
+through as door 4 (E0353). Door 4 measures 0 on this corpus, and that zero has
+no control: the corpus that names a module its writer cannot see is the
+compile_fail corpus, which never reaches the end-of-run report - the same
+reason `vis_gate_reject` is emitted at the refusal rather than tallied. Moving
+the check would also make it fire for the 2 calls the home lookup serves, which
+currently bypass it, and that changes what a program compiles to. Left as a
+separate question with its own measurement.
+
+#### The row moved buckets; it did not stop being recorded
+
+The site is renamed `FnBindStampedRet`, "return type from the stamp (home
+missed)", and reflagged **B3**. It reads an authoritative answer now, so
+counting it against a target of zero would make `B1 == 0` false for a
+legitimate site - the mistake 7.3 records about `canonical_qualified`.
+
+`b1-gate` reports the old row GONE (was 4), and asks for the mechanism before a
+re-pin, because a row can also fall by stopping being recorded. The control:
+on the gate's own target, `B3 return type from the stamp (home missed)` reads
+**4** - the same population, the same count, a different bucket.
+
+B1 stays 0 and B4 stays 0. `make test` OVERALL PASS (178 compile-fail, 38
+projects). `lane-check` 127/6, unmoved: the file still makes one
+`lookup_func_return` call in this function, under a better key.
+
+### 8.33 M4's scan answers nothing on three populations, and the fourth is UNMEASURED 2026-09-01
+
+The mono bare-name template scan is a deletion candidate: it is called and it
+answers nothing. Measured, per population, one process each with
+`CRYO_CODEGEN_THREADS=1`:
+
+| population | blocks | scan calls | scan hits |
+|---|---:|---:|---:|
+| native - 14 examples + the compiler's own sources | 15 | 6,840 | **0** |
+| cross-target - the other OS's platform-gated modules | 3 | 4,134 | **0** |
+| the 41 projects, individually | 41 | 7,986 | **0** |
+| **total** | **59** | **18,960** | **0** |
+
+59 counter blocks from 59 files: the block count equals the file count, which is
+the control that says no run contributed silently nothing.
+
+**It is still not certified, and the missing population is the one that has
+already burned this exact deletion.** The `tests/` tree compiles orphan modules
+no `cryo build` reaches, and it cannot be measured with this instrument:
+`cryo test` forks per test, counters are per-process, and the parent's stderr is
+all a caller captures. The run yields ONE block in which **every row is zero** -
+not the scan's rows alone, every row - so the process being measured compiled
+nothing. That is an empty process, not a population reading zero.
+
+This is the distinction 8.25 records from the other side: `resolve_struct_literal`'s
+last resort was deleted on a zero and the suite went red, because the corpus that
+exercised it was the one the measurement had not reached. A zero needs a control
+that says what would have to be true for it to be zero for an uninteresting
+reason, and here the uninteresting reason is confirmed.
+
+**So the scan stays.** What would certify it is an instrument that tallies the
+CHILD processes - per-test counter files, or an in-process test driver - not
+another corpus run through the same tool. Recorded so the three-population zero
+is not mistaken for a complete one.
