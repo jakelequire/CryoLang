@@ -1971,6 +1971,43 @@ public:
         return SymbolStr::empty();
     }
 
+    /// The module whose REGISTERED NAME ends with `path`, or empty when none
+    /// does.  An import may spell a suffix of a module's registered name
+    /// (`core::option` for `std::core::option`), so a direct graph lookup can
+    /// miss a module that is present.
+    ///
+    /// The suffix must land on a segment boundary, so `ture` does not name
+    /// `std::future`.  `Resolver::ns_written_as` states that same rule, but
+    /// over a module's NAMESPACE and checking both characters of the `::`
+    /// where this checks one; the two are not interchangeable until someone
+    /// decides which relation import resolution is entitled to, so this does
+    /// not call it.
+    ///
+    /// `kind` names the audit row: the caller knows whether it is resolving an
+    /// import head or a sub-module, and the row cannot say so on its own.
+    module_by_path_suffix(&this, path: string, kind: string) -> SymbolStr {
+        ResolveCounter::Site::M5Calls.bump();
+        const count: i64 = this.ctx.module_graph.module_count() as i64;
+        const path_len: i64 = path.length() as i64;
+        for (mut k: i64 = 0; k < count; k++) {
+            const candidate: ModuleInfo* = this.ctx.module_graph.get_module(k);
+            const cand_name: string = this.resolver.intern_table.resolve(candidate.name);
+            const cand_len: i64 = cand_name.length() as i64;
+            if (cand_len < path_len) { continue; }
+            const suffix: string = cand_name + (cand_len - path_len);
+            if (!suffix.eq(path)) { continue; }
+            if (cand_len == path_len || cand_name[cand_len - path_len - 2] == ':') {
+                ResolveCounter::Site::M5Hits.bump();
+                ResolveCounter::path_hit(
+                    kind,
+                    this.resolver.intern_table.resolve(this.resolver.current_module),
+                    path, cand_name);
+                return candidate.name;
+            }
+        }
+        return SymbolStr::empty();
+    }
+
     /// Binds what an `import` - or an `export` - names into the current scope.
     ///
     /// An export is deliberately NOT branched on here.  It grants an importer
@@ -2009,37 +2046,14 @@ public:
             // module graph's file path lookup.  The ImportResolution pass
             // may have stored the resolved path; search all modules for one
             // whose import-path suffix matches.
-            // Use module_count() for the bound; method calls resolve
-            // correctly through the pointer chain, whereas .modules.length
-            // loses type info when accessed through this.ctx.
-            ResolveCounter::Site::M5Calls.bump();
-            const _mod_count: i64 = this.ctx.module_graph.module_count() as i64;
-            for (mut k: i64 = 0; k < _mod_count; k++) {
-                const candidate: ModuleInfo* = this.ctx.module_graph.get_module(k);
-                const cand_name: string = this.resolver.intern_table.resolve(candidate.name);
-                // Check if the candidate's name ends with the import path.
-                // e.g., "std::core::option" ends with "core::option".
-                const cand_len: i64 = cand_name.length() as i64;
-                const path_len: i64 = module_path.length() as i64;
-                if (cand_len >= path_len) {
-                    const suffix: string = cand_name + (cand_len - path_len);
-                    if (suffix.eq(module_path)) {
-                        // Verify it's either an exact match or preceded by "::"
-                        if (cand_len == path_len || cand_name[cand_len - path_len - 2] == ':') {
-                            ResolveCounter::Site::M5Hits.bump();
-                            ResolveCounter::path_hit(
-                                "M5-IMPORT",
-                                this.resolver.intern_table.resolve(
-                                    this.resolver.current_module),
-                                module_path, cand_name);
-                            module_sym = candidate.name;
-                            LOG_DEBUG(LogComponent::General,
-                                "[NameResolver] resolved import '%s' -> '%s'",
-                                module_path, cand_name);
-                            break;
-                        }
-                    }
-                }
+            const suffix_match: SymbolStr =
+                this.module_by_path_suffix(module_path, "M5-IMPORT");
+            if (suffix_match.is_valid()) {
+                module_sym = suffix_match;
+                LOG_DEBUG(LogComponent::General,
+                    "[NameResolver] resolved import '%s' -> '%s'",
+                    module_path,
+                    this.resolver.intern_table.resolve(module_sym));
             }
         }
 
@@ -2153,29 +2167,9 @@ public:
                     // (mirrors the module_sym resolution at the top of process_import).
                     const sub_idx: i64 = this.ctx.module_graph.find_module_index(sub_sym);
                     if (sub_idx < 0) {
-                        ResolveCounter::Site::M5Calls.bump();
-                        const _sub_mod_count: i64 = this.ctx.module_graph.module_count() as i64;
-                        for (mut sk: i64 = 0; sk < _sub_mod_count; sk++) {
-                            const sub_cand: ModuleInfo* = this.ctx.module_graph.get_module(sk);
-                            const sub_cand_name: string = this.resolver.intern_table.resolve(sub_cand.name);
-                            const sub_cand_len: i64 = sub_cand_name.length() as i64;
-                            const sub_path_len: i64 = sub_path.length() as i64;
-                            if (sub_cand_len >= sub_path_len) {
-                                const sub_suffix: string = sub_cand_name + (sub_cand_len - sub_path_len);
-                                if (sub_suffix.eq(sub_path)) {
-                                    if (sub_cand_len == sub_path_len || sub_cand_name[sub_cand_len - sub_path_len - 2] == ':') {
-                                        ResolveCounter::Site::M5Hits.bump();
-                                        ResolveCounter::path_hit(
-                                            "M5-SUBMOD",
-                                            this.resolver.intern_table.resolve(
-                                                this.resolver.current_module),
-                                            sub_path, sub_cand_name);
-                                        sub_sym = sub_cand.name;
-                                        break;
-                                    }
-                                }
-                            }
-                        }
+                        const sub_match: SymbolStr =
+                            this.module_by_path_suffix(sub_path, "M5-SUBMOD");
+                        if (sub_match.is_valid()) { sub_sym = sub_match; }
                     }
                     // Import all public exports from the resolved sub-module.
                     const sub_exports: SymbolID[] = this.resolver.get_exports(sub_sym);

@@ -7520,3 +7520,73 @@ reason, and here the uninteresting reason is confirmed.
 CHILD processes - per-test counter files, or an in-process test driver - not
 another corpus run through the same tool. Recorded so the three-population zero
 is not mistaken for a complete one.
+
+### 8.34 The first deletion: four dead functions, and one scan that is now one scan 2026-09-02
+
+Mechanism 2 says every string-keyed lookup reachable from `sema`, `mono` or
+`codegen` ceases to EXIST, because a stage cannot re-derive what it has no
+function to call. Measuring and proving dead had been happening for weeks;
+removing had not. This is the first removal.
+
+| removed | where | control |
+|---|---|---|
+| `qualify_symbol` | `compilation_context.cryo` | its only textual mention is a comment |
+| `qualify_name` | `compilation_context.cryo` | one caller, and it was `qualify_symbol` |
+| `qualify(leaf) -> QualifiedName` | `compilation_context.cryo` | no caller |
+| `qualify(sym) -> SymbolStr` | `codegen/ops/declaration_emitter.cryo` | no caller |
+| `resolve_type_qualified_name_bare` | `resolver/resolver.cryo` | no caller; its `_from` sibling has 4, which is what says the grep would have found one |
+
+#### `qualify` was three functions, and one of them is live
+
+An inventory that reports "`qualify`, 0 callers" is reading a name, not a
+symbol. **Three** definitions carry it: the two above, and
+`codegen/context.cryo`'s, which `decl_visit_emitter` reaches through `this.cg`
+- a `CodegenContext*`, so that call resolves to the third. It is not touched.
+The error would have gone both ways at once: one too few deleted, and one
+deleted that is called.
+
+#### D2: the two M5 suffix scans are one scan, and are NOT deleted
+
+`process_import` carried the same suffix-match loop twice - once for the import
+head, once for a sub-module - differing only in variable names and the audit
+row they emit. They are now one `module_by_path_suffix`.
+
+**Factored rather than deleted, deliberately.** The scan's counters read 4
+calls and **0 hits** over 59 blocks (native, cross-target, the 41 projects),
+which looks like the same evidence 8.33 gathered for M4. It is not comparable
+evidence: 4 calls is not a population, and the corpus that exercises import
+resolution hardest is `tests/`, which 8.33 established cannot be measured with
+this instrument at all. A zero over 4 calls, with the relevant corpus missing,
+is not grounds for deleting a branch of import resolution. Factoring gets the
+same line saving and needs no zero.
+
+The helper preserves the loop character for character, so the gates are a clean
+control on a purely structural change - and they did not move: `lane-check`
+127/6, `b1-check` B1=0 B4=0 17 sites on all three sections, `make test` OVERALL
+PASS (178 compile-fail, 38 projects), all identical to the run immediately
+before the change.
+
+**A third copy of the boundary rule exists and was left alone.**
+`Resolver::ns_written_as` states the same "suffix must land on a `::` boundary"
+rule, over a module's NAMESPACE rather than its registered NAME, and checks
+both characters of the `::` where this checks one. Making the helper call it
+would fold three copies into two and is probably right - but it is a stricter
+relation, so it is a behaviour change, not a de-duplication, and it is not what
+this change is.
+
+#### Still standing, and it is correctness debt
+
+**D1 is a different pair from the one 8.30 deduped, and it is still two hand-
+maintained copies.** `canonical_type_qname` (`declaration_emitter.cryo`) and
+`canonical_impl_target` (`decl_visit_emitter.cryo`) both run the same three-step
+cascade - cursor-qualified, then bare, then the arena's bare-name alias - then
+ask the arena for the qualified name, differing only in which qualifier they
+mint and what they fall back to. 8.30 deduped `declare_impl_block` against
+`generate_impl_block`; these are the *other* pair in the same two files, and
+nothing has merged them.
+
+The code's own comment says what disagreement costs: a method declared under
+one key and defined under another leaves the declaration bodyless, and LLVM
+rejects the module. Two copies of the rule that decides that key is the same
+hazard 8.30 records, unfixed. Not addressed here because it needs the same
+measured treatment 8.30 got, not a textual merge.
