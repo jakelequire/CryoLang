@@ -348,61 +348,6 @@ type struct AbiClassifier {
         return this.classify_signature(params, return_type, is_variadic);
     }
 
-    /// Classify a method signature.  The implicit receiver (a `&this` /
-    /// `mut &this` pointer, or a by-value `this` struct copy in the
-    /// rare case where the user wrote `this` by value) is always
-    /// treated as `Direct`: it is either already a pointer or a value
-    /// the caller has passed in a register the same way the underlying
-    /// scalar would be.  Future phases may revisit by-value `this` once
-    /// eightbyte classification lands; for now structures-by-value go
-    /// through the same Direct path as today.
-    ///
-    /// `this_llvm_ty` is the LLVM type of the receiver slot - typically
-    /// `T*` for the common `&this`/implicit form.  Passing it in directly
-    /// keeps this function decoupled from the receiver-resolution logic
-    /// in `declare_method`.
-    classify_method_signature(mut &this,
-                              this_llvm_ty: LType,
-                              has_explicit_self: boolean,
-                              params: TypeRef[],
-                              return_type: TypeRef,
-                              is_variadic: boolean) -> SignaturePlan {
-        // For methods we don't yet feed the receiver through the
-        // classifier; pre-pend a `Direct` plan for it so call sites see
-        // a uniform `param_plans` shape.  Once eightbyte classification
-        // arrives this is the seam where by-value `this` will be split
-        // correctly.
-        const return_plan: ParamPlan = this.classify_return(return_type);
-
-        mut param_plans: ParamPlan[] = [];
-        if (this_llvm_ty.is_valid()) {
-            mut slots: LType[] = [];
-            slots.push(this_llvm_ty);
-            param_plans.push(ParamPlan {
-                cryo_type:  TypeRef::invalid(),
-                cls:      ArgClass::Direct,
-                llvm_slots: slots,
-                attr:       AbiAttr::None,
-                pointee_ty: LType::null(),
-            });
-        }
-        for (mut i: i64 = 0; i < params.length; i++) {
-            param_plans.push(this.classify_param(params[i]));
-        }
-
-        const sret: boolean = return_plan.cls == ArgClass::Indirect;
-        const llvm_fn_ty: LType = AbiClassifier::build_llvm_fn_type(
-            return_plan, param_plans, is_variadic);
-
-        return SignaturePlan {
-            return_plan:  return_plan,
-            param_plans:  param_plans,
-            llvm_fn_type: llvm_fn_ty,
-            sret_slot:    sret,
-            is_variadic:  is_variadic,
-        };
-    }
-
 
     // Per-type classification
 
@@ -1212,7 +1157,6 @@ type struct AbiClassifier {
             }
         }
     }
-
 
 
     // Free-function helpers

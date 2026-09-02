@@ -43,16 +43,6 @@ type enum OutputKind {
 }
 
 implement enum OutputKind {
-    /// Map the kind to LLVM's `LLVMCodeGenFileType` value where one
-    /// applies (Asm = 0, Object = 1).  Returns -1 for kinds that
-    /// don't go through `LLVMTargetMachineEmitToFile`.
-    llvm_file_type(&this) -> i32 {
-        return match (this) {
-            OutputKind::Asm    => {  0 }
-            OutputKind::Object => {  1 }
-            _                  => { -1 }
-        };
-    }
 
     is_override(&this) -> boolean {
         return match (this) {
@@ -584,49 +574,6 @@ public:
         return this.intern_table.intern(ns + "::" + bare);
     }
 
-    /// `qualify_symbol_sym`, judged against the module that WROTE the syntax
-    /// rather than the module the compiler is standing in.
-    ///
-    /// PROBE FORM: this returns the CURSOR's answer, unchanged, and only
-    /// records what the span's home module would have minted.  The flip is a
-    /// separate, measured step and cannot be done wholesale: a qualifier
-    /// minted here is matched later by a lookup that mints it the same way, so
-    /// both sides read the cursor and therefore AGREE WITH EACH OTHER even
-    /// where both are wrong.  Changing one side alone unpairs them, which is
-    /// why a divergence row is evidence about a site and not yet a defect.
-    ///
-    /// `span_file` is the node's own `span.file`, so the answer travels with
-    /// the syntax rather than with the walk.  A file that names no module in
-    /// the graph (a synthesized node, single-file mode) is recorded as
-    /// `Cursor`, never folded into agreement: "provenance was unavailable" and
-    /// "provenance agreed" are different findings, and merging them is what
-    /// would let a guess be reported as an authoritative answer.
-    ///
-    /// The home lookup is behind the audit flag because `ns_sym_of_file` is a
-    /// linear scan over the module graph and this sits in a hot path.  So
-    /// `QualSymCalls` IS the control for the other three: read as zero with
-    /// the probe off, `QualSymDiff` says nothing at all.
-    qualify_symbol_sym_at(mut &this, sym: SymbolStr, site: string,
-                          span_file: string) -> SymbolStr {
-        const cursor: SymbolStr = this.qualify_symbol_sym(sym);
-        if (!ResolveCounter::Audit::Scope.enabled()) { return cursor; }
-        ResolveCounter::Site::QualSymCalls.bump();
-        const cursor_ns: string = this.namespace_display();
-        const home: SymbolStr = this.module_ns_sym_of_file(span_file);
-        if (!home.is_valid()) {
-            ResolveCounter::Site::QualSymCursor.bump();
-            ResolveCounter::qual_sym_diff(site, span_file, "", cursor_ns,
-                                          this.intern_table.resolve(sym));
-            return cursor;
-        }
-        ResolveCounter::Site::QualSymSyntax.bump();
-        const home_ns: string = this.intern_table.resolve(home);
-        if (home_ns != cursor_ns) { ResolveCounter::Site::QualSymDiff.bump(); }
-        ResolveCounter::qual_sym_diff(site, span_file, home_ns, cursor_ns,
-                                      this.intern_table.resolve(sym));
-        return cursor;
-    }
-
     /// Qualify `sym` under an extern-module binding namespace when
     /// `binding_namespace` is set, otherwise under the file's ambient
     /// namespace (`qualify_symbol_sym`).  Used for the struct/enum/typedef
@@ -662,7 +609,7 @@ public:
         const di: DeclarationIndex* = this.decl_index;
         const arena: TypeArena* = this.type_arena;
         mut tref: TypeRef = di.lookup_type(
-            this.qualify_symbol_sym_at(name, "wrap/de-canon-typeref", ""));
+            this.qualify_symbol_sym(name));
         if (!tref.is_valid()) { tref = di.lookup_type(name); }
         if (!tref.is_valid()) { tref = arena.lookup_by_name(name); }
         return tref;
@@ -685,7 +632,7 @@ public:
             const q: SymbolStr = arena.get_qualified_name(tref);
             if (q.is_valid()) { return q; }
         }
-        return this.qualify_symbol_sym_at(name, "wrap/de-canon-qname", "");
+        return this.qualify_symbol_sym(name);
     }
 
 
@@ -758,23 +705,6 @@ public:
         }
     }
 
-    /// Initialize the module loader for import resolution.
-    /// Called by the ImportResolution pass.
-    init_module_loader(mut &this) -> void {
-        // Will create ModuleLoader with include_paths when defined.
-    }
-
-    /// Initialize the code generation backend.
-    /// Called by the TypeLowering pass.
-    init_codegen(mut &this) -> void {
-        // Will create LLVM context and module when @cImport is available.
-    }
-
-    /// Initialize the directive registry.
-    /// Called by the DirectiveProcessing pass.
-    init_directives(mut &this) -> void {
-        // Will create DirectiveRegistry when defined.
-    }
 
     /// Record a source span that ConfigGating stripped as inactive for the
     /// target OS (a decl / method / inline block gated to another platform).
@@ -795,10 +725,6 @@ public:
         this.diagnostics.emit(Diagnostic::error(code, message));
     }
 
-    /// Emit a warning diagnostic.
-    emit_warning(mut &this, code: ErrorCode, message: string) -> void {
-        this.diagnostics.emit(Diagnostic::warning(code, message));
-    }
 
     /// Emit an error with source location.
     emit_error_at(mut &this, code: ErrorCode, message: string, span: SourceSpan) -> void {
@@ -817,10 +743,6 @@ public:
         this.diagnostics.emit(diag);
     }
 
-    /// Emit a note diagnostic.
-    emit_note(mut &this, code: ErrorCode, message: string) -> void {
-        this.diagnostics.emit(Diagnostic::note(code, message));
-    }
 
     /// Emit a help message (code E0000, severity Help).
     emit_help(mut &this, message: string) -> void {
@@ -856,13 +778,6 @@ public:
 
 
     // Provision tracking
-
-    /// Check whether a provision has been satisfied.
-    /// Provisions are marked exclusively by PassRegistry::run_all() using
-    /// metadata from PassID::metadata(); this is a read-only query.
-    has_provided(&this, p: Provision) -> boolean {
-        return this.provisions.has(p);
-    }
 
 
     // Module-level reset (stdlib batch mode)
