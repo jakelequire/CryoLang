@@ -7769,3 +7769,601 @@ the example named nothing; it now uses `body_ns_diff`, which is gated on
 `Audit::Scope` and makes the same point. A deleted symbol surviving inside the
 rationale for a design is how a comment starts describing a tree that is no
 longer there.
+
+### 8.38 The import-cycle ordering casualties are gone, and 8.2ak describes a tree that no longer exists - MEASURED 2026-09-02
+
+8.2ak measured 333 unstamped annotations on `examples/09-json-config` and
+classified 106 of them as real types that went unstamped because "the export
+table is filled in module processing order, so a module whose declarer has not
+been walked yet cannot be answered". It named that the import-cycle population,
+put it at 4% of annotations, and made it "the question that has to be answered
+before any consumer may treat `Pending` as an ICE".
+
+That account rests on the resolver filling its export table during the same
+walk that reads it. The code does not do that, and has not since `c5e7c434` -
+the day after 8.2ak was written.
+
+#### One caller, and it is a whole sweep earlier
+
+`NameResolver::forward_declare` is what reaches `export_symbol`, and it has
+exactly one caller: `NameDeclarationPass::run`. `run_module_resolution` runs
+AutoImport + ImportResolution + NameDeclaration across EVERY module, and only
+then NameResolution across every module. The export table is therefore complete
+before any module's resolving walk begins.
+
+That is the property itself, not a mitigation of its absence: no module order
+can put every declarer first inside a cycle, so declaring every module before
+resolving any is what makes the invariant hold by construction. 8.2ak's
+"populated per module by the forward-declare sweep of `visit(ProgramNode*)`" is
+stale in the literal sense - `forward_declare` is not reachable from
+`visit(ProgramNode*)` at all.
+
+#### Measured, two corpora, `[host:windows]`, at `651a9ba3`
+
+| outcome | `examples/09-json-config` | `compiler/` |
+|---|---:|---:|
+| annotations offered to the stamp | 3848 | 33323 |
+| stamped `Def` | 2893 | 32203 |
+| stamped `GenericParam` | 753 | 917 |
+| stamped `PrimTy` | 194 | 194 |
+| stamped `TypeRelative` | 8 | 8 |
+| UNSTAMPED span names no module | 0 | 0 |
+| UNSTAMPED module has no scope | 0 | 0 |
+| **UNSTAMPED bare name not in scope** | **0** | **1** |
+
+`qualified spelling` is a subset marker on the way in, not a disjoint bucket:
+36 on the compiler corpus, of which 8 leave as `TypeRelative` and 28 as
+`ANN-ROOTED` answers folded into `Def`. With that read, both columns close
+exactly - 2893+753+194+8 = 3848, and 32203+917+194+8+1 = 33323 - with no
+residue on either.
+
+#### What makes the zero readable
+
+* The population GREW rather than shrank: the same project offered 2,699
+  annotations when 8.2ak measured it and offers 3,848 now, and the compiler
+  corpus is 8.7x larger again. A zero over a vanished population would be the
+  uninteresting reason, and this is not one.
+* The stream is live. `ANN-UNSTAMPED` is emitted per name, and on the compiler
+  corpus it fired - once. 28 `ANN-ROOTED` rows and the `PATH-*` traffic appear
+  in the same logs, so a silent stream is ruled out.
+* `ANN-QUALIFIED` is 0 on both, so nothing is parked in the qualified-refusal
+  exit either.
+
+#### The one survivor is a different defect
+
+The single unstamped annotation across all of `compiler/src` is `CompileMode`
+in `Compiler::Passes::DirectiveProcessing`
+(`passes/directive_processing.cryo:1780`). That is the module/type name
+collision already on record as unimplemented and awaiting a decision - a
+namespace and a type contesting one leaf. It is not an ordering casualty, and
+no pass reordering would answer it.
+
+#### Consequence for the privatization buckets
+
+Bucket C was carried as "gated on the import cycle", and the honest limit
+recorded against it was that no per-site stamp probe had ever been run to say
+which sites were actually blocked. The blocking condition is a `Pending` stamp,
+and the stamp is answered 33322 of 33323 times on the compiler's own source.
+There is no ordering blocker left for those sites to be gated on.
+
+### 8.39 Three decisions: the stamp is authoritative, Function folds into Value, modules bind in the type namespace 2026-09-02
+
+#### 1. A `Res` stamp is AUTHORITATIVE, not advisory
+
+A consumer that reads a stamp takes the answer. It does not read the stamp and
+then fall back to a name lookup when the answer does not suit it. Every
+"stamp first, then the old cascade" site is therefore wrong by construction
+rather than merely suspect, and needs no per-site argument to remove - only the
+measurement that says what the old lane was answering.
+
+This is what licenses deleting a lane on its own numbers. It does NOT license
+deleting every second lane: a lane addressing a key space no `Res` can name is
+a different question, not a second answer to this one. The extern-module alias
+lane in the global cascade is the worked example - see 8.40.
+
+Two sites already in violation, both now straightforwardly wrong:
+
+* `call_specializer.cryo:2542` and `:2577` branch on `is_pending()` as a
+  DECISION. `res.cryo`'s own contract forbids exactly that: the predicate is
+  "for DIAGNOSING an unstamped node at a consumer that holds it, never for
+  deciding what to do about one", because a consumer that branches on absence
+  is the fallback the type exists to make unwriteable.
+* `sema.cryo:3162` reads the stamp, then falls to `lookup_type_by_sym`, then to
+  `resolve_primitive` - six answering paths for one name.
+
+#### 2. `Namespace::Function` folds into `Namespace::Value`
+
+Rust's model. Two of the three arms are never constructed anywhere in the tree,
+so this collapses dead code toward the intended end state rather than changing
+what any program means. The third namespace is reserved for macros, which are
+wanted long after the v1.0 freeze; spending it on a Function/Value split that
+nothing constructs would spend it on nothing.
+
+`namespace.cryo` opens with a 20-line argument for the three-namespace model it
+does not implement. When the arms collapse, that prose goes with them.
+
+#### 3. Modules become bindings in the TYPE namespace
+
+Rust's model, and it retires the parked "module/type collision needs a
+decision" item. The collision is not a design question awaiting a bespoke
+precedence rule; it is the consequence of Cryo never declaring a module as a
+`Symbol` at all. With modules bound in the type namespace, a module and a type
+contesting one leaf is an ordinary duplicate definition, diagnosed by the rule
+that already exists.
+
+`CompileMode` at `passes/directive_processing.cryo:1780` - the single
+unstamped annotation left across `compiler/src` in 8.38's measurement - is
+expected to fall out of this rather than needing its own treatment. It is not a
+straggler; it is where the missing structure shows through.
+
+To be SCOPED before implementing. It is the largest of the three and it is
+structural.
+
+#### The rule these three share
+
+The prose in `resolver/` is ahead of its code in several places: a namespace
+model whose arms are never built, a `TypeRelative` variant given four
+paragraphs of justification that `resolve_path` has never produced (both its
+callers pass a one-element array, so `trailing` is always 0), and a stated
+"no variant means missing" alongside a `def_name()` that returns an
+empty-string sentinel. 8.2ak's stale premise rode three weeks of handoffs on
+exactly that kind of confident writing. When one of these files is touched, the
+prose is brought to what the code does.
+
+### 8.40 Line endings: `git ls-files --eol` is the authority, and byte counts are not 2026-09-02
+
+Three consecutive handoffs recorded the tree's line-ending state, in
+alternating directions, and all three were wrong. Each measured by counting
+bytes in the working tree. That is the wrong instrument, and the reason is
+structural rather than a slip.
+
+`.gitattributes` sets `* text=auto eol=lf`: LF in the repository AND in the
+working tree, for every text file. `git ls-files --eol` reports index state,
+worktree state and the governing attribute together:
+
+    i/lf    w/lf    attr/text=auto eol=lf   compiler/src/.../sema.cryo
+    i/lf    w/crlf  attr/text=auto eol=lf   docs/name-resolution.md
+
+Every file in this tree is `i/lf`. The files that read as CRLF are `w/crlf`
+DEVIATIONS from the policy, not a convention to be matched. So the advice each
+handoff derived from its byte count - "this file is CRLF, preserve it on
+write" - perpetuates the deviation, and a handoff that carries it instructs the
+next session to keep doing so.
+
+A byte count also cannot see the attribute, which is what makes the working
+tree change under a reader: `git checkout -- <path>` restores the file to
+policy LF. A session that measured CRLF before a checkout and patched with
+CRLF anchors afterwards finds its anchors do not match. That happened here, and
+the `count == 1` assert caught it - the same guard that caught the collapsed
+escape sequences.
+
+**The rule: write LF. Verify with `git ls-files --eol`, never by counting
+CR bytes.** A byte count answers a question about one drifted worktree file;
+`--eol` answers the question that was meant, which is what the repository
+holds and what the attribute requires.
+
+### 8.41 The global cascade is a stamp lane and an alias lane 2026-09-02
+
+`resolve_scope_resolution` asked three questions to find the global a
+`A::B` path names: a key built from the WRITTEN qualifier, then a linear scan
+over every module global matching a namespace SUFFIX, then the BARE member
+leaf. Measured over four corpora before changing anything:
+
+| corpus | 1 spelling | 2 scan | 3 bare leaf | none |
+|---|---:|---:|---:|---:|
+| `examples/09-json-config` | 0 | 106 | 0 | 0 |
+| `compiler/` | 0 | 422 | 0 | 0 |
+| `ffi_c_import` (`cryo test`) | 51 | 140 | 0 | 0 |
+| `tests/` whole tree | 11 | 584 | 0 | 10 |
+| total | 62 | 1252 | 0 | 10 |
+
+Step 2 is now one stamp read: `scope_global_type` takes the qualifier's
+`Res::Def`, appends the written member leaf, and asks once. On all 1,252 the
+stamp reached the POINTER-IDENTICAL `TypeRef` the scan returned - no
+disagreement, and no case where the scan answered and the stamp did not. Step 3
+is deleted on 0 of 1,314, which 8.39 licenses without further argument.
+
+#### The alias lane is a different question, not a second answer
+
+Step 1 stays, and the reason is measured rather than argued: its 62 answers are
+all C-import constants (`cit::FLAG_A`), and on every one the stamp answered
+NOTHING. An `extern module` alias is not a Cryo module, the name layer declares
+no module symbol for one, so no `Res` can name it; bindgen registers each
+constant under the bare alias. That is a key space `Res` does not address,
+which is what distinguishes it from a fallback.
+
+#### The corpus that mattered was reachable only by the other tool
+
+On `examples/` and `compiler/` alone, step 1 answers ZERO and reads as dead.
+Deleting it there would have broken C imports silently. The population lives in
+`tests/tests/projects/ffi_c_import`, whose bindings are in the project's own
+`tests/` subdir - compiled by `cryo test` and NOT by `cryo build`. A right
+corpus reached with the wrong tool measures a confident zero over nothing.
+
+#### A door was improved, not closed
+
+`lane-check` did not move, and that was predicted: `lookup_global_exact` and
+`lookup_global_in_scope` never matched the gate's `.lookup_global(` pattern, so
+the two `DeclarationIndex.lookup_global` sites this work was filed under are
+untouched. **Improving a cascade and closing a door are different work.** The
+door needs the alias key space AND codegen's `resolve_global`, which is live
+traffic (285 hits / 970 misses over the four corpora) with no `Res` available
+after sema.
+
+The same split holds for the other two doors examined: `lookup_func_return`
+keeps a C-import site (`try_resolve_cimport_function`) and a codegen site;
+`lookup_method_return` keeps a post-monomorphisation site keyed by a mangled
+instantiation name, which a `Res` cannot serve by construction. Counting DI
+callers predicts neither the work nor the outcome.
+
+#### The five lookups do not close INDIVIDUALLY, and the reason repeats
+
+Three doors were examined at caller level and none of them closes, each
+stopped by the same two things:
+
+| door | blocker 1 | blocker 2 |
+|---|---|---|
+| `lookup_global` | `cit::FLAG_A` alias key space | codegen `resolve_global` |
+| `lookup_func_return` | `try_resolve_cimport_function` | codegen `symbol_resolver` |
+| `lookup_method_return` | - | post-mono mangled instantiation key |
+
+Neither blocker is a caller that has not been converted yet. An `extern module`
+alias is a key space `Res` does not model at all, and codegen runs after sema
+holding names rather than nodes; the third door swaps blocker 1 for an
+instantiation name, which 8.20 already established a `Res` cannot name.
+
+So "N callers, staged, one door at a time" is the wrong shape for this work,
+and the DI caller count is not a measure of it - it was wrong about the work
+AND about the outcome three times running. The doors close when the ALIAS KEY
+SPACE and CODEGEN'S POSITION are addressed as their own items. Until then a
+caller conversion improves a cascade, which is worth doing on its own merits,
+but it does not retire a lookup and `lane-check` will not move for it.
+
+### 8.42 A subsystem built on every compile that nothing ever read 2026-09-02
+
+`ModuleGraph.cross_module_fns` was populated for every function of every module
+on every build - a `lookup_func_type`, an arena fetch and a parameter-array
+copy each - and its only reader, `find_cross_module_fn`, had no callers at all.
+The comment at its call site already said so. Codegen resolves cross-module
+references through `SymbolResolver` and never consulted it.
+
+Removed: the descriptor type, the field and its initializer, the registrar, the
+reader, the producer, and the per-module loop that drove it.
+
+Predicted before running, and confirmed: `lane-check` 122 -> **119** with all
+three from `module_graph.cryo` (the producer held the only three per-kind
+lookups in that file), `b1-check` UNCHANGED at B1=0 B4=0 17 sites on all three
+targets, `make test` OVERALL PASS 178 / 38 / 0.
+
+The falsifier was any counter movement whatever: a subsystem nothing reads
+cannot change a measurement, so a moved counter would have meant something did
+read it. Nothing moved.
+
+One movement was NOT predicted and is explained rather than waved at: warnings
+349 -> 348. The deleted producer nested `for (mut i: i64 ...)` inside another
+loop over `i`, and that shadow was one warning.
+
+#### Open, and it needs a decision
+
+8.32 measured that `resolve_direct_call`'s stamp strictly dominates its
+home-qualified guess - 40 answers the guess misses, identical `TypeRef` on the
+2 it serves - and deliberately did NOT collapse them, because the losing branch
+carries `enforce_callee_visibility` (E0353) and moving the check makes it fire
+for those 2 calls, which currently bypass it. 8.39 makes the stamp
+authoritative, which points at collapsing; but the collapse changes what an
+existing program compiles to, and that is not a consequence to take silently.
+**Left standing pending a ruling.**
+
+### 8.43 `resolve_method_owner` is not a stamp conversion - MEASURED 2026-09-02
+
+Queued as one of "the two cascades" to convert by 8.32's method. It is not one,
+and both halves of that judgement are measured rather than argued.
+
+`MOWNER-STEP`, one row per outcome:
+
+| corpus | 0 none | 1 as-is | 2 qualified | 3 cross-module |
+|---|---:|---:|---:|---:|
+| `examples/09-json-config` | 8509 | 6491 | 18 | 56 |
+| `tests/` whole tree | 65751 | 57167 | 154 | 644 |
+
+**The widening steps are LIVE.** 798 answers on `tests/` between them, and
+step 3 answers more than step 2. There is no zero here to delete on, so the
+shape that made the global cascade collapsible is absent.
+
+**And the stamp answers a disjoint population.** At the one caller that holds a
+node (`call_resolver` scope-call), comparing the cascade's returned owner
+against the scope segment's stamp gives **STAMP-SAME = 0** over 8,029 rows -
+and every `STAMP-DIFFERENT` is the cascade returning NO owner, 0 of them a real
+disagreement. Where the stamp names a definition the cascade finds nothing;
+where the cascade finds an owner the stamp is not a `Def` at all. There is
+nothing to replace, because the two never answer the same call.
+
+That is consistent with what the function is for: it reports WHICH of several
+candidate names carries a method, and a method's owner is not the thing the
+scope segment's stamp names. It is a name-keyed search, so it belongs to the
+string seam and will be answered when that seam carries a `Res` - not by a
+per-site stamp read.
+
+#### The probe was wrong twice before it was right
+
+First it compared the stamp against the cascade's FIRST step, which on the
+global cascade never fires - measuring a door that never opens says nothing.
+Then it reported `STAMP-DIFFERENT` without separating "the cascade returned a
+different owner" from "the cascade returned nothing", which are opposite
+conclusions from one label. Both were caught by asking what the number would
+have to mean, not by the build. A comparison probe must record what the
+incumbent answered, not only whether the two strings matched.
+
+### 8.44 An unqualified call took a same-leaf function's signature - MEASURED AND FIXED 2026-09-02
+
+`lookup_callee_function_type` asked two spelling-keyed questions for an
+identifier callee: the name qualified with the WRITING module, then the BARE
+leaf. Its own comment said the bare slot "stays load-bearing", and it does -
+but it is single-slot last-write-wins across every module declaring that leaf,
+and nothing had ever measured what it answers with.
+
+Measured over four corpora, comparing each against what the incumbent door
+actually returned:
+
+| outcome | `09-json` | `compiler` | `tests` | `ffi` |
+|---|---:|---:|---:|---:|
+| 1-home, stamp agrees | 724 | 2907 | 7040 | 1217 |
+| 2-bare, stamp agrees | 20 | 1571 | 8387 | 157 |
+| 2-bare, stamp silent | 73 | 2149 | 278 | 226 |
+| 1-home, stamp silent | 0 | 0 | 22 | 0 |
+| **2-bare, stamp DISAGREES** | 0 | 0 | **18** | 0 |
+
+#### The 18, and why the stamp is the right one
+
+All 18 are unqualified calls to `sleep` and `write` in test modules that
+import them. The stamp says `std::time::clock::sleep` and
+`std::fs::file::write` - what the writing scope bound. The bare slot returned a
+DIFFERENT `TypeRef`, because three modules declare `sleep`
+(`ffi::libc::sleep(u32) -> u32`, `thread::sleep(u64) -> void`,
+`time::clock::sleep(Duration) -> void`) and five declare `write`, with
+signatures that have nothing in common. Home-qualification cannot save it: an
+IMPORTED function is qualified by the declaring module, not the calling one, so
+the home key misses and the leaf answers.
+
+This type is what expected-type propagation hands the arguments, and the site's
+own comment records the consequence - a generic-enum literal argument then
+never instantiates and codegen drops its payload store.
+
+#### The stamp does NOT dominate, and the fix does not pretend it does
+
+2,653 calls take the bare door where the stamp is silent. That is why the
+spelling lookups stay: the stamp is asked FIRST and settles the question
+whenever it makes a claim, and the spelling keys answer only where it makes
+none. That is 8.39's rule applied exactly - a consumer takes the stamp's answer
+where there is one - and NOT "the stamp replaces the cascade", which the
+measurement would not support.
+
+#### A stamp read that does not move the ratchet
+
+The read is `DeclarationIndex::func_type_of_res(r)`, keyed by the `Res`.
+Inlining a `lookup_func_type` call at the site would have taken `lane-check`
+from 119 to 120 - regrowth, which is what the ratchet exists to catch - for a
+change that is architecturally the right direction. A `Res`-keyed accessor on
+the owner is the way the gate says to add one: the call site does not match the
+five patterns, and the owner's own internal call is excluded. This is decision
+2's shape and not a facade, because the public signature takes a `Res` and not
+a string.
+
+Predicted before running and confirmed: `lane-check` **119, unmoved**,
+`b1-check` UNCHANGED at B1=0 B4=0 17 sites on all three targets, `make test`
+OVERALL PASS 178 / 38 / 0, `make lsp` clean. The only behaviour change is those
+18 calls, which now use the signature of the function the call actually names.
+
+### 8.45 Scope: replacing the string seam with the `Res` seam
+
+The type layer already consults the new name layer - it just receives the
+answer as a canonical STRING. `canonical_type_name` asks
+`resolve_type_qualified_name_from` with the annotation's home scope and falls
+back to `resolve_type_qualified_name` on the ambient chain. Because that string
+is accurate, the later steps of `resolve_named`'s cascade are never reached,
+which is why the cascade can stand while B1 reads 0.
+
+#### What is actually in it, counted by symbol
+
+Four definitions in `resolver.cryo` (`resolve_type_qualified_name`, and the
+`_from`, `_strict_from`, `_bare_from` variants) and **nine** call sites - not
+the 44 a raw grep suggests. Five are internal to `resolver.cryo` or are the
+NAME layer producing stamps (`name_resolution.cryo:1459`, `:1494`), which is
+the seam's correct side and stays. The consumer side is **three**:
+`types/resolver.cryo:1553` and `:1556` (both inside `canonical_type_name`) and
+`sema/type_utils.cryo:384`.
+
+`canonical_type_name` has exactly ONE caller: step 3 of `resolve_named`.
+
+#### What it touches, and why the threading is small
+
+`resolve_named(name, ctx)` takes a SPELLING plus a `ResolutionContext` whose
+fields are strings and `TypeRef`s - no `Res` anywhere. Its entry point
+`resolve_named_at_span(name, span, ctx)` derives the home module from the SPAN,
+which is the string-shaped stand-in for the stamp.
+
+That entry point has **two callers**, `types/resolver.cryo:376` and `:1895`,
+and BOTH are `TypeAnnotation::Named` dispatch arms holding the annotation node.
+The node already carries the answer: 8.38 measured the annotation stamp
+answered 33,322 of 33,323 on the compiler's own source. So the work is to pass
+the node's `ResSlot` where the span is passed now, and to have step 3 read it
+instead of rebuilding the name.
+
+#### It stages, in three steps with a measurement between each
+
+1. Thread the `ResSlot` to `resolve_named` and PROBE only - for every
+   annotation reaching step 3, does the stamp's `Res::Def` reach the same
+   `TypeRef` `canonical_type_name` produced? Nothing changes behaviour.
+2. Make the stamp authoritative where it answers, keeping the string path only
+   for where it does not, exactly as 8.44 did for the callee type.
+3. Delete `canonical_type_name` and the two consumer-side variant calls once
+   the population reaching them is zero, with the call count as the control.
+
+#### The prediction, stated before step 1 runs
+
+Agreement, not coverage, is the risk: coverage is already known to be
+33,322/33,323. So the prediction is that step 1 reports STAMP-SAME for
+substantially all annotations reaching step 3, with any `STAMP-DIFFERENT`
+being a real disagreement about which declaration a written type names - the
+same shape as 8.44's 18, and to be investigated as a defect rather than
+smoothed over. A material `INCUMBENT-ONLY` population means the stamp does not
+dominate and step 2 keeps the string path for it, which 8.44 establishes is a
+normal outcome rather than a failure.
+
+The probe must record WHAT THE INCUMBENT ANSWERED, not merely whether two
+values matched - 8.43 records what happens twice when it does not.
+
+### 8.46 The visibility gate 8.32 parked on would not have fired - MEASURED 2026-09-02
+
+8.32 measured that `resolve_direct_call`'s stamp strictly dominates its
+home-qualified guess and then declined to collapse the two, on this reason:
+the losing branch carries `enforce_callee_visibility`, and "moving the check
+would also make it fire for the 2 calls the home lookup serves, which currently
+bypass it, and that changes what a program compiles to."
+
+That was a hypothesis about what WOULD happen, and it was never run. Running it
+means asking the gate's own conditions at the home-lane exit without changing
+anything.
+
+| corpus | home-lane calls | would REJECT (E0353) |
+|---|---:|---:|
+| `compiler/` | 2 | **0** |
+| `tests/` whole tree | 64 | **0** |
+| `ffi_c_import` | 48 | **0** |
+
+Every one is `would-SKIP:same-module`. Simulating the gate on what the STAMP
+lane would actually hand it - the single qualified alternative, which is the
+value the existing code passes - gives `alt-SKIP:same-module` for all of them
+too; the 12 on `tests/` with no single alternative are calls the stamp lane
+does not offer to the gate at all.
+
+#### The reason is structural, not incidental
+
+`qualify_symbol_sym_home` qualifies with the module that WROTE the call. A name
+that lookup answers is therefore declared in the caller's own module - and the
+gate's first exemption is a module calling its own items (spec §4). A private
+callee in ANOTHER module cannot be reached through this door, so the door
+cannot be the thing shielding one.
+
+So the parked reason is neither of the two shapes it could have had. It is not
+"collapsing introduces E0353 for two real violations", and it is not "the gate
+would wrongly reject two legitimate calls". **The gate is a no-op over this
+population**, and the blocker does not exist.
+
+#### Stated as a property, because it cannot drift
+
+This is not a number that needs re-measuring as the tree changes. It follows
+from two facts that are true by construction: the home lane's key is built by
+`qualify_symbol_sym_home`, which qualifies with the module the call was WRITTEN
+in; and the gate's first exemption is a module calling its own items. A name
+the home lane answers is therefore declared in the caller's own module, and no
+such call can be a cross-module privacy violation. The measurement above is a
+control on that reasoning, not the reason.
+
+#### The identity check ran, and the collapse is taken
+
+The binding axis was the remaining question - 8.32 had established identical
+`TypeRef`s on one corpus only. Re-measured over all three, recording what the
+incumbent answered: **114 of 114 STAMP-SAME** (2 `compiler/`, 64 `tests/`, 48
+`ffi_c_import`), with no `STAMP-DIFFERENT`, no `STAMP-EMPTY`, and no call where
+the home lane answered while the stamp did not.
+
+So the home-qualified lane answered the same declaration wherever it answered
+at all, and it is deleted. `resolve_direct_call` now asks the stamp and nothing
+else. `lane-check` 119 -> **118**, predicted before it was run, one row off
+`call_resolver.cryo`.
+
+### 8.48 The bare function-type slot names a different declaration for 245 calls - MEASURED 2026-09-02
+
+`DeclarationIndex.func_type_refs` is ONE slot per LEAF for the whole program,
+last-write-wins across every module that declares that leaf. 8.44 fixed a
+consumer that read it; this records what is actually in it, because the
+exposure is a property of the map and not of that consumer.
+
+Measured by asking, at every call whose identifier carries a stamp, what the
+bare leaf would have returned and which declaration owns it:
+
+| corpus | call sites where they differ |
+|---|---:|
+| `compiler/` | 7 |
+| `tests/` whole tree | 234 |
+| `ffi_c_import` | 4 |
+
+Twenty distinct leaves on `tests/` alone. Six of the collisions are stdlib
+against stdlib, so they are not an artefact of test naming:
+
+| leaf | the stamp names | the bare slot holds |
+|---|---|---|
+| `sleep` | `std::time::clock::sleep` | `std::thread::sleep` |
+| `read` | `std::fs::file::read` | `std::core::intrinsics::read` |
+| `write` | `std::fs::file::write` | `std::core::intrinsics::write` |
+| `malloc` | `std::ffi::libc::malloc` | `std::core::intrinsics::malloc` |
+| `free` | `std::ffi::libc::free` | `std::alloc::heap::free` |
+| `byte_at` | `std::encoding::base64::byte_at` | `std::net::ws::frame::byte_at` |
+
+#### Realized versus latent, kept apart
+
+245 is the EXPOSURE - calls where the two disagree about which declaration the
+name means. The REALIZED subset is 8.44's 18: the calls that actually reached
+the bare door, because the module-qualified lane missed as well. The rest were
+shielded by that lane rather than by anything checking the answer.
+
+Since 8.44 the stamp is asked first, so all 245 now bind the declaration the
+name resolves to. The bare door still stands for the 2,653 calls where the
+stamp is silent, and nothing establishes that those are collision-free - that
+population has not been measured, and a leaf-keyed answer there is exposed in
+exactly the same way.
+
+#### A correction to what was reported in conversation
+
+The `sleep` collision was described mid-session as involving
+`ffi::libc::sleep(u32) -> u32`. That was inferred from three `sleep`
+declarations existing, and it is wrong: the bare slot holds
+`std::thread::sleep`. Three do exist and any of them could have been the
+last writer, which is the point - WHICH one it is was never a property of the
+program, only of registration order. The inference was reported before it was
+measured, and the measurement disagrees with it.
+
+
+### 8.47 The two `is_pending` decisions: one is dead, one is a boundary 2026-09-02
+
+`res.cryo` states that `is_pending` is "for DIAGNOSING an unstamped node at a
+consumer that holds it, never for deciding what to do about one", because a
+consumer that branches on absence is the fallback the type exists to make
+unwriteable. Two sites in `call_specializer.cryo` branched on it. Measured
+before touching either:
+
+| site | `examples` | `compiler` | `tests` | `ffi` |
+|---|---:|---:|---:|---:|
+| `scoped_template_from_stamp` | 0 | 0 | 0 | 0 |
+| `find_function_template_for_call` | 1 | 19 | 64 | 32 |
+
+**The first never fires on any corpus** - the slot is never null and never
+pending there - so the guard decided nothing. It is removed: `require` yields
+`Err` for an unanswered slot and the match below declines it exactly as it
+declines a non-definition, so the outcome is identical and the forbidden shape
+is gone.
+
+#### The second is extern and intrinsic names, and it is PARKED
+
+The 116 pending askers were emitted by name. They are `strlen` and the
+`atomic_*` family - `extern "C"` twins and compiler intrinsics. That is NOT the
+post-monomorphisation case where a `Res` cannot name an instantiation; it is
+the same class `enforce_callee_visibility` already exempts as "not a module
+member to enforce against".
+
+Removing this guard would put 116 calls through `require`, each recording a
+pending bug, which prints on an otherwise successful build. That is
+user-visible output, so it is written up rather than taken. The question it
+raises is the useful one: an `extern "C"` function IS declared, so whether
+these are legitimately unstampable or simply unstamped is a real question, and
+the answer decides whether the guard becomes a documented boundary or the nodes
+get stamped.
+
+#### The comment that contradicted its own file
+
+The doc comment two definitions below claimed `is_pending` is "used for
+diagnosis here and nowhere else" - falsified by the two sites above, in the
+same file. It turned out to be a stale paragraph left standing in front of the
+comment that replaced it, so the file stated both the old claim and the new one
+at once. Removed.
