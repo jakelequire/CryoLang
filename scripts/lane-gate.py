@@ -207,7 +207,7 @@ def main():
     live_totals = {k: sum(v.values()) for k, v in counts.items()}
 
     if args.update:
-        with open(GOLDEN, "w", encoding="utf-8") as fh:
+        with open(GOLDEN, "w", encoding="utf-8", newline=chr(10)) as fh:
             fh.write(render(counts))
         print("lane-gate: golden updated -- LOOKUP = %d, REENTRY = %d"
               % (live_totals["LOOKUP"], live_totals["REENTRY"]))
