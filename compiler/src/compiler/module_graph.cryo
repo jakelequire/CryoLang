@@ -193,27 +193,6 @@ type struct ModuleInfo {
 
 }
 
-/// Function descriptor saved between compilation units.
-/// Uses TypeRefs directly from the shared TypeArena; no lossy conversion
-/// to a simplified type representation.  The TypeArena is global and
-/// persists across all modules, so these refs remain valid.
-type struct CrossModuleFnDescriptor {
-    name:        SymbolStr;
-    return_type: TypeRef;
-    param_types: TypeRef[];
-    is_var_arg:  boolean;
-
-    static new(name: SymbolStr, ret: TypeRef) -> CrossModuleFnDescriptor {
-        return CrossModuleFnDescriptor {
-            name:        name,
-            return_type: ret,
-            param_types: [],
-            is_var_arg:  false,
-        };
-    }
-}
-
-
 /// Tracks modules and their dependency relationships for multi-module and
 /// stdlib batch compilation.
 type struct ModuleGraph {
@@ -224,7 +203,6 @@ type struct ModuleGraph {
     /// diagnostic; before this the cycle was reported to the debug channel
     /// only, so a plain build printed "1 errors" and nothing else.
     topo_unplaced:    u32[];
-    cross_module_fns: CrossModuleFnDescriptor[];
 
     // Per-module AST storage: raw pointer array to avoid array[i]=x codegen bug
     module_ast_buf: void*;       // malloc'd buffer of ProgramNode* pointers
@@ -260,7 +238,6 @@ type struct ModuleGraph {
             modules:          [],
             topo_order:       [],
             topo_unplaced:    [],
-            cross_module_fns: [],
             module_ast_buf:   ast_buf,
             module_ast_cap:   initial_cap,
             module_sources:   [],
@@ -526,21 +503,6 @@ type struct ModuleGraph {
         return this.topo_order.length == n;
     }
 
-    /// Register a cross-module function descriptor.
-    register_cross_module_fn(mut &this, desc: CrossModuleFnDescriptor) -> void {
-        this.cross_module_fns.push(desc);
-    }
-
-    /// Look up a cross-module function by name.  Returns null if not found.
-    find_cross_module_fn(&this, name: SymbolStr) -> CrossModuleFnDescriptor* {
-        for (mut i: int = 0; i < this.cross_module_fns.length; i++) {
-            if (this.cross_module_fns[i].name.equals(name)) {
-                return &this.cross_module_fns[i];
-            }
-        }
-        return null;
-    }
-
     /// Transitive import closure of module `root` (including `root` itself),
     /// returned as a per-module-index boolean set of length `n`.  Follows
     /// `ModuleInfo.dependencies` edges via the name index; dependencies that
@@ -621,53 +583,6 @@ type struct ModuleGraph {
         return true;
     }
 
-    /// Build cross-module function descriptors for a specific module.
-    /// Looks up each function's FunctionType in the DeclIndex -> arena to get
-    /// the full signature (return type, param types, variadic flag).
-    static build_cross_module_descriptors(
-        graph: ModuleGraph*, module_sym: SymbolStr,
-        decl_index: DeclarationIndex*, arena: TypeArena*) -> void {
-        if (graph == null || decl_index == null || arena == null) { return; }
-
-        const funcs: SymbolStr[] = decl_index.get_functions_in_module(module_sym);
-        for (mut i: i64 = 0; i < funcs.length; i++) {
-            const fn_name: SymbolStr = funcs[i];
-            const func_type_ref: TypeRef = decl_index.lookup_func_type(fn_name);
-
-            if (func_type_ref.is_invalid()) {
-                // No FunctionType registered; use return-type-only fallback
-                const ret_type: TypeRef = decl_index.lookup_func_return(fn_name);
-                if (ret_type.is_valid()) {
-                    graph.register_cross_module_fn(CrossModuleFnDescriptor::new(fn_name, ret_type));
-                }
-                continue;
-            }
-
-            // Look up the FunctionType in the arena to get full signature
-            const ty: Type* = arena.lookup(func_type_ref.id);
-            if (ty == null || ty.kind != TypeKind::Function) {
-                const ret_type: TypeRef = decl_index.lookup_func_return(fn_name);
-                if (ret_type.is_valid()) {
-                    graph.register_cross_module_fn(CrossModuleFnDescriptor::new(fn_name, ret_type));
-                }
-                continue;
-            }
-
-            const ft: FunctionType* = ty as FunctionType*;
-            // Independent copy of `param_types` (TypeRef is Copy): the descriptor
-            // owns its array, so aliasing `ft.param_types` here would free the
-            // FunctionType's buffer twice.
-            mut pt_copy: TypeRef[] = [];
-            for (mut i: i64 = 0; i < ft.param_types.length; i++) { pt_copy.push(ft.param_types[i]); }
-            const desc: CrossModuleFnDescriptor = CrossModuleFnDescriptor {
-                name:        fn_name,
-                return_type: ft.return_type,
-                param_types: pt_copy,
-                is_var_arg:  ft.is_variadic,
-            };
-            graph.register_cross_module_fn(desc);
-        }
-    }
 
 }
 
