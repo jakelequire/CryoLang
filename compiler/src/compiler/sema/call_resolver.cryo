@@ -221,6 +221,23 @@ type struct CallResolver {
             // IMPORTED free function is qualified by neither module - its
             // qualified name is the DECLARING one - and only the bare lookup
             // can reach it.
+            // The stamp is the writing scope's own answer for this callee and
+            // names ONE declaration, so it settles the question whenever it
+            // makes a claim.  The spelling-keyed lookups below cannot: the
+            // bare slot is last-write-wins across every module declaring the
+            // leaf, and an imported `sleep` reached that way takes whichever
+            // `sleep` registered last - a different signature entirely, which
+            // is then what expected-type propagation hands the arguments.
+            match (ident.res) {
+                ResSlot::Answered(r) => {
+                    const via_res: TypeRef = this.ctx.decl_index.func_type_of_res(r);
+                    if (via_res.is_valid()) { return via_res; }
+                }
+                _ => { }
+            }
+            // The stamp claimed nothing, so the written spelling is all there
+            // is: an imported free function is qualified by neither the calling
+            // module nor the compiler's own, and only the bare slot reaches it.
             const q_sym: SymbolStr =
                 this.ctx.qualify_symbol_sym_home(ident.name, ident.span.file);
             const qual: TypeRef = this.ctx.decl_index.lookup_func_type(q_sym);
@@ -2853,15 +2870,13 @@ type struct CallResolver {
                 return (fp_t as FunctionType*).return_type;
             }
         }
-        // R4: prefer the current-module qualified definition over a same-leaf
-        // function in another unit (fixes the #9 last-write-wins collision).
-        const qual_name: SymbolStr = this.ctx.qualify_symbol_sym_home(ident.name, ident.span.file);
-        mut func_ret: TypeRef = this.types.lookup_func_return(qual_name);
-        if (!func_ret.is_valid()) {
-            // The name layer's own answer for this callee.  It is a canonical
-            // name, so it names ONE declaration; the bare leaf this used to
-            // ask carries no owner, so a plural leaf answered from whichever
-            // module happened to register it last.
+        // The name layer's own answer for this callee, and the only one asked.
+        // It is a canonical name, so it names ONE declaration.  Qualifying the
+        // leaf with the writing module answered the same declaration wherever
+        // it answered at all, and asking the bare leaf answers from whichever
+        // module registered it last - which is a different function.
+        mut func_ret: TypeRef = TypeRef::invalid();
+        {
             mut stamped_q: SymbolStr = SymbolStr::empty();
             match (ident.res) {
                 ResSlot::Answered(r) => { stamped_q = r.def_name(); }
