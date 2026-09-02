@@ -253,25 +253,6 @@ type enum Site {
     BodyNsCursor;
     BodyNsDiff;
 
-    // Ambient-cursor divergence (§2b, §5.2), measured where the true scope is
-    // KNOWN: the home-module preference step.  There a caller has said which
-    // module the annotation was written in, so the module-blind chain can be
-    // re-run and compared.  §6's caveat is that the cursor contaminates any
-    // measurement of itself; this is the one place that is not true.
-    //
-    // Read CursorSame/CursorDiff FIRST.  A comparison where home and cursor
-    // are the same module proves nothing - one scope was in play, so
-    // agreement is forced.  DiffPlural is the control on that control: scope
-    // can only change an answer when the leaf has more than one declaring
-    // module.  With DiffPlural at zero, a zero Diverge says nothing about
-    // scope; it says the corpus has no collisions.
-    HomeCursorSame;
-    HomeCursorDiff;
-    HomeDiffPlural;
-    HomeAgree;
-    HomeDiverge;
-    HomeBlindMiss;
-
     // What remains of the namespace-suffix matchers.  M1 is a CHECK: it
     // validates an answer already chosen against the qualifier the source
     // wrote.  It produces no binding of its own, which is why its rows are
@@ -375,21 +356,6 @@ type enum Site {
     /// synthesizer, and leaving it unstamped is what makes it reportable
     /// instead of silently re-derived downstream.
     SynthScopeResNoName;
-
-    /// Where the QUALIFIER minted by `qualify_symbol_sym` came from.  A bare
-    /// leaf is qualified with the module the compiler is STANDING IN, which is
-    /// the right answer only while a pass walks a module's own declarations in
-    /// order; it is the wrong one for any syntax re-visited from elsewhere.
-    /// `Diff` is the population that matters: the names whose writing module
-    /// and ambient cursor disagree, i.e. the set the cursor mis-qualifies.
-    ///
-    /// `Calls` is bumped at every probed site, so `Syntax + Cursor` failing to
-    /// sum to it means a site is reaching the unprobed entry point - which
-    /// looks identical to "the cursor always agreed" if only `Diff` is read.
-    QualSymCalls;
-    QualSymSyntax;
-    QualSymCursor;
-    QualSymDiff;
 
     /// Impl heads reached by the async-declare walk, and the share of them the
     /// walk actually consumes.
@@ -644,10 +610,6 @@ implement enum Site {
             Site::ScopeUseSyntax        => { "   " }
             Site::ScopeUseCursor        => { "   " }
             Site::ScopeUseDiff          => { "   " }
-            Site::QualSymCalls          => { "   " }
-            Site::QualSymSyntax         => { "   " }
-            Site::QualSymCursor         => { "   " }
-            Site::QualSymDiff           => { "!! " }
             Site::DefaultArgNoOwner     => { "!! " }
             Site::VisFastpath           => { "   " }
             Site::VisWouldReject        => { "!! " }
@@ -679,12 +641,6 @@ implement enum Site {
             Site::BodyNsSyntax          => { "   " }
             Site::BodyNsCursor          => { "   " }
             Site::BodyNsDiff            => { "   " }
-            Site::HomeCursorSame        => { "   " }
-            Site::HomeCursorDiff        => { "   " }
-            Site::HomeDiffPlural        => { "   " }
-            Site::HomeAgree             => { "   " }
-            Site::HomeDiverge           => { "!! " }
-            Site::HomeBlindMiss         => { "   " }
             Site::M1AgreeCalls          => { "B1 " }
             Site::M1AgreeHits           => { "B1 " }
             Site::M1QualReject          => { "   " }
@@ -821,10 +777,6 @@ implement enum Site {
             Site::ScopeUseSyntax        => { "scope use site from the SYNTAX's own module" }
             Site::ScopeUseCursor        => { "  no provenance: fell back to the cursor" }
             Site::ScopeUseDiff          => { "  syntax != cursor (the mis-judged set)" }
-            Site::QualSymCalls          => { "qualify_symbol_sym probed calls" }
-            Site::QualSymSyntax         => { "  span names a module (provenance available)" }
-            Site::QualSymCursor         => { "  no provenance: fell back to the cursor" }
-            Site::QualSymDiff           => { "  syntax != cursor (the MIS-QUALIFIED set)" }
             Site::DefaultArgNoOwner     => { "default arg expanded with NO owning module" }
             Site::VisFastpath           => { "single-candidate fast path taken" }
             Site::VisWouldReject        => { "  WOULD BE REJECTED once gated" }
@@ -856,12 +808,6 @@ implement enum Site {
             Site::BodyNsSyntax          => { "body annots: the body's OWN file" }
             Site::BodyNsCursor          => { "  no provenance: fell back to the cursor" }
             Site::BodyNsDiff            => { "  syntax != cursor (the mis-judged set)" }
-            Site::HomeCursorSame        => { "home == ambient cursor (proves nothing)" }
-            Site::HomeCursorDiff        => { "home != ambient cursor (the evidence)" }
-            Site::HomeDiffPlural        => { "  of those, leaf declared by >1 module" }
-            Site::HomeAgree             => { "  both chains agreed" }
-            Site::HomeDiverge           => { "  blind chain binds a DIFFERENT type" }
-            Site::HomeBlindMiss         => { "  blind chain answers nothing" }
             Site::M1AgreeCalls          => { "M1 CHECK qualifier_agrees calls" }
             Site::M1AgreeHits           => { "M1 CHECK qualifier_agrees agreed" }
             Site::M1QualReject          => { "  CHECK rejected the leaf answer" }
@@ -1034,8 +980,8 @@ implement enum Audit {
 // ---- Audit emitters ----------------------------------------------------
 //
 // Free functions rather than methods on `Audit`, deliberately.  A method would
-// be callable on any variant - `Audit::Leaf.scope_diverge(...)` would compile
-// and then gate a SCOPE-DIVERGE line on `CRYO_LEAF_AUDIT`.  That is a silent
+// be callable on any variant - `Audit::Leaf.body_ns_diff(...)` would compile
+// and then gate a BODY-NS line on `CRYO_LEAF_AUDIT`.  That is a silent
 // mis-gating bug of exactly the kind this module exists to catch.  Each
 // emitter below names its own stream once, in one place.
 
@@ -1301,15 +1247,6 @@ public function trait_decl_lookup(site: string, key: string,
                  site, key, outcome);
 }
 
-/// Print one annotation whose meaning DEPENDS on having a scope: the module
-/// it was written in binds `name` to `home_qn`, the ambient chain binds it to
-/// `blind_qn`, and they are not the same type.
-public function scope_diverge(home: string, name: string,
-                              home_qn: string, blind_qn: string) -> void {
-    if (!Audit::Scope.enabled()) { return; }
-    fmt::eprintf("SCOPE-DIVERGE\t%s\t%s\t%s\t%s\n", home, name, home_qn, blind_qn);
-}
-
 /// Print one body-annotation context where the module that WROTE the body and
 /// the ambient cursor name different modules (§8, task #7).
 ///
@@ -1322,25 +1259,6 @@ public function body_ns_diff(file: string, syntax_ns: string,
                              cursor_ns: string) -> void {
     if (!Audit::Scope.enabled()) { return; }
     fmt::eprintf("BODY-NS\t%s\t%s\t%s\n", file, syntax_ns, cursor_ns);
-}
-
-/// One qualifier mint: which call site asked, the file the syntax was written
-/// in, what that file's module would qualify with, what the ambient cursor
-/// qualified with, and the bare leaf.
-///
-/// Emitted on EVERY probed call, not only the diverging ones, so that a zero
-/// in `QualSymDiff` stays re-derivable offline by a comparison this compiler
-/// did not perform.  A zero computed only by the `!=` inside the probe would
-/// be its own control; an awk pass over the stream is not.
-///
-/// `site` is passed by the CALLER rather than derived here, for the reason
-/// `resolve_scoped` documents: one location inside the wrapper would collapse
-/// every caller into itself and report the wrapper as the whole population.
-public function qual_sym_diff(site: string, file: string, syntax_ns: string,
-                              cursor_ns: string, bare: string) -> void {
-    if (!Audit::Scope.enabled()) { return; }
-    fmt::eprintf("QUAL-SYM\t%s\t%s\t%s\t%s\t%s\n",
-                 site, file, syntax_ns, cursor_ns, bare);
 }
 
 /// Print one MONO-side resolution context, naming (a) the file whose syntax it
@@ -1478,10 +1396,6 @@ public function report() -> void {
     Site::ScopeUseSyntax.print_row();
     Site::ScopeUseCursor.print_row();
     Site::ScopeUseDiff.print_row();
-    Site::QualSymCalls.print_row();
-    Site::QualSymSyntax.print_row();
-    Site::QualSymCursor.print_row();
-    Site::QualSymDiff.print_row();
     Site::DefaultArgNoOwner.print_row();
     Site::VisFastpath.print_row();
     Site::VisWouldReject.print_row();
@@ -1518,14 +1432,6 @@ public function report() -> void {
     Site::BodyNsCursor.print_row();
     Site::BodyNsDiff.print_row();
 
-    fmt::eprintf("\n-- ambient-cursor divergence (spec §2b, §5.2) ---------\n");
-    fmt::eprintf("     (CRYO_SCOPE_PROBE only; all zero without it)\n");
-    Site::HomeCursorSame.print_row();
-    Site::HomeCursorDiff.print_row();
-    Site::HomeDiffPlural.print_row();
-    Site::HomeAgree.print_row();
-    Site::HomeDiverge.print_row();
-    Site::HomeBlindMiss.print_row();
 
     fmt::eprintf("\n-- namespace-suffix matchers --------------------------\n");
     Site::M1AgreeCalls.print_row();

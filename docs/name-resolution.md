@@ -7730,3 +7730,42 @@ It had none. `CodegenContext::qualify` was its only remaining user and was
 itself uncalled once 8.35 landed - 8.34 had kept it because
 `decl_visit_emitter` reached it through `this.cg`, and 8.35 removed that call.
 The site string is retired with the function.
+
+### 8.37 The reporting the probes fed is removed with them 2026-09-02
+
+8.36 retired `qualify_symbol_sym_at` and `probe_ambient_divergence` and left
+their reporting standing. This removes it: `qual_sym_diff`, `scope_diverge`,
+ten `Site` variants - four `QualSym*`, six `Home*` - the print block for the
+ambient-cursor section, and `audit_registry_key`, which had no caller at all.
+
+An audit stream is normally kept even when it reads zero, because the ability
+to measure is the thing of value and a zero is a finding. That reasoning does
+not reach these. What produced their rows is gone, so they cannot read
+anything: they print zero because nothing can bump them, not because a
+population measured zero. Keeping them would preserve the shape of a
+measurement without its capacity, which is the same defect the probes
+themselves were.
+
+`Audit::Scope` is NOT removed. `rn_trace` still gates on it, and
+`CRYO_SCOPE_PROBE` still switches a real stream.
+
+#### The control on the b1 gate, and the one that nearly misread it
+
+None of the ten variants is an asserted row, so removing them cannot move
+`b1-check` - which held at B1=0 B4=0, 17 sites, all three sections. That claim
+survived a scare worth recording: a search of the golden for `home` returns
+six hits, which reads as "the Home rows ARE pinned". They are
+`2c  home-module (ambient cursor)`, the label of `RnHomeModule` - a different,
+live variant, untouched here. A broad grep answering a question about a
+specific symbol is how a live row gets deleted; the narrow search was the
+correct one and the broad one was the false alarm.
+
+#### One comment named a function that no longer exists
+
+The `Audit` emitters carry a comment explaining why they are free functions
+rather than methods, using `Audit::Leaf.scope_diverge(...)` as the
+counterexample that would compile and mis-gate. With `scope_diverge` deleted
+the example named nothing; it now uses `body_ns_diff`, which is gated on
+`Audit::Scope` and makes the same point. A deleted symbol surviving inside the
+rationale for a design is how a comment starts describing a tree that is no
+longer there.
