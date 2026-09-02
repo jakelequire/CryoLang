@@ -7590,3 +7590,64 @@ one key and defined under another leaves the declaration bodyless, and LLVM
 rejects the module. Two copies of the rule that decides that key is the same
 hazard 8.30 records, unfixed. Not addressed here because it needs the same
 measured treatment 8.30 got, not a textual merge.
+
+### 8.35 D1: the canonical name is derived once 2026-09-02
+
+8.34 left `canonical_type_qname` (`declaration_emitter.cryo`) and
+`canonical_impl_target` (`decl_visit_emitter.cryo`) standing as two hand-
+maintained copies of one cascade, and said they needed the measured treatment
+8.30 got rather than a textual merge. This is that treatment.
+
+#### The two were value-identical, and the proof is per-ingredient
+
+A textual merge would have assumed it. Each ingredient was traced instead:
+
+| ingredient | `canonical_type_qname` | `canonical_impl_target` |
+|---|---|---|
+| step-1 key | `qualify_symbol_sym_at(name, "wrap/de-canon-typeref", "")` | `cg.qualify(name)` |
+| step 2 | `lookup_type(name)` | `lookup_type(name)` |
+| step 3 | `get_arena().lookup_by_name(name)` | `cg.get_arena().lookup_by_name(name)` |
+| fallback | `qualify_symbol_sym_at(name, "wrap/de-canon-qname", "")` | `local`, the step-1 key |
+
+`CodegenContext::qualify` is `qualify_symbol_sym_at(sym, "wrap/cgctx-qualify",
+"")`, and `qualify_symbol_sym_at` **returns the cursor's answer on every path**:
+the site string and `span_file` feed counters and nothing else. Both sites pass
+`""` for `span_file`, so `module_ns_sym_of_file` is invalid for both and neither
+can take the home branch. All four expressions therefore reduce to
+`qualify_symbol_sym(name)`. The counter table above is the independent control
+on that reading: both rows report **0 diverge** with "no home" equal to their
+call count, which is what a site that always returns the cursor looks like.
+
+Both `get_arena()` resolve to `ctx.type_arena` and both `get_decl_index()` to
+`ctx.decl_index`, so the two cascades read the same index and the same arena.
+
+#### Where it lives, and why not on either emitter
+
+`DeclarationEmitter` holds a `CompilationContext*`; `DeclVisitEmitter` holds a
+`CodegenContext*`. The one object both already reach is `CompilationContext`,
+which owns all three ingredients - `decl_index`, `type_arena` and the namespace
+cursor. Putting the derivation anywhere else would have meant plumbing one of
+them to a second owner, which is how the pair arose.
+
+`canonical_type_ref` remains as a delegate on `DeclarationEmitter` because
+`declare_class_methods` needs the `TypeRef` itself, not the name.
+
+#### Measured
+
+`lane-check` moved as a de-duplication must - the duplicate lookups are gone:
+LOOKUP **127 -> 125**, `declaration_emitter` 9 -> 7, `decl_visit_emitter`
+5 -> 3, `compilation_context` 0 -> 2; REENTRY unmoved at 6. Re-pinned.
+
+Everything that must NOT move did not: `b1-check` B1=0 B4=0 **17 sites** on all
+three sections, `make test` **OVERALL PASS** (178 compile-fail, 38 projects, 0
+failed) - identical to the run immediately before the change. A change in any
+mangled name is what this pair's hazard consists of, so an unchanged suite over
+38 projects is the control on value-identity, not merely on compilation.
+
+#### One recorded split is now stale
+
+`canonical_impl_target`'s calls moved from `wrap/cgctx-qualify` to
+`wrap/de-canon-typeref`. Total `QualSymCalls` is unchanged and both rows still
+diverge zero, but the 3,455 / 3,695 split in the table above was measured
+before this and no longer describes the two sites. `wrap/cgctx-qualify`
+survives with its other callers.
