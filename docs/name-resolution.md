@@ -7651,3 +7651,82 @@ mangled name is what this pair's hazard consists of, so an unchanged suite over
 diverge zero, but the 3,455 / 3,695 split in the table above was measured
 before this and no longer describes the two sites. `wrap/cgctx-qualify`
 survives with its other callers.
+
+### 8.36 The deletion sweep, and two probes that answered with the cursor 2026-09-02
+
+8.34 was the first deletion and removed four functions. This removes 96, plus
+two probes, and the mechanism-2 surface it clears is what the count is for:
+`lane-check` ratcheted **127 -> 122** across the change.
+
+#### The probes returned their input's cursor answer on every path
+
+`qualify_symbol_sym_at` computed `qualify_symbol_sym(sym)` and returned it from
+every exit; the site string and `span_file` reached only counters. Its 20 call
+sites are therefore plain `qualify_symbol_sym` calls by construction, not by
+measurement, and collapsing them cannot change a name. Its own docstring said
+"PROBE FORM" in capitals and said the flip was a separate step; the flip is
+what this is, and the probe is gone.
+
+`probe_ambient_divergence` re-ran the module-blind chain to classify the pair
+it produced against the scoped answer. It early-returned unless
+`CRYO_SCOPE_PROBE` was set, returned `void`, and had one caller. Removing it
+also removed `home_via`, which three sites wrote and only the probe read.
+
+#### Why `b1-check` could not move, stated before it was run
+
+The probe called `arena.lookup_by_leaf`, and `lookup_by_leaf calls` IS an
+asserted row. Two independent reasons said the row was unreachable from it:
+`b1-gate.py` sets only `CRYO_RESOLVE_COUNTER`, `CRYO_CODEGEN_THREADS` and
+`CRYO_STDLIB`, never `CRYO_SCOPE_PROBE`, so the probe returned at its first
+line throughout the measurement; and its replayed lookups sat inside
+`suspend()`/`resume()` precisely so they could not inflate the leaf-index
+tallies. B1 held at 0 with 17 sites on all three sections. Had it moved, the
+reading of the gate's environment was wrong - which is what made it worth
+predicting rather than observing.
+
+#### The two re-pins, each predicted before it was taken
+
+`lane-check` 125 -> 124 when `scope_fn_arity` went, which held one
+`lookup_func_type`; and 124 -> 122 when the probe went, which held two
+`lookup_type`. Each golden diff contains only the predicted rows. A re-pin
+that lands where it was predicted is evidence; one that lands elsewhere is a
+finding, and the two are indistinguishable without the prediction.
+
+#### The sweep's method, and the guard that earned its place
+
+Candidates came from a name-based scan for definitions with no reference of
+any kind across compiler, tools, stdlib, tests, runtime and examples - an
+upper bound, not a dead list, since a name-based test cannot see an
+address-taken function. The control is `make cryo`: a wrongly deleted function
+fails to compile and names itself. `make lsp` is a SECOND control and not
+redundant, because the LSP links the compiler library and no other local gate
+builds it.
+
+Two false-positive classes were caught before deleting rather than by the
+build: the bindgen `visit_*` statics are passed by address to
+`clang_visitChildren`, and five one-liner methods sit adjacent to live
+siblings, where scanning forward for a closing brace at the same indent
+swallows the next definition. A guard rejecting any range containing a second
+definition caught all five. Across 94 deletions the build found **no** further
+false positive, which says the scan was stronger than assumed - not that the
+control was unnecessary.
+
+#### Left standing, and what it now measures
+
+Retiring the probes stranded their reporting: `qual_sym_diff` and
+`scope_diverge` have no callers, and ten `Site` variants - four `QualSym*`,
+six `Home*` - are never bumped and print zero. They are NOT deleted here. The
+question they pose has changed shape, though: keeping an audit stream normally
+preserves the ability to measure, and these no longer can, because what fed
+them is gone.
+
+`scope_fn_arity`'s deletion also removed one of the per-kind lookup callers,
+which is what a dead function holding a live call site looks like.
+
+#### Correction to 8.35
+
+8.35 closed by saying `wrap/cgctx-qualify` "survives with its other callers".
+It had none. `CodegenContext::qualify` was its only remaining user and was
+itself uncalled once 8.35 landed - 8.34 had kept it because
+`decl_visit_emitter` reached it through `this.cg`, and 8.35 removed that call.
+The site string is retired with the function.

@@ -191,12 +191,6 @@ type struct MangledName {
         return MangledName { value: SymbolStr::empty() };
     }
 
-    /// Pass-through for `extern "C"`: the linker-visible name is the
-    /// source name, unmangled (spec section 1).
-    static extern_c(table: InternTable*, name: string) -> MangledName {
-        return MangledName { value: table.intern(name) };
-    }
-
 
     // Function-like factories
 
@@ -211,19 +205,6 @@ type struct MangledName {
             params, ret, ReceiverKind::None, is_variadic);
     }
 
-    /// Mangle a free generic function: `C$<base$L<args>$G>$F<params>$R<ret>`.
-    /// The leaf segment of `qname` carries the generic arg list.
-    static for_free_function_generic(table: InternTable*, arena: TypeArena*,
-                                     qname: QualifiedName, generic_args: &TypeRef[],
-                                     params: &TypeRef[], ret: TypeRef,
-                                     is_variadic: boolean) -> MangledName {
-        mut ctx: MangleContext = MangleContext::new(table, arena);
-        const path: string = ctx.encode_path_with_leaf_generics(
-            qname, generic_args, SymbolStr::empty(), false);
-        return ctx.mangle_with_path(
-            "", path, params, ret,
-            ReceiverKind::None, is_variadic, true);
-    }
 
     /// Mangle a method: `C$<owner>-<member>$F[$s|$m_]<params>$R<ret>`.
     /// Pass `receiver = ReceiverKind::None` for static methods.
@@ -238,55 +219,6 @@ type struct MangledName {
             params, ret, receiver, is_variadic);
     }
 
-    /// Mangle a method on a generic type: `<owner_base$L<args>$G>-<method>...`.
-    static for_method_generic(table: InternTable*, arena: TypeArena*,
-                              owner_qname: QualifiedName, owner_generics: &TypeRef[],
-                              method: SymbolStr, receiver: ReceiverKind,
-                              params: &TypeRef[], ret: TypeRef,
-                              is_variadic: boolean) -> MangledName {
-        mut ctx: MangleContext = MangleContext::new(table, arena);
-        const path: string = ctx.encode_path_with_leaf_generics(
-            owner_qname, owner_generics, method, true);
-        return ctx.mangle_with_path(
-            "", path, params, ret, receiver, is_variadic, true);
-    }
-
-    /// Mangle a constructor: `C$ct$<owner>-<owner_leaf>$F<params>$Rv`.
-    /// The convention is that the constructor's "method name" duplicates
-    /// the type's leaf segment (spec section 5).
-    static for_constructor(table: InternTable*, arena: TypeArena*,
-                           owner_qname: QualifiedName,
-                           params: &TypeRef[], ret: TypeRef,
-                           is_variadic: boolean) -> MangledName {
-        mut ctx: MangleContext = MangleContext::new(table, arena);
-        const leaf: SymbolStr = MangleContext::owner_qname_leaf_or_intern(table, owner_qname);
-        return ctx.mangle_function_like(
-            "ct", owner_qname, leaf, true,
-            params, ret, ReceiverKind::None, is_variadic);
-    }
-
-    /// Mangle a destructor: `C$dt$<owner>-<owner_leaf>$F$s$Rv`.
-    static for_destructor(table: InternTable*, arena: TypeArena*,
-                          owner_qname: QualifiedName,
-                          params: &TypeRef[], ret: TypeRef) -> MangledName {
-        mut ctx: MangleContext = MangleContext::new(table, arena);
-        const leaf: SymbolStr = MangleContext::owner_qname_leaf_or_intern(table, owner_qname);
-        return ctx.mangle_function_like(
-            "dt", owner_qname, leaf, true,
-            params, ret, ReceiverKind::ImmutRef, false);
-    }
-
-    /// Mangle an operator overload: `C$op$<owner>-<op_code>$F...`.
-    static for_operator(table: InternTable*, arena: TypeArena*,
-                        owner_qname: QualifiedName, op: OperatorKind,
-                        receiver: ReceiverKind,
-                        params: &TypeRef[], ret: TypeRef) -> MangledName {
-        mut ctx: MangleContext = MangleContext::new(table, arena);
-        const code_sym: SymbolStr = table.intern(op.code());
-        return ctx.mangle_function_like(
-            "op", owner_qname, code_sym, true,
-            params, ret, receiver, false);
-    }
 
     /// Mangle a trait-impl method: `C$tr$<trait>$f<owner>-<method>$F...`.
     static for_trait_impl(table: InternTable*, arena: TypeArena*,
@@ -344,30 +276,6 @@ type struct MangledName {
         return MangledName { value: table.intern("C$vt$" + path) };
     }
 
-    /// Type info for a class: `C$ti$<path>`.
-    static for_type_info(table: InternTable*, owner_qname: QualifiedName) -> MangledName {
-        const path: string = MangleContext::encode_path(table, owner_qname, SymbolStr::empty(), false);
-        return MangledName { value: table.intern("C$ti$" + path) };
-    }
-
-    /// Module initializer: `C$mi$<namespace_path>`.
-    static for_module_init(table: InternTable*, ns_qname: QualifiedName) -> MangledName {
-        const path: string = MangleContext::encode_path(table, ns_qname, SymbolStr::empty(), false);
-        return MangledName { value: table.intern("C$mi$" + path) };
-    }
-
-    /// Compiler-generated closure: `C$cl$<enclosing_path>$O<index>`.
-    static for_closure(table: InternTable*, enclosing_qname: QualifiedName,
-                       index: u32) -> MangledName {
-        const path: string = MangleContext::encode_path(table, enclosing_qname, SymbolStr::empty(), false);
-        const idx_u: u64 = index as u64;
-        const idx_str: string = idx_u.to_decimal_str();
-        mut buf_cl: string = "C$cl$";
-        buf_cl += path;
-        buf_cl += "$O";
-        buf_cl += idx_str;
-        return MangledName { value: table.intern(buf_cl) };
-    }
 
     /// Global variable / constant: `C$<namespace_path>.<name>` (data symbol,
     /// no signature).  When `namespace_sym` is empty the result is the
@@ -404,19 +312,6 @@ type struct MangledName {
         return MangledName { value: table.intern("C$" + path) };
     }
 
-    /// Mangled path for a generic specialization (no signature attached).
-    /// `Pair<int>` -> `C$4Pair$Li$G`.  Used by the monomorphizer / specializer
-    /// to label instantiated structs.
-    static for_generic_path(table: InternTable*, arena: TypeArena*,
-                            base_qname: QualifiedName,
-                            type_args: &TypeRef[]) -> MangledName {
-        mut ctx: MangleContext = MangleContext::new(table, arena);
-        const path: string = ctx.encode_path_with_leaf_generics(
-            base_qname, type_args, SymbolStr::empty(), false);
-        mut buf: string = "C$";
-        buf += path;
-        return MangledName { value: table.intern(buf) };
-    }
 
     /// Centralized identifier generator for generic specializations.
     /// This is **the** way to derive a unique key for a monomorphized
@@ -444,17 +339,6 @@ type struct MangledName {
 
     // Overload disambiguator
 
-    /// Append `$O<N>` to disambiguate overloads where signatures collide
-    /// (e.g., overloads differing only in return type; spec section 10).
-    with_overload_index(&this, table: InternTable*, n: u32) -> MangledName {
-        const cur: string = table.resolve(this.value);
-        const n_u: u64 = n as u64;
-        const idx_str: string = n_u.to_decimal_str();
-        mut buf_o: string = cur;
-        buf_o += "$O";
-        buf_o += idx_str;
-        return MangledName { value: table.intern(buf_o) };
-    }
 
     /// Append `$MG<arg>{_<arg>}*$` encoding the concrete type arguments of a
     /// generic METHOD specialization (`m<T>` with `T = i64`).  A generic method
