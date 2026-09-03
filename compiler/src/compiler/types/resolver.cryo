@@ -1715,36 +1715,54 @@ private:
         if ((this.home_module_len(ctx) > 0)
                 && this.name_resolver != null
                 && !this.name_resolver.contains_separator(name_str)) {
-            // One exit, not three.  Each hit records WHICH qualified name won
-            // so the divergence probe below can name both sides of a mismatch;
-            // the lookup order and short-circuiting are unchanged.
             mut home_hit: TypeRef = TypeRef::invalid();
-            // Which qualified name won, so a comparison against the node's own
-            // answer can name both sides rather than only report that they
-            // differed.
+            // WHICH qualified name this leaf denotes, taken from the node.
+            //
+            // The annotation was answered for by NameResolution, in the scope
+            // it was written in, and that answer is what this step used to
+            // rebuild out of `home_module + "::" + leaf` and, failing that, out
+            // of a second walk over the writing module's imports.  Rebuilding a
+            // name the node already carries is a second way to ask one
+            // question, free to disagree with the first; the string form also
+            // cannot express what an import resolves to without repeating the
+            // import walk.  Read, never re-derived.
             mut home_key: SymbolStr = SymbolStr::empty();
+            match (slot) {
+                ResSlot::Answered(r) => {
+                    match (r) {
+                        Res::Def(q) => { home_key = q; }
+                        // A parameter names itself and a primitive is answered
+                        // above; neither denotes a declaration to look up here.
+                        _           => { }
+                    }
+                }
+                _ => { }
+            }
 
-            const home_qn: SymbolStr =
-                this.intern_table.intern(ctx.home_module + "::" + name_str);
-            if (this.decl_index != null) {
-                const home_di: TypeRef = this.decl_index.lookup_type(home_qn);
-                if (home_di.is_valid()) { home_hit = home_di; home_key = home_qn; }
-            }
-            if (!home_hit.is_valid()) {
-                const home_arena: TypeRef = this.arena.lookup_by_name(home_qn);
-                if (home_arena.is_valid()) { home_hit = home_arena; home_key = home_qn; }
-            }
-            // The home module does not DECLARE the leaf, but "resolve where it
-            // was written" means resolving against what that module can SEE -
-            // its imports and the prelude - not only what it declares.  Without
-            // this, an annotation naming an imported type (the overwhelmingly
-            // common case: `struct String<A = GlobalAlloc>` in
-            // `std::collections::string`, where `GlobalAlloc` is declared in
-            // `std::alloc::allocator`) misses every scoped step and lands on
-            // the global leaf index.  Import-scoped, so it cannot bind to some
-            // unrelated same-leaf type in a module the home module never
-            // imported.
-            if (!home_hit.is_valid() && this.decl_index != null) {
+            if (home_key.is_valid()) {
+                // What remains is only WHERE the name's `TypeRef` is stored.
+                // The DeclarationIndex indexes the qualified NAME without
+                // necessarily holding the type, and the arena is the other
+                // place, so a miss in one is not an answer.
+                if (this.decl_index != null) {
+                    home_hit = this.decl_index.lookup_type(home_key);
+                }
+                if (!home_hit.is_valid()) {
+                    home_hit = this.arena.lookup_by_name(home_key);
+                }
+                if (!home_hit.is_valid()) {
+                    // The name is an ANSWER that no store can serve, which is a
+                    // declaration that never registered rather than a name this
+                    // step failed to derive.  Recorded rather than retried.
+                    ResolveCounter::path_hit(
+                        "RN-2C-UNSERVED",
+                        this.intern_table.resolve(home_key), name_str,
+                        span.to_string());
+                }
+            } else if (this.decl_index != null) {
+                // No answer on the node.  The gate still owes a refusal for a
+                // leaf the writing module cannot reach: refusing is not a
+                // second way to ANSWER, it is the reason there is no answer.
                 const home_ns: SymbolStr = this.intern_table.intern(ctx.home_module);
                 const home_res: ScopeResolution =
                     this.decl_index.resolve_qualified_scoped(
@@ -1760,31 +1778,6 @@ private:
                     this.rn_trace("gate-unreachable", name_str, ctx,
                                   TypeRef::invalid());
                     return TypeRef::invalid();
-                }
-                const home_scoped: SymbolStr = home_res.resolved_or(name);
-                if (home_scoped.is_valid() && home_scoped.id != name.id) {
-                    mut home_st: TypeRef = this.decl_index.lookup_type(home_scoped);
-                    // The scope question is already ANSWERED at this point: the
-                    // home module's imports resolved the leaf to exactly one
-                    // qualified name.  What remains is only WHERE that name's
-                    // TypeRef is stored, and the DeclarationIndex is not always
-                    // the place - it indexes the qualified NAME (that is how
-                    // `resolve_qualified_scoped` found it) without necessarily
-                    // holding the type.  `GlobalAlloc` is the whole population
-                    // of this case on `examples/09-json-config`: 86 lookups, one
-                    // candidate each, `std::alloc::allocator::GlobalAlloc`, and
-                    // no DI type for any of them.
-                    //
-                    // Falling through here does not make the resolution fail -
-                    // it makes it succeed LATER, at the global leaf index, which
-                    // answers the same question with the module scope thrown
-                    // away.  Completing the lookup in the arena under the name
-                    // scope already chose keeps the answer identical and keeps
-                    // it import-scoped.
-                    if (!home_st.is_valid()) {
-                        home_st = this.arena.lookup_by_name(home_scoped);
-                    }
-                    if (home_st.is_valid()) { home_hit = home_st; home_key = home_scoped; }
                 }
             }
 

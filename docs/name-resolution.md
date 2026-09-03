@@ -9834,3 +9834,132 @@ working: `namespace_gate` (6, `Crate`) and `namespace_gate_methods` (1,
 `Parcel`) exist to assert E0240 on a name its module cannot reach.
 
 **Zero unstamped annotations remain across every corpus that compiles.**
+
+### 8.63 2c reads the name instead of rebuilding it, and that exposed a lane that ignores `private` - MEASURED AND FIXED 2026-09-03
+
+8.61 and 8.62 closed the coverage gap 8.51 named as the precondition: the stamp
+answers every annotation reaching 2c, over every corpus that compiles, and
+agrees with the incumbent on all of them. This collapses the seam.
+
+#### What 2c was doing, and what it does now
+
+Step 2c derived the qualified name TWICE - `home_module + "::" + leaf` against
+the declaration index and then the arena, and failing that a second walk over
+the writing module's imports via `resolve_qualified_scoped` - and only then
+looked up a `TypeRef`. The stamp already holds the answer to the first question,
+so the derivation is gone. What remains is the second question, which was never
+the stamp's: WHERE the named type is stored, asked of the index and then the
+arena.
+
+Rebuilding a name the node already carries is a second way to ask one question,
+free to disagree with the first. It also cannot express what an import resolves
+to without repeating the import walk, which is the walk that made this step
+expensive.
+
+`RN-2C-UNSERVED` is a new audit row for a `Res::Def` no store can serve - a
+declaration that never registered, which `res.cryo` already frames as its own
+outcome rather than a licence to search. It reads 0.
+
+#### What the collapse cost, measured off the corpus it was developed against
+
+`compiler/` is the one corpus whose source this work edits, and its counters
+have now moved twice for that reason alone. The controls are the 50 corpora it
+does not touch, which must come back row-for-row identical:
+
+| corpus | before | after | delta |
+|---|---:|---:|---:|
+| `compiler/` | 61,309 | 61,304 | -5 |
+| `tests/reexport_private_module` | 2,063 | 2,488 | **+425** |
+| every other corpus | - | - | **0** |
+
+The `compiler/` delta is not behaviour. The collapse deletes five declarations
+from `types/resolver.cryo` - `home_qn` and `home_scoped` (`SymbolStr`),
+`home_di`, `home_arena` and `home_st` (`TypeRef`) - and the seam counts
+annotations in the source it is compiling: `SymbolStr` 55 to 53, `TypeRef` 96 to
+93. Exactly -2 and -3.
+
+The work removed is real, and it is the point:
+
+| counter, on `compiler/` | before | after |
+|---|---:|---:|
+| `lookup_qualified_alternatives` calls | 559,622 | **511,340** |
+| `lookup_qualified_alternatives` hits | 370,122 | **321,819** |
+| single-candidate fast path taken | 364,276 | **315,995** |
+
+About 48,280 import-scoped walks per build that no longer happen. `lane-check`
+`LOOKUP` goes 118 to 117 in `types/resolver.cryo`, which the gate itself calls
+progress and asks to be re-pinned deliberately.
+
+#### The corpus that moved, and why the agreement figure could not have caught it
+
+`reexport_private_module` went from failing to compile to compiling further, and
+`make test` reported it:
+
+    reexport_private_module ... [FAIL]  (output missing "error[E0240]")
+    error[E0503]: type `Hidden` is private to module `ReexportPrivateModule::Store`
+
+The program is still REJECTED - by a later visibility check rather than by the
+use-site reachability gate. So a second, independent part of the compiler
+already knew `Hidden` is private, which is what makes the next paragraph a
+defect rather than a design question.
+
+**The agreement measurement could not have predicted this, and the reason is
+reusable.** `rn_seam_probe` fires inside `if (home_hit.is_valid())` - only where
+2c ANSWERS. Every row where the incumbent REFUSED emitted nothing, and those are
+exactly the rows a collapse puts at risk. 266,623 of 266,623 was measured over
+the answering population and says nothing about the refusing one. A zero, or a
+perfect agreement, is a statement about the population the instrument can see.
+
+#### The defect the collapse uncovered
+
+`forward_declare` declares a function with its own visibility and exports it
+only when public. Every TYPE kind passed a hardcoded `true` and exported
+unconditionally:
+
+    declare_function(fn_node.name, fn_node.span, fn_node.is_public);   // honours private
+    declare_type(struct_node.name, struct_node.span, true);            // never did
+
+`StructDeclNode.is_public` exists and is documented as "a `private` type is only
+nameable within its own module"; the parser fills it from the `private`
+keyword. The resolver discarded it. So a private type is Public and exported in
+the symbol table, survives the `is_public()` filter in the re-export closure,
+binds in every importer's scope, and the stamper answers for it - while the
+declaration index, reading the real visibility, refuses. Two lanes, two answers
+about one name, and only the index was right.
+
+Struct, union, enum and class carry `is_public` and now use it. Trait and type
+alias have no such field, so there is nothing there to honour and they are left
+alone rather than given an invented rule.
+
+#### Stated before the run
+
+That the private fix restores E0240 rather than changing it: with the type
+unbound, the stamp is `Pending`, 2c takes the no-answer branch, and the gate
+refuses exactly as it did before the collapse. Predicted every other corpus
+unchanged, `make test` back to 38, B1 and B4 0, `lane-check` 117.
+
+    error[E0240]: `Hidden` is not reachable from this module
+
+| corpus | 2c `SAME` | unstamped | `DIFFERENT` | declines |
+|---|---:|---:|---:|---:|
+| `compiler/` | 61,304 | 0 | 0 | 0 |
+| 14 `examples/` projects | 65,713 | 0 | 0 | 0 |
+| 36 `tests/` projects that compile | 139,602 | **0** | 0 | 3 |
+| **all 57 corpora** | **266,619** | **0** | **0** | **9** |
+
+Every corpus is unchanged but two, and both moved in the same direction for
+the same reason: `STAMP-DECLINE` went 7 to 9, adding `Hidden` in
+`reexport_private_module` and `VisibilityTypeMask::Vault::Hidden` in
+`visibility_type_mask`. The decline prediction was wrong - only the first of
+those was foreseen - and the two new rows are the fix working on the two
+corpora built to test it. Their `SAME` counts do not move (2,063 and 2,484), so
+nothing lost a binding; a private type simply stopped binding where it never
+should have. All nine declines are now the gate refusing a name a module cannot
+reach.
+
+#### Why the gate survives the collapse
+
+The reachability check remains on the no-answer branch. Decision 1 forbids a
+second way to ANSWER; refusing is not an answer, it is the reason there is not
+one. The branch is not dead - `namespace_gate_methods` and this corpus both
+reach it, which is what makes it testable rather than assumed.
