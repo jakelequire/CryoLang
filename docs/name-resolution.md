@@ -9275,14 +9275,52 @@ with `res: ResSlot::Pending` written out explicitly. Each also sets
 `types/resolver.cryo:364` before `resolve_named` is ever reached - which is why
 these mints are mostly invisible at 2c.
 
-**The testable claim: the residue is the subset whose `pre_resolved` came back
-INVALID**, falling through the short-circuit to a `Pending` slot. `:196` takes
-it from `resolved_arg_typeref(pi)` and the other two from a caller-supplied
-`inner_pre_resolved`; the per-instantiation shape of the counts fits.
+The testable claim was that the residue is the subset whose `pre_resolved` came
+back INVALID, falling through the short-circuit to a `Pending` slot.
 
-The measurement is a counter at each mint site splitting valid from invalid
-`pre_resolved`, compared against the 3,180. If they match, the fix is that a
-synthesizer with no `TypeRef` to offer must still answer its node's slot; if
-they do not, the population is somewhere else and the owner - which declaration
-the annotation hangs off - is the next instrument, since the span has been shown
-useless here.
+**Measured, and false.** A counter at each of the three mint sites, split by
+whether the minted node got a valid `TypeRef`:
+
+| mint site | valid | invalid |
+|---|---:|---:|
+| `substituter:rewrite-to-pointer` | 6,642 | **0** |
+| `substituter:rewrite-to-array` | 315 | **0** |
+| `substituter:projection-base` | 28 | **0** |
+
+All 6,985 substituter mints carry a valid `pre_resolved`, so every one
+short-circuits at `types/resolver.cryo:364` and none reaches `resolve_named` at
+all. Control on the run: 2c unstamped is still 3,180 and `SAME` still 58,120, so
+the probe perturbed nothing. **The substituter is not the source.**
+
+#### Four predictions falsified, which is the finding
+
+This section stops here under the three-hypothesis rule rather than trying a
+fifth. What has been ruled out, and how:
+
+| ruled out | by |
+|---|---|
+| `stamp_annotation` skips generic annotations | it has a `Generic` arm stamping base and args |
+| the struct visitor misses inline methods | it walks `node.methods`; the method visitor delegates to the function visitor |
+| `ASTCloner` drops the stamp | it delegates to `TypeAnnotation::clone_ptr`, which copies `res` |
+| the residue is synthesized, identifiable by a missing span | synthesizers borrow the original's span; the discriminator does not discriminate |
+| the residue is the substituter's invalid-`pre_resolved` mints | there are none - 6,985 of 6,985 are valid |
+
+What remains established: the 3,180 were never offered to the stamper, and they
+are not produced by any path examined above.
+
+#### The next instrument, and why it is not the span
+
+Every remaining candidate mints with `pre_resolved: TypeRef::invalid()` and so
+does reach the cascade: `parser/expr_parser.cryo:2756`, `:2879`, `:2897`,
+`:3034`, `parser/parser.cryo:896`, `passes/default_expansion.cryo:752`,
+`passes/type_resolution.cryo:1889`, `sema/async_lower.cryo:573` and `:589`,
+`bindgen/type_map.cryo:90`, `types/resolver.cryo:1039`.
+
+Enumerating them one at a time is what produced four falsifications. The
+instrument that answers it in one pass is the node's OWNER - which declaration
+the annotation hangs off - recorded where the node is created rather than where
+it is read. That distinguishes "this visitor should have reached it" from "no
+visitor owns it" without another guess about which site is responsible, and it
+is what the two parser sites in particular need, since a parser-produced node
+exists well before the stamping pass runs and cannot be explained by minting at
+all.
