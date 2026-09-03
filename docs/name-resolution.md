@@ -9957,6 +9957,32 @@ nothing lost a binding; a private type simply stopped binding where it never
 should have. All nine declines are now the gate refusing a name a module cannot
 reach.
 
+#### The probe that licensed this is now spent, and the figure above says so
+
+The sweep table in this section reports 266,619 `SAME` and no disagreements at
+2c AFTER the collapse. **That is not evidence of agreement.** `home_key` is now
+taken from `slot`, and it is `home_key` that the probe receives as the
+incumbent, so the comparison is the stamp against itself: the verdict can only
+be `SAME`, and an unstamped row cannot reach the probe at all because
+`home_key` would be invalid and no lookup would hit. Recorded because the
+number was published before the tautology was noticed - the section warns two
+paragraphs earlier that a perfect agreement is a statement about the population
+an instrument can see, and then quotes a figure whose instrument had stopped
+seeing anything.
+
+What licenses the collapse is unchanged: the agreement measured BEFORE it, while
+the two derivations were independent (266,623 of 266,623), the 50 corpora that
+came back row-for-row identical, and `make test` - which is what actually caught
+the private-type regression that the vacuous verdict column did not.
+
+So the 2c call is deleted. The control first: `rn_trace`'s `2c-home-syntax` and
+`2c-home-cursor` rows number exactly the seam rows on every corpus checked
+(`compiler/` 61,304, `reexport_private_module` 2,063, `examples/09-json-config`
+5,749), so the volume-and-site signal - the one that caught the regression by
+moving a corpus 425 rows - survives the deletion. No script or gate reads
+`RN-SEAM`; the 3b call site keeps it, and there the two sides are still derived
+separately.
+
 #### Why the gate survives the collapse
 
 The reachability check remains on the no-answer branch. Decision 1 forbids a
