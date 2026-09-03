@@ -10046,3 +10046,86 @@ the control `resolve_struct_literal` did not have when a measured zero was
 deleted on and the suite went red.
 
 Recorded as a candidate, not taken.
+
+### 8.65 The extern and intrinsic callees CAN be stamped, and doing it needs a language answer first - MEASURED, PARKED 2026-09-03
+
+8.47 parked the guard at `find_function_template_for_call`, which branches on
+`is_pending` for 116 callees across the corpora, and framed the question: an
+`extern "C"` function IS declared, so are these legitimately unstampable or
+merely unstamped? The instruction here was to find out and stamp them if they
+can be. They can be. Doing it that way breaks the program.
+
+#### The mechanism, measured
+
+The guard's population on `compiler/` is 19 rows, matching 8.47's figure, and
+every one is an `intrinsic function`: `strlen` once and the `atomic_*` family
+eighteen times. `strlen` is an intrinsic at `core/intrinsics.cryo`, distinct
+from libc's `extern "C"` twin - so the population is intrinsics, not externs.
+
+The chain is short and each link was read rather than assumed:
+
+* `NodeKind::IntrinsicDeclaration` calls `declare(sym)` and **never**
+  `export_symbol`. Function, struct, union, enum and class arms all export.
+* So `std::core::intrinsics` exports **3** names while declaring 142. The
+  wildcard-bind probe reported that count directly, on every module importing
+  it.
+* An importer therefore binds none of them, `Resolver::lookup` fails in
+  `visit(IdentifierNode*)`, and `bare_name_res` returns `Pending` for an
+  invalid symbol.
+* The callee reaches monomorphisation with an empty slot, which is what the
+  guard is reading.
+
+The inherited hypothesis was half right. "`IntrinsicDeclaration` declares but
+never exports" holds. "`ExternBlock` exports its alias namespace" describes only
+the C-import form; a plain `extern "C"` block declares its functions in the
+current scope with their own visibility and exports them when public, so extern
+callees were never the problem.
+
+#### They can be stamped
+
+Adding `export_symbol` to the intrinsic arm takes the guard's population from
+**19 to 0** on `compiler/`. The nodes are not unstampable; nothing about an
+intrinsic prevents a `Res`.
+
+#### And that is exactly what must not be done yet
+
+The same build fails:
+
+    error[E0202]: cannot find function `panic` in this scope
+     --> stdlib/future/poll.cryo:44:37
+
+`panic` is declared twice - `intrinsic function panic(...) -> never;` in
+`core/intrinsics.cryo` and `function panic(...) -> never { ... }` in
+`core/_module.cryo`. `poll.cryo` imports nothing and reaches it through the
+prelude. Unexported, only the real function is visible and the name resolves.
+Exported, both are, the leaf is ambiguous, and it resolves to neither.
+
+This is not one name. **87 of the 142 intrinsic functions have a same-leaf
+declaration elsewhere in the stdlib** - `abort`, `exit`, `close`, `malloc`,
+`strlen`, `panic` among them. Exporting ambiguates all 87.
+
+The tree already knows. `ffi/libc.cryo` carries an import of
+`core::intrinsics` added for no other purpose than to force a topo-sort:
+
+    so the compiler intrinsics (`malloc`/`strlen`/`fopen`/...) claim their bare
+    leaf names before libc's same-named `extern "C"` twins are seen
+
+That is REGISTRATION ORDER deciding which of two declarations a bare leaf names,
+held in place by an edge in the module graph. It is the same shape §7 describes
+and this migration exists to remove, and it is load-bearing today.
+
+#### The question, and why it is not this session's
+
+Stamping these requires deciding what a bare `panic`, `malloc` or `strlen`
+names when an intrinsic declaration and a real function or `extern "C"` twin
+both declare it. That is a source-language rule, not a resolution defect: it
+changes what an existing valid program compiles to, for 87 leaves. No stamping
+strategy avoids it, because the ambiguity is in the program's declarations
+rather than in how they are looked up - and answering it inside the resolver by
+preferring one kind would be a special-case by declaration kind, which is the
+shape of the cascade being dismantled.
+
+The guard at `find_function_template_for_call` therefore stays for now, and it
+stays as a branch on absence that the `Res` contract forbids - recorded as owed,
+not as a boundary. The experiment is reverted; the tree is unchanged by this
+section.
