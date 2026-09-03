@@ -10346,3 +10346,87 @@ The predicate is now correct in advance of the binding that will exercise it.
 
 `LOOKUP` 117, `REENTRY` 6, B1 0 and B4 0 on three arms, 178 compile-fail cases
 and 38 projects.
+
+### 8.69 Decision 3 step 3: the duplicate module scopes are a dead save path - MEASURED, NOT TAKEN 2026-09-03
+
+Step 3 is "give the module symbol its scope, so `find_module_scope`'s multimap
+and its tie-break can be replaced by identity". Two implementations were
+predicted and both measured wrong. What they bought is the shape of the real
+one, so the step stops here rather than reaching for a third.
+
+#### First: reuse the module's existing scope. Measured dead.
+
+The obvious reading of step 3 is that a module should have ONE scope, so
+`set_module` should reuse the one it already made instead of building another.
+8.57 measured 3-13 candidates per name with exactly one populated and the rest
+empty, which makes reuse look safe.
+
+It is not, because the populated one is not the first:
+
+| winner's position in its bucket | lookups |
+|---|---:|
+| ordinal 3 | **40,117** |
+| ordinal 2 | 10 |
+| ordinal 1 | **0** |
+
+Binding a module to the scope it created first would bind every module to an
+empty placeholder. The tie-break is not merely skipping placeholders in some
+order - the real scope is reliably the THIRD one built.
+
+And the duplication is larger than 8.57's 3-13 suggested, because that figure is
+the bucket size at the moment of a lookup rather than the total:
+
+| Module scopes created per module | modules |
+|---:|---:|
+| 14 | **244** |
+| 13 | 1 |
+| 1 | 1 |
+
+About 3,400 Module scopes for 245 modules.
+
+#### Second: stop the leak at its source. Also measured dead, and that is the finding.
+
+`CompilationContext::switch_to_module` calls `set_module`, which CREATES a
+scope, under a comment saying "scope restore handled by orchestrator". The
+orchestrator then restores the saved scope immediately after, at
+`instance.cryo`. So the scope switch_to_module just built is abandoned, once per
+module per pass - which is exactly where 14 comes from, and why the rivals are
+empty.
+
+The fix looked mechanical: ask the module graph for the module's saved scope and
+restore it when there is one, create only when there is not.
+
+**No effect. Not one number moved** - 14 scopes per module, the same bucket
+sizes, the same winner ordinal, 2c unchanged.
+
+The reason is the useful part. There are TWO scope-saving mechanisms and the one
+the context can see is dead:
+
+* `CompilationContext::save_module_scope`, which writes the scope into
+  `ModuleGraph.module_scope_buf` - and **nothing calls it**. Zero callers in the
+  tree.
+* the orchestrator's own `scope_buf` in `instance.cryo`, which is the live one
+  and which the context has no access to.
+
+So `get_module_scope` answered 0 every time and the new branch always took the
+create path. A dead save path had been sitting behind a comment that describes
+the live one.
+
+#### What step 3 actually requires
+
+Not a stored pointer from symbol to scope - that would freeze the popularity
+heuristic rather than remove it. In order:
+
+1. Make the saved scope reachable from the `CompilationContext`, either by
+   calling the dead `save_module_scope` after NameResolution or by giving the
+   context the orchestrator's buffer. Until then no caller inside the context
+   can know a module's scope.
+2. Then `switch_to_module` restores instead of creating, which should take the
+   per-module count from 14 to the 2 built before NameResolution runs.
+3. Then find and remove those 2, which is what makes the bucket single-valued.
+4. Only then is there one scope per module to hang the step 1 symbol on, and
+   `find_module_scope`'s multimap and symbol-count tie-break can go.
+
+Nothing here is committed; the tree is unchanged by this section. Recorded
+because the two dead predictions cost a build each and the next attempt should
+not repeat them.
