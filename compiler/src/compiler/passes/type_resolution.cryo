@@ -1879,15 +1879,22 @@ type struct TypeResolutionPasses {
     static rewrite_this_type_annotation(ann: TypeAnnotation*,
                                          target: SymbolStr,
                                          target_args: &TypeAnnotation*[],
-                                         home_span: SourceSpan) -> void {
+                                         home_span: SourceSpan,
+                                         home_res: ResSlot) -> void {
         if (ann == null) { return; }
         match (*ann) {
             TypeAnnotation::ThisType(t) => {
+                // The impl head already asked what its target spells, in the
+                // scope it was written in, and this node names that same type.
+                // The head's slot is carried across whatever it holds: a head
+                // no resolver could answer for mints an unanswered node, and a
+                // second walk here would be a second opinion about one
+                // spelling.
                 const named: NamedAnnotation* = new NamedAnnotation {
                     name:         target,
                     span:         home_span,
                     pre_resolved: TypeRef::invalid(),
-                    res: ResSlot::Pending,
+                    res:          home_res,
                 };
                 const temp: TypeAnnotation* = intrinsics::malloc(sizeof(TypeAnnotation)) as TypeAnnotation*;
                 if (target_args.length > 0) {
@@ -1921,29 +1928,29 @@ type struct TypeResolutionPasses {
                 intrinsics::free(temp as void*);
             }
             TypeAnnotation::Reference(r) => {
-                TypeResolutionPasses::rewrite_this_type_annotation(r.inner, target, target_args, home_span);
+                TypeResolutionPasses::rewrite_this_type_annotation(r.inner, target, target_args, home_span, home_res);
             }
             TypeAnnotation::Pointer(p) => {
-                TypeResolutionPasses::rewrite_this_type_annotation(p.inner, target, target_args, home_span);
+                TypeResolutionPasses::rewrite_this_type_annotation(p.inner, target, target_args, home_span, home_res);
             }
             TypeAnnotation::Array(a) => {
-                TypeResolutionPasses::rewrite_this_type_annotation(a.element, target, target_args, home_span);
+                TypeResolutionPasses::rewrite_this_type_annotation(a.element, target, target_args, home_span, home_res);
             }
             TypeAnnotation::Generic(g) => {
-                TypeResolutionPasses::rewrite_this_type_annotation(g.base, target, target_args, home_span);
+                TypeResolutionPasses::rewrite_this_type_annotation(g.base, target, target_args, home_span, home_res);
                 for (mut i: i64 = 0; i < g.args.length; i++) {
-                    TypeResolutionPasses::rewrite_this_type_annotation(g.args[i], target, target_args, home_span);
+                    TypeResolutionPasses::rewrite_this_type_annotation(g.args[i], target, target_args, home_span, home_res);
                 }
             }
             TypeAnnotation::Tuple(tu) => {
                 for (mut i: i64 = 0; i < tu.elements.length; i++) {
-                    TypeResolutionPasses::rewrite_this_type_annotation(tu.elements[i], target, target_args, home_span);
+                    TypeResolutionPasses::rewrite_this_type_annotation(tu.elements[i], target, target_args, home_span, home_res);
                 }
             }
             TypeAnnotation::Function(f) => {
-                TypeResolutionPasses::rewrite_this_type_annotation(f.return_type, target, target_args, home_span);
+                TypeResolutionPasses::rewrite_this_type_annotation(f.return_type, target, target_args, home_span, home_res);
                 for (mut i: i64 = 0; i < f.parameters.length; i++) {
-                    TypeResolutionPasses::rewrite_this_type_annotation(f.parameters[i], target, target_args, home_span);
+                    TypeResolutionPasses::rewrite_this_type_annotation(f.parameters[i], target, target_args, home_span, home_res);
                 }
             }
             _ => { }
@@ -2032,11 +2039,12 @@ type struct TypeResolutionPasses {
                                             target_args: &TypeAnnotation*[],
                                             param_names: &SymbolStr[],
                                             arg_anns: &TypeAnnotation*[],
-                                            home_span: SourceSpan) -> void {
+                                            home_span: SourceSpan,
+                                            home_res: ResSlot) -> void {
         if (cloned == null) { return; }
         const ret_ann: TypeAnnotation* = cloned.return_type_annotation;
         if (ret_ann != null) {
-            TypeResolutionPasses::rewrite_this_type_annotation(ret_ann, target, target_args, home_span);
+            TypeResolutionPasses::rewrite_this_type_annotation(ret_ann, target, target_args, home_span, home_res);
             if (param_names.length > 0) {
                 TypeResolutionPasses::rewrite_trait_params_annotation(
                     ret_ann, param_names, arg_anns);
@@ -2046,7 +2054,7 @@ type struct TypeResolutionPasses {
             const param: VarDeclNode* = cloned.parameters[p];
             if (param != null && param.type_annotation != null) {
                 TypeResolutionPasses::rewrite_this_type_annotation(
-                    param.type_annotation, target, target_args, home_span);
+                    param.type_annotation, target, target_args, home_span, home_res);
                 if (param_names.length > 0) {
                     TypeResolutionPasses::rewrite_trait_params_annotation(
                         param.type_annotation, param_names, arg_anns);
@@ -2820,7 +2828,7 @@ type struct TypeResolutionPasses {
                 };
             TypeResolutionPasses::rewrite_default_method_signature(
                 cloned, impl_node.target_type, impl_node.target_args,
-                trait_param_names, args_ref, this_home_span);
+                trait_param_names, args_ref, this_home_span, impl_node.res);
             mut method: MethodNode* = new MethodNode(cloned, cloned.span);
             method.set_static(cloned.is_static);
             impl_node.add_method(method);
