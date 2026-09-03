@@ -9439,10 +9439,56 @@ declaration annotations (`mut s: String = out;`), which is the population the
 declaration visitors provably do stamp. Not chased here; it is 8% of the
 residue and a different mechanism from the 92%.
 
-#### Sequencing
+#### Fixed, and what the prediction said first
 
-The expression-position gap is the whole lever, the same way the generic-parameter
-default was in 8.51: one position, five visitors, 2,302 of 3,180 rows. Stamping
-it runs the reachability gate over syntax it has never been run over, which is
-the risk 8.51 also carried and where the 38 projects and 178 compile-fail cases
-are the instrument.
+One helper, called from the five visitors that were walking past their own
+`generic_args` (and `ScopeResolutionNode`'s `scope_generic_args`); `new`'s
+existing loop folds into the same helper so there is one walk over a written
+argument list rather than two.
+
+Predicted before the run: 2c unstamped to about 878, `SAME` up by the same
+2,302, `DIFFERENT` to stay 0, gates unchanged. A nonzero `DIFFERENT` would have
+meant the stamp just written disagrees with 2c - a defect in the fix rather than
+a finding about the seam. A new diagnostic on any corpus would have meant an
+expression-position type argument names something its module cannot reach, which
+is a source-language question to park rather than to work around.
+
+| | before | after |
+|---|---:|---:|
+| 2c `INCUMBENT-ONLY` | 3,180 | **936** |
+| 2c `SAME` | 58,120 | **60,366** |
+| 2c `DIFFERENT` | 0 | **0** |
+| `STAMP-DECLINE` | 0 | **0** |
+| annotations offered | 33,324 | 33,818 |
+| coverage at 2c | 94.8% | **98.5%** |
+
+`STAMP-DECLINE` staying at 0 is the answer to the reachability risk: the gate was
+run over syntax it had never been run over and refused none of it. Warning count
+349 either side, `LOOKUP` 118, `REENTRY` 6, B1 0 and B4 0 on three arms, 178
+compile-fail cases and 38 projects.
+
+The offered figure rises by 494 while `SAME` rises by 2,246, which is the
+template ratio: an offer is once per written node, a 2c row is once per
+instantiation.
+
+#### What is left, and it is three mechanisms rather than one
+
+| owner | offered? | sites | rows |
+|---|---|---:|---:|
+| impl head target, via the `This` rewrite | no | 44 | 495 |
+| plain declaration annotation | **yes** | 186 | 219 |
+| plain declaration annotation | no | 50 | 74 |
+| scope qualifier type args | **yes** | 6 | 68 |
+| static-match type pattern | no | 5 | 33 |
+| declaration type args | **yes** / no | 25 | 37 |
+| struct literal type args | **yes** / no | 9 | 10 |
+
+The expression-position families are gone: scope qualifier args 1,734 to 68,
+call args 353 to 0, struct literal args 215 to 2. What survives at those owners
+is the offered-and-still-unstamped shape, not the unwalked one.
+
+The order by size is the impl head's `This` rewrite (495, a synthesizer holding
+the answer already), then the 319 offered-and-still-unstamped rows (two nodes at
+one site), then the static-match type patterns (33, which `visit(StaticMatchExprNode*)`
+documents itself as skipping).
+
