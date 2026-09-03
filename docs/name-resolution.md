@@ -9699,6 +9699,25 @@ The pin cannot serve as this control: `bin/cryo` predates the `RN-SEAM` and
 `STAMP-DECLINE` probes and emits zero rows, which reads exactly like a clean
 measurement.
 
+#### The fixed point, on both arms
+
+The briefing this work started from listed `selfhost-check` as not having run
+since 35e07375's content, so every measurement above rested on a compiler nobody
+had shown reproduces itself. It does, over all four changes:
+
+| arm | stages | verdict | modules | IR |
+|---|---|---|---:|---|
+| linux (WSL) | 8/8 | `FIXED POINT OK` | 245 | md5 `5468b56f60fb8a1d74df43913b30195c`, cryo.ll 951,350 bytes |
+| windows (native) | 8/8 | `FIXED POINT OK` | 245 | 109,473,678 bytes |
+
+Stage-3 and stage-4 produce byte-identical IR on each. One arm passing is not
+the gate: the run has to say `FIXED POINT OK` TWICE, and a single occurrence is
+what a half-run looks like.
+
+Re-confirmed in passing: the run leaves `compiler/build/cryo` an ELF and DELETES
+`cryo.exe`, so a Windows session needs `make cryo` again before anything reads
+that path. `make test` does not rebuild it.
+
 #### What is unblocked, what is not, and what is parked
 
 8.51 set the sequencing: close the coverage gap, then collapse 2c - never
