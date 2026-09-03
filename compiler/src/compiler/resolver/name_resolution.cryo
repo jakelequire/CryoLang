@@ -492,6 +492,7 @@ public:
             this.stamp_annotation(param.type_annotation);
         }
         this.stamp_annotation(node.return_type_annotation);
+        this.stamp_trait_bounds(&node.trait_bounds);
 
         // The base-constructor initializer list, if this function is the
         // constructor one was written on.  Resolved here, after the parameters
@@ -673,6 +674,9 @@ public:
         for (mut i: int = 0; i < node.variants.length; i++) {
             const variant: EnumVariantNode* = node.variants[i];
             this.resolver.declare_enum_variant(variant.name, variant.span);
+            // A payload is written type syntax; a variant carrying one spells
+            // a type exactly as a field declaration does.
+            this.stamp_annotation_list(&variant.associated_types);
         }
 
         this.resolver.exit_scope();
@@ -740,6 +744,13 @@ public:
         // while that leaf is unique program-wide.
         this.stamp_annotation(node.trait_annotation);
 
+        // `type Item = T;` in the body binds an associated type to written
+        // syntax, and the impl's own `where` clause spells types the same way
+        // a method's does.  Both are read after the generic params are
+        // declared, so a binding naming one is answered as that param.
+        this.stamp_annotation_list(&node.assoc_binding_annotations);
+        this.stamp_trait_bounds(&node.where_bounds);
+
         // Declare and visit methods
         for (mut i: int = 0; i < node.methods.length; i++) {
             const method: MethodNode* = node.methods[i];
@@ -786,6 +797,7 @@ public:
     }
 
     override visit(node: DestructureDeclNode*) -> void {
+        this.stamp_annotation(node.type_annotation);
         // Resolve the initializer first; its identifiers must bind to the
         // outer scope, before the new field locals shadow anything.
         if (node.has_initializer()) {
@@ -1296,6 +1308,23 @@ public:
         node.set_scope_res(Res::TypeRelative(base, trailing));
     }
 
+    /// Stamp the written types in a `where` clause.
+    ///
+    /// A bound spells types twice over - the projection it constrains, and the
+    /// arguments of each trait it names - and both are ordinary written syntax
+    /// in the file holding the clause.  The trait PATH is not stamped here: a
+    /// bound names a trait, whose identity `TraitRef.resolved_name` carries.
+    stamp_trait_bounds(&this, bounds: &TraitBound[]) -> void {
+        for (mut i: i64 = 0; i < bounds.length; i++) {
+            const b: TraitBound* = &bounds[i];
+            this.stamp_annotation(b.subject_type);
+            for (mut j: i64 = 0; j < b.trait_refs.length; j++) {
+                const tref: TraitRef* = &b.trait_refs[j];
+                this.stamp_annotation_list(&tref.type_args);
+            }
+        }
+    }
+
     /// Stamp a written list of type arguments.
     ///
     /// An expression carries the same written type syntax a declaration does -
@@ -1634,8 +1663,8 @@ public:
     }
 
     override visit(node: StaticMatchExprNode*) -> void {
-        // Scrutinee/type-patterns are type annotations (resolved later by the
-        // TypeResolver); only arm bodies contain names to resolve here.
+        // The scrutinee is a type annotation resolved later by the
+        // TypeResolver; each arm stamps its own type patterns.
         for (mut i: int = 0; i < node.arms.length; i++) {
             node.arms[i].accept(this);
         }
@@ -1866,7 +1895,10 @@ public:
     }
 
     override visit(node: StaticMatchArmNode*) -> void {
-        // No pattern bindings (the pattern is a type); just scope the body.
+        // The pattern IS a type, written in this file, so it is stamped like
+        // any other written type.  It binds no name, which is why the arm
+        // scope below holds only the body.
+        this.stamp_annotation_list(&node.type_patterns);
         this.resolver.enter_scope(ScopeKind::Block, "<static-match-arm>", node.span);
         if (node.body != null) {
             node.body.accept(this);

@@ -9576,3 +9576,144 @@ Two populations remain, and they are unrelated:
   skipping), enum variant payload annotations, an impl body's associated-type
   binding, a destructuring declaration's annotation, and a `where` clause's
   bound arguments. Each is a missing walk of the 8.51 kind, none of them large.
+
+### 8.61 The 2c residue closes to one row, and that row is a wildcard import - MEASURED AND FIXED 2026-09-03
+
+8.60 left 441 unstamped at 2c on `compiler/`, split into two populations with
+nothing in common: 319 offered AND still unstamped, and 122 never offered at
+all. Both are closed here; they had different causes.
+
+#### The 319: an answer written, then thrown away
+
+`DefaultExpansion` rewrites a bare `Named(X)` into `Generic(Named(X), [defaults])`
+so `String` means `String<GlobalAlloc>`. It builds a FRESH `NamedAnnotation` for
+the base, copying the original's name and span - and wrote `res: ResSlot::Pending`
+outright, discarding the answer NameResolution had already written on the node
+it was replacing.
+
+That is the offer stream's second shape exactly: a site offered and answered,
+with an unstamped node standing at the same file, line and column. It could not
+have been told from a never-walked node without the column, because the two
+nodes share a line by construction - one is built from the other.
+
+The fix carries `named.res` onto the rebuilt base. Same shape as 8.60: a copy of
+an answer this pass did not have to ask for, not a second walk.
+
+#### The 122: five owners, each written syntax the walk did not reach
+
+| owner | rows |
+|---|---:|
+| static-match arm type pattern (`Slice<u8> => { }`) | 57 |
+| enum variant payload (`Def(SymbolStr);`) | 39 |
+| associated-type binding (`type Output = Result<Array<u8>, IoError>;`) | 15 |
+| destructuring declaration annotation (`const { ptr, alloc }: Box<T, A> = this;`) | 7 |
+| `where` clause bound arguments (`where A: Future<Result<T1, E>>`) | 4 |
+
+One helper for a `where` clause's written types, and a stamp call in each of the
+five visitors. The trait PATH in a bound is deliberately not stamped: a bound
+names a trait, and `TraitRef.resolved_name` is where that identity lives.
+
+#### Stated before the run
+
+2c unstamped 441 to about 0; `DIFFERENT` to stay 0; the offered count to rise by
+the newly walked nodes plus exactly one for the `ResSlot` local the expansion fix
+adds to the compiler's own source. A nonzero `STAMP-DECLINE` was the falsifier
+that mattered - it would mean some of this syntax names a type its own module
+cannot reach, which is a source-language question to record and park.
+
+| on `compiler/` | before | after |
+|---|---:|---:|
+| 2c `INCUMBENT-ONLY` | 441 | **0** |
+| 2c `SAME` | 60,863 | **61,309** |
+| 2c `DIFFERENT` | 0 | **0** |
+| `STAMP-DECLINE` | 0 | **0** |
+| annotations offered | 33,820 | 33,934 |
+| UNSTAMPED counter buckets, all three | 0 | **0** |
+
+B1 0 and B4 0 on three arms, `LOOKUP` 118, `REENTRY` 6, 178 compile-fail cases
+and 38 projects, warning count 349 throughout.
+
+#### The control on that zero, and why one corpus was not enough
+
+The obvious way for this zero to be uninteresting is a probe that stopped
+firing. It did not: `SAME` ROSE by 446 in the same run and the offer stream is
+33,934 rows, so both halves of the comparison are still being taken.
+
+The less obvious way is the corpus. `compiler/` is ONE project, it has no extern
+module population, and 8.51's own re-take already found the residue
+proportionally larger outside it. Re-measured over every corpus:
+
+| corpus | 2c `SAME` | unstamped | `DIFFERENT` | declines |
+|---|---:|---:|---:|---:|
+| `compiler/` | 61,309 | 0 | 0 | 0 |
+| 14 `examples/` projects | 65,713 | 0 | 0 | 0 |
+| 36 `tests/` projects that compile | 139,601 | **1** | 0 | 8 |
+| **all 57 corpora** | **266,623** | **1** | **0** | **8** |
+
+Six of the 57 emit no rows at all - `stdlib` has no entry point as a project,
+and five compile-fail projects abort before the seam is reached - so the claim
+covers the 51 that compile. **266,623 agreements, no disagreements, and one
+unstamped row.** The `compiler/`-only zero was not the tree-wide zero.
+
+#### The one row: the stamper does not follow a wildcard import
+
+    STAMP-DECLINE  Widget  ReexportBasic::GlobCtl  reexport_basic/src/globctl.cryo:10
+    RN-SEAM 2c INCUMBENT-ONLY  ReexportBasic::GlobCtl  Widget
+                               ReexportBasic::Inner::Widget  <pending>
+
+`globctl.cryo` writes `import ReexportBasic::Inner::*;` and then
+`const w: Widget = make_widget(5);`. The project exists to assert that `M::*`
+stays legal as a LOCAL import - only the export form is rejected. 2c resolves
+the annotation correctly to `ReexportBasic::Inner::Widget`; the stamper is
+offered it and DECLINES.
+
+`type_spelling_res` asks `resolve_type_qualified_name_bare_from`, which is
+`resolve_path` over the rib chain outward plus the prelude, then import ALIASES.
+No tier there sees a name a wildcard import brought in, while 2c's
+`home_module + "::" + leaf` construction reaches it.
+
+The build is green on that project - it is one of the 38 - so this is a silent
+under-reach and not a diagnostic. The program compiles today BECAUSE the string
+seam answers where the stamp will not, which is precisely the dependency
+collapsing 2c would remove.
+
+The other 7 declines are the gate working: `namespace_gate` (6, `Crate`) and
+`namespace_gate_methods` (1, `Parcel`) are corpora that exist to assert E0240 on
+an unreachable name.
+
+#### It predates this session, measured rather than argued
+
+A compiler built at `e2e588bb`, the session's starting commit, in a worktree,
+run over the same project:
+
+| `reexport_basic` | at `e2e588bb` | now |
+|---|---:|---:|
+| the `Widget` decline | **1, identical row** | 1 |
+| 2c `INCUMBENT-ONLY` | 520 | **1** |
+| 2c `SAME` | 3,633 | 4,152 |
+
+So the wildcard decline is inherited, and this corpus is an independent
+before/after on the session's stamping work that does not come from `compiler/`.
+
+The pin cannot serve as this control: `bin/cryo` predates the `RN-SEAM` and
+`STAMP-DECLINE` probes and emits zero rows, which reads exactly like a clean
+measurement.
+
+#### What is unblocked, what is not, and what is parked
+
+8.51 set the sequencing: close the coverage gap, then collapse 2c - never
+collapse it behind a fallback, which decision 1 forbids. Coverage is now 266,623
+of 266,624 with zero disagreements, so the collapse is no longer blocked on
+coverage or on agreement.
+
+Two things still stand in front of it, and neither is a measurement:
+
+* **The wildcard row.** Making the stamper follow a wildcard import means the
+  reachability gate ACCEPTS a spelling it currently refuses. It changes what no
+  valid program compiles to - the program already compiles - and it aligns the
+  stamp with the incumbent rather than the reverse. It is still a change to the
+  gate, so it is recorded here rather than folded into this fix.
+* **What a 2c consumer does with a legitimate `Pending`.** A synthesizer that
+  genuinely cannot answer for its node is allowed to leave the slot empty; the
+  `Res` slot contract frames that as `require`-and-ICE. Which of the remaining
+  `Pending` producers are legitimate is a decision, not a count.
