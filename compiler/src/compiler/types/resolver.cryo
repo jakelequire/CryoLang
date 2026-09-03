@@ -373,7 +373,7 @@ type struct TypeResolver {
                 // resolve_generic and deliberately bypasses this, so it is NOT
                 // canonicalized here (which would nest as `String<GlobalAlloc><...>`).
                 this.canonicalize_default_generic_type(
-                    this.resolve_named_at_span(n.name, n.span, ctx))
+                    this.resolve_named_at_span(n.name, n.span, ctx, n.res))
             }
             TypeAnnotation::Pointer(p) => {
                 mut inner: TypeRef = this.resolve(p.inner, ctx);
@@ -1439,18 +1439,23 @@ type struct TypeResolver {
     /// than clearing it.  Reading missing provenance as a namespace would make
     /// it compare unequal to every real module - the false-positive direction
     /// that reverted the visibility gate once.
+    /// `slot` is the annotation node's own answer, carried alongside the
+    /// spelling rather than re-derived from it.  The span is the string-shaped
+    /// stand-in for it: it names the file, from which the home module is
+    /// recovered, which is the question the stamp already answers exactly.
+    /// Callers holding no node pass `ResSlot::Pending`.
     resolve_named_at_span(&this, name: SymbolStr, span: SourceSpan,
-                          ctx: ResolutionContext*) -> TypeRef {
-        if (ctx == null) { return this.resolve_named(name, ctx); }
+                          ctx: ResolutionContext*, slot: ResSlot) -> TypeRef {
+        if (ctx == null) { return this.resolve_named(name, ctx, slot); }
         const ann_ns: string = ModuleGraph::home_ns_of_file(
             this.module_graph, this.intern_table, span.file);
         if (ann_ns.length() == 0 || ann_ns == ctx.home_module) {
-            return this.resolve_named(name, ctx);
+            return this.resolve_named(name, ctx, slot);
         }
         const saved_home:   string     = ctx.home_module;
         const saved_origin: HomeOrigin = ctx.home_origin;
         ctx.set_home_module(ann_ns, HomeOrigin::Syntax);
-        const out: TypeRef = this.resolve_named(name, ctx);
+        const out: TypeRef = this.resolve_named(name, ctx, slot);
         ctx.set_home_module(saved_home, saved_origin);
         return out;
     }
@@ -1521,6 +1526,67 @@ private:
                                   name_str, answer);
     }
 
+    /// Record one annotation at the string seam: the canonical name the string
+    /// path produced beside the name the node's own stamp carries.
+    ///
+    /// The two are compared as NAMES rather than by looking each one up.  The
+    /// index lookup is a deterministic function of the name handed to it, so
+    /// equal names reach one type without a second lookup having to prove it -
+    /// and a second lookup here would add a per-kind call site to the very
+    /// surface the lane ratchet pins, making the instrument indistinguishable
+    /// from the regrowth that ratchet exists to catch.
+    ///
+    /// The comparison over-reports: two names that alias one target are
+    /// distinct here and identical after the alias walk, so a `DIFFERENT` row
+    /// is a candidate to adjudicate, not a defect already established.
+    ///
+    /// `slot` is read for diagnosis, never to decide - nothing below branches
+    /// on it, and `require` is deliberately not called, because a `Pending`
+    /// annotation is a fact this probe exists to count rather than an internal
+    /// bug to report.
+    rn_seam_probe(&this, step: string, name_str: string, qualified: SymbolStr,
+                  slot: ResSlot, ctx: ResolutionContext*) -> void {
+        if (!ResolveCounter::Audit::Named.enabled()) { return; }
+
+        mut incumbent: string = "<none>";
+        if (qualified.is_valid()) {
+            incumbent = this.intern_table.resolve(qualified);
+        }
+
+        mut stamped:      string  = "<pending>";
+        mut stamp_is_def: boolean = false;
+        match (slot) {
+            ResSlot::Answered(r) => {
+                match (r) {
+                    Res::Def(q) => {
+                        stamped = this.intern_table.resolve(q);
+                        stamp_is_def = true;
+                    }
+                    _ => { stamped = r.to_string(); }
+                }
+            }
+            _ => { }
+        }
+
+        mut verdict: string = "NEITHER";
+        if (stamp_is_def) {
+            if (qualified.is_valid()) {
+                verdict = "DIFFERENT";
+                if (stamped.eq(incumbent)) { verdict = "SAME"; }
+            } else {
+                verdict = "STAMP-ONLY";
+            }
+        } else {
+            if (qualified.is_valid()) { verdict = "INCUMBENT-ONLY"; }
+        }
+
+        mut home: string = "<none>";
+        if (ctx != null && ctx.home_module.length() > 0) { home = ctx.home_module; }
+
+        ResolveCounter::rn_stamp_seam(step, verdict, home, name_str, incumbent,
+                                      stamped);
+    }
+
     /// Length of `ctx.home_module`, or 0 when the context is absent.
     home_module_len(&this, ctx: ResolutionContext*) -> i64 {
         if (ctx == null) { return 0; }
@@ -1563,7 +1629,8 @@ private:
     ///   2. Primitive name check (handles Named("i32") from generic substitution)
     ///   3. DeclarationIndex, by written literal then canonicalized name
     ///   4. Global leaf index
-    resolve_named(&this, name: SymbolStr, ctx: ResolutionContext*) -> TypeRef {
+    resolve_named(&this, name: SymbolStr, ctx: ResolutionContext*,
+                  slot: ResSlot) -> TypeRef {
         const name_str: string = this.intern_table.resolve(name);
         const name_len: i64 = name_str.length() as i64;
         LOG_DEBUG(LogComponent::TypeChecker, "resolve_named() name='%s'", name_str);
@@ -1642,16 +1709,20 @@ private:
             // so the divergence probe below can name both sides of a mismatch;
             // the lookup order and short-circuiting are unchanged.
             mut home_hit: TypeRef = TypeRef::invalid();
+            // Which qualified name won, so a comparison against the node's own
+            // answer can name both sides rather than only report that they
+            // differed.
+            mut home_key: SymbolStr = SymbolStr::empty();
 
             const home_qn: SymbolStr =
                 this.intern_table.intern(ctx.home_module + "::" + name_str);
             if (this.decl_index != null) {
                 const home_di: TypeRef = this.decl_index.lookup_type(home_qn);
-                if (home_di.is_valid()) { home_hit = home_di; }
+                if (home_di.is_valid()) { home_hit = home_di; home_key = home_qn; }
             }
             if (!home_hit.is_valid()) {
                 const home_arena: TypeRef = this.arena.lookup_by_name(home_qn);
-                if (home_arena.is_valid()) { home_hit = home_arena; }
+                if (home_arena.is_valid()) { home_hit = home_arena; home_key = home_qn; }
             }
             // The home module does not DECLARE the leaf, but "resolve where it
             // was written" means resolving against what that module can SEE -
@@ -1703,12 +1774,13 @@ private:
                     if (!home_st.is_valid()) {
                         home_st = this.arena.lookup_by_name(home_scoped);
                     }
-                    if (home_st.is_valid()) { home_hit = home_st; }
+                    if (home_st.is_valid()) { home_hit = home_st; home_key = home_scoped; }
                 }
             }
 
             if (home_hit.is_valid()) {
                 const home_answer: TypeRef = this.follow_alias(home_hit);
+                this.rn_seam_probe("2c", name_str, home_key, slot, ctx);
                 // Same mechanism, two very different claims.  When the home
                 // module came from the syntax's own span this IS spec §5.1
                 // resolution - the leaf resolved in the module that wrote it -
@@ -1788,6 +1860,7 @@ private:
             // own module when the context names one.
             if (this.name_resolver != null) {
                 const qualified: SymbolStr = this.canonical_type_name(name, ctx);
+                this.rn_seam_probe("3b", name_str, qualified, slot, ctx);
                 if (qualified.is_valid()) {
                     const di_found: TypeRef = this.decl_index.lookup_type(qualified);
                     if (di_found.is_valid()) {
@@ -1892,7 +1965,7 @@ private:
         // A bare Named base goes straight through resolve_named, bypassing the
         // canonicalization the `resolve()` Named arm applies to bare uses.
         mut base: TypeRef = match (*g.base) {
-            TypeAnnotation::Named(bn) => { this.resolve_named_at_span(bn.name, bn.span, ctx) }
+            TypeAnnotation::Named(bn) => { this.resolve_named_at_span(bn.name, bn.span, ctx, bn.res) }
             _                         => { this.resolve(g.base, ctx) }
         };
 

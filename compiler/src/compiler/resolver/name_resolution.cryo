@@ -75,6 +75,23 @@ public:
             spans.push(gp.span);
         }
         this.resolver.declare_generic_params(names, spans);
+
+        // A parameter's default (`struct Array<T, A = GlobalAlloc>`) is written
+        // type syntax with a span, in the template's own file, and it is
+        // resolved like any other annotation - so it needs an answer like any
+        // other annotation.  Unstamped, the only thing a reader has is the
+        // spelling, and it rebuilds a qualified name out of the home module and
+        // the leaf to get back what the slot would have held.
+        //
+        // After the parameters are declared, so a default naming an earlier one
+        // (`<T, U = T>`) is answered by that parameter instead of being searched
+        // for among declarations.
+        for (mut i: int = 0; i < generic_params.length; i++) {
+            const gp: GenericParamNode* = generic_params[i];
+            if (gp.has_default_annotation()) {
+                this.stamp_annotation(gp.default_annotation);
+            }
+        }
     }
 
 
@@ -1516,7 +1533,17 @@ public:
     stamp_named_annotation(&this, n: NamedAnnotation*) -> void {
         match (this.type_spelling_res(n.name, n.span)) {
             ResSlot::Answered(r) => { n.res.answer(r); }
-            _                    => { }
+            _                    => {
+                // A silent decline and a node the pass never saw are the same
+                // observation at every reader downstream, and they imply
+                // opposite fixes.  Recorded with the spelling and the span so
+                // the two stay apart.
+                ResolveCounter::stamp_decline(
+                    this.resolver.intern_table.resolve(n.name),
+                    this.resolver.intern_table.resolve(
+                        this.resolver.current_module_sym()),
+                    n.span.file, n.span.start_line as i32);
+            }
         }
     }
 
