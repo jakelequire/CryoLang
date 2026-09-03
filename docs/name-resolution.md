@@ -10206,3 +10206,100 @@ the step rather than a precondition someone else supplies.
 
 Named here so it arrives as the planned final item rather than as a surprise at
 the end.
+
+### 8.67 Decision 3 step 1: a module has an identity - MEASURED 2026-09-03
+
+8.57 scoped decision 3 in five steps and said plainly that nothing in it was
+built. Step 1 is built here, alone and verified alone, because the plan is
+reasoning rather than a tested sequence.
+
+#### The step as written could not be executed
+
+Step 1 says to declare the symbol "in the parent's scope". There is no parent
+scope. `set_module` builds every module scope with `this.global_scope` as its
+parent and the module's FULL name as its owner, so module scopes are flat
+siblings under global rather than a tree - `Compiler::Types::TypeRef` is not
+inside any scope belonging to `Compiler::Types`.
+
+Resolved toward the inert reading: the symbol is declared in the global scope
+under the module's full name. A full dotted name is never asked for as a bare
+leaf, so nothing can resolve differently for its being there. Binding a module
+under its LEAF - which is what makes a path like `TypeRef::TypeRef::x` resolve -
+is what an import must do, and it belongs to steps 2 and 4 rather than here.
+
+The C-import alias remains the precedent 8.57 identified: declared, exported,
+given a child Module scope. It is still the only construct in the tree that
+gives a module a symbol, and now it is no longer the only one that gives a
+module an identity.
+
+#### What it measures
+
+| | |
+|---|---:|
+| module symbols declared, `compiler/` build | **245** |
+| distinct modules among them | **245** |
+| modules the build reports compiling | 164 local + 81 std = **245** |
+
+One symbol per module, and first-wins holds: `set_module` runs once per module
+per pipeline stage and builds a fresh scope each time, so without the guard this
+would have declared a symbol per stage - which is the same 3-to-13 duplication
+8.57 measured in the scope index.
+
+#### The control, and a prediction that was wrong for a now-familiar reason
+
+Predicted behaviour-preserving and identical. On `compiler/` 2c answered 61,304
+before and **61,308** after, +4.
+
+Not behaviour. `declare_module_symbol` adds exactly four written annotations to
+`resolver.cryo` - `SymbolStr`, `i64`, `SymbolID`, `Symbol` - and `compiler/` is
+the corpus that compiles its own source. This is the THIRD time this artifact
+has been explained after the fact in this document (8.60's +2 offers, 8.63's -5
+rows). It is predictable and should be predicted: **a change to compiler source
+moves any count taken over `compiler/` by the number of declarations it adds or
+removes.**
+
+The real control is a corpus this work does not touch, and it is exact:
+
+| corpus | before | after | declines |
+|---|---:|---:|---:|
+| `examples/09-json-config` | 5,749 | **5,749** | 0 -> 0 |
+| `tests/reexport_private_module` | 2,063 | **2,063** | 1 -> 1 |
+
+`LOOKUP` 117, `REENTRY` 6, B1 0 and B4 0 on three arms, 178 compile-fail cases
+and 38 projects.
+
+#### What step 1 does NOT yet buy, and the ordering that follows
+
+The symbol exists; nothing reads it. `home_module` is still a string,
+`find_module_scope` still takes a string and still picks by symbol count among
+2-12 empty placeholders, and no `Res` names a module. Those are steps 2 to 4.
+
+The ordering matters more than 8.66 recorded. That entry put the qualifier
+change second and decision 3 first on general grounds; the constraint is harder
+than that. Measured over the whole tree:
+
+| spelling | occurrences |
+|---|---:|
+| `Compiler::Types::TypeRef::...` - fully qualified | **0** |
+| `Types::TypeRef::...` - bare module leaf | **0** |
+| `TypeRef::...` - the shorthand | 3,018 across 151 files |
+
+**There is no spelling of "the module, then the type" that resolves today.** A
+plain `import` binds a module's exports and never the module's own name, so a
+rewritten path would name something that does not exist. The codemod is blocked
+behind steps 2 to 4, exactly as 8.57 ordered it and contrary to 8.66.
+
+#### A number the coming steps need
+
+Binding modules under their leaf is viable but not free. Over the 319 modules of
+`compiler/src` plus `stdlib`:
+
+| | |
+|---|---:|
+| distinct leaf names | 297 |
+| leaves used by more than one module | **17** |
+| modules sharing a leaf | 39 |
+
+`error` is five modules, `Resolver` and `State` three each. 88% of modules have
+a unique leaf; the rest collide only where one file imports two of them, which
+`insert_import` already records as ambiguity rather than silently picking.
