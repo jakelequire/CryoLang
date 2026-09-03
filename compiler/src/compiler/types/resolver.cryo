@@ -1446,16 +1446,16 @@ type struct TypeResolver {
     /// Callers holding no node pass `ResSlot::Pending`.
     resolve_named_at_span(&this, name: SymbolStr, span: SourceSpan,
                           ctx: ResolutionContext*, slot: ResSlot) -> TypeRef {
-        if (ctx == null) { return this.resolve_named(name, ctx, slot); }
+        if (ctx == null) { return this.resolve_named(name, ctx, slot, span); }
         const ann_ns: string = ModuleGraph::home_ns_of_file(
             this.module_graph, this.intern_table, span.file);
         if (ann_ns.length() == 0 || ann_ns == ctx.home_module) {
-            return this.resolve_named(name, ctx, slot);
+            return this.resolve_named(name, ctx, slot, span);
         }
         const saved_home:   string     = ctx.home_module;
         const saved_origin: HomeOrigin = ctx.home_origin;
         ctx.set_home_module(ann_ns, HomeOrigin::Syntax);
-        const out: TypeRef = this.resolve_named(name, ctx, slot);
+        const out: TypeRef = this.resolve_named(name, ctx, slot, span);
         ctx.set_home_module(saved_home, saved_origin);
         return out;
     }
@@ -1545,7 +1545,8 @@ private:
     /// annotation is a fact this probe exists to count rather than an internal
     /// bug to report.
     rn_seam_probe(&this, step: string, name_str: string, qualified: SymbolStr,
-                  slot: ResSlot, ctx: ResolutionContext*) -> void {
+                  slot: ResSlot, ctx: ResolutionContext*,
+                  span: SourceSpan) -> void {
         if (!ResolveCounter::Audit::Named.enabled()) { return; }
 
         mut incumbent: string = "<none>";
@@ -1583,8 +1584,15 @@ private:
         mut home: string = "<none>";
         if (ctx != null && ctx.home_module.length() > 0) { home = ctx.home_module; }
 
+        // An absent file is the whole point of carrying the span: it separates a
+        // node standing for syntax the pass could have walked to from one that
+        // did not exist when the pass ran.
+        mut site_file: string = "<nospan>";
+        if (span.file.length() > 0) { site_file = span.file; }
+
         ResolveCounter::rn_stamp_seam(step, verdict, home, name_str, incumbent,
-                                      stamped);
+                                      stamped, site_file,
+                                      span.start_line as i32);
     }
 
     /// Length of `ctx.home_module`, or 0 when the context is absent.
@@ -1630,7 +1638,7 @@ private:
     ///   3. DeclarationIndex, by written literal then canonicalized name
     ///   4. Global leaf index
     resolve_named(&this, name: SymbolStr, ctx: ResolutionContext*,
-                  slot: ResSlot) -> TypeRef {
+                  slot: ResSlot, span: SourceSpan) -> TypeRef {
         const name_str: string = this.intern_table.resolve(name);
         const name_len: i64 = name_str.length() as i64;
         LOG_DEBUG(LogComponent::TypeChecker, "resolve_named() name='%s'", name_str);
@@ -1780,7 +1788,7 @@ private:
 
             if (home_hit.is_valid()) {
                 const home_answer: TypeRef = this.follow_alias(home_hit);
-                this.rn_seam_probe("2c", name_str, home_key, slot, ctx);
+                this.rn_seam_probe("2c", name_str, home_key, slot, ctx, span);
                 // Same mechanism, two very different claims.  When the home
                 // module came from the syntax's own span this IS spec §5.1
                 // resolution - the leaf resolved in the module that wrote it -
@@ -1860,7 +1868,7 @@ private:
             // own module when the context names one.
             if (this.name_resolver != null) {
                 const qualified: SymbolStr = this.canonical_type_name(name, ctx);
-                this.rn_seam_probe("3b", name_str, qualified, slot, ctx);
+                this.rn_seam_probe("3b", name_str, qualified, slot, ctx, span);
                 if (qualified.is_valid()) {
                     const di_found: TypeRef = this.decl_index.lookup_type(qualified);
                     if (di_found.is_valid()) {
