@@ -10014,6 +10014,22 @@ and a slot read - neither of them a search over the program.
 than by ratchet: there is no longer a path by which the ambient cursor supplies
 the module a bare leaf is resolved in, because 2c does not resolve one.
 
+#### The 742 failures are a signal, not breakage
+
+`X-failed` is the largest number in the tail and the one that looks worst - 42
+of them on `compiler/`, which builds green, so something recovered. Every one is
+a single-letter name: `T` 26, `C` 16, from three sites.
+
+The site carrying 34 of the 42 fails on purpose. `method_binding` resolves an
+explicit type argument in a FRESH context carrying no bindings, so that an
+argument naming the enclosing body's abstract parameter cannot select a concrete
+instantiation and the whole call is deferred. The failed resolution IS the
+detection. `sema.cryo:3776` and `type_resolution.cryo:63` account for the other
+8.
+
+So the tail below 2c is 101 answers and 742 deliberate refusals, and no part of
+it is a fallback recovering from a lookup that should have worked.
+
 #### A zero that is explained but not yet controlled
 
 `2-primitive` also answers 0 everywhere. The mechanism is known: 8.58 measured
