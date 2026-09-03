@@ -10303,3 +10303,46 @@ Binding modules under their leaf is viable but not free. Over the 319 modules of
 `error` is five modules, `Resolver` and `State` three each. 88% of modules have
 a unique leaf; the rest collide only where one file imports two of them, which
 `insert_import` already records as ambiguity rather than silently picking.
+
+### 8.68 Decision 3 step 2: modules admitted to the type namespace, and it is inert - MEASURED 2026-09-03
+
+One line: `Namespace::accepts` now answers true for `SymbolKind::Namespace` when
+asked in the TYPE namespace. 8.57 calls this "the one-line core of modules bind
+in the type namespace" and predicts steps 1 to 4 behaviour-preserving.
+
+#### Predicted NOT inert, and that was wrong
+
+The concern was concrete rather than vague. `resolve_path` resolves
+`segments[0]` as the head, and a written qualified annotation arrives as ONE
+`SymbolStr` containing `::` rather than as segments. Step 1 puts module symbols
+in the global scope under their FULL dotted name, and `resolve_path` walks the
+rib chain outward to global. So an annotation spelled `Compiler::Types::TypeRef`
+looked able to match the MODULE of that name and answer for it instead of the
+type inside - which would be 8.56's qualifier question arriving inside a step
+labelled safe.
+
+| corpus | before | after | declines | new diagnostics |
+|---|---:|---:|---:|---|
+| `examples/09-json-config` | 5,749 | **5,749** | 0 | none |
+| `tests/reexport_private_module` | 2,063 | **2,063** | 1 | E0240, its own assertion |
+| `compiler/` | 61,308 | **61,308** | 0 | none |
+
+Inert on every corpus, `compiler/` included - and note that `compiler/` does not
+move here either, because this change adds no declaration to the source being
+measured, which is the other half of 8.67's standing artifact rule.
+
+#### Why it is inert, which is the part worth keeping
+
+A qualified spelling never reaches this tier. `type_spelling_res` separates
+qualified from bare and only a BARE name is passed to
+`resolve_type_qualified_name_bare_from`, which is the only caller that asks
+`resolve_path` in the type namespace with an annotation's name. A bare leaf
+cannot equal a full dotted module name, so no module symbol is reachable from
+there however the namespace filter is set.
+
+That is also why the step buys nothing on its own: admitting the kind matters
+only once modules are bound under their LEAF, which is what an import must do.
+The predicate is now correct in advance of the binding that will exercise it.
+
+`LOOKUP` 117, `REENTRY` 6, B1 0 and B4 0 on three arms, 178 compile-fail cases
+and 38 projects.
