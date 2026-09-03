@@ -9989,3 +9989,44 @@ The reachability check remains on the no-answer branch. Decision 1 forbids a
 second way to ANSWER; refusing is not an answer, it is the reason there is not
 one. The branch is not dead - `namespace_gate_methods` and this corpus both
 reach it, which is what makes it testable rather than assumed.
+
+### 8.64 What the cascade is now: two steps and a 101-row tail - MEASURED 2026-09-03
+
+With 2c reading the stamp, `resolve_named`'s answers were re-taken over all 57
+corpora. This is the payoff figure for the migration, and it is taken over every
+corpus rather than the one this work is developed against.
+
+| step | rows | share | corpora answering |
+|---|---:|---:|---:|
+| `2c-home-syntax` - the stamp | 266,619 | 60.7% | 51 |
+| `1-generic` - an O(1) binding in the context | 169,640 | 38.6% | 52 |
+| `1b-assoc` - a projection on a generic param | 2,068 | 0.47% | 51 |
+| `3a-di-literal` | 63 | 0.014% | 5 |
+| `3b-di-canonical` | 38 | 0.009% | 6 |
+| `gate-unreachable` (a refusal, not an answer) | 5 | - | 3 |
+| `X-failed` | 742 | - | 42 |
+
+**Everything below 2c answers 101 times in 439,175 resolutions.** The nine-step
+cascade §7 describes is two steps and a tail, and the two are a context lookup
+and a slot read - neither of them a search over the program.
+
+`2c-home-cursor` is **0 on every corpus**. B1 is now zero by construction rather
+than by ratchet: there is no longer a path by which the ambient cursor supplies
+the module a bare leaf is resolved in, because 2c does not resolve one.
+
+#### A zero that is explained but not yet controlled
+
+`2-primitive` also answers 0 everywhere. The mechanism is known: 8.58 measured
+the substituter's 6,985 mints all carrying a valid `pre_resolved`, which
+short-circuits at `types/resolver.cryo` before `resolve_named` is entered, so
+the post-substitution `Named("i32")` the step exists for never arrives.
+
+That explains why these corpora read zero. It does not establish that no program
+reaches the step, and the failure mode is not graceful: a substituted primitive
+is minted with a `Pending` slot, so with the step gone it would fall past 2c
+into the 101-row tail and fail to resolve. Deleting on this zero needs a counter
+at the short-circuit showing it catches the WHOLE primitive population first -
+the control `resolve_struct_literal` did not have when a measured zero was
+deleted on and the suite went red.
+
+Recorded as a candidate, not taken.
