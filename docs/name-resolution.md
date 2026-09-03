@@ -7942,6 +7942,33 @@ CR bytes.** A byte count answers a question about one drifted worktree file;
 `--eol` answers the question that was meant, which is what the repository
 holds and what the attribute requires.
 
+#### How to check, because the obvious command lies
+
+A fourth session hit this, and not on the rule above - on the instrument used
+to test it. **`grep -c $'\r' <file>` is unreliable under Git Bash**: the shell
+does not always expand `$'\r'` to a literal CR, and the pattern then degenerates
+to one that matches every line. It reports a CR count equal to the file's LINE
+count, which reads as "every line is CRLF" and is indistinguishable from a real
+CRLF file at a glance.
+
+The tell is exact equality with `wc -l`. Observed here on five known-LF files:
+1,677 / 2,335 / 5,654 / 2,056 / 8,777 "CR lines" against 1,677 / 2,335 / 5,654 /
+2,056 / 8,777 lines.
+
+Three commands answer it, and they should agree:
+
+    git ls-files --eol <paths>     # the authority: index, worktree, attribute
+    tr -cd '\r' < <file> | wc -c   # actual CR BYTES, not lines containing one
+    head -c 60 <file> | od -c      # eyeball the line terminators
+
+`tr` is the byte-level check because it counts characters rather than matching
+lines, so a broken escape cannot inflate it. All five files above read 0 CR
+bytes, `i/lf w/lf`, and `\n` terminators under `od -c`.
+
+State it as the negative too, since that is the form that keeps being
+rediscovered: a nonzero `grep -c $'\r'` is NOT evidence of CRLF, and on its own
+is not grounds for changing how a file is written.
+
 ### 8.41 The global cascade is a stamp lane and an alias lane 2026-09-02
 
 `resolve_scope_resolution` asked three questions to find the global a
@@ -8154,7 +8181,16 @@ Predicted before running and confirmed: `lane-check` **119, unmoved**,
 OVERALL PASS 178 / 38 / 0, `make lsp` clean. The only behaviour change is those
 18 calls, which now use the signature of the function the call actually names.
 
-### 8.45 Scope: replacing the string seam with the `Res` seam
+### 8.45 Scope: replacing the string seam with the `Res` seam - STEPS 2-3 SUPERSEDED by 8.49/8.51
+
+> Step 1 ran and is recorded in 8.49. Its agreement prediction held; its scope
+> did not. `canonical_type_name` answers 22 of 78,310 resolutions on
+> `compiler/`, so steps 2 and 3 below are aimed at 0.03% of the traffic and are
+> **superseded**. The seam that carries it is step 2c, scoped in 8.51, whose
+> blocking coverage gap is now closed. `canonical_type_name` stays: it is the
+> only step that expands a written qualifier, and its population is small, not
+> zero.
+
 
 The type layer already consults the new name layer - it just receives the
 answer as a canonical STRING. `canonical_type_name` asks
@@ -8367,3 +8403,778 @@ diagnosis here and nowhere else" - falsified by the two sites above, in the
 same file. It turned out to be a stale paragraph left standing in front of the
 comment that replaced it, so the file stated both the old claim and the new one
 at once. Removed.
+
+### 8.49 The string seam 8.45 scoped carries 0.03% of the traffic - MEASURED 2026-09-02
+
+8.45 scoped the replacement of `canonical_type_name` on the reasoning that the
+type layer consults the name layer and receives the answer as a canonical
+string, and anchored its prediction on 8.38's annotation-stamp coverage of
+33,322 of 33,323. Step 1 was to thread the annotation's `ResSlot` into
+`resolve_named` and compare, at that seam, what the string path produced
+against what the stamp names.
+
+The threading is done and the probe ran. The agreement prediction held. The
+scope did not.
+
+#### Stated before the run
+
+Substantially all annotations reaching step 3 would be `STAMP-SAME`; any
+`STAMP-DIFFERENT` is a real disagreement about which declaration a written type
+names and is investigated as a defect; a material `INCUMBENT-ONLY` population
+means the stamp does not dominate and step 2 keeps the string path for it. The
+falsifier written down for coverage was that materially fewer stamps at this
+site would mean the population reaching the seam is exactly the one the stamp
+does not cover, and step 2's premise fails.
+
+#### What answers, over four corpora
+
+`cryo build --no-incremental` with `CRYO_RN_AUDIT` and `CRYO_RESOLVE_COUNTER`,
+counting every `resolve_named` exit:
+
+| corpus | total RN answers | 2c home-syntax | reach `canonical_type_name` | it answers |
+|---|---:|---:|---:|---:|
+| `compiler/` | 78,310 | 61,290 | 64 | **22** |
+| `examples/09-json-config` | 9,521 | 5,749 | 14 | **0** |
+| `tests/…/ffi_c_import` | 7,472 | 4,145 | 14 | **0** |
+| `examples/14-threads` | 8,944 | 4,868 | 65 | **11** |
+
+On the compiler's own source the seam is consulted 64 times in 78,310
+resolutions and answers 22 of them - **0.03%**. Steps `3c-di-bare` and
+`5-leaf-index` answer zero on every corpus.
+
+#### The two populations that reach it, and neither is the general case
+
+Every row that reaches `canonical_type_name` is one of exactly two shapes, and
+they are the same four corpora over:
+
+**Partially-qualified written names**, which is all of the productive traffic:
+`ResolveCounter::Site` -> `Compiler::ResolveCounter::Site`, `stdio::Stdin` ->
+`std::io::stdio::Stdin`, `mpsc::Sender` -> `std::sync::mpsc::Sender`. The work
+being done is expanding a written prefix to the canonical path. All 22 on
+`compiler/` and all 9 on `14-threads` carry a `::`.
+
+**Bare generic parameters that then fail** - `T` and `C`, 42 of them on
+`compiler/`, of which 36 carry no stamp at all and 6 stamp `GenericParam`. The
+`NEITHER` count equals the `X-failed` count exactly on every corpus: nothing
+that reaches this seam without a written qualifier is ever answered by it.
+
+A bare name that succeeds never gets here. Step **2c** takes it first.
+
+#### Agreement held; coverage did not
+
+Where both sides answer: **31 of 31 `SAME`** (22 `compiler/`, 9 `14-threads`),
+**0 `DIFFERENT`**, 0 `STAMP-ONLY`. Two `INCUMBENT-ONLY`, both `mpsc::Sender`
+with a `Pending` slot - the same spelling that is stamped on three other rows
+in the same build, so it is a stamping gap and not a disagreement.
+
+So the agreement prediction is confirmed and the coverage prediction is
+falsified, in the shape the falsifier named: the rows reaching this seam are
+disproportionately the ones the stamp does not cover, because they are
+overwhelmingly generic parameters and failures.
+
+#### Where the string seam actually is
+
+`resolve_named` step 2c answers 61,290 of 78,310 on `compiler/` and the
+plurality on every other corpus. It reaches its answer by building one:
+
+    this.intern_table.intern(ctx.home_module + "::" + name_str)
+
+`ctx.home_module` is derived from the annotation's SPAN, through
+`home_ns_of_file` - which is the string-shaped stand-in for the stamp that 8.45
+itself names, one step above the function it went on to scope. The stamp
+replaces 2c's INPUT, not `canonical_type_name`'s output. Retargeting is a
+separate scoping exercise and is not taken here.
+
+#### What this does not license
+
+It does not license deleting `canonical_type_name`. The population is small,
+not zero, and it is the only step that expands a written qualifier - the
+measurement above is the control on that, not a clearance. All four corpora
+were built with `cryo build`, which does not compile the orphan modules `cryo
+test` reaches, and `tests/` as a whole is unmeasured here; 8.48 found 234 of
+its 245 collisions in exactly that tree.
+
+#### The probe
+
+`rn_seam_probe` compares the two as NAMES rather than looking each one up. The
+index lookup is a deterministic function of the name handed to it, so equal
+names reach one type without a second lookup proving it - and a second lookup
+would have added a per-kind call site to the surface `lane-gate.py` pins,
+making the instrument indistinguishable from the regrowth that ratchet exists
+to catch. `LOOKUP` stayed at 118 across the change, which was predicted before
+it was run. The comparison over-reports rather than under-reports: two names
+aliasing one target are distinct here and identical after the alias walk, so a
+`DIFFERENT` row would be a candidate to adjudicate rather than a defect already
+established. None appeared.
+
+### 8.50 The bare door's residual exposure is one signature-identical call - MEASURED 2026-09-02
+
+8.48 left the 2,653 stamp-silent calls reaching the bare `func_type_refs` door
+unmeasured for leaf collisions, and said so: "nothing establishes that those are
+collision-free". This measures them.
+
+#### Stated before the run
+
+A non-trivial share of bare answers would land on a leaf more than one module
+declares. The falsifier: if that share is zero across every corpus, the residual
+exposure is closed by measurement rather than by argument, and 8.48's fork can
+be answered instead of carried.
+
+#### Method, and the control on the instrument
+
+`lookup_callee_function_type` has three exits - the stamp, the home-qualified
+lookup, and the bare slot. A row is emitted at each, carrying the leaf and how
+many DISTINCT modules registered a function type under it, read from the index's
+own owner-aware overload arrays. Logging every door and not only the bare one is
+deliberate: the exposure is a fraction, and a numerator without its denominator
+is the shape this ledger has had to retract before.
+
+The instrument was controlled against 8.48's own collision list before its zero
+was believed. It reports **4** distinct declarers for `read`
+(`intrinsics`/`ffi::libc`/`sys`/`fs::file`), **3** for `free`
+(`intrinsics`/`alloc::heap`/`alloc::allocator`) and **2** for `sleep`
+(`time::clock`/`thread`) - the exact pair 8.48 recorded. So a colliding leaf is
+visible to it.
+
+**Every one of those reaches the STAMP door and never the bare one.**
+
+#### What answers, over five corpora
+
+| corpus | STAMP | HOME | BARE | BARE on a plural leaf |
+|---|---:|---:|---:|---:|
+| `compiler/` | 4,478 | 0 | 2,173 | 0 |
+| `examples/09-json-config` | 744 | 0 | 73 | 0 |
+| `tests/…/ffi_c_import` | 550 | 0 | 73 | 0 |
+| `examples/14-threads` | 740 | 0 | 194 | 0 |
+| `tests/` (41 projects) | 16,364 | 6 | 2,394 | **1** |
+
+On `tests/`, **618 STAMP rows carry a plural leaf** - calls that would be
+exposed and are not, which is the value of asking the stamp first, measured
+rather than asserted.
+
+#### The one exposed call, and why it cannot harm
+
+`tests/tests/projects/visibility_gate`, the leaf `stash`, declared by both
+`VisibilityGate::Annex` and `VisibilityGate::Vault`. The project exists to
+construct exactly this: its own source says the second declarer's "only job is
+to push `Main`'s bare `stash(1)` off the binder's fast path".
+
+Both declarations are `(v: i32) -> i32` - the same signature, on purpose, so
+that which one binds is not visible in the result. The harm the bare slot can do
+is hand expected-type propagation a WRONG signature; two identical signatures
+cannot. The choice of which function is actually called is made by
+`try_pin_overload_mangled_callee`'s import-scoped path, not by this hint.
+
+#### The metric's blind spot, and its control
+
+Owner 0 is a global claim naming no module, so a leaf claimed only by owner-0
+entries would read as singly-declared however many modules wrote it. Across all
+five corpora that reduces to eight leaves, and cross-tabulating owner count
+against whether the door answered closes it: six of them (`Parser`, `ASTCloner`,
+`NameResolver`, `SemaVisitor`, `IRGeneratorVisitor`, `ASTDumper`) **miss** - no
+answer, so no wrong answer - and the two that hit, `_open_osfhandle` and
+`_get_osfhandle`, are each declared once.
+
+`Parser` is the instructive one: it IS plural (`Compiler::Parser::Parser` and
+`std::json::parser::Parser`, and the compiler imports the latter), and it still
+cannot be exposed, because no function type is registered under the bare leaf
+for a constructor to answer from.
+
+#### A zero that had the wrong population, caught in time
+
+The HOME door answers **0** on all four build corpora, and a deletion was very
+nearly proposed on that - the shape 8.46 used to retire a lane. `tests/` answers
+**6**, all of them the synthesized `main$async` of the three `async_main`
+projects. The door is alive and serves one synthesized-name population. Four
+corpora agreeing on zero were four corpora that did not contain the case.
+
+#### What this answers, and what it does not
+
+8.48's fork was: leave the bare door shielded by its consumers, or make the map
+owner-aware so a leaf cannot answer for a module that did not declare it.
+Shielding is **empirically sufficient today** - the residual is one call, and it
+is signature-identical. The owner-aware map remains the structurally correct
+fix; what changes is that its size is now known rather than feared.
+
+It does not close the question. All five corpora were built with `cryo build`,
+which does not compile the orphan modules `cryo test` reaches; 14 of the 41
+`tests/` projects are compile-fail gates whose rows stop at the diagnostic. And
+the bare count here is not 8.48's 2,653 - that figure and this one are taken at
+different sites and are not claimed to measure the same population.
+
+### 8.51 The real string seam agrees 40,450 of 40,450, and is blocked on one unstamped owner - MEASURED 2026-09-02
+
+8.49 located the seam that carries the traffic: step 2c, which answers 61,290 of
+78,310 type resolutions on `compiler/` by building
+`intern(ctx.home_module + "::" + name_str)`. This measures whether the stamp can
+replace that construction, by the same name-comparison the 8.49 probe uses.
+
+#### Stated before the run
+
+Volume of order 61,000; high `Def` coverage, on 8.38's 33,322-of-33,323; a large
+`SAME` majority. A material `DIFFERENT` population is a real disagreement about
+which declaration a bare annotation names - the 8.44 shape - and a defect. A
+material `INCUMBENT-ONLY` population means the stamp cannot replace 2c wholesale.
+
+#### What it answers
+
+| verdict | rows | share |
+|---|---:|---:|
+| `SAME` | 40,450 | 66% |
+| `INCUMBENT-ONLY` | 20,844 | 34% |
+| `DIFFERENT` | **0** | - |
+| `STAMP-ONLY` | 0 | - |
+
+**Where the stamp answers it agrees, 40,450 of 40,450, with no exceptions.** So
+agreement is not the risk at this seam either, and the retarget is not blocked on
+correctness. It is blocked on coverage: every one of the 20,844 is `Pending` -
+not a non-definition answer, but no answer at all.
+
+#### The coverage figure that was inherited, and what it actually counted
+
+8.45 anchored its prediction on the annotation stamp answering 33,322 of 33,323,
+read as "annotations reaching the resolver carry a stamp". At this seam 34% do
+not. The two are not in conflict; they count different populations, and only one
+of them is the population a consumer meets. A coverage figure taken at the
+stamping pass cannot stand in for one taken at the reader.
+
+#### It is one owner, not a spread
+
+| written name | unstamped rows |
+|---|---:|
+| `GlobalAlloc` | 17,877 |
+| `TypeRef` | 684 |
+| `LValue` | 420 |
+| `String` | 318 |
+| everything else | ~1,545 |
+
+`GlobalAlloc` is **86%** of the gap, and its home modules are
+`std::collections::array` (14,644), `::string` and `::hashmap`. That is the
+signature of one construct: `struct Array<T, A = GlobalAlloc>`. Names such as
+`TypeRef` and `LValue` appear in BOTH columns, which is the same story - the
+parser-produced use is stamped and the default-argument use is not.
+
+#### The cause
+
+`expand_default_type_args` resolves `gp.default_annotation`, which is a real
+parser-produced annotation carrying a `res` slot - the `= GlobalAlloc` in the
+template's own declaration. Nothing ever writes that slot.
+
+`declare_generics` is, by its own doc comment, the single call site for
+introducing generic parameters. It declares the parameter NAMES and never calls
+`stamp_annotation` on their defaults; the identifier `default_annotation` does
+not occur anywhere in `name_resolution.cryo`.
+
+So a generic parameter's default is the sixth owner of written syntax the
+stamping pass does not visit, after the four already closed and the impl head.
+It is not a synthesized node that legitimately has no stamp - it is written type
+syntax with a span and a slot, in a file the pass walks.
+
+#### Why this is the whole lever
+
+Closing it takes stamp coverage at the seam carrying 78% of type resolutions
+from 66% to roughly 95%, against a measured zero disagreements. No other change
+found so far moves the migration by a comparable amount, and none of the
+alternatives is a one-owner fix.
+
+#### Fixed, and what the prediction said first
+
+`declare_generics` now stamps each parameter's default after declaring the
+parameter NAMES, so a default naming an earlier parameter (`<T, U = T>`) is
+answered by that parameter rather than searched for among declarations. It is
+the same ordering the sibling `stamp_annotation(param.type_annotation)` call
+already depends on, and all seven `declare_generics` call sites are in the
+resolving pass's `visit` methods - none in forward declaration, which matters
+because `answer` is first-write-wins and an early wrong answer would be
+permanent.
+
+Predicted before the run: `INCUMBENT-ONLY` to about 2,970, `DIFFERENT` to stay
+at 0, gates unchanged. A nonzero `DIFFERENT` would have meant the stamp just
+written disagrees with 2c - a defect in the fix, not a finding about the seam.
+
+| | before | after |
+|---|---:|---:|
+| `SAME` | 40,450 | **58,115** |
+| `INCUMBENT-ONLY` | 20,844 | **3,180** |
+| `DIFFERENT` | 0 | **0** |
+| coverage | 66% | **94.8%** |
+
+Agreement is now 58,115 of 58,115. `LOOKUP` 118, `REENTRY` 6, B1 0 and B4 0 on
+all three arms, 178 compile-fail cases and 38 projects unchanged - the last of
+those is the one that mattered, because stamping runs the reachability gate over
+syntax it had never been run over, and a default naming something its own module
+cannot reach would have produced a diagnostic no program had seen before. None
+appeared.
+
+#### The residue, and one thing it is not
+
+3,180 remain, now spread rather than concentrated: `TypeRef` 684, `LValue` 420,
+`String` 318, and `GlobalAlloc` down to 213 from 17,877. That last 213 is worth
+naming as unfinished rather than rounded away - the same construct is stamped
+17,664 times and unstamped 213 times, so there is a second path producing these
+nodes, and cloning is the obvious suspect (`ASTCloner` copies a default
+annotation, and a `Res` is copied verbatim by contract). It was not chased here.
+
+#### Agreement re-measured over 44 corpora
+
+`compiler/` alone is one corpus, and 8.48 found 234 of its 245 collisions in
+`tests/`, so the agreement claim was re-taken over the three build corpora plus
+all 41 `tests/` projects:
+
+| | rows |
+|---|---:|
+| 2c `SAME` | 133,926 |
+| 2c `INCUMBENT-ONLY` | 20,438 |
+| 2c `DIFFERENT` | **0** |
+| 3b `NEITHER` / `SAME` / `INCUMBENT-ONLY` | 517 / 12 / 2 |
+
+**Zero disagreements in 154,895 rows.** Coverage is 86.8% across all corpora
+against 94.8% on `compiler/` alone, so the residue is proportionally larger
+outside the compiler and the `compiler/`-only figure would have flattered it.
+
+The residue is a fixed population, not a growing one: every one is a stdlib
+generic type written in a stdlib module - `std::core::iter` (3,861),
+`std::collections::hashmap` (3,790), `::array`, `::str` - spelled `String`,
+`RefIter`, `Str`, `TakeIter`, `MapIter`, `ValuesIter`. Many appear exactly 585
+times, which is 44 corpora times a constant: the stdlib resolved once per build.
+The clone is not the cause - `TypeAnnotation::clone` copies `res` verbatim, and
+`NameResolution` runs before `DefaultExpansion`, so a cloned default carries the
+stamp the fix now writes. Locating the construct needs the annotation's own span
+on the probe row, which it does not carry.
+
+#### What blocks the retarget now, and it is not agreement
+
+Making 2c authoritative requires the answer to a design question rather than
+another measurement. Decision 1 says a consumer reads the stamp and takes the
+answer, and that "stamp first, then the old cascade" is wrong by construction.
+At 86.8% coverage a retarget can only be that hybrid - unless the residual
+13.2% is stamped first. So the sequencing is: close the coverage gap, then
+collapse 2c; not collapse 2c behind a fallback.
+
+### 8.52 The remaining unstamped annotations were never offered to the stamper - MEASURED 2026-09-02
+
+8.51 closed the largest stamping gap and left 13.2%. Two hypotheses about the
+residue were formed and both were wrong before anything was changed, which is
+recorded because each looked obviously right:
+
+- **`stamp_annotation` has no `Generic` arm.** Every residual spelling is a
+  generic type written `Foo<...>`, so a missing arm would explain all of it. It
+  has one, and it stamps both the base and every argument.
+- **The clone drops the stamp.** `TypeAnnotation::clone` copies `res` verbatim,
+  and `NameResolution` runs before `DefaultExpansion`, so a cloned default
+  carries the stamp.
+
+#### Instrumented instead of guessed a third time
+
+The stamper's failure arm was a bare `_ => { }`: a silent decline. That makes
+"the stamper refused this name" and "this node was never offered to the stamper"
+the same observation at every reader downstream, and they imply opposite fixes -
+a lookup that cannot see the name, versus a node minted after the pass ran. An
+event was emitted at the arm.
+
+**`STAMP-DECLINE` is 0** on `examples/14-threads`, whose 2c residue is 58
+`Shared`, 56 `String`, 45 `Payload`, 30 `ChanNode`, 24 `ScopePayload`.
+
+#### The control on that zero
+
+Both this probe and the existing impl-head decline counter read 0 on that
+corpus, which is consistent but proves nothing on its own - a probe that never
+fires reads the same as a stamper that never refuses. Run over
+`tests/tests/projects/namespace_gate`, the probe emits **6** declines, all the
+spelling `Crate` at `src/main.cryo:11-14`. So it fires, and `type_spelling_res`
+does return `Pending` when a name is genuinely unreachable.
+
+The zero is therefore real, and it settles the question: these nodes are **not
+declined, they are never presented**. Every one names a type that is declared in
+a real file (`Shared`, `Payload`, `ScopePayload` in `stdlib/thread/_module.cryo`;
+`ChanNode`, `ChannelInner` in `stdlib/sync/mpsc.cryo`), so the SPELLING is
+resolvable - it is the NODE that postdates the pass.
+
+#### What that makes it
+
+A different defect class from 8.51's. That one was written syntax the pass
+walked past and could simply visit. This one is annotation nodes minted or
+rebuilt after name resolution has finished, by async lowering, monomorphisation
+and the mint sites in `type_resolution` and `expr_parser`. The rule they violate
+is already stated - a synthesizer owes its node a `Res` - and the fix is
+per-synthesizer, because only the minting site knows what its node means.
+
+It is scoped, not taken. Closing it is what makes 2c collapsible without the
+fallback decision 1 forbids, and it is the last thing standing between the
+measurements above and that collapse.
+
+### 8.53 Two inherited claims corrected, with their derivations 2026-09-02
+
+Both arrived through the handoff's "assumptions I did NOT verify" section, and
+both were relayed onward as fact before anyone re-derived them. Recorded here
+rather than fixed privately, because a correction that lives only in a session's
+context is inherited as the original error.
+
+#### `pre_resolved` has six readers, not one
+
+The claim: "`pre_resolved` reduces to one answering site
+(`types/resolver.cryo:364`), with three `substituter` sites minting `Pending`."
+
+Derived under `lane-gate.py`'s own rules - `//` tails stripped, comment-only
+lines dropped - over every `.cryo` file in `compiler/src`:
+
+| site | what it does |
+|---|---|
+| `types/resolver.cryo:364-365` | **answers** - returns the value |
+| `passes/type_resolution.cryo:342` | guard: `is_valid()` then skip |
+| `passes/type_resolution.cryo:390` | guard |
+| `passes/type_resolution.cryo:1975` | guard |
+| `sema/member_resolver.cryo:838` | guard |
+| `AST/_module.cryo:350` | the clone copies it (defining file) |
+
+**Six read sites, five outside the defining file: one answering and four
+guards.** The one answering site is right; the four guards were never
+enumerated.
+
+The second half is wrong twice over. The substituter writes the field at **five**
+sites - `:196`, `:272`, `:291`, `:1010`, `:1031` - not three; two further
+`inner_pre_resolved` occurrences at `:1006` and `:1027` are PARAMETER names, not
+field accesses, which is the likeliest way a count of three was reached. And
+none of them mints `Pending`: `Pending` is a `ResSlot` state, `pre_resolved` is a
+`TypeRef` whose absent value is `TypeRef::invalid()`, and the substituter writes
+REAL TypeRefs there (`resolved_arg_typeref`, `spec_typeref`) - it is the site
+that makes them valid, the opposite of minting absence. `res.cryo` states the
+distinction between the two fields explicitly.
+
+Why it mattered: 8.45 step 3 deletes `canonical_type_name` "once the population
+reaching them is zero, with the call count as the control". A deletion control
+needs every reader of the seam, and four of them were invisible.
+
+#### The section-coordinate comments are not concentrated in `resolver/`
+
+The claim, from the cleanliness audit: "15 of 19 section-coordinate comments sit
+in `resolver/`."
+
+    grep -rn '§[0-9]' compiler/src --include=*.cryo | wc -l     -> 103
+    grep -rln '§[0-9]' compiler/src --include=*.cryo | ...      -> 19 files
+
+**103 comment lines across 19 files in 7 directories**, of which **3 files** are
+under `resolver/`: `compiler/` 6, `sema/` 5, `resolver/` 3, `codegen/visit/` 2,
+and one each in `types/`, `passes/`, `mono/`. The audit appears to have counted
+FILES, got 19, and attributed them to one directory.
+
+The house rule against spec coordinates in comments still applies to all 103;
+what changes is that cleaning `resolver/` would address three files, not
+fifteen, so the work is spread rather than concentrated.
+
+### 8.54 `selfhost-check`'s Linux arm leaves an ELF where the Windows binary was 2026-09-02
+
+The Linux arm's stage 4 builds to `build` - `compiler/build` itself, not a
+stage-private directory the way the Windows arm's `build/self/win-s2..s4` and
+the Linux arm's own `build/self/s3..s4` do. Combined with the run's "Wiping
+stage outputs" step, a `make selfhost-check` on Windows ends with
+`compiler/build/cryo.exe` **deleted** and `compiler/build/cryo` an
+`ELF 64-bit LSB pie executable`.
+
+`make test` does not rebuild the compiler. So a `make test` straight after a
+green `selfhost-check`, without `make cryo` first, runs against a missing or
+foreign-architecture binary - which presents as a test failure with no source
+change behind it, the exact shape this document elsewhere warns reads as a
+regression. `make cryo` restores the PE32+.
+
+`stdlib/.bin` is NOT affected: it holds `x86_64-pc-linux-gnu`,
+`x86_64-pc-windows-gnu` and `self` side by side, so the per-triple split does
+here what it was built to do. It is `compiler/build` alone that is shared.
+
+### 8.55 `CompileMode` was a missing import, not the module/type collision - MEASURED AND FIXED 2026-09-02
+
+Scoping decision 3 begins with the case it is expected to subsume. 8.38 recorded
+the single unstamped annotation in `compiler/src` as `CompileMode` at
+`passes/directive_processing.cryo:1780` and classified it: "That is the
+module/type name collision already on record as unimplemented and awaiting a
+decision - a namespace and a type contesting one leaf." 8.39 carried that
+forward: it "is expected to fall out of this rather than needing its own
+treatment. It is not a straggler; it is where the missing structure shows
+through."
+
+Both are wrong. It was a straggler, and one import closed it.
+
+#### The mechanism, read rather than inferred
+
+`type_spelling_res` returns `Pending` at `AnnResUnresolved` when
+`resolve_type_qualified_name_bare_from(home_scope, name)` cannot answer - that
+is, when **the writing module's own scope cannot reach the name**. It is a
+reachability fact about one file's imports, not a contest between two
+declarations.
+
+`passes/directive_processing.cryo` imports `Compiler::CompilationContext` and
+does not import `Compiler::CompileMode`. Nothing else brings the name in: using
+a value of a type does not bind the type's name.
+
+#### The experiment, with its falsifier stated first
+
+Predicted: adding `import Compiler::CompileMode;` drives `ANN-UNSTAMPED` from 1
+to 0. Falsifier: if it stayed at 1 the name was already reachable and something
+else blocked stamping, which would have supported 8.38's reading over this one.
+
+| | `ANN-UNSTAMPED` on `compiler/` |
+|---|---:|
+| before | 1 (`CompileMode`, `directive_processing.cryo:1780:13`) |
+| after | **0** |
+
+Control on the zero: the same run emits **97,345** `PATH-HIT` rows, so the
+stream is live and the zero is an absence of events rather than an absence of
+instrumentation.
+
+#### The collision the decision dissolves has no instances
+
+The tree was counted for both shapes a module/type leaf clash can take, over
+`compiler/src` and `stdlib` - 319 modules:
+
+| shape | meaning | count |
+|---|---|---:|
+| A | the type is declared INSIDE the module whose leaf it shares (`namespace A::B;` + `type struct B` in that file) | **76** |
+| B | a module `A::B` and a type `B` contesting the SAME scope `A` | **0** |
+
+Shape A is 24% of every module in the tree - it is the file-per-type convention
+(`Compiler::Codegen::Ops::ExprOps` holding `type class ExprOps`). Under Rust's
+model these do NOT collide: the module binding lives in the PARENT's type
+namespace and the type in the module's own, so they are never in one scope.
+`CompileMode` is Shape A.
+
+Shape B is the one 8.39 describes as becoming "an ordinary duplicate
+definition", and there are none.
+
+#### The defect backlog decision 3 was chosen partly to clear is EMPTY
+
+Stated plainly, because the decision was taken partly on the grounds that it
+"retires the parked module/type collision item":
+
+**There is no parked collision to retire.** Shape B has zero instances across
+319 modules. The one case ever cited as an instance - `CompileMode` - was a
+missing import and is fixed. Nothing in `compiler/src` or `stdlib` today is
+waiting on this decision.
+
+The decision may still be right: modules are genuinely not `Symbol`s in this
+compiler, and Rust's model is a real structural improvement. But the case for it
+has to be made on what the structure buys, because:
+
+* its named beneficiary is fixed, and was never an instance of the problem;
+* the collision shape it dissolves has zero occurrences in the tree;
+* the shape that IS pervasive is already legal under the model being adopted,
+  so adopting it neither breaks nor improves those 76.
+
+This is a re-decision, not a footnote: whoever chose it should get to weigh it
+against the real evidence rather than against a backlog that does not exist.
+
+#### How the wrong cause propagated, which is the reusable part
+
+The mechanism matters more than the instance. A cleanliness audit observed ONE
+symptom - a single unstamped annotation - and inferred a STRUCTURAL cause for it
+(a namespace and a type contesting one leaf). Nobody checked the file's import
+list, which is four lines long and settles it. The inference was then repeated
+into 8.38, carried into 8.39 as the justification for a design decision, and
+relayed onward twice more as fact. Five restatements, no measurement.
+
+That is the shape of 8.2ak exactly: a plausible structural story attached to a
+real symptom, repeated until its confidence came from the repetition rather than
+from evidence. The guard is the same one this section keeps arriving at - a
+claim about a CAUSE has to name the measurement that distinguishes it from the
+next cause over, and "the file does not import the name" was one grep away
+throughout.
+
+### 8.56 PARKED FOR JAKE: does Cryo keep a qualifier shorthand Rust does not have?
+
+Blocks the qualifier-position half of decision 3. It is a source-language
+semantics question - it decides what `A::B` means when `A` names both a module
+and a type - so it is not taken here.
+
+#### It is not a precedence rule, it is a feature
+
+8.39 records the intended rule as "module wins in qualifier position", which
+reads like an ordering tweak. It is not. Consider the shape, which 8.55 measured
+at **76 of 319 modules**:
+
+    namespace Compiler::CompileMode;        // module  Compiler::CompileMode
+    type enum CompileMode { Check; ... }    // type    Compiler::CompileMode::CompileMode
+
+Rust's equivalent is `mod compile_mode { enum CompileMode { Check } }`, and Rust
+makes you write **`compile_mode::CompileMode::Check`**. There is no shortcut:
+the module and the type are separate path segments and both must be spelled.
+
+Cryo today lets you write **`CompileMode::Check`** - the qualifier resolves to
+the TYPE, and the module segment is elided. That elision is the convenience
+"module wins in qualifier position" would remove, because module-wins resolves
+`CompileMode` to the module, whose members do not include `Check`.
+
+#### So the question is
+
+**Does Cryo keep a shorthand Rust deliberately does not have?**
+
+* **Keep it.** `A::B` prefers the TYPE when `A` names both and the module has no
+  member `B`. Cryo stays more concise than Rust for the file-per-type
+  convention, which is 24% of the tree. Cost: the qualifier's meaning depends on
+  what the qualified name resolves to, which is a lookup, not a syntactic rule -
+  and a rule of that shape is how the old cascade grew.
+* **Drop it, matching Rust.** `A::B` always resolves `A` as a module when one
+  exists. Uniform, syntactic, no lookup-dependent meaning. Cost: every
+  `CompileMode::Check`-style path in the tree needs the module segment spelled,
+  and that is a source-breaking change to existing valid programs.
+
+The second is the one 8.39 currently records. Neither is taken until Jake
+answers, and the 76 modules are the blast radius either way.
+
+#### What is NOT blocked on it
+
+The rest of decision 3 - modules declared as `Symbol`s and bound in the type
+namespace - does not depend on this. Shape A does not collide under either
+answer, because the module binding and the type live in different scopes. Only
+the qualifier's meaning is contested.
+
+### 8.57 Scope for decision 3: a module has a name, and no identity - MEASURED 2026-09-02
+
+8.55 removed decision 3's stated justification by measuring the backlog it was
+to clear at zero. This is the justification that survives measurement, and the
+scope that follows from it. Nothing here is built.
+
+#### The premise checks out, against a prediction that it would not
+
+Predicted: modules ARE declared as `Symbol`s, since `SymbolKind::Namespace`
+exists and is constructed, so 8.39's "Cryo never declares a module as a `Symbol`
+at all" is overstated. **Wrong.** `Symbol::namespace_sym` has exactly ONE caller
+- `name_resolution.cryo:385`, the namespace alias of a C-import `extern` block.
+An ordinary `namespace A::B;` never produces a symbol.
+
+The exception is worth keeping in view rather than discarding: the C-import
+alias is declared, exported, and given a child `ScopeKind::Module` scope. It is
+a working precedent in this tree for exactly what decision 3 proposes, on a
+population of one construct.
+
+#### What a module is instead
+
+A string. `find_module_scope(module_name: string)` interns the name and consults
+`module_scope_index: HashMap<u32, u64[]>` - a MULTIMAP, because "the resolver
+may create several same-named Module scopes across pipeline stages". It then
+returns the scope with the most symbols.
+
+Five callers, every one passing a string:
+`mono/monomorphizer.cryo:584`, `resolver/name_resolution.cryo:1472` and `:1506`,
+`sema/sema.cryo:458`, `types/resolver.cryo:1602`.
+
+`:1506` is inside `type_spelling_res`, and `types/resolver.cryo:1602` is
+`home_scope_of`, which feeds `canonical_type_name`. So **the stamp itself is
+derived through this lookup**, and so is the 2c seam 8.51 measured at 61,290 of
+78,310 resolutions.
+
+#### The tie-break is not an edge case
+
+The field's comment says the resolver "may create" several same-named scopes.
+Measured over a full `compiler/` build:
+
+| candidate scopes under one module name | lookups |
+|---:|---:|
+| 1 | **0** |
+| 3 | 10 |
+| 4 | 32,162 |
+| 7 | 9 |
+| 8 | 15 |
+| 10 | 2,828 |
+| 11 | 38 |
+| 12 | 411 |
+| 13 | 4,323 |
+
+**39,797 lookups and not one has a single candidate.** The minimum is three, so
+`may create` is `always creates`.
+
+Control on the counts: `create_scope` allocates a fresh `next_scope_id` before
+pushing, so every entry in a bucket is a DISTINCT scope by construction and the
+candidate count cannot be inflated by one scope recorded repeatedly.
+
+#### But the tie-break is not CHOOSING anything - a correction to the line above
+
+This entry first read the count above as "a module name is ambiguous 3-13 ways
+on every lookup, resolved by a popularity heuristic standing in for identity."
+**That was wrong**, and the measurement that corrects it was run against a
+prediction that it would find a defect.
+
+Predicted: some losing candidate holds a name the winner lacks, because scopes
+built at different pipeline stages plausibly hold different subsets - which
+would make the name unreachable through the lookup, a real defect. Falsifier: a
+winner that is a superset in 100% of lookups leaves the argument structural
+rather than a bug.
+
+| | lookups |
+|---|---:|
+| winner holds every name its rivals hold | **39,797** |
+| winner MISSING a name a rival holds | **0** |
+
+Zero mis-picks. And the control on that zero is the finding:
+
+| | lookups |
+|---|---:|
+| every rival scope EMPTY | **39,797** |
+| at least one populated rival | **0** |
+| loser symbols summed over the whole build | **0** |
+
+So there is exactly ONE populated scope per module name, and the other 2-12 are
+empty. The superset result is trivially true - a winner is a superset of nothing
+- and the tie-break is **skipping placeholders, not selecting among rival
+bindings.** Its outcome is deterministic today.
+
+Control on THAT control, because two zeros in a row are worth distrusting: the
+candidate distribution in the same build is unchanged at 3-13 and never 1, so
+rivals do exist; and all 39,797 winners are themselves populated, so the compare
+had a real set on both sides of the question. A sample row -
+`Compiler::Diag::Severity`, 3 candidates, winner holding 1 symbol, rivals
+holding 0.
+
+#### What the fragility actually is
+
+Not ambiguity. The honest claim is narrower and still worth making: the index
+accumulates 2-12 empty duplicate Module scopes per name, and NOTHING enforces
+that only one is ever populated. The tie-break is correct by accident of that
+invariant rather than by construction, and the invariant is not written down or
+checked anywhere. If a second scope under one name were ever populated, the
+lookup would silently pick by symbol count and no diagnostic would fire.
+
+That is a latent hazard and a waste, not a live defect. No mis-pick exists on
+this corpus.
+
+#### The justification that survives
+
+One argument survives measurement, and it is the string one:
+
+* because there is no module symbol, there is no `Res` a consumer can hold for
+  a module. That is why `ResolutionContext.home_module` is a `string`, why
+  `find_module_scope` takes a `string`, and why 2c must rebuild
+  `home_module + "::" + leaf` to ask its question. It is a root cause for the
+  string seam 8.51 measured at 61,290 of 78,310 resolutions, and it is the
+  reason that seam cannot be fully retired by stamping alone: closing 8.52's
+  synthesizer gap makes consumers read stamps, but the stamps themselves are
+  still derived by NAME, through `type_spelling_res` at
+  `name_resolution.cryo:1506`.
+
+Two arguments do NOT survive, and both were load-bearing when the decision was
+taken:
+
+* **the parked collision backlog is empty** (8.55): Shape B has zero instances
+  across 319 modules, and the one case ever cited was a missing import;
+* **the module-name ambiguity is nominal**: one populated scope per name in
+  39,797 of 39,797 lookups, with the tie-break skipping empty placeholders
+  rather than choosing between bindings.
+
+That is now twice in one session that a structural problem cited for this
+decision has measured as nominal. The pattern is worth stating for whoever
+re-decides: the case for decision 3 rests on the string seam and on what module
+identity buys the migration, and it should be argued there. It is not a defect
+backlog, and it is not an ambiguity being resolved by luck.
+
+#### Scope of the change, for planning only
+
+1. Declare a `Symbol` for every `namespace A::B;`, in the parent's scope, kind
+   `Namespace` - the C-import alias path is the template.
+2. Admit `SymbolKind::Namespace` to the TYPE namespace in `Namespace::accepts`,
+   which is the one-line core of "modules bind in the type namespace".
+3. Give the module symbol its scope, so `find_module_scope`'s multimap and its
+   tie-break can be replaced by identity rather than merely indexed better.
+4. Re-key the five string callers onto the symbol.
+5. Only then the qualifier question of 8.56, which is Jake's and is parked.
+
+Steps 1-4 are behaviour-preserving in principle and each is separately
+measurable; step 5 is not, and is the one that changes what an existing valid
+program compiles to.
