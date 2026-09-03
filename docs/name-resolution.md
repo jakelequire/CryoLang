@@ -7969,6 +7969,28 @@ State it as the negative too, since that is the form that keeps being
 rediscovered: a nonzero `grep -c $'\r'` is NOT evidence of CRLF, and on its own
 is not grounds for changing how a file is written.
 
+#### How widespread the deviation is, so the warning is not read as a fault
+
+**670 of 1,400 `.cryo` files are `w/crlf`** - 48% of the tree. Editing one and
+staging it prints
+
+    warning: in the working copy of '<path>', CRLF will be replaced by LF the
+    next time Git touches it
+
+and that warning is the policy WORKING: `.gitattributes` normalises on the way
+into the index, so the committed blob is LF regardless of what the worktree
+holds. Verified across a whole session's commits - every blob measured 0 CR
+bytes while one of the edited files was `w/crlf` throughout.
+
+Two consequences worth knowing before reacting to it. `git checkout -- <path>`
+does NOT normalise a `w/crlf` file: git compares content after normalisation,
+sees no difference, and does nothing - so the deviation cannot be cleaned that
+way and there is no need to clean it. And because nearly half the tree is
+deviant, a session will meet this warning routinely; it is not a signal that
+anything was written wrongly, and the check that settles it is
+`git ls-files --eol` on the committed path plus `tr -cd` on the blob, never a
+count over the worktree file.
+
 ### 8.41 The global cascade is a stamp lane and an alias lane 2026-09-02
 
 `resolve_scope_resolution` asked three questions to find the global a
