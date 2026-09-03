@@ -1006,7 +1006,63 @@ type struct Resolver {
             }
             Option::None => { }
         }
+        this.audit_module_scope_pick(module_name, oid, best_id, best_count);
         return best_id;
+    }
+
+    /// Whether the winning module scope holds every NAME its same-named rivals
+    /// hold, and what it lacks when it does not.
+    ///
+    /// The tie-break is on symbol COUNT, which stands in safely for the
+    /// identity a module symbol would supply only if the most populated scope
+    /// is a SUPERSET of the others - stages of one module rather than different
+    /// bindings. A name present in a loser and absent from the winner is
+    /// unreachable through this lookup, and a count cannot show that: the
+    /// winner can be larger overall and still be missing one.
+    ///
+    /// Gated first, before any of the comparison work: this walks every rival
+    /// scope's entries, which is far too expensive to run when nobody is
+    /// reading the stream.
+    audit_module_scope_pick(&this, module_name: string, oid: u32,
+                            winner: u64, winner_count: i64) -> void {
+        if (!ResolveCounter::Audit::Scope.enabled()) { return; }
+        if (winner == 0) { return; }
+        const widx: i64 = (winner - 1) as i64;
+        mut cands:   i32    = 0;
+        mut missing: i32    = 0;
+        mut example: string = "<none>";
+        // A superset result is only informative if the rivals hold anything at
+        // all: several EMPTY same-named scopes would make the winner a superset
+        // trivially, and would mean the tie-break skips placeholders rather than
+        // choosing between real alternatives.
+        mut loser_syms:     i32 = 0;
+        mut loser_nonempty: i32 = 0;
+        match (this.module_scope_index.get_ref(&oid)) {
+            Option::Some(plist) => {
+                cands = (*plist).length as i32;
+                for (mut k: i64 = 0; k < (*plist).length; k++) {
+                    const sid: u64 = (*plist)[k];
+                    if (sid == winner) { continue; }
+                    const lidx: i64 = (sid - 1) as i64;
+                    const lcount: i64 = this.scopes[lidx].symbols.length;
+                    loser_syms = loser_syms + (lcount as i32);
+                    if (lcount > 0) { loser_nonempty = loser_nonempty + 1; }
+                    for (mut e: i64 = 0; e < this.scopes[lidx].symbols.length; e++) {
+                        const nm: SymbolStr = this.scopes[lidx].symbols[e].name;
+                        if (!this.scopes[widx].find(nm).is_valid()) {
+                            missing = missing + 1;
+                            if (missing == 1) {
+                                example = this.intern_table.resolve(nm);
+                            }
+                        }
+                    }
+                }
+            }
+            Option::None => { }
+        }
+        ResolveCounter::module_scope_pick(module_name, cands,
+                                          winner_count as i32, missing, example,
+                                          loser_syms, loser_nonempty);
     }
 
     /// Dump the current scope tree and symbol table for debugging.

@@ -183,6 +183,47 @@ type struct CallResolver {
     }
 
 
+    /// Record which door supplied an unqualified callee's signature, and how
+    /// many distinct modules declare the leaf that door answered from.
+    ///
+    /// Read at every exit, not only the bare one: the bare slot's exposure is
+    /// the share of callees that reach it AND land on a leaf more than one
+    /// module claims, and neither half of that is legible without the other.
+    ///
+    /// Owner 0 is a global claim that names no module - extern "C" twins and
+    /// combined-name registrations - so it is skipped rather than counted as a
+    /// distinct declarer, which would report a collision for a leaf only one
+    /// module declares.
+    callee_door_probe(&this, door: string, leaf: SymbolStr,
+                      answered: boolean) -> void {
+        if (!ResolveCounter::Audit::Path.enabled()) { return; }
+        if (this.ctx == null || this.ctx.decl_index == null) { return; }
+
+        mut ans: string = "miss";
+        if (answered) { ans = "hit"; }
+
+        mut names:    string = "";
+        mut distinct: i32    = 0;
+        const owners: u32[] =
+            this.ctx.decl_index.lookup_func_overload_owners(leaf);
+        for (mut i: i64 = 0; i < owners.length; i++) {
+            const o: u32 = owners[i];
+            if (o == 0) { continue; }
+            mut seen: boolean = false;
+            for (mut j: i64 = 0; j < i; j++) {
+                if (owners[j] == o) { seen = true; break; }
+            }
+            if (seen) { continue; }
+            distinct = distinct + 1;
+            if (names.length() > 0) { names = names + ","; }
+            names = names + this.intern.resolve(SymbolStr::from_id(o));
+        }
+        if (names.length() == 0) { names = "<none>"; }
+
+        ResolveCounter::callee_door(door, this.intern.resolve(leaf), ans,
+                                    distinct, names);
+    }
+
     // -- Callee / payload-type lookups (for expected-type propagation) --
 
     lookup_callee_function_type(&this, callee: ExpressionNode*) -> TypeRef {
@@ -231,7 +272,10 @@ type struct CallResolver {
             match (ident.res) {
                 ResSlot::Answered(r) => {
                     const via_res: TypeRef = this.ctx.decl_index.func_type_of_res(r);
-                    if (via_res.is_valid()) { return via_res; }
+                    if (via_res.is_valid()) {
+                        this.callee_door_probe("STAMP", ident.name, true);
+                        return via_res;
+                    }
                 }
                 _ => { }
             }
@@ -241,8 +285,13 @@ type struct CallResolver {
             const q_sym: SymbolStr =
                 this.ctx.qualify_symbol_sym_home(ident.name, ident.span.file);
             const qual: TypeRef = this.ctx.decl_index.lookup_func_type(q_sym);
-            if (qual.is_valid()) { return qual; }
-            return this.ctx.decl_index.lookup_func_type(ident.name);
+            if (qual.is_valid()) {
+                this.callee_door_probe("HOME", ident.name, true);
+                return qual;
+            }
+            const bare: TypeRef = this.ctx.decl_index.lookup_func_type(ident.name);
+            this.callee_door_probe("BARE", ident.name, bare.is_valid());
+            return bare;
         }
         if (n.kind == NodeKind::ScopeResolution) {
             const sr: ScopeResolutionNode* = callee as ScopeResolutionNode*;
