@@ -935,6 +935,7 @@ public:
             ResSlot::Answered(r) => { node.set_res(r); }
             _                    => { }
         }
+        this.stamp_annotation_list(&node.generic_args);
     }
 
     override visit(node: ScopeResolutionNode*) -> void {
@@ -952,6 +953,12 @@ public:
         // the stamp is built from the lookup already performed rather than from
         // a second one asking the same question.
         this.stamp_module_scope(node, scope_sym);
+        // The scope segment's own arguments (`Pair<String, String>::new`) and
+        // the member's (`Layout::of<Entry<K, V>>`) are written types in their
+        // own right; what they name is settled here, where the writing scope
+        // is still the current one.
+        this.stamp_annotation_list(&node.scope_generic_args);
+        this.stamp_annotation_list(&node.generic_args);
         // Member resolution within the type's scope is deferred to
         // TypeResolution (needs type info to find the TypeBody scope).
     }
@@ -1289,6 +1296,19 @@ public:
         node.set_scope_res(Res::TypeRelative(base, trailing));
     }
 
+    /// Stamp a written list of type arguments.
+    ///
+    /// An expression carries the same written type syntax a declaration does -
+    /// `Array<T, GlobalAlloc> { }` and `Layout::of<Entry<K, V>>()` spell a type
+    /// the way an annotation spells one - and the position a spelling is
+    /// written in does not change what it names.  A list left unwalked is a
+    /// node with a span and a slot that no consumer can read an answer from.
+    stamp_annotation_list(&this, args: &TypeAnnotation*[]) -> void {
+        for (mut i: i64 = 0; i < args.length; i++) {
+            this.stamp_annotation(args[i]);
+        }
+    }
+
     /// Stamp every `Named` node in a type-annotation tree.
     ///
     /// A `TypeAnnotation` is not an AST node and is never `accept`-visited, so
@@ -1569,6 +1589,8 @@ public:
             }
         }
 
+        this.stamp_annotation_list(&node.generic_args);
+
         // Visit arguments
         for (mut i: int = 0; i < node.arguments.length; i++) {
             node.arguments[i].accept(this);
@@ -1578,6 +1600,7 @@ public:
     override visit(node: MemberAccessNode*) -> void {
         // Visit the object expression; member resolution deferred to TypeResolution
         node.object.accept(this);
+        this.stamp_annotation_list(&node.generic_args);
     }
 
     override visit(node: BinaryExprNode*) -> void {
@@ -1634,9 +1657,7 @@ public:
             _                    => { }
         }
 
-        for (mut i: i64 = 0; i < node.generic_args.length; i++) {
-            this.stamp_annotation(node.generic_args[i]);
-        }
+        this.stamp_annotation_list(&node.generic_args);
 
         for (mut i: int = 0; i < node.arguments.length; i++) {
             node.arguments[i].accept(this);
@@ -1676,6 +1697,7 @@ public:
             ResSlot::Answered(r) => { node.set_res(r); }
             _                    => { }
         }
+        this.stamp_annotation_list(&node.generic_args);
 
         // Visit field initializer expressions
         for (mut i: int = 0; i < node.field_inits.length; i++) {
