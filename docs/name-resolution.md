@@ -9346,3 +9346,103 @@ visitor owns it" without another guess about which site is responsible, and it
 is what the two parser sites in particular need, since a parser-produced node
 exists well before the stamping pass runs and cannot be explained by minting at
 all.
+
+### 8.59 The residue's owner is a POSITION, not a node kind - MEASURED 2026-09-03
+
+8.58 established that the 3,180 annotations reaching 2c unstamped were never
+offered to the stamper, ruled out four producers, and stopped. It named the next
+instrument: the node's owner, recorded where the node is created rather than
+where it is read.
+
+#### The instrument
+
+`ANN-OFFER` records every spelling the stamper is offered, keyed by the file,
+line and COLUMN of its own span. The residue's rows carry the same key, so the
+two sets subtract: a site in the residue and absent from the offer stream was
+never walked to; a site present in both has a second node standing at the same
+syntax. Neither can be read off a count of offers, which is why 8.58's
+33,323-with-no-failures could sit beside 3,180 unstamped without contradiction.
+
+The column is not a refinement, it is what makes the key a key. Taken by line
+alone the answer is wrong in both directions: `const b: Box<T> = Box<T>::new()`
+writes the same spelling twice on one line, the declaration annotation is
+offered and the scope qualifier's argument is not, and the offered one masks the
+other. Line-only keys put 455 rows in the wrong column here.
+
+#### The controls
+
+`ANN-OFFER` totals 33,324, which is exactly the counter's `annotations offered
+to the stamp` - the probe sees the whole offered population and no more. Placed
+one frame in, at `stamp_named_annotation`, it reads 27,246: the remaining 6,078
+offers are the two node spellings that are not annotations at all (a struct
+literal's `struct_type`, an impl head's `target_type`), which is worth knowing
+because the counter's line calls all 33,324 "annotations".
+
+Across all three runs 2c stayed at 3,180 `INCUMBENT-ONLY` and 58,120 `SAME`, so
+the probe perturbed nothing it was measuring.
+
+#### What owns the residue
+
+| owner | offered? | sites | rows |
+|---|---|---:|---:|
+| scope qualifier type args (`Pair<String, String>::new`) | no | 145 | 1,734 |
+| impl head target (`for struct Fnv128Hasher`) | no | 44 | 495 |
+| call type args (`Layout::of<Entry<K, V>>()`) | no | 66 | 353 |
+| plain declaration annotation | **yes** | 186 | 219 |
+| struct literal type args (`Array<T, GlobalAlloc> { }`) | no | 10 | 215 |
+| plain declaration annotation | no | 50 | 74 |
+| static-match type pattern (`Slice<u8> => { }`) | no | 5 | 33 |
+| declaration type args | no | 12 | 25 |
+| declaration type args | **yes** | 19 | 24 |
+| struct literal type args | **yes** | 8 | 8 |
+
+**2,929 of 3,180 - 92% - were never offered.** The prediction was that the
+residue resolves to one or two owner kinds; the falsifier was a spread across
+many, meaning the gap is in the walk's entry points. It resolves to one
+POSITION: a type argument written in EXPRESSION position. That is 2,302 rows
+across three expression forms, and the mechanism is one line long -
+
+`IdentifierNode`, `CallExprNode`, `StructLiteralNode`, `MemberAccessNode` and
+`ScopeResolutionNode` each carry a `generic_args: TypeAnnotation*[]` (and
+`ScopeResolutionNode` a `scope_generic_args` as well). `NewExprNode` carries one
+too, and its visitor is the only one of the six that calls `stamp_annotation` on
+it. The other five walk past written type syntax that has a span, a slot, and a
+file the pass is standing in.
+
+This is 8.51's defect class, not 8.52's: written syntax the pass could visit and
+does not. 8.52 read the residue as minted-after-the-pass on the strength of
+`STAMP-DECLINE` being 0, and that reading is now wrong for 92% of it - a zero
+decline count says only that the stamper refused nothing, and the offer stream
+is what separates "refused" from "never presented".
+
+#### The impl head's 495 rows are a synthesizer, and it has the answer
+
+The impl head is the one family that is written syntax and still not the
+visitor's fault. `visit(ImplBlockNode*)` does stamp the target, onto the NODE,
+from `node.span`; the residue's rows carry `target_type_span` - the column of
+the target lexeme - so they are a different node. It is minted by
+`rewrite_default_method_signature`, which rewrites `This` in a trait-default
+method signature cloned into the impl and names the target with the narrower
+span. Every one of the 44 sites is a trait impl, and none is inherent.
+
+That mint can answer for its own node without a lookup: `ImplBlockNode.res`
+carries the stamp `visit(ImplBlockNode*)` already wrote for the same type, so
+the rewrite is a copy of a `Res` the pass produced, not a second opinion about
+the spelling.
+
+#### The 251 offered-and-still-unstamped rows
+
+A node was offered at that exact file, line and column, and a node at the same
+site reaches 2c `Pending`. They are two nodes, and the copy is taken from
+something the stamp never reached - or before it ran. 186 sites of it are plain
+declaration annotations (`mut s: String = out;`), which is the population the
+declaration visitors provably do stamp. Not chased here; it is 8% of the
+residue and a different mechanism from the 92%.
+
+#### Sequencing
+
+The expression-position gap is the whole lever, the same way the generic-parameter
+default was in 8.51: one position, five visitors, 2,302 of 3,180 rows. Stamping
+it runs the reachability gate over syntax it has never been run over, which is
+the risk 8.51 also carried and where the 38 projects and 178 compile-fail cases
+are the instrument.
