@@ -9736,3 +9736,101 @@ Two things still stand in front of it, and neither is a measurement:
   genuinely cannot answer for its node is allowed to leave the slot empty; the
   `Res` slot contract frames that as `require`-and-ICE. Which of the remaining
   `Pending` producers are legitimate is a decision, not a count.
+
+### 8.62 `import M::*` bound nothing at all - MEASURED AND FIXED 2026-09-03
+
+8.61's sweep left exactly one unstamped annotation across the 51 corpora that
+compile: `Widget` in `reexport_basic/src/globctl.cryo`, reached through
+`import ReexportBasic::Inner::*;`. A population of one is a different problem
+from the systemic gap, so this was chased with the cheapest instrument that
+could still be wrong, and stopped at each step to ask which of several
+explanations the row was consistent with.
+
+#### Three free readings before any probe
+
+* The stamper's tier list. `type_spelling_res` asks
+  `resolve_type_qualified_name_bare_from`, which is `resolve_path` over the rib
+  chain plus the prelude, then import ALIASES. Nothing there names wildcards -
+  but nothing there needs to, because a wildcard import declares its names INTO
+  the scope the rib chain walks.
+* `Namespace::accepts` returns true for `SymbolKind::Import` in every
+  namespace, so an import symbol is never filtered out of a type question.
+* `qualified_name_of` builds `source_module::name` for an import, which is
+  exactly the incumbent's answer. So a FOUND import would have stamped
+  correctly.
+
+Each of those would have been a plausible cause; none of them is. That is what
+made the next question "is the name in the scope at all", rather than "which
+tier rejected it".
+
+#### The probe, and the four outcomes it separates
+
+The counter already answers the first half: `UNSTAMPED bare name not in scope`
+reads 1 on this corpus, so the home-scope walk found nothing. A probe at the
+failure arm reported the raw `Scope::find` result in the home scope, ignoring
+the namespace filter: **`<absent>`**. Not present and refused - not present.
+
+A second probe on the wildcard branch reported the module it resolved, the scope
+it binds into, and how many exports it had to bind - emitted in execution order,
+so its position also answers whether it ran too late:
+
+    WILDCARD-BIND  ReexportBasic::Inner     ReexportBasic::Aggregate  scope=6  exports=2
+    WILDCARD-BIND  ReexportBasic::Inner::*  ReexportBasic::GlobCtl    scope=9  exports=0
+
+Four candidate causes, one row: the branch ran, before the annotation, into the
+right scope - and bound **nothing**, because the module it looked up is
+`ReexportBasic::Inner::*`.
+
+#### The cause
+
+The parser writes the wildcard into the module PATH:
+
+    const star_path: string = format("%s::*", pinned);
+
+while also recording `ImportStyle::Wildcard` beside it. `*` is not part of any
+module's name, so `find_module_index` misses, the suffix fallback misses,
+`get_exports` is asked for a namespace that does not exist, and the loop binds
+zero names. The one construction of `::*` in the tree is this line, and nothing
+anywhere reads the suffix back - it is written and never consumed.
+
+The failure is silent by construction: a wildcard that binds no names is
+indistinguishable from a module that exports none.
+
+#### What that means about the corpus
+
+`reexport_basic` compiles, and its `via_glob()` calls `make_widget` and
+`Widget::unwrap` through an import that binds nothing. It passes because the
+module-blind leaf index answers what the scope could not - the string seam
+carrying a program the scope-based lane had already refused. **`M::*` has never
+bound a name**, and the project asserting that it stays legal was passing for
+the wrong reason.
+
+#### Stated before the fix, and what happened
+
+Predicted: the `WILDCARD-BIND` row goes `exports=0` to `exports=2`, the corpus's
+unstamped row and its decline both go to 0, `DIFFERENT` stays 0. The falsifier
+that mattered was a NEW diagnostic anywhere: binding names that were previously
+bound by nothing can collide, and `insert_import` marks two modules exporting
+one leaf as ambiguous.
+
+| `reexport_basic` | before | after |
+|---|---:|---:|
+| `WILDCARD-BIND` exports | 0 | **2** |
+| 2c `INCUMBENT-ONLY` | 1 | **0** |
+| `STAMP-DECLINE` | 1 | **0** |
+| 2c `SAME` | 4,152 | 4,153 |
+
+Over every corpus:
+
+| corpus | 2c `SAME` | unstamped | `DIFFERENT` | declines |
+|---|---:|---:|---:|---:|
+| `compiler/` | 61,309 | 0 | 0 | 0 |
+| 14 `examples/` projects | 65,713 | 0 | 0 | 0 |
+| 36 `tests/` projects that compile | 139,602 | **0** | 0 | 7 |
+| **all 57 corpora** | **266,624** | **0** | **0** | **7** |
+
+No new diagnostic appeared. The 7 remaining declines are the reachability gate
+working: `namespace_gate` (6, `Crate`) and `namespace_gate_methods` (1,
+`Parcel`) exist to assert E0240 on a name its module cannot reach.
+
+**Zero unstamped annotations remain across every corpus that compiles.**
