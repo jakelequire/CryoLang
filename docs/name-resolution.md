@@ -9178,3 +9178,111 @@ backlog, and it is not an ambiguity being resolved by luck.
 Steps 1-4 are behaviour-preserving in principle and each is separately
 measurable; step 5 is not, and is the one that changes what an existing valid
 program compiles to.
+
+### 8.58 The residue was never offered to the stamper, and the span cannot say why - MEASURED 2026-09-03
+
+8.52 concluded that the annotations still reaching 2c unstamped are minted after
+name resolution finishes, and scoped a per-synthesizer fix on that reading. Its
+evidence was `STAMP-DECLINE` measuring 0, which establishes only that the
+stamper did not REFUSE them - a node that existed and was never walked to gives
+the same zero. This set out to separate the two and did not succeed; what it
+established instead is narrower and firmer.
+
+#### The instrument, and why it could not answer the question
+
+The annotation's own span was threaded through `resolve_named` to the seam
+probe, on the reasoning that written syntax carries a real file and line while a
+node synthesized after parsing carries none. Predicted: a material `<nospan>`
+population, concentrated in two or three mint sites dominated by async lowering.
+
+| | rows |
+|---|---:|
+| unstamped at 2c, `compiler/` | 3,180 |
+| carrying `<nospan>` | **0** |
+| carrying a real file and line | **3,180** |
+
+**That zero does not mean what the instrument was built to make it mean.** The
+premise is false: `AST/substituter.cryo` mints `NamedAnnotation` at `:196`,
+`:1010` and `:1031` with `span: named.span` - the ORIGINAL's span, borrowed - so
+a synthesized node here is indistinguishable from written syntax by span alone.
+The three sites also mint `res: ResSlot::Pending` explicitly, which is a
+synthesizer declining to answer for its own node.
+
+So "3,180 of 3,180 carry a real span" is consistent with every one of them being
+synthesized, and 8.52's reading is not refuted. The prediction is falsified on
+the concentration half; on the `<nospan>` half the measurement is void rather
+than negative, because the discriminator does not discriminate.
+
+Recorded because the failure is reusable: **a provenance instrument has to be
+checked against what the producers actually write, not against what they would
+plausibly write.** Every synthesizer here had a reason to borrow a span - it is
+what makes a diagnostic point at the user's code - and that reason was visible
+in the code before the probe was built.
+
+#### Three independent instruments agree the nodes were never offered
+
+The counter report from the same run, which was in the tree the whole time:
+
+    annotations offered to the stamp          33323
+      stamped Def (bare, via home scope)      32204
+      stamped GenericParam                      917
+      qualified spelling                         37
+      UNSTAMPED span names no module              0
+      UNSTAMPED module has no scope               0
+      UNSTAMPED bare name not in scope            0
+
+Every annotation the stamper was offered received an answer; all three failure
+buckets are zero. `STAMP-DECLINE` is 0 over `compiler/` as well as over the two
+corpora 8.52 checked, and that probe is proven to fire - six rows on
+`namespace_gate`.
+
+So the 3,180 are not in the 33,323. **They were never offered to the stamper at
+all** - not refused, not failed, absent. That holds regardless of the span
+question, because it depends only on counts of what the stamper saw.
+
+#### Where they are
+
+| site | spelling | rows |
+|---|---|---:|
+| `stdlib/collections/array.cryo:49` | `GlobalAlloc` | 119 |
+| `stdlib/core/hash.cryo:201` | `Fnv128Hasher` | 54 |
+| `stdlib/env/_module.cryo:112` | `String` | 24 |
+| `stdlib/collections/hashmap.cryo:517,521,551,817,829` | `Entry` | 23 each |
+| `stdlib/collections/hashmap.cryo:101,125` | `GlobalAlloc` | 22 each |
+| `stdlib/alloc/box.cryo:71,98` | `GlobalAlloc` | 22 each |
+
+118 distinct spellings, none ever declined. Every site sits inside a generic
+template, and the per-site counts cluster near a constant - the shape of once
+per instantiation rather than once per written occurrence, which is what a
+template body cloned per specialization would produce.
+
+#### Ruled out, and how
+
+* **`stamp_annotation` skipping generic annotations.** It has a `Generic` arm
+  that stamps the base and every argument.
+* **The struct visitor not reaching inline methods.** `visit(StructDeclNode*)`
+  walks `node.methods`, and `visit(MethodNode*)` delegates to the function
+  visitor, which stamps parameters and the return type.
+* **`ASTCloner` dropping the stamp.** Its `clone_type_annotation` delegates to
+  `TypeAnnotation::clone_ptr`, and `TypeAnnotation::clone` copies `res`
+  verbatim. So an ordinary clone is not the leak.
+
+#### The live lead
+
+`AST/substituter.cryo` mints `NamedAnnotation` at `:196`, `:1010` and `:1031`
+with `res: ResSlot::Pending` written out explicitly. Each also sets
+`pre_resolved` to a real `TypeRef`, and a valid one short-circuits at
+`types/resolver.cryo:364` before `resolve_named` is ever reached - which is why
+these mints are mostly invisible at 2c.
+
+**The testable claim: the residue is the subset whose `pre_resolved` came back
+INVALID**, falling through the short-circuit to a `Pending` slot. `:196` takes
+it from `resolved_arg_typeref(pi)` and the other two from a caller-supplied
+`inner_pre_resolved`; the per-instantiation shape of the counts fits.
+
+The measurement is a counter at each mint site splitting valid from invalid
+`pre_resolved`, compared against the 3,180. If they match, the fix is that a
+synthesizer with no `TypeRef` to offer must still answer its node's slot; if
+they do not, the population is somewhere else and the owner - which declaration
+the annotation hangs off - is the next instrument, since the span has been shown
+useless here.
