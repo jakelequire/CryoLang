@@ -10129,3 +10129,80 @@ The guard at `find_function_template_for_call` therefore stays for now, and it
 stays as a branch on absence that the `Res` contract forbids - recorded as owed,
 not as a boundary. The experiment is reverted; the tree is unchanged by this
 section.
+
+### 8.66 Scope and sequence: the old model goes entirely 2026-09-03
+
+Three questions parked across §8.47, §8.56 and §8.57 are answered, and the scope
+of the migration is settled with them. Recorded here because the sequence that
+follows is not derivable from any measurement in this document, and because the
+last item on it retires the instruments every earlier item was made safe by.
+
+#### The scope
+
+Everything from the old model goes. Not "measured inert and ratcheted" - the
+defensible stopping point after the 2c collapse is not the target. What remains
+at the end is the new implementation, with the cascade, the string seams and the
+counters that policed them all removed.
+
+#### The qualifier shorthand is dropped
+
+`A::B` no longer prefers the type when `A` names both a module and a type: the
+path is written out, as in Rust. §8.56 laid out the cost and it is accepted -
+this is source-breaking across the 76 of 319 modules using the file-per-type
+convention. The change is mechanical but lands as one large diff, so it is its
+own change with its own verification rather than folded into anything else.
+
+The argument that decided it is the one §8.56 already stated: keep the shorthand
+and a qualifier's meaning depends on a lookup rather than on syntax, which is
+the shape the old cascade grew from.
+
+#### Modules bind in the type namespace
+
+Decision 3 stands, on structure rather than on a backlog. The two justifications
+it was originally given have not survived measurement - the collision backlog is
+empty (Shape B, 0 of 319) and the ambiguity is nominal (39,797 of 39,797) - and
+the ledger should not lean on either.
+
+What survives is the reason to do it: a module has a NAME and no identity, so
+there is no `Res` a consumer can hold for one. That is why 2c rebuilt
+`home_module + "::" + leaf` out of strings, and why every consumer asking what a
+module-qualified path names has had to re-derive it. 8.63 removed that
+construction from the seam carrying 78% of type resolutions; it did not give
+modules an identity, so the remaining module-qualified paths still have nothing
+to read.
+
+§8.57's five-step plan is now live rather than hypothetical. It is reasoning and
+not a tested plan, so step 1 gets its own prediction, falsifier and verification
+before step 2 is written.
+
+#### The intrinsic callees
+
+Investigated in 8.65: stampable, and blocked on a language rule about what a
+bare leaf names when an intrinsic and a real declaration both claim it. Parked
+with the evidence, not worked around.
+
+#### The order
+
+1. ~~Collapse 2c~~ - done, 8.63.
+2. Modules as bindings in the type namespace, step 1 first and verified alone.
+3. Drop the qualifier shorthand, as its own change.
+4. Whatever those strand.
+5. **Retire `resolve_counter.cryo`, and it is last for a reason.**
+
+#### Why the counter is last, and what it costs
+
+`resolve_counter.cryo` is 1,615 lines, and retiring it retires `lane-check` and
+`b1-check` with it. Those two ratchets are what made every deletion in this
+project safe: `LOOKUP` and `REENTRY` catch a per-kind lookup or a resolver
+re-entry being added back, and B1/B4 catch a fuzzy fallback or an instantiation
+key returning. Every collapse recorded above was verified by a number one of
+them holds.
+
+So the last step removes the evidence that the previous ones held. It cannot be
+taken until there is an answer to what preserves the guarantee afterwards - a
+test that fails when a cascade step is reintroduced, rather than a counter that
+merely reports one. That answer does not exist yet, and inventing it is part of
+the step rather than a precondition someone else supplies.
+
+Named here so it arrives as the planned final item rather than as a surprise at
+the end.
