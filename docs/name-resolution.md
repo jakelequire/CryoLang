@@ -9492,3 +9492,87 @@ the answer already), then the 319 offered-and-still-unstamped rows (two nodes at
 one site), then the static-match type patterns (33, which `visit(StaticMatchExprNode*)`
 documents itself as skipping).
 
+
+### 8.60 The impl head's `This` rewrite carries the head's own answer - MEASURED AND FIXED 2026-09-03
+
+8.59 left 936 unstamped at 2c and named the largest survivor: 495 rows over 44
+sites, every one an impl head, every one a trait impl and none inherent.
+
+#### Why the head looked stamped and was not
+
+`visit(ImplBlockNode*)` does answer for the target - `ImplResStamped` counts it -
+but it answers onto the NODE, from `node.span`. The residue's rows carry
+`target_type_span`, the column of the target lexeme itself, so they are a
+different node standing at narrower syntax. The column is what separates them;
+by line the two are one site.
+
+That node is minted by `rewrite_this_type_annotation`, reached only from
+`rewrite_default_method_signature`, reached only from the synthesis that clones
+a trait's default methods into an impl. It rewrites `This` in the cloned
+signature to the impl's target and wrote `res: ResSlot::Pending` outright. With
+`pre_resolved: TypeRef::invalid()` beside it, the node reaches the cascade
+rather than short-circuiting, which is why it is visible at 2c at all - and why
+8.58's substituter mints, which carry a valid `pre_resolved`, were not.
+
+#### The fix is a copy, not a lookup
+
+The impl head asked what its target spells, in the scope the head was written
+in, and this node names that same type. So the head's `ResSlot` is threaded to
+the mint and written verbatim.
+
+Threading the SLOT rather than a `Res` is what keeps this from being a branch on
+absence: a head no resolver could answer for mints an unanswered node, exactly
+as before, and no code tests for pendingness to decide. A second walk here would
+be a second opinion about one spelling, which is the shape the old cascade grew
+from.
+
+#### Stated before the run, and what happened
+
+Predicted: 2c unstamped 936 to about 441, `DIFFERENT` to stay 0, `SAME` up by
+about 495, the offered count UNCHANGED - because this is a copy of an answer and
+not an offer, so a rise there would mean the mint had been given its own lookup.
+
+| | before | after |
+|---|---:|---:|
+| 2c `INCUMBENT-ONLY` | 936 | **441** |
+| 2c `SAME` | 60,366 | **60,863** |
+| 2c `DIFFERENT` | 0 | **0** |
+| `STAMP-DECLINE` | 0 | **0** |
+| annotations offered | 33,818 | 33,820 |
+| coverage at 2c | 98.5% | **99.3%** |
+
+The impl-head family is 495 to **0**. `LOOKUP` 118, `REENTRY` 6, B1 0 and B4 0
+on three arms, 178 compile-fail cases and 38 projects, warning count 349 either
+side.
+
+The offered count moved by 2 against a prediction of 0, which is an artifact of
+measuring the compiler over its own source: the fix adds `home_res: ResSlot` to
+two signatures, and `ResSlot` offers go 45 to 47. Nothing about the pass
+changed; the input did.
+
+#### What the 441 are
+
+| owner | offered? | sites | rows |
+|---|---|---:|---:|
+| plain declaration annotation | **yes** | 186 | 219 |
+| scope qualifier type args | **yes** | 6 | 68 |
+| declaration type args | **yes** | 19 | 24 |
+| struct literal type args | **yes** | 8 | 8 |
+| static-match arm type pattern | no | 8 | 57 |
+| enum variant payload annotation | no | 39 | 39 |
+| associated-type binding (`type Output = ...`) | no | 6 | 15 |
+| destructure decl annotation | no | 7 | 7 |
+| where-clause bound type args | no | 2 | 4 |
+
+Two populations remain, and they are unrelated:
+
+* **319 offered and still unstamped.** A node was offered and answered at that
+  exact file, line and column, and a node at the same site reaches 2c `Pending`.
+  Two nodes at one syntax, and the second is copied from something the stamp
+  never reached or taken before it ran. This is now the largest single thing
+  left and it has not been instrumented.
+* **122 never offered**, in five small owners rather than one: static-match arm
+  type patterns (which `visit(StaticMatchExprNode*)` documents itself as
+  skipping), enum variant payload annotations, an impl body's associated-type
+  binding, a destructuring declaration's annotation, and a `where` clause's
+  bound arguments. Each is a missing walk of the 8.51 kind, none of them large.
