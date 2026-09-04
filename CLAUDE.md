@@ -26,6 +26,7 @@ make test             # unit + compile-fail + project suites
 make b1-check         # name-resolution fallback ratchet
 make roster-check     # unit-test roster golden
 make examples         # smoke-build every examples/ project
+make lsp-check        # compile tools/CryoLSP; no other gate does
 make selfhost-check   # byte-identity fixed point, BOTH OS, ~17 min
 ```
 

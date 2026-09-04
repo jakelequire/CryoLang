@@ -164,7 +164,7 @@ EXT_ID        := cryolang.cryo-analyzer
 EXT_VSIX      := $(EXT_DIR)/cryo-analyzer.vsix
 
 .DEFAULT_GOAL := help
-.PHONY: help stdlib cryo cryo-exe selfhost-check test test-list roster-check b1-check lane-check vendor-check api-index api-index-check examples examples-golden valgrind-check verify-freestanding runtime-tiers runtime-tiers-win pin \
+.PHONY: help stdlib cryo cryo-exe selfhost-check test test-list roster-check b1-check lane-check lsp-check vendor-check api-index api-index-check examples examples-golden valgrind-check verify-freestanding runtime-tiers runtime-tiers-win pin \
         pin-linux-impl pin-windows-impl _pin-windows-do \
         install uninstall clean lsp install-lsp release release-linux release-windows
 
@@ -184,6 +184,8 @@ help:
 	@echo "  make test-list         List the discovered test cases without running them"
 	@echo "  make b1-check          Pin the B1 fuzzy-fallback bucket against its golden"
 	@echo "  make lane-check        Pin the resolution-lane surface against its golden"
+	@echo "  make lsp-check         Compile tools/CryoLSP against current source"
+	@echo "                         (installs nothing; the only gate that builds it)"
 	@echo "  make vendor-check      Check every constant shape survives cryo vendor"
 	@echo "  make api-index         Regenerate docs/stdlib-api.txt (the stdlib API index)"
 	@echo "  make api-index-check   Fail if docs/stdlib-api.txt is stale"
@@ -556,6 +558,31 @@ endif
 # per-host golden.
 lane-check:
 	@$(PYTHON) scripts/lane-gate.py $(ARGS)
+
+# ---- language-server compile gate --------------------------------------
+# The LSP links the compiler as a LIBRARY (tools/CryoLSP/cryoconfig ->
+# path = "../../compiler"), so it sees every AST, NodeKind and public-signature
+# change - and no other gate compiles it.  A green local suite has therefore
+# never been evidence that the LSP builds, and it has been broken behind one
+# more than once.
+#
+# Separate from `make lsp` on purpose.  That target also installs over
+# bin/cryolsp, which any running editor holds open, and the failure is a bare
+# `error: linking failed` with no linker diagnostic AFTER a clean compile.  A
+# gate that goes red because a language server is running gets ignored, and an
+# ignored gate is not a gate.  This one builds into its own directory and
+# installs nothing, so a held pin cannot reach it.
+#
+# Built with the PIN, like `make lsp` and for the same reason: the compiler
+# LIBRARY is rebuilt from current source either way, so requiring the stage-2
+# BINARY would drag a full self-host in front of the gate for no coverage.
+ifeq ($(HOST_OS),windows)
+lsp-check:
+	@$(PYTHON) scripts/lsp-gate.py --cryo "$(PIN_EXE)" $(ARGS)
+else
+lsp-check: $(PIN) $(LIBCRYO_A)
+	@$(PYTHON) scripts/lsp-gate.py --cryo "$(PIN)" $(ARGS)
+endif
 
 # ---- stdlib API index --------------------------------------------------
 # Regenerate docs/stdlib-api.txt, the one-file answer to "does this already
