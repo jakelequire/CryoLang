@@ -1,0 +1,62 @@
+/// Inline `<T: Bound>` constraints - the syntax nothing else in the tree writes.
+///
+/// WHAT THIS PINS, AND WHAT IT DOES NOT
+///
+/// It pins that the syntax parses, compiles and runs. It does NOT pin bound
+/// enforcement, because there is none to pin: measured two ways on this tree,
+///
+///   * dropping the constraint (`<T: Tagged>` -> `<T>`) compiles just the same,
+///     so the bound is not load-bearing for the body's `x.tag()`;
+///   * instantiating with a type that does NOT implement the trait is rejected
+///     as `E0358: no method named 'tag'` - a method-resolution failure in the
+///     body, the identical error an unbounded `<T>` produces. Nothing reports a
+///     violated bound.
+///
+/// So an inline constraint is currently parsed, stored, resolved to a trait
+/// TypeRef, and then observed by nothing. Do not read a pass here as evidence
+/// that a bound was checked. If bound enforcement is ever implemented, the
+/// negative case belongs beside this file.
+///
+/// WHY IT EXISTS ANYWAY
+///
+/// A `where` bound and an inline constraint travel through DIFFERENT AST
+/// fields: the first becomes a `TraitBound`, the second becomes
+/// `GenericParamNode.constraints`. Only the second reaches the constraint loop
+/// in `create_generic_param_types`, and the tree writes `where` everywhere -
+/// 398 where-clauses across 86 stdlib files and not one inline constraint
+/// outside a docstring, in stdlib, compiler/src, examples or tests.
+///
+/// That loop was therefore unreachable by every corpus in the repository, so a
+/// change to it - or a deletion of it - looked inert on all of them. This file
+/// is what makes it reachable. A counter over that code reads the same zero
+/// whether it is starved or dead; this project is the difference.
+namespace InlineGenericBound::Main;
+
+type trait Tagged {
+    tag(&this) -> i32;
+}
+
+type struct Widget {
+    v: i32;
+}
+
+implement trait Tagged for Widget {
+    tag(&this) -> i32 { return this.v; }
+}
+
+/// Reaches the constraint loop via a free function's own generic params.
+function tag_of<T: Tagged>(x: &T) -> i32 {
+    return x.tag();
+}
+
+/// And via a declaration's, which is routed to the loop by a different caller.
+type struct Holder<T: Tagged> {
+    item: T;
+}
+
+function main() -> i32 {
+    mut w: Widget = Widget { v: 7 };
+    const a: i32 = tag_of<Widget>(&w);
+    mut h: Holder<Widget> = Holder<Widget> { item: Widget { v: 5 } };
+    return a - h.item.tag() - 2;
+}
