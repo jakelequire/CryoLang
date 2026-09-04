@@ -704,22 +704,6 @@ type struct CompilerInstance {
         }
     }
 
-    /// Like load_module but also restores saved scope from scope_buf.
-    static load_module_with_scope(ctx: CompilationContext*, intern: InternTable*,
-                                   ast_buf: void*, scope_buf: void*,
-                                   mod_idx: u32, mod_count: u32) -> void {
-        CompilerInstance::load_module(ctx, intern, ast_buf, mod_idx, mod_count);
-        // Restore saved scope
-        if (scope_buf != null && mod_idx < mod_count && ctx.resolver != null) {
-            const sc_slot: u64* = (scope_buf as u64*) + mod_idx;
-            const saved_scope: u64 = *sc_slot;
-            if (saved_scope > 0) {
-                const info: ModuleInfo* = &ctx.module_graph.modules[mod_idx];
-                ctx.resolver.set_module_with_scope(info.name, saved_scope);
-            }
-        }
-    }
-
     /// Compile a multi-module project using whole-program multi-pass.
     /// Parses cryoconfig, discovers all modules, then runs each pipeline
     /// stage across ALL modules before advancing to the next stage.
@@ -1687,8 +1671,6 @@ type struct CompilerInstance {
         const buf_size: u64 = n as u64 * 8;
         const ast_buf: void* = intrinsics::malloc(buf_size);
         mem::zero<u8>(ast_buf as u8*, buf_size);
-        const scope_buf: void* = intrinsics::malloc(buf_size);
-        mem::zero<u8>(scope_buf as u8*, buf_size);
 
         mut pipeline: PassRegistry = PassRegistry::new();
         pipeline.set_verbose(this.config.verbose_passes);
@@ -1696,23 +1678,23 @@ type struct CompilerInstance {
         // Run each stage across ALL modules before advancing to the next; see
         // the stage-driver block below for why the ordering is load-bearing.
         if (!this.run_frontend(ctx, &pipeline, ast_buf)) {
-            return this.project_failure_release(ctx, ast_buf, scope_buf);
+            return this.project_failure_release(ctx, ast_buf);
         }
-        if (!this.run_module_resolution(ctx, &pipeline, ast_buf, scope_buf)) {
-            return this.project_failure_release(ctx, ast_buf, scope_buf);
+        if (!this.run_module_resolution(ctx, &pipeline, ast_buf)) {
+            return this.project_failure_release(ctx, ast_buf);
         }
-        if (!this.collect_type_declarations(ctx, &pipeline, ast_buf, scope_buf)) {
-            return this.project_failure_release(ctx, ast_buf, scope_buf);
+        if (!this.collect_type_declarations(ctx, &pipeline, ast_buf)) {
+            return this.project_failure_release(ctx, ast_buf);
         }
 
-        if (!this.register_templates(ctx, &pipeline, ast_buf, scope_buf)) {
-            return this.project_failure_release(ctx, ast_buf, scope_buf);
+        if (!this.register_templates(ctx, &pipeline, ast_buf)) {
+            return this.project_failure_release(ctx, ast_buf);
         }
-        if (!this.expand_defaults_and_signatures(ctx, &pipeline, ast_buf, scope_buf)) {
-            return this.project_failure_release(ctx, ast_buf, scope_buf);
+        if (!this.expand_defaults_and_signatures(ctx, &pipeline, ast_buf)) {
+            return this.project_failure_release(ctx, ast_buf);
         }
-        if (!this.resolve_types(ctx, &pipeline, ast_buf, scope_buf)) {
-            return this.project_failure_release(ctx, ast_buf, scope_buf);
+        if (!this.resolve_types(ctx, &pipeline, ast_buf)) {
+            return this.project_failure_release(ctx, ast_buf);
         }
 
         tm_frontend_end = Instant::now().as_nanos();
@@ -1721,20 +1703,20 @@ type struct CompilerInstance {
         // directives (layout flags) -> body typecheck (mono-after-sema) ->
         // monomorphization.  Each must complete for EVERY module before the
         // next begins (see the stage-driver block for the invariants).
-        if (!this.process_directives(ctx, &pipeline, ast_buf, scope_buf)) {
-            return this.project_failure_release(ctx, ast_buf, scope_buf);
+        if (!this.process_directives(ctx, &pipeline, ast_buf)) {
+            return this.project_failure_release(ctx, ast_buf);
         }
-        if (!this.typecheck_bodies(ctx, &pipeline, ast_buf, scope_buf)) {
-            return this.project_failure_release(ctx, ast_buf, scope_buf);
+        if (!this.typecheck_bodies(ctx, &pipeline, ast_buf)) {
+            return this.project_failure_release(ctx, ast_buf);
         }
-        if (!this.monomorphize(ctx, &pipeline, ast_buf, scope_buf)) {
-            return this.project_failure_release(ctx, ast_buf, scope_buf);
+        if (!this.monomorphize(ctx, &pipeline, ast_buf)) {
+            return this.project_failure_release(ctx, ast_buf);
         }
 
         // Spec routing: deferred injection of the specs mono created, before
         // semantic analysis so the DI is fully populated for sema.
-        if (!this.route_specializations(ctx, ast_buf, scope_buf)) {
-            return this.project_failure_release(ctx, ast_buf, scope_buf);
+        if (!this.route_specializations(ctx, ast_buf)) {
+            return this.project_failure_release(ctx, ast_buf);
         }
 
         // Soundness assertion: every specialization must have been routed to an
@@ -1748,7 +1730,7 @@ type struct CompilerInstance {
                     ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
                     format("spec routing left %d specialization(s) unowned (no module matched their owner key)",
                         orphaned)));
-                return this.project_failure_release(ctx, ast_buf, scope_buf);
+                return this.project_failure_release(ctx, ast_buf);
             }
         }
 
@@ -1767,7 +1749,7 @@ type struct CompilerInstance {
                 ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
                 format("monomorphizer worklist not drained between monomorphization and semantic analysis (%d pending)",
                     remaining)));
-            return this.project_failure_release(ctx, ast_buf, scope_buf);
+            return this.project_failure_release(ctx, ast_buf);
         }
 
         tm_mono_end = Instant::now().as_nanos();
@@ -1976,7 +1958,7 @@ type struct CompilerInstance {
             // downstream (cross-module descriptors, other modules' codegen,
             // linking) reads a cached module's lowered AST.
             if (pm_active && pm_cached[order[i] as i64]) { continue; }
-            CompilerInstance::load_module_with_scope(ctx, ctx.intern_table, ast_buf, scope_buf, order[i], n);
+            CompilerInstance::load_module(ctx, ctx.intern_table, ast_buf, order[i], n);
             ctx.provisions.clear();
             ctx.provisions.mark(Provision::Tokens);
             ctx.provisions.mark(Provision::AST);
@@ -2221,8 +2203,8 @@ type struct CompilerInstance {
                 Compiler::Codegen::LLVMTypes::set_codegen_context_new_keep_prior();
                 Compiler::Codegen::TypeMap::TypeMapperCache::reset_shared_type_cache();
 
-                CompilerInstance::load_module_with_scope(
-                    ctx, ctx.intern_table, ast_buf, scope_buf, order[i], n);
+                CompilerInstance::load_module(
+                    ctx, ctx.intern_table, ast_buf, order[i], n);
                 ctx.provisions.clear();
                 ctx.provisions.mark(Provision::Tokens);
                 ctx.provisions.mark(Provision::AST);
@@ -2706,7 +2688,6 @@ type struct CompilerInstance {
         mut ok_result: CompilationResult = CompilationResult::ok(exe_path);
         ok_result.stdlib_root = ctx.stdlib_root;
         intrinsics::free(ast_buf);
-        intrinsics::free(scope_buf);
         return ok_result;
     }
 
@@ -2760,8 +2741,7 @@ type struct CompilerInstance {
     }
 
     /// Module resolution, in two sweeps over every module: AutoImport +
-    /// ImportResolution + NameDeclaration, then NameResolution.  Saves each
-    /// module's resolver scope into `scope_buf` for later stages to restore.
+    /// ImportResolution + NameDeclaration, then NameResolution.
     ///
     /// The sweeps are separate because an import is answered from the declaring
     /// module's EXPORTS, which exist only once that module has been declared.
@@ -2774,7 +2754,7 @@ type struct CompilerInstance {
     /// reason `register_templates` runs across all modules before any
     /// DefaultExpansion consults the registry.
     run_module_resolution(&this, ctx: CompilationContext*, pipeline: PassRegistry*,
-                          ast_buf: void*, scope_buf: void*) -> boolean {
+                          ast_buf: void*) -> boolean {
         const order: &u32[] = &ctx.module_graph.topo_order;
         const n: u32 = order.length as u32;
 
@@ -2795,17 +2775,6 @@ type struct CompilerInstance {
             if (!pipeline.run_all(ctx)) {
                 return false;
             }
-            // Save the scope NameDeclaration filled, so the walk below resumes
-            // in the scope holding this module's own names rather than a fresh
-            // one.
-            if (ctx.resolver != null && ctx.active_module_index >= 0) {
-                const scope_val: u64 = ctx.resolver.get_current_scope_id();
-                const sc_idx: u32 = ctx.active_module_index as u32;
-                if (sc_idx < n) {
-                    const sc_slot: u64* = (scope_buf as u64*) + sc_idx;
-                    *sc_slot = scope_val;
-                }
-            }
             pipeline.reset();
         }
 
@@ -2818,8 +2787,8 @@ type struct CompilerInstance {
         }
 
         for (mut i: u32 = 0; i < n; i++) {
-            CompilerInstance::load_module_with_scope(ctx, ctx.intern_table, ast_buf,
-                                                     scope_buf, order[i], n);
+            CompilerInstance::load_module(ctx, ctx.intern_table, ast_buf,
+                                                     order[i], n);
             ctx.provisions.clear();
             ctx.provisions.mark(Provision::Tokens);
             ctx.provisions.mark(Provision::AST);
@@ -2831,14 +2800,6 @@ type struct CompilerInstance {
             if (!pipeline.run_all(ctx)) {
                 return false;
             }
-            if (ctx.resolver != null && ctx.active_module_index >= 0) {
-                const scope_val: u64 = ctx.resolver.get_current_scope_id();
-                const sc_idx: u32 = ctx.active_module_index as u32;
-                if (sc_idx < n) {
-                    const sc_slot: u64* = (scope_buf as u64*) + sc_idx;
-                    *sc_slot = scope_val;
-                }
-            }
             pipeline.reset();
         }
         return true;
@@ -2849,7 +2810,7 @@ type struct CompilerInstance {
     /// node.cryo uses ASTVisitor* defined in visitor.cryo, which depends on
     /// node).
     collect_type_declarations(&this, ctx: CompilationContext*, pipeline: PassRegistry*,
-                              ast_buf: void*, scope_buf: void*) -> boolean {
+                              ast_buf: void*) -> boolean {
         const order: &u32[] = &ctx.module_graph.topo_order;
         const n: u32 = order.length as u32;
         pipeline.set_passes([PassID::TypeDeclaration]);
@@ -2861,7 +2822,7 @@ type struct CompilerInstance {
         }
 
         for (mut i: u32 = 0; i < n; i++) {
-            CompilerInstance::load_module_with_scope(ctx, ctx.intern_table, ast_buf, scope_buf, order[i], n);
+            CompilerInstance::load_module(ctx, ctx.intern_table, ast_buf, order[i], n);
             ctx.provisions.clear();
             ctx.provisions.mark(Provision::Tokens);
             ctx.provisions.mark(Provision::AST);
@@ -2884,7 +2845,7 @@ type struct CompilerInstance {
     /// (rather than relying on topo order) fixes bare-template rewrites when the
     /// import graph places a consumer before its declarer in `order[]`.
     register_templates(&this, ctx: CompilationContext*, pipeline: PassRegistry*,
-                       ast_buf: void*, scope_buf: void*) -> boolean {
+                       ast_buf: void*) -> boolean {
         const order: &u32[] = &ctx.module_graph.topo_order;
         const n: u32 = order.length as u32;
         pipeline.set_passes([PassID::TemplateRegistration]);
@@ -2897,7 +2858,7 @@ type struct CompilerInstance {
         }
 
         for (mut i: u32 = 0; i < n; i++) {
-            CompilerInstance::load_module_with_scope(ctx, ctx.intern_table, ast_buf, scope_buf, order[i], n);
+            CompilerInstance::load_module(ctx, ctx.intern_table, ast_buf, order[i], n);
             ctx.provisions.clear();
             ctx.provisions.mark(Provision::Tokens);
             ctx.provisions.mark(Provision::AST);
@@ -2921,7 +2882,7 @@ type struct CompilerInstance {
     /// one module iteration because signature resolution is guarded by
     /// `!resolved_type.is_valid()`, so a later re-walk would skip them.
     expand_defaults_and_signatures(&this, ctx: CompilationContext*, pipeline: PassRegistry*,
-                                   ast_buf: void*, scope_buf: void*) -> boolean {
+                                   ast_buf: void*) -> boolean {
         const order: &u32[] = &ctx.module_graph.topo_order;
         const n: u32 = order.length as u32;
         pipeline.set_passes([PassID::DefaultExpansion,
@@ -2936,7 +2897,7 @@ type struct CompilerInstance {
         }
 
         for (mut i: u32 = 0; i < n; i++) {
-            CompilerInstance::load_module_with_scope(ctx, ctx.intern_table, ast_buf, scope_buf, order[i], n);
+            CompilerInstance::load_module(ctx, ctx.intern_table, ast_buf, order[i], n);
             ctx.provisions.clear();
             ctx.provisions.mark(Provision::Tokens);
             ctx.provisions.mark(Provision::AST);
@@ -2957,7 +2918,7 @@ type struct CompilerInstance {
 
     /// TypeResolution + StructFieldTypeSync over every module.
     resolve_types(&this, ctx: CompilationContext*, pipeline: PassRegistry*,
-                  ast_buf: void*, scope_buf: void*) -> boolean {
+                  ast_buf: void*) -> boolean {
         const order: &u32[] = &ctx.module_graph.topo_order;
         const n: u32 = order.length as u32;
         pipeline.set_passes([PassID::TypeResolution, PassID::StructFieldTypeSync]);
@@ -2972,7 +2933,7 @@ type struct CompilerInstance {
         }
 
         for (mut i: u32 = 0; i < n; i++) {
-            CompilerInstance::load_module_with_scope(ctx, ctx.intern_table, ast_buf, scope_buf, order[i], n);
+            CompilerInstance::load_module(ctx, ctx.intern_table, ast_buf, order[i], n);
             ctx.provisions.clear();
             ctx.provisions.mark(Provision::Tokens);
             ctx.provisions.mark(Provision::AST);
@@ -3084,7 +3045,7 @@ type struct CompilerInstance {
     /// otherwise be cloned before its (later) template module's directives were
     /// processed, silently dropping the layout onto every instantiation.
     process_directives(&this, ctx: CompilationContext*, pipeline: PassRegistry*,
-                       ast_buf: void*, scope_buf: void*) -> boolean {
+                       ast_buf: void*) -> boolean {
         const order: &u32[] = &ctx.module_graph.topo_order;
         const n: u32 = order.length as u32;
         pipeline.set_passes([PassID::DirectiveProcessing]);
@@ -3097,7 +3058,7 @@ type struct CompilerInstance {
             pipeline.validate_with_initial(init6ai);
         }
         for (mut i: u32 = 0; i < n; i++) {
-            CompilerInstance::load_module_with_scope(ctx, ctx.intern_table, ast_buf, scope_buf, order[i], n);
+            CompilerInstance::load_module(ctx, ctx.intern_table, ast_buf, order[i], n);
             ctx.provisions.clear();
             ctx.provisions.mark(Provision::Tokens);
             ctx.provisions.mark(Provision::AST);
@@ -3122,7 +3083,7 @@ type struct CompilerInstance {
     /// processed (so layout flags are visible) but must precede mono so it, not
     /// mono, resolves generic call return types.
     typecheck_bodies(&this, ctx: CompilationContext*, pipeline: PassRegistry*,
-                     ast_buf: void*, scope_buf: void*) -> boolean {
+                     ast_buf: void*) -> boolean {
         const order: &u32[] = &ctx.module_graph.topo_order;
         const n: u32 = order.length as u32;
         pipeline.set_passes([PassID::FunctionBodyTypeCheck]);
@@ -3136,7 +3097,7 @@ type struct CompilerInstance {
             pipeline.validate_with_initial(init6sema);
         }
         for (mut i: u32 = 0; i < n; i++) {
-            CompilerInstance::load_module_with_scope(ctx, ctx.intern_table, ast_buf, scope_buf, order[i], n);
+            CompilerInstance::load_module(ctx, ctx.intern_table, ast_buf, order[i], n);
             ctx.provisions.clear();
             ctx.provisions.mark(Provision::Tokens);
             ctx.provisions.mark(Provision::AST);
@@ -3160,7 +3121,7 @@ type struct CompilerInstance {
     /// every template carries its final layout and sema has resolved the types
     /// mono specializes.
     monomorphize(&this, ctx: CompilationContext*, pipeline: PassRegistry*,
-                 ast_buf: void*, scope_buf: void*) -> boolean {
+                 ast_buf: void*) -> boolean {
         const order: &u32[] = &ctx.module_graph.topo_order;
         const n: u32 = order.length as u32;
         pipeline.set_passes([
@@ -3178,7 +3139,7 @@ type struct CompilerInstance {
         }
 
         for (mut i: u32 = 0; i < n; i++) {
-            CompilerInstance::load_module_with_scope(ctx, ctx.intern_table, ast_buf, scope_buf, order[i], n);
+            CompilerInstance::load_module(ctx, ctx.intern_table, ast_buf, order[i], n);
             ctx.provisions.clear();
             ctx.provisions.mark(Provision::Tokens);
             ctx.provisions.mark(Provision::AST);
@@ -3206,11 +3167,11 @@ type struct CompilerInstance {
     /// ownership stay consistent.  Runs while still in bootstrap mode so spec
     /// registration can fall back to the arena.
     route_specializations(&this, ctx: CompilationContext*,
-                          ast_buf: void*, scope_buf: void*) -> boolean {
+                          ast_buf: void*) -> boolean {
         const order: &u32[] = &ctx.module_graph.topo_order;
         const n: u32 = order.length as u32;
         for (mut i: u32 = 0; i < n; i++) {
-            CompilerInstance::load_module_with_scope(ctx, ctx.intern_table, ast_buf, scope_buf, order[i], n);
+            CompilerInstance::load_module(ctx, ctx.intern_table, ast_buf, order[i], n);
             if (!SpecializationPasses::route_specializations_to_owners(ctx).success) {
                 return false;
             }
@@ -3225,7 +3186,7 @@ type struct CompilerInstance {
     /// once per project change) does not leak ~16 bytes per module
     /// per recompile.
     project_failure_release(&this, ctx: CompilationContext*,
-                            ast_buf: void*, scope_buf: void*)
+                            ast_buf: void*)
             -> CompilationResult {
         // Per-target arena: DEACTIVATE (failure path).  This is the single
         // chokepoint for all 12 pass-failure returns in
@@ -3237,7 +3198,6 @@ type struct CompilerInstance {
         // pass-failure returns, so the context never leaks past a failed target.
         Compiler::Codegen::LLVMTypes::dispose_codegen_context();
         intrinsics::free(ast_buf);
-        intrinsics::free(scope_buf);
         return this.project_failure(ctx);
     }
 

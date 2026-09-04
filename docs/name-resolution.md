@@ -10430,3 +10430,133 @@ heuristic rather than remove it. In order:
 Nothing here is committed; the tree is unchanged by this section. Recorded
 because the two dead predictions cost a build each and the next attempt should
 not repeat them.
+
+### 8.70 A module scope is not a rib: one scope per module, and the save/restore machinery deleted - MEASURED AND FIXED 2026-09-03
+
+8.69 recorded two dead predictions about the duplicate module scopes, and both
+were attempts to make save/restore work. The workaround was the defect.
+
+#### The model that was wrong
+
+`rustc_resolve` has no save/restore of module scopes, because nothing is ever
+unset. A module is built ONCE during module-tree construction and that object is
+the module's identity; the resolver holds a map from `DefId` to it, and entering
+a module sets a pointer to something that already exists.
+
+Rust keeps two kinds of scope with different lifetimes and never confuses them.
+**Ribs** - function bodies, blocks, generic parameter lists - are transient, and
+push/pop is right for them. **Module scopes** are persistent nodes in a graph,
+created once, keyed by identity, alive for the whole compilation.
+
+Cryo was treating a module scope like a rib: building one on entry. That is the
+whole cause. Entering a module fourteen times produced fourteen scopes, only the
+third populated, and a save/restore mechanism existed solely to carry the
+populated one across the gap.
+
+#### Why this is decision 3's third justification, and the only measured one
+
+Rust can key its map because a module has a `DefId`. Cryo modules had a name and
+no identity, so there was nothing to key on - which is precisely why the code
+resorted to building a scope on entry and hunting for the populated one at
+lookup. 8.67's module symbols are that identity.
+
+So this is not a step that follows decision 3, it is what decision 3 is FOR. The
+two justifications the decision was originally given both measured empty - the
+collision backlog (8.55) and the module-name ambiguity (8.57). The string-seam
+argument survived on structure. This one is backed by a defect that was measured
+before it was fixed: 3,430 scopes for 245 modules, and 40,127 lookups searching
+for the populated one.
+
+#### The ordering precondition, checked rather than assumed
+
+rustc can build the whole module tree before resolving anything. 8.38 records
+all-modules-first discipline at four stages, so the ordering this needs may
+already hold - and it does:
+
+| module-scope creations | graph size at that moment |
+|---:|---|
+| **3,430 of 3,430** | complete, 245 modules |
+
+A first run showed 2 at `graph=0`; that was the probe's own initialiser, since
+`switch_to_module` sets it and the resolver does not exist on the first call.
+Closing the gap made it unanimous. An ambiguous zero is not a measurement.
+
+#### Where the fourteen came from
+
+3,430 = 245 x 14, and the creators are three:
+
+* `switch_to_module` calls `set_module`, which CREATED a scope, once per module
+  per pass - and the orchestrator restored the saved one immediately after, so
+  the scope just built was abandoned.
+* `NameDeclarationPass::run` calls `set_module` TWICE in one invocation, once
+  from the module graph's name and once from the AST's namespace. That is why
+  the populated scope is ordinal 3.
+* `NameResolutionPass::run` already did it correctly, with
+  `set_module_with_scope` and a comment naming the hazard. The right model was
+  present in one place and contradicted everywhere else.
+
+The double call was never resolving a conflict. The graph's `namespace_name` and
+the AST's agree on every module measured - 245 of 245 on `compiler/`, 61 of 61
+and 58 of 58 on two projects - with no `<none>` on either side. Two scopes were
+being built for one name.
+
+#### What replaced it
+
+`module_scope_of` builds a module's scope on first ask and returns it unchanged
+forever after, declaring the module's `Symbol` with it so identity and bindings
+are created together. `set_module` is a lookup that never constructs.
+`find_module_scope` is a single map read.
+
+Deleted with them: the `HashMap<u32, u64[]>` multimap, the symbol-count
+tie-break, and the 55-line `audit_module_scope_pick` that existed only to
+interrogate that tie-break - vacuous once there is nothing to choose between,
+the same category as the 2c seam probe in 8.63.
+
+And both halves of the save/restore machinery, because with one canonical scope
+there is nothing to save and nothing to restore:
+
+* the dead one - `CompilationContext::save_module_scope` and
+  `ModuleGraph.module_scope_buf`/`_cap`, which 8.69 found had zero callers;
+* the live one - the orchestrator's `scope_buf`, its malloc, its two save sites,
+  its frees, `load_module_with_scope`, and the parameter threaded through 12
+  signatures.
+
+Neither was repaired. Both were artefacts of the wrong model.
+
+| | before | after |
+|---|---:|---:|
+| Module scopes, `compiler/` build | **3,430** | **245** |
+| scopes per module | 14 | **1** |
+| candidate scopes at a lookup | 3-13 | **1** |
+| `find_module_scope` tie-break | symbol count | none |
+
+#### Controls
+
+Predicted one scope per module and no behaviour change. The corpora this work
+does not edit are exact:
+
+| corpus | 2c before | 2c after | module scopes | diagnostic |
+|---|---:|---:|---:|---|
+| `examples/09-json-config` | 5,749 | **5,749** | 61 | none |
+| `tests/reexport_private_module` | 2,063 | **2,063** | 56 | E0240, its assertion |
+| `tests/reexport_basic` | 4,153 | **4,153** | 58 | none |
+
+`compiler/` drifts to 61,294 from 61,309, which is 8.67's standing artifact -
+this change deletes far more source than it adds, and `compiler/` compiles its
+own source.
+
+The falsifier that mattered was `forward_declare` re-entering a populated scope:
+it used to get a fresh one each run, so a second run would re-declare and raise
+E0205. None appeared, on 178 compile-fail cases and 38 projects - so the
+declaration pass runs once per module, which the canonical model now requires
+rather than merely tolerates.
+
+`LOOKUP` 117, `REENTRY` 6, B1 0 and B4 0 on three arms.
+
+#### What is still owed
+
+`set_module_with_scope` survives with six callers in mono, sema and name
+resolution. They are not the save/restore buffers - they switch to another
+module's scope deliberately - but with canonical scopes each is now equivalent
+to `set_module` of that module, so the helper should collapse into it. That is
+the next deletion, not part of this one.
