@@ -10949,3 +10949,71 @@ verified here explicitly.
 
 `examples/` swept by hand, **14 of 14** - `make examples` is a no-op on Windows
 that exits 0, and this is the sweep that would have caught the 110 files.
+
+### 8.75 The fixed point holds on BOTH hosts after a rename that changed every mangled symbol - MEASURED 2026-09-03
+
+`selfhost-check` last passed on the content of `a114beb7`. Thirteen commits have
+landed since - the 2c collapse, the canonical module scope, `home_module` as an
+identity, and the rename - and every measurement over them was `[host:windows]`.
+Single-host measurement has been this document's standing gap.
+
+The rename is why this could not wait any longer. A mangled name embeds the
+module path, so renaming 165 namespaces rewrote the symbol of every generic
+instantiation in the compiler. That is a specific, tree-wide reason to distrust
+any cached object, not merely accumulated drift - and it was observed, not
+assumed: the LSP link failed with `undefined reference` symbols carrying
+`8Compiler.7Codegen.6Passes` and `8compiler.7codegen.6passes` in the same build.
+
+#### Stated before the run
+
+Both arms reach `FIXED POINT OK`, printed exactly TWICE - a single OK is one arm,
+which on this host is a pass-shaped failure. Two failure modes were named in
+advance so they could not be confused after the fact:
+
+* `FIXED POINT BROKEN` naming a first-differing module would mean the rename was
+  NOT mechanical - some name binds to a different declaration in the compiler
+  one stage built than in the next.
+* a link error whose `undefined reference` carries BOTH spellings would mean
+  stale-object contamination, which is an environment fault and not a defect in
+  the change.
+
+Recorded also in advance, because it would otherwise look like a break: the
+emitted IR's mangled symbols now carry lowercase module paths. A fixed point
+compares stage 3 against stage 4, not against history, and both stages produce
+the same new names.
+
+#### Result: green on both, from an emptied `compiler/build`
+
+| arm | stages | fixed point | modules | IR |
+|---|---:|---|---:|---:|
+| linux (WSL) | 8/8 | **OK** | 245 | 110,528,568 bytes |
+| windows (native) | 8/8 | **OK** | 245 | 109,836,681 bytes |
+
+`FIXED POINT OK` appears exactly twice; exit 0. Linux 4m53.5s, Windows 2m10.2s.
+The linux arm's `cryo.ll` is md5 `e5589a3a8fb8bf7a806d0f83b1ab2570`, 951,350
+bytes. 245 modules on both, matching 8.67's count.
+
+What that buys is stronger than clearing the backlog. The boot compiler is the
+PIN, which predates the rename and knows only the old names; it compiles the
+renamed source, the compiler it produces compiles that source again, and stage 3
+and stage 4 emit byte-identical IR. A rename that altered every symbol in the
+tree therefore survives a full six-stage bootstrap on two operating systems.
+That is the strongest available confirmation that 8.74's change was mechanical,
+and it is consistent with the quieter evidence there: `compiler/` 2c did not move.
+
+#### A wait that looked like progress
+
+The first launch of this check ran nothing for 48 minutes. `Start-Process` was
+given the shell redirection inside its `-ArgumentList`, PowerShell re-quoted
+`> ... 2>&1` into a single argument, and `cmd` exited immediately. No log was
+created and no stage ran.
+
+The failure is worth recording because of its SHAPE rather than its cause. An
+absent log is exactly what a healthy run of this check looks like early on - the
+output is buffered, so a long silence is expected - and the two states are
+indistinguishable without checking whether the process is alive and whether the
+build tree is being repopulated. It is the same failure mode as an audit stream
+gated on the wrong environment variable: an absence that reads as progress.
+
+Put the redirection inside the wrapper script, and confirm liveness within the
+first minute: a live PID and a log that is GROWING. Silence alone says nothing.
