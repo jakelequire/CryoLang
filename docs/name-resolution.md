@@ -11192,11 +11192,28 @@ real, non-empty `span.file`, and module discovery is import-driven, so a file
 that was compiled is in the graph by construction. `ns_sym_of_file` therefore
 answers, and the fallback is unreachable **for a compiled project**.
 
-That is not the whole population. `ModuleLoader::set_lsp_override` serves an
-editor buffer, and single-file mode compiles without a project graph; neither is
-covered by any measurement above. This is the same shape as 8.64's
-`2-primitive`: a zero with a known mechanism over an unbounded population, and
-that one was recorded as a candidate rather than taken. So is this.
+That is not the whole population. Two cases sit outside a project build, and
+one of them is now measured.
 
-Recorded, not taken. The missing control is a measurement of `array_size_of`
-under LSP/single-file mode, where the graph may legitimately fail to name a file.
+**Single-file mode is covered, and it does not fall back.** `cryo build
+solo.cryo` on a lone file holding `const N` and `cells: i32[N]` reaches
+`array_size_of` seven times and falls back **zero** times, with the row for the
+array size itself - `solo.cryo:6:18` - showing the graph naming the file. So
+"compiles without a project" does not mean "compiles without a graph": the
+loader registers the file it was handed, and `ns_sym_of_file` answers.
+
+**The LSP buffer is not.** `ModuleLoader::set_lsp_override` substitutes editor
+text for a path, and a buffer for a file not yet in the graph is the one shape
+that could reach the fallback. Nothing in any local gate builds the LSP, so
+this is unmeasured rather than measured-zero.
+
+That leaves the same shape as 8.64's `2-primitive` - a zero with a known
+mechanism over a population that is now narrow but still not bounded - and that
+one was recorded as a candidate rather than taken. So is this.
+
+Recorded, not taken. There is a second reason not to rush it: deleting the
+fallback is not obviously behaviour-identical even where it fires. Interning a
+file path yields a VALID `SymbolStr` naming no module, while deleting leaves the
+EMPTY symbol, and whether `ConstEval` treats "a namespace nothing declares" and
+"no namespace" alike is not established here. The missing controls are therefore
+`array_size_of` under an LSP override, and that `ConstEval` distinction.
