@@ -11796,3 +11796,125 @@ ground `examples` already walked, so it can go late.
 Worth re-checking the rest of the job against that rule rather than assuming
 this was the only instance.
 
+### 8.83 The gate that certifies the branch counted a skipped arm as a pass - MEASURED AND FIXED 2026-09-04
+
+`selfhost-check` has two arms: the Linux 6-stage byte-identity chain and the
+Windows one. Both host paths mapped a SKIPPED arm to exit 0.
+
+    scripts/selfhost-check.py:754   return 0 if win in ("ok", "skip") else 1
+    scripts/selfhost-check.py:898   if win == "fail": return 1
+
+`run_windows_selfhost` returns `"skip"` when `bin/cryo.exe` is absent, or when
+wine and the fetched Windows toolchain are not present. CI's selfhost job runs
+on `ubuntu-latest` and installs neither. So the job ran one arm and exited 0,
+and "the fixed point holds on both hosts" was a claim about a run that could
+not be told apart from a run that checked one host.
+
+8.75 and the commit that recorded the both-arms verification rest on this gate.
+The "exactly twice" criterion - two `FIXED POINT OK` lines - lived in a commit
+message and in a memory note, which is to say in a discipline, which is what
+§7 says gets violated under deadline.
+
+This is the sixth instance of the absence that reads as progress, and the one
+that certifies the other five.
+
+#### Demonstrated, not inferred
+
+The mapping was read from the source and then the branch was executed, in the
+environment CI uses, by reproducing exactly what CI has: no wine on PATH.
+
+    ARM_RESULT='skip'
+    linux-host   (line 898-903): exit 0
+    windows-host (line 754)    : exit 0
+
+A code read would have been enough to justify the change; it is not enough to
+justify the claim, because the branch reached in practice is a question about
+the environment and not about the source.
+
+#### The fix, and why it is a flag rather than a hard failure
+
+The arms are now counted, named and printed, and a skip is a refusal - unless
+the caller passes `--allow-skipped-arm`.
+
+Making a skip fail unconditionally would have repeated the failure 8.79 was
+built to avoid: a gate that goes red in an environment that legitimately cannot
+run an arm is a gate that gets ignored, and an ignored gate is not evidence.
+The declaration is a flag precisely so that it lives at the CALL SITE - visible
+in the workflow file or the make invocation a reader inspects - rather than
+inside a status mapping nobody reads. CI now says out loud, in the job, that it
+verifies the Linux arm only.
+
+A fourth status keeps the two kinds of not-running apart. `DECLINED` is an arm a
+flag put out of scope for this invocation because something else is accountable
+for it - the Windows-host entry point runs the Linux arm inside WSL with
+`--no-windows` and then runs the Windows arm natively, so the child is not
+failing to cover the Windows arm, it is not responsible for it. `skip` is an arm
+that was attempted and could not run. The first is a division of labour; the
+second is missing coverage. Collapsing them is how the hole was readable as
+intentional.
+
+The Windows-host path is the one that matters most and it takes no flag: that
+host can run both arms, so it is the host whose green licenses the both-arms
+claim, and it is now unreachable with the Windows arm skipped.
+
+#### Controls
+
+A seven-case decision table, run against the changed function:
+
+| arms | `--allow-skipped-arm` | expected | got |
+|---|---|---:|---:|
+| both verified | no | 0 | 0 |
+| windows skipped | no | 1 | 1 |
+| windows skipped | yes | 0 | 0 |
+| windows failed | no | 1 | 1 |
+| windows failed | yes | 1 | 1 |
+| linux broken | yes | 1 | 1 |
+| windows declined | no | 0 | 0 |
+
+The fifth row is the one worth stating: the flag forgives an arm that could not
+run, never one that ran and broke.
+
+Then the whole gate, on the host that has both arms - the run that the
+both-arms claim actually depends on:
+
+    ==> selfhost-check arms  2 verified, 0 skipped, 0 failed
+          linux     ✓ verified  verified in WSL (see above)
+          windows   ✓ verified  245 modules byte-identical
+
+245 modules on both arms, matching 8.75. `FIXED POINT OK` appears exactly twice
+in the log, which was the hand-checked criterion in a memory note and is now a
+property of the gate: the summary cannot say "2 verified" unless two arms ran.
+
+The inner WSL child prints its own summary first, and it is the control for the
+DECLINED status - `1 verified, 0 skipped, 0 failed` with the Windows arm marked
+"not this run's job". A child that had counted its declined arm as skipped would
+have failed the run; one that had counted it as verified would have made the
+parent's "2 verified" a double count.
+
+#### A seventh instance, in the tooling that made the change
+
+Counting the one above as the sixth, this is the seventh, and it happened
+during the fix. The patch script that rewrote the five return sites reported
+success while the single most important one - the wine-missing branch, the one CI actually takes -
+did not match its anchor and was left untouched. `str.replace` returns the
+string unchanged when the anchor is absent, and the script's only assertion was
+that *something* had changed.
+
+The decision-table control caught it: `CI_BRANCH='skip'` came back a bare string
+where every other site returned a tuple. Without that control the commit would
+have shipped a gate that still passed on a skipped arm, with a ledger entry
+saying it did not - which is worse than the defect, because it converts a hole
+into a hole with a certificate.
+
+The general rule, and it applies to every patch script in `scripts/`: **assert
+per anchor, not per file.** A rewrite that reports success having matched
+nothing is the same shape as a gate that exits 0 having swept nothing, and it
+reached the instrument for closing exactly that.
+
+#### Open, and now visible
+
+Whether CI should install wine and the Windows toolchain and verify both arms is
+a real question with a real cost, and it is not answered here. What changed is
+that it is now a visible decision in the workflow file instead of a silent
+property of a status mapping. Deciding it belongs to whoever weighs the CI
+minutes against the coverage.
