@@ -8,31 +8,31 @@
 /// Mode-specific behavior comes from CompileMode policy methods queried
 /// by individual passes, not from flags on this struct.
 
-namespace Compiler::Instance;
+namespace compiler::instance;
 
-import Compiler::{
-    CompileMode, CompilationContext, Diag, Artifacts, ModuleGraph,
-    ModuleLoader, ProjectConfig, BuildManifest, Codegen, Lex
+import compiler::{
+    compile_mode, compilation_context, diag, artifacts, module_graph,
+    module_loader, project_config, build_manifest, codegen, lex
 };
-import Compiler::Passes::{
-    PassID, PassRegistry, Specialization
+import compiler::passes::{
+    pass_id, pass_registry, specialization
 };
-import Compiler::Codegen::{
-    LLVMTypes, Passes, TestMainCodegen, TypeMap
+import compiler::codegen::{
+    llvm_types, passes, test_main_codegen, type_map
 };
-import Compiler::Resolver::{
-    InternTable, SymbolStr, MangledName
+import compiler::resolver::{
+    intern_table, symbol_str, mangled_name
 };
-import Compiler::Resolver::Res;
-import Compiler::AST::{ Node, Declaration, Dumper, NodeKind };
-import Compiler::Deps::DepResolver;
-import Compiler::Deps::Lockfile;
-import Compiler::Vendor::AutoVendor;
-import Compiler::Diag::Diagnostic;
-import Compiler::Lex::Lexer;
-import Compiler::ResolveCounter;
-import Utils;
-import Utils::Logger;
+import compiler::resolver::res;
+import compiler::ast::{ node, declaration, dumper, NodeKind };
+import compiler::deps::dep_resolver;
+import compiler::deps::lockfile;
+import compiler::vendor::auto_vendor;
+import compiler::diag::diagnostic;
+import compiler::lex::lexer;
+import compiler::resolve_counter;
+import utils;
+import utils::logger;
 import std::fmt;
 import std::fs::metadata;
 import std::fs::path;
@@ -516,8 +516,8 @@ type struct CompilerInstance {
         // unrelated types here. Every other codegen entry resets it
         // (compile_project_with_ctx, compile_for_lsp_content_into); raw was the
         // one that didn't.
-        Compiler::Codegen::TypeMap::TypeMapperCache::reset_shared_type_cache();
-        Compiler::Codegen::AstArena::cryo_ast_arena_reset();
+        compiler::codegen::type_map::TypeMapperCache::reset_shared_type_cache();
+        compiler::codegen::ast_arena::cryo_ast_arena_reset();
         mut pipeline: PassRegistry = PassRegistry::build_raw_pipeline();
         return this.run_pipeline(&ctx, &pipeline, ctx.artifacts.linked.object_file_path);
     }
@@ -580,7 +580,7 @@ type struct CompilerInstance {
             return CompilationResult::failed(1, 0);
         }
 
-        MangledName::set_lsp_safe(true);
+        mangled_name::set_lsp_safe(true);
         mut ctx: CompilationContext = CompilationContext::new(CompileMode::Lsp, source);
         mut pipeline: PassRegistry = PassRegistry::build_frontend_pipeline();
         return this.run_pipeline(&ctx, &pipeline, "");
@@ -597,12 +597,12 @@ type struct CompilerInstance {
     /// For real diagnostics, route through `compile_for_lsp_project_into`.
     compile_for_lsp_content_into(&this, ctx: CompilationContext*,
                                  virtual_path: string, content: string) -> CompilationResult {
-        MangledName::set_lsp_safe(true);
+        mangled_name::set_lsp_safe(true);
         // Same risk as the multi-target build path: TypeArena.next_id
         // resets every compile, so without clearing the (TypeRef.id ->
         // LLVMTypeRef) cache between LSP recompiles every fresh TypeRef
         // would alias a stale entry from a prior keystroke's compile.
-        Compiler::Codegen::TypeMap::TypeMapperCache::reset_shared_type_cache();
+        compiler::codegen::type_map::TypeMapperCache::reset_shared_type_cache();
         // NB: the arena is NOT reset here.  The LSP session owns the arena
         // lifecycle - it resets + activates routing before constructing `ctx`
         // (so this single-file path's whole container heap - intern strings,
@@ -631,7 +631,7 @@ type struct CompilerInstance {
                                  config_path: string,
                                  override_path: string,
                                  override_content: string) -> CompilationResult {
-        MangledName::set_lsp_safe(true);
+        mangled_name::set_lsp_safe(true);
         ctx.lsp_override_path    = override_path;
         ctx.lsp_override_content = override_content;
         mut config: ProjectConfig = ProjectConfig::parse(config_path);
@@ -927,7 +927,7 @@ type struct CompilerInstance {
         // Release this target's arena chunks back to the OS (the bulk of the
         // per-target heap) so the next target builds from a low baseline
         // instead of climbing on top of the prior target's retained arena.
-        Compiler::Codegen::AstArena::cryo_ast_arena_release();
+        compiler::codegen::ast_arena::cryo_ast_arena_release();
         return result;
     }
 
@@ -950,7 +950,7 @@ type struct CompilerInstance {
         // compile in this process.  TypeArena.next_id resets to 1 every
         // compile, so without this every fresh TypeRef would alias a
         // stale cache entry from the previous run.
-        Compiler::Codegen::TypeMap::TypeMapperCache::reset_shared_type_cache();
+        compiler::codegen::type_map::TypeMapperCache::reset_shared_type_cache();
         // Reclaim the previous target's AST nodes (parse trees + monomorphized
         // clones) in bulk.  Each target uses its own heap-leaked
         // CompilationContext, so the prior target's `preserved_asts` /
@@ -971,17 +971,17 @@ type struct CompilerInstance {
             _                => { false }
         };
         if (!lsp_owns_arena) {
-            Compiler::Codegen::AstArena::cryo_ast_arena_reset();
+            compiler::codegen::ast_arena::cryo_ast_arena_reset();
             // Defensive: guarantee this target STARTS with arena routing OFF, so
             // its survivor construction (below, pre-activation) always lands in
             // libc - even on the impossible-by-construction path where a prior
             // target leaked the active flag.  The bracket re-enables it at Frontend.
-            Compiler::Codegen::AstArena::cryo_alloc_arena_set_active(false);
+            compiler::codegen::ast_arena::cryo_alloc_arena_set_active(false);
         }
         // Same defensive reset for the LLVM context: dispose any leftover from
         // a prior target so this target starts on the global-context fallback
         // until its own context is published at Frontend.
-        Compiler::Codegen::LLVMTypes::dispose_codegen_context();
+        compiler::codegen::llvm_types::dispose_codegen_context();
 
         // CRYO_TIMINGS phase profiling.  All marks are captured regardless;
         // the report only prints (success path) when the env var is set, so
@@ -1190,7 +1190,7 @@ type struct CompilerInstance {
             // Deactivate the arena in case LSP mode activated it early (above);
             // no-op on the build path, which activates only at ~1396.  Keeps the
             // active flag from leaking past this pre-frontend early return.
-            Compiler::Codegen::AstArena::cryo_alloc_arena_set_active(false);
+            compiler::codegen::ast_arena::cryo_alloc_arena_set_active(false);
             return CompilationResult::failed(ctx.diagnostics.error_count, ctx.diagnostics.warning_count);
         }
 
@@ -1375,7 +1375,7 @@ type struct CompilerInstance {
             if (pm.namespace_name.id != prelude_ns_sym.id) { continue; }
             for (mut psi: i64 = 0; psi < pm.submodules.length; psi++) {
                 prelude_set.push(pm.submodules[psi]);
-                ResolveCounter::path_prelude(
+                resolve_counter::path_prelude(
                     ctx.intern_table.resolve(pm.submodules[psi]));
             }
         }
@@ -1444,7 +1444,7 @@ type struct CompilerInstance {
             const imi_ns_str: string =
                 ctx.intern_table.resolve(imi_info.namespace_name);
             for (mut si: i64 = 0; si < imi_visible.length; si++) {
-                ResolveCounter::path_scope(
+                resolve_counter::path_scope(
                     imi_ns_str, ctx.intern_table.resolve(imi_visible[si]));
             }
         }
@@ -1552,7 +1552,7 @@ type struct CompilerInstance {
         const do_incremental: boolean =
             this.config.incremental && ctx.mode.codegen_enabled()
             && this.config.output_path_override.length() == 0;
-        mut mod_entries: BuildManifest::ModuleEntry[] = [];
+        mut mod_entries: build_manifest::ModuleEntry[] = [];
         mut manifest_artifacts: string[] = [];
         mut manifest_stdlib_archive: string = "";
         mut build_fp_hex: string = "";
@@ -1570,7 +1570,7 @@ type struct CompilerInstance {
         if (do_incremental) {
             for (mut i: u32 = 0; i < n; i++) {
                 const minfo: ModuleInfo* = &ctx.module_graph.modules[order[i]];
-                mod_entries.push(BuildManifest::ModuleEntry {
+                mod_entries.push(build_manifest::ModuleEntry {
                     namespace_name: ctx.intern_table.resolve(minfo.name),
                     source_path:    minfo.file_path,
                     origin_subdir:  ModuleInfo::origin_subdir(minfo.origin, minfo.origin_name),
@@ -1609,11 +1609,11 @@ type struct CompilerInstance {
                 };
                 manifest_artifacts.push(ctx.project_config.lib_archive_path(archive_name));
             }
-            const manifest: BuildManifest::Manifest = Compiler::BuildManifest::Manifest::new(
+            const manifest: build_manifest::Manifest = compiler::build_manifest::Manifest::new(
                 ctx.project_config, ctx.opt_level, ctx.emit_debug_info,
                 manifest_stdlib_archive);
             const build_fp: u128 = manifest.compute_fingerprint(&mod_entries);
-            build_fp_hex = Compiler::BuildManifest::Manifest::hex128(build_fp);
+            build_fp_hex = compiler::build_manifest::Manifest::hex128(build_fp);
 
             if (manifest.is_up_to_date(build_fp_hex, &manifest_artifacts)) {
                 // Nothing changed and the artifact still exists: skip
@@ -1641,7 +1641,7 @@ type struct CompilerInstance {
         // clone at ~844, ctx.stdlib_root at ~879).  Deactivated before result
         // construction below (success) and in `project_failure_release` (every
         // pass-failure path), so the active flag never leaks past a target.
-        Compiler::Codegen::AstArena::cryo_alloc_arena_set_active(true);
+        compiler::codegen::ast_arena::cryo_alloc_arena_set_active(true);
 
         // -- Per-target LLVM context: CREATE -----------------------------
         // Publish a fresh LLVMContextRef for this target's codegen.  All leaf
@@ -1662,7 +1662,7 @@ type struct CompilerInstance {
         // that entirely; the null disposes downstream are no-ops.
         match (ctx.mode) {
             CompileMode::Lsp => { }
-            _ => { Compiler::Codegen::LLVMTypes::set_codegen_context_new(); }
+            _ => { compiler::codegen::llvm_types::set_codegen_context_new(); }
         }
 
         // Allocate local buffers for per-module ASTs and scopes.
@@ -1775,13 +1775,13 @@ type struct CompilerInstance {
             mut pm_src_h: u128[] = [];
             for (mut m: u32 = 0; m < n; m++) {
                 const mi: ModuleInfo* = &ctx.module_graph.modules[m];
-                pm_src_h.push(Compiler::BuildManifest::Manifest::module_source_hash(
+                pm_src_h.push(compiler::build_manifest::Manifest::module_source_hash(
                     ctx.intern_table.resolve(mi.name),
                     ModuleInfo::origin_subdir(mi.origin, mi.origin_name),
                     mi.file_path));
             }
 
-            const pm_tool_fp: u128 = Compiler::BuildManifest::Manifest::toolchain_fingerprint(
+            const pm_tool_fp: u128 = compiler::build_manifest::Manifest::toolchain_fingerprint(
                 ctx.project_config, ctx.opt_level, ctx.emit_debug_info);
 
             // Spec ownership.  A spec whose owner can't be attributed to a
@@ -1833,8 +1833,8 @@ type struct CompilerInstance {
             }
             const pm_global: u128 = pm_global_h.finish128();
 
-            const pm_prior: BuildManifest::ModuleKeyTable =
-                Compiler::BuildManifest::ModuleKeyTable::read_module_keys(ctx.project_config.module_keys_path());
+            const pm_prior: build_manifest::ModuleKeyTable =
+                compiler::build_manifest::ModuleKeyTable::read_module_keys(ctx.project_config.module_keys_path());
 
             // Per-module key (indexed by module index, parallel arrays).
             // `pm_closure_ok` clears for any module whose import closure came
@@ -1899,7 +1899,7 @@ type struct CompilerInstance {
                     if (pm_implicit_short) { pm_closure_ok[m as i64] = false; }
                 }
                 pm_key_names.push(ns);
-                pm_key_hex.push(Compiler::BuildManifest::Manifest::hex128(k.finish128()));
+                pm_key_hex.push(compiler::build_manifest::Manifest::hex128(k.finish128()));
             }
 
             // Cached if the prior key matches AND the .o is still on disk.
@@ -1913,7 +1913,7 @@ type struct CompilerInstance {
                     const objp: string = format("%s/%s.o",
                         ctx.project_config.deps_dir_for(
                             ModuleInfo::origin_subdir(mi.origin, mi.origin_name)),
-                        Compiler::BuildManifest::Manifest::path_module(ctx.intern_table.resolve(mi.name)));
+                        compiler::build_manifest::Manifest::path_module(ctx.intern_table.resolve(mi.name)));
                     if (metadata::exists(Path::from(objp))) {
                         pm_cached[m as i64] = true;
                     }
@@ -2155,7 +2155,7 @@ type struct CompilerInstance {
             // The per-TARGET codegen context (published before sema/mono) is
             // superseded by per-MODULE contexts below; dispose it up front so
             // the first `set_codegen_context_new_keep_prior` doesn't orphan it.
-            Compiler::Codegen::LLVMTypes::dispose_codegen_context();
+            compiler::codegen::llvm_types::dispose_codegen_context();
 
             // Per-topo-position object path to hand the linker ("" = nothing to
             // register: a cached hit records its own path, an IRText/Asm/-o
@@ -2187,7 +2187,7 @@ type struct CompilerInstance {
                     cg_obj[i as i64] = format("%s/%s.o",
                         ctx.project_config.deps_dir_for(
                             ModuleInfo::origin_subdir(_mi.origin, _mi.origin_name)),
-                        Compiler::BuildManifest::Manifest::path_module(_mn));
+                        compiler::build_manifest::Manifest::path_module(_mn));
                     cdebug("[Compiler] Codegen: reused cached object %s\n", cg_obj[i as i64]);
                     continue;
                 }
@@ -2200,8 +2200,8 @@ type struct CompilerInstance {
                 // `.o` is self-contained (types re-declared per module), so
                 // per-module contexts leave objects byte-identical - the
                 // selfhost byte-identity gate is the arbiter.
-                Compiler::Codegen::LLVMTypes::set_codegen_context_new_keep_prior();
-                Compiler::Codegen::TypeMap::TypeMapperCache::reset_shared_type_cache();
+                compiler::codegen::llvm_types::set_codegen_context_new_keep_prior();
+                compiler::codegen::type_map::TypeMapperCache::reset_shared_type_cache();
 
                 CompilerInstance::load_module(
                     ctx, ctx.intern_table, ast_buf, order[i], n);
@@ -2228,7 +2228,7 @@ type struct CompilerInstance {
                     // has no module to emit; reclaim it now.
                     fmt::eprintln(f"error: codegen failed for module {CompilerInstance::codegen_module_name(ctx, i)}");
                     cg_failed = true;
-                    Compiler::Codegen::LLVMTypes::dispose_codegen_context();
+                    compiler::codegen::llvm_types::dispose_codegen_context();
                     pipeline.reset();
                     continue;
                 }
@@ -2241,7 +2241,7 @@ type struct CompilerInstance {
                 // emitter to be safe.  Off by default; zero cost when unset.
                 match (env::var(Str::new("CRYO_CTX_AUDIT"))) {
                     Option::Some(_) => {
-                        Compiler::Codegen::Passes::ctx_audit_module(
+                        compiler::codegen::passes::ctx_audit_module(
                             ctx.artifacts.ir.llvm_module, mod_name);
                     }
                     Option::None => { }
@@ -2263,7 +2263,7 @@ type struct CompilerInstance {
                     // IR tree mirrors the source tree instead of one flat folder
                     // of `__`-joined stems.
                     const ll_rel: string =
-                        Compiler::BuildManifest::Manifest::path_module(mod_name);
+                        compiler::build_manifest::Manifest::path_module(mod_name);
                     const ll_path: string = format("%s/%s.ll", ir_dir, ll_rel);
                     ProjectConfig::mkdir_p(ll_path.parent_dir());
                     mut ll_err: i8* = null;
@@ -2286,7 +2286,7 @@ type struct CompilerInstance {
                     mut lmod0: LModule = LModule { raw: ctx.artifacts.ir.llvm_module };
                     lmod0.dispose();
                     ctx.artifacts.ir = IROutput::empty();
-                    Compiler::Codegen::LLVMTypes::dispose_codegen_context();
+                    compiler::codegen::llvm_types::dispose_codegen_context();
                     pipeline.reset();
                     continue;
                 }
@@ -2300,7 +2300,7 @@ type struct CompilerInstance {
                     const wrote: boolean = lmbc.write_bitcode(bc_path);
                     lmbc.dispose();
                     ctx.artifacts.ir = IROutput::empty();
-                    Compiler::Codegen::LLVMTypes::dispose_codegen_context();
+                    compiler::codegen::llvm_types::dispose_codegen_context();
                     pipeline.reset();
                     if (wrote) {
                         mp_bc.push(bc_path);
@@ -2330,7 +2330,7 @@ type struct CompilerInstance {
                     cg_tri, ctx.opt_level as i32);
                 cg_jobs.push(EmitJob {
                     llvm_module:     ctx.artifacts.ir.llvm_module,
-                    llvm_context:    Compiler::Codegen::LLVMTypes::current_codegen_context(),
+                    llvm_context:    compiler::codegen::llvm_types::current_codegen_context(),
                     tm:              cg_tm.raw,
                     emit_path:       tgt.emit_path,
                     emit_type:       tgt.emit_type,
@@ -2433,7 +2433,7 @@ type struct CompilerInstance {
 
             // The last per-module context was disposed above; NULL the global
             // (do not dispose) before the target-end teardown, or it double-frees.
-            Compiler::Codegen::LLVMTypes::clear_codegen_context_ptr();
+            compiler::codegen::llvm_types::clear_codegen_context_ptr();
 
             // Register every module's object in topo order - link-stable
             // regardless of the order objects finished emitting.
@@ -2556,14 +2556,14 @@ type struct CompilerInstance {
         //
         // Tallies are per-process, so a `require` reached inside a forked
         // codegen child is not represented here.
-        // Spelled in full because the namespace `Compiler::Resolver::Res` and
+        // Spelled in full because the namespace `compiler::resolver::res` and
         // the enum `Res` it declares share a spelling, and a bare `Res::`
         // qualifier binds the type.
-        const pending: u64 = Compiler::Resolver::Res::pending_bug_count();
+        const pending: u64 = compiler::resolver::res::pending_bug_count();
         if (!ctx.diagnostics.has_errors() && pending > 0) {
             ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
                 format("%llu path-bearing node(s) reached a stage requiring name resolution with no `Res` recorded; first required at %s",
-                    pending, Compiler::Resolver::Res::pending_bug_first_site()));
+                    pending, compiler::resolver::res::pending_bug_first_site()));
         }
 
         // A consumer held a canonical name the declaration index does not
@@ -2571,11 +2571,11 @@ type struct CompilerInstance {
         // tally above: a name-layer answer is only worth having if the
         // registration it names exists, and a consumer that quietly looked
         // elsewhere would turn the defect into a wrong type instead.
-        const unreg: u64 = Compiler::Resolver::Res::unregistered_def_count();
+        const unreg: u64 = compiler::resolver::res::unregistered_def_count();
         if (!ctx.diagnostics.has_errors() && unreg > 0) {
             ctx.emit_error(ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
                 format("%llu canonical name(s) named no registered declaration; first consumed at %s",
-                    unreg, Compiler::Resolver::Res::unregistered_def_first_site()));
+                    unreg, compiler::resolver::res::unregistered_def_first_site()));
         }
 
         const skip_flush: boolean = match (ctx.mode) {
@@ -2599,7 +2599,7 @@ type struct CompilerInstance {
         // manifest side-files) land in libc and outlive the next target's
         // reset.  Free/realloc still recognise arena pointers via `owns()`,
         // so this flip never strands a live arena block to libc `free`.
-        Compiler::Codegen::AstArena::cryo_alloc_arena_set_active(false);
+        compiler::codegen::ast_arena::cryo_alloc_arena_set_active(false);
 
         // -- Per-target LLVM context: DISPOSE (success path) -------------
         // Codegen + linking are done (linking reads on-disk objects, not LLVM
@@ -2607,7 +2607,7 @@ type struct CompilerInstance {
         // Codegen loop).  Free this target's whole LLVM context now so its
         // type tables don't survive into the next target.  Nothing below
         // touches LLVM (exe_path + manifest are pure string/file work).
-        Compiler::Codegen::LLVMTypes::dispose_codegen_context();
+        compiler::codegen::llvm_types::dispose_codegen_context();
 
         if (ctx.diagnostics.has_errors()) {
             return CompilationResult::failed(
@@ -2633,7 +2633,7 @@ type struct CompilerInstance {
         // Gated on `do_incremental`; the fingerprint locals were computed
         // before the frontend ran. Side files only; no effect on the IR.
         if (do_incremental && ctx.project_config != null) {
-            const manifest: BuildManifest::Manifest = Compiler::BuildManifest::Manifest::new(
+            const manifest: build_manifest::Manifest = compiler::build_manifest::Manifest::new(
                 ctx.project_config, ctx.opt_level, ctx.emit_debug_info,
                 manifest_stdlib_archive);
             manifest.write_fingerprint(build_fp_hex);
@@ -2642,7 +2642,7 @@ type struct CompilerInstance {
             // whenever they were computed: every module not marked cached was
             // just recompiled, so its key now matches its on-disk .o.
             if (pm_key_names.length > 0) {
-                Compiler::BuildManifest::ModuleKeyTable::write_module_keys(
+                compiler::build_manifest::ModuleKeyTable::write_module_keys(
                     ctx.project_config.module_keys_path(),
                     &pm_key_names, &pm_key_hex);
             }
@@ -2683,7 +2683,7 @@ type struct CompilerInstance {
         // measurement; no-op unless CRYO_RESOLVE_COUNTER is set.  Pin
         // CRYO_CODEGEN_THREADS=1 for a baseline, or multiprocess codegen
         // drops the child tallies.
-        ResolveCounter::report();
+        resolve_counter::report();
 
         mut ok_result: CompilationResult = CompilationResult::ok(exe_path);
         ok_result.stdlib_root = ctx.stdlib_root;
@@ -3192,11 +3192,11 @@ type struct CompilerInstance {
         // chokepoint for all 12 pass-failure returns in
         // compile_project_with_ctx, so the active flag never leaks past a
         // failed target into the next target's survivor construction.
-        Compiler::Codegen::AstArena::cryo_alloc_arena_set_active(false);
+        compiler::codegen::ast_arena::cryo_alloc_arena_set_active(false);
         // Dispose this target's LLVM context too (frees any modules/types
         // built before the failure).  Single chokepoint for all 12
         // pass-failure returns, so the context never leaks past a failed target.
-        Compiler::Codegen::LLVMTypes::dispose_codegen_context();
+        compiler::codegen::llvm_types::dispose_codegen_context();
         intrinsics::free(ast_buf);
         return this.project_failure(ctx);
     }

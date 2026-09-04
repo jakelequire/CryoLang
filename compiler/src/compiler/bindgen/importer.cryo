@@ -23,26 +23,26 @@
 /// `field_cursors` first (rather than emitted one-by-one) so a run of bitfields
 /// can be spanned by a single storage blob with look-ahead.
 
-namespace Compiler::Bindgen::Importer;
+namespace compiler::bindgen::importer;
 
-import Compiler::Bindgen::Clang;
-import Compiler::Bindgen::Clang::{ CXCursor, CXType, CXUnsavedFile, CXSourceRange, CXToken, CXString, CXSourceLocation };
-import Compiler::Bindgen::TypeMap;
-import Compiler::Bindgen::TypeMap::{ CTypeMapper };
-import Compiler::Lex::Lexer;
-import Compiler::Codegen::Util;
-import Compiler::Passes::PassID;
-import Compiler::Diag;
-import Compiler::Diag::{ Snapshot, Sink, SourceSpan, Diagnostic };
-import Compiler::Artifacts;
-import Compiler::CompilationContext;
-import Compiler::AST;
-import Compiler::AST::{ Node, Declaration };
-import Compiler::AST::Expression;
-import Compiler::AST::Statement;
-import Compiler::Resolver::{ SymbolStr, InternTable };
-import Utils;
-import Utils::Logger;
+import compiler::bindgen::clang;
+import compiler::bindgen::clang::{ CXCursor, CXType, CXUnsavedFile, CXSourceRange, CXToken, CXString, CXSourceLocation };
+import compiler::bindgen::type_map;
+import compiler::bindgen::type_map::{ CTypeMapper };
+import compiler::lex::lexer;
+import compiler::codegen::util;
+import compiler::passes::pass_id;
+import compiler::diag;
+import compiler::diag::{ snapshot, sink, source_span, diagnostic };
+import compiler::artifacts;
+import compiler::compilation_context;
+import compiler::ast;
+import compiler::ast::{ node, declaration };
+import compiler::ast::expression;
+import compiler::ast::statement;
+import compiler::resolver::{ symbol_str, intern_table };
+import utils;
+import utils::logger;
 import std::fmt;
 import std::fmt::float;
 import std::collections::string;
@@ -326,13 +326,13 @@ type struct Importer {
         const imp: Importer* = client as Importer*;
 
         if (cursor.is_in_system_header()) {
-            return Clang::VISIT_CONTINUE;
+            return clang::VISIT_CONTINUE;
         }
 
-        const k: i32 = Clang::clang_getCursorKind(cursor);
-        if (k == Clang::CURSOR_FUNCTION_DECL) {
+        const k: i32 = clang::clang_getCursorKind(cursor);
+        if (k == clang::CURSOR_FUNCTION_DECL) {
             imp.emit_function(cursor);
-            return Clang::VISIT_CONTINUE;
+            return clang::VISIT_CONTINUE;
         }
 
         // C++ (Strategy A): recurse into namespaces so a `namespace ns { ... }`
@@ -341,47 +341,47 @@ type struct Importer {
         // methods.  All gated on `is_cpp` so the C path is byte-for-byte unchanged
         // (these cursor kinds never appear in a C TU anyway).
         if (imp.is_cpp) {
-            if (k == Clang::CURSOR_NAMESPACE) {
-                Clang::clang_visitChildren(cursor, Importer::visit_decl, client);
-                return Clang::VISIT_CONTINUE;
+            if (k == clang::CURSOR_NAMESPACE) {
+                clang::clang_visitChildren(cursor, Importer::visit_decl, client);
+                return clang::VISIT_CONTINUE;
             }
-            if (k == Clang::CURSOR_CLASS_DECL) {
+            if (k == clang::CURSOR_CLASS_DECL) {
                 imp.emit_cxx_class(cursor);
-                return Clang::VISIT_CONTINUE;
+                return clang::VISIT_CONTINUE;
             }
-            if (k == Clang::CURSOR_FUNCTION_TEMPLATE) {
+            if (k == clang::CURSOR_FUNCTION_TEMPLATE) {
                 imp.report.skip(format("function template `%s` (no instantiated symbol)",
                                 imp.spelling_of(cursor)));
-                return Clang::VISIT_CONTINUE;
+                return clang::VISIT_CONTINUE;
             }
         }
 
         if (imp.functions_only) {
-            return Clang::VISIT_CONTINUE;
+            return clang::VISIT_CONTINUE;
         }
 
-        if (imp.is_cpp && k == Clang::CURSOR_STRUCT_DECL) {
+        if (imp.is_cpp && k == clang::CURSOR_STRUCT_DECL) {
             // A C++ `struct` can carry methods too (only its access default
             // differs from `class`); bind it through the same class path.
             imp.emit_cxx_class(cursor);
-        } else if (k == Clang::CURSOR_TYPEDEF_DECL) {
+        } else if (k == clang::CURSOR_TYPEDEF_DECL) {
             imp.emit_typedef(cursor);
-        } else if (k == Clang::CURSOR_STRUCT_DECL) {
+        } else if (k == clang::CURSOR_STRUCT_DECL) {
             imp.emit_record(cursor, false);
-        } else if (k == Clang::CURSOR_UNION_DECL) {
+        } else if (k == clang::CURSOR_UNION_DECL) {
             imp.emit_record(cursor, true);
-        } else if (k == Clang::CURSOR_ENUM_DECL) {
+        } else if (k == clang::CURSOR_ENUM_DECL) {
             imp.emit_enum(cursor);
-        } else if (k == Clang::CURSOR_VAR_DECL) {
+        } else if (k == clang::CURSOR_VAR_DECL) {
             imp.emit_global(cursor);
-        } else if (k == Clang::CURSOR_MACRO_DEFINITION) {
+        } else if (k == clang::CURSOR_MACRO_DEFINITION) {
             // W1: defer - a macro can alias an enum constant, struct, or another
             // macro that this walk hasn't reached yet (cursor order is not
             // guaranteed with a detailed-preprocessing-record TU), so it is
             // emitted only after every decl is bound.
             imp.macro_cursors.push(cursor);
         }
-        return Clang::VISIT_CONTINUE;
+        return clang::VISIT_CONTINUE;
     }
 
     /// Nested visitor: collect a record's layout-contributing children into
@@ -392,48 +392,48 @@ type struct Importer {
     /// named field that references it is collected as a normal FieldDecl.  The
     /// collected list is processed by `populate_record_fields` with look-ahead.
     static visit_collect_member(cursor: CXCursor, parent: CXCursor, client: void*) -> i32 {
-        const k: i32 = Clang::clang_getCursorKind(cursor);
+        const k: i32 = clang::clang_getCursorKind(cursor);
         const imp: Importer* = client as Importer*;
-        if (k == Clang::CURSOR_FIELD_DECL) {
+        if (k == clang::CURSOR_FIELD_DECL) {
             imp.field_cursors.push(cursor);
-        } else if ((k == Clang::CURSOR_STRUCT_DECL || k == Clang::CURSOR_UNION_DECL)
+        } else if ((k == clang::CURSOR_STRUCT_DECL || k == clang::CURSOR_UNION_DECL)
                    && cursor.is_anonymous_record_decl()) {
             imp.field_cursors.push(cursor);
         }
-        return Clang::VISIT_CONTINUE;
+        return clang::VISIT_CONTINUE;
     }
 
     /// Nested visitor: collect a union/anon-record's FieldDecl members into
     /// `acc_members` (for reinterpret-accessor generation).  Anonymous
     /// sub-records are ignored here - accessors only cover named members.
     static visit_collect_acc_member(cursor: CXCursor, parent: CXCursor, client: void*) -> i32 {
-        if (Clang::clang_getCursorKind(cursor) == Clang::CURSOR_FIELD_DECL) {
+        if (clang::clang_getCursorKind(cursor) == clang::CURSOR_FIELD_DECL) {
             const imp: Importer* = client as Importer*;
             imp.acc_members.push(cursor);
         }
-        return Clang::VISIT_CONTINUE;
+        return clang::VISIT_CONTINUE;
     }
 
     /// Nested visitor: one EnumVariantNode per EnumConstantDecl child of a NAMED
     /// enum.
     static visit_enum_const(cursor: CXCursor, parent: CXCursor, client: void*) -> i32 {
-        if (Clang::clang_getCursorKind(cursor) != Clang::CURSOR_ENUM_CONSTANT_DECL) {
-            return Clang::VISIT_CONTINUE;
+        if (clang::clang_getCursorKind(cursor) != clang::CURSOR_ENUM_CONSTANT_DECL) {
+            return clang::VISIT_CONTINUE;
         }
         const imp: Importer* = client as Importer*;
         imp.add_enum_const_from(cursor);
-        return Clang::VISIT_CONTINUE;
+        return clang::VISIT_CONTINUE;
     }
 
     /// Nested visitor: emit one alias-namespaced global `const NAME = value` per
     /// EnumConstantDecl child of an ANONYMOUS enum cursor.
     static visit_anon_enum_const(cursor: CXCursor, parent: CXCursor, client: void*) -> i32 {
-        if (Clang::clang_getCursorKind(cursor) != Clang::CURSOR_ENUM_CONSTANT_DECL) {
-            return Clang::VISIT_CONTINUE;
+        if (clang::clang_getCursorKind(cursor) != clang::CURSOR_ENUM_CONSTANT_DECL) {
+            return clang::VISIT_CONTINUE;
         }
         const imp: Importer* = client as Importer*;
         imp.add_anon_const_from(cursor);
-        return Clang::VISIT_CONTINUE;
+        return clang::VISIT_CONTINUE;
     }
 
     /// True if `name` was already emitted as a top-level type in this import.
@@ -502,15 +502,15 @@ type struct Importer {
     /// Emit one FunctionDeclNode for a C function prototype.
     emit_function(mut &this, cursor: CXCursor) -> void {
         const name_sym: SymbolStr = cursor.intern_spelling(this.ctx);
-        const nargs: i32 = Clang::clang_Cursor_getNumArguments(cursor);
+        const nargs: i32 = clang::clang_Cursor_getNumArguments(cursor);
 
         mut func: FunctionDeclNode* = new FunctionDeclNode(name_sym, SourceSpan::none());
-        func.return_type_annotation = this.types.map(Clang::clang_getCursorResultType(cursor));
+        func.return_type_annotation = this.types.map(clang::clang_getCursorResultType(cursor));
 
         mut params: VarDeclNode*[] = [];
         for (mut i: i32 = 0; i < nargs; i++) {
-            const arg: CXCursor = Clang::clang_Cursor_getArgument(cursor, i as u32);
-            const ptype: TypeAnnotation* = this.types.map(Clang::clang_getCursorType(arg));
+            const arg: CXCursor = clang::clang_Cursor_getArgument(cursor, i as u32);
+            const ptype: TypeAnnotation* = this.types.map(clang::clang_getCursorType(arg));
             const pname: SymbolStr = arg.intern_arg_name(i, this.ctx);
             mut pnode: VarDeclNode* = new VarDeclNode(pname, SourceSpan::none());
             pnode.type_annotation = ptype;
@@ -518,7 +518,7 @@ type struct Importer {
         }
         func.parameters = params;
         func.is_variadic =
-            Clang::clang_isFunctionTypeVariadic(Clang::clang_getCursorType(cursor)) != 0;
+            clang::clang_isFunctionTypeVariadic(clang::clang_getCursorType(cursor)) != 0;
 
         // C++ free/namespace function: pin its mangled symbol via `![symbol]`.  A
         // function with no emitted symbol (inline / template) yields an empty
@@ -558,12 +558,12 @@ type struct Importer {
     /// of `#include`s that defines nothing itself, so every constant the library
     /// ships lives one level down and is silently invisible.
     is_from_bound_header(&this, cursor: CXCursor) -> boolean {
-        const loc: CXSourceLocation = Clang::clang_getCursorLocation(cursor);
+        const loc: CXSourceLocation = clang::clang_getCursorLocation(cursor);
         mut file: void* = null;
         mut line: u32 = 0;
         mut col: u32 = 0;
         mut off: u32 = 0;
-        Clang::clang_getFileLocation(loc, &file, &line, &col, &off);
+        clang::clang_getFileLocation(loc, &file, &line, &col, &off);
         if (file == null) { return false; }
         for (mut i: i64 = 0; i < this.input_files.length; i++) {
             if (this.input_files[i] == file) { return true; }
@@ -581,15 +581,15 @@ type struct Importer {
     /// members are handled by the layout walk (`visit_collect_member`); this walk
     /// only gathers callables, which `emit_cxx_methods` then binds or reports.
     static visit_collect_cxx_method(cursor: CXCursor, parent: CXCursor, client: void*) -> i32 {
-        const k: i32 = Clang::clang_getCursorKind(cursor);
+        const k: i32 = clang::clang_getCursorKind(cursor);
         const imp: Importer* = client as Importer*;
-        if (k == Clang::CURSOR_CXX_METHOD
-                || k == Clang::CURSOR_CONSTRUCTOR
-                || k == Clang::CURSOR_DESTRUCTOR
-                || k == Clang::CURSOR_FUNCTION_TEMPLATE) {
+        if (k == clang::CURSOR_CXX_METHOD
+                || k == clang::CURSOR_CONSTRUCTOR
+                || k == clang::CURSOR_DESTRUCTOR
+                || k == clang::CURSOR_FUNCTION_TEMPLATE) {
             imp.cxx_method_cursors.push(cursor);
         }
-        return Clang::VISIT_CONTINUE;
+        return clang::VISIT_CONTINUE;
     }
 
     /// Emit a C++ class/struct: a layout-faithful `type struct` (reusing the C
@@ -603,7 +603,7 @@ type struct Importer {
         // a forward-declaration cursor has none).  Done BEFORE emitting the
         // record so a vtable can be detected before committing to a layout.
         this.cxx_method_cursors = [];
-        Clang::clang_visitChildren(cursor, Importer::visit_collect_cxx_method, this as void*);
+        clang::clang_visitChildren(cursor, Importer::visit_collect_cxx_method, this as void*);
 
         const owner_sym: SymbolStr = cursor.intern_spelling(this.ctx);
         const owner_str: string = this.ctx.intern_table.resolve(owner_sym);
@@ -663,20 +663,20 @@ type struct Importer {
     /// or skip + report it.  Returns true when a method was added.
     emit_cxx_method(mut &this, impl: ImplBlockNode*, cursor: CXCursor,
                     owner_str: string) -> boolean {
-        const k: i32 = Clang::clang_getCursorKind(cursor);
+        const k: i32 = clang::clang_getCursorKind(cursor);
         const mname: string = this.spelling_of(cursor);
 
         // Constructors / destructors are a lifecycle concern (allocate +
         // call the mangled ctor, call dtor before free) - report for now.
-        if (k == Clang::CURSOR_CONSTRUCTOR) {
+        if (k == clang::CURSOR_CONSTRUCTOR) {
             this.report.skip(format("%s constructor (lifecycle binding is Phase 2)", owner_str));
             return false;
         }
-        if (k == Clang::CURSOR_DESTRUCTOR) {
+        if (k == clang::CURSOR_DESTRUCTOR) {
             this.report.skip(format("%s destructor (lifecycle binding is Phase 2)", owner_str));
             return false;
         }
-        if (k == Clang::CURSOR_FUNCTION_TEMPLATE) {
+        if (k == clang::CURSOR_FUNCTION_TEMPLATE) {
             this.report.skip(format("%s::%s (member template, no instantiated symbol)",
                 owner_str, mname));
             return false;
@@ -714,7 +714,7 @@ type struct Importer {
         const is_static: boolean = cursor.is_static_method();
         mut func: FunctionDeclNode* = new FunctionDeclNode(
             cursor.intern_spelling(this.ctx), SourceSpan::none());
-        func.return_type_annotation = this.types.map(Clang::clang_getCursorResultType(cursor));
+        func.return_type_annotation = this.types.map(clang::clang_getCursorResultType(cursor));
         func.is_public = true;
         func.is_static = is_static;
         func.link_name = this.ctx.intern_table.resolve(mangled);
@@ -733,17 +733,17 @@ type struct Importer {
             func.parameters.push(recv);
         }
 
-        const nargs: i32 = Clang::clang_Cursor_getNumArguments(cursor);
+        const nargs: i32 = clang::clang_Cursor_getNumArguments(cursor);
         for (mut i: i32 = 0; i < nargs; i++) {
-            const arg: CXCursor = Clang::clang_Cursor_getArgument(cursor, i as u32);
-            const ptype: TypeAnnotation* = this.types.map(Clang::clang_getCursorType(arg));
+            const arg: CXCursor = clang::clang_Cursor_getArgument(cursor, i as u32);
+            const ptype: TypeAnnotation* = this.types.map(clang::clang_getCursorType(arg));
             const pname: SymbolStr = arg.intern_arg_name(i, this.ctx);
             mut pnode: VarDeclNode* = new VarDeclNode(pname, SourceSpan::none());
             pnode.type_annotation = ptype;
             func.parameters.push(pnode);
         }
         func.is_variadic =
-            Clang::clang_isFunctionTypeVariadic(Clang::clang_getCursorType(cursor)) != 0;
+            clang::clang_isFunctionTypeVariadic(clang::clang_getCursorType(cursor)) != 0;
 
         mut method: MethodNode* = new MethodNode(func, SourceSpan::none());
         method.set_visibility(Visibility::Public);
@@ -786,9 +786,9 @@ type struct Importer {
             // same sized/aligned blob - but members are accessed directly (`v.i`)
             // instead of through synthesized reinterpret accessors.
             if (this.name_seen(name_sym)) { return; }
-            const ct: CXType = Clang::clang_getCursorType(cursor);
-            const size: i64 = Clang::clang_Type_getSizeOf(ct);
-            const align: i64 = Clang::clang_Type_getAlignOf(ct);
+            const ct: CXType = clang::clang_getCursorType(cursor);
+            const size: i64 = clang::clang_Type_getSizeOf(ct);
+            const align: i64 = clang::clang_Type_getAlignOf(ct);
             if (size <= 0) { return; }
             mut unode: UnionDeclNode* = new UnionDeclNode(name_sym, SourceSpan::none());
             unode.binding_namespace = this.alias;
@@ -800,7 +800,7 @@ type struct Importer {
             this.type_names.push(name_sym);
             this.emit_top_level(unode as ASTNode*);
             this.field_cursors = [];
-            Clang::clang_visitChildren(cursor, Importer::visit_collect_member, this as void*);
+            clang::clang_visitChildren(cursor, Importer::visit_collect_member, this as void*);
             this.populate_union_fields(unode);
             return;
         }
@@ -820,7 +820,7 @@ type struct Importer {
         // earlier forward-decl cursor left it empty; the definition fills it).
         if (node.fields.length == 0) {
             this.field_cursors = [];
-            Clang::clang_visitChildren(cursor, Importer::visit_collect_member, this as void*);
+            clang::clang_visitChildren(cursor, Importer::visit_collect_member, this as void*);
             this.populate_record_fields(node, cursor);
         }
     }
@@ -863,8 +863,8 @@ type struct Importer {
     /// authoritative figure, so an opaque blob (alignment 1) can't lower the
     /// record's overall alignment below the C ABI.  Each lossy member is reported.
     populate_record_fields(mut &this, node: StructDeclNode*, record_cursor: CXCursor) -> void {
-        const rec_type: CXType = Clang::clang_getCursorType(record_cursor);
-        const struct_size: i64 = Clang::clang_Type_getSizeOf(rec_type);
+        const rec_type: CXType = clang::clang_getCursorType(record_cursor);
+        const struct_size: i64 = clang::clang_Type_getSizeOf(rec_type);
         const sname: string = this.ctx.intern_table.resolve(node.name);
         mut approximated: boolean = false;
         mut anon_n: i32 = 0;
@@ -873,13 +873,13 @@ type struct Importer {
         mut i: i64 = 0;
         while (i < this.field_cursors.length) {
             const cur: CXCursor = this.field_cursors[i];
-            const k: i32 = Clang::clang_getCursorKind(cur);
+            const k: i32 = clang::clang_getCursorKind(cur);
 
             // Anonymous struct/union member: an aligned opaque blob in place.
-            if (k == Clang::CURSOR_STRUCT_DECL || k == Clang::CURSOR_UNION_DECL) {
-                const ct: CXType = Clang::clang_getCursorType(cur);
-                const sz: i64 = Clang::clang_Type_getSizeOf(ct);
-                const al: i64 = Clang::clang_Type_getAlignOf(ct);
+            if (k == clang::CURSOR_STRUCT_DECL || k == clang::CURSOR_UNION_DECL) {
+                const ct: CXType = clang::clang_getCursorType(cur);
+                const sz: i64 = clang::clang_Type_getSizeOf(ct);
+                const al: i64 = clang::clang_Type_getAlignOf(ct);
                 const fname: SymbolStr =
                     this.ctx.intern_table.intern(format("_anon%d", anon_n));
                 mut fnode: FieldDeclNode* = new FieldDeclNode(fname, SourceSpan::none());
@@ -889,7 +889,7 @@ type struct Importer {
                 // anonymous struct (members at their byte offsets) get reinterpret
                 // accessors over the blob - `add_reinterpret_accessors` reads each
                 // member's offset, so the same path covers both.
-                const kindword: string = if (k == Clang::CURSOR_UNION_DECL) { "union" } else { "struct" };
+                const kindword: string = if (k == clang::CURSOR_UNION_DECL) { "union" } else { "struct" };
                 const nacc: i32 = this.add_reinterpret_accessors(node, fname, cur);
                 if (nacc > 0) {
                     this.report.approx(format("anonymous %s in struct '%s' -> field '_anon%d' (%lld-byte) + %d get/set accessors",
@@ -906,12 +906,12 @@ type struct Importer {
 
             // Bitfield run: collapse consecutive bitfields into one storage blob.
             if (cur.is_bitfield()) {
-                const start_bits: i64 = Clang::clang_Cursor_getOffsetOfField(cur);
+                const start_bits: i64 = clang::clang_Cursor_getOffsetOfField(cur);
                 mut start_byte: i64 = if (start_bits >= 0) { start_bits / 8 } else { 0 };
 
                 mut j: i64 = i + 1;
                 while (j < this.field_cursors.length
-                       && Clang::clang_getCursorKind(this.field_cursors[j]) == Clang::CURSOR_FIELD_DECL
+                       && clang::clang_getCursorKind(this.field_cursors[j]) == clang::CURSOR_FIELD_DECL
                        && this.field_cursors[j].is_bitfield()) {
                     j = j + 1;
                 }
@@ -923,8 +923,8 @@ type struct Importer {
                 mut end_byte: i64 = struct_size;
                 mut tail: boolean = true;
                 if (j < this.field_cursors.length
-                    && Clang::clang_getCursorKind(this.field_cursors[j]) == Clang::CURSOR_FIELD_DECL) {
-                    const nb: i64 = Clang::clang_Cursor_getOffsetOfField(this.field_cursors[j]);
+                    && clang::clang_getCursorKind(this.field_cursors[j]) == clang::CURSOR_FIELD_DECL) {
+                    const nb: i64 = clang::clang_Cursor_getOffsetOfField(this.field_cursors[j]);
                     if (nb >= 0) { end_byte = nb / 8; tail = false; }
                 }
                 mut span: i64 = end_byte - start_byte;
@@ -956,7 +956,7 @@ type struct Importer {
             // Plain field.  A named field of anonymous record type is mapped to
             // an aligned blob by `map` (not `void*`); flag it as approximated so
             // the struct alignment is corrected and the loss is reported.
-            const ftype: CXType = Clang::clang_getCursorType(cur);
+            const ftype: CXType = clang::clang_getCursorType(cur);
             const fname: SymbolStr = cur.intern_spelling(this.ctx);
             mut fnode: FieldDeclNode* = new FieldDeclNode(fname, SourceSpan::none());
             fnode.type_annotation = this.types.map(ftype);
@@ -970,7 +970,7 @@ type struct Importer {
         }
 
         if (approximated && struct_size > 0) {
-            const al: i64 = Clang::clang_Type_getAlignOf(rec_type);
+            const al: i64 = clang::clang_Type_getAlignOf(rec_type);
             if (al > 0) { node.min_alignment = al as u64; }
         }
     }
@@ -987,13 +987,13 @@ type struct Importer {
         mut anon_n: i32 = 0;
         for (mut i: i64 = 0; i < this.field_cursors.length; i++) {
             const cur: CXCursor = this.field_cursors[i];
-            const k: i32 = Clang::clang_getCursorKind(cur);
+            const k: i32 = clang::clang_getCursorKind(cur);
 
             // Anonymous struct/union member: an aligned opaque blob in place.
-            if (k == Clang::CURSOR_STRUCT_DECL || k == Clang::CURSOR_UNION_DECL) {
-                const ct: CXType = Clang::clang_getCursorType(cur);
-                const sz: i64 = Clang::clang_Type_getSizeOf(ct);
-                const al: i64 = Clang::clang_Type_getAlignOf(ct);
+            if (k == clang::CURSOR_STRUCT_DECL || k == clang::CURSOR_UNION_DECL) {
+                const ct: CXType = clang::clang_getCursorType(cur);
+                const sz: i64 = clang::clang_Type_getSizeOf(ct);
+                const al: i64 = clang::clang_Type_getAlignOf(ct);
                 const fname: SymbolStr =
                     this.ctx.intern_table.intern(format("_anon%d", anon_n));
                 mut fnode: FieldDeclNode* = new FieldDeclNode(fname, SourceSpan::none());
@@ -1006,7 +1006,7 @@ type struct Importer {
             }
 
             // Named member: a native union field of the member's mapped type.
-            const ftype: CXType = Clang::clang_getCursorType(cur);
+            const ftype: CXType = clang::clang_getCursorType(cur);
             const fname: SymbolStr = cur.intern_spelling(this.ctx);
             mut fnode: FieldDeclNode* = new FieldDeclNode(fname, SourceSpan::none());
             fnode.type_annotation = this.types.map(ftype);
@@ -1027,16 +1027,16 @@ type struct Importer {
     add_reinterpret_accessors(mut &this, node: StructDeclNode*, blob_field: SymbolStr,
                               record_cursor: CXCursor) -> i32 {
         this.acc_members = [];
-        Clang::clang_visitChildren(record_cursor, Importer::visit_collect_acc_member, this as void*);
+        clang::clang_visitChildren(record_cursor, Importer::visit_collect_acc_member, this as void*);
         mut n: i32 = 0;
         for (mut i: i64 = 0; i < this.acc_members.length; i++) {
             const m: CXCursor = this.acc_members[i];
             if (m.is_bitfield()) { continue; }
             const mname: SymbolStr = m.intern_spelling(this.ctx);
             if (this.ctx.intern_table.resolve(mname).eq("")) { continue; }
-            const mt: CXType = Clang::clang_getCursorType(m);
+            const mt: CXType = clang::clang_getCursorType(m);
             if (mt.is_anonymous_record()) { continue; }
-            const off_bits: i64 = Clang::clang_Cursor_getOffsetOfField(m);
+            const off_bits: i64 = clang::clang_Cursor_getOffsetOfField(m);
             const off_bytes: i64 = if (off_bits >= 0) { off_bits / 8 } else { 0 };
             const vt: TypeAnnotation* = this.types.map(mt);
             const set_name: SymbolStr = this.ctx.intern_table.intern(
@@ -1073,13 +1073,13 @@ type struct Importer {
         mut n: i32 = 0;
         for (mut p: i64 = run_lo; p < run_hi; p++) {
             const cur: CXCursor = this.field_cursors[p];
-            const ct: CXType = Clang::clang_getCursorType(cur);
+            const ct: CXType = clang::clang_getCursorType(cur);
             // Only integer-typed bitfields (the universe in C); an unsigned field
             // reads with a plain shift/mask, a signed one sign-extends.
             if (!Importer::is_unsigned_int_type(ct) && !Importer::is_signed_int_type(ct)) { continue; }
             const signed: boolean = Importer::is_signed_int_type(ct);
-            const off: i64 = Clang::clang_Cursor_getOffsetOfField(cur) - run_start_bit;
-            const width: i64 = Clang::clang_getFieldDeclBitWidth(cur) as i64;
+            const off: i64 = clang::clang_Cursor_getOffsetOfField(cur) - run_start_bit;
+            const width: i64 = clang::clang_getFieldDeclBitWidth(cur) as i64;
             if (off < 0 || width <= 0) { continue; }
             const mname: SymbolStr = cur.intern_spelling(this.ctx);
             if (this.ctx.intern_table.resolve(mname).eq("")) { continue; }
@@ -1104,18 +1104,18 @@ type struct Importer {
     /// True if `t`'s canonical type is a signed integer (so a bitfield of this
     /// type must sign-extend on read).
     static is_signed_int_type(t: CXType) -> boolean {
-        const k: i32 = Clang::clang_getCanonicalType(t).kind;
-        return k == Clang::TK_Char_S || k == Clang::TK_SChar || k == Clang::TK_Short
-            || k == Clang::TK_Int || k == Clang::TK_Long || k == Clang::TK_LongLong;
+        const k: i32 = clang::clang_getCanonicalType(t).kind;
+        return k == clang::TK_Char_S || k == clang::TK_SChar || k == clang::TK_Short
+            || k == clang::TK_Int || k == clang::TK_Long || k == clang::TK_LongLong;
     }
 
     /// True if `t`'s canonical type is an unsigned integer (so a bitfield of this
     /// type needs no sign extension and a plain shift/mask accessor is correct).
     static is_unsigned_int_type(t: CXType) -> boolean {
-        const k: i32 = Clang::clang_getCanonicalType(t).kind;
-        return k == Clang::TK_Bool || k == Clang::TK_Char_U || k == Clang::TK_UChar
-            || k == Clang::TK_UShort || k == Clang::TK_UInt
-            || k == Clang::TK_ULong || k == Clang::TK_ULongLong;
+        const k: i32 = clang::clang_getCanonicalType(t).kind;
+        return k == clang::TK_Bool || k == clang::TK_Char_U || k == clang::TK_UChar
+            || k == clang::TK_UShort || k == clang::TK_UInt
+            || k == clang::TK_ULong || k == clang::TK_ULongLong;
     }
 
     /// Emit a `type enum E : <int> { NAME = value; ... }` for a NAMED C enum.
@@ -1128,9 +1128,9 @@ type struct Importer {
             // The anonymous enum's underlying integer type; each constant's
             // global is typed against it.  Kept on the stack for the synchronous
             // walk and pointed at via `cur_enum_int`.
-            mut int_type: CXType = Clang::clang_getEnumDeclIntegerType(cursor);
+            mut int_type: CXType = clang::clang_getEnumDeclIntegerType(cursor);
             this.cur_enum_int = &int_type;
-            Clang::clang_visitChildren(cursor, Importer::visit_anon_enum_const, this as void*);
+            clang::clang_visitChildren(cursor, Importer::visit_anon_enum_const, this as void*);
             return;
         }
         if (this.name_seen(name_sym)) { return; }
@@ -1139,7 +1139,7 @@ type struct Importer {
         enode.binding_namespace = this.alias;
         enode.repr_c = true;
         enode.discriminant_annotation =
-            this.types.map(Clang::clang_getEnumDeclIntegerType(cursor));
+            this.types.map(clang::clang_getEnumDeclIntegerType(cursor));
 
         this.cur_enum = enode;
         this.cur_enum_values      = [];
@@ -1147,7 +1147,7 @@ type struct Importer {
         this.cur_enum_dup_names   = [];
         this.cur_enum_dup_values  = [];
         this.cur_enum_dup_firsts  = [];
-        Clang::clang_visitChildren(cursor, Importer::visit_enum_const, this as void*);
+        clang::clang_visitChildren(cursor, Importer::visit_enum_const, this as void*);
 
         this.seen_names.push(name_sym);
         this.type_names.push(name_sym);
@@ -1183,7 +1183,7 @@ type struct Importer {
     /// cursor) to the named enum currently being populated (`cur_enum`).
     add_enum_const_from(mut &this, cursor: CXCursor) -> void {
         const cname: SymbolStr = cursor.intern_spelling(this.ctx);
-        const value: i64 = Clang::clang_getEnumConstantDeclValue(cursor);
+        const value: i64 = clang::clang_getEnumConstantDeclValue(cursor);
         // A later constant repeating an earlier value is a C enum alias; it
         // can't be a second variant with the same discriminant, so queue it for
         // an alias `const` emitted after the enum (see `emit_enum`).
@@ -1218,7 +1218,7 @@ type struct Importer {
         // value (e.g. -1) emits as the unsigned two's-complement decimal, and
         // LLVMConstInt truncates it to the const's declared width at codegen,
         // reproducing C's value exactly (-1 in an `int` enum -> 0xFFFFFFFF).
-        const v: i64 = Clang::clang_getEnumConstantDeclValue(cursor);
+        const v: i64 = clang::clang_getEnumConstantDeclValue(cursor);
         const v_str: string = format("%llu", v as u64);
         mut lit: LiteralNode* = new LiteralNode(v_str, LiteralKind::Integer, SourceSpan::none());
         this.emit_alias_const(cname, this.types.map(*this.cur_enum_int), lit as ExpressionNode*);
@@ -1245,7 +1245,7 @@ type struct Importer {
         const name_str: string = this.ctx.intern_table.resolve(name_sym);
         if (name_str.eq("")) { return; }
         if (this.name_seen(name_sym)) { return; }
-        const ctype: CXType = Clang::clang_getCursorType(cursor);
+        const ctype: CXType = clang::clang_getCursorType(cursor);
 
         // A `static const` in a header is not a symbol - every translation unit
         // gets its own copy - so it cannot be bound as an imported global.  It
@@ -1254,8 +1254,8 @@ type struct Importer {
         // `static const VkFlagBits64 VK_PIPELINE_STAGE_2_* = 0x...ULL`, which is
         // the same "flag constant" a smaller API would have written as a
         // `#define`.  Bind the VALUE, and report only when clang cannot fold it.
-        if (Clang::clang_getCursorLinkage(cursor) != Clang::LINKAGE_EXTERNAL) {
-            if (Clang::clang_isConstQualifiedType(ctype) != 0
+        if (clang::clang_getCursorLinkage(cursor) != clang::LINKAGE_EXTERNAL) {
+            if (clang::clang_isConstQualifiedType(ctype) != 0
                     && this.emit_evaluated_const(name_sym, cursor)) {
                 return;
             }
@@ -1268,7 +1268,7 @@ type struct Importer {
         mut vnode: VarDeclNode* = new VarDeclNode(name_sym, SourceSpan::none());
         vnode.is_global        = true;
         vnode.is_extern_import = true;
-        vnode.is_mutable       = Clang::clang_isConstQualifiedType(ctype) == 0;
+        vnode.is_mutable       = clang::clang_isConstQualifiedType(ctype) == 0;
         vnode.binding_namespace = this.alias;
         vnode.type_annotation  = this.types.map(ctype);
 
@@ -1294,9 +1294,9 @@ type struct Importer {
         const name_str: string = this.ctx.intern_table.resolve(name_sym);
         if (name_str.eq("")) { return; }
 
-        const underlying: CXType = Clang::clang_getTypedefDeclUnderlyingType(cursor);
-        const canon: CXType = Clang::clang_getCanonicalType(underlying);
-        if (canon.kind == Clang::TK_Record || canon.kind == Clang::TK_Enum) {
+        const underlying: CXType = clang::clang_getTypedefDeclUnderlyingType(cursor);
+        const canon: CXType = clang::clang_getCanonicalType(underlying);
+        if (canon.kind == clang::TK_Record || canon.kind == clang::TK_Enum) {
             const tag: SymbolStr = this.types.tag_name(canon);
             if (!tag.is_empty() && this.ctx.intern_table.resolve(tag).eq(name_str)) {
                 return; // typedef name == tag name; the record decl covers it.
@@ -1320,7 +1320,7 @@ type struct Importer {
     /// never silently dropped.  String/char binding awaits escape-faithful
     /// lowering.
     emit_macro(mut &this, cursor: CXCursor) -> void {
-        if (Clang::clang_Cursor_isMacroBuiltin(cursor) != 0) { return; }
+        if (clang::clang_Cursor_isMacroBuiltin(cursor) != 0) { return; }
         // Bind only what the library's own headers wrote (see
         // `is_from_bound_header`): compiler predefines are not this library's
         // API, and a macro one `#include` below the entry header is.
@@ -1337,17 +1337,17 @@ type struct Importer {
         // every simple const, so an alias/arithmetic macro can resolve forward
         // references regardless of cursor order.  No report entries here; the
         // complex pass is the single point that classifies the unbound.
-        if (Clang::clang_Cursor_isMacroFunctionLike(cursor) != 0) { return; }
+        if (clang::clang_Cursor_isMacroFunctionLike(cursor) != 0) { return; }
 
         // Tokenize the definition's extent: token[0] is the macro name, the rest
         // are its replacement list.
-        const range: CXSourceRange = Clang::clang_getCursorExtent(cursor);
+        const range: CXSourceRange = clang::clang_getCursorExtent(cursor);
         mut toks: CXToken* = null;
         mut ntok: u32 = 0;
-        Clang::clang_tokenize(this.tu, range, &toks, &ntok);
+        clang::clang_tokenize(this.tu, range, &toks, &ntok);
         if (toks == null) { return; }
         if (ntok < 2) {
-            Clang::clang_disposeTokens(this.tu, toks, ntok);
+            clang::clang_disposeTokens(this.tu, toks, ntok);
             return;
         }
 
@@ -1357,9 +1357,9 @@ type struct Importer {
         mut lit_idx: u32 = 1;
         mut bindable: boolean = true;
         if (nrepl == 2) {
-            const k0: i32 = Clang::clang_getTokenKind(*(toks + 1));
+            const k0: i32 = clang::clang_getTokenKind(*(toks + 1));
             const s0: string = (*(toks + 1)).spelling(this.tu, this.ctx);
-            if (k0 == Clang::TOKEN_PUNCTUATION && (s0.eq("-") || s0.eq("+"))) {
+            if (k0 == clang::TOKEN_PUNCTUATION && (s0.eq("-") || s0.eq("+"))) {
                 neg = s0.eq("-");
                 lit_idx = 2;
             } else {
@@ -1369,19 +1369,19 @@ type struct Importer {
             bindable = false;
         }
         if (!bindable) {
-            Clang::clang_disposeTokens(this.tu, toks, ntok);
+            clang::clang_disposeTokens(this.tu, toks, ntok);
             return;
         }
 
-        const litk: i32 = Clang::clang_getTokenKind(*(toks + lit_idx));
+        const litk: i32 = clang::clang_getTokenKind(*(toks + lit_idx));
         const spell: string = (*(toks + lit_idx)).spelling(this.tu, this.ctx);
-        if (litk != Clang::TOKEN_LITERAL) {
-            Clang::clang_disposeTokens(this.tu, toks, ntok);
+        if (litk != clang::TOKEN_LITERAL) {
+            clang::clang_disposeTokens(this.tu, toks, ntok);
             return;
         }
         if (spell.is_text_literal()) {
             this.emit_text_macro(name_sym, name_str, spell, neg);
-            Clang::clang_disposeTokens(this.tu, toks, ntok);
+            clang::clang_disposeTokens(this.tu, toks, ntok);
             return;
         }
 
@@ -1395,7 +1395,7 @@ type struct Importer {
             mut flit: LiteralNode* = new LiteralNode(ftext, LiteralKind::Float, SourceSpan::none());
             this.emit_alias_const(name_sym, this.types.prim("f64"), flit as ExpressionNode*);
             this.record_macro_const(name_sym, "f64", ftext, true);
-            Clang::clang_disposeTokens(this.tu, toks, ntok);
+            clang::clang_disposeTokens(this.tu, toks, ntok);
             return;
         }
 
@@ -1422,7 +1422,7 @@ type struct Importer {
             new LiteralNode(itext, LiteralKind::Integer, SourceSpan::none());
         this.emit_alias_const(name_sym, this.types.prim(type_name), ilit as ExpressionNode*);
         this.record_macro_const(name_sym, type_name, itext, false);
-        Clang::clang_disposeTokens(this.tu, toks, ntok);
+        clang::clang_disposeTokens(this.tu, toks, ntok);
     }
 
     /// Record an object-like macro const (name -> type/text/is-float) so a later
@@ -1450,45 +1450,45 @@ type struct Importer {
     /// (function-like, header guards, markers) via `ignore`, and a construct we
     /// *could* bind but don't yet via `skip` (the headline "not bound" bucket).
     emit_macro_complex(mut &this, cursor: CXCursor) -> void {
-        if (Clang::clang_Cursor_isMacroBuiltin(cursor) != 0) { return; }
+        if (clang::clang_Cursor_isMacroBuiltin(cursor) != 0) { return; }
         if (!this.is_from_bound_header(cursor)) { return; }
         const name_sym: SymbolStr = cursor.intern_spelling(this.ctx);
         const name_str: string = this.ctx.intern_table.resolve(name_sym);
         if (name_str.eq("")) { return; }
         if (this.name_seen(name_sym)) { return; } // already bound by the simple pass
 
-        if (Clang::clang_Cursor_isMacroFunctionLike(cursor) != 0) {
+        if (clang::clang_Cursor_isMacroFunctionLike(cursor) != 0) {
             this.report.ignore(format("function-like macro '%s'", name_str));
             return;
         }
 
-        const range: CXSourceRange = Clang::clang_getCursorExtent(cursor);
+        const range: CXSourceRange = clang::clang_getCursorExtent(cursor);
         mut toks: CXToken* = null;
         mut ntok: u32 = 0;
-        Clang::clang_tokenize(this.tu, range, &toks, &ntok);
+        clang::clang_tokenize(this.tu, range, &toks, &ntok);
         if (toks == null) {
             this.report.ignore(format("macro '%s' (no tokens)", name_str));
             return;
         }
         if (ntok < 2) {
-            Clang::clang_disposeTokens(this.tu, toks, ntok);
+            clang::clang_disposeTokens(this.tu, toks, ntok);
             this.report.ignore(format("valueless macro '%s' (header guard / marker)", name_str));
             return;
         }
 
         // W3: compound-literal struct const, e.g. `CLITERAL(Color){ 245,... }`.
         if (this.try_emit_compound_struct(name_sym, name_str, toks, ntok)) {
-            Clang::clang_disposeTokens(this.tu, toks, ntok);
+            clang::clang_disposeTokens(this.tu, toks, ntok);
             return;
         }
 
         // W2: single-identifier alias.  (A single LITERAL token was already
         // bound by the simple pass, so a 2-token body here is non-literal.)
         if (ntok == 2) {
-            const k1: i32 = Clang::clang_getTokenKind(*(toks + 1));
+            const k1: i32 = clang::clang_getTokenKind(*(toks + 1));
             const s1: string = (*(toks + 1)).spelling(this.tu, this.ctx);
-            Clang::clang_disposeTokens(this.tu, toks, ntok);
-            if (k1 == Clang::TOKEN_IDENTIFIER) {
+            clang::clang_disposeTokens(this.tu, toks, ntok);
+            if (k1 == clang::TOKEN_IDENTIFIER) {
                 if (this.try_emit_identifier_alias(name_sym, name_str, s1)) { return; }
                 if (this.is_bound_function(s1)) {
                     this.report.skip(format("alias '%s' -> function '%s' (forwarding wrapper unsupported)",
@@ -1507,11 +1507,11 @@ type struct Importer {
 
         // W4: constant arithmetic over literals / macro consts.
         if (this.try_emit_arith_macro(name_sym, name_str, toks, ntok)) {
-            Clang::clang_disposeTokens(this.tu, toks, ntok);
+            clang::clang_disposeTokens(this.tu, toks, ntok);
             return;
         }
 
-        Clang::clang_disposeTokens(this.tu, toks, ntok);
+        clang::clang_disposeTokens(this.tu, toks, ntok);
         this.defer_probe(name_sym,
             format("compound macro '%s' (non-trivial replacement)", name_str), true);
     }
@@ -1589,12 +1589,12 @@ type struct Importer {
         };
         // No detailed preprocessing record: this TU is read for VALUES, and the
         // macro cursors were already collected from the real one.
-        const ptu: void* = Clang::clang_parseTranslationUnit(
+        const ptu: void* = clang::clang_parseTranslationUnit(
             index, probe_file as u8*, &args[0], args.length as i32, &uf, 1, 0);
         if (ptu != null) {
-            const proot: CXCursor = Clang::clang_getTranslationUnitCursor(ptu);
-            Clang::clang_visitChildren(proot, Importer::visit_probe, this as void*);
-            Clang::clang_disposeTranslationUnit(ptu);
+            const proot: CXCursor = clang::clang_getTranslationUnitCursor(ptu);
+            clang::clang_visitChildren(proot, Importer::visit_probe, this as void*);
+            clang::clang_disposeTranslationUnit(ptu);
         }
 
         // Whatever the probe did not bind keeps the token passes' verdict.
@@ -1609,18 +1609,18 @@ type struct Importer {
     /// variable.  The trailing index maps the probe back to the macro that
     /// produced it, so no name matching is needed.
     static visit_probe(cursor: CXCursor, parent: CXCursor, client: void*) -> i32 {
-        if (Clang::clang_getCursorKind(cursor) != Clang::CURSOR_VAR_DECL) {
-            return Clang::VISIT_CONTINUE;
+        if (clang::clang_getCursorKind(cursor) != clang::CURSOR_VAR_DECL) {
+            return clang::VISIT_CONTINUE;
         }
         const imp: Importer* = client as Importer*;
         const spell: string = imp.spelling_of(cursor);
-        if (!spell.starts_with(PROBE_PREFIX)) { return Clang::VISIT_CONTINUE; }
+        if (!spell.starts_with(PROBE_PREFIX)) { return clang::VISIT_CONTINUE; }
         const idx: i64 = spell.substr(PROBE_PREFIX.length() as i64,
                                       (spell.length() - PROBE_PREFIX.length()) as i64)
                               .parse_c_uint() as i64;
-        if (idx < 0 || idx >= imp.probe_names.length) { return Clang::VISIT_CONTINUE; }
+        if (idx < 0 || idx >= imp.probe_names.length) { return clang::VISIT_CONTINUE; }
         imp.bind_probed_macro(imp.probe_names[idx], cursor);
-        return Clang::VISIT_CONTINUE;
+        return clang::VISIT_CONTINUE;
     }
 
     /// Bind one probe's folded value as an alias-namespaced `const`.  The Cryo
@@ -1641,12 +1641,12 @@ type struct Importer {
     /// shape.  A result that is not an integer, float, or string has no Cryo
     /// constant form; the caller reports those.
     emit_evaluated_const(mut &this, name_sym: SymbolStr, cursor: CXCursor) -> boolean {
-        const ev: void* = Clang::clang_Cursor_Evaluate(cursor);
+        const ev: void* = clang::clang_Cursor_Evaluate(cursor);
         if (ev == null) { return false; }
         mut bound: boolean = true;
-        const kind: i32 = Clang::clang_EvalResult_getKind(ev);
+        const kind: i32 = clang::clang_EvalResult_getKind(ev);
 
-        if (kind == Clang::EVAL_INT) {
+        if (kind == clang::EVAL_INT) {
             // Width comes from the expression's own C type, never from the
             // magnitude: `SDL_UINT64_C(0x10000000)` is a 64-bit constant whose
             // VALUE happens to fit 32 bits, and an API that ORs it into a 64-bit
@@ -1655,15 +1655,15 @@ type struct Importer {
             // re-deriving it from the value would discard the one thing the
             // macro was written to say.  Anything narrower than `int` has been
             // promoted to `int` by the expression that reads it.
-            const wide: boolean = Clang::clang_Type_getSizeOf(
-                Clang::clang_getCursorType(cursor)) > 4;
+            const wide: boolean = clang::clang_Type_getSizeOf(
+                clang::clang_getCursorType(cursor)) > 4;
             mut type_name: string = "i32";
             mut value_u64: u64 = 0;
-            if (Clang::clang_EvalResult_isUnsignedInt(ev) != 0) {
-                value_u64 = Clang::clang_EvalResult_getAsUnsigned(ev);
+            if (clang::clang_EvalResult_isUnsignedInt(ev) != 0) {
+                value_u64 = clang::clang_EvalResult_getAsUnsigned(ev);
                 type_name = if (wide) { "u64" } else { "u32" };
             } else {
-                const sv: i64 = Clang::clang_EvalResult_getAsLongLong(ev);
+                const sv: i64 = clang::clang_EvalResult_getAsLongLong(ev);
                 value_u64 = sv as u64;
                 type_name = if (wide) { "i64" } else { "i32" };
             }
@@ -1672,15 +1672,15 @@ type struct Importer {
                 new LiteralNode(itext, LiteralKind::Integer, SourceSpan::none());
             this.emit_alias_const(name_sym, this.types.prim(type_name), ilit as ExpressionNode*);
             this.record_macro_const(name_sym, type_name, itext, false);
-        } else if (kind == Clang::EVAL_FLOAT) {
-            mut ftext: string = format("%.17g", Clang::clang_EvalResult_getAsDouble(ev));
+        } else if (kind == clang::EVAL_FLOAT) {
+            mut ftext: string = format("%.17g", clang::clang_EvalResult_getAsDouble(ev));
             if (!Importer::has_float_marker(ftext)) { ftext = ftext + ".0"; }
             mut flit: LiteralNode* =
                 new LiteralNode(ftext, LiteralKind::Float, SourceSpan::none());
             this.emit_alias_const(name_sym, this.types.prim("f64"), flit as ExpressionNode*);
             this.record_macro_const(name_sym, "f64", ftext, true);
-        } else if (kind == Clang::EVAL_STRLIT) {
-            const raw: u8* = Clang::clang_EvalResult_getAsStr(ev);
+        } else if (kind == clang::EVAL_STRLIT) {
+            const raw: u8* = clang::clang_EvalResult_getAsStr(ev);
             if (raw != null) {
                 // clang hands back the DECODED bytes and owns them; the intern
                 // table copies, and the serializer re-escapes on the way out.
@@ -1696,7 +1696,7 @@ type struct Importer {
         } else {
             bound = false;
         }
-        Clang::clang_EvalResult_dispose(ev);
+        clang::clang_EvalResult_dispose(ev);
         return bound;
     }
 
@@ -1855,7 +1855,7 @@ type struct Importer {
         mut bc: i64 = -1;
         for (mut i: i64 = 1; i < ntok as i64; i++) {
             const sp: string = (*(toks + i)).spelling(this.tu, this.ctx);
-            if (Clang::clang_getTokenKind(*(toks + i)) == Clang::TOKEN_PUNCTUATION) {
+            if (clang::clang_getTokenKind(*(toks + i)) == clang::TOKEN_PUNCTUATION) {
                 if (sp.eq("{") && bo < 0) { bo = i; }
                 if (sp.eq("}"))           { bc = i; }
             }
@@ -1866,7 +1866,7 @@ type struct Importer {
         // (handles both `(Type){...}` and `CLITERAL(Type){...}`).
         mut struct_node: StructDeclNode* = null;
         for (mut i: i64 = 1; i < bo; i++) {
-            if (Clang::clang_getTokenKind(*(toks + i)) != Clang::TOKEN_IDENTIFIER) { continue; }
+            if (clang::clang_getTokenKind(*(toks + i)) != clang::TOKEN_IDENTIFIER) { continue; }
             const sp: string = (*(toks + i)).spelling(this.tu, this.ctx);
             const cand: StructDeclNode* = this.find_struct(this.ctx.intern_table.intern(sp));
             if (cand != null) { struct_node = cand; }
@@ -1877,7 +1877,7 @@ type struct Importer {
         // and are skipped); each must be a numeric literal.
         mut vals: string[] = [];
         for (mut i: i64 = bo + 1; i < bc; i++) {
-            if (Clang::clang_getTokenKind(*(toks + i)) != Clang::TOKEN_LITERAL) { continue; }
+            if (clang::clang_getTokenKind(*(toks + i)) != clang::TOKEN_LITERAL) { continue; }
             vals.push((*(toks + i)).spelling(this.tu, this.ctx));
         }
         if (vals.length != struct_node.fields.length || vals.length == 0) { return false; }
@@ -1917,9 +1917,9 @@ type struct Importer {
         mut lo: i64 = 1;
         mut hi: i64 = (ntok as i64) - 1;
         while (lo < hi
-               && Clang::clang_getTokenKind(*(toks + lo)) == Clang::TOKEN_PUNCTUATION
+               && clang::clang_getTokenKind(*(toks + lo)) == clang::TOKEN_PUNCTUATION
                && (*(toks + lo)).spelling(this.tu, this.ctx).eq("(")
-               && Clang::clang_getTokenKind(*(toks + hi)) == Clang::TOKEN_PUNCTUATION
+               && clang::clang_getTokenKind(*(toks + hi)) == clang::TOKEN_PUNCTUATION
                && (*(toks + hi)).spelling(this.tu, this.ctx).eq(")")) {
             lo = lo + 1;
             hi = hi - 1;
@@ -1932,7 +1932,7 @@ type struct Importer {
         mut op: string = "";
         mut p: i64 = lo + 1;
         while (p <= hi) {
-            if (Clang::clang_getTokenKind(*(toks + p)) != Clang::TOKEN_PUNCTUATION) { return false; }
+            if (clang::clang_getTokenKind(*(toks + p)) != clang::TOKEN_PUNCTUATION) { return false; }
             const o: string = (*(toks + p)).spelling(this.tu, this.ctx);
             if (op.eq("")) { op = o; } else if (!op.eq(o)) { return false; }
             p = p + 2;
@@ -2011,14 +2011,14 @@ type struct Importer {
     /// lexing), a bound INT macro const, or an enum constant.  Returns false for
     /// a float/text literal or a float macro const (the float path handles those).
     arith_operand_int(&this, tok: CXToken, out: i64*) -> boolean {
-        const k: i32 = Clang::clang_getTokenKind(tok);
+        const k: i32 = clang::clang_getTokenKind(tok);
         const sp: string = tok.spelling(this.tu, this.ctx);
-        if (k == Clang::TOKEN_LITERAL) {
+        if (k == clang::TOKEN_LITERAL) {
             if (sp.is_text_literal() || sp.is_float_literal()) { return false; }
             *out = sp.parse_c_uint() as i64;
             return true;
         }
-        if (k == Clang::TOKEN_IDENTIFIER) {
+        if (k == clang::TOKEN_IDENTIFIER) {
             const tsym: SymbolStr = this.ctx.intern_table.intern(sp);
             for (mut i: i64 = 0; i < this.ec_names.length; i++) {
                 if (this.ec_names[i].equals(tsym)) { *out = this.ec_values[i]; return true; }
@@ -2037,14 +2037,14 @@ type struct Importer {
     /// (any C float/int suffix stripped) or a bound macro const referenced by
     /// name.  Returns false for anything else.
     arith_operand(&this, tok: CXToken, out: f64*) -> boolean {
-        const k: i32 = Clang::clang_getTokenKind(tok);
+        const k: i32 = clang::clang_getTokenKind(tok);
         const sp: string = tok.spelling(this.tu, this.ctx);
-        if (k == Clang::TOKEN_LITERAL) {
+        if (k == clang::TOKEN_LITERAL) {
             if (sp.is_text_literal()) { return false; }
             *out = float::parse_f64(Importer::strip_float_suffix(sp)).unwrap_or(0.0);
             return true;
         }
-        if (k == Clang::TOKEN_IDENTIFIER) {
+        if (k == clang::TOKEN_IDENTIFIER) {
             const tsym: SymbolStr = this.ctx.intern_table.intern(sp);
             for (mut i: i64 = 0; i < this.mac_names.length; i++) {
                 if (!this.mac_names[i].equals(tsym)) { continue; }
@@ -2233,16 +2233,16 @@ type struct Importer {
         // Drop system headers first (already covered by the libclang-version
         // fold); this also avoids allocating a path string for files we discard.
         const loc: CXSourceLocation =
-            Clang::clang_getLocationForOffset(imp.tu, included_file, 0);
-        if (Clang::clang_Location_isInSystemHeader(loc) != 0) { return; }
-        const fname: CXString = Clang::clang_getFileName(included_file);
-        const cstr: u8* = Clang::clang_getCString(fname);
+            clang::clang_getLocationForOffset(imp.tu, included_file, 0);
+        if (clang::clang_Location_isInSystemHeader(loc) != 0) { return; }
+        const fname: CXString = clang::clang_getFileName(included_file);
+        const cstr: u8* = clang::clang_getCString(fname);
         if (cstr != null && (cstr as string).length() > 0) {
             mut owned: String = String::from_string(cstr as string);
             imp.inputs.push(owned.into_raw());
             imp.input_files.push(included_file);
         }
-        Clang::clang_disposeString(fname);
+        clang::clang_disposeString(fname);
     }
 
     /// Build a libclang TU (forcing C with `-x c`), walk its top-level
@@ -2260,7 +2260,7 @@ type struct Importer {
                            extra_args: &u8*[], label: string, extern_node: ExternBlockNode*,
                            ctx: CompilationContext*, out_report: ImportReport*,
                            out_inputs: string[]*, lang: string, cpp_std: string) -> i32 {
-        const index: void* = Clang::clang_createIndex(0, 0);
+        const index: void* = clang::clang_createIndex(0, 0);
         // Force the source language.  C (`-x c`) is the default and reproduces the
         // old preprocess byte-for-byte; C++ (`-x c++ -std=<cpp_std>`) drives the
         // C++ binding generator (Strategy A: direct mangled-symbol binding).
@@ -2303,14 +2303,14 @@ type struct Importer {
             args.push(extra_args[ei]);
         }
 
-        const tu: void* = Clang::clang_parseTranslationUnit(
+        const tu: void* = clang::clang_parseTranslationUnit(
             index, source_filename, &args[0], args.length as i32, unsaved, num_unsaved,
-            Clang::TU_DETAILED_PREPROCESSING_RECORD);
+            clang::TU_DETAILED_PREPROCESSING_RECORD);
         if ((tu as void*) == null) {
             ctx.diagnostics.emit(Diagnostic::error(
                 ErrorCode::E0806_HEADER_PREPROC_FAILED,
                 format("libclang failed to parse C header '%s'", label)));
-            Clang::clang_disposeIndex(index);
+            clang::clang_disposeIndex(index);
             return 0;
         }
 
@@ -2323,9 +2323,9 @@ type struct Importer {
         // ("did one of this library's own headers write this?"), so it has to be
         // known before any macro is judged.  It doubles as the include-graph
         // provenance record threaded out below.
-        Clang::clang_getInclusions(tu, Importer::visit_inclusion, (&imp) as void*);
-        const cursor: CXCursor = Clang::clang_getTranslationUnitCursor(tu);
-        Clang::clang_visitChildren(cursor, Importer::visit_decl, (&imp) as void*);
+        clang::clang_getInclusions(tu, Importer::visit_inclusion, (&imp) as void*);
+        const cursor: CXCursor = clang::clang_getTranslationUnitCursor(tu);
+        clang::clang_visitChildren(cursor, Importer::visit_decl, (&imp) as void*);
         // W1 two-pass macro emission (deferred from the decl walk): bind the
         // simple literal consts first so the macro-const table is complete, then
         // resolve the alias/compound/arithmetic macros against the full set of
@@ -2352,8 +2352,8 @@ type struct Importer {
             }
         }
 
-        Clang::clang_disposeTranslationUnit(tu);
-        Clang::clang_disposeIndex(index);
+        clang::clang_disposeTranslationUnit(tu);
+        clang::clang_disposeIndex(index);
         return imp.count;
     }
 

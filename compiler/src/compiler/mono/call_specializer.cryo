@@ -1,4 +1,4 @@
-/// Mono Call Specializer  (Compiler::Mono::CallSpecializer)
+/// Mono Call Specializer  (compiler::mono::call_specializer)
 ///
 /// The sema-stash CONSUMER.  Walks a module's call sites and, for each generic
 /// free-function / method / static call that sema already resolved, mints the
@@ -14,24 +14,24 @@
 /// where-bound checking, and the clone+substitute+register mechanics - none of
 /// which is inference.
 
-namespace Compiler::Mono::CallSpecializer;
+namespace compiler::mono::call_specializer;
 
-import Compiler::AST;
-import Compiler::AST::{ Node, Declaration, Statement, Expression, Pattern };
-import Compiler::Types::{
-    Generic, UserDefined, Compound, Type, Arena, TypeRef, Substitution, Resolver, GenericRegistry, Ownership, TypeKind, RefMutability
+import compiler::ast;
+import compiler::ast::{ node, declaration, statement, expression, pattern };
+import compiler::types::{
+    generic, user_defined, compound, type_base, arena, type_ref, substitution, resolver, generic_registry, ownership, TypeKind, RefMutability
 };
-import Compiler::Diag;
-import Compiler::Diag::{ Sink, Diagnostic, SourceSpan };
-import Compiler::DeclIndex;
-import Compiler::Resolver::{ InternTable, SymbolStr, QualifiedName, MangledName };
-import Compiler::Resolver::{ Res, ResSlot };
-import Compiler::Mono::{ State, TraitSpecializer, AstResolver };
-import Compiler::ModuleGraph;
-import Compiler::ResolveCounter;
+import compiler::diag;
+import compiler::diag::{ sink, diagnostic, source_span };
+import compiler::decl_index;
+import compiler::resolver::{ intern_table, symbol_str, qualified_name, mangled_name };
+import compiler::resolver::{ res, ResSlot };
+import compiler::mono::{ state, trait_specializer, ast_resolver };
+import compiler::module_graph;
+import compiler::resolve_counter;
 import std::alloc::allocator;
-import Compiler::AST::Cloner;
-import Compiler::AST::Substituter;
+import compiler::ast::cloner;
+import compiler::ast::substituter;
 
 
 type struct MonoCallSpecializer {
@@ -118,10 +118,10 @@ type struct MonoCallSpecializer {
     }
 
     /// The module that WROTE `file`, or "" when the graph cannot say.  See
-    /// `ModuleGraph::home_ns_of_file` for why "" must not become a fallback to
+    /// `module_graph::home_ns_of_file` for why "" must not become a fallback to
     /// the cursor.
     home_ns_of(&this, file: string) -> SymbolStr {
-        return ModuleGraph::home_ns_sym_of_file(this.module_graph, file);
+        return module_graph::home_ns_sym_of_file(this.module_graph, file);
     }
 
     /// Qualify a written scope name by judging it in the module that WROTE it,
@@ -136,7 +136,7 @@ type struct MonoCallSpecializer {
     /// false-positive direction that reverted the visibility gate once.
     ///
     /// The empty-answer policy lives here, once, for the reason
-    /// `ModuleGraph::home_ns_of_file` is a free function: a rule spelled out at
+    /// `module_graph::home_ns_of_file` is a free function: a rule spelled out at
     /// each call site is a rule the next call site forgets.  `origin_file` and
     /// `origin_line` still come from the CALLER - a wrapper that named itself
     /// would collapse every call site onto one location and then read as the
@@ -708,7 +708,7 @@ type struct MonoCallSpecializer {
         // identifier it eventually reaches came from, and a sixth entry point
         // added later would silently reinstate the scope-less context.
         const fnval_home: SymbolStr = this.home_ns_of((ident as ASTNode*).span.file);
-        ResolveCounter::mono_home("fnval", (ident as ASTNode*).span.file, "",
+        resolve_counter::mono_home("fnval", (ident as ASTNode*).span.file, "",
                                   this.intern_table.resolve(this.current_ns),
                                   this.intern_table.resolve(fnval_home));
         res_ctx.set_home_module(fnval_home, HomeOrigin::Syntax);
@@ -1236,7 +1236,7 @@ type struct MonoCallSpecializer {
             // (spec §8.2m).
             const body_home: SymbolStr =
                 this.home_ns_of((spec_method.func as ASTNode*).span.file);
-            ResolveCounter::mono_home("methbody",
+            resolve_counter::mono_home("methbody",
                                       (spec_method.func as ASTNode*).span.file,
                                       this.arena.module_ns_of(recv_type),
                                       this.intern_table.resolve(this.current_ns),
@@ -1490,7 +1490,7 @@ type struct MonoCallSpecializer {
         // and derives its own home from `entry`; the two are deliberately not
         // the same value.
         const scope_home: SymbolStr = this.home_ns_of((scope as ASTNode*).span.file);
-        ResolveCounter::mono_home("ownerbinds", (scope as ASTNode*).span.file,
+        resolve_counter::mono_home("ownerbinds", (scope as ASTNode*).span.file,
                                   this.intern_table.resolve(entry.module_name),
                                   this.intern_table.resolve(this.current_ns),
                                   this.intern_table.resolve(scope_home));
@@ -1849,7 +1849,7 @@ type struct MonoCallSpecializer {
         // records: the entity's module and the file's module are the same thing
         // only until a body is written in a third module.
         const tmpl_home: SymbolStr = this.home_ns_of(tmpl.ast_node.span.file);
-        ResolveCounter::mono_home("tmplrecv", tmpl.ast_node.span.file,
+        resolve_counter::mono_home("tmplrecv", tmpl.ast_node.span.file,
                                   this.intern_table.resolve(tmpl.module_name),
                                   this.intern_table.resolve(this.current_ns),
                                   this.intern_table.resolve(tmpl_home));
@@ -2170,7 +2170,7 @@ type struct MonoCallSpecializer {
             // were the span; the span itself is not a proxy (spec §8.2m).
             const sig_home: SymbolStr =
                 this.home_ns_of((spec_method.func as ASTNode*).span.file);
-            ResolveCounter::mono_home("ownersig",
+            resolve_counter::mono_home("ownersig",
                                       (spec_method.func as ASTNode*).span.file,
                                       this.arena.module_ns_of(owner_type),
                                       this.intern_table.resolve(this.current_ns),
@@ -2477,7 +2477,7 @@ type struct MonoCallSpecializer {
     find_scoped_function_template(mut &this, name: SymbolStr,
                                   scope: SymbolStr, call_arity: i64,
                                   scope_slot: ResSlot*) -> TemplateEntry* {
-        ResolveCounter::Site::SfCalls.bump();
+        resolve_counter::Site::SfCalls.bump();
         const registry: GenericRegistry* = this.generic_registry;
         if (registry == null || !scope.is_valid()) { return null; }
         // The scope segment already records WHICH module it names, under the
@@ -2487,7 +2487,7 @@ type struct MonoCallSpecializer {
         // qualifier is any whole-segment suffix of the real one.
         const via_res: TemplateEntry* = this.scoped_template_from_stamp(scope_slot, name);
         if (via_res != null) {
-            ResolveCounter::Site::SfViaRes.bump();
+            resolve_counter::Site::SfViaRes.bump();
             return via_res;
         }
         const scope_str: string = this.intern_table.resolve(scope);
@@ -2517,11 +2517,11 @@ type struct MonoCallSpecializer {
         }
 
         if (match_count == 0) {
-            ResolveCounter::Site::SfScanNone.bump();
+            resolve_counter::Site::SfScanNone.bump();
         } else if (match_count == 1) {
-            ResolveCounter::Site::SfScanOne.bump();
+            resolve_counter::Site::SfScanOne.bump();
         } else {
-            ResolveCounter::Site::SfScanPlural.bump();
+            resolve_counter::Site::SfScanPlural.bump();
         }
         // A suffix borne by more than one template is not a question the
         // spelling can answer.  Call arity and longest shared module prefix
@@ -2584,7 +2584,7 @@ type struct MonoCallSpecializer {
                     const via_res: TemplateEntry* = registry.get_template(q);
                     if (via_res != null
                             && via_res.node_kind == NodeKind::FunctionDeclaration) {
-                        ResolveCounter::Site::M4ViaRes.bump();
+                        resolve_counter::Site::M4ViaRes.bump();
                         return via_res;
                     }
                 }
@@ -2615,7 +2615,7 @@ type struct MonoCallSpecializer {
         // vs `net::http2::frame::read_frame`) are indistinguishable here.  All
         // this scan can establish is whether exactly ONE template bears the
         // leaf; deciding between several is not something a spelling can do.
-        ResolveCounter::Site::M4Calls.bump();
+        resolve_counter::Site::M4Calls.bump();
         const total: i64 = registry.template_count();
         mut first: TemplateEntry* = null;
         mut match_count: i64 = 0;
@@ -2633,11 +2633,11 @@ type struct MonoCallSpecializer {
         // population that would regain an answer if a discriminator were ever
         // reintroduced here.
         if (match_count == 0) {
-            ResolveCounter::Site::M4ScanNone.bump();
+            resolve_counter::Site::M4ScanNone.bump();
         } else if (match_count == 1) {
-            ResolveCounter::Site::M4ScanOne.bump();
+            resolve_counter::Site::M4ScanOne.bump();
         } else {
-            ResolveCounter::Site::M4ScanPlural.bump();
+            resolve_counter::Site::M4ScanPlural.bump();
         }
         // A leaf naming more than one template is not a question a spelling
         // can answer.  Call arity, longest shared module prefix and scan order
@@ -2646,8 +2646,8 @@ type struct MonoCallSpecializer {
         // names the declaration exactly, and is the only path that can.
         if (match_count > 1) { return null; }
         if (first != null) {
-            ResolveCounter::Site::M4Hits.bump();
-            ResolveCounter::Site::M4Single.bump();
+            resolve_counter::Site::M4Hits.bump();
+            resolve_counter::Site::M4Single.bump();
             this.record_m4_asker(asker, first);
         }
         return first;
@@ -2659,35 +2659,35 @@ type struct MonoCallSpecializer {
     /// way consulting the stamp first could rebind a call.
     record_m4_pre(mut &this, asker: ResSlot*, chosen: TemplateEntry*) -> void {
         if (asker == null || asker.is_pending()) {
-            ResolveCounter::Site::M4PreNoStamp.bump(); return;
+            resolve_counter::Site::M4PreNoStamp.bump(); return;
         }
         mut def_name: SymbolStr = SymbolStr::empty();
         match (asker.require("m4-pre-probe")) {
             Res::Def(q) => { def_name = q; }
-            _           => { ResolveCounter::Site::M4PreNoStamp.bump(); return; }
+            _           => { resolve_counter::Site::M4PreNoStamp.bump(); return; }
         }
         const registry: GenericRegistry* = this.generic_registry;
         if (registry == null) { return; }
         const via_res: TemplateEntry* = registry.get_template(def_name);
-        if (via_res == null) { ResolveCounter::Site::M4PreNoStamp.bump(); return; }
-        if (via_res == chosen) { ResolveCounter::Site::M4PreAgree.bump(); }
-        else { ResolveCounter::Site::M4PreDiffers.bump(); }
+        if (via_res == null) { resolve_counter::Site::M4PreNoStamp.bump(); return; }
+        if (via_res == chosen) { resolve_counter::Site::M4PreAgree.bump(); }
+        else { resolve_counter::Site::M4PreDiffers.bump(); }
     }
 
     record_m4_asker(mut &this, asker: ResSlot*, chosen: TemplateEntry*) -> void {
-        if (asker == null) { ResolveCounter::Site::M4ResPending.bump(); return; }
-        if (asker.is_pending()) { ResolveCounter::Site::M4ResPending.bump(); return; }
+        if (asker == null) { resolve_counter::Site::M4ResPending.bump(); return; }
+        if (asker.is_pending()) { resolve_counter::Site::M4ResPending.bump(); return; }
         mut def_name: SymbolStr = SymbolStr::empty();
         match (asker.require("m4-probe")) {
-            Res::Def(q) => { ResolveCounter::Site::M4ResDef.bump(); def_name = q; }
-            _           => { ResolveCounter::Site::M4ResOther.bump(); return; }
+            Res::Def(q) => { resolve_counter::Site::M4ResDef.bump(); def_name = q; }
+            _           => { resolve_counter::Site::M4ResOther.bump(); return; }
         }
         const registry: GenericRegistry* = this.generic_registry;
         if (registry == null) { return; }
         const via_res: TemplateEntry* = registry.get_template(def_name);
-        if (via_res == null) { ResolveCounter::Site::M4ResNoTemplate.bump(); return; }
-        if (via_res == chosen) { ResolveCounter::Site::M4ResAgree.bump(); }
-        else { ResolveCounter::Site::M4ResDiffers.bump(); }
+        if (via_res == null) { resolve_counter::Site::M4ResNoTemplate.bump(); return; }
+        if (via_res == chosen) { resolve_counter::Site::M4ResAgree.bump(); }
+        else { resolve_counter::Site::M4ResDiffers.bump(); }
     }
 
 

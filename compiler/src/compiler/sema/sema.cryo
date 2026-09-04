@@ -1,4 +1,4 @@
-/// SemaVisitor - the semantic-analysis main visitor (Compiler::Sema::Sema)
+/// SemaVisitor - the semantic-analysis main visitor (compiler::sema::sema)
 ///
 /// The composition root of the decomposed Sema subsystem.  Owns the immutable
 /// environment (`arena` / `intern` / `ctx` / `this_sym`), the by-value
@@ -21,39 +21,39 @@
 /// (identifier, binary, unary, cast, if/ternary/match/try, struct/array/tuple
 /// literals, scope-resolution-as-value).
 
-namespace Compiler::Sema::Sema;
+namespace compiler::sema::sema;
 
-import Compiler::Diag;
-import Compiler::Diag::{
-    Diagnostic, Suggestion, SourceSpan, EditDistance, Snapshot
+import compiler::diag;
+import compiler::diag::{
+    diagnostic, suggestion, source_span, edit_distance, snapshot
 };
-import Compiler::DeclIndex;
-import Compiler::ConstTable;
-import Compiler::ResolveCounter;
-import Compiler::AST;
-import Compiler::AST::{ Node, Expression, Statement, Declaration, Pattern, Visitor, NodeLocator, Cloner };
-import Compiler::Passes::PassID;
-import Compiler::CompilationContext;
-import Compiler::Lex;
-import Compiler::ModuleGraph;
-import Compiler::Types;
-import Compiler::Types::{
-    TypeRef, Type, UserDefined, Compound, Generic, Arena,
-    Checker, Ownership, Resolver, GenericRegistry, Substitution, TraitChecker
+import compiler::decl_index;
+import compiler::const_table;
+import compiler::resolve_counter;
+import compiler::ast;
+import compiler::ast::{ node, expression, statement, declaration, pattern, visitor, node_locator, cloner };
+import compiler::passes::pass_id;
+import compiler::compilation_context;
+import compiler::lex;
+import compiler::module_graph;
+import compiler::types;
+import compiler::types::{
+    type_ref, type_base, user_defined, compound, generic, arena,
+    checker, ownership, resolver, generic_registry, substitution, trait_checker
 };
-import Compiler::Resolver::{ SymbolStr, InternTable, QualifiedName, MangledName, Resolver };
-import Compiler::Resolver::Res;
-import Compiler::Sema::{
-    State, Helpers, ScopeManager, TypeUtils, LiteralResolver, Diagnostics,
-    Dispatch, SymbolicChecker, MethodBinding, PatternResolver,
-    LambdaSynth, AsyncLower, MemberResolver, CallResolver
+import compiler::resolver::{ symbol_str, intern_table, qualified_name, mangled_name, resolver };
+import compiler::resolver::res;
+import compiler::sema::{
+    state, helpers, scope_manager, type_utils, literal_resolver, diagnostics,
+    dispatch, symbolic_checker, method_binding, pattern_resolver,
+    lambda_synth, async_lower, member_resolver, call_resolver
 };
 import std::core::{ option, mem };
 import std::collections::hashmap;
 import std::fmt;
-import Utils::Logger;
-import Compiler::Diag::Sink;
-import Compiler::Passes::TypeResolution;
+import utils::logger;
+import compiler::diag::sink;
+import compiler::passes::type_resolution;
 
 
 /// Operator -> (trait leaf, method) overloading map. `valid == false` means
@@ -274,9 +274,9 @@ public:
                     // read only when the owner declares an `async` method, so
                     // a divergence counted over all of them says nothing about
                     // whether anything consumed the wrong answer.
-                    ResolveCounter::Site::ImplHeadSeen.bump();
+                    resolve_counter::Site::ImplHeadSeen.bump();
                     const ih_stamped: boolean = ib.qualified_target_name.is_valid();
-                    if (!ih_stamped) { ResolveCounter::Site::ImplHeadUnstamped.bump(); }
+                    if (!ih_stamped) { resolve_counter::Site::ImplHeadUnstamped.bump(); }
                     mut ih_async: boolean = false;
                     for (mut ihm: i64 = 0; ihm < ib.methods.length; ihm++) {
                         const ihmn: MethodNode* = ib.methods[ihm];
@@ -284,8 +284,8 @@ public:
                         if (ihmn.func.is_async) { ih_async = true; }
                     }
                     if (ih_async) {
-                        ResolveCounter::Site::ImplHeadAsync.bump();
-                        if (!ih_stamped) { ResolveCounter::Site::ImplHeadAsyncUnstamped.bump(); }
+                        resolve_counter::Site::ImplHeadAsync.bump();
+                        if (!ih_stamped) { resolve_counter::Site::ImplHeadAsyncUnstamped.bump(); }
                     }
                     // Type resolution stamped the canonical target on the node;
                     // the two other spellings it also registered the methods
@@ -590,26 +590,26 @@ public:
     /// already-failed resolution each name something that is not a
     /// declaration, so there is no key to look one up under.
     impl_target_type(mut &this, node: ImplBlockNode*) -> TypeRef {
-        ResolveCounter::Site::SpellTyImplCalls.bump();
+        resolve_counter::Site::SpellTyImplCalls.bump();
         return match (node.res) {
             ResSlot::Answered(r) => {
                 match (r) {
                     Res::Def(q) => {
-                        ResolveCounter::Site::SpellTyImplResDef.bump();
+                        resolve_counter::Site::SpellTyImplResDef.bump();
                         this.types.def_type(q, "sema/visit:ImplBlockNode/node.res")
                     }
                     Res::PrimTy(n) => {
-                        ResolveCounter::Site::SpellTyImplResPrim.bump();
+                        resolve_counter::Site::SpellTyImplResPrim.bump();
                         this.types.lookup_type_exact(n)
                     }
                     _ => {
-                        ResolveCounter::Site::SpellTyImplResOther.bump();
+                        resolve_counter::Site::SpellTyImplResOther.bump();
                         TypeRef::invalid()
                     }
                 }
             }
             _ => {
-                ResolveCounter::Site::SpellTyImplResPend.bump();
+                resolve_counter::Site::SpellTyImplResPend.bump();
                 this.types.lookup_type_exact(node.target_type)
             }
         };
@@ -893,7 +893,7 @@ public:
         mut rc: ResolutionContext = ResolutionContext::new(FILE, LINE, this.ctx.source_file, "", SymbolStr::empty(), HomeOrigin::Unset);
         const owner_ns: SymbolStr = this.arena.module_ns_sym_of(this.state.current_owner_type);
         if (owner_ns.is_valid()) {
-            ResolveCounter::Site::BodyNsOwner.bump();
+            resolve_counter::Site::BodyNsOwner.bump();
             rc.set_home_module(owner_ns, HomeOrigin::Syntax);
             return rc;
         }
@@ -908,13 +908,13 @@ public:
         const cursor_ns: SymbolStr = this.ctx.namespace_str;
         const syntax_ns: SymbolStr = this.ctx.module_ns_sym_of_file(span.file);
         if (syntax_ns.is_valid()) {
-            ResolveCounter::Site::BodyNsSyntax.bump();
-            if (!syntax_ns.equals(cursor_ns)) { ResolveCounter::Site::BodyNsDiff.bump(); }
+            resolve_counter::Site::BodyNsSyntax.bump();
+            if (!syntax_ns.equals(cursor_ns)) { resolve_counter::Site::BodyNsDiff.bump(); }
             // Emitted on EVERY row, not only the diverging ones, so that Diff's
             // zero stays re-derivable offline by a comparison this compiler did
             // not perform.  A zero computed only by the `!=` above would be its
             // own control; `awk -F'\t' '$3!=$4'` over the stream is not.
-            ResolveCounter::body_ns_diff(span.file,
+            resolve_counter::body_ns_diff(span.file,
                                         this.intern.resolve(syntax_ns),
                                         this.intern.resolve(cursor_ns));
             rc.set_home_module(syntax_ns, HomeOrigin::Syntax);
@@ -923,7 +923,7 @@ public:
         // No module claims the file (synthesized node, single-file mode).
         // Counted, so "provenance was available" is never confused with
         // "provenance agreed with the cursor".
-        ResolveCounter::Site::BodyNsCursor.bump();
+        resolve_counter::Site::BodyNsCursor.bump();
         rc.set_home_module(cursor_ns, HomeOrigin::Cursor);
         return rc;
     }
@@ -2561,7 +2561,7 @@ public:
     make_poll_ready(&this, value: ExpressionNode*, poll_out: TypeRef,
                     span: SourceSpan) -> ExpressionNode* {
         mut scope: ScopeResolutionNode* = new ScopeResolutionNode(
-            this.intern.intern(AsyncLower::POLL_TYPE), this.intern.intern("Ready"), span);
+            this.intern.intern(async_lower::POLL_TYPE), this.intern.intern("Ready"), span);
         scope.set_synthesized_ref(poll_out, this.ctx.definition_name_of(poll_out));
         mut call: CallExprNode* = new CallExprNode(scope as ExpressionNode*, span);
         call.add_argument(value);
@@ -2835,8 +2835,8 @@ public:
         // above applies and the stamp is the whole answer: it names one
         // definition, canonically, accounting for the writing module's imports.
         if (!struct_ref.is_valid()) {
-            ResolveCounter::Site::SpellTyLitCalls.bump();
-            struct_ref = this.types.spelling_type(lit.res, ResolveCounter::Site::SpellTyLitNoDef);
+            resolve_counter::Site::SpellTyLitCalls.bump();
+            struct_ref = this.types.spelling_type(lit.res, resolve_counter::Site::SpellTyLitNoDef);
         }
         // Last, for a literal the stamp makes no claim for - a type the writing
         // module cannot see is deliberately left unstamped - where the spelling
@@ -2847,9 +2847,9 @@ public:
         if (!struct_ref.is_valid()) {
             struct_ref = this.types.lookup_type_by_sym(lit.struct_type, "sema/resolve_struct_literal/lit.struct_type");
             if (struct_ref.is_valid()) {
-                ResolveCounter::Site::SpellTyLitFbHit.bump();
+                resolve_counter::Site::SpellTyLitFbHit.bump();
             } else {
-                ResolveCounter::Site::SpellTyLitFbMiss.bump();
+                resolve_counter::Site::SpellTyLitFbMiss.bump();
             }
         }
         mut struct_t: Type* = if (struct_ref.is_valid()) { this.arena.lookup(struct_ref.id) } else { null };
@@ -3156,22 +3156,22 @@ public:
         // one.  `resolve_primitive` beneath it answers nothing on any corpus,
         // but it is only ever reached when the lookup above declines, so that
         // zero is shadowed rather than measured.
-        ResolveCounter::Site::SpellTyNewCalls.bump();
-        mut base: TypeRef = this.types.spelling_type(new_expr.res, ResolveCounter::Site::SpellTyNewNoDef);
+        resolve_counter::Site::SpellTyNewCalls.bump();
+        mut base: TypeRef = this.types.spelling_type(new_expr.res, resolve_counter::Site::SpellTyNewNoDef);
         const new_unstamped: boolean = !base.is_valid();
         if (!base.is_valid()) {
             base = this.types.lookup_type_by_sym(new_expr.type_name, "sema/resolve_new_expr/new_expr.type_name");
-            if (base.is_valid()) { ResolveCounter::Site::SpellTyNewStep2.bump(); }
+            if (base.is_valid()) { resolve_counter::Site::SpellTyNewStep2.bump(); }
         }
         if (!base.is_valid() && this.ctx.type_resolver != null) {
             base = this.ctx.type_resolver.resolve_primitive(new_expr.type_name);
-            if (base.is_valid()) { ResolveCounter::Site::SpellTyNewStep3.bump(); }
+            if (base.is_valid()) { resolve_counter::Site::SpellTyNewStep3.bump(); }
         }
         if (new_unstamped) {
             if (base.is_valid()) {
-                ResolveCounter::Site::SpellTyNewFbHit.bump();
+                resolve_counter::Site::SpellTyNewFbHit.bump();
             } else {
-                ResolveCounter::Site::SpellTyNewFbMiss.bump();
+                resolve_counter::Site::SpellTyNewFbMiss.bump();
             }
         }
         if (base.is_valid()) { return this.arena.get_pointer_to(base); }
@@ -3722,11 +3722,11 @@ public:
             const trait_name: SymbolStr = this.trait_leaf_name(imp.bounds[i]);
             if (!trait_name.is_valid()) { continue; }
             const bound_id: SymbolStr = TypeAnnotation::trait_identity(imp.bounds[i]);
-            if (ResolveCounter::Audit::Trait.enabled()) {
+            if (resolve_counter::Audit::Trait.enabled()) {
                 mut idtext: string = "<EMPTY>";
                 if (bound_id.is_valid()) { idtext = this.intern.resolve(bound_id); }
                 const bsp: SourceSpan = annotation_span(imp.bounds[i]);
-                ResolveCounter::trait_decl_lookup("verify_impl_trait_bounds",
+                resolve_counter::trait_decl_lookup("verify_impl_trait_bounds",
                     idtext, format("%s @ %s:%u",
                         this.intern.resolve(var_node.name),
                         bsp.file, bsp.start_line));
