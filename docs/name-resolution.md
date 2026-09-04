@@ -11659,12 +11659,24 @@ of order 2 to 20 rather than thousands. Falsified by a zero there.
 
 | corpus | tool | calls | hits |
 |---|---|---:|---:|
-| the three pinned b1 targets | `cryo build` | 2,206 | 0 |
-| `examples/14-threads` alone | `cryo build` | 2,036 | 0 |
+| `examples/09-json-config` (the `[host:windows]` row) | `cryo build` | 2,206 | 0 |
+| `tests/.../ffi_c_import` | `cryo build` | 1,578 | 0 |
+| `examples/14-threads` | `cryo build` | 2,036 | 0 |
+| **all three pinned targets** | `cryo build` | **5,820** | **0** |
 | `resolution_leaf_index` | `cryo build` | 1,578 | **0** |
 | `resolution_leaf_index` | `cryo test` | 3,546 | **8** |
 
 The prediction holds, including the size.
+
+A first draft of this entry cited 2,206 as the three-target total. It is one
+target - the golden pins a separate row per target, and they sum to 5,820.
+Corrected here rather than left to be re-cited.
+
+The two 1,578 rows are not a coincidence worth ignoring: `ffi_c_import` and
+`resolution_leaf_index` are different projects with the same count, because
+under `cryo build` almost every call comes from compiling the STDLIB and
+hardly any from the project. That is the corpus-independence of the row said
+numerically, and it is why moving between small projects never moved it.
 
 #### The tool is a variable, not a detail
 
@@ -11783,3 +11795,4 @@ ground `examples` already walked, so it can go late.
 
 Worth re-checking the rest of the job against that rule rather than assuming
 this was the only instance.
+
