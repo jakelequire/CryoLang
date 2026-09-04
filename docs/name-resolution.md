@@ -11918,3 +11918,129 @@ a real question with a real cost, and it is not answered here. What changed is
 that it is now a visible decision in the workflow file instead of a silent
 property of a status mapping. Deciding it belongs to whoever weighs the CI
 minutes against the coverage.
+
+### 8.84 The `written_leaf` bound sites: the accessor is the symptom, the stamp arrives too late, and the syntax has no coverage - MEASURED, DECLINED 2026-09-04
+
+Three sites resolve a generic parameter's inline constraints by asking the
+arena's leaf index for the written leaf:
+
+    types/resolver.cryo:1231        create_param_type
+    passes/type_resolution.cryo:1298 create_generic_param_types
+    sema/symbolic_checker.cryo:94    symbolic_param_ref
+
+`written_leaf`'s own docstring says it "is a search key and not an identity"
+and that "anything asking WHICH trait this names must call `identity()`
+instead", and `TraitRef.resolved_name` is stamped by `stamp_trait_ref`. The
+proposed change was to swap the accessor at all three. Measured, that change is
+a no-op at the only site that runs, and a regression if it is completed.
+
+#### The stamp is fully qualified, so the accessor cannot be swapped alone
+
+`BOUND-STAMP-ALL` names both halves:
+
+    stamp_trait_ref   Ord     std::core::cmp::Ord
+    stamp_trait_ref   Clone   std::core::clone::Clone
+
+`resolved_name` is a qualified name; `written_leaf` is a bare leaf. The leaf
+index is keyed BY LEAF. So `lookup_by_leaf(identity())` on a stamped ref would
+look a qualified name up in a leaf-keyed map and miss - and a miss here is
+silent, because a constraint that does not resolve falls back to a plain
+`GenericParamType` by design. Swapping the accessor requires also swapping the
+lookup to `lookup_by_name`, and the two must move together or bounds are lost
+without a diagnostic.
+
+#### Two of the three sites are unreachable, and the third is unstamped
+
+A probe was put at all three sites, OUTSIDE the `if (trait_ref.is_valid())` the
+existing counters sit inside - which is the entered-counter those sites lack,
+and the reason "never called" and "called and refused" have been the same
+number there.
+
+On `examples/14-threads` it produced **no rows at all**, with the audit stream
+carrying 9,044 other rows in the same run and the probe's three tags present in
+the binary. The loops never execute.
+
+The reason is not the corpus. `GenericParamNode.constraints` is populated only
+by the INLINE `<T: Bound>` syntax; a `where` clause becomes a `TraitBound` and
+travels elsewhere. The tree writes `where`: **398 where-clauses across 86
+stdlib files, and not one inline constraint outside a docstring** in `stdlib`,
+`compiler/src`, `examples` or `tests`. The regex was controlled against a known
+inline bound first, because an empty result from a broken pattern is the same
+output as an empty result from an empty population.
+
+So this is a third kind of starvation, after the corpus and the tool of 8.81:
+**starved by source syntax**. No corpus in the repository can reach these sites,
+and none ever could.
+
+A project written to use the syntax reaches exactly one of them:
+
+    5 x  typeres-bound   unstamped   namemiss-leafok
+
+`create_generic_param_types` runs; `create_param_type` and `symbolic_param_ref`
+do not, even here. And every reach is UNSTAMPED - `identity()` would return the
+written leaf, `lookup_by_name` would miss, `lookup_by_leaf` hits.
+
+#### The pass-ordering question, answered by measurement
+
+The stamp is not missing. It lands late:
+
+    log line 578   BOUND-PROBE       typeres-bound  unstamped
+    log line 628   BOUND-STAMP-ALL   stamp_trait_ref  Tagged -> InlineGenericBound::Main::Tagged
+
+`stamp_generic_constraints` does stamp the inline constraint, fifty rows after
+the site that read it. The identity exists; it is simply not there yet when
+`create_generic_param_types` asks.
+
+That makes the accessor swap a no-op today: with `resolved_name` invalid,
+`identity()` returns `written_leaf()` by definition, so all three sites would
+compile to the same lookup they perform now. A change that produces no
+behavioural difference while reading as a correctness fix is worse than no
+change, because it retires the question.
+
+#### Why the ordering is not a reordering
+
+`create_generic_param_types` has **seven callers**, spanning
+`passes/specialization.cryo`, `passes/type_resolution.cryo`,
+`sema/async_lower.cryo` and `sema/sema.cryo`, while the stamper is one routed
+pass. Making the stamp precede every read is not moving one pass in front of
+another; it is establishing an ordering across sema, specialization and async
+lowering. That is a structural change to what a program compiles to - for any
+plural leaf it changes which trait a bound names - and it is not this session's
+to make.
+
+Declined, with the measurement recorded. The accessor swap should follow the
+ordering fix, not precede it.
+
+#### The syntax is inert, which is why nobody noticed
+
+Two controls on the fixture, both of which it failed as a bounds test:
+
+* dropping the constraint (`<T: Tagged>` to `<T>`) compiles identically, so the
+  bound is not load-bearing for the body's `x.tag()`;
+* instantiating with a type that does not implement the trait is rejected as
+  `E0358: no method named 'tag'` - a method-resolution failure in the body, the
+  same error an unbounded `<T>` gives. Nothing reports a violated bound.
+
+An inline constraint is parsed, stored, resolved to a trait TypeRef, and then
+observed by nothing. That is the answer to why a whole syntax went unwritten and
+unnoticed, and why these three sites could sit uninstrumented indefinitely.
+
+The fixture is committed anyway, as `tests/tests/projects/inline_generic_bound`,
+and its header says exactly this so that a pass is never read as a bound having
+been checked. It exists because it is the only thing in the tree that makes the
+constraint loop reachable: a counter over that code reads the same zero whether
+it is starved or dead, and this project is the difference. If bound enforcement
+is ever implemented, the negative case belongs beside it.
+
+#### What this says about the eight remaining undistinguished zeros
+
+Two of them are these sites, and they are now distinguished: not dead, not
+starved by corpus - unreachable without a syntax the tree does not use, and
+unstamped when reached. The instrument that answered was an entered-counter
+placed outside the guard the existing bump sits inside, which is the same
+instrument the other undistinguished zeros need and do not have.
+
+The order stands as the audit put it: instrument, then fixture. A fixture
+against a blind instrument answers nothing - and the reverse also held here,
+since the entered-counter alone would have said "never runs" without the fixture
+to say what running would look like.
