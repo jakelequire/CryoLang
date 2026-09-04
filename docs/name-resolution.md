@@ -11109,3 +11109,94 @@ tree is 494 `.cryo` files that NOTHING builds - one comment in
 `selfhost-check.py` is its only mention in the build. It is inert rather than
 ungated, and damage there is invisible because it cannot matter. Recorded so the
 next reader does not build a gate for it.
+
+### 8.77 `current_module` is not the seam `home_module` was, and its one reader is a second answering path - MEASURED, NOT TAKEN 2026-09-03
+
+8.73 converted `ResolutionContext.home_module` from a string to a `SymbolStr`
+and found the conversion DELETED work, because four of the five consumers
+already held the identity and un-interned it. `current_module` sits one field
+above it in the same struct and looks like the same job. Measured, it is not,
+and converting it the same way would make the compiler slower to no purpose.
+
+#### One reader, and it is a fallback
+
+`current_module` has 57 construction sites and exactly ONE read. At
+`types/resolver.cryo`, `array_size_of` asks which module a bare constant in an
+array size means, answers it from the annotation's own file, and then - only if
+that fails - interns `ctx.current_module` and uses that instead:
+
+    module_ns = this.module_graph.ns_sym_of_file(a.span.file);
+    if (!module_ns.is_valid()) { module_ns = intern(ctx.current_module); }
+
+That is one question with two answering paths, which is the defect class this
+migration exists to remove. The first path derives the module from the syntax;
+the second re-derives it from a field the caller supplied.
+
+#### 35 of the 57 sites supply the wrong KIND of value
+
+The field is documented as a module namespace and its only consumer treats it as
+one. What the constructors actually pass:
+
+| passed as `current_module` | sites |
+|---|---:|
+| `this.ctx.source_file` | 30 |
+| `ctx_ptr.source_file` | 3 |
+| `source_file`, `this.origin_file` | 2 |
+| a real module name (`module_name`, `resolve(module_sym)`) | 10 |
+| empty (`""`, `_empty`, `_pm`, `_mod_dummy`) | 10 |
+| other | 2 |
+
+**35 of 57 pass a FILE PATH.** Were the fallback to fire at one of them,
+`ConstEval` would fold a bare constant against a "module" named
+`src/compiler/....cryo`, which names no module, so it would find nothing and
+report nothing. A wrong answer with no diagnostic, invisible because the path
+does not run.
+
+#### The fallback is dead over five populations
+
+Instrumented at both branches, so the zero has a denominator:
+
+| population | reached | fallback |
+|---|---:|---:|
+| `examples/09-json-config` | 8 | **0** |
+| `tests/reexport_private_module` | 0 | **0** |
+| `tests/reexport_basic` | 6 | **0** |
+| `examples/`, all 14 projects | 82 | **0** |
+| `compiler/` | 12 | **0** |
+| `tests/` via `cryo test` | 30 | **0** |
+| total | **138** | **0** |
+
+`tests/` was measured with `cryo test` rather than `cryo build`, because that is
+the tool that reaches modules only the test runner compiles, and the stream was
+confirmed live rather than silently empty: 88,208 audit rows in that run. The
+run also exits 1, and that is the probe's doing rather than a regression -
+`namespace_gate_methods` and `visibility_gate` assert that output must NOT
+contain certain strings, and a probe printing paths and spans breaks them.
+178 compile-fail and 36 of 38 projects passed underneath.
+
+#### Why converting it would be a pessimisation
+
+The intern at the fallback runs **zero** times. Converting the field to
+`SymbolStr` requires every constructor to supply one, and 35 of them hold a
+`string` file path - so the conversion would add an `intern` at 35 sites,
+executed on every context construction, to produce a value that is the wrong
+kind and that nothing reads. That is exactly the "moves the intern from callee
+to caller" outcome 8.71 predicted for `home_module` and was wrong about. Here it
+is right.
+
+#### What is owed before the fallback can be deleted
+
+Deleting the second answering path is the correct end state, and the zero is
+explained rather than bare: every one of the 42 reached rows inspected carries a
+real, non-empty `span.file`, and module discovery is import-driven, so a file
+that was compiled is in the graph by construction. `ns_sym_of_file` therefore
+answers, and the fallback is unreachable **for a compiled project**.
+
+That is not the whole population. `ModuleLoader::set_lsp_override` serves an
+editor buffer, and single-file mode compiles without a project graph; neither is
+covered by any measurement above. This is the same shape as 8.64's
+`2-primitive`: a zero with a known mechanism over an unbounded population, and
+that one was recorded as a candidate rather than taken. So is this.
+
+Recorded, not taken. The missing control is a measurement of `array_size_of`
+under LSP/single-file mode, where the graph may legitimately fail to name a file.
