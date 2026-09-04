@@ -11066,6 +11066,9 @@ reported the same way as a thing that did its job:
 * **a detached `selfhost-check` that never started** (8.75) - the launch was
   mis-quoted and `cmd` exited at once. No log is also what a healthy early run
   of that check looks like, because its output buffers.
+* **an incremental `cryo build` counting a corpus that was already built**
+  (8.78) - the counter reports 0, which is what "this step answered nothing"
+  looks like and also what "nothing was compiled" looks like.
 
 In each case the failing state and the passing state are OBSERVATIONALLY
 IDENTICAL to the person reading the result. This is the same error as reading a
@@ -11217,3 +11220,101 @@ file path yields a VALID `SymbolStr` naming no module, while deleting leaves the
 EMPTY symbol, and whether `ConstEval` treats "a namespace nothing declares" and
 "no namespace" alike is not established here. The missing controls are therefore
 `array_size_of` under an LSP override, and that `ConstEval` distinction.
+
+### 8.78 The two halves of the scope model get two names - MEASURED AND FIXED 2026-09-04
+
+8.70 rebuilt module scopes on the rule that a module scope is not a rib: a rib
+is transient and a stack is right for it, a module scope is a persistent node
+built once and looked up forever after. The code then kept ONE helper for both,
+and two consecutive readings of its call sites were wrong about what they do -
+8.70 said four of six were free collapses, 8.71 corrected that to none. Both
+claims came from the shape of the calls rather than their guards.
+
+#### 8.71's API gap was closed by 8.70 and nobody noticed
+
+8.71 ended: "Collapsing needs a way to ask [whether a module was entered]
+without also creating - which is a distinction the current API does not offer."
+
+It does. `find_module_scope` is a single map read that returns 0 for a module
+nobody entered and creates nothing; 8.70 made it that in the same commit. So
+the guard the call sites already write IS the question, and the collapse is
+available with the guard KEPT rather than removed - which is what 8.71 was
+right to refuse.
+
+#### The six callers are two different operations
+
+| site | shape | what it means |
+|---|---|---|
+| `monomorphizer`, `sema` | `if (find_module_scope(m) > 0) { ... }` | **enter module `m`** |
+| `monomorphizer`, `sema` restore | scope from `get_current_scope_id()` | **resume a saved scope** |
+| `name_resolution` x2 | scope from `get_current_scope_id()` | **resume a saved scope** |
+
+The first pair looked up a module's scope and handed it straight back, which
+says "restore" while meaning "enter". Since the guard already proves the scope
+exists, `set_module` finds it rather than building one, and the two are
+identical by construction: same map, same id, and both helpers set
+`current_module` and clear `import_aliases`.
+
+The other four are the transient half and legitimately need both arguments: the
+scope came from wherever the pass was standing, which may be a RIB inside a
+module. Jumping to the module's own scope would lose the nesting.
+
+So the helper is now `restore_scope`, and `set_module` is the module
+destination. The name was doing the confusing: a call that says "restore" while
+meaning "enter" is what both earlier readings tripped on.
+
+#### Two comments asserted the model 8.70 replaced
+
+Both were live and both were false:
+
+* `set_module`'s own doc said it "Creates a fresh Module scope parented to
+  global". It has not created one on entry since 8.70; it looks up the module's
+  single scope.
+* `name_resolution` justified not using `set_module` with "`set_module` here
+  would start the walk in a fresh empty scope." Same stale premise. The real
+  reason to keep the two-argument form there is different and narrower - it
+  preserves the cursor the caller is standing in - and the comment now says
+  that, along with the fact that the two coincide only while the walk has not
+  entered a rib, which is true as far as anyone has measured and is not
+  established.
+
+A comment is a hypothesis. These two survived a change that falsified them
+because nothing re-reads a comment when the code beneath it moves.
+
+#### Controls
+
+Predicted behaviour-preserving, on the construction argument above rather than
+on the call shape.
+
+| corpus | before | after |
+|---|---:|---:|
+| `examples/09-json-config` | 5,749 | **5,749** |
+| `tests/reexport_private_module` | 2,063 + E0240 | **2,063** + E0240 |
+| `tests/reexport_basic` | 4,153 | **4,153** |
+
+`LOOKUP` 117, `REENTRY` 6, B1 0 and B4 0 on three arms, 178 compile-fail cases,
+38 projects, examples-gate 14 of 14.
+
+#### A fourth instance of the absence that reads as progress, in the instrument
+
+The first reading of those corpora was 2c = **0** on two of the three, against
+baselines of 5,749 and 4,153. Taken at face value that is the falsifier firing
+and the change reverted.
+
+It was the measurement. `cryo build` is incremental, and the gate chain that ran
+immediately before - `make examples`, then `make test` - had just built both
+corpora with the new compiler, so the measuring run compiled nothing and the
+step it counts answered nothing. Clearing the two `build/` directories restores
+5,749 and 4,153 exactly.
+
+The corpus that did NOT move is what identifies it: `reexport_private_module`
+reported 2,063 throughout, because it fails with E0240 and can therefore never
+cache a successful build. A control that cannot be affected by the confound was
+already in the measurement and said so.
+
+Earlier readings in this migration were not affected - they were taken before a
+gate chain had rebuilt the corpora, so the cache was stale against a changed
+compiler and every run recompiled. But the trap is live for anyone measuring
+after a gate run, and it has the shape 8.76 names: 0 rows and 0 work done are
+the same number. **Delete the corpus `build/` directory before counting, or
+count something that cannot be skipped.**
