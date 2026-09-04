@@ -10687,3 +10687,119 @@ tomorrow.
 So the two are separable and should be sequenced that way: the rename is a
 mechanical change with a compile-time falsifier, and the rule is a language
 decision that outlives it.
+
+### 8.73 Decision 3 step 4: `home_module` is an identity, and the seam was un-interning - MEASURED AND FIXED 2026-09-03
+
+8.71 sized step 4 as converting a field that 53 sites write and 86 read, and
+said re-keying `find_module_scope`'s five callers alone "would move the intern
+from callee to caller and change nothing". The first half is right. The second
+is backwards, and reading the five calls rather than counting them is what shows
+it.
+
+#### Two corrections to 8.71, both from reading the calls
+
+`home_module` is **86 references across 15 files**, not 8 - ten holding code and
+five holding only a doc-comment mention.
+
+And the five `find_module_scope` callers do not intern. Four of them already
+hold the identity and UN-INTERN it so the callee can re-intern it:
+
+| caller | passes |
+|---|---|
+| `monomorphizer.cryo` | `intern_table.resolve(entry.module_name)` |
+| `name_resolution.cryo` (two sites) | `intern_table.resolve(q_ns)`, `...(use_ns)` |
+| `sema.cryo` | `intern.resolve(template_mod)` |
+| `types/resolver.cryo` | `ctx.home_module` - the only real string |
+
+`find_module_scope` then opened with `intern_table.lookup(module_name)` to undo
+it. Re-keying removes work at every caller rather than relocating it. That is
+the third time this document has been wrong about a set of call sites from their
+count, and 8.71's own closing line names the failure it then repeated.
+
+#### Why `SymbolStr` and not the step 1 symbol
+
+The identity is the interned module name, not the `SymbolID` of the module
+`Symbol` 8.67 declares. `module_scopes` is already keyed on `SymbolStr.id`,
+`Resolver.current_module` is already a `SymbolStr`, `declare_module_symbol`
+takes one, and `Res::Def` carries one. It is the identity currency this compiler
+already uses, so the field now speaks it. A `SymbolID` would have needed a name
+lookup to serve the one consumer that must produce a qualified name - the E0240
+gate's `decl_index.resolve_qualified_scoped`.
+
+#### The unset test is exact, and a doc comment said otherwise
+
+The field's "no home" test was `home_module.length() == 0`, in two places.
+`InternTable::new` seeds `""` at index 0 and `SymbolStr::empty()` is id 0, so
+`intern("")` returns the empty sentinel and `.length() == 0` is exactly
+`!is_valid()`. Checked before relying on it, because the substitution is the
+whole conversion.
+
+`module_ns_sym_of_file` carried a doc comment claiming the invalid symbol is
+"deliberately distinguishable from the module whose namespace is empty". It is
+not: both are id 0. Nothing declares an empty namespace, so the two cases do not
+both arise - but the comment asserted a property the type does not have, and it
+is corrected here rather than left standing. The part of it that was true and
+load-bearing is kept: test `is_valid()` and fall back explicitly, because
+reading a missing answer as a namespace that compares unequal to every real one
+is the false-positive direction that reverted the visibility gate.
+
+#### What the conversion removed
+
+Seven `resolve`/`intern`/`lookup` round trips, each one a place where an
+identity was flattened to characters so the next layer could re-derive it:
+
+* four `resolve` at the `find_module_scope` callers;
+* the `lookup` inside `find_module_scope`;
+* the `intern(ctx.home_module)` at the E0240 gate;
+* a seventh at `call_resolver.cryo`, `resolve(tmpl.module_name)` feeding
+  `set_home_module`, which the type change surfaced as a compile error.
+
+`CompilationContext::module_ns_of_file` - the string form - is DELETED. Once
+`home_module` stopped being a string it had zero callers in the tree: it existed
+only to build one.
+
+Three producers convert whole, because every use of each fed `home_module` and
+nothing else: `CallResolver::syntax_module_of`, `MethodBinding::owner_module_of`,
+and `home_ns_of` in the three mono files. Two new primitives follow the pattern
+already here - the `SymbolStr` form is the implementation, the string form a
+display wrapper: `ModuleGraph::home_ns_sym_of_file`, which keeps the
+empty-answer policy written once, and `TypeArena::module_ns_sym_of` /
+`type_module_sym`. `home_module_len` becomes `home_module_sym`; a length helper
+is a lie once the field is not a string.
+
+#### The compile errors are the falsifier, and they found the next seam
+
+A missed producer cannot resolve differently - it fails to compile. Six did, in
+two rounds, and five of them were one shape: a single local in
+`call_specializer` feeding BOTH `ResolutionContext.current_module`, still a
+`string`, and `home_module`. Converting the local for one slot broke the other.
+
+So `current_module: string` is the same seam one field up, with 57 construction
+sites. It is named here and not taken: folding it in would have invalidated the
+falsifier this change was verified against. The five sites resolve at the
+`current_module` slot, which leaves the net round-trip count at those sites
+unchanged - the string previously came from `home_ns_of`, which resolved.
+
+#### Controls
+
+Predicted behaviour-preserving. The corpora this work does not edit are exact,
+and were re-taken from a compiler forced to rebuild from an emptied
+`compiler/build` rather than a hoist, because `make cryo` reports "cryo is up to
+date" and skips edits:
+
+| corpus | before | after | diagnostic |
+|---|---:|---:|---|
+| `examples/09-json-config` | 5,749 | **5,749** | none |
+| `tests/reexport_private_module` | 2,063 | **2,063** | E0240, its own assertion |
+| `tests/reexport_basic` | 4,153 | **4,153** | none |
+
+`2c-home-cursor` stays 0 on all three. `compiler/` moves 61,293 -> **61,321**,
+which is 8.67's standing artifact and not a control, because `compiler/`
+compiles its own source. The +28 was checked rather than waved at: the diff adds
+a net 63 written-annotation tokens by a deliberately over-inclusive count, and
+only a fraction of those reach 2c, so the direction and order of magnitude are
+what added source predicts. The corpora above are the control precisely because
+this one cannot be.
+
+`LOOKUP` 117, `REENTRY` 6, B1 0 and B4 0 on three arms, 178 compile-fail cases
+and 38 projects. The compiler build emits 349 warnings before and after.
