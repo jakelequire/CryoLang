@@ -9,7 +9,7 @@
 ///!      from didOpen / didChange).
 ///!   3. From the session's `CompilationContext`, find the module
 ///!      whose `file_path` matches the URI's filesystem path.
-///!   4. Walk that module's AST via `Compiler::AST::NodeLocator` to find
+///!   4. Walk that module's AST via `compiler::ast::node_locator` to find
 ///!      the innermost node covering the cursor (1-based on entry).
 ///!   5. Read the node's `resolved_type` and render it via the type
 ///!      arena's display formatter.
@@ -34,27 +34,27 @@ import std::collections::str;
 import std::collections::string;
 import std::json::value;
 
-import Compiler::CompilationContext;
-import Compiler::AST;
-import Compiler::AST::Node;
-import Compiler::AST::Expression;
-import Compiler::AST::Statement;
-import Compiler::AST::Declaration;
-import Compiler::AST::Pattern;
-import Compiler::AST::NodeLocator;
-import Compiler::Diag::SourceSpan;
-import Compiler::Resolver::Resolver;
-import Compiler::Resolver::Symbol;
-import Compiler::Resolver::SymbolID;
-import Compiler::Resolver::SymbolStr;
-import Compiler::Resolver::InternTable;
-import Compiler::Types::TypeRef;
-import Compiler::Types::Arena;
-import Compiler::Types;
-import Compiler::Types::Type;
-import Compiler::Types::Compound;
-import Compiler::Types::Generic;
-import Compiler::ModuleGraph;
+import compiler::compilation_context;
+import compiler::ast;
+import compiler::ast::node;
+import compiler::ast::expression;
+import compiler::ast::statement;
+import compiler::ast::declaration;
+import compiler::ast::pattern;
+import compiler::ast::node_locator;
+import compiler::diag::source_span;
+import compiler::resolver::resolver;
+import compiler::resolver::symbol;
+import compiler::resolver::symbol_id;
+import compiler::resolver::symbol_str;
+import compiler::resolver::intern_table;
+import compiler::types::type_ref;
+import compiler::types::arena;
+import compiler::types;
+import compiler::types::type_base;
+import compiler::types::compound;
+import compiler::types::generic;
+import compiler::module_graph;
 
 import Lsp::Server::Docs;
 import Lsp::Server::Session;
@@ -145,7 +145,7 @@ public function handle_hover_ex(docs: &Docs, sessions: mut &SessionMap,
         if (mod_idx >= 0) {
             const ast: ProgramNode* = ctx.module_graph.get_module_ast(mod_idx as u32);
             if (ast != null) {
-                node = NodeLocator::find_innermost_node_at(ast, cursor_line, cursor_char);
+                node = node_locator::find_innermost_node_at(ast, cursor_line, cursor_char);
             }
         }
     }
@@ -185,9 +185,9 @@ public function handle_hover_ex(docs: &Docs, sessions: mut &SessionMap,
     eng.verbose = verbose;
 
     // -- Pick a content string and a span for the highlight ---------
-    const name_span: SourceSpan = NodeLocator::name_span_of(node);
+    const name_span: SourceSpan = node_locator::name_span_of(node);
     const on_decl_name: boolean =
-        NodeLocator::span_contains(name_span, cursor_line, cursor_char);
+        node_locator::span_contains(name_span, cursor_line, cursor_char);
 
     mut content: string = "";
     mut hover_span: SourceSpan = node.span;
@@ -218,7 +218,7 @@ public function handle_hover_ex(docs: &Docs, sessions: mut &SessionMap,
             // Reverse-walk to find which struct/class/impl block owns
             // this method so the hover reads `Str::from_raw`, not just
             // `from_raw`.  Empty owner falls through to bare-name form.
-            const owner: SymbolStr = NodeLocator::find_method_owner(
+            const owner: SymbolStr = node_locator::find_method_owner(
                 ctx.module_graph, m);
             const owner_str: string = if (owner.is_valid()) {
                 HoverEngine::leaf_after_separator(ctx.type_arena.intern_table.resolve(owner))
@@ -307,12 +307,12 @@ public function handle_hover_ex(docs: &Docs, sessions: mut &SessionMap,
         // Scope side first.  The member span is checked to break ties on
         // synthetic nodes whose scope/member spans both equal the whole
         // span (there the cursor is treated as on the member).
-        const on_scope: boolean = NodeLocator::span_contains(
+        const on_scope: boolean = node_locator::span_contains(
                 sr.scope_span, cursor_line, cursor_char)
-            && !NodeLocator::span_contains(
+            && !node_locator::span_contains(
                 sr.member_span, cursor_line, cursor_char);
         if (on_scope) {
-            const scope_decl: ASTNode* = NodeLocator::find_type_decl_in_modules(
+            const scope_decl: ASTNode* = node_locator::find_type_decl_in_modules(
                 ctx.module_graph, ctx.intern_table, sr.scope_name);
             if (scope_decl != null) {
                 content    = eng.format_type_decl(scope_decl);
@@ -333,7 +333,7 @@ public function handle_hover_ex(docs: &Docs, sessions: mut &SessionMap,
         }
 
         if (content == "") {
-            const m: MethodNode* = NodeLocator::find_method_in_modules(
+            const m: MethodNode* = node_locator::find_method_in_modules(
                 ctx.module_graph, ctx.intern_table, sr.scope_name, sr.member_name);
             if (m != null && m.func != null) {
                 const owner_str: string = HoverEngine::leaf_after_separator(
@@ -341,7 +341,7 @@ public function handle_hover_ex(docs: &Docs, sessions: mut &SessionMap,
                 content  = eng.format_method_signature_full(m, owner_str);
                 doc_text = m.documentation;
             } else {
-                const f: FunctionDeclNode* = NodeLocator::find_function_in_modules(
+                const f: FunctionDeclNode* = node_locator::find_function_in_modules(
                     ctx.module_graph, sr.member_name);
                 if (f != null) {
                     content  = eng.format_callable_decl(f);
@@ -350,7 +350,7 @@ public function handle_hover_ex(docs: &Docs, sessions: mut &SessionMap,
                     // Enum-variant fallback.  `find_type_decl_in_modules`
                     // already accepts qualified-or-bare names and matches
                     // enum decls; cast and scan variants for the member.
-                    const td: ASTNode* = NodeLocator::find_type_decl_in_modules(
+                    const td: ASTNode* = node_locator::find_type_decl_in_modules(
                         ctx.module_graph, ctx.intern_table, sr.scope_name);
                     if (td != null && td.kind == NodeKind::EnumDeclaration) {
                         const ed: EnumDeclNode* = td as EnumDeclNode*;
@@ -474,7 +474,7 @@ public function handle_hover_ex(docs: &Docs, sessions: mut &SessionMap,
                 // render the method, even on a field read like
                 // `return this.length;` where `length` is the field
                 // and the enclosing function `length()` is unrelated.
-                const is_call: boolean = NodeLocator::is_member_access_callee(
+                const is_call: boolean = node_locator::is_member_access_callee(
                     ctx.module_graph, ma);
 
                 // Generic-param receiver fallback: when the carrier
@@ -491,7 +491,7 @@ public function handle_hover_ex(docs: &Docs, sessions: mut &SessionMap,
                     type_sym, ma.member);
                 if (trait_m != null) {
                     const trait_owner: SymbolStr =
-                        NodeLocator::find_trait_for_function(
+                        node_locator::find_trait_for_function(
                             ctx.module_graph, trait_m);
                     const owner_str: string = if (trait_owner.is_valid()) {
                         HoverEngine::leaf_after_separator(
@@ -500,7 +500,7 @@ public function handle_hover_ex(docs: &Docs, sessions: mut &SessionMap,
                     content  = eng.format_trait_method_signature(
                         trait_m, owner_str);
                     doc_text = trait_m.documentation;
-                    if (NodeLocator::span_contains(
+                    if (node_locator::span_contains(
                             ma.member_span, cursor_line, cursor_char)) {
                         hover_span = ma.member_span;
                     }
@@ -514,13 +514,13 @@ public function handle_hover_ex(docs: &Docs, sessions: mut &SessionMap,
                     // callable.  Fall back to a field of the same
                     // name only if no method matches (rare; would be
                     // a function-pointer-typed field).
-                    const m: MethodNode* = NodeLocator::find_method_in_modules(
+                    const m: MethodNode* = node_locator::find_method_in_modules(
                         ctx.module_graph, ctx.intern_table, type_sym, ma.member);
                     if (m != null && m.func != null) {
                         content  = eng.format_method_signature_full(m, owner_display);
                         doc_text = m.documentation;
                     } else {
-                        const fld: FieldDeclNode* = NodeLocator::find_field_in_modules(
+                        const fld: FieldDeclNode* = node_locator::find_field_in_modules(
                             ctx.module_graph, ctx.intern_table, type_sym, ma.member);
                         if (fld != null) {
                             content  = eng.format_field_decl(fld);
@@ -535,7 +535,7 @@ public function handle_hover_ex(docs: &Docs, sessions: mut &SessionMap,
                     // Methods can also be referenced bare (e.g.
                     // function-pointer assignment of a method) but
                     // the field reading is far more common.
-                    const fld: FieldDeclNode* = NodeLocator::find_field_in_modules(
+                    const fld: FieldDeclNode* = node_locator::find_field_in_modules(
                         ctx.module_graph, ctx.intern_table, type_sym, ma.member);
                     if (fld != null) {
                         content  = eng.format_field_decl(fld);
@@ -544,7 +544,7 @@ public function handle_hover_ex(docs: &Docs, sessions: mut &SessionMap,
                             ma.span.file, cursor_line, cursor_char);
                         doc_text = fld.documentation;
                     } else {
-                        const m: MethodNode* = NodeLocator::find_method_in_modules(
+                        const m: MethodNode* = node_locator::find_method_in_modules(
                             ctx.module_graph, ctx.intern_table, type_sym, ma.member);
                         if (m != null && m.func != null) {
                             content  = eng.format_method_signature(m, owner_display);
@@ -553,7 +553,7 @@ public function handle_hover_ex(docs: &Docs, sessions: mut &SessionMap,
                     }
                 }
 
-                if (content != "" && NodeLocator::span_contains(
+                if (content != "" && node_locator::span_contains(
                         ma.member_span, cursor_line, cursor_char)) {
                     hover_span = ma.member_span;
                 }
@@ -607,7 +607,7 @@ public function handle_hover_ex(docs: &Docs, sessions: mut &SessionMap,
         for (mut gpi: i64 = 0; gpi < impl_blk.generic_params.length; gpi++) {
             const gp: GenericParamNode* = impl_blk.generic_params[gpi];
             if (gp == null) { continue; }
-            if (!NodeLocator::span_contains(gp.span, cursor_line, cursor_char)) {
+            if (!node_locator::span_contains(gp.span, cursor_line, cursor_char)) {
                 continue;
             }
             const leaf: string = ctx.intern_table.resolve(gp.name);
@@ -620,10 +620,10 @@ public function handle_hover_ex(docs: &Docs, sessions: mut &SessionMap,
         // NamedAnnotations, so reuse the same path used for type
         // annotations elsewhere in this file.
         if (content == "" && impl_blk.trait_annotation != null) {
-            const named: NamedAnnotation* = NodeLocator::find_named_annotation_at(
+            const named: NamedAnnotation* = node_locator::find_named_annotation_at(
                 impl_blk.trait_annotation, cursor_line, cursor_char);
             if (named != null) {
-                const decl: ASTNode* = NodeLocator::find_type_decl_in_modules(
+                const decl: ASTNode* = node_locator::find_type_decl_in_modules(
                     ctx.module_graph, ctx.intern_table, named.name);
                 if (decl != null) {
                     content    = eng.format_type_decl(decl);
@@ -636,9 +636,9 @@ public function handle_hover_ex(docs: &Docs, sessions: mut &SessionMap,
         // `parse_implementation_block`; absent on legacy paths
         // (defensive `is_valid` check).
         if (content == "" && impl_blk.target_type_span.has_location()
-                && NodeLocator::span_contains(impl_blk.target_type_span,
+                && node_locator::span_contains(impl_blk.target_type_span,
                                               cursor_line, cursor_char)) {
-            const decl: ASTNode* = NodeLocator::find_type_decl_in_modules(
+            const decl: ASTNode* = node_locator::find_type_decl_in_modules(
                 ctx.module_graph, ctx.intern_table, impl_blk.target_type);
             if (decl != null) {
                 content    = eng.format_type_decl(decl);
@@ -659,7 +659,7 @@ public function handle_hover_ex(docs: &Docs, sessions: mut &SessionMap,
         const named: NamedAnnotation* = eng.static_match_annotation_at(
             node, cursor_line, cursor_char);
         if (named != null) {
-            const decl: ASTNode* = NodeLocator::find_type_decl_in_modules(
+            const decl: ASTNode* = node_locator::find_type_decl_in_modules(
                 ctx.module_graph, ctx.intern_table, named.name);
             if (decl != null) {
                 content    = eng.format_type_decl(decl);
@@ -683,7 +683,7 @@ public function handle_hover_ex(docs: &Docs, sessions: mut &SessionMap,
             for (mut ei: i64 = 0; ei < ep.elements.length; ei++) {
                 const pb: PatternBinding* = ep.binding_at(ei);
                 if (pb == null) { continue; }
-                if (NodeLocator::span_contains(pb.span, cursor_line, cursor_char)) {
+                if (node_locator::span_contains(pb.span, cursor_line, cursor_char)) {
                     content    = eng.format_pattern_binding(ep, ei, pb);
                     hover_span = pb.span;
                     break;
@@ -693,13 +693,13 @@ public function handle_hover_ex(docs: &Docs, sessions: mut &SessionMap,
             // 2/3. Variant vs enum-path token.  Look the enum decl up once;
             //      `Some` renders the variant, `Option` renders the enum.
             if (content == "") {
-                const td: ASTNode* = NodeLocator::find_type_decl_in_modules(
+                const td: ASTNode* = node_locator::find_type_decl_in_modules(
                     ctx.module_graph, ctx.intern_table, ep.enum_name);
                 if (td != null && td.kind == NodeKind::EnumDeclaration) {
                     const ed: EnumDeclNode* = td as EnumDeclNode*;
-                    const on_variant: boolean = NodeLocator::span_contains(
+                    const on_variant: boolean = node_locator::span_contains(
                         ep.variant_span, cursor_line, cursor_char);
-                    if (!on_variant && NodeLocator::span_contains(
+                    if (!on_variant && node_locator::span_contains(
                             ep.enum_span, cursor_line, cursor_char)) {
                         content    = eng.format_type_decl(td);
                         hover_span = ep.enum_span;
@@ -741,7 +741,7 @@ public function handle_hover_ex(docs: &Docs, sessions: mut &SessionMap,
                 }
             }
             if (content == "") {
-                const cv: VarDeclNode* = NodeLocator::find_const_in_modules(
+                const cv: VarDeclNode* = node_locator::find_const_in_modules(
                     ctx.module_graph, pat.binding_name);
                 if (cv != null) {
                     content    = eng.format_variable_decl(cv);
@@ -787,7 +787,7 @@ public function handle_hover_ex(docs: &Docs, sessions: mut &SessionMap,
         if (id_node.name.is_valid() && ctx.intern_table != null) {
             const this_sym: SymbolStr = ctx.intern_table.intern("this");
             if (id_node.name.equals(this_sym)) {
-                const owner: SymbolStr = NodeLocator::find_enclosing_method_owner(
+                const owner: SymbolStr = node_locator::find_enclosing_method_owner(
                     ctx.module_graph, id_node.span.file,
                     id_node.span.start_line, id_node.span.start_col);
                 if (owner.is_valid()) {
@@ -894,7 +894,7 @@ public function handle_hover_ex(docs: &Docs, sessions: mut &SessionMap,
         for (mut ai: i64 = 0; ai < td.assoc_types.length; ai++) {
             const a: AssocTypeDeclNode* = td.assoc_types[ai];
             if (a == null) { continue; }
-            if (NodeLocator::span_contains(a.span, cursor_line, cursor_char)) {
+            if (node_locator::span_contains(a.span, cursor_line, cursor_char)) {
                 content    = eng.format_assoc_type(a);
                 hover_span = a.span;
                 break;
@@ -912,7 +912,7 @@ public function handle_hover_ex(docs: &Docs, sessions: mut &SessionMap,
         const trait_ref_match: SymbolStr = HoverEngine::trait_ref_at_cursor(
             node, cursor_line, cursor_char);
         if (trait_ref_match.is_valid()) {
-            const decl: ASTNode* = NodeLocator::find_type_decl_in_modules(
+            const decl: ASTNode* = node_locator::find_type_decl_in_modules(
                 ctx.module_graph, ctx.intern_table, trait_ref_match);
             if (decl != null) {
                 content    = eng.format_type_decl(decl);
@@ -1014,7 +1014,7 @@ public function handle_hover_ex(docs: &Docs, sessions: mut &SessionMap,
             // `This` token (`ZipIter<This, J>`): explain the implementing
             // type it stands for.  Checked before the named-segment walk,
             // which skips `ThisType` entirely.
-            const this_span: SourceSpan = NodeLocator::find_this_span_at(
+            const this_span: SourceSpan = node_locator::find_this_span_at(
                 ann_root, cursor_line, cursor_char);
             if (this_span.has_location()) {
                 content    = eng.this_reference_type(node);
@@ -1022,11 +1022,11 @@ public function handle_hover_ex(docs: &Docs, sessions: mut &SessionMap,
             }
 
             const named: NamedAnnotation* = if (content == "") {
-                NodeLocator::find_named_annotation_at(
+                node_locator::find_named_annotation_at(
                     ann_root, cursor_line, cursor_char)
             } else { null };
             if (named != null) {
-                const decl: ASTNode* = NodeLocator::find_type_decl_in_modules(
+                const decl: ASTNode* = node_locator::find_type_decl_in_modules(
                     ctx.module_graph, ctx.intern_table, named.name);
                 if (decl != null) {
                     content    = eng.format_type_decl(decl);
@@ -1056,7 +1056,7 @@ public function handle_hover_ex(docs: &Docs, sessions: mut &SessionMap,
         }
 
         if (content == "") {
-            const ty: TypeRef = NodeLocator::resolved_type_of(node);
+            const ty: TypeRef = node_locator::resolved_type_of(node);
             if (!ty.is_valid()) { return JsonValue::Null; }
             const type_name: string = ctx.type_arena.resolve_display_name_short(ty.id);
             if (type_name == "") { return JsonValue::Null; }
@@ -1070,7 +1070,7 @@ public function handle_hover_ex(docs: &Docs, sessions: mut &SessionMap,
             // enclosing decl.
             const ann_span: SourceSpan = HoverEngine::annotation_span_at_cursor(
                 node, cursor_line, cursor_char);
-            if (NodeLocator::span_contains(ann_span, cursor_line, cursor_char)) {
+            if (node_locator::span_contains(ann_span, cursor_line, cursor_char)) {
                 hover_span = ann_span;
             }
         }
@@ -1283,14 +1283,14 @@ type struct HoverEngine {
     /// hovers, which previously each re-implemented the trait check.
     format_callable_decl(&this, func: FunctionDeclNode*) -> string {
         if (func == null) { return ""; }
-        const trait_owner: SymbolStr = NodeLocator::find_trait_for_function(
+        const trait_owner: SymbolStr = node_locator::find_trait_for_function(
             this.graph, func);
         if (trait_owner.is_valid()) {
             const owner_str: string = HoverEngine::leaf_after_separator(
                 this.intern.resolve(trait_owner));
             return this.format_trait_method_signature(func, owner_str);
         }
-        const eb: ExternBlockNode* = NodeLocator::find_extern_block_for_function(
+        const eb: ExternBlockNode* = node_locator::find_extern_block_for_function(
             this.graph, func);
         if (eb != null) {
             return this.format_extern_function_signature(func, eb);
@@ -1886,14 +1886,14 @@ type struct HoverEngine {
                 const ib: ImplBlockNode* = stmt as ImplBlockNode*;
                 // The impl's span covers head-through-closing-brace, so a
                 // cursor anywhere inside a method body maps to this impl.
-                if (!NodeLocator::span_contains(ib.span, line, col)) { continue; }
+                if (!node_locator::span_contains(ib.span, line, col)) { continue; }
                 const s: string = this.render_where_for_param(&ib.where_bounds, pname);
                 if (s != "") { return s; }
                 // A method may add its own `where` on top of the impl's.
                 for (mut mi: i64 = 0; mi < ib.methods.length; mi++) {
                     const m: MethodNode* = ib.methods[mi];
                     if (m == null || m.func == null) { continue; }
-                    if (!NodeLocator::span_contains(m.span, line, col)) { continue; }
+                    if (!node_locator::span_contains(m.span, line, col)) { continue; }
                     const ms: string = this.render_where_for_param(
                         &m.func.trait_bounds, pname);
                     if (ms != "") { return ms; }
@@ -1902,7 +1902,7 @@ type struct HoverEngine {
             }
             if (stmt.kind == NodeKind::FunctionDeclaration) {
                 const f: FunctionDeclNode* = stmt as FunctionDeclNode*;
-                if (!NodeLocator::span_contains(f.span, line, col)) { continue; }
+                if (!node_locator::span_contains(f.span, line, col)) { continue; }
                 const s: string = this.render_where_for_param(&f.trait_bounds, pname);
                 if (s != "") { return s; }
             }
@@ -1939,7 +1939,7 @@ type struct HoverEngine {
             f = (node as MethodNode*).func;
         }
         if (f != null) {
-            const trait_owner: SymbolStr = NodeLocator::find_trait_for_function(
+            const trait_owner: SymbolStr = node_locator::find_trait_for_function(
                 this.graph, f);
             if (trait_owner.is_valid()) {
                 return "This: " + HoverEngine::leaf_after_separator(
@@ -1947,7 +1947,7 @@ type struct HoverEngine {
             }
         }
         if (node.kind == NodeKind::MethodDeclaration) {
-            const owner: SymbolStr = NodeLocator::find_method_owner(
+            const owner: SymbolStr = node_locator::find_method_owner(
                 this.graph, node as MethodNode*);
             if (owner.is_valid()) {
                 return "This = " + HoverEngine::leaf_after_separator(
@@ -1972,7 +1972,7 @@ type struct HoverEngine {
                 HoverEngine::generic_params_of_decl(node), name)) {
             return true;
         }
-        const f: FunctionDeclNode* = NodeLocator::find_enclosing_function(
+        const f: FunctionDeclNode* = node_locator::find_enclosing_function(
             this.graph, file, line, col);
         if (f != null && HoverEngine::param_list_has(&f.generic_params, name)) {
             return true;
@@ -1984,7 +1984,7 @@ type struct HoverEngine {
         for (mut si: i64 = 0; si < ast.statements.length; si++) {
             const stmt: ASTNode* = HoverEngine::unwrap_top_decl(ast.statements[si]);
             if (stmt == null) { continue; }
-            if (!NodeLocator::span_contains(stmt.span, line, col)) { continue; }
+            if (!node_locator::span_contains(stmt.span, line, col)) { continue; }
             if (HoverEngine::param_list_has(
                     HoverEngine::generic_params_of_decl(stmt), name)) {
                 return true;
@@ -2205,7 +2205,7 @@ type struct HoverEngine {
                            pb: PatternBinding*) -> string {
         if (pb == null) { return ""; }
         mut s: string = this.intern.resolve(pb.name);
-        const td: ASTNode* = NodeLocator::find_type_decl_in_modules(
+        const td: ASTNode* = node_locator::find_type_decl_in_modules(
             this.graph, this.intern, ep.enum_name);
         if (td != null && td.kind == NodeKind::EnumDeclaration) {
             const ed: EnumDeclNode* = td as EnumDeclNode*;
@@ -2227,7 +2227,7 @@ type struct HoverEngine {
     /// function or no matching parameter.
     identifier_as_param(&this, name: SymbolStr, file: string,
                         line: u32, col: u32) -> string {
-        const f: FunctionDeclNode* = NodeLocator::find_enclosing_function(
+        const f: FunctionDeclNode* = node_locator::find_enclosing_function(
             this.graph, file, line, col);
         if (f == null) { return ""; }
         for (mut i: i64 = 0; i < f.parameters.length; i++) {
@@ -2301,7 +2301,7 @@ type struct HoverEngine {
         const ast: ProgramNode* = this.graph.get_module_ast(mod_idx as u32);
         if (ast == null) { return null; }
 
-        const node: ASTNode* = NodeLocator::find_innermost_node_at(
+        const node: ASTNode* = node_locator::find_innermost_node_at(
             ast, decl_span.start_line, decl_span.start_col);
         if (node == null) { return null; }
         if (node.kind != NodeKind::VariableDeclaration) { return null; }
@@ -2333,7 +2333,7 @@ type struct HoverEngine {
         // impl's `where_bounds`, not the `next` method's own (empty) ones.
 
         // 1. Enclosing function/method's own trait bounds.
-        const fdecl: FunctionDeclNode* = NodeLocator::find_enclosing_function(
+        const fdecl: FunctionDeclNode* = node_locator::find_enclosing_function(
             this.graph, file_path, line, character);
         if (fdecl != null) {
             const f: FunctionDeclNode* = this.trait_method_from_bounds(
@@ -2354,7 +2354,7 @@ type struct HoverEngine {
                         if (stmt == null) { continue; }
                         if (stmt.kind != NodeKind::ImplementationBlock) { continue; }
                         const ib: ImplBlockNode* = stmt as ImplBlockNode*;
-                        if (!NodeLocator::span_contains(ib.span, line, character)) {
+                        if (!node_locator::span_contains(ib.span, line, character)) {
                             continue;
                         }
                         const f: FunctionDeclNode* = this.trait_method_from_bounds(
@@ -2381,7 +2381,7 @@ type struct HoverEngine {
                 const tref: &TraitRef = &b.trait_refs[ti];
                 if (tref.path.length == 0) { continue; }
                 const trait_leaf: SymbolStr = tref.path[tref.path.length - 1];
-                const f: FunctionDeclNode* = NodeLocator::find_trait_method_in_modules(
+                const f: FunctionDeclNode* = node_locator::find_trait_method_in_modules(
                     this.graph, this.intern, trait_leaf, method_name);
                 if (f != null) { return f; }
             }
@@ -2420,7 +2420,7 @@ type struct HoverEngine {
         if (id.name.is_valid() && this.intern != null) {
             const this_sym: SymbolStr = this.intern.intern("this");
             if (id.name.equals(this_sym) && id.span.has_location()) {
-                return NodeLocator::find_enclosing_method_owner(
+                return node_locator::find_enclosing_method_owner(
                     this.graph, id.span.file,
                     id.span.start_line, id.span.start_col);
             }
@@ -2461,7 +2461,7 @@ type struct HoverEngine {
             const this_sym: SymbolStr = this.intern.intern("this");
             if (base_id.name.is_valid() && base_id.name.equals(this_sym)
                     && base_id.span.has_location()) {
-                owner = NodeLocator::find_enclosing_method_owner(
+                owner = node_locator::find_enclosing_method_owner(
                     this.graph, base_id.span.file,
                     base_id.span.start_line, base_id.span.start_col);
             } else {
@@ -2471,7 +2471,7 @@ type struct HoverEngine {
         }
         if (!owner.is_valid()) { return SymbolStr::empty(); }
 
-        const fld: FieldDeclNode* = NodeLocator::find_field_in_modules(
+        const fld: FieldDeclNode* = node_locator::find_field_in_modules(
             this.graph, this.intern, owner, inner.member);
         if (fld == null || fld.type_annotation == null) {
             return SymbolStr::empty();
@@ -2542,7 +2542,7 @@ type struct HoverEngine {
                       arms: &StaticMatchArmNode*[], line: u32,
                       col: u32) -> NamedAnnotation* {
         if (scrutinee != null) {
-            const n: NamedAnnotation* = NodeLocator::find_named_annotation_at(
+            const n: NamedAnnotation* = node_locator::find_named_annotation_at(
                 scrutinee, line, col);
             if (n != null) { return n; }
         }
@@ -2550,7 +2550,7 @@ type struct HoverEngine {
             const arm: StaticMatchArmNode* = arms[i];
             if (arm == null) { continue; }
             for (mut j: i64 = 0; j < arm.type_patterns.length; j++) {
-                const n: NamedAnnotation* = NodeLocator::find_named_annotation_at(
+                const n: NamedAnnotation* = node_locator::find_named_annotation_at(
                     arm.type_patterns[j], line, col);
                 if (n != null) { return n; }
             }
@@ -2599,7 +2599,7 @@ type struct HoverEngine {
         // resolved type is an InstantiatedType wrapping a spec that already
         // carries its args in the display name.
         if (type_sym.is_valid() && this.graph != null && this.intern != null) {
-            const decl: ASTNode* = NodeLocator::find_type_decl_in_modules(
+            const decl: ASTNode* = node_locator::find_type_decl_in_modules(
                 this.graph, this.intern, type_sym);
             if (decl != null) {
                 const nm: SymbolStr = HoverEngine::decl_type_name(decl);
@@ -2665,7 +2665,7 @@ type struct HoverEngine {
         const ast: ProgramNode* = this.graph.get_module_ast(mod_idx as u32);
         if (ast == null) { return null; }
 
-        const node: ASTNode* = NodeLocator::find_innermost_node_at(
+        const node: ASTNode* = node_locator::find_innermost_node_at(
             ast, decl_span.start_line, decl_span.start_col);
         if (node == null) { return null; }
         if (node.kind != NodeKind::FunctionDeclaration) { return null; }
@@ -2706,11 +2706,11 @@ type struct HoverEngine {
     /// fallback in `format_namespace_overview` produces useful output.
     resolve_namespace_path(&this, literal: string) -> string {
         if (this.graph == null) { return literal; }
-        if (NodeLocator::find_program_by_namespace(this.graph, literal) != null) {
+        if (node_locator::find_program_by_namespace(this.graph, literal) != null) {
             return literal;
         }
         const std_path: string = "std::" + literal;
-        if (NodeLocator::find_program_by_namespace(this.graph, std_path) != null) {
+        if (node_locator::find_program_by_namespace(this.graph, std_path) != null) {
             return std_path;
         }
         // Neither namespace is loaded - pick whichever has descendants
@@ -2760,7 +2760,7 @@ type struct HoverEngine {
     /// this namespace" view from already-parsed source.
     format_namespace_overview(&this, path: string) -> string {
         mut sig: string = "namespace " + path + ";";
-        const prog: ProgramNode* = NodeLocator::find_program_by_namespace(this.graph, path);
+        const prog: ProgramNode* = node_locator::find_program_by_namespace(this.graph, path);
 
         if (prog != null) {
             mut had_modules: boolean = false;
@@ -2825,7 +2825,7 @@ type struct HoverEngine {
     /// identification `format_namespace_overview` uses to *skip* it).
     /// Empty string when the namespace isn't loaded or has no banner.
     namespace_doc_for_path(&this, path: string) -> string {
-        const prog: ProgramNode* = NodeLocator::find_program_by_namespace(this.graph, path);
+        const prog: ProgramNode* = node_locator::find_program_by_namespace(this.graph, path);
         if (prog == null) { return ""; }
         for (mut i: i64 = 0; i < prog.statements.length; i++) {
             const stmt: ASTNode* = HoverEngine::unwrap_top_decl(prog.statements[i]);
@@ -2883,7 +2883,7 @@ type struct HoverEngine {
         if (sl == null) { return result; }
 
         // Look up the struct/class decl whose name appears at the head.
-        const decl: ASTNode* = NodeLocator::find_type_decl_in_modules(
+        const decl: ASTNode* = node_locator::find_type_decl_in_modules(
             this.graph, this.intern, sl.struct_type);
 
         // Field-name dispatch.  For each field-init, the name occupies
@@ -2952,7 +2952,7 @@ type struct HoverEngine {
 
     /// Return everything after the final `::` in `s`, or `s` itself when
     /// there's no `::`.  Mirrors `extract_leaf_segment` in
-    /// `Compiler::Types::Arena` - duplicated here to avoid the cross-
+    /// `compiler::types::arena` - duplicated here to avoid the cross-
     /// module import for one tiny string helper.
     static leaf_after_separator(s: string) -> string {
         const len: i64 = strlen(s) as i64;
@@ -2973,7 +2973,7 @@ type struct HoverEngine {
     /// on a type token that isn't its own AST node.
     static annotation_span_at_cursor(node: ASTNode*, line: u32, ch: u32) -> SourceSpan {
         const ann: TypeAnnotation* = HoverEngine::annotation_for_decl(node);
-        return NodeLocator::annotation_span(ann);
+        return node_locator::annotation_span(ann);
     }
 
     /// Scan a FunctionDeclNode or MethodNode's `trait_bounds[]` for a
@@ -2989,7 +2989,7 @@ type struct HoverEngine {
             const b: &TraitBound = &(*bounds)[bi];
             for (mut ti: i64 = 0; ti < b.trait_refs.length; ti++) {
                 const tref: &TraitRef = &b.trait_refs[ti];
-                if (!NodeLocator::span_contains(tref.span, line, character)) { continue; }
+                if (!node_locator::span_contains(tref.span, line, character)) { continue; }
                 if (tref.path.length == 0) { continue; }
                 return tref.path[tref.path.length - 1];
             }
@@ -3006,7 +3006,7 @@ type struct HoverEngine {
             const b: &TraitBound = &(*bounds)[bi];
             for (mut ti: i64 = 0; ti < b.trait_refs.length; ti++) {
                 const tref: &TraitRef = &b.trait_refs[ti];
-                if (NodeLocator::span_contains(tref.span, line, character)) {
+                if (node_locator::span_contains(tref.span, line, character)) {
                     return tref.span;
                 }
             }
@@ -3033,7 +3033,7 @@ type struct HoverEngine {
                 b.span.file,
                 b.span.start_line, b.span.start_col,
                 first.span.start_line, first.span.start_col);
-            if (NodeLocator::span_contains(param_span, line, character)) {
+            if (node_locator::span_contains(param_span, line, character)) {
                 return param_span;
             }
         }
@@ -3051,7 +3051,7 @@ type struct HoverEngine {
                 b.span.file,
                 b.span.start_line, b.span.start_col,
                 first.span.start_line, first.span.start_col);
-            if (NodeLocator::span_contains(param_span, line, character)) {
+            if (node_locator::span_contains(param_span, line, character)) {
                 return b.type_parameter;
             }
         }
@@ -3200,18 +3200,18 @@ type struct HoverEngine {
         if (node == null) { return false; }
         // Declared name (function / method / variable / parameter / field /
         // struct / ... - name_span_of covers every declaration kind).
-        const nspan: SourceSpan = NodeLocator::name_span_of(node);
-        if (NodeLocator::span_contains(nspan, cline, cchar)) { return true; }
+        const nspan: SourceSpan = node_locator::name_span_of(node);
+        if (node_locator::span_contains(nspan, cline, cchar)) { return true; }
         // Identifier use (`return default;`, `pred(value)`).
         if (node.kind == NodeKind::Identifier) {
             const id: IdentifierNode* = node as IdentifierNode*;
-            if (NodeLocator::span_contains(id.span, cline, cchar)) { return true; }
+            if (node_locator::span_contains(id.span, cline, cchar)) { return true; }
         }
         // `import A::B::C;` path segment.
         if (node.kind == NodeKind::ImportDeclaration) {
             const imp: ImportDeclNode* = node as ImportDeclNode*;
             for (mut i: i64 = 0; i < imp.path_segment_spans.length; i++) {
-                if (NodeLocator::span_contains(imp.path_segment_spans[i], cline, cchar)) {
+                if (node_locator::span_contains(imp.path_segment_spans[i], cline, cchar)) {
                     return true;
                 }
             }
@@ -3220,7 +3220,7 @@ type struct HoverEngine {
         if (node.kind == NodeKind::ModuleDeclaration) {
             const md: ModuleDeclNode* = node as ModuleDeclNode*;
             for (mut i: i64 = 0; i < md.path_segment_spans.length; i++) {
-                if (NodeLocator::span_contains(md.path_segment_spans[i], cline, cchar)) {
+                if (node_locator::span_contains(md.path_segment_spans[i], cline, cchar)) {
                     return true;
                 }
             }
@@ -3302,7 +3302,7 @@ type struct HoverEngine {
     static import_segment_at(imp: ImportDeclNode*, line: u32, ch: u32) -> i64 {
         if (imp == null) { return -1 as i64; }
         for (mut i: i64 = 0; i < imp.path_segment_spans.length; i++) {
-            if (NodeLocator::span_contains(imp.path_segment_spans[i], line, ch)) {
+            if (node_locator::span_contains(imp.path_segment_spans[i], line, ch)) {
                 return i;
             }
         }
@@ -3317,7 +3317,7 @@ type struct HoverEngine {
     static module_decl_segment_at(md: ModuleDeclNode*, line: u32, ch: u32) -> i64 {
         if (md == null) { return -1 as i64; }
         for (mut i: i64 = 0; i < md.path_segment_spans.length; i++) {
-            if (NodeLocator::span_contains(md.path_segment_spans[i], line, ch)) {
+            if (node_locator::span_contains(md.path_segment_spans[i], line, ch)) {
                 return i;
             }
         }

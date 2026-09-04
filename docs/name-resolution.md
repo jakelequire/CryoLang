@@ -10803,3 +10803,149 @@ this one cannot be.
 
 `LOOKUP` 117, `REENTRY` 6, B1 0 and B4 0 on three arms, 178 compile-fail cases
 and 38 projects. The compiler build emits 349 warnings before and after.
+
+### 8.74 The qualifier change is a rename, and a module-qualified path has four meanings - MEASURED AND FIXED 2026-09-03
+
+8.72 sized dropping the shorthand as "about 357 edited lines plus 75 file-level
+renames", on the finding that `import M;` binds a type's leaf so `Leaf::Member`
+call sites do not move. The finding holds. The sizing does not, and neither do
+two claims 8.67 made about what resolves today.
+
+#### What the population actually is
+
+| | 8.72 said | measured |
+|---|---:|---:|
+| `namespace` declarations colliding with a type they declare | 75 | **76** |
+| `import`/`export` lines naming one | 282 across 114 files | **496 across 138 files** |
+| module-qualified free-fn/const call sites | not measured | **132 across 13 files** |
+
+The third is the one that changes the shape of the work. "The call sites do not
+move" is true of `Leaf::Member` where `Leaf` is a TYPE. Ten of the 76 modules
+also declare FREE functions, which are called through the MODULE's leaf -
+`ModuleGraph::home_ns_of_file`, `NodeLocator::annotation_span`. Those move.
+
+Two 8.67 claims are also wrong, both generalised from one module:
+
+* "There is no spelling of the module, then the type that resolves today" -
+  there are **110** in code. `CLI::Runner::new(...)` is module, then type, then
+  method, sixteen times.
+* "A plain `import` binds a module's exports and never the module's own name" -
+  measured on scratch projects with a negative control: `import Scratch::my_mod;`
+  then `my_mod::add(1, 2)` compiles AND RUNS, returning 3; removing only the
+  import gives `error[E0233]: cannot find my_mod::add`. A module's own leaf IS
+  usable as a qualifier for its free functions. Had it not been, the rename
+  would have left those call sites with no valid spelling.
+
+#### The scope taken
+
+All 165 `compiler/src` namespaces, whole path, to match stdlib - which is
+already 154 of 154 snake_case, so no user-visible import changes. Only 76 of the
+165 carry a collision; renaming just those would have left 89 PascalCase
+namespaces beside them and required a second pass over the same files.
+
+Two cannot take their mechanical name because it lexes as a KEYWORD, checked
+against the lexer's table rather than by eye:
+
+    Compiler::Types::Type         -> compiler::types::type_base
+    Compiler::Resolver::Namespace -> compiler::resolver::namespace_kind
+
+Everything else maps with zero segment collisions, zero full-path collisions and
+no clash against any stdlib namespace. 74 of 76 file basenames already equalled
+the snake form: the file convention was already snake_case and only the
+`namespace` line had drifted.
+
+#### A module-qualified path has four meanings, and two of them move
+
+This is what the mechanical change actually has to distinguish:
+
+| form | example | moves |
+|---|---|---|
+| module + free function | `NodeLocator::annotation_span` | yes |
+| module + type | `ResolveCounter::Site` | yes |
+| type + static method | `NodeLocator::walk_node` | **no** - the type keeps its name |
+| enum variant or plain identifier | `LogComponent::CLI` | **no** - never a module |
+
+`NodeLocator` produces two of the four in ONE file. The rule that separates them
+is structural rather than a guess: a leaf that is not a type name anywhere is
+unambiguously a module, so `Leaf::` rewrites blanket; a leaf that IS a type name
+somewhere needs the module's declaration list, extracted with brace-depth
+tracking so a type body's methods are never collected. Multi-segment paths move
+wherever they appear; single-segment names - `Main`, `CLI`, `Compiler`, `Utils` -
+are ordinary identifiers too and move only in a path position.
+
+#### A green build was not evidence
+
+The transformer took five corrections. Four announced themselves as compile
+errors, which is the falsifier 8.72 promised. The fifth did not, and it is the
+one worth recording.
+
+The type-name population was computed over `compiler/src`, `stdlib` and `tools`;
+the rewrite was applied to the whole repository. A test file declaring its own
+`type struct Sink` was invisible to the question and visible to the rewrite. The
+result: **110 files wrongly rewritten** across `examples/`, `legacy/bootstrap`
+and `tests/` - and the build went green, all three unedited corpora were EXACT,
+`LOOKUP` was 117 and B1/B4 were 0 on three arms.
+
+None of those gates compile `examples/` or `legacy/`, so their agreement was a
+statement about a population that excluded every damaged file. Only `make test`
+saw it, as `error[E0233]: cannot find sink::new`. This is the same shape as the
+agreement figure that could only see rows the lane already answered.
+
+The fix is scope, not a larger type list: only `compiler/src` and `tools` can
+name a compiler namespace. Checked rather than assumed - the eight outside files
+that appear to `import Utils;` are legacy test projects importing their own
+local `namespace Utils;`.
+
+#### Mangled names embed the module path, so every cached object is stale
+
+The LSP link failed with undefined references carrying BOTH spellings inside one
+symbol:
+
+    ...$L8Compiler.7Codegen.6Passes.13EmitWorkerCtx...   stale std/thread.o
+    ...$L8compiler.7codegen.6passes.13EmitWorkerCtx...   fresh instance.o
+
+A generic instantiation carries the instantiating type's module path in its
+mangled name, so a rename invalidates every object built before it and an
+incremental build links the two spellings against each other. `compiler/build`
+had already been emptied - to defeat `make cryo` reporting "cryo is up to date"
+and skipping the edits - or it would have hit the same wall. Any build tree
+carried across this commit must be cleaned, `make pin` and `selfhost-check`
+included.
+
+#### Controls
+
+177 files, +2,125 / -2,125 - exactly symmetric, which is what a pure rename
+looks like: every changed line is a substitution. Nothing outside `compiler/src`
+and `tools`. Measured from a compiler forced to rebuild rather than hoisted.
+
+The three corpora cannot drift, because nothing they compile was edited, so any
+movement in them would be a defect rather than an artifact:
+
+| corpus | before | after |
+|---|---:|---:|
+| `examples/09-json-config` | 5,749 | **5,749** |
+| `tests/reexport_private_module` | 2,063 + E0240 | **2,063** + E0240 |
+| `tests/reexport_basic` | 4,153 | **4,153** |
+
+`LOOKUP` 117, `REENTRY` 6, B1 0 and B4 0 on three arms, 178 compile-fail cases,
+38 projects, 349 compiler warnings before and after.
+
+`compiler/` was predicted to MOVE - it is the only corpus that compiles the
+edited source, and removing a module/type collision could plausibly reroute a
+resolution. It does not move: **61,321 before and after**, `2c-home-cursor` 0.
+
+That is the more useful result. A rename changes the SPELLING of a module name
+and nothing else: the count and structure of annotations is untouched, every
+type leaf is still bound by the same import, and every module-qualified path
+still names the same module. The collision was a hazard in what a reader and a
+future resolver could write, not a mechanism anything was resolving THROUGH.
+Which is also why mechanical substitution compiled once the four meanings of
+`Leaf::` were separated.
+
+`make lsp`: 0 compile errors, 481 warnings, and the link succeeds. Only the
+hoist copy fails, because a `cryolsp.exe` was running and holds that path. The
+LSP is in no local gate and 12 of its files name renamed modules, so it is
+verified here explicitly.
+
+`examples/` swept by hand, **14 of 14** - `make examples` is a no-op on Windows
+that exits 0, and this is the sweep that would have caught the 110 files.

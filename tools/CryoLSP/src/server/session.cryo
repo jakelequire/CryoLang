@@ -39,10 +39,10 @@ import std::collections::hashmap;
 
 import std::alloc::arena;
 
-import Compiler::CompileMode;
-import Compiler::CompilationContext;
-import Compiler::Instance;
-import Compiler::Codegen::AstArena;
+import compiler::compile_mode;
+import compiler::compilation_context;
+import compiler::instance;
+import compiler::codegen::ast_arena;
 
 import Lsp::Protocol::Conv;
 import Lsp::Server::Docs;
@@ -56,7 +56,7 @@ import Lsp::Server::Docs;
 // hover / go-to-def on an already-compiled file answer instantly, with no
 // re-parse, even after edits to other files.  Before compiling OR reading a
 // session, the daemon makes that session's arena the current one via
-// `AstArena::cryo_ast_arena_set_current` (see the note there on why reads must
+// `ast_arena::cryo_ast_arena_set_current` (see the note there on why reads must
 // publish too: `GlobalAlloc`'s free/realloc key on the published arena).
 //
 // A single shared arena would need a per-recompile reset guarded by a
@@ -125,7 +125,7 @@ type struct CompilerSession {
             // so freeing a still-published arena makes the next `free`
             // anywhere in the process a wild read - and in `drop` that next
             // free is a few lines below, dropping this session's own buffers.
-            AstArena::cryo_ast_arena_retract(this.arena);
+            ast_arena::cryo_ast_arena_retract(this.arena);
             // `ctx` and every container it owns live inside this arena, so
             // releasing the chunks frees them all at once; free the Arena
             // struct itself (libc-allocated, see `recompile`) afterwards.
@@ -203,13 +203,13 @@ type struct CompilerSession {
         // recompile footprint is stable and the chunks are reused cleanly (no
         // capacity creep - that only happened when one shared arena hosted
         // differently-sized projects back to back).
-        AstArena::cryo_ast_arena_set_current(this.arena);
+        ast_arena::cryo_ast_arena_set_current(this.arena);
         this.arena.reset();
         // ACTIVATE routing so the `CompilationContext::new` below - and
         // everything the compile allocates - is arena-backed rather than libc.
         // Deactivated before returning so per-request handler allocations
         // (hover/completion strings) land in libc and are freed as usual.
-        AstArena::cryo_alloc_arena_set_active(true);
+        ast_arena::cryo_alloc_arena_set_active(true);
 
         // Allocate a fresh CompilationContext on the heap with mode=Lsp.  With
         // routing active this - and the whole context - lands in `this.arena`.
@@ -231,14 +231,14 @@ type struct CompilerSession {
             // now and the next recompile use libc (and are freed as usual),
             // leaving the arena holding only this compile's ctx for the handlers
             // to walk until the next recompile's reset reclaims it.
-            AstArena::cryo_alloc_arena_set_active(false);
+            ast_arena::cryo_alloc_arena_set_active(false);
             return r_sf;
         }
 
         const config_cstr: string = this.config_buf.as_ptr() as string;
         mut r_proj: CompilationResult = this.instance.compile_for_lsp_project_into(
             this.ctx, config_cstr, path_cstr, content_cstr);
-        AstArena::cryo_alloc_arena_set_active(false);
+        ast_arena::cryo_alloc_arena_set_active(false);
         return r_proj;
     }
 }
@@ -430,7 +430,7 @@ type struct SessionMap {
             // or read of another document may have made a different arena
             // current) so pointers in `ctx` are the ones `holds()` recognises.
             if (session.arena != null) {
-                AstArena::cryo_ast_arena_set_current(session.arena);
+                ast_arena::cryo_ast_arena_set_current(session.arena);
             }
             this.touch_live(uri);
             return session;

@@ -10,27 +10,27 @@
 ///! Design note: Reuses the existing TypeAnnotation enum from AST/_module.cryo
 ///! directly, avoiding parallel definitions.
 
-namespace Compiler::Types::Resolver;
+namespace compiler::types::resolver;
 
-import Compiler::Diag;
-import Compiler::Diag::{ Sink, Diagnostic, SourceSpan };
-import Compiler::Types::{
-    Arena, TypeRef, GenericRegistry, Registry, Inference, Ownership, TypeKind, RefMutability
+import compiler::diag;
+import compiler::diag::{ sink, diagnostic, source_span };
+import compiler::types::{
+    arena, type_ref, generic_registry, registry, inference, ownership, TypeKind, RefMutability
 };
-import Compiler::AST;
-import Compiler::AST::{ Node, Declaration, Statement, Expression };
-import Compiler::Resolver::{ SymbolStr, InternTable, Resolver };
-import Compiler::DeclIndex;
-import Compiler::ConstTable;
-import Compiler::ModuleGraph;
-import Compiler::ResolveCounter;
-import Utils::Logger;
+import compiler::ast;
+import compiler::ast::{ node, declaration, statement, expression };
+import compiler::resolver::{ symbol_str, intern_table, resolver };
+import compiler::decl_index;
+import compiler::const_table;
+import compiler::module_graph;
+import compiler::resolve_counter;
+import utils::logger;
 import std::collections::pair;
-import Compiler::Resolver::Scope;
-import Compiler::Resolver::Res;
-import Compiler::Types::Compound;
-import Compiler::Types::Type;
-import Compiler::Types::UserDefined;
+import compiler::resolver::scope;
+import compiler::resolver::res;
+import compiler::types::compound;
+import compiler::types::type_base;
+import compiler::types::user_defined;
 
 
 // ResolutionContext: context for type resolution
@@ -179,7 +179,7 @@ type struct ResolutionContext {
     /// event can.
     set_home_module(mut &this, module_ns: SymbolStr, origin: HomeOrigin) -> void {
         if (!module_ns.is_valid() && origin != HomeOrigin::Unset) {
-            ResolveCounter::home_empty(this.origin_file, this.origin_line,
+            resolve_counter::home_empty(this.origin_file, this.origin_line,
                                        origin.display_name());
         }
         this.home_module = module_ns;
@@ -633,7 +633,7 @@ type struct TypeResolver {
             // which carries no module at all.
             mut bctx: ResolutionContext = ResolutionContext::new(
                 FILE, LINE, "", "",
-                ModuleGraph::home_ns_sym_of_file(this.module_graph,
+                module_graph::home_ns_sym_of_file(this.module_graph,
                                                  impl_node.span.file),
                 HomeOrigin::Syntax);
             if (impl_node.target_args.length == base_args.length) {
@@ -1230,7 +1230,7 @@ type struct TypeResolver {
         for (mut k: i64 = 0; k < gp.constraints.length; k++) {
             const trait_ref: TypeRef = this.arena.lookup_by_leaf(gp.constraints[k].written_leaf());
             if (trait_ref.is_valid()) {
-                ResolveCounter::Site::LeafViaResolverBound.bump();
+                resolve_counter::Site::LeafViaResolverBound.bump();
                 bounds.push(trait_ref);
             }
         }
@@ -1281,8 +1281,8 @@ type struct TypeResolver {
                 // home the CALLER handed in and binds per-caller.  Named, not
                 // just counted: the missing owner is a property of one template
                 // and only its name says which registration dropped it.
-                ResolveCounter::Site::DefaultArgNoOwner.bump();
-                ResolveCounter::default_arg_no_owner(
+                resolve_counter::Site::DefaultArgNoOwner.bump();
+                resolve_counter::default_arg_no_owner(
                     this.intern_table.resolve(entry.name),
                     this.intern_table.resolve(def_ctx.home_module));
             }
@@ -1448,7 +1448,7 @@ type struct TypeResolver {
     resolve_named_at_span(&this, name: SymbolStr, span: SourceSpan,
                           ctx: ResolutionContext*, slot: ResSlot) -> TypeRef {
         if (ctx == null) { return this.resolve_named(name, ctx, slot, span); }
-        const ann_ns: SymbolStr = ModuleGraph::home_ns_sym_of_file(
+        const ann_ns: SymbolStr = module_graph::home_ns_sym_of_file(
             this.module_graph, span.file);
         if (!ann_ns.is_valid() || ann_ns.equals(ctx.home_module)) {
             return this.resolve_named(name, ctx, slot, span);
@@ -1498,7 +1498,7 @@ private:
     /// a wrong bind is a statement about one name.
     rn_trace(&this, step: string, name_str: string, ctx: ResolutionContext*,
              result: TypeRef) -> void {
-        if (!ResolveCounter::Audit::Named.enabled()) { return; }
+        if (!resolve_counter::Audit::Named.enabled()) { return; }
         mut answer: string = "<invalid>";
         if (result.is_valid()) {
             const t: Type* = this.arena.lookup(result.id);
@@ -1525,7 +1525,7 @@ private:
             site_file = ctx.origin_file;
             site_line = ctx.origin_line;
         }
-        ResolveCounter::rn_answer(step, home, cursor, site_file, site_line,
+        resolve_counter::rn_answer(step, home, cursor, site_file, site_line,
                                   name_str, answer);
     }
 
@@ -1550,7 +1550,7 @@ private:
     rn_seam_probe(&this, step: string, name_str: string, qualified: SymbolStr,
                   slot: ResSlot, ctx: ResolutionContext*,
                   span: SourceSpan) -> void {
-        if (!ResolveCounter::Audit::Named.enabled()) { return; }
+        if (!resolve_counter::Audit::Named.enabled()) { return; }
 
         mut incumbent: string = "<none>";
         if (qualified.is_valid()) {
@@ -1596,7 +1596,7 @@ private:
         mut site_file: string = "<nospan>";
         if (span.file.length() > 0) { site_file = span.file; }
 
-        ResolveCounter::rn_stamp_seam(step, verdict, home, name_str, incumbent,
+        resolve_counter::rn_stamp_seam(step, verdict, home, name_str, incumbent,
                                       stamped, site_file,
                                       span.start_line as i32,
                                       span.start_col as i32);
@@ -1650,11 +1650,11 @@ private:
         const name_str: string = this.intern_table.resolve(name);
         const name_len: i64 = name_str.length() as i64;
         LOG_DEBUG(LogComponent::TypeChecker, "resolve_named() name='%s'", name_str);
-        ResolveCounter::Site::RnCalls.bump();
+        resolve_counter::Site::RnCalls.bump();
         // 1. Check generic bindings first (O(1) SymbolStr comparison)
         mut binding: TypeRef = ctx.lookup_binding(name);
         if (binding.is_valid()) {
-            ResolveCounter::Site::RnGenericBinding.bump();
+            resolve_counter::Site::RnGenericBinding.bump();
             this.rn_trace("1-generic", name_str, ctx, binding);
             return binding;
         }
@@ -1683,7 +1683,7 @@ private:
                     const member_sym: SymbolStr = this.intern_table.intern(member_str);
                     const proj: TypeRef = this.project_member(prefix_ty, member_sym, ctx);
                     if (proj.is_valid()) {
-                        ResolveCounter::Site::RnAssocProjection.bump();
+                        resolve_counter::Site::RnAssocProjection.bump();
                         this.rn_trace("1b-assoc", name_str, ctx, proj);
                         return proj;
                     }
@@ -1697,7 +1697,7 @@ private:
         //    This fallback ensures they resolve correctly.
         const prim: TypeRef = this.resolve_primitive(name);
         if (prim.is_valid()) {
-            ResolveCounter::Site::RnPrimitive.bump();
+            resolve_counter::Site::RnPrimitive.bump();
             this.rn_trace("2-primitive", name_str, ctx, prim);
             return prim;
         }
@@ -1760,7 +1760,7 @@ private:
                     // The name is an ANSWER that no store can serve, which is a
                     // declaration that never registered rather than a name this
                     // step failed to derive.  Recorded rather than retried.
-                    ResolveCounter::path_hit(
+                    resolve_counter::path_hit(
                         "RN-2C-UNSERVED",
                         this.intern_table.resolve(home_key), name_str,
                         span.to_string());
@@ -1797,10 +1797,10 @@ private:
                 // B1, so migrating a site to real provenance shows up as B1
                 // going DOWN rather than up.  See `HomeOrigin`.
                 if (ctx.home_origin == HomeOrigin::Syntax) {
-                    ResolveCounter::Site::RnHomeModuleSyntax.bump();
+                    resolve_counter::Site::RnHomeModuleSyntax.bump();
                     this.rn_trace("2c-home-syntax", name_str, ctx, home_answer);
                 } else {
-                    ResolveCounter::Site::RnHomeModule.bump();
+                    resolve_counter::Site::RnHomeModule.bump();
                     this.rn_trace("2c-home-cursor", name_str, ctx, home_answer);
                 }
                 return home_answer;
@@ -1830,7 +1830,7 @@ private:
                         Diagnostic::error(ErrorCode::E0203_UNDEFINED_TYPE, msg));
                 }
             }
-            ResolveCounter::Site::RnAmbiguous.bump();
+            resolve_counter::Site::RnAmbiguous.bump();
             this.rn_trace("2b-ambiguous", name_str, ctx, TypeRef::invalid());
             return TypeRef::invalid();
         }
@@ -1858,7 +1858,7 @@ private:
                     && this.name_resolver.contains_separator(name_str)) {
                 const di_literal: TypeRef = this.decl_index.lookup_type(name);
                 if (di_literal.is_valid()) {
-                    ResolveCounter::Site::RnDiLiteral.bump();
+                    resolve_counter::Site::RnDiLiteral.bump();
                     const a_lit: TypeRef = this.follow_alias(di_literal);
                     this.rn_trace("3a-di-literal", name_str, ctx, a_lit);
                     return a_lit;
@@ -1872,7 +1872,7 @@ private:
                 if (qualified.is_valid()) {
                     const di_found: TypeRef = this.decl_index.lookup_type(qualified);
                     if (di_found.is_valid()) {
-                        ResolveCounter::Site::RnDiCanonical.bump();
+                        resolve_counter::Site::RnDiCanonical.bump();
                         const a_can: TypeRef = this.follow_alias(di_found);
                         this.rn_trace("3b-di-canonical", name_str, ctx, a_can);
                         return a_can;
@@ -1882,7 +1882,7 @@ private:
             // Try bare name
             const di_bare: TypeRef = this.decl_index.lookup_type(name);
             if (di_bare.is_valid()) {
-                ResolveCounter::Site::RnDiBare.bump();
+                resolve_counter::Site::RnDiBare.bump();
                 const a_bare: TypeRef = this.follow_alias(di_bare);
                 this.rn_trace("3c-di-bare", name_str, ctx, a_bare);
                 return a_bare;
@@ -1899,7 +1899,7 @@ private:
         // 5. Leaf-index: O(1) lookup by bare leaf name.
         //    Load-bearing for circular forward references: e.g., AST node
         //    files reference ASTVisitor* in accept() methods but can't
-        //    import Compiler::AST::Visitor without creating a cycle.  Also
+        //    import compiler::ast::visitor without creating a cycle.  Also
         //    handles types from transitive submodule re-exports.
         //
         //    No length-based skip.  Step 1 already returned for any name
@@ -1915,20 +1915,20 @@ private:
         //    misroute a stray `T` into a real type.
         found = this.arena.lookup_by_leaf(name);
         if (found.is_valid()) {
-            ResolveCounter::Site::RnLeafIndex.bump();
-            ResolveCounter::Site::LeafViaResolveNamed.bump();
+            resolve_counter::Site::RnLeafIndex.bump();
+            resolve_counter::Site::LeafViaResolveNamed.bump();
             // Which names actually need the global index, and who asks.  §2.10a
             // justifies this fallback narrowly (circular `ASTVisitor*` refs in
             // AST node files); the audit decides whether legalizing
             // intra-package import cycles would really retire it.
-            ResolveCounter::leaf_hit(this.intern_table.resolve(ctx.home_module),
+            resolve_counter::leaf_hit(this.intern_table.resolve(ctx.home_module),
                                      name_str);
             this.rn_trace("5-leaf-index", name_str, ctx, found);
             return found;
         }
 
         // Not found; return invalid (caller should create error)
-        ResolveCounter::Site::RnFailed.bump();
+        resolve_counter::Site::RnFailed.bump();
         this.rn_trace("X-failed", name_str, ctx, TypeRef::invalid());
         LOG_DEBUG(LogComponent::TypeChecker, "[TypeResolver] resolve_named() FAILED for '%s'", name_str);
         return TypeRef::invalid();

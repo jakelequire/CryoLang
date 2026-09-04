@@ -29,25 +29,25 @@ import std::collections::str;
 import std::collections::string;
 import std::json::value;
 
-import Compiler::CompilationContext;
-import Compiler::AST;
-import Compiler::AST::Node;
-import Compiler::AST::Expression;
-import Compiler::AST::Declaration;
-import Compiler::AST::NodeLocator;
-import Compiler::Diag::SourceSpan;
-import Compiler::Resolver::Resolver;
-import Compiler::Resolver::Symbol;
-import Compiler::Resolver::SymbolID;
-import Compiler::Resolver::SymbolStr;
-import Compiler::Resolver::InternTable;
-import Compiler::Types::TypeRef;
-import Compiler::Types::Arena;
-import Compiler::Types;
-import Compiler::Types::Type;
-import Compiler::Types::Compound;
-import Compiler::Types::Generic;
-import Compiler::ModuleGraph;
+import compiler::compilation_context;
+import compiler::ast;
+import compiler::ast::node;
+import compiler::ast::expression;
+import compiler::ast::declaration;
+import compiler::ast::node_locator;
+import compiler::diag::source_span;
+import compiler::resolver::resolver;
+import compiler::resolver::symbol;
+import compiler::resolver::symbol_id;
+import compiler::resolver::symbol_str;
+import compiler::resolver::intern_table;
+import compiler::types::type_ref;
+import compiler::types::arena;
+import compiler::types;
+import compiler::types::type_base;
+import compiler::types::compound;
+import compiler::types::generic;
+import compiler::module_graph;
 import std::fs::metadata;
 import std::fs::path;
 
@@ -111,14 +111,14 @@ public function handle_definition(docs: &Docs, sessions: mut &SessionMap,
     // Compiler spans are 1-based; LSP positions are 0-based.
     const cursor_line: u32 = line + 1 as u32;
     const cursor_char: u32 = character + 1 as u32;
-    const node: ASTNode* = NodeLocator::find_innermost_node_at(
+    const node: ASTNode* = node_locator::find_innermost_node_at(
         ast, cursor_line, cursor_char);
     if (node == null) { return JsonValue::Null; }
 
     // -- Dispatch -----------------------------------------------------
-    const name_span: SourceSpan = NodeLocator::name_span_of(node);
+    const name_span: SourceSpan = node_locator::name_span_of(node);
     const on_decl_name: boolean =
-        NodeLocator::span_contains(name_span, cursor_line, cursor_char);
+        node_locator::span_contains(name_span, cursor_line, cursor_char);
 
     mut target_span: SourceSpan = SourceSpan::none();
 
@@ -174,24 +174,24 @@ public function handle_definition(docs: &Docs, sessions: mut &SessionMap,
     if (!target_span.has_location() && node.kind == NodeKind::ImplementationBlock) {
         const impl_blk: ImplBlockNode* = node as ImplBlockNode*;
         if (impl_blk.trait_annotation != null) {
-            const named: NamedAnnotation* = NodeLocator::find_named_annotation_at(
+            const named: NamedAnnotation* = node_locator::find_named_annotation_at(
                 impl_blk.trait_annotation, cursor_line, cursor_char);
             if (named != null) {
-                const decl: ASTNode* = NodeLocator::find_type_decl_in_modules(
+                const decl: ASTNode* = node_locator::find_type_decl_in_modules(
                     ctx.module_graph, ctx.intern_table, named.name);
                 if (decl != null) {
-                    target_span = NodeLocator::name_span_of(decl);
+                    target_span = node_locator::name_span_of(decl);
                 }
             }
         }
         if (!target_span.has_location()
                 && impl_blk.target_type_span.has_location()
-                && NodeLocator::span_contains(impl_blk.target_type_span,
+                && node_locator::span_contains(impl_blk.target_type_span,
                                               cursor_line, cursor_char)) {
-            const decl: ASTNode* = NodeLocator::find_type_decl_in_modules(
+            const decl: ASTNode* = node_locator::find_type_decl_in_modules(
                 ctx.module_graph, ctx.intern_table, impl_blk.target_type);
             if (decl != null) {
-                target_span = NodeLocator::name_span_of(decl);
+                target_span = node_locator::name_span_of(decl);
             }
         }
     }
@@ -200,12 +200,12 @@ public function handle_definition(docs: &Docs, sessions: mut &SessionMap,
     //    Mirrors hover's resolution; falls through when neither hits.
     if (!target_span.has_location() && node.kind == NodeKind::ScopeResolution) {
         const sr: ScopeResolutionNode* = node as ScopeResolutionNode*;
-        const m: MethodNode* = NodeLocator::find_method_in_modules(
+        const m: MethodNode* = node_locator::find_method_in_modules(
             ctx.module_graph, ctx.intern_table, sr.scope_name, sr.member_name);
         if (m != null && m.func != null) {
             target_span = m.func.name_span;
         } else {
-            const f: FunctionDeclNode* = NodeLocator::find_function_in_modules(
+            const f: FunctionDeclNode* = node_locator::find_function_in_modules(
                 ctx.module_graph, sr.member_name);
             if (f != null) {
                 target_span = f.name_span;
@@ -213,10 +213,10 @@ public function handle_definition(docs: &Docs, sessions: mut &SessionMap,
                 // Last resort: jump to the type/module named on the
                 // scope side - useful for `Foo::Bar` where `Bar` is
                 // a nested type or a constant on `Foo`.
-                const td: ASTNode* = NodeLocator::find_type_decl_in_modules(
+                const td: ASTNode* = node_locator::find_type_decl_in_modules(
                     ctx.module_graph, ctx.intern_table, sr.scope_name);
                 if (td != null) {
-                    target_span = NodeLocator::name_span_of(td);
+                    target_span = node_locator::name_span_of(td);
                 }
             }
         }
@@ -243,27 +243,27 @@ public function handle_definition(docs: &Docs, sessions: mut &SessionMap,
             if (recv_ty.is_valid()) {
                 const type_sym: SymbolStr = ctx.decl_index.lookup_type_name(recv_ty);
                 if (type_sym.is_valid()) {
-                    const is_call: boolean = NodeLocator::is_member_access_callee(
+                    const is_call: boolean = node_locator::is_member_access_callee(
                         ctx.module_graph, ma);
                     if (is_call) {
-                        const m: MethodNode* = NodeLocator::find_method_in_modules(
+                        const m: MethodNode* = node_locator::find_method_in_modules(
                             ctx.module_graph, ctx.intern_table, type_sym, ma.member);
                         if (m != null && m.func != null) {
                             target_span = m.func.name_span;
                         } else {
-                            const fld: FieldDeclNode* = NodeLocator::find_field_in_modules(
+                            const fld: FieldDeclNode* = node_locator::find_field_in_modules(
                                 ctx.module_graph, ctx.intern_table, type_sym, ma.member);
                             if (fld != null) {
-                                target_span = NodeLocator::name_span_of(fld as ASTNode*);
+                                target_span = node_locator::name_span_of(fld as ASTNode*);
                             }
                         }
                     } else {
-                        const fld: FieldDeclNode* = NodeLocator::find_field_in_modules(
+                        const fld: FieldDeclNode* = node_locator::find_field_in_modules(
                             ctx.module_graph, ctx.intern_table, type_sym, ma.member);
                         if (fld != null) {
-                            target_span = NodeLocator::name_span_of(fld as ASTNode*);
+                            target_span = node_locator::name_span_of(fld as ASTNode*);
                         } else {
-                            const m: MethodNode* = NodeLocator::find_method_in_modules(
+                            const m: MethodNode* = node_locator::find_method_in_modules(
                                 ctx.module_graph, ctx.intern_table, type_sym, ma.member);
                             if (m != null && m.func != null) {
                                 target_span = m.func.name_span;
@@ -301,14 +301,14 @@ public function handle_definition(docs: &Docs, sessions: mut &SessionMap,
                 && id_node.span.has_location()) {
             const this_sym: SymbolStr = ctx.intern_table.intern("this");
             if (id_node.name.equals(this_sym)) {
-                const owner: SymbolStr = NodeLocator::find_enclosing_method_owner(
+                const owner: SymbolStr = node_locator::find_enclosing_method_owner(
                     ctx.module_graph, id_node.span.file,
                     id_node.span.start_line, id_node.span.start_col);
                 if (owner.is_valid()) {
-                    const decl: ASTNode* = NodeLocator::find_type_decl_in_modules(
+                    const decl: ASTNode* = node_locator::find_type_decl_in_modules(
                         ctx.module_graph, ctx.intern_table, owner);
                     if (decl != null) {
-                        target_span = NodeLocator::name_span_of(decl);
+                        target_span = node_locator::name_span_of(decl);
                     }
                 }
             }
@@ -334,13 +334,13 @@ public function handle_definition(docs: &Docs, sessions: mut &SessionMap,
     if (!target_span.has_location()) {
         const ann: TypeAnnotation* = DefinitionEngine::annotation_for_node(node);
         if (ann != null) {
-            const named: NamedAnnotation* = NodeLocator::find_named_annotation_at(
+            const named: NamedAnnotation* = node_locator::find_named_annotation_at(
                 ann, cursor_line, cursor_char);
             if (named != null) {
-                const decl: ASTNode* = NodeLocator::find_type_decl_in_modules(
+                const decl: ASTNode* = node_locator::find_type_decl_in_modules(
                     ctx.module_graph, ctx.intern_table, named.name);
                 if (decl != null) {
-                    target_span = NodeLocator::name_span_of(decl);
+                    target_span = node_locator::name_span_of(decl);
                 }
             }
         }
@@ -406,9 +406,9 @@ type struct DefinitionEngine {
     jump_to_namespace(&this, literal: string) -> JsonValue {
         const std_path: string = "std::" + literal;
 
-        mut prog: ProgramNode* = NodeLocator::find_program_by_namespace(this.graph, literal);
+        mut prog: ProgramNode* = node_locator::find_program_by_namespace(this.graph, literal);
         if (prog == null) {
-            prog = NodeLocator::find_program_by_namespace(this.graph, std_path);
+            prog = node_locator::find_program_by_namespace(this.graph, std_path);
         }
         if (prog != null) {
             const span: SourceSpan = DefinitionEngine::first_namespace_decl_span(prog);
@@ -494,11 +494,11 @@ type struct DefinitionEngine {
         const ast: ProgramNode* = this.graph.get_module_ast(mod_idx as u32);
         if (ast == null) { return decl_span; }
 
-        const decl: ASTNode* = NodeLocator::find_innermost_node_at(
+        const decl: ASTNode* = node_locator::find_innermost_node_at(
             ast, decl_span.start_line, decl_span.start_col);
         if (decl == null) { return decl_span; }
 
-        const name_span: SourceSpan = NodeLocator::name_span_of(decl);
+        const name_span: SourceSpan = node_locator::name_span_of(decl);
         if (name_span.has_location()) { return name_span; }
         return decl_span;
     }
@@ -545,7 +545,7 @@ type struct DefinitionEngine {
     static import_segment_at(imp: ImportDeclNode*, line: u32, ch: u32) -> i64 {
         if (imp == null) { return -1 as i64; }
         for (mut i: i64 = 0; i < imp.path_segment_spans.length; i++) {
-            if (NodeLocator::span_contains(imp.path_segment_spans[i], line, ch)) {
+            if (node_locator::span_contains(imp.path_segment_spans[i], line, ch)) {
                 return i;
             }
         }
@@ -558,7 +558,7 @@ type struct DefinitionEngine {
     static module_decl_segment_at(md: ModuleDeclNode*, line: u32, ch: u32) -> i64 {
         if (md == null) { return -1 as i64; }
         for (mut i: i64 = 0; i < md.path_segment_spans.length; i++) {
-            if (NodeLocator::span_contains(md.path_segment_spans[i], line, ch)) {
+            if (node_locator::span_contains(md.path_segment_spans[i], line, ch)) {
                 return i;
             }
         }

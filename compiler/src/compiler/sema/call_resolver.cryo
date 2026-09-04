@@ -26,31 +26,31 @@
 /// `try_pin_overload_mangled_callee`'s no-op-on-template remain the "decline to pin"
 /// seams (sema must not pin the un-specialized template form mono will pin).
 
-namespace Compiler::Sema::CallResolver;
+namespace compiler::sema::call_resolver;
 
-import Compiler::Types::{
-    TypeRef, Type, Arena, Compound, UserDefined, Generic, Substitution,
-    Inference, TraitChecker, GenericRegistry, Resolver, Checker, Ownership, TypeKind
+import compiler::types::{
+    type_ref, type_base, arena, compound, user_defined, generic, substitution,
+    inference, trait_checker, generic_registry, resolver, checker, ownership, TypeKind
 };
-import Compiler::Resolver::{ SymbolStr, InternTable, QualifiedName, MangledName };
-import Compiler::AST;
-import Compiler::AST::{ Node, Visitor, Expression, Statement, Declaration };
-import Compiler::AST::NodeLocator;
-import Compiler::Diag;
-import Compiler::Diag::{ Diagnostic, Suggestion, SourceSpan };
-import Compiler::CompilationContext;
-import Compiler::DeclIndex;
-import Compiler::ModuleGraph;
-import Compiler::ResolveCounter;
-import Compiler::Lex;
-import Compiler::Sema::{
-    State, TypeUtils, LiteralResolver, Diagnostics, MethodBinding,
-    SymbolicChecker, MemberResolver, LambdaSynth, ScopeManager, Dispatch, Helpers
+import compiler::resolver::{ symbol_str, intern_table, qualified_name, mangled_name };
+import compiler::ast;
+import compiler::ast::{ node, visitor, expression, statement, declaration };
+import compiler::ast::node_locator;
+import compiler::diag;
+import compiler::diag::{ diagnostic, suggestion, source_span };
+import compiler::compilation_context;
+import compiler::decl_index;
+import compiler::module_graph;
+import compiler::resolve_counter;
+import compiler::lex;
+import compiler::sema::{
+    state, type_utils, literal_resolver, diagnostics, method_binding,
+    symbolic_checker, member_resolver, lambda_synth, scope_manager, dispatch, helpers
 };
 import std::core::{ slice, option };
 import std::fmt;
-import Compiler::Resolver::Resolver;
-import Compiler::Resolver::Res;
+import compiler::resolver::resolver;
+import compiler::resolver::res;
 
 // Format-argument categories for the `printf`/`eprintf` directive checker.
 // A `%` conversion expects one of these; each variadic argument's resolved
@@ -174,11 +174,11 @@ type struct CallResolver {
         const cursor: SymbolStr = this.ctx.current_module_ns();
         const syn: SymbolStr = this.ctx.module_ns_sym_of_file(span.file);
         if (!syn.is_valid()) {
-            ResolveCounter::Site::FnBindUseCursor.bump();
+            resolve_counter::Site::FnBindUseCursor.bump();
             return cursor;
         }
-        ResolveCounter::Site::FnBindUseSyntax.bump();
-        if (syn.id != cursor.id) { ResolveCounter::Site::FnBindUseDiff.bump(); }
+        resolve_counter::Site::FnBindUseSyntax.bump();
+        if (syn.id != cursor.id) { resolve_counter::Site::FnBindUseDiff.bump(); }
         return syn;
     }
 
@@ -196,7 +196,7 @@ type struct CallResolver {
     /// module declares.
     callee_door_probe(&this, door: string, leaf: SymbolStr,
                       answered: boolean) -> void {
-        if (!ResolveCounter::Audit::Path.enabled()) { return; }
+        if (!resolve_counter::Audit::Path.enabled()) { return; }
         if (this.ctx == null || this.ctx.decl_index == null) { return; }
 
         mut ans: string = "miss";
@@ -220,7 +220,7 @@ type struct CallResolver {
         }
         if (names.length() == 0) { names = "<none>"; }
 
-        ResolveCounter::callee_door(door, this.intern.resolve(leaf), ans,
+        resolve_counter::callee_door(door, this.intern.resolve(leaf), ans,
                                     distinct, names);
     }
 
@@ -2528,10 +2528,10 @@ type struct CallResolver {
             // fast path (spec §8.1): the sole overload is pinned without
             // consulting `bare_candidate_scope` at all, so a function the use
             // site never imported binds anyway.  Measure before gating.
-            ResolveCounter::Site::FnBindSingle.bump();
+            resolve_counter::Site::FnBindSingle.bump();
             if (scoped_bare && owners.length > 0 && owners[0] != 0) {
                 this.check_fnbind_candidate(owners[0], use_ns, call.span,
-                    ResolveCounter::Site::FnBindVisSingle);
+                    resolve_counter::Site::FnBindVisSingle);
             }
             mut unique_mangled: SymbolStr = di.lookup_overload_mangled(lookup_key, overloads[0]);
             if (!unique_mangled.is_valid()) { unique_mangled = di.lookup_mangled_name(lookup_key); }
@@ -2596,7 +2596,7 @@ type struct CallResolver {
             const owner: u32 = if (owners.length > oi) { owners[oi] } else { 0 };
             if (owner != 0) {
                 this.check_fnbind_candidate(owner, use_ns, call.span,
-                    ResolveCounter::Site::FnBindVisPlural);
+                    resolve_counter::Site::FnBindVisPlural);
             }
             mut mangled: SymbolStr = SymbolStr::empty();
             if (owner != 0) {
@@ -2618,7 +2618,7 @@ type struct CallResolver {
             mut mangled: SymbolStr = SymbolStr::empty();
             if (scoped_bare && owners.length > oi && owners[oi] != 0) {
                 this.check_fnbind_candidate(owners[oi], use_ns, call.span,
-                    ResolveCounter::Site::FnBindVisPlural);
+                    resolve_counter::Site::FnBindVisPlural);
                 mangled = di.lookup_overload_mangled_owned(
                     lookup_key, overloads[oi], owners[oi]);
             }
@@ -2672,7 +2672,7 @@ type struct CallResolver {
             const oi: i64 = if (imported_owned.length == 1) { imported_owned[0] }
                             else { prelude_owned[0] };
             this.check_fnbind_candidate(owners[oi], use_ns, call.span,
-                    ResolveCounter::Site::FnBindVisPlural);
+                    resolve_counter::Site::FnBindVisPlural);
             mut mangled: SymbolStr = di.lookup_overload_mangled_owned(
                 lookup_key, overloads[oi], owners[oi]);
             if (!mangled.is_valid()) {
@@ -2708,7 +2708,7 @@ type struct CallResolver {
     /// the gate lives here rather than at each of them: doors 2, 3 and 4 all
     /// funnel through this one function.  `door` records which.
     check_fnbind_candidate(mut &this, owner: u32, use_ns: SymbolStr,
-                           span: SourceSpan, door: ResolveCounter::Site) -> void {
+                           span: SourceSpan, door: resolve_counter::Site) -> void {
         const owner_sym: SymbolStr = SymbolStr::from_id(owner);
         const di: DeclarationIndex* = this.ctx.decl_index;
         const c_ns: SymbolStr = di.namespace_of(owner_sym, this.intern);
@@ -2717,15 +2717,15 @@ type struct CallResolver {
         if (c_ns.id == use_ns.id) { return; }
         mut kind: string = "";
         if (!di.ns_imports(use_ns, c_ns) && !di.is_prelude_ns(c_ns)) {
-            ResolveCounter::Site::FnBindSingleHidden.bump();
+            resolve_counter::Site::FnBindSingleHidden.bump();
             kind = "HIDDEN";
         } else if (!di.is_candidate_public(owner_sym)) {
-            ResolveCounter::Site::FnBindPrivateBound.bump();
+            resolve_counter::Site::FnBindPrivateBound.bump();
             kind = "PRIVATE";
         }
         // Resolve the names only when someone is reading them.
-        if (kind != "" && ResolveCounter::Audit::Visibility.enabled()) {
-            ResolveCounter::fnbind_violation(kind,
+        if (kind != "" && resolve_counter::Audit::Visibility.enabled()) {
+            resolve_counter::fnbind_violation(kind,
                 this.intern.resolve(use_ns), this.intern.resolve(owner_sym));
         }
         this.enforce_callee_visibility(owner_sym, use_ns, span, door);
@@ -2756,7 +2756,7 @@ type struct CallResolver {
     /// different function, and a wrong bind is a miscompile that every gate in
     /// this repo stays green through (§4.1).  A hard error is the honest one.
     enforce_callee_visibility(mut &this, callee: SymbolStr, use_ns: SymbolStr,
-                              span: SourceSpan, door: ResolveCounter::Site) -> void {
+                              span: SourceSpan, door: resolve_counter::Site) -> void {
         if (this.state.in_symbolic_check) { return; }
         if (!callee.is_valid() || !use_ns.is_valid()) { return; }
         const di: DeclarationIndex* = this.ctx.decl_index;
@@ -2764,7 +2764,7 @@ type struct CallResolver {
         if (!c_ns.is_valid()) { return; }
         if (c_ns.id == use_ns.id) { return; }
         if (di.is_candidate_public(callee)) { return; }
-        ResolveCounter::Site::FnBindVisReject.bump();
+        resolve_counter::Site::FnBindVisReject.bump();
         // WHICH door caught it.  §8.1e's lesson is that shutting two of the
         // three doors is indistinguishable from shutting all three - the call
         // still fails to bind through the open one only when nothing else
@@ -2772,7 +2772,7 @@ type struct CallResolver {
         // the door it was written for is the door that fired.
         door.bump();
         const callee_str: string = this.intern.resolve(callee);
-        ResolveCounter::vis_gate_reject(door.label(),
+        resolve_counter::vis_gate_reject(door.label(),
             this.intern.resolve(use_ns), callee_str);
         mut d: Diagnostic = Diagnostic::error(
             ErrorCode::E0353_PRIVATE_ACCESS,
@@ -2798,7 +2798,7 @@ type struct CallResolver {
     enforce_value_ref_visibility(mut &this, name: SymbolStr, span: SourceSpan) -> void {
         const q: SymbolStr = this.ctx.resolve_scoped_or_at(name, span.file, FILE, LINE);
         this.enforce_callee_visibility(q, this.call_use_site_ns(span), span,
-            ResolveCounter::Site::FnBindVisValueBare);
+            resolve_counter::Site::FnBindVisValueBare);
     }
 
     /// The function a qualified path in VALUE position names, or an invalid
@@ -2815,7 +2815,7 @@ type struct CallResolver {
         const ft: TypeRef = this.ctx.decl_index.lookup_func_type(q_sym);
         if (!ft.is_valid()) { return TypeRef::invalid(); }
         this.enforce_callee_visibility(q_sym, this.call_use_site_ns(scope.span),
-            scope.span, ResolveCounter::Site::FnBindVisValueQual);
+            scope.span, resolve_counter::Site::FnBindVisValueQual);
         return ft;
     }
 
@@ -2846,7 +2846,7 @@ type struct CallResolver {
         }
         if (!owner.is_valid()) { return; }
         this.member.enforce_method_visibility(owner, member_sym, span,
-            ResolveCounter::Site::MethodVisStatic);
+            resolve_counter::Site::MethodVisStatic);
     }
 
     /// Scope class of a bare-call overload candidate owned by `owner` (a
@@ -2935,13 +2935,13 @@ type struct CallResolver {
                 func_ret = this.types.lookup_func_return(stamped_q);
             }
             if (func_ret.is_valid()) {
-                ResolveCounter::Site::FnBindStampedRet.bump();
+                resolve_counter::Site::FnBindStampedRet.bump();
                 const alts: SymbolStr[] =
                     this.ctx.decl_index.lookup_qualified_alternatives(ident.name);
                 if (alts.length == 1) {
                     this.check_fnbind_candidate(alts[0].id, this.call_use_site_ns(ident.span),
                                                 ident.span,
-                                                ResolveCounter::Site::FnBindVisRetLane);
+                                                resolve_counter::Site::FnBindVisRetLane);
                 }
             }
         }
@@ -2968,15 +2968,15 @@ type struct CallResolver {
         // answered exactly nothing: one call reached it, and it found no type.
         // Kept because the site is too rarely reached to certify either way,
         // NOT because a population for it has been shown.
-        ResolveCounter::Site::SpellTyIdCalls.bump();
-        const stamped_ty: TypeRef = this.types.spelling_type(ident.res, ResolveCounter::Site::SpellTyIdNoDef);
+        resolve_counter::Site::SpellTyIdCalls.bump();
+        const stamped_ty: TypeRef = this.types.spelling_type(ident.res, resolve_counter::Site::SpellTyIdNoDef);
         if (stamped_ty.is_valid()) { return stamped_ty; }
         const type_ref: TypeRef = this.types.lookup_type_by_sym(ident.name, "call_resolver/resolve_direct_call/ident.name");
         if (type_ref.is_valid()) {
-            ResolveCounter::Site::SpellTyIdFbHit.bump();
+            resolve_counter::Site::SpellTyIdFbHit.bump();
             return type_ref;
         }
-        ResolveCounter::Site::SpellTyIdFbMiss.bump();
+        resolve_counter::Site::SpellTyIdFbMiss.bump();
 
         const name: string = this.intern.resolve(ident.name);
         mut diag: Diagnostic = Diagnostic::error(
@@ -3387,10 +3387,10 @@ type struct CallResolver {
 
     resolve_method_call(mut &this, visitor: ASTVisitor*, member: MemberAccessNode*,
                         call: CallExprNode*) -> TypeRef {
-        ResolveCounter::Site::McCalls.bump();
+        resolve_counter::Site::McCalls.bump();
         const obj_type: TypeRef = this.dispatch.resolve_expr(visitor, member.object);
         if (!obj_type.is_valid()) {
-            ResolveCounter::Site::McFailed.bump();
+            resolve_counter::Site::McFailed.bump();
             return TypeRef::invalid();
         }
         if (this.symbolic.symbolic_is_generic_owner_receiver(obj_type)) {
@@ -3400,7 +3400,7 @@ type struct CallResolver {
             // mono can specialize the nested call (else codegen E0636).
             this.binding.stash_owner_generic_method_bindings(obj_type, member, call);
             mut mret: TypeRef = this.symbolic.symbolic_resolve_owner_method_return(obj_type, member.member);
-            if (mret.is_valid()) { ResolveCounter::Site::McOwnerSymbolic.bump(); }
+            if (mret.is_valid()) { resolve_counter::Site::McOwnerSymbolic.bump(); }
             if (!mret.is_valid()) {
                 // A method delivered by a trait impl ON the owner
                 // (`implement trait AsyncRead for struct BufStream<S>`) is not in
@@ -3416,10 +3416,10 @@ type struct CallResolver {
                 // unresolved receiver method surfaces as "operand does not
                 // implement `Future`" at the `await` instead.
                 mret = this.binding.resolve_method_return_via_template(obj_type, member.member);
-                if (mret.is_valid()) { ResolveCounter::Site::McOwnerTemplate.bump(); }
+                if (mret.is_valid()) { resolve_counter::Site::McOwnerTemplate.bump(); }
             }
             if (mret.is_valid()) { member.set_resolved_type(mret); return mret; }
-            ResolveCounter::Site::McFailed.bump();
+            resolve_counter::Site::McFailed.bump();
             return TypeRef::invalid();
         }
         if (this.symbolic.symbolic_type_unresolved(obj_type)) {
@@ -3448,11 +3448,11 @@ type struct CallResolver {
             const abs_ret: TypeRef =
                 this.binding.abstract_receiver_method_return(obj_type, member.member);
             if (abs_ret.is_valid()) {
-                ResolveCounter::Site::McAbstractReceiver.bump();
+                resolve_counter::Site::McAbstractReceiver.bump();
                 member.set_resolved_type(abs_ret);
                 return abs_ret;
             }
-            ResolveCounter::Site::McFailed.bump();
+            resolve_counter::Site::McFailed.bump();
             return TypeRef::invalid();
         }
         this.binding.stash_method_call_bindings(obj_type, member, call);
@@ -3491,8 +3491,8 @@ type struct CallResolver {
             // means those arms declined; re-asking the same sources with less
             // information cannot turn that into an answer.  They only spent
             // four lookups before the failure below.
-            ResolveCounter::Site::McNoTypeSym.bump();
-            ResolveCounter::Site::McFailed.bump();
+            resolve_counter::Site::McNoTypeSym.bump();
+            resolve_counter::Site::McFailed.bump();
             return TypeRef::invalid();
         }
 
@@ -3507,10 +3507,10 @@ type struct CallResolver {
 
         const ret: TypeRef = this.binding.lookup_method_with_inheritance(lookup_ref, type_sym, member.member);
         if (ret.is_valid() && !proj_blocked) {
-            ResolveCounter::Site::McInheritance.bump();
+            resolve_counter::Site::McInheritance.bump();
             const acc_span: SourceSpan = if (member.member_span.has_location()) { member.member_span } else { member.span };
             this.member.enforce_method_visibility(lookup_ref, member.member, acc_span,
-                ResolveCounter::Site::MethodVisMember);
+                resolve_counter::Site::MethodVisMember);
             const refined: TypeRef = if (member.generic_args.length > 0) {
                 this.binding.resolve_method_return_with_explicit_args(obj_type, member, ret)
             } else {
@@ -3544,7 +3544,7 @@ type struct CallResolver {
             const trait_ret: TypeRef = this.binding.lookup_method_through_bounds(
                 base_t as BoundedParamType*, lookup_ref, member.member);
             if (trait_ret.is_valid()) {
-                ResolveCounter::Site::McBoundsPostSym.bump();
+                resolve_counter::Site::McBoundsPostSym.bump();
                 member.set_resolved_type(trait_ret);
                 return trait_ret;
             }
@@ -3552,7 +3552,7 @@ type struct CallResolver {
 
         const inherited: TypeRef = this.binding.lookup_method_through_trait_impls(type_sym, member.member);
         if (inherited.is_valid() && !proj_blocked) {
-            ResolveCounter::Site::McTraitImpls.bump();
+            resolve_counter::Site::McTraitImpls.bump();
             const subst_inherited: TypeRef = this.binding.subst_this_in_type(inherited, obj_type);
             mut fin_inherited: TypeRef = subst_inherited;
             if (fin_inherited.is_valid() && this.types.contains_generic_param(fin_inherited)) {
@@ -3565,13 +3565,13 @@ type struct CallResolver {
 
         const field_ret: TypeRef = this.member.try_field_function_call(lookup_ref, member.member, member);
         if (field_ret.is_valid()) {
-            ResolveCounter::Site::McFieldFn.bump();
+            resolve_counter::Site::McFieldFn.bump();
             return field_ret;
         }
 
         if (member.member.equals(this.intern.intern("drop"))
                 && OwnershipQuery::is_copy(this.arena, this.ctx.get_generic_registry(), this.intern, lookup_ref)) {
-            ResolveCounter::Site::McCopyDrop.bump();
+            resolve_counter::Site::McCopyDrop.bump();
             member.set_resolved_type(this.arena.get_void());
             return this.arena.get_void();
         }
@@ -3584,7 +3584,7 @@ type struct CallResolver {
         // coerced receiver so mono/codegen bind the method on `Target`.
         const coerced: TypeRef = this.member.try_deref_coercion(visitor, member);
         if (coerced.is_valid()) {
-            ResolveCounter::Site::McDerefCoercion.bump();
+            resolve_counter::Site::McDerefCoercion.bump();
             this.binding.stash_method_call_bindings(member.object.resolved_type, member, call);
             member.set_resolved_type(coerced);
             return coerced;
@@ -3592,7 +3592,7 @@ type struct CallResolver {
 
         // Every remaining exit is a failure, diagnosed one of several ways.
         // Counted once here so the tally is over OUTCOMES, not diagnostics.
-        ResolveCounter::Site::McFailed.bump();
+        resolve_counter::Site::McFailed.bump();
 
         const method_name: string = this.intern.resolve(member.member);
         const recv_t: Type* = this.arena.lookup(lookup_ref.id);
@@ -3771,7 +3771,7 @@ type struct CallResolver {
     /// same-leaf types.  Lists every registered qualified candidate so the
     /// author can pick one; the fix is always to write the fully-qualified name.
     report_scope_ambiguity(mut &this, scope: ScopeResolutionNode*) -> void {
-        ResolveCounter::Site::BareAltsViaAmbigDiag.bump();
+        resolve_counter::Site::BareAltsViaAmbigDiag.bump();
         const alts: SymbolStr[] = this.ctx.decl_index.lookup_qualified_alternatives(scope.scope_name);
         mut cand_list: string = "";
         for (mut i: i64 = 0; i < alts.length; i++) {
@@ -4117,7 +4117,7 @@ type struct CallResolver {
         // Named at the event: the delayed tally says HOW MANY nodes arrived
         // unclaimed, only a per-node line says WHICH.
         if (scope.scope_res.is_pending()) {
-            ResolveCounter::path_hit(
+            resolve_counter::path_hit(
                 "RES-PENDING", this.intern.resolve(scope.scope_name),
                 this.intern.resolve(scope.member_name), scope.span.to_string());
         }
@@ -5041,14 +5041,14 @@ type struct CallResolver {
     /// move passes an ownership answer for a function that is not being called.
     resolve_module_qualified_symbol(mut &this, scope_name: SymbolStr, member_name: SymbolStr,
                                     scope: ScopeResolutionNode*) -> SymbolStr {
-        ResolveCounter::Site::M2Calls.bump();
+        resolve_counter::Site::M2Calls.bump();
         if (scope == null) { return SymbolStr::empty(); }
         // Named at the event.  The delayed-bug tally says HOW MANY nodes
         // arrived unclaimed; only a per-node line says WHICH, and this site
         // runs during sema, so it sees synthesized nodes that codegen's
         // equivalent report never reaches.
         if (scope.scope_res.is_pending() && !scope.has_resolved_type()) {
-            ResolveCounter::path_hit(
+            resolve_counter::path_hit(
                 "RES-PENDING", this.intern.resolve(scope_name),
                 this.intern.resolve(member_name), scope.span.to_string());
         }
@@ -5064,13 +5064,13 @@ type struct CallResolver {
             // own name, which a re-export would explain.  Counted and emitted
             // rather than searched for elsewhere: looking is what reopens the
             // lane this function exists to keep closed.
-            ResolveCounter::Site::M2StampMemberMiss.bump();
-            ResolveCounter::scope_res_member_miss(
+            resolve_counter::Site::M2StampMemberMiss.bump();
+            resolve_counter::scope_res_member_miss(
                 this.intern.resolve(stamped_ns), member_str);
             return SymbolStr::empty();
         }
-        ResolveCounter::Site::M2ViaStamp.bump();
-        ResolveCounter::path_hit("M2", this.current_module_name(),
+        resolve_counter::Site::M2ViaStamp.bump();
+        resolve_counter::path_hit("M2", this.current_module_name(),
                                  this.intern.resolve(scope_name) + "::" + member_str,
                                  this.intern.resolve(q));
         return q;
@@ -5127,7 +5127,7 @@ type struct CallResolver {
             if (scope != null) { scope.span } else { SourceSpan::none() }
         };
         this.enforce_callee_visibility(q_sym, this.call_use_site_ns(q_span), q_span,
-            ResolveCounter::Site::FnBindVisQualified);
+            resolve_counter::Site::FnBindVisQualified);
 
         mut is_fn_template: boolean = false;
         mut tmpl: TemplateEntry* = null;
@@ -5294,7 +5294,7 @@ type struct CallResolver {
         mut arg_refs: TypeRef[] = [];
         for (mut i: i64 = 0; i < generic_args.length; i++) {
             const arg_ns: SymbolStr =
-                this.syntax_module_of(NodeLocator::annotation_span(generic_args[i]));
+                this.syntax_module_of(node_locator::annotation_span(generic_args[i]));
             if (arg_ns.is_valid()) {
                 res_ctx.set_home_module(arg_ns, HomeOrigin::Syntax);
             } else {
@@ -5355,7 +5355,7 @@ type struct CallResolver {
             // the template keeps the TEMPLATE's span, so homing every argument on
             // the scope would bind one declaration's default per caller.
             const arg_ns: SymbolStr =
-                this.syntax_module_of(NodeLocator::annotation_span(generic_args[i]));
+                this.syntax_module_of(node_locator::annotation_span(generic_args[i]));
             if (arg_ns.is_valid()) { res_ctx.set_home_module(arg_ns, HomeOrigin::Syntax); }
             else                     { res_ctx.set_home_module(scope_ns, HomeOrigin::Syntax); }
             const a: TypeRef = this.ctx.type_resolver.resolve(generic_args[i], &res_ctx);
@@ -5371,7 +5371,7 @@ type struct CallResolver {
             // decides whether this path can answer at all for `String` and
             // `RawBuffer<u8>`, and a silent slot mismatch there is indis-
             // tinguishable from the spelling fallback quietly covering for it.
-            ResolveCounter::path_hit(
+            resolve_counter::path_hit(
                 "PAIR-DEFAULTS", this.intern.resolve(this.types.lookup_type_sym(base)),
                 format("%lld", arg_refs.length), format("%lld", tmpl.param_count));
             arg_refs = this.ctx.type_resolver.expand_default_type_args(tmpl, arg_refs, &res_ctx);
