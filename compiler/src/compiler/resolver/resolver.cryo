@@ -69,7 +69,17 @@ type struct Resolver {
     // create several same-named Module scopes across pipeline stages, so this
     // is a multimap; find_module_scope iterates only the candidates and still
     // picks the most-populated live scope (symbol counts read live).
-    module_scope_index: HashMap<u32, u64[]>;
+    /// The one scope a module owns, by its interned name.
+    ///
+    /// A module scope is not a rib.  A rib - a function body, a block, a
+    /// generic parameter list - is pushed on entry and popped on exit, and a
+    /// stack is right for it.  A module is a persistent node: it is built once
+    /// and looked up forever after, and entering one sets a pointer to
+    /// something that already exists.  Treating the two alike is what made
+    /// entering a module fourteen times produce fourteen scopes, only the
+    /// third of them populated, and a save/restore mechanism necessary to
+    /// paper over it.
+    module_scopes: HashMap<u32, u64>;
 
     /// Create a new Resolver with a global scope.
     /// The InternTable pointer must outlive the Resolver (owned by CompilationContext).
@@ -93,7 +103,7 @@ type struct Resolver {
             import_aliases:       [],
             current_module:       SymbolStr::empty(),
             prelude_modules:      [],
-            module_scope_index:   HashMap<u32, u64[]>::new(),
+            module_scopes:        HashMap<u32, u64>::new(),
         };
     }
 
@@ -108,14 +118,6 @@ type struct Resolver {
 
         const scope: Scope = Scope::new(id, kind, parent, module, owner, span);
         this.scopes.push(scope);
-
-        // Index Module-kind scopes by their interned owner name so
-        // find_module_scope skips the full scope scan.
-        if (kind == ScopeKind::Module) {
-            const oid: u32 = this.intern_table.intern(owner).id;
-            const bucket: u64[]* = this.module_scope_index.get_or_insert(oid, []);
-            (*bucket).push(id.id);
-        }
 
         // Register as child of parent (O(1) direct index)
         if (parent.is_valid()) {
@@ -959,12 +961,31 @@ type struct Resolver {
     /// saved scope via set_module_with_scope().
     set_module(mut &this, name: SymbolStr) -> void {
         this.current_module = name;
+        this.current_scope = ScopeID { id: this.module_scope_of(name) };
+        this.import_aliases = [];
+    }
+
+    /// The scope a module owns, built on first ask and returned unchanged
+    /// after.
+    ///
+    /// Every entry into a module goes through here, so there is exactly one
+    /// scope per module for the life of the compilation and nothing to save or
+    /// restore: the scope a pass left behind is the scope the next pass finds.
+    /// The module's `Symbol` is declared with it, so the identity and the
+    /// bindings it owns are created together.
+    module_scope_of(mut &this, name: SymbolStr) -> u64 {
+        const oid: u32 = name.id;
+        match (this.module_scopes.get(&oid)) {
+            Option::Some(sid) => { return sid; }
+            Option::None      => { }
+        }
         const mod_str: string = this.intern_table.resolve(name);
-        this.current_scope = this.create_scope(
+        const fresh: ScopeID = this.create_scope(
             ScopeKind::Module, this.global_scope,
             mod_str, mod_str, SourceSpan::none());
-        this.import_aliases = [];
+        this.module_scopes.insert(oid, fresh.id);
         this.declare_module_symbol(name);
+        return fresh.id;
     }
 
     /// Give a module an IDENTITY.
@@ -1013,86 +1034,18 @@ type struct Resolver {
         return this.current_scope.id;
     }
 
-    /// Find the scope ID for a module by its namespace name.
-    /// Searches all Module-kind scopes for one whose owner_name matches
-    /// the given module name string.  Returns the most populated scope
-    /// (highest symbol count) since the Resolver may create multiple
-    /// scopes with the same module name at different pipeline stages.
+    /// The scope a module owns, or 0 when no module of that name was entered.
+    ///
+    /// This used to search every scope recorded under the name and return the
+    /// most populated one, because entering a module built a new scope each
+    /// time and all but one of them were empty.  There is one scope now, so
+    /// there is nothing to choose between.
     find_module_scope(&this, module_name: string) -> u64 {
-        mut best_id: u64 = 0;
-        mut best_count: i64 = -1;
         const oid: u32 = this.intern_table.lookup(module_name).id;
-        match (this.module_scope_index.get_ref(&oid)) {
-            Option::Some(plist) => {
-                for (mut k: i64 = 0; k < (*plist).length; k++) {
-                    const sid: u64 = (*plist)[k];
-                    const idx: i64 = (sid - 1) as i64;
-                    const count: i64 = this.scopes[idx].symbols.length;
-                    if (count > best_count) {
-                        best_count = count;
-                        best_id = sid;
-                    }
-                }
-            }
-            Option::None => { }
-        }
-        this.audit_module_scope_pick(module_name, oid, best_id, best_count);
-        return best_id;
-    }
-
-    /// Whether the winning module scope holds every NAME its same-named rivals
-    /// hold, and what it lacks when it does not.
-    ///
-    /// The tie-break is on symbol COUNT, which stands in safely for the
-    /// identity a module symbol would supply only if the most populated scope
-    /// is a SUPERSET of the others - stages of one module rather than different
-    /// bindings. A name present in a loser and absent from the winner is
-    /// unreachable through this lookup, and a count cannot show that: the
-    /// winner can be larger overall and still be missing one.
-    ///
-    /// Gated first, before any of the comparison work: this walks every rival
-    /// scope's entries, which is far too expensive to run when nobody is
-    /// reading the stream.
-    audit_module_scope_pick(&this, module_name: string, oid: u32,
-                            winner: u64, winner_count: i64) -> void {
-        if (!ResolveCounter::Audit::Scope.enabled()) { return; }
-        if (winner == 0) { return; }
-        const widx: i64 = (winner - 1) as i64;
-        mut cands:   i32    = 0;
-        mut missing: i32    = 0;
-        mut example: string = "<none>";
-        // A superset result is only informative if the rivals hold anything at
-        // all: several EMPTY same-named scopes would make the winner a superset
-        // trivially, and would mean the tie-break skips placeholders rather than
-        // choosing between real alternatives.
-        mut loser_syms:     i32 = 0;
-        mut loser_nonempty: i32 = 0;
-        match (this.module_scope_index.get_ref(&oid)) {
-            Option::Some(plist) => {
-                cands = (*plist).length as i32;
-                for (mut k: i64 = 0; k < (*plist).length; k++) {
-                    const sid: u64 = (*plist)[k];
-                    if (sid == winner) { continue; }
-                    const lidx: i64 = (sid - 1) as i64;
-                    const lcount: i64 = this.scopes[lidx].symbols.length;
-                    loser_syms = loser_syms + (lcount as i32);
-                    if (lcount > 0) { loser_nonempty = loser_nonempty + 1; }
-                    for (mut e: i64 = 0; e < this.scopes[lidx].symbols.length; e++) {
-                        const nm: SymbolStr = this.scopes[lidx].symbols[e].name;
-                        if (!this.scopes[widx].find(nm).is_valid()) {
-                            missing = missing + 1;
-                            if (missing == 1) {
-                                example = this.intern_table.resolve(nm);
-                            }
-                        }
-                    }
-                }
-            }
-            Option::None => { }
-        }
-        ResolveCounter::module_scope_pick(module_name, cands,
-                                          winner_count as i32, missing, example,
-                                          loser_syms, loser_nonempty);
+        return match (this.module_scopes.get(&oid)) {
+            Option::Some(sid) => { sid }
+            Option::None      => { 0 }
+        };
     }
 
     /// Dump the current scope tree and symbol table for debugging.
