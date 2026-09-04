@@ -120,8 +120,8 @@ type struct MonoCallSpecializer {
     /// The module that WROTE `file`, or "" when the graph cannot say.  See
     /// `ModuleGraph::home_ns_of_file` for why "" must not become a fallback to
     /// the cursor.
-    home_ns_of(&this, file: string) -> string {
-        return ModuleGraph::home_ns_of_file(this.module_graph, this.intern_table, file);
+    home_ns_of(&this, file: string) -> SymbolStr {
+        return ModuleGraph::home_ns_sym_of_file(this.module_graph, file);
     }
 
     /// Qualify a written scope name by judging it in the module that WROTE it,
@@ -173,7 +173,7 @@ type struct MonoCallSpecializer {
         // the identifier it is actually resolving.  A home module set here would
         // be a per-body approximation of a per-node fact (spec §8.2m).
         const _empty: string = "";
-        mut res_ctx: ResolutionContext = ResolutionContext::new(FILE, LINE, _empty, _empty, "", HomeOrigin::Unset);
+        mut res_ctx: ResolutionContext = ResolutionContext::new(FILE, LINE, _empty, _empty, SymbolStr::empty(), HomeOrigin::Unset);
         for (mut i: i64 = 0; i < root.statements.length; i++) {
             const stmt: ASTNode* = root.statements[i];
             if (stmt == null) { continue; }
@@ -245,7 +245,7 @@ type struct MonoCallSpecializer {
         // why the home module is derived per node at the consumer instead of
         // being approximated here.
         const _empty: string = "";
-        mut res_ctx: ResolutionContext = ResolutionContext::new(FILE, LINE, _empty, _empty, "", HomeOrigin::Unset);
+        mut res_ctx: ResolutionContext = ResolutionContext::new(FILE, LINE, _empty, _empty, SymbolStr::empty(), HomeOrigin::Unset);
         match (decl.kind) {
             NodeKind::FunctionDeclaration => {
                 const f: FunctionDeclNode* = decl as FunctionDeclNode*;
@@ -707,10 +707,10 @@ type struct MonoCallSpecializer {
         // five walk entry points - a walk entry cannot see which file the
         // identifier it eventually reaches came from, and a sixth entry point
         // added later would silently reinstate the scope-less context.
-        const fnval_home: string = this.home_ns_of((ident as ASTNode*).span.file);
+        const fnval_home: SymbolStr = this.home_ns_of((ident as ASTNode*).span.file);
         ResolveCounter::mono_home("fnval", (ident as ASTNode*).span.file, "",
                                   this.intern_table.resolve(this.current_ns),
-                                  fnval_home);
+                                  this.intern_table.resolve(fnval_home));
         res_ctx.set_home_module(fnval_home, HomeOrigin::Syntax);
 
         // A first-class function-reference value (`f<i32>` not invoked) has no
@@ -1234,15 +1234,15 @@ type struct MonoCallSpecializer {
             // here, all `stdlib/io/traits.cryo` bodies attributed to
             // `std::io::stdio` / `std::fs::file`).  The span says which
             // (spec §8.2m).
-            const body_home: string =
+            const body_home: SymbolStr =
                 this.home_ns_of((spec_method.func as ASTNode*).span.file);
             ResolveCounter::mono_home("methbody",
                                       (spec_method.func as ASTNode*).span.file,
                                       this.arena.module_ns_of(recv_type),
                                       this.intern_table.resolve(this.current_ns),
-                                      body_home);
+                                      this.intern_table.resolve(body_home));
             const _pm: string = "";
-            mut prune_ctx: ResolutionContext = ResolutionContext::new(FILE, LINE, body_home, _pm, "", HomeOrigin::Unset);
+            mut prune_ctx: ResolutionContext = ResolutionContext::new(FILE, LINE, this.intern_table.resolve(body_home), _pm, SymbolStr::empty(), HomeOrigin::Unset);
             prune_ctx.set_home_module(body_home, HomeOrigin::Syntax);
             if (recv_type.is_valid()) { prune_ctx.set_this_type(recv_type); }
             this.ast_resolver.prune_static_match_in_block(
@@ -1261,7 +1261,7 @@ type struct MonoCallSpecializer {
             // Bare by design: the walk's only consumer is
             // `specialize_fn_value_ref`, which derives the home module from
             // the span of the identifier it resolves (spec §8.2m).
-            mut rw_ctx: ResolutionContext = ResolutionContext::new(FILE, LINE, _empty, _empty, "", HomeOrigin::Unset);
+            mut rw_ctx: ResolutionContext = ResolutionContext::new(FILE, LINE, _empty, _empty, SymbolStr::empty(), HomeOrigin::Unset);
             mut owner_subst: TypeSubstitution = TypeSubstitution::empty();
             this.add_owner_param_bindings(&owner_subst, recv_type);
             // Also bind THIS method's own generic params (`m<W>`) to their concrete
@@ -1326,7 +1326,7 @@ type struct MonoCallSpecializer {
             // Bare by design: the walk's only consumer is
             // `specialize_fn_value_ref`, which derives the home module from
             // the span of the identifier it resolves (spec §8.2m).
-            mut rw_ctx: ResolutionContext = ResolutionContext::new(FILE, LINE, _empty, _empty, "", HomeOrigin::Unset);
+            mut rw_ctx: ResolutionContext = ResolutionContext::new(FILE, LINE, _empty, _empty, SymbolStr::empty(), HomeOrigin::Unset);
             this.walk_block(spec_method.func.body, &rw_ctx, null);
         }
         return true;
@@ -1489,13 +1489,13 @@ type struct MonoCallSpecializer {
         // `caller` row).  `expand_default_type_args` below is the callee's half
         // and derives its own home from `entry`; the two are deliberately not
         // the same value.
-        const scope_home: string = this.home_ns_of((scope as ASTNode*).span.file);
+        const scope_home: SymbolStr = this.home_ns_of((scope as ASTNode*).span.file);
         ResolveCounter::mono_home("ownerbinds", (scope as ASTNode*).span.file,
                                   this.intern_table.resolve(entry.module_name),
                                   this.intern_table.resolve(this.current_ns),
-                                  scope_home);
+                                  this.intern_table.resolve(scope_home));
         const _m: string = "";
-        mut rc: ResolutionContext = ResolutionContext::new(FILE, LINE, scope_home, _m, "", HomeOrigin::Unset);
+        mut rc: ResolutionContext = ResolutionContext::new(FILE, LINE, this.intern_table.resolve(scope_home), _m, SymbolStr::empty(), HomeOrigin::Unset);
         rc.set_home_module(scope_home, HomeOrigin::Syntax);
         mut binds: TypeRef[] = [];
         for (mut i: i64 = 0; i < scope.scope_generic_args.length; i++) {
@@ -1613,12 +1613,12 @@ type struct MonoCallSpecializer {
             // the same module - so deriving the home module twice would let the
             // two drift apart; only `body_ctx` used to have it at all
             // (spec §8.2l, the `template` row).
-            mut body_mod: string = "";
+            mut body_mod: SymbolStr = SymbolStr::empty();
             if (owner_entry != null && owner_entry.module_name.is_valid()) {
-                body_mod = this.intern_table.resolve(owner_entry.module_name);
+                body_mod = owner_entry.module_name;
             }
 
-            mut prune_ctx: ResolutionContext = ResolutionContext::new(FILE, LINE, body_mod, "", "", HomeOrigin::Unset);
+            mut prune_ctx: ResolutionContext = ResolutionContext::new(FILE, LINE, this.intern_table.resolve(body_mod), "", SymbolStr::empty(), HomeOrigin::Unset);
             prune_ctx.set_home_module(body_mod, HomeOrigin::Syntax);
             if (recv_type.is_valid()) { prune_ctx.set_this_type(recv_type); }
             this.ast_resolver.prune_static_match_in_block(spec_method.func.body, &prune_ctx);
@@ -1629,7 +1629,7 @@ type struct MonoCallSpecializer {
                 const pref: TypeRef = this.arena.create_generic_param(method_param_names[i], i as u64);
                 full_subst.add(pref.id, method_binds[i]);
             }
-            mut body_ctx: ResolutionContext = ResolutionContext::new(FILE, LINE, body_mod, "", "", HomeOrigin::Unset);
+            mut body_ctx: ResolutionContext = ResolutionContext::new(FILE, LINE, this.intern_table.resolve(body_mod), "", SymbolStr::empty(), HomeOrigin::Unset);
             // The body's local annotations were written in the owner's module;
             // the ambient scope chain is the caller's.
             body_ctx.set_home_module(body_mod, HomeOrigin::Syntax);
@@ -1669,7 +1669,7 @@ type struct MonoCallSpecializer {
             // Bare by design: the walk's only consumer is
             // `specialize_fn_value_ref`, which derives the home module from
             // the span of the identifier it resolves (spec §8.2m).
-            mut rw_ctx: ResolutionContext = ResolutionContext::new(FILE, LINE, _empty, _empty, "", HomeOrigin::Unset);
+            mut rw_ctx: ResolutionContext = ResolutionContext::new(FILE, LINE, _empty, _empty, SymbolStr::empty(), HomeOrigin::Unset);
             mut owner_subst: TypeSubstitution = TypeSubstitution::empty();
             this.add_owner_param_bindings(&owner_subst, recv_type);
             // Publish the owner context so walk_expr can stamp owner-constructing
@@ -1848,13 +1848,13 @@ type struct MonoCallSpecializer {
         // than from `tmpl.module_name` for the reason the `ownersig` site below
         // records: the entity's module and the file's module are the same thing
         // only until a body is written in a third module.
-        const tmpl_home: string = this.home_ns_of(tmpl.ast_node.span.file);
+        const tmpl_home: SymbolStr = this.home_ns_of(tmpl.ast_node.span.file);
         ResolveCounter::mono_home("tmplrecv", tmpl.ast_node.span.file,
                                   this.intern_table.resolve(tmpl.module_name),
                                   this.intern_table.resolve(this.current_ns),
-                                  tmpl_home);
+                                  this.intern_table.resolve(tmpl_home));
         const _pm: string = "";
-        mut rc: ResolutionContext = ResolutionContext::new(FILE, LINE, tmpl_home, _pm, "", HomeOrigin::Unset);
+        mut rc: ResolutionContext = ResolutionContext::new(FILE, LINE, this.intern_table.resolve(tmpl_home), _pm, SymbolStr::empty(), HomeOrigin::Unset);
         rc.set_home_module(tmpl_home, HomeOrigin::Syntax);
         for (mut i: i64 = 0; i < params.length; i++) {
             const gp: GenericParamNode* = params[i];
@@ -2168,14 +2168,14 @@ type struct MonoCallSpecializer {
             // `stdlib/io/traits.cryo` body attributed to `std::io::stdio` or
             // `std::fs::file`.  It was a proxy for the span labelled as if it
             // were the span; the span itself is not a proxy (spec §8.2m).
-            const sig_home: string =
+            const sig_home: SymbolStr =
                 this.home_ns_of((spec_method.func as ASTNode*).span.file);
             ResolveCounter::mono_home("ownersig",
                                       (spec_method.func as ASTNode*).span.file,
                                       this.arena.module_ns_of(owner_type),
                                       this.intern_table.resolve(this.current_ns),
-                                      sig_home);
-            mut res_ctx: ResolutionContext = ResolutionContext::new(FILE, LINE, module_name, "", "", HomeOrigin::Unset);
+                                      this.intern_table.resolve(sig_home));
+            mut res_ctx: ResolutionContext = ResolutionContext::new(FILE, LINE, module_name, "", SymbolStr::empty(), HomeOrigin::Unset);
             res_ctx.set_home_module(sig_home, HomeOrigin::Syntax);
             if (owner_type.is_valid()) { res_ctx.set_this_type(owner_type); }
             if (owner_impl != null) {
