@@ -12044,3 +12044,168 @@ The order stands as the audit put it: instrument, then fixture. A fixture
 against a blind instrument answers nothing - and the reverse also held here,
 since the entered-counter alone would have said "never runs" without the fixture
 to say what running would look like.
+
+#### 8.84 addendum: the two quiet sites are entered thousands of times
+
+8.84 said `create_param_type` and `symbolic_param_ref` are "unreachable, even
+here". That was a zero over one corpus stated as a property, which is the error
+this section exists to stop. An entered-counter at FUNCTION level, rather than
+inside the constraint loop, corrects it:
+
+| site | entered | of those, carrying constraints |
+|---|---:|---:|
+| `symbolic_param_ref` | 3,165 | **0** |
+| `create_generic_param_types` | 665 | **5** |
+| `create_param_type` | 423 | **0** |
+
+All three run, and run hot. None is dead code and none is uncalled. What is
+empty is the LOOP: only `create_generic_param_types` is ever handed a parameter
+carrying an inline constraint, and only on the one project in the tree that
+writes the syntax. The `lookup_by_leaf` line in the other two is never reached
+because there is nothing to iterate.
+
+"Unreachable" and "entered 3,165 times with an empty loop" are different
+findings with different consequences, and only the second is true.
+
+One observation not chased: `symbolic_param_ref` saw 3,165 parameters and zero
+constraints on a project whose parameters demonstrably carry them - the same
+declarations reach `create_generic_param_types` with `consPLUS`. The nodes the
+symbolic walk sees are not the ones the parser attached constraints to. Recorded
+as an open question, not investigated.
+
+#### Method: a compound command reported the wrong step's status
+
+The probe-removal script failed its own assertion and printed a traceback, and
+the shell line was `python ...; git diff --stat; echo ...; make cryo`, so the
+command reported `make cryo`'s exit 0. The probes stayed in the tree AND went
+into the rebuilt compiler, and two gates were then run against a probed binary.
+
+Caught by looking at the diff rather than the exit code. This is the rule
+CLAUDE.md already states - read the log's own summary, not a chained status -
+and it is the third instance in two sessions of a rewrite reporting success
+having changed nothing. The per-anchor assertion from 8.83 is necessary and was
+not sufficient: the assertion fired correctly and the SHELL discarded it.
+
+The sources were restored with `git checkout` against HEAD rather than by
+patching the patch, because HEAD was known probe-free; the compiler was rebuilt
+and confirmed to contain zero probe strings before any gate result was believed.
+
+### 8.85 Intrinsic census: 84 of the 87 contested leaves are not intrinsics at all - MEASURED 2026-09-04
+
+The decision on 8.65 is to namespace intrinsics and reach them by explicit path,
+with no precedence rule and no registration-order hack, and to reduce the
+intrinsic count rather than adjudicate collisions. This is the census that sizes
+it, taken before any change.
+
+#### The load-bearing question: codegen recognises intrinsics BY NAME
+
+`IntrinsicKind::from_name(name)` at `codegen/ops/intrinsics_codegen.cryo:176`
+maps a literal name string to an enum, and `intrinsic_emitter` switches on that
+enum. So lowering is name-driven and a rename breaks it - but the scope of that
+exposure is much smaller than the intrinsic count:
+
+**56 of the 142 declarations are matched by `from_name`.** The other 86 are
+declared `intrinsic function` and lowered by nothing; codegen emits an ordinary
+call for them.
+
+#### The cross-tabulation
+
+87 of 142 have a same-leaf declaration elsewhere in the stdlib, re-measured here
+independently of 8.65 and agreeing with it.
+
+| | lowered by `from_name` | not lowered |
+|---|---:|---:|
+| **contested** | **3** | **84** |
+| uncontested | 53 | 2 |
+
+**84 of the 87 collisions are between a declaration codegen does not lower and a
+`extern "C"` twin that already exists.** 86 of the 87 twins live in one file,
+`stdlib/ffi/libc.cryo` - the file carrying the topo-sort import edge. These are
+not intrinsics in any sense the compiler acts on; they are C functions wearing
+the keyword.
+
+The three contested AND lowered are `panic`, `vfprintf`, `vprintf`. Those are
+the only ones needing a real answer rather than a deletion.
+
+`intrinsics.cryo`'s own header already states the doctrine the decision asks
+for: "Everything else that lives in libc (`printf`, `strlen`, `fopen`) belongs
+in the `ffi` module as explicit C externs." The file has drifted from its own
+rule by 84 declarations.
+
+#### The two uncontested unlowered are NOT deletable
+
+`format` and `try_catch` are absent from `from_name` and are still special:
+`format`'s body is emitted per-module by `emit_format_runtime`, and `try_catch`
+is the `catch_unwind` primitive. **Absence from `from_name` does not mean "an
+ordinary call"**, so category D cannot be swept by the same argument as
+category A. Any deletion pass must check the emitter, not just the name table.
+
+#### Blast radius, source-visible
+
+Explicit `intrinsics::<name>(` call sites for the 84:
+
+| tree | sites |
+|---|---:|
+| `compiler/src` | 273 |
+| `examples` | 87 |
+| `tests` | 41 |
+| `stdlib` | 37 |
+| `tools` | 6 |
+| **total** | **444** |
+
+`free` 148, `malloc` 138, `printf` 110 account for most of it.
+
+#### The cost nobody has priced: the twins do not have the same signatures
+
+Comparing each of the 84 against its `ffi::libc` twin:
+
+| | count |
+|---|---:|
+| identical signature | 26 |
+| differ in parameter NAMES only | 0 |
+| **differ in TYPES** | **58** |
+
+The differences are systematic, not incidental: the intrinsic takes `string`
+where libc takes `u8*`, and `void*` where libc takes `u8*`.
+
+    malloc    intrinsic(u64)->void*          libc(u64)->u8*
+    memcpy    intrinsic(void*,void*,u64)->void*  libc(u8*,u8*,u64)->u8*
+    fopen     intrinsic(string,string)->void*    libc(u8*,u8*)->void*
+    printf    intrinsic(string,args...)->i32     libc(u8*,...)->i32
+
+So "point the callers at `libc::`" is not a rename. For 58 of the 84 it is a
+rename plus a cast at each call site, and the intrinsic signature is the more
+ergonomic of the two - which is presumably why the declarations were added.
+
+#### The question that decides the cheapest route, and is NOT yet answered
+
+How a bare `malloc` binds today is not established, and the obvious answer is
+contradicted by two prior measurements. `stdlib/prelude.cryo:17` says
+`public module core::intrinsics;` - but `public module` was measured four ways
+to grant no visibility, and 8.65 measured that `IntrinsicDeclaration` never
+calls `export_symbol`, so the module exports 3 names while declaring 142. An
+importer binds none of them.
+
+Yet `libc.cryo`'s comment names the failure as an ambiguous overload **at
+codegen** (E0636), and codegen binds unpinned calls by name and arity. That
+points at the declaration index rather than the resolver's scope chain as the
+place the two twins actually contest.
+
+Until that is measured, the cheapest option cannot be chosen, because it decides
+whether the collision disappears by removing a prelude edge, by deleting 84
+declarations, or only by changing what codegen indexes. **Measuring it is the
+next step and it precedes any edit.**
+
+#### The shape of the options, to be costed once that is answered
+
+* **Delete category A, point callers at `libc::`.** Removes 84 of 87 collisions
+  and the topo-sort edge. Costs 444 call-site edits, 58 of them with casts, and
+  is source-visible in `examples` and `tests`.
+* **Keep the ergonomic signatures as ordinary Cryo functions** wrapping
+  `ffi::libc`, the way `core::mem::size_of` wraps its intrinsic. The casts live
+  once in the wrapper instead of at 444 call sites, and the wrappers are
+  ordinary functions reached by path.
+* **Category B (`panic`, `vfprintf`, `vprintf`) is separate under either**, and
+  is the only part touching `from_name`.
+
+Not started; reported for a decision.
