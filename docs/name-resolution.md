@@ -10577,3 +10577,53 @@ calls.
 A temporary probe used to measure the graph/AST name agreement shipped in the
 previous commit by mistake and is removed here; it was audit-gated, so it
 emitted rows only under `CRYO_PATH_AUDIT`.
+
+### 8.71 What decision 3 step 4 actually costs, and why the leftover call sites are not free - MEASURED 2026-09-03
+
+8.57 step 4 is one line - "re-key the five string callers onto the symbol" - and
+it reads like a five-site edit. Measured before starting it, it is not, and the
+call sites 8.70 described as collapsible are not collapsible either. Both are
+recorded here so the next attempt does not pay for the discovery twice.
+
+#### The seam is the field's TYPE, not the five callers
+
+`find_module_scope`'s five callers all pass a `string`, and every one of those
+strings comes from `ResolutionContext.home_module`, which is declared `string`.
+Re-keying only the callers would move the intern from callee to caller and
+change nothing: the identity has to reach them.
+
+| | |
+|---|---:|
+| `home_module` references | **86**, across 8 files |
+| `set_home_module` call sites | **53** |
+| files holding a third or more | `types/resolver.cryo` 29, `sema/call_resolver.cryo` 20 |
+
+So step 4 is converting a field that 53 sites write and 86 read, not editing
+five lookups. It is the same order of work as the 8.56 codemod and deserves the
+same treatment: its own change, its own verification.
+
+#### The guard on the "collapsible" sites is load-bearing
+
+8.70 said four of the six `set_module_with_scope` callers are now equivalent to
+`set_module`. Reading them again, none is a free collapse. `monomorphizer` and
+`sema` both have this shape:
+
+    const template_scope: u64 = find_module_scope(mod_str);
+    if (template_scope > 0) {
+        set_module_with_scope(name, template_scope);
+        ...
+    }
+
+The guard means "switch only if that module HAS a scope". Canonical
+`set_module` CREATES one when it is absent, so the collapse would switch into a
+freshly built empty scope for a module that was never entered - and in sema's
+case also swap the namespace and set `needs_restore`, on nothing.
+
+The guard is asking a question the canonical model still answers: has this
+module been entered at all? `find_module_scope` returning 0 is that answer, and
+it stays meaningful. Collapsing needs a way to ask it without also creating -
+which is a distinction the current API does not offer.
+
+That is twice in two entries that a claim about these call sites was made from
+their shape rather than from their guards. The count of callers is not a
+description of them.
