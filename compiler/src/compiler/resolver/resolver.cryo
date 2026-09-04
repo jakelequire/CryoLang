@@ -954,11 +954,16 @@ type struct Resolver {
         this.import_aliases = [];
     }
 
-    /// Switch to a specific module.  Creates a fresh Module scope
-    /// parented to global so that each module's declarations live in
-    /// their own scope and bare names cannot collide across modules.
-    /// Used by NameResolution (Phase 3).  Later phases restore the
-    /// saved scope via set_module_with_scope().
+    /// Enter a module: its scope becomes the current one.
+    ///
+    /// A LOOKUP, not a construction.  The module owns exactly one scope for
+    /// the life of the compilation, built on the first ask and returned
+    /// unchanged after, so entering a module twice lands in the same scope
+    /// and there is nothing to save or restore across the gap.
+    ///
+    /// Use this whenever the destination is a MODULE.  `restore_scope` is for
+    /// the other half of the model - resuming a scope captured earlier, which
+    /// may be a rib inside a module rather than the module itself.
     set_module(mut &this, name: SymbolStr) -> void {
         this.current_module = name;
         this.current_scope = ScopeID { id: this.module_scope_of(name) };
@@ -1016,9 +1021,19 @@ type struct Resolver {
         resolve_counter::path_hit("MODULE-SYMBOL", this.intern_table.resolve(name), "", "");
     }
 
-    /// Switch to a module and restore a previously saved scope.
-    /// Used by the multi-module orchestrator for passes after NameResolution.
-    set_module_with_scope(mut &this, name: SymbolStr, saved_scope: u64) -> void {
+    /// Resume a scope captured earlier, under `name` as the current module.
+    ///
+    /// The transient half of the model, and the reason this is not just
+    /// `set_module`: `saved_scope` comes from `get_current_scope_id()` at the
+    /// top of a scope-switched region and may be a RIB - a function body a
+    /// pass was standing in - rather than a module scope.  Jumping to the
+    /// module's own scope instead would lose that nesting.
+    ///
+    /// A module destination wants `set_module`.  Reaching for this one with a
+    /// scope that was just looked up for the same module says "restore" while
+    /// meaning "enter", which is how two readings of these call sites were
+    /// wrong about what they do.
+    restore_scope(mut &this, name: SymbolStr, saved_scope: u64) -> void {
         this.current_module = name;
         if (saved_scope > 0) {
             this.current_scope = ScopeID { id: saved_scope };
