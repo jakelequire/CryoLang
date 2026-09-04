@@ -10555,8 +10555,25 @@ rather than merely tolerates.
 
 #### What is still owed
 
-`set_module_with_scope` survives with six callers in mono, sema and name
-resolution. They are not the save/restore buffers - they switch to another
-module's scope deliberately - but with canonical scopes each is now equivalent
-to `set_module` of that module, so the helper should collapse into it. That is
-the next deletion, not part of this one.
+`set_module_with_scope` survives with six callers, and reading them corrects
+the claim this section first made - that all six are now equivalent to
+`set_module`. Four are: `monomorphizer` and `sema` each ask
+`find_module_scope(name)` and then switch into the answer, and the two in
+`NameResolutionPass::run` exist to name a module WITHOUT creating its scope,
+which is what `set_module` now does by itself.
+
+The other two are not. They restore a `saved_scope` captured from
+`get_current_scope_id()` at the top of a scope-switched region, and that scope
+may be a RIB rather than a module scope - a function body the monomorphizer or
+sema was standing in. Collapsing those to `set_module` would jump to the module
+scope and lose the nesting.
+
+So the helper has a second and legitimate use: restoring an arbitrary saved
+scope, which is the transient half of the model and correct as a stack. Four
+call sites can collapse; the helper stays. Recorded because the first version of
+this paragraph said otherwise on inspection of the call count rather than the
+calls.
+
+A temporary probe used to measure the graph/AST name agreement shipped in the
+previous commit by mistake and is removed here; it was audit-gated, so it
+emitted rows only under `CRYO_PATH_AUDIT`.
