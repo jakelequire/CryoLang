@@ -583,22 +583,16 @@ api-index-check: $(LIBCRYO_A)
 # build/ dirs are gitignored.  Run `make cryo` first to pick up compiler
 # changes.  CRYO_STDLIB pins the in-tree stdlib so resolution is independent
 # of which compiler binary builds the examples.
+# Driven by a script rather than a shell loop because the loop was POSIX-only
+# and the Windows branch printed "run it from WSL" and exited 0.  A gate that
+# exits 0 having done nothing is counted as evidence, so this one refuses to
+# report success unless it can say what it swept.
 ifeq ($(HOST_OS),windows)
 examples: $(STAGE2_EXE) $(LIBCRYO_A)
-	@echo "make examples runs under POSIX/WSL; native Windows cmd looping is unsupported."
-	@echo "Run it from WSL or Git Bash instead."
+	@$(PYTHON) scripts/examples-gate.py --cryo "$(STAGE2_EXE)"
 else
 examples: $(STAGE2) $(LIBCRYO_A)
-	@failed=""; \
-	for cfg in examples/*/cryoconfig; do \
-	    dir=$$(dirname "$$cfg"); \
-	    printf '==> %s\n' "$$dir"; \
-	    if ! ( cd "$$dir" && CRYO_STDLIB="$(ROOT)/stdlib" "$(STAGE2)" build >/dev/null ); then \
-	        failed="$$failed $$dir"; \
-	    fi; \
-	done; \
-	if [ -n "$$failed" ]; then echo "==> FAILED examples:$$failed"; exit 1; fi; \
-	echo "==> All examples built"
+	@$(PYTHON) scripts/examples-gate.py --cryo "$(STAGE2)"
 endif
 
 # ---- examples golden-output check -------------------------------------
@@ -608,8 +602,7 @@ endif
 # as `examples` (the script loops + runs binaries).
 ifeq ($(HOST_OS),windows)
 examples-golden: $(STAGE2_EXE) $(LIBCRYO_A)
-	@echo "make examples-golden runs under POSIX/WSL; native Windows cmd looping is unsupported."
-	@echo "Run it from WSL or Git Bash instead."
+	@$(PYTHON) scripts/gate-unavailable.py examples-golden "it builds AND RUNS the examples and diffs stdout; run it from WSL."
 else
 examples-golden: $(STAGE2) $(LIBCRYO_A)
 	@CRYO="$(STAGE2)" CRYO_STDLIB="$(ROOT)/stdlib" bash scripts/check-examples-output.sh
@@ -623,7 +616,7 @@ endif
 # caught here.  POSIX/Linux-only and requires valgrind on PATH.
 ifeq ($(HOST_OS),windows)
 valgrind-check: $(STAGE2_EXE) $(LIBCRYO_A)
-	@echo "make valgrind-check runs under POSIX/Linux only (valgrind)."
+	@$(PYTHON) scripts/gate-unavailable.py valgrind-check "valgrind is POSIX/Linux only; run it from WSL."
 else
 valgrind-check: $(STAGE2) $(LIBCRYO_A)
 	@CRYO="$(STAGE2)" CRYO_STDLIB="$(ROOT)/stdlib" bash scripts/valgrind-check.sh
