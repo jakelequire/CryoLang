@@ -11420,3 +11420,208 @@ BINARY would put a full self-host in front of the gate for no added coverage.
 `LOOKUP` 117, `REENTRY` 6, B1 0 and B4 0 on three arms, roster 2,106, examples
 14 of 14 - unchanged, as they must be, since no compiler or stdlib source moved.
 
+### 8.80 What replaces the counter: two guarantees, two instruments, and one permanent narrowing - DESIGNED 2026-09-04
+
+8.66 put "retire `resolve_counter.cryo`" last and said inventing its replacement
+is part of that step rather than a precondition someone supplies. This is that
+design, written now while the collapses are recent, because at the end the
+reasoning would have to be reconstructed from the instrument being deleted.
+
+Nothing here is built. The step is not started.
+
+#### First correction: `lane-check` does not die with the counter
+
+8.66 says retiring `resolve_counter.cryo` retires `lane-check` and `b1-check`
+with it. Measured, that is half wrong.
+
+`scripts/lane-gate.py` counts CALL SITES IN THE SOURCE under `compiler/src` -
+the five per-kind lookups outside the file defining them, and `get_resolver()`
+outside the driver. It reads no counter, needs no compiler, no stdlib and no
+link, and `tests/lane-baseline.txt` contains **zero rows from
+`resolve_counter.cryo`**. Deleting that file leaves `LOOKUP` and `REENTRY`
+untouched.
+
+So `lane-check` survives verbatim, and the guarantee needing replacement is
+`b1-check`'s alone. That halves the problem, and it means the ratchet against a
+NEW lookup lane appearing is not in question at any point.
+
+#### Second correction: what `b1-check` holds today is two different things
+
+From the committed golden, on a tree where both totals are zero:
+
+| row | value |
+|---|---:|
+| `B1_TOTAL` / `B4_TOTAL` | 0 / 0 |
+| `2c home-module (ambient cursor)` | 0 |
+| `5 GLOBAL LEAF INDEX` | 0 |
+| `lookup_by_leaf` calls / hits | **2,206** / 0 |
+| `by caller: canonical_qualified` / folded | **638** / **316** |
+| `M1 qualifier_agrees` calls / agreed | **5,566** / 5,566 |
+| `M2 resolve_module_qualified_sym` calls | **2,258** |
+| `M4 mono bare-name scan` / hits | **267** / 0 |
+
+Every ANSWER is zero and no CALL is. The machinery is entered thousands of times
+per build and returns nothing. The gate therefore holds two guarantees that have
+been read as one:
+
+* **an absence of answers** - no fuzzy fallback binds a name, and no lookup is
+  keyed on an instantiation;
+* **an exact pin on call volume** - how often each lane is entered, per host and
+  per target, which is why the golden has host sections at all.
+
+#### The sharper reason the counter is last
+
+8.66 gave it as "the last step removes the evidence the earlier ones held". The
+measurement gives a better one.
+
+The call-volume half is **transitional by construction**. It protects the lanes
+while they still exist; once `lookup_by_leaf`, M1, M2, M4 and the leaf index are
+deleted, "2,206 calls" is not a number anyone can preserve, because there is
+nothing left to call. Every row goes structurally zero, and a golden of zeroes
+asserts nothing a deleted function could violate.
+
+So the ordering is not a courtesy to the evidence. **The counter cannot be
+retired before the lanes it counts, and needs no replacement for its readings
+after them, because by then its readings are vacuous.** What has to be replaced
+is not the counter's numbers but the other half of its guarantee: the absence of
+answers, which outlives the lanes as a property the tree must keep.
+
+#### The absence has two failure modes, and they need different instruments
+
+This is the substantive design point, and collapsing it into one "cascade gate"
+would be wrong.
+
+* **B1 regrowth makes an INVALID program COMPILE.** A name that nothing in scope
+  binds gets bound anyway. The observable is a rejection that stops happening.
+* **B4 regrowth makes a VALID program COMPUTE THE WRONG THING.** A lookup keyed
+  on a mangled instantiation name binds the wrong instantiation; the build
+  succeeds and the answer is wrong; a sized and an unsized array instantiation of
+  the same generic colliding is one such shape. There is no diagnostic to
+  assert.
+
+A rejection test cannot see the second and a runtime test cannot see the first.
+Two instruments, not one.
+
+#### Both instruments already exist in this tree, and one is already doing this job
+
+No new harness is needed. What is missing is coverage, not machinery.
+
+**For B1 - a rejection that must keep happening.** `tests/negative/` files carry
+`![config(negative, <CODE>)]` plus `//~` annotations, and the checker is
+**two-way**: every annotation must match a diagnostic on severity, code, LINE and
+message substring, AND every diagnostic anchored in the file must be annotated,
+so an unexpected one fails. That polarity is exactly what 8.66 asked for. If a
+cascade step returns and the name resolves, the expected `error[E0240]` at that
+line stops being emitted and the test goes red; if the step's return produces a
+different error instead, the unannotated half catches it. A fixture cannot
+quietly pass in either of the two usual ways.
+
+**For B4 - a wrong answer that must stay impossible.** `tests/projects/` with
+`"outcome": "collect"`, in the shape `resolution_leaf_index` already uses: the
+sources make the binding **observable at runtime** through a discriminator
+(`tag()` returning 1 or 2 for the two declarers), so the test cannot be satisfied
+by any value that merely round-trips. A lookup that binds the wrong instantiation
+returns the wrong tag.
+
+#### The precedent settles the question a counter cannot answer
+
+`resolution_leaf_index`'s header states the decisive property, and it was written
+about cascade step 5:
+
+> On every other corpus in the tree step 5 answers ZERO times - 2c takes every
+> unique leaf before it is reached - so a change that deleted the leaf index
+> would look inert. It is starved, not dead, and only a plural leaf shows it.
+
+**A counter reports the same 0 for a starved lane and a deleted one.** A fixture
+that constructs the shape reaching the lane distinguishes them. For the specific
+question "is this step gone", the fixture is not a weaker substitute for the
+counter - it is the stronger instrument, and the golden above is the evidence:
+five lanes reading zero answers against thousands of calls are all starved, and
+no number in that table says which would answer if asked.
+
+That is also the standing rule about zeros, applied to the instrument itself: a
+zero needs a control, and for a starved lane the control is a corpus that feeds
+it.
+
+#### The migration protocol, already demonstrated once
+
+`resolution_leaf_index`'s header records what was done when a case became an
+error: resolution_tripwire's visibility half moved to `visibility_gate`. So each
+step has a two-phase fixture life.
+
+1. **While the lane exists** - a `collect` project with `WRONG_`-prefixed tests
+   pinning the behaviour the spec calls wrong, plus a runtime discriminator, plus
+   `CONTROL_` tests proving the shape is live and the lane is actually reached.
+2. **Once the lane is deleted** - the same case moves to a rejection fixture with
+   the diagnostic it must now produce, in the same change that made it an error.
+
+Phase 2 is literally "a test that fails when a cascade step returns": reintroduce
+the step and the program compiles, and a fixture asserting it must not is red.
+
+#### A measured asymmetry that decides which form to prefer
+
+The two-way check runs ONLY on the file-level path (`check_annotations`,
+`commands.cryo:1770`, called once at `:1980`). Project-level `compile_fail` is
+`exit != 0` plus an `output_contains` substring - **one-way**. It catches the
+case that matters (the step returns, the build succeeds, `fails` is violated),
+but it will pass while gating nothing if the fixture develops an unrelated error
+that happens to carry the same code.
+
+Two consequences:
+
+* Prefer the **file-level** form wherever the shape fits in one file, because it
+  is two-way for free.
+* A **project-level** fixture, needed whenever the shape is genuinely cross-module
+  - which for name resolution is most of them - must be paired with a positive
+  control project built from the same sources with the binding made legitimate,
+  so a fixture that starts failing for an unrelated reason is visible. This is
+  the `CONTROL_` discipline `resolution_leaf_index` already applies within a
+  project, lifted to the pair.
+
+The one piece of harness work worth doing instead: extend `//~` to the
+project-level `compile_fail` path, which would make the paired control
+unnecessary and every existing project fixture stricter. Recorded as the concrete
+engineering item, not scheduled.
+
+#### Host independence is a third reason the end state is stronger
+
+A `collect` fixture with a discriminator can be host-dependent - the leaf index's
+winner is decided by directory enumeration order, and the B1 golden carries host
+sections for the same reason. A rejection fixture asserts that NOTHING binds, so
+there is no winner to vary and no host section to keep. Phase 2 fixtures need no
+per-host golden, which removes the failure mode where one host's re-pin hides
+another's regression.
+
+#### The permanent narrowing, stated plainly
+
+The counter observed every resolution in a build - 439,175 of them across 57
+corpora. A fixture set observes only the shapes someone thought to write.
+
+Retiring the counter therefore gives up, permanently, the ability to notice a
+lane answering for a shape nobody anticipated. `lane-check` catches a NEW lane
+being added; the fixtures catch a KNOWN lane answering a KNOWN shape. **Neither
+catches an existing lane answering a new shape**, and after the retirement
+nothing will.
+
+That is a real loss, not one the fixture design closes, and it is a project
+decision rather than a method one. It is recorded here so it is taken
+deliberately at the point of the step instead of discovered afterwards. The
+mitigating fact, and the reason it is probably acceptable: once the lanes are
+deleted there is no lane left to answer for an unanticipated shape, and what
+remains is `2c` reading a stamp and `1-generic` reading a context binding -
+neither of which is a search over the program.
+
+#### Sequencing that follows from all of the above
+
+1. **Enumerate the answering exits from the counter WHILE IT EXISTS.** It is what
+   makes them enumerable and attributable per site; that map cannot be recovered
+   afterwards. This is the one step that must not be deferred.
+2. One fixture per exit, in phase-1 form, each with its `CONTROL_` proving the
+   lane is reached rather than starved.
+3. Prove each fixture red-on-reintroduction before trusting it. A fixture never
+   observed failing is a green test asserting nothing.
+4. Delete the lane; migrate its fixture to phase 2 in the same change.
+5. The counter last, when its rows are structurally zero.
+
+The fixture bodies are not designed here - only the form, the polarity, the
+controls each needs, and the order.
