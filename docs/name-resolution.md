@@ -10627,3 +10627,63 @@ which is a distinction the current API does not offer.
 That is twice in two entries that a claim about these call sites was made from
 their shape rather than from their guards. The count of callers is not a
 description of them.
+
+### 8.72 `import` binds a type's leaf, so the qualifier change is a rename and not a path rewrite - MEASURED 2026-09-03
+
+8.56 framed dropping the qualifier shorthand as source-breaking across 3,018
+call sites, and 8.67 measured that no alternative spelling of "the module, then
+the type" resolves today. Both are true. Neither answers the question that
+actually sizes the work: does `import` bind a TYPE's leaf into the importing
+file's scope?
+
+Cryo has `import`, `export` and `module`; there is no `use`. The parallel to
+Rust here is about the mechanism, not the syntax.
+
+#### Measured on four scratch projects, with a negative control
+
+| project | shape | result |
+|---|---|---|
+| A | module `ImpA::Shapes` holds `Color`; `import ImpA::Shapes;` then `Color::Red` | compiles |
+| B | file-per-type: module `ImpB::CompileMode` holds `CompileMode`; `CompileMode::Check` | compiles |
+| C | **renamed**: module `ImpC::compile_mode` holds `CompileMode`; `CompileMode::Check` | **compiles** |
+| D | `import ImpD::compile_mode::{ CompileMode };` then `CompileMode::Check` | compiles |
+| E | same as C but main does NOT import the module | **`error[E0240]`** |
+
+C is the load-bearing row and E is why it can be believed. With the module named
+`compile_mode` and the type `CompileMode` there is no module/type collision for
+a shorthand to shortcut, and the call site still resolves with no module segment
+spelled. E removes only the import and the reachability gate refuses, so the
+import is what bound the name - not the module-blind leaf index, which is how
+`reexport_basic` passed for the wrong reason in 8.62.
+
+**`import M;` binds the leaf of every type `M` exports into the importing file's
+scope.** That is what makes `CompileMode::Check` work, and it keeps working
+after a rename.
+
+#### What that does to the size of the change
+
+The call sites do not move. Renaming the modules to snake_case removes the
+module/type collision at its source, and every `Leaf::Member` path continues to
+resolve through the imported type.
+
+| | |
+|---|---:|
+| `Leaf::` call sites that DO NOT change | **3,018** across 151 files |
+| `namespace` declarations to rename | **75** |
+| `import`/`export` lines naming one of them | **282** across 114 files |
+
+So the job is about 357 edited lines plus 75 file-level renames, not 3,018 path
+rewrites. The largest single import is `Utils::Logger` at 46 occurrences.
+
+#### What still has to be decided about it
+
+The rename removes the collision; it does not by itself remove the SHORTHAND.
+While a module and a type can share a name, `A::B` still has to decide what `A`
+means, and decision 3 gives modules a binding in the type namespace that will
+compete. Renaming every file-per-type module means no such pair remains in this
+tree, but the language rule is still owed - a user can write the colliding shape
+tomorrow.
+
+So the two are separable and should be sequenced that way: the rename is a
+mechanical change with a compile-time falsifier, and the rule is a language
+decision that outlives it.
