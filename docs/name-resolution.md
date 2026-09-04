@@ -11625,3 +11625,161 @@ neither of which is a search over the program.
 
 The fixture bodies are not designed here - only the form, the polarity, the
 controls each needs, and the order.
+
+### 8.81 `lookup_by_leaf`'s zero is starvation, and the row that pins it cannot see the lane - MEASURED 2026-09-04
+
+8.80 named the question every remaining deletion candidate turns on: a lane
+answering 0 may be dead, or it may be starved by a corpus that never presents
+the shape reaching it. `lookup_by_leaf` is the largest live-but-silent lane -
+entered 2,206 times across the three pinned targets and answering nothing - so
+it is the one that settles whether the question has teeth.
+
+It does. The zero is **starvation**.
+
+#### The burden of proof, before the measurement
+
+"Starved" and "dead" have opposite consequences and unequal costs. Call a lane
+dead when it is starved and deleting it breaks a program shape no gate covers -
+silently, because the corpora that would catch it are exactly the ones that do
+not reach the lane. Call it starved when it is dead and unreachable code is
+kept.
+
+So the default answer is starved, and only positive evidence that the lane
+cannot be reached moves it. **A zero measured over a corpus that does not
+present the shape is not that evidence; it is the definition of starvation.**
+
+#### Prediction and falsifier
+
+Predicted: on `tests/tests/projects/resolution_leaf_index` - the project written
+because "on every other corpus step 5 answers ZERO times ... it is starved, not
+dead, and only a plural leaf shows it" - `lookup_by_leaf hits` would be non-zero,
+of order 2 to 20 rather than thousands. Falsified by a zero there.
+
+#### The measurement
+
+| corpus | tool | calls | hits |
+|---|---|---:|---:|
+| the three pinned b1 targets | `cryo build` | 2,206 | 0 |
+| `examples/14-threads` alone | `cryo build` | 2,036 | 0 |
+| `resolution_leaf_index` | `cryo build` | 1,578 | **0** |
+| `resolution_leaf_index` | `cryo test` | 3,546 | **8** |
+
+The prediction holds, including the size.
+
+#### The tool is a variable, not a detail
+
+The third and fourth rows are **the same corpus**. `ResolutionLeafIndex::Orphan`
+is named only from a test file, module discovery is import-driven, and
+`cryo build` does not compile `tests/` - so the build never compiles the module
+whose signatures reach the lane, and reports a confident zero over sources it
+did not read.
+
+This is stronger than the recorded form of the trap. Measuring on the corpus
+that presents the shape is **necessary and not sufficient**: the corpus must
+also be compiled by the tool that reaches it. A zero is a statement about the
+corpus AND the tool, and either alone can produce it.
+
+#### The eight answers, named rather than counted
+
+A count says how many, never which, so the audit stream was read at the event:
+
+    4  LEAF-HIT     ResolutionLeafIndex::Orphan  Widget
+    2  PATH-HIT  LEAF-TYPEUTILS  ...::Orphan::Widget        Widget
+    2  PATH-HIT  LEAF-TYPEUTILS  ...::Orphan::6Widget$Ll$G  6Widget$Ll$G
+
+Every one is one module asking one leaf - exactly the shape the project
+constructs, and exactly the defect its header documents: a bare plural leaf
+resolving with nothing in scope.
+
+The last pair also explains the lane's `B4` flag rather than leaving it as a
+label. `6Widget$Ll$G` is a mangled instantiation name, minted after the name
+layer has finished, being used as a lookup key - which is what B4 means and
+what a `Res` cannot name.
+
+Getting those rows needed two env vars, not one: `leaf_hit` is gated on
+`CRYO_LEAF_AUDIT` and the `type_utils` row on `CRYO_PATH_AUDIT`. Enabling only
+the first shows four hits where the counter says eight, and the missing half
+reads as a stream with nothing to report. The audit vars are not
+interchangeable and picking wrong is silent.
+
+#### The deletion unit is the caller, not the function
+
+The counter already splits the hits by caller, and the five callers are not in
+one state:
+
+| caller | hits on the feeding corpus |
+|---|---:|
+| `resolve_named` step 5 | 4 |
+| `sema type_utils` | 4 |
+| `resolver` generic bound | 0 |
+| `symbolic_checker` | 0 |
+| `type_resolution` bound | 0 |
+
+Two callers are demonstrated live. The other three answer 0 even here, because
+this project constructs a plural leaf and not a generic parameter constrained by
+a trait leaf - their shape is a different one, and it has not been built yet.
+
+So "delete `lookup_by_leaf`" was never the available move, and the function's
+total was never the number to read. **The count of call sites is not a
+description of them**, applied to a lane rather than to a seam.
+
+#### What the pinned row is actually worth
+
+`b1-check` pins `lookup_by_leaf hits` at 0 across three targets that are all
+built with `cryo build` and none of which contains a plural leaf. The row is
+pinned over a population in which it **cannot** be non-zero.
+
+That is not useless - a fallback regrowing on those corpora would still move it -
+but it is not what it has been read as. It has never observed this lane
+answering, and a reader taking the 0 as the lane's state would be taking a
+starvation for a death. The behaviour IS gated, by `resolution_leaf_index`'s
+`WRONG_` tests inside `make test`; it is the counter, not the tree, that is
+blind here.
+
+This is the concrete instance behind 8.80's claim that for "is this step gone" a
+fixture is the stronger instrument. The fixture answered; the counter's row
+could not.
+
+#### Standing consequence for the remaining lanes
+
+Every other zero in that report - `M4 mono bare-name scan hits`, the const-table
+leaf pair, `2c-home-cursor`, `2-primitive` at the `pre_resolved` short-circuit -
+is now a statement about a corpus, a tool, and a caller, until someone builds
+the shape that would feed it. None of them may be deleted on the pinned zero
+alone, and the burden of proof is on "dead" in each case.
+
+`lookup_by_leaf` itself is not deletable: it answers, and the answers are the
+ones `resolution_leaf_index` exists to pin.
+
+#### Open, and the next shape to build
+
+The three generic-bound callers are undetermined. They are called and have not
+been observed answering on any corpus measured here. Determining them needs a
+fixture presenting a generic parameter whose constraint names a trait by a leaf
+that is in the index but not reachable through scope - the constraint analogue
+of `Orphan`. Recorded as the next lane fixture, not attempted.
+
+### 8.82 A gate that runs last cannot catch what it exists for
+
+8.79 moved the two language-server steps ahead of the test suite as a one-off
+ordering fix. The argument generalises and is recorded here as a rule, because
+the same shape can be reintroduced anywhere in a job.
+
+**A gate ordered after the gates most likely to fail is conditional on their
+success, and a conditional gate is not one.** The LSP step sat after the test
+suite, the roster, both example gates and valgrind; a job dying at `examples`
+never reached it, and a breakage stayed in for weeks behind a red that was about
+something else entirely.
+
+The failure is invisible in exactly the way 8.76 names: the step is not reported
+as skipped, it is simply absent from a run that already failed, and the run's
+red is attributed to the earlier gate. Nobody reads a gate that did not print.
+
+The ordering rule that follows: **a gate covering a surface no other gate covers
+runs before gates that merely cover it again.** Coverage uniqueness, not cost
+and not tradition, decides the position. The LSP compile is the only thing in
+the tree that compiles the LSP, so it goes early; `examples-golden` re-covers
+ground `examples` already walked, so it can go late.
+
+Worth re-checking the rest of the job against that rule rather than assuming
+this was the only instance.
