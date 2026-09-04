@@ -12209,3 +12209,130 @@ next step and it precedes any edit.**
   is the only part touching `from_name`.
 
 Not started; reported for a decision.
+
+### 8.86 A bare intrinsic binds through the prelude, not through codegen - MEASURED 2026-09-04
+
+8.85 stopped before choosing a route because the binding mechanism was
+unmeasured and the three candidate answers had wildly different costs. This is
+that measurement. **The prediction was wrong**, and the correction moves the
+lever.
+
+#### Prediction and falsifier
+
+Predicted: a bare `malloc` never binds through the resolver's scope chain. It
+reaches codegen with an empty slot and codegen binds it from the declaration
+index by name and arity, so the twins contest an overload set in `decl_index`
+populated in registration order - which is what `libc.cryo`'s import edge
+manipulates. Falsified by a resolver scope hit, or by E0636 being raised from
+the resolver rather than codegen.
+
+The reasoning behind it was inherited and looked strong: `IntrinsicDeclaration`
+calls `declare(sym)` and never `export_symbol`, so `core::intrinsics` exports 3
+names while declaring 142 and an importer binds none of them; `public module`
+was measured four ways to grant no visibility; and `libc.cryo` names the
+symptom as an ambiguous overload **at codegen**, with E0636 raised from
+`codegen/visit/call_emitter.cryo` and `codegen/ops/expr_ops.cryo`.
+
+#### The control, and the falsification
+
+Three one-file projects, one variable each: a bare `malloc`/`free` with no
+imports, the same with `import std::ffi::libc;`, and the qualified
+`intrinsics::malloc`. All three compile today.
+
+Then `public module core::intrinsics;` was removed from `stdlib/prelude.cryo`
+and the same projects rebuilt:
+
+| project | with the prelude line | without it |
+|---|---|---|
+| bare `malloc`/`free`, no imports | builds | **`E0202: cannot find function 'free' in this scope`** |
+| `intrinsics::malloc` by path | builds | **`E0240: 'intrinsics' is not reachable from this module`** |
+
+So the prelude line is load-bearing for both the bare leaf AND the module path,
+and a bare intrinsic resolves **through the resolver**. The prediction is
+falsified, and with it the inference chain behind it.
+
+**`public module` in the prelude does grant visibility.** The standing note that
+it grants none, and that its edges should not be followed, does not hold for
+this edge - measured here by removing it and watching two different resolution
+errors appear. Whether the prelude is special-cased or the earlier measurement
+was over a narrower population is not established; what is established is that
+the general claim cannot be applied to the prelude without checking.
+
+E0636 being raised from codegen was true and irrelevant: it is the diagnostic
+for a callee that reached codegen unbound, not the mechanism that binds one.
+A failure site is not an answering site, and reading one as the other is what
+produced the prediction.
+
+#### What the lever actually is, and what it costs
+
+The collision is not two entries in a codegen index. It is the prelude making
+an intrinsic's bare leaf visible in every module, while an `import ffi::libc`
+brings a second declaration of the same leaf into the same scope.
+
+That means the blunt fix - dropping intrinsics from the prelude - breaks every
+bare call site, not merely the contested ones. Counted across `compiler/src`,
+`stdlib`, `examples`, `tests`, `tools` and `runtime`, with comments stripped and
+each file's own declarations subtracted (an upper bound, since a file importing
+`ffi::libc` may already bind the twin):
+
+| census category | bare sites | files |
+|---|---:|---:|
+| A contested, not lowered (the libc twins) | 335 | 73 |
+| B contested, lowered (`panic`, `vfprintf`, `vprintf`) | 34 | 8 |
+| C uncontested, lowered (the real intrinsics) | 65 | 6 |
+| D uncontested, not lowered (`format`, `try_catch`) | **830** | 81 |
+| **total** | **1,264** | **144** |
+
+`format` alone is 830 of them. Dropping the prelude edge would cost 1,264 edits
+to remove 369 sites' worth of contested exposure, and would break `format` and
+the genuine intrinsics for no benefit. **The prelude edge is not the lever to
+pull**, which is the useful half of the falsification.
+
+#### The route the numbers now point at
+
+Category A is the population to move, and moving it is a deletion rather than a
+prelude change: delete the 84 declarations that codegen does not lower and whose
+`extern "C"` twin already exists, and `core::intrinsics` keeps its remaining 58,
+stays in the prelude, and bare `format`, `panic` and the real intrinsics keep
+resolving - 895 of the 1,264 bare sites never move.
+
+What must be answered for the 84 is where their callers go, and the two shapes
+have very different costs:
+
+* **Callers go to `ffi::libc` directly.** 444 qualified `intrinsics::X(` sites
+  plus 335 bare ones, and 58 of the 84 have a twin whose signature differs in
+  TYPES, so a large share need a cast as well as a rename.
+* **Ordinary Cryo functions keep the ergonomic signatures**, wrapping
+  `ffi::libc`, in a module the prelude already carries. Bare callers keep
+  working because exactly one declaration claims the leaf; the casts live once
+  in each wrapper instead of at every call site; `ffi::libc` stays reachable by
+  path and contests nothing.
+
+The second is what the collision analysis actually supports: the ambiguity comes
+from TWO declarations claiming one bare leaf, so the fix is to leave one, not to
+hide both. It is also the branch the decision already names - an ordinary
+function wrapping the primitive, the way `core::mem::size_of` wraps its
+intrinsic.
+
+Reported for a decision; nothing changed.
+
+#### Method: a chained shell line reports only its last command
+
+8.83's rule - assert per anchor, not per file - fired correctly and was thrown
+away. The probe-removal script raised an `AssertionError` and printed a
+traceback, but the shell line was `python ...; git diff; echo ...; make cryo`,
+so the command's status was `make cryo`'s 0. The probes stayed in the tree, went
+into the rebuilt compiler, and two gates ran against a probed binary before the
+diff was read.
+
+The existing rule about not reading an exit code through a pipeline does not
+cover this: there was no pipeline, and the assertion was correct. The rule that
+does cover it is narrower and worth stating on its own:
+
+**An assertion that is not the last command in a chained line is not an
+assertion.** Separate the steps, join them with `&&` so a failure stops the
+line, or check the result explicitly afterwards. A verification step whose
+failure cannot fail the command is decoration.
+
+This is the eighth instance of the absence-that-reads-as-progress family and the
+first in which the instrument was correct and the plumbing discarded it.
