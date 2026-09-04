@@ -11017,3 +11017,95 @@ gated on the wrong environment variable: an absence that reads as progress.
 
 Put the redirection inside the wrapper script, and confirm liveness within the
 first minute: a live PID and a log that is GROWING. Silence alone says nothing.
+
+### 8.76 An absence that reads as progress, and the gate that had it - MEASURED AND FIXED 2026-09-03
+
+The safety argument for every deletion in this document is that a gate would
+have caught it. One of the gates could not, and the way it failed has now
+happened three times in three different subsystems. It is one category and it is
+named here.
+
+#### The tree state that passed everything
+
+During 8.74 the rename transformer computed "is this leaf also a type name?"
+over `compiler/src`, `stdlib` and `tools`, then applied the answer to the whole
+repository. A test file declaring its own `type struct Sink` was invisible to
+the question and visible to the rewrite. **110 files were wrongly rewritten** -
+every `examples/` project, about ninety `legacy/bootstrap` tests, and five
+`tests/` files.
+
+That tree passed:
+
+| gate | reported |
+|---|---|
+| `make cryo` | 0 errors, 349 warnings |
+| `examples/09-json-config` | 5,749 - exact |
+| `tests/reexport_private_module` | 2,063 + E0240 - exact |
+| `tests/reexport_basic` | 4,153 - exact |
+| `lane-check` | `LOOKUP` 117, `REENTRY` 6 |
+| `b1-check` | B1 0 / B4 0 on three arms |
+
+Six green results over a tree with 110 damaged files. None of them is wrong;
+each is a true statement about a population that excluded every damaged file.
+`make test` caught it, as `error[E0233]: cannot find sink::new`, and only
+because five of the 110 happened to live under `tests/`.
+
+The `examples/` half was caught by a sweep run BY HAND. `make examples` on this
+host printed "run it from WSL" and exited 0.
+
+#### The category: an absence that reads as progress
+
+Three instances, three subsystems, one shape - a thing that did nothing and
+reported the same way as a thing that did its job:
+
+* **`make examples` on Windows** - printed a message and exited 0. A message
+  attached to a success is not a mitigation, because nobody reads it.
+* **an audit stream gated on the wrong environment variable** - `CRYO_PATH_AUDIT`
+  where `CRYO_RN_AUDIT` was meant. The stream is empty, which is exactly what a
+  clean run looks like, so the zero reads as a finding.
+* **a detached `selfhost-check` that never started** (8.75) - the launch was
+  mis-quoted and `cmd` exited at once. No log is also what a healthy early run
+  of that check looks like, because its output buffers.
+
+In each case the failing state and the passing state are OBSERVATIONALLY
+IDENTICAL to the person reading the result. This is the same error as reading a
+measured zero without asking what would have to be true for it to be zero for an
+uninteresting reason - except the zero here is the gate's own output.
+
+The rule that follows: **a gate must state the population it swept, and refuse
+rather than report success when it cannot sweep one.** An exit code is not a
+measurement. "OK" and "OK, over nothing" must not print the same way.
+
+#### What was built
+
+`scripts/examples-gate.py` replaces the POSIX-only shell loop and runs on both
+hosts. It ends with `examples-gate: OK -- 14 project(s) built`, naming the
+population, and it has three refusals that exit non-zero instead of passing:
+
+| condition | outcome |
+|---|---|
+| compiler binary missing | FAIL, exit 2 |
+| fewer projects discovered than `--min` (default 1) | FAIL, exit 2 |
+| any project fails to build | FAIL, exit 1, naming the projects |
+
+All three were exercised rather than asserted. The third was checked by breaking
+`examples/01-hello` on purpose - `examples-gate: FAIL -- 1 of 14 project(s) did
+not build: examples/01-hello` - because a gate nobody has seen fail is a gate
+nobody has tested.
+
+`scripts/gate-unavailable.py` gives the refusal one home. `examples-golden` and
+`valgrind-check` also exited 0 on Windows having done nothing; they now exit 1
+and say so. Both genuinely cannot run there - the first runs the built examples
+and diffs stdout, the second needs valgrind - and "it could not run" is the
+second honest outcome of a gate, not the first.
+
+CI runs all three on ubuntu, so nothing about the Linux path changes; the script
+was run under WSL against the ELF compiler to confirm it, 14 of 14.
+
+#### `legacy/` is not a gate gap
+
+About ninety of the 110 damaged files were under `legacy/bootstrap/tests`. That
+tree is 494 `.cryo` files that NOTHING builds - one comment in
+`selfhost-check.py` is its only mention in the build. It is inert rather than
+ungated, and damage there is invisible because it cannot matter. Recorded so the
+next reader does not build a gate for it.
