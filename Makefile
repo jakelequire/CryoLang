@@ -429,10 +429,10 @@ ifeq ($(HOST_OS),windows)
 # stdlib/.bin and compiler/build but not runtime/.bin, so building the tiers up
 # front survives every round.
 selfhost-check: runtime-tiers
-	scripts\selfhost-check-windows.cmd
+	scripts\selfhost-check-windows.cmd $(ARGS)
 else
 selfhost-check: $(PIN) runtime-tiers
-	@python3 scripts/selfhost-check.py
+	@python3 scripts/selfhost-check.py $(ARGS)
 endif
 
 # ---- pin self-verification (M14 / M12) --------------------------------

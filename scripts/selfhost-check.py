@@ -596,7 +596,10 @@ def _compare_ir_trees(root_a: Path, root_b: Path):
 def run_windows_selfhost(runner: list, verbose: bool = False) -> str:
     """Windows section: the 6-stage byte-identity self-host with bin/cryo.exe.
     `runner` is [] (native, Windows host) or ['wine'] (Linux host).  Returns
-    'ok' / 'skip' / 'fail'."""
+    (status, reason) with status 'ok' / 'skip' / 'fail'.  The reason travels
+    with the status because the run's arm summary has to be readable on its
+    own: a summary that says "see the output above" is the kind of gate line
+    nobody checks."""
     native = not runner
     print()
     print(f"{C.BOLD}==> Windows 6-stage byte-identity gate "
@@ -604,7 +607,7 @@ def run_windows_selfhost(runner: list, verbose: bool = False) -> str:
 
     if not WIN_BOOT.exists():
         print(f"  {C.YELLOW}↷ skipped{C.RESET} (bin/cryo.exe not present)")
-        return "skip"
+        return ("skip", "bin/cryo.exe not present")
 
     # Environment per runner.  Native inherits the host PATH/CRYO_CC (set
     # CRYO_CC if your C driver isn't `cc`); wine needs the fetched toolchain.
@@ -623,7 +626,7 @@ def run_windows_selfhost(runner: list, verbose: bool = False) -> str:
                 print(f"      {C.DIM}- {m}{C.RESET}")
             print(f"      {C.DIM}A self-host links a runnable cryo.exe at stages 2/4/6; that needs")
             print(f"      wine + the fetched llvm-mingw (clang/ld.lld) and llvm-win (LLVM-C) bits.{C.RESET}")
-            return "skip"
+            return ("skip", "missing " + ", ".join(missing))
         zwin = lambda p: "Z:" + str(p).replace("/", "\\")
         env = {"WINEDEBUG": "-all",
                "CRYO_STDLIB": "Z:" + str(ROOT / "stdlib").replace("\\", "/"),
@@ -647,7 +650,7 @@ def run_windows_selfhost(runner: list, verbose: bool = False) -> str:
             print_summary(times, time.perf_counter() - start)
             print()
             print(f"{C.RED}{C.BOLD}✗ Windows FAILED at stage {i}/{len(stages)}{C.RESET}")
-            return "fail"
+            return ("fail", f"stage {i}/{len(stages)} did not build")
         _drop_llvm_dll_beside(WIN_S2_EXE)
         _drop_llvm_dll_beside(WIN_S3_EXE)
 
@@ -657,20 +660,85 @@ def run_windows_selfhost(runner: list, verbose: bool = False) -> str:
     if ok is None:
         print(f"  {C.RED}✗ cannot compare windows IR:{C.RESET} {detail}")
         print(f"     {C.DIM}looked under {WIN_S3_IR.relative_to(ROOT)} and …/self/win-s4{C.RESET}")
-        result = "fail"
+        result = ("fail", "windows IR could not be compared")
     elif ok:
         nmods, total = detail
         print(f"  {C.GREEN}{C.BOLD}✓ FIXED POINT OK{C.RESET}  "
               f"windows stage-3 and stage-4 produce byte-identical IR")
         print(f"  {C.DIM}modules:{C.RESET} {nmods}")
         print(f"  {C.DIM}IR size:{C.RESET} {total:,} bytes")
-        result = "ok"
+        result = ("ok", f"{nmods} modules byte-identical")
     else:
         print(f"  {C.RED}{C.BOLD}✗ FIXED POINT BROKEN{C.RESET}  first differing module: {detail}")
-        result = "fail"
+        result = ("fail", f"first differing module: {detail}")
 
     print_summary(times, time.perf_counter() - start)
     return result
+
+
+# ---------------------------------------------------------------------------
+# What the run actually verified.
+#
+# This gate certifies the branch, and it has two arms: the Linux 6-stage chain
+# and the Windows one.  Both mapped a SKIPPED arm to exit 0 - so an environment
+# without wine ran half the gate and reported success, and "the fixed point
+# holds on both hosts" was a claim about a run nobody could tell apart from a
+# run that checked one host.  The repo already has the rule this violates, in
+# scripts/gate-unavailable.py: a gate has two honest outcomes, it ran and
+# passed or it did not pass, and "it could not run here" is the second.
+#
+# So the arms are counted and named, and a skip is a refusal unless the caller
+# declared it.  The declaration is a flag rather than a silent default because
+# it then lives at the CALL SITE - visible in the workflow or Makefile a reader
+# inspects - instead of inside a mapping nobody reads.
+# ---------------------------------------------------------------------------
+
+# An arm that a flag put out of scope for THIS invocation, and which something
+# else is accountable for.  Distinct from 'skip', which is an arm that was
+# attempted and could not run: the first is a division of labour, the second is
+# missing coverage.
+DECLINED = "declined"
+
+
+def finish_arms(arms: list, allow_skipped: bool) -> int:
+    """Print what each arm did and decide the run's exit status.
+
+    `arms` is a list of (name, status, reason) with status 'ok' / 'skip' /
+    'fail' / DECLINED.  Any failure fails the run; so does any skip, unless
+    --allow-skipped-arm was passed."""
+    verified = [a for a in arms if a[1] == "ok"]
+    skipped  = [a for a in arms if a[1] == "skip"]
+    failed   = [a for a in arms if a[1] == "fail"]
+
+    print()
+    print(f"{C.BOLD}==> selfhost-check arms{C.RESET}  "
+          f"{len(verified)} verified, {len(skipped)} skipped, {len(failed)} failed")
+    for name, status, reason in arms:
+        if status == "ok":
+            mark = f"{C.GREEN}✓ verified{C.RESET}"
+        elif status == "fail":
+            mark = f"{C.RED}✗ FAILED{C.RESET}"
+        elif status == "skip":
+            mark = f"{C.YELLOW}↷ SKIPPED{C.RESET}"
+        else:
+            mark = f"{C.DIM}- not this run's job{C.RESET}"
+        print(f"      {name:<9} {mark}  {C.DIM}{reason}{C.RESET}")
+
+    if failed:
+        return 1
+    if skipped and not allow_skipped:
+        print()
+        print(f"{C.RED}{C.BOLD}✗ selfhost-check: an arm did not run.{C.RESET}")
+        for name, _, reason in skipped:
+            print(f"  {C.DIM}{name}: {reason}{C.RESET}")
+        print(f"  {C.DIM}A gate that did not run has not passed.  Provide what the arm")
+        print(f"  needs, or pass --allow-skipped-arm to record deliberately that this")
+        print(f"  environment verifies {len(verified)} of {len(arms)} arms.{C.RESET}")
+        return 1
+    if skipped:
+        print(f"  {C.YELLOW}accepted with --allow-skipped-arm: "
+              f"{len(verified)} of {len(arms)} arms verified here.{C.RESET}")
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -747,11 +815,17 @@ def main_windows(args) -> int:
     sys.stderr.flush()
     rc = subprocess.run(["wsl.exe", "--", "bash", "-lc", inner]).returncode
     if rc != 0:
+        # The child printed its own arms; it is the authority on the Linux one.
         return rc
 
     # 2. Windows section natively (bin/cryo.exe through the same 6 stages).
-    win = run_windows_selfhost([], verbose=args.verbose)
-    return 0 if win in ("ok", "skip") else 1
+    #    This is the host that can run BOTH arms, so it is the one whose green
+    #    licenses "the fixed point holds on both hosts" - it must not be
+    #    reachable with the windows arm skipped.
+    st, why = run_windows_selfhost([], verbose=args.verbose)
+    arms = [("linux", "ok", "verified in WSL (see above)"),
+            ("windows", st, why)]
+    return finish_arms(arms, args.allow_skipped_arm)
 
 
 # ---------------------------------------------------------------------------
@@ -777,7 +851,12 @@ def main():
     parser.add_argument("--keep-logs", action="store_true",
                         help="keep build-logs/selfhost-check/ from previous runs")
     parser.add_argument("--no-windows", action="store_true",
-                        help="skip the optional Windows cross-build verification stage")
+                        help="this invocation is not accountable for the Windows arm "
+                             "(the Windows-host entry point runs it natively instead)")
+    parser.add_argument("--allow-skipped-arm", action="store_true",
+                        help="exit 0 even though an arm could not run here.  Records "
+                             "a partial verification deliberately; without it a "
+                             "skipped arm fails the gate.")
     args = parser.parse_args()
 
     # Windows host: native pre-check + WSL Linux chain.  This branch never
@@ -892,15 +971,20 @@ def main():
     print_summary(times, total)
 
     # Windows section: the same 6-stage self-host with bin/cryo.exe, under wine
-    # on this Linux host.  Only after the Linux fixed point holds.  Skips
-    # cleanly when wine / the windows toolchain isn't present, so it never
-    # breaks a Linux-only run.
-    if result_ok and not args.no_windows:
-        win = run_windows_selfhost(["wine"], verbose=args.verbose)
-        if win == "fail":
-            return 1
+    # on this Linux host.  Only attempted once the Linux fixed point holds -
+    # a broken Linux arm makes the Windows one uninformative, not optional.
+    arms = [("linux", "ok" if result_ok else "fail",
+             "stage-3 == stage-4 IR" if result_ok else "fixed point broken")]
+    if not result_ok:
+        return finish_arms(arms, args.allow_skipped_arm)
 
-    return 0 if result_ok else 1
+    if args.no_windows:
+        arms.append(("windows", DECLINED, "--no-windows: run natively by the caller"))
+    else:
+        st, why = run_windows_selfhost(["wine"], verbose=args.verbose)
+        arms.append(("windows", st, why))
+
+    return finish_arms(arms, args.allow_skipped_arm)
 
 
 if __name__ == "__main__":
