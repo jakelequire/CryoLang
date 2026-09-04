@@ -49,6 +49,32 @@ jobs:
           ./compiler/build/cryo --version
           ./compiler/build/cryo --help
 
+      # Moved ahead of the test suite deliberately.  The LSP links the compiler
+      # as a library and nothing else here compiles it, so it is the only step
+      # covering that surface - and while it ran last, an unrelated failure
+      # earlier in the job meant it never ran at all.  It stayed broken for
+      # weeks behind a job that died at `examples`.  A gate that only runs when
+      # everything else already passed cannot catch what it is for.
+      - name: Build the language server (tools/CryoLSP via bin/cryo)
+        run: make lsp
+
+      - name: Smoke-test the LSP binary
+        run: |
+          test -x bin/cryolsp || { echo "bin/cryolsp not built"; exit 1; }
+          # cryolsp is a stdio JSON-RPC server (no --help). Smoke = it starts
+          # and exits on its own when stdin closes, rather than hanging
+          # (timeout -> 124) or dying on a signal (128+N).
+          #
+          # `|| code=$?` rather than `; code=$?`: the step runs under `bash -e`,
+          # where a bare failing command aborts before the tolerance check below
+          # can read its status - so an ordinary non-zero exit (cryolsp returns 1
+          # on EOF) failed the step with no diagnostic at all.
+          code=0
+          printf '' | timeout 10 bin/cryolsp >/dev/null 2>&1 || code=$?
+          if [ "$code" -ge 124 ]; then
+            echo "cryolsp hung or crashed on EOF (exit $code)"; exit 1
+          fi
+
       - name: Run the test suite (tests/ via cryo test)
         run: make test
 
@@ -93,26 +119,6 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends valgrind
           make valgrind-check
-
-      - name: Build the language server (tools/CryoLSP via bin/cryo)
-        run: make lsp
-
-      - name: Smoke-test the LSP binary
-        run: |
-          test -x bin/cryolsp || { echo "bin/cryolsp not built"; exit 1; }
-          # cryolsp is a stdio JSON-RPC server (no --help). Smoke = it starts
-          # and exits on its own when stdin closes, rather than hanging
-          # (timeout -> 124) or dying on a signal (128+N).
-          #
-          # `|| code=$?` rather than `; code=$?`: the step runs under `bash -e`,
-          # where a bare failing command aborts before the tolerance check below
-          # can read its status - so an ordinary non-zero exit (cryolsp returns 1
-          # on EOF) failed the step with no diagnostic at all.
-          code=0
-          printf '' | timeout 10 bin/cryolsp >/dev/null 2>&1 || code=$?
-          if [ "$code" -ge 124 ]; then
-            echo "cryolsp hung or crashed on EOF (exit $code)"; exit 1
-          fi
 
   selfhost-check:
     name: selfhost-check (stage-3 == stage-4 byte-identity)

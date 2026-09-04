@@ -11318,3 +11318,105 @@ compiler and every run recompiled. But the trap is live for anyone measuring
 after a gate run, and it has the shape 8.76 names: 0 rows and 0 work done are
 the same number. **Delete the corpus `build/` directory before counting, or
 count something that cannot be skipped.**
+
+### 8.79 The language server is gated locally, and the gate found the hole it was built to avoid - MEASURED AND FIXED 2026-09-04
+
+The LSP links the compiler as a LIBRARY, so it sees every AST, NodeKind and
+public-signature change, and no local gate compiled it. A green local suite has
+never been evidence that it builds, and it has been broken behind one three
+times. It survived the 8.74 rename - which renamed modules twelve of its files
+name - only because someone ran `make lsp` by hand.
+
+CI does build it, so the gap was local. But the CI step ran LAST, after the test
+suite, the roster, both example gates and valgrind, and a job that died earlier
+never reached it: that is how one of the three breakages stayed in for weeks.
+
+#### Prediction and falsifier
+
+Wiring the LSP build into the local gate set is behaviour-preserving for the
+compiler; the LSP compiles with 0 errors and about 481 warnings, and links.
+
+The falsifier was not about the compile. `make lsp` also installs over
+`bin/cryolsp`, which an editor holds open, and the failure is a bare
+`error: linking failed` with no linker diagnostic AFTER a clean compile. If the
+gate cannot tell that apart from a real link break it is 8.76's defect pointing
+the other way - a gate that cries wolf gets ignored, which is how it stops being
+evidence.
+
+#### The falsifier is answered by not writing to a held path
+
+`make lsp` does two jobs - compile the server, and install the result. Only the
+first is a gate. `make lsp-check` builds into `tools/CryoLSP/build/gate` and
+installs nothing, so a held pin cannot reach it. Whether the pin can be replaced
+is a different question from whether the source still compiles, and only the
+second one belongs in a gate.
+
+This was measured in the confounded state rather than argued: a `cryolsp.exe`
+was running throughout, and the gate passed.
+
+| | |
+|---|---:|
+| modules compiled | 266 (24 local, 81 std, 161 dep) |
+| errors | 0 |
+| warnings | 481 |
+| linked | `build/gate/cryolsp.exe` |
+| cold wall time | 93 s |
+
+The prediction holds exactly.
+
+#### A fifth instance of the absence that reads as progress, found in the gate
+
+The naive gate is `cryo build` plus an exit code. Run twice, the second run
+prints
+
+    cryolsp is up to date (release)
+    Compiled -> build/gate/cryolsp.exe
+
+and exits 0 in ten seconds having compiled nothing. `Compiled ->` is printed
+either way, so the line that looks like the result is not one. A gate written on
+that exit code sweeps nothing and reports success - `make examples`' defect
+reproduced in a new location, a day after it was removed from the old one.
+
+So the gate starts cold and refuses anything it did not watch happen. Success
+requires the compiler to have stated the population it built - the
+`N local, M std, K dep module(s)` line - and that population to clear
+`--min-modules` (200 against 266 today). "Up to date" is a refusal, not a pass.
+
+The general form: **a tool's success message is not evidence that the tool did
+the work.** `Compiled ->` names an output file that exists; it says nothing
+about whether anything was compiled to produce it. Only the population line
+does, and only because the compiler cannot print it without having counted.
+
+#### Controls
+
+Both run, neither assumed.
+
+| control | expected | observed |
+|---|---|---|
+| warm build (`ARGS=--keep`) | refuse | `FAIL -- nothing was compiled; an incremental build that skipped the tree has not gated it` |
+| a real break (`Logger::init` renamed in `main.cryo`) | fail, naming it | `FAIL -- build exited 1 with 1 error line(s)`, quoting `error[E0233]: cannot find Logger::init_removed_by_control` |
+
+The second is the one that matters: without it the gate is a green test asserting
+nothing, which is the shape this tree has been caught by before. The break was
+reverted and the file compared byte-for-byte against a copy taken before the
+edit.
+
+#### The CI ordering, fixed in the same change
+
+The two LSP steps moved from the end of the Linux job to immediately after
+`make cryo`. A gate that only runs when everything else has already passed
+cannot catch what it is for, and the record shows it failing to.
+
+#### What it does not cover
+
+The install path. `make lsp` still hoists to `bin/cryolsp` and still fails on a
+held pin - correctly, because there the install IS the job. The gate covers
+compile and link only, which is the surface a compiler change breaks.
+
+It builds with the PIN, like `make lsp` and for the same reason: the compiler
+LIBRARY is rebuilt from current source either way, so requiring the stage-2
+BINARY would put a full self-host in front of the gate for no added coverage.
+
+`LOOKUP` 117, `REENTRY` 6, B1 0 and B4 0 on three arms, roster 2,106, examples
+14 of 14 - unchanged, as they must be, since no compiler or stdlib source moved.
+
