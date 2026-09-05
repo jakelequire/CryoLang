@@ -13163,6 +13163,12 @@ another intrinsic is a different shape from an intrinsic contested by a libc
 twin, and namespacing - the answer for the other three - may not be the answer
 for it. Not decided here.
 
+> **WITHDRAWN by 8.94.** The set is three. The runtime declaration is
+> `![config(linux)]` in `CryoRt::Backtrace`, a separate compilation unit that
+> cannot reach `std::core::intrinsics` and must declare what it lowers; the two
+> never share a scope. The "four" came from a census that treated every tree as
+> one population, which is §8.76's rule from the other side.
+
 **`realloc` is coupled to `free` and cannot be ordered separately.**
 `bare_intrinsic_priority.cryo` asserts in one file that a bare `free` and a
 bare two-argument `realloc` both bind the intrinsic, so the test's premise
@@ -13270,3 +13276,72 @@ The result is that `intrinsics::malloc`, `intrinsics::free` and
 `intrinsics::realloc` now have **zero source callers** while keeping their
 declarations. That is a deliberate intermediate state: the migration half is
 finished and the remaining question is isolated to who may own a bare leaf.
+
+### 8.94 The lowered leaves need no namespacing, and 8.92's correction to the census was itself wrong - MEASURED 2026-09-05
+
+The decision's third category - the intrinsics codegen actually lowers, to be
+namespaced and reached by explicit path rather than deleted - turns out to need
+nothing. Each of the four is already in the shape the decision asks for, for a
+different reason, and one of them was never contested at all.
+
+#### `panic`: the wrapper already exists and the bare leaf correctly names it
+
+`std::core::_module` declares an ordinary Cryo `panic(message, file, line) ->
+never` whose whole body is `intrinsics::panic(message, file, line)`, and
+`core::_module` is in the prelude. So the two claimants on the bare leaf are a
+wrapper and the primitive it wraps, and they cannot diverge.
+
+Measured over the tree: 34 bare `panic(...)` calls, every one of them in a
+stdlib module reaching `core::panic` through the prelude, and exactly **two**
+sites naming the intrinsic - `core::_module.cryo:43`, which is the wrapper's own
+body, and `mangled_name.cryo:899`. That is already "reach it by explicit path":
+the primitive is named where the primitive is meant, and the bare leaf names
+the public API.
+
+This is also the wrapper route 8.86 recommended and 8.87 refuted, working. The
+refutation stands - a wrapper is a declaration of the leaf and does not remove
+the ambiguity - but where both claimants end at the same place, the remaining
+ambiguity decides nothing.
+
+#### `vfprintf` and `vprintf`: one call site, already qualified
+
+`vfprintf` has a single caller, `utils/logger.cryo:294`, already written
+`intrinsics::vfprintf`. `vprintf` has none. Both belong to the variadic family
+parked in 8.91, and neither is reached bare anywhere.
+
+#### `frame_address` was never contested, and 8.92's correction was an artifact
+
+8.92 recorded that the lowered-and-contested set is four rather than three,
+because `frame_address` is contested by a second `intrinsic function`
+declaration in `runtime/backtrace/src/lib.cryo` returning `u8*` where the
+stdlib returns `void*`. **That correction is withdrawn.**
+
+The runtime declaration is `![config(linux)]` inside `CryoRt::Backtrace`, a
+module whose only import is `CryoRt::Sys`. The runtime tiers are a separate
+compilation unit that cannot reach `std::core::intrinsics` - that is the whole
+point of the tiered runtime - so it must declare the intrinsics it lowers. The
+two declarations never share a scope, never contest a leaf, and the differing
+return type is each unit's own view of a pointer that LLVM's
+`llvm.frameaddress.p0` returns either way.
+
+8.85's three was right. The four came from a census that walked `stdlib`,
+`compiler/src`, `runtime`, `tests`, `tools` and `examples` as one population
+and called a same-leaf declaration in any of them a contest - **the population
+computed over was not the population the answer applies to**, which is §8.76's
+rule, arrived at from the other direction. A "contest" is only a contest inside
+one linked unit, and the instrument had no notion of one.
+
+Recorded rather than quietly dropped, because a correction that was carried
+into a commit message and a brief is exactly the kind that outlives its
+evidence.
+
+#### Where the migration stands
+
+`core::intrinsics` is 142 declarations down to **64**. Of the 84 libc twins,
+81 are gone; the three that remain - `malloc`, `free`, `realloc` - have zero
+source callers and are held only by the bare-leaf question in 8.93. The lowered
+intrinsics keep their declarations, as intended, and are already reached by
+path. What is left is two parked questions, both resolution rather than
+migration: which declarations may claim a bare leaf when a prelude edge makes
+several visible, and whether `ffi::libc`'s fixed-arg variadic externs can serve
+callers that need Cryo-side forwarding.
