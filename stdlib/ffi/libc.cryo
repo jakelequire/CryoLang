@@ -778,9 +778,6 @@ extern "C" {
     function tmpnam(buf: u8*)                           -> u8*;
     function tempnam(dir: u8*, prefix: u8*)             -> u8*;
 
-    function popen(command: u8*, mode: u8*) -> void*;
-    function pclose(stream: void*)          -> i32;
-
     function getline(lineptr: u8**, n: u64*, stream: void*) -> i64;
     function getdelim(lineptr: u8**, n: u64*, delim: i32, stream: void*) -> i64;
 
@@ -913,7 +910,44 @@ extern "C" {
     function mbstowcs(dest: u32*, src: u8*, n: u64) -> u64;
     function wcstombs(dest: u8*, src: u32*, n: u64) -> u64;
 
+}
+
+// Pipe-backed subprocess and path canonicalisation, OS-dispatched.
+//
+// msvcrt spells `popen`/`pclose` as `_popen`/`_pclose`, and has no
+// `realpath` at all - `_fullpath(absPath, relPath, maxLen)` fills the same
+// role, but only lexically: it makes a path absolute and normalises `.`/`..`
+// without resolving symlinks or requiring the target to exist. Note its
+// argument order is the reverse of POSIX `realpath(path, resolved)`, so the
+// shim swaps them, and its buffer is assumed to be PATH_MAX (4096) bytes -
+// the size POSIX `realpath` documents for a null `resolved`.
+![target(unix)]
+extern "C" {
+    function popen(command: u8*, mode: u8*) -> void*;
+    function pclose(stream: void*)          -> i32;
     function realpath(path: u8*, resolved: u8*) -> u8*;
+}
+
+![target(windows)]
+extern "C" {
+    function _popen(command: u8*, mode: u8*) -> void*;
+    function _pclose(stream: void*) -> i32;
+    function _fullpath(absPath: u8*, relPath: u8*, maxLength: u64) -> u8*;
+}
+
+![target(windows)]
+function popen(command: u8*, mode: u8*) -> void* {
+    return _popen(command, mode);
+}
+
+![target(windows)]
+function pclose(stream: void*) -> i32 {
+    return _pclose(stream);
+}
+
+![target(windows)]
+function realpath(path: u8*, resolved: u8*) -> u8* {
+    return _fullpath(resolved, path, 4096);
 }
 
 // Over-aligned allocation, OS-dispatched.
@@ -990,11 +1024,8 @@ function isatty(fd: i32) -> i32 {
 
 // Windows-only msvcrt env helper.  mingw doesn't ship POSIX
 // `setenv`/`unsetenv`; the equivalent is `_putenv_s(name, value)`
-// (empty value deletes the binding).  The other msvcrt-underscored
-// CRT aliases (`_popen` / `_pclose` / `_isatty` / `GetModuleFileNameA`)
-// are declared inline in `core::intrinsics` next to the Cryo shims
-// that call them, since `core::intrinsics` is the leaf module and
-// can't import `ffi::libc` without back-edging the module graph.
+// (empty value deletes the binding).  Every msvcrt-underscored CRT alias
+// lives beside the shim that calls it, in this file.
 ![target(windows)]
 extern "C" {
     function _putenv_s(name: u8*, value: u8*) -> i32;
