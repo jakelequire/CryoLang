@@ -12685,3 +12685,164 @@ character rather than as care around it: a backslash cannot appear in a
 heredoc at all, including in prose describing the trap. The general form: a
 workaround recorded against a trap is itself a claim, and it inherits the same
 burden of evidence as the measurement it protects.
+
+### 8.90 The intrinsics migration starts with 48 declarations nobody calls, and the instrument was wrong twice before it was right - MEASURED, PARTIALLY LANDED 2026-09-04
+
+8.85 sized the category-A population, 8.86 found the binding mechanism and
+8.87 costed the deletion at about 779 call sites and declined the wrapper
+route. This is the re-measurement that precedes the edits, the two instrument
+defects it went through, and the first batch.
+
+#### The two counts, re-taken under one methodology
+
+8.86's 1,264 strips comments and subtracts each file's own declarations;
+8.85's 444 states no such thing, so the two were not comparable and neither
+could size the work. Re-taken together, comments stripped with string literals
+respected, own declarations subtracted, over the same six trees:
+
+| | sites | files |
+|---|---:|---:|
+| qualified `intrinsics::X(` | **444** | 78 |
+| bare, real calls | **302** | - |
+
+The qualified figure reproduces 8.85's 444 exactly, so that number was already
+comparable and the concern about it was unfounded - comments contain no
+qualified sites at all. The bare figure is the one that moved, and why it moved
+is the substance of this entry.
+
+#### The question 8.87 left open for the qualified half
+
+Of the 444 qualified sites, **31 are in files that already import `ffi::libc`**
+(13 files); 413 in 65 files are not. The bare half splits the same way, 34 of
+342 - and that 34 reproduces 8.87's 34 exactly.
+
+So the "free" population, where deleting the intrinsic simply lets an existing
+binding win, is **8% of the work, not a shortcut through it**. Predicted under
+25% on the grounds that `compiler/src` owns 273 of the 444 and intrinsics.cryo's
+own header says the compiler calls `intrinsics::malloc`/`free` directly.
+Confirmed, and more strongly than predicted.
+
+#### Two instrument defects, both caught by a spot-check rather than by the count
+
+The first: a bare-call pattern excluding a preceding `:` but not a `.`, so
+every `x.free()` **method call** counted as a bare intrinsic call. It read 427.
+
+The second is the one worth recording. **Cryo declares methods without the
+`function` keyword** - `close(mut this) -> void {`, `wait(&this) ->
+BarrierWaitResult {`. A declaration regex anchored on `function` therefore
+cannot see a method, which has two consequences pointing in opposite
+directions: the contested census is a LOWER bound, because a same-leaf method
+was never counted as a twin; and the bare-call count is an UPPER bound, because
+a method declaration sits at the start of its line and matches a bare-call
+pattern with nothing to subtract it.
+
+The repair failed once before it worked. Distinguishing a declaration from a
+call by what follows the closing paren, with the `-> type` made optional,
+classifies `fflush(stdout);` as a prototype: a call statement and a prototype
+both end in `;`, and only the `->` separates them. That read 42 declarations
+and 0 calls for `fflush`, which is exactly backwards. Requiring a body brace,
+and leaving prototypes to the `function` regex that already sees them, reads 40
+calls and 2 prototypes.
+
+Neither defect was caught by the totals, which looked reasonable throughout.
+Both were caught by reading the sites behind a small number: `dup`'s single
+site is `return dup(1, 2);` inside the negative test that declares its own
+two-parameter `dup`. **The count of call sites is not a description of them**,
+and the cheapest place to apply that rule is the leaf with four sites, not the
+one with 148.
+
+#### 52 of the 84 are called from nowhere
+
+| category A, by work required | leaves |
+|---|---:|
+| no call sites at all | **52** |
+| identical twin signature, has callers | 7 |
+| twin signature differs, has callers | 25 |
+
+The 58-differ / 26-identical split reproduces 8.85 exactly, but only 25 of the
+58 differing leaves have callers, so **the 271 casts attach to 25 functions,
+not 58**. The migration is not one 779-site change; it is a deletion of 52
+declarations that cost nothing, then 32 per-function changes.
+
+The zero is controlled. Every `.cryo` file in the repository - 1,554 of them,
+including the inert `legacy/` tree and the gitignored `dist/` release copy -
+was searched for a bare word match with no paren required, so a use as a
+function value or through a re-export would still appear. Every hit is prose, a
+`libc::`-qualified call, or a declaration. Non-`.cryo` hits are config keys,
+build logs and generated docs. A zero can only be inflated by the method-syntax
+defect, never deflated, so the correction moved five leaves INTO the dead set
+(`close`, `kill`, `open`, `pipe`, `wait`) and none out of it.
+
+#### 8.85's demanded emitter control fires, on the two the plan defers
+
+8.85 warned that absence from `from_name` does not mean "an ordinary call" and
+that a deletion pass must check the emitter. It does fire. Ten category-A
+leaves are named by a string literal in `compiler/src`; six are coincidence
+(`link` and `system` are cryoconfig keys, `read` appears in context labels).
+The rest split into two mechanisms that look identical in a grep and are not:
+
+* `abort`, `strcmp`, `memcpy`, and one of the two `free` sites call
+  `llvm_module.add_function(name, ty)`, which declares the LLVM function
+  directly and needs no Cryo declaration at all.
+* **`malloc` at three sites in `expr_ops.cryo` and `free` at one call
+  `resolver.resolve_function(intern_str(name))`**, and `resolve_function`
+  resolves the **bare leaf through the DeclarationIndex**.
+
+So deleting `intrinsics::malloc` and `intrinsics::free` would change what
+codegen synthesizes for an array literal in every module that does not import
+`ffi::libc`, falling through to `declare_extern_function_return_only`. That is
+a codegen coupling belonging to those two leaves alone, and it has to be
+resolved inside their own change rather than discovered during it. The `free`
+site is also a fallback chain - `std::alloc::allocator::free`, then bare `free`
+- which is the shape this tree keeps growing.
+
+#### `ffi::libc` is complete for category A, and that is not the same as adequate
+
+All 84 twins are present, so there is no completeness gap to close. Adequacy is
+a different question and has at least one real answer: `libc::popen`,
+`libc::pclose` and `libc::realpath` are declared **ungated**, so on Windows they
+name symbols msvcrt does not export. The working Windows path is a shim in
+`intrinsics.cryo` that forwards to `_popen`/`_pclose`/`_fullpath`, and
+`realpath`'s shim reverses the argument order. Those three, plus the unix-gated
+`open_memstream`, are the only target-gated leaves and are held out of the
+deletion batch: moving them means moving shim logic into `ffi::libc` first.
+
+#### What landed
+
+48 declarations deleted - the 43 with no call sites and no target gate, plus
+the five the instrument correction added. 142 intrinsic declarations become 94.
+Gates before and after are identical: `OVERALL PASS` (178 compile-fail, 39
+projects), B1 = 0 and B4 = 0 on all three arms, `LOOKUP` 117 and `REENTRY` 6,
+`lsp-check` 266 modules / 0 errors. Nothing moved that was not predicted to.
+
+#### Four corrections
+
+**Category B is four, not three.** `frame_address` is contested and lowered.
+Its twin is not a libc extern but a **second `intrinsic function` declaration**
+in `runtime/backtrace/src/lib.cryo`, returning `u8*` where the stdlib returns
+`void*`. A different shape from the other three and not category-A work.
+Contested is 88 rather than 87 under a regex that models modifiers.
+
+**`api-index-check` is not a control on any of this.** The generated
+`std::core::intrinsics` section lists six entries - the six plain `function`
+declarations - and none of the 142 `intrinsic function` ones. Deleting 48 of
+them left `docs/stdlib-api.txt` byte-identical. Predicted the index would go
+stale and need regenerating; it did not, because the population it indexes
+excludes intrinsics entirely. Recorded because an unchanged golden after a
+48-declaration deletion reads as a broken instrument until the reason is known.
+
+**A comment naming a consumer that does not consume it.** `open_memstream`'s
+comment said it "Backs the diagnostic renderer's render to a string path" and
+directed Windows callers to "a tmpfile-based path (see renderer.cryo
+::render_to_string)". `renderer.cryo` contains no `tmpfile`, and its own
+docstring says every write goes through `utils::diag_sink`, "no `FILE*`
+involved". The comment described a consumer, and a fallback for that consumer,
+neither of which exists. Replaced with the mechanism and the POSIX-only
+constraint.
+
+**The regression test's premise.** `tests/tests/lang/bare_intrinsic_priority.cryo`
+pins bare `free` and bare 2-arg `realloc` binding the intrinsic. Both leaves
+survive this batch, so the test is untouched and still passes. It comes due
+with `free`, where it is to be replaced rather than inverted: the replacement
+asserts that bare `free` does not resolve and that `libc::free` and
+`heap::free` each resolve to what they name.
