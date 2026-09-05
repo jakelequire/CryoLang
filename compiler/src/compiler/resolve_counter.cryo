@@ -202,6 +202,11 @@ type enum Site {
 
     // A default type argument expanded with no owning module on its template,
     // so it resolved against the caller instead of the file it was written in.
+    // `Expanded` counts every expansion, refused or not: `NoOwner` is bumped
+    // inside the branch that lacks a module, so on its own a zero there is
+    // produced equally by "every template carries its owner" and by "no
+    // default was ever expanded".
+    DefaultArgExpanded;
     DefaultArgNoOwner;
 
     // Leaf-index consumers, bumped on a HIT (an answer actually produced).
@@ -283,6 +288,11 @@ type enum Site {
     FnBindUseCursor;
     FnBindUseDiff;
 
+    // Every call that reaches the check.  The door rows are bumped AFTER a
+    // rejection, so they restate `Reject` rather than bounding it, and this is
+    // the only row that distinguishes "nothing was refused" from "the gate was
+    // never reached".
+    FnBindVisCalls;
     // ENFORCED (spec §3.3, §8.1e): calls rejected as cross-module `private`.
     // Unlike the rows above this one is not a blast radius - it is the gate
     // firing.  A NON-zero value is only correct if every event is a real
@@ -302,6 +312,9 @@ type enum Site {
     FnBindVisValueBare;
     FnBindVisValueQual;
 
+    // Every method call reaching the check, for the reason the free-function
+    // gate needs one: the lane rows below sit after the rejection.
+    MethodVisCalls;
     // ENFORCED: METHOD calls rejected as non-public (E0353), and which lane
     // caught it.  Member is the receiver-access lane, Static the `Type::m()`
     // one - which reached no gate at all until it was named here, because
@@ -471,6 +484,10 @@ type enum Site {
     /// it answered.  The `Res` rows say whether the answer was available
     /// without any scan at all.
     M4Single;
+    /// Every entry to the asker probe.  Its exits are NOT exhaustive - a null
+    /// registry returns without bumping any of them - so they cannot be summed
+    /// to recover the call count, and the rows below are unreadable without it.
+    M4ResCalls;
     M4ResDef;
     M4ResOther;
     M4ResPending;
@@ -480,6 +497,9 @@ type enum Site {
     M4ResAgree;
     M4ResDiffers;
     M4ResNoTemplate;
+    /// Entries to the pre-scan probe, which returns unbumped on a null
+    /// registry for the same reason `M4ResCalls` exists.
+    M4PreCalls;
     /// The same agreement question at the two exits that run BEFORE the scan.
     /// Inserting the stamp ahead of them would rebind this population, so it
     /// has to be measured before the stamp is allowed to answer first.
@@ -683,6 +703,7 @@ implement enum Site {
             Site::ScopeUseSyntax        => { "   " }
             Site::ScopeUseCursor        => { "   " }
             Site::ScopeUseDiff          => { "   " }
+            Site::DefaultArgExpanded    => { "B1 " }
             Site::DefaultArgNoOwner     => { "!! " }
             Site::VisFastpath           => { "   " }
             Site::VisWouldReject        => { "!! " }
@@ -712,6 +733,7 @@ implement enum Site {
             Site::FnBindUseSyntax       => { "   " }
             Site::FnBindUseCursor       => { "   " }
             Site::FnBindUseDiff         => { "   " }
+            Site::FnBindVisCalls        => { "B1 " }
             Site::FnBindVisReject       => { "!! " }
             Site::FnBindVisQualified    => { "   " }
             Site::FnBindVisSingle       => { "   " }
@@ -719,6 +741,7 @@ implement enum Site {
             Site::FnBindVisRetLane      => { "   " }
             Site::FnBindVisValueBare    => { "   " }
             Site::FnBindVisValueQual    => { "   " }
+            Site::MethodVisCalls        => { "B1 " }
             Site::MethodVisReject       => { "!! " }
             Site::MethodVisMember       => { "   " }
             Site::MethodVisStatic       => { "   " }
@@ -762,7 +785,7 @@ implement enum Site {
             Site::BareAltsCanonFolded   => { "B3*" }
             Site::ImplHeadSeen          => { "   " }
             Site::ImplHeadUnstamped     => { "   " }
-            Site::ImplHeadAsync         => { "   " }
+            Site::ImplHeadAsync         => { "B1 " }
             Site::ImplHeadAsyncUnstamped => { "!! " }
             Site::CgImplTargetSeen      => { "   " }
             Site::CgImplTargetUnstamped => { "   " }
@@ -773,12 +796,14 @@ implement enum Site {
             Site::M4Single              => { "   " }
             Site::M4ResDef              => { "   " }
             Site::M4ResOther            => { "   " }
+            Site::M4ResCalls            => { "B1 " }
             Site::M4ResPending          => { "   " }
             Site::M4ResAgree            => { "   " }
             Site::M4ResDiffers          => { "!! " }
             Site::M4ResNoTemplate       => { "!! " }
             Site::M4PreAgree            => { "   " }
             Site::M4PreDiffers          => { "!! " }
+            Site::M4PreCalls            => { "B1 " }
             Site::M4PreNoStamp          => { "   " }
             Site::M4ViaRes              => { "   " }
             Site::SfCalls               => { "   " }
@@ -865,6 +890,7 @@ implement enum Site {
             Site::ScopeUseSyntax        => { "scope use site from the SYNTAX's own module" }
             Site::ScopeUseCursor        => { "  no provenance: fell back to the cursor" }
             Site::ScopeUseDiff          => { "  syntax != cursor (the mis-judged set)" }
+            Site::DefaultArgExpanded    => { "default args expanded" }
             Site::DefaultArgNoOwner     => { "default arg expanded with NO owning module" }
             Site::VisFastpath           => { "single-candidate fast path taken" }
             Site::VisWouldReject        => { "  WOULD BE REJECTED once gated" }
@@ -894,6 +920,7 @@ implement enum Site {
             Site::FnBindUseSyntax       => { "use site from the SYNTAX's own module" }
             Site::FnBindUseCursor       => { "  no provenance: fell back to the cursor" }
             Site::FnBindUseDiff         => { "  syntax != cursor (the mis-judged set)" }
+            Site::FnBindVisCalls        => { "callee visibility checks reached" }
             Site::FnBindVisReject       => { "REJECTED: private, cross-module (E0353)" }
             Site::FnBindVisQualified    => { "  door 1: written qualified path" }
             Site::FnBindVisSingle       => { "  door 2: single-overload fast path" }
@@ -901,6 +928,7 @@ implement enum Site {
             Site::FnBindVisRetLane      => { "  door 4: bare return-type lane" }
             Site::FnBindVisValueBare    => { "  door 5b: bare name in value position" }
             Site::FnBindVisValueQual    => { "  door 5a: qualified path, value position" }
+            Site::MethodVisCalls        => { "method visibility checks reached" }
             Site::MethodVisReject       => { "REJECTED: non-public method (E0353)" }
             Site::MethodVisMember       => { "  lane: receiver member access" }
             Site::MethodVisStatic       => { "  lane: static `Type::method()` call" }
@@ -987,12 +1015,14 @@ implement enum Site {
             Site::M4ScanNone            => { "  M4 scan found: no candidate" }
             Site::M4ScanOne             => { "  M4 scan found: exactly one" }
             Site::M4ScanPlural          => { "  M4 scan found: PLURAL (tie-break pop)" }
+            Site::M4ResCalls            => { "M4 asker probes" }
             Site::M4ResDef              => { "  M4 asker carried Res::Def" }
             Site::M4ResOther            => { "  M4 asker carried another Res" }
             Site::M4ResPending          => { "  M4 asker carried NO stamp" }
             Site::M4ResAgree            => { "    stamp REACHES the same template" }
             Site::M4ResDiffers          => { "    stamp reaches a DIFFERENT one" }
             Site::M4ResNoTemplate       => { "    stamp names no template" }
+            Site::M4PreCalls            => { "M4 pre-scan probes" }
             Site::M4PreAgree            => { "pre-scan exit: stamp agrees" }
             Site::M4PreDiffers          => { "pre-scan exit: stamp DIFFERS" }
             Site::M4PreNoStamp          => { "pre-scan exit: no stamp" }
@@ -1660,6 +1690,7 @@ public function report() -> void {
     Site::ScopeUseSyntax.print_row();
     Site::ScopeUseCursor.print_row();
     Site::ScopeUseDiff.print_row();
+    Site::DefaultArgExpanded.print_row();
     Site::DefaultArgNoOwner.print_row();
     Site::VisFastpath.print_row();
     Site::VisWouldReject.print_row();
@@ -1674,6 +1705,7 @@ public function report() -> void {
     Site::FnBindUseSyntax.print_row();
     Site::FnBindUseCursor.print_row();
     Site::FnBindUseDiff.print_row();
+    Site::FnBindVisCalls.print_row();
     Site::FnBindVisReject.print_row();
     Site::FnBindVisQualified.print_row();
     Site::FnBindVisSingle.print_row();
@@ -1681,6 +1713,7 @@ public function report() -> void {
     Site::FnBindVisRetLane.print_row();
     Site::FnBindVisValueBare.print_row();
     Site::FnBindVisValueQual.print_row();
+    Site::MethodVisCalls.print_row();
     Site::MethodVisReject.print_row();
     Site::MethodVisMember.print_row();
     Site::MethodVisStatic.print_row();
@@ -1772,12 +1805,14 @@ public function report() -> void {
     Site::M4ScanNone.print_row();
     Site::M4ScanOne.print_row();
     Site::M4ScanPlural.print_row();
+    Site::M4ResCalls.print_row();
     Site::M4ResDef.print_row();
     Site::M4ResOther.print_row();
     Site::M4ResPending.print_row();
     Site::M4ResAgree.print_row();
     Site::M4ResDiffers.print_row();
     Site::M4ResNoTemplate.print_row();
+    Site::M4PreCalls.print_row();
     Site::M4PreAgree.print_row();
     Site::M4PreDiffers.print_row();
     Site::M4PreNoStamp.print_row();

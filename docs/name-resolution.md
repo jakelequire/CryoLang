@@ -13494,3 +13494,128 @@ per host rather than one measurement copied across.
 `asked by: sema type_utils` tracks `5 miss` exactly on **every** arm, which is
 the per-host form of the identity: every call that reaches the leaf index falls
 through it, everywhere.
+
+### 8.96 The counter's own violation bucket was asserted by nothing, and seven of its zeros could not be read at all - MEASURED AND FIXED 2026-09-05
+
+8.95 left the rest of 8.80's step 1: of 173 declared sites the gate pinned 23,
+and **22 carry the `!!` bucket the counter documents as "flags a violation
+row"** - a count that is correct only at zero. There were zero `!!` rows in the
+golden and zero mentions of `!!` in `b1-gate.py`. The strongest-worded category
+the instrument has was asserted by nothing.
+
+The prediction on the record was that at least one of the 22 would read
+non-zero, on the reasoning that an all-zero bucket would already have been
+promoted. **All 22 read zero, on all three gate corpora.** The prediction is
+falsified.
+
+#### A zero refusal has two causes, and a gate cannot tell them apart
+
+The falsifier said an all-zero result makes the pinning mechanical. It does not,
+and the reason generalises past these 22:
+
+**Every `!!` row is a count taken inside a guard.** Its zero is produced equally
+by "nothing was refused" and by "nothing arrived to be refused". Pinning the
+refusal alone therefore ratchets whichever of those happens to hold, and a lane
+that stops being entered reads exactly like a lane that stopped violating - the
+absence-reads-as-progress shape, in the one bucket whose whole purpose is to be
+read as an alarm.
+
+So a refusal row is not assertable on its own. It needs a row that **bounds**
+it: an entry count taken before every guard the refusal shares. Two rows moving
+independently distinguish the two causes; one row cannot.
+
+Classifying all 22 by their exit sets rather than by report adjacency - which is
+an ordering choice, not evidence - gave 15 with a live bounding row already
+printed, 4 provably starved, and 3 with no denominator in existence.
+
+#### The four starved zeros, proven by exit identity and then by entry count
+
+`ImplHeadAsyncUnstamped` is nested inside `if (ih_async)`, and `ImplHeadAsync`
+reads **0**. Meanwhile `ImplHeadUnstamped` reads **313**: unstamped impl heads
+are abundant, none of them owns an `async` method. The zero is fully explained
+by the conjunction never occurring and asserts nothing about stamping.
+
+`M4ResDiffers` and `M4ResNoTemplate` sit in `record_m4_asker`, whose six exits
+all read 0; `M4PreDiffers` sits in `record_m4_pre`, whose three exits all read
+0. Summing exits suggested both functions are never called - but **the exits are
+not exhaustive**: each returns unbumped when the generic registry is null, so
+the sum bounds nothing. The entry counts added here read **0 on all three
+corpora**, which is what actually establishes it.
+
+#### Three that were unknowable turned out to be real ratchets
+
+`DefaultArgNoOwner`, `FnBindVisReject` and `MethodVisReject` had no denominator
+at all. `FnBindVisReject` and `MethodVisReject` bump their `door` rows
+*downstream* of the rejection, so the doors reading 0 restates the rejection
+rather than bounding it - the `if (found)` trap in its exact form.
+
+With entry counts added:
+
+| row | denominator | main / ffi / gen |
+|---|---|---|
+| `DefaultArgNoOwner` = 0 | default args expanded | 338 / 189 / 203 |
+| `FnBindVisReject` = 0 | callee visibility checks | 1126 / 860 / 1148 |
+| `MethodVisReject` = 0 | method visibility checks | 3505 / 2120 / 2550 |
+
+All three sit on lanes the corpora exercise hundreds to thousands of times and
+refuse nothing. They move from unreadable to genuinely asserted, which is the
+gain that justified the work.
+
+#### Where a denominator is bumped, and why it is not the refusal's own lane
+
+Each entry count is bumped **before every guard**, including bails the refusal
+also passes through. A denominator sharing any of the refusal's conditions can
+reach zero for the same reason the refusal does, which is the one thing it
+exists to rule out. It bounds the refusal rather than describing the population
+refused, and inflation by suppressed or symbolic calls is harmless to that job.
+
+#### What landed
+
+Five `Site` variants - `DefaultArgExpanded`, `FnBindVisCalls`,
+`MethodVisCalls`, `M4ResCalls`, `M4PreCalls` - bucketed `B1 ` and wired into
+`report()`; `ImplHeadAsync` re-bucketed from `"   "` to `B1 ` since its
+denominator already existed and only needed gating; and `b1-gate.py` extended to
+select `!!`. The gate goes from **23 pinned sites to 51** - 23 + 22 `!!` + 5
+denominators + `ImplHeadAsync` - with `B1_TOTAL` and `B4_TOTAL` unchanged at 0,
+because `B1 ` marks a gated row and the totals are a hand-written sum list that
+the bucket string does not feed.
+
+Adding variants mid-enum shifts every later `Site` index into `g_tally`, so this
+needed a clean rebuild rather than an incremental one.
+
+#### A number moved that was not predicted, and it is a second host axis
+
+The re-pin put **4** rows on the host axis rather than 3. Three are 8.95's
+known set - `lookup_by_leaf calls`, `asked by: sema type_utils` and `type
+cascade: 5 miss` - which track each other exactly and sit 52 apart. The fourth
+is new and is one of the rows added here:
+
+| row | windows | linux |
+|---|---:|---:|
+| `method visibility checks reached` | 3505 | **3507** |
+
+It differs by 2 and in the **opposite direction**, so it is not the same axis
+seen again: whatever varies here makes Linux ask the method-visibility gate
+twice MORE, while the leaf-index axis makes Linux ask 52 times less. Two extra
+non-public method accesses reach the gate in the platform-gated half of the
+stdlib. Which two is **not** isolated, and is recorded as open rather than
+guessed - the explanation is plausible enough to be worth distrusting, since a
+platform-gated source difference is also what an ordinary corpus difference
+would look like.
+
+It changes nothing about the pin: the golden is per-host by construction and
+both arms were measured, not copied. It is recorded because an unpredicted
+number that moves is a finding, and because a row this small could later drift
+to equality and be read as a fix.
+
+#### Two corrections to the brief
+
+`b1-gate.py` has **no `--merge` flag**; that flag belongs to `roster-check.py`,
+whose golden is a union. `b1-gate.py`'s `--update` writes only the invoking
+host's sections and reports the others as "left untouched", so one `--update`
+run per host is what "never copy an arm across hosts" means here. Verified by
+comparing sections: the three `linux` blocks are byte-identical across the
+re-pin and the three `windows` blocks gained exactly 28 rows each with none
+removed.
+
+The pinning was also not mechanical, as recorded above.
