@@ -10053,6 +10053,15 @@ deleted on and the suite went red.
 
 Recorded as a candidate, not taken.
 
+The mechanism in the paragraph above is wrong, and 8.88 has the measurement.
+The substituter does not mint `Named("i32")` for a substituted primitive at
+all - it replaces the annotation with a `Primitive` node - so the bulk of the
+population never reaches the short-circuit and no counter placed there could
+have accounted for it. The short-circuit is the mechanism for a much smaller
+population that the pointer and array rewrites put back into `Named` position.
+The counter this section asked for exists and the control it wanted holds; the
+deletion is still declined, for a reason 8.88 states.
+
 ### 8.65 The extern and intrinsic callees CAN be stamped, and doing it needs a language answer first - MEASURED, PARKED 2026-09-03
 
 8.47 parked the guard at `find_function_template_for_call`, which branches on
@@ -12450,3 +12459,98 @@ it is described correctly as resolving `prefix::leaf` through the module's
 export set. It is on no target list in `docs/` or `scripts/`, so there was
 nothing to remove. Recorded because "checked, does not apply" and "not checked"
 look identical afterwards.
+
+### 8.88 The primitive step is starved by two different mechanisms, and 8.64 named the smaller one - MEASURED, DELETION DECLINED 2026-09-04
+
+8.64 recorded `resolve_named`'s primitive step at 0 on every corpus, gave a
+mechanism for it, and asked for one instrument before anything was deleted: a
+counter at the `pre_resolved` short-circuit showing that it catches the WHOLE
+primitive population. That counter now exists. It says the short-circuit does
+catch the whole population, and that 8.64's account of which population that is
+was wrong.
+
+#### The two doors above the step
+
+`resolve_named`'s primitive step answers a `Named` annotation spelled as a
+primitive. Two things upstream decide whether one ever arrives, and they are
+different mechanisms with the same tally:
+
+| door | `compiler/` | fixture |
+|---|---:|---:|
+| rewritten to a `Primitive` node - never enters the cascade | 54,105 | 9,062 |
+| `pre_resolved` short-circuit in `TypeResolver::resolve` | 44,576 | 2,069 |
+| of that, spelled as a primitive | 622 | 25 |
+| `2-primitive` - the step itself | 0 | 0 |
+
+8.64 said the substituter's mints "all carry a valid `pre_resolved`, which
+short-circuits before `resolve_named` is entered, so the post-substitution
+`Named("i32")` the step exists for never arrives". The second half is right and
+the first half is not the reason. Substituting a primitive into a generic does
+not produce `Named("i32")` at all: the rewrite tests the display against
+`is_primitive_spelling` and, on a hit, replaces the whole annotation with a
+`Primitive` node. Those are the 54,105. They never reach the short-circuit
+either, so no counter at the short-circuit could ever have accounted for them -
+which is why the number 8.64 predicted and the number measured differ by two
+orders of magnitude.
+
+The comment above the step in `types/resolver.cryo` states the same thing 8.64
+did - "the ASTTypeSubstituter creates `Named("i32")`, `Named("string")`" - and
+it describes a rewrite the substituter no longer performs.
+
+#### The population that does reach it, and the control on the zero
+
+622 primitive-spelled annotations reach the short-circuit on `compiler/` and
+return from it. The step answers 0. Those two numbers together are the control:
+a primitive-spelled `Named` arriving WITHOUT a valid `pre_resolved` would fall
+past the short-circuit into the cascade and answer at the step, so the step's
+own zero is what certifies that none does. The short-circuit catches 100% of
+the population, which is what 8.64 asked to see before a deletion.
+
+The 622 are entirely canonical spellings - `void` 207, `u32` 127, `u8` 125,
+`u64` 45, `string` 35, `boolean` 32, `i64` 29, `u128` 11, `i32` 11 - and they
+are there because the pointer and array rewrites put a primitive back into
+`Named` position after the primitive branch has already been passed:
+`T = i32*` becomes `Pointer(Named("i32"))`, carrying the pointee's `TypeRef`.
+
+#### An alias hypothesis that the fixture killed
+
+The two primitive predicates disagree. `resolve_primitive` accepts `int`,
+`uint`, `float`, `double` and `va_list`; `is_primitive_spelling` deliberately
+excludes the four alias keywords, because a module may be named for one -
+`std::fmt::float` is. Reading alone, that is a live hole: `Cell<int>` should
+miss the substituter's primitive branch, take the user-type branch, and arrive
+as `Named("int")` - exactly the step's shape.
+
+It does not happen, and a fixture written to make it happen measured zero. The
+name the rewrite writes is the type ARGUMENT'S display, taken from the resolved
+type, not the spelling in the source, so `int` is already `i32` by the time the
+predicate is asked. The disagreement is real on paper and unreachable through
+substitution. It is not a defect to fix; it is a hole that would open if
+anything ever propagated a written spelling into `type_arg_displays`.
+
+#### Why the step is not deleted
+
+Starved, not dead - and starvation by a mechanism that can stop. Every one of
+the 27,682 substituter mints on `compiler/` carries a valid `pre_resolved`, so
+nothing currently falls through. But two of the four mint sites derive that
+`TypeRef` from an unwrap - the pointee of the substitution argument, or its
+element - and both carry comments explaining what goes wrong when the unwrap
+declines. The step is the recovery for precisely that case.
+
+Keeping it is not the right answer either: it is a second answering path for a
+question the carried `TypeRef` already answers, which is the defect class §7
+exists to shrink. The coherent end state is that the mint sites cannot produce
+an invalid `pre_resolved` - so the unwrap's decline becomes a diagnostic rather
+than something recovered by name three layers down - and the step is then
+deleted with nothing left to catch. That converts a currently-silent recovery
+into a hard failure for programs no corpus produces, so it is parked rather than
+taken.
+
+#### The instrument counts a corpus it is part of
+
+`compiler/` is the largest corpus available and the instrument lives inside it.
+Two runs of the same measurement across the three patches differ by 2 on the
+`Primitive`-node row for that reason alone. It does not move any conclusion
+here, and it is the reason the fixture exists as a second reading. §8.67's rule
+has no clean instance on this question: there is no large corpus that exercises
+generic substitution and does not contain the compiler.

@@ -123,6 +123,28 @@ type enum Site {
     RnLeafIndex;
     RnFailed;
 
+    /// The two doors ABOVE the cascade that decide whether a primitive
+    /// spelling ever reaches `RnPrimitive`.
+    ///
+    /// `RnPrimitive` exists for a `Named` annotation spelled as a primitive,
+    /// and reads 0.  A step that answers 0 is either dead or starved, and
+    /// which one it is depends entirely on what happens upstream of it: an
+    /// annotation rewritten to a `Primitive` node never enters the cascade at
+    /// all, and one carrying a valid `pre_resolved` returns from the type
+    /// layer before the cascade is entered.  Those are different mechanisms
+    /// with the same tally, so both are counted.
+    ///
+    /// `AnnPreResolvedPrim` asks the SAME predicate `RnPrimitive` does -
+    /// `resolve_primitive` - rather than the substituter's
+    /// `is_primitive_spelling`.  The two sets differ (`int`, `uint`, `float`,
+    /// `double`, `va_list` are in one and not the other), and the whole
+    /// question is which spellings the short-circuit swallows, so asking the
+    /// other predicate here would measure a different population than the one
+    /// the answer is applied to.
+    AnnPrimitiveNode;
+    AnnPreResolvedHit;
+    AnnPreResolvedPrim;
+
     // `sema/call_resolver.cryo` resolve_method_call.  B2's bulk: dispatch that
     // genuinely needs the receiver's type, and cannot move into the resolver
     // (§6.2).  One site per OUTCOME, same as the resolve_named cascade above,
@@ -589,6 +611,9 @@ implement enum Site {
             Site::McDerefCoercion       => { "B2 " }
             Site::McFailed              => { "   " }
             Site::RnPrimitive           => { "B3 " }
+            Site::AnnPrimitiveNode      => { "   " }
+            Site::AnnPreResolvedHit     => { "   " }
+            Site::AnnPreResolvedPrim    => { "   " }
             Site::RnHomeModule          => { "B1 " }
             Site::RnHomeModuleSyntax    => { "B3 " }
             Site::RnAmbiguous           => { "B1 " }
@@ -755,6 +780,9 @@ implement enum Site {
             Site::McDerefCoercion       => { "m10 deref coercion, retry on pointee" }
             Site::McFailed              => { "unresolved" }
             Site::RnPrimitive           => { "2   primitive name" }
+            Site::AnnPrimitiveNode      => { "  upstream: Primitive node, no cascade" }
+            Site::AnnPreResolvedHit     => { "  upstream: pre_resolved short-circuit" }
+            Site::AnnPreResolvedPrim    => { "    of which spelled as a primitive" }
             Site::RnHomeModule          => { "2c  home-module (ambient cursor)" }
             Site::RnHomeModuleSyntax    => { "2c* home-module (syntax provenance)" }
             Site::RnAmbiguous           => { "2b  ambiguity -> E0203" }
@@ -1150,6 +1178,23 @@ public function callee_door(door: string, leaf: string, answered: string,
                  door, leaf, answered, owners, owner_list);
 }
 
+/// Log the SPELLING of a primitive-named annotation the type layer answered
+/// from its carried `TypeRef` rather than from the name cascade.
+///
+/// The tally beside this says how many there are; it cannot say what they are,
+/// and the two readings imply different things about the cascade's primitive
+/// step.  A canonical spelling here means a pointer or array rewrite put one
+/// back into `Named` position after the substituter had already decided
+/// primitives become `Primitive` nodes; an alias spelling means the
+/// substituter's primitive predicate does not recognise it and the whole
+/// annotation took the user-type branch.  One is structural and appears in any
+/// program using `T*`, the other follows how the source happens to spell its
+/// integers.
+public function pre_resolved_prim(spelling: string) -> void {
+    if (!Audit::Named.enabled()) { return; }
+    fmt::eprintf("PRERESOLVED-PRIM\t%s\n", spelling);
+}
+
 /// Log one annotation node minted with an unanswered slot, and whether it was
 /// given a `TypeRef` to stand in for that answer.
 ///
@@ -1479,6 +1524,9 @@ public function report() -> void {
     Site::RnGenericBinding.print_row();
     Site::RnAssocProjection.print_row();
     Site::RnPrimitive.print_row();
+    Site::AnnPrimitiveNode.print_row();
+    Site::AnnPreResolvedHit.print_row();
+    Site::AnnPreResolvedPrim.print_row();
     Site::RnHomeModule.print_row();
     Site::RnHomeModuleSyntax.print_row();
     Site::RnAmbiguous.print_row();
