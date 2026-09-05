@@ -13800,3 +13800,104 @@ already-pinned row silently mapped to a label of "B1"; and `all()` over an empty
 sequence returning True, so three unmeasured bounds were reported as bounds that
 read zero. Neither was caught by a number looking wrong. Both were caught by
 asking what would have to be true for the answer to be uninteresting.
+
+### 8.99 The lane gate counts a NAME, not a receiver, and the seam is nine call sites - MEASURED, BATCH 1 LANDED 2026-09-05
+
+The lane surface was 117 direct calls to the five per-kind lookups. Two things
+about that number turned out to be wrong, and the second one relocates the whole
+privatization question.
+
+#### `qualify_symbol_sym` is 22, not 78
+
+`lookup_type` accounts for **78** of the 117, which is one of the three figures
+(78 / 87 / 92) quoted for `qualify_symbol_sym`'s site count and never
+re-derived. Re-derived here under `lane-gate.py`'s own comment rules:
+`qualify_symbol_sym` has **22** call sites in 9 files, 18 excluding its own
+definer. The collision with 78 is coincidence - the two counts are independent -
+but the inherited figure was wrong by three to four times, so it is retired
+rather than settled as noise.
+
+#### The gate matches a method name on any receiver
+
+`LOOKUP_RE` is `\.(?:lookup_type|...)\s*\(`, which matches the **name**, not
+the receiver, while the docstring says "direct calls to the five per-kind
+lookups". `TypeUtils` carries same-named wrappers, so a call already routed
+through it counts exactly like a raw index call. Split by receiver:
+
+| receiver | sites | what it is |
+|---|---:|---|
+| `decl_index` / `di` | **87** | a real lane site |
+| `this.types` | **19** | already routed through `TypeUtils` |
+| bare `this` | **11** | inside `TypeUtils` itself |
+
+So the surface to migrate was 87, and 19 of the 117 were already where they
+should be. The gate is not wrong to fail on growth - a new same-named wrapper
+IS the regrowth its header warns about - but its number cannot be read as "raw
+index calls", and a migration measured against it partly rewards renaming.
+Recorded as available rather than taken: the counting could be split by
+receiver, which would make the total mean what the docstring says.
+
+#### Eleven of the sites are not lane sites at all, and they are a floor
+
+The bare-`this` group is not, as the receiver split first suggested, calls
+inside `TypeUtils`. `move_check.cryo`, `drop_insertion.cryo` and
+`ir_generator.cryo` each define **their own** `lookup_type(&this, name)`, and
+those methods have nothing to do with the `DeclarationIndex`: `move_check`'s
+reads a local symbol-to-type map, `drop_insertion`'s walks its scope stack in
+reverse so an inner shadow wins. They are local VARIABLE type lookups that
+happen to share a name with an index accessor.
+
+The gate counts them, and no migration can remove them - they are already
+correct. **`LOOKUP` therefore has an irreducible floor of 11** that is not a
+lane surface, so "drive LOOKUP to zero" is not a reachable target as the gate is
+written. After batch 1 the 103 decomposes as **72 real index calls, 20 routed
+through `TypeUtils`, and 11 false positives**; 87 - 16 + 1 = 72 closes the
+arithmetic.
+
+This is the same reading as the receiver blindness above and it is the sharper
+version of it: a name-matched count cannot separate the surface from things that
+merely resemble it. Recorded as available rather than taken, with the receiver
+split.
+
+#### Batch 1: sixteen sites, and the one that is not a swap
+
+`call_resolver` and `sema` hold a `TypeUtils` already, so their raw index calls
+move by changing the receiver. Every destination is a literal one-line
+passthrough - `lookup_type_exact`, `lookup_global_exact`, `lookup_func_return`,
+and a new `lookup_func_type_exact` added because no wrapper existed - so the
+swap is behaviour-identical by inspection and `b1-check` confirms it: 106 sites,
+no drift, both totals still 0.
+
+**`lookup_method_return` is excluded, and this is the trap in the batch.**
+`TypeUtils::lookup_method_return` canonicalizes its answer, and
+`lookup_method_return_raw` runs a bare-to-qualified-to-cross-module widening
+cascade. Neither is a passthrough, so moving that call site would have changed
+behaviour under cover of a mechanical rename. One site, left alone.
+
+LOOKUP 117 -> 103, predicted exactly: -8 in `sema`, -7 in `call_resolver`, +1
+for the new wrapper's own call.
+
+#### The seam is nine call sites, and the ruling it needs
+
+After migration every path converges on `type_utils.cryo`, which is a **different
+namespace** from `decl_index`, so the five must stay public and privatization is
+blocked no matter how many call sites move. The seam is small and exact: **9
+calls in 6 methods** - four pure passthroughs (`lookup_type_exact`,
+`lookup_global_exact`, `lookup_func_type_exact`, `lookup_func_return`) and two
+widening cascades (`resolve_method_owner`, `lookup_type_by_sym`).
+
+Moving the four passthroughs into `decl_index` is trivial - they need only
+`SymbolStr` and the index - and would leave five cross-namespace calls in two
+methods. But a public `lookup_type_exact` beside a private `lookup_type`, same
+signature and same semantics, is a **rename**, and the lane gate's own header
+names that as what privatization does not fix.
+
+So the question is not how to move the seam but what `decl_index` is allowed to
+expose:
+
+- if a public string-keyed type lookup is acceptable, privatization is cosmetic
+  and the lane gate is the real enforcement;
+- if it is not, every caller must supply a `Res` or a scope, which is §7.2's
+  "call-site migration, not a wrapper", across the 87 raw sites.
+
+Not decided here.
