@@ -358,10 +358,25 @@ type struct TypeResolver {
 
         return match (*ann) {
             TypeAnnotation::Primitive(p) => {
+                resolve_counter::Site::AnnPrimitiveNode.bump();
                 this.resolve_primitive(p.name)
             }
             TypeAnnotation::Named(n) => {
                 if (n.pre_resolved.is_valid()) {
+                    // Counted OUTSIDE the primitive test, then split by it.
+                    // `resolve_named`'s primitive step reads 0, and a step
+                    // that answers 0 because nothing of its shape is ever
+                    // offered licenses the opposite action from one that is
+                    // dead: the fall-through here mints a `Pending` slot, so
+                    // a `Named` primitive arriving WITHOUT an answer would
+                    // drop past the whole cascade.  Only the split says which
+                    // of the two this is; the total alone cannot.
+                    resolve_counter::Site::AnnPreResolvedHit.bump();
+                    if (this.resolve_primitive(n.name).is_valid()) {
+                        resolve_counter::Site::AnnPreResolvedPrim.bump();
+                        resolve_counter::pre_resolved_prim(
+                            this.intern_table.resolve(n.name));
+                    }
                     return n.pre_resolved;
                 }
                 // Canonicalize a BARE all-default generic name to its default
@@ -1642,7 +1657,8 @@ private:
     ///
     /// Fallback chain:
     ///   1. Generic bindings (T -> i32 from enclosing generic context)
-    ///   2. Primitive name check (handles Named("i32") from generic substitution)
+    ///   2. Primitive name check (a primitive spelling that reached Named
+    ///      position carrying no TypeRef of its own)
     ///   3. DeclarationIndex, by written literal then canonicalized name
     ///   4. Global leaf index
     resolve_named(&this, name: SymbolStr, ctx: ResolutionContext*,
@@ -1691,10 +1707,18 @@ private:
             }
         }
 
-        // 2. Check if this is a primitive type name.
-        //    After generic substitution, the ASTTypeSubstituter creates
-        //    Named("i32"), Named("string"), etc. instead of Primitive annotations.
-        //    This fallback ensures they resolve correctly.
+        // 2. A primitive spelling that arrived as a Named annotation.
+        //    Substituting a primitive into a generic does NOT produce one:
+        //    the rewrite replaces the whole annotation with a Primitive node,
+        //    which never enters this cascade.  What does produce one is the
+        //    pointer and array rewrite putting a primitive back into Named
+        //    position - `T = i32*` becomes `Pointer(Named("i32"))` - and every
+        //    such node carries the pointee's TypeRef, so it answers at the
+        //    short-circuit in `resolve` and never reaches here either.
+        //
+        //    This step is therefore the recovery for one case: a mint whose
+        //    carried TypeRef is INVALID, which happens when the unwrap
+        //    supplying it declines.  It answers zero while no unwrap declines.
         const prim: TypeRef = this.resolve_primitive(name);
         if (prim.is_valid()) {
             resolve_counter::Site::RnPrimitive.bump();
