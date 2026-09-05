@@ -49,6 +49,83 @@ import std::fmt;
 import compiler::resolver::symbol_str;
 import compiler::resolver::symbol_id;
 
+/// The identity of a declaration, as resolution answered it.
+///
+/// `Res::Def` used to carry the qualified name itself, which made an answer
+/// constructible from a spelling: any consumer holding a string could assemble
+/// the payload and any consumer holding the payload could re-key a map with
+/// it.  A resolution answer that can be rebuilt from the name it answered for
+/// is not an answer, it is the name with better manners, and it leaves
+/// "re-derive it here" writeable at every use site.
+///
+/// The field is `private`, so the literal can only be written inside this
+/// type's own methods (E0353) and every mint in the tree goes through
+/// `of_definition`.  Cryo's visibility is scoped to the declaring TYPE rather
+/// than to a module, so this cannot be narrowed further to "only the resolver
+/// may mint" - the resolver is as much an outsider to `DefId` as codegen is.
+/// What the private field buys is therefore not unforgeability but a single
+/// named door: minting and unwrapping are each one greppable call, so the
+/// population that turns a name into an answer is countable and can be pinned,
+/// which is the same enforcement the lane and b1 ratchets already run.
+///
+/// It is deliberately NOT a type alias.  An alias would keep every existing
+/// string-keyed call compiling, and the point of the distinct type is that the
+/// compiler reports the sites which hold only a name - those are not sites
+/// needing a different API, they are sites where the resolution answer was
+/// discarded and is being recomputed.
+type struct DefId {
+private:
+    /// The canonical qualified name the definition is registered under.
+    ///
+    /// This stays a `SymbolStr` for now: the maps it keys are `HashMap<u32,
+    /// TypeRef>` on `SymbolStr.id`, so a newtype over it is representationally
+    /// identical and no consumer's storage changes.  Making it an index into a
+    /// definition table is a separate change with its own measurement, because
+    /// a type-system change and a data-structure change failing together
+    /// cannot be told apart.
+    qn: SymbolStr;
+
+public:
+    /// The id of the definition registered under `qualified`.
+    ///
+    /// The one mint.  Every caller is a place that knows the referent for a
+    /// reason other than the spelling in front of it - a resolver that just
+    /// walked to the declaration, or a synthesizer that built the node and so
+    /// holds the type it refers to.  A caller that has only a written name has
+    /// not resolved anything and must not reach this.
+    static of_definition(qualified: SymbolStr) -> DefId {
+        return DefId { qn: qualified };
+    }
+
+    /// The id naming no definition, for a slot that must hold one before an
+    /// answer exists.  Distinct from `Res::Err`, which is an ANSWER: this is
+    /// the absence of one and never reaches a `Res`.
+    static invalid() -> DefId {
+        return DefId { qn: SymbolStr::empty() };
+    }
+
+    /// The canonical name of this definition.
+    ///
+    /// The one unwrap, and the point at which an answer becomes a string
+    /// again.  Legitimate for a diagnostic, a mangled symbol, or any consumer
+    /// whose output IS text.  A consumer that unwraps in order to re-key a
+    /// lookup has re-derived what it was handed, and should take the `DefId`.
+    qualified_name(&this) -> SymbolStr {
+        return this.qn;
+    }
+
+    /// Whether this names a definition at all.
+    is_valid(&this) -> boolean {
+        return this.qn.is_valid();
+    }
+
+    /// O(1) identity, inherited from interning: two ids naming the same
+    /// definition always carry the same handle.
+    equals(&this, other: DefId) -> boolean {
+        return this.qn.equals(other.qn);
+    }
+}
+
 /// The part of a type-relative path the name layer DID finish.
 ///
 /// Exactly the three answers that can name a type, so a base that could not
@@ -61,8 +138,8 @@ import compiler::resolver::symbol_id;
 /// enum is laid out as a tag plus a payload area sized to its largest variant,
 /// which for a self-referential variant has no finite size.
 type enum ResBase {
-    /// A declared type, by its canonical qualified name.
-    Def(SymbolStr);
+    /// A declared type, by the id resolution answered with.
+    Def(DefId);
     /// A type parameter, BY NAME - its members are reached through its bound.
     GenericParam(SymbolStr);
     /// A primitive, by its spelling.  Primitives own members without being
@@ -120,7 +197,7 @@ implement enum ResBase {
     /// The name this base was recorded under, whichever kind it is.
     name(&this) -> SymbolStr {
         return match (&this) {
-            ResBase::Def(q)          => { q }
+            ResBase::Def(d)          => { d.qualified_name() }
             ResBase::GenericParam(n) => { n }
             ResBase::PrimTy(n)       => { n }
         };
@@ -136,8 +213,8 @@ implement enum ResBase {
 }
 
 type enum Res {
-    /// A declaration or module, by its canonical qualified name.
-    Def(SymbolStr);
+    /// A declaration or module, by the id resolution answered with.
+    Def(DefId);
     /// A local binding (parameter or local variable).
     Local(SymbolID);
     /// A type parameter, BY NAME - never the type it is bound to.
@@ -158,14 +235,19 @@ type enum Res {
 }
 
 implement enum Res {
-    /// The qualified name of a resolved definition, or an empty SymbolStr for
-    /// every other answer.  Callers that only accept a definition use this;
-    /// callers that must tell one non-definition answer from another match
-    /// instead.
-    def_name(&this) -> SymbolStr {
+    /// The id of a resolved definition, or an invalid one for every other
+    /// answer.  Callers that only accept a definition use this; callers that
+    /// must tell one non-definition answer from another match instead.
+    ///
+    /// This deliberately does not hand back a name.  A consumer that wanted a
+    /// name in order to key a lookup is re-deriving what it was already given,
+    /// and taking the id is what makes that lookup take the answer instead of
+    /// the spelling; one that genuinely emits text asks for the name through
+    /// `DefId::qualified_name` and says so at the call site.
+    def_id(&this) -> DefId {
         return match (&this) {
-            Res::Def(q) => { q }
-            _           => { SymbolStr::empty() }
+            Res::Def(d) => { d }
+            _           => { DefId::invalid() }
         };
     }
 

@@ -13901,3 +13901,118 @@ expose:
   "call-site migration, not a wrapper", across the 87 raw sites.
 
 Not decided here.
+
+### 8.100 A `DefId` cannot be made mintable by the resolver alone, and the enumeration lands on two doors - MEASURED AND LANDED 2026-09-05
+
+`Res::Def` carried a `SymbolStr`. Every answer in the new model was therefore an
+interned qualified name that consumers re-keyed a hash map with, which makes a
+`Res` **fabricatable from a spelling** - a name with better manners. The plan
+was a `DefId` newtype whose constructor is private to the resolver, so the five
+per-kind lookups could take something a caller cannot forge and the compiler
+would then report every site holding only a name.
+
+The newtype landed. **The private-to-the-resolver half is not expressible in
+Cryo, and that is a fact about the language rather than a shortfall in the
+attempt.**
+
+#### The census the plan rested on, re-derived
+
+`Res::Def` is constructed at **9 sites in 4 files**, not the single canonical
+site an earlier audit claimed; `ResBase::Def` is a second door at **5** more.
+Three of the fourteen are outside the resolver - `AST/expression.cryo` twice and
+`sema/async_lower.cryo` once - and all three are synthesizers handed a name by
+their caller. Classified with a control on the classifier itself: a known
+construction and a known match arm were pushed through the same split, and the
+arithmetic closes at 14 construct + 23 destructure = 37 total matches.
+
+#### Visibility is scoped to the declaring TYPE, so a private mint excludes the resolver too
+
+`enforce_field_visibility` and `enforce_method_visibility` both gate on
+`owner.id == declaring_t.id` - the enclosing type, compared by identity. There
+is no module tier and no friend tier, and a context that is not inside a method
+body has no owner at all and falls straight through to `E0353`.
+
+So a `DefId` whose mint is private is mintable only from `DefId`'s own methods,
+which excludes `name_resolution.cryo` exactly as hard as it excludes codegen.
+Any mint the resolver can reach is a public static, and a public static is
+callable from anywhere. A witness type does not recover it either: a
+module-private witness cannot be named in a signature across namespaces, and a
+public one is as forgeable as what it guards.
+
+**The private field still buys the thing the count depends on.** It makes the
+literal unwriteable outside the type, so both crossings are named functions
+rather than a struct literal anyone can spell. Proven by breaking it: a
+`DefId { qn: SymbolStr::empty() }` written in `sema/type_utils.cryo` gives
+
+```
+error[E0353]: field `qn` of `compiler::resolver::res::DefId` is private
+```
+
+pointing at the literal. Without that control the clean build would have been
+consistent with the field not being enforced for this shape at all.
+
+#### What the enumeration actually found
+
+The compiler aborts on the first type error, so it enumerates one site per
+build rather than producing a list. The static census did the work instead, and
+the residue after patching it was **zero** - one build, no errors.
+
+The interesting result is where the mints ended up. The eight synthesizer call
+sites all read `this.ctx.definition_name_of(ty)`, which is
+`decl_index.lookup_type_name(ty)` - a reverse lookup **through the declaration
+index**, not a cast from a spelling. It converts outright rather than growing a
+sibling, so `definition_id_of` returns a `DefId` and eight call sites mint
+nothing at all. `TypeUtils::def_type` likewise already documented itself as
+consuming "the name layer's own answer", and it now takes one.
+
+That leaves **16 mints in 5 files** - eleven in the resolver's own walk, two in
+the index read, three at synthesizer callers - against **26 unwraps in 14
+files**. Both are pinned as new `lane-gate.py` rows. The mint count reconciles
+against the original fourteen exactly: the three synthesizers stopped
+constructing and now receive, their three callers mint instead, and
+`definition_id_of` has two return paths, so 14 - 3 + 3 + 2 = 16.
+
+`DEFID_UNWRAP` is the number that matters and the one to drive down. Every row
+in it is a place where an answer becomes a string again; some are legitimate,
+because the output is text - a diagnostic, a mangled symbol, the `X::member`
+concatenation in `scope_global_type` - and the rest are consumers re-keying a
+lookup with what they were already handed. Before this change the distinction
+could not be counted, because every consumer held a string.
+
+There is a third door and it is worth naming, because the count would otherwise
+be read as complete: `ResBase::name()` answers "the name this base was recorded
+under, whichever kind it is", so for a `Def` base it unwraps on its caller's
+behalf and the crossing appears in `res.cryo` rather than at the site. It has
+exactly **one** caller in that position, `call_resolver.cryo:5236`, so the true
+number of places an answer becomes a name is 27 rather than 26. The regex
+cannot absorb it - `.name()` matches most of the tree - and the accessor is
+legitimate, since two of its three arms genuinely hold nothing but a name. It is
+enumerated here instead, which is the honest form: the gate counts what it can
+see, and what it cannot see is one site rather than an unknown.
+
+#### What did not move, predicted in advance
+
+`b1-check` 106 sites with `B1=0 B4=0` on all three arms, and `lane-check`
+`LOOKUP = 103` / `REENTRY = 6`. Both were predicted to be unchanged before the
+edit, on the grounds that a newtype over `SymbolStr` is representationally
+identical - `decl_index`'s maps stay keyed on `SymbolStr.id` and nothing about
+the data changes. A counter moving would have falsified that, and none did.
+`LOOKUP` was also predicted to hold because `LOOKUP_RE` matches the five names
+followed by `(`, so neither `lookup_type_exact` nor any new wrapper is counted.
+
+#### The seam ruling is unchanged, and stage 2 is what settles it
+
+8.99 left the question of what `decl_index` may expose, and this does not answer
+it: `lookup_type_exact` and `lookup_global_exact` still take a `SymbolStr`, and
+a site holding a `DefId` calls `qualified_name()` to reach them. That call is
+the point - it is now a countable admission rather than the ambient condition.
+
+Making `DefId` a real index into a definition table populated during declaration
+is a separate change and is **not started**. It is separate because this one is
+a type-system change with a compile-time falsifier and no runtime behaviour
+change, while that one re-keys five hash maps and four parallel arrays
+(`module_global_keys`, `extern_global_keys`, `type_reverse`, `mangled_names`);
+a failure in the two together could be either. It is also where
+unforgeability arrives for free and structurally rather than syntactically:
+once the payload is an index, minting one requires the table and can fail, and
+a lookup that can fail is not a cast.
