@@ -13619,3 +13619,89 @@ re-pin and the three `windows` blocks gained exactly 28 rows each with none
 removed.
 
 The pinning was also not mechanical, as recorded above.
+
+### 8.97 Four labels named ten different rows, and the remaining pinning is one decision rather than 121 - MEASURED 2026-09-05
+
+8.96 pinned the violation bucket. The rest of 8.80's step 1 is the other 121
+rows, and enumerating them changed what the task is.
+
+#### Four labels were shared by ten rows
+
+`RnCalls` and `McCalls` both printed `calls (total)`; `RnFailed` and `McFailed`
+both `unresolved`; three sites printed `no provenance: fell back to the cursor`
+and three more `syntax != cursor (the mis-judged set)`.
+
+They are not unreadable in the report - a person reading it sees them under
+different section headings. They are unreadable to any **label-keyed consumer**,
+which is every tool that touches them: the golden is a list of
+`(label, count)`, and `b1-gate.py` refuses outright when two selected rows share
+a label. So the ten were unpinnable by construction, and any analysis keyed on
+the label silently took whichever printed first.
+
+Renamed to distinct labels. All ten were unpinned, so no golden key changed and
+the gate stayed green with no re-pin - which is itself the check that they were
+unpinned.
+
+Three values had been mis-attributed, and the rename is what exposed them:
+
+| row | read as | actually |
+|---|---:|---:|
+| `body-ns: syntax != cursor` | 10579 | **0** |
+| `fn-bind: syntax != cursor` | 10579 | **14** |
+| `resolve_named unresolved` | 608 | **14** |
+
+`BodyNsDiff` is **0**: the body-namespace lane has no mis-judged set at all,
+which no label-keyed reading could have said. Those corrupted values had already
+been used in the bound analysis below; re-checked against the corrected ones,
+none of its conclusions move - `BodyNsCursor` is still bounded by `BodyNsOwner`
+at 298 and `FnBindUseCursor` by `FnBindUseSyntax` at 1128.
+
+#### Every remaining zero already has a bound
+
+Of 178 declared sites the gate now pins 51, leaving 121: **57 read zero on all
+three corpora and 64 read non-zero**. Reading the 21 functions that hold an
+unpinned zero, **every one of those zeros is bounded** - `ScopeUseCursor` = 0
+under `ScopeUseSyntax` = 44,484; the two `VisReject` causes = 0 under
+`VisFastpath` = 38,362; `AnnResNoHome`/`NoHomeScope`/`Unresolved` = 0 under
+`AnnResSeen` = 4,113; `LeafCallSymbolicCheck` = 0 under `ParamRefSymbolic` =
+3,278, and so on. The only rows in the tree with no bound at all were the seven
+8.96 gave one to.
+
+#### Which makes the rest one decision, not 121
+
+A zero pinned without its bound is exactly the blind ratchet 8.96 exists to
+prevent. **Every one of these bounds is a non-zero row.** So the 57 zeros cannot
+be pinned as a "pure ratchet" half while the 64 non-zero rows are parked: pinning
+the zeros alone rebuilds the defect on 57 rows at once.
+
+The 121 are therefore one decision, and it is the one already reserved: pinning
+a non-zero row writes its current value into the golden. That also runs against
+this gate's own documented design - `bucket()` calls `"   "` context-only, and
+the header states the B2 and B3 totals and individual B3 rows are deliberately
+unasserted because "a noisy gate gets turned off". 59 of the 64 are
+corpus-dependent, so pinning them makes ordinary work re-pin the golden.
+
+Not decided here. The enumeration is the deliverable 8.80's step 1 asked for,
+and it is now complete: every site is classified, every zero has a named bound,
+and nothing is left resting on a number nobody attributed.
+
+#### Three screens, three wrong verdicts, each caught by reading
+
+Section adjacency said every zero looked ratchetable - it would have passed
+`ImplHeadAsyncUnstamped`, which sits in a section with `ImplHeadSeen` at 963 and
+is starved by its own inner guard. Grouping by enclosing function missed bounds
+that live in a callee, calling `SpellTyNoDef` and `SpellTyPending` unbounded when
+both sit under `SpellTyHit` at 363 in `def_type`. Requiring the bound at a
+*shallower* indent missed entry counts at the *same* indent, so it reported
+`M4ResCalls` and `SpellTyIdCalls` as absent when they are the very rows that
+bound their lanes.
+
+Each screen narrowed the population usefully and each produced false verdicts at
+the boundary. **A structural screen over instrumentation is a way to choose what
+to read, never a substitute for reading it.**
+
+A fourth: three variants looked never-bumped, which would have made them rows
+incapable of ever being non-zero. They are passed as `Site`-typed *arguments* -
+`spelling_type(res, nodef_site)`, the same shape as the `door` parameter - so a
+search for `Site::X.bump()` cannot see them. Caught because the control, a
+variant known to be bumped, also returned zero.
