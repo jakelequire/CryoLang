@@ -13183,7 +13183,7 @@ ones the staging deliberately left until the end. Their 330 call sites are
 migrated. **The three declarations stay**, and the reason is measured rather
 than cautious.
 
-#### The codegen coupling was real and turned out benign
+#### The codegen coupling was real and benign ON THE PATH MEASURED
 
 8.90 found that codegen synthesises allocator calls through
 `resolver.resolve_function(intern_str("malloc"))` at three sites and `("free")`
@@ -13204,7 +13204,18 @@ before and after the deletion, and diffing the object's symbol table:
 * disassembly shows the pointer loaded into `rcx` and a relocation to `free` -
   a correct one-argument call, not the zero-argument fallback shape.
 
-So `resolve_function("free")` finds `ffi::libc`'s declaration by the same
+**That covers one of the four sites, not four.** The probe allocated and
+released an array literal; it never emitted a `delete`. `emit_delete`'s
+lowering is a two-step fallback for one question that ends in a bare `return`,
+so a `free` lookup that stopped resolving would emit **nothing** - no
+diagnostic, green build, leaked memory - and no test here reaches it. Reading
+"the coupling is benign" off an array-literal probe is measuring one path and
+concluding about four, which is §8.76's rule and the same error 8.94 records
+against the census. The decline below does not rest on this paragraph, and the
+four sites stay unexposed only because the declarations stay.
+
+The narrower statement that IS supported: on the array-literal path,
+`resolve_function("free")` finds `ffi::libc`'s declaration by the same
 bare-leaf lookup and emits the same C symbol. Worth recording as a mechanism
 that survives its supplier being deleted, and worth recording that the check
 was a symbol table and a disassembly rather than a passing suite: both failure
@@ -13233,6 +13244,21 @@ pointer and aborts on one it did not hand out. It is precisely the crash
 `bare_intrinsic_priority.cryo` was written for - "`free(malloc'd)` dispatched to
 `heap::free`, which crashed on the foreign pointer" - reintroduced by removing
 the declaration that was holding the leaf.
+
+The mechanism is written down in the compiler, and this entry originally
+recorded the observation without it. `decl_index.cryo`'s intrinsic
+registration "claims SOLE ownership of the bare leaf name for a compiler
+intrinsic: any previously-registered overload (an `extern "C"` libc twin such
+as `malloc`/`strlen`/`fopen`) is **dropped from the overload index** so the
+leaf-name dispatcher sees only the intrinsic", which it says is what "makes
+bare-name resolution order-independent".
+
+So an intrinsic declaration is not one claimant among several - it is the thing
+that **evicts** the others. Deleting it does not leave the leaf unclaimed; it
+un-evicts everyone, and the dispatcher then picks from whatever the index still
+holds. That is why the measured answer was `heap::free` rather than a name
+error, and it generalises past this leaf: the eviction is what every bare
+intrinsic's order-independence rests on.
 
 `alloc::heap` is not in the prelude, but `alloc::box` and `alloc::rc` are, and
 8.86 measured that a prelude `public module` edge does grant visibility. So the
@@ -13345,3 +13371,126 @@ path. What is left is two parked questions, both resolution rather than
 migration: which declarations may claim a bare leaf when a prelude edge makes
 several visible, and whether `ffi::libc`'s fixed-arg variadic externs can serve
 callers that need Cryo-side forwarding.
+
+### 8.95 The gate could not see the largest widening cascade in the tree, and the pin cannot measure it - MEASURED AND FIXED 2026-09-05
+
+8.80's step 1 - enumerate the counter's answering exits while it still exists -
+is the one step that must not be deferred. `TypeUtils::lookup_type_by_sym` was
+outside it: four widening steps, twelve callers, and no gated row on any of
+them.
+
+#### What was invisible, and why
+
+The cascade has five exits. Steps 1, 2, 3 and 5 carried **no tally at all** -
+only `cascade_outcome`, whose first line is
+`if (!resolve_counter::Audit::Path.enabled()) { return; }`, so an ordinary build
+records nothing. Step 4's two tallies existed but carried bucket `"   "`, and
+`b1-gate.py` selects only rows whose bucket starts `B1`, `B3*` or `B4`, so they
+printed and gated nothing.
+
+The chain that made this worth fixing: three of the twelve callers are the
+`spelling_type` fallbacks, so a declined stamp reaches a four-step widening
+cascade whose **step 2 is the ambient cursor** and whose **step 3 re-enters the
+resolver** - one of the six re-entries `lane-check` counts, on a gate whose own
+header says re-entry "is where B1 comes from" - and none of it reached the gate
+that certifies this branch.
+
+The wider shape: the counter declares **169 sites**, the gate pins **17**
+(12 `B1` + 2 `B3*` + 2 `B4` + 1 `B4*`). Of the other 152, **22 carry the `!!`
+bucket the counter uses for a violation**, and there are zero `!!` rows in the
+golden and zero mentions of `!!` in `b1-gate.py`. The counter's own
+strongest-worded category is asserted by nothing.
+
+#### The pin cannot produce these rows, so `make cryo` measures zero
+
+The first attempt to measure the cascade over the compiler's own source read
+**0 rows** with `CRYO_PATH_AUDIT=1` set and a build that did not skip. The tree
+was not starved; the instrument could not exist.
+
+`make cryo` compiles the stdlib, the runtime tiers and the compiler **with
+`bin/cryo.exe`**, the pin. `llvm-strings` finds `TYPE-CASCADE` **0 times** in
+the pin and once in `compiler/build/cryo.exe`. The instrumentation lives only
+in the compiler being built, never in the one doing the building, so no
+environment variable can make `make cryo` emit a cascade row.
+
+This is the fifth absence in this session that was the instrument rather than
+the tree, and it generalises: **any measurement of compiler-internal
+instrumentation must run `compiler/build/cryo` over a corpus, never `make
+cryo`.** The pin is a fixed older compiler and reports on nothing added since
+it was cut - the same reason 8.91 found it can no longer reproduce the b1
+golden.
+
+#### The exits, measured before the tallies existed
+
+Over three corpora - the three the gate itself compiles - with
+`CRYO_PATH_AUDIT` and the row-count identity as the control (`cascade_outcome`
+reports once per call, so rows equal calls):
+
+| corpus | rows | 1-EXACT | 2-CURSOR | 3-CROSSMOD | 4-LEAF | 5-MISS |
+|---|---:|---:|---:|---:|---:|---:|
+| `examples/09-json-config` | 5,691 | 3,357 | 0 | 0 | 0 | 2,334 |
+| `examples/14-threads` | 4,723 | 2,599 | 0 | 0 | 0 | 2,124 |
+| `tests/.../ffi_c_import` | 3,971 | 2,265 | 0 | 0 | 0 | 1,706 |
+
+Every call exits exact or misses. **The three widening steps answer zero**, and
+step 4's `asked` tally equals `5-MISS` exactly (2,334), which says every call
+reaching the leaf index falls through it. Seven of the twelve call sites are
+reached at all; five are not.
+
+So this is the 8.81 shape again - a lane entered thousands of times that
+answers nothing - and it was reached through starvation of a different kind:
+not the corpus and not the tool, but a bucket string.
+
+#### What was added
+
+Four `Site` variants, one per untallied exit, bucketed `B1 ` and wired into
+`report()`; and step 4's existing pair re-bucketed from `"   "` to `B1 `. Six
+rows now reach the gate. `B1 ` marks a **gated row, not a summand** - which is
+how `M2Calls` sits in the golden at 2,258 while `B1_TOTAL` is 0 - so
+`B1_TOTAL` and `B4_TOTAL` are unchanged at 0, and the drift was six `NEW SITE`
+lines rather than a total moving.
+
+Adding a variant with a bucket and a label is **not** enough to make it print:
+`report()` calls `print_row()` per site from an explicit ordered list, so a new
+row is silently absent until it is added there. Discovered by the rows not
+appearing, which is the cheap version of discovering it from a golden that
+pinned nothing.
+
+Two rows are the widening answers to drive to zero, and two are the denominator
+that makes those zeros readable: a widening row falling to zero because its
+callers stopped asking is indistinguishable from one falling because the
+widening stopped, and only the totals beside it separate those - the control
+8.81 said a starved zero needs, built into the golden this time rather than
+reconstructed later.
+
+The tallies were verified against the audit stream measured **before they
+existed**: 3,357 / 0 / 0 / 2,334 from `CRYO_PATH_AUDIT`, and 3,357 / 0 / 0 /
+2,334 from the new rows. An instrument checked against an independent one that
+predates it.
+
+#### What this does not do
+
+It pins one cascade. The other 146 unpinned sites, including all 22 `!!` rows,
+remain outside the gate, and enumerating them is the rest of 8.80's step 1.
+
+#### One row is host-dependent and one is not, which is itself a reading
+
+Pinned across all six arms:
+
+| row | linux / -ffi / -gen | windows / -ffi / -gen |
+|---|---|---|
+| `1 exact` | 3357 / 2265 / 2599 | 3357 / 2265 / 2599 |
+| `2 ambient cursor` | 0 / 0 / 0 | 0 / 0 / 0 |
+| `3 resolver re-entry` | 0 / 0 / 0 | 0 / 0 / 0 |
+| `5 miss` | 2282 / 1702 / 2026 | 2334 / 1706 / 2124 |
+
+The exact-hit count is **identical on both hosts**; the miss count is not, so
+the cascade is entered a different number of times per host (5,639 against
+5,691 on the first corpus). Whatever varies is upstream of the cascade and
+reaches it only as calls that miss - the same host axis the golden already
+carries `lookup_by_leaf calls` for, and the reason 8.91's re-pin needs one run
+per host rather than one measurement copied across.
+
+`asked by: sema type_utils` tracks `5 miss` exactly on **every** arm, which is
+the per-host form of the identity: every call that reaches the leaf index falls
+through it, everywhere.
