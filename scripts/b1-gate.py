@@ -32,7 +32,7 @@ this script.
 
 WHAT IS ASSERTED
 ----------------
-The B1 total AND every per-site row the report flags `B1` or `B3*`.  The
+The B1 total AND every per-site row the report flags `B1`, `B3*` or `!!`.  The
 breakdown is asserted, not merely reported, because a change that moves 500
 answers from one fallback to another without moving the total is still a
 resolution behavior change, and the cascade's history is precisely that of steps
@@ -48,6 +48,19 @@ being the kind of leaf lookup a future caller could misuse for binding.  Such a
 row keeps its ratchet because the alternative is to trade a reachable B1 target
 for a lane nobody can see growing, which is the failure this gate exists to
 prevent.  A B3 row with no such regrowth story stays unasserted.
+
+`!!` is the counter's own marker for a violation row -- a count that is correct
+only at zero.  Every one of them is pinned, because the bucket asserted by
+nothing is the bucket most worth asserting.
+
+A `!!` row is a count taken INSIDE a guard, so its zero has two causes that a
+gate cannot tell apart: nothing was refused, or nothing arrived to refuse.  A
+pin on the refusal alone therefore ratchets whichever of those happens to hold,
+and a lane that stops being entered reads as a lane that stopped violating.
+Each `!!` row is pinned together with a row that BOUNDS it -- an entry count
+taken before every guard the refusal shares -- so the two move independently and
+a starved zero is visible as the denominator falling, not as the violation
+staying at zero.
 
 THE ROWS DO NOT SUM TO THE TOTAL, AND MUST NOT BE ASSERTED TO
 -------------------------------------------------------------
@@ -319,8 +332,12 @@ def parse_report(err):
         # keys identity rather than binding names, but could regrow into a
         # binding path if a future caller misused it, and would do so
         # invisibly in an unasserted bucket.
+        # `!!` is the counter's violation bucket: a row correct only at zero.
+        # It is pinned with its denominator rather than alone, because a count
+        # taken inside a guard reaches zero equally by never being refused and
+        # by never being reached.
         if row and (row[0].startswith("B1") or row[0].startswith("B3*")
-                    or row[0].startswith("B4")):
+                    or row[0].startswith("B4") or row[0].startswith("!!")):
             rows.append((row[1], row[2]))
 
     if b1 is None or b4 is None:
