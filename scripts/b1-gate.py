@@ -76,9 +76,11 @@ unasserted, apart from the `B3*` exception above.
 
 THE GOLDEN IS PER-HOST, WITH NO INHERITANCE
 -------------------------------------------
-One row genuinely differs by host: `lookup_by_leaf calls` is 5,041 on Windows
-and 4,989 on Linux for the same commit, because a Windows build compiles
-Windows-only stdlib modules that a Linux build never loads.  The same asymmetry
+One row genuinely differs by host: `lookup_by_leaf calls` is 2,206 on Windows
+and 2,154 on Linux for the same commit (the `[host:<host>]` target), because a
+Windows build compiles Windows-only stdlib modules that a Linux build never
+loads.  Read the figure off the golden rather than from here: an example in a
+docstring is not checked by anything and this pair had already drifted once.  The same asymmetry
 moves `2c` by 20 and `declaration took a slot an import held` from 9 to 2.  B1's
 TOTAL is identical on both.
 
