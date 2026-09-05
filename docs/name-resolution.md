@@ -12846,3 +12846,64 @@ survive this batch, so the test is untouched and still passes. It comes due
 with `free`, where it is to be replaced rather than inverted: the replacement
 asserts that bare `free` does not resolve and that `libc::free` and
 `heap::free` each resolve to what they name.
+
+#### 8.90 addendum: a third instrument defect, and the rename-only batch
+
+The instrument was wrong a third time, in the same family as the first two and
+found the same way - by reading the sites behind a small count rather than by
+the count looking odd.
+
+Comments were being stripped; **string literal contents were not**. `abort`'s
+only apparent call site is the word `abort` inside a usage message, and two of
+`exit`'s three are inside the phrase "at scope exit (double free)" in a
+diagnostic string. A call never occurs inside a string literal, so blanking
+literal contents loses nothing real and removes a whole class of false
+positive: every leaf whose name is an ordinary English word was over-counted.
+
+The lexer is now strictly length-preserving - comment bodies and string
+contents become spaces, newlines stay newlines - so an offset found in the
+blanked text indexes the same character in the raw file, which is what lets a
+rewrite locate a call safely. That assertion immediately earned itself:
+`E0012_unterminated_block_comment.cryo` has an unterminated `/*`, and the
+block-comment handler stepped past the end and lost a character. Length
+preservation now holds across all 1,401 `.cryo` files, and the totals are
+unchanged by the fix except where they should be.
+
+Final category-A figures, all three corrections applied:
+
+| | sites |
+|---|---:|
+| bare, real calls | 300 |
+| qualified | 444 |
+| **total** | **744** |
+| leaves with no call site at all | **53 of 84** |
+
+#### What landed in the second batch
+
+`abort`, `dup` and `exit` join the dead set. None is a real call: `dup`'s is
+`return dup(1, 2);` binding to the two-parameter `dup` the negative test
+declares for E0205, and `exit`'s is `runtime/sys/src/lib.cryo` calling the
+`exit` it declares itself eleven lines earlier.
+
+`getpid`, `closedir`, `fclose` and `fflush` are migrated: 51 call sites rewritten
+to `libc::`, 7 files gaining `import std::ffi::libc;`, and their declarations
+deleted. All four twins have identical signatures, so no call site needed a
+cast. 94 intrinsic declarations become 87.
+
+Gates unchanged: `OVERALL PASS` (178 compile-fail, 39 projects), B1 and B4 zero
+on three arms, `LOOKUP` 117, `REENTRY` 6, `lsp-check` 266 modules / 0 errors.
+
+#### What the remaining 25 cost, now that `string` is pinned down
+
+The remaining leaves with callers need a cast as well as a rename, and the
+deltas are three shapes: `string` to `u8*` (49), `void*` to `u8*` (25), `i8*`
+to `u8*` (19). `docs/cryo.md` settles the largest: **`string` IS a
+NUL-terminated `u8*`**, FFI-shaped, so that conversion is representation-
+identical and the cast is mechanical rather than semantic.
+
+This is worth stating because the stdlib's existing idiom looks like the
+opposite. Calls such as `libc::mkdir(c_path.as_ptr(), ...)` and
+`libc::stat(c_path.as_ptr(), ...)` go through `as_ptr()` rather than a cast,
+but those callers hold a `Str` or `String` - length-typed UTF-8 - and
+`as_ptr()` is the FFI boundary conversion. A caller already holding a `string`
+is on the other side of that boundary and needs no such thing.
