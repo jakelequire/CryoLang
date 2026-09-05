@@ -12907,3 +12907,178 @@ opposite. Calls such as `libc::mkdir(c_path.as_ptr(), ...)` and
 but those callers hold a `Str` or `String` - length-typed UTF-8 - and
 `as_ptr()` is the FFI boundary conversion. A caller already holding a `string`
 is on the other side of that boundary and needs no such thing.
+
+### 8.91 The 271 casts do not exist, and a qualified call is not argument-checked at all - MEASURED 2026-09-04
+
+8.85 and 8.87 costed the migration as about 779 sites with **271 needing a
+cast**, on the grounds that the intrinsic takes `string` or `void*` where the
+libc twin takes `u8*`. Both halves of that are wrong, and finding out why
+turned up a compiler defect that prices the whole migration differently.
+
+#### The first probe measured nothing, and the control is what said so
+
+Passing an `f64` to `libc::strlen` compiles clean. So does passing a `string`.
+Read on its own, the second says no cast is needed; read next to the first, it
+says the argument is not being checked at all and the probe is worthless.
+
+**A zero needs a control, and so does an acceptance.** The control that makes
+the result real is a call on the same path that IS rejected: a bare call to a
+local `takes_u8p(p: u8*)` refuses an `f64` with E0214, and the same function
+accepts a `string`, a `void*` and an `i8*`. Three separate functions taking
+`u8*`, `void*` and `i8*` each reject an `f64` and each accept every pointer
+shape.
+
+So pointer-to-pointer conversion among `string`, `u8*`, `i8*` and `void*` is
+implicit in argument position, and `docs/cryo.md` says why: `string` IS a
+NUL-terminated `u8*`, FFI-shaped. **The cast term for arguments is zero.**
+
+#### Where a cast IS needed, and it is not where anyone looked
+
+Argument position converts; an initializer does not. `core/primitives.cryo`
+binds `const hit: i8* = strstr(...)`, and libc's `strstr` returns `u8*`, which
+is E0200. The leaves that cost anything are therefore the ones whose RETURN
+type differs - `getcwd`, `strstr`, `memmove`, `memset`, `readdir`, `memcpy` -
+and only at the sites that bind the result to a typed location. That is a
+different, much smaller population than "58 signatures differ", and it is a
+different mechanism, so those six are staged separately.
+
+#### The defect: `check_call_arity` is reachable only from a bare identifier
+
+The reason the first probe was uninformative is worth its own entry. **A
+qualified call receives no argument or arity check whatsoever.**
+
+The isolation is one variable - same file, same argument, same declaration
+shape, two calls on one line:
+
+    return (Helper::takes_ptr(n) + local_takes_ptr(n)) as i32;   // n: f64
+
+Exactly one E0214, on the LOCAL call. And it is not the module boundary:
+`Main::same_module_takes_ptr(3.5)`, qualified into its own module, is also
+accepted. `check_call_arity` has one call site, `call_resolver.cryo:987`,
+inside the branch handling an `IdentifierNode` callee; a qualified callee takes
+the following `MemberAccess` branch and reaches no check.
+
+This prices the migration. Rewriting a **bare** call to `libc::X(...)` moves it
+from the checked path to the unchecked path, so the migration as specified
+removes argument checking from roughly 300 call sites. It does not make the 444
+qualified sites worse - those were never checked - and it is not a reason to
+stop, since a contested bare leaf ceasing to resolve is the point. It is a
+compiler defect rather than a migration decision, so it is recorded here and
+parked.
+
+#### Three more declaration forms, each found by the build
+
+The rewrite was applied and reverted three times, and each failure named a form
+the instrument did not model. None was caught by a count looking wrong; all
+three were caught by the compiler.
+
+**A trait method prototype.** `read(mut &this, buffer: u8*, length: u64) ->
+Result<u64, IoError>;` in `io/traits.cryo` is method syntax with no `function`
+keyword AND no body, so neither the keyword regex nor the body-brace test sees
+it, and it was rewritten into `libc::read(mut &this, ...)`. A call statement and
+a prototype both end in `;`; only a REQUIRED return arrow separates them.
+Making that arrow optional is what once classified `fflush(stdout);` as a
+prototype, and dropping the pattern entirely is what mangled this one. Both
+errors came from the same line of code, in opposite directions.
+
+**An attribute.** `![link("kernel32")]` in `sys/syscall.cryo` reads as a bare
+`link(` call and became `![libc::link("kernel32")]`. An attribute is not an
+expression context, so it is now blanked like a comment or a string.
+
+#### The fourth is not a syntax question at all
+
+`stdlib/fs/file.cryo:276` reads `mut data: Array<u8> = read(p)?;`. That is
+`fs::read`, taking a `Path` and returning a `Result` - a completely different
+function that happens to share a leaf with the intrinsic. Rewriting it to
+`libc::read` produced an `i64` and E0234 on the `?`.
+
+**The migration had been assuming that every bare call to a category-A leaf
+binds to the intrinsic, and that is exactly the assumption the whole
+name-resolution project exists to distrust.** Two rules narrow it:
+
+* A file that DECLARES the leaf itself binds its own bare calls to that
+  declaration. `fs/file.cryo`, `sys/_module.cryo` and the `string_as_cstr`
+  test all declare theirs, and the leaf is now skipped wholesale in such a
+  file.
+* A file that IMPORTS a module declaring the leaf is equally ambiguous, and
+  that case is real: six `write(p, payload.as_bytes())` calls across two fs
+  tests are `fs::write` reached by import, with no local declaration to key
+  on.
+
+`read` and `write` are the only two leaves in this batch with a competing free
+function outside `ffi::libc`, and both are held back for individual reading
+rather than rewritten by rule. The general form: **a leaf name is not a
+binding, and a rewrite keyed on the name is a claim about resolution that the
+name cannot support.**
+
+#### What landed
+
+Eleven leaves with no competing declaration - `access`, `chdir`, `mkdir`,
+`opendir`, `fopen`, `memcmp`, `link`, `strncmp`, `fputs`, `strcmp`, `strlen` -
+migrated at 128 call sites across 17 files, 15 of which gained
+`import std::ffi::libc;`. Their declarations are deleted. 87 intrinsic
+declarations become 76, from 142 at the start.
+
+`OVERALL PASS` (178 compile-fail, 39 projects), `LOOKUP` 117, `REENTRY` 6 and
+`lsp-check` 266 modules / 0 errors are all unchanged. `b1-check` moved and is
+re-pinned deliberately, below. The LSP handlers carry 61 of the 128 sites, so
+`lsp-check` is the gate that actually covered this batch.
+
+#### Parked, with evidence
+
+**The variadic three.** `printf` (132 sites), `fprintf` (5) and `snprintf` (5)
+are not a mechanical rename. `libc.cryo` says so itself, directly above the
+declarations: "Use the `core::intrinsics` variants when the call needs
+Cryo-side variadic forwarding; these bare externs are for fixed-arg use
+cases." The intrinsic spells `args...` and the twin spells `...`, and the
+difference is Cryo-side forwarding, not punctuation. Whether the twins can
+serve the forwarding callers is a language question, not a migration step.
+
+**`malloc`, `free`, `realloc`.** Deferred as planned, now with a second reason.
+Besides the codegen coupling in 8.90 - `resolve_function` on the bare leaf at
+four sites - `bare_intrinsic_priority.cryo` pins all three together, asserting
+that a bare `free` and a bare two-argument `realloc` bind the intrinsic. They
+move as one change, with that test replaced rather than inverted.
+
+#### The ratchet moved, on both hosts, and re-pinning needed a Linux build
+
+`b1-check` went red: B1 and B4 stayed 0, but three context rows moved.
+
+    M2 resolve_module_qualified_sym calls    2258 -> 2376  (+118)
+    M4 mono bare-name template scan           267 ->  266   (-1)
+    lookup_by_leaf calls                     2206 -> 2324  (+118)
+
+The gate asks for the mechanism before a re-pin, and there were two candidates,
+both mine: the 128 call-site rewrites, or the 11 declaration deletions changing
+what the prelude makes visible. Restoring `intrinsics.cryo` alone, leaving the
+rewrites in place, reproduces the drift exactly. **The deletions contribute
+nothing; the movement is the rewrites.** A bare call resolves through the bare
+path, a qualified one through `resolve_module_qualified_sym`, and each of those
+does one `lookup_by_leaf` - which is why the two rows move by the same +118 and
+why `lookup_by_leaf hits` stays 0.
+
+Only the stdlib is compiled by the three pinned corpora, so the +118 comes from
+the 37 rewritten stdlib sites, at about three resolutions each. That multiplier
+is the same in all six arms despite three different corpora, which rules out
+instantiation as its cause and points at the pipeline resolving a call more
+than once.
+
+Re-pinning both hosts from one Windows box was nearly abandoned on a false
+negative. Probing for `llvm-config` and `clang` found neither and read as "no
+Linux toolchain here"; apt.llvm.org installs **versioned** names, and
+`llvm-config-20`, `clang-20`, `c-index-test-20` and `libclang-20.so.1` were all
+present and satisfy `install-llvm.sh`'s own `toolchain_ok`. That is the fourth
+absence in this session that was the instrument rather than the tree.
+
+The recipe's stated control - run the PIN and check it reproduces the golden -
+**cannot be used any more**: `bin/cryo` predates the B4 fix and measures B4=156
+against a golden of 0. What replaces it is cheaper and stronger. Of the
+eighteen rows in each section, fifteen reproduced their golden value exactly
+under WSL/9p, including `lookup_by_leaf calls` starting from the Linux-specific
+2154 rather than Windows' 2206 - the one row that is legitimately
+host-dependent. A readdir-order artifact would perturb leaf-index rows
+generally; instead exactly the three rows the change explains moved, by
+identical amounts on both hosts. **The unchanged rows are the control.**
+
+Both sections are re-pinned from their own host's measurement, B1 and B4 are 0
+in all six arms, and no row moved anywhere except those three.
