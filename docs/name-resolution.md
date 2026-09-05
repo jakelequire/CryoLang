@@ -13169,3 +13169,104 @@ bare two-argument `realloc` both bind the intrinsic, so the test's premise
 vanishes for both at once. Least-used-first would put `realloc` (1 site) near
 the front and `free` (164) at the back; they move together, at the back, with
 the replacement test.
+
+### 8.93 Every allocator caller now names its module, and deleting the leaf is DECLINED on a measured crash - MEASURED 2026-09-05
+
+`malloc`, `free` and `realloc` were the last three category-A leaves and the
+ones the staging deliberately left until the end. Their 330 call sites are
+migrated. **The three declarations stay**, and the reason is measured rather
+than cautious.
+
+#### The codegen coupling was real and turned out benign
+
+8.90 found that codegen synthesises allocator calls through
+`resolver.resolve_function(intern_str("malloc"))` at three sites and `("free")`
+at one, resolving the **bare leaf** through the DeclarationIndex, and that
+`declare_extern_function_return_only` - the fallback when nothing is found -
+builds a **zero-parameter** function type. A one-argument call against a
+zero-argument declaration is a silent miscompile, and a total miss is worse:
+`resolve_function` returning null makes the array-literal path `return val`,
+handing back the stack value instead of a heap copy.
+
+Neither happens. Compiling a probe project that allocates an array literal,
+before and after the deletion, and diffing the object's symbol table:
+
+* the allocation goes through mangled `std::alloc::allocator::alloc`, not the
+  bare `malloc` site at all;
+* the deallocation references bare `free`, and the object is **byte-identical**
+  either way;
+* disassembly shows the pointer loaded into `rcx` and a relocation to `free` -
+  a correct one-argument call, not the zero-argument fallback shape.
+
+So `resolve_function("free")` finds `ffi::libc`'s declaration by the same
+bare-leaf lookup and emits the same C symbol. Worth recording as a mechanism
+that survives its supplier being deleted, and worth recording that the check
+was a symbol table and a disassembly rather than a passing suite: both failure
+modes here are silent.
+
+A second thing fell out of it. The `free` site is a fallback chain - it tries
+`resolve_function("std::alloc::allocator::free")` first and drops to bare
+`free`. **The first branch never answers.** `allocator::free` is defined in the
+stdlib objects and referenced by nothing; every deallocation goes through the
+bare fallback. A raw `::`-joined string is not a DeclarationIndex key. That is
+a dead branch in a two-branch cascade, in the file this project keeps finding
+them in, and it is not fixed here.
+
+#### Why the deletion is declined
+
+Deleting the three declarations does not make a bare `free` stop resolving. It
+makes it resolve to something worse.
+
+A one-file project importing **nothing at all** and calling a bare `free(p)`
+compiles clean, and the object says what it bound to:
+
+    U C$3std.5alloc.4heap.4free$FPv$Rv
+
+That is `std::alloc::heap::free`, which recovers a segment header from the
+pointer and aborts on one it did not hand out. It is precisely the crash
+`bare_intrinsic_priority.cryo` was written for - "`free(malloc'd)` dispatched to
+`heap::free`, which crashed on the foreign pointer" - reintroduced by removing
+the declaration that was holding the leaf.
+
+`alloc::heap` is not in the prelude, but `alloc::box` and `alloc::rc` are, and
+8.86 measured that a prelude `public module` edge does grant visibility. So the
+leaf is reachable without an import, and removing one claimant just hands it to
+the next.
+
+**The brief's shape for this - `libc::free` and `heap::free` as distinct paths,
+bare `free` meaning nothing - does not follow from deleting the intrinsic.**
+Distinct paths exist and every caller now uses them; what does not follow is
+the third clause. Making a bare `free` name nothing is a resolution change
+about which declarations may claim a bare leaf and how a prelude edge
+propagates, not a migration step, and it is where this stops.
+
+#### The test that caught it was mine, and it was wrong first
+
+The replacement test asserted E0202 on a bare `free` in a module importing
+`ffi::libc`. It failed, because **an import makes a module's members
+bare-callable**: with `import std::ffi::libc;` a bare `free` binds
+`libc::free` and compiles. Rewriting the probe to import nothing is what
+surfaced the `heap::free` binding. Both the original assertion and its
+correction were wrong about the mechanism in the same way - assuming the
+absence of a declaration produces a name error rather than a different
+binding - which is the assumption this whole project exists to distrust.
+
+`bare_intrinsic_priority.cryo` is therefore **not replaced and not inverted**.
+It still passes, and it is now also the record of why the leaf is still held.
+
+#### What landed
+
+330 call sites across 47 files move to `libc::malloc`, `libc::free` and
+`libc::realloc`, and 33 files gain the import. One site needed a cast, on the
+same return-type rule as 8.92: `const buf: i8* = libc::malloc(n + 1) as i8*`.
+
+Two files are deliberately untouched. `ffi/libc.cryo`'s own `free(ptr)` calls
+bind its own declaration. `alloc/heap.cryo`'s `free(ptr)` inside `heap::realloc`
+must mean `heap::free` - it releases a block carrying heap's segment header,
+and libc's would corrupt - and the rule that skips a leaf in a file declaring
+it protected exactly that.
+
+The result is that `intrinsics::malloc`, `intrinsics::free` and
+`intrinsics::realloc` now have **zero source callers** while keeping their
+declarations. That is a deliberate intermediate state: the migration half is
+finished and the remaining question is isolated to who may own a bare leaf.

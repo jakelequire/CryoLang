@@ -35,6 +35,7 @@ import compiler::resolver::{ symbol_str, intern_table };
 import compiler::lex;
 import std::collections::pair;
 import compiler::types::generic;
+import std::ffi::libc;
 
 
 type struct ExprOps {
@@ -432,23 +433,23 @@ type struct ExprOps {
         mut strcmp_fn: LValue = this.resolver.resolve_function(strcmp_sym);
         if (!strcmp_fn.is_valid()) {
             const i8_ptr: LType = LType::pointer_to(LType::i8());
-            const param_buf: void* = intrinsics::malloc(16);
+            const param_buf: void* = libc::malloc(16);
             const params: void** = param_buf as void**;
             params[0] = i8_ptr.raw;
             params[1] = i8_ptr.raw;
             const strcmp_ty: LType = LType::function_type(LType::i32(), param_buf, 2, false);
-            intrinsics::free(param_buf);
+            libc::free(param_buf);
             strcmp_fn = this.llvm_module.add_function("strcmp", strcmp_ty);
             this.functions.register(strcmp_sym, strcmp_fn);
         }
 
         const strcmp_ty: LType = LType { raw: llvm::LLVMGlobalGetValueType(strcmp_fn.raw) };
-        const arg_buf: void* = intrinsics::malloc(16);
+        const arg_buf: void* = libc::malloc(16);
         const args: void** = arg_buf as void**;
         args[0] = lhs.raw;
         args[1] = rhs.raw;
         const cmp_result: LValue = this.builder.build_call(strcmp_ty, strcmp_fn, arg_buf, 2, "strcmp");
-        intrinsics::free(arg_buf);
+        libc::free(arg_buf);
 
         const zero: LValue = LType::const_int(LType::i32(), 0, false);
         if (op_kind == TokenType::EqualEqual) {
@@ -999,7 +1000,7 @@ type struct ExprOps {
         mut fn: LValue = this.llvm_module.get_named_function("__cryo_personality_v0");
         if (fn.is_valid()) { return fn; }
         const ptr_ty: LType = LType::pointer_to(LType::i8());
-        const param_buf: void* = intrinsics::malloc(40);
+        const param_buf: void* = libc::malloc(40);
         const param_slots: void** = param_buf as void**;
         param_slots[0] = LType::i32().raw;
         param_slots[1] = LType::i32().raw;
@@ -1007,7 +1008,7 @@ type struct ExprOps {
         param_slots[3] = ptr_ty.raw;
         param_slots[4] = ptr_ty.raw;
         const fty: LType = LType::function_type(LType::i32(), param_buf, 5, false);
-        intrinsics::free(param_buf);
+        libc::free(param_buf);
         return this.llvm_module.add_function("__cryo_personality_v0", fty);
     }
 
@@ -1015,12 +1016,12 @@ type struct ExprOps {
     /// selector).  LLVM uniques literal struct types by structure within a
     /// context, so this returns the same type on every call in a module.
     landingpad_type(mut &this) -> LType {
-        const elems_buf: void* = intrinsics::malloc(16);
+        const elems_buf: void* = libc::malloc(16);
         const elems: void** = elems_buf as void**;
         elems[0] = LType::pointer_to(LType::i8()).raw;
         elems[1] = LType::i32().raw;
         const t: LType = LType::literal_struct(elems_buf, 2, false);
-        intrinsics::free(elems_buf);
+        libc::free(elems_buf);
         return t;
     }
 
@@ -1113,14 +1114,14 @@ type struct ExprOps {
         const panic_fn: LValue = this.intrinsics.get_or_decl_cryo_panic();
         if (!panic_fn.is_valid()) { return; }
         const ptr_ty: LType = LType::pointer_to(LType::i8());
-        const param_buf: void* = intrinsics::malloc(24);
+        const param_buf: void* = libc::malloc(24);
         const param_slots: void** = param_buf as void**;
         param_slots[0] = ptr_ty.raw;
         param_slots[1] = ptr_ty.raw;
         param_slots[2] = LType::i32().raw;
         const fty: LType = LType::function_type(LType::void_type(), param_buf, 3, false);
-        intrinsics::free(param_buf);
-        const arg_buf: void* = intrinsics::malloc(24);
+        libc::free(param_buf);
+        const arg_buf: void* = libc::malloc(24);
         const arg_slots: void** = arg_buf as void**;
         arg_slots[0] = msg.raw;
         arg_slots[1] = file.raw;
@@ -1142,12 +1143,12 @@ type struct ExprOps {
             this.invoke_lpad   = lpad_bb;
             this.build_call_maybe_invoke(fty, panic_fn, arg_buf, 3, "");
             this.invoke_active = false;
-            intrinsics::free(arg_buf);
+            libc::free(arg_buf);
             this.builder.build_unreachable();
             this.emit_cleanup_landingpad_sched(visitor, sched, cur_fn, lpad_bb);
         } else {
             this.builder.build_call(fty, panic_fn, arg_buf, 3, "");
-            intrinsics::free(arg_buf);
+            libc::free(arg_buf);
             this.builder.build_unreachable();
         }
     }
@@ -1187,7 +1188,7 @@ type struct ExprOps {
         mut expected_count: u32 = llvm::LLVMCountParamTypes(callee_type.raw);
         mut param_types_buf: void* = null;
         if (expected_count > 0 && expected_count <= 64) {
-            param_types_buf = intrinsics::malloc(expected_count as u64 * 8);
+            param_types_buf = libc::malloc(expected_count as u64 * 8);
             llvm::LLVMGetParamTypes(callee_type.raw, param_types_buf);
         }
 
@@ -1202,12 +1203,12 @@ type struct ExprOps {
         if (param_types_buf != null && expected_count > n) {
             const r: LValue = this.codegen_call_direct_dp_expand(
                 callee, callee_type, args, param_types_buf, expected_count, name);
-            intrinsics::free(param_types_buf);
+            libc::free(param_types_buf);
             return r;
         }
 
         // Build argument array, coercing integer widths where needed.
-        const buf: void* = intrinsics::malloc(n as u64 * 8);
+        const buf: void* = libc::malloc(n as u64 * 8);
         const slots: void** = buf as void**;
         const param_types: void** = param_types_buf as void**;
         for (mut i: u32 = 0; i < n; i++) {
@@ -1219,10 +1220,10 @@ type struct ExprOps {
             }
             slots[i] = arg_val.raw;
         }
-        if (param_types_buf != null) { intrinsics::free(param_types_buf); }
+        if (param_types_buf != null) { libc::free(param_types_buf); }
 
         out_value = this.build_call_maybe_invoke(callee_type, callee, buf, n, name);
-        intrinsics::free(buf);
+        libc::free(buf);
 
         // Phase 2 - propagate `byval(%T)` from the callee's parameter
         // attributes onto the matching call-site slots.  In this 1:1 path
@@ -1275,7 +1276,7 @@ type struct ExprOps {
                                   name: string) -> LValue {
         const n: u32 = args.length as u32;
         const param_types: void** = param_types_buf as void**;
-        const buf: void* = intrinsics::malloc(expected_count as u64 * 8);
+        const buf: void* = libc::malloc(expected_count as u64 * 8);
         const slots: void** = buf as void**;
 
         mut source_idx: u32 = 0;
@@ -1291,7 +1292,7 @@ type struct ExprOps {
             // libLLVM): the function-body validator sees the unterminated
             // body and the queued error surfaces normally.
             if (arg_val.raw == null) {
-                intrinsics::free(buf);
+                libc::free(buf);
                 return LValue::null();
             }
             const actual_ty: void* = llvm::LLVMTypeOf(arg_val.raw);
@@ -1382,13 +1383,13 @@ type struct ExprOps {
 
                 // Hi half: GEP `i8, ptr %src, i64 8` then load.
                 const i8_ty: LType = LType::i8();
-                const idx_buf: void* = intrinsics::malloc(8);
+                const idx_buf: void* = libc::malloc(8);
                 const idx_arr: void** = idx_buf as void**;
                 const eight: LValue = LType::const_int(LType::i64(), 8, false);
                 idx_arr[0] = eight.raw;
                 const hi_ptr: LValue = this.builder.build_gep(
                     i8_ty, src_ptr, idx_buf, 1, "arg.dp.hi.ptr");
-                intrinsics::free(idx_buf);
+                libc::free(idx_buf);
 
                 const hi_lty: LType = LType { raw: param_types[llvm_slot_idx + 1] };
                 const hi_val: LValue = this.builder.build_load(hi_lty, hi_ptr, "arg.dp.hi");
@@ -1430,7 +1431,7 @@ type struct ExprOps {
 
         const out: LValue = this.build_call_maybe_invoke(
             callee_type, callee, buf, expected_count, name);
-        intrinsics::free(buf);
+        libc::free(buf);
 
         // Phase 2 - byval propagation, driven off the LLVM slot index.
         // The DirectPair expansion above fills slots 0..expected_count
@@ -1488,12 +1489,12 @@ type struct ExprOps {
                     // string + int -> GEP i8 for pointer arithmetic.
                     // Caller uses this idiom for substring-from-offset,
                     // C-string walking, etc.
-                    const buf: void* = intrinsics::malloc(8);
+                    const buf: void* = libc::malloc(8);
                     const slots: void** = buf as void**;
                     slots[0] = rhs_val.raw;
                     out_value = this.builder.build_gep(
                         LType::i8(), lhs_val, buf, 1, "ptradv");
-                    intrinsics::free(buf);
+                    libc::free(buf);
                     return out_value;
                 }
                 // string + string -> call std::core::primitives::string::append.
@@ -1538,12 +1539,12 @@ type struct ExprOps {
                 // this, `-` fell through to the null-return below and
                 // silently miscompiled.
                 const neg: LValue = this.builder.build_neg(rhs_val, "stroff.neg");
-                const buf: void* = intrinsics::malloc(8);
+                const buf: void* = libc::malloc(8);
                 const slots: void** = buf as void**;
                 slots[0] = neg.raw;
                 out_value = this.builder.build_gep(
                     LType::i8(), lhs_val, buf, 1, "ptrret");
-                intrinsics::free(buf);
+                libc::free(buf);
                 return out_value;
             }
             // Ordered comparison between two strings (i.e. raw `char*`
@@ -1636,12 +1637,12 @@ type struct ExprOps {
                 if (op_kind == TokenType::Minus) {
                     idx = this.builder.build_neg(rhs_val, "gep.neg");
                 }
-                const buf: void* = intrinsics::malloc(8);
+                const buf: void* = libc::malloc(8);
                 const slots: void** = buf as void**;
                 slots[0] = idx.raw;
                 out_value = this.builder.build_gep(
                     pointee_lty, lhs_val, buf, 1, "ptradv");
-                intrinsics::free(buf);
+                libc::free(buf);
                 return out_value;
             }
         }
@@ -2229,13 +2230,13 @@ type struct ExprOps {
         // Build the fat-pointer struct: { data_ptr, count, count }.
         const elem_ptr_lty: LType = LType::pointer_to(elem_lty);
         const i64_ty: LType = LType::i64();
-        const buf: void* = intrinsics::malloc(24);
+        const buf: void* = libc::malloc(24);
         const slots: void** = buf as void**;
         slots[0] = elem_ptr_lty.raw;
         slots[1] = i64_ty.raw;
         slots[2] = i64_ty.raw;
         const fat_ty: LType = LType::literal_struct(buf, 3, false);
-        intrinsics::free(buf);
+        libc::free(buf);
 
         const fat: LValue = this.flow.create_entry_alloca(fn_val, "arrlit.fat", fat_ty);
         const ptr_slot: LValue = this.builder.build_struct_gep(fat_ty, fat, 0, "fat.ptr");

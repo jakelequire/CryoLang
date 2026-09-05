@@ -34,6 +34,7 @@ import std::collections::pair;
 import std::fmt::float;
 import compiler::ast::expression;
 import compiler::types::generic_registry;
+import std::ffi::libc;
 
 
 type struct DeclarationEmitter {
@@ -492,13 +493,13 @@ type struct DeclarationEmitter {
             const ret_ty: LType = this.map_return_type(node);
             if (!ret_ty.is_valid()) { return; }
             const argv_ty: LType = LType::pointer_to(LType::pointer_to(LType::i8()));
-            const buf: void* = intrinsics::malloc(3 * 8);
+            const buf: void* = libc::malloc(3 * 8);
             const slots: void** = buf as void**;
             slots[0] = LType::i32().raw;
             slots[1] = argv_ty.raw;
             slots[2] = argv_ty.raw;
             fn_type = LType::function_type(ret_ty, buf, 3, false);
-            intrinsics::free(buf);
+            libc::free(buf);
         } else {
             mut params: TypeRef[] = [];
             for (mut i: u32 = 0; i < param_count; i++) {
@@ -917,13 +918,13 @@ type struct DeclarationEmitter {
         const fn_ptr_ty: LType = LType::pointer_to(LType::i8());
         const vtable_ty: LType = LType::array_of(fn_ptr_ty, n);
 
-        const buf: void* = intrinsics::malloc(n as u64 * 8);
+        const buf: void* = libc::malloc(n as u64 * 8);
         const slot_ptrs: void** = buf as void**;
         for (mut i: u32 = 0; i < n; i++) {
             slot_ptrs[i] = llvm::LLVMConstBitCast(impls[i].raw, fn_ptr_ty.raw);
         }
         const init: LValue = LType::const_array(fn_ptr_ty, buf, n);
-        intrinsics::free(buf);
+        libc::free(buf);
 
         const qname: QualifiedName = QualifiedName::from_symbol(cls.qualified_name);
         const mangled: string = MangledName::for_vtable(intern, qname).resolve(intern);
@@ -1024,12 +1025,12 @@ type struct DeclarationEmitter {
             // anonymous LLVM literal struct so the signature reads
             // e.g. `{i64, i64}` - matches what `build_llvm_fn_type`
             // produces for free functions taking the same return.
-            const dp_buf: void* = intrinsics::malloc(2 * 8);
+            const dp_buf: void* = libc::malloc(2 * 8);
             const dp_slots: void** = dp_buf as void**;
             dp_slots[0] = ret_plan.llvm_slots[0].raw;
             dp_slots[1] = ret_plan.llvm_slots[1].raw;
             ret_ty = LType::literal_struct(dp_buf, 2, false);
-            intrinsics::free(dp_buf);
+            libc::free(dp_buf);
         } else if (ret_plan.llvm_slots.length > 0) {
             ret_ty = ret_plan.llvm_slots[0];
         } else {
@@ -1191,7 +1192,7 @@ type struct DeclarationEmitter {
             + (if (prepend_implicit_this) { 1 } else { 0 } as u32)
             + sret_inc;
 
-        const buf: void* = intrinsics::malloc(total_params as u64 * 8);
+        const buf: void* = libc::malloc(total_params as u64 * 8);
         const slots: void** = buf as void**;
 
         // Parallel array tracking the byval pointee for each LLVM
@@ -1256,12 +1257,12 @@ type struct DeclarationEmitter {
         }
 
         if (!params_valid) {
-            intrinsics::free(buf);
+            libc::free(buf);
             return;
         }
 
         const fn_type: LType = LType::function_type(ret_ty, buf, total_params, func.is_variadic);
-        intrinsics::free(buf);
+        libc::free(buf);
 
         const fn_val: LValue = this.llvm_module.add_function(fn_name, fn_type);
         this.apply_spec_linkage(fn_val, node.func, fn_name, false);
@@ -1886,13 +1887,13 @@ type struct DeclarationEmitter {
                 // GEP at byte offset 8 via i8 base, mirroring the
                 // call-site DirectPair expansion.
                 const i8_ty: LType = LType::i8();
-                const idx_buf: void* = intrinsics::malloc(8);
+                const idx_buf: void* = libc::malloc(8);
                 const idx_slots: void** = idx_buf as void**;
                 const eight: LValue = LType::const_int(LType::i64(), 8, false);
                 idx_slots[0] = eight.raw;
                 const hi_ptr: LValue = this.builder.build_gep(
                     i8_ty, alloca, idx_buf, 1, "param.hi.ptr");
-                intrinsics::free(idx_buf);
+                libc::free(idx_buf);
                 this.builder.build_store(hi_arg, hi_ptr);
                 this.values.set(param.name, alloca);
                 llvm_idx += 2;
@@ -2037,7 +2038,7 @@ type struct DeclarationEmitter {
         const nparams: u32 = llvm::LLVMCountParamTypes(fn_type.raw);
         mut arg_buf: void* = null;
         if (nparams > 0) {
-            arg_buf = intrinsics::malloc(nparams as u64 * 8);
+            arg_buf = libc::malloc(nparams as u64 * 8);
             const arg_slots: void** = arg_buf as void**;
             for (mut i: u32 = 0; i < nparams; i++) {
                 arg_slots[i] = wrapper.get_param(i).raw;
@@ -2045,7 +2046,7 @@ type struct DeclarationEmitter {
         }
         const r: LValue = this.builder.build_invoke(
             fn_type, user_main, arg_buf, nparams, cont_bb, lpad_bb, "");
-        if (arg_buf != null) { intrinsics::free(arg_buf); }
+        if (arg_buf != null) { libc::free(arg_buf); }
 
         // Normal exit: return the user main's result (or void).
         this.builder.position_at_end(cont_bb);
@@ -2321,13 +2322,13 @@ type struct DeclarationEmitter {
                             raw: llvm::LLVMGetParam(fn_val.raw, sret_off + 1) };
                         this.builder.build_store(lo_arg, slot);
                         const i8_ty: LType = LType::i8();
-                        const idx_buf: void* = intrinsics::malloc(8);
+                        const idx_buf: void* = libc::malloc(8);
                         const idx_slots: void** = idx_buf as void**;
                         const eight: LValue = LType::const_int(LType::i64(), 8, false);
                         idx_slots[0] = eight.raw;
                         const hi_ptr: LValue = this.builder.build_gep(
                             i8_ty, slot, idx_buf, 1, "this.hi.ptr");
-                        intrinsics::free(idx_buf);
+                        libc::free(idx_buf);
                         this.builder.build_store(hi_arg, hi_ptr);
                         this.values.set(this_sym, slot);
                         recv_slots = 2;
@@ -2405,13 +2406,13 @@ type struct DeclarationEmitter {
                 };
                 this.builder.build_store(lo_arg, alloca);
                 const i8_ty: LType = LType::i8();
-                const idx_buf: void* = intrinsics::malloc(8);
+                const idx_buf: void* = libc::malloc(8);
                 const idx_slots: void** = idx_buf as void**;
                 const eight: LValue = LType::const_int(LType::i64(), 8, false);
                 idx_slots[0] = eight.raw;
                 const hi_ptr: LValue = this.builder.build_gep(
                     i8_ty, alloca, idx_buf, 1, "param.hi.ptr");
-                intrinsics::free(idx_buf);
+                libc::free(idx_buf);
                 this.builder.build_store(hi_arg, hi_ptr);
                 this.values.set(param.name, alloca);
                 param_idx += 2;
@@ -2639,7 +2640,7 @@ type struct DeclarationEmitter {
         if (layout.kind == TypeKind::Struct) { field_count = (layout as StructType*).fields.length; }
         else if (layout.kind == TypeKind::Class) { field_count = (layout as ClassType*).fields.length; }
         if (field_count < 0 || sl.field_inits.length != field_count) { return LValue::null(); }
-        const buf: void* = intrinsics::malloc((n as u64) * 8);
+        const buf: void* = libc::malloc((n as u64) * 8);
         const slots: void** = buf as void**;
         // Zero every element first, so any padding element is a well-formed
         // constant even though no field initializer names it.
@@ -2660,9 +2661,9 @@ type struct DeclarationEmitter {
             if (!slot.is_valid()) { ok = false; break; }
             slots[elem] = slot.raw;
         }
-        if (!ok) { intrinsics::free(buf); return LValue::null(); }
+        if (!ok) { libc::free(buf); return LValue::null(); }
         const v: LValue = LType::const_named_struct(ty, buf, n);
-        intrinsics::free(buf);
+        libc::free(buf);
         return v;
     }
 
@@ -2726,7 +2727,7 @@ type struct DeclarationEmitter {
             return LValue::null();
         }
 
-        const buf: void* = intrinsics::malloc((n as u64) * 8);
+        const buf: void* = libc::malloc((n as u64) * 8);
         const slots: void** = buf as void**;
         mut ok: boolean = true;
         for (mut i: u32 = 0; i < n; i++) {
@@ -2735,9 +2736,9 @@ type struct DeclarationEmitter {
             if (!v.is_valid()) { ok = false; break; }
             slots[i as i64] = v.raw;
         }
-        if (!ok) { intrinsics::free(buf); return LValue::null(); }
+        if (!ok) { libc::free(buf); return LValue::null(); }
         const out: LValue = LType::const_array(ety, buf, n);
-        intrinsics::free(buf);
+        libc::free(buf);
         return out;
     }
 }

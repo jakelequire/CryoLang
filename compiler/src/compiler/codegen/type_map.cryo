@@ -16,6 +16,7 @@ import compiler::diag;
 import compiler::diag::{ diagnostic, sink };
 import std::core::option;
 import std::collections::{ pair, hashmap };
+import std::ffi::libc;
 
 
 // Cross-module shared type cache
@@ -338,13 +339,13 @@ type struct TypeMapper {
             return;
         }
         const total: u32 = n + 1;
-        const buf: void* = intrinsics::malloc(total as u64 * 8);
+        const buf: void* = libc::malloc(total as u64 * 8);
         const dst: void** = buf as void**;
         const src: void** = slots as void**;
         for (mut i: u32 = 0; i < n; i++) { dst[i] = src[i]; }
         dst[n] = LType::array_of(LType::i8(), pad as u32).raw;
         llvm_ty.set_struct_body(buf, total, packed);
-        intrinsics::free(buf);
+        libc::free(buf);
     }
 
     /// Report that a user-defined type could not be lowered soundly because
@@ -507,13 +508,13 @@ type struct TypeMapper {
 
         const elem_ptr: LType = LType::pointer_to(elem);
         const i64_ty: LType = LType::i64();
-        const buf: void* = intrinsics::malloc(24);
+        const buf: void* = libc::malloc(24);
         const slots: void** = buf as void**;
         slots[0] = elem_ptr.raw;
         slots[1] = i64_ty.raw;
         slots[2] = i64_ty.raw;
         const result: LType = LType::literal_struct(buf, 3, false);
-        intrinsics::free(buf);
+        libc::free(buf);
         return result;
     }
 
@@ -529,7 +530,7 @@ type struct TypeMapper {
     /// Tuple -> anonymous struct { elem0, elem1, ... }
     map_tuple(mut &this, t: TupleType*) -> LType {
         const n: u32 = t.elements.length as u32;
-        const buf: void* = intrinsics::malloc(n as u64 * 8);
+        const buf: void* = libc::malloc(n as u64 * 8);
         const slots: void** = buf as void**;
         mut has_null: boolean = false;
         for (mut i: u32 = 0; i < n; i++) {
@@ -541,11 +542,11 @@ type struct TypeMapper {
             slots[i] = mapped.raw;
         }
         if (has_null) {
-            intrinsics::free(buf);
+            libc::free(buf);
             return LType::null();
         }
         const result: LType = LType::literal_struct(buf, n, false);
-        intrinsics::free(buf);
+        libc::free(buf);
         return result;
     }
 
@@ -554,12 +555,12 @@ type struct TypeMapper {
         const wrapped: LType = this.map_type(t.wrapped);
         if (!wrapped.is_valid()) { return LType::null(); }
         const i1_ty: LType = LType::i1();
-        const buf: void* = intrinsics::malloc(16);
+        const buf: void* = libc::malloc(16);
         const slots: void** = buf as void**;
         slots[0] = wrapped.raw;
         slots[1] = i1_ty.raw;
         const result: LType = LType::literal_struct(buf, 2, false);
-        intrinsics::free(buf);
+        libc::free(buf);
         return result;
     }
 
@@ -627,11 +628,11 @@ type struct TypeMapper {
             else if (u_align == 8) { elem = LType::i64(); }
             const count: u32 = (u_size / u_align) as u32;
             const blob: LType = LType::array_of(elem, count);
-            const ubuf: void* = intrinsics::malloc(8);
+            const ubuf: void* = libc::malloc(8);
             const uslots: void** = ubuf as void**;
             uslots[0] = blob.raw;
             llvm_ty.set_struct_body(ubuf, 1, false);
-            intrinsics::free(ubuf);
+            libc::free(ubuf);
             return llvm_ty;
         }
 
@@ -645,7 +646,7 @@ type struct TypeMapper {
         // at most one filler per field, plus the tail.
         const n: u32 = t.fields.length as u32;
         if (n > 0) {
-            const buf: void* = intrinsics::malloc((n as u64 * 2 + 1) * 8);
+            const buf: void* = libc::malloc((n as u64 * 2 + 1) * 8);
             const slots: void** = buf as void**;
             // A field whose type can't be lowered to LLVM means an
             // un-substituted generic or unresolved type reached codegen -- a
@@ -673,13 +674,13 @@ type struct TypeMapper {
                 count += 1;
             }
             if (bad_fields > 0) {
-                intrinsics::free(buf);
+                libc::free(buf);
                 this.report_unmappable_fields(mangled, bad_fields, first_bad);
                 return LType::null();
             }
             const pad: u64 = this.tail_padding_for(t.computed_size, buf, count, packed);
             this.set_body_with_padding(llvm_ty, buf, count, packed, pad);
-            intrinsics::free(buf);
+            libc::free(buf);
         } else {
             llvm_ty.set_struct_body(null, 0, packed);
         }
@@ -742,7 +743,7 @@ type struct TypeMapper {
             return llvm_ty;
         }
 
-        const buf: void* = intrinsics::malloc(total as u64 * 8);
+        const buf: void* = libc::malloc(total as u64 * 8);
         const slots: void** = buf as void**;
 
         mut idx: u32 = 0;
@@ -779,14 +780,14 @@ type struct TypeMapper {
         }
 
         if (bad_fields > 0) {
-            intrinsics::free(buf);
+            libc::free(buf);
             this.report_unmappable_fields(mangled, bad_fields, first_bad);
             return LType::null();
         }
 
         const pad: u64 = this.tail_padding_for(t.computed_size, buf, total, false);
         this.set_body_with_padding(llvm_ty, buf, total, false, pad);
-        intrinsics::free(buf);
+        libc::free(buf);
 
         return llvm_ty;
     }
@@ -869,13 +870,13 @@ type struct TypeMapper {
         // variant's payload is zero-sized, elem_count=0 keeps the layout
         // as a 2-field struct rather than collapsing to a raw i32.
         const i32_ty: LType = LType::i32();
-        const buf: void* = intrinsics::malloc(16);
+        const buf: void* = libc::malloc(16);
         const slots: void** = buf as void**;
         slots[0] = i32_ty.raw;
         const payload_ty: LType = LType::array_of(elem_ty, elem_count);
         slots[1] = payload_ty.raw;
         const result: LType = LType::literal_struct(buf, 2, false);
-        intrinsics::free(buf);
+        libc::free(buf);
         return result;
     }
 
