@@ -13705,3 +13705,98 @@ incapable of ever being non-zero. They are passed as `Site`-typed *arguments* -
 `spelling_type(res, nodef_site)`, the same shape as the `door` parameter - so a
 search for `Site::X.bump()` cannot see them. Caught because the control, a
 variant known to be bumped, also returned zero.
+
+### 8.98 A bound does not have to be asserted at its value, which makes the remaining pinning possible - MEASURED AND LANDED 2026-09-05
+
+8.97 concluded the 121 unpinned rows were one decision: the zeros cannot be
+pinned without their bounds, the bounds are non-zero and corpus-dependent, so
+pinning either half is wrong. Both halves were right and the conclusion was not,
+because it assumed a bound must be pinned **at its value**.
+
+It does not. Assert the violation `== 0` and its bound `> 0`. The zero is the
+ratchet; the bound's assertion cannot go noisy, because it fails only when the
+lane stops being exercised **entirely** - which is precisely the event that
+turns the zero into a blind spot. Together they say "this path is reached and
+never violates", which is the claim the pinning was always meant to protect.
+
+#### Could the gate express it - no, and the failure mode was the bad one
+
+`parse_golden` accepted a row only when the count token satisfied `isdigit()`,
+and a line failing that was **silently skipped**. A predicate written into the
+golden would therefore have left its row unasserted while still looking pinned
+in the file - the exact shape this gate exists to notice. Fixed to reject an
+unparseable row loudly rather than drop it; verified by feeding it a garbage
+token and getting exit 1 where it previously returned quietly.
+
+The floor is carried by the bucket, the way `*` already qualifies membership: a
+bucket ending `>` is a floor. `parse_report` normalises a floor row's
+measurement into the assertion's own vocabulary - `>0` when the count is
+positive, `0` when it is not - so the existing exact list comparison keeps doing
+the work and the drift report still names the row that moved.
+
+#### Does it close the hole - for lane death yes, for lane narrowing no
+
+Proven by breaking it rather than by the gate being green: a floor row measured
+at 38,362 yields `>0` and matches; the same row measured at 0 yields `0`, which
+does not match `>0`, and the gate fails.
+
+The residual is real and is recorded rather than hidden. A lane that **narrows**
+instead of dying satisfies `>0` while making its violation row weak evidence.
+That is academic for `single-candidate fast path taken` at 38,362, and not
+academic for `by caller: resolve_named step 5`, whose floor is **14**. Two of
+the sixteen live floors sit under 200.
+
+#### How much it covers, and the second form it needs
+
+The 40 mapped zeros rest on only **20 distinct bound rows** - they share bounds
+roughly 2:1 - so this pins about twenty non-zero rows rather than all
+sixty-four, and the rest stay unpinned. That is most of why the noise objection
+dissolves.
+
+**Four of the twenty bounds are themselves zero**: `M4PreCalls`, `M4ResCalls`,
+`SpellTyIdCalls` and `SpellTyNewCalls`. `> 0` would fail on those on day one, so
+they take `== 0` instead, which is a pure ratchet and says something worth
+saying - this lane is dead, and if it wakes up the gate stops and someone looks.
+Measured on both hosts and all three corpora, **sixteen bounds are live on all
+six arms and four are dead on all six; none is mixed**, so the split is a
+property of the lanes rather than of one host.
+
+The floors are also where the host drift lives - `scope use site from the
+SYNTAX's own module` is 44,484 on Windows and 44,574 on Linux, `single-candidate
+fast path taken` 38,362 against 38,474 - so pinning them at their values would
+have meant six per-host numbers that move under ordinary work. `>0` collapses
+all of it.
+
+`M1AgreeCalls` is a bound and is **not** converted: it is already pinned exactly
+at 5,566, and replacing that with `>0` would relax an assertion that already
+holds. A floor is for a row that cannot otherwise be asserted, not a cheaper
+form for one that can.
+
+#### What landed
+
+A `>` bucket suffix with its rule stated at `bucket()`; 15 rows re-bucketed
+`B1>` and 40 to `B1 `; the gate taught to render, parse and compare the
+predicate, to refuse an unparseable golden line, and to leave floor rows out of
+the completeness sum - correct because a floor is a denominator and a
+denominator is never a summand, so flooring one by mistake makes the total
+exceed the sum and fires that check. The gate goes from **51 pinned sites to
+106**, `B1_TOTAL` and `B4_TOTAL` unchanged at 0.
+
+#### A control that fails with the instrument is worth more than one that fails with the subject
+
+Three variants came back with no bump site and were nearly recorded as rows
+structurally incapable of firing. They are passed as `Site`-typed arguments -
+`spelling_type(res, nodef_site)` - which a search for `Site::X.bump()` cannot
+see. Nothing about the subject revealed this. What revealed it was the control:
+a variant known to be bumped returned zero too, which is impossible if the
+instrument works.
+
+The rule: **a control should be chosen so that it can only fail if the
+instrument is broken.** A known-positive run through the same search, the same
+regex, the same parser. Both zeros were then explained at once, and the search
+was wrong rather than the tree. The same session lost the same way twice more -
+a label regex that also matched the three-character bucket strings, so any
+already-pinned row silently mapped to a label of "B1"; and `all()` over an empty
+sequence returning True, so three unmeasured bounds were reported as bounds that
+read zero. Neither was caught by a number looking wrong. Both were caught by
+asking what would have to be true for the answer to be uninteresting.

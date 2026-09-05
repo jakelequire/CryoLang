@@ -53,6 +53,20 @@ prevent.  A B3 row with no such regrowth story stays unasserted.
 only at zero.  Every one of them is pinned, because the bucket asserted by
 nothing is the bucket most worth asserting.
 
+A bucket ending `>` is a FLOOR row, asserted as `>0` rather than at its value.
+A violation row and its denominator cannot be pinned the same way: the violation
+is pinned at 0 and must stay there, while the denominator is a corpus-dependent
+count that would make the gate re-pin on ordinary work.  What the denominator is
+there to prove is that the lane is still ENTERED, so that is what is asserted.
+`>0` cannot go noisy: it fails only when the lane stops being exercised
+entirely, which is exactly the event that would otherwise turn the violation's
+zero into a silent blind spot.
+
+The residual, stated rather than hidden: a lane that NARROWS instead of dying
+satisfies `>0` while making its violation row weak evidence.  Tolerable where
+the floor is large, worth remembering where it is small -- the smallest here is
+`by caller: resolve_named step 5` at 14.
+
 A `!!` row is a count taken INSIDE a guard, so its zero has two causes that a
 gate cannot tell apart: nothing was refused, or nothing arrived to refuse.  A
 pin on the refusal alone therefore ratchets whichever of those happens to hold,
@@ -174,6 +188,11 @@ def section_key(host, suffix):
     """The golden section a (host, target) pair is pinned under."""
     return host if not suffix else "%s-%s" % (host, suffix)
 BUILD_SUBDIR = os.path.join("build", "b1-gate")
+
+# A floor row asserts that its lane is still ENTERED, not how often.  Written
+# into the golden in place of a count, and produced by `parse_report` for any
+# row whose bucket ends `>`.
+FLOOR = ">0"
 
 _B1_TOTAL_RE = re.compile(r"^\s*B1 fuzzy fallback\s*->\s*ZERO\s+(\d+)\s*$")
 _B2_TOTAL_RE = re.compile(r"^\s*B2 type-dependent\s*->\s*stays \(FLOOR\)\s+(\d+)\s*$")
@@ -338,7 +357,15 @@ def parse_report(err):
         # by never being reached.
         if row and (row[0].startswith("B1") or row[0].startswith("B3*")
                     or row[0].startswith("B4") or row[0].startswith("!!")):
-            rows.append((row[1], row[2]))
+            # A bucket ending `>` is a FLOOR row: what is asserted is that the
+            # lane is still entered, not how often.  The measurement is
+            # normalised into the assertion's own vocabulary here so the exact
+            # list comparison below keeps doing the work -- a live lane yields
+            # `>0` and matches, a dead one yields 0 and does not.
+            if row[0].endswith(">"):
+                rows.append((row[1], FLOOR if row[2] > 0 else 0))
+            else:
+                rows.append((row[1], row[2]))
 
     if b1 is None or b4 is None:
         sys.stderr.write(err)
@@ -377,7 +404,12 @@ def parse_report(err):
     # What must hold is that every summand appears among the flagged rows,
     # i.e. the total never exceeds their sum.  If it does, a B1 contributor is
     # not being parsed and the per-site assertion has silently gone blind.
-    row_sum = sum(c for _, c in rows)
+    # A floor row carries the predicate rather than a count, so it contributes
+    # nothing here.  That is correct rather than a gap: a floor is a
+    # denominator and a denominator is never a B1 summand, so if one is ever
+    # given a floor bucket by mistake the total will exceed the sum and this
+    # check fires -- which is the alarm it exists to raise.
+    row_sum = sum(c for _, c in rows if not isinstance(c, str))
     if b1 + b4 > row_sum:
         sys.stderr.write(
             "b1-gate: B1+B4 total is %d but the flagged rows sum to only %d.\n"
@@ -444,7 +476,7 @@ def render_section(host, b1, b2, b3, b4, rows):
              "B4_TOTAL %d" % b4,
              ""]
     for label, count in rows:
-        lines.append("%-46s %d" % (label, count))
+        lines.append("%-46s %s" % (label, count))
     return lines
 
 
@@ -518,8 +550,17 @@ def parse_golden(text):
         # count is the last whitespace-separated token, and the label keeps
         # its internal double spaces.
         parts = stripped.rsplit(None, 1)
-        if len(parts) == 2 and parts[1].isdigit():
+        if len(parts) == 2 and parts[1] == FLOOR:
+            parsed[host][2].append((parts[0].strip(), FLOOR))
+        elif len(parts) == 2 and parts[1].isdigit():
             parsed[host][2].append((parts[0].strip(), int(parts[1])))
+        elif len(parts) == 2:
+            # Neither a count nor the predicate.  Dropping it silently would
+            # leave the row unasserted while it still LOOKS pinned in the file,
+            # which is the failure this gate exists to notice.
+            print("b1-gate: golden line is neither a count nor %s: %r"
+                  % (FLOOR, stripped), file=sys.stderr)
+            sys.exit(1)
     # Trailing blank lines inside a block would be re-emitted on every update.
     for h in raw:
         while raw[h] and not raw[h][-1].strip():
