@@ -86,6 +86,17 @@ LOOKUPS = (
 )
 LOOKUP_RE = re.compile(r"\.(?:%s)\s*\(" % "|".join(LOOKUPS))
 REENTRY_RE = re.compile(r"\bget_resolver\s*\(\s*\)")
+# The one door that turns a name into a resolution answer, and the one that
+# turns an answer back into a name.  `DefId`'s field is private, so the literal
+# cannot be written outside the type and every crossing goes through these two.
+DEFID_MINT_RE = re.compile(r"DefId::of_definition\s*\(")
+# The leading dot is what keeps the MODULE `compiler::resolver::qualified_name`
+# out: a module is reached with `::` and an import names it bare, so neither
+# can match, while a receiver can only be a value.
+DEFID_UNWRAP_RE = re.compile(r"\.qualified_name\s*\(")
+
+# Every counted population, in the order they are rendered and compared.
+KINDS = ("LOOKUP", "REENTRY", "DEFID_MINT", "DEFID_UNWRAP")
 
 # The file that DEFINES the five lookups.  Its own calls are not the surface.
 LOOKUP_OWNERS = {"decl_index.cryo"}
@@ -106,7 +117,7 @@ def strip_comment(line):
 
 def scan():
     """Return {kind: {relpath: count}} over the compiler sources."""
-    found = {"LOOKUP": {}, "REENTRY": {}}
+    found = {k: {} for k in KINDS}
     for dirpath, _dirs, files in os.walk(SRC):
         for fname in sorted(files):
             if not fname.endswith(".cryo"):
@@ -115,20 +126,20 @@ def scan():
             rel = os.path.relpath(full, SRC).replace(os.sep, "/")
             with open(full, "r", encoding="utf-8", errors="replace") as fh:
                 text = fh.readlines()
-            lookups = 0
-            reentries = 0
+            tally = {k: 0 for k in KINDS}
             for raw in text:
                 line = strip_comment(raw)
                 if not line.strip():
                     continue
                 if fname not in LOOKUP_OWNERS:
-                    lookups += len(LOOKUP_RE.findall(line))
+                    tally["LOOKUP"] += len(LOOKUP_RE.findall(line))
                 if fname not in REENTRY_OWNERS:
-                    reentries += len(REENTRY_RE.findall(line))
-            if lookups:
-                found["LOOKUP"][rel] = lookups
-            if reentries:
-                found["REENTRY"][rel] = reentries
+                    tally["REENTRY"] += len(REENTRY_RE.findall(line))
+                tally["DEFID_MINT"] += len(DEFID_MINT_RE.findall(line))
+                tally["DEFID_UNWRAP"] += len(DEFID_UNWRAP_RE.findall(line))
+            for kind in KINDS:
+                if tally[kind]:
+                    found[kind][rel] = tally[kind]
     return found
 
 
@@ -142,6 +153,21 @@ HEADER = [
     "# REENTRY  get_resolver() outside the driver. Name resolution is a PASS, not a",
     "#          service: a resolver called from sema no longer holds the writer's",
     "#          imports, so it answers from a string. That is where B1 comes from.",
+    "# DEFID_MINT    DefId::of_definition() -- where a name BECOMES a resolution",
+    "#               answer. Legitimate only where the referent is known for a",
+    "#               reason other than the spelling in front of it: a resolver",
+    "#               that just walked to the declaration, or a read of the",
+    "#               declaration index.",
+    "# DEFID_UNWRAP  DefId::qualified_name() -- where an answer becomes a name",
+    "#               again. Legitimate where the output IS text (a diagnostic, a",
+    "#               mangled symbol); a re-keyed lookup here has re-derived what",
+    "#               it was handed, and should take the DefId instead.",
+    "#",
+    "# Those two exist because Cryo's visibility is scoped to the declaring TYPE",
+    "# rather than to a module: a constructor private enough to exclude codegen",
+    "# excludes the resolver too, so DefId cannot be made mintable by the resolver",
+    "# ALONE. The private field still buys one named door in each direction, and",
+    "# these rows are what make the traffic through them countable.",
     "#",
     "# Both ratchet DOWNWARD. An increase is regrowth; a decrease is progress and",
     "# must still be re-pinned with `make lane-check ARGS=--update`, because a",
@@ -155,7 +181,7 @@ HEADER = [
 
 def render(counts):
     lines = list(HEADER)
-    for kind in ("LOOKUP", "REENTRY"):
+    for kind in KINDS:
         rows = counts[kind]
         lines.append("")
         lines.append("[%s]" % kind)
@@ -169,7 +195,7 @@ def render(counts):
 def parse_golden(path):
     if not os.path.exists(path):
         return None
-    counts = {"LOOKUP": {}, "REENTRY": {}}
+    counts = {k: {} for k in KINDS}
     totals = {}
     kind = None
     with open(path, "r", encoding="utf-8") as fh:
@@ -209,8 +235,8 @@ def main():
     if args.update:
         with open(GOLDEN, "w", encoding="utf-8", newline=chr(10)) as fh:
             fh.write(render(counts))
-        print("lane-gate: golden updated -- LOOKUP = %d, REENTRY = %d"
-              % (live_totals["LOOKUP"], live_totals["REENTRY"]))
+        print("lane-gate: golden updated -- "
+              + ", ".join("%s = %d" % (k, live_totals[k]) for k in KINDS))
         return 0
 
     parsed = parse_golden(GOLDEN)
@@ -227,7 +253,7 @@ def main():
     gold_counts, gold_totals = parsed
 
     problems = []
-    for kind in ("LOOKUP", "REENTRY"):
+    for kind in KINDS:
         if kind not in gold_totals:
             problems.append("  %s: golden has no TOTAL line" % kind)
             continue
@@ -253,9 +279,9 @@ def main():
             "change that moved it.\n")
         return 1
 
-    print("lane-gate: OK -- LOOKUP = %d (%d files), REENTRY = %d (%d files)"
-          % (live_totals["LOOKUP"], len(counts["LOOKUP"]),
-             live_totals["REENTRY"], len(counts["REENTRY"])))
+    print("lane-gate: OK -- "
+          + ", ".join("%s = %d (%d files)" % (k, live_totals[k], len(counts[k]))
+                      for k in KINDS))
     return 0
 
 
