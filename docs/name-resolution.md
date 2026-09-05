@@ -10010,9 +10010,15 @@ corpus rather than the one this work is developed against.
 cascade §7 describes is two steps and a tail, and the two are a context lookup
 and a slot read - neither of them a search over the program.
 
-`2c-home-cursor` is **0 on every corpus**. B1 is now zero by construction rather
-than by ratchet: there is no longer a path by which the ambient cursor supplies
-the module a bare leaf is resolved in, because 2c does not resolve one.
+`2c-home-cursor` is **0 on every corpus** measured here.
+
+The first draft of this paragraph said B1 was zero "by construction" because
+"there is no longer a path by which the ambient cursor supplies the module".
+That is wrong, and 8.86 is the reason to distrust exactly this shape of claim.
+`HomeOrigin::Cursor` is still written at two live sites -
+`mono/ast_resolver.cryo:118` and `sema/sema.cryo:929` - so the path exists and
+these corpora do not exercise it. The zero is measured, not structural, and it
+is another starved-versus-dead question rather than a closed one.
 
 #### The 742 failures are a signal, not breakage
 
@@ -12336,3 +12342,111 @@ failure cannot fail the command is decoration.
 
 This is the eighth instance of the absence-that-reads-as-progress family and the
 first in which the instrument was correct and the plumbing discarded it.
+
+### 8.87 The wrapper route does not remove the collision, and four claims corrected - MEASURED 2026-09-04
+
+#### The route premise was wrong, mine as much as anyone's
+
+8.86 recommended ordinary Cryo functions wrapping `ffi::libc` on the grounds
+that bare callers would keep working "because exactly one declaration claims the
+leaf". That reasoning does not hold, and the error is worth stating plainly
+because it was in the recommendation rather than in the measurement.
+
+A wrapper **is** a declaration of the leaf. If `core::intrinsics` keeps a
+`malloc` - intrinsic or ordinary function - and `ffi::libc` declares its twin,
+then a module with both in scope still has two candidates for a bare `malloc`,
+and registration order still decides. Wrapping centralises the CASTS; it does
+not remove the ambiguity. The ambiguity is removed only by leaving one
+declaration of the leaf, which means the callers of the deleted one move.
+
+So the wrapper's saving is real but smaller than claimed: it converts 271
+hand-written casts into 84 wrappers, and leaves the call-site edits standing.
+
+#### What deleting category A actually costs
+
+Of the 335 bare category-A call sites:
+
+| | sites | files |
+|---|---:|---:|
+| in files that already `import std::ffi::libc` | 34 | 14 |
+| in files that do NOT | **301** | **59** |
+
+and **271 of the 335 name a twin whose signature differs in TYPES**, so they
+need a cast as well as a rename. Adding the 444 qualified `intrinsics::X(`
+sites, the deletion moves about 779 call sites, 59 files gain an import, and the
+type-differing share is the majority rather than the exception.
+
+The heaviest single files are `compiler/src/CLI/commands.cryo` (71),
+`stdlib/core/primitives.cryo` (33) and three `tools/CryoLSP` handlers (58
+between them), so the LSP - the tree no local gate compiled until 8.79 - is in
+the blast radius.
+
+That is the honest size of "libc things become `extern "C"` in the libc module".
+It is not a reason not to do it; it is the number that should be seen before
+starting rather than discovered at file 40.
+
+#### Four corrections, all verified against the code rather than inherited
+
+**§8.64's `2c-home-cursor` zero is measured, not structural.** That entry said
+there is "no longer a path by which the ambient cursor supplies the module".
+`HomeOrigin::Cursor` is written at two live sites, `mono/ast_resolver.cryo:118`
+and `sema/sema.cryo:929`. The path exists; the corpora do not exercise it.
+Corrected in place, because a "by construction" claim is exactly what stops
+anyone re-measuring.
+
+**`b1-gate.py`'s docstring quoted figures its own golden contradicts** - 5,041
+Windows / 4,989 Linux for `lookup_by_leaf calls`, where the golden pins 2,206
+and 2,154. Corrected, with a line saying to read the figure off the golden: an
+example inside a docstring is checked by nothing, and this pair had already
+drifted once.
+
+**Two comments describing machinery §8.70 deleted.** `resolver.cryo` carried an
+index comment calling the module-scope map a multimap that "may create several
+same-named Module scopes across pipeline stages" - sitting directly above the
+docstring that says a module owns exactly one scope. And `declare_module_symbol`
+justified its first-wins guard with "`set_module` ... builds a fresh scope each
+time", which `module_scope_of` contradicts in its own docstring ("built on first
+ask and returned unchanged after"). Both replaced with what the code does; the
+guard is still needed, for a different reason than the one written down.
+
+**A function that exists only in comments.** `module_ns_of_file` has no
+definition and no callers - it survives in two comments, in `module_graph.cryo`
+and `resolve_counter.cryo`, both phrased as though a reader could go and call
+it. Both dereferenced.
+
+#### A test pins the precedence the change would remove
+
+`tests/tests/lang/bare_intrinsic_priority.cryo` asserts that a bare `free` and
+a bare 2-arg `realloc` bind the INTRINSIC from a module importing nothing
+allocation-related, and its header states the mechanism: "the bare decl-index
+slot is owned by the intrinsic and a later same-leaf regular function must not
+rebind it". It records what the bug looked like - `free(malloc'd)` dispatching
+to `heap::free` and crashing on a foreign pointer, and bare `realloc` failing
+codegen outright.
+
+Two things follow.
+
+**The mechanism is both, not either.** 8.86 measured that the resolver binds a
+bare intrinsic through the prelude edge, and that stands. This test names a
+second, independent surface: a bare decl-index slot keyed by mangled name, which
+a same-leaf regular function can last-write-stomp. The prediction 8.86 falsified
+was not wrong about the slot existing, only about it being the whole story.
+
+**The contested set is not only libc twins.** This collision is with
+`std::alloc::heap::free`, an ordinary Cryo function. The census already showed
+twins outside `ffi/libc.cryo` - `sys` 5, `alloc/heap` 2, `fs` 2 and others -
+so "move the libc things to libc" does not by itself empty the contested set.
+
+And deleting `intrinsics::free` makes this test's premise vanish: a bare `free`
+in a module importing nothing would resolve to nothing. The test would have to
+be deleted or inverted in the same change, which is a decision about what the
+language does, not a migration step.
+
+#### One item checked and not applicable
+
+`walk_module_rooted_type` was flagged as sitting on target lists it does not
+belong on. It appears once outside its own definition, in this document, where
+it is described correctly as resolving `prefix::leaf` through the module's
+export set. It is on no target list in `docs/` or `scripts/`, so there was
+nothing to remove. Recorded because "checked, does not apply" and "not checked"
+look identical afterwards.
