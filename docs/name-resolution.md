@@ -12554,3 +12554,134 @@ Two runs of the same measurement across the three patches differ by 2 on the
 here, and it is the reason the fixture exists as a second reading. §8.67's rule
 has no clean instance on this question: there is no large corpus that exercises
 generic substitution and does not contain the compiler.
+
+### 8.89 The symbolic walk's 3,165 empty constraint lists are a syntax fact, and the type kind they feed is built nowhere in the compiler - MEASURED 2026-09-04
+
+The finding as inherited: `symbolic_param_ref` sees 3,165 generic parameters
+carrying zero constraints on a project whose declarations demonstrably carry
+them, since the same constraints reach `create_generic_param_types`. Both
+halves are true. Neither explanation offered for them is.
+
+#### Ordering is ruled out without measuring anything
+
+`GenericParamNode.constraints` ORIGINATES at exactly one place in the tree -
+`parser.cryo`, `add_constraint` off the inline `<T: Bound>` syntax. The only
+other writer is the cloner, which deep-copies an existing list and adds
+nothing to it. Every pass that could observe the field runs after parsing, so "the constraints are
+attached later than the walk" has no later to refer to. That disposes of one of
+the two candidate explanations by construction rather than by a count, which
+matters because the count it would have produced is the same 0 either way.
+
+#### Node identity is ruled out by giving the walk the shape it never gets
+
+The remaining explanations were "the walk sees different nodes" and "the walk
+sees the right nodes and there is nothing on them". Those produce identical
+tallies, so the discriminator has to vary the SYNTAX rather than the corpus.
+
+`inline_generic_bound` is the only member of the tree writing inline
+constraints, and it writes them on a struct with no methods and on a free
+function. `symbolic_check_owner_methods` walks the METHOD BODIES of a generic
+owner, so neither declaration reaches it: the project's constrained parameters
+and the walk never meet. A second fixture adds exactly that missing shape - a
+constrained owner that has a method, and one whose method carries constrained
+parameters of its own:
+
+| | inline_generic_bound | + constrained owner with methods |
+|---|---:|---:|
+| params offered: symbolic_checker | 3,165 | 3,169 |
+| constraint lookups asked by symbolic_checker | 0 | 4 |
+| of those, answered | 0 | 4 |
+
+The walk receives the parser's own constrained nodes as soon as a constrained
+declaration is one it walks, and the leaf lookup answers every one. So the
+3,165 are 3,165 parameters that genuinely carry nothing: the tree writes
+`where`, a `where` bound becomes a `TraitBound` on the declaration, and
+`GenericParamNode.constraints` holds only the inline form.
+
+#### The zero belongs to the caller, not to the lookup
+
+The leaf-index report attributed 24,898 calls and 0 hits with five per-caller
+rows all reading 0 - and every one of those rows sits inside
+`if (trait_ref.is_valid())`, so each says nothing about whether its caller
+asked. The group's own comment says as much ("bumped on a HIT") without the
+call side existing. With it:
+
+| caller | asks | answers |
+|---|---:|---:|
+| sema type_utils | 24,856 | 0 |
+| resolve_named step 5 | 42 | 0 |
+| symbolic_checker | 0 | 0 |
+| resolver generic bound | 0 | 0 |
+| type_resolution bound | 0 | 0 |
+
+The 24,898 was never about generic bounds. Two consumers make every call and
+neither is answered; the three bound-building loops contribute nothing to it.
+A leaf consumer's zero is unreadable without the call beside it, and five of
+them had been readable as either thing for as long as the rows existed.
+
+#### Nothing downstream is misled, and the reason is not the one it looks like
+
+The empty list means `create_bounded_param` is not reached, so the parameter is
+built as a bare `GenericParam` rather than a `BoundedParam`. There are exactly
+three sites in the tree that construct a `BoundedParamType`, and they are the
+three loops measured above. On `compiler/` they iterate 0 times over 6,247
+parameters, so **building the compiler constructs no `BoundedParamType` at
+all**. The step that consumes one - the method cascade's `m6`, `BoundedParam`
+bound after `m5` missed - reads 0 on all three corpora, including the fixture
+where four are built and whose bodies call a trait method on the bounded
+receiver. That kind is not merely unbuilt; it is unconsumed even when built.
+
+The obvious conclusion from that - two representations of a bound, and the
+inline one is read by nothing - is wrong, and it was nearly recorded here.
+`find_generic_method_on_receiver_bounds` collects a receiver's bound leaves
+from FOUR sources into one list: the impl node's `where_bounds`, the current
+function's `trait_bounds`, and the `constraints` on the owner's and the
+method's own `GenericParamNode`s. The last two are the inline form, read
+straight off the node rather than through any type kind. So an inline
+constraint does drive abstract-receiver dispatch, and it is the fixture's own
+evidence: `m2` rises when the constrained owner with methods is added.
+
+The accurate shape is therefore not two representations with one of them dead.
+It is one consumer that reads both, plus a type kind - `BoundedParamType` -
+that three loops exist to build and that nothing in a compiler build either
+constructs or consults. The 3,165 empty lists cost nothing, because the bounds
+those parameters actually carry are read from `where_bounds` in the same
+function, two loops above.
+
+#### Where this leaves the audit's zeros
+
+All four of the zeros the audit called structurally undistinguishable are now
+resolved, and **none of them by deletion**: `lookup_by_leaf` starved by the
+tool, three bound callers settled by measurement, and 8.88's primitive step
+starved by a mechanism upstream of it. The audit framed those zeros as the
+measure of what remained, so four resolving to "not deletable as it stands"
+changes the shape of the remaining work rather than its count - the cascade is
+not carrying four removable steps, it is carrying four steps whose removal each
+needs a different upstream change first.
+
+#### The absence-that-reads-as-progress family gains two more, both self-inflicted
+
+The eight recorded instances all had an external cause. These two are the fix
+for an earlier instance failing, and then the write-up of that failure
+failing the same way.
+
+The recorded workaround for the heredoc that eats a backslash is to write the
+script to a file and run it instead of piping it. Doing exactly that still ate
+one: a backslash-t and a backslash-n inside a Python replacement string
+arrived as a literal tab and a literal newline, written into a Cryo string
+literal, where they compiled clean and would have produced identical output at
+runtime. Only `od -c` on the emitted line showed it.
+
+`cat > file <<'EOF'` is not the fix; the heredoc is the eater, and routing it
+through a file does not change that. What holds is building the escape from
+`chr(92)` so no backslash crosses the shell at all.
+
+The paragraph above was written twice. The first draft spelled the two
+escapes literally to say what had been eaten, and the heredoc ate them the
+same way, putting a raw tab and a raw newline into a sentence about raw tabs
+and raw newlines. That is the tenth instance and the second self-inflicted
+one, and it is the reason the rule is stated as a prohibition on the
+character rather than as care around it: a backslash cannot appear in a
+heredoc at all, including in prose describing the trap. The general form: a
+workaround recorded against a trap is itself a claim, and it inherits the same
+burden of evidence as the measurement it protects.
