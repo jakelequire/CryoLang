@@ -13082,3 +13082,90 @@ identical amounts on both hosts. **The unchanged rows are the control.**
 
 Both sections are re-pinned from their own host's measurement, B1 and B4 are 0
 in all six arms, and no row moved anywhere except those three.
+
+### 8.92 The return-cast six, the two leaves that were never intrinsic calls, and the Windows shims move to where the bindings live - LANDED 2026-09-05
+
+8.91 left twelve of the eighty-four: six whose twin returns a different pointer
+type, `read` and `write`, and four that are target-gated. All twelve are done
+here, and `core::intrinsics` goes from 76 declarations to 64.
+
+#### An argument converts, an initializer does not
+
+The six return-cast leaves - `getcwd`, `strstr`, `memmove`, `memset`,
+`readdir`, `memcpy` - moved at 63 call sites across 19 files. Only **two**
+needed a cast, and both bind the result to a typed local:
+
+    const hit: i8* = libc::strstr(this, needle) as i8*;   core/primitives.cryo
+    const got: i8* = libc::getcwd(&cwd_buf[0], 4096) as i8*;   CLI/commands.cryo
+
+The refinement 8.91 could not make is that `void*` is not like the others. Four
+`mut entry: void* = libc::readdir(dp)` initializers in the same file compiled
+without a cast while the `i8*` one three hundred lines later did not, so the
+rule is not "an initializer rejects a pointer conversion" but "an initializer
+rejects a conversion to a CONCRETE pointer type; `void*` still absorbs
+anything". Grepping every binding of the six ahead of the build turned one
+build-fix-build cycle per site into one grep.
+
+#### `read` and `write` were never calls to the intrinsic
+
+Both are pure deletions. Every bare occurrence resolves elsewhere, and the
+reasons are worth keeping because a count would have called all nine of them
+callers:
+
+* `fs/file.cryo`'s `read(p)?` is `fs::read` - the file declares its own.
+* `io/traits.cryo` and `async_trait_method.cryo` hold trait method
+  prototypes, not calls.
+* All six `write(p, payload.as_bytes())` sites take TWO arguments and `match`
+  a `Result`. `intrinsics::write(fd, buffer, count)` takes three and returns
+  `i64`. They are `fs::write`, reached by import.
+
+#### The Windows shims move to the module that owns the bindings
+
+`libc::popen`, `libc::pclose` and `libc::realpath` were declared **ungated**,
+so on Windows they named symbols mingw's CRT does not export: the declaration
+compiled and the link would fail. The only working Windows implementation was a
+shim in `intrinsics.cryo` forwarding to `_popen`/`_pclose`/`_fullpath`, in a
+module whose own header says C functions belong in `ffi`.
+
+Those three externs are now `![target(unix)]`, and `ffi::libc` carries the
+Windows arm in the shape it already uses for `isatty`/`aligned_alloc`: a gated
+`extern "C"` block for the underscored CRT aliases plus a Cryo function per
+leaf. `realpath`'s shim keeps the argument swap - `_fullpath(absPath, relPath,
+maxLen)` reverses POSIX `realpath(path, resolved)` - and its 4096-byte
+assumption, both of which were only recorded in the module being emptied.
+
+**No program changes meaning.** Nothing calls `libc::popen` or `libc::pclose`
+anywhere, and the one caller of `libc::realpath`, `fs::dir::canonicalize`, is
+itself `![target(unix)]` with a Windows arm on `GetFullPathNameA` - a comment
+there already recorded that the POSIX symbol "does not exist in the mingw CRT".
+What changes is that a Windows caller of these three would now link instead of
+failing at link time.
+
+`open_memstream` needed no move at all: its `libc` twin was already
+`![target(unix)]`, matching the intrinsic. It is a deletion like the rest.
+
+Two comments went with the move. `libc.cryo` said the underscored aliases "are
+declared inline in `core::intrinsics` ... since `core::intrinsics` is the leaf
+module and can't import `ffi::libc`", which is no longer where they live. And
+`intrinsics.cryo`'s surviving filesystem section was headed by a note that
+`readlink`/`isatty` had "moved to `ffi::libc`" - migration framing for a move
+long finished, above the only two declarations left in it. The dirent
+accessors are genuine intrinsics, lowered by `from_name` to a load at the
+platform's own field offset, and the header now says that instead.
+
+#### Two corrections to the brief, recorded rather than carried
+
+**The lowered-and-contested set is four, not three.** `panic`, `vfprintf` and
+`vprintf` are contested by `ffi::libc` twins. `frame_address` is contested by a
+**second `intrinsic function` declaration**, in `runtime/backtrace/src/lib.cryo`,
+returning `u8*` where the stdlib returns `void*`. An intrinsic contested by
+another intrinsic is a different shape from an intrinsic contested by a libc
+twin, and namespacing - the answer for the other three - may not be the answer
+for it. Not decided here.
+
+**`realloc` is coupled to `free` and cannot be ordered separately.**
+`bare_intrinsic_priority.cryo` asserts in one file that a bare `free` and a
+bare two-argument `realloc` both bind the intrinsic, so the test's premise
+vanishes for both at once. Least-used-first would put `realloc` (1 site) near
+the front and `free` (164) at the back; they move together, at the back, with
+the replacement test.

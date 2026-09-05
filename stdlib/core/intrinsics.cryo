@@ -6,24 +6,6 @@
 
 namespace std::core::intrinsics;
 
-// Windows-only msvcrt aliases for the few CRT functions POSIX names
-// differently.  Declared inline (rather than via `import ffi::libc`)
-// because intrinsics is a leaf module - libc and syscall already
-// import the prelude (which itself re-exports intrinsics), so a
-// cross-import here would back-edge the module graph.  Multiple
-// extern declarations of the same C symbol are equivalent at link
-// time, so the duplication with `ffi::libc` is harmless.
-![target(windows)]
-extern "C" {
-    function _popen(command: string, mode: string) -> void*;
-    function _pclose(stream: void*) -> i32;
-    // msvcrt's realpath equivalent: `_fullpath(absPath, relPath, maxLen)`.
-    // Note the argument order is the reverse of POSIX `realpath(path,
-    // resolved)`; the Windows `realpath` shim below swaps them.  Returns
-    // `absPath` on success, null on failure (same contract as realpath).
-    function _fullpath(absPath: i8*, relPath: string, maxLength: u64) -> i8*;
-}
-
 // Allocation.  These remain intrinsics because the self-hosted compiler
 // (compiler/src) still calls `intrinsics::malloc` / `intrinsics::free`
 // directly; new stdlib code calls the `ffi::libc` wrappers instead.
@@ -32,11 +14,6 @@ extern "C" {
 intrinsic function malloc(size: u64) -> void*;
 intrinsic function realloc(ptr: void*, new_size: u64) -> void*;
 intrinsic function free(ptr: void*) -> void;
-
-// Bulk memory.
-intrinsic function memcpy(dest: void*, src: void*, count: u64) -> void*;
-intrinsic function memmove(dest: void*, src: void*, count: u64) -> void*;
-intrinsic function memset(dest: void*, value: i32, count: u64) -> void*;
 
 // Pointer distance in bytes. Pointer stepping is done with the `+`/`-`
 // operators (element-scaled) or `mem::offset`; there is no `ptr_add`/`ptr_sub`.
@@ -189,8 +166,6 @@ intrinsic function fma64(x: f64, y: f64, z: f64) -> f64;
 // New stdlib code should call the typed wrappers in `ffi::libc` instead.
 
 // stdio: strings & streams
-intrinsic function strstr(haystack: string, needle: string) -> i8*;
-
 intrinsic function printf(format: string, args...) -> i32;
 intrinsic function snprintf(buffer: i8*, size: u64, format: string, args...) -> i32;
 intrinsic function fprintf(file: void*, format: string, args...) -> i32;
@@ -203,55 +178,9 @@ intrinsic function vfprintf(file: void*, format: string, va: void*) -> i32;
 // printf-style `print` / `println` in `std::fmt`.
 intrinsic function vprintf(format: string, va: void*) -> i32;
 
-// Pipe-backed subprocess.  POSIX `popen`/`pclose` are spelled
-// `_popen`/`_pclose` on msvcrt.  The Windows shims forward through the
-// gated extern decls in `ffi::libc`; the public surface
-// (`intrinsics::popen`/`pclose`) stays the same.
-![target(unix)]
-intrinsic function popen(command: string, mode: string) -> void*;
-
-![target(unix)]
-intrinsic function pclose(pipe: void*) -> i32;
-
-![target(windows)]
-function popen(command: string, mode: string) -> void* {
-    return _popen(command, mode);
-}
-
-![target(windows)]
-function pclose(pipe: void*) -> i32 {
-    return _pclose(pipe);
-}
-
-// In-memory output stream: open_memstream(char **bufp, size_t *sizep).
-// fprintf into the returned FILE*, then fflush/fclose; *bufp then holds
-// the accumulated bytes as a NUL-terminated buffer the caller must free.
-//
-// POSIX-only: msvcrt has no equivalent, so a caller needing this on
-// Windows has to buffer the bytes some other way.
-![target(unix)]
-intrinsic function open_memstream(bufp: i8**, sizep: u64*) -> void*;
-
-// fd-level I/O
-intrinsic function read(fd: i32, buffer: void*, count: u64) -> i64;
-intrinsic function write(fd: i32, buffer: void*, count: u64) -> i64;
-
-// Filesystem
-// readlink / isatty moved to `ffi::libc` (OS-dispatched there).
-// realpath: POSIX absolute-path canonicalizer.  msvcrt has no `realpath`,
-// but `_fullpath` fills the same role (it lexically resolves to an absolute
-// path; unlike POSIX realpath it does not resolve symlinks, which Windows
-// largely doesn't use for the paths Cryo canonicalizes - stdlib roots and
-// the compiler's own location).  Argument order is swapped vs `_fullpath`.
-![target(unix)]
-intrinsic function realpath(path: string, resolved: i8*) -> i8*;
-
-![target(windows)]
-function realpath(path: string, resolved: i8*) -> i8* {
-    return _fullpath(resolved, path, 4096);
-}
-intrinsic function getcwd(buf: i8*, size: u64) -> i8*;
-intrinsic function readdir(dirp: void*) -> void*;
+// `struct dirent` field accessors.  Genuine intrinsics: codegen lowers each
+// to a load at the platform's own field offset, so the stdlib never has to
+// model a layout that differs between the C libraries.
 intrinsic function dirent_name(entry: void*) -> string;
 intrinsic function dirent_type(entry: void*) -> i32;
 
