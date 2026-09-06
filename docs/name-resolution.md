@@ -13965,6 +13965,15 @@ sibling, so `definition_id_of` returns a `DefId` and eight call sites mint
 nothing at all. `TypeUtils::def_type` likewise already documented itself as
 consuming "the name layer's own answer", and it now takes one.
 
+This corrects the scoping rather than merely refining it. The plan expected
+three sites outside the resolver to be **fabricating** a `Res` from a name they
+had been handed, and to need a caller-side mint each. They were not fabricating:
+every one of them was already reading the answer out of the declaration index
+and only losing its provenance on the way through a `SymbolStr`-typed parameter.
+The three were a **type hole, not a lane violation** - which is why giving the
+parameter the stronger type closed them without changing a single lookup, and
+why the mint count landed on the index read rather than on the synthesizers.
+
 That leaves **16 mints in 5 files** - eleven in the resolver's own walk, two in
 the index read, three at synthesizer callers - against **26 unwraps in 14
 files**. Both are pinned as new `lane-gate.py` rows. The mint count reconciles
@@ -13989,6 +13998,13 @@ cannot absorb it - `.name()` matches most of the tree - and the accessor is
 legitimate, since two of its three arms genuinely hold nothing but a name. It is
 enumerated here instead, which is the honest form: the gate counts what it can
 see, and what it cannot see is one site rather than an unknown.
+
+**So `DEFID_UNWRAP` must not be read as the complete count of crossings.** It is
+the complete count of *direct* ones. The gap is exactly one named site, listed
+above and re-checkable by grepping `ResBase` for a `.name()` receiver - not an
+estimate, not a residue of unknown size. If a second caller of `ResBase::name()`
+in unwrapping position ever appears, the gate will not see it either, and that
+is the failure mode to watch rather than a drifting total.
 
 #### What did not move, predicted in advance
 
@@ -14016,3 +14032,207 @@ a failure in the two together could be either. It is also where
 unforgeability arrives for free and structurally rather than syntactically:
 once the payload is an index, minting one requires the table and can fail, and
 a lookup that can fail is not a cast.
+
+### 8.101 Tier 2 is not fifty mechanical sites: routing a canonical key is a definitional no-op, and half the surface is a cascade - MEASURED 2026-09-05
+
+Tier 2 was scoped as ~50 raw index calls to route through `TypeUtils` the way
+batch 1 routed sixteen. Measured, the population does not have that shape, and
+the difference is not a matter of degree.
+
+#### The surface, classified with provenance rather than name shape
+
+`LOOKUP` 103 decomposes as 72 raw index calls / 20 already routed / 11 floor,
+confirming 8.99. Nine of the 72 are the seam inside `type_utils.cryo`, leaving
+**63**. Each argument was traced to its assignment rather than judged by its
+spelling, and every site falls in exactly one bucket:
+
+| bucket | sites | what it is |
+|---|---:|---|
+| cascade step | **20** | one question, two-to-four lookups, each guarded on the last one's miss |
+| index read | **23** | single lookup on a key the caller CONSTRUCTED canonically |
+| bare spelling | **20** | single lookup on a written name |
+
+20 + 43 = 63, and the 43 singles split 23 / 20.
+
+Two instrument defects were caught by controls on the way, neither of which
+made a total look wrong. A name-shape screen called `qsym` bare because the
+`qualify_binding_sym` that builds it is on the previous line, and a line-local
+argument reader returned the empty string for every multi-line call - which
+silently moved `type_resolution.cryo`'s three `..._owner` sites from index read
+to bare spelling. The corrected reader is controlled against a known multi-line
+call, which is the case that broke it.
+
+#### Why routing 23 of them is a rename in the strict sense
+
+`TypeUtils::lookup_type_exact` is `return this.ctx.decl_index.lookup_type(name);`
+- one line, no canonicalization, no widening. For a caller that already holds a
+constructed canonical key, `di.lookup_type(q)` and `types.lookup_type_exact(q)`
+are therefore **the same operation on the same key**, and the swap changes the
+gate's number and nothing else. This is not a judgement about whether the sites
+are tasteful; it is what the two function bodies are.
+
+`type_resolution.cryo` holds the largest group of these and holds them
+legitimately: it is the pass that POPULATES the index, and its own comment at
+the biggest cluster says so - "Uses DeclarationIndex (just populated above by
+register_decl_in_index)". A pass reading back what it just registered, under the
+key it registered it with, is an index read. It is not a lane violation and
+routing it through sema's wrapper would only make it harder to see that.
+
+#### Why routing the other 20 would be worse than leaving them
+
+The cascade sites are eight groups, and two of them are the SAME algorithm
+written out twice:
+
+```
+K = qualify_symbol_sym_home(NAME, file);   T = lookup_type(K);
+if (T invalid) { K = resolve_scoped_or(NAME); T = lookup_type(K); }
+if (T invalid) { K = NAME;                    T = lookup_type(K); }
+```
+
+verbatim in `decl_visit_emitter.cryo` and `new_delete_emitter.cryo`, with a
+four-step variant in `type_resolution.cryo` and five two-step variants
+elsewhere. Both copies need the winning KEY as well as the type, which is why
+neither was ever factored into a helper returning a `TypeRef`.
+
+Moving the receiver on these leaves the cascade intact and removes the only
+thing that currently makes it visible - a run of `.lookup_type(` calls in one
+function. That is the defect this project has repeatedly found itself with:
+a change that makes a defect unobservable while leaving its cause in place.
+**The bare-leaf third step is the actual defect**, and it is the B1 shape: a
+written name reaching the index with no resolver answer, so it binds in
+whichever module registered that leaf.
+
+Collapsing the duplicate into one named widening primitive is NOT taken here
+and is left as a question rather than a decision, because it cuts both ways: it
+would put the cascade in one place where deleting the bare step is one edit, and
+it would also give the cascade a name, make a seventh caller cheap, and hide it
+from a gate that counts `.lookup_type(` rather than the primitive.
+
+#### What is actually left, and why it is not this tier's shape
+
+The 20 bare-spelling sites are the only ones where something is genuinely lost,
+and only some of them: a site whose argument is a helper's own parameter
+(`symbol_resolver.cryo` twice, `ir_generator.cryo` once) has pushed the question
+to its callers, and a site reading a DECLARATION's own name (`node.name` on a
+`StructDeclNode`, `fn_node.name`) is asking the index for the thing it is
+currently emitting.
+
+What remains are sites holding an AST node that CARRIES a `ResSlot` -
+`IdentifierNode` and `ScopeResolutionNode` both do - and taking `.name` off it
+instead of the answer. `call_emitter.cryo:238` on `id.name` is the clearest.
+Those are the sites 8.100's thesis describes: the resolution answer was
+discarded and is being recomputed from a name.
+
+Fixing them is **call-site migration, not receiver routing** - §7.2's own
+distinction - and it can change which type is found where two modules own the
+same leaf, which is a behaviour change rather than a refactor. It is therefore
+recorded here and parked rather than taken under a tier whose warrant was that
+it was mechanical.
+
+#### The conclusion that matters for the lane gate
+
+Completing tier 2 as scoped would not unblock privatizing the five, because
+8.99 already showed the seam blocks it regardless of how many call sites move.
+So the swap is neither necessary nor sufficient for the goal it was serving,
+while being a no-op on 23 sites and a concealment on 20. `LOOKUP` is not a
+count of lane violations and driving it down is not the same as removing them:
+of the 103, at most 20 are sites where a name is doing work an answer should do,
+and 11 are not lane sites at all.
+
+### 8.102 The bare-leaf step is dead in five of eight cascades and is not a fallback in the other three - MEASURED 2026-09-05
+
+8.101 found the raw index surface is half cascade, and that the bare-leaf last
+step - a written name reaching the index with no resolver answer - is the actual
+defect rather than the receiver. Whether it can be deleted is a question about
+how often it ANSWERS, so it was measured rather than argued.
+
+#### The instrument, and the control each zero needed
+
+Each of the eight cascade groups got a counter on the bare step being REACHED
+and on it ANSWERING. Reached and answered are separate because a zero arrives
+two ways - the earlier steps always answered, or the step ran and never helped -
+and only the second is evidence about deleting it.
+
+Three groups then read zero on BOTH, which is the uncontrolled shape: a step
+never reached tells you nothing unless the cascade around it ran. Those three
+got a third counter on the cascade being ENTERED, and the zeros survived it
+against live denominators of 102, 684 and 14,244.
+
+Corpus: 57 compilation units - `examples/` (14), the compiler itself, and
+`tests/` (42) - built cold from a compiler copied out of the build tree, with
+`CRYO_STDLIB` and `CRYO_RESOLVE_COUNTER` set. Block count equalled project count
+in every corpus, so no unit was silently unmeasured.
+
+| cascade group | entered | bare reached | bare answered | |
+|---|---:|---:|---:|---|
+| `canonical_type_ref` | - | 2662 | **10** | 0.4% |
+| base-ctor key | 102 | 0 | 0 | never reached |
+| new/delete type | 684 | 0 | 0 | never reached |
+| impl target (4-step) | 14244 | 0 | 0 | never reached |
+| impl param index | - | 111 | **0** | reached, never answers |
+| impl owner: signatures | - | 11607 | 9888 | 85.2% |
+| impl owner: second pass | - | 11161 | 9508 | 85.2% |
+| impl owner: trait bodies | - | 10510 | 9508 | 90.5% |
+
+#### The three that answer are not a fallback, and this is measured rather than read
+
+`type_resolution.cryo` carries a comment saying the bare step exists because
+"primitive impls like `implement string` use bare". A comment is a hypothesis,
+and 85% is high enough that the alternative - the bare step doing real
+cross-module widening, which would be a large B1 finding - had to be excluded
+rather than assumed.
+
+A probe on the three owner groups classified each bare ANSWER by whether the
+impl target is a primitive spelling. **28,904 primitive, 0 declared.** The
+arithmetic closes against the table above: bare answers across all eight groups
+total 28,914, the owner probe accounts for 28,904, and the remaining 10 are
+`canonical_type_ref`'s.
+
+So those three are not a widening cascade at all. They are a two-case dispatch
+that happens to be written in cascade shape: a declared type is found under its
+qualified name, and a primitive has no qualified form to be found under -
+`qualify_symbol_sym_home` cannot answer for `string`, and the index registers
+primitives by spelling. Deleting the step would break every `implement string`.
+
+They should be read, and eventually written, as the primitive-impl path rather
+than as a fallback. Counting them as lane sites is what made the cascade
+population look twice as defective as it is.
+
+#### What is now deletable, and what is not
+
+- **Four groups can lose their bare step with no measured behaviour change**:
+  base-ctor key, new/delete type and impl target never reach it across 15,030
+  cascade entries, and impl param index reaches it 111 times and answers none.
+- **Three groups must keep it** and are miscategorised, per above.
+- **`canonical_type_ref` cannot be cleared on this evidence.** It answers 10
+  times in 2,662, which is small but not zero, so deleting it changes what some
+  program compiles to. What those 10 are is not established here.
+
+The deletion is not taken in this pass. The measurement was the ruling; a change
+to what an existing program compiles to is a separate decision, and the one
+group that would need it is the one group the evidence does not clear.
+
+#### The counters stay, and one of them is an invariant
+
+`CascOwnerBareDecl` reading **0** is a live claim, not a spent measurement: if a
+DECLARED type ever reaches an impl-owner bare step, the primitive explanation
+above has stopped holding and the step has become the widening fallback it was
+mistaken for. All twenty-one rows are bucketed blank rather than `B1`, so
+`b1-gate.py` - which selects only `B1`/`B3*`/`B4`/`!!` - does not see them and
+its 106 pinned sites are unaffected.
+
+#### Two instrument defects, both caught by controls rather than by a wrong total
+
+A `grep -c ENTERED` control matched a pre-existing counter row (`m3* no type
+sym: branch ENTERED`) and reported 14 blocks of instrumentation that did not
+exist. Behind it: a Python edit had failed its assertion and `make cryo` ran
+anyway, because the two were separate lines and only `MAKE_EXIT` was read - the
+"an assertion that is not the last command in a chained line is not an
+assertion" rule, in its own idiom. The counter rows were absent from the SOURCE,
+which is what the second control checked.
+
+The failing edit itself was a format mismatch: the generator wrote
+`Site::%-23s=> ` and the search string reconstructed it as `%-22s => `, which
+are the same width but not the same string. Insertion is now line-based and
+copies the padding from the line it inserts beside, so the format cannot be
+re-derived wrongly.
