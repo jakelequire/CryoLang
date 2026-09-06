@@ -14407,3 +14407,62 @@ succeeding and 14 failing exactly as before.
 2,652 reaches, with the one thing it was serving fixed at its source rather than
 at its symptom. It is still not deleted - that decision is held with the other
 four - but it is now held on a zero rather than on a 0.4%.
+
+### 8.105 canonical_type_ref was not the only consumer that assumed a bare leaf: the ambient qualifier is handed an already-qualified name 206,678 times - MEASURED 2026-09-05
+
+8.104 fixed one consumer that qualified an already-qualified name. The question
+that leaves is whether it was the only one, since another consumer making the
+same assumption is a latent instance of the same defect - invisible precisely
+because nothing recovers it into a counter.
+
+Answered by instrumenting the qualifiers rather than by auditing their call
+sites: a probe at each of the three places a namespace is actually prepended,
+firing when the input already carries a separator. Reading the call sites would
+have measured what the arguments are NAMED; this measures what they ARE.
+
+| prepend site | already-qualified inputs |
+|---|---:|
+| `qualify_symbol_sym` (ambient) | **206,678** |
+| `qualify_symbol_sym_home` | 0 |
+| `qualify_binding_sym` | 0 |
+
+Over the same 57 units. The two zeros are the control: the same predicate at
+three sites, discriminating rather than always-true, so the 206,678 is not an
+artefact of a predicate that fires on everything.
+
+The inputs are not closure names. They are already-canonical type names and
+mangled monomorph names - `std::core::result::Result` 106,836 times,
+`std::core::option::Option` 41,454, then a long tail of specialization keys like
+`std::core::result::6Result$Lh_N$L...ConversionError$G$G`. So the family is
+much wider than the two conventions on `StructDeclNode.name` that 8.104 was
+chasing: it is every path that asks the ambient namespace to qualify something
+that is already qualified.
+
+**What this does NOT establish, and the distinction matters.** A count of
+category errors at the producer is not a count of defects at the consumer. Each
+of those 206,678 results is a key of the form `<ns>::<already::qualified::Name>`,
+and there are two ways that is currently harmless and one way it is not:
+
+- the caller looks the key up, misses, and falls back - wasted work and a
+  latent trap, which is exactly what `canonical_type_ref` was doing;
+- something registered the SAME doubled form through the same qualifier, so the
+  lookup hits and the whole subsystem is self-consistently doubled;
+- or a doubled key collides with a real name, which would be a mis-binding.
+
+Which of the three applies, and in what proportion, is **not measured here**.
+`passes/specialization.cryo` is the case to look at first, because it computes
+`qualify_symbol_sym(spec_name)` and then both looks up AND registers under the
+result, which is the mechanism by which the second possibility would arise.
+
+The probes were removed rather than kept. `Site::bump` is unconditional, so the
+separator scan would have run on a hot path in release builds; and a row pinned
+at 206,678 is a backlog rather than an invariant - a drifting denominator no
+gate can act on, which is the shape 8.96 exists to avoid. The measurement is
+recorded here and reproduced by re-adding three four-line probes at the sites
+named above.
+
+What did land is the precondition, stated on `qualify_symbol_sym` itself: `sym`
+is a bare leaf, prepending is unconditional, and a caller that may hold either
+form wants `canonical_decl_key`. The function had no doc comment saying so,
+which is the cheapest reason 206,678 calls could violate it without anyone
+noticing.
