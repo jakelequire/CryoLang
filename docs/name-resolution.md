@@ -14466,3 +14466,174 @@ is a bare leaf, prepending is unconditional, and a caller that may hold either
 form wants `canonical_decl_key`. The function had no doc comment saying so,
 which is the cheapest reason 206,678 calls could violate it without anyone
 noticing.
+
+8.106 censused the consumers and found the nomination above is WRONG:
+`specialization.cryo` never receives an already-qualified name, and no doubled
+key is registered anywhere.
+
+### 8.106 The consumer census: nothing registers a doubled key, and the second producer of a qualified declaration name is `async_lower` - MEASURED AND LANDED 2026-09-06
+
+8.105 counted 206,678 already-qualified inputs reaching the ambient qualifier
+and said plainly that a count of category errors at the PRODUCER is not a count
+of defects at the CONSUMER. Three outcomes were possible - miss and fall back,
+hit a self-consistently doubled registration, or collide with a real name - and
+none had been measured. This is that measurement.
+
+#### The instrument, and what each zero is controlled by
+
+Every one of the 18 external call sites plus the 3 in-family delegations was
+routed through a tagged sibling that emits one row when its input already
+carries a separator, using `QualifiedName::segment_count` - deliberately the
+SAME predicate `canonical_decl_key` uses, so the census counts exactly what
+that function would treat as already qualified. A separate untagged probe at
+the prepend itself is the denominator.
+
+Corpus: the same 57 units, cold, from a copied compiler. 57 counter blocks for
+57 units, so no unit went unmeasured.
+
+| site | already-qualified inputs |
+|---|---:|
+| `type_utils.cryo:199` method-return cursor | 180,546 |
+| `sema.cryo:298` impl alias | 12,790 |
+| `sema.cryo:296` impl canonical | 12,779 |
+| `type_utils.cryo:322` type-cascade cursor | 461 |
+| `sema.cryo:527` struct visit | 46 |
+| `qualify_binding_sym` empty-binding fallback | 34 |
+| `sema.cryo:522` generic struct visit | 22 |
+| the remaining 15 sites | **0** |
+| SUM | **206,678** |
+| denominator at the prepend | **206,678** |
+
+The residue is **0**: the decomposition closes against the denominator, which
+is what says no rows were dropped and no call site went unenumerated. Fifteen
+zeros, `canonical_decl_key`'s own delegation among them - it prepends only for
+a name of one segment, so it cannot contribute and does not - are what say the
+predicate discriminates rather than firing on everything.
+
+#### `specialization.cryo` was the wrong place to look, and that was inference
+
+8.105 nominated `passes/specialization.cryo` as the case to examine first,
+because it computes `qualify_symbol_sym(spec_name)` and then both looks up and
+registers under the result. That was read off the source, not measured. The
+site reads **0**: `entry.specialized_name` is never already qualified, so the
+doubled registration it was offered as evidence for does not arise there.
+
+#### No doubled key is ever registered, anywhere
+
+Each consuming lookup was then probed for its outcome, with the arm recorded as
+`/DBL` or `/PLAIN` so that a zero has a control at the same line.
+
+| arm | HIT | MISS |
+|---|---:|---:|
+| method-return cursor `/DBL` | **0** | 180,546 |
+| impl canonical `/DBL` | **0** | 12,779 |
+| type-cascade cursor `/DBL` | **0** | 461 |
+| struct visit `/DBL` | **0** | 68 |
+| impl via `qualified_target_name` (control) | 27,005 | 0 |
+| struct visit `/PLAIN` (control) | 10,769 | 0 |
+| method-return cursor `/PLAIN` (control) | 709 | 148,178 |
+
+**193,854 doubled lookups, not one hit.** So the second outcome has no instance
+and the third - a doubled key colliding with a real name, which would appear
+here as a hit - has none either. The family is entirely the first outcome: a
+key nothing holds, missed.
+
+The type-cascade cursor's `/PLAIN` arm answers zero as well, which its own
+`/DBL` zero cannot control. It is controlled from outside this measurement:
+`tests/b1-baseline.txt` already pins `type cascade: 2 ambient cursor` at 0 over
+a different corpus. Two instruments that share no code agree the step never
+answers.
+
+#### `async_lower` is a second producer, and two more consumers assumed bare
+
+8.104 found `StructDeclNode.name` carrying two conventions and named
+`lambda_synth` as what mints the qualified one. It is not the only one.
+`async_lower` mints an async future's state-machine struct the same way:
+`q_name` is built from a bare leaf, `new StructDeclNode(q_name, span)` carries
+the qualified form, and `register_type_with_module(q_name, ...)` makes it the
+registration key. Both producers then add the declaration to the AST root, so
+both reach sema's struct visit.
+
+Three consumers read that field assuming a bare leaf. `canonical_type_ref` is
+the one 8.104 fixed, and it had a bare fallback quietly absorbing the
+difference. The other two do not:
+
+- `sema.cryo:522/527` qualifies it and calls `lookup_type_exact`, which is one
+  index lookup and nothing else;
+- `sema.cryo:259` reaches `declare_async_methods` through
+  `qualify_binding_sym`, whose empty-binding branch delegates to the ambient
+  qualifier.
+
+#### Only ten of the events have anything downstream to be wrong
+
+Whether a missed owner type matters depends on whether the declaration has
+methods for it to type, so that was measured rather than read - and the reading
+would have been wrong, because the two producers differ exactly there.
+`async_lower` never calls `add_method` on its struct declaration; it adds
+fields and generic parameters, and hangs `poll` off the impl block instead.
+`lambda_synth` does call `add_method`, twice.
+
+| arm | method list empty | non-empty |
+|---|---:|---:|
+| struct visit `/DBL` | 58 | **10** |
+| `declare_async_methods` `/DBL` | 29 | **5** |
+
+58 of the 68 struct visits are future structs, where the invalid `TypeRef` is
+handed to an empty method list and nothing reads it. **Ten are closure
+structs**, where it is threaded into a body walk. Ten is 8.104's ten - five
+synthesized closure types, twice each - so the population `canonical_type_ref`
+was recovering is the same population this consumer drops, measured by a second
+instrument that shares no code with the first.
+
+The 34 at `declare_async_methods` split 29/5 and account exactly for the 34 at
+the `qualify_binding_sym` fallback.
+
+#### The fix is 8.104's rule reaching the consumers it had not reached
+
+A name that is already qualified is already canonical, and `canonical_decl_key`
+is where that is decided. The two struct-visit sites and
+`qualify_binding_sym`'s empty-binding branch now derive through it, which is
+three lines and no new mechanism - the alternative, teaching each consumer to
+recognise a synthesized name, is the second answering path this tree keeps
+growing.
+
+Predicted before the edit and checked after, over the same 57 units:
+
+| | before | after |
+|---|---:|---:|
+| struct visit, already-qualified input | 46 + 22 | **0 + 0** |
+| `qualify_binding_sym` fallback | 34 | **0** |
+| ambient qualifier, already-qualified inputs | 206,678 | **206,576** |
+| struct-visit lookups on those names | 68 MISS | **68 HIT** |
+| corpus build outcomes | 43 / 14 | 43 / 14 |
+
+The delta being exactly 102 is what the prediction was for. The three sites
+account for 46 + 22 + 34, so any re-keying that reached a declaration it was
+not meant to would have moved the denominator by more than the sites removed.
+Every control arm is unchanged to the count - the method-return cursor still
+answers 709 of 148,887, the impl path still answers 27,005, and the struct
+visit's plain arm still answers 10,769 - so no name that used to resolve
+stopped resolving.
+
+The 68 becoming hits rather than disappearing is the part that says the fix
+addressed the cause: those names were registered the whole time, under the
+qualified form their producers minted, and the only thing standing between the
+consumer and the entry was a namespace prepended twice.
+
+#### What this does NOT establish
+
+- **The ten are not shown to miscompile.** What is shown is that a wrong key
+  is computed, the lookup misses with no fallback, and the invalid `TypeRef`
+  is threaded into a body walk over a non-empty method list. Whether anything
+  observable followed from that is a different question, and the corpus builds
+  43 / 14 either way.
+- The impl-block path is untouched and still doubles 12,779 times. It misses
+  every time and reaches `reject_undeclarable_async`, which is silent only
+  because none of those owners carries an `async` method - measured, not
+  assumed: no `MISS-ASYNC` row exists. An `async` method on a monomorphized
+  owner would be rejected on a key nothing holds. That is user-visible error
+  behaviour and is left for a ruling rather than taken here.
+- The method-return cursor's 180,546 is left standing. It is the largest
+  single member of the family and it answers nothing on those inputs, but the
+  step it sits in is a cascade with a further arm, so removing it is the same
+  decision held for the five bare steps.
